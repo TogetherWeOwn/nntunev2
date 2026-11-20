@@ -37,6 +37,7 @@ declare global {
 	interface Window {
 		__passkeyCreateCalls?: number;
 		__releasePasskeyCreate?: () => void;
+		__signupCreationOptions?: Array<{ handle: number[]; challenge: number[]; rpId?: string }>;
 	}
 }
 
@@ -71,9 +72,16 @@ async function installCreateDouble(
 				value: FixturePublicKeyCredential
 			});
 			window.__passkeyCreateCalls = 0;
+			window.__signupCreationOptions = [];
 			Object.defineProperty(navigator, 'credentials', {
 				value: {
-					create: async () => {
+					create: async (options: CredentialCreationOptions) => {
+						const key = options.publicKey!;
+						window.__signupCreationOptions?.push({
+							handle: Array.from(new Uint8Array(key.user.id as ArrayBuffer)),
+							challenge: Array.from(new Uint8Array(key.challenge as ArrayBuffer)),
+							rpId: key.rp.id
+						});
 						window.__passkeyCreateCalls = (window.__passkeyCreateCalls ?? 0) + 1;
 						const calls = window.__passkeyCreateCalls;
 						if (holdCeremony && calls === 1) {
@@ -263,6 +271,64 @@ test('signup: Start over is hidden while finishing and returns with the settled 
 	await expect(page.getByRole('alert')).toHaveText(SIGNUP_GENERIC);
 	await expect(startOver(page)).toBeVisible();
 	expect(traffic.finishPosts).toBe(1);
+});
+
+test('signup: creation handles stay fresh across lost-finish retries and new starts', async ({ page }) => {
+	await installCreateDouble(page);
+	await page.addInitScript(() => {
+		let calls = 0;
+		Object.defineProperty(crypto, 'getRandomValues', {
+			value: (bytes: Uint8Array) => bytes.fill(++calls)
+		});
+	});
+	const traffic = await routeSignup(page, { finishStatus: 401 });
+	// Model a finish whose response is lost after the credential was created.
+	await page.route('**/v1/auth/passkey/register/finish', (route) => route.abort(), { times: 1 });
+	await reachSignupCodeStep(page);
+	await page.getByLabel('Email code').fill('fixture-code');
+	const finish = page.getByRole('button', { name: /finish creating account/i });
+	await finish.click();
+	await expect(page.getByRole('alert')).toHaveText(SIGNUP_GENERIC);
+	await finish.click();
+	await expect(page.getByRole('alert')).toHaveText(SIGNUP_GENERIC);
+	expect(traffic.startPosts).toBe(1);
+	await startOver(page).click();
+	await page.getByTestId('signup-submit').click();
+	await page.getByLabel('Email code').fill('fixture-code');
+	await finish.click();
+	await expect(page.getByRole('alert')).toHaveText(SIGNUP_GENERIC);
+
+	const options = await page.evaluate(() => window.__signupCreationOptions!);
+	expect(options).toHaveLength(3);
+	for (const [index, option] of options.entries()) {
+		expect(option.handle).toHaveLength(32);
+		expect(new Set(option.handle).size).toBe(1);
+		expect(option.handle[0]).toBeGreaterThan(0);
+		expect(option.rpId).toBe('localhost');
+		if (index > 0) expect(option.handle).not.toEqual(options[index - 1].handle);
+	}
+	expect(options[0].challenge).toEqual(Array.from(new TextEncoder().encode('first')));
+	expect(options[1].challenge).toEqual(options[0].challenge);
+	expect(options[2].challenge).toEqual(Array.from(new TextEncoder().encode('second')));
+	expect(traffic.finishBodies.map((body) => body.challenge)).toEqual([
+		FIRST_CHALLENGE, SECOND_CHALLENGE
+	]);
+});
+
+test('signup: RNG failure sends neither a creation nor a finish request', async ({ page }) => {
+	await installCreateDouble(page);
+	await page.addInitScript(() => {
+		Object.defineProperty(crypto, 'getRandomValues', {
+			value: () => { throw new Error('randomness unavailable'); }
+		});
+	});
+	const traffic = await routeSignup(page);
+	await reachSignupCodeStep(page);
+	await page.getByLabel('Email code').fill('fixture-code');
+	await page.getByRole('button', { name: /finish creating account/i }).click();
+	await expect(page.getByRole('alert')).toHaveText(SIGNUP_GENERIC);
+	expect(await createCalls(page)).toBe(0);
+	expect(traffic.finishPosts).toBe(0);
 });
 
 test('signup: Start over activates from the keyboard', async ({ page }) => {

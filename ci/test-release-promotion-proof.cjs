@@ -152,8 +152,10 @@ describe("release retry and repair wiring", () => {
   });
 
   it("keeps every CalVer call on the pinned shared releaser", () => {
-    const uses = release.match(/TogetherWeOwn\/\.github\/actions\/calver@cf983076/g) || [];
-    assert.equal(uses.length, 4);
+    const uses = release.match(/TogetherWeOwn\/\.github\/actions\/calver@[^\r\n]+/g) || [];
+    assert.deepEqual(uses, Array(4).fill(
+      "TogetherWeOwn/.github/actions/calver@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0",
+    ));
   });
 
   it("releases only after the production deploy succeeds, for the promoted SHA", () => {

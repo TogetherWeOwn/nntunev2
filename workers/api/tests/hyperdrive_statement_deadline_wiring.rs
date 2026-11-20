@@ -265,6 +265,13 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
+    let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
+    let prototype = store.split_once(prototype_gate).expect("prototype gate").1;
+    let store = store.replacen(
+        function_body(prototype, "asyncfnstore_reconcile_outcome("),
+        "{}",
+        1,
+    );
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
@@ -281,9 +288,54 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             "Store impl slice must contain {anchor}"
         );
     }
-    for piece in &pieces {
-        assert_bounded(piece, method_name(piece));
+    let release_gate =
+        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
+    assert_eq!(
+        names
+            .iter()
+            .filter(|&&n| n == "store_reconcile_outcome")
+            .count(),
+        2
+    );
+    for gate in [prototype_gate, release_gate] {
+        assert_eq!(
+            store
+                .matches(&format!("{gate}asyncfnstore_reconcile_outcome("))
+                .count(),
+            1
+        );
     }
+    for (index, piece) in pieces.iter().enumerate() {
+        let name = method_name(piece);
+        if name == "store_reconcile_outcome" && pieces[index - 1].ends_with(prototype_gate) {
+            continue;
+        }
+        if matches!(name, "like_delete" | "taste_delete") {
+            let love_only = name == "like_delete";
+            let body = function_body(piece, name);
+            assert_eq!(
+                body,
+                format!("{{self.delete_preference(user_id,kind,target,{love_only}).await}}"),
+                "{name} must delegate its entire operation to the bounded helper"
+            );
+        } else if name == "acquire_playback_lease" {
+            assert_eq!(
+                function_body(piece, name),
+                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,expires_at,takeover,).await}",
+                "lease acquisition must delegate its entire operation to the bounded helper"
+            );
+            assert_bounded(
+                function_body(&source, "asyncfnacquire_private_aware_lease("),
+                "acquire_private_aware_lease",
+            );
+        } else {
+            assert_bounded(piece, name);
+        }
+    }
+    assert_bounded(
+        function_body(&source, "asyncfndelete_preference("),
+        "delete_preference",
+    );
 }
 
 #[test]
@@ -359,6 +411,21 @@ fn rate_limit_pair_commits_both_claims_in_one_cancellation_safe_transaction() {
 }
 
 #[test]
+fn account_deleting_probe_runs_unnamed_with_a_text_owner() {
+    let source = production();
+    let probe = function_body(&source, "asyncfnaccount_deleting(");
+    let queries = calls(probe, ".query_typed_opt");
+    assert_eq!(queries.len(), 1, "the pooled probe must run unnamed");
+    assert_eq!(
+        queries[0].args.as_slice(),
+        [
+            "crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL",
+            "&[(&user_id,Type::TEXT)]",
+        ]
+    );
+}
+
+#[test]
 fn mint_path_statements_run_unnamed_through_query_typed() {
     // TWO-222: tokio-postgres names prepared statements `sN` per isolate, and
     // a named statement can collide on, or go missing from, a
@@ -376,7 +443,12 @@ fn mint_path_statements_run_unnamed_through_query_typed() {
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
-    for name in ["user_by_email", "insert_user", "insert_session"] {
+    for name in [
+        "user_by_email",
+        "insert_user",
+        "insert_session",
+        "private_session_active",
+    ] {
         let piece = pieces
             .iter()
             .find(|piece| method_name(piece) == name)
@@ -491,12 +563,22 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
-    for name in [
-        "session_by_id",
-        "revoke_all_sessions",
-        "revoke_all_native_credentials",
+    let credential_store: String = include_str!("../src/credential_session_store.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<String>()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    for (source, name) in [
+        (store, "session_by_id"),
+        (
+            credential_store.as_str(),
+            "revoke_sessions_and_native_credentials",
+        ),
+        (credential_store.as_str(), "insert_native_credential"),
     ] {
-        let body = function_body(store, &format!("asyncfn{name}("));
+        let body = function_body(source, &format!("asyncfn{name}("));
         assert!(
             body.contains(".query_typed("),
             "{name} must run its statements unnamed via query_typed"

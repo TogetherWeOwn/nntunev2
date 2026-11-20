@@ -116,10 +116,17 @@ and limits each run, including waiting and approval, to [35 days](https://docs.g
 The extra day and UTC date rounding include the boundary. Thus an old run that
 was rerun or waited before deploying late is included; a small creation-only
 lookback would not be sufficient. Revisit this horizon if those platform limits
-change. Each query must return a complete, stable-count, duplicate-free listing
-below GitHub's 1,000-result search ceiling (up to ten pages, 4 MiB per page).
-Missing pages, inconsistent counts, ceiling exhaustion, malformed evidence and
-the existing 120-second aggregate network deadline refuse admission.
+change. Creation-date discovery uses two inclusive 22-day UTC ranges starting
+at the rounded cutoff, then an open-ended range starting on the next UTC date.
+The ranges do not overlap and the open tail includes pushes after the journey
+opened. The five all-time unresolved searches still have no date filter.
+
+Each query must return a complete, stable-count, duplicate-free listing below
+GitHub's 1,000-result search ceiling (up to ten pages, 4 MiB per page). A recent
+unresolved run can appear in both searches, but both records must agree. Out-of-scope
+rows, missing pages, inconsistent counts, ceiling exhaustion, malformed evidence
+or expiry of the shared 120-second network deadline refuse admission. The
+verifier never evaluates conflicts from a partial union.
 
 Completed runs last updated before the opening observation cannot contain a
 later completed job in that snapshot. For other conflicting runs, inspect jobs

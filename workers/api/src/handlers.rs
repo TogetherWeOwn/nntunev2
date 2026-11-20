@@ -46,8 +46,7 @@ use crate::session::{self, SessionClaims, SessionRecord};
 use crate::vault::{self, AuditEvent, ValidatedTarget};
 use crate::webauthn;
 
-/// Request bodies above this size reject before routing (not an oracle:
-/// size only, same for every route).
+/// Default request-body cap, checked before routing.
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// Intake-route body cap: `POST /api/ingest` carries an NZB document, not
 /// API JSON, so it gets its own bound. The value parities the NZB intake
@@ -59,8 +58,7 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// must not ship in this worker); bump both together.
 pub const INGEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Per-route request-body bound: the NZB intake route and the admin NZB
-/// upload route accept document uploads, every other route takes
+/// Per-route request-body bounds for NZB uploads, likes import, and default
 /// API-sized bodies. Both the entry's collection gate and the pre-routing
 /// size check call this, so the two caps cannot drift apart.
 pub fn max_body_bytes(method: &str, path: &str) -> usize {
@@ -68,6 +66,9 @@ pub fn max_body_bytes(method: &str, path: &str) -> usize {
         INGEST_BODY_LIMIT_BYTES
     } else if method == "POST" && path == "/v1/admin/ingest" {
         admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES
+    } else if method == "POST" && path == "/v1/me/likes/import" {
+        // A compact batch of 500 maximum-length track IDs exceeds 32 KiB.
+        320 * 1024
     } else {
         MAX_BODY_BYTES
     }
@@ -126,12 +127,9 @@ const MAIL_PER_IP_PER_HOUR: u64 = 30;
 const MAIL_GLOBAL_PER_WINDOW: u64 = 100;
 const MAIL_GLOBAL_WINDOW_SECS: u64 = 300;
 /// Unverified-signup retention: a user row that still holds no credential
-/// and no other account activity (vault, session, unexpired magic link or
-/// register challenge) after this is a never-completed signup;
-/// `register_start` reaps such rows best-effort (their challenges expire
-/// within 5 minutes and are pruned with them). Magic-only accounts (session
-/// without a passkey yet) and vault owners are never reaped: their
-/// vault/session/magic rows exempt them.
+/// or establishment evidence (legacy vault marker, session, unexpired magic
+/// link or register challenge) after this is a never-completed signup.
+/// `register_start` reaps such rows and prunes expired challenges.
 const UNVERIFIED_USER_TTL_SECS: u64 = 24 * 3600;
 /// Fixed scope key for the fleet-wide auth-start and mail budgets.
 const GLOBAL_SCOPE_KEY: &str = "global";
@@ -141,7 +139,7 @@ const GLOBAL_SCOPE_KEY: &str = "global";
 /// `worker_entry`) and the statement-shape test below. The purpose literal must stay
 /// `PURPOSE_REGISTER` (`'register'`): reaping on `'login'` would delete
 /// never-completed signups on the wrong ceremony. Exemptions (credentials,
-/// unexpired register challenges, vaults, sessions, unexpired magic links)
+/// unexpired register challenges, legacy vault marker, sessions, unexpired magic links)
 /// must stay in sync with the `FakeStore` mirror. Accounts with a
 /// scheduled deletion (`deleting_at IS NOT NULL`) are also exempt: they
 /// are owned by the deletion executor, and their `delete_operations`
@@ -164,8 +162,7 @@ fn unverified_user_filter() -> String {
                          WHERE auth_challenges.user_id = users.id \
                            AND auth_challenges.purpose = '{PURPOSE_REGISTER}' \
                            AND auth_challenges.expires_at > $3) \
-         AND NOT EXISTS (SELECT 1 FROM provider_vaults \
-                         WHERE provider_vaults.user_id = users.id) \
+         AND NOT users.legacy_vault_established \
          AND NOT EXISTS (SELECT 1 FROM sessions \
                          WHERE sessions.user_id = users.id) \
          AND NOT EXISTS (SELECT 1 FROM magic_link_tokens \
@@ -245,6 +242,9 @@ pub struct Config {
     /// looked up by exact version (composite `UNIQUE (pepper_version,
     /// key_hmac)`, migration 0019).
     pub native_rest_pepper_version: u32,
+    /// Dedicated compatibility keyring, loaded only from the Worker secret.
+    /// Absent or invalid configuration disables issuance, not native routes.
+    pub subsonic_index: Option<crate::subsonic_config::SubsonicIndexConfig>,
     /// Stripe bearer secret (`STRIPE_SECRET_KEY` Worker secret), test mode
     /// only. `None` until the operator provisions it (see the Worker entry
     /// and `wrangler.toml.example`); unprovisioned, every Stripe-touching
@@ -340,6 +340,7 @@ impl Config {
             session_previous_secret,
             native_rest_pepper: None,
             native_rest_pepper_version: 0,
+            subsonic_index: None,
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             play_grant_secret: None,
@@ -671,6 +672,56 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    /// Standalone private-play mark, adapted from PR #982's preserved patch;
+    /// not authority to issue a grant. Activation must instead atomically
+    /// fence, refresh privacy, mark, acquire the lease and conditionally
+    /// commit. Idempotent: a replay keeps the first `marked_at`. Fails closed.
+    fn mark_private_play(
+        &self,
+        _user_id: &str,
+        _track_id: &str,
+        _key: &str,
+        _marked_at: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Observation only; not authority to issue a play grant. Activation must
+    /// atomically fence, refresh privacy, mark/probe, acquire and commit.
+    fn private_play_marked(
+        &self,
+        _user_id: &str,
+        _track_id: &str,
+        _key: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Observe an exact private session using server time. This is not authority
+    /// to issue a play; activation must recheck under the account fence.
+    fn private_session_active(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async move {
+            let _ = (user_id, session_id);
+            Err(StoreError)
+        }
+    }
+    /// Atomically replace the expiration for an exact owner/session pair.
+    /// Writers must fence the account against deletion and reject missing or
+    /// deleting accounts, invalid database values and storage failures.
+    /// Stores without a transactional implementation fail closed.
+    fn upsert_private_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        expires_at: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async move {
+            let _ = (user_id, session_id, expires_at);
+            Err(StoreError)
+        }
+    }
     fn user_by_email(
         &self,
         email: &str,
@@ -947,10 +998,11 @@ pub trait Store {
             Err(StoreError)
         }
     }
-    /// Derivation metadata for one (user, track) pair
-    /// (`meter_sink::track_meter_meta_statement`); unknown or
-    /// non-UUID tracks resolve to the all-`None` meta (the fallback
-    /// rung), never an error — only a store failure errors. Default
+    /// Derivation metadata for one user and local track ID or recording MBID
+    /// (app and mirror metadata statements in `meter_sink`). Exact local IDs
+    /// take precedence; ambiguous recording matches suppress artifact fields.
+    /// A recording without an artifact can still resolve in the mirror. Unknown
+    /// or non-UUID IDs resolve to all-`None`; store failures still error. Default
     /// `Err` fails closed like [`Store::live_subscription`] (the sink
     /// answers 500 and the DO retries; nothing meters on a guess).
     fn track_meter_meta(
@@ -1157,7 +1209,16 @@ pub trait Store {
             self.revoke_session(id).await.map(|_| true)
         }
     }
-    fn revoke_all_sessions(&self, user_id: &str) -> impl Future<Output = Result<(), StoreError>>;
+    /// Atomically revoke all sessions, native and compatibility credentials for
+    /// one owner. Returns the number of newly revoked native credentials,
+    /// preserving timestamps on already revoked rows. An empty owner revokes
+    /// nothing. Must serialize with issuance on both surfaces; composing
+    /// independent writes is not valid.
+    fn revoke_sessions_and_native_credentials(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>>;
     /// Whether the user's account is fenced for deletion
     /// (`users.deleting_at IS NOT NULL`, ADR 0002 rule 3). Handlers use
     /// it only to classify a fenced write's failure as the typed 409
@@ -1170,15 +1231,13 @@ pub trait Store {
     }
     /// Whether the account was ever admitted past signup: it holds a
     /// passkey credential, a session row (current or revoked — a
-    /// completed sign-in leaves one), or a provider vault, or it
-    /// carries a non-member role (promotion is an admission act; the
-    /// reaper's `unverified_user_filter` protects the same states).
+    /// completed sign-in leaves one), the legacy vault marker, or a
+    /// non-member role; the reaper protects these same states.
     /// The magic-finish invite gate refuses only accounts for which
     /// this is false — a never-admitted signup in progress — so
     /// established magic-only members keep signing in after
     /// `INVITES_REQUIRED` flips. The default checks credentials only;
-    /// production and the test fake override it with the full legacy
-    /// predicate (sessions, role and remaining encrypted rows included).
+    /// production and the test fake override it with the full predicate.
     fn account_admitted(&self, user_id: &str) -> impl Future<Output = Result<bool, StoreError>> {
         async move { Ok(!self.credentials_for_user(user_id).await?.is_empty()) }
     }
@@ -1264,11 +1323,12 @@ pub trait Store {
         async move { Ok(()) }
     }
     /// The reconciliation input for one user: bound Stripe customer, live
-    /// subscription row, and the full `plan_prices` map. Default `Err`
-    /// (fail closed): without local state nothing advances.
+    /// or explicitly targeted subscription row, and the full `plan_prices`
+    /// map. Default `Err` (fail closed): without local state nothing advances.
     fn load_reconcile_input(
         &self,
         _user_id: &str,
+        _target_subscription_id: Option<&str>,
     ) -> impl Future<Output = Result<crate::billing_reconcile::ReconcileInput, StoreError>> {
         async move { Err(StoreError) }
     }
@@ -1434,13 +1494,50 @@ pub trait Store {
     ) -> impl Future<Output = Result<AdminInviteRevokeOutcome, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Compatibility lifecycle is native-session-only. Implementations must
+    /// fence the live owner and commit before returning success; false means
+    /// no insert (deleting owner or active-credential limit). The default
+    /// cannot mint, list invented data, or claim a successful revocation.
+    fn insert_subsonic_credential(
+        &self,
+        _row: &crate::subsonic_lifecycle::PreparedCredential,
+        _session: &SessionClaims,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn subsonic_credentials_for_user(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError>>
+    {
+        async { Err(StoreError) }
+    }
+    fn revoke_subsonic_credential(
+        &self,
+        _id: &str,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Stores that enable compatibility issuance must include it in recovery.
+    /// The default is safe only because default issuance always refuses.
+    fn revoke_all_subsonic_credentials(
+        &self,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>> {
+        async { Ok(0) }
+    }
     /// Persist a freshly issued native REST credential row (migration
-    /// 0019). Fail-closed default (`Err`) so an unprovisioned store can
-    /// never report a mint it did not durably record; production and the
-    /// test fake override it.
+    /// 0019) only while the issuing session is still live and belongs to the
+    /// credential owner. The check and insert must serialize with session
+    /// revocation and retain the account-deletion fence through commit.
+    /// Fail-closed default: an unprovisioned store never reports a mint.
     fn insert_native_credential(
         &self,
         _row: &NativeCredentialRow,
+        _session_id: &str,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Err(StoreError) }
     }
@@ -1479,19 +1576,6 @@ pub trait Store {
     ) -> impl Future<Output = Result<bool, StoreError>> {
         async { Ok(false) }
     }
-    /// Bulk revoke for the recovery/revoke-all path (ADR 0010: the
-    /// session-compromise response revokes every unrevoked row alongside
-    /// the sessions): transitions each live row for `user_id`, stamps the
-    /// transition with the store's wall-clock `now`, and returns how many
-    /// transitioned. An empty user id revokes nothing. Fail-closed
-    /// default is `0`; production and the test fake override it.
-    fn revoke_all_native_credentials(
-        &self,
-        _user_id: &str,
-        _now: u64,
-    ) -> impl Future<Output = Result<u64, StoreError>> {
-        async { Ok(0) }
-    }
     /// Best-effort successful-use accounting (`last_used_at`): called by
     /// the bearer gate after authorization, its outcome never changes the
     /// decision (like `audit`). Default no-op keeps out-of-tree `Store`
@@ -1502,6 +1586,108 @@ pub trait Store {
         _now: u64,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async { Ok(()) }
+    }
+    /// Delete only the specified owner's session; an absent session is harmless.
+    fn delete_private_session(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Read a resolved target exactly, including expired snoozes. Callers must
+    /// canonicalize known MBIDs and preserve opaque job IDs, including UUID-shaped
+    /// ones. Presentation filters expired snoozes.
+    fn taste_get(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<Option<crate::preference_rows::TasteDbRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Read metered public history for the authenticated owner. Callers must
+    /// retain the deleting-account read fence before invoking this inert method.
+    fn history_list(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::preference_rows::HistoryDbRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// List taste for the owner. Callers must retain the deleting-account read fence.
+    fn taste_list(
+        &self,
+        _user_id: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<Vec<crate::preference_rows::TasteDbRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// List bounded collections for the authenticated owner; handlers must retain
+    /// the deleting-account read fence before calling these inert methods.
+    fn likes_list(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::preference_rows::TasteDbRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Write a resolved identity using server-supplied owner and time. Missing or
+    /// deleting accounts and storage failures return an error, never success.
+    fn taste_upsert(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+        _signal: crate::taste_signal::TasteSignal,
+        _snooze_until: Option<u64>,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::preference_rows::TasteDbRow, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Add or convert a resolved like under the deletion fence. Return false only
+    /// when it was already a love at write time; that replay leaves the row untouched.
+    fn import_like(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Delete only love, or any signal respectively. Missing accounts fail closed.
+    fn like_delete(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn taste_delete(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Probe own-or-shared membership. Tracks retain the original spelling;
+    /// release targets are canonicalized before binding. Unsupported stores fail closed.
+    fn catalogue_member_target(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Resolve an owned or shared track, preferring an exact opaque job ID.
+    fn resolve_member_track(
+        &self,
+        _user_id: &str,
+        _target: &str,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> {
+        async { Err(StoreError) }
     }
     /// Catalogue slice-1 reads: the per-user ingest library plus
     /// the shared mirror collections. Read-only: implementations must not
@@ -1695,6 +1881,544 @@ fn account_deleting_response() -> Response {
     }
 }
 
+// The deletion probe is a precheck, not a substitute for a transactional fence.
+async fn preference_authenticate<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    mutation: bool,
+) -> Result<(SessionClaims, String), Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if req.authorization.is_some() {
+        return Err(not_found());
+    }
+    let pair = ctx.authenticate(req, mutation).await?;
+    match ctx.store.account_deleting(&pair.0.user_id).await {
+        Ok(false) => Ok(pair),
+        Ok(true) => Err(account_deleting_response()),
+        Err(_) => Err(unavailable()),
+    }
+}
+
+// Adapted from PR #982. Serialize with privacy-aware new-play acquisition.
+async fn me_private_session<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    const TTL_SECS: u64 = 21_600;
+    // Fits the signed epoch column and its tighter CHECK in migration 0041.
+    const MAX_EXPIRY: u64 = 253_402_300_799;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        session_id: String,
+        enabled: bool,
+    }
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let invalid = || validation_failed("invalid private session request");
+    // Serde structs also accept positional arrays without this object check.
+    if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+        return invalid();
+    }
+    let Some(body) = parse_body::<Body>(req) else {
+        return invalid();
+    };
+    let session_id = body.session_id;
+    // The private-session writers bind the ID as PostgreSQL TEXT.
+    if !valid_client_session_id(&session_id) || session_id.contains('\0') {
+        return invalid();
+    }
+
+    let owner = &claims.user_id;
+    let result = if body.enabled {
+        let Some(expiry) = ctx.now.checked_add(TTL_SECS).filter(|&t| t <= MAX_EXPIRY) else {
+            return unavailable();
+        };
+        ctx.store
+            .upsert_private_session(owner, &session_id, expiry)
+            .await
+            .map(|()| Some(expiry))
+    } else {
+        ctx.store
+            .delete_private_session(owner, &session_id)
+            .await
+            .map(|()| None)
+    };
+    match result {
+        Ok(private_until) => json_response(
+            200,
+            serde_json::json!({"session_id": session_id, "private_until": private_until}),
+        ),
+        Err(_) if matches!(ctx.store.account_deleting(owner).await, Ok(true)) => {
+            account_deleting_response()
+        }
+        Err(_) => unavailable(),
+    }
+}
+
+// Adapted from the preference collection handler in PR #982.
+async fn me_likes_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = match preference_authenticate(ctx, req, false).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match ctx.store.likes_list(&claims.user_id).await {
+        Ok(rows) => {
+            let items: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "kind": row.kind,
+                        "target_id": row.target_id,
+                        "created_at": row.created_at,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({"items": items}))
+        }
+        Err(_) => unavailable(),
+    }
+}
+
+async fn me_taste_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = match preference_authenticate(ctx, req, false).await {
+        Ok(pair) => pair,
+        // Keep the preference contract's envelope without changing legacy session routes.
+        Err(resp) if resp.status == 401 => {
+            let error = crate::api_error::ApiError::unauthorized("authentication required");
+            return Response {
+                body: error.body_json(),
+                ..resp
+            };
+        }
+        Err(resp) => return resp,
+    };
+    match ctx.store.taste_list(&claims.user_id, ctx.now).await {
+        Ok(rows) => {
+            let items: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "kind": row.kind,
+                        "target_id": row.target_id,
+                        "signal": row.signal,
+                        "until": row.snooze_until,
+                        "updated_at": row.updated_at,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({"items": items}))
+        }
+        Err(_) => unavailable(),
+    }
+}
+
+async fn me_history_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = match preference_authenticate(ctx, req, false).await {
+        Ok(pair) => pair,
+        // Keep the preference contract's envelope without changing legacy session routes.
+        Err(resp) if resp.status == 401 => {
+            let error = crate::api_error::ApiError::unauthorized("authentication required");
+            return Response {
+                body: error.body_json(),
+                ..resp
+            };
+        }
+        Err(resp) if resp.status == 500 => {
+            let error = crate::api_error::ApiError::internal_error("unexpected error");
+            return Response {
+                body: error.body_json(),
+                ..resp
+            };
+        }
+        Err(resp) => return resp,
+    };
+    match ctx.store.history_list(&claims.user_id).await {
+        Ok(rows) => {
+            let items: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "play_id": row.play_id,
+                        "track_id": row.track_id,
+                        "played_at": row.played_at,
+                        "stream_seconds": row.stream_seconds,
+                    })
+                })
+                .collect();
+            json_response(200, serde_json::json!({"items": items}))
+        }
+        Err(_) => unavailable(),
+    }
+}
+
+async fn me_like_track<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    target: &str,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{valid_target_id, TargetKind};
+    use crate::taste_signal::TasteSignal;
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if !valid_target_id(target) {
+        return not_found();
+    }
+    let target = match ctx
+        .store
+        .resolve_member_track(&claims.user_id, target)
+        .await
+    {
+        Ok(Some(target)) => target,
+        Ok(None) => return not_found(),
+        Err(_) => return unavailable(),
+    };
+    match ctx
+        .store
+        .taste_upsert(
+            &claims.user_id,
+            TargetKind::Track,
+            &target,
+            TasteSignal::Love,
+            None,
+            ctx.now,
+        )
+        .await
+    {
+        Ok(row) => json_response(
+            200,
+            serde_json::json!({"target_id": target, "liked_at": row.created_at}),
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
+async fn me_unlike_track<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    target: &str,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{valid_target_id, TargetKind};
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if !valid_target_id(target) {
+        return not_found();
+    }
+    let target = match ctx
+        .store
+        .resolve_member_track(&claims.user_id, target)
+        .await
+    {
+        Ok(Some(target)) => target,
+        Ok(None) => return not_found(),
+        Err(_) => return unavailable(),
+    };
+    match ctx
+        .store
+        .like_delete(&claims.user_id, TargetKind::Track, &target)
+        .await
+    {
+        Ok(_) => json_response(
+            200,
+            serde_json::json!({"target_id": target, "liked": false}),
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
+// Adapted from PR #982.
+async fn me_likes_import<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{canonical_target_id, valid_target_id, TargetKind};
+    use serde::de::{value::MapAccessDeserializer, MapAccess, Visitor};
+    use std::{fmt, marker::PhantomData};
+
+    // Serde's derived structs also accept positional arrays. Require maps
+    // without losing the derived checks for duplicate and unknown fields.
+    struct Object<T>(T);
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct ObjectVisitor<T>(PhantomData<T>);
+            impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+                type Value = Object<T>;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                    T::deserialize(MapAccessDeserializer::new(map)).map(Object)
+                }
+            }
+            d.deserialize_map(ObjectVisitor(PhantomData))
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        items: Vec<Object<Item>>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Item {
+        kind: String,
+        target_id: String,
+    }
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let Some(Object(Body { items })) = parse_body(req) else {
+        return validation_failed("invalid likes import body");
+    };
+    if items.len() > 500 {
+        return validation_failed("too many likes import items");
+    }
+
+    let owner = &claims.user_id;
+    let (mut added, mut already) = (0, 0);
+    let mut rejected = Vec::new();
+    for Object(Item { kind, target_id }) in items {
+        let mut reject = |reason| {
+            rejected.push(serde_json::json!({
+                "target_id": target_id.chars().take(64).collect::<String>(), "reason": reason,
+            }));
+        };
+        let kind = match TargetKind::parse(&kind) {
+            Some(TargetKind::Track) if valid_target_id(&target_id) => TargetKind::Track,
+            Some(TargetKind::Release) if crate::catalogue::is_catalogue_mbid(&target_id) => {
+                TargetKind::Release
+            }
+            _ => {
+                reject("invalid");
+                continue;
+            }
+        };
+        let target = match kind {
+            TargetKind::Track => ctx.store.resolve_member_track(owner, &target_id).await,
+            TargetKind::Release => {
+                let target = canonical_target_id(&target_id);
+                ctx.store
+                    .catalogue_member_target(owner, kind, &target)
+                    .await
+                    .map(|member| member.then_some(target))
+            }
+        };
+        let target = match target {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                reject("not_member");
+                continue;
+            }
+            Err(_) => return unavailable(),
+        };
+        match ctx.store.import_like(owner, kind, &target, ctx.now).await {
+            Ok(true) => added += 1,
+            Ok(false) => already += 1,
+            Err(_) => return unavailable(),
+        }
+    }
+    json_response(
+        200,
+        serde_json::json!({"added": added, "already": already, "rejected": rejected}),
+    )
+}
+
+async fn me_taste_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{canonical_target_id, valid_target_id, TargetKind};
+    use crate::taste_signal::{valid_snooze_seconds, TasteSignal};
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        kind: String,
+        target_id: String,
+        signal: String,
+        #[serde(default, deserialize_with = "present_seconds")]
+        snooze_seconds: Option<u64>,
+    }
+    // Distinguish omission from explicit null, which is never a duration.
+    fn present_seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        u64::deserialize(d).map(Some)
+    }
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let invalid = || validation_failed("invalid taste signal request");
+    // Serde structs can also deserialize from arrays; require an object here.
+    if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+        return invalid();
+    }
+    let Some(body) = parse_body::<Body>(req) else {
+        return invalid();
+    };
+    let (Some(kind), Some(signal)) = (
+        TargetKind::parse(&body.kind),
+        TasteSignal::parse(&body.signal),
+    ) else {
+        return invalid();
+    };
+    let until = match (signal, body.snooze_seconds) {
+        (TasteSignal::Snooze, Some(seconds)) if valid_snooze_seconds(seconds) => {
+            let Some(expiry) = ctx.now.checked_add(seconds) else {
+                return unavailable();
+            };
+            Some(expiry)
+        }
+        (TasteSignal::Snooze, _) | (_, Some(_)) => return invalid(),
+        (_, None) => None,
+    };
+    let owner = &claims.user_id;
+    let target = match kind {
+        TargetKind::Track if valid_target_id(&body.target_id) => {
+            ctx.store.resolve_member_track(owner, &body.target_id).await
+        }
+        TargetKind::Release if crate::catalogue::is_catalogue_mbid(&body.target_id) => {
+            let target = canonical_target_id(&body.target_id);
+            ctx.store
+                .catalogue_member_target(owner, kind, &target)
+                .await
+                .map(|member| member.then_some(target))
+        }
+        _ => return not_found(),
+    };
+    let target = match target {
+        Ok(Some(target)) => target,
+        Ok(None) => return not_found(),
+        Err(_) => return unavailable(),
+    };
+    match ctx
+        .store
+        .taste_upsert(owner, kind, &target, signal, until, ctx.now)
+        .await
+    {
+        Ok(row) => json_response(
+            200,
+            serde_json::json!({
+                "kind": row.kind, "target_id": row.target_id, "signal": row.signal, "until": row.snooze_until,
+            }),
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
+async fn me_taste_clear<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{canonical_target_id, valid_target_id, TargetKind};
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        kind: String,
+        target_id: String,
+    }
+
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    // Serde structs can also deserialize positional arrays; require an object.
+    if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+        return validation_failed("invalid taste clear body");
+    }
+    let Ok(Body { kind, target_id }) = serde_json::from_slice(&req.body) else {
+        return validation_failed("invalid taste clear body");
+    };
+    let Some(kind) = TargetKind::parse(&kind) else {
+        return validation_failed("invalid taste clear body");
+    };
+    let owner = &claims.user_id;
+    if !valid_target_id(&target_id) {
+        return not_found();
+    }
+    let member = match kind {
+        TargetKind::Track => ctx.store.resolve_member_track(owner, &target_id).await,
+        TargetKind::Release if crate::catalogue::is_catalogue_mbid(&target_id) => {
+            let target = canonical_target_id(&target_id);
+            ctx.store
+                .catalogue_member_target(owner, kind, &target)
+                .await
+                .map(|member| member.then_some(target))
+        }
+        TargetKind::Release => return not_found(),
+    };
+    let target = match member {
+        Ok(Some(target)) => target,
+        Ok(None) => return not_found(),
+        Err(_) => return unavailable(),
+    };
+    match ctx.store.taste_delete(owner, kind, &target).await {
+        Ok(cleared) => json_response(200, serde_json::json!({"cleared": cleared})),
+        Err(_) => unavailable(),
+    }
+}
+
 fn internal() -> Response {
     json_response(500, serde_json::json!({"error": "internal error"}))
 }
@@ -1775,7 +2499,7 @@ fn is_example_test_mailbox(email: &str) -> bool {
 
 /// Constant-time bearer comparison for the seam route. Length mismatch
 /// rejects without comparing (only the length leaks, never content).
-fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
+pub(crate) fn qa_bearer_ok(presented: Option<&str>, expected: &str) -> bool {
     match presented {
         Some(candidate) => {
             let a = candidate.as_bytes();
@@ -1873,8 +2597,6 @@ fn email_rate_limit_key(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "email-rate-limit", email, 0, 32)
 }
 
-/// Stand-in user id for register/start taken-email shapes, shaped like
-/// the real 16-byte random user ids and stable per email.
 fn valid_challenge_id(value: &str) -> bool {
     value.len() == 43
         && value
@@ -1882,6 +2604,9 @@ fn valid_challenge_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+/// Public register/start user handle, stable per normalized email and
+/// independent of stored account state. Internal user ids stay server-side;
+/// register/finish resolves enrollment through the stored challenge instead.
 fn fake_user_id(cfg: &Config, email: &str) -> String {
     fake_id(cfg, "fake-user", email, 0, 16)
 }
@@ -2460,12 +3185,12 @@ where
         Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
         Err(_) => return internal(),
     };
-    let shape = |user_id: String| {
+    let shape = || {
         json_response(
             200,
             serde_json::json!({
                 "challenge": challenge.id.clone(),
-                "user_id": user_id,
+                "user_id": fake_user_id(ctx.cfg, &email),
                 "rp_id": ctx.cfg.rp_id,
             }),
         )
@@ -2512,7 +3237,7 @@ where
                     // Unstored challenge + deterministic stand-in user id:
                     // same shape on every call, no row growth, finish
                     // fails generically at lookup.
-                    return shape(fake_user_id(ctx.cfg, &email));
+                    return shape();
                 }
                 Err(_) => return internal(),
             }
@@ -2533,7 +3258,7 @@ where
                 Ok(()) => user,
                 // Unique-email race: another request just claimed the row,
                 // indistinguishable from a taken account by design.
-                Err(_) => return shape(fake_user_id(ctx.cfg, &email)),
+                Err(_) => return shape(),
             }
         }
     };
@@ -2552,7 +3277,7 @@ where
         .unwrap_or(false);
     ctx.audit(&user.id, "auth.register_start", admitted).await;
     if !admitted {
-        return shape(user.id.clone());
+        return shape();
     }
     // Challenge insert plus concurrent-reap healing. With the migration
     // 0006 FK (`auth_challenges.user_id -> users(id)`) a concurrent reap
@@ -2573,7 +3298,7 @@ where
                     created_at: ctx.now,
                 };
                 if ctx.store.insert_user(&healed).await.is_err() {
-                    return shape(fake_user_id(ctx.cfg, &email));
+                    return shape();
                 }
                 if ctx
                     .store
@@ -2596,7 +3321,7 @@ where
                     created_at: ctx.now,
                 };
                 if ctx.store.insert_user(&healed).await.is_err() {
-                    return shape(fake_user_id(ctx.cfg, &email));
+                    return shape();
                 }
                 match ctx.store.challenge_by_id(&challenge.id).await {
                     Ok(Some(row))
@@ -2621,7 +3346,7 @@ where
                 }
             }
             Ok(Some(_)) => {
-                return shape(fake_user_id(ctx.cfg, &email));
+                return shape();
             }
             Err(_) => return internal(),
         }
@@ -2629,7 +3354,7 @@ where
     // Email-ownership proof and magic login share one atomic per-email
     // issuance budget, so parallel requests cannot oversend.
     ctx.send_magic_link_if_allowed(req, &user.id, &email).await;
-    shape(user.id.clone())
+    shape()
 }
 
 async fn register_finish<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -3360,8 +4085,8 @@ where
     // would complete a signup with no invite consumed. Refuse
     // generically WITHOUT spending the token, so the legitimate
     // enrollment at register/finish can still use it. "Never
-    // admitted" is the full reaper-protected predicate (no
-    // credential AND no prior session AND no vault AND member role),
+    // admitted" means no credential, no prior session, no legacy
+    // vault marker, and member role,
     // NOT mere credential-lessness: magic-only accounts are an
     // established state, and gating on credentials alone would lock
     // those members out the moment invites flip on, with
@@ -3622,30 +4347,17 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    // ADR 0010 session-compromise response: the same event revokes every
-    // unrevoked native REST credential alongside the sessions. Native
-    // credentials go first: if the session sweep then fails, the caller
-    // keeps a valid session and can retry, while already-revoked bearer
-    // keys fail closed. The reverse order would strand live bearer keys
-    // behind dead sessions with no retry path. The two sweeps are
-    // separate store calls (no cross-table transaction), so a failure
-    // between them returns 500 and the caller retries the whole event.
+    // ADR 0010: one committed event covers both sessions and credentials.
+    // On failure neither sweep commits; retain the cookie so the caller can
+    // retry. Audit success only after the store reports the committed result.
     let revoked_native = match ctx
         .store
-        .revoke_all_native_credentials(&claims.user_id, ctx.now)
+        .revoke_sessions_and_native_credentials(&claims.user_id, ctx.now)
         .await
     {
         Ok(revoked) => revoked,
         Err(_) => return internal(),
     };
-    if ctx
-        .store
-        .revoke_all_sessions(&claims.user_id)
-        .await
-        .is_err()
-    {
-        return internal();
-    }
     ctx.audit(&claims.user_id, "session.revoke_all", true).await;
     if revoked_native > 0 {
         ctx.audit(&claims.user_id, "native_credentials_revoked_all", true)
@@ -4018,6 +4730,9 @@ where
     }
 }
 
+#[path = "subsonic_handlers.rs"]
+mod subsonic_handlers;
+
 // --- Native REST credentials (ADR 0010) ------------------------------------------------------
 //
 // Session-authenticated issuance surface only: `POST /v1/credentials`
@@ -4168,7 +4883,12 @@ where
         created_from_ip: ctx.source_ip.clone(),
         last_used_at: None,
     };
-    if ctx.store.insert_native_credential(&row).await.is_err() {
+    if ctx
+        .store
+        .insert_native_credential(&row, &claims.session_id)
+        .await
+        .is_err()
+    {
         // A fenced insert (account being deleted) is the typed 409,
         // never the generic 500; anything else stays generic so a probe
         // failure cannot leak a new shape. Mirrors `vault_put` (ADR 0002
@@ -5368,21 +6088,21 @@ where
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PlayIssueBody {
-    track_id: String,
+pub(crate) struct PlayIssueBody {
+    pub(crate) track_id: String,
     /// Client-generated playback session id (per tab/device): the lease
     /// holder name. Distinct from the account session cookie — two
     /// signed-in devices share one account but hold different holders.
-    session_id: String,
+    pub(crate) session_id: String,
     /// Continuation key only: present when refreshing a grant for the
     /// caller's own current play. Never accepted as a fresh play id —
     /// new starts always mint one server-side, so a replay cannot be
     /// under-metered by reusing an old id.
-    play_id: Option<String>,
+    pub(crate) play_id: Option<String>,
     /// Explicit "play here instead": take the lease from the other
     /// session now rather than waiting out its TTL.
     #[serde(default)]
-    takeover: bool,
+    pub(crate) takeover: bool,
 }
 
 #[derive(Deserialize)]
@@ -5421,12 +6141,33 @@ fn subscription_refusal(refusal: crate::playback::SubscriptionRefusal) -> Respon
     }
 }
 
-/// Mint the grant for an already-acquired lease hold and render the
-/// issuance body. The minter re-checks the identity field rule, so an
-/// unmeterable identity still cannot mint even though the handler
-/// validated earlier; `NotConfigured` is unreachable after the
-/// up-front secret check but stays a fail-closed 500, never a token.
-fn play_grant_response(
+/// Internal issuance result, deliberately not Debug: it contains a bearer
+/// grant. Only the native HTTP adapter serializes it; other surfaces can
+/// forward the grant privately without parsing or exposing a JSON response.
+pub(crate) struct IssuedPlay {
+    pub(crate) grant: crate::play_grant::IssuedGrant,
+    pub(crate) play_id: String,
+    pub(crate) lease_epoch: u64,
+    pub(crate) lease_expires_at: u64,
+}
+
+impl IssuedPlay {
+    fn into_response(self) -> Response {
+        json_response(
+            200,
+            serde_json::json!({
+                "grant": self.grant.token,
+                "play_id": self.play_id,
+                "lease_epoch": self.lease_epoch,
+                "expires_at": self.grant.exp_unix,
+                "lease_expires_at": self.lease_expires_at,
+                "heartbeat_interval_secs": crate::playback::HEARTBEAT_INTERVAL_SECS,
+            }),
+        )
+    }
+}
+
+fn mint_play(
     secret: &[u8],
     user_id: &str,
     track_id: &str,
@@ -5434,7 +6175,7 @@ fn play_grant_response(
     epoch: u64,
     now: u64,
     lease_expires_at: u64,
-) -> Response {
+) -> Result<IssuedPlay, Response> {
     match crate::play_grant::issue_v2_at(
         user_id,
         track_id,
@@ -5444,19 +6185,16 @@ fn play_grant_response(
         crate::play_grant::MAX_GRANT_TTL,
         Some(secret),
     ) {
-        Ok(issued) => json_response(
-            200,
-            serde_json::json!({
-                "grant": issued.token,
-                "play_id": play_id,
-                "lease_epoch": epoch,
-                "expires_at": issued.exp_unix,
-                "lease_expires_at": lease_expires_at,
-                "heartbeat_interval_secs": crate::playback::HEARTBEAT_INTERVAL_SECS,
-            }),
-        ),
-        Err(crate::play_grant::MintError::NotConfigured) => internal(),
-        Err(crate::play_grant::MintError::InvalidIdentity) => validation_failed("invalid request"),
+        Ok(grant) => Ok(IssuedPlay {
+            grant,
+            play_id: play_id.to_string(),
+            lease_epoch: epoch,
+            lease_expires_at,
+        }),
+        Err(crate::play_grant::MintError::NotConfigured) => Err(internal()),
+        Err(crate::play_grant::MintError::InvalidIdentity) => {
+            Err(validation_failed("invalid request"))
+        }
     }
 }
 
@@ -5471,11 +6209,34 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    match issue_play_for_user(ctx, &claims.user_id, parse_body::<PlayIssueBody>(req)).await {
+        Ok(issued) => issued.into_response(),
+        Err(response) => response,
+    }
+}
+
+/// Shared issuance after surface-specific authentication. This is not an
+/// authorizer: callers supply only their authenticated user's id and must
+/// enforce that surface's catalogue/source access before requesting a grant.
+/// It accepts no HTTP credentials and creates no account session. Keep the
+/// typed grant internal; compatibility forwarding must use a private header,
+/// never serialize a native grant into a compatibility response or URL.
+pub(crate) async fn issue_play_for_user<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    body: Option<PlayIssueBody>,
+) -> Result<IssuedPlay, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
     // The lease writers are fenced on `deleting_at` (ADR 0002 rule 3);
     // answer the typed 409 up front rather than a lease 429/500 after
     // the fence refuses the write.
-    if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
-        return account_deleting_response();
+    if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) {
+        return Err(account_deleting_response());
     }
     // An unprovisioned (or too-short) secret fails closed before any
     // lease write: an unmintable grant must never burn a lease epoch or
@@ -5486,26 +6247,25 @@ where
         .as_deref()
         .filter(|secret| secret.len() >= crate::play_grant::MIN_SECRET_BYTES)
     else {
-        return internal();
+        return Err(internal());
     };
-    let Some(body) = parse_body::<PlayIssueBody>(req) else {
-        return validation_failed("invalid request");
+    let Some(body) = body else {
+        return Err(validation_failed("invalid request"));
     };
     if !valid_client_session_id(&body.session_id) {
-        return validation_failed("invalid session_id");
+        return Err(validation_failed("invalid session_id"));
     }
     // The track id must be meterable before any lease write: the
     // ledger field rule is the single authority (probed with a
     // placeholder play id — the same probe the minter runs with the
     // real one). User ids are server-generated; an unmeterable one
     // fails this same check rather than minting an unbillable grant.
-    if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, "play").is_err()
-    {
-        return validation_failed("invalid track_id");
+    if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, "play").is_err() {
+        return Err(validation_failed("invalid track_id"));
     }
-    let lease = match ctx.store.playback_lease(&claims.user_id).await {
+    let lease = match ctx.store.playback_lease(user_id).await {
         Ok(row) => row,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     // Continuation: the same client session refreshing the grant for
     // its own current play (seek/resume/refresh ahead of grant
@@ -5517,16 +6277,15 @@ where
     // simply a new start through the gates below.
     if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
         if row.is_continuation(&body.session_id, play_id, &body.track_id) {
-            if crate::ledger::derive_play_idempotency_key(&claims.user_id, &body.track_id, play_id)
-                .is_err()
+            if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, play_id).is_err()
             {
-                return validation_failed("invalid play_id");
+                return Err(validation_failed("invalid play_id"));
             }
             let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
             match ctx
                 .store
                 .touch_playback_lease(
-                    &claims.user_id,
+                    user_id,
                     &body.session_id,
                     play_id,
                     row.epoch,
@@ -5536,9 +6295,9 @@ where
                 .await
             {
                 Ok(true) => {
-                    return play_grant_response(
+                    return mint_play(
                         secret,
-                        &claims.user_id,
+                        user_id,
                         &body.track_id,
                         play_id,
                         row.epoch,
@@ -5547,29 +6306,29 @@ where
                     );
                 }
                 Ok(false) => {}
-                Err(_) => return internal(),
+                Err(_) => return Err(internal()),
             }
         }
     }
     // New start, gate 1: subscription. `now` saturates into i64 rather
     // than wrapping — an absurd clock reads as far-future (closed),
     // never as the distant past (entitled forever).
-    let subscription = match ctx.store.live_subscription(&claims.user_id).await {
+    let subscription = match ctx.store.live_subscription(user_id).await {
         Ok(row) => row,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     let effective = crate::billing::resolve_effective_plan(
         subscription.as_ref().map(|row| row.as_view()),
         i64::try_from(ctx.now).unwrap_or(i64::MAX),
     );
     if !effective.entitled {
-        let ever_paid = match ctx.store.ever_subscribed(&claims.user_id).await {
+        let ever_paid = match ctx.store.ever_subscribed(user_id).await {
             Ok(ever) => ever,
-            Err(_) => return internal(),
+            Err(_) => return Err(internal()),
         };
         let refusal = crate::playback::subscription_refusal(&effective, ever_paid)
             .expect("an unentitled effective plan always refuses");
-        return subscription_refusal(refusal);
+        return Err(subscription_refusal(refusal));
     }
     // Caps are plan DATA from the `plans` row; a missing row fails
     // closed to the reserved `free` caps (0 h) — the 402 below, never
@@ -5577,32 +6336,34 @@ where
     let caps = match ctx.store.plan_caps(effective.plan.as_str()).await {
         Ok(Some(caps)) => caps,
         Ok(None) => crate::plan_limits::PlanId::Free.caps(),
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     // Gate 2: the monthly hour cap. An unreadable meter refuses the
     // new start (store default `Err`) rather than reading as zero.
     let period_month = crate::ledger::period_month_for_timestamp(ctx.now);
     let used_seconds = match ctx
         .store
-        .monthly_stream_seconds(&claims.user_id, &period_month)
+        .monthly_stream_seconds(user_id, &period_month)
         .await
     {
         Ok(seconds) => seconds,
-        Err(_) => return internal(),
+        Err(_) => return Err(internal()),
     };
     if let Some(denial) =
         crate::plan_limits::check_stream_hours_with_caps(&caps, used_seconds).denial()
     {
-        return plan_limit_refusal(denial);
+        return Err(plan_limit_refusal(denial));
     }
     // A zero concurrency allowance refuses with the lease 429 wire and
     // the static retry: no lease exists to wait on. Allowances above
     // one are still enforced as one — the lease table holds a single
     // row per user by design (every seeded plan allows exactly one).
     if caps.max_concurrent_streams == 0 {
-        return plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
-            &caps,
-            crate::plan_limits::CONCURRENT_RETRY_AFTER_SECS,
+        return Err(plan_limit_refusal(
+            crate::plan_limits::deny_concurrent_lease(
+                &caps,
+                crate::plan_limits::CONCURRENT_RETRY_AFTER_SECS,
+            ),
         ));
     }
     // Gate 3: the lease. The play id is minted here, never taken from
@@ -5611,13 +6372,13 @@ where
     // store; `Held` is the other-session 429 with the live TTL.
     let play_id = match random_id::<16>() {
         Ok(id) => id,
-        Err(_) => return unavailable(),
+        Err(_) => return Err(unavailable()),
     };
     let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
     match ctx
         .store
         .acquire_playback_lease(
-            &claims.user_id,
+            user_id,
             &body.session_id,
             &body.track_id,
             &play_id,
@@ -5627,30 +6388,25 @@ where
         )
         .await
     {
-        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => play_grant_response(
+        Ok(crate::playback::LeaseAcquire::Acquired { epoch }) => mint_play(
             secret,
-            &claims.user_id,
+            user_id,
             &body.track_id,
             &play_id,
             epoch,
             ctx.now,
             lease_expires_at,
         ),
-        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => {
-            // Zero rows back can also mean the deletion fence closed
-            // after the up-front check (the marker landed mid-request):
-            // re-read it so that race answers the typed 409, not a
-            // concurrent-streams 429.
-            if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
-                account_deleting_response()
-            } else {
-                plan_limit_refusal(crate::plan_limits::deny_concurrent_lease(
-                    &caps,
-                    retry_after_secs,
-                ))
-            }
+        // Preserve the typed 409 when deletion wins after the first check.
+        Ok(crate::playback::LeaseAcquire::Held { .. }) | Err(_)
+            if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) =>
+        {
+            Err(account_deleting_response())
         }
-        Err(_) => internal(),
+        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => Err(plan_limit_refusal(
+            crate::plan_limits::deny_concurrent_lease(&caps, retry_after_secs),
+        )),
+        Err(_) => Err(unavailable()),
     }
 }
 
@@ -5906,7 +6662,7 @@ where
         .map_err(|_| ())?;
     let input = ctx
         .store
-        .load_reconcile_input(user_id)
+        .load_reconcile_input(user_id, None)
         .await
         .map_err(|_| ())?;
     let listed = ctx
@@ -6257,7 +7013,7 @@ where
 {
     let fresh = ctx
         .store
-        .load_reconcile_input(user_id)
+        .load_reconcile_input(user_id, None)
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?
         .stripe_customer_id;
@@ -6498,7 +7254,7 @@ where
 {
     let input = ctx
         .store
-        .load_reconcile_input(user_id)
+        .load_reconcile_input(user_id, None)
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
     // Plan ids come only from `plan_prices`: an unmapped, unselectable,
@@ -6760,7 +7516,7 @@ where
 {
     Ok(ctx
         .store
-        .load_reconcile_input(user_id)
+        .load_reconcile_input(user_id, None)
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?
         .stripe_customer_id)
@@ -6838,9 +7594,15 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/plays"
             | "/v1/plays/heartbeat"
             | "/v1/credentials"
+            | "/v1/subsonic-credentials"
             | "/v1/plans"
             | "/v1/me/usage"
             | "/v1/me/subscription"
+            | "/v1/me/likes"
+            | "/v1/me/likes/import"
+            | "/v1/me/taste"
+            | "/v1/me/history"
+            | "/v1/me/private-session"
             | "/v1/library"
             | "/api/library"
             | "/v1/artists"
@@ -6876,6 +7638,9 @@ fn options_preflight_served(path: &str) -> bool {
     }
     if let Some(rest) = path.strip_prefix("/v1/credentials/") {
         return !rest.is_empty() && !rest.contains('/');
+    }
+    if let Some(rest) = path.strip_prefix("/v1/subsonic-credentials/") {
+        return crate::meter_sink::is_uuid_shaped(rest);
     }
     // Playlist subpaths preflight only as single items: nested,
     // trailing-slash, or empty-segment shapes are denied before spend on
@@ -7031,6 +7796,13 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
+        ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
+        ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
+        ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
+        ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
+        ("DELETE", "/v1/me/taste") => me_taste_clear(ctx, req).await,
+        ("GET", "/v1/me/history") => me_history_list(ctx, req).await,
+        ("PUT", "/v1/me/private-session") => me_private_session(ctx, req).await,
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
         // NZB intake cap guard: refuses capped callers with the plan-limit
@@ -7051,6 +7823,11 @@ where
         // above never sees its Authorization header; it is absent
         // from `is_known_path` on purpose (no browser preflight).
         ("POST", crate::meter_sink::SINK_PATH) => meter_sink_ingest(ctx, req).await,
+        ("POST", "/v1/subsonic-credentials") => subsonic_handlers::mint(ctx, req).await,
+        ("GET", "/v1/subsonic-credentials") => subsonic_handlers::list(ctx, req).await,
+        ("DELETE", path) if path.starts_with("/v1/subsonic-credentials/") => {
+            subsonic_handlers::revoke(ctx, req).await
+        }
         ("POST", "/v1/credentials") => credentials_mint(ctx, req).await,
         ("GET", "/v1/credentials") => credentials_list(ctx, req).await,
         // Stripe webhook carve-out: unauthenticated by design (the
@@ -7123,6 +7900,14 @@ where
         // paths, the single-segment revoke id, and the scope-map-served
         // native paths); unserved shapes stay 404 on preflight too.
         ("OPTIONS", path) if options_preflight_served(path) => preflight_response(),
+        ("PUT", path) => match crate::native_rest::like_track_target(path) {
+            Some(target) => me_like_track(ctx, req, target).await,
+            None => not_found(),
+        },
+        ("DELETE", path) => match crate::native_rest::like_track_target(path) {
+            Some(target) => me_unlike_track(ctx, req, target).await,
+            None => not_found(),
+        },
         _ => not_found(),
     }
 }
@@ -7227,9 +8012,25 @@ mod tests {
         })
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PreferenceFailure {
+        Member,
+        Write,
+    }
+
     #[derive(Default)]
     struct FakeStore {
+        taste_rows: RefCell<HashMap<(String, String, String), crate::preference_rows::TasteDbRow>>,
+        taste_write_attempts: std::cell::Cell<usize>,
+        preference_failure: std::cell::Cell<Option<(PreferenceFailure, &'static str)>>,
+        fail_taste_read: RefCell<bool>,
+        fail_taste_write: RefCell<bool>,
+        delete_before_taste_write: RefCell<bool>,
         users: RefCell<HashMap<String, UserRecord>>,
+        private_sessions: RefCell<HashMap<(String, String), u64>>,
+        private_session_write_attempts: std::cell::Cell<usize>,
+        fail_private_session_write: RefCell<bool>,
+        concurrent_holder_on_privacy_failure: RefCell<Option<crate::playback::LeaseRow>>,
         challenges: RefCell<HashMap<String, ChallengeRow>>,
         credentials: RefCell<HashMap<String, PasskeyCredential>>,
         magic: RefCell<HashMap<String, MagicLinkRecord>>,
@@ -7247,10 +8048,13 @@ mod tests {
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
         native_credentials: RefCell<HashMap<String, NativeCredentialRow>>,
-        /// User ids that still own a legacy `provider_vaults` row. The
-        /// product no longer reads or writes vaults; the reaper and
-        /// magic admission keep protecting these accounts.
-        legacy_vault_users: RefCell<HashSet<String>>,
+        subsonic_credentials:
+            RefCell<HashMap<String, (String, crate::subsonic_lifecycle::ListedCredential)>>,
+        fail_subsonic_write: RefCell<bool>,
+        revoke_session_before_mint: RefCell<bool>,
+        fail_bulk_revoke: RefCell<bool>,
+        /// Users with `legacy_vault_established` set.
+        legacy_vault_established: RefCell<HashSet<String>>,
         audits: RefCell<Vec<AuditEvent>>,
         /// Mirror of `users.role` (migration 0028): an absent entry is
         /// the column default (`member`) for an existing user.
@@ -7289,6 +8093,8 @@ mod tests {
         /// Users whose `users.deleting_at` is set (ADR 0002 rule 3):
         /// fenced writers refuse them, mirroring the production SQL.
         deleting_users: RefCell<std::collections::HashSet<String>>,
+        fail_deleting_probe: RefCell<bool>,
+        mark_deleting_after_next_probe: std::cell::Cell<bool>,
         /// Mirror of the daily ingest-job count, keyed by
         /// `(user_id, UTC epoch day)`: the epoch-day key matches the
         /// production UTC-day boundary over `ingest_jobs.accepted_at`.
@@ -7298,6 +8104,10 @@ mod tests {
         /// reconcile input loads whole.
         billing_customers: RefCell<HashMap<String, String>>,
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
+        remove_billing_row_after_read: std::cell::Cell<bool>,
+        reconcile_outcome_attempts: std::cell::Cell<usize>,
+        // Displaced rows are retained without changing the per-user projection.
+        billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
         /// Claimed webhook event ids (first claim wins, mirroring
         /// `billing_webhook_events`).
@@ -7369,6 +8179,8 @@ mod tests {
         /// Stored play windows by idempotency key, mirroring the
         /// monotonic upsert (see `record_play_window`).
         play_windows: RefCell<HashMap<String, crate::ledger::PlayWindow>>,
+        private_play_marks: RefCell<HashSet<(String, String)>>,
+        fail_history_read: RefCell<bool>,
         /// Catalogue slice-1 fixtures: joined library rows by user id plus
         /// the shared mirror collections and per-release track lists.
         /// Tests seed these in store (query) order; the bound and the
@@ -7386,7 +8198,135 @@ mod tests {
         fail_catalogue_release_tracks: RefCell<bool>,
     }
 
+    fn merge_billing_row(
+        existing: Option<&crate::billing_reconcile::ReconciledRow>,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> crate::billing_reconcile::ReconciledRow {
+        // Mirrors the production upsert's monotonic coverage CASE: a
+        // pass that folded an older snapshot commits without
+        // regressing confirmed `paid_through_at` (or the plan and
+        // anchor tied to it). An equal-end pass carrying an anchor
+        // relabels the plan and anchor (the defined equal-end
+        // plan-switch outcome) — but only when the stored row still
+        // matches what the pass read — so a keep committing after a
+        // relabel, or an older relabel committing after a newer one,
+        // keeps the stored ones instead of reversing the newer
+        // plan/anchor. An anchor-less tie keeps the stored ones too.
+        // The same staleness predicate guards
+        // `status` and `grace_until`: strictly older money — or the
+        // anchor-less equal-end shape only the stale fold emits — keeps
+        // the entire stored row instead of writing stale fields over
+        // a fresher pass. History still converges on the invoice id.
+        match existing {
+            Some(existing)
+                if existing.stripe_subscription_id == outcome.row.stripe_subscription_id =>
+            {
+                let advances = outcome.row.paid_through_unix.is_some_and(|end| {
+                    existing
+                        .paid_through_unix
+                        .is_none_or(|previous| end > previous)
+                });
+                let relabels = !advances
+                && outcome.row.paid_invoice_id.is_some()
+                && matches!(
+                    (outcome.row.paid_through_unix, existing.paid_through_unix),
+                    (Some(end), Some(previous)) if end == previous
+                )
+                // Mirrors the tie arm (`subscriptions.plan_id =
+                // $14 AND subscriptions.paid_invoice_id IS NOT
+                // DISTINCT FROM $13`): only a pass whose read row
+                // is still stored relabels — a late keep, or an
+                // older relabel, committing after the row moved
+                // keeps the stored plan/anchor. `None` read plan
+                // never equals a stored plan, so an anchor-less
+                // keep never relabels either.
+                && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
+                && existing.paid_invoice_id == outcome.read_anchor;
+                let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
+                    (Some(end), Some(previous)) => {
+                        end < previous
+                            || (end == previous
+                                && outcome.row.paid_invoice_id.is_none()
+                                && existing.paid_invoice_id.is_some())
+                    }
+                    _ => false,
+                };
+                if stale {
+                    return existing.clone();
+                }
+                let mut row = outcome.row.clone();
+                if !advances && !relabels {
+                    row.paid_through_unix = existing.paid_through_unix;
+                    row.plan_id = existing.plan_id.clone();
+                    row.paid_invoice_id = existing.paid_invoice_id.clone();
+                } else if row.paid_invoice_id.is_none() {
+                    row.paid_invoice_id = existing.paid_invoice_id.clone();
+                }
+                row
+            }
+            _ => outcome.row.clone(),
+        }
+    }
+
     impl FakeStore {
+        fn check_taste_write(
+            &self,
+            user_id: &str,
+            target: &str,
+            now: u64,
+        ) -> Result<(), StoreError> {
+            self.taste_write_attempts
+                .set(self.taste_write_attempts.get() + 1);
+            if self.preference_failure.get() == Some((PreferenceFailure::Write, target)) {
+                return Err(StoreError);
+            }
+            if self.delete_before_taste_write.replace(false) {
+                self.deleting_users.borrow_mut().insert(user_id.into());
+            }
+            if *self.fail_taste_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || !(1..=128).contains(&user_id.chars().count())
+                || !(1..=512).contains(&target.chars().count())
+                || user_id.contains('\0')
+                || target.contains('\0')
+                || now > 253_402_300_799
+            {
+                return Err(StoreError);
+            }
+            Ok(())
+        }
+
+        fn delete_preference(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+            love_only: bool,
+        ) -> Result<bool, StoreError> {
+            if self.delete_before_taste_write.replace(false) {
+                self.deleting_users.borrow_mut().insert(user_id.into());
+            }
+            if *self.fail_taste_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || user_id.contains('\0')
+                || target.contains('\0')
+            {
+                return Err(StoreError);
+            }
+            let key = (user_id.into(), kind.as_str().into(), target.into());
+            let mut rows = self.taste_rows.borrow_mut();
+            if rows
+                .get(&key)
+                .is_some_and(|row| !love_only || row.signal == "love")
+            {
+                rows.remove(&key);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
         /// Member releases for a fake user, mirroring the production
         /// membership read: distinct well-formed release MBIDs from the
         /// fake ledger, sorted for a stable page.
@@ -7441,7 +8381,426 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dispatched_history_lists_only_public_metered_plays_and_fails_closed() {
+        use serde_json::{json, Value};
+
+        let h = play_harness();
+        let store = &h.store;
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/me/history".into(),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob","cursor":"p20"}"#.to_vec(),
+        };
+        let call = |req: &Request| {
+            let resp = block_on(handle(&h.ctx(), req));
+            assert!(resp.set_cookie.is_none() && resp.extra_headers.is_empty());
+            (resp.status, resp.body)
+        };
+        let unauthorized = || {
+            (
+                401,
+                crate::api_error::ApiError::unauthorized("authentication required").body_json(),
+            )
+        };
+        assert_eq!(call(&req), unauthorized());
+        req.cookie = Some(alice.clone());
+        let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, false)).unwrap();
+        seed_entitled(&h, "alice", "plus", 100);
+        assert!(shared_play_call(&h, "alice", &claims.session_id, "track", None).is_ok());
+        // A grant without delivery does not make a history item.
+        assert_eq!(call(&req), (200, r#"{"items":[]}"#.into()));
+
+        let record = |owner: &str, play: &str, at| {
+            let window = crate::ledger::prepare_play_window(
+                owner,
+                "track",
+                play,
+                100,
+                Some(200),
+                Some(14_000),
+                at,
+            )
+            .unwrap();
+            assert_eq!(
+                block_on(store.record_play_window(&window)).unwrap(),
+                crate::meter_sink::PlayWindowOutcome::Written
+            );
+            window
+        };
+        for i in 0..55 {
+            record("alice", &format!("p{i:02}"), NOW + i / 2);
+        }
+        let private = record("alice", "private", NOW + 100);
+        store
+            .private_play_marks
+            .borrow_mut()
+            .insert(("alice".into(), private.idempotency_key.clone()));
+        for (key, bytes) in [
+            ("play:bob:track:forged", 100),
+            ("play:alice:other:forged", 100),
+            ("play:alice:track:extra:part", 100),
+            ("ingest:alice:track:non-play", 100),
+            ("play:alice:track:zero", 0),
+        ] {
+            let mut window = private.clone();
+            window.idempotency_key = key.into();
+            window.bytes_served = bytes;
+            store.play_windows.borrow_mut().insert(key.into(), window);
+        }
+        record("bob", "foreign", NOW + 200);
+        block_on(store.upsert_private_session("alice", &claims.session_id, NOW + 60)).unwrap();
+        block_on(store.taste_upsert(
+            "alice",
+            crate::target_identity::TargetKind::Track,
+            "track",
+            crate::taste_signal::TasteSignal::Love,
+            None,
+            NOW,
+        ))
+        .unwrap();
+        let snapshot = || {
+            (
+                store.play_windows.borrow().clone(),
+                store.stream_seconds.borrow().clone(),
+                store.taste_rows.borrow().clone(),
+                store.private_play_marks.borrow().clone(),
+                store.private_sessions.borrow().clone(),
+            )
+        };
+        let before = snapshot();
+        let item = |play_id, played_at| json!({"play_id": play_id, "track_id": "track", "played_at": played_at, "stream_seconds": 7});
+        let (status, body) = call(&req);
+        assert_eq!(status, 200);
+        // Equal timestamps exercise the key tie-breaker, including at the cap.
+        let expected: Vec<_> = (5..55)
+            .rev()
+            .map(|i| item(format!("p{i:02}"), NOW + i / 2))
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"items": expected})
+        );
+        req.cookie = Some(bob);
+        let (status, body) = call(&req);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"items":[item("foreign".into(), NOW + 200)]})
+        );
+        req.cookie = Some(alice);
+
+        *store.fail_session_lookup.borrow_mut() = true;
+        let (status, body) = call(&req);
+        assert_eq!(status, 500);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"code": "internal_error", "message": "unexpected error", "retryable": true})
+        );
+        *store.fail_session_lookup.borrow_mut() = false;
+
+        *store.fail_history_read.borrow_mut() = true;
+        assert_eq!(call(&req), (503, unavailable().body));
+        store.deleting_users.borrow_mut().insert("alice".into());
+        assert_eq!(call(&req), (409, account_deleting_response().body));
+        *store.fail_history_read.borrow_mut() = false;
+        *store.fail_deleting_probe.borrow_mut() = true;
+        assert_eq!(call(&req), (503, unavailable().body));
+        *store.fail_deleting_probe.borrow_mut() = false;
+        store.deleting_users.borrow_mut().remove("alice");
+        // Model an erased user and cascaded session while retaining ledger fixtures.
+        store.users.borrow_mut().remove("alice");
+        store.sessions.borrow_mut().remove(&claims.session_id);
+        assert_eq!(call(&req), unauthorized());
+        assert_eq!(snapshot(), before);
+    }
+
+    #[test]
+    fn private_session_upsert_is_scoped_and_fails_closed() {
+        let store = FakeStore::default();
+        for id in ["alice", "Alice"] {
+            store.users.borrow_mut().insert(
+                id.into(),
+                UserRecord {
+                    id: id.into(),
+                    email: format!("{id}@example.test"),
+                    created_at: 0,
+                },
+            );
+        }
+        for (owner, session, expiry) in [
+            ("alice", "session", 10),
+            ("alice", "Session", 20),
+            ("alice", "other", 30),
+            ("Alice", "session", 40),
+            ("alice", "session", 100),
+            ("alice", "session", 0),
+        ] {
+            block_on(store.upsert_private_session(owner, session, expiry)).unwrap();
+        }
+        let expected = HashMap::from([
+            (("alice".into(), "session".into()), 0),
+            (("alice".into(), "Session".into()), 20),
+            (("alice".into(), "other".into()), 30),
+            (("Alice".into(), "session".into()), 40),
+        ]);
+        assert_eq!(*store.private_sessions.borrow(), expected);
+        for (owner, session, expiry) in [
+            ("missing", "session", 1),
+            ("alice", "", 1),
+            ("alice", "bad\0id", 1),
+            ("alice", "session", u64::MAX),
+            ("alice", "session", 253_402_300_800),
+        ] {
+            assert!(block_on(store.upsert_private_session(owner, session, expiry)).is_err());
+        }
+        assert!(block_on(store.upsert_private_session("alice", &"x".repeat(129), 1)).is_err());
+        store.deleting_users.borrow_mut().insert("alice".into());
+        assert!(block_on(store.upsert_private_session("alice", "session", 1)).is_err());
+        store.deleting_users.borrow_mut().clear();
+        *store.fail_private_session_write.borrow_mut() = true;
+        assert!(block_on(store.upsert_private_session("alice", "session", 1)).is_err());
+        assert_eq!(*store.private_sessions.borrow(), expected);
+    }
+
+    #[test]
+    fn private_play_marks_are_exact_bound_idempotent_and_fail_closed() {
+        let store = FakeStore::default();
+        for id in ["alice", "Alice"] {
+            store.users.borrow_mut().insert(
+                id.into(),
+                UserRecord {
+                    id: id.into(),
+                    email: format!("{id}@example.test"),
+                    created_at: 0,
+                },
+            );
+        }
+        let key = "play:alice:Track:Play";
+        let marked = |k: &str| {
+            store
+                .private_play_marks
+                .borrow()
+                .contains(&("alice".to_owned(), k.to_owned()))
+        };
+        for at in [0, 1, 253_402_300_799] {
+            block_on(store.mark_private_play("alice", "Track", key, at)).unwrap();
+        }
+        assert!(marked(key));
+        assert_eq!(store.private_play_marks.borrow().len(), 1);
+        for (owner, track, k, at) in [
+            ("Alice", "Track", key, 1),
+            ("alice", "track", key, 1),
+            ("alice", "Track", "play:alice:Track:", 1),
+            ("alice", "Track", key, 253_402_300_800),
+            ("alice", "Track", key, u64::MAX),
+            ("missing", "Track", "play:missing:Track:Play", 1),
+        ] {
+            assert!(block_on(store.mark_private_play(owner, track, k, at)).is_err());
+        }
+        store.deleting_users.borrow_mut().insert("alice".into());
+        assert!(
+            block_on(store.mark_private_play("alice", "Track", "play:alice:Track:X", 1)).is_err()
+        );
+        store.deleting_users.borrow_mut().clear();
+        *store.fail_private_session_write.borrow_mut() = true;
+        assert!(
+            block_on(store.mark_private_play("alice", "Track", "play:alice:Track:Y", 1)).is_err()
+        );
+        assert!(!marked("play:alice:Track:X") && !marked("play:alice:Track:Y"));
+        assert_eq!(store.private_play_marks.borrow().len(), 1);
+    }
+
+    #[test]
+    fn private_session_active_is_an_owner_scoped_observation() {
+        let store = FakeStore::default();
+        for id in ["alice", "Alice"] {
+            store.users.borrow_mut().insert(
+                id.into(),
+                UserRecord {
+                    id: id.into(),
+                    email: format!("{id}@example.test"),
+                    created_at: 0,
+                },
+            );
+        }
+        block_on(store.upsert_private_session("alice", "Session", 253_402_300_799)).unwrap();
+        block_on(store.upsert_private_session("alice", "expired", 0)).unwrap();
+        assert!(block_on(store.private_session_active("alice", "Session")).unwrap());
+        for (owner, session) in [
+            ("alice", "session"),
+            ("Alice", "Session"),
+            ("alice", "expired"),
+            ("alice", "absent"),
+        ] {
+            assert!(!block_on(store.private_session_active(owner, session)).unwrap());
+        }
+        for (owner, session) in [("missing", "Session"), ("alice", ""), ("alice", "bad\0id")] {
+            assert!(block_on(store.private_session_active(owner, session)).is_err());
+        }
+        store.deleting_users.borrow_mut().insert("alice".into());
+        assert!(block_on(store.private_session_active("alice", "Session")).is_err());
+        store.deleting_users.borrow_mut().clear();
+        *store.fail_private_session_write.borrow_mut() = true;
+        assert!(block_on(store.private_session_active("alice", "Session")).is_err());
+    }
+
+    #[test]
+    fn private_play_marks_are_exact_bound_and_fail_closed() {
+        let store = FakeStore::default();
+        for id in ["alice", "Alice"] {
+            store.users.borrow_mut().insert(
+                id.into(),
+                UserRecord {
+                    id: id.into(),
+                    email: format!("{id}@example.test"),
+                    created_at: 0,
+                },
+            );
+        }
+        let key = "play:alice:Track:Play";
+        assert!(!block_on(store.private_play_marked("alice", "Track", key)).unwrap());
+        store
+            .private_play_marks
+            .borrow_mut()
+            .insert(("alice".into(), key.into()));
+        assert!(block_on(store.private_play_marked("alice", "Track", key)).unwrap());
+        assert!(
+            !block_on(store.private_play_marked("alice", "Track", "play:alice:Track:play"))
+                .unwrap()
+        );
+        assert!(
+            !block_on(store.private_play_marked("Alice", "Track", "play:Alice:Track:Play"))
+                .unwrap()
+        );
+        for (owner, track, key) in [
+            ("Alice", "Track", key),
+            ("alice", "track", key),
+            ("alice", "Track", "play:alice:Track:"),
+            ("missing", "Track", "play:missing:Track:Play"),
+        ] {
+            assert!(block_on(store.private_play_marked(owner, track, key)).is_err());
+        }
+        store.deleting_users.borrow_mut().insert("alice".into());
+        assert!(block_on(store.private_play_marked("alice", "Track", key)).is_err());
+        store.deleting_users.borrow_mut().clear();
+        *store.fail_private_session_write.borrow_mut() = true;
+        assert!(block_on(store.private_play_marked("alice", "Track", key)).is_err());
+        assert_eq!(store.private_play_marks.borrow().len(), 1);
+    }
+
     impl Store for FakeStore {
+        async fn mark_private_play(
+            &self,
+            user_id: &str,
+            track_id: &str,
+            key: &str,
+            marked_at: u64,
+        ) -> Result<(), StoreError> {
+            if *self.fail_private_session_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || !crate::history_key::matches_owner_track(key, user_id, track_id)
+                || !crate::history_key::valid_mark_time(marked_at)
+            {
+                return Err(StoreError);
+            }
+            self.private_play_marks
+                .borrow_mut()
+                .insert((user_id.into(), key.into()));
+            Ok(())
+        }
+
+        async fn private_play_marked(
+            &self,
+            user_id: &str,
+            track_id: &str,
+            key: &str,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_private_session_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || !crate::history_key::matches_owner_track(key, user_id, track_id)
+            {
+                return Err(StoreError);
+            }
+            Ok(self
+                .private_play_marks
+                .borrow()
+                .contains(&(user_id.into(), key.into())))
+        }
+
+        async fn private_session_active(
+            &self,
+            user_id: &str,
+            session_id: &str,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_private_session_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || session_id.contains('\0')
+                || !(1..=128).contains(&session_id.chars().count())
+            {
+                return Err(StoreError);
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| StoreError)?
+                .as_secs();
+            Ok(self
+                .private_sessions
+                .borrow()
+                .get(&(user_id.into(), session_id.into()))
+                .is_some_and(|expiry| *expiry > now))
+        }
+
+        async fn upsert_private_session(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            expires_at: u64,
+        ) -> Result<(), StoreError> {
+            self.private_session_write_attempts
+                .set(self.private_session_write_attempts.get() + 1);
+            if *self.fail_private_session_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || [user_id, session_id]
+                    .iter()
+                    .any(|id| id.contains('\0') || !(1..=128).contains(&id.chars().count()))
+                || expires_at > 253_402_300_799
+            {
+                return Err(StoreError);
+            }
+            self.private_sessions
+                .borrow_mut()
+                .insert((user_id.into(), session_id.into()), expires_at);
+            Ok(())
+        }
+        async fn like_delete(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<bool, StoreError> {
+            self.delete_preference(user_id, kind, target, true)
+        }
+        async fn taste_delete(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<bool, StoreError> {
+            self.delete_preference(user_id, kind, target, false)
+        }
         async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
             Ok(self
                 .users
@@ -7736,24 +9095,32 @@ mod tests {
             expires_at: u64,
             takeover: bool,
         ) -> Result<crate::playback::LeaseAcquire, StoreError> {
-            // Mirror the conditional upsert: insert at epoch 1, or
-            // replace at epoch+1 when expired, same-session, or
-            // takeover — else Held with the remaining TTL. The
-            // statement's deletion fence writes nothing (zero rows,
-            // which the Pg glue reads back as Held), no epoch burned.
+            // All checks precede the commit of the classification and holder.
             if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
                 self.deleting_users.borrow_mut().insert(marker);
             }
-            if self.deleting_users.borrow().contains(user_id) {
-                return Ok(crate::playback::LeaseAcquire::Held {
-                    retry_after_secs: self
-                        .playback_leases
-                        .borrow()
-                        .get(user_id)
-                        .map_or(0, |row| row.retry_after_secs(now)),
-                });
+            let key = crate::ledger::derive_play_idempotency_key(user_id, track_id, play_id)
+                .map_err(|_| StoreError)?;
+            if !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || !crate::history_key::valid_mark_time(now)
+                || session_id.contains('\0')
+            {
+                return Err(StoreError);
             }
             let mut leases = self.playback_leases.borrow_mut();
+            if let Some(holder) = self.concurrent_holder_on_privacy_failure.take() {
+                leases.insert(user_id.to_string(), holder);
+                return Err(StoreError);
+            }
+            let private = self
+                .private_sessions
+                .borrow()
+                .get(&(user_id.into(), session_id.into()))
+                .is_some_and(|&expiry| expiry > now);
+            if private && *self.fail_private_session_write.borrow() {
+                return Err(StoreError);
+            }
             match leases.get(user_id) {
                 Some(existing)
                     if existing.is_live(now) && existing.session_id != session_id && !takeover =>
@@ -7774,6 +9141,11 @@ mod tests {
                             expires_at,
                         },
                     );
+                    if private {
+                        self.private_play_marks
+                            .borrow_mut()
+                            .insert((user_id.into(), key));
+                    }
                     Ok(crate::playback::LeaseAcquire::Acquired { epoch })
                 }
             }
@@ -7971,8 +9343,8 @@ mod tests {
             ttl_secs: u64,
             protected_user_id: Option<&str>,
         ) -> Result<(), StoreError> {
-            // Mirror `reap_unverified_users_sql`: magic-only accounts (session
-            // without a passkey yet) and vault owners are never reaped.
+            // Mirror `reap_unverified_users_sql`: a prior session or legacy
+            // vault marker protects the account even without a passkey.
             let cutoff = now.saturating_sub(ttl_secs);
             let credentialed: HashSet<String> = self
                 .credentials
@@ -7987,7 +9359,7 @@ mod tests {
                 .filter(|row| row.purpose == PURPOSE_REGISTER && row.challenge.expires_at > now)
                 .filter_map(|row| row.user_id.clone())
                 .collect();
-            let vault_owners: HashSet<String> = self.legacy_vault_users.borrow().clone();
+            let marked_users: HashSet<String> = self.legacy_vault_established.borrow().clone();
             let session_owners: HashSet<String> = self
                 .sessions
                 .borrow()
@@ -8015,7 +9387,7 @@ mod tests {
                     || admins.contains(&user.id)
                     || credentialed.contains(&user.id)
                     || active_registrations.contains(&user.id)
-                    || vault_owners.contains(&user.id)
+                    || marked_users.contains(&user.id)
                     || session_owners.contains(&user.id)
                     || magic_owners.contains(&user.id)
                     || protected_user_id == Some(user.id.as_str())
@@ -8221,21 +9593,133 @@ mod tests {
                 _ => Ok(false),
             }
         }
-        async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), StoreError> {
-            for row in self.sessions.borrow_mut().values_mut() {
-                if row.user_id == user_id {
-                    row.revoked = true;
+        async fn insert_subsonic_credential(
+            &self,
+            row: &crate::subsonic_lifecycle::PreparedCredential,
+            session: &SessionClaims,
+        ) -> Result<bool, StoreError> {
+            if !self
+                .sessions
+                .borrow()
+                .get(&session.session_id)
+                .is_some_and(|r| {
+                    !r.revoked
+                        && r.user_id == row.record.user_id
+                        && r.rotation_counter == session.rotation_counter
+                })
+            {
+                return Ok(false);
+            }
+            if *self.fail_subsonic_write.borrow() {
+                return Err(StoreError);
+            }
+            let owner = &row.record.user_id;
+            if !self.users.borrow().contains_key(owner)
+                || self.deleting_users.borrow().contains(owner)
+            {
+                return Ok(false);
+            }
+            let mut rows = self.subsonic_credentials.borrow_mut();
+            if rows
+                .values()
+                .filter(|(u, r)| u == owner && r.revoked_at.is_none())
+                .count()
+                >= 32
+            {
+                return Ok(false);
+            }
+            rows.insert(
+                row.record.id.clone(),
+                (
+                    owner.clone(),
+                    crate::subsonic_lifecycle::ListedCredential {
+                        id: row.record.id.clone(),
+                        label: row.label.clone(),
+                        auth_mode: match row.record.auth_mode {
+                            crate::subsonic_auth::AuthMode::ApiKey => "apikey",
+                            crate::subsonic_auth::AuthMode::Token => "token",
+                            crate::subsonic_auth::AuthMode::Both => "both",
+                        }
+                        .to_string(),
+                        created_at: row.created_at,
+                        last_used_at: None,
+                        revoked_at: None,
+                    },
+                ),
+            );
+            Ok(true)
+        }
+        async fn subsonic_credentials_for_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
+            Ok(self
+                .subsonic_credentials
+                .borrow()
+                .values()
+                .filter(|(u, _)| u == user_id)
+                .map(|(_, r)| r.clone())
+                .collect())
+        }
+        async fn revoke_subsonic_credential(
+            &self,
+            id: &str,
+            user_id: &str,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            if *self.fail_subsonic_write.borrow() {
+                return Err(StoreError);
+            }
+            let mut rows = self.subsonic_credentials.borrow_mut();
+            let Some((u, row)) = rows.get_mut(id) else {
+                return Ok(false);
+            };
+            if u != user_id {
+                return Ok(false);
+            }
+            row.revoked_at.get_or_insert(now);
+            Ok(true)
+        }
+        async fn revoke_all_subsonic_credentials(
+            &self,
+            user_id: &str,
+            now: u64,
+        ) -> Result<u64, StoreError> {
+            if *self.fail_subsonic_write.borrow() {
+                return Err(StoreError);
+            }
+            let mut count = 0;
+            for (u, row) in self.subsonic_credentials.borrow_mut().values_mut() {
+                if u == user_id && row.revoked_at.is_none() {
+                    row.revoked_at = Some(now);
+                    count += 1;
                 }
             }
-            Ok(())
+            Ok(count)
         }
         async fn insert_native_credential(
             &self,
             row: &NativeCredentialRow,
+            session_id: &str,
         ) -> Result<(), StoreError> {
-            // Mirror the production in-statement fence: a deleting
-            // account's insert writes nothing and fails (ADR 0002 rule 3).
-            if self.deleting_users.borrow().contains(&row.record.user_id) {
+            // Pin a session transition after handler authentication.
+            if *self.revoke_session_before_mint.borrow() {
+                self.sessions
+                    .borrow_mut()
+                    .get_mut(session_id)
+                    .expect("mint must bind the authenticated session")
+                    .revoked = true;
+            }
+            // Mirror the production account and session fences.
+            if self.deleting_users.borrow().contains(&row.record.user_id)
+                || !self
+                    .sessions
+                    .borrow()
+                    .get(session_id)
+                    .is_some_and(|session| {
+                        session.user_id == row.record.user_id && !session.revoked
+                    })
+            {
                 return Err(StoreError);
             }
             let mut rows = self.native_credentials.borrow_mut();
@@ -8305,15 +9789,22 @@ mod tests {
                 _ => Ok(false),
             }
         }
-        async fn revoke_all_native_credentials(
+        async fn revoke_sessions_and_native_credentials(
             &self,
             user_id: &str,
             now: u64,
         ) -> Result<u64, StoreError> {
-            // Mirror the production statement: empty user revokes nothing
-            // (an upstream bug must never become a mass revocation).
+            if *self.fail_bulk_revoke.borrow() {
+                return Err(StoreError);
+            }
             if user_id.is_empty() {
                 return Ok(0);
+            }
+            self.revoke_all_subsonic_credentials(user_id, now).await?;
+            for row in self.sessions.borrow_mut().values_mut() {
+                if row.user_id == user_id {
+                    row.revoked = true;
+                }
             }
             let mut revoked = 0;
             for row in self.native_credentials.borrow_mut().values_mut() {
@@ -8329,6 +9820,253 @@ mod tests {
                 row.last_used_at = Some(now);
             }
             Ok(())
+        }
+        async fn delete_private_session(
+            &self,
+            user_id: &str,
+            session_id: &str,
+        ) -> Result<(), StoreError> {
+            self.private_session_write_attempts
+                .set(self.private_session_write_attempts.get() + 1);
+            if *self.fail_private_session_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || session_id.contains('\0')
+            {
+                return Err(StoreError);
+            }
+            self.private_sessions
+                .borrow_mut()
+                .remove(&(user_id.into(), session_id.into()));
+            Ok(())
+        }
+        async fn taste_upsert(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+            signal: crate::taste_signal::TasteSignal,
+            snooze_until: Option<u64>,
+            now: u64,
+        ) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
+            use crate::taste_signal::TasteSignal;
+            self.check_taste_write(user_id, target, now)?;
+            if snooze_until.is_some_and(|t| t > 253_402_300_799)
+                || (signal == TasteSignal::Snooze) != snooze_until.is_some()
+            {
+                return Err(StoreError);
+            }
+            let key = (user_id.into(), kind.as_str().into(), target.into());
+            let mut rows = self.taste_rows.borrow_mut();
+            let created_at = rows.get(&key).map_or(now as i64, |row| {
+                if signal == TasteSignal::Love && row.signal != "love" {
+                    now as i64
+                } else {
+                    row.created_at
+                }
+            });
+            let row = crate::preference_rows::TasteDbRow {
+                kind: kind.as_str().into(),
+                target_id: target.into(),
+                signal: signal.as_str().into(),
+                snooze_until: snooze_until.map(|t| t as i64),
+                created_at,
+                updated_at: now as i64,
+            };
+            rows.insert(key, row.clone());
+            Ok(row)
+        }
+        async fn import_like(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            self.check_taste_write(user_id, target, now)?;
+            let key = (user_id.into(), kind.as_str().into(), target.into());
+            let mut rows = self.taste_rows.borrow_mut();
+            if rows.get(&key).is_some_and(|row| row.signal == "love") {
+                return Ok(false);
+            }
+            rows.insert(
+                key,
+                crate::preference_rows::TasteDbRow {
+                    kind: kind.as_str().into(),
+                    target_id: target.into(),
+                    signal: "love".into(),
+                    snooze_until: None,
+                    created_at: now as i64,
+                    updated_at: now as i64,
+                },
+            );
+            Ok(true)
+        }
+        async fn taste_get(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<Option<crate::preference_rows::TasteDbRow>, StoreError> {
+            if *self.fail_taste_read.borrow() {
+                return Err(StoreError);
+            }
+            Ok(self
+                .taste_rows
+                .borrow()
+                .get(&(user_id.into(), kind.as_str().into(), target.into()))
+                .cloned())
+        }
+        async fn history_list(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::preference_rows::HistoryDbRow>, StoreError> {
+            if *self.fail_history_read.borrow() {
+                return Err(StoreError);
+            }
+            let marks = self.private_play_marks.borrow();
+            let mut rows: Vec<_> = self
+                .play_windows
+                .borrow()
+                .values()
+                .filter_map(|window| {
+                    let play_id = crate::history_key::play_id_from_key(&window.idempotency_key)?;
+                    if window.user_id != user_id
+                        || window.bytes_served == 0
+                        || marks.contains(&(user_id.to_owned(), window.idempotency_key.clone()))
+                        || crate::ledger::derive_play_idempotency_key(
+                            user_id,
+                            &window.track_id,
+                            &play_id,
+                        )
+                        .ok()
+                        .as_deref()
+                            != Some(window.idempotency_key.as_str())
+                    {
+                        return None;
+                    }
+                    Some((
+                        window.recorded_at,
+                        window.idempotency_key.clone(),
+                        crate::preference_rows::HistoryDbRow {
+                            play_id,
+                            track_id: window.track_id.clone(),
+                            played_at: i64::try_from(window.recorded_at).ok()?,
+                            stream_seconds: i64::try_from(window.stream_seconds).ok()?,
+                        },
+                    ))
+                })
+                .collect();
+            rows.sort_by(|a, b| (b.0, &b.1).cmp(&(a.0, &a.1)));
+            Ok(rows.into_iter().take(50).map(|(_, _, row)| row).collect())
+        }
+        async fn taste_list(
+            &self,
+            user_id: &str,
+            now: u64,
+        ) -> Result<Vec<crate::preference_rows::TasteDbRow>, StoreError> {
+            if *self.fail_taste_read.borrow() {
+                return Err(StoreError);
+            }
+            let now = i64::try_from(now).map_err(|_| StoreError)?;
+            let mut rows: Vec<_> = self
+                .taste_rows
+                .borrow()
+                .iter()
+                .filter(|((owner, _, _), row)| {
+                    owner == user_id
+                        && (row.signal != "snooze"
+                            || row.snooze_until.is_some_and(|until| until > now))
+                })
+                .map(|(_, row)| row.clone())
+                .collect();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
+            rows.truncate(500);
+            Ok(rows)
+        }
+        async fn likes_list(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<crate::preference_rows::TasteDbRow>, StoreError> {
+            if *self.fail_taste_read.borrow() {
+                return Err(StoreError);
+            }
+            let mut rows: Vec<_> = self
+                .taste_rows
+                .borrow()
+                .iter()
+                .filter(|((owner, _, _), row)| owner == user_id && row.signal == "love")
+                .map(|(_, row)| row.clone())
+                .collect();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.created_at));
+            rows.truncate(500);
+            Ok(rows)
+        }
+        async fn catalogue_member_target(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+        ) -> Result<bool, StoreError> {
+            use crate::target_identity::TargetKind;
+            if kind == TargetKind::Release && !crate::catalogue::is_catalogue_mbid(target) {
+                return Ok(false);
+            }
+            if *self.fail_catalogue_reads.borrow()
+                || self.preference_failure.get() == Some((PreferenceFailure::Member, target))
+            {
+                return Err(StoreError);
+            }
+            let rows = self.catalogue_library.borrow();
+            // The empty key represents shared library rows in this fake.
+            Ok([user_id, ""]
+                .into_iter()
+                .filter_map(|key| rows.get(key))
+                .flatten()
+                .any(|row| match kind {
+                    TargetKind::Track => {
+                        row.job_id == target
+                            || (crate::catalogue::is_catalogue_mbid(target)
+                                && row
+                                    .recording_mbids
+                                    .iter()
+                                    .any(|id| id.eq_ignore_ascii_case(target)))
+                    }
+                    TargetKind::Release => row
+                        .release_mbid
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(target)),
+                }))
+        }
+        async fn resolve_member_track(
+            &self,
+            user_id: &str,
+            target: &str,
+        ) -> Result<Option<String>, StoreError> {
+            if *self.fail_catalogue_reads.borrow()
+                || self.preference_failure.get() == Some((PreferenceFailure::Member, target))
+            {
+                return Err(StoreError);
+            }
+            let rows = self.catalogue_library.borrow();
+            let members: Vec<_> = [user_id, ""]
+                .into_iter()
+                .filter_map(|key| rows.get(key))
+                .flatten()
+                .collect();
+            if members.iter().any(|row| row.job_id == target) {
+                return Ok(Some(target.to_owned()));
+            }
+            if crate::catalogue::is_catalogue_mbid(target)
+                && members.iter().any(|row| {
+                    row.recording_mbids
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(target))
+                })
+            {
+                return Ok(Some(crate::target_identity::canonical_target_id(target)));
+            }
+            Ok(None)
         }
         async fn catalogue_library(
             &self,
@@ -8450,12 +10188,19 @@ mod tests {
                 .unwrap_or_default())
         }
         async fn account_deleting(&self, user_id: &str) -> Result<bool, StoreError> {
-            Ok(self.deleting_users.borrow().contains(user_id))
+            if *self.fail_deleting_probe.borrow() {
+                return Err(StoreError);
+            }
+            let deleting = self.deleting_users.borrow().contains(user_id);
+            if self.mark_deleting_after_next_probe.take() {
+                self.deleting_users.borrow_mut().insert(user_id.into());
+            }
+            Ok(deleting)
         }
         async fn account_admitted(&self, user_id: &str) -> Result<bool, StoreError> {
             // Mirror the production EXISTS probe: credential, any
-            // session row, vault, or a non-member role (an absent
-            // `user_roles` entry is the `member` column default).
+            // session row, legacy vault marker, or non-member role
+            // (an absent `user_roles` entry defaults to `member`).
             let admitted = self
                 .credentials
                 .borrow()
@@ -8466,7 +10211,7 @@ mod tests {
                     .borrow()
                     .values()
                     .any(|s| s.user_id == user_id)
-                || self.legacy_vault_users.borrow().contains(user_id)
+                || self.legacy_vault_established.borrow().contains(user_id)
                 || self
                     .user_roles
                     .borrow()
@@ -8589,31 +10334,44 @@ mod tests {
         async fn load_reconcile_input(
             &self,
             user_id: &str,
+            target_subscription_id: Option<&str>,
         ) -> Result<crate::billing_reconcile::ReconcileInput, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            let live = self.billing_rows.borrow().get(user_id).map(|row| {
-                crate::billing_reconcile::LiveRow {
-                    stripe_subscription_id: row.stripe_subscription_id.clone(),
-                    stripe_customer_id: row.stripe_customer_id.clone(),
-                    stripe_item_id: row.stripe_item_id.clone(),
-                    stripe_price_id: row.stripe_price_id.clone(),
-                    plan_id: row.plan_id.clone(),
-                    status: row.status.clone(),
-                    paid_through_unix: row.paid_through_unix,
-                    paid_invoice_id: row.paid_invoice_id.clone(),
-                    grace_until_unix: row.grace_until_unix,
-                }
+            let current = self.billing_rows.borrow().get(user_id).cloned();
+            let selected = match target_subscription_id {
+                Some(target) => current
+                    .filter(|row| row.stripe_subscription_id == target)
+                    .or_else(|| {
+                        self.billing_shadow
+                            .borrow()
+                            .get(&(user_id.to_string(), target.to_string()))
+                            .cloned()
+                    }),
+                None => current.filter(|row| {
+                    matches!(
+                        row.status.as_str(),
+                        "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                    )
+                }),
+            };
+            let live = selected.map(|row| crate::billing_reconcile::LiveRow {
+                stripe_subscription_id: row.stripe_subscription_id.clone(),
+                stripe_customer_id: row.stripe_customer_id.clone(),
+                stripe_item_id: row.stripe_item_id.clone(),
+                stripe_price_id: row.stripe_price_id.clone(),
+                plan_id: row.plan_id.clone(),
+                status: row.status.clone(),
+                paid_through_unix: row.paid_through_unix,
+                paid_invoice_id: row.paid_invoice_id.clone(),
+                grace_until_unix: row.grace_until_unix,
             });
-            // A `trialing` or terminal row sits outside the live slot: the
-            // production predicate excludes it, so the fake does too.
-            let live = live.filter(|row| {
-                matches!(
-                    row.status.as_str(),
-                    "incomplete" | "active" | "past_due" | "unpaid" | "paused"
-                )
-            });
+            if self.remove_billing_row_after_read.replace(false) {
+                // The caller keeps its read snapshot, but persistence sees an absent target.
+                assert!(live.is_some());
+                assert!(self.billing_rows.borrow_mut().remove(user_id).is_some());
+            }
             Ok(crate::billing_reconcile::ReconcileInput {
                 stripe_customer_id: self.billing_customers.borrow().get(user_id).cloned(),
                 live,
@@ -8639,75 +10397,92 @@ mod tests {
             user_id: &str,
             outcome: &crate::billing_reconcile::ReconcileOutcome,
         ) -> Result<(), StoreError> {
+            self.reconcile_outcome_attempts
+                .set(self.reconcile_outcome_attempts.get() + 1);
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
-            // Mirrors the production upsert's monotonic coverage CASE: a
-            // pass that folded an older snapshot commits without
-            // regressing confirmed `paid_through_at` (or the plan and
-            // anchor tied to it). An equal-end pass carrying an anchor
-            // relabels the plan and anchor (the defined equal-end
-            // plan-switch outcome) — but only when the stored row still
-            // matches what the pass read — so a keep committing after a
-            // relabel, or an older relabel committing after a newer one,
-            // keeps the stored ones instead of reversing the newer
-            // plan/anchor. An anchor-less tie keeps the stored ones too.
-            // The same staleness predicate guards
-            // `status` and `grace_until`: strictly older money — or the
-            // anchor-less equal-end shape only the stale fold emits — keeps
-            // the stored verbatim fields instead of writing stale ones over
-            // a fresher pass. Bindings still update verbatim; history still
-            // converges on the invoice id.
-            let mut rows = self.billing_rows.borrow_mut();
-            let merged = match rows.get(user_id) {
-                Some(existing)
-                    if existing.stripe_subscription_id == outcome.row.stripe_subscription_id =>
-                {
-                    let advances = outcome.row.paid_through_unix.is_some_and(|end| {
-                        existing
-                            .paid_through_unix
-                            .is_none_or(|previous| end > previous)
-                    });
-                    let relabels = !advances
-                        && outcome.row.paid_invoice_id.is_some()
-                        && matches!(
-                            (outcome.row.paid_through_unix, existing.paid_through_unix),
-                            (Some(end), Some(previous)) if end == previous
-                        )
-                        // Mirrors the tie arm (`subscriptions.plan_id =
-                        // $14 AND subscriptions.paid_invoice_id IS NOT
-                        // DISTINCT FROM $13`): only a pass whose read row
-                        // is still stored relabels — a late keep, or an
-                        // older relabel, committing after the row moved
-                        // keeps the stored plan/anchor. `None` read plan
-                        // never equals a stored plan, so an anchor-less
-                        // keep never relabels either.
-                        && outcome.read_plan.as_deref() == Some(existing.plan_id.as_str())
-                        && existing.paid_invoice_id == outcome.read_anchor;
-                    let stale = match (outcome.row.paid_through_unix, existing.paid_through_unix) {
-                        (Some(end), Some(previous)) => {
-                            end < previous
-                                || (end == previous
-                                    && outcome.row.paid_invoice_id.is_none()
-                                    && existing.paid_invoice_id.is_some())
-                        }
-                        _ => false,
-                    };
-                    let mut row = outcome.row.clone();
-                    if !advances && !relabels {
-                        row.paid_through_unix = existing.paid_through_unix;
-                        row.plan_id = existing.plan_id.clone();
-                        row.paid_invoice_id = existing.paid_invoice_id.clone();
-                    }
-                    if stale {
-                        row.status = existing.status.clone();
-                        row.grace_until_unix = existing.grace_until_unix;
-                    }
-                    row
-                }
-                _ => outcome.row.clone(),
+            let sub = &outcome.row.stripe_subscription_id;
+            if self
+                .billing_rows
+                .borrow()
+                .iter()
+                .any(|(owner, row)| owner != user_id && &row.stripe_subscription_id == sub)
+                || self
+                    .billing_shadow
+                    .borrow()
+                    .keys()
+                    .any(|(owner, id)| owner != user_id && id == sub)
+            {
+                return Err(StoreError);
+            }
+            use crate::billing_store_classification::{
+                classify_explicit_stale, validate_history_target, Target,
             };
-            rows.insert(user_id.to_string(), merged);
+            validate_history_target(outcome).map_err(|_| StoreError)?;
+            if outcome.explicit_stale {
+                let own_current = self
+                    .billing_rows
+                    .borrow()
+                    .get(user_id)
+                    .is_some_and(|row| &row.stripe_subscription_id == sub);
+                let own_shadow = self
+                    .billing_shadow
+                    .borrow()
+                    .contains_key(&(user_id.to_string(), sub.clone()));
+                let target = if own_current || own_shadow {
+                    // Explicit stale ignores the numeric suppression predicate.
+                    Target::Owned {
+                        predicate_stale: false,
+                        other_live_holder: false,
+                    }
+                } else {
+                    Target::Absent
+                };
+                classify_explicit_stale(&target, outcome.history.is_empty())
+                    .map_err(|_| StoreError)?;
+            }
+            if !outcome.explicit_stale {
+                let mut rows = self.billing_rows.borrow_mut();
+                let mut shadow = self.billing_shadow.borrow_mut();
+                let key = (
+                    user_id.to_string(),
+                    outcome.row.stripe_subscription_id.clone(),
+                );
+                let current = rows.get(user_id);
+                let stored = current
+                    .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
+                    .or_else(|| shadow.get(&key));
+                let merged = merge_billing_row(stored, outcome);
+                // Mirrors `uq_subscriptions_live_slot`: a different live
+                // subscription holding the slot aborts the write before any
+                // row or history mutation.
+                let live = |status: &str| {
+                    matches!(
+                        status,
+                        "incomplete" | "active" | "past_due" | "unpaid" | "paused"
+                    )
+                };
+                if current.is_some_and(|row| {
+                    row.stripe_subscription_id != merged.stripe_subscription_id
+                        && live(&row.status)
+                        && live(&merged.status)
+                }) {
+                    return Err(StoreError);
+                }
+                if let Some(existing) = current {
+                    if existing.stripe_subscription_id != merged.stripe_subscription_id {
+                        shadow.insert(
+                            (user_id.to_string(), existing.stripe_subscription_id.clone()),
+                            existing.clone(),
+                        );
+                    }
+                }
+                if let Some(retained) = shadow.get_mut(&key) {
+                    *retained = merged.clone();
+                }
+                rows.insert(user_id.to_string(), merged);
+            }
             let mut history = self.invoice_history.borrow_mut();
             for row in &outcome.history {
                 history
@@ -9460,10 +11235,7 @@ mod tests {
                                 return false;
                             }
                         }
-                        if req.paid_only && invoice.status != "paid" {
-                            return false;
-                        }
-                        true
+                        !req.paid_only || invoice.status == "paid"
                     })
                     .cloned()
                     .collect())
@@ -9795,7 +11567,7 @@ mod tests {
     }
 
     fn live_for(h: &Harness, user_id: &str) -> Option<crate::billing_reconcile::LiveRow> {
-        block_on(h.store.load_reconcile_input(user_id))
+        block_on(h.store.load_reconcile_input(user_id, None))
             .ok()
             .and_then(|input| input.live)
     }
@@ -10980,21 +12752,34 @@ mod tests {
             ),
             history: vec![history_row("in_test_2", BILLING_NOW + BILLING_PERIOD)],
             fail_closed: None,
+            explicit_stale: false,
             // Inserts (no stored row yet), so the guard never reads this.
             read_plan: None,
             read_anchor: None,
         };
         block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
-        let stale = crate::billing_reconcile::ReconcileOutcome {
+        let mut stale = crate::billing_reconcile::ReconcileOutcome {
             row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
             fail_closed: None,
+            explicit_stale: false,
             // Read the fresh row: strictly-older money, so the stale arm
             // fires on the ends regardless.
             read_plan: Some(PLAN_PLUS.to_string()),
             read_anchor: Some("in_test_2".to_string()),
         };
+        stale.row.stripe_customer_id = "cus_delayed".into();
+        stale.row.stripe_item_id = "si_delayed".into();
+        stale.row.stripe_price_id = PRICE_PRO.into();
+        stale.row.plan_id = PLAN_PRO.into();
+        stale.row.current_period_end_unix = Some(BILLING_NOW - 1);
+        stale.row.cancel_at_period_end = true;
         block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("stale stores");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
+        stale.row.paid_through_unix = fresh.row.paid_through_unix;
+        stale.row.paid_invoice_id = None;
+        block_on(h.store.store_reconcile_outcome("u1", &stale)).expect("tie stores");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
         let live = live_for(&h, "u1").expect("live row stored");
         assert_eq!(
             live.paid_through_unix,
@@ -11023,6 +12808,12 @@ mod tests {
             2,
             "both paid invoices keep their history rows"
         );
+        let mut next = stale.clone();
+        next.row.paid_through_unix = Some(BILLING_NOW + 2 * BILLING_PERIOD);
+        next.row.paid_invoice_id = Some("in_next".into());
+        next.history.clear();
+        block_on(h.store.store_reconcile_outcome("u1", &next)).expect("fresh update stores");
+        assert_eq!(h.store.billing_rows.borrow()["u1"], next.row);
     }
 
     /// Fold input over the handlers-test bindings (PLUS/PRO): stored live
@@ -11075,10 +12866,700 @@ mod tests {
             },
             history: vec![],
             fail_closed: None,
+            explicit_stale: false,
             // Seeds commit as inserts (no stored row yet), so the
             // equal-end adopt arm never reads this.
             read_plan: None,
             read_anchor: None,
+        }
+    }
+
+    #[test]
+    fn billing_live_slot_conflict_rolls_back_checkout_and_webhook_reconcile() {
+        // Anchored live A holds the slot; a paid B (A's anchor absent from
+        // its invoices) resolves to any live status. The store must fail
+        // with its normal error before row or history mutation, so the
+        // checkout does not succeed and the webhook is retried.
+        let live = ["incomplete", "active", "past_due", "unpaid", "paused"];
+        for a_status in live {
+            for b_status in live {
+                for webhook in [false, true] {
+                    let h = stripe_harness();
+                    seed_billing_user(&h, "u1");
+                    let end = BILLING_NOW + BILLING_PERIOD;
+                    let a = stored_seed(PLAN_PLUS, a_status, Some(end), Some("in_a"), None);
+                    h.store.billing_rows.borrow_mut().insert("u1".into(), a.row);
+                    block_on(h.store.create_checkout_operation(
+                        "op_b",
+                        "u1",
+                        PRICE_PLUS,
+                        Some("cus_test_1"),
+                    ))
+                    .expect("op insert");
+                    block_on(h.store.update_checkout_operation(
+                        "op_b",
+                        "submitted",
+                        PRICE_PLUS,
+                        Some("cs_b"),
+                    ))
+                    .expect("mark submitted");
+                    let session = test_session(
+                        "cs_b",
+                        "complete",
+                        "paid",
+                        Some("cus_test_1"),
+                        Some("sub_b"),
+                        Some("op_b"),
+                    );
+                    h.stripe
+                        .sessions
+                        .borrow_mut()
+                        .insert("cs_b".into(), session);
+                    h.stripe.subscriptions.borrow_mut().insert(
+                        "sub_b".into(),
+                        test_subscription("sub_b", "cus_test_1", b_status, PRICE_PLUS),
+                    );
+                    let invoice = test_invoice(
+                        "in_b",
+                        "cus_test_1",
+                        "sub_b",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end + BILLING_PERIOD,
+                        BILLING_NOW + 60,
+                    );
+                    h.stripe
+                        .invoices
+                        .borrow_mut()
+                        .insert("in_b".into(), invoice);
+                    let rows = h.store.billing_rows.borrow().clone();
+                    let shadow = h.store.billing_shadow.borrow().clone();
+                    let history = h.store.invoice_history.borrow().clone();
+                    let case = format!("{a_status}/{b_status}/webhook={webhook}");
+                    if webhook {
+                        let body = checkout_completed_body("evt_b", "cs_b", false);
+                        let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+                        assert_eq!(resp.status, 500, "{case}");
+                        assert!(h.store.webhook_events.borrow().is_empty(), "{case}");
+                    } else {
+                        // `ensure_checkout_session` refuses a live A before
+                        // reaching its completed-session branch, so drive
+                        // that branch's shared driver directly.
+                        let result = block_on(reconcile_checkout_session(&h.ctx(), "cs_b"));
+                        assert_eq!(result, Err(()), "{case}");
+                    }
+                    let op = block_on(h.store.checkout_operation_by_id("op_b"))
+                        .expect("op lookup")
+                        .expect("op stored");
+                    assert_eq!(op.state, "submitted", "{case}: not succeeded");
+                    assert_eq!(*h.store.billing_rows.borrow(), rows, "{case}");
+                    assert_eq!(*h.store.billing_shadow.borrow(), shadow, "{case}");
+                    assert_eq!(*h.store.invoice_history.borrow(), history, "{case}");
+                    assert_eq!(*h.stripe.sessions_created.borrow(), 0, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn billing_shadow_preserves_per_user_projection() {
+        let h = stripe_harness();
+        let first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
+        block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
+        let mut second = first.clone();
+        second.row.stripe_subscription_id = "sub_second".into();
+        block_on(h.store.store_reconcile_outcome("u2", &second)).unwrap();
+
+        let mut replacement = stored_seed(PLAN_PLUS, "canceled", None, None, None);
+        replacement.row.stripe_subscription_id = "sub_other".to_string();
+        block_on(h.store.store_reconcile_outcome("u1", &replacement)).unwrap();
+        assert!(
+            live_for(&h, "u1").is_none(),
+            "terminal projection remains hidden"
+        );
+        assert_eq!(
+            live_for(&h, "u2").unwrap().stripe_subscription_id,
+            "sub_second"
+        );
+        let shadow = h.store.billing_shadow.borrow();
+        let displaced = &shadow[&(String::from("u1"), String::from("sub_test_1"))];
+        assert_eq!(displaced.status, "active");
+        assert_eq!(displaced.paid_through_unix, Some(BILLING_NOW));
+        assert_eq!(displaced.paid_invoice_id.as_deref(), Some("in_1"));
+        assert_eq!(shadow.len(), 1);
+        drop(shadow);
+
+        block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
+        assert_eq!(
+            live_for(&h, "u1").unwrap().stripe_subscription_id,
+            "sub_test_1"
+        );
+        let shadow = h.store.billing_shadow.borrow();
+        assert_eq!(
+            shadow[&(String::from("u1"), String::from("sub_other"))].status,
+            "canceled"
+        );
+        assert_eq!(shadow.len(), 2);
+    }
+
+    #[test]
+    fn billing_fake_rejects_foreign_identity_without_mutation() {
+        for (owner_status, shadow_only, holder, incoming_history) in [
+            ("active", false, false, false),
+            ("active", false, true, true),
+            ("canceled", false, false, true),
+            ("canceled", true, false, true),
+            ("canceled", true, true, true),
+        ] {
+            let h = stripe_harness();
+            let mut owner = stored_seed(PLAN_PLUS, owner_status, Some(100), Some("in_a"), None);
+            owner
+                .history
+                .push(crate::billing_reconcile::PaidInvoiceRow {
+                    stripe_invoice_id: "in_a".into(),
+                    stripe_subscription_id: "sub_test_1".into(),
+                    plan_id: PLAN_PLUS.into(),
+                    period_start_unix: 0,
+                    period_end_unix: 100,
+                    amount_cents: 1_000,
+                    currency: "usd".into(),
+                    paid_at_unix: 1,
+                });
+            block_on(h.store.store_reconcile_outcome("u1", &owner)).unwrap();
+            if shadow_only {
+                let mut replacement = stored_seed(PLAN_PLUS, "active", None, None, None);
+                replacement.row.stripe_subscription_id = "sub_replacement".into();
+                block_on(h.store.store_reconcile_outcome("u1", &replacement)).unwrap();
+            }
+            if holder {
+                let mut own = stored_seed(PLAN_PLUS, "active", None, None, None);
+                own.row.stripe_subscription_id = "sub_holder".into();
+                block_on(h.store.store_reconcile_outcome("u2", &own)).unwrap();
+            }
+            let mut incoming = owner.clone();
+            incoming.row.status = "active".into();
+            incoming.row.plan_id = PLAN_PRO.into();
+            incoming.row.paid_through_unix = Some(200);
+            if incoming_history {
+                incoming.history[0].stripe_invoice_id = "in_foreign".into();
+                incoming.history[0].period_end_unix = 200;
+            } else {
+                incoming.history.clear();
+            }
+            let rows = h.store.billing_rows.borrow().clone();
+            let shadow = h.store.billing_shadow.borrow().clone();
+            let history = h.store.invoice_history.borrow().clone();
+            let projections = (live_for(&h, "u1"), live_for(&h, "u2"));
+            for _ in 0..2 {
+                assert!(block_on(h.store.store_reconcile_outcome("u2", &incoming)).is_err());
+                assert_eq!(*h.store.billing_rows.borrow(), rows);
+                assert_eq!(*h.store.billing_shadow.borrow(), shadow);
+                assert_eq!(*h.store.invoice_history.borrow(), history);
+                assert_eq!((live_for(&h, "u1"), live_for(&h, "u2")), projections);
+            }
+        }
+    }
+
+    #[test]
+    fn billing_webhook_foreign_owner_retries_after_attribution_repair() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        seed_billing_user(&h, "u2");
+        deliver_first_period(&h, "evt_original");
+        let owner_before = h.store.billing_rows.borrow()["u1"].clone();
+        let history_before = h.store.invoice_history.borrow().clone();
+        block_on(h.store.create_checkout_operation(
+            "op_collision",
+            "u2",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .expect("incoming op");
+        block_on(h.store.update_checkout_operation(
+            "op_collision",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_collision"),
+        ))
+        .expect("submitted op");
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_collision".into(),
+            test_session(
+                "cs_collision",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_collision"),
+            ),
+        );
+        let body = checkout_completed_body("evt_collision", "cs_collision", false);
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+            500
+        );
+        assert_eq!(h.store.billing_rows.borrow()["u1"], owner_before);
+        assert_eq!(*h.store.invoice_history.borrow(), history_before);
+        assert!(live_for(&h, "u2").is_none());
+        let op = block_on(h.store.checkout_operation_by_id("op_collision"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(op.state, "succeeded");
+        assert!(!h.store.webhook_events.borrow().contains("evt_collision"));
+        for _ in 0..2 {
+            assert_eq!(
+                block_on(ensure_checkout_session(
+                    &h.ctx(),
+                    "u2",
+                    PRICE_PLUS,
+                    "https://example.com/ok",
+                    "https://example.com/cancel",
+                    None,
+                )),
+                Err(EnsureCheckoutError::Failed)
+            );
+            assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+            assert_ne!(
+                block_on(h.store.checkout_operation_by_id("op_collision"))
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "succeeded"
+            );
+            assert_eq!(h.store.billing_rows.borrow()["u1"], owner_before);
+            assert_eq!(*h.store.invoice_history.borrow(), history_before);
+            assert!(live_for(&h, "u2").is_none());
+        }
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut("op_collision")
+            .unwrap()
+            .user_id = "u1".into();
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(h.store.billing_rows.borrow()["u1"], owner_before);
+        assert_eq!(*h.store.invoice_history.borrow(), history_before);
+        assert_eq!(
+            block_on(h.store.checkout_operation_by_id("op_collision"))
+                .unwrap()
+                .unwrap()
+                .state,
+            "succeeded"
+        );
+    }
+
+    #[test]
+    fn billing_webhook_retries_when_stale_target_disappears_after_read() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let seed = stored_seed(
+            PLAN_PLUS,
+            "active",
+            Some(BILLING_NOW + BILLING_PERIOD),
+            Some("in_newer"),
+            None,
+        );
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_1".into(),
+            test_session(
+                "cs_test_1",
+                "complete",
+                "paid",
+                Some("cus_test_1"),
+                Some("sub_test_1"),
+                Some("op_test_1"),
+            ),
+        );
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".into(),
+            test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+        );
+        // Stripe's exhausted listing is missing the read row's invoice anchor.
+        h.stripe.invoices.borrow_mut().insert(
+            "in_old".into(),
+            test_invoice(
+                "in_old",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                BILLING_NOW,
+                BILLING_NOW - 100,
+            ),
+        );
+        block_on(h.store.create_checkout_operation(
+            "op_test_1",
+            "u1",
+            PRICE_PLUS,
+            Some("cus_test_1"),
+        ))
+        .unwrap();
+        block_on(h.store.update_checkout_operation(
+            "op_test_1",
+            "submitted",
+            PRICE_PLUS,
+            Some("cs_test_1"),
+        ))
+        .unwrap();
+        let op = || {
+            block_on(h.store.checkout_operation_by_id("op_test_1"))
+                .unwrap()
+                .unwrap()
+        };
+        let deliver = |event| {
+            let body = checkout_completed_body(event, "cs_test_1", false);
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW)))
+        };
+        let submitted = op();
+        assert_eq!(submitted.state, "submitted");
+        for _ in 0..2 {
+            block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+            h.store.remove_billing_row_after_read.set(true);
+            assert_eq!(deliver("evt_row6").status, 500);
+            assert!(!h.store.remove_billing_row_after_read.get());
+            assert!(!h.store.webhook_events.borrow().contains("evt_row6"));
+            assert_eq!(op(), submitted);
+            assert_eq!(h.store.checkout_ops.borrow().len(), 1);
+            assert!(h.store.billing_rows.borrow().is_empty());
+            assert!(h.store.billing_shadow.borrow().is_empty());
+            assert!(h.store.invoice_history.borrow().is_empty());
+        }
+        // An independently restored own target makes that stale fold safe to retry.
+        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+        for _ in 0..2 {
+            let attempts = h.store.reconcile_outcome_attempts.get();
+            webhook_ok(&deliver("evt_row6"));
+            // A duplicate must reach persistence, not just acknowledge the claim.
+            assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts + 1);
+            assert!(h.store.webhook_events.borrow().contains("evt_row6"));
+            assert_eq!(op().state, "succeeded");
+            assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
+            let history = h.store.invoice_history.borrow();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history["in_old"].stripe_subscription_id, "sub_test_1");
+        }
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+    }
+
+    #[test]
+    fn billing_target_selector_preserves_none_and_isolates_user_and_id() {
+        let h = stripe_harness();
+        let a = stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_100"), Some(10));
+        let mut b = stored_seed(PLAN_PLUS, "active", Some(200), Some("in_200"), None);
+        b.row.stripe_subscription_id = "sub_other".into();
+        let mut stale = a.clone();
+        stale.row.paid_through_unix = Some(50);
+        for row in [&a, &b, &stale, &b] {
+            block_on(h.store.store_reconcile_outcome("u1", row)).unwrap();
+        }
+        let select = |user, target| {
+            block_on(h.store.load_reconcile_input(user, target))
+                .unwrap()
+                .live
+        };
+        let retained = select("u1", Some("sub_test_1")).unwrap();
+        assert_eq!(retained.status, "canceled");
+        assert_eq!(retained.paid_through_unix, Some(100));
+        assert_eq!(retained.paid_invoice_id.as_deref(), Some("in_100"));
+        assert_eq!(retained.grace_until_unix, Some(10));
+        assert_eq!(
+            select("u1", None).unwrap().stripe_subscription_id,
+            "sub_other"
+        );
+        assert_eq!(select("u1", Some("sub_other")).unwrap().status, "active");
+        assert!(select("u2", Some("sub_test_1")).is_none());
+        assert!(select("u1", Some("missing")).is_none());
+        let mut other = a.clone();
+        other.row.stripe_subscription_id = "sub_u2".into();
+        other.row.paid_through_unix = Some(999);
+        block_on(h.store.store_reconcile_outcome("u2", &other)).unwrap();
+        assert!(select("u2", Some("sub_test_1")).is_none());
+        assert_eq!(
+            select("u2", Some("sub_u2")).unwrap().paid_through_unix,
+            Some(999)
+        );
+        let mut current = b.row.clone();
+        current.paid_through_unix = Some(123);
+        h.store
+            .billing_rows
+            .borrow_mut()
+            .insert("u1".into(), current);
+        h.store
+            .billing_shadow
+            .borrow_mut()
+            .insert(("u1".into(), "sub_other".into()), b.row.clone());
+        assert_eq!(
+            select("u1", Some("sub_other")).unwrap().paid_through_unix,
+            Some(123)
+        );
+        *h.store.fail_billing.borrow_mut() = true;
+        assert!(block_on(h.store.load_reconcile_input("u1", Some("sub_test_1"))).is_err());
+        assert!(block_on(h.store.load_reconcile_input("u1", None)).is_err());
+    }
+
+    #[test]
+    fn billing_shadow_retains_rows_across_repeated_displacement() {
+        let h = stripe_harness();
+        let a = stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_100"), Some(10));
+        let mut b = stored_seed(PLAN_PLUS, "canceled", None, None, None);
+        b.row.stripe_subscription_id = "sub_other".to_string();
+        let mut other = a.clone();
+        other.row.stripe_subscription_id = "sub_user_2".to_string();
+        other.row.paid_through_unix = Some(999);
+        let put = |user: &str, outcome: &crate::billing_reconcile::ReconcileOutcome| {
+            block_on(h.store.store_reconcile_outcome(user, outcome)).unwrap();
+        };
+        let key = ("u1".to_string(), "sub_test_1".to_string());
+        put("u1", &a);
+        put("u2", &other);
+        put("u1", &b);
+        assert!(live_for(&h, "u1").is_none());
+        let before_rows = h.store.billing_rows.borrow().clone();
+        let before_shadow = h.store.billing_shadow.borrow().clone();
+        let before_history = h.store.invoice_history.borrow().clone();
+        *h.store.fail_billing.borrow_mut() = true;
+        assert!(block_on(h.store.store_reconcile_outcome("u1", &a)).is_err());
+        *h.store.fail_billing.borrow_mut() = false;
+        assert_eq!(*h.store.billing_rows.borrow(), before_rows);
+        assert_eq!(*h.store.billing_shadow.borrow(), before_shadow);
+        assert_eq!(*h.store.invoice_history.borrow(), before_history);
+        let mut stale = a.clone();
+        stale.row.paid_through_unix = Some(50);
+        stale.row.status = "incomplete_expired".to_string();
+        stale.row.stripe_customer_id = "cus_stale".into();
+        stale.row.stripe_item_id = "si_stale".into();
+        stale.row.stripe_price_id = "price_stale".into();
+        stale.row.current_period_end_unix = Some(50);
+        stale.row.cancel_at_period_end = true;
+        let expected = a.row.clone();
+        for _ in 0..2 {
+            put("u1", &stale);
+            assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
+            assert_eq!(h.store.billing_shadow.borrow()[&key], expected);
+            assert!(live_for(&h, "u1").is_none());
+            put("u1", &b);
+            assert_eq!(h.store.billing_rows.borrow()["u1"], b.row);
+            assert_eq!(h.store.billing_shadow.borrow()[&key], expected);
+        }
+        let mut advanced = a.clone();
+        advanced.row.paid_through_unix = Some(150);
+        advanced.row.plan_id = PLAN_PRO.to_string();
+        advanced.row.paid_invoice_id = Some("in_150".to_string());
+        put("u1", &advanced);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], advanced.row);
+        assert_eq!(h.store.billing_shadow.borrow()[&key], advanced.row);
+        advanced.row.paid_through_unix = Some(200);
+        advanced.row.paid_invoice_id = Some("in_200".to_string());
+        put("u1", &advanced);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], advanced.row);
+        assert_eq!(h.store.billing_shadow.borrow()[&key], advanced.row);
+        put("u1", &b);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], b.row);
+        put("u1", &a);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], advanced.row);
+        assert_eq!(h.store.billing_shadow.borrow()[&key], advanced.row);
+        assert_eq!(h.store.billing_rows.borrow()["u2"], other.row);
+
+        // A directly seeded current row wins over a disagreeing shadow copy.
+        let mut seeded = advanced.row.clone();
+        seeded.paid_through_unix = Some(120);
+        h.store
+            .billing_rows
+            .borrow_mut()
+            .insert("u1".into(), seeded.clone());
+        put("u1", &a);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], seeded);
+        assert_eq!(h.store.billing_shadow.borrow()[&key], seeded);
+
+        // The projection filter is unchanged, but retained status changes its result.
+        for (stored_status, incoming_status, visible) in
+            [("active", "canceled", true), ("canceled", "active", false)]
+        {
+            let h = stripe_harness();
+            let stored = stored_seed(PLAN_PLUS, stored_status, Some(100), Some("in_100"), None);
+            let mut incoming = stored.clone();
+            incoming.row.status = incoming_status.into();
+            incoming.row.paid_through_unix = Some(50);
+            for outcome in [&stored, &b, &incoming] {
+                block_on(h.store.store_reconcile_outcome("u1", outcome)).unwrap();
+            }
+            assert_eq!(h.store.billing_rows.borrow()["u1"], stored.row);
+            assert_eq!(live_for(&h, "u1").is_some(), visible);
+        }
+    }
+
+    #[test]
+    fn billing_shadow_matches_existing_upsert_field_guards() {
+        for case in [
+            "valid",
+            "shared",
+            "read-plan",
+            "read-anchor",
+            "no-anchor",
+            "null-end",
+            "first-end",
+            "advance-null-anchor",
+        ] {
+            let h = stripe_harness();
+            let mut stored =
+                stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_old"), Some(10));
+            if case == "first-end" {
+                stored.row.paid_through_unix = None;
+            }
+            let mut replacement = stored.clone();
+            replacement.row.stripe_subscription_id = "sub_other".into();
+            replacement.row.status = "canceled".into();
+            let mut incoming = stored_seed(
+                PLAN_PRO,
+                "incomplete_expired",
+                Some(100),
+                Some("in_new"),
+                Some(20),
+            );
+            incoming.row.stripe_customer_id = "cus_new".into();
+            incoming.row.stripe_item_id = "si_new".into();
+            incoming.row.stripe_price_id = "price_new".into();
+            incoming.row.current_period_end_unix = Some(200);
+            incoming.row.cancel_at_period_end = true;
+            incoming.read_plan = Some(PLAN_PLUS.into());
+            incoming.read_anchor = Some("in_old".into());
+            match case {
+                "shared" => incoming.row.paid_invoice_id = Some("in_old".into()),
+                "read-plan" => incoming.read_plan = Some(PLAN_PRO.into()),
+                "read-anchor" => incoming.read_anchor = Some("in_wrong".into()),
+                "no-anchor" | "advance-null-anchor" => incoming.row.paid_invoice_id = None,
+                "null-end" => incoming.row.paid_through_unix = None,
+                _ => {}
+            }
+            if case == "advance-null-anchor" {
+                incoming.row.paid_through_unix = Some(150);
+            }
+            let mut expected = incoming.row.clone();
+            if matches!(case, "read-plan" | "read-anchor" | "no-anchor" | "null-end") {
+                expected.paid_through_unix = stored.row.paid_through_unix;
+                expected.plan_id = stored.row.plan_id.clone();
+                expected.paid_invoice_id = stored.row.paid_invoice_id.clone();
+            } else if case == "advance-null-anchor" {
+                expected.paid_invoice_id = stored.row.paid_invoice_id.clone();
+            }
+            if case == "no-anchor" {
+                expected = stored.row.clone();
+            }
+            for outcome in [&stored, &replacement, &incoming] {
+                block_on(h.store.store_reconcile_outcome("u1", outcome)).unwrap();
+            }
+            let key = ("u1".to_string(), "sub_test_1".to_string());
+            assert_eq!(
+                h.store.billing_rows.borrow()["u1"],
+                expected,
+                "{case} current"
+            );
+            assert_eq!(
+                h.store.billing_shadow.borrow()[&key],
+                expected,
+                "{case} retained"
+            );
+            if case == "advance-null-anchor" {
+                let fresh = stripe_harness();
+                for outcome in [&stored, &incoming] {
+                    block_on(fresh.store.store_reconcile_outcome("u1", outcome)).unwrap();
+                }
+                assert_eq!(fresh.store.billing_rows.borrow()["u1"], expected, "same-ID");
+            }
+        }
+    }
+
+    #[test]
+    fn billing_equal_end_selection_and_fresh_update_through_store() {
+        for (tied_payment, expected) in [(false, "in_a"), (true, "in_z")] {
+            for reverse in [false, true] {
+                let h = stripe_harness();
+                seed_billing_user(&h, "u1");
+                let end = BILLING_NOW + BILLING_PERIOD;
+                let seed = test_invoice(
+                    "in_seed",
+                    "cus_test_1",
+                    "sub_test_1",
+                    PRICE_PLUS,
+                    BILLING_NOW - BILLING_PERIOD,
+                    BILLING_NOW,
+                    BILLING_NOW - 100,
+                );
+                let mut invoices = vec![
+                    test_invoice(
+                        "in_z",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end,
+                        BILLING_NOW,
+                    ),
+                    test_invoice(
+                        "in_a",
+                        "cus_test_1",
+                        "sub_test_1",
+                        PRICE_PLUS,
+                        BILLING_NOW,
+                        end,
+                        BILLING_NOW + i64::from(!tied_payment),
+                    ),
+                ];
+                if reverse {
+                    invoices.reverse();
+                }
+                // Assign values to existing fake-map slots in iteration order so
+                // the actual caller receives both listings without changing the fake.
+                {
+                    let mut listed = h.stripe.invoices.borrow_mut();
+                    listed.insert("slot_a".into(), invoices[0].clone());
+                    listed.insert("slot_b".into(), invoices[1].clone());
+                    listed.insert("in_seed".into(), seed);
+                    let slots: Vec<_> = listed
+                        .keys()
+                        .filter(|k| k.starts_with("slot_"))
+                        .cloned()
+                        .collect();
+                    for (slot, invoice) in slots.into_iter().zip(invoices) {
+                        *listed.get_mut(&slot).unwrap() = invoice;
+                    }
+                }
+                h.stripe.subscriptions.borrow_mut().insert(
+                    "sub_test_1".into(),
+                    test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS),
+                );
+                block_on(h.store.store_reconcile_outcome(
+                    "u1",
+                    &stored_seed(
+                        PLAN_PLUS,
+                        "active",
+                        Some(BILLING_NOW),
+                        Some("in_seed"),
+                        None,
+                    ),
+                ))
+                .unwrap();
+                let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+                    .expect("caller reconciles");
+                assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some(expected));
+                let live = live_for(&h, "u1").unwrap();
+                assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(live.paid_through_unix, Some(end));
+
+                h.stripe
+                    .subscriptions
+                    .borrow_mut()
+                    .get_mut("sub_test_1")
+                    .unwrap()
+                    .status = "past_due".into();
+                block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+                    .expect("fresh caller update");
+                let live = live_for(&h, "u1").unwrap();
+                assert_eq!(live.status, "past_due");
+                assert_eq!(live.paid_invoice_id.as_deref(), Some(expected));
+                assert_eq!(live.paid_through_unix, Some(end));
+                assert_eq!(h.store.invoice_history.borrow().len(), 3);
+            }
         }
     }
 
@@ -11152,6 +13633,77 @@ mod tests {
         );
         assert_eq!(live.status, "active");
         assert!(live.grace_until_unix.is_none());
+    }
+
+    #[test]
+    fn billing_explicit_stale_fold_never_changes_stored_fields() {
+        let h = stripe_harness();
+        let end = BILLING_NOW + BILLING_PERIOD;
+        let seed = stored_seed(PLAN_PLUS, "active", Some(end), Some("in_seed"), None);
+        let mut subscription = test_subscription("sub_test_1", "cus_test_1", "active", PRICE_PLUS);
+        subscription.cancel_at_period_end = true;
+        subscription.current_period_end = Some(end + 100);
+        let remote = crate::billing_reconcile::RemoteSubscription {
+            subscription,
+            invoices: vec![test_invoice(
+                "in_old",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW - BILLING_PERIOD,
+                BILLING_NOW,
+                BILLING_NOW - 100,
+            )],
+        };
+        let stale = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_seed")),
+            &remote,
+            BILLING_NOW,
+        );
+        assert!(stale.explicit_stale);
+        assert_eq!(stale.history.len(), 1);
+        // The same fold needs a freshly observed owner before appending history.
+        assert!(block_on(h.store.store_reconcile_outcome("u1", &stale)).is_err());
+        let mut empty = stale.clone();
+        empty.history.clear();
+        block_on(h.store.store_reconcile_outcome("u1", &empty)).unwrap();
+        assert!(h.store.billing_rows.borrow().is_empty());
+        assert!(h.store.billing_shadow.borrow().is_empty());
+        assert!(h.store.invoice_history.borrow().is_empty());
+
+        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+        let mut misattributed = stale.clone();
+        misattributed.history[0].stripe_subscription_id = "sub_other".into();
+        assert!(block_on(h.store.store_reconcile_outcome("u1", &misattributed)).is_err());
+        assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
+        assert!(h.store.invoice_history.borrow().is_empty());
+        block_on(h.store.store_reconcile_outcome("u1", &stale)).unwrap();
+        assert_eq!(h.store.billing_rows.borrow()["u1"], seed.row);
+        assert!(h.store.invoice_history.borrow().contains_key("in_old"));
+        let fresh_remote = crate::billing_reconcile::RemoteSubscription {
+            invoices: vec![test_invoice(
+                "in_seed",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                BILLING_NOW,
+                end,
+                BILLING_NOW,
+            )],
+            ..remote
+        };
+        let fresh = crate::billing_reconcile::reconcile_subscription(
+            &fold_input(PLAN_PLUS, "active", Some(end), None, Some("in_seed")),
+            &fresh_remote,
+            BILLING_NOW,
+        );
+        assert!(!fresh.explicit_stale);
+        block_on(h.store.store_reconcile_outcome("u1", &fresh)).unwrap();
+        assert!(h.store.billing_rows.borrow()["u1"].cancel_at_period_end);
+        assert_eq!(
+            h.store.billing_rows.borrow()["u1"].current_period_end_unix,
+            Some(end + 100)
+        );
     }
 
     #[test]
@@ -11347,6 +13899,192 @@ mod tests {
             Some("in_seed"),
             "the anchor stays with the recovery"
         );
+    }
+
+    #[test]
+    fn billing_stale_held_and_terminal_commit_orders_keep_fresh_status_and_grace() {
+        // Both passes fold the same stored row. Only the fresh snapshot
+        // contains its anchor; equal coverage must not hide stale evidence
+        // when the held/terminal pass commits after a status/grace change.
+        let end = BILLING_NOW + BILLING_PERIOD;
+        let grace = end + crate::billing_reconcile::RENEWAL_GRACE_SECS;
+        for status in [
+            "incomplete",
+            "unpaid",
+            "paused",
+            "canceled",
+            "incomplete_expired",
+        ] {
+            for (before, after) in [("active", "past_due"), ("past_due", "active")] {
+                for empty in [false, true] {
+                    for stale_first in [false, true] {
+                        let h = stripe_harness();
+                        seed_billing_user(&h, "u1");
+                        let initial_grace = (before == "past_due").then_some(grace);
+                        block_on(h.store.store_reconcile_outcome(
+                            "u1",
+                            &stored_seed(
+                                PLAN_PLUS,
+                                before,
+                                Some(end),
+                                Some("in_seed"),
+                                initial_grace,
+                            ),
+                        ))
+                        .expect("seed stores");
+                        let input = fold_input(
+                            PLAN_PLUS,
+                            before,
+                            Some(end),
+                            initial_grace,
+                            Some("in_seed"),
+                        );
+                        let invoice = |id, invoice_end| {
+                            test_invoice(
+                                id,
+                                "cus_test_1",
+                                "sub_test_1",
+                                PRICE_PLUS,
+                                BILLING_NOW - BILLING_PERIOD,
+                                invoice_end,
+                                BILLING_NOW,
+                            )
+                        };
+                        let stale = crate::billing_reconcile::reconcile_subscription(
+                            &input,
+                            &crate::billing_reconcile::RemoteSubscription {
+                                subscription: test_subscription(
+                                    "sub_test_1",
+                                    "cus_test_1",
+                                    status,
+                                    PRICE_PLUS,
+                                ),
+                                invoices: if empty {
+                                    vec![]
+                                } else {
+                                    vec![invoice("in_old", BILLING_NOW)]
+                                },
+                            },
+                            BILLING_NOW,
+                        );
+                        assert_eq!(stale.fail_closed, None);
+                        assert_eq!(stale.row.status, before);
+                        assert_eq!(stale.row.grace_until_unix, initial_grace);
+                        assert_eq!(stale.row.paid_through_unix, Some(end));
+                        assert_eq!(
+                            stale.row.paid_invoice_id, None,
+                            "stale evidence, never a re-pin"
+                        );
+                        assert_eq!(stale.read_anchor.as_deref(), Some("in_seed"));
+                        assert!(
+                            stale.history.is_empty(),
+                            "held/terminal paths do not backfill history"
+                        );
+                        let fresh = crate::billing_reconcile::reconcile_subscription(
+                            &input,
+                            &crate::billing_reconcile::RemoteSubscription {
+                                subscription: test_subscription(
+                                    "sub_test_1",
+                                    "cus_test_1",
+                                    after,
+                                    PRICE_PLUS,
+                                ),
+                                invoices: vec![invoice("in_seed", end)],
+                            },
+                            BILLING_NOW,
+                        );
+                        let commits = if stale_first {
+                            [&stale, &fresh]
+                        } else {
+                            [&fresh, &stale]
+                        };
+                        for outcome in commits {
+                            block_on(h.store.store_reconcile_outcome("u1", outcome))
+                                .expect("pass stores");
+                        }
+                        let row = h.store.billing_rows.borrow()["u1"].clone();
+                        assert_eq!(
+                            row.status, after,
+                            "{status}, empty={empty}, stale_first={stale_first}"
+                        );
+                        assert_eq!(row.grace_until_unix, (after == "past_due").then_some(grace));
+                        assert_eq!(row.plan_id, PLAN_PLUS);
+                        assert_eq!(row.paid_through_unix, Some(end));
+                        assert_eq!(row.paid_invoice_id.as_deref(), Some("in_seed"));
+                        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn billing_permuted_invoice_history_replays_idempotently() {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let line = |price, start, end| {
+            test_invoice(
+                "in_mix",
+                "cus_test_1",
+                "sub_test_1",
+                price,
+                BILLING_NOW + start,
+                BILLING_NOW + end,
+                BILLING_NOW,
+            )
+            .lines
+            .expect("lines")
+            .data
+            .remove(0)
+        };
+        let lines = [
+            line(PRICE_PRO, 1, 10),
+            line(PRICE_PLUS, 0, 15),
+            line(PRICE_PRO, 10, 30),
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut invoice = test_invoice(
+                "in_mix",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PRO,
+                BILLING_NOW + 1,
+                BILLING_NOW + 30,
+                BILLING_NOW,
+            );
+            invoice.lines.as_mut().expect("lines").data = order.map(|i| lines[i].clone()).to_vec();
+            let input = block_on(h.store.load_reconcile_input("u1", None)).expect("input loads");
+            let outcome = crate::billing_reconcile::reconcile_subscription(
+                &input,
+                &crate::billing_reconcile::RemoteSubscription {
+                    subscription: test_subscription(
+                        "sub_test_1",
+                        "cus_test_1",
+                        "active",
+                        PRICE_PRO,
+                    ),
+                    invoices: vec![invoice],
+                },
+                BILLING_NOW,
+            );
+            assert_eq!(outcome.history.len(), 1);
+            assert_eq!(outcome.history[0].period_start_unix, BILLING_NOW + 1);
+            block_on(h.store.store_reconcile_outcome("u1", &outcome)).expect("replay stores");
+            let history = h.store.invoice_history.borrow();
+            assert_eq!(
+                history.len(),
+                1,
+                "all permutations retain the same invoice identity"
+            );
+            assert_eq!(history["in_mix"], outcome.history[0]);
+        }
     }
 
     #[test]
@@ -12792,6 +15530,2174 @@ mod tests {
         cookie_of(&resp)
     }
 
+    #[test]
+    fn preference_authentication_is_session_only_and_fail_closed() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/me/likes".into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob"}"#.to_vec(),
+        };
+        for mutation in [false, true] {
+            let (claims, _) =
+                block_on(preference_authenticate(&h.ctx(), &req, mutation)).expect("valid session");
+            assert_eq!(claims.user_id, "alice");
+        }
+        req.cookie = Some(bob);
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, false))
+                .ok()
+                .unwrap()
+                .0
+                .user_id,
+            "bob"
+        );
+        req.cookie = Some(alice.clone());
+        req.origin = Some("https://wrong.example".into());
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, true))
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        req.origin = Some(ORIGIN.into());
+        req.authorization = Some("Bearer ntk_test".into());
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, false))
+                .err()
+                .unwrap()
+                .status,
+            404
+        );
+        req.authorization = None;
+        req.cookie = None;
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, false))
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        req.cookie = Some(format!("{}=invalid", alice.split('=').next().unwrap()));
+        assert_eq!(
+            block_on(preference_authenticate(&h.ctx(), &req, false))
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(
+            block_on(preference_authenticate(&expired, &req, false))
+                .err()
+                .unwrap()
+                .status,
+            401
+        );
+        h.store.deleting_users.borrow_mut().insert("alice".into());
+        let deleting = block_on(preference_authenticate(&h.ctx(), &req, false))
+            .err()
+            .unwrap();
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        let unavailable_response = block_on(preference_authenticate(&h.ctx(), &req, false))
+            .err()
+            .unwrap();
+        assert_eq!(unavailable_response.body, unavailable().body);
+        assert_eq!(unavailable_response.status, 503);
+        for path in [
+            "/v1/me/likes/",
+            "/v1/me/taste/",
+            "/v1/me/history/",
+            "/v1/me/private-session/",
+        ] {
+            assert_eq!(
+                h.call_full("GET", path, None, req.cookie.clone(), Some(ORIGIN))
+                    .status,
+                404
+            );
+            assert_eq!(
+                h.call_full("OPTIONS", path, None, None, Some(ORIGIN))
+                    .status,
+                404
+            );
+        }
+    }
+
+    #[test]
+    fn dispatched_likes_returns_only_the_sessions_newest_likes() {
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::{Hide, Love};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let put = |owner: &str, id: &str, signal, at| {
+            block_on(h.store.taste_upsert(owner, Track, id, signal, None, at)).unwrap();
+        };
+        for i in 1..=501 {
+            put("alice", &format!("Job-{i}"), Love, i);
+        }
+        put("alice", "hidden", Hide, 999);
+        put("bob", "foreign", Love, 1000);
+
+        let path = "/v1/me/likes";
+        let read = |cookie, origin| {
+            let resp = h.call_full("GET", path, None, Some(cookie), origin);
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            let cors = crate::worker_entry::cors_headers(resp.status, origin, ORIGIN);
+            assert_eq!(cors.is_empty(), origin != Some(ORIGIN));
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap()
+        };
+        let expected: Vec<_> = (2..=501)
+            .rev()
+            .map(|i| serde_json::json!({"kind":"track", "target_id":format!("Job-{i}"), "created_at":i}))
+            .collect();
+        let expected = serde_json::json!({"items":expected});
+        assert_eq!(read(alice.clone(), Some(ORIGIN)), expected);
+        assert_eq!(read(alice, Some("https://other.example")), expected);
+        assert_eq!(
+            read(bob, None),
+            serde_json::json!({"items":[{"kind":"track", "target_id":"foreign", "created_at":1000}]})
+        );
+    }
+
+    #[test]
+    fn dispatched_likes_and_history_require_a_cookie_and_map_only_exact_gets() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        let h = peppered_harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let cookie = magic_login(&h, "alice@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 3600}),
+        );
+        assert_eq!(minted.status, 201);
+        let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let assert_not_found = |resp: Response| {
+            assert_eq!((resp.status, resp.body), (404, not_found().body));
+        };
+        for path in ["/v1/me/likes", "/v1/me/history"] {
+            let mut req = Request {
+                method: "GET".into(),
+                path: path.into(),
+                cookie: None,
+                origin: Some(ORIGIN.into()),
+                authorization: None,
+                stripe_signature: None,
+                body: Vec::new(),
+            };
+            assert_eq!(scope_for_operation("GET", path), RouteDecision::SessionOnly);
+            assert_eq!(call(&req).status, 401);
+            req.authorization = Some(format!("Bearer {secret}"));
+            assert_not_found(call(&req));
+            req.cookie = Some(cookie.clone());
+            assert_not_found(call(&req));
+            req.authorization = None;
+            for method in ["HEAD", "PUT", "POST", "PATCH", "DELETE"] {
+                req.method = method.into();
+                assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
+                assert_not_found(call(&req));
+            }
+        }
+        let cases = [
+            ("/v1/me/likes", "GET"),
+            ("/v1/me/history", "GET"),
+            ("/v1/me/likes/import", "POST"),
+        ];
+        for (path, method, origin) in cases.into_iter().flat_map(|(path, method)| {
+            [Some(ORIGIN), Some("https://other.example"), None].map(|origin| (path, method, origin))
+        }) {
+            let resp = h.call_full("OPTIONS", path, None, None, origin);
+            assert_eq!(resp.status, 204);
+            assert!(resp.body.is_empty() && resp.set_cookie.is_none());
+            let cors = crate::worker_entry::cors_headers(resp.status, origin, ORIGIN);
+            if origin == Some(ORIGIN) {
+                assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
+                assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                assert!(cors.iter().any(|(name, methods)| {
+                    *name == "access-control-allow-methods"
+                        && methods.split(", ").any(|m| m == method)
+                }));
+            } else {
+                assert!(cors.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn likes_handler_is_owner_scoped_and_fail_closed() {
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::{Hide, Love};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mut req = Request {
+            method: "GET".into(),
+            path: "/v1/me/likes".into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| block_on(me_likes_list(&h.ctx(), req));
+        let empty = call(&req);
+        assert_eq!(empty.status, 200);
+        assert_eq!(empty.body, r#"{"items":[]}"#);
+        assert!(empty.set_cookie.is_none());
+        assert!(empty.retry_after.is_none());
+        assert!(empty.extra_headers.is_empty());
+        for i in 1..=501 {
+            block_on(
+                h.store
+                    .taste_upsert("alice", Track, &format!("Job-{i}"), Love, None, i),
+            )
+            .unwrap();
+        }
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "hidden", Hide, None, 999),
+        )
+        .unwrap();
+        block_on(
+            h.store
+                .taste_upsert("bob", Track, "foreign", Love, None, 1000),
+        )
+        .unwrap();
+        let response = call(&req);
+        assert_eq!(response.status, 200);
+        let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 500);
+        assert_eq!(
+            items[0],
+            serde_json::json!({"kind":"track", "target_id":"Job-501", "created_at":501})
+        );
+        assert_eq!(items[499]["target_id"], "Job-2");
+        assert!(items
+            .windows(2)
+            .all(|w| w[0]["created_at"].as_i64() >= w[1]["created_at"].as_i64()));
+        assert!(items
+            .iter()
+            .all(|item| item["target_id"] != "foreign" && item["target_id"] != "hidden"));
+        req.cookie = Some(bob);
+        let switched: serde_json::Value = serde_json::from_str(&call(&req).body).unwrap();
+        assert_eq!(
+            switched,
+            serde_json::json!({"items":[{"kind":"track", "target_id":"foreign", "created_at":1000}]})
+        );
+        req.cookie = Some(alice.clone());
+        for authorization in ["Bearer ntk_test", "Bearer anything"] {
+            req.authorization = Some(authorization.into());
+            assert_eq!(call(&req).status, 404);
+        }
+        req.authorization = None;
+        req.cookie = None;
+        assert_eq!(call(&req).status, 401);
+        req.cookie = Some("__Host-nntune-session=invalid".into());
+        assert_eq!(call(&req).status, 401);
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(block_on(me_likes_list(&expired, &req)).status, 401);
+        *h.store.fail_taste_read.borrow_mut() = true;
+        let failure = call(&req);
+        assert_eq!(failure.status, 503);
+        assert_eq!(failure.body, unavailable().body);
+        *h.store.fail_taste_read.borrow_mut() = false;
+        h.store.deleting_users.borrow_mut().insert("alice".into());
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        assert_eq!(call(&req).body, unavailable().body);
+        assert_eq!(call(&req).status, 503);
+    }
+
+    #[test]
+    fn taste_list_handler_is_bounded_owner_scoped_and_fail_closed() {
+        assert_taste_list_contract("/v1/me/taste?user_id=bob", false);
+    }
+
+    #[test]
+    fn taste_list_dispatch_is_bounded_owner_scoped_and_fail_closed() {
+        // Worker entry forwards only the bare path.
+        assert_taste_list_contract("/v1/me/taste", true);
+    }
+
+    fn assert_taste_list_contract(path: &str, dispatch: bool) {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mut req = Request {
+            method: "GET".into(),
+            path: path.into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob"}"#.to_vec(),
+        };
+        let call_at = |ctx: &Ctx<'_, _, _, _, _>, req: &Request| {
+            if dispatch {
+                block_on(handle(ctx, req))
+            } else {
+                block_on(me_taste_list(ctx, req))
+            }
+        };
+        let call = |req: &Request| call_at(&h.ctx(), req);
+        let empty = call(&req);
+        assert_eq!(
+            (empty.status, empty.body.as_str()),
+            (200, r#"{"items":[]}"#)
+        );
+        assert!(empty.set_cookie.is_none() && empty.retry_after.is_none());
+        assert!(empty.extra_headers.is_empty());
+        for i in 1..=501 {
+            block_on(
+                h.store
+                    .taste_upsert("alice", Track, &format!("Job-{i}"), Love, None, i),
+            )
+            .unwrap();
+        }
+        let now = h.ctx().now;
+        for (owner, kind, id, signal, until, updated) in [
+            ("alice", Release, "release", Love, None, 502),
+            ("alice", Track, "dislike", Dislike, None, 503),
+            ("alice", Track, "hide", Hide, None, 504),
+            ("alice", Track, "ban", Ban, None, 505),
+            ("alice", Track, "past", Snooze, Some(now - 1), 506),
+            ("alice", Track, "equal", Snooze, Some(now), 507),
+            ("alice", Track, "future", Snooze, Some(now + 1), 508),
+            ("bob", Track, "foreign", Love, None, 999),
+        ] {
+            block_on(
+                h.store
+                    .taste_upsert(owner, kind, id, signal, until, updated),
+            )
+            .unwrap();
+        }
+        let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, false)).unwrap();
+        block_on(
+            h.store
+                .upsert_private_session("alice", &claims.session_id, h.ctx().now + 60),
+        )
+        .unwrap();
+        let response = call(&req);
+        assert_eq!(response.status, 200);
+        let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 500);
+        assert_eq!(
+            items[0],
+            serde_json::json!({"kind":"track", "target_id":"future", "signal":"snooze", "until":now + 1, "updated_at":508})
+        );
+        for (index, kind, id, signal, updated) in [
+            (1, "track", "ban", "ban", 505),
+            (2, "track", "hide", "hide", 504),
+            (3, "track", "dislike", "dislike", 503),
+            (4, "release", "release", "love", 502),
+        ] {
+            assert_eq!(
+                items[index],
+                serde_json::json!({"kind":kind, "target_id":id, "signal":signal, "until":null, "updated_at":updated})
+            );
+        }
+        assert_eq!(
+            items[5],
+            serde_json::json!({"kind":"track", "target_id":"Job-501", "signal":"love", "until":null, "updated_at":501})
+        );
+        assert_eq!(items[499]["target_id"], "Job-7");
+        assert!(items
+            .windows(2)
+            .all(|w| w[0]["updated_at"].as_i64() >= w[1]["updated_at"].as_i64()));
+        assert!(items.iter().all(
+            |item| !["past", "equal", "foreign"].contains(&item["target_id"].as_str().unwrap())
+        ));
+        req.cookie = Some(bob);
+        for origin in [Some(ORIGIN), None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            let response = call(&req);
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+                serde_json::json!({"items":[{"kind":"track", "target_id":"foreign", "signal":"love", "until":null, "updated_at":999}]})
+            );
+        }
+        req.cookie = Some(alice.clone());
+        req.authorization = Some("Bearer anything".into());
+        let denied = call(&req);
+        assert_eq!((denied.status, denied.body), (404, not_found().body));
+        req.authorization = None;
+        for cookie in [None, Some("__Host-nntune-session=invalid".into())] {
+            req.cookie = cookie;
+            let denied = call(&req);
+            assert_eq!(denied.status, 401);
+            assert_eq!(
+                denied.body,
+                r#"{"code":"unauthorized","message":"authentication required","retryable":false}"#
+            );
+        }
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(call_at(&expired, &req).status, 401);
+        *h.store.fail_taste_read.borrow_mut() = true;
+        let failure = call(&req);
+        assert_eq!((failure.status, failure.body), (503, unavailable().body));
+        *h.store.fail_taste_read.borrow_mut() = false;
+        h.store.deleting_users.borrow_mut().insert("alice".into());
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        let failure = call(&req);
+        assert_eq!((failure.status, failure.body), (503, unavailable().body));
+    }
+
+    #[test]
+    fn unwired_like_write_checks_session_membership_and_fenced_replay() {
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::{Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mbid = "abcdefab-1234-1234-1234-abcdefabcdef";
+        let mut own = matched_library_row("Job_A", CAT_REC_A, 1);
+        own.recording_mbids.push(mbid.into());
+        let uuid_job = "ABCDEFAB-5678-1234-1234-ABCDEFABCDEF";
+        let job_only = "ABCDEFAB-9999-1234-1234-ABCDEFABCDEF";
+        own.recording_mbids.push(uuid_job.to_ascii_lowercase());
+        h.store.catalogue_library.borrow_mut().insert(
+            "alice".into(),
+            vec![
+                own,
+                unmatched_library_row(uuid_job),
+                unmatched_library_row(job_only),
+            ],
+        );
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("bob".into(), vec![unmatched_library_row("Private")]);
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("".into(), vec![unmatched_library_row("Shared")]);
+        let mut req = Request {
+            method: "PUT".into(),
+            path: "/v1/me/likes/track/Job_A".into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob"}"#.to_vec(),
+        };
+        let call = |req: &Request, target: &str| block_on(me_like_track(&h.ctx(), req, target));
+        let first = call(&req, "Job_A");
+        assert_eq!(first.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first.body).unwrap(),
+            serde_json::json!({"target_id":"Job_A", "liked_at":NOW})
+        );
+        assert!(
+            first.set_cookie.is_none()
+                && first.retry_after.is_none()
+                && first.extra_headers.is_empty()
+        );
+        let mut later = h.ctx();
+        later.now += 100;
+        assert_eq!(
+            block_on(me_like_track(&later, &req, "Job_A")).body,
+            first.body
+        );
+        for (signal, until) in [(Hide, None), (Snooze, Some(NOW - 1))] {
+            block_on(
+                h.store
+                    .taste_upsert("alice", Track, "Job_A", signal, until, NOW - 2),
+            )
+            .unwrap();
+            let result = block_on(me_like_track(&later, &req, "Job_A"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.body).unwrap()["liked_at"],
+                NOW + 100
+            );
+        }
+        let canonical = call(&req, &mbid.to_ascii_uppercase());
+        assert_eq!(canonical.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&canonical.body).unwrap()["target_id"],
+            mbid
+        );
+        let opaque = call(&req, uuid_job);
+        assert_eq!(opaque.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&opaque.body).unwrap()["target_id"],
+            uuid_job
+        );
+        assert!(h.store.taste_rows.borrow().contains_key(&(
+            "alice".into(),
+            "track".into(),
+            uuid_job.into()
+        )));
+        let recording = call(&req, &uuid_job.to_ascii_lowercase());
+        assert_eq!(recording.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recording.body).unwrap()["target_id"],
+            uuid_job.to_ascii_lowercase()
+        );
+        assert_eq!(call(&req, job_only).status, 200);
+        assert_eq!(call(&req, &job_only.to_ascii_lowercase()).status, 404);
+        assert_eq!(call(&req, "Shared").status, 200);
+        let missing = call(&req, "missing");
+        for target in [
+            "",
+            "bad/path",
+            "é",
+            "Private",
+            "job_a",
+            CAT_RELEASE,
+            &"a".repeat(513),
+        ] {
+            let response = call(&req, target);
+            assert_eq!(
+                (response.status, response.body),
+                (missing.status, missing.body.clone())
+            );
+        }
+        assert_eq!(missing.status, 404);
+        req.cookie = Some(bob.clone());
+        assert_eq!(call(&req, "Job_A").status, 404);
+        assert_eq!(call(&req, "Private").status, 200);
+        let bob_row = h
+            .store
+            .taste_rows
+            .borrow()
+            .get(&("bob".into(), "track".into(), "Private".into()))
+            .unwrap()
+            .clone();
+        req.cookie = Some(alice.clone());
+        for origin in [None, Some("https://wrong.example".into())] {
+            req.origin = origin;
+            assert_eq!(call(&req, "Job_A").status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        for auth in ["Bearer ntk_test", "Bearer anything"] {
+            req.authorization = Some(auth.into());
+            assert_eq!(call(&req, "Job_A").status, 404);
+        }
+        req.authorization = None;
+        for cookie in [None, Some("__Host-nntune-session=invalid".into())] {
+            req.cookie = cookie;
+            assert_eq!(call(&req, "Job_A").status, 401);
+        }
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(block_on(me_like_track(&expired, &req, "Job_A")).status, 401);
+        *h.store.fail_catalogue_reads.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        *h.store.fail_catalogue_reads.borrow_mut() = false;
+        *h.store.fail_taste_write.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        *h.store.fail_taste_write.borrow_mut() = false;
+        let before = h.store.taste_rows.borrow().clone();
+        *h.store.delete_before_taste_write.borrow_mut() = true;
+        let raced = call(&req, "Job_A");
+        assert_eq!(raced.status, 503);
+        assert_eq!(raced.body, unavailable().body);
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+        let deleting = call(&req, "Job_A");
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        assert_eq!(
+            h.store
+                .taste_rows
+                .borrow()
+                .get(&("bob".into(), "track".into(), "Private".into()))
+                .unwrap(),
+            &bob_row
+        );
+        assert_eq!(bob_row.signal, Love.as_str());
+    }
+
+    #[test]
+    fn unlike_handler_preserves_other_signals_and_fails_closed() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let mbid = "abcdefab-1234-1234-1234-abcdefabcdef";
+        let mut own = matched_library_row("Job_A", CAT_REC_A, 1);
+        own.recording_mbids.push(mbid.into());
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![own, unmatched_library_row("CaseJob")]);
+        h.store.catalogue_library.borrow_mut().insert(
+            "bob".into(),
+            vec![
+                unmatched_library_row("Job_A"),
+                unmatched_library_row("Private"),
+            ],
+        );
+        let mut req = Request {
+            method: "DELETE".into(),
+            path: "/v1/me/likes/track/Job_A".into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"user_id":"bob"}"#.to_vec(),
+        };
+        let call = |req: &Request, target: &str| block_on(me_unlike_track(&h.ctx(), req, target));
+        for (user, kind) in [("alice", Track), ("alice", Release), ("bob", Track)] {
+            block_on(h.store.taste_upsert(user, kind, "Job_A", Love, None, NOW)).unwrap();
+        }
+        let first = call(&req, "Job_A");
+        assert_eq!(first.status, 200);
+        assert_eq!(first.body, r#"{"liked":false,"target_id":"Job_A"}"#);
+        assert!(
+            first.set_cookie.is_none()
+                && first.retry_after.is_none()
+                && first.extra_headers.is_empty()
+        );
+        let alice_track = ("alice".into(), "track".into(), "Job_A".into());
+        assert!(!h.store.taste_rows.borrow().contains_key(&alice_track));
+        assert_eq!(call(&req, "Job_A").body, first.body);
+        assert!(!h.store.taste_rows.borrow().contains_key(&alice_track));
+        for (user, kind) in [("alice", Release), ("bob", Track)] {
+            assert_eq!(
+                h.store.taste_rows.borrow()[&(user.into(), kind.as_str().into(), "Job_A".into())]
+                    .signal,
+                "love"
+            );
+        }
+        for (signal, until) in [
+            (Dislike, None),
+            (Hide, None),
+            (Ban, None),
+            (Snooze, Some(NOW - 1)),
+        ] {
+            let row = block_on(
+                h.store
+                    .taste_upsert("alice", Track, "Job_A", signal, until, NOW),
+            )
+            .unwrap();
+            assert_eq!(call(&req, "Job_A").body, first.body);
+            assert_eq!(
+                h.store.taste_rows.borrow()[&("alice".into(), "track".into(), "Job_A".into())],
+                row
+            );
+        }
+        block_on(h.store.taste_upsert("alice", Track, mbid, Love, None, NOW)).unwrap();
+        let canonical = call(&req, &mbid.to_ascii_uppercase());
+        assert!(!h.store.taste_rows.borrow().contains_key(&(
+            "alice".into(),
+            "track".into(),
+            mbid.into()
+        )));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&canonical.body).unwrap(),
+            serde_json::json!({"target_id": mbid, "liked": false})
+        );
+        assert_eq!(call(&req, "CaseJob").status, 200);
+        let missing = call(&req, "missing");
+        assert_eq!(missing.status, 404);
+        for target in [
+            "",
+            "bad/path",
+            "é",
+            "Private",
+            "casejob",
+            CAT_RELEASE,
+            &"a".repeat(513),
+        ] {
+            let response = call(&req, target);
+            assert_eq!(
+                (response.status, response.body),
+                (missing.status, missing.body.clone())
+            );
+        }
+        req.cookie = Some(bob);
+        assert_eq!(call(&req, "Private").status, 200);
+        assert_eq!(call(&req, "CaseJob").body, missing.body);
+        req.cookie = Some(alice.clone());
+        for origin in [None, Some("https://wrong.example".into())] {
+            req.origin = origin;
+            assert_eq!(call(&req, "Job_A").status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        for auth in ["Bearer ntk_test", "Bearer anything"] {
+            req.authorization = Some(auth.into());
+            assert_eq!(call(&req, "Job_A").status, 404);
+        }
+        req.authorization = None;
+        for cookie in [None, Some("__Host-nntune-session=invalid".into())] {
+            req.cookie = cookie;
+            assert_eq!(call(&req, "Job_A").status, 401);
+        }
+        req.cookie = Some(alice);
+        let mut expired = h.ctx();
+        expired.now += 365 * 24 * 60 * 60;
+        assert_eq!(
+            block_on(me_unlike_track(&expired, &req, "Job_A")).status,
+            401
+        );
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Job_A", Love, None, NOW),
+        )
+        .unwrap();
+        let before = h.store.taste_rows.borrow().clone();
+        *h.store.fail_catalogue_reads.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        *h.store.fail_catalogue_reads.borrow_mut() = false;
+        *h.store.fail_taste_write.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+        *h.store.fail_taste_write.borrow_mut() = false;
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+        *h.store.delete_before_taste_write.borrow_mut() = true;
+        let raced = call(&req, "Job_A");
+        assert_eq!((raced.status, raced.body), (503, unavailable().body));
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+        assert_eq!(call(&req, "Job_A").status, 409);
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        assert_eq!(call(&req, "Job_A").body, unavailable().body);
+    }
+
+    fn taste_put_request(h: &Harness, user: &str) -> Request {
+        let email = format!("{user}@example.com");
+        seed_user(h, user, &email);
+        Request {
+            method: "PUT".into(),
+            path: "/v1/me/taste".into(),
+            cookie: Some(magic_login(h, &email)),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"kind":"track","target_id":"Job_A","signal":"love"}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn taste_put_handler_replaces_and_replays_with_server_time() {
+        use serde_json::json;
+        let h = harness();
+        let stored = |owner: &str| {
+            h.store.taste_rows.borrow()[&(owner.into(), "track".into(), "Job_A".into())].clone()
+        };
+        let mut req = taste_put_request(&h, "alice");
+        let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, true)).unwrap();
+        block_on(
+            h.store
+                .upsert_private_session("alice", &claims.session_id, 253_402_300_799),
+        )
+        .unwrap();
+        assert!(block_on(h.store.private_session_active("alice", &claims.session_id)).unwrap());
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("".into(), vec![unmatched_library_row("Job_A")]);
+        for (offset, signal, seconds, created) in [
+            (0, "love", None, 0),
+            (1, "love", None, 0),
+            (2, "dislike", None, 0),
+            (3, "hide", None, 0),
+            (4, "ban", None, 0),
+            (5, "snooze", Some(60), 0),
+            (65, "love", None, 65),
+            (66, "love", None, 65),
+            (67, "snooze", Some(2_592_000), 65),
+        ] {
+            let mut ctx = h.ctx();
+            ctx.now += offset;
+            let mut body = json!({"kind":"track", "target_id":"Job_A", "signal":signal});
+            if let Some(seconds) = seconds {
+                body["snooze_seconds"] = json!(seconds);
+            }
+            req.body = body.to_string().into_bytes();
+            let res = block_on(me_taste_put(&ctx, &req));
+            let until = seconds.map(|s| ctx.now + s);
+            let expected =
+                json!({"kind":"track", "target_id":"Job_A", "signal":signal, "until":until});
+            assert_eq!((res.status, res.body), (200, expected.to_string()));
+            assert!(res.set_cookie.is_none());
+            assert!(res.retry_after.is_none());
+            assert!(res.extra_headers.is_empty());
+            let row = stored("alice");
+            assert_eq!(row.signal, signal);
+            assert_eq!(row.snooze_until, until.map(|t| t as i64));
+            assert_eq!(row.created_at, (NOW + created) as i64);
+            assert_eq!(row.updated_at, ctx.now as i64);
+        }
+        let alice_row = stored("alice");
+        let bob = taste_put_request(&h, "bob");
+        assert_eq!(block_on(me_taste_put(&h.ctx(), &bob)).status, 200);
+        assert_eq!(stored("bob").signal, "love");
+        assert_eq!(stored("alice"), alice_row);
+    }
+
+    #[test]
+    fn taste_put_handler_resolves_only_visible_kind_specific_targets() {
+        use serde_json::json;
+        let h = harness();
+        let req = taste_put_request(&h, "alice");
+        let job = "ABCDEFAB-5678-1234-1234-ABcDEFABCDEF";
+        let recording = job.to_ascii_lowercase();
+        let mut own = matched_library_row("Job_A", CAT_REC_A, 1);
+        own.recording_mbids.push(recording.clone());
+        let mut foreign = matched_library_row("Foreign", CAT_REC_A, 1);
+        let foreign_release = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee";
+        foreign.release_mbid = Some(foreign_release.into());
+        let mut library = h.store.catalogue_library.borrow_mut();
+        library.insert("alice".into(), vec![own, unmatched_library_row(job)]);
+        library.insert("bob".into(), vec![foreign]);
+        drop(library);
+        let call = |kind: &str, target: &str| {
+            let mut req = req.clone();
+            req.body = json!({"kind":kind, "target_id":target, "signal":"hide"})
+                .to_string()
+                .into_bytes();
+            block_on(me_taste_put(&h.ctx(), &req))
+        };
+        for (kind, input, resolved) in [
+            ("track", "Job_A", "Job_A"),
+            ("track", job, job),
+            ("track", &job.to_ascii_uppercase(), &recording),
+            ("release", &CAT_RELEASE.to_ascii_uppercase(), CAT_RELEASE),
+        ] {
+            let res = call(kind, input);
+            assert_eq!(res.status, 200);
+            assert_eq!(
+                res.body,
+                json!({"kind":kind, "target_id":resolved, "signal":"hide", "until":null})
+                    .to_string()
+            );
+            assert!(h.store.taste_rows.borrow().contains_key(&(
+                "alice".into(),
+                kind.into(),
+                resolved.into()
+            )));
+        }
+        let before = h.store.taste_rows.borrow().clone();
+        for (kind, target) in [
+            ("track", "missing"),
+            ("track", "Foreign"),
+            ("track", "job_a"),
+            ("track", "bad/path"),
+            ("track", ""),
+            ("release", "Job_A"),
+            ("release", foreign_release),
+            ("release", &recording),
+        ] {
+            let res = call(kind, target);
+            assert_eq!(
+                (res.status, res.body),
+                (404, not_found().body),
+                "{kind} {target}"
+            );
+        }
+        *h.store.fail_catalogue_reads.borrow_mut() = true;
+        for (kind, target) in [("track", "Job_A"), ("release", CAT_RELEASE)] {
+            let res = call(kind, target);
+            assert_eq!((res.status, res.body), (503, unavailable().body));
+        }
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+    }
+
+    #[test]
+    fn taste_put_handler_rejects_invalid_bodies_and_fails_closed() {
+        let h = harness();
+        let mut req = taste_put_request(&h, "alice");
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
+        let call = |req: &Request| block_on(me_taste_put(&h.ctx(), req));
+        let valid = req.body.clone();
+        for body in [
+            "{",
+            "null",
+            r#"["track","Job_A","love"]"#,
+            r#"{"kind":"track","signal":"love"}"#,
+            r#"{"kind":"track","target_id":1,"signal":"love"}"#,
+            r#"{"kind":"Track","target_id":"Job_A","signal":"love"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"Love"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","user_id":"bob"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","extra":true}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","signal":"ban"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":59}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":2592001}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":60.5}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":"60"}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"snooze","snooze_seconds":null}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","snooze_seconds":60}"#,
+            r#"{"kind":"track","target_id":"Job_A","signal":"love","snooze_seconds":null}"#,
+        ] {
+            req.body = body.as_bytes().to_vec();
+            let res = call(&req);
+            assert_eq!(res.status, 422, "{body}");
+            assert!(res.body.contains("validation_failed"));
+        }
+        req.body = valid;
+        let cookie = req.cookie.take();
+        assert_eq!(call(&req).status, 401);
+        req.cookie = cookie;
+        for origin in [None, Some("https://wrong.example".into())] {
+            req.origin = origin;
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        req.authorization = Some("Bearer ntk_test".into());
+        let bearer = call(&req);
+        assert_eq!((bearer.status, bearer.body), (404, not_found().body));
+        req.authorization = None;
+        for flag in [
+            &h.store.fail_deleting_probe,
+            &h.store.fail_taste_write,
+            &h.store.delete_before_taste_write,
+        ] {
+            flag.replace(true);
+            let res = call(&req);
+            assert_eq!((res.status, res.body), (503, unavailable().body));
+            assert!(h.store.taste_rows.borrow().is_empty());
+            flag.replace(false);
+        }
+        let deleting = call(&req);
+        assert_eq!(
+            (deleting.status, deleting.body),
+            (409, account_deleting_response().body)
+        );
+        assert!(h.store.taste_rows.borrow().is_empty());
+    }
+
+    #[test]
+    fn taste_clear_handler_checks_owner_membership_and_fails_closed() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let uuid_job = "ABCDEFAB-5678-1234-1234-ABCDEFABCDEF";
+        let recording = uuid_job.to_ascii_lowercase();
+        let mut own = matched_library_row("Job_A", CAT_REC_A, 1);
+        own.recording_mbids.push(recording.clone());
+        h.store.catalogue_library.borrow_mut().extend([
+            ("alice".into(), vec![own, unmatched_library_row(uuid_job)]),
+            ("bob".into(), vec![unmatched_library_row("Private")]),
+            ("".into(), vec![unmatched_library_row("Shared")]),
+        ]);
+        let req = Request {
+            method: "DELETE".into(),
+            path: "/v1/me/taste".into(),
+            cookie: Some(alice),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request, body: &[u8]| {
+            let mut req = req.clone();
+            req.body = body.to_vec();
+            let resp = block_on(me_taste_clear(&h.ctx(), &req));
+            assert_eq!((resp.set_cookie, resp.retry_after), (None, None));
+            assert!(resp.extra_headers.is_empty());
+            (resp.status, resp.body)
+        };
+        let clear = |req: &Request, kind: &str, target: &str| {
+            let body = serde_json::json!({"kind": kind, "target_id": target});
+            call(req, body.to_string().as_bytes())
+        };
+        let store = &h.store;
+        let seed = |owner: &str, kind, target: &str, signal, until| {
+            block_on(store.taste_upsert(owner, kind, target, signal, until, NOW)).unwrap()
+        };
+        let get = |owner: &str, kind, target: &str| {
+            block_on(store.taste_get(owner, kind, target)).unwrap()
+        };
+        let yes = (200, r#"{"cleared":true}"#.to_owned());
+        let no = (200, r#"{"cleared":false}"#.to_owned());
+        let missing = (404, not_found().body);
+        let failed = (503, unavailable().body);
+        let track_body = br#" {"kind":"track","target_id":"Job_A"} "#;
+        let foreign = seed("bob", Track, "Shared", Hide, None);
+        seed("alice", Track, "Shared", Ban, None);
+        let other_target = seed("alice", Track, &recording, Dislike, None);
+        assert_eq!(call(&req, track_body), no);
+        for (signal, until) in [
+            (Love, None),
+            (Dislike, None),
+            (Hide, None),
+            (Ban, None),
+            (Snooze, Some(NOW - 1)),
+            (Snooze, Some(NOW + 60)),
+        ] {
+            seed("alice", Track, "Job_A", signal, until);
+            assert_eq!(call(&req, track_body), yes, "{signal:?} {until:?}");
+            assert!(get("alice", Track, "Job_A").is_none());
+            assert_eq!(call(&req, track_body), no);
+        }
+        seed("alice", Track, uuid_job, Love, None);
+        assert_eq!(clear(&req, "track", uuid_job), yes);
+        assert!(get("alice", Track, uuid_job).is_none());
+        assert_eq!(clear(&req, "track", uuid_job), no); // Exact membership still wins.
+        assert_eq!(get("alice", Track, &recording), Some(other_target));
+        assert_eq!(clear(&req, "track", &format!("a{}", &uuid_job[1..])), yes);
+        assert!(get("alice", Track, &recording).is_none());
+        let other_kind = seed("alice", Track, CAT_RELEASE, Love, None);
+        seed("alice", Release, CAT_RELEASE, Ban, None);
+        let uppercase_release = CAT_RELEASE.to_ascii_uppercase();
+        assert_eq!(clear(&req, "release", &uppercase_release), yes);
+        assert!(get("alice", Release, CAT_RELEASE).is_none());
+        assert_eq!(clear(&req, "release", CAT_RELEASE), no);
+        assert_eq!(get("alice", Track, CAT_RELEASE), Some(other_kind));
+        assert_eq!(clear(&req, "track", "Shared"), yes);
+        assert_eq!(get("bob", Track, "Shared"), Some(foreign));
+        let mut bob_req = req.clone();
+        bob_req.cookie = Some(bob);
+        assert_eq!(call(&bob_req, track_body), missing);
+        assert_eq!(clear(&bob_req, "release", CAT_RELEASE), missing);
+        assert_eq!(clear(&bob_req, "track", "Shared"), yes);
+
+        seed("alice", Track, "Job_A", Ban, None);
+        seed("alice", Release, CAT_RELEASE, Love, None);
+        seed("bob", Track, "Private", Love, None);
+        let before = h.store.taste_rows.borrow().clone();
+        for target in ["bad/path", "missing", "job_a", "Private"] {
+            assert_eq!(clear(&req, "track", target), missing, "{target:?}");
+        }
+        for target in ["Job_A", CAT_REC_A] {
+            assert_eq!(clear(&req, "release", target), missing, "{target:?}");
+        }
+        let invalid = (422, validation_failed("invalid taste clear body").body);
+        for body in [
+            "{",
+            r#"["track","Job_A"]"#,
+            r#"{"kind":"track"}"#,
+            r#"{"kind":"track","target_id":null}"#,
+            r#"{"kind":"Track","target_id":"Job_A"}"#,
+            r#"{"kind":"track","target_id":"Job_A","user_id":"bob"}"#,
+            r#"{"kind":"track","kind":"track","target_id":"Job_A"}"#,
+        ] {
+            assert_eq!(call(&req, body.as_bytes()), invalid, "{body}");
+        }
+        let mut denied = req.clone();
+        denied.authorization = Some("Bearer not-a-session".into());
+        assert_eq!(call(&denied, track_body), missing);
+        denied.authorization = None;
+        for origin in [None, Some("https://wrong.example".into())] {
+            denied.origin = origin;
+            assert_eq!(call(&denied, track_body).0, 401);
+        }
+        denied.origin = req.origin.clone();
+        for cookie in [None, Some("__Host-nntune-session=invalid".into())] {
+            denied.cookie = cookie;
+            assert_eq!(call(&denied, track_body).0, 401);
+        }
+        for flag in [
+            &h.store.fail_catalogue_reads,
+            &h.store.fail_taste_write,
+            &h.store.fail_deleting_probe,
+        ] {
+            flag.replace(true);
+            assert_eq!(call(&req, track_body), failed);
+            assert_eq!(clear(&req, "release", CAT_RELEASE), failed);
+            flag.replace(false);
+        }
+        h.store.delete_before_taste_write.replace(true);
+        assert_eq!(call(&req, track_body), failed);
+        let deleting = (409, account_deleting_response().body);
+        assert_eq!(call(&req, track_body), deleting);
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+    }
+
+    fn private_session_request(
+        ctx: &Ctx<'_, FakeStore, FakeMailer, FakeDialer, FakeDns>,
+        owner: &str,
+    ) -> Request {
+        let login = block_on(ctx.start_session(owner)).unwrap();
+        Request {
+            method: "PUT".into(),
+            path: "/v1/me/private-session".into(),
+            cookie: Some(cookie_of(&login)),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"session_id":"s","enabled":true}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn dispatched_private_session_toggles_only_the_current_owner() {
+        use serde_json::json;
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let mut ctx = h.ctx();
+        let alice = private_session_request(&ctx, "alice");
+        let bob = private_session_request(&ctx, "bob");
+        let session_id = "é".repeat(64); // The play contract caps bytes, not characters.
+        let play = crate::ledger::prepare_play_window(
+            "alice",
+            "track",
+            "private",
+            100,
+            Some(100),
+            Some(30_000),
+            NOW,
+        )
+        .unwrap();
+        let key = &play.idempotency_key;
+        block_on(h.store.record_play_window(&play)).unwrap();
+        let history = || block_on(h.store.history_list("alice")).unwrap();
+        assert_eq!(history()[0].play_id, "private");
+        block_on(h.store.mark_private_play("alice", "track", key, NOW)).unwrap();
+        let windows = h.store.play_windows.borrow().clone();
+        let billed = h.store.stream_seconds.borrow().clone();
+        assert_eq!(billed[&("alice".into(), play.period_month.clone())], 30);
+
+        let initial = Some(NOW + 21_600);
+        let refreshed = Some(NOW + 21_610);
+        let bob_until = Some(NOW + 21_620);
+        for (request, enabled, offset, alice_row, bob_row, until) in [
+            (&alice, true, 0, initial, None, initial),
+            (&alice, true, 0, initial, None, initial),
+            (&alice, true, 10, refreshed, None, refreshed),
+            (&bob, true, 20, refreshed, bob_until, bob_until),
+            (&alice, false, 30, None, bob_until, None),
+            (&alice, false, 40, None, bob_until, None),
+            (&bob, false, 50, None, None, None),
+        ] {
+            let mut req = request.clone();
+            req.body = json!({"session_id": session_id, "enabled": enabled})
+                .to_string()
+                .into_bytes();
+            ctx.now = NOW + offset;
+            let res = block_on(handle(&ctx, &req));
+            let expected = json!({"session_id": session_id, "private_until": until});
+            assert_eq!((res.status, res.body), (200, expected.to_string()));
+            let expected: HashMap<_, _> = [("alice", alice_row), ("bob", bob_row)]
+                .into_iter()
+                .filter_map(|(owner, expiry)| {
+                    expiry.map(|t| ((owner.to_string(), session_id.clone()), t))
+                })
+                .collect();
+            assert_eq!(*h.store.private_sessions.borrow(), expected);
+            assert!(block_on(h.store.private_play_marked("alice", "track", key)).unwrap());
+            assert!(history().is_empty());
+            assert_eq!(*h.store.play_windows.borrow(), windows);
+            assert_eq!(*h.store.stream_seconds.borrow(), billed);
+        }
+    }
+
+    #[test]
+    fn dispatched_private_session_rejects_without_mutating_rows() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let ctx = h.ctx();
+        let mut req = private_session_request(&ctx, "alice");
+        assert_eq!(block_on(handle(&ctx, &req)).status, 200);
+        let saved = h.store.private_sessions.borrow().clone();
+        assert_eq!(saved[&("alice".into(), "s".into())], NOW + 21_600);
+        let check = |req: &Request, status, attempts| {
+            let res = block_on(handle(&ctx, req));
+            assert_eq!(res.status, status, "request body: {:?}", req.body);
+            if status == 503 {
+                assert_eq!(res.body, unavailable().body);
+            } else if status == 409 {
+                assert_eq!(res.body, account_deleting_response().body);
+            }
+            assert_eq!(*h.store.private_sessions.borrow(), saved);
+            assert_eq!(h.store.private_session_write_attempts.get(), attempts);
+        };
+        for body in [
+            r#"["s",false]"#,
+            "null",
+            "{",
+            r#"{"session_id":"s"}"#,
+            r#"{"enabled":false}"#,
+            r#"{"session_id":1,"enabled":true}"#,
+            r#"{"session_id":"s","enabled":"false"}"#,
+            r#"{"session_id":"s","enabled":null}"#,
+            r#"{"session_id":"s","enabled":true,"enabled":false}"#,
+            r#"{"session_id":"s","enabled":false,"user_id":"bob"}"#,
+            r#"{"session_id":"","enabled":false}"#,
+            r#"{"session_id":"s\u0000","enabled":true}"#,
+            r#"{"session_id":"s\u0000","enabled":false}"#,
+            &format!(r#"{{"session_id":"{}x","enabled":true}}"#, "é".repeat(64)),
+        ] {
+            req.body = body.as_bytes().to_vec();
+            check(&req, 422, 1);
+        }
+        req.body = br#"{"session_id":"s","enabled":false}"#.to_vec();
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        assert!(is_known_path(&req.path));
+        assert_eq!(
+            scope_for_operation("PUT", &req.path),
+            RouteDecision::SessionOnly
+        );
+        req.method = "OPTIONS".into();
+        check(&req, 204, 1);
+        for method in ["GET", "POST", "HEAD", "PATCH", "DELETE"] {
+            req.method = method.into();
+            assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
+            check(&req, 404, 1);
+        }
+        req.method = "PUT".into();
+        let cookie = req.cookie.take();
+        check(&req, 401, 1);
+        req.authorization = Some("Bearer ntk_test".into());
+        check(&req, 404, 1);
+        req.cookie = cookie;
+        check(&req, 404, 1);
+        req.authorization = None;
+        req.origin = Some("https://wrong.example".into());
+        check(&req, 401, 1);
+        req.origin = None;
+        check(&req, 401, 1);
+        req.origin = Some(ORIGIN.into());
+        h.store.deleting_users.borrow_mut().insert("alice".into());
+        check(&req, 409, 1);
+        h.store.deleting_users.borrow_mut().clear();
+        *h.store.fail_deleting_probe.borrow_mut() = true;
+        check(&req, 503, 1);
+        *h.store.fail_deleting_probe.borrow_mut() = false;
+        *h.store.fail_private_session_write.borrow_mut() = true;
+        check(&req, 503, 2);
+        let enable = br#"{"session_id":"new","enabled":true}"#;
+        req.body = enable.to_vec();
+        check(&req, 503, 3);
+        *h.store.fail_private_session_write.borrow_mut() = false;
+        for (index, body) in [enable.as_slice(), br#"{"session_id":"s","enabled":false}"#]
+            .into_iter()
+            .enumerate()
+        {
+            req.body = body.to_vec();
+            h.store.mark_deleting_after_next_probe.set(true);
+            check(&req, 409, 4 + index);
+            h.store.deleting_users.borrow_mut().clear();
+        }
+    }
+
+    #[test]
+    fn dispatched_private_session_checks_expiry_before_writing() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let max = 253_402_300_799;
+        let mut ctx = h.ctx();
+        ctx.now = max - 21_600;
+        let req = private_session_request(&ctx, "alice");
+        let res = block_on(handle(&ctx, &req));
+        let expected = serde_json::json!({"session_id": "s", "private_until": max});
+        assert_eq!((res.status, res.body), (200, expected.to_string()));
+        let saved = HashMap::from([(("alice".into(), "s".into()), max)]);
+        assert_eq!(*h.store.private_sessions.borrow(), saved);
+        for now in [max - 21_599, i64::MAX as u64, u64::MAX - 1] {
+            ctx.now = now;
+            let req = private_session_request(&ctx, "alice");
+            let res = block_on(handle(&ctx, &req));
+            assert_eq!(
+                (res.status, res.body),
+                (503, unavailable().body),
+                "now={now}"
+            );
+            assert_eq!(h.store.private_session_write_attempts.get(), 1);
+            assert_eq!(*h.store.private_sessions.borrow(), saved);
+        }
+    }
+
+    fn likes_import_request(h: &Harness) -> Request {
+        seed_user(h, "alice", "alice@example.com");
+        Request {
+            method: "POST".into(),
+            path: "/v1/me/likes/import".into(),
+            cookie: Some(magic_login(h, "alice@example.com")),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        }
+    }
+
+    fn import_item(kind: &str, target_id: &str) -> serde_json::Value {
+        serde_json::json!({"kind": kind, "target_id": target_id})
+    }
+
+    fn assert_import(resp: Response, added: usize, already: usize, rejected: &[serde_json::Value]) {
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&resp.body).unwrap(),
+            serde_json::json!({"added": added, "already": already, "rejected": rejected})
+        );
+    }
+
+    #[test]
+    fn dispatched_likes_import_rejects_bad_structure_and_auth_before_writing() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+
+        let h = peppered_harness();
+        let mut req = likes_import_request(&h);
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job")]);
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let valid = r#"{"kind":"track","target_id":"Job"}"#;
+        for body in [
+            "{",
+            "{}",
+            "null",
+            r#"{"items":{}}"#,
+            r#"{"items":null}"#,
+            &format!("[[{valid}]]"),
+            &format!(r#"{{"items":[{valid}],"user_id":"bob"}}"#),
+            &format!(r#"{{"items":[{valid}],"items":[]}}"#),
+            &format!(r#"{{"items":[{valid}]}} []"#),
+        ] {
+            req.body = body.as_bytes().to_vec();
+            assert_eq!(call(&req).status, 422, "{body}");
+        }
+        for item in [
+            "null",
+            "{}",
+            r#"["track","Job"]"#,
+            r#"{"kind":"track"}"#,
+            r#"{"target_id":"Job"}"#,
+            r#"{"kind":true,"target_id":"Job"}"#,
+            r#"{"kind":"track","target_id":7}"#,
+            r#"{"kind":"track","target_id":"Job","user_id":"bob"}"#,
+            r#"{"kind":"track","target_id":"Job","target_id":"Job"}"#,
+        ] {
+            req.body = format!(r#"{{"items":[{valid},{item}]}}"#).into_bytes();
+            assert_eq!(call(&req).status, 422, "{item}");
+        }
+        req.body = format!(r#"{{"items":[{valid}]}}"#).into_bytes();
+        for origin in [None, Some("https://wrong.example".into())] {
+            req.origin = origin;
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        let cookie = req.cookie.take().unwrap();
+        assert_eq!(call(&req).status, 401);
+
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        let lookups = *h.store.native_credential_lookups.borrow();
+        req.authorization = Some(format!("Bearer {key}"));
+        assert_eq!(
+            scope_for_operation("POST", &req.path),
+            RouteDecision::SessionOnly
+        );
+        for session in [None, Some(cookie)] {
+            req.cookie = session;
+            let denied = call(&req);
+            assert_eq!((denied.status, denied.body), (404, not_found().body));
+        }
+        req.authorization = None;
+        for method in ["GET", "HEAD", "PUT", "PATCH", "DELETE", "post"] {
+            req.method = method.into();
+            assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
+            assert_eq!(max_body_bytes(method, &req.path), MAX_BODY_BYTES);
+            assert_eq!(call(&req).status, 404, "{method}");
+        }
+
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
+        assert!(h.store.taste_rows.borrow().is_empty());
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+    }
+
+    fn collect_import_body(
+        req: &Request,
+        declared_len: Option<usize>,
+        body: Vec<u8>,
+    ) -> crate::worker_entry::CollectedBody {
+        use crate::worker_entry::{
+            collect_body_with_cap, BodyChunkStream, BodyReadError, BodySource,
+        };
+
+        struct OneChunk(Option<Vec<u8>>);
+        impl BodyChunkStream for OneChunk {
+            fn poll_next_chunk(
+                &mut self,
+                _: &mut TaskContext<'_>,
+            ) -> Poll<Option<Result<Vec<u8>, BodyReadError>>> {
+                Poll::Ready(self.0.take().map(Ok))
+            }
+        }
+
+        block_on(collect_body_with_cap(
+            declared_len,
+            BodySource::Stream(OneChunk(Some(body))),
+            max_body_bytes(&req.method, &req.path),
+        ))
+    }
+
+    #[test]
+    fn dispatched_likes_import_bounds_batch_and_rejection_echo() {
+        use crate::worker_entry::CollectedBody;
+
+        let h = harness();
+        let mut req = likes_import_request(&h);
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        req.body = br#"{"items":[]}"#.to_vec();
+        assert_import(call(&req), 0, 0, &[]);
+        let targets: Vec<_> = (0..500)
+            .map(|i| format!("{}{:03}", "A".repeat(509), i))
+            .collect();
+        h.store.catalogue_library.borrow_mut().insert(
+            "alice".into(),
+            targets.iter().map(|id| unmatched_library_row(id)).collect(),
+        );
+        let mut items: Vec<_> = targets.iter().map(|id| import_item("track", id)).collect();
+        items.push(items[0].clone());
+        req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        assert_eq!(call(&req).status, 422);
+        assert!(h.store.taste_rows.borrow().is_empty());
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+        items.pop();
+        req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        let cap = max_body_bytes(&req.method, &req.path);
+        assert_eq!(cap, 320 * 1024);
+        assert!(req.body.len() > MAX_BODY_BYTES && req.body.len() < cap);
+        req.body.resize(cap + 1, b' ');
+        for declared in [None, Some(cap + 1)] {
+            assert_eq!(
+                collect_import_body(&req, declared, req.body.clone()),
+                CollectedBody::Oversized
+            );
+        }
+        let oversized = call(&req);
+        assert_eq!(
+            (oversized.status, oversized.body),
+            (400, invalid_request().body)
+        );
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+
+        req.body.truncate(cap);
+        assert_eq!(
+            collect_import_body(&req, None, req.body.clone()),
+            CollectedBody::Complete(req.body.clone())
+        );
+        assert_import(call(&req), 500, 0, &[]);
+        let saved = h.store.taste_rows.borrow().clone();
+        assert_eq!(saved.len(), 500);
+        assert!(targets
+            .iter()
+            .all(|id| saved[&("alice".into(), "track".into(), id.clone())].signal == "love"));
+        let prefix = "\"\\\n😀".repeat(16); // 64 Unicode scalar values, with JSON escapes.
+        let mut invalid = vec![import_item("track", &format!("{prefix}discarded")); 499];
+        invalid.push(import_item("track", &"A".repeat(513)));
+        req.body = serde_json::to_vec(&serde_json::json!({"items": invalid})).unwrap();
+        let mut rejected = vec![serde_json::json!({"target_id": prefix, "reason": "invalid"}); 499];
+        rejected.push(serde_json::json!({"target_id": "A".repeat(64), "reason": "invalid"}));
+        assert_import(call(&req), 0, 0, &rejected);
+        assert_eq!(*h.store.taste_rows.borrow(), saved);
+        assert_eq!(h.store.taste_write_attempts.get(), 500);
+    }
+
+    #[test]
+    fn dispatched_likes_import_collects_ordinary_batch_without_displacing_taste() {
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::Hide;
+        use crate::worker_entry::CollectedBody;
+
+        let h = harness();
+        let mut req = likes_import_request(&h);
+        let targets: Vec<_> = (0..500)
+            .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+            .collect();
+        h.store.catalogue_library.borrow_mut().insert(
+            "alice".into(),
+            targets.iter().map(|id| unmatched_library_row(id)).collect(),
+        );
+        let items: Vec<_> = targets.iter().map(|id| import_item("track", id)).collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        assert!(bytes.len() > MAX_BODY_BYTES);
+        let mut taste = Request {
+            method: "PUT".into(),
+            path: "/v1/me/taste".into(),
+            ..req.clone()
+        };
+        let collect = |req: &Request, declared| {
+            assert_eq!(
+                collect_import_body(&taste, declared, bytes.clone()),
+                CollectedBody::Oversized
+            );
+            match collect_import_body(req, declared, bytes.clone()) {
+                CollectedBody::Complete(body) => body,
+                other => {
+                    panic!("batch with declared length {declared:?} was not collected: {other:?}")
+                }
+            }
+        };
+        req.body = collect(&req, Some(bytes.len()));
+        assert_import(block_on(handle(&h.ctx(), &req)), 500, 0, &[]);
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Unrelated", Hide, None, NOW + 1),
+        )
+        .unwrap();
+        let saved = h.store.taste_rows.borrow().clone();
+
+        req.body = collect(&req, None);
+        let mut later = h.ctx();
+        later.now += 2;
+        assert_import(block_on(handle(&later, &req)), 0, 500, &[]);
+        assert_eq!(*h.store.taste_rows.borrow(), saved);
+        taste.method = "GET".into();
+        let response = block_on(handle(&later, &taste));
+        assert_eq!(response.status, 200);
+        let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let listed = json["items"].as_array().unwrap();
+        assert_eq!(listed.len(), 500);
+        assert_eq!(listed[0]["target_id"], "Unrelated");
+        assert_eq!(listed[0]["signal"], "hide");
+    }
+
+    #[test]
+    fn dispatched_likes_import_resolves_members_and_replays_per_owner() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::Snooze;
+        let h = harness();
+        let mut req = likes_import_request(&h);
+        seed_user(&h, "bob", "bob@example.com");
+        let job = "ABCDEFAB-1234-1234-1234-ABCDEFABCDEF";
+        let recording = "abcdefab-4321-4321-4321-abcdefabcdef";
+        let mut own = matched_library_row(job, recording, 1);
+        own.recording_mbids.push(recording.into());
+        h.store.catalogue_library.borrow_mut().extend([
+            ("alice".into(), vec![own]),
+            ("bob".into(), vec![unmatched_library_row("Private")]),
+            ("".into(), vec![unmatched_library_row("Shared")]),
+        ]);
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, job, Snooze, Some(NOW + 60), NOW - 1),
+        )
+        .unwrap();
+        let items = [
+            import_item("track", job),
+            import_item("track", &job.to_ascii_lowercase()),
+            import_item("release", "not-an-mbid"),
+            import_item("track", "Private"),
+            import_item("artist", CAT_RELEASE),
+            import_item("release", &CAT_RELEASE.to_ascii_uppercase()),
+            import_item("track", &recording.to_ascii_uppercase()),
+            import_item("track", "Shared"),
+            import_item("track", job),
+        ];
+        let rejected = [
+            (job.to_ascii_lowercase().as_str(), "not_member"),
+            ("not-an-mbid", "invalid"),
+            ("Private", "not_member"),
+            (CAT_RELEASE, "invalid"),
+        ]
+        .map(|(id, reason)| serde_json::json!({"target_id": id, "reason": reason}));
+        req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        assert_import(block_on(handle(&h.ctx(), &req)), 4, 1, &rejected);
+        let mut later = h.ctx();
+        later.now += 60;
+        assert_import(block_on(handle(&later, &req)), 0, 5, &rejected);
+        let get = |owner, kind, id| block_on(h.store.taste_get(owner, kind, id)).unwrap();
+        for (kind, id) in [
+            (Track, job),
+            (Track, recording),
+            (Track, "Shared"),
+            (Release, CAT_RELEASE),
+        ] {
+            let row = get("alice", kind, id).unwrap();
+            assert_eq!(
+                (row.signal.as_str(), row.created_at, row.snooze_until),
+                ("love", NOW as i64, None)
+            );
+        }
+        assert_eq!(h.store.taste_rows.borrow().len(), 4);
+        req.cookie = Some(magic_login(&h, "bob@example.com"));
+        req.body = serde_json::to_vec(&serde_json::json!({"items": [items[0].clone(), import_item("track", "Shared"), import_item("track", "Private")]})).unwrap();
+        assert_import(
+            block_on(handle(&later, &req)),
+            2,
+            0,
+            &[serde_json::json!({"target_id": job, "reason": "not_member"})],
+        );
+        assert_eq!(
+            get("alice", Track, "Shared").unwrap().created_at,
+            NOW as i64
+        );
+        for id in ["Shared", "Private"] {
+            let row = get("bob", Track, id).unwrap();
+            assert_eq!(
+                (row.signal.as_str(), row.created_at),
+                ("love", later.now as i64)
+            );
+        }
+        assert!(get("alice", Track, "Private").is_none());
+        assert_eq!(h.store.taste_rows.borrow().len(), 6);
+    }
+
+    #[test]
+    fn dispatched_likes_import_fails_closed_and_retries_partial_writes() {
+        use PreferenceFailure::{Member, Write};
+        for fault in [(Member, "Second"), (Member, CAT_RELEASE), (Write, "Second")] {
+            let h = harness();
+            let mut req = likes_import_request(&h);
+            h.store.catalogue_library.borrow_mut().insert(
+                "alice".into(),
+                vec![
+                    unmatched_library_row("First"),
+                    matched_library_row("Second", CAT_REC_A, 1),
+                    unmatched_library_row("Last"),
+                ],
+            );
+            let second = if fault.1 == CAT_RELEASE {
+                import_item("release", CAT_RELEASE)
+            } else {
+                import_item("track", "Second")
+            };
+            req.body = serde_json::to_vec(&serde_json::json!({"items": [import_item("track", "First"), second, import_item("track", "Last")]})).unwrap();
+            h.store.preference_failure.set(Some(fault));
+            let failed = block_on(handle(&h.ctx(), &req));
+            assert_eq!((failed.status, failed.body), (503, unavailable().body));
+            let key = ("alice".into(), "track".into(), "First".into());
+            let saved = h.store.taste_rows.borrow().clone();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[&key].signal, "love");
+            h.store.preference_failure.set(None);
+            let mut later = h.ctx();
+            later.now += 1;
+            assert_import(block_on(handle(&later, &req)), 2, 1, &[]);
+            let recovered = h.store.taste_rows.borrow().clone();
+            assert_eq!(recovered.len(), 3);
+            assert!(recovered.values().all(|row| row.signal == "love"));
+            assert_eq!(recovered[&key].created_at, saved[&key].created_at);
+            let writes = h.store.taste_write_attempts.get();
+            h.store.delete_before_taste_write.replace(true);
+            let raced = block_on(handle(&later, &req));
+            assert_eq!((raced.status, raced.body), (503, unavailable().body));
+            let deleting = block_on(handle(&later, &req));
+            assert_eq!(
+                (deleting.status, deleting.body),
+                (409, account_deleting_response().body)
+            );
+            assert_eq!(*h.store.taste_rows.borrow(), recovered);
+            assert_eq!(h.store.taste_write_attempts.get(), writes + 1);
+        }
+    }
+
+    #[test]
+    fn taste_dispatch_has_exact_session_only_routing() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        let h = peppered_harness();
+        let mut req = taste_put_request(&h, "alice");
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
+        let cookie = req.cookie.take().unwrap();
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        req.authorization = Some(format!("Bearer {key}"));
+        assert!(is_known_path(&req.path));
+        let before = *h.store.native_credential_lookups.borrow();
+        for method in ["PUT", "GET", "DELETE"] {
+            req.method = method.into();
+            if method == "DELETE" {
+                req.body = br#"{"kind":"track","target_id":"Job_A"}"#.to_vec();
+            }
+            assert_eq!(
+                scope_for_operation(method, &req.path),
+                RouteDecision::SessionOnly
+            );
+            for session in [None, Some(cookie.clone())] {
+                req.cookie = session;
+                let denied = block_on(handle(&h.ctx(), &req));
+                assert_eq!((denied.status, denied.body), (404, not_found().body));
+            }
+        }
+        assert_eq!(*h.store.native_credential_lookups.borrow(), before);
+        assert!(h.store.taste_rows.borrow().is_empty());
+        req.method = "OPTIONS".into();
+        req.cookie = None;
+        req.body.clear();
+        for origin in [Some(ORIGIN), None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            let response = block_on(handle(&h.ctx(), &req));
+            assert_eq!((response.status, response.body.as_str()), (204, ""));
+            let cors = crate::worker_entry::cors_headers(response.status, origin, ORIGIN);
+            if origin == Some(ORIGIN) {
+                assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
+                assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                for method in ["PUT", "DELETE"] {
+                    assert!(cors.iter().any(|(name, methods)| {
+                        *name == "access-control-allow-methods"
+                            && methods.split(", ").any(|m| m == method)
+                    }));
+                }
+            } else {
+                assert!(cors.is_empty());
+            }
+        }
+        for method in ["HEAD", "POST", "PATCH", "get", "put", "delete"] {
+            assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
+            let denied = h.call_full(method, &req.path, None, Some(cookie.clone()), Some(ORIGIN));
+            assert_eq!(denied.status, 404, "{method}");
+        }
+    }
+
+    #[test]
+    fn dispatched_taste_put_persists_and_replaces_only_the_session_owners_signal() {
+        use serde_json::json;
+
+        let h = harness();
+        let mut alice = taste_put_request(&h, "alice");
+        let bob = taste_put_request(&h, "bob");
+        h.store.catalogue_library.borrow_mut().insert(
+            "bob".into(),
+            vec![
+                unmatched_library_row("Job_A"),
+                unmatched_library_row("Private"),
+            ],
+        );
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let read = |req: &Request| h.call_full("GET", &req.path, None, req.cookie.clone(), None);
+        assert_eq!(call(&bob).status, 200);
+        let bob_before = read(&bob);
+        assert_eq!(bob_before.status, 200);
+        let before = h.store.taste_rows.borrow().clone();
+
+        let valid = alice.body.clone();
+        for target in ["bad/path", "Private", "Absent"] {
+            alice.body = json!({"kind":"track", "target_id":target, "signal":"hide"})
+                .to_string()
+                .into_bytes();
+            let resp = call(&alice);
+            assert_eq!(
+                (resp.status, resp.body),
+                (404, not_found().body),
+                "{target}"
+            );
+        }
+        alice.body = vec![b' '; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&alice).status, 400);
+        alice.body = valid;
+        for origin in [None, Some("https://other.example")] {
+            alice.origin = origin.map(str::to_string);
+            assert_eq!(call(&alice).status, 401);
+        }
+        alice.origin = Some(ORIGIN.into());
+        let cookie = alice.cookie.take();
+        assert_eq!(call(&alice).status, 401);
+        alice.cookie = cookie;
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+
+        for (offset, signal) in [(1, "hide"), (2, "love"), (3, "love")] {
+            let mut expected = json!({"kind":"track", "target_id":"Job_A", "signal":signal});
+            alice.body = expected.to_string().into_bytes();
+            expected["until"] = json!(null);
+            let mut ctx = h.ctx();
+            ctx.now += offset;
+            let written = block_on(handle(&ctx, &alice));
+            assert_eq!((written.status, written.body), (200, expected.to_string()));
+            expected["updated_at"] = json!(ctx.now);
+            let fetched = read(&alice);
+            assert_eq!(
+                (fetched.status, fetched.body),
+                (200, json!({"items":[expected]}).to_string())
+            );
+        }
+        let likes = h.call_full("GET", "/v1/me/likes", None, alice.cookie.clone(), None);
+        assert_eq!(
+            (likes.status, likes.body),
+            (
+                200,
+                json!({"items":[{"kind":"track", "target_id":"Job_A", "created_at":NOW + 2}]})
+                    .to_string()
+            )
+        );
+        let bob_after = read(&bob);
+        assert_eq!((bob_after.status, bob_after.body), (200, bob_before.body));
+    }
+
+    #[test]
+    fn dispatched_taste_clear_removes_only_the_session_owners_signal() {
+        use serde_json::json;
+
+        let h = harness();
+        let mut alice = taste_put_request(&h, "alice");
+        let bob = taste_put_request(&h, "bob");
+        h.store.catalogue_library.borrow_mut().extend([
+            ("alice".into(), vec![unmatched_library_row("Job_A")]),
+            (
+                "bob".into(),
+                vec![
+                    unmatched_library_row("Job_A"),
+                    unmatched_library_row("Private"),
+                ],
+            ),
+        ]);
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let read = |req: &Request| h.call_full("GET", &req.path, None, req.cookie.clone(), None);
+        alice.body = br#"{"kind":"track","target_id":"Job_A","signal":"hide"}"#.to_vec();
+        assert_eq!(call(&alice).status, 200);
+        assert_eq!(call(&bob).status, 200);
+        let before = h.store.taste_rows.borrow().clone();
+
+        alice.method = "DELETE".into();
+        for target in ["bad/path", "Private", "Absent"] {
+            alice.body = json!({"kind":"track", "target_id":target})
+                .to_string()
+                .into_bytes();
+            let resp = call(&alice);
+            assert_eq!(
+                (resp.status, resp.body),
+                (404, not_found().body),
+                "{target}"
+            );
+        }
+        alice.body = vec![b' '; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&alice).status, 400);
+        alice.body = br#"{"kind":"track","target_id":"Job_A"}"#.to_vec();
+        for origin in [None, Some("https://other.example")] {
+            alice.origin = origin.map(str::to_string);
+            assert_eq!(call(&alice).status, 401);
+        }
+        alice.origin = Some(ORIGIN.into());
+        let cookie = alice.cookie.take();
+        assert_eq!(call(&alice).status, 401);
+        alice.cookie = cookie;
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+
+        for cleared in [true, false] {
+            let resp = call(&alice);
+            assert_eq!(
+                (resp.status, resp.body),
+                (200, json!({"cleared":cleared}).to_string())
+            );
+            let fetched = read(&alice);
+            assert_eq!(
+                (fetched.status, fetched.body.as_str()),
+                (200, r#"{"items":[]}"#)
+            );
+            let bob_after = read(&bob);
+            assert_eq!(
+                (bob_after.status, bob_after.body),
+                (
+                    200,
+                    json!({"items":[{"kind":"track", "target_id":"Job_A", "signal":"love", "until":null, "updated_at":NOW}]})
+                        .to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn dispatched_track_like_is_session_only_and_owner_scoped() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        use serde_json::json;
+
+        let h = peppered_harness();
+        for (user, email, track) in [
+            ("alice", "alice@example.com", "Job_A"),
+            ("bob", "bob@example.com", "Private"),
+        ] {
+            seed_user(&h, user, email);
+            h.store
+                .catalogue_library
+                .borrow_mut()
+                .insert(user.into(), vec![unmatched_library_row(track)]);
+        }
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let path = "/v1/me/likes/track/Job_A";
+        let mut req = Request {
+            method: "PUT".into(),
+            path: path.into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let assert_not_found = |resp: Response| {
+            assert_eq!((resp.status, resp.body), (404, not_found().body));
+        };
+        assert_eq!(scope_for_operation("PUT", path), RouteDecision::SessionOnly);
+        let first = call(&req);
+        assert_eq!(first.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first.body).unwrap(),
+            json!({"target_id": "Job_A", "liked_at": NOW})
+        );
+        let mut later = h.ctx();
+        later.now += 100;
+        let replay = block_on(handle(&later, &req));
+        assert_eq!((replay.status, replay.body), (200, first.body));
+        let saved = h.store.taste_rows.borrow().clone();
+        assert_eq!(saved.len(), 1);
+        assert!(saved.contains_key(&("alice".into(), "track".into(), "Job_A".into())));
+
+        req.cookie = Some(bob);
+        assert_not_found(call(&req));
+        req.cookie = Some(alice.clone());
+        for target in ["Job.A", "Private", "Absent"] {
+            req.path = format!("/v1/me/likes/track/{target}");
+            assert_not_found(call(&req));
+        }
+        req.path = path.into();
+        req.body = vec![0; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&req).status, 400);
+        req.body.clear();
+        for origin in [None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        req.cookie = None;
+        assert_eq!(call(&req).status, 401);
+
+        let minted = mint_call(
+            &h,
+            &alice,
+            json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        req.authorization = Some(format!("Bearer {key}"));
+        let lookups = *h.store.native_credential_lookups.borrow();
+        assert_not_found(call(&req));
+        req.cookie = Some(alice);
+        assert_not_found(call(&req));
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
+
+        req.authorization = None;
+        for method in ["GET", "HEAD", "POST", "PATCH", "put", "delete"] {
+            assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
+            req.method = method.into();
+            assert_not_found(call(&req));
+        }
+        for origin in [Some(ORIGIN), None, Some("https://other.example")] {
+            let resp = h.call_full("OPTIONS", path, None, None, origin);
+            assert_eq!(resp.status, 204);
+            assert!(resp.body.is_empty() && resp.set_cookie.is_none());
+            let cors = crate::worker_entry::cors_headers(resp.status, origin, ORIGIN);
+            if origin == Some(ORIGIN) {
+                assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
+                assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                for method in ["PUT", "DELETE"] {
+                    assert!(cors.iter().any(|(name, methods)| {
+                        *name == "access-control-allow-methods"
+                            && methods.split(", ").any(|m| m == method)
+                    }));
+                }
+            } else {
+                assert!(cors.is_empty());
+            }
+        }
+        assert_eq!(*h.store.taste_rows.borrow(), saved);
+    }
+
+    #[test]
+    fn dispatched_track_unlike_is_session_only_and_owner_scoped() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::{Hide, Love};
+        use serde_json::json;
+
+        let h = peppered_harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let alice = magic_login(&h, "alice@example.com");
+        for (user, other_track) in [("alice", "Hidden"), ("bob", "Private")] {
+            h.store.catalogue_library.borrow_mut().insert(
+                user.into(),
+                vec![
+                    unmatched_library_row("Job_A"),
+                    unmatched_library_row(other_track),
+                ],
+            );
+            block_on(h.store.taste_upsert(user, Track, "Job_A", Love, None, NOW)).unwrap();
+        }
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Hidden", Hide, None, NOW),
+        )
+        .unwrap();
+        let mut expected = h.store.taste_rows.borrow().clone();
+        let path = "/v1/me/likes/track/Job_A";
+        assert_eq!(
+            scope_for_operation("DELETE", path),
+            RouteDecision::SessionOnly
+        );
+        let mut req = Request {
+            method: "DELETE".into(),
+            path: path.into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let assert_not_found = |resp: Response| {
+            assert_eq!((resp.status, resp.body), (404, not_found().body));
+        };
+        for target in ["Job.A", "Private", "Absent"] {
+            req.path = format!("/v1/me/likes/track/{target}");
+            assert_not_found(call(&req));
+        }
+        req.path = path.into();
+        req.body = vec![0; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&req).status, 400);
+        req.body.clear();
+        for origin in [None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        req.cookie = None;
+        assert_eq!(call(&req).status, 401);
+        let minted = mint_call(
+            &h,
+            &alice,
+            json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        req.authorization = Some(format!("Bearer {key}"));
+        let lookups = *h.store.native_credential_lookups.borrow();
+        assert_not_found(call(&req));
+        req.cookie = Some(alice);
+        assert_not_found(call(&req));
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
+        req.authorization = None;
+        assert_eq!(*h.store.taste_rows.borrow(), expected);
+        assert!(expected
+            .remove(&("alice".into(), "track".into(), "Job_A".into()))
+            .is_some());
+        for _ in 0..2 {
+            let resp = call(&req);
+            assert_eq!(
+                (resp.status, resp.body.as_str()),
+                (200, r#"{"liked":false,"target_id":"Job_A"}"#)
+            );
+            assert_eq!(*h.store.taste_rows.borrow(), expected);
+        }
+        req.path = "/v1/me/likes/track/Hidden".into();
+        let resp = call(&req);
+        assert_eq!(
+            (resp.status, resp.body.as_str()),
+            (200, r#"{"liked":false,"target_id":"Hidden"}"#)
+        );
+        assert_eq!(*h.store.taste_rows.borrow(), expected);
+
+        req.path = path.into();
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Job_A", Love, None, NOW),
+        )
+        .unwrap();
+        let before_delete = h.store.taste_rows.borrow().clone();
+        *h.store.delete_before_taste_write.borrow_mut() = true;
+        let raced = call(&req);
+        assert_eq!((raced.status, raced.body), (503, unavailable().body));
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert!(deleting.body.contains("account_deleting"));
+        assert_eq!(*h.store.taste_rows.borrow(), before_delete);
+    }
+
+    #[test]
+    fn other_preference_paths_remain_unregistered() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        let cookie = magic_login(&h, "alice@example.com");
+        for path in [
+            "/v1/me/likes/",
+            "/v1/me/likes-extra",
+            "/v1/me/likes/import/",
+            "/v1/me/likes/import/extra",
+            "/v1/me/likes/track",
+            "/v1/me/likes/track/",
+            "/v1/me/likes/track//example",
+            "/v1/me/likes/track/example/",
+            "/v1/me/likes/track/example/nested",
+            "/v1/me/likes/release/example",
+            "/v1/me/taste/",
+            "/v1/me/taste/track/example",
+            "/v1/me/tastes",
+            "/v1/me/history/",
+            "/v1/me/history/extra",
+            "/v1/me/private-session/",
+            "/v1/me/private-session/extra",
+        ] {
+            assert!(!is_known_path(path), "{path}");
+            assert!(!options_preflight_served(path), "{path}");
+            for method in ["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"] {
+                assert_eq!(
+                    crate::native_rest::scope_for_operation(method, path),
+                    crate::native_rest::RouteDecision::Deny,
+                    "{method} {path}"
+                );
+                for session in [None, Some(cookie.clone())] {
+                    let resp = h.call_full(method, path, None, session, Some(ORIGIN));
+                    assert_eq!(
+                        (resp.status, resp.body),
+                        (404, not_found().body),
+                        "{method} {path}"
+                    );
+                }
+            }
+        }
+    }
+
     const PLAY_SECRET: &[u8] = b"test-play-grant-secret-32-bytes-long!";
 
     /// Harness with the play-grant secret provisioned (the default
@@ -12832,9 +17738,188 @@ mod tests {
         )
     }
 
+    // Adapted from PR #982: no compensation over a newer concurrent holder.
+    #[test]
+    fn play_issue_privacy_failure_does_not_restore_a_stale_holder() {
+        use serde_json::json;
+        let h = play_harness();
+        let user = "user-plays-1";
+        let cookie = play_user(&h);
+        seed_entitled(&h, user, "plus", 100);
+        let first = play_call(
+            &h,
+            &cookie,
+            json!({"track_id": "first", "session_id": "tab-a"}),
+        );
+        assert_eq!(first.status, 200);
+        let mut holder = h.store.playback_leases.borrow()[user].clone();
+        holder.play_id = "concurrent".into();
+        holder.epoch += 1;
+        *h.store.concurrent_holder_on_privacy_failure.borrow_mut() = Some(holder.clone());
+        let failed = play_call(
+            &h,
+            &cookie,
+            json!({"track_id": "next", "session_id": "tab-b", "takeover": true}),
+        );
+        assert_eq!((failed.status, failed.body), (503, unavailable().body));
+        assert!(h.store.private_play_marks.borrow().is_empty());
+        assert_eq!(h.store.playback_leases.borrow()[user], holder);
+    }
+
     fn play_user(h: &Harness) -> String {
         seed_user(h, "user-plays-1", "plays@example.com");
         magic_login(h, "plays@example.com")
+    }
+
+    fn shared_play_call(
+        h: &Harness,
+        user_id: &str,
+        session_id: &str,
+        track_id: &str,
+        play_id: Option<String>,
+    ) -> Result<IssuedPlay, Response> {
+        block_on(issue_play_for_user(
+            &h.ctx(),
+            user_id,
+            Some(PlayIssueBody {
+                track_id: track_id.to_string(),
+                session_id: session_id.to_string(),
+                play_id,
+                takeover: false,
+            }),
+        ))
+    }
+
+    #[test]
+    fn shared_play_core_returns_typed_grant_without_creating_account_sessions() {
+        let h = play_harness();
+        seed_user(&h, "user-plays-1", "plays@example.com");
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let issued = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .expect("authenticated identity can use shared gates without a cookie");
+        let expected = crate::play_grant::issue_v2_at(
+            "user-plays-1",
+            "track-9",
+            &issued.play_id,
+            issued.lease_epoch,
+            NOW,
+            crate::play_grant::MAX_GRANT_TTL,
+            Some(PLAY_SECRET),
+        )
+        .unwrap();
+        assert_eq!(issued.grant, expected);
+        assert_eq!(issued.lease_epoch, 1);
+        assert_eq!(issued.lease_expires_at, NOW + 45);
+        let native_wire = issued.into_response();
+        assert_eq!(native_wire.status, 200);
+        assert!(native_wire.set_cookie.is_none());
+        assert!(h.store.sessions.borrow().is_empty());
+    }
+
+    #[test]
+    fn shared_play_core_and_native_route_contend_for_one_user_lease() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        let first = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .expect("first holder");
+        let refused = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "native-tab"}),
+        );
+        assert_eq!(refused.status, 429);
+        assert_eq!(refused.retry_after, Some(45));
+        let takeover = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({
+                "track_id": "track-10", "session_id": "native-tab", "takeover": true,
+            }),
+        );
+        assert_eq!(takeover.status, 200);
+        let refused = shared_play_call(
+            &h,
+            "user-plays-1",
+            "compat-holder",
+            "track-9",
+            Some(first.play_id),
+        )
+        .map(|_| ())
+        .expect_err("old compatibility play cannot renew after native takeover");
+        assert_eq!(refused.status, 429);
+        let current = h.store.playback_leases.borrow()["user-plays-1"].clone();
+        assert_eq!(current.session_id, "native-tab");
+        assert_eq!(current.epoch, first.lease_epoch + 1);
+    }
+
+    #[test]
+    fn shared_play_core_enforces_subscription_and_cap_but_preserves_continuation() {
+        let h = play_harness();
+        seed_user(&h, "user-plays-1", "plays@example.com");
+        let unsubscribed = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .map(|_| ())
+            .expect_err("unsubscribed");
+        assert_eq!(unsubscribed.status, 402);
+        assert!(h.store.playback_leases.borrow().is_empty());
+        seed_entitled(&h, "user-plays-1", "plus", 1);
+        let first = shared_play_call(&h, "user-plays-1", "compat-holder", "track-9", None)
+            .expect("entitled first start");
+        h.store.stream_seconds.borrow_mut().insert(
+            (
+                "user-plays-1".to_string(),
+                crate::ledger::period_month_for_timestamp(NOW),
+            ),
+            3600,
+        );
+        let continued = shared_play_call(
+            &h,
+            "user-plays-1",
+            "compat-holder",
+            "track-9",
+            Some(first.play_id.clone()),
+        )
+        .expect("current track finishes across the cap");
+        assert_eq!(continued.play_id, first.play_id);
+        assert_eq!(continued.lease_epoch, first.lease_epoch);
+        let capped = shared_play_call(&h, "user-plays-1", "compat-holder", "track-10", None)
+            .map(|_| ())
+            .expect_err("next start at cap");
+        assert_eq!(capped.status, 402);
+        assert_eq!(h.store.playback_leases.borrow()["user-plays-1"].epoch, 1);
+    }
+
+    #[test]
+    fn shared_play_core_preserves_pre_write_validation_and_configuration_gates() {
+        let h = play_harness();
+        seed_user(&h, "user-plays-1", "plays@example.com");
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        for (session_id, track_id) in [("", "track-9"), ("holder", "not/meterable")] {
+            let refused = shared_play_call(&h, "user-plays-1", session_id, track_id, None)
+                .map(|_| ())
+                .expect_err("invalid lease input");
+            assert_eq!(refused.status, 422);
+        }
+        let malformed = block_on(issue_play_for_user(&h.ctx(), "user-plays-1", None))
+            .map(|_| ())
+            .expect_err("missing body");
+        assert_eq!(malformed.status, 422);
+        let mut unconfigured = play_harness();
+        unconfigured.config.play_grant_secret = None;
+        let refused = shared_play_call(&unconfigured, "user-plays-1", "holder", "track-9", None)
+            .map(|_| ())
+            .expect_err("missing signing secret");
+        assert_eq!(refused.status, 500);
+        h.store
+            .deleting_users
+            .borrow_mut()
+            .insert("user-plays-1".to_string());
+        let deleting = block_on(issue_play_for_user(&h.ctx(), "user-plays-1", None))
+            .map(|_| ())
+            .expect_err("deletion refusal precedes malformed body");
+        assert_eq!(deleting.status, 409);
+        assert!(h.store.playback_leases.borrow().is_empty());
+        assert!(unconfigured.store.playback_leases.borrow().is_empty());
     }
 
     #[test]
@@ -13130,9 +18215,7 @@ mod tests {
             NOW + 10,
             "a deleting account's lease must not extend"
         );
-        // The FakeStore mirrors the statement fences directly, so a
-        // handler regression that skipped the pre-check still could
-        // not write (acquire reads Held, touch reads false).
+        // The Store fences writes even if a handler skips the pre-check.
         let acquired = block_on(h.store.acquire_playback_lease(
             "user-plays-1",
             "tab-b",
@@ -13141,12 +18224,8 @@ mod tests {
             NOW,
             NOW + 45,
             true,
-        ))
-        .expect("store call succeeds");
-        assert!(matches!(
-            acquired,
-            crate::playback::LeaseAcquire::Held { .. }
         ));
+        assert!(acquired.is_err());
         let touched = block_on(h.store.touch_playback_lease(
             "user-plays-1",
             "tab-a",
@@ -13164,9 +18243,8 @@ mod tests {
         let h = play_harness();
         let cookie = play_user(&h);
         seed_entitled(&h, "user-plays-1", "plus", 100);
-        // The marker lands after the up-front probe, inside the lease
-        // write: the fenced acquire reads Held, and the post-write
-        // re-read — not the concurrency 429 — classifies the refusal.
+        // The marker lands after the up-front probe. The acquisition fails
+        // at the fence and the re-read classifies it as deletion.
         *h.store.mark_deleting_before_next_lease_write.borrow_mut() =
             Some("user-plays-1".to_string());
         let resp = play_call(
@@ -15506,6 +20584,241 @@ mod tests {
 
     // --- Native REST credentials (ADR 0010) -------------------------------------
 
+    fn subsonic_harness() -> Harness {
+        let mut h = harness();
+        h.config.subsonic_index = Some(
+            crate::subsonic_config::SubsonicIndexConfig::parse(
+                &serde_json::json!({"current_version":1,"keys":{"1":crate::b64::encode(&[7;32])}})
+                    .to_string(),
+            )
+            .unwrap(),
+        );
+        h
+    }
+
+    fn subsonic_mint(h: &Harness, cookie: &str, body: serde_json::Value) -> Response {
+        h.call_full(
+            "POST",
+            "/v1/subsonic-credentials",
+            Some(body.to_string()),
+            Some(cookie.to_string()),
+            Some(ORIGIN),
+        )
+    }
+
+    #[test]
+    fn subsonic_lifecycle_show_once_listing_and_owner_revocation() {
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        seed_user(&h, "u2", "b@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let foreign = magic_login(&h, "b@example.com");
+        for mode in ["apikey", "token", "both"] {
+            let response = subsonic_mint(
+                &h,
+                &cookie,
+                serde_json::json!({"label":"client", "auth_mode":mode}),
+            );
+            assert_eq!(response.status, 201, "{}", response.body);
+            assert!(response
+                .extra_headers
+                .contains(&("cache-control".into(), "private, no-store".into())));
+            let value: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+            let id = value["id"].as_str().unwrap();
+            assert_eq!(value["api_key"].is_string(), mode != "token");
+            assert_eq!(value["token_secret"].is_string(), mode != "apikey");
+            let listing = h.call_full(
+                "GET",
+                "/v1/subsonic-credentials",
+                None,
+                Some(cookie.clone()),
+                None,
+            );
+            assert_eq!(listing.status, 200);
+            assert!(
+                !listing.body.contains("username")
+                    && !listing.body.contains("secret")
+                    && !listing.body.contains("api_key")
+            );
+            for key in ["username", "api_key", "token_secret"] {
+                if let Some(s) = value[key].as_str() {
+                    assert!(!listing.body.contains(s));
+                    assert!(!format!("{:?}", h.store.audits.borrow()).contains(s));
+                }
+            }
+            let path = format!("/v1/subsonic-credentials/{id}");
+            assert_eq!(
+                h.call_full("DELETE", &path, None, Some(foreign.clone()), Some(ORIGIN))
+                    .status,
+                404
+            );
+            assert_eq!(
+                h.call_full("DELETE", &path, None, Some(cookie.clone()), Some(ORIGIN))
+                    .status,
+                200
+            );
+            assert_eq!(
+                h.call_full("DELETE", &path, None, Some(cookie.clone()), Some(ORIGIN))
+                    .status,
+                200
+            );
+            assert_eq!(
+                h.store.subsonic_credentials.borrow()[id].1.revoked_at,
+                Some(NOW)
+            );
+        }
+        let listing = h.call_full("GET", "/v1/subsonic-credentials", None, Some(foreign), None);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&listing.body).unwrap()["credentials"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn subsonic_lifecycle_requires_native_fresh_session_and_origin() {
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/subsonic-credentials".into(),
+            cookie: Some(cookie.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"label":"client"}"#.to_vec(),
+        };
+        let ctx = Ctx {
+            cfg: &h.config,
+            store: &h.store,
+            mailer: &h.mailer,
+            dialer: &h.dialer,
+            dns: &h.dns,
+            stripe: &h.stripe,
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            source_ip: "198.51.100.9".into(),
+        };
+        let response = block_on(handle(&ctx, &req));
+        assert_eq!(response.status, 401);
+        assert!(response.body.contains("reauth_required"));
+        req.origin = None;
+        assert_ne!(
+            h.call_full(
+                "POST",
+                &req.path,
+                Some("{\"label\":\"client\"}".into()),
+                Some(cookie.clone()),
+                None
+            )
+            .status,
+            201
+        );
+        req.cookie = None;
+        req.authorization = Some("Bearer nsk_not_a_session".into());
+        req.origin = Some(ORIGIN.into());
+        assert_ne!(block_on(handle(&ctx, &req)).status, 201);
+        assert!(h.store.subsonic_credentials.borrow().is_empty());
+        req.method = "GET".into();
+        req.cookie = Some(cookie);
+        req.authorization = None;
+        assert_eq!(block_on(handle(&ctx, &req)).status, 200);
+    }
+
+    #[test]
+    fn subsonic_lifecycle_refuses_unconfigured_invalid_and_failed_writes() {
+        let h = harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        assert_eq!(
+            subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+            503
+        );
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for body in [
+            serde_json::json!({"label":"client","auth_mode":"native"}),
+            serde_json::json!({"label":"x".repeat(65)}),
+            serde_json::json!({"label":"client","scope":"native-rest"}),
+            serde_json::json!({"label":""}),
+        ] {
+            assert_eq!(subsonic_mint(&h, &cookie, body).status, 422);
+        }
+        *h.store.fail_subsonic_write.borrow_mut() = true;
+        let response = subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"}));
+        assert_eq!(response.status, 500);
+        assert!(
+            !response.body.contains("nsk_")
+                && !response.body.contains("nst_")
+                && !response.body.contains("nsu_")
+        );
+        assert!(h.store.subsonic_credentials.borrow().is_empty());
+    }
+
+    #[test]
+    fn subsonic_lifecycle_cap_deletion_and_recovery_are_fail_closed() {
+        let h = subsonic_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        for _ in 0..32 {
+            assert_eq!(
+                subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+                201
+            );
+        }
+        assert_eq!(
+            subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+            422
+        );
+        h.store.deleting_users.borrow_mut().insert("u1".into());
+        assert_eq!(
+            subsonic_mint(&h, &cookie, serde_json::json!({"label":"client"})).status,
+            409
+        );
+        h.store.deleting_users.borrow_mut().clear();
+        *h.store.fail_subsonic_write.borrow_mut() = true;
+        assert_eq!(
+            h.call_full(
+                "POST",
+                "/v1/session/revoke-all",
+                None,
+                Some(cookie.clone()),
+                Some(ORIGIN)
+            )
+            .status,
+            500
+        );
+        assert_eq!(
+            h.call_full(
+                "GET",
+                "/v1/subsonic-credentials",
+                None,
+                Some(cookie.clone()),
+                None
+            )
+            .status,
+            200
+        );
+        *h.store.fail_subsonic_write.borrow_mut() = false;
+        assert_eq!(
+            h.call_full(
+                "POST",
+                "/v1/session/revoke-all",
+                None,
+                Some(cookie),
+                Some(ORIGIN)
+            )
+            .status,
+            200
+        );
+        assert!(h
+            .store
+            .subsonic_credentials
+            .borrow()
+            .values()
+            .all(|(_, r)| r.revoked_at == Some(NOW)));
+    }
+
     fn peppered_cfg() -> Config {
         cfg().with_native_rest_pepper(vec![7u8; 32], 1)
     }
@@ -17211,7 +22524,7 @@ mod tests {
         assert_eq!(start.status, 200, "{}", start.body);
         let start: serde_json::Value = serde_json::from_str(&start.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
-        let user_id = start["user_id"].as_str().unwrap().to_string();
+        let user_id = block_on(h.store.user_by_email(email)).unwrap().unwrap().id;
         let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
         let att = fx_none_attestation(cred_id, &fx_es256_cose(cose_seed));
         let resp = h.call(
@@ -17602,7 +22915,10 @@ mod tests {
         assert_eq!(start.status, 200, "{}", start.body);
         let start_body: serde_json::Value = serde_json::from_str(&start.body).unwrap();
         let challenge = start_body["challenge"].as_str().unwrap().to_string();
-        let racer_id = start_body["user_id"].as_str().unwrap().to_string();
+        let racer_id = block_on(h.store.user_by_email("racer@example.com"))
+            .unwrap()
+            .unwrap()
+            .id;
         let emailed = h.mailer.sent.borrow().last().unwrap().1.clone();
         let code_hash = auth::hash_invite_code(&code);
         assert!(
@@ -17743,7 +23059,7 @@ mod tests {
     fn magic_finish_invite_gate_keeps_established_magic_only_members_signed_in() {
         // Regression (review round 1): the gate must refuse only
         // never-admitted accounts. A magic-only member — no passkey,
-        // but a prior session or a vault, the states the reaper
+        // but a prior session or legacy vault marker, the states the reaper
         // protects — keeps signing in by email once invites are
         // required; gating on credential-lessness alone locked them
         // out at the flip with no way back in.
@@ -17765,17 +23081,17 @@ mod tests {
         let cookie = magic_login(&h, "magic-session@example.com");
         assert!(!cookie.is_empty());
 
-        // Established via a vault, with no credential and no session.
+        // Established via the legacy marker, with no credential or session.
         seed_user(&h, "u-magic-vault", "magic-vault@example.com");
         h.store
-            .legacy_vault_users
+            .legacy_vault_established
             .borrow_mut()
             .insert("u-magic-vault".to_string());
         let cookie = magic_login(&h, "magic-vault@example.com");
         assert!(!cookie.is_empty());
 
         // The bypass stays closed in the same posture: a fresh
-        // account with none of credential/session/vault is still
+        // account with no credential, session or marker is still
         // refused generically and its token stays unspent.
         seed_user(&h, "u-fresh", "fresh-signup@example.com");
         let start = h.call(
@@ -18084,6 +23400,67 @@ mod tests {
         );
         let rows = block_on(h.store.native_credentials_for_user("u1")).unwrap();
         assert_eq!(rows.len(), 1, "fenced mint stores nothing");
+    }
+
+    #[test]
+    fn credentials_mint_store_refusal_returns_no_secret_or_success_audit() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        *h.store.revoke_session_before_mint.borrow_mut() = true;
+        let before = h.store.audits.borrow().len();
+        let resp = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(!resp.body.contains("secret"));
+        assert!(!resp.body.contains("ntk_"));
+        assert!(h.store.native_credentials.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), before);
+    }
+
+    #[test]
+    fn session_revoke_all_failure_retains_cookie_and_writes_no_success_audit() {
+        let h = peppered_harness();
+        seed_user(&h, "u1", "a@example.com");
+        let cookie = magic_login(&h, "a@example.com");
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes": ["library:read"], "ttl_secs": 60}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let before = h.store.audits.borrow().len();
+        *h.store.fail_bulk_revoke.borrow_mut() = true;
+        let resp = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(resp.status, 500, "{}", resp.body);
+        assert!(resp.set_cookie.is_none());
+        assert_eq!(h.store.audits.borrow().len(), before);
+        assert!(h.store.sessions.borrow().values().all(|row| !row.revoked));
+        assert!(h
+            .store
+            .native_credentials
+            .borrow()
+            .values()
+            .all(|row| row.record.revoked_at.is_none()));
+        *h.store.fail_bulk_revoke.borrow_mut() = false;
+        let retry = h.call_full(
+            "POST",
+            "/v1/session/revoke-all",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(retry.status, 200, "{}", retry.body);
+        assert_eq!(retry.set_cookie, Some(session::clear_cookie_header()));
     }
 
     #[test]
@@ -18603,6 +23980,20 @@ mod tests {
         let start: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
 
+        let user = block_on(h.store.user_by_email("new@example.com"))
+            .unwrap()
+            .unwrap();
+        let public_handle = start["user_id"].as_str().unwrap();
+        assert_ne!(public_handle, user.id);
+        assert_eq!(
+            block_on(h.store.challenge_by_id(&challenge))
+                .unwrap()
+                .unwrap()
+                .user_id
+                .as_deref(),
+            Some(user.id.as_str())
+        );
+
         let cred_id = b"synthetic-cred";
         let mut auth = Vec::new();
         auth.extend_from_slice(&sha2::Sha256::digest(b"example.com"));
@@ -18644,6 +24035,22 @@ mod tests {
         );
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(resp.set_cookie.is_some());
+        assert_eq!(
+            block_on(h.store.credentials_for_user(&user.id))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(block_on(h.store.credentials_for_user(public_handle))
+            .unwrap()
+            .is_empty());
+        assert_eq!(h.store.sessions.borrow().len(), 1);
+        assert!(h
+            .store
+            .sessions
+            .borrow()
+            .values()
+            .all(|session| session.user_id == user.id));
 
         // Login with an assertion (sign_count 2 > stored 1).
         let resp = h.call(
@@ -19169,6 +24576,101 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
             assert_eq!(body["allow_credentials"], serde_json::json!([]), "{email}");
         }
+    }
+
+    #[test]
+    fn register_start_public_handle_survives_account_cleanup() {
+        let h = harness();
+        seed_user(&h, "known", "known@example.com");
+        seed_user(&h, "resumed", "resumed@example.com");
+        block_on(h.store.insert_credential(&PasskeyCredential {
+            cred_id_b64url: b64url_encode(b"known-cred"),
+            user_id: "known".to_string(),
+            public_key: fx_es256_cose(55),
+            sign_count: 0,
+            registered_at: NOW,
+        }))
+        .unwrap();
+        let start_at = |email: &str, now| {
+            let mut ctx = h.ctx();
+            ctx.now = now;
+            let req = Request {
+                method: "POST".to_string(),
+                path: "/v1/auth/passkey/register/start".to_string(),
+                cookie: None,
+                origin: Some(ORIGIN.to_string()),
+                authorization: None,
+                stripe_signature: None,
+                body: serde_json::json!({"email": email}).to_string().into_bytes(),
+            };
+            let resp = block_on(handle(&ctx, &req));
+            assert_eq!(resp.status, 200, "{}", resp.body);
+            let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body.as_object().unwrap().len(), 3);
+            assert_eq!(body["rp_id"], h.config.rp_id);
+            assert_eq!(
+                b64url_decode(body["user_id"].as_str().unwrap())
+                    .unwrap()
+                    .len(),
+                16
+            );
+            assert!(valid_challenge_id(body["challenge"].as_str().unwrap()));
+            body
+        };
+        let emails = [
+            "fresh@example.com",
+            "resumed@example.com",
+            "known@example.com",
+        ];
+        let before: Vec<_> = emails.iter().map(|email| start_at(email, NOW)).collect();
+        let internal_ids: Vec<_> = emails
+            .iter()
+            .map(|email| block_on(h.store.user_by_email(email)).unwrap().unwrap().id)
+            .collect();
+        for (body, internal_id) in before.iter().zip(&internal_ids) {
+            assert_ne!(body["user_id"].as_str().unwrap(), internal_id);
+        }
+        assert_ne!(before[0]["user_id"], before[1]["user_id"]);
+        assert_ne!(before[0]["user_id"], before[2]["user_id"]);
+        assert_eq!(h.mailer.sent.borrow().len(), 2);
+
+        let later = NOW + UNVERIFIED_USER_TTL_SECS + 1;
+        start_at("maintenance@example.com", later);
+        for email in &emails[..2] {
+            assert!(block_on(h.store.user_by_email(email)).unwrap().is_none());
+        }
+        assert_eq!(
+            block_on(h.store.user_by_email(emails[2]))
+                .unwrap()
+                .unwrap()
+                .id,
+            internal_ids[2]
+        );
+        for (index, email) in emails.iter().enumerate() {
+            let after = start_at(email, later);
+            assert_eq!(before[index]["user_id"], after["user_id"]);
+            assert_ne!(before[index]["challenge"], after["challenge"]);
+            let internal_id = block_on(h.store.user_by_email(email)).unwrap().unwrap().id;
+            let row = block_on(
+                h.store
+                    .challenge_by_id(after["challenge"].as_str().unwrap()),
+            )
+            .unwrap();
+            if index < 2 {
+                assert_ne!(internal_id, internal_ids[index]);
+                assert_eq!(row.unwrap().user_id.as_deref(), Some(internal_id.as_str()));
+            } else {
+                assert!(row.is_none());
+            }
+        }
+        let normalized = start_at("  FRESH@EXAMPLE.COM  ", later);
+        assert_eq!(normalized["user_id"], before[0]["user_id"]);
+        assert!(h
+            .mailer
+            .sent
+            .borrow()
+            .iter()
+            .all(|(email, _)| email != emails[2]));
     }
 
     #[test]
@@ -20212,7 +25714,7 @@ mod tests {
         for predicate in [
             "NOT EXISTS (SELECT 1 FROM webauthn_credentials",
             "NOT EXISTS (SELECT 1 FROM auth_challenges",
-            "NOT EXISTS (SELECT 1 FROM provider_vaults",
+            "AND NOT users.legacy_vault_established",
             "NOT EXISTS (SELECT 1 FROM sessions",
             "NOT EXISTS (SELECT 1 FROM magic_link_tokens",
         ] {
@@ -20244,18 +25746,14 @@ mod tests {
     }
 
     #[test]
-    fn register_start_reaper_preserves_magic_only_vault_and_inbox() {
-        // CRITICAL pin: `magic_finish` issues a session with no credential
-        // check and the register inbox email carries a redeemable magic link,
-        // while `provider_vaults.user_id ... ON DELETE CASCADE` destroys a
-        // vault saved under that session. A stale magic-only account (session
-        // + vault, no passkey) and a stale inbox-only account (unexpired
-        // magic, no session yet) must both survive a later `register_start`
-        // for another email; a truly abandoned signup must still be reaped.
+    fn register_start_reaper_preserves_session_marker_and_inbox() {
+        // A session, a legacy marker and an unexpired magic link each protect
+        // an old account independently. A truly abandoned signup is reaped.
         let h = harness();
         let stale_at = NOW.saturating_sub(UNVERIFIED_USER_TTL_SECS + 1);
         for (id, email) in [
             ("magic-only", "magic-only@example.com"),
+            ("marker-only", "marker-only@example.com"),
             ("inbox-only", "inbox-only@example.com"),
             ("abandoned", "abandoned2@example.com"),
         ] {
@@ -20266,22 +25764,19 @@ mod tests {
             }))
             .unwrap();
         }
-        let (_, magic_only_record) =
-            auth::issue_magic_link("magic-only", "magic-only@example.com", NOW).expect("issue");
-        block_on(h.store.insert_magic(&magic_only_record)).unwrap();
         block_on(h.store.insert_session(&SessionRecord {
             id: "sess-magic-only".to_string(),
             user_id: "magic-only".to_string(),
             created_at: NOW,
             expires_at: NOW + 3600,
             rotation_counter: 0,
-            revoked: false,
+            revoked: true,
         }))
         .unwrap();
         h.store
-            .legacy_vault_users
+            .legacy_vault_established
             .borrow_mut()
-            .insert("magic-only".to_string());
+            .insert("marker-only".to_string());
         let (_, inbox_record) =
             auth::issue_magic_link("inbox-only", "inbox-only@example.com", NOW).expect("issue");
         block_on(h.store.insert_magic(&inbox_record)).unwrap();
@@ -20295,7 +25790,13 @@ mod tests {
             block_on(h.store.user_by_email("magic-only@example.com"))
                 .unwrap()
                 .is_some(),
-            "magic-only account with session/vault must survive reaping"
+            "magic-only account with a revoked session must survive reaping"
+        );
+        assert!(
+            block_on(h.store.user_by_email("marker-only@example.com"))
+                .unwrap()
+                .is_some(),
+            "an account with only the legacy marker must survive reaping"
         );
         assert!(
             block_on(h.store.user_by_email("inbox-only@example.com"))
@@ -20308,10 +25809,6 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "truly abandoned signup must still be reaped"
-        );
-        assert!(
-            h.store.legacy_vault_users.borrow().contains("magic-only"),
-            "surviving legacy vault marker must not cascade-delete"
         );
     }
 
@@ -20978,6 +26475,286 @@ mod tests {
             artist_mbid: None,
             artist_name: None,
         }
+    }
+
+    #[test]
+    fn fake_member_target_matches_visibility_kind_and_errors() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        let store = FakeStore::default();
+        let uuid_job = "11111111-1111-1111-1111-AAAAAAAAAAAA";
+        let mut own = matched_library_row(uuid_job, CAT_REC_A, 1);
+        own.recording_mbids.push("opaque-invalid".into());
+        own.recording_mbids
+            .push("BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB".into());
+        store
+            .catalogue_library
+            .borrow_mut()
+            .insert("u1".into(), vec![own]);
+        store
+            .catalogue_library
+            .borrow_mut()
+            .insert("".into(), vec![unmatched_library_row("Shared")]);
+        store
+            .catalogue_library
+            .borrow_mut()
+            .insert("other".into(), vec![unmatched_library_row("Private")]);
+        for (kind, target, expected) in [
+            (Track, uuid_job, true),
+            (Track, "11111111-1111-1111-1111-aaaaaaaaaaaa", false),
+            (Track, "Shared", true),
+            (Track, "Private", false),
+            (Track, "missing", false),
+            (Track, "OPAQUE-INVALID", false),
+            (Track, CAT_REC_A, true),
+            (Track, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", true),
+            (Track, CAT_RELEASE, false),
+            (Release, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", true),
+            (Release, CAT_REC_A, false),
+        ] {
+            assert_eq!(
+                block_on(store.catalogue_member_target("u1", kind, target)).unwrap(),
+                expected
+            );
+        }
+        *store.fail_catalogue_reads.borrow_mut() = true;
+        assert!(block_on(store.catalogue_member_target("u1", Track, uuid_job)).is_err());
+    }
+
+    #[test]
+    fn fake_private_session_mutations_are_scoped_and_fenced() {
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        seed_user(&h, "u2", "u2@example.test");
+        let s = &h.store;
+        for (owner, session, expiry) in [("u1", "A", 1), ("u1", "a", 2), ("u2", "A", 3)] {
+            block_on(s.upsert_private_session(owner, session, expiry)).unwrap();
+        }
+        block_on(s.delete_private_session("u1", "A")).unwrap();
+        block_on(s.delete_private_session("u1", "A")).unwrap();
+        assert_eq!(s.private_sessions.borrow().len(), 2);
+        assert!(block_on(s.delete_private_session("missing", "a")).is_err());
+        s.deleting_users.borrow_mut().insert("u1".into());
+        assert!(block_on(s.delete_private_session("u1", "a")).is_err());
+        *s.fail_private_session_write.borrow_mut() = true;
+        assert!(block_on(s.delete_private_session("u2", "A")).is_err());
+        assert_eq!(
+            s.private_sessions.borrow().get(&("u1".into(), "a".into())),
+            Some(&2)
+        );
+        assert_eq!(
+            s.private_sessions.borrow().get(&("u2".into(), "A".into())),
+            Some(&3)
+        );
+    }
+
+    #[test]
+    fn fake_taste_collection_is_bounded_and_scoped() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        seed_user(&h, "u2", "u2@example.test");
+        let s = &h.store;
+        for i in 1..=501 {
+            block_on(s.taste_upsert("u1", Track, &format!("Job-{i}"), Love, None, i)).unwrap();
+        }
+        for (owner, kind, id, signal, until, now) in [
+            ("u1", Release, "Job-501", Love, None, 502),
+            ("u1", Track, "job-501", Dislike, None, 503),
+            ("u1", Track, "hide", Hide, None, 504),
+            ("u1", Track, "ban", Ban, None, 505),
+            ("u1", Track, "past", Snooze, Some(99), 506),
+            ("u1", Track, "equal", Snooze, Some(100), 507),
+            ("u1", Track, "future", Snooze, Some(101), 508),
+            ("u2", Track, "private", Love, None, 999),
+        ] {
+            block_on(s.taste_upsert(owner, kind, id, signal, until, now)).unwrap();
+        }
+        let taste = block_on(s.taste_list("u1", 100)).unwrap();
+        assert_eq!(taste.len(), 500);
+        assert!(taste.windows(2).all(|r| r[0].updated_at >= r[1].updated_at));
+        for kind in ["track", "release"] {
+            assert!(taste
+                .iter()
+                .any(|r| r.kind == kind && r.target_id == "Job-501"));
+        }
+        for id in ["job-501", "hide", "ban", "future"] {
+            assert!(taste.iter().any(|r| r.target_id == id));
+        }
+        for id in ["past", "equal", "private"] {
+            assert!(!taste.iter().any(|r| r.target_id == id));
+        }
+        assert!(block_on(s.taste_list("missing", 100)).unwrap().is_empty());
+        assert!(block_on(s.taste_list("u1", u64::MAX)).is_err());
+        *s.fail_taste_read.borrow_mut() = true;
+        assert!(block_on(s.taste_list("u1", 100)).is_err());
+    }
+
+    #[test]
+    fn fake_preference_collections_are_bounded_and_scoped() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        seed_user(&h, "u2", "u2@example.test");
+        let s = &h.store;
+        for i in 1..=501 {
+            block_on(s.taste_upsert("u1", Track, &format!("Job-{i}"), Love, None, i)).unwrap();
+        }
+        for (owner, kind, id, signal, until, now) in [
+            ("u1", Release, "Job-501", Love, None, 502),
+            ("u1", Track, "job-501", Dislike, None, 503),
+            ("u1", Track, "hide", Hide, None, 504),
+            ("u1", Track, "ban", Ban, None, 505),
+            ("u1", Track, "past", Snooze, Some(99), 506),
+            ("u1", Track, "equal", Snooze, Some(100), 507),
+            ("u1", Track, "future", Snooze, Some(101), 508),
+            ("u2", Track, "private", Love, None, 999),
+        ] {
+            block_on(s.taste_upsert(owner, kind, id, signal, until, now)).unwrap();
+        }
+        let likes = block_on(s.likes_list("u1")).unwrap();
+        assert_eq!(likes.len(), 500);
+        assert!(likes.windows(2).all(|r| r[0].created_at >= r[1].created_at));
+        assert!(likes
+            .iter()
+            .all(|r| r.signal == "love" && r.target_id != "private"));
+        assert!(likes
+            .iter()
+            .any(|r| r.kind == "release" && r.target_id == "Job-501"));
+        assert!(likes
+            .iter()
+            .any(|r| r.kind == "track" && r.target_id == "Job-501"));
+        assert!(block_on(s.likes_list("missing")).unwrap().is_empty());
+        *s.fail_taste_read.borrow_mut() = true;
+        assert!(block_on(s.likes_list("u1")).is_err());
+    }
+
+    #[test]
+    fn fake_taste_upsert_replays_and_fails_closed() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Love, Snooze};
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        let store = &h.store;
+        let write = |kind, signal, until, now| {
+            block_on(store.taste_upsert("u1", kind, "Job_A", signal, until, now))
+        };
+        assert_eq!(write(Track, Love, None, 10).unwrap().created_at, 10);
+        assert_eq!(write(Track, Love, None, 20).unwrap().created_at, 10);
+        assert_eq!(
+            write(Track, Snooze, Some(25), 21).unwrap().snooze_until,
+            Some(25)
+        );
+        let row = write(Track, Love, None, 30).unwrap();
+        assert_eq!(
+            (row.created_at, row.updated_at, row.snooze_until),
+            (30, 30, None)
+        );
+        write(Release, Love, None, 40).unwrap();
+        assert_eq!(
+            block_on(store.taste_get("u1", Track, "Job_A")).unwrap(),
+            Some(row.clone())
+        );
+        assert!(block_on(store.taste_upsert("missing", Track, "Job_A", Love, None, 50)).is_err());
+        assert!(write(Track, Snooze, None, 50).is_err());
+        *store.fail_taste_write.borrow_mut() = true;
+        assert!(write(Track, Love, None, 50).is_err());
+        *store.fail_taste_write.borrow_mut() = false;
+        store.deleting_users.borrow_mut().insert("u1".into());
+        assert!(write(Track, Love, None, 50).is_err());
+        assert_eq!(
+            block_on(store.taste_get("u1", Track, "Job_A")).unwrap(),
+            Some(row)
+        );
+    }
+
+    #[test]
+    fn fake_preference_deletes_are_scoped_and_fenced() {
+        use crate::target_identity::TargetKind::{Release, Track};
+        use crate::taste_signal::TasteSignal::{Ban, Dislike, Hide, Love, Snooze};
+        let h = harness();
+        seed_user(&h, "u1", "u1@example.test");
+        seed_user(&h, "u2", "u2@example.test");
+        let s = &h.store;
+        for (id, signal, until) in [
+            ("love", Love, None),
+            ("dislike", Dislike, None),
+            ("hide", Hide, None),
+            ("ban", Ban, None),
+            ("snooze", Snooze, Some(2)),
+        ] {
+            block_on(s.taste_upsert("u1", Track, id, signal, until, 3)).unwrap();
+            assert_eq!(
+                block_on(s.like_delete("u1", Track, id)).unwrap(),
+                signal == Love
+            );
+            assert_eq!(
+                block_on(s.taste_get("u1", Track, id)).unwrap().is_some(),
+                signal != Love
+            );
+            assert_eq!(
+                block_on(s.taste_delete("u1", Track, id)).unwrap(),
+                signal != Love
+            );
+            assert!(!block_on(s.taste_delete("u1", Track, id)).unwrap());
+        }
+        for (user, kind, target) in [
+            ("u1", Track, "Job_A"),
+            ("u1", Release, "Job_A"),
+            ("u1", Track, "job_a"),
+            ("u2", Track, "Job_A"),
+        ] {
+            block_on(s.taste_upsert(user, kind, target, Love, None, 3)).unwrap();
+        }
+        assert!(block_on(s.like_delete("u1", Track, "Job_A")).unwrap());
+        for (user, kind, target) in [
+            ("u1", Release, "Job_A"),
+            ("u1", Track, "job_a"),
+            ("u2", Track, "Job_A"),
+        ] {
+            assert!(block_on(s.taste_get(user, kind, target)).unwrap().is_some());
+        }
+        assert!(block_on(s.taste_delete("missing", Track, "Job_A")).is_err());
+        s.deleting_users.borrow_mut().insert("u2".into());
+        assert!(block_on(s.taste_delete("u2", Track, "Job_A")).is_err());
+        *s.fail_taste_write.borrow_mut() = true;
+        assert!(block_on(s.like_delete("u1", Track, "job_a")).is_err());
+        assert!(block_on(s.taste_get("u2", Track, "Job_A"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn fake_taste_get_is_scoped_and_fails_closed() {
+        use crate::preference_rows::TasteDbRow;
+        use crate::target_identity::TargetKind::{Release, Track};
+        let store = FakeStore::default();
+        let row = TasteDbRow {
+            kind: "track".into(),
+            target_id: "Job_A".into(),
+            signal: "snooze".into(),
+            snooze_until: Some(5),
+            created_at: 1,
+            updated_at: 2,
+        };
+        store
+            .taste_rows
+            .borrow_mut()
+            .insert(("u1".into(), "track".into(), "Job_A".into()), row.clone());
+        assert_eq!(
+            block_on(store.taste_get("u1", Track, "Job_A")).unwrap(),
+            Some(row)
+        );
+        for (user, kind, id) in [
+            ("other", Track, "Job_A"),
+            ("u1", Release, "Job_A"),
+            ("u1", Track, "job_a"),
+        ] {
+            assert_eq!(block_on(store.taste_get(user, kind, id)).unwrap(), None);
+        }
+        *store.fail_taste_read.borrow_mut() = true;
+        assert!(block_on(store.taste_get("u1", Track, "Job_A")).is_err());
     }
 
     fn seed_catalogue(h: &Harness) {
@@ -21742,7 +27519,7 @@ mod tests {
         );
         assert!(h.dialer.seen.borrow().is_empty(), "no probe dial");
         assert!(
-            h.store.legacy_vault_users.borrow().is_empty(),
+            h.store.legacy_vault_established.borrow().is_empty(),
             "no vault state is created"
         );
     }

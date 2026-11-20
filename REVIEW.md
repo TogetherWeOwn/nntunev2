@@ -26,6 +26,15 @@ never replaces same-build staging, migrations, rollback or exact-head
 production authorization. This analysis-only review is not the final
 merge/approval stage described in CONTRIBUTING.
 
+## Dependency-bump PRs
+
+For dependency version-bump PRs (including Dependabot-style updates):
+
+- Evaluate the bump against the dependency's own changelog and this repository's actual usage.
+- Do not flag lockfile or transitive-dependency churn by itself. A dependency-induced correctness, compatibility, installation, build, output, or reliability regression remains reportable under this repository's existing finding rules, whether or not it involves a changed API this repository calls. Identify the affected repository call site or path, concrete trigger and wrong outcome, and supporting evidence at the reviewed commit.
+- Report a known security advisory introduced or left unfixed with its concrete impact. Existing security-review rules take precedence over this churn guidance: do not suppress a plausible security issue merely because it has no published advisory; apply the existing exploit-path and evidence requirements and state any unverified step.
+- Follow this repository's existing dependency policy for pins versus ranges; do not substitute reviewer preference.
+
 ## Before you flag a security issue
 
 - Require a concrete exploit path at the exact reviewed commit: who the
@@ -158,6 +167,14 @@ A missing test alone is not a runtime bug. These are blocking findings:
   a real provider/Subsonic client.
 
 ## This repository: where defects hide
+
+- **CI and deploy wiring** (`.github/workflows/ci.yml`, `deploy.yml`, `deploy-production.yml`):
+  when a PR adds or tightens a CI, deploy or gate check, or edits a workflow,
+  trace each new input, env and output to its supplying job and verify `needs:` ordering.
+  Judge merge-commit and post-merge deploy paths, not only PR-head checks; compare
+  migration, history and allowlist gates against current `main`, not the PR base.
+  For publish/artifact jobs, verify no key, token or secret material reaches an uploaded
+  artifact or public output. Report a violation as Severe only with the exact job/line and failing path.
 
 - **Provider credentials (highest stakes):** users bring their own Usenet
   provider accounts. Credentials must never be logged, cached in plaintext

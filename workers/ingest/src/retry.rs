@@ -491,6 +491,7 @@ mod tests {
             provider_id: msg.provider_id.clone(),
             transcode_inputs: Vec::new(),
             transcode_next: 0,
+            accepted_audio_manifest_v1: None,
         }
     }
 

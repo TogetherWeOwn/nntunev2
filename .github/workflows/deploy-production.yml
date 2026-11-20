@@ -2,7 +2,7 @@ name: deploy-production
 
 # Production promotion for the web frontend (apps/web only).
 #
-# Cutover only. Never runs on push, PR, release, or another workflow.
+# Manual only; never runs on push, PR, release, or another workflow.
 # Disabled by default: the preflight job refuses unless the repo variable
 # PRODUCTION_DEPLOY_ENABLED is exactly "true". The production hostname is
 # decided at launch; until then the workflow builds against the placeholder
@@ -56,6 +56,11 @@ on:
         required: false
         type: string
         default: ""
+      mode:
+        description: "Seed unexposed maintenance (app promotion is disabled)"
+        type: choice
+        options: [promote, bootstrap-maintenance]
+        default: promote
 
 permissions:
   contents: read
@@ -68,7 +73,7 @@ concurrency:
 env:
   NODE_VERSION: "24"
   PNPM_VERSION: 10.34.7
-  WRANGLER_VERSION: 4.153.0
+  WRANGLER_VERSION: 4.162.0
   # Placeholder production hostname until the launch decision lands in the
   # repo variable PRODUCTION_DOMAIN. ".invalid" never resolves, so a
   # misconfigured run cannot send traffic anywhere real; the preflight job
@@ -92,10 +97,18 @@ jobs:
         id: target
         env:
           INPUT_SHA: ${{ inputs.sha }}
+          DEPLOY_MODE: ${{ inputs.mode }}
           PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
           PRODUCTION_DOMAIN: ${{ vars.PRODUCTION_DOMAIN }}
+          UNPROTECTED_ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+          UNPROTECTED_WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          UNPROTECTED_ROUTE_PROOF: ${{ vars.PRODUCTION_BOOTSTRAP_ROUTE_PROOF }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_REF" != refs/heads/main ] || [ -n "$UNPROTECTED_ACCEPTED_SHA" ]; then
+            echo '::error::Dispatch on main; PRODUCTION_ACCEPTED_SHA must exist only in the production Environment'
+            exit 1
+          fi
           if [ "${PRODUCTION_DEPLOY_ENABLED:-}" != "true" ]; then
             echo "::error::Production lane disabled: repo variable PRODUCTION_DEPLOY_ENABLED must be exactly true"
             exit 1
@@ -110,11 +123,16 @@ jobs:
             exit 1
           fi
           case "$domain" in
-            *\ *|*/*|*:*) echo "::error::PRODUCTION_DOMAIN must be a bare hostname (no scheme, path, port or spaces)"; exit 1;;
+            *[!a-zA-Z0-9.-]*) echo '::error::PRODUCTION_DOMAIN must be a bare hostname'; exit 1;;
           esac
+          [ "$DEPLOY_MODE" = bootstrap-maintenance ] ||
+            { echo '::error::Application promotion is disabled; only bootstrap-maintenance is supported'; exit 1; }
+          [ "$INPUT_SHA" = "${GITHUB_SHA:-}" ] ||
+            { echo '::error::Bootstrap SHA must match the dispatched main commit'; exit 1; }
+          [ -z "${UNPROTECTED_WORKER_ID:-}${UNPROTECTED_ROUTE_PROOF:-}" ] ||
+            { echo '::error::Worker ID and route proof must exist only in the production Environment'; exit 1; }
           echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
           echo "domain=$domain" >> "$GITHUB_OUTPUT"
-          echo "Promotion target: $INPUT_SHA -> $domain (lane enabled)"
 
   staging-evidence:
     name: staging-evidence
@@ -138,8 +156,12 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          # Check inheritance from outside production without passing secret values to this runner.
+          UNPROTECTED_CF_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' }}
         run: |
           set -euo pipefail
+          [ "${UNPROTECTED_CF_CONFIG:-}" = false ] ||
+            { echo '::error::Cloudflare credentials must exist only in the production Environment'; exit 1; }
           python3 - <<'PY'
           import json, os, sys, urllib.request
 
@@ -220,6 +242,7 @@ jobs:
 
   deploy-production:
     name: deploy-production
+    if: inputs.mode == 'promote'
     needs: [preflight, staging-evidence]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -228,9 +251,8 @@ jobs:
     concurrency:
       group: production-worker-mutation
       cancel-in-progress: false
-    # Required reviewers are live repo settings unless auto-approve is on;
-    # the preflight gate already refused a disabled lane or a placeholder
-    # hostname before this job could start.
+    # Keep the candidate authorization in the production Environment, not in
+    # dispatch inputs. Preflight rejects any repo/org-level value of that name.
     environment:
       name: production
       url: ${{ format('https://{0}', needs.preflight.outputs.domain) }}
@@ -239,12 +261,22 @@ jobs:
     # build/upload run steps set working-directory apps/web individually
     # instead of defaulting the whole job there.
     steps:
+      - name: Require the exact Release Manager-accepted SHA
+        env:
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ACCEPTED_SHA" ] || [ "$DEPLOY_SHA" != "$ACCEPTED_SHA" ]; then
+            echo '::error::Dispatch SHA must match PRODUCTION_ACCEPTED_SHA in the production Environment'
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Deploy the validated dispatch SHA, never a newer main head.
           ref: ${{ needs.preflight.outputs.sha }}
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -259,9 +291,16 @@ jobs:
         env:
           BUILD_SHA: ${{ needs.preflight.outputs.sha }}
         run: pnpm build
+      - name: Pin the shared action and production steps to locked Wrangler
+        run: |
+          set -euo pipefail
+          shim="$GITHUB_WORKSPACE/ci/locked-wrangler"
+          version="$("$shim/npx" wrangler --version)"
+          test "$version" = "${WRANGLER_VERSION:?}"
+          printf '%s\n' "$shim" >> "$GITHUB_PATH"
       - name: Build production target without deploying
         working-directory: apps/web
-        run: npx --yes "wrangler@${WRANGLER_VERSION:?}" deploy --dry-run --env production --outdir dist-production
+        run: npx wrangler deploy --dry-run --env production --outdir dist-production
       - name: Require production Worker secret shape before upload
         # Offline shape check, not a secret read: the web Worker ships no
         # bindings and needs no secrets, so any production vars table in
@@ -296,15 +335,13 @@ jobs:
           WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
         run: |
           set -euo pipefail
-          npx --yes "wrangler@${WRANGLER_VERSION:?}" deployments list --env production --name "$WORKER_NAME" --json \
+          npx wrangler deployments list --env production --name "$WORKER_NAME" --json \
             | node -e '
               let raw = "";
               process.stdin.on("data", (c) => { raw += c; });
               process.stdin.on("end", () => {
-                const seed = "one-time production seed required: make one full deploy of the web frontend " +
-                  "to production (e.g. wrangler deploy --env production from the launch SHA) with the " +
-                  "production custom domain attached, leaving a single 100% deployment; then re-dispatch " +
-                  "this lane. See docs/ops.md production seed precondition.";
+                const seed = "Require one production version at 100%. If unseeded, keep promotion off. " +
+                  "See docs/ops.md production seed precondition.";
                 let parsed;
                 try {
                   parsed = JSON.parse(raw);
@@ -336,6 +373,7 @@ jobs:
       # triggers. Never use a full deploy or a trigger-syncing subcommand
       # here: those re-provision the production hostname and fail or drift.
       - name: Upload reviewed production version without changing triggers
+        if: inputs.mode == 'promote'
         working-directory: apps/web
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
@@ -343,7 +381,7 @@ jobs:
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          npx --yes "wrangler@${WRANGLER_VERSION:?}" versions upload --env production \
+          npx wrangler versions upload --env production \
             --tag "${DEPLOY_SHA:?}-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
       # Gradual promotion lives in the shared central composite action
       # (pinned below): 5% -> 50% -> 100% with per-stage health gates pinned
@@ -351,8 +389,9 @@ jobs:
       # pre-promote version on any stage failure. Repo-specific build/upload
       # stays above; only versions promote/rollback runs here.
       - name: Gradual promotion 5-50-100 with automatic rollback
+        if: inputs.mode == 'promote'
         id: gradual
-        uses: TogetherWeOwn/.github/actions/gradual-promote@cf983076f568407ce2dceb6eeabd1beb2e1e28c6 # v0.4.0
+        uses: TogetherWeOwn/.github/actions/gradual-promote@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
         with:
           worker-name: ${{ env.PRODUCTION_WORKER_NAME }}
           version-tag: ${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -360,6 +399,7 @@ jobs:
           api-token: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           account-id: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
       - name: Verify production serves the promoted build
+        if: inputs.mode == 'promote'
         # Post-promotion verification: after the gradual promotion reaches
         # 100%, probe the public-route set against the production origin and
         # prove the serving build is the promoted SHA (GET /api/build). Same
@@ -387,6 +427,7 @@ jobs:
           echo "::error::post-promotion smoke failed; promoted candidate remains live at 100%; recorded restoration target ${PREV_VERSION:-unknown} - restore it with a wrangler rollback to that version id"
           exit 1
       - name: Record successful production promotion
+        if: inputs.mode == 'promote'
         # Success-only and after the identity-aware smoke above. Write inline
         # because the selected deployment checkout can predate this receipt
         # protocol. release.yml proves this receipt before tagging.
@@ -416,6 +457,7 @@ jobs:
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
           PROMOTED_VERSION_ID: ${{ steps.gradual.outputs.promoted-version-id }}
       - name: Upload production promotion proof
+        if: inputs.mode == 'promote'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: production-promotion-${{ needs.preflight.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -423,8 +465,48 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  bootstrap-maintenance:
+    name: bootstrap-maintenance
+    if: inputs.mode == 'bootstrap-maintenance'
+    needs: [preflight, staging-evidence]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    concurrency:
+      group: production-worker-mutation
+      cancel-in-progress: false
+    environment: production
+    steps:
+      - name: Require the exact Release Manager-accepted SHA
+        env:
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+        run: |
+          set -euo pipefail
+          # A partial rerun can reuse successful preflight and staging admission.
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 && -n "$ACCEPTED_SHA" && "$DEPLOY_SHA" == "$ACCEPTED_SHA" ]] ||
+            { echo '::error::Use a fresh dispatch whose SHA matches PRODUCTION_ACCEPTED_SHA in the production Environment'; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Seed only the pinned, empty maintenance Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          ROUTE_PROOF: ${{ vars.PRODUCTION_BOOTSTRAP_ROUTE_PROOF }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+        run: node ci/production-maintenance/seed.mjs
+
   release:
     name: release
+    if: inputs.mode == 'promote'
     # Tag the commit that is now live and publish its notes (release.yml),
     # only after the production deploy succeeds. preflight.outputs.sha is
     # the promoted commit (DEPLOY_SHA), never main's tip.

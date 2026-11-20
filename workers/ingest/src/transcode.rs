@@ -29,12 +29,9 @@
 //! contract, so their bytes and hashes coincide by construction.
 //! Source bytes are only ever read, never modified.
 //!
-//! Publication (spec §4.2, ADR 0002 rule 3 / ADR 0003 §writers), one
+//! Publication helpers use one
 //! idempotent statement each, all converging on redelivery. This step
-//! publishes the content-global row only; the two user rows stay
-//! pinned here but unwired until the tracks/providers writers land
-//! (a follow-up wires them, with the §8 proof, once their FK targets
-//! exist — publishing them today would fail closed on every job):
+//! publishes only the content-global row:
 //!
 //! - [`upsert_cache_object_sql`] — the content-global blob row. No
 //!   writer fence: the row carries no user identity and an orphaned
@@ -42,18 +39,13 @@
 //! - [`upsert_track_media_sql`] — the per-user mapping with
 //!   `format='opus'`, `bitrate=64` as SQL literals (the profile is
 //!   pinned in the statement, not in a caller-supplied value).
-//! - [`upsert_cache_grant_sql`] — `user_cache_grants(user,
-//!   artifact_hash)` with the fetching `provider_id`, so a transcode
-//!   derived from own-provider bytes keeps the same own-provider
-//!   proof requirement as its source: knowing the hash confers
-//!   nothing.
 //!
-//! The two user rows select through the standard `writer_fence`
+//! The unwired mapping selects through the standard `writer_fence`
 //! (`users` row `FOR SHARE` while `deleting_at IS NULL`), so
 //! publication cannot repopulate library state after deletion is
 //! scheduled. A zero-row write is either a benign replay
 //! (`ON CONFLICT DO NOTHING` converged) or a fenced account; the
-//! consumer separates them with the PK selects plus
+//! mapping contract separates them with a PK select plus
 //! [`classify_publish_zero_rows`], never by assuming.
 //!
 //! Runtime: the `Transcoding` step (`run_transcode_step` in
@@ -72,8 +64,6 @@
 //! an operator action). Missing-table SQLSTATEs map through
 //! `crate::library::is_deterministic_sqlstate` to permanent
 //! failures, so jobs quarantine at once instead of burning budget.
-//! Grant publication (the follow-up, not this step) carries the
-//! standing threat-model §8 gate with it.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -456,34 +446,12 @@ pub fn upsert_track_media_sql() -> &'static str {
     "INSERT INTO track_media (user_id, track_id, source_job_id, content_hash, format, bitrate, verified_at) SELECT $1, $2, $3, $4, 'opus', 64, $5 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, track_id, source_job_id, content_hash) DO NOTHING"
 }
 
-/// `$n` parameter order for [`upsert_cache_grant_sql`].
-pub const CACHE_GRANT_PARAM_ORDER: [&str; 4] =
-    ["user_id", "content_hash", "provider_id", "verified_at"];
-
-/// Idempotent own-provider proof for the artifact: without this row
-/// the bytes are unservable (ADR 0003: the blob row is a storage
-/// index, never authorization). `provider_id` is the fetching
-/// provider's UUID text. Fenced like [`upsert_track_media_sql`];
-/// zero-row writes classify through [`select_cache_grant_by_pk_sql`]
-/// plus [`classify_publish_zero_rows`]. `verified_at` is BIGINT unix
-/// seconds; `last_served_at` is initialized by the schema default at
-/// publication.
-pub fn upsert_cache_grant_sql() -> &'static str {
-    "INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at) SELECT $1, $2, $3, $4 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, content_hash) DO NOTHING"
-}
-
 /// Fetch the mapping row after a zero-row [`upsert_track_media_sql`]
 /// write so the consumer can separate a benign replay from a fenced
 /// account. Parameters: `user_id` ($1), `track_id` ($2),
 /// `source_job_id` ($3), `content_hash` ($4).
 pub fn select_track_media_by_pk_sql() -> &'static str {
     "SELECT user_id, track_id, source_job_id, content_hash, format, bitrate FROM track_media WHERE user_id = $1 AND track_id = $2 AND source_job_id = $3 AND content_hash = $4"
-}
-
-/// Fetch the grant row after a zero-row [`upsert_cache_grant_sql`]
-/// write. Parameters: `user_id` ($1), `content_hash` ($2).
-pub fn select_cache_grant_by_pk_sql() -> &'static str {
-    "SELECT user_id, content_hash, provider_id FROM user_cache_grants WHERE user_id = $1 AND content_hash = $2"
 }
 
 /// Outcome of one idempotent publication write.
@@ -918,16 +886,8 @@ mod tests {
             "INSERT INTO track_media (user_id, track_id, source_job_id, content_hash, format, bitrate, verified_at) SELECT $1, $2, $3, $4, 'opus', 64, $5 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, track_id, source_job_id, content_hash) DO NOTHING"
         );
         assert_eq!(
-            upsert_cache_grant_sql(),
-            "INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at) SELECT $1, $2, $3, $4 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id, content_hash) DO NOTHING"
-        );
-        assert_eq!(
             select_track_media_by_pk_sql(),
             "SELECT user_id, track_id, source_job_id, content_hash, format, bitrate FROM track_media WHERE user_id = $1 AND track_id = $2 AND source_job_id = $3 AND content_hash = $4"
-        );
-        assert_eq!(
-            select_cache_grant_by_pk_sql(),
-            "SELECT user_id, content_hash, provider_id FROM user_cache_grants WHERE user_id = $1 AND content_hash = $2"
         );
         // Literals pin the profile: no parameter can relabel the bytes.
         assert!(upsert_track_media_sql().contains("'opus', 64"));
@@ -940,10 +900,6 @@ mod tests {
                 "content_hash",
                 "verified_at"
             ]
-        );
-        assert_eq!(
-            CACHE_GRANT_PARAM_ORDER,
-            ["user_id", "content_hash", "provider_id", "verified_at"]
         );
         assert_eq!(
             CACHE_OBJECT_PARAM_ORDER,
@@ -1312,6 +1268,7 @@ mod tests {
             provider_id: None,
             transcode_inputs: Vec::new(),
             transcode_next: 7,
+            accepted_audio_manifest_v1: None,
         };
         record_transcode_inputs(&mut cp, &files, &staged, JOB, 2).unwrap();
         assert_eq!(cp.transcode_inputs.len(), 1);

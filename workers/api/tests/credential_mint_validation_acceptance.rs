@@ -308,13 +308,27 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
-    async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), handlers::StoreError> {
+    async fn revoke_sessions_and_native_credentials(
+        &self,
+        user_id: &str,
+        now: u64,
+    ) -> Result<u64, handlers::StoreError> {
+        if user_id.is_empty() {
+            return Ok(0);
+        }
         for row in self.sessions.borrow_mut().values_mut() {
             if row.user_id == user_id {
                 row.revoked = true;
             }
         }
-        Ok(())
+        let mut revoked = 0;
+        for row in self.native_credentials.borrow_mut().values_mut() {
+            if row.record.user_id == user_id && row.record.revoked_at.is_none() {
+                row.record.revoked_at = Some(now);
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
     }
 
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
@@ -325,7 +339,16 @@ impl handlers::Store for FakeStore {
     async fn insert_native_credential(
         &self,
         row: &handlers::NativeCredentialRow,
+        session_id: &str,
     ) -> Result<(), handlers::StoreError> {
+        if !self
+            .sessions
+            .borrow()
+            .get(session_id)
+            .is_some_and(|session| session.user_id == row.record.user_id && !session.revoked)
+        {
+            return Err(handlers::StoreError);
+        }
         let mut rows = self.native_credentials.borrow_mut();
         // Mirror the migration 0019 composite UNIQUE: neither the id nor
         // the (pepper_version, key_hmac) identity may repeat.

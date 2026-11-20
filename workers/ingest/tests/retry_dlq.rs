@@ -33,23 +33,10 @@ fn always_fails(_: &QueueMsg) -> Result<(), JobError> {
 }
 
 fn checkpoint_for(msg: &QueueMsg) -> JobCheckpoint {
-    JobCheckpoint {
-        job_id: msg.job_id.clone(),
-        user_id: msg.user_id.clone(),
-        idempotency_key: msg.idempotency_key.clone(),
-        source: msg.source,
-        state: msg.state,
-        attempt: 1,
-        repair_rounds: msg.repair_rounds,
-        probe_tally: None,
-        par2_set_id: None,
-        missing_blocks: 0,
-        failure_code: None,
-        failure_reason: None,
-        provider_id: msg.provider_id.clone(),
-        transcode_inputs: Vec::new(),
-        transcode_next: 0,
-    }
+    let mut cp = nntune_ingest::checkpoint::initial(msg);
+    cp.state = msg.state;
+    cp.repair_rounds = msg.repair_rounds;
+    cp
 }
 
 #[test]

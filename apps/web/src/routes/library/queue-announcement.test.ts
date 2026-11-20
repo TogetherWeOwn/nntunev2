@@ -1,6 +1,9 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import * as queueFunctions from '#lib/player/queue.js';
+import { createQueueShare } from '#lib/player/queueShare.js';
+import { createPlayerController } from '#lib/player/controller.svelte.js';
+import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary, selectFavoriteItems } from '#lib/library/favorites.js';
 import {
@@ -11,8 +14,8 @@ import {
 } from '#lib/library/recent-finds.js';
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
-import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { displayArtist, displayTitle, orderLibraryItems, shortTitle } from '#lib/library/order.js';
+import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
 import { libraryTabTitle } from '#lib/library/tab-title.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
@@ -73,13 +76,15 @@ function extractFirstScript(source: string): string | undefined {
 	return undefined;
 }
 
-function pageScript() {
+function pageScript(onEndTrackDrag = endTrackDrag) {
 	const script = extractFirstScript(sources['./+page.svelte']);
 	if (!script) throw new Error('Library page script missing');
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const body = parsed.statements
 		.filter((statement) => !ts.isImportDeclaration(statement))
-		.map((statement) => statement.getText(parsed))
+		.map((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
+			(declaration) => declaration.name.getText(parsed) === 'queue'
+		) ? 'let queue; queueController.subscribe((value) => { queue = value; });' : statement.getText(parsed))
 		.join('\n');
 	const compiled = ts.transpileModule(body, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
@@ -88,6 +93,8 @@ function pageScript() {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
+		createQueueShare, createPlayerController,
+		createFavoritesExport,
 		moveTrack: queueFunctions.moveTrack,
 		nextTrack: queueFunctions.nextTrack,
 		playNext: queueFunctions.playNext,
@@ -107,11 +114,10 @@ function pageScript() {
 		displayArtist,
 		displayTitle,
 		clearMiniPlayerHint,
-		setMiniPlayerHint,
 		orderLibraryItems,
 		filterLibraryItems,
 		libraryTabTitle,
-		endTrackDrag,
+		endTrackDrag: onEndTrackDrag,
 		appendResultLabel,
 		appendSelection,
 		clearSelection,
@@ -128,25 +134,32 @@ function pageScript() {
 		clearSignedInEmail: () => {},
 		resolveStreamUrl: () => null,
 		onMount: () => {},
+		shortTitle,
 		tick: () => Promise.resolve(),
-		$state: <T>(value: T) => value,
+		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
 		return {
 			refresh, selectTrack, moveQueuedTrack, toggleFavorite,
+			dispose: refresher.dispose, subscribeQueue: queueController.subscribe,
 			handleAuthTransition, handleLocalAuthTransition, unstarFromShelf, confirmClearFavorites,
-			read: () => ({ queue, announcement: queueAnnouncement, items, loadError }),
+			read: () => ({ queue, announcement: player.queueAnnouncement.text, items, loadError }),
 			readFavorites: () => ({ favorites, announcement: favoritesAnnouncement }),
 			// Fixture setup only: do not call a non-move page edit, which would
 			// clear the announcement before the handler under test ever runs.
-			emptyQueueWithoutEdit: () => { queue = clearQueue(queue); },
+			emptyQueueWithoutEdit: () => {
+				const next = clearQueue(queue);
+				queueController.publish(next, queueController.begin(next, 'clear'));
+			},
 			setFavoriteAnnouncementForFixture: (announcement) => {
 				favoritesAnnouncement = announcement;
 			}
 		};
 	`)(...Object.values(bindings)) as {
 		refresh: () => Promise<void>;
+		dispose: () => void;
+		subscribeQueue: (listener: (queue: queueFunctions.QueueState) => void) => () => void;
 		selectTrack: (id: string) => void;
 		moveQueuedTrack: (from: number, to: number) => void;
 		toggleFavorite: (id: string) => void;
@@ -170,6 +183,60 @@ function pageScript() {
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+test.each(['handleLocalAuthTransition', 'dispose'] as const)(
+	'a deferred response cannot publish to the Library route after %s',
+	async (revoke) => {
+		const dragCleanup = vi.fn(endTrackDrag);
+		const page = pageScript(dragCleanup);
+		let resolve!: (response: Response) => void;
+		const response = new Promise<Response>((accept) => { resolve = accept; });
+		vi.stubGlobal('fetch', () => response);
+
+		const pending = page.refresh();
+		page[revoke]();
+		const before = dragCleanup.mock.calls.length;
+		resolve(Response.json(ITEMS));
+		await pending;
+
+		expect(dragCleanup).toHaveBeenCalledTimes(before);
+		expect(page.read().items).toEqual([]);
+	}
+);
+
+test('disposal during queue reconciliation stops the remaining refresh effects', async () => {
+	const page = pageScript();
+	vi.stubGlobal('fetch', async () => Response.json(ITEMS));
+	await page.refresh();
+	page.selectTrack(ITEMS[0].id);
+	const search = vi.fn(() => '');
+	vi.stubGlobal('window', { location: { get search() { return search(); } } });
+	const unsubscribe = page.subscribeQueue((queue) => {
+		if (queue.tracks.length === 0) page.dispose();
+	});
+	vi.stubGlobal('fetch', async () => Response.json(ITEMS.slice(1)));
+	await page.refresh();
+	unsubscribe();
+
+	expect(page.read().queue.tracks).toEqual([]);
+	expect(search).not.toHaveBeenCalled();
+});
+
+test('cached fallback does not resolve share input on refresh completion', async () => {
+	const page = pageScript();
+	vi.stubGlobal('fetch', async () => Response.json(ITEMS));
+	await page.refresh();
+	const search = vi.fn(() => '');
+	vi.stubGlobal('window', { location: { get search() { return search(); } } });
+	vi.stubGlobal('fetch', async () => { throw new TypeError('network unavailable'); });
+	await page.refresh();
+
+	expect(page.read().items).toEqual(ITEMS);
+	expect(search).not.toHaveBeenCalled();
+	vi.stubGlobal('fetch', async () => Response.json(ITEMS));
+	await page.refresh();
+	expect(search).toHaveBeenCalledOnce();
+});
 
 for (const boundary of ['storage', 'local'] as const) {
 	test(`${boundary} auth clears an announcement even when the queue is already empty`, async () => {

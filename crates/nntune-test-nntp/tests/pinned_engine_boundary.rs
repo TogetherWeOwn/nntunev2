@@ -12,7 +12,40 @@ use std::time::Duration;
 
 use nntune_core::nntp::{NntpClient, NntpConfig, PostOutcome};
 use nntune_core::transports::{connect_native, NativeTlsTransport};
-use nntune_test_nntp::{default_corpus, generate_wav_bytes, TestNntpServer};
+use nntune_test_nntp::{
+    default_corpus, generate_wav_bytes, nzb_for, nzb_for_multipart, TestNntpServer,
+};
+
+#[test]
+fn message_ids_reject_unicode_whitespace_and_controls_at_consumer_boundary() {
+    for ch in ['\u{a0}', '\u{85}', '\u{2028}', '\u{80}'] {
+        let id = format!("boundary{ch}@nntune.test");
+        assert!(nntune_core::nzb::normalize_message_id(&id).is_err());
+    }
+    let id = "café@nntune.test";
+    assert_eq!(nntune_core::nzb::normalize_message_id(id).unwrap(), id);
+}
+
+#[test]
+fn fixture_nzbs_preserve_escaped_identity_and_encoded_size() {
+    let mut article = default_corpus().remove(0);
+    article.message_id = "<boundary&escaped@nntune.test>".into();
+    let articles = [&article];
+    for xml in [
+        nzb_for(&articles, "alt.binaries.nntune&test"),
+        nzb_for_multipart(&articles, "alt.binaries.nntune&test"),
+    ] {
+        assert!(xml.contains("<group>alt.binaries.nntune&amp;test</group>"));
+        let document = nntune_core::nzb::parse(xml.as_bytes()).expect("fixture NZB parses");
+        assert_eq!(document.files.len(), 1);
+        let segments = &document.files[0].segments;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].message_id, "boundary&escaped@nntune.test");
+        assert_eq!(segments[0].encoded_bytes, article.raw.len() as i64);
+        assert_eq!(document.encoded_bytes, article.raw.len() as i64);
+        assert_ne!(article.raw.len(), article.payload.len());
+    }
+}
 
 async fn connect(server: &TestNntpServer) -> NntpClient<NativeTlsTransport> {
     let config = NntpConfig {

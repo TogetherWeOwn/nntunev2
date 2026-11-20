@@ -147,6 +147,10 @@ const _: () = assert!(PROBE_DELIVERY_BUDGET_MS * 10 < 15 * 60 * 1_000);
 /// per file and resumes on redelivery past this.
 const VERIFY_WALL_CLOCK_BUDGET_MS: u64 = 20_000;
 
+fn verify_budget_elapsed(started_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(started_ms) > VERIFY_WALL_CLOCK_BUDGET_MS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Settlement {
     Ack,
@@ -790,9 +794,7 @@ async fn run_verifying(
     let scratch = R2Scratch { bucket };
     let mut source = PoolBodySource { env, msg };
     let started_ms = worker::Date::now().as_millis();
-    let deadline = move || {
-        worker::Date::now().as_millis().saturating_sub(started_ms) > VERIFY_WALL_CLOCK_BUDGET_MS
-    };
+    let deadline = move || verify_budget_elapsed(started_ms, worker::Date::now().as_millis());
     let staged_before = progress.staged.len();
     let spooled_before: usize = progress.spool.values().map(Vec::len).sum();
     let judged_before: u64 = progress.judging.values().map(|c| c.pos).sum();
@@ -2141,6 +2143,16 @@ pub async fn ingest_queue(
 mod tests {
     use super::*;
     use crate::dispatch::{build_search_dispatch, build_upload_dispatch};
+
+    #[test]
+    fn verify_budget_preserves_boundary_and_clock_rollback_behavior() {
+        assert!(!verify_budget_elapsed(1_000, 1_000));
+        assert!(!verify_budget_elapsed(1_000, 21_000));
+        assert!(verify_budget_elapsed(1_000, 21_001));
+        assert!(!verify_budget_elapsed(1_000, 999));
+        assert!(verify_budget_elapsed(0, u64::MAX));
+        assert!(!verify_budget_elapsed(u64::MAX, 0));
+    }
 
     fn search_message() -> QueueMsg {
         build_search_dispatch("user_01", "dark side", "vault_idx_01", &[3000], 25, 0).unwrap()

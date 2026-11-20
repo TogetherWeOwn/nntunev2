@@ -1,0 +1,76 @@
+name: gate-incidents
+
+# Observe conclusions, never change a deployment or qualification gate. Read
+# completed runs through the API; never execute their source or download artifacts.
+on:
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Recent reporting or a read-only plan for one completed run
+        type: choice
+        options:
+          - recent
+          - run-id-dry-run
+        default: recent
+      run_id:
+        description: Required only for run-id-dry-run (positive decimal, at most 20 digits)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+# One issue writer; queue completions instead of dropping pending reports.
+concurrency:
+  group: gate-incident-writer
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  report:
+    name: Report completed gate incidents
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read # Read trusted run and job conclusions, never logs or artifacts.
+      issues: write # Open, update and recover keyed incidents only.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Open, update or recover gate incidents
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INCIDENT_EVENT: ${{ github.event_name }}
+          INCIDENT_MODE: ${{ inputs.mode }}
+          INCIDENT_RUN_ID: ${{ inputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$INCIDENT_EVENT:${INCIDENT_MODE:-recent}" in
+            schedule:recent|workflow_dispatch:recent)
+              if [[ -n "$INCIDENT_RUN_ID" ]]; then
+                printf '%s\n' 'Recent mode does not accept a run ID' >&2
+                exit 1
+              fi
+              exec python3 -I ci/incident_report.py --recent
+              ;;
+            workflow_dispatch:run-id-dry-run)
+              if [[ ! "$INCIDENT_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]; then
+                printf '%s\n' 'Dry-run mode requires a positive decimal run ID (at most 20 digits)' >&2
+                exit 1
+              fi
+              # No dispatch-controlled write mode. Keep the complete action/refusal
+              # output in the Actions log, including unrelated pending deliveries.
+              exec python3 -I ci/incident_report.py --run-id "$INCIDENT_RUN_ID" --dry-run
+              ;;
+            *)
+              printf '%s\n' 'Unsupported incident reporting event or mode' >&2
+              exit 1
+              ;;
+          esac

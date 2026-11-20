@@ -422,13 +422,20 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
-    async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), handlers::StoreError> {
+    async fn revoke_sessions_and_native_credentials(
+        &self,
+        user_id: &str,
+        _now: u64,
+    ) -> Result<u64, handlers::StoreError> {
+        if user_id.is_empty() {
+            return Ok(0);
+        }
         for row in self.sessions.borrow_mut().values_mut() {
             if row.user_id == user_id {
                 row.revoked = true;
             }
         }
-        Ok(())
+        Ok(0)
     }
 
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {
@@ -1077,7 +1084,10 @@ fn invite_budget_denies_eleventh_attempt_with_generic_error() {
     assert_eq!(response.status, 200, "{}", response.body);
     let start: serde_json::Value =
         serde_json::from_str(&response.body).expect("start shape is JSON");
-    let user_id = start["user_id"].as_str().expect("user id").to_string();
+    let user_id = block_on(harness.store.user_by_email("throttled@example.com"))
+        .expect("lookup works")
+        .expect("register/start stored the account")
+        .id;
     let attempt_key = format!("{SOURCE_IP}:{user_id}");
     let attempt_key = format!("invite:{attempt_key}");
     for _ in 0..u64::from(auth::INVITE_REDEMPTION_MAX_ATTEMPTS) {
@@ -1162,9 +1172,10 @@ fn register_finish_rejects_login_purpose_challenge() {
         serde_json::json!({"email": "victim@example.com"}),
     );
     assert_eq!(register_start.status, 200, "{}", register_start.body);
-    let register: serde_json::Value =
-        serde_json::from_str(&register_start.body).expect("start shape is JSON");
-    let user_id = register["user_id"].as_str().expect("user id").to_string();
+    let user_id = block_on(harness.store.user_by_email("victim@example.com"))
+        .expect("lookup works")
+        .expect("register/start stored the account")
+        .id;
     let magic = harness
         .mailer
         .sent
@@ -1269,7 +1280,10 @@ fn register_finish_without_inbox_proof_enrolls_nothing() {
     let start: serde_json::Value =
         serde_json::from_str(&response.body).expect("start shape is JSON");
     let challenge = start["challenge"].as_str().expect("challenge").to_string();
-    let user_id = start["user_id"].as_str().expect("user id").to_string();
+    let user_id = block_on(harness.store.user_by_email("fresh@example.com"))
+        .expect("lookup works")
+        .expect("register/start stored the account")
+        .id;
 
     let key = test_signing_key(23);
     let cred_id = b"fresh-cred".to_vec();
@@ -1839,7 +1853,10 @@ fn registration_requires_user_verification_and_keeps_failed_challenge_retryable(
     assert_eq!(start.status, 200, "{}", start.body);
     let start: serde_json::Value = serde_json::from_str(&start.body).expect("JSON start");
     let challenge = start["challenge"].as_str().expect("challenge").to_string();
-    let user_id = start["user_id"].as_str().expect("user id").to_string();
+    let user_id = block_on(harness.store.user_by_email(email))
+        .expect("lookup works")
+        .expect("register/start stored the account")
+        .id;
     let magic_token = harness
         .mailer
         .sent

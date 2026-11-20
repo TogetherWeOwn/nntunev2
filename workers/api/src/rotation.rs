@@ -1,8 +1,7 @@
 //! Bounded/resumable KEK re-wrap job (`docs/security/kek-rotation.md` §6).
 //!
 //! This is the executable runner core for routine rotation phase 3: it
-//! re-wraps every `provider_vaults` row below a target KEK version to that
-//! version — DEK only, payload and nonces preserved — through the §6
+//! re-wraps the DEK only — payload and nonces preserved — through the §6
 //! claim/CAS contract. What runs today, over any [`RewrapStore`]:
 //!
 //! - cursor-based batch claims (`kek_version < to`, `user_id > cursor`,
@@ -24,7 +23,7 @@
 //! and the Hyperdrive [`RewrapStore`] implementation. [`ROTATION_RUNS_DDL`]
 //! is fixture-validated (it executes verbatim on the sqlite stand-in, which
 //! is why it sticks to the Postgres/sqlite overlap); the production DDL
-//! and store wiring land with the trigger card, which orchestrates
+//! and store wiring never landed. A driver would orchestrate
 //! `load_open_run` → `open_run` → [`run_rewrap_pass`] → `close_run`.
 //!
 //! Redaction: claims and envelopes carry wrap ciphertext, so their `Debug`
@@ -46,26 +45,6 @@ pub const MAX_BATCH_LIMIT: u32 = 100;
 /// envelope; only persistent contention (every attempt loses) defers.
 pub const MAX_ROW_ATTEMPTS: u32 = 3;
 
-/// The normative §6 claim SELECT: rows below the target version after the
-/// cursor, in `user_id` order, with a bound batch size (`LIMIT $3`).
-/// Byte-identical to the runbook text; drift fails the job tests.
-pub const CLAIM_BATCH_SQL: &str = "SELECT user_id, kek_version, dek_wrapped, dek_wrapped_nonce
-  FROM provider_vaults
- WHERE kek_version < $1 AND user_id > $2
- ORDER BY user_id LIMIT $3;";
-
-/// The normative §6 conditional UPDATE: a compare-and-swap on the captured
-/// envelope (user + captured version + captured wrapped DEK and nonce), so
-/// a same-version vault PUT between claim and write loses the claim instead
-/// of being overwritten. Byte-identical to the runbook text.
-pub const CAS_REWRAP_SQL: &str = "UPDATE provider_vaults
-      SET kek_version = $new, dek_wrapped = $w,
-          dek_wrapped_nonce = $n, updated_at = $now,
-          rewrapped_at = $now
-    WHERE user_id = $u AND kek_version = $old
-      AND dek_wrapped = $captured_wrapped
-      AND dek_wrapped_nonce = $captured_wrapped_nonce;";
-
 /// Designed `rotation_runs` progress record (runbook §6: id, env,
 /// from/to versions, cursor, counts, started/finished), reconciled with two
 /// drill counts the design implies but does not name — `rows_deferred`
@@ -77,8 +56,7 @@ pub const CAS_REWRAP_SQL: &str = "UPDATE provider_vaults
 /// [`JobError::PassAlreadyRunning`].
 ///
 /// Fixture-validated only: this DDL executes verbatim on the sqlite
-/// stand-in. There is deliberately no production migration for it yet (see
-/// the module docs); the trigger card carries the production DDL.
+/// stand-in. There is no production migration for it.
 pub const ROTATION_RUNS_DDL: &str = "CREATE TABLE IF NOT EXISTS rotation_runs (
   id             TEXT PRIMARY KEY,
   env            TEXT NOT NULL,
@@ -335,8 +313,7 @@ impl KekSource for Config {
 }
 
 /// Persistence the pass needs: wrap-only vault claims + the CAS write, and
-/// the `rotation_runs` ledger. Claim/CAS SQL is [`CLAIM_BATCH_SQL`] /
-/// [`CAS_REWRAP_SQL`]; ledger statements follow [`ROTATION_RUNS_DDL`].
+/// the progress ledger. The store owns schema-specific SQL.
 /// Parameterized statements only, like every other store in this crate.
 pub trait RewrapStore {
     /// Claim up to `limit` rows below `to_version` after `after_user_id`
