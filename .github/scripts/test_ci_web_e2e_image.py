@@ -9,7 +9,7 @@ import re
 import unittest
 
 from test_ci_playwright_image import ROOT, WORKFLOW, run_body
-from test_ci_pnpm_retry import split_jobs, split_steps, step_field
+from test_ci_pnpm_retry import job_level_field, split_jobs, split_steps, step_field
 
 VERIFY_NAME = "Verify preinstalled web Playwright chromium"
 
@@ -72,7 +72,7 @@ class TestWebPlaywrightImage(unittest.TestCase):
 
     def test_shards_run_independently_with_distinct_reports(self):
         self.assertIn("    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2]\n", self.job)
-        self.assertIsNone(step_field(self.job, "continue-on-error"))
+        self.assertIsNone(job_level_field(self.job, "continue-on-error"))
         steps = {step_field(s, "name"): s for s in split_steps(self.job)}
         self.assertEqual(step_field(steps["Verify web Playwright shard coverage"], "if"), "matrix.shard == 1")
         for step, prefix in (("Upload Playwright report", "web-e2e-html-report"),
