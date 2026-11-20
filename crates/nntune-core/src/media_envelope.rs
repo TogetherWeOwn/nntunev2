@@ -170,6 +170,17 @@ pub fn verify_enrolled_scheme2(
     record: &[u8],
     manifest: &OriginManifest,
 ) -> Result<(), EnrolledEnvelopeError> {
+    enrolled_scheme2_key(root, expected, trusted_record, record, manifest).map(drop)
+}
+
+/// Internal readback handoff. Use the checked key for this manifest only.
+pub(crate) fn enrolled_scheme2_key(
+    root: &[u8; 32],
+    expected: &EnvelopeContext,
+    trusted_record: &[u8; 230],
+    record: &[u8],
+    manifest: &OriginManifest,
+) -> Result<FileKey, EnrolledEnvelopeError> {
     let [_, environment, library, object, generation, provider] = expected.identities;
     let identities = [environment, library, object, generation, provider];
     let geometry = manifest.geometry();
@@ -187,7 +198,7 @@ pub fn verify_enrolled_scheme2(
     let header = Header::from_bytes(manifest.header_bytes());
     VerifiedHeader::verify(&Profile::nntune(), KeyMode::Random, &key, &header)
         .map_err(|_| EnrolledEnvelopeError::Header)?;
-    Ok(())
+    Ok(key)
 }
 
 #[cfg(test)]

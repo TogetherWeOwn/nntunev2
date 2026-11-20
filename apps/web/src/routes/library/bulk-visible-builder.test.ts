@@ -6,7 +6,7 @@ import { filterLibraryItems } from '#lib/library/filter.js';
 import { groupLibraryItems } from '#lib/library/group.js';
 import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { createPlayerController } from '#lib/player/controller.js';
+import { createPlayerController } from '#lib/player/controller.svelte.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 
 // Builder-owned integration regression: the merged favorites/query projections
@@ -25,14 +25,14 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks', 'replaceQueue', 'commitQueue',
-		'addDisplayedTracksToQueue', 'clearShareFeedback', 'resetRestartOnSourceChange', 'syncMiniPlayerHint'
+		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks',
+		'addDisplayedTracksToQueue', 'clearShareFeedback', 'syncMiniPlayerHint'
 	]);
 	const functions = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) => handlers.has(node.name?.text ?? ''));
 	expect(new Set(functions.map((node) => node.name?.text))).toEqual(handlers);
 	// Queue replacement clears real share state when the current source changes.
 	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'player', 'queueController', 'media', 'mediaRevision']);
+	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'player', 'replaceQueue', 'queueController']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));
@@ -61,7 +61,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	return new Function(...Object.keys(bindings), `
 		${compiled}
 		const { next, sources: evidence } = queueController.prepareLibrary([...items, ...queue.tracks]);
-		queueController.publish(next, queueController.begin(next, 'replace', true), evidence);
+		player.commitQueue(next, 'replace', { sources: evidence, isCurrent: () => true });
 		queueController.subscribe((value) => { queue = value; });
 		return {
 			disabled: bulkDisabled, allQueued: bulkAllQueued,

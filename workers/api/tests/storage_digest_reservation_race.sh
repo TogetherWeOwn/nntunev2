@@ -111,3 +111,59 @@ exec 3>&-
 wait "$holder"
 wait "$contender"
 [[ "$(<"$dir/contender")" == $'1\nt' ]] || { printf 'rollback contender did not win an unexpired lease\n' >&2; exit 1; }
+
+psql_run -f "$(dirname -- "${BASH_SOURCE[0]}")/fixtures/storage_digest_reference.sql"
+# First test reference-key waits with expired and valid authorization, then both winner lock orders.
+for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false COMMIT f false' '10 true COMMIT f true' '11 false ROLLBACK t true' '12 true ROLLBACK t false'; do
+  read -r id deleting finish expected tombstone other <<<"$scenario"
+  mkfifo "$dir/ref-$scenario"; exec 3<>"$dir/ref-$scenario"
+  PGAPPNAME=digest_ref_holder psql_run -At <"$dir/ref-$scenario" >"$dir/ref-holder" & holder=$!
+  printf "BEGIN; SELECT public.digest_ref_fixture(%s,%s);\n\\! touch '%s/ready-%s'\n" "$id" "$deleting" "$dir" "$scenario" >&3
+  for _ in {1..100}; do [[ -e "$dir/ready-$scenario" ]] && break; sleep 0.1; done
+  [[ -e "$dir/ready-$scenario" ]] || exit 1
+  object="$(printf '21000000-0000-4000-8000-%012d' "$id")"
+  deadline=infinity; query="SELECT public.digest_ref_fixture($id, NOT $deleting)"
+  if [[ -n "$other" ]]; then
+    duration='1 minute'; [[ "$expected" != f ]] || duration='8 seconds'
+    deadline="$(psql_run -Atc "SELECT clock_timestamp() + interval '$duration'")"
+    query="SELECT public.digest_ref_fixture($other, false, '', '$object', '$deadline')"
+  fi
+  PGAPPNAME=digest_ref_contender psql_run -Atc "$query" >"$dir/ref-contender" & contender=$!
+  blocked=0
+  for _ in {1..100}; do
+    if [[ "$(psql_run -Atc "SELECT count(*) FROM pg_stat_activity c JOIN pg_stat_activity h ON h.pid=ANY(pg_blocking_pids(c.pid)) WHERE c.application_name='digest_ref_contender' AND h.application_name='digest_ref_holder' AND c.wait_event='transactionid' AND clock_timestamp() < '$deadline'")" == 1 ]]; then blocked=1; break; fi
+    sleep 0.1
+  done
+  [[ "$blocked" == 1 ]] || { printf 'reference contender did not block before deadline: %s\n' "$scenario" >&2; exit 1; }
+  if [[ -n "$other" && "$expected" == f ]]; then psql_run -c "SELECT pg_sleep_until('$deadline')" >/dev/null; fi
+  printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
+  wait "$holder"; wait "$contender"
+  [[ "$(<"$dir/ref-holder")" == t && "$(<"$dir/ref-contender")" == "$expected" ]] || { printf 'unexpected reference race result: %s\n' "$scenario" >&2; exit 1; }
+  if [[ -n "$other" ]]; then
+    target=none
+    if [[ "$expected" == t ]]; then target="$(printf '21000000-0000-4000-8000-%012d' "$other")"; fi
+    [[ "$(psql_run -Atc "SELECT coalesce(string_agg(object_id::text, ','), 'none') FROM public.storage_validated_digest_references WHERE reference_id='$object'")" == "$target" ]] || exit 1
+    # Remove the verified synthetic reference so the winner-lock cases can reuse the objects.
+    psql_run -c "DELETE FROM public.storage_validated_digest_references WHERE reference_id='$object'"
+    printf 'reference-key lock case passed: holder rolled back; contender=%s committed reference target=%s\n' "$expected" "$target"
+  else
+    [[ "$(psql_run -Atc "SELECT (deleting_at IS NOT NULL) = $tombstone AND EXISTS (SELECT FROM public.storage_validated_digest_references WHERE object_id=w.object_id) <> $tombstone FROM public.storage_validated_digest_winners w WHERE object_id='$object'")" == t ]] || exit 1
+    printf 'reference/delete lock case passed: delete-first=%s holder=%s contender=%s\n' "$deleting" "$finish" "$expected"
+  fi
+done
+psql_run <<'SQL'
+DO $$ DECLARE attempt record; original jsonb; BEGIN
+    FOR attempt IN SELECT * FROM (VALUES ('01','quarantined=false'), ('10','deleting_at=NULL'), ('10','deleting_at=''infinity''')) AS changes(suffix, assignment) LOOP
+        SELECT to_jsonb(w) INTO STRICT original FROM public.storage_validated_digest_winners w WHERE right(object_id::text,2)=attempt.suffix;
+        BEGIN
+            EXECUTE format('UPDATE public.storage_validated_digest_winners SET %s WHERE right(object_id::text,2)=%L', attempt.assignment, attempt.suffix);
+            RAISE EXCEPTION 'retirement mutation accepted: %', attempt.assignment;
+        EXCEPTION WHEN check_violation THEN NULL; END;
+        IF (SELECT to_jsonb(w) FROM public.storage_validated_digest_winners w WHERE right(object_id::text,2)=attempt.suffix) IS DISTINCT FROM original THEN
+            RAISE EXCEPTION 'rejected retirement mutation changed state: %', attempt.assignment;
+        END IF;
+        RAISE NOTICE 'committed retirement preserved: %', attempt.assignment;
+    END LOOP;
+END $$;
+DROP FUNCTION public.digest_ref_fixture(int, bool, text, uuid, timestamptz);
+SQL
