@@ -78,14 +78,17 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		return (currentTarget: unknown = target) => listener({ type, currentTarget } as Event);
 	};
 	let onClear = () => {};
+	let onClearFeedback = () => {};
 	const bindings = {
 		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump,
 		clearMiniPlayerHint, setMiniPlayerHint, restartIsAvailable,
 		createPlayerController: (_: ReturnType<typeof createQueue>, end: Parameters<typeof createPlayerController>[1]) => {
-			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), end, (audio, source) =>
-				audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
+			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), {
+				...end,
+				clearShareFeedback: () => { onClearFeedback(); end.clearShareFeedback(); }
+			}, (audio, source) => audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
 			const clear = player.media.clearShareSeek;
 			player.media.clearShareSeek = () => { onClear(); clear(); };
 			return player;
@@ -176,7 +179,11 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		page.attach(next);
 		return element = next;
 	};
-	return { page, media, writes, location, track, element, capture, remount, observeClear: (callback: () => void) => { onClear = callback; } };
+	return {
+		page, media, writes, location, track, element, capture, remount,
+		observeClear: (callback: () => void) => { onClear = callback; },
+		observeClearFeedback: (callback: () => void) => { onClearFeedback = callback; }
+	};
 }
 
 test('restart reads mutable availability once per gesture', () => {
@@ -1306,7 +1313,7 @@ const pine = { id: 'pine', title: 'Pine Morning', artist: '', streamUrl: '/test-
 
 test.each(['none', 'callback reset', 'callback source change', 'publication reset'] as const)('native ended uses the queue transaction with boundary %s', async (boundary) => {
 	const flush = vi.fn(async () => {});
-	const { page, element, remount, observeClear, writes } = restartFixture(flush);
+	const { page, element, remount, observeClear, observeClearFeedback, writes } = restartFixture(flush);
 	element.play = vi.fn(async () => {});
 	page.replaceQueue(addTrack(page.read().queue, pine));
 	const before = page.read();
@@ -1322,7 +1329,7 @@ test.each(['none', 'callback reset', 'callback source change', 'publication rese
 	if (boundary === 'callback reset') {
 		observeClear(() => { observeClear(() => {}); page.resetAuth(); });
 	} else if (boundary === 'callback source change') {
-		observeClear(() => { element.sourceAttribute = '/test-audio/other'; });
+		observeClearFeedback(() => { element.sourceAttribute = '/test-audio/other'; });
 	}
 
 	element.paused = false;
