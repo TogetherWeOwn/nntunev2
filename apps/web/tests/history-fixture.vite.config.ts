@@ -17,9 +17,12 @@ function splice(code: string, anchor: string, replacement: string): string {
 const fixtureTransport = `<script lang="ts">
 	import { createPageListenHistory } from '#lib/player/pageListenHistory.js';
 	const listenHistory = createPageListenHistory();
-	function fixtureGrantId() {
+	const fixtureGrants = new WeakMap<HTMLAudioElement, string>();
+	function issueFixtureGrant(audio: HTMLAudioElement) {
 		const bytes = crypto.getRandomValues(new Uint8Array(16));
-		return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+		const id = btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+		fixtureGrants.set(audio, id);
+		return () => (window as { __nntuneFixtureGrant?: string }).__nntuneFixtureGrant ?? fixtureGrants.get(audio);
 	}`;
 const anchor = '\t\trefreshRecent();\n\t\ttry {\n\t\t\tqueue = restoreQueue';
 const injection = `
@@ -78,7 +81,7 @@ export default defineConfig(async (env) => {
 					code = splice(code, '\t\treturn media.attach(audio, {', '\t\tconst detach = media.attach(audio, {');
 					const endAttach = '\t\t});\n\t}\n\n\tfunction announceEnd';
 					code = splice(code, endAttach, `		});
-		const stop = listenHistory.attach(audio, queueCurrentTrack(queueController.snapshot)?.id, fixtureGrantId);
+		const stop = listenHistory.attach(audio, queueCurrentTrack(queueController.snapshot)?.id, issueFixtureGrant(audio));
 		return () => { stop(); detach(); };
 	}
 
@@ -86,10 +89,10 @@ export default defineConfig(async (env) => {
 					return splice(code, '\t\t\tmedia.destroy();', '\t\t\tstopHistory();\n\t\t\tmedia.destroy();');
 				}
 				const observe = '\t\tconst stopObserving = playback.observe(node);';
-				code = splice(code, observe, `${observe}\n\t\tconst stop = listenHistory.attach(node, trackId, fixtureGrantId);`);
+				code = splice(code, observe, `${observe}\n\t\tconst stop = listenHistory.attach(node, trackId, issueFixtureGrant(node));`);
 				code = splice(code, '\t\t\t\tstopObserving();', '\t\t\t\tstop();\n\t\t\t\tstopObserving();');
 				const finalNext = '\t\t\t// End of the queue: really stop, so status and playback agree.';
-				code = splice(code, finalNext, `${finalNext}\n\t\t\tlistenHistory.finish(audioEl);`);
+				code = splice(code, finalNext, `${finalNext}\n\t\t\tlistenHistory.finish(audioEl);\n\t\t\tif (audioEl) issueFixtureGrant(audioEl);`);
 				const cleanup = '\t\t\t// A copy settling after teardown must not resurrect state.';
 				return splice(splice(code, anchor, `\t\trefreshRecent();\n${injection}\t\ttry {\n\t\t\tqueue = restoreQueue`),
 					cleanup, `\t\t\tstopHistory();\n${teardown}${cleanup}`);

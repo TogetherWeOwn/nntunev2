@@ -154,6 +154,29 @@ describe('createListenEventSender', () => {
 		expect(fetchFn).toHaveBeenCalledTimes(1);
 	});
 
+	it('drains a queued terminal once after a held start is accepted on close', async () => {
+		vi.useFakeTimers();
+		let release = () => {};
+		const gate = new Promise<void>((r) => (release = r));
+		const events: string[] = [];
+		const fetchFn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+			events.push(JSON.parse(String(init?.body)).event);
+			if (events.length > 1) return new Response('', { status: 503 });
+			await gate;
+			return ok();
+		});
+		const sender = createListenEventSender({ context, baseUrl: '', fetchFn, retryDelaysMs: [1] });
+		sender.send(ev('start'));
+		sender.send(ev('skip'));
+		await vi.advanceTimersByTimeAsync(0);
+		const closing = sender.close();
+		expect(events).toEqual(['start']);
+		release();
+		await vi.advanceTimersByTimeAsync(10);
+		await closing;
+		expect(events).toEqual(['start', 'skip']);
+	});
+
 	it('rejects control characters in track ids', () => {
 		for (const id of ['a\nb', 'a\u0000', '\u007f', 'x\u0085y', '']) {
 			expect(isValidTrackId(id)).toBe(false);
@@ -168,22 +191,23 @@ describe('createListenEventSender', () => {
 			.mockResolvedValueOnce(new Response('', { status: 429, headers: { 'retry-after': '120' } }))
 			.mockResolvedValue(ok());
 		createListenEventSender({ context, baseUrl: '', fetchFn, retryDelaysMs: [1] }).send(ev('start'));
-		await vi.advanceTimersByTimeAsync(30_000);
+		await vi.advanceTimersByTimeAsync(59_999);
 		expect(fetchFn).toHaveBeenCalledTimes(1);
-		await vi.advanceTimersByTimeAsync(31_000);
+		await vi.advanceTimersByTimeAsync(1);
 		expect(fetchFn).toHaveBeenCalledTimes(2);
 	});
 
-	it('does not send a terminal when the start was rejected (422) or dropped', async () => {
-		const fetchFn = vi.fn(async () => new Response('', { status: 422 }));
+	it.each([409, 422])('does not retry a rejected start (%i) or send its terminal', async (status) => {
+		vi.useFakeTimers();
+		const fetchFn = vi.fn(async () => new Response('', { status }));
 		const sender = createListenEventSender({ context, baseUrl: '', fetchFn, retryDelaysMs: [1] });
 		sender.send(ev('start'));
 		sender.send(ev('complete'));
-		await new Promise((r) => setTimeout(r, 30));
+		await vi.advanceTimersByTimeAsync(30);
 		expect(fetchFn).toHaveBeenCalledTimes(1);
 		// A terminal with no known start is never sent.
 		sender.send({ ...ev('skip'), playback_id: '22222222-2222-4222-8222-222222222222' });
-		await new Promise((r) => setTimeout(r, 10));
+		await vi.advanceTimersByTimeAsync(10);
 		expect(fetchFn).toHaveBeenCalledTimes(1);
 	});
 

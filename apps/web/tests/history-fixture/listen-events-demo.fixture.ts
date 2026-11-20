@@ -5,9 +5,13 @@ const context = 'a'.repeat(43);
 type Body = { playback_id: string; track_id: string; event: string; context: string };
 
 async function mountDemo(page: Page, { refuseThirdTrack = false, realDelivery = false } = {}) {
+	let contextLoads = 0;
 	const bodies: Body[] = [];
 	await watchListenContext(page);
-	await page.route(contextPath, (route) => route.fulfill({ json: { context } }));
+	// A second read would hand out a different scope, so reopening it cannot go unnoticed.
+	await page.route(contextPath, (route) =>
+		route.fulfill({ json: { context: ++contextLoads === 1 ? context : 'c'.repeat(43) } })
+	);
 	if (!realDelivery) await page.route(eventsPath, (route) => {
 		const body = route.request().postDataJSON() as Body;
 		bodies.push(body);
@@ -25,7 +29,7 @@ async function mountDemo(page: Page, { refuseThirdTrack = false, realDelivery = 
 	});
 	await page.goto('/demo/player');
 	await expect(page.locator('html')).toHaveAttribute('data-history-context-read', 'true');
-	return bodies;
+	return { bodies, contextLoads: () => contextLoads };
 }
 
 function startResponse(page: Page) {
@@ -34,7 +38,7 @@ function startResponse(page: Page) {
 }
 
 test('demo records actual playback and keeps playing when history is refused', async ({ page }) => {
-	const bodies = await mountDemo(page, { refuseThirdTrack: true });
+	const { bodies } = await mountDemo(page, { refuseThirdTrack: true });
 	await page.getByTestId('queue-select-demo-track').click();
 	await expect.poll(() => bodies[0]).toEqual({
 		playback_id: expect.stringMatching(/^[0-9a-f-]{36}$/), track_id: 'demo-track', event: 'start', context
@@ -62,7 +66,11 @@ test('reloading the document finishes the started listen', async ({ page, reques
 });
 
 test('a restored page starts a fresh listen without reopening the auth scope', async ({ page }) => {
-	const bodies = await mountDemo(page);
+	const { bodies, contextLoads } = await mountDemo(page);
+	const pin = (id: string) => page.evaluate((id) => {
+		(window as { __nntuneFixtureGrant?: string }).__nntuneFixtureGrant = id;
+	}, id);
+	await pin('A'.repeat(22));
 	const started = startResponse(page);
 	await page.getByTestId('queue-select-demo-track').click();
 	await started;
@@ -73,11 +81,16 @@ test('a restored page starts a fresh listen without reopening the auth scope', a
 	await expect.poll(() => bodies).toEqual([bodies[0], { ...bodies[0], event: 'skip' }]);
 	await playing(); // Ignore queued media events while the page is hidden.
 	await persistedEvent('pageshow');
+	await playing(); // The same grant resumes the finished listen, so no new start.
+	await pin('A'.repeat(21) + 'Q'); // An explicit new grant restarts with the original context.
 	const restored = startResponse(page);
 	await playing();
 	await restored;
-	expect(bodies[2]).toEqual({ ...bodies[0], playback_id: expect.any(String) });
-	expect(bodies[2].playback_id).not.toBe(bodies[0].playback_id);
+	expect(contextLoads()).toBe(1);
+	expect(bodies).toEqual([
+		bodies[0], { ...bodies[0], event: 'skip' },
+		{ ...bodies[0], playback_id: '00000000-0000-0000-0000-000000000001' }
+	]);
 	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
 		key: 'nntune.library.auth-transition.v1'
 	})));
@@ -89,7 +102,7 @@ test('a restored page starts a fresh listen without reopening the auth scope', a
 });
 
 test('pause keeps the listen but Next at the queue end abandons it', async ({ page }) => {
-	const bodies = await mountDemo(page);
+	const { bodies } = await mountDemo(page);
 	const started = startResponse(page);
 	await page.getByTestId('queue-select-third-light').click();
 	await started;

@@ -97,6 +97,8 @@ for the operation/scope pairs declared here: `/v1/library`, `/v1/artists`,
 `/v1/releases`, `/v1/tracks`, `/v1/search`, and read operations on
 `/v1/playlists` require `library:read`; playlist create/edit/delete require
 `playlists:write`; play-event writes on `/v1/plays/events` require `plays:write`;
+`POST /v1/plays` checks `plays:write` before dispatch for presented bearers,
+then requires cookie authentication and exact Origin for issuance (see below);
 playback on `/v1/stream` requires `stream:read`; ingest submission requires
 `ingest:submit`. Every other operation, including an unlisted method on a
 listed route, is denied to bearer keys and must use session auth. In

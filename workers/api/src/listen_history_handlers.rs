@@ -72,7 +72,7 @@ where
     let owner = match (bearer, claims.as_ref()) {
         (None, Some(claims))
             if session::verify_listen_context(
-                &ctx.cfg.session_secret,
+                &ctx.cfg.session_keys(),
                 claims,
                 body.context.as_deref(),
             ) =>
@@ -103,7 +103,19 @@ where
     match ctx.store.record_listen_event(owner, &event, ctx.now).await {
         Ok(WriteOutcome::Written) => json_response(200, serde_json::json!({"ok": true})),
         Ok(WriteOutcome::AccountDeleting) => account_deleting_response(),
-        Ok(WriteOutcome::Conflict) => validation_failed("history event conflicts with playback"),
+        Ok(WriteOutcome::Conflict) => {
+            let error = crate::api_error::ApiError::by_code(
+                "conflict",
+                "history event conflicts with playback",
+            );
+            Response {
+                status: error.status,
+                body: error.body_json(),
+                set_cookie: None,
+                retry_after: None,
+                extra_headers: Vec::new(),
+            }
+        }
         Err(_) => internal(),
     }
 }
