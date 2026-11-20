@@ -181,7 +181,8 @@ async fn clear_and_terminal_write_share_owner_fence() {
     let before = export(&clearer, &owner, None).await.unwrap();
     assert_eq!(write(&mut writer, &other, event(2, Start)).await, Written);
     assert_eq!(export(&clearer, &owner, None).await.unwrap(), before);
-    let other_cursor = export(&clearer, &other, None).await.unwrap()[0].cursor();
+    let other_rows = export(&clearer, &other, None).await.unwrap();
+    let other_cursor = other_rows[0].cursor();
     let cursor = ExportCursor::parse(Some(&other_cursor)).unwrap();
     let foreign_page = export(&clearer, &owner, cursor.as_ref()).await.unwrap();
     assert!(foreign_page.is_empty());
@@ -212,16 +213,42 @@ async fn clear_and_terminal_write_share_owner_fence() {
     let (mut writer, result) = terminal.await.unwrap();
     assert_eq!(result, Conflict);
     assert!(export(&clearer, &owner, None).await.unwrap().is_empty());
+    assert_eq!(export(&clearer, &other, None).await.unwrap(), other_rows);
     seed_lease(&clearer, &owner, 3).await;
     for phase in [Start, Complete] {
-        assert_eq!(write(&mut writer, &owner, event(3, phase)).await, Written);
+        let body = event(3, phase);
+        assert_eq!(write(&mut writer, &owner, body.clone()).await, Written);
+        assert_eq!(
+            record(&mut writer, &owner, &body, 2000).await.unwrap(),
+            Written
+        );
+    }
+    let result = write(&mut writer, &owner, event(3, ListenEvent::Skip)).await;
+    assert_eq!(result, Conflict);
+    let rows = export(&clearer, &owner, None).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.event, row.recorded_at))
+            .collect::<Vec<_>>(),
+        [(Complete, 1000), (Start, 1000)]
+    );
+    let cursor = ExportCursor::parse(Some(&rows[0].cursor())).unwrap();
+    let after_completion = export(&clearer, &owner, cursor.as_ref()).await.unwrap();
+    assert_eq!(after_completion, rows[1..]);
+
+    for number in 4..=104 {
+        seed_lease(&clearer, &owner, number).await;
+        assert_eq!(
+            write(&mut writer, &owner, event(number, Start)).await,
+            Written
+        );
     }
     let rows = export(&clearer, &owner, None).await.unwrap();
-    let cursor = ExportCursor::parse(Some(&rows[0].cursor())).unwrap();
-    assert_eq!(
-        export(&clearer, &owner, cursor.as_ref()).await.unwrap(),
-        rows[1..]
-    );
+    assert_eq!(rows.len(), EXPORT_PAGE_SIZE + 1);
+    let cursor = ExportCursor::parse(Some(&rows[EXPORT_PAGE_SIZE - 1].cursor())).unwrap();
+    let rest = export(&clearer, &owner, cursor.as_ref()).await.unwrap();
+    assert_eq!(rest.len(), 3);
+    assert_eq!(rest[0], rows[EXPORT_PAGE_SIZE]);
 
     clearer
         .execute(
