@@ -344,6 +344,11 @@ async function failFavoritesStorage(page: Page, operation: 'getItem' | 'setItem'
 	).toBe('available');
 }
 
+async function settleFavorites(page: Page): Promise<void> {
+	const key = `${FAVORITES_KEY_BASE}.${await readAuthContext(page)}`;
+	await page.evaluate((key) => navigator.locks.request(key, () => {}), key);
+}
+
 async function restoreFavoritesStorage(page: Page): Promise<void> {
 	await page.evaluate(() => Reflect.get(window, '__restoreFavoritesStorage')());
 }
@@ -435,6 +440,7 @@ test.describe('favorites storage regressions', () => {
 			await expectFavoriteIds(page, ['fav-zulu', 'fav-alpha']);
 			await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'true');
 			await starButton(page, 'fav-zulu').click();
+			await settleFavorites(page);
 			await expectFavoriteIds(page, ['fav-alpha']);
 			await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'false');
 			await expect(starButton(page, 'fav-alpha')).toHaveAttribute('aria-pressed', 'true');
@@ -500,7 +506,7 @@ test.describe('favorites storage regressions', () => {
 		await seedLibrary(page);
 		await failFavoritesStorage(page, 'setItem');
 		await starButton(page, 'fav-zulu').click();
-		await expectFavoriteIds(page, ['fav-zulu']);
+		await settleFavorites(page);
 		await restoreFavoritesStorage(page);
 		// Recovery must not write the visit-only star along with the new edit.
 		await starButton(page, 'fav-alpha').click();

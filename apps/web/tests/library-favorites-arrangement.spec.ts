@@ -272,16 +272,73 @@ test('[FAVORDER-06] remove and re-star use the latest arranged membership withou
 	expect(await stored(page)).toEqual(['arr-m', 'arr-z', 'arr-a']);
 });
 
-test('same-scope edits reconcile a retired move and apply Star all to the whole selection', async ({ page }) => {
-	const initial = ['arr-z', 'arr-m'];
-	await open(page, initial);
+test('a retired move reconciles durable favorites without dropping a visit-only star', async ({ page }) => {
+	await open(page, ['arr-z', 'arr-m']);
+	await faultStorage(page, 'write');
+	await star(page, 'arr-a').click();
+	await page.evaluate((key) => navigator.locks.request(key, () => {}), KEY);
 	const peer = await page.context().newPage();
-	await open(peer, initial);
+	await open(peer, ['arr-z', 'arr-m']);
 	await star(peer, 'arr-m').click();
 	await expect.poll(() => stored(peer)).toEqual(['arr-z']);
 	await activate(page, 'Mike Song', 'up');
-	await expectIds(page, ['arr-z']);
+	await expectIds(page, ['arr-z', 'arr-a']);
 	await expect(page.getByTestId('favorites-announcement')).toBeEmpty();
+});
+
+async function holdFavorites(page: Page): Promise<() => Promise<void>> {
+	await page.evaluate((key) => new Promise<void>((ready) => {
+		void navigator.locks.request(key, () => new Promise<void>((release) => {
+			Reflect.set(window, 'releaseFavorites', release);
+			ready();
+		}));
+	}), KEY);
+	return () => page.evaluate(() => Reflect.get(window, 'releaseFavorites')());
+}
+
+for (const moveFocus of [false, true]) {
+	test(`a rebased move ${moveFocus ? 'does not steal focus' : 'restores focus at the durable boundary'}`, async ({ page }) => {
+		await open(page, ALL);
+		const release = await holdFavorites(page);
+		await page.evaluate((key) => localStorage.setItem(key, '["arr-a","arr-z","arr-m"]'), KEY);
+		const down = move(page, 'Zulu Song', 'down');
+		await down.press('Enter');
+		await expectIds(page, ['arr-a', 'arr-z', 'arr-m']);
+		await expect(down).toBeFocused();
+		const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+		if (moveFocus) await refresh.focus();
+		await release();
+		await expectIds(page, ['arr-a', 'arr-m', 'arr-z']);
+		await expect(moveFocus ? refresh : move(page, 'Zulu Song', 'up')).toBeFocused();
+	});
+}
+
+test('queue Star all keeps its direction when a pending edit reconciles', async ({ page }) => {
+	await open(page, ['arr-z']);
+	for (const id of ['arr-z', 'arr-m']) {
+		await page.locator(`[data-testid="library-item"][data-id="${id}"]`).click();
+	}
+	const rows = page.getByTestId('queue-item');
+	for (const checkbox of await rows.getByRole('checkbox').all()) await checkbox.check();
+	const release = await holdFavorites(page);
+	await star(page, 'arr-a').click();
+	await expect.poll(() => page.evaluate(async (key) => (await navigator.locks.query()).pending?.some((lock) => lock.name === key), KEY)).toBe(true);
+	await rows.first().getByTestId('queue-more').click();
+	const action = page.getByRole('menuitem', { name: 'Star all', exact: true });
+	await expect(action).toBeVisible();
+	await page.evaluate((key) => localStorage.setItem(key, '["arr-z","arr-m"]'), KEY);
+	await release();
+	await expect(star(page, 'arr-m')).toHaveAttribute('aria-pressed', 'true');
+	await action.click();
+	await page.evaluate((key) => navigator.locks.request(key, () => {}), KEY);
+	await expectIds(page, ['arr-z', 'arr-m', 'arr-a']);
+	expect(await stored(page)).toEqual(['arr-z', 'arr-m', 'arr-a']);
+});
+
+test('Library Star all sends the full selection when a peer removes a star', async ({ page }) => {
+	await open(page, ['arr-z']);
+	const peer = await page.context().newPage();
+	await open(peer, ['arr-z']);
 	await page.getByRole('button', { name: 'Select all', exact: true }).click();
 	await page.getByTestId('track-more').first().click();
 	await star(peer, 'arr-z').click();
