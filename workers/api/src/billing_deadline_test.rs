@@ -212,7 +212,7 @@ pub(crate) async fn test_restricted_history(replay: bool) -> Result<(), StoreErr
 
 pub(crate) async fn test_reconcile_raw_update() -> Result<(), &'static str> {
     use futures_util::future::{select, Either};
-    use std::{cell::Cell, rc::Rc, time::Duration};
+    use std::{cell::Cell, rc::Rc};
 
     setup_ack_fixture().await?;
     let store = PgStore {
@@ -251,21 +251,7 @@ pub(crate) async fn test_reconcile_raw_update() -> Result<(), &'static str> {
             let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, ReconcileProbe::None));
             // Do not release the writer until the exact table lock is observed waiting on it.
             phase.set("raw update: Worker table lock did not wait on the writer");
-            let wait_for_lock = Box::pin(async {
-                for _ in 0..40 {
-                    let blocked: bool = writer.query_one(
-                        "SELECT EXISTS (
-                             SELECT 1 FROM pg_catalog.pg_locks l
-                             WHERE l.relation = 'public.subscriptions'::regclass
-                               AND l.mode = 'ShareRowExclusiveLock' AND NOT l.granted
-                               AND pg_backend_pid() = ANY(pg_blocking_pids(l.pid)))", &[],
-                    ).await.map_err(|_| StoreError)?.get(0);
-                    if blocked { return Ok(()); }
-                    worker::Delay::from(Duration::from_millis(50)).await;
-                }
-                Err(StoreError)
-            });
-            match select(reconcile.as_mut(), wait_for_lock).await {
+            match select(reconcile.as_mut(), Box::pin(wait_for_raw_writer(writer))).await {
                 Either::Left(_) => return Err(StoreError),
                 Either::Right((observed, _)) => observed?,
             }
@@ -286,6 +272,119 @@ pub(crate) async fn test_reconcile_raw_update() -> Result<(), &'static str> {
             ).await.map_err(|_| StoreError)?;
             if row.get::<_, Option<String>>(0).as_deref() != Some(committed.as_str())
                 || row.get::<_, Option<bool>>(1) != Some(true)
+            {
+                return Err(StoreError);
+            }
+            Ok(())
+        }),
+        |_| {},
+    ).await.map_err(|_| diagnostic.get())
+}
+
+async fn wait_for_raw_writer(writer: &tokio_postgres::Client) -> Result<(), StoreError> {
+    for _ in 0..40 {
+        let blocked: bool = writer
+            .query_one(
+                "SELECT EXISTS (
+                 SELECT 1 FROM pg_catalog.pg_locks l
+                 WHERE l.relation = 'public.subscriptions'::regclass
+                   AND l.mode = 'ShareRowExclusiveLock' AND NOT l.granted
+                   AND pg_backend_pid() = ANY(pg_blocking_pids(l.pid)))",
+                &[],
+            )
+            .await
+            .map_err(|_| StoreError)?
+            .get(0);
+        if blocked {
+            return Ok(());
+        }
+        worker::Delay::from(std::time::Duration::from_millis(50)).await;
+    }
+    Err(StoreError)
+}
+
+pub(crate) async fn test_reconcile_raw_replace(commit: bool) -> Result<(), &'static str> {
+    use futures_util::future::{select, Either};
+    use std::{cell::Cell, rc::Rc};
+
+    setup_ack_fixture().await?;
+    let store = PgStore {
+        env: None,
+        trace_id: "worker-raw-replace-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        work_deadline_observer: None,
+        cancel_token_observer: None,
+    };
+    let user = "worker_fault_user";
+    store
+        .store_reconcile_owned(user.into(), test_outcome(), ReconcileProbe::None)
+        .await
+        .map_err(|_| "raw replacement: seed through dormant store failed")?;
+    let mut outcome = test_outcome();
+    outcome.explicit_stale = true;
+    outcome.history.truncate(1);
+    outcome.history[0].stripe_invoice_id = "in_worker_raw_replace".into();
+
+    let phase = Rc::new(Cell::new("raw replacement: seed second owner"));
+    let diagnostic = phase.clone();
+    billing_budget::with_owned_connection(
+        "127.0.0.1", 5432, CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |writer| Box::pin(async move {
+            writer.batch_execute(
+                "INSERT INTO public.users (id, email, created_at)
+                 VALUES ('worker_replacement_user', 'worker-replacement@example.test', 1786032000); BEGIN",
+            ).await.map_err(|_| StoreError)?;
+            let original: String = writer.query_one(
+                "SELECT to_jsonb(s)::text FROM public.subscriptions s", &[],
+            ).await.map_err(|_| StoreError)?.get(0);
+            let history_sql = "SELECT jsonb_agg(to_jsonb(h) ORDER BY stripe_invoice_id)::text
+                               FROM public.paid_invoice_history h
+                               WHERE stripe_invoice_id <> 'in_worker_raw_replace'";
+            let history: String = writer.query_one(history_sql, &[]).await.map_err(|_| StoreError)?.get(0);
+
+            phase.set("raw replacement: delete and reinsert the global key");
+            if writer.execute(
+                "DELETE FROM public.subscriptions
+                 WHERE user_id = 'worker_fault_user' AND stripe_subscription_id = 'sub_worker_fault'", &[],
+            ).await.map_err(|_| StoreError)? != 1 {
+                return Err(StoreError);
+            }
+            let replacement: String = writer.query_one(
+                "INSERT INTO public.subscriptions AS s
+                    (user_id, stripe_subscription_id, stripe_customer_id,
+                     stripe_subscription_item_id, stripe_price_id, plan_id, status)
+                 VALUES ('worker_replacement_user', 'sub_worker_fault', 'cus_worker_replacement',
+                         'si_worker_replacement', 'price_worker_fault', 'plus', 'canceled')
+                 RETURNING to_jsonb(s)::text", &[],
+            ).await.map_err(|_| StoreError)?.get(0);
+
+            phase.set("raw replacement: Worker table lock did not wait on the writer");
+            let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, ReconcileProbe::None));
+            match select(reconcile.as_mut(), Box::pin(wait_for_raw_writer(writer))).await {
+                Either::Left(_) => return Err(StoreError),
+                Either::Right((observed, _)) => observed?,
+            }
+            phase.set("raw replacement: preceding writer did not finish");
+            writer.batch_execute(if commit { "COMMIT" } else { "ROLLBACK" }).await.map_err(|_| StoreError)?;
+            phase.set("raw replacement: wrong reconciliation result after writer finished");
+            if reconcile.await.is_ok() == commit {
+                return Err(StoreError);
+            }
+
+            phase.set("raw replacement: durable subscription or history differed");
+            let observed: String = writer.query_one(
+                "SELECT to_jsonb(s)::text FROM public.subscriptions s", &[],
+            ).await.map_err(|_| StoreError)?.get(0);
+            let observed_history: String = writer.query_one(history_sql, &[]).await.map_err(|_| StoreError)?.get(0);
+            let invoice = writer.query_opt(
+                "SELECT user_id = 'worker_fault_user' AND stripe_subscription_id = 'sub_worker_fault'
+                        AND plan_id = 'plus' AND amount_cents = 800 AND currency = 'usd'
+                 FROM public.paid_invoice_history WHERE stripe_invoice_id = 'in_worker_raw_replace'", &[],
+            ).await.map_err(|_| StoreError)?;
+            if observed != if commit { replacement } else { original }
+                || observed_history != history
+                || invoice.map(|row| row.get::<_, bool>(0)) != if commit { None } else { Some(true) }
             {
                 return Err(StoreError);
             }
