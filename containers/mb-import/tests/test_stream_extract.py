@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -73,7 +74,11 @@ class StreamExtractTest(unittest.TestCase):
         result, out = self.run_extract({"mbdump/artist": b"x\n"})
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing required tables", result.stderr.decode())
-        self.assertIn("track", json.loads((out / "dump-meta.json").read_text())["missing"])
+        missing = json.loads((out / "dump-meta.json").read_text())["missing"]
+        self.assertIn("track", missing)
+        self.assertIn("artist_alias", missing)
+        self.assertIn("work", missing)
+        self.assertIn("work_type", missing)
 
 
 class DuplicateMemberTest(unittest.TestCase):
@@ -130,6 +135,158 @@ class EtlDiskBoundedModeTest(unittest.TestCase):
             outputs.append(path.read_bytes())
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(gzip.decompress(outputs[0]), b"row\n")
+
+
+class ProjectionTestCase(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        source = ROOT / "tests" / "fixtures" / "mbdump"
+        self.raw = shutil.copytree(source, self.tmp / "raw")
+        self.curated = self.raw / "curated"
+
+    def run_etl(self, directory, **mode):
+        env = dict(os.environ, DUMP_TS="2025-02-03T04:05:06Z",
+                   MB_ETL_CONSUME_INPUTS="0", MB_ETL_GZIP_OUTPUT="0")
+        env.update(mode)
+        return subprocess.run([sys.executable, str(ROOT / "etl.py"), str(directory)],
+                              env=env, capture_output=True, text=True, check=False)
+
+
+class ArtistAliasProjectionTest(ProjectionTestCase):
+    output = "mbdump-artist_alias.tsv"
+
+    def setUp(self):
+        super().setUp()
+        self.aliases = self.raw / "artist_alias"
+
+    def test_streamed_aliases_match_plain_after_reordering(self):
+        plain = self.run_etl(self.raw)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        # The winner must come from the same source row, even with reversed ties.
+        members["mbdump/artist_alias"] = b"".join(reversed(self.aliases.read_bytes().splitlines(keepends=True)))
+        packed = self.tmp / "packed"
+        extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
+                                 input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        self.assertTrue((packed / "artist_alias.gz").is_file())
+        gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
+        self.assertFalse((packed / "artist_alias.gz").exists())
+        self.assertEqual(gzip.decompress((packed / "curated" / (self.output + ".gz")).read_bytes()),
+                         (self.curated / self.output).read_bytes())
+
+    def test_empty_alias_table_emits_empty_sidecar(self):
+        self.aliases.write_bytes(b"")
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), b"")
+
+    def test_alias_errors_and_changed_output_preserve_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        original = self.aliases.read_bytes()
+        for changed, error in (
+            (None, "missing input file:"),
+            (b"broken\n", "expected 16 fields"),
+            (original.replace(rb"Caf\303\xA9", rb"Caf\303"), "invalid COPY text in name or locale"),
+            (original.replace(b"11\t10\t", b"11\t999\t", 1), "artist_alias references missing artist 999"),
+            (original.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            (original.replace(b"\tt\tf\n", b"\t\\N\tf\n", 1), "invalid primary_for_locale"),
+            (original.replace(b"Jazz", b"Updated"), "already has different curated output"),
+        ):
+            with self.subTest(error=error):
+                if changed is None:
+                    self.aliases.unlink()
+                else:
+                    self.aliases.write_bytes(changed)
+                refused = self.run_etl(self.raw)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+
+
+class WorkProjectionTest(ProjectionTestCase):
+    output = "mbdump-work.tsv"
+
+    def test_typed_and_untyped_works_match_streamed_gzip(self):
+        plain = self.run_etl(self.raw)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        expected = (
+            "80808080-8080-4808-8808-808080808080\tA\\tSong\\\\N\tSong\\tSuite\t2025-02-03T04:05:06Z\n"
+            "10101010-1010-4010-8010-101010101010\tCafé\\nLive\t\\N\t2025-02-03T04:05:06Z\n"
+        ).encode()
+        self.assertEqual((self.curated / self.output).read_bytes(), expected)
+
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        members["mbdump/work"] = b"".join(reversed(members["mbdump/work"].splitlines(keepends=True)))
+        for table in ("work_alias", "l_recording_work"):
+            members[f"mbdump/{table}"] = b"not admitted\n"
+        packed = self.tmp / "packed"
+        extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
+                                 input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        for table in ("work_alias", "l_recording_work"):
+            self.assertFalse((packed / f"{table}.gz").exists())
+        gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
+        for table in ("work", "work_type"):
+            self.assertFalse((packed / f"{table}.gz").exists())
+        self.assertEqual(gzip.decompress((packed / "curated" / (self.output + ".gz")).read_bytes()), expected)
+
+    def test_empty_work_table_emits_empty_sidecar(self):
+        (self.raw / "work").write_bytes(b"")
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), b"")
+
+    def test_work_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        work = (self.raw / "work").read_bytes()
+        lookup = (self.raw / "work_type").read_bytes()
+        for table, changed, error in (
+            ("work", None, "missing input file:"),
+            ("work_type", None, "missing input file:"),
+            ("work", b"broken\n", "expected 7 fields"),
+            ("work_type", b"broken\n", "expected 6 fields"),
+            ("work", work.replace(b"\t1\t", b"\t999\t"), "work 80 references missing work_type 999"),
+            ("work", work.replace(b"\t1\t", b"\t2147483648\t"), "invalid type_id"),
+            ("work", work.replace(b"81\t", b"\\N\t"), "invalid id"),
+            ("work", work.replace(b"81\t", b"80\t"), "UNIQUE constraint failed: work.id"),
+            ("work", work.replace(b"10101010-1010-4010-8010-101010101010", b"bad"), "invalid work MBID"),
+            ("work", work.replace(b"10101010-1010-4010-8010-101010101010", b"\\N"), "invalid work MBID"),
+            ("work", work.replace(b"10101010-1010-4010-8010-101010101010", b"80808080-8080-4808-8808-808080808080"),
+             "UNIQUE constraint failed: work.gid"),
+            ("work", work.replace(rb"A\tSong\\N", rb"\N"), "name must not be NULL"),
+            ("work", work.replace(rb"A\tSong\\N", rb"A\q"), "invalid COPY text in name"),
+            ("work_type", lookup.replace(b"1\t", b"+1\t", 1), "invalid id"),
+            ("work_type", lookup * 2, "UNIQUE constraint failed: work_type.id"),
+            ("work_type", lookup.replace(rb"Song\tSuite", rb"\000"), "invalid COPY text in name"),
+            ("work", work.replace(b"Live", b"Studio"), "already has different curated output"),
+        ):
+            with self.subTest(table=table, error=error):
+                path = self.raw / table
+                if changed is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(changed)
+                # Use a fresh timestamp except when testing the reuse check.
+                mode = {} if error.startswith("already has") else {"DUMP_TS": "2025-02-04T04:05:06Z"}
+                refused = self.run_etl(self.raw, **mode)
+                path.write_bytes(work if table == "work" else lookup)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
 
 
 if __name__ == "__main__":

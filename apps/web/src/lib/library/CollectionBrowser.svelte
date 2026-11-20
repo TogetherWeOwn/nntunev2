@@ -1,12 +1,12 @@
 <script lang="ts">
+	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError } from '../api/client.js';
-	import { subscribeLocalAuthTransition } from '../auth-transition.js';
 	import { ARTWORK_PLACEHOLDER_SRC } from '../player/artwork.js';
-	import { LIBRARY_AUTH_TRANSITION_KEY } from './cache.js';
-	import { COLLECTION_LIMIT, displayCollections, loadCollections, type Collection, type CollectionFilter, type CollectionSort } from './collections.js';
+	import { displayCollections, loadCollections, type Collection, type CollectionFilter, type CollectionSort } from './collections.js';
 
-	let { filter, baseUrl }: { filter: CollectionFilter; baseUrl: string } = $props();
+	let { filter, accessRevoked }: { filter: CollectionFilter; accessRevoked: boolean } = $props();
 	let query = $state('');
+	let searchInput = $state<HTMLInputElement>();
 	let sort = $state<CollectionSort>('catalogue');
 	let reverse = $state(false);
 	let layout = $state<'list' | 'grid'>('list');
@@ -22,47 +22,34 @@
 		rows = [];
 		status = 'loading';
 		try {
-			const client = new ApiClient({ baseUrl, signal: request.signal });
+			const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal });
 			const result = await loadCollections(client, selected);
-			if (request.signal.aborted) return;
+			if (request.signal.aborted || accessRevoked || selected !== filter) return;
 			rows = result;
 			status = 'ready';
 		} catch (error) {
-			if (request.signal.aborted) return;
+			if (request.signal.aborted || accessRevoked || selected !== filter) return;
 			status = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error';
+			if (status === 'sign-in') query = '';
 			request.abort();
 		}
 	}
-
 	$effect(() => {
-		void load(filter);
-		return () => active?.abort();
-	});
-
-	$effect(() => {
-		function reset(): void {
-			active?.abort();
+		if (accessRevoked) {
 			rows = [];
 			query = '';
 			status = 'sign-in';
+			return;
 		}
-		function onStorage(event: StorageEvent): void {
-			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) reset();
-		}
-		const unsubscribe = subscribeLocalAuthTransition(reset);
-		window.addEventListener('storage', onStorage);
-		return () => {
-			unsubscribe();
-			window.removeEventListener('storage', onStorage);
-		};
+		void load(filter);
+		return () => active?.abort();
 	});
 </script>
-
 <section aria-label="Library collections">
 	<div class="nt-collection-toolbar">
-		<label>Search in Your Library <input type="search" bind:value={query} /></label>
+		<label>Search in Your Library <input class="nt-button nt-button--ghost" type="search" bind:this={searchInput} bind:value={query} /></label>
 		<label>Sort collections
-			<select bind:value={sort}>
+			<select class="nt-button nt-button--ghost" bind:value={sort}>
 				<option value="catalogue">Catalogue order</option>
 				<option value="title">A–Z</option>
 				<option value="creator">Creator</option>
@@ -71,13 +58,12 @@
 		<button class="nt-button nt-button--ghost" type="button" aria-pressed={reverse}
 			onclick={() => { reverse = !reverse; }}>Reverse order</button>
 		<label>Collection view
-			<select bind:value={layout}>
+			<select class="nt-button nt-button--ghost" bind:value={layout}>
 				<option value="list">List</option>
 				<option value="grid">Grid</option>
 			</select>
 		</label>
 	</div>
-
 	{#if status === 'loading'}
 		<p role="status">Loading your collections…</p>
 	{:else if status === 'sign-in'}
@@ -85,14 +71,9 @@
 	{:else if status === 'error'}
 		<p role="alert">Could not load your collections.</p>
 		<button class="nt-button" type="button" onclick={() => void load(filter)}>Retry collections</button>
-	{:else if rows.length === 0}
-		<p role="status">No {filter === 'all' ? 'collections' : filter} in your library yet.</p>
 	{:else}
-		<p role="status">Showing {visible.length} of {rows.length} loaded items.</p>
-		<p>Search and sort cover the first {COLLECTION_LIMIT} items of each collection type.</p>
-		{#if visible.length === 0}
-			<button class="nt-button" type="button" onclick={() => { query = ''; }}>Clear collection search</button>
-		{:else}
+		<p role="status">{rows.length ? `Showing ${visible.length} of ${rows.length} loaded items.` : `No ${filter === 'all' ? 'collections' : filter} in the loaded results.`}</p>
+		{#if visible.length > 0}
 			<ul role="list" data-view={layout}>
 				{#each visible as row (`${row.kind}:${row.id}`)}
 					<li data-kind={row.kind}>
@@ -109,10 +90,11 @@
 					</li>
 				{/each}
 			</ul>
+		{:else if rows.length > 0}
+			<button class="nt-button" type="button" onclick={() => { query = ''; searchInput?.focus(); }}>Clear collection search</button>
 		{/if}
 	{/if}
 </section>
-
 <style>
 	.nt-collection-toolbar {
 		display: flex;
@@ -122,16 +104,7 @@
 		margin-block: var(--nt-space-3);
 	}
 	label { display: grid; gap: var(--nt-space-1); max-width: 100%; }
-	input, select {
-		font: inherit;
-		color: var(--nt-fg);
-		background: var(--nt-bg-raised);
-		border: 1px solid var(--nt-border);
-		border-radius: var(--nt-radius-sm);
-		min-height: var(--nt-control);
-		min-width: 0;
-		padding-inline: var(--nt-space-2);
-	}
+	input, select { font: inherit; background: var(--nt-bg-raised); min-height: var(--nt-control); min-width: 0; }
 	ul { list-style: none; padding: 0; }
 	li {
 		display: flex;
@@ -139,7 +112,6 @@
 		gap: var(--nt-space-3);
 		padding: var(--nt-library-row-padding) var(--nt-space-2);
 		min-height: calc(var(--nt-control) + 2 * var(--nt-library-row-padding));
-		box-sizing: border-box;
 		overflow-wrap: anywhere;
 	}
 	li p { margin: 0; color: var(--nt-fg-muted); }

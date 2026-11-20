@@ -10,7 +10,7 @@ import type { ShareTarget } from './shareTimestamp.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 
-type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'revoke' | 'isCurrent'>;
+type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'revoke' | 'isCurrent' | 'purging'>;
 
 export type MediaSelection = {
 	commit: (queue: QueueState) => boolean;
@@ -83,19 +83,36 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		clearJumpFeedback();
 	}
 
-	function reset(): void {
+	function retire(): HTMLAudioElement | undefined {
 		const previous = current;
 		current = undefined;
 		// Retire the native receipt without imposing replacement's share-clear policy on remove/clear.
 		attachmentVersion += 1;
 		previous?.listeners.abort();
-		pause(previous?.audio);
+		return previous?.audio;
+	}
+
+	function reset(): void {
+		pause(retire());
+	}
+
+	function purgeAtAuthBoundary(clearHint: () => void): void {
+		pendingShare.clear();
+		positionIntent += 1;
+		nextPosition = undefined;
+		const audio = retire();
+		try {
+			clearHint();
+			clearSeekFeedback();
+		} finally {
+			try { pause(audio); } catch { /* The retired element cannot own player state. */ }
+		}
 	}
 
 	async function playSelected(
 		base: QueueState, index: number, source: QueuedPlaySource, suffix = ''
 	): Promise<void> {
-		if (!selection) return;
+		if (!selection || queue.purging) return;
 		const target = base.tracks[index];
 		if (!target || destroyed || !source.isCurrent()) return;
 		const { streamUrl } = source;
@@ -206,7 +223,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function jump(direction: JumpDirection): void {
-		if (destroyed) return;
+		if (destroyed || queue.purging) return;
 		const track = currentTrack(queue.snapshot);
 		const source = resolveStreamUrl(track);
 		const attachment = current;
@@ -371,7 +388,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		get audio() { return current?.audio; },
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement): () => void {
-			if (destroyed) return () => {};
+			if (destroyed || queue.purging) return () => {};
 			if (mountedAudio.has(audio)) throw new Error('Native observations require a fresh audio element');
 			mountedAudio.add(audio);
 			const previous = current;
@@ -439,7 +456,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				if (current === receipt) reset();
 			};
 		},
-		reset,
+		reset, purgeAtAuthBoundary,
 		destroy() {
 			destroyed = true;
 			pendingShare.clear();

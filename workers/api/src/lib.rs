@@ -251,6 +251,31 @@ pub async fn billing_owned_test_entry(
                     Err(_) => worker::Response::error("billing-restricted-history-failed", 500),
                 };
             }
+            "/billing-raw-update-proof" => {
+                return match worker_entry::billing_deadline_test::test_reconcile_raw_update().await
+                {
+                    Ok(()) => worker::Response::ok("billing-raw-update-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            path
+            @ ("/billing-raw-replace-commit-proof" | "/billing-raw-replace-rollback-proof") => {
+                let commit = path == "/billing-raw-replace-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_raw_replace(commit)
+                    .await
+                {
+                    Ok(()) => worker::Response::ok("billing-raw-replace-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            "/billing-parent-cycle-proof" => {
+                return match worker_entry::billing_deadline_test::test_reconcile_parent_cycle()
+                    .await
+                {
+                    Ok(()) => worker::Response::ok("billing-parent-cycle-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
             _ => {}
         }
     }

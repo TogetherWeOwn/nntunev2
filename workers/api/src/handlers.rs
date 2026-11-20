@@ -950,6 +950,19 @@ pub trait Store {
             Err(StoreError)
         }
     }
+
+    fn export_listen_events(
+        &self,
+        _owner: &str,
+        _before: Option<&crate::listen_history::ExportCursor>,
+    ) -> impl Future<Output = Result<Vec<crate::listen_history::ListenRow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+
+    fn clear_listen_events(&self, _owner: &str) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
+    }
+
     /// The user's `playback_leases` row, if any. Default `Err` fails
     /// closed like [`Store::live_subscription`].
     fn playback_lease(
@@ -4735,6 +4748,9 @@ where
     }
 }
 
+#[path = "listen_history_controls.rs"]
+mod listen_history_controls;
+
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
 
@@ -7608,6 +7624,8 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/session/revoke-all"
             | "/v1/plays"
             | "/v1/plays/heartbeat"
+            | listen_history_controls::CLEAR_PATH
+            | listen_history_controls::EXPORT_PATH
             | "/v1/credentials"
             | "/v1/subsonic-credentials"
             | "/v1/plans"
@@ -7762,6 +7780,17 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    // Keep the largest route's state out of every caller's future.
+    Box::pin(dispatch_request(ctx, req)).await
+}
+
+async fn dispatch_request<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
     if req.body.len() > max_body_bytes(&req.method, &req.path) {
         // Oversized admin uploads answer the 413 failure shape (with a
         // null job: nothing was parsed, so no row and no audit), never
@@ -7792,6 +7821,7 @@ where
             }
         }
     }
+    use listen_history_controls as listens;
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/healthz") => json_response(
             200,
@@ -7832,6 +7862,8 @@ where
         // in the scope map, so it never enters the gate.
         ("POST", "/v1/plays") => play_issue(ctx, req).await,
         ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
+        ("POST", listens::EXPORT_PATH) => listens::export(ctx, req).await,
+        ("DELETE", listens::CLEAR_PATH) => listens::clear(ctx, req).await,
         // Internal meter sink: HMAC-authenticated inside the handler
         // (crate::meter_sink), no session/bearer surface. The scope
         // map denies this path to bearer credentials, so the gate
@@ -8059,6 +8091,7 @@ mod tests {
         /// Mirror of `users.invited_by` (migration 0033), keyed by the
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
+        listen_rows: RefCell<Vec<(String, crate::listen_history::ListenRow)>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
         lose_next_refresh_ack: RefCell<bool>,
@@ -9094,6 +9127,34 @@ mod tests {
                 .copied()
                 .unwrap_or(0))
         }
+
+        async fn export_listen_events(
+            &self,
+            owner: &str,
+            before: Option<&crate::listen_history::ExportCursor>,
+        ) -> Result<Vec<crate::listen_history::ListenRow>, StoreError> {
+            use crate::listen_history::EXPORT_PAGE_SIZE;
+            let rows = self.listen_rows.borrow();
+            let mut owned = rows.iter().rev().filter(|(id, _)| id == owner);
+            if before.is_some_and(|before| {
+                !owned.any(|(_, row)| {
+                    crate::listen_history::ExportCursor::parse(Some(&row.cursor()))
+                        == Ok(Some(before.clone()))
+                })
+            }) {
+                return Ok(Vec::new());
+            }
+            Ok(owned
+                .take(EXPORT_PAGE_SIZE + 1)
+                .map(|(_, row)| row.clone())
+                .collect())
+        }
+
+        async fn clear_listen_events(&self, owner: &str) -> Result<(), StoreError> {
+            self.listen_rows.borrow_mut().retain(|(id, _)| id != owner);
+            Ok(())
+        }
+
         async fn playback_lease(
             &self,
             user_id: &str,
@@ -18476,6 +18537,8 @@ mod tests {
         }
         (h, cookie, secret)
     }
+
+    include!("listen_history_control_tests.rs");
 
     fn assert_play_bearer_refused(
         h: &Harness,

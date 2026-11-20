@@ -11,8 +11,10 @@ trap 'rm -rf "$temp_dir"' EXIT
 cp -R "$fixtures/mbdump" "$temp_dir/mbdump"
 DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/mbdump"
 diff -u "$expected/mbdump-artist.tsv" "$temp_dir/mbdump/curated/mbdump-artist.tsv"
+diff -u "$expected/mbdump-artist_alias.tsv" "$temp_dir/mbdump/curated/mbdump-artist_alias.tsv"
 diff -u "$expected/mbdump-release_group.tsv" "$temp_dir/mbdump/curated/mbdump-release_group.tsv"
 diff -u "$expected/mbdump-release.tsv" "$temp_dir/mbdump/curated/mbdump-release.tsv"
+diff -u "$expected/mbdump-release_credit.tsv" "$temp_dir/mbdump/curated/mbdump-release_credit.tsv"
 diff -u "$expected/mbdump-recording.tsv" "$temp_dir/mbdump/curated/mbdump-recording.tsv"
 diff -u "$expected/mbdump-url.tsv" "$temp_dir/mbdump/curated/mbdump-url.tsv"
 diff -u "$expected/mbdump-artist_url.tsv" "$temp_dir/mbdump/curated/mbdump-artist_url.tsv"
@@ -98,7 +100,7 @@ if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/dangling-url"
 fi
 grep -q 'artist-url link references missing url' "$temp_dir/dangling-url.err"
 
-if DUMP_TS= "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/timestamp.err"; then
+if DUMP_TS='' "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/timestamp.err"; then
   echo 'expected missing timestamp failure' >&2
   exit 1
 fi
@@ -112,12 +114,42 @@ if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/unknown-count
 fi
 grep -q 'missing input file: .*release_unknown_country' "$temp_dir/unknown-country-missing.err"
 
+# The disk-bounded path publishes the same credit bytes under the packed name.
+cp -R "$fixtures/mbdump" "$temp_dir/packed"
+MB_ETL_GZIP_OUTPUT=1 DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/packed"
+gzip -dc "$temp_dir/packed/curated/mbdump-release_credit.tsv.gz" > "$temp_dir/packed-credit.tsv"
+diff -u "$expected/mbdump-release_credit.tsv" "$temp_dir/packed-credit.tsv"
+
 # Publication survival: identical same-DUMP_TS reruns reuse the published
 # snapshot byte-for-byte; changed or failed reruns must leave the published
-# snapshot, its symlink target and all ten TSV hashes untouched.
+# snapshot, its symlink target and all TSV hashes untouched.
 published_target="$(readlink "$temp_dir/mbdump/curated")"
 published_hashes="$temp_dir/published.sha256"
-( cd "$temp_dir/mbdump/curated" && sha256sum mbdump-artist.tsv mbdump-release_group.tsv mbdump-release.tsv mbdump-recording.tsv mbdump-track.tsv mbdump-url.tsv mbdump-artist_url.tsv mbdump-recording_url.tsv mbdump-recording_music_video.tsv mbdump-recording_isrc.tsv > "$published_hashes" )
+( cd "$temp_dir/mbdump/curated" && sha256sum mbdump-*.tsv > "$published_hashes" )
+
+# Credit text can change without affecting the first-artist release projection.
+credit_names="$temp_dir/mbdump/artist_credit_name"
+cp "$credit_names" "$temp_dir/credits.bak"
+sed -i 's/Second Artist/Guest Artist/' "$credit_names"
+if DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/changed-credit.err"; then
+  echo 'expected same-timestamp changed-credit refusal' >&2
+  exit 1
+fi
+grep -q 'already has different curated output' "$temp_dir/changed-credit.err"
+[[ "$(readlink "$temp_dir/mbdump/curated")" == "$published_target" ]]
+( cd "$temp_dir/mbdump/curated" && sha256sum -c "$published_hashes" )
+
+# The same position for two artists is ambiguous even when it is not first.
+cp "$temp_dir/credits.bak" "$credit_names"
+printf '300\t1\t10\tGuest Artist\t\n' >> "$credit_names"
+if DUMP_TS=2025-02-03T04:05:08Z "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/duplicate-credit.err"; then
+  echo 'expected duplicate credit position failure' >&2
+  exit 1
+fi
+grep -q 'UNIQUE constraint failed: artist_credit_name.credit, artist_credit_name.position' "$temp_dir/duplicate-credit.err"
+[[ "$(readlink "$temp_dir/mbdump/curated")" == "$published_target" ]]
+( cd "$temp_dir/mbdump/curated" && sha256sum -c "$published_hashes" )
+cp "$temp_dir/credits.bak" "$credit_names"
 
 # Identical input at the same DUMP_TS reuses the existing snapshot.
 DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump"

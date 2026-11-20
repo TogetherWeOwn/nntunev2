@@ -86,7 +86,6 @@
 		type Track
 	} from '#lib/player/queue.js';
 
-	let { data }: { data?: { collectionsApiBase: string } } = $props();
 	type Density = 'comfortable' | 'compact';
 	const DENSITY_KEY = 'nntune:density:v1';
 	let density = $state<Density>('comfortable');
@@ -95,6 +94,7 @@
 	] as const;
 	let collectionFilter = $state<CollectionFilter | 'tracks'>('tracks');
 	const showingTracks = $derived(collectionFilter === 'tracks');
+	let collectionsAccessRevoked = $state(false);
 
 	function readStoredDensity(): Density {
 		try {
@@ -324,8 +324,9 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
-		onStateChange: (state, { isCurrent, authoritative }) => {
+		onStateChange: (state, { isCurrent, authoritative, authBoundary }) => {
 			if (!isCurrent()) return;
+			if (authBoundary || (authoritative && !state.libraryUnavailable)) collectionsAccessRevoked = !!authBoundary;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -354,16 +355,15 @@
 				recentFindsInitialized = false;
 				recentFindsAnnouncement = '';
 			}
-			if (state.loading || state.items.length === 0) {
+			if (!authBoundary && (state.loading || state.items.length === 0)) {
 				player.browseCopy.invalidate();
 				clearFavoritesExportFeedback();
 				media.clearShareSeek();
 			}
 			if (!isCurrent()) return;
-			if (authoritative) {
+			if (authoritative && !authBoundary) {
 				player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
 					if (queueChanged) queueConfirmGeneration += 1;
-					if (state.loadError && state.items.length === 0) player.announceQueue('');
 				});
 			}
 			// Queue publication can reenter the route and revoke this receipt.
@@ -602,7 +602,8 @@
 	function resetShareAtAuthBoundary(): void {
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
-		player.resetAtAuthBoundary();
+		if (queueController.snapshot.tracks.length) queueConfirmGeneration += 1;
+		player.purgeAtAuthBoundary();
 		queueShare.reset();
 		shareInvalid = false;
 	}
@@ -1386,12 +1387,10 @@
 	}
 
 	function handleAuthTransition(event: StorageEvent): void {
-		// The refresher's auth reset clears queue membership and evidence together.
 		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) {
 			resetShareAtAuthBoundary();
 			clearFavoritesExportFeedback();
 			releaseFavoritesDownload();
-			// Queue and source evidence are cleared by the refresher notification.
 			clearSignedInEmail();
 			// Clear favorites storage BEFORE the refresher revokes the
 			// session auth context the scoped key derives from.
@@ -1418,7 +1417,6 @@
 		resetShareAtAuthBoundary();
 		clearFavoritesExportFeedback();
 		releaseFavoritesDownload();
-		// Queue and source evidence are cleared by the refresher notification.
 		clearSignedInEmail();
 		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
@@ -1438,6 +1436,14 @@
 		refresher.handleLocalAuthTransition();
 	}
 
+	let disposeRoute: (() => void) | undefined;
+	// Register before template effects so the child's native detach cannot pause first.
+	$effect.pre(() => () => {
+		const dispose = disposeRoute;
+		disposeRoute = undefined;
+		dispose?.();
+	});
+
 	onMount(() => {
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
@@ -1448,19 +1454,16 @@
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
-		void refresh();
-		return () => {
+		disposeRoute = () => {
 			endTrackDrag();
 			// Restore only while this page still owns the title; a newer route's title wins.
 			if (priorDocumentTitle !== null && document.title === tabTitle) {
 				document.title = priorDocumentTitle;
 			}
 			shareAlive = false;
-			queueController.destroy();
 			queueShare.dispose();
-			media.destroy();
+			player.destroy();
 			favoritesExport.destroy();
-			player.browseCopy.invalidate();
 			refresher.dispose();
 			// The queue is page state but the mini-player hint is shell
 			// state: leaving the library empties the queue's visible hint
@@ -1472,6 +1475,7 @@
 			window.removeEventListener('storage', handleAuthTransition);
 			window.removeEventListener('pagehide', recordFindQuery);
 		};
+		void refresh();
 	});
 </script>
 
@@ -1498,7 +1502,7 @@
 		{/each}
 	</div>
 	{#if collectionFilter !== 'tracks'}
-		<CollectionBrowser filter={collectionFilter} baseUrl={data?.collectionsApiBase ?? ''} />
+		<CollectionBrowser filter={collectionFilter} accessRevoked={collectionsAccessRevoked} />
 	{/if}
 
 	{#if shareInvalid}
@@ -1544,20 +1548,19 @@
 	{#if loading && items.length === 0}
 		<p role="status" hidden={!showingTracks}>Loading your library…</p>
 	{:else if loadError && items.length === 0}
-		<div hidden={!showingTracks}>
-			<p role="alert">{loadError}</p>
-			{#if requiresSignIn}
-				<a class="nt-button" href="/login">Sign in</a>
-			{/if}
-			<button
-				class="nt-button"
-				type="button"
-				bind:this={refreshButton}
-				onclick={() => void refreshFromButton()}
-			>
-				Retry
-			</button>
-		</div>
+		<p role="alert" hidden={!showingTracks}>{loadError}</p>
+		{#if requiresSignIn}
+			<a class="nt-button" href="/login" hidden={!showingTracks}>Sign in</a>
+		{/if}
+		<button
+			class="nt-button"
+			type="button"
+			hidden={!showingTracks}
+			bind:this={refreshButton}
+			onclick={() => void refreshFromButton()}
+		>
+			Retry
+		</button>
 	{:else}
 		<!-- Keep the Tracks DOM and controller state while browsing; the queue stays visible. -->
 		<div hidden={!showingTracks}>
@@ -2080,7 +2083,7 @@
 		background: var(--nt-fg);
 		color: var(--nt-bg);
 	}
-	button[hidden] { display: none; }
+	.nt-button[hidden] { display: none; }
 	.nt-library-density {
 		display: flex;
 		align-items: center;

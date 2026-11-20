@@ -1,5 +1,6 @@
 import { expect, test, vi } from 'vitest';
-import { clearMiniPlayerHint, onMiniPlayerHint, type MiniPlayerHint } from '../shell/mini-player.js';
+import { get } from 'svelte/store';
+import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint, type MiniPlayerHint } from '../shell/mini-player.js';
 import { createPlayerController } from './controller.svelte.js';
 import { createQueue } from './queue.js';
 
@@ -146,7 +147,7 @@ test.each([
 	player.browseCopy.settle(old, outcome.status, outcome.fallbackUrl);
 	other.browseCopy.settle(otherReceipt, 'Copied another link.', null);
 
-	player.resetAtAuthBoundary();
+	player.purgeAtAuthBoundary();
 	expect(player.browseCopy.feedback).toEqual(empty);
 	expect(other.browseCopy.feedback).toEqual({ status: 'Copied another link.', fallbackUrl: null });
 	player.browseCopy.settle(old, outcome.status, outcome.fallbackUrl);
@@ -158,4 +159,216 @@ test.each([
 	const fresh = player.browseCopy.invalidate();
 	player.browseCopy.settle(fresh, outcome.status, outcome.fallbackUrl);
 	expect(player.browseCopy.feedback).toEqual(outcome);
+});
+
+test('final teardown retires all receipts before native pause and leaves a fresh player alone', async () => {
+	const initial = createQueue([{ id: 'coral', title: 'Coral', artist: '', streamUrl: '/coral' }]);
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const flush = vi.fn(() => promise);
+	const matchesNative = (audio: HTMLAudioElement, source: string) =>
+		audio.isConnected && audio.getAttribute('src') === source;
+	const player = createPlayerController(initial, { flush }, matchesNative);
+	const fresh = createPlayerController(initial, { flush: async () => {} }, matchesNative);
+	const makeAudio = () => Object.assign(new EventTarget(), {
+		paused: false, ended: false, isConnected: true, getAttribute: () => '/coral',
+		play: vi.fn(async () => {}), pause: vi.fn(), currentTime: 0, duration: 120
+	});
+	const oldAudio = makeAudio();
+	const listen = vi.spyOn(oldAudio, 'addEventListener');
+	const detach = player.media.attach(oldAudio as unknown as HTMLAudioElement);
+	const [event, listener, options] = listen.mock.calls[0]!;
+	const signal = (options as AddEventListenerOptions).signal;
+	const deliverOldPlay = () => (listener as EventListener)({ type: event, currentTarget: oldAudio } as unknown as Event);
+
+	try {
+		expect(player.reconcileLibrary(initial.tracks, () => true)).toBe(true);
+		const source = player.queue.sourceForQueuedPlay('coral')!;
+		const playing = player.media.playSelected(initial, 0, source);
+		expect(flush).toHaveBeenCalledOnce();
+		const snapshot = player.queue.snapshot;
+		const operation = player.queue.begin(snapshot, 'replace');
+		const playback = player.queue.revision;
+		const target = { trackId: 'coral', seconds: 45 };
+		const retry = player.media.captureShareSeek(player.media.beginShareInput(), target, () => true)!;
+		expect(player.media.pendingShareSeek).toMatchObject(target);
+		const copy = player.browseCopy.invalidate();
+		player.browseCopy.settle(copy, 'Earlier copy', null);
+		const oldAttachment = player.media.attachment!;
+		const announcement = player.queueAnnouncement;
+		const empty = createQueue([]);
+
+		const freshAudio = makeAudio();
+		oldAudio.pause.mockImplementationOnce(() => {
+			expect(player.queue.isCurrentOperation(operation)).toBe(false);
+			expect(player.queue.isCurrent(playback)).toBe(false);
+			expect(source.isCurrent()).toBe(false);
+			expect(player.media.pendingShareSeek).toBeNull();
+			expect(player.media.attachment).toBeUndefined();
+			expect(signal?.aborted).toBe(true);
+			expect(player.browseCopy.generation).not.toBe(copy);
+			player.queue.publish(empty, operation);
+			player.browseCopy.settle(copy, 'Stale copy', null);
+			retry();
+			deliverOldPlay();
+			player.destroy();
+			expect(player.replaceQueue(empty)).toBe(false);
+			expect(player.browseCopy.feedback).toEqual({ status: '', fallbackUrl: null });
+			fresh.media.attach(freshAudio as unknown as HTMLAudioElement);
+		});
+		player.destroy();
+		const receipts = () => [player.queue.revision, player.media.attachmentVersion, player.browseCopy.generation];
+		const retired = receipts();
+		const freshCopy = fresh.browseCopy.invalidate();
+		const freshRetry = fresh.media.captureShareSeek(fresh.media.beginShareInput(), target, () => true)!;
+		player.destroy();
+		detach();
+		deliverOldPlay();
+		retry();
+		resolve();
+		await playing;
+
+		expect(receipts()).toEqual(retired);
+		expect(player.queue.snapshot).toBe(snapshot);
+		expect(player.queueAnnouncement).toBe(announcement);
+		expect(oldAttachment.playing).toBe(false);
+		expect(oldAudio.currentTime).toBe(0);
+		expect(oldAudio.play).not.toHaveBeenCalled();
+		expect(oldAudio.pause).toHaveBeenCalledOnce();
+		expect(fresh.media.audio).toBe(freshAudio);
+		expect(freshAudio.pause).not.toHaveBeenCalled();
+		freshAudio.dispatchEvent(new Event('playing'));
+		expect(fresh.media.attachment?.playing).toBe(true);
+		freshRetry();
+		expect(freshAudio.currentTime).toBe(45);
+		fresh.browseCopy.settle(freshCopy, 'Fresh copy', null);
+		expect(fresh.browseCopy.feedback.status).toBe('Fresh copy');
+	} finally {
+		clearMiniPlayerHint();
+	}
+});
+
+test('a source-only purge retires an in-progress snapshot even with no queue publication', () => {
+	const empty = createQueue([]);
+	const player = createPlayerController(empty, { flush: async () => {} });
+	const oldItems = [{ id: 'coral', streamUrl: '/coral' }];
+	expect(player.reconcileLibrary(oldItems, () => true)).toBe(true);
+	const oldSource = player.queue.sourceForQueuedPlay('coral')!;
+	const operation = player.queue.begin(empty, 'replace');
+	const playback = player.queue.revision;
+	const published = vi.fn();
+	const stop = player.queue.subscribe(published);
+	published.mockClear();
+	try {
+		// The caller still claims the old refresh is current; the player owns a separate fence.
+		expect(player.reconcileLibrary(oldItems, () => true, () => player.purgeAtAuthBoundary())).toBe(false);
+		expect(published).not.toHaveBeenCalled();
+		expect(player.queue.snapshot).toBe(empty);
+		expect(player.queue.isCurrentOperation(operation)).toBe(false);
+		expect(player.queue.isCurrent(playback)).toBe(false);
+		expect(oldSource.isCurrent()).toBe(false);
+		expect(player.queue.sourceForQueuedPlay('coral')).toBeNull();
+		expect(player.reconcileLibrary([{ id: 'coral', streamUrl: '/fresh' }], () => true)).toBe(true);
+		expect(player.queue.sourceForQueuedPlay('coral')?.streamUrl).toBe('/fresh');
+		expect(oldSource.isCurrent()).toBe(false);
+	} finally {
+		stop();
+	}
+});
+
+test.each(['direct', 'nested publication'])('auth purge retires playback before reentry (%s)', async (when) => {
+	const oldQueue = createQueue([{ id: 'coral', title: 'Coral', artist: '', streamUrl: '/coral' }]);
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const inNativePlay = when === 'direct';
+	const player = createPlayerController(createQueue([]), {
+		flush: () => inNativePlay ? Promise.resolve() : promise
+	}, () => true);
+	const oldAudio = Object.assign(new EventTarget(), {
+		paused: false, ended: false, isConnected: true, getAttribute: () => '/coral',
+		play: vi.fn(() => promise), pause: vi.fn(), currentTime: 30, duration: 120,
+		seekable: { length: 1, start: () => 0, end: () => 120 }
+	});
+	const listen = vi.spyOn(oldAudio, 'addEventListener');
+	expect(player.reconcileLibrary(oldQueue.tracks, () => true)).toBe(true);
+	expect(player.replaceQueue(oldQueue)).toBe(true);
+	const detach = player.media.attach(oldAudio as unknown as HTMLAudioElement);
+	const [event, listener, options] = listen.mock.calls[0]!;
+	const signal = (options as AddEventListenerOptions).signal;
+	const deliverOldPlay = () => (listener as EventListener)({ type: event, currentTarget: oldAudio } as unknown as Event);
+	const oldAttachment = player.media.attachment!;
+	const source = player.queue.sourceForQueuedPlay('coral')!;
+	const playing = player.media.playSelected(oldQueue, 0, source);
+	await Promise.resolve();
+	expect(oldAudio.play).toHaveBeenCalledTimes(Number(inNativePlay));
+	player.media.restart();
+	expect(get(player.media.seekFeedback).restartStatus).toBe('Restarted Coral.');
+	const share = { trackId: 'coral', seconds: 45 };
+	const shareIntent = player.media.beginShareInput();
+	const retry = player.media.captureShareSeek(shareIntent, share, () => true)!;
+	expect(player.media.pendingShareSeek).toMatchObject(share);
+	const copy = player.browseCopy.invalidate();
+	player.browseCopy.settle(copy, 'Earlier copy', null);
+	player.announceQueue('Earlier announcement', true);
+	const version = player.queueAnnouncement.version;
+	const beforeRetire = player.media.attachmentVersion;
+	const reentrantPlays: Promise<void>[] = [];
+	const attemptRestore = () => {
+		reentrantPlays.push(player.media.playSelected(oldQueue, 0, source));
+		return player.replaceQueue(oldQueue);
+	};
+	const duringPause = vi.fn(() => ({
+		snapshot: player.queue.snapshot,
+		source: player.queue.sourceForQueuedPlay('coral'),
+		share: player.media.pendingShareSeek,
+		attachment: player.media.attachment,
+		aborted: signal?.aborted,
+		hint: readMiniPlayerHint(),
+		committed: attemptRestore(),
+		reconciled: player.reconcileLibrary(oldQueue.tracks, () => true)
+	}));
+	oldAudio.pause.mockImplementation(() => { duringPause(); });
+	const duringPublication = vi.fn(attemptRestore);
+	let purged = false;
+	const stop = player.queue.subscribe((snapshot) => {
+		if (snapshot.tracks.length === 0) duringPublication();
+		else if (when === 'nested publication' && snapshot !== oldQueue && !purged) {
+			purged = true;
+			player.purgeAtAuthBoundary();
+		}
+	});
+	try {
+		if (when === 'direct') player.purgeAtAuthBoundary();
+		else expect(player.commitQueue({ ...oldQueue }, 'move')).toBe(false);
+		expect(duringPause.mock.results[0]?.value).toEqual({
+			snapshot: createQueue([]), source: null, share: null, attachment: undefined,
+			aborted: true, hint: null, committed: false, reconciled: false
+		});
+		expect(duringPublication.mock.results.map(({ value }) => value)).toEqual([false]);
+		expect(player.media.attachmentVersion).toBe(beforeRetire + 1);
+		expect(get(player.media.seekFeedback)).toMatchObject({ restartCanSeek: false, restartStatus: '', jumpStatus: '' });
+		expect(player.browseCopy.feedback).toEqual({ status: '', fallbackUrl: null });
+		expect(player.queueAnnouncement).toEqual({ text: '', version });
+
+		const fresh = createQueue([{ ...oldQueue.tracks[0], title: 'Fresh Coral', streamUrl: '/fresh' }]);
+		expect(player.reconcileLibrary(fresh.tracks, () => true)).toBe(true);
+		expect(player.replaceQueue(fresh)).toBe(true);
+		expect(player.media.captureShareSeek(shareIntent, share, () => true)).toBeUndefined();
+		player.browseCopy.settle(copy, 'Stale copy', null);
+		detach();
+		retry();
+		deliverOldPlay();
+		resolve();
+		await Promise.all([playing, ...reentrantPlays]);
+		expect(oldAudio.pause).toHaveBeenCalledOnce();
+		expect(oldAudio.play).toHaveBeenCalledTimes(Number(inNativePlay));
+		expect(oldAudio.currentTime).toBe(0);
+		expect(oldAttachment.playing).toBe(false);
+		expect(player.queue.snapshot).toBe(fresh);
+		expect(player.queueAnnouncement).toEqual({ text: '', version });
+		expect(player.browseCopy.feedback).toEqual({ status: '', fallbackUrl: null });
+		expect(readMiniPlayerHint()?.title).toBe('Fresh Coral');
+	} finally {
+		resolve();
+		stop();
+		clearMiniPlayerHint();
+	}
 });

@@ -1,4 +1,4 @@
-//! Bounded owned snapshot construction, not connected to the mount.
+//! Bounded owned snapshot construction for the dormant production adapter and staging.
 //!
 //! The caller must independently bound database collection and input storage.
 //! Logical byte limits do not bound allocator capacity or other runtime
@@ -84,7 +84,7 @@ pub fn plan_snapshot_output(
 // This receipt owns its rows and exclusively borrows the ledger for their
 // entire lifetime. It deliberately has no mutable row access or constructor
 // accepting caller-owned vectors. Logical byte limits are not an upper bound
-// on allocator capacity; this receipt is not connected to the mount.
+// on allocator capacity.
 #[allow(dead_code)]
 struct OwnedRawRows<'a> {
     budget: &'a mut ConstructionBudget,
@@ -212,7 +212,7 @@ impl<'a> OwnedRawRows<'a> {
     }
 }
 
-type Snapshot = (Vec<Artist>, Vec<Album>, Vec<Song>);
+pub(crate) type Snapshot = (Vec<Artist>, Vec<Album>, Vec<Song>);
 
 /// Even an empty borrowed slice can have a retained, allocated backing vector.
 /// Without a raw-row receipt no input is admitted.

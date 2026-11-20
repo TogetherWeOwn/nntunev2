@@ -50,6 +50,7 @@ const test = base.extend<{ mountedLibrary: Page }, { libraryOrigin: string }>({
 			publicDir: false,
 			resolve: { alias: {
 				'#lib': `${webRoot}src/lib`,
+				'$app/env/public': `${webRoot}tests/fixtures/library-public-env.ts`,
 				'$app/navigation': `${fixtureRoot}navigation.ts`
 			} },
 			plugins: [{

@@ -5,8 +5,9 @@
 //! over [`crate::subsonic_pg::PgStore`]), loads the caller's membership
 //! catalogue through the existing [`crate::catalogue`] reads, then serves
 //! the request synchronously through [`nntune_subsonic::SubsonicApp`]
-//! over a [`ProductionStore`] snapshot built by [`build_snapshot`]. The
-//! split keeps this module free of `worker::` types so every rule below
+//! over a [`ProductionStore`] snapshot built by the
+//! [checked constructor](crate::subsonic_snapshot_plan::build_owned_bounded_snapshot).
+//! The split keeps this module free of `worker::` types so every rule below
 //! is natively testable.
 //!
 //! Honest gaps, all fail-closed rather than silently dropped:

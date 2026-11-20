@@ -409,6 +409,47 @@ def main():
                 check_restricted_history(f"http://127.0.0.1:{port}", settings)
                 admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
                 try:
+                    url = f"http://127.0.0.1:{port}/billing-raw-update-proof"
+                    status, _, body = routing.http("POST", url)
+                    routing.check(
+                        status == 200 and body == "billing-raw-update-ok", body
+                    )
+                    print(
+                        "PASS: dormant store classified after a preceding raw UPDATE",
+                        flush=True,
+                    )
+                finally:
+                    admin(f"DROP DATABASE {BILLING_DB}")
+                for finish in ("commit", "rollback"):
+                    admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                    try:
+                        url = f"http://127.0.0.1:{port}/billing-raw-replace-{finish}-proof"
+                        status, _, body = routing.http("POST", url)
+                        routing.check(
+                            status == 200 and body == "billing-raw-replace-ok",
+                            f"raw DELETE/reinsert {finish}: {body}",
+                        )
+                        print(
+                            f"PASS: dormant store classified after raw DELETE/reinsert {finish}",
+                            flush=True,
+                        )
+                    finally:
+                        admin(f"DROP DATABASE {BILLING_DB}")
+                admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                try:
+                    url = f"http://127.0.0.1:{port}/billing-parent-cycle-proof"
+                    status, _, body = routing.http("POST", url)
+                    routing.check(
+                        status == 200 and body == "billing-parent-cycle-ok", body
+                    )
+                    print(
+                        "PASS: dormant store and parent cascade resolved their lock cycle atomically",
+                        flush=True,
+                    )
+                finally:
+                    admin(f"DROP DATABASE {BILLING_DB}")
+                admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                try:
                     url = f"http://127.0.0.1:{port}/billing-cancel-proof"
                     with close_observer.close_observer() as (closed, relay_result):
                         with ThreadPoolExecutor(max_workers=1) as pool:

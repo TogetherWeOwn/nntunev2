@@ -28,6 +28,8 @@ export interface LibraryRefreshUpdate {
 	isCurrent: () => boolean;
 	/** A successful response or an explicit invalidation, never cached fallback. */
 	authoritative: boolean;
+	/** The account purge ran before this empty snapshot was published. */
+	authBoundary?: true;
 }
 
 export interface LibraryRefresherDeps {
@@ -88,6 +90,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		state.libraryUnavailable = false;
 		state.requiresSignIn = false;
 		let authoritative = false;
+		let authBoundary: true | undefined;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -270,6 +273,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					? 'You are signed out or do not have access to this library.'
 					: 'You do not have access to this library.';
 				authoritative = true;
+				authBoundary = true;
 				deps.invalidateLibraryCache();
 				return;
 			}
@@ -314,7 +318,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			if (activeRequest === controller) activeRequest = null;
 			if (isCurrent()) {
 				state.loading = false;
-				deps.onStateChange?.(state, { isCurrent, authoritative });
+				deps.onStateChange?.(state, { isCurrent, authoritative, authBoundary });
 			}
 		}
 	}
@@ -340,7 +344,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		state.requiresSignIn = true;
 		state.loadError = 'Your session changed. Sign in again to see this library.';
 		state.loading = false;
-		deps.onStateChange?.(state, { isCurrent, authoritative: true });
+		deps.onStateChange?.(state, { isCurrent, authoritative: true, authBoundary: true });
 	}
 
 	function handleAuthTransition(event: Pick<StorageEvent, 'key'>): void {

@@ -622,6 +622,57 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
 }
 
 #[test]
+fn history_controls_wire_to_postgres_storage() {
+    let source = production();
+    let dispatch = function_body(&source, "pubasyncfndispatch(");
+    assert!(dispatch.contains("store:&PgStore{"));
+    assert!(dispatch.contains("handlers::handle(&ctx,&guarded_request).await"));
+    let store = source.split_once("implStoreforPgStore{").unwrap().1;
+    for (method, operation) in [
+        ("export_listen_events", "export(&client,owner,before)"),
+        ("clear_listen_events", "clear(&mutclient,owner)"),
+    ] {
+        let body = function_body(store, &format!("asyncfn{method}("));
+        assert!(body.contains("self.connect().await?"), "{method}");
+        assert!(
+            body.contains(&format!("crate::listen_history::{operation}.await")),
+            "{method}"
+        );
+    }
+}
+
+#[test]
+fn listen_history_statements_run_unnamed_through_query_typed() {
+    let source: String = include_str!("../src/listen_history.rs")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    for name in [
+        "owner_is_deleting",
+        "record",
+        "clear_in_transaction",
+        "export",
+    ] {
+        let body = function_body(&source, &format!("asyncfn{name}("));
+        assert!(
+            body.contains(".query_typed("),
+            "{name} must use unnamed statements"
+        );
+        for named in [
+            ".query(",
+            ".query_one(",
+            ".query_opt(",
+            ".query_raw(",
+            ".execute(",
+            ".execute_raw(",
+            ".prepare",
+        ] {
+            assert!(!body.contains(named), "{name} must not use {named}");
+        }
+    }
+}
+
+#[test]
 fn seam_delegates_to_the_shared_helper_with_the_opaque_error() {
     let source = production();
     let pgstore = source
