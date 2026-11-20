@@ -7538,6 +7538,38 @@ mod tests {
     }
 
     #[test]
+    fn production_mount_returns_snapshot_refusal_before_dispatch() {
+        // The native tests exercise the constructor without a Worker Env.
+        // Pin the mount separately so bypassing it can't keep those tests green.
+        let (mount, _) = include_str!("worker_entry.rs")
+            .split_once("\npub async fn subsonic_mount(")
+            .expect("production mount must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("production mount must have a closing brace");
+        let mount: String = mount.split_ascii_whitespace().collect();
+        let checked: String = r#"
+            let (artists, albums, songs) = match construct_production_subsonic_snapshot(
+                &artist_rows, &release_rows, &track_rows, &merged, PRODUCTION_SNAPSHOT_LIMITS,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(response) => return respond_document(&response),
+            };
+        "#
+        .split_ascii_whitespace()
+        .collect();
+        let refusal = mount
+            .find(checked.as_str())
+            .expect("mount must use production snapshot limits and return the refusal response");
+        let store = mount.find("ProductionStore::new(").expect("dispatch store");
+        let dispatch = mount.find("app.handle(").expect("Subsonic dispatch");
+        assert!(
+            refusal + checked.len() <= store && store < dispatch,
+            "mount must return a snapshot refusal before building the store or dispatching"
+        );
+    }
+
+    #[test]
     fn production_snapshot_bounds_charge_duplicate_output_bytes() {
         use crate::subsonic_dispatch::{FLAC_CONTENT_TYPE, FLAC_SUFFIX};
         use nntune_subsonic::construction_budget::ConstructionBudget;
