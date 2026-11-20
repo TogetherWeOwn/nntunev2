@@ -26,7 +26,7 @@ Run `DUMP_TS=<ISO-8601 timestamp> ./etl.sh <mbdump-dir>` before
 `import.sh <mbdump-dir>/curated`. The input directory must contain the official,
 headerless MusicBrainz COPY files from the CC0 core dump: the entity files
 (`artist` with `artist_alias` and `artist_type`/`area`/`iso_3166_1` lookups,
-`release` with
+`release` with `release_alias` and
 `artist_credit_name`/`release_group`/`release_group_primary_type`/`release_country`/`release_unknown_country`,
 `recording` with `recording_alias`/`medium`/`track`, `work` with `work_type`, `label` with
 `label_type`) plus the relationship files (`url`, `link_type`, `link`,
@@ -56,6 +56,13 @@ decoded alias name, and decoded locale. It includes aliases for recordings
 with no track, and refuses malformed projected fields or missing recordings.
 An empty `recording_alias` input produces an empty sidecar; disk-bounded
 mode writes the same TSV content under `.tsv.gz`.
+
+`mbdump-release_alias.tsv` uses the same columns and tie-break, keyed by
+the exact release MBID in `mbdump-release.tsv`. The 16-column CC0
+`release_alias` input uses the same COPY positions as `recording_alias`.
+Rows sort by release MBID, decoded alias name, and decoded locale. Malformed
+projected fields or missing releases refuse publication; an empty input
+produces an empty sidecar. Disk-bounded mode emits the same rows as `.tsv.gz`.
 
 The sidecar `mbdump-work.tsv` contains the work MBID, title, work-type name
 (`\N` for an untyped work), and dump timestamp, ordered by upstream work ID.
