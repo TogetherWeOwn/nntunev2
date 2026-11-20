@@ -133,6 +133,7 @@ pub(crate) async fn test_connect_deadline() -> Result<(), &'static str> {
         let attempt = connect_auth(&socket, &config, || {
             socket.track_fixture(fixture.get(0).unchecked_into())
         });
+        let started = worker::Date::now().as_millis();
         // Fail if the connector gets no timer, or gives the handshake a fresh
         // 2 seconds after the fixture spends 1 second waiting for open.
         if !matches!(
@@ -140,6 +141,9 @@ pub(crate) async fn test_connect_deadline() -> Result<(), &'static str> {
             Err(BusyOrCapacity)
         ) {
             return Err("Subsonic startup did not expire without a client or driver");
+        }
+        if worker::Date::now().as_millis().saturating_sub(started) < 1_800 {
+            return Err("Subsonic startup expired before its connect budget");
         }
         socket
             .close_confirmed()
