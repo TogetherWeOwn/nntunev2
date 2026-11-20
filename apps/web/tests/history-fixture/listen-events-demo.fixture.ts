@@ -25,7 +25,9 @@ async function mountDemo(page: Page, { refuseThirdTrack = false, realDelivery = 
 			queueMicrotask(() => this.dispatchEvent(new Event('playing')));
 			return Promise.resolve();
 		};
-		HTMLMediaElement.prototype.pause = function () {};
+		HTMLMediaElement.prototype.pause = function () {
+			queueMicrotask(() => this.dispatchEvent(new Event('pause')));
+		};
 	});
 	await page.goto('/demo/player');
 	await expect(page.locator('html')).toHaveAttribute('data-history-context-read', 'true');
@@ -65,24 +67,29 @@ test('reloading the document finishes the started listen', async ({ page, reques
 	}).toEqual([body, { ...body, event: 'skip' }]);
 });
 
-test('a restored page starts a fresh listen without reopening the auth scope', async ({ page }) => {
-	type RestoreWindow = Window & { __historyEventPosts: number; __nntuneFixtureGrant?: string };
+type FixtureWindow = Window & { __historyEventPosts: number; __nntuneFixtureGrant?: string };
+
+async function observeEventPosts(page: Page) {
 	await page.addInitScript(() => {
-		const fixture = window as RestoreWindow;
+		const fixture = window as FixtureWindow;
 		fixture.__historyEventPosts = 0;
 		const fetchOriginal = window.fetch.bind(window);
 		window.fetch = (input, init) => {
-			// A new start calls fetch synchronously; count it before Playwright routes the request.
+			// Count fetch calls synchronously, before Playwright routes the request.
 			if (String(input).endsWith('/v1/plays/events') && init?.method === 'POST') {
 				fixture.__historyEventPosts++;
 			}
 			return fetchOriginal(input, init);
 		};
 	});
+	return () => page.evaluate(() => (window as FixtureWindow).__historyEventPosts);
+}
+
+test('a restored page starts a fresh listen without reopening the auth scope', async ({ page }) => {
+	const postCount = await observeEventPosts(page);
 	const { bodies, contextLoads } = await mountDemo(page);
-	const postCount = () => page.evaluate(() => (window as RestoreWindow).__historyEventPosts);
 	const pin = (id: string) => page.evaluate((id) => {
-		(window as RestoreWindow).__nntuneFixtureGrant = id;
+		(window as FixtureWindow).__nntuneFixtureGrant = id;
 	}, id);
 	const first = {
 		playback_id: '00000000-0000-0000-0000-000000000000', track_id: 'demo-track', event: 'start', context
@@ -128,19 +135,22 @@ test('a restored page starts a fresh listen without reopening the auth scope', a
 });
 
 test('pause keeps the listen but Next at the queue end abandons it', async ({ page }) => {
+	const postCount = await observeEventPosts(page);
 	const { bodies } = await mountDemo(page);
 	const started = startResponse(page);
 	await page.getByTestId('queue-select-third-light').click();
-	await started;
+	const first: Body = (await started).request().postDataJSON();
 	const toggle = () => page.keyboard.press('k');
 	const status = page.getByTestId('player-status');
 	await toggle();
 	await expect(status).toHaveText('Status: paused');
 	await toggle();
 	await expect(status).toHaveText('Status: playing');
+	expect(await postCount()).toBe(1);
+	expect(bodies).toEqual([first]);
 	await page.getByTestId('player-next').click();
 	await expect(status).toHaveText('Status: ended');
-	await expect.poll(() => bodies).toEqual([bodies[0], { ...bodies[0], event: 'skip' }]);
+	await expect.poll(() => bodies).toEqual([first, { ...first, event: 'skip' }]);
 	await toggle();
 	await expect.poll(() => bodies.map((body) => body.event)).toEqual(['start', 'skip', 'start']);
 	expect(bodies[2].track_id).toBe(bodies[0].track_id);
