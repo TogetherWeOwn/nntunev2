@@ -7136,6 +7136,58 @@ fn respond_document(res: &nntune_subsonic::HttpResponse) -> WorkerResult<Respons
     Ok(response)
 }
 
+#[derive(Clone, Copy)]
+struct SubsonicSnapshotLimits {
+    allocation_bytes: usize,
+    row_text_bytes: usize,
+    total_text_bytes: usize,
+    order_work: crate::subsonic_dispatch::snapshot_order::OrderWork,
+}
+
+// Provisional limits for the dormant adapter's construction step only. The
+// query guards separately bound the source rows, including the retained tracks.
+// These limits do not cover driver allocations, dispatch, or concurrent work.
+const PRODUCTION_SNAPSHOT_LIMITS: SubsonicSnapshotLimits = SubsonicSnapshotLimits {
+    allocation_bytes: 8 * 1024 * 1024,
+    row_text_bytes: 8 * 1024,
+    total_text_bytes: 1024 * 1024,
+    order_work: crate::subsonic_dispatch::snapshot_order::OrderWork {
+        // The SQL row caps bound pairwise comparisons but allow much larger
+        // artist lookup work (a row scan per comparison operand).
+        comparisons: 7_000_000,
+        artist_row_probes: 16_000_000,
+    },
+};
+
+fn subsonic_catalogue_error(query: &str) -> nntune_subsonic::HttpResponse {
+    crate::subsonic_dispatch::render_error(
+        query,
+        nntune_subsonic::envelope::code::GENERIC,
+        "Internal server error.",
+    )
+}
+
+fn construct_production_subsonic_snapshot(
+    artists: &[crate::catalogue::ArtistDbRow],
+    releases: &[crate::catalogue::ReleaseDbRow],
+    tracks: &[crate::catalogue::TrackDbRow],
+    query: &str,
+    limits: SubsonicSnapshotLimits,
+) -> Result<crate::subsonic_snapshot_plan::Snapshot, nntune_subsonic::HttpResponse> {
+    let mut budget =
+        nntune_subsonic::construction_budget::ConstructionBudget::new(limits.allocation_bytes);
+    crate::subsonic_snapshot_plan::build_owned_bounded_snapshot(
+        &mut budget,
+        artists,
+        releases,
+        tracks,
+        limits.order_work,
+        limits.row_text_bytes,
+        limits.total_text_bytes,
+    )
+    .map_err(|_| subsonic_catalogue_error(query))
+}
+
 /// Authenticate before constructing the member-scoped dispatch store.
 /// Playback remains unavailable until an occurrence has a trusted binding
 /// to an application track; the dispatcher never receives audio bytes.
@@ -7219,9 +7271,7 @@ pub async fn subsonic_mount(
                 store
                     .subsonic_member_catalogue(principal.user_id())
                     .await
-                    .map_err(|_| {
-                        core::render_error(merged, code::GENERIC, "Internal server error.")
-                    })
+                    .map_err(|_| subsonic_catalogue_error(merged))
             })
             .await?;
             Ok((principal, rows))
@@ -7253,7 +7303,16 @@ pub async fn subsonic_mount(
         is_admin,
         is_manager: role == "manager",
     };
-    let (artists, albums, songs) = core::build_snapshot(&artist_rows, &release_rows, &track_rows);
+    let (artists, albums, songs) = match construct_production_subsonic_snapshot(
+        &artist_rows,
+        &release_rows,
+        &track_rows,
+        &merged,
+        PRODUCTION_SNAPSHOT_LIMITS,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(response) => return respond_document(&response),
+    };
     let app = SubsonicApp::production(core::ProductionStore::new(
         identity,
         account,
@@ -7474,6 +7533,209 @@ mod tests {
         assert!(require_complete_snapshot_page(cap - 1, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap, SUBSONIC_SNAPSHOT_CAP).is_ok());
         assert!(require_complete_snapshot_page(cap + 1, SUBSONIC_SNAPSHOT_CAP).is_err());
+    }
+
+    fn snapshot_track() -> crate::catalogue::TrackDbRow {
+        crate::catalogue::TrackDbRow {
+            release_mbid: "release".into(),
+            recording_mbid: "recording".into(),
+            title: "café".into(),
+            duration_ms: Some(1_234),
+            medium_no: Some(1),
+            track_no: Some(2),
+            release_title: String::new(),
+            artist_mbid: None,
+            artist_name: None,
+        }
+    }
+
+    fn assert_snapshot_refusal(response: nntune_subsonic::HttpResponse) {
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "application/json");
+        assert!(response.body.len() <= 1024);
+        let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"subsonic-response": {
+                "status": "failed",
+                "version": nntune_subsonic::envelope::API_VERSION,
+                "type": nntune_subsonic::envelope::SERVER_TYPE,
+                "serverVersion": nntune_subsonic::envelope::SERVER_VERSION,
+                "openSubsonic": true,
+                "error": {"code": 0, "message": "Internal server error."}
+            }})
+        );
+    }
+
+    #[test]
+    fn production_mount_returns_snapshot_refusal_before_dispatch() {
+        // The native tests exercise the constructor without a Worker Env.
+        // Pin the mount separately so bypassing it can't keep those tests green.
+        let (mount, _) = include_str!("worker_entry.rs")
+            .split_once("\npub async fn subsonic_mount(")
+            .expect("production mount must exist")
+            .1
+            .split_once("\n}\n")
+            .expect("production mount must have a closing brace");
+        let (before_store, before_dispatch) = mount
+            .split_once("ProductionStore::new(")
+            .expect("dispatch store");
+        assert!(!before_store.contains("app.handle("));
+        assert!(before_dispatch.contains("app.handle("));
+        assert!(!mount.contains("build_snapshot("));
+
+        // Compare the entire account-to-store span, not a substring that could be commented out.
+        let construction: String = before_store
+            .split_once("\n    let account = UserAccount {")
+            .expect("account setup")
+            .1
+            .split_ascii_whitespace()
+            .collect();
+        let checked: String = r#"
+            email, is_admin, is_manager: role == "manager",
+            };
+            let (artists, albums, songs) = match construct_production_subsonic_snapshot(
+                &artist_rows, &release_rows, &track_rows, &merged, PRODUCTION_SNAPSHOT_LIMITS,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(response) => return respond_document(&response),
+            };
+            let app = SubsonicApp::production(core::
+        "#
+        .split_ascii_whitespace()
+        .collect();
+        assert_eq!(construction, checked);
+    }
+
+    #[test]
+    fn production_snapshot_bounds_charge_duplicate_output_bytes() {
+        use crate::subsonic_dispatch::{FLAC_CONTENT_TYPE, FLAC_SUFFIX};
+        use nntune_subsonic::construction_budget::ConstructionBudget;
+        use nntune_subsonic::library::{Song, NOW};
+        use std::mem::{align_of, align_of_val, size_of, size_of_val};
+
+        let track = snapshot_track();
+        let raw = [
+            track.release_mbid.len(),
+            track.recording_mbid.len(),
+            track.title.len(),
+        ];
+        let output = [
+            track.recording_mbid.len(),
+            track.title.len(),
+            track.release_mbid.len(), // cover art
+            track.release_mbid.len(), // album ID: a separate allocation
+            FLAC_CONTENT_TYPE.len(),
+            FLAC_SUFFIX.len(),
+            NOW.len(),
+        ];
+        let row = output.iter().sum::<usize>();
+        let total = row + raw.iter().sum::<usize>();
+        let mut ledger = ConstructionBudget::new(usize::MAX);
+        ledger
+            .charge(1, size_of_val(&track), align_of_val(&track))
+            .unwrap();
+        ledger
+            .charge(1, size_of::<Song>(), align_of::<Song>())
+            .unwrap();
+        for len in raw.into_iter().chain(output) {
+            ledger.charge(len, 1, 1).unwrap();
+        }
+        let allocation = ledger.charged();
+
+        for delta in [-1, 0, 1] {
+            for limits in [
+                SubsonicSnapshotLimits {
+                    row_text_bytes: row.checked_add_signed(delta).unwrap(),
+                    ..PRODUCTION_SNAPSHOT_LIMITS
+                },
+                SubsonicSnapshotLimits {
+                    total_text_bytes: total.checked_add_signed(delta).unwrap(),
+                    ..PRODUCTION_SNAPSHOT_LIMITS
+                },
+                SubsonicSnapshotLimits {
+                    allocation_bytes: allocation.checked_add_signed(delta).unwrap(),
+                    ..PRODUCTION_SNAPSHOT_LIMITS
+                },
+            ] {
+                let tracks = std::slice::from_ref(&track);
+                let snapshot =
+                    construct_production_subsonic_snapshot(&[], &[], tracks, "f=json", limits);
+                if delta < 0 {
+                    assert_snapshot_refusal(snapshot.unwrap_err());
+                } else {
+                    let actual = snapshot.unwrap();
+                    let expected = crate::subsonic_dispatch::build_snapshot(&[], &[], tracks);
+                    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_snapshot_order_work_refuses_over_budget() {
+        use crate::catalogue::ArtistDbRow;
+        use crate::subsonic_dispatch::snapshot_order::OrderWork;
+
+        let artists = ["b", "a"].map(|id| ArtistDbRow {
+            mbid: id.into(),
+            name: id.into(),
+            sort_name: id.into(),
+            artist_type: None,
+            country: None,
+        });
+        // One comparison with two lookups over two artist rows.
+        for (comparisons, probes) in [(0, 4), (1, 3), (1, 4), (2, 5)] {
+            let limits = SubsonicSnapshotLimits {
+                order_work: OrderWork {
+                    comparisons,
+                    artist_row_probes: probes,
+                },
+                ..PRODUCTION_SNAPSHOT_LIMITS
+            };
+            let snapshot =
+                construct_production_subsonic_snapshot(&artists, &[], &[], "f=json", limits);
+            if comparisons == 0 || probes < 4 {
+                assert_snapshot_refusal(snapshot.unwrap_err());
+            } else {
+                assert_eq!(snapshot.unwrap().0[0].id, "a");
+            }
+        }
+    }
+
+    #[test]
+    fn production_snapshot_preserves_empty_and_occurrence_identity() {
+        use crate::subsonic_dispatch::ProductionStore;
+
+        let snapshot = |tracks: &[crate::catalogue::TrackDbRow]| {
+            construct_production_subsonic_snapshot(&[], &[], tracks, "", PRODUCTION_SNAPSHOT_LIMITS)
+                .unwrap()
+        };
+        let (artists, albums, songs) = snapshot(&[]);
+        assert!(artists.is_empty() && albums.is_empty() && songs.is_empty());
+
+        let track = snapshot_track();
+        let duplicate = crate::catalogue::TrackDbRow {
+            medium_no: Some(2),
+            ..track.clone()
+        };
+        let unique = crate::catalogue::TrackDbRow {
+            recording_mbid: "other".into(),
+            track_no: Some(3),
+            ..track.clone()
+        };
+        let tracks = [duplicate, unique, track];
+        let (_, _, songs) = snapshot(&tracks);
+        assert_eq!(
+            songs
+                .iter()
+                .map(|s| (s.id.as_str(), s.disc, s.track))
+                .collect::<Vec<_>>(),
+            [("recording", 1, 2), ("other", 1, 3), ("recording", 2, 2),]
+        );
+        assert!(ProductionStore::resolve_song_occurrence(&tracks, &songs, "recording").is_none());
+        let resolved = ProductionStore::resolve_song_occurrence(&tracks, &songs, "other").unwrap();
+        assert!(std::ptr::eq(resolved, &songs[1]));
     }
 
     #[test]
