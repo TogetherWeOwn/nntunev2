@@ -57,7 +57,6 @@ pub mod jobs;
 pub mod library;
 pub mod matching;
 pub mod metering;
-pub mod multipart;
 pub mod newznab;
 pub mod nzb_fetch;
 pub mod nzb_intake;
@@ -1587,6 +1586,8 @@ fn owned_checkpoint<E>(
         Err(_) => Err(()),
     }
 }
+
+pub mod multipart;
 
 #[cfg(test)]
 mod tests {

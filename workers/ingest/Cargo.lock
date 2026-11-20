@@ -669,6 +669,7 @@ dependencies = [
  "nntune-ssrf-guard",
  "nntune-test-fixtures",
  "nntune-test-nntp",
+ "quick-xml",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

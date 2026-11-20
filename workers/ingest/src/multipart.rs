@@ -8,8 +8,6 @@ use sha2::{Digest, Sha256};
 use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 
 pub const PART_BYTES: usize = 5_244_160;
-pub const CHECKSUM_ALGORITHM: &str = "SHA256";
-pub const CHECKSUM_TYPE: &str = "COMPOSITE";
 pub const MAX_COMPLETION_BODY: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,11 +84,10 @@ impl<'a> Plan<'a> {
             }
             composite.update(part.digest);
         }
-        let checksum = format!("{}-{count}", STANDARD.encode(composite.finalize()));
         Ok(Completion {
             plan: self,
             parts,
-            checksum,
+            checksum: format!("{}-{count}", STANDARD.encode(composite.finalize())),
         })
     }
 }
@@ -217,13 +214,25 @@ impl<'a> Completion<'a> {
         if status != 200 {
             return Err(MultipartError::CompletionStatus);
         }
+        use quick_xml::events::Event::{Empty, Eof, Start};
         use MultipartError::{Checksum, CompletionBody, EmbeddedError};
         const S3_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
-        // Block DTDs before the UTF-8 parser can process entity declarations.
         let dtd = b"<!DOCTYPE";
         if body.len() > MAX_COMPLETION_BODY || body.windows(dtd.len()).any(|bytes| bytes == dtd) {
             return Err(CompletionBody);
         }
+        // Check raw attributes before namespace resolution can discard duplicates.
+        let mut tokens = quick_xml::Reader::from_reader(body);
+        loop {
+            match tokens.read_event().map_err(|_| CompletionBody)? {
+                Start(tag) | Empty(tag) if tag.attributes().any(|attr| attr.is_err()) => {
+                    return Err(CompletionBody)
+                }
+                Eof => break,
+                _ => {}
+            }
+        }
+        let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
         let reader = ParserConfig::new()
             .override_encoding(Some(Encoding::Utf8))
             .allow_multiple_root_elements(false)

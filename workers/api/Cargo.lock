@@ -902,6 +902,7 @@ dependencies = [
  "nntune-core",
  "nntune-logging",
  "nntune-ssrf-guard",
+ "quick-xml",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

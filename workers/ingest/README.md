@@ -390,7 +390,7 @@ be wired to a live transport as if it were approved policy.
 `src/nzb_fetch.rs` is a **library-only policy guard and buffered simulator**
 for the admin-ingest path, not a live SSRF boundary (module at
 `src/nzb_fetch.rs:1-73`, exported as `pub mod nzb_fetch` in
-`src/lib.rs:62`). No ingest route calls it (`fetch_nzb` at
+`src/lib.rs:60`). No ingest route calls it (`fetch_nzb` at
 `src/nzb_fetch.rs:414` has no non-test call site; only
 `tests/nzb_fetch_ssrf_guard.rs` calls it); no runtime resolver or
 HTTPS transport is provided (no non-test `FetchTransport`

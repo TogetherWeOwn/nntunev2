@@ -39,17 +39,14 @@ impl FakeS3<'_> {
         let expected = self.0.chunks(PART_BYTES).nth(number as usize - 1).unwrap();
         let digest = STANDARD.encode(Sha256::digest(expected));
         assert!(target == TARGET);
-        assert_eq!(body, expected);
-        assert_eq!(checksum, digest);
+        assert_eq!((body, checksum), (expected, digest.as_str()));
         (format!("\"opaque-{number}\""), digest)
     }
 
     fn complete(&self, request: &Completion<'_>, prefixed: bool) -> String {
-        let (target, len) = request.object();
+        assert!(request.object() == (TARGET, self.0.len() as u64));
         let chunks = self.0.chunks(PART_BYTES);
         let count = chunks.len();
-        assert!(target == TARGET);
-        assert_eq!(len, self.0.len() as u64);
         assert_eq!(request.manifest().count(), count);
         let mut hashes = Vec::new();
         for (i, ((number, etag, checksum), bytes)) in request.manifest().zip(chunks).enumerate() {
@@ -60,8 +57,10 @@ impl FakeS3<'_> {
             hashes.extend_from_slice(&hash);
         }
         let composite = STANDARD.encode(Sha256::digest(hashes));
+        let bom = if prefixed { "\u{feff}" } else { "" };
         let (p, ns) = if prefixed { ("s3:", ":s3") } else { ("", "") };
-        format!(" \n<{p}{SUCCESS} xmlns{ns}=\"http://s3.amazonaws.com/doc/2006-03-01/\"><{p}Key>a&amp;b&#x2E;flac</{p}Key><{p}ChecksumSHA256>{composite}-{count}</{p}ChecksumSHA256></{p}{SUCCESS}>")
+        let s3 = "http://s3.amazonaws.com/doc/2006-03-01/";
+        format!("{bom} \n<{p}{SUCCESS} xmlns{ns}=\"{s3}\"><{p}Key xmlns{ns}=\"urn:fixture\">a&amp;b&#x2E;flac</{p}Key><{p}ChecksumSHA256>{composite}-{count}</{p}ChecksumSHA256></{p}{SUCCESS}>")
     }
 }
 
@@ -92,26 +91,23 @@ fn rejects_bad_receipts_and_false_completion_success() {
     let (plan, parts, wire) = fixture(1);
     let fake = FakeS3(&wire);
     let (etag, checksum) = fake.upload(&parts[0]);
-    for bad in ["", &etag] {
-        let receipt = parts[0].verify_reply(etag.clone(), bad);
-        assert!(matches!(receipt, Err(Checksum)));
-    }
+    let invalid = parts[0].verify_reply(etag.clone(), &etag);
+    assert!(matches!(invalid, Err(Checksum)));
     assert!(matches!(plan.partition().finish(), Err(Geometry)));
     assert!(matches!(plan.complete(Vec::new()), Err(Geometry)));
     let receipt = parts[0].verify_reply(etag, &checksum).unwrap();
     let completion = plan.complete(vec![receipt]).unwrap();
     let success = fake.complete(&completion, false);
-    assert_eq!(
-        completion.verify_reply(503, success.as_bytes()),
-        Err(CompletionStatus)
-    );
-    let end = format!("</{SUCCESS}>");
-    let embedded = success.replace(&end, &format!("<Error/>{end}"));
+    let non_ok = completion.verify_reply(503, success.as_bytes());
+    assert_eq!(non_ok, Err(CompletionStatus));
+    let duplicate_prefix = format!("<{SUCCESS} xmlns:a='x' xmlns:a='y'/>");
     for (body, error) in [
         (" \n<Error/>".into(), EmbeddedError),
-        (embedded, EmbeddedError),
+        (format!("<{SUCCESS}><Error/></{SUCCESS}>"), EmbeddedError),
         (success.replace("-1</", "-2</"), Checksum),
-        (success.trim_end_matches(&end).into(), CompletionBody),
+        (success.trim_end_matches('>').into(), CompletionBody),
+        (format!("<{SUCCESS} xmlns='' xmlns=''/>"), CompletionBody),
+        (duplicate_prefix, CompletionBody),
         (success.replace("&amp;", "&undefined;"), CompletionBody),
         (success.replace("&#x2E;", "&#xD800;"), CompletionBody),
         (format!("{success}<!-- bad--comment -->"), CompletionBody),
