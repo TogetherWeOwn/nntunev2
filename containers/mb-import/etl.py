@@ -37,7 +37,7 @@ RECORDING_ID, RECORDING_GID, RECORDING_NAME, RECORDING_LENGTH = 1, 2, 3, 5
 MEDIUM_ID, MEDIUM_RELEASE_ID, MEDIUM_POSITION = 1, 2, 3
 TRACK_ID, TRACK_RECORDING_ID, TRACK_MEDIUM_ID, TRACK_POSITION = 1, 3, 4, 5
 URL_ID, URL_GID, URL_URL = 1, 2, 3
-LINK_TYPE_ID, LINK_TYPE_GID, LINK_TYPE_NAME = 1, 4, 7
+LINK_TYPE_ID, LINK_TYPE_GID, LINK_TYPE_ENTITY0, LINK_TYPE_ENTITY1, LINK_TYPE_NAME = 1, 4, 5, 6, 7
 LINK_ID, LINK_LINK_TYPE_ID = 1, 2
 ATTR_TYPE_ID, ATTR_TYPE_GID = 1, 5
 LINK_ATTR_LINK_ID, LINK_ATTR_ATTR_TYPE_ID = 1, 2
@@ -178,7 +178,7 @@ def rows(path: Path, expected: int):
 def load(db: sqlite3.Connection, path: Path, expected: int, select_positions: tuple[int, ...], table: str, columns: str, convert=None) -> int:
     count = 0
     batch = []
-    statement = f"INSERT INTO {table} ({columns}) VALUES ({','.join('?' for _ in select_positions)})"
+    statement = f"INSERT INTO {table} ({columns}) VALUES ({','.join('?' for _ in columns.split(','))})"
     for row in rows(path, expected):
         selected = tuple(None if get(row, position) == NULL else get(row, position) for position in select_positions)
         if convert is not None:
@@ -221,7 +221,7 @@ def load_filtered(db: sqlite3.Connection, path: Path, expected: int, select_posi
     return count
 
 
-def as_ints(context: str, integer_fields: tuple[int, ...], nullable_fields: tuple[int, ...] = ()):
+def as_ints(context: str, integer_fields: tuple[int, ...], nullable_fields: tuple[int, ...] = (), *, mark_canonical_id=False):
     def convert(values, line_number):
         converted = list(values)
         for index in integer_fields:
@@ -230,6 +230,9 @@ def as_ints(context: str, integer_fields: tuple[int, ...], nullable_fields: tupl
                 raise ValueError(f"{context} row {line_number}: required integer is NULL")
             if item is not None:
                 converted[index] = required_int(item, f"{context} row {line_number}")
+        if mark_canonical_id:
+            # Keep legacy integer joins; the sidecar already bounds referenced IDs.
+            converted.append(str(converted[0]) == values[0])
         return tuple(converted)
     return convert
 
@@ -346,11 +349,8 @@ def recording_work_values(values, line_number):
 
 
 def validate_recording_work_row(row):
-    recording_gid, _, type_name = row
-    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", recording_gid, re.IGNORECASE):
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", row[0], re.IGNORECASE):
         raise ValueError("l_recording_work: invalid recording MBID")
-    if not validate_copy_name(type_name, "l_recording_work link_type").strip():
-        raise ValueError("l_recording_work link_type: name must not be empty")
     return row
 
 
@@ -401,12 +401,15 @@ def main() -> int:
                     CREATE TABLE release_unknown_country (release INTEGER NOT NULL, year INTEGER);
                     CREATE INDEX release_unknown_country_id ON release_unknown_country(release);
                     CREATE TABLE release (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, credit INTEGER NOT NULL, group_id INTEGER NOT NULL);
-                    CREATE TABLE recording (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, length INTEGER);
+                    CREATE TABLE recording (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, length INTEGER, canonical_id INTEGER NOT NULL);
                     CREATE TABLE medium (id INTEGER PRIMARY KEY, release INTEGER NOT NULL, position INTEGER NOT NULL);
                     CREATE TABLE track (id INTEGER PRIMARY KEY, recording INTEGER NOT NULL, medium INTEGER NOT NULL, position INTEGER NOT NULL);
                     CREATE INDEX track_recording_id ON track(recording);
                     CREATE TABLE url (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, url TEXT NOT NULL);
-                    CREATE TABLE link_type (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL);
+                    CREATE TABLE link_type (
+                        id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL,
+                        entity0 TEXT, entity1 TEXT, canonical_id INTEGER NOT NULL, name_key TEXT
+                    );
                     CREATE TABLE link (id INTEGER PRIMARY KEY, link_type INTEGER NOT NULL);
                     CREATE TABLE link_attribute_type (id INTEGER PRIMARY KEY, gid TEXT NOT NULL);
                     CREATE TABLE link_attribute (link INTEGER NOT NULL, attribute_type INTEGER NOT NULL);
@@ -449,7 +452,11 @@ def main() -> int:
                 counts["release_country"] = load(db, dump_dir / "release_country", FIELD_COUNTS["release_country"], (RELEASE_COUNTRY_RELEASE_ID, RELEASE_COUNTRY_YEAR), "release_country", "release,year", as_ints("release_country", (0, 1), (1,)))
                 counts["release_unknown_country"] = load(db, dump_dir / "release_unknown_country", FIELD_COUNTS["release_unknown_country"], (RELEASE_UNKNOWN_COUNTRY_RELEASE_ID, RELEASE_UNKNOWN_COUNTRY_YEAR), "release_unknown_country", "release,year", as_ints("release_unknown_country", (0, 1), (1,)))
                 counts["release"] = load(db, dump_dir / "release", FIELD_COUNTS["release"], (RELEASE_ID, RELEASE_GID, RELEASE_NAME, RELEASE_CREDIT_ID, RELEASE_GROUP_ID), "release", "id,gid,name,credit,group_id", as_ints("release.id", (0, 3, 4)))
-                counts["recording"] = load(db, dump_dir / "recording", FIELD_COUNTS["recording"], (RECORDING_ID, RECORDING_GID, RECORDING_NAME, RECORDING_LENGTH), "recording", "id,gid,name,length", as_ints("recording.id", (0, 3), (3,)))
+                counts["recording"] = load(
+                    db, dump_dir / "recording", FIELD_COUNTS["recording"],
+                    (RECORDING_ID, RECORDING_GID, RECORDING_NAME, RECORDING_LENGTH),
+                    "recording", "id,gid,name,length,canonical_id", as_ints("recording.id", (0, 3), (3,), mark_canonical_id=True),
+                )
                 counts["medium"] = load(db, dump_dir / "medium", FIELD_COUNTS["medium"], (MEDIUM_ID, MEDIUM_RELEASE_ID, MEDIUM_POSITION), "medium", "id,release,position", as_ints("medium.id", (0, 1, 2)))
                 counts["track"] = load(db, dump_dir / "track", FIELD_COUNTS["track"], (TRACK_ID, TRACK_RECORDING_ID, TRACK_MEDIUM_ID, TRACK_POSITION), "track", "id,recording,medium,position", as_ints("track.id", (0, 1, 2, 3)))
                 # Relationship slice: resolve the allowlisted link-type and
@@ -458,7 +465,11 @@ def main() -> int:
                 # only allowlisted links. The kept-link id set is small
                 # (allowlisted types only), so the downstream membership
                 # filters are set lookups, not joins.
-                counts["link_type"] = load(db, dump_dir / "link_type", FIELD_COUNTS["link_type"], (LINK_TYPE_ID, LINK_TYPE_GID, LINK_TYPE_NAME), "link_type", "id,gid,name", as_ints("link_type.id", (0,)))
+                counts["link_type"] = load(
+                    db, dump_dir / "link_type", FIELD_COUNTS["link_type"],
+                    (LINK_TYPE_ID, LINK_TYPE_GID, LINK_TYPE_NAME, LINK_TYPE_ENTITY0, LINK_TYPE_ENTITY1),
+                    "link_type", "id,gid,name,entity0,entity1,canonical_id", as_ints("link_type.id", (0,), mark_canonical_id=True),
+                )
                 counts["link_attribute_type"] = load(db, dump_dir / "link_attribute_type", FIELD_COUNTS["link_attribute_type"], (ATTR_TYPE_ID, ATTR_TYPE_GID), "link_attribute_type", "id,gid", as_ints("link_attribute_type.id", (0,)))
 
                 def link_type_id(gid: str, what: str) -> int:
@@ -645,20 +656,36 @@ def main() -> int:
                     raise ValueError(f"music-video link references missing recording ({bad_l_rr[0]}, {bad_l_rr[1]})")
                 bad_recording_work = db.execute("""
                     SELECT CASE
-                        WHEN r.id IS NULL THEN 'recording ' || l.recording
-                        WHEN w.id IS NULL THEN 'work ' || l.work
-                        WHEN k.id IS NULL THEN 'link ' || l.link
-                        ELSE 'link_type ' || k.link_type
+                        WHEN r.id IS NULL THEN 'references missing recording ' || l.recording
+                        WHEN w.id IS NULL THEN 'references missing work ' || l.work
+                        WHEN k.id IS NULL THEN 'references missing link ' || l.link
+                        WHEN lt.id IS NULL THEN 'references missing link_type ' || k.link_type
+                        WHEN NOT r.canonical_id THEN 'invalid recording id ' || r.id
+                        WHEN NOT lt.canonical_id THEN 'invalid link_type id ' || lt.id
+                        ELSE 'link_type ' || lt.id || ' is not recording-to-work'
                     END
                     FROM l_recording_work l
                     LEFT JOIN recording r ON r.id=l.recording
                     LEFT JOIN work w ON w.id=l.work
                     LEFT JOIN recording_work_link k ON k.id=l.link
                     LEFT JOIN link_type lt ON lt.id=k.link_type
-                    WHERE r.id IS NULL OR w.id IS NULL OR k.id IS NULL OR lt.id IS NULL LIMIT 1
+                    WHERE r.id IS NULL OR w.id IS NULL OR k.id IS NULL OR lt.id IS NULL
+                        OR NOT r.canonical_id OR NOT lt.canonical_id
+                        OR lt.entity0 IS NOT 'recording' OR lt.entity1 IS NOT 'work'
+                    LIMIT 1
                 """).fetchone()
                 if bad_recording_work:
-                    raise ValueError(f"l_recording_work references missing {bad_recording_work[0]}")
+                    raise ValueError(f"l_recording_work: {bad_recording_work[0]}")
+                # Decode only referenced type names, once per type. Legacy URL
+                # and music-video projections still use the raw name and GIDs.
+                for type_id, name in db.execute("""
+                    SELECT id,name FROM link_type
+                    WHERE id IN (SELECT link_type FROM recording_work_link)
+                """).fetchall():
+                    name_key = validate_copy_name(name, "l_recording_work link_type")
+                    if not name_key.strip():
+                        raise ValueError("l_recording_work link_type: name must not be empty")
+                    db.execute("UPDATE link_type SET name_key=? WHERE id=?", (name_key, type_id))
                 bad_isrc_recording = db.execute("SELECT i.recording FROM isrc i LEFT JOIN recording r ON r.id=i.recording WHERE r.id IS NULL LIMIT 1").fetchone()
                 if bad_isrc_recording:
                     raise ValueError(f"isrc references missing recording {bad_isrc_recording[0]}")
@@ -847,15 +874,17 @@ def main() -> int:
                 """
                 work_count = insert_select(db, work_query, output_dir / curated_name("work"), updated_at)
 
-                # Directed triples; distinct link IDs may encode the same triple.
+                # Group directed triples by decoded type name, choosing one
+                # deterministic COPY spelling without emitting raw delimiters.
                 recording_work_query = """
-                    SELECT DISTINCT r.gid,w.gid,lt.name
+                    SELECT r.gid,w.gid,MIN(lt.name)
                     FROM l_recording_work l
                     JOIN recording r ON r.id=l.recording
                     JOIN work w ON w.id=l.work
                     JOIN recording_work_link k ON k.id=l.link
                     JOIN link_type lt ON lt.id=k.link_type
-                    ORDER BY r.gid,w.gid,lt.name
+                    GROUP BY r.gid,w.gid,lt.name_key
+                    ORDER BY r.gid,w.gid,lt.name_key
                 """
                 recording_work_count = insert_select(
                     db, recording_work_query, output_dir / curated_name("recording_work"),

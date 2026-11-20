@@ -343,8 +343,29 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
         self.edges.write_bytes(b"".join(reversed(self.edges.read_bytes().splitlines(keepends=True))))
         self.assertEqual(self.run_streamed_etl(), expected)
 
+    def test_equivalent_copy_type_names_collapse_in_decoded_order(self):
+        types = self.raw / "link_type"
+        performance = types.read_bytes().splitlines(keepends=True)[-2]
+        with types.open("ab") as stream:
+            stream.write(performance.replace(b"513\t", b"515\t", 1).replace(
+                b"0006-4006-8006-000000000006", b"0008-4008-8008-000000000008",
+            ).replace(b"\tperformance\t", b"\t\\160erformance\t"))
+        link = self.raw / "link"
+        link.write_bytes(link.read_bytes().replace(b"217\t513", b"217\t515"))
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plain = (self.curated / self.output).read_bytes()
+        self.assertEqual([row.split(b"\t")[2] for row in plain.splitlines()],
+                         [b"performance", b"medley", b"\\160erformance", b"performance"])
+        self.edges.write_bytes(b"".join(reversed(self.edges.read_bytes().splitlines(keepends=True))))
+        self.assertEqual(self.run_streamed_etl(), plain)
+
     def test_empty_table_emits_empty_sidecar_in_both_modes(self):
         self.edges.write_bytes(b"")
+        # Unreferenced keys retain the legacy loaders' acceptance rules.
+        for table, key in (("recording", b"50"), ("link_type", b"504")):
+            path = self.raw / table
+            path.write_bytes(path.read_bytes().replace(key + b"\t", b"+" + key + b"\t", 1))
         result = self.run_etl(self.raw)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.curated / self.output).read_bytes(), b"")
@@ -369,8 +390,13 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
             (self.edges.name, edges.replace(b"401\t216\t51", b"401\t216\t+51"), "invalid recording"),
             (self.edges.name, edges.replace(b"401\t216\t51\t80", b"401\t216\t51\t2147483648"), "invalid work"),
             ("link", links.replace(b"216\t513", b"216\t999"), "references missing link_type 999"),
+            ("link", links.replace(b"216\t513", b"216\t506"), "link_type 506 is not recording-to-work"),
             ("link", links.replace(b"216\t513", b"216\t+513"), "invalid link_type"),
             ("link", links + links.splitlines(keepends=True)[-1], "UNIQUE constraint failed: recording_work_link.id"),
+            ("link_type", types.replace(b"\n513\t", b"\n+513\t"), "invalid link_type id 513"),
+            ("link_type", types.replace(b"\trecording\twork\tperformance", b"\t\\N\twork\tperformance"),
+             "link_type 513 is not recording-to-work"),
+            ("recording", recordings.replace(b"\n51\t", b"\n+51\t"), "invalid recording id 51"),
             ("link_type", types.replace(b"\tperformance\t", b"\t\t"), "name must not be empty"),
             ("link_type", types.replace(b"\tperformance\t", b"\t\\q\t"), "invalid COPY text in name"),
             ("recording", recordings.replace(b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD", b"bad"), "invalid recording MBID"),
