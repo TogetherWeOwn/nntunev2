@@ -360,9 +360,13 @@ mod tests {
             playback_lease_acquire_statement(),
             "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
         );
+    }
+
+    #[test]
+    fn touch_statement_requires_a_live_lease() {
         assert_eq!(
             playback_lease_touch_statement(),
-            "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 RETURNING expires_at"
+            "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND playback_leases.expires_at > $6 RETURNING expires_at"
         );
     }
 
