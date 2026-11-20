@@ -323,7 +323,7 @@ async function failFavoritesStorage(page: Page, operation: 'getItem' | 'setItem'
 				Storage.prototype.setItem = function (key, value) {
 					if (this === window.localStorage && key.startsWith(`${base}.`)) {
 						Reflect.set(window, '__favoritesWriteRejected', true);
-							throw new DOMException('Favorites writes unavailable', 'QuotaExceededError');
+						throw new DOMException('Favorites writes unavailable', 'QuotaExceededError');
 					}
 					setItem.call(this, key, value);
 				};
