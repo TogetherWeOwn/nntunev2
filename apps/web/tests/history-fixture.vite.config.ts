@@ -1,3 +1,4 @@
+import { json } from 'node:stream/consumers';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, mergeConfig, normalizePath } from 'vite';
 import appConfig from '../vite.config';
@@ -35,6 +36,21 @@ export default defineConfig(async (env) => {
 		plugins: [{
 			name: 'acceptance-history-live-store',
 			enforce: 'pre',
+			configurePreviewServer(server) {
+				// Observe real keepalive delivery after reload, without a browser route interceptor.
+				const events = new Map<string, unknown[]>();
+				server.middlewares.use(async (req, res, next) => {
+					const url = new URL(req.url ?? '/', 'http://localhost');
+					if (url.pathname !== '/v1/plays/events') return next();
+					res.setHeader('content-type', 'application/json');
+					if (req.method === 'GET') return res.end(JSON.stringify(events.get(url.searchParams.get('playback_id') ?? '') ?? []));
+					if (req.method !== 'POST' || !(Number(req.headers['content-length']) <= 1024)) return res.writeHead(400).end();
+					const event = await json(req).catch(() => null) as { playback_id?: string } | null;
+					if (typeof event?.playback_id !== 'string') return res.writeHead(400).end();
+					events.set(event.playback_id, [...(events.get(event.playback_id) ?? []), event]);
+					res.end('{}');
+				});
+			},
 			transform(code, id) {
 				if (normalizePath(id) !== target) return;
 				const cleanup = '\t\t\t// A copy settling after teardown must not resurrect state.';

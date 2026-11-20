@@ -1,7 +1,7 @@
 /**
  * Best-effort listen-event telemetry (`POST /v1/plays/events`).
  *
- * Pending work lives in memory and cannot outlive the player page's session scope.
+ * Pending work lives in memory and remains bound to the original playback session.
  */
 
 import type { ListenContext } from './listenContext.js';
@@ -26,6 +26,8 @@ export interface ListenEventSenderOptions {
 
 export interface ListenEventSender {
 	send(event: ListenEvent): void;
+	/** Reject new work and finish queued first attempts without retrying. */
+	close(): Promise<void>;
 	/** Permanently stop sending and abort pending work. */
 	dispose(): void;
 }
@@ -64,12 +66,20 @@ export function createListenEventSender({
 }: ListenEventSenderOptions): ListenEventSender {
 	const url = `${baseUrl.replace(/\/+$/, '')}/v1/plays/events`;
 	// Ordered chain and immutable binding for each playback.
-	const chains = new Map<string, { tail: Promise<void>; accepted: boolean; binding: string }>();
+	const chains = new Map<string, { tail?: Promise<void>; accepted: boolean; binding: string }>();
 	const controller = new AbortController();
+	const retries = new AbortController();
 	const { signal } = controller;
 	function dispose(): void {
 		controller.abort();
+		retries.abort();
 		chains.clear();
+	}
+
+	async function close(): Promise<void> {
+		retries.abort();
+		await Promise.all([...chains.values()].map(({ tail }) => tail));
+		dispose();
 	}
 
 	function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -105,8 +115,9 @@ export function createListenEventSender({
 			} catch {
 				// Network failure: retry within the same scope and budget.
 			}
-			if (n >= retryDelaysMs.length) break;
-			await sleep(Math.max(retryDelaysMs[n], wait), signal);
+			if (retries.signal.aborted || n >= retryDelaysMs.length) break;
+			await sleep(Math.max(retryDelaysMs[n], wait), retries.signal);
+			if (retries.signal.aborted) break;
 		}
 		return false;
 	}
@@ -114,37 +125,37 @@ export function createListenEventSender({
 	return {
 		send(event) {
 			try {
-				if (signal.aborted || !isValidTrackId(event.track_id)) return;
+				if (retries.signal.aborted || !isValidTrackId(event.track_id)) return;
 				let chain = chains.get(event.playback_id);
 				if (!chain) {
 					if (event.event !== 'start' || chains.size >= MAX_PENDING_PLAYBACKS) return;
 					const binding = context.current();
 					if (!binding) return;
-					chain = { tail: Promise.resolve(), accepted: false, binding };
+					chain = { accepted: false, binding };
 					chains.set(event.playback_id, chain);
 				}
 				const owner = chain;
 				const isStart = event.event === 'start';
-				const next: Promise<void> = owner.tail
-					.then(async () => {
-						if (!isStart && !owner.accepted) return;
-						const ok = await attempt(event, owner.binding);
-						if (isStart) owner.accepted = ok;
-					})
+				const send = async () => {
+					if (!isStart && !owner.accepted) return;
+					const ok = await attempt(event, owner.binding);
+					if (isStart) owner.accepted = ok;
+				};
+				// Dispatch ready keepalive fetches before pagehide returns.
+				const next: Promise<void> = (owner.tail ? owner.tail.then(send) : send())
 					.catch(() => {})
 					.then(() => {
-						// Forget the playback once nothing more can follow: after its
-						// terminal, or when the start was never accepted.
 						if (chains.get(event.playback_id) !== owner) return;
-						if (!isStart ? owner.tail === next : !owner.accepted) {
-							chains.delete(event.playback_id);
-						}
+						if (isStart && !owner.accepted) chains.delete(event.playback_id);
+						else if (owner.tail === next && isStart) delete owner.tail;
+						else if (owner.tail === next) chains.delete(event.playback_id);
 					});
 				owner.tail = next;
 			} catch {
 				// Telemetry never throws into playback.
 			}
 		},
+		close,
 		dispose
 	};
 }
