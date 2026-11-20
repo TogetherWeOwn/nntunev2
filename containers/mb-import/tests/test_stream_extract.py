@@ -218,6 +218,8 @@ class RecordingAliasProjectionTest(ProjectionTestCase):
     output = "mbdump-recording_alias.tsv"
 
     def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        # Both English aliases survive: echo reprise sorts before Écho only
+        # after decoding the latter's escaped COPY spelling.
         self.assert_alias_output_matches_in_both_modes()
 
     def test_conflicting_primaries_break_ties_by_sort_name_then_id(self):
@@ -225,10 +227,13 @@ class RecordingAliasProjectionTest(ProjectionTestCase):
         rows = aliases.read_bytes().splitlines(keepends=True)
         # MusicBrainz permits only one primary per non-null locale. Exercise
         # the curator's fallback ordering separately from the normal fixture.
-        aliases.write_bytes(b"".join(
-            row.removesuffix(b"f\tf\n") + b"t\tf\n" if row.startswith((b"708\t", b"710\t")) else row
-            for row in rows
-        ))
+        for index, row in enumerate(rows):
+            if row.startswith(b"708\t"):
+                # Echo\101 ranks below Echo\tMix raw, but above it decoded.
+                row = row.replace(b"\tAlternate\t", b"\tEcho\\101\t", 1)
+            if row.startswith((b"708\t", b"710\t")):
+                rows[index] = row.removesuffix(b"f\tf\n") + b"t\tf\n"
+        aliases.write_bytes(b"".join(rows))
         self.assert_alias_output_matches_in_both_modes()
 
     def test_alias_id_breaks_ties_independently_of_rowid(self):
