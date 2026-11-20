@@ -2267,8 +2267,6 @@ where
     )
 }
 
-// Prepared for direct testing only; preference routes remain unregistered.
-#[allow(dead_code)]
 async fn me_taste_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -7790,6 +7788,7 @@ where
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
         ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
+        ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
         ("PUT", "/v1/me/private-session") => me_private_session(ctx, req).await,
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
@@ -16240,7 +16239,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_taste_put_replaces_and_replays_with_server_time() {
+    fn taste_put_handler_replaces_and_replays_with_server_time() {
         use serde_json::json;
         let h = harness();
         let stored = |owner: &str| {
@@ -16298,7 +16297,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_taste_put_resolves_only_visible_kind_specific_targets() {
+    fn taste_put_handler_resolves_only_visible_kind_specific_targets() {
         use serde_json::json;
         let h = harness();
         let req = taste_put_request(&h, "alice");
@@ -16366,7 +16365,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_taste_put_rejects_invalid_bodies_and_fails_closed() {
+    fn taste_put_handler_rejects_invalid_bodies_and_fails_closed() {
         let h = harness();
         let mut req = taste_put_request(&h, "alice");
         h.store
@@ -17024,11 +17023,15 @@ mod tests {
     }
 
     #[test]
-    fn taste_list_dispatch_has_exact_session_only_routing() {
+    fn taste_dispatch_has_exact_session_only_routing() {
         use crate::native_rest::{scope_for_operation, RouteDecision};
         let h = peppered_harness();
-        seed_user(&h, "alice", "alice@example.com");
-        let cookie = magic_login(&h, "alice@example.com");
+        let mut req = taste_put_request(&h, "alice");
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
+        let cookie = req.cookie.take().unwrap();
         let minted = mint_call(
             &h,
             &cookie,
@@ -17036,40 +17039,125 @@ mod tests {
         );
         assert_eq!(minted.status, 201, "{}", minted.body);
         let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
-        let mut req = Request {
-            method: "GET".into(),
-            path: "/v1/me/taste".into(),
-            cookie: None,
-            origin: Some(ORIGIN.into()),
-            authorization: Some(format!("Bearer {key}")),
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        let path = req.path.as_str();
-        assert!(is_known_path(path));
-        assert_eq!(scope_for_operation("GET", path), RouteDecision::SessionOnly);
+        req.authorization = Some(format!("Bearer {key}"));
+        assert!(is_known_path(&req.path));
         let before = *h.store.native_credential_lookups.borrow();
-        for session in [None, Some(cookie.clone())] {
-            req.cookie = session;
-            let denied = block_on(handle(&h.ctx(), &req));
-            assert_eq!((denied.status, denied.body), (404, not_found().body));
+        for method in ["PUT", "GET"] {
+            req.method = method.into();
+            assert_eq!(
+                scope_for_operation(method, &req.path),
+                RouteDecision::SessionOnly
+            );
+            for session in [None, Some(cookie.clone())] {
+                req.cookie = session;
+                let denied = block_on(handle(&h.ctx(), &req));
+                assert_eq!((denied.status, denied.body), (404, not_found().body));
+            }
         }
         assert_eq!(*h.store.native_credential_lookups.borrow(), before);
+        assert!(h.store.taste_rows.borrow().is_empty());
         req.method = "OPTIONS".into();
         req.cookie = None;
+        req.body.clear();
         for origin in [Some(ORIGIN), None, Some("https://other.example")] {
             req.origin = origin.map(str::to_string);
             let response = block_on(handle(&h.ctx(), &req));
-            let control = h.call_full("OPTIONS", "/v1/me/private-session", None, None, origin);
-            assert_eq!(response.status, 204);
-            assert_eq!(response.status, control.status);
-            assert_eq!(response.body, control.body);
+            assert_eq!((response.status, response.body.as_str()), (204, ""));
+            let cors = crate::worker_entry::cors_headers(response.status, origin, ORIGIN);
+            if origin == Some(ORIGIN) {
+                assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
+                assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                assert!(cors.iter().any(|(name, methods)| {
+                    *name == "access-control-allow-methods"
+                        && methods.split(", ").any(|m| m == "PUT")
+                }));
+            } else {
+                assert!(cors.is_empty());
+            }
         }
-        for method in ["HEAD", "PUT", "POST", "PATCH", "DELETE", "get"] {
+        for method in ["HEAD", "POST", "PATCH", "DELETE", "get", "put"] {
             assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
             let denied = h.call_full(method, &req.path, None, Some(cookie.clone()), Some(ORIGIN));
             assert_eq!(denied.status, 404, "{method}");
         }
+    }
+
+    #[test]
+    fn dispatched_taste_put_persists_and_replaces_only_the_session_owners_signal() {
+        use serde_json::json;
+
+        let h = harness();
+        let mut alice = taste_put_request(&h, "alice");
+        let bob = taste_put_request(&h, "bob");
+        h.store.catalogue_library.borrow_mut().insert(
+            "bob".into(),
+            vec![
+                unmatched_library_row("Job_A"),
+                unmatched_library_row("Private"),
+            ],
+        );
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let read = |req: &Request| h.call_full("GET", &req.path, None, req.cookie.clone(), None);
+        assert_eq!(call(&bob).status, 200);
+        let bob_before = read(&bob);
+        assert_eq!(bob_before.status, 200);
+        let before = h.store.taste_rows.borrow().clone();
+
+        let valid = alice.body.clone();
+        for target in ["bad/path", "Private", "Absent"] {
+            alice.body = json!({"kind":"track", "target_id":target, "signal":"hide"})
+                .to_string()
+                .into_bytes();
+            let resp = call(&alice);
+            assert_eq!(
+                (resp.status, resp.body),
+                (404, not_found().body),
+                "{target}"
+            );
+        }
+        alice.body = vec![b' '; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&alice).status, 400);
+        alice.body = valid;
+        for origin in [None, Some("https://other.example")] {
+            alice.origin = origin.map(str::to_string);
+            assert_eq!(call(&alice).status, 401);
+        }
+        alice.origin = Some(ORIGIN.into());
+        let cookie = alice.cookie.take();
+        assert_eq!(call(&alice).status, 401);
+        alice.cookie = cookie;
+        assert_eq!(*h.store.taste_rows.borrow(), before);
+
+        for (offset, signal) in [(1, "hide"), (2, "love"), (3, "love")] {
+            let mut expected = json!({"kind":"track", "target_id":"Job_A", "signal":signal});
+            alice.body = expected.to_string().into_bytes();
+            expected["until"] = json!(null);
+            let mut ctx = h.ctx();
+            ctx.now += offset;
+            let written = block_on(handle(&ctx, &alice));
+            assert_eq!((written.status, written.body), (200, expected.to_string()));
+            expected["updated_at"] = json!(ctx.now);
+            let fetched = read(&alice);
+            assert_eq!(
+                (fetched.status, fetched.body),
+                (200, json!({"items":[expected]}).to_string())
+            );
+        }
+        let likes = h.call_full("GET", "/v1/me/likes", None, alice.cookie.clone(), None);
+        assert_eq!(
+            (likes.status, likes.body),
+            (
+                200,
+                json!({"items":[{"kind":"track", "target_id":"Job_A", "created_at":NOW + 2}]})
+                    .to_string()
+            )
+        );
+        let bob_after = read(&bob);
+        assert_eq!((bob_after.status, bob_after.body), (200, bob_before.body));
     }
 
     #[test]

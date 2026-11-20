@@ -616,8 +616,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/me"
-                || path == "/v1/me/private-session"
+            if matches!(path, "/v1/me" | "/v1/me/private-session" | "/v1/me/taste")
                 || like_track_target(path).is_some()
             {
                 return SessionOnly;
