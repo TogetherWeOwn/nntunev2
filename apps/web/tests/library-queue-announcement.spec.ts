@@ -20,6 +20,32 @@ const ITEMS = [
 	{ id: 'row-mike', title: 'Mike Song', artist: 'Queue Artist' }
 ];
 
+const PLAYABLE_ITEMS = ITEMS.map((item) => item.id === 'row-mike'
+	? { ...item, streamUrl: '/test-audio/account' }
+	: item);
+
+async function probeDecoder(page: Page) {
+	await expect(page.getByTestId('mini-player')).toContainText('Mike Song');
+	const audio = await page.getByTestId('audio-player').elementHandle();
+	await audio!.evaluate((element) => {
+		Object.defineProperties(element, {
+			paused: { get: () => false },
+			pause: { value() {
+				const count = Number(element.getAttribute('data-pauses') ?? 0);
+				element.setAttribute('data-pauses', String(count + 1));
+				element.setAttribute('data-paused-while-mounted', String(element.isConnected));
+			} }
+		});
+	});
+	return async () => {
+		await expect(page.getByTestId('audio-player')).toHaveCount(0);
+		await expect(page.getByTestId('mini-player')).toHaveCount(0);
+		expect(await audio!.getAttribute('data-pauses')).toBe('1');
+		expect(await audio!.getAttribute('data-paused-while-mounted')).toBe('true');
+		await audio!.dispose();
+	};
+}
+
 async function seedLibrary(
 	page: Page,
 	payload: { current: unknown } = { current: ITEMS }
@@ -118,9 +144,13 @@ test('refresh dropping a queued id clears the announcement and keeps survivors',
 });
 
 test('storage auth transition clears a move announcement before the next session retry', async ({ page }) => {
-	const payload: { current: unknown } = { current: ITEMS };
+	const payload: { current: unknown } = { current: PLAYABLE_ITEMS };
+	await page.route('**/test-audio/**', (route) => route.abort());
 	await seedQueue(page, payload);
 	await moveAlphaUp(page);
+	const decoderPurged = await probeDecoder(page);
+	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', { key: 'unrelated' })));
+	await expect(page.getByTestId('queue-item')).toHaveCount(3);
 
 	const otherTab = await page.context().newPage();
 	await otherTab.goto('/login');
@@ -133,6 +163,7 @@ test('storage auth transition clears a move announcement before the next session
 	await expect(page.getByRole('alert')).toContainText(/session changed/i);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByText('Alpha Song', { exact: false })).toHaveCount(0);
+	await decoderPurged();
 	payload.current = [{ id: 'row-bravo', title: 'Bravo Song' }];
 	await page.getByRole('button', { name: 'Retry', exact: true }).click();
 
@@ -164,7 +195,8 @@ test('same-tab auth transition clears a move announcement before the next sessio
 		};
 	});
 	await page.route('**/v1/**', (route) => route.fulfill({ status: 500, json: {} }));
-	const payload: { current: unknown } = { current: ITEMS };
+	const payload: { current: unknown } = { current: PLAYABLE_ITEMS };
+	await page.route('**/test-audio/**', (route) => route.abort());
 	await page.route('**/api/library', (route) => route.fulfill({
 		status: 200, json: payload.current
 	}));
@@ -187,6 +219,7 @@ test('same-tab auth transition clears a move announcement before the next sessio
 	await row(page, 'row-zulu').click();
 	await row(page, 'row-alpha').click();
 	await moveAlphaUp(page);
+	const decoderPurged = await probeDecoder(page);
 
 	await page.evaluate(() =>
 		(window as Window & { __queueAnnouncementLogout: { release: () => void } })
@@ -196,12 +229,38 @@ test('same-tab auth transition clears a move announcement before the next sessio
 	await expect(page).toHaveURL(/\/library$/);
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByText('Alpha Song', { exact: false })).toHaveCount(0);
+	await decoderPurged();
 	payload.current = [{ id: 'row-bravo', title: 'Bravo Song' }];
 	await page.getByRole('button', { name: 'Retry', exact: true }).click();
 	await expect(page.getByTestId('library-list')).toContainText('Bravo Song');
 	await expect(page.getByTestId('queue-item')).toHaveCount(0);
 	await expect(page.getByTestId('queue-announcement')).toHaveText('');
 });
+
+for (const refusal of [401, 403]) {
+	test(`refresh ${refusal} purges the mounted player before a fresh Retry`, async ({ page }) => {
+		let status = 200;
+		let items: unknown = PLAYABLE_ITEMS;
+		await page.route('**/test-audio/**', (route) => route.abort());
+		await page.route('**/api/library', (route) => route.fulfill({ status, json: items }));
+		await page.goto('/library');
+		await row(page, 'row-mike').click();
+		const decoderPurged = await probeDecoder(page);
+		status = refusal;
+		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+		await expect(page.getByRole('alert')).toContainText(/do not have access/i);
+		await decoderPurged();
+		status = 200;
+		items = [{ id: 'row-mike', title: 'Fresh Mike', streamUrl: '/test-audio/fresh' }];
+		await page.getByRole('button', { name: 'Retry', exact: true }).click();
+		await expect(row(page, 'row-mike')).toContainText('Fresh Mike');
+		await expect(page.getByTestId('queue-item')).toHaveCount(0);
+		await expect(page.getByTestId('queue-announcement')).toHaveText('');
+		await row(page, 'row-mike').click();
+		await expect(page.getByTestId('audio-player')).toHaveAttribute('src', '/test-audio/fresh');
+		await expect(page.getByTestId('mini-player')).toContainText('Fresh Mike');
+	});
+}
 
 test('remove replaces a stale move announcement with the remove outcome', async ({ page }) => {
 	await seedQueue(page);
