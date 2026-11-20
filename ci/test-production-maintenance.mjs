@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -34,7 +34,7 @@ const checkedAt = '2026-10-01T12:00:00Z';
 const now = () => Date.parse(checkedAt) + 60_000;
 const routeProof = JSON.stringify({ worker_id: workerId, sha, checked_at: checkedAt, route_count: 0 });
 
-test('only exact-main bootstrap uses the protected production job after staging admission', () => {
+test('only exact-main bootstrap uses the protected production job after staging admission', (t) => {
   const preflight = workflow.match(/id: target\n        env:\n((?: {10}[^\n]*\n)+)        run: \|\n((?: {10}[^\n]*\n)+)/);
   assert.ok(preflight);
   assert.match(preflight[1], /^ {10}DEPLOY_MODE: \$\{\{ inputs\.mode \}\}$/m);
@@ -43,23 +43,25 @@ test('only exact-main bootstrap uses the protected production job after staging 
   assert.match(job, /if: inputs.mode == 'bootstrap-maintenance'\n    needs: \[preflight, staging-evidence\]/);
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false\n    environment: production/);
   assert.match(job, /ACCEPTED_SHA: \$\{\{ vars\.PRODUCTION_ACCEPTED_SHA \}\}[\s\S]*run: node ci\/production-maintenance\/seed\.mjs/);
-  for (const [overrides, diagnostic] of [
+  const workspace = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'maintenance-preflight-'));
+  t.after(() => rmSync(workspace, { recursive: true, force: true }));
+  const output = join(workspace, 'github-output');
+  for (const [overrides, refusal] of [
     [{ DEPLOY_MODE: 'promote' }, /Application promotion is disabled/],
     [{ INPUT_SHA: 'c'.repeat(40) }, /must match the dispatched main commit/],
-    [{}, /^sha=a{40}$/m],
+    [{}],
   ]) {
     const result = spawnSync('/bin/bash', ['-c', preflight[2].replace(/^ {10}/gm, '')], {
       encoding: 'utf8', timeout: 5_000, env: {
-        PATH: process.env.PATH, GITHUB_OUTPUT: '/dev/stdout', GITHUB_REF: 'refs/heads/main', GITHUB_SHA: sha,
+        PATH: process.env.PATH, GITHUB_OUTPUT: output, GITHUB_REF: 'refs/heads/main', GITHUB_SHA: sha,
         INPUT_SHA: sha, DEPLOY_MODE: 'bootstrap-maintenance', PRODUCTION_DEPLOY_ENABLED: 'true',
         UNPROTECTED_ACCEPTED_SHA: '', PRODUCTION_DOMAIN: 'example.com', PRODUCTION_DOMAIN_DEFAULT: 'example.invalid',
         ...overrides,
       },
     });
-    const refused = Object.keys(overrides).length > 0;
-    assert.equal(result.status, refused ? 1 : 0, result.stderr);
-    assert.match(result.stdout, diagnostic);
-    if (refused) assert.doesNotMatch(result.stdout, /^sha=|^domain=/m);
+    assert.equal(result.status, refusal ? 1 : 0, result.stderr);
+    if (refusal) assert.match(result.stdout, refusal);
+    assert.equal(existsSync(output) ? readFileSync(output, 'utf8') : '', refusal ? '' : `sha=${sha}\ndomain=example.com\n`);
   }
 });
 

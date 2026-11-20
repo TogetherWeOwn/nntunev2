@@ -1113,35 +1113,30 @@ writes automatically, and an observer success alone is not verified recovery.
 
 The first rollback target is a binding-free maintenance Worker, not a direct
 application deploy. Do not bypass the production lane to seed the app.
-`promote` refuses even when enabled; bootstrap changes no DNS, routes or triggers.
+Promotion stays disabled; bootstrap changes no DNS, routes or triggers.
 
-1. **Release Manager:** Accept the seed and exact dispatch `main` SHA after M1,
-   staging admission, Security → QA, exact-head CI and migration ledger review.
-   Verify production Environment protection with the GitHub custodian. Set
-   `PRODUCTION_ACCEPTED_SHA` and `PRODUCTION_WORKER_ID` (the immutable `nntune-web`
-   ID) only there. Use only its token scoped to that Worker and matching account.
-   Configure the launch hostname (preflight does not contact it) and turn
-   `PRODUCTION_DEPLOY_ENABLED` on only for the accepted window.
-2. **Route custodian:** Immediately before dispatch, inventory all applicable
-   zone Worker routes (every page, including wildcards) with existing read-only
-   access. Record coverage, Worker ID, SHA, UTC read time and zero matches on
-   the release record. Refuse incomplete/unreadable coverage. The GitHub
-   custodian copies the result into `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in
-   `production`: JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`)
-   and numeric `route_count: 0`. Freeze routing; the Worker token cannot list
-   zone routes. This lane must remain the sole Worker writer through readback:
-   Actions locking cannot stop external writes and there is no conditional deploy.
-3. **Release Manager:** Dispatch `mode=bootstrap-maintenance` on `main` with
-   the accepted `sha`. Under the production mutation lock, the job requires
-   proof ≤30 minutes old, empty deployment/version/binding inventories, no
-   custom domain, and workers.dev and previews off. One immutable-ID
-   [upload with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/)
-   installs `worker.mjs` at 100%. Record verified version/readback. On uncertainty,
-   close the window and reconcile Worker, deployment and route state before any retry.
-4. **Close/undo:** Turn `PRODUCTION_DEPLOY_ENABLED` off, clear the accepted SHA
-   and route proof, and verify the seed remains unrouted and unexposed. Do not
-   delete the latest deployment or Worker; re-entry refuses. If a separately
-   accepted cutover attached a hostname, reverse only its new DNS/routes.
+1. **Release Manager:** After M1, staging admission, Security → QA, exact-head CI
+   and migration ledger review, accept the seed and exact `main` dispatch SHA.
+   Verify `production` Environment protection with the GitHub custodian. Only there,
+   set `PRODUCTION_ACCEPTED_SHA` and `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID)
+   and use its Worker-scoped token and matching account. Configure the hostname
+   and enable `PRODUCTION_DEPLOY_ENABLED` only for the accepted window.
+2. **Route custodian:** Just before dispatch, inventory applicable zone Worker
+   routes (every page, including wildcards) with existing read-only access.
+   Refuse gaps. Record coverage, Worker ID, SHA, UTC read time and zero matches.
+   The GitHub custodian sets `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in `production`:
+   JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`) and numeric
+   `route_count: 0`. Freeze routes; the Worker token cannot list them. This lane
+   must be the sole Worker writer through readback; there is no conditional deploy.
+3. **Release Manager:** Dispatch `mode=bootstrap-maintenance` on `main` at the
+   accepted `sha`. Under the mutation lock, require proof ≤30 minutes old, empty
+   deployment/version/binding inventories, no custom domain, workers.dev or previews.
+   One [upload by immutable ID with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/)
+   installs `worker.mjs` at 100%. Record verified readback. On uncertainty, close
+   the window and reconcile Worker, deployment and routes before any retry.
+4. **Close/undo:** Disable `PRODUCTION_DEPLOY_ENABLED`, clear the accepted SHA and
+   route proof, and verify the seed remains unexposed and unrouted. Leave it and
+   the Worker intact; re-entry refuses. Reverse only separately accepted cutover routes/DNS.
 
 ### Production Worker secret-shape gate
 

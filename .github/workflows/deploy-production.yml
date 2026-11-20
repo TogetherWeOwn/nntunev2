@@ -470,6 +470,7 @@ jobs:
           retention-days: 30
 
   bootstrap-maintenance:
+    name: bootstrap-maintenance
     if: inputs.mode == 'bootstrap-maintenance'
     needs: [preflight, staging-evidence]
     runs-on: ubuntu-latest
