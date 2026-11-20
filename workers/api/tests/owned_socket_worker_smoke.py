@@ -110,6 +110,110 @@ def check_reconcile_ack(base):
     print("PASS: test-feature billing prototype lost COMMIT acknowledgement, retry and replay", flush=True)
 
 
+def check_restricted_history(base, settings):
+    admin = partial(routing.psql, settings, settings["admin"], timeout=10)
+    observe = partial(routing.psql, settings, BILLING_DB, timeout=10)
+    admin("""CREATE ROLE billing_history_fixture LOGIN NOSUPERUSER NOCREATEDB
+             NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD 'ci-throwaway'""")
+    try:
+        admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+        try:
+            exercise_restricted_history(base, observe)
+        finally:
+            admin(f"DROP DATABASE {BILLING_DB}")
+    finally:
+        admin("DROP ROLE billing_history_fixture")
+
+
+def exercise_restricted_history(base, observe):
+    status, _, body = routing.http("POST", base + "/billing-ack-fixture")
+    routing.check(status == 200 and body == "billing-ack-fixture-ok", body)
+    observe(
+        stdin=f"""
+        CREATE SCHEMA billing_history_fixture;
+        CREATE TABLE billing_history_fixture.paid_invoice_history
+            (LIKE public.paid_invoice_history INCLUDING ALL);
+        GRANT USAGE ON SCHEMA public, billing_history_fixture TO billing_history_fixture;
+        ALTER ROLE billing_history_fixture IN DATABASE {BILLING_DB}
+            SET search_path TO billing_history_fixture, public;
+        GRANT SELECT, INSERT, UPDATE ON public.subscriptions TO billing_history_fixture;
+        CREATE SEQUENCE public.restricted_subscription_write;
+        GRANT USAGE ON SEQUENCE public.restricted_subscription_write TO billing_history_fixture;
+        CREATE FUNCTION public.note_restricted_subscription_write() RETURNS trigger
+        LANGUAGE plpgsql AS $$ BEGIN
+            IF current_user <> 'billing_history_fixture'
+               OR current_schema() <> 'billing_history_fixture' THEN
+                RAISE EXCEPTION 'restricted fixture context missing';
+            END IF;
+            PERFORM nextval('public.restricted_subscription_write');
+            RETURN NEW;
+        END; $$;
+        CREATE TRIGGER note_restricted_subscription_write AFTER INSERT ON public.subscriptions
+            FOR EACH ROW EXECUTE FUNCTION public.note_restricted_subscription_write();
+    """
+    )
+
+    def snapshot():
+        return json.loads(
+            observe(
+                """
+            SELECT jsonb_build_array(
+                COALESCE((SELECT jsonb_agg(s ORDER BY stripe_subscription_id)
+                          FROM public.subscriptions s), '[]'),
+                COALESCE((SELECT jsonb_agg(h ORDER BY stripe_invoice_id)
+                          FROM public.paid_invoice_history h), '[]'),
+                (SELECT count(*) FROM billing_history_fixture.paid_invoice_history))
+        """,
+                tuples=True,
+            )
+        )
+
+    status, _, body = routing.http("POST", base + "/billing-restricted-history-proof")
+    routing.check(status == 500 and body == "billing-restricted-history-failed", body)
+    # A sequence advance survives rollback and proves this was not an early refusal.
+    witness = observe(
+        "SELECT is_called FROM public.restricted_subscription_write", tuples=True
+    )
+    routing.check(
+        witness == "t", "restricted Worker did not reach the subscription insert"
+    )
+    routing.check(
+        snapshot() == [[], [], 0], "denied history write left committed billing rows"
+    )
+
+    observe("GRANT INSERT ON public.paid_invoice_history TO billing_history_fixture")
+    status, _, body = routing.http("POST", base + "/billing-restricted-history-proof")
+    routing.check(status == 200 and body == "billing-restricted-history-ok", body)
+    committed = snapshot()
+    subscriptions, invoices, alternative_rows = committed
+    routing.check(
+        len(subscriptions) == 1
+        and subscriptions[0]["user_id"] == "worker_fault_user"
+        and subscriptions[0]["stripe_subscription_id"] == "sub_worker_fault"
+        and subscriptions[0]["paid_invoice_id"] == "in_worker_second"
+        and [row["stripe_invoice_id"] for row in invoices]
+        == ["in_worker_first", "in_worker_second"]
+        and all(
+            row["user_id"] == "worker_fault_user"
+            and row["stripe_subscription_id"] == "sub_worker_fault"
+            and row["plan_id"] == "plus"
+            and row["amount_cents"] == 800
+            for row in invoices
+        )
+        and alternative_rows == 0,
+        "restricted retry did not commit the expected public billing rows",
+    )
+    status, _, body = routing.http("POST", base + "/billing-restricted-history-replay")
+    routing.check(status == 200 and body == "billing-restricted-history-ok", body)
+    routing.check(
+        snapshot() == committed, "restricted replay changed committed billing rows"
+    )
+    print(
+        "PASS: restricted Worker history denial rolled back; retry and replay used public history",
+        flush=True,
+    )
+
+
 def check_webhook_ack(base, observe):
     status, _, body = routing.http("POST", base + "/billing-ack-fixture")
     routing.check(status == 200 and body == "billing-ack-fixture-ok", body)
@@ -302,6 +406,7 @@ def main():
                     check_webhook_ack(f"http://127.0.0.1:{port}", observe)
                 finally:
                     admin(f"DROP DATABASE {BILLING_DB}")
+                check_restricted_history(f"http://127.0.0.1:{port}", settings)
                 admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
                 try:
                     url = f"http://127.0.0.1:{port}/billing-cancel-proof"
