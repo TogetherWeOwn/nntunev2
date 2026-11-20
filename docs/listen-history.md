@@ -24,13 +24,22 @@ opaque `track_id` (1–128 UTF-8 bytes with no control characters), and `event`
 endpoints require the configured Origin and a valid cookie session. Native
 REST writes require `plays:write` and omit `context`.
 
-Start is recorded when audio actually plays, not on click. Pause and buffering
-preserve the playback identity. Natural end is `complete`; abandoning started
-playback is `skip`. Replays use a new UUID. Identical retries do not add rows or
-refresh timestamps. A changed retry, conflicting terminal or terminal without a
-matching start returns 422. Delivery is best effort; a missing terminal is not
-evidence that a listen completed. The demo and library audio players use this
-contract. There is no official video embed producer in this build.
+Encode the 16 bytes of the server-issued grant `play_id` as `playback_id`
+using lowercase UUID formatting without changing any bits. The first `start`
+requires a live lease for that account, play and track. A play marked private
+at grant time is never recorded, even if private listening is later switched
+off. Observations without a matching grant identity are not admitted.
+
+Send `start` when audio actually plays, not on click. Pause and buffering
+preserve the play identity. Natural end is `complete`; abandoning started
+playback is `skip`. A new grant play (not a continuation) has a different ID.
+Identical retries do not add rows or refresh timestamps. Terminals and retries
+can refer to an accepted start after the lease changes. Ineligible or
+conflicting observations, including a terminal without a matching start,
+return 422. Delivery is best effort; a missing terminal is not evidence that
+a listen completed. The demo and library pages do not send observations:
+neither obtains a grant-backed source in this build. There is no official
+video embed producer.
 
 ## Export and clear
 

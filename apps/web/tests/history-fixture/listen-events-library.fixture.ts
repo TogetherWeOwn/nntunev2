@@ -2,10 +2,10 @@ import { expect, test, type Page } from '@playwright/test';
 import { contextPath, eventsPath, watchListenContext } from '../fixtures/listen-context.js';
 
 /**
- * Library route integration for listen-event telemetry. Fixtures follow
+ * Fixture-only library integration for listen-event telemetry. Fixtures follow
  * library-repeat-end-policy.spec.ts: route-mocked `/api/library`, pending
  * `/test-audio/**`, doubled media play/pause, synthetic media events. The real
- * page, audio attachment and sender run; `/v1/plays/events` is fulfilled in-test.
+ * route injects simulated grant IDs; `/v1/plays/events` is fulfilled in-test.
  */
 type Body = { playback_id: string; track_id: string; event: string; context: string };
 

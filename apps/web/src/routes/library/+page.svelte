@@ -5,7 +5,6 @@
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
 	import { createPlayerController } from '#lib/player/controller.svelte.js';
-	import { createPageListenHistory } from '#lib/player/pageListenHistory.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { describeJump, type JumpDirection } from '#lib/player/relativeJump.js';
 	import { restartIsAvailable } from './restartAvailability.js';
@@ -256,18 +255,12 @@
 	let restoreFilterFocus = false;
 	const repeat = media.repeat;
 
-	const listenHistory = createPageListenHistory();
 	function attachNativeAudio(audio: HTMLAudioElement): () => void {
-		const detach = media.attach(audio, {
+		return media.attach(audio, {
 			source: () => shareAlive ? resolveStreamUrl(queueCurrentTrack(queueController.snapshot)) : null,
 			seeking: handleSeeking,
 			position: refreshRestartAvailability
 		});
-		const stopHistory = listenHistory.attach(audio, queueCurrentTrack(queueController.snapshot)?.id);
-		return () => {
-			stopHistory();
-			detach();
-		};
 	}
 
 	function announceEnd(track?: Track): void {
@@ -1608,7 +1601,6 @@
 	}
 
 	onMount(() => {
-		const stopHistory = listenHistory.mount();
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
 		media.restoreRepeat(browserStorage('local'));
@@ -1628,7 +1620,6 @@
 			shareAlive = false;
 			queueController.destroy();
 			queueShare.dispose();
-			stopHistory();
 			media.destroy();
 			favoritesExport.destroy();
 			clearShareFeedback();

@@ -7,7 +7,7 @@ export default defineConfig({
 	use: { baseURL: 'http://127.0.0.1:43827', trace: 'retain-on-failure' },
 	webServer: {
 		command: 'pnpm exec svelte-kit sync && pnpm exec vite build --config tests/history-fixture.vite.config.ts && pnpm exec vite preview --config tests/history-fixture.vite.config.ts --host 127.0.0.1 --port 43827 --strictPort',
-		env: { PUBLIC_LISTEN_HISTORY_ENABLED: 'true', PUBLIC_API_BASE_URL: '' },
+		env: { PUBLIC_API_BASE_URL: '' },
 		cwd: decodeURIComponent(new URL('..', import.meta.url).pathname),
 		port: 43827,
 		stdout: 'pipe',
