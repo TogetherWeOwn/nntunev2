@@ -269,6 +269,18 @@ pub async fn billing_owned_test_entry(
                     Err(message) => worker::Response::error(message, 500),
                 };
             }
+            path @ ("/billing-worker-first-insert-commit-proof"
+            | "/billing-worker-first-insert-rollback-proof") => {
+                let commit = path == "/billing-worker-first-insert-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_before_raw_insert(
+                    commit,
+                )
+                .await
+                {
+                    Ok(()) => worker::Response::ok("billing-worker-first-insert-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
             path
             @ ("/billing-raw-replace-commit-proof" | "/billing-raw-replace-rollback-proof") => {
                 let commit = path == "/billing-raw-replace-commit-proof";

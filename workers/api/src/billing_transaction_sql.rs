@@ -57,13 +57,13 @@ pub(crate) enum ReconcileProbe {
     None,
     WorkerDeadline,
     ServerWatchdog,
-    ParentCascade,
+    BeforeCommit(Option<std::rc::Rc<std::cell::Cell<bool>>>),
     ObserveStaleRefusal(std::rc::Rc<std::cell::Cell<bool>>),
     ObserveTargetRefusal(std::rc::Rc<std::cell::Cell<bool>>),
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-pub(crate) const PARENT_CASCADE_GATE: i64 = 781349054;
+pub(crate) const PRECOMMIT_GATE: i64 = 781349054;
 
 pub(crate) async fn apply_reconcile_transaction(
     transaction: &mut tokio_postgres::Client,
@@ -198,14 +198,18 @@ pub(crate) async fn apply_reconcile_transaction(
         }
         // The blocking probes run only after all billing writes and before COMMIT.
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-        if matches!(probe, ReconcileProbe::ParentCascade) {
+        if let ReconcileProbe::BeforeCommit(ref rollback) = probe {
             transaction
                 .query_typed(
                     "SELECT pg_advisory_xact_lock($1)",
-                    &[(&PARENT_CASCADE_GATE, Type::INT8)],
+                    &[(&PRECOMMIT_GATE, Type::INT8)],
                 )
                 .await
                 .map_err(|_| StoreError)?;
+            if let Some(observed) = rollback {
+                observed.set(true);
+                return Err(StoreError);
+            }
         } else if matches!(
             probe,
             ReconcileProbe::WorkerDeadline | ReconcileProbe::ServerWatchdog
