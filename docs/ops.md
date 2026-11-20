@@ -1113,43 +1113,35 @@ writes automatically, and an observer success alone is not verified recovery.
 
 The first rollback target is a binding-free maintenance Worker, not a direct
 application deploy. Do not bypass the production lane to seed the app.
-The dispatch form offers only `promote`. Do not dispatch bootstrap as a probe:
-if a legacy `mode=bootstrap-maintenance` request reaches preflight, it fails
-before staging admission and may be reported as a preflight incident even though
-no deployment ran. Keep promotion disabled.
-Cloudflare documents [empty Worker creation](https://developers.cloudflare.com/workers/platform/infrastructure-as-code/),
-but [version upload with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/)
-and [deployment creation](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
-do not document a deploy-only-if-undeployed condition. Actions serialization
-cannot stop a concurrent provider write between the empty read and deployment.
-No account-wide credential, manual deployment, or live experiment may be
-used as a workaround. The sequence below is held until a safe path lands.
+`promote` refuses even when enabled; bootstrap changes no DNS, routes or triggers.
 
-1. **Release Manager:** Accept the exact launch SHA after M1, staging
-   admission, Security → QA, exact-head CI and migration ledger review.
-   Explicitly accept the maintenance seed, hostname attachment and rollback.
-2. **DevOps / GitHub custodian:** Verify the production Environment protection
-   and credential scopes. After independent Release Manager acceptance, set
-   `PRODUCTION_ACCEPTED_SHA` **only** in that Environment, never as a repo or org
-   variable. Both modes require this exact SHA, in addition to staging admission.
-   A future bootstrap must pin the immutable `nntune-web` identity and refuse
-   unless empty, unrouted, unbound, with workers.dev and previews off. Use only
-   the Environment's Worker-scoped credentials; qualify asset upload separately.
-   On refusal, drift or an uncertain response, reconcile pinned Worker, version
-   and route state before re-entry; never delete by name or retry blindly.
-3. **Cloudflare custodian / DevOps:** Record the exact seed version at 100%.
-   Verify ownership of `PRODUCTION_DOMAIN` and absence of DNS, domain and
-   route conflicts; attach the host to `nntune-web` without displacing routing.
-   Record the non-cacheable, non-indexable maintenance 503 probe. First-cutover
-   undo closes the enable window and reverses only new production DNS/routes.
-4. **DevOps:** Verify that version is still at 100%; dispatch `mode=promote`
-   only after separate exact-SHA/mode acceptance. The gradual action uses the
-   lockfile-installed Wrangler for promotion and automatic stage rollback.
-   On final smoke failure, use the same CLI and production credentials:
-   `pnpm --dir apps/web exec wrangler rollback "$MAINTENANCE_VERSION" --name nntune-web --yes`.
-   Verify 100% on that version, maintenance 503 on `/` and `/api/build`, and
-   no tag. Retry only with current release admission. The GitHub custodian
-   clears `PRODUCTION_ACCEPTED_SHA` after the authorized window closes.
+1. **Release Manager:** Accept the seed and exact dispatch `main` SHA after M1,
+   staging admission, Security → QA, exact-head CI and migration ledger review.
+   Verify production Environment protection with the GitHub custodian. Set
+   `PRODUCTION_ACCEPTED_SHA` and `PRODUCTION_WORKER_ID` (the immutable `nntune-web`
+   ID) only there. Use only its token scoped to that Worker and matching account.
+   Configure the launch hostname (preflight does not contact it) and turn
+   `PRODUCTION_DEPLOY_ENABLED` on only for the accepted window.
+2. **Route custodian:** Immediately before dispatch, inventory all applicable
+   zone Worker routes (every page, including wildcards) with existing read-only
+   access. Record coverage, Worker ID, SHA, UTC read time and zero matches on
+   the release record. Refuse incomplete/unreadable coverage. The GitHub
+   custodian copies the result into `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in
+   `production`: JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`)
+   and numeric `route_count: 0`. Freeze routing; the Worker token cannot list
+   zone routes. This lane must remain the sole Worker writer through readback:
+   Actions locking cannot stop external writes and there is no conditional deploy.
+3. **Release Manager:** Dispatch `mode=bootstrap-maintenance` on `main` with
+   the accepted `sha`. Under the production mutation lock, the job requires
+   proof ≤30 minutes old, empty deployment/version/binding inventories, no
+   custom domain, and workers.dev and previews off. One immutable-ID
+   [upload with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/)
+   installs `worker.mjs` at 100%. Record verified version/readback. On uncertainty,
+   close the window and reconcile Worker, deployment and route state before any retry.
+4. **Close/undo:** Turn `PRODUCTION_DEPLOY_ENABLED` off, clear the accepted SHA
+   and route proof, and verify the seed remains unrouted and unexposed. Do not
+   delete the latest deployment or Worker; re-entry refuses. If a separately
+   accepted cutover attached a hostname, reverse only its new DNS/routes.
 
 ### Production Worker secret-shape gate
 
