@@ -672,6 +672,11 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    fn webhook_ack_control(&self) -> bool {
+        false
+    }
+
     /// Standalone private-play mark, adapted from PR #982's preserved patch;
     /// not authority to issue a grant. Activation must instead atomically
     /// fence, refresh privacy, mark, acquire the lease and conditionally
@@ -6660,9 +6665,16 @@ where
         .retrieve_subscription(subscription_id.to_string())
         .await
         .map_err(|_| ())?;
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    let exact = ctx.store.webhook_ack_control();
+    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
+    let exact = false;
+    if exact && subscription.id != subscription_id {
+        return Err(());
+    }
     let input = ctx
         .store
-        .load_reconcile_input(user_id, None)
+        .load_reconcile_input(user_id, exact.then_some(subscription_id))
         .await
         .map_err(|_| ())?;
     let listed = ctx
@@ -6714,14 +6726,17 @@ where
         }
         invoices.push(invoice);
     }
-    let outcome = crate::billing_reconcile::reconcile_subscription(
-        &input,
-        &crate::billing_reconcile::RemoteSubscription {
-            subscription,
-            invoices,
-        },
-        billing_now_i64(ctx.now),
-    );
+    let remote = crate::billing_reconcile::RemoteSubscription {
+        subscription,
+        invoices,
+    };
+    let now = billing_now_i64(ctx.now);
+    let outcome = if exact {
+        crate::billing_reconcile::reconcile_exact_target(subscription_id, input, &remote, now)
+            .ok_or(())?
+    } else {
+        crate::billing_reconcile::reconcile_subscription(&input, &remote, now)
+    };
     ctx.store
         .store_reconcile_outcome(user_id, &outcome)
         .await

@@ -2,7 +2,7 @@
 use super::{billing_budget, MirrorBinding, PgStore, Store, StoreError};
 use crate::billing_reconcile::{PaidInvoiceRow, ReconcileOutcome, ReconciledRow};
 use crate::billing_transaction_sql::ReconcileProbe;
-const CONNECTION: &str =
+pub(super) const CONNECTION: &str =
     "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable";
 async fn fixture(setup: bool) -> Result<(), StoreError> {
     billing_budget::with_owned_connection(
