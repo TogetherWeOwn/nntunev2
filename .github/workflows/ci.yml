@@ -2001,7 +2001,7 @@ jobs:
       - name: Exercise owned transport in a separate test Worker
         run: |
           set -euo pipefail
-          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok|billing-ack-ok:|/billing-webhook-(ack|retry)-proof|billing-restricted-history-|/billing-raw-update-proof|/billing-raw-replace-(commit|rollback)-proof|/billing-(parent|row-update)-cycle-proof' workers/api/build/index_bg.wasm; then
+          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok|billing-ack-ok:|/billing-webhook-(ack|retry)-proof|billing-restricted-history-|/billing-raw-update-proof|/billing-raw-replace-(commit|rollback)-proof|/billing-(parent|row-update)-cycle-proof|/billing-parent-delete-(commit|rollback)-proof' workers/api/build/index_bg.wasm; then
             printf '%s\n' 'test entry marker found in release WASM' >&2
             exit 1
           fi
