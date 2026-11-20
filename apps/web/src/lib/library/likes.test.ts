@@ -64,6 +64,11 @@ describe('server likes', () => {
 		expect(fetchFn.mock.calls[1][1]?.body).toBeUndefined();
 	});
 
+	it.each([true, false])('rejects a contradictory receipt when setting liked to %s', async (liked) => {
+		const { client } = mockClient(Response.json({ target_id: JOB, liked_at: 1, liked: false }));
+		await expect(setTrackLike(client, JOB, liked)).rejects.toThrow('Invalid like confirmation');
+	});
+
 	it('never sends an occurrence key or accepts a different opaque job receipt', async () => {
 		const { client, fetchFn } = mockClient(Response.json({ target_id: 'job_a', liked_at: 1 }));
 		await expect(setTrackLike(client, 'Job_A:2', true)).rejects.toThrow('Invalid track ID');
