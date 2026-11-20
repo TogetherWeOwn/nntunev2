@@ -622,6 +622,26 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
 }
 
 #[test]
+fn history_controls_wire_to_postgres_storage() {
+    let source = production();
+    let dispatch = function_body(&source, "pubasyncfndispatch(");
+    assert!(dispatch.contains("store:&PgStore{"));
+    assert!(dispatch.contains("handlers::handle(&ctx,&guarded_request).await"));
+    let store = source.split_once("implStoreforPgStore{").unwrap().1;
+    for (method, operation) in [
+        ("export_listen_events", "export(&client,owner,before)"),
+        ("clear_listen_events", "clear(&mutclient,owner)"),
+    ] {
+        let body = function_body(store, &format!("asyncfn{method}("));
+        assert!(body.contains("self.connect().await?"), "{method}");
+        assert!(
+            body.contains(&format!("crate::listen_history::{operation}.await")),
+            "{method}"
+        );
+    }
+}
+
+#[test]
 fn listen_history_statements_run_unnamed_through_query_typed() {
     let source: String = include_str!("../src/listen_history.rs")
         .chars()
