@@ -288,7 +288,7 @@ test('a retired move reconciles durable favorites without dropping a visit-only 
 	await expect(page.getByTestId('favorites-announcement')).toBeEmpty();
 });
 
-test('a visit-only favorite retains its moved position after a peer adds a durable star', async ({ page }) => {
+test('a visit-only favorite retains its moved position after peer additions and reorders', async ({ page }) => {
 	await open(page, ['arr-z']);
 	await faultStorage(page, 'write');
 	await star(page, 'arr-a').click();
@@ -301,6 +301,11 @@ test('a visit-only favorite retains its moved position after a peer adds a durab
 	await activate(page, 'Alpha Song', 'up');
 	await expectIds(page, ['arr-a', 'arr-z', 'arr-m']);
 	expect(await stored(page)).toEqual(['arr-z', 'arr-m']);
+	await activate(peer, 'Mike Song', 'up');
+	await expect.poll(() => stored(peer)).toEqual(['arr-m', 'arr-z']);
+	await activate(page, 'Alpha Song', 'down');
+	await expectIds(page, ['arr-m', 'arr-z', 'arr-a']);
+	expect(await stored(page)).toEqual(['arr-m', 'arr-z']);
 });
 
 async function holdFavorites(page: Page): Promise<() => Promise<void>> {
@@ -330,27 +335,34 @@ for (const moveFocus of [false, true]) {
 	});
 }
 
-test('queue Unstar all removes the remaining star after a pending edit reconciles', async ({ page }) => {
-	await open(page, ['arr-z', 'arr-m']);
-	for (const title of ['Zulu Song', 'Mike Song']) {
-		await page.getByTestId('library-item').getByRole('button', { name: new RegExp(`^${title}`) }).click();
-	}
-	const rows = page.getByTestId('queue-item');
-	await expect(rows).toHaveCount(2);
-	for (const checkbox of await rows.getByRole('checkbox').all()) await checkbox.check();
-	const release = await holdFavorites(page);
-	await star(page, 'arr-a').click();
-	await expect.poll(() => page.evaluate(async (key) => (await navigator.locks.query()).pending?.some((lock) => lock.name === key), KEY)).toBe(true);
-	await rows.first().getByTestId('queue-more').click();
-	const action = page.getByRole('menuitem', { name: 'Unstar all', exact: true });
-	await expect(action).toBeVisible();
-	await page.evaluate((key) => localStorage.setItem(key, '["arr-z"]'), KEY);
-	await release();
-	await expectIds(page, ['arr-z', 'arr-a']);
-	await action.click();
-	await expect.poll(() => stored(page)).toEqual(['arr-a']);
-	await expectIds(page, ['arr-a']);
-});
+for (const unstar of [true, false]) {
+	test(`queue ${unstar ? 'Unstar all' : 'Star all'} retains its direction after reconciliation`, async ({ page }) => {
+		const one = ['arr-z'];
+		const both = ['arr-z', 'arr-m'];
+		await open(page, unstar ? both : one);
+		for (const title of ['Zulu Song', 'Mike Song']) {
+			await page.getByTestId('library-item').getByRole('button', { name: new RegExp(`^${title}`) }).click();
+		}
+		const rows = page.getByTestId('queue-item');
+		await expect(rows).toHaveCount(2);
+		for (const checkbox of await rows.getByRole('checkbox').all()) await checkbox.check();
+		const release = await holdFavorites(page);
+		await star(page, 'arr-a').click();
+		await expect.poll(() => page.evaluate(async (key) => (await navigator.locks.query()).pending?.some((lock) => lock.name === key), KEY)).toBe(true);
+		await rows.first().getByTestId('queue-more').click();
+		const action = page.getByRole('menuitem', { name: unstar ? 'Unstar all' : 'Star all', exact: true });
+		await expect(action).toBeVisible();
+		const rebased = unstar ? one : both;
+		await page.evaluate(([key, ids]) => localStorage.setItem(key, JSON.stringify(ids)), [KEY, rebased] as const);
+		await release();
+		await expectIds(page, [...rebased, 'arr-a']);
+		await action.click();
+		await page.evaluate((key) => navigator.locks.request(key, () => {}), KEY);
+		const expected = unstar ? ['arr-a'] : [...both, 'arr-a'];
+		expect(await stored(page)).toEqual(expected);
+		await expectIds(page, expected);
+	});
+}
 
 test('Library Star all sends the full selection when a peer removes a star', async ({ page }) => {
 	await open(page, ['arr-z']);

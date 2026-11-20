@@ -787,7 +787,8 @@
 
 	function editFavorites(
 		update: (latest: readonly string[]) => readonly string[],
-		applied?: (before: readonly string[], after: readonly string[]) => void
+		applied?: (before: readonly string[], after: readonly string[]) => void,
+		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection }
 	): void {
 		const session = browserStorage('session');
 		const key = favoritesKey(session);
@@ -816,16 +817,21 @@
 				const visit = new Set(optimistic);
 				const durable = committed.filter((id) => !baseline.has(id) || visit.has(id));
 				const visible = new Set(durable);
-				// Keep visit-only IDs before their next surviving durable neighbor.
+				// Anchor an explicit visit-only move to the row it crossed; keep other
+				// visit-only IDs before their next surviving durable neighbor.
+				const moved = placement && !baseline.has(placement.id) && !visible.has(placement.id)
+					&& visible.has(placement.crossed) ? placement : undefined;
 				const beforeNeighbor = new Map<string, string[]>();
 				let pending: string[] = [];
 				for (const id of optimistic) {
 					if (visible.has(id)) {
 						if (pending.length) beforeNeighbor.set(id, pending);
 						pending = [];
-					} else if (!baseline.has(id)) pending.push(id);
+					} else if (!baseline.has(id) && id !== moved?.id) pending.push(id);
 				}
-				favorites = [...durable.flatMap((id) => [...(beforeNeighbor.get(id) ?? []), id]), ...pending];
+				const reconciled = [...durable.flatMap((id) => [...(beforeNeighbor.get(id) ?? []), id]), ...pending];
+				if (moved) reconciled.splice(reconciled.indexOf(moved.crossed) + (moved.direction === 'down' ? 1 : 0), 0, moved.id);
+				favorites = reconciled;
 			}
 			favoriteBaseline = committed;
 		});
@@ -908,7 +914,10 @@
 		const loaded = new Set(items.map((track) => track.id));
 		const visible = (ids: readonly string[]) => ids.filter((storedId) => loaded.has(storedId));
 		const move = (ids: readonly string[]) => moveFavoriteId(ids, visible(ids), id, direction);
-		if (move(favorites) === favorites) return;
+		const displayed = visible(favorites);
+		const index = displayed.indexOf(id);
+		const crossed = displayed[index + (direction === 'down' ? 1 : -1)];
+		if (index === -1 || crossed === undefined) return;
 		favoritesAnnouncement = '';
 		const track = items.find((candidate) => candidate.id === id);
 		recoverFocus();
@@ -919,7 +928,7 @@
 			if (position !== -1 && position !== visible(before).indexOf(id)) {
 				favoritesAnnouncement = `${track ? displayTitle(track) : id} moved to ${position + 1} of ${ids.length}`;
 			}
-		});
+		}, { id, crossed, direction });
 	}
 
 	function moveFavoriteLabel(track: LibraryItem, direction: FavoriteMoveDirection): string {
