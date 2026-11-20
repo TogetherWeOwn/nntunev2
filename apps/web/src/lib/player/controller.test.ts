@@ -164,8 +164,10 @@ test('final teardown retires all receipts before native pause and leaves a fresh
 	const initial = createQueue([{ id: 'coral', title: 'Coral', artist: '', streamUrl: '/coral' }]);
 	const { promise, resolve } = Promise.withResolvers<void>();
 	const flush = vi.fn(() => promise);
-	const player = createPlayerController(initial, { flush });
-	const fresh = createPlayerController(initial, { flush: async () => {} });
+	const matchesNative = (audio: HTMLAudioElement, source: string) =>
+		audio.isConnected && audio.getAttribute('src') === source;
+	const player = createPlayerController(initial, { flush }, matchesNative);
+	const fresh = createPlayerController(initial, { flush: async () => {} }, matchesNative);
 	const makeAudio = () => Object.assign(new EventTarget(), {
 		paused: false, ended: false, isConnected: true, getAttribute: () => '/coral',
 		play: vi.fn(async () => {}), pause: vi.fn(), currentTime: 0, duration: 120
