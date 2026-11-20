@@ -31,6 +31,7 @@ export function createPlayerController(
 	function resetAtAuthBoundary(): void {
 		media.clearShareSeek();
 		retireNativeHost();
+		media.clearSeekFeedback();
 	}
 
 	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit): boolean {

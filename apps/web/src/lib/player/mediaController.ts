@@ -94,7 +94,6 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		// Retire the native receipt without imposing replacement's share-clear policy on remove/clear.
 		attachmentVersion += 1;
 		previous?.listeners.abort();
-		clearSeekFeedback();
 		pause(previous?.audio);
 	}
 
@@ -429,7 +428,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 					audio.addEventListener(type, observe, { signal: receipt.listeners.signal });
 				}
 			}
-			if (previous && current === receipt) clearSeekFeedback();
+			lastJumpTarget = undefined;
 			listenForNativeEvents();
 			pause(previous?.audio);
 			return () => {
