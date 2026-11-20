@@ -1016,7 +1016,11 @@ impl PgStore {
                         "worker-cancel-test" => 15433,
                         _ => 5432,
                     },
-                    "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
+                    if self.trace_id == billing_deadline_test::RESTRICTED_HISTORY_TRACE {
+                        "host=127.0.0.1 user=billing_history_fixture password=ci-throwaway dbname=nntune_billing_ack sslmode=disable"
+                    } else {
+                        "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test"
+                    }.to_owned(),
                 );
                 #[cfg(not(feature = "billing-owned-wasm-test"))]
                 let target = {

@@ -30,6 +30,9 @@ pub const LOOKUP_TARGET: &str = "SELECT user_id, stripe_subscription_id, \
 /// This statement alone does not couple the write to the lock, lookup or history.
 pub const WRITE_SUBSCRIPTION: &str = include_str!("billing_transaction_write.sql");
 
+// The coupled store pins history to the same schema as the lock and target.
+const WRITE_HISTORY: &str = "INSERT INTO public.paid_invoice_history (user_id, stripe_invoice_id, stripe_subscription_id, plan_id, period_start, period_end, amount_cents, currency, paid_at) VALUES ($1, $2, $3, $4, to_timestamp($5::bigint), to_timestamp($6::bigint), $7, $8, to_timestamp($9::bigint)) ON CONFLICT DO NOTHING";
+
 /// Ordered parameters for the global lookup: key, incoming paid-through epoch,
 /// incoming paid invoice ID. Do not use an owner filter to hide foreign rows.
 #[derive(Debug, PartialEq, Eq)]
@@ -160,7 +163,7 @@ pub(crate) async fn apply_reconcile_transaction(
         for history in &outcome.history {
             transaction
                 .query_typed(
-                    crate::billing_reconcile::insert_paid_invoice_history_statement(),
+                    WRITE_HISTORY,
                     &[
                         (&user_id, Type::TEXT),
                         (&history.stripe_invoice_id, Type::TEXT),
@@ -248,6 +251,18 @@ mod tests {
         parameters.sort_unstable();
         parameters.dedup();
         assert_eq!(parameters, (1..=15).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn history_write_only_changes_the_legacy_relation() {
+        assert_eq!(
+            WRITE_HISTORY,
+            crate::billing_reconcile::insert_paid_invoice_history_statement().replacen(
+                "INSERT INTO paid_invoice_history ",
+                "INSERT INTO public.paid_invoice_history ",
+                1,
+            ),
+        );
     }
 
     #[test]

@@ -242,6 +242,15 @@ pub async fn billing_owned_test_entry(
             "/billing-webhook-retry-proof" => {
                 return worker_entry::billing_webhook_ack_test::deliver(req, env, false).await;
             }
+            path @ ("/billing-restricted-history-proof" | "/billing-restricted-history-replay") => {
+                let replay = path == "/billing-restricted-history-replay";
+                return match worker_entry::billing_deadline_test::test_restricted_history(replay)
+                    .await
+                {
+                    Ok(()) => worker::Response::ok("billing-restricted-history-ok"),
+                    Err(_) => worker::Response::error("billing-restricted-history-failed", 500),
+                };
+            }
             _ => {}
         }
     }
