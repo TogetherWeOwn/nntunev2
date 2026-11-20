@@ -119,15 +119,22 @@ pub(super) async fn mount(request: &web_sys::Request, env: &Env) -> Option<Worke
 #[cfg(feature = "staging-body-wasm-test")]
 mod wasm_test {
     use super::*;
+    use worker::js_sys::Array;
     use worker::wasm_bindgen::{self, prelude::*};
 
     #[wasm_bindgen]
-    pub fn staging_measurement_admits(request: web_sys::Request, env: Env, now: u32) -> bool {
-        var(&env, "SUBSONIC_MEASUREMENT_LEASE").is_some_and(|raw| {
-            admitted(&request, &env, u64::from(now), &raw)
-                .and_then(|(_, schedule)| runner_case(&request, &env, schedule))
-                .and_then(schedule::Case::catalogue)
-                .is_some()
-        })
+    pub fn staging_measurement_case(
+        request: web_sys::Request,
+        env: Env,
+        now: u32,
+    ) -> Option<Array> {
+        let raw = var(&env, "SUBSONIC_MEASUREMENT_LEASE")?;
+        let (_, schedule) = admitted(&request, &env, u64::from(now), &raw)?;
+        let case = runner_case(&request, &env, schedule)?;
+        case.catalogue()?;
+        Some(Array::of2(
+            &JsValue::from_str(case.fixture_id()),
+            &case.headroom().map_or(JsValue::UNDEFINED, JsValue::from),
+        ))
     }
 }

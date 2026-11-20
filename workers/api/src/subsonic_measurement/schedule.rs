@@ -68,11 +68,15 @@ impl Case {
         }
     }
 
-    pub(super) fn catalogue(self) -> Option<SyntheticCatalogue> {
-        SyntheticCatalogue::from_trusted_id(if self.headroom().is_some() {
+    pub(super) fn fixture_id(self) -> &'static str {
+        if self.headroom().is_some() {
             "small"
         } else {
             self.0
-        })
+        }
+    }
+
+    pub(super) fn catalogue(self) -> Option<SyntheticCatalogue> {
+        SyntheticCatalogue::from_trusted_id(self.fixture_id())
     }
 }

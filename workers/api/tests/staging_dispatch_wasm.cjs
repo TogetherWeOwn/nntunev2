@@ -2,7 +2,8 @@
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { staging_dispatch_test: dispatch, staging_measurement_admits: admits, staging_fixture_charge: charge } = require(process.env.STAGING_BODY_WASM_JS);
+const { staging_dispatch_test: dispatch, staging_measurement_case: resolveCase, staging_fixture_charge: charge } = require(process.env.STAGING_BODY_WASM_JS);
+const admits = (...args) => resolveCase(...args) !== undefined;
 
 const request = (path) => new Request(`https://example.test/rest/${path}`);
 const neverOpen = () => assert.fail('app connector must not run');
@@ -28,15 +29,15 @@ test('only the exact armed staging deployment admits the QA runner', () => {
     assert.equal(admits(req(target), env, 1000), false);
   }
   assert.equal(admits(req(), {}, 1000), false);
-  for (const id of ['empty', 'small', 'charge-below', 'charge-exact', 'charge-over'])
-    assert.equal(admits(req(url, undefined, id), env, 1000), true);
-  const fullMatrix = ['empty', 'small', 'large-mixed',
-    ...['rows', 'charge', 'text', 'output-json', 'output-xml', 'output-jsonp']
+  const chargeHeadroom = { 'charge-below': 4025, 'charge-exact': 4024, 'charge-over': 4023 };
+  const fullMatrix = ['empty', 'small', 'large-mixed', ...Object.keys(chargeHeadroom),
+    ...['rows', 'text', 'output-json', 'output-xml', 'output-jsonp']
       .flatMap((prefix) => ['below', 'exact', 'over'].map((position) => `${prefix}-${position}`))];
+  const fullEnv = { ...env, SUBSONIC_MEASUREMENT_LEASE: `${lease};${fullMatrix.join(',')}` };
   for (const id of fullMatrix) {
-    assert.equal(admits(req(url, undefined, id), {
-      ...env, SUBSONIC_MEASUREMENT_LEASE: `${lease};${fullMatrix.join(',')}`,
-    }, 1000), true, id);
+    const headroom = chargeHeadroom[id];
+    assert.deepEqual(resolveCase(req(url, undefined, id), fullEnv, 1000),
+      [headroom === undefined ? id : 'small', headroom], id);
   }
   assert.equal(admits(req(`${url}?fixture=unknown&cap=0`), env, 1000), true);
   const missing = req(`${url}?case=small`);
