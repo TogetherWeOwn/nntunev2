@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -229,6 +230,27 @@ class RecordingAliasProjectionTest(ProjectionTestCase):
             for row in rows
         ))
         self.assert_alias_output_matches_in_both_modes()
+
+    def test_alias_id_breaks_ties_independently_of_rowid(self):
+        etl = load("etl_alias_order", ROOT / "etl.py", {"MB_ETL_GZIP_OUTPUT": "0"})
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        # An INTEGER PRIMARY KEY aliases rowid and masks a missing ID sort.
+        db.executescript(r"""
+            CREATE TABLE recording (id INTEGER PRIMARY KEY, gid TEXT);
+            INSERT INTO recording VALUES (50, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd');
+            CREATE TABLE recording_alias (
+                id INTEGER NOT NULL, entity INTEGER, name TEXT, locale TEXT,
+                sort_name TEXT, primary_flag TEXT, name_key TEXT, locale_key TEXT
+            );
+            INSERT INTO recording_alias VALUES
+                (710, 50, 'Echo', 'en', 'Echo', 't', 'Echo', 'en'),
+                (709, 50, '\105cho', 'en', 'Echo', 't', 'Echo', 'en');
+        """)
+        stamp = "2025-02-03T04:05:06Z"
+        self.assertEqual(etl.project_aliases(db, "recording", self.tmp, stamp), 1)
+        self.assertEqual((self.tmp / self.output).read_text(encoding="utf-8"),
+                         f"dddddddd-dddd-4ddd-8ddd-dddddddddddd\t\\105cho\ten\tEcho\tt\t{stamp}\n")
 
     def assert_alias_output_matches_in_both_modes(self):
         expected = (ROOT / "tests" / "expected" / self.output).read_bytes()
