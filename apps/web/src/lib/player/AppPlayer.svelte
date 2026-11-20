@@ -1,14 +1,11 @@
 <script module lang="ts">
 	import { createContext } from 'svelte';
 	import { createPlayerController } from './controller.svelte.js';
-
-	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & {
-		claimShareEntry?: () => boolean;
-	}>();
+	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & { claimShareEntry?: () => boolean }>();
 </script>
 
 <script lang="ts">
-	import { tick, type Snippet } from 'svelte';
+	import { onMount, tick, type Snippet } from 'svelte';
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
 	import { browserStorage, LIBRARY_AUTH_TRANSITION_KEY } from '../library/cache.js';
 	import { LIBRARY_ACCESS_REFUSED_EVENT } from '../library/refresh.js';
@@ -24,13 +21,11 @@
 	}));
 	const { queue, media } = player;
 	const seekFeedback = media.seekFeedback;
-	const attachNativeAudio = media.attach;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 
 	// Retire the decoder before the mounted Library handles the same signal.
 	$effect.pre(() => {
-		media.restoreRepeat(browserStorage('local'));
 		const offAuth = subscribeLocalAuthTransition(player.purgeAtAuthBoundary);
 		const onStorage = (event: StorageEvent) => {
 			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) player.purgeAtAuthBoundary();
@@ -41,6 +36,13 @@
 			offAuth();
 			window.removeEventListener('storage', onStorage);
 			window.removeEventListener(LIBRARY_ACCESS_REFUSED_EVENT, player.purgeAtAuthBoundary);
+		};
+	});
+
+	// Library's pre-effect disposes route state before player teardown.
+	onMount(() => {
+		media.restoreRepeat(browserStorage('local'));
+		return () => {
 			clearMiniPlayerHint();
 			player.destroy();
 		};
@@ -51,7 +53,7 @@
 {#if streamUrl}
 	<div class="nt-wrap">
 		<NativePlayer
-			{currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
+			{currentTrack} mediaRevision={player.mediaRevision} {streamUrl} attachNativeAudio={media.attach}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump}
 		/>
 	</div>
