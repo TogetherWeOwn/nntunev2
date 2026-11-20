@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LIBRARY_AUTH_CONTEXT_KEY, type SnapshotStorage } from './cache.js';
 import { clearFavoritesAtAuthBoundary, loadFavorites, saveFavorites } from './favorites.js';
 
@@ -20,6 +20,8 @@ function sessionFor(context: string): SnapshotStorage {
 	session.setItem(LIBRARY_AUTH_CONTEXT_KEY, context);
 	return session;
 }
+afterEach(() => vi.unstubAllGlobals());
+
 const KEY = 'nntune.library.favorites.v1.account-a';
 
 describe('favorites arrangement ordered storage controls', () => {
@@ -63,11 +65,14 @@ describe('favorites arrangement ordered storage controls', () => {
 		expect(local.getItem(KEY)).toBe('["arr-m","hidden","arr-z","arr-a"]');
 	});
 
-	it('[FAVORDER-S04] outgoing arranged order is cleared before a new context can bootstrap', () => {
+	it('[FAVORDER-S04] the outgoing purge leaves the new context untouched', async () => {
+		const request = async (name: string, _: LockOptions, run: LockGrantedCallback<unknown>) =>
+			run({ name, mode: 'exclusive' });
+		vi.stubGlobal('navigator', { locks: { request } });
 		const session = sessionFor('account-a');
 		const local = memoryStorage();
 		saveFavorites(session, local, ['arr-m', 'hidden', 'arr-z', 'arr-a']);
-		clearFavoritesAtAuthBoundary(session, local);
+		await clearFavoritesAtAuthBoundary(session, local);
 		expect(local.getItem(KEY)).toBeNull();
 		session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'account-b');
 		expect(loadFavorites(session, local)).toEqual([]);

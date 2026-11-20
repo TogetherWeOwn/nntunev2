@@ -496,23 +496,20 @@ test.describe('favorites storage regressions', () => {
 		});
 	}
 
-	test('[FAV-R06] recovered writes persist the full pending set and survive reload', async ({ page }) => {
+	test('[FAV-R06] recovered writes persist only the new intent', async ({ page }) => {
 		await seedLibrary(page);
 		await failFavoritesStorage(page, 'setItem');
 		await starButton(page, 'fav-zulu').click();
 		await expectFavoriteIds(page, ['fav-zulu']);
 		await restoreFavoritesStorage(page);
-		// The next successful write must include the unpersisted first star,
-		// rather than rebuilding from the stale (empty) stored value.
+		// Recovery must not write the visit-only star along with the new edit.
 		await starButton(page, 'fav-alpha').click();
-		expect(storedIds(await readFavoritesRaw(page, await readAuthContext(page))).sort()).toEqual([
-			'fav-alpha', 'fav-zulu'
-		]);
-		await expectFavoriteIds(page, ['fav-alpha', 'fav-zulu']);
+		await expect.poll(async () => storedIds(await readFavoritesRaw(page, await readAuthContext(page)))).toEqual(['fav-alpha']);
+		await expectFavoriteIds(page, ['fav-alpha']);
 		await page.reload();
 		await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
-		await expectFavoriteIds(page, ['fav-alpha', 'fav-zulu']);
-		await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'true');
+		await expectFavoriteIds(page, ['fav-alpha']);
+		await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'false');
 		await expect(starButton(page, 'fav-alpha')).toHaveAttribute('aria-pressed', 'true');
 	});
 });

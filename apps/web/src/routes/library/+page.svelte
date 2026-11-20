@@ -22,9 +22,10 @@
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import {
 		clearFavoritesAtAuthBoundary,
+		favoritesKey,
 		loadFavorites,
-		saveFavorites,
-		selectFavoriteItems
+		selectFavoriteItems,
+		updateStoredFavorites
 	} from '#lib/library/favorites.js';
 	import {
 		clearRecentFindsAtAuthBoundary,
@@ -162,6 +163,7 @@
 	let queueConfirmGeneration = $state(0);
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
+	let favoriteEdit = 0;
 	let favoritesAnnouncement = $state('');
 	// One shared polite outcome for order, view and clear actions: a new
 	// outcome replaces the previous text (keyed re-announce), never queues.
@@ -383,8 +385,7 @@
 				}
 			}
 			// Bootstrap once after an authenticated load has minted the context.
-			// Memory stays authoritative for this visit, even if persistence
-			// fails; Refresh must not overwrite pending edits with stale storage.
+			// Refresh must not overwrite visit-only edits when persistence fails.
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
 				if (!favoritesInitialized) {
@@ -782,18 +783,29 @@
 		player.announceQueue(`Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`);
 	}
 
+	function editFavorites(update: (latest: readonly string[]) => readonly string[]): void {
+		const session = browserStorage('session');
+		const local = browserStorage('local');
+		const key = favoritesKey(session);
+		const edit = ++favoriteEdit;
+		// Keep the visit usable when storage is unavailable, but never replay
+		// its in-memory list as a durable write.
+		favorites = [...update(favorites)];
+		if (!local || !key) return;
+		void updateStoredFavorites(session, local, key, update).then((committed) => {
+			if (committed && edit === favoriteEdit && favoritesKey(session) === key) {
+				favorites = committed;
+			}
+		});
+	}
+
 	function toggleFavorite(id: string): void {
-		// Toggle visible state, not the last successful write. The next write
-		// persists the full set, including edits made while storage failed.
-		const next = favorites.includes(id)
-			? favorites.filter((favorite) => favorite !== id)
-			: [...favorites, id];
-		favorites = next;
+		const remove = favorites.includes(id);
+		editFavorites((latest) => remove ? latest.filter((favorite) => favorite !== id) : [...new Set([...latest, id])]);
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), next);
 		// Favorites-only unmounts an unstarred row, including its focused button.
 		// All-tracks keeps that button mounted and must leave focus alone.
-		if (view === 'favorites' && !next.includes(id)) focusLibraryView();
+		if (view === 'favorites' && remove) focusLibraryView();
 	}
 
 	function focusLibraryView(): void {
@@ -849,10 +861,7 @@
 	 * Move a visible favorite one slot up or down within the complete
 	 * stored order. No-ops (boundary activation, stale id) return the same
 	 * array and change nothing: no save, no announcement, no focus shift.
-	 * Real moves persist the full list through the existing seam, announce
-	 * the new visible position politely, and keep keyboard focus on the
-	 * moved track's controls. Never touches the queue, the library view,
-	 * stars, refresh or the network.
+	 * Apply the move to the latest durable order without adding missing IDs.
 	 */
 	async function moveFavorite(
 		id: string,
@@ -860,13 +869,14 @@
 		event: Event | HTMLElement
 	): Promise<void> {
 		const button = event instanceof HTMLElement ? event : event.currentTarget;
-		const visibleIds = favoriteTracks.map((track) => track.id);
-		const next = moveFavoriteId(favorites, visibleIds, id, direction);
+		const loaded = new Set(items.map((track) => track.id));
+		const visible = (ids: readonly string[]) => ids.filter((storedId) => loaded.has(storedId));
+		const move = (ids: readonly string[]) => moveFavoriteId(ids, visible(ids), id, direction);
+		const next = move(favorites);
 		if (next === favorites) return;
-		favorites = [...next];
-		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
-		const visible = new Set(visibleIds);
-		const position = next.filter((storedId) => visible.has(storedId)).indexOf(id) + 1;
+		editFavorites(move);
+		const visibleIds = visible(next);
+		const position = visibleIds.indexOf(id) + 1;
 		const track = items.find((candidate) => candidate.id === id);
 		favoritesAnnouncement = `${track ? displayTitle(track) : id} moved to ${position} of ${visibleIds.length}`;
 		await tick();
@@ -971,8 +981,7 @@
 	}
 
 	/**
-	 * Shelf unstar: remove one id from the full visit state (hidden ids ride
-	 * along untouched) and persist the whole set through the existing saver.
+	 * Shelf unstar: remove one ID, leaving all other IDs untouched.
 	 * Queue, ordering and refresh are untouched. Focus moves to the next
 	 * surviving shelf unstar control, or the shelf heading when none remains.
 	 */
@@ -980,9 +989,8 @@
 		const removedIndex = favoriteTracks.findIndex((item) => item.id === id);
 		const track = items.find((item) => item.id === id);
 		const title = track ? displayTitle(track) : 'track';
-		favorites = favorites.filter((favorite) => favorite !== id);
+		editFavorites((latest) => latest.filter((favorite) => favorite !== id));
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
 		managementFeedback = `Removed ${title} from favorites.`;
 		void tick().then(() => {
 			const controls = shelfSection?.querySelectorAll<HTMLButtonElement>('[data-shelf-unstar]');
@@ -1004,14 +1012,12 @@
 	}
 
 	/**
-	 * Confirmed clear: persist the entire empty scoped set (including ids
-	 * absent from this library) through the existing saver. Never touches
-	 * the auth context, other accounts, the queue or the network.
+	 * Confirmed clear: remove every ID in the current scope, including IDs
+	 * absent from this library.
 	 */
 	function confirmClearFavorites(): void {
-		favorites = [];
+		editFavorites(() => []);
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), []);
 		confirmClear = false;
 		managementFeedback = 'Cleared local favorites.';
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
@@ -1197,8 +1203,9 @@
 		if (!surviving.length) return;
 		const remove = surviving.every((id) => favoriteIds.has(id));
 		const changed = surviving.filter((id) => favoriteIds.has(id) === remove);
-		favorites = remove ? favorites.filter((id) => !changed.includes(id)) : [...favorites, ...changed];
-		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
+		editFavorites((latest) => remove
+			? latest.filter((id) => !changed.includes(id))
+			: [...new Set([...latest, ...changed])]);
 		const already = surviving.length - changed.length;
 		const count = `${changed.length} ${changed.length === 1 ? 'track' : 'tracks'}`;
 		const track = (queued ? queue.tracks : source).find((track) => track.id === surviving[0]);
@@ -1392,9 +1399,9 @@
 			clearFavoritesExportFeedback();
 			releaseFavoritesDownload();
 			clearSignedInEmail();
-			// Clear favorites storage BEFORE the refresher revokes the
+			// Queue the purge before the refresher revokes the
 			// session auth context the scoped key derives from.
-			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+			void clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			favorites = [];
 			favoritesInitialized = false;
@@ -1418,7 +1425,7 @@
 		clearFavoritesExportFeedback();
 		releaseFavoritesDownload();
 		clearSignedInEmail();
-		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+		void clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
 		favoritesInitialized = false;

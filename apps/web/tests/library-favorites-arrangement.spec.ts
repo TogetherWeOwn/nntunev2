@@ -228,7 +228,7 @@ test('[FAVORDER-04] reload restores arrangement only after authenticated library
 
 for (const kind of ['getter', 'write'] as const) {
 	for (const recovery of ['move', 'toggle'] as const) {
-		test(`[FAVORDER-05:${kind}:${recovery}] storage failure keeps arrangement authoritative through refresh and later full-list save`, async ({ page }) => {
+		test(`[FAVORDER-05:${kind}:${recovery}] failed moves stay in memory until the next successful edit`, async ({ page }) => {
 			await open(page, ['arr-z', 'hidden', 'arr-a', 'arr-m']);
 			await faultStorage(page, kind);
 			await activate(page, 'Mike Song', 'up');
@@ -245,15 +245,15 @@ for (const kind of ['getter', 'write'] as const) {
 			await page.evaluate(() => Reflect.get(window, '__restoreArrangementStorage')());
 			if (recovery === 'move') {
 				await activate(page, 'Alpha Song', 'up');
-				await expectIds(page, ['arr-m', 'arr-a', 'arr-z']);
-				expect(await stored(page)).toEqual(['arr-m', 'hidden', 'arr-a', 'arr-z']);
+				await expect.poll(() => stored(page)).toEqual(['arr-a', 'hidden', 'arr-z', 'arr-m']);
+				await expectIds(page, ['arr-a', 'arr-z', 'arr-m']);
 			} else {
 				await star(page, 'arr-z').click();
-				await expectIds(page, ['arr-m', 'arr-a']);
-				expect(await stored(page)).toEqual(['arr-m', 'hidden', 'arr-a']);
+				await expect.poll(() => stored(page)).toEqual(['hidden', 'arr-a', 'arr-m']);
+				await expectIds(page, ['arr-a', 'arr-m']);
 			}
 			await page.reload();
-			await expectIds(page, recovery === 'move' ? ['arr-m', 'arr-a', 'arr-z'] : ['arr-m', 'arr-a']);
+			await expectIds(page, recovery === 'move' ? ['arr-a', 'arr-z', 'arr-m'] : ['arr-a', 'arr-m']);
 		});
 	}
 }
