@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { isListenContextRequest } from '../fixtures/listen-context.js';
 
 const HISTORY = 'nntune:demo-recently-played:v1';
 const QUEUE = 'nntune:demo-queue:v1';
@@ -17,6 +18,7 @@ async function open(page: Page) {
 		const request = route.request();
 		const url = new URL(request.url());
 		origin ||= url.origin;
+		if (isListenContextRequest(request, origin)) return route.fulfill({ status: 401 });
 		if (url.origin !== origin || request.method() !== 'GET' || ['fetch', 'xhr'].includes(request.resourceType())) {
 			rejected.push(`${request.method()} ${url.origin}${url.pathname}`);
 			await route.abort();
