@@ -2,7 +2,7 @@
 use super::{billing_budget, MirrorBinding, PgStore, ReconcileProbe, StoreError, CONNECTION};
 use crate::billing_reconcile::{
     reconcile_exact_target, reconcile_live_select_statement, reconcile_target_select_statement,
-    LiveRow, PriceBinding, ReconcileInput, RemoteSubscription,
+    FailClosedReason, LiveRow, PriceBinding, ReconcileInput, RemoteSubscription,
 };
 use serde_json::json;
 
@@ -377,6 +377,117 @@ pub(super) async fn check() -> Result<(), &'static str> {
         || state(HOLDER, None).await? != released
     {
         return Err("fresh exact-target retry did not recover state and history");
+    }
+    check_existing_target_suppression(&store).await
+}
+
+async fn check_existing_target_suppression(store: &PgStore) -> Result<(), &'static str> {
+    let holder = state(TARGET, None).await?;
+    let old = state(TERMINAL, None).await?;
+    let terminal = remote(TERMINAL, "si_worker_terminal", "incomplete_expired", &[]);
+    let close = reconcile_exact_target(input(old.row.clone()), &terminal, NOW);
+    store
+        .store_reconcile_owned(USER.into(), close, ReconcileProbe::None)
+        .await
+        .map_err(|_| "existing terminal update beside a live holder failed")?;
+    let archived = state(TERMINAL, None).await?;
+    if archived.row.as_ref().map(|row| row.status.as_str()) != Some("incomplete_expired")
+        || archived.history != old.history
+        || state(TARGET, None).await? != holder
+    {
+        return Err("existing terminal update was suppressed or displaced the holder");
+    }
+
+    let listing = remote(
+        TERMINAL,
+        "si_worker_terminal",
+        "active",
+        &[("in_worker_terminal_recovery", "usd")],
+    );
+    let delayed = reconcile_exact_target(input(holder.row.clone()), &listing, NOW);
+    if delayed.read_plan.is_some()
+        || delayed.read_anchor.is_some()
+        || store
+            .store_reconcile_owned(USER.into(), delayed, ReconcileProbe::None)
+            .await
+            .is_ok()
+        || state(TERMINAL, None).await? != archived
+        || state(TARGET, None).await? != holder
+    {
+        return Err("replacement-only read did not refuse the old target without writes");
+    }
+
+    let fresh = reconcile_exact_target(input(archived.row.clone()), &listing, NOW);
+    if fresh.explicit_stale
+        || fresh.fail_closed.is_some()
+        || fresh.read_plan.as_deref() != Some("free")
+        || fresh.read_anchor.is_some()
+        || fresh.row.paid_through_unix != Some(END)
+        || fresh.history.len() != 1
+    {
+        return Err("old target fold did not produce advancing evidence with its own proof");
+    }
+    store
+        .store_reconcile_owned(USER.into(), fresh.clone(), ReconcileProbe::None)
+        .await
+        .map_err(|_| "old target live-slot suppression refused attributed history")?;
+    let suppressed = state(TERMINAL, None).await?;
+    let history: serde_json::Value = serde_json::from_str(&suppressed.history)
+        .map_err(|_| "invalid suppression history snapshot")?;
+    if suppressed.subscription != archived.subscription
+        || suppressed.history_count != archived.history_count + 1
+        || history[1]["stripe_invoice_id"] != "in_worker_terminal_recovery"
+        || history[1]["stripe_subscription_id"] != TERMINAL
+        || history[1]["user_id"] != USER
+        || state(TARGET, None).await? != holder
+        || live_subscription_id().await? != TARGET
+    {
+        return Err("suppression did not preserve both rows and commit only attributed history");
+    }
+    store
+        .store_reconcile_owned(USER.into(), fresh.clone(), ReconcileProbe::None)
+        .await
+        .map_err(|_| "old target suppression replay failed")?;
+    if state(TERMINAL, None).await? != suppressed || state(TARGET, None).await? != holder {
+        return Err("old target suppression replay changed committed state");
+    }
+
+    let unknown = remote(TERMINAL, "si_worker_terminal", "trialing", &[]);
+    let observed = reconcile_exact_target(input(suppressed.row.clone()), &unknown, NOW);
+    if observed.explicit_stale
+        || observed.read_plan.as_deref() != Some("free")
+        || observed.fail_closed != Some(FailClosedReason::UnknownStatus)
+    {
+        return Err("unknown status did not produce a fresh fail-closed fold with its own proof");
+    }
+    store
+        .store_reconcile_owned(USER.into(), observed, ReconcileProbe::None)
+        .await
+        .map_err(|_| "unknown status update beside a live holder failed")?;
+    let recorded = state(TERMINAL, None).await?;
+    if recorded.row.as_ref().map(|row| row.status.as_str()) != Some("trialing")
+        || recorded.history != suppressed.history
+        || state(TARGET, None).await? != holder
+        || live_subscription_id().await? != TARGET
+    {
+        return Err("unknown status was not recorded verbatim or changed the live slot or history");
+    }
+
+    let released = state(TARGET, Some("canceled")).await?;
+    store
+        .store_reconcile_owned(USER.into(), fresh, ReconcileProbe::None)
+        .await
+        .map_err(|_| "same owned fold failed after the replacement released its slot")?;
+    let recovered = state(TERMINAL, None).await?;
+    let row = recovered.row.ok_or("old target missing after release")?;
+    if row.status != "active"
+        || row.paid_through_unix != Some(END)
+        || row.paid_invoice_id.as_deref() != Some("in_worker_terminal_recovery")
+        || recovered.history != suppressed.history
+        || state(TARGET, None).await? != released
+        || live_subscription_id().await? != TERMINAL
+    {
+        return Err("released slot did not accept the same fold without duplicating history");
     }
     Ok(())
 }

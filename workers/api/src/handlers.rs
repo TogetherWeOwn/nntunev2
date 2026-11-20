@@ -10370,6 +10370,7 @@ mod tests {
                     // Explicit stale ignores the numeric suppression predicate.
                     Target::Owned {
                         predicate_stale: false,
+                        other_live_holder: false,
                     }
                 } else {
                     Target::Absent

@@ -10,14 +10,17 @@
 /// Excludes subscription DML until the enclosing transaction ends.
 pub const LOCK_SUBSCRIPTIONS: &str = "LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE";
 
-/// Global key lookup and the existing upsert's conflict-WHERE suppression
-/// predicate. `IS TRUE` makes SQL NULL semantics yield an unambiguous boolean.
+/// Global key lookup and the upsert's stale and other-live-holder observations.
+/// `IS TRUE` makes SQL NULL semantics yield an unambiguous stale predicate.
 /// The owner is deliberately not part of the lookup predicate.
 pub const LOOKUP_TARGET: &str = "SELECT user_id, stripe_subscription_id, \
     (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND \
     (to_timestamp($2::bigint) < paid_through_at OR \
     (to_timestamp($2::bigint) = paid_through_at AND $3::text IS NULL AND \
-    paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale \
+    paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale, \
+    EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = subscriptions.user_id \
+    AND live.stripe_subscription_id <> subscriptions.stripe_subscription_id \
+    AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) AS other_live_holder \
     FROM public.subscriptions WHERE stripe_subscription_id = $1";
 
 /// Unused production write for the future transaction. It has the same 15
@@ -61,7 +64,8 @@ pub(crate) async fn apply_reconcile_transaction(
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))] probe: ReconcileProbe,
 ) -> Result<(), crate::handlers::StoreError> {
     use crate::billing_store_classification::{
-        classify_explicit_stale, classify_target, classify_write, Identity, ObservedTarget, Target,
+        classify_explicit_stale, classify_target, classify_write, has_slot_suppression_proof,
+        Identity, ObservedTarget, Target,
     };
     use crate::{billing_reconcile::reconcile_lock_statement, handlers::StoreError};
     use tokio_postgres::types::Type;
@@ -95,6 +99,7 @@ pub(crate) async fn apply_reconcile_transaction(
                         subscription_id: found.try_get("stripe_subscription_id")?,
                     },
                     predicate_stale: found.try_get("predicate_stale")?,
+                    other_live_holder: found.try_get("other_live_holder")?,
                 })
             })
             .collect::<Result<Vec<_>, tokio_postgres::Error>>()
@@ -148,7 +153,13 @@ pub(crate) async fn apply_reconcile_transaction(
                 })
                 .collect::<Result<Vec<_>, tokio_postgres::Error>>()
                 .map_err(|_| StoreError)?;
-            classify_write(&requested, &target, &returned).map_err(|_| StoreError)?;
+            classify_write(
+                &requested,
+                &target,
+                &returned,
+                has_slot_suppression_proof(&outcome),
+            )
+            .map_err(|_| StoreError)?;
         }
         for history in &outcome.history {
             transaction
@@ -211,17 +222,17 @@ mod tests {
             LOCK_SUBSCRIPTIONS,
             "LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE"
         );
-        assert_eq!(LOOKUP_TARGET, "SELECT user_id, stripe_subscription_id, (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND (to_timestamp($2::bigint) < paid_through_at OR (to_timestamp($2::bigint) = paid_through_at AND $3::text IS NULL AND paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale FROM public.subscriptions WHERE stripe_subscription_id = $1");
+        assert_eq!(LOOKUP_TARGET, "SELECT user_id, stripe_subscription_id, (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND (to_timestamp($2::bigint) < paid_through_at OR (to_timestamp($2::bigint) = paid_through_at AND $3::text IS NULL AND paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale, EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = subscriptions.user_id AND live.stripe_subscription_id <> subscriptions.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) AS other_live_holder FROM public.subscriptions WHERE stripe_subscription_id = $1");
     }
 
     #[test]
-    fn write_matches_existing_statement_except_relation_guard_and_returning() {
+    fn write_retains_legacy_binds_with_owner_and_live_slot_guards() {
         let existing = crate::billing_reconcile::store_reconciled_subscription_statement();
         let expected = existing.replacen(
             "INSERT INTO subscriptions ",
             "INSERT INTO public.subscriptions ",
             1,
-        ) + " AND subscriptions.user_id = EXCLUDED.user_id RETURNING user_id, stripe_subscription_id";
+        ) + " AND subscriptions.user_id = EXCLUDED.user_id AND (EXCLUDED.status NOT IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused') OR NOT EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = EXCLUDED.user_id AND live.stripe_subscription_id <> EXCLUDED.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused'))) RETURNING user_id, stripe_subscription_id";
         assert_eq!(WRITE_SUBSCRIPTION.trim(), expected);
 
         // Pin the insert bind order and the three additional fold inputs.
