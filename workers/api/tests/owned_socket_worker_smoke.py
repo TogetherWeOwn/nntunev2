@@ -426,6 +426,23 @@ def main():
                 for finish in ("commit", "rollback"):
                     admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
                     try:
+                        url = (
+                            f"http://127.0.0.1:{port}/billing-raw-insert-{finish}-proof"
+                        )
+                        status, _, body = routing.http("POST", url)
+                        routing.check(
+                            status == 200 and body == "billing-raw-insert-ok",
+                            f"preceding raw INSERT {finish}: HTTP {status}: {body}",
+                        )
+                        print(
+                            f"PASS: dormant store classified after preceding raw INSERT {finish}",
+                            flush=True,
+                        )
+                    finally:
+                        admin(f"DROP DATABASE {BILLING_DB}")
+                for finish in ("commit", "rollback"):
+                    admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                    try:
                         url = f"http://127.0.0.1:{port}/billing-raw-replace-{finish}-proof"
                         status, _, body = routing.http("POST", url)
                         routing.check(
