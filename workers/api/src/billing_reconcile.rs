@@ -283,6 +283,19 @@ fn qualify_line(
     Some(QualifiedLine { plan, start, end })
 }
 
+/// Fold a reconciliation snapshot without borrowing state from another subscription.
+#[allow(dead_code)] // The release caller stays on the legacy fold until activation.
+pub(crate) fn reconcile_exact_target(
+    mut local: ReconcileInput,
+    remote: &RemoteSubscription,
+    now_unix: i64,
+) -> ReconcileOutcome {
+    local.live = local
+        .live
+        .filter(|row| row.stripe_subscription_id == remote.subscription.id);
+    reconcile_subscription(&local, remote, now_unix)
+}
+
 /// Shared by the webhook and API/inline paths: fold one retrieved remote
 /// subscription plus its paid invoices (full lines) against local state
 /// into the row to persist, the history rows to insert, and the
