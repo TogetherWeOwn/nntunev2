@@ -2037,9 +2037,6 @@ where
     }
 }
 
-// Adapted from the history reader in PR #982. Keep unregistered until
-// private classification is atomic with new-play acquisition.
-#[allow(dead_code)]
 async fn me_history_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2049,6 +2046,14 @@ where
 {
     let (claims, _) = match preference_authenticate(ctx, req, false).await {
         Ok(pair) => pair,
+        // Keep the preference contract's envelope without changing legacy session routes.
+        Err(resp) if resp.status == 401 => {
+            let error = crate::api_error::ApiError::unauthorized("authentication required");
+            return Response {
+                body: error.body_json(),
+                ..resp
+            };
+        }
         Err(resp) => return resp,
     };
     match ctx.store.history_list(&claims.user_id).await {
@@ -7589,6 +7594,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/me/likes"
             | "/v1/me/likes/import"
             | "/v1/me/taste"
+            | "/v1/me/history"
             | "/v1/me/private-session"
             | "/v1/library"
             | "/api/library"
@@ -7788,6 +7794,7 @@ where
         ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
         ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
         ("DELETE", "/v1/me/taste") => me_taste_clear(ctx, req).await,
+        ("GET", "/v1/me/history") => me_history_list(ctx, req).await,
         ("PUT", "/v1/me/private-session") => me_private_session(ctx, req).await,
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
@@ -8368,7 +8375,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_history_lists_only_public_metered_plays_and_fails_closed() {
+    fn dispatched_history_lists_only_public_metered_plays_and_fails_closed() {
         use serde_json::{json, Value};
 
         let h = play_harness();
@@ -8379,18 +8386,26 @@ mod tests {
         let bob = magic_login(&h, "bob@example.com");
         let mut req = Request {
             method: "GET".into(),
-            path: "/v1/me/history?user_id=bob".into(),
-            cookie: Some(alice.clone()),
+            path: "/v1/me/history".into(),
+            cookie: None,
             origin: None,
             authorization: None,
             stripe_signature: None,
-            body: br#"{"user_id":"bob"}"#.to_vec(),
+            body: br#"{"user_id":"bob","cursor":"p20"}"#.to_vec(),
         };
         let call = |req: &Request| {
-            let resp = block_on(me_history_list(&h.ctx(), req));
+            let resp = block_on(handle(&h.ctx(), req));
             assert!(resp.set_cookie.is_none() && resp.extra_headers.is_empty());
             (resp.status, resp.body)
         };
+        let unauthorized = || {
+            (
+                401,
+                crate::api_error::ApiError::unauthorized("authentication required").body_json(),
+            )
+        };
+        assert_eq!(call(&req), unauthorized());
+        req.cookie = Some(alice.clone());
         let (claims, _) = block_on(preference_authenticate(&h.ctx(), &req, false)).unwrap();
         seed_entitled(&h, "alice", "plus", 100);
         assert!(shared_play_call(&h, "alice", &claims.session_id, "track", None).is_ok());
@@ -8488,7 +8503,7 @@ mod tests {
         // Model an erased user and cascaded session while retaining ledger fixtures.
         store.users.borrow_mut().remove("alice");
         store.sessions.borrow_mut().remove(&claims.session_id);
-        assert_eq!(call(&req), (401, generic_auth().body));
+        assert_eq!(call(&req), unauthorized());
         assert_eq!(snapshot(), before);
     }
 
@@ -15589,7 +15604,7 @@ mod tests {
         for path in [
             "/v1/me/likes/",
             "/v1/me/taste/",
-            "/v1/me/history",
+            "/v1/me/history/",
             "/v1/me/private-session/",
         ] {
             assert_eq!(
@@ -15645,7 +15660,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatched_likes_requires_a_cookie_and_maps_only_the_exact_get() {
+    fn dispatched_likes_and_history_require_a_cookie_and_map_only_exact_gets() {
         use crate::native_rest::{scope_for_operation, RouteDecision};
         let h = peppered_harness();
         seed_user(&h, "alice", "alice@example.com");
@@ -15657,35 +15672,38 @@ mod tests {
         );
         assert_eq!(minted.status, 201);
         let secret = mint_secret(&serde_json::from_str(&minted.body).unwrap());
-        let mut req = Request {
-            method: "GET".into(),
-            path: "/v1/me/likes".into(),
-            cookie: None,
-            origin: Some(ORIGIN.into()),
-            authorization: None,
-            stripe_signature: None,
-            body: Vec::new(),
-        };
         let call = |req: &Request| block_on(handle(&h.ctx(), req));
         let assert_not_found = |resp: Response| {
             assert_eq!((resp.status, resp.body), (404, not_found().body));
         };
-        assert_eq!(
-            scope_for_operation("GET", &req.path),
-            RouteDecision::SessionOnly
-        );
-        assert_eq!(call(&req).status, 401);
-        req.authorization = Some(format!("Bearer {secret}"));
-        assert_not_found(call(&req));
-        req.cookie = Some(cookie);
-        assert_not_found(call(&req));
-        req.authorization = None;
-        for method in ["HEAD", "PUT", "POST", "PATCH", "DELETE"] {
-            req.method = method.into();
-            assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
+        for path in ["/v1/me/likes", "/v1/me/history"] {
+            let mut req = Request {
+                method: "GET".into(),
+                path: path.into(),
+                cookie: None,
+                origin: Some(ORIGIN.into()),
+                authorization: None,
+                stripe_signature: None,
+                body: Vec::new(),
+            };
+            assert_eq!(scope_for_operation("GET", path), RouteDecision::SessionOnly);
+            assert_eq!(call(&req).status, 401);
+            req.authorization = Some(format!("Bearer {secret}"));
             assert_not_found(call(&req));
+            req.cookie = Some(cookie.clone());
+            assert_not_found(call(&req));
+            req.authorization = None;
+            for method in ["HEAD", "PUT", "POST", "PATCH", "DELETE"] {
+                req.method = method.into();
+                assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
+                assert_not_found(call(&req));
+            }
         }
-        let cases = [(&*req.path, "GET"), ("/v1/me/likes/import", "POST")];
+        let cases = [
+            ("/v1/me/likes", "GET"),
+            ("/v1/me/history", "GET"),
+            ("/v1/me/likes/import", "POST"),
+        ];
         for (path, method, origin) in cases.into_iter().flat_map(|(path, method)| {
             [Some(ORIGIN), Some("https://other.example"), None].map(|origin| (path, method, origin))
         }) {
@@ -17639,7 +17657,8 @@ mod tests {
             "/v1/me/taste/",
             "/v1/me/taste/track/example",
             "/v1/me/tastes",
-            "/v1/me/history",
+            "/v1/me/history/",
+            "/v1/me/history/extra",
             "/v1/me/private-session/",
             "/v1/me/private-session/extra",
         ] {
