@@ -5,6 +5,8 @@ use tokio_postgres::{types::Type, Client, IsolationLevel, Transaction};
 
 use crate::handlers::StoreError;
 
+pub const EVENTS_PATH: &str = "/v1/plays/events";
+pub const EVENTS_PER_MINUTE: u64 = 120;
 pub const EXPORT_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -49,6 +51,15 @@ pub struct ListenEventBody {
     pub playback_id: String,
     pub track_id: String,
     pub event: ListenEvent,
+}
+
+impl ListenEventBody {
+    pub fn valid(&self) -> bool {
+        valid_playback_id(&self.playback_id)
+            && !self.track_id.is_empty()
+            && self.track_id.len() <= 128
+            && !self.track_id.chars().any(char::is_control)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -101,12 +112,14 @@ impl ExportCursor {
 // Lock acquisition and history access must be separate statements at READ
 // COMMITTED, so the history snapshot starts after the owner lock is granted.
 async fn owner_is_deleting(tx: &Transaction<'_>, owner: &str) -> Result<Option<bool>, StoreError> {
-    tx.query_opt(
+    tx.query_typed(
         "SELECT deleting_at IS NOT NULL FROM public.users WHERE id = $1 FOR NO KEY UPDATE",
-        &[&owner],
+        &[(&owner, Type::TEXT)],
     )
     .await
     .map_err(|_| StoreError)?
+    .into_iter()
+    .next()
     .map(|row| row.try_get(0).map_err(|_| StoreError))
     .transpose()
 }
@@ -163,9 +176,9 @@ pub async fn record(
 
 async fn clear_in_transaction(tx: &Transaction<'_>, owner: &str) -> Result<(), StoreError> {
     if owner_is_deleting(tx, owner).await?.is_some() {
-        tx.execute(
+        tx.query_typed(
             "DELETE FROM public.listen_events WHERE user_id = $1",
-            &[&owner],
+            &[(&owner, Type::TEXT)],
         )
         .await
         .map_err(|_| StoreError)?;
