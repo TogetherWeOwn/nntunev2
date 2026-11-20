@@ -49,7 +49,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const bindings = {
 		view, favorites, queue, findQuery, findScope: 'both', order, groupByArtist, items: ITEMS,
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
-		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
+		libraryUnavailable: false,
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
 		groupLibraryItems, resolveStreamUrl,
 		createQueue: () => queue, createPlayerController,
@@ -60,11 +60,12 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		${compiled}
 		const { next, sources: evidence } = queueController.prepareLibrary([...items, ...queue.tracks]);
 		player.commitQueue(next, 'replace', { sources: evidence, isCurrent: () => true });
+		player.announceQueue('Previous outcome');
 		queueController.subscribe((value) => { queue = value; });
 		return {
 			disabled: bulkDisabled, allQueued: bulkAllQueued,
 			add: addDisplayedTracksToQueue,
-			read: () => ({ queue, announcement: queueAnnouncement })
+			read: () => ({ queue, announcement: player.queueAnnouncement.text })
 		};
 	`)(...Object.values(bindings)) as {
 		disabled: boolean; allQueued: boolean; add: () => void;

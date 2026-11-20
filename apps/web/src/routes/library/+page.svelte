@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import type { QueuedPlaySource } from '#lib/player/queueController.js';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
@@ -36,6 +35,7 @@
 		displayArtist,
 		displayTitle,
 		orderLibraryItems,
+		shortTitle,
 		type LibraryOrder
 	} from '#lib/library/order.js';
 	import { filterLibraryItems, type FindScope } from '#lib/library/filter.js';
@@ -143,12 +143,7 @@
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
-	const player = createPlayerController(createQueue([]), {
-		flush: () => tick(),
-		clearShareFeedback,
-		announce: (track) => announceEnd(track),
-		clearQueueAnnouncement: () => { queueAnnouncement = ''; }
-	});
+	const player = createPlayerController(createQueue([]), { flush: () => tick(), clearShareFeedback });
 	const commitQueue = player.commitQueue;
 	const replaceQueue = player.replaceQueue;
 	const queueController = player.queue;
@@ -226,8 +221,6 @@
 	let rangeAnchorId: string | null = null;
 	// Shift state of the checkbox click whose change event is in flight.
 	let extendSelection = false;
-	let queueAnnouncement = $state('');
-	let queueAnnouncementVersion = $state(0);
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -248,11 +241,6 @@
 
 	const seekFeedback = media.seekFeedback;
 	const attachNativeAudio = media.attach;
-
-	function announceEnd(track?: Track): void {
-		queueAnnouncement = track ? `Playing ${shortTitle(track.title?.trim() ? track.title : track.id)}.` : '';
-		if (track) queueAnnouncementVersion += 1;
-	}
 
 	let shareStatus = $state('');
 	let shareFallbackUrl: string | null = $state(null);
@@ -369,7 +357,7 @@
 			if (authoritative) {
 				const { next, sources } = queueController.prepareLibrary(state.items);
 				if (next !== queueController.snapshot) queueConfirmGeneration += 1;
-				if (state.loadError && state.items.length === 0) queueAnnouncement = '';
+				if (state.loadError && state.items.length === 0) player.announceQueue('');
 				commitQueue(next, 'replace', { sources, isCurrent });
 			}
 			// Queue publication can reenter the route and revoke this receipt.
@@ -547,7 +535,7 @@
 			.filter((item) => queueController.hasLibraryTrack(item.id));
 		if (missing.length === 0) return;
 		if (!replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)))) return;
-		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
+		player.announceQueue(`Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`);
 	}
 
 	/**
@@ -576,16 +564,7 @@
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
 		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
-		await playSelected(base, index, evidence, counts);
-	}
-
-	function playSelected(base: QueueState, index: number, source: QueuedPlaySource, suffix = ''): Promise<void> {
-		return media.playSelected(base, index, source, suffix, {
-			commit: replaceQueue,
-			flush: tick,
-			announce: (message) => { queueAnnouncement = message; },
-			bumpAnnouncement: () => { queueAnnouncementVersion += 1; }
-		});
+		await media.playSelected(base, index, evidence, counts);
 	}
 
 	let favoritesAction = 0;
@@ -600,7 +579,7 @@
 		}
 		if (action !== favoritesAction) return;
 		const added = queueController.snapshot.tracks.length - before;
-		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
+		player.announceQueue(`Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`);
 	}
 
 	/** Snapshot the listed favorites, in arranged order, as queue display tracks. */
@@ -639,13 +618,6 @@
 		} catch {
 			return undefined;
 		}
-	}
-
-	function shortTitle(title: string): string {
-		// Count code points, not UTF-16 units: slicing between a surrogate pair
-		// would announce a lone surrogate before the ellipsis.
-		const points = Array.from(title);
-		return points.length > 70 ? `${points.slice(0, 69).join('')}…` : title;
 	}
 
 	async function copyTrackLink(id: string, item = items.find((track) => track.id === id)): Promise<void> {
@@ -732,7 +704,7 @@
 		// live region.
 		if (reordered === queue) return;
 		if (!commitQueue(reordered, 'move')) return;
-		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
+		player.announceQueue(`${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`);
 	}
 
 	function removeQueuedTrack(index: number): void {
@@ -745,8 +717,7 @@
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
 		if (!commitQueue(next, 'remove')) return;
-		queueAnnouncement = `${title} removed from the queue.`;
-		queueAnnouncementVersion += 1;
+		player.announceQueue(`${title} removed from the queue.`, true);
 	}
 
 	function clearQueuedTracks(): void {
@@ -756,8 +727,7 @@
 		// region.
 		if (next === queue) return;
 		if (!commitQueue(next, 'clear')) return;
-		queueAnnouncement = 'Queue cleared.';
-		queueAnnouncementVersion += 1;
+		player.announceQueue('Queue cleared.', true);
 	}
 
 	/**
@@ -777,7 +747,7 @@
 		if (selected === queue) return;
 		if (!commitQueue(selected, 'select')) return;
 		const title = target.title?.trim() ? target.title : target.id;
-		queueAnnouncement = `Selected ${title}`;
+		player.announceQueue(`Selected ${title}`);
 	}
 
 	async function playQueuedTrack(id: string): Promise<void> {
@@ -788,7 +758,7 @@
 		if (!target) return;
 		const evidence = queueController.sourceForQueuedPlay(id, resolveStreamUrl(target) || undefined);
 		if (!evidence) return;
-		await playSelected(queue, index, evidence);
+		await media.playSelected(queue, index, evidence);
 	}
 
 	function trimPreviousTracks(): void {
@@ -800,7 +770,7 @@
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
 		if (!commitQueue(trimmed, 'trim')) return;
-		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
+		player.announceQueue(`Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`);
 	}
 
 	function trimUpcomingTracks(): void {
@@ -811,7 +781,7 @@
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
 		if (!commitQueue(trimmed, 'trim')) return;
-		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
+		player.announceQueue(`Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`);
 	}
 
 	function toggleFavorite(id: string): void {
@@ -874,7 +844,7 @@
 		if (!track) return;
 		const wasFavorite = favorites.includes(id);
 		toggleFavorite(id);
-		queueAnnouncement = `${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`;
+		player.announceQueue(`${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`);
 	}
 
 	function starLabel(track: LibraryItem): string {
@@ -1175,16 +1145,11 @@
 		return current ? [current, ...others] : others;
 	}
 
-	function announceInteraction(text: string): void {
-		queueAnnouncement = text;
-		queueAnnouncementVersion += 1;
-	}
-
 	function availableInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): string[] {
 		const queue = queueController.snapshot;
 		const surviving = survivingInteractionIds(ids, queued ? queue.tracks : source, loading || libraryUnavailable)
 			.filter(queueController.hasLibraryTrack);
-		if (!surviving.length) announceInteraction('That track is no longer available.');
+		if (!surviving.length) player.announceQueue('That track is no longer available.', true);
 		return surviving;
 	}
 
@@ -1209,7 +1174,7 @@
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
 		const counts = ids.length > 1 ? `Added ${added}${surviving.length > added ? `, ${surviving.length - added} already queued` : ''}.` : '';
-		await playSelected(base, index, evidence, (counts + missingInteractionLabel(ids, surviving)).trim());
+		await media.playSelected(base, index, evidence, (counts + missingInteractionLabel(ids, surviving)).trim());
 	}
 
 	function appendInteractionIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
@@ -1218,7 +1183,7 @@
 		if (!surviving.length) return;
 		const result = appendSelection(queue, surviving, source);
 		if (!replaceQueue(result.queue)) return;
-		announceInteraction(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving));
+		player.announceQueue(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving), true);
 	}
 
 	function favoriteInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): void {
@@ -1256,7 +1221,7 @@
 		const next = insertTracksNext(queue, knownTracks(surviving, source));
 		if (next === queue) return;
 		if (!replaceQueue(next)) return;
-		announceInteraction('Tracks placed next in the queue.' + missingInteractionLabel(ids, surviving));
+		player.announceQueue('Tracks placed next in the queue.' + missingInteractionLabel(ids, surviving), true);
 	}
 
 	function insertQueuedIds(ids: readonly string[], beforeId: string | null): void {
@@ -1267,8 +1232,7 @@
 		if (next === queue) return;
 		const added = next.tracks.length - queue.tracks.length;
 		if (!replaceQueue(next)) return;
-		queueAnnouncement = added ? `Added ${added} to the queue.` : 'Queue order updated.';
-		queueAnnouncementVersion += 1;
+		player.announceQueue(added ? `Added ${added} to the queue.` : 'Queue order updated.', true);
 	}
 
 	function reorderQueuedIds(ids: readonly string[], beforeId: string | null): void {
@@ -1281,8 +1245,7 @@
 		const next = insertTracks(queue, tracks, beforeId);
 		if (next === queue) return;
 		if (!replaceQueue(next)) return;
-		queueAnnouncement = 'Queue order updated.';
-		queueAnnouncementVersion += 1;
+		player.announceQueue('Queue order updated.', true);
 	}
 
 	function removeQueuedIds(ids: readonly string[]): void {
@@ -1296,8 +1259,7 @@
 		if (next === queue) return;
 		const removed = queue.tracks.length - next.tracks.length;
 		if (!replaceQueue(next)) return;
-		queueAnnouncement = `${removed} selected ${removed === 1 ? 'track removed' : 'tracks removed'} from queue.`;
-		queueAnnouncementVersion += 1;
+		player.announceQueue(`${removed} selected ${removed === 1 ? 'track removed' : 'tracks removed'} from queue.`, true);
 	}
 
 	function playbackMenuActions(ids: readonly string[], source: () => readonly LibraryItem[] = () => items): MenuAction[] {
@@ -1945,8 +1907,8 @@
 			-->
 			<PlayerQueue
 				state={queue}
-				announcement={queueAnnouncement}
-				announcementVersion={queueAnnouncementVersion}
+				announcement={player.queueAnnouncement.text}
+				announcementVersion={player.queueAnnouncement.version}
 				{favoriteIds}
 				ontogglefavorite={toggleQueuedFavorite}
 				onfavoriteids={(ids) => favoriteInteractionIds(ids, true)}

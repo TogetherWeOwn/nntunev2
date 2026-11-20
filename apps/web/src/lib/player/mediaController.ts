@@ -1,6 +1,7 @@
 import { get, writable } from 'svelte/store';
+import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
-import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode, type Track } from './queue.js';
+import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
 import { createPendingShareSeek } from './pendingShareSeek.js';
@@ -11,21 +12,14 @@ export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boole
 
 type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'revoke' | 'isCurrent'>;
 
-export type NaturalEndSelection = {
+export type MediaSelection = {
 	commit: (queue: QueueState) => boolean;
 	flush: () => Promise<void>;
 	clearShareFeedback: () => void;
-	announce: (track?: Track) => void;
+	announce: (message: string, replay?: boolean) => void;
 };
 
 const REPEAT_KEY = 'nntune:library-repeat:v1';
-
-type PlaySelection = {
-	commit: (queue: QueueState) => boolean;
-	flush: () => Promise<void>;
-	announce: (message: string) => void;
-	bumpAnnouncement: () => void;
-};
 
 function describeRestart(words: string, title: string): string {
 	const suffix = ` ${title}.`;
@@ -46,7 +40,7 @@ function matchesNativeSource(audio: HTMLAudioElement, source: string): boolean {
 	return nativeIsConnected?.call(audio) === true && nativeGetAttribute?.call(audio, 'src') === source;
 }
 
-export function createMediaController(queue: QueueAuthority, naturalEnd?: NaturalEndSelection, matchesNative = matchesNativeSource) {
+export function createMediaController(queue: QueueAuthority, selection?: MediaSelection, matchesNative = matchesNativeSource) {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let attachmentVersion = 0;
 	let endGeneration = 0;
@@ -99,14 +93,15 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 	}
 
 	async function playSelected(
-		base: QueueState, index: number, source: QueuedPlaySource, suffix: string, deps: PlaySelection
+		base: QueueState, index: number, source: QueuedPlaySource, suffix = ''
 	): Promise<void> {
+		if (!selection) return;
 		const target = base.tracks[index];
 		if (!target || destroyed || !source.isCurrent()) return;
 		const { streamUrl } = source;
 		const tracks = [...base.tracks];
 		tracks[index] = { ...target, streamUrl };
-		if (!deps.commit(selectTrack({ ...base, tracks }, index)) || !source.isCurrent() || destroyed) return;
+		if (!selection.commit(selectTrack({ ...base, tracks }, index)) || !source.isCurrent() || destroyed) return;
 
 		const receipt = queue.revoke();
 		let attachment = current;
@@ -116,7 +111,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
 		if (streamUrl) {
-			await deps.flush();
+			await selection.flush();
 			// A source change retires the old node before commit. In that case
 			// flush can admit one attachment, but not a reset or replacement while waiting.
 			if (!ownsAttempt() || attachmentVersion !== version + Number(!attachment && !!current)) return;
@@ -137,8 +132,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 			}
 		}
 		if (!isCurrent()) return;
-		deps.announce(suffix ? `${lead} ${suffix}` : lead);
-		if (isCurrent()) deps.bumpAnnouncement();
+		selection.announce(suffix ? `${lead} ${suffix}` : lead, true);
 	}
 
 	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
@@ -288,8 +282,8 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 	}
 
 	async function handleEnded(attachment: MediaAttachment, source: string, matchesOrigin: () => boolean): Promise<void> {
-		if (!naturalEnd) return;
-		const { commit, flush, clearShareFeedback, announce } = naturalEnd;
+		if (!selection) return;
+		const { commit, flush, clearShareFeedback, announce } = selection;
 		const { audio } = attachment;
 		const intent = positionIntent;
 		const version = attachmentVersion;
@@ -306,7 +300,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		if (result.action === 'ignore' || !ownsOrigin()) return;
 		attachment.playing = false;
 		generation = ++endGeneration;
-		announce();
+		announce('');
 		if (result.action !== 'play') return;
 		const track = currentTrack(result.queue);
 		const streamUrl = resolveStreamUrl(track);
@@ -345,7 +339,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 			// A captured play promise can fulfill before the queued pause event runs.
 			if (!matches() || target.paused || target.ended || target.error !== null) return;
 			replay.playing = true;
-			announce(track);
+			announce(`Playing ${shortTitle(displayTitle(track))}.`, true);
 		} catch {
 			// Autoplay can be refused; native controls remain available, no success claim.
 			if (matches()) replay.playing = false;

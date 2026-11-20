@@ -7,18 +7,18 @@ import { createQueueController } from './queueController.js';
 const createMediaController = (matchesNative?: Parameters<typeof createMedia>[2], initial: QueueState = createQueue([])) =>
 	createMedia(createQueueController(initial), undefined, matchesNative);
 
-test('feedback that retires the attempt cannot also bump its live region', async () => {
+test.each([true, false])('streamless play publishes one keyed outcome only for a current source (%s)', async (current) => {
 	const queue = { tracks: [{ id: 'coral', title: 'Coral', artist: '', streamUrl: '' }], currentIndex: 0 };
-	const media = createMediaController(undefined, queue);
-	const announce = vi.fn(() => media.destroy());
-	const bumpAnnouncement = vi.fn();
+	const announce = vi.fn();
 	const flush = vi.fn(async () => {});
-	await media.playSelected(queue, 0, { streamUrl: '', isCurrent: () => true }, '', {
-		commit: () => true, flush, announce, bumpAnnouncement
+	let valid = true;
+	const media = createMedia(createQueueController(queue), {
+		commit: () => { valid = current; return true; }, flush, clearShareFeedback: () => {}, announce
 	});
-	expect(announce).toHaveBeenCalledExactlyOnceWith('Selected Coral; no stream to play.');
+	await media.playSelected(queue, 0, { streamUrl: '', isCurrent: () => valid });
+	if (current) expect(announce).toHaveBeenCalledExactlyOnceWith('Selected Coral; no stream to play.', true);
+	else expect(announce).not.toHaveBeenCalled();
 	expect(flush).not.toHaveBeenCalled();
-	expect(bumpAnnouncement).not.toHaveBeenCalled();
 });
 
 const coral = createQueue([{ id: 'coral', title: 'Coral', artist: '', streamUrl: '/coral' }]);

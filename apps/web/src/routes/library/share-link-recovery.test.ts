@@ -7,7 +7,7 @@ import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { clearFavoritesAtAuthBoundary, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
 import { clearRecentFindsAtAuthBoundary, loadRecentFinds } from '#lib/library/recent-finds.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
-import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
+import { displayArtist, displayTitle, orderLibraryItems, shortTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
@@ -70,6 +70,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
 		afterNavigate: () => {},
+		shortTitle,
 		tick,
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
@@ -87,7 +88,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 			currentAudio: () => media.audio,
 			playTop: () => { renderedItems = items; return playDisplayedFromTop(); },
 			playIds: () => playLibraryIds(['coral']),
-			feedback: () => [queueAnnouncement, queueAnnouncementVersion],
+			feedback: () => [player.queueAnnouncement.text, player.queueAnnouncement.version],
 			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: media.pendingShareSeek, loadError })
 		};
 	`)(...Object.values(bindings)) as {
