@@ -452,6 +452,9 @@ pub(crate) fn cors_headers(
         ("vary", "origin".to_string()),
         ("access-control-allow-credentials", "true".to_string()),
     ];
+    if status == 429 {
+        headers.push(("access-control-expose-headers", "retry-after".to_string()));
+    }
     if status == 204 {
         // Exactly the methods the scope map serves, plus the OPTIONS
         // self-grant: omitting a served method (HEAD revalidation, PATCH
@@ -8775,6 +8778,14 @@ mod tests {
             ]
         );
         assert!(headers.iter().all(|(_, v)| v != "*"));
+    }
+
+    #[test]
+    fn cors_rate_limit_exposes_retry_after_only_to_the_configured_origin() {
+        let cfg = "https://app.example.com";
+        assert!(cors_headers(429, Some(cfg), cfg)
+            .contains(&("access-control-expose-headers", "retry-after".to_string(),)));
+        assert!(cors_headers(429, Some("https://other.example.com"), cfg).is_empty());
     }
 
     #[test]
