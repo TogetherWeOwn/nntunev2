@@ -251,6 +251,13 @@ pub async fn billing_owned_test_entry(
                     Err(_) => worker::Response::error("billing-restricted-history-failed", 500),
                 };
             }
+            "/billing-raw-update-proof" => {
+                return match worker_entry::billing_deadline_test::test_reconcile_raw_update().await
+                {
+                    Ok(()) => worker::Response::ok("billing-raw-update-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
             _ => {}
         }
     }
