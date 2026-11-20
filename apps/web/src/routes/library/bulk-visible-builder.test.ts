@@ -25,13 +25,11 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
 		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks',
-		'addDisplayedTracksToQueue', 'clearShareFeedback'
+		'addDisplayedTracksToQueue'
 	]);
 	const functions = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) => handlers.has(node.name?.text ?? ''));
 	expect(new Set(functions.map((node) => node.name?.text))).toEqual(handlers);
-	// Queue replacement clears real share state when the current source changes.
-	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'player', 'replaceQueue', 'queueController']);
+	const stateNames = new Set(['player', 'replaceQueue', 'queueController']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));

@@ -15,7 +15,7 @@ type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' 
 export type MediaSelection = {
 	commit: (queue: QueueState) => boolean;
 	flush: () => Promise<void>;
-	clearShareFeedback: () => void;
+	browseCopy: { invalidate: () => void };
 	announce: (message: string, replay?: boolean) => void;
 };
 
@@ -283,7 +283,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	async function handleEnded(attachment: MediaAttachment, source: string, matchesOrigin: () => boolean): Promise<void> {
 		if (!selection) return;
-		const { commit, flush, clearShareFeedback, announce } = selection;
+		const { commit, flush, browseCopy, announce } = selection;
 		const { audio } = attachment;
 		const intent = positionIntent;
 		const version = attachmentVersion;
@@ -308,7 +308,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const { volume, muted, playbackRate } = audio;
 		if (!ownsOrigin()) return;
 		// Replay supersedes a deferred share even when the native source survives.
-		clearShareFeedback();
+		browseCopy.invalidate();
 		if (!ownsOrigin()) return;
 		pendingShare.clear();
 		if (!commit(result.queue) || queue.snapshot !== result.queue || !track || !streamUrl) return;

@@ -143,7 +143,7 @@
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
-	const player = createPlayerController(createQueue([]), { flush: () => tick(), clearShareFeedback });
+	const player = createPlayerController(createQueue([]), { flush: () => tick() });
 	const commitQueue = player.commitQueue;
 	const replaceQueue = player.replaceQueue;
 	const queueController = player.queue;
@@ -242,10 +242,7 @@
 	const seekFeedback = media.seekFeedback;
 	const attachNativeAudio = media.attach;
 
-	let shareStatus = $state('');
-	let shareFallbackUrl: string | null = $state(null);
 	let shareInvalid = $state(false);
-	let shareGeneration = 0;
 	let shareAlive = true;
 	let draggedLibraryItem: LibraryItem | null = null;
 	// Queue-row share outcomes live apart from the browse share feedback so a
@@ -349,7 +346,7 @@
 				recentFindsAnnouncement = '';
 			}
 			if (state.loading || state.items.length === 0) {
-				clearShareFeedback();
+				player.browseCopy.invalidate();
 				clearFavoritesExportFeedback();
 				media.clearShareSeek();
 			}
@@ -515,7 +512,7 @@
 
 	function selectTrack(id: string, item = items.find((track) => track.id === id)): boolean {
 		if (!item || !queueController.hasLibraryTrack(id)) return false;
-		clearShareFeedback();
+		player.browseCopy.invalidate();
 		media.clearShareSeek();
 		// Preserve append-only row selection; only an inbound link explicitly
 		// selects its target. Stream-less items still carry display fields only.
@@ -593,17 +590,11 @@
 			.join('\u0001');
 	}
 
-	function clearShareFeedback(): void {
-		shareGeneration += 1;
-		shareStatus = '';
-		shareFallbackUrl = null;
-	}
-
 	function resetShareAtAuthBoundary(): void {
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 		player.resetAtAuthBoundary();
-		clearShareFeedback();
+		player.browseCopy.invalidate();
 		queueShare.reset();
 		shareInvalid = false;
 	}
@@ -621,8 +612,7 @@
 	}
 
 	async function copyTrackLink(id: string, item = items.find((track) => track.id === id)): Promise<void> {
-		clearShareFeedback();
-		const generation = shareGeneration;
+		const generation = player.browseCopy.invalidate();
 		if (!item || loading) return;
 		const current = queueCurrentTrack(queueController.snapshot);
 		const seconds =
@@ -634,20 +624,19 @@
 		} catch {
 			return;
 		}
-		const clipboard = clipboardWriter();
-		if (!clipboard) {
-			shareFallbackUrl = url;
-			return;
-		}
+		let copied = false;
 		try {
-			await clipboard.writeText(url);
+			const clipboard = clipboardWriter();
+			if (clipboard) {
+				await clipboard.writeText(url);
+				copied = true;
+			}
 		} catch {
-			if (shareAlive && generation === shareGeneration) shareFallbackUrl = url;
-			return;
+			// Clipboard refusal falls back to a manual copy if this attempt still owns feedback.
 		}
-		if (!shareAlive || generation !== shareGeneration) return;
-		const title = shortTitle(displayTitle(item));
-		shareStatus = `Copied link for ${title}.`;
+		if (!shareAlive || generation !== player.browseCopy.generation) return;
+		const status = copied ? `Copied link for ${shortTitle(displayTitle(item))}.` : '';
+		player.browseCopy.settle(generation, status, copied ? null : url);
 	}
 
 	function applyShareLink(): void {
@@ -1456,7 +1445,7 @@
 			queueShare.dispose();
 			media.destroy();
 			favoritesExport.destroy();
-			clearShareFeedback();
+			player.browseCopy.invalidate();
 			refresher.dispose();
 			// The queue is page state but the mini-player hint is shell
 			// state: leaving the library empties the queue's visible hint
@@ -1492,9 +1481,9 @@
 			Invalid link — choose a track from your library.
 		</p>
 	{/if}
-	<div data-testid="library-share-status" aria-live="polite" aria-atomic="true">{shareStatus}</div>
+	<div data-testid="library-share-status" aria-live="polite" aria-atomic="true">{player.browseCopy.feedback.status}</div>
 	<p data-testid="library-browse-status" class="nt-visually-hidden" aria-live="polite" aria-atomic="true">{#key browseAnnouncementVersion}{browseAnnouncement}{/key}</p>
-	{#if shareFallbackUrl}
+	{#if player.browseCopy.feedback.fallbackUrl}
 		<div class="nt-library-share-fallback">
 			<label for="library-share-url">Track link</label>
 			<input
@@ -1502,7 +1491,7 @@
 				data-testid="library-share-fallback"
 				aria-describedby="library-share-instructions"
 				readonly
-				value={shareFallbackUrl}
+				value={player.browseCopy.feedback.fallbackUrl}
 			/>
 			<p id="library-share-instructions" data-testid="library-share-instructions">
 				Select the link and press Ctrl+C or Cmd+C to copy it.

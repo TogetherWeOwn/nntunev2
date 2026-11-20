@@ -5,7 +5,7 @@ import { createQueue } from './queue.js';
 
 test('queue commits publish only display metadata and skip same-object Library refreshes', () => {
 	const player = createPlayerController(createQueue([]), {
-		flush: async () => {}, clearShareFeedback: () => {}
+		flush: async () => {}
 	});
 	const next = {
 		tracks: [
@@ -36,7 +36,7 @@ test('queue commits publish only display metadata and skip same-object Library r
 
 test('queue feedback preserves replay keys across refresh and replacement', () => {
 	const initial = createQueue([]);
-	const effects = { flush: async () => {}, clearShareFeedback: () => {} };
+	const effects = { flush: async () => {} };
 	const player = createPlayerController(initial, effects);
 	const other = createPlayerController(initial, effects);
 	const text = 'Queue cleared.';
@@ -54,4 +54,25 @@ test('queue feedback preserves replay keys across refresh and replacement', () =
 	expect(player.replaceQueue(createQueue([]))).toBe(true);
 	expect(player.queueAnnouncement).toEqual({ text: '', version: 2 });
 	expect(other.queueAnnouncement).toEqual({ text: '', version: 0 });
+});
+
+test('an accepted replacement clears only its own browse-copy feedback', () => {
+	const initial = createQueue([{ id: 'coral', title: 'Coral', artist: '', streamUrl: '/coral' }]);
+	const effects = { flush: async () => {} };
+	const player = createPlayerController(initial, effects);
+	const other = createPlayerController(initial, effects);
+	const empty = createQueue([]);
+	for (const { browseCopy } of [player, other]) {
+		browseCopy.settle(browseCopy.invalidate(), 'Copied link for Coral.', null);
+	}
+
+	try {
+		expect(player.commitQueue(empty, 'replace', { sources: new Map(), isCurrent: () => false })).toBe(false);
+		expect(player.browseCopy.feedback.status).toBe('Copied link for Coral.');
+		expect(player.replaceQueue(empty)).toBe(true);
+		expect(player.browseCopy.feedback).toEqual({ status: '', fallbackUrl: null });
+		expect(other.browseCopy.feedback.status).toBe('Copied link for Coral.');
+	} finally {
+		clearMiniPlayerHint();
+	}
 });
