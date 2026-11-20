@@ -45,6 +45,8 @@ L_ARTIST_URL_LINK_ID, L_ARTIST_URL_ARTIST_ID, L_ARTIST_URL_URL_ID = 2, 3, 4
 L_RECORDING_URL_LINK_ID, L_RECORDING_URL_RECORDING_ID, L_RECORDING_URL_URL_ID = 2, 3, 4
 L_RR_LINK_ID, L_RR_E0_ID, L_RR_E1_ID = 2, 3, 4
 ISRC_RECORDING_ID, ISRC_CODE = 2, 3
+WORK_ID, WORK_GID, WORK_NAME, WORK_TYPE_ID = 1, 2, 3, 4
+WORK_TYPE_LOOKUP_ID, WORK_TYPE_NAME = 1, 2
 
 FIELD_COUNTS = {
     "artist": 19,
@@ -75,6 +77,8 @@ FIELD_COUNTS = {
     # (positions 2, 3), but the row validator must accept the full
     # upstream width or the first real ISRC row aborts the ETL.
     "isrc": 5,
+    "work": 7,
+    "work_type": 6,
 }
 
 # Allowlisted relationship link-type GIDs (pinned from the MusicBrainz
@@ -300,6 +304,41 @@ def load_artist_aliases(db: sqlite3.Connection, path: Path) -> int:
     return db.executemany("INSERT INTO artist_alias VALUES (?,?,?,?,?,?,?,?)", aliases()).rowcount
 
 
+def work_key(field: str | None, context: str, column: str) -> int:
+    # COPY emits positive serial keys in canonical decimal form.
+    if field is not None and re.fullmatch(r"[1-9][0-9]{0,9}", field):
+        number = int(field)
+        if number <= 2**31 - 1:
+            return number
+    raise ValueError(f"{context}: invalid {column} (expected a positive 32-bit integer)")
+
+
+def validate_work_name(name: str | None, context: str) -> None:
+    if name is None:
+        raise ValueError(f"{context}: name must not be NULL")
+    try:
+        decode_copy_text(name)
+    except ValueError as exc:
+        raise ValueError(f"{context}: invalid COPY text in name") from exc
+
+
+def work_type_values(values, line_number):
+    context = f"work_type row {line_number}"
+    row_id, name = values
+    validate_work_name(name, context)
+    return work_key(row_id, context, "id"), name
+
+
+def work_values(values, line_number):
+    context = f"work row {line_number}"
+    row_id, gid, name, type_id = values
+    if gid is None or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", gid):
+        raise ValueError(f"{context}: invalid work MBID")
+    validate_work_name(name, context)
+    return (work_key(row_id, context, "id"), gid, name,
+            None if type_id is None else work_key(type_id, context, "type_id"))
+
+
 def main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage: DUMP_TS=<ISO-8601 timestamp> ./etl.sh <mbdump-dir>", file=sys.stderr)
@@ -363,6 +402,8 @@ def main() -> int:
                     CREATE TABLE l_recording_recording (link INTEGER NOT NULL, e0 INTEGER NOT NULL, e1 INTEGER NOT NULL);
                     CREATE TABLE isrc (recording INTEGER NOT NULL, code TEXT NOT NULL);
                     CREATE INDEX isrc_recording ON isrc(recording);
+                    CREATE TABLE work_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                    CREATE TABLE work (id INTEGER PRIMARY KEY, gid TEXT NOT NULL UNIQUE, name TEXT NOT NULL, type_id INTEGER);
                 """)
 
                 counts = {}
@@ -371,6 +412,14 @@ def main() -> int:
                 counts["iso_3166_1"] = load(db, dump_dir / "iso_3166_1", FIELD_COUNTS["iso_3166_1"], (ISO_AREA_ID, ISO_CODE), "iso_3166_1", "area,code", as_ints("iso_3166_1.area", (0,)))
                 counts["artist"] = load(db, dump_dir / "artist", FIELD_COUNTS["artist"], (ARTIST_ID, ARTIST_GID, ARTIST_NAME, ARTIST_SORT_NAME, ARTIST_TYPE_ID, ARTIST_AREA_ID), "artist", "id,gid,name,sort_name,type_id,area_id", as_ints("artist.id", (0, 4, 5), (4, 5)))
                 counts["artist_alias"] = load_artist_aliases(db, dump_dir / "artist_alias")
+                counts["work_type"] = load(
+                    db, dump_dir / "work_type", FIELD_COUNTS["work_type"],
+                    (WORK_TYPE_LOOKUP_ID, WORK_TYPE_NAME), "work_type", "id,name", work_type_values,
+                )
+                counts["work"] = load(
+                    db, dump_dir / "work", FIELD_COUNTS["work"],
+                    (WORK_ID, WORK_GID, WORK_NAME, WORK_TYPE_ID), "work", "id,gid,name,type_id", work_values,
+                )
                 counts["artist_credit_name"] = load(
                     db, dump_dir / "artist_credit_name", FIELD_COUNTS["artist_credit_name"],
                     (CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID, CREDIT_NAME, CREDIT_JOIN_PHRASE),
@@ -506,6 +555,12 @@ def main() -> int:
                 bad_alias = db.execute("SELECT al.artist FROM artist_alias al LEFT JOIN artist a ON a.id=al.artist WHERE a.id IS NULL LIMIT 1").fetchone()
                 if bad_alias:
                     raise ValueError(f"artist_alias references missing artist {bad_alias[0]}")
+                bad_work_type = db.execute("""
+                    SELECT w.id,w.type_id FROM work w LEFT JOIN work_type t ON t.id=w.type_id
+                    WHERE w.type_id IS NOT NULL AND t.id IS NULL LIMIT 1
+                """).fetchone()
+                if bad_work_type:
+                    raise ValueError(f"work {bad_work_type[0]} references missing work_type {bad_work_type[1]}")
                 bad_credit_artist = db.execute("SELECT c.credit,c.artist FROM artist_credit_name c LEFT JOIN artist a ON a.id=c.artist WHERE a.id IS NULL LIMIT 1").fetchone()
                 if bad_credit_artist:
                     raise ValueError(f"artist credit {bad_credit_artist[0]} references missing artist {bad_credit_artist[1]}")
@@ -734,8 +789,16 @@ def main() -> int:
                 """
                 isrc_count = insert_select(db, isrc_query, output_dir / curated_name("recording_isrc"), updated_at)
 
+                work_query = """
+                    SELECT w.gid,w.name,t.name
+                    FROM work w LEFT JOIN work_type t ON t.id=w.type_id
+                    ORDER BY w.id
+                """
+                work_count = insert_select(db, work_query, output_dir / curated_name("work"), updated_at)
+
                 for table, input_count, output_count in (
                     ("artist", counts["artist"], artist_count),
+                    ("work", counts["work"], work_count),
                     ("release_group", counts["release_group"], release_group_count),
                     ("release", counts["release"], release_count),
                     ("recording", counts["recording"], recording_count),
@@ -778,7 +841,7 @@ def main() -> int:
             os.symlink(snapshot_name, link_tmp)
             os.replace(link_tmp, curated_link)
 
-        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, artist_alias={artist_alias_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count})")
+        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, artist_alias={artist_alias_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count}, work={work_count})")
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"etl: {exc}", file=sys.stderr)

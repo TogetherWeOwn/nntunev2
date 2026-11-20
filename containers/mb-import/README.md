@@ -28,15 +28,15 @@ headerless MusicBrainz COPY files from the CC0 core dump: the entity files
 (`artist` with `artist_alias` and `artist_type`/`area`/`iso_3166_1` lookups,
 `release` with
 `artist_credit_name`/`release_group`/`release_group_primary_type`/`release_country`/`release_unknown_country`,
-`recording` with `medium`/`track`) plus the relationship files (`url`,
-`link_type`, `link`, `link_attribute_type`, `link_attribute`,
-`l_artist_url`, `l_recording_url`, `l_recording_recording`, `isrc`) listed in
-`etl.py`. The ETL writes the ten curated import files and the release-credit
-and artist-alias sidecars into an immutable snapshot and atomically swaps
-`<mbdump-dir>/curated` to point to it; previous snapshots are retained. It uses
-the image's Python 3 and a temporary, disk-backed SQLite projection (no
-external database). `stream_extract.py` admits the same required tables as
-`.gz` inputs for the disk-bounded path.
+`recording` with `medium`/`track`, `work` with `work_type`) plus the
+relationship files (`url`, `link_type`, `link`, `link_attribute_type`,
+`link_attribute`, `l_artist_url`, `l_recording_url`, `l_recording_recording`,
+`isrc`) listed in `etl.py`. The ETL writes the ten curated import files and the
+release-credit, artist-alias and work sidecars into an immutable snapshot and
+atomically swaps `<mbdump-dir>/curated` to point to it; previous snapshots
+are retained. It uses the image's Python 3 and a temporary, disk-backed SQLite
+projection (no external database). `stream_extract.py` admits the same required
+tables as `.gz` inputs for the disk-bounded path.
 
 The sidecar `mbdump-release_credit.tsv` contains the release MBID, zero-based
 credit position, artist MBID, credited name, join phrase, and dump timestamp.
@@ -48,10 +48,15 @@ locale (empty for NULL), sort name, primary-for-locale (`t` or `f`), and dump
 timestamp. Keys use the COPY-decoded name and locale. Each key keeps one
 source row's COPY text: primary wins, then the greatest raw sort name, then
 the lowest alias ID. Missing artists and malformed primary flags refuse ETL.
-Disk-bounded mode emits the same TSV content under `.tsv.gz`.
+
+The sidecar `mbdump-work.tsv` contains the work MBID, title, work-type name
+(`\N` for an untyped work), and dump timestamp, ordered by upstream work ID.
+It preserves the COPY text of the title and type name. A non-NULL type ID
+with no lookup row refuses publication; an empty `work` file produces an
+empty sidecar. Disk-bounded mode emits the same TSV content under `.tsv.gz`.
 
 `import.sh` still loads only its existing ten files; no database table or read
-route consumes either sidecar yet. To regenerate an older snapshot with the
+route consumes the sidecars yet. To regenerate an older snapshot with the
 sidecars, use a fresh dump directory and keep the original dump timestamp. An
 existing snapshot is never modified in place.
 
