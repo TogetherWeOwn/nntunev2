@@ -528,6 +528,53 @@ test('auth retirement increments the render revision and cancels pending share w
 	expect(writes).toEqual([]);
 });
 
+test.each(['wrong target', 'disconnected', 'wrong source', 'source swapped during read', 'unreadable source'] as const)(
+	'native events ignore a %s even while the attachment receipt is active', (boundary) => {
+		const { page, element, media, track, capture } = restartFixture();
+		const readSource = element.getAttribute;
+		const target = boundary === 'wrong target' ? new EventTarget() : element;
+		if (boundary === 'disconnected') element.connected = false;
+		if (boundary === 'wrong source') element.sourceAttribute = '/test-audio/other';
+		if (boundary === 'source swapped during read') {
+			element.getAttribute = () => {
+				element.sourceAttribute = '/test-audio/other';
+				return track.streamUrl;
+			};
+		}
+		if (boundary === 'unreadable source') element.getAttribute = () => { throw new Error('unreadable source'); };
+		element.paused = false;
+		media.duration = NaN;
+		capture('playing')(target);
+		capture('timeupdate')(target);
+		expect(page.nativeIntent().playing).toBe(false);
+		expect(page.read().restartCanSeek).toBe(true);
+
+		element.connected = true;
+		element.sourceAttribute = track.streamUrl;
+		element.getAttribute = readSource;
+		element.dispatchEvent(new Event('playing'));
+		element.dispatchEvent(new Event('timeupdate'));
+		expect(page.nativeIntent().playing).toBe(true);
+		expect(page.read().restartCanSeek).toBe(false);
+	}
+);
+
+test('metadata cannot refresh availability after a share retry changes the native source', async () => {
+	const { page, element, location, capture, writes } = restartFixture();
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	Object.defineProperty(element, 'duration', { get() {
+		element.sourceAttribute = '/test-audio/other';
+		return NaN;
+	} });
+	capture('loadedmetadata')();
+	await Promise.resolve();
+	expect(element.sourceAttribute).toBe('/test-audio/other');
+	expect(writes).toEqual([]);
+	expect(page.read().restartCanSeek).toBe(true);
+});
+
 test('queued and captured events from a retired node cannot change its same-source replacement', async () => {
 	const { page, element, media, capture, remount } = restartFixture();
 	const [play, pause, error, ended, seeking, progress] =

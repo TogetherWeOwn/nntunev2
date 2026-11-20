@@ -257,7 +257,6 @@
 
 	function attachNativeAudio(audio: HTMLAudioElement): () => void {
 		return media.attach(audio, {
-			source: () => shareAlive ? resolveStreamUrl(queueCurrentTrack(queueController.snapshot)) : null,
 			seeking: handleSeeking,
 			position: refreshRestartAvailability
 		});
