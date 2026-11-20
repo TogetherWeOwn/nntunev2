@@ -415,13 +415,13 @@ async fn private_aware_acquisition_commits_and_rolls_back() {
         db.execute("INSERT INTO public.private_sessions(user_id,session_id,expires_at) VALUES ($1,'private',$2),($1,'competitor',$2),($1,'expired',$3),($4,'other',$2)", &[&user, &(now + 300), &(now - 1), &other]).await.map_err(|e| e.to_string())?;
         for (session, play, expected_private) in [("missing", "a", false), ("expired", "b", false), ("other", "c", false), ("private", "d", true)] {
             let result = acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, session, "track", play, now as u64, now as u64 + 45, true).await.map_err(|_| "acquire failed")?;
-            if result != (Acquired { epoch: match play { "a" => 1, "b" => 2, "c" => 3, _ => 4 } }, expected_private) { return Err(format!("wrong acquisition: {result:?}")); }
+            if result != (Acquired { epoch: match play { "a" => 1, "b" => 2, "c" => 3, _ => 4 } }) { return Err(format!("wrong acquisition: {result:?}")); }
             let key = format!("play:{user}:track:{play}");
             let marked: bool = db.query_one("SELECT EXISTS(SELECT 1 FROM public.private_plays WHERE user_id=$1 AND play_key=$2)", &[&user, &key]).await.map_err(|e| e.to_string())?.get(0);
             if marked != expected_private { return Err("wrong persisted classification".into()); }
         }
         let held = acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "competitor", "track", "refused", now as u64 + 1, now as u64 + 46, false).await.map_err(|_| "refusal failed")?;
-        if held != (Held { retry_after_secs: 44 }, false) { return Err(format!("wrong refusal: {held:?}")); }
+        if held != (Held { retry_after_secs: 44 }) { return Err(format!("wrong refusal: {held:?}")); }
         let refused = format!("play:{user}:track:refused");
         let count: i64 = db.query_one("SELECT count(*) FROM public.private_plays WHERE user_id=$1 AND play_key=$2", &[&user, &refused]).await.map_err(|e| e.to_string())?.get(0);
         if count != 0 { return Err("refused mark persisted".into()); }
@@ -449,7 +449,7 @@ async fn private_aware_acquisition_errors_preserve_incumbent_and_marks() {
     let result: Result<(), String> = tokio::time::timeout(Duration::from_secs(30), async {
         let now: i64 = db.query_one("SELECT extract(epoch from statement_timestamp())::bigint", &[]).await.map_err(|e| e.to_string())?.get(0);
         db.execute("INSERT INTO public.private_sessions(user_id,session_id,expires_at) VALUES ($1,'private',$2)", &[&user, &(now + 300)]).await.map_err(|e| e.to_string())?;
-        if acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "private", "track", "incumbent", now as u64, now as u64 + 45, false).await.map_err(|_| "seed failed")? != (Acquired { epoch: 1 }, true) { return Err("wrong seed".into()); }
+        if acquire(disposable_accounts::connect_guarded().await.map_err(|e| e.to_string())?, &user, "private", "track", "incumbent", now as u64, now as u64 + 45, false).await.map_err(|_| "seed failed")? != (Acquired { epoch: 1 }) { return Err("wrong seed".into()); }
         let other_key = format!("play:{other}:track:existing");
         db.execute("INSERT INTO public.private_plays(user_id,play_key,marked_at) VALUES ($1,$2,$3)", &[&other, &other_key, &now]).await.map_err(|e| e.to_string())?;
         db.batch_execute(&format!("CREATE FUNCTION public.{tag}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.user_id = '{user}' AND NEW.play_key LIKE '%:mark-error' THEN RAISE EXCEPTION 'synthetic mark failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER {tag} BEFORE INSERT ON public.private_plays FOR EACH ROW EXECUTE FUNCTION public.{tag}()"))
