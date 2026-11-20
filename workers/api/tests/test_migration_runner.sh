@@ -15,10 +15,17 @@ case " $* " in
     while IFS= read -r line; do
       case "$line" in
         "SELECT 'reader-ready';") printf '%s\n' reader-ready ;;
+        'INSERT INTO public.invite_windows '*' RETURNING id;') printf '%s\n' 1 ;;
         '\q') exit 0 ;;
       esac
     done
     exit 0 ;;
+  *' -1 -v VERBOSITY=verbose '*' INSERT INTO public.invite_windows '*)
+    printf 'ERROR: 55P03: canceling statement due to lock timeout\n' >&2
+    exit 3 ;;
+  *' -v VERBOSITY=verbose '*' INSERT INTO public.invite_windows '*)
+    printf 'ERROR: 23P01: conflicting key violates exclusion constraint "invite_windows_no_overlap"\n' >&2
+    exit 3 ;;
   *' -1 -v VERBOSITY=verbose '*)
     printf 'ERROR: 55P03: could not obtain lock on relation\n' >&2
     exit 3 ;;
@@ -50,6 +57,9 @@ for fixture in grants vault owner owner_admin owner_deleting; do
   grep -Fq "purge guard ($fixture): ERROR: legacy provider purge refused:" "$dir/output"
 done
 grep -Fq -- '-v purge_case=allow -c BEGIN;' "$dir/calls"
+grep -Fq 'workers/api/tests/fixtures/invite_windows_upgrade.sql' "$dir/calls"
+grep -Fq 'uncommitted invite window: ERROR: 55P03:' "$dir/output"
+grep -Fq 'committed invite window: ERROR: 23P01:' "$dir/output"
 
 # A psql error must still stop the runner before the success message.
 status=0
