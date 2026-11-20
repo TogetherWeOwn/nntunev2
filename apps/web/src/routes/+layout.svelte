@@ -470,10 +470,7 @@
 			{/if}
 		</div>
 	</div>
-{/if}
-
-{#snippet appBody()}
-	<div class="nt-body">
+	{#snippet appRail()}
 		<div class="nt-rail" data-testid="shell-rail">
 			<nav aria-label="Primary" class="nt-destinations nt-rail-nav">
 				<a href="/home" aria-current={primaryDestination === 'home' ? 'page' : undefined}>
@@ -492,12 +489,13 @@
 				<a href="/library/recent">Recent</a>
 			</div>
 		</div>
-		{@render children()}
-	</div>
-{/snippet}
-
-{#if !isPublicRoute}
-	<AppPlayer children={appBody} />
+	{/snippet}
+	<AppPlayer>
+		<div class="nt-body">
+			{@render appRail()}
+			{@render children()}
+		</div>
+	</AppPlayer>
 	{#if rightSnippet}
 		<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
 			{@render rightSnippet()}

@@ -227,7 +227,7 @@ async function restore(page: Page) {
 }
 async function tabTo(page: Page, target: Locator) {
 	await expect(target).toBeVisible();
-	for (let i = 0; i < 80; i += 1) {
+	for (let i = 0; i < 84; i += 1) { // Includes the four Library type controls.
 		if (await target.evaluate((node) => node === document.activeElement)) break;
 		await page.keyboard.press('Tab');
 	}

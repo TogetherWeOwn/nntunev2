@@ -275,3 +275,8 @@ sha256 = "ccd14876ce8ed7379c0a03ad1fb4404f12b32f0d31cb470b6b9f1817c8b0e0ca"
 file = "0054_listen_history.sql"
 target = "app"
 sha256 = "27d43e70497bb7ab5b65218b2c56a50580ce3ecb7517a1d0d8afd2e582755f6e"
+
+[[migration]]
+file = "0055_storage_digest_inventory_intents.sql"
+target = "app"
+sha256 = "b6bf4b124a926002dbf59e4a77a9df48594cc7b99074c4f2167d80743153713c"

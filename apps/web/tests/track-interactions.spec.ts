@@ -151,7 +151,8 @@ test('Copy link is inline, restores focus and preserves whole-menu dismissal', a
 
 for (const scenario of ['outside-click', 'scroll-only', 'scroll-then-click', 'outside-focus', 'scroll-then-focus', 'explicit-focus', 'scroll-then-explicit-focus'] as const) {
 	test(`track menu focus contract: ${scenario}`, async ({ page }, testInfo) => {
-		await page.setViewportSize({ width: 1280, height: 1000 });
+		// The baseline and comparison clicks need both the heading and More in view before scrolling.
+		await page.setViewportSize({ width: 1280, height: scenario === 'scroll-then-click' ? 1200 : 1000 });
 		await seed(page);
 		// Ensure a real document scroll is available without changing the controls under test.
 		await page.evaluate(() => {
