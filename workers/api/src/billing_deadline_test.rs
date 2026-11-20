@@ -394,18 +394,33 @@ pub(crate) async fn test_reconcile_raw_replace(commit: bool) -> Result<(), &'sta
     ).await.map_err(|_| diagnostic.get())
 }
 
-// Hold the parent before the dormant store takes subscription exclusion. The
-// real history FK and cascade must then wait on opposite sides of the cycle.
-pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
+// The raw transaction first holds a row lock that is compatible with table
+// exclusion. Its later write must wait for the Worker, which waits on that row.
+pub(crate) async fn test_reconcile_lock_cycle(row_update: bool) -> Result<(), &'static str> {
     use futures_util::future::{join, select, Either};
     use std::{cell::Cell, rc::Rc};
     use tokio_postgres::error::SqlState;
 
+    let (lock_row, worker_statement, raw_write) = if row_update {
+        (
+            "SELECT pg_backend_pid() FROM public.subscriptions
+             WHERE user_id = 'worker_fault_user' AND stripe_subscription_id = 'sub_worker_fault' FOR UPDATE",
+            "INSERT INTO public.subscriptions %",
+            "UPDATE public.subscriptions SET stripe_price_id = 'price_raw_cycle'
+             WHERE user_id = 'worker_fault_user' AND stripe_subscription_id = 'sub_worker_fault'",
+        )
+    } else {
+        (
+            "SELECT pg_backend_pid() FROM public.users WHERE id = 'worker_fault_user' FOR UPDATE",
+            "INSERT INTO public.paid_invoice_history %",
+            "DELETE FROM public.users WHERE id = 'worker_fault_user'",
+        )
+    };
     setup_ack_fixture().await?;
     let user = "worker_fault_user";
     let store = PgStore {
         env: None,
-        trace_id: "worker-parent-cycle-test".into(),
+        trace_id: "worker-lock-cycle-test".into(),
         mirror_binding: MirrorBinding::Unconfigured,
         work_deadline_observer: None,
         cancel_token_observer: None,
@@ -414,21 +429,26 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
     store
         .store_reconcile_owned(user.into(), outcome.clone(), ReconcileProbe::None)
         .await
-        .map_err(|_| "parent cycle: seed through dormant store failed")?;
+        .map_err(|_| "lock cycle: seed through dormant store failed")?;
     outcome.read_plan = Some(outcome.row.plan_id.clone());
     outcome.read_anchor = outcome.row.paid_invoice_id.clone();
     outcome.row.cancel_at_period_end = true;
     outcome.history.truncate(1);
-    outcome.history[0].stripe_invoice_id = "in_worker_parent_cycle".into();
+    outcome.history[0].stripe_invoice_id = if row_update {
+        "in_worker_row_update_cycle"
+    } else {
+        "in_worker_parent_cycle"
+    }
+    .into();
     // Distinct values catch a period start / payment timestamp swap.
     outcome.history[0].paid_at_unix += 10;
     let expected_history = outcome.history[0].clone();
 
-    let phase = Rc::new(Cell::new("parent cycle: connect disposable deleter"));
+    let phase = Rc::new(Cell::new("lock cycle: connect disposable writer"));
     let diagnostic = phase.clone();
-    let parent_pid = Rc::new(Cell::new(None::<i32>));
+    let writer_pid = Rc::new(Cell::new(None::<i32>));
     let worker_pid = Rc::new(Cell::new(None::<i32>));
-    let parent = parent_pid.clone();
+    let writer = writer_pid.clone();
     let worker = worker_pid.clone();
     let observe = billing_budget::with_owned_connection(
         "127.0.0.1",
@@ -437,8 +457,8 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
         |_| Box::pin(async { Ok(()) }),
         move |db| {
             Box::pin(async move {
-                let parent = wait_parent_cycle(|| async { Ok(parent.get()) }).await?;
-                let pid = wait_parent_cycle(|| async {
+                let writer = wait_lock_cycle(|| async { Ok(writer.get()) }).await?;
+                let pid = wait_lock_cycle(|| async {
                     let row = db
                         .query_opt(
                             "SELECT l.pid FROM pg_catalog.pg_locks l
@@ -446,9 +466,9 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
                      WHERE l.relation = 'public.subscriptions'::regclass
                        AND l.mode = 'ShareRowExclusiveLock' AND l.granted
                        AND a.application_name = 'owned_billing_reconcile_test'
-                       AND a.query LIKE 'INSERT INTO public.paid_invoice_history %'
+                       AND a.query LIKE $2 AND a.wait_event_type = 'Lock'
                        AND $1 = ANY(pg_blocking_pids(l.pid))",
-                            &[&parent],
+                            &[&writer, &worker_statement],
                         )
                         .await
                         .map_err(|_| StoreError)?;
@@ -456,12 +476,12 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
                 })
                 .await?;
                 worker.set(Some(pid));
-                wait_parent_cycle(|| async {
+                wait_lock_cycle(|| async {
                     let cycle: bool = db.query_one(
                     "SELECT $2 = ANY(pg_blocking_pids($1)) AND $1 = ANY(pg_blocking_pids($2))
                        AND EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE pid = $1
                          AND relation = 'public.subscriptions'::regclass
-                         AND mode = 'RowExclusiveLock' AND NOT granted)", &[&parent, &pid],
+                         AND mode = 'RowExclusiveLock' AND NOT granted)", &[&writer, &pid],
                 ).await.map_err(|_| StoreError)?.get(0);
                     Ok(cycle.then_some(()))
                 })
@@ -476,22 +496,22 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
         5432,
         CONNECTION,
         |_| Box::pin(async { Ok(()) }),
-        move |deleter| {
+        move |raw| {
             Box::pin(async move {
-                phase.set("parent cycle: snapshot and lock parent");
-                let before = parent_cycle_snapshot(deleter, &expected_history).await?;
-                let deadlocks_before = parent_cycle_deadlocks(deleter).await?;
-                deleter
-                    .batch_execute("BEGIN; SET LOCAL statement_timeout = '5s'")
+                phase.set("lock cycle: snapshot and lock fixture row");
+                let before = lock_cycle_snapshot(raw, &expected_history).await?;
+                let deadlocks_before = lock_cycle_deadlocks(raw).await?;
+                raw.batch_execute("BEGIN; SET LOCAL statement_timeout = '5s'")
                     .await
                     .map_err(|_| StoreError)?;
-                let parent: i32 = deleter.query_one(
-                "SELECT pg_backend_pid() FROM public.users WHERE id = 'worker_fault_user' FOR UPDATE",
-                &[],
-            ).await.map_err(|_| StoreError)?.get(0);
-                parent_pid.set(Some(parent));
+                let writer: i32 = raw
+                    .query_one(lock_row, &[])
+                    .await
+                    .map_err(|_| StoreError)?
+                    .get(0);
+                writer_pid.set(Some(writer));
                 phase
-                    .set("parent cycle: history FK did not wait on parent while holding exclusion");
+                    .set("lock cycle: Worker statement did not wait on the raw writer while holding exclusion");
                 let mut reconcile = Box::pin(store.store_reconcile_owned(
                     user.into(),
                     outcome,
@@ -499,54 +519,48 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
                 ));
                 let worker = match select(
                     reconcile.as_mut(),
-                    Box::pin(wait_parent_cycle(|| async { Ok(worker_pid.get()) })),
+                    Box::pin(wait_lock_cycle(|| async { Ok(worker_pid.get()) })),
                 )
                 .await
                 {
                     Either::Right((observed, _)) => observed?,
                     Either::Left(_) => return Err(StoreError),
                 };
-                phase.set("parent cycle: expected either reconciliation or cascade to abort");
-                let remove = async {
-                    let deleted = deleter
-                        .execute(
-                            "DELETE FROM public.users WHERE id = 'worker_fault_user'",
-                            &[],
-                        )
-                        .await;
-                    // Never persist the fixture's deletion, even when the Worker is the victim.
-                    deleter
-                        .batch_execute("ROLLBACK")
+                phase.set("lock cycle: expected exactly one writer to abort");
+                let raw_attempt = async {
+                    let written = raw.execute(raw_write, &[]).await;
+                    // Never persist the raw write, even when the Worker is the victim.
+                    raw.batch_execute("ROLLBACK")
                         .await
                         .map_err(|_| StoreError)?;
-                    match deleted {
+                    match written {
                         Ok(1) => Ok(true),
                         Err(e) if e.code() == Some(&SqlState::T_R_DEADLOCK_DETECTED) => Ok(false),
                         _ => Err(StoreError),
                     }
                 };
-                let (deleted, reconciled) = join(remove, reconcile).await;
+                let (written, reconciled) = join(raw_attempt, reconcile).await;
                 let committed = reconciled.is_ok();
-                if deleted? == committed {
+                if written? == committed {
                     return Err(StoreError);
                 }
                 // The hosted smoke gives this pair a fresh database. With both
-                // waits observed, a successful cascade and one server-counted
+                // waits observed, a successful raw write and one server-counted
                 // deadlock identify the Worker as the victim, not a lock timeout.
-                phase.set("parent cycle: PostgreSQL did not report exactly one deadlock");
-                let deadlocks_after = wait_parent_cycle(|| async {
-                    let count = parent_cycle_deadlocks(deleter).await?;
+                phase.set("lock cycle: PostgreSQL did not report exactly one deadlock");
+                let deadlocks_after = wait_lock_cycle(|| async {
+                    let count = lock_cycle_deadlocks(raw).await?;
                     Ok((count != deadlocks_before).then_some(count))
                 })
                 .await?;
                 if deadlocks_after != deadlocks_before + 1 {
                     return Err(StoreError);
                 }
-                phase.set("parent cycle: partial write, changed history or retained lock");
-                let after = parent_cycle_snapshot(deleter, &expected_history).await?;
-                let locks: bool = deleter.query_one(
+                phase.set("lock cycle: partial write, changed history or retained lock");
+                let after = lock_cycle_snapshot(raw, &expected_history).await?;
+                let locks: bool = raw.query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE pid IN ($1, $2) AND relation = 'public.subscriptions'::regclass)",
-                &[&parent, &worker],
+                &[&writer, &worker],
             ).await.map_err(|_| StoreError)?.get(0);
                 if before.0 != after.0
                     || before.1 != after.1
@@ -566,11 +580,11 @@ pub(crate) async fn test_reconcile_parent_cycle() -> Result<(), &'static str> {
     let (observed, ran) = join(observe, run).await;
     ran.map_err(|_| diagnostic.get())?;
     observed.map_err(|_| {
-        "parent cycle: cascade did not wait on Worker exclusion while history FK waited"
+        "lock cycle: raw write did not wait on Worker exclusion while the Worker statement waited"
     })
 }
 
-async fn wait_parent_cycle<T, F: std::future::Future<Output = Result<Option<T>, StoreError>>>(
+async fn wait_lock_cycle<T, F: std::future::Future<Output = Result<Option<T>, StoreError>>>(
     mut sample: impl FnMut() -> F,
 ) -> Result<T, StoreError> {
     for _ in 0..80 {
@@ -582,7 +596,7 @@ async fn wait_parent_cycle<T, F: std::future::Future<Output = Result<Option<T>, 
     Err(StoreError)
 }
 
-async fn parent_cycle_deadlocks(db: &tokio_postgres::Client) -> Result<i64, StoreError> {
+async fn lock_cycle_deadlocks(db: &tokio_postgres::Client) -> Result<i64, StoreError> {
     db.query_one(
         "SELECT deadlocks FROM pg_catalog.pg_stat_database WHERE datname = current_database()",
         &[],
@@ -592,7 +606,7 @@ async fn parent_cycle_deadlocks(db: &tokio_postgres::Client) -> Result<i64, Stor
     .map_err(|_| StoreError)
 }
 
-async fn parent_cycle_snapshot(
+async fn lock_cycle_snapshot(
     db: &tokio_postgres::Client,
     expected_history: &PaidInvoiceRow,
 ) -> Result<(String, String, bool, Option<bool>), StoreError> {
@@ -600,18 +614,19 @@ async fn parent_cycle_snapshot(
         "SELECT (SELECT jsonb_agg(to_jsonb(s) - 'cancel_at_period_end' ORDER BY stripe_subscription_id)::text
                   FROM public.subscriptions s),
                 (SELECT jsonb_agg(to_jsonb(h) ORDER BY stripe_invoice_id)::text FROM public.paid_invoice_history h
-                  WHERE stripe_invoice_id <> 'in_worker_parent_cycle'),
+                  WHERE stripe_invoice_id <> $4),
                 (SELECT cancel_at_period_end FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'),
                 (SELECT user_id = 'worker_fault_user' AND stripe_subscription_id = 'sub_worker_fault'
                      AND plan_id = 'plus' AND amount_cents = 800 AND currency = 'usd'
                      AND period_start = to_timestamp($1::bigint)
                      AND period_end = to_timestamp($2::bigint)
                      AND paid_at = to_timestamp($3::bigint)
-                  FROM public.paid_invoice_history WHERE stripe_invoice_id = 'in_worker_parent_cycle')",
+                  FROM public.paid_invoice_history WHERE stripe_invoice_id = $4)",
         &[
             &expected_history.period_start_unix,
             &expected_history.period_end_unix,
             &expected_history.paid_at_unix,
+            &expected_history.stripe_invoice_id,
         ],
     ).await.map_err(|_| StoreError)?;
     (|| {

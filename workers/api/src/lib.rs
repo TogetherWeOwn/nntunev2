@@ -268,11 +268,14 @@ pub async fn billing_owned_test_entry(
                     Err(message) => worker::Response::error(message, 500),
                 };
             }
-            "/billing-parent-cycle-proof" => {
-                return match worker_entry::billing_deadline_test::test_reconcile_parent_cycle()
-                    .await
+            "/billing-parent-cycle-proof" | "/billing-row-update-cycle-proof" => {
+                let row_update = req.path() == "/billing-row-update-cycle-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_lock_cycle(
+                    row_update,
+                )
+                .await
                 {
-                    Ok(()) => worker::Response::ok("billing-parent-cycle-ok"),
+                    Ok(()) => worker::Response::ok("billing-lock-cycle-ok"),
                     Err(message) => worker::Response::error(message, 500),
                 };
             }
