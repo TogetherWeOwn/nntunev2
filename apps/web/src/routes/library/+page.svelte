@@ -8,6 +8,8 @@
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
 	import TrackRows from './TrackRows.svelte';
+	import CollectionBrowser from '#lib/library/CollectionBrowser.svelte';
+	import type { CollectionFilter } from '#lib/library/collections.js';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -87,6 +89,12 @@
 	type Density = 'comfortable' | 'compact';
 	const DENSITY_KEY = 'nntune:density:v1';
 	let density = $state<Density>('comfortable');
+	const libraryTypes = [
+		['tracks', 'Tracks'], ['all', 'All collections'], ['albums', 'Albums'], ['artists', 'Artists']
+	] as const;
+	let collectionFilter = $state<CollectionFilter | 'tracks'>('tracks');
+	const showingTracks = $derived(collectionFilter === 'tracks');
+	let collectionsAccessRevoked = $state(false);
 
 	function readStoredDensity(): Density {
 		try {
@@ -318,6 +326,7 @@
 		},
 		onStateChange: (state, { isCurrent, authoritative, authBoundary }) => {
 			if (!isCurrent()) return;
+			if (authBoundary || (authoritative && !state.libraryUnavailable)) collectionsAccessRevoked = !!authBoundary;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -1486,6 +1495,16 @@
 		</select>
 	</div>
 
+	<div class="nt-library-types" role="group" aria-label="Library type">
+		{#each libraryTypes as [type, label] (type)}
+			<button class="nt-button nt-button--ghost" type="button" aria-pressed={collectionFilter === type}
+				onclick={() => { collectionFilter = type; }}>{label}</button>
+		{/each}
+	</div>
+	{#if collectionFilter !== 'tracks'}
+		<CollectionBrowser filter={collectionFilter} accessRevoked={collectionsAccessRevoked} />
+	{/if}
+
 	{#if shareInvalid}
 		<p data-testid="library-share-invalid" role="alert">
 			Invalid link — choose a track from your library.
@@ -1527,21 +1546,24 @@
 	{/if}
 
 	{#if loading && items.length === 0}
-		<p role="status">Loading your library…</p>
+		<p role="status" hidden={!showingTracks}>Loading your library…</p>
 	{:else if loadError && items.length === 0}
-		<p role="alert">{loadError}</p>
+		<p role="alert" hidden={!showingTracks}>{loadError}</p>
 		{#if requiresSignIn}
-			<a class="nt-button" href="/login">Sign in</a>
+			<a class="nt-button" href="/login" hidden={!showingTracks}>Sign in</a>
 		{/if}
 		<button
 			class="nt-button"
 			type="button"
+			hidden={!showingTracks}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>
 			Retry
 		</button>
 	{:else}
+		<!-- Keep the Tracks DOM and controller state while browsing; the queue stays visible. -->
+		<div hidden={!showingTracks}>
 		{#if loading}
 			<p role="status">Loading your library…</p>
 		{/if}
@@ -1896,6 +1918,9 @@
 				{/if}
 			</div>
 			{/if}
+		{/if}
+		</div>
+		{#if !libraryUnavailable && items.length > 0}
 			<!--
 				The queue panel stays mounted across background refreshes (its
 				rows remain readable while the new list loads), but its four
@@ -1939,6 +1964,7 @@
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
+			hidden={!showingTracks}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>
@@ -2047,6 +2073,17 @@
 		outline: 2px solid var(--nt-accent);
 		outline-offset: 2px;
 	}
+	.nt-library-types {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--nt-space-2);
+		margin-block: var(--nt-space-3);
+	}
+	.nt-library-types [aria-pressed='true'] {
+		background: var(--nt-fg);
+		color: var(--nt-bg);
+	}
+	.nt-button[hidden] { display: none; }
 	.nt-library-density {
 		display: flex;
 		align-items: center;
