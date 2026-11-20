@@ -419,5 +419,112 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
                 self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
 
 
+class LabelProjectionTest(ProjectionTestCase):
+    def test_labels_and_decoded_edges_match_streamed_gzip(self):
+        # 255 decoded characters, but more than 255 COPY bytes.
+        boundary = "é" * 254 + r"\t"
+        types = self.raw / "label_type"
+        types.write_bytes(types.read_bytes().replace(rb"Original\tProduction", boundary.encode()))
+        edges = self.raw / "release_label"
+        edges.write_bytes(edges.read_bytes() + f"11\t30\t71\t{boundary}\t\\N\n".encode())
+        plain = self.run_etl(self.raw)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        ts = "2025-02-03T04:05:06Z"
+        quartz = "71717171-7171-4717-8717-717171717171"
+        untyped = "62626262-6262-4626-8626-626262626262"
+        first = "55555555-5555-4555-8555-555555555555"
+        second = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        expected_labels = (
+            f"{quartz}\tQuartz\\tRecords\t12345\t{boundary}\t{ts}\n"
+            f"{untyped}\tUntyped Label\t\\N\t\\N\t{ts}\n"
+        )
+        expected_edges = (
+            f"{first}\t{untyped}\tCafé\\tDisc\\\\N\t{ts}\n"
+            f"{first}\t{quartz}\t\t{ts}\n"
+            f"{first}\t{quartz}\t QZ-1 \t{ts}\n"
+            f"{first}\t{quartz}\t qz-1 \t{ts}\n"
+            f"{first}\t{quartz}\t\\\\N\t{ts}\n"
+            f"{first}\t{quartz}\t{boundary}\t{ts}\n"
+            f"{second}\t{quartz}\t QZ-1 \t{ts}\n"
+        )
+        self.assertEqual((self.curated / "mbdump-label.tsv").read_bytes(), expected_labels.encode())
+        self.assertEqual((self.curated / "mbdump-release_label.tsv").read_bytes(), expected_edges.encode())
+
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        tables = ("label", "label_type", "release_label")
+        for table in tables:
+            key = f"mbdump/{table}"
+            members[key] = b"".join(reversed(members[key].splitlines(keepends=True)))
+        # The streamed copy has only the alternate spelling for this edge.
+        key = "mbdump/release_label"
+        members[key] = b"".join(line for line in members[key].splitlines(keepends=True)
+                                if not line.startswith((b"5\t", b"7\t")))
+        packed = self.tmp / "packed"
+        extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
+                                 input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        for table in tables:
+            self.assertTrue((packed / f"{table}.gz").is_file())
+        gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
+        for table in tables:
+            self.assertFalse((packed / f"{table}.gz").exists())
+        self.assertEqual(
+            {p.name.removesuffix(".gz"): gzip.decompress(p.read_bytes()) for p in (packed / "curated").iterdir()},
+            {p.name: p.read_bytes() for p in self.curated.iterdir()},
+        )
+
+    def test_only_null_labels_produce_no_edges(self):
+        (self.raw / "release_label").write_bytes(b"4\t30\t\\N\tNot an edge\t\\N\n")
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.curated / "mbdump-release_label.tsv").read_bytes(), b"")
+
+    def test_label_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        labels = (self.raw / "label").read_bytes()
+        types = (self.raw / "label_type").read_bytes()
+        edges = (self.raw / "release_label").read_bytes()
+        releases = (self.raw / "release").read_bytes()
+        too_long = "é".encode() * 255 + rb"\t"
+        for table, changed, error in (
+            ("label_type", None, "missing input file:"),
+            ("label", b"broken\n", "expected 16 fields"),
+            ("release_label", b"broken\n", "expected 5 fields"),
+            ("label", labels.replace(b"\t12345\t1\t", b"\t12345\t999\t"), "references missing label_type 999"),
+            ("label", labels.replace(b"\t12345\t", b"\t2147483648\t"), "invalid label code"),
+            ("label", labels.replace(b"72\t", b"\\N\t", 1), "invalid id"),
+            ("label", labels.replace(b"62626262-6262-4626-8626-626262626262", b"bad"), "invalid label MBID"),
+            ("label", labels.replace(b"Untyped Label", rb"\N"), "name must not be NULL"),
+            ("label_type", types.replace(rb"Original\tProduction", rb"\000"), "invalid COPY text in name"),
+            ("label_type", types.replace(rb"Original\tProduction", too_long), "name exceeds 255 characters"),
+            ("release_label", edges + b"1\t31\t71\tDifferent number\t\\N\n", "UNIQUE constraint failed: release_label.id"),
+            ("release_label", edges + b"11\t30\t71\t" + too_long + b"\t\\N\n", "catalogue number exceeds 255 characters"),
+            ("release_label", edges + b"11\t999\t\\N\t\\N\t\\N\n", "references missing release 999"),
+            ("release_label", edges + b"11\t30\t999\t\\N\t\\N\n", "references missing label 999"),
+            ("release_label", edges + b"11\t\\N\t71\t\\N\t\\N\n", "invalid release"),
+            ("release_label", edges + b"11\t30\t+71\t\\N\t\\N\n", "invalid label"),
+            ("release_label", edges + b"11\t30\t71\t\\377\t\\N\n", "invalid COPY text in catalogue number"),
+            ("release", releases.replace(b"55555555-5555-4555-8555-555555555555", b"bad"), "invalid release MBID"),
+        ):
+            with self.subTest(table=table, error=error):
+                path = self.raw / table
+                original = path.read_bytes()
+                if changed is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-04T04:05:06Z")
+                path.write_bytes(original)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
+
+
 if __name__ == "__main__":
     unittest.main()

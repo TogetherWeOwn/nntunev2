@@ -65,6 +65,7 @@ pub mod probe;
 pub mod provider_response;
 pub mod range;
 pub mod routes;
+pub mod s3_range_response;
 pub mod trace;
 pub mod yenc;
 

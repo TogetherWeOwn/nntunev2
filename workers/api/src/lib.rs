@@ -285,6 +285,16 @@ pub async fn billing_owned_test_entry(
                     Err(message) => worker::Response::error(message, 500),
                 };
             }
+            path @ ("/billing-parent-first-delete-commit-proof"
+            | "/billing-parent-first-delete-rollback-proof") => {
+                let commit = path == "/billing-parent-first-delete-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_after_parent_delete(
+                    commit,
+                ).await {
+                    Ok(()) => worker::Response::ok("billing-parent-first-delete-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
             "/billing-parent-cycle-proof" | "/billing-row-update-cycle-proof" => {
                 let row_update = req.path() == "/billing-row-update-cycle-proof";
                 return match worker_entry::billing_deadline_test::test_reconcile_lock_cycle(

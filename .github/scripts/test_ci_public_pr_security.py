@@ -73,11 +73,23 @@ class PublicPrSecurityTests(unittest.TestCase):
                            re.MULTILINE | re.DOTALL).group(1)
         self.assertEqual(re.findall(r"^  ([\w_]+):", events, re.MULTILINE),
                          ["pull_request", "merge_group", "push", "workflow_dispatch"])
-        self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", events)
         self.assertIn("branches: [main]", events)
         self.assertIn("group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}", self.text)
         self.assertIn("cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}", self.text)
         self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read\n")
+
+    def test_required_repo_workflows_do_not_repeat_on_readiness(self):
+        for workflow, types in {
+            "ci": "opened, synchronize, reopened",
+            "codeql": "opened, synchronize, reopened",
+            "gitleaks": "opened, synchronize, reopened",
+            "migrations-staging": "opened, edited, synchronize, reopened",
+            "pr-lint": "opened, edited, synchronize, reopened",
+            "pr-size": "opened, synchronize, reopened, labeled, unlabeled",
+        }.items():
+            with self.subTest(workflow=workflow):
+                text = WORKFLOW.with_name(f"{workflow}.yml").read_text(encoding="utf-8")
+                self.assertIn(f"\n  pull_request:\n    types: [{types}]\n", text)
 
     def test_ci_ok_and_regression_suite_are_required(self):
         self.assertIn("public-pr-security", self.needs)

@@ -6,6 +6,9 @@ use nntune_core::origin_sealer::{SealedChunk, MAX_NEW_PLAINTEXT};
 use sha2::{Digest, Sha256};
 use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 
+pub mod head_receipt;
+pub mod resume_checkpoint;
+
 pub const PART_BYTES: usize = 5_244_160;
 pub const MAX_COMPLETION_BODY: usize = 16 * 1024;
 
@@ -199,7 +202,7 @@ impl<'a> Completion<'a> {
             .map(|p| (p.number, p.etag.as_str(), p.checksum.as_str()))
     }
 
-    /// Verify a declaration-free receipt with the exact composite checksum and part-count suffix.
+    /// Verify the bounded receipt's composite checksum and any included bucket/key.
     pub fn verify_reply(&self, status: u16, body: &[u8]) -> Result<()> {
         if status != 200 {
             return Err(MultipartError::CompletionStatus);
@@ -239,15 +242,22 @@ impl<'a> Completion<'a> {
             .create_reader(body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body));
         let mut next = || reader.next().map_err(|_| CompletionBody);
         let (mut depth, mut root_ns, mut matched, mut typed) = (0, None, false, false);
+        let (mut saw_bucket, mut saw_key) = (false, false);
         loop {
             match next()? {
                 StartElement { name, .. } => {
                     match (depth, name.local_name.as_str(), name.namespace.as_deref()) {
                         (_, "Error", _) => return Err(EmbeddedError),
                         (0, SUCCESS, None | Some(S3_NS)) => root_ns = name.namespace,
-                        (1, field @ (SHA256 | "ChecksumType"), n) if n == root_ns.as_deref() => {
+                        (1, field @ (SHA256 | "ChecksumType" | "Bucket" | "Key"), n)
+                            if n == root_ns.as_deref() =>
+                        {
                             let (seen, want, error) = match field {
                                 SHA256 => (&mut matched, self.checksum.as_str(), Checksum),
+                                "Bucket" => {
+                                    (&mut saw_bucket, self.plan.target.bucket, CompletionBody)
+                                }
+                                "Key" => (&mut saw_key, self.plan.target.key, CompletionBody),
                                 _ => (&mut typed, "COMPOSITE", CompletionBody),
                             };
                             let valid = !*seen && matches!(next()?, Characters(s) if s == want);
@@ -257,7 +267,7 @@ impl<'a> Completion<'a> {
                             *seen = true;
                             continue;
                         }
-                        (1, "Location" | "Bucket" | "Key" | "ETag", _) => {}
+                        (1, "Location" | "ETag", _) => {}
                         _ => return Err(CompletionBody),
                     }
                     depth += 1;

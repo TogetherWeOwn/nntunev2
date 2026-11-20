@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 const TARGET: UploadTarget<'static> = UploadTarget {
     bucket: "test",
-    key: "opaque",
+    key: "a&b.flac",
     upload_id: "fixture",
 };
 const SUCCESS: &str = "CompleteMultipartUploadResult";
