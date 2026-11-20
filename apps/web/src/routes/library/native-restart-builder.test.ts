@@ -4,7 +4,7 @@ import { get } from 'svelte/store';
 import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
 
@@ -19,7 +19,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'syncMiniPlayerHint',
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback',
 		'applyShareLink', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'resetShareAtAuthBoundary', 'announceEnd', 'onRepeatChange', 'shortTitle', 'playQueuedTrack', 'playSelected'
@@ -79,9 +79,9 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	let onClearFeedback = () => {};
 	const bindings = {
 		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
-		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
+		selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, get,
-		clearMiniPlayerHint, setMiniPlayerHint,
+		clearMiniPlayerHint,
 		createPlayerController: (_: ReturnType<typeof createQueue>, end: Parameters<typeof createPlayerController>[1]) => {
 			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), {
 				...end,
@@ -632,10 +632,18 @@ test('a reentrant subscription cannot publish an older operation hint', () => {
 	const unsubscribe = page.subscribe((value) => {
 		if (value === pine) page.replaceQueue(oak);
 	});
-	page.replaceQueue(pine);
-	expect(page.read().queue).toBe(oak);
-	expect(readMiniPlayerHint()?.trackId).toBe('oak');
-	unsubscribe();
+	const hints = vi.fn();
+	const stopHints = onMiniPlayerHint(hints);
+	hints.mockClear();
+	try {
+		page.replaceQueue(pine);
+		expect(page.read().queue).toBe(oak);
+		expect(readMiniPlayerHint()?.trackId).toBe('oak');
+		expect(hints).toHaveBeenCalledExactlyOnceWith({ trackId: 'oak', title: 'Oak', artist: null });
+	} finally {
+		stopHints();
+		unsubscribe();
+	}
 });
 
 test('reentrant replacement during share append prevents the older navigation', async () => {
