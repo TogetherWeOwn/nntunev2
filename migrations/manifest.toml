@@ -280,3 +280,8 @@ sha256 = "27d43e70497bb7ab5b65218b2c56a50580ce3ecb7517a1d0d8afd2e582755f6e"
 file = "0055_storage_digest_inventory_intents.sql"
 target = "app"
 sha256 = "b6bf4b124a926002dbf59e4a77a9df48594cc7b99074c4f2167d80743153713c"
+
+[[migration]]
+file = "0056_subsonic_measurement_auth.sql"
+target = "app"
+sha256 = "1658162dd6ff7f15b8f4f6c3708f26fbc5a42b6fa4b19a687cdce0133be84424"
