@@ -103,13 +103,13 @@ def pressure(model, limits):
 
 
 def validate(model, slot, sample, elapsed, limits):
-    maximum = limits["body_bytes"]
-    require(0 <= sample.get("body_bytes", 0) <= maximum, "body-limit")
+    require(0 <= sample.get("body_bytes", 0) <= limits["body_bytes"], "body-limit")
     if "pair" not in slot:
         require(sample == slot["expected"], "response-mismatch")
     elif slot.get("reader") == "disconnect":
         require(sample == {"oracle": "client-ended"}, "disconnect-unconfirmed")
-    elif sample == {"oracle": "fixed_capacity_json", "http_status": 503, "body_bytes": 112}:
+    elif sample in ({"oracle": "fixed_capacity_json", "http_status": 503, "body_bytes": 112},
+                    {"oracle": "fixed_capacity_xml", "http_status": 503, "body_bytes": 120}):
         require(model.busy_observed(slot) is True, "unattributed-pair-result")
         require(elapsed <= limits["busy_rejection_max_ms"], "busy-latency")
     else:
@@ -128,7 +128,8 @@ def execute(model, matrix, report, cutoff):
     while next_slot or active:
         require(model.now < cutoff, "clock-or-window")
         backends = pressure(model, limits)
-        report["max_simulated_backends"] = max(report["max_simulated_backends"], backends)
+        peak = report["max_simulated_backends"]
+        report["max_simulated_backends"] = backends if peak is None else max(peak, backends)
         for number, (slot, started) in list(active.items()):
             elapsed = model.now - started
             deadline = limits["request_timeout_ms"]
@@ -136,12 +137,14 @@ def execute(model, matrix, report, cutoff):
                 deadline = min(deadline, limits["reader_hold_max_ms"])
             require(elapsed <= deadline, "request-or-reader-timeout")
             sample = model.result(slot)
-            if sample is not None:
-                validate(model, slot, sample, elapsed, limits)
-                report["samples"].append({"slot": number, "elapsed_ms": elapsed, **sample})
-                del active[number]
-            else:
+            if sample is None:
                 require(elapsed < deadline, "request-or-reader-timeout")
+                continue
+            row = report["slots"][number]
+            row.update(state="rejected", elapsed_ms=elapsed)
+            validate(model, slot, sample, elapsed, limits)
+            row.update(sample, state="accepted")
+            del active[number]
         if next_slot and model.now - last_start >= limits["min_start_interval_ms"]:
             paired = next_slot.get("leg") == 2
             same_pair = all(slot.get("pair") == next_slot.get("pair") for slot, _ in active.values())
@@ -152,8 +155,9 @@ def execute(model, matrix, report, cutoff):
                 require(model.now + limits["request_timeout_ms"] < cutoff, "window-reserve")
                 require(len(active) < limits["in_flight"] and report["starts"] < limits["request_starts"],
                         "start-limit")
-                if active:
-                    report["simulated_overlap_starts"] += 1
+                if paired:
+                    report["simulated_pair_overlap"][next_slot["pair"]] = bool(active)
+                report["slots"][next_slot["slot"]]["state"] = "unfinished"
                 report["starts"] += 1
                 last_start = model.now
                 active[next_slot["slot"]] = (next_slot, last_start)
@@ -166,11 +170,12 @@ def execute(model, matrix, report, cutoff):
 
 def rehearse(path, model):
     report = {"mode": "offline-simulation", "stop": "complete", "cleanup": "not-armed",
-              "starts": 0, "max_simulated_clients": 0, "max_simulated_backends": 0,
-              "simulated_overlap_starts": 0, "samples": []}
+              "starts": 0, "max_simulated_clients": 0, "max_simulated_backends": None,
+              "simulated_pair_overlap": {}, "slots": {}}
     baseline = None
     try:
         matrix = load_matrix(path)
+        report["slots"] = {slot["slot"]: {"state": "unstarted"} for slot in matrix["slots"]}
         limits = matrix["limits"]
         version, lease = model.readback()
         require(version and lease is False and pressure(model, limits) == 0, "preflight-not-off-and-idle")

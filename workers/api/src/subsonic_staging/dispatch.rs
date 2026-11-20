@@ -214,8 +214,6 @@ impl StagingConstruction {
             {
                 return Err(reject(StagingRejection::Unavailable));
             }
-            // The admitted GET and form POST paths have already charged their
-            // request-specific prefixes; the fixture caps the same suffix.
             self.input.budget.restrict_remaining(headroom);
         }
         let budget = &mut self.input.budget;

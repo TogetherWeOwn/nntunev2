@@ -29,8 +29,8 @@ const CASE_IDS: [&str; 21] = [
     "large-mixed",
 ];
 
-// wasm32 getArtists (JSON), after auth and parameter parsing: raw rows + owned
-// copy + snapshot + Value graph + complete response buffer. See the fixture crosswalk.
+// wasm32 GET getArtists (JSON), small fixture: raw rows + owned copy +
+// snapshot + Value graph + complete response buffer. See the fixture crosswalk.
 const ARTIST_INDEX_CHARGE: usize = 4_024;
 
 pub(super) struct Schedule(u32);

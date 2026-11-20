@@ -19,10 +19,12 @@ async function main() {
         origin: { secure: true, hostname: new URL(origin).hostname } },
     });
     try {
-      const fetchCase = (endpoint, params, requestHeaders) => {
+      const fetchCase = (endpoint, params, headers, method = 'POST') => {
         const url = new URL(`/rest/${endpoint}`, origin);
+        const form = new URLSearchParams(params);
+        if (method === 'GET') url.search = form; // Disposable CI credentials only.
         return worker.fetch(url.href, {
-          method: 'POST', body: new URLSearchParams(params), headers: requestHeaders,
+          method, body: method === 'POST' ? form : undefined, headers,
           redirect: 'error', signal: AbortSignal.timeout(15_000),
         });
       };
@@ -59,8 +61,9 @@ async function main() {
         assert.equal(await rejected.text(), fixedCapacity);
       }
       let complete;
-      for (const [id, status] of [['small', 200], ['charge-below', 200], ['charge-exact', 200], ['charge-over', 503]]) {
-        const response = await fetchCase('getArtists', { f: 'json', apiKey: matching }, select(id));
+      const cases = [['small', 200], ['charge-below', 200], ['charge-exact', 200], ['charge-over', 503]];
+      for (const [method, id, status] of ['POST', 'GET'].flatMap((method) => cases.map((c) => [method, ...c]))) {
+        const response = await fetchCase('getArtists', { f: 'json', apiKey: matching }, select(id), method);
         assert.equal(response.status, status, id);
         assert.equal(response.headers.get('retry-after'), status === 503 ? '1' : null, id);
         assert.equal(response.headers.get('cache-control'), 'private, no-store', id);
