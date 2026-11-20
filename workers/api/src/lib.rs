@@ -48,6 +48,7 @@ pub mod ingest_session_request;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
+pub mod listen_history;
 mod magic_redemption;
 pub mod meter_sink;
 pub mod native_rest;
