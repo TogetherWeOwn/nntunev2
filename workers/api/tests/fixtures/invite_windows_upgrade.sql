@@ -95,6 +95,20 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'upgrade or replay changed an admin invite';
     END IF;
+
+    -- The count can pass via a sequential scan; check the index separately.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_index i
+        WHERE i.indrelid = 'public.invite_codes'::regclass
+          AND i.indexrelid = to_regclass('public.idx_invite_codes_window_issuer')
+          AND i.indisvalid
+          AND i.indnkeyatts = 2
+          AND pg_get_indexdef(i.indexrelid, 1, false) = 'window_id'
+          AND pg_get_indexdef(i.indexrelid, 2, false) = 'issued_by'
+          AND pg_get_expr(i.indpred, i.indrelid) = '(window_id IS NOT NULL)'
+    ) THEN
+        RAISE EXCEPTION 'missing or invalid invite quota index covering all window-linked rows';
+    END IF;
 END $$;
 
 ROLLBACK;
