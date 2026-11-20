@@ -322,7 +322,8 @@ async function failFavoritesStorage(page: Page, operation: 'getItem' | 'setItem'
 			} else {
 				Storage.prototype.setItem = function (key, value) {
 					if (this === window.localStorage && key.startsWith(`${base}.`)) {
-						throw new DOMException('Favorites writes unavailable', 'QuotaExceededError');
+						Reflect.set(window, '__favoritesWriteRejected', true);
+							throw new DOMException('Favorites writes unavailable', 'QuotaExceededError');
 					}
 					setItem.call(this, key, value);
 				};
@@ -507,6 +508,7 @@ test.describe('favorites storage regressions', () => {
 		await failFavoritesStorage(page, 'setItem');
 		await starButton(page, 'fav-zulu').click();
 		await settleFavorites(page);
+		expect(await page.evaluate(() => Reflect.get(window, '__favoritesWriteRejected'))).toBe(true);
 		await restoreFavoritesStorage(page);
 		// Recovery must not write the visit-only star along with the new edit.
 		await starButton(page, 'fav-alpha').click();

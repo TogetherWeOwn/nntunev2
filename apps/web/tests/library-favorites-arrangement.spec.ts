@@ -277,6 +277,7 @@ test('a retired move reconciles durable favorites without dropping a visit-only 
 	await faultStorage(page, 'write');
 	await star(page, 'arr-a').click();
 	await page.evaluate((key) => navigator.locks.request(key, () => {}), KEY);
+	expect(await stored(page)).toEqual(['arr-z', 'arr-m']);
 	const peer = await page.context().newPage();
 	await open(peer, ['arr-z', 'arr-m']);
 	await star(peer, 'arr-m').click();
