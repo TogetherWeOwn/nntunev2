@@ -77,9 +77,10 @@ BEGIN
     END IF;
 END $$;
 
+ALTER TABLE public.storage_validated_digest_winners DISABLE TRIGGER storage_validated_digest_winner_immutable;
 SELECT pg_temp.expect_error(s, '23514') FROM (VALUES
     ('UPDATE public.storage_object_envelope_intents SET wrapped_record = wrapped_record'),
     ('DELETE FROM public.storage_object_envelope_intents'),
-    ('TRUNCATE public.storage_object_envelope_intents')
+    ('TRUNCATE public.storage_object_envelope_intents CASCADE')
 ) AS cases(s);
 ROLLBACK;

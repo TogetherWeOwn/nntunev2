@@ -91,7 +91,7 @@ check_purge_upgrade() {
 replay=()
 declare -A historical_test=()
 for f in "${migrations[@]}"; do
-  if [[ "${f##*/}" == 0052_purge_legacy_provider_credentials.sql ]]; then
+  if [[ "${f##*/}" == 0053_purge_legacy_provider_credentials.sql ]]; then
     # The one-way contract requires the old relations to exist. Verify the
     # replay-safe prefix and its historical fixtures before removing them.
     replay_migrations "${replay[@]}"

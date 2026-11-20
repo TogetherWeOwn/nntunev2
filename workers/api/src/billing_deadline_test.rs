@@ -253,6 +253,7 @@ async fn late_fault_and_retry() -> Result<(), &'static str> {
     let before = fault_snapshot()
         .await
         .map_err(|_| "corrected retry state invalid")?;
+    before.carry_read_provenance(&mut outcome);
     store
         .store_reconcile_outcome("worker_fault_user", &outcome)
         .await
@@ -394,6 +395,15 @@ struct FaultSnapshot {
     subscription: String,
     existing_history: String,
     recovered_history: Option<String>,
+    plan: String,
+    anchor: Option<String>,
+}
+
+impl FaultSnapshot {
+    fn carry_read_provenance(&self, outcome: &mut ReconcileOutcome) {
+        outcome.read_plan = Some(self.plan.clone());
+        outcome.read_anchor = self.anchor.clone();
+    }
 }
 
 async fn fault_snapshot() -> Result<FaultSnapshot, StoreError> {
@@ -430,7 +440,9 @@ async fn fault_snapshot_with_recovery(recovered: bool) -> Result<FaultSnapshot, 
                                  FROM public.paid_invoice_history h
                                  WHERE stripe_invoice_id <> 'in_worker_absent'),
                                 (SELECT to_jsonb(h)::text FROM public.paid_invoice_history h
-                                 WHERE stripe_invoice_id = 'in_worker_absent')",
+                                 WHERE stripe_invoice_id = 'in_worker_absent'),
+                                (SELECT plan_id FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'),
+                                (SELECT paid_invoice_id FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault')",
                         &[&recovered],
                     )
                     .await
@@ -444,6 +456,8 @@ async fn fault_snapshot_with_recovery(recovered: bool) -> Result<FaultSnapshot, 
                     subscription: row.get(2),
                     existing_history: row.get(3),
                     recovered_history: row.get(4),
+                    plan: row.get(5),
+                    anchor: row.get(6),
                 })
             })
         },
@@ -580,8 +594,8 @@ pub(crate) async fn setup_ack_fixture() -> Result<(), &'static str> {
         .map_err(|_| "billing fixture setup failed")
 }
 
-// The relay withholds a successful COMMIT response from the test-feature
-// prototype. Observe the committed rows before retrying the same outcome.
+// The relay withholds a successful COMMIT response from the dormant store.
+// Retry the same invoice delivery using an exact read of the committed row.
 pub(crate) async fn test_reconcile_ack_retry() -> Result<(), &'static str> {
     let expired = std::rc::Rc::new(std::cell::Cell::new(false));
     let store = PgStore {
@@ -606,6 +620,7 @@ pub(crate) async fn test_reconcile_ack_retry() -> Result<(), &'static str> {
     let committed = fault_snapshot()
         .await
         .map_err(|_| "COMMIT acknowledgement loss stored incorrect state")?;
+    committed.carry_read_provenance(&mut outcome);
     let retry = PgStore {
         trace_id: "worker-fault-test".into(),
         work_deadline_observer: None,
