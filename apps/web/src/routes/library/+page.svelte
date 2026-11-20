@@ -149,7 +149,7 @@
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
-	let retainedQueueOnError = $state(false);
+	let retainedQueueWithoutListing = $state(false);
 	let requiresSignIn = $state(false);
 	const listingUnavailable = $derived(loading || libraryUnavailable || loadError !== null);
 	const player = getAppPlayer();
@@ -334,14 +334,12 @@
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
-			retainedQueueOnError = !authBoundary && !!(state.libraryUnavailable || state.loadError) && queueController.snapshot.tracks.length > 0;
+			// Keep the empty focus target even if the last queued row is removed during a retry.
+			retainedQueueWithoutListing = !authBoundary && (state.loading || state.libraryUnavailable || !!state.loadError) &&
+				(retainedQueueWithoutListing || queueController.snapshot.tracks.length > 0);
 			requiresSignIn = state.requiresSignIn;
-			// An access refusal that empties the library unmounts the queue
-			// panel (alert branch); the route-owned filter text must go with
-			// it so the next account never inherits the previous query.
-			// Successful same-account refreshes keep items and keep the query.
+			if (authBoundary) queueFilterQuery = '';
 			if (state.loadError && state.items.length === 0) {
-				queueFilterQuery = '';
 				findQuery = '';
 				findScope = 'both';
 				view = 'all';
@@ -651,14 +649,14 @@
 		const search = window.location.search;
 		if (search === handledShareSearch) return;
 		handledShareSearch = search;
-		shareInvalid = false;
-		const params = new URLSearchParams(search);
-		if (!params.has('track') && !params.has('t')) return media.clearShareSeek();
 		const account = queueExportAuthGeneration;
-		const intent = media.beginShareInput();
 		// A native retry can run after the URL changes but before afterNavigate.
 		const inputIsCurrent = () => shareAlive && account === queueExportAuthGeneration &&
 			handledShareSearch === search && window.location.search === search;
+		shareInvalid = false;
+		const params = new URLSearchParams(search);
+		if (!params.has('track') && !params.has('t')) return media.clearShareSeek();
+		const intent = media.beginShareInput();
 		const target = resolveShareTarget(
 			{ track: params.get('track'), t: params.get('t') },
 			items.map((track) => track.id)
@@ -1176,8 +1174,7 @@
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
 		const counts = ids.length > 1 ? `Added ${added}${surviving.length > added ? `, ${surviving.length - added} already queued` : ''}.` : '';
-		await media.playSelected(base, index, { ...evidence, isCurrent: () => shareAlive && evidence.isCurrent() },
-			(counts + missingInteractionLabel(ids, surviving)).trim());
+		await media.playSelected(base, index, { ...evidence, isCurrent: () => shareAlive && evidence.isCurrent() }, (counts + missingInteractionLabel(ids, surviving)).trim());
 	}
 
 	function appendInteractionIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
@@ -1915,8 +1912,7 @@
 		{/if}
 		</div>
 	{/if}
-	{#if !loading || items.length > 0}
-		{#if queue.tracks.length > 0 || retainedQueueOnError || (!libraryUnavailable && items.length > 0)}
+		{#if queue.tracks.length > 0 || retainedQueueWithoutListing || (!libraryUnavailable && items.length > 0)}
 			<!--
 				The queue panel stays mounted across background refreshes (its
 				rows remain readable while the new list loads), but its four
@@ -1956,7 +1952,8 @@
 			/>
 			<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />
 		{/if}
-		{#if !loadError || items.length > 0}
+
+	{#if (!loading && !loadError) || items.length > 0}
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
@@ -1966,7 +1963,6 @@
 		>
 			{staleAt ? 'Retry' : 'Refresh'}
 		</button>
-		{/if}
 	{/if}
 
 	<!-- Contract placeholders from main: usage-meter deliberately carries no
