@@ -16,6 +16,7 @@
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
 	import ShuffleUpcoming from '#lib/player/ShuffleUpcoming.svelte';
+	import VolumeControls from '#lib/player/VolumeControls.svelte';
 	import {
 		applyGainToNode,
 		loadLevelingEnabled,
@@ -1207,11 +1208,9 @@
 		if (restored && eventForCurrent(event)) updateSound(event.currentTarget);
 	}
 
-	function handleVolumeInput(event: Event & { currentTarget: HTMLInputElement }): void {
-		if (!audioEl || !restored) return;
-		updateSound({ volume: Number(event.currentTarget.value) / 100, muted: audioEl.muted });
-		// A rejected setter leaves state unchanged: undo the range's own edit.
-		event.currentTarget.value = String(sound.volume * 100);
+	function handleVolumeInput(volume: number): number {
+		if (audioEl && restored) updateSound({ volume, muted: audioEl.muted });
+		return sound.volume;
 	}
 
 	function toggleMuteShortcut(): void {
@@ -1730,23 +1729,14 @@
 		></audio>
 	{/key}
 
-	<div class="nt-sound">
-		<label>
-			Volume {Math.round(sound.volume * 100)}%
-			<input
-				type="range"
-				min="0"
-				max="100"
-				value={sound.volume * 100}
-				disabled={!restored || sound.restricted}
-				oninput={handleVolumeInput}
-			/>
-		</label>
-		<button type="button" aria-pressed={sound.muted} onclick={toggleMuteShortcut}>
-			Mute
-		</button>
-	</div>
-	<p role="status" hidden={!sound.restricted}>Use system volume controls.</p>
+	<VolumeControls
+		volume={sound.volume}
+		muted={sound.muted}
+		restricted={sound.restricted}
+		ready={restored}
+		onvolumeinput={handleVolumeInput}
+		ontogglemute={toggleMuteShortcut}
+	/>
 
 	<div>
 		<label for="track-time-mode">Time display</label>
