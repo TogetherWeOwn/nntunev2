@@ -119,6 +119,15 @@ impl Principal {
         }
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "staging-body-wasm-test"))]
+    pub(crate) fn staging_test_fixture() -> Self {
+        Self {
+            user_id: "fixture-user".into(),
+            credential_id: "fixture-credential".into(),
+            username: "fixture-name".into(),
+        }
+    }
+
     pub fn user_id(&self) -> &str {
         &self.user_id
     }

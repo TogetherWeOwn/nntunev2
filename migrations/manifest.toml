@@ -262,7 +262,11 @@ target = "app"
 sha256 = "ff16b0766d071b944191190e1f237c40ce276bb421c0e0dcd29384c643deadeb"
 
 [[migration]]
-file = "0052_listen_history.sql"
+file = "0052_storage_digest_reference_admission.sql"
+target = "app"
+sha256 = "16a26d5f322ee3b651d44519b0d07adfff7f1e4adc47d14c8f83757fa9eb8676"
+
+[[migration]]
+file = "0053_listen_history.sql"
 target = "app"
 sha256 = "27d43e70497bb7ab5b65218b2c56a50580ce3ecb7517a1d0d8afd2e582755f6e"
-renamed_from = [{ file = "0037_listen_history.sql", sha256 = "27d43e70497bb7ab5b65218b2c56a50580ce3ecb7517a1d0d8afd2e582755f6e" }]
