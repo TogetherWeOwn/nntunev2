@@ -37,6 +37,13 @@ pub struct StagingDispatch {
     pub order_work: OrderWork,
 }
 
+impl StagingDispatch {
+    pub(crate) const FIXTURE_ORDER_WORK: OrderWork = OrderWork {
+        comparisons: 5, // Three artist and two track/release lookups; no sorting.
+        artist_row_probes: 0,
+    };
+}
+
 pub enum StagingApp<'a, K> {
     Postgres {
         client: Client,
@@ -282,7 +289,7 @@ mod wasm_test {
         type NoMirror = fn() -> std::future::Ready<Result<Client, StagingRejection>>;
         let context = StagingDispatch {
             now_millis: 0,
-            order_work: SyntheticCatalogue::SNAPSHOT_WORK,
+            order_work: StagingDispatch::FIXTURE_ORDER_WORK,
         };
         let fixture = if small {
             SyntheticCatalogue::Small

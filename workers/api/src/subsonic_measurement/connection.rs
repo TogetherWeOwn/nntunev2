@@ -31,7 +31,7 @@ pub(super) async fn respond(
     let config = OnceCell::new();
     let context = StagingDispatch {
         now_millis: now_ms as i64,
-        order_work: SyntheticCatalogue::SNAPSHOT_WORK,
+        order_work: StagingDispatch::FIXTURE_ORDER_WORK,
     };
     let response = {
         let operation = within_request(

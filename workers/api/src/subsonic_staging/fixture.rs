@@ -1,7 +1,6 @@
 use nntune_subsonic::construction_budget::{BudgetExceeded, ConstructionBudget};
 
 use crate::catalogue::{ArtistDbRow, ReleaseDbRow, TrackDbRow};
-use crate::subsonic_dispatch::snapshot_order::OrderWork;
 
 #[derive(Clone, Copy)]
 pub enum SyntheticCatalogue {
@@ -23,12 +22,6 @@ const TEXT: [&str; 13] = [
 ];
 
 impl SyntheticCatalogue {
-    // One row per kind needs no sorting, but three artist and two track/release lookups.
-    pub(crate) const SNAPSHOT_WORK: OrderWork = OrderWork {
-        comparisons: 5,
-        artist_row_probes: 0,
-    };
-
     /// One row of each kind at most; no caller text, external catalogue or DB.
     pub(super) fn rows(self, budget: &mut ConstructionBudget) -> Result<Rows, BudgetExceeded> {
         if matches!(self, Self::Empty) {
