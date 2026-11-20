@@ -59,7 +59,8 @@ pub(super) async fn respond(
                     acquired.set(true);
                     let pg_config: tokio_postgres::Config =
                         db.connection_string().parse().map_err(|_| Unavailable)?;
-                    let tracked = socket.open(db.host(), db.port()).map_err(|_| Unavailable)?;
+                    let host = db.host();
+                    let tracked = socket.open(&host, db.port()).map_err(|_| Unavailable)?;
                     tracked.opened().await.map_err(|_| Unavailable)?;
                     let (client, connection) = pg_config
                         .connect_raw(tracked, socket.tls())
