@@ -147,10 +147,11 @@
 				attempt.signal
 			);
 			if (attempt.signal.aborted) return;
-			invalidateLibraryCache();
+			const purge = invalidateLibraryCache();
 			status = 'created';
 			stashSignedInEmail(email.trim());
-			window.location.href = '/account/billing';
+			await purge;
+			if (!attempt.signal.aborted) window.location.href = '/account/billing';
 		} catch (error) {
 			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {

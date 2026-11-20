@@ -245,45 +245,41 @@ export function broadcastAuthTransition(storage: SnapshotStorage | null): void {
 	}
 }
 
-export function favoritesKey(session: SnapshotStorage | null): string | null {
-	try {
-		const context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY);
-		return context ? `${LIBRARY_FAVORITES_KEY}.${context}` : null;
-	} catch {
-		return null;
-	}
-}
-
 /** The storage key is also the lock name for every coordinated scoped mutation. */
-export async function withFavoritesLock<T>(key: string, run: () => T | Promise<T>): Promise<T | null> {
+export async function withFavoritesLock<T>(key: string, run: () => T | Promise<T>, unavailable?: () => void): Promise<T | null> {
 	try {
 		const locks = globalThis.navigator?.locks;
-		if (!locks) return null;
-		return await locks.request(key, { mode: 'exclusive' }, (lock) => lock ? run() : null);
-	} catch {
-		return null;
+		if (locks) return await locks.request(key, { mode: 'exclusive' }, (lock) => lock ? run() : null);
+	} catch { /* A rejected lock must not enable an unlocked edit. */ }
+	unavailable?.();
+	return null;
+}
+
+// Session storage carries only purge markers (no favorite IDs) across a redirect.
+export async function purgeFavorites(session: SnapshotStorage | null, local: SnapshotStorage, key: string) {
+	try { session?.setItem(key, ''); } catch { /* Storage may be full or blocked. */ }
+	const remove = () => {
+		try {
+			local.removeItem(key);
+			session?.removeItem(key);
+		} catch { /* Best effort; keep the marker if removal failed. */ }
+	};
+	await withFavoritesLock(key, remove, remove); // Deletion only when locks are unavailable.
+}
+
+export function resumeFavoritesPurges(): void {
+	const session = browserStorage('session');
+	const local = browserStorage('local');
+	if (!session || !local) return;
+	for (const key of Object.keys(session)) {
+		if (key.startsWith(`${LIBRARY_FAVORITES_KEY}.`)) void purgeFavorites(session, local, key);
 	}
 }
 
-/** Capture the outgoing key before revocation. The caller revokes access immediately. */
-export async function clearFavoritesAtAuthBoundary(
-	session: SnapshotStorage | null,
-	local: SnapshotStorage | null
-): Promise<void> {
-	if (!local) return;
-	const key = favoritesKey(session);
-	try {
-		local.removeItem(LIBRARY_FAVORITES_KEY);
-	} catch {
-		// The legacy key is never read.
-	}
-	// Queue deletion after any in-flight writer, even if the key is corrupt.
-	if (key) await withFavoritesLock(key, () => local.removeItem(key));
-}
-
-function clearRecentFindsKeys(storage: SnapshotStorage | null, context: string | null): void {
+function clearFavoritesKeys(storage: SnapshotStorage | null, context: string | null): void {
 	if (!storage) return;
 	try {
+		storage.removeItem(LIBRARY_FAVORITES_KEY);
 		if (context) storage.removeItem(`${LIBRARY_RECENT_FINDS_KEY}.${context}`);
 		storage.removeItem(LIBRARY_RECENT_FINDS_KEY);
 	} catch {
@@ -299,22 +295,29 @@ function clearRecentFindsKeys(storage: SnapshotStorage | null, context: string |
  * shared browser), and tell other tabs to do the same. Never throws, so
  * it is safe to call right after a credential exchange succeeds.
  */
-export function invalidateLibraryCache(): void {
+export async function invalidateLibraryCache(): Promise<void> {
 	const session = browserStorage('session');
-	// Capture the outgoing scopes before clearSnapshot revokes access.
+	// Capture the auth context before clearSnapshot revokes it: the scoped
+	// favorites key in localStorage derives from it.
 	let context: string | null = null;
 	try {
 		context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY) ?? null;
 	} catch {
 		context = null;
 	}
-	const local = browserStorage('local');
-	void clearFavoritesAtAuthBoundary(session, local);
 	clearSnapshot(session);
+	const local = browserStorage('local');
 	clearSnapshot(local);
-	clearRecentFindsKeys(local, context);
+	clearFavoritesKeys(local, context);
+	const purge = context && local ? purgeFavorites(session, local, `${LIBRARY_FAVORITES_KEY}.${context}`) : null;
 	clearUsageWarnings();
 	broadcastAuthTransition(local);
+	if (!purge) return;
+	// The next document resumes the purge if contention outlasts this budget.
+	await new Promise<void>((resolve) => {
+		const timer = setTimeout(resolve, 500);
+		void purge.then(() => { clearTimeout(timer); resolve(); });
+	});
 }
 
 /**

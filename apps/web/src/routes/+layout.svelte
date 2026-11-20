@@ -7,7 +7,7 @@
 	import favicon from '#lib/assets/favicon.svg';
 	import PaywallModal from '#lib/billing/PaywallModal.svelte';
 	import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
-	import { invalidateLibraryCache } from '#lib/library/cache.js';
+	import { invalidateLibraryCache, resumeFavoritesPurges } from '#lib/library/cache.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		notifyLocalAuthTransition,
@@ -315,6 +315,7 @@
 		const offPanel = onRightPanel((panel) => {
 			rightSnippet = panel;
 		});
+		resumeFavoritesPurges();
 		const offAuth = subscribeLocalAuthTransition(clearShellAtAuthBoundary);
 		const onStorage = (event: StorageEvent): void => {
 			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) clearShellAtAuthBoundary();
@@ -360,15 +361,15 @@
 			}
 		} catch {
 			pushToast('Could not sign out. Please try again.');
-			return;
-		} finally {
 			signingOut = false;
+			return;
 		}
 		clearMiniPlayerHint();
 		clearToasts();
-		invalidateLibraryCache();
+		const purge = invalidateLibraryCache();
 		clearSignedInEmail();
 		notifyLocalAuthTransition();
+		await purge;
 		window.location.href = '/login';
 	}
 

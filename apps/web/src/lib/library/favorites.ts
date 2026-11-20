@@ -8,12 +8,28 @@
  * the snapshot keys in `cache.ts`. Reload-safe (the context is tab-scoped
  * session state), never shared across accounts (a rotated or removed
  * context makes the previous account's favorites unreachable), and
- * corrupt values fall back to empty on display reads.
+ * corrupt values fall back to empty without throwing. No network use:
+ * every helper touches Web Storage only.
  */
 
-import { favoritesKey, withFavoritesLock, type SnapshotStorage } from './cache.js';
+import {
+	LIBRARY_AUTH_CONTEXT_KEY,
+	LIBRARY_FAVORITES_KEY,
+	purgeFavorites,
+	withFavoritesLock,
+	type SnapshotStorage
+} from './cache.js';
 
-export { clearFavoritesAtAuthBoundary, favoritesKey } from './cache.js';
+/** Scoped favorites key for the current auth context, or null without one. */
+export function favoritesKey(session: SnapshotStorage | null): string | null {
+	if (!session) return null;
+	try {
+		const context = session.getItem(LIBRARY_AUTH_CONTEXT_KEY);
+		return context ? `${LIBRARY_FAVORITES_KEY}.${context}` : null;
+	} catch {
+		return null;
+	}
+}
 
 function isStoredId(value: unknown): value is string {
 	return typeof value === 'string' && value.length > 0;
@@ -69,7 +85,7 @@ export async function updateStoredFavorites(
 		const parsed: unknown = raw === null ? [] : JSON.parse(raw);
 		if (!Array.isArray(parsed) || !parsed.every(isStoredId)) return null;
 		const latest = [...new Set<string>(parsed)];
-		const committed = [...new Set(update([...latest]))];
+		const committed = [...new Set(update(latest.slice()))];
 		if (!committed.every(isStoredId) || favoritesKey(session) !== key) return null;
 		const encoded = JSON.stringify(committed);
 		if (encoded !== JSON.stringify(latest)) local.setItem(key, encoded);
@@ -77,7 +93,7 @@ export async function updateStoredFavorites(
 	});
 }
 
-/** Legacy Liked route bridge. New writers must use updateStoredFavorites. */
+/** Persist favorites, returning whether storage accepted the current set. */
 export function saveFavorites(
 	session: SnapshotStorage | null,
 	local: SnapshotStorage | null,
@@ -107,4 +123,25 @@ export function selectFavoriteItems<T extends { id: string }>(
 ): T[] {
 	const starred = new Set(favoriteIds);
 	return orderedItems.filter((item) => starred.has(item.id));
+}
+
+/**
+ * Clear favorites at the auth boundary: the scoped key for the outgoing
+ * context plus the legacy unscoped base key. Call BEFORE the refresher's
+ * transition handler revokes the session auth context — afterwards the
+ * scoped key is unknowable. Never throws.
+ */
+export async function clearFavoritesAtAuthBoundary(
+	session: SnapshotStorage | null,
+	local: SnapshotStorage | null
+): Promise<void> {
+	if (!local) return;
+	const key = favoritesKey(session);
+	const purge = key ? purgeFavorites(session, local, key) : undefined;
+	try {
+		local.removeItem(LIBRARY_FAVORITES_KEY);
+	} catch {
+		// Best effort; a key without its auth context is never read.
+	}
+	await purge;
 }

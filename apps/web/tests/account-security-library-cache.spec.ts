@@ -153,9 +153,20 @@ test('successful local logout invalidates library snapshots across tabs before r
 
 	await securityTab.goto('/account/security');
 	await seedActingTabSnapshot(securityTab);
+	const favorites = `nntune.library.favorites.v1.${AUTH_CONTEXT}`;
+	await page.evaluate((key) => new Promise<void>((ready) => {
+		localStorage.setItem(key, '["old"]');
+		void navigator.locks.request(key, () => new Promise<void>((release) => {
+			Reflect.set(window, 'releaseFavorites', release);
+			ready();
+		}));
+	}), favorites);
 	await securityTab.getByRole('button', { name: /^sign out$/i }).click();
 
 	await securityTab.waitForURL('**/login');
+	// The redirect is bounded even while the other tab still holds the lock.
+	await page.evaluate(() => Reflect.get(window, 'releaseFavorites')());
+	await expect.poll(() => securityTab.evaluate((key) => localStorage.getItem(key), favorites)).toBeNull();
 	expect(logoutPosts()).toBe(1);
 	await expectSnapshotCleared(securityTab);
 	await expectLibraryTabInvalidated(page);

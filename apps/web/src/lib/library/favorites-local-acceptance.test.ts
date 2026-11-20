@@ -57,10 +57,6 @@ function installWindow(): { session: SnapshotStorage; local: SnapshotStorage } {
 	const session = memoryStorage();
 	const local = memoryStorage();
 	vi.stubGlobal('window', { sessionStorage: session, localStorage: local });
-	vi.stubGlobal('navigator', { locks: {
-		request: (name: string, _: LockOptions, run: LockGrantedCallback<unknown>) =>
-			Promise.resolve().then(() => run({ name, mode: 'exclusive' }))
-	} });
 	return { session, local };
 }
 
@@ -69,15 +65,18 @@ describe('favorites auth-boundary clearing', () => {
 		vi.unstubAllGlobals();
 	});
 
-	it('[FAV-U01] crossing the auth boundary clears the scoped favorites key', async () => {
+	it('[FAV-U01] crossing the auth boundary clears the scoped favorites key', () => {
 		const { session, local } = installWindow();
 		session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'account-a');
 		local.setItem(scopedFavoritesKey('account-a'), JSON.stringify(['track-a', 'track-b']));
 
 		invalidateLibraryCache();
 
+		expect(
+			local.getItem(scopedFavoritesKey('account-a')),
+			'scoped favorites must not survive the auth boundary'
+		).toBeNull();
 		expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
-		await expect.poll(() => local.getItem(scopedFavoritesKey('account-a'))).toBeNull();
 	});
 
 	it('[FAV-U02] crossing the auth boundary clears the legacy unscoped favorites key', () => {
@@ -94,12 +93,15 @@ describe('favorites auth-boundary clearing', () => {
 		expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
 	});
 
-	it('[FAV-U03] a corrupt favorites value is cleared at the auth boundary', async () => {
+	it('[FAV-U03] a corrupt favorites value is cleared without throwing', () => {
 		const { session, local } = installWindow();
 		session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'account-a');
 		local.setItem(scopedFavoritesKey('account-a'), '{not-json');
 
 		expect(() => invalidateLibraryCache()).not.toThrow();
-		await expect.poll(() => local.getItem(scopedFavoritesKey('account-a'))).toBeNull();
+		expect(
+			local.getItem(scopedFavoritesKey('account-a')),
+			'corrupt favorites must not survive the auth boundary'
+		).toBeNull();
 	});
 });

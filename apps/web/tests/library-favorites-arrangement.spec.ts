@@ -272,6 +272,33 @@ test('[FAVORDER-06] remove and re-star use the latest arranged membership withou
 	expect(await stored(page)).toEqual(['arr-m', 'arr-z', 'arr-a']);
 });
 
+test('same-scope edits reconcile a retired move and apply Star all to the whole selection', async ({ page }) => {
+	const initial = ['arr-z', 'arr-m'];
+	await open(page, initial);
+	const peer = await page.context().newPage();
+	await open(peer, initial);
+	await star(peer, 'arr-m').click();
+	await expect.poll(() => stored(peer)).toEqual(['arr-z']);
+	await activate(page, 'Mike Song', 'up');
+	await expectIds(page, ['arr-z']);
+	await expect(page.getByTestId('favorites-announcement')).toBeEmpty();
+
+	await page.getByRole('button', { name: 'Select all', exact: true }).click();
+	await page.getByTestId('track-more').first().click();
+	await star(peer, 'arr-z').click();
+	await expect.poll(() => stored(peer)).toEqual([]);
+	await peer.evaluate((key) => new Promise<void>((ready) => {
+		void navigator.locks.request(key, () => new Promise<void>((release) => {
+			window.addEventListener('release-favorites', () => release(), { once: true });
+			ready();
+		}));
+	}), KEY);
+	await page.getByRole('menuitem', { name: 'Star all', exact: true }).click();
+	await expect.poll(() => page.evaluate(async () => (await navigator.locks.query()).pending?.map((lock) => lock.name))).toContain(KEY);
+	await peer.evaluate(() => window.dispatchEvent(new Event('release-favorites')));
+	await expect.poll(async () => ((await stored(page)) as string[]).sort()).toEqual([...ALL].sort());
+});
+
 test('[FAVORDER-07] an auth transition purges a pending arrangement and never restores another account order', async ({ page }) => {
 	await open(page, ALL);
 	await faultStorage(page, 'write');

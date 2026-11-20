@@ -385,7 +385,8 @@
 				}
 			}
 			// Bootstrap once after an authenticated load has minted the context.
-			// Refresh must not overwrite visit-only edits when persistence fails.
+			// Memory stays authoritative for this visit, even if persistence
+			// fails; Refresh must not overwrite pending edits with stale storage.
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
 				if (!favoritesInitialized) {
@@ -783,19 +784,24 @@
 		player.announceQueue(`Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`);
 	}
 
-	function editFavorites(update: (latest: readonly string[]) => readonly string[]): void {
+	function editFavorites(
+		update: (latest: readonly string[]) => readonly string[],
+		applied?: (before: readonly string[], after: readonly string[]) => void
+	): void {
 		const session = browserStorage('session');
-		const local = browserStorage('local');
 		const key = favoritesKey(session);
 		const edit = ++favoriteEdit;
-		// Keep the visit usable when storage is unavailable, but never replay
-		// its in-memory list as a durable write.
-		favorites = [...update(favorites)];
-		if (!local || !key) return;
-		void updateStoredFavorites(session, local, key, update).then((committed) => {
-			if (committed && edit === favoriteEdit && favoritesKey(session) === key) {
-				favorites = committed;
-			}
+		const before = favorites;
+		const optimistic = update(before);
+		favorites = [...optimistic];
+		let base = before;
+		void updateStoredFavorites(session, browserStorage('local'), key, (latest) => {
+			base = latest;
+			return update(latest);
+		}).then((committed) => {
+			if (edit !== favoriteEdit || favoritesKey(session) !== key) return;
+			if (committed) favorites = committed;
+			applied?.(committed ? base : before, committed ?? optimistic);
 		});
 	}
 
@@ -872,13 +878,16 @@
 		const loaded = new Set(items.map((track) => track.id));
 		const visible = (ids: readonly string[]) => ids.filter((storedId) => loaded.has(storedId));
 		const move = (ids: readonly string[]) => moveFavoriteId(ids, visible(ids), id, direction);
-		const next = move(favorites);
-		if (next === favorites) return;
-		editFavorites(move);
-		const visibleIds = visible(next);
-		const position = visibleIds.indexOf(id) + 1;
+		if (move(favorites) === favorites) return;
+		favoritesAnnouncement = '';
 		const track = items.find((candidate) => candidate.id === id);
-		favoritesAnnouncement = `${track ? displayTitle(track) : id} moved to ${position} of ${visibleIds.length}`;
+		editFavorites(move, (before, after) => {
+			const ids = visible(after);
+			const position = ids.indexOf(id);
+			if (position !== -1 && position !== visible(before).indexOf(id)) {
+				favoritesAnnouncement = `${track ? displayTitle(track) : id} moved to ${position + 1} of ${ids.length}`;
+			}
+		});
 		await tick();
 		// The keyed list preserves nodes, so an enabled button keeps focus
 		// on its own; a move onto a boundary disables the activated button
@@ -1011,10 +1020,7 @@
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
 	}
 
-	/**
-	 * Confirmed clear: remove every ID in the current scope, including IDs
-	 * absent from this library.
-	 */
+	/** Confirmed clear removes every ID in the current scope. */
 	function confirmClearFavorites(): void {
 		editFavorites(() => []);
 		favoritesAnnouncement = '';
@@ -1197,23 +1203,23 @@
 		player.announceQueue(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving), true);
 	}
 
-	function favoriteInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): void {
+	function favoriteInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items, remove = ids.every((id) => favoriteIds.has(id))): void {
 		const queue = queueController.snapshot;
 		const surviving = availableInteractionIds(ids, queued, source);
 		if (!surviving.length) return;
-		const remove = surviving.every((id) => favoriteIds.has(id));
-		const changed = surviving.filter((id) => favoriteIds.has(id) === remove);
-		editFavorites((latest) => remove
-			? latest.filter((id) => !changed.includes(id))
-			: [...new Set([...latest, ...changed])]);
-		const already = surviving.length - changed.length;
-		const count = `${changed.length} ${changed.length === 1 ? 'track' : 'tracks'}`;
-		const track = (queued ? queue.tracks : source).find((track) => track.id === surviving[0]);
-		const subject = ids.length === 1 && track ? displayTitle(track) : count;
-		favoritesAnnouncement = (remove ? `Removed ${subject} from favorites.`
-			: `Starred ${subject}${already ? `; ${already} ${already === 1 ? 'was' : 'were'} already starred` : ''}.`) + missingInteractionLabel(ids, surviving);
+		const targets = new Set(surviving);
+		favoritesAnnouncement = '';
+		editFavorites((latest) => remove ? latest.filter((id) => !targets.has(id)) : [...new Set([...latest, ...targets])], (before) => {
+			const changed = surviving.filter((id) => before.includes(id) === remove).length;
+			const already = surviving.length - changed;
+			const count = `${changed} ${changed === 1 ? 'track' : 'tracks'}`;
+			const track = (queued ? queue.tracks : source).find((track) => track.id === surviving[0]);
+			const subject = ids.length === 1 && track ? displayTitle(track) : count;
+			favoritesAnnouncement = (remove ? `Removed ${subject} from favorites.`
+				: `Starred ${subject}${already ? `; ${already} ${already === 1 ? 'was' : 'were'} already starred` : ''}.`) + missingInteractionLabel(ids, surviving);
+		});
 		const focusedId = focusedLibraryRowId();
-		if (!queued && view === 'favorites' && remove && focusedId !== null && changed.includes(focusedId)) {
+		if (!queued && view === 'favorites' && remove && focusedId !== null && targets.has(focusedId)) {
 			focusAfterSelectedRowRemoval(null, null);
 		}
 	}
@@ -1290,7 +1296,7 @@
 		const starred = ids.every((id) => favoriteIds.has(id));
 		const actions = playbackMenuActions(ids, source);
 		actions.push(
-			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids, false, source()) },
+			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids, false, source(), starred) },
 			unavailablePlaylistAction
 		);
 		if (ids.length === 1) actions.push({ label: 'Copy link', run: () => {
@@ -1399,9 +1405,9 @@
 			clearFavoritesExportFeedback();
 			releaseFavoritesDownload();
 			clearSignedInEmail();
-			// Queue the purge before the refresher revokes the
+			// Clear favorites storage BEFORE the refresher revokes the
 			// session auth context the scoped key derives from.
-			void clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+			clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 			favorites = [];
 			favoritesInitialized = false;
@@ -1425,7 +1431,7 @@
 		clearFavoritesExportFeedback();
 		releaseFavoritesDownload();
 		clearSignedInEmail();
-		void clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
+		clearFavoritesAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		clearRecentFindsAtAuthBoundary(browserStorage('session'), browserStorage('local'));
 		favorites = [];
 		favoritesInitialized = false;
