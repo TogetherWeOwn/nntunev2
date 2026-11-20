@@ -9,15 +9,15 @@ const neverOpen = () => assert.fail('app connector must not run');
 
 test('only the exact armed staging deployment admits the QA runner', () => {
   const sha = 'abcd'.repeat(10);
+  const lease = `v1:${sha}:1000:2200:fixture-user`;
   const env = {
     RP_ID: 'example.test', BUILD_SHA: sha, QA_CODE_SEAM: '1', QA_AUTH_TOKEN: 'fixture',
     SUBSONIC_MEASUREMENT_STAGE: 'staging', SUBSONIC_MEASUREMENT_ENABLE: '1',
-    SUBSONIC_MEASUREMENT_LEASE: `v1:${sha}:1000:2200:fixture-user`,
-    SUBSONIC_MEASUREMENT_FIXTURE: 'small',
+    SUBSONIC_MEASUREMENT_LEASE: `${lease};empty,small,charge-below,charge-exact,charge-over`,
   };
   const url = 'https://example.test/rest/ping';
-  const req = (target = url, bearer = 'Bearer fixture') => new Request(target, {
-    headers: { authorization: bearer, 'x-forwarded-host': 'example.test' },
+  const req = (target = url, bearer = 'Bearer fixture', id = 'small') => new Request(target, {
+    headers: { authorization: bearer, 'x-subsonic-measurement-case': id, 'x-forwarded-host': 'example.test' },
   });
   for (const [now, expected] of [[1000, true], [2199, true], [2200, false]])
     assert.equal(admits(req(), env, now), expected);
@@ -28,12 +28,29 @@ test('only the exact armed staging deployment admits the QA runner', () => {
     assert.equal(admits(req(target), env, 1000), false);
   }
   assert.equal(admits(req(), {}, 1000), false);
-  const fixtureEnv = (id) => ({ ...env, SUBSONIC_MEASUREMENT_FIXTURE: id });
-  assert.equal(admits(req(`${url}?fixture=unknown`), fixtureEnv('large-mixed'), 1000), true);
-  assert.equal(admits(req(`${url}?fixture=large-mixed`), fixtureEnv('unknown'), 1000), false);
-  for (const overrides of [{ SUBSONIC_MEASUREMENT_STAGE: 'production' }, { QA_CODE_SEAM: '0' },
-    { SUBSONIC_MEASUREMENT_ENABLE: '0' }, { SUBSONIC_MEASUREMENT_LEASE: undefined },
-    { BUILD_SHA: 'f'.repeat(40) }, { SUBSONIC_MEASUREMENT_FIXTURE: 'unknown' }]) {
+  for (const id of ['empty', 'small', 'charge-below', 'charge-exact', 'charge-over'])
+    assert.equal(admits(req(url, undefined, id), env, 1000), true);
+  const fullMatrix = ['empty', 'small', 'large-mixed',
+    ...['rows', 'charge', 'text', 'output-json', 'output-xml', 'output-jsonp']
+      .flatMap((prefix) => ['below', 'exact', 'over'].map((position) => `${prefix}-${position}`))];
+  for (const id of fullMatrix) {
+    assert.equal(admits(req(url, undefined, id), {
+      ...env, SUBSONIC_MEASUREMENT_LEASE: `${lease};${fullMatrix.join(',')}`,
+    }, 1000), true, id);
+  }
+  assert.equal(admits(req(`${url}?fixture=unknown&cap=0`), env, 1000), true);
+  const missing = req(`${url}?case=small`);
+  missing.headers.delete('x-subsonic-measurement-case');
+  assert.equal(admits(missing, env, 1000), false);
+  for (const id of ['', 'large-mixed', 'unknown', 'SMALL', 'small, small', 'x'.repeat(8192)])
+    assert.equal(admits(req(url, undefined, id), env, 1000), false);
+  for (const value of [undefined, lease, `${lease};`, `${lease};small,`, `${lease};small,small`,
+    `${lease};small,unknown`, `${lease};field-exact`, `${lease};small;large-mixed`, 'a'.repeat(641)]) {
+    assert.equal(admits(req(), { ...env, SUBSONIC_MEASUREMENT_LEASE: value }, 1000), false);
+  }
+  for (const overrides of [{ SUBSONIC_MEASUREMENT_STAGE: 'production' },
+    { SUBSONIC_MEASUREMENT_STAGE: undefined }, { QA_CODE_SEAM: '0' }, { QA_AUTH_TOKEN: undefined },
+    { SUBSONIC_MEASUREMENT_ENABLE: '0' }, { BUILD_SHA: 'f'.repeat(40) }]) {
     assert.equal(admits(req(), { ...env, ...overrides }, 1000), false);
   }
 });
