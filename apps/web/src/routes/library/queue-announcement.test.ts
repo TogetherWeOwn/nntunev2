@@ -15,7 +15,7 @@ import {
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
 import { libraryTabTitle } from '#lib/library/tab-title.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
@@ -114,7 +114,6 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		displayArtist,
 		displayTitle,
 		clearMiniPlayerHint,
-		setMiniPlayerHint,
 		orderLibraryItems,
 		filterLibraryItems,
 		libraryTabTitle,

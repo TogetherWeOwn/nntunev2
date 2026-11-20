@@ -56,7 +56,7 @@
 		toggleSelected
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
-	import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+	import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 	import NativePlayer from '#lib/player/NativePlayer.svelte';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import ContextMenu from '#lib/interactions/ContextMenu.svelte';
@@ -147,8 +147,7 @@
 		flush: () => tick(),
 		clearShareFeedback,
 		announce: (track) => announceEnd(track),
-		clearQueueAnnouncement: () => { queueAnnouncement = ''; },
-		syncMiniPlayerHint
+		clearQueueAnnouncement: () => { queueAnnouncement = ''; }
 	});
 	const commitQueue = player.commitQueue;
 	const replaceQueue = player.replaceQueue;
@@ -613,20 +612,6 @@
 		return favoritesExportSnapshot()
 			.tracks.map((track) => `${track.id}\u0000${track.title}\u0000${track.artist}`)
 			.join('\u0001');
-	}
-
-	/** Mirror the current selection into the metadata-only mobile hint. */
-	function syncMiniPlayerHint(next: QueueState): void {
-		const current = queueCurrentTrack(next);
-		if (current) {
-			setMiniPlayerHint({
-				trackId: current.id,
-				title: displayTitle(current),
-				artist: displayArtist(current)
-			});
-		} else {
-			clearMiniPlayerHint();
-		}
 	}
 
 	function clearShareFeedback(): void {

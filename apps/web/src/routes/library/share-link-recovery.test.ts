@@ -8,7 +8,7 @@ import { clearFavoritesAtAuthBoundary, loadFavorites, selectFavoriteItems } from
 import { clearRecentFindsAtAuthBoundary, loadRecentFinds } from '#lib/library/recent-finds.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
 import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
@@ -63,7 +63,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		insertTracks: queueFunctions.insertTracks, survivingInteractionIds,
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
-		clearMiniPlayerHint, setMiniPlayerHint,
+		clearMiniPlayerHint,
 		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag,
 		browserStorage: () => null,

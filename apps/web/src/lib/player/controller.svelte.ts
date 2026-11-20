@@ -1,11 +1,12 @@
+import { displayArtist, displayTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
+import { clearMiniPlayerHint, setMiniPlayerHint } from '../shell/mini-player.js';
 import { createMediaController, type NaturalEndSelection } from './mediaController.js';
 import { currentTrack, type QueueState } from './queue.js';
 import { createQueueController, type LibrarySources, type QueueCommitKind } from './queueController.js';
 
 type PlayerEffects = Omit<NaturalEndSelection, 'commit'> & {
 	clearQueueAnnouncement: () => void;
-	syncMiniPlayerHint: (next: QueueState) => void;
 };
 
 type LibraryCommit = {
@@ -68,7 +69,13 @@ export function createPlayerController(
 		if (!isCurrent()) return false;
 		queue.publish(next, receipt, library?.sources);
 		if (!isCurrent()) return false;
-		effects.syncMiniPlayerHint(next);
+		const selected = currentTrack(queue.snapshot);
+		if (selected) {
+			setMiniPlayerHint({ trackId: selected.id, title: displayTitle(selected), artist: displayArtist(selected) });
+		} else {
+			clearMiniPlayerHint();
+		}
+		// Hint listeners run synchronously and can retire this operation too.
 		return isCurrent();
 	}
 
