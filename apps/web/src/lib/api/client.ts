@@ -287,6 +287,10 @@ export class ApiClient {
 		});
 	}
 
+	async delete<T>(path: string): Promise<T> {
+		return this.request<T>(path, { method: 'DELETE' });
+	}
+
 	/**
 	 * Request an email magic link. Always resolves the same way for unknown
 	 * and known addresses (the API never reveals which emails exist).
