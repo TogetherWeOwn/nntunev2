@@ -2,6 +2,7 @@ use super::*;
 use crate::listen_history::{ExportCursor, EXPORT_PAGE_SIZE};
 
 pub(super) const EXPORT_PATH: &str = "/v1/plays/export";
+pub(super) const CLEAR_PATH: &str = "/v1/plays/events";
 const EXPORTS_PER_MINUTE: u64 = 120;
 const CLEARS_PER_MINUTE: u64 = 6;
 

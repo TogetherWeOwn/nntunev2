@@ -7624,7 +7624,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/session/revoke-all"
             | "/v1/plays"
             | "/v1/plays/heartbeat"
-            | crate::listen_history::EVENTS_PATH
+            | listen_history_controls::CLEAR_PATH
             | listen_history_controls::EXPORT_PATH
             | "/v1/credentials"
             | "/v1/subsonic-credentials"
@@ -7853,7 +7853,7 @@ where
         ("POST", listen_history_controls::EXPORT_PATH) => {
             listen_history_controls::export(ctx, req).await
         }
-        ("DELETE", crate::listen_history::EVENTS_PATH) => {
+        ("DELETE", listen_history_controls::CLEAR_PATH) => {
             listen_history_controls::clear(ctx, req).await
         }
         // Internal meter sink: HMAC-authenticated inside the handler

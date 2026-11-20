@@ -1,6 +1,8 @@
+use super::listen_history_controls::{CLEAR_PATH, EXPORT_PATH};
+
 #[test]
 fn history_export_pages_and_clear_affect_only_the_session_owner() {
-    use crate::listen_history::{ListenEvent, ListenRow, EVENTS_PATH, EXPORT_PAGE_SIZE};
+    use crate::listen_history::{ListenEvent, ListenRow, EXPORT_PAGE_SIZE};
     let h = harness();
     seed_user(&h, "listener-a", "alice@example.com");
     seed_user(&h, "listener-b", "bob@example.com");
@@ -25,7 +27,7 @@ fn history_export_pages_and_clear_affect_only_the_session_owner() {
     let export = |cookie: &str, body: serde_json::Value| -> serde_json::Value {
         let resp = h.call_full(
             "POST",
-            listen_history_controls::EXPORT_PATH,
+            EXPORT_PATH,
             Some(body.to_string()),
             Some(cookie.into()),
             Some(ORIGIN),
@@ -52,17 +54,8 @@ fn history_export_pages_and_clear_affect_only_the_session_owner() {
         serde_json::json!([])
     );
     for _ in 0..2 {
-        assert_eq!(
-            h.call_full(
-                "DELETE",
-                EVENTS_PATH,
-                None,
-                Some(alice.clone()),
-                Some(ORIGIN)
-            )
-            .status,
-            200
-        );
+        let resp = h.call_full("DELETE", CLEAR_PATH, None, Some(alice.clone()), Some(ORIGIN));
+        assert_eq!(resp.status, 200, "{}", resp.body);
     }
     assert_eq!(
         export(&alice, serde_json::json!({}))["events"],
@@ -77,10 +70,7 @@ fn history_export_pages_and_clear_affect_only_the_session_owner() {
 #[test]
 fn history_privacy_routes_require_cookie_origin_and_fresh_clear() {
     let (h, cookie, secret) = play_bearer_harness("plays:write", false);
-    for (method, path) in [
-        ("POST", listen_history_controls::EXPORT_PATH),
-        ("DELETE", crate::listen_history::EVENTS_PATH),
-    ] {
+    for (method, path) in [("POST", EXPORT_PATH), ("DELETE", CLEAR_PATH)] {
         let mut ctx = h.ctx();
         let mut req = Request {
             method: method.into(),
@@ -107,7 +97,11 @@ fn history_privacy_routes_require_cookie_origin_and_fresh_clear() {
             assert_eq!(stale.status, 401, "{}", stale.body);
             assert!(stale.body.contains("reauth_required"));
             req.method = "POST".into();
-            assert_eq!(block_on(handle(&ctx, &req)).status, 404);
+            ctx.now = NOW;
+            for path in [CLEAR_PATH, "/v1/plays/events/context"] {
+                req.path = path.into();
+                assert_eq!(block_on(handle(&ctx, &req)).status, 404, "{path}");
+            }
         } else {
             assert_eq!(block_on(handle(&ctx, &req)).status, 200);
             for body in [r#"{"before_id":"42"}"#, r#"{"user_id":"other"}"#] {
@@ -123,10 +117,7 @@ fn history_export_and_clear_exhaust_independent_budgets() {
     let h = harness();
     seed_user(&h, "listener-a", "alice@example.com");
     let cookie = magic_login(&h, "alice@example.com");
-    for (method, path, limit) in [
-        ("DELETE", crate::listen_history::EVENTS_PATH, 6),
-        ("POST", listen_history_controls::EXPORT_PATH, 120),
-    ] {
+    for (method, path, limit) in [("DELETE", CLEAR_PATH, 6), ("POST", EXPORT_PATH, 120)] {
         let request = || {
             h.call_full(
                 method,
