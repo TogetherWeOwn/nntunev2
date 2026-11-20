@@ -42,5 +42,6 @@ SELECT pg_temp.expect_error(s, code) FROM (VALUES
 -- Isolate the claim guard: the referencing table must be included, but its
 -- own guard must not mask a missing claim-intent TRUNCATE trigger.
 ALTER TABLE public.storage_digest_reservations DISABLE TRIGGER storage_digest_reservations_no_delete;
-SELECT pg_temp.expect_error('TRUNCATE public.storage_plaintext_digest_claim_intents, public.storage_digest_reservations', '23514');
+ALTER TABLE public.storage_validated_digest_winners DISABLE TRIGGER storage_validated_digest_winner_immutable;
+SELECT pg_temp.expect_error('TRUNCATE public.storage_plaintext_digest_claim_intents CASCADE', '23514');
 ROLLBACK;

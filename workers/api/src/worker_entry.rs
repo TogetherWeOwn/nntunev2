@@ -439,7 +439,7 @@ fn allowed_cors_origin<'a>(req_origin: Option<&'a str>, cfg_origin: &str) -> Opt
 /// No match (or no `Origin`) yields no headers at all — never a reflection,
 /// never `*`. A 204 is always the known-path OPTIONS preflight, which
 /// additionally needs the method/header grant.
-fn cors_headers(
+pub(crate) fn cors_headers(
     status: u16,
     req_origin: Option<&str>,
     cfg_origin: &str,
@@ -5127,10 +5127,11 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
+                // Keep the session-path probe unnamed through Hyperdrive.
                 let row = client
-                    .query_opt(
+                    .query_typed_opt(
                         crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
-                        &[&user_id],
+                        &[(&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -7864,6 +7865,16 @@ mod tests {
         // ... and query strings never reach the log either.
         assert_eq!(served_display_path("/v1/vault?token=abc"), "unknown");
         assert_eq!(served_display_path("/probe/x?token=abc"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/likes?user_id=alice"),
+            "/v1/me/likes"
+        );
+        assert_eq!(served_display_path("/v1/me/likes/track/alice"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/taste?user_id=bob"),
+            "/v1/me/taste"
+        );
+        assert_eq!(served_display_path("/v1/me/taste/bob"), "unknown");
     }
 
     /// Drive one ready future to completion on a noop waker (the gate

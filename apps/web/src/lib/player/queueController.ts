@@ -3,7 +3,7 @@ import { resolveStreamUrl } from '../library/stream-url.js';
 import { currentTrack, type QueueState } from './queue.js';
 import { createQueueRevision } from './queueRevision.js';
 
-type LibrarySources = ReadonlyMap<string, ReadonlySet<string>>;
+export type LibrarySources = ReadonlyMap<string, ReadonlySet<string>>;
 export interface QueuedPlaySource {
 	streamUrl: string;
 	isCurrent: () => boolean;
