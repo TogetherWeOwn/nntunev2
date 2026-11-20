@@ -23,5 +23,10 @@ export const variables = defineEnvVars({
 		public: true,
 		description: 'Base URL of the workers/api worker. Empty means same-origin.',
 		schema: (value) => value ?? ''
+	},
+	PUBLIC_LISTEN_HISTORY_ENABLED: {
+		public: true,
+		description: 'Record playback history unless explicitly disabled.',
+		schema: (value) => value !== 'false'
 	}
 });
