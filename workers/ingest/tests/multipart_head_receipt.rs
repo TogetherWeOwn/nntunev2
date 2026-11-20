@@ -46,7 +46,10 @@ fn compares_only_bounded_completion_and_head_metadata() {
     let digest = Sha256::digest(Sha256::digest(bytes));
     let part = part.verify_reply("opaque-part".into(), checksum).unwrap();
     let completion = plan.complete(vec![part]).unwrap();
-    let body = format!("<CompleteMultipartUploadResult><ChecksumSHA256>{}-1</ChecksumSHA256></CompleteMultipartUploadResult>", STANDARD.encode(digest));
+    let receipt_xml = |fields: &str| {
+        format!("<CompleteMultipartUploadResult>{fields}<ChecksumSHA256>{}-1</ChecksumSHA256></CompleteMultipartUploadResult>", STANDARD.encode(digest))
+    };
+    let body = receipt_xml("");
     let context = EnvelopeContext {
         identities: [0, 1, 2, 0xab, 0xcd, 5].map(id),
         plaintext_len: 1,
@@ -69,6 +72,30 @@ fn compares_only_bounded_completion_and_head_metadata() {
     };
     let check = |receipt: Option<HeadReceipt<'_>>| compare(&body, &expected, receipt);
     assert_eq!(check(Some(head())), Ok(()));
+    let bucket_field = format!("<Bucket>{BUCKET}</Bucket>");
+    let key_field = format!("<Key>{KEY}</Key>");
+    for fields in [
+        &bucket_field,
+        &key_field,
+        &format!("{bucket_field}{key_field}"),
+    ] {
+        assert_eq!(
+            compare(&receipt_xml(fields), &expected, Some(head())),
+            Ok(())
+        );
+    }
+    let other_key = KEY.replace("cd", "ef");
+    for fields in [
+        format!("<Bucket>other-bucket</Bucket>{key_field}"),
+        format!("{bucket_field}<Key>{other_key}</Key>"),
+        bucket_field.repeat(2),
+        key_field.repeat(2),
+    ] {
+        assert_eq!(
+            compare(&receipt_xml(&fields), &expected, Some(head())),
+            Err(Completion(MultipartError::CompletionBody))
+        );
+    }
     assert_eq!(check(None), Err(MissingHead));
     assert_eq!(
         compare("<Error/>", &expected, Some(head())),
@@ -76,6 +103,47 @@ fn compares_only_bounded_completion_and_head_metadata() {
     );
     assert_eq!(
         compare(&body, &locate("other-bucket", KEY), Some(head())),
+        Err(ExpectedObject)
+    );
+    let other_header = OriginSealer::new(1).unwrap().header().to_bytes();
+    assert_ne!(other_header, context.header);
+    for wrong_context in [
+        EnvelopeContext {
+            header: other_header,
+            ..context
+        },
+        EnvelopeContext {
+            plaintext_len: 2,
+            ..context
+        },
+    ] {
+        assert_eq!(
+            compare_head_receipt(
+                &completion,
+                200,
+                body.as_bytes(),
+                &wrong_context,
+                &expected,
+                Some(head())
+            ),
+            Err(ExpectedObject)
+        );
+    }
+    let mut other_context = EnvelopeContext { ..context };
+    other_context.identities[4] = id(0xef);
+    let other_locator = locate(BUCKET, &other_key);
+    assert_eq!(
+        compare_head_receipt(
+            &completion,
+            200,
+            body.as_bytes(),
+            &other_context,
+            &other_locator,
+            Some(HeadReceipt {
+                locator: Some(&other_locator),
+                ..head()
+            })
+        ),
         Err(ExpectedObject)
     );
 
