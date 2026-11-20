@@ -6,6 +6,7 @@
 
 	let { filter, accessRevoked }: { filter: CollectionFilter; accessRevoked: boolean } = $props();
 	let query = $state('');
+	let searchInput = $state<HTMLInputElement>();
 	let sort = $state<CollectionSort>('catalogue');
 	let reverse = $state(false);
 	let layout = $state<'list' | 'grid'>('list');
@@ -45,10 +46,9 @@
 		return () => active?.abort();
 	});
 </script>
-
 <section aria-label="Library collections">
 	<div class="nt-collection-toolbar">
-		<label>Search in Your Library <input class="nt-button nt-button--ghost" type="search" bind:value={query} /></label>
+		<label>Search in Your Library <input class="nt-button nt-button--ghost" type="search" bind:this={searchInput} bind:value={query} /></label>
 		<label>Sort collections
 			<select class="nt-button nt-button--ghost" bind:value={sort}>
 				<option value="catalogue">Catalogue order</option>
@@ -93,7 +93,7 @@
 				{/each}
 			</ul>
 		{:else if rows.length > 0}
-			<button class="nt-button" type="button" onclick={() => { query = ''; }}>Clear collection search</button>
+			<button class="nt-button" type="button" onclick={() => { query = ''; searchInput?.focus(); }}>Clear collection search</button>
 		{/if}
 	{/if}
 </section>

@@ -26,14 +26,12 @@ test('browses member collections without changing track selection or queue', asy
 	await expect(queue).toHaveText(/Track One/);
 	const queued = await queue.elementHandle();
 	const { choose, region } = controls(page), rows = region.getByRole('listitem');
-	await choose('All collections');
+	await Promise.all([page.waitForResponse((response) => response.url().endsWith(artPath) && response.status() === 404), choose('All collections')]);
 	await expect(rows).toHaveCount(52);
 	await expect(trackRows.first()).toBeHidden();
 	await expect(meter).toHaveCount(1);
 	await choose('Artists');
-	await expect(rows).toHaveCount(50);
-	await expect(rows.last()).toHaveText(/Artist 50/);
-	await expect(rows.filter({ hasNotText: /Artist/ })).toHaveCount(0);
+	await expect(rows).toHaveText(Array.from({ length: 50 }, (_, i) => new RegExp(`Artist ${i + 1}\\s*Artist`)));
 	await choose('Albums');
 	await region.getByRole('combobox', { name: 'Sort collections' }).selectOption('title');
 	await expect(rows).toHaveText([/Café/, /Élan/]);
@@ -65,7 +63,9 @@ test('retries collection reads and renders single, empty and sign-in states', as
 	await region.getByRole('button', { name: 'Retry collections' }).click();
 	await expect(region.getByRole('status')).toHaveText('No albums in the loaded results.');
 	await choose('Artists');
-	await region.getByRole('searchbox').fill('North');
+	await region.getByRole('searchbox').fill('No matching collection');
+	await region.getByRole('button', { name: 'Clear collection search' }).press('Enter');
+	await expect(region.getByRole('searchbox')).toBeFocused();
 	await expect(region.getByRole('listitem')).toHaveText([/North/]);
 	await page.route('**/v1/releases', (route) => route.fulfill({ status: 401, json: {} }));
 	await choose('All collections');
