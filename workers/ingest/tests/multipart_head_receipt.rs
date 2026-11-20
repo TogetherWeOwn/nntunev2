@@ -1,0 +1,143 @@
+use base64::{engine::general_purpose::STANDARD, Engine};
+use nntune_core::{
+    media::{ciphertext_size, HEADER_SIZE, TAG_SIZE},
+    media_envelope::EnvelopeContext,
+    origin_sealer::{OriginSealer, MAX_NEW_PLAINTEXT},
+    s3_locator::{S3Binding, S3Locator},
+};
+use nntune_ingest::multipart::{
+    head_receipt::{compare_head_receipt, HeadReceipt, HeadReceiptError::*},
+    MultipartError, Plan, UploadTarget,
+};
+use sha2::{Digest, Sha256};
+
+const BUCKET: &str = "test-bucket";
+const KEY: &str = "media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd";
+
+fn id(byte: u8) -> [u8; 16] {
+    let mut value = [byte; 16];
+    value[6] = 0x40;
+    value[8] = 0x80;
+    value
+}
+
+#[test]
+fn compares_only_bounded_completion_and_head_metadata() {
+    let mut sealer = OriginSealer::new(1).unwrap();
+    let target = UploadTarget {
+        bucket: BUCKET,
+        key: KEY,
+        upload_id: "synthetic",
+    };
+    let plan = Plan::new(target, sealer.header(), 1).unwrap();
+    for invalid in [0, MAX_NEW_PLAINTEXT + 1, u64::MAX] {
+        assert!(matches!(
+            Plan::new(target, sealer.header(), invalid),
+            Err(MultipartError::Geometry)
+        ));
+    }
+    let mut partition = plan.partition();
+    assert!(partition
+        .push(&sealer.seal_chunk(&[42]).unwrap())
+        .unwrap()
+        .is_none());
+    let part = partition.finish().unwrap().unwrap();
+    let (_, _, bytes, checksum) = part.request();
+    let digest = Sha256::digest(Sha256::digest(bytes));
+    let part = part.verify_reply("opaque-part".into(), checksum).unwrap();
+    let completion = plan.complete(vec![part]).unwrap();
+    let body = format!("<CompleteMultipartUploadResult><ChecksumSHA256>{}-1</ChecksumSHA256></CompleteMultipartUploadResult>", STANDARD.encode(digest));
+    let context = EnvelopeContext {
+        identities: [0, 1, 2, 0xab, 0xcd, 5].map(id),
+        plaintext_len: 1,
+        header: sealer.header().to_bytes(),
+    };
+    let binding = S3Binding::Etag("\"opaque-object\"".into());
+    let locate = |bucket: &str, key: &str| {
+        S3Locator::new(bucket.into(), key.into(), binding.clone()).unwrap()
+    };
+    let expected = locate(BUCKET, KEY);
+    let observed = locate(BUCKET, KEY);
+    let length = HEADER_SIZE + 1 + TAG_SIZE;
+    let head = || HeadReceipt {
+        configuration: Some(id(5)),
+        locator: Some(&observed),
+        content_length: Some(length),
+    };
+    let compare = |xml: &str, want: &S3Locator, receipt: Option<HeadReceipt<'_>>| {
+        compare_head_receipt(&completion, 200, xml.as_bytes(), &context, want, receipt)
+    };
+    let check = |receipt: Option<HeadReceipt<'_>>| compare(&body, &expected, receipt);
+    assert_eq!(check(Some(head())), Ok(()));
+    assert_eq!(check(None), Err(MissingHead));
+    assert_eq!(
+        compare("<Error/>", &expected, Some(head())),
+        Err(Completion(MultipartError::EmbeddedError))
+    );
+    assert_eq!(
+        compare(&body, &locate("other-bucket", KEY), Some(head())),
+        Err(ExpectedObject)
+    );
+
+    for missing in [
+        HeadReceipt {
+            configuration: None,
+            ..head()
+        },
+        HeadReceipt {
+            locator: None,
+            ..head()
+        },
+        HeadReceipt {
+            content_length: None,
+            ..head()
+        },
+    ] {
+        assert_eq!(check(Some(missing)), Err(MissingMetadata));
+    }
+    for wrong in [
+        locate("other-bucket", KEY),
+        locate(BUCKET, &KEY.replace("abababababab", "dededededede")),
+        locate(BUCKET, &KEY.replace("cdcdcdcdcdcd", "efefefefefef")),
+        S3Locator::new(
+            BUCKET.into(),
+            KEY.into(),
+            S3Binding::Etag("\"different\"".into()),
+        )
+        .unwrap(),
+        S3Locator::new(
+            BUCKET.into(),
+            KEY.into(),
+            S3Binding::VersionId("other-version".into()),
+        )
+        .unwrap(),
+    ] {
+        let receipt = HeadReceipt {
+            locator: Some(&wrong),
+            ..head()
+        };
+        assert_eq!(check(Some(receipt)), Err(WrongObject));
+    }
+    assert_eq!(
+        check(Some(HeadReceipt {
+            configuration: Some(id(6)),
+            ..head()
+        })),
+        Err(WrongObject)
+    );
+    for (size, error) in [
+        (0, InvalidSize),
+        (length - 1, InvalidSize),
+        (length + 1, SizeMismatch),
+        (ciphertext_size(MAX_NEW_PLAINTEXT).unwrap() + 1, InvalidSize),
+        (u64::MAX, InvalidSize),
+    ] {
+        assert_eq!(
+            check(Some(HeadReceipt {
+                content_length: Some(size),
+                ..head()
+            })),
+            Err(error)
+        );
+    }
+}
