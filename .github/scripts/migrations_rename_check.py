@@ -11,8 +11,38 @@ import json
 import pathlib
 import sys
 
-from migration_history import HistoryError, api_coverage, read_input, verify
+from migration_history import HistoryError, UnappliedRename, api_coverage, read_input, verify
 from migration_snapshot import event_metadata, resumed_budget, snapshot_coverage
+
+
+# Trusted event-base code owns this record. The 2026-11-19 21:21 UTC
+# custodian observation found the storage 0051 on staging, but no purge
+# filename or digest in its ledger and no other known shared target.
+# Key: GitHub repository ID/name, PR number, base ref and head ref. Both
+# sides must be from this repository. No PR or ledger input can add records.
+REVIEWED_UNAPPLIED = {
+    (1417703572, "TogetherWeOwn/nntunev2", 1335, "main", "fix/purge-legacy-provider-credentials"):
+        UnappliedRename(
+            reviewed_head="10c9e67b73c59efed95c2c693fd2fd1971dbf2e6",
+            accepted_base="a61c8c0e3af8f73c308e8577694e6e1d774f97b2",
+            old_path="migrations/0051_purge_legacy_provider_credentials.sql",
+            new_path="migrations/0052_purge_legacy_provider_credentials.sql",
+            sha256="ccd14876ce8ed7379c0a03ad1fb4404f12b32f0d31cb470b6b9f1817c8b0e0ca",
+            target="app",
+        ),
+}
+
+
+def unapplied_policy(expected):
+    base, head = expected["base"], expected["head"]
+    repo = base["repo"]
+    identity = repo["id"], repo["full_name"]
+    # Deny new aliases for known-unapplied identities even when this PR
+    # (or a fork) is not authorized to use their source-only record.
+    aliases = {(record.old_path.removeprefix("migrations/"), record.sha256)
+               for key, record in REVIEWED_UNAPPLIED.items() if key[:2] == identity}
+    record = REVIEWED_UNAPPLIED.get((*identity, expected["number"], base["ref"], head["ref"]))
+    return {"unapplied": record if repo == head["repo"] else None, "unapplied_aliases": aliases}
 
 
 def main(argv=None):
@@ -41,13 +71,14 @@ def main(argv=None):
                                                     files_text, metadata_text, expected, budget)
             for name, base in (("event", args.base_sha), ("effective", effective)):
                 outcomes[name].update(base=base, head=args.head_sha)
+            policy = unapplied_policy(expected)
             # Never let B1 absorb an event-range edge or the original baseline.
             active_pass = "event"
             edges = verify(args.root, args.base_sha, args.head_sha, manifest_text,
-                           budget=budget, audit=outcomes["event"])
+                           budget=budget, audit=outcomes["event"], **policy)
             active_pass = "effective"
             verify(args.root, effective, args.head_sha, manifest_text, coverage,
-                   budget=budget, audit=outcomes["effective"])
+                   budget=budget, audit=outcomes["effective"], **policy)
             budget.remaining(1)
             active_pass = None
         else:
