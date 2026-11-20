@@ -894,6 +894,7 @@ dependencies = [
 name = "nntune-ingest"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "crc32fast",
  "futures-util",
  "hex",
@@ -901,6 +902,7 @@ dependencies = [
  "nntune-core",
  "nntune-logging",
  "nntune-ssrf-guard",
+ "quick-xml",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
