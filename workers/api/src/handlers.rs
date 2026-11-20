@@ -7850,11 +7850,12 @@ where
         // in the scope map, so it never enters the gate.
         ("POST", "/v1/plays") => play_issue(ctx, req).await,
         ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
+        // Keep the privacy futures off the shared dispatcher's stack frame.
         ("POST", listen_history_controls::EXPORT_PATH) => {
-            listen_history_controls::export(ctx, req).await
+            Box::pin(listen_history_controls::export(ctx, req)).await
         }
         ("DELETE", listen_history_controls::CLEAR_PATH) => {
-            listen_history_controls::clear(ctx, req).await
+            Box::pin(listen_history_controls::clear(ctx, req)).await
         }
         // Internal meter sink: HMAC-authenticated inside the handler
         // (crate::meter_sink), no session/bearer surface. The scope
