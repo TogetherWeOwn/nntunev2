@@ -217,7 +217,7 @@ async function beginSecurity(page: Page, kind: 'logout' | 'revoke-all') {
 }
 
 /** A real delegated anchor click, not page.goto/history-only URL replacement. */
-async function clientNavigate(page: Page, path: string) {
+async function clientNavigate(page: Page, path: string, requireHeld = true) {
 	await page.evaluate((href) => {
 		const link = document.createElement('a');
 		link.href = href;
@@ -230,7 +230,7 @@ async function clientNavigate(page: Page, path: string) {
 	await page.getByTestId('leave-held-action').evaluate((link) => link.remove());
 	// This exact probe lives only in the original JS realm. A full reload
 	// would lose the pending request and make the negative test meaningless.
-	expect(await page.evaluate(() => window.__transition.requests.length)).toBeGreaterThan(0);
+	if (requireHeld) expect(await page.evaluate(() => window.__transition.requests.length)).toBeGreaterThan(0);
 }
 
 async function release(page: Page, path: string, status: number, body: unknown) {
@@ -322,21 +322,27 @@ async function openHome(page: Page) {
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 }
 
-for (const paused of [false, true]) {
-	test(`Library → Home → Library keeps the ${paused ? 'paused' : 'playing'} native decoder`, async ({ page }) => {
+for (const mode of ['playing', 'paused', 'unavailable', 'timestamp Back']) {
+	const timestamp = mode === 'timestamp Back';
+	const paused = timestamp || mode === 'paused';
+	test(`Library → Home → Library keeps the native decoder (${mode})`, async ({ page }) => {
 		const errors: string[] = [];
 		page.on('pageerror', (error) => errors.push(error.message));
 		await servePlaybackLibrary(page);
-		await page.goto('/library');
+		const share = `/library?track=${playbackFixture.id}&t=2`;
+		const time = () => page.getByTestId('audio-player').evaluate((node: HTMLAudioElement) => node.currentTime);
+		await page.goto(timestamp ? share : '/library');
+		if (timestamp) await expect.poll(time).toBeCloseTo(2);
 		const audio = await startNativePlayback(page);
-		const before = await audio.evaluate((node: HTMLAudioElement, paused) => {
+		const before = await audio.evaluate((node: HTMLAudioElement, { paused, timestamp }) => {
 			if (paused) node.pause();
+			if (timestamp) node.currentTime = 4;
 			const play = node.play.bind(node);
 			node.play = () => { node.dataset.replay = 'called'; return play(); };
 			node.addEventListener('play', () => { node.dataset.replay = 'event'; });
 			node.addEventListener('loadstart', () => { node.dataset.reload = 'event'; });
 			return { position: node.currentTime, source: node.currentSrc };
-		}, paused);
+		}, { paused, timestamp });
 		const inspect = async (position: number) => {
 			await expect(page.getByTestId('audio-player')).toBeVisible();
 			await expect(page.locator('audio')).toHaveCount(1);
@@ -353,21 +359,21 @@ for (const paused of [false, true]) {
 
 		await openHome(page);
 		const atHome = await inspect(before.position);
-		await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();
-		await expect(page.getByTestId('now-playing')).toContainText(playbackFixture.title);
-		await expect(page.getByTestId('player-next')).toBeVisible();
+		if (mode === 'unavailable') await page.route('**/api/library', (route) => route.fulfill({ status: 404 }));
+		if (timestamp) await page.goBack();
+		else await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();
+		if (mode === 'unavailable') await expect(page.getByText('Library listing is not available yet.')).toBeVisible();
+		else {
+			await expect(page.getByTestId('now-playing')).toContainText(playbackFixture.title);
+			await expect(page.getByTestId('player-next')).toBeVisible();
+		}
 		await inspect(atHome);
-		if (!paused) {
-			// The authenticated shell has no public link; use a client anchor,
-			// not a reload that would discard the retained decoder handle.
-			await page.evaluate(() => {
-				const link = document.createElement('a');
-				link.href = '/';
-				document.body.append(link);
-				link.click();
-				link.remove();
-			});
-			await expect(page).toHaveURL((url) => url.pathname === '/');
+		if (timestamp) {
+			await openHome(page);
+			await clientNavigate(page, share, false);
+			await expect.poll(time).toBeCloseTo(2);
+		} else if (!paused) {
+			await clientNavigate(page, '/', false);
 			await expect(page.locator('audio')).toHaveCount(0);
 			await expect(page.getByTestId('library-now-playing')).toHaveCount(0);
 			expect(await audio.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
 	import type { Snippet } from 'svelte';
-	import { afterNavigate, goto } from '$app/navigation';
+	import { afterNavigate, goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import favicon from '#lib/assets/favicon.svg';
@@ -32,6 +32,14 @@
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
+
+	// Store only the current player's opaque receipt, never the share target or position.
+	function claimShareEntry(owner: string): boolean {
+		const state = page.state as App.PageState & { libraryShareOwner?: string };
+		if (state.libraryShareOwner === owner) return false;
+		void replaceState(window.location.href, { ...state, libraryShareOwner: owner });
+		return true;
+	}
 
 	type Appearance = 'system' | 'light' | 'dark';
 
@@ -490,7 +498,7 @@
 			</div>
 		</div>
 	{/snippet}
-	<AppPlayer>
+	<AppPlayer {claimShareEntry}>
 		<div class="nt-body">
 			{@render appRail()}
 			{@render children()}

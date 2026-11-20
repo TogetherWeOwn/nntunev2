@@ -105,7 +105,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const page = new Function(...Object.keys(bindings), `
 		let items = [track], queue = createQueue(items);
 		let loading = false, loadError = null, libraryUnavailable = false;
-		let routeAlive = true, handledShareSearch = null;
+		let shareAlive = true, handledShareSearch = null;
 		let shareInvalid = false;
 		let queueConfirmGeneration = 0;
 		let density, priorDocumentTitle = null, tabTitle = '';

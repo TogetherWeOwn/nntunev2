@@ -247,7 +247,7 @@
 	const repeat = media.repeat;
 
 	let shareInvalid = $state(false);
-	let routeAlive = true;
+	let shareAlive = true;
 	let draggedLibraryItem: LibraryItem | null = null;
 	// Queue-row share outcomes live apart from the browse share feedback so a
 	// queue action never touches browse-row announcements (and vice versa).
@@ -359,7 +359,7 @@
 				media.clearShareSeek();
 			}
 			if (!isCurrent()) return;
-			if (authoritative && !authBoundary) {
+			if (authoritative && !authBoundary && !state.libraryUnavailable) {
 				player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
 					if (queueChanged) queueConfirmGeneration += 1;
 				});
@@ -565,7 +565,7 @@
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
 		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
-		await media.playSelected(base, index, { ...evidence, isCurrent: () => routeAlive && evidence.isCurrent() }, counts);
+		await media.playSelected(base, index, { ...evidence, isCurrent: () => shareAlive && evidence.isCurrent() }, counts);
 	}
 
 	let favoritesAction = 0;
@@ -637,7 +637,7 @@
 		} catch {
 			// Clipboard refusal falls back to a manual copy if this attempt still owns feedback.
 		}
-		if (!routeAlive || generation !== player.browseCopy.generation) return;
+		if (!shareAlive || generation !== player.browseCopy.generation) return;
 		const status = copied ? `Copied link for ${shortTitle(displayTitle(item))}.` : '';
 		player.browseCopy.settle(generation, status, copied ? null : url);
 	}
@@ -645,7 +645,7 @@
 	function applyShareLink(): void {
 		// A failed/unavailable load cannot resolve a link against the library.
 		// Leave it unconsumed for Retry; auth resets still fence account changes.
-		if (typeof window === 'undefined' || !routeAlive || loading || loadError || libraryUnavailable) return;
+		if (typeof window === 'undefined' || !shareAlive || loading || loadError || libraryUnavailable) return;
 		const search = window.location.search;
 		if (search === handledShareSearch) return;
 		handledShareSearch = search;
@@ -658,7 +658,7 @@
 		const account = queueExportAuthGeneration;
 		const intent = media.beginShareInput();
 		// A native retry can run after the URL changes but before afterNavigate.
-		const inputIsCurrent = () => routeAlive && account === queueExportAuthGeneration &&
+		const inputIsCurrent = () => shareAlive && account === queueExportAuthGeneration &&
 			handledShareSearch === search && window.location.search === search;
 		const target = resolveShareTarget(
 			{ track: params.get('track'), t: params.get('t') },
@@ -673,6 +673,7 @@
 			shareInvalid = true;
 			return;
 		}
+		if (player.claimShareEntry?.() === false) return;
 		// A newly consumed navigation must not inherit consent for the old arrangement.
 		queueConfirmGeneration += 1;
 		if (!selectTrack(target.trackId) || !inputIsCurrent()) return;
@@ -753,7 +754,7 @@
 		if (!target) return;
 		const evidence = queueController.sourceForQueuedPlay(id, resolveStreamUrl(target) || undefined);
 		if (!evidence) return;
-		await media.playSelected(queue, index, { ...evidence, isCurrent: () => routeAlive && evidence.isCurrent() });
+		await media.playSelected(queue, index, { ...evidence, isCurrent: () => shareAlive && evidence.isCurrent() });
 	}
 
 	function trimPreviousTracks(): void {
@@ -1176,7 +1177,7 @@
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
 		const counts = ids.length > 1 ? `Added ${added}${surviving.length > added ? `, ${surviving.length - added} already queued` : ''}.` : '';
-		await media.playSelected(base, index, { ...evidence, isCurrent: () => routeAlive && evidence.isCurrent() },
+		await media.playSelected(base, index, { ...evidence, isCurrent: () => shareAlive && evidence.isCurrent() },
 			(counts + missingInteractionLabel(ids, surviving)).trim());
 	}
 
@@ -1457,7 +1458,7 @@
 			if (priorDocumentTitle !== null && document.title === tabTitle) {
 				document.title = priorDocumentTitle;
 			}
-			routeAlive = false;
+			shareAlive = false;
 			queueShare.dispose();
 			player.browseCopy.invalidate();
 			media.clearShareSeek();

@@ -1,10 +1,12 @@
 import { mount, tick } from 'svelte';
-import LibraryPlayerHarness from '../LibraryPlayerHarness.svelte';
+import Library from '../LibraryPlayerHarness.svelte';
 import { moveTrack, restoreQueue, selectTrack, type QueueState, type Track } from '../../../src/lib/player/queue.js';
 import '../../../src/app.css';
 
 /** Test-only bridge; the Vite pre-transform exports the route's existing setter. */
-const library = mount(LibraryPlayerHarness, { target: document.getElementById('app')! });
+const library = mount(Library, { target: document.getElementById('app')! }) as unknown as {
+	acceptanceReplaceQueue(state: QueueState): void;
+};
 let state: QueueState = { tracks: [], currentIndex: -1 };
 async function replace(next: QueueState) {
 	state = next;

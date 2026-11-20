@@ -2,11 +2,13 @@
 	import { createContext } from 'svelte';
 	import { createPlayerController } from './controller.svelte.js';
 
-	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController>>();
+	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & {
+		claimShareEntry?: () => boolean;
+	}>();
 </script>
 
 <script lang="ts">
-	import { onMount, tick, type Snippet } from 'svelte';
+	import { tick, type Snippet } from 'svelte';
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
 	import { browserStorage, LIBRARY_AUTH_TRANSITION_KEY } from '../library/cache.js';
 	import { LIBRARY_ACCESS_REFUSED_EVENT } from '../library/refresh.js';
@@ -15,9 +17,11 @@
 	import NativePlayer from './NativePlayer.svelte';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
 
-	let { children }: { children: Snippet } = $props();
-
-	const player = setAppPlayer(createPlayerController(createQueue([]), { flush: tick }));
+	let { children, claimShareEntry }: { children: Snippet; claimShareEntry?: (owner: string) => boolean } = $props();
+	let shareOwner: string | undefined;
+	const player = setAppPlayer(Object.assign(createPlayerController(createQueue([]), { flush: tick }), {
+		claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true
+	}));
 	const { queue, media } = player;
 	const seekFeedback = media.seekFeedback;
 	const attachNativeAudio = media.attach;
@@ -26,6 +30,7 @@
 
 	// Retire the decoder before the mounted Library handles the same signal.
 	$effect.pre(() => {
+		media.restoreRepeat(browserStorage('local'));
 		const offAuth = subscribeLocalAuthTransition(player.purgeAtAuthBoundary);
 		const onStorage = (event: StorageEvent) => {
 			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) player.purgeAtAuthBoundary();
@@ -36,12 +41,6 @@
 			offAuth();
 			window.removeEventListener('storage', onStorage);
 			window.removeEventListener(LIBRARY_ACCESS_REFUSED_EVENT, player.purgeAtAuthBoundary);
-		};
-	});
-
-	onMount(() => {
-		media.restoreRepeat(browserStorage('local'));
-		return () => {
 			clearMiniPlayerHint();
 			player.destroy();
 		};
