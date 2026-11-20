@@ -44,7 +44,7 @@ impl FakeS3<'_> {
         (format!("\"opaque-{number}\""), digest)
     }
 
-    fn complete(&self, request: &Completion<'_>) -> String {
+    fn complete(&self, request: &Completion<'_>, prefixed: bool) -> String {
         let (target, len) = request.object();
         let chunks = self.0.chunks(PART_BYTES);
         let count = chunks.len();
@@ -60,7 +60,8 @@ impl FakeS3<'_> {
             hashes.extend_from_slice(&hash);
         }
         let composite = STANDARD.encode(Sha256::digest(hashes));
-        format!(" \n<{SUCCESS} xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ChecksumSHA256>{composite}-{count}</ChecksumSHA256></{SUCCESS}>")
+        let (p, ns) = if prefixed { ("s3:", ":s3") } else { ("", "") };
+        format!(" \n<{p}{SUCCESS} xmlns{ns}=\"http://s3.amazonaws.com/doc/2006-03-01/\"><{p}Key>a&amp;b&#x2E;flac</{p}Key><{p}ChecksumSHA256>{composite}-{count}</{p}ChecksumSHA256></{p}{SUCCESS}>")
     }
 }
 
@@ -80,7 +81,7 @@ fn exact_wire_partition_and_retry() {
         }
         let completion = plan.complete(receipts).unwrap();
         completion
-            .verify_reply(200, fake.complete(&completion).as_bytes())
+            .verify_reply(200, fake.complete(&completion, count > 1).as_bytes())
             .unwrap();
     }
 }
@@ -92,16 +93,14 @@ fn rejects_bad_receipts_and_false_completion_success() {
     let fake = FakeS3(&wire);
     let (etag, checksum) = fake.upload(&parts[0]);
     for bad in ["", &etag] {
-        assert!(matches!(
-            parts[0].verify_reply(etag.clone(), bad),
-            Err(Checksum)
-        ));
+        let receipt = parts[0].verify_reply(etag.clone(), bad);
+        assert!(matches!(receipt, Err(Checksum)));
     }
     assert!(matches!(plan.partition().finish(), Err(Geometry)));
     assert!(matches!(plan.complete(Vec::new()), Err(Geometry)));
     let receipt = parts[0].verify_reply(etag, &checksum).unwrap();
     let completion = plan.complete(vec![receipt]).unwrap();
-    let success = fake.complete(&completion);
+    let success = fake.complete(&completion, false);
     assert_eq!(
         completion.verify_reply(503, success.as_bytes()),
         Err(CompletionStatus)
@@ -113,6 +112,10 @@ fn rejects_bad_receipts_and_false_completion_success() {
         (embedded, EmbeddedError),
         (success.replace("-1</", "-2</"), Checksum),
         (success.trim_end_matches(&end).into(), CompletionBody),
+        (success.replace("&amp;", "&undefined;"), CompletionBody),
+        (success.replace("&#x2E;", "&#xD800;"), CompletionBody),
+        (format!("{success}<!-- bad--comment -->"), CompletionBody),
+        (format!("<!DOCTYPE {SUCCESS}>{success}"), CompletionBody),
         (" ".repeat(MAX_COMPLETION_BODY + 1), CompletionBody),
     ] {
         assert_eq!(completion.verify_reply(200, body.as_bytes()), Err(error));

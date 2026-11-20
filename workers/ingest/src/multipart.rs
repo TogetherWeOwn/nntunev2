@@ -4,8 +4,8 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use nntune_core::media::{ciphertext_size, Header, HEADER_SIZE, PLAIN_CHUNK_SIZE, TAG_SIZE};
 use nntune_core::origin_sealer::{SealedChunk, MAX_NEW_PLAINTEXT};
-use quick_xml::{events::Event, Reader};
 use sha2::{Digest, Sha256};
+use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 
 pub const PART_BYTES: usize = 5_244_160;
 pub const CHECKSUM_ALGORITHM: &str = "SHA256";
@@ -217,47 +217,49 @@ impl<'a> Completion<'a> {
         if status != 200 {
             return Err(MultipartError::CompletionStatus);
         }
-        if body.len() > MAX_COMPLETION_BODY || std::str::from_utf8(body).is_err() {
-            return Err(MultipartError::CompletionBody);
+        use MultipartError::{Checksum, CompletionBody, EmbeddedError};
+        const S3_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+        // Block DTDs before the UTF-8 parser can process entity declarations.
+        let dtd = b"<!DOCTYPE";
+        if body.len() > MAX_COMPLETION_BODY || body.windows(dtd.len()).any(|bytes| bytes == dtd) {
+            return Err(CompletionBody);
         }
-        let mut reader = Reader::from_reader(body);
-        reader.config_mut().expand_empty_elements = true;
-        let (mut root, mut depth, mut matched) = (false, 0, false);
-        let malformed = |_| MultipartError::CompletionBody;
-        loop {
-            match reader.read_event().map_err(malformed)? {
-                Event::Start(tag) => {
-                    if tag.local_name().into_inner() == "Error" {
-                        return Err(MultipartError::EmbeddedError);
-                    }
-                    if tag.attributes().any(|a| a.is_err()) {
-                        return Err(MultipartError::CompletionBody);
-                    }
-                    match (depth, tag.name().into_inner()) {
-                        (0, "CompleteMultipartUploadResult") if !root => {
-                            root = true;
-                            depth = 1;
+        let reader = ParserConfig::new()
+            .override_encoding(Some(Encoding::Utf8))
+            .allow_multiple_root_elements(false)
+            .create_reader(body);
+        let (mut depth, mut root_ns, mut in_checksum, mut matched) = (0, None, false, false);
+        for event in reader {
+            match event.map_err(|_| CompletionBody)? {
+                StartElement { name, .. } => {
+                    match (depth, name.local_name.as_str(), name.namespace.as_deref()) {
+                        (_, "Error", _) => return Err(EmbeddedError),
+                        (0, "CompleteMultipartUploadResult", None | Some(S3_NS)) => {
+                            root_ns = name.namespace;
                         }
-                        (1, "ChecksumSHA256") if !matched => {
-                            let checksum = reader.read_text(tag.name()).map_err(malformed)?;
-                            if checksum.as_ref() != self.checksum.as_str() {
-                                return Err(MultipartError::Checksum);
-                            }
-                            matched = true;
+                        (1, "ChecksumSHA256", ns) if !matched && ns == root_ns.as_deref() => {
+                            in_checksum = true;
                         }
-                        (1, name) if name != "ChecksumSHA256" => depth = 2,
-                        _ => return Err(MultipartError::CompletionBody),
+                        (1, field, _) if field != "ChecksumSHA256" => {}
+                        _ => return Err(CompletionBody),
                     }
+                    depth += 1;
                 }
-                Event::Text(_) | Event::GeneralRef(_) if depth == 2 => {}
-                Event::Text(text) if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
-                Event::End(_) if depth > 0 => depth -= 1,
-                Event::Decl(_) if !root => {}
-                Event::Comment(_) => {}
-                Event::Eof if root && depth == 0 => break,
-                _ => return Err(MultipartError::CompletionBody),
+                Characters(text) if in_checksum && !matched && text == self.checksum => {
+                    matched = true
+                }
+                Characters(_) | Whitespace(_) if in_checksum => return Err(Checksum),
+                Characters(_) if depth == 2 => {}
+                StartDocument { .. } | Whitespace(_) => {}
+                EndElement { .. } if in_checksum && !matched => return Err(Checksum),
+                EndElement { .. } => {
+                    in_checksum = false;
+                    depth -= 1;
+                }
+                EndDocument => return matched.then_some(()).ok_or(Checksum),
+                _ => return Err(CompletionBody),
             }
         }
-        matched.then_some(()).ok_or(MultipartError::Checksum)
+        Err(CompletionBody)
     }
 }

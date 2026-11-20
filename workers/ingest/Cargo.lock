@@ -669,7 +669,6 @@ dependencies = [
  "nntune-ssrf-guard",
  "nntune-test-fixtures",
  "nntune-test-nntp",
- "quick-xml",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
@@ -678,6 +677,7 @@ dependencies = [
  "tokio-postgres",
  "wasm-bindgen-futures",
  "worker",
+ "xml",
 ]
 
 [[package]]
@@ -1699,6 +1699,12 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "xml"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f45bb2c13fec6a6cb4c0f76a7e94839e110a14ec803ec2940777a94c347bc52"
 
 [[package]]
 name = "yoke"
