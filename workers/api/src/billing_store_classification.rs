@@ -18,12 +18,16 @@ pub struct Identity<'a> {
 pub struct ObservedTarget<'a> {
     pub identity: Identity<'a>,
     pub predicate_stale: bool,
+    pub other_live_holder: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Target {
     Absent,
-    Owned { predicate_stale: bool },
+    Owned {
+        predicate_stale: bool,
+        other_live_holder: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +36,7 @@ pub enum Accepted {
     StaleAbsentEmpty,
     AppliedOwned,
     PredicateStaleOwned,
+    LiveSlotSuppressedOwned,
 }
 
 /// A refusal is intentionally opaque to the caller. Database decoding errors
@@ -61,6 +66,7 @@ pub fn classify_target(
         [] => Ok(Target::Absent),
         [row] if row.identity == *requested => Ok(Target::Owned {
             predicate_stale: row.predicate_stale,
+            other_live_holder: row.other_live_holder,
         }),
         _ => Err(Refused),
     }
@@ -75,22 +81,34 @@ pub fn classify_explicit_stale(target: &Target, history_empty: bool) -> Result<A
     }
 }
 
+/// Only a nonterminal fold with exact-target read provenance can commit
+/// history for a write suppressed by a different subscription's live slot.
+pub fn has_slot_suppression_proof(outcome: &ReconcileOutcome) -> bool {
+    outcome.read_plan.is_some()
+        && !crate::billing_reconcile::is_terminal_status(&outcome.row.status)
+}
+
 /// Classify checked RETURNING rows for a non-explicit write, before history.
 /// SQL and constraint errors must not be converted into an empty result.
 pub fn classify_write(
     requested: &Identity<'_>,
     target: &Target,
     returned: &[Identity<'_>],
+    slot_suppression_proof: bool,
 ) -> Result<Accepted, Refused> {
     match returned {
         [identity] if identity == requested => Ok(Accepted::AppliedOwned),
-        [] if *target
-            == (Target::Owned {
+        [] => match target {
+            Target::Owned {
                 predicate_stale: true,
-            }) =>
-        {
-            Ok(Accepted::PredicateStaleOwned)
-        }
+                ..
+            } => Ok(Accepted::PredicateStaleOwned),
+            Target::Owned {
+                other_live_holder: true,
+                ..
+            } if slot_suppression_proof => Ok(Accepted::LiveSlotSuppressedOwned),
+            _ => Err(Refused),
+        },
         _ => Err(Refused),
     }
 }
@@ -114,10 +132,12 @@ mod tests {
             ObservedTarget {
                 identity: identity("user-b", "sub-a"),
                 predicate_stale: true,
+                other_live_holder: false,
             },
             ObservedTarget {
                 identity: identity("user-a", "sub-b"),
                 predicate_stale: false,
+                other_live_holder: false,
             },
         ] {
             assert_eq!(classify_target(&requested, &[row]), Err(Refused));
@@ -126,10 +146,12 @@ mod tests {
             ObservedTarget {
                 identity: identity("user-a", "sub-a"),
                 predicate_stale: false,
+                other_live_holder: false,
             },
             ObservedTarget {
                 identity: identity("user-a", "sub-a"),
                 predicate_stale: false,
+                other_live_holder: false,
             },
         ];
         assert_eq!(classify_target(&requested, &rows), Err(Refused));
@@ -141,6 +163,7 @@ mod tests {
         let own = [ObservedTarget {
             identity: identity("user-a", "sub-a"),
             predicate_stale: false,
+            other_live_holder: false,
         }];
         let target = classify_target(&requested, &own).unwrap();
         assert_eq!(
@@ -166,26 +189,48 @@ mod tests {
         let requested = identity("user-a", "sub-a");
         let own_stale = Target::Owned {
             predicate_stale: true,
+            other_live_holder: false,
         };
         let own_fresh = Target::Owned {
             predicate_stale: false,
+            other_live_holder: false,
         };
         assert_eq!(
-            classify_write(&requested, &Target::Absent, &[identity("user-a", "sub-a")]),
+            classify_write(
+                &requested,
+                &Target::Absent,
+                &[identity("user-a", "sub-a")],
+                false
+            ),
             Ok(Accepted::AppliedOwned)
         );
         assert_eq!(
-            classify_write(&requested, &own_stale, &[]),
+            classify_write(&requested, &own_stale, &[], false),
             Ok(Accepted::PredicateStaleOwned)
         );
-        assert_eq!(classify_write(&requested, &own_fresh, &[]), Err(Refused));
         assert_eq!(
-            classify_write(&requested, &Target::Absent, &[]),
+            classify_write(&requested, &own_fresh, &[], true),
+            Err(Refused)
+        );
+        assert_eq!(
+            classify_write(&requested, &Target::Absent, &[], true),
+            Err(Refused)
+        );
+        let occupied = Target::Owned {
+            predicate_stale: false,
+            other_live_holder: true,
+        };
+        assert_eq!(
+            classify_write(&requested, &occupied, &[], true),
+            Ok(Accepted::LiveSlotSuppressedOwned)
+        );
+        assert_eq!(
+            classify_write(&requested, &occupied, &[], false),
             Err(Refused)
         );
         for wrong in [identity("user-b", "sub-a"), identity("user-a", "sub-b")] {
             assert_eq!(
-                classify_write(&requested, &own_stale, &[wrong]),
+                classify_write(&requested, &own_stale, &[wrong], true),
                 Err(Refused)
             );
         }
@@ -193,7 +238,8 @@ mod tests {
             classify_write(
                 &requested,
                 &own_stale,
-                &[identity("user-a", "sub-a"), identity("user-a", "sub-a")]
+                &[identity("user-a", "sub-a"), identity("user-a", "sub-a")],
+                true
             ),
             Err(Refused)
         );
