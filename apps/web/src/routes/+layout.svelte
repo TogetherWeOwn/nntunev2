@@ -34,10 +34,9 @@
 	let { children }: LayoutProps = $props();
 
 	// Store only the current player's opaque receipt, never the share target or position.
-	function claimShareEntry(owner: string): boolean {
-		const state = page.state as App.PageState & { libraryShareOwner?: string };
-		if (state.libraryShareOwner === owner) return false;
-		void replaceState(window.location.href, { ...state, libraryShareOwner: owner });
+	function claimShareEntry(libraryShareOwner: string): boolean {
+		if ((page.state as { libraryShareOwner?: string }).libraryShareOwner === libraryShareOwner) return false;
+		replaceState(window.location.href, { ...page.state, libraryShareOwner });
 		return true;
 	}
 
@@ -174,7 +173,7 @@
 	const PUBLIC_BASES = ['/login', '/signup', '/pricing', '/demo', '/auth'];
 
 	const isPublicRoute = $derived.by((): boolean => {
-		const pathname = page.url.pathname;
+		const pathname = page.route.id ?? page.url.pathname;
 		return pathname === '/' || PUBLIC_BASES.some((base) => matchesBoundary(pathname, base));
 	});
 
@@ -498,12 +497,17 @@
 			</div>
 		</div>
 	{/snippet}
-	<AppPlayer {claimShareEntry}>
+	{#snippet appBody()}
 		<div class="nt-body">
 			{@render appRail()}
 			{@render children()}
 		</div>
-	</AppPlayer>
+	{/snippet}
+	{#if page.route.id === null}
+		{@render appBody()}
+	{:else}
+		<AppPlayer {claimShareEntry} children={appBody} />
+	{/if}
 	{#if rightSnippet}
 		<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
 			{@render rightSnippet()}

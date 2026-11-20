@@ -299,9 +299,8 @@ const playbackFixture = {
 	streamUrl: '/api/demo/audio?track=coral'
 };
 
-async function servePlaybackLibrary(page: Page) {
-	await page.route('**/api/library', (route) => route.fulfill({ json: [playbackFixture] }));
-}
+const servePlaybackLibrary = (page: Page) =>
+	page.route('**/api/library', (route) => route.fulfill({ json: [playbackFixture] }));
 
 async function startNativePlayback(page: Page) {
 	await page.getByRole('button', { name: 'Play displayed from the top' }).click();
@@ -322,7 +321,7 @@ async function openHome(page: Page) {
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 }
 
-for (const mode of ['playing', 'paused', 'unavailable', 'timestamp Back']) {
+for (const mode of ['playing', 'demo', 'paused', 'unavailable', 'timestamp Back']) {
 	const timestamp = mode === 'timestamp Back';
 	const paused = timestamp || mode === 'paused';
 	test(`Library → Home → Library keeps the native decoder (${mode})`, async ({ page }) => {
@@ -363,18 +362,24 @@ for (const mode of ['playing', 'paused', 'unavailable', 'timestamp Back']) {
 		if (timestamp) await page.goBack();
 		else await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();
 		if (mode === 'unavailable') await expect(page.getByText('Library listing is not available yet.')).toBeVisible();
-		else {
-			await expect(page.getByTestId('now-playing')).toContainText(playbackFixture.title);
-			await expect(page.getByTestId('player-next')).toBeVisible();
-		}
+		await expect(page.getByTestId('now-playing')).toContainText(playbackFixture.title);
+		await expect(page.getByTestId('player-next')).toBeVisible();
 		await inspect(atHome);
 		if (timestamp) {
 			await openHome(page);
 			await clientNavigate(page, share, false);
 			await expect.poll(time).toBeCloseTo(2);
 		} else if (!paused) {
-			await clientNavigate(page, '/', false);
-			await expect(page.locator('audio')).toHaveCount(0);
+			if (mode === 'unavailable') {
+				await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+				await expect(page.getByTestId('queue-clear-confirm')).toBeVisible();
+			}
+			const path = mode === 'playing' ? '/' : '/demo/player';
+			await clientNavigate(page, mode === 'unavailable' ? path.replace(/[a-z]/, (ch) => `%${ch.charCodeAt(0).toString(16)}`) : path, false);
+			await expect(page.getByRole('heading', { name: path === '/' ? 'NNTune' : 'Player resilience demo', exact: true })).toBeVisible();
+			if (path !== '/') await expect(page.getByTestId('demo-audio')).toHaveCount(1);
+			await expect(page.locator('audio')).toHaveCount(path === '/' ? 0 : 1);
+			await expect(page.getByText(playbackFixture.title)).toHaveCount(0);
 			await expect(page.getByTestId('library-now-playing')).toHaveCount(0);
 			expect(await audio.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);
 		}
@@ -411,8 +416,7 @@ for (const signal of ['local', 'cross-tab', 401, 403] as const) {
 		await expect(page.getByTestId('audio-player')).toHaveCount(0);
 		await expect(page.getByTestId('library-now-playing')).toHaveCount(0);
 		await expect(page.getByTestId('mini-player')).toHaveCount(0);
-		expect(await audio.evaluate((node: HTMLAudioElement) => ({ connected: node.isConnected, paused: node.paused })))
-			.toEqual({ connected: false, paused: true });
+		expect(await audio.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);
 		await page.getByTestId('shell-rail').getByRole('link', { name: 'Your Library', exact: true }).click();
 		await expect(page.getByTestId('library-item')).toHaveCount(1);
 		await expect(page.getByTestId('now-playing')).toHaveText('Queue is empty');

@@ -309,10 +309,7 @@
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
-		onAccessRefused: () => {
-			resetShareAtAuthBoundary();
-			player.purgeAtAuthBoundary();
-		},
+		onAccessRefused: () => { resetShareAtAuthBoundary(); player.purgeAtAuthBoundary(); },
 		invalidateLibraryCache: () => {
 			clearFavoritesExportFeedback();
 			releaseFavoritesDownload();
@@ -651,10 +648,7 @@
 		handledShareSearch = search;
 		shareInvalid = false;
 		const params = new URLSearchParams(search);
-		if (!params.has('track') && !params.has('t')) {
-			media.clearShareSeek();
-			return;
-		}
+		if (!params.has('track') && !params.has('t')) return media.clearShareSeek();
 		const account = queueExportAuthGeneration;
 		const intent = media.beginShareInput();
 		// A native retry can run after the URL changes but before afterNavigate.
@@ -1915,7 +1909,7 @@
 			{/if}
 		{/if}
 		</div>
-		{#if !libraryUnavailable && items.length > 0}
+		{#if queue.tracks.length > 0 || (!libraryUnavailable && items.length > 0)}
 			<!--
 				The queue panel stays mounted across background refreshes (its
 				rows remain readable while the new list loads), but its four
