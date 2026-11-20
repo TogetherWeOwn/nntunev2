@@ -4,7 +4,7 @@
 use nntune_api::billing_reconcile::{insert_paid_invoice_history_statement, ReconcileOutcome};
 use nntune_api::billing_store_classification::{
     classify_explicit_stale, classify_target, classify_write, has_slot_suppression_proof,
-    validate_history_target, Accepted, Identity, ObservedTarget,
+    validate_history_target, validate_read_provenance, Accepted, Identity, ObservedTarget, Target,
 };
 use nntune_api::billing_transaction_sql::{LOCK_SUBSCRIPTIONS, LOOKUP_TARGET, WRITE_SUBSCRIPTION};
 use tokio_postgres::types::{ToSql, Type};
@@ -114,6 +114,8 @@ pub async fn run(
         classify_explicit_stale(&target, o.history.is_empty())
             .map_err(|_| "absent row with history rejected")?
     } else {
+        validate_read_provenance(o, matches!(&target, Target::Owned { .. }))
+            .map_err(|_| "missing exact-target read provenance")?;
         let types = [Type::TEXT; 7]
             .into_iter()
             .chain([

@@ -65,7 +65,7 @@ pub(crate) async fn apply_reconcile_transaction(
 ) -> Result<(), crate::handlers::StoreError> {
     use crate::billing_store_classification::{
         classify_explicit_stale, classify_target, classify_write, has_slot_suppression_proof,
-        Identity, ObservedTarget, Target,
+        validate_read_provenance, Identity, ObservedTarget, Target,
     };
     use crate::{billing_reconcile::reconcile_lock_statement, handlers::StoreError};
     use tokio_postgres::types::Type;
@@ -114,12 +114,8 @@ pub(crate) async fn apply_reconcile_transaction(
         if outcome.explicit_stale {
             classify_explicit_stale(&target, outcome.history.is_empty()).map_err(|_| StoreError)?;
         } else {
-            // The table exclusion keeps this observation valid through DML. An
-            // absence fold cannot update a row that appeared before the lock,
-            // even if the paid-end predicate would otherwise suppress the write.
-            if matches!(&target, Target::Owned { .. }) && outcome.read_plan.is_none() {
-                return Err(StoreError);
-            }
+            validate_read_provenance(&outcome, matches!(&target, Target::Owned { .. }))
+                .map_err(|_| StoreError)?;
             let written = transaction
                 .query_typed(
                     crate::billing_transaction_sql::WRITE_SUBSCRIPTION,
