@@ -51,11 +51,7 @@ fn admitted<'a>(
         Some("1"),
         Some(raw),
     )?;
-    let fixture = match var(env, "SUBSONIC_MEASUREMENT_FIXTURE").as_deref() {
-        Some("empty") => SyntheticCatalogue::Empty,
-        Some("small") => SyntheticCatalogue::Small,
-        _ => return None,
-    };
+    let fixture = SyntheticCatalogue::from_trusted_id(&var(env, "SUBSONIC_MEASUREMENT_FIXTURE")?)?;
     Some((lease, fixture))
 }
 
