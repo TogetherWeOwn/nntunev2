@@ -27,13 +27,10 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const script = source.slice(start, source.indexOf('</script', start));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'queueFavorites', 'clearShareFeedback'
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'queueFavorites'
 	]);
-	// Row selection now clears transient link feedback. Execute that real
-	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
-		'favoriteTracks', 'favoritesAction', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
-		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'player', 'commitQueue', 'replaceQueue', 'queueController', 'media'
+		'favoriteTracks', 'favoritesAction', 'player', 'commitQueue', 'replaceQueue', 'queueController', 'media'
 	]);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)
@@ -53,8 +50,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	};
 	return new Function(...Object.keys(bindings), `
 		${compiled}
-		const library = queueController.prepareLibrary([...items, ...queue.tracks]);
-		player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true });
+		player.reconcileLibrary([...items, ...queue.tracks], () => true);
 		player.announceQueue(announcement);
 		queueController.subscribe((value) => { queue = value; });
 		return {

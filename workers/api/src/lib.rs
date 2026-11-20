@@ -231,9 +231,29 @@ pub async fn main(
 #[worker::event(fetch)]
 pub async fn billing_owned_test_entry(
     req: worker::Request,
-    _env: worker::Env,
+    env: worker::Env,
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
+    if req.method() == worker::Method::Post {
+        match req.path().as_str() {
+            "/billing-webhook-ack-proof" => {
+                return worker_entry::billing_webhook_ack_test::deliver(req, env, true).await;
+            }
+            "/billing-webhook-retry-proof" => {
+                return worker_entry::billing_webhook_ack_test::deliver(req, env, false).await;
+            }
+            path @ ("/billing-restricted-history-proof" | "/billing-restricted-history-replay") => {
+                let replay = path == "/billing-restricted-history-replay";
+                return match worker_entry::billing_deadline_test::test_restricted_history(replay)
+                    .await
+                {
+                    Ok(()) => worker::Response::ok("billing-restricted-history-ok"),
+                    Err(_) => worker::Response::error("billing-restricted-history-failed", 500),
+                };
+            }
+            _ => {}
+        }
+    }
     if req.method() == worker::Method::Post && req.path() == "/billing-ack-proof" {
         return match worker_entry::billing_budget::test_commit_ack().await {
             Ok(pid) => worker::Response::ok(format!("billing-ack-ok:{pid}")),

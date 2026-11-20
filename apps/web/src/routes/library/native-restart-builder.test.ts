@@ -3,9 +3,10 @@ import ts from 'typescript';
 import { get } from 'svelte/store';
 import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { displayArtist, displayTitle } from '#lib/library/order.js';
+import { displayArtist, displayTitle, shortTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js';
-import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { createQueueShare } from '#lib/player/queueShare.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -19,7 +20,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback',
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clipboardWriter', 'copyTrackLink',
 		'applyShareLink', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'resetShareAtAuthBoundary', 'onRepeatChange', 'playQueuedTrack'
@@ -30,7 +31,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
 	const mount = parsed.statements.find((node) => ts.isExpressionStatement(node) &&
 		ts.isCallExpression(node.expression) && node.expression.expression.getText(parsed) === 'onMount');
-	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media']);
+	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'queueShareOutcome', 'queueShare']);
 	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
 		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));
 	if (!mount || controllers.length !== bindingsInRoute.size) throw new Error('Missing route mount or player authority');
@@ -39,7 +40,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const track = { id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/coral' };
-	const location = { search: '' };
+	const location = { search: '', origin: 'https://example.test' };
+	const clipboard = { writeText: vi.fn(async (_url: string) => {}) };
 	const writes: number[] = [];
 	const media = { position: 30, duration: 120, rangeStart: 0, refuse: false };
 	class NativeAudio extends EventTarget {
@@ -76,17 +78,19 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		return (currentTarget: unknown = target) => listener({ type, currentTarget } as Event);
 	};
 	let onClear = () => {};
-	let onClearFeedback = () => {};
+	let onInvalidateBrowseCopy = () => {};
 	const bindings = {
 		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
 		selectQueueIndex: selectTrack, removeTrack,
-		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, get,
+		resolveStreamUrl, displayArtist, displayTitle, shortTitle, resolveShareTarget, get,
+		buildShareQuery, createQueueShare, queueCurrentTrack: currentTrack, navigator: { clipboard },
+		$state: { raw: <T>(value: T) => value },
 		clearMiniPlayerHint,
 		createPlayerController: (_: ReturnType<typeof createQueue>, end: Parameters<typeof createPlayerController>[1]) => {
-			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), {
-				...end,
-				clearShareFeedback: () => { onClearFeedback(); end.clearShareFeedback(); }
-			}, (audio, source) => audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
+			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), end,
+				(audio, source) => audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
+			const invalidate = player.browseCopy.invalidate;
+			player.browseCopy.invalidate = () => { onInvalidateBrowseCopy(); return invalidate(); };
 			const clear = player.media.clearShareSeek;
 			player.media.clearShareSeek = () => { onClear(); clear(); };
 			return player;
@@ -97,7 +101,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let items = [track], queue = createQueue(items);
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null;
-		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
+		let shareInvalid = false;
 		let queueConfirmGeneration = 0;
 		let density, priorDocumentTitle = null, tabTitle = '';
 		let cleanup;
@@ -108,17 +112,21 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		const clearSnapshot = () => {}, browserStorage = () => null, refresh = () => {};
 		const endTrackDrag = () => {}, document = { title: '' };
 		let queueExportAuthGeneration = 0;
-		const queueShare = { dispose() {}, reset() {} }, favoritesExport = { destroy() {} }, refresher = { dispose() {} };
+		const favoritesExport = { destroy() {} }, refresher = { dispose() {} };
 		window.addEventListener = () => {}; window.removeEventListener = () => {};
 		${compiled}
-		const library = queueController.prepareLibrary(items);
-		player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true });
+		player.reconcileLibrary(items, () => true);
 		queueController.subscribe((value) => { queue = value; });
 		const queueRevision = queueController;
 		return {
 			detach: media.attach(element),
 			restart: media.restart, applyShareLink, retryShare: (type = 'loadedmetadata') => capture(type)(), jump: media.jump,
 			resetAuth: resetShareAtAuthBoundary,
+			copyTrackLink, copyQueueLink: queueShare.copy,
+			refreshLibrary: () => player.reconcileLibrary(items, () => true, (queueChanged) => {
+				if (queueChanged) throw new Error('Expected a same-object refresh');
+			}),
+			readCopy: () => ({ browse: player.browseCopy.feedback, queue: queueShareOutcome }),
 			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
 			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
@@ -133,6 +141,13 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
 		resetAuth: () => void;
+		copyTrackLink: (id: string) => Promise<void>;
+		copyQueueLink: (id: string) => Promise<void>;
+		refreshLibrary: () => void;
+		readCopy: () => {
+			browse: { status: string; fallbackUrl: string | null };
+			queue: { status: string; fallbackUrl: string | null; forQueue: ReturnType<typeof createQueue> | null };
+		};
 		applyShareLink: () => void;
 		retryShare: (type?: 'loadedmetadata' | 'durationchange') => void;
 		jump: (direction: 'back' | 'forward') => void;
@@ -176,9 +191,9 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		return element = next;
 	};
 	return {
-		page, media, writes, location, track, element, capture, remount,
+		page, media, writes, location, track, element, capture, remount, clipboard,
 		observeClear: (callback: () => void) => { onClear = callback; },
-		observeClearFeedback: (callback: () => void) => { onClearFeedback = callback; }
+		observeInvalidateBrowseCopy: (callback: () => void) => { onInvalidateBrowseCopy = callback; }
 	};
 }
 
@@ -511,14 +526,20 @@ test('selecting another track with the same resolved source retires the native h
 });
 
 test('auth retirement increments the render revision and cancels pending share work', async () => {
-	const { page, media, location, writes, remount, capture } = restartFixture();
+	const { page, media, location, writes, remount, capture, observeInvalidateBrowseCopy } = restartFixture();
 	media.duration = Number.NaN;
 	location.search = '?track=coral&t=45';
 	page.applyShareLink();
 	const metadata = capture('loadedmetadata');
 	const before = page.read();
 	expect(before.pendingShareSeek).not.toBeNull();
+	const invalidate = vi.fn(() => {
+		expect(page.read().pendingShareSeek).toBeNull();
+		expect(page.currentAudio()).toBeUndefined();
+	});
+	observeInvalidateBrowseCopy(invalidate);
 	page.resetAuth();
+	expect(invalidate).toHaveBeenCalledTimes(1);
 	expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
 	expect(page.read().attachmentVersion).toBe(before.attachmentVersion + 1);
 	expect(page.read().pendingShareSeek).toBeNull();
@@ -1327,9 +1348,9 @@ test.each(['tick', 'play', 'play rejection'] as const)('same-source repeat canno
 
 const pine = { id: 'pine', title: 'Pine Morning', artist: '', streamUrl: '/test-audio/pine' };
 
-test.each(['none', 'callback reset', 'callback source change', 'publication reset'] as const)('native ended uses the queue transaction with boundary %s', async (boundary) => {
+test.each(['none', 'callback reset', 'invalidation source change', 'publication reset'] as const)('native ended uses the queue transaction with boundary %s', async (boundary) => {
 	const flush = vi.fn(async () => {});
-	const { page, element, remount, observeClear, observeClearFeedback, writes } = restartFixture(flush);
+	const { page, element, remount, observeClear, observeInvalidateBrowseCopy, writes } = restartFixture(flush);
 	element.play = vi.fn(async () => {});
 	page.replaceQueue(addTrack(page.read().queue, pine));
 	const before = page.read();
@@ -1344,8 +1365,8 @@ test.each(['none', 'callback reset', 'callback source change', 'publication rese
 	});
 	if (boundary === 'callback reset') {
 		observeClear(() => { observeClear(() => {}); page.resetAuth(); });
-	} else if (boundary === 'callback source change') {
-		observeClearFeedback(() => { element.sourceAttribute = '/test-audio/other'; });
+	} else if (boundary === 'invalidation source change') {
+		observeInvalidateBrowseCopy(() => { element.sourceAttribute = '/test-audio/other'; });
 	}
 
 	element.paused = false;
@@ -1354,7 +1375,7 @@ test.each(['none', 'callback reset', 'callback source change', 'publication rese
 	element.dispatchEvent(new Event('pause'));
 	element.dispatchEvent(new Event('ended'));
 	stop();
-	if (boundary === 'callback source change') {
+	if (boundary === 'invalidation source change') {
 		expect(element.getAttribute('src')).toBe('/test-audio/other');
 		expect(element.isConnected).toBe(true);
 		expect(page.currentAudio()).toBe(element);
@@ -1406,6 +1427,52 @@ function signalNaturalEnd({ element, capture, media }: ReturnType<typeof restart
 	media.position = media.duration;
 	element.ended = element.paused = true;
 	capture('pause')(); // The browser's completion pause is not a manual pause.
+}
+
+for (const refuses of [false, true]) {
+	test.each(['replace', 'repeat', 'stop', 'ignore', 'append', 'refresh'] as const)(
+		`browse copy ${refuses ? 'refusal' : 'success'} after %s only settles on a live receipt`, async (action) => {
+			let releaseFlush!: () => void;
+			const flush = new Promise<void>((resolve) => { releaseFlush = resolve; });
+			const fixture = restartFixture(() => flush);
+			const { page, element, track, clipboard, writes } = fixture;
+			const before = page.read().queue;
+			await page.copyQueueLink(track.id);
+			const queueFeedback = page.readCopy().queue;
+			expect(queueFeedback).toEqual({ status: 'Copied link for Coral Night.', fallbackUrl: null, forQueue: before });
+
+			let finish!: () => void;
+			clipboard.writeText.mockImplementationOnce(() => new Promise<void>((resolve, reject) => {
+				finish = refuses ? () => reject(new Error('clipboard refused')) : resolve;
+			}));
+			const copy = page.copyTrackLink(track.id);
+			const url = 'https://example.test/library?track=coral&t=30';
+			expect(clipboard.writeText).toHaveBeenLastCalledWith(url);
+			if (action === 'replace') page.replaceQueue(createQueue([pine]));
+			if (action === 'append') page.replaceQueue(addTrack(before, pine));
+			if (action === 'refresh') page.refreshLibrary();
+			if (action === 'repeat' || action === 'stop') signalNaturalEnd(fixture);
+			element.play = async () => { element.ended = element.paused = false; };
+			const end = action === 'repeat' || action === 'ignore' ? page.end('one') :
+				action === 'stop' ? page.end('off') : undefined;
+			// Settle against the accepted boundary without waiting for the native flush.
+			finish();
+			await copy;
+			const retired = action === 'replace' || action === 'repeat';
+			expect(page.readCopy().browse).toEqual({
+				status: retired || refuses ? '' : 'Copied link for Coral Night.',
+				fallbackUrl: !retired && refuses ? url : null
+			});
+			releaseFlush();
+			await end;
+			if (action === 'repeat') {
+				expect(page.read().queue).toBe(before);
+				expect(page.readCopy().queue).toBe(queueFeedback);
+				expect(writes).toEqual([0]);
+				expect(page.read().queueAnnouncement).toBe('Playing Coral Night.');
+			}
+		}
+	);
 }
 
 test('route selection drives native repeat, and cleanup retires only its own player', async () => {

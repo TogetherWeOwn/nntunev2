@@ -7,6 +7,7 @@
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
+	import TrackRows from './TrackRows.svelte';
 	import {
 		browserStorage,
 		clearSnapshot,
@@ -143,7 +144,7 @@
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
-	const player = createPlayerController(createQueue([]), { flush: () => tick(), clearShareFeedback });
+	const player = createPlayerController(createQueue([]), { flush: () => tick() });
 	const commitQueue = player.commitQueue;
 	const replaceQueue = player.replaceQueue;
 	const queueController = player.queue;
@@ -242,10 +243,7 @@
 	const seekFeedback = media.seekFeedback;
 	const attachNativeAudio = media.attach;
 
-	let shareStatus = $state('');
-	let shareFallbackUrl: string | null = $state(null);
 	let shareInvalid = $state(false);
-	let shareGeneration = 0;
 	let shareAlive = true;
 	let draggedLibraryItem: LibraryItem | null = null;
 	// Queue-row share outcomes live apart from the browse share feedback so a
@@ -349,16 +347,16 @@
 				recentFindsAnnouncement = '';
 			}
 			if (state.loading || state.items.length === 0) {
-				clearShareFeedback();
+				player.browseCopy.invalidate();
 				clearFavoritesExportFeedback();
 				media.clearShareSeek();
 			}
 			if (!isCurrent()) return;
 			if (authoritative) {
-				const { next, sources } = queueController.prepareLibrary(state.items);
-				if (next !== queueController.snapshot) queueConfirmGeneration += 1;
-				if (state.loadError && state.items.length === 0) player.announceQueue('');
-				commitQueue(next, 'replace', { sources, isCurrent });
+				player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
+					if (queueChanged) queueConfirmGeneration += 1;
+					if (state.loadError && state.items.length === 0) player.announceQueue('');
+				});
 			}
 			// Queue publication can reenter the route and revoke this receipt.
 			if (!isCurrent()) return;
@@ -515,7 +513,7 @@
 
 	function selectTrack(id: string, item = items.find((track) => track.id === id)): boolean {
 		if (!item || !queueController.hasLibraryTrack(id)) return false;
-		clearShareFeedback();
+		player.browseCopy.invalidate();
 		media.clearShareSeek();
 		// Preserve append-only row selection; only an inbound link explicitly
 		// selects its target. Stream-less items still carry display fields only.
@@ -593,17 +591,10 @@
 			.join('\u0001');
 	}
 
-	function clearShareFeedback(): void {
-		shareGeneration += 1;
-		shareStatus = '';
-		shareFallbackUrl = null;
-	}
-
 	function resetShareAtAuthBoundary(): void {
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 		player.resetAtAuthBoundary();
-		clearShareFeedback();
 		queueShare.reset();
 		shareInvalid = false;
 	}
@@ -621,8 +612,7 @@
 	}
 
 	async function copyTrackLink(id: string, item = items.find((track) => track.id === id)): Promise<void> {
-		clearShareFeedback();
-		const generation = shareGeneration;
+		const generation = player.browseCopy.invalidate();
 		if (!item || loading) return;
 		const current = queueCurrentTrack(queueController.snapshot);
 		const seconds =
@@ -634,20 +624,19 @@
 		} catch {
 			return;
 		}
-		const clipboard = clipboardWriter();
-		if (!clipboard) {
-			shareFallbackUrl = url;
-			return;
-		}
+		let copied = false;
 		try {
-			await clipboard.writeText(url);
+			const clipboard = clipboardWriter();
+			if (clipboard) {
+				await clipboard.writeText(url);
+				copied = true;
+			}
 		} catch {
-			if (shareAlive && generation === shareGeneration) shareFallbackUrl = url;
-			return;
+			// Clipboard refusal falls back to a manual copy if this attempt still owns feedback.
 		}
-		if (!shareAlive || generation !== shareGeneration) return;
-		const title = shortTitle(displayTitle(item));
-		shareStatus = `Copied link for ${title}.`;
+		if (!shareAlive || generation !== player.browseCopy.generation) return;
+		const status = copied ? `Copied link for ${shortTitle(displayTitle(item))}.` : '';
+		player.browseCopy.settle(generation, status, copied ? null : url);
 	}
 
 	function applyShareLink(): void {
@@ -845,11 +834,6 @@
 		const wasFavorite = favorites.includes(id);
 		toggleFavorite(id);
 		player.announceQueue(`${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`);
-	}
-
-	function starLabel(track: LibraryItem): string {
-		const title = displayTitle(track);
-		return favoriteIds.has(track.id) ? `Unstar ${title}` : `Star ${title}`;
 	}
 
 	/**
@@ -1069,13 +1053,20 @@
 		});
 	}
 
+	function libraryCheckboxClick(event: MouseEvent): void {
+		event.stopPropagation();
+		extendSelection = event.shiftKey;
+	}
+
 	/**
 	 * Checkbox activation: Shift extends from the anchor through the
 	 * displayed rows (additive, so focus never leaves with a row); a plain
 	 * activation, or Shift without a displayed anchor, toggles exactly one
 	 * ID. Selection changes announce the count once; no-ops stay silent.
 	 */
-	function activateSelectionRow(id: string, extend: boolean, box: HTMLInputElement): void {
+	function libraryCheckboxChange(id: string, box: HTMLInputElement): void {
+		const extend = extendSelection;
+		extendSelection = false;
 		selectInteractionRow(id, extend);
 		// A native toggle the selection did not follow (Shift on a selected
 		// anchor) would leave the box out of sync: re-assert the truth.
@@ -1132,6 +1123,11 @@
 		appendFeedback = appendResultLabel(result.added, result.skipped);
 	}
 
+
+	function startLibraryTrackDrag(event: DragEvent, track: LibraryItem): void {
+		draggedLibraryItem = track;
+		startTrackDrag(event, interactionIds(track.id));
+	}
 
 	function interactionIds(id: string): string[] {
 		return projectInteractionIds(id, selectedIds, renderedItems);
@@ -1456,7 +1452,7 @@
 			queueShare.dispose();
 			media.destroy();
 			favoritesExport.destroy();
-			clearShareFeedback();
+			player.browseCopy.invalidate();
 			refresher.dispose();
 			// The queue is page state but the mini-player hint is shell
 			// state: leaving the library empties the queue's visible hint
@@ -1492,9 +1488,9 @@
 			Invalid link — choose a track from your library.
 		</p>
 	{/if}
-	<div data-testid="library-share-status" aria-live="polite" aria-atomic="true">{shareStatus}</div>
+	<div data-testid="library-share-status" aria-live="polite" aria-atomic="true">{player.browseCopy.feedback.status}</div>
 	<p data-testid="library-browse-status" class="nt-visually-hidden" aria-live="polite" aria-atomic="true">{#key browseAnnouncementVersion}{browseAnnouncement}{/key}</p>
-	{#if shareFallbackUrl}
+	{#if player.browseCopy.feedback.fallbackUrl}
 		<div class="nt-library-share-fallback">
 			<label for="library-share-url">Track link</label>
 			<input
@@ -1502,7 +1498,7 @@
 				data-testid="library-share-fallback"
 				aria-describedby="library-share-instructions"
 				readonly
-				value={shareFallbackUrl}
+				value={player.browseCopy.feedback.fallbackUrl}
 			/>
 			<p id="library-share-instructions" data-testid="library-share-instructions">
 				Select the link and press Ctrl+C or Cmd+C to copy it.
@@ -1989,96 +1985,25 @@
 {/if}
 
 {#snippet trackRows(tracks: LibraryItem[])}
-	<ul class="nt-track-list" role="list">
-		{#each tracks as track (libraryItemKey(track))}
-			{@const queued = queuedIds.has(track.id)}
-			<!-- svelte-ignore a11y_no_noninteractive_tabindex: programmatic menu-return target only. -->
-			<!-- svelte-ignore a11y_no_noninteractive_element_interactions: modifier clicks extend the checkbox selection; keyboard equivalents are list-scoped above. -->
-			<li class="nt-library-item" data-testid="library-item" data-id={track.id}
-				tabindex="-1"
-				data-selected={selectedIds.includes(track.id) ? '' : undefined}
-				use:contextMenu={(invoker, point) => openTrackMenu(track, invoker, point)}
-				onclickcapture={(event) => libraryRowClick(event, track.id)}
-				draggable="true"
-				ondragstart={(event) => {
-					draggedLibraryItem = track;
-					startTrackDrag(event, interactionIds(track.id));
-				}}
-				ondragend={() => { draggedLibraryItem = null; }}
-			>
-				<input
-					class="nt-library-select"
-					type="checkbox"
-					aria-label={`Select ${displayTitle(track)}`}
-					checked={selectedIds.includes(track.id)}
-					onclick={(event) => {
-						event.stopPropagation();
-						extendSelection = event.shiftKey;
-					}}
-					onchange={(event) => {
-						const extend = extendSelection;
-						extendSelection = false;
-						activateSelectionRow(track.id, extend, event.currentTarget);
-					}}
-				/>
-				<button
-					type="button"
-					class="nt-library-row"
-					data-context-menu-longpress
-					aria-label={queued
-						? `${displayTitle(track)}${displayArtist(track) ? ` — ${displayArtist(track)}` : ''} — Queued`
-						: undefined}
-					aria-pressed={queued ? true : undefined}
-					onclick={() => selectTrack(track.id, track)}
-				>
-					{displayTitle(track)}
-					{#if displayArtist(track)}
-						<span> — {displayArtist(track)}</span>
-					{/if}
-					{#if queued}
-						<span class="nt-queued-badge" data-testid="library-queued-badge">Queued</span>
-					{/if}
-				</button>
-				<button type="button" class="nt-library-more"
-					data-testid="track-more" aria-label={`More actions for ${displayTitle(track)}`}
-					aria-haspopup="menu"
-					onclick={(event) => openTrackMenu(track, event.currentTarget)}
-				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
-				<button
-					type="button"
-					class="nt-library-copy"
-					data-testid="library-copy-link"
-					aria-label={`Copy link ${displayTitle(track)}`}
-					onclick={() => void copyTrackLink(track.id, track)}
-				>
-					Copy link
-				</button>
-				<button
-					type="button"
-					class="nt-library-star"
-					aria-pressed={favoriteIds.has(track.id)}
-					aria-label={starLabel(track)}
-					onclick={() => toggleFavorite(track.id)}
-				>
-					<span aria-hidden="true">{favoriteIds.has(track.id) ? '★' : '☆'}</span>
-				</button>
-			</li>
-		{/each}
-	</ul>
+	<TrackRows
+		{tracks} {queuedIds} {selectedIds} {favoriteIds}
+		onrowclick={libraryRowClick}
+		onselectionclick={libraryCheckboxClick}
+		onselectionchange={libraryCheckboxChange}
+		ontrackdragstart={startLibraryTrackDrag}
+		ontrackdragend={() => { draggedLibraryItem = null; }}
+		ontrackplay={(track) => selectTrack(track.id, track)}
+		ontrackmenu={openTrackMenu}
+		oncopylink={(track) => void copyTrackLink(track.id, track)}
+		ontogglefavorite={toggleFavorite}
+	/>
 {/snippet}
 
-
 <style>
-	.nt-library-item[data-selected] { background: var(--nt-bg-raised); outline: 1px solid var(--nt-accent); }
-	.nt-track-list { padding: 0; list-style: none; }
-	.nt-library-more { flex: 0 0 2.75rem; min-height: 40px; padding: 0.25rem; font: inherit; }
-	@media (max-width: 480px) {
-		.nt-track-list .nt-library-copy { width: 2.75rem; padding: 0.25rem; white-space: normal; }
-	}
 	.nt-favorite-more { font: inherit; padding: var(--nt-space-2); }
 	[data-context-menu-longpress] { -webkit-touch-callout: none; user-select: none; }
 	@media (pointer: coarse) {
-		.nt-library-more, .nt-favorite-more, .nt-favorite-row, .nt-favorite-move, .nt-shelf-unstar { min-width: 48px; min-height: 48px; }
+		.nt-favorite-more, .nt-favorite-row, .nt-favorite-move, .nt-shelf-unstar { min-width: 48px; min-height: 48px; }
 	}
 
 	.nt-visually-hidden {
@@ -2383,49 +2308,6 @@
 	.nt-artist-group h2 {
 		overflow-wrap: anywhere;
 	}
-	.nt-library-select {
-		flex: 0 0 auto;
-		width: 1.5rem;
-		height: 1.5rem;
-		margin: 0.5rem 0 0.5rem 0.75rem;
-		accent-color: var(--nt-accent);
-	}
-	.nt-library-item {
-		display: flex;
-		align-items: center;
-		padding: var(--nt-library-row-padding) 0;
-	}
-	.nt-library-row {
-		display: block;
-		flex: 1 1 auto;
-		min-width: 0;
-		min-height: 2.75rem;
-		overflow-wrap: anywhere;
-		width: 100%;
-		text-align: left;
-		background: none;
-		border: 0;
-		padding: 0.5rem 0.75rem;
-		cursor: pointer;
-		font: inherit;
-		color: inherit;
-	}
-	.nt-library-copy,
-	.nt-library-star {
-		flex: 0 0 auto;
-		min-width: 2.75rem;
-		min-height: 2.75rem;
-		background: none;
-		border: 0;
-		padding: 0.5rem 0.75rem;
-		cursor: pointer;
-		font: inherit;
-		color: inherit;
-	}
-	.nt-library-copy {
-		color: var(--nt-accent);
-		white-space: nowrap;
-	}
 	.nt-library-share-fallback {
 		margin-block: var(--nt-space-3);
 	}
@@ -2439,16 +2321,5 @@
 		background: var(--nt-bg-raised);
 		border: 1px solid var(--nt-border);
 		border-radius: var(--nt-radius);
-	}
-	.nt-queued-badge {
-		display: inline-block;
-		margin-left: var(--nt-space-2);
-		padding: 0 var(--nt-space-2);
-		border-radius: var(--nt-radius);
-		background: var(--nt-accent);
-		color: var(--nt-accent-fg);
-		font-size: 0.75rem;
-		line-height: 1.6;
-		white-space: nowrap;
 	}
 </style>

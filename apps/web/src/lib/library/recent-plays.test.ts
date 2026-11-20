@@ -30,14 +30,32 @@ describe('loadRecentPlays', () => {
 	});
 });
 
-it('labels exact job and recording IDs but does not guess for ambiguous jobs', () => {
+const recordingA = '00000000-0000-4000-8000-000000000001';
+const recordingB = '00000000-0000-4000-8000-000000000002';
+
+it('labels exact job and recording IDs for a single linked recording', () => {
 	const titles = recentPlayTitles([
-		{ id: 'recording_a', occurrence_key: 'Job_A:0', title: 'First' },
-		{ id: 'recording_b', occurrence_key: 'Job_B:0', title: 'Second' },
-		{ id: 'recording_c', occurrence_key: 'Job_B:1', title: 'Third' }
+		{ id: recordingA, occurrence_key: 'Job_A:1', recording_mbids: [recordingA], title: 'First' }
 	]);
 	expect(titles.get('Job_A')).toBe('First');
 	expect(titles.has('job_a')).toBe(false);
-	expect(titles.get('recording_b')).toBe('Second');
-	expect(titles.has('Job_B')).toBe(false);
+	expect(titles.get(recordingA)).toBe('First');
+});
+
+it.each(['untitled', 'off-page'])('does not label a job when its second recording is %s', (second) => {
+	const recording_mbids = [recordingA, recordingB];
+	const rows = [{ id: recordingA, occurrence_key: 'Job_A:1', recording_mbids, title: 'First' }];
+	const titles = recentPlayTitles(second === 'untitled'
+		? [...rows, { id: recordingB, occurrence_key: 'Job_A:2', recording_mbids, title: null }]
+		: rows);
+	expect(titles.get(recordingA)).toBe('First');
+	expect(titles.has('Job_A')).toBe(false);
+});
+
+it('drops conflicting titles for an exact recording ID', () => {
+	const titles = recentPlayTitles([
+		{ id: recordingA, occurrence_key: 'Job_A:1', recording_mbids: [recordingA], title: 'First' },
+		{ id: recordingA, occurrence_key: 'Job_B:1', recording_mbids: [recordingA], title: 'Second' }
+	]);
+	expect(titles.has(recordingA)).toBe(false);
 });

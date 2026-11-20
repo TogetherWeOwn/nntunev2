@@ -41,7 +41,10 @@ export function recentPlayTitles(payload: unknown): Map<string, string> {
 	for (const row of toLibraryItems(payload) ?? []) {
 		const title = typeof row.title === 'string' ? row.title.trim() : '';
 		if (!title) continue;
-		const jobId = typeof row.occurrence_key === 'string' ? row.occurrence_key.split(':')[0] : '';
+		// The full job membership is present even when other occurrences fall off the page.
+		const recordings = row.recording_mbids;
+		const jobId = Array.isArray(recordings) && recordings.length === 1 && recordings[0] === row.id
+			&& typeof row.occurrence_key === 'string' ? row.occurrence_key.split(':')[0] : '';
 		for (const id of [row.id, jobId]) {
 			if (!id || ambiguous.has(id)) continue;
 			if (titles.has(id) && titles.get(id) !== title) {

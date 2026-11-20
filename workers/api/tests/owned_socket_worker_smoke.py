@@ -1,6 +1,8 @@
 """Run the separately built owned-transport WASM Worker on hosted Actions only."""
 import hashlib
+import hmac
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -108,6 +110,226 @@ def check_reconcile_ack(base):
     print("PASS: test-feature billing prototype lost COMMIT acknowledgement, retry and replay", flush=True)
 
 
+def check_restricted_history(base, settings):
+    admin = partial(routing.psql, settings, settings["admin"], timeout=10)
+    observe = partial(routing.psql, settings, BILLING_DB, timeout=10)
+    admin("""CREATE ROLE billing_history_fixture LOGIN NOSUPERUSER NOCREATEDB
+             NOCREATEROLE NOINHERIT NOBYPASSRLS PASSWORD 'ci-throwaway'""")
+    try:
+        admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+        try:
+            exercise_restricted_history(base, observe)
+        finally:
+            admin(f"DROP DATABASE {BILLING_DB}")
+    finally:
+        admin("DROP ROLE billing_history_fixture")
+
+
+def exercise_restricted_history(base, observe):
+    status, _, body = routing.http("POST", base + "/billing-ack-fixture")
+    routing.check(status == 200 and body == "billing-ack-fixture-ok", body)
+    observe(
+        stdin=f"""
+        CREATE SCHEMA billing_history_fixture;
+        CREATE TABLE billing_history_fixture.paid_invoice_history
+            (LIKE public.paid_invoice_history INCLUDING ALL);
+        GRANT USAGE ON SCHEMA public, billing_history_fixture TO billing_history_fixture;
+        ALTER ROLE billing_history_fixture IN DATABASE {BILLING_DB}
+            SET search_path TO billing_history_fixture, public;
+        GRANT SELECT, INSERT, UPDATE ON public.subscriptions TO billing_history_fixture;
+        CREATE SEQUENCE public.restricted_subscription_write;
+        GRANT USAGE ON SEQUENCE public.restricted_subscription_write TO billing_history_fixture;
+        CREATE FUNCTION public.note_restricted_subscription_write() RETURNS trigger
+        LANGUAGE plpgsql AS $$ BEGIN
+            IF current_user <> 'billing_history_fixture'
+               OR current_schema() <> 'billing_history_fixture' THEN
+                RAISE EXCEPTION 'restricted fixture context missing';
+            END IF;
+            PERFORM nextval('public.restricted_subscription_write');
+            RETURN NEW;
+        END; $$;
+        CREATE TRIGGER note_restricted_subscription_write AFTER INSERT ON public.subscriptions
+            FOR EACH ROW EXECUTE FUNCTION public.note_restricted_subscription_write();
+    """
+    )
+
+    def snapshot():
+        return json.loads(
+            observe(
+                """
+            SELECT jsonb_build_array(
+                COALESCE((SELECT jsonb_agg(s ORDER BY stripe_subscription_id)
+                          FROM public.subscriptions s), '[]'),
+                COALESCE((SELECT jsonb_agg(h ORDER BY stripe_invoice_id)
+                          FROM public.paid_invoice_history h), '[]'),
+                (SELECT count(*) FROM billing_history_fixture.paid_invoice_history))
+        """,
+                tuples=True,
+            )
+        )
+
+    status, _, body = routing.http("POST", base + "/billing-restricted-history-proof")
+    routing.check(status == 500 and body == "billing-restricted-history-failed", body)
+    # A sequence advance survives rollback and proves this was not an early refusal.
+    witness = observe(
+        "SELECT is_called FROM public.restricted_subscription_write", tuples=True
+    )
+    routing.check(
+        witness == "t", "restricted Worker did not reach the subscription insert"
+    )
+    routing.check(
+        snapshot() == [[], [], 0], "denied history write left committed billing rows"
+    )
+
+    observe("GRANT INSERT ON public.paid_invoice_history TO billing_history_fixture")
+    status, _, body = routing.http("POST", base + "/billing-restricted-history-proof")
+    routing.check(status == 200 and body == "billing-restricted-history-ok", body)
+    committed = snapshot()
+    subscriptions, invoices, alternative_rows = committed
+    routing.check(
+        len(subscriptions) == 1
+        and subscriptions[0]["user_id"] == "worker_fault_user"
+        and subscriptions[0]["stripe_subscription_id"] == "sub_worker_fault"
+        and subscriptions[0]["paid_invoice_id"] == "in_worker_second"
+        and [row["stripe_invoice_id"] for row in invoices]
+        == ["in_worker_first", "in_worker_second"]
+        and all(
+            row["user_id"] == "worker_fault_user"
+            and row["stripe_subscription_id"] == "sub_worker_fault"
+            and row["plan_id"] == "plus"
+            and row["amount_cents"] == 800
+            for row in invoices
+        )
+        and alternative_rows == 0,
+        "restricted retry did not commit the expected public billing rows",
+    )
+    status, _, body = routing.http("POST", base + "/billing-restricted-history-replay")
+    routing.check(status == 200 and body == "billing-restricted-history-ok", body)
+    routing.check(
+        snapshot() == committed, "restricted replay changed committed billing rows"
+    )
+    print(
+        "PASS: restricted Worker history denial rolled back; retry and replay used public history",
+        flush=True,
+    )
+
+
+def check_webhook_ack(base, observe):
+    status, _, body = routing.http("POST", base + "/billing-ack-fixture")
+    routing.check(status == 200 and body == "billing-ack-fixture-ok", body)
+    observe("""
+        INSERT INTO public.billing_accounts (user_id, stripe_customer_id)
+        VALUES ('worker_fault_user', 'cus_worker_fault');
+        INSERT INTO public.plan_prices (stripe_price_id, plan_id, currency, price_cents, billing_interval, livemode)
+        VALUES ('price_worker_fault', 'plus', 'usd', 800, 'month', false);
+        INSERT INTO public.billing_operations (id, user_id, kind, state, request_key, request_payload)
+        VALUES ('a0000000-0000-4000-8000-000000000001', 'worker_fault_user', 'checkout', 'pending',
+                'webhook_ack_fixture', '{"kind":"checkout","price_id":"price_worker_fault","session_id":"cs_worker_fault"}');
+    """)
+
+    def snapshot():
+        return json.loads(
+            observe(
+                """
+            SELECT jsonb_build_array(
+                COALESCE((SELECT jsonb_agg(s ORDER BY stripe_subscription_id) FROM public.subscriptions s), '[]'),
+                COALESCE((SELECT jsonb_agg(h ORDER BY stripe_invoice_id) FROM public.paid_invoice_history h), '[]'),
+                COALESCE((SELECT jsonb_agg(o ORDER BY id) FROM public.billing_operations o), '[]'),
+                COALESCE((SELECT jsonb_agg(e ORDER BY stripe_event_id) FROM public.billing_webhook_events e), '[]'))
+        """,
+                tuples=True,
+            )
+        )
+
+    body = json.dumps(
+        {
+            "id": "evt_worker_fault",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {"object": {"id": "cs_worker_fault"}},
+        }
+    ).encode()
+    stamp = "1786032000"
+    digest = hmac.digest(
+        b"webhook-ack-fixture", stamp.encode() + b"." + body, "sha256"
+    ).hex()
+    headers = {
+        "Stripe-Signature": f"t={stamp},v1={digest}",
+        "Content-Type": "application/json",
+    }
+    before = snapshot()
+    routing.check(
+        before[:2] == [[], []] and not before[3],
+        "webhook fixture already has billing state",
+    )
+    with relay.commit_relay() as ack:
+        status, _, error = routing.http(
+            "POST", base + "/billing-webhook-ack-proof", body, headers
+        )
+        routing.check(
+            status == 500 and error == '{"error":"internal error"}',
+            f"first delivery: {status} {error}",
+        )
+        routing.check(
+            ack.result(timeout=2) == b"W", "webhook relay did not withhold COMMIT"
+        )
+
+    subs, history, operations, claims = snapshot()
+    routing.check(
+        operations == before[2] and not claims,
+        "failed delivery changed checkout or retained claim",
+    )
+    for row in subs + history:
+        routing.check(
+            row["user_id"] == "worker_fault_user"
+            and row["stripe_subscription_id"] == "sub_worker_fault"
+            and row["plan_id"] == "plus",
+            "committed billing rows have incorrect attribution",
+        )
+    routing.check(
+        [(s["status"], s["paid_invoice_id"]) for s in subs]
+        == [("active", "in_worker_second")],
+        "lost acknowledgement did not leave the expected committed subscription",
+    )
+    routing.check(
+        [(h["stripe_invoice_id"], h["amount_cents"], h["currency"]) for h in history]
+        == [("in_worker_first", 800, "usd"), ("in_worker_second", 800, "eur")],
+        "lost acknowledgement did not leave both attributed history rows",
+    )
+
+    settled = None
+    for phase in ("redelivery", "replay"):
+        status, _, reply = routing.http(
+            "POST", base + "/billing-webhook-retry-proof", body, headers
+        )
+        routing.check(
+            status == 200 and reply == '{"ok":true}', f"{phase}: {status} {reply}"
+        )
+        after = snapshot()
+        routing.check(
+            after[:2] == [subs, history], f"{phase} changed committed billing state"
+        )
+        routing.check(len(after[2]) == 1, f"{phase} added or removed a checkout")
+        op = after[2][0]
+        routing.check(
+            op["id"] == before[2][0]["id"]
+            and op["state"] == "succeeded"
+            and op["request_payload"] == before[2][0]["request_payload"],
+            f"{phase} did not settle the original checkout",
+        )
+        routing.check(
+            [claim["stripe_event_id"] for claim in after[3]] == ["evt_worker_fault"],
+            f"{phase} did not retain the delivery claim",
+        )
+        if settled is not None:
+            routing.check(after == settled, "replay changed settled checkout or claim")
+        settled = after
+    print(
+        "PASS: signed webhook recovered and settled after a withheld billing COMMIT",
+        flush=True,
+    )
+
+
 def main():
     routing.check(os.environ.get("GITHUB_ACTIONS") == "true" and
                   os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted", "hosted Actions only")
@@ -178,6 +400,13 @@ def main():
                     check_reconcile_ack(f"http://127.0.0.1:{port}")
                 finally:
                     admin(f"DROP DATABASE {BILLING_DB}")
+                admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                try:
+                    observe = partial(routing.psql, settings, BILLING_DB, timeout=10)
+                    check_webhook_ack(f"http://127.0.0.1:{port}", observe)
+                finally:
+                    admin(f"DROP DATABASE {BILLING_DB}")
+                check_restricted_history(f"http://127.0.0.1:{port}", settings)
                 admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
                 try:
                     url = f"http://127.0.0.1:{port}/billing-cancel-proof"

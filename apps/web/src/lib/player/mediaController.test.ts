@@ -13,7 +13,7 @@ test.each([true, false])('streamless play publishes one keyed outcome only for a
 	const flush = vi.fn(async () => {});
 	let valid = true;
 	const media = createMedia(createQueueController(queue), {
-		commit: () => { valid = current; return true; }, flush, clearShareFeedback: () => {}, announce
+		commit: () => { valid = current; return true; }, flush, browseCopy: { invalidate: () => {} }, announce
 	});
 	await media.playSelected(queue, 0, { streamUrl: '', isCurrent: () => valid });
 	if (current) expect(announce).toHaveBeenCalledExactlyOnceWith('Selected Coral; no stream to play.', true);

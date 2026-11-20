@@ -44,6 +44,9 @@ mod billing_cancel_control;
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 #[path = "billing_deadline_test.rs"]
 pub(crate) mod billing_deadline_test;
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+#[path = "billing_webhook_ack_test.rs"]
+pub(crate) mod billing_webhook_ack_test;
 
 use crate::session::SessionRecord;
 use crate::vault::{
@@ -1009,11 +1012,15 @@ impl PgStore {
                 let target = (
                     "127.0.0.1".to_owned(),
                     match self.trace_id.as_str() {
-                        "worker-commit-ack-loss-test" => 15432,
+                        "worker-commit-ack-loss-test" | "worker-webhook-ack-test" => 15432,
                         "worker-cancel-test" => 15433,
                         _ => 5432,
                     },
-                    "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
+                    if self.trace_id == billing_deadline_test::RESTRICTED_HISTORY_TRACE {
+                        "host=127.0.0.1 user=billing_history_fixture password=ci-throwaway dbname=nntune_billing_ack sslmode=disable"
+                    } else {
+                        "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test"
+                    }.to_owned(),
                 );
                 #[cfg(not(feature = "billing-owned-wasm-test"))]
                 let target = {
@@ -1504,6 +1511,10 @@ impl PgStore {
     }
 
     async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        if self.webhook_ack_control() {
+            return Self::bounded(billing_webhook_ack_test::connect(), TOTAL_TIMEOUT_MS).await;
+        }
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
             return Ok(client);
@@ -2977,6 +2988,15 @@ async fn admin_revoke_invite_on(
 }
 
 impl Store for PgStore {
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    fn webhook_ack_control(&self) -> bool {
+        self.env.is_none()
+            && matches!(
+                self.trace_id.as_str(),
+                "worker-webhook-ack-test" | "worker-webhook-retry-test"
+            )
+    }
+
     async fn mark_private_play(
         &self,
         user_id: &str,
@@ -5252,6 +5272,14 @@ impl Store for PgStore {
                     })
                     .transpose()?
                     .flatten();
+                // A live-row lookup can return the same row after COMMIT.
+                // Require the exact selector in this control even in that case.
+                #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+                if self.webhook_ack_control()
+                    && target_subscription_id != Some(billing_webhook_ack_test::SUBSCRIPTION)
+                {
+                    return Err(failed());
+                }
                 let live_rows = match target_subscription_id {
                     Some(target) => {
                         client
@@ -6373,6 +6401,8 @@ impl Mailer for WebhookMailer {
 // here logs header values or response bodies.
 struct WorkerStripeTransport {
     secret_key: Option<String>,
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    webhook_script: Option<billing_webhook_ack_test::StripeScript>,
 }
 
 impl WorkerStripeTransport {
@@ -6381,6 +6411,10 @@ impl WorkerStripeTransport {
         T: serde::de::DeserializeOwned,
     {
         use crate::stripe::{StripeError, STRIPE_API_BASE, STRIPE_API_VERSION};
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        if let Some(script) = &self.webhook_script {
+            return script.send(req);
+        }
         let key = self
             .secret_key
             .as_deref()
@@ -7312,6 +7346,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // same config before any Stripe call).
     let stripe = WorkerStripeTransport {
         secret_key: config.stripe_secret_key.clone(),
+        #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+        webhook_script: None,
     };
     let ctx = handlers::Ctx {
         cfg: &config,

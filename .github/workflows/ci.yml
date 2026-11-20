@@ -765,10 +765,13 @@ jobs:
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
         run: |
-          test_name='listen_history::postgres_tests::clear_and_terminal_write_share_owner_fence'
-          inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --list)"
-          test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
-          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --exact
+          for test_name in \
+            listen_history::postgres_tests::clear_and_terminal_write_share_owner_fence \
+            listen_history::postgres_tests::history_uses_the_grant_privacy_decision; do
+            inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --list)"
+            test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
+            cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --exact
+          done
       # Meter-metadata boundary runs below against independently migrated
       # app/mirror stores (their own env vars); it must not run here on the
       # single shared database, where the split-store env vars are absent.
@@ -1983,6 +1986,8 @@ jobs:
           mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
           test "${#wranglers[@]}" -eq 1
           python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
+      - name: Rehearse the offline Subsonic staging schedule
+        run: python3 -I scripts/test-subsonic-staging-runner.py
       - name: Exercise Worker routing with disposable PostgreSQL
         run: |
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
@@ -1996,7 +2001,7 @@ jobs:
       - name: Exercise owned transport in a separate test Worker
         run: |
           set -euo pipefail
-          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok|billing-ack-ok:' workers/api/build/index_bg.wasm; then
+          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok|billing-ack-ok:|/billing-webhook-(ack|retry)-proof|billing-restricted-history-' workers/api/build/index_bg.wasm; then
             printf '%s\n' 'test entry marker found in release WASM' >&2
             exit 1
           fi

@@ -2,7 +2,7 @@
 use super::{billing_budget, MirrorBinding, PgStore, Store, StoreError};
 use crate::billing_reconcile::{PaidInvoiceRow, ReconcileOutcome, ReconciledRow};
 use crate::billing_transaction_sql::ReconcileProbe;
-const CONNECTION: &str =
+pub(super) const CONNECTION: &str =
     "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable";
 async fn fixture(setup: bool) -> Result<(), StoreError> {
     billing_budget::with_owned_connection(
@@ -190,6 +190,26 @@ fn test_outcome() -> ReconcileOutcome {
         read_anchor: None,
     }
 }
+pub(super) const RESTRICTED_HISTORY_TRACE: &str = "worker-restricted-history-test";
+
+pub(crate) async fn test_restricted_history(replay: bool) -> Result<(), StoreError> {
+    let store = PgStore {
+        env: None,
+        trace_id: RESTRICTED_HISTORY_TRACE.into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        work_deadline_observer: None,
+        cancel_token_observer: None,
+    };
+    let mut outcome = test_outcome();
+    if replay {
+        outcome.read_plan = Some(outcome.row.plan_id.clone());
+        outcome.read_anchor = outcome.row.paid_invoice_id.clone();
+    }
+    store
+        .store_reconcile_owned("worker_fault_user".into(), outcome, ReconcileProbe::None)
+        .await
+}
+
 // Exercise history refusal, late rollback and replay through the shared store.
 async fn late_fault_and_retry() -> Result<(), &'static str> {
     let store = PgStore {
