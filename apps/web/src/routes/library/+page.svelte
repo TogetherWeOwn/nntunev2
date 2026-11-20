@@ -821,18 +821,18 @@
 					&& visible.has(placement.crossed) ? placement : undefined;
 				const beforeNeighbor = new Map<string, string[]>();
 				let pending: string[] = [];
-				// Rebase the pre-move overlay before assigning the moved ID a visible slot.
 				for (const id of moved ? before : optimistic) {
 					if (visible.has(id)) {
 						if (pending.length) beforeNeighbor.set(id, pending);
 						pending = [];
-					} else if (!baseline.has(id)) pending.push(id);
+					} else if (!baseline.has(id) && id !== moved?.id) pending.push(id);
 				}
 				const reconciled = [...durable.flatMap((id) => [...(beforeNeighbor.get(id) ?? []), id]), ...pending];
 				if (moved) {
-					// Reorder only the loaded slots, leaving hidden IDs in place.
-					const order = reconciled.filter((id) => moved.loaded.has(id) && id !== moved.id);
+					// Keep the visit-only row's original slot instead of anchoring it to a hidden neighbor.
+					const order = reconciled.filter((id) => moved.loaded.has(id));
 					order.splice(order.indexOf(moved.crossed) + Number(moved.direction === 'down'), 0, moved.id);
+					reconciled.splice(before.indexOf(moved.id), 0, moved.id);
 					let slot = 0;
 					favorites = reconciled.map((id) => moved.loaded.has(id) ? order[slot++] : id);
 				} else favorites = reconciled;

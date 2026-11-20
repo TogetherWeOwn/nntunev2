@@ -308,7 +308,7 @@ test('a visit-only move honors peer reorders without displacing hidden favorite 
 	const expanded = [...ITEMS, { id: 'hidden', title: 'Hidden Song', artist: '' }];
 	await page.route('**/api/library', (route) => route.fulfill({ json: expanded }));
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-	await expectIds(page, ['arr-m', 'arr-z', 'hidden', 'arr-a']);
+	await expectIds(page, ['arr-m', 'hidden', 'arr-z', 'arr-a']);
 	expect(await stored(page)).toEqual(['arr-m', 'hidden', 'arr-z']);
 });
 
