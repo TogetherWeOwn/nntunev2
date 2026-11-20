@@ -203,11 +203,13 @@ test('same-source Library refresh and reorder preserve the native element and it
 		time: (node as HTMLAudioElement).currentTime,
 		paused: (node as HTMLAudioElement).paused
 	}));
-	await Promise.all([
-		page.waitForResponse((response) => new URL(response.url()).pathname === '/api/library' && response.ok()),
-		page.getByRole('button', { name: 'Refresh', exact: true }).click()
-	]);
-	await settleFrames(page);
+	// A title change proves the snapshot rendered without changing the queued sources.
+	const refreshedTitle = 'Coral Night (Remastered)';
+	await page.route('**/api/library', (route) =>
+		route.fulfill({ json: [{ ...ITEMS[0], title: refreshedTitle }, ...ITEMS.slice(1)] })
+	);
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByTestId('library-item').filter({ hasText: refreshedTitle })).toBeVisible();
 	expect(await nativeState()).toEqual({ current: true, time: 37, paused: false });
 
 	await page.getByRole('button', { name: 'Move Pine Morning up', exact: true }).click();
