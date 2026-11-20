@@ -295,19 +295,15 @@ async function probeSnapshot(page: Page) {
 }
 
 const playbackFixture = {
-	id: 'account-coral', title: 'Account Coral', artist: 'Fixture Artist',
-	streamUrl: '/api/demo/audio?track=coral'
+	id: 'account-coral', title: 'Account Coral', artist: 'Fixture Artist', streamUrl: '/api/demo/audio?track=coral'
 };
-
-const servePlaybackLibrary = (page: Page) =>
-	page.route('**/api/library', (route) => route.fulfill({ json: [playbackFixture] }));
+const servePlaybackLibrary = (page: Page, multi = false) => page.route('**/api/library', (route) =>
+	route.fulfill({ json: multi ? [playbackFixture, { id: 'moss', title: 'Moss' }] : [playbackFixture] }));
 
 async function startNativePlayback(page: Page) {
 	await page.getByRole('button', { name: 'Play displayed from the top' }).click();
-	const player = page.getByTestId('audio-player');
+	const player = page.locator(`audio[data-testid="audio-player"][controls=""][src="${playbackFixture.streamUrl}"]`);
 	await expect(player).toBeVisible();
-	await expect(player).toHaveAttribute('controls', '');
-	await expect(player).toHaveAttribute('src', playbackFixture.streamUrl);
 	const audio = (await player.elementHandle())!;
 	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
 		!node.paused && node.seekable.length > 0 && node.currentTime > 0.2)).toBe(true);
@@ -321,13 +317,13 @@ async function openHome(page: Page) {
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 }
 
-for (const mode of ['playing', 'demo', 'paused', 'unavailable', 'timestamp Back']) {
-	const timestamp = mode === 'timestamp Back';
-	const paused = timestamp || mode === 'paused';
+for (const mode of ['playing', 'demo', 'encoded demo', 'paused', '404 clear', '404 remove', '503 clear', 'timestamp Back']) {
+	const timestamp = mode === 'timestamp Back', status = Number.parseInt(mode, 10);
+	const paused = timestamp || mode === 'paused', demo = mode.endsWith('demo');
 	test(`Library → Home → Library keeps the native decoder (${mode})`, async ({ page }) => {
 		const errors: string[] = [];
 		page.on('pageerror', (error) => errors.push(error.message));
-		await servePlaybackLibrary(page);
+		await servePlaybackLibrary(page, mode === '404 clear');
 		const share = `/library?track=${playbackFixture.id}&t=2`;
 		const time = () => page.getByTestId('audio-player').evaluate((node: HTMLAudioElement) => node.currentTime);
 		await page.goto(timestamp ? share : '/library');
@@ -350,18 +346,17 @@ for (const mode of ['playing', 'demo', 'paused', 'unavailable', 'timestamp Back'
 				sameNode: node === document.querySelector('audio'), source: node.currentSrc,
 				paused: node.paused, replay: node.dataset.replay ?? null, reload: node.dataset.reload ?? null
 			}))).toEqual({ sameNode: true, source: before.source, paused, replay: null, reload: null });
-			const time = () => audio.evaluate((node: HTMLAudioElement) => node.currentTime);
 			if (paused) expect(await time()).toBeCloseTo(position, 3);
 			else await expect.poll(time).toBeGreaterThan(position + 0.15);
 			return time();
 		};
-
+		const queueItem = page.getByTestId('queue-item');
+		if (status) await queueItem.getByRole('button', { name: `Star ${playbackFixture.title}` }).click();
 		await openHome(page);
 		const atHome = await inspect(before.position);
-		if (mode === 'unavailable') await page.route('**/api/library', (route) => route.fulfill({ status: 404 }));
-		if (timestamp) await page.goBack();
-		else await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();
-		if (mode === 'unavailable') await expect(page.getByText('Library listing is not available yet.')).toBeVisible();
+		if (status) await page.route('**/api/library', (route) => route.fulfill({ status }), { times: 1 });
+		await (timestamp ? page.goBack() : page.getByRole('link', { name: 'Open Your Library', exact: true }).click());
+		await expect(status ? page.getByText(status === 404 ? 'Library listing is not available yet.' : 'Library is not reachable right now.') : page.getByTestId('library-item')).toBeVisible();
 		await expect(page.getByTestId('now-playing')).toContainText(playbackFixture.title);
 		await expect(page.getByTestId('player-next')).toBeVisible();
 		await inspect(atHome);
@@ -369,16 +364,23 @@ for (const mode of ['playing', 'demo', 'paused', 'unavailable', 'timestamp Back'
 			await openHome(page);
 			await clientNavigate(page, share, false);
 			await expect.poll(time).toBeCloseTo(2);
+		} else if (status) {
+			const clear = mode.endsWith('clear');
+			await expect(queueItem).toHaveCount(mode === '404 clear' ? 2 : 1);
+			await expect(queueItem.getByRole('button', { name: /^(Unstar|Star) / })).toHaveCount(0);
+			await expect(queueItem.getByRole('checkbox')).toHaveCount(0);
+			if (clear) await page.getByRole('button', { name: 'Clear queue', exact: true }).press('Enter');
+			await page.getByRole('button', { name: clear ? 'Yes, clear queue' : 'Remove Account Coral from queue' }).press('Enter');
+			await expect(page.getByTestId('queue-empty-focus')).toBeFocused();
+			await expect(page.locator('audio')).toHaveCount(0);
+			await page.reload();
+			await expect(page.getByTestId('favorite-item')).toContainText(playbackFixture.title);
 		} else if (!paused) {
-			if (mode === 'unavailable') {
-				await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
-				await expect(page.getByTestId('queue-clear-confirm')).toBeVisible();
-			}
-			const path = mode === 'playing' ? '/' : '/demo/player';
-			await clientNavigate(page, mode === 'unavailable' ? path.replace(/[a-z]/, (ch) => `%${ch.charCodeAt(0).toString(16)}`) : path, false);
-			await expect(page.getByRole('heading', { name: path === '/' ? 'NNTune' : 'Player resilience demo', exact: true })).toBeVisible();
-			if (path !== '/') await expect(page.getByTestId('demo-audio')).toHaveCount(1);
-			await expect(page.locator('audio')).toHaveCount(path === '/' ? 0 : 1);
+			const path = mode === 'encoded demo' ? '/d%65mo/player' : demo ? '/demo/player' : '/';
+			await clientNavigate(page, path, false);
+			await expect(page.getByRole('heading', { name: demo ? 'Player resilience demo' : 'NNTune', exact: true })).toBeVisible();
+			if (demo) await expect(page.getByTestId('demo-audio')).toHaveCount(1);
+			await expect(page.locator('audio')).toHaveCount(demo ? 1 : 0);
 			await expect(page.getByText(playbackFixture.title)).toHaveCount(0);
 			await expect(page.getByTestId('library-now-playing')).toHaveCount(0);
 			expect(await audio.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);

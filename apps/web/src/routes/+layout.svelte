@@ -477,7 +477,8 @@
 			{/if}
 		</div>
 	</div>
-	{#snippet appRail()}
+	{#snippet appBody()}
+	<div class="nt-body">
 		<div class="nt-rail" data-testid="shell-rail">
 			<nav aria-label="Primary" class="nt-destinations nt-rail-nav">
 				<a href="/home" aria-current={primaryDestination === 'home' ? 'page' : undefined}>
@@ -496,12 +497,8 @@
 				<a href="/library/recent">Recent</a>
 			</div>
 		</div>
-	{/snippet}
-	{#snippet appBody()}
-		<div class="nt-body">
-			{@render appRail()}
-			{@render children()}
-		</div>
+		{@render children()}
+	</div>
 	{/snippet}
 	{#if page.route.id === null}
 		{@render appBody()}

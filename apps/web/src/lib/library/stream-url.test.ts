@@ -39,7 +39,7 @@ describe('resolveStreamUrl', () => {
 // Builder-owned exact pins for the library player wiring, via the same Vite
 // raw-glob seam as the other route-markup pins. The exact binding and the
 // helper derivation are pinned here.
-const sources = import.meta.glob(['../../routes/library/+page.svelte', '../player/AppPlayer.svelte', '../player/NativeAudio.svelte', '../player/NativePlayer.svelte'], {
+const sources = import.meta.glob(['../../routes/+layout.svelte', '../../routes/library/+page.svelte', '../player/AppPlayer.svelte', '../player/NativeAudio.svelte', '../player/NativePlayer.svelte'], {
 	query: '?raw',
 	import: 'default',
 	eager: true
@@ -58,6 +58,7 @@ describe('library player wiring', () => {
 		expect(source).toMatch(/\{#if streamUrl\}\s*<div class="nt-wrap">\s*<NativePlayer\b[^>]*\/>\s*<\/div>\s*\{\/if\}/);
 		expect(player).toMatch(/<section aria-label="Player">/);
 		expect(sources['../../routes/library/+page.svelte']).not.toContain('<NativePlayer');
+		expect(sources['../../routes/+layout.svelte']).toMatch(/\{#if page\.route\.id === null\}\s*\{@render appBody\(\)\}\s*\{:else\}\s*<AppPlayer\b/);
 		expect(source + player).not.toMatch(/<audio\b/);
 	});
 

@@ -28,14 +28,13 @@
 	// Retire the decoder before the mounted Library handles the same signal.
 	$effect.pre(() => {
 		const offAuth = subscribeLocalAuthTransition(player.purgeAtAuthBoundary);
-		const onStorage = (event: StorageEvent) => { if (event.key === LIBRARY_AUTH_TRANSITION_KEY) player.purgeAtAuthBoundary(); };
-		window.addEventListener('storage', onStorage);
-		window.addEventListener(LIBRARY_ACCESS_REFUSED_EVENT, player.purgeAtAuthBoundary);
-		return () => {
-			offAuth();
-			window.removeEventListener('storage', onStorage);
-			window.removeEventListener(LIBRARY_ACCESS_REFUSED_EVENT, player.purgeAtAuthBoundary);
-		};
+		const listeners = new AbortController();
+		const options = { signal: listeners.signal };
+		window.addEventListener('storage', (event) => {
+			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) player.purgeAtAuthBoundary();
+		}, options);
+		window.addEventListener(LIBRARY_ACCESS_REFUSED_EVENT, player.purgeAtAuthBoundary, options);
+		return () => { offAuth(); listeners.abort(); };
 	});
 	// Library's pre-effect disposes route state before player teardown.
 	onMount(() => {
@@ -43,12 +42,10 @@
 		return () => { clearMiniPlayerHint(); player.destroy(); };
 	});
 </script>
-
 {@render children()}
 {#if streamUrl}
 	<div class="nt-wrap">
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
-			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump}
-		/>
+			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
 	</div>
 {/if}

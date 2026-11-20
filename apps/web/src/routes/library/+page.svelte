@@ -149,7 +149,9 @@
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
+	let retainedQueueOnError = $state(false);
 	let requiresSignIn = $state(false);
+	const listingUnavailable = $derived(loading || libraryUnavailable || loadError !== null);
 	const player = getAppPlayer();
 	const commitQueue = player.commitQueue;
 	const replaceQueue = player.replaceQueue;
@@ -332,6 +334,7 @@
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
+			retainedQueueOnError = !authBoundary && !!(state.libraryUnavailable || state.loadError) && queueController.snapshot.tracks.length > 0;
 			requiresSignIn = state.requiresSignIn;
 			// An access refusal that empties the library unmounts the queue
 			// panel (alert branch); the route-owned filter text must go with
@@ -422,6 +425,8 @@
 	// venture slices that own them. The placeholder below keeps its hook
 	// rendered until then.
 	const overLimit = false;
+	// Queue metadata alone is not playable media: the player renders only
+	// when resolveStreamUrl finds a real (non-blank) stream URL.
 	const currentTrack = $derived(queueCurrentTrack(queue));
 	const queuedIds = $derived(new Set(queue.tracks.map((track) => track.id)));
 	// One-action bulk queue: the same final rendered ordered collection the
@@ -831,7 +836,7 @@
 
 	function toggleQueuedFavorite(id: string): void {
 		const track = queueController.snapshot.tracks.find((track) => track.id === id);
-		if (!track) return;
+		if (!track || !favoritesInitialized || loading || loadError || libraryUnavailable) return;
 		const wasFavorite = favorites.includes(id);
 		toggleFavorite(id);
 		player.announceQueue(`${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`);
@@ -1909,7 +1914,9 @@
 			{/if}
 		{/if}
 		</div>
-		{#if queue.tracks.length > 0 || (!libraryUnavailable && items.length > 0)}
+	{/if}
+	{#if !loading || items.length > 0}
+		{#if queue.tracks.length > 0 || retainedQueueOnError || (!libraryUnavailable && items.length > 0)}
 			<!--
 				The queue panel stays mounted across background refreshes (its
 				rows remain readable while the new list loads), but its four
@@ -1923,7 +1930,7 @@
 				announcement={player.queueAnnouncement.text}
 				announcementVersion={player.queueAnnouncement.version}
 				{favoriteIds}
-				ontogglefavorite={toggleQueuedFavorite}
+				ontogglefavorite={listingUnavailable ? undefined : toggleQueuedFavorite}
 				onfavoriteids={(ids) => favoriteInteractionIds(ids, true)}
 				bind:filterQuery={queueFilterQuery}
 				liveRegions={!loading}
@@ -1933,9 +1940,9 @@
 				onshuffle={() => replaceQueue(shuffleUpcoming(queueController.snapshot))}
 				onmove={moveQueuedTrack}
 				oninsert={insertQueuedIds}
-				interactionsUnavailable={loading || libraryUnavailable}
+				interactionsUnavailable={listingUnavailable}
 				onmenufocusfallback={focusLibraryRecovery}
-				onreorder={reorderQueuedIds}
+				onreorder={listingUnavailable ? undefined : reorderQueuedIds}
 				onplaynextids={queueNextIds}
 				onremoveids={removeQueuedIds}
 				onplaynext={(index) => replaceQueue(playNext(queueController.snapshot, index))}
@@ -1949,7 +1956,7 @@
 			/>
 			<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />
 		{/if}
-
+		{#if !loadError || items.length > 0}
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
@@ -1959,6 +1966,7 @@
 		>
 			{staleAt ? 'Retry' : 'Refresh'}
 		</button>
+		{/if}
 	{/if}
 
 	<!-- Contract placeholders from main: usage-meter deliberately carries no
