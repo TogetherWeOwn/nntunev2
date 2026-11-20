@@ -497,7 +497,12 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // Session-only reads (never reachable by bearer).
             if matches!(
                 path,
-                "/v1/me" | "/v1/indexers" | "/v1/me/likes" | "/v1/me/taste" | "/v1/me/history"
+                "/v1/me"
+                    | "/v1/indexers"
+                    | "/v1/me/likes"
+                    | "/v1/me/likes/session"
+                    | "/v1/me/taste"
+                    | "/v1/me/history"
             ) {
                 return SessionOnly;
             }

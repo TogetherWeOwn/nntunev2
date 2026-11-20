@@ -226,10 +226,11 @@ test('[FAV-05] an auth transition clears favorites so the next account starts em
 	}, AUTH_TRANSITION_KEY);
 
 	await expect(page.getByRole('alert')).toContainText(/session changed/i);
-	expect(
-		await readFavoritesRaw(page, contextBefore),
-		'previous-account favorites must be cleared at the auth boundary'
-	).toBeNull();
+	await expect
+		.poll(() => readFavoritesRaw(page, contextBefore), {
+			message: 'previous-account favorites must be cleared at the auth boundary'
+		})
+		.toBeNull();
 	await otherTab.close();
 
 	// The next account refetches and starts with an empty Favorites section.

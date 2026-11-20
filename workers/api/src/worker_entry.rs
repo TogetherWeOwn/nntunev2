@@ -6680,11 +6680,12 @@ fn render_header_pairs(
             crate::rate_limit::retry_after_header_value(retry_after),
         ));
     }
-    // Caller-supplied extra headers (plan-limit denials): rendered
-    // verbatim after the security set, so they can neither suppress nor
-    // precede it.
+    // Caller-supplied extra headers are rendered after the security set.
     for (name, value) in &response.extra_headers {
         pairs.push((name.clone(), value.clone()));
+        if name == handlers::SESSION_BINDING_HEADER && !cors.is_empty() {
+            pairs.push(("access-control-expose-headers".into(), name.clone()));
+        }
     }
     // Credentialed CORS for the configured origin only: the exact header
     // set is decided by the unit-tested `cors_headers`; render only
@@ -8573,6 +8574,29 @@ mod tests {
         )));
         assert!(headers.contains(&("x-content-type-options".to_string(), "nosniff".to_string())));
         assert!(headers.contains(&("cache-control".to_string(), "no-store".to_string())));
+    }
+
+    #[test]
+    fn render_exposes_library_binding_only_to_the_allowed_origin() {
+        let binding = handlers::SESSION_BINDING_HEADER.to_string();
+        let response = handlers::Response {
+            status: 200,
+            body: "[]".into(),
+            set_cookie: None,
+            retry_after: None,
+            extra_headers: vec![(binding.clone(), "opaque-binding".into())],
+        };
+        let allowed = "https://app.example";
+        for origin in [None, Some(allowed), Some("https://other.example")] {
+            let cors = cors_headers(response.status, origin, allowed);
+            let headers = render_header_pairs(&response, &cors, REQUEST_TRACE);
+            assert!(headers.contains(&(binding.clone(), "opaque-binding".into())));
+            assert!(headers.contains(&("cache-control".into(), "no-store".into())));
+            assert_eq!(
+                headers.contains(&("access-control-expose-headers".into(), binding.clone())),
+                origin == Some(allowed)
+            );
+        }
     }
 
     #[test]

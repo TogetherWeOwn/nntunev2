@@ -242,6 +242,7 @@ for (const kind of ['getter', 'write'] as const) {
 			await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 			await expect(page.locator('[data-testid="library-item"][data-id="arr-a"]')).toContainText('Refreshed artist');
 			await expectIds(page, ['arr-m', 'arr-z', 'arr-a']);
+			await page.evaluate((key) => navigator.locks.request(key, () => {}), KEY);
 			await page.evaluate(() => Reflect.get(window, '__restoreArrangementStorage')());
 			if (recovery === 'move') {
 				await activate(page, 'Alpha Song', 'up');
@@ -316,10 +317,11 @@ for (const moveFocus of [false, true]) {
 
 test('queue Star all keeps its direction when a pending edit reconciles', async ({ page }) => {
 	await open(page, ['arr-z']);
-	for (const id of ['arr-z', 'arr-m']) {
-		await page.locator(`[data-testid="library-item"][data-id="${id}"]`).click();
+	for (const title of ['Zulu Song', 'Mike Song']) {
+		await page.getByTestId('library-item').getByRole('button', { name: new RegExp(`^${title}`) }).click();
 	}
 	const rows = page.getByTestId('queue-item');
+	await expect(rows).toHaveCount(2);
 	for (const checkbox of await rows.getByRole('checkbox').all()) await checkbox.check();
 	const release = await holdFavorites(page);
 	await star(page, 'arr-a').click();
@@ -344,7 +346,11 @@ test('Library Star all sends the full selection when a peer removes a star', asy
 	await page.getByTestId('track-more').first().click();
 	await star(peer, 'arr-z').click();
 	await expect.poll(() => stored(peer)).toEqual([]);
+	const release = await holdFavorites(peer);
 	await page.getByRole('menuitem', { name: 'Star all', exact: true }).click();
+	await expect.poll(() => page.evaluate(async (key) => (await navigator.locks.query()).pending?.some((lock) => lock.name === key), KEY)).toBe(true);
+	expect(await stored(peer)).toEqual([]);
+	await release();
 	await expect.poll(async () => ((await stored(page)) as string[]).sort()).toEqual([...ALL].sort());
 });
 
