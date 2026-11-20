@@ -8076,6 +8076,7 @@ mod tests {
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
         listen_writes: RefCell<Vec<(String, crate::listen_history::ListenEventBody)>>,
+        listen_conflict: RefCell<bool>,
         listen_rows: RefCell<Vec<(String, crate::listen_history::ListenRow)>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
@@ -9076,7 +9077,11 @@ mod tests {
             self.listen_writes
                 .borrow_mut()
                 .push((owner.to_string(), event.clone()));
-            Ok(crate::listen_history::WriteOutcome::Written)
+            Ok(if *self.listen_conflict.borrow() {
+                crate::listen_history::WriteOutcome::Conflict
+            } else {
+                crate::listen_history::WriteOutcome::Written
+            })
         }
 
         async fn export_listen_events(

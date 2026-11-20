@@ -101,20 +101,28 @@ test('library keeps a pending start bound when no auth notification arrives', as
 	let activeContext = original;
 	let contextLoads = 0;
 	const received: Body[] = [];
+	const cookies: (string | undefined)[] = [];
+	const setSession = (value: string) => page.context().addCookies([
+		{ name: 'fixture_session', value, url: new URL(page.url()).origin, httpOnly: true }
+	]);
 	await page.route(contextPath, (route) => {
 		contextLoads++;
 		return route.fulfill({ json: { context: activeContext } });
 	});
-	await page.route(eventsPath, (route) => {
+	await page.route(eventsPath, async (route) => {
 		const body = route.request().postDataJSON() as Body;
 		received.push(body);
+		cookies.push((await route.request().allHeaders()).cookie);
 		if (received.length === 1) {
+			// Synthetic session switch: the cookie and the context endpoint both change.
+			await setSession('second');
 			activeContext = replacement;
 			return route.fulfill({ json: {}, status: 503 });
 		}
 		return route.fulfill({ json: {}, status: body.context === activeContext ? 200 : 401 });
 	});
 	await mountLibrary(page);
+	await setSession('first');
 	const refused = page.waitForResponse((response) =>
 		response.url().endsWith('/v1/plays/events') && response.status() === 401
 	);
@@ -122,6 +130,9 @@ test('library keeps a pending start bound when no auth notification arrives', as
 	await refused;
 	expect(received.map((body) => body.context)).toEqual([original, original]);
 	expect(received[0]).toEqual(received[1]);
+	// The retry carries the new cookie but still the original JSON binding.
+	expect(cookies[0]).toContain('fixture_session=first');
+	expect(cookies[1]).toContain('fixture_session=second');
 	expect(contextLoads).toBe(1);
 	await expect(page.getByTestId('audio-player')).toBeVisible();
 });

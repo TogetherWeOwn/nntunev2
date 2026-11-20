@@ -243,17 +243,21 @@ pub fn listen_context(secret: &[u8], claims: &SessionClaims) -> Result<String, S
     Ok(crate::b64::encode(&tag))
 }
 
-/// Must be called with the claims from full cookie and row verification.
+/// Verify against the same window as cookie authentication. Claims must
+/// come from full cookie and row verification.
 pub fn verify_listen_context(
-    secret: &[u8],
+    keys: &SessionKeys<'_>,
     claims: &SessionClaims,
     presented: Option<&str>,
 ) -> bool {
     let Some(presented) = presented.filter(|value| value.len() == 43) else {
         return false;
     };
-    listen_context(secret, claims)
-        .is_ok_and(|expected| bool::from(expected.as_bytes().ct_eq(presented.as_bytes())))
+    let matches = |secret: &[u8]| {
+        listen_context(secret, claims)
+            .is_ok_and(|expected| bool::from(expected.as_bytes().ct_eq(presented.as_bytes())))
+    };
+    matches(keys.primary) || keys.previous.is_some_and(matches)
 }
 
 /// Issue a new session token for `user_id` valid for `ttl_secs` from `now`.
@@ -912,17 +916,17 @@ mod tests {
         let claims = verify_session(secret, &token, now).unwrap();
         let context = listen_context(secret, &claims).unwrap();
         assert_ne!(context, claims.session_id);
-        assert!(verify_listen_context(secret, &claims, Some(&context)));
-        assert!(!verify_listen_context(secret, &claims, None));
-        assert!(!verify_listen_context(secret, &claims, Some(&token)));
+        assert!(verify_listen_context(&keys, &claims, Some(&context)));
+        assert!(!verify_listen_context(&keys, &claims, None));
+        assert!(!verify_listen_context(&keys, &claims, Some(&token)));
 
         let refreshed = rotate_session(&keys, &token, now + 60, 3600).unwrap();
         let refreshed = verify_session(secret, &refreshed, now + 60).unwrap();
-        assert!(verify_listen_context(secret, &refreshed, Some(&context)));
+        assert!(verify_listen_context(&keys, &refreshed, Some(&context)));
         for user in ["listener-a", "listener-b"] {
             let other = issue_session(secret, user, now, 3600).unwrap();
             let other = verify_session(secret, &other, now).unwrap();
-            assert!(!verify_listen_context(secret, &other, Some(&context)));
+            assert!(!verify_listen_context(&keys, &other, Some(&context)));
         }
     }
 

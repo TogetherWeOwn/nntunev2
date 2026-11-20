@@ -36,10 +36,11 @@ playback is `skip`. A new grant play (not a continuation) has a different ID.
 Identical retries do not add rows or refresh timestamps. Terminals and retries
 can refer to an accepted start after the lease changes. Ineligible or
 conflicting observations, including a terminal without a matching start,
-return 422. Delivery is best effort; a missing terminal is not evidence that
-a listen completed. The demo and library pages do not send observations:
-neither obtains a grant-backed source in this build. There is no official
-video embed producer.
+return `409 conflict` and must not be retried unchanged. Malformed input
+returns `422 validation_failed`. Delivery is best effort; a missing terminal
+is not evidence that a listen completed. The demo and library pages do not
+send observations: neither obtains a grant-backed source in this build.
+There is no official video embed producer.
 
 ## Export and clear
 
@@ -79,5 +80,10 @@ Use synthetic accounts on the normal staging deployment. Record the deployed
 merge SHA and run, confirm the playback lifecycle on the available audio paths,
 page the export, verify owner isolation and clear, and verify that account
 erasure reaches history. The real ingest → play → meter journey must remain
-unchanged. Hosted fixtures test the code paths; they do not replace this
-served-build smoke.
+unchanged. Hosted handler tests dispatch through `handle` with a fake store;
+PostgreSQL tests call the storage API directly against a disposable database.
+The wiring guard checks that the Worker's `PgStore` delegates to that API,
+but neither test crosses the deployed Worker, Hyperdrive and PostgreSQL in
+one request. Served acceptance must still post a start and terminal against
+an issued grant, confirm both through export, and verify that a clear is
+visible on a subsequent export without affecting another account.

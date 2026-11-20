@@ -67,6 +67,58 @@ fn history_context_follows_the_verified_session_across_cookie_refresh() {
 }
 
 #[test]
+fn history_context_accepts_the_previous_key_only_during_rotation() {
+    let mut h = harness();
+    seed_user(&h, "listener-a", "alice@example.com");
+    let cookie = magic_login(&h, "alice@example.com");
+    let other = magic_login(&h, "alice@example.com");
+    let issue = |h: &Harness, cookie: &str| {
+        let response = h.call_full(
+            "POST",
+            listen_history_handlers::CONTEXT_PATH,
+            None,
+            Some(cookie.into()),
+            Some(ORIGIN),
+        );
+        assert_eq!(response.status, 200, "{}", response.body);
+        serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["context"].clone()
+    };
+    let previous = issue(&h, &cookie);
+    h.config.session_previous_secret =
+        Some(std::mem::replace(&mut h.config.session_secret, vec![7; 32]));
+    let current = issue(&h, &cookie);
+    assert_ne!(current, previous);
+    let refreshed = h.call_full(
+        "POST",
+        "/v1/session/refresh",
+        None,
+        Some(cookie),
+        Some(ORIGIN),
+    );
+    assert_eq!(refreshed.status, 200, "{}", refreshed.body);
+    let refreshed = cookie_of(&refreshed);
+    let write = |h: &Harness, cookie: &str, binding: &serde_json::Value| {
+        let mut body = history_start();
+        body["context"] = binding.clone();
+        h.call_full(
+            "POST",
+            crate::listen_history::EVENTS_PATH,
+            Some(body.to_string()),
+            Some(cookie.into()),
+            Some(ORIGIN),
+        )
+        .status
+    };
+    assert_eq!(write(&h, &refreshed, &previous), 200);
+    assert_ne!(issue(&h, &other), current);
+    assert_eq!(write(&h, &other, &previous), 401);
+    h.config.session_previous_secret = None;
+    assert_eq!(write(&h, &refreshed, &previous), 401);
+    assert_eq!(write(&h, &refreshed, &current), 200);
+    assert_eq!(h.store.listen_writes.borrow().len(), 2);
+}
+
+#[test]
 fn history_native_write_requires_plays_scope_without_browser_context() {
     for (scope, expected) in [("plays:write", 200), ("library:read", 403)] {
         let (h, cookie, secret) = play_bearer_harness(scope, false);
@@ -210,5 +262,59 @@ fn history_privacy_routes_require_cookie_origin_and_fresh_clear() {
             req.body = br#"{"before_id":"42"}"#.to_vec();
             assert_eq!(block_on(handle(&ctx, &req)).status, 422);
         }
+    }
+}
+
+#[test]
+fn history_conflict_is_distinct_from_invalid_input() {
+    let (h, _, secret) = play_bearer_harness("plays:write", false);
+    *h.store.listen_conflict.borrow_mut() = true;
+    let mut req = Request {
+        method: "POST".into(),
+        path: crate::listen_history::EVENTS_PATH.into(),
+        cookie: None,
+        origin: None,
+        authorization: Some(format!("Bearer {secret}")),
+        stripe_signature: None,
+        body: b"{}".to_vec(),
+    };
+    for (status, code) in [(422, "validation_failed"), (409, "conflict")] {
+        let response = block_on(handle(&h.ctx(), &req));
+        assert_eq!(response.status, status);
+        assert_eq!(response.retry_after, None);
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["code"], code);
+        assert_eq!(body["retryable"], false);
+        req.body = history_start().to_string().into_bytes();
+    }
+}
+
+#[test]
+fn history_export_and_clear_exhaust_independent_budgets() {
+    let h = harness();
+    seed_user(&h, "listener-a", "alice@example.com");
+    let cookie = magic_login(&h, "alice@example.com");
+    for (method, path, limit) in [
+        ("DELETE", crate::listen_history::EVENTS_PATH, 6),
+        ("POST", listen_history_handlers::EXPORT_PATH, 120),
+    ] {
+        let request = || {
+            h.call_full(
+                method,
+                path,
+                Some("{}".into()),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            )
+        };
+        for _ in 0..limit {
+            assert_eq!(request().status, 200);
+        }
+        let limited = request();
+        assert_eq!(limited.status, 429);
+        assert_eq!(limited.retry_after, Some(60));
+        let body: serde_json::Value = serde_json::from_str(&limited.body).unwrap();
+        assert_eq!(body["code"], "rate_limited");
+        assert_eq!(body["retryable"], true);
     }
 }
