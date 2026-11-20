@@ -104,6 +104,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let density, priorDocumentTitle = null, tabTitle = '';
 		let cleanup;
 		const onMount = (callback) => { cleanup = callback(); };
+		const listenHistory = { mount: () => () => {}, attach: () => () => {} };
 		const readStoredDensity = () => 'comfortable';
 		const handleAuthTransition = () => {}, recordFindQuery = () => {};
 		const subscribeLocalAuthTransition = () => () => {}, handleLocalAuthTransition = () => {};
