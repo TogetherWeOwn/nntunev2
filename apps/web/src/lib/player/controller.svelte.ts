@@ -17,6 +17,7 @@ export function createPlayerController(
 ) {
 	const queue = createQueueController(initial);
 	let queueAnnouncement = $state.raw<Readonly<{ text: string; version: number }>>({ text: '', version: 0 });
+	let destroyed = false;
 	let browseCopyGeneration = 0;
 	let browseCopyFeedback = $state.raw<Readonly<{ status: string; fallbackUrl: string | null }>>({ status: '', fallbackUrl: null });
 	const browseCopy = {
@@ -28,14 +29,14 @@ export function createPlayerController(
 			return generation;
 		},
 		settle(generation: number, status: string, fallbackUrl: string | null): void {
-			if (generation === browseCopyGeneration) browseCopyFeedback = { status, fallbackUrl };
+			if (!destroyed && generation === browseCopyGeneration) browseCopyFeedback = { status, fallbackUrl };
 		}
 	};
 	const media = createMediaController(queue, { ...effects, browseCopy, commit: replaceQueue, announce: announceQueue }, matchesNative);
 
 	// Keyed messages can announce identical text again without replacing the live region.
 	function announceQueue(text: string, replay = false): void {
-		if (text === queueAnnouncement.text && !replay) return;
+		if (destroyed || (text === queueAnnouncement.text && !replay)) return;
 		queueAnnouncement = { text, version: queueAnnouncement.version + Number(replay) };
 	}
 
@@ -49,14 +50,24 @@ export function createPlayerController(
 	}
 
 	function resetAtAuthBoundary(): void {
+		if (destroyed) return;
 		media.clearShareSeek();
 		retireNativeHost();
 		media.clearSeekFeedback();
 		browseCopy.invalidate();
 	}
 
+	function destroy(): void {
+		if (destroyed) return;
+		destroyed = true;
+		// Retire queue and copy receipts before media destruction can call native pause.
+		queue.destroy();
+		browseCopy.invalidate();
+		media.destroy();
+	}
+
 	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit): boolean {
-		if (library && !library.isCurrent()) return false;
+		if ((library && !library.isCurrent()) || destroyed) return false;
 		const receipt = queue.begin(next, kind, !!library);
 		let version = media.attachmentVersion;
 		// A callback can reset media without publishing a queue write (e.g. auth reset).
@@ -103,7 +114,7 @@ export function createPlayerController(
 		items: Parameters<typeof queue.prepareLibrary>[0], isCurrent: () => boolean,
 		beforeCommit?: (queueChanged: boolean) => void
 	): boolean {
-		if (!isCurrent()) return false;
+		if (!isCurrent() || destroyed) return false;
 		const { next, sources } = queue.prepareLibrary(items);
 		// The caller's UI work runs inline; the guarded commit rechecks the receipt afterward.
 		beforeCommit?.(next !== queue.snapshot);
@@ -118,6 +129,6 @@ export function createPlayerController(
 		queue, media, browseCopy, get mediaRevision() { return mediaRevision; },
 		get queueAnnouncement() { return queueAnnouncement; }, announceQueue,
 		commitQueue: (next: QueueState, kind: QueueCommitKind) => commitQueue(next, kind),
-		reconcileLibrary, replaceQueue, resetAtAuthBoundary
+		reconcileLibrary, replaceQueue, resetAtAuthBoundary, destroy
 	};
 }

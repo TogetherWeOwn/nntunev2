@@ -69,6 +69,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
+		$effect: { pre: () => {} },
 		afterNavigate: () => {},
 		shortTitle,
 		tick,

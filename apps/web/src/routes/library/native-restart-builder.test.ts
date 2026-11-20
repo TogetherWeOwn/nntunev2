@@ -29,13 +29,13 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		node.name && names.has(node.name.text)
 	);
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
-	const mount = parsed.statements.find((node) => ts.isExpressionStatement(node) &&
-		ts.isCallExpression(node.expression) && node.expression.expression.getText(parsed) === 'onMount');
-	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'queueShareOutcome', 'queueShare']);
+	const lifecycle = parsed.statements.filter((node) => ts.isExpressionStatement(node) &&
+		ts.isCallExpression(node.expression) && ['$effect.pre', 'onMount'].includes(node.expression.expression.getText(parsed)));
+	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'queueShareOutcome', 'queueShare', 'disposeRoute']);
 	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
 		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));
-	if (!mount || controllers.length !== bindingsInRoute.size) throw new Error('Missing route mount or player authority');
-	const handlers = [...declarations, ...controllers, mount].map((node) => node.getText(parsed)).join('\n');
+	if (lifecycle.length !== 2 || controllers.length !== bindingsInRoute.size) throw new Error('Missing route lifecycle or player authority');
+	const handlers = [...declarations, ...controllers, ...lifecycle].map((node) => node.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(handlers, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
@@ -79,13 +79,19 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	};
 	let onClear = () => {};
 	let onInvalidateBrowseCopy = () => {};
+	const routeCleanup: string[] = [];
 	const bindings = {
 		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
 		selectQueueIndex: selectTrack, removeTrack,
 		resolveStreamUrl, displayArtist, displayTitle, shortTitle, resolveShareTarget, get,
-		buildShareQuery, createQueueShare, queueCurrentTrack: currentTrack, navigator: { clipboard },
+		buildShareQuery, queueCurrentTrack: currentTrack, navigator: { clipboard },
 		$state: { raw: <T>(value: T) => value },
-		clearMiniPlayerHint,
+		routeCleanup,
+		clearMiniPlayerHint: () => { routeCleanup.push('hint'); clearMiniPlayerHint(); },
+		createQueueShare: (...args: Parameters<typeof createQueueShare>) => {
+			const share = createQueueShare(...args);
+			return { ...share, dispose: () => { routeCleanup.push('share'); share.dispose(); } };
+		},
 		createPlayerController: (_: ReturnType<typeof createQueue>, end: Parameters<typeof createPlayerController>[1]) => {
 			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), end,
 				(audio, source) => audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
@@ -105,15 +111,18 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let queueConfirmGeneration = 0;
 		let density, priorDocumentTitle = null, tabTitle = '';
 		let cleanup;
-		const onMount = (callback) => { cleanup = callback(); };
+		const $effect = { pre: (callback) => { cleanup = callback(); } };
+		const onMount = (callback) => { callback(); };
 		const readStoredDensity = () => 'comfortable';
-		const handleAuthTransition = () => {}, recordFindQuery = () => {};
-		const subscribeLocalAuthTransition = () => () => {}, handleLocalAuthTransition = () => {};
+		const handleAuthTransition = () => {}, recordFindQuery = () => routeCleanup.push('query');
+		const subscribeLocalAuthTransition = () => () => routeCleanup.push('local-auth'), handleLocalAuthTransition = () => {};
 		const clearSnapshot = () => {}, browserStorage = () => null, refresh = () => {};
-		const endTrackDrag = () => {}, document = { title: '' };
+		const endTrackDrag = () => routeCleanup.push('drag'), document = { title: '' };
 		let queueExportAuthGeneration = 0;
-		const favoritesExport = { destroy() {} }, refresher = { dispose() {} };
-		window.addEventListener = () => {}; window.removeEventListener = () => {};
+		const favoritesExport = { destroy: () => routeCleanup.push('export') };
+		const refresher = { dispose: () => routeCleanup.push('refresh') };
+		window.addEventListener = () => {};
+		window.removeEventListener = (type) => routeCleanup.push(type);
 		${compiled}
 		player.reconcileLibrary(items, () => true);
 		queueController.subscribe((value) => { queue = value; });
@@ -191,7 +200,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		return element = next;
 	};
 	return {
-		page, media, writes, location, track, element, capture, remount, clipboard,
+		page, media, writes, location, track, element, capture, remount, clipboard, routeCleanup,
 		observeClear: (callback: () => void) => { onClear = callback; },
 		observeInvalidateBrowseCopy: (callback: () => void) => { onInvalidateBrowseCopy = callback; }
 	};
@@ -885,6 +894,36 @@ test('a late rejection cannot report against a replacement attachment at the sam
 	expect(page.currentAudio()).toBe(replacement);
 	expect(page.nativeIntent().playing).toBe(true);
 	expect(page.read()).toEqual(before);
+});
+
+test('Library cleanup fences queue copy before pausing and disposes the route once', async () => {
+	const { page, element, track, clipboard, routeCleanup } = restartFixture();
+	page.replaceQueue(createQueue([{ ...track, artist: '' }]));
+	expect(readMiniPlayerHint()?.trackId).toBe(track.id);
+	let finish!: () => void;
+	const pending = new Promise<void>((resolve) => { finish = resolve; });
+	clipboard.writeText.mockReturnValue(pending);
+	const copies = [page.copyTrackLink(track.id), page.copyQueueLink(track.id)];
+	expect(clipboard.writeText).toHaveBeenCalledTimes(2);
+	const before = page.readCopy();
+	element.paused = false;
+	const pause = vi.spyOn(element, 'pause').mockImplementation(() => {
+		expect(routeCleanup).toEqual(['drag', 'share']);
+		expect(page.currentAudio()).toBeUndefined();
+		expect(readMiniPlayerHint()?.trackId).toBe(track.id);
+		page.cleanup();
+		page.detach();
+		element.paused = true;
+	});
+
+	page.cleanup();
+	page.cleanup();
+	finish();
+	await Promise.all(copies);
+	expect(pause).toHaveBeenCalledOnce();
+	expect(page.readCopy()).toEqual(before);
+	expect(readMiniPlayerHint()).toBeNull();
+	expect(routeCleanup).toEqual(['drag', 'share', 'export', 'refresh', 'hint', 'query', 'local-auth', 'storage', 'pagehide']);
 });
 
 test('route cleanup fences an explicit play waiting for tick', async () => {
