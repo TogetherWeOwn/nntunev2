@@ -58,7 +58,12 @@ class RequestContractTests(unittest.TestCase):
                 if post.slot not in (5, 6):
                     params["apiKey"] = [self.api_key]
                 self.assertEqual(
-                    parse_qs(post.body.decode("ascii"), strict_parsing=True), params
+                    parse_qs(
+                        post.body.decode("ascii"),
+                        keep_blank_values=True,
+                        strict_parsing=True,
+                    ),
+                    params,
                 )
 
     def test_missing_or_unsafe_credentials_and_changed_matrix_refuse(self):
@@ -125,6 +130,9 @@ class RequestContractTests(unittest.TestCase):
                     bad[i] = replacement
                     with self.assertRaisesRegex(runner["Stop"], "^response-mismatch$"):
                         classify(slot, *bad)
+                if retry is not None:
+                    with self.assertRaisesRegex(runner["Stop"], "^response-mismatch$"):
+                        classify(slot, *args[:-1], None)
         with self.assertRaisesRegex(runner["Stop"], "^body-limit$"):
             classify(
                 slots[23],
