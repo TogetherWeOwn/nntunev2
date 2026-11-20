@@ -341,6 +341,7 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		captureShareSeek,
 		clearShareSeek: pendingShare.clear,
 		get pendingShareSeek() { return pendingShare.current; },
+		get attachmentVersion() { return attachmentVersion; },
 		get audio() { return current?.audio; },
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement, observations?: NativeObservations): () => void {
