@@ -39,7 +39,9 @@ pub struct StagingDispatch {
 
 impl StagingDispatch {
     pub(crate) const FIXTURE_ORDER_WORK: OrderWork = OrderWork {
-        comparisons: 5, // Three artist and two track/release lookups; no sorting.
+        // Insertion-sort pairs and mapping lookups for at most four albums,
+        // one artist and 1,024 tracks (checked again by the snapshot builder).
+        comparisons: 532_000,
         artist_row_probes: 0,
     };
 }
@@ -284,18 +286,15 @@ mod wasm_test {
         request: web_sys::Request,
         open_app: js_sys::Function,
         allowed: bool,
-        small: bool,
+        fixture_id: Option<String>,
     ) -> Result<web_sys::Response, JsValue> {
         type NoMirror = fn() -> std::future::Ready<Result<Client, StagingRejection>>;
         let context = StagingDispatch {
             now_millis: 0,
             order_work: StagingDispatch::FIXTURE_ORDER_WORK,
         };
-        let fixture = if small {
-            SyntheticCatalogue::Small
-        } else {
-            SyntheticCatalogue::Empty
-        };
+        let fixture = SyntheticCatalogue::from_trusted_id(fixture_id.as_deref().unwrap_or("empty"))
+            .ok_or(JsValue::NULL)?;
         respond_staging(
             &request,
             context,
