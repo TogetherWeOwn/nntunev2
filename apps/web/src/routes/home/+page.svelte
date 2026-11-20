@@ -18,16 +18,18 @@
 	let loadError = $state<string | null>(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
+	let accessRefused = $state(false);
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache,
-		onStateChange: (state) => {
+		onStateChange: (state, update) => {
 			items = state.items;
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			requiresSignIn = state.requiresSignIn;
+			accessRefused = update.authBoundary === true && !state.requiresSignIn;
 		}
 	});
 
@@ -68,34 +70,41 @@
 <main class="nt-wrap" id="main-content">
 	<h1>Home</h1>
 
-	{#if loading}
-		<p role="status">Loading your library…</p>
-	{:else if requiresSignIn}
+	<section aria-labelledby="home-discovery-heading">
+		<h2 id="home-discovery-heading">Discover your library</h2>
 		<p>
-			Sign in to see your library. <a href="/login">Sign in</a>
+			This preview uses the same library catalogue as Search. It shows up to five tracks in
+			catalogue order. Your account listening history is not used to select or rank them.
 		</p>
-	{:else if loadError}
-		<div role="alert">
-			<p>Could not load your library: {loadError}</p>
+
+		{#if loading}
+			<p role="status">Loading your library…</p>
+		{:else if requiresSignIn}
+			<p>
+				Sign in to see your library. <a href="/login">Sign in</a>
+			</p>
+		{:else if accessRefused}
+			<p role="alert">You do not have access to this library.</p>
+		{:else if loadError}
+			<div role="alert">Could not load your library: {loadError}</div>
 			<button type="button" onclick={() => refresher.refresh()}>Retry</button>
-		</div>
-	{:else if libraryUnavailable}
-		<p>Your library is not available yet.</p>
-	{:else if items.length === 0}
-		<p>
-			Your library is empty. <a href="/library">Open Your Library</a> to add tracks.
-		</p>
-	{:else}
-		<section aria-labelledby="home-library-heading">
-			<h2 id="home-library-heading">From your library ({items.length})</h2>
+		{:else if libraryUnavailable}
+			<p>Your library is not available yet.</p>
+		{:else if items.length === 0}
+			<p>
+				Your library is empty. <a href="/library">Open Your Library</a> to add tracks.
+			</p>
+		{:else}
+			<h3>From your library ({items.length})</h3>
 			<ul>
 				{#each preview as item (libraryItemKey(item))}
 					<li>{displayTitle(item)}{displayArtist(item) ? ` — ${displayArtist(item)}` : ''}</li>
 				{/each}
 			</ul>
 			<p><a href="/library">Open Your Library</a></p>
-		</section>
-	{/if}
+			<p><a href="/search">Search your library</a></p>
+		{/if}
+	</section>
 
 	{#if liked.length > 0}
 		<section aria-labelledby="home-liked-heading">
