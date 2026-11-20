@@ -58,7 +58,9 @@ export async function setTrackLike(
 	const receipt = record(liked ? await client.put<unknown>(path, {}) : await client.delete<unknown>(path));
 	if (!isTrackId(receipt.target_id) ||
 		(receipt.target_id !== id && (!RELEASE_ID.test(receipt.target_id) || receipt.target_id !== id.toLowerCase())) ||
-		(liked ? !isCount(receipt.liked_at) : receipt.liked !== false)) {
+		(liked
+			? !isCount(receipt.liked_at) || receipt.liked !== undefined
+			: receipt.liked !== false || receipt.liked_at !== undefined)) {
 		throw new Error('Invalid like confirmation');
 	}
 	return receipt.target_id;
