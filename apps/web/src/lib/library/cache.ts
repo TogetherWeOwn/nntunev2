@@ -245,7 +245,6 @@ export function broadcastAuthTransition(storage: SnapshotStorage | null): void {
 	}
 }
 
-/** The storage key is also the lock name for every coordinated scoped mutation. */
 export async function withFavoritesLock<T>(key: string, run: () => T | Promise<T>, unavailable?: () => void): Promise<T | null> {
 	try {
 		const locks = globalThis.navigator?.locks;
@@ -276,6 +275,10 @@ export function resumeFavoritesPurges(): void {
 	}
 }
 
+/**
+ * Drop legacy favorites and recent finds at the auth boundary; values are
+ * removed, never parsed, so a corrupt value is cleared without error.
+ */
 function clearFavoritesKeys(storage: SnapshotStorage | null, context: string | null): void {
 	if (!storage) return;
 	try {
@@ -312,12 +315,7 @@ export async function invalidateLibraryCache(): Promise<void> {
 	const purge = context && local ? purgeFavorites(session, local, `${LIBRARY_FAVORITES_KEY}.${context}`) : null;
 	clearUsageWarnings();
 	broadcastAuthTransition(local);
-	if (!purge) return;
-	// The next document resumes the purge if contention outlasts this budget.
-	await new Promise<void>((resolve) => {
-		const timer = setTimeout(resolve, 500);
-		void purge.then(() => { clearTimeout(timer); resolve(); });
-	});
+	if (purge) await Promise.race([purge, new Promise<void>((resolve) => setTimeout(resolve, 500))]);
 }
 
 /**

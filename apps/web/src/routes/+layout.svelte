@@ -352,10 +352,7 @@
 			try {
 				await client.logout();
 			} catch (error) {
-				if (!(error instanceof ApiError) || error.status !== 401) {
-					pushToast('Could not sign out. Please try again.');
-					return;
-				}
+				if (!(error instanceof ApiError) || error.status !== 401) throw error;
 				// A 401 means the session is already gone: cross the boundary
 				// exactly like a successful sign-out.
 			}

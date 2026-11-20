@@ -164,6 +164,7 @@
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
 	let favoriteEdit = 0;
+	let favoriteVisitOnly = false;
 	let favoritesAnnouncement = $state('');
 	// One shared polite outcome for order, view and clear actions: a new
 	// outcome replaces the previous text (keyed re-announce), never queues.
@@ -390,6 +391,7 @@
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
 				if (!favoritesInitialized) {
+					favoriteVisitOnly = false;
 					favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 					favoritesInitialized = true;
 				}
@@ -799,7 +801,11 @@
 			base = latest;
 			return update(latest);
 		}).then((committed) => {
-			if (edit !== favoriteEdit || favoritesKey(session) !== key) return;
+			if (favoritesKey(session) !== key) return;
+			// A durable no-op does not prove writes recovered.
+			if (favoriteVisitOnly && JSON.stringify(base) === JSON.stringify(committed)) committed = null;
+			favoriteVisitOnly = !committed;
+			if (edit !== favoriteEdit) return;
 			if (committed) favorites = committed;
 			applied?.(committed ? base : before, committed ?? optimistic);
 		});
@@ -867,7 +873,10 @@
 	 * Move a visible favorite one slot up or down within the complete
 	 * stored order. No-ops (boundary activation, stale id) return the same
 	 * array and change nothing: no save, no announcement, no focus shift.
-	 * Apply the move to the latest durable order without adding missing IDs.
+	 * Real moves use the latest durable order, announce
+	 * the new visible position politely, and keep keyboard focus on the
+	 * moved track's controls. Never touches the queue, the library view,
+	 * stars, refresh or the network.
 	 */
 	async function moveFavorite(
 		id: string,
@@ -990,7 +999,8 @@
 	}
 
 	/**
-	 * Shelf unstar: remove one ID, leaving all other IDs untouched.
+	 * Shelf unstar: remove one id from the full visit state (hidden ids ride
+	 * along untouched) and remove that same id from durable storage.
 	 * Queue, ordering and refresh are untouched. Focus moves to the next
 	 * surviving shelf unstar control, or the shelf heading when none remains.
 	 */
@@ -1020,7 +1030,10 @@
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
 	}
 
-	/** Confirmed clear removes every ID in the current scope. */
+	/**
+	 * Confirmed clear removes every ID in the current scope. Never touches
+	 * the auth context, other accounts, the queue or the network.
+	 */
 	function confirmClearFavorites(): void {
 		editFavorites(() => []);
 		favoritesAnnouncement = '';

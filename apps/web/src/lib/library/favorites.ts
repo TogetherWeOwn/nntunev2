@@ -78,9 +78,7 @@ export async function updateStoredFavorites(
 	if (!local || !key || favoritesKey(session) !== key) return null;
 	return withFavoritesLock(key, async () => {
 		if (favoritesKey(session) !== key) return null;
-		if (verify && !(await verify())) return null;
-		if (favoritesKey(session) !== key) return null;
-
+		if (verify && (!(await verify()) || favoritesKey(session) !== key)) return null;
 		const raw = local.getItem(key);
 		const parsed: unknown = raw === null ? [] : JSON.parse(raw);
 		if (!Array.isArray(parsed) || !parsed.every(isStoredId)) return null;
@@ -137,11 +135,10 @@ export async function clearFavoritesAtAuthBoundary(
 ): Promise<void> {
 	if (!local) return;
 	const key = favoritesKey(session);
-	const purge = key ? purgeFavorites(session, local, key) : undefined;
 	try {
 		local.removeItem(LIBRARY_FAVORITES_KEY);
 	} catch {
 		// Best effort; a key without its auth context is never read.
 	}
-	await purge;
+	if (key) await purgeFavorites(session, local, key);
 }

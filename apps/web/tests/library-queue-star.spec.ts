@@ -396,9 +396,7 @@ test('[QSTAR-06] corrupt favorites storage falls back to unstarred without break
 	await toggle.click();
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
-	expect(storedIds(await readFavoritesRaw(page, await readAuthContext(page)))).toEqual([
-		'qstar-mike'
-	]);
+	expect(await readFavoritesRaw(page, await readAuthContext(page))).toBe('{not-json');
 });
 
 test('[QSTAR-07] Enter and Space toggle a focused queue star button', async ({ page }) => {

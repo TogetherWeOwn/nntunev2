@@ -73,6 +73,7 @@ describe('coordinated favorites mutations', () => {
 		const { session, local, key } = fixture();
 		local.setItem(key, '["retired","keep"]');
 		const getItem = vi.fn(local.getItem);
+		expect(await updateStoredFavorites(session, { ...local, getItem }, key, () => [], async () => false)).toBeNull();
 		const verification = Promise.withResolvers<boolean>();
 		const retirement = updateStoredFavorites(session, { ...local, getItem }, key,
 			(ids) => ids.filter((id) => id !== 'retired'), () => verification.promise);
@@ -96,10 +97,13 @@ describe('coordinated favorites mutations', () => {
 		const purge = clearFavoritesAtAuthBoundary(session, local);
 		clearSnapshot(session);
 		expect(local.getItem(key)).toBe('["old"]');
+		session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'next-account');
+		expect(await updateStoredFavorites(session, local, favoritesKey(session), () => ['new'])).toEqual(['new']);
 		verification.resolve(true);
 		expect(await holding).toBeNull();
 		await purge;
 		expect(local.getItem(key)).toBeNull();
+		expect(loadFavorites(session, local)).toEqual(['new']);
 	});
 
 	it('leaves malformed and unreadable storage untouched while keeping reads permissive', async () => {

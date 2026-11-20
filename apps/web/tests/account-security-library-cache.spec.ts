@@ -150,6 +150,7 @@ test('successful local logout invalidates library snapshots across tabs before r
 	await openLibraryTab(page);
 	const securityTab = await openSecurityTab(page);
 	const logoutPosts = await mockSessionEndpoint(securityTab, 'logout', 200);
+	await securityTab.route('**/v1/session/logout', (route) => route.fulfill({ status: 503 }), { times: 1 });
 
 	await securityTab.goto('/account/security');
 	await seedActingTabSnapshot(securityTab);
@@ -161,7 +162,13 @@ test('successful local logout invalidates library snapshots across tabs before r
 			ready();
 		}));
 	}), favorites);
-	await securityTab.getByRole('button', { name: /^sign out$/i }).click();
+	const account = securityTab.getByRole('button', { name: 'Account menu' });
+	const signOut = securityTab.getByRole('menuitem', { name: 'Sign out' });
+	await account.click();
+	await signOut.click();
+	await expect(securityTab.getByTestId('toast')).toContainText('Could not sign out');
+	await account.click();
+	await signOut.click();
 
 	await securityTab.waitForURL('**/login');
 	// The redirect is bounded even while the other tab still holds the lock.

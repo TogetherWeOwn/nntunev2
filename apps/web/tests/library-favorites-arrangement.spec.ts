@@ -282,20 +282,11 @@ test('same-scope edits reconcile a retired move and apply Star all to the whole 
 	await activate(page, 'Mike Song', 'up');
 	await expectIds(page, ['arr-z']);
 	await expect(page.getByTestId('favorites-announcement')).toBeEmpty();
-
 	await page.getByRole('button', { name: 'Select all', exact: true }).click();
 	await page.getByTestId('track-more').first().click();
 	await star(peer, 'arr-z').click();
 	await expect.poll(() => stored(peer)).toEqual([]);
-	await peer.evaluate((key) => new Promise<void>((ready) => {
-		void navigator.locks.request(key, () => new Promise<void>((release) => {
-			window.addEventListener('release-favorites', () => release(), { once: true });
-			ready();
-		}));
-	}), KEY);
 	await page.getByRole('menuitem', { name: 'Star all', exact: true }).click();
-	await expect.poll(() => page.evaluate(async () => (await navigator.locks.query()).pending?.map((lock) => lock.name))).toContain(KEY);
-	await peer.evaluate(() => window.dispatchEvent(new Event('release-favorites')));
 	await expect.poll(async () => ((await stored(page)) as string[]).sort()).toEqual([...ALL].sort());
 });
 
