@@ -79,6 +79,28 @@ export function saveFavorites(
 	}
 }
 
+/** Retire only confirmed IDs from the still-active scope, never from a memory fallback. */
+export function retireStoredFavorites(
+	session: SnapshotStorage | null,
+	local: SnapshotStorage | null,
+	key: string,
+	ids: readonly string[]
+): boolean {
+	if (!local || favoritesKey(session) !== key) return false;
+	try {
+		const raw = local.getItem(key);
+		if (raw === null) return true;
+		const stored: unknown = JSON.parse(raw);
+		if (!Array.isArray(stored) || favoritesKey(session) !== key) return false;
+		const confirmed = new Set<unknown>(ids);
+		const remaining = stored.filter((id: unknown) => !confirmed.has(id));
+		if (remaining.length !== stored.length) local.setItem(key, JSON.stringify(remaining));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Project the loaded rows to the starred subset for the transient
  * Favorites-only view. Pure: matches by stable id against the already

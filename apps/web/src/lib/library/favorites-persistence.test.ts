@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { LIBRARY_AUTH_CONTEXT_KEY, type SnapshotStorage } from './cache.js';
-import { favoritesKey, loadFavorites, saveFavorites } from './favorites.js';
+import { favoritesKey, loadFavorites, retireStoredFavorites, saveFavorites } from './favorites.js';
 
 function memoryStorage(): SnapshotStorage {
 	const map = new Map<string, string>();
@@ -41,6 +41,30 @@ describe('favorites persistence feedback', () => {
 		expect(loadFavorites(session, unreadable, fallback)).toEqual(fallback);
 		expect(loadFavorites(session, unreadable, fallback)).not.toBe(fallback);
 		expect(loadFavorites(session, null, fallback)).toEqual(fallback);
+	});
+
+	it('retires only exact confirmed IDs against the latest storage in the same scope', () => {
+		const { session, local, key } = fixture();
+		saveFavorites(session, local, ['A', 'a', 'added-in-another-tab']);
+		expect(retireStoredFavorites(session, local, key, ['A'])).toBe(true);
+		expect(loadFavorites(session, local)).toEqual(['a', 'added-in-another-tab']);
+
+		session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'another-context');
+		saveFavorites(session, local, ['a']);
+		expect(retireStoredFavorites(session, local, key, ['a'])).toBe(false);
+		expect(loadFavorites(session, local)).toEqual(['a']);
+		expect(local.getItem(key)).toBe('["a","added-in-another-tab"]');
+	});
+
+	it('does not rewrite unreadable or malformed storage during retirement', () => {
+		const { session, local, key } = fixture();
+		local.setItem(key, '["A","B"]');
+		const unreadable = { ...local, getItem: () => { throw new Error('denied'); } };
+		expect(retireStoredFavorites(session, unreadable, key, ['A'])).toBe(false);
+		expect(local.getItem(key)).toBe('["A","B"]');
+		local.setItem(key, '{}');
+		expect(retireStoredFavorites(session, local, key, ['A'])).toBe(false);
+		expect(local.getItem(key)).toBe('{}');
 	});
 
 	it('respects legitimate empty, missing and corrupt stored lists instead of memory', () => {
