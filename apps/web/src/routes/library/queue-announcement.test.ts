@@ -136,6 +136,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		onMount: () => {},
 		shortTitle,
 		tick: () => Promise.resolve(),
+		$props: () => ({}),
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
 	};

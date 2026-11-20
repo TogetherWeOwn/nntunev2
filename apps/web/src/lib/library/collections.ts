@@ -19,9 +19,7 @@ function parseCollections(value: unknown, kind: Collection['kind']): Collection[
 		if (typeof entry !== 'object' || entry === null) throw new Error('Invalid catalogue row');
 		const { mbid, title, name, artist, art_url } = entry as Record<string, unknown>;
 		const label = kind === 'Album' ? title : name;
-		if (typeof mbid !== 'string' || !MBID.test(mbid) || typeof label !== 'string' || !label.trim()) {
-			throw new Error('Invalid catalogue row');
-		}
+		if (typeof mbid !== 'string' || !MBID.test(mbid) || typeof label !== 'string' || !label.trim()) throw new Error('Invalid catalogue row');
 		const id = mbid.toLowerCase();
 		if (seen.has(id)) throw new Error('Duplicate catalogue row');
 		seen.add(id);

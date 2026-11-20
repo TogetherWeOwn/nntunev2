@@ -72,6 +72,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		afterNavigate: () => {},
 		shortTitle,
 		tick,
+		$props: () => ({}),
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
 	};
