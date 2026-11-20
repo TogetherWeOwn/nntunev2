@@ -52,6 +52,10 @@ count starts, schedule pairs, provision the auth binding or authorize live use.
 
 Run `python3 -I scripts/subsonic-staging-runner.py --simulate` offline. This
 uses no credentials or network and supplies no evidence about live staging.
+The offline request-contract tests also check the exact staging POST target,
+form-body credential placement, and fixed application rejections. They use
+synthetic credentials and do not exercise live transport or attribute a pair
+response to permit contention.
 
 ### Read-only staging observer smoke
 

@@ -4,12 +4,30 @@
 import argparse
 import hashlib
 import json
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlencode
 
 MATRIX = Path(__file__).resolve().parents[1] / "fixtures/subsonic/staging/matrix.json"
 MATRIX_DIGEST = "18a076d2fc86f2a7dadf5efd2e1a1200c741b821379afeb158c4dac06ce80abb"
 MATRIX_LIMIT = 32 * 1024
+STAGING_ORIGIN = "https://staging.nntune.com"
+FORM_LIMIT = 8 * 1024
+REJECTION_LIMIT = 1024
 TICK_MS = 50
+
+REJECTION_ORACLES = {
+    "fixed_staging_off": (404, "xml", 70, "Endpoint not supported in staging.", None),
+    "fixed_capacity_json": (503, "json", 0, "Service unavailable.", "1"),
+    "fixed_oversize_no_callback": (
+        413,
+        None,
+        0,
+        "Request or document too large.",
+        None,
+    ),
+}
 
 
 class Stop(Exception):
@@ -38,6 +56,86 @@ def load_matrix(path):
         raise Stop("unreviewed-matrix") from None
     require(hashlib.sha256(encoded).hexdigest() == MATRIX_DIGEST, "unreviewed-matrix")
     return matrix
+
+
+@dataclass(frozen=True)
+class PreparedPost:
+    slot: int
+    url: str
+    headers: tuple[tuple[str, str], ...] = field(repr=False)
+    body: bytes = field(repr=False)
+    method: str = field(default="POST", init=False)
+
+
+def prepare_requests(path, bearer, api_key):
+    """Build unsent POSTs from only the reviewed schedule, with no live CLI."""
+    matrix = load_matrix(path)
+    require(
+        isinstance(bearer, str) and re.fullmatch(r"[!-~]{1,1024}", bearer),
+        "credential-shape",
+    )
+    require(
+        isinstance(api_key, str) and re.fullmatch(r"[!-~]{32,512}", api_key),
+        "credential-shape",
+    )
+    return (_prepare_post(slot, bearer, api_key) for slot in matrix["slots"])
+
+
+def _prepare_post(slot, bearer, api_key):
+    auth = slot.get("auth")
+    params = dict(slot["params"])
+    if auth is None:
+        params["apiKey"] = api_key
+    body = urlencode(params).encode("ascii")
+    require(len(body) <= FORM_LIMIT, "form-limit")
+    headers = (
+        ("Content-Type", "application/x-www-form-urlencoded"),
+        ("Accept-Encoding", "identity"),
+        ("X-Subsonic-Measurement-Case", slot["case"]),
+    )
+    if auth != "omit_both":
+        headers += (("Authorization", f"Bearer {bearer}"),)
+    return PreparedPost(
+        slot["slot"], f"{STAGING_ORIGIN}/rest/{slot['endpoint']}", headers, body
+    )
+
+
+def classify_fixed_rejection(
+    slot, status, body, content_type, cache_control, retry_after
+):
+    """Accept only the application's pinned rejection, not a proxy status or pair outcome."""
+    expected = slot["expected"]
+    oracle = expected["oracle"]
+    require(oracle in REJECTION_ORACLES, "response-mismatch")
+    wanted_status, fmt, code, message, wanted_retry = REJECTION_ORACLES[oracle]
+    if fmt is None:
+        # An over-cap JSONP response must be plain JSON, with no callback.
+        fmt = "json" if slot["params"].get("f") in ("json", "jsonp") else "xml"
+    if fmt == "json":
+        payload = {
+            "subsonic-response": {
+                "status": "failed",
+                "version": "1.16.1",
+                "error": {"code": code, "message": message},
+            }
+        }
+        wanted_body = json.dumps(payload, separators=(",", ":")).encode("ascii")
+    else:
+        wanted_body = (
+            f'<subsonic-response status="failed" version="1.16.1">'
+            f'<error code="{code}" message="{message}"/></subsonic-response>'
+        ).encode("ascii")
+    require(len(body) <= REJECTION_LIMIT, "body-limit")
+    require(
+        status == wanted_status == expected["http_status"]
+        and content_type == f"application/{fmt}"
+        and cache_control == "private, no-store"
+        and retry_after == wanted_retry
+        and body == wanted_body
+        and len(body) == expected.get("body_bytes", len(wanted_body)),
+        "response-mismatch",
+    )
+    return {"oracle": oracle, "http_status": status, "body_bytes": len(body)}
 
 
 class StagingModel:
