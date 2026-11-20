@@ -4,20 +4,18 @@ name: codeql
 # Rust coverage comes from cargo audit/clippy jobs the scaffold card adds.
 # Feeds the `CodeQL` code_scanning rule on main.
 
-# Web code lives in apps/web: run when JS/TS or workflow files change, so
-# docs/Rust-only PRs do not burn a needless scan. The code_scanning ruleset
-# rule follows once scans pass on real code.
+# No path filters: the `baseline-codeql` ruleset requires CodeQL results on
+# every PR once main has analyses, so a filtered-out PR (Rust or docs only)
+# waits forever for results that never arrive. Every PR and every main push
+# is scanned so the rule always has a result to compare.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'apps/web/**', '.github/workflows/**']
-  # Merge queue validation: report on merge_group now so a future
-  # code_scanning required rule never stalls the queue. Path filtering still
-  # applies to the queue's merge diff.
+  # Merge queue validation: report on merge_group so the code_scanning rule
+  # never stalls the queue.
   merge_group:
   push:
     branches: [main]
-    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'apps/web/**', '.github/workflows/**']
   schedule:
     - cron: '23 3 * * 1'
 
@@ -48,10 +46,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}
 
-      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: "/language:${{ matrix.language }}"

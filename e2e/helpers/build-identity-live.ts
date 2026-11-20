@@ -74,6 +74,18 @@ export async function assertServingBuildMatchesPromotion(
       `head=${expected}`,
   );
   if (verdict.sameBuild) {
+    // Whitelisted, non-secret live observations for the staging receipt. Never
+    // emit an equal-identity certificate for skipped/unconfigured API deploys.
+    test.info().annotations.push({
+      type: 'candidate-identity',
+      description: JSON.stringify({
+        phase: context,
+        web: deployed,
+        api: verdict.apiSha,
+        expected,
+        observed_at: new Date().toISOString(),
+      }),
+    });
     console.log(`[${context}] build identity: web = API = head = ${expected}`);
   } else {
     console.log(`[${context}] build identity: ${verdict.note}`);

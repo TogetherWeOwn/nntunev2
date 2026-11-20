@@ -1,5 +1,6 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import ts from 'typescript';
+import { createM3UDownload, m3uDownloadFailure } from './m3uDownload.js';
 import { createQueue, formatQueueM3U, formatQueueText } from './queue.js';
 
 const sources = import.meta.glob('./QueueExport.svelte', {
@@ -24,7 +25,7 @@ function component() {
 	const effects: (() => void)[] = [];
 	let destroy = () => {};
 	const bindings = {
-		formatQueueM3U, formatQueueText,
+		formatQueueM3U, formatQueueText, createM3UDownload, m3uDownloadFailure,
 		$props: () => ({ queue: QUEUE, authGeneration: 0, loading: false }),
 		$state: <T>(value: T) => value,
 		$effect: (effect: () => void) => effects.push(effect),
@@ -173,4 +174,57 @@ test('failed download initiation releases the URL and removes its temporary link
 	expect(io.links[0].remove).toHaveBeenCalledOnce();
 	expect(exportUI.read().status).toMatch(/could not start/i);
 	expect(exportUI.read().status).not.toMatch(/download started|saved|copied/i);
+});
+
+
+test('link creation failure escapes without releasing the preceding URL or publishing refusal', () => {
+	const io = browser();
+	const exportUI = component();
+	exportUI.downloadQueueM3U();
+	const error = new Error('No DOM');
+	vi.spyOn(document, 'createElement').mockImplementation(() => { throw error; });
+	expect(() => exportUI.downloadQueueM3U()).toThrow(error);
+	expect(exportUI.read()).toEqual({ status: '', fallback: null });
+	expect([...io.active]).toEqual(['blob:queue-1']);
+	expect(io.released).toEqual([]);
+	expect(io.links).toHaveLength(1);
+	expect(io.links[0].remove).toHaveBeenCalledOnce();
+	exportUI.destroy();
+	expect(io.active.size).toBe(0);
+});
+
+for (const phase of ['append', 'click', 'remove'] as const) {
+	test(`${phase} failure preserves caller feedback, cleanup and escape boundaries`, () => {
+		const io = browser();
+		const exportUI = component();
+		const error = new Error(phase);
+		const link = { href: '', download: '', hidden: false, click: vi.fn(), remove: vi.fn() };
+		vi.spyOn(document, 'createElement').mockReturnValue(link as unknown as HTMLAnchorElement);
+		if (phase === 'append') vi.mocked(document.body.append).mockImplementation(() => { throw error; });
+		else link[phase].mockImplementation(() => { throw error; });
+		if (phase === 'remove') expect(() => exportUI.downloadQueueM3U()).toThrow(error);
+		else expect(() => exportUI.downloadQueueM3U()).not.toThrow();
+		expect(link.remove).toHaveBeenCalledOnce();
+		expect(exportUI.read().status).toBe(phase === 'remove'
+			? 'Download started. Check your browser’s downloads for queue.m3u.'
+			: 'Could not start the download. Try again or copy the queue as text.');
+		expect([...io.active]).toEqual(phase === 'remove' ? ['blob:queue-1'] : []);
+		exportUI.destroy();
+		expect(io.active.size).toBe(0);
+	});
+}
+
+test('removal failure after append refusal escapes after failure feedback and URL cleanup', () => {
+	const io = browser();
+	const exportUI = component();
+	const error = new Error('Cannot remove');
+	const link = { href: '', download: '', hidden: false, click: vi.fn(), remove: vi.fn(() => { throw error; }) };
+	vi.spyOn(document, 'createElement').mockReturnValue(link as unknown as HTMLAnchorElement);
+	vi.mocked(document.body.append).mockImplementation(() => { throw new Error('Blocked'); });
+	expect(() => exportUI.downloadQueueM3U()).toThrow(error);
+	expect(exportUI.read().status).toBe('Could not start the download. Try again or copy the queue as text.');
+	expect(io.active.size).toBe(0);
+	expect(link.click).not.toHaveBeenCalled();
+	expect(link.remove).toHaveBeenCalledOnce();
+	exportUI.destroy();
 });

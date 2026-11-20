@@ -122,7 +122,14 @@ feature — never as an audio source.
   `/youtubei/`, yt-dlp and equivalents are banned by
   `clean_room_lint.py`).
 - No caching or offline copies of YouTube content.
-- The embed must work on the free plan; never charge for watching it.
+- Never charge separately for watching the embed, upsell it, or gate
+  it beyond access to the service itself (no step past the play
+  click except login/age checks, no rewards for watching). There is
+  no free plan at launch (ADR 0004), so ADR 0012 §YouTubeEmbedSource
+  restates III.F.3.a for an invite-only, subscription-gated service.
+  Whether that reading satisfies III.F.3.a is a launch-gate legal
+  item, not a settled permission; do not add a free-plan embed path
+  or claim the item resolved without a product/legal decision.
 - Never call `search.list` at play time. Resolve video IDs ahead of
   time and validate them in `videos.list` batches. Storing video IDs
   is fine; any other stored API metadata is refreshed or deleted

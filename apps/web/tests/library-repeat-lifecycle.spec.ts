@@ -153,6 +153,73 @@ async function expectNoErrors(page: Page, errors: string[]) {
 		'No unhandled rejection from asynchronous playback').toEqual([]);
 }
 
+test('a same-flush queue source round trip replaces the rendered audio host', async ({ page }) => {
+	await openLibrary(page);
+	const region = page.getByRole('region', { name: 'Player', exact: true });
+	const audio = page.locator('audio');
+	await expect(region).toHaveCount(0);
+	await expect(audio).toHaveCount(0);
+	await enqueue(page, ['lib-coral', 'lib-pine']);
+	await expect(audio).toHaveCount(1);
+	await playCurrent(page);
+	const player = region.getByTestId('audio-player').and(audio);
+	await expect(player).toHaveAttribute('src', ITEMS[0].streamUrl);
+	const oldAudio = (await player.elementHandle())!;
+	const coral = await page.getByRole('button', { name: 'Select Coral Night', exact: true }).elementHandle();
+	const pine = await page.getByRole('button', { name: 'Select Pine Morning', exact: true }).elementHandle();
+
+	// Both real queue events run on one JS stack, with no render between them.
+	expect(await oldAudio.evaluate((node, { coral, pine }) => {
+		pine!.click();
+		coral!.click();
+		return { connected: node.isConnected, paused: (node as HTMLAudioElement).paused };
+	}, { coral, pine })).toEqual({ connected: true, paused: true });
+	await expect.poll(() => oldAudio.evaluate((node) => node.isConnected)).toBe(false);
+	await expect(audio).toHaveCount(1);
+	await expect(player).toHaveCount(1);
+	await expect(player).toHaveAttribute('src', ITEMS[0].streamUrl);
+	await expect(player).toHaveJSProperty('controls', true);
+	await expect(player).toHaveJSProperty('autoplay', false);
+	await expect(region.getByTestId('library-now-playing')).toHaveText('Coral Night — Mira');
+
+	// Route-owned Play now must find the replacement through the attachment.
+	await page.getByTestId('queue-item').getByRole('button', { name: 'More actions for Coral Night', exact: true }).click();
+	await page.getByRole('menuitem', { name: 'Play now', exact: true }).click();
+	await expect(player).toHaveJSProperty('paused', false);
+	expect(await plays(page)).toHaveLength(2);
+});
+
+test('same-source Library refresh and reorder preserve the native element and its position', async ({ page }) => {
+	await openLibrary(page);
+	await enqueue(page, ['lib-coral', 'lib-pine']);
+	await playCurrent(page);
+	const player = page.getByTestId('audio-player');
+	const original = (await player.elementHandle())!;
+	await original.evaluate((node) => {
+		Object.defineProperty(node, 'currentTime', { value: 37, writable: true, configurable: true });
+	});
+	const nativeState = () => original.evaluate((node) => ({
+		current: node === document.querySelector('[data-testid="audio-player"]'),
+		time: (node as HTMLAudioElement).currentTime,
+		paused: (node as HTMLAudioElement).paused
+	}));
+	// A title change proves the snapshot rendered without changing the queued sources.
+	const refreshedTitle = 'Coral Night (Remastered)';
+	await page.route('**/api/library', (route) =>
+		route.fulfill({ json: [{ ...ITEMS[0], title: refreshedTitle }, ...ITEMS.slice(1)] })
+	);
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByTestId('library-item').filter({ hasText: refreshedTitle })).toBeVisible();
+	expect(await nativeState()).toEqual({ current: true, time: 37, paused: false });
+
+	await page.getByRole('button', { name: 'Move Pine Morning up', exact: true }).click();
+	expect(await queueOrder(page)).toEqual(['lib-pine', 'lib-coral']);
+	await expect(player).toHaveCount(1);
+	await expect(player).toHaveAttribute('src', ITEMS[0].streamUrl);
+	expect(await nativeState()).toEqual({ current: true, time: 37, paused: false });
+	expect(await plays(page)).toHaveLength(1);
+});
+
 test('pending automatic play is silent and auth teardown pauses its connected native audio', async ({ page }) => {
 	const errors: string[] = [];
 	page.on('pageerror', (error) => errors.push(error.message));

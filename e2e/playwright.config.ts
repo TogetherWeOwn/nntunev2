@@ -32,7 +32,7 @@ export default defineConfig({
   // secrets inside failure messages (e.g. toHaveValue Received strings), so
   // the workflow scrubs secret values from test-results/ before uploading.
   reporter: process.env.CI
-    ? [['list'], ['junit', { outputFile: 'test-results/junit.xml' }]]
+    ? [['list'], ['junit', { outputFile: 'test-results/junit.xml', includeRetries: true }]]
     : [['list']],
   use: {
     baseURL,

@@ -2,14 +2,18 @@
 
 Serverless music streaming on Cloudflare, from a shared curated catalogue.
 
+Read the [roadmap](ROADMAP.md) for product direction, boundaries and conditional
+future intentions. It is not a feature-availability or delivery-status tracker.
+
 ## Vision
 
 Users do **not** bring a Usenet provider or NZBs. NNTune serves one shared,
-admin-curated catalogue: playback is fetched through service-owned backend
-provider accounts (ADR 0014), and tracks proven popular by real plays are
-served from a shared R2 popularity cache (ADR 0013). We provide the music
-experience on top: search, streaming and library management. There are no
-user provider accounts to connect and no offline downloads.
+admin-curated catalogue. The approved storage direction is a plain S3 client:
+media comes from a configured S3-compatible provider, which owns storage-side
+accounts, encryption, caching and repair ([ADR 0015](docs/adr/0015-standard-s3-storage-boundary.md)).
+The existing NNTP implementation has not yet migrated. We provide search,
+streaming and library management; there are no user provider accounts to
+connect and no offline downloads.
 
 ## Plans
 
@@ -22,7 +26,7 @@ metering primitives below are built to support them from day one.
 | Concern | Choice |
 |---|---|
 | Backend | **Rust** (`workers-rs` → `wasm32`) for backend Workers, including Durable Objects; the staging Tail alert Worker (`workers/observability`) is JavaScript |
-| Shared core | `crates/nntune-core`: NNTP client, SIMD yEnc, NZB parsing, decrypt, par2-verify — compiled to `wasm32` **and** native |
+| Shared core | `crates/nntune-core`: transitional NNTP re-export shim for [velmora](https://github.com/TogetherWeOwn/velmora), currently pinned by git `rev`. Remove the shim only after its last caller is gone; the approved target ([ADR 0015](docs/adr/0015-standard-s3-storage-boundary.md)) is a plain standard S3 client, not yet migrated |
 | Frontend | **SvelteKit** on Cloudflare (`adapter-cloudflare`) |
 | Relational data | **PlanetScale Postgres via Cloudflare Hyperdrive** for ALL relational data, including our own MusicBrainz mirror |
 | Object cache | **R2** for audio / artwork cache |
@@ -30,7 +34,7 @@ metering primitives below are built to support them from day one.
 | Config | **KV** |
 | Usage enforcement (designed) | **Postgres** daily flow ledger and live cache-grant gauge; pool Durable Object leases for concurrency (`docs/adr/0009-stack.md:30`, pool semantics in `docs/adr/0004-plan-matrix.md`) |
 | Observability | **Analytics Engine**, sampled telemetry only — never a billing/cap authority (`docs/adr/0009-stack.md:31`) |
-| Batch only | **Containers** — MusicBrainz import, par2 repair (everything interactive stays serverless) |
+| Batch only | **Containers** — par2 repair (everything interactive stays serverless); MusicBrainz import instead follows the [2026-11-07 no-Containers amendment](docs/adr/0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement), with import/activation still gated |
 
 This is the accepted design (`docs/adr/0009-stack.md:3`), not deployed
 billing evidence: plan prices are launch proposals, not permission to
@@ -39,7 +43,7 @@ subscription mechanism lives in `docs/adr/0005-billing.md`; no vendor is
 chosen or changed here.
 
 ```text
-crates/nntune-core   # NNTP client, SIMD yEnc, NZB, decrypt, par2-verify (wasm32 + native)
+crates/nntune-core   # velmora engine re-export (NNTP, yEnc, NZB, decrypt, par2) + transcode (wasm32 + native)
 workers/             # Rust workers-rs backends incl. Durable Objects
 apps/web/            # SvelteKit frontend (adapter-cloudflare)
 ```

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
 	decodeBase64Url,
@@ -8,6 +8,8 @@ import {
 	toRegistrationOptions,
 	toRequestOptions
 } from './webauthn.js';
+
+afterEach(() => vi.restoreAllMocks());
 
 describe('decodeBase64Url', () => {
 	it('decodes unpadded base64url to raw bytes', () => {
@@ -90,12 +92,14 @@ describe('WebAuthn options', () => {
 		// The Worker returns only {challenge, user_id, rp_id}; the client
 		// assembles the rest (algorithms the server verifies, none
 		// attestation, resident key required).
-		const options = toRegistrationOptions('AQID', 'BAUG', 'example.com', 'ada@example.com');
+		const handle = new Uint8Array(32).fill(7);
+		vi.spyOn(crypto, 'getRandomValues').mockReturnValue(handle);
+		const options = toRegistrationOptions('AQID', 'example.com', 'ada@example.com');
 
 		expect(options.challenge).toBe('AQID');
 		expect(options.rp).toEqual({ name: 'NNTune', id: 'example.com' });
 		expect(options.user).toEqual({
-			id: 'BAUG',
+			id: encodeBase64Url(handle),
 			name: 'ada@example.com',
 			displayName: 'ada@example.com'
 		});
@@ -109,13 +113,41 @@ describe('WebAuthn options', () => {
 		// The assembled options must survive the browser conversion.
 		const browser = toCreationOptions(options);
 		expect(Array.from(new Uint8Array(browser.challenge as ArrayBuffer))).toEqual([1, 2, 3]);
-		expect(Array.from(new Uint8Array(browser.user.id as ArrayBuffer))).toEqual([4, 5, 6]);
+		expect(browser.user.id).toEqual(handle);
 		expect(browser.authenticatorSelection).toEqual({
 			residentKey: 'required',
 			requireResidentKey: true,
 			userVerification: 'required'
 		});
 		expect(options.authenticatorSelection?.userVerification).toBe('required');
+	});
+
+	it('uses fresh 32-byte handles even when retrying the same challenge', () => {
+		let calls = 0;
+		const rng = vi.spyOn(crypto, 'getRandomValues').mockImplementation((bytes) => {
+			(bytes as Uint8Array).fill(++calls);
+			return bytes;
+		});
+		const options = ['AQID', 'BAUG', 'BAUG'].map((challenge) =>
+			toCreationOptions(toRegistrationOptions(challenge, 'example.com', 'ada@example.com'))
+		);
+		expect(rng).toHaveBeenCalledTimes(3);
+		for (const [index, option] of options.entries()) {
+			expect(option.user.id).toEqual(new Uint8Array(32).fill(index + 1));
+			expect(option.rp.id).toBe('example.com');
+		}
+		expect(options[0].challenge).toEqual(decodeBase64Url('AQID'));
+		expect(options[1].challenge).toEqual(decodeBase64Url('BAUG'));
+		expect(options[2].challenge).toEqual(options[1].challenge);
+	});
+
+	it('propagates randomness failures without a fallback handle', () => {
+		vi.spyOn(crypto, 'getRandomValues').mockImplementation(() => {
+			throw new Error('randomness unavailable');
+		});
+		expect(() => toRegistrationOptions('AQID', 'example.com', 'ada@example.com')).toThrow(
+			'randomness unavailable'
+		);
 	});
 
 	it('forces user verification on login even if the options ask for less', () => {
@@ -201,7 +233,7 @@ describe('serializePublicKeyCredential', () => {
 });
 
 it('requires user verification for creation and request options', () => {
-	const registration = toRegistrationOptions('AQID', 'BAUG', 'example.com', 'ada@example.com');
+	const registration = toRegistrationOptions('AQID', 'example.com', 'ada@example.com');
 	expect(registration.authenticatorSelection?.userVerification).toBe('required');
 
 	const weakenedCreation = toCreationOptions({

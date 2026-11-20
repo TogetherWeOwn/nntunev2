@@ -97,18 +97,20 @@ export function isLibraryItem(value: unknown): value is LibraryItem {
 	return typeof id === 'string' && id.length > 0;
 }
 
-/**
- * Keep the first valid occurrence of each `id`, in original order. Later
- * rows sharing an `id` are dropped whole — their fields are never merged
- * into the kept row — so the result satisfies the library view's keyed
- * list (`{#each … (track.id)}`) uniqueness requirement. IDs are compared
- * exactly (case-sensitive), matching Svelte's key comparison.
- */
-function dedupeById(items: LibraryItem[]): LibraryItem[] {
+/** Occurrence identity is separate from the legacy playback id. */
+export function libraryItemKey(item: LibraryItem): string {
+	return typeof item.occurrence_key === 'string' && item.occurrence_key.length > 0
+		? `occurrence:${item.occurrence_key}`
+		: `id:${item.id}`;
+}
+
+/** Keep the first copy of each occurrence, preserving the API's order. */
+function dedupeByKey(items: LibraryItem[]): LibraryItem[] {
 	const seen = new Set<string>();
 	return items.filter((item) => {
-		if (seen.has(item.id)) return false;
-		seen.add(item.id);
+		const key = libraryItemKey(item);
+		if (seen.has(key)) return false;
+		seen.add(key);
 		return true;
 	});
 }
@@ -117,8 +119,8 @@ function dedupeById(items: LibraryItem[]): LibraryItem[] {
  * Normalize an unknown API payload into a list of items. Accepts either a
  * bare array (the documented `/api/library` shape) or `{ items: [...] }`
  * and drops entries without a string `id` so one malformed row can never
- * blank the list. Rows are also deduplicated by `id` (first occurrence
- * wins) so duplicate API rows can never reach keyed rendering.
+ * blank the list. Duplicate occurrence keys (or legacy ids) keep their
+ * first row so repeated recordings survive without duplicate render keys.
  */
 export function toLibraryItems(payload: unknown): LibraryItem[] | null {
 	const raw = Array.isArray(payload)
@@ -127,7 +129,7 @@ export function toLibraryItems(payload: unknown): LibraryItem[] | null {
 			? (payload as Record<string, unknown>).items
 			: undefined;
 	if (!Array.isArray(raw)) return null;
-	const items = dedupeById(raw.filter(isLibraryItem));
+	const items = dedupeByKey(raw.filter(isLibraryItem));
 	return raw.length > 0 && items.length === 0 ? null : items;
 }
 
@@ -183,7 +185,7 @@ export function decodeSnapshot(raw: string | null): LibrarySnapshot | null {
 		// or byte budget that a unique row behind it would otherwise get,
 		// and restored rows must satisfy the same keyed-list uniqueness
 		// rule as freshly normalized API rows.
-		const items = dedupeById(parsed.items.filter(isLibraryItem));
+		const items = dedupeByKey(parsed.items.filter(isLibraryItem));
 		if (parsed.items.length > 0 && items.length === 0) return null;
 		return { savedAt: parsed.savedAt, items: evictToCap(items) };
 	} catch {

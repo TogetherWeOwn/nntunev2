@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "dataset_kind": "synthetic",
+  "playable_artist_mbids": [
+    "aaaaaaaa-0000-4000-8000-000000000001",
+    "aaaaaaaa-0000-4000-8000-000000000002",
+    "aaaaaaaa-0000-4000-8000-000000000003",
+    "aaaaaaaa-0000-4000-8000-000000000004",
+    "aaaaaaaa-0000-4000-8000-000000000005",
+    "AAAAAAAA-0000-4000-8000-000000000001"
+  ],
+  "resolved_root_ids": ["root-a", "root-b"],
+  "memberships": [
+    {"artist_mbid": "aaaaaaaa-0000-4000-8000-000000000001", "root_id": "root-a"},
+    {"artist_mbid": "aaaaaaaa-0000-4000-8000-000000000001", "root_id": "root-b"},
+    {"artist_mbid": "aaaaaaaa-0000-4000-8000-000000000001", "root_id": "root-a"},
+    {"artist_mbid": "aaaaaaaa-0000-4000-8000-000000000002", "root_id": "root-a"},
+    {"artist_mbid": "aaaaaaaa-0000-4000-8000-000000000003", "root_id": "root-b"},
+    {"artist_mbid": "aaaaaaaa-0000-4000-8000-000000000004", "root_id": "root-a"},
+    {"artist_mbid": "aaaaaaaa-0000-4000-8000-000000000005", "root_id": "unknown-root"},
+    {"artist_mbid": "aaaaaaaa-0000-4000-8000-000000000005", "root_id": null},
+    {"artist_mbid": "aaaaaaaa-0000-4000-8000-000000000099", "root_id": "root-a"}
+  ]
+}

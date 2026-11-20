@@ -60,7 +60,8 @@ updates:
       prefix: "chore"
       include: "scope"
 
-  # Root workspace (covers crates/nntune-core; workers/* are excluded
+  # Root workspace (covers crates/nntune-core and its velmora git `rev`
+  # pin, which must move in every lockfile together; workers/* are excluded
   # standalone crates and get their own entries below).
   - package-ecosystem: "cargo"
     directory: "/"
@@ -76,6 +77,33 @@ updates:
       time: "06:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Standalone allocator-conflict fixture crates.
+  - package-ecosystem: "cargo"
+    directory: "/.github/fixtures/ledger-conflicting-allocator/conflicting-allocator-dep"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: "cargo"
+    directory: "/.github/fixtures/ledger-conflicting-allocator/probe"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
     labels:
       - "dependencies"
     commit-message:

@@ -114,7 +114,7 @@
 			const credential = await navigator.credentials.create({
 				signal: attempt.signal,
 				publicKey: toCreationOptions(
-					toRegistrationOptions(pending.challenge, pending.user_id, pending.rp_id, email.trim())
+					toRegistrationOptions(pending.challenge, pending.rp_id, email.trim())
 				)
 			});
 			if (attempt.signal.aborted) return;

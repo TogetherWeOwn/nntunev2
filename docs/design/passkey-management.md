@@ -77,10 +77,10 @@ Sources: `workers/api/src/handlers.rs:1416-1444`,
 | `/v1/session/reauthenticate/finish` | login-finish shape | 200 `{ok:true}` and replacement session cookie |
 
 Sources: `workers/api/src/handlers.rs:1467-1501`,
-`workers/api/src/handlers.rs:1840-1856`,
-`workers/api/src/handlers.rs:1928-1986`,
-`workers/api/src/handlers.rs:2083-2099`,
-`workers/api/src/handlers.rs:2233-2240`,
+`workers/api/src/handlers.rs:1897-1913`,
+`workers/api/src/handlers.rs:1985-2043`,
+`workers/api/src/handlers.rs:2140-2156`,
+`workers/api/src/handlers.rs:2290-2297`,
 `apps/web/src/lib/api/client.ts:342-417`.
 
 Registration is initial enrollment only. An existing account with any passkey
@@ -90,8 +90,8 @@ optional/required invites are also validated. Proof is account-bound, not
 registration-challenge-bound. The proof claims and credential insertion commit
 in one enrollment transaction; a failed claim or insertion rolls them all back.
 Never loosen these existing routes
-to add another key. Sources: `workers/api/src/handlers.rs:1536-1546`,
-`workers/api/src/handlers.rs:1725-1839`.
+to add another key. Sources: `workers/api/src/handlers.rs:1593-1603`,
+`workers/api/src/handlers.rs:1782-1896`.
 
 Login's browser ceremony is discoverable, but HTTP login remains email-selected:
 finish requires the selected account's credential. Unknown-email starts have
@@ -100,10 +100,10 @@ purpose `reauth`, requires the current cookie and exact request Origin, and chec
 challenge user and credential user against that cookie. Its challenge has no
 session-ID binding: it is account/purpose-bound, and finish replaces the session
 presented at finish, not necessarily the one used at start. Sources:
-`workers/api/src/handlers.rs:1894-1935`,
-`workers/api/src/handlers.rs:2018-2050`,
-`workers/api/src/handlers.rs:1945-1973`,
-`workers/api/src/handlers.rs:2109-2230`,
+`workers/api/src/handlers.rs:1951-1992`,
+`workers/api/src/handlers.rs:2075-2107`,
+`workers/api/src/handlers.rs:2002-2030`,
+`workers/api/src/handlers.rs:2166-2287`,
 `workers/api/src/handlers.rs:415-420`.
 
 ### 2.2 RP, verifier, allow-lists and limits
@@ -113,7 +113,7 @@ presented at finish, not necessarily the one used at start. Sources:
   `https://staging.nntune.com`. These are config-file observations, not live
   settings. RP ID must exactly equal the canonical origin host; one configured
   origin, not a multi-origin list. HTTPS except explicitly enabled loopback dev.
-  Sources: `workers/api/src/worker_entry.rs:187-188`, `config/prod.json:6-7`,
+  Sources: `workers/api/src/worker_entry.rs:193-194`, `config/prod.json:6-7`,
   `config/staging.json:6-7`, `workers/api/src/auth.rs:185-203`.
 - Verifier checks client-data type/challenge/exact origin, rejects crossOrigin,
   verifies RP-ID hash and requires UP plus UV. ES256 and EdDSA are accepted;
@@ -127,22 +127,22 @@ presented at finish, not necessarily the one used at start. Sources:
   allow-lists. Do not infer a device/provider from these choices. Sources:
   `apps/web/src/lib/webauthn.ts:65-86`,
   `apps/web/src/lib/webauthn.ts:118-129`,
-  `workers/api/src/handlers.rs:1930-1933`,
-  `workers/api/src/handlers.rs:1980-1983`.
+  `workers/api/src/handlers.rs:1987-1990`,
+  `workers/api/src/handlers.rs:2037-2040`.
 - Challenges are 32 random bytes, expire after 300 seconds and are single-use;
   finish checks a 43-character challenge ID. Inbox tokens last 900 seconds.
   Request bodies are capped at 32 KiB. Sources:
   `workers/api/src/auth.rs:17-20`, `workers/api/src/auth.rs:53-56`,
   `workers/api/src/auth.rs:205-211`,
   `workers/api/src/handlers.rs:1073-1077`,
-  `workers/api/src/handlers.rs:3323-3325`.
+  `workers/api/src/handlers.rs:3380-3382`.
 
 | Existing rate scope | Limit and observable denial | Sources |
 | --- | --- | --- |
-| Register/login start IP | shared 30/hour plus default 10/60-second burst; register IP denial 429 with Retry-After; login preserves shaped 200 | `workers/api/src/handlers.rs:67-111`, `workers/api/src/handlers.rs:1287-1375`, `workers/api/src/handlers.rs:1503-1506`, `workers/api/src/handlers.rs:1878-1892` |
-| Register/login account | separate actions, 10/hour each; opaque scope for unknown login email, ordinary-shaped 200 denial | `workers/api/src/handlers.rs:1570-1586`, `workers/api/src/handlers.rs:1894-1914` |
-| Reauth start | 10/user/hour, generic 401 denial | `workers/api/src/handlers.rs:1955-1967` |
-| Each finish | 100/IP/300 seconds before lookup; 10/challenge/300 seconds before crypto; generic 401 denial | `workers/api/src/handlers.rs:1678-1723`, `workers/api/src/handlers.rs:2001-2044`, `workers/api/src/handlers.rs:2119-2162` |
+| Register/login start IP | shared 30/hour plus default 10/60-second burst; register IP denial 429 with Retry-After; login preserves shaped 200 | `workers/api/src/handlers.rs:67-111`, `workers/api/src/handlers.rs:1287-1375`, `workers/api/src/handlers.rs:1503-1505`, `workers/api/src/handlers.rs:1935-1949` |
+| Register/login account | separate actions, 10/hour each; opaque scope for unknown login email, ordinary-shaped 200 denial | `workers/api/src/handlers.rs:1627-1643`, `workers/api/src/handlers.rs:1951-1971` |
+| Reauth start | 10/user/hour, generic 401 denial | `workers/api/src/handlers.rs:2012-2024` |
+| Each finish | 100/IP/300 seconds before lookup; 10/challenge/300 seconds before crypto; generic 401 denial | `workers/api/src/handlers.rs:1735-1780`, `workers/api/src/handlers.rs:2058-2101`, `workers/api/src/handlers.rs:2176-2219` |
 | Inbox mail | 30/IP/hour, 100/global/300 seconds, 3/email/900 seconds; no token/mail on denial | `workers/api/src/handlers.rs:1385-1404` |
 
 Burst overrides have bounded validation; do not describe defaults as immutable
@@ -158,7 +158,7 @@ explicitly does not record BE/BS. Sources: `migrations/0002_auth_vault.sql:17-35
 
 **No passkey list, remove, rename or authenticated add route exists** in the
 dispatcher. `/v1/credentials` is the separate native-REST bearer surface.
-Sources: `workers/api/src/handlers.rs:3341-3375`,
+Sources: `workers/api/src/handlers.rs:3398-3432`,
 `apps/web/src/lib/api/client.ts:320-338`.
 
 The registry uses `{code,message,retryable}`, not `error_code/next_action`.
@@ -181,14 +181,14 @@ preserves it; no method-specific proof receipt is in session claims. Existing
 reauth replaces only the current session, atomically revoking its predecessor
 and inserting the replacement. Sources: `workers/api/src/session.rs:19-26`,
 `workers/api/src/session.rs:67-79`, `workers/api/src/session.rs:358-416`,
-`workers/api/src/worker_entry.rs:1098-1144`.
+`workers/api/src/worker_entry.rs:1314-1360`.
 
 Revoke-all authenticates cookie plus Origin, without freshness; revokes native
 REST credentials and all account sessions via separate sweeps; does not delete
 passkeys or consume outstanding auth challenges. Successful local sign-out and
 qualifying 401s invalidate library/display identity. These are regression
 boundaries, not permission to change session semantics. Sources:
-`workers/api/src/handlers.rs:2441-2483`,
+`workers/api/src/handlers.rs:2498-2540`,
 `apps/web/src/routes/account/security/+page.svelte:18-102`.
 
 Security UI has sign-out and sign-out-everywhere only. **It is not SSR:** its
@@ -544,7 +544,7 @@ bank `apps/web/tests/passkey-in-flight.spec.ts`; identity bank
 failed-revoke bank `apps/web/tests/account-security.spec.ts:13-106`; load/cache
 bank `apps/web/src/routes/account/security/page.test.ts`; auth transition bank
 `apps/web/tests/security-auth-transition.spec.ts`. Backend synthetic ceremony
-builders and reauth cases start at `workers/api/src/handlers.rs:5972-6103`;
+builders and reauth cases start at `workers/api/src/handlers.rs:6267-6398`;
 additional verifier caps live in `workers/api/tests/webauthn_input_caps_acceptance.rs`
 and `workers/api/tests/webauthn_cbor_hardening_acceptance.rs`.
 These were inspected statically, not executed as feature evidence.

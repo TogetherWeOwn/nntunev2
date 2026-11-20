@@ -40,6 +40,15 @@ type = "hyperdrive"
 staging = "61c87403f119430bbc3a7f571df47002"
 prod = "d38a229748f6452bb417c6d33d277a8d"
 
+# The catalogue slice-1 reads reach the shared MusicBrainz read mirror
+# through the api Worker too (`MB_DB`, src/worker_entry.rs
+# `connect_mirror`): same shared id in both environments (docs/ops.md).
+[[worker.binding]]
+binding = "MB_DB"
+type = "hyperdrive"
+staging = "1c6460d5112448888031973c87f671bc"
+prod = "1c6460d5112448888031973c87f671bc"
+
 [[worker]]
 name = "ingest"
 config = "workers/ingest/wrangler.toml"

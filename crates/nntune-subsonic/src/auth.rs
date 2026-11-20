@@ -172,9 +172,31 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+fn md5_padded_capacity(len: usize) -> Option<usize> {
+    len.checked_add(9)?.checked_next_multiple_of(64)
+}
+
 /// MD5 hex digest (RFC 1321), for `t = md5(password + salt)` token auth.
 /// A checksum compatibility helper, not a security primitive.
 pub fn md5_hex(input: &[u8]) -> String {
+    let padded = md5_padded_capacity(input.len()).expect("MD5 input capacity overflow");
+    md5_hex_in(input, Vec::with_capacity(padded), Vec::with_capacity(32))
+}
+
+/// Charge and reserve both buffers before preparing the compatibility digest.
+pub fn md5_hex_charged(
+    input: &[u8],
+    budget: &mut crate::construction_budget::ConstructionBudget,
+) -> Result<String, crate::construction_budget::BudgetExceeded> {
+    use crate::construction_budget::BudgetExceeded;
+
+    let padded = md5_padded_capacity(input.len()).ok_or(BudgetExceeded)?;
+    let msg = budget.allocate_exact(padded)?;
+    let digest = budget.allocate_exact(32)?;
+    Ok(md5_hex_in(input, msg, digest))
+}
+
+fn md5_hex_in(input: &[u8], mut msg: Vec<u8>, mut out: Vec<u8>) -> String {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
@@ -193,8 +215,8 @@ pub fn md5_hex(input: &[u8]) -> String {
         0xeb86d391,
     ];
 
-    let mut msg = input.to_vec();
-    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    msg.extend_from_slice(input);
+    let bit_len = (input.len() as u64).wrapping_mul(8);
     msg.push(0x80);
     while msg.len() % 64 != 56 {
         msg.push(0);
@@ -242,18 +264,27 @@ pub fn md5_hex(input: &[u8]) -> String {
         d0 = d0.wrapping_add(d);
     }
 
-    let mut out = String::with_capacity(32);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for word in [a0, b0, c0, d0] {
         for byte in word.to_le_bytes() {
-            out.push_str(&format!("{byte:02x}"));
+            out.push(HEX[usize::from(byte >> 4)]);
+            out.push(HEX[usize::from(byte & 0x0f)]);
         }
     }
-    out
+    String::from_utf8(out).expect("hex alphabet is ASCII")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn md5_padding_capacity_checks_both_additions() {
+        assert_eq!(md5_padded_capacity(55), Some(64));
+        assert_eq!(md5_padded_capacity(56), Some(128));
+        assert_eq!(md5_padded_capacity(usize::MAX), None);
+        assert_eq!(md5_padded_capacity(usize::MAX - 9), None);
+    }
 
     #[test]
     fn credentials_debug_redacts_values() {
@@ -326,6 +357,16 @@ mod tests {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
         // Verified against `md5sum` and Python `hashlib` (both agree).
         assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn md5_stable_at_max_bounded_input() {
+        // 768 bytes is the production token path maximum (512-byte secret +
+        // 256-byte salt); digest pinned against Python `hashlib` so the
+        // single-copy padding path cannot drift at that size.
+        let input = [b"a".repeat(512), b"b".repeat(256)].concat();
+        assert_eq!(input.len(), 768);
+        assert_eq!(md5_hex(&input), "d98cecdea4a53dfcdc8cf7773b172e1a");
     }
 
     #[test]

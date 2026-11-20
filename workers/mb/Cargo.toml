@@ -12,7 +12,7 @@ name = "nntune_mb"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-worker = { version = "0.8", features = ["http", "tokio-postgres"] }
+worker = { version = "0.9", features = ["http", "tokio-postgres"] }
 http = "1"
 # Hyperdrive Postgres client: `connect_raw` over the Worker socket with
 # the generated connection string (workers-rs `tokio-postgres` example).
@@ -22,6 +22,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Structured log emitter + trace-ID propagation (docs/logging-standard.md).
 nntune-logging = { version = "0.1.0", path = "../../crates/nntune-logging" }
+# R2 snapshot backend (phase 0 spike, `src/snapshot.rs`): pure-Rust raw
+# DEFLATE for snapshot blocks (wasm-safe, no C), and `join_all` for the
+# parallel range reads of one search. Both were already in the lock graph's
+# registry; neither has a build script.
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # Native deadline for `with_db_deadline` (wasm uses `worker::Delay`);
 # the api worker gates the same dependency the same way.

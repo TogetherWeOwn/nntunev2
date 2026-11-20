@@ -61,17 +61,19 @@ export function encodeBase64Url(value: ArrayBuffer | ArrayBufferView): string {
  * (algorithms the server verifies: ES256 and EdDSA; `none` attestation,
  * which the server accepts). Shape pinned by
  * `workers/api/tests/fixtures/api-web-contract.json`.
+ * The public user_id is not an authenticator handle. Generate a fresh handle
+ * for every creation attempt, including retries with the same challenge.
  */
 export function toRegistrationOptions(
 	challenge: string,
-	userId: string,
 	rpId: string,
 	email: string
 ): RegistrationOptionsJSON {
+	const handle = crypto.getRandomValues(new Uint8Array(32));
 	return {
 		challenge,
 		rp: { name: 'NNTune', id: rpId },
-		user: { id: userId, name: email, displayName: email },
+		user: { id: encodeBase64Url(handle), name: email, displayName: email },
 		pubKeyCredParams: [
 			{ type: 'public-key', alg: -7 },
 			{ type: 'public-key', alg: -8 }

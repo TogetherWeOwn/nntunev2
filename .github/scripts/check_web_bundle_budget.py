@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Client-JS bundle budget: fail when the web client build grows past budget.
+"""Client-JS bundle budget: report when the web client build grows past budget.
 
 Sums every ``*.js`` file under the SvelteKit client output
 (``apps/web/.svelte-kit/output/client``, produced by ``pnpm build``) and
-fails when the total exceeds the pinned budget below. Without this gate,
+reports when the total exceeds the pinned budget below. Without this report,
 bundle bloat (a heavy dependency, an accidental full-library import) lands
 silently — ``pnpm build`` itself asserts nothing about size.
+
+Advisory overage (owner order 2026-11-16: build first, optimise later): an
+over-budget total prints a WARNING with the measured bytes and largest files,
+emits a GitHub warning annotation and job-summary line, and exits 0. It never
+claims the bundle fits. Measurement errors below still fail.
 
 Budget: ``BUDGET_CLIENT_JS_BYTES = 368_640`` (360 KiB, raw bytes, not gzip).
 Measured 339,150 B (~331 KiB, 52 files) on 2026-11-03 for the pending W10
@@ -32,20 +37,27 @@ as Wasm enforcement.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 # Pinned budget, raw bytes. See module docstring for how to update.
-BUDGET_CLIENT_JS_BYTES = 368_640  # 360 KiB; measured 339,150 B on 2026-11-03 (W10 app-shell client)
+BUDGET_CLIENT_JS_BYTES = (
+    368_640  # 360 KiB; measured 339,150 B on 2026-11-03 (W10 app-shell client)
+)
 
 CLIENT_DIR_PARTS = ("apps", "web", ".svelte-kit", "output", "client")
 
-# Largest files listed on failure so the culprit is visible in the log.
+# Largest files listed on an overage so the culprit is visible in the log.
 TOP_FILES_ON_REPORT = 5
 
 
 class BudgetError(Exception):
     """The client bundle could not be measured safely."""
+
+
+class BudgetExceeded(BudgetError):
+    """The client bundle was measured and its total exceeds the budget."""
 
 
 def default_client_dir() -> Path:
@@ -61,8 +73,7 @@ def client_js_files(client_dir: Path) -> list[Path]:
     files = sorted(p for p in client_dir.rglob("*.js") if p.is_file())
     if not files:
         raise BudgetError(
-            f"no client JS files under {client_dir}; "
-            "refusing to pass an empty bundle"
+            f"no client JS files under {client_dir}; refusing to pass an empty bundle"
         )
     return files
 
@@ -85,11 +96,40 @@ def check(client_dir: Path, budget: int) -> tuple[int, list[tuple[Path, int]]]:
     sized = measure(client_dir)
     total = sum(size for _, size in sized)
     if total > budget:
-        raise BudgetError(
+        raise BudgetExceeded(
             f"client JS total {total} B exceeds budget {budget} B "
             f"(over by {total - budget} B)"
         )
     return total, sized
+
+
+def publish_warning(message: str) -> None:
+    """Surface an advisory overage as an Actions annotation and job summary."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::warning::{escaped}", flush=True)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(f"## Client-JS bundle budget (advisory)\n\n- {message}\n")
+        except OSError as exc:
+            print(
+                f"bundle budget: WARNING: could not write job summary: {exc}",
+                flush=True,
+            )
+
+
+def report_top_files(client_dir: Path) -> None:
+    if not client_dir.is_dir():
+        return
+    try:
+        over = measure(client_dir)
+    except BudgetError:
+        over = []
+    for path, size in over[:TOP_FILES_ON_REPORT]:
+        print(f"bundle budget:   {size:>8} B  {path.name}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -109,15 +149,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         total, sized = check(args.client_dir, args.budget)
+    except BudgetExceeded as exc:
+        message = f"{exc} (advisory, not a failure)"
+        print(f"bundle budget: WARNING: {message}", flush=True)
+        report_top_files(args.client_dir)
+        publish_warning(message)
+        return 0
     except BudgetError as exc:
         print(f"bundle budget: FAIL: {exc}", flush=True)
-        if args.client_dir.is_dir():
-            try:
-                over = measure(args.client_dir)
-            except BudgetError:
-                over = []
-            for path, size in over[:TOP_FILES_ON_REPORT]:
-                print(f"bundle budget:   {size:>8} B  {path.name}", flush=True)
+        report_top_files(args.client_dir)
         return 1
     headroom = args.budget - total
     print(

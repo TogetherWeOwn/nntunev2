@@ -272,13 +272,20 @@ impl handlers::Store for FakeStore {
         Ok(())
     }
 
-    async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), handlers::StoreError> {
+    async fn revoke_sessions_and_native_credentials(
+        &self,
+        user_id: &str,
+        _now: u64,
+    ) -> Result<u64, handlers::StoreError> {
+        if user_id.is_empty() {
+            return Ok(0);
+        }
         for row in self.sessions.borrow_mut().values_mut() {
             if row.user_id == user_id {
                 row.revoked = true;
             }
         }
-        Ok(())
+        Ok(0)
     }
 
     async fn insert_audit(&self, event: &vault::AuditEvent) -> Result<(), handlers::StoreError> {

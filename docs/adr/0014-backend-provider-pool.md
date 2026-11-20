@@ -1,10 +1,16 @@
 # ADR 0014: Backend provider account pool
 
-- **Status:** Accepted design; implementation and independent review gates remain.
+- **Status:** Superseded by [ADR 0015](0015-standard-s3-storage-boundary.md)
+  (2026-11-13); retained as historical design, not new provider-pool authority.
 - **Date:** 2026-11-03
 - **Replaces:** the per-user provider model of the BYOP era (one
   `ProviderConfig` in a user's vault, a `providers` row minted per user
   save, a per-user NNTP pool keyed to that account).
+
+- **Amended by:** [ADR 0015](0015-standard-s3-storage-boundary.md) (approved
+  target, 2026-11-13): the storage provider is to own NNTP access, posting,
+  accounts and repair, and NNTune is to hold no NNTP accounts. This record
+  stays as history of the merged design; nothing is migrated or removed yet.
 
 ## Context
 
@@ -20,8 +26,9 @@ never as schema or code changes.
 
 Existing pieces this design reuses rather than replaces:
 
-- The NNTP transport and protocol core (`crates/nntune-core`: `nntp.rs`,
-  `transport.rs`, `pinned_transport.rs`, yEnc/PAR2/segment identity) —
+- The NNTP transport and protocol core (`crates/nntune-core`, now a
+  re-export of the velmora engine: `nntp.rs`, `transport.rs`,
+  `pinned_transport.rs`, yEnc/PAR2/segment identity) —
   transport-injected, no user coupling.
 - The envelope encryption built for provider credentials (KEK-versioned,
   ADR 0008 lineage) — the same envelope homes pool account secrets; only
@@ -32,7 +39,8 @@ Existing pieces this design reuses rather than replaces:
   `provider_authority_store.rs` (currently inert and not installed —
   this ADR is the design that installs a production version of that
   idea, it does not bless the model file as-is).
-- The synthetic NNTP test server (`crates/nntune-test-nntp`) for pool
+- The synthetic NNTP test server (`crates/nntune-test-nntp`, a re-export
+  of velmora's `velmora-test-nntp`) for pool
   behaviour tests without real Usenet access.
 
 What does not exist yet: any pool registry, any account selection, any

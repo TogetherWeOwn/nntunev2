@@ -10,7 +10,7 @@
 //!
 //! `runtime.rs` is wasm32-only, so native `cargo test` never links it; like
 //! the existing `assert_pinned_entry_wires_through_helper` guard in
-//! `crates/nntune-core/src/pinned_transport.rs`, this file reads the source
+//! velmora `crates/velmora/src/pinned_transport.rs`, this file reads the source
 //! as text via `include_str!` and pins the wiring per dial site:
 //!
 //! - each site's function body contains exactly one pinned dial;

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import filecmp
+import gzip
 import hashlib
+import io
 import os
 import sqlite3
 import sys
@@ -22,8 +24,7 @@ ARTIST_TYPE_ID, ARTIST_AREA_ID = 11, 12
 ARTIST_TYPE_LOOKUP_ID, ARTIST_TYPE_NAME = 1, 2
 AREA_ID = 1
 ISO_AREA_ID, ISO_CODE = 1, 2
-CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID = 1, 2, 3
-CREDIT_NAME, CREDIT_JOIN_PHRASE = 4, 5
+CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID, CREDIT_NAME, CREDIT_JOIN_PHRASE = 1, 2, 3, 4, 5
 RELEASE_ID, RELEASE_GID, RELEASE_NAME = 1, 2, 3
 RELEASE_CREDIT_ID, RELEASE_GROUP_ID = 4, 5
 GROUP_ID, GROUP_GID, GROUP_NAME, GROUP_CREDIT_ID, GROUP_TYPE_ID = 1, 2, 3, 4, 5
@@ -41,20 +42,7 @@ LINK_ATTR_LINK_ID, LINK_ATTR_ATTR_TYPE_ID = 1, 2
 L_ARTIST_URL_LINK_ID, L_ARTIST_URL_ARTIST_ID, L_ARTIST_URL_URL_ID = 2, 3, 4
 L_RECORDING_URL_LINK_ID, L_RECORDING_URL_RECORDING_ID, L_RECORDING_URL_URL_ID = 2, 3, 4
 L_RR_LINK_ID, L_RR_E0_ID, L_RR_E1_ID = 2, 3, 4
-# Every other l_* relationship table shares the same 9-column COPY layout
-# (id, link, entity0, entity1, edits_pending, last_updated, link_order,
-# entity0_credit, entity1_credit): one position triple covers them all.
-L_REL_LINK_ID, L_REL_E0_ID, L_REL_E1_ID = 2, 3, 4
 ISRC_RECORDING_ID, ISRC_CODE = 2, 3
-# Alias tables share one 16-column COPY layout (id, entity, name, locale,
-# edits_pending, last_updated, type, sort_name, begin/end dates,
-# primary_for_locale, ended): the projection only keeps the columns below.
-ALIAS_ENTITY_ID, ALIAS_NAME, ALIAS_LOCALE, ALIAS_SORT_NAME, ALIAS_PRIMARY = 2, 3, 4, 8, 15
-LABEL_ID, LABEL_GID, LABEL_NAME, LABEL_CODE, LABEL_TYPE_ID = 1, 2, 3, 10, 11
-LABEL_TYPE_LOOKUP_ID, LABEL_TYPE_NAME = 1, 2
-RELEASE_LABEL_RELEASE_ID, RELEASE_LABEL_LABEL_ID, RELEASE_LABEL_CATNO = 2, 3, 4
-WORK_ID, WORK_GID, WORK_NAME, WORK_TYPE_ID = 1, 2, 3, 4
-WORK_TYPE_LOOKUP_ID, WORK_TYPE_NAME = 1, 2
 
 FIELD_COUNTS = {
     "artist": 19,
@@ -78,36 +66,12 @@ FIELD_COUNTS = {
     "l_artist_url": 9,
     "l_recording_url": 9,
     "l_recording_recording": 9,
-    "l_artist_recording": 9,
-    "l_artist_release": 9,
-    "l_artist_work": 9,
-    "l_recording_work": 9,
-    # Alias tables are (id, entity, name, locale, edits_pending,
-    # last_updated, type, sort_name, begin/end dates, primary_for_locale,
-    # ended): 16 columns, matching the pinned CreateTables.sql layout.
-    "artist_alias": 16,
-    "recording_alias": 16,
-    "release_alias": 16,
-    "release_group_alias": 16,
-    "work_alias": 16,
-    "label_alias": 16,
-    # label is (id, gid, name, begin/end dates, label_code, type, area,
-    # comment, edits_pending, last_updated, ended): 16 columns.
-    "label": 16,
-    "label_type": 6,
-    # release_label is (id, release, label, catalog_number, last_updated):
-    # 5 columns, with label and catalog_number nullable.
-    "release_label": 5,
-    # work is (id, gid, name, type, comment, edits_pending, last_updated):
-    # 7 columns.
-    "work": 7,
-    "work_type": 6,
-    # Upstream isrc is (id, recording, isrc, source, edits_pending,
-    # created): six columns. The curated projection only keeps the
-    # (recording, isrc) pair (positions 2, 3), but the row validator must
-    # accept the full upstream width or the first real ISRC row aborts
-    # the ETL.
-    "isrc": 6,
+    # Upstream isrc is (id, recording, isrc, edits_pending, created): five
+    # columns since upstream dropped `source` (the real 20261104 dump has
+    # five). The curated projection only keeps the (recording, isrc) pair
+    # (positions 2, 3), but the row validator must accept the full
+    # upstream width or the first real ISRC row aborts the ETL.
+    "isrc": 5,
 }
 
 # Allowlisted relationship link-type GIDs (pinned from the MusicBrainz
@@ -133,118 +97,10 @@ MUSIC_VIDEO_LINK_GID = "ce3de655-7451-44d1-9224-87eb948c205d"
 VIDEO_ATTR_GID = "112054d5-e706-4dd8-99ea-09aabee36cd6"
 NULL = r"\N"
 BATCH_SIZE = 5000
-# Every curated file the ETL publishes, in importer FK order (parents
-# first): the snapshot reuse-compare and the completion print below must
-# cover all of them, or a same-timestamp rerun could publish a partial set.
-CURATED_TABLES = ("artist", "release_group", "release", "recording", "track",
-                  "url", "artist_url", "recording_url", "recording_music_video",
-                  "recording_isrc",
-                  "work", "label",
-                  "artist_recording", "artist_release", "artist_work",
-                  "recording_work", "recording_recording", "release_credit",
-                  "artist_alias", "release_alias", "recording_alias",
-                  "release_group_alias", "work_alias", "label_alias",
-                  "release_label")
 
 
 def get(row: list[str], position: int) -> str:
     return row[position - 1]
-
-
-# COPY text escape vocabulary the curated dumps share with the validator
-# (crates/mb-import-validate) and the importer duplicate pre-check
-# (import.sh): named escapes, 1-3 octal digits (value <= 255) and 1-2 hex
-# digits. Anything else after a backslash is undecodable.
-_COPY_NAMED = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
-               "v": "\v", "\\": "\\"}
-_COPY_HEX = frozenset("0123456789abcdefABCDEF")
-
-
-def copy_decode(token: str) -> str | None:
-    """Decode one COPY text field, or None when it cannot validate.
-
-    Mirrors the validator's decoder: raw upstream spellings such as `A B`
-    and `A\\040B` decode to the same value, so alias callers must group on
-    this (not on the raw token) before projecting. Octal/hex escapes denote
-    bytes — including the bytes of a multibyte UTF-8 character — so the
-    field is collected as bytes and decoded once as strict UTF-8.
-    """
-    decoded = bytearray()
-    i, n = 0, len(token)
-    while i < n:
-        c = token[i]
-        if c != "\\":
-            if c == "\r":
-                return None
-            decoded.extend(c.encode("utf-8"))
-            i += 1
-            continue
-        i += 1
-        if i >= n:
-            return None
-        e = token[i]
-        if e in _COPY_NAMED:
-            decoded.extend(_COPY_NAMED[e].encode("utf-8"))
-            i += 1
-        elif "0" <= e <= "7":
-            j = i
-            while j < n and j - i < 3 and "0" <= token[j] <= "7":
-                j += 1
-            if int(token[i:j], 8) > 255:
-                return None
-            decoded.append(int(token[i:j], 8))
-            i = j
-        elif e == "x":
-            j = i + 1
-            while j < n and j - i - 1 < 2 and token[j] in _COPY_HEX:
-                j += 1
-            if j == i + 1:
-                return None
-            decoded.append(int(token[i + 1:j], 16))
-            i = j
-        else:
-            return None
-    if 0 in decoded:
-        return None
-    try:
-        return bytes(decoded).decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-
-def copy_decode_or_raw(token: str) -> str:
-    """Decoded value for grouping, or the raw token when it cannot decode.
-
-    Undecodable spellings keep today's behaviour: they pass through to the
-    curated dump, where the validator routes them to the dead-letter table
-    instead of silently vanishing from the projection.
-    """
-    decoded = copy_decode(token)
-    return decoded if decoded is not None else token
-
-
-def copy_escape(decoded: str) -> str:
-    """Re-escape a decoded value for COPY text output.
-
-    The projection stores raw upstream bytes, so a decoded value must be
-    escaped before writing: a decoded tab or newline would otherwise split
-    the curated line, and a decoded backslash would read back as an escape.
-    Only called on values `copy_decode` accepted (no NUL, no raw CR).
-    """
-    return (decoded.replace("\\", "\\\\").replace("\b", "\\b")
-                   .replace("\f", "\\f").replace("\n", "\\n")
-                   .replace("\r", "\\r").replace("\t", "\\t")
-                   .replace("\v", "\\v"))
-
-
-def copy_roundtrip(token: str) -> str:
-    """Decode-then-escape one text field for curated output.
-
-    Equivalent spellings (`A B`, `A\\040B`) collapse to one canonical
-    token; undecodable spellings pass through raw for the poison path.
-    """
-    decoded = copy_decode(token)
-    return copy_escape(decoded) if decoded is not None else token
 
 
 def value(field: str) -> str | None:
@@ -261,10 +117,42 @@ def required_int(field: str, context: str) -> int:
         raise ValueError(f"{context}: invalid integer {parsed!r}") from exc
 
 
+# Disk-bounded mode (R2 snapshot spike, `stream_extract.py`): inputs may be
+# `<table>.gz` instead of `<table>`, MB_ETL_CONSUME_INPUTS=1 deletes each
+# input once it is fully loaded, and MB_ETL_GZIP_OUTPUT=1 writes the curated
+# files as `mbdump-<table>.tsv.gz`. All three are off by default, so the
+# importer's plain-file contract is unchanged.
+CONSUME_INPUTS = os.environ.get("MB_ETL_CONSUME_INPUTS") == "1"
+GZIP_OUTPUT = os.environ.get("MB_ETL_GZIP_OUTPUT") == "1"
+OUTPUT_SUFFIX = ".tsv.gz" if GZIP_OUTPUT else ".tsv"
+
+
+def open_input(path: Path):
+    packed = path.with_name(path.name + ".gz")
+    if path.is_file() and packed.is_file():
+        raise ValueError(f"ambiguous input: both {path} and {packed} exist")
+    if path.is_file():
+        return path, path.open("r", encoding="utf-8", newline="")
+    if packed.is_file():
+        return packed, gzip.open(packed, "rt", encoding="utf-8", newline="")
+    raise ValueError(f"missing input file: {path}")
+
+
+def open_output(path: Path):
+    if GZIP_OUTPUT:
+        # mtime=0 keeps the bytes reproducible for the same-DUMP_TS reuse check.
+        packed = gzip.GzipFile(path, "wb", compresslevel=1, mtime=0)
+        return io.TextIOWrapper(packed, encoding="utf-8", newline="")
+    return path.open("w", encoding="utf-8", newline="")
+
+
+def curated_name(table: str) -> str:
+    return f"mbdump-{table}{OUTPUT_SUFFIX}"
+
+
 def rows(path: Path, expected: int):
-    if not path.is_file():
-        raise ValueError(f"missing input file: {path}")
-    with path.open("r", encoding="utf-8", newline="") as source:
+    actual, source = open_input(path)
+    with source:
         for line_number, line in enumerate(source, 1):
             if line.endswith("\n"):
                 line = line[:-1]
@@ -276,6 +164,8 @@ def rows(path: Path, expected: int):
                     f"{path}: row {line_number}: expected {expected} fields, got {len(fields)}"
                 )
             yield fields
+    if CONSUME_INPUTS:
+        actual.unlink()
 
 
 def load(db: sqlite3.Connection, path: Path, expected: int, select_positions: tuple[int, ...], table: str, columns: str, convert=None) -> int:
@@ -354,7 +244,7 @@ def validate_timestamp(timestamp: str) -> str:
 
 def insert_select(db: sqlite3.Connection, query: str, output_path: Path, updated_at: str, row_transform=None) -> int:
     count = 0
-    with output_path.open("w", encoding="utf-8", newline="") as output:
+    with open_output(output_path) as output:
         for row in db.execute(query):
             fields = row_transform(row) if row_transform else row
             output.write("\t".join(NULL if item is None else str(item) for item in (*fields, updated_at)) + "\n")
@@ -382,21 +272,20 @@ def main() -> int:
             output_dir = work_dir / "curated"
             output_dir.mkdir()
             db = sqlite3.connect(db_path)
-            # COPY-decode helper for the alias projection: equivalent raw
-            # upstream spellings must share one window partition (see
-            # project_alias). Deterministic, so it is usable in ORDER BY.
-            db.create_function("copy_decode_or_raw", 1,
-                               copy_decode_or_raw, deterministic=True)
-            db.create_function("copy_roundtrip", 1,
-                               copy_roundtrip, deterministic=True)
             try:
                 db.executescript("""
                     CREATE TABLE artist (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, sort_name TEXT NOT NULL, type_id INTEGER, area_id INTEGER);
                     CREATE TABLE artist_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                     CREATE TABLE area (id INTEGER PRIMARY KEY);
                     CREATE TABLE iso_3166_1 (area INTEGER PRIMARY KEY, code TEXT);
-                    CREATE TABLE artist_credit_name (credit INTEGER NOT NULL, position INTEGER NOT NULL, artist INTEGER NOT NULL, name TEXT NOT NULL, join_phrase TEXT NOT NULL);
-                    CREATE INDEX artist_credit_name_order ON artist_credit_name(credit, position);
+                    CREATE TABLE artist_credit_name (
+                        credit INTEGER NOT NULL,
+                        position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 2147483647),
+                        artist INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        join_phrase TEXT NOT NULL,
+                        PRIMARY KEY (credit, position)
+                    );
                     CREATE TABLE release_group_primary_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                     CREATE TABLE release_group (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, credit INTEGER, type_id INTEGER);
                     CREATE TABLE release_country (release INTEGER NOT NULL, year INTEGER);
@@ -419,24 +308,8 @@ def main() -> int:
                     CREATE TABLE l_recording_url (link INTEGER NOT NULL, recording INTEGER NOT NULL, url INTEGER NOT NULL);
                     CREATE INDEX l_recording_url_recording ON l_recording_url(recording);
                     CREATE TABLE l_recording_recording (link INTEGER NOT NULL, e0 INTEGER NOT NULL, e1 INTEGER NOT NULL);
-                    CREATE TABLE l_artist_recording (link INTEGER NOT NULL, e0 INTEGER NOT NULL, e1 INTEGER NOT NULL);
-                    CREATE TABLE l_artist_release (link INTEGER NOT NULL, e0 INTEGER NOT NULL, e1 INTEGER NOT NULL);
-                    CREATE TABLE l_artist_work (link INTEGER NOT NULL, e0 INTEGER NOT NULL, e1 INTEGER NOT NULL);
-                    CREATE TABLE l_recording_work (link INTEGER NOT NULL, e0 INTEGER NOT NULL, e1 INTEGER NOT NULL);
                     CREATE TABLE isrc (recording INTEGER NOT NULL, code TEXT NOT NULL);
                     CREATE INDEX isrc_recording ON isrc(recording);
-                    CREATE TABLE artist_alias (entity INTEGER NOT NULL, name TEXT NOT NULL, locale TEXT, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL);
-                    CREATE TABLE recording_alias (entity INTEGER NOT NULL, name TEXT NOT NULL, locale TEXT, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL);
-                    CREATE TABLE release_alias (entity INTEGER NOT NULL, name TEXT NOT NULL, locale TEXT, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL);
-                    CREATE TABLE release_group_alias (entity INTEGER NOT NULL, name TEXT NOT NULL, locale TEXT, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL);
-                    CREATE TABLE work_alias (entity INTEGER NOT NULL, name TEXT NOT NULL, locale TEXT, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL);
-                    CREATE TABLE label_alias (entity INTEGER NOT NULL, name TEXT NOT NULL, locale TEXT, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL);
-                    CREATE TABLE label_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
-                    CREATE TABLE label (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, code INTEGER, type_id INTEGER);
-                    CREATE TABLE release_label (release INTEGER NOT NULL, label INTEGER, catalog_number TEXT);
-                    CREATE INDEX release_label_release ON release_label(release);
-                    CREATE TABLE work_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
-                    CREATE TABLE work (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, type_id INTEGER);
                 """)
 
                 counts = {}
@@ -444,7 +317,12 @@ def main() -> int:
                 counts["area"] = load(db, dump_dir / "area", FIELD_COUNTS["area"], (AREA_ID,), "area", "id", as_ints("area.id", (0,)))
                 counts["iso_3166_1"] = load(db, dump_dir / "iso_3166_1", FIELD_COUNTS["iso_3166_1"], (ISO_AREA_ID, ISO_CODE), "iso_3166_1", "area,code", as_ints("iso_3166_1.area", (0,)))
                 counts["artist"] = load(db, dump_dir / "artist", FIELD_COUNTS["artist"], (ARTIST_ID, ARTIST_GID, ARTIST_NAME, ARTIST_SORT_NAME, ARTIST_TYPE_ID, ARTIST_AREA_ID), "artist", "id,gid,name,sort_name,type_id,area_id", as_ints("artist.id", (0, 4, 5), (4, 5)))
-                counts["artist_credit_name"] = load(db, dump_dir / "artist_credit_name", FIELD_COUNTS["artist_credit_name"], (CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID, CREDIT_NAME, CREDIT_JOIN_PHRASE), "artist_credit_name", "credit,position,artist,name,join_phrase", as_ints("artist_credit_name", (0, 1, 2)))
+                counts["artist_credit_name"] = load(
+                    db, dump_dir / "artist_credit_name", FIELD_COUNTS["artist_credit_name"],
+                    (CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID, CREDIT_NAME, CREDIT_JOIN_PHRASE),
+                    "artist_credit_name", "credit,position,artist,name,join_phrase",
+                    as_ints("artist_credit_name", (0, 1, 2)),
+                )
                 counts["release_group_primary_type"] = load(db, dump_dir / "release_group_primary_type", FIELD_COUNTS["release_group_primary_type"], (PRIMARY_TYPE_ID, PRIMARY_TYPE_NAME), "release_group_primary_type", "id,name", as_ints("release_group_primary_type.id", (0,)))
                 counts["release_group"] = load(db, dump_dir / "release_group", FIELD_COUNTS["release_group"], (GROUP_ID, GROUP_GID, GROUP_NAME, GROUP_CREDIT_ID, GROUP_TYPE_ID), "release_group", "id,gid,name,credit,type_id", as_ints("release_group.id", (0, 3, 4), (3, 4)))
                 counts["release_country"] = load(db, dump_dir / "release_country", FIELD_COUNTS["release_country"], (RELEASE_COUNTRY_RELEASE_ID, RELEASE_COUNTRY_YEAR), "release_country", "release,year", as_ints("release_country", (0, 1), (1,)))
@@ -481,27 +359,22 @@ def main() -> int:
                     raise ValueError(f'pinned link attribute "video" ({VIDEO_ATTR_GID}) absent from link_attribute_type input')
                 video_attr_id = video_attr[0]
 
+                kept_link_ids: set[int] = set()
                 referenced_url_ids: set[int] = set()
 
-                # The link table loads whole: the URL/music-video slice
-                # filters to allowlisted links below, while the phase-2
-                # relation projections resolve every core link type through
-                # the same table. Link types themselves are core CC0 data;
-                # the ETL still never reads tag/genre/rating/annotation or
-                # Live Data Feed tables.
-                counts["link"] = load(
+                def keep_allowlisted_link(selected) -> bool:
+                    link_id = required_int(selected[0], "link.id")
+                    if required_int(selected[1], "link.link_type") in allowlisted_type_ids:
+                        kept_link_ids.add(link_id)
+                        return True
+                    return False
+
+                counts["link"] = load_filtered(
                     db, dump_dir / "link", FIELD_COUNTS["link"], (LINK_ID, LINK_LINK_TYPE_ID),
-                    "link", "id,link_type",
+                    "link", "id,link_type", keep_allowlisted_link,
                     as_ints("link.id", (0, 1)),
                 )
-                kept_link_ids = {
-                    row[0]
-                    for row in db.execute(
-                        "SELECT id FROM link WHERE link_type IN (%s)" % ",".join("?" * len(allowlisted_type_ids)),
-                        tuple(sorted(allowlisted_type_ids)),
-                    )
-                }
-                if not kept_link_ids:
+                if counts["link"] == 0:
                     raise ValueError("link input projects zero allowlisted links; refusing an empty relationship slice")
 
                 def keep_kept_link(selected) -> bool:
@@ -526,17 +399,8 @@ def main() -> int:
                     referenced_url_ids.add(required_int(selected[2], "l_recording_url.url"))
                     return True
 
-                # Phase-2 song relations take every core link type (no
-                # allowlist): the music-video GID is excluded in the
-                # recording_recording projection, not at load, so the
-                # music-video pairs below filter the same full table.
-                def load_relation(name: str) -> int:
-                    return load(
-                        db, dump_dir / name, FIELD_COUNTS[name],
-                        (L_REL_LINK_ID, L_REL_E0_ID, L_REL_E1_ID),
-                        name, "link,e0,e1",
-                        as_ints(f"{name}", (0, 1, 2)),
-                    )
+                def keep_l_recording_recording(selected) -> bool:
+                    return required_int(selected[0], "l_recording_recording.link") in kept_link_ids
 
                 counts["l_artist_url"] = load_filtered(
                     db, dump_dir / "l_artist_url", FIELD_COUNTS["l_artist_url"],
@@ -550,11 +414,12 @@ def main() -> int:
                     "l_recording_url", "link,recording,url", keep_l_recording_url,
                     as_ints("l_recording_url", (0, 1, 2)),
                 )
-                counts["l_recording_recording"] = load_relation("l_recording_recording")
-                counts["l_artist_recording"] = load_relation("l_artist_recording")
-                counts["l_artist_release"] = load_relation("l_artist_release")
-                counts["l_artist_work"] = load_relation("l_artist_work")
-                counts["l_recording_work"] = load_relation("l_recording_work")
+                counts["l_recording_recording"] = load_filtered(
+                    db, dump_dir / "l_recording_recording", FIELD_COUNTS["l_recording_recording"],
+                    (L_RR_LINK_ID, L_RR_E0_ID, L_RR_E1_ID),
+                    "l_recording_recording", "link,e0,e1", keep_l_recording_recording,
+                    as_ints("l_recording_recording", (0, 1, 2)),
+                )
                 # Only URLs targeted by a kept relationship row are stored:
                 # the upstream url table is far larger than the allowlisted
                 # slice the mirror serves.
@@ -571,38 +436,6 @@ def main() -> int:
                     db, dump_dir / "isrc", FIELD_COUNTS["isrc"], (ISRC_RECORDING_ID, ISRC_CODE),
                     "isrc", "recording,code", as_ints("isrc.recording", (0,)),
                 )
-                # Aliases, labels, works: core CC0 tables, loaded whole like
-                # artist/area above. primary_flag stays the raw COPY boolean
-                # (`t`/`f`); the alias projections emit the validator's
-                # literal `true`/`false`.
-                def load_alias(name: str) -> int:
-                    loaded = load(
-                        db, dump_dir / name, FIELD_COUNTS[name],
-                        (ALIAS_ENTITY_ID, ALIAS_NAME, ALIAS_LOCALE, ALIAS_SORT_NAME, ALIAS_PRIMARY),
-                        name, "entity,name,locale,sort_name,primary_flag",
-                        as_ints(f"{name}.entity", (0,)),
-                    )
-                    # Upstream COPY booleans are `t`/`f`; anything else (or a
-                    # NULL) would project a wrong primary flag, so refuse
-                    # the dump instead of guessing.
-                    bad_primary = db.execute(
-                        f"SELECT entity FROM {name} WHERE primary_flag NOT IN ('t','f') LIMIT 1"
-                    ).fetchone()
-                    if bad_primary:
-                        raise ValueError(f"{name} references invalid primary_for_locale for entity {bad_primary[0]}")
-                    return loaded
-
-                counts["artist_alias"] = load_alias("artist_alias")
-                counts["recording_alias"] = load_alias("recording_alias")
-                counts["release_alias"] = load_alias("release_alias")
-                counts["release_group_alias"] = load_alias("release_group_alias")
-                counts["work_alias"] = load_alias("work_alias")
-                counts["label_alias"] = load_alias("label_alias")
-                counts["label_type"] = load(db, dump_dir / "label_type", FIELD_COUNTS["label_type"], (LABEL_TYPE_LOOKUP_ID, LABEL_TYPE_NAME), "label_type", "id,name", as_ints("label_type.id", (0,)))
-                counts["label"] = load(db, dump_dir / "label", FIELD_COUNTS["label"], (LABEL_ID, LABEL_GID, LABEL_NAME, LABEL_CODE, LABEL_TYPE_ID), "label", "id,gid,name,code,type_id", as_ints("label.id", (0, 3, 4), (3, 4)))
-                counts["release_label"] = load(db, dump_dir / "release_label", FIELD_COUNTS["release_label"], (RELEASE_LABEL_RELEASE_ID, RELEASE_LABEL_LABEL_ID, RELEASE_LABEL_CATNO), "release_label", "release,label,catalog_number", as_ints("release_label", (0, 1), (1,)))
-                counts["work_type"] = load(db, dump_dir / "work_type", FIELD_COUNTS["work_type"], (WORK_TYPE_LOOKUP_ID, WORK_TYPE_NAME), "work_type", "id,name", as_ints("work_type.id", (0,)))
-                counts["work"] = load(db, dump_dir / "work", FIELD_COUNTS["work"], (WORK_ID, WORK_GID, WORK_NAME, WORK_TYPE_ID), "work", "id,gid,name,type_id", as_ints("work.id", (0, 3), (3,)))
                 db.commit()
 
                 if counts["recording"] and counts["track"] == 0:
@@ -666,81 +499,6 @@ def main() -> int:
                 bad_isrc_recording = db.execute("SELECT i.recording FROM isrc i LEFT JOIN recording r ON r.id=i.recording WHERE r.id IS NULL LIMIT 1").fetchone()
                 if bad_isrc_recording:
                     raise ValueError(f"isrc references missing recording {bad_isrc_recording[0]}")
-                # Phase-2 song relations: every endpoint must resolve, like
-                # the URL/music-video edges above.
-                for rel_table, parent0, parent1 in (
-                    ("l_artist_recording", "artist", "recording"),
-                    ("l_artist_release", "artist", "release"),
-                    ("l_artist_work", "artist", "work"),
-                    ("l_recording_work", "recording", "work"),
-                ):
-                    bad_rel = db.execute(
-                        f"SELECT l.e0,l.e1 FROM {rel_table} l "
-                        f"LEFT JOIN {parent0} p0 ON p0.id=l.e0 LEFT JOIN {parent1} p1 ON p1.id=l.e1 "
-                        "WHERE p0.id IS NULL OR p1.id IS NULL LIMIT 1"
-                    ).fetchone()
-                    if bad_rel:
-                        raise ValueError(f"{rel_table} references missing {parent0} or {parent1} ({bad_rel[0]}, {bad_rel[1]})")
-                bad_rr = db.execute("SELECT l.e0,l.e1 FROM l_recording_recording l LEFT JOIN recording r0 ON r0.id=l.e0 LEFT JOIN recording r1 ON r1.id=l.e1 WHERE r0.id IS NULL OR r1.id IS NULL LIMIT 1").fetchone()
-                if bad_rr:
-                    raise ValueError(f"recording-recording link references missing recording ({bad_rr[0]}, {bad_rr[1]})")
-                # Phase-2 song relations: every edge must resolve its link
-                # and link type, like the endpoints above. The projections
-                # below inner-join both, so an orphan edge would otherwise
-                # be silently dropped while the nonempty-output guard still
-                # passes on the surviving edges.
-                for rel_table in (
-                    "l_artist_recording",
-                    "l_artist_release",
-                    "l_artist_work",
-                    "l_recording_work",
-                    "l_recording_recording",
-                ):
-                    bad_rel_link = db.execute(
-                        f"SELECT l.e0,l.e1 FROM {rel_table} l "
-                        "LEFT JOIN link k ON k.id=l.link "
-                        "WHERE k.id IS NULL LIMIT 1"
-                    ).fetchone()
-                    if bad_rel_link:
-                        raise ValueError(f"{rel_table} references missing link ({bad_rel_link[0]}, {bad_rel_link[1]})")
-                    bad_rel_link_type = db.execute(
-                        f"SELECT l.e0,l.e1 FROM {rel_table} l "
-                        "JOIN link k ON k.id=l.link "
-                        "LEFT JOIN link_type lt ON lt.id=k.link_type "
-                        "WHERE lt.id IS NULL LIMIT 1"
-                    ).fetchone()
-                    if bad_rel_link_type:
-                        raise ValueError(f"{rel_table} references missing link_type ({bad_rel_link_type[0]}, {bad_rel_link_type[1]})")
-                # Aliases: every alias names a kept entity of its own kind.
-                for alias_table, parent in (
-                    ("artist_alias", "artist"),
-                    ("recording_alias", "recording"),
-                    ("release_alias", "release"),
-                    ("release_group_alias", "release_group"),
-                    ("work_alias", "work"),
-                    ("label_alias", "label"),
-                ):
-                    bad_alias = db.execute(
-                        f"SELECT a.entity FROM {alias_table} a LEFT JOIN {parent} p ON p.id=a.entity "
-                        "WHERE p.id IS NULL LIMIT 1"
-                    ).fetchone()
-                    if bad_alias:
-                        raise ValueError(f"{alias_table} references missing {parent} {bad_alias[0]}")
-                # Labels and works: a named type that is absent from the dump
-                # would project as a silent NULL, so refuse like the release
-                # group primary type above.
-                bad_label_type = db.execute("SELECT l.id FROM label l LEFT JOIN label_type t ON t.id=l.type_id WHERE l.type_id IS NOT NULL AND t.id IS NULL LIMIT 1").fetchone()
-                if bad_label_type:
-                    raise ValueError(f"label {bad_label_type[0]} references missing label_type {db.execute('SELECT type_id FROM label WHERE id=?', bad_label_type).fetchone()[0]}")
-                bad_release_label = db.execute("SELECT rl.release FROM release_label rl LEFT JOIN release r ON r.id=rl.release WHERE r.id IS NULL LIMIT 1").fetchone()
-                if bad_release_label:
-                    raise ValueError(f"release_label references missing release {bad_release_label[0]}")
-                bad_release_label_label = db.execute("SELECT rl.label FROM release_label rl LEFT JOIN label l ON l.id=rl.label WHERE rl.label IS NOT NULL AND l.id IS NULL LIMIT 1").fetchone()
-                if bad_release_label_label:
-                    raise ValueError(f"release_label references missing label {bad_release_label_label[0]}")
-                bad_work_type = db.execute("SELECT w.id FROM work w LEFT JOIN work_type t ON t.id=w.type_id WHERE w.type_id IS NOT NULL AND t.id IS NULL LIMIT 1").fetchone()
-                if bad_work_type:
-                    raise ValueError(f"work {bad_work_type[0]} references missing work_type {db.execute('SELECT type_id FROM work WHERE id=?', bad_work_type).fetchone()[0]}")
 
                 artist_query = """
                     SELECT a.gid,a.name,a.sort_name,t.name,i.code
@@ -750,7 +508,7 @@ def main() -> int:
                     LEFT JOIN area ar ON ar.id=i.area
                     ORDER BY a.id
                 """
-                artist_count = insert_select(db, artist_query, output_dir / "mbdump-artist.tsv", updated_at)
+                artist_count = insert_select(db, artist_query, output_dir / curated_name("artist"), updated_at)
                 release_group_query = """
                     SELECT g.gid,g.name,a.gid,pt.name
                     FROM release_group g
@@ -760,7 +518,7 @@ def main() -> int:
                     LEFT JOIN release_group_primary_type pt ON pt.id=g.type_id
                     ORDER BY g.id
                 """
-                release_group_count = insert_select(db, release_group_query, output_dir / "mbdump-release_group.tsv", updated_at)
+                release_group_count = insert_select(db, release_group_query, output_dir / curated_name("release_group"), updated_at)
                 release_query = """
                     SELECT r.gid,a.gid,r.name,pt.name,
                            (SELECT MIN(year) FROM (SELECT rc.year FROM release_country rc WHERE rc.release=r.id UNION ALL SELECT ruc.year FROM release_unknown_country ruc WHERE ruc.release=r.id) WHERE year IS NOT NULL),
@@ -776,10 +534,20 @@ def main() -> int:
                 release_count = insert_select(
                     db,
                     release_query,
-                    output_dir / "mbdump-release.tsv",
+                    output_dir / curated_name("release"),
                     updated_at,
                     lambda row: (row[0], row[1], row[2], row[3], row[4], f"https://coverartarchive.org/release/{row[0]}/front-250", row[5]),
                 )
+                # Release-group-only credits do not project here. Preserve
+                # the credited spelling and join phrase as upstream COPY text.
+                release_credit_query = """
+                    SELECT r.gid,c.position,a.gid,c.name,c.join_phrase
+                    FROM release r
+                    JOIN artist_credit_name c ON c.credit=r.credit
+                    JOIN artist a ON a.id=c.artist
+                    ORDER BY r.id,c.position
+                """
+                release_credit_count = insert_select(db, release_credit_query, output_dir / curated_name("release_credit"), updated_at)
                 recording_query = """
                     WITH ranked_track AS (
                         SELECT t.recording,t.position,m.release,
@@ -807,7 +575,7 @@ def main() -> int:
                 """).fetchone()
                 if missing_release:
                     raise ValueError(f"recording {missing_release[0]} resolves to missing release {missing_release[1]}")
-                recording_count = insert_select(db, recording_query, output_dir / "mbdump-recording.tsv", updated_at)
+                recording_count = insert_select(db, recording_query, output_dir / curated_name("recording"), updated_at)
                 # Every track appearance becomes one membership row, unlike
                 # the canonical single release on the recording row above:
                 # a recording shared with a reissue/compilation is listed
@@ -823,13 +591,13 @@ def main() -> int:
                     JOIN recording rec ON rec.id=t.recording
                     ORDER BY rel.id,m.position,t.position,t.id
                 """
-                track_count = insert_select(db, track_query, output_dir / "mbdump-track.tsv", updated_at)
+                track_count = insert_select(db, track_query, output_dir / curated_name("track"), updated_at)
                 # URLs: only the allowlisted relationship targets the `url`
                 # load kept.
                 url_query = """
                     SELECT gid,url FROM url ORDER BY id
                 """
-                url_count = insert_select(db, url_query, output_dir / "mbdump-url.tsv", updated_at)
+                url_count = insert_select(db, url_query, output_dir / curated_name("url"), updated_at)
                 # Relationship pairs, deduplicated: one curated row per
                 # (entity, url, link type). The joins are total: the
                 # reference checks above already rejected orphans, and every
@@ -844,7 +612,7 @@ def main() -> int:
                     JOIN link_type lt ON lt.id=k.link_type
                     ORDER BY a.gid,u.gid,lt.name
                 """
-                artist_url_count = insert_select(db, artist_url_query, output_dir / "mbdump-artist_url.tsv", updated_at)
+                artist_url_count = insert_select(db, artist_url_query, output_dir / curated_name("artist_url"), updated_at)
                 # is_video marks links carrying the "video" attribute: the
                 # music-video -> stream join follows only those URLs. One row
                 # per (recording, url, link type): when the same triple is
@@ -864,7 +632,7 @@ def main() -> int:
                     ORDER BY rec.gid,u.gid,lt.name
                 """
                 recording_url_count = 0
-                with (output_dir / "mbdump-recording_url.tsv").open("w", encoding="utf-8", newline="") as output:
+                with open_output(output_dir / curated_name("recording_url")) as output:
                     for row in db.execute(recording_url_query, (video_attr_id,)):
                         is_video = "true" if row[3] else "false"
                         output.write("\t".join(NULL if item is None else str(item) for item in (*row[:3], is_video, updated_at)) + "\n")
@@ -872,22 +640,18 @@ def main() -> int:
                 # Music-video pairs, canonically ordered by (lowercased) GID
                 # so one undirected link is one row whichever side the dump
                 # lists first. The read join treats both sides
-                # symmetrically. The source table now loads whole (the
-                # phase-2 recording_recording projection shares it), so the
-                # pair query filters to the music-video link type itself.
-                music_video_query = f"""
+                # symmetrically.
+                music_video_query = """
                     SELECT DISTINCT
                            CASE WHEN lower(r0.gid)<lower(r1.gid) THEN r0.gid ELSE r1.gid END,
                            CASE WHEN lower(r0.gid)<lower(r1.gid) THEN r1.gid ELSE r0.gid END
                     FROM l_recording_recording l
                     JOIN recording r0 ON r0.id=l.e0
                     JOIN recording r1 ON r1.id=l.e1
-                    JOIN link k ON k.id=l.link
-                    JOIN link_type lt ON lt.id=k.link_type
-                    WHERE r0.id != r1.id AND lt.gid = '{MUSIC_VIDEO_LINK_GID}'
+                    WHERE r0.id != r1.id
                     ORDER BY 1,2
                 """
-                music_video_count = insert_select(db, music_video_query, output_dir / "mbdump-recording_music_video.tsv", updated_at)
+                music_video_count = insert_select(db, music_video_query, output_dir / curated_name("recording_music_video"), updated_at)
                 # ISRCs, deduplicated and uppercased (the mirror CHECK
                 # requires the canonical 12-character uppercase form).
                 isrc_query = """
@@ -896,157 +660,8 @@ def main() -> int:
                     JOIN recording rec ON rec.id=i.recording
                     ORDER BY rec.gid,2
                 """
-                isrc_count = insert_select(db, isrc_query, output_dir / "mbdump-recording_isrc.tsv", updated_at)
-                # Phase-2 song relations: one curated row per (entity,
-                # entity, link type), deduplicated. The joins are total: the
-                # reference checks above already rejected orphans, and every
-                # link resolves to a core link type by construction.
-                def project_relation(table: str, parent0: str, parent1: str, out: str) -> int:
-                    query = f"""
-                        SELECT DISTINCT p0.gid,p1.gid,lt.name
-                        FROM {table} l
-                        JOIN {parent0} p0 ON p0.id=l.e0
-                        JOIN {parent1} p1 ON p1.id=l.e1
-                        JOIN link k ON k.id=l.link
-                        JOIN link_type lt ON lt.id=k.link_type
-                        ORDER BY p0.gid,p1.gid,lt.name
-                    """
-                    return insert_select(db, query, output_dir / out, updated_at)
+                isrc_count = insert_select(db, isrc_query, output_dir / curated_name("recording_isrc"), updated_at)
 
-                artist_recording_count = project_relation(
-                    "l_artist_recording", "artist", "recording", "mbdump-artist_recording.tsv")
-                artist_release_count = project_relation(
-                    "l_artist_release", "artist", "release", "mbdump-artist_release.tsv")
-                artist_work_count = project_relation(
-                    "l_artist_work", "artist", "work", "mbdump-artist_work.tsv")
-                recording_work_count = project_relation(
-                    "l_recording_work", "recording", "work", "mbdump-recording_work.tsv")
-                # Directed song relations: both listing directions stay rows,
-                # but the music-video link type is excluded here — those
-                # pairs live in mbdump-recording_music_video above, so one
-                # link never lands in both files.
-                recording_recording_count = insert_select(
-                    db,
-                    f"""
-                        SELECT DISTINCT r0.gid,r1.gid,lt.name
-                        FROM l_recording_recording l
-                        JOIN recording r0 ON r0.id=l.e0
-                        JOIN recording r1 ON r1.id=l.e1
-                        JOIN link k ON k.id=l.link
-                        JOIN link_type lt ON lt.id=k.link_type
-                        WHERE lt.gid != '{MUSIC_VIDEO_LINK_GID}'
-                        ORDER BY 1,2,3
-                    """,
-                    output_dir / "mbdump-recording_recording.tsv", updated_at)
-                # Full release credits: every artist-credit position on the
-                # release, in order, with the credited name and join phrase.
-                # Credits never used by a release (release-group-only artist
-                # credits) project nowhere by design; the orphan guard above
-                # already refused credits naming a missing artist.
-                release_credit_query = """
-                    SELECT rel.gid,acn.position,art.gid,acn.name,acn.join_phrase
-                    FROM artist_credit_name acn
-                    JOIN release rel ON rel.credit=acn.credit
-                    JOIN artist art ON art.id=acn.artist
-                    ORDER BY rel.id,acn.position
-                """
-                release_credit_count = insert_select(db, release_credit_query, output_dir / "mbdump-release_credit.tsv", updated_at)
-                # Aliases: one row per (entity, name, locale), NULL locales
-                # rewritten to ''. Rows group on the COPY-decoded name and
-                # locale — raw upstream spellings such as `A B` and
-                # `A\\040B` decode to one value, and separate groups would
-                # reach the TSV as two tokens for one key, tripping the
-                # importer's duplicate-key refusal. The winner's text
-                # fields are re-escaped for COPY output, so the curated
-                # dump carries one canonical spelling. Duplicate spellings
-                # collapse to one source row — the primary-for-locale row
-                # wins, then the greatest sort name — so sort_name and
-                # primary_flag always come from the same row instead of
-                # mixing MAX() columns from different rows.
-                def project_alias(table: str, parent: str, out: str) -> int:
-                    query = f"""
-                        SELECT gid,name,locale,sort_name,primary_flag FROM (
-                            SELECT a.gid AS gid,al.name AS name,
-                                   COALESCE(al.locale,'') AS locale,
-                                   al.sort_name AS sort_name,
-                                   al.primary_flag AS primary_flag,
-                                   ROW_NUMBER() OVER (
-                                       PARTITION BY a.gid,
-                                                    copy_decode_or_raw(al.name),
-                                                    copy_decode_or_raw(COALESCE(al.locale,''))
-                                       ORDER BY al.primary_flag DESC,
-                                                al.sort_name DESC,
-                                                al.entity
-                                   ) AS rn
-                            FROM {table} al
-                            JOIN {parent} a ON a.id=al.entity
-                        ) WHERE rn=1
-                        ORDER BY gid,
-                                 copy_decode_or_raw(name),
-                                 copy_decode_or_raw(locale)
-                    """
-                    return insert_select(
-                        db, query, output_dir / out, updated_at,
-                        lambda row: (row[0], copy_roundtrip(row[1]),
-                                     copy_roundtrip(row[2]),
-                                     copy_roundtrip(row[3]),
-                                     "true" if row[4] == "t" else "false"),
-                    )
-
-                artist_alias_count = project_alias("artist_alias", "artist", "mbdump-artist_alias.tsv")
-                release_alias_count = project_alias("release_alias", "release", "mbdump-release_alias.tsv")
-                recording_alias_count = project_alias("recording_alias", "recording", "mbdump-recording_alias.tsv")
-                release_group_alias_count = project_alias("release_group_alias", "release_group", "mbdump-release_group_alias.tsv")
-                work_alias_count = project_alias("work_alias", "work", "mbdump-work_alias.tsv")
-                label_alias_count = project_alias("label_alias", "label", "mbdump-label_alias.tsv")
-                # Labels and works: the type columns denormalize the
-                # label/work-type names; an absent type row was already
-                # refused above, so the LEFT JOIN never hides an orphan.
-                label_query = """
-                    SELECT label.gid,label.name,code,lt.name
-                    FROM label LEFT JOIN label_type lt ON lt.id=label.type_id
-                    ORDER BY label.id
-                """
-                label_count = insert_select(db, label_query, output_dir / "mbdump-label.tsv", updated_at)
-                # Catalogue numbers: NULL-label rows are skipped (a catalogue
-                # number with no label is not a label edge) and NULL numbers
-                # become ''. Canonicalize COPY spellings before DISTINCT so
-                # equivalent catalogue numbers produce one importable key.
-                release_label_query = """
-                    SELECT DISTINCT rel.gid,l.gid,copy_roundtrip(COALESCE(rl.catalog_number,''))
-                    FROM release_label rl
-                    JOIN release rel ON rel.id=rl.release
-                    JOIN label l ON l.id=rl.label
-                    WHERE rl.label IS NOT NULL
-                    ORDER BY 1,2,3
-                """
-                release_label_count = insert_select(db, release_label_query, output_dir / "mbdump-release_label.tsv", updated_at)
-                work_query = """
-                    SELECT work.gid,work.name,wt.name
-                    FROM work LEFT JOIN work_type wt ON wt.id=work.type_id
-                    ORDER BY work.id
-                """
-                work_count = insert_select(db, work_query, output_dir / "mbdump-work.tsv", updated_at)
-
-                # The shared recording-recording source splits in two: the
-                # music-video trigger counts only music-video links and the
-                # general trigger only the rest, so a dump with no videos
-                # (or no other relations) does not trip the other guard.
-                mv_input = db.execute(
-                    "SELECT COUNT(*) FROM l_recording_recording l JOIN link k ON k.id=l.link "
-                    "JOIN link_type lt ON lt.id=k.link_type WHERE lt.gid=?",
-                    (MUSIC_VIDEO_LINK_GID,),
-                ).fetchone()[0]
-                non_mv_input = db.execute(
-                    "SELECT COUNT(*) FROM l_recording_recording l JOIN link k ON k.id=l.link "
-                    "JOIN link_type lt ON lt.id=k.link_type WHERE lt.gid!=?",
-                    (MUSIC_VIDEO_LINK_GID,),
-                ).fetchone()[0]
-                # NULL-label release_label rows are skipped, not edges, so
-                # the trigger counts only rows that can project.
-                release_label_input = db.execute(
-                    "SELECT COUNT(*) FROM release_label WHERE label IS NOT NULL"
-                ).fetchone()[0]
                 for table, input_count, output_count in (
                     ("artist", counts["artist"], artist_count),
                     ("release_group", counts["release_group"], release_group_count),
@@ -1054,36 +669,18 @@ def main() -> int:
                     ("recording", counts["recording"], recording_count),
                     ("track", counts["track"], track_count),
                     ("url", counts["url"], url_count),
-                    ("work", counts["work"], work_count),
-                    ("label", counts["label"], label_count),
                 ):
                     if input_count and output_count == 0:
                         raise ValueError(f"{table} input is non-empty but curated output is empty")
                     if input_count != output_count:
                         raise ValueError(f"{table} input/output row count mismatch: {input_count} != {output_count}")
                 # Deduplicated projections: only the empty-output guard
-                # applies (dedup legitimately shrinks the row count). The
-                # release_credit trigger is the release input: every release
-                # carries at least one credit row (guarded above), so a
-                # non-empty release input must project non-empty credits.
+                # applies (dedup legitimately shrinks the row count).
                 for table, input_count, output_count in (
                     ("artist_url", counts["l_artist_url"], artist_url_count),
                     ("recording_url", counts["l_recording_url"], recording_url_count),
-                    ("recording_music_video", mv_input, music_video_count),
+                    ("recording_music_video", counts["l_recording_recording"], music_video_count),
                     ("recording_isrc", counts["isrc"], isrc_count),
-                    ("artist_recording", counts["l_artist_recording"], artist_recording_count),
-                    ("artist_release", counts["l_artist_release"], artist_release_count),
-                    ("artist_work", counts["l_artist_work"], artist_work_count),
-                    ("recording_work", counts["l_recording_work"], recording_work_count),
-                    ("recording_recording", non_mv_input, recording_recording_count),
-                    ("release_credit", counts["release"], release_credit_count),
-                    ("artist_alias", counts["artist_alias"], artist_alias_count),
-                    ("release_alias", counts["release_alias"], release_alias_count),
-                    ("recording_alias", counts["recording_alias"], recording_alias_count),
-                    ("release_group_alias", counts["release_group_alias"], release_group_alias_count),
-                    ("work_alias", counts["work_alias"], work_alias_count),
-                    ("label_alias", counts["label_alias"], label_alias_count),
-                    ("release_label", release_label_input, release_label_count),
                 ):
                     if input_count and output_count == 0:
                         raise ValueError(f"{table} input is non-empty but curated output is empty")
@@ -1098,17 +695,17 @@ def main() -> int:
             snapshot_name = f".curated-{timestamp_key}"
             snapshot = dump_dir / snapshot_name
             if snapshot.exists():
-                for table in CURATED_TABLES:
-                    name = f"mbdump-{table}.tsv"
-                    if not filecmp.cmp(output_dir / name, snapshot / name, shallow=False):
-                        raise ValueError("this DUMP_TS already has different curated output; use a new timestamp")
+                for output in output_dir.iterdir():
+                    previous = snapshot / output.name
+                    if not previous.is_file() or not filecmp.cmp(output, previous, shallow=False):
+                        raise ValueError("this DUMP_TS already has different curated output; use a fresh dump directory or a new dump")
             else:
                 os.replace(output_dir, snapshot)
             link_tmp = dump_dir / f".curated-link-{uuid.uuid4().hex}"
             os.symlink(snapshot_name, link_tmp)
             os.replace(link_tmp, curated_link)
 
-        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, release_group={release_group_count}, release={release_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count}, work={work_count}, label={label_count}, artist_recording={artist_recording_count}, artist_release={artist_release_count}, artist_work={artist_work_count}, recording_work={recording_work_count}, recording_recording={recording_recording_count}, release_credit={release_credit_count}, artist_alias={artist_alias_count}, release_alias={release_alias_count}, recording_alias={recording_alias_count}, release_group_alias={release_group_alias_count}, work_alias={work_alias_count}, label_alias={label_alias_count}, release_label={release_label_count})")
+        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count})")
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"etl: {exc}", file=sys.stderr)

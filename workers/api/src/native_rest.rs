@@ -143,8 +143,10 @@ fn base62_encode(bytes: &[u8]) -> String {
 
 fn lowercase_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in bytes {
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 0x0f)]));
     }
     out
 }
@@ -446,6 +448,12 @@ pub enum RouteDecision {
     Deny,
 }
 
+/// Match the route shape; the handler validates the target's identity.
+pub(crate) fn like_track_target(path: &str) -> Option<&str> {
+    path.strip_prefix("/v1/me/likes/track/")
+        .filter(|target| !target.is_empty() && !target.contains('/'))
+}
+
 /// The exhaustive default-deny map (ADR 0010). Methods match exact
 /// uppercase (`"get"` fails closed); paths match the listed collection
 /// roots plus subpaths. The HTTP layer passes the path without the query
@@ -465,11 +473,17 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
     }
     match method {
         "GET" => {
-            // Catalog reads → library:read (roots and subpaths).
+            // Catalog reads → library:read (roots and subpaths). The
+            // `/api/library` legacy alias is deliberately outside this map
+            // (like `/api/ingest`): it serves the same entries as
+            // `/v1/library` through its own session-or-bearer-session
+            // dispatch, so a presented native-REST bearer on the alias is
+            // the handler's 401 — never the gate's 404, never a second
+            // scope.
             if path == "/v1/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
-                || path.starts_with("/v1/releases/")
+                || one_segment_after("/v1/releases/", path)
                 || path == "/v1/tracks"
                 || path == "/v1/search"
                 || path == "/v1/playlists"
@@ -481,7 +495,10 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 return Bearer(Scope::StreamRead);
             }
             // Session-only reads (never reachable by bearer).
-            if path == "/v1/me" || path == "/v1/indexers" {
+            if matches!(
+                path,
+                "/v1/me" | "/v1/indexers" | "/v1/me/likes" | "/v1/me/taste" | "/v1/me/history"
+            ) {
                 return SessionOnly;
             }
             // Billing/usage display reads: session-only like checkout —
@@ -489,7 +506,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/plans" || path == "/v1/me/usage" || path == "/v1/me/subscription" {
                 return SessionOnly;
             }
-            if path == "/v1/credentials" {
+            if path == "/v1/credentials" || path == "/v1/subsonic-credentials" {
                 return SessionOnly;
             }
             if one_segment_after("/v1/operations/", path) {
@@ -534,6 +551,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
         // revalidates, and every other HEAD shape stays Deny until the
         // map is explicitly updated.
         "HEAD" => {
+            // The `/api/library` alias stays out here too: HEAD has no
+            // dispatch reader, so the alias answers the plain dispatch 404
+            // like every other unmapped HEAD shape.
             if path == "/v1/library"
                 || path == "/v1/artists"
                 || path == "/v1/releases"
@@ -558,11 +578,13 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // Session-only writes (never reachable by bearer).
             if path == "/v1/indexers"
                 || path == "/v1/credentials"
+                || path == "/v1/subsonic-credentials"
                 || path == "/v1/auth/passkey/login/start"
                 || path == "/v1/session/refresh"
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
                 || path == "/v1/admin/ingest"
+                || path == "/v1/me/likes/import"
             {
                 return SessionOnly;
             }
@@ -595,7 +617,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/me" {
+            if matches!(path, "/v1/me" | "/v1/me/private-session" | "/v1/me/taste")
+                || like_track_target(path).is_some()
+            {
                 return SessionOnly;
             }
             // Admin writes (migration 0028): one setting key, or one
@@ -627,7 +651,10 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
             }
-            if path == "/v1/account" {
+            if matches!(path, "/v1/account" | "/v1/me/taste") || like_track_target(path).is_some() {
+                return SessionOnly;
+            }
+            if one_segment_after("/v1/subsonic-credentials/", path) {
                 return SessionOnly;
             }
             if path.starts_with("/v1/credentials/") && path.len() > "/v1/credentials/".len() {
@@ -755,7 +782,16 @@ mod tests {
                 "HEAD {path}"
             );
         }
-        for path in ["/v1/plays", "/v1/stream", "/v1/ingest", "/v1/nope"] {
+        // The `/api/library` alias is outside the bearer scope map (its
+        // handler owns session-or-bearer-session auth), so HEAD on the
+        // alias stays Deny like the other unmapped HEAD shapes.
+        for path in [
+            "/api/library",
+            "/v1/plays",
+            "/v1/stream",
+            "/v1/ingest",
+            "/v1/nope",
+        ] {
             assert_eq!(
                 scope_for_operation("HEAD", path),
                 RouteDecision::Deny,

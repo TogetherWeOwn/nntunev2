@@ -1,13 +1,30 @@
 # YouTube backend spike: yt-dlp-style extraction on Workers
 
-Status: **Day 1 in progress** — portable core, OMV/ATV selection and the
-runtime entry landed (`workers/youtube` crate + `YtExtract` Durable
-Object shell + `wrangler.toml.example` deploy contract); the extraction
-wiring, corpus re-cut and gate measurement are pending, and the
-proxy-client slice is parked until the resi dev path exists (see Open
-dependencies). Nothing below is a gate result yet.
+Status: **Deferred research, not current release acceptance.** The owner
+kept the spike as a follow-on track on 2026-11-03, with working visible
+embeds first; see [ADR 0012 §7](adr/0012-compliant-youtube-video-and-brainz-data.md#7-the-workersyoutube-extraction-spike-is-kept--embeds-first-owner-decision-2026-11-03).
+That later keep decision supersedes older wording about retiring the
+spike. Preserve the research; do not treat it as fully retired or resume
+it under this document.
 
-## Decision
+Production remains **visible official IFrame embed-only**. The old
+extractor stays disabled/off in production, not a user-facing fallback.
+Any research execution needs separate admission after working visible
+embeds are actually evidenced. This clarification supplies neither that
+evidence nor authorization for extraction, deployment, proxy use, spend
+or credentials. ADR 0012 §7's separate owner gates remain unchanged.
+
+The retained Day-1 implementation snapshot: portable core, OMV/ATV
+selection and the runtime entry landed (`workers/youtube` crate +
+`YtExtract` Durable Object shell + `wrangler.toml.example` deploy
+contract); extraction wiring, corpus re-cut and gate measurement were
+pending, and the proxy-client slice was parked until the resi dev path
+existed (see Open dependencies). The decisions, architecture, findings,
+day plan and dependencies below are historical research context and
+deferred proposals, not current operational instructions. No new gate
+results or success rates are claimed here.
+
+## Historical decision
 
 Owner 2026-10-21: build our own yt-dlp-style YouTube backend on
 Cloudflare Workers, with a residential proxy only for auth/extraction
@@ -29,7 +46,7 @@ Owner 2026-10-21 update (scope + proxy rules for this spike):
   implemented from the research comment text and are reconciled with
   the report when it lands.
 
-## GO/NO-GO gate
+## Deferred research GO/NO-GO gate
 
 Are label-video stream URLs bound to the extraction IP? The Day-1
 measurement extracts 100 videos (50 label music, 50 audio tracks),
@@ -139,7 +156,7 @@ is the reference for version bumps.
   (procurement outside this spike) — the home IP never appears in a
   public-facing path.
 
-## Day plan
+## Deferred proposed day plan
 
 - **Day 1** (this card's first slices): Worker + `connect()` proxy
   client; 100-video corpus measurement from Worker egress; non-proxy
@@ -153,10 +170,30 @@ is the reference for version bumps.
   compiled to WASM, no eval; `youtubei.js` ships a `cf-worker` entry
   point needing a custom evaluator). CPU time + memory, cold and warm;
   DASH manifest playback and seek in a browser.
-- **Day 3:** 6 h soak of 1,000 extractions. Bot-wall rate, proxy GB,
-  URL lifetime, CPU time.
+- **Day 3 (timing clarification, 2026-11-07):** if separately admitted,
+  **6 h is the maximum investigation budget**, not a minimum soak or
+  automatic acceptance. Retain the intended **1,000 judged representative
+  attempts**, with representative strata specified in the authorized
+  plan, and coverage of actual URL lifetime and expiry boundaries.
+  Record bot-wall rate, proxy GB and CPU time as originally proposed.
+  The greater-than-5% Worker-egress byte-fetch failure **NO-GO** above
+  remains unchanged; a passing rate alone does not establish complete
+  representative or lifetime coverage.
+  - Neither 1,000 rapid calls nor six silent hours proves URL lifetime
+    or expiry-boundary coverage. End the investigation once sufficient
+    evidence supports its disposition; there is no obligation to wait
+    out the budget. This does not shorten the required coverage or
+    invent a new technical threshold.
+  - Before any future execution, its separate authorization must name
+    the accountable source owner, actual start time, maximum UTC end
+    time (no more than six hours after that start), intended evidence
+    and timeout action. This document starts no clock or experiment.
+  - At the maximum, stop. If the evidence is insufficient, record
+    **UNKNOWN/NO-GO** and the exact missing evidence, retain the hold
+    and route that gap to the accountable owner. No quiet extension
+    and no acceptance by elapsed time or call count.
 
-## Open dependencies
+## Historical open dependencies
 
 - **Residential egress for spike dev testing (owner 2026-10-21):**
   the home residential IP via gluetun (`mcp-resi-vpn`), dev/internal

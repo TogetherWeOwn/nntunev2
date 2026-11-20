@@ -2,6 +2,7 @@
 	import {
 		browserStorage,
 		invalidateLibraryCache,
+		libraryItemKey,
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { favoritesKey, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
@@ -88,7 +89,7 @@
 		<section aria-labelledby="home-library-heading">
 			<h2 id="home-library-heading">From your library ({items.length})</h2>
 			<ul>
-				{#each preview as item (item.id)}
+				{#each preview as item (libraryItemKey(item))}
 					<li>{displayTitle(item)}{displayArtist(item) ? ` — ${displayArtist(item)}` : ''}</li>
 				{/each}
 			</ul>

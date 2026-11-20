@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Bounded Git provenance for source renames, never applied-row identities."""
+from dataclasses import dataclass
 import hashlib
 import json
 import pathlib
@@ -125,6 +126,87 @@ def validate_entries(entries):
     return entries
 
 
+def bounded_metadata_json(value):
+    """Bound canonical JSON before serializing any complete metadata object."""
+    size = 0
+    active = set()
+
+    def add(amount):
+        nonlocal size
+        size += amount
+        if size > MAX_INPUT:
+            raise HistoryError("import metadata bound exceeded")
+
+    def visit(item, depth):
+        if depth > 100:
+            raise HistoryError("import metadata nesting bound exceeded")
+        if isinstance(item, str):
+            # A JSON string needs at least one byte per character. Encode only
+            # small chunks so an oversized value cannot cause a large copy.
+            add(len(item) + 2)
+            for start in range(0, len(item), 4096):
+                chunk = item[start:start + 4096]
+                if any(0xD800 <= ord(char) <= 0xDFFF for char in chunk):
+                    raise HistoryError("import metadata contains non-scalar Unicode")
+                add(len(json.dumps(chunk, ensure_ascii=True)) - 2 - len(chunk))
+        elif isinstance(item, (dict, list)):
+            identity = id(item)
+            if identity in active:
+                raise HistoryError("import metadata contains a cycle")
+            active.add(identity)
+            add(2 + max(0, len(item) - 1))
+            if isinstance(item, dict):
+                add(len(item))  # colons
+                for key, child in item.items():
+                    if not isinstance(key, str):
+                        raise HistoryError("import metadata keys must be strings")
+                    visit(key, depth + 1)
+                    visit(child, depth + 1)
+            else:
+                for child in item:
+                    visit(child, depth + 1)
+            active.remove(identity)
+        else:
+            if type(item) not in (int, float, bool, type(None)):
+                raise HistoryError("import metadata is not canonical JSON")
+            if type(item) is int and item.bit_length() > MAX_INPUT * 3:
+                raise HistoryError("import metadata bound exceeded")
+            add(len(json.dumps(item, allow_nan=False)))
+
+    try:
+        visit(value, 0)
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        if isinstance(exc, HistoryError):
+            raise
+        raise HistoryError("import metadata is not canonical JSON") from exc
+
+
+def validate_fresh_import(source, candidate, baseline, sql_bytes):
+    """Compare one candidate with a separately verified source entry.
+
+    This dormant helper does not establish source authority or verify Git history;
+    callers must do both independently before treating a match as evidence.
+    """
+    source_json = bounded_metadata_json(source)
+    candidate_json = bounded_metadata_json(candidate)
+    validate_entries([source])
+    if not isinstance(baseline, list):
+        raise HistoryError("baseline must be a list of entries")
+    if len(baseline) >= MAX_FILES:
+        raise HistoryError("migration entry bound exceeded")
+    # Bound aggregate baseline data, including aliases, before copying or
+    # handing it to the shared validators which traverse those lists.
+    bounded_metadata_json(baseline)
+    validate_entries(baseline + [candidate])
+    if source_json != candidate_json:
+        raise HistoryError("import metadata differs from source")
+    if not isinstance(sql_bytes, bytes) or len(sql_bytes) > MAX_BLOB:
+        raise HistoryError("import SQL blob is invalid or oversized")
+    if hashlib.sha256(sql_bytes).hexdigest() != source["sha256"]:
+        raise HistoryError("import SQL hash differs from source")
+
+
 def read_input(path):
     try:
         with pathlib.Path(path).open("rb") as stream:
@@ -199,11 +281,30 @@ def validate_sql_path(path):
         raise HistoryError("invalid migration path")
 
 
+class EvidenceBudget:
+    """One deadline/output allowance for acquisition, retries and both Git passes."""
+    def __init__(self, *, deadline=None, total_output=0):
+        self.deadline = time.monotonic() + 180 if deadline is None else deadline
+        self.total_output = total_output
+
+    def remaining(self, maximum):
+        remaining = min(maximum, self.deadline - time.monotonic())
+        if remaining <= 0:
+            raise HistoryError("shared evidence deadline exceeded")
+        return remaining
+
+    def consume(self, size):
+        self.total_output += size
+        if self.total_output > MAX_TOTAL_OUTPUT:
+            raise HistoryError("shared evidence output bound exceeded")
+
+
 class GitHistory:
-    def __init__(self, root, base, head):
+    def __init__(self, root, base, head, budget=None):
         if not all(COMMIT_RE.fullmatch(ref) for ref in (base, head)):
             raise HistoryError("base and head must be full pinned commit IDs")
         self.root, self.base, self.head = pathlib.Path(root), base, head
+        self.budget = budget or EvidenceBudget()
         self.total_output, self.trees, self.hashes, self.diffs = 0, {}, {}, {}
         for ref in (base, head):
             if self.git("rev-parse", "--verify", f"{ref}^{{commit}}").decode().strip() != ref:
@@ -223,11 +324,11 @@ class GitHistory:
 
     def git(self, *args, limit=MAX_OUTPUT):
         """Bound stdout while reading, not after an unbounded capture_output."""
+        deadline = time.monotonic() + self.budget.remaining(GIT_TIMEOUT)
         child = subprocess.Popen(["git", "--no-replace-objects", "-C", str(self.root),
                                   "-c", f"diff.renameLimit={MAX_FILES}", *args],
                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         output = bytearray()
-        deadline = time.monotonic() + GIT_TIMEOUT
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(child.stdout, selectors.EVENT_READ)
@@ -241,6 +342,7 @@ class GitHistory:
                         continue
                     output.extend(chunk)
                     self.total_output += len(chunk)
+                    self.budget.consume(len(chunk))
                     if len(output) > limit or self.total_output > MAX_TOTAL_OUTPUT:
                         raise HistoryError("Git evidence output bound exceeded")
             if child.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
@@ -372,7 +474,76 @@ class GitHistory:
         return self.states.get(self.head, self.boundary(self.head))
 
 
-def verify(root, base, head, manifest_text, coverage=None):
+@dataclass(frozen=True)
+class UnappliedRename:
+    """Source-only evidence selected by the trusted PR caller, never the manifest."""
+    reviewed_head: str
+    accepted_base: str
+    old_path: str
+    new_path: str
+    sha256: str
+    target: str
+    reviewed_merge: str | None = None
+
+    def verify(self, history, entry, event):
+        if entry["target"] != self.target:
+            raise HistoryError("unapplied rename differs from reviewed target")
+        parent, child, old, new, old_sha, new_sha = event
+        if ((parent, old, new) != (self.reviewed_head, self.old_path, self.new_path)
+                or not old_sha == new_sha == entry["sha256"] == self.sha256):
+            raise HistoryError("unapplied rename differs from reviewed paths, lineage or digest")
+        parents = next(parents for commit, parents in history.commits if commit == child)
+        other = [p for p in parents if p != parent]
+        if len(parents) != 2 or len(other) != 1:
+            raise HistoryError("unapplied rename must directly merge the reviewed head with main")
+        main = other[0]
+        if self.reviewed_merge is not None and (child, main) != (self.reviewed_merge, self.accepted_base):
+            raise HistoryError("unapplied rename differs from exact reviewed merge and main parent")
+        for ancestor, descendant in ((self.accepted_base, main), (main, history.base)):
+            if history.git("merge-base", "--all", ancestor, descendant).decode().splitlines() != [ancestor]:
+                raise HistoryError("unapplied rename merge parent is outside accepted main lineage")
+
+        before, after = history.tree(parent), history.tree(child)
+        oid = before[old]
+        if (new in before or old in after or after[new] != oid
+                or list(before.values()).count(oid) != 1 or list(after.values()).count(oid) != 1):
+            raise HistoryError("unapplied rename does not have unique byte-identical Git blobs")
+
+
+def verify_unapplied_chain(history, entries, entry, pins, events):
+    if len(pins) != len(events):
+        raise HistoryError("unapplied rename lacks the exact reviewed edge chain")
+    prior = None
+    for pin, event in zip(pins, events):
+        # Only the legacy first edge may use an ancestry-only pin.
+        if prior is not None and pin.reviewed_merge is None:
+            raise HistoryError("unapplied rename after the first edge requires an exact reviewed merge pin")
+        pin.verify(history, entry, event)
+        parent, _, old, _, _, _ = event
+        # A merge between renames is fine only if it carries the earlier edge
+        # on the very path that is about to be renamed again.
+        if prior is not None:
+            _, inherited = history.states.get(parent, {}).get(old, ((), ()))
+            if prior[3] != old or prior not in inherited:
+                raise HistoryError("unapplied rename edges are not contiguous in Git lineage")
+        prior = event
+
+    old_paths = {pin.old_path for pin in pins}
+    new = pins[-1].new_path
+    final = history.tree(history.head)
+    oid = history.tree(events[-1][1])[new]
+    if old_paths.intersection(final) or list(final.values()).count(oid) != 1:
+        raise HistoryError("unapplied rename does not have a unique final Git identity")
+    accepted = history.tree(history.base)
+    prefix = parse_manifest(history.git("show", f"{history.base}:migrations/manifest.toml",
+                                        limit=MAX_INPUT).decode("utf-8"))
+    if ((old_paths | {new}).intersection(accepted) or entries[:len(prefix)] != prefix
+            or any(final.get(path) != blob for path, blob in accepted.items())):
+        raise HistoryError("unapplied rename changes the accepted migration prefix")
+
+
+def verify(root, base, head, manifest_text, coverage=None, *, budget=None, audit=None,
+           unapplied=(), unapplied_aliases=()):
     """Return Git-derived edges by final entry; validate all claimed provenance.
 
     Common-baseline metadata was verified when introduced and is immutable.
@@ -381,13 +552,14 @@ def verify(root, base, head, manifest_text, coverage=None):
     no historical applied aliases may be reclassified or removed.
     """
     entries = parse_manifest(manifest_text)
-    history = GitHistory(root, base, head)
+    history = GitHistory(root, base, head, budget=budget)
     base_text = history.git("show", f"{history.merge_base}:migrations/manifest.toml",
                             limit=MAX_INPUT).decode("utf-8")
     previous = {e["file"]: e for e in parse_manifest(base_text)}
     states = history.collect()
     owners, result = {}, {}
     chronology = {commit: i for i, (commit, _parents) in enumerate(history.commits)}
+    reviewed_chains = {pin.new_path: unapplied[:i] for i, pin in enumerate(unapplied, 1)}
     for entry in entries:
         name, path = entry["file"], "migrations/" + entry["file"]
         if history.sha(head, path) != entry["sha256"]:
@@ -404,21 +576,31 @@ def verify(root, base, head, manifest_text, coverage=None):
             raise HistoryError("source rename evidence is forged, missing, unreachable or belongs to another entry")
         if (events or claimed - old_events or aliases - old_aliases) and len(roots) != 1:
             raise HistoryError("ambiguous independent Git lineages at merge")
-        for alias in aliases - old_aliases:
+        new_aliases = aliases - old_aliases
+        if new_aliases.intersection(unapplied_aliases):
+            raise HistoryError("confirmed-unapplied identity must not become an applied alias")
+        for alias in new_aliases:
             if not any(e[2] == "migrations/" + alias[0] and e[4] == alias[1] for e in events):
                 raise HistoryError("new applied alias lacks genuine byte-identical historical provenance")
+        ordered = sorted(events, key=lambda e: (chronology[e[1]], e))
+        unapplied_edges = ()
+        if path in reviewed_chains and name not in previous:
+            verify_unapplied_chain(history, entries, entry, reviewed_chains[path], ordered)
+            unapplied_edges = events
+            if audit is not None:
+                audit["unapplied_renames"] = [dict(zip(EDGE_KEYS, edge)) for edge in ordered]
         for event in events:
             if event in owners and owners[event] != name:
                 raise HistoryError("rename edge resolves to multiple current entries")
             owners[event] = name
             identical = event[4] == event[5] == entry["sha256"]
             applied = aliases | {(name, entry["sha256"])}
-            if identical and (event[2].removeprefix("migrations/"), event[4]) not in applied:
+            if (identical and event not in unapplied_edges
+                    and (event[2].removeprefix("migrations/"), event[4]) not in applied):
                 raise HistoryError("byte-identical rename lacks renamed_from applied alias")
             if not identical and event not in claimed:
                 raise HistoryError("rename edge lacks source_rename_history coverage")
-        result[name] = [dict(zip(EDGE_KEYS, event)) for event in
-                        sorted(events, key=lambda e: (chronology[e[1]], e))]
+        result[name] = [dict(zip(EDGE_KEYS, event)) for event in ordered]
     if set(owners) != history.events:
         raise HistoryError("rename has an unresolved terminal or missing tail to a final entry")
     # Retiring a base entry must not retire its source or applied history either.
@@ -438,4 +620,50 @@ def verify(root, base, head, manifest_text, coverage=None):
                 # Net mappings are coverage, not fabricated chronological edges.
                 if not any(e[2] == old for e in states[new][1]):
                     raise HistoryError("net rename has no verified source continuity")
+    if audit is not None:
+        audit.update(base=base, head=head, merge_base=history.merge_base,
+                     commits=len(history.commits), events=len(history.events), outcome="verified")
     return result
+
+
+def verify_preserved_source(root, base, head, manifest_sha256, *, budget):
+    """Verify caller-supplied local Git history; this does not authorize imports.
+
+    This is not repository-origin authorization, bounded acquisition, or an
+    offline sandbox. Git inherits the caller's environment and configuration.
+    The caller must establish identity and authorization independently and share
+    one budget across acquisition and all verification passes. Baseline rename
+    claims cannot be established by this verifier and are rejected.
+    """
+    if not isinstance(budget, EvidenceBudget):
+        raise HistoryError("shared evidence budget required")
+    if not isinstance(manifest_sha256, str) or not SHA_RE.fullmatch(manifest_sha256):
+        raise HistoryError("invalid source manifest digest")
+    source = GitHistory(root, base, head, budget=budget)
+    if source.git("rev-parse", "--is-shallow-repository").strip() != b"false":
+        raise HistoryError("shallow source repository cannot prove complete history")
+    if source.merge_base != base:
+        raise HistoryError("source base is not an ancestor of source head")
+    baseline = source.git("show", f"{base}:migrations/manifest.toml", limit=MAX_INPUT)
+    try:
+        baseline_entries = parse_manifest(baseline.decode("utf-8"))
+    except UnicodeError as exc:
+        raise HistoryError("source baseline manifest is not UTF-8") from exc
+    if any(entry.get("renamed_from") or entry.get("source_rename_history")
+           for entry in baseline_entries):
+        raise HistoryError("unverified baseline provenance")
+    record = source.git("ls-tree", "-z", head, "--", "migrations/manifest.toml")
+    match = re.fullmatch(rb"100644 blob ([0-9a-f]{40})\tmigrations/manifest\.toml\x00", record)
+    if match is None:
+        raise HistoryError("source manifest must be a regular non-executable blob")
+    raw = source.git("cat-file", "blob", match.group(1).decode("ascii"), limit=MAX_INPUT)
+    if hashlib.sha256(raw).hexdigest() != manifest_sha256:
+        raise HistoryError("source manifest digest mismatch")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise HistoryError("source manifest is not UTF-8") from exc
+    entries = parse_manifest(text)
+    verify(root, base, head, text, budget=budget)
+    budget.remaining(1)
+    return entries

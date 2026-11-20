@@ -4,6 +4,7 @@
 	import {
 		browserStorage,
 		invalidateLibraryCache,
+		libraryItemKey,
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { filterLibraryItems } from '#lib/library/filter.js';
@@ -98,7 +99,7 @@
 			{results.length} {results.length === 1 ? 'result' : 'results'} for “{trimmed}”.
 		</p>
 		<ul>
-			{#each results as item (item.id)}
+			{#each results as item (libraryItemKey(item))}
 				<li>{displayTitle(item)}{displayArtist(item) ? ` — ${displayArtist(item)}` : ''}</li>
 			{/each}
 		</ul>

@@ -169,30 +169,109 @@ target = "app"
 sha256 = "1417321340620eafd178e94785b183c8d42f8f21034a872276c7d3760fc318bd"
 
 [[migration]]
-file = "0035_mb_mirror_phase2_relations.sql"
-target = "mirror"
-sha256 = "15f8834a1d33a353b0863e7a4767ca4b99658c19cff7d2f1f07d5583c55c61dd"
+file = "0035_library_table.sql"
+target = "app"
+sha256 = "fcca71547ad14366c7ba7d37920fba476fa6237b40ee8986ecee3d19f604efc0"
+
+[[migration]]
+file = "0036_library_shared_owner.sql"
+target = "app"
+sha256 = "638249d6f8d40454e480f06f941b2b5f96f2309846f1df65277ff00d859a3b65"
+
+[[migration]]
+file = "0037_subsonic_credentials.sql"
+target = "app"
+sha256 = "e0d05ff850b376f07af53020c97d9128cc0ea915a029cf9009f5f16d6823fa1f"
+
+[[migration]]
+file = "0038_ingest_acceptance_order.sql"
+target = "app"
+sha256 = "f9d18a1c324f54c8110b88fb7f23fbdfeadc6485fe2d064eb8c563d1220b6187"
+
+[[migration]]
+file = "0039_ingest_audio_manifest.sql"
+target = "app"
+sha256 = "0a87c7d9bebe483cf7c82918fe0de49cfdb4d12cd81ccff9ea839d986c968ac8"
+
+[[migration]]
+file = "0040_ingest_audio_classifications.sql"
+target = "app"
+sha256 = "1b0d87756240e098c5902c4f8f2320a381bfceee60f42045d848bc81362ba5d2"
+
+[[migration]]
+file = "0041_account_taste_and_privacy.sql"
+target = "app"
+sha256 = "378c0932a25758f4b50282bab112220bc090a5b0ff01707a9b6e432adb40374e"
 
 [[migration.source_rename_history]]
-parent = "95b1cdc81bcd070b2004ba321b47470542027777"
-commit = "e0eb63967335f8996bb856111636ba91cd74fa49"
-old_path = "migrations/0031_mb_mirror_phase2_relations.sql"
-new_path = "migrations/0033_mb_mirror_phase2_relations.sql"
-old_sha256 = "af91df547dd324a3f576f673fea0f848e9f51f25f57ac36a1f19557949ae0266"
-new_sha256 = "a6177e085aadcacef064fec788849b964d1c80eabf3251932e95838ef2e2a06d"
+parent = "eca22a03b3d5809d1c623b7d4398d53220d10570"
+commit = "4d977b054c81f138c8593e3270fefb8c7469ac27"
+old_path = "migrations/0037_account_taste_and_privacy.sql"
+new_path = "migrations/0041_account_taste_and_privacy.sql"
+old_sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219"
+new_sha256 = "a9aca4fa865bfb35eb5fb60bf067ac84a296e112fa65093a43df844a07305219"
 
-[[migration.source_rename_history]]
-parent = "c0c34e0fc823e57ef7762f634d092dd17276d0c2"
-commit = "dc38e5b8d519333f707c6e4b3ae86dc20c9e1e34"
-old_path = "migrations/0033_mb_mirror_phase2_relations.sql"
-new_path = "migrations/0034_mb_mirror_phase2_relations.sql"
-old_sha256 = "a6177e085aadcacef064fec788849b964d1c80eabf3251932e95838ef2e2a06d"
-new_sha256 = "285f92563c0bb357477bd0ff30e77eebac8c8839e2389838df65e8ef746e4e89"
+[[migration]]
+file = "0042_storage_namespaces.sql"
+target = "app"
+sha256 = "40e243b952f7fc289f0167cb118a3fcc5ec3b17c1b74b62424a2abd3477a88ab"
 
-[[migration.source_rename_history]]
-parent = "5b8cc823467a3f6d9cab0fba85ff271c8324b629"
-commit = "f151b1e2b34d131642938a5982997bb8bc21b5b0"
-old_path = "migrations/0034_mb_mirror_phase2_relations.sql"
-new_path = "migrations/0035_mb_mirror_phase2_relations.sql"
-old_sha256 = "285f92563c0bb357477bd0ff30e77eebac8c8839e2389838df65e8ef746e4e89"
-new_sha256 = "a630856126faff99e875c3877c8b9d53396b4679dde5eea4b1ee08fb7f4486c1"
+[[migration]]
+file = "0043_storage_object_intents.sql"
+target = "app"
+sha256 = "20aba6004de405fd9b3bd9c5c74e418d3f9ac0626058e5f4b6aac4218fa77787"
+
+[[migration]]
+file = "0044_storage_digest_map_intents.sql"
+target = "app"
+sha256 = "512933c73aca98b0d809f0780428f218d8951f5fe1d319815188df6f54cf4c5d"
+
+[[migration]]
+file = "0045_storage_plaintext_digest_claim_intents.sql"
+target = "app"
+sha256 = "72f290344655562f7fafef39d18c18f679e1b13635f0e622612afca57a76cf47"
+
+[[migration]]
+file = "0046_storage_digest_reservations.sql"
+target = "app"
+sha256 = "2c73d6cdb8e6f3b49ce510ead0dd0e45c01e55bc497d0677bfc444e55c46c53b"
+
+[[migration]]
+file = "0047_storage_digest_candidate_batch.sql"
+target = "app"
+sha256 = "d2be227b0921f715fceab9233314ca1a612a4c5342d8eeab4800aebfc24b9c26"
+
+[[migration]]
+file = "0048_legacy_vault_established.sql"
+target = "app"
+sha256 = "52736113f25cd0aa6a5af161f02f8f2fa546140da61f3dd5cf4560206a4a868d"
+
+[[migration]]
+file = "0049_reconcile_legacy_vault_cohort.sql"
+target = "app"
+sha256 = "3a3ef5862778cdf66e558cd23ca727d93384d3ddf0211c9c8f9bb08b56f4758b"
+
+[[migration]]
+file = "0050_refresh_legacy_vault_cohort.sql"
+target = "app"
+sha256 = "b4c11522e567f8db575936ebe61e1e02e5133b8ea6bf8c23f4c2190b7ba3d7ee"
+
+[[migration]]
+file = "0051_storage_object_envelope_intents.sql"
+target = "app"
+sha256 = "ff16b0766d071b944191190e1f237c40ce276bb421c0e0dcd29384c643deadeb"
+
+[[migration]]
+file = "0052_storage_digest_reference_admission.sql"
+target = "app"
+sha256 = "16a26d5f322ee3b651d44519b0d07adfff7f1e4adc47d14c8f83757fa9eb8676"
+
+[[migration]]
+file = "0053_purge_legacy_provider_credentials.sql"
+target = "app"
+sha256 = "ccd14876ce8ed7379c0a03ad1fb4404f12b32f0d31cb470b6b9f1817c8b0e0ca"
+
+[[migration]]
+file = "0054_listen_history.sql"
+target = "app"
+sha256 = "27d43e70497bb7ab5b65218b2c56a50580ce3ecb7517a1d0d8afd2e582755f6e"

@@ -14,6 +14,13 @@ that the shared catalogue or pool is implemented. Keep their current
 coverage and update this matrix in the same PRs that change the specs,
 per the rule below.
 
+Current status of the journey's later legs: user NZB ingest is retired, so
+the playback, Range, usage-meter and plan-limit legs are parked by name (see
+rows 3, 4 and the parked-leg list) and are not asserted live today. Offline
+helper pins for them are not exit evidence. Parking does not waive the
+catalogue task's real journey gate: that gate still needs a real exact-head
+staging journey, and these legs return via admin-ingested tracks.
+
 Line numbers below track the cited specs; re-verify with the commands at the
 end of this document whenever a spec is added, renamed, or retitled, and update this
 matrix in the same PR. CI enforces the file and title citations on
@@ -28,7 +35,7 @@ a manual re-verify item.
   closing it is separate work.
 
 One global caveat applies to every COVERED/PARTIAL row: all live specs
-(`health`, `signup`, `signup-arrival`, `login-magic-link`,
+(`health`, `signup`, `signup-arrival`, `login-magic-link`, `catalogue`,
 `ingest-play-meter`, `player-queue-order`) skip while
 `STAGING_BASE_URL` is unset (file-level skip plus in-test guards, see
 `e2e/README.md` "Activation progression"). Until staging is configured, a
@@ -53,6 +60,28 @@ configured, the harness fails closed instead of skipping.
 ## Coverage that is not an M1 exit step
 
 Listed so it is not mistaken for (or double-counted as) M1 coverage:
+
+- Catalogue fresh-account contracts in `e2e/tests/catalogue.spec.ts`:
+  "catalogue aliases return the same library for each fresh account",
+  "catalogue collections expose member-scoped array contracts for a fresh account",
+  and "Library renders the real API state for a fresh account" assert real-API
+  alias parity, array contracts, unowned-release refusal and Library rendering.
+  Before admin publication they retain the empty-state assertions; afterwards
+  they accept shared rows and require populated rendering.
+  "admin-published rich catalogue is shared by two fresh accounts" additionally
+  requires two distinct QA-seam accounts to see identical, nonempty `/v1/library`
+  results with mirror titles and non-null release MBIDs. While
+  `SHARED_CATALOGUE_PUBLISHED` is not `true`, its named **PARKED:** skip counts
+  against the skip budget and the configured journey gate can be green; that
+  green gate is not populated-catalogue acceptance. With the variable `true`,
+  a skip fails the gate. A missing, duplicated or failed case fails in either
+  mode. Un-park only
+  after the admin consumer publishes a curated matched release to staging, by
+  setting `SHARED_CATALOGUE_PUBLISHED=true` for the post-deploy workflow, then
+  rerunning on the deployed SHA. A variable alone cannot satisfy the nonempty
+  assertions. No fixture injection, playback/metering or live acceptance is
+  claimed. SQL visibility/isolation and publish-once proof run separately in
+  `workers/api/tests/sql/library_catalogue.sql` under exact-head migration CI.
 
 - Local Favorites bulk queue (`apps/web/tests/library-favorites-queue-all.spec.ts:114`,
   '[FAVQ-01] the queue-all action renders exactly once only when a favorite resolves',

@@ -2,7 +2,7 @@
 
 One shared rule governs every segment message-id at every stage. The rule
 itself is defined and documented once, in code, at
-`crates/nntune-core/src/segment_identity.rs`
+velmora `crates/velmora/src/segment_identity.rs`
 (`MAX_SEGMENT_ID_BYTES` + `valid_segment_id`); this note is the map, not
 a second definition. If the two ever disagree, the code wins.
 

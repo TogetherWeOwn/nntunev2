@@ -82,13 +82,17 @@ python3 scripts/cargo_cache.py run -- build -p nntune-backup
 ```
 
 What it does (`crates/nntune-backup/src/drill.rs`): seals a random
-fixture (ephemeral KEK → random per-file media key → rclone-crypt
-ciphertext via `nntune-core` → v2 envelope row), writes the bundle,
-wipes every drill-owned copy (KEK, media key, derived — the caller's
+fixture (ephemeral KEK → random per-file media key → `velmora.media.v1`
+Random-mode ciphertext via `nntune-core::media` under the NNTune profile
+→ v2 envelope row plus the media record: format, key mode, 48-byte
+header and plaintext size), writes the bundle,
+wipes every drill-owned copy (KEK, media key, payload key — the caller's
 fixture buffer is kept only for the final hash comparison), restores
 the bundle into an isolated directory,
 re-verifies it there, opens the envelope with the recovered keyring
-only, decrypts the full plaintext through two ranged reads
+only, verifies the record header's key commitment, fully verifies
+the object (wire header, every chunk, final flag, no trailing bytes),
+decrypts the full plaintext through two ranged reads
 (article-window shaped), and compares SHA-256. Exit 0 prints the
 evidence JSON; exit 2 means the drill failed; exit 1 is a usage/IO
 error. Temp dirs are removed afterwards — the drill proves restore
@@ -110,25 +114,20 @@ serialization cannot leak one.
 2. Operator copies the newest `offsite/staging/db/…` dump and the
    keyring objects for exactly the versions in that backup's
    manifest. Anything else fails closed at step 4.
-3. Restore the dump; run the KEK re-wrap pass first if the backup
-   predates a rotation (`docs/security/kek-rotation.md`,
-   `docs/database-restore-runbook.md`).
-4. Verify every `track_sources` envelope row opens — authentication
-   only, no plaintext is printed. `track_sources` is the wrapped
-   per-file-key table that gates library recovery; provider credential
-   envelopes use a different table/AAD binding and are verified by
-   their own open path when first used post-restore. Presence of every
-   backed-up table is still covered by the dump restore plus the
-   per-table row counts recorded in step 5.
+3. Restore the dump. For vault re-wrap applicability see
+   [database restore step 3.5](database-restore-runbook.md#3-restore-step-order-operator-executes).
+4. Verify every `track_sources` envelope opens without printing plaintext.
+   This example checks only wrapped per-file keys; it does not replace the
+   other envelope and serving-key checks in restore step 3.5. Keep the
+   isolated target unchanged between the count and export. If any check
+   fails, do not continue to the fixture check.
    ```sh
    umask 077
-   SCRATCH="$(mktemp -d)"
+   SCRATCH="$(mktemp -d)" || exit 1
    trap 'shred -u "$SCRATCH/rows.jsonl" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
-   # One JSON object per line via row_to_json: the verifier parses
-   # JSONL, not the tab-delimited text a bare COPY (SELECT …) emits
-   # (every such row would fail closed as Shape). Key names must match
-   # the verifier's row shape exactly.
-   psql "$RESTORE_DSN" -t -A -c "COPY (SELECT row_to_json(t) FROM (SELECT 'global' AS user_id, \
+   expected="$(psql -X -v ON_ERROR_STOP=1 "$RESTORE_DSN" -Atc 'SELECT count(*) FROM track_sources')" || exit 1
+   # The verifier needs one JSON object per line, not tab-delimited columns.
+   psql -X -v ON_ERROR_STOP=1 "$RESTORE_DSN" -Atc "COPY (SELECT row_to_json(t) FROM (SELECT 'shared:track-source' AS user_id, \
      track_id::text AS row_key, \
      nzb_ref_envelope_version AS envelope_version, \
      nzb_ref_payload_format AS payload_format, nzb_ref_kek_version AS kek_version, \
@@ -136,22 +135,31 @@ serialization cannot leak one.
      encode(nzb_ref_dek_wrapped,'hex') AS dek_wrapped_hex, \
      encode(nzb_ref_payload_nonce,'hex') AS payload_nonce_hex, \
      encode(nzb_ref_encrypted,'hex') AS ciphertext_hex \
-     FROM track_sources) t) TO STDOUT" > "$SCRATCH/rows.jsonl"
-   BACKUP_DRILL_KEK_V1="$(op read …)" BACKUP_DRILL_KEK_V2="$(op read …)" \
-     ./target/debug/backup-drill verify --rows "$SCRATCH/rows.jsonl" > "$SCRATCH/verify-report.json"
+     FROM track_sources) t) TO STDOUT" > "$SCRATCH/rows.jsonl" || exit 1
+   (
+     BACKUP_DRILL_KEK_V1="$(op read …)" || exit 1
+     BACKUP_DRILL_KEK_V2="$(op read …)" || exit 1
+     export BACKUP_DRILL_KEK_V1 BACKUP_DRILL_KEK_V2
+     ./target/debug/backup-drill verify --rows "$SCRATCH/rows.jsonl"
+   ) > "$SCRATCH/verify-report.json" || exit 1
+   jq -e --argjson expected "$expected" '
+     if $expected > 0 and .rows == $expected and .ok == $expected and .failed == 0
+     then {expected: $expected, rows, ok, failed, keyring_versions}
+     else error("envelope verification totals do not match") end
+   ' "$SCRATCH/verify-report.json" || exit 1
    ```
    Post-migration-0027 notes: `track_sources` has no `user_id` column
    (one global slot per `track_id`), no `row_key` column, and the
-   ciphertext column is `nzb_ref_encrypted`. `'global'` is the sealer's
-   tagged global `owner_scope` per ADR 0002 and `track_id::text` the
+   ciphertext column is `nzb_ref_encrypted`. The sealer uses `shared:track-source` as `owner_scope` and `track_id::text` as
    `row_key`; both must equal the seal-time AAD inputs (pinned where
    the pipeline seals) — any mismatch fails closed as failed rows,
    never as a silent pass. The export lives in a `0700` scratch dir,
    never world-readable `/tmp` files, and is shredded on exit.
-   KEKs arrive as 64 hex chars via environment (operator-store read,
-   never a file, never a log); exit 2 on any failure, including zero
-   rows. The report carries `rows`, `ok`, `failed` and
-   `keyring_versions` only.
+   Pass KEKs as 64 hex chars via environment from the operator store;
+   never write them to a file or enable shell tracing. The populated
+   drill passes only when `rows == ok == expected count > 0` and
+   `failed == 0`. Save the printed evidence JSON: the expected count
+   and the report's `rows`, `ok`, `failed`, and `keyring_versions` only.
 5. Decrypt one posted fixture track end to end from the restored
    material only (fetch its articles through the normal ranged path
    against the isolated target, decrypt, compare SHA-256 with the

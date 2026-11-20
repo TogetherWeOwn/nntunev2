@@ -109,8 +109,11 @@ plan or one line in its body:
 Size justification: <why this change cannot land in smaller pieces>
 ```
 
-The limit is a working agreement, not a gate: the `pr-size` workflow stays
-advisory and no required check enforces it.
+The limit is enforced: the `pr-size-gate` job in the same workflow is a
+required check on `main` (`protect-main` ruleset, context
+`pr-size-gate / gate`) and fails PRs that exceed it without exception
+evidence. Thresholds are the org values (warn from 200, fail over 400
+lines / 20 files, hard stop 1000) and are never raised per repo.
 
 ## Pull-request size labels (advisory)
 
@@ -124,9 +127,10 @@ and fixtures. The labeller lives once in the org
 (`CI-STANDARD.md`, "Advisory PR-size labels"); the workflow here is a thin
 caller with both `uses:` refs pinned to one central SHA and `exclude-extra:
 ""` (none today — the central exclusions already cover this repo's lockfiles
-and fixture/test data). This is advisory only: it is not a required check
-(caller `ADVISORY ONLY` header; absent from the `protect-main` required
-checks) and never blocks a merge. A Monday run of the same workflow
+and fixture/test data). The labelling job is advisory only: it is not a required check
+(not in the `protect-main` required checks) and never blocks a merge
+by itself. The gate job (`pr-size-gate`) in the same workflow *is*
+required and blocks over-limit PRs. A Monday run of the same workflow
 (`17 7 * * 1`) prints the weekly tally of merged pull requests per size; the
 labels are the durable record behind it.
 
@@ -138,6 +142,7 @@ labels are the durable record behind it.
 - Delete the branch on merge (automatic repo setting).
 - Every PR must pass the required status checks on `main` (the
   `protect-main` ruleset): **`ci-ok`, `gitleaks`, `pr-lint`,
+  `pr-size-gate / gate`,
   `migrations-staging` and `Devin Review`**. CodeRabbit is advisory: answer
   its findings when it reviews, but never wait for it or trigger it manually.
 - A PR merges once every required check is green and every review finding
@@ -159,10 +164,13 @@ labels are the durable record behind it.
 - Staging migrations: staging is verified against the database itself —
   applies are recorded in `schema_migrations` and the staging deploy gate
   compares them with `migrations/manifest.toml`; see "Staging migrations"
-  in `docs/ops.md`. Green checks are not enough for such a PR: the DDL
-  needs board approval before it is applied to staging (via
-  `.github/scripts/apply_migration.py`), and the PR merges only once the
-  apply is recorded. A PR that renames a migration must rename it
+  in `docs/ops.md`. Green checks are not enough for such a PR: once the
+  DDL has board approval on its card, the authoring agent dispatches
+  `.github/workflows/migrations-staging-apply.yml` with the approved
+  commit `ref`, migration `file`, `applied_by` and the board-approval
+  interaction id (the ref supplies migration data only; the workflow runs
+  the trusted `.github/scripts/apply_migration.py` from `main`), and the
+  PR merges only once the apply is recorded in the job summary. A PR that renames a migration must rename it
   byte-identically and carry its `renamed_from` manifest history
   (`migrations-staging` enforces it).
 - Never commit secrets. The `gitleaks` gate (`.github/workflows/gitleaks.yml`,
