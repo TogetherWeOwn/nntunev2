@@ -149,6 +149,7 @@ async fn history_uses_the_grant_privacy_decision() {
         .execute("DELETE FROM public.users WHERE id = $1", &[&owner])
         .await
         .unwrap();
+    first_admission_requires_each_lease_predicate().await;
 }
 
 async fn pid(client: &Client) -> i32 {
@@ -234,4 +235,42 @@ async fn clear_and_terminal_write_share_owner_fence() {
     assert_eq!(result, AccountDeleting);
     let cleanup = "DELETE FROM public.users WHERE id IN ($1, $2)";
     clearer.execute(cleanup, &[&owner, &other]).await.unwrap();
+}
+
+async fn first_admission_requires_each_lease_predicate() {
+    use ListenEvent::Start;
+    use WriteOutcome::{Conflict, Written};
+    let mut client = connect().await;
+    let suffix = rand::random::<u64>();
+    let owner = format!("listen-{suffix:x}-nolease");
+    let other = format!("listen-{suffix:x}-lease");
+    seed_owner(&client, &owner).await;
+    seed_owner(&client, &other).await;
+    let other = other.as_str();
+
+    // Owner: only another account holds the lease.
+    seed_lease(&client, other, 1).await;
+    assert_eq!(write(&mut client, &owner, event(1, Start)).await, Conflict);
+    assert_eq!(write(&mut client, other, event(1, Start)).await, Written);
+    // Track: same lease and play id, different catalogue track.
+    seed_lease(&client, other, 2).await;
+    let mut wrong_track = event(2, Start);
+    wrong_track.track_id = "catalogue-43".into();
+    assert_eq!(write(&mut client, other, wrong_track).await, Conflict);
+    assert_eq!(write(&mut client, other, event(2, Start)).await, Written);
+    // Play id: lease still names playback 2.
+    assert_eq!(write(&mut client, other, event(3, Start)).await, Conflict);
+    seed_lease(&client, other, 3).await;
+    assert_eq!(write(&mut client, other, event(3, Start)).await, Written);
+    // Expiry: the lease expires at 1045 and must be strictly in the future.
+    seed_lease(&client, other, 4).await;
+    let expired = record(&mut client, other, &event(4, Start), 1045).await;
+    assert_eq!(expired.unwrap(), Conflict);
+    let live = record(&mut client, other, &event(4, Start), 1044).await;
+    assert_eq!(live.unwrap(), Written);
+
+    assert!(export(&client, &owner, None).await.unwrap().is_empty());
+    assert_eq!(export(&client, other, None).await.unwrap().len(), 4);
+    let cleanup = "DELETE FROM public.users WHERE id IN ($1, $2)";
+    client.execute(cleanup, &[&owner, &other]).await.unwrap();
 }

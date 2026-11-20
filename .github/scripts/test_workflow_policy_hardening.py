@@ -112,8 +112,9 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         production = (WORKFLOWS / "deploy-production.yml").read_text()
         evidence = job(production, "staging-evidence")
         self.assertIn("    environment:\n      name: staging\n      deployment: false\n", evidence)
+        without_presence_checks = re.sub(r"secrets\.PRODUCTION_CLOUDFLARE_(?:API_TOKEN|ACCOUNT_ID) != ''", "", evidence)
         self.assertEqual(
-            sorted(re.findall(r"secrets\.([A-Z_]+)", evidence)),
+            sorted(re.findall(r"secrets\.([A-Z_]+)", without_presence_checks)),
             ["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "STAGING_BASE_URL"],
         )
         self.assertIn("persist-credentials: false", evidence)

@@ -1,4 +1,4 @@
-//! Authenticated dispatch for the unmounted staging construction scope.
+//! Authenticated dispatch for the staging construction scope.
 
 use std::future::Future;
 
@@ -35,12 +35,22 @@ use crate::worker_entry::{
 pub struct StagingDispatch {
     pub now_millis: i64,
     pub order_work: OrderWork,
+    pub construction_headroom: Option<usize>,
+}
+
+impl StagingDispatch {
+    pub(crate) const FIXTURE_ORDER_WORK: OrderWork = OrderWork {
+        // Insertion-sort pairs and mapping lookups for at most four albums,
+        // one artist and 1,024 tracks (checked again by the snapshot builder).
+        comparisons: 532_000,
+        artist_row_probes: 0,
+    };
 }
 
 pub enum StagingApp<'a, K> {
     Postgres {
         client: Client,
-        peppers: &'a IndexKeyring<'a>,
+        peppers: IndexKeyring<'a>,
         keks: &'a K,
         now_seconds: u64,
     },
@@ -63,7 +73,7 @@ pub enum CatalogueSource<C> {
     IsolatedMirror(C),
 }
 
-/// Unmounted. The caller must first verify staging arming and app/mirror
+/// The caller must first verify staging arming and app/mirror
 /// isolation. Source selection runs only after real auth, before account,
 /// fixture, membership or mirror reads. `None` denies access.
 pub async fn respond_staging<'a, K: KekSource + 'a, A, M, C>(
@@ -197,6 +207,12 @@ impl StagingConstruction {
         let params = self.dispatch_params()?;
         let (format, refusal) = request_format(&params)?;
         let reject = |reason| DocumentError::Rejected(reason, refusal);
+        if let Some(headroom) = context.construction_headroom {
+            if self.method() != "GET" || name != "getArtists" || !matches!(format, Format::Json) {
+                return Err(reject(StagingRejection::Unavailable));
+            }
+            self.input.budget.restrict_remaining(headroom);
+        }
         let budget = &mut self.input.budget;
         let doc = if MemberBrowse::supports(name) {
             let (artists, releases, tracks) = match catalogue {
@@ -269,7 +285,6 @@ fn request_format(params: &Params) -> Result<(Format<'_>, RejectionFormat), Docu
 mod wasm_test {
     use super::*;
     use crate::handlers::Config;
-    use crate::subsonic_dispatch::snapshot_order::order_work;
     use worker::wasm_bindgen::{self, prelude::*};
     use worker::{js_sys, wasm_bindgen_futures::JsFuture};
 
@@ -278,18 +293,16 @@ mod wasm_test {
         request: web_sys::Request,
         open_app: js_sys::Function,
         allowed: bool,
-        small: bool,
+        fixture_id: Option<String>,
     ) -> Result<web_sys::Response, JsValue> {
         type NoMirror = fn() -> std::future::Ready<Result<Client, StagingRejection>>;
         let context = StagingDispatch {
             now_millis: 0,
-            order_work: order_work(2, 2, 4, 2).unwrap(),
+            order_work: StagingDispatch::FIXTURE_ORDER_WORK,
+            construction_headroom: None,
         };
-        let fixture = if small {
-            SyntheticCatalogue::Small
-        } else {
-            SyntheticCatalogue::Empty
-        };
+        let fixture = SyntheticCatalogue::from_trusted_id(fixture_id.as_deref().unwrap_or("empty"))
+            .ok_or(JsValue::NULL)?;
         respond_staging(
             &request,
             context,

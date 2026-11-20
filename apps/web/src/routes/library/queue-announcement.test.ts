@@ -14,8 +14,8 @@ import {
 } from '#lib/library/recent-finds.js';
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
-import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { displayArtist, displayTitle, orderLibraryItems, shortTitle } from '#lib/library/order.js';
+import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
 import { libraryTabTitle } from '#lib/library/tab-title.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
@@ -114,7 +114,6 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		displayArtist,
 		displayTitle,
 		clearMiniPlayerHint,
-		setMiniPlayerHint,
 		orderLibraryItems,
 		filterLibraryItems,
 		libraryTabTitle,
@@ -135,6 +134,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		clearSignedInEmail: () => {},
 		resolveStreamUrl: () => null,
 		onMount: () => {},
+		shortTitle,
 		tick: () => Promise.resolve(),
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
@@ -144,7 +144,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 			refresh, selectTrack, moveQueuedTrack, toggleFavorite,
 			dispose: refresher.dispose, subscribeQueue: queueController.subscribe,
 			handleAuthTransition, handleLocalAuthTransition, unstarFromShelf, confirmClearFavorites,
-			read: () => ({ queue, announcement: queueAnnouncement, items, loadError }),
+			read: () => ({ queue, announcement: player.queueAnnouncement.text, items, loadError }),
 			readFavorites: () => ({ favorites, announcement: favoritesAnnouncement }),
 			// Fixture setup only: do not call a non-move page edit, which would
 			// clear the announcement before the handler under test ever runs.

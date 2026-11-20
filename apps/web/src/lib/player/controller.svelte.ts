@@ -1,13 +1,11 @@
+import { displayArtist, displayTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
-import { createMediaController, type NaturalEndSelection } from './mediaController.js';
+import { clearMiniPlayerHint, setMiniPlayerHint } from '../shell/mini-player.js';
+import { createMediaController, type MediaSelection } from './mediaController.js';
 import { currentTrack, type QueueState } from './queue.js';
 import { createQueueController, type LibrarySources, type QueueCommitKind } from './queueController.js';
 
-type PlayerEffects = Omit<NaturalEndSelection, 'commit'> & {
-	clearRestartFeedback: () => void;
-	clearQueueAnnouncement: () => void;
-	syncMiniPlayerHint: (next: QueueState) => void;
-};
+type PlayerEffects = Pick<MediaSelection, 'flush' | 'clearShareFeedback'>;
 
 type LibraryCommit = {
 	sources: LibrarySources;
@@ -18,7 +16,14 @@ export function createPlayerController(
 	initial: QueueState, effects: PlayerEffects, matchesNative?: (audio: HTMLAudioElement, source: string) => boolean
 ) {
 	const queue = createQueueController(initial);
-	const media = createMediaController(queue, { ...effects, commit: replaceQueue }, matchesNative);
+	let queueAnnouncement = $state.raw<Readonly<{ text: string; version: number }>>({ text: '', version: 0 });
+	const media = createMediaController(queue, { ...effects, commit: replaceQueue, announce: announceQueue }, matchesNative);
+
+	// Keyed messages can announce identical text again without replacing the live region.
+	function announceQueue(text: string, replay = false): void {
+		if (text === queueAnnouncement.text && !replay) return;
+		queueAnnouncement = { text, version: queueAnnouncement.version + Number(replay) };
+	}
 
 	// A source round trip before Svelte flushes must not revive a retired node.
 	// This keys the render, independently of attachment and detach receipts.
@@ -32,6 +37,7 @@ export function createPlayerController(
 	function resetAtAuthBoundary(): void {
 		media.clearShareSeek();
 		retireNativeHost();
+		media.clearSeekFeedback();
 	}
 
 	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit): boolean {
@@ -56,7 +62,7 @@ export function createPlayerController(
 			if (!isCurrent()) return false;
 		}
 		if (rawSourceChanged && (kind === 'replace' || kind === 'remove' || kind === 'select')) {
-			effects.clearRestartFeedback();
+			media.clearSeekFeedback();
 			if (!isCurrent()) return false;
 		}
 		if (trackChanged || resolveStreamUrl(before) !== resolveStreamUrl(after)) {
@@ -64,11 +70,17 @@ export function createPlayerController(
 			retireNativeHost();
 			if (!isCurrent()) return false;
 		}
-		if (kind === 'replace') effects.clearQueueAnnouncement();
+		if (kind === 'replace') announceQueue('');
 		if (!isCurrent()) return false;
 		queue.publish(next, receipt, library?.sources);
 		if (!isCurrent()) return false;
-		effects.syncMiniPlayerHint(next);
+		const selected = currentTrack(queue.snapshot);
+		if (selected) {
+			setMiniPlayerHint({ trackId: selected.id, title: displayTitle(selected), artist: displayArtist(selected) });
+		} else {
+			clearMiniPlayerHint();
+		}
+		// Hint listeners run synchronously and can retire this operation too.
 		return isCurrent();
 	}
 
@@ -76,5 +88,9 @@ export function createPlayerController(
 		return commitQueue(next, 'replace');
 	}
 
-	return { queue, media, get mediaRevision() { return mediaRevision; }, commitQueue, replaceQueue, resetAtAuthBoundary };
+	return {
+		queue, media, get mediaRevision() { return mediaRevision; },
+		get queueAnnouncement() { return queueAnnouncement; }, announceQueue,
+		commitQueue, replaceQueue, resetAtAuthBoundary
+	};
 }

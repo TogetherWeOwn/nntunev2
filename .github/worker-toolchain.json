@@ -60,6 +60,6 @@
     }
   },
   "locks": {
-    "workers/api/Cargo.lock": "5926eaf9192b031f93958a8a66e5ab7aca4c5680d6e9feac96eaca3f01d7e318"
+    "workers/api/Cargo.lock": "5806ae732c41e8a68654bf8d7644cc5b2a8e74c69ddfc8879041f4d909b11af0"
   }
 }

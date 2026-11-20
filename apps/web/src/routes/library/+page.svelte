@@ -1,13 +1,10 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import type { QueuedPlaySource } from '#lib/player/queueController.js';
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
 	import { createPlayerController } from '#lib/player/controller.svelte.js';
 	import { createFavoritesExport } from './favoritesExport.js';
-	import { describeJump, type JumpDirection } from '#lib/player/relativeJump.js';
-	import { restartIsAvailable } from './restartAvailability.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
 	import {
@@ -38,6 +35,7 @@
 		displayArtist,
 		displayTitle,
 		orderLibraryItems,
+		shortTitle,
 		type LibraryOrder
 	} from '#lib/library/order.js';
 	import { filterLibraryItems, type FindScope } from '#lib/library/filter.js';
@@ -58,7 +56,7 @@
 		toggleSelected
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
-	import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+	import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 	import NativePlayer from '#lib/player/NativePlayer.svelte';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import ContextMenu from '#lib/interactions/ContextMenu.svelte';
@@ -145,19 +143,7 @@
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
-	const player = createPlayerController(createQueue([]), {
-		flush: () => tick(),
-		clearShareFeedback,
-		clearJumpFeedback: () => { jumpStatus = ''; },
-		announce: (track) => announceEnd(track),
-		clearRestartFeedback: () => {
-			restartCanSeek = false;
-			restartStatus = '';
-			jumpStatus = '';
-		},
-		clearQueueAnnouncement: () => { queueAnnouncement = ''; },
-		syncMiniPlayerHint
-	});
+	const player = createPlayerController(createQueue([]), { flush: () => tick(), clearShareFeedback });
 	const commitQueue = player.commitQueue;
 	const replaceQueue = player.replaceQueue;
 	const queueController = player.queue;
@@ -235,8 +221,6 @@
 	let rangeAnchorId: string | null = null;
 	// Shift state of the checkbox click whose change event is in flight.
 	let extendSelection = false;
-	let queueAnnouncement = $state('');
-	let queueAnnouncementVersion = $state(0);
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
 	/**
@@ -255,17 +239,8 @@
 	let restoreFilterFocus = false;
 	const repeat = media.repeat;
 
-	function attachNativeAudio(audio: HTMLAudioElement): () => void {
-		return media.attach(audio, {
-			seeking: handleSeeking,
-			position: refreshRestartAvailability
-		});
-	}
-
-	function announceEnd(track?: Track): void {
-		queueAnnouncement = track ? `Playing ${shortTitle(track.title?.trim() ? track.title : track.id)}.` : '';
-		if (track) queueAnnouncementVersion += 1;
-	}
+	const seekFeedback = media.seekFeedback;
+	const attachNativeAudio = media.attach;
 
 	let shareStatus = $state('');
 	let shareFallbackUrl: string | null = $state(null);
@@ -329,20 +304,6 @@
 	const copyFavoritesText = favoritesExport.copy;
 	const downloadFavoritesM3U = favoritesExport.downloadM3U;
 
-	// Restart availability is live native state of the mounted matching
-	// element, re-evaluated on media events — never cached coordinates.
-	// The outcome lives only in one polite status inside the Player region
-	// and clears whenever the current source changes or an auth boundary
-	// purges the queue, so a previous track or account never lingers.
-	let restartCanSeek = $state(false);
-	let restartStatus = $state('');
-	let restartStatusVersion = $state(0);
-	// One-shot readout for Back/Forward 10 seconds; cleared on source change
-	// and at the auth boundary.
-	let jumpStatus = $state('');
-	let jumpStatusVersion = $state(0);
-	let lastJumpSeek: { element: HTMLAudioElement; target: number } | null = null;
-
 	let trackMenu = $state<MenuRequest | null>(null);
 
 	const refresher = createLibraryRefresher({
@@ -396,7 +357,7 @@
 			if (authoritative) {
 				const { next, sources } = queueController.prepareLibrary(state.items);
 				if (next !== queueController.snapshot) queueConfirmGeneration += 1;
-				if (state.loadError && state.items.length === 0) queueAnnouncement = '';
+				if (state.loadError && state.items.length === 0) player.announceQueue('');
 				commitQueue(next, 'replace', { sources, isCurrent });
 			}
 			// Queue publication can reenter the route and revoke this receipt.
@@ -574,7 +535,7 @@
 			.filter((item) => queueController.hasLibraryTrack(item.id));
 		if (missing.length === 0) return;
 		if (!replaceQueue(appendMissingTracks(missing.map(queuedTrackFor)))) return;
-		queueAnnouncement = `Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`;
+		player.announceQueue(`Added ${missing.length} ${missing.length === 1 ? 'track' : 'tracks'} to the queue.`);
 	}
 
 	/**
@@ -603,16 +564,7 @@
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
 		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
-		await playSelected(base, index, evidence, counts);
-	}
-
-	function playSelected(base: QueueState, index: number, source: QueuedPlaySource, suffix = ''): Promise<void> {
-		return media.playSelected(base, index, source, suffix, {
-			commit: replaceQueue,
-			flush: tick,
-			announce: (message) => { queueAnnouncement = message; },
-			bumpAnnouncement: () => { queueAnnouncementVersion += 1; }
-		});
+		await media.playSelected(base, index, evidence, counts);
 	}
 
 	let favoritesAction = 0;
@@ -627,7 +579,7 @@
 		}
 		if (action !== favoritesAction) return;
 		const added = queueController.snapshot.tracks.length - before;
-		queueAnnouncement = `Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`;
+		player.announceQueue(`Queued ${added} ${added === 1 ? 'favorite' : 'favorites'}, ${favoriteTracks.length - added} already queued.`);
 	}
 
 	/** Snapshot the listed favorites, in arranged order, as queue display tracks. */
@@ -639,20 +591,6 @@
 		return favoritesExportSnapshot()
 			.tracks.map((track) => `${track.id}\u0000${track.title}\u0000${track.artist}`)
 			.join('\u0001');
-	}
-
-	/** Mirror the current selection into the metadata-only mobile hint. */
-	function syncMiniPlayerHint(next: QueueState): void {
-		const current = queueCurrentTrack(next);
-		if (current) {
-			setMiniPlayerHint({
-				trackId: current.id,
-				title: displayTitle(current),
-				artist: displayArtist(current)
-			});
-		} else {
-			clearMiniPlayerHint();
-		}
 	}
 
 	function clearShareFeedback(): void {
@@ -667,9 +605,6 @@
 		player.resetAtAuthBoundary();
 		clearShareFeedback();
 		queueShare.reset();
-		restartCanSeek = false;
-		restartStatus = '';
-		jumpStatus = '';
 		shareInvalid = false;
 	}
 
@@ -683,13 +618,6 @@
 		} catch {
 			return undefined;
 		}
-	}
-
-	function shortTitle(title: string): string {
-		// Count code points, not UTF-16 units: slicing between a surrogate pair
-		// would announce a lone surrogate before the ellipsis.
-		const points = Array.from(title);
-		return points.length > 70 ? `${points.slice(0, 69).join('')}…` : title;
 	}
 
 	async function copyTrackLink(id: string, item = items.find((track) => track.id === id)): Promise<void> {
@@ -731,6 +659,7 @@
 		handledShareSearch = search;
 		const account = queueExportAuthGeneration;
 		const intent = media.beginShareInput();
+		// A native retry can run after the URL changes but before afterNavigate.
 		const inputIsCurrent = () => shareAlive && account === queueExportAuthGeneration &&
 			handledShareSearch === search && window.location.search === search;
 		shareInvalid = false;
@@ -756,94 +685,10 @@
 		if (!replaceQueue(
 			selectQueueIndex(appended, appended.tracks.findIndex((track) => track.id === target.trackId))
 		)) return;
-		const source = resolveStreamUrl(queueCurrentTrack(queueController.snapshot));
-		if (!source) return;
-		const trySeek = media.captureShareSeek(intent, { ...target, streamUrl: source }, () => {
-			if (!inputIsCurrent()) return false;
-			const current = queueCurrentTrack(queueController.snapshot);
-			return current?.id === target.trackId && resolveStreamUrl(current) === source;
-		});
+		const trySeek = media.captureShareSeek(intent, target, inputIsCurrent);
 		if (!trySeek) return;
-		// A same-source share skips the source-change reset; the share moves the
-		// position, so an earlier jump readout no longer describes it.
-		jumpStatus = '';
 		// Try after the keyed audio mounts; the controller handles native retries.
 		void tick().then(trySeek);
-	}
-
-	function handleSeeking(element: HTMLAudioElement): void {
-		// Keep the jump's own queued event from erasing its announcement.
-		// A different native seek retires feedback for the old position.
-		if (
-			lastJumpSeek?.element !== element ||
-			!Number.isFinite(element.currentTime) ||
-			Math.abs(element.currentTime - lastJumpSeek.target) > 0.05
-		) {
-			jumpStatus = '';
-			lastJumpSeek = null;
-		}
-	}
-
-	function refreshRestartAvailability(element: HTMLAudioElement): void {
-		restartCanSeek = restartIsAvailable(element);
-	}
-
-	function setRestartStatus(text: string): void {
-		restartStatus = text;
-		restartStatusVersion += 1;
-	}
-
-	function restartCurrentTrack(): void {
-		const current = queueCurrentTrack(queueController.snapshot);
-		if (!shareAlive || !current) return;
-		const source = resolveStreamUrl(current);
-		if (!source) return;
-		const revision = player.mediaRevision;
-		const queueRevision = queueController.revision;
-		const jumpVersion = jumpStatusVersion;
-		media.restart(source, current.title?.trim() ? current.title : current.id, {
-			trackId: current.id,
-			isCurrent: () => shareAlive && revision === player.mediaRevision && queueController.isCurrent(queueRevision) &&
-				jumpVersion === jumpStatusVersion,
-			available: restartIsAvailable,
-			assigned: () => {
-				if (shareAlive && revision === player.mediaRevision && jumpVersion === jumpStatusVersion) jumpStatus = '';
-			},
-			publish: (message, available) => {
-				if (!available) restartCanSeek = false;
-				setRestartStatus(message);
-			}
-		});
-	}
-
-	/**
-	 * Back/Forward 10 seconds act on the mounted audio element for the current
-	 * source only. Like restart, the gesture supersedes a pending inbound-share
-	 * seek for that source even if the jump is refused, so later metadata
-	 * events cannot move the position to the share time.
-	 */
-	function jumpRelative(direction: JumpDirection): void {
-		const element = media.audio;
-		const current = queueCurrentTrack(queueController.snapshot);
-		if (!shareAlive) return;
-		const source = resolveStreamUrl(current);
-		const queueRevision = queueController.revision;
-		const revision = player.mediaRevision;
-		const jumpVersion = jumpStatusVersion;
-		media.jump(source, direction, {
-			trackId: current?.id,
-			isCurrent: () => shareAlive && revision === player.mediaRevision && queueController.isCurrent(queueRevision),
-			assigned: () => {
-				if (!shareAlive || revision !== player.mediaRevision || jumpVersion !== jumpStatusVersion) return;
-				jumpStatus = '';
-			},
-			publish: (outcome) => {
-				// A no-write outcome must not disown an earlier jump's queued event.
-				if (element && outcome.kind === 'jumped') lastJumpSeek = { element, target: outcome.target };
-				jumpStatus = describeJump(direction, outcome);
-				jumpStatusVersion += 1;
-			}
-		});
 	}
 
 	if (typeof window !== 'undefined') {
@@ -859,7 +704,7 @@
 		// live region.
 		if (reordered === queue) return;
 		if (!commitQueue(reordered, 'move')) return;
-		queueAnnouncement = `${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`;
+		player.announceQueue(`${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`);
 	}
 
 	function removeQueuedTrack(index: number): void {
@@ -872,8 +717,7 @@
 		if (next === queue) return;
 		const title = removed.title?.trim() ? removed.title : removed.id;
 		if (!commitQueue(next, 'remove')) return;
-		queueAnnouncement = `${title} removed from the queue.`;
-		queueAnnouncementVersion += 1;
+		player.announceQueue(`${title} removed from the queue.`, true);
 	}
 
 	function clearQueuedTracks(): void {
@@ -883,8 +727,7 @@
 		// region.
 		if (next === queue) return;
 		if (!commitQueue(next, 'clear')) return;
-		queueAnnouncement = 'Queue cleared.';
-		queueAnnouncementVersion += 1;
+		player.announceQueue('Queue cleared.', true);
 	}
 
 	/**
@@ -904,7 +747,7 @@
 		if (selected === queue) return;
 		if (!commitQueue(selected, 'select')) return;
 		const title = target.title?.trim() ? target.title : target.id;
-		queueAnnouncement = `Selected ${title}`;
+		player.announceQueue(`Selected ${title}`);
 	}
 
 	async function playQueuedTrack(id: string): Promise<void> {
@@ -915,7 +758,7 @@
 		if (!target) return;
 		const evidence = queueController.sourceForQueuedPlay(id, resolveStreamUrl(target) || undefined);
 		if (!evidence) return;
-		await playSelected(queue, index, evidence);
+		await media.playSelected(queue, index, evidence);
 	}
 
 	function trimPreviousTracks(): void {
@@ -927,7 +770,7 @@
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
 		if (!commitQueue(trimmed, 'trim')) return;
-		queueAnnouncement = `Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`;
+		player.announceQueue(`Removed ${removed} ${removed === 1 ? 'track' : 'tracks'} before the current track.`);
 	}
 
 	function trimUpcomingTracks(): void {
@@ -938,7 +781,7 @@
 		if (trimmed === queue) return;
 		const removed = queue.tracks.length - trimmed.tracks.length;
 		if (!commitQueue(trimmed, 'trim')) return;
-		queueAnnouncement = `Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`;
+		player.announceQueue(`Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`);
 	}
 
 	function toggleFavorite(id: string): void {
@@ -1001,7 +844,7 @@
 		if (!track) return;
 		const wasFavorite = favorites.includes(id);
 		toggleFavorite(id);
-		queueAnnouncement = `${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`;
+		player.announceQueue(`${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`);
 	}
 
 	function starLabel(track: LibraryItem): string {
@@ -1302,16 +1145,11 @@
 		return current ? [current, ...others] : others;
 	}
 
-	function announceInteraction(text: string): void {
-		queueAnnouncement = text;
-		queueAnnouncementVersion += 1;
-	}
-
 	function availableInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): string[] {
 		const queue = queueController.snapshot;
 		const surviving = survivingInteractionIds(ids, queued ? queue.tracks : source, loading || libraryUnavailable)
 			.filter(queueController.hasLibraryTrack);
-		if (!surviving.length) announceInteraction('That track is no longer available.');
+		if (!surviving.length) player.announceQueue('That track is no longer available.', true);
 		return surviving;
 	}
 
@@ -1336,7 +1174,7 @@
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
 		const counts = ids.length > 1 ? `Added ${added}${surviving.length > added ? `, ${surviving.length - added} already queued` : ''}.` : '';
-		await playSelected(base, index, evidence, (counts + missingInteractionLabel(ids, surviving)).trim());
+		await media.playSelected(base, index, evidence, (counts + missingInteractionLabel(ids, surviving)).trim());
 	}
 
 	function appendInteractionIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
@@ -1345,7 +1183,7 @@
 		if (!surviving.length) return;
 		const result = appendSelection(queue, surviving, source);
 		if (!replaceQueue(result.queue)) return;
-		announceInteraction(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving));
+		player.announceQueue(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving), true);
 	}
 
 	function favoriteInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): void {
@@ -1383,7 +1221,7 @@
 		const next = insertTracksNext(queue, knownTracks(surviving, source));
 		if (next === queue) return;
 		if (!replaceQueue(next)) return;
-		announceInteraction('Tracks placed next in the queue.' + missingInteractionLabel(ids, surviving));
+		player.announceQueue('Tracks placed next in the queue.' + missingInteractionLabel(ids, surviving), true);
 	}
 
 	function insertQueuedIds(ids: readonly string[], beforeId: string | null): void {
@@ -1394,8 +1232,7 @@
 		if (next === queue) return;
 		const added = next.tracks.length - queue.tracks.length;
 		if (!replaceQueue(next)) return;
-		queueAnnouncement = added ? `Added ${added} to the queue.` : 'Queue order updated.';
-		queueAnnouncementVersion += 1;
+		player.announceQueue(added ? `Added ${added} to the queue.` : 'Queue order updated.', true);
 	}
 
 	function reorderQueuedIds(ids: readonly string[], beforeId: string | null): void {
@@ -1408,8 +1245,7 @@
 		const next = insertTracks(queue, tracks, beforeId);
 		if (next === queue) return;
 		if (!replaceQueue(next)) return;
-		queueAnnouncement = 'Queue order updated.';
-		queueAnnouncementVersion += 1;
+		player.announceQueue('Queue order updated.', true);
 	}
 
 	function removeQueuedIds(ids: readonly string[]): void {
@@ -1423,8 +1259,7 @@
 		if (next === queue) return;
 		const removed = queue.tracks.length - next.tracks.length;
 		if (!replaceQueue(next)) return;
-		queueAnnouncement = `${removed} selected ${removed === 1 ? 'track removed' : 'tracks removed'} from queue.`;
-		queueAnnouncementVersion += 1;
+		player.announceQueue(`${removed} selected ${removed === 1 ? 'track removed' : 'tracks removed'} from queue.`, true);
 	}
 
 	function playbackMenuActions(ids: readonly string[], source: () => readonly LibraryItem[] = () => items): MenuAction[] {
@@ -2072,8 +1907,8 @@
 			-->
 			<PlayerQueue
 				state={queue}
-				announcement={queueAnnouncement}
-				announcementVersion={queueAnnouncementVersion}
+				announcement={player.queueAnnouncement.text}
+				announcementVersion={player.queueAnnouncement.version}
 				{favoriteIds}
 				ontogglefavorite={toggleQueuedFavorite}
 				onfavoriteids={(ids) => favoriteInteractionIds(ids, true)}
@@ -2142,8 +1977,7 @@
 	{#if streamUrl}
 		<NativePlayer
 			{currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
-			{restartCanSeek} {restartStatus} {restartStatusVersion} {restartCurrentTrack}
-			{jumpStatus} {jumpStatusVersion} {jumpRelative}
+			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump}
 		/>
 	{/if}
 </main>

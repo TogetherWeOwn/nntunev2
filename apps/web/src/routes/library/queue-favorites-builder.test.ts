@@ -1,8 +1,8 @@
 import { expect, test } from 'vitest';
 import ts from 'typescript';
-import { addTrack, clearQueue, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
+import { addTrack, clearQueue, createQueue, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { readMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
 import type { LibraryItem } from '#lib/library/cache.js';
@@ -27,7 +27,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const script = source.slice(start, source.indexOf('</script', start));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'queueFavorites', 'clearShareFeedback', 'syncMiniPlayerHint'
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'queueFavorites', 'clearShareFeedback'
 	]);
 	// Row selection now clears transient link feedback. Execute that real
 	// dependency with its real initial state, not a no-op handler substitute.
@@ -46,21 +46,21 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const bindings = {
-		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
-		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
+		items: ITEMS, favorites, queue, announcement,
+		addTrack, resolveStreamUrl, displayArtist, displayTitle,
 		createQueue: () => queue, createPlayerController,
-		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `
 		${compiled}
 		const library = queueController.prepareLibrary([...items, ...queue.tracks]);
 		player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true });
+		player.announceQueue(announcement);
 		queueController.subscribe((value) => { queue = value; });
 		return {
 			queueAll: typeof queueFavorites === 'function' ? queueFavorites : () => {},
 			replaceQueue, commitQueue, subscribe: queueController.subscribe,
-			read: () => ({ queue, announcement: queueAnnouncement })
+			read: () => ({ queue, announcement: player.queueAnnouncement.text })
 		};
 	`)(...Object.values(bindings)) as {
 		queueAll: () => void;

@@ -4,10 +4,9 @@ import { displayArtist, displayTitle, orderLibraryItems, type LibraryOrder } fro
 import { selectFavoriteItems } from '#lib/library/favorites.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
 import { groupLibraryItems } from '#lib/library/group.js';
-import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from '#lib/player/queue.js';
+import { createQueue, type QueueState } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 
 // Builder-owned integration regression: the merged favorites/query projections
 // must bound both the bulk action and its disabled/already-queued states.
@@ -26,7 +25,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
 		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks',
-		'addDisplayedTracksToQueue', 'clearShareFeedback', 'syncMiniPlayerHint'
+		'addDisplayedTracksToQueue', 'clearShareFeedback'
 	]);
 	const functions = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) => handlers.has(node.name?.text ?? ''));
 	expect(new Set(functions.map((node) => node.name?.text))).toEqual(handlers);
@@ -50,11 +49,10 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const bindings = {
 		view, favorites, queue, findQuery, findScope: 'both', order, groupByArtist, items: ITEMS,
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
-		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
+		libraryUnavailable: false,
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
-		groupLibraryItems, queueCurrentTrack, resolveStreamUrl,
+		groupLibraryItems, resolveStreamUrl,
 		createQueue: () => queue, createPlayerController,
-		clearMiniPlayerHint, setMiniPlayerHint,
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
 	};
@@ -62,11 +60,12 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		${compiled}
 		const { next, sources: evidence } = queueController.prepareLibrary([...items, ...queue.tracks]);
 		player.commitQueue(next, 'replace', { sources: evidence, isCurrent: () => true });
+		player.announceQueue('Previous outcome');
 		queueController.subscribe((value) => { queue = value; });
 		return {
 			disabled: bulkDisabled, allQueued: bulkAllQueued,
 			add: addDisplayedTracksToQueue,
-			read: () => ({ queue, announcement: queueAnnouncement })
+			read: () => ({ queue, announcement: player.queueAnnouncement.text })
 		};
 	`)(...Object.values(bindings)) as {
 		disabled: boolean; allQueued: boolean; add: () => void;

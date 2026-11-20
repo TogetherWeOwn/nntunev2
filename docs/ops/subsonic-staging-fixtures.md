@@ -1,0 +1,81 @@
+# Inert Subsonic staging fixtures
+
+These recipes contain only authored synthetic data. The measurement mount
+remains off by default. In a separately authorized window, the trusted
+`SUBSONIC_MEASUREMENT_LEASE` appends `;` and a nonempty comma-separated
+allowlist of case IDs to the existing v1 lease fields. The entire value is
+bounded to 640 bytes. Unknown, duplicate or empty entries invalidate the whole
+schedule. The SHA, expiry, exact HTTPS staging host and runner bearer checks
+remain in force. The runner selects one listed case with the
+`X-Subsonic-Measurement-Case` header; missing, malformed and unlisted selectors
+on an armed mount receive the same fixed 404 as a missing runner bearer.
+Fixture selection follows real auth against the dedicated binding and the
+lease-principal match. No request can supply a recipe, ceiling or identity;
+no case falls back to ordinary staging Hyperdrive or a catalogue database.
+
+## Fixture-to-boundary map
+
+Each triplet uses the suffixes `below`, `exact`, `over` in that order. Sizes are
+uncompressed UTF-8 response bytes. `A` is artist ID
+`00000000-0000-4000-8000-000000000001`; `R` is release ID
+`00000000-0000-4000-8000-000000000002`. Request paths below are under `/rest/`.
+
+| Fixture IDs | Boundary inputs | Request | Expected HTTP status / bytes |
+| --- | --- | --- | --- |
+| `rows-*` | 1,023 / 1,024 / 1,025 track rows (one artist and release) | `getArtist?id=A&f=json` | 200 / 492; 200 / 492; 503 / 112 |
+| `field-*` (WASM only) | 1,023 / 1,024 / 1,025 title bytes | `getAlbum?id=R&f=json` | 200 / 1,991; 200 / 1,992; 503 / 112 |
+| `text-*` | 262,143 / 262,144 / 262,145 raw field bytes across 258 rows | `getArtists?f=json` | 200 / 296; 200 / 296; 503 / 112 |
+| `output-json-*` | 262,143 / 262,144 / 262,145 encoded bytes | `getAlbum?id=R&f=json` | 200 / 262,143; 200 / 262,144; 413 / 122 |
+| `output-xml-*` | Same, including XML escaping | `getAlbum?id=R` | 200 / 262,143; 200 / 262,144; 413 / 130 |
+| `output-jsonp-*` | Same, including wrapper and callback | `getAlbum?id=R&f=jsonp&callback=fixture.cb` | 200 / 262,143; 200 / 262,144; 413 / 122 (plain JSON) |
+| `large-mixed` | One artist, four releases, 512 track occurrences; 256-byte UTF-8 titles with repeated escaping | First release via the three `getAlbum` requests above | 200 / 106,659 (JSON), 118,091 (XML), 106,676 (JSONP) |
+
+`empty` and `small` are unchanged. The short `rows-*` and `text-*` projections
+intentionally avoid the independent output cap while building the full snapshot.
+Row/text/charge preflight runs before raw row reservation; the existing counted
+renderer rejects over-cap output before allocating the response body.
+
+## Runner crosswalk (not an executable schedule)
+
+| Slots | Case selection and expected outcome |
+| --- | --- |
+| 01–06 | `empty` artist index, then `small` album in JSON, XML and JSONP (four complete 200s). Withhold the runner bearer for fixed 404; withhold Subsonic credentials but send the runner bearer and `small` for HTTP 200 with protocol error 40 and no catalogue. |
+| 07–09 | `rows-{below,exact,over}` as above. |
+| 10–12 | `charge-{below,exact,over}` as pinned below. |
+| 13–15 | `text-{below,exact,over}` as above. |
+| 16–24 | `output-{json,xml,jsonp}-{below,exact,over}`, in format order as above. |
+| 25–36 | `large-mixed` first release, four samples per format using the body byte counts above. |
+| 37–48 | Six `large-mixed` pairs: two ordinary, two held-reader, two disconnect. Record observed overlap and completion vs. busy refusal; the isolate-local permit does not guarantee a busy response across isolates. |
+
+Slots count starts, not distinct case IDs or retries. The allowlist does not
+count starts, schedule pairs, provision the auth binding or authorize live use.
+
+### Charge triplet
+
+Use one unchanged authenticated `GET /rest/getArtists?f=json` request (with
+its Subsonic authentication parameters) across all three selectors. Each maps
+to `small`. Write `P` for the cumulative ledger at the end of authenticated
+parameter parsing. It includes request collection, credential decode, real
+auth and dispatch parameter allocations. That prefix varies with the
+credential shape; it is not refunded, reset or assumed to be fixture data.
+The lower ceiling is `min(8 MiB, P + headroom)` on that **same** ledger.
+
+| Slot | Case | Headroom (bytes) | Attempted cumulative charge | HTTP status / body bytes |
+| --- | --- | ---: | ---: | --- |
+| 10 | `charge-below` | 4,025 | P + 4,024 | 200 / 296; complete artist index |
+| 11 | `charge-exact` | 4,024 | P + 4,024 | 200 / 296; byte-identical index |
+| 12 | `charge-over` | 4,023 | P + 4,024 | 503 / 112; fixed JSON only, `Retry-After: 1` |
+
+The wasm32 ledger delta is **4,024 bytes**: raw rows 768, owned row copy 768,
+mapped snapshot 1,040, artist index and response graph 1,136, and exact 296-byte
+body buffer 312 after allocator rounding. At one byte short the writer refuses
+that final buffer before any response data is sent. This is not the separate
+291,928-byte `large-mixed` raw-row phase oracle, and does not cover the Worker
+JS transfer copy or isolate memory. Non-charge cases keep the default 8 MiB
+ceiling. All cases retain the row, field, aggregate text and document limits.
+
+The `worker-release-builds` job exercises the boundary presets on release
+WASM and the charge triplet through the release Worker's real authentication
+against disposable PostgreSQL. `api-migrations` separately tests PostgreSQL
+membership, mirror row/text preflight and transfer/transaction behavior using
+disposable databases, not a shared mirror.

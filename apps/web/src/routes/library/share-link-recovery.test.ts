@@ -7,15 +7,14 @@ import { createLibraryRefresher } from '#lib/library/refresh.js';
 import { clearFavoritesAtAuthBoundary, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
 import { clearRecentFindsAtAuthBoundary, loadRecentFinds } from '#lib/library/recent-finds.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
-import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { displayArtist, displayTitle, orderLibraryItems, shortTitle } from '#lib/library/order.js';
+import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 import { survivingInteractionIds } from './interactionSelection.js';
-import { restartIsAvailable } from './restartAvailability.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -55,7 +54,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare, restartIsAvailable,
+		createQueueShare,
 		createPlayerController: (initial: queueFunctions.QueueState, end: Parameters<typeof createPlayerController>[1]) =>
 			createPlayerController(initial, end, (audio, source) => audio.isConnected && audio.getAttribute('src') === source),
 		createFavoritesExport,
@@ -64,13 +63,14 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		insertTracks: queueFunctions.insertTracks, survivingInteractionIds,
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
-		clearMiniPlayerHint, setMiniPlayerHint,
+		clearMiniPlayerHint,
 		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag,
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
 		afterNavigate: () => {},
+		shortTitle,
 		tick,
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
@@ -88,7 +88,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 			currentAudio: () => media.audio,
 			playTop: () => { renderedItems = items; return playDisplayedFromTop(); },
 			playIds: () => playLibraryIds(['coral']),
-			feedback: () => [queueAnnouncement, queueAnnouncementVersion],
+			feedback: () => [player.queueAnnouncement.text, player.queueAnnouncement.version],
 			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: media.pendingShareSeek, loadError })
 		};
 	`)(...Object.values(bindings)) as {
@@ -121,7 +121,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 }
 
 function playableAudio(play: () => Promise<void>, src = ITEMS[0].streamUrl) {
-	return { currentTime: 0, duration: 60, paused: true, isConnected: true, getAttribute: () => src, play };
+	return Object.assign(new EventTarget(), { currentTime: 0, duration: 60, paused: true, isConnected: true, getAttribute: () => src, play });
 }
 
 function serve(payload: { id: string; title: string; streamUrl?: string }[] = ITEMS) {
@@ -146,7 +146,7 @@ for (const status of [500, 404]) {
 		expect(queueFunctions.currentTrack(page.read().queue)?.id).toBe('coral');
 		expect(page.read().shareInvalid).toBe(false);
 		expect(page.read().pendingShareSeek?.seconds).toBe(90);
-		const audio = Object.assign(new EventTarget(), playableAudio(async () => {}));
+		const audio = playableAudio(async () => {});
 		page.attachNativeAudio(audio);
 		audio.dispatchEvent(new Event('loadedmetadata'));
 		expect(audio.currentTime).toBe(60);
@@ -328,7 +328,7 @@ test('queue publication exposes new evidence before a reentrant auth boundary', 
 			expect(page.requiresSignIn()).toBe(false);
 			expect(page.read().queue).toBe(queue);
 		});
-		page.setAudio({ currentTime: 0, duration: 60, paused: false, pause });
+		page.setAudio(Object.assign(new EventTarget(), { currentTime: 0, duration: 60, paused: false, pause }));
 		page.handleLocalAuthTransition();
 		expect(pause).toHaveBeenCalledOnce();
 		expect(page.currentAudio()).toBeUndefined();
