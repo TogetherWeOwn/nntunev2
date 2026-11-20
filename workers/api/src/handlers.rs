@@ -7780,6 +7780,17 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    // Keep the largest route's state out of every caller's future.
+    Box::pin(dispatch_request(ctx, req)).await
+}
+
+async fn dispatch_request<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
     if req.body.len() > max_body_bytes(&req.method, &req.path) {
         // Oversized admin uploads answer the 413 failure shape (with a
         // null job: nothing was parsed, so no row and no audit), never
@@ -7810,6 +7821,7 @@ where
             }
         }
     }
+    use listen_history_controls as listens;
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/healthz") => json_response(
             200,
@@ -7850,13 +7862,8 @@ where
         // in the scope map, so it never enters the gate.
         ("POST", "/v1/plays") => play_issue(ctx, req).await,
         ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
-        // Keep the privacy futures off the shared dispatcher's stack frame.
-        ("POST", listen_history_controls::EXPORT_PATH) => {
-            Box::pin(listen_history_controls::export(ctx, req)).await
-        }
-        ("DELETE", listen_history_controls::CLEAR_PATH) => {
-            Box::pin(listen_history_controls::clear(ctx, req)).await
-        }
+        ("POST", listens::EXPORT_PATH) => listens::export(ctx, req).await,
+        ("DELETE", listens::CLEAR_PATH) => listens::clear(ctx, req).await,
         // Internal meter sink: HMAC-authenticated inside the handler
         // (crate::meter_sink), no session/bearer surface. The scope
         // map denies this path to bearer credentials, so the gate
