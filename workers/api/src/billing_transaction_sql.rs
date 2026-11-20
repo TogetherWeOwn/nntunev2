@@ -58,7 +58,11 @@ pub(crate) enum ReconcileProbe {
     None,
     WorkerDeadline,
     ServerWatchdog,
+    ParentCascade,
 }
+
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) const PARENT_CASCADE_GATE: i64 = 781349054;
 
 pub(crate) async fn apply_reconcile_transaction(
     transaction: &mut tokio_postgres::Client,
@@ -181,7 +185,15 @@ pub(crate) async fn apply_reconcile_transaction(
         }
         // The probes run only after all billing writes and before COMMIT.
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-        if probe != ReconcileProbe::None {
+        if probe == ReconcileProbe::ParentCascade {
+            transaction
+                .query_typed(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    &[(&PARENT_CASCADE_GATE, Type::INT8)],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+        } else if probe != ReconcileProbe::None {
             let written = transaction.query_one(
                 "SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[],
             ).await.map_err(|_| StoreError)?;

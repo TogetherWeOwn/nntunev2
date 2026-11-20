@@ -394,6 +394,138 @@ pub(crate) async fn test_reconcile_raw_replace(commit: bool) -> Result<(), &'sta
     ).await.map_err(|_| diagnostic.get())
 }
 
+// An empty stale outcome takes exclusion without acquiring a history FK lock.
+// This isolates the cascade's child-table wait from the separate parent cycle.
+pub(crate) async fn test_reconcile_before_parent_delete(commit: bool) -> Result<(), &'static str> {
+    use crate::billing_transaction_sql::PARENT_CASCADE_GATE;
+    use futures_util::future::{join, select, Either};
+    use std::{cell::Cell, rc::Rc};
+
+    setup_ack_fixture().await?;
+    let store = PgStore {
+        env: None,
+        trace_id: "worker-before-parent-delete-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        work_deadline_observer: None,
+        cancel_token_observer: None,
+    };
+    let user = "worker_fault_user";
+    let mut outcome = test_outcome();
+    store
+        .store_reconcile_owned(user.into(), outcome.clone(), ReconcileProbe::None)
+        .await
+        .map_err(|_| "parent delete: seed through dormant store failed")?;
+    outcome.explicit_stale = true;
+    outcome.history.clear();
+
+    let phase = Rc::new(Cell::new("parent delete: connect independent observer"));
+    let diagnostic = phase.clone();
+    billing_budget::with_owned_connection(
+        "127.0.0.1", 5432, CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |db| Box::pin(async move {
+            phase.set("parent delete: snapshot and hold the Worker before COMMIT");
+            let before = parent_delete_snapshot(db).await?;
+            if before.0.is_none() || before.1.is_none() || before.2.is_none() {
+                return Err(StoreError);
+            }
+            // Keep samples in autocommit so pg_stat_activity is refreshed.
+            db.query_one("SELECT pg_advisory_lock($1)", &[&PARENT_CASCADE_GATE])
+                .await.map_err(|_| StoreError)?;
+            let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, ReconcileProbe::ParentCascade));
+            let worker = match select(reconcile.as_mut(), Box::pin(wait_lock_cycle(|| async {
+                let row = db.query_opt(
+                    "SELECT l.pid FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a USING (pid)
+                     WHERE l.relation = 'public.subscriptions'::regclass AND l.granted
+                       AND l.mode = 'ShareRowExclusiveLock'
+                       AND a.application_name = 'owned_billing_reconcile_test'
+                       AND a.wait_event_type = 'Lock' AND a.wait_event = 'advisory'
+                       AND a.query = 'SELECT pg_advisory_xact_lock($1)'
+                       AND pg_backend_pid() = ANY(pg_blocking_pids(l.pid))", &[],
+                ).await.map_err(|_| StoreError)?;
+                Ok(row.map(|row| row.get::<_, i32>(0)))
+            }))).await {
+                Either::Left(_) => return Err(StoreError),
+                Either::Right((worker, _)) => worker?,
+            };
+
+            let deleter_pid = Rc::new(Cell::new(None::<i32>));
+            let record_pid = deleter_pid.clone();
+            let mut delete = Box::pin(billing_budget::with_owned_connection(
+                "127.0.0.1", 5432, CONNECTION,
+                |_| Box::pin(async { Ok(()) }),
+                move |raw| Box::pin(async move {
+                    raw.batch_execute("BEGIN; SET LOCAL statement_timeout = '5s'")
+                        .await.map_err(|_| StoreError)?;
+                    record_pid.set(Some(raw.query_one("SELECT pg_backend_pid()", &[])
+                        .await.map_err(|_| StoreError)?.get(0)));
+                    if raw.execute("DELETE FROM public.users WHERE id = $1", &[&user])
+                        .await.map_err(|_| StoreError)? != 1
+                    {
+                        return Err(StoreError);
+                    }
+                    raw.batch_execute(if commit { "COMMIT" } else { "ROLLBACK" })
+                        .await.map_err(|_| StoreError)
+                }),
+                |_| {},
+            ));
+            phase.set("parent delete: cascade did not wait on the Worker's subscription exclusion");
+            let deleter = match select(delete.as_mut(), Box::pin(wait_lock_cycle(|| async {
+                let Some(pid) = deleter_pid.get() else { return Ok(None); };
+                let waiting: bool = db.query_one(
+                    "SELECT $2 = ANY(pg_blocking_pids($1)) AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_locks WHERE pid = $1
+                          AND relation = 'public.subscriptions'::regclass
+                          AND mode = 'RowExclusiveLock' AND NOT granted)", &[&pid, &worker],
+                ).await.map_err(|_| StoreError)?.get(0);
+                Ok(waiting.then_some(pid))
+            }))).await {
+                Either::Left(_) => return Err(StoreError),
+                Either::Right((deleter, _)) => deleter?,
+            };
+
+            phase.set("parent delete: plain read did not preserve the committed snapshot while waiting");
+            if parent_delete_snapshot(db).await? != before {
+                return Err(StoreError);
+            }
+            let released: bool = db.query_one("SELECT pg_advisory_unlock($1)", &[&PARENT_CASCADE_GATE])
+                .await.map_err(|_| StoreError)?.get(0);
+            if !released {
+                return Err(StoreError);
+            }
+            phase.set("parent delete: Worker or raw delete failed after release");
+            let (reconciled, deleted) = join(reconcile, delete).await;
+            reconciled?;
+            deleted?;
+            phase.set("parent delete: partial cascade, changed rollback snapshot or retained lock");
+            let after = parent_delete_snapshot(db).await?;
+            let locked: bool = db.query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE pid IN ($1, $2)
+                   AND relation IN ('public.users'::regclass, 'public.subscriptions'::regclass,
+                                    'public.paid_invoice_history'::regclass))", &[&worker, &deleter],
+            ).await.map_err(|_| StoreError)?.get(0);
+            if locked || after != if commit { (None, None, None) } else { before } {
+                return Err(StoreError);
+            }
+            Ok(())
+        }),
+        |_| {},
+    ).await.map_err(|_| diagnostic.get())
+}
+
+async fn parent_delete_snapshot(
+    db: &tokio_postgres::Client,
+) -> Result<(Option<String>, Option<String>, Option<String>), StoreError> {
+    let row = db.query_one(
+        "SELECT (SELECT jsonb_agg(to_jsonb(u) ORDER BY id)::text FROM public.users u),
+                (SELECT jsonb_agg(to_jsonb(s) ORDER BY stripe_subscription_id)::text FROM public.subscriptions s),
+                (SELECT jsonb_agg(to_jsonb(h) ORDER BY stripe_invoice_id)::text FROM public.paid_invoice_history h)",
+        &[],
+    ).await.map_err(|_| StoreError)?;
+    let snapshot = || Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?));
+    snapshot().map_err(|_: tokio_postgres::Error| StoreError)
+}
+
 // The raw transaction first holds a row lock that is compatible with table
 // exclusion. Its later write must wait for the Worker, which waits on that row.
 pub(crate) async fn test_reconcile_lock_cycle(row_update: bool) -> Result<(), &'static str> {
