@@ -217,6 +217,20 @@ class RecordingAliasProjectionTest(ProjectionTestCase):
     output = "mbdump-recording_alias.tsv"
 
     def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        self.assert_alias_output_matches_in_both_modes()
+
+    def test_conflicting_primaries_break_ties_by_sort_name_then_id(self):
+        aliases = self.raw / "recording_alias"
+        rows = aliases.read_bytes().splitlines(keepends=True)
+        # MusicBrainz permits only one primary per non-null locale. Exercise
+        # the curator's fallback ordering separately from the normal fixture.
+        aliases.write_bytes(b"".join(
+            row.removesuffix(b"f\tf\n") + b"t\tf\n" if row.startswith((b"708\t", b"710\t")) else row
+            for row in rows
+        ))
+        self.assert_alias_output_matches_in_both_modes()
+
+    def assert_alias_output_matches_in_both_modes(self):
         expected = (ROOT / "tests" / "expected" / self.output).read_bytes()
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
@@ -429,6 +443,8 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
 
     def test_empty_table_emits_empty_sidecar_in_both_modes(self):
         self.edges.write_bytes(b"")
+        # The alias sidecar also validates referenced recording IDs.
+        (self.raw / "recording_alias").write_bytes(b"")
         # Unreferenced keys retain the legacy loaders' acceptance rules.
         for table, key in (("recording", b"50"), ("link_type", b"504")):
             path = self.raw / table
