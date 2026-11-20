@@ -7876,9 +7876,12 @@ mod tests {
             "/v1/me/likes/track/{target_id}"
         );
         for path in [
+            "/v1/me/likes/track",
             "/v1/me/likes/track/",
+            "/v1/me/likes/track//Job_A",
             "/v1/me/likes/track/Job_A/",
             "/v1/me/likes/track/Job_A/nested",
+            "/v1/me/likes/release/Job_A",
         ] {
             assert_eq!(served_display_path(path), "unknown", "{path}");
         }
