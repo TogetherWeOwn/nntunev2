@@ -66,10 +66,28 @@ test('reloading the document finishes the started listen', async ({ page, reques
 });
 
 test('a restored page starts a fresh listen without reopening the auth scope', async ({ page }) => {
+	type RestoreWindow = Window & { __historyEventPosts: number; __nntuneFixtureGrant?: string };
+	await page.addInitScript(() => {
+		const fixture = window as RestoreWindow;
+		fixture.__historyEventPosts = 0;
+		const fetchOriginal = window.fetch.bind(window);
+		window.fetch = (input, init) => {
+			// A new start calls fetch synchronously; count it before Playwright routes the request.
+			if (String(input).endsWith('/v1/plays/events') && init?.method === 'POST') {
+				fixture.__historyEventPosts++;
+			}
+			return fetchOriginal(input, init);
+		};
+	});
 	const { bodies, contextLoads } = await mountDemo(page);
+	const postCount = () => page.evaluate(() => (window as RestoreWindow).__historyEventPosts);
 	const pin = (id: string) => page.evaluate((id) => {
-		(window as { __nntuneFixtureGrant?: string }).__nntuneFixtureGrant = id;
+		(window as RestoreWindow).__nntuneFixtureGrant = id;
 	}, id);
+	const first = {
+		playback_id: '00000000-0000-0000-0000-000000000000', track_id: 'demo-track', event: 'start', context
+	};
+	const finished = [first, { ...first, event: 'skip' }];
 	await pin('A'.repeat(22));
 	const started = startResponse(page);
 	await page.getByTestId('queue-select-demo-track').click();
@@ -78,27 +96,35 @@ test('a restored page starts a fresh listen without reopening the auth scope', a
 		page.evaluate((type) => window.dispatchEvent(new PageTransitionEvent(type, { persisted: true })), type);
 	const playing = () => page.getByTestId('demo-audio').evaluate((el) => el.dispatchEvent(new Event('playing')));
 	await persistedEvent('pagehide');
-	await expect.poll(() => bodies).toEqual([bodies[0], { ...bodies[0], event: 'skip' }]);
-	await playing(); // Ignore queued media events while the page is hidden.
+	await expect.poll(() => bodies).toEqual(finished);
 	await persistedEvent('pageshow');
-	await playing(); // The same grant resumes the finished listen, so no new start.
-	await pin('A'.repeat(21) + 'Q'); // An explicit new grant restarts with the original context.
+	await playing(); // The same grant must not restart, even after restoring.
+	expect(await postCount()).toBe(2);
+
+	await persistedEvent('pagehide');
+	await pin('A'.repeat(21) + 'Q');
+	await playing(); // A fresh, valid grant must not start while hidden.
+	expect(await postCount()).toBe(2);
+	await persistedEvent('pageshow');
+	expect(await postCount()).toBe(2); // Restoring alone must not start it either.
 	const restored = startResponse(page);
 	await playing();
 	await restored;
-	expect(contextLoads()).toBe(1);
-	expect(bodies).toEqual([
-		bodies[0], { ...bodies[0], event: 'skip' },
-		{ ...bodies[0], playback_id: '00000000-0000-0000-0000-000000000001' }
-	]);
+	const expected = [...finished, { ...first, playback_id: '00000000-0000-0000-0000-000000000001' }];
+	expect(bodies).toEqual(expected);
+	expect(await postCount()).toBe(3);
+
 	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
 		key: 'nntune.library.auth-transition.v1'
 	})));
 	await persistedEvent('pagehide');
 	await persistedEvent('pageshow');
-	await page.getByTestId('demo-audio').evaluate((el) => el.dispatchEvent(new Event('playing')));
+	await pin('A'.repeat(21) + 'g'); // Auth reset must prevent delivery even for a fresh grant.
+	await playing();
+	expect(await postCount()).toBe(3);
+	expect(contextLoads()).toBe(1);
 	await page.reload({ waitUntil: 'domcontentloaded' });
-	expect(bodies.map((body) => body.event)).toEqual(['start', 'skip', 'start']);
+	expect(bodies).toEqual(expected);
 });
 
 test('pause keeps the listen but Next at the queue end abandons it', async ({ page }) => {
