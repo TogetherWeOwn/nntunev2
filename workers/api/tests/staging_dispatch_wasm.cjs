@@ -42,11 +42,31 @@ test('busy refusal and app-open timeout release the permit', { timeout: 10000 },
 
 test('fixture authorization gates account and catalogue reads and permits charged dispatch', async () => {
   for (const endpoint of ['getLicense', 'getArtists']) {
-    const denied = await dispatch(request(`${endpoint}?f=json`), () => true, false);
+    const denied = await dispatch(request(`${endpoint}?f=json`), () => true, false, true);
     assert.equal(JSON.parse(await refusal(denied, 200))['subsonic-response'].error.code, 50);
   }
   const allowed = await dispatch(request('getMusicFolders?f=json'), () => true, true);
   const payload = JSON.parse(await refusal(allowed, 200))['subsonic-response'];
   assert.equal(payload.status, 'ok');
   assert.deepEqual(payload.musicFolders.musicFolder, [{ id: 1, name: 'Music' }]);
+});
+
+test('authorized synthetic rows use the bounded snapshot and all three render formats', async () => {
+  const route = 'getAlbum?id=00000000-0000-4000-8000-000000000002';
+  const empty = await dispatch(request('getArtists?f=json'), () => true, true, false);
+  const emptyPayload = JSON.parse(await refusal(empty, 200))['subsonic-response'];
+  assert.equal(emptyPayload.status, 'ok');
+  assert.equal(emptyPayload.artists.index?.length ?? 0, 0);
+
+  const render = (format) => dispatch(request(`${route}${format}`), () => true, true, true);
+  const json = await refusal(await render('&f=json'), 200);
+  const { album, status } = JSON.parse(json)['subsonic-response'];
+  assert.equal(status, 'ok');
+  assert.equal(album.name, 'Fixture <Album>');
+  assert.equal(album.artist, 'Fixture 雪 & Wind');
+  assert.equal(album.song.length, 1);
+  assert.equal(album.song[0].title, 'Fixture "Track"');
+  assert.match(await refusal(await render(''), 200), /name="Fixture &lt;Album&gt;"/);
+  const jsonp = await refusal(await render('&f=jsonp&callback=fixture.cb'), 200);
+  assert.equal(jsonp, `/**/fixture.cb(${json});`);
 });

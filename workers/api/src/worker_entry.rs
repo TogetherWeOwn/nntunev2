@@ -1003,30 +1003,30 @@ impl PgStore {
         let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
         crate::billing_store_classification::validate_history_target(&outcome)
             .map_err(|_| failed())?;
-        #[cfg(feature = "billing-owned-wasm-test")]
-        let (host, port, connection_string) = (
-                "127.0.0.1".to_owned(),
-                match self.trace_id.as_str() {
-                    "worker-commit-ack-loss-test" => 15432,
-                    "worker-cancel-test" => 15433,
-                    _ => 5432,
-                },
-                "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
-            );
-        #[cfg(not(feature = "billing-owned-wasm-test"))]
-        let (host, port, connection_string) = {
-            let env = self.env.as_ref().ok_or(StoreError)?;
-            let hyperdrive = env.hyperdrive(HYPERDRIVE_BINDING).map_err(|_| StoreError)?;
-            (
-                hyperdrive.host().to_owned(),
-                hyperdrive.port(),
-                hyperdrive.connection_string(),
-            )
-        };
-        billing_budget::with_owned_connection(
-            &host,
-            port,
-            &connection_string,
+        billing_budget::with_owned_connection_from(
+            || {
+                #[cfg(feature = "billing-owned-wasm-test")]
+                let target = (
+                    "127.0.0.1".to_owned(),
+                    match self.trace_id.as_str() {
+                        "worker-commit-ack-loss-test" => 15432,
+                        "worker-cancel-test" => 15433,
+                        _ => 5432,
+                    },
+                    "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_ack sslmode=disable application_name=owned_billing_reconcile_test".to_owned(),
+                );
+                #[cfg(not(feature = "billing-owned-wasm-test"))]
+                let target = {
+                    let env = self.env.as_ref().ok_or(StoreError)?;
+                    let hyperdrive = env.hyperdrive(HYPERDRIVE_BINDING).map_err(|_| StoreError)?;
+                    (
+                        hyperdrive.host().to_owned(),
+                        hyperdrive.port(),
+                        hyperdrive.connection_string(),
+                    )
+                };
+                Ok(target)
+            },
             |client| {
                 #[cfg(feature = "billing-owned-wasm-test")]
                 if let Some(observer) = &self.cancel_token_observer {
@@ -5127,10 +5127,11 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
+                // Keep the session-path probe unnamed through Hyperdrive.
                 let row = client
-                    .query_opt(
+                    .query_typed_opt(
                         crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL,
-                        &[&user_id],
+                        &[(&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -7869,6 +7870,11 @@ mod tests {
             "/v1/me/likes"
         );
         assert_eq!(served_display_path("/v1/me/likes/track/alice"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/taste?user_id=bob"),
+            "/v1/me/taste"
+        );
+        assert_eq!(served_display_path("/v1/me/taste/bob"), "unknown");
     }
 
     /// Drive one ready future to completion on a noop waker (the gate

@@ -65,6 +65,7 @@ pub mod stripe;
 pub mod subsonic_auth;
 pub mod subsonic_config;
 pub mod subsonic_dispatch;
+pub mod subsonic_experiment_gate;
 pub mod subsonic_http;
 pub mod subsonic_lifecycle;
 #[cfg(target_arch = "wasm32")]

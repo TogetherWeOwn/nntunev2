@@ -483,11 +483,11 @@ class UnappliedRename:
     new_path: str
     sha256: str
     target: str
+    reviewed_merge: str | None = None
 
-    def verify(self, history, entries, entry, events):
-        if len(events) != 1 or entry["target"] != self.target:
-            raise HistoryError("unapplied rename lacks a single exact reviewed edge and target")
-        event, = events
+    def verify(self, history, entry, event):
+        if entry["target"] != self.target:
+            raise HistoryError("unapplied rename differs from reviewed target")
         parent, child, old, new, old_sha, new_sha = event
         if ((parent, old, new) != (self.reviewed_head, self.old_path, self.new_path)
                 or not old_sha == new_sha == entry["sha256"] == self.sha256):
@@ -497,6 +497,8 @@ class UnappliedRename:
         if len(parents) != 2 or len(other) != 1:
             raise HistoryError("unapplied rename must directly merge the reviewed head with main")
         main = other[0]
+        if self.reviewed_merge is not None and (child, main) != (self.reviewed_merge, self.accepted_base):
+            raise HistoryError("unapplied rename differs from exact reviewed merge and main parent")
         for ancestor, descendant in ((self.accepted_base, main), (main, history.base)):
             if history.git("merge-base", "--all", ancestor, descendant).decode().splitlines() != [ancestor]:
                 raise HistoryError("unapplied rename merge parent is outside accepted main lineage")
@@ -506,20 +508,42 @@ class UnappliedRename:
         if (new in before or old in after or after[new] != oid
                 or list(before.values()).count(oid) != 1 or list(after.values()).count(oid) != 1):
             raise HistoryError("unapplied rename does not have unique byte-identical Git blobs")
-        final = history.tree(history.head)
-        if old in final or list(final.values()).count(oid) != 1:
-            raise HistoryError("unapplied rename does not have a unique final Git identity")
-        accepted = history.tree(history.base)
-        prefix = parse_manifest(history.git("show", f"{history.base}:migrations/manifest.toml",
-                                            limit=MAX_INPUT).decode("utf-8"))
-        if (old in accepted or new in accepted or entries[:len(prefix)] != prefix
-                or any(final.get(path) != blob for path, blob in accepted.items())):
-            raise HistoryError("unapplied rename changes the accepted migration prefix")
-        return event
+
+
+def verify_unapplied_chain(history, entries, entry, pins, events):
+    if len(pins) != len(events):
+        raise HistoryError("unapplied rename lacks the exact reviewed edge chain")
+    prior = None
+    for pin, event in zip(pins, events):
+        # Only the legacy first edge may use an ancestry-only pin.
+        if prior is not None and pin.reviewed_merge is None:
+            raise HistoryError("unapplied rename after the first edge requires an exact reviewed merge pin")
+        pin.verify(history, entry, event)
+        parent, _, old, _, _, _ = event
+        # A merge between renames is fine only if it carries the earlier edge
+        # on the very path that is about to be renamed again.
+        if prior is not None:
+            _, inherited = history.states.get(parent, {}).get(old, ((), ()))
+            if prior[3] != old or prior not in inherited:
+                raise HistoryError("unapplied rename edges are not contiguous in Git lineage")
+        prior = event
+
+    old_paths = {pin.old_path for pin in pins}
+    new = pins[-1].new_path
+    final = history.tree(history.head)
+    oid = history.tree(events[-1][1])[new]
+    if old_paths.intersection(final) or list(final.values()).count(oid) != 1:
+        raise HistoryError("unapplied rename does not have a unique final Git identity")
+    accepted = history.tree(history.base)
+    prefix = parse_manifest(history.git("show", f"{history.base}:migrations/manifest.toml",
+                                        limit=MAX_INPUT).decode("utf-8"))
+    if ((old_paths | {new}).intersection(accepted) or entries[:len(prefix)] != prefix
+            or any(final.get(path) != blob for path, blob in accepted.items())):
+        raise HistoryError("unapplied rename changes the accepted migration prefix")
 
 
 def verify(root, base, head, manifest_text, coverage=None, *, budget=None, audit=None,
-           unapplied=None, unapplied_aliases=()):
+           unapplied=(), unapplied_aliases=()):
     """Return Git-derived edges by final entry; validate all claimed provenance.
 
     Common-baseline metadata was verified when introduced and is immutable.
@@ -535,6 +559,7 @@ def verify(root, base, head, manifest_text, coverage=None, *, budget=None, audit
     states = history.collect()
     owners, result = {}, {}
     chronology = {commit: i for i, (commit, _parents) in enumerate(history.commits)}
+    reviewed_chains = {pin.new_path: unapplied[:i] for i, pin in enumerate(unapplied, 1)}
     for entry in entries:
         name, path = entry["file"], "migrations/" + entry["file"]
         if history.sha(head, path) != entry["sha256"]:
@@ -557,24 +582,25 @@ def verify(root, base, head, manifest_text, coverage=None, *, budget=None, audit
         for alias in new_aliases:
             if not any(e[2] == "migrations/" + alias[0] and e[4] == alias[1] for e in events):
                 raise HistoryError("new applied alias lacks genuine byte-identical historical provenance")
-        unapplied_edge = None
-        if unapplied and path == unapplied.new_path and name not in previous:
-            unapplied_edge = unapplied.verify(history, entries, entry, events)
+        ordered = sorted(events, key=lambda e: (chronology[e[1]], e))
+        unapplied_edges = ()
+        if path in reviewed_chains and name not in previous:
+            verify_unapplied_chain(history, entries, entry, reviewed_chains[path], ordered)
+            unapplied_edges = events
             if audit is not None:
-                audit["unapplied_rename"] = dict(zip(EDGE_KEYS, unapplied_edge))
+                audit["unapplied_renames"] = [dict(zip(EDGE_KEYS, edge)) for edge in ordered]
         for event in events:
             if event in owners and owners[event] != name:
                 raise HistoryError("rename edge resolves to multiple current entries")
             owners[event] = name
             identical = event[4] == event[5] == entry["sha256"]
             applied = aliases | {(name, entry["sha256"])}
-            if (identical and event != unapplied_edge
+            if (identical and event not in unapplied_edges
                     and (event[2].removeprefix("migrations/"), event[4]) not in applied):
                 raise HistoryError("byte-identical rename lacks renamed_from applied alias")
             if not identical and event not in claimed:
                 raise HistoryError("rename edge lacks source_rename_history coverage")
-        result[name] = [dict(zip(EDGE_KEYS, event)) for event in
-                        sorted(events, key=lambda e: (chronology[e[1]], e))]
+        result[name] = [dict(zip(EDGE_KEYS, event)) for event in ordered]
     if set(owners) != history.events:
         raise HistoryError("rename has an unresolved terminal or missing tail to a final entry")
     # Retiring a base entry must not retire its source or applied history either.

@@ -411,6 +411,21 @@ fn rate_limit_pair_commits_both_claims_in_one_cancellation_safe_transaction() {
 }
 
 #[test]
+fn account_deleting_probe_runs_unnamed_with_a_text_owner() {
+    let source = production();
+    let probe = function_body(&source, "asyncfnaccount_deleting(");
+    let queries = calls(probe, ".query_typed_opt");
+    assert_eq!(queries.len(), 1, "the pooled probe must run unnamed");
+    assert_eq!(
+        queries[0].args.as_slice(),
+        [
+            "crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL",
+            "&[(&user_id,Type::TEXT)]",
+        ]
+    );
+}
+
+#[test]
 fn mint_path_statements_run_unnamed_through_query_typed() {
     // TWO-222: tokio-postgres names prepared statements `sN` per isolate, and
     // a named statement can collide on, or go missing from, a
