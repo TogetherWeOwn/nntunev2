@@ -7925,6 +7925,11 @@ mod tests {
             "/v1/me/taste"
         );
         assert_eq!(served_display_path("/v1/me/taste/bob"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/history?user_id=bob&cursor=Play_A"),
+            "/v1/me/history"
+        );
+        assert_eq!(served_display_path("/v1/me/history/bob"), "unknown");
     }
 
     /// Drive one ready future to completion on a noop waker (the gate

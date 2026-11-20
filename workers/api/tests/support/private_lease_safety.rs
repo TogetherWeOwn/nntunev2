@@ -60,6 +60,11 @@ async fn dispatched_private_delivery_keeps_history_and_billing_distinct() {
         same_lease(&public, play(&public["play_id"]).await);
         assert!(!marked(&key(&public)).await);
         deliver(&public).await;
+        let history = async || call("GET", "/v1/me/history", Value::Null).await;
+        let public_history = json!({"items": [{
+            "play_id": public["play_id"], "track_id": TRACK, "played_at": fx.now, "stream_seconds": 2,
+        }]});
+        assert_eq!(history().await, public_history, "public play remains visible in private mode");
 
         let private = play(&Value::Null).await;
         let private_key = key(&private);
@@ -80,9 +85,9 @@ async fn dispatched_private_delivery_keeps_history_and_billing_distinct() {
         let private_row = rows.iter().find(|row| row.get::<_, &str>(0) == private_key).unwrap();
         assert_eq!((private_row.get::<_, i64>(1), private_row.get::<_, i32>(2)), (80_000, 2));
         assert_eq!(store.monthly_stream_seconds(fx.user, &period_month_for_timestamp(fx.now)).await.unwrap(), 4);
-        let history = store.history_list(fx.user).await.unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(Some(history[0].play_id.as_str()), public["play_id"].as_str());
+        let usage = call("GET", "/v1/me/usage", Value::Null).await;
+        assert_eq!(usage["streamSecondsMonth"], json!(4));
+        assert_eq!(history().await, public_history, "private delivery and grant-only plays stay hidden");
     }).await;
 }
 
