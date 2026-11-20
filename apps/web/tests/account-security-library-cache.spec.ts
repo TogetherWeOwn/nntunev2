@@ -150,33 +150,62 @@ test('successful local logout invalidates library snapshots across tabs before r
 	await openLibraryTab(page);
 	const securityTab = await openSecurityTab(page);
 	const logoutPosts = await mockSessionEndpoint(securityTab, 'logout', 200);
+
+	await securityTab.goto('/account/security');
+	await seedActingTabSnapshot(securityTab);
+	await securityTab.getByRole('button', { name: /^sign out$/i }).click();
+
+	await securityTab.waitForURL('**/login');
+	expect(logoutPosts()).toBe(1);
+	await expectSnapshotCleared(securityTab);
+	await expectLibraryTabInvalidated(page);
+	await securityTab.close();
+});
+
+test('account menu logout retries and resumes favorites deletion after redirect', async ({ page }) => {
+	await page.goto('/login');
+	const securityTab = await openSecurityTab(page);
+	const logoutPosts = await mockSessionEndpoint(securityTab, 'logout', 200);
 	await securityTab.route('**/v1/session/logout', (route) => route.fulfill({ status: 503 }), { times: 1 });
 
 	await securityTab.goto('/account/security');
 	await seedActingTabSnapshot(securityTab);
 	const favorites = `nntune.library.favorites.v1.${AUTH_CONTEXT}`;
-	await page.evaluate((key) => new Promise<void>((ready) => {
-		localStorage.setItem(key, '["old"]');
-		void navigator.locks.request(key, () => new Promise<void>((release) => {
-			Reflect.set(window, 'releaseFavorites', release);
-			ready();
-		}));
-	}), favorites);
+	const oldValue = JSON.stringify(['old']);
+	await page.evaluate(
+		({ key, value }) => new Promise<void>((ready) => {
+			localStorage.setItem(key, value);
+			void navigator.locks.request(key, () => new Promise<void>((release) => {
+				Reflect.set(window, 'releaseFavorites', release);
+				ready();
+			}));
+		}),
+		{ key: favorites, value: oldValue }
+	);
+	const readFavoritesStorage = () =>
+		securityTab.evaluate((key) => ({
+			value: localStorage.getItem(key),
+			marker: sessionStorage.getItem(key)
+		}), favorites);
+
 	const account = securityTab.getByRole('button', { name: 'Account menu' });
 	const signOut = securityTab.getByRole('menuitem', { name: 'Sign out' });
 	await account.click();
 	await signOut.click();
 	await expect(securityTab.getByTestId('toast')).toContainText('Could not sign out');
+	await expectSnapshotPresent(securityTab);
+	expect(await readFavoritesStorage()).toEqual({ value: oldValue, marker: null });
+
 	await account.click();
 	await signOut.click();
-
 	await securityTab.waitForURL('**/login');
-	// The redirect is bounded even while the other tab still holds the lock.
-	await page.evaluate(() => Reflect.get(window, 'releaseFavorites')());
-	await expect.poll(() => securityTab.evaluate((key) => localStorage.getItem(key), favorites)).toBeNull();
 	expect(logoutPosts()).toBe(1);
 	await expectSnapshotCleared(securityTab);
-	await expectLibraryTabInvalidated(page);
+	// The original value and the pending marker survive navigation while the lock is held.
+	expect(await readFavoritesStorage()).toEqual({ value: oldValue, marker: '' });
+
+	await page.evaluate(() => Reflect.get(window, 'releaseFavorites')());
+	await expect.poll(readFavoritesStorage).toEqual({ value: null, marker: null });
 	await securityTab.close();
 });
 

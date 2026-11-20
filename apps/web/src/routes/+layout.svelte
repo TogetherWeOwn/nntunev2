@@ -367,6 +367,7 @@
 		clearSignedInEmail();
 		notifyLocalAuthTransition();
 		await purge;
+		signingOut = false;
 		window.location.href = '/login';
 	}
 
