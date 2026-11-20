@@ -21,6 +21,7 @@
 	}));
 	const { queue, media } = player;
 	const seekFeedback = media.seekFeedback;
+	const attachNativeAudio = media.attach;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 
@@ -38,7 +39,6 @@
 			window.removeEventListener(LIBRARY_ACCESS_REFUSED_EVENT, player.purgeAtAuthBoundary);
 		};
 	});
-
 	// Library's pre-effect disposes route state before player teardown.
 	onMount(() => {
 		media.restoreRepeat(browserStorage('local'));
@@ -53,7 +53,7 @@
 {#if streamUrl}
 	<div class="nt-wrap">
 		<NativePlayer
-			{currentTrack} mediaRevision={player.mediaRevision} {streamUrl} attachNativeAudio={media.attach}
+			{currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump}
 		/>
 	</div>
