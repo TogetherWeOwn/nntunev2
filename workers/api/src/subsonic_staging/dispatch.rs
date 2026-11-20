@@ -13,7 +13,9 @@ use nntune_subsonic::Params;
 use tokio_postgres::Client;
 use worker::{web_sys, Response, Result as WorkerResult};
 
-use super::{InputError, StagingConstruction, StagingInput, CONSTRUCTION_BYTES};
+use super::{
+    InputError, StagingConstruction, StagingInput, SyntheticCatalogue, CONSTRUCTION_BYTES,
+};
 use crate::rotation::KekSource;
 use crate::subsonic_auth::{self, AuthError, IndexKeyring, Principal};
 use crate::subsonic_dispatch::{snapshot_order::OrderWork, ProductionStore};
@@ -56,18 +58,23 @@ impl<K> StagingApp<'_, K> {
     }
 }
 
+pub enum CatalogueSource<C> {
+    Synthetic(SyntheticCatalogue),
+    IsolatedMirror(C),
+}
+
 /// Unmounted. The caller must first verify staging arming and app/mirror
-/// isolation. The supplied fixture authorization runs after real auth and
-/// before account, membership or mirror reads.
-pub async fn respond_staging<'a, K: KekSource + 'a, A, M>(
+/// isolation. Source selection runs only after real auth, before account,
+/// fixture, membership or mirror reads. `None` denies access.
+pub async fn respond_staging<'a, K: KekSource + 'a, A, M, C>(
     request: &web_sys::Request,
     context: StagingDispatch,
     open_app: impl FnOnce() -> A,
-    authorize_fixture: impl FnOnce(&Principal) -> bool,
-    open_mirror: impl FnOnce() -> M,
+    authorize_catalogue: impl FnOnce(&Principal) -> Option<CatalogueSource<C>>,
 ) -> WorkerResult<Response>
 where
     A: Future<Output = Result<StagingApp<'a, K>, StagingRejection>>,
+    C: FnOnce() -> M,
     M: Future<Output = Result<Client, StagingRejection>>,
 {
     let reject_xml = |reason| respond_fixed_rejection(reason, RejectionFormat::Xml);
@@ -137,11 +144,11 @@ where
             return scope.protocol_failure(error.subsonic_code(), message);
         }
     };
-    if !authorize_fixture(&principal) {
+    let Some(catalogue) = authorize_catalogue(&principal) else {
         return scope.protocol_failure(code::NOT_AUTHORIZED, "Not authorized for staging.");
-    }
+    };
     let document = scope
-        .dispatch_document(&mut app, &principal, open_mirror, name, context)
+        .dispatch_document(&mut app, &principal, catalogue, name, context)
         .await;
     finish_document(document.map(Some))
 }
@@ -183,7 +190,7 @@ impl StagingConstruction {
         &mut self,
         app: &mut StagingApp<'_, impl KekSource>,
         principal: &Principal,
-        connect_isolated: impl FnOnce() -> F,
+        catalogue: CatalogueSource<impl FnOnce() -> F>,
         name: &str,
         context: StagingDispatch,
     ) -> Result<StagingDocument, DocumentError> {
@@ -192,19 +199,24 @@ impl StagingConstruction {
         let reject = |reason| DocumentError::Rejected(reason, refusal);
         let budget = &mut self.input.budget;
         let doc = if MemberBrowse::supports(name) {
-            let member = load_staging_membership(budget, app.postgres(), principal)
-                .await
-                .map_err(reject)?;
-            let selection = MirrorSelection {
-                releases: &member.releases,
-                pairs: &member.pairs,
-                remaining_text_bytes: member.remaining_text_bytes,
+            let (artists, releases, tracks) = match catalogue {
+                CatalogueSource::Synthetic(fixture) => {
+                    fixture.rows(budget).map_err(|_| reject(BusyOrCapacity))?
+                }
+                CatalogueSource::IsolatedMirror(connect_isolated) => {
+                    let member = load_staging_membership(budget, app.postgres(), principal)
+                        .await
+                        .map_err(reject)?;
+                    let selection = MirrorSelection {
+                        releases: &member.releases,
+                        pairs: &member.pairs,
+                        remaining_text_bytes: member.remaining_text_bytes,
+                    };
+                    load_staging_mirror(budget, selection, connect_isolated)
+                        .await
+                        .map_err(reject)?
+                }
             };
-            let (artists, releases, tracks) =
-                load_staging_mirror(budget, selection, connect_isolated)
-                    .await
-                    .map_err(reject)?;
-            drop(member);
             let (artists, albums, songs) = build_owned_bounded_snapshot(
                 budget,
                 &artists,
@@ -266,10 +278,17 @@ mod wasm_test {
         request: web_sys::Request,
         open_app: js_sys::Function,
         allowed: bool,
+        small: bool,
     ) -> Result<web_sys::Response, JsValue> {
+        type NoMirror = fn() -> std::future::Ready<Result<Client, StagingRejection>>;
         let context = StagingDispatch {
             now_millis: 0,
-            order_work: order_work(0, 0, 0, 0).unwrap(),
+            order_work: order_work(2, 2, 4, 2).unwrap(),
+        };
+        let fixture = if small {
+            SyntheticCatalogue::Small
+        } else {
+            SyntheticCatalogue::Empty
         };
         respond_staging(
             &request,
@@ -285,9 +304,8 @@ mod wasm_test {
             },
             |principal| {
                 assert_eq!(principal.user_id(), "fixture-user");
-                allowed
+                allowed.then_some(CatalogueSource::<NoMirror>::Synthetic(fixture))
             },
-            || async { panic!("unexpected mirror") },
         )
         .await
         .map(Into::into)
