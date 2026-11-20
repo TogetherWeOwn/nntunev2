@@ -32,42 +32,43 @@ test('Recent lists only metered plays and clears them on an auth transition', as
 });
 
 test('Recent stays signed out when pending catalogue enrichment completes', async ({ page }) => {
-	await page.addInitScript(() => {
-		// Simulate a transport that can still deliver its response after cancellation.
+	await page.addInitScript((rows) => {
 		const fetch = window.fetch.bind(window);
-		window.fetch = (input, init) => fetch(input,
-			typeof input === 'string' && input.endsWith('/v1/library') ? { ...init, signal: undefined } : init);
-	});
+		window.fetch = (input, init) => {
+			if (typeof input !== 'string' || !input.endsWith('/v1/library')) return fetch(input, init);
+			// Hold a successful response even if the caller aborts in the meantime.
+			return new Promise<Response>((resolve) => {
+				window.addEventListener('release-recent-catalogue', () => resolve(Response.json(rows)), { once: true });
+				document.documentElement.dataset.recentCataloguePending = 'true';
+			});
+		};
+	}, catalogue);
 	await page.route('**/v1/me/history', (route) => route.fulfill({ json: { items: plays } }));
-	let release!: () => void;
-	const held = new Promise<void>((resolve) => { release = resolve; });
-	await page.route('**/v1/library', async (route) => {
-		await held;
-		await route.fulfill({ json: catalogue });
-	});
+	await page.goto('/library/recent');
 
 	const history = page.getByRole('region', { name: 'Recently played' });
 	const signIn = history.getByRole('link', { name: 'Sign in' });
-	try {
-		await Promise.all([page.waitForRequest('**/v1/library'), page.goto('/library/recent')]);
-		await expect(history.getByRole('status')).toContainText('Loading');
-		await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
-			key: 'nntune.library.auth-transition.v1'
-		})));
-		await expect(signIn).toBeVisible();
+	await expect(page.locator('html')).toHaveAttribute('data-recent-catalogue-pending', 'true');
+	await expect(history.getByRole('status')).toContainText('Loading');
+	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
+		key: 'nntune.library.auth-transition.v1'
+	})));
+	await expect(signIn).toBeVisible();
 
-		const returned = page.waitForResponse('**/v1/library');
-		release();
-		const response = await returned;
-		expect(response.ok()).toBe(true);
-		expect(await response.finished()).toBeNull();
-		await page.evaluate(() => new Promise<void>((resolve) =>
-			requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-		await expect(signIn).toBeVisible();
-		await expect(history.getByRole('listitem')).toHaveCount(0);
-	} finally {
-		release();
-	}
+	await page.evaluate(() => new Promise<void>((resolve) => {
+		window.dispatchEvent(new Event('release-recent-catalogue'));
+		// The response body is in memory. Let its promise chain and Svelte's
+		// render microtasks drain before the next browser task, not a timed wait.
+		const channel = new MessageChannel();
+		channel.port1.onmessage = () => {
+			channel.port1.close();
+			channel.port2.close();
+			resolve();
+		};
+		channel.port2.postMessage(null);
+	}));
+	await expect(signIn).toBeVisible();
+	await expect(history.getByRole('listitem')).toHaveCount(0);
 });
 
 test('Recent offers sign-in when the initial history request returns 401', async ({ page }) => {
