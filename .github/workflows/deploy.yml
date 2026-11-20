@@ -364,6 +364,7 @@ jobs:
           [env.staging.observability]
           enabled = true
           head_sampling_rate = 1
+          redact_query_string = true
 
           [[env.staging.tail_consumers]]
           service = "nntune-alerts-staging"
