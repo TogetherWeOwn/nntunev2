@@ -58,7 +58,8 @@ class TestWebPlaywrightImage(unittest.TestCase):
         self.assertIsNone(step_field(verify, "working-directory"))
         self.assertIsNone(step_field(suite, "working-directory"))
         self.assertTrue(any(step_field(s, "run") == "pnpm install --frozen-lockfile" for s in steps))
-        self.assertEqual(step_field(suite, "run"), "pnpm test:e2e")
+        self.assertEqual(step_field(suite, "run"), 'pnpm test:e2e --shard="$PLAYWRIGHT_SHARD"')
+        self.assertEqual(step_field(suite, "PLAYWRIGHT_SHARD"), "${{ matrix.shard }}/2")
         self.assertEqual(step_field(verify, "shell"), "bash")
         self.assertEqual(step_field(verify, "timeout-minutes"), "1")
         self.assertLess(steps.index(verify), steps.index(suite))
@@ -68,6 +69,15 @@ class TestWebPlaywrightImage(unittest.TestCase):
         self.assertIn("web-e2e", step_field(self.jobs["ci-ok"], "needs"))
         self.assertIn('all(.[]; .result == "success")', self.jobs["ci-ok"])
         self.assertIn("python3 .github/scripts/test_ci_web_e2e_image.py", self.jobs["e2e-lint"])
+
+    def test_shards_run_independently_with_distinct_reports(self):
+        self.assertIn("    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2]\n", self.job)
+        self.assertIsNone(step_field(self.job, "continue-on-error"))
+        steps = {step_field(s, "name"): s for s in split_steps(self.job)}
+        self.assertEqual(step_field(steps["Verify web Playwright shard coverage"], "if"), "matrix.shard == 1")
+        for step, prefix in (("Upload Playwright report", "web-e2e-html-report"),
+                             ("Upload failure artifacts", "web-e2e-report")):
+            self.assertIn(f"name: {prefix}-shard-${{{{ matrix.shard }}}}", steps[step])
 
     def test_preflight_reuses_the_exercised_launch_close_contract(self):
         # The neighboring suite executes this exact body with a usable browser,
