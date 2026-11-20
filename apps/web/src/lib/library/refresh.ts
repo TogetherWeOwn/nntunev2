@@ -30,7 +30,7 @@ export interface LibraryRefreshUpdate {
 	/** A successful response or an explicit invalidation, never cached fallback. */
 	authoritative: boolean;
 	/** The account purge ran before this empty snapshot was published. */
-	authBoundary?: true;
+	authBoundary: boolean;
 }
 
 export interface LibraryRefresherDeps {
@@ -93,7 +93,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		state.libraryUnavailable = false;
 		state.requiresSignIn = false;
 		let authoritative = false;
-		let authBoundary: true | undefined;
+		let authBoundary = false;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -219,7 +219,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		});
 
 		try {
-			deps.onStateChange?.(state, { isCurrent, authoritative: false });
+			deps.onStateChange?.(state, { isCurrent, authoritative: false, authBoundary: false });
 			if (!isCurrent()) return;
 			const fetchPromise = fetchFn('/api/library', {
 				credentials: 'include',
