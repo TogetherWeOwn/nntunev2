@@ -46,8 +46,7 @@ use crate::session::{self, SessionClaims, SessionRecord};
 use crate::vault::{self, AuditEvent, ValidatedTarget};
 use crate::webauthn;
 
-/// Request bodies above this size reject before routing (not an oracle:
-/// size only, same for every route).
+/// Default request-body cap, checked before routing.
 pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// Intake-route body cap: `POST /api/ingest` carries an NZB document, not
 /// API JSON, so it gets its own bound. The value parities the NZB intake
@@ -59,8 +58,7 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024;
 /// must not ship in this worker); bump both together.
 pub const INGEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Per-route request-body bound: the NZB intake route and the admin NZB
-/// upload route accept document uploads, every other route takes
+/// Per-route request-body bounds for NZB uploads, likes import, and default
 /// API-sized bodies. Both the entry's collection gate and the pre-routing
 /// size check call this, so the two caps cannot drift apart.
 pub fn max_body_bytes(method: &str, path: &str) -> usize {
@@ -68,6 +66,9 @@ pub fn max_body_bytes(method: &str, path: &str) -> usize {
         INGEST_BODY_LIMIT_BYTES
     } else if method == "POST" && path == "/v1/admin/ingest" {
         admin_ingest::ADMIN_INGEST_BODY_LIMIT_BYTES
+    } else if method == "POST" && path == "/v1/me/likes/import" {
+        // A compact batch of 500 maximum-length track IDs exceeds 32 KiB.
+        320 * 1024
     } else {
         MAX_BODY_BYTES
     }
@@ -1642,6 +1643,17 @@ pub trait Store {
     ) -> impl Future<Output = Result<crate::preference_rows::TasteDbRow, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Add or convert a resolved like under the deletion fence. Return false only
+    /// when it was already a love at write time; that replay leaves the row untouched.
+    fn import_like(
+        &self,
+        _user_id: &str,
+        _kind: crate::target_identity::TargetKind,
+        _target: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Delete only love, or any signal respectively. Missing accounts fail closed.
     fn like_delete(
         &self,
@@ -2150,8 +2162,7 @@ where
     }
 }
 
-// Adapted from PR #982. Activation, including the route-specific body cap, is separate.
-#[allow(dead_code)]
+// Adapted from PR #982.
 async fn me_likes_import<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2160,7 +2171,6 @@ where
     N: AsyncDns,
 {
     use crate::target_identity::{canonical_target_id, valid_target_id, TargetKind};
-    use crate::taste_signal::TasteSignal::Love;
     use serde::de::{value::MapAccessDeserializer, MapAccess, Visitor};
     use std::{fmt, marker::PhantomData};
 
@@ -2243,22 +2253,10 @@ where
             }
             Err(_) => return unavailable(),
         };
-        let Ok(prior) = ctx.store.taste_get(owner, kind, &target).await else {
-            return unavailable();
-        };
-        // Even a replay goes through the deletion-fenced writer.
-        if ctx
-            .store
-            .taste_upsert(owner, kind, &target, Love, None, ctx.now)
-            .await
-            .is_err()
-        {
-            return unavailable();
-        }
-        if prior.is_some_and(|row| row.signal == Love.as_str()) {
-            already += 1;
-        } else {
-            added += 1;
+        match ctx.store.import_like(owner, kind, &target, ctx.now).await {
+            Ok(true) => added += 1,
+            Ok(false) => already += 1,
+            Err(_) => return unavailable(),
         }
     }
     json_response(
@@ -7589,6 +7587,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/me/usage"
             | "/v1/me/subscription"
             | "/v1/me/likes"
+            | "/v1/me/likes/import"
             | "/v1/me/taste"
             | "/v1/me/private-session"
             | "/v1/library"
@@ -7785,6 +7784,7 @@ where
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
+        ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
         ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
         ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
         ("DELETE", "/v1/me/taste") => me_taste_clear(ctx, req).await,
@@ -8001,7 +8001,6 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum PreferenceFailure {
         Member,
-        Read,
         Write,
     }
 
@@ -8256,6 +8255,34 @@ mod tests {
     }
 
     impl FakeStore {
+        fn check_taste_write(
+            &self,
+            user_id: &str,
+            target: &str,
+            now: u64,
+        ) -> Result<(), StoreError> {
+            self.taste_write_attempts
+                .set(self.taste_write_attempts.get() + 1);
+            if self.preference_failure.get() == Some((PreferenceFailure::Write, target)) {
+                return Err(StoreError);
+            }
+            if self.delete_before_taste_write.replace(false) {
+                self.deleting_users.borrow_mut().insert(user_id.into());
+            }
+            if *self.fail_taste_write.borrow()
+                || !self.users.borrow().contains_key(user_id)
+                || self.deleting_users.borrow().contains(user_id)
+                || !(1..=128).contains(&user_id.chars().count())
+                || !(1..=512).contains(&target.chars().count())
+                || user_id.contains('\0')
+                || target.contains('\0')
+                || now > 253_402_300_799
+            {
+                return Err(StoreError);
+            }
+            Ok(())
+        }
+
         fn delete_preference(
             &self,
             user_id: &str,
@@ -9792,24 +9819,8 @@ mod tests {
             now: u64,
         ) -> Result<crate::preference_rows::TasteDbRow, StoreError> {
             use crate::taste_signal::TasteSignal;
-            const MAX_TIME: u64 = 253_402_300_799;
-            self.taste_write_attempts
-                .set(self.taste_write_attempts.get() + 1);
-            if self.preference_failure.get() == Some((PreferenceFailure::Write, target)) {
-                return Err(StoreError);
-            }
-            if self.delete_before_taste_write.replace(false) {
-                self.deleting_users.borrow_mut().insert(user_id.into());
-            }
-            if *self.fail_taste_write.borrow()
-                || !self.users.borrow().contains_key(user_id)
-                || self.deleting_users.borrow().contains(user_id)
-                || !(1..=128).contains(&user_id.chars().count())
-                || !(1..=512).contains(&target.chars().count())
-                || user_id.contains('\0')
-                || target.contains('\0')
-                || now > MAX_TIME
-                || snooze_until.is_some_and(|t| t > MAX_TIME)
+            self.check_taste_write(user_id, target, now)?;
+            if snooze_until.is_some_and(|t| t > 253_402_300_799)
                 || (signal == TasteSignal::Snooze) != snooze_until.is_some()
             {
                 return Err(StoreError);
@@ -9834,15 +9845,39 @@ mod tests {
             rows.insert(key, row.clone());
             Ok(row)
         }
+        async fn import_like(
+            &self,
+            user_id: &str,
+            kind: crate::target_identity::TargetKind,
+            target: &str,
+            now: u64,
+        ) -> Result<bool, StoreError> {
+            self.check_taste_write(user_id, target, now)?;
+            let key = (user_id.into(), kind.as_str().into(), target.into());
+            let mut rows = self.taste_rows.borrow_mut();
+            if rows.get(&key).is_some_and(|row| row.signal == "love") {
+                return Ok(false);
+            }
+            rows.insert(
+                key,
+                crate::preference_rows::TasteDbRow {
+                    kind: kind.as_str().into(),
+                    target_id: target.into(),
+                    signal: "love".into(),
+                    snooze_until: None,
+                    created_at: now as i64,
+                    updated_at: now as i64,
+                },
+            );
+            Ok(true)
+        }
         async fn taste_get(
             &self,
             user_id: &str,
             kind: crate::target_identity::TargetKind,
             target: &str,
         ) -> Result<Option<crate::preference_rows::TasteDbRow>, StoreError> {
-            if *self.fail_taste_read.borrow()
-                || self.preference_failure.get() == Some((PreferenceFailure::Read, target))
-            {
+            if *self.fail_taste_read.borrow() {
                 return Err(StoreError);
             }
             Ok(self
@@ -15650,8 +15685,11 @@ mod tests {
             assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
             assert_not_found(call(&req));
         }
-        for origin in [Some(ORIGIN), Some("https://other.example"), None] {
-            let resp = h.call_full("OPTIONS", &req.path, None, None, origin);
+        let cases = [(&*req.path, "GET"), ("/v1/me/likes/import", "POST")];
+        for (path, method, origin) in cases.into_iter().flat_map(|(path, method)| {
+            [Some(ORIGIN), Some("https://other.example"), None].map(|origin| (path, method, origin))
+        }) {
+            let resp = h.call_full("OPTIONS", path, None, None, origin);
             assert_eq!(resp.status, 204);
             assert!(resp.body.is_empty() && resp.set_cookie.is_none());
             let cors = crate::worker_entry::cors_headers(resp.status, origin, ORIGIN);
@@ -15660,7 +15698,7 @@ mod tests {
                 assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
                 assert!(cors.iter().any(|(name, methods)| {
                     *name == "access-control-allow-methods"
-                        && methods.split(", ").any(|m| m == "GET")
+                        && methods.split(", ").any(|m| m == method)
                 }));
             } else {
                 assert!(cors.is_empty());
@@ -16793,14 +16831,16 @@ mod tests {
     }
 
     #[test]
-    fn unwired_likes_import_rejects_bad_structure_and_auth_before_writing() {
-        let h = harness();
+    fn dispatched_likes_import_rejects_bad_structure_and_auth_before_writing() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+
+        let h = peppered_harness();
         let mut req = likes_import_request(&h);
         h.store
             .catalogue_library
             .borrow_mut()
             .insert("alice".into(), vec![unmatched_library_row("Job")]);
-        let call = |req: &Request| block_on(me_likes_import(&h.ctx(), req));
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
         let valid = r#"{"kind":"track","target_id":"Job"}"#;
         for body in [
             "{",
@@ -16836,21 +16876,73 @@ mod tests {
             assert_eq!(call(&req).status, 401);
         }
         req.origin = Some(ORIGIN.into());
-        req.authorization = Some("Bearer ntk_test".into());
-        assert_eq!(call(&req).status, 404);
-        req.cookie = None;
-        assert_eq!(call(&req).status, 404);
-        req.authorization = None;
+        let cookie = req.cookie.take().unwrap();
         assert_eq!(call(&req).status, 401);
+
+        let minted = mint_call(
+            &h,
+            &cookie,
+            serde_json::json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201, "{}", minted.body);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        let lookups = *h.store.native_credential_lookups.borrow();
+        req.authorization = Some(format!("Bearer {key}"));
+        assert_eq!(
+            scope_for_operation("POST", &req.path),
+            RouteDecision::SessionOnly
+        );
+        for session in [None, Some(cookie)] {
+            req.cookie = session;
+            let denied = call(&req);
+            assert_eq!((denied.status, denied.body), (404, not_found().body));
+        }
+        req.authorization = None;
+        for method in ["GET", "HEAD", "PUT", "PATCH", "DELETE", "post"] {
+            req.method = method.into();
+            assert_eq!(scope_for_operation(method, &req.path), RouteDecision::Deny);
+            assert_eq!(max_body_bytes(method, &req.path), MAX_BODY_BYTES);
+            assert_eq!(call(&req).status, 404, "{method}");
+        }
+
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
         assert!(h.store.taste_rows.borrow().is_empty());
         assert_eq!(h.store.taste_write_attempts.get(), 0);
     }
 
+    fn collect_import_body(
+        req: &Request,
+        declared_len: Option<usize>,
+        body: Vec<u8>,
+    ) -> crate::worker_entry::CollectedBody {
+        use crate::worker_entry::{
+            collect_body_with_cap, BodyChunkStream, BodyReadError, BodySource,
+        };
+
+        struct OneChunk(Option<Vec<u8>>);
+        impl BodyChunkStream for OneChunk {
+            fn poll_next_chunk(
+                &mut self,
+                _: &mut TaskContext<'_>,
+            ) -> Poll<Option<Result<Vec<u8>, BodyReadError>>> {
+                Poll::Ready(self.0.take().map(Ok))
+            }
+        }
+
+        block_on(collect_body_with_cap(
+            declared_len,
+            BodySource::Stream(OneChunk(Some(body))),
+            max_body_bytes(&req.method, &req.path),
+        ))
+    }
+
     #[test]
-    fn unwired_likes_import_bounds_batch_and_rejection_echo() {
+    fn dispatched_likes_import_bounds_batch_and_rejection_echo() {
+        use crate::worker_entry::CollectedBody;
+
         let h = harness();
         let mut req = likes_import_request(&h);
-        let call = |req: &Request| block_on(me_likes_import(&h.ctx(), req));
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
         req.body = br#"{"items":[]}"#.to_vec();
         assert_import(call(&req), 0, 0, &[]);
         let targets: Vec<_> = (0..500)
@@ -16868,7 +16960,28 @@ mod tests {
         assert_eq!(h.store.taste_write_attempts.get(), 0);
         items.pop();
         req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
-        assert!(req.body.len() > 32 * 1024);
+        let cap = max_body_bytes(&req.method, &req.path);
+        assert_eq!(cap, 320 * 1024);
+        assert!(req.body.len() > MAX_BODY_BYTES && req.body.len() < cap);
+        req.body.resize(cap + 1, b' ');
+        for declared in [None, Some(cap + 1)] {
+            assert_eq!(
+                collect_import_body(&req, declared, req.body.clone()),
+                CollectedBody::Oversized
+            );
+        }
+        let oversized = call(&req);
+        assert_eq!(
+            (oversized.status, oversized.body),
+            (400, invalid_request().body)
+        );
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+
+        req.body.truncate(cap);
+        assert_eq!(
+            collect_import_body(&req, None, req.body.clone()),
+            CollectedBody::Complete(req.body.clone())
+        );
         assert_import(call(&req), 500, 0, &[]);
         let saved = h.store.taste_rows.borrow().clone();
         assert_eq!(saved.len(), 500);
@@ -16887,7 +17000,66 @@ mod tests {
     }
 
     #[test]
-    fn unwired_likes_import_resolves_members_and_replays_per_owner() {
+    fn dispatched_likes_import_collects_ordinary_batch_without_displacing_taste() {
+        use crate::target_identity::TargetKind::Track;
+        use crate::taste_signal::TasteSignal::Hide;
+        use crate::worker_entry::CollectedBody;
+
+        let h = harness();
+        let mut req = likes_import_request(&h);
+        let targets: Vec<_> = (0..500)
+            .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+            .collect();
+        h.store.catalogue_library.borrow_mut().insert(
+            "alice".into(),
+            targets.iter().map(|id| unmatched_library_row(id)).collect(),
+        );
+        let items: Vec<_> = targets.iter().map(|id| import_item("track", id)).collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        assert!(bytes.len() > MAX_BODY_BYTES);
+        let mut taste = Request {
+            method: "PUT".into(),
+            path: "/v1/me/taste".into(),
+            ..req.clone()
+        };
+        let collect = |req: &Request, declared| {
+            assert_eq!(
+                collect_import_body(&taste, declared, bytes.clone()),
+                CollectedBody::Oversized
+            );
+            match collect_import_body(req, declared, bytes.clone()) {
+                CollectedBody::Complete(body) => body,
+                other => {
+                    panic!("batch with declared length {declared:?} was not collected: {other:?}")
+                }
+            }
+        };
+        req.body = collect(&req, Some(bytes.len()));
+        assert_import(block_on(handle(&h.ctx(), &req)), 500, 0, &[]);
+        block_on(
+            h.store
+                .taste_upsert("alice", Track, "Unrelated", Hide, None, NOW + 1),
+        )
+        .unwrap();
+        let saved = h.store.taste_rows.borrow().clone();
+
+        req.body = collect(&req, None);
+        let mut later = h.ctx();
+        later.now += 2;
+        assert_import(block_on(handle(&later, &req)), 0, 500, &[]);
+        assert_eq!(*h.store.taste_rows.borrow(), saved);
+        taste.method = "GET".into();
+        let response = block_on(handle(&later, &taste));
+        assert_eq!(response.status, 200);
+        let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let listed = json["items"].as_array().unwrap();
+        assert_eq!(listed.len(), 500);
+        assert_eq!(listed[0]["target_id"], "Unrelated");
+        assert_eq!(listed[0]["signal"], "hide");
+    }
+
+    #[test]
+    fn dispatched_likes_import_resolves_members_and_replays_per_owner() {
         use crate::target_identity::TargetKind::{Release, Track};
         use crate::taste_signal::TasteSignal::Snooze;
         let h = harness();
@@ -16926,10 +17098,10 @@ mod tests {
         ]
         .map(|(id, reason)| serde_json::json!({"target_id": id, "reason": reason}));
         req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
-        assert_import(block_on(me_likes_import(&h.ctx(), &req)), 4, 1, &rejected);
+        assert_import(block_on(handle(&h.ctx(), &req)), 4, 1, &rejected);
         let mut later = h.ctx();
         later.now += 60;
-        assert_import(block_on(me_likes_import(&later, &req)), 0, 5, &rejected);
+        assert_import(block_on(handle(&later, &req)), 0, 5, &rejected);
         let get = |owner, kind, id| block_on(h.store.taste_get(owner, kind, id)).unwrap();
         for (kind, id) in [
             (Track, job),
@@ -16947,7 +17119,7 @@ mod tests {
         req.cookie = Some(magic_login(&h, "bob@example.com"));
         req.body = serde_json::to_vec(&serde_json::json!({"items": [items[0].clone(), import_item("track", "Shared"), import_item("track", "Private")]})).unwrap();
         assert_import(
-            block_on(me_likes_import(&later, &req)),
+            block_on(handle(&later, &req)),
             2,
             0,
             &[serde_json::json!({"target_id": job, "reason": "not_member"})],
@@ -16968,14 +17140,9 @@ mod tests {
     }
 
     #[test]
-    fn unwired_likes_import_fails_closed_and_retries_partial_writes() {
-        use PreferenceFailure::{Member, Read, Write};
-        for fault in [
-            (Member, "Second"),
-            (Member, CAT_RELEASE),
-            (Read, "Second"),
-            (Write, "Second"),
-        ] {
+    fn dispatched_likes_import_fails_closed_and_retries_partial_writes() {
+        use PreferenceFailure::{Member, Write};
+        for fault in [(Member, "Second"), (Member, CAT_RELEASE), (Write, "Second")] {
             let h = harness();
             let mut req = likes_import_request(&h);
             h.store.catalogue_library.borrow_mut().insert(
@@ -16993,7 +17160,7 @@ mod tests {
             };
             req.body = serde_json::to_vec(&serde_json::json!({"items": [import_item("track", "First"), second, import_item("track", "Last")]})).unwrap();
             h.store.preference_failure.set(Some(fault));
-            let failed = block_on(me_likes_import(&h.ctx(), &req));
+            let failed = block_on(handle(&h.ctx(), &req));
             assert_eq!((failed.status, failed.body), (503, unavailable().body));
             let key = ("alice".into(), "track".into(), "First".into());
             let saved = h.store.taste_rows.borrow().clone();
@@ -17002,16 +17169,16 @@ mod tests {
             h.store.preference_failure.set(None);
             let mut later = h.ctx();
             later.now += 1;
-            assert_import(block_on(me_likes_import(&later, &req)), 2, 1, &[]);
+            assert_import(block_on(handle(&later, &req)), 2, 1, &[]);
             let recovered = h.store.taste_rows.borrow().clone();
             assert_eq!(recovered.len(), 3);
             assert!(recovered.values().all(|row| row.signal == "love"));
             assert_eq!(recovered[&key].created_at, saved[&key].created_at);
             let writes = h.store.taste_write_attempts.get();
             h.store.delete_before_taste_write.replace(true);
-            let raced = block_on(me_likes_import(&later, &req));
+            let raced = block_on(handle(&later, &req));
             assert_eq!((raced.status, raced.body), (503, unavailable().body));
-            let deleting = block_on(me_likes_import(&later, &req));
+            let deleting = block_on(handle(&later, &req));
             assert_eq!(
                 (deleting.status, deleting.body),
                 (409, account_deleting_response().body)
@@ -17461,7 +17628,8 @@ mod tests {
         for path in [
             "/v1/me/likes/",
             "/v1/me/likes-extra",
-            "/v1/me/likes/import",
+            "/v1/me/likes/import/",
+            "/v1/me/likes/import/extra",
             "/v1/me/likes/track",
             "/v1/me/likes/track/",
             "/v1/me/likes/track//example",
