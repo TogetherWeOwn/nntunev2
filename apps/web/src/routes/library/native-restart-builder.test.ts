@@ -1,13 +1,12 @@
 import { expect, test, vi } from 'vitest';
 import ts from 'typescript';
+import { get } from 'svelte/store';
 import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
 import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
-import { describeJump } from '#lib/player/relativeJump.js';
-import { restartIsAvailable } from './restartAvailability.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -21,10 +20,9 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'syncMiniPlayerHint',
-		'applyShareLink', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
+		'applyShareLink', 'selectQueuedTrack', 'removeQueuedTrack',
 		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
-		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'resetShareAtAuthBoundary', 'jumpRelative',
-		'attachNativeAudio', 'announceEnd', 'onRepeatChange', 'shortTitle', 'playQueuedTrack', 'playSelected'
+		'resetShareAtAuthBoundary', 'announceEnd', 'onRepeatChange', 'shortTitle', 'playQueuedTrack', 'playSelected'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
 		node.name && names.has(node.name.text)
@@ -82,8 +80,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const bindings = {
 		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
 		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
-		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump,
-		clearMiniPlayerHint, setMiniPlayerHint, restartIsAvailable,
+		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, get,
+		clearMiniPlayerHint, setMiniPlayerHint,
 		createPlayerController: (_: ReturnType<typeof createQueue>, end: Parameters<typeof createPlayerController>[1]) => {
 			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), {
 				...end,
@@ -101,8 +99,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		let shareAlive = true, handledShareSearch = null;
 		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
 		let queueConfirmGeneration = 0;
-		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
-		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
+		let queueAnnouncement = '';
 		let queueAnnouncementVersion = 0;
 		let density, priorDocumentTitle = null, tabTitle = '';
 		let cleanup;
@@ -121,18 +118,18 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		queueController.subscribe((value) => { queue = value; });
 		const queueRevision = queueController;
 		return {
-			detach: attachNativeAudio(element),
-			restart: restartCurrentTrack, applyShareLink, retryShare: (type = 'loadedmetadata') => capture(type)(), jump: jumpRelative,
+			detach: media.attach(element),
+			restart: media.restart, applyShareLink, retryShare: (type = 'loadedmetadata') => capture(type)(), jump: media.jump,
 			resetAuth: resetShareAtAuthBoundary,
 			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
 			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
 			seeking: (target = element) => capture('seeking')(target), replaceQueue,
-			subscribe: queueController.subscribe, attach: attachNativeAudio, currentAudio: () => media.audio,
+			subscribe: queueController.subscribe, attach: media.attach, currentAudio: () => media.audio,
 			nativeIntent: () => ({ playing: media.attachment?.playing }),
 			end: (mode) => { onRepeatChange({ currentTarget: { value: mode } }); return capture('ended')(); },
 			refresh: () => capture('timeupdate')(),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: media.pendingShareSeek, queue, jumpStatus, playEpoch: queueRevision.revision, mediaRevision: player.mediaRevision, attachmentVersion: media.attachmentVersion, queueAnnouncement, queueAnnouncementVersion })
+			read: () => ({ ...get(media.seekFeedback), pendingShareSeek: media.pendingShareSeek, queue, playEpoch: queueRevision.revision, mediaRevision: player.mediaRevision, attachmentVersion: media.attachmentVersion, queueAnnouncement, queueAnnouncementVersion })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
@@ -988,14 +985,26 @@ test('removing the current queue row clears its jump readout', () => {
 	expect(page.read().jumpStatus).toBe('');
 });
 
-test('native seeking clears a previous jump readout but not the jump seek itself', () => {
-	const { page, media } = restartFixture();
+test('native seeking retires only an outdated jump readout', () => {
+	const { page, element, media } = restartFixture();
 	page.jump('forward');
 	page.seeking();
 	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
 	media.position = 90;
 	page.seeking();
 	expect(page.read().jumpStatus).toBe('');
+	page.jump('back');
+	vi.spyOn(element, 'currentTime', 'get').mockImplementationOnce(() => { page.jump('back'); return 90; });
+	page.seeking();
+	expect(page.read().jumpStatus).toBe('Back 10 seconds, now at 1:10.');
+});
+
+test('native availability reads cannot overwrite the replacement attachment', () => {
+	const { page, element, remount } = restartFixture();
+	vi.spyOn(element, 'duration', 'get').mockImplementationOnce(() => { remount(); page.refresh(); return NaN; });
+	page.refresh();
+	expect(page.currentAudio()).not.toBe(element);
+	expect(page.read().restartCanSeek).toBe(true);
 });
 
 test('repeated seeks at the jump target retain an accurate readout', () => {

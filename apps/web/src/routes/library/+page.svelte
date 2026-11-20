@@ -6,8 +6,6 @@
 	import { createQueueShare } from '#lib/player/queueShare.js';
 	import { createPlayerController } from '#lib/player/controller.svelte.js';
 	import { createFavoritesExport } from './favoritesExport.js';
-	import { describeJump, type JumpDirection } from '#lib/player/relativeJump.js';
-	import { restartIsAvailable } from './restartAvailability.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
 	import {
@@ -148,13 +146,7 @@
 	const player = createPlayerController(createQueue([]), {
 		flush: () => tick(),
 		clearShareFeedback,
-		clearJumpFeedback: () => { jumpStatus = ''; },
 		announce: (track) => announceEnd(track),
-		clearRestartFeedback: () => {
-			restartCanSeek = false;
-			restartStatus = '';
-			jumpStatus = '';
-		},
 		clearQueueAnnouncement: () => { queueAnnouncement = ''; },
 		syncMiniPlayerHint
 	});
@@ -255,12 +247,8 @@
 	let restoreFilterFocus = false;
 	const repeat = media.repeat;
 
-	function attachNativeAudio(audio: HTMLAudioElement): () => void {
-		return media.attach(audio, {
-			seeking: handleSeeking,
-			position: refreshRestartAvailability
-		});
-	}
+	const seekFeedback = media.seekFeedback;
+	const attachNativeAudio = media.attach;
 
 	function announceEnd(track?: Track): void {
 		queueAnnouncement = track ? `Playing ${shortTitle(track.title?.trim() ? track.title : track.id)}.` : '';
@@ -328,20 +316,6 @@
 	const releaseFavoritesDownload = favoritesExport.release;
 	const copyFavoritesText = favoritesExport.copy;
 	const downloadFavoritesM3U = favoritesExport.downloadM3U;
-
-	// Restart availability is live native state of the mounted matching
-	// element, re-evaluated on media events — never cached coordinates.
-	// The outcome lives only in one polite status inside the Player region
-	// and clears whenever the current source changes or an auth boundary
-	// purges the queue, so a previous track or account never lingers.
-	let restartCanSeek = $state(false);
-	let restartStatus = $state('');
-	let restartStatusVersion = $state(0);
-	// One-shot readout for Back/Forward 10 seconds; cleared on source change
-	// and at the auth boundary.
-	let jumpStatus = $state('');
-	let jumpStatusVersion = $state(0);
-	let lastJumpSeek: { element: HTMLAudioElement; target: number } | null = null;
 
 	let trackMenu = $state<MenuRequest | null>(null);
 
@@ -667,9 +641,6 @@
 		player.resetAtAuthBoundary();
 		clearShareFeedback();
 		queueShare.reset();
-		restartCanSeek = false;
-		restartStatus = '';
-		jumpStatus = '';
 		shareInvalid = false;
 	}
 
@@ -764,86 +735,8 @@
 			return current?.id === target.trackId && resolveStreamUrl(current) === source;
 		});
 		if (!trySeek) return;
-		// A same-source share skips the source-change reset; the share moves the
-		// position, so an earlier jump readout no longer describes it.
-		jumpStatus = '';
 		// Try after the keyed audio mounts; the controller handles native retries.
 		void tick().then(trySeek);
-	}
-
-	function handleSeeking(element: HTMLAudioElement): void {
-		// Keep the jump's own queued event from erasing its announcement.
-		// A different native seek retires feedback for the old position.
-		if (
-			lastJumpSeek?.element !== element ||
-			!Number.isFinite(element.currentTime) ||
-			Math.abs(element.currentTime - lastJumpSeek.target) > 0.05
-		) {
-			jumpStatus = '';
-			lastJumpSeek = null;
-		}
-	}
-
-	function refreshRestartAvailability(element: HTMLAudioElement): void {
-		restartCanSeek = restartIsAvailable(element);
-	}
-
-	function setRestartStatus(text: string): void {
-		restartStatus = text;
-		restartStatusVersion += 1;
-	}
-
-	function restartCurrentTrack(): void {
-		const current = queueCurrentTrack(queueController.snapshot);
-		if (!shareAlive || !current) return;
-		const source = resolveStreamUrl(current);
-		if (!source) return;
-		const revision = player.mediaRevision;
-		const queueRevision = queueController.revision;
-		const jumpVersion = jumpStatusVersion;
-		media.restart(source, current.title?.trim() ? current.title : current.id, {
-			trackId: current.id,
-			isCurrent: () => shareAlive && revision === player.mediaRevision && queueController.isCurrent(queueRevision) &&
-				jumpVersion === jumpStatusVersion,
-			available: restartIsAvailable,
-			assigned: () => {
-				if (shareAlive && revision === player.mediaRevision && jumpVersion === jumpStatusVersion) jumpStatus = '';
-			},
-			publish: (message, available) => {
-				if (!available) restartCanSeek = false;
-				setRestartStatus(message);
-			}
-		});
-	}
-
-	/**
-	 * Back/Forward 10 seconds act on the mounted audio element for the current
-	 * source only. Like restart, the gesture supersedes a pending inbound-share
-	 * seek for that source even if the jump is refused, so later metadata
-	 * events cannot move the position to the share time.
-	 */
-	function jumpRelative(direction: JumpDirection): void {
-		const element = media.audio;
-		const current = queueCurrentTrack(queueController.snapshot);
-		if (!shareAlive) return;
-		const source = resolveStreamUrl(current);
-		const queueRevision = queueController.revision;
-		const revision = player.mediaRevision;
-		const jumpVersion = jumpStatusVersion;
-		media.jump(source, direction, {
-			trackId: current?.id,
-			isCurrent: () => shareAlive && revision === player.mediaRevision && queueController.isCurrent(queueRevision),
-			assigned: () => {
-				if (!shareAlive || revision !== player.mediaRevision || jumpVersion !== jumpStatusVersion) return;
-				jumpStatus = '';
-			},
-			publish: (outcome) => {
-				// A no-write outcome must not disown an earlier jump's queued event.
-				if (element && outcome.kind === 'jumped') lastJumpSeek = { element, target: outcome.target };
-				jumpStatus = describeJump(direction, outcome);
-				jumpStatusVersion += 1;
-			}
-		});
 	}
 
 	if (typeof window !== 'undefined') {
@@ -2142,8 +2035,7 @@
 	{#if streamUrl}
 		<NativePlayer
 			{currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
-			{restartCanSeek} {restartStatus} {restartStatusVersion} {restartCurrentTrack}
-			{jumpStatus} {jumpStatusVersion} {jumpRelative}
+			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump}
 		/>
 	{/if}
 </main>
