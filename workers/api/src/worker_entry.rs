@@ -6875,6 +6875,8 @@ fn served_display_path(path: &str) -> String {
         // Single-segment release ids only: nested shapes stay `unknown`
         // (they 404 in dispatch), so probe paths never reach the log.
         "/v1/releases/{mbid}".to_string()
+    } else if crate::native_rest::like_track_target(bare).is_some() {
+        "/v1/me/likes/track/{target_id}".to_string()
     } else {
         "unknown".to_string()
     }
@@ -7869,7 +7871,17 @@ mod tests {
             served_display_path("/v1/me/likes?user_id=alice"),
             "/v1/me/likes"
         );
-        assert_eq!(served_display_path("/v1/me/likes/track/alice"), "unknown");
+        assert_eq!(
+            served_display_path("/v1/me/likes/track/Job_A?user_id=alice"),
+            "/v1/me/likes/track/{target_id}"
+        );
+        for path in [
+            "/v1/me/likes/track/",
+            "/v1/me/likes/track/Job_A/",
+            "/v1/me/likes/track/Job_A/nested",
+        ] {
+            assert_eq!(served_display_path(path), "unknown", "{path}");
+        }
         assert_eq!(
             served_display_path("/v1/me/taste?user_id=bob"),
             "/v1/me/taste"

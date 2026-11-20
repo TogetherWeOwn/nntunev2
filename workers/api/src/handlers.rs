@@ -2058,8 +2058,6 @@ where
     }
 }
 
-// Prepared for direct testing only; preference routes remain unregistered.
-#[allow(dead_code)]
 async fn me_like_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -7892,6 +7890,10 @@ where
         // paths, the single-segment revoke id, and the scope-map-served
         // native paths); unserved shapes stay 404 on preflight too.
         ("OPTIONS", path) if options_preflight_served(path) => preflight_response(),
+        ("PUT", path) => match crate::native_rest::like_track_target(path) {
+            Some(target) => me_like_track(ctx, req, target).await,
+            None => not_found(),
+        },
         _ => not_found(),
     }
 }
@@ -17068,6 +17070,111 @@ mod tests {
     }
 
     #[test]
+    fn dispatched_track_like_is_session_only_and_owner_scoped() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        use serde_json::json;
+
+        let h = peppered_harness();
+        for (user, email, track) in [
+            ("alice", "alice@example.com", "Job_A"),
+            ("bob", "bob@example.com", "Private"),
+        ] {
+            seed_user(&h, user, email);
+            h.store
+                .catalogue_library
+                .borrow_mut()
+                .insert(user.into(), vec![unmatched_library_row(track)]);
+        }
+        let alice = magic_login(&h, "alice@example.com");
+        let bob = magic_login(&h, "bob@example.com");
+        let path = "/v1/me/likes/track/Job_A";
+        let mut req = Request {
+            method: "PUT".into(),
+            path: path.into(),
+            cookie: Some(alice.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let assert_not_found = |resp: Response| {
+            assert_eq!((resp.status, resp.body), (404, not_found().body));
+        };
+        assert_eq!(scope_for_operation("PUT", path), RouteDecision::SessionOnly);
+        let first = call(&req);
+        assert_eq!(first.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first.body).unwrap(),
+            json!({"target_id": "Job_A", "liked_at": NOW})
+        );
+        let mut later = h.ctx();
+        later.now += 100;
+        let replay = block_on(handle(&later, &req));
+        assert_eq!((replay.status, replay.body), (200, first.body));
+        let saved = h.store.taste_rows.borrow().clone();
+        assert_eq!(saved.len(), 1);
+        assert!(saved.contains_key(&("alice".into(), "track".into(), "Job_A".into())));
+
+        req.cookie = Some(bob);
+        assert_not_found(call(&req));
+        req.cookie = Some(alice.clone());
+        for target in ["Job.A", "Private", "Absent"] {
+            req.path = format!("/v1/me/likes/track/{target}");
+            assert_not_found(call(&req));
+        }
+        req.path = path.into();
+        req.body = vec![0; MAX_BODY_BYTES + 1];
+        assert_eq!(call(&req).status, 400);
+        req.body.clear();
+        for origin in [None, Some("https://other.example")] {
+            req.origin = origin.map(str::to_string);
+            assert_eq!(call(&req).status, 401);
+        }
+        req.origin = Some(ORIGIN.into());
+        req.cookie = None;
+        assert_eq!(call(&req).status, 401);
+
+        let minted = mint_call(
+            &h,
+            &alice,
+            json!({"scopes":["library:read"], "ttl_secs":3600}),
+        );
+        assert_eq!(minted.status, 201);
+        let key = mint_secret(&serde_json::from_str(&minted.body).unwrap());
+        req.authorization = Some(format!("Bearer {key}"));
+        let lookups = *h.store.native_credential_lookups.borrow();
+        assert_not_found(call(&req));
+        req.cookie = Some(alice);
+        assert_not_found(call(&req));
+        assert_eq!(*h.store.native_credential_lookups.borrow(), lookups);
+
+        req.authorization = None;
+        for method in ["GET", "HEAD", "POST", "PATCH", "DELETE", "put"] {
+            assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
+            req.method = method.into();
+            assert_not_found(call(&req));
+        }
+        for origin in [Some(ORIGIN), None, Some("https://other.example")] {
+            let resp = h.call_full("OPTIONS", path, None, None, origin);
+            assert_eq!(resp.status, 204);
+            assert!(resp.body.is_empty() && resp.set_cookie.is_none());
+            let cors = crate::worker_entry::cors_headers(resp.status, origin, ORIGIN);
+            if origin == Some(ORIGIN) {
+                assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
+                assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                assert!(cors.iter().any(|(name, methods)| {
+                    *name == "access-control-allow-methods"
+                        && methods.split(", ").any(|m| m == "PUT")
+                }));
+            } else {
+                assert!(cors.is_empty());
+            }
+        }
+        assert_eq!(*h.store.taste_rows.borrow(), saved);
+    }
+
+    #[test]
     fn other_preference_paths_remain_unregistered() {
         let h = harness();
         seed_user(&h, "alice", "alice@example.com");
@@ -17076,7 +17183,10 @@ mod tests {
             "/v1/me/likes/",
             "/v1/me/likes-extra",
             "/v1/me/likes/import",
-            "/v1/me/likes/track/example",
+            "/v1/me/likes/track",
+            "/v1/me/likes/track/",
+            "/v1/me/likes/track/example/",
+            "/v1/me/likes/track/example/nested",
             "/v1/me/taste/",
             "/v1/me/taste/track/example",
             "/v1/me/tastes",
