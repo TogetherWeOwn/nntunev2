@@ -59,6 +59,7 @@ pub(crate) enum ReconcileProbe {
     ServerWatchdog,
     ParentCascade,
     ObserveStaleRefusal(std::rc::Rc<std::cell::Cell<bool>>),
+    ObserveTargetRefusal(std::rc::Rc<std::cell::Cell<bool>>),
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
@@ -115,7 +116,13 @@ pub(crate) async fn apply_reconcile_transaction(
             user_id: &user_id,
             subscription_id: &row.stripe_subscription_id,
         };
-        let target = classify_target(&requested, &observed).map_err(|_| StoreError)?;
+        let target = classify_target(&requested, &observed).map_err(|_| {
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            if let ReconcileProbe::ObserveTargetRefusal(refused) = &probe {
+                refused.set(true);
+            }
+            StoreError
+        })?;
         crate::billing_store_classification::validate_history_target(&outcome)
             .map_err(|_| StoreError)?;
         if outcome.explicit_stale {

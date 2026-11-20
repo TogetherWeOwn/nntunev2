@@ -304,6 +304,99 @@ async fn wait_for_raw_writer(writer: &tokio_postgres::Client) -> Result<(), Stor
     Err(StoreError)
 }
 
+// Exercise a genuinely absent key, not a DELETE/reinsert of an existing target.
+pub(crate) async fn test_reconcile_after_raw_insert(commit: bool) -> Result<(), &'static str> {
+    use futures_util::future::{select, Either};
+    use std::{cell::Cell, rc::Rc};
+
+    setup_ack_fixture().await?;
+    let store = PgStore {
+        env: None,
+        trace_id: "worker-after-raw-insert-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        work_deadline_observer: None,
+        cancel_token_observer: None,
+    };
+    let phase = Rc::new(Cell::new("raw INSERT: connect writer"));
+    let diagnostic = phase.clone();
+    billing_budget::with_owned_connection(
+        "127.0.0.1", 5432, CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |writer| Box::pin(async move {
+            phase.set("raw INSERT: seed contender with an initially empty target");
+            writer.batch_execute(
+                "INSERT INTO public.users (id, email, created_at)
+                 VALUES ('worker_insert_user', 'worker-insert@example.test', 1786032000)",
+            ).await.map_err(|_| StoreError)?;
+            let before = parent_delete_snapshot(writer, None).await?;
+            if before.1.is_some() || before.2.is_some() {
+                return Err(StoreError);
+            }
+            writer.batch_execute("BEGIN; SET LOCAL statement_timeout = '5s'")
+                .await.map_err(|_| StoreError)?;
+            let inserted: String = writer.query_one(
+                "INSERT INTO public.subscriptions AS s
+                    (user_id, stripe_subscription_id, stripe_customer_id,
+                     stripe_subscription_item_id, stripe_price_id, plan_id, status)
+                 VALUES ('worker_insert_user', 'sub_worker_fault', 'cus_worker_insert',
+                         'si_worker_insert', 'price_worker_fault', 'plus', 'active')
+                 RETURNING jsonb_build_array(to_jsonb(s))::text", &[],
+            ).await.map_err(|_| StoreError)?.get(0);
+
+            phase.set("raw INSERT: Worker table lock did not wait on the writer");
+            let refused = Rc::new(Cell::new(false));
+            let mut reconcile = Box::pin(store.store_reconcile_owned(
+                "worker_fault_user".into(), test_outcome(), ReconcileProbe::ObserveTargetRefusal(refused.clone()),
+            ));
+            match select(reconcile.as_mut(), Box::pin(wait_for_raw_writer(writer))).await {
+                Either::Left(_) => return Err(StoreError),
+                Either::Right((observed, _)) => observed?,
+            }
+            phase.set("raw INSERT: preceding writer did not finish");
+            writer.batch_execute(if commit { "COMMIT" } else { "ROLLBACK" })
+                .await.map_err(|_| StoreError)?;
+            phase.set("raw INSERT: wrong reconciliation result after the writer finished");
+            if reconcile.await.is_ok() == commit || refused.get() != commit {
+                return Err(StoreError);
+            }
+
+            phase.set("raw INSERT: wrong durable owner or history");
+            if commit {
+                if parent_delete_snapshot(writer, None).await? != (before.0, Some(inserted), None) {
+                    return Err(StoreError);
+                }
+            } else {
+                let valid: bool = writer.query_one(
+                    "SELECT (SELECT count(*) = 1 AND bool_and(user_id = 'worker_fault_user'
+                                      AND stripe_subscription_id = 'sub_worker_fault'
+                                      AND status = 'active' AND paid_invoice_id = 'in_worker_second')
+                             FROM public.subscriptions)
+                        AND (SELECT count(*) = 2 AND bool_and(user_id = 'worker_fault_user'
+                                      AND stripe_subscription_id = 'sub_worker_fault'
+                                      AND plan_id = 'plus' AND amount_cents = 800 AND currency = 'usd')
+                                 AND array_agg(stripe_invoice_id ORDER BY stripe_invoice_id)
+                                     = ARRAY['in_worker_first', 'in_worker_second']
+                             FROM public.paid_invoice_history)", &[],
+                ).await.map_err(|_| StoreError)?.get::<_, Option<bool>>(0).unwrap_or(false);
+                if !valid || parent_delete_snapshot(writer, None).await?.0 != before.0 {
+                    return Err(StoreError);
+                }
+            }
+            phase.set("raw INSERT: billing lock survived completion");
+            let clear: bool = writer.query_one(
+                "SELECT NOT EXISTS (SELECT 1 FROM pg_catalog.pg_locks
+                   WHERE relation = 'public.subscriptions'::regclass AND database =
+                       (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()))", &[],
+            ).await.map_err(|_| StoreError)?.get(0);
+            if !clear {
+                return Err(StoreError);
+            }
+            Ok(())
+        }),
+        |_| {},
+    ).await.map_err(|_| diagnostic.get())
+}
+
 pub(crate) async fn test_reconcile_raw_replace(commit: bool) -> Result<(), &'static str> {
     use futures_util::future::{select, Either};
     use std::{cell::Cell, rc::Rc};
