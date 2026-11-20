@@ -352,10 +352,10 @@
 			}
 			if (!isCurrent()) return;
 			if (authoritative) {
-				const { next, sources } = queueController.prepareLibrary(state.items);
-				if (next !== queueController.snapshot) queueConfirmGeneration += 1;
-				if (state.loadError && state.items.length === 0) player.announceQueue('');
-				commitQueue(next, 'replace', { sources, isCurrent });
+				player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
+					if (queueChanged) queueConfirmGeneration += 1;
+					if (state.loadError && state.items.length === 0) player.announceQueue('');
+				});
 			}
 			// Queue publication can reenter the route and revoke this receipt.
 			if (!isCurrent()) return;

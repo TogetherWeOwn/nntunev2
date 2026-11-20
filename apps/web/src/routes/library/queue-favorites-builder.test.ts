@@ -50,8 +50,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	};
 	return new Function(...Object.keys(bindings), `
 		${compiled}
-		const library = queueController.prepareLibrary([...items, ...queue.tracks]);
-		player.commitQueue(library.next, 'replace', { sources: library.sources, isCurrent: () => true });
+		player.reconcileLibrary([...items, ...queue.tracks], () => true);
 		player.announceQueue(announcement);
 		queueController.subscribe((value) => { queue = value; });
 		return {

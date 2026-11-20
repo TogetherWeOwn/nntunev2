@@ -99,6 +99,17 @@ export function createPlayerController(
 		return isCurrent();
 	}
 
+	function reconcileLibrary(
+		items: Parameters<typeof queue.prepareLibrary>[0], isCurrent: () => boolean,
+		beforeCommit?: (queueChanged: boolean) => void
+	): boolean {
+		if (!isCurrent()) return false;
+		const { next, sources } = queue.prepareLibrary(items);
+		// The caller's UI work runs inline; the guarded commit rechecks the receipt afterward.
+		beforeCommit?.(next !== queue.snapshot);
+		return commitQueue(next, 'replace', { sources, isCurrent });
+	}
+
 	function replaceQueue(next: QueueState): boolean {
 		return commitQueue(next, 'replace');
 	}
@@ -106,6 +117,7 @@ export function createPlayerController(
 	return {
 		queue, media, browseCopy, get mediaRevision() { return mediaRevision; },
 		get queueAnnouncement() { return queueAnnouncement; }, announceQueue,
-		commitQueue, replaceQueue, resetAtAuthBoundary
+		commitQueue: (next: QueueState, kind: QueueCommitKind) => commitQueue(next, kind),
+		reconcileLibrary, replaceQueue, resetAtAuthBoundary
 	};
 }
