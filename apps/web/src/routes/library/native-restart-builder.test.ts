@@ -985,7 +985,7 @@ test('removing the current queue row clears its jump readout', () => {
 	expect(page.read().jumpStatus).toBe('');
 });
 
-test('native seeking retires only an outdated jump readout', () => {
+test('native seeking clears a previous jump readout but not the jump seek itself', () => {
 	const { page, element, media } = restartFixture();
 	page.jump('forward');
 	page.seeking();

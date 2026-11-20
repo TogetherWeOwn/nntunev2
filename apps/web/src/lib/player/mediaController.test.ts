@@ -38,25 +38,30 @@ test.each(['availability', 'position', 'assignment', 'readback'] as const)(
 		const media = createMediaController((_audio, source) => source === '/coral', coral);
 		const replacement = new SeekableAudio() as unknown as HTMLAudioElement;
 		let position = 30;
+		let reads = 0, armed = false;
 		const native = new class extends SeekableAudio {
 			play = vi.fn(); pause = vi.fn(); load = vi.fn();
-			override get duration() { if (phase === 'availability') media.attach(replacement); return 120; }
-			override get currentTime() {
-				if (phase === (position === 0 ? 'readback' : 'position')) media.attach(replacement);
+			get duration() { if (armed && phase === 'availability') media.attach(replacement); return 120; }
+			get currentTime() {
+				if (armed && ++reads === (phase === 'position' ? 2 : phase === 'readback' ? 3 : 0)) media.attach(replacement);
 				return position;
 			}
-			override set currentTime(value: number) {
+			set currentTime(value: number) {
 				position = value;
-				if (phase === 'assignment') media.attach(replacement);
+				if (armed && phase === 'assignment') media.attach(replacement);
 			}
 		}();
 		const audio = native as unknown as HTMLAudioElement;
 		const staleCleanup = media.attach(audio);
+		media.jump('back');
+		const jumpStatus = 'Back 10 seconds, now at 0:20.';
+		expect(get(media.seekFeedback).jumpStatus).toBe(jumpStatus);
+		armed = true;
 		media.restart();
 		staleCleanup();
 		expect(media.audio).toBe(replacement);
-		expect(position).toBe(phase === 'assignment' || phase === 'readback' ? 0 : 30);
-		expect(get(media.seekFeedback).restartStatusVersion).toBe(0);
+		expect(position).toBe(phase === 'assignment' || phase === 'readback' ? 0 : 20);
+		expect(get(media.seekFeedback)).toMatchObject({ restartStatusVersion: 0, jumpStatus: phase === 'readback' ? '' : jumpStatus });
 		for (const method of [native.play, native.pause, native.load]) expect(method).not.toHaveBeenCalled();
 	}
 );
@@ -67,7 +72,7 @@ test('only the newer restart on an unchanged receipt can seek and publish', () =
 	const seek = vi.spyOn(native, 'currentTime', 'set');
 	media.attach(native as unknown as HTMLAudioElement);
 	const receipt = media.attachment;
-	vi.spyOn(native, 'duration', 'get').mockImplementationOnce(() => { media.restart(); return 120; });
+	vi.spyOn(native, 'duration', 'get').mockImplementationOnce(() => { media.restart(); return NaN; });
 	media.restart();
 	expect(media.attachment).toBe(receipt);
 	expect(seek).toHaveBeenCalledExactlyOnceWith(0);
