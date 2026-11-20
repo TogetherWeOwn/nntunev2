@@ -37,25 +37,34 @@ const routeProof = JSON.stringify({ worker_id: workerId, sha, checked_at: checke
 test('only exact-main bootstrap uses the protected production job after staging admission', (t) => {
   const preflight = workflow.match(/id: target\n        env:\n((?: {10}[^\n]*\n)+)        run: \|\n((?: {10}[^\n]*\n)+)/);
   assert.ok(preflight);
-  assert.match(preflight[1], /^ {10}DEPLOY_MODE: \$\{\{ inputs\.mode \}\}$/m);
+  assert.doesNotMatch(workflow.split('\n  staging-evidence:\n')[0], /^    environment:/m);
+  assert.match(preflight[1], /UNPROTECTED_CF_CONFIG: \$\{\{ secrets\.PRODUCTION_CLOUDFLARE_API_TOKEN != '' \|\| secrets\.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' \}\}/);
   assert.match(workflow, /staging-evidence:\n    name: staging-evidence\n    needs: \[preflight\]/);
   const job = workflow.split('\n  bootstrap-maintenance:\n')[1].split('\n  release:\n')[0];
   assert.match(job, /if: inputs.mode == 'bootstrap-maintenance'\n    needs: \[preflight, staging-evidence\]/);
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false\n    environment: production/);
-  assert.match(job, /ACCEPTED_SHA: \$\{\{ vars\.PRODUCTION_ACCEPTED_SHA \}\}[\s\S]*run: node ci\/production-maintenance\/seed\.mjs/);
+  const gate = job.match(/ACCEPTED_SHA: \$\{\{ vars\.PRODUCTION_ACCEPTED_SHA \}\}\n        run: \|\n((?: {10}[^\n]*\n)+)      - uses: actions\/checkout@/);
+  assert.ok(gate);
+  for (const [accepted, attempt] of [[sha, '1'], ['c'.repeat(40), '1'], [sha, '2']]) {
+    const env = { DEPLOY_SHA: sha, ACCEPTED_SHA: accepted, GITHUB_RUN_ATTEMPT: attempt };
+    assert.equal(spawnSync('/bin/bash', ['-c', gate[1]], { env, timeout: 5_000 }).status,
+      accepted === sha && attempt === '1' ? 0 : 1);
+  }
   const workspace = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'maintenance-preflight-'));
   t.after(() => rmSync(workspace, { recursive: true, force: true }));
   const output = join(workspace, 'github-output');
   for (const [overrides, refusal] of [
     [{ DEPLOY_MODE: 'promote' }, /Application promotion is disabled/],
     [{ INPUT_SHA: 'c'.repeat(40) }, /must match the dispatched main commit/],
+    [{ UNPROTECTED_CF_CONFIG: 'true' }, /Cloudflare credentials must exist only in the production Environment/],
     [{}],
   ]) {
     const result = spawnSync('/bin/bash', ['-c', preflight[2].replace(/^ {10}/gm, '')], {
       encoding: 'utf8', timeout: 5_000, env: {
         PATH: process.env.PATH, GITHUB_OUTPUT: output, GITHUB_REF: 'refs/heads/main', GITHUB_SHA: sha,
         INPUT_SHA: sha, DEPLOY_MODE: 'bootstrap-maintenance', PRODUCTION_DEPLOY_ENABLED: 'true',
-        UNPROTECTED_ACCEPTED_SHA: '', PRODUCTION_DOMAIN: 'example.com', PRODUCTION_DOMAIN_DEFAULT: 'example.invalid',
+        UNPROTECTED_ACCEPTED_SHA: '', UNPROTECTED_CF_CONFIG: 'false',
+        PRODUCTION_DOMAIN: 'example.com', PRODUCTION_DOMAIN_DEFAULT: 'example.invalid',
         ...overrides,
       },
     });

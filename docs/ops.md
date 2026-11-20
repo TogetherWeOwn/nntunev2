@@ -1115,28 +1115,17 @@ The first rollback target is a binding-free maintenance Worker, not a direct
 application deploy. Do not bypass the production lane to seed the app.
 Promotion stays disabled; bootstrap changes no DNS, routes or triggers.
 
-1. **Release Manager:** After M1, staging admission, Security → QA, exact-head CI
-   and migration ledger review, accept the seed and exact `main` dispatch SHA.
-   Verify `production` Environment protection with the GitHub custodian. Only there,
-   set `PRODUCTION_ACCEPTED_SHA` and `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID)
-   and use its Worker-scoped token and matching account. Configure the hostname
-   and enable `PRODUCTION_DEPLOY_ENABLED` only for the accepted window.
-2. **Route custodian:** Just before dispatch, inventory applicable zone Worker
-   routes (every page, including wildcards) with existing read-only access.
-   Refuse gaps. Record coverage, Worker ID, SHA, UTC read time and zero matches.
-   The GitHub custodian sets `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in `production`:
-   JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`) and numeric
-   `route_count: 0`. Freeze routes; the Worker token cannot list them. This lane
-   must be the sole Worker writer through readback; there is no conditional deploy.
-3. **Release Manager:** Dispatch `mode=bootstrap-maintenance` on `main` at the
-   accepted `sha`. Under the mutation lock, require proof ≤30 minutes old, empty
-   deployment/version/binding inventories, no custom domain, workers.dev or previews.
-   One [upload by immutable ID with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/)
-   installs `worker.mjs` at 100%. Record verified readback. On uncertainty, close
-   the window and reconcile Worker, deployment and routes before any retry.
-4. **Close/undo:** Disable `PRODUCTION_DEPLOY_ENABLED`, clear the accepted SHA and
-   route proof, and verify the seed remains unexposed and unrouted. Leave it and
-   the Worker intact; re-entry refuses. Reverse only separately accepted cutover routes/DNS.
+1. **Release Manager:** After M1, staging admission, Security → QA, exact-head CI and migration ledger review, accept the seed and exact `main` SHA.
+   Verify `production` Environment protection with the GitHub custodian; configure the hostname and `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
+   Keep `PRODUCTION_ACCEPTED_SHA`, `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID), Worker-scoped bearer and matching account in `production` only; inherited Cloudflare secrets cause preflight to refuse.
+2. **Route custodian:** Immediately before dispatch, inventory every applicable zone and page, including wildcards, with existing read-only access. Refuse gaps; record zones, Worker ID, SHA, read time and zero matches.
+   The GitHub custodian sets `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in `production`: JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`) and numeric `route_count: 0`.
+   Freeze routes and keep this lane the sole Worker writer through readback. The Worker token cannot list zone routes; Cloudflare does not provide a conditional deploy.
+3. **Release Manager:** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`; Actions reruns are refused.
+   Under the mutation lock, require proof ≤30 minutes old, empty deployment/version/binding inventories and no custom domain, workers.dev or previews.
+   One [upload by immutable ID with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/) installs `worker.mjs` at 100%. Record verified readback.
+4. **Close/undo:** Disable `PRODUCTION_DEPLOY_ENABLED` and clear the accepted SHA and route proof. To abort an in-flight run, cancel it too and reconcile Worker, deployment and route state before any retry.
+   Verify the seed remains unrouted and unexposed. Leave it and the Worker intact; re-entry refuses. Reverse only separately accepted cutover routes/DNS.
 
 ### Production Worker secret-shape gate
 
