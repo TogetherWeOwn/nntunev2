@@ -221,8 +221,21 @@ enum EnrolledReadbackError {
     Body(BodyReadbackError),
 }
 
+fn compact_uuid(id: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    id.iter()
+        .flat_map(|&byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 0xf)]),
+            ]
+        })
+        .collect()
+}
+
 /// The inputs must come from one independently authorized custody and locator
-/// snapshot. No caller-supplied file key or fallback is accepted on this path.
+/// snapshot. Pins use logical keys relative to the trusted provider prefix.
+/// No caller-supplied file key or fallback is accepted on this path.
 /// Success authorizes neither publication nor reuse.
 #[allow(dead_code)] // Not mounted; a concrete validator and trusted snapshot are still required.
 async fn verify_enrolled_readback<'a, B: ReadbackBody>(
@@ -243,6 +256,19 @@ async fn verify_enrolled_readback<'a, B: ReadbackBody>(
     .map_err(|_| EnrolledReadbackError::Envelope)?;
     let [_, environment, library, object, generation, provider] = envelope.context.identities;
     let identities = [environment, library, object, generation, provider];
+    let lifecycle = format!("{}/{}", compact_uuid(&object), compact_uuid(&generation));
+    let map_prefix = format!(
+        "media-digests/{lifecycle}/{}",
+        compact_uuid(manifest.map_id())
+    );
+    if pages.len() != manifest.geometry().pages() as usize
+        || media.object_key != format!("media/{lifecycle}")
+        || !pages
+            .iter()
+            .all(|(index, pin)| pin.object_key == format!("{map_prefix}/{index:08x}"))
+    {
+        return Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory));
+    }
     verify_readback(manifest, &key, &identities, media, pages, open, validation)
         .await
         .map_err(EnrolledReadbackError::Body)
@@ -316,7 +342,7 @@ async fn verify_readback<'a, B: ReadbackBody>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::digest_test_fixture::{fixture, id, Fixture};
+    use crate::digest_test_fixture::{fixture, fixture_with_identities, id, Fixture};
 
     struct Body<'a>(&'a [u8], bool);
 
@@ -395,12 +421,18 @@ mod tests {
             }
         }
 
+        const MEDIA: &str =
+            "media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd";
+        const PAGE: &str = concat!(
+            "media-digests/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd/",
+            "02020202020240028002020202020202/00000000",
+        );
         let plaintext = b"synthetic media";
-        let f = fixture(plaintext);
+        let f = fixture_with_identities(plaintext, [id(6), id(7), id(0xab), id(0xcd), id(1)]);
         let mut media_bytes = f.header.to_vec();
         media_bytes.extend_from_slice(&f.chunks[0]);
         let context = EnvelopeContext {
-            identities: [id(9), id(1), id(1), id(1), id(1), id(1)],
+            identities: [id(9), id(6), id(7), id(0xab), id(0xcd), id(1)],
             plaintext_len: plaintext.len() as u64,
             header: f.header,
         };
@@ -409,11 +441,49 @@ mod tests {
             crate::media_envelope::wrap_scheme2(&root, &context, f.key.expose_secret()).unwrap();
         let mut altered = record;
         altered[229] ^= 1;
-        for (root, trusted, retained, accepted) in [
-            (&root, &record, &record, true),
-            (&root, &record, &altered, false),
-            (&root, &altered, &altered, false),
-            (&[3; 32], &record, &record, false),
+        let bad_object = MEDIA.replacen("ab", "AB", 1);
+        let bad_generation = MEDIA.replacen("cd", "ab", 1);
+        let bad_map = PAGE.replacen("/02", "/03", 1);
+        let bad_index = PAGE.replacen("/00000000", "/00000001", 1);
+        let envelope = || Err(EnrolledReadbackError::Envelope);
+        let inventory = || Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory));
+        for (root, trusted, retained, media, page, expected) in [
+            (&root, &record, &record, MEDIA, PAGE, Ok(())),
+            (&root, &record, &altered, MEDIA, PAGE, envelope()),
+            (&root, &altered, &altered, MEDIA, PAGE, envelope()),
+            (&[3; 32], &record, &record, MEDIA, PAGE, envelope()),
+            (
+                &root,
+                &record,
+                &record,
+                bad_object.as_str(),
+                PAGE,
+                inventory(),
+            ),
+            (
+                &root,
+                &record,
+                &record,
+                bad_generation.as_str(),
+                PAGE,
+                inventory(),
+            ),
+            (
+                &root,
+                &record,
+                &record,
+                MEDIA,
+                bad_map.as_str(),
+                inventory(),
+            ),
+            (
+                &root,
+                &record,
+                &record,
+                MEDIA,
+                bad_index.as_str(),
+                inventory(),
+            ),
         ] {
             let mut opens = 0;
             let result = verify_enrolled_readback(
@@ -424,12 +494,12 @@ mod tests {
                     trusted_record: trusted,
                     retained_record: retained,
                 },
-                pin("media"),
-                &[(0, pin("page"))],
+                pin(media),
+                &[(0, pin(page))],
                 async |request: ReadbackPin<'_>| {
                     let bytes = match request.object_key {
-                        "media" => media_bytes.as_slice(),
-                        "page" => f.pages[0].as_slice(),
+                        MEDIA => media_bytes.as_slice(),
+                        PAGE => f.pages[0].as_slice(),
                         _ => panic!("unexpected synthetic request"),
                     };
                     opens += 1;
@@ -447,13 +517,8 @@ mod tests {
                 ExactMedia(plaintext),
             )
             .await;
-            if accepted {
-                assert_eq!(result, Ok(()));
-                assert_eq!(opens, 2);
-            } else {
-                assert_eq!(result, Err(EnrolledReadbackError::Envelope));
-                assert_eq!(opens, 0);
-            }
+            assert_eq!(opens, if expected.is_ok() { 2 } else { 0 });
+            assert_eq!(result, expected);
         }
     }
 
