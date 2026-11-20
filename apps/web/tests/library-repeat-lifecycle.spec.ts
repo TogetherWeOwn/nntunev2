@@ -189,6 +189,35 @@ test('a same-flush queue source round trip replaces the rendered audio host', as
 	expect(await plays(page)).toHaveLength(2);
 });
 
+test('same-source Library refresh and reorder preserve the native element and its position', async ({ page }) => {
+	await openLibrary(page);
+	await enqueue(page, ['lib-coral', 'lib-pine']);
+	await playCurrent(page);
+	const player = page.getByTestId('audio-player');
+	const original = (await player.elementHandle())!;
+	await original.evaluate((node) => {
+		Object.defineProperty(node, 'currentTime', { value: 37, writable: true, configurable: true });
+	});
+	const nativeState = () => original.evaluate((node) => ({
+		current: node === document.querySelector('[data-testid="audio-player"]'),
+		time: (node as HTMLAudioElement).currentTime,
+		paused: (node as HTMLAudioElement).paused
+	}));
+	await Promise.all([
+		page.waitForResponse((response) => new URL(response.url()).pathname === '/api/library' && response.ok()),
+		page.getByRole('button', { name: 'Refresh', exact: true }).click()
+	]);
+	await settleFrames(page);
+	expect(await nativeState()).toEqual({ current: true, time: 37, paused: false });
+
+	await page.getByRole('button', { name: 'Move Pine Morning up', exact: true }).click();
+	expect(await queueOrder(page)).toEqual(['lib-pine', 'lib-coral']);
+	await expect(player).toHaveCount(1);
+	await expect(player).toHaveAttribute('src', ITEMS[0].streamUrl);
+	expect(await nativeState()).toEqual({ current: true, time: 37, paused: false });
+	expect(await plays(page)).toHaveLength(1);
+});
+
 test('pending automatic play is silent and auth teardown pauses its connected native audio', async ({ page }) => {
 	const errors: string[] = [];
 	page.on('pageerror', (error) => errors.push(error.message));

@@ -103,16 +103,18 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 
 		const receipt = queue.revoke();
 		let attachment = current;
+		let version = attachmentVersion;
 		const ownsAttempt = () => !destroyed && queue.isCurrent(receipt) && source.isCurrent();
-		const isCurrent = () => ownsAttempt() && current === attachment;
+		const isCurrent = () => ownsAttempt() && current === attachment && attachmentVersion === version;
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
 		if (streamUrl) {
 			await deps.flush();
 			// A source change retires the old node before commit. In that case
-			// flush mounts its replacement; a surviving node keeps its receipt.
-			if (!ownsAttempt() || (attachment && !isCurrent())) return;
+			// flush can admit one attachment, but not a reset or replacement while waiting.
+			if (!ownsAttempt() || attachmentVersion !== version + Number(!attachment && !!current)) return;
 			attachment = current;
+			version = attachmentVersion;
 			const audio = attachment?.audio;
 			lead = `Selected ${title}, paused: playback was blocked.`;
 			try {

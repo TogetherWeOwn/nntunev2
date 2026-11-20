@@ -5,7 +5,6 @@ import { createQueueController, type LibrarySources, type QueueCommitKind } from
 
 type PlayerEffects = Omit<NaturalEndSelection, 'commit'> & {
 	clearRestartFeedback: () => void;
-	bumpMediaKey: () => void;
 	clearQueueAnnouncement: () => void;
 	syncMiniPlayerHint: (next: QueueState) => void;
 };
@@ -20,6 +19,20 @@ export function createPlayerController(
 ) {
 	const queue = createQueueController(initial);
 	const media = createMediaController(queue, { ...effects, commit: replaceQueue }, matchesNative);
+
+	// A source round trip before Svelte flushes must not revive a retired node.
+	// This keys the render, independently of attachment and detach receipts.
+	let mediaRevision = $state(0);
+
+	function retireNativeHost(): void {
+		mediaRevision += 1;
+		media.reset();
+	}
+
+	function resetAtAuthBoundary(): void {
+		media.clearShareSeek();
+		retireNativeHost();
+	}
 
 	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit): boolean {
 		if (library && !library.isCurrent()) return false;
@@ -47,10 +60,8 @@ export function createPlayerController(
 			if (!isCurrent()) return false;
 		}
 		if (trackChanged || resolveStreamUrl(before) !== resolveStreamUrl(after)) {
-			effects.bumpMediaKey();
-			if (!isCurrent()) return false;
 			version += 1;
-			media.reset();
+			retireNativeHost();
 			if (!isCurrent()) return false;
 		}
 		if (kind === 'replace') effects.clearQueueAnnouncement();
@@ -65,5 +76,5 @@ export function createPlayerController(
 		return commitQueue(next, 'replace');
 	}
 
-	return { queue, media, commitQueue, replaceQueue };
+	return { queue, media, get mediaRevision() { return mediaRevision; }, commitQueue, replaceQueue, resetAtAuthBoundary };
 }
