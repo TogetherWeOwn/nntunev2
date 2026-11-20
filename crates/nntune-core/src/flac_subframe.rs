@@ -166,6 +166,28 @@ mod tests {
             assert_eq!(bits.read(&mut rest, 7), Ok(Some(0x55)));
             assert_eq!(rest, [0xaa]);
         }
+
+        // Three leading bits, then the same header and sample, then five tail bits.
+        let bytes = [0xa2, 0x60, 0x1a, 0xad, 0xaa];
+        let mut bits = BitInput::default();
+        let mut reader = SubframeHeaderReader::new(16).unwrap();
+        let mut prefix = &bytes[..1];
+        assert_eq!(bits.read(&mut prefix, 3), Ok(Some(0b101)));
+        // Only five bits of the eight-bit header are buffered.
+        assert_eq!(reader.read(&mut bits, &mut prefix), Ok(None));
+        assert!(prefix.is_empty());
+        let mut rest = &bytes[1..];
+        assert_eq!(
+            reader.read(&mut bits, &mut rest),
+            Ok(Some(SubframeHeader {
+                kind: SubframeKind::Fixed(1),
+                wasted: 9,
+                sample_bits: 7,
+            }))
+        );
+        assert_eq!(bits.read(&mut rest, 7), Ok(Some(0x55)));
+        assert_eq!(bits.read(&mut rest, 5), Ok(Some(0b01101)));
+        assert_eq!(rest, [0xaa]);
     }
 
     #[test]
