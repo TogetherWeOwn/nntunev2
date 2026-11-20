@@ -702,6 +702,7 @@
 		handledShareSearch = search;
 		const account = queueExportAuthGeneration;
 		const intent = media.beginShareInput();
+		// A native retry can run after the URL changes but before afterNavigate.
 		const inputIsCurrent = () => shareAlive && account === queueExportAuthGeneration &&
 			handledShareSearch === search && window.location.search === search;
 		shareInvalid = false;
@@ -727,13 +728,7 @@
 		if (!replaceQueue(
 			selectQueueIndex(appended, appended.tracks.findIndex((track) => track.id === target.trackId))
 		)) return;
-		const source = resolveStreamUrl(queueCurrentTrack(queueController.snapshot));
-		if (!source) return;
-		const trySeek = media.captureShareSeek(intent, { ...target, streamUrl: source }, () => {
-			if (!inputIsCurrent()) return false;
-			const current = queueCurrentTrack(queueController.snapshot);
-			return current?.id === target.trackId && resolveStreamUrl(current) === source;
-		});
+		const trySeek = media.captureShareSeek(intent, target, inputIsCurrent);
 		if (!trySeek) return;
 		// Try after the keyed audio mounts; the controller handles native retries.
 		void tick().then(trySeek);

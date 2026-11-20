@@ -3,8 +3,9 @@ import { resolveStreamUrl } from '../library/stream-url.js';
 import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode, type Track } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
-import { createPendingShareSeek, type ShareSeekTarget } from './pendingShareSeek.js';
+import { createPendingShareSeek } from './pendingShareSeek.js';
 import { restartIsAvailable } from './restartAvailability.js';
+import type { ShareTarget } from './shareTimestamp.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 
@@ -189,13 +190,22 @@ export function createMediaController(queue: QueueAuthority, naturalEnd?: Natura
 		});
 	}
 
-	function captureShareSeek(intent: number, target: ShareSeekTarget, selected: () => boolean) {
-		if (!selected() || destroyed || intent !== positionIntent) return;
+	function captureShareSeek(intent: number, { trackId, seconds }: ShareTarget, routeIsCurrent: () => boolean) {
+		if (!routeIsCurrent() || destroyed || intent !== positionIntent) return;
+		const track = currentTrack(queue.snapshot);
+		if (track?.id !== trackId) return;
+		const streamUrl = resolveStreamUrl(track);
+		if (!streamUrl) return;
 		// Before the keyed node mounts, only the first upcoming attachment can inherit this seek.
 		const version = current ? attachmentVersion : attachmentVersion + 1;
-		const revision = pendingShare.set(target, (audio) => ({
-			isCurrent: () => matchesSource(audio, target.streamUrl, () =>
-				selected() && current?.audio === audio && attachmentVersion === version && positionIntent === intent)
+		const revision = pendingShare.set({ trackId, streamUrl, seconds }, (audio) => ({
+			isCurrent: () => matchesSource(audio, streamUrl, () => {
+				if (!routeIsCurrent() || destroyed || current?.audio !== audio ||
+					attachmentVersion !== version || positionIntent !== intent) return false;
+				// Other queue edits need not revoke a seek for this track and source.
+				const selected = currentTrack(queue.snapshot);
+				return selected?.id === trackId && resolveStreamUrl(selected) === streamUrl;
+			})
 		}));
 		clearJumpFeedback();
 		return () => retryShare(current?.audio, revision);
