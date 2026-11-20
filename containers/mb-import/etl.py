@@ -24,7 +24,7 @@ ARTIST_TYPE_ID, ARTIST_AREA_ID = 11, 12
 ARTIST_TYPE_LOOKUP_ID, ARTIST_TYPE_NAME = 1, 2
 AREA_ID = 1
 ISO_AREA_ID, ISO_CODE = 1, 2
-CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID = 1, 2, 3
+CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID, CREDIT_NAME, CREDIT_JOIN_PHRASE = 1, 2, 3, 4, 5
 RELEASE_ID, RELEASE_GID, RELEASE_NAME = 1, 2, 3
 RELEASE_CREDIT_ID, RELEASE_GROUP_ID = 4, 5
 GROUP_ID, GROUP_GID, GROUP_NAME, GROUP_CREDIT_ID, GROUP_TYPE_ID = 1, 2, 3, 4, 5
@@ -278,8 +278,14 @@ def main() -> int:
                     CREATE TABLE artist_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                     CREATE TABLE area (id INTEGER PRIMARY KEY);
                     CREATE TABLE iso_3166_1 (area INTEGER PRIMARY KEY, code TEXT);
-                    CREATE TABLE artist_credit_name (credit INTEGER NOT NULL, position INTEGER NOT NULL, artist INTEGER NOT NULL);
-                    CREATE INDEX artist_credit_name_order ON artist_credit_name(credit, position);
+                    CREATE TABLE artist_credit_name (
+                        credit INTEGER NOT NULL,
+                        position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 2147483647),
+                        artist INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        join_phrase TEXT NOT NULL,
+                        PRIMARY KEY (credit, position)
+                    );
                     CREATE TABLE release_group_primary_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                     CREATE TABLE release_group (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, credit INTEGER, type_id INTEGER);
                     CREATE TABLE release_country (release INTEGER NOT NULL, year INTEGER);
@@ -311,7 +317,12 @@ def main() -> int:
                 counts["area"] = load(db, dump_dir / "area", FIELD_COUNTS["area"], (AREA_ID,), "area", "id", as_ints("area.id", (0,)))
                 counts["iso_3166_1"] = load(db, dump_dir / "iso_3166_1", FIELD_COUNTS["iso_3166_1"], (ISO_AREA_ID, ISO_CODE), "iso_3166_1", "area,code", as_ints("iso_3166_1.area", (0,)))
                 counts["artist"] = load(db, dump_dir / "artist", FIELD_COUNTS["artist"], (ARTIST_ID, ARTIST_GID, ARTIST_NAME, ARTIST_SORT_NAME, ARTIST_TYPE_ID, ARTIST_AREA_ID), "artist", "id,gid,name,sort_name,type_id,area_id", as_ints("artist.id", (0, 4, 5), (4, 5)))
-                counts["artist_credit_name"] = load(db, dump_dir / "artist_credit_name", FIELD_COUNTS["artist_credit_name"], (CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID), "artist_credit_name", "credit,position,artist", as_ints("artist_credit_name", (0, 1, 2)))
+                counts["artist_credit_name"] = load(
+                    db, dump_dir / "artist_credit_name", FIELD_COUNTS["artist_credit_name"],
+                    (CREDIT_ID, CREDIT_POSITION, CREDIT_ARTIST_ID, CREDIT_NAME, CREDIT_JOIN_PHRASE),
+                    "artist_credit_name", "credit,position,artist,name,join_phrase",
+                    as_ints("artist_credit_name", (0, 1, 2)),
+                )
                 counts["release_group_primary_type"] = load(db, dump_dir / "release_group_primary_type", FIELD_COUNTS["release_group_primary_type"], (PRIMARY_TYPE_ID, PRIMARY_TYPE_NAME), "release_group_primary_type", "id,name", as_ints("release_group_primary_type.id", (0,)))
                 counts["release_group"] = load(db, dump_dir / "release_group", FIELD_COUNTS["release_group"], (GROUP_ID, GROUP_GID, GROUP_NAME, GROUP_CREDIT_ID, GROUP_TYPE_ID), "release_group", "id,gid,name,credit,type_id", as_ints("release_group.id", (0, 3, 4), (3, 4)))
                 counts["release_country"] = load(db, dump_dir / "release_country", FIELD_COUNTS["release_country"], (RELEASE_COUNTRY_RELEASE_ID, RELEASE_COUNTRY_YEAR), "release_country", "release,year", as_ints("release_country", (0, 1), (1,)))
@@ -527,6 +538,16 @@ def main() -> int:
                     updated_at,
                     lambda row: (row[0], row[1], row[2], row[3], row[4], f"https://coverartarchive.org/release/{row[0]}/front-250", row[5]),
                 )
+                # Release-group-only credits do not project here. Preserve
+                # the credited spelling and join phrase as upstream COPY text.
+                release_credit_query = """
+                    SELECT r.gid,c.position,a.gid,c.name,c.join_phrase
+                    FROM release r
+                    JOIN artist_credit_name c ON c.credit=r.credit
+                    JOIN artist a ON a.id=c.artist
+                    ORDER BY r.id,c.position
+                """
+                release_credit_count = insert_select(db, release_credit_query, output_dir / curated_name("release_credit"), updated_at)
                 recording_query = """
                     WITH ranked_track AS (
                         SELECT t.recording,t.position,m.release,
@@ -674,17 +695,17 @@ def main() -> int:
             snapshot_name = f".curated-{timestamp_key}"
             snapshot = dump_dir / snapshot_name
             if snapshot.exists():
-                for table in ("artist", "release_group", "release", "recording", "track", "url", "artist_url", "recording_url", "recording_music_video", "recording_isrc"):
-                    name = curated_name(table)
-                    if not filecmp.cmp(output_dir / name, snapshot / name, shallow=False):
-                        raise ValueError("this DUMP_TS already has different curated output; use a new timestamp")
+                for output in output_dir.iterdir():
+                    previous = snapshot / output.name
+                    if not previous.is_file() or not filecmp.cmp(output, previous, shallow=False):
+                        raise ValueError("this DUMP_TS already has different curated output; use a fresh dump directory or a new dump")
             else:
                 os.replace(output_dir, snapshot)
             link_tmp = dump_dir / f".curated-link-{uuid.uuid4().hex}"
             os.symlink(snapshot_name, link_tmp)
             os.replace(link_tmp, curated_link)
 
-        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, release_group={release_group_count}, release={release_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count})")
+        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count})")
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"etl: {exc}", file=sys.stderr)

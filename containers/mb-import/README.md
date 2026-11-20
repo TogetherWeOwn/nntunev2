@@ -30,11 +30,20 @@ with `artist_type`/`area`/`iso_3166_1` lookups, `release` with
 `recording` with `medium`/`track`) plus the relationship files (`url`,
 `link_type`, `link`, `link_attribute_type`, `link_attribute`,
 `l_artist_url`, `l_recording_url`, `l_recording_recording`, `isrc`) listed in
-`etl.py`. The ETL writes the ten curated `mbdump-<table>.tsv` files into an
-immutable snapshot and atomically swaps `<mbdump-dir>/curated` to point to it;
-previous snapshots are retained. It uses the image's Python 3 and a temporary,
-disk-backed SQLite projection (no external database). Run the fixture checks
-with `bash containers/mb-import/tests/test_etl.sh` and
+`etl.py`. The ETL writes the ten curated import files and the release credit
+sidecar into an immutable snapshot and atomically swaps `<mbdump-dir>/curated`
+to point to it; previous snapshots are retained. It uses the image's Python 3
+and a temporary, disk-backed SQLite projection (no external database).
+
+The sidecar `mbdump-release_credit.tsv` contains the release MBID, zero-based
+credit position, artist MBID, credited name, join phrase, and dump timestamp.
+It keeps every credit position and the upstream COPY text, not just the first
+artist in the release row. `import.sh` still loads only its existing ten
+files; no database table or read route consumes the sidecar yet. To regenerate
+an older snapshot with the sidecar, use a fresh dump directory and keep the
+original dump timestamp. An existing snapshot is never modified in place.
+
+Run the fixture checks with `bash containers/mb-import/tests/test_etl.sh` and
 `bash containers/mb-import/tests/test_etl_reference_graphs.sh` (from the
 repository root — the latter pins four broken-reference refusal diagnostics:
 missing artist_type, release credit-name rows, track recording, medium
@@ -44,7 +53,7 @@ shipping fixtures in the runtime image. (Sources: `etl.sh:1-14`;
 `etl.py` `validate_timestamp` (`DUMP_TS` validation), `main` (temp SQLite projection; immutable
 snapshot + atomic `curated` symlink swap, previous snapshots retained);
 `tests/test_etl.sh`; `Dockerfile:9-17,40-41`;
-`.github/workflows/ci.yml:298-313`.)
+`.github/workflows/ci.yml:629-640`.)
 
 ### Import admission
 
@@ -207,7 +216,7 @@ resume — suites 1-12 cover all ten tables, including the relationship/ISRC
 generators and the newer/older-changed-dump and split-fixture suites) against
 a scratch database: (Sources: `test-import.sh:10-15` (contract/refusal
 guard), `:111-665` (suites 1-12);
-`.github/workflows/ci.yml:746-790`.)
+`.github/workflows/ci.yml:1157-1205`.)
 
 The shipped CI image carries `mb-validate`.
 The Docker build and import test suite run in the GitHub Actions
