@@ -27,6 +27,10 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    // Serde structs also accept positional arrays without this object check.
+    if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+        return validation_failed("invalid request");
+    }
     let Some(body) = parse_body::<ExportRequest>(req) else {
         return validation_failed("invalid request");
     };
@@ -57,11 +61,7 @@ where
         Ok(mut rows) => {
             let has_more = rows.len() > EXPORT_PAGE_SIZE;
             rows.truncate(EXPORT_PAGE_SIZE);
-            let next_cursor = if has_more {
-                rows.last().map(|row| row.cursor())
-            } else {
-                None
-            };
+            let next_cursor = rows.last().filter(|_| has_more).map(|row| row.cursor());
             json_response(
                 200,
                 serde_json::json!({

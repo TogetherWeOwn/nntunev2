@@ -104,7 +104,7 @@ fn history_privacy_routes_require_cookie_origin_and_fresh_clear() {
             }
         } else {
             assert_eq!(block_on(handle(&ctx, &req)).status, 200);
-            for body in [r#"{"before_id":"42"}"#, r#"{"user_id":"other"}"#] {
+            for body in ["[null]", r#"{"before_id":"42"}"#, r#"{"user_id":"other"}"#] {
                 req.body = body.as_bytes().to_vec();
                 assert_eq!(block_on(handle(&ctx, &req)).status, 422);
             }
