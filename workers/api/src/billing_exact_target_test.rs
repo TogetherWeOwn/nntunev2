@@ -1,14 +1,15 @@
 //! Exact-target folds committed through the dormant Worker store on disposable PostgreSQL.
 use super::{billing_budget, MirrorBinding, PgStore, ReconcileProbe, StoreError, CONNECTION};
 use crate::billing_reconcile::{
-    reconcile_exact_target, reconcile_target_select_statement, LiveRow, PriceBinding,
-    ReconcileInput, RemoteSubscription,
+    reconcile_exact_target, reconcile_live_select_statement, reconcile_target_select_statement,
+    LiveRow, PriceBinding, ReconcileInput, RemoteSubscription,
 };
 use serde_json::json;
 
 const USER: &str = "worker_fault_user";
 const HOLDER: &str = "sub_worker_fault";
 const TARGET: &str = "sub_worker_exact";
+const TERMINAL: &str = "sub_worker_new_terminal";
 const PRICE: &str = "price_worker_fault";
 const NOW: i64 = 1_786_032_001;
 const END: i64 = 1_786_032_100;
@@ -58,6 +59,28 @@ async fn state(
         }),
         |_| {},
     ).await.map_err(|_| "exact-target fixture query failed")
+}
+
+async fn live_subscription_id() -> Result<String, &'static str> {
+    billing_budget::with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        |client| {
+            Box::pin(async move {
+                client
+                    .query_one(reconcile_live_select_statement(), &[&USER])
+                    .await
+                    .map_err(|_| StoreError)?
+                    .try_get("stripe_subscription_id")
+                    .map_err(|_| StoreError)
+            })
+        },
+        |_| {},
+    )
+    .await
+    .map_err(|_| "live projection fixture query failed")
 }
 
 fn remote(id: &str, item: &str, status: &str, invoices: &[(&str, &str)]) -> RemoteSubscription {
@@ -156,6 +179,69 @@ pub(super) async fn check() -> Result<(), &'static str> {
     }
 
     let holder = state(HOLDER, None).await?;
+    // A genuine new terminal target is not an existing-target suppression.
+    let terminal_listing = remote(TERMINAL, "si_worker_terminal", "canceled", &[]);
+    let mut terminal = reconcile_exact_target(input(holder.row.clone()), &terminal_listing, NOW);
+    let terminal_absent = state(TERMINAL, None).await?;
+    if terminal_absent.row.is_some()
+        || terminal_absent.subscription.is_some()
+        || terminal_absent.history_count != 0
+        || terminal.explicit_stale
+        || terminal.fail_closed.is_some()
+        || terminal.read_plan.is_some()
+        || terminal.read_anchor.is_some()
+        || !terminal.history.is_empty()
+    {
+        return Err("new terminal fold did not start without target proof");
+    }
+    // The terminal fold emits no history itself. Supply independently folded,
+    // attributed paid evidence to exercise the store's atomic history contract.
+    let confirmed = remote(
+        TERMINAL,
+        "si_worker_terminal",
+        "active",
+        &[("in_worker_terminal", "usd")],
+    );
+    terminal.history = reconcile_exact_target(input(None), &confirmed, NOW).history;
+    store
+        .store_reconcile_owned(USER.into(), terminal.clone(), ReconcileProbe::None)
+        .await
+        .map_err(|_| "new terminal beside live holder was refused")?;
+    let terminal_committed = state(TERMINAL, None).await?;
+    let Some(row) = terminal_committed.row.clone() else {
+        return Err("accepted new terminal target was not inserted");
+    };
+    let history: serde_json::Value = serde_json::from_str(&terminal_committed.history)
+        .map_err(|_| "invalid terminal history snapshot")?;
+    if terminal_committed.subscription.is_none()
+        || row.status != "canceled"
+        || row.stripe_item_id != "si_worker_terminal"
+        || row.stripe_price_id != PRICE
+        || row.plan_id != "free"
+        || row.paid_through_unix.is_some()
+        || row.paid_invoice_id.is_some()
+        || row.grace_until_unix.is_some()
+        || terminal_committed.history_count != 1
+        || history[0]["user_id"] != USER
+        || history[0]["stripe_subscription_id"] != TERMINAL
+        || history[0]["stripe_invoice_id"] != "in_worker_terminal"
+        || holder != state(HOLDER, None).await?
+    {
+        return Err("new terminal commit changed holder, coverage, or history attribution");
+    }
+    let mut replay = reconcile_exact_target(input(Some(row)), &terminal_listing, NOW);
+    replay.history = terminal.history;
+    store
+        .store_reconcile_owned(USER.into(), replay, ReconcileProbe::None)
+        .await
+        .map_err(|_| "new terminal replay with exact read proof was refused")?;
+    if state(TERMINAL, None).await? != terminal_committed || state(HOLDER, None).await? != holder {
+        return Err("new terminal replay changed committed subscription or history");
+    }
+    if live_subscription_id().await? != HOLDER {
+        return Err("new terminal displaced the live projection");
+    }
+
     let absent = state(TARGET, None).await?;
     let listing = remote(
         TARGET,
@@ -172,8 +258,11 @@ pub(super) async fn check() -> Result<(), &'static str> {
         || outcome.fail_closed.is_some()
         || outcome.read_anchor.is_some()
         || outcome.read_plan.is_some()
+        || outcome.row.paid_invoice_id.as_deref() != Some("in_worker_exact")
+        || outcome.history.len() != 1
+        || outcome.history[0].stripe_invoice_id != "in_worker_exact"
     {
-        return Err("exact-target fold borrowed proof from the live slot holder");
+        return Err("genuine new paid fold did not produce its own invoice and absent proof");
     }
     if store
         .store_reconcile_owned(USER.into(), outcome.clone(), ReconcileProbe::None)
@@ -181,6 +270,7 @@ pub(super) async fn check() -> Result<(), &'static str> {
         .is_ok()
         || holder != state(HOLDER, None).await?
         || absent != state(TARGET, None).await?
+        || terminal_committed != state(TERMINAL, None).await?
     {
         return Err("occupied live slot did not refuse the target without writes");
     }
@@ -196,6 +286,8 @@ pub(super) async fn check() -> Result<(), &'static str> {
     let history: serde_json::Value =
         serde_json::from_str(&committed.history).map_err(|_| "invalid history snapshot")?;
     if released != state(HOLDER, None).await?
+        || terminal_committed != state(TERMINAL, None).await?
+        || live_subscription_id().await? != TARGET
         || committed.history_count != 1
         || row.stripe_subscription_id != TARGET
         || row.stripe_item_id != "si_worker_exact"
