@@ -144,18 +144,35 @@ for (const width of [320, 360, 390, 799]) {
 	});
 }
 
-test('crossing the shell breakpoint keeps decoder, seek node, position and accessory focus', async ({ page }) => {
-	const { audio, seek, favorite, mute } = await openPlayer(page, 800);
+test('crossing the shell breakpoint keeps decoder, seek, feedback and accessory focus', async ({ page }) => {
+	const { region, audio, seek, favorite, restart, mute } = await openPlayer(page, 800);
 	const decoder = await audio.elementHandle();
 	const slider = await seek.elementHandle();
+	await restart.click();
+	await favorite.click();
+	const live = [region.getByRole('status'), region.getByTestId('library-restart-status'),
+		region.getByTestId('player-favorite-status'), region.getByText('Use system volume controls.', { exact: true })];
+	await expect(live[0]).toHaveText('Paused');
+	await expect(live[1]).toHaveText('Restarted Coral Night.');
+	await expect(live[2]).toHaveText(/^Starred Coral Night/);
+	const announcements = await Promise.all(live.map((region) => region.elementHandle()));
+	const texts = await Promise.all(live.map((region) => region.textContent()));
+	const expectSameAnnouncements = async () => {
+		for (const [i, node] of live.entries()) {
+			expect(await node.evaluate((el, original) => el === original, announcements[i])).toBe(true);
+			await expect(node).toHaveText(texts[i]!);
+		}
+	};
 	await favorite.focus();
 	await page.setViewportSize({ width: 799, height: 900 });
 	await expect(favorite).toBeFocused();
+	await expectSameAnnouncements();
 	await mute.focus();
 	await page.setViewportSize({ width: 800, height: 900 });
 	await expect(mute).toBeFocused();
+	await expectSameAnnouncements();
 	expect(await audio.evaluate((node, original) => node === original, decoder)).toBe(true);
 	expect(await seek.evaluate((node, original) => node === original, slider)).toBe(true);
-	await expect(audio).toHaveJSProperty('currentTime', 2);
+	await expect(audio).toHaveJSProperty('currentTime', 0);
 	await expect(audio).toHaveJSProperty('paused', true);
 });

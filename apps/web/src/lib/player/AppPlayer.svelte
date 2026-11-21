@@ -63,12 +63,12 @@
 	});
 </script>
 <svelte:window onkeydown={onShortcutKeydown} />
-{#snippet soundControls()}
-	<VolumeControls {...$sound} onvolumeinput={media.sound.setVolume} ontogglemute={media.sound.toggleMute} />
+{#snippet soundControls(part: 'controls' | 'status')}
+	<VolumeControls {...$sound} {part} onvolumeinput={media.sound.setVolume} ontogglemute={media.sound.toggleMute} />
 {/snippet}
 <svelte:document onvisibilitychange={() => { if (document.visibilityState === 'visible') sleepTimer.tick(); }} />
 {@render children()}
-{#snippet favoriteAction()}<CurrentTrackFavorite currentFavorite={player.currentFavorite} snapshot={$queue} />{/snippet}
+{#snippet favoriteAction(statusOnly: boolean)}<CurrentTrackFavorite currentFavorite={player.currentFavorite} snapshot={$queue} {statusOnly} />{/snippet}
 {#if streamUrl}
 	<div class="nt-wrap" bind:this={shortcutScope}>
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio} volumeControls={soundControls}
