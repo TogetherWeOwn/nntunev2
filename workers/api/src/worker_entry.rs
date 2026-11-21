@@ -3064,6 +3064,64 @@ async fn member_invite_summary_on(
     }))
 }
 
+async fn member_invite_history_on(
+    client: &impl GenericClient,
+    issuer: &str,
+    before: Option<i64>,
+) -> Result<Option<handlers::MemberInviteHistory>, StoreError> {
+    use handlers::{MemberInviteHistory, MemberInviteHistoryEntry};
+    const PAGE_SIZE: usize = 50;
+    // One snapshot covers the deletion fence and the page. The production
+    // call is a standalone statement, so its transaction clock is fresh.
+    // LEFT JOIN returns a sentinel for an existing owner with no rows.
+    let rows = client
+        .query_typed(
+            "SELECT page.id, page.created_at, LEAST(page.expires_at, w.ends_at) AS expires_at,
+                    page.redeemed, page.revoked, floor(extract(epoch FROM now()))::bigint AS now
+             FROM users u LEFT JOIN LATERAL (
+                 SELECT i.id, i.created_at, i.expires_at, i.window_id,
+                        (i.used OR i.redeemed_at IS NOT NULL) AS redeemed,
+                        (i.revoked_at IS NOT NULL) AS revoked
+                 FROM invite_codes i
+                 WHERE i.issued_by = u.id AND i.kind = 'member' AND ($2 IS NULL OR i.id < $2)
+                 ORDER BY i.id DESC LIMIT $3
+             ) page ON TRUE
+             LEFT JOIN invite_windows w ON w.id = page.window_id
+             WHERE u.id = $1 AND u.deleting_at IS NULL
+             ORDER BY page.id DESC",
+            &[
+                (&issuer, Type::TEXT),
+                (&before, Type::INT8),
+                (&((PAGE_SIZE + 1) as i64), Type::INT8),
+            ],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut invites = Vec::with_capacity(rows.len().min(PAGE_SIZE));
+    for row in rows.iter().take(PAGE_SIZE) {
+        let Some(id) = row.try_get("id")? else { break };
+        let expires_at = u64_of(row.try_get("expires_at")?)?;
+        invites.push(MemberInviteHistoryEntry {
+            id,
+            created_at: u64_of(row.try_get("created_at")?)?,
+            expires_at,
+            status: crate::auth::InviteStatus::at(
+                u64_of(row.try_get("now")?)?,
+                expires_at,
+                row.try_get("redeemed")?,
+                row.try_get("revoked")?,
+            ),
+        });
+    }
+    let next_cursor = (rows.len() > PAGE_SIZE).then(|| invites[PAGE_SIZE - 1].id.to_string());
+    Ok(Some(MemberInviteHistory {
+        invites,
+        next_cursor,
+    }))
+}
+
 async fn member_issue_invite_on(
     client: &mut tokio_postgres::Client,
     issuer: &str,
@@ -6432,6 +6490,18 @@ impl Store for PgStore {
         .await
     }
 
+    async fn member_invite_history(
+        &self,
+        issuer: &str,
+        before: Option<i64>,
+    ) -> Result<Option<handlers::MemberInviteHistory>, StoreError> {
+        Self::bounded(
+            async { member_invite_history_on(&self.connect().await?, issuer, before).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn member_issue_invite(
         &self,
         issuer: &str,
@@ -7872,13 +7942,13 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // the gates never read). Server logs redact this header the way
     // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
     // module logs header values.
-    // The runtime path strips the query string everywhere; the admin
-    // ingest list route needs its `?status=&limit=&offset=` filters in
-    // production, so the entry reattaches the raw query for exactly
-    // `GET /v1/admin/ingest` (non-empty query only). Every other route
-    // keeps the bare path, so no new query surface appears elsewhere.
+    // Only list routes that use a query get it back from the runtime URL.
     let bare_path = req.path();
-    let handler_path = if req.method() == Method::Get && bare_path == "/v1/admin/ingest" {
+    let handler_path = if req.method() == Method::Get
+        && matches!(
+            bare_path.as_str(),
+            "/v1/admin/ingest" | crate::native_rest::MEMBER_INVITE_HISTORY_PATH
+        ) {
         match req.url().ok().and_then(|url| {
             url.query()
                 .filter(|query| !query.is_empty())

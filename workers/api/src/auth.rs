@@ -357,14 +357,39 @@ impl InviteRecord {
     /// `redeemed_at`, not `redeemed_by`: account deletion nulls the FK
     /// but must never free the code.
     pub fn status(&self, now: u64) -> &'static str {
-        if self.redeemed_at.is_some() || self.used {
-            "redeemed"
-        } else if self.revoked_at.is_some() {
-            "revoked"
-        } else if self.expires_at <= now {
-            "expired"
+        match InviteStatus::at(
+            now,
+            self.expires_at,
+            self.redeemed_at.is_some() || self.used,
+            self.revoked_at.is_some(),
+        ) {
+            InviteStatus::Redeemed => "redeemed",
+            InviteStatus::Revoked => "revoked",
+            InviteStatus::Expired => "expired",
+            InviteStatus::Active => "active",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteStatus {
+    Active,
+    Redeemed,
+    Revoked,
+    Expired,
+}
+
+impl InviteStatus {
+    pub(crate) fn at(now: u64, expires_at: u64, redeemed: bool, revoked: bool) -> Self {
+        if redeemed {
+            Self::Redeemed
+        } else if revoked {
+            Self::Revoked
+        } else if expires_at <= now {
+            Self::Expired
         } else {
-            "active"
+            Self::Active
         }
     }
 }

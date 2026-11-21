@@ -455,6 +455,7 @@ pub(crate) fn like_track_target(path: &str) -> Option<&str> {
 }
 
 pub(crate) const MEMBER_INVITES_PATH: &str = "/v1/me/invites";
+pub(crate) const MEMBER_INVITE_HISTORY_PATH: &str = "/v1/me/invites/history";
 pub(crate) const ADMIN_INVITE_WINDOWS_PATH: &str = "/v1/admin/invite-windows";
 
 pub(crate) fn admin_invite_window_close_id(path: &str) -> Option<i64> {
@@ -518,6 +519,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                     | "/v1/me/taste"
                     | "/v1/me/history"
                     | MEMBER_INVITES_PATH
+                    | MEMBER_INVITE_HISTORY_PATH
             ) {
                 return SessionOnly;
             }
