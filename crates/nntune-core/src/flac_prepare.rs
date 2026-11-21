@@ -89,6 +89,8 @@ pub(crate) fn prepare<'a>(
             || frame.first_sample != samples
             || frame.samples == 0
             || frame.samples > info.max_block
+            // RFC 9639 §8.2 exempts the final frame from the minimum.
+            || (frame.samples < info.min_block && frame.bytes.end < audio.len())
         {
             return Err(PrepareError::FrameGeometry);
         }

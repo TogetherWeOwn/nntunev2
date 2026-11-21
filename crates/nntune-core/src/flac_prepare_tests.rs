@@ -129,6 +129,22 @@ fn refuses_truncated_metadata_missing_frames_and_inconsistent_geometry() {
 }
 
 #[test]
+fn only_the_final_frame_can_be_shorter_than_streaminfo_minimum() {
+    let input = fixture();
+    let mut frames = spans();
+    // Keep byte and sample continuity and the total; only the minimum is wrong.
+    frames[0].samples -= 1;
+    frames[1].first_sample -= 1;
+    frames[2].first_sample -= 1;
+    frames[2].samples += 1;
+    assert_eq!(
+        prepare(&input, &[], frames).err(),
+        Some(PrepareError::FrameGeometry)
+    );
+    assert!(prepare(&input, &[], spans()).is_ok());
+}
+
+#[test]
 fn bounds_replacement_comments_without_reintroducing_art() {
     let exact_fit = "x".repeat(MAX_COMMENT_BYTES - 20);
     assert_eq!(
