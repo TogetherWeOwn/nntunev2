@@ -3,7 +3,7 @@ import { emptySeek, readAbsoluteSeek, writeAbsoluteSeek, type AbsoluteSeekState 
 import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { createPlayerSleepTimer } from './playerSleepTimer.js';
-import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode } from './queue.js';
+import { currentTrack, naturalEndPolicy, nextTrack, previousTrack, selectTrack, type QueueState, type RepeatMode } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
 import { createNativeSound } from './nativeSound.js';
@@ -18,7 +18,7 @@ export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' |
 
 type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
 type QueueAuthority = Pick<ReturnType<typeof createQueueController>,
-	'snapshot' | 'subscribe' | 'revision' | 'revoke' | 'isCurrent' | 'purging'>;
+	'snapshot' | 'subscribe' | 'revision' | 'revoke' | 'isCurrent' | 'purging' | 'sourceForQueuedPlay'>;
 
 export type MediaSelection = {
 	commit: (queue: QueueState) => boolean;
@@ -182,6 +182,25 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!ownsPause()) return;
 		if (audio.paused || audio.ended) attachment.playing = false;
 		readPlayback(audio, ownsPause, get(playbackStatus));
+	}
+
+	function navigateQueue(step: (state: QueueState) => QueueState): void {
+		if (!selection) return;
+		const base = queue.snapshot;
+		const next = step(base);
+		if (next === base) return;
+		const target = currentTrack(next);
+		if (!target) return;
+		// Bulk-added slots carry metadata only. Keep the decoder unless Library can resolve the destination.
+		const source = queue.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || undefined);
+		if (!source?.streamUrl || !source.isCurrent()) return;
+		// Match Library Next's paused handoff, hydrating only the destination slot.
+		if (target.streamUrl === source.streamUrl) selection.commit(next);
+		else {
+			const tracks = [...next.tracks];
+			tracks[next.currentIndex] = { ...target, streamUrl: source.streamUrl };
+			selection.commit({ ...next, tracks });
+		}
 	}
 
 	function clearJumpFeedback(): void {
@@ -684,8 +703,12 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (target?.attachment === receipt) {
 				sound.connect(audio, target.matches, receipt.listeners.signal);
 				readPlayback(audio, target.matches, 'starting');
-				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
-					{ playCurrent, pauseCurrent }, receipt.listeners.signal);
+				bindSystemTransport(queue, audio, () => target.matches() ? currentTrack(queue.snapshot) : null,
+					{
+						playCurrent, pauseCurrent,
+						onNext: selection && (() => navigateQueue(nextTrack)),
+						onPrevious: selection && (() => navigateQueue(previousTrack))
+					}, receipt.listeners.signal);
 			}
 			observePosition();
 			pause(previous?.audio);

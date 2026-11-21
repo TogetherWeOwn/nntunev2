@@ -317,7 +317,7 @@ function isMemberInviteSummary(value: unknown): value is MemberInviteSummary {
 		(row.next_window === null || hasInviteBounds(row.next_window));
 }
 
-export interface IssuedMemberInvite {
+export interface IssuedInvite {
 	code: string;
 	expires_at: number;
 }
@@ -464,6 +464,19 @@ export class ApiClient {
 		return rows.map(({ id, status, issued_by, expires_at }) => ({ id, status, issued_by, expires_at }));
 	}
 
+	/** Issue a single invite. The code is returned once; never retry or persist it. */
+	async issueAdminInvite(input: { email?: string; expires_in_days?: number }, signal: AbortSignal): Promise<IssuedInvite> {
+		const { data, status } = await this.requestWithStatus<{ code?: unknown; invite?: Record<string, unknown> } | null>(
+			ADMIN_INVITES, { method: 'POST', cache: 'no-store', redirect: 'error', signal,
+				headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }
+		);
+		const row = data?.invite;
+		if (status !== 201 || !isMemberInviteCode(data?.code) || !isInviteId(row?.id) ||
+			row?.kind !== 'admin' || row.status !== 'active' || !isEpoch(row.expires_at) || row.expires_at === 0)
+			throw new ApiError(status, 'request_failed', 'Invalid invite issuance response', null, false);
+		return { code: data.code, expires_at: row.expires_at };
+	}
+
 	/** Bodyless, once-only dispatch; the Worker owns the authorization and audited write. */
 	async revokeAdminInvite(id: number, signal: AbortSignal): Promise<void> {
 		if (!isInviteId(id)) throw new TypeError('Invalid invite ID');
@@ -506,8 +519,8 @@ export class ApiClient {
 	}
 
 	/** Spend one invite from the browser session's current window. Do not retry automatically. */
-	async issueMemberInvite(signal: AbortSignal): Promise<IssuedMemberInvite> {
-		const { data, status } = await this.requestWithStatus<Partial<IssuedMemberInvite> | null>(
+	async issueMemberInvite(signal: AbortSignal): Promise<IssuedInvite> {
+		const { data, status } = await this.requestWithStatus<Partial<IssuedInvite> | null>(
 			MEMBER_INVITES, { method: 'POST', cache: 'no-store', redirect: 'error', signal }
 		);
 		if (status !== 201 || !isMemberInviteCode(data?.code) ||

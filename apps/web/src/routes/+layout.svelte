@@ -276,7 +276,8 @@
 	}
 
 	let miniLink: HTMLAnchorElement | undefined = $state();
-	let expandedFromMini = false;
+	let desktopNowPlayingLink: HTMLAnchorElement | undefined = $state();
+	let expandedFromOpener = false;
 
 	// Keep the anchor's normal behavior for modified clicks and new tabs.
 	function openNowPlaying(event: MouseEvent): void {
@@ -292,15 +293,16 @@
 	afterNavigate((navigation) => {
 		openMenu = null;
 		menuOpener = null;
-		const returnToMini = expandedFromMini && 'delta' in navigation && navigation.delta === -1;
-		expandedFromMini = navigation.to?.route.id === '/now-playing' && page.state.nowPlayingFromMini === true;
+		const returnToOpener = expandedFromOpener && 'delta' in navigation && navigation.delta === -1;
+		expandedFromOpener = navigation.to?.route.id === '/now-playing' && page.state.nowPlayingFromMini === true;
 		if (restoreAfterNavigation) {
 			restoreAfterNavigation = false;
 			restoreFocus();
-		} else if (returnToMini) {
-			miniLink?.focus({ preventScroll: true });
-			// The opener may have disappeared on a resize or auth teardown.
-			if (document.activeElement !== miniLink) focusMain();
+		} else if (returnToOpener) {
+			const opener = [desktopNowPlayingLink, miniLink].find((link) => link?.getClientRects().length);
+			opener?.focus({ preventScroll: true });
+			// Auth teardown can remove both openers.
+			if (document.activeElement !== opener) focusMain();
 		}
 	});
 
@@ -512,6 +514,11 @@
 				<a href="/library/liked">Liked</a>
 				<a href="/library/recent">Recent</a>
 			</div>
+			{#if miniHint && page.route.id !== '/now-playing'}
+				<a class="nt-button nt-button--ghost" href="/now-playing" bind:this={desktopNowPlayingLink} onclick={openNowPlaying}>
+					Now Playing
+				</a>
+			{/if}
 		</div>
 		{@render children()}
 		{#if rightSnippet}

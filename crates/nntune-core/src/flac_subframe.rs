@@ -27,6 +27,16 @@ impl BitInput {
         Ok(Some(value))
     }
 
+    /// Consume only the buffered low bits at the end of the final subframe.
+    /// A whole buffered byte can be part of an unfinished field, not padding.
+    pub(crate) fn consume_zero_padding(&mut self) -> Result<(), ()> {
+        if self.available >= 8 || self.value != 0 {
+            return Err(());
+        }
+        self.available = 0;
+        Ok(())
+    }
+
     /// Count unary zeroes by byte, retaining the count across slices.
     pub(crate) fn unary(
         &mut self,

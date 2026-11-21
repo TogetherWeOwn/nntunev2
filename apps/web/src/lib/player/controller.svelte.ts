@@ -2,7 +2,7 @@ import { displayArtist, displayTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '../shell/mini-player.js';
 import { createMediaController, type MediaSelection } from './mediaController.js';
-import { currentTrack, type QueueState } from './queue.js';
+import { clearQueue, currentTrack, moveTrack, removeTrack, type QueueState } from './queue.js';
 import { createQueueController, type LibrarySources, type QueueCommitKind } from './queueController.js';
 
 type PlayerEffects = Pick<MediaSelection, 'flush'>;
@@ -147,7 +147,41 @@ export function createPlayerController(
 		return commitQueue(next, 'replace');
 	}
 
+	// These callbacks edit the live snapshot synchronously. The renderer owns
+	// gesture validation, confirmation and focus recovery.
+	function moveQueuedTrack(from: number, to: number): boolean {
+		const state = queue.snapshot;
+		const moved = state.tracks[from];
+		if (moved === undefined) return false;
+		const next = moveTrack(state, from, to);
+		if (next === state || !commitQueue(next, 'move')) return false;
+		announceQueue(`${moved.title} moved to ${to + 1} of ${next.tracks.length}`);
+		return true;
+	}
+
+	function removeQueuedTrack(index: number): boolean {
+		const state = queue.snapshot;
+		const removed = state.tracks[index];
+		if (removed === undefined) return false;
+		const next = removeTrack(state, index);
+		if (next === state) return false;
+		const title = removed.title?.trim() ? removed.title : removed.id;
+		if (!commitQueue(next, 'remove')) return false;
+		// Distinct rows with equal titles still replay in the stable live region.
+		announceQueue(`${title} removed from the queue.`, true);
+		return true;
+	}
+
+	function clearQueuedTracks(): boolean {
+		const state = queue.snapshot;
+		const next = clearQueue(state);
+		if (next === state || !commitQueue(next, 'clear')) return false;
+		announceQueue('Queue cleared.', true);
+		return true;
+	}
+
 	return {
+		moveQueuedTrack, removeQueuedTrack, clearQueuedTracks,
 		queue, media, browseCopy, get mediaRevision() { return mediaRevision; },
 		get queueAnnouncement() { return queueAnnouncement; }, announceQueue,
 		commitQueue: (next: QueueState, kind: QueueCommitKind) => commitQueue(next, kind),

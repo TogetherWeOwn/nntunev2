@@ -2,7 +2,87 @@ import { expect, test, vi } from 'vitest';
 import { get } from 'svelte/store';
 import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint, type MiniPlayerHint } from '../shell/mini-player.js';
 import { createPlayerController } from './controller.svelte.js';
-import { createQueue } from './queue.js';
+import { createQueue, currentTrack } from './queue.js';
+
+test('route-independent move, remove and clear preserve queue identity and report only real edits', () => {
+	const initial = createQueue([
+		{ id: 'first', title: 'Intro', artist: '', streamUrl: '/first' },
+		{ id: 'second', title: 'Intro', artist: '', streamUrl: '/second' },
+		{ id: 'last', title: 'Outro', artist: '', streamUrl: '/last' }
+	]);
+	const player = createPlayerController(initial, { flush: async () => {} });
+	const { moveQueuedTrack, removeQueuedTrack, clearQueuedTracks, queue } = player;
+	const ids = () => queue.snapshot.tracks.map(({ id }) => id);
+	try {
+		expect(moveQueuedTrack(0, 1)).toBe(true);
+		expect(ids()).toEqual(['second', 'first', 'last']);
+		expect(currentTrack(queue.snapshot)?.id).toBe('first');
+		expect(player.mediaRevision).toBe(0);
+		expect(player.queueAnnouncement).toEqual({ text: 'Intro moved to 2 of 3', version: 0 });
+		const moved = queue.snapshot;
+		const revision = queue.revision;
+		const announcement = player.queueAnnouncement;
+		expect(moveQueuedTrack(1, 1)).toBe(false);
+		expect(moveQueuedTrack(0, 3)).toBe(false);
+		expect(removeQueuedTrack(0.5)).toBe(false);
+		expect(queue.snapshot).toBe(moved);
+		expect(queue.revision).toBe(revision);
+		expect(player.queueAnnouncement).toBe(announcement);
+
+		expect(removeQueuedTrack(0)).toBe(true);
+		expect(ids()).toEqual(['first', 'last']);
+		expect(currentTrack(queue.snapshot)?.id).toBe('first');
+		expect(player.mediaRevision).toBe(0);
+		expect(player.queueAnnouncement).toEqual({ text: 'Intro removed from the queue.', version: 1 });
+		expect(removeQueuedTrack(0)).toBe(true);
+		expect(ids()).toEqual(['last']);
+		expect(currentTrack(queue.snapshot)?.id).toBe('last');
+		expect(player.mediaRevision).toBe(1);
+		expect(player.queueAnnouncement).toEqual({ text: 'Intro removed from the queue.', version: 2 });
+
+		expect(clearQueuedTracks()).toBe(true);
+		expect(queue.snapshot).toEqual(createQueue([]));
+		expect(player.queueAnnouncement).toEqual({ text: 'Queue cleared.', version: 3 });
+		const cleared = queue.snapshot;
+		const clearedRevision = queue.revision;
+		expect(clearQueuedTracks()).toBe(false);
+		expect(queue.snapshot).toBe(cleared);
+		expect(queue.revision).toBe(clearedRevision);
+		expect(player.queueAnnouncement).toEqual({ text: 'Queue cleared.', version: 3 });
+	} finally {
+		player.destroy();
+		clearMiniPlayerHint();
+	}
+});
+
+const editActions = {
+	move: (player: ReturnType<typeof createPlayerController>) => player.moveQueuedTrack(0, 1),
+	remove: (player: ReturnType<typeof createPlayerController>) => player.removeQueuedTrack(0),
+	clear: (player: ReturnType<typeof createPlayerController>) => player.clearQueuedTracks()
+};
+
+test.each(Object.entries(editActions))('%s cannot report a queue edit superseded by auth purge', (_name, edit) => {
+	const initial = createQueue(['old-first', 'old-second'].map((id) => ({ id, title: id, artist: '', streamUrl: '' })));
+	const player = createPlayerController(initial, { flush: async () => {} });
+	player.announceQueue('Earlier feedback', true);
+	let purged = false;
+	const stop = player.queue.subscribe((snapshot) => {
+		if (snapshot === initial || purged) return;
+		purged = true;
+		player.purgeAtAuthBoundary();
+	});
+	try {
+		expect(edit(player)).toBe(false);
+		expect(purged).toBe(true);
+		expect(player.queue.snapshot).toEqual(createQueue([]));
+		expect(player.queueAnnouncement).toEqual({ text: '', version: 1 });
+		expect(edit(player)).toBe(false);
+		expect(readMiniPlayerHint()).toBeNull();
+	} finally {
+		stop();
+		player.destroy();
+	}
+});
 
 test('queue commits publish only display metadata and skip same-object Library refreshes', () => {
 	const player = createPlayerController(createQueue([]), {
