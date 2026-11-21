@@ -14,7 +14,7 @@ import type { SystemSeekGuard } from './systemSeek.js';
 import { bindSystemTransport } from './systemTransport.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
-export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | { end: number; interior: boolean; played: TimeRanges; settled?: number; progressed?: boolean } };
+export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | { end: number; seekDuration: number; played: TimeRanges; settled?: number; progressed?: boolean } };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error' | 'retrying';
 
 type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
@@ -400,8 +400,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	function onSeekLanded(attachment: MediaAttachment, system?: SystemSeekGuard) {
 		if (system || typeof attachment.soughtToEnd === 'object') return (target: number, duration: number, observed: number) => {
 			// An interior write can settle at the end after rounding or a duration correction.
-			const end = Math.min(duration, Math.max(target, observed));
-			attachment.soughtToEnd = system ? { end, interior: end < duration, played: attachment.audio.played } : false;
+			attachment.soughtToEnd = system ? { end: Math.min(duration, Math.max(target, observed)), seekDuration: duration, played: attachment.audio.played } : false;
 		};
 	}
 
@@ -539,8 +538,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!audio.ended || audio.error !== null || !attachment.playing || !ownsOrigin()) return;
 		const { soughtToEnd } = attachment;
 		if (typeof soughtToEnd === 'object') {
-			const { duration, currentTime } = audio, { end, interior, played, progressed } = soughtToEnd, slack = SEEK_READBACK_TOLERANCE;
-			const reachedNewEnd = duration > end && (interior || (currentTime >= duration - slack &&
+			const { duration, currentTime } = audio, { end, seekDuration, played, progressed } = soughtToEnd, slack = SEEK_READBACK_TOLERANCE;
+			const reachedNewEnd = duration > end && (end < seekDuration || (currentTime >= duration - slack &&
 				(currentTime > end + slack || progressed || playedNewTail(played, audio.played, end, duration))));
 			if (!ownsOrigin()) return;
 			if (!reachedNewEnd) { attachment.playing = attachment.soughtToEnd = false; return; }
@@ -666,7 +665,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 						if (!matches(intent)) return;
 						if (event.type === 'seeked') {
 							marker.settled = currentTime;
-							if (marker.interior && Number.isFinite(duration) && duration > 0 && currentTime >= duration) Object.assign(marker, { end: duration, interior: false });
+							const roundedAfterCorrection = duration < marker.seekDuration && currentTime >= duration - SEEK_READBACK_TOLERANCE;
+							if (marker.end < marker.seekDuration && Number.isFinite(duration) && duration > 0 && (currentTime >= duration || roundedAfterCorrection)) marker.end = marker.seekDuration = duration;
 						} else marker.progressed ||= !paused && !ended && currentTime > Math.max(marker.end, marker.settled ?? Infinity) && currentTime < duration;
 					}
 					switch (event.type) {
