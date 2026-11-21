@@ -7,7 +7,6 @@ import { createQueueController } from './queueController.js';
 
 const actions = ['seekto', 'seekforward', 'seekbackward'] as const;
 const track = { id: 'one', title: 'One', artist: '', streamUrl: '/one' };
-const other = { id: 'two', title: 'Two', artist: '', streamUrl: '/two' };
 
 class Decoder extends EventTarget {
 	paused = true;
@@ -28,8 +27,7 @@ class Decoder extends EventTarget {
 	constructor(public source: string, public isConnected = true) { super(); }
 	getAttribute() { return this.source; }
 	setReady(ranges: [number, number][] = [[0, 60]]) {
-		this.duration = 60;
-		this.ranges = ranges;
+		Object.assign(this, { duration: 60, ranges, HAVE_METADATA: 1, readyState: 1, playbackRate: 1 });
 		this.dispatchEvent(new Event('loadedmetadata'));
 	}
 	play = vi.fn(async () => { this.paused = false; });
@@ -84,7 +82,10 @@ test('system seeks use owner readback, clamping and feedback without starting or
 	expect(audio.currentTime).toBe(1);
 	expect(audio.paused).toBe(false);
 	expect(audio.play).toHaveBeenCalledOnce();
+	fire('seekto', { seekTime: 12.25 });
 	for (const unused of [audio.pause, audio.load, audio.fastSeek, session.setPositionState]) expect(unused).not.toHaveBeenCalled();
+	audio.dispatchEvent(new Event('seeked'));
+	expect(session.setPositionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
 });
 
 test.each([['seekforward', 59.98, 1, 'Forward'], ['seekbackward', 0.02, -1, 'Back']] as const)(
@@ -214,7 +215,7 @@ test.each(['decoder', 'source', 'auth', 'detach'])('fences all queued callbacks 
 		queue.purgeAtAuthBoundary(() => media.purgeAtAuthBoundary(() => {}));
 		select(track);
 	} else if (boundary === 'source') {
-		select(other); // Source changes before the old audio detaches.
+		select({ ...track, id: 'two', title: 'Two', streamUrl: '/two' }); // Source changes before the old audio detaches.
 		for (const action of actions) expect(handlers.get(action)).toBeNull();
 		select(track); // Round-trip must not revive old callbacks.
 	} else if (boundary === 'detach') detach();
