@@ -44,8 +44,9 @@ synthetic sample data only and must never be cited as a real run.
 - **Production facts presented as staging facts** (or the reverse):
   extrapolated production cost or load must be labelled an estimate with
   its formula, never "measured".
-- **Private content identifiers:** production library contents and private
-  filenames. Staging uses [approved audio fixtures](fixture-audio-licences.md)
+- **Private content identifiers and NZB data:** production library contents,
+  private release names and filenames, and NZB names, bytes, message IDs,
+  subjects and segment lists. Staging uses [approved audio fixtures](fixture-audio-licences.md)
   with a tracked manifest and licensed audio bytes stored outside Git.
 
 If any of the above is found in a draft readout, the readout is withdrawn,
@@ -141,7 +142,7 @@ evidence IDs. Rows marked † are must-pass for a `GO`.
 
 | # | Step (user-observable) | Expected outcome | Result | Evidence |
 |---|---|---|---|---|
-| 1† | Access gate | Unauthenticated request to staging is challenged; no bypass used during the run | | |
+| 1† | Access gate | Access denies anonymous requests to each of `/api/health`, `/api/ready` and the app shell `/`. Record evidence for all three paths with Access enforced throughout the run | | |
 | 2† | Invited signup | A synthetic listener redeems an owner-issued invite and reaches the plan picker | | |
 | 3† | Test-mode subscription | The synthetic listener subscribes in test mode and has active playback entitlement | | |
 | 4† | Admin publication | An admin publishes a matched curated FLAC release and entitled accounts see it in the shared catalogue | | |
