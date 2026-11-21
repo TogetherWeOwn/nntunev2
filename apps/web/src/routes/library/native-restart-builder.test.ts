@@ -8,7 +8,6 @@ import { onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js'
 import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createQueueShare } from '#lib/player/queueShare.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
-import { createCurrentTrackFavorite } from '#lib/player/currentTrackFavorite.svelte.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -99,7 +98,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			player.browseCopy.invalidate = () => { onInvalidateBrowseCopy(); return invalidate(); };
 			const clear = player.media.clearShareSeek;
 			player.media.clearShareSeek = () => { onClear(); clear(); };
-			return Object.assign(player, { currentFavorite: createCurrentTrackFavorite(player.queue) });
+			return Object.assign(player, { currentFavorite: { bind: () => () => {} } });
 		},
 		tick, window: { location }, element, track, capture, readPlayerFavorites: () => null
 	};

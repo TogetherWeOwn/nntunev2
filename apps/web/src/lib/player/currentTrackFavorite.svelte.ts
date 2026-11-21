@@ -14,12 +14,9 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 	let outcome = $state.raw<(Selection & { text: string }) | null>(null);
 
 	function bind(member: FavoriteOwner): () => void {
-		const binding = { member, version: ++ownerVersion };
-		owner = binding;
+		const binding = owner = { member, version: ++ownerVersion };
 		outcome = null;
-		return () => {
-			if (owner === binding) { owner = null; outcome = null; }
-		};
+		return () => { if (owner === binding) { owner = null; outcome = null; } };
 	}
 
 	function view(snapshot: QueueState) {
@@ -29,12 +26,12 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 		const binding = owner;
 		const membership = binding.member.read(track.id);
 		if (!membership || binding !== owner || !queue.isCurrent(revision)) return null;
-		return { id: track.id, title: displayTitle(track), receipt: `${binding.version}:${revision}`, ...membership };
+		return { pressed: membership.pressed, edit: membership.edit,
+			id: track.id, title: displayTitle(track), receipt: `${binding.version}:${revision}` };
 	}
 
 	const matches = (current: Selection | null, previous: Selection) => current?.receipt === previous.receipt &&
 		current.id === previous.id && current.edit === previous.edit && current.pressed === previous.pressed;
-
 	async function activate(intent: Selection): Promise<void> {
 		const target = view(queue.snapshot);
 		if (!owner || !target || !matches(target, intent)) return;
