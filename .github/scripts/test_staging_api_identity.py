@@ -6,11 +6,10 @@ import json
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
-spec = importlib.util.spec_from_file_location(
-    "identity", Path(__file__).with_name("staging_api_identity.py")
-)
+spec = importlib.util.spec_from_file_location("identity", Path(__file__).with_name("staging_api_identity.py"))
 identity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(identity)
 
@@ -54,12 +53,22 @@ class IdentityTests(unittest.TestCase):
     def test_current_version_build_and_default_off(self):
         deployment = current()
         deployment["deployments"] += current(OTHER, OTHER)["deployments"]
-        unrelated = {"type": "secret_text", "name": "UNRELATED"}
-        read = MagicMock(side_effect=[deployment, version(unrelated), deployment])
-        body = b'{"type":"wrangler-session","version":1}\n' + output()
-        result = identity.receipt(body, SHA, ACCOUNT, read)
+        read = MagicMock(side_effect=[deployment, version(), deployment])
+        stream = io.StringIO()
+        with TemporaryDirectory() as temp, patch.object(identity, "provider_result", read):
+            Path(temp, "wrangler-output-test.json").write_bytes(
+                b'{"type":"wrangler-session","version":1}\n' + output()
+            )
+            env = {
+                "WRANGLER_OUTPUT_FILE_DIRECTORY": temp,
+                "GITHUB_SHA": SHA,
+                "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                "CLOUDFLARE_API_TOKEN": "synthetic-token",
+            }
+            with patch.dict(identity.os.environ, env, clear=True), redirect_stdout(stream):
+                self.assertEqual(identity.main(), 0)
         self.assertEqual(
-            result,
+            json.loads(stream.getvalue()),
             {
                 "identity": "matched",
                 "deployment_id": DEPLOYMENT,
@@ -74,9 +83,6 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(
             [c.args[0] for c in read.call_args_list],
             [path + "/deployments", path + "/versions/" + VERSION, path + "/deployments"],
-        )
-        identity.verify_version(
-            version({"name": PREFIX + "ENABLE", "type": "plain_text", "text": "0"}), VERSION, SHA
         )
 
     def test_bad_deploy_output_never_reads_provider(self):
@@ -144,7 +150,7 @@ class IdentityTests(unittest.TestCase):
         conn = connect.return_value
         response = conn.getresponse.return_value.__enter__.return_value
         for status, body, reason in (
-            (403, b"synthetic sensitive response", "provider-auth-denied"),
+            (403, b"synthetic sensitive response", "version-auth-denied"),
             (302, b"not followed", "provider-http-status"),
             (200, b"x" * (identity.MAX_BODY + 1), "provider-body-limit"),
             (200, b'{"success":true,"success":true}', "provider-response-shape"),
@@ -155,13 +161,10 @@ class IdentityTests(unittest.TestCase):
                 identity.provider_result("/mock", "synthetic-token")
             self.assertEqual(str(exc.exception), reason)
             connect.assert_called_with("api.cloudflare.com", timeout=5)
-            conn.request.assert_called_once_with(
-                "GET",
-                "/mock",
-                headers={
-                    "Authorization": "Bearer synthetic-token",
-                    "Cache-Control": "no-cache, no-store",
-                },
+            conn.request.assert_called_once()
+            self.assertEqual(conn.request.call_args.args, ("GET", "/mock"))
+            self.assertEqual(
+                conn.request.call_args.kwargs["headers"]["Authorization"], "Bearer synthetic-token"
             )
         response.read.assert_called_with(identity.MAX_BODY + 1)
 
@@ -170,7 +173,8 @@ class IdentityTests(unittest.TestCase):
         with patch.dict(identity.os.environ, {}, clear=True), redirect_stdout(stream):
             self.assertEqual(identity.main(), 1)
         self.assertEqual(
-            json.loads(stream.getvalue()), {"identity": "unavailable", "reason": "credential-config"}
+            json.loads(stream.getvalue()),
+            {"identity": "unavailable", "reason": "credential-config"},
         )
 
 

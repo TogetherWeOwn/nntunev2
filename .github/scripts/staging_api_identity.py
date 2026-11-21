@@ -4,8 +4,6 @@ import http.client
 import json
 import os
 import re
-import signal
-import sys
 from pathlib import Path
 
 SCRIPT = "nntune-api-staging"
@@ -56,7 +54,7 @@ def valid(pattern, value):
 
 def deployed_version(body):
     # The pinned action has no version-ID output. Wrangler 4.162.0 writes
-    # wrangler-session and deploy v1 JSONL to WRANGLER_OUTPUT_FILE_PATH.
+    # wrangler-session and deploy v1 JSONL to the action's output directory.
     reason = "deploy-output-unavailable"
     require(len(body) <= MAX_DEPLOY_OUTPUT and body.endswith(b"\n"), reason)
     records = [decode(line, reason) for line in body.splitlines()]
@@ -87,7 +85,9 @@ def provider_result(path, token):
         )
         with conn.getresponse() as response:
             if response.status in (401, 403):
-                raise Unavailable("provider-auth-denied")
+                raise Unavailable(
+                    "deployments-auth-denied" if path.endswith("/deployments") else "version-auth-denied"
+                )
             require(response.status == 200, "provider-http-status")
             body = response.read(MAX_BODY + 1)
     except (http.client.HTTPException, OSError, ValueError):
@@ -179,35 +179,28 @@ def receipt(body, expected_sha, account, read):
     }
 
 
-def deadline(_signum, _frame):
-    raise Unavailable("deadline")
-
-
 def main():
-    signal.signal(signal.SIGALRM, deadline)
-    signal.alarm(25)
     try:
         token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
         require(valid(re.compile(r"[\x21-\x7e]{1,512}"), token), "credential-config")
         try:
-            with Path(os.environ.get("WRANGLER_OUTPUT_FILE_PATH", "")).open("rb") as source:
+            (output,) = Path(os.environ["WRANGLER_OUTPUT_FILE_DIRECTORY"]).glob("wrangler-output-*.json")
+            with output.open("rb") as source:
                 body = source.read(MAX_DEPLOY_OUTPUT + 1)
-        except (OSError, ValueError):
+        except (OSError, KeyError, ValueError):
             raise Unavailable("deploy-output-unavailable") from None
         result = receipt(
             body,
-            os.environ.get("EXPECTED_BUILD_SHA", ""),
+            os.environ.get("GITHUB_SHA", ""),
             os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""),
             lambda path: provider_result(path, token),
         )
     except Unavailable as exc:
         print(json.dumps({"identity": "unavailable", "reason": str(exc)}))
         return 1
-    finally:
-        signal.alarm(0)
     print(json.dumps(result))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
