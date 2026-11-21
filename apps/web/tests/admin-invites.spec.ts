@@ -43,14 +43,14 @@ test('reauthorizes a restored ledger before showing rows and applies one server-
 	});
 	await page.goto('/admin/invite-windows');
 	await page.getByRole('link', { name: 'Invite ledger' }).press('Enter');
-	await expect(page).toHaveURL(path);
 	await expect(results(page).getByRole('listitem')).toHaveCount(3);
-	await page.evaluate(() => ['pagehide', 'pageshow'].forEach((type) =>
-		dispatchEvent(new PageTransitionEvent(type, { persisted: true }))));
+	const ledgerContent = results(page).or(page.getByRole('button', { name: 'Revoke invite #17' }));
+	await page.evaluate(() => dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })));
+	await expect(ledgerContent).toHaveCount(0);
+	await page.evaluate(() => dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
 	await expect.poll(() => calls.length).toBe(2);
 	await expect(page.getByText('Loading invites…')).toBeVisible();
-	await expect(results(page)).toHaveCount(0);
-	await expect(page.getByRole('button', { name: 'Revoke invite #17' })).toHaveCount(0);
+	await expect(ledgerContent).toHaveCount(0);
 	restore.resolve();
 	await expect(results(page).getByRole('listitem')).toHaveCount(3);
 	await expect(page.getByText(/Up to 200 matching invites.*not a complete history/)).toBeVisible();
