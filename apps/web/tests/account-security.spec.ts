@@ -36,12 +36,10 @@ test('account security confirms before revoking sessions and redirects after suc
 
 	// The first confirmation is declined; no session-revocation request may
 	// be sent until the user explicitly accepts the destructive action.
-	page.once('dialog', (dialog) => dialog.dismiss());
-	await revoke.click();
+	await Promise.all([page.waitForEvent('dialog').then((dialog) => dialog.dismiss()), revoke.click()]);
 	expect(revokePosts).toBe(0);
 
-	page.once('dialog', (dialog) => dialog.accept());
-	await revoke.click();
+	await Promise.all([page.waitForEvent('dialog').then((dialog) => dialog.accept()), revoke.click()]);
 	await page.waitForURL('**/login');
 	expect(revokePosts).toBe(1);
 });
