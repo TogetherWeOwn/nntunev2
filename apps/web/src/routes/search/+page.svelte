@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import { onMount } from 'svelte';
 	import {
 		browserStorage,
 		invalidateLibraryCache,
@@ -8,6 +9,7 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { filterLibraryItems } from '#lib/library/filter.js';
+	import { mountLibraryRefresher } from '#lib/library/mount-refresher.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 
@@ -32,10 +34,7 @@
 		}
 	});
 
-	$effect(() => {
-		void refresher.refresh();
-		return () => refresher.dispose();
-	});
+	onMount(() => mountLibraryRefresher(refresher));
 
 	// The applied query lives in the URL (`?q=`) so the top-bar search and
 	// this page share one destination. The draft is the field's text; submit
