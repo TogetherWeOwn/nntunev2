@@ -3,10 +3,12 @@
 import importlib.util
 import io
 import json
+import subprocess
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from textwrap import dedent
 from unittest.mock import MagicMock, patch
 
 spec = importlib.util.spec_from_file_location("identity", Path(__file__).with_name("staging_api_identity.py"))
@@ -22,15 +24,9 @@ PREFIX = "SUBSONIC_MEASUREMENT_"
 
 
 def output(**changes):
-    deploy = {
-        "type": "deploy",
-        "version": 1,
-        "worker_name": "nntune-api-staging",
-        "wrangler_environment": "staging",
-        "version_id": VERSION,
-    }
-    deploy.update(changes)
-    return json.dumps(deploy).encode() + b"\n"
+    deploy = {"type": "deploy", "version": 1, "worker_name": "nntune-api-staging",
+              "wrangler_environment": "staging", "version_id": VERSION}
+    return json.dumps(deploy | changes).encode() + b"\n"
 
 
 def current(deployment_id=DEPLOYMENT, version_id=VERSION, percentage=100):
@@ -44,46 +40,33 @@ def version(*bindings, sha=SHA):
 
 
 class IdentityTests(unittest.TestCase):
-    def test_current_version_build_and_default_off(self):
+    def test_cli_reports_matched_or_unavailable(self):
         deployment = identity.decode(json.dumps(current()).replace("100}", "100.0}").encode(), "bad fixture")
         deployment["deployments"] += current(OTHER, OTHER)["deployments"]
         read = MagicMock(side_effect=[deployment, version(), deployment])
         stream = io.StringIO()
         with TemporaryDirectory() as temp, patch.object(identity, "provider_result", read):
             Path(temp, "wrangler-output-test.json").write_bytes(b'{"type":"wrangler-session","version":1}\n' + output())
-            with patch.dict(identity.os.environ, {
-                "WRANGLER_OUTPUT_FILE_DIRECTORY": temp,
-                "GITHUB_SHA": SHA,
-                "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
-                "CLOUDFLARE_API_TOKEN": "synthetic-token",
-            }, clear=True), redirect_stdout(stream):
+            env = {"WRANGLER_OUTPUT_FILE_DIRECTORY": temp, "GITHUB_SHA": SHA,
+                   "CLOUDFLARE_ACCOUNT_ID": ACCOUNT, "CLOUDFLARE_API_TOKEN": "synthetic-token"}
+            with patch.dict(identity.os.environ, env, clear=True), redirect_stdout(stream):
                 self.assertEqual(identity.main(), 0)
-        expected = {
-            "identity": "matched",
-            "deployment_id": DEPLOYMENT,
-            "version_id": VERSION,
-            "build_sha": SHA,
-            "enable_flag": "off",
-            "lease": "absent",
-            "measurement_db_binding": "absent",
-        }
-        self.assertEqual(json.loads(stream.getvalue()), expected)
+        self.assertEqual(json.loads(stream.getvalue()), {
+            "identity": "matched", "deployment_id": DEPLOYMENT, "version_id": VERSION, "build_sha": SHA,
+            "enable_flag": "off", "lease": "absent", "measurement_db_binding": "absent",
+        })
         path = f"/client/v4/accounts/{ACCOUNT}/workers/scripts/nntune-api-staging"
-        self.assertEqual(
-            [c.args[0] for c in read.call_args_list],
-            [path + "/deployments", path + "/versions/" + VERSION, path + "/deployments"],
-        )
+        self.assertEqual([c.args[0] for c in read.call_args_list],
+                         [path + endpoint for endpoint in ("/deployments", f"/versions/{VERSION}", "/deployments")])
+        with patch.dict(identity.os.environ, {}, clear=True), redirect_stdout(io.StringIO()) as unavailable:
+            self.assertEqual(identity.main(), 1)
+        self.assertEqual(json.loads(unavailable.getvalue()), {"identity": "unavailable", "reason": "credential-config"})
 
     def test_bad_deploy_output_never_reads_provider(self):
         for body in (
-            b"",
-            b"{" + b"x" * identity.MAX_DEPLOY_OUTPUT,
-            output()[:-1],
-            output() + output(),
-            output(version=True),
-            output(version_id=None),
-            output(worker_name="wrong"),
-            output(wrangler_environment="production"),
+            b"", b"{" + b"x" * identity.MAX_DEPLOY_OUTPUT, output()[:-1], output() * 2,
+            output(version=True), output(version_id=None),
+            output(worker_name="wrong"), output(wrangler_environment="production"),
             output().replace(b'"version": 1', b'"version": 2, "version": 1'),
         ):
             with self.subTest(body=body[:30]):
@@ -130,10 +113,7 @@ class IdentityTests(unittest.TestCase):
             ("LEASE", {"type": "secret_text"}),
             ("DB", {"type": "hyperdrive"}),
         ):
-            with (
-                self.subTest(name=name),
-                self.assertRaisesRegex(identity.Unavailable, "default-off-not-verified"),
-            ):
+            with self.subTest(name=name), self.assertRaisesRegex(identity.Unavailable, "default-off-not-verified"):
                 identity.verify_version(version(dict(binding, name=PREFIX + name)), VERSION, SHA)
 
     @patch.object(identity.http.client, "HTTPSConnection")
@@ -150,6 +130,7 @@ class IdentityTests(unittest.TestCase):
             ("1.1 200", valid, None, None),
             ("1.1 200", valid, f"Content-Length: {len(valid) + 1}", "provider-transport"),
             ("1.1 200", valid, f"Content-Length: {len(valid)}\r\nMalformed header", "provider-transport"),
+            ("1.1 200", valid, f"X-Test: one\rContent-Length: {len(valid)}", "provider-transport"),
             ("1.1 200", valid, "Connection: close", "provider-transport"),
             ("1.1 200", chunk, chunked, "provider-transport"),
             ("1.1 200", chunk + b"\r\n", chunked, None),
@@ -159,28 +140,41 @@ class IdentityTests(unittest.TestCase):
         ):
             framing = framing or f"Content-Length: {len(body)}"
             wire = f"HTTP/{status} Test\r\n{framing}\r\n\r\n".encode() + body
-            response = identity.http.client.HTTPResponse(MagicMock(makefile=MagicMock(return_value=io.BytesIO(wire))))
-            response.begin()
-            conn.getresponse.return_value = response
+            conn.sock.makefile.return_value = io.BytesIO(wire)
             conn.request.reset_mock()
-            with self.subTest(reason=reason):
+            with self.subTest(status=status, framing=framing, reason=reason):
                 if reason:
                     with self.assertRaisesRegex(identity.Unavailable, f"^{reason}$"):
                         identity.provider_result("/mock", "synthetic-token")
                 else:
                     self.assertEqual(identity.provider_result("/mock", "synthetic-token"), {})
             connect.assert_called_with("api.cloudflare.com", timeout=5)
-            conn.request.assert_called_once_with(
-                "GET",
-                "/mock",
-                headers={"Authorization": "Bearer synthetic-token", "Cache-Control": "no-cache, no-store"},
-            )
+            conn.request.assert_called_once_with("GET", "/mock", headers={
+                "Authorization": "Bearer synthetic-token", "Cache-Control": "no-cache, no-store",
+            })
 
-    def test_cli_unavailable_is_explicit_and_nonzero(self):
-        stream = io.StringIO()
-        with patch.dict(identity.os.environ, {}, clear=True), redirect_stdout(stream):
-            self.assertEqual(identity.main(), 1)
-        self.assertEqual(json.loads(stream.getvalue()), {"identity": "unavailable", "reason": "credential-config"})
+    def test_workflow_keeps_deploy_marker_separate_from_identity(self):
+        workflow = Path(__file__).parents[1] / "workflows" / "deploy.yml"
+        step = workflow.read_text().split("- name: Record API deployment outcome\n", 1)[1]
+        script = dedent(step.split("        run: |\n", 1)[1].split("\n\n", 1)[0])
+        for status, has_receipt, outcome, deployed in (
+            ("success", False, "deployed", "true"), ("success", True, "deployed", "true"),
+            ("failure", True, "failed", "false"), ("cancelled", True, "cancelled", "false"),
+        ):
+            with self.subTest(status=status, has_receipt=has_receipt), TemporaryDirectory() as temp:
+                output_file, summary = Path(temp, "output"), Path(temp, "summary")
+                matched = '{"identity":"matched"}'
+                if has_receipt:
+                    Path(temp, "staging-api-identity.json").write_text(matched)
+                env = {"PATH": identity.os.defpath, "RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(output_file),
+                       "GITHUB_STEP_SUMMARY": str(summary), "CONFIGURED": "true", "HYPERDRIVE_OUTCOME": "success",
+                       "SCHEMA_OUTCOME": "success", "JOB_STATUS": status, "DEPLOY_OUTCOME": status, "SOURCE_SHA": SHA}
+                subprocess.run(["bash", "-c", script], check=True, env=env)
+                sha = SHA if deployed == "true" else ""
+                self.assertEqual(output_file.read_text(), f"deployed={deployed}\noutcome={outcome}\nsource_sha={sha}\n")
+                text = summary.read_text()
+                expect_match = deployed == "true" and has_receipt
+                self.assertEqual((matched in text, "identity=unavailable" in text), (expect_match, not expect_match))
 
 
 if __name__ == "__main__":

@@ -53,8 +53,7 @@ def valid(pattern, value):
 
 
 def deployed_version(body):
-    # The pinned action has no version-ID output. Wrangler 4.162.0 writes
-    # wrangler-session and deploy v1 JSONL to the action's output directory.
+    # The action has no version-ID output; use Wrangler 4.162.0's session and deploy v1 JSONL.
     reason = "deploy-output-unavailable"
     require(len(body) <= MAX_DEPLOY_OUTPUT and body.endswith(b"\n"), reason)
     records = [decode(line, reason) for line in body.splitlines()]
@@ -70,8 +69,7 @@ def deployed_version(body):
 
 
 def read_chunked(stream):
-    # http.client tolerates EOF at the end of a chunked message. Require
-    # complete framing and fail closed on unsupported extensions/trailers.
+    # Require complete chunk framing; do not accept extensions or trailers.
     body = bytearray()
     while True:
         line = stream.readline(19)
@@ -86,30 +84,48 @@ def read_chunked(stream):
         body.extend(chunk)
 
 
+def read_response(stream, endpoint):
+    # Validate raw HTTP syntax before any parser can normalize malformed lines.
+    reason = "provider-transport"
+    status = re.fullmatch(rb"HTTP/1\.([01]) ([0-9]{3}) [\t\x20-\x7e\x80-\xff]*\r\n", stream.readline(8192))
+    require(status, reason)
+    minor, code = status.groups()
+    if code in (b"401", b"403"):
+        raise Unavailable(endpoint + "-auth-denied")
+    require(code == b"200", "provider-http-status")
+    framing = {}
+    for _ in range(100):
+        line = stream.readline(8192)
+        if line == b"\r\n":
+            break
+        header = re.fullmatch(rb"([!#$%&'*+.^_`|~0-9A-Za-z-]+):([\t\x20-\x7e\x80-\xff]*)\r\n", line)
+        require(header, reason)
+        name, value = header.groups()
+        name = name.lower()
+        if name in (b"transfer-encoding", b"content-length"):
+            require(name not in framing, reason)
+            framing[name] = value.strip(b" \t").lower()
+    else:
+        raise Unavailable(reason)
+    if b"transfer-encoding" in framing:
+        require(minor == b"1" and framing == {b"transfer-encoding": b"chunked"}, reason)
+        return read_chunked(stream)
+    length = framing.get(b"content-length", b"")
+    require(re.fullmatch(rb"[0-9]+", length), reason)
+    size = int(length)
+    require(size <= MAX_BODY, "provider-body-limit")
+    body = stream.read(size)
+    require(len(body) == size, reason)
+    return body
+
+
 def provider_result(path, token):
     # Fixed TLS origin, GET only, no redirects, proxy, retries or response logs.
     conn = http.client.HTTPSConnection(HOST, timeout=5)
     try:
-        conn.request(
-            "GET",
-            path,
-            headers={"Authorization": f"Bearer {token}", "Cache-Control": "no-cache, no-store"},
-        )
-        with conn.getresponse() as response:
-            if response.status in (401, 403):
-                raise Unavailable("deployments-auth-denied" if path.endswith("/deployments") else "version-auth-denied")
-            require(response.status == 200, "provider-http-status")
-            require(not response.headers.defects, "provider-transport")
-            encodings = response.headers.get_all("Transfer-Encoding", [])
-            lengths = response.headers.get_all("Content-Length", [])
-            if response.chunked:
-                require(response.version == 11 and len(encodings) == 1 and not lengths, "provider-transport")
-                body = read_chunked(response.fp)
-            else:
-                require(not encodings and len(lengths) == 1 and response.length is not None, "provider-transport")
-                require(re.fullmatch(r"[0-9]+", lengths[0].strip(" \t")), "provider-transport")
-                require(response.length <= MAX_BODY, "provider-body-limit")
-                body = response.read()  # Exact declared length or IncompleteRead.
+        conn.request("GET", path, headers={"Authorization": f"Bearer {token}", "Cache-Control": "no-cache, no-store"})
+        with conn.sock.makefile("rb") as stream:
+            body = read_response(stream, "deployments" if path.endswith("/deployments") else "version")
     except (http.client.HTTPException, OSError, ValueError):
         raise Unavailable("provider-transport") from None
     finally:
@@ -122,8 +138,7 @@ def provider_result(path, token):
 
 
 def current_deployment(result, version_id):
-    # Cloudflare's list contract (also used by `wrangler deployments status`):
-    # the first entry is the latest deployment serving traffic, not the latest upload.
+    # As in Wrangler, Cloudflare lists the latest serving deployment first, not the latest version upload.
     deployments = field(result, "deployments")
     require(isinstance(deployments, list) and deployments, "deployment-shape")
     ids = [field(deployment, "id") for deployment in deployments]
@@ -145,10 +160,8 @@ def verify_version(result, version_id, expected_sha):
     by_name = {}
     for binding in bindings:
         name, kind = field(binding, "name"), field(binding, "type")
-        require(
-            isinstance(name, str) and name and isinstance(kind, str) and kind and name not in by_name,
-            "version-bindings-shape",
-        )
+        require(isinstance(name, str) and name and isinstance(kind, str) and kind and name not in by_name,
+                "version-bindings-shape")
         by_name[name] = binding
     build = by_name.get("BUILD_SHA")
     require(field(build, "type") == "plain_text" and valid(SHA, field(build, "text")), "version-build-unavailable")
@@ -167,15 +180,8 @@ def receipt(body, expected_sha, account, read):
     deployment_id = current_deployment(read(deployments), version_id)
     verify_version(read(path + "/versions/" + version_id), version_id, expected_sha)
     require(current_deployment(read(deployments), version_id) == deployment_id, "deployment-changed-during-readback")
-    return {
-        "identity": "matched",
-        "deployment_id": deployment_id,
-        "version_id": version_id,
-        "build_sha": expected_sha,
-        "enable_flag": "off",
-        "lease": "absent",
-        "measurement_db_binding": "absent",
-    }
+    return {"identity": "matched", "deployment_id": deployment_id, "version_id": version_id,
+            "build_sha": expected_sha, "enable_flag": "off", "lease": "absent", "measurement_db_binding": "absent"}
 
 
 def main():
