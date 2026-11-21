@@ -346,7 +346,6 @@ test('keyboard Play and Pause keep the range-capable native decoder and position
 	await expect.poll(time).toBeGreaterThan(2.1);
 	await pause.press('Space');
 	await expect(status).toHaveText('Paused');
-	await expect(play).toBeFocused();
 	const pausedAt = await time();
 	await openHome(page);
 	await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();

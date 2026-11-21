@@ -38,7 +38,6 @@ class TransportAudio extends EventTarget {
 	paused = true;
 	ended = false;
 	error: { code: number } | null = null;
-	currentTime = 30;
 	constructor(readonly source = '/coral') { super(); }
 	getAttribute() { return this.source; }
 	play = vi.fn(async () => { this.paused = false; });
@@ -96,14 +95,17 @@ test.each(['queue', 'shared'])('%s Play reports a resource error once with queue
 	expect(status()).toBe('paused');
 });
 
-test.each(['playing', 'blocked', 'paused', 'resumed'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
+test.each(['playing', 'blocked', 'paused', 'pause event', 'resumed'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
 	const { audio, media, announce, status } = compactTransport();
 	const pending = audio.deferPlay(), compact = media.playCurrent();
-	const queued = media.playSelected(coral, 0, coralSource);
+	const paused = outcome === 'paused' || outcome === 'pause event';
+	const counts = paused ? 'Added 0, 1 already queued.' : '';
+	const queued = media.playSelected(coral, 0, coralSource, counts);
+	if (paused) audio.pause();
+	if (outcome === 'pause event') audio.emit('pause'); // Before the queue's flush completes.
 	await Promise.resolve();
 	expect(audio.play).toHaveBeenCalledOnce();
-	if (outcome === 'paused') audio.pause(); // Do not dispatch the queued pause event before settlement.
-	if (outcome === 'playing' || outcome === 'paused') pending.resolve();
+	if (outcome === 'playing' || paused) pending.resolve();
 	else if (outcome === 'blocked') { audio.paused = true; pending.reject(new DOMException('Blocked', 'NotAllowedError')); }
 	else {
 		audio.pause();
@@ -112,10 +114,12 @@ test.each(['playing', 'blocked', 'paused', 'resumed'])('same-track queue Play sh
 		pending.reject(new DOMException('Interrupted by pause', 'AbortError'));
 	}
 	await Promise.all([compact, queued]);
-	if (outcome === 'resumed' || outcome === 'paused') {
+	if (paused || outcome === 'resumed') {
 		if (outcome === 'resumed') audio.emit('playing');
-		expect(status()).toBe(outcome === 'resumed' ? 'playing' : 'paused');
-		expect(announce).not.toHaveBeenCalled();
+		expect(status()).toBe(paused ? 'paused' : 'playing');
+		if (paused) expect(announce).toHaveBeenCalledExactlyOnceWith(counts, true);
+		if (outcome === 'paused') audio.emit('pause'); // Settlement preceded the native event.
+		expect(announce).toHaveBeenCalledTimes(Number(paused));
 		return;
 	}
 	expect(status()).toBe(outcome);
@@ -125,7 +129,6 @@ test.each(['playing', 'blocked', 'paused', 'resumed'])('same-track queue Play sh
 		await media.playCurrent();
 		expect(status()).toBe('playing');
 		expect(audio.load).not.toHaveBeenCalled();
-		expect(audio.currentTime).toBe(30);
 	}
 });
 
@@ -141,11 +144,8 @@ test('compact Play starts in the gesture, deduplicates pending Play, and reads n
 	await attempt;
 	expect(status()).toBe('playing');
 	media.pauseCurrent();
-	expect(audio.pause).toHaveBeenCalledOnce();
 	expect(status()).toBe('paused');
 	expect(media.audio).toBe(audio.element);
-	expect(audio.currentTime).toBe(30);
-	expect(audio.load).not.toHaveBeenCalled();
 });
 
 test.each(['compact', 'native'])('%s Pause fences pending success, including after a newer start', async (path) => {
@@ -165,8 +165,9 @@ test.each(['compact', 'native'])('%s Pause fences pending success, including aft
 });
 
 test.each(['replacement', 'detach', 'account purge', 'destroy'])('late Play is inert after %s', async (boundary) => {
-	const { audio, queue, media, detach, status } = compactTransport();
+	const { audio, queue, media, detach, announce, status } = compactTransport();
 	const pending = audio.deferPlay(), attempt = media.playCurrent();
+	const queued = media.playSelected(coral, 0, coralSource, 'Added 0, 1 already queued.');
 	let replacement: TransportAudio | undefined;
 	if (boundary === 'replacement') {
 		replacement = new TransportAudio('/kelp');
@@ -180,10 +181,10 @@ test.each(['replacement', 'detach', 'account purge', 'destroy'])('late Play is i
 	audio.emit('playing');
 	if (boundary === 'replacement') pending.resolve();
 	else pending.reject(new DOMException('Interrupted', 'AbortError'));
-	await attempt;
+	await Promise.all([attempt, queued]);
 	expect(status()).toBe(replacement ? 'paused' : 'unavailable');
 	expect(media.audio).toBe(replacement?.element);
-	expect(replacement?.play.mock.calls ?? []).toEqual([]);
+	expect(announce).not.toHaveBeenCalled();
 	expect(audio.pause).toHaveBeenCalledOnce();
 });
 

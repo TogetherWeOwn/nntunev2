@@ -207,8 +207,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		let attachment = current;
 		let version = attachmentVersion;
 		const intent = playIntent;
-		const ownsAttempt = () => !destroyed && playIntent === intent && queue.isCurrent(receipt) && source.isCurrent();
-		const isCurrent = () => ownsAttempt() && current === attachment && attachmentVersion === version;
+		const ownsQueue = () => !destroyed && source.isCurrent() && queue.isCurrent(receipt);
+		const isCurrent = () => ownsQueue() && current === attachment && attachmentVersion === version;
+		const ownsPlay = () => isCurrent() && playIntent === intent;
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
 		if (streamUrl) {
@@ -217,37 +218,37 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			await selection.flush();
 			// A source change retires the old node before commit. In that case
 			// flush can admit one attachment, but not a reset or replacement while waiting.
-			if (!ownsAttempt() || attachmentVersion !== version + Number(!attachment && !!current)) return;
+			if (!ownsQueue() || attachmentVersion !== version + Number(!attachment && !!current)) return;
 			attachment = current;
 			version = attachmentVersion;
 			const audio = attachment?.audio;
 			lead = `Selected ${title}, paused: playback was blocked.`;
+			if (sharedPlay && audio) {
+				const outcome = await sharedPlay;
+				if (!matchesSource(audio, streamUrl, isCurrent)) return;
+				if (outcome === 'error' || audio.error) lead = `Selected ${title}; audio unavailable.`;
+				else if (outcome !== 'blocked') lead = outcome && !audio.paused && !audio.ended ? `Playing ${title}.` : '';
+				// An interrupted Play can still own the committed queue result.
+				if (!isCurrent()) return;
+				const message = [playIntent === intent && lead, suffix].filter(Boolean).join(' ');
+				if (message) selection.announce(message, true);
+				return;
+			}
+			if (!ownsPlay()) return;
 			try {
-				if (audio?.isConnected && audio.getAttribute('src') === streamUrl && isCurrent()) {
-					if (sharedPlay) {
-						const outcome = await sharedPlay;
-						if (!isCurrent()) return;
-						if (outcome === 'error' || audio.error) lead = `Selected ${title}; audio unavailable.`;
-						else if (!outcome) return;
-						else if (outcome === 'playing') {
-							if (audio.paused || audio.ended) return;
-							lead = `Playing ${title}.`;
-						}
-					} else {
-						const play = audio.play;
-						if (!isCurrent()) return;
-						await play.call(audio);
-						lead = `Playing ${title}.`;
-					}
+				if (audio?.isConnected && audio.getAttribute('src') === streamUrl && ownsPlay()) {
+					const play = audio.play;
+					if (!ownsPlay()) return;
+					await play.call(audio);
+					lead = `Playing ${title}.`;
 				}
 			} catch {
 				// No retry and no pause or selection change on a retired receipt.
-				if (isCurrent() && attachment) attachment.playing = false;
+				if (ownsPlay() && attachment) attachment.playing = false;
 			}
-			if (isCurrent() && audio?.error) lead = `Selected ${title}; audio unavailable.`;
+			if (ownsPlay() && audio?.error) lead = `Selected ${title}; audio unavailable.`;
 		}
-		if (!isCurrent()) return;
-		selection.announce(suffix ? `${lead} ${suffix}` : lead, true);
+		if (ownsPlay()) selection.announce(suffix ? `${lead} ${suffix}` : lead, true);
 	}
 
 	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
@@ -500,10 +501,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			// Node identity is not attachment identity, even for the same source.
 			const receipt = { audio, playing: false, listeners: new AbortController() };
 			current = receipt;
-			if (previous) {
-				previous.listeners.abort();
-				invalidatePlay();
-			}
+			previous?.listeners.abort();
+			if (previous) invalidatePlay();
 			function listenForNativeEvents(): void {
 				const observe = (event: Event) => {
 					if (current !== receipt || event.currentTarget !== audio) return;
