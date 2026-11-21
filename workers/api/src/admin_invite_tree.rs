@@ -71,7 +71,7 @@ pub(crate) async fn read_on(
     }
     let mut invitee_ids = Vec::with_capacity(rows.len().min(PAGE_SIZE));
     for row in rows.iter().take(PAGE_SIZE) {
-        if let Some(id) = row.try_get("child")? {
+        if let Some(id) = row.try_get::<_, Option<String>>("child")? {
             invitee_ids.push(id);
         }
     }
