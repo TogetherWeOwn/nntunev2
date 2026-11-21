@@ -53,10 +53,12 @@ async fn pins_require_authorization_and_live_committed_protection() {
         .unwrap();
     let id = |column: &str| fixture.get::<_, ReadUuid>(column).0;
     let object = id("object_id");
+    let reference = 0x2100_0000_0000_4000_8000_0000_0000_00ffu128.to_be_bytes();
+    let reference_text = uuid_text(reference);
     let target = || DigestReadTarget {
         environment: id("environment_id"),
         library: id("library_id"),
-        reference: object,
+        reference,
         object,
         generation: id("generation_id"),
         provider_configuration: id("provider_configuration_version_id"),
@@ -92,11 +94,11 @@ async fn pins_require_authorization_and_live_committed_protection() {
         .query_one(
             "SELECT public.attach_storage_digest_reference(w.environment_id, w.library_id,
              w.plaintext_sha256, w.plaintext_bytes, w.object_id, i.generation_id,
-             w.root_version_id, w.object_id, $2)
+             w.root_version_id, $3::text::uuid, $2)
          FROM public.storage_validated_digest_winners w
          JOIN public.storage_object_intents i USING (object_id)
          WHERE w.object_id = $1::text::uuid",
-            &[&OBJECT, &requested],
+            &[&OBJECT, &requested, &reference_text],
         )
         .await
         .unwrap()
@@ -135,7 +137,7 @@ async fn pins_require_authorization_and_live_committed_protection() {
         target(),
         requested,
         async |candidate| {
-            assert_eq!(candidate.reference, object);
+            assert_eq!(candidate.reference, reference);
             assert_eq!(candidate.object, object);
             assert_eq!(candidate.generation, id("generation_id"));
             Some(requested)
@@ -145,10 +147,26 @@ async fn pins_require_authorization_and_live_committed_protection() {
     .await
     .unwrap()
     .expect("live committed pins");
-    assert_eq!(read.pins().map_id, id("map_id"));
-    assert_eq!(read.pins().media_version, "media-12");
-    assert_eq!(read.pins().page_versions, ["page-12"]);
-    assert_eq!(read.pins().usable_until, requested);
+    let snapshot = read.playback_snapshot().unwrap();
+    assert_eq!(snapshot.environment_id, id("environment_id"));
+    assert_eq!(snapshot.library_id, id("library_id"));
+    assert_eq!(snapshot.reference_id, reference);
+    assert_eq!(snapshot.object_id, object);
+    assert_eq!(snapshot.generation_id, id("generation_id"));
+    assert_eq!(
+        snapshot.provider_configuration,
+        id("provider_configuration_version_id")
+    );
+    assert_eq!(snapshot.root_version_id, id("root_version_id"));
+    assert_eq!(
+        snapshot.plaintext_len,
+        u64::try_from(target().plaintext_bytes).unwrap()
+    );
+    assert_eq!(snapshot.plaintext_sha256, target().plaintext_sha256);
+    assert_eq!(snapshot.map_id, id("map_id"));
+    assert_eq!(snapshot.media_version, "media-12");
+    assert_eq!(snapshot.page_versions, ["page-12"]);
+    assert_eq!(snapshot.usable_until, requested);
     assert_eq!(observed_deadline(&observer).await, requested);
 
     let later = requested + Duration::from_secs(1);
@@ -180,7 +198,7 @@ async fn pins_require_authorization_and_live_committed_protection() {
         "the hold was committed"
     );
     assert_eq!(observer.execute(
-        "DELETE FROM public.storage_validated_digest_references WHERE reference_id = $1::text::uuid AND object_id = $1::text::uuid",
-        &[&OBJECT],
+        "DELETE FROM public.storage_validated_digest_references WHERE object_id = $1::text::uuid AND reference_id = $2::text::uuid",
+        &[&OBJECT, &reference_text],
     ).await.unwrap(), 1);
 }
