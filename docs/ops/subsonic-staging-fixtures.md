@@ -100,6 +100,37 @@ mode), without extending the five-minute job deadline or holding up restore.
 This policy has no collectors or live entrypoint; it does not prove provider
 coverage or cleanup.
 
+### Version-fenced restore rehearsal (offline)
+
+The rehearsal pins a known-off deployment and checks that the serving version
+agrees with the deployment version. On cleanup it cancels clients, then attempts
+restore only for the experiment's exact deployment identity. The simulated write
+compares that identity atomically; even a newer deployment of the same version
+must survive. A separately verified newer off deployment is not a restoration
+of the pinned baseline.
+
+Off requires disabled measurement, no lease, and no measurement DB binding.
+The independent zero DB count must follow the off readback and the deployment
+must still match after that sample. Missing proof leaves cleanup unverified.
+
+This is not a Cloudflare adapter. Ordinary staging API deployment and a future
+live executor must share a GitHub concurrency group across activation, load,
+and cleanup. That group does not fence dashboard or API writes. Cloudflare's
+[deployment create API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
+does not expose an expected-current deployment precondition. A read followed by
+an unconditional rollback is not safe; do not arm or attempt that write without
+a fence that covers all writers. The rehearsal does not exercise Actions
+cancellation or independent UTC lease expiry.
+
+### Independent UTC expiry (disposable release Fetch)
+
+The disposable release Fetch test checks the Worker's UTC clock:
+measurement remains enabled and the binding and exact SHA remain configured,
+but a valid lease with a past expiry must reach the inert staging response
+without opening the measurement socket. This checks expiry without running
+cleanup or injecting a runner clock. Expiry stops admission; it does not remove
+the lease or binding, restore a deployment, or prove DB drain.
+
 ### Charge triplet
 
 Use the same `POST /rest/getArtists` with form-encoded `f=json` and credentials

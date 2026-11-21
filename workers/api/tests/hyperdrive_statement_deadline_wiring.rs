@@ -317,7 +317,7 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         } else if name == "acquire_playback_lease" {
             assert_eq!(
                 function_body(piece, name),
-                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,expires_at,takeover,).await}",
+                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,continuation_deadline,takeover,).await}",
                 "lease acquisition must delegate its entire operation to the bounded helper"
             );
             assert_bounded(

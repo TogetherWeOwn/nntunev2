@@ -1,5 +1,4 @@
--- Regression test for the playback-enforcement statements: the lease
--- acquire/touch upserts from workers/api/src/playback.rs, the ever-paid
+-- Regression test for the previous Worker's idle-only lease statements, the ever-paid
 -- probe from billing.rs, and the plans-row caps read from
 -- plan_limits.rs — mirrored here with literal values. Run after ALL
 -- migrations (see ../run_migration_tests.sh) in one rolled-back
