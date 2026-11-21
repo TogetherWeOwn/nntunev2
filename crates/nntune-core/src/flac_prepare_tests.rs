@@ -46,7 +46,9 @@ fn rewrites_metadata_and_keeps_exact_audio_frames() {
 
     let output = [preamble, audio_tail].concat();
     let (info, audio) = FlacPreamble::default().push(&output).unwrap().unwrap();
-    for (i, point) in preamble[80..].chunks_exact(18).enumerate() {
+    let (points, remainder) = preamble[80..].as_chunks::<18>();
+    assert!(remainder.is_empty());
+    for (i, point) in points.iter().enumerate() {
         let sample = u64::from_be_bytes(point[..8].try_into().unwrap());
         let offset = u64::from_be_bytes(point[8..16].try_into().unwrap());
         let count = u16::from_be_bytes(point[16..].try_into().unwrap());
