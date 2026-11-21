@@ -15,7 +15,7 @@ test('Home keeps a failed history read recoverable and distinguishes empty histo
 	await expect(shelf.getByRole('listitem')).toHaveCount(0);
 
 	await page.route(path, (route) => route.fulfill({ json: envelope([]) }), { times: 1 });
-	await shelf.getByRole('button', { name: 'Retry' }).click();
+	await shelf.getByRole('button', { name: 'Retry loading listening history', exact: true }).click();
 	await expect(shelf.getByText('No listening events have been recorded for this account.')).toBeVisible();
 	await expect(shelf.getByRole('listitem')).toHaveCount(0);
 
@@ -54,7 +54,7 @@ test('Home sends browser Origin and discards already rendered listens on a cross
 	await expect(shelf.getByRole('listitem')).toHaveCount(0);
 
 	await page.route(path, (route) => route.fulfill({ status: 401 }), { times: 1 });
-	await shelf.getByRole('button', { name: 'Retry' }).click();
+	await shelf.getByRole('button', { name: 'Retry loading listening history', exact: true }).click();
 	await expect(shelf.getByRole('link', { name: 'Sign in' })).toHaveAttribute('href', '/login');
 	await expect(shelf.getByRole('listitem')).toHaveCount(0);
 });

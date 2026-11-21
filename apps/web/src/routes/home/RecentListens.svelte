@@ -47,7 +47,7 @@
 				? 'Listening history is hidden until you check the current session again.'
 				: 'Could not load listening history.'}
 		</p>
-		<button type="button" onclick={reader.load}>Retry</button>
+		<button type="button" onclick={reader.load}>Retry loading listening history</button>
 	{:else if view.kind === 'ready'}
 		<p>Up to five recorded playback events, in the order returned by your listening history.</p>
 		<ul>
