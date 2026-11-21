@@ -1,4 +1,8 @@
-import type { ListenEvent, ListenEventSender } from './listenEventSender.js';
+export interface ListenEvent {
+	playback_id: string;
+	track_id: string;
+	event: 'start' | 'complete' | 'skip';
+}
 
 export interface ListenAudioLike {
 	readonly ended?: boolean;
@@ -9,7 +13,7 @@ export interface ListenAudioLike {
 export interface ListenObserverOptions {
 	/** Track attached to this keyed media element. */
 	trackId: string;
-	sender: Pick<ListenEventSender, 'send'>;
+	sender: { send(event: ListenEvent): void };
 	/** Play ID from the current grant for this exact source, never the track metadata. */
 	grantPlayId: () => string | undefined;
 	canStart?: () => boolean;
