@@ -317,6 +317,17 @@ function isMemberInviteSummary(value: unknown): value is MemberInviteSummary {
 		(row.next_window === null || hasInviteBounds(row.next_window));
 }
 
+export type MemberInviteHistory = {
+	invites: { id: number; created_at: number; expires_at: number; status: InviteStatus }[];
+	next_cursor: string | null;
+};
+
+function isMemberInviteHistoryRow(value: unknown): value is MemberInviteHistory['invites'][number] {
+	const row = value as Partial<MemberInviteHistory['invites'][number]> | null;
+	return row != null && isInviteId(row.id) && isEpoch(row.created_at) && isEpoch(row.expires_at) &&
+		row.status !== undefined && INVITE_STATUSES.includes(row.status);
+}
+
 export interface IssuedInvite {
 	code: string;
 	expires_at: number;
@@ -516,6 +527,21 @@ export class ApiClient {
 		if (status !== 200 || !isMemberInviteSummary(data))
 			throw new ApiError(status, 'request_failed', 'Invalid invite summary response', null, false);
 		return data;
+	}
+
+	/** Read one private history page in the browser session. The cursor is opaque. */
+	async readMemberInviteHistory(cursor: string | null, signal: AbortSignal): Promise<MemberInviteHistory> {
+		const query = cursor === null ? '' : `?cursor=${encodeURIComponent(cursor)}`;
+		const { data, status } = await this.requestWithStatus<{ invites?: unknown; next_cursor?: unknown } | null>(
+			`${MEMBER_INVITES}/history${query}`, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 200 || !Array.isArray(data?.invites) || !data.invites.every(isMemberInviteHistoryRow) ||
+			(data.next_cursor !== null && (typeof data.next_cursor !== 'string' || !data.next_cursor)))
+			throw new ApiError(status, 'request_failed', 'Invalid invite history response', null, false);
+		return {
+			invites: data.invites.map(({ id, created_at, expires_at, status }) => ({ id, created_at, expires_at, status })),
+			next_cursor: data.next_cursor
+		};
 	}
 
 	/** Spend one invite from the browser session's current window. Do not retry automatically. */

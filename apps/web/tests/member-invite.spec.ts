@@ -5,6 +5,12 @@ test.use({ locale: 'en-US' });
 const code = 'synthetic_invite_codeA';
 const issued = { id: '1', code, expires_at: 1_893_456_000 };
 const endpoint = '**/v1/me/invites';
+const historyEndpoint = (url: URL) => url.pathname === '/v1/me/invites/history';
+const emptyHistory = { invites: [], next_cursor: null };
+
+test.beforeEach(async ({ page }) => {
+	await page.route(historyEndpoint, (route) => route.fulfill({ json: emptyHistory }));
+});
 const month = 30 * 86_400;
 const bounds = { starts_at: 1_893_456_000, ends_at: 1_894_060_800 };
 const snapshot = {
@@ -15,6 +21,13 @@ const snapshot = {
 const mockInvite = (route: Route) => route.request().method() === 'GET'
 	? route.fulfill({ json: snapshot })
 	: route.fulfill({ status: 201, json: issued });
+
+const historyRow = (id: number, status: string) => ({
+	id, status, created_at: bounds.starts_at + id, expires_at: bounds.starts_at + 60
+});
+const deleting = { code: 'account_deleting', message: 'Fixture account is being deleted', retryable: false };
+const historyRegion = (page: Page) => page.getByRole('region', { name: 'Issued invites' });
+const opaqueCursor = 'synthetic+cursor/&';
 
 async function mockClipboard(page: Page, blocked = false) {
 	await page.addInitScript((blocked) => {
@@ -305,3 +318,147 @@ for (const [status, detail] of [
 		expect(posts).toBe(1);
 	});
 }
+
+test('shows server status and effective expiry, with keyboard paging and append retry at 320px', async ({ page }) => {
+	await page.setViewportSize({ width: 320, height: 720 });
+	await page.clock.setFixedTime(new Date((bounds.starts_at + 55) * 1000));
+	await page.route(endpoint, mockInvite);
+	const invites = ['active', 'redeemed', 'revoked', 'expired'].map((status, index) => historyRow(50 - index, status));
+	const hidden = { code, link: `https://example.test/signup#invite=${code}`, email: 'fixture@example.test', billing: 'fixture-billing' };
+	const cursors: (string | null)[] = [];
+	const failAppend = Promise.withResolvers<void>();
+	await page.route(historyEndpoint, async (route) => {
+		expect(route.request().method()).toBe('GET');
+		expect(await route.request().headerValue('authorization')).toBeNull();
+		cursors.push(new URL(route.request().url()).searchParams.get('cursor'));
+		if (cursors.length === 1) return route.fulfill({ json: {
+			invites: invites.map((row) => ({ ...row, ...hidden })), next_cursor: opaqueCursor
+		} });
+		if (cursors.length === 2) {
+			await failAppend.promise;
+			return route.fulfill({ status: 500, json: {} });
+		}
+		return route.fulfill({ json: { invites: [historyRow(1, 'active')], next_cursor: null } });
+	});
+	await page.goto('/account/invites');
+	const region = historyRegion(page);
+	const rows = region.getByRole('listitem');
+	await expect(rows).toHaveCount(4);
+	for (const [index, label] of ['Active', 'Redeemed', 'Revoked', 'Expired'].entries()) {
+		await expect(rows.nth(index).getByText(label, { exact: true })).toBeVisible();
+	}
+	const times = rows.last().locator('time');
+	// The early-closed row is expired on the server even though its shortened expiry is in the browser's future.
+	await expect(times.first()).toHaveAttribute('datetime', new Date(invites[3]!.created_at * 1000).toISOString());
+	await expect(times.last()).toHaveAttribute('datetime', new Date(invites[3]!.expires_at * 1000).toISOString());
+	const markup = await region.innerHTML();
+	for (const value of [...Object.values(hidden), opaqueCursor]) expect(markup).not.toContain(value);
+	await expect(page).toHaveURL(/\/account\/invites$/);
+	expect(await region.evaluate((section) => section.scrollWidth)).toBeLessThanOrEqual(320);
+
+	const more = region.getByRole('button', { name: 'Load more invites' });
+	await page.getByRole('button', { name: 'Create invite' }).focus();
+	await page.keyboard.press('Tab');
+	await expect(more).toBeFocused();
+	await page.keyboard.press('Enter');
+	await expect(more).toBeDisabled();
+	await more.evaluate((button: HTMLButtonElement) => { button.click(); button.click(); });
+	failAppend.resolve();
+	await expect(region.getByText('Couldn’t load more invites.')).toBeVisible();
+	await expect(rows).toHaveCount(4);
+	const retry = region.getByRole('button', { name: 'Retry loading invites' });
+	await expect(retry).toBeFocused();
+	await page.keyboard.press('Enter');
+	await expect(rows).toHaveCount(5);
+	await expect(region.getByRole('button')).toHaveCount(0);
+	await expect(region.getByRole('status')).toBeFocused();
+	expect(cursors).toEqual([null, opaqueCursor, opaqueCursor]);
+});
+
+for (const [status, json, message] of [
+	[200, emptyHistory, 'No invites issued yet.'],
+	[200, { invites: [historyRow(1, 'unknown')], next_cursor: null }, 'Couldn’t load issued invites.'],
+	[500, {}, 'Couldn’t load issued invites.'],
+	[403, {}, 'Access to issued invites was denied.'],
+	[409, deleting, 'scheduled for deletion']
+] as const) test(`has no rows for ${status}: ${message}`, async ({ page }) => {
+	await page.route(endpoint, mockInvite);
+	await page.route(historyEndpoint, (route) => route.fulfill({ status, json }));
+	await page.goto('/account/invites');
+	await expect(page.getByText(message, { exact: status !== 409 })).toBeVisible();
+	await expect(historyRegion(page).getByRole('listitem')).toHaveCount(0);
+});
+
+for (const [status, json, message] of [
+	[403, {}, 'Access to issued invites was denied.'],
+	[409, deleting, 'scheduled for deletion']
+] as const) test(`clears loaded history on ${status} during paging`, async ({ page }) => {
+	await page.route(endpoint, mockInvite);
+	await page.route(historyEndpoint, (route) => new URL(route.request().url()).search
+		? route.fulfill({ status, json })
+		: route.fulfill({ json: { invites: [historyRow(3, 'active')], next_cursor: opaqueCursor } }));
+	await page.goto('/account/invites');
+	const region = historyRegion(page);
+	await expect(region.getByRole('listitem')).toHaveCount(1);
+	await region.getByRole('button', { name: 'Load more invites' }).click();
+	await expect(page.getByText(message, { exact: status !== 409 })).toBeVisible();
+	await expect(region.getByRole('listitem')).toHaveCount(0);
+	await expect(region.getByRole('button')).toHaveCount(0);
+});
+
+for (const boundary of ['session change', 'restore', 'issuance']) test(`discards a pending append on ${boundary}`, async ({ page }) => {
+	const methods: string[] = [];
+	const queries: string[] = [];
+	await page.route(endpoint, (route) => { methods.push(route.request().method()); return mockInvite(route); });
+	await page.route(historyEndpoint, (route) => {
+		queries.push(new URL(route.request().url()).search);
+		return route.fulfill({ json: queries.length === 1
+			? { invites: [historyRow(3, 'active')], next_cursor: opaqueCursor }
+			: { invites: [historyRow(4, 'redeemed')], next_cursor: null } });
+	});
+	await page.goto('/account/invites');
+	const region = historyRegion(page);
+	await expect(region.getByText('Active', { exact: true })).toBeVisible();
+	await page.evaluate((stale) => {
+		const fetch = window.fetch;
+		const fixture = document.documentElement.dataset;
+		window.fetch = (input, init) => {
+			if (!String(input).includes('/v1/me/invites/history?')) return fetch(input, init);
+			fixture.historyFixture = 'pending';
+			init?.signal?.addEventListener('abort', () => { fixture.historyFixture = 'aborted'; }, { once: true });
+			// Simulate a transport resolving after abort.
+			return new Promise((resolve) => window.addEventListener('release-history', () => resolve(new Response(JSON.stringify(stale))), { once: true }));
+		};
+	}, { invites: [historyRow(2, 'revoked')], next_cursor: null });
+	await region.getByRole('button', { name: 'Load more invites' }).click();
+	await expect(page.locator('html')).toHaveAttribute('data-history-fixture', 'pending');
+
+	if (boundary === 'issuance') {
+		await page.getByRole('button', { name: 'Create invite' }).click();
+		await expect(page.getByRole('textbox', { name: 'Signup link' })).toHaveValue(new RegExp(`#invite=${code}$`));
+	} else if (boundary === 'restore') {
+		await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })));
+		await expect(region).toHaveCount(0);
+		await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
+	} else {
+		await page.evaluate(() => {
+			const key = 'nntune.auth.generation.v1';
+			localStorage.setItem(key, 'fixture-new-session');
+			window.dispatchEvent(new StorageEvent('storage', { key, storageArea: localStorage }));
+		});
+		await expect(region).toHaveCount(0);
+		await page.getByRole('button', { name: 'Refresh summary' }).click();
+	}
+	await expect(page.locator('html')).toHaveAttribute('data-history-fixture', 'aborted');
+	await expect(region.getByText('Redeemed', { exact: true })).toBeVisible();
+	await page.evaluate(() => {
+		window.dispatchEvent(new Event('release-history'));
+		return new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+	});
+	await expect(region.getByRole('listitem')).toHaveCount(1);
+	await expect(region.getByText('Redeemed', { exact: true })).toBeVisible();
+	await expect(region.getByRole('textbox')).toHaveCount(0);
+	expect(await region.innerHTML()).not.toContain(code);
+	expect(queries).toEqual(['', '']);
+	expect(methods).toEqual(boundary === 'issuance' ? ['GET', 'POST', 'GET'] : ['GET', 'GET']);
+});
