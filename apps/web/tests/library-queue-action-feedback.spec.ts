@@ -50,19 +50,26 @@ test('QF-R04 keyboard reorder keeps the current row and focus on its move contro
 	await expect(page.getByTestId('queue-announcement')).toHaveText('Intro moved to 2 of 3');
 });
 
-test('QF-R05 newer focus after keyboard reorder wins over recovery', async ({ page }) => {
+test('QF-R05 newer focus after reorder dispatch wins over recovery', async ({ page }) => {
 	await seedQueue(page);
 	const rows = page.getByTestId('queue-item');
 	const move = rows.and(page.locator('[data-track-id="intro-one"]'))
 		.getByRole('button', { name: 'Move Intro down', exact: true });
 	const filter = page.getByRole('searchbox', { name: 'Filter queue', exact: true });
 	await move.focus();
-	await expect(move).toBeFocused();
-	await filter.evaluate((element) => {
-		// The delegated Move handler runs before this later click listener.
-		document.addEventListener('click', () => (element as HTMLInputElement).focus(), { once: true });
+	const dispatch = await move.evaluate((element) => {
+		const button = element as HTMLButtonElement;
+		const filter = document.querySelector<HTMLInputElement>('#queue-filter-input')!;
+		let focusedAtDispatch = false;
+		button.addEventListener('click', () => {
+			focusedAtDispatch = document.activeElement === button;
+		}, { once: true });
+		// A synchronous click keeps the later listener ahead of the tick() continuation.
+		document.addEventListener('click', () => filter.focus(), { once: true });
+		button.click();
+		return { focusedAtDispatch, newerFocusPlaced: document.activeElement === filter };
 	});
-	await page.keyboard.press('Enter');
+	expect(dispatch).toEqual({ focusedAtDispatch: true, newerFocusPlaced: true });
 	await expect(rows.nth(1)).toHaveAttribute('data-track-id', 'intro-one');
 	await expect(page.getByTestId('queue-announcement')).toHaveText('Intro moved to 2 of 3');
 	await expect(filter).toBeFocused();
