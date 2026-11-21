@@ -807,9 +807,9 @@
 				if (wrote) favoriteBaseline = update(favoriteBaseline);
 				return;
 			}
-			// Feedback uses the actual operation result, before applying the display overlay.
-			applied?.(committed ? base : before, committed ?? optimistic);
-			if (!committed) return;
+			if (!committed) return applied?.(before, optimistic);
+			const visitOnly = placement && !favoriteBaseline.includes(placement.id) && !committed.includes(placement.id)
+				? placement : undefined;
 			// A no-op reconciles peer edits without replaying the visit-only overlay.
 			if (wrote) favorites = committed;
 			else if (JSON.stringify(favoriteBaseline) !== JSON.stringify(committed)) {
@@ -817,8 +817,7 @@
 				const visit = new Set(optimistic);
 				const durable = committed.filter((id) => !baseline.has(id) || visit.has(id));
 				const visible = new Set(durable);
-				const moved = placement && !baseline.has(placement.id) && !visible.has(placement.id)
-					&& visible.has(placement.crossed) ? placement : undefined;
+				const moved = visitOnly && visible.has(visitOnly.crossed) ? visitOnly : undefined;
 				const beforeNeighbor = new Map<string, string[]>();
 				let pending: string[] = [];
 				for (const id of moved ? before : optimistic) {
@@ -829,15 +828,18 @@
 				}
 				const reconciled = [...durable.flatMap((id) => [...(beforeNeighbor.get(id) ?? []), id]), ...pending];
 				if (moved) {
-					// Keep the visit-only row's original slot instead of anchoring it to a hidden neighbor.
 					const order = reconciled.filter((id) => moved.loaded.has(id));
 					order.splice(order.indexOf(moved.crossed) + Number(moved.direction === 'down'), 0, moved.id);
-					reconciled.splice(before.indexOf(moved.id), 0, moved.id);
+					// Add a loaded slot without shifting the reconciled hidden slots.
+					reconciled.push(moved.id);
 					let slot = 0;
 					favorites = reconciled.map((id) => moved.loaded.has(id) ? order[slot++] : id);
 				} else favorites = reconciled;
 			}
 			favoriteBaseline = committed;
+			// A visit-only move has a display outcome only if the crossed row survived.
+			const displayMove = visitOnly && favorites.includes(visitOnly.crossed);
+			applied?.(displayMove ? before : base, displayMove ? favorites : committed);
 		});
 	}
 

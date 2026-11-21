@@ -294,6 +294,11 @@ test('a visit-only move honors peer reorders without displacing hidden favorite 
 	await star(page, 'arr-a').click();
 	await page.evaluate((key) => navigator.locks.request(key, () => {}), KEY);
 	expect(await stored(page)).toEqual(['arr-z', 'hidden']);
+	const announcement = page.getByTestId('favorites-announcement');
+	await activate(page, 'Alpha Song', 'up');
+	await expect(announcement).toHaveText('Alpha Song moved to 1 of 2');
+	await activate(page, 'Alpha Song', 'down');
+	await expect(announcement).toHaveText('Alpha Song moved to 2 of 2');
 	const peer = await page.context().newPage();
 	await open(peer, ['arr-z', 'hidden']);
 	await star(peer, 'arr-m').click();
@@ -304,6 +309,7 @@ test('a visit-only move honors peer reorders without displacing hidden favorite 
 	await activate(peer, 'Mike Song', 'up');
 	await expect.poll(() => stored(peer)).toEqual(['arr-m', 'hidden', 'arr-z']);
 	await activate(page, 'Alpha Song', 'down');
+	await expect(announcement).toHaveText('Alpha Song moved to 3 of 3');
 	await expectIds(page, ['arr-m', 'arr-z', 'arr-a']);
 	const expanded = [...ITEMS, { id: 'hidden', title: 'Hidden Song', artist: '' }];
 	await page.route('**/api/library', (route) => route.fulfill({ json: expanded }));
@@ -341,9 +347,9 @@ for (const moveFocus of [false, true]) {
 
 for (const unstar of [true, false]) {
 	test(`queue ${unstar ? 'Unstar all' : 'Star all'} retains its direction after reconciliation`, async ({ page }) => {
-		const one = ['arr-z'];
 		const both = ['arr-z', 'arr-m'];
-		await open(page, unstar ? both : one);
+		const mixed = ['arr-z', 'arr-a'];
+		await open(page, unstar ? both : mixed);
 		for (const title of ['Zulu Song', 'Mike Song']) {
 			await page.getByTestId('library-item').getByRole('button', { name: new RegExp(`^${title}`) }).click();
 		}
@@ -351,18 +357,19 @@ for (const unstar of [true, false]) {
 		await expect(rows).toHaveCount(2);
 		for (const checkbox of await rows.getByRole('checkbox').all()) await checkbox.check();
 		const release = await holdFavorites(page);
-		await star(page, 'arr-a').click();
-		await expect.poll(() => page.evaluate(async (key) => (await navigator.locks.query()).pending?.some((lock) => lock.name === key), KEY)).toBe(true);
+		await activate(page, 'Zulu Song', 'down');
 		await rows.first().getByTestId('queue-more').click();
 		const action = page.getByRole('menuitem', { name: unstar ? 'Unstar all' : 'Star all', exact: true });
 		await expect(action).toBeVisible();
-		const rebased = unstar ? one : both;
-		await page.evaluate(([key, ids]) => localStorage.setItem(key, JSON.stringify(ids)), [KEY, rebased] as const);
+		// Change star membership without resizing the shelf and triggering menu dismissal on scroll.
+		const peerOrder = unstar ? mixed : both;
+		await page.evaluate(([key, ids]) => localStorage.setItem(key, JSON.stringify(ids)), [KEY, peerOrder] as const);
 		await release();
-		await expectIds(page, [...rebased, 'arr-a']);
-		await action.click();
+		const rebased = [...peerOrder].reverse();
+		await expectIds(page, rebased);
+		await action.press('Enter');
 		await page.evaluate((key) => navigator.locks.request(key, () => {}), KEY);
-		const expected = unstar ? ['arr-a'] : [...both, 'arr-a'];
+		const expected = unstar ? ['arr-a'] : rebased;
 		expect(await stored(page)).toEqual(expected);
 		await expectIds(page, expected);
 	});
