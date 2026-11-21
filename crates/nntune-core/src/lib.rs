@@ -64,6 +64,8 @@ mod flac_preamble;
 #[allow(dead_code)] // Not mounted until full frame validation is available.
 mod flac_predictor;
 #[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_prepare;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
 mod flac_residual;
 #[allow(dead_code)] // Not mounted until full frame validation is available.
 mod flac_subframe;
