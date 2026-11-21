@@ -41,8 +41,8 @@ import { expect, test, type ElementHandle, type Page, type TestInfo } from '@pla
  *   audio node itself (no reload/remount), queue order and current
  *   identity, `playbackRate` and `volume` are preserved; `play()`,
  *   `pause()` and `load()` are never called by the gesture; no track
- *   advance and no completion/ended accounting. NO global keyboard
- *   shortcut is added (the demo `0` binding does not exist here).
+ *   advance and no completion/ended accounting. The app shortcut suite
+ *   covers the approved `0` binding; unrelated keys must not restart.
  * - An explicit restart SUPERSEDES any pending/remembered inbound-share
  *   seek for that source: later loadedmetadata/durationchange/canplay
  *   events for the same source must not move the position away from 0.
@@ -907,7 +907,7 @@ test('LIBRESTART-LR13 auth teardown clears restart and pending state; the next a
 	});
 });
 
-test('LIBRESTART-LR14 no global shortcut restarts the library track', async ({ page }, info) => {
+test('LIBRESTART-LR14 unrelated shortcuts do not restart the library track', async ({ page }, info) => {
 	await openLibrary(page);
 	await mountCoral(page);
 	await mockMedia(page, { time: 30, duration: 120 });
@@ -918,7 +918,7 @@ test('LIBRESTART-LR14 no global shortcut restarts the library track', async ({ p
 	await page.evaluate(() => {
 		if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
 	});
-	for (const key of ['0', 'r', 'R']) await page.keyboard.press(key);
+	for (const key of ['r', 'R']) await page.keyboard.press(key);
 	await settle(page);
 
 	await check(info, {

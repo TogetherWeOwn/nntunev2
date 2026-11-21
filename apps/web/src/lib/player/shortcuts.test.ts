@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	actionForKey,
+	actionForShortcutEvent,
 	isModalOpen,
 	isTypingTarget,
 	SEEK_SECONDS,
@@ -33,6 +34,26 @@ describe('actionForKey', () => {
 		expect(actionForKey('ArrowRight')).toBeNull();
 		expect(actionForKey('Enter')).toBeNull();
 		expect(actionForKey('F1')).toBeNull();
+	});
+});
+
+describe('actionForShortcutEvent', () => {
+	const scope = (modal: boolean): ModalScope => ({ querySelector: () => modal, querySelectorAll: () => [] });
+	const keydown = (key: string, overrides: object = {}) => ({ key, ...overrides }) as KeyboardEvent;
+
+	it.each([
+		{ defaultPrevented: true }, { ctrlKey: true }, { metaKey: true },
+		{ altKey: true }, { isComposing: true }, { keyCode: 229 }
+	])('leaves owned chords to their original handler: %o', (flags) => {
+		expect(actionForShortcutEvent(keydown('k', flags), scope(false))).toBeNull();
+		expect(actionForShortcutEvent(keydown('Escape', flags), scope(true))).toBeNull();
+	});
+
+	it('allows shifted help but leaves editing and other modals alone', () => {
+		expect(actionForShortcutEvent(keydown('?', { shiftKey: true }), scope(false))).toBe('open-shortcuts');
+		expect(actionForShortcutEvent(keydown('0', { target: { tagName: 'SELECT' } }), scope(false))).toBeNull();
+		expect(actionForShortcutEvent(keydown('j'), scope(true))).toBeNull();
+		expect(actionForShortcutEvent(keydown('Escape'), scope(true))).toBe('close-shortcuts');
 	});
 });
 

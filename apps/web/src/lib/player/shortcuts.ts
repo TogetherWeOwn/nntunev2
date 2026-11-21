@@ -1,10 +1,6 @@
 /**
- * Global transport keyboard shortcuts for the demo player.
- *
- * Pure key/guard helpers only — no DOM globals, no listeners — so unit
- * tests can pin the map with plain fakes. The page owns the listener and
- * the transport calls. Guards are structural (tag names, rect counts) on
- * purpose: real DOM nodes satisfy them and so do test doubles.
+ * Shared transport shortcut map and guards. Each player owns its listener
+ * and binds only the actions its transport supports.
  */
 
 export type ShortcutAction =
@@ -87,6 +83,16 @@ export function isModalOpen(scope: ModalScope): boolean {
 		if (isRendered(dialogs[index])) return true;
 	}
 	return false;
+}
+
+export function actionForShortcutEvent(event: KeyboardEvent, scope: ModalScope): ShortcutAction | null {
+	if (event.metaKey || event.ctrlKey || event.altKey) return null;
+	// Prior ownership and IME keys (including the legacy 229 signal) win.
+	if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return null;
+	const action = actionForKey(event.key);
+	// The caller can close its own dialog, but must leave other dialogs alone.
+	if (!action || action === 'close-shortcuts') return action;
+	return isTypingTarget(event.target) || isModalOpen(scope) ? null : action;
 }
 
 export type ShortcutRow = { key: string; label: string };

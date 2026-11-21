@@ -6,6 +6,8 @@
 	import { resolveStreamUrl } from '../library/stream-url.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
+	import ShortcutHelp from './ShortcutHelp.svelte';
+	import { appShortcutActions, handleAppShortcut } from './appShortcuts.js';
 	import { createPlayerController } from './controller.svelte.js';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
 	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & { claimShareEntry?: () => boolean }>();
@@ -19,6 +21,10 @@
 	const attachNativeAudio = media.attach;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	let shortcutHelp = $state.raw<ReturnType<typeof ShortcutHelp>>();
+	function onShortcutKeydown(event: KeyboardEvent) {
+		if (streamUrl) handleAppShortcut(event, media, shortcutHelp);
+	}
 	$effect.pre(() => { if (signedOut) untrack(player.purgeAtAuthBoundary); });
 	// Retire the decoder before the mounted Library handles the same signal.
 	$effect.pre(() => {
@@ -35,11 +41,13 @@
 		return () => { clearMiniPlayerHint(); player.destroy(); };
 	});
 </script>
+<svelte:window onkeydown={onShortcutKeydown} />
 {@render children()}
 {#if streamUrl}
 	<div class="nt-wrap">
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
+		<ShortcutHelp bind:this={shortcutHelp} actions={appShortcutActions} buttonClass="nt-button nt-button--ghost" />
 	</div>
 {/if}
