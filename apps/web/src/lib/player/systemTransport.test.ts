@@ -218,8 +218,8 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	['interior rounded up', 60, false, 0], ['interior natural end', 59.999, true, 0],
 	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
 ] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?) => {
-	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot, positionState = vi.mocked(session.setPositionState)!.mockClear();
-	await media.playCurrent();
+	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot, positionState = vi.mocked(session.setPositionState)!;
+	await media.playCurrent(); audio.emit('playing'); positionState.mockClear();
 	for (const [action, details, target] of [
 		['seekforward', {}, 30], ['seekbackward', { seekOffset: 2.5 }, 27.5], ['seekforward', { seekOffset: 100 }, 60],
 		['seekbackward', { seekOffset: 100 }, 0], ['seekto', { seekTime: 100 }, 60],
@@ -230,7 +230,7 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 		if (action === 'seekto') expect(get(media.absoluteSeek).position).toBe(target);
 	}
 	for (const unused of [audio.pause, audio.fastSeek, positionState]) expect(unused).not.toHaveBeenCalled();
-	audio.emit('seeked', 'playing');
+	audio.emit('seeked');
 	expect(positionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
 	const ignored = scenario.endsWith('ignored'), unchanged = ignored || scenario.endsWith('unchanged'), endpoint = unchanged ? 60.035 : 60;
 	const forward = scenario === 'seekforward' || scenario.startsWith('forward'), rounded = scenario === 'interior rounded up';
