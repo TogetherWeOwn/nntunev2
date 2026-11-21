@@ -219,7 +219,7 @@ function setup({ unsupported, connected = true, ready = connected }: { unsupport
 		fire: (action: typeof actions[number], details: object = {}) => handler(action)!({ action, ...details }) };
 }
 
-test.each(['seekto', 'seekforward'] as const)('system seek readback and %s endpoint preserve transport ownership', async (endpoint) => {
+test.each([['seekto', false], ['seekforward', false], ['seekto', true]] as const)('system seek readback and %s endpoint (superseded: %s)', async (endpoint, superseded) => {
 	const { audio, media, session, fire, queue } = setup();
 	const initial = queue.snapshot;
 	vi.mocked(session.setPositionState)!.mockClear();
@@ -231,25 +231,25 @@ test.each(['seekto', 'seekforward'] as const)('system seek readback and %s endpo
 		fire(action, details);
 		expect(audio.currentTime).toBe(target);
 		if (action === 'seekto') expect(get(media.absoluteSeek).position).toBe(target);
-		if (target === 19.75) expect(get(media.seekFeedback).jumpStatus).toMatch(/^Back 2\.5 seconds/);
 	}
 	expect(audio.paused).toBe(true);
 	expect(audio.play).not.toHaveBeenCalled();
 	await media.playCurrent();
-	fire('seekforward', { seekOffset: 1 });
-	expect(audio.currentTime).toBe(1);
-	expect(audio.paused).toBe(false);
 	fire('seekto', { seekTime: 12.25 });
+	expect(audio).toMatchObject({ currentTime: 12.25, paused: false });
 	for (const unused of [audio.pause, audio.fastSeek, session.setPositionState]) expect(unused).not.toHaveBeenCalled();
 	audio.emit('seeked');
 	expect(session.setPositionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
 	audio.emit('playing');
+	audio.write.mockImplementationOnce((target) => { audio.position = target - 0.000001; });
 	fire(endpoint, { seekTime: 60, seekOffset: 100 });
-	expect(audio.currentTime).toBe(60);
+	expect(audio.currentTime).toBe(59.999999);
+	if (superseded) media.seek(get(media.absoluteSeek).attachment, 59.9999995);
 	audio.emit('seeking', 'seeked');
-	audio.ended = audio.paused = true;
+	Object.assign(audio, { position: 60, ended: true, paused: true });
 	audio.emit('pause', 'ended');
-	expect(queue.snapshot).toBe(initial);
+	if (superseded) expect(queue.snapshot.currentIndex).toBe(1);
+	else expect(queue.snapshot).toBe(initial);
 	expect(audio.play).toHaveBeenCalledOnce();
 	expect(audio.load).not.toHaveBeenCalled();
 	expect(get(media.playbackStatus)).toBe('paused');

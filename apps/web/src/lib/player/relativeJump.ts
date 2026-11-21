@@ -36,13 +36,11 @@ function seekableCovers(ranges: TimeRanges, target: number): boolean {
  */
 export function jumpMedia(
 	media: JumpMedia, direction: JumpDirection, matches: () => boolean = () => true, assigned?: () => void,
-	seconds = RELATIVE_JUMP_SECONDS, onSystemUnavailable?: () => void,
-	assign = (target: number, _duration: number) => { media.currentTime = target; }
+	seconds = RELATIVE_JUMP_SECONDS, onSystemUnavailable?: () => void, landed?: (target: number, duration: number, readback: number) => void
 ): JumpOutcome {
 	let duration: number, position: number, target: number, raw: number;
 	try {
-		duration = media.duration;
-		position = media.currentTime;
+		({ duration, currentTime: position } = media);
 		if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(position) || (onSystemUnavailable && 'error' in media && media.error)) {
 			onSystemUnavailable?.();
 			return { kind: 'unavailable' };
@@ -53,7 +51,9 @@ export function jumpMedia(
 		const slack = onSystemUnavailable ? 0 : TOLERANCE;
 		const atEdge = back ? position <= slack : position >= duration - slack;
 		if (onSystemUnavailable && !seekable(media, duration, atEdge ? undefined : target, onSystemUnavailable)) return { kind: 'unavailable' };
-		if (atEdge) return { kind: 'boundary', edge: back ? 'start' : 'end' };
+		if (atEdge) {
+			return { kind: 'boundary', edge: back ? 'start' : 'end' };
+		}
 		if (onSystemUnavailable && target === position) return { kind: 'refused' };
 		if (!onSystemUnavailable && !seekableCovers(media.seekable, target)) return { kind: 'unavailable' };
 	} catch {
@@ -62,15 +62,15 @@ export function jumpMedia(
 	}
 	try {
 		if (!matches()) return { kind: 'unavailable' };
-		assign(target, duration);
+		media.currentTime = target;
 		assigned?.();
-		if (!matches()) return { kind: 'unavailable' };
+		if (!landed && !matches()) return { kind: 'unavailable' };
 		const readback = media.currentTime;
-		// For small system jumps, scale readback slack to the clamped displacement.
 		const tolerance = onSystemUnavailable ? Math.min(TOLERANCE, Math.abs(target - position) / 2) : TOLERANCE;
 		if (!Number.isFinite(readback) || Math.abs(readback - target) > tolerance) {
 			return { kind: 'refused' };
 		}
+		if (readback !== position) landed?.(target, duration, readback);
 	} catch {
 		return { kind: 'refused' };
 	}

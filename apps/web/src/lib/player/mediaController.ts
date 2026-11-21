@@ -14,7 +14,7 @@ import type { SystemSeekGuard } from './systemSeek.js';
 import { bindSystemTransport } from './systemTransport.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
-export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: false | 'native' | 'system' };
+export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | number };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error' | 'retrying';
 
 type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
@@ -388,13 +388,11 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		return () => retryShare(current?.audio, revision);
 	}
 
-	function seekWriter(attachment: MediaAttachment, system?: SystemSeekGuard) {
-		return (target: number, duration: number) => {
-			const { audio } = attachment;
-			audio.currentTime = target;
-			// Attribute the write independently of ownership of subsequent feedback.
-			if (system && target === duration) attachment.soughtToEnd = audio.currentTime >= duration && 'system';
-			else if (attachment.soughtToEnd === 'system' && audio.currentTime < duration) attachment.soughtToEnd = false;
+	function onSeekLanded(attachment: MediaAttachment, system?: SystemSeekGuard) {
+		if (!system && typeof attachment.soughtToEnd !== 'number') return;
+		// Keep the accepted endpoint readback, not the unrounded request.
+		return (target: number, duration: number, readback: number) => {
+			attachment.soughtToEnd = system && target === duration ? Math.min(readback, duration) : false;
 		};
 	}
 
@@ -416,7 +414,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			const matches = (guard = system?.active) => !!audio && !!source && matchesSource(audio, source, () => isCurrent(guard));
 			const outcome = attachment && audio && matches() ? jumpMedia(audio, direction, matches, () => {
 				if (current === attachment) clearJumpFeedback();
-			}, seconds, system?.unavailable, seekWriter(attachment, system)) : undefined;
+			}, seconds, system?.unavailable, onSeekLanded(attachment, system)) : undefined;
 			if (outcome ? !matches(system?.canReport) : !isCurrent()) return;
 			if (outcome?.kind === 'jumped') lastJumpTarget = outcome.target;
 			seekFeedback.update((feedback) => ({
@@ -460,7 +458,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const isCurrent = (guard = system?.active) => matches(() => positionIntent === intent && sameSelection() && guard?.() !== false);
 		runPosition(() => {
 			if (!isCurrent()) return;
-			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent, system?.unavailable, seekWriter(target.attachment, system));
+			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent, system?.unavailable, onSeekLanded(target.attachment, system));
 			const canReport = () => isCurrent(system?.canReport);
 			if (canReport()) observeAbsoluteSeek(audio, canReport, feedback, replay, false, system?.unavailable);
 		});
@@ -533,7 +531,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!audio.ended || audio.error !== null || !attachment.playing || !ownsOrigin()) return;
 		const { soughtToEnd } = attachment;
 		attachment.playing = attachment.soughtToEnd = false;
-		if (soughtToEnd === 'system') return;
+		if (typeof soughtToEnd === 'number') return;
 		generation = ++endGeneration;
 		announce('');
 		if (!ownsOrigin()) return;
@@ -675,7 +673,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 						case 'seeking': {
 							const { currentTime, duration } = audio;
 							if (!matches(intent)) return;
-							receipt.soughtToEnd = Number.isFinite(duration) && duration > 0 && currentTime >= duration && (receipt.soughtToEnd || 'native');
+							if (!(typeof receipt.soughtToEnd === 'number' && currentTime >= receipt.soughtToEnd))
+								receipt.soughtToEnd = Number.isFinite(duration) && duration > 0 && currentTime >= duration;
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
 							return observeSeeking(audio, () => matches(intent));
 						}

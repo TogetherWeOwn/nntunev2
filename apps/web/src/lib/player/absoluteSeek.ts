@@ -29,8 +29,7 @@ export function readAbsoluteSeek(media: SeekMedia): typeof emptyObservation {
 	}
 }
 
-export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: () => boolean, unavailable?: () => void,
-	assign = (target: number, _duration: number) => { media.currentTime = target; }): string {
+export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: () => boolean, unavailable?: () => void, landed?: (target: number, duration: number, readback: number) => void): string {
 	let validating = true;
 	try {
 		const { duration, currentTime, error } = media;
@@ -42,10 +41,12 @@ export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: ()
 		if (!seekable(media, duration, target, unavailable)) return 'That position is not seekable yet.';
 		validating = false;
 		if (!matches() || target === currentTime) return '';
-		assign(target, duration);
-		if (!matches()) return '';
+		media.currentTime = target;
+		if (!landed && !matches()) return '';
 		const observed = media.currentTime;
-		if (Number.isFinite(observed) && Math.abs(observed - target) <= 0.05) return '';
+		const accepted = Number.isFinite(observed) && Math.abs(observed - target) <= 0.05;
+		if (accepted && observed !== currentTime) landed?.(target, duration, observed);
+		if (accepted) return '';
 	} catch {
 		if (validating) unavailable?.();
 	}
