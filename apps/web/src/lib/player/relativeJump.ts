@@ -30,22 +30,23 @@ function seekableCovers(ranges: TimeRanges, target: number): boolean {
  * without a finite positive duration, a finite position, or a native
  * seekable range covering the target is unavailable and left untouched (a
  * source served without range support reports only [0, 0]). Success needs
- * readback at the target. Never plays or loads, so paused/playing intent is
- * unchanged.
+ * readback near the target and movement in the requested direction. Never
+ * plays or loads, so paused/playing intent is unchanged.
  */
 export function jumpMedia(
 	media: JumpMedia, direction: JumpDirection, matches: () => boolean = () => true, assigned?: () => void,
 	seconds = RELATIVE_JUMP_SECONDS
 ): JumpOutcome {
+	const back = direction === 'back';
+	let position: number;
 	let target: number;
 	let raw: number;
 	try {
 		const duration = media.duration;
-		const position = media.currentTime;
+		position = media.currentTime;
 		if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(position)) {
 			return { kind: 'unavailable' };
 		}
-		const back = direction === 'back';
 		if (back ? position <= TOLERANCE : position >= duration - TOLERANCE) {
 			return { kind: 'boundary', edge: back ? 'start' : 'end' };
 		}
@@ -61,7 +62,8 @@ export function jumpMedia(
 		assigned?.();
 		if (!matches()) return { kind: 'unavailable' };
 		const readback = media.currentTime;
-		if (!Number.isFinite(readback) || Math.abs(readback - target) > TOLERANCE) {
+		const moved = back ? readback < position : readback > position;
+		if (!moved || !Number.isFinite(readback) || Math.abs(readback - target) > TOLERANCE) {
 			return { kind: 'refused' };
 		}
 	} catch {

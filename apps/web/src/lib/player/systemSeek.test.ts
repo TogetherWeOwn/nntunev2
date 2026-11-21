@@ -96,6 +96,27 @@ test('system seeks use owner readback, clamping and feedback without starting or
 	media.destroy();
 });
 
+test.each([['seekforward', 20.01, 'Forward'], ['seekbackward', 19.99, 'Back']] as const)(
+	'%s requires movement even when a fractional target is within readback tolerance', (action, target, word) => {
+		const { audio, media, fire } = setup();
+		audio.setReady();
+		let position = 20;
+		const write = vi.fn<(seconds: number) => void>();
+		Object.defineProperty(audio, 'currentTime', { get: () => position, set: write });
+
+		fire(action, { seekOffset: 0.01 });
+		expect(write).toHaveBeenCalledWith(target);
+		expect(audio.currentTime).toBe(20);
+		expect(get(media.seekFeedback).jumpStatus).toBe('The player did not accept that jump.');
+
+		write.mockImplementation((seconds) => { position = seconds; });
+		fire(action, { seekOffset: 0.01 });
+		expect(audio.currentTime).toBe(target);
+		expect(get(media.seekFeedback).jumpStatus).toContain(`${word} 0.01 seconds`);
+		media.destroy();
+	}
+);
+
 test('malformed details leave the native position and feedback unchanged', () => {
 	const { audio, media, fire } = setup();
 	audio.setReady();
