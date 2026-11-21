@@ -106,9 +106,12 @@ cannot clear it by returning later.
 
 The separate build-health helper prepares one credential-free HTTP/1.1 staging
 `/healthz` probe, without redirects or retries. An offline preflight requires
-curl and libcurl 8.4 or later for the streaming response-size cap. The helper
-requires a 200 with unambiguous uncached response headers, `ok: true`, and the
-expected build SHA. It records probe start and bounds preflight, transfer, and
+curl and libcurl 8.4 or later for the streaming response-size cap. The request
+uses a fresh random query value and asks caches not to reuse or store the
+response. The helper requires a 200, exactly one `Cache-Control: no-store`, no
+`Age`, `ok: true`, and the expected build SHA. A direct Worker response need
+not carry `CF-Cache-Status`; if present, it must be a single `DYNAMIC` or
+`BYPASS` value. It records probe start and bounds preflight, transfer, and
 validation by the caller deadline and three-second freshness limit. Build SHA
 is not a Cloudflare version or deployment ID: redeploying the same build can
 change bindings, so this sample alone cannot satisfy the serving-version fence.

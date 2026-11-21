@@ -56,6 +56,17 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(set(kwargs["env"]), {"PATH", "LC_ALL"})
         self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
 
+    def test_direct_worker_response_does_not_need_edge_cache_status(self):
+        # The API Worker renders no-store, but does not add CF-Cache-Status.
+        footer = (
+            b'\x1e200\x1e{"content-type":["application/json; charset=utf-8"],'
+            b'"cache-control":["no-store"]}'
+        )
+        observed = sample(
+            SHA, deadline_ms=2_000, run=curl(BODY + footer), monotonic=lambda: 1
+        )
+        self.assertEqual((observed.observed_ms, observed.build_sha), (1_000, SHA))
+
     def test_status_and_cache_fail_closed(self):
         for footer, reason in (
             (FOOTER.replace(b"200", b"302"), "status"),
@@ -67,7 +78,9 @@ class HealthTests(unittest.TestCase):
                 FOOTER.replace(b'"no-store"', b'"no-store","max-age=60"'),
                 "cache-unverified",
             ),
+            (FOOTER.replace(b'"DYNAMIC"', b'""'), "cache-unverified"),
             (FOOTER.replace(b'"DYNAMIC"', b""), "cache-unverified"),
+            (b"\x1e200\x1e{}", "cache-unverified"),
             (FOOTER.replace(b"no-store", b"max-age=60"), "cache-unverified"),
             (FOOTER[:-1] + b',"cf-cache-status":["HIT"]}', "cache-unverified"),
             (FOOTER[:-1], "cache-unverified"),

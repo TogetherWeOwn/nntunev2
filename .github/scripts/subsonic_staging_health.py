@@ -54,8 +54,13 @@ def _validate(response, expected_sha):
         and len(cache_control) == 1
         and isinstance(cache_control[0], str)
         and cache_control[0].lower() == "no-store"
-        and headers.get("cf-cache-status") in (["DYNAMIC"], ["BYPASS"])
         and "age" not in headers
+        # The direct Worker response supplies no-store, not a CF cache status.
+        # If the edge adds a status, it must corroborate the Worker policy.
+        and (
+            "cf-cache-status" not in headers
+            or headers["cf-cache-status"] in (["DYNAMIC"], ["BYPASS"])
+        )
     ):
         raise UnsafeHealth("cache-unverified")
     try:
