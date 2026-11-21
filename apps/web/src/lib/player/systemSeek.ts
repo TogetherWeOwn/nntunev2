@@ -7,10 +7,9 @@ export type SystemSeekGuard = { active: () => boolean; canReport: () => boolean;
 export type SystemSeekOwner = {
 	audio: HTMLAudioElement; attachment: number; availability: Writable<AbsoluteSeekState>;
 	matches: () => boolean; positionIntent: () => number;
-	dispatch: (action: 'seekto' | 'seekforward' | 'seekbackward', seconds: number, guard: SystemSeekGuard) => void;
+	dispatch: (action: MediaSessionSeekDetails['action'], seconds: number, guard: SystemSeekGuard) => void;
 };
 
-/** Advertise only observed seekability, and recheck it before accepting a system gesture. */
 export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner, signal: AbortSignal) {
 	const eligible = derived(owner.availability, (state) => state.attachment === owner.attachment && state.enabled);
 	let handlers: Pick<MediaSessionHandlers, 'onSeekTo' | 'onSeekForward' | 'onSeekBackward'> | undefined;
@@ -19,7 +18,6 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 		if (signal.aborted || enabled === !!handlers) return;
 		if (!enabled) handlers = undefined;
 		else {
-			// The OS can retain callbacks across unregistration and attachment teardown.
 			const active = () => !signal.aborted && handlers === registration;
 			const retire = () => {
 				if (!active() || !owner.matches() || !active()) return false;
@@ -37,8 +35,7 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 				if (!owner.matches() || !active() || owner.positionIntent() !== intent) return;
 				if (!readAbsoluteSeek(owner.audio).enabled) { retire(); return; }
 				if (!owner.matches() || !active() || owner.positionIntent() !== intent) return;
-				// Loss retires the registration, but this attempt may still report it.
-				let retired = false;
+				let retired = false; // Loss retires the registration, but this attempt may still report it.
 				owner.dispatch(name, seconds, { active, canReport: () => retired || active(), unavailable: () => { retired ||= retire(); } });
 			};
 			const registration = { onSeekTo: action('seekto'), onSeekForward: action('seekforward'), onSeekBackward: action('seekbackward') };

@@ -41,13 +41,15 @@ export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: ()
 		const target = Math.min(duration, Math.max(0, seconds));
 		if (!seekable(media, duration, target, unavailable)) return 'That position is not seekable yet.';
 		validating = false;
+		const canStartEndpointSeek = landed && target === duration && !media.seeking;
 		if (!matches() || target === currentTime) return '';
 		media.currentTime = target;
 		if (!landed && !matches()) return '';
 		const observed = media.currentTime;
-		const accepted = Number.isFinite(observed) && Math.abs(observed - target) <= SEEK_READBACK_TOLERANCE;
-		if (accepted && observed !== currentTime) landed?.(target, duration);
-		if (accepted) return '';
+		if (Number.isFinite(observed) && Math.abs(observed - target) <= SEEK_READBACK_TOLERANCE) {
+			if (observed !== currentTime || (canStartEndpointSeek && media.seeking)) landed?.(target, duration);
+			return '';
+		}
 	} catch { if (validating) unavailable?.(); }
 	return 'The player did not accept that seek.';
 }

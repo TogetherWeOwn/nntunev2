@@ -205,10 +205,7 @@ test.each(['nexttrack', 'previoustrack'] as const)('unsupported %s leaves the ot
 function setup({ unsupported, connected = true, ranges }: { unsupported?: string; connected?: boolean; ranges?: Decoder['ranges'] } = {}) {
 	const { session, handler } = stubSession(unsupported);
 	const queue = createQueueController(createQueue([coral, moss]));
-	const commit = (next: typeof queue.snapshot) => {
-		queue.publish(next, queue.begin(next, 'replace'));
-		return queue.snapshot === next;
-	};
+	const commit = (next: typeof queue.snapshot) => { queue.publish(next, queue.begin(next, 'replace')); return queue.snapshot === next; };
 	const media = createMediaController(queue, { commit, flush: async () => {}, browseCopy: { invalidate() {} }, announce() {} }, () => true);
 	const audio = Object.assign(new Decoder(coral.streamUrl), { isConnected: connected });
 	const detach = media.attach(audio.element);
@@ -218,10 +215,11 @@ function setup({ unsupported, connected = true, ranges }: { unsupported?: string
 		fire: (action: typeof actions[number], details: object = {}) => handler(action)!({ action, ...details }) };
 }
 
-test.each(['seekto', 'seekforward', 'compact', 'extended', 'old end'])('system seek readback and endpoint (%s)', async (scenario) => {
-	const { audio, media, session, fire, queue } = setup();
-	const initial = queue.snapshot;
-	vi.mocked(session.setPositionState)!.mockClear();
+test.each([['seekto', 60, false], ['seekforward', 60, false], ['compact', 60, true], ['extended', 75, true],
+	['old end', 60, false], ['rounded old end', 60.001, false], ['unchanged', 60, false], ['ignored', 60.035, true]
+] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances) => {
+	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot;
+	const positionState = vi.mocked(session.setPositionState)!.mockClear();
 	for (const [action, details, target] of [
 		['seekto', { seekTime: 12.25, fastSeek: true }, 12.25], ['seekforward', {}, 22.25],
 		['seekbackward', { seekOffset: 2.5 }, 19.75], ['seekforward', { seekOffset: 100 }, 60],
@@ -237,21 +235,25 @@ test.each(['seekto', 'seekforward', 'compact', 'extended', 'old end'])('system s
 	fire('seekforward');
 	expect(audio).toMatchObject({ currentTime: 10, paused: false });
 	fire('seekto', { seekTime: 12.25 });
-	for (const unused of [audio.pause, audio.fastSeek, session.setPositionState]) expect(unused).not.toHaveBeenCalled();
+	for (const unused of [audio.pause, audio.fastSeek, positionState]) expect(unused).not.toHaveBeenCalled();
 	audio.emit('seeked');
-	expect(session.setPositionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
+	expect(positionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
 	audio.emit('playing');
-	audio.write.mockImplementationOnce((target) => { audio.position = target - 0.000001; });
-	fire(scenario === 'seekforward' ? 'seekforward' : 'seekto', { seekTime: 60, seekOffset: 100 });
-	expect(audio.currentTime).toBe(59.999999);
+	const unchanged = scenario === 'unchanged' || scenario === 'ignored', endpoint = unchanged ? 60.035 : 60;
+	if (unchanged) Object.assign(audio, { duration: endpoint, ranges: [[0, endpoint]], position: 60 });
+	audio.write.mockImplementationOnce((target) => {
+		if (scenario !== 'ignored') Object.assign(audio, { position: unchanged ? 60 : target - 0.000001, seeking: true });
+	});
+	fire(scenario === 'seekforward' ? 'seekforward' : 'seekto', { seekTime: endpoint, seekOffset: 100 });
+	expect(audio.write).toHaveBeenLastCalledWith(endpoint);
+	expect(audio.currentTime).toBe(unchanged ? 60 : 59.999999);
 	if (scenario === 'compact') media.seek(get(media.absoluteSeek).attachment, 59.9999995);
 	else if (scenario === 'seekto' || scenario === 'seekforward') audio.position = 59.999998;
-	audio.emit('seeking', 'seeked');
-	audio.duration = scenario === 'extended' || scenario === 'old end' ? 75 : 60;
-	if (audio.duration === 75) audio.emit('durationchange');
-	Object.assign(audio, { position: scenario === 'extended' ? 75 : 60, ended: true, paused: true });
+	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('seeked'); }
+	if (scenario === 'extended' || scenario.endsWith('old end')) { audio.duration = 75; audio.emit('durationchange'); }
+	Object.assign(audio, { position, ended: true, paused: true });
 	audio.emit('pause', 'ended');
-	if (scenario === 'extended' || scenario === 'compact') expect(queue.snapshot.currentIndex).toBe(1);
+	if (advances) expect(queue.snapshot.currentIndex).toBe(1);
 	else expect(queue.snapshot).toBe(initial);
 	expect(audio.play).toHaveBeenCalledOnce();
 	expect(audio.load).not.toHaveBeenCalled();
@@ -302,8 +304,7 @@ test.each([
 	const { audio, media, handler, fire } = setup();
 	fire('seekforward', { seekOffset: 1 }); // Seed a prior success message.
 	audio.position = 20;
-	const retired = actions.map((action) => handler(action)!);
-	const ranges = audio.seekable;
+	const retired = actions.map((action) => handler(action)!), ranges = audio.seekable;
 	let reads = 0;
 	const seekable = vi.spyOn(audio, 'seekable', 'get').mockImplementation(() => {
 		const read = reads++;

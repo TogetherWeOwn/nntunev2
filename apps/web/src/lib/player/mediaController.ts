@@ -527,17 +527,21 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const base = queue.snapshot;
 		if (!audio.ended || audio.error !== null || !attachment.playing || !ownsOrigin()) return;
 		const { soughtToEnd } = attachment;
-		// A duration revision alone does not make an old endpoint event natural.
-		const systemEnd = typeof soughtToEnd === 'number' && !(audio.duration > soughtToEnd && audio.currentTime > soughtToEnd);
-		if (!ownsOrigin()) return;
+		if (typeof soughtToEnd === 'number') {
+			const { duration, currentTime } = audio, slack = SEEK_READBACK_TOLERANCE;
+			if (!ownsOrigin()) return;
+			attachment.soughtToEnd = false;
+			// Require the new end, not just rounding above the originally sought end.
+			if (!(duration > soughtToEnd && currentTime >= duration - slack && currentTime > soughtToEnd + slack)) { attachment.playing = false; return; }
+		}
+		const natural = !attachment.soughtToEnd;
 		attachment.playing = attachment.soughtToEnd = false;
-		if (systemEnd) return;
 		generation = ++endGeneration;
 		announce('');
 		if (!ownsOrigin()) return;
 		const result = naturalEndPolicy(base, {
 			repeat: get(repeat), radioActive: false, continueRadio: false,
-			sleepComplete: sleepTimer.observeEnd(soughtToEnd !== true), playing: true, validEnd: true
+			sleepComplete: sleepTimer.observeEnd(natural), playing: true, validEnd: true
 		});
 		if (result.action !== 'play' || !ownsOrigin()) return;
 		const track = currentTrack(result.queue);
