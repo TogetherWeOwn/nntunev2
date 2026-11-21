@@ -3,6 +3,7 @@ import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const workflow = readFileSync(new URL('../../.github/workflows/deploy.yml', import.meta.url), 'utf8');
 // Scoped to the staging-api job only: the staging-mb and staging-ingest lanes
@@ -283,4 +284,27 @@ prod = "dummy-mb-mirror"
     expect(result.toml).toBeUndefined();
     expect(result.summary).not.toContain('mirror:');
   });
+});
+
+test('only an unconfigured API omits the empty-history smoke from discovery', () => {
+  const e2eDir = fileURLToPath(new URL('../', import.meta.url));
+  const cli = join(e2eDir, 'node_modules', '@playwright', 'test', 'cli.js');
+  const smoke = 'empty-history privacy-route smoke: export, reject, clear, export again';
+  for (const outcome of ['unconfigured', 'deployed', undefined]) {
+    // Discovery only: clean environment, no browser, credentials or staging calls.
+    const result = spawnSync(process.execPath, [
+      cli, 'test', '--list', '--config=playwright.config.ts',
+      'tests/listen-history-privacy.spec.ts', 'tests/zz-build-identity-final.spec.ts',
+    ], {
+      cwd: e2eDir,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: outcome === undefined ? {} : { API_DEPLOY_OUTCOME: outcome },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(result.stdout).toContain('deployed build still matches the promotion SHA at journey end');
+    expect(result.stdout.includes(smoke), `registration with API outcome ${outcome ?? '(unset)'}`)
+      .toBe(outcome !== 'unconfigured');
+  }
 });
