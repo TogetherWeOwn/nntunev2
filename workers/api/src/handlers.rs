@@ -10818,16 +10818,13 @@ mod tests {
                     };
                     validate_terminal_provenance(outcome, &target).map_err(|_| StoreError)?;
                 }
-                if occupied {
-                    if live(&outcome.row.status) {
-                        // Suppression is for proven existing targets, never new live inserts.
-                        if stored.is_none() || !has_slot_suppression_proof(outcome) {
-                            return Err(StoreError);
-                        }
-                    } else {
-                        let merged = merge_billing_row(stored, outcome);
-                        shadow.insert(key, merged);
+                if occupied && live(&outcome.row.status) {
+                    // Suppression is for proven existing targets, never new live inserts.
+                    if stored.is_none() || !has_slot_suppression_proof(outcome) {
+                        return Err(StoreError);
                     }
+                } else if occupied {
+                    shadow.insert(key, merge_billing_row(stored, outcome));
                 } else {
                     let merged = merge_billing_row(stored, outcome);
                     if let Some(existing) = current.filter(|row| &row.stripe_subscription_id != sub)
@@ -13883,6 +13880,9 @@ mod tests {
                 Some("in_new"),
                 Some(20),
             );
+            if matches!(case, "read-plan" | "read-anchor") {
+                incoming.row.status = "active".into();
+            }
             incoming.row.stripe_customer_id = "cus_new".into();
             incoming.row.stripe_item_id = "si_new".into();
             incoming.row.stripe_price_id = "price_new".into();
