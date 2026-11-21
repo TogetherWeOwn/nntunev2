@@ -100,10 +100,12 @@ export function createPlayerController(
 			media.clearSeekFeedback();
 			if (!isCurrent()) return false;
 		}
-		if (trackChanged || resolveStreamUrl(before) !== resolveStreamUrl(after)) {
+		const nextSource = resolveStreamUrl(after);
+		if (trackChanged || resolveStreamUrl(before) !== nextSource) {
 			version += 1;
 			retireNativeHost();
 			if (!isCurrent()) return false;
+			if (!nextSource) media.sleepTimer.cancel();
 		}
 		if (kind === 'replace') announceQueue('');
 		if (!isCurrent()) return false;

@@ -6,6 +6,7 @@
 	import { resolveStreamUrl } from '../library/stream-url.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
+	import SleepTimerControls from './SleepTimerControls.svelte';
 	import { createPlayerController } from './controller.svelte.js';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
 	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & { claimShareEntry?: () => boolean }>();
@@ -19,6 +20,7 @@
 	const attachNativeAudio = media.attach;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	const sleepTimer = media.sleepTimer;
 	$effect.pre(() => { if (signedOut) untrack(player.purgeAtAuthBoundary); });
 	// Retire the decoder before the mounted Library handles the same signal.
 	$effect.pre(() => {
@@ -32,7 +34,13 @@
 	// Library's pre-effect disposes route state before player teardown.
 	onMount(() => {
 		media.restoreRepeat(browserStorage('local'));
-		return () => { clearMiniPlayerHint(); player.destroy(); };
+		const tickOnVisible = () => { if (document.visibilityState === 'visible') sleepTimer.tick(); };
+		document.addEventListener('visibilitychange', tickOnVisible);
+		return () => {
+			document.removeEventListener('visibilitychange', tickOnVisible);
+			clearMiniPlayerHint();
+			player.destroy();
+		};
 	});
 </script>
 {@render children()}
@@ -41,5 +49,8 @@
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
+		<section aria-label="Sleep timer">
+			<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
+		</section>
 	</div>
 {/if}

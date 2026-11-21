@@ -1,6 +1,7 @@
 import { get, writable } from 'svelte/store';
 import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
+import { createPlayerSleepTimer } from './playerSleepTimer.js';
 import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
@@ -64,6 +65,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	const selectedSource = () => resolveStreamUrl(currentTrack(queue.snapshot));
+	const sleepTimer = createPlayerSleepTimer(pauseCurrent, () => !destroyed && !queue.purging && !!selectedSource());
 
 	function invalidatePlay(): void {
 		++playIntent;
@@ -120,11 +122,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function pauseCurrent(): void {
+		if (destroyed || queue.purging) return;
 		const target = transportTarget();
-		if (!target || !target.matches()) return;
-		const { audio, attachment, matches } = target;
+		if (target && !target.matches()) return;
 		invalidatePlay();
 		endGeneration += 1;
+		// An accepted pause also revokes autoplay waiting for a new attachment.
+		if (!target) return;
+		const { audio, attachment, matches } = target;
 		const intent = playIntent;
 		const ownsPause = () => matches(() => playIntent === intent);
 		pause(audio);
@@ -173,6 +178,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function purgeAtAuthBoundary(clearHint: () => void): void {
+		sleepTimer.cancel();
 		pendingShare.clear();
 		positionIntent += 1;
 		nextPosition = undefined;
@@ -398,15 +404,19 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			queue.isCurrent(revision);
 		const ownsOrigin = () => ownsEnd() && matchesOrigin() && ownsEnd();
 		const base = queue.snapshot;
-		const result = naturalEndPolicy(base, {
-			repeat: get(repeat), radioActive: false, continueRadio: false, sleepComplete: false,
-			playing: attachment.playing, validEnd: audio.ended && audio.error === null
-		});
-		if (result.action === 'ignore' || !ownsOrigin()) return;
+		const validEnd = audio.ended && audio.error === null;
+		const playing = attachment.playing;
+		if (!validEnd || !playing || !ownsOrigin()) return;
 		attachment.playing = false;
 		generation = ++endGeneration;
 		announce('');
-		if (result.action !== 'play') return;
+		if (!ownsOrigin()) return;
+		// Only this current, consumed native completion can advance the timer.
+		const result = naturalEndPolicy(base, {
+			repeat: get(repeat), radioActive: false, continueRadio: false,
+			sleepComplete: sleepTimer.observeEnd(), playing, validEnd
+		});
+		if (result.action !== 'play' || !ownsOrigin()) return;
 		const track = currentTrack(result.queue);
 		const streamUrl = resolveStreamUrl(track);
 		const replacing = currentTrack(base)?.id !== track?.id || source !== streamUrl;
@@ -466,6 +476,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			repeat.set(value);
 			try { storage?.setItem(REPEAT_KEY, value); } catch { /* Keep the choice for this visit. */ }
 		},
+		sleepTimer,
 		playSelected,
 		restart,
 		jump,
@@ -565,6 +576,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		reset, purgeAtAuthBoundary,
 		destroy() {
 			destroyed = true;
+			sleepTimer.cancel();
 			pendingShare.clear();
 			reset();
 		}
