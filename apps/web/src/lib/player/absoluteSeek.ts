@@ -27,13 +27,12 @@ export function readAbsoluteSeek(media: SeekMedia): typeof emptyObservation {
 }
 
 export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: () => boolean): string {
-	let target: number;
 	try {
 		const { duration, currentTime, error } = media;
 		if (error || !Number.isFinite(duration) || duration <= 0 || !Number.isFinite(currentTime)) {
 			return 'Seeking is unavailable for this track.';
 		}
-		target = Math.min(duration, Math.max(0, seconds));
+		const target = Math.min(duration, Math.max(0, seconds));
 		if (!seekable(media, duration, target)) return 'That position is not seekable yet.';
 		if (!matches() || target === currentTime) return '';
 		media.currentTime = target;

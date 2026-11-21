@@ -9,7 +9,7 @@
 
 	let {
 		currentTrack, mediaRevision, streamUrl, attachNativeAudio,
-		playbackStatus, playCurrent, pauseCurrent,
+		playbackStatus, playCurrent, pauseCurrent, retryCurrent,
 		seekState, seek,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
 		jumpStatus, jumpStatusVersion, jumpRelative
@@ -20,6 +20,7 @@
 		playbackStatus: PlaybackStatus;
 		playCurrent: () => Promise<void>;
 		pauseCurrent: () => void;
+		retryCurrent: () => Promise<void>;
 		restartCanSeek: boolean;
 		restartStatus: string;
 		restartStatusVersion: number;
@@ -35,7 +36,8 @@
 		starting: 'Starting playback…',
 		playing: 'Playing',
 		blocked: 'Playback was blocked. Press Play to try again.',
-		error: 'This audio could not be loaded or played. Choose another track.'
+		error: 'This audio could not be loaded or played. Retry playback or choose another track.',
+		retrying: 'Retrying playback…'
 	};
 </script>
 
@@ -48,9 +50,15 @@
 	{/if}
 	<div class="nt-library-player-controls">
 		<button class="nt-button nt-library-transport" type="button"
-			disabled={playbackStatus === 'error' || playbackStatus === 'unavailable'}
-			onclick={() => canPause ? pauseCurrent() : void playCurrent()}>
-			{canPause ? 'Pause' : 'Play'}
+			disabled={playbackStatus === 'unavailable'}
+			aria-disabled={playbackStatus === 'retrying' ? 'true' : undefined}
+			onclick={() => {
+				if (playbackStatus === 'retrying') return;
+				if (playbackStatus === 'error') void retryCurrent();
+				else if (canPause) pauseCurrent();
+				else void playCurrent();
+			}}>
+			{playbackStatus === 'error' || playbackStatus === 'retrying' ? 'Retry playback' : canPause ? 'Pause' : 'Play'}
 		</button>
 		<NativeAudio {mediaRevision} {streamUrl} {attachNativeAudio} />
 		<button
@@ -112,6 +120,7 @@
 		font: inherit;
 	}
 	.nt-library-transport:disabled,
+	.nt-library-transport[aria-disabled='true'],
 	.nt-library-restart:disabled {
 		cursor: default;
 		opacity: 0.5;

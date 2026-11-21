@@ -40,6 +40,7 @@
 	<div class="nt-wrap">
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
+			retryCurrent={media.retryCurrent}
 			seekState={$absoluteSeek} seek={media.seek}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
 	</div>
