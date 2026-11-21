@@ -245,10 +245,11 @@ export interface CredentialsList {
 }
 
 const REVOKE_ALL = '/v1/session/revoke-all';
-const staleRevocation = () => new ApiError(409, 'conflict', 'Could not verify the current session. Confirm sign out everywhere again.');
+const LOGOUT = '/v1/session/logout';
+const staleSession = () => new ApiError(409, 'conflict', 'Could not verify the current session. Try signing out again.');
 const COOKIE_MUTATIONS = new Set([
 	'/v1/auth/magic/finish', '/v1/auth/passkey/register/finish', '/v1/auth/passkey/login/finish',
-	'/v1/session/reauthenticate/finish', '/v1/session/refresh', '/v1/session/logout', REVOKE_ALL
+	'/v1/session/reauthenticate/finish', '/v1/session/refresh', LOGOUT, REVOKE_ALL
 ]);
 
 export class ApiClient {
@@ -327,7 +328,7 @@ export class ApiClient {
 	/** Bind the user confirmation to the browser's current auth generation. */
 	async revokeAllSessions(confirm: () => boolean): Promise<{ ok: true } | undefined> {
 		const expected = (await captureAuthFence())?.generation;
-		if (typeof window !== 'undefined' && !expected) throw staleRevocation();
+		if (typeof window !== 'undefined' && !expected) throw staleSession();
 		if (!confirm()) return;
 		return (await this.requestWithStatus<{ ok: true }>(REVOKE_ALL, {
 			method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
@@ -474,9 +475,10 @@ export class ApiClient {
 				headers,
 				credentials: 'include'
 			});
-			const stale = route === REVOKE_ALL ? staleRevocation() : undefined;
+			const intent = route === REVOKE_ALL ? { stale: staleSession(), revocation: { generation: expected } }
+				: route === LOGOUT ? { stale: staleSession() } : undefined;
 			const response = await (route && COOKIE_MUTATIONS.has(route)
-				? runAuthMutation(controller.signal, dispatch, stale, expected) : dispatch());
+				? runAuthMutation(controller.signal, dispatch, intent) : dispatch());
 			// A transport may ignore abort; never publish an abandoned response.
 			callerSignal?.throwIfAborted();
 			if (!response.ok) {

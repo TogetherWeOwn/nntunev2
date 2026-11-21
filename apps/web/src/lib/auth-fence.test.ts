@@ -24,7 +24,7 @@ async function startWriter(lockDenied = false) {
 	const started = Promise.withResolvers<void>(), response = Promise.withResolvers<Response>();
 	const fetchFn = () => { started.resolve(); return response.promise; };
 	if (lockDenied) vi.spyOn(navigator.locks, 'request').mockRejectedValueOnce(denied());
-	const result = new WriterClient({ baseUrl: '', fetchFn }).logout();
+	const result = new WriterClient({ baseUrl: '', fetchFn }).post('/v1/auth/passkey/login/finish', {});
 	await Promise.race([started.promise, result]);
 	return () => { response.resolve(ok()); return result; };
 }
@@ -58,6 +58,14 @@ it('shares the read lock, queues logout and recovers after storage errors', asyn
 	expect(await (await captureAuthFence())?.run(() => true)).toBe(true);
 	expect(read()).not.toBe(initial);
 	expect(await first!.run(() => true)).toBeUndefined();
+});
+it('does not dispatch logout queued behind a second tab signing in', async () => {
+	const { api, send } = setup();
+	const finishSignIn = await startWriter();
+	const logout = api.logout().catch((error: unknown) => error);
+	expect((await navigator.locks.query().finally(finishSignIn)).pending).toContainEqual(exclusive);
+	expect(await logout).toMatchObject({ code: 'conflict' });
+	expect(send).not.toHaveBeenCalled();
 });
 it.each(['local', 'cache'])('withholds receipts on %s read denial, not logout', async (store) => {
 	const { send, api } = setup();
@@ -143,9 +151,8 @@ it.each(['busy', 'changed', 'missing', 'unchanged', 'cancelled'])('checks revoca
 			await Promise.race([confirmed.promise, result]);
 			expect((await navigator.locks.query()).pending).not.toContainEqual(exclusive);
 		}
-		if (state === 'cancelled') expect(await result).toBeUndefined();
-		else if (state === 'unchanged') expect(await result).toEqual({});
-		else expect(await result).toMatchObject({ code: 'conflict' });
+		expect(await result).toEqual(state === 'cancelled' ? undefined :
+			state === 'unchanged' ? {} : expect.objectContaining({ code: 'conflict' }));
 		expect(send).toHaveBeenCalledTimes(state === 'unchanged' ? 1 : 0);
 	} finally { unlock.resolve(); await Promise.all([writer, result]); }
 });
