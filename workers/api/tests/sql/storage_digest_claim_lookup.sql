@@ -132,7 +132,7 @@ BEGIN
     END LOOP;
     SELECT * INTO STRICT f FROM digest_lookup_fixture WHERE n=1;
     FOREACH fault IN ARRAY ARRAY['environment','library','digest','size','object','generation','root',
-        'reference','provider','expired','beyond authorization','unbounded'] LOOP
+        'reference','provider','expired','beyond authorization','unbounded','unbounded authorization'] LOOP
         IF EXISTS (SELECT FROM pg_temp.read_lookup(
             CASE WHEN fault='environment' THEN gen_random_uuid() ELSE f.environment_id END,
             CASE WHEN fault='library' THEN gen_random_uuid() ELSE f.library_id END,
@@ -142,7 +142,7 @@ BEGIN
             CASE WHEN fault='generation' THEN gen_random_uuid() ELSE f.generation_id END,
             CASE WHEN fault='root' THEN gen_random_uuid() ELSE f.root_id END,
             CASE WHEN fault='reference' THEN gen_random_uuid() ELSE ref END,
-            CASE WHEN fault='unbounded' THEN 'infinity' ELSE cutoff END,
+            CASE WHEN fault IN ('unbounded', 'unbounded authorization') THEN 'infinity' ELSE cutoff END,
             CASE WHEN fault='provider' THEN gen_random_uuid() ELSE f.provider_id END,
             CASE fault WHEN 'expired' THEN cutoff - interval '6 minutes' WHEN 'unbounded' THEN 'infinity'
                        WHEN 'beyond authorization' THEN cutoff + interval '1 second' ELSE cutoff END)) THEN

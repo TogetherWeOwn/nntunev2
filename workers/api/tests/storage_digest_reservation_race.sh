@@ -133,10 +133,9 @@ for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false C
     deadline="$(psql_run -Atc "SELECT clock_timestamp() + interval '$duration'")"
     query="SELECT public.digest_ref_fixture($other, false, '', '$object', '$deadline')"
   elif [[ "$deleting" == detach ]]; then
-    holder_query="SELECT 1 FROM public.storage_validated_digest_winners WHERE object_id='$object' FOR UPDATE;
-      DELETE FROM public.storage_validated_digest_references WHERE reference_id='$object' AND object_id='$object'"
+    holder_query="SELECT 1 FROM public.storage_validated_digest_winners WHERE object_id='$object' FOR UPDATE"
     query="SELECT * FROM public.digest_read_lookup_fixture($id, clock_timestamp() + interval '5 minutes')"
-    holder_expected=1; contender_expected=''
+    holder_expected=$'1\n1'; contender_expected=''
     if [[ "$expected" == t ]]; then contender_expected="$pins"; fi
   elif [[ "$deleting" == true ]]; then
     holder_query="$delete"; query="$lookup"; contender_expected=''
@@ -156,6 +155,14 @@ for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false C
     sleep 0.1
   done
   [[ "$blocked" == 1 ]] || { printf 'reference contender did not block before deadline: %s\n' "$scenario" >&2; exit 1; }
+  if [[ "$deleting" == detach ]]; then
+    # The holder owns only the winner lock at this point. A reference-first
+    # lookup would block this delete while still waiting for the winner.
+    printf "%s\n" "SET LOCAL lock_timeout = '2s';
+      WITH detached AS (DELETE FROM public.storage_validated_digest_references
+                        WHERE reference_id='$object' AND object_id='$object' RETURNING 1)
+      SELECT count(*) FROM detached;" >&3
+  fi
   if [[ -n "$other" && "$expected" == f ]]; then psql_run -c "SELECT pg_sleep_until('$deadline')" >/dev/null; fi
   printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
   wait "$holder"; wait "$contender"
