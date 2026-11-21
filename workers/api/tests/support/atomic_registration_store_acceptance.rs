@@ -1513,7 +1513,7 @@ fn postgres_reap_holds_selected_parent_lock_through_delete() {
 // and extended audit committing together) and that the recorded old value
 // is the value actually replaced, never a stale snapshot read.
 
-async fn seed_admin_test_users(client: &Client) -> (String, String) {
+async fn seed_admin_test_users(client: &impl tokio_postgres::GenericClient) -> (String, String) {
     let prefix = format!("admin-foundation-{:016x}", rand::random::<u64>());
     let actor_id = format!("{prefix}-actor");
     let subject_id = format!("{prefix}-subject");
@@ -2357,6 +2357,157 @@ fn postgres_admin_invite_issue_and_revoke_audit_by_row_id() {
             .expect("read revoked invite");
         assert_eq!(row.get::<_, i64>(0), NOW as i64);
         assert_eq!(row.get::<_, String>(1), actor);
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_invite_ledger_uses_effective_expiry_before_limit() {
+    use super::admin_list_invites_on as list;
+    run_test(async {
+        let mut client = connect().await;
+        let tx = client.transaction().await.unwrap();
+        let (admin, member) = seed_admin_test_users(&tx).await;
+        let window = tx
+            .query_one(
+                "WITH t AS (SELECT GREATEST(MAX(ends_at), $1) AS start FROM invite_windows)
+                 INSERT INTO invite_windows (starts_at, ends_at)
+                 SELECT start, start + 20 FROM t RETURNING id, starts_at, ends_at",
+                &[&(NOW as i64)],
+            )
+            .await
+            .unwrap();
+        let window_id: i64 = window.get(0);
+        let start: i64 = window.get(1);
+        let original_end: i64 = window.get(2);
+        let closed_at = start + 10;
+
+        let mut ids = Vec::new();
+        let revoked_at = Some(start + 2);
+        for (label, expires_at, used, redeemed_at, revoked_at) in [
+            ("long", original_end, false, None, None),
+            ("short", closed_at - 1, false, None, None),
+            ("admin", original_end, false, None, None),
+            ("stamped", original_end, false, Some(start + 1), revoked_at),
+            ("legacy", original_end, true, None, revoked_at),
+            ("revoked", original_end, false, None, revoked_at),
+        ] {
+            let (kind, issuer, window_id) = if label == "admin" {
+                ("admin", &admin, None)
+            } else {
+                ("member", &member, Some(window_id))
+            };
+            let id: i64 = tx
+                .query_one(
+                    "INSERT INTO invite_codes (code_hash, kind, issued_by, window_id, created_at,
+                                               expires_at, used, redeemed_at, revoked_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+                    &[
+                        &crate::auth::hash_invite_code(&format!("{member}-{label}")),
+                        &kind,
+                        &issuer,
+                        &window_id,
+                        &start,
+                        &expires_at,
+                        &used,
+                        &redeemed_at,
+                        &revoked_at,
+                    ],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            ids.push(id);
+        }
+        let fixture_ids: [i64; 6] = ids.try_into().unwrap();
+        let [long, short, admin_invite, stamped, legacy, revoked] = fixture_ids;
+        tx.execute(
+            "UPDATE invite_windows SET ends_at = $1 WHERE id = $2",
+            &[&closed_at, &window_id],
+        )
+        .await
+        .unwrap();
+
+        let expiry = closed_at as u64;
+        let invite_ids = |rows: &[InviteRecord]| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        for (now, long_status) in [
+            (expiry - 1, "active"),
+            (expiry, "expired"),
+            (expiry + 1, "expired"),
+        ] {
+            let rows = list(&tx, None, None, now, fixture_ids.len()).await.unwrap();
+            let states: Vec<_> = rows
+                .iter()
+                .map(|r| (r.id, r.status(now), r.expires_at))
+                .collect();
+            assert_eq!(
+                states,
+                [
+                    (revoked, "revoked", expiry),
+                    (legacy, "redeemed", expiry),
+                    (stamped, "redeemed", expiry),
+                    (admin_invite, "active", original_end as u64),
+                    (short, "expired", expiry - 1),
+                    (long, long_status, expiry),
+                ]
+            );
+            let expected_active = if now < expiry {
+                vec![admin_invite, long]
+            } else {
+                vec![admin_invite]
+            };
+            let expected_expired = if now < expiry {
+                vec![short]
+            } else {
+                vec![short, long]
+            };
+            for (status, expected) in [
+                ("active", expected_active),
+                ("expired", expected_expired),
+                ("redeemed", vec![legacy, stamped]),
+                ("revoked", vec![revoked]),
+            ] {
+                // Leave room for every fixture so the limit cannot hide extra matches.
+                let rows = list(&tx, None, Some(status), now, fixture_ids.len())
+                    .await
+                    .unwrap();
+                let mut matched = invite_ids(&rows);
+                matched.retain(|id| fixture_ids.contains(id));
+                assert_eq!(matched, expected, "{status} at {now}");
+            }
+        }
+        let rows = list(&tx, Some(&admin), None, expiry, 200).await.unwrap();
+        assert_eq!(invite_ids(&rows), [admin_invite]);
+
+        let mut newer_ids: Vec<i64> = tx
+            .query(
+                "INSERT INTO invite_codes (code_hash, issued_by, created_at, expires_at)
+                 SELECT md5($1::text || n), $1, $2, $3 FROM generate_series(1, 201) n
+                 RETURNING id",
+                &[&admin, &start, &original_end],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        newer_ids.sort_unstable_by(|a, b| b.cmp(a));
+        let rows = list(&tx, None, None, expiry, 200).await.unwrap();
+        assert_eq!(invite_ids(&rows), newer_ids[..200]);
+        let rows = list(&tx, Some(&member), None, expiry, 200).await.unwrap();
+        assert_eq!(invite_ids(&rows), [revoked, legacy, stamped, short, long]);
+        let rows = list(&tx, None, Some("expired"), expiry, 200).await.unwrap();
+        assert!(invite_ids(&rows).starts_with(&[short, long]));
+        let stored: i64 = tx
+            .query_one(
+                "SELECT expires_at FROM invite_codes WHERE id = $1",
+                &[&long],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(stored, original_end);
+        tx.rollback().await.unwrap();
     });
 }
 
