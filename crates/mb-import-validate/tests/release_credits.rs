@@ -26,7 +26,7 @@ fn reads_ordered_credits_from_curated_artifact() {
     ];
     assert_eq!(lookup(ARTIFACT, RELEASE), Ok(expected));
     assert_eq!(
-        lookup(reversed.as_bytes(), RELEASE),
+        lookup(reversed.as_bytes(), &RELEASE.to_ascii_uppercase()),
         lookup(ARTIFACT, RELEASE)
     );
     assert_eq!(lookup(ARTIFACT, ABSENT), Ok(vec![]));
@@ -41,7 +41,8 @@ fn decodes_utf8_escapes_without_losing_empty_fields() {
             concat!(r"Björk\303\251\t\\N", "\t", r" \x26"),
             1,
         )
-        .replacen("Second Artist\t with", "\t", 1);
+        .replacen("Second Artist\t with", "\t", 1)
+        .replacen("2025-02-03T04:05:06Z", r"\062025-02-03T04:05:06.123456Z", 1);
     let credits = lookup(bytes.as_bytes(), OTHER).unwrap();
     assert_eq!(credits.len(), 2);
     assert_eq!(
@@ -70,6 +71,16 @@ fn refuses_invalid_artifacts_even_for_no_match() {
             Err(ReadError::InvalidRow {
                 line: 2,
                 reason: expected
+            })
+        );
+    }
+    for timestamp in ["2025-+2-03T04:05:06Z", "2025-02-03T04:05:+6Z"] {
+        let changed = text.replacen("2025-02-03T04:05:06Z", timestamp, 1);
+        assert_eq!(
+            lookup(changed.as_bytes(), ABSENT),
+            Err(ReadError::InvalidRow {
+                line: 1,
+                reason: "bad_timestamp"
             })
         );
     }

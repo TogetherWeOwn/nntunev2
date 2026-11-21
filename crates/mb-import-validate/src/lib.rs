@@ -29,8 +29,6 @@
 //! meaning of the dump's encoded bytes. Poison rows always keep the exact
 //! original dump bytes.
 
-pub mod release_credits;
-
 /// Which curated dump file a line comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Table {
@@ -664,6 +662,8 @@ fn is_time(time: &str) -> bool {
     }
     true
 }
+
+pub mod release_credits;
 
 #[cfg(test)]
 mod tests {

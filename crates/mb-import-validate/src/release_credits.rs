@@ -63,9 +63,12 @@ pub fn lookup(bytes: &[u8], release_mbid: &str) -> Result<Vec<ReleaseCredit>, Re
             credited_name: decode_required(name).map_err(invalid)?,
             join_phrase: decode_required(join).map_err(invalid)?,
         };
-        FieldKind::Timestamp
+        let timestamp = FieldKind::Timestamp
             .check(timestamp, true)
             .map_err(invalid)?;
+        if !is_curated_timestamp(&timestamp) {
+            return Err(invalid(reason::BAD_TIMESTAMP));
+        }
         let matches = release.eq_ignore_ascii_case(release_mbid);
         if !seen.insert((release, position)) {
             return Err(invalid("duplicate_credit_position"));
@@ -76,6 +79,21 @@ pub fn lookup(bytes: &[u8], release_mbid: &str) -> Result<Vec<ReleaseCredit>, Re
     }
     credits.sort_unstable_by_key(|credit| credit.position);
     Ok(credits)
+}
+
+// The producer emits UTC seconds or UTC seconds with six fractional digits.
+// The shared COPY validator checks calendar ranges but accepts signed components.
+fn is_curated_timestamp(timestamp: &str) -> bool {
+    timestamp.strip_suffix('Z').is_some_and(|utc| {
+        matches!(utc.len(), 19 | 26)
+            && utc.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 => b == b'-',
+                10 => b == b'T',
+                13 | 16 => b == b':',
+                19 => b == b'.',
+                _ => b.is_ascii_digit(),
+            })
+    })
 }
 
 fn decode_required(token: &str) -> Result<String, &'static str> {
