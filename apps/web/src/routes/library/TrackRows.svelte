@@ -2,6 +2,8 @@
 	import { libraryItemKey, type LibraryItem } from '#lib/library/cache.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import { contextMenu } from '#lib/interactions/context-menu.js';
+	import TrackLikeButton from '#lib/library/TrackLikeButton.svelte';
+	import type { TrackLikeControls } from '#lib/library/track-like-controls.js';
 
 	let {
 		tracks,
@@ -16,7 +18,8 @@
 		ontrackplay,
 		ontrackmenu,
 		oncopylink,
-		ontogglefavorite
+		ontogglefavorite,
+		likeControls
 	}: {
 		tracks: readonly LibraryItem[];
 		queuedIds: ReadonlySet<string>;
@@ -31,6 +34,7 @@
 		ontrackmenu: (track: LibraryItem, invoker: HTMLElement, point?: { x: number; y: number }) => void;
 		oncopylink: (track: LibraryItem) => void;
 		ontogglefavorite: (id: string) => void;
+		likeControls?: TrackLikeControls;
 	} = $props();
 </script>
 
@@ -92,15 +96,20 @@
 			>
 				Copy link
 			</button>
-			<button
-				type="button"
-				class="nt-library-star"
-				aria-pressed={favorite}
-				aria-label={`${favorite ? 'Unstar' : 'Star'} ${title}`}
-				onclick={() => ontogglefavorite(track.id)}
-			>
-				<span aria-hidden="true">{favorite ? '★' : '☆'}</span>
-			</button>
+			{#if likeControls}
+				{@const control = likeControls(track.id)}
+				{#if control}<TrackLikeButton {title} {control} />{/if}
+			{:else}
+				<button
+					type="button"
+					class="nt-library-star"
+					aria-pressed={favorite}
+					aria-label={`${favorite ? 'Unstar' : 'Star'} ${title}`}
+					onclick={() => ontogglefavorite(track.id)}
+				>
+					<span aria-hidden="true">{favorite ? '★' : '☆'}</span>
+				</button>
+			{/if}
 		</li>
 	{/each}
 </ul>
