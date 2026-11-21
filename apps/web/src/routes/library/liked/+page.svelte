@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
 	import AccountLikes from '#lib/library/AccountLikes.svelte';
 	import {
 		browserStorage,
@@ -56,7 +57,12 @@
 		}
 	});
 
-	onMount(() => mountLibraryRefresher(refresher));
+	onMount(() => {
+		const lifetime = new AbortController();
+		subscribeAuthFenceInvalidation(refresher.suspendVerification, lifetime.signal);
+		const dispose = mountLibraryRefresher(refresher);
+		return () => { lifetime.abort(); dispose(); };
+	});
 
 	const session = browserStorage('session');
 	const local = browserStorage('local');
@@ -93,7 +99,7 @@
 
 	async function persistChange(id: string, change: FavoriteChange): Promise<void> {
 		const scope = favoriteVisitKey;
-		if (!scope || scope !== favoritesKey(session)) return;
+		if (!scope || refresher.state.verificationSuspended || scope !== favoritesKey(session)) return;
 		pendingChanges.delete(id);
 		pendingChanges.set(id, change);
 		favoriteIds = currentFavorites();
@@ -177,6 +183,7 @@
 	{/if}
 	{#if !loading && !requiresSignIn && !loadError}
 		<AccountLikes {titles} {libraryBinding} {deviceScope} readDeviceIds={currentFavorites} {retireDeviceIds}
-			deviceCount={deviceScope ? favoriteIds.length : 0} onSessionChanged={refresher.handleLocalAuthTransition} />
+			deviceCount={deviceScope ? favoriteIds.length : 0} onSessionChanged={refresher.handleLocalAuthTransition}
+			onVerificationSuspended={refresher.suspendVerification} />
 	{/if}
 </main>

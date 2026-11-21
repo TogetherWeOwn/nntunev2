@@ -2,13 +2,13 @@
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { onMount } from 'svelte';
 	import { ApiClient, ApiError } from '../api/client.js';
-	import { captureAuthFence, subscribeAuthFenceInvalidation } from '../auth-fence.js';
+	import { captureAuthFence } from '../auth-fence.js';
 	import { browserStorage, verifiedFavoritesKey } from './cache.js';
 	import { importDeviceLikes, loadLikes, type LibraryLike } from './likes.js';
 	import { verifyLibrarySession } from './session-verification.js';
 
 	type Fence = NonNullable<Awaited<ReturnType<typeof captureAuthFence>>>;
-	let { titles, libraryBinding, deviceScope, deviceCount, readDeviceIds, retireDeviceIds, onSessionChanged }: {
+	let { titles, libraryBinding, deviceScope, deviceCount, readDeviceIds, retireDeviceIds, onSessionChanged, onVerificationSuspended }: {
 		titles: ReadonlyMap<string, string>;
 		libraryBinding?: string;
 		deviceScope?: string;
@@ -16,6 +16,7 @@
 		readDeviceIds: () => string[];
 		retireDeviceIds: (key: string, ids: readonly string[], verify: () => Promise<boolean>, run: Fence['run']) => Promise<boolean>;
 		onSessionChanged: () => void;
+		onVerificationSuspended: () => void;
 	} = $props();
 	let phase = $state<'loading' | 'ready' | 'sign-in' | 'error'>('loading');
 	let likes = $state<LibraryLike[]>([]);
@@ -55,7 +56,7 @@
 		} catch (error) {
 			await run(() => { phase = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error'; });
 		} finally {
-			if (!signal.aborted && !fence.isCurrent()) sessionChanged();
+			if (!signal.aborted && !fence.isCurrent()) onVerificationSuspended();
 			else if (!signal.aborted && phase === 'loading') phase = 'error';
 		}
 	}
@@ -110,17 +111,15 @@
 			if (error instanceof ApiError && (error.status === 401 || error.status === 412)) sessionChanged();
 			else await run(() => { feedback = 'Import could not finish. Unconfirmed favorites are still on this device.'; });
 		} finally {
-			if (!signal.aborted && !fence.isCurrent()) sessionChanged();
+			if (!signal.aborted && !fence.isCurrent()) onVerificationSuspended();
 			if (isCurrent()) await read(request, fence, binding);
 			if (active?.signal === signal) importing = false;
 		}
 	}
 
 	onMount(() => {
-		const lifetime = new AbortController();
-		subscribeAuthFenceInvalidation(sessionChanged, lifetime.signal);
 		void load();
-		return () => { lifetime.abort(); active?.abort(); };
+		return () => active?.abort();
 	});
 </script>
 

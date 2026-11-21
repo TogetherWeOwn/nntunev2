@@ -11,6 +11,7 @@ const likes = (items: unknown[] = []) => ({ session_binding: BINDING, items });
 
 async function seedLibrary(page: Page, ids: string[] = [], verified = true): Promise<void> {
 	await page.addInitScript(({ context, key, ids, verified, binding }) => {
+		if (location.pathname !== '/library/liked') return;
 		sessionStorage.setItem('nntune.library.auth-context.v1', context);
 		if (verified) sessionStorage.setItem('nntune.library.session-binding.v1', JSON.stringify([context, binding]));
 		localStorage.setItem(key, JSON.stringify(ids));
@@ -22,19 +23,55 @@ async function seedLibrary(page: Page, ids: string[] = [], verified = true): Pro
 	await page.route('**/v1/me/likes/session', (route) => route.fulfill({ json: likes() }));
 }
 
-test('Liked Songs can retry a failed read and only lists confirmed track likes', async ({ page }) => {
-	await seedLibrary(page);
-	let reads = 0;
-	await page.route('**/v1/me/likes', (route) => ++reads === 1
-		? route.fulfill({ status: 503, json: {} })
-		: route.fulfill({ json: likes([likedTrack, { ...likedTrack, target_id: 'Unlisted' },
-			{ ...likedTrack, kind: 'release', target_id: RELEASE }]) }));
-	await page.goto('/library/liked');
-	const shelf = page.getByRole('region', { name: 'Liked Songs' });
-	await expect(shelf.getByRole('alert')).toHaveText('Could not load your liked songs.');
-	await shelf.getByRole('button', { name: 'Retry liked songs' }).click();
-	await expect(shelf.getByRole('listitem')).toHaveText(['Coral Horizon', 'Unknown track']);
-});
+for (const status of [401, 503]) {
+	test(`Liked Songs handles a direct ${status}`, async ({ page }) => {
+		await seedLibrary(page, [TRACK]);
+		await page.route('**/v1/me/likes', (route) => route.fulfill({ status, json: {} }), { times: 1 });
+		await page.goto('/library/liked');
+		const shelf = page.getByRole('region', { name: 'Liked Songs' });
+		if (status === 401) {
+			await expect(shelf.getByRole('link', { name: 'Sign in' })).toHaveAttribute('href', '/login');
+			await expect(shelf.getByRole('listitem').or(shelf.getByRole('button'))).toHaveCount(0);
+			return;
+		}
+		await expect(shelf.getByRole('alert')).toHaveText('Could not load your liked songs.');
+		await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes([likedTrack,
+			{ ...likedTrack, target_id: 'Unlisted' }, { ...likedTrack, kind: 'release', target_id: RELEASE }]) }));
+		await shelf.getByRole('button', { name: 'Retry liked songs' }).click();
+		await expect(shelf.getByRole('listitem')).toHaveText(['Coral Horizon', 'Unknown track']);
+	});
+}
+
+for (const status of [200, 503]) {
+	test(`sign-out ${status} hides liked rows until the outcome is known`, async ({ page }) => {
+		await seedLibrary(page, [TRACK]);
+		const stored = () => page.evaluate((key) => localStorage.getItem(key), KEY);
+		const finish = Promise.withResolvers<void>();
+		await page.route('**/v1/session/logout', async (route) => {
+			await finish.promise;
+			await route.fulfill({ status, json: { ok: status === 200 } });
+		});
+		await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes([likedTrack]) }));
+		await page.goto('/library/liked');
+		const rows = page.getByRole('region', { name: 'Liked Songs' }).getByRole('listitem')
+			.or(page.getByRole('button', { name: 'Remove Coral Horizon from Liked' }));
+		await expect(rows).toHaveCount(2);
+		await page.getByRole('button', { name: 'Account menu' }).click();
+		await page.getByRole('menuitem', { name: 'Sign out' }).click();
+		await expect(rows).toHaveCount(0);
+		expect(await stored()).toBe(JSON.stringify([TRACK]));
+		finish.resolve();
+		if (status === 200) {
+			await expect(page).toHaveURL(/\/login$/);
+			expect(await stored()).toBeNull();
+		} else {
+			await expect(page.getByText('Could not sign out. Please try again.')).toBeVisible();
+			await page.getByRole('button', { name: 'Retry', exact: true }).click();
+			await expect(rows).toHaveCount(2);
+			expect(await stored()).toBe(JSON.stringify([TRACK]));
+		}
+	});
+}
 for (const result of ['partial', 'corrupt', 'all rejected'] as const) {
 	test(`explicit import reports ${result} and preserves unconfirmed device data`, async ({ page }) => {
 		await seedLibrary(page, [TRACK, REJECTED]);
@@ -76,18 +113,16 @@ test('an unbound legacy list stays device-only even when the shelf has verified 
 	await expect(shelf.getByRole('button', { name: 'Import device favorites' })).toHaveCount(0);
 	expect(await page.evaluate((key) => localStorage.getItem(key), KEY)).toBe(JSON.stringify([TRACK]));
 });
-for (const cause of ['shelf overlap', 'retirement overlap', 'server replacement'] as const) {
+for (const cause of ['shelf overlap', 'retirement overlap', 'shelf mismatch', 'retirement mismatch'] as const) {
 	test(`an old receipt cannot publish or retire after ${cause}`, async ({ page }) => {
 		await seedLibrary(page, [TRACK]);
 		const checking = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
-		const importing = cause !== 'shelf overlap';
+		const importing = cause.startsWith('retirement'), overlap = cause.endsWith('overlap');
 		let verifies = 0;
 		await page.route('**/v1/me/likes/session', async (route) => {
-			if (++verifies === (importing ? 3 : 2)) {
-				checking.resolve();
-				await finish.promise;
-			}
-			return route.fulfill({ json: { session_binding: verifies >= 3 && cause === 'server replacement' ? 'E'.repeat(43) : BINDING } });
+			const held = ++verifies === (importing ? 3 : 2);
+			if (held) { checking.resolve(); await finish.promise; }
+			return route.fulfill({ json: { session_binding: held && !overlap ? 'E'.repeat(43) : BINDING } });
 		});
 		await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes([likedTrack]) }));
 		await page.route('**/v1/me/likes/import', (route) => route.fulfill({ json: { added: 0, already: 1, rejected: [] } }));
@@ -95,10 +130,12 @@ for (const cause of ['shelf overlap', 'retirement overlap', 'server replacement'
 		if (importing) await page.getByRole('button', { name: 'Import device favorites' }).click();
 		await checking.promise;
 		// The writing context does not receive a storage event for its own change.
-		if (cause !== 'server replacement') await page.evaluate(() => navigator.locks.request('nntune.auth.cookie-transition.v1',
+		if (overlap) await page.evaluate(() => navigator.locks.request('nntune.auth.cookie-transition.v1',
 			() => localStorage.setItem('nntune.auth.generation.v1', 'new-generation')));
 		finish.resolve();
-		await expect(page.getByRole('main').getByRole('link', { name: 'Sign in' })).toBeVisible();
+		const main = page.getByRole('main');
+		await expect(overlap ? main.getByRole('button', { name: 'Retry', exact: true }) :
+			main.getByRole('link', { name: 'Sign in' })).toBeVisible();
 		await expect(page.getByText('Coral Horizon')).toHaveCount(0);
 		expect(await page.evaluate((key) => localStorage.getItem(key), KEY)).toBe(JSON.stringify([TRACK]));
 	});
