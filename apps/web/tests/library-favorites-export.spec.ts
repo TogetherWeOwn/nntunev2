@@ -534,7 +534,8 @@ test('[FAVEXPORT-04] exporting mutates neither favorites, queue, selection, play
 	await page.getByRole('checkbox', { name: 'Select Mike Song', exact: true }).check();
 	await move(page, 'Mike Song', 'up').click();
 	await expectFavoriteIds(page, ['fav-z', 'fav-m', 'fav-a']);
-	expect(await stored(page)).toEqual(['fav-z', 'fav-m', 'fav-a']);
+	// The optimistic order renders before the locked storage write completes.
+	await expect.poll(() => stored(page)).toEqual(['fav-z', 'fav-m', 'fav-a']);
 
 	const before = {
 		stored: await stored(page),

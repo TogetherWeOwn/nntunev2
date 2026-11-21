@@ -74,6 +74,54 @@ job is not evidence. This is point-in-time database telemetry, not lease or
 `/rest` readiness, and cannot be reused to admit a future load window. The job
 does not deploy a Worker, change bindings or send application traffic.
 
+### In-window telemetry policy (offline)
+
+The offline policy checks staging DB pressure and staging health for the pinned
+serving version while clients run, just before each start and at load close.
+Collectors must validate the identity and source timestamp first, then map it
+onto the runner's monotonic timeline; receipt time cannot make an old signal
+fresh. DB and health samples must be inside the window and at most three seconds
+old. Keep room for two measurement sessions in total. After all clients in a
+request group terminate, record the group's completion on the monotonic timeline
+before checking admission for the next group. Only an independently observed
+zero DB count strictly after that fence proves drain; a fresh zero from before
+or at the fence is insufficient. Only the second client of a scheduled pair
+can use the overlap allowance. A violated threshold or missing signal stops
+admission for the rest of the window, with a fixed classification.
+
+Resource-event evidence must cover the pinned version continuously from window
+open, not just contain the most recent event. An empty or sampled response is
+not proof of zero events. If the provider only supplies delayed resource events,
+select delayed mode before the window and record the lack of real-time coverage.
+It does not waive DB or health checks, and any reported resource exceedance or
+termination still stops admission. Reconciliation needs clean coverage through
+client termination within two minutes of load close (three seconds in live
+mode), without extending the five-minute job deadline or holding up restore.
+This policy has no collectors or live entrypoint; it does not prove provider
+coverage or cleanup.
+
+### Version-fenced restore rehearsal (offline)
+
+The rehearsal pins a known-off deployment and checks that the serving version
+agrees with the deployment version. On cleanup it cancels clients, then attempts
+restore only for the experiment's exact deployment identity. The simulated write
+compares that identity atomically; even a newer deployment of the same version
+must survive. A separately verified newer off deployment is not a restoration
+of the pinned baseline.
+
+Off requires disabled measurement, no lease, and no measurement DB binding.
+The independent zero DB count must follow the off readback and the deployment
+must still match after that sample. Missing proof leaves cleanup unverified.
+
+This is not a Cloudflare adapter. Ordinary staging API deployment and a future
+live executor must share a GitHub concurrency group across activation, load,
+and cleanup. That group does not fence dashboard or API writes. Cloudflare's
+[deployment create API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
+does not expose an expected-current deployment precondition. A read followed by
+an unconditional rollback is not safe; do not arm or attempt that write without
+a fence that covers all writers. The rehearsal does not exercise Actions
+cancellation or independent UTC lease expiry.
+
 ### Charge triplet
 
 Use the same `POST /rest/getArtists` with form-encoded `f=json` and credentials
