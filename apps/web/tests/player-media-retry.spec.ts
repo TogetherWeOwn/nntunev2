@@ -117,7 +117,8 @@ for (const boundary of ['new selection', 'auth transition'] as const) {
 			await requested.promise;
 			await expect(status).toHaveText('Retrying playback…');
 			if (boundary === 'new selection') {
-				await page.getByTestId('library-item').filter({ hasText: 'Moss' }).getByRole('button', { name: 'Moss', exact: true }).click();
+				await page.getByRole('button', { name: 'More actions for Moss', exact: true }).click();
+				await page.getByRole('menuitem', { name: 'Play now', exact: true }).click();
 				await expect(audio).toHaveAttribute('src', moss.streamUrl);
 			} else {
 				// Deliver the same browser signal another tab publishes on sign-out.
