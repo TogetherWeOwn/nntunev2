@@ -131,14 +131,19 @@ impl LeaseRow {
         self.expires_at > now
     }
 
-    /// True when this row is the same client session continuing the
-    /// same play of the same track — the continuation case that skips
-    /// the subscription/cap gates. Expiry is irrelevant here: it frees
-    /// the lease for others, it does not revoke the holder's own play
-    /// (a stall then resumes the same epoch, metered under the same
-    /// play id).
-    pub fn is_continuation(&self, session_id: &str, play_id: &str, track_id: &str) -> bool {
-        self.session_id == session_id && self.play_id == play_id && self.track_id == track_id
+    /// True while the same client session holds a live lease for this
+    /// play and track. Retain expired rows for the next acquire's epoch.
+    pub fn is_continuation(
+        &self,
+        session_id: &str,
+        play_id: &str,
+        track_id: &str,
+        now: u64,
+    ) -> bool {
+        self.is_live(now)
+            && self.session_id == session_id
+            && self.play_id == play_id
+            && self.track_id == track_id
     }
 
     /// Seconds until another session may acquire without a takeover
@@ -169,8 +174,7 @@ pub enum LeaseHeartbeat {
     /// displaced (takeover or its own newer play elsewhere) and must
     /// pause.
     Superseded,
-    /// No lease row exists for the user (never acquired, or the account
-    /// row is gone): nothing to extend.
+    /// No lease row exists for the user, or the matching lease expired.
     Expired,
 }
 
@@ -184,18 +188,26 @@ impl LeaseHeartbeat {
         }
     }
 
-    /// Classify a heartbeat against the stored row. `Active` requires
-    /// the exact (session, play, epoch) triple — an epoch mismatch is
-    /// a takeover even from the same session (its newer play replaced
-    /// this one). The handler still performs the conditional touch;
-    /// this is the read-side classification it reports.
-    pub fn classify(row: Option<&LeaseRow>, session_id: &str, play_id: &str, epoch: u64) -> Self {
+    /// `Active` requires a live lease for the exact (session, play, epoch).
+    /// An identity mismatch still reports displacement. The handler must
+    /// also win the conditional touch before reporting `Active`.
+    pub fn classify(
+        row: Option<&LeaseRow>,
+        session_id: &str,
+        play_id: &str,
+        epoch: u64,
+        now: u64,
+    ) -> Self {
         match row {
             None => LeaseHeartbeat::Expired,
             Some(row)
                 if row.session_id == session_id && row.play_id == play_id && row.epoch == epoch =>
             {
-                LeaseHeartbeat::Active
+                if row.is_live(now) {
+                    LeaseHeartbeat::Active
+                } else {
+                    LeaseHeartbeat::Expired
+                }
             }
             Some(_) => LeaseHeartbeat::Superseded,
         }
@@ -235,13 +247,12 @@ pub fn playback_lease_acquire_statement() -> &'static str {
 
 /// Parameters: user_id, session_id, play_id, epoch, expires_at, now.
 /// Heartbeat/continuation extension: extends only the exact holder's
-/// row; zero rows back means the caller no longer holds the lease
-/// (superseded between its read and this touch) or the deletion fence
-/// refused. The write is monotonic (`GREATEST`): overlapping heartbeats
+/// live row; zero rows means expiry, displacement, or a deletion fence
+/// refusal. The write is monotonic (`GREATEST`): overlapping heartbeats
 /// from the same holder can arrive out of order, and an older request
 /// must never shorten the deadline a newer one already stored.
 pub fn playback_lease_touch_statement() -> &'static str {
-    "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 RETURNING expires_at"
+    "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND playback_leases.expires_at > $6 RETURNING expires_at"
 }
 
 #[cfg(test)]
@@ -308,41 +319,44 @@ mod tests {
     }
 
     #[test]
-    fn continuation_needs_the_exact_session_play_track() {
+    fn continuation_needs_the_exact_session_play_track_and_live_lease() {
         let row = lease();
-        assert!(row.is_continuation("sess-1", "play-7", "track-9"));
-        assert!(!row.is_continuation("sess-2", "play-7", "track-9"));
-        assert!(!row.is_continuation("sess-1", "play-8", "track-9"));
-        assert!(!row.is_continuation("sess-1", "play-7", "track-8"));
-        // Expiry does not revoke the holder's own continuation.
-        let mut stale = lease();
-        stale.expires_at = NOW - 3600;
-        assert!(stale.is_continuation("sess-1", "play-7", "track-9"));
-        assert!(!stale.is_live(NOW));
+        assert!(row.is_continuation("sess-1", "play-7", "track-9", row.expires_at - 1));
+        assert!(!row.is_continuation("sess-2", "play-7", "track-9", NOW));
+        assert!(!row.is_continuation("sess-1", "play-8", "track-9", NOW));
+        assert!(!row.is_continuation("sess-1", "play-7", "track-8", NOW));
+        assert!(!row.is_continuation("sess-1", "play-7", "track-9", row.expires_at));
+        assert!(!row.is_continuation("sess-1", "play-7", "track-9", row.expires_at + 1));
     }
 
     #[test]
     fn heartbeat_classification() {
         let row = lease();
         assert_eq!(
-            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 3),
+            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 3, row.expires_at - 1),
             LeaseHeartbeat::Active
         );
-        // Epoch bump (takeover, or a newer play from the same session).
+        for now in [row.expires_at, row.expires_at + 1] {
+            assert_eq!(
+                LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 3, now),
+                LeaseHeartbeat::Expired
+            );
+        }
+        // A replaced epoch stays superseded even after the new row expires.
         assert_eq!(
-            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 2),
+            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-7", 2, row.expires_at),
             LeaseHeartbeat::Superseded
         );
         assert_eq!(
-            LeaseHeartbeat::classify(Some(&row), "sess-2", "play-7", 3),
+            LeaseHeartbeat::classify(Some(&row), "sess-2", "play-7", 3, NOW),
             LeaseHeartbeat::Superseded
         );
         assert_eq!(
-            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-9", 3),
+            LeaseHeartbeat::classify(Some(&row), "sess-1", "play-9", 3, NOW),
             LeaseHeartbeat::Superseded
         );
         assert_eq!(
-            LeaseHeartbeat::classify(None, "sess-1", "play-7", 3),
+            LeaseHeartbeat::classify(None, "sess-1", "play-7", 3, NOW),
             LeaseHeartbeat::Expired
         );
         assert_eq!(LeaseHeartbeat::Active.as_str(), "active");
@@ -360,9 +374,13 @@ mod tests {
             playback_lease_acquire_statement(),
             "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
         );
+    }
+
+    #[test]
+    fn touch_statement_requires_a_live_lease() {
         assert_eq!(
             playback_lease_touch_statement(),
-            "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 RETURNING expires_at"
+            "UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, $5), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND playback_leases.expires_at > $6 RETURNING expires_at"
         );
     }
 
