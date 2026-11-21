@@ -102,8 +102,16 @@ executor. It reuses the fixed query, validates the database clock and counts,
 and limits the call to the earlier of the caller's monotonic deadline and the
 three-second freshness bound. It reports the start of the query's local time
 bracket, not its receipt time: a query started at or before a drain fence
-cannot clear it by returning later. Nothing calls this helper in a live load
-window yet. Health and resource collectors, live provider coverage and live
+cannot clear it by returning later.
+
+The separate build-health helper prepares one credential-free staging
+`/healthz` probe, without redirects or retries. It requires an uncached 200
+with `ok: true` and the expected build SHA, records probe start, and enforces
+the caller deadline and three-second freshness limit through validation. It
+requires curl 8.4 or later for the streaming response-size cap. Build SHA is
+not a Cloudflare version or deployment ID: redeploying the same build can change
+bindings, so this sample alone cannot satisfy the serving-version fence.
+Neither helper is wired to a live load window. Resource-event coverage and live
 cleanup remain unverified.
 
 ### Version-fenced restore rehearsal (offline)
