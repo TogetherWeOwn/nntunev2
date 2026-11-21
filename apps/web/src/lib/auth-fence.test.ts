@@ -1,21 +1,33 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { ApiClient } from './api/client.js';
-import { AUTH_GENERATION_KEY, AUTH_LOCK, captureAuthFence } from './auth-fence.js';
+import {
+	AUTH_GENERATION_KEY,
+	AUTH_LOCK,
+	captureAuthFence
+} from './auth-fence.js';
 
 function setup() {
-	const values = new Map<string, string>();
 	const localStorage = {
-		getItem: (key: string) => values.get(key) ?? null,
+		getItem: (key: string): string | null =>
+			Object.getOwnPropertyDescriptor(localStorage, key)?.value ?? null,
 		setItem: vi.fn((key: string, value: string) => {
-			values.set(key, value);
+			Object.defineProperty(localStorage, key, {
+				value,
+				configurable: true,
+				enumerable: true
+			});
 		}),
 		removeItem: (key: string) => {
-			values.delete(key);
+			Reflect.deleteProperty(localStorage, key);
 		}
 	};
 	vi.stubGlobal('window', { localStorage });
 	const send = vi.fn(async () => Response.json({}));
-	return { localStorage, send, api: new ApiClient({ baseUrl: '', fetchFn: send }) };
+	return {
+		localStorage,
+		send,
+		api: new ApiClient({ baseUrl: '', fetchFn: send })
+	};
 }
 
 afterEach(() => {
@@ -25,7 +37,10 @@ afterEach(() => {
 
 it('shares the read lock, queues logout and recovers a new generation after a quota error', async () => {
 	const { localStorage, send, api } = setup();
-	const [first, second] = await Promise.all([captureAuthFence(), captureAuthFence()]);
+	const [first, second] = await Promise.all([
+		captureAuthFence(),
+		captureAuthFence()
+	]);
 	const initial = localStorage.getItem(AUTH_GENERATION_KEY);
 	expect(initial).not.toBeNull();
 	expect(localStorage.setItem).toHaveBeenCalledTimes(1);
@@ -76,7 +91,9 @@ it('withholds receipts when generation initialization cannot write, and retries 
 it('keeps logout available but withholds receipts when access to storage is blocked', async () => {
 	const { api, send } = setup();
 	vi.stubGlobal('window', {
-		get localStorage() { throw new DOMException('Storage denied', 'SecurityError'); }
+		get localStorage() {
+			throw new DOMException('Storage denied', 'SecurityError');
+		}
 	});
 	expect(await captureAuthFence()).toBeUndefined();
 	await api.logout();
@@ -84,12 +101,60 @@ it('keeps logout available but withholds receipts when access to storage is bloc
 	expect(await captureAuthFence()).toBeUndefined();
 });
 
-it('falls back once when the browser denies the lock before dispatch', async () => {
-	const { api, send } = setup();
-	vi.spyOn(navigator.locks, 'request').mockRejectedValueOnce(new DOMException('Denied', 'SecurityError'));
-	await api.logout();
-	expect(send).toHaveBeenCalledTimes(1);
-});
+it.each([false, true])(
+	'withholds cross-tab receipts through overlapping fallback writes (quota retry: %s)',
+	async (quotaRetry) => {
+		const { localStorage } = setup();
+		const before = await captureAuthFence();
+		expect(before?.isCurrent()).toBe(true);
+		const lock = vi.spyOn(navigator.locks, 'request');
+		async function startLogout() {
+			// Re-evaluate the modules to give each writer independent epoch and pending state.
+			vi.resetModules();
+			const { ApiClient: WriterClient } = await import('./api/client.js');
+			const started = Promise.withResolvers<void>();
+			const response = Promise.withResolvers<Response>();
+			const fetchFn = vi.fn(() => {
+				started.resolve();
+				return response.promise;
+			});
+			const writer = new WriterClient({ baseUrl: '', fetchFn });
+			lock.mockRejectedValueOnce(new DOMException('Denied', 'SecurityError'));
+			const logout = writer.logout();
+			await Promise.race([started.promise, logout]);
+			return { response, logout, fetchFn };
+		}
+
+		if (quotaRetry)
+			localStorage.setItem.mockImplementationOnce(() => {
+				throw new DOMException('Storage full', 'QuotaExceededError');
+			});
+		const first = await startLogout();
+		try {
+			expect(before?.isCurrent()).toBe(false);
+			const trusted = vi.fn();
+			expect(await before?.run(trusted)).toBeUndefined();
+			expect(trusted).not.toHaveBeenCalled();
+			expect(await captureAuthFence()).toBeUndefined();
+			const second = await startLogout();
+			try {
+				first.response.resolve(Response.json({}));
+				await first.logout;
+				expect(await captureAuthFence()).toBeUndefined();
+			} finally {
+				second.response.resolve(Response.json({}));
+				await second.logout;
+			}
+			expect(second.fetchFn).toHaveBeenCalledTimes(1);
+		} finally {
+			first.response.resolve(Response.json({}));
+			await first.logout;
+		}
+		expect(first.fetchFn).toHaveBeenCalledTimes(1);
+		expect(before?.isCurrent()).toBe(false);
+		expect((await captureAuthFence())?.isCurrent()).toBe(true);
+	}
+);
 
 it('does not resend a cookie mutation when dispatch rejects under the lock', async () => {
 	const { api, send } = setup();
