@@ -131,6 +131,23 @@ does not expose an expected-current deployment precondition. A read followed by
 an unconditional rollback is not safe; do not arm or attempt that write without
 a fence that covers all writers.
 
+### Read-only off and drain verifier
+
+`verify_cleanup` in [the staging cleanup module](../../.github/scripts/subsonic_staging_cleanup.py)
+accepts a trusted deployment ID, version ID and build SHA. It checks fresh
+provider deployment and version results (not saved receipts) for 100% traffic
+on that exact deployment and for the default-off configuration. It then takes
+one independent `sample_pressure` reading. Its query start must be strictly
+later than the off readback, and a fresh zero measurement-session count must
+still hold as evidence when the final deployment read matches the pin.
+
+All reads receive the same absolute monotonic deadline. A future adapter must
+provide silent, uncached, staging-only reads and enforce that deadline itself;
+the verifier rejects late evidence but cannot interrupt a stalled adapter.
+Only an outcome code is returned. This verifies point-in-time observations,
+not an atomic fence against concurrent writers, and supplies no recovery
+writer, runner or proof that cleanup ran after cancellation.
+
 ### Actions step finalization (synthetic only)
 
 The `public-text` CI job arms a synthetic deployment and starts a simulated
