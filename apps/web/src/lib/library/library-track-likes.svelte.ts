@@ -6,9 +6,10 @@ import { loadLikes, MAX_LIKES, trackLikeTarget } from './likes.js';
 import type { LibraryRefreshUpdate } from './refresh.js';
 import { verifyLibrarySession } from './session-verification.js';
 import { createTrackLikeControls, type TrackLikeOwner } from './track-like-controls.js';
+import { loadTrackTaste, type TrackTaste } from './taste.js';
 
 /** One owner per verified Library listing, shared by Tracks and Queue. */
-export function createLibraryTrackLikes() {
+export function createLibraryTrackLikes(onInvalidated?: () => void) {
 	const retry = 'Account likes are unavailable. Refresh the library to try again.';
 	let active: AbortController | undefined;
 	let owner = $state.raw<TrackLikeOwner & { targets: Map<string, string | undefined> }>();
@@ -34,6 +35,7 @@ export function createLibraryTrackLikes() {
 	function invalidate() {
 		if (!active && !feedback) return;
 		retire();
+		onInvalidated?.();
 		feedback = retry;
 	}
 
@@ -50,30 +52,44 @@ export function createLibraryTrackLikes() {
 			// Retire the old owner immediately, but let its already-dispatched
 			// writes settle before reading the same account again.
 			await Promise.all(writes.get(binding) ?? []);
-			const read = await guarded(() => ({ response: loadLikes(readClient).catch(() => undefined) }));
+			const read = await guarded(() => ({
+				likes: loadLikes(readClient).catch(() => undefined),
+				taste: loadTrackTaste(readClient, binding).catch(() => undefined)
+			}));
 			if (!read) return;
-			const list = await read.response;
+			const list = await read.likes;
 			if (list?.binding !== binding) throw new Error('Likes session could not be verified');
+			const saved = await read.taste;
 			const check = await guarded(() => ({ response: verifyLibrarySession(binding, signal).catch(() => false) }));
 			if (!check) return;
 			if (!await check.response) throw new Error('Likes session could not be verified');
 			await guarded(() => {
 				const targets = new Map(items.map(({ id, like_target_id }) => [id, trackLikeTarget(id, like_target_id)]));
-				const liked = new SvelteMap<string, boolean>();
-				for (const item of list.items) if (item.kind === 'track') liked.set(item.targetId, true);
+				const liked = new Set(list.items.filter((item) => item.kind === 'track').map((item) => item.targetId));
 				// A full response cannot prove the absence of an older like.
 				const unlisted = list.items.length < MAX_LIKES ? false : undefined;
+				// Explicit taste rows and confirmed writes take precedence over the Likes snapshot.
+				const preferences = new SvelteMap<string, TrackTaste | null>(saved?.tracks);
 				owner = {
 					binding, client, targets, readiness: () => receipt,
-					liked: (id) => liked.get(id) ?? unlisted,
+					liked: (id) => preferences.has(id) ? preferences.get(id)?.signal === 'love' : liked.has(id) || unlisted,
 					confirm: (id, confirmedId, value) => {
 						if (id !== confirmedId) return invalidate();
-						liked.set(id, value);
+						preferences.set(id, value ? { signal: 'love', until: null } : null);
 						feedback = '';
 					},
-					failed: (_id, error) => {
+					failed: (_id, error, taste) => {
 						if (error instanceof ApiError && [401, 403, 412].includes(error.status)) invalidate();
-						else feedback = 'Could not confirm that Like change. Try again or refresh the library.';
+						else feedback = `Could not confirm that ${taste ? 'track preference' : 'Like'} change. Try again or refresh the library.`;
+					},
+					taste: saved && {
+						read: (id) => preferences.has(id) ? preferences.get(id) : saved.complete ? null : undefined,
+						verify: () => verifyLibrarySession(binding, signal),
+						invalidate,
+						confirm: (id, value) => {
+							preferences.set(id, value);
+							feedback = value ? 'Track preference saved to your account.' : 'Track preference cleared.';
+						}
 					}
 				};
 				feedback = '';
