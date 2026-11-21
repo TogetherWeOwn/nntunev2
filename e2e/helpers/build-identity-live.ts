@@ -31,6 +31,7 @@ export async function assertServingBuildMatchesPromotion(
   request: APIRequestContext,
   baseURL: string,
   context: string,
+  log: (message: string) => void = console.log,
 ): Promise<string> {
   // Promotion SHA from the push-triggered deploy run (EXPECTED_BUILD_SHA via
   // deploy.yml expected_sha from github.sha) — never a source checkout.
@@ -64,12 +65,12 @@ export async function assertServingBuildMatchesPromotion(
   const outcome = apiDeployOutcome();
   // Logged before the API verdict so a failing run still shows the web and
   // head values; the API value follows on the next line (or in the error).
-  console.log(
+  log(
     `[${context}] build identity: web=${deployed} head=${expected} ` +
       `staging-api=${outcome || '(not provided)'}`,
   );
   const verdict = resolveApiIdentity(apiRes.status(), apiBody, expected, outcome, context);
-  console.log(
+  log(
     `[${context}] build identity: web=${deployed} api=${verdict.apiSha ?? '(absent)'} ` +
       `head=${expected}`,
   );
@@ -88,9 +89,9 @@ export async function assertServingBuildMatchesPromotion(
         }),
       });
     }
-    console.log(`[${context}] build identity: web = API = head = ${expected}`);
+    log(`[${context}] build identity: web = API = head = ${expected}`);
   } else {
-    console.log(`[${context}] build identity: ${verdict.note}`);
+    log(`[${context}] build identity: ${verdict.note}`);
     test.info().annotations.push({ type: 'api-not-redeployed', description: verdict.note });
   }
   return deployed;

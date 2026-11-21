@@ -279,13 +279,15 @@ test('only the opening and closing build reads emit candidate-identity', async (
         JSON.stringify(url === `${origin}/api/build` ? { sha: head } : { ok: true, build_sha: apiSha }),
     }),
   } as unknown as APIRequestContext;
+  // This offline double also runs in the staging journey; don't log mock SHAs.
+  const readIdentity = (phase: string) =>
+    assertServingBuildMatchesPromotion(request, origin, phase, () => {});
   try {
     for (const phase of ['build-identity', 'listen-history-privacy', 'build-identity-final']) {
-      await expect(assertServingBuildMatchesPromotion(request, origin, phase)).resolves.toBe(head);
+      await expect(readIdentity(phase)).resolves.toBe(head);
     }
     apiSha = 'b'.repeat(40);
-    await expect(assertServingBuildMatchesPromotion(request, origin, 'listen-history-privacy'))
-      .rejects.toThrow(/API build identity mismatch/);
+    await expect(readIdentity('listen-history-privacy')).rejects.toThrow(/API build identity mismatch/);
     const phases = testInfo.annotations.slice(initialAnnotationCount)
       .filter(({ type }) => type === 'candidate-identity')
       .map(({ description }) => JSON.parse(description ?? '{}').phase);
