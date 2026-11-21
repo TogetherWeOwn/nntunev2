@@ -239,8 +239,8 @@ test.each([['seekto', 60, false, 0], ['seekto played', 60, true, 0], ['seekforwa
 		audio.emit('seeking');
 		if (late || scenario.startsWith('seekto')) audio.position = late ? 59.8 : 59.98;
 		audio.seeking = false;
-		audio.emit('timeupdate', 'seeked');
-		expect(session.setPositionState).toHaveBeenCalled();
+		audio.emit('seeked');
+		expect(session.setPositionState).toHaveBeenLastCalledWith({ duration: audio.duration, position: audio.position, playbackRate: 1 });
 	}
 	if (revisedDuration && !corrected) Object.assign(audio, { duration: revisedDuration }).emit('durationchange');
 	if (priorStart !== undefined && (corrected || rounded)) Object.assign(audio, { position: motion ?? audio.position }).emit('timeupdate');
@@ -250,7 +250,7 @@ test.each([['seekto', 60, false, 0], ['seekto played', 60, true, 0], ['seekforwa
 	Object.assign(audio, { position, ended: true, paused: true }).emit('pause', 'ended');
 	await Promise.resolve();
 	if (advances) expect(queue.snapshot.currentIndex).toBe(1); else expect(queue.snapshot).toBe(initial);
-	expect(get(media.sleepTimer).remaining).toBe(advances ? '1 track remaining' : '2 tracks remaining');
+	expect([get(media.playbackStatus), get(media.sleepTimer).remaining]).toEqual(['paused', advances ? '1 track remaining' : '2 tracks remaining']);
 	expect([audio.play.mock.calls.length, audio.load.mock.calls.length]).toEqual([1, 0]);
 });
 
