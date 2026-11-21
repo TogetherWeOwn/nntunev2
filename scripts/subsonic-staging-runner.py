@@ -4,9 +4,15 @@
 import argparse
 import hashlib
 import json
+import math
+import os
 import re
+import signal
+import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from selectors import EVENT_READ, EVENT_WRITE, DefaultSelector
 from urllib.parse import quote_plus, urlencode
 
 MATRIX = Path(__file__).resolve().parents[1] / "fixtures/subsonic/staging/matrix.json"
@@ -71,17 +77,21 @@ class PreparedPost:
 def prepare_requests(path, bearer, api_key):
     """Build unsent POSTs from only the reviewed schedule, with no live CLI."""
     matrix = load_matrix(path)
+    _validate_credentials(bearer, api_key)
+    return (_prepare_post(slot, bearer, api_key) for slot in matrix["slots"])
+
+
+def _validate_credentials(bearer, api_key):
     require(
-        isinstance(bearer, str) and re.fullmatch(r"[!-~]{1,1024}", bearer),
+        type(bearer) is str and re.fullmatch(r"[!-~]{1,1024}", bearer),
         "credential-shape",
     )
     require(
-        isinstance(api_key, str)
+        type(api_key) is str
         and re.fullmatch(r"[!-~]{32,512}", api_key)
         and len(quote_plus(api_key)) <= ENCODED_API_KEY_LIMIT,
         "credential-shape",
     )
-    return (_prepare_post(slot, bearer, api_key) for slot in matrix["slots"])
 
 
 def _prepare_post(slot, bearer, api_key):
@@ -142,6 +152,189 @@ def classify_fixed_rejection(
     if "body_bytes" in expected:
         sample["body_bytes"] = len(body)
     return sample
+
+
+@dataclass(frozen=True)
+class PostResponse:
+    status: int
+    body: bytes = field(repr=False)
+    content_type: str | None = field(repr=False)
+    cache_control: str | None = field(repr=False)
+    retry_after: str | None = field(repr=False)
+
+
+def _curl_config(post):
+    def quoted(value):
+        return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    lines = [f"header = {quoted(f'{name}: {value}')}" for name, value in post.headers]
+    lines.append(f"data-binary = {quoted(post.body.decode('ascii'))}")
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+_RESPONSE_FIELDS = (b"content-type", b"cache-control", b"retry-after")
+_RESPONSE_HEADER_LIMIT = 8192
+
+
+def _response_head(raw, cap):
+    status_line, *lines = bytes(raw).split(b"\r\n")
+    match = re.fullmatch(rb"HTTP/1\.[01] ([2-5][0-9]{2})(?: [ -~]*)?", status_line)
+    require(match, "response-headers")
+    status = int(match[1])
+    require(not 300 <= status < 400, "redirect-refused")
+    fields = {}
+    for line in lines:
+        name, sep, value = line.partition(b":")
+        require(sep and re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name), "response-headers")
+        name = name.lower()
+        if name in (*_RESPONSE_FIELDS, b"content-length", b"content-encoding", b"transfer-encoding"):
+            require(name not in fields and re.fullmatch(rb"[\t -~]*", value), "response-headers")
+            fields[name] = value.strip().decode("ascii")
+    require(fields.get(b"content-encoding", "identity").lower() == "identity", "response-headers")
+    length = fields.get(b"content-length")
+    if b"transfer-encoding" in fields:
+        require(length is None and fields[b"transfer-encoding"].lower() == "chunked", "response-headers")
+    if length is not None:
+        require(length.isdecimal(), "response-headers")
+        length = length.lstrip("0") or "0"
+        require(len(length) <= len(str(cap)) and int(length) <= cap, "body-limit")
+        length = int(length)
+    return status, length, tuple(fields.get(name) for name in _RESPONSE_FIELDS)
+
+
+class StagingPostTransport:
+    """One reviewed slot per call. The executor still owns scheduling and server evidence."""
+
+    def __init__(self, *, spawn=subprocess.Popen, clock=time.monotonic):
+        self._matrix = load_matrix(MATRIX)
+        self._spawn = spawn  # Trusted dependency injection for disposable clients only.
+        self._clock = clock
+
+    def _remaining(self, deadline, cancel):
+        require(not cancel.is_set(), "cancelled")
+        remaining = deadline - self._clock()
+        require(remaining > 0, "request-or-reader-timeout")
+        return min(0.05, remaining)
+
+    def send(self, number, bearer, api_key, *, deadline, cancel):
+        """Return a PostResponse or a sanitized fixed-rejection/client-ended sample.
+
+        deadline is the executor's absolute monotonic cutoff; cancel is a threading.Event.
+        Credentials are the staging measurement credentials, not health Access tokens.
+        """
+        slots, limits = self._matrix["slots"], self._matrix["limits"]
+        require(type(number) is int and 1 <= number <= len(slots), "unreviewed-slot")
+        require(type(deadline) is float and math.isfinite(deadline), "invalid-deadline")
+        slot = slots[number - 1]
+        _validate_credentials(bearer, api_key)
+        post = _prepare_post(slot, bearer, api_key)
+        require(post.method == "POST" and post.url == f"{STAGING_ORIGIN}/rest/{slot['endpoint']}",
+                "destination-refused")
+        reader = slot.get("reader", "normal")
+        timeout_ms = limits["request_timeout_ms"]
+        if reader != "normal":
+            timeout_ms = min(timeout_ms, limits["reader_hold_max_ms"])
+        start = self._clock()
+        end = min(deadline, start + timeout_ms / 1000)
+        # Withhold even pipe reads for paired legs; curl, TLS and kernel buffering still exist.
+        read_after = start + {"normal": 0, "held": 1.5, "disconnect": 1.1}[reader]
+        oracle = slot["expected"]["oracle"]
+        cap = REJECTION_LIMIT if oracle in REJECTION_ORACLES else limits["body_bytes"]
+        argv = (
+            "/usr/bin/curl", "--disable", "--globoff", "--proto", "=https", "--noproxy", "*",
+            "--no-location", "--retry", "0", "--http1.1", "--silent", "--no-buffer", "--include",
+            "--connect-timeout", str(limits["connect_timeout_ms"] / 1000),
+            "--max-time", str(timeout_ms / 1000), "--request", "POST", "--config", "-",
+            "--url", post.url,
+        )
+        self._remaining(end, cancel)
+        try:
+            process = self._spawn(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env={}, close_fds=True)
+            try:
+                response = self._exchange(process, _curl_config(post), cap, end, cancel,
+                                          read_after, reader == "disconnect")
+            finally:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=limits["cleanup_timeout_ms"] / 1000)
+                finally:
+                    process.stdin.close()
+                    process.stdout.close()
+        except subprocess.TimeoutExpired:
+            raise Stop("client-reap-timeout") from None
+        except OSError:
+            raise Stop("transport-io") from None
+        self._remaining(end, cancel)
+        if response is None:
+            require(process.returncode == -signal.SIGKILL, "disconnect-unconfirmed")
+            return {"oracle": "client-ended"}  # Local client only; never evidence of server drain.
+        if oracle in REJECTION_ORACLES:
+            return classify_fixed_rejection(slot, response.status, response.body,
+                                            response.content_type, response.cache_control,
+                                            response.retry_after)
+        return response
+
+    def _exchange(self, process, config, cap, end, cancel, read_after, disconnect):
+        head, body = bytearray(), bytearray()
+        response_head, eof, reading = None, False, False
+        with DefaultSelector() as selector:
+            os.set_blocking(process.stdin.fileno(), False)
+            os.set_blocking(process.stdout.fileno(), False)
+            selector.register(process.stdin, EVENT_WRITE)
+            while True:
+                wait = self._remaining(end, cancel)
+                until_read = read_after - self._clock()
+                if not reading and until_read <= 0:
+                    selector.register(process.stdout, EVENT_READ)
+                    reading = True
+                if eof and process.poll() is not None:
+                    break
+                if not reading and until_read > 0:
+                    wait = min(wait, until_read)
+                if not selector.get_map():
+                    cancel.wait(wait)
+                    continue
+                for key, _ in selector.select(wait):
+                    self._remaining(end, cancel)
+                    if key.fileobj is process.stdin:
+                        config = config[os.write(key.fd, config):]
+                        if not config:
+                            selector.unregister(key.fileobj)
+                            process.stdin.close()
+                        continue
+                    if response_head:
+                        read_size = min(8192, cap - len(body) + 1)
+                    else:
+                        read_size = min(REJECTION_LIMIT, _RESPONSE_HEADER_LIMIT - len(head) + 1)
+                    chunk = os.read(key.fd, read_size)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        eof = True
+                        continue
+                    if not response_head:
+                        head.extend(chunk)
+                        offset = head.find(b"\r\n\r\n")
+                        if offset < 0:
+                            require(len(head) < _RESPONSE_HEADER_LIMIT, "response-headers")
+                            continue
+                        require(offset + 4 <= _RESPONSE_HEADER_LIMIT, "response-headers")
+                        response_head = _response_head(head[:offset], cap)
+                        if disconnect:
+                            status, length, _ = response_head
+                            require(status == 200 and length != 0, "response-mismatch")
+                            require(process.poll() is None, "disconnect-unconfirmed")
+                            return None
+                        chunk = head[offset + 4:]
+                        head.clear()
+                    require(len(body) + len(chunk) <= cap, "body-limit")
+                    body.extend(chunk)
+        require(process.returncode != 28, "request-or-reader-timeout")  # CURLE_OPERATION_TIMEDOUT
+        require(process.returncode == 0 and response_head is not None, "transport-incomplete")
+        status, length, fields = response_head
+        require(length is None or len(body) == length, "transport-incomplete")
+        return PostResponse(status, bytes(body), *fields)
 
 
 @dataclass(frozen=True)

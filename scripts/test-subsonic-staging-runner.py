@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 import runpy
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from threading import Event, Timer
+from unittest.mock import patch
+from urllib.parse import parse_qs, quote_plus, urlsplit
 
 runner = runpy.run_path(str(Path(__file__).with_name("subsonic-staging-runner.py")))
 StagingModel, matrix, rehearse = (runner[key] for key in ("StagingModel", "MATRIX", "rehearse"))
@@ -152,6 +158,172 @@ class RequestContractTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(runner["Stop"], "^response-mismatch$"):
             classify(slots[36], 503, unavailable, "application/json", "private, no-store", "1")
+
+
+class TransportTests(unittest.TestCase):
+    bearer = r'synthetic"\-bearer'
+    api_key = RequestContractTests.api_key
+    ok_head = b"HTTP/1.1 200 OK\r\n\r\n"
+
+    def setUp(self):
+        self.children = []
+        self.cancel = Event()
+        self.program = ""
+        self.transport = runner["StagingPostTransport"](spawn=self.fake_curl)
+
+    def fake_curl(self, argv, **options):
+        self.assertEqual(options, dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, env={}, close_fds=True))
+        self.argv = argv
+        code = "import os, sys, time\nconfig = sys.stdin.buffer.read()\nout = sys.stdout.buffer\n"
+        child = subprocess.Popen([sys.executable, "-I", "-c", code + self.program], **options)
+        self.children.append(child)
+        self.addCleanup(self.reap_on_failure, child)
+        return child
+
+    @staticmethod
+    def reap_on_failure(child):
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=2)
+        child.stdin.close()
+        child.stdout.close()
+
+    def send(self, slot=1, seconds=4):
+        return self.transport.send(slot, self.bearer, self.api_key,
+                                   deadline=time.monotonic() + seconds, cancel=self.cancel)
+
+    def assert_reaped(self, returncode=None):
+        child = self.children[-1]
+        self.assertIsNotNone(child.returncode)  # Don't poll: the transport must have reaped it.
+        self.assertTrue(child.stdin.closed and child.stdout.closed)
+        if returncode is not None:
+            self.assertEqual(child.returncode, returncode)
+
+    def test_fixed_https_post_passes_credentials_only_on_stdin(self):
+        self.program = f"out.write({self.ok_head!r} + config)"
+        result = self.send()
+        self.assertEqual(self.argv, (
+            "/usr/bin/curl", "--disable", "--globoff", "--proto", "=https", "--noproxy", "*",
+            "--no-location", "--retry", "0", "--http1.1", "--silent", "--no-buffer", "--include",
+            "--connect-timeout", "2.0", "--max-time", "10.0", "--request", "POST", "--config", "-",
+            "--url", "https://staging.nntune.com/rest/getArtists",
+        ))
+        self.assertEqual(result.body.decode().splitlines(), [
+            'header = "Content-Type: application/x-www-form-urlencoded"',
+            'header = "Accept-Encoding: identity"',
+            'header = "X-Subsonic-Measurement-Case: empty"',
+            r'header = "Authorization: Bearer synthetic\"\\-bearer"',
+            f'data-binary = "f=json&apiKey={quote_plus(self.api_key)}"',
+        ])
+        self.assertEqual(repr(result), "PostResponse(status=200)")
+        self.assert_reaped(0)
+
+    def test_rejects_unreviewed_slot_and_alternative_destinations_before_spawn(self):
+        for slot in (0, 49, True, "https://example.invalid/rest/getArtists"):
+            with self.assertRaisesRegex(runner["Stop"], "^unreviewed-slot$"):
+                self.send(slot)
+        prepare = runner["_prepare_post"]
+        original = next(runner["prepare_requests"](matrix, self.bearer, self.api_key))
+        for url in (
+            original.url.replace("https:", "http:"),
+            original.url.replace("staging.nntune.com", "example.invalid"),
+            original.url.replace("staging.nntune.com", "staging.nntune.com:443"),
+            original.url.replace("staging.nntune.com", "user@staging.nntune.com"),
+            original.url.replace("getArtists", "getAlbum"), original.url + "?q=1", original.url + "#x",
+        ):
+            with patch.dict(prepare.__globals__, _prepare_post=lambda *_: replace(original, url=url)):
+                with self.assertRaisesRegex(runner["Stop"], "^destination-refused$"):
+                    self.send()
+        self.assertEqual(self.children, [])
+
+    def test_redirect_refused_without_following_or_echoing_location(self):
+        head = b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://example.invalid/private\r\n\r\n"
+        self.program = f"out.write({head!r}); out.flush(); time.sleep(60)"
+        with self.assertRaisesRegex(runner["Stop"], "^redirect-refused$"):
+            self.send()
+        self.assertEqual(len(self.children), 1)
+        self.assert_reaped(-signal.SIGKILL)
+
+    def test_fixed_rejection_uses_existing_oracle(self):
+        head = (b"HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n"
+                b"Cache-Control: private, no-store\r\n\r\n")
+        off = (b'<subsonic-response status="failed" version="1.16.1"><error code="70" '
+               b'message="Endpoint not supported in staging."/></subsonic-response>')
+        self.program = f"out.write({(head + off)!r})"
+        self.assertEqual(self.send(5), {"oracle": "fixed_staging_off", "http_status": 404})
+        self.program = f"out.write({head!r} + b'edge error')"
+        with self.assertRaisesRegex(runner["Stop"], "^response-mismatch$"):
+            self.send(5)
+        self.assert_reaped(0)
+
+    def test_response_limits_and_framing(self):
+        cap = runner["load_matrix"](matrix)["limits"]["body_bytes"]
+        self.program = f"out.write({self.ok_head!r} + b'x' * {cap})"
+        self.assertEqual(len(self.send().body), cap)
+        for slot, head, size, reason in (
+            (1, self.ok_head, cap + 1, "body-limit"),
+            (1, f"HTTP/1.1 200 OK\r\nContent-Length: {cap + 1}\r\n\r\n".encode(), 0, "body-limit"),
+            (5, b"HTTP/1.1 404 Not Found\r\n\r\n", 1025, "body-limit"),
+            (1, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", 1, "transport-incomplete"),
+            (1, b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n", 1, "response-headers"),
+            (1, b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n", 1, "response-headers"),
+            (1, b"HTTP/1.1 200 OK\r\nLong: " + b"x" * 8192 + b"\r\n\r\n", 0, "response-headers"),
+        ):
+            with self.subTest(slot=slot, size=size, reason=reason):
+                head_expr = repr(head) if len(head) < 8192 else "b'x' * 8193"
+                self.program = f"out.write({head_expr} + b'x' * {size})"
+                with self.assertRaisesRegex(runner["Stop"], f"^{reason}$"):
+                    self.send(slot)
+                self.assert_reaped()
+
+    def test_deadline_kills_client_despite_progress_and_eof_without_exit(self):
+        self.program = "sys.exit(28)"
+        with self.assertRaisesRegex(runner["Stop"], "^request-or-reader-timeout$"):
+            self.send()
+        self.assert_reaped(28)
+        for progress in ("os.close(sys.stdout.fileno()); time.sleep(60)",
+                         "while True: out.write(b'x'); out.flush(); time.sleep(.02)"):
+            self.program = f"out.write({self.ok_head!r}); out.flush()\n" + progress
+            with self.assertRaisesRegex(runner["Stop"], "^request-or-reader-timeout$"):
+                self.send(seconds=.35)
+            self.assert_reaped(-signal.SIGKILL)
+
+    def test_cancellation_reaps_live_client_even_during_hold(self):
+        self.program = "time.sleep(60)"
+        spawn = self.fake_curl
+        self.cancel.set()
+        with self.assertRaisesRegex(runner["Stop"], "^cancelled$"):
+            self.send()
+        self.assertEqual(self.children, [])
+        self.cancel.clear()
+
+        def spawn_then_cancel(*args, **kwargs):
+            child = spawn(*args, **kwargs)
+            timer = Timer(.05, self.cancel.set)
+            timer.start()
+            self.addCleanup(timer.join)
+            return child
+
+        transport = runner["StagingPostTransport"](spawn=spawn_then_cancel)
+        with self.assertRaisesRegex(runner["Stop"], "^cancelled$"):
+            transport.send(41, self.bearer, self.api_key, deadline=time.monotonic() + 4,
+                           cancel=self.cancel)
+        self.assert_reaped(-signal.SIGKILL)
+
+    def test_held_reader_and_disconnect_are_distinct_client_outcomes(self):
+        self.program = f"out.write({self.ok_head!r} + b'fixture')"
+        start = time.monotonic()
+        self.assertEqual(self.send(41).body, b"fixture")
+        self.assertGreaterEqual(time.monotonic() - start, 1.5)
+        self.assertIn("5.0", self.argv)
+        self.assert_reaped(0)
+        with self.assertRaisesRegex(runner["Stop"], "^disconnect-unconfirmed$"):
+            self.send(45)  # Already exited: never claim we disconnected it.
+        self.assert_reaped(0)
+        self.program = f"out.write({self.ok_head!r}); out.flush(); out.write(b'x' * 106659); time.sleep(60)"
+        self.assertEqual(self.send(45), {"oracle": "client-ended"})
+        self.assert_reaped(-signal.SIGKILL)
 
 
 class RunnerTests(unittest.TestCase):
