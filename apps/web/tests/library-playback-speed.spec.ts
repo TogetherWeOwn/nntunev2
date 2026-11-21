@@ -57,27 +57,25 @@ test('speed follows the current decoder and restores across source change and re
 	await expect(audio(page)).toHaveJSProperty('playbackRate', 0.5);
 });
 
-test('Library and Demo speed labels each target their own select', async ({ page }) => {
+test('Library and Demo speed labels each target their own select in a shared document', async ({ page }) => {
+	await page.goto('/demo/player');
+	const demo = page.getByTestId('playback-speed');
+	const field = (testId: string) => page.getByTestId(testId).locator('..');
+	const demoMarkup = await field('playback-speed').evaluate((node) => node.outerHTML);
+
 	await openLibrary(page);
 	await enqueue(page, 0);
 	const library = page.getByTestId('library-playback-speed');
-	await expect(library).toBeEnabled();
-	await page.evaluate(() => {
-		// Use the client router so the selected Library decoder stays mounted.
-		const link = document.createElement('a');
-		link.href = '/demo/player';
-		link.textContent = 'Open Demo for label test';
-		document.body.append(link);
-	});
-	const link = page.getByRole('link', { name: 'Open Demo for label test' });
-	await link.click();
-	await expect(page).toHaveURL(/\/demo\/player$/);
-	await link.evaluate((node) => node.remove());
-	const demo = page.getByTestId('playback-speed');
+	const libraryField = field('library-playback-speed');
+	// The public Demo unmounts the Library player. Insert the actual rendered
+	// Demo field before the live Library control to test native label association.
+	await libraryField.evaluate((node, markup) => node.insertAdjacentHTML('beforebegin', markup), demoMarkup);
+
 	await expect(demo).toHaveAccessibleName('Playback speed');
 	await expect(library).toHaveAccessibleName('Playback speed');
-	const id = await library.getAttribute('id');
-	await page.locator(`label[for="${id}"]`).click();
+	await field('playback-speed').locator('label').click();
+	await expect(demo).toBeFocused();
+	await libraryField.locator('label').click();
 	await expect(library).toBeFocused();
 });
 
