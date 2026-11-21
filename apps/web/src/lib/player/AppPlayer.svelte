@@ -65,14 +65,14 @@
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			retryCurrent={media.retryCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
-		<PlaybackSpeedControl value={$speedState.rate === null ? null : String($speedState.rate)}
-			feedback={$speedState.feedback} onchange={(control) => {
-				control.value = String(speed.set(Number(control.value)) ?? '');
-			}} />
 		<ShortcutHelp bind:this={shortcutHelp} actions={appShortcutActions} buttonClass="nt-button nt-button--ghost" playerScoped />
 	</div>
 {/if}
 {#if streamUrl}
+	<div class="nt-wrap">
+		<PlaybackSpeedControl value={$speedState.rate === null ? null : String($speedState.rate)}
+			feedback={$speedState.feedback} onchange={(control) => { control.value = String(speed.set(Number(control.value)) ?? ''); }} />
+	</div>
 	<section class="nt-wrap" aria-label="Sleep timer">
 		<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
 	</section>
