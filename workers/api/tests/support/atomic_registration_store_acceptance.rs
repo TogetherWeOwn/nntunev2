@@ -2447,83 +2447,85 @@ async fn remove_member_window_fixture(client: &Client, window: i64) {
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() {
-    use super::member_issue_invite_on as issue;
-    use crate::handlers::MemberInviteIssueOutcome as Outcome;
+    use super::member_issue_invite_on;
+    use crate::handlers::MemberInviteIssueOutcome::*;
+    use futures_util::future::join;
 
     run_test(async {
         let mut db = connect().await;
         let mut other = connect().await;
+        let locker = connect().await;
+        let db_pid = backend_pid(&db).await;
+        let other_pid = backend_pid(&other).await;
+        let locker_pid = backend_pid(&locker).await;
         let (_, issuer) = seed_admin_test_users(&db).await;
         let (_, peer) = seed_admin_test_users(&db).await;
-        let ip = "198.51.100.9";
-        let code = |n| format!("hash-{issuer}-{n}");
-        let (first, second, third) = (code(1), code(2), code(3));
-        let outcome = issue(&mut db, &issuer, &first, ip).await.unwrap();
-        assert_eq!(outcome, Outcome::WindowClosed);
-        let (window, end) = seed_member_window(&db, 600).await;
+        let issue = async |db: &mut Client, user: &str, n: u8| {
+            let hash = format!("hash-{user}-{n}");
+            member_issue_invite_on(db, user, &hash, "198.51.100.9").await.unwrap()
+        };
+        assert_eq!(issue(&mut db, &issuer, 1).await, WindowClosed);
+        let (window, _) = seed_member_window(&db, 2 * 86_400).await;
+        let settings = "UPDATE app_settings SET value = v.value FROM (VALUES
+            ('invite_member_min_paid_months', $1::text), ('invite_member_per_window', $2::text),
+            ('invite_default_expiry_days', $3::text)) AS v(key, value) WHERE app_settings.key = v.key";
+        assert_eq!(db.execute(settings, &[&"2", &"1", &"1"]).await.unwrap(), 3);
         db.execute("INSERT INTO subscriptions
             (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, paid_through_at)
             SELECT u, u, u, u, 'price_fixture', 'plus', 'active', now() + interval '1 day'
             FROM (VALUES ($1::text), ($2::text)) AS members(u)", &[&issuer, &peer]).await.unwrap();
-        // 60 distinct paid days despite overlapping spans and a free term.
+        // 45 distinct paid days despite overlapping spans and a free term.
         let history = "INSERT INTO paid_invoice_history
             (stripe_invoice_id, user_id, stripe_subscription_id, plan_id, period_start, period_end, amount_cents, currency, paid_at)
             SELECT u || s::text, u, u || '-old', 'plus', to_timestamp(s * 86400), to_timestamp(e * 86400), cents, 'usd', to_timestamp(0)";
-        let partial = format!(
-            "{history} FROM (VALUES ($1::text,1,31,800),($1,15,45,800),
-            ($1,16,46,800),($1,46,61,800),($1,61,91,0)) AS terms(u,s,e,cents)"
-        );
+        let partial = format!("{history} FROM (VALUES ($1::text,1,31,800),($1,15,46,800),($1,46,76,0)) AS terms(u,s,e,cents)");
         db.execute(&partial, &[&issuer]).await.unwrap();
-        let outcome = issue(&mut db, &issuer, &first, ip).await.unwrap();
-        assert_eq!(outcome, Outcome::Ineligible);
-        // A disjoint term on an older subscription makes exactly 90 days.
-        let terms = "($1::text,120,150,800),($2::text,1,91,800)";
-        let qualified = format!("{history} FROM (VALUES {terms}) AS terms(u,s,e,cents)");
+        assert_eq!(issue(&mut db, &issuer, 1).await, Ineligible);
+        // A disjoint term on an older subscription makes exactly 60 days.
+        let qualified = format!("{history} FROM (VALUES ($1::text,120,135,800),($2::text,1,61,800)) AS terms(u,s,e,cents)");
         db.execute(&qualified, &[&issuer, &peer]).await.unwrap();
         let status_sql = "UPDATE subscriptions SET status = $2 WHERE user_id = $1";
         db.execute(status_sql, &[&issuer, &"unpaid"]).await.unwrap();
-        let outcome = issue(&mut db, &issuer, &first, ip).await.unwrap();
-        assert_eq!(outcome, Outcome::Ineligible);
+        assert_eq!(issue(&mut db, &issuer, 1).await, Ineligible);
         db.execute(status_sql, &[&issuer, &"active"]).await.unwrap();
-        let Outcome::Issued { id, expires_at } = issue(&mut db, &issuer, &first, ip).await.unwrap()
-        else {
+        // Stall the first audit after the quota check; the second must wait on that issuer.
+        let audit_lock = "BEGIN; LOCK TABLE audit_log IN SHARE MODE";
+        locker.batch_execute(audit_lock).await.unwrap();
+        let (first, (second, ())) = join(issue(&mut db, &issuer, 1), async {
+            await_lock_wait(&locker, db_pid, locker_pid).await;
+            join(issue(&mut other, &issuer, 2), async {
+                await_lock_wait(&locker, other_pid, db_pid).await;
+                locker.batch_execute("COMMIT").await.unwrap();
+            })
+            .await
+        })
+        .await;
+        let Issued { id, expires_at } = first else {
             panic!("exact paid threshold should issue");
         };
-        assert_eq!(expires_at, end);
-        let revoke = "UPDATE invite_codes SET revoked_at = created_at WHERE id = $1";
-        db.execute(revoke, &[&id]).await.unwrap();
-        let (a, b) = futures_util::future::join(
-            issue(&mut db, &issuer, &second, ip),
-            issue(&mut other, &issuer, &third, ip),
-        )
-        .await;
-        let (winner, unused_hash) = match (a.unwrap(), b.unwrap()) {
-            (Outcome::Issued { id, .. }, Outcome::QuotaExhausted) => (id, &third),
-            (Outcome::QuotaExhausted, Outcome::Issued { id, .. }) => (id, &second),
-            outcomes => panic!("expected one winner: {outcomes:?}"),
-        };
+        assert_eq!(second, QuotaExhausted);
+        let valid: bool = db.query_one("SELECT i.expires_at = i.created_at + 86400 AND i.expires_at = $2
+            AND EXISTS (SELECT 1 FROM audit_log a WHERE a.user_id = i.issued_by AND a.action = 'invite.issued'
+                AND a.at = i.created_at AND a.details = jsonb_build_object('invite_id', i.id, 'kind', 'member', 'window_id', i.window_id))
+            FROM invite_codes i WHERE id = $1", &[&id, &expires_at]).await.unwrap().get(0);
+        assert!(valid, "configured lifetime and matching audit");
         for stamp in [
-            "UPDATE invite_codes SET expires_at = created_at WHERE id = $1",
-            "UPDATE invite_codes SET expires_at = created_at + 600, redeemed_at = created_at, used = true WHERE id = $1",
+            "revoked_at = created_at",
+            "revoked_at = NULL, expires_at = created_at",
+            "expires_at = created_at + 600, redeemed_at = created_at, used = true",
         ] {
-            db.execute(stamp, &[&winner]).await.unwrap();
-            let outcome = issue(&mut db, &issuer, unused_hash, ip).await.unwrap();
-            assert_eq!(outcome, Outcome::QuotaExhausted);
+            let sql = format!("UPDATE invite_codes SET {stamp} WHERE id = $1");
+            db.execute(&sql, &[&id]).await.unwrap();
+            assert_eq!(issue(&mut db, &issuer, 2).await, QuotaExhausted);
         }
-        let outcome = issue(&mut db, &peer, &code(4), ip).await.unwrap();
-        assert!(matches!(outcome, Outcome::Issued { .. }));
-        let audit_sql = "SELECT count(*) FROM audit_log a JOIN invite_codes i
-            ON a.details->>'invite_id' = i.id::text WHERE a.user_id = $1 AND i.issued_by = $1
-            AND a.action = 'invite.issued' AND a.at = i.created_at AND a.details =
-                jsonb_build_object('invite_id', i.id, 'kind', 'member', 'window_id', i.window_id)";
-        let audited: i64 = db.query_one(audit_sql, &[&issuer]).await.unwrap().get(0);
-        assert_eq!(audited, 2);
-        let next: i64 = db.query_one("WITH closed AS (UPDATE invite_windows SET
+        assert!(matches!(issue(&mut db, &peer, 1).await, Issued { .. }));
+        let next = db.query_one("WITH closed AS (UPDATE invite_windows SET
             ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint WHERE id = $1 RETURNING ends_at)
-            INSERT INTO invite_windows (starts_at, ends_at) SELECT ends_at, ends_at + 600 FROM closed RETURNING id",
-            &[&window]).await.unwrap().get(0);
-        let outcome = issue(&mut db, &issuer, unused_hash, ip).await.unwrap();
-        assert!(matches!(outcome, Outcome::Issued { .. }));
+            INSERT INTO invite_windows (starts_at, ends_at) SELECT ends_at, ends_at + 600 FROM closed RETURNING id, ends_at",
+            &[&window]).await.unwrap();
+        let (next, end): (i64, i64) = (next.get(0), next.get(1));
+        let outcome = issue(&mut db, &issuer, 2).await;
+        assert!(matches!(outcome, Issued { expires_at, .. } if expires_at == end));
         // The sequence survives rollback and proves each attempt reached the audit write.
         db.batch_execute("CREATE SEQUENCE member_issue_delay_seen;
             CREATE FUNCTION member_issue_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
@@ -2535,15 +2537,14 @@ fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() 
             CREATE TRIGGER member_issue_delay BEFORE INSERT ON audit_log FOR EACH ROW
                 WHEN (NEW.action = 'invite.issued') EXECUTE FUNCTION member_issue_delay();").await.unwrap();
         for (writes, window_secs, paid_secs, expected) in [
-            (1_i64, 4_i64, 600_i64, Outcome::WindowClosed),
-            (2, 600, 4, Outcome::Ineligible),
+            (1_i64, 4_i64, 600_i64, WindowClosed),
+            (2, 600, 4, Ineligible),
         ] {
             db.execute("WITH boundary AS (SELECT floor(extract(epoch FROM statement_timestamp()))::bigint AS t),
                 changed AS (UPDATE invite_windows SET ends_at = t + $3 FROM boundary WHERE id = $2)
                 UPDATE subscriptions SET cancel_at_period_end = true, paid_through_at = to_timestamp(t + $4)
                 FROM boundary WHERE user_id = $1", &[&peer, &next, &window_secs, &paid_secs]).await.unwrap();
-            let outcome = issue(&mut other, &peer, &code(5), ip).await.unwrap();
-            assert_eq!(outcome, expected);
+            assert_eq!(issue(&mut other, &peer, 2).await, expected);
             let rolled_back: bool = db.query_one("SELECT is_called AND last_value = $3
                  AND NOT EXISTS (SELECT 1 FROM invite_codes WHERE issued_by = $1 AND window_id = $2)
                  AND NOT EXISTS (SELECT 1 FROM audit_log WHERE user_id = $1 AND action = 'invite.issued'
@@ -2552,6 +2553,7 @@ fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() 
             assert!(rolled_back, "rollback missing: {expected:?}");
         }
         db.batch_execute("DROP TRIGGER member_issue_delay ON audit_log; DROP FUNCTION member_issue_delay(); DROP SEQUENCE member_issue_delay_seen;").await.unwrap();
+        assert_eq!(db.execute(settings, &[&"3", &"2", &"7"]).await.unwrap(), 3);
         remove_member_window_fixture(&db, next).await;
         remove_member_window_fixture(&db, window).await;
     });
