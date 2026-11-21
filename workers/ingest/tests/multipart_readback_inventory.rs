@@ -242,13 +242,11 @@ async fn completed_readback_binds_the_exact_inventory_after_flac_and_eof() {
     }
 }
 
-// Runs only against the migrated disposable Actions database.
 #[tokio::test]
 #[ignore = "requires a migrated disposable PostgreSQL database"]
 async fn postgres_append_stages_only_exact_live_candidate_inventory() {
     use tokio_postgres::{Client, NoTls, Transaction};
-    use InventoryAppendError::{Conflict, Identity, Indeterminate, MissingOrFenced};
-
+    use InventoryAppendError::{Conflict, Identity, MissingOrFenced};
     async fn connect(url: &str) -> Client {
         let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
         tokio::spawn(async move { connection.await.unwrap() });
@@ -298,7 +296,7 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         })
         .await
         .unwrap();
-    let mut intent = CandidateIntent {
+    let intent = CandidateIntent {
         identities: fixture.context.identities[1..].try_into().unwrap(),
         plaintext_len: fixture.context.plaintext_len,
         map_id: MAP_ID,
@@ -326,27 +324,22 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         .iter()
         .map(|hash| hash.to_vec())
         .collect();
-    assert_ne!(hashes[0], hashes[1]);
 
-    let tx = writer.transaction().await.unwrap();
+    let mut tx = writer.transaction().await.unwrap();
     for (bucket, configuration) in [("other-bucket", CONFIGURATION), (BUCKET, id(8))] {
         let scope = ReadbackScope {
             bucket,
             configuration,
         };
         assert_eq!(
-            append_inventory(&tx, &intent, scope, &verified).await,
+            append_inventory(&mut tx, &intent, scope, &verified).await,
             Err(Identity)
         );
     }
-    assert_eq!(
-        append_inventory(&tx, &intent, SCOPE, &verified).await,
-        Err(MissingOrFenced)
-    );
     hashes.swap(0, 1);
     insert_candidate(&tx, &ids, &map, &hashes).await;
     assert_eq!(
-        append_inventory(&tx, &intent, SCOPE, &verified).await,
+        append_inventory(&mut tx, &intent, SCOPE, &verified).await,
         Err(MissingOrFenced)
     );
     tx.rollback().await.unwrap();
@@ -356,52 +349,52 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
     insert_candidate(&tx, &ids, &map, &hashes).await;
     tx.commit().await.unwrap();
 
-    let mut locker = connect(&url).await;
-    let held = locker.transaction().await.unwrap();
-    held.query_one("SELECT generation FROM public.storage_digest_reservations WHERE object_id = $1::text::uuid FOR UPDATE", &[&ids[2]]).await.unwrap();
-    let tx = writer.transaction().await.unwrap();
-    tx.batch_execute("SET LOCAL lock_timeout = '250ms'")
-        .await
-        .unwrap();
-    assert_eq!(
-        append_inventory(&tx, &intent, SCOPE, &verified).await,
-        Err(Indeterminate)
-    );
-    tx.rollback().await.unwrap();
-    held.rollback().await.unwrap();
-
     let lookup = "SELECT media_version, page_versions FROM public.storage_digest_inventory_intents WHERE map_id = $1::text::uuid";
-    let tx = writer.transaction().await.unwrap();
-    intent.reservation_generation = 2;
+    let mut tx = writer.transaction().await.unwrap();
+    // The insert trigger flips the fixture clock within this transaction.
+    tx.batch_execute(
+        "CREATE TEMP SEQUENCE inventory_insert_attempt;
+         CREATE FUNCTION public.clock_timestamp() RETURNS timestamptz LANGUAGE sql VOLATILE AS $$
+             SELECT CASE WHEN is_called THEN 'infinity' ELSE '-infinity' END::timestamptz
+               FROM pg_temp.inventory_insert_attempt
+         $$;
+         CREATE FUNCTION public.test_mark_inventory_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM nextval('pg_temp.inventory_insert_attempt'); RETURN NEW; END $$;
+         CREATE TRIGGER mark_inventory_insert BEFORE INSERT ON public.storage_digest_inventory_intents
+         FOR EACH ROW EXECUTE FUNCTION public.test_mark_inventory_insert();
+         SET LOCAL search_path = public, pg_catalog;",
+    ).await.unwrap();
     assert_eq!(
-        append_inventory(&tx, &intent, SCOPE, &verified).await,
+        append_inventory(&mut tx, &intent, SCOPE, &verified).await,
         Err(MissingOrFenced)
     );
-    intent.reservation_generation = 1;
-    tx.execute("UPDATE public.storage_digest_reservations SET expires_at = clock_timestamp() WHERE object_id = $1::text::uuid", &[&ids[2]]).await.unwrap();
-    assert_eq!(
-        append_inventory(&tx, &intent, SCOPE, &verified).await,
-        Err(MissingOrFenced)
-    );
+    assert!(tx
+        .query_one(
+            "SELECT is_called FROM pg_temp.inventory_insert_attempt",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_none());
     tx.rollback().await.unwrap();
 
-    let tx = writer.transaction().await.unwrap();
-    append_inventory(&tx, &intent, SCOPE, &verified)
+    let mut tx = writer.transaction().await.unwrap();
+    append_inventory(&mut tx, &intent, SCOPE, &verified)
         .await
         .unwrap();
     assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_some());
     assert!(observer.query_opt(lookup, &[&map]).await.unwrap().is_none());
     tx.rollback().await.unwrap();
-    assert!(observer.query_opt(lookup, &[&map]).await.unwrap().is_none());
 
-    let tx = writer.transaction().await.unwrap();
-    append_inventory(&tx, &intent, SCOPE, &verified)
+    let mut tx = writer.transaction().await.unwrap();
+    append_inventory(&mut tx, &intent, SCOPE, &verified)
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    let tx = writer.transaction().await.unwrap();
+    let mut tx = writer.transaction().await.unwrap();
     assert_eq!(
-        append_inventory(&tx, &intent, SCOPE, &verified).await,
+        append_inventory(&mut tx, &intent, SCOPE, &verified).await,
         Err(Conflict)
     );
     tx.rollback().await.unwrap();

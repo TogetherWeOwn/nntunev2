@@ -57,7 +57,7 @@ impl InventoryAppendError {
 /// and owns commit and its outcome. Success only describes a staged append.
 /// Conflict and indeterminate results grant no retry, reuse or publication authority.
 pub async fn append_inventory(
-    tx: &Transaction<'_>,
+    tx: &mut Transaction<'_>,
     intent: &CandidateIntent,
     scope: ReadbackScope<'_>,
     verified: &VerifiedCompletedReadback<'_, '_>,
@@ -92,7 +92,11 @@ pub async fn append_inventory(
         .ok_or(MissingOrFenced)?;
 
     // READ COMMITTED sees the prior lock holder's changes after a wait.
-    let row = tx
+    let append = tx
+        .transaction()
+        .await
+        .map_err(InventoryAppendError::from_db)?;
+    let result = append
         .query_opt(
             APPEND_SQL,
             &[
@@ -112,10 +116,15 @@ pub async fn append_inventory(
             ],
         )
         .await
-        .map_err(InventoryAppendError::from_db)?
-        .ok_or(MissingOrFenced)?;
-    match row.try_get(0).map_err(InventoryAppendError::from_db)? {
-        true => Ok(()),
-        false => Err(MissingOrFenced),
+        .and_then(|row| row.map(|row| row.try_get::<_, bool>(0)).transpose());
+    if matches!(result, Ok(Some(true))) {
+        return append.commit().await.map_err(InventoryAppendError::from_db);
     }
+    append
+        .rollback()
+        .await
+        .map_err(InventoryAppendError::from_db)?;
+    Err(result
+        .err()
+        .map_or(MissingOrFenced, InventoryAppendError::from_db))
 }
