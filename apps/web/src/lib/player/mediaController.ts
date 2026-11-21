@@ -151,6 +151,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		}
 	}
 
+	function playCurrent(): Promise<void> {
+		return startCurrent(false);
+	}
+
 	function pauseCurrent(): void {
 		const target = transportTarget();
 		if (!target || !target.matches()) return;
@@ -496,7 +500,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		observeSound: sound.observe,
 		seekFeedback: { subscribe: seekFeedback.subscribe },
 		playbackStatus: { subscribe: playbackStatus.subscribe },
-		playCurrent: () => startCurrent(false), pauseCurrent, retryCurrent: () => startCurrent(true),
+		playCurrent, pauseCurrent, retryCurrent: () => startCurrent(true),
 		clearSeekFeedback,
 		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
 			let value: string | null | undefined;
