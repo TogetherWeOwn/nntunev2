@@ -3,8 +3,9 @@ import { setTrackLike } from './likes.js';
 import type { LibraryRefreshUpdate } from './refresh.js';
 
 export interface TrackLikeOwner {
-	/** The host must bind requests to this ownership scope, not just ambient cookies. */
 	client: Parameters<typeof setTrackLike>[0];
+	/** The host supplies the server-verified binding for this authorization epoch. */
+	readonly binding: string;
 	/** Latest listing publication for this owner only. Return the published object, not a copy. */
 	readiness: () => LibraryRefreshUpdate | undefined;
 	/** Undefined until the track and its confirmed Like state are known in this scope. */
@@ -33,6 +34,7 @@ export function createTrackLikeControls(
 		const receipt = owner?.readiness();
 		const run = receipt?.runIfCurrent;
 		if (!owner || !receipt || !run || !receipt.authoritative || receipt.authBoundary || !receipt.isCurrent()) return;
+		const binding = owner.binding;
 		const liked = owner.liked(id);
 		if (liked === undefined) return;
 		let pending = pendingByOwner.get(owner);
@@ -53,7 +55,7 @@ export function createTrackLikeControls(
 					const started = await run(() => {
 						if (!stillCurrent()) return;
 						// Return a container, not the network promise: release the auth fence before waiting.
-						return { result: setTrackLike(owner.client, id, !liked).catch(() => undefined) };
+						return { result: setTrackLike(owner.client, id, !liked, binding).catch(() => undefined) };
 					}).catch(() => undefined);
 					if (!started) return;
 					const confirmedId = await started.result;

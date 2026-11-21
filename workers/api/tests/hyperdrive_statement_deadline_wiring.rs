@@ -630,7 +630,7 @@ fn history_controls_wire_to_postgres_storage() {
     let source = production();
     let dispatch = function_body(&source, "pubasyncfndispatch(");
     assert!(dispatch.contains("store:&PgStore{"));
-    assert!(dispatch.contains("handlers::handle(&ctx,&guarded_request).await"));
+    assert!(dispatch.contains("handle_with_transport_headers(&ctx,collected_request,&headers_map)"));
     let store = source.split_once("implStoreforPgStore{").unwrap().1;
     for (method, operation) in [
         ("export_listen_events", "export(&client,owner,before)"),
