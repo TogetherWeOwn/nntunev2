@@ -6,13 +6,14 @@
 //! Builder contract: PgStore::bounded(operation, timeout_ms) races one store
 //! operation against the shared with_deadline helper, expiring to the opaque
 //! StoreError. Every `Store for PgStore` method and `SingleUseStore::claim`
-//! except billing reconciliation must await exactly one Self::bounded call with TOTAL_TIMEOUT_MS whose
+//! must await exactly one Self::bounded call with TOTAL_TIMEOUT_MS whose
 //! async block contains that method's connects — self.connect(), the
 //! self.connect_mirror() the catalogue reads use, or (catalogue_library)
 //! both — plus all of its statements (connects and statements share one
 //! bound: finishing one statement must not unbind a later stalled one).
 //! Hyperdrive RESETs pooled backends, so this per-method race is what
-//! bounds statements where they run.
+//! bounds statements where they run. Billing reconciliation is the sole
+//! exception: it delegates to the owned, budgeted transaction instead.
 //!
 //! Breaks caught: a new Store method that connects without the seam, a
 //! method that bounds an empty block while its statements run outside it,
@@ -265,7 +266,9 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
-    let pieces: Vec<&str> = store.split("asyncfn").skip(1).collect();
+    let mut pieces = store.split("asyncfn");
+    pieces.next().expect("preamble before the first method");
+    let pieces: Vec<&str> = pieces.collect();
     let names: Vec<&str> = pieces.iter().map(|piece| method_name(piece)).collect();
     // Anchors prove the splitter saw the whole impl, first method to last.
     for anchor in [
@@ -282,7 +285,7 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
     assert_eq!(
         names
             .iter()
-            .filter(|&&name| name == "store_reconcile_outcome")
+            .filter(|&&n| n == "store_reconcile_outcome")
             .count(),
         1
     );

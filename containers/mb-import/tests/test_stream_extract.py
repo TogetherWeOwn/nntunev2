@@ -71,6 +71,22 @@ class StreamExtractTest(unittest.TestCase):
         self.assertEqual(meta["skipped_members"], 1)
         self.assertEqual(meta["missing"], [])
 
+    def test_label_alias_requires_exact_archive_member(self):
+        extract = load("stream_extract", EXTRACT)
+        members = {f"mbdump/{table}": b"" for table in extract.REQUIRED_TABLES if table != "label_alias"}
+        members["mbdump/nested/label_alias"] = b"not the core member\n"
+        members["mbdump/label_alias_type"] = b"not the projection input\n"
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            result = subprocess.run([sys.executable, str(EXTRACT), str(out)],
+                                    input=tar_bytes(members), capture_output=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            meta = json.loads((out / "dump-meta.json").read_text())
+            self.assertEqual(meta["missing"], ["label_alias"])
+            self.assertEqual(meta["skipped_members"], 2)
+            self.assertFalse((out / "label_alias.gz").exists())
+            self.assertFalse((out / "label_alias_type.gz").exists())
+
     def test_missing_required_table_fails(self):
         result, out = self.run_extract({"mbdump/artist": b"x\n"})
         self.assertEqual(result.returncode, 1)
@@ -82,6 +98,7 @@ class StreamExtractTest(unittest.TestCase):
         self.assertIn("release_alias", missing)
         self.assertIn("release_group_alias", missing)
         self.assertIn("work", missing)
+        self.assertIn("work_alias", missing)
         self.assertIn("work_type", missing)
         self.assertIn("l_recording_work", missing)
 
@@ -322,7 +339,7 @@ class RecordingAliasProjectionTest(ProjectionTestCase):
                 self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
 
 
-class ReleaseFamilyAliasProjectionTestCase(ProjectionTestCase):
+class AliasProjectionTestCase(ProjectionTestCase):
     @property
     def output(self):
         return f"mbdump-{self.entity}_alias.tsv"
@@ -354,7 +371,7 @@ class ReleaseFamilyAliasProjectionTestCase(ProjectionTestCase):
         self.assertEqual(gzip.decompress((packed / "curated" / (self.output + ".gz")).read_bytes()), expected)
 
 
-class ReleaseAliasProjectionTest(ReleaseFamilyAliasProjectionTestCase):
+class ReleaseAliasProjectionTest(AliasProjectionTestCase):
     entity = "release"
 
     def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
@@ -397,7 +414,7 @@ class ReleaseAliasProjectionTest(ReleaseFamilyAliasProjectionTestCase):
                 self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
 
 
-class ReleaseGroupAliasProjectionTest(ReleaseFamilyAliasProjectionTestCase):
+class ReleaseGroupAliasProjectionTest(AliasProjectionTestCase):
     entity = "release_group"
 
     def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
@@ -440,6 +457,52 @@ class ReleaseGroupAliasProjectionTest(ReleaseFamilyAliasProjectionTestCase):
                 self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
 
 
+class WorkAliasProjectionTest(AliasProjectionTestCase):
+    entity = "work"
+
+    def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        self.assert_plain_and_streamed_output((ROOT / "tests" / "expected" / self.output).read_bytes())
+        alias_mbids = self.curated_mbids("work_alias")
+        self.assertLess(alias_mbids, self.curated_mbids("work"))
+        self.assertTrue(alias_mbids.isdisjoint(self.curated_mbids("recording")))
+
+    def test_empty_work_alias_table_emits_empty_sidecar(self):
+        (self.raw / "work_alias").write_bytes(b"")
+        self.assert_plain_and_streamed_output(b"")
+
+    def test_work_alias_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        self.assertIn("work_alias=3,", published.stdout)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        path = self.raw / "work_alias"
+        aliases = path.read_bytes()
+        first_row = aliases.splitlines(keepends=True)[0]
+        for changed, error in (
+            (None, "missing input file:"),
+            (b"broken\n", "expected 16 fields"),
+            (aliases + first_row, "UNIQUE constraint failed: work_alias.id"),
+            # 51 exists as a recording, not as a work. Keep valid aliases too.
+            (aliases.replace(b"920\t80\t", b"920\t51\t", 1), "work_alias references missing work 51"),
+            (aliases.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            (aliases.replace(rb"\303\x89tude", rb"\303tude", 1), "invalid COPY text in name or locale"),
+            (aliases.replace(rb"Study\tOne", rb"Study\377", 1), "invalid COPY text in sort_name"),
+        ):
+            with self.subTest(error=error):
+                if changed is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-03T04:05:07Z")
+                path.write_bytes(aliases)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
+
+
 class WorkProjectionTest(ProjectionTestCase):
     output = "mbdump-work.tsv"
 
@@ -454,13 +517,14 @@ class WorkProjectionTest(ProjectionTestCase):
 
         members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
         members["mbdump/work"] = b"".join(reversed(members["mbdump/work"].splitlines(keepends=True)))
-        for table in ("work_alias", "l_artist_work"):
+        excluded_tables = ("work_alias_type", "l_artist_work")
+        for table in excluded_tables:
             members[f"mbdump/{table}"] = b"not admitted\n"
         packed = self.tmp / "packed"
         extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
                                  input=tar_bytes(members), capture_output=True, check=False)
         self.assertEqual(extract.returncode, 0, extract.stderr)
-        for table in ("work_alias", "l_artist_work"):
+        for table in excluded_tables:
             self.assertFalse((packed / f"{table}.gz").exists())
         gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
         self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
@@ -470,6 +534,7 @@ class WorkProjectionTest(ProjectionTestCase):
 
     def test_empty_work_table_emits_empty_sidecar(self):
         (self.raw / "work").write_bytes(b"")
+        (self.raw / "work_alias").write_bytes(b"")
         result = self.run_etl(self.raw)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.curated / self.output).read_bytes(), b"")
@@ -642,6 +707,51 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
                 mode = {} if error.startswith("already has") else {"DUMP_TS": "2025-02-04T04:05:06Z"}
                 refused = self.run_etl(self.raw, **mode)
                 path.write_bytes(original)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
+
+
+class LabelAliasProjectionTest(AliasProjectionTestCase):
+    entity = "label"
+
+    def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        self.assert_plain_and_streamed_output((ROOT / "tests" / "expected" / self.output).read_bytes())
+        alias_mbids = self.curated_mbids("label_alias")
+        self.assertLess(alias_mbids, self.curated_mbids("label"))
+        self.assertTrue(alias_mbids.isdisjoint(self.curated_mbids("release")))
+
+    def test_empty_label_alias_table_emits_empty_sidecar(self):
+        (self.raw / "label_alias").write_bytes(b"")
+        self.assert_plain_and_streamed_output(b"")
+
+    def test_label_alias_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        self.assertIn("label_alias=4,", published.stdout)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        path = self.raw / "label_alias"
+        aliases = path.read_bytes()
+        first_row = aliases.splitlines(keepends=True)[0]
+        for changed, error in (
+            (None, "missing input file:"),
+            (b"broken\n", "expected 16 fields"),
+            (aliases + first_row, "UNIQUE constraint failed: label_alias.id"),
+            # 30 exists as a release, not as a label. Other aliases stay valid.
+            (aliases.replace(b"930\t71\t", b"930\t30\t", 1), "label_alias references missing label 30"),
+            (aliases.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            (aliases.replace(rb"\303\x89tiquette", rb"\303tiquette", 1), "invalid COPY text in name or locale"),
+            (aliases.replace(rb"Quartz\tRecords", rb"Quartz\377", 1), "invalid COPY text in sort_name"),
+        ):
+            with self.subTest(error=error):
+                if changed is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-03T04:05:07Z")
                 self.assertEqual(refused.returncode, 1, refused.stdout)
                 self.assertIn(error, refused.stderr)
                 self.assertEqual(self.curated.readlink(), target)

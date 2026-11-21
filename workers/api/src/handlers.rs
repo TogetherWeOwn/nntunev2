@@ -562,6 +562,37 @@ pub enum AdminInviteRevokeOutcome {
     ActorNotAdmin,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct InviteWindow {
+    pub id: i64,
+    pub starts_at: i64,
+    pub ends_at: i64,
+    pub created_by: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InviteWindowSchedule {
+    pub starts_at: i64,
+    pub ends_at: i64,
+    pub note: Option<String>,
+}
+
+pub enum InviteWindowWrite<'a> {
+    Schedule(&'a InviteWindowSchedule),
+    Close(i64),
+}
+
+#[derive(Debug)]
+pub enum InviteWindowOutcome {
+    Window(InviteWindow),
+    InvalidSchedule,
+    Overlap,
+    Missing,
+    ActorNotAdmin,
+}
+
 impl From<auth::AuthError> for StoreError {
     fn from(_: auth::AuthError) -> Self {
         StoreError
@@ -998,10 +1029,10 @@ pub trait Store {
             Err(StoreError)
         }
     }
-    /// Extend the exact holder's lease (`playback::playback_lease_
-    /// touch_statement`): true iff the (`session_id`, `play_id`,
-    /// `epoch`) triple still names the stored row. Default `Err` fails
-    /// closed like [`Store::live_subscription`].
+    /// Extend the exact holder's live lease. Returns true only if the
+    /// (`session_id`, `play_id`, `epoch`) triple still names a live row
+    /// at `now` and the deletion fence allows the write. Default `Err`
+    /// fails closed like [`Store::live_subscription`].
     fn touch_playback_lease(
         &self,
         user_id: &str,
@@ -1510,6 +1541,21 @@ pub trait Store {
         _source_ip: &str,
         _now: u64,
     ) -> impl Future<Output = Result<AdminInviteRevokeOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn admin_list_invite_windows(
+        &self,
+    ) -> impl Future<Output = Result<Vec<InviteWindow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Recheck admin under the write lock, then atomically commit the transition and audit.
+    fn admin_write_invite_window(
+        &self,
+        _actor: &str,
+        _write: InviteWindowWrite<'_>,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<InviteWindowOutcome, StoreError>> {
         async { Err(StoreError) }
     }
     /// Compatibility lifecycle is native-session-only. Implementations must
@@ -6145,6 +6191,63 @@ where
     }
 }
 
+async fn admin_invite_windows<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let mutation = req.method == "POST";
+    let claims = match ctx.authenticate_admin(req, mutation).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    if !mutation {
+        return match ctx.store.admin_list_invite_windows().await {
+            Ok(windows) => json_response(200, serde_json::json!({"windows": windows})),
+            Err(_) => internal(),
+        };
+    }
+    let schedule;
+    let (write, status) = if req.path == crate::native_rest::ADMIN_INVITE_WINDOWS_PATH {
+        // Derived structs also accept positional arrays. Check the shape first,
+        // then parse the original bytes to preserve duplicate-field rejection.
+        let first = req.body.iter().copied().find(|b| !b.is_ascii_whitespace());
+        let Some(body) = (first == Some(b'{'))
+            .then(|| parse_body::<InviteWindowSchedule>(req))
+            .flatten()
+        else {
+            return validation_failed("invalid invite window schedule");
+        };
+        schedule = body;
+        (InviteWindowWrite::Schedule(&schedule), 201)
+    } else if let Some(id) = crate::native_rest::admin_invite_window_close_id(&req.path) {
+        (InviteWindowWrite::Close(id), 200)
+    } else {
+        return not_found();
+    };
+    match ctx
+        .store
+        .admin_write_invite_window(&claims.user_id, write, &ctx.source_ip, ctx.now)
+        .await
+    {
+        Ok(InviteWindowOutcome::Window(window)) => {
+            json_response(status, serde_json::json!({"window": window}))
+        }
+        Ok(InviteWindowOutcome::InvalidSchedule) => {
+            validation_failed("invalid invite window schedule")
+        }
+        Ok(InviteWindowOutcome::Overlap) => {
+            let error =
+                crate::api_error::ApiError::by_code("conflict", "invite windows cannot overlap");
+            json_response(error.status, serde_json::json!(error))
+        }
+        Ok(InviteWindowOutcome::Missing | InviteWindowOutcome::ActorNotAdmin) => not_found(),
+        Err(_) => internal(),
+    }
+}
+
 // --- Play grant issuance -----------------------------------------------------------------
 //
 // `POST /v1/plays` is THE enforcement point: the stream Worker has no DB
@@ -6347,7 +6450,7 @@ where
     // lost the lease between the read and now, in which case this is
     // simply a new start through the gates below.
     if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
-        if row.is_continuation(&body.session_id, play_id, &body.track_id) {
+        if row.is_continuation(&body.session_id, play_id, &body.track_id, ctx.now) {
             if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, play_id).is_err()
             {
                 return Err(validation_failed("invalid play_id"));
@@ -6482,10 +6585,10 @@ where
 }
 
 /// Heartbeat: the holder's keepalive and the takeover signal in one.
-/// Always 200 for lease state (`active` extends, `superseded` tells the
-/// displaced player to pause, `expired` means no row) — lease state is
-/// an answer, not an error. No subscription or cap gates: a current
-/// play finishes even when a new start would be refused.
+/// Always 200 for lease state (`active` extends, `superseded` signals
+/// displacement, and `expired` means the matching lease ended or no
+/// row exists). No subscription or cap gates: a current play finishes
+/// even when a new start would be refused.
 async fn play_heartbeat<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -6530,6 +6633,7 @@ where
         &body.session_id,
         &body.play_id,
         body.lease_epoch,
+        ctx.now,
     );
     let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
         let expires = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
@@ -7865,8 +7969,13 @@ where
             }
         }
     }
+    use crate::native_rest::{admin_invite_window_close_id, ADMIN_INVITE_WINDOWS_PATH};
     use listen_history_controls as listens;
     match (req.method.as_str(), req.path.as_str()) {
+        ("GET" | "POST", ADMIN_INVITE_WINDOWS_PATH) => admin_invite_windows(ctx, req).await,
+        ("POST", path) if admin_invite_window_close_id(path).is_some() => {
+            admin_invite_windows(ctx, req).await
+        }
         ("GET", "/healthz") => json_response(
             200,
             serde_json::json!({"ok": true, "build_sha": ctx.cfg.build_sha}),
@@ -8130,6 +8239,9 @@ mod tests {
         /// mailbox (mirrors the migration 0018 table).
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
+        invite_window_list: RefCell<Option<Vec<InviteWindow>>>,
+        invite_window_outcomes: RefCell<std::collections::VecDeque<InviteWindowOutcome>>,
+        invite_window_calls: RefCell<Vec<serde_json::Value>>,
         /// Next surrogate invite id to hand out (mirror of the
         /// migration 0033 identity column).
         next_invite_id: RefCell<i64>,
@@ -8792,6 +8904,38 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn admin_list_invite_windows(&self) -> Result<Vec<InviteWindow>, StoreError> {
+            self.invite_window_calls
+                .borrow_mut()
+                .push(serde_json::json!("list"));
+            self.invite_window_list
+                .borrow_mut()
+                .take()
+                .ok_or(StoreError)
+        }
+
+        async fn admin_write_invite_window(
+            &self,
+            actor: &str,
+            write: InviteWindowWrite<'_>,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<InviteWindowOutcome, StoreError> {
+            let write = match write {
+                InviteWindowWrite::Schedule(schedule) => {
+                    serde_json::json!([schedule.starts_at, schedule.ends_at, schedule.note])
+                }
+                InviteWindowWrite::Close(id) => serde_json::json!(id),
+            };
+            self.invite_window_calls
+                .borrow_mut()
+                .push(serde_json::json!([actor, source_ip, now, write]));
+            self.invite_window_outcomes
+                .borrow_mut()
+                .pop_front()
+                .ok_or(StoreError)
+        }
+
         async fn mark_private_play(
             &self,
             user_id: &str,
@@ -9278,13 +9422,12 @@ mod tests {
             session_id: &str,
             play_id: &str,
             epoch: u64,
-            _now: u64,
+            now: u64,
             expires_at: u64,
         ) -> Result<bool, StoreError> {
-            // Mirror the conditional UPDATE: only the exact
-            // (session, play, epoch) holder extends, monotonically
-            // (an out-of-order older deadline never shortens), and
-            // never for a deleting account (in-statement fence).
+            // Mirror the conditional UPDATE: only the exact holder of a
+            // live lease extends, monotonically, and never for a deleting
+            // account (in-statement fence).
             if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
                 self.deleting_users.borrow_mut().insert(marker);
             }
@@ -9294,7 +9437,8 @@ mod tests {
             let mut leases = self.playback_leases.borrow_mut();
             match leases.get_mut(user_id) {
                 Some(row)
-                    if row.session_id == session_id
+                    if row.is_live(now)
+                        && row.session_id == session_id
                         && row.play_id == play_id
                         && row.epoch == epoch =>
                 {
@@ -11946,65 +12090,6 @@ mod tests {
     }
 
     #[test]
-    fn billing_target_caller_retries_after_live_slot_release() {
-        let h = stripe_harness();
-        seed_billing_user(&h, "u1");
-        deliver_first_period(&h, "evt_test_1");
-        let reconcile = || block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_b"));
-        let subscriptions = &h.stripe.subscriptions;
-        subscriptions.borrow_mut().insert(
-            "sub_b".into(),
-            test_subscription("sub_b", "cus_test_1", "past_due", PRICE_PLUS),
-        );
-        let end = BILLING_NOW + BILLING_PERIOD;
-        h.stripe.invoices.borrow_mut().insert(
-            "in_b".into(),
-            test_invoice(
-                "in_b",
-                "cus_test_1",
-                "sub_b",
-                PRICE_PLUS,
-                BILLING_NOW,
-                end,
-                BILLING_NOW + 60,
-            ),
-        );
-        let attempts = h.store.reconcile_outcome_attempts.get();
-        assert!(reconcile().is_err());
-        assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts + 1);
-        assert_eq!(h.store.invoice_history.borrow().len(), 1);
-        let mut canceled_holder = h.store.billing_rows.borrow()["u1"].clone();
-        canceled_holder.status = "canceled".into();
-        h.store.release_live_slot_before_store.set(true);
-        subscriptions.borrow_mut().get_mut("sub_b").unwrap().status = "active".into();
-        let outcome = reconcile().expect("slot released after fresh fold accepts target");
-        assert_eq!(
-            h.store
-                .billing_shadow
-                .borrow()
-                .get(&("u1".into(), "sub_test_1".into()))
-                .unwrap(),
-            &canceled_holder
-        );
-        assert!(!outcome.disable_new_purchases());
-        assert_eq!(outcome.row.stripe_subscription_id, "sub_b");
-        assert_eq!(outcome.row.stripe_price_id, PRICE_PLUS);
-        assert_eq!(outcome.row.plan_id, PLAN_PLUS);
-        assert_eq!(outcome.row.status, "active");
-        assert_eq!(outcome.row.grace_until_unix, None);
-        assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some("in_b"));
-        assert_eq!(outcome.row.paid_through_unix, Some(end));
-        assert_eq!(outcome.read_anchor, None);
-        assert_eq!(outcome.read_plan, None);
-        let live = live_for(&h, "u1").unwrap();
-        assert_eq!(live.stripe_subscription_id, "sub_b");
-        assert_eq!(live.status, "active");
-        let history = h.store.invoice_history.borrow();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history["in_b"].stripe_subscription_id, "sub_b");
-    }
-
-    #[test]
     fn billing_webhook_out_of_order_invoices_never_regress() {
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
@@ -13210,9 +13295,38 @@ mod tests {
                     assert_eq!(*h.store.billing_shadow.borrow(), shadow, "{case}");
                     assert_eq!(*h.store.invoice_history.borrow(), history, "{case}");
                     assert_eq!(*h.stripe.sessions_created.borrow(), 0, "{case}");
+                    if (a_status, b_status, webhook) == ("active", "active", false) {
+                        assert_billing_retry_after_fold(&h, end + BILLING_PERIOD);
+                    }
                 }
             }
         }
+    }
+
+    fn assert_billing_retry_after_fold(h: &Harness, end: i64) {
+        let mut canceled = h.store.billing_rows.borrow()["u1"].clone();
+        canceled.status = "canceled".into();
+        h.store.release_live_slot_before_store.set(true);
+        let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_b"))
+            .expect("slot released after fresh fold accepts exact target");
+        assert_eq!(
+            h.store.billing_shadow.borrow()[&("u1".into(), "sub_test_1".into())],
+            canceled
+        );
+        assert!(!outcome.disable_new_purchases());
+        assert_eq!((outcome.read_anchor, outcome.read_plan), (None, None));
+        assert_eq!(outcome.row.stripe_subscription_id, "sub_b");
+        assert_eq!(outcome.row.stripe_item_id, "si_test_1");
+        assert_eq!(outcome.row.stripe_price_id, PRICE_PLUS);
+        assert_eq!(outcome.row.plan_id, PLAN_PLUS);
+        assert_eq!(outcome.row.status, "active");
+        assert_eq!(outcome.row.grace_until_unix, None);
+        assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some("in_b"));
+        assert_eq!(outcome.row.paid_through_unix, Some(end));
+        assert_eq!(h.store.billing_rows.borrow()["u1"], outcome.row);
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history["in_b"].stripe_subscription_id, "sub_b");
     }
 
     #[test]
@@ -13490,20 +13604,36 @@ mod tests {
         };
         let submitted = op();
         assert_eq!(submitted.state, "submitted");
-        for _ in 0..2 {
+        let return_id = |id: &str| {
+            let mut responses = h.stripe.subscriptions.borrow_mut();
+            responses.get_mut("sub_test_1").unwrap().id = id.into();
+        };
+        for wrong_id in [false, false, true] {
             block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
-            h.store.remove_billing_row_after_read.set(true);
+            h.store.remove_billing_row_after_read.set(!wrong_id);
+            if wrong_id {
+                return_id("sub_wrong");
+            }
+            let attempts = h.store.reconcile_outcome_attempts.get();
             assert_eq!(deliver("evt_row6").status, 500);
+            assert_eq!(
+                h.store.reconcile_outcome_attempts.get() - attempts,
+                if wrong_id { 0 } else { 1 }
+            );
             assert!(!h.store.remove_billing_row_after_read.get());
             assert!(!h.store.webhook_events.borrow().contains("evt_row6"));
             assert_eq!(op(), submitted);
             assert_eq!(h.store.checkout_ops.borrow().len(), 1);
-            assert!(h.store.billing_rows.borrow().is_empty());
+            assert_eq!(
+                h.store.billing_rows.borrow().get("u1"),
+                wrong_id.then_some(&seed.row)
+            );
+            assert_eq!(h.store.billing_rows.borrow().is_empty(), !wrong_id);
             assert!(h.store.billing_shadow.borrow().is_empty());
             assert!(h.store.invoice_history.borrow().is_empty());
         }
-        // An independently restored own target makes that stale fold safe to retry.
-        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+        // The own target is restored; correcting the returned ID permits retry.
+        return_id("sub_test_1");
         for _ in 0..2 {
             let attempts = h.store.reconcile_outcome_attempts.get();
             webhook_ok(&deliver("evt_row6"));
@@ -22957,6 +23087,204 @@ mod tests {
                 event.action
             );
         }
+    }
+
+    #[test]
+    fn admin_invite_window_routes_require_browser_admin_and_write_origin() {
+        use crate::native_rest::{scope_for_operation, RouteDecision, ADMIN_INVITE_WINDOWS_PATH};
+        let h = harness();
+        seed_user(&h, "member", "member@example.com");
+        let member = magic_login(&h, "member@example.com");
+        let admin = seed_admin(&h, "admin", "admin@example.com");
+        let stale_ctx = Ctx {
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            ..h.ctx()
+        };
+        let assert_hidden = |response: Response| {
+            assert_eq!(response.status, 404);
+            assert_eq!(response.body, not_found().body);
+        };
+        for (method, path) in [
+            ("GET", ADMIN_INVITE_WINDOWS_PATH),
+            ("POST", ADMIN_INVITE_WINDOWS_PATH),
+            ("POST", "/v1/admin/invite-windows/1/close"),
+        ] {
+            assert_eq!(
+                scope_for_operation(method, path),
+                RouteDecision::SessionOnly
+            );
+            for cookie in [None, Some(member.clone())] {
+                assert_hidden(h.call_full(method, path, None, cookie, Some(ORIGIN)));
+            }
+            let mut request = Request {
+                method: method.into(),
+                path: path.into(),
+                cookie: None,
+                origin: Some(ORIGIN.into()),
+                authorization: Some("Bearer ntk_synthetic".into()),
+                stripe_signature: None,
+                body: br#"{"starts_at":100,"ends_at":200}"#.to_vec(),
+            };
+            assert_hidden(block_on(handle(&h.ctx(), &request)));
+            request.cookie = Some(admin.clone());
+            assert_hidden(block_on(handle(&h.ctx(), &request)));
+            request.authorization = None;
+            if method == "POST" {
+                for origin in [None, Some("https://foreign.example")] {
+                    assert_hidden(h.call_full(method, path, None, Some(admin.clone()), origin));
+                }
+                let stale = block_on(handle(&stale_ctx, &request));
+                assert_eq!(stale.status, 401);
+                assert!(stale.body.contains("\"code\":\"reauth_required\""));
+            }
+        }
+        assert!(h.store.invite_window_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn admin_invite_window_routes_reject_invalid_paths_and_bodies() {
+        use crate::native_rest::{scope_for_operation, RouteDecision, ADMIN_INVITE_WINDOWS_PATH};
+        let h = harness();
+        let admin = seed_admin(&h, "admin", "admin@example.com");
+        let close = "/v1/admin/invite-windows/1/close";
+        for (method, path) in [
+            ("GET", close),
+            ("DELETE", ADMIN_INVITE_WINDOWS_PATH),
+            ("POST", "/v1/admin/invite-windows/"),
+            ("POST", "/v1/admin/invite-windows//close"),
+            ("POST", "/v1/admin/invite-windows/0/close"),
+            ("POST", "/v1/admin/invite-windows/-1/close"),
+            ("POST", "/v1/admin/invite-windows/01/close"),
+            ("POST", "/v1/admin/invite-windows/%31/close"),
+            ("POST", "/v1/admin/invite-windows/9223372036854775808/close"),
+            ("POST", "/v1/admin/invite-windows/1/x/close"),
+            ("POST", "/v1/admin/invite-windows/1/close/"),
+        ] {
+            assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
+            let response = h.call_full(method, path, None, Some(admin.clone()), Some(ORIGIN));
+            assert_eq!(response.status, 404, "{method} {path}");
+            assert_eq!(response.body, not_found().body);
+        }
+        for body in [
+            "{",
+            "{}",
+            "[100,200,null]",
+            r#"{"starts_at":"100","ends_at":200}"#,
+            r#"{"starts_at":100,"starts_at":101,"ends_at":200}"#,
+            r#"{"starts_at":100,"ends_at":200,"actor":"someone"}"#,
+        ] {
+            let response = h.call_full(
+                "POST",
+                ADMIN_INVITE_WINDOWS_PATH,
+                Some(body.into()),
+                Some(admin.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(response.status, 422, "{body}");
+            assert!(response.body.contains("\"code\":\"validation_failed\""));
+        }
+        assert!(h.store.invite_window_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn admin_invite_window_routes_forward_writes_and_map_store_outcomes() {
+        use crate::native_rest::ADMIN_INVITE_WINDOWS_PATH;
+        use InviteWindowOutcome as Outcome;
+        let h = harness();
+        let admin = seed_admin(&h, "admin", "admin@example.com");
+        let window = |id, ends_at| InviteWindow {
+            id,
+            starts_at: 100,
+            ends_at,
+            created_by: Some("admin".into()),
+            note: Some("first cohort".into()),
+        };
+        let call = |method: &str, path: &str, body: Option<&str>, origin: Option<&str>| {
+            h.call_full(
+                method,
+                path,
+                body.map(str::to_owned),
+                Some(admin.clone()),
+                origin,
+            )
+        };
+        *h.store.invite_window_list.borrow_mut() = Some(vec![window(7, 200), window(3, 100)]);
+        let response = call("GET", ADMIN_INVITE_WINDOWS_PATH, None, None);
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+            serde_json::json!({"windows": [window(7, 200), window(3, 100)]})
+        );
+        assert_eq!(
+            call("GET", ADMIN_INVITE_WINDOWS_PATH, None, None).status,
+            500
+        );
+
+        h.store.invite_window_outcomes.borrow_mut().extend([
+            Outcome::Window(window(7, 200)),
+            Outcome::InvalidSchedule,
+            Outcome::Overlap,
+            Outcome::Window(window(7, 150)), // active close
+            Outcome::Window(window(3, 100)), // future cancellation
+            Outcome::Window(window(3, 100)), // idempotent return of retained row
+            Outcome::Missing,
+            Outcome::ActorNotAdmin, // store's locked recheck lost the role race
+        ]);
+        let schedule = |body| call("POST", ADMIN_INVITE_WINDOWS_PATH, Some(body), Some(ORIGIN));
+        let body = r#"{"starts_at":100,"ends_at":200,"note":"first cohort"}"#;
+        let body_with_whitespace = format!(" \n\t{body}");
+        let created = schedule(&body_with_whitespace);
+        assert_eq!(created.status, 201);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&created.body).unwrap(),
+            serde_json::json!({"window": window(7, 200)})
+        );
+        assert_eq!(schedule(r#"{"starts_at":200,"ends_at":100}"#).status, 422);
+        let overlap = schedule(body);
+        assert_eq!(overlap.status, 409);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&overlap.body).unwrap(),
+            serde_json::json!({"code": "conflict", "message": "invite windows cannot overlap", "retryable": false})
+        );
+
+        let close = |id| {
+            call(
+                "POST",
+                &format!("{ADMIN_INVITE_WINDOWS_PATH}/{id}/close"),
+                None,
+                Some(ORIGIN),
+            )
+        };
+        for (id, end) in [(7, 150), (3, 100), (3, 100)] {
+            let response = close(id);
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+                serde_json::json!({"window": window(id, end)})
+            );
+        }
+        for id in [404, 7] {
+            let response = close(id);
+            assert_eq!(response.status, 404);
+            assert_eq!(response.body, not_found().body);
+        }
+        assert_eq!(close(3).status, 500);
+        assert_eq!(
+            *h.store.invite_window_calls.borrow(),
+            [
+                serde_json::json!("list"),
+                serde_json::json!("list"),
+                serde_json::json!(["admin", "198.51.100.9", NOW, [100, 200, "first cohort"]]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, [200, 100, null]]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, [100, 200, "first cohort"]]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 7]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 3]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 3]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 404]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 7]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 3]),
+            ]
+        );
     }
 
     #[test]

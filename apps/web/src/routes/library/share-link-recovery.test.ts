@@ -8,7 +8,6 @@ import { clearFavoritesAtAuthBoundary, loadFavorites, selectFavoriteItems } from
 import { clearRecentFindsAtAuthBoundary, loadRecentFinds } from '#lib/library/recent-finds.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
 import { displayArtist, displayTitle, orderLibraryItems, shortTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
@@ -55,15 +54,14 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
 		createQueueShare,
-		createPlayerController: (initial: queueFunctions.QueueState, end: Parameters<typeof createPlayerController>[1]) =>
-			createPlayerController(initial, end, (audio, source) => audio.isConnected && audio.getAttribute('src') === source),
+		getAppPlayer: () =>
+			createPlayerController(queueFunctions.createQueue([]), { flush: tick }, (audio, source) => audio.isConnected && audio.getAttribute('src') === source),
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
 		insertTracks: queueFunctions.insertTracks, survivingInteractionIds,
 		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
-		clearMiniPlayerHint,
 		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag,
 		browserStorage: () => null,
@@ -78,13 +76,14 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
 		let renderedItems, playDisplayedDisabled = false;
+		function endSession() { player.purgeAtAuthBoundary(); handleLocalAuthTransition(); }
 		return {
-			refresh, applyShareLink, handleLocalAuthTransition, selectTrack,
+			refresh, applyShareLink, handleLocalAuthTransition: endSession, selectTrack,
 			requiresSignIn: () => refresher.state.requiresSignIn,
-			attachNativeAudio, playQueuedTrack, subscribe: queueController.subscribe,
+			attachNativeAudio: media.attach, playQueuedTrack, subscribe: queueController.subscribe,
 			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
 			source: queueController.sourceForQueuedPlay,
-			endSession: handleLocalAuthTransition, dispose: refresher.dispose,
+			endSession, dispose: refresher.dispose,
 			setAudio: media.attach,
 			currentAudio: () => media.audio,
 			attachmentVersion: () => media.attachmentVersion,

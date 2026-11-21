@@ -32,8 +32,9 @@ use crate::auth::{
 };
 use crate::handlers::{
     self, AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome, AsyncDns,
-    ChallengeRow, Config, Dialer, Mailer, NativeCredentialRow, PairAdmission, PlanRow,
-    QaIssuedCode, RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord,
+    ChallengeRow, Config, Dialer, InviteWindow, InviteWindowOutcome, InviteWindowWrite, Mailer,
+    NativeCredentialRow, PairAdmission, PlanRow, QaIssuedCode, RateLimitBudget, Store, StoreError,
+    SubscriptionRow, UserRecord,
 };
 #[allow(dead_code)] // Prepared for the separately qualified owned billing transport.
 #[path = "billing_budget.rs"]
@@ -2981,6 +2982,136 @@ async fn admin_revoke_invite_on(
         .map_err(|_| StoreError)?;
     transaction.commit().await.map_err(|_| StoreError)?;
     Ok(AdminInviteRevokeOutcome::Revoked)
+}
+
+fn invite_window_from_row(row: &tokio_postgres::Row) -> Result<InviteWindow, StoreError> {
+    Ok(InviteWindow {
+        id: row.try_get("id").map_err(|_| StoreError)?,
+        starts_at: row.try_get("starts_at").map_err(|_| StoreError)?,
+        ends_at: row.try_get("ends_at").map_err(|_| StoreError)?,
+        created_by: row.try_get("created_by").map_err(|_| StoreError)?,
+        note: row.try_get("note").map_err(|_| StoreError)?,
+    })
+}
+
+async fn admin_list_invite_windows_on(
+    client: &tokio_postgres::Client,
+) -> Result<Vec<InviteWindow>, StoreError> {
+    let rows = client
+        .query_typed(
+            "SELECT id, starts_at, ends_at, created_by, note FROM invite_windows ORDER BY id DESC LIMIT 200",
+            &[],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    rows.iter().map(invite_window_from_row).collect()
+}
+
+async fn admin_write_invite_window_on(
+    client: &mut tokio_postgres::Client,
+    actor: &str,
+    write: InviteWindowWrite<'_>,
+    source_ip: &str,
+    now: u64,
+) -> Result<InviteWindowOutcome, StoreError> {
+    use InviteWindowOutcome as Outcome;
+    let transaction = client.transaction().await.map_err(|_| StoreError)?;
+    if !admin_actor_locked(&transaction, actor).await? {
+        return Ok(Outcome::ActorNotAdmin);
+    }
+    let now = i64_of(now)?;
+    let (row, action) = match write {
+        InviteWindowWrite::Schedule(schedule) => {
+            if schedule.starts_at < 0
+                || schedule.starts_at >= schedule.ends_at
+                || schedule
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.len() > 512 || note.contains('\0'))
+            {
+                return Ok(Outcome::InvalidSchedule);
+            }
+            let inserted = transaction
+                .query_typed_opt(
+                    "INSERT INTO invite_windows (starts_at, ends_at, created_by, note) \
+                     VALUES ($1, $2, $3, $4) RETURNING id, starts_at, ends_at, created_by, note",
+                    &[
+                        (&schedule.starts_at, Type::INT8),
+                        (&schedule.ends_at, Type::INT8),
+                        (&actor, Type::TEXT),
+                        (&schedule.note, Type::TEXT),
+                    ],
+                )
+                .await;
+            match inserted {
+                Ok(Some(row)) => (row, "invite.window_scheduled"),
+                Err(err)
+                    if err.as_db_error().is_some_and(|db| {
+                        db.code() == &tokio_postgres::error::SqlState::EXCLUSION_VIOLATION
+                            && db.constraint() == Some("invite_windows_no_overlap")
+                    }) =>
+                {
+                    return Ok(Outcome::Overlap)
+                }
+                _ => return Err(StoreError),
+            }
+        }
+        InviteWindowWrite::Close(id) => {
+            // Request timestamps can arrive out of order under the lock. Use the
+            // committed close audit to recognize a prior close even with stale `now`.
+            let shortened = transaction
+                .query_typed_opt(
+                    "UPDATE invite_windows AS w SET ends_at = GREATEST(w.starts_at, $2) \
+                     WHERE w.id = $1 AND w.ends_at > GREATEST(w.starts_at, $2) \
+                       AND NOT EXISTS (SELECT 1 FROM audit_log a \
+                           WHERE a.action = 'invite.window_closed' AND a.at = w.ends_at \
+                             AND a.details->'window_id' = to_jsonb(w.id)) \
+                     RETURNING id, starts_at, ends_at, created_by, note",
+                    &[(&id, Type::INT8), (&now, Type::INT8)],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+            let Some(row) = shortened else {
+                // Already ended or empty: return the retained row without another audit.
+                let existing = transaction
+                    .query_typed_opt(
+                        "SELECT id, starts_at, ends_at, created_by, note FROM invite_windows WHERE id = $1",
+                        &[(&id, Type::INT8)],
+                    )
+                    .await
+                    .map_err(|_| StoreError)?;
+                return match existing {
+                    Some(row) => Ok(Outcome::Window(invite_window_from_row(&row)?)),
+                    None => Ok(Outcome::Missing),
+                };
+            };
+            let starts_at: i64 = row.try_get("starts_at").map_err(|_| StoreError)?;
+            (
+                row,
+                if now < starts_at {
+                    "invite.window_cancelled"
+                } else {
+                    "invite.window_closed"
+                },
+            )
+        }
+    };
+    let window = invite_window_from_row(&row)?;
+    transaction
+        .query_typed(
+            "INSERT INTO audit_log (user_id, action, ok, source_ip, at, details) \
+             VALUES ($1, $2, TRUE, $3, $4, jsonb_build_object('window_id', $5, 'starts_at', $6, 'ends_at', $7))",
+            &[
+                (&actor, Type::TEXT), (&action, Type::TEXT),
+                (&crate::vault::sanitize_source_ip(Some(source_ip)), Type::TEXT),
+                (&now, Type::INT8), (&window.id, Type::INT8),
+                (&window.starts_at, Type::INT8), (&window.ends_at, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    transaction.commit().await.map_err(|_| StoreError)?;
+    Ok(Outcome::Window(window))
 }
 
 impl Store for PgStore {
@@ -5957,6 +6088,31 @@ impl Store for PgStore {
         .await
     }
 
+    async fn admin_list_invite_windows(&self) -> Result<Vec<InviteWindow>, StoreError> {
+        Self::bounded(
+            async { admin_list_invite_windows_on(&self.connect().await?).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_write_invite_window(
+        &self,
+        actor: &str,
+        write: InviteWindowWrite<'_>,
+        source_ip: &str,
+        now: u64,
+    ) -> Result<InviteWindowOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_write_invite_window_on(&mut client, actor, write, source_ip, now).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn reserve_rate_limit(
         &self,
         scope_key: &str,
@@ -8010,6 +8166,16 @@ mod tests {
             };
             assert_eq!(kind, "statement_failed", "unexpected db failure kind");
             let site = format!("self.statement_failed(\"{event}\")");
+            if operation == "store_reconcile_outcome" {
+                assert!(method.contains("self.store_reconcile_owned("));
+                let mut helpers = production.split("async fn store_reconcile_owned(").skip(1);
+                for target in ["WASM", "native"] {
+                    let (body, _) = helpers.next().unwrap().split_once("\n    }\n").unwrap();
+                    assert!(body.contains(&site), "{target} must emit {event}");
+                }
+                assert!(helpers.next().is_none());
+                continue;
+            }
             assert!(method.contains(&site), "{operation} must emit {event}");
         }
     }
