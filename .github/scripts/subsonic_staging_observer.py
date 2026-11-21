@@ -112,10 +112,29 @@ def parse_sample(raw, since, now):
     return row
 
 
-def sample(env, run=subprocess.run, wall=time.time, monotonic=time.monotonic):
+class PressureObservation(NamedTuple):
+    observed_ms: int
+    measurement: int
+    ordinary_free: int
+
+
+def _sample(env, run, wall, monotonic, deadline_ms=None):
     child = connection_env(env)
     started = monotonic()
-    since = wall()
+    started_ms = started * 1000
+    observed_ms = int(started_ms)
+    timeout = DEADLINE_SECONDS
+    if deadline_ms is None:
+        since = wall()
+    else:
+        cutoff_ms = min(deadline_ms, observed_ms + MAX_SAMPLE_AGE_SECONDS * 1000)
+        if not started_ms < cutoff_ms:
+            raise UnsafeSample("deadline")
+        since = wall()
+        dispatch_ms = monotonic() * 1000
+        if not started_ms <= dispatch_ms < cutoff_ms:
+            raise UnsafeSample("deadline")
+        timeout = (cutoff_ms - dispatch_ms) / 1000
     try:
         result = run(
             [
@@ -131,18 +150,45 @@ def sample(env, run=subprocess.run, wall=time.time, monotonic=time.monotonic):
             input=SQL.encode("ascii"),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=DEADLINE_SECONDS,
+            timeout=timeout,
             env=child,
         )
     except subprocess.TimeoutExpired:
         raise UnsafeSample("deadline") from None
     except (OSError, ValueError):
         raise UnsafeSample("client") from None
-    if monotonic() - started > DEADLINE_SECONDS:
+    finished = monotonic()
+    if deadline_ms is None:
+        # Keep the smoke CLI's original inclusive elapsed-time limit.
+        if finished - started > DEADLINE_SECONDS:
+            raise UnsafeSample("deadline")
+    elif not dispatch_ms <= finished * 1000 < cutoff_ms:
         raise UnsafeSample("deadline")
     if result.returncode != 0:
         raise UnsafeSample("query")
-    return parse_sample(result.stdout, since, wall())
+    row = parse_sample(result.stdout, since, wall())
+    if deadline_ms is not None:
+        validated_ms = monotonic() * 1000
+        if not finished * 1000 <= validated_ms < cutoff_ms:
+            raise UnsafeSample("deadline")
+    return observed_ms, row
+
+
+def sample(env, run=subprocess.run, wall=time.time, monotonic=time.monotonic):
+    return _sample(env, run, wall, monotonic)[1]
+
+
+def sample_pressure(
+    env, *, deadline_ms, run=subprocess.run, wall=time.time, monotonic=time.monotonic
+):
+    """Read once, under an absolute monotonic deadline; do not admit or retry."""
+    if type(deadline_ms) is not int or deadline_ms < 0:
+        raise UnsafeSample("deadline")
+    observed_ms, row = _sample(env, run, wall, monotonic, deadline_ms)
+    # The timestamp and count came from a new connection. Using the start of
+    # that query's local time bracket is conservative: a query begun before a
+    # drain fence cannot provide post-fence evidence merely by returning later.
+    return PressureObservation(observed_ms, row.measurement, row.ordinary_free)
 
 
 def require_preflight(row):
