@@ -35,13 +35,13 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 			}
 		};
 		try {
-			if (inherited != null) writePort.playbackRate = inherited; // Live handoff, not a preference write.
-			else if (request === undefined) preference?.apply();
+			if (inherited != null) { // Live handoff, not a preference write.
+				if (read(current) !== inherited) writePort.playbackRate = inherited;
+			} else if (request === undefined) preference?.apply();
 			else preference?.set(request);
-		} catch { /* A refused handoff still allows play at the observed rate. */ } finally {
+		} catch { /* Still show native readback if the setter throws. */ } finally {
 			writePort = previousPort;
 		}
-		// A throwing setter never persists, but its readable actual rate still belongs in the UI.
 		const rate = observed === undefined ? read(current) : observed;
 		if (!current.matches()) return;
 		const feedback = rate === intended ? '' : rate === null
@@ -74,7 +74,7 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 			state.set(unavailable);
 			if (current) write(undefined, current, inherit?.());
 		},
-		reapply: (current: RateTarget) => write(undefined, current),
+		reapply: (current: RateTarget, inherited?: number) => write(undefined, current, inherited),
 		retire: () => state.set(unavailable),
 		set(rate: number): number | null {
 			if (preference && !writePort) write(rate);

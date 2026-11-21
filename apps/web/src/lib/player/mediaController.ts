@@ -490,6 +490,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (!matches()) return;
 			clearJumpFeedback();
 			const play = target.play;
+			if (replacing && playbackRate !== null) speed.reapply({ audio: target, matches }, playbackRate);
 			if (!matches()) return;
 			await play.call(target);
 			// A captured play promise can fulfill before the queued pause event runs.
