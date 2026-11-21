@@ -52,7 +52,10 @@ existing staging infrastructure with no new service or spend.
 - Name-only placement metadata (source task, after reviews and separate
   authorization): service token `nntune-subsonic-staging-runner`, runner inputs
   `access_client_id`, `access_client_secret` and `bearer`, Worker staging secret
-  `SUBSONIC_MEASUREMENT_RUNNER`. No workflow consumes these inputs in this slice.
+  `SUBSONIC_MEASUREMENT_RUNNER`. Measurement admission also requires the
+  existing Worker staging flag `QA_CODE_SEAM=1`. Verify it only during a
+  separately authorized measurement window. This draft leaves the flag unset
+  wherever it is currently off. No workflow consumes these inputs in this slice.
   The Operator stages the dedicated Worker binding and runner inputs through
   approved secret handling, never in repo config, logs, argv or cards. No
   fallback to shared QA, health or deploy credentials; those stay unchanged.
