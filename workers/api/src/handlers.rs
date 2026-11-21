@@ -571,6 +571,32 @@ pub enum MemberInviteIssueOutcome {
     AccountDeleting,
 }
 
+/// Informational only: eligibility excludes the window and quota gates.
+#[derive(Debug, serde::Serialize)]
+pub struct MemberInviteSummary {
+    pub paid_seconds: i64,
+    pub required_paid_seconds: i64,
+    pub entitled: bool,
+    pub eligible: bool,
+    pub per_window_limit: i64,
+    pub open_window: Option<MemberInviteOpenWindow>,
+    pub next_window: Option<MemberInviteWindowBounds>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MemberInviteWindowBounds {
+    pub starts_at: i64,
+    pub ends_at: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MemberInviteOpenWindow {
+    #[serde(flatten)]
+    pub bounds: MemberInviteWindowBounds,
+    pub used: i64,
+    pub remaining: i64,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct InviteWindow {
     pub id: i64,
@@ -1546,6 +1572,13 @@ pub trait Store {
         _source_ip: &str,
         _now: u64,
     ) -> impl Future<Output = Result<AdminInviteIssueOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Read the issuer's summary; `None` means the issuer is absent or deleting.
+    fn member_invite_summary(
+        &self,
+        _issuer: &str,
+    ) -> impl Future<Output = Result<Option<MemberInviteSummary>, StoreError>> {
         async { Err(StoreError) }
     }
     fn member_issue_invite(
@@ -6133,6 +6166,29 @@ where
     )
 }
 
+/// Browser-session read only; do not use invite lookups that observe expiry.
+async fn member_invite_summary(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+) -> Response {
+    let mut response = if req.authorization.is_some() {
+        not_found()
+    } else {
+        match ctx.authenticate(req, false).await {
+            Ok((claims, _)) => match ctx.store.member_invite_summary(&claims.user_id).await {
+                Ok(Some(summary)) => json_response(200, serde_json::json!(summary)),
+                Ok(None) => account_deleting_response(),
+                Err(_) => internal(),
+            },
+            Err(response) => response,
+        }
+    };
+    response
+        .extra_headers
+        .push(("cache-control".into(), "private, no-store".into()));
+    response
+}
+
 /// Bodyless browser issuance for the authenticated principal.
 async fn member_invite_issue(
     ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
@@ -8097,6 +8153,7 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
+        ("GET", crate::native_rest::MEMBER_INVITES_PATH) => member_invite_summary(ctx, req).await,
         ("POST", crate::native_rest::MEMBER_INVITES_PATH) => member_invite_issue(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
         ("GET", "/v1/me/likes/session") => me_likes_session(ctx, req).await,
@@ -8344,6 +8401,7 @@ mod tests {
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
         member_invite_calls: RefCell<Vec<(String, String)>>,
+        member_invite_summary_calls: RefCell<Vec<String>>,
         invite_window_list: RefCell<Option<Vec<InviteWindow>>>,
         invite_window_outcomes: RefCell<std::collections::VecDeque<InviteWindowOutcome>>,
         invite_window_calls: RefCell<Vec<serde_json::Value>>,
@@ -9011,6 +9069,34 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn member_invite_summary(
+            &self,
+            issuer: &str,
+        ) -> Result<Option<MemberInviteSummary>, StoreError> {
+            self.member_invite_summary_calls
+                .borrow_mut()
+                .push(issuer.into());
+            Ok(Some(MemberInviteSummary {
+                paid_seconds: 86_400,
+                required_paid_seconds: 7_776_000,
+                entitled: true,
+                eligible: false,
+                per_window_limit: 2,
+                open_window: Some(MemberInviteOpenWindow {
+                    bounds: MemberInviteWindowBounds {
+                        starts_at: 1,
+                        ends_at: 2,
+                    },
+                    used: 1,
+                    remaining: 1,
+                }),
+                next_window: Some(MemberInviteWindowBounds {
+                    starts_at: 3,
+                    ends_at: 4,
+                }),
+            }))
+        }
+
         async fn member_issue_invite(
             &self,
             issuer: &str,
@@ -23204,6 +23290,54 @@ mod tests {
                 event.action
             );
         }
+    }
+
+    #[test]
+    fn member_invite_summary_is_private_and_session_scoped() {
+        use crate::native_rest::{scope_for_operation, RouteDecision, MEMBER_INVITES_PATH as PATH};
+        let h = harness();
+        seed_user(&h, "member", "member@example.com");
+        let session = magic_login(&h, "member@example.com");
+        let audits = h.store.audits.borrow().len();
+        assert_eq!(scope_for_operation("GET", PATH), RouteDecision::SessionOnly);
+        let mut req = Request {
+            method: "GET".into(),
+            path: PATH.into(),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"issuer":"other"}"#.to_vec(),
+        };
+        let call = |req| block_on(handle(&h.ctx(), req));
+        assert_eq!(call(&req).status, 401);
+        req.authorization = Some("Bearer ntk_synthetic".into());
+        assert_eq!(call(&req).status, 404);
+        req.cookie = Some(session);
+        assert_eq!(call(&req).status, 404, "never fall back to the cookie");
+        assert!(h.store.member_invite_summary_calls.borrow().is_empty());
+        req.authorization = None;
+        let response = call(&req);
+        assert_eq!(response.status, 200);
+        assert!(response
+            .extra_headers
+            .contains(&("cache-control".into(), "private, no-store".into())));
+        assert!(response.set_cookie.is_none());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+            serde_json::json!({
+                "paid_seconds": 86_400, "required_paid_seconds": 7_776_000,
+                "entitled": true, "eligible": false, "per_window_limit": 2,
+                "open_window": {"starts_at": 1, "ends_at": 2, "used": 1, "remaining": 1},
+                "next_window": {"starts_at": 3, "ends_at": 4},
+            })
+        );
+        assert_eq!(
+            *h.store.member_invite_summary_calls.borrow(),
+            ["member".to_owned()]
+        );
+        assert!(h.store.member_invite_calls.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audits);
     }
 
     #[test]
