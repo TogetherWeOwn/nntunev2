@@ -23057,8 +23057,7 @@ mod tests {
             .extra_headers
             .contains(&("cache-control".into(), "private, no-store".into())));
         let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
-        let code = body["code"].as_str().unwrap();
-        let hash = auth::hash_invite_code(code);
+        let hash = auth::hash_invite_code(body["code"].as_str().unwrap());
         let calls = h.store.member_invite_calls.borrow();
         assert_eq!(*calls, [("member".to_owned(), hash)]);
     }

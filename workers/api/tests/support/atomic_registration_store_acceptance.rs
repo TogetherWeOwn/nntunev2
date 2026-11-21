@@ -2477,10 +2477,8 @@ fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() 
         let outcome = issue(&mut db, &issuer, &first, ip).await.unwrap();
         assert_eq!(outcome, Outcome::Ineligible);
         // A disjoint term on an older subscription makes exactly 90 days.
-        let qualified = format!(
-            "{history} FROM (VALUES ($1::text,120,150,800),
-            ($2::text,1,91,800)) AS terms(u,s,e,cents)"
-        );
+        let terms = "($1::text,120,150,800),($2::text,1,91,800)";
+        let qualified = format!("{history} FROM (VALUES {terms}) AS terms(u,s,e,cents)");
         db.execute(&qualified, &[&issuer, &peer]).await.unwrap();
         let status_sql = "UPDATE subscriptions SET status = $2 WHERE user_id = $1";
         db.execute(status_sql, &[&issuer, &"unpaid"]).await.unwrap();
