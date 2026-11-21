@@ -63,6 +63,7 @@ pub mod rate_limit;
 pub mod rotation;
 pub mod session;
 pub mod session_retry_store;
+pub mod storage_digest_read;
 pub mod stripe;
 pub mod subsonic_auth;
 pub mod subsonic_config;
