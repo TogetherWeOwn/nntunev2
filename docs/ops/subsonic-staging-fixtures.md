@@ -41,12 +41,14 @@ existing staging infrastructure with no new service or spend.
   also match subpaths. The Worker checks the exact `POST` and serialized
   pathname and HTTPS staging host before body reads or fixture DB access. No
   alias or pathname decoding in the mount. Off/unsupported requests stay with
-  the ordinary adapter. The runner independently pins the whole HTTPS URL and
-  method before curl spawns, without redirects. Check normalization settings
-  before placement: if the edge rewrites alternate spellings into admitted
-  paths before Worker Fetch, the Worker cannot recover the original spelling.
-  If existing access cannot be preserved or the narrow boundary cannot be
-  enforced, leave the draft unapplied; do not substitute a broader policy.
+  the ordinary adapter, so Worker refusal of measurement admission does not
+  restrict the dedicated identity's access to ordinary routes. Before placement,
+  verify effective Access denies that identity on other methods, descendants,
+  aliases and sibling paths while preserving existing callers' access. Check
+  both edge normalization and Fetch URL parsing, which can normalize a path
+  before the Worker compares it. The runner independently pins the whole HTTPS
+  URL and method before curl spawns, without redirects. If either boundary
+  cannot be enforced, leave the draft unapplied.
 - Name-only placement metadata (source task, after reviews and separate
   authorization): service token `nntune-subsonic-staging-runner`, runner inputs
   `access_client_id`, `access_client_secret` and `bearer`, Worker staging secret
