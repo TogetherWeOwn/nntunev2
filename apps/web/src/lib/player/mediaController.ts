@@ -5,6 +5,7 @@ import { resolveStreamUrl } from '../library/stream-url.js';
 import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
+import { createNativeSound } from './nativeSound.js';
 import { createPendingShareSeek } from './pendingShareSeek.js';
 import { restartIsAvailable } from './restartAvailability.js';
 import { bindSystemTransport } from './systemTransport.js';
@@ -52,6 +53,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let playIntent = 0;
 	let pendingPlay: { result: Promise<PlayOutcome>; finish: (outcome: PlayOutcome) => void } | undefined;
 	const playbackStatus = writable<PlaybackStatus>('unavailable');
+	const sound = createNativeSound();
 	const repeat = writable<RepeatMode>('off');
 	const seekFeedback = writable({ restartCanSeek: false, restartStatus: '', restartStatusVersion: 0,
 		jumpStatus: '', jumpStatusVersion: 0 });
@@ -489,7 +491,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const track = currentTrack(result.queue);
 		const streamUrl = resolveStreamUrl(track);
 		const replacing = currentTrack(base)?.id !== track?.id || source !== streamUrl;
-		const { volume, muted, playbackRate } = audio;
+		const { playbackRate } = audio;
+		if (!ownsOrigin()) return;
+		// Queue commit captures sound for replacements; replay keeps this attachment.
+		if (!replacing) sound.observe();
 		if (!ownsOrigin()) return;
 		// Replay supersedes a deferred share even when the native source survives.
 		browseCopy.invalidate();
@@ -508,10 +513,6 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const target = replay.audio;
 		const matches = () => matchesSource(target, streamUrl, isCurrent);
 		try {
-			if (!matches()) return;
-			target.volume = volume;
-			if (!matches()) return;
-			target.muted = muted;
 			if (!matches()) return;
 			target.playbackRate = playbackRate;
 			runPosition(() => { if (matches()) target.currentTime = 0; });
@@ -532,6 +533,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	return {
 		repeat: { subscribe: repeat.subscribe },
+		sound: { state: sound.state, setVolume: sound.setVolume, toggleMute: sound.toggleMute },
+		observeSound: sound.observe,
 		seekFeedback: { subscribe: seekFeedback.subscribe },
 		absoluteSeek: { subscribe: absoluteSeek.subscribe }, seek,
 		playbackStatus: { subscribe: playbackStatus.subscribe },
@@ -649,6 +652,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			listenForNativeEvents();
 			const target = transportTarget();
 			if (target?.attachment === receipt) {
+				sound.connect(audio, target.matches, receipt.listeners.signal);
 				readPlayback(audio, target.matches, 'starting');
 				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
 					{ playCurrent: () => startCurrent(false), pauseCurrent }, receipt.listeners.signal);

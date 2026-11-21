@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ComponentProps } from 'svelte';
+	import type { ComponentProps, Snippet } from 'svelte';
 	import { displayArtist, displayTitle } from '../library/order.js';
 	import NativeAudio from './NativeAudio.svelte';
 	import PlayerSeek from './PlayerSeek.svelte';
@@ -12,8 +12,9 @@
 		playbackStatus, playCurrent, pauseCurrent, retryCurrent,
 		seekState, seek,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
-		jumpStatus, jumpStatusVersion, jumpRelative
+		jumpStatus, jumpStatusVersion, jumpRelative, volumeControls
 	}: ComponentProps<typeof NativeAudio> & {
+		volumeControls: Snippet;
 		currentTrack: Pick<Track, 'id' | 'title' | 'artist'> | null;
 		seekState: ComponentProps<typeof PlayerSeek>['state'];
 		seek: ComponentProps<typeof PlayerSeek>['seek'];
@@ -73,6 +74,7 @@
 		</button>
 	</div>
 	{#key seekState.attachment}<PlayerSeek state={seekState} {seek} />{/key}
+	{@render volumeControls()}
 	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
 	{#if !restartCanSeek}
 		<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
