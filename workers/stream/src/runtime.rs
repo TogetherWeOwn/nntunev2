@@ -2,7 +2,7 @@
 //! per-user `NntpPool` Durable Object with its internal routes.
 //!
 //! - The Worker's public `fetch` serves only `GET /play/{track_id}`
-//!   ([`crate::play_route`]): the signed `v2` grant is verified before any
+//!   ([`crate::play_route`]): the signed play grant is verified before any
 //!   source is touched (no grant → no bytes), then the requested range is
 //!   served from the R2 popularity cache (`AUDIO_CACHE`) and the
 //!   client-written byte interval of the completed response is reported
@@ -31,29 +31,27 @@
 //! warm provider connection parked in the pool is reused by later requests.
 
 use std::cell::{OnceCell, RefCell};
-use std::pin::Pin;
-use std::task::{Context as PollContext, Poll};
 use std::time::Duration;
 
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use nntune_core::nntp::NntpClient;
 use nntune_core::transports::WorkerTransport;
 use worker::wasm_bindgen::JsValue;
 use worker::{
-    durable_object, event, ByteStream, Context, Date, Delay, DurableObject, Env, Headers, Method,
-    Range, Request, RequestInit, Response, Result, State,
+    durable_object, event, Context, Date, Delay, DurableObject, Env, Headers, Method, Range,
+    Request, RequestInit, Response, Result, State,
 };
 
 use crate::api_error::ApiError;
 use crate::body::{parse_body_request, run_body, BodyReply, MAX_BODY_REQUEST_BYTES};
 use crate::delivered::{parse_delivered_report, DeliveredInterval, MAX_DELIVERED_REQUEST_BYTES};
-use crate::grant;
 use crate::meter_sink::{self, MeterBook};
-use crate::play_route::{self, PLAY_CONTENT_TYPE, TRACK_MANIFEST_SUFFIX};
+use crate::play_route::{self, TRACK_MANIFEST_SUFFIX};
 use crate::pool::Pool;
 use crate::probe::{
     parse_request, run_probe, PoolProvider, ProbeError, ProbeReply, WallClock, MAX_PROBE_BODY_BYTES,
 };
+use crate::r2_play;
 use crate::range::{self, RangeOutcome};
 use crate::routes::{self, PoolAction, ProbeDecision, PublicRoute};
 
@@ -101,8 +99,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 }
 
-/// Serve one `GET /play/{track_id}` from the R2 popularity cache:
-/// verify the `v2` grant before touching any source, resolve the HTTP
+/// Serve one `GET /play/{track_id}` from R2:
+/// verify the metered grant before touching any source, resolve the HTTP
 /// range against the cached blob, stream exactly that slice, and report
 /// the client-written interval when the response stream settles.
 async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Result<Response> {
@@ -117,51 +115,21 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
     let authorization = req.headers().get("authorization").ok().flatten();
     let token = play_route::bearer_token(authorization.as_deref()).unwrap_or("");
     let now_unix = Date::now().as_millis() / 1000;
-    let Ok(grant) = grant::verify(token, secret.as_bytes(), now_unix) else {
-        return api_error_response(&ApiError::unauthorized(), None);
+    let play = match r2_play::authorize(token, track_id, secret.as_bytes(), now_unix) {
+        Ok(play) => play,
+        Err(error) => return api_error_response(&error, None),
     };
-    // Same order as the portable route: the `v2` requirement before the
-    // track binding, so a `v1` grant — even one minted for another
-    // track — is a `401`, never a `403`. A `v1` grant carries no play
-    // id to meter against; this route only serves `v2` (see
-    // [`crate::play_route`]).
-    let Some(play_id) = grant.play_id.clone() else {
-        return api_error_response(&ApiError::unauthorized(), None);
-    };
-    if grant.track_id != track_id {
-        return api_error_response(&ApiError::forbidden(), None);
-    }
-
+    let content_type = play.content_type();
     let Ok(bucket) = env.bucket(AUDIO_CACHE_BINDING) else {
         return api_error_response(&ApiError::internal_error(), None);
     };
-    let pointer = match bucket.get(format!("track/{track_id}")).execute().await {
-        Ok(pointer) => pointer,
-        Err(_) => return unavailable(),
-    };
-    let Some(pointer) = pointer else {
-        // No cache pointer: a manifest means a known track the wasm NNTP
-        // adapter does not serve yet; no manifest means unknown track.
-        let manifest_key = format!("track/{track_id}{TRACK_MANIFEST_SUFFIX}");
-        return match bucket.head(manifest_key).await {
-            Ok(Some(_)) => unavailable(),
-            Ok(None) => api_error_response(&ApiError::not_found(), None),
-            Err(_) => unavailable(),
-        };
-    };
-    if pointer.size() > MAX_POINTER_BYTES {
-        return unavailable();
-    }
-    let Some(pointer_body) = pointer.body() else {
-        return unavailable();
-    };
-    let Ok(pointer_bytes) = pointer_body.bytes().await else {
-        return unavailable();
-    };
-    // Pointer shape is portable-core contract (`cache.rs` owns the key
-    // layout and unit-tests it); this adapter only fetches the bytes.
-    let Some(blob_key) = crate::cache::blob_key_for_pointer(&pointer_bytes) else {
-        return unavailable();
+    let blob_key = if let Some(key) = play.artifact_key {
+        key
+    } else {
+        match legacy_blob_key(&bucket, track_id).await {
+            Ok(key) => key,
+            Err(error) => return api_error_response(&error, None),
+        }
     };
     let blob_len = match bucket.head(blob_key.clone()).await {
         Ok(Some(blob)) => blob.size(),
@@ -186,7 +154,8 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
             }
         };
     let headers = Headers::new();
-    headers.set("content-type", PLAY_CONTENT_TYPE)?;
+    headers.set("content-type", content_type)?;
+    headers.set("cache-control", "private, no-store")?;
     headers.set("accept-ranges", "bytes")?;
     headers.set("content-length", &expected.to_string())?;
     if let Some(content_range) = &content_range {
@@ -215,69 +184,53 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
     let Ok(stream) = body.stream() else {
         return unavailable();
     };
-    let metered = MeteredStream {
-        inner: Box::pin(stream),
-        written: 0,
-        expected,
-        report: Some((
-            env,
-            ctx,
-            DeliveredInterval {
-                user_id: grant.user_id.clone(),
-                play_id,
-                track_id: track_id.to_string(),
-                start,
-                end: start,
-                file_bytes: Some(blob_len),
-            },
-        )),
+    let interval = DeliveredInterval {
+        user_id: play.user_id,
+        play_id: play.play_id,
+        track_id: track_id.to_string(),
+        start,
+        end: start,
+        file_bytes: Some(blob_len),
     };
+    let metered = r2_play::meter(stream, expected, move |written| {
+        let interval = DeliveredInterval {
+            end: start + written,
+            ..interval
+        };
+        ctx.wait_until(report_delivered(env, interval));
+    });
     Response::builder()
         .with_headers(headers)
         .with_status(status)
         .from_stream(metered)
 }
 
-/// Response-stream wrapper that counts bytes actually pulled toward the
-/// client and, when the stream settles (completed, errored, or dropped
-/// on client abort), reports the written interval exactly once. The
-/// report rides `wait_until`, so it survives the response finishing.
-struct MeteredStream {
-    inner: Pin<Box<ByteStream>>,
-    written: u64,
-    expected: u64,
-    /// `(env, ctx, interval-template)`; the template's `end` is patched
-    /// from `written` at settle time and the report fires at most once.
-    report: Option<(Env, Context, DeliveredInterval)>,
-}
-
-impl Stream for MeteredStream {
-    type Item = Result<Vec<u8>>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                self.written = self.written.saturating_add(chunk.len() as u64);
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            other => other,
-        }
+/// Resolve the old track pointer for a legacy grant only. A missing signed
+/// rendition must never fall back to a pointer or an original source.
+async fn legacy_blob_key(
+    bucket: &worker::Bucket,
+    track_id: &str,
+) -> core::result::Result<String, ApiError> {
+    let unavailable = ApiError::upstream_unavailable;
+    let pointer = bucket
+        .get(format!("track/{track_id}"))
+        .execute()
+        .await
+        .map_err(|_| unavailable())?;
+    let Some(pointer) = pointer else {
+        // Known manifest-only tracks cannot be served by this adapter yet.
+        let manifest_key = format!("track/{track_id}{TRACK_MANIFEST_SUFFIX}");
+        return Err(match bucket.head(manifest_key).await {
+            Ok(None) => ApiError::not_found(),
+            _ => unavailable(),
+        });
+    };
+    if pointer.size() > MAX_POINTER_BYTES {
+        return Err(unavailable());
     }
-}
-
-impl Drop for MeteredStream {
-    fn drop(&mut self) {
-        if self.written == 0 {
-            return;
-        }
-        let Some((env, ctx, mut interval)) = self.report.take() else {
-            return;
-        };
-        interval.end = interval.start + self.written.min(self.expected);
-        if interval.end > interval.start {
-            ctx.wait_until(report_delivered(env, interval));
-        }
-    }
+    let body = pointer.body().ok_or_else(unavailable)?;
+    let bytes = body.bytes().await.map_err(|_| unavailable())?;
+    crate::cache::blob_key_for_pointer(&bytes).ok_or_else(unavailable)
 }
 
 /// POST one delivered interval to the user's pool object. Bounded
@@ -326,6 +279,7 @@ async fn post_delivered(env: &Env, user_id: &str, body: &str) -> core::result::R
 fn api_error_response(error: &ApiError, extra: Option<(&str, &str)>) -> Result<Response> {
     let headers = Headers::new();
     headers.set("content-type", "application/json")?;
+    headers.set("cache-control", "private, no-store")?;
     if let Some((name, value)) = extra {
         headers.set(name, value)?;
     }
