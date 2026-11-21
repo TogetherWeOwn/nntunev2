@@ -1,171 +1,166 @@
 use super::listen_history_receiver as receiver;
+use serde_json::{from_str, json, Value};
 
-const RECORD_PATH: &str = "/v1/plays/events";
 const CONTEXT_PATH: &str = "/v1/plays/events/context";
+const START: &str = r#"{"playback_id":"40c325c0-2cee-489d-a8b6-fbe937155601","track_id":"catalogue-42","event":"start"}"#;
 
-fn receive_request(cookie: Option<String>, body: serde_json::Value) -> Request {
+fn receive_request(cookie: Option<String>) -> Request {
     Request {
         method: "POST".into(),
-        path: RECORD_PATH.into(),
+        path: CONTEXT_PATH.into(),
         cookie,
         origin: Some(ORIGIN.into()),
         authorization: None,
         stripe_signature: None,
-        body: body.to_string().into_bytes(),
+        body: START.as_bytes().to_vec(),
     }
 }
 
-fn receive_start() -> serde_json::Value {
-    serde_json::json!({"playback_id": "40c325c0-2cee-489d-a8b6-fbe937155601", "track_id": "catalogue-42", "event": "start"})
-}
-
-fn issued_context(response: Response) -> serde_json::Value {
+fn bind_start(response: Response) -> Vec<u8> {
     assert_eq!(response.status, 200);
-    assert!(response
-        .extra_headers
-        .contains(&("cache-control".into(), "private, no-store".into())));
-    response_json(&response)["context"].clone()
-}
-
-fn response_json(response: &Response) -> serde_json::Value {
-    serde_json::from_str(&response.body).unwrap()
+    let no_store = ("cache-control".into(), "private, no-store".into());
+    assert!(response.extra_headers.contains(&no_store));
+    let mut event: Value = from_str(START).unwrap();
+    event["context"] = from_str::<Value>(&response.body).unwrap()["context"].clone();
+    event.to_string().into_bytes()
 }
 
 #[test]
 fn unmounted_history_context_tracks_cookie_refresh_and_key_rotation() {
     let mut h = harness();
     seed_user(&h, "listener-a", "alice@example.com");
-    seed_user(&h, "listener-b", "bob@example.com");
     let first = magic_login(&h, "alice@example.com");
-    let same_account = magic_login(&h, "alice@example.com");
-    let other_account = magic_login(&h, "bob@example.com");
-    let mut context = receive_request(Some(first.clone()), serde_json::Value::Null);
-    context.path = CONTEXT_PATH.into();
-    context.origin = Some("https://example.com:443".into());
-    assert_eq!(block_on(receiver::context(&h.ctx(), &context)).status, 401);
-    context.origin = Some(ORIGIN.into());
-    let previous = issued_context(block_on(receiver::context(&h.ctx(), &context)));
+    let same = magic_login(&h, "alice@example.com");
+    let mut req = receive_request(Some(first.clone()));
+    let previous = bind_start(block_on(receiver::context(&h.ctx(), &req)));
     h.config.session_previous_secret =
         Some(std::mem::replace(&mut h.config.session_secret, vec![7; 32]));
-    let current = issued_context(block_on(receiver::context(&h.ctx(), &context)));
-    assert_ne!(current, previous);
-    let refreshed = h.call_full(
-        "POST",
-        "/v1/session/refresh",
-        None,
-        Some(first.clone()),
-        Some(ORIGIN),
-    );
-    let refreshed = cookie_of(&refreshed);
-    let mut body = receive_start();
-    body["context"] = previous;
-    for (cookie, origin) in [
-        (Some(first), Some(ORIGIN)),
-        (Some(same_account), Some(ORIGIN)),
-        (Some(other_account), Some(ORIGIN)),
-        (None, Some(ORIGIN)),
-        (Some(refreshed.clone()), None),
-        (Some(refreshed.clone()), Some("https://example.com:443")),
-    ] {
-        let mut req = receive_request(cookie, body.clone());
-        req.origin = origin.map(str::to_owned);
-        assert_eq!(block_on(receiver::write(&h.ctx(), &req)).status, 401);
+    let current = bind_start(block_on(receiver::context(&h.ctx(), &req)));
+    req.path = "/v1/session/refresh".into();
+    req.body.clear();
+    let refreshed = cookie_of(&block_on(handle(&h.ctx(), &req)));
+    req.path = CLEAR_PATH.into();
+    req.body = previous;
+    let write = |h: &Harness, req: &Request| block_on(receiver::write(&h.ctx(), req));
+    for cookie in [None, Some(first), Some(same)] {
+        req.cookie = cookie;
+        assert_eq!(write(&h, &req).status, 401);
     }
-    assert!(h.store.listen_owners.borrow().is_empty());
-    let mut req = receive_request(Some(refreshed), body.clone());
-    assert_eq!(block_on(receiver::write(&h.ctx(), &req)).status, 200);
+    req.cookie = Some(refreshed);
+    req.origin = Some("https://example.com:443".into());
+    assert_eq!(write(&h, &req).status, 401);
+    req.origin = Some(ORIGIN.into());
+    assert_eq!(write(&h, &req).status, 200);
     h.config.session_previous_secret = None;
-    assert_eq!(block_on(receiver::write(&h.ctx(), &req)).status, 401);
-    body["context"] = current;
-    req.body = body.to_string().into_bytes();
+    assert_eq!(write(&h, &req).status, 401);
+    req.body = current;
     for _ in 1..120 {
-        assert_eq!(block_on(receiver::write(&h.ctx(), &req)).status, 200);
+        assert_eq!(write(&h, &req).status, 200);
     }
-    let limited = block_on(receiver::write(&h.ctx(), &req));
+    let limited = write(&h, &req);
     assert_eq!((limited.status, limited.retry_after), (429, Some(60)));
-    for (method, path) in [("POST", EXPORT_PATH), ("DELETE", CLEAR_PATH)] {
-        let response = h.call_full(
-            method,
-            path,
-            Some("{}".into()),
-            req.cookie.clone(),
-            Some(ORIGIN),
-        );
-        assert_eq!(response.status, 200);
-    }
-    assert_eq!(
-        h.store.listen_owners.borrow().as_slice(),
-        ["listener-a"; 120]
-    );
+    let owners = h.store.listen_owners.borrow();
+    assert_eq!(owners.as_slice(), ["listener-a"; 120]);
+    req.body = b"{}".to_vec();
+    req.path = EXPORT_PATH.into();
+    assert_eq!(block_on(handle(&h.ctx(), &req)).status, 200);
+    req.path = CLEAR_PATH.into();
+    req.method = "DELETE".into();
+    assert_eq!(block_on(handle(&h.ctx(), &req)).status, 200);
 }
 
 #[test]
 fn unmounted_history_receiver_keeps_bearer_admission_out_of_the_router() {
-    use crate::native_rest::{scope_for_operation, RouteDecision};
-    for (scope, status) in [("plays:write", 200), ("library:read", 403)] {
-        let (h, cookie, secret) = play_bearer_harness(scope, false);
-        let mut req = receive_request(Some(cookie), receive_start());
-        req.authorization = Some("Bearer malformed".into());
-        assert_eq!(block_on(receiver::write(&h.ctx(), &req)).status, 404);
-        req.authorization = Some(format!("Bearer {secret}"));
-        assert_eq!(block_on(receiver::context(&h.ctx(), &req)).status, 404);
+    use crate::native_rest::{scope_for_operation, RouteDecision::Deny};
+    let (h, _, secret) = play_bearer_harness("plays:write", false);
+    seed_user(&h, "listener-b", "bob@example.com");
+    let other = magic_login(&h, "bob@example.com");
+    let mut req = receive_request(None);
+    req.authorization = Some(format!("Bearer {secret}"));
+    for cookie in [None, Some(other)] {
+        req.cookie = cookie;
+        assert_eq!(block_on(receiver::write(&h.ctx(), &req)).status, 200);
+    }
+    assert_eq!(h.store.listen_owners.take(), ["user-plays-1"; 2]);
+    assert_eq!(block_on(receiver::context(&h.ctx(), &req)).status, 404);
+    for path in [CLEAR_PATH, CONTEXT_PATH] {
+        assert_eq!(scope_for_operation("POST", path), Deny);
+    }
+    assert!(!options_preflight_served(CONTEXT_PATH));
+    assert_history_rejections(&h, req);
+    let (h, cookie, secret) = play_bearer_harness("library:read", false);
+    let mut req = receive_request(Some(cookie));
+    req.body = bind_start(block_on(receiver::context(&h.ctx(), &req)));
+    let bearer = format!("Bearer {secret}");
+    for (header, status) in [("Bearer malformed", 404), (&bearer, 403)] {
+        req.authorization = Some(header.into());
         assert_eq!(block_on(receiver::write(&h.ctx(), &req)).status, status);
-        let mut bound = receive_start();
-        bound["context"] = "browser-context".into();
-        req.body = bound.to_string().into_bytes();
-        assert_eq!(
-            block_on(receiver::write(&h.ctx(), &req)).status,
-            if status == 200 { 422 } else { 403 }
-        );
-        let writes = h.store.listen_owners.borrow().len();
-        assert_eq!(writes, usize::from(status == 200));
-        for path in [RECORD_PATH, CONTEXT_PATH] {
-            req.path = path.into();
-            assert_eq!(scope_for_operation("POST", path), RouteDecision::Deny);
-            assert_eq!(block_on(handle(&h.ctx(), &req)).status, 404);
-        }
-        assert!(!options_preflight_served(CONTEXT_PATH));
+    }
+    assert!(h.store.listen_owners.borrow().is_empty());
+    req.authorization = None;
+    assert_eq!(block_on(receiver::write(&h.ctx(), &req)).status, 200);
+}
+
+fn assert_history_rejections(h: &Harness, mut req: Request) {
+    let write = |req: &Request| block_on(receiver::write(&h.ctx(), req));
+    for (key, value) in [
+        ("extra", json!(1)),
+        ("context", json!("browser")),
+        ("playback_id", json!("bad")),
+        ("track_id", json!("")),
+        ("track_id", json!("x".repeat(129))),
+        ("track_id", json!("x\ny")),
+    ] {
+        let mut event: Value = from_str(START).unwrap();
+        event[key] = value;
+        req.body = event.to_string().into_bytes();
+        let response = write(&req);
+        assert_eq!(response.status, 422, "{key}: {}", response.body);
+    }
+    let array = r#"["40c325c0-2cee-489d-a8b6-fbe937155601","catalogue-42","start",null]"#;
+    req.body = array.as_bytes().to_vec();
+    assert_eq!(write(&req).status, 422);
+    req.body = START.as_bytes().to_vec();
+    req.body.resize(MAX_BODY_BYTES + 1, b' ');
+    assert_eq!(write(&req).status, 400);
+    assert!(h.store.listen_owners.borrow().is_empty());
+    req.body.truncate(START.len());
+    for (failure, attempts) in [("plays.history", 0), ("write", 1)] {
+        h.store.listen_failure.set(Some(failure));
+        let resp = write(&req);
+        assert_eq!(resp.status, 500);
+        assert_eq!(resp.body, r#"{"error":"internal error"}"#);
+        assert_eq!(h.store.listen_owners.borrow().len(), attempts);
     }
 }
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 #[tokio::test]
 async fn unmounted_history_receiver_writes_through_pg_store() {
-    use crate::listen_history::{
-        export,
-        postgres_tests::{connect, seed_lease, seed_owner},
-        ListenEvent,
-    };
+    use crate::listen_history::postgres_tests::{connect, seed_lease, seed_owner};
+    use crate::listen_history::{export, ListenEvent};
+    use crate::worker_entry::playback_store_for_postgres_test;
     let observer = connect().await;
     let owner = format!("listen-receiver-{:x}", rand::random::<u64>());
     seed_owner(&observer, &owner).await;
-    let store =
-        crate::worker_entry::playback_store_for_postgres_test(|| async { Ok(connect().await) });
+    let store = playback_store_for_postgres_test(|| async { Ok(connect().await) });
     let h = harness();
     let ctx = Ctx {
+        cfg: &h.config,
         store: &store,
+        mailer: &h.mailer,
+        dialer: &h.dialer,
+        dns: &h.dns,
+        stripe: &h.stripe,
         now: 1000,
-        ..h.ctx()
+        source_ip: h.ctx().source_ip,
     };
-    let cookie = cookie_of(&ctx.start_session(&owner).await.unwrap());
-    let mut req = receive_request(Some(cookie), serde_json::Value::Null);
-    req.path = CONTEXT_PATH.into();
-    let mut body = receive_start();
-    body["context"] = issued_context(receiver::context(&ctx, &req).await);
-    req.path = RECORD_PATH.into();
-    for invalid in [
-        b"{}".as_slice(),
-        br#"["40c325c0-2cee-489d-a8b6-fbe937155601","catalogue-42","start",null]"#,
-    ] {
-        req.body = invalid.to_vec();
-        let response = receiver::write(&ctx, &req).await;
-        assert_eq!(response.status, 422);
-        assert_eq!(response_json(&response)["code"], "validation_failed");
-    }
-    req.body = body.to_string().into_bytes();
+    let mut req = receive_request(Some(cookie_of(&ctx.start_session(&owner).await.unwrap())));
+    req.body = bind_start(receiver::context(&ctx, &req).await);
+    req.path = CLEAR_PATH.into();
     let refused = receiver::write(&ctx, &req).await;
     assert_eq!((refused.status, refused.retry_after), (409, None));
-    let envelope = response_json(&refused);
+    let envelope: Value = from_str(&refused.body).unwrap();
     assert_eq!(envelope["code"], "conflict");
     assert_eq!(envelope["retryable"], false);
     assert!(export(&observer, &owner, None).await.unwrap().is_empty());
@@ -175,8 +170,6 @@ async fn unmounted_history_receiver_writes_through_pg_store() {
     let rows = export(&observer, &owner, None).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].event, ListenEvent::Start);
-    observer
-        .execute("DELETE FROM public.users WHERE id = $1", &[&owner])
-        .await
-        .unwrap();
+    let delete = "DELETE FROM public.users WHERE id = $1";
+    observer.execute(delete, &[&owner]).await.unwrap();
 }

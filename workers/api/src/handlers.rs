@@ -8205,6 +8205,7 @@ mod tests {
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
         listen_owners: RefCell<Vec<String>>,
+        listen_failure: std::cell::Cell<Option<&'static str>>,
         listen_rows: RefCell<Vec<(String, crate::listen_history::ListenRow)>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
@@ -9249,6 +9250,9 @@ mod tests {
             _now: u64,
         ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
             self.listen_owners.borrow_mut().push(owner.into());
+            if self.listen_failure.get() == Some("write") {
+                return Err(StoreError);
+            }
             Ok(crate::listen_history::WriteOutcome::Written)
         }
 
@@ -9437,6 +9441,9 @@ mod tests {
             now: u64,
             window_secs: u64,
         ) -> Result<bool, StoreError> {
+            if self.listen_failure.get() == Some(action) {
+                return Err(StoreError);
+            }
             if limit == 0 || window_secs == 0 {
                 return Ok(false);
             }
