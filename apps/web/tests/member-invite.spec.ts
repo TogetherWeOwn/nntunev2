@@ -271,7 +271,7 @@ for (const [status, json, detail] of [
 		methods.push(route.request().method());
 		if (methods.length !== 3) return mockInvite(route);
 		await finishSummary.promise;
-		return route.fulfill({ status, json });
+		return route.fulfill({ status, json: status === 409 ? {} : json });
 	});
 	await page.route(historyEndpoint, (route) => {
 		queries.push(new URL(route.request().url()).search);
@@ -416,7 +416,7 @@ for (const [status, json, message] of [
 
 for (const [status, json, message] of [
 	[403, {}, 'Access to issued invites was denied.'],
-	[409, deleting, 'scheduled for deletion']
+	[409, {}, 'scheduled for deletion']
 ] as const) test(`clears loaded history on ${status} during paging`, async ({ page }) => {
 	await page.route(endpoint, mockInvite);
 	await page.route(historyEndpoint, (route) => new URL(route.request().url()).search
