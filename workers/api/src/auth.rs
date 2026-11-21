@@ -524,13 +524,35 @@ impl SingleUseClaim<'_> {
         match self {
             Self::MagicLink { .. } => "UPDATE magic_link_tokens SET used = TRUE WHERE token_hash = $1 AND user_id = $2 AND email = $3 AND expires_at = $4 AND expires_at > $5 AND used = FALSE RETURNING token_hash",
             Self::Challenge { .. } => "UPDATE auth_challenges SET consumed = TRUE WHERE id = $1 AND rp_id = $2 AND origin = $3 AND expires_at = $4 AND expires_at > $5 AND consumed = FALSE RETURNING id",
-            // One conditional UPDATE carries every spend predicate, so
-            // revocation, expiry and a competing redemption all win or
-            // lose atomically against this claim. The email predicates
-            // read the redeemer's `users` row ($2) in-database — the
-            // same values `prepare_invite_redemption` checked on the
-            // snapshot, re-proven at claim time.
-            Self::Invite { .. } => "UPDATE invite_codes SET used = TRUE, redeemed_by = $2, redeemed_at = $3 WHERE code_hash = $1 AND used = FALSE AND redeemed_at IS NULL AND revoked_at IS NULL AND expires_at > $3 AND (email IS NULL OR EXISTS (SELECT 1 FROM users WHERE id = $2 AND lower(email) = lower(invite_codes.email))) AND NOT EXISTS (SELECT 1 FROM users issuer JOIN users redeemer ON lower(redeemer.email) = lower(issuer.email) WHERE issuer.id = invite_codes.issued_by AND redeemer.id = $2) RETURNING code_hash",
+            // Lock the live invite first so a wait on a competing spend or
+            // revocation cannot move redemption past the window deadline.
+            // SHARE (not KEY SHARE) conflicts with close's ends_at UPDATE.
+            // Only project the wall clock after the lateral locking read;
+            // materialization keeps the time predicates above that lock.
+            Self::Invite { .. } => "WITH locked_invite AS MATERIALIZED (
+                SELECT kind, window_id FROM invite_codes
+                WHERE code_hash = $1 AND used = FALSE AND redeemed_at IS NULL AND revoked_at IS NULL
+                FOR NO KEY UPDATE
+            ), checked AS MATERIALIZED (
+                SELECT i.kind, w.starts_at, w.ends_at,
+                       floor(extract(epoch FROM clock_timestamp()))::bigint AS live_now
+                FROM locked_invite i
+                LEFT JOIN LATERAL (
+                    SELECT starts_at, ends_at FROM invite_windows
+                    WHERE id = i.window_id AND i.kind = 'member'
+                    FOR SHARE
+                ) w ON TRUE
+            )
+            UPDATE invite_codes SET used = TRUE, redeemed_by = $2, redeemed_at = $3
+            FROM checked
+            WHERE code_hash = $1 AND used = FALSE AND redeemed_at IS NULL AND revoked_at IS NULL
+              AND expires_at > $3
+              AND (checked.kind = 'admin' OR (checked.kind = 'member'
+                   AND starts_at <= live_now AND live_now < ends_at AND live_now < expires_at))
+              AND (email IS NULL OR EXISTS (SELECT 1 FROM users WHERE id = $2 AND lower(email) = lower(invite_codes.email)))
+              AND NOT EXISTS (SELECT 1 FROM users issuer JOIN users redeemer ON lower(redeemer.email) = lower(issuer.email)
+                              WHERE issuer.id = invite_codes.issued_by AND redeemer.id = $2)
+            RETURNING code_hash",
         }
     }
 }

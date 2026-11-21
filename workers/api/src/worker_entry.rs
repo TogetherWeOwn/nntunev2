@@ -4460,13 +4460,17 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // The issuer's current email rides along so the pure
-                // prepare can refuse self-invites before any claim.
+                // Preflight only: the shared claim rechecks the window under lock.
+                // Pass the issuer's current email along for self-invite refusal.
                 let statement = format!(
                     "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email \
                      FROM invite_codes \
                      LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
-                     WHERE invite_codes.code_hash = $1"
+                     WHERE invite_codes.code_hash = $1 \
+                     AND (invite_codes.kind = 'admin' OR (invite_codes.kind = 'member' AND EXISTS ( \
+                         SELECT 1 FROM invite_windows w WHERE w.id = invite_codes.window_id \
+                         AND int8range(w.starts_at, w.ends_at, '[)') \
+                             @> floor(extract(epoch FROM clock_timestamp()))::bigint)))"
                 );
                 let rows = client
                     .query_typed(&statement, &[(&code_hash, Type::TEXT)])
