@@ -14,7 +14,7 @@ function storage() {
 function setup() {
 	const local = storage(), session = storage();
 	vi.stubGlobal('window', { localStorage: local, sessionStorage: session });
-	// Model non-queuing readers without relying on Node's Web Locks support.
+	vi.stubGlobal('caches', { keys: async () => [] });
 	let writerHeld = false;
 	vi.stubGlobal('navigator', { locks: { async request<T>(name: string, options: LockOptions | LockGrantedCallback<T>, read: LockGrantedCallback<T>) {
 		if (typeof options !== 'function') return read(writerHeld ? null : {} as Lock);
@@ -36,14 +36,14 @@ afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 it.each([200, 401, 403, 0])('withholds a stale result (%i) without purging its scope', async (status) => {
 	const { local, session, verify, refresh, update, refresher, onAccessRefused } = setup();
-	await refresh();
-	const key = update().deviceScope!;
+	const key = await refresh().then(() => update().deviceScope!);
+	expect(key).toEqual(expect.any(String));
 	local.setItem(key, bytes);
 	const started = Promise.withResolvers<void>(), reply = Promise.withResolvers<Response>();
 	const deferred = () => { started.resolve(); return reply.promise; };
 	if (status < 400) verify.mockImplementationOnce(deferred);
 	const pending = status < 400 ? refresh() : refresher.refresh(deferred);
-	await started.promise;
+	await Promise.race([started.promise, pending.then(() => { throw new Error('Refresh ended before the deferred request'); })]);
 	if (status) {
 		local.setItem(AUTH_GENERATION_KEY, 'replacement');
 		reply.resolve(status === 200 ? proof() : new Response(null, { status }));
@@ -59,8 +59,8 @@ it.each([200, 401, 403, 0])('withholds a stale result (%i) without purging its s
 
 it('preserves exact favorite bytes across inconclusive verification and never binds a legacy list', async () => {
 	const { local, session, verify, refresh, update, refresher, onAccessRefused } = setup();
-	await refresh();
-	const key = update().deviceScope!;
+	const key = await refresh().then(() => update().deviceScope!);
+	expect(key).toEqual(expect.any(String));
 	local.setItem(key, bytes);
 	for (const binding of [null, '', `${label.slice(1)}B`, label]) {
 		if (binding === label) verify.mockResolvedValueOnce(Response.json({}));
