@@ -43,7 +43,10 @@ test('signup finish limit preserves the code and challenge for retry', async ({ 
 			value: FixturePublicKeyCredential
 		});
 		Object.defineProperty(navigator, 'credentials', {
-			value: { create: async () => new FixturePublicKeyCredential() }
+			value: { create: async () => {
+				sessionStorage.setItem('test.passkeys', String(Number(sessionStorage.getItem('test.passkeys')) + 1));
+				return new FixturePublicKeyCredential();
+			} }
 		});
 	});
 	await page.route('**/v1/auth/passkey/register/start', (route) =>
@@ -92,8 +95,24 @@ test('signup finish limit preserves the code and challenge for retry', async ({ 
 
 	await dialog.getByRole('button', { name: 'Not now' }).click();
 	await expect(dialog).toBeHidden();
+	await page.locator('form').filter({ has: page.getByLabel('Email code') }).evaluate((form) => new Promise<void>((ready) => {
+		const key = 'nntune.library.favorites.v1.signup-test';
+		sessionStorage.setItem('nntune.library.auth-context.v1', 'signup-test');
+		void navigator.locks.request(key, () => new Promise<void>((release) => {
+			const observer = new MutationObserver(() => {
+				if (!document.body.textContent?.includes('Account created')) return;
+				observer.disconnect();
+				sessionStorage.setItem('test.disabled', String(form.querySelectorAll(':disabled').length));
+				form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
+				release();
+			});
+			observer.observe(document.body, { childList: true, characterData: true, subtree: true });
+			ready();
+		}));
+	}));
 	await page.getByRole('button', { name: /finish creating account/i }).click();
 	await page.waitForURL('/account/billing');
+	expect(await page.evaluate(() => [sessionStorage.getItem('test.disabled'), sessionStorage.getItem('test.passkeys')])).toEqual(['3', '2']);
 	expect(finishPosts).toBe(2);
 	expect(finishBodies[1]).toEqual(finishBodies[0]);
 	expect(finishBodies[1]).toMatchObject({

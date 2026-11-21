@@ -22,7 +22,7 @@ from pathlib import Path
 # extract must use the schema revision matching these pinned declarations.
 ARTIST_ID, ARTIST_GID, ARTIST_NAME, ARTIST_SORT_NAME = 1, 2, 3, 4
 ARTIST_TYPE_ID, ARTIST_AREA_ID = 11, 12
-ALIAS_ID, ALIAS_ARTIST_ID, ALIAS_NAME, ALIAS_LOCALE, ALIAS_SORT_NAME, ALIAS_PRIMARY = 1, 2, 3, 4, 8, 15
+ALIAS_ID, ALIAS_ENTITY_ID, ALIAS_NAME, ALIAS_LOCALE, ALIAS_SORT_NAME, ALIAS_PRIMARY = 1, 2, 3, 4, 8, 15
 ARTIST_TYPE_LOOKUP_ID, ARTIST_TYPE_NAME = 1, 2
 AREA_ID = 1
 ISO_AREA_ID, ISO_CODE = 1, 2
@@ -48,6 +48,9 @@ L_RW_LINK_ID, L_RW_RECORDING_ID, L_RW_WORK_ID = 2, 3, 4
 ISRC_RECORDING_ID, ISRC_CODE = 2, 3
 WORK_ID, WORK_GID, WORK_NAME, WORK_TYPE_ID = 1, 2, 3, 4
 WORK_TYPE_LOOKUP_ID, WORK_TYPE_NAME = 1, 2
+LABEL_ID, LABEL_GID, LABEL_NAME, LABEL_CODE, LABEL_TYPE_ID = 1, 2, 3, 10, 11
+LABEL_TYPE_LOOKUP_ID, LABEL_TYPE_NAME = 1, 2
+RELEASE_LABEL_ID, RELEASE_LABEL_RELEASE_ID, RELEASE_LABEL_LABEL_ID, RELEASE_LABEL_CATNO = 1, 2, 3, 4
 
 FIELD_COUNTS = {
     "artist": 19,
@@ -57,11 +60,14 @@ FIELD_COUNTS = {
     "iso_3166_1": 2,
     "artist_credit_name": 5,
     "release": 14,
+    "release_alias": 16,
     "release_group": 8,
+    "release_group_alias": 16,
     "release_group_primary_type": 6,
     "release_country": 5,
     "release_unknown_country": 4,
     "recording": 9,
+    "recording_alias": 16,
     "medium": 9,
     "track": 12,
     "url": 5,
@@ -80,7 +86,11 @@ FIELD_COUNTS = {
     # upstream width or the first real ISRC row aborts the ETL.
     "isrc": 5,
     "work": 7,
+    "work_alias": 16,
     "work_type": 6,
+    "label": 16,
+    "label_type": 6,
+    "release_label": 5,
 }
 
 # Allowlisted relationship link-type GIDs (pinned from the MusicBrainz
@@ -284,12 +294,19 @@ def decode_copy_text(text: str) -> str:
     return decoded.decode("utf-8")
 
 
-def load_artist_aliases(db: sqlite3.Connection, path: Path) -> int:
+def load_aliases(db: sqlite3.Connection, dump_dir: Path, entity: str) -> int:
+    table = f"{entity}_alias"
+
     def aliases():
-        for line_number, row in enumerate(rows(path, FIELD_COUNTS["artist_alias"]), 1):
-            context = f"artist_alias row {line_number}"
-            alias_id = required_int(get(row, ALIAS_ID), context)
-            artist = required_int(get(row, ALIAS_ARTIST_ID), context)
+        for line_number, row in enumerate(rows(dump_dir / table, FIELD_COUNTS[table]), 1):
+            context = f"{table} row {line_number}"
+            raw_id, raw_entity = get(row, ALIAS_ID), get(row, ALIAS_ENTITY_ID)
+            if entity != "artist":
+                alias_id = positive_key(raw_id, context, "id")
+                entity_id = positive_key(raw_entity, context, entity)
+            else:
+                alias_id = required_int(raw_id, context)
+                entity_id = required_int(raw_entity, context)
             name = get(row, ALIAS_NAME)
             locale = value(get(row, ALIAS_LOCALE)) or ""
             sort_name = get(row, ALIAS_SORT_NAME)
@@ -302,9 +319,44 @@ def load_artist_aliases(db: sqlite3.Connection, path: Path) -> int:
                 name_key, locale_key = decode_copy_text(name), decode_copy_text(locale)
             except ValueError as exc:
                 raise ValueError(f"{context}: invalid COPY text in name or locale") from exc
-            yield alias_id, artist, name, locale, sort_name, primary, name_key, locale_key
+            if entity != "artist":
+                try:
+                    decode_copy_text(sort_name)
+                except ValueError as exc:
+                    raise ValueError(f"{context}: invalid COPY text in sort_name") from exc
+            yield alias_id, entity_id, name, locale, sort_name, primary, name_key, locale_key
 
-    return db.executemany("INSERT INTO artist_alias VALUES (?,?,?,?,?,?,?,?)", aliases()).rowcount
+    return db.executemany(f"INSERT INTO {table} VALUES (?,?,?,?,?,?,?,?)", aliases()).rowcount
+
+
+def project_aliases(db: sqlite3.Connection, entity: str, output_dir: Path, updated_at: str) -> int:
+    table = f"{entity}_alias"
+    # Pick a whole raw COPY row for each decoded key. Prefer a primary
+    # alias, then the greatest raw sort name, then the lowest alias ID.
+    # Match the corresponding curated entity's MBID spelling.
+    gid = "LOWER(e.gid)" if entity == "recording" else "e.gid"
+    query = f"""
+        WITH ranked AS (
+            SELECT {gid} AS gid,al.*,ROW_NUMBER() OVER (
+                PARTITION BY {gid},al.name_key,al.locale_key
+                ORDER BY al.primary_flag DESC,al.sort_name DESC,al.id
+            ) AS rank
+            FROM {table} al JOIN {entity} e ON e.id=al.entity
+        )
+        SELECT gid,name,locale,sort_name,primary_flag FROM ranked
+        WHERE rank=1 ORDER BY gid,name_key,locale_key
+    """
+
+    mbid_pattern = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                              re.IGNORECASE if entity in ("release", "release_group") else 0)
+
+    def validate_alias_row(row):
+        if not mbid_pattern.fullmatch(row[0]):
+            raise ValueError(f"{table}: invalid {entity} MBID")
+        return row
+
+    return insert_select(db, query, output_dir / curated_name(table), updated_at,
+                         validate_alias_row if entity != "artist" else None)
 
 
 def positive_key(field: str | None, context: str, column: str) -> int:
@@ -354,6 +406,54 @@ def validate_recording_work_row(row):
     return row
 
 
+def label_type_values(values, line_number):
+    context = f"label_type row {line_number}"
+    row_id, name = values
+    if len(validate_copy_name(name, context)) > 255:
+        raise ValueError(f"{context}: name exceeds 255 characters")
+    return positive_key(row_id, context, "id"), name
+
+
+def label_values(values, line_number):
+    context = f"label row {line_number}"
+    row_id, gid, name, code, type_id = values
+    if gid is None or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", gid):
+        raise ValueError(f"{context}: invalid label MBID")
+    validate_copy_name(name, context)
+    if code is not None:
+        if not re.fullmatch(r"0|-?[1-9][0-9]{0,9}", code) or not -2**31 <= int(code) <= 2**31 - 1:
+            raise ValueError(f"{context}: invalid label code (expected a 32-bit integer)")
+        code = int(code)
+    return (positive_key(row_id, context, "id"), gid, name, code,
+            None if type_id is None else positive_key(type_id, context, "type_id"))
+
+
+def release_label_values(values, line_number):
+    context = f"release_label row {line_number}"
+    row_id, release_id, label_id, catalog_number = values
+    row_id = positive_key(row_id, context, "id")
+    release_id = positive_key(release_id, context, "release")
+    if label_id is not None:
+        label_id = positive_key(label_id, context, "label")
+    try:
+        number_key = decode_copy_text(catalog_number or "")
+    except ValueError as exc:
+        raise ValueError(f"{context}: invalid COPY text in catalogue number") from exc
+    if len(number_key) > 255:
+        raise ValueError(f"{context}: catalogue number exceeds 255 characters")
+    return row_id, release_id, label_id, number_key
+
+
+COPY_ENCODE = str.maketrans({raw.decode(): "\\" + escape.decode() for escape, raw in COPY_NAMED.items()})
+
+
+def release_label_output(row):
+    release_gid, label_gid, number_key = row
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", release_gid):
+        raise ValueError("release_label: invalid release MBID")
+    return release_gid, label_gid, number_key.translate(COPY_ENCODE)
+
+
 def main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage: DUMP_TS=<ISO-8601 timestamp> ./etl.sh <mbdump-dir>", file=sys.stderr)
@@ -379,7 +479,22 @@ def main() -> int:
                     PRAGMA temp_store = FILE;
                     CREATE TABLE artist (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, sort_name TEXT NOT NULL, type_id INTEGER, area_id INTEGER);
                     CREATE TABLE artist_alias (
-                        id INTEGER PRIMARY KEY, artist INTEGER NOT NULL, name TEXT NOT NULL,
+                        id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
+                        locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
+                        name_key TEXT NOT NULL, locale_key TEXT NOT NULL
+                    );
+                    CREATE TABLE release_alias (
+                        id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
+                        locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
+                        name_key TEXT NOT NULL, locale_key TEXT NOT NULL
+                    );
+                    CREATE TABLE release_group_alias (
+                        id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
+                        locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
+                        name_key TEXT NOT NULL, locale_key TEXT NOT NULL
+                    );
+                    CREATE TABLE recording_alias (
+                        id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
                         locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
                         name_key TEXT NOT NULL, locale_key TEXT NOT NULL
                     );
@@ -425,6 +540,14 @@ def main() -> int:
                     CREATE INDEX isrc_recording ON isrc(recording);
                     CREATE TABLE work_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                     CREATE TABLE work (id INTEGER PRIMARY KEY, gid TEXT NOT NULL UNIQUE, name TEXT NOT NULL, type_id INTEGER);
+                    CREATE TABLE work_alias (
+                        id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
+                        locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
+                        name_key TEXT NOT NULL, locale_key TEXT NOT NULL
+                    );
+                    CREATE TABLE label_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                    CREATE TABLE label (id INTEGER PRIMARY KEY, gid TEXT NOT NULL UNIQUE, name TEXT NOT NULL, code INTEGER, type_id INTEGER);
+                    CREATE TABLE release_label (id INTEGER PRIMARY KEY, release INTEGER NOT NULL, label INTEGER, number_key TEXT NOT NULL);
                 """)
 
                 counts = {}
@@ -432,7 +555,7 @@ def main() -> int:
                 counts["area"] = load(db, dump_dir / "area", FIELD_COUNTS["area"], (AREA_ID,), "area", "id", as_ints("area.id", (0,)))
                 counts["iso_3166_1"] = load(db, dump_dir / "iso_3166_1", FIELD_COUNTS["iso_3166_1"], (ISO_AREA_ID, ISO_CODE), "iso_3166_1", "area,code", as_ints("iso_3166_1.area", (0,)))
                 counts["artist"] = load(db, dump_dir / "artist", FIELD_COUNTS["artist"], (ARTIST_ID, ARTIST_GID, ARTIST_NAME, ARTIST_SORT_NAME, ARTIST_TYPE_ID, ARTIST_AREA_ID), "artist", "id,gid,name,sort_name,type_id,area_id", as_ints("artist.id", (0, 4, 5), (4, 5)))
-                counts["artist_alias"] = load_artist_aliases(db, dump_dir / "artist_alias")
+                counts["artist_alias"] = load_aliases(db, dump_dir, "artist")
                 counts["work_type"] = load(
                     db, dump_dir / "work_type", FIELD_COUNTS["work_type"],
                     (WORK_TYPE_LOOKUP_ID, WORK_TYPE_NAME), "work_type", "id,name", work_type_values,
@@ -440,6 +563,21 @@ def main() -> int:
                 counts["work"] = load(
                     db, dump_dir / "work", FIELD_COUNTS["work"],
                     (WORK_ID, WORK_GID, WORK_NAME, WORK_TYPE_ID), "work", "id,gid,name,type_id", work_values,
+                )
+                counts["work_alias"] = load_aliases(db, dump_dir, "work")
+                load(
+                    db, dump_dir / "label_type", FIELD_COUNTS["label_type"],
+                    (LABEL_TYPE_LOOKUP_ID, LABEL_TYPE_NAME), "label_type", "id,name", label_type_values,
+                )
+                counts["label"] = load(
+                    db, dump_dir / "label", FIELD_COUNTS["label"],
+                    (LABEL_ID, LABEL_GID, LABEL_NAME, LABEL_CODE, LABEL_TYPE_ID),
+                    "label", "id,gid,name,code,type_id", label_values,
+                )
+                load(
+                    db, dump_dir / "release_label", FIELD_COUNTS["release_label"],
+                    (RELEASE_LABEL_ID, RELEASE_LABEL_RELEASE_ID, RELEASE_LABEL_LABEL_ID, RELEASE_LABEL_CATNO),
+                    "release_label", "id,release,label,number_key", release_label_values,
                 )
                 counts["artist_credit_name"] = load(
                     db, dump_dir / "artist_credit_name", FIELD_COUNTS["artist_credit_name"],
@@ -452,11 +590,14 @@ def main() -> int:
                 counts["release_country"] = load(db, dump_dir / "release_country", FIELD_COUNTS["release_country"], (RELEASE_COUNTRY_RELEASE_ID, RELEASE_COUNTRY_YEAR), "release_country", "release,year", as_ints("release_country", (0, 1), (1,)))
                 counts["release_unknown_country"] = load(db, dump_dir / "release_unknown_country", FIELD_COUNTS["release_unknown_country"], (RELEASE_UNKNOWN_COUNTRY_RELEASE_ID, RELEASE_UNKNOWN_COUNTRY_YEAR), "release_unknown_country", "release,year", as_ints("release_unknown_country", (0, 1), (1,)))
                 counts["release"] = load(db, dump_dir / "release", FIELD_COUNTS["release"], (RELEASE_ID, RELEASE_GID, RELEASE_NAME, RELEASE_CREDIT_ID, RELEASE_GROUP_ID), "release", "id,gid,name,credit,group_id", as_ints("release.id", (0, 3, 4)))
+                counts["release_alias"] = load_aliases(db, dump_dir, "release")
+                counts["release_group_alias"] = load_aliases(db, dump_dir, "release_group")
                 counts["recording"] = load(
                     db, dump_dir / "recording", FIELD_COUNTS["recording"],
                     (RECORDING_ID, RECORDING_GID, RECORDING_NAME, RECORDING_LENGTH),
                     "recording", "id,gid,name,length,canonical_id", as_ints("recording.id", (0, 3), (3,), mark_canonical_id=True),
                 )
+                counts["recording_alias"] = load_aliases(db, dump_dir, "recording")
                 counts["medium"] = load(db, dump_dir / "medium", FIELD_COUNTS["medium"], (MEDIUM_ID, MEDIUM_RELEASE_ID, MEDIUM_POSITION), "medium", "id,release,position", as_ints("medium.id", (0, 1, 2)))
                 counts["track"] = load(db, dump_dir / "track", FIELD_COUNTS["track"], (TRACK_ID, TRACK_RECORDING_ID, TRACK_MEDIUM_ID, TRACK_POSITION), "track", "id,recording,medium,position", as_ints("track.id", (0, 1, 2, 3)))
                 # Relationship slice: resolve the allowlisted link-type and
@@ -598,15 +739,46 @@ def main() -> int:
                 bad_country_area = db.execute("SELECT i.area FROM iso_3166_1 i LEFT JOIN area a ON a.id=i.area WHERE a.id IS NULL LIMIT 1").fetchone()
                 if bad_country_area:
                     raise ValueError(f"iso_3166_1 references missing area {bad_country_area[0]}")
-                bad_alias = db.execute("SELECT al.artist FROM artist_alias al LEFT JOIN artist a ON a.id=al.artist WHERE a.id IS NULL LIMIT 1").fetchone()
+                bad_alias = db.execute("SELECT al.entity FROM artist_alias al LEFT JOIN artist a ON a.id=al.entity WHERE a.id IS NULL LIMIT 1").fetchone()
                 if bad_alias:
                     raise ValueError(f"artist_alias references missing artist {bad_alias[0]}")
+                bad_recording_alias = db.execute("""
+                    SELECT al.entity,r.id FROM recording_alias al LEFT JOIN recording r ON r.id=al.entity
+                    WHERE r.id IS NULL OR NOT r.canonical_id LIMIT 1
+                """).fetchone()
+                if bad_recording_alias:
+                    entity_id, resolved_id = bad_recording_alias
+                    reason = "missing recording" if resolved_id is None else "invalid recording id"
+                    raise ValueError(f"recording_alias references {reason} {entity_id}")
+                for entity in ("release", "release_group", "work"):
+                    missing_alias_parent = db.execute(f"""
+                        SELECT al.entity FROM {entity}_alias al LEFT JOIN {entity} e ON e.id=al.entity
+                        WHERE e.id IS NULL LIMIT 1
+                    """).fetchone()
+                    if missing_alias_parent:
+                        raise ValueError(f"{entity}_alias references missing {entity} {missing_alias_parent[0]}")
                 bad_work_type = db.execute("""
                     SELECT w.id,w.type_id FROM work w LEFT JOIN work_type t ON t.id=w.type_id
                     WHERE w.type_id IS NOT NULL AND t.id IS NULL LIMIT 1
                 """).fetchone()
                 if bad_work_type:
                     raise ValueError(f"work {bad_work_type[0]} references missing work_type {bad_work_type[1]}")
+                bad_label_type = db.execute("""
+                    SELECT l.id,l.type_id FROM label l LEFT JOIN label_type t ON t.id=l.type_id
+                    WHERE l.type_id IS NOT NULL AND t.id IS NULL LIMIT 1
+                """).fetchone()
+                if bad_label_type:
+                    raise ValueError(f"label {bad_label_type[0]} references missing label_type {bad_label_type[1]}")
+                bad_release_label = db.execute("""
+                    SELECT rl.release,rl.label,r.id FROM release_label rl
+                    LEFT JOIN release r ON r.id=rl.release
+                    LEFT JOIN label l ON l.id=rl.label
+                    WHERE r.id IS NULL OR (rl.label IS NOT NULL AND l.id IS NULL) LIMIT 1
+                """).fetchone()
+                if bad_release_label:
+                    release_id, label_id, resolved_release = bad_release_label
+                    missing = f"release {release_id}" if resolved_release is None else f"label {label_id}"
+                    raise ValueError(f"release_label references missing {missing}")
                 bad_credit_artist = db.execute("SELECT c.credit,c.artist FROM artist_credit_name c LEFT JOIN artist a ON a.id=c.artist WHERE a.id IS NULL LIMIT 1").fetchone()
                 if bad_credit_artist:
                     raise ValueError(f"artist credit {bad_credit_artist[0]} references missing artist {bad_credit_artist[1]}")
@@ -699,21 +871,8 @@ def main() -> int:
                     ORDER BY a.id
                 """
                 artist_count = insert_select(db, artist_query, output_dir / curated_name("artist"), updated_at)
-                # Pick a whole raw COPY row for each decoded key. Prefer a
-                # primary alias, then the greatest raw sort name; alias ID
-                # breaks ties independently of dump order or escape spelling.
-                artist_alias_query = """
-                    WITH ranked AS (
-                        SELECT a.gid,al.*,ROW_NUMBER() OVER (
-                            PARTITION BY a.gid,al.name_key,al.locale_key
-                            ORDER BY al.primary_flag DESC,al.sort_name DESC,al.id
-                        ) AS rank
-                        FROM artist_alias al JOIN artist a ON a.id=al.artist
-                    )
-                    SELECT gid,name,locale,sort_name,primary_flag FROM ranked
-                    WHERE rank=1 ORDER BY gid,name_key,locale_key
-                """
-                artist_alias_count = insert_select(db, artist_alias_query, output_dir / curated_name("artist_alias"), updated_at)
+                artist_alias_count = project_aliases(db, "artist", output_dir, updated_at)
+                recording_alias_count = project_aliases(db, "recording", output_dir, updated_at)
                 release_group_query = """
                     SELECT g.gid,g.name,a.gid,pt.name
                     FROM release_group g
@@ -724,6 +883,7 @@ def main() -> int:
                     ORDER BY g.id
                 """
                 release_group_count = insert_select(db, release_group_query, output_dir / curated_name("release_group"), updated_at)
+                release_group_alias_count = project_aliases(db, "release_group", output_dir, updated_at)
                 release_query = """
                     SELECT r.gid,a.gid,r.name,pt.name,
                            (SELECT MIN(year) FROM (SELECT rc.year FROM release_country rc WHERE rc.release=r.id UNION ALL SELECT ruc.year FROM release_unknown_country ruc WHERE ruc.release=r.id) WHERE year IS NOT NULL),
@@ -743,6 +903,7 @@ def main() -> int:
                     updated_at,
                     lambda row: (row[0], row[1], row[2], row[3], row[4], f"https://coverartarchive.org/release/{row[0]}/front-250", row[5]),
                 )
+                release_alias_count = project_aliases(db, "release", output_dir, updated_at)
                 # Release-group-only credits do not project here. Preserve
                 # the credited spelling and join phrase as upstream COPY text.
                 release_credit_query = """
@@ -873,6 +1034,7 @@ def main() -> int:
                     ORDER BY w.id
                 """
                 work_count = insert_select(db, work_query, output_dir / curated_name("work"), updated_at)
+                work_alias_count = project_aliases(db, "work", output_dir, updated_at)
 
                 # Group directed triples by decoded type name, choosing one
                 # deterministic COPY spelling without emitting raw delimiters.
@@ -891,9 +1053,31 @@ def main() -> int:
                     updated_at, validate_recording_work_row,
                 )
 
+                label_query = """
+                    SELECT l.gid,l.name,l.code,t.name
+                    FROM label l LEFT JOIN label_type t ON t.id=l.type_id
+                    ORDER BY l.id
+                """
+                label_count = insert_select(db, label_query, output_dir / curated_name("label"), updated_at)
+
+                # An absent label is not an edge. A real label with no number
+                # uses empty text. Sort and deduplicate before re-escaping COPY.
+                release_label_query = """
+                    SELECT DISTINCT LOWER(r.gid),l.gid,rl.number_key
+                    FROM release_label rl
+                    JOIN release r ON r.id=rl.release
+                    JOIN label l ON l.id=rl.label
+                    ORDER BY 1,2,3
+                """
+                release_label_count = insert_select(
+                    db, release_label_query, output_dir / curated_name("release_label"),
+                    updated_at, release_label_output,
+                )
+
                 for table, input_count, output_count in (
                     ("artist", counts["artist"], artist_count),
                     ("work", counts["work"], work_count),
+                    ("label", counts["label"], label_count),
                     ("release_group", counts["release_group"], release_group_count),
                     ("release", counts["release"], release_count),
                     ("recording", counts["recording"], recording_count),
@@ -908,6 +1092,10 @@ def main() -> int:
                 # applies (dedup legitimately shrinks the row count).
                 for table, input_count, output_count in (
                     ("artist_alias", counts["artist_alias"], artist_alias_count),
+                    ("release_alias", counts["release_alias"], release_alias_count),
+                    ("release_group_alias", counts["release_group_alias"], release_group_alias_count),
+                    ("work_alias", counts["work_alias"], work_alias_count),
+                    ("recording_alias", counts["recording_alias"], recording_alias_count),
                     ("artist_url", counts["l_artist_url"], artist_url_count),
                     ("recording_url", counts["l_recording_url"], recording_url_count),
                     ("recording_music_video", counts["l_recording_recording"], music_video_count),
@@ -937,7 +1125,9 @@ def main() -> int:
             os.symlink(snapshot_name, link_tmp)
             os.replace(link_tmp, curated_link)
 
-        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, artist_alias={artist_alias_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count}, work={work_count}, recording_work={recording_work_count})")
+        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, artist_alias={artist_alias_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count}, work={work_count}, recording_work={recording_work_count}, "
+              f"recording_alias={recording_alias_count}, release_alias={release_alias_count}, release_group_alias={release_group_alias_count}, "
+              f"work_alias={work_alias_count}, label={label_count}, release_label={release_label_count})")
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"etl: {exc}", file=sys.stderr)

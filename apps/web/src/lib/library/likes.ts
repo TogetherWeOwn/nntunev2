@@ -1,4 +1,4 @@
-import type { ApiClient } from '../api/client.js';
+import { ApiError, type ApiClient } from '../api/client.js';
 
 type LikesClient = Pick<ApiClient, 'get' | 'put' | 'delete' | 'post'>;
 
@@ -29,11 +29,22 @@ function record(value: unknown): Record<string, unknown> {
 	return (value ?? {}) as Record<string, unknown>;
 }
 
-export async function loadLikes(client: Pick<LikesClient, 'get'>): Promise<LibraryLike[]> {
-	const { items } = record(await client.get<unknown>(LIKES_PATH));
-	if (!Array.isArray(items) || items.length > MAX_LIKES) throw new Error('Invalid likes list');
+export async function isLikesSession(client: Pick<LikesClient, 'get'>, binding: string): Promise<boolean> {
+	try {
+		return record(await client.get<unknown>(`${LIKES_PATH}/session`)).session_binding === binding;
+	} catch (error) {
+		if (error instanceof ApiError && error.status === 401) return false;
+		throw error;
+	}
+}
+
+export async function loadLikes(client: Pick<LikesClient, 'get'>) {
+	const { items, session_binding: binding } = record(await client.get<unknown>(LIKES_PATH));
+	if (!Array.isArray(items) || items.length > MAX_LIKES || typeof binding !== 'string' || !binding) {
+		throw new Error('Invalid likes list');
+	}
 	const seen = new Set<string>();
-	return items.map((item: unknown) => {
+	const likes = items.map((item: unknown): LibraryLike => {
 		const { kind, target_id, created_at } = record(item);
 		if ((kind !== 'track' && kind !== 'release') || !isTrackId(target_id) ||
 			(kind === 'release' && !RELEASE_ID.test(target_id)) || !isCount(created_at)) {
@@ -44,6 +55,7 @@ export async function loadLikes(client: Pick<LikesClient, 'get'>): Promise<Libra
 		seen.add(key);
 		return { kind, targetId: target_id, createdAt: created_at };
 	});
+	return { items: likes, binding };
 }
 
 /** Return the confirmed server identity, which can differ from the input MBID. */
@@ -101,19 +113,22 @@ export async function importDeviceLikes(
 	client: Pick<LikesClient, 'post'>,
 	ids: readonly string[],
 	scope: {
+		binding: string;
 		isCurrent: () => boolean;
-		retireConfirmed: (ids: readonly string[]) => void;
+		retireConfirmed: (ids: readonly string[]) => Promise<boolean>;
 	}
-): Promise<void> {
+): Promise<boolean> {
 	const targets = [...new Set(ids.filter(isTrackId))];
 	for (let start = 0; start < targets.length; start += IMPORT_BATCH_SIZE) {
-		if (!scope.isCurrent()) return;
+		if (!scope.isCurrent()) return false;
 		const batch = targets.slice(start, start + IMPORT_BATCH_SIZE);
 		const receipt = await client.post<unknown>(`${LIKES_PATH}/import`, {
+			session_binding: scope.binding,
 			items: batch.map((target_id) => ({ kind: 'track', target_id }))
 		});
-		if (!scope.isCurrent()) return;
+		if (!scope.isCurrent()) return false;
 		const confirmed = confirmedIds(batch, receipt);
-		if (confirmed.length > 0) scope.retireConfirmed(confirmed);
+		if (confirmed.length && !(await scope.retireConfirmed(confirmed))) return false;
 	}
+	return true;
 }

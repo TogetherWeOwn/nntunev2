@@ -32,6 +32,7 @@ export interface LibrarySnapshot {
 /** Base key for snapshots; the tab's authentication context scopes each value. */
 export const LIBRARY_SNAPSHOT_KEY = 'nntune.library.snapshot.v1';
 export const LIBRARY_AUTH_CONTEXT_KEY = 'nntune.library.auth-context.v1';
+export const LIBRARY_SESSION_BINDING_KEY = 'nntune.library.session-binding.v1';
 export const LIBRARY_AUTH_TRANSITION_KEY = 'nntune.library.auth-transition.v1';
 /**
  * Base key for device-local favorites. Values live in `localStorage` under
@@ -226,6 +227,7 @@ export function clearSnapshot(storage: SnapshotStorage | null): void {
 		const key = snapshotKey(storage);
 		// Revoke access to the snapshot before attempting to remove its bytes.
 		storage.removeItem(LIBRARY_AUTH_CONTEXT_KEY);
+		storage.removeItem(LIBRARY_SESSION_BINDING_KEY);
 		if (key) storage.removeItem(key);
 		storage.removeItem(LIBRARY_SNAPSHOT_KEY);
 	} catch {
@@ -245,15 +247,43 @@ export function broadcastAuthTransition(storage: SnapshotStorage | null): void {
 	}
 }
 
+export async function withFavoritesLock<T>(key: string, run: () => T | Promise<T>, unavailable?: () => void): Promise<T | null> {
+	try {
+		const locks = globalThis.navigator?.locks;
+		if (locks) return await locks.request(key, { mode: 'exclusive' }, (lock) => lock ? run() : null);
+	} catch { /* A rejected lock must not enable an unlocked edit. */ }
+	unavailable?.();
+	return null;
+}
+
+// Session storage carries only purge markers (no favorite IDs) across a redirect.
+export async function purgeFavorites(session: SnapshotStorage | null, local: SnapshotStorage, key: string) {
+	try { session?.setItem(key, ''); } catch { /* Storage may be full or blocked. */ }
+	const remove = () => {
+		try {
+			local.removeItem(key);
+			session?.removeItem(key);
+		} catch { /* Best effort; keep the marker if removal failed. */ }
+	};
+	await withFavoritesLock(key, remove, remove); // Deletion only when locks are unavailable.
+}
+
+export function resumeFavoritesPurges(): void {
+	const session = browserStorage('session');
+	const local = browserStorage('local');
+	if (!session || !local) return;
+	for (const key of Object.keys(session)) {
+		if (key.startsWith(`${LIBRARY_FAVORITES_KEY}.`)) void purgeFavorites(session, local, key);
+	}
+}
+
 /**
- * Drop favorites and recent finds at the auth boundary: the scoped keys for
- * the outgoing context plus the legacy unscoped base key. Never throws; values are
+ * Drop legacy favorites and recent finds at the auth boundary; values are
  * removed, never parsed, so a corrupt value is cleared without error.
  */
 function clearFavoritesKeys(storage: SnapshotStorage | null, context: string | null): void {
 	if (!storage) return;
 	try {
-		if (context) storage.removeItem(`${LIBRARY_FAVORITES_KEY}.${context}`);
 		storage.removeItem(LIBRARY_FAVORITES_KEY);
 		if (context) storage.removeItem(`${LIBRARY_RECENT_FINDS_KEY}.${context}`);
 		storage.removeItem(LIBRARY_RECENT_FINDS_KEY);
@@ -270,7 +300,7 @@ function clearFavoritesKeys(storage: SnapshotStorage | null, context: string | n
  * shared browser), and tell other tabs to do the same. Never throws, so
  * it is safe to call right after a credential exchange succeeds.
  */
-export function invalidateLibraryCache(): void {
+export async function invalidateLibraryCache(): Promise<void> {
 	const session = browserStorage('session');
 	// Capture the auth context before clearSnapshot revokes it: the scoped
 	// favorites key in localStorage derives from it.
@@ -284,8 +314,10 @@ export function invalidateLibraryCache(): void {
 	const local = browserStorage('local');
 	clearSnapshot(local);
 	clearFavoritesKeys(local, context);
+	const purge = context && local ? purgeFavorites(session, local, `${LIBRARY_FAVORITES_KEY}.${context}`) : null;
 	clearUsageWarnings();
 	broadcastAuthTransition(local);
+	if (purge) await Promise.race([purge, new Promise<void>((resolve) => setTimeout(resolve, 500))]);
 }
 
 /**

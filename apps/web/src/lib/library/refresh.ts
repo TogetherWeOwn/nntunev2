@@ -1,6 +1,7 @@
 import {
 	clearSnapshot,
 	LIBRARY_AUTH_TRANSITION_KEY,
+	LIBRARY_SESSION_BINDING_KEY,
 	loadSnapshot,
 	saveSnapshot,
 	toLibraryItems,
@@ -10,6 +11,7 @@ import {
 } from './cache.js';
 
 export const LIBRARY_REQUEST_TIMEOUT_MS = 10_000;
+export const LIBRARY_ACCESS_REFUSED_EVENT = 'nntune:library-access-refused';
 
 /** Largest library JSON body retained in memory (1 MiB, counted in UTF-8 bytes). */
 export const LIBRARY_BODY_MAX_BYTES = 1_048_576;
@@ -29,7 +31,8 @@ export interface LibraryRefreshUpdate {
 	/** A successful response or an explicit invalidation, never cached fallback. */
 	authoritative: boolean;
 	/** The account purge ran before this empty snapshot was published. */
-	authBoundary?: true;
+	authBoundary: boolean;
+	sessionBinding?: string;
 }
 
 export interface LibraryRefresherDeps {
@@ -37,8 +40,11 @@ export interface LibraryRefresherDeps {
 	sessionStorage: () => SnapshotStorage | null;
 	/** Clears every snapshot area and tells other tabs the session ended. */
 	invalidateLibraryCache: () => void;
+	/** Override the same-tab refusal signal when the route owns its local cleanup. */
+	onAccessRefused?: () => void;
 	/** Called after state mutations so the page can mirror them reactively. */
 	onStateChange?: (state: LibraryRefreshState, update: LibraryRefreshUpdate) => void;
+	verifySession?: (binding: string, signal: AbortSignal) => Promise<boolean>;
 	timeoutMs?: number;
 }
 
@@ -90,7 +96,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		state.libraryUnavailable = false;
 		state.requiresSignIn = false;
 		let authoritative = false;
-		let authBoundary: true | undefined;
+		let authBoundary = false;
+		let sessionBinding: string | undefined;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -216,7 +223,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		});
 
 		try {
-			deps.onStateChange?.(state, { isCurrent, authoritative: false });
+			deps.onStateChange?.(state, { isCurrent, authoritative: false, authBoundary: false });
 			if (!isCurrent()) return;
 			const fetchPromise = fetchFn('/api/library', {
 				credentials: 'include',
@@ -274,6 +281,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					: 'You do not have access to this library.';
 				authoritative = true;
 				authBoundary = true;
+				if (deps.onAccessRefused) deps.onAccessRefused();
+				else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
 				deps.invalidateLibraryCache();
 				return;
 			}
@@ -286,11 +295,25 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			activeResponse = null;
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
+			const binding = response.headers?.get('x-nntune-session-binding');
+			if (binding && deps.verifySession) {
+				const matches = await Promise.race([deps.verifySession(binding, controller.signal), timeout, aborted]);
+				if (!isCurrent() || controller.signal.aborted) return;
+				if (!matches) return applyAuthTransition();
+			}
+			const storage = deps.sessionStorage();
+			if (!isCurrent()) return;
+			if (storage && binding) {
+				try {
+					const previous = storage.getItem(LIBRARY_SESSION_BINDING_KEY);
+					if (previous && previous !== binding) return applyAuthTransition();
+					if (!previous) storage.setItem(LIBRARY_SESSION_BINDING_KEY, binding);
+					sessionBinding = binding;
+				} catch { /* No verified device scope without readable storage. */ }
+			}
 			authenticatedThisLoad = true;
 			state.items = fresh;
 			state.staleAt = null;
-			const storage = deps.sessionStorage();
-			if (!isCurrent()) return;
 			const persistedSnapshot = saveSnapshot(storage, fresh);
 			if (!isCurrent()) return;
 			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
@@ -318,7 +341,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			if (activeRequest === controller) activeRequest = null;
 			if (isCurrent()) {
 				state.loading = false;
-				deps.onStateChange?.(state, { isCurrent, authoritative, authBoundary });
+				deps.onStateChange?.(state, { isCurrent, authoritative, authBoundary, sessionBinding });
 			}
 		}
 	}

@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { onMount } from 'svelte';
+	import { ApiClient } from '#lib/api/client.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import AccountLikes from '#lib/library/AccountLikes.svelte';
 	import {
@@ -11,40 +13,37 @@
 	import {
 		favoritesKey,
 		loadFavorites,
-		retireStoredFavorites,
-		saveFavorites,
-		selectFavoriteItems
+		selectFavoriteItems,
+		updateStoredFavorites
 	} from '#lib/library/favorites.js';
 	import { restoreFavoriteId } from '#lib/library/favorites-order.js';
+	import { isLikesSession } from '#lib/library/likes.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import { recentPlayTitles } from '#lib/library/recent-plays.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import { pushToast } from '#lib/shell/toasts.js';
 
+	// Device favorites are the visitor's starred subset of their own library:
+	// rows projected through the device-local favorites for this auth
+	// context. Removing a favorite persists immediately and offers Undo.
 	let items = $state<LibraryItem[]>([]);
 	let loading = $state(true);
 	let loadError = $state<string | null>(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let deviceScope = $state<string | null>(null);
-	const session = browserStorage('session');
-	const local = browserStorage('local');
-	let favoriteIds = $state<string[]>([]);
-	const liked = $derived(selectFavoriteItems(items, favoriteIds));
-	const titles = $derived(recentPlayTitles(items));
-
-	type FavoriteChange = (ids: readonly string[]) => readonly string[];
-	const pendingChanges = new Map<string, FavoriteChange>();
-
+	let libraryBinding = $state<string>();
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => session,
 		invalidateLibraryCache,
-		onStateChange: (state, { authoritative, authBoundary }) => {
+		verifySession: (binding, signal) => isLikesSession(new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal }), binding),
+		onStateChange: (state, { authoritative, authBoundary, sessionBinding }) => {
 			items = state.items;
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			requiresSignIn = state.requiresSignIn;
+			libraryBinding = sessionBinding;
 			if (authBoundary) {
 				deviceScope = null;
 				pendingChanges.clear();
@@ -67,30 +66,54 @@
 		};
 	});
 
+	const session = browserStorage('session');
+	const local = browserStorage('local');
+	let favoriteIds = $state<string[]>([]);
+	const liked = $derived(selectFavoriteItems(items, favoriteIds));
+	const titles = $derived(recentPlayTitles(items));
+
+	type FavoriteChange = (ids: readonly string[]) => readonly string[];
+	const pendingChanges = new Map<string, FavoriteChange>();
+
 	function readDeviceIds(): string[] {
 		return deviceScope && deviceScope === favoritesKey(session) ? currentFavorites() : [];
 	}
 
-	function retireDeviceIds(ids: readonly string[]): void {
-		if (!deviceScope || !retireStoredFavorites(session, local, deviceScope, ids)) return;
-		for (const id of ids) pendingChanges.delete(id);
+	async function retireDeviceIds(ids: readonly string[], verify: () => Promise<boolean>): Promise<boolean> {
+		const scope = deviceScope;
+		const confirmed = new Set(ids);
+		const pending = new Map(pendingChanges);
+		const remaining = await updateStoredFavorites(session, local, scope,
+			(stored) => stored.filter((id) => !confirmed.has(id)), verify);
+		if (!remaining || scope !== deviceScope) return false;
+		for (const id of ids) if (pendingChanges.get(id) === pending.get(id)) pendingChanges.delete(id);
 		favoriteIds = currentFavorites();
+		return true;
 	}
 
-	function currentFavorites(): string[] {
-		// Retry unsaved per-track changes against fresh storage, preserving
-		// both this visit's edits and additions from another tab.
-		let ids: readonly string[] = loadFavorites(session, local, favoriteIds);
-		for (const change of pendingChanges.values()) ids = change(ids);
+	function applyChanges(ids: readonly string[], changes = pendingChanges): string[] {
+		for (const change of changes.values()) ids = change(ids);
 		return [...ids];
 	}
 
-	function persistChange(id: string, change: FavoriteChange): void {
-		if (!deviceScope || deviceScope !== favoritesKey(session)) return;
+	function currentFavorites(): string[] {
+		return applyChanges(loadFavorites(session, local, favoriteIds));
+	}
+
+	async function persistChange(id: string, change: FavoriteChange): Promise<void> {
+		const scope = deviceScope;
+		if (!scope || scope !== favoritesKey(session)) return;
 		pendingChanges.delete(id);
 		pendingChanges.set(id, change);
 		favoriteIds = currentFavorites();
-		if (saveFavorites(session, local, favoriteIds)) pendingChanges.clear();
+		let changes = pendingChanges;
+		const stored = await updateStoredFavorites(session, local, scope, (ids) => {
+			changes = new Map(pendingChanges);
+			return applyChanges(ids, changes);
+		});
+		if (!stored || scope !== deviceScope) return;
+		for (const [id, saved] of changes) if (pendingChanges.get(id) === saved) pendingChanges.delete(id);
+		favoriteIds = currentFavorites();
 	}
 
 	function removeFavorite(id: string, title: string): void {
@@ -107,7 +130,7 @@
 			predecessor: previousIndex > 0 ? previous[previousIndex - 1] : null,
 			successor: previousIndex < previous.length - 1 ? previous[previousIndex + 1] : null
 		};
-		persistChange(id, (ids) => ids.filter((entry) => entry !== id));
+		void persistChange(id, (ids) => ids.filter((entry) => entry !== id));
 		pushToast(`Removed “${title}” from Liked.`, {
 			action: {
 				label: 'Undo',
@@ -116,7 +139,7 @@
 					// navigation or another tab's save is never overwritten,
 					// and anchor on the surviving successor so adjacent Undos
 					// restore the original order in either sequence.
-					persistChange(id, (ids) => restoreFavoriteId(ids, id, anchor));
+					void persistChange(id, (ids) => restoreFavoriteId(ids, id, anchor));
 				}
 			}
 		});
@@ -157,12 +180,8 @@
 			{/each}
 		</ul>
 	{/if}
-	{#if !requiresSignIn}
-		<AccountLikes
-			{titles}
-			deviceCount={!loading && !loadError && !libraryUnavailable && deviceScope ? favoriteIds.length : 0}
-			{readDeviceIds}
-			{retireDeviceIds}
-		/>
+	{#if !loading && !requiresSignIn}
+		<AccountLikes {titles} {libraryBinding} {readDeviceIds} {retireDeviceIds}
+			deviceCount={deviceScope ? favoriteIds.length : 0} onSessionChanged={refresher.handleLocalAuthTransition} />
 	{/if}
 </main>

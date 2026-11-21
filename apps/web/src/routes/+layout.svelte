@@ -1,13 +1,13 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
 	import type { Snippet } from 'svelte';
-	import { afterNavigate, goto } from '$app/navigation';
+	import { afterNavigate, goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import favicon from '#lib/assets/favicon.svg';
 	import PaywallModal from '#lib/billing/PaywallModal.svelte';
 	import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
-	import { invalidateLibraryCache } from '#lib/library/cache.js';
+	import { invalidateLibraryCache, resumeFavoritesPurges } from '#lib/library/cache.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		notifyLocalAuthTransition,
@@ -27,10 +27,18 @@
 		type Toast
 	} from '#lib/shell/toasts.js';
 	import { onRightPanel } from '#lib/shell/right-panel.js';
+	import AppPlayer from '#lib/player/AppPlayer.svelte';
 	import '../app.css';
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
+
+	// Store only the current player's opaque receipt, never the share target or position.
+	function claimShareEntry(libraryShareOwner: string): boolean {
+		if ((page.state as { libraryShareOwner?: string }).libraryShareOwner === libraryShareOwner) return false;
+		replaceState(window.location.href, { ...page.state, libraryShareOwner });
+		return true;
+	}
 
 	type Appearance = 'system' | 'light' | 'dark';
 
@@ -165,7 +173,7 @@
 	const PUBLIC_BASES = ['/login', '/signup', '/pricing', '/demo', '/auth'];
 
 	const isPublicRoute = $derived.by((): boolean => {
-		const pathname = page.url.pathname;
+		const pathname = page.route.id ?? page.url.pathname;
 		return pathname === '/' || PUBLIC_BASES.some((base) => matchesBoundary(pathname, base));
 	});
 
@@ -315,6 +323,7 @@
 		const offPanel = onRightPanel((panel) => {
 			rightSnippet = panel;
 		});
+		resumeFavoritesPurges();
 		const offAuth = subscribeLocalAuthTransition(clearShellAtAuthBoundary);
 		const onStorage = (event: StorageEvent): void => {
 			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) clearShellAtAuthBoundary();
@@ -351,24 +360,22 @@
 			try {
 				await client.logout();
 			} catch (error) {
-				if (!(error instanceof ApiError) || error.status !== 401) {
-					pushToast('Could not sign out. Please try again.');
-					return;
-				}
+				if (!(error instanceof ApiError) || error.status !== 401) throw error;
 				// A 401 means the session is already gone: cross the boundary
 				// exactly like a successful sign-out.
 			}
 		} catch {
 			pushToast('Could not sign out. Please try again.');
-			return;
-		} finally {
 			signingOut = false;
+			return;
 		}
 		clearMiniPlayerHint();
 		clearToasts();
-		invalidateLibraryCache();
+		const purge = invalidateLibraryCache();
 		clearSignedInEmail();
 		notifyLocalAuthTransition();
+		await purge;
+		signingOut = false;
 		window.location.href = '/login';
 	}
 
@@ -469,6 +476,7 @@
 			{/if}
 		</div>
 	</div>
+	{#snippet appBody()}
 	<div class="nt-body">
 		<div class="nt-rail" data-testid="shell-rail">
 			<nav aria-label="Primary" class="nt-destinations nt-rail-nav">
@@ -490,6 +498,12 @@
 		</div>
 		{@render children()}
 	</div>
+	{/snippet}
+	{#if page.route.id === null}
+		{@render appBody()}
+	{:else}
+		<AppPlayer {claimShareEntry} children={appBody} signedOut={page.route.id === '/account/billing' && page.data.signedOut === true} />
+	{/if}
 	{#if rightSnippet}
 		<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
 			{@render rightSnippet()}

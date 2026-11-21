@@ -52,6 +52,27 @@ count starts, schedule pairs, provision the auth binding or authorize live use.
 
 Run `python3 -I scripts/subsonic-staging-runner.py --simulate` offline. This
 uses no credentials or network and supplies no evidence about live staging.
+The offline request-contract tests also check the exact staging POST target,
+form-body credential placement, and fixed application rejections. They use
+synthetic credentials and do not exercise live transport or attribute a pair
+response to permit contention.
+
+### Read-only staging observer smoke
+
+After the observer workflow ships, manually run `subsonic-staging-observer` on
+protected `main`. The job uses only the existing `staging` observer secret. It
+makes one fresh PostgreSQL connection with verified TLS and reads the fixed
+counts function in a short read-only transaction. The five fields, in order,
+are measurement sessions, all client sessions, observer sessions, maximum
+connections, and all reserved connections. The observer must see itself once
+in the client count; subtract the reserve and client count only once from the
+maximum. The smoke requires zero measurement sessions and at least two free
+ordinary slots. Missing or unsafe telemetry fails the job with a fixed category.
+
+Record the run, successful job, exact source SHA and UTC sample time. A skipped
+job is not evidence. This is point-in-time database telemetry, not lease or
+`/rest` readiness, and cannot be reused to admit a future load window. The job
+does not deploy a Worker, change bindings or send application traffic.
 
 ### Charge triplet
 

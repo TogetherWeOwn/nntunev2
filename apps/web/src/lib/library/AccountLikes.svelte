@@ -1,39 +1,50 @@
 <script lang="ts">
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { onMount } from 'svelte';
 	import { ApiClient, ApiError } from '../api/client.js';
-	import { subscribeLocalAuthTransition } from '../auth-transition.js';
-	import { browserStorage, LIBRARY_AUTH_TRANSITION_KEY } from './cache.js';
+	import { browserStorage } from './cache.js';
 	import { favoritesKey } from './favorites.js';
-	import { importDeviceLikes, loadLikes, type LibraryLike } from './likes.js';
+	import { importDeviceLikes, isLikesSession, loadLikes, type LibraryLike } from './likes.js';
 
-	let { titles, deviceCount, readDeviceIds, retireDeviceIds }: {
+	let { titles, libraryBinding, deviceCount, readDeviceIds, retireDeviceIds, onSessionChanged }: {
 		titles: ReadonlyMap<string, string>;
+		libraryBinding: string | undefined;
 		deviceCount: number;
 		readDeviceIds: () => string[];
-		retireDeviceIds: (ids: readonly string[]) => void;
+		retireDeviceIds: (ids: readonly string[], verify: () => Promise<boolean>) => Promise<boolean>;
+		onSessionChanged: () => void;
 	} = $props();
 
-	type Phase = 'loading' | 'ready' | 'sign-in' | 'error';
-	let phase = $state<Phase>('loading');
+	let phase = $state<'loading' | 'ready' | 'sign-in' | 'error'>('loading');
 	let likes = $state<LibraryLike[]>([]);
+	let shelfBinding = $state<string>();
 	let importing = $state(false);
 	let feedback = $state('');
 	let active: AbortController | undefined;
 	const songs = $derived(likes.filter((like) => like.kind === 'track'));
+	const canImport = $derived(!!shelfBinding && shelfBinding === libraryBinding && deviceCount > 0);
 
 	function clientFor(request: AbortController): ApiClient {
 		return new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal });
 	}
 
-	async function read(client: ApiClient, isCurrent: () => boolean): Promise<void> {
+	function sessionChanged(): void {
+		active?.abort();
+		onSessionChanged();
+	}
+
+	async function read(client: ApiClient, isCurrent: () => boolean, expected = libraryBinding): Promise<void> {
 		try {
-			const items = await loadLikes(client);
+			const { items, binding } = await loadLikes(client);
+			const matches = (!expected || binding === expected) && await isLikesSession(client, binding);
 			if (!isCurrent()) return;
+			if (!matches) return sessionChanged();
+			shelfBinding = binding;
 			likes = items;
 			phase = 'ready';
 		} catch (error) {
 			if (!isCurrent()) return;
-			likes = [];
+			shelfBinding = undefined;
 			phase = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error';
 		}
 	}
@@ -47,53 +58,45 @@
 	}
 
 	async function importLikes(): Promise<void> {
-		if (phase !== 'ready' || importing || !deviceCount) return;
+		const binding = shelfBinding;
+		if (phase !== 'ready' || importing || !canImport || !binding) return;
 		const session = browserStorage('session');
 		const key = favoritesKey(session);
-		if (!key) return;
 		const ids = readDeviceIds();
-		if (!ids.length) return;
+		if (!key || !ids.length) return;
 		active?.abort();
 		const request = new AbortController();
 		active = request;
-		const isCurrent = () => !request.signal.aborted && favoritesKey(session) === key;
+		const isCurrent = () => !request.signal.aborted && libraryBinding === binding && favoritesKey(session) === key;
 		const client = clientFor(request);
 		importing = true;
 		feedback = '';
 		try {
-			await importDeviceLikes(client, ids, { isCurrent, retireConfirmed: retireDeviceIds });
-			if (isCurrent()) {
-				feedback = readDeviceIds().length ? 'Some favorites remain on this device.' : 'Device favorites imported.';
-			}
-		} catch {
-			if (isCurrent()) {
-				feedback = 'Import could not finish. Unconfirmed favorites are still on this device.';
-			}
+			const cleaned = await importDeviceLikes(client, ids, {
+				binding, isCurrent,
+				retireConfirmed: (confirmed) => retireDeviceIds(confirmed, async () => {
+					if (!isCurrent()) return false;
+					const matches = await isLikesSession(client, binding);
+					if (isCurrent() && !matches) sessionChanged();
+					return matches && isCurrent();
+				})
+			});
+			if (isCurrent()) feedback = !cleaned
+				? 'Favorites were saved to your account, but device cleanup could not finish.'
+				: readDeviceIds().length ? 'Some favorites remain on this device.' : 'Device favorites imported.';
+		} catch (error) {
+			if (!isCurrent()) return;
+			if (error instanceof ApiError && (error.status === 401 || error.status === 412)) return sessionChanged();
+			feedback = 'Import could not finish. Unconfirmed favorites are still on this device.';
 		} finally {
-			if (isCurrent()) await read(client, isCurrent);
+			if (isCurrent()) await read(client, isCurrent, binding);
 			if (active === request) importing = false;
 		}
 	}
 
-	$effect(() => {
-		function reset(): void {
-			active?.abort();
-			likes = [];
-			feedback = '';
-			importing = false;
-			phase = 'sign-in';
-		}
-		function onStorage(event: StorageEvent): void {
-			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) reset();
-		}
-		const unsubscribe = subscribeLocalAuthTransition(reset);
-		window.addEventListener('storage', onStorage);
+	onMount(() => {
 		void load();
-		return () => {
-			active?.abort();
-			unsubscribe();
-			window.removeEventListener('storage', onStorage);
-		};
+		return () => active?.abort();
 	});
 </script>
 
@@ -112,13 +115,13 @@
 		{:else}
 			<ul>
 				{#each songs as song (song.targetId)}
-					<li>{titles.get(song.targetId) ?? 'Unknown track'}</li>
+					<li>{(shelfBinding === libraryBinding && titles.get(song.targetId)) || 'Unknown track'}</li>
 				{/each}
 			</ul>
 		{/if}
-		{#if deviceCount > 0 || importing || feedback}
-			{#if deviceCount > 0}<p>Import favorites from this device into your signed-in account.</p>{/if}
-			<button class="nt-button" type="button" onclick={importLikes} aria-disabled={importing || deviceCount === 0}>
+		{#if canImport || importing || feedback}
+			{#if canImport}<p>Import favorites from this device into your signed-in account.</p>{/if}
+			<button class="nt-button" type="button" onclick={importLikes} aria-disabled={importing || !canImport}>
 				{importing ? 'Importing…' : 'Import device favorites'}
 			</button>
 		{/if}

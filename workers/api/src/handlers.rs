@@ -562,6 +562,37 @@ pub enum AdminInviteRevokeOutcome {
     ActorNotAdmin,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct InviteWindow {
+    pub id: i64,
+    pub starts_at: i64,
+    pub ends_at: i64,
+    pub created_by: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InviteWindowSchedule {
+    pub starts_at: i64,
+    pub ends_at: i64,
+    pub note: Option<String>,
+}
+
+pub enum InviteWindowWrite<'a> {
+    Schedule(&'a InviteWindowSchedule),
+    Close(i64),
+}
+
+#[derive(Debug)]
+pub enum InviteWindowOutcome {
+    Window(InviteWindow),
+    InvalidSchedule,
+    Overlap,
+    Missing,
+    ActorNotAdmin,
+}
+
 impl From<auth::AuthError> for StoreError {
     fn from(_: auth::AuthError) -> Self {
         StoreError
@@ -998,10 +1029,10 @@ pub trait Store {
             Err(StoreError)
         }
     }
-    /// Extend the exact holder's lease (`playback::playback_lease_
-    /// touch_statement`): true iff the (`session_id`, `play_id`,
-    /// `epoch`) triple still names the stored row. Default `Err` fails
-    /// closed like [`Store::live_subscription`].
+    /// Extend the exact holder's live lease. Returns true only if the
+    /// (`session_id`, `play_id`, `epoch`) triple still names a live row
+    /// at `now` and the deletion fence allows the write. Default `Err`
+    /// fails closed like [`Store::live_subscription`].
     fn touch_playback_lease(
         &self,
         user_id: &str,
@@ -1512,6 +1543,21 @@ pub trait Store {
     ) -> impl Future<Output = Result<AdminInviteRevokeOutcome, StoreError>> {
         async { Err(StoreError) }
     }
+    fn admin_list_invite_windows(
+        &self,
+    ) -> impl Future<Output = Result<Vec<InviteWindow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Recheck admin under the write lock, then atomically commit the transition and audit.
+    fn admin_write_invite_window(
+        &self,
+        _actor: &str,
+        _write: InviteWindowWrite<'_>,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<InviteWindowOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Compatibility lifecycle is native-session-only. Implementations must
     /// fence the live owner and commit before returning success; false means
     /// no insert (deleting owner or active-credential limit). The default
@@ -1860,10 +1906,9 @@ pub struct Response {
     pub set_cookie: Option<String>,
     /// `Retry-After` seconds for a 429; the entry renders the header.
     pub retry_after: Option<u64>,
-    /// Extra response headers the entry renders verbatim (plan-limit
-    /// `x-plan-limit` / `x-plan-reset` today). Values must be names-only
-    /// by construction — see `plan_limits::Denial::headers`; never put
-    /// account data here.
+    /// Extra response headers the entry renders verbatim (plan-limit hints
+    /// and the opaque library session binding). Never put credentials or
+    /// raw account/session identifiers here.
     pub extra_headers: Vec<(String, String)>,
 }
 
@@ -1986,6 +2031,35 @@ where
     }
 }
 
+pub(crate) const SESSION_BINDING_HEADER: &str = "x-nntune-session-binding";
+
+// A precondition, not a credential. Cookie refresh preserves the verified
+// session ID; a replacement session gets a new random ID, even for the same user.
+fn session_binding(claims: &SessionClaims) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    hash.update(b"nntune:likes-import:session-binding:v1\0");
+    hash.update(claims.session_id.as_bytes());
+    b64url_encode(&hash.finalize())
+}
+
+async fn me_likes_session<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    match preference_authenticate(ctx, req, false).await {
+        Ok((claims, _)) => json_response(
+            200,
+            serde_json::json!({"session_binding": session_binding(&claims)}),
+        ),
+        Err(resp) => resp,
+    }
+}
+
 // Adapted from the preference collection handler in PR #982.
 async fn me_likes_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
@@ -2010,7 +2084,10 @@ where
                     })
                 })
                 .collect();
-            json_response(200, serde_json::json!({"items": items}))
+            json_response(
+                200,
+                serde_json::json!({"items": items, "session_binding": session_binding(&claims)}),
+            )
         }
         Err(_) => unavailable(),
     }
@@ -2226,6 +2303,7 @@ where
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Body {
+        session_binding: String,
         items: Vec<Object<Item>>,
     }
     #[derive(Deserialize)]
@@ -2239,9 +2317,22 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
-    let Some(Object(Body { items })) = parse_body(req) else {
+    let Some(Object(Body {
+        session_binding: provided_binding,
+        items,
+    })) = parse_body(req)
+    else {
         return validation_failed("invalid likes import body");
     };
+    if provided_binding.is_empty() {
+        return validation_failed("invalid likes import body");
+    }
+    if provided_binding != session_binding(&claims) {
+        return json_response(
+            412,
+            serde_json::json!({"error": "session binding mismatch"}),
+        );
+    }
     if items.len() > 500 {
         return validation_failed("too many likes import items");
     }
@@ -4498,18 +4589,23 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let user_id = if req.authorization.is_some() {
-        match ctx.authenticate_bearer_session(req).await {
-            Ok((claims, _token)) => claims.user_id,
-            Err(resp) => return resp,
-        }
+    let is_cookie = req.authorization.is_none();
+    let authenticated = if is_cookie {
+        ctx.authenticate(req, false).await
     } else {
-        match ctx.authenticate(req, false).await {
-            Ok((claims, _token)) => claims.user_id,
-            Err(resp) => return resp,
-        }
+        ctx.authenticate_bearer_session(req).await
     };
-    catalogue_library_entries(ctx, &user_id).await
+    let (claims, _) = match authenticated {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let mut response = catalogue_library_entries(ctx, &claims.user_id).await;
+    if is_cookie && response.status == 200 {
+        response
+            .extra_headers
+            .push((SESSION_BINDING_HEADER.into(), session_binding(&claims)));
+    }
+    response
 }
 
 /// Shared store read plus serialization for the two library routes: the
@@ -6297,7 +6393,7 @@ where
     // lost the lease between the read and now, in which case this is
     // simply a new start through the gates below.
     if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
-        if row.is_continuation(&body.session_id, play_id, &body.track_id) {
+        if row.is_continuation(&body.session_id, play_id, &body.track_id, ctx.now) {
             if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, play_id).is_err()
             {
                 return Err(validation_failed("invalid play_id"));
@@ -6432,10 +6528,10 @@ where
 }
 
 /// Heartbeat: the holder's keepalive and the takeover signal in one.
-/// Always 200 for lease state (`active` extends, `superseded` tells the
-/// displaced player to pause, `expired` means no row) — lease state is
-/// an answer, not an error. No subscription or cap gates: a current
-/// play finishes even when a new start would be refused.
+/// Always 200 for lease state (`active` extends, `superseded` signals
+/// displacement, and `expired` means the matching lease ended or no
+/// row exists). No subscription or cap gates: a current play finishes
+/// even when a new start would be refused.
 async fn play_heartbeat<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -6480,6 +6576,7 @@ where
         &body.session_id,
         &body.play_id,
         body.lease_epoch,
+        ctx.now,
     );
     let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
         let expires = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
@@ -7632,6 +7729,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/me/usage"
             | "/v1/me/subscription"
             | "/v1/me/likes"
+            | "/v1/me/likes/session"
             | "/v1/me/likes/import"
             | "/v1/me/taste"
             | "/v1/me/history"
@@ -7842,6 +7940,7 @@ where
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
+        ("GET", "/v1/me/likes/session") => me_likes_session(ctx, req).await,
         ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
         ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
         ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
@@ -9232,13 +9331,12 @@ mod tests {
             session_id: &str,
             play_id: &str,
             epoch: u64,
-            _now: u64,
+            now: u64,
             expires_at: u64,
         ) -> Result<bool, StoreError> {
-            // Mirror the conditional UPDATE: only the exact
-            // (session, play, epoch) holder extends, monotonically
-            // (an out-of-order older deadline never shortens), and
-            // never for a deleting account (in-statement fence).
+            // Mirror the conditional UPDATE: only the exact holder of a
+            // live lease extends, monotonically, and never for a deleting
+            // account (in-statement fence).
             if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
                 self.deleting_users.borrow_mut().insert(marker);
             }
@@ -9248,7 +9346,8 @@ mod tests {
             let mut leases = self.playback_leases.borrow_mut();
             match leases.get_mut(user_id) {
                 Some(row)
-                    if row.session_id == session_id
+                    if row.is_live(now)
+                        && row.session_id == session_id
                         && row.play_id == play_id
                         && row.epoch == epoch =>
                 {
@@ -15742,12 +15841,14 @@ mod tests {
             .rev()
             .map(|i| serde_json::json!({"kind":"track", "target_id":format!("Job-{i}"), "created_at":i}))
             .collect();
-        let expected = serde_json::json!({"items":expected});
-        assert_eq!(read(alice.clone(), Some(ORIGIN)), expected);
-        assert_eq!(read(alice, Some("https://other.example")), expected);
+        let allowed = read(alice.clone(), Some(ORIGIN));
+        assert_eq!(allowed["items"], serde_json::json!(expected));
+        assert_eq!(read(alice, Some("https://other.example")), allowed);
+        let other = read(bob, None);
+        assert_ne!(other["session_binding"], allowed["session_binding"]);
         assert_eq!(
-            read(bob, None),
-            serde_json::json!({"items":[{"kind":"track", "target_id":"foreign", "created_at":1000}]})
+            other["items"],
+            serde_json::json!([{"kind":"track", "target_id":"foreign", "created_at":1000}])
         );
     }
 
@@ -15768,7 +15869,7 @@ mod tests {
         let assert_not_found = |resp: Response| {
             assert_eq!((resp.status, resp.body), (404, not_found().body));
         };
-        for path in ["/v1/me/likes", "/v1/me/history"] {
+        for path in ["/v1/me/likes", "/v1/me/likes/session", "/v1/me/history"] {
             let mut req = Request {
                 method: "GET".into(),
                 path: path.into(),
@@ -15793,6 +15894,7 @@ mod tests {
         }
         let cases = [
             ("/v1/me/likes", "GET"),
+            ("/v1/me/likes/session", "GET"),
             ("/v1/me/history", "GET"),
             ("/v1/me/likes/import", "POST"),
         ];
@@ -15837,7 +15939,9 @@ mod tests {
         let call = |req: &Request| block_on(me_likes_list(&h.ctx(), req));
         let empty = call(&req);
         assert_eq!(empty.status, 200);
-        assert_eq!(empty.body, r#"{"items":[]}"#);
+        let empty_body: serde_json::Value = serde_json::from_str(&empty.body).unwrap();
+        assert_eq!(empty_body["items"], serde_json::json!([]));
+        assert!(empty_body["session_binding"].is_string());
         assert!(empty.set_cookie.is_none());
         assert!(empty.retry_after.is_none());
         assert!(empty.extra_headers.is_empty());
@@ -15877,8 +15981,8 @@ mod tests {
         req.cookie = Some(bob);
         let switched: serde_json::Value = serde_json::from_str(&call(&req).body).unwrap();
         assert_eq!(
-            switched,
-            serde_json::json!({"items":[{"kind":"track", "target_id":"foreign", "created_at":1000}]})
+            switched["items"],
+            serde_json::json!([{"kind":"track", "target_id":"foreign", "created_at":1000}])
         );
         req.cookie = Some(alice.clone());
         for authorization in ["Bearer ntk_test", "Bearer anything"] {
@@ -16915,17 +17019,41 @@ mod tests {
         }
     }
 
-    fn likes_import_request(h: &Harness) -> Request {
+    fn current_likes_binding(h: &Harness, cookie: &str) -> String {
+        let resp = h.call_full(
+            "GET",
+            "/v1/me/likes/session",
+            None,
+            Some(cookie.into()),
+            None,
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let binding = body["session_binding"].as_str().unwrap();
+        assert!(!binding.is_empty());
+        assert_eq!(body, serde_json::json!({"session_binding": binding}));
+        binding.into()
+    }
+
+    fn likes_import_request(h: &Harness) -> (Request, String) {
         seed_user(h, "alice", "alice@example.com");
-        Request {
+        let cookie = magic_login(h, "alice@example.com");
+        let binding = current_likes_binding(h, &cookie);
+        let req = Request {
             method: "POST".into(),
             path: "/v1/me/likes/import".into(),
-            cookie: Some(magic_login(h, "alice@example.com")),
+            cookie: Some(cookie),
             origin: Some(ORIGIN.into()),
             authorization: None,
             stripe_signature: None,
             body: Vec::new(),
-        }
+        };
+        (req, binding)
+    }
+
+    fn import_body(binding: &str, items: impl serde::Serialize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"session_binding": binding, "items": items}))
+            .unwrap()
     }
 
     fn import_item(kind: &str, target_id: &str) -> serde_json::Value {
@@ -16941,27 +17069,86 @@ mod tests {
     }
 
     #[test]
+    fn dispatched_likes_import_requires_the_current_browser_session_binding() {
+        use serde_json::{json, Value};
+
+        let h = harness();
+        let (mut req, original) = likes_import_request(&h);
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![unmatched_library_row("Job")]);
+        let replacement = magic_login(&h, "alice@example.com");
+        req.cookie = Some(replacement.clone());
+        let current = current_likes_binding(&h, &replacement);
+        assert_ne!(original, current);
+        let (claims, token) = block_on(h.ctx().authenticate(&req, true)).unwrap();
+        assert_ne!(current, claims.session_id);
+        assert_ne!(current, token);
+        let read = |path| h.call_full("GET", path, None, Some(replacement.clone()), Some(ORIGIN));
+        let likes = read("/v1/me/likes");
+        assert_eq!(likes.status, 200);
+        assert_eq!(
+            serde_json::from_str::<Value>(&likes.body).unwrap(),
+            json!({"items": [], "session_binding": current})
+        );
+        let library = read("/api/library");
+        assert_eq!(library.status, 200);
+        assert_eq!(library.body, read("/v1/library").body);
+        assert_eq!(
+            library.extra_headers,
+            [(SESSION_BINDING_HEADER.to_string(), current.clone())]
+        );
+        *h.store.fail_taste_read.borrow_mut() = true;
+        assert_eq!(read("/v1/me/likes").status, 503);
+        assert_eq!(current_likes_binding(&h, &replacement), current);
+
+        let items = [import_item("track", "Job")];
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        h.store
+            .preference_failure
+            .set(Some((PreferenceFailure::Member, "Job")));
+        for (body, status) in [
+            (serde_json::to_vec(&json!({"items": items})).unwrap(), 422),
+            (import_body("", &items), 422),
+            (import_body("other-binding", &items), 412),
+            (import_body(&original, &items), 412),
+        ] {
+            req.body = body;
+            assert_eq!(call(&req).status, status);
+        }
+        assert!(h.store.taste_rows.borrow().is_empty());
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+        req.body = import_body(&current, &items);
+        assert_eq!(call(&req).status, 503, "valid binding reaches resolution");
+        h.store.preference_failure.set(None);
+        assert_import(call(&req), 1, 0, &[]);
+    }
+
+    #[test]
     fn dispatched_likes_import_rejects_bad_structure_and_auth_before_writing() {
         use crate::native_rest::{scope_for_operation, RouteDecision};
 
         let h = peppered_harness();
-        let mut req = likes_import_request(&h);
+        let (mut req, binding) = likes_import_request(&h);
         h.store
             .catalogue_library
             .borrow_mut()
             .insert("alice".into(), vec![unmatched_library_row("Job")]);
         let call = |req: &Request| block_on(handle(&h.ctx(), req));
         let valid = r#"{"kind":"track","target_id":"Job"}"#;
+        let field = format!(r#""session_binding":"{binding}""#);
         for body in [
             "{",
             "{}",
             "null",
-            r#"{"items":{}}"#,
-            r#"{"items":null}"#,
-            &format!("[[{valid}]]"),
-            &format!(r#"{{"items":[{valid}],"user_id":"bob"}}"#),
-            &format!(r#"{{"items":[{valid}],"items":[]}}"#),
-            &format!(r#"{{"items":[{valid}]}} []"#),
+            &format!(r#"{{{field},"items":{{}}}}"#),
+            &format!(r#"{{{field},"items":null}}"#),
+            &format!(r#"["{binding}",[{valid}]]"#),
+            &format!(r#"{{{field},{field},"items":[{valid}]}}"#),
+            &format!(r#"{{{field},"items":[{valid}],"user_id":"bob"}}"#),
+            &format!(r#"{{{field},"items":[{valid}],"items":[]}}"#),
+            &format!(r#"{{{field},"items":[{valid}]}} []"#),
         ] {
             req.body = body.as_bytes().to_vec();
             assert_eq!(call(&req).status, 422, "{body}");
@@ -16977,10 +17164,10 @@ mod tests {
             r#"{"kind":"track","target_id":"Job","user_id":"bob"}"#,
             r#"{"kind":"track","target_id":"Job","target_id":"Job"}"#,
         ] {
-            req.body = format!(r#"{{"items":[{valid},{item}]}}"#).into_bytes();
+            req.body = format!(r#"{{{field},"items":[{valid},{item}]}}"#).into_bytes();
             assert_eq!(call(&req).status, 422, "{item}");
         }
-        req.body = format!(r#"{{"items":[{valid}]}}"#).into_bytes();
+        req.body = format!(r#"{{{field},"items":[{valid}]}}"#).into_bytes();
         for origin in [None, Some("https://wrong.example".into())] {
             req.origin = origin;
             assert_eq!(call(&req).status, 401);
@@ -17051,9 +17238,9 @@ mod tests {
         use crate::worker_entry::CollectedBody;
 
         let h = harness();
-        let mut req = likes_import_request(&h);
+        let (mut req, binding) = likes_import_request(&h);
         let call = |req: &Request| block_on(handle(&h.ctx(), req));
-        req.body = br#"{"items":[]}"#.to_vec();
+        req.body = import_body(&binding, Vec::<serde_json::Value>::new());
         assert_import(call(&req), 0, 0, &[]);
         let targets: Vec<_> = (0..500)
             .map(|i| format!("{}{:03}", "A".repeat(509), i))
@@ -17064,12 +17251,12 @@ mod tests {
         );
         let mut items: Vec<_> = targets.iter().map(|id| import_item("track", id)).collect();
         items.push(items[0].clone());
-        req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        req.body = import_body(&binding, &items);
         assert_eq!(call(&req).status, 422);
         assert!(h.store.taste_rows.borrow().is_empty());
         assert_eq!(h.store.taste_write_attempts.get(), 0);
         items.pop();
-        req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        req.body = import_body(&binding, &items);
         let cap = max_body_bytes(&req.method, &req.path);
         assert_eq!(cap, 320 * 1024);
         assert!(req.body.len() > MAX_BODY_BYTES && req.body.len() < cap);
@@ -17101,7 +17288,7 @@ mod tests {
         let prefix = "\"\\\n😀".repeat(16); // 64 Unicode scalar values, with JSON escapes.
         let mut invalid = vec![import_item("track", &format!("{prefix}discarded")); 499];
         invalid.push(import_item("track", &"A".repeat(513)));
-        req.body = serde_json::to_vec(&serde_json::json!({"items": invalid})).unwrap();
+        req.body = import_body(&binding, invalid);
         let mut rejected = vec![serde_json::json!({"target_id": prefix, "reason": "invalid"}); 499];
         rejected.push(serde_json::json!({"target_id": "A".repeat(64), "reason": "invalid"}));
         assert_import(call(&req), 0, 0, &rejected);
@@ -17116,7 +17303,7 @@ mod tests {
         use crate::worker_entry::CollectedBody;
 
         let h = harness();
-        let mut req = likes_import_request(&h);
+        let (mut req, binding) = likes_import_request(&h);
         let targets: Vec<_> = (0..500)
             .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
             .collect();
@@ -17125,7 +17312,7 @@ mod tests {
             targets.iter().map(|id| unmatched_library_row(id)).collect(),
         );
         let items: Vec<_> = targets.iter().map(|id| import_item("track", id)).collect();
-        let bytes = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        let bytes = import_body(&binding, &items);
         assert!(bytes.len() > MAX_BODY_BYTES);
         let mut taste = Request {
             method: "PUT".into(),
@@ -17173,7 +17360,7 @@ mod tests {
         use crate::target_identity::TargetKind::{Release, Track};
         use crate::taste_signal::TasteSignal::Snooze;
         let h = harness();
-        let mut req = likes_import_request(&h);
+        let (mut req, binding) = likes_import_request(&h);
         seed_user(&h, "bob", "bob@example.com");
         let job = "ABCDEFAB-1234-1234-1234-ABCDEFABCDEF";
         let recording = "abcdefab-4321-4321-4321-abcdefabcdef";
@@ -17207,7 +17394,7 @@ mod tests {
             (CAT_RELEASE, "invalid"),
         ]
         .map(|(id, reason)| serde_json::json!({"target_id": id, "reason": reason}));
-        req.body = serde_json::to_vec(&serde_json::json!({"items": items})).unwrap();
+        req.body = import_body(&binding, &items);
         assert_import(block_on(handle(&h.ctx(), &req)), 4, 1, &rejected);
         let mut later = h.ctx();
         later.now += 60;
@@ -17226,8 +17413,17 @@ mod tests {
             );
         }
         assert_eq!(h.store.taste_rows.borrow().len(), 4);
-        req.cookie = Some(magic_login(&h, "bob@example.com"));
-        req.body = serde_json::to_vec(&serde_json::json!({"items": [items[0].clone(), import_item("track", "Shared"), import_item("track", "Private")]})).unwrap();
+        let bob = magic_login(&h, "bob@example.com");
+        let binding = current_likes_binding(&h, &bob);
+        req.cookie = Some(bob);
+        req.body = import_body(
+            &binding,
+            [
+                items[0].clone(),
+                import_item("track", "Shared"),
+                import_item("track", "Private"),
+            ],
+        );
         assert_import(
             block_on(handle(&later, &req)),
             2,
@@ -17254,7 +17450,7 @@ mod tests {
         use PreferenceFailure::{Member, Write};
         for fault in [(Member, "Second"), (Member, CAT_RELEASE), (Write, "Second")] {
             let h = harness();
-            let mut req = likes_import_request(&h);
+            let (mut req, binding) = likes_import_request(&h);
             h.store.catalogue_library.borrow_mut().insert(
                 "alice".into(),
                 vec![
@@ -17268,7 +17464,14 @@ mod tests {
             } else {
                 import_item("track", "Second")
             };
-            req.body = serde_json::to_vec(&serde_json::json!({"items": [import_item("track", "First"), second, import_item("track", "Last")]})).unwrap();
+            req.body = import_body(
+                &binding,
+                [
+                    import_item("track", "First"),
+                    second,
+                    import_item("track", "Last"),
+                ],
+            );
             h.store.preference_failure.set(Some(fault));
             let failed = block_on(handle(&h.ctx(), &req));
             assert_eq!((failed.status, failed.body), (503, unavailable().body));
@@ -17429,13 +17632,11 @@ mod tests {
             );
         }
         let likes = h.call_full("GET", "/v1/me/likes", None, alice.cookie.clone(), None);
+        assert_eq!(likes.status, 200);
+        let likes: serde_json::Value = serde_json::from_str(&likes.body).unwrap();
         assert_eq!(
-            (likes.status, likes.body),
-            (
-                200,
-                json!({"items":[{"kind":"track", "target_id":"Job_A", "created_at":NOW + 2}]})
-                    .to_string()
-            )
+            likes["items"],
+            json!([{"kind":"track", "target_id":"Job_A", "created_at":NOW + 2}])
         );
         let bob_after = read(&bob);
         assert_eq!((bob_after.status, bob_after.body), (200, bob_before.body));
@@ -27077,6 +27278,7 @@ mod tests {
         // Session-as-Bearer with no cookie serves the identical entries.
         let via_bearer = h.call_bearer("GET", "/api/library", Some(format!("Bearer {session}")));
         assert_eq!(via_bearer.status, 200, "{}", via_bearer.body);
+        assert!(via_bearer.extra_headers.is_empty());
         let via_cookie = h.call_full(
             "GET",
             "/api/library",

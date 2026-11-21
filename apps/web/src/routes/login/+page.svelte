@@ -107,8 +107,8 @@
 			);
 			if (attempt.signal.aborted) return;
 			stashSignedInEmail(attemptedEmail);
-			invalidateLibraryCache();
-			window.location.href = '/library';
+			await invalidateLibraryCache();
+			if (!attempt.signal.aborted) window.location.href = '/library';
 		} catch (error) {
 			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {
