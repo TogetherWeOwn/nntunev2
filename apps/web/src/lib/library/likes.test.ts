@@ -50,6 +50,16 @@ describe('server likes', () => {
 		for (let i = 0; i < 3; i++) await expect(loadLikes(client)).rejects.toThrow('Invalid likes list');
 	});
 
+	it.each([
+		['missing', {}],
+		['noncanonical', { session_binding: `${binding.slice(1)}B` }]
+	])('rejects an otherwise valid list with a %s binding', async (_case, fields) => {
+		const { client } = mockClient(Response.json({
+			...fields, items: [{ kind: 'track', target_id: JOB, created_at: 10 }]
+		}));
+		await expect(loadLikes(client)).rejects.toThrow('Invalid likes list');
+	});
+
 	it('sends exact IDs on both methods and returns the acknowledged identity', async () => {
 		const { client, fetchFn } = mockClient(
 			Response.json({ target_id: JOB, liked_at: 1 }),
@@ -102,9 +112,41 @@ describe('legacy likes import', () => {
 		const scope = currentScope();
 		await expect(importDeviceLikes(client, ids, scope)).rejects.toMatchObject({ status: 503 });
 		expect(scope.retireConfirmed).toHaveBeenCalledExactlyOnceWith(ids.slice(0, 50));
-		await importDeviceLikes(client, ids.slice(50), scope);
+		await expect(importDeviceLikes(client, ids.slice(50), scope)).resolves.toBe('complete');
 		expect(scope.retireConfirmed).toHaveBeenLastCalledWith(ids.slice(50));
 		expect(fetchFn.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).session_binding)).toEqual([binding, binding, binding]);
+	});
+
+	it('does not send or retire a batch denied by the verified runner', async () => {
+		const ids = Array.from({ length: 51 }, (_, i) => `Job_${i}`);
+		const { client, fetchFn } = mockClient(importReceipt(50), importReceipt(1));
+		const scope = currentScope();
+		let admissions = 0;
+		const admit = async <T>(work: () => T) => ++admissions === 1 ? work() : undefined;
+
+		await expect(importDeviceLikes(client, ids, { ...scope, run: admit })).resolves.toBeNull();
+		expect(admissions).toBe(2);
+		expect(fetchFn).toHaveBeenCalledOnce();
+		expect(scope.retireConfirmed).toHaveBeenCalledExactlyOnceWith(ids.slice(0, 50));
+	});
+
+	it('waits for cleanup and stops importing if device storage refuses retirement', async () => {
+		const ids = Array.from({ length: 51 }, (_, i) => `Job_${i}`);
+		const { client, fetchFn } = mockClient(importReceipt(50), importReceipt(1));
+		const started = Promise.withResolvers<void>();
+		const cleanup = Promise.withResolvers<boolean>();
+		const retireConfirmed = vi.fn((_ids: readonly string[]) => {
+			started.resolve();
+			return cleanup.promise;
+		});
+
+		const importing = importDeviceLikes(client, ids, { ...currentScope(), retireConfirmed });
+		await started.promise;
+		expect(fetchFn).toHaveBeenCalledOnce();
+		cleanup.resolve(false);
+		await expect(importing).resolves.toBe('cleanup-failed');
+		expect(fetchFn).toHaveBeenCalledOnce();
+		expect(retireConfirmed).toHaveBeenCalledExactlyOnceWith(ids.slice(0, 50));
 	});
 
 	it('does not trust incomplete counts or mismatched rejection identities', async () => {
