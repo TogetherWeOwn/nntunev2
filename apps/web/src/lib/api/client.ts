@@ -268,8 +268,7 @@ const ADMIN_INVITES = '/v1/admin/invites';
 const invalidAdminInvites = (status: number) => new ApiError(status, 'request_failed', 'Invalid invite ledger response');
 const isInviteId = (id: unknown): id is number => typeof id === 'number' && Number.isSafeInteger(id) && id > 0;
 // Account IDs are minted from 16 random bytes in unpadded base64url.
-export const isInviteIssuerId = (id: unknown): id is string =>
-	typeof id === 'string' && id.length === 22 && /^[A-Za-z0-9_-]{22}$/.test(id);
+export const isInviteIssuerId = (id: unknown): id is string => typeof id === 'string' && /^[A-Za-z0-9_-]{22}$/.test(id);
 function isAdminInvite(value: unknown): value is AdminInvite {
 	const row = value as Partial<AdminInvite> | null;
 	return row != null && isInviteId(row.id) && row.status !== undefined && INVITE_STATUSES.includes(row.status) &&

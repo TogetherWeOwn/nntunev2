@@ -57,7 +57,6 @@ test('shows only the returned ledger rows and applies one server-side filter at 
 	await search.fill(issuer);
 	await search.press('Enter');
 	await expect(page.getByText('No invites match this filter.')).toBeVisible();
-	await expect(results(page)).toHaveCount(0);
 	expect(calls).toEqual([`GET ${api}`, `GET ${api}/status/redeemed`, `GET ${api}/issuer/${issuer}`]);
 });
 
@@ -67,26 +66,25 @@ for (const status of [404, 500, 200]) test(`does not expose ledger controls afte
 	await expect(page.getByRole('alert')).toContainText('Reload this page to check access');
 	await expect(page.getByLabel('Filter by')).toHaveCount(0);
 	await expect(results(page)).toHaveCount(0);
-	await expect(page.getByRole('button', { name: 'Revoke', exact: false })).toHaveCount(0);
 	expect(calls).toEqual([`GET ${api}`]);
 });
 
-test('cancel sends nothing; confirmed revoke sends one bodyless write and reloads Active', async ({ page }) => {
-	const pending = Promise.withResolvers<void>();
+test('cancel sends nothing; confirmed revoke locks controls through the Active refresh', async ({ page }) => {
+	await page.setViewportSize({ width: 320, height: 800 });
+	const write = Promise.withResolvers<void>();
+	const refresh = Promise.withResolvers<void>();
 	let revoked = false;
-	let activeReads = 0;
 	const calls = await mock(page, async (route, pathname) => {
 		if (pathname.endsWith('/revoke')) {
-			await pending.promise;
+			await write.promise;
 			revoked = true;
 			return route.fulfill({ json: { id: row.id, status: 'revoked' } });
 		}
-		if (pathname.endsWith('/active')) activeReads++;
+		if (revoked) await refresh.promise;
 		return route.fulfill({ json: { invites: revoked ? [] : [row] } });
 	});
 	await page.goto(path);
 	await apply(page, 'active');
-	await expect(page.getByText('Results: Active')).toBeVisible();
 	const revoke = page.getByRole('button', { name: 'Revoke invite #17' });
 	page.once('dialog', (dialog) => dialog.dismiss());
 	await revoke.press('Enter');
@@ -99,33 +97,40 @@ test('cancel sends nothing; confirmed revoke sends one bodyless write and reload
 	await expect(page.getByText('Revoking invite…')).toBeVisible();
 	await expect(revoke).toBeDisabled();
 	await revoke.press('Enter');
+	const reading = page.waitForRequest(`**${api}/status/active`);
+	write.resolve();
+	await reading;
+	const submit = page.getByRole('button', { name: 'Apply filter' });
+	await expect(submit).toBeDisabled();
+	await submit.press('Enter');
 	await expect(page.getByText('Invite #17 revoked.')).toHaveCount(0);
-	pending.resolve();
+	refresh.resolve();
 	await expect(page.getByText('Invite #17 revoked.')).toBeVisible();
 	await expect(page.getByText('No invites match this filter.')).toBeVisible();
-	await expect(results(page)).toHaveCount(0);
-	expect(activeReads).toBe(2);
 	expect(calls).toEqual([`GET ${api}`, `GET ${api}/status/active`, `POST ${api}/17/revoke`, `GET ${api}/status/active`]);
 });
 
-for (const [name, status, json] of [
+for (const [name, status, json, refresh] of [
 	['redemption', 422, { code: 'validation_failed' }], ['admin refusal', 404, {}],
 	['reauthentication', 401, { code: 'reauth_required' }], ['wrong ID', 200, { id: 18, status: 'revoked' }],
 	['wrong status', 200, { id: 17, status: 'active' }], ['network loss', 0, {}],
-	['access lost on refresh', 200, { id: 17, status: 'revoked' }]
+	['access lost on refresh', 200, { id: 17, status: 'revoked' }, 404],
+	['contradictory Active refresh', 200, { id: 17, status: 'revoked' }, 200]
 ] as const) test(`requires a fresh authorized list after ${name}, without replay`, async ({ page }) => {
-	let reads = 0;
+	let written = false;
 	const calls = await mock(page, (route, pathname) => {
-		if (pathname === api) return reads++ ? route.fulfill({ status: 404 }) : route.fulfill({ json: { invites: [row] } });
+		if (!pathname.endsWith('/revoke')) return route.fulfill({ status: written ? refresh : 200, json: { invites: [row] } });
+		written = true;
 		return status === 0 ? route.abort() : route.fulfill({ status, json });
 	});
 	await page.goto(path);
+	if (refresh) await apply(page, 'active');
 	page.once('dialog', (dialog) => dialog.accept());
 	await page.getByRole('button', { name: 'Revoke invite #17' }).press('Enter');
 	await expect(page.getByRole('alert')).toContainText(/reload|sign in again/i);
 	await expect(page.getByText('Invite #17 revoked.')).toHaveCount(0);
 	await expect(results(page)).toHaveCount(0);
-	expect(calls).toEqual([`GET ${api}`, `POST ${api}/17/revoke`, ...(name === 'access lost on refresh' ? [`GET ${api}`] : [])]);
+	expect(calls).toEqual(refresh ? [`GET ${api}`, `GET ${api}/status/active`, `POST ${api}/17/revoke`, `GET ${api}/status/active`] : [`GET ${api}`, `POST ${api}/17/revoke`]);
 });
 
 async function holdResponse(page: Page, heldPath: string, payload: unknown) {

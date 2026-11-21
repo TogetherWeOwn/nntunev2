@@ -70,9 +70,11 @@
 		applied = filter;
 		rows = [];
 		void run((signal) => client.listAdminInvites(filter, signal), (result, fence) => {
+			if (result.some(({ id, status }) => id === confirmedId && status !== 'revoked')) return clear('The refreshed list didn’t confirm revocation. Reload for a fresh list.');
 			owner = fence;
 			rows = result;
 			if (confirmedId !== undefined) notice = `Invite #${confirmedId} revoked.`;
+			writing = false;
 		}, () => clear());
 	}
 
@@ -94,10 +96,7 @@
 		heading.focus();
 		writing = true;
 		notice = '';
-		void run((signal) => client.revokeAdminInvite(row.id, signal), () => {
-			writing = false;
-			load(applied, row.id);
-		}, (cause) => {
+		void run((signal) => client.revokeAdminInvite(row.id, signal), () => load(applied, row.id), (cause) => {
 			if (cause instanceof ApiError) {
 				if (cause.code === 'reauth_required') return clear('Sign out and sign in again, then reopen the ledger for a fresh list.');
 				if ([401, 403, 404].includes(cause.status)) return clear(unavailable);
@@ -135,7 +134,7 @@
 		<p class="result-filter">Results: {applied ? ('issuer' in applied ? `Issuer ${applied.issuer}` : label(applied.status)) : 'All invites'}</p>
 		<div role="status">
 			{#if notice}<p>{notice}</p>{/if}
-			{#if writing}<p>Revoking invite…</p>
+			{#if writing}<p>{rows.length ? 'Revoking invite…' : 'Refreshing invites…'}</p>
 			{:else if request}<p>Loading invites…</p>
 			{:else if !rows.length}<p>No invites match this filter.</p>{/if}
 		</div>
