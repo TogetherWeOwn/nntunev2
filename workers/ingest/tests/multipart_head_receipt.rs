@@ -7,6 +7,8 @@ use nntune_core::{
 };
 use nntune_ingest::multipart::{
     head_receipt::{compare_head_receipt, HeadReceipt, HeadReceiptError::*},
+    resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
+    session_completion::{PrepareError, SessionCompletion},
     MultipartError, Plan, UploadTarget, VersionedCompletionReply,
 };
 use sha2::{Digest, Sha256};
@@ -135,6 +137,146 @@ fn pins_only_the_exact_versioned_completion_response() {
             Some(CompletionIdentity)
         );
     }
+}
+
+#[test]
+fn session_completion_requires_checkpoint_full_manifest_and_head() {
+    let mut sealer = OriginSealer::new(1).unwrap();
+    let target = UploadTarget {
+        bucket: BUCKET,
+        key: KEY,
+        upload_id: "synthetic",
+    };
+    let plan = Plan::new(target, sealer.header(), 1).unwrap();
+    let mut partition = plan.partition();
+    assert!(partition
+        .push(&sealer.seal_chunk(&[42]).unwrap())
+        .unwrap()
+        .is_none());
+    let part = partition.finish().unwrap().unwrap();
+    let (_, number, bytes, checksum) = part.request();
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    let saved = CheckpointPart {
+        number,
+        len: bytes.len(),
+        etag: "opaque-part",
+        digest,
+    };
+    let binding = ResumeBinding {
+        plan,
+        environment: "test",
+        library: "library",
+        session: "session",
+        object: "object",
+        generation: "generation",
+        envelope_scheme: 2,
+    };
+    let parts = [saved];
+    let checkpoint = ResumeCheckpoint {
+        binding,
+        parts: &parts,
+    };
+    let receipts = || vec![part.verify_reply(saved.etag.into(), checksum).unwrap()];
+    assert!(matches!(
+        SessionCompletion::prepare(
+            binding,
+            receipts(),
+            &ResumeCheckpoint {
+                binding: ResumeBinding {
+                    session: "other-session",
+                    ..binding
+                },
+                ..checkpoint
+            }
+        ),
+        Err(PrepareError::CheckpointMismatch)
+    ));
+    let mut stale_part = saved;
+    stale_part.digest[0] ^= 1;
+    assert!(matches!(
+        SessionCompletion::prepare(
+            binding,
+            receipts(),
+            &ResumeCheckpoint {
+                parts: &[stale_part],
+                ..checkpoint
+            }
+        ),
+        Err(PrepareError::CheckpointMismatch)
+    ));
+    assert!(matches!(
+        SessionCompletion::prepare(
+            binding,
+            vec![],
+            &ResumeCheckpoint {
+                parts: &[],
+                ..checkpoint
+            }
+        ),
+        Err(PrepareError::Parts(MultipartError::Geometry))
+    ));
+    let completion = SessionCompletion::prepare(binding, receipts(), &checkpoint).unwrap();
+    assert!(completion.manifest().eq([(1, saved.etag, checksum)]));
+    let body = format!(
+        "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key><ChecksumSHA256>{}-1</ChecksumSHA256></CompleteMultipartUploadResult>",
+        STANDARD.encode(Sha256::digest(digest))
+    );
+    let context = EnvelopeContext {
+        identities: [0, 1, 2, 0xab, 0xcd, 5].map(id),
+        plaintext_len: 1,
+        header: sealer.header().to_bytes(),
+    };
+    let locate = |version: &str| {
+        S3Locator::new(
+            BUCKET.into(),
+            KEY.into(),
+            S3Binding::VersionId(version.into()),
+        )
+        .unwrap()
+    };
+    let observed = locate("pinned-version");
+    let wrong_version = locate("other-version");
+    let head = |locator| HeadReceipt {
+        configuration: Some(id(5)),
+        locator: Some(locator),
+        content_length: Some(HEADER_SIZE + 1 + TAG_SIZE),
+    };
+    let verify = |body: &[u8], version_headers: &[&str]| {
+        completion.verify_completion(
+            &context,
+            VersionedCompletionReply {
+                configuration: id(5),
+                status: 200,
+                body,
+                version_headers,
+            },
+        )
+    };
+    let completed = verify(body.as_bytes(), &["pinned-version"]).unwrap();
+    assert_eq!(completed.metadata().locator(), &observed);
+    assert_eq!(
+        completed.verify_head(&context, Some(head(&observed))),
+        Ok(())
+    );
+    assert_eq!(completed.verify_head(&context, None), Err(MissingHead));
+    assert_eq!(
+        completed.verify_head(&context, Some(head(&wrong_version))),
+        Err(WrongObject)
+    );
+    let mut wrong_context = EnvelopeContext { ..context };
+    wrong_context.identities[5] = id(6);
+    assert_eq!(
+        completed.verify_head(&wrong_context, Some(head(&observed))),
+        Err(ExpectedObject)
+    );
+    assert_eq!(
+        verify(body.as_bytes(), &[]).err(),
+        Some(MultipartError::CompletionVersion)
+    );
+    assert_eq!(
+        verify(b"<Error/>", &["pinned-version"]).err(),
+        Some(MultipartError::EmbeddedError)
+    );
 }
 
 #[test]
