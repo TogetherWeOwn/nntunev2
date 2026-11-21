@@ -3,7 +3,7 @@ import { currentTrack, type QueueState } from './queue.js';
 import type { createQueueController } from './queueController.js';
 
 export type FavoriteWrite = 'saved' | 'visit' | null;
-type FavoriteOwner = { read(id: string): readonly string[] | null; write(id: string, pressed: boolean): FavoriteWrite };
+type FavoriteOwner = { read(id: string): readonly string[] | null; write(id: string, pressed: boolean): Promise<FavoriteWrite> };
 
 type FavoriteIntent = { id: string; receipt: string; membership: readonly string[] };
 
@@ -38,11 +38,11 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 	const matches = (current: FavoriteIntent | null, intent: FavoriteIntent) =>
 		current?.receipt === intent.receipt && current.id === intent.id && current.membership === intent.membership;
 
-	function activate(intent: FavoriteIntent): void {
+	async function activate(intent: FavoriteIntent): Promise<void> {
 		const target = view(queue.snapshot);
 		if (!owner || target === null || !matches(target, intent)) return;
 		const pressed = !target.pressed;
-		const result = owner.member.write(target.id, pressed);
+		const result = await owner.member.write(target.id, pressed);
 		if (!result) return;
 		// A retired selection or owner cannot publish a success message.
 		const updated = view(queue.snapshot);

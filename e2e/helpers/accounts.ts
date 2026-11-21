@@ -219,7 +219,7 @@ function throwOnRedirect(status: number, headers: Record<string, string>, contex
  * this only protects propagated errors, not Playwright's internal API steps.
  */
 async function credentialedTransport(
-  method: 'GET' | 'POST' | 'OPTIONS',
+  method: 'GET' | 'POST' | 'DELETE' | 'OPTIONS',
   send: () => Promise<APIResponse>,
 ): Promise<APIResponse> {
   try {
@@ -883,4 +883,23 @@ export async function submitPublicUiSignupToBilling(
     'authenticated billing action not visible after public UI signup',
   ).toBeVisible({ timeout: 15_000 });
   return { email, viaApi: false };
+}
+
+/** Credentialed, bodyless DELETE with the same no-follow contract as apiGet. */
+export async function apiDelete(
+  request: APIRequestContext,
+  url: string,
+  headers: Record<string, string>,
+  context: string,
+  opts?: { timeout?: number },
+): Promise<APIResponse> {
+  const res = await credentialedTransport('DELETE', () =>
+    request.delete(url, {
+      headers,
+      timeout: opts?.timeout ?? 30_000,
+      maxRedirects: 0,
+    }),
+  );
+  throwOnRedirect(res.status(), res.headers(), context);
+  return res;
 }

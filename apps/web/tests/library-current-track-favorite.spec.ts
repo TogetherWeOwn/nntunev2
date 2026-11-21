@@ -26,7 +26,7 @@ async function storedFavorites(page: Page, scope?: string | null) {
 async function expectMembership(page: Page, id: string | null, announcement = '', visitOnly = false) {
 	await expect(favorite(page)).toHaveAttribute('aria-pressed', String(id !== null));
 	await expect(feedback(page)).toHaveText(announcement);
-	expect(await storedFavorites(page)).toBe(id === null || visitOnly ? null : JSON.stringify([id]));
+	await expect.poll(() => storedFavorites(page)).toBe(id === null || visitOnly ? null : JSON.stringify([id]));
 }
 
 test('the player stars the selected track once and shares membership with Library and queue controls', async ({ page }) => {

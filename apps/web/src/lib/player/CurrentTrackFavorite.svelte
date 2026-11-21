@@ -56,7 +56,7 @@
 		button.addEventListener('click', (event) => {
 			const intent = intents.get(event);
 			intents.delete(event);
-			if (intent && !event.defaultPrevented) currentFavorite.activate(intent);
+			if (intent && !event.defaultPrevented) void currentFavorite.activate(intent);
 		}, { signal: listeners.signal });
 		return { update(next) { rendered = next; }, destroy() { clearSpace(); listeners.abort(); } };
 	};

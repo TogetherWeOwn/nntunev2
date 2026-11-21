@@ -7,7 +7,7 @@ function setup() {
 	const queue = createQueueController(createQueue(DEMO_TRACKS));
 	const favorite = createCurrentTrackFavorite(queue);
 	let ids: string[] = [];
-	const write = vi.fn((id: string, pressed: boolean) => {
+	const write = vi.fn(async (id: string, pressed: boolean) => {
 		ids = pressed ? [...ids, id] : ids.filter((item) => item !== id);
 		return 'saved' as const;
 	});
@@ -20,15 +20,17 @@ function setup() {
 	return { favorite, view: () => favorite.view(queue.snapshot), read, write, select, dispose };
 }
 
-test('writes just the selected track, once per rendered intent, and reports the applied state', () => {
+test('writes just the selected track, once per rendered intent, and reports only after settlement', async () => {
 	const { favorite, select, view, write } = setup();
 	select(1);
 	const before = view()!;
-	favorite.activate(before);
-	favorite.activate(before);
+	const pending = favorite.activate(before);
+	expect(favorite.feedback(view())).toBeNull();
+	await favorite.activate(before);
+	await pending;
 	expect(write.mock.calls).toEqual([['second-signal', true]]);
 	expect(favorite.feedback(view())?.text).toBe('Starred Second Signal.');
-	favorite.activate(view()!);
+	await favorite.activate(view()!);
 	expect(write.mock.calls).toEqual([['second-signal', true], ['second-signal', false]]);
 	expect(favorite.feedback(view())?.text).toBe('Unstarred Second Signal.');
 });
@@ -43,16 +45,18 @@ test.each(['selection round trip', 'owner refusal'] as const)('%s cannot write o
 	expect(favorite.feedback(view())).toBeNull();
 });
 
-test('disposing the live owner prevents replay before and after replacement', () => {
+test('disposing the live owner prevents replay and late feedback across replacement', async () => {
 	const { favorite, view, write, dispose } = setup();
 	const before = view()!;
+	const pending = favorite.activate(before);
 	dispose();
-	favorite.activate(before);
+	void favorite.activate(before);
 	expect([view(), favorite.feedback(view())]).toEqual([null, null]);
-	expect(write).not.toHaveBeenCalled();
-	const replacement = vi.fn(() => null);
+	expect(write).toHaveBeenCalledTimes(1);
+	const replacement = vi.fn(async () => null);
 	favorite.bind({ read: () => before.membership, write: replacement });
-	favorite.activate(before);
+	await favorite.activate(before);
+	await pending;
 	expect(replacement).not.toHaveBeenCalled();
 	expect(favorite.feedback(view())).toBeNull();
 });
