@@ -141,12 +141,24 @@ one independent `sample_pressure` reading. Its query start must be strictly
 later than the off readback, and a fresh zero measurement-session count must
 still hold as evidence when the final deployment read matches the pin.
 
-All reads receive the same absolute monotonic deadline. A future adapter must
-provide silent, uncached, staging-only reads and enforce that deadline itself;
-the verifier rejects late evidence but cannot interrupt a stalled adapter.
-Only an outcome code is returned. This verifies point-in-time observations,
-not an atomic fence against concurrent writers, and supplies no recovery
-writer, runner or proof that cleanup ran after cancellation.
+The manual [`subsonic-staging-off-drain`](../../.github/workflows/subsonic-staging-off-drain.yml)
+workflow is read-only and runs only on protected `main`. It uses a dedicated
+`SUBSONIC_STAGING_WORKERS_READ_TOKEN` in the `staging` environment with Workers
+Scripts Read on the intended account, the configured `CLOUDFLARE_ACCOUNT_ID`, and
+that environment's `PLANETSCALE_OBSERVER_URL_STAGING`. Do not substitute the
+staging deploy token or the health-only Access token. The provider reads target
+only `nntune-api-staging`. All reads share a 30-second monotonic deadline;
+Actions also bounds the command and its children with an outer timeout.
+
+Dispatch once on `main` with `expected_deployment_id`, `expected_version_id`,
+and `expected_build_sha` from the **same** trusted staging deployment receipt
+for the off deployment being checked. The workflow SHA can differ from the
+staging build SHA. The receipt supplies the pin, not the evidence: require the
+actual readback step to report `subsonic-staging-off-drain: verified` and succeed.
+A skipped job, timeout, drift or any other result is not verification. Record
+the run/job link and pinned receipt. This is point-in-time evidence only: it
+neither fences concurrent writers nor restores a deployment, cancels clients,
+proves recovery after runner loss, or authorizes measurement.
 
 ### Actions step finalization (synthetic only)
 
