@@ -143,6 +143,7 @@
 	{#if !access && !error}<p role="status">Checking access…</p>{/if}
 	{#if error}<p role="alert">{error}</p>{/if}
 	{#if access}
+		<p><a href="/admin/invite-policy">Invite policy</a></p>
 		<section aria-labelledby="schedule-heading">
 			<h2 id="schedule-heading">Schedule a window</h2>
 			<p>Enter times in UTC. Member invites can only be created and redeemed while the window is open.</p>

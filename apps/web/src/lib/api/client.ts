@@ -259,6 +259,21 @@ function isInviteWindow(value: unknown): value is InviteWindow {
 const invalidInviteWindows = (status: number) =>
 	new ApiError(status, 'request_failed', 'Invalid invite window response', null, false);
 
+export const INVITE_POLICY_BOUNDS = {
+	invite_member_min_paid_months: [0, 600],
+	invite_member_per_window: [0, 10_000],
+	invite_default_expiry_days: [1, 30]
+} as const;
+export type InvitePolicyKey = keyof typeof INVITE_POLICY_BOUNDS;
+export type InvitePolicy = Record<InvitePolicyKey, number>;
+const ADMIN_SETTINGS = '/v1/admin/settings';
+export function isInvitePolicyValue(key: InvitePolicyKey, value: unknown): value is number {
+	const [min, max] = INVITE_POLICY_BOUNDS[key];
+	return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
+}
+const invalidAdminSettings = (status: number) =>
+	new ApiError(status, 'request_failed', 'Invalid admin settings response');
+
 export interface IssuedMemberInvite {
 	code: string;
 	expires_at: number;
@@ -385,6 +400,28 @@ export class ApiClient {
 		if (status !== (close ? 200 : 201) || !isInviteWindow(row) || (close && row.id !== input))
 			throw invalidInviteWindows(status);
 		return row;
+	}
+
+	async readInvitePolicy(signal: AbortSignal): Promise<InvitePolicy> {
+		const { data, status } = await this.requestWithStatus<{ settings?: InvitePolicy } | null>(
+			ADMIN_SETTINGS, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		const settings = data?.settings;
+		const keys = Object.keys(INVITE_POLICY_BOUNDS) as InvitePolicyKey[];
+		if (status !== 200 || !settings || !keys.every((key) => isInvitePolicyValue(key, settings[key])))
+			throw invalidAdminSettings(status);
+		return settings;
+	}
+
+	/** The Worker enforces admin role, Origin and fresh-session checks. Do not retry. */
+	async writeInvitePolicy(key: InvitePolicyKey, value: number, signal: AbortSignal): Promise<number> {
+		const { data, status } = await this.requestWithStatus<{ key?: unknown; value?: unknown } | null>(
+			`${ADMIN_SETTINGS}/${key}`, { method: 'PUT', cache: 'no-store', redirect: 'error', signal,
+				headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value }) }
+		);
+		if (status !== 200 || data?.key !== key || !isInvitePolicyValue(key, data.value))
+			throw invalidAdminSettings(status);
+		return data.value;
 	}
 
 	/** Spend one invite from the browser session's current window. Do not retry automatically. */
