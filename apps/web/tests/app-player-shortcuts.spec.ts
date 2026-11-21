@@ -8,10 +8,10 @@ const time = (page: Page) => audio(page).evaluate((node: HTMLAudioElement) => no
 const keyPasses = (page: Page, key: string) => page.evaluate((key) => document.activeElement!.dispatchEvent(
 	new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
 ), key);
-
 async function openLibrary(page: Page) {
 	await page.route('**/api/library', (route) => route.fulfill({ json: [track] }));
 	await page.goto(`/library?track=${track.id}&t=12`);
+	await expect(page.locator('#library-density')).toBeAttached();
 	await expect(status(page)).toHaveText('Paused');
 	await expect(page.getByTestId('library-restart')).toBeEnabled();
 	await expect.poll(() => time(page)).toBeCloseTo(12);
@@ -30,6 +30,7 @@ test('app shortcuts act once on the live native audio across routes and stop at 
 	const home = page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true });
 	await home.click();
 	await expect(page).toHaveURL(/\/home$/);
+	await expect(page.locator('#library-density')).toHaveCount(0);
 	await home.focus();
 	await expect(home).toBeFocused();
 	for (const key of ['0', '?', 'k', 'j', 'l']) expect(await keyPasses(page, key)).toBe(true);
@@ -63,7 +64,6 @@ test('app shortcuts act once on the live native audio across routes and stop at 
 	expect(await keyPasses(page, '0')).toBe(true);
 	expect(await time(page)).toBeCloseTo(7);
 	await expect(restartStatus).toHaveText('Restarted Keys Coral.');
-
 	// A delegated link leaves the app shell without replacing the JS realm.
 	await page.evaluate(() => {
 		const exit = document.createElement('a');
@@ -104,18 +104,18 @@ test('app shortcut help lists only supported bindings, restores focus and respec
 	await help(page).click();
 	await close.click();
 	await expect(help(page)).toBeFocused();
-
 	expect(await page.evaluate(() => {
 		const send = (target: EventTarget, key: string, flags?: KeyboardEventInit) => target.dispatchEvent(
 			new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...flags })
 		);
-		const native = document.querySelector('audio[controls]')!;
-		return ['0', ' ', 'ArrowLeft', 'ArrowRight', 'Enter'].every((key) => send(native, key)) &&
-			['n', 'p', 'm', 's', 'r'].every((key) => send(document.activeElement!, key)) &&
+		return ['n', 'p', 'm', 's', 'r'].every((key) => send(document.activeElement!, key)) &&
 			['J', 'K', 'L', '0'].every((key) => send(document.activeElement!, key, { shiftKey: true })) &&
 			[{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { isComposing: true }, { repeat: true }]
 				.every((flags) => send(document.activeElement!, '0', flags));
 	})).toBe(true);
+	await audio(page).focus();
+	await expect(audio(page)).toBeFocused();
+	for (const key of ['0', 'k', 'j', 'l', '?', ' ', 'ArrowLeft', 'ArrowRight', 'Enter']) expect(await keyPasses(page, key)).toBe(true);
 	expect(await time(page)).toBeCloseTo(12);
 	await play.press('Space');
 	await expect(status(page)).toHaveText('Playing');
