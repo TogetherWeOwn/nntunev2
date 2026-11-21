@@ -160,6 +160,23 @@ mod tests {
     }
 
     #[test]
+    fn rice_quotient_resumes_mid_unary_and_preserves_tail() {
+        // Method 0, partition order 0, Rice parameter 1, then six unary zeros.
+        let bytes = [0x00, 0x40, 0b10_101101, 0xff];
+        let (mut input, mut rest) = bytes.split_at(2);
+        let mut bits = BitInput::default();
+        let mut reader = ResidualReader::new(1, 0);
+        assert_eq!(reader.read(&mut bits, &mut input), Ok(Residual::NeedInput));
+        assert!(input.is_empty());
+
+        // The unary terminator and zero remainder fold to 12 only with the saved quotient.
+        assert_eq!(reader.read(&mut bits, &mut rest), Ok(Residual::Sample(6)));
+        assert_eq!(reader.read(&mut bits, &mut rest), Ok(Residual::End));
+        assert_eq!(bits.read(&mut rest, 6), Ok(Some(0b101101)));
+        assert_eq!(rest, [0xff]);
+    }
+
+    #[test]
     fn five_bit_parameters_cover_signed_escape_and_folded_limit() {
         let mut bits = BitInput::default();
         let mut input = [0x43, 0xe3, 0x8f].as_slice();
