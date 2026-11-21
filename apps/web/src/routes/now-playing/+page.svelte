@@ -32,8 +32,8 @@
 			fullscreenActive = active;
 			fullscreenFailure = '';
 			if (!surface.isConnected || (!active && doc.fullscreenElement)) return;
-			// Also runs on browser-driven exit. Never focus a retired route.
-			const control = fullscreenButton;
+			// On exit without a track the control will unmount, even if it is still visible now.
+			const control = active || track ? fullscreenButton : undefined;
 			const focusTarget = control?.getClientRects().length ? control : heading;
 			focusTarget?.focus({ preventScroll: true });
 		}

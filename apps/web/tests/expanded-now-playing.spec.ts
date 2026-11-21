@@ -10,6 +10,7 @@ const nextTrack = { id: 'expanded-moss', title: 'Expanded Moss' };
 
 const audio = (page: Page) => page.locator('audio[data-testid="audio-player"]');
 const miniLink = (page: Page) => page.getByTestId('mini-player').getByRole('link');
+const desktopLink = (page: Page) => page.getByTestId('shell-rail').getByRole('link', { name: 'Now Playing', exact: true });
 const tab = (page: Page, name: string) =>
 	page.getByTestId('shell-tabbar').getByRole('link', { name, exact: true });
 const heading = (page: Page) =>
@@ -122,19 +123,25 @@ test('direct entry is empty and offers standard Library access', async ({ page }
 	await expect(page).toHaveURL(/\/library$/);
 });
 
+async function prepareLogout(actor: Page) {
+	await actor.route('**/v1/session/logout', (route) => route.fulfill({ json: { ok: true } }));
+	await actor.goto('/now-playing');
+	await expect(actor.locator('html')).toHaveAttribute('data-hydrated', '');
+	await actor.getByRole('button', { name: 'Account menu' }).click();
+	return actor.getByRole('menuitem', { name: 'Sign out' });
+}
+
 test('a logout in another tab drops identity and stops the decoder while expanded', async ({ page }) => {
 	await page.setViewportSize({ width: 390, height: 844 });
 	const decoder = await startPlayback(page);
 	await miniLink(page).click();
 	await expectExpanded(page);
+	await expect(enterFullscreen(page)).toBeHidden();
 
 	const actor = await page.context().newPage();
 	try {
-		await actor.route('**/v1/session/logout', (route) => route.fulfill({ json: { ok: true } }));
-		await actor.goto('/now-playing');
-		await expect(actor.locator('html')).toHaveAttribute('data-hydrated', '');
-		await actor.getByRole('button', { name: 'Account menu' }).click();
-		await actor.getByRole('menuitem', { name: 'Sign out' }).click();
+		const signOut = await prepareLogout(actor);
+		await signOut.click();
 		await expect(actor).toHaveURL(/\/login$/);
 	} finally {
 		await actor.close();
@@ -155,17 +162,35 @@ const back = (page: Page) => page.getByRole('main').getByRole('button', { name: 
 const noFullscreen = (page: Page) => page.evaluate(() => document.fullscreenElement === null);
 
 async function openDesktopExpanded(page: Page) {
-	// The currently shipped entry point is the narrow layout's mini-player.
-	await page.setViewportSize({ width: 390, height: 844 });
+	await page.setViewportSize({ width: 1280, height: 800 });
 	const decoder = await startPlayback(page);
 	await expect(enterFullscreen(page)).toBeHidden();
-	await miniLink(page).click();
+	await desktopLink(page).press('Enter');
 	await expectExpanded(page);
-	await expect(enterFullscreen(page)).toBeHidden();
-	await page.setViewportSize({ width: 1280, height: 800 });
 	await expect(enterFullscreen(page)).toBeVisible();
 	return decoder;
 }
+
+test('fullscreen exit focuses the heading after logout clears the track', async ({ page }) => {
+	const actor = await page.context().newPage();
+	const signOut = await prepareLogout(actor);
+	await page.bringToFront();
+	await openDesktopExpanded(page);
+	await enterFullscreen(page).click();
+	await expect(exitFullscreen(page)).toBeFocused();
+
+	// Exercise the real logout handler without changing the fullscreen tab.
+	await signOut.evaluate((button: HTMLButtonElement) => button.click());
+	await expect(actor).toHaveURL(/\/login$/);
+	await expect(page.getByText('Nothing playing.', { exact: false })).toBeVisible();
+	await expect(page.locator('audio')).toHaveCount(0);
+	await expect(exitFullscreen(page)).toBeVisible();
+	await page.evaluate(() => document.exitFullscreen());
+	await expect(exitFullscreen(page)).toHaveCount(0);
+	await expect(enterFullscreen(page)).toHaveCount(0);
+	await expect(heading(page)).toBeFocused();
+	await expect(page).toHaveURL(/\/now-playing$/);
+});
 
 for (const paused of [true, false]) {
 	test(`native fullscreen preserves the ${paused ? 'paused' : 'playing'} decoder across entry, exit and Back`, async ({ page }) => {
@@ -269,6 +294,7 @@ test('unavailable fullscreen leaves the expanded view and Back usable', async ({
 	await expect.poll(() => noFullscreen(page)).toBe(true);
 	await back(page).click();
 	await expect(page).toHaveURL(/\/library$/);
+	await expect(desktopLink(page)).toBeFocused();
 });
 
 test('refused fullscreen entry and exit are truthful and retryable', async ({ page }) => {
