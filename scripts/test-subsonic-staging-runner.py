@@ -18,6 +18,11 @@ class RecordingModel(StagingModel):
     def __init__(self):
         super().__init__()
         self.starts = []
+        self.cleanup_started_at = None
+
+    def cancel_clients(self):
+        self.cleanup_started_at = self.now
+        super().cancel_clients()
 
     def start(self, slot):
         number = slot["slot"]
@@ -216,7 +221,7 @@ class RunnerTests(unittest.TestCase):
         model.delays = {41: 6000, 42: 6000}
         report = rehearse(matrix, model)
         self.assertEqual((report["stop"], report["starts"]), ("request-or-reader-timeout", 42))
-        self.assertEqual(model.now - dict(model.starts)[41], 5000)
+        self.assertEqual(model.cleanup_started_at - dict(model.starts)[41], 5000)
         self.assertEqual(report["simulated_pair_overlap"], {1: False, 2: False, 3: True})
         self.assertEqual([report["slots"][i]["state"] for i in (41, 42, 43)],
                          ["unfinished", "unfinished", "unstarted"])
@@ -294,14 +299,29 @@ class RunnerTests(unittest.TestCase):
 
     def test_restore_requires_drain_sample_after_off_readback(self):
         class DrainFence(RecordingModel):
-            def cancel_clients(self):
-                self.cancelled_at = self.now
-                super().cancel_clients()
+            off_read_at = None
+            zero_sample_at = None
+
+            def readback(self):
+                state = super().readback()
+                if (self.cleanup_started_at is not None and state.verified_off()
+                        and self.off_read_at is None):
+                    self.off_read_at = self.now
+                return state
+
+            def telemetry(self):
+                at, healthy, backends = super().telemetry()
+                if (self.cleanup_started_at is not None and healthy and backends == 0
+                        and self.zero_sample_at is None):
+                    self.zero_sample_at = at
+                return at, healthy, backends
 
         model = DrainFence()
         report = rehearse(matrix, model)
         self.assertEqual(report["cleanup"], "simulated-off-and-drained")
-        self.assertGreater(model.now, model.cancelled_at)
+        self.assertIsNotNone(model.off_read_at)
+        self.assertIsNotNone(model.zero_sample_at)
+        self.assertGreater(model.zero_sample_at, model.off_read_at)
 
     def test_deployment_change_during_drain_invalidates_off_readback(self):
         class ChangedDuringDrain(RecordingModel):
