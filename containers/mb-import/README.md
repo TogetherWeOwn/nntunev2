@@ -28,9 +28,10 @@ headerless MusicBrainz COPY files from the CC0 core dump: the entity files
 (`artist` with `artist_alias` and `artist_type`/`area`/`iso_3166_1` lookups,
 `release` with `release_alias` and `artist_credit_name`/`release_country`/`release_unknown_country`,
 `release_group` with `release_group_alias` and `release_group_primary_type`,
-`recording` with `recording_alias`/`medium`/`track`, `work` with `work_type`, `label` with
-`label_type`) plus the relationship files (`url`, `link_type`, `link`,
-`link_attribute_type`, `link_attribute`, `l_artist_url`, `l_recording_url`,
+`recording` with `recording_alias`/`medium`/`track`, `work` with
+`work_alias`/`work_type`, `label` with `label_type`) plus the relationship files
+(`url`, `link_type`, `link`, `link_attribute_type`, `link_attribute`,
+`l_artist_url`, `l_recording_url`,
 `l_recording_recording`, `l_recording_work`, `release_label`, `isrc`) listed in
 `etl.py`. The ETL writes the ten curated import files and the sidecars below
 into an immutable snapshot and atomically swaps
@@ -79,6 +80,14 @@ The sidecar `mbdump-work.tsv` contains the work MBID, title, work-type name
 It preserves the COPY text of the title and type name. A non-NULL type ID
 with no lookup row refuses publication; an empty `work` file produces an
 empty sidecar. Disk-bounded mode emits the same TSV content under `.tsv.gz`.
+
+`mbdump-work_alias.tsv` uses the alias columns and whole-row tie-break above,
+keyed by the work MBID in `mbdump-work.tsv`, not a recording MBID. The required
+CC0 `work_alias` input has 16 COPY fields and uses the same field positions as
+`release_group_alias`. Rows sort by work MBID, decoded alias name, and decoded
+locale. Works without aliases produce no rows; an empty input produces an
+empty sidecar. Malformed projected fields or missing works refuse publication.
+Disk-bounded mode emits the same TSV content under `.tsv.gz`.
 
 The sidecar `mbdump-recording_work.tsv` contains recording MBID, work MBID,
 link-type name (raw COPY text), and dump timestamp. It sorts and deduplicates
