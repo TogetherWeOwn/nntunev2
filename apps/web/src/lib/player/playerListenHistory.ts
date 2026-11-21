@@ -13,6 +13,7 @@ interface PlayerListenScope {
 /** Mount once at the shared player, not in a route child or for each keyed audio node. */
 export function createPlayerListenHistory(scope: PlayerListenScope, lifecycle: Window = window) {
 	const observers = new Map<HTMLAudioElement, ListenObserver>();
+	const startedPlaybacks = new Set<string>();
 	const listeners = new AbortController();
 	const { signal } = listeners;
 	let phase: 'observing' | 'draining' | 'closed' = 'observing';
@@ -24,6 +25,7 @@ export function createPlayerListenHistory(scope: PlayerListenScope, lifecycle: W
 	}
 	function stopListening() {
 		phase = 'closed';
+		startedPlaybacks.clear();
 		unsubscribe();
 		listeners.abort();
 	}
@@ -66,6 +68,7 @@ export function createPlayerListenHistory(scope: PlayerListenScope, lifecycle: W
 			const observer = observeListenEvents(audio, {
 				trackId,
 				grantPlayId,
+				startedPlaybacks,
 				canStart: () => phase === 'observing' && !hidden,
 				sender: { send: (event) => { if (phase !== 'closed') scope.send(event); } }
 			});

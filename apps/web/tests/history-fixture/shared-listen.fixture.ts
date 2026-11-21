@@ -46,9 +46,12 @@ test('signed-in route replacement and pause/resume keep the same listen until co
 		f.issue(next); f.media('playing');
 		// Source teardown clears audio.ended before the ended event arrives.
 		f.setEnded(true); f.media('timeupdate'); f.setEnded(false);
-		f.media('emptied'); f.detach();
+		f.media('emptied');
 	}, ids[1]);
-	expect(await journal(page)).toEqual([row(0, 'start'), row(0, 'complete'), row(1, 'start'), row(1, 'complete')]);
+	const completed = [row(0, 'start'), row(0, 'complete'), row(1, 'start'), row(1, 'complete')];
+	expect(await journal(page)).toEqual(completed);
+	await page.evaluate(() => window.sharedListenFixture.detach());
+	expect(await journal(page)).toEqual(completed);
 });
 
 test('missing identity and initial error are silent; error and abandonment each end once', async ({ page }) => {

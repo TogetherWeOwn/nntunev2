@@ -16,13 +16,15 @@ export interface ListenObserverOptions {
 	sender: { send(event: ListenEvent): void };
 	/** Play ID from the current grant for this exact source, never the track metadata. */
 	grantPlayId: () => string | undefined;
+	/** Shared by every attachment in the same player lifetime. */
+	startedPlaybacks: Set<string>;
 	canStart?: () => boolean;
 }
 
 export interface ListenObserver {
 	/** End the current listen without releasing the audio element. */
 	finish(): void;
-	/** Release listeners; a started playback ends (complete if the media ended, else skip). */
+	/** Release listeners and end the current listen. */
 	dispose(): void;
 }
 
@@ -34,73 +36,41 @@ function playbackIdFromGrant(id: string | undefined): string | undefined {
 	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
-/**
- * Observe one audio element. `start` fires on the first actual `playing`
- * of a playback; resume after pause or buffering is the same playback.
- * `complete` fires on natural end. A repeat needs a new grant play ID.
- * `skip` fires when a started playback is abandoned: source
- * emptied, media error, explicit stop or observer disposal. A playback that
- * never started (failed load) emits nothing.
- *
- * Page `onended` handlers can swap the source and tear this element down
- * before our own `ended` listener runs (microtasks run between listeners).
- * So a natural end is also recognised from `element.ended`, sampled on
- * `pause`/`timeupdate` too, because teardown clears it before `emptied`.
- *
- * Every callback is contained: a failing sender or id source never reaches
- * the element's event dispatch or its teardown.
- */
+/** Start once per grant on `playing`; resume keeps the active listen. */
 export function observeListenEvents(
 	element: ListenAudioLike,
-	{ trackId, sender, grantPlayId, canStart }: ListenObserverOptions
+	{ trackId, sender, grantPlayId, startedPlaybacks, canStart }: ListenObserverOptions
 ): ListenObserver {
 	let active: string | undefined;
-	let lastStarted: string | undefined;
 	let endedSeen = false;
 
-	function emit(playback_id: string, track_id: string, event: ListenEvent['event']): void {
-		try {
-			sender.send({ playback_id, track_id, event });
-		} catch {
-			// Best effort.
-		}
-	}
-
 	function finish(event: 'complete' | 'skip'): void {
-		const playback = active;
+		const playback_id = active;
 		active = undefined;
 		endedSeen = false;
-		if (playback) emit(playback, trackId, event);
+		if (playback_id) sender.send({ playback_id, track_id: trackId, event });
 	}
 
 	function finishAbandoned(): void {
 		let ended = endedSeen;
-		try {
-			ended = ended || element.ended === true;
-		} catch {
-			// Fall back to what was sampled earlier.
-		}
+		try { ended ||= element.ended === true; } catch { /* Keep the sampled value. */ }
 		finish(ended ? 'complete' : 'skip');
 	}
 
-	function safe(fn: () => void): () => void {
-		return () => {
-			try {
-				fn();
-			} catch {
-				// Never error playback.
-			}
-		};
-	}
+	const safe = (fn: () => void) => () => {
+		try { fn(); } catch { /* Never interrupt playback. */ }
+	};
 
 	const onPlaying = safe(() => {
 		endedSeen = false;
 		if (active || canStart?.() === false) return;
 		const id = playbackIdFromGrant(grantPlayId());
-		if (!id || id === lastStarted) return;
-		active = lastStarted = id;
-		emit(id, trackId, 'start');
+		if (!id || startedPlaybacks.has(id)) return;
+		startedPlaybacks.add(id);
+		active = id;
+		sender.send({ playback_id: id, track_id: trackId, event: 'start' });
 	});
+	// Teardown can clear element.ended before our ended listener runs.
 	const sampleEnded = safe(() => {
 		if (element.ended === true) endedSeen = true;
 	});
