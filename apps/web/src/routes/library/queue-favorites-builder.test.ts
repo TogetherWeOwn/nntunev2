@@ -45,7 +45,7 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const bindings = {
 		items: ITEMS, favorites, queue, announcement,
 		addTrack, resolveStreamUrl, displayArtist, displayTitle,
-		createQueue: () => queue, createPlayerController,
+		createQueue: () => queue, getAppPlayer: () => createPlayerController(queue, { flush: () => Promise.resolve() }),
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `
