@@ -164,11 +164,20 @@ class PostResponse:
     retry_after: str | None = field(repr=False)
 
 
-def _curl_config(post):
+def _validate_access(client_id, secret):
+    for value in (client_id, secret):
+        require(
+            type(value) is str and re.fullmatch(r"[A-Za-z0-9._-]{1,512}", value),
+            "access-credential-shape",
+        )
+
+
+def _curl_config(post, client_id, secret):
     def quoted(value):
         return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
-    lines = [f"header = {quoted(f'{name}: {value}')}" for name, value in post.headers]
+    access = (("CF-Access-Client-Id", client_id), ("CF-Access-Client-Secret", secret))
+    lines = [f"header = {quoted(f'{name}: {value}')}" for name, value in post.headers + access]
     lines.append(f"data-binary = {quoted(post.body.decode('ascii'))}")
     return ("\n".join(lines) + "\n").encode("ascii")
 
@@ -183,6 +192,8 @@ def _response_head(raw, cap):
     require(match, "response-headers")
     status = int(match[1])
     require(not 300 <= status < 400, "redirect-refused")
+    # No reviewed application oracle uses either Access denial status.
+    require(status not in (401, 403), "access-refused")
     cap = min(cap, REJECTION_LIMIT) if status >= 400 else cap
     fields = {}
     for line in lines:
@@ -221,17 +232,21 @@ class StagingPostTransport:
         require(remaining > 0, "request-or-reader-timeout")
         return min(0.05, remaining)
 
-    def send(self, number, bearer, api_key, *, deadline, cancel):
+    def send(self, number, bearer, api_key, *, deadline, cancel,
+             access_client_id=None, access_client_secret=None):
         """Return a PostResponse or a sanitized fixed-rejection/client-ended sample.
 
         deadline is the executor's absolute monotonic cutoff; cancel is a threading.Event.
-        Credentials are the staging measurement credentials, not health Access tokens.
+        The caller must inject a separately authorized Access pair for staging /rest,
+        not a health-only token. There is no credential discovery or fallback.
         """
         slots, limits = self._matrix["slots"], self._matrix["limits"]
         require(type(number) is int and 1 <= number <= len(slots), "unreviewed-slot")
         require(type(deadline) is float and math.isfinite(deadline), "invalid-deadline")
+        _validate_access(access_client_id, access_client_secret)
+        bearer, api_key = _validate_credentials(bearer, api_key)
         slot = slots[number - 1]
-        post = _prepare_post(slot, *_validate_credentials(bearer, api_key))
+        post = _prepare_post(slot, bearer, api_key)
         require(post.method == "POST" and post.url == f"{STAGING_ORIGIN}/rest/{slot['endpoint']}",
                 "destination-refused")
         reader = slot.get("reader", "normal")
@@ -258,8 +273,10 @@ class StagingPostTransport:
             process = self._spawn(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, env={}, close_fds=True)
             try:
-                response = self._exchange(process, _curl_config(post), cap, end, cancel,
-                                          read_after, reader == "disconnect")
+                response = self._exchange(
+                    process, _curl_config(post, access_client_id, access_client_secret),
+                    cap, end, cancel, read_after, reader == "disconnect",
+                )
             finally:
                 try:
                     if process.poll() is None:
@@ -280,6 +297,12 @@ class StagingPostTransport:
             return classify_fixed_rejection(slot, response.status, response.body,
                                             response.content_type, response.cache_control,
                                             response.retry_after)
+        # Do not return credential reflections in a proxy or application response.
+        fields = (response.content_type, response.cache_control, response.retry_after)
+        exposed = (response.body, *(value.encode("ascii") for value in fields if value is not None))
+        for value in (access_client_id, access_client_secret, bearer, api_key, quote_plus(api_key)):
+            credential = value.encode("ascii")
+            require(not any(credential in part for part in exposed), "credential-reflected")
         return response
 
     def _exchange(self, process, config, cap, end, cancel, read_after, disconnect):
