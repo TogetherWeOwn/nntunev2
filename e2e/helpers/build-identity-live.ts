@@ -24,13 +24,14 @@ import {
  * the same SHA unless `staging-api` did not redeploy this run
  * (`API_DEPLOY_OUTCOME` skipped/unconfigured), which is logged and
  * annotated explicitly. Logs one plain `web=… api=… head=…` line for QA.
- * Every gap throws by name; callers skip only while `STAGING_BASE_URL` is
- * unset. Returns the web SHA so the closing leg can name it.
+ * Every gap throws by name. Only the opening and closing reads contribute
+ * candidate identity annotations. Returns the web SHA for the closing leg.
  */
 export async function assertServingBuildMatchesPromotion(
   request: APIRequestContext,
   baseURL: string,
   context: string,
+  log: (message: string) => void = console.log,
 ): Promise<string> {
   // Promotion SHA from the push-triggered deploy run (EXPECTED_BUILD_SHA via
   // deploy.yml expected_sha from github.sha) — never a source checkout.
@@ -64,31 +65,33 @@ export async function assertServingBuildMatchesPromotion(
   const outcome = apiDeployOutcome();
   // Logged before the API verdict so a failing run still shows the web and
   // head values; the API value follows on the next line (or in the error).
-  console.log(
+  log(
     `[${context}] build identity: web=${deployed} head=${expected} ` +
       `staging-api=${outcome || '(not provided)'}`,
   );
   const verdict = resolveApiIdentity(apiRes.status(), apiBody, expected, outcome, context);
-  console.log(
+  log(
     `[${context}] build identity: web=${deployed} api=${verdict.apiSha ?? '(absent)'} ` +
       `head=${expected}`,
   );
   if (verdict.sameBuild) {
-    // Whitelisted, non-secret live observations for the staging receipt. Never
-    // emit an equal-identity certificate for skipped/unconfigured API deploys.
-    test.info().annotations.push({
-      type: 'candidate-identity',
-      description: JSON.stringify({
-        phase: context,
-        web: deployed,
-        api: verdict.apiSha,
-        expected,
-        observed_at: new Date().toISOString(),
-      }),
-    });
-    console.log(`[${context}] build identity: web = API = head = ${expected}`);
+    if (context === 'build-identity' || context === 'build-identity-final') {
+      // Admission accepts only the opening and closing receipt phases. Other
+      // callers require the same strict match without contributing evidence.
+      test.info().annotations.push({
+        type: 'candidate-identity',
+        description: JSON.stringify({
+          phase: context,
+          web: deployed,
+          api: verdict.apiSha,
+          expected,
+          observed_at: new Date().toISOString(),
+        }),
+      });
+    }
+    log(`[${context}] build identity: web = API = head = ${expected}`);
   } else {
-    console.log(`[${context}] build identity: ${verdict.note}`);
+    log(`[${context}] build identity: ${verdict.note}`);
     test.info().annotations.push({ type: 'api-not-redeployed', description: verdict.note });
   }
   return deployed;
