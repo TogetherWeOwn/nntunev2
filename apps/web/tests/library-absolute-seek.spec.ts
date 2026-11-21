@@ -10,19 +10,18 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	// This route serves a real generated WAV with HTTP Range responses.
 	const rangeResponse = page.waitForResponse((response) =>
 		response.url().endsWith(items[0].streamUrl) && response.status() === 206);
-	await page.goto('/library');
+	await page.goto(`/library?track=${items[0].id}&t=2`);
 	const region = page.getByRole('region', { name: 'Player', exact: true });
 	const audio = page.getByTestId('audio-player');
 	const slider = region.getByRole('slider', { name: 'Seek', exact: true });
-	await page.locator('[data-testid="library-item"][data-id="seek-0"]').getByRole('button', { name: /^Coral/ }).click();
 	await rangeResponse;
 	await expect(slider).toBeEnabled();
 	await expect(audio).toHaveCount(1);
 	await expect(audio).toHaveJSProperty('controls', true);
 	const firstAudio = await audio.elementHandle();
 	if (!firstAudio) throw new Error('The sole native decoder did not mount.');
-	await region.getByRole('button', { name: 'Pause', exact: true }).click();
-	await expect(audio).toHaveJSProperty('paused', true);
+	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => !el.seeking && el.paused &&
+		Math.abs(el.currentTime - 2) < 0.05)).toBe(true);
 	await audio.evaluate((el: HTMLAudioElement) => {
 		el.addEventListener('seeked', () => { el.dataset.seeked = 'yes'; }, { once: true });
 	});
@@ -95,6 +94,7 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	});
 	try {
 		await page.locator('[data-testid="library-item"][data-id="seek-1"]').getByRole('button', { name: /^Pine/ }).click();
+		await page.getByTestId('player-next').click();
 		await expect(audio).toHaveAttribute('src', items[1].streamUrl);
 		expect(await firstAudio.evaluate((el) => el.isConnected)).toBe(false);
 		await expect(slider).toBeDisabled();

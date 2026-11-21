@@ -599,8 +599,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'emptied', 'seeking',
 					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate', 'seeked']) {
 					audio.addEventListener(type, (event) => {
-						observe(event);
+						const settlement = observe(event);
 						if (event.currentTarget === audio && type !== 'play' && type !== 'playing' && type !== 'pause') observePosition();
+						return settlement;
 					}, { signal: receipt.listeners.signal });
 				}
 			}
