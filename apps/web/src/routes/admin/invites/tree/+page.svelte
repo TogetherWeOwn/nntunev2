@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { flushSync, onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient, ApiError, isInviteTreeUserId, type AdminInviteTreePage } from '#lib/api/client.js';
+	import { ApiClient, ApiError, isAdminInviteTreeDenial, isInviteTreeUserId, type AdminInviteTreePage } from '#lib/api/client.js';
 	import { captureAuthFence, subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
@@ -19,7 +19,6 @@
 	let selectedHeading = $state<HTMLHeadingElement>();
 	let inviteesHeading = $state<HTMLHeadingElement>();
 	let moreButton = $state<HTMLButtonElement>();
-
 	function reset(message = '') {
 		if (heading?.parentElement?.contains(document.activeElement)) heading.focus();
 		pending?.abort();
@@ -46,10 +45,6 @@
 		void load(input);
 	}
 
-	function loadMore() {
-		if (node && node.next_cursor !== null && !pending) void load(node.user_id, node);
-	}
-
 	async function load(id: string, previous?: AdminInviteTreePage) {
 		if (!previous) {
 			heading.focus();
@@ -59,7 +54,7 @@
 		pending = attempt;
 		const current = () => pending === attempt && !attempt.signal.aborted;
 		try {
-			const fence = await captureAuthFence();
+			const fence = await captureAuthFence({ readOnly: true });
 			// Do not hold the shared auth lock while waiting for the network.
 			const sent = await fence?.run(() => current() ? {
 				result: client.readAdminInviteTree(id, previous?.next_cursor ?? null, attempt.signal).then(
@@ -74,7 +69,7 @@
 				if (page) {
 					if (previous && page.next_cursor === null && document.activeElement === moreButton) inviteesHeading?.focus();
 					node = { ...page, invitee_ids: [...new Set([...(previous?.invitee_ids ?? []), ...page.invitee_ids])] };
-				} else if (cause instanceof ApiError && ([401, 403, 404, 409].includes(cause.status) || cause.code === 'account_deleting')) {
+				} else if (cause instanceof ApiError && (isAdminInviteTreeDenial(cause.status) || cause.code === 'account_deleting')) {
 					reset(unavailable);
 				} else {
 					reset(cause instanceof ApiError && cause.status === 422 && previous
@@ -94,11 +89,9 @@
 		}
 	}
 </script>
-
 <svelte:window onpagehide={() => flushSync(() => reset())} onpageshow={({ persisted }) => { if (persisted) reset(); }}
 	onstorage={({ key }) => { if (key === LIBRARY_AUTH_TRANSITION_KEY) reset(unavailable); }} />
 <svelte:head><title>NNTune — Invite tree</title></svelte:head>
-
 <main class="nt-wrap">
 	<h1 tabindex="-1" bind:this={heading}>Invite tree</h1>
 	<p><a href="/admin/invites">Back to invite ledger</a></p>
@@ -127,14 +120,13 @@
 			</ul>
 		{:else}<p>No direct invitees.</p>{/if}
 		{#if node.next_cursor !== null}
-			<button class="nt-button" bind:this={moreButton} aria-disabled={!!pending} onclick={loadMore}>Load more</button>
+			<button class="nt-button" bind:this={moreButton} aria-disabled={!!pending}
+				onclick={() => { if (node?.next_cursor && !pending) void load(node.user_id, node); }}>Load more</button>
 		{/if}
 	{/if}
 </main>
 
-{#snippet edge(id: string)}
-	<button class="nt-button nt-button--ghost" onclick={() => void load(id)}>{id}</button>
-{/snippet}
+{#snippet edge(id: string)}<button class="nt-button nt-button--ghost" onclick={() => void load(id)}>{id}</button>{/snippet}
 
 <style>
 	main { overflow-wrap: anywhere; padding-block-end: var(--nt-space-4); }

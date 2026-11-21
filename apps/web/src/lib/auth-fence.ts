@@ -6,7 +6,8 @@ let localEpoch = 0, pending = 0;
 function withStorage<T>(read: (storage: Storage) => T, fallback: T): T {
 	try { return read(window.localStorage); } catch { return fallback; }
 }
-const generation = () => withStorage((storage) => storage.getItem(AUTH_GENERATION_KEY), null);
+const readGeneration = () => withStorage((storage) => storage.getItem(AUTH_GENERATION_KEY), undefined);
+const generation = () => readGeneration() ?? null;
 const pendingMarker = (key: string) => key.startsWith(PENDING_PREFIX);
 const invalidation = new EventTarget();
 
@@ -48,8 +49,9 @@ const markBeforeDispatch = (signal: AbortSignal) => new Promise<ClearMarker | un
 });
 function invalidateGeneration(removeOnFailure = true): boolean {
 	if (withStorage<void | false>((storage) => storage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID()), false) !== false) return true;
-	// Removal doesn't need quota. A later capture must initialize a new generation.
-	return removeOnFailure && withStorage<void | false>((storage) => storage.removeItem(AUTH_GENERATION_KEY), false) !== false;
+	// Removal doesn't need quota, but removing an absent key cannot invalidate a read-only capture.
+	return removeOnFailure && generation() !== null &&
+		withStorage<void | false>((storage) => storage.removeItem(AUTH_GENERATION_KEY), false) !== false;
 }
 async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 	try {
@@ -58,20 +60,23 @@ async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 		});
 	} catch { return undefined; }
 }
-/** Use run() for trusted dispatch, publication and storage commits, not just a receipt check. */
-export function captureAuthFence() {
+type Fence<G> = { generation: G; isCurrent: () => boolean; run: <T>(work: () => T) => Promise<T | undefined> };
+/** Use run() for trusted dispatch and publication. Read-only captures never initialize the generation. */
+export function captureAuthFence(options: { readOnly: true }): Promise<Fence<string | null> | undefined> | undefined;
+export function captureAuthFence(): Promise<Fence<string> | undefined> | undefined;
+export function captureAuthFence({ readOnly = false } = {}) {
 	const locks = globalThis.navigator?.locks;
 	if (!locks || typeof window === 'undefined') return;
 	const epoch = localEpoch;
 	return readLock(async () => {
 		if (receiptsBlocked()) return;
 		// Initialize once, while the outer shared lock excludes locked writes.
-		if (!generation()) await locks.request(`${AUTH_LOCK}.init`, () => {
+		if (!readOnly && !generation()) await locks.request(`${AUTH_LOCK}.init`, () => {
 			if (!generation() && !receiptsBlocked()) invalidateGeneration(false);
 		});
-		const id = generation();
-		const isCurrent = () => !pending && epoch === localEpoch && !receiptsBlocked() && generation() === id;
-		if (!id || (await cacheReceiptsBlocked()) || !isCurrent()) return;
+		const id = readGeneration();
+		const isCurrent = () => !pending && epoch === localEpoch && !receiptsBlocked() && readGeneration() === id;
+		if (id === undefined || (!readOnly && !id) || (await cacheReceiptsBlocked()) || !isCurrent()) return;
 		return { generation: id, isCurrent, run: <T>(work: () => T) => readLock(() => isCurrent() ? work() : undefined) };
 	});
 }

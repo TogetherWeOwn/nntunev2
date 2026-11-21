@@ -78,6 +78,8 @@ test('loads one continuation at a time, deduplicates rows and stops at a null cu
 		await route.fulfill({ json: target === next ? result(root, null, [full[49], leaf]) : result(root, null, full, cursor) });
 	});
 	await page.goto(path);
+	const storage = () => page.evaluate(() => [Object.entries(localStorage), Object.entries(sessionStorage)]);
+	const before = await storage();
 	await lookup(page, root);
 	await expect(list(page).getByRole('listitem')).toHaveCount(50);
 	await more(page).press('Enter');
@@ -88,6 +90,7 @@ test('loads one continuation at a time, deduplicates rows and stops at a null cu
 	await expect(page.getByRole('button', { name: full[49], exact: true })).toHaveCount(1);
 	await expect(more(page)).toHaveCount(0);
 	expect(calls).toEqual([tree(root), next]);
+	expect(await storage()).toEqual(before);
 });
 
 for (const continuation of [false, true]) test(`ignores a late ${continuation ? 'continuation' : 'lookup'} after switching nodes`, async ({ page }) => {
@@ -123,6 +126,16 @@ for (const continuation of [false, true]) test(`ignores a late ${continuation ? 
 
 for (const status of [0, 422, 401, 403, 404, 409]) test(`clears IDs after a failed continuation (${status || 'network'})`, async ({ page }) => {
 	const next = `${tree(root)}?cursor=${cursor}`;
+	if ([401, 403, 404, 409].includes(status)) {
+		// Route fixtures supply the HTTP status; replace denial bodies with streams that never close.
+		await page.addInitScript((next) => {
+			const fetchNormally = window.fetch.bind(window);
+			window.fetch = async (input, init) => {
+				const response = await fetchNormally(input, init);
+				return String(input).endsWith(next) ? new Response(new ReadableStream(), { status: response.status }) : response;
+			};
+		}, next);
+	}
 	const calls = await mock(page, (route, target) => target === next
 		? status ? route.fulfill({ status, json: { message: 'untrusted error body' } }) : route.abort('failed')
 		: route.fulfill({ json: result(root, null, [leaf], cursor) }));

@@ -55,6 +55,16 @@ it('shares the read lock, queues logout and recovers after storage errors', asyn
 	expect(read()).not.toBe(initial);
 	expect(await first!.run(() => true)).toBeUndefined();
 });
+it('fences a read-only capture with no generation when a writer hits quota', async () => {
+	const { setItem, removeItem } = setup();
+	const capture = await captureAuthFence({ readOnly: true });
+	expect(capture?.generation).toBeNull();
+	expect(setItem).not.toHaveBeenCalled();
+	expect(removeItem).not.toHaveBeenCalled();
+	setItem.mockImplementation(fail(full));
+	await (await startWriter())();
+	expect(await capture!.run(() => true)).toBeUndefined();
+});
 it('does not dispatch logout queued behind a second tab signing in', async () => {
 	const { api, send } = setup();
 	const finishSignIn = await startWriter();
