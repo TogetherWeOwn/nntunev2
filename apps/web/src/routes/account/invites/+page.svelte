@@ -1,19 +1,19 @@
 <script lang="ts">
-	import { onDestroy, onMount, tick } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError } from '#lib/api/client.js';
+	import { captureAuthFence, subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 	const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-	let requesting = $state(false);
 	let copying = $state(false);
-	let invite = $state<{ link: string; expires: Date } | null>(null);
+	let invite = $state<{ link: string; expires: Date; isCurrent: () => boolean } | null>(null);
 	let notice = $state('');
 	let error = $state('');
 	let signedOut = $state(false);
-	let request: AbortController | undefined;
+	let request = $state<AbortController>();
 	let field = $state<HTMLInputElement>();
 	let createButton = $state<HTMLButtonElement>();
 
@@ -22,30 +22,38 @@
 		request = undefined;
 		if (field) field.value = '';
 		invite = null;
-		requesting = copying = signedOut = false;
+		copying = signedOut = false;
 		notice = error = '';
 	}
 
-	onMount(() => subscribeLocalAuthTransition(clear));
-	onDestroy(clear);
-
-	function onStorage(event: StorageEvent) {
-		if (event.key === LIBRARY_AUTH_TRANSITION_KEY) clear();
-	}
+	onMount(() => {
+		const lifetime = new AbortController();
+		subscribeAuthFenceInvalidation(clear, lifetime.signal);
+		const unsubscribe = subscribeLocalAuthTransition(clear);
+		return () => { lifetime.abort(); unsubscribe(); clear(); };
+	});
 
 	async function issue() {
 		if (request || invite || signedOut) return;
 		const attempt = new AbortController();
 		request = attempt;
-		requesting = true;
 		error = notice = '';
 		try {
-			const { code, expires_at } = await client.issueMemberInvite(attempt.signal);
-			if (attempt.signal.aborted) return;
-			const link = new URL('/signup', window.location.origin);
-			// Fragments are not sent in the signup request or Referer header.
-			link.hash = new URLSearchParams({ invite: code }).toString();
-			invite = { link: link.href, expires: new Date(expires_at * 1000) };
+			const fence = await captureAuthFence();
+			// Box the promise so the shared lock covers dispatch, not the network wait.
+			const sent = await fence?.run(() => attempt.signal.aborted ? undefined : { result: client.issueMemberInvite(attempt.signal) });
+			if (!fence || !sent) {
+				if (!attempt.signal.aborted) error = 'Couldn’t verify this browser session. No invite was requested.';
+				return;
+			}
+			const { code, expires_at } = await sent.result;
+			await fence.run(() => {
+				if (attempt.signal.aborted) return;
+				const link = new URL('/signup', window.location.origin);
+				link.hash = new URLSearchParams({ invite: code }).toString();
+				invite = { link: link.href, expires: new Date(expires_at * 1000), isCurrent: fence.isCurrent };
+			});
+			if (!invite && !attempt.signal.aborted) throw new Error('Invite was not published');
 			await tick();
 			if (!attempt.signal.aborted) field?.focus();
 		} catch (cause) {
@@ -63,10 +71,7 @@
 				error = 'No link was received. Another attempt could use another invite from your quota.';
 			}
 		} finally {
-			if (request === attempt) {
-				request = undefined;
-				requesting = false;
-			}
+			if (request === attempt) request = undefined;
 		}
 	}
 
@@ -80,6 +85,7 @@
 
 	async function copy() {
 		if (!invite || copying) return;
+		if (!invite.isCurrent()) return clear();
 		const { link } = invite;
 		copying = true;
 		error = '';
@@ -97,7 +103,7 @@
 	}
 </script>
 
-<svelte:window onpagehide={clear} onstorage={onStorage} />
+<svelte:window onpagehide={clear} onstorage={({ key }) => { if (key === LIBRARY_AUTH_TRANSITION_KEY) clear(); }} />
 
 <svelte:head><title>NNTune — Invites</title></svelte:head>
 
@@ -126,7 +132,7 @@
 			<a href="/login">Sign in</a>
 		{:else}
 			<button class="nt-button" type="button" bind:this={createButton} onclick={issue}
-				disabled={requesting}>{requesting ? 'Creating invite…' : 'Create invite'}</button>
+				disabled={!!request}>{request ? 'Creating invite…' : 'Create invite'}</button>
 		{/if}
 	{/if}
 	<div role="status">{notice}</div>
@@ -134,12 +140,6 @@
 </main>
 
 <style>
-	section {
-		background: var(--nt-bg-raised);
-		border: 1px solid var(--nt-border);
-		border-radius: var(--nt-radius-pane);
-		padding: var(--nt-space-3);
-	}
 	input {
 		display: block;
 		width: 100%;
