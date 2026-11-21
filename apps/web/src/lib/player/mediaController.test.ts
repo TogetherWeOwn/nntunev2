@@ -366,6 +366,17 @@ test('absolute seek cancels deferred share and uses native time, including refus
 	expect(state()).toMatchObject({ position: 30, feedback: 'That position is not seekable yet.' });
 	media.seek(attachment, Infinity);
 	expect(setter).toHaveBeenCalledTimes(1);
+	for (const event of ['seeking', 'timeupdate', 'seeked']) {
+		if (event !== 'seeking') native.position += 1;
+		native.dispatchEvent(new Event(event));
+		expect(state().feedback).toBe('That position is not seekable yet.');
+	}
+	native.currentTime = 60;
+	native.seeking = true;
+	native.dispatchEvent(new Event('seeking'));
+	native.seeking = false;
+	native.dispatchEvent(new Event('seeked'));
+	expect(state()).toMatchObject({ attachment, position: 60, elapsed: 60, feedback: '' });
 	media.seek(attachment, 200);
 	expect(setter).toHaveBeenLastCalledWith(120);
 	expect(state()).toMatchObject({ position: 120, duration: 120, enabled: true, feedback: '' });

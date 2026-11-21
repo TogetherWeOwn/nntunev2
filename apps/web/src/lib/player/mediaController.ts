@@ -352,13 +352,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		});
 	}
 
-	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string, replay = false): void {
+	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string, replay = false, nativeSeeking = false): void {
 		const attachment = attachmentVersion;
 		const observation = readAbsoluteSeek(audio);
 		if (!matches()) return;
 		const prior = get(absoluteSeek);
 		const previous = prior.attachment === attachment ? prior : emptySeek;
-		const message = feedback ?? previous.feedback;
+		// Only a new seek with changed native readback can supersede a refusal.
+		const message = feedback ?? (nativeSeeking && observation.position !== previous.position ? '' : previous.feedback);
 		const elapsed = observation.seeking ? previous.elapsed : observation.position;
 		if (prior.attachment !== attachment || previous.position !== observation.position ||
 			previous.duration !== observation.duration || previous.enabled !== observation.enabled ||
@@ -544,11 +545,11 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (previous) invalidatePlay();
 			const target = transportTarget();
 			const trackId = currentTrack(queue.snapshot)?.id;
-			const observePosition = () => {
+			const observePosition = (type?: string) => {
 				if (target?.audio !== audio) return;
 				const intent = positionIntent;
 				const matches = () => target.matches(() => positionIntent === intent && currentTrack(queue.snapshot)?.id === trackId);
-				if (matches()) observeAbsoluteSeek(audio, matches);
+				if (matches()) observeAbsoluteSeek(audio, matches, undefined, false, type === 'seeking');
 			};
 			function listenForNativeEvents(): void {
 				const observe = (event: Event) => {
@@ -613,7 +614,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate', 'seeked']) {
 					audio.addEventListener(type, (event) => {
 						const settlement = observe(event);
-						if (event.currentTarget === audio && type !== 'play' && type !== 'playing' && type !== 'pause') observePosition();
+						if (event.currentTarget === audio && type !== 'play' && type !== 'playing' && type !== 'pause') observePosition(type);
 						return settlement;
 					}, { signal: receipt.listeners.signal });
 				}
