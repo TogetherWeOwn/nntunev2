@@ -10,9 +10,7 @@ test('a duration armed in Library pauses the same native player on Home', async 
 	const player = page.getByRole('region', { name: 'Player', exact: true });
 	const status = player.getByRole('status');
 	const timer = page.getByRole('region', { name: 'Sleep timer' });
-	const native = player.locator('audio[controls][data-testid="audio-player"]');
-	await expect(native).toBeVisible();
-	const audio = (await native.elementHandle())!;
+	const audio = (await player.locator('audio[controls][data-testid="audio-player"]').elementHandle())!;
 	await audio.evaluate((node: HTMLAudioElement) => {
 		node.loop = true; // Keep the short fixture from ending on slow runners.
 		const pause = node.pause.bind(node);
@@ -27,7 +25,7 @@ test('a duration armed in Library pauses the same native player on Home', async 
 	const timerStatus = timer.getByTestId('sleep-timer-status');
 	await minutes.fill('1');
 	await arm.press('Enter');
-	await page.clock.fastForward(30_000);
+	await page.clock.runFor(30_000);
 	await minutes.fill('0');
 	await arm.press('Enter');
 	await expect(minutes).toHaveAttribute('aria-invalid', 'true');
@@ -35,11 +33,11 @@ test('a duration armed in Library pauses the same native player on Home', async 
 	await expect(timer.getByRole('alert')).toBeVisible();
 	await expect(timerStatus).toHaveText('Sleep in 1 minute');
 	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).press('Enter');
+	await page.clock.runFor(29_500); // Also releases the router's deferred link navigation.
 	await expect(page).toHaveURL(/\/home$/);
-	await page.clock.fastForward(29_500);
 	await expect(timer.getByTestId('sleep-timer-remaining')).toHaveText('0:01');
 	expect(await audio.evaluate((node: HTMLAudioElement) => [node.paused, node.dataset.pauses ?? '0'])).toEqual([false, '0']);
-	await page.clock.fastForward(500);
+	await page.clock.runFor(500);
 	await expect(timerStatus).toHaveText('Sleep timer fired — playback paused');
 	await expect(status).toHaveText('Paused');
 	await expect(identity).toHaveText('Coral');

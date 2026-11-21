@@ -25,7 +25,7 @@ const ITEMS: Item[] = [
 ];
 const IRREVERSIBLE = /cannot be undone|irreversible|permanently|no undo/i;
 const yes = (page: Page) => page.getByRole('button', { name: /^(confirm|yes\b|clear\s+\d+)/i });
-const cancel = (page: Page) => page.getByRole('button', { name: /^cancel\b/i });
+const cancel = (page: Page) => page.getByTestId('queue-clear-confirm').getByRole('button', { name: 'Cancel', exact: true });
 const clear = (page: Page) => page.getByRole('button', { name: 'Clear queue', exact: true });
 const trim = (page: Page) => page.getByRole('button', { name: 'Clear upcoming', exact: true });
 const filter = (page: Page) => page.getByLabel('Filter queue', { exact: true });
