@@ -48,19 +48,11 @@ def _validate(response, expected_sha):
         raise UnsafeHealth("cache-unverified") from None
     if type(headers) is not dict or any(key != key.lower() for key in headers):
         raise UnsafeHealth("cache-unverified")
-    cache_control = headers.get("cache-control")
-    if not (
-        isinstance(cache_control, list)
-        and len(cache_control) == 1
-        and isinstance(cache_control[0], str)
-        and cache_control[0].lower() == "no-store"
-        and "age" not in headers
-        # The direct Worker response supplies no-store, not a CF cache status.
-        # If the edge adds a status, it must corroborate the Worker policy.
-        and (
-            "cf-cache-status" not in headers
-            or headers["cf-cache-status"] in (["DYNAMIC"], ["BYPASS"])
-        )
+    # Direct Worker responses have no CF cache status; a present one must agree.
+    if (
+        headers.get("cache-control") != ["no-store"]
+        or "age" in headers
+        or headers.get("cf-cache-status", ["DYNAMIC"]) not in (["DYNAMIC"], ["BYPASS"])
     ):
         raise UnsafeHealth("cache-unverified")
     try:

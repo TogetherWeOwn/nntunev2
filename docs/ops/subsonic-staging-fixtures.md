@@ -104,19 +104,12 @@ three-second freshness bound. It reports the start of the query's local time
 bracket, not its receipt time: a query started at or before a drain fence
 cannot clear it by returning later.
 
-Dispatch `subsonic-staging-health` on protected `main` with the
-`expected_health_sha` from the staging API deployment record to take one
-build-health sample. The health job requires a dedicated health-only Access
-service token in the protected staging environment. It sends the headers to the
-fixed staging health endpoint, over stdin to curl rather than in process
-arguments. The job rejects redirects, unverified cache responses, unhealthy
-responses, the wrong SHA, and responses outside the three-second deadline.
-The separate database observer workflow does not receive the health token.
-
-A successful health sample identifies the responding build at one instant. It
-does not identify the Cloudflare deployment or verify its bindings. Neither
-sample is wired to a live load window; resource coverage and live cleanup
-remain unverified.
+Dispatch `subsonic-staging-health` on protected `main` with
+`expected_health_sha` from the staging API deployment record. The job sends the
+dedicated health-only Access headers to curl via stdin. It rejects redirects,
+unverified cache evidence, wrong or unhealthy builds, and late responses.
+This identifies only the responding build, not the deployment or bindings.
+Neither observer is wired to load; resource coverage and cleanup are unverified.
 
 ### Version-fenced restore rehearsal (offline)
 
