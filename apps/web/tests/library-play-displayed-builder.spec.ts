@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { syntheticBody } from '../src/lib/player/demoMedia.js';
 
 /**
  * Builder-owned supplement to the protected play-from-top acceptance bank
@@ -25,7 +26,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *
  * From apps/web: `CI=1 pnpm exec playwright test
  * tests/library-play-displayed-builder.spec.ts --workers=1`. Real /library,
- * real queue and real ordering; only /api/library is mocked and media
+ * real queue and real ordering; /api/library and local WAV responses are mocked. Other media
  * requests are refused. No backend/provider/production requests.
  */
 
@@ -152,9 +153,11 @@ async function playCalls(page: Page): Promise<number> {
 test.beforeEach(async ({ context }) => {
 	await context.route('**/*', (route) => {
 		const request = route.request();
-		if (request.resourceType() === 'media') return route.abort('blockedbyclient');
 		const url = new URL(request.url());
 		if (!['localhost', '127.0.0.1'].includes(url.hostname)) return route.abort('blockedbyclient');
+		if (url.pathname.startsWith('/__playall-build__/'))
+			return route.fulfill({ contentType: 'audio/wav', body: Buffer.from(syntheticBody()) });
+		if (request.resourceType() === 'media') return route.abort('blockedbyclient');
 		if (url.pathname.startsWith('/api/')) return route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
 		return route.continue();
 	});

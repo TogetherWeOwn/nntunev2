@@ -12,6 +12,7 @@ import type { ShareTarget } from './shareTimestamp.js';
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error';
 
+type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
 type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'revoke' | 'isCurrent' | 'purging'>;
 
 export type MediaSelection = {
@@ -47,7 +48,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let attachmentVersion = 0;
 	let endGeneration = 0;
 	let playIntent = 0;
-	let pendingPlay: Promise<boolean> | undefined;
+	let pendingPlay: { result: Promise<PlayOutcome>; finish: (outcome: PlayOutcome) => void } | undefined;
 	const playbackStatus = writable<PlaybackStatus>('unavailable');
 	const repeat = writable<RepeatMode>('off');
 	const seekFeedback = writable({ restartCanSeek: false, restartStatus: '', restartStatusVersion: 0,
@@ -66,9 +67,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	const selectedSource = () => resolveStreamUrl(currentTrack(queue.snapshot));
 
+	function settlePlay(outcome?: PlayOutcome): void {
+		pendingPlay?.finish(outcome);
+		pendingPlay = undefined;
+	}
+
 	function invalidatePlay(): void {
 		++playIntent;
-		pendingPlay = undefined;
+		settlePlay();
 	}
 
 	function readPlayback(
@@ -100,25 +106,26 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!matches() || audio.error || (!audio.paused && !audio.ended) ||
 			!matches(() => playIntent === previousIntent)) return;
 		++playIntent;
-		let finish!: (played: boolean) => void;
-		const result = new Promise<boolean>((resolve) => { finish = resolve; });
-		const ownsAttempt = () => pendingPlay === result;
-		const matchesAttempt = () => matches(ownsAttempt);
-		pendingPlay = result;
-		let played = false;
+		let finish!: (outcome: PlayOutcome) => void;
+		const result = new Promise<PlayOutcome>((resolve) => { finish = resolve; });
+		const attempt = pendingPlay = { result, finish };
+		const matchesAttempt = () => matches(() => pendingPlay === attempt);
+		let state: PlaybackStatus | undefined;
 		try {
 			playbackStatus.set('starting');
 			// No flush or reload: this is a user gesture on the mounted decoder.
 			const play = audio.play;
 			if (!matchesAttempt()) return;
 			await play.call(audio);
-			played = matchesAttempt() && readPlayback(audio, matchesAttempt, 'playing') === 'playing';
-		} catch {
-			if (matchesAttempt()) readPlayback(audio, matchesAttempt,
-				get(playbackStatus) === 'playing' ? 'playing' : 'starting', 'blocked');
+			if (matchesAttempt()) state = readPlayback(audio, matchesAttempt, 'playing');
+		} catch (error) {
+			if (!matchesAttempt()) return;
+			// The queued native pause event may already see a resumed decoder.
+			const interrupted = error instanceof DOMException && error.name === 'AbortError' && !audio.error;
+			if (interrupted) invalidatePlay();
+			state = readPlayback(audio, interrupted ? matches : matchesAttempt, 'starting', interrupted ? 'paused' : 'blocked');
 		} finally {
-			finish(played && ownsAttempt());
-			if (ownsAttempt()) pendingPlay = undefined;
+			if (pendingPlay === attempt) settlePlay(state === 'playing' || state === 'blocked' || state === 'error' ? state : undefined);
 		}
 	}
 
@@ -204,40 +211,48 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		let attachment = current;
 		let version = attachmentVersion;
 		const intent = playIntent;
-		const ownsAttempt = () => !destroyed && playIntent === intent && queue.isCurrent(receipt) && source.isCurrent();
-		const isCurrent = () => ownsAttempt() && current === attachment && attachmentVersion === version;
+		const ownsQueue = () => !destroyed && source.isCurrent() && queue.isCurrent(receipt);
+		const isCurrent = () => ownsQueue() && current === attachment && attachmentVersion === version;
+		const ownsPlay = () => isCurrent() && playIntent === intent;
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
 		if (streamUrl) {
 			// A same-attachment gesture shares the compact outcome, even if it settles during flush.
-			const sharedPlay = pendingPlay;
+			const sharedPlay = pendingPlay?.result;
 			await selection.flush();
 			// A source change retires the old node before commit. In that case
 			// flush can admit one attachment, but not a reset or replacement while waiting.
-			if (!ownsAttempt() || attachmentVersion !== version + Number(!attachment && !!current)) return;
+			if (!ownsQueue() || attachmentVersion !== version + Number(!attachment && !!current)) return;
 			attachment = current;
 			version = attachmentVersion;
 			const audio = attachment?.audio;
 			lead = `Selected ${title}, paused: playback was blocked.`;
+			if (sharedPlay && audio) {
+				const outcome = await sharedPlay;
+				if (!matchesSource(audio, streamUrl, isCurrent)) return;
+				if (outcome === 'error' || audio.error) lead = `Selected ${title}; audio unavailable.`;
+				else if (outcome !== 'blocked') lead = outcome && !audio.paused && !audio.ended ? `Playing ${title}.` : '';
+				// An interrupted Play can still own the committed queue result.
+				if (!isCurrent()) return;
+				const message = [playIntent === intent && lead, suffix].filter(Boolean).join(' ');
+				if (message) selection.announce(message, true);
+				return;
+			}
+			if (!ownsPlay()) return;
 			try {
-				if (audio?.isConnected && audio.getAttribute('src') === streamUrl && isCurrent()) {
-					if (sharedPlay) {
-						if (await sharedPlay && !audio.paused && !audio.ended) lead = `Playing ${title}.`;
-					} else {
-						const play = audio.play;
-						if (!isCurrent()) return;
-						await play.call(audio);
-						lead = `Playing ${title}.`;
-					}
+				if (audio?.isConnected && audio.getAttribute('src') === streamUrl && ownsPlay()) {
+					const play = audio.play;
+					if (!ownsPlay()) return;
+					await play.call(audio);
+					lead = `Playing ${title}.`;
 				}
 			} catch {
 				// No retry and no pause or selection change on a retired receipt.
-				if (isCurrent() && attachment) attachment.playing = false;
+				if (ownsPlay() && attachment) attachment.playing = false;
 			}
-			if (isCurrent() && audio?.error) lead = `Selected ${title}; audio unavailable.`;
+			if (ownsPlay() && audio?.error) lead = `Selected ${title}; audio unavailable.`;
 		}
-		if (!isCurrent()) return;
-		selection.announce(suffix ? `${lead} ${suffix}` : lead, true);
+		if (ownsPlay()) selection.announce(suffix ? `${lead} ${suffix}` : lead, true);
 	}
 
 	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
@@ -495,10 +510,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			// Node identity is not attachment identity, even for the same source.
 			const receipt = { audio, playing: false, listeners: new AbortController() };
 			current = receipt;
-			if (previous) {
-				previous.listeners.abort();
-				invalidatePlay();
-			}
+			previous?.listeners.abort();
+			if (previous) invalidatePlay();
 			function listenForNativeEvents(): void {
 				const observe = (event: Event) => {
 					if (current !== receipt || event.currentTarget !== audio) return;
@@ -553,8 +566,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					if (!matches()) return;
 					receipt.playing = false;
 					endGeneration += 1;
-					// A resource error ends compact playback, not the current queue announcement.
-					if (audio.error) pendingPlay = undefined;
+					// A fatal decoder error may never settle the native play promise.
+					if (audio.error) settlePlay('error');
 					else invalidatePlay();
 					readPlayback(audio, matches, get(playbackStatus));
 				};
