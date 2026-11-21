@@ -125,10 +125,13 @@ def _sample(env, run, wall, monotonic, deadline_ms=None):
     cutoff_ms = started_ms + DEADLINE_SECONDS * 1000
     if deadline_ms is not None:
         cutoff_ms = min(deadline_ms, observed_ms + MAX_SAMPLE_AGE_SECONDS * 1000)
-    timeout = (cutoff_ms - started_ms) / 1000
-    if timeout <= 0:
+    if not started_ms < cutoff_ms:
         raise UnsafeSample("deadline")
     since = wall()
+    dispatch_ms = started_ms if deadline_ms is None else monotonic() * 1000
+    if not started_ms <= dispatch_ms < cutoff_ms:
+        raise UnsafeSample("deadline")
+    timeout = (cutoff_ms - dispatch_ms) / 1000
     try:
         result = run(
             [
@@ -152,11 +155,16 @@ def _sample(env, run, wall, monotonic, deadline_ms=None):
     except (OSError, ValueError):
         raise UnsafeSample("client") from None
     finished_ms = monotonic() * 1000
-    if not started_ms <= finished_ms < cutoff_ms:
+    if not dispatch_ms <= finished_ms < cutoff_ms:
         raise UnsafeSample("deadline")
     if result.returncode != 0:
         raise UnsafeSample("query")
-    return observed_ms, parse_sample(result.stdout, since, wall())
+    row = parse_sample(result.stdout, since, wall())
+    if deadline_ms is not None:
+        validated_ms = monotonic() * 1000
+        if not finished_ms <= validated_ms < cutoff_ms:
+            raise UnsafeSample("deadline")
+    return observed_ms, row
 
 
 def sample(env, run=subprocess.run, wall=time.time, monotonic=time.monotonic):

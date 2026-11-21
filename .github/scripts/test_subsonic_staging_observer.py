@@ -111,21 +111,21 @@ class ObserverTests(unittest.TestCase):
             deadline_ms=1625,
             run=run,
             wall=iter((99, 100)).__next__,
-            monotonic=iter((1.125, 1.5)).__next__,
+            monotonic=iter((1.125, 1.25, 1.5, 1.6)).__next__,
         )
         # A zero arriving at 1500 cannot by itself clear a fence at 1125.
         self.assertEqual(reading.observed_ms, 1125)
         self.assertEqual(reading.measurement, 0)
         self.assertEqual(reading.ordinary_free, 2)
         run.assert_called_once()
-        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.375)
 
     def test_pressure_drops_expired_late_and_stale_samples(self):
         for deadline, clocks, raw, calls, category in (
             (1000, (1,), VALID, 0, "deadline"),
-            (1500, (1, 1.5), VALID, 1, "deadline"),
-            (9000, (1, 4), VALID, 1, "deadline"),
-            (9000, (1, 2), b"96\n0|20|1|25|3\n", 1, "stale"),
+            (1500, (1, 1, 1.5), VALID, 1, "deadline"),
+            (9000, (1, 1, 4), VALID, 1, "deadline"),
+            (9000, (1, 1, 2), b"96\n0|20|1|25|3\n", 1, "stale"),
         ):
             run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout=raw))
             with (
@@ -144,6 +144,47 @@ class ObserverTests(unittest.TestCase):
                 self.assertEqual(
                     run.call_args.kwargs["timeout"], min(3, deadline / 1000 - 1)
                 )
+
+    def test_pressure_does_not_dispatch_after_wall_clock_setup_crosses_deadline(self):
+        now = 1
+        run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout=VALID))
+
+        def wall():
+            nonlocal now
+            now = 1.501
+            return 100
+
+        with self.assertRaisesRegex(UnsafeSample, "^deadline$"):
+            OBSERVER["sample_pressure"](
+                ENV, deadline_ms=1500, run=run, wall=wall, monotonic=lambda: now
+            )
+        run.assert_not_called()
+
+    def test_pressure_rechecks_both_cutoffs_after_validation(self):
+        def check(deadline, returned, validated):
+            now = 1
+
+            def query(*args, **kwargs):
+                nonlocal now
+                now = returned
+                return subprocess.CompletedProcess([], 0, stdout=VALID)
+
+            def wall():
+                nonlocal now
+                if now == returned:
+                    now = validated
+                return 100
+
+            run = Mock(side_effect=query)
+            with self.assertRaisesRegex(UnsafeSample, "^deadline$"):
+                OBSERVER["sample_pressure"](
+                    ENV, deadline_ms=deadline, run=run, wall=wall, monotonic=lambda: now
+                )
+            run.assert_called_once()
+
+        for deadline, returned, validated in ((1500, 1.499, 1.501), (9000, 3.999, 4)):
+            with self.subTest(deadline=deadline):
+                check(deadline, returned, validated)
 
     def test_bad_shape_identity_and_stale_telemetry_stop(self):
         for raw, category in (
