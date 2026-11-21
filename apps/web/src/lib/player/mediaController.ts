@@ -538,7 +538,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const { soughtToEnd } = attachment;
 		if (typeof soughtToEnd === 'object') {
 			const { duration, currentTime } = audio, { end, seekDuration, played, progressed, tailProgress, settled } = soughtToEnd, slack = SEEK_READBACK_TOLERANCE;
-			const correctedTail = duration < seekDuration && settled !== undefined && settled >= duration - slack;
+			const correctedTail = duration < seekDuration && settled !== undefined && (end >= seekDuration || settled >= duration - slack);
 			const reachedNewEnd = correctedTail
 				? currentTime >= duration - slack && (tailProgress || playedNewTail(played, audio.played, settled, duration))
 				: duration > end

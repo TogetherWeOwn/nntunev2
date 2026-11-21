@@ -217,7 +217,7 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	['interior corrected down historical', 59.84, false, 59.84, 59.8], ['interior corrected down replay', 59.84, true, 59.84, 59.8, 59.82],
 	['interior corrected down played', 59.84, true, 59.84], ['interior corrected down played rounded', 59.839, true, 59.84],
 	['interior rounded up', 60, false, 0], ['interior rounded up settled', 60, false, 0, 59.98], ['interior rounded up played', 60, true, 0], ['interior rounded up replay', 60, true, 0, 59.98, 59.99],
-	['late correction', 59.98, false, 59.99], ['late correction played', 59.99, true, 59.99],
+	['late correction', 59.8, false, 59.86], ['late correction played', 59.86, true, 59.86],
 	['interior late correction', 59.8, false, 59.84], ['interior late correction played', 59.84, true, 59.84],
 	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
 ] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?, motion?) => {
@@ -245,9 +245,13 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	if (forward) expect(get(media.seekFeedback).jumpStatus).toBe(ignored ? 'The player did not accept that jump.' : 'Forward to the end, 1:00.');
 	if (scenario === 'compact') media.seek(get(media.absoluteSeek).attachment, 59.9999995);
 	else if (corrected) Object.assign(audio, { duration: revisedDuration || position, position: 59.8 }).emit('durationchange');
-	if (late) audio.position = target === endpoint ? 59.98 : 59.8;
 	if (rounded && scenario !== 'interior rounded up') audio.position = 59.98;
-	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('timeupdate', 'seeked'); }
+	if (audio.seeking) {
+		audio.emit('seeking');
+		if (late) audio.position = 59.8;
+		audio.seeking = false;
+		audio.emit('timeupdate', 'seeked');
+	}
 	if (revisedDuration && !corrected) Object.assign(audio, { duration: revisedDuration }).emit('durationchange');
 	if (priorStart !== undefined && (corrected || rounded)) Object.assign(audio, { position: motion ?? audio.position }).emit('timeupdate');
 	if (scenario.endsWith('extension') || scenario === 'interior natural end' || scenario.includes('played')) audio.played = timeRanges([[corrected || rounded || late ? audio.position : target, corrected ? revisedDuration : position]]);
