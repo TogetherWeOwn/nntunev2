@@ -30,6 +30,7 @@
 			const active = ownsFullscreen();
 			if (active === fullscreenActive) return;
 			fullscreenActive = active;
+			fullscreenFailure = '';
 			if (!surface.isConnected || (!active && doc.fullscreenElement)) return;
 			// Also runs on browser-driven exit. Never focus a retired route.
 			const control = fullscreenButton;

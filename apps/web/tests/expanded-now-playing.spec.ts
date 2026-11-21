@@ -180,19 +180,43 @@ for (const paused of [true, false]) {
 			for (const event of ['loadstart', 'play', 'pause', 'seeking']) {
 				node.addEventListener(event, () => { node.dataset.fullscreenMediaEvent = event; });
 			}
+			// Record even no-op commands while keeping the real WAV playback and clock.
+			const media = HTMLMediaElement.prototype;
+			for (const command of ['play', 'pause', 'load', 'fastSeek'] as const) {
+				const original = media[command];
+				if (typeof original !== 'function') continue;
+				Object.defineProperty(media, command, {
+					value: function (this: HTMLMediaElement, ...args: unknown[]) {
+						node.dataset.fullscreenMediaCommand = command;
+						return Reflect.apply(original, this, args);
+					}
+				});
+			}
+			const clock = Object.getOwnPropertyDescriptor(media, 'currentTime')!;
+			Object.defineProperty(media, 'currentTime', {
+				...clock,
+				set(this: HTMLMediaElement, value: number) {
+					node.dataset.fullscreenMediaCommand = 'currentTime';
+					clock.set!.call(this, value);
+				}
+			});
 			return { source: node.currentSrc, position: node.currentTime };
 		});
 		let position = before.position;
 		const time = () => decoder.evaluate((node) => node.currentTime);
 		const expectSamePlayback = async () => {
-			await expect(audio(page)).toHaveCount(1);
+			await expect(page.locator('audio')).toHaveCount(1);
 			expect(await decoder.evaluate((node) => ({
 				sameNode: document.querySelector('audio[data-testid="audio-player"]') === node,
 				source: node.currentSrc,
 				paused: node.paused,
 				event: node.dataset.fullscreenMediaEvent,
+				command: node.dataset.fullscreenMediaCommand,
 				insideFullscreen: document.fullscreenElement?.contains(node) ?? false
-			}))).toEqual({ sameNode: true, source: before.source, paused, event: undefined, insideFullscreen: false });
+			}))).toEqual({
+				sameNode: true, source: before.source, paused, event: undefined,
+				command: undefined, insideFullscreen: false
+			});
 			if (paused) expect(await time()).toBeCloseTo(position, 3);
 			else await expect.poll(time).toBeGreaterThan(position + 0.1);
 			position = await time();
@@ -280,10 +304,14 @@ test('refused fullscreen entry and exit are truthful and retryable', async ({ pa
 	await expect(exit).toBeFocused();
 	await expect.poll(() => noFullscreen(page)).toBe(false);
 
-	await exit.click();
+	// The first app exit was refused. A subsequent browser-driven exit must
+	// clear its status and restore focus even though the app button was not used.
+	await back(page).focus();
+	await page.evaluate(() => document.exitFullscreen());
 	await expect(enter).toBeFocused();
 	await expect.poll(() => noFullscreen(page)).toBe(true);
 	await expect(page.getByText('Could not exit full screen.')).toHaveCount(0);
+	await expect(page).toHaveURL(/\/now-playing$/);
 });
 
 test('leaving with entry pending retires the fullscreen request without affecting the next visit', async ({ page }) => {
