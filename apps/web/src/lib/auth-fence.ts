@@ -3,7 +3,6 @@ export const AUTH_GENERATION_KEY = 'nntune.auth.generation.v1';
 export const AUTH_LOCK = 'nntune.auth.cookie-transition.v1';
 // An abandoned unlocked write can leave its marker; don't guess when its cookie settled.
 const UNLOCKED_PREFIX = 'nntune.auth.pending.v1.';
-const RECEIPT_RESERVE_KEY = 'nntune.auth.fence-reserve.v1';
 let localEpoch = 0;
 let pending = 0;
 
@@ -15,54 +14,43 @@ function generation(): string | null {
 	}
 }
 
-function receiptsBlocked(requireReserve = false): boolean {
+const pendingMarker = (key: string) => key.startsWith(UNLOCKED_PREFIX);
+
+function receiptsBlocked(): boolean {
 	try {
-		const storage = window.localStorage;
-		const reserve = storage.getItem(RECEIPT_RESERVE_KEY);
-		return (
-			reserve === '' ||
-			(requireReserve && reserve !== '1') ||
-			Object.keys(storage).some((key) => key.startsWith(UNLOCKED_PREFIX))
-		);
+		return Object.keys(window.localStorage).some(pendingMarker);
 	} catch {
 		return true;
 	}
 }
 
-function reserveReceiptSpace(storage: Storage): void {
-	if (storage.getItem(RECEIPT_RESERVE_KEY) === null)
-		storage.setItem(RECEIPT_RESERVE_KEY, '1');
+async function cacheReceiptsBlocked(): Promise<boolean> {
+	try {
+		return (await caches.keys()).some(pendingMarker);
+	} catch {
+		return true;
+	}
 }
 
-function markUnlockedMutation(): string | undefined {
+async function markUnlockedMutation(): Promise<
+	(() => Promise<void>) | undefined
+> {
 	try {
-		const storage = window.localStorage;
-		// Each fallback owns its marker, so one response can't clear another writer's guard.
 		const key = `${UNLOCKED_PREFIX}${crypto.randomUUID()}`;
-		const mark = () => {
-			reserveReceiptSpace(storage);
+		try {
+			const storage = window.localStorage;
 			storage.setItem(key, '');
-		};
-		try {
-			mark();
-		} catch (error) {
-			if (
-				!(error instanceof DOMException) ||
-				error.name !== 'QuotaExceededError'
-			)
-				throw error;
-			storage.removeItem(AUTH_GENERATION_KEY);
-			mark();
-		}
-		return key;
-	} catch {
-		// Shorten the reserved entry at quota. Never clear this flag on another
-		// writer's completion: an unmarked request may still be in flight.
-		try {
-			window.localStorage.setItem(RECEIPT_RESERVE_KEY, '');
+			return async () => storage.removeItem(key);
 		} catch {
-			/* A context denied all storage writes cannot publish a shared flag. */
+			// Empty cache name only: separate from localStorage quota, no cached data.
+			const storage = globalThis.caches;
+			await storage.open(key);
+			return async () => {
+				await storage.delete(key);
+			};
 		}
+	} catch {
+		/* A context denied both shared stores cannot announce its transition. */
 	}
 }
 
@@ -85,7 +73,11 @@ async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 		return await globalThis.navigator?.locks?.request(
 			AUTH_LOCK,
 			{ mode: 'shared', ifAvailable: true },
-			(lock) => (lock && !pending ? work() : undefined)
+			async (lock) => {
+				if (!lock || pending || (await cacheReceiptsBlocked()) || pending)
+					return;
+				return work();
+			}
 		);
 	} catch {
 		return undefined;
@@ -102,12 +94,10 @@ export function captureAuthFence() {
 		if (receiptsBlocked()) return;
 		const storage = window.localStorage;
 		// Initialize once, while the outer shared lock excludes locked writes.
-		if (!generation() || storage.getItem(RECEIPT_RESERVE_KEY) === null)
+		if (!generation())
 			await locks.request(`${AUTH_LOCK}.init`, () => {
 				try {
-					if (receiptsBlocked()) return;
-					reserveReceiptSpace(storage);
-					if (!generation() && !receiptsBlocked(true))
+					if (!generation() && !receiptsBlocked())
 						storage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID());
 				} catch {
 					/* No receipt while generation storage is unavailable. */
@@ -118,9 +108,9 @@ export function captureAuthFence() {
 			!!id &&
 			!pending &&
 			epoch === localEpoch &&
-			!receiptsBlocked(true) &&
+			!receiptsBlocked() &&
 			generation() === id;
-		if (isCurrent())
+		if (!(await cacheReceiptsBlocked()) && isCurrent())
 			return {
 				isCurrent,
 				run: <T>(work: () => T) =>
@@ -140,16 +130,23 @@ export async function runAuthMutation<T>(
 	let dispatched = false;
 	const send = async (unlocked = false) => {
 		signal.throwIfAborted();
-		const marker = unlocked ? markUnlockedMutation() : undefined;
-		const invalidated = invalidateGeneration();
-		dispatched = true;
+		const clearMarker = unlocked ? await markUnlockedMutation() : undefined;
+		let invalidated = false;
 		try {
+			signal.throwIfAborted();
+			invalidated = invalidateGeneration();
+			dispatched = true;
 			return await dispatch();
 		} finally {
-			// If the generation couldn't be invalidated, don't revive old receipts.
-			if (marker && invalidated) {
+			// Invalidate again if an unlocked write could not publish a guard.
+			if (unlocked && !clearMarker && dispatched) invalidateGeneration();
+			// Retry on recovery; never remove a guard that still protects old receipts.
+			if (
+				clearMarker &&
+				(!dispatched || invalidated || invalidateGeneration())
+			) {
 				try {
-					window.localStorage.removeItem(marker);
+					await clearMarker();
 				} catch {
 					/* Keep receipts withheld if cleanup is denied. */
 				}

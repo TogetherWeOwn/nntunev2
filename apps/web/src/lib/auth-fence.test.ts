@@ -22,6 +22,12 @@ function setup() {
 		}
 	};
 	vi.stubGlobal('window', { localStorage });
+	const names = new Set<string>();
+	vi.stubGlobal('caches', {
+		keys: async () => [...names],
+		open: async (name: string) => names.add(name),
+		delete: async (name: string) => names.delete(name)
+	});
 	const send = vi.fn(async () => Response.json({}));
 	return {
 		localStorage,
@@ -85,11 +91,9 @@ it('shares the read lock, queues logout and recovers a new generation after a qu
 
 it('withholds receipts when generation initialization cannot write, and retries on the next capture', async () => {
 	const { localStorage } = setup();
-	localStorage.setItem
-		.mockImplementationOnce(localStorage.setItem.getMockImplementation()!)
-		.mockImplementationOnce(() => {
-			throw new DOMException('Storage denied', 'SecurityError');
-		});
+	localStorage.setItem.mockImplementationOnce(() => {
+		throw new DOMException('Storage denied', 'SecurityError');
+	});
 	expect(await captureAuthFence()).toBeUndefined();
 	expect((await captureAuthFence())?.isCurrent()).toBe(true);
 });
@@ -107,13 +111,29 @@ it('keeps logout available but withholds receipts when access to storage is bloc
 	expect(await captureAuthFence()).toBeUndefined();
 });
 
-it.each(['normal', 'retry', 'exhausted', 'exhausted from empty storage'])(
+it('fails closed on cache inspection errors without blocking ordinary auth', async () => {
+	const { send, api } = setup();
+	const before = await captureAuthFence();
+	expect(before?.isCurrent()).toBe(true);
+	vi.spyOn(caches, 'keys').mockRejectedValue(
+		new DOMException('Denied', 'SecurityError')
+	);
+	const trusted = vi.fn();
+	expect(await before?.run(trusted)).toBeUndefined();
+	expect(trusted).not.toHaveBeenCalled();
+	expect(await captureAuthFence()).toBeUndefined();
+	await api.logout();
+	expect(send).toHaveBeenCalledTimes(1);
+});
+
+it.each(['normal', 'retry', 'full', 'full before first capture'])(
 	'withholds cross-tab receipts through overlapping fallback writes (%s)',
 	async (quota) => {
-		const exhausted = quota.startsWith('exhausted');
+		const full = quota.startsWith('full');
 		const { localStorage } = setup();
-		const before = await captureAuthFence();
-		expect(before?.isCurrent()).toBe(true);
+		const fresh = quota === 'full before first capture';
+		const before = fresh ? undefined : await captureAuthFence();
+		if (!fresh) expect(before?.isCurrent()).toBe(true);
 		const lock = vi.spyOn(navigator.locks, 'request');
 		async function startLogout() {
 			// Re-evaluate the modules to give each writer independent epoch and pending state.
@@ -136,7 +156,8 @@ it.each(['normal', 'retry', 'exhausted', 'exhausted from empty storage'])(
 			localStorage.setItem.mockImplementationOnce(() => {
 				throw new DOMException('Storage full', 'QuotaExceededError');
 			});
-		if (exhausted) {
+		if (full) {
+			localStorage.setItem('unrelated', 'x'.repeat(256));
 			const size = (items: object) =>
 				Object.entries(items).reduce(
 					(sum, [key, value]) =>
@@ -144,9 +165,6 @@ it.each(['normal', 'retry', 'exhausted', 'exhausted from empty storage'])(
 					0
 				);
 			const limit = size(localStorage);
-			if (quota === 'exhausted from empty storage')
-				for (const [key, value] of Object.entries(localStorage))
-					if (typeof value === 'string') localStorage.removeItem(key);
 			const write = localStorage.setItem.getMockImplementation()!;
 			localStorage.setItem.mockImplementation((key, value) => {
 				if (size({ ...localStorage, [key]: value }) > limit)
@@ -156,16 +174,27 @@ it.each(['normal', 'retry', 'exhausted', 'exhausted from empty storage'])(
 		}
 		const first = await startLogout();
 		try {
-			expect(before?.isCurrent()).toBe(false);
-			const trusted = vi.fn();
-			expect(await before?.run(trusted)).toBeUndefined();
-			expect(trusted).not.toHaveBeenCalled();
+			if (before) {
+				expect(before.isCurrent()).toBe(false);
+				const trusted = vi.fn();
+				expect(await before.run(trusted)).toBeUndefined();
+				expect(trusted).not.toHaveBeenCalled();
+			}
 			expect(await captureAuthFence()).toBeUndefined();
+			if (full) {
+				expect(await caches.keys()).toHaveLength(1);
+				localStorage.removeItem('unrelated');
+				expect(await captureAuthFence()).toBeUndefined();
+			}
 			const second = await startLogout();
 			try {
+				second.response.resolve(Response.json({}));
+				await second.logout;
+				expect(await captureAuthFence()).toBeUndefined();
 				first.response.resolve(Response.json({}));
 				await first.logout;
-				expect(await captureAuthFence()).toBeUndefined();
+				expect((await captureAuthFence())?.isCurrent()).toBe(true);
+				expect(await caches.keys()).toHaveLength(0);
 			} finally {
 				second.response.resolve(Response.json({}));
 				await second.logout;
@@ -176,10 +205,7 @@ it.each(['normal', 'retry', 'exhausted', 'exhausted from empty storage'])(
 			await first.logout;
 		}
 		expect(first.fetchFn).toHaveBeenCalledTimes(1);
-		expect(before?.isCurrent()).toBe(false);
-		expect((await captureAuthFence())?.isCurrent()).toBe(
-			exhausted ? undefined : true
-		);
+		if (before) expect(before.isCurrent()).toBe(false);
 	}
 );
 
