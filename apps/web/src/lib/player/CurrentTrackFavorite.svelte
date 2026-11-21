@@ -9,8 +9,7 @@
 	const activateRendered: Action<HTMLButtonElement, NonNullable<typeof target>> = (button, rendered) => {
 		const listeners = new AbortController(), capture = { capture: true, signal: listeners.signal };
 		const hits = (event: Event) => event.composedPath().includes(button);
-		// Touch and pen clicks must match the originating pointer.
-		const pointers = new Map<string, { id: number; intent: typeof rendered }>();
+		const pointers = new Map<string, { id: number; intent: typeof rendered }>(); // Match the originating touch or pen press.
 		const takePointer = ({ pointerId, pointerType }: PointerEvent) => {
 			const press = pointers.get(pointerType);
 			if (press?.id !== pointerId) return;
@@ -48,15 +47,13 @@
 		}, capture);
 		button.addEventListener('blur', clearSpace, { signal: listeners.signal });
 		window.addEventListener('keyup', (event) => {
-			// Space clicks after keyup; expire a press whose click was canceled.
-			if (event.key === ' ' && space) release = setTimeout(clearSpace, 0);
+			if (event.key === ' ' && space) release = setTimeout(clearSpace, 0); // Expire if the click never follows.
 		}, capture);
 		window.addEventListener('click', (event) => {
 			const fromPointer = event.isTrusted && (event.detail > 0 || ('pointerType' in event && !!event.pointerType));
 			const fromSpace = event.isTrusted && !fromPointer && release !== undefined;
 			const pointer = 'pointerType' in event ? event as PointerEvent : legacyRelease;
-			const intent = fromPointer ? (pointer && pointer.pointerType !== 'mouse' ? takePointer(pointer) : mouseRelease)
-				: fromSpace ? space : undefined;
+			const intent = fromPointer ? (pointer && pointer.pointerType !== 'mouse' ? takePointer(pointer) : mouseRelease) : fromSpace ? space : undefined;
 			if (fromPointer) mouseRelease = legacyRelease = undefined;
 			if (fromSpace) clearSpace();
 			if (hits(event)) intents.set(event, intent ?? rendered);
