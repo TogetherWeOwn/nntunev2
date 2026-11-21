@@ -3,7 +3,7 @@ import { expect, test, vi } from 'vitest';
 import { createLivePlaybackSpeed } from './livePlaybackSpeed.js';
 import { PLAYBACK_SPEED_STORAGE_KEY } from './playbackSpeed.js';
 
-function fixture(seed = '1.3') {
+function fixture(seed: string | null = '1.3') {
 	let target: { audio: { playbackRate: number }; matches: () => boolean } | undefined;
 	const speed = createLivePlaybackSpeed(() => target);
 	let stored: string | null = seed;
@@ -27,6 +27,18 @@ function fixture(seed = '1.3') {
 	}
 	return { speed, storage, attach, retire: () => { target = undefined; speed.retire(); } };
 }
+
+test('a passive attach in a stale tab leaves the newer shared preference untouched', () => {
+	const { speed, storage, attach } = fixture(null);
+	let audio: { playbackRate: number } | undefined;
+	const stale = createLivePlaybackSpeed(() => audio && { audio, matches: () => true });
+	stale.restore(storage);
+	attach();
+	speed.set(1.5);
+	audio = { playbackRate: 1 };
+	stale.attach();
+	expect(storage.getItem()).toBe('1.5');
+});
 
 test('renders clamped readback and keeps mismatch feedback through the write’s ratechange', () => {
 	const { speed, attach, storage } = fixture();

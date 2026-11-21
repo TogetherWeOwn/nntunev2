@@ -3,14 +3,12 @@ import { clampPlaybackSpeed, createPlaybackSpeed, type PlaybackSpeedDeps } from 
 
 type RatePort = { playbackRate: number };
 type RateTarget = { audio: RatePort; matches: () => boolean };
-type SpeedState = { rate: number | null; feedback: string };
-const unavailable: SpeedState = { rate: null, feedback: '' };
-const noStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+const unavailable: { rate: number | null; feedback: string } = { rate: null, feedback: '' };
 
 export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 	const state = writable(unavailable);
 	let preference: ReturnType<typeof createPlaybackSpeed> | undefined;
-	let writePort: RatePort | undefined;
+	let writePort: (RatePort & { passive: boolean }) | undefined;
 
 	function read({ audio, matches }: RateTarget): number | null {
 		try {
@@ -29,6 +27,7 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 		const previousPort = writePort;
 		let observed: number | null | undefined;
 		writePort = {
+			passive: request === undefined,
 			get playbackRate() {
 				observed = read(current);
 				return observed ?? NaN;
@@ -57,7 +56,20 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 		state: { subscribe: state.subscribe },
 		get managed() { return preference !== undefined; },
 		restore(storage: PlaybackSpeedDeps['storage'] | null): void {
-			preference = createPlaybackSpeed({ storage: storage ?? noStorage, audio: () => writePort });
+			let saved: string | null | undefined;
+			preference = createPlaybackSpeed({
+				audio: () => writePort,
+				storage: {
+					getItem: (key) => (saved = storage?.getItem(key) ?? null),
+					setItem(key, rate) {
+						// Passive restores must not overwrite a value saved by another tab.
+						if (!storage || (writePort?.passive && storage.getItem(key) !== saved)) return;
+						storage.setItem(key, rate);
+						saved = rate;
+					},
+					removeItem() {}
+				}
+			});
 			write();
 		},
 		attach(): void {
