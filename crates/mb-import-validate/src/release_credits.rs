@@ -82,7 +82,8 @@ pub fn lookup(bytes: &[u8], release_mbid: &str) -> Result<Vec<ReleaseCredit>, Re
 }
 
 // The producer emits UTC seconds or UTC seconds with six fractional digits.
-// The shared COPY validator checks calendar ranges but accepts signed components.
+// The shared COPY validator checks calendar ranges but accepts signed components
+// and second 60, which the producer's datetime cannot emit.
 fn is_curated_timestamp(timestamp: &str) -> bool {
     timestamp.strip_suffix('Z').is_some_and(|utc| {
         matches!(utc.len(), 19 | 26)
@@ -90,6 +91,7 @@ fn is_curated_timestamp(timestamp: &str) -> bool {
                 4 | 7 => b == b'-',
                 10 => b == b'T',
                 13 | 16 => b == b':',
+                17 => matches!(b, b'0'..=b'5'),
                 19 => b == b'.',
                 _ => b.is_ascii_digit(),
             })
