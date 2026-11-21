@@ -48,9 +48,11 @@ struct Entry {
     order: u64,
     sequence: u64,
     online_until: u64,
-    retain_until: u64,
+    created_at: u64,
 }
 
+/// Replay protection is instance-local. A future adapter must preserve the
+/// sequence markers across replacement or invalidate those login sessions.
 pub struct Presence {
     owner: String,
     last_order: u64,
@@ -93,7 +95,7 @@ impl Presence {
         // Expired presence is hidden, but sequence high-water marks survive
         // until even a refreshed credential for that session cannot be valid.
         self.devices
-            .retain(|_, entry| session.now < entry.retain_until);
+            .retain(|_, entry| session.now < entry.created_at.saturating_add(MAX_SESSION_SECS));
         if self.devices.len() >= MAX_DEVICES {
             return Err(PresenceError::Capacity);
         }
@@ -107,22 +109,41 @@ impl Presence {
                 order,
                 sequence,
                 online_until,
-                retain_until: claims.created_at.saturating_add(MAX_SESSION_SECS),
+                created_at: claims.created_at,
             },
         );
         self.last_order = order;
         Ok(())
     }
 
-    pub fn online(&self, session: PresenceSession<'_>) -> Result<Vec<OnlineDevice>, PresenceError> {
+    /// Resolve candidate peers from a fresh, owner-scoped server snapshot.
+    /// Missing or invalid rows are offline without changing sequence markers.
+    pub fn online<'a>(
+        &self,
+        session: PresenceSession<'_>,
+        mut peer_row: impl FnMut(&str) -> Option<&'a SessionRecord>,
+    ) -> Result<Vec<OnlineDevice>, PresenceError> {
         let claims = self.verify_owner(&session)?;
         let mut online: Vec<_> = self
             .devices
             .iter()
             .filter(|(_, entry)| session.now < entry.online_until)
-            .map(|(id, entry)| OnlineDevice {
-                order: entry.order,
-                is_current: id == &claims.session_id,
+            .filter_map(|(id, entry)| {
+                let is_current = id == &claims.session_id;
+                let row = if is_current {
+                    session.current_row
+                } else {
+                    peer_row(id)
+                }?;
+                (row.id == *id
+                    && row.user_id == self.owner
+                    && row.created_at == entry.created_at
+                    && !row.revoked
+                    && session.now < row.expires_at)
+                    .then_some(OnlineDevice {
+                        order: entry.order,
+                        is_current,
+                    })
             })
             .collect();
         online.sort_unstable_by_key(|device| device.order);
@@ -168,6 +189,13 @@ mod tests {
             }
         }
 
+        fn refresh(&mut self, now: u64, ttl: u64) {
+            let keys = SessionKeys::single(&TEST_KEY);
+            self.token = rotate_session(&keys, &self.token, now, ttl).unwrap();
+            self.row.rotation_counter += 1;
+            self.row.expires_at = now + ttl;
+        }
+
         fn auth(&self, now: u64) -> PresenceSession<'_> {
             PresenceSession {
                 keys: SessionKeys::single(&TEST_KEY),
@@ -204,7 +232,10 @@ mod tests {
                 presence.heartbeat(auth(), 2),
                 Err(PresenceError::InvalidSession)
             );
-            assert_eq!(presence.online(auth()), Err(PresenceError::InvalidSession));
+            assert_eq!(
+                presence.online(auth(), |_| panic!("invalid caller")),
+                Err(PresenceError::InvalidSession)
+            );
         }
         assert_eq!(presence.devices[&session.row.id].sequence, 1);
     }
@@ -220,15 +251,17 @@ mod tests {
             presence.heartbeat(foreign.auth(START), 1),
             Err(PresenceError::WrongOwner)
         );
+        presence.heartbeat(second.auth(START), 9).unwrap();
         assert_eq!(
-            presence.online(foreign.auth(START)),
+            presence.online(foreign.auth(START), |_| panic!("foreign caller")),
             Err(PresenceError::WrongOwner)
         );
-        presence.heartbeat(second.auth(START), 9).unwrap();
         presence.heartbeat(first.auth(START), 1).unwrap();
         presence.heartbeat(second.auth(START + 1), 10).unwrap();
         assert_eq!(
-            presence.online(first.auth(START + 1)).unwrap(),
+            presence
+                .online(first.auth(START + 1), |_| Some(&second.row))
+                .unwrap(),
             [
                 OnlineDevice {
                     order: 1,
@@ -244,7 +277,7 @@ mod tests {
 
     #[test]
     fn replay_cannot_extend_presence_or_reset_sequence_after_refresh() {
-        let mut device = TestSession::new("alice", START, 100);
+        let mut device = TestSession::new("alice", START, 10);
         let stale_token = device.token.clone();
         let mut presence = Presence::new(device.auth(START)).unwrap();
         assert_eq!(
@@ -253,17 +286,14 @@ mod tests {
         );
         presence.heartbeat(device.auth(START), 7).unwrap();
 
-        let now = START + ONLINE_SECS - 1;
-        let keys = SessionKeys::single(&TEST_KEY);
-        device.token = rotate_session(&keys, &device.token, now, 100).unwrap();
-        device.row.rotation_counter = 1;
-        device.row.expires_at = now + 100;
+        let now = START + 9;
+        device.refresh(now, 100);
         let stale_auth = || PresenceSession {
             token: &stale_token,
             ..device.auth(now)
         };
         assert_eq!(
-            presence.online(stale_auth()),
+            presence.online(stale_auth(), |_| None),
             Err(PresenceError::InvalidSession)
         );
         assert_eq!(
@@ -274,15 +304,28 @@ mod tests {
             presence.heartbeat(device.auth(now), 7),
             Err(PresenceError::StaleSequence)
         );
-        let now = now + 1;
-        assert!(presence.online(device.auth(now)).unwrap().is_empty());
+
+        let now = now + 1; // Original credential expired; new registration runs pruning.
+        let peer = TestSession::new("alice", now, 100);
+        presence.heartbeat(peer.auth(now), 1).unwrap();
+        for stale in [7, 6] {
+            assert_eq!(
+                presence.heartbeat(device.auth(now), stale),
+                Err(PresenceError::StaleSequence)
+            );
+        }
         assert_eq!(
-            presence.heartbeat(device.auth(now), 6),
-            Err(PresenceError::StaleSequence)
+            presence
+                .online(peer.auth(now), |_| Some(&device.row))
+                .unwrap(),
+            [OnlineDevice {
+                order: 2,
+                is_current: true
+            }]
         );
         presence.heartbeat(device.auth(now), 8).unwrap();
         assert_eq!(
-            presence.online(device.auth(now)).unwrap(),
+            presence.online(device.auth(now), |_| None).unwrap(),
             [OnlineDevice {
                 order: 1,
                 is_current: true
@@ -291,13 +334,22 @@ mod tests {
     }
 
     #[test]
-    fn presence_ends_at_session_expiry_even_before_heartbeat_ttl() {
-        let first = TestSession::new("alice", START, 10);
+    fn peer_snapshot_requires_a_live_current_row() {
+        let mut first = TestSession::new("alice", START, 100);
         let second = TestSession::new("alice", START, 100);
         let mut presence = Presence::new(first.auth(START)).unwrap();
         presence.heartbeat(first.auth(START), 1).unwrap();
-        assert_eq!(presence.online(second.auth(START + 9)).unwrap().len(), 1);
-        assert!(presence.online(second.auth(START + 10)).unwrap().is_empty());
+        first.refresh(START + 1, 9);
+        let mut revoked = first.row.clone();
+        revoked.revoked = true;
+        let mut foreign = first.row.clone();
+        foreign.user_id = "bob".into();
+        let snapshot = |now, row| presence.online(second.auth(now), |_| row).unwrap();
+        assert_eq!(snapshot(START + 9, Some(&first.row)).len(), 1);
+        assert!(snapshot(START + 9, Some(&revoked)).is_empty());
+        assert!(snapshot(START + 9, Some(&foreign)).is_empty());
+        assert!(snapshot(START + 9, None).is_empty());
+        assert!(snapshot(START + 10, Some(&first.row)).is_empty());
     }
 
     #[test]
@@ -311,7 +363,10 @@ mod tests {
         }
         let now = START + ONLINE_SECS;
         let extra = TestSession::new("alice", now, 100);
-        assert!(presence.online(extra.auth(now)).unwrap().is_empty());
+        assert!(presence
+            .online(extra.auth(now), |_| panic!("expired heartbeat"))
+            .unwrap()
+            .is_empty());
         assert_eq!(
             presence.heartbeat(extra.auth(now), 1),
             Err(PresenceError::Capacity)
@@ -326,7 +381,7 @@ mod tests {
         presence.heartbeat(fresh.auth(now), 1).unwrap();
         assert_eq!(presence.devices.len(), 1);
         assert_eq!(
-            presence.online(fresh.auth(now)).unwrap(),
+            presence.online(fresh.auth(now), |_| None).unwrap(),
             [OnlineDevice {
                 order: MAX_DEVICES as u64 + 1,
                 is_current: true
