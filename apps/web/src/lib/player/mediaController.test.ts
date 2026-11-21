@@ -66,7 +66,6 @@ function compactTransport() {
 }
 
 const coralSource = { streamUrl: '/coral', isCurrent: () => true };
-
 test('queue Play reports a decoder error once, including queue counts', async () => {
 	const { audio, media, announce, status } = compactTransport();
 	const pending = audio.deferPlay();
@@ -99,8 +98,7 @@ test.each(['playing', 'blocked'])('same-track queue Play shares a pending compac
 test('compact Play starts in the gesture, deduplicates pending Play, and reads native settlement', async () => {
 	const { audio, media, status } = compactTransport();
 	expect(status()).toBe('paused');
-	const pending = audio.deferPlay();
-	const attempt = media.playCurrent();
+	const pending = audio.deferPlay(), attempt = media.playCurrent();
 	expect(audio.play).toHaveBeenCalledOnce();
 	audio.emit('play');
 	await media.playCurrent();
