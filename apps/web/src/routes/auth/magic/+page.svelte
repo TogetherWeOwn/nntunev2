@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient, ApiError } from '#lib/api/client.js';
+	import { ApiClient, ApiError, StaleSessionError } from '#lib/api/client.js';
 	import { invalidateLibraryCache } from '#lib/library/cache.js';
 	import {
 		clearSignedInEmail,
@@ -22,8 +22,7 @@
 	// signed in and can sign out to redeem the other link.
 	let signedInEmail = $state<string | null>(null);
 	let signingOut = $state(false);
-	// Shown only when POST /v1/session/logout fails: the HttpOnly cookie
-	// (the real session) is untouched, so the recovery button must stay.
+	let sessionChanged = $state(false);
 	let signOutError = $state<string | null>(null);
 
 	// Only a branch change schedules entry focus. Same-branch logout updates
@@ -105,10 +104,13 @@
 		} catch (error) {
 			if (!mounted) return;
 			if (!(error instanceof ApiError && error.status === 401)) {
-				// The HttpOnly cookie is the real session and it is untouched,
-				// so a failed logout must NOT clear the label or show success:
-				// keep the button and surface the failure instead.
 				signOutError = 'Could not sign out. Try again.';
+				if (error instanceof StaleSessionError) {
+					clearSignedInEmail();
+					signedInEmail = null;
+					sessionChanged = true;
+					signOutError = 'The browser session changed. Nothing was signed out.';
+				}
 				signingOut = false;
 				return;
 			}
@@ -198,7 +200,7 @@
 				? 'Signing out…'
 				: signedInEmail !== null
 					? `Sign out ${signedInEmail}`
-					: 'Sign out and try this link again'}
+					: sessionChanged ? 'Sign out the current browser session' : 'Sign out and try this link again'}
 		</button>
 	{/if}
 </main>

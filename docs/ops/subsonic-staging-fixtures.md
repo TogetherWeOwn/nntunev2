@@ -97,8 +97,14 @@ It does not waive DB or health checks, and any reported resource exceedance or
 termination still stops admission. Reconciliation needs clean coverage through
 client termination within two minutes of load close (three seconds in live
 mode), without extending the five-minute job deadline or holding up restore.
-This policy has no collectors or live entrypoint; it does not prove provider
-coverage or cleanup.
+The read-only observer exposes a one-shot pressure sample for a future
+executor. It reuses the fixed query, validates the database clock and counts,
+and limits the call to the earlier of the caller's monotonic deadline and the
+three-second freshness bound. It reports the start of the query's local time
+bracket, not its receipt time: a query started at or before a drain fence
+cannot clear it by returning later. Nothing calls this helper in a live load
+window yet. Health and resource collectors, live provider coverage and live
+cleanup remain unverified.
 
 ### Version-fenced restore rehearsal (offline)
 
@@ -130,10 +136,16 @@ fixture receipt (intentional exit or native interrupt), runs the restore
 rehearsal, and checks that the synthetic deployment is off and drained. The
 job uses no staging credentials, provider calls or live traffic.
 
-A step timeout is not cancellation of the entire job or workflow. Forced
-cancellation or runner loss can prevent finalizer execution. This test does
-not establish live restore or drain, and UTC expiry alone cannot supply that
-proof.
+The same CI job also kills a synthetic producer with `SIGKILL` after it writes
+its active state, before it can write a stop receipt. A fresh process reads that
+state and must observe synthetic off readback and a zero backend count after
+client cancellation. The backend remains busy through the first sample, so
+clearing local clients alone cannot pass the rehearsal.
+
+Neither rehearsal cancels the whole workflow or loses its runner. The
+synthetic state stays on the same filesystem; a live recovery path would need
+state available after runner loss and a restore fence that protects newer
+staging deployments. UTC expiry does not establish live restore or drain.
 
 ### Independent UTC expiry (disposable release Fetch)
 
