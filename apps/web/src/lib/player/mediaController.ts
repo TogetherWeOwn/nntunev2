@@ -8,6 +8,7 @@ import type { createQueueController, QueuedPlaySource } from './queueController.
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
 import { createNativeSound } from './nativeSound.js';
 import { createPendingShareSeek } from './pendingShareSeek.js';
+import { createLivePlaybackSpeed } from './livePlaybackSpeed.js';
 import { restartIsAvailable } from './restartAvailability.js';
 import { bindSystemTransport } from './systemTransport.js';
 import type { ShareTarget } from './shareTimestamp.js';
@@ -104,6 +105,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		return { audio, attachment, matches };
 	}
 
+	const speed = createLivePlaybackSpeed(transportTarget);
+
 	async function startCurrent(retry: boolean): Promise<void> {
 		const target = transportTarget();
 		if (!target || pendingPlay) return;
@@ -131,7 +134,11 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					readPlayback(audio, matchesAttempt, 'starting');
 					return;
 				}
+				const rateTarget = { audio, matches: matchesAttempt };
+				const liveRate = speed.read(rateTarget);
+				if (!matchesAttempt()) return;
 				load.call(audio);
+				speed.reapply(rateTarget, liveRate); // load() resets playbackRate.
 				if (!matchesAttempt()) return;
 			}
 			// Stay in the gesture, on the same decoder. Only explicit Retry can reload it.
@@ -210,6 +217,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		invalidatePlay();
 		absoluteSeek.set({ ...emptySeek, attachment: attachmentVersion });
 		playbackStatus.set('unavailable');
+		speed.retire();
 		return previous?.audio;
 	}
 
@@ -503,7 +511,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const track = currentTrack(result.queue);
 		const streamUrl = resolveStreamUrl(track);
 		const replacing = currentTrack(base)?.id !== track?.id || source !== streamUrl;
-		const { playbackRate } = audio;
+		const playbackRate = speed.observe({ audio, matches: ownsOrigin });
 		if (!ownsOrigin()) return;
 		// Queue commit captures sound for replacements; replay keeps this attachment.
 		if (!replacing) sound.observe();
@@ -526,11 +534,11 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const matches = () => matchesSource(target, streamUrl, isCurrent);
 		try {
 			if (!matches()) return;
-			target.playbackRate = playbackRate;
 			runPosition(() => { if (matches()) target.currentTime = 0; });
 			if (!matches()) return;
 			clearJumpFeedback();
 			const play = target.play;
+			if (replacing && playbackRate !== null) speed.reapply({ audio: target, matches }, playbackRate);
 			if (!matches()) return;
 			await play.call(target);
 			// A captured play promise can fulfill before the queued pause event runs.
@@ -551,6 +559,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		absoluteSeek: { subscribe: absoluteSeek.subscribe }, seek,
 		playbackStatus: { subscribe: playbackStatus.subscribe },
 		playCurrent, pauseCurrent, retryCurrent: () => startCurrent(true),
+		speed,
 		clearSeekFeedback,
 		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
 			let value: string | null | undefined;
@@ -626,6 +635,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 						case 'error':
 							if (audio.error === null) return;
 							break;
+						case 'ratechange': return speed.observe({ audio, matches });
 						case 'ended': return handleEnded(receipt, source, matches);
 						case 'seeked': return;
 						case 'seeking': {
@@ -657,6 +667,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					else invalidatePlay();
 					readPlayback(audio, matches, get(playbackStatus));
 				};
+				audio.addEventListener('ratechange', observe, { signal: receipt.listeners.signal });
 				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'emptied', 'seeking',
 					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate', 'seeked']) {
 					audio.addEventListener(type, (event) => {
@@ -668,6 +679,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			}
 			lastJumpTarget = undefined;
 			listenForNativeEvents();
+			speed.attach();
 			const target = transportTarget();
 			if (target?.attachment === receipt) {
 				sound.connect(audio, target.matches, receipt.listeners.signal);

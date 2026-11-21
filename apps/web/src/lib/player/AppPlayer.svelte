@@ -6,6 +6,7 @@
 	import { resolveStreamUrl } from '../library/stream-url.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
+	import PlaybackSpeedControl from './PlaybackSpeedControl.svelte';
 	import ShortcutHelp from './ShortcutHelp.svelte';
 	import SleepTimerControls from './SleepTimerControls.svelte';
 	import VolumeControls from './VolumeControls.svelte';
@@ -24,6 +25,7 @@
 	const player = setAppPlayer(Object.assign(controller, { currentFavorite: createCurrentTrackFavorite(controller.queue),
 		claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
 	const { queue, media, media: { seekFeedback, playbackStatus, absoluteSeek } } = player;
+	const { speed, speed: { state: speedState } } = media;
 	const attachNativeAudio = media.attach;
 	const sound = media.sound.state;
 	const currentTrack = $derived(queueCurrentTrack($queue));
@@ -49,7 +51,9 @@
 	});
 	// Library's pre-effect disposes route state before player teardown.
 	onMount(() => {
-		media.restoreRepeat(browserStorage('local'));
+		const storage = browserStorage('local');
+		media.restoreRepeat(storage);
+		media.speed.restore(storage);
 		return () => { clearMiniPlayerHint(); player.destroy(); };
 	});
 </script>
@@ -71,6 +75,10 @@
 	</div>
 {/if}
 {#if streamUrl}
+	<div class="nt-wrap">
+		<PlaybackSpeedControl value={$speedState.rate === null ? null : String($speedState.rate)}
+			feedback={$speedState.feedback} onchange={(control) => { control.value = String(speed.set(Number(control.value)) ?? ''); }} />
+	</div>
 	<section class="nt-wrap" aria-label="Sleep timer">
 		<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
 	</section>
