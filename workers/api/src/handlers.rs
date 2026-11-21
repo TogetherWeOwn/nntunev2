@@ -18134,6 +18134,17 @@ mod tests {
             stripe_signature: None,
             body: Vec::new(),
         };
+        let ctx = h.ctx();
+        let transport = |req: &Request, binding: Option<&str>| {
+            let headers = binding
+                .map(|value| HashMap::from([("x-nntune-session-binding".into(), value.into())]))
+                .unwrap_or_default();
+            block_on(crate::worker_entry::handle_with_transport_headers(
+                &ctx,
+                req.clone(),
+                &headers,
+            ))
+        };
         for cookie in [replacement, other_account] {
             let current = current_likes_binding(&h, &cookie);
             let combined = format!("{current}, {stale}");
@@ -18146,13 +18157,13 @@ mod tests {
                     Some(stale.as_str()),
                     Some(combined.as_str()),
                 ] {
-                    let resp = block_on(handle_with_session_binding(&h.ctx(), &req, expected));
+                    let resp = transport(&req, expected);
                     assert_eq!(
                         (resp.status, resp.body.as_str()),
                         (412, r#"{"error":"session binding mismatch"}"#)
                     );
                 }
-                let matched = block_on(handle_with_session_binding(&h.ctx(), &req, Some(&current)));
+                let matched = transport(&req, Some(&current));
                 assert_eq!(matched.status, 503);
             }
         }
@@ -21036,16 +21047,18 @@ mod tests {
             stripe_signature: None,
             body: Vec::new(),
         };
+        let headers = media_type
+            .map(|value| HashMap::from([("content-type".into(), value.into())]))
+            .unwrap_or_default();
         block_on(crate::worker_entry::dispatch_collected(
             crate::worker_entry::CollectedBody::Complete(body.as_bytes().to_vec()),
             request,
-            |collected_request| async move {
-                crate::worker_entry::handle_with_refresh_transport_guard(
+            |collected_request| {
+                crate::worker_entry::handle_with_transport_headers(
+                    &ctx,
                     collected_request,
-                    media_type,
-                    |guarded_request| async move { handle(&ctx, &guarded_request).await },
+                    &headers,
                 )
-                .await
             },
         ))
     }
@@ -21129,16 +21142,15 @@ mod tests {
         assert_eq!(legacy.status, 200);
         assert!(h.store.refresh_retries.borrow().is_empty());
         let source = strip_line_comments(include_str!("worker_entry.rs"));
-        let dispatch = source.split_once("pub async fn dispatch(").unwrap().1;
-        assert!(dispatch.contains("headers_map.get(\"content-type\")"));
-        let normalized = dispatch.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(normalized.contains(
-            "handle_with_refresh_transport_guard( collected_request, refresh_content_type.as_deref(),"
-        ));
-        let guard = dispatch
-            .find("handle_with_refresh_transport_guard")
+        let transport = source
+            .split_once("async fn handle_with_transport_headers<")
+            .unwrap()
+            .1;
+        assert!(transport.contains("headers.get(\"content-type\")"));
+        let guard = transport
+            .find("handlers::refresh_transport_rejection(")
             .unwrap();
-        let handle = dispatch
+        let handle = transport
             .find("handlers::handle_with_session_binding(")
             .unwrap();
         assert!(
