@@ -2,7 +2,7 @@ import type { ApiClient } from '../api/client.js';
 import { validBinding } from './session-verification.js';
 
 export type TasteSignal = 'dislike' | 'hide' | 'ban' | 'snooze';
-export type TrackTaste = { signal: TasteSignal; until: number | null };
+export type TrackTaste = { signal: TasteSignal | 'love'; until: number | null };
 
 const PATH = '/v1/me/taste/session';
 const MAX_TASTE_ROWS = 500;
@@ -17,13 +17,12 @@ function record(value: unknown): Record<string, unknown> {
 	return value as Record<string, unknown>;
 }
 
-function preference({ signal, until }: Record<string, unknown>): TrackTaste | null {
+function preference({ signal, until }: Record<string, unknown>): TrackTaste {
 	if (signal === 'snooze' && typeof until === 'number' && Number.isSafeInteger(until) && until > 0) {
 		return { signal, until };
 	}
-	if (until === null) {
-		if (signal === 'love') return null;
-		if (signal === 'dislike' || signal === 'hide' || signal === 'ban') return { signal, until };
+	if (until === null && (signal === 'love' || signal === 'dislike' || signal === 'hide' || signal === 'ban')) {
+		return { signal, until };
 	}
 	throw new Error('Invalid taste signal');
 }
@@ -33,7 +32,7 @@ export async function loadTrackTaste(client: Pick<ApiClient, 'get'>, binding: st
 	if (result.session_binding !== binding || !Array.isArray(result.items) || result.items.length > MAX_TASTE_ROWS) {
 		throw new Error('Invalid taste list');
 	}
-	const tracks = new Map<string, TrackTaste | null>();
+	const tracks = new Map<string, TrackTaste>();
 	for (const row of result.items) {
 		const item = record(row);
 		if (item.kind === 'release') continue;

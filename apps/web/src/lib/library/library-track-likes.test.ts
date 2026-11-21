@@ -88,15 +88,24 @@ const target = { kind: 'track', target_id: track };
 const hide = { ...target, signal: 'hide', until: null };
 const tasteReply = (row = hide, binding = A) => Response.json({ ...row, session_binding: binding });
 
-it('keeps an explicit Hide editable but does not infer absence from full lists', async () => {
+it('uses explicit Hide over conflicting Likes and explicit Love outside a full Likes list', async () => {
 	const { likes, fetcher, tasteRead } = setup();
-	const others = Array.from({ length: 500 }, (_, i) => ({ ...liked, target_id: `Other_${i}` }));
-	fetcher.mockResolvedValueOnce(list(A, [liked, ...others.slice(1)])).mockResolvedValueOnce(session(A));
-	tasteRead.mockResolvedValueOnce(list(A, [{ ...hide, target_id: tracks[1].id },
-		...others.slice(1).map((item) => ({ ...item, signal: 'love', until: null }))]));
-	await likes.publish(listing(), tracks);
-	expect(likes.controls(track)).toMatchObject({ liked: true, taste: undefined });
-	expect(likes.controls(tracks[1].id)).toMatchObject({ taste: { saved: 'hide' } });
+	const loved = tracks[1].id, omitted = 'Job_C';
+	const others = Array.from({ length: MAX_LIKES - 2 }, (_, i) => ({ ...liked, target_id: `Other_${i}` }));
+	fetcher.mockResolvedValueOnce(list(A, [liked, { ...liked, target_id: omitted }, ...others])).mockResolvedValueOnce(session(A));
+	tasteRead.mockResolvedValueOnce(list(A, [hide, ...[...others, { ...target, target_id: loved }]
+		.map((item) => ({ ...item, signal: 'love', until: null }))]));
+	await likes.publish(listing(), [...tracks, { id: omitted }]);
+	expect(likes.controls(track)).toMatchObject({ liked: false, taste: { saved: 'hide' } });
+	expect(likes.controls(loved)).toMatchObject({ liked: true, taste: { saved: undefined } });
+	expect(likes.controls(omitted)).toMatchObject({ liked: true, taste: undefined });
+
+	fetcher.mockResolvedValueOnce(Response.json({ ...target, cleared: true, session_binding: A })).mockResolvedValueOnce(session(A));
+	await likes.controls(track)!.taste!.set(null);
+	expect(likes.controls(track)).toMatchObject({ liked: false, taste: { saved: undefined } });
+	fetcher.mockResolvedValueOnce(Response.json({ target_id: loved, liked: false }));
+	await likes.controls(loved)!.toggle();
+	expect(likes.controls(loved)).toMatchObject({ liked: false, taste: { saved: undefined } });
 });
 
 it('withholds taste data from a mismatched read without changing verified Likes', async () => {

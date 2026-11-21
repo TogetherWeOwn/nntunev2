@@ -53,7 +53,7 @@ export function createTrackLikeControls(
 		const inFlight = pending;
 		const taste = owner.taste;
 		const saved = taste?.read(id);
-		const visible = saved?.until != null && saved.until <= Date.now() / 1000 ? null : saved;
+		const visible = saved?.signal === 'love' || (saved?.until != null && saved.until <= Date.now() / 1000) ? null : saved;
 		const stillCurrent = () => currentOwner() === owner && owner.readiness() === receipt &&
 			receipt.isCurrent() && owner.liked(id) === liked && taste?.read(id) === saved;
 		const write = async <T,>(start: () => Promise<T>, confirm: (value: T) => void, preference?: typeof taste) => {

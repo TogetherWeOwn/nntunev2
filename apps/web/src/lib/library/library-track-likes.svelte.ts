@@ -6,7 +6,7 @@ import { loadLikes, MAX_LIKES, trackLikeTarget } from './likes.js';
 import type { LibraryRefreshUpdate } from './refresh.js';
 import { verifyLibrarySession } from './session-verification.js';
 import { createTrackLikeControls, type TrackLikeOwner } from './track-like-controls.js';
-import { loadTrackTaste } from './taste.js';
+import { loadTrackTaste, type TrackTaste } from './taste.js';
 
 /** One owner per verified Library listing, shared by Tracks and Queue. */
 export function createLibraryTrackLikes(onInvalidated?: () => void) {
@@ -65,32 +65,29 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 			if (!await check.response) throw new Error('Likes session could not be verified');
 			await guarded(() => {
 				const targets = new Map(items.map(({ id, like_target_id }) => [id, trackLikeTarget(id, like_target_id)]));
-				const liked = new SvelteMap<string, boolean>();
-				for (const item of list.items) if (item.kind === 'track') liked.set(item.targetId, true);
+				const liked = new Set(list.items.filter((item) => item.kind === 'track').map((item) => item.targetId));
 				// A full response cannot prove the absence of an older like.
 				const unlisted = list.items.length < MAX_LIKES ? false : undefined;
-				const preferences = saved && new SvelteMap(saved.tracks);
+				// Explicit taste rows and confirmed writes take precedence over the Likes snapshot.
+				const preferences = new SvelteMap<string, TrackTaste | null>(saved?.tracks);
 				owner = {
 					binding, client, targets, readiness: () => receipt,
-					liked: (id) => liked.get(id) ?? (preferences?.get(id) ? false : unlisted),
+					liked: (id) => preferences.has(id) ? preferences.get(id)?.signal === 'love' : liked.has(id) || unlisted,
 					confirm: (id, confirmedId, value) => {
 						if (id !== confirmedId) return invalidate();
-						liked.set(id, value);
-						if (value) preferences?.set(id, null);
+						preferences.set(id, value ? { signal: 'love', until: null } : null);
 						feedback = '';
 					},
 					failed: (_id, error, taste) => {
 						if (error instanceof ApiError && [401, 403, 412].includes(error.status)) invalidate();
 						else feedback = `Could not confirm that ${taste ? 'track preference' : 'Like'} change. Try again or refresh the library.`;
 					},
-					taste: preferences && {
-						read: (id) => preferences.has(id) ? preferences.get(id) : saved?.complete ? null : undefined,
+					taste: saved && {
+						read: (id) => preferences.has(id) ? preferences.get(id) : saved.complete ? null : undefined,
 						verify: () => verifyLibrarySession(binding, signal),
 						invalidate,
 						confirm: (id, value) => {
 							preferences.set(id, value);
-							// These actions replace/delete the same row that backs Like.
-							liked.set(id, false);
 							feedback = value ? 'Track preference saved to your account.' : 'Track preference cleared.';
 						}
 					}
