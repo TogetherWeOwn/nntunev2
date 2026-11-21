@@ -412,7 +412,7 @@ test('[FAVORDER-07] an auth transition purges a pending arrangement and never re
 	await expectIds(page, []);
 	await star(page, 'arr-z').click();
 	await expectIds(page, ['arr-z']);
-	expect(await page.evaluate(({ base, context }) => JSON.parse(localStorage.getItem(`${base}.${context}`) ?? 'null'),
+	await expect.poll(() => page.evaluate(({ base, context }) => JSON.parse(localStorage.getItem(`${base}.${context}`) ?? 'null'),
 		{ base: KEY_BASE, context: nextContext })).toEqual(['arr-z']);
 });
 

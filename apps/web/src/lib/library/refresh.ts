@@ -318,12 +318,12 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
-			binding = response.headers?.get('x-nntune-session-binding') ?? null;
+			const label = (binding = response.headers?.get('x-nntune-session-binding') ?? null);
 			const storage = deps.sessionStorage();
 			if (!isCurrent()) return;
 			const previous = verified?.binding ?? libraryScopeBinding(storage);
-			if (!validBinding(binding) && !(legacyFixture() && !previous && binding === null)) return void refuse();
-			if (previous && previous !== binding) {
+			if (!validBinding(label) && !(legacyFixture() && !previous && label === null)) return void refuse();
+			if (previous && previous !== label) {
 				if (await fence?.run(() => !controller.signal.aborted && refuse(true))) return;
 				return void refuse();
 			}
@@ -336,7 +336,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
 			const commit = () => {
-				const snapshot = saveSnapshot(storage, fresh, undefined, !binding);
+				const snapshot = saveSnapshot(storage, fresh, undefined, !label);
 				if (!isCurrent()) return;
 				authenticatedThisLoad = true;
 				inMemorySnapshot = { ...snapshot, items: fresh };
@@ -344,8 +344,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				state.staleAt = null;
 				authoritative = true;
 			};
-			if (!binding) return commit();
-			const label = binding;
+			if (!label) return commit();
 			// Start verification under the lock, but never hold it over the wire.
 			const started = await fence?.run(() => {
 				if (!isCurrent() || controller.signal.aborted) return;
@@ -393,12 +392,6 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	 * status), drop snapshots and memory, and enter the sign-in-required
 	 * presentation. Never requests, rebroadcasts, navigates or retries.
 	 */
-	function notifyAccessRefused(): void {
-		clearToasts();
-		if (deps.onAccessRefused) deps.onAccessRefused();
-		else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
-	}
-
 	function applyAuthTransition(replaced = true, notify = false, status?: number): void {
 		if (disposed) return;
 		const isCurrent = startReceipt();
@@ -408,7 +401,11 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		authenticatedThisLoad = false;
 		verified = undefined;
 		inMemorySnapshot = null;
-		if (replaced && notify) notifyAccessRefused();
+		if (replaced && notify) {
+			clearToasts();
+			if (deps.onAccessRefused) deps.onAccessRefused();
+			else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
+		}
 		if (status) deps.invalidateLibraryCache();
 		else if (replaced) clearSnapshot(deps.sessionStorage());
 		if (!isCurrent()) return;

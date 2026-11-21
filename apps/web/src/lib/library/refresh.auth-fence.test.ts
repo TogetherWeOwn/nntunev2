@@ -14,6 +14,13 @@ function storage() {
 function setup() {
 	const local = storage(), session = storage();
 	vi.stubGlobal('window', { localStorage: local, sessionStorage: session });
+	// Model non-queuing readers without relying on Node's Web Locks support.
+	let writerHeld = false;
+	vi.stubGlobal('navigator', { locks: { async request<T>(name: string, options: LockOptions | LockGrantedCallback<T>, read: LockGrantedCallback<T>) {
+		if (typeof options !== 'function') return read(writerHeld ? null : {} as Lock);
+		writerHeld = name === AUTH_LOCK;
+		try { return await options({} as Lock); } finally { writerHeld = false; }
+	} } });
 	const verify = vi.fn(async () => proof());
 	vi.stubGlobal('fetch', verify);
 	let update: LibraryRefreshUpdate;
