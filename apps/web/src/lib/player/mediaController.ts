@@ -684,7 +684,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (target?.attachment === receipt) {
 				sound.connect(audio, target.matches, receipt.listeners.signal);
 				readPlayback(audio, target.matches, 'starting');
-				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
+				bindSystemTransport(queue, audio, () => target.matches() ? currentTrack(queue.snapshot) : null,
 					{ playCurrent, pauseCurrent }, receipt.listeners.signal);
 			}
 			observePosition();
