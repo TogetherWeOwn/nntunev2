@@ -8,7 +8,7 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
-import { beginAuthMutation } from '../auth-fence.js';
+import { runAuthMutation } from '../auth-fence.js';
 import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import { isJsonBodyTooLarge, readCappedJson } from './cappedJson.js';
 import { parseErrorBody } from './errors.js';
@@ -463,18 +463,16 @@ export class ApiClient {
 			timedOut = true;
 			controller.abort(new DOMException(`request timed out after ${API_REQUEST_TIMEOUT_MS}ms`, 'TimeoutError'));
 		}, API_REQUEST_TIMEOUT_MS);
-		let finishAuthMutation: (() => void) | undefined;
 		try {
 			callerSignal?.throwIfAborted();
-			if (init.method === 'POST' && COOKIE_MUTATIONS.has(path)) {
-				finishAuthMutation = beginAuthMutation();
-			}
-			const response = await this.fetchFn(`${this.baseUrl}${path}`, {
+			const dispatch = () => this.fetchFn(`${this.baseUrl}${path}`, {
 				...init,
 				signal: controller.signal,
 				headers,
 				credentials: 'include'
 			});
+			const response = await (init.method === 'POST' && COOKIE_MUTATIONS.has(path)
+				? runAuthMutation(controller.signal, dispatch) : dispatch());
 			// A transport may ignore abort; never publish an abandoned response.
 			callerSignal?.throwIfAborted();
 			if (!response.ok) {
@@ -533,7 +531,6 @@ export class ApiClient {
 			if (timedOut) throw this.timeoutError();
 			throw error;
 		} finally {
-			finishAuthMutation?.();
 			clearTimeout(timer);
 			callerSignal?.removeEventListener('abort', onCallerAbort);
 		}

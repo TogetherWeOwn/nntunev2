@@ -1,68 +1,53 @@
-// Non-credential state shared by tabs on the app origin. Storage events are
-// useful for UI resets, but neither starting nor checking a receipt uses them.
+// The browser releases this origin-wide lock even if a writer tab closes.
 export const AUTH_GENERATION_KEY = 'nntune.auth.generation.v1';
-const pendingPrefix = `${AUTH_GENERATION_KEY}.pending.`;
-const blockedKey = `${AUTH_GENERATION_KEY}.blocked`;
-let localPending = 0;
-let storageFailed = false;
+export const AUTH_LOCK = 'nntune.auth.cookie-transition.v1';
+let localEpoch = 0;
+let pending = 0;
 
-const rejected = () => false;
-
-/** Capture before starting trusted work; check again at its commit point. */
-export function captureAuthFence(): () => boolean {
-	function idleGeneration(initialize: boolean): string | null {
-		if (localPending || storageFailed) return null;
-		try {
-			const storage = window.localStorage;
-			let generation = storage.getItem(AUTH_GENERATION_KEY);
-			if (generation === null && initialize) {
-				generation = crypto.randomUUID();
-				storage.setItem(AUTH_GENERATION_KEY, generation);
-			}
-			if (!generation || Object.keys(storage).some((key) => key.startsWith(pendingPrefix))) {
-				return null;
-			}
-			// A writer might have started while we were scanning the pending keys.
-			return storage.getItem(AUTH_GENERATION_KEY) === generation && storage.getItem(blockedKey) === null
-				? generation : null;
-		} catch {
-			return null;
-		}
-	}
-
-	const generation = idleGeneration(true);
-	return generation ? () => idleGeneration(false) === generation : rejected;
+function generation(): string | null {
+	try { return window.localStorage.getItem(AUTH_GENERATION_KEY); }
+	catch { return null; }
 }
 
-/** Mark synchronously before dispatching a cookie-mutating browser request. */
-export function beginAuthMutation(): () => void {
-	if (typeof window === 'undefined') return () => {};
-	localPending++;
-	let storage: Storage | undefined;
-	let pending: string | undefined;
-	let published = false;
+async function tryLock<T>(work: () => T): Promise<T | undefined> {
 	try {
-		storage = window.localStorage;
-		const generation = crypto.randomUUID();
-		pending = `${pendingPrefix}${generation}`;
-		storage.setItem(pending, '');
-		// Even a failed HTTP request retires old receipts. Separate pending
-		// keys let overlapping requests settle without clearing each other.
-		if (storage.getItem(AUTH_GENERATION_KEY) !== '') {
-			storage.setItem(AUTH_GENERATION_KEY, generation);
+		return await globalThis.navigator?.locks?.request(AUTH_LOCK, { ifAvailable: true },
+			(lock) => lock && !pending ? work() : undefined);
+	} catch { return undefined; }
+}
+
+/** Use run() for trusted dispatch, publication and storage commits, not just a receipt check. */
+export function captureAuthFence() {
+	if (typeof window === 'undefined' || !globalThis.navigator?.locks) return;
+	return tryLock(() => {
+		let id = generation();
+		if (!id) {
+			id = crypto.randomUUID();
+			window.localStorage.setItem(AUTH_GENERATION_KEY, id);
 		}
-		published = true;
-	} catch {
-		storageFailed = true;
-		// Quota can refuse a new key even though shrinking the generation
-		// value works. Quarantine instead of leaving an old receipt valid.
-		try { storage?.setItem(AUTH_GENERATION_KEY, ''); } catch { /* Storage is blocked. */ }
-		// A separate flag survives a generation write already underway in another tab.
-		try { storage?.setItem(blockedKey, ''); } catch { /* Generation remains closed. */ }
-	}
-	return () => {
-		localPending--;
-		// Without a published generation, don't make any written marker disappear.
-		try { if (published && pending) storage?.removeItem(pending); } catch { /* Leave the fence closed. */ }
+		const epoch = localEpoch;
+		const isCurrent = () => !pending && epoch === localEpoch && generation() === id;
+		return { isCurrent, run: <T>(work: () => T) => tryLock(() => isCurrent() ? work() : undefined) };
+	});
+}
+
+/** Mark before dispatch and hold until fetch settles (including response cookies). */
+export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Promise<T>): Promise<T> {
+	if (typeof window === 'undefined') return dispatch();
+	localEpoch++;
+	pending++;
+	const send = () => {
+		signal.throwIfAborted();
+		try { window.localStorage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID()); }
+		catch {
+			// Removal doesn't need quota. A later capture must initialize a NEW generation.
+			try { window.localStorage.removeItem(AUTH_GENERATION_KEY); } catch { /* Storage blocked. */ }
+		}
+		return dispatch();
 	};
+	try {
+		const locks = globalThis.navigator?.locks;
+		// Without Web Locks, auth remains available but trusted reads fail closed.
+		return await (locks ? locks.request(AUTH_LOCK, { signal }, send) : send());
+	} finally { pending--; }
 }

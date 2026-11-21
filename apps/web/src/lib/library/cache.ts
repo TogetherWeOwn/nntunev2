@@ -49,19 +49,20 @@ export const LIBRARY_FAVORITES_KEY = 'nntune.library.favorites.v1';
  */
 export const LIBRARY_RECENT_FINDS_KEY = 'nntune.library.recent-finds.v1';
 
-function readScopeBinding(session: SnapshotStorage, context: string): string | null {
-	const raw = session.getItem(LIBRARY_SESSION_BINDING_KEY);
-	if (raw === null) return null;
-	const proof: unknown = JSON.parse(raw);
-	return Array.isArray(proof) && proof.length === 2 && proof[0] === context &&
-		typeof proof[1] === 'string' && proof[1] ? proof[1] : null;
+export function libraryScopeBinding(session: SnapshotStorage | null): string | null {
+	try {
+		const context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY);
+		const proof: unknown = JSON.parse(session?.getItem(LIBRARY_SESSION_BINDING_KEY) ?? 'null');
+		return context && Array.isArray(proof) && proof.length === 2 && proof[0] === context &&
+			typeof proof[1] === 'string' && proof[1] ? proof[1] : null;
+	} catch { return null; }
 }
 
 /** Recheck provenance at use time; a label binding alone never authorizes import. */
 export function verifiedFavoritesKey(session: SnapshotStorage | null, binding: string): string | null {
 	try {
 		const context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY);
-		return session && context && readScopeBinding(session, context) === binding
+		return context && libraryScopeBinding(session) === binding
 			? `${LIBRARY_FAVORITES_KEY}.${context}` : null;
 	} catch {
 		return null;
@@ -73,21 +74,15 @@ export function establishVerifiedLibraryScope(
 	session: SnapshotStorage | null,
 	local: SnapshotStorage | null,
 	binding: string
-): 'unchanged' | 'replaced' {
-	if (!session) return 'unchanged';
+): void {
 	try {
-		const current = session.getItem(LIBRARY_AUTH_CONTEXT_KEY);
-		if (current) {
-			const previous = readScopeBinding(session, current);
-			return previous && previous !== binding ? 'replaced' : 'unchanged';
-		}
+		if (!session || session.getItem(LIBRARY_AUTH_CONTEXT_KEY)) return;
 		const context = crypto.randomUUID();
-		if (local?.getItem(`${LIBRARY_FAVORITES_KEY}.${context}`) !== null) return 'unchanged';
+		if (local?.getItem(`${LIBRARY_FAVORITES_KEY}.${context}`) !== null) return;
 		// Publish the context last; a failed write leaves no usable provenance.
 		session.setItem(LIBRARY_SESSION_BINDING_KEY, JSON.stringify([context, binding]));
 		session.setItem(LIBRARY_AUTH_CONTEXT_KEY, context);
 	} catch { /* No import provenance without readable and writable storage. */ }
-	return 'unchanged';
 }
 
 function snapshotKey(storage: SnapshotStorage | null, createContext = false): string | null {

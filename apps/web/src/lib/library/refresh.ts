@@ -6,6 +6,7 @@ import {
 	clearSnapshot,
 	establishVerifiedLibraryScope,
 	LIBRARY_AUTH_TRANSITION_KEY,
+	libraryScopeBinding,
 	loadSnapshot,
 	saveSnapshot,
 	toLibraryItems,
@@ -35,7 +36,7 @@ export interface LibraryRefreshUpdate {
 	isCurrent: () => boolean;
 	/** A successful response or an explicit invalidation, never cached fallback. */
 	authoritative: boolean;
-	/** The Library scope was revoked before publishing this empty view. */
+	/** Library access is suspended or the scope was revoked. */
 	authBoundary: boolean;
 	/** Verified binding for these Library rows; not device import provenance. */
 	sessionBinding?: string;
@@ -95,7 +96,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		requiresSignIn: false
 	};
 	let authenticatedThisLoad = false;
-	let verified: { binding: string; isStillAuth: () => boolean } | undefined;
+	let verified: { binding: string; fence: NonNullable<Awaited<ReturnType<typeof captureAuthFence>>> } | undefined;
 	let inMemorySnapshot: LibrarySnapshot | null = null;
 	let activeRequest: AbortController | null = null;
 	let requestGeneration = 0;
@@ -109,7 +110,6 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	async function refresh(fetchFn: typeof fetch = fetch): Promise<void> {
 		if (disposed || activeRequest) return;
 		const isCurrent = startReceipt();
-		const isStillAuth = captureAuthFence();
 		const controller = new AbortController();
 		activeRequest = controller;
 		state.loading = true;
@@ -244,8 +244,29 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			}, timeoutMs);
 		});
 
+		function publish(): void {
+			if (!isCurrent()) return;
+			if (activeRequest === controller) activeRequest = null;
+			state.loading = false;
+			const fence = verified?.fence;
+			deps.onStateChange?.(state, {
+				isCurrent: () => isCurrent() && (!fence || fence.isCurrent()),
+				authoritative, authBoundary,
+				sessionBinding: authoritative ? binding ?? undefined : undefined,
+				deviceScope
+			});
+		}
+
+		function refuse(replaced = false): true {
+			if (isCurrent()) applyAuthTransition(replaced, true);
+			return true;
+		}
+
 		try {
 			deps.onStateChange?.(state, { isCurrent, authoritative: false, authBoundary: false });
+			if (!isCurrent()) return;
+			const capture = captureAuthFence();
+			const fence = capture && await Promise.race([capture, timeout, aborted]);
 			if (!isCurrent()) return;
 			const fetchPromise = fetchFn('/api/library', {
 				credentials: 'include',
@@ -305,85 +326,74 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					: 'You do not have access to this library.';
 				authoritative = true;
 				authBoundary = true;
-				if (deps.onAccessRefused) deps.onAccessRefused();
-				else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
+				notifyAccessRefused();
 				deps.invalidateLibraryCache();
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
-			const payload = await Promise.race([readJsonBody(response), timeout, aborted]);
-			if (!isCurrent() || controller.signal.aborted) {
-				cancelResponse(response);
+			binding = response.headers?.get('x-nntune-session-binding') ?? null;
+			const storage = deps.sessionStorage();
+			if (!isCurrent()) return;
+			const previous = verified?.binding ?? libraryScopeBinding(storage);
+			if (previous && previous !== binding) {
+				if (!binding || !await fence?.run(() => !controller.signal.aborted && refuse(true))) refuse();
 				return;
 			}
+			const payload = await Promise.race([readJsonBody(response), timeout, aborted]);
+			if (!isCurrent() || controller.signal.aborted) return;
 			activeResponse = null;
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
-			binding = response.headers?.get('x-nntune-session-binding') ?? null;
-			if (binding) {
-				if (!isStillAuth()) return applyAuthTransition();
-				const verify = deps.verifySession ?? verifyLibrarySession;
-				const matches = await Promise.race([verify(binding, controller.signal), timeout, aborted]);
+			const commit = () => {
+				const snapshot = saveSnapshot(storage, fresh);
+				if (!isCurrent()) return;
+				authenticatedThisLoad = true;
+				inMemorySnapshot = { ...snapshot, items: fresh };
+				state.items = fresh;
+				state.staleAt = null;
+				authoritative = true;
+			};
+			if (!binding) return commit();
+			const label = binding;
+			const verify = deps.verifySession ?? verifyLibrarySession;
+			// Start verification under the lock, but never hold it over the wire.
+			const started = await fence?.run(() => {
 				if (!isCurrent() || controller.signal.aborted) return;
-				if (!matches || !isStillAuth() || (verified && verified.binding !== binding)) {
-					return applyAuthTransition();
-				}
-			} else if (verified) {
-				throw new Error('library response lost its session binding');
-			}
-			const storage = deps.sessionStorage();
-			if (!isCurrent()) return;
-			if (binding) {
-				if (!isStillAuth() || establishVerifiedLibraryScope(storage, browserStorage('local'), binding) === 'replaced') {
-					return applyAuthTransition();
-				}
-				deviceScope = verifiedFavoritesKey(storage, binding) ?? undefined;
-				if (!isStillAuth()) return applyAuthTransition();
-				verified = { binding, isStillAuth };
-			}
-			authenticatedThisLoad = true;
-			state.items = fresh;
-			state.staleAt = null;
-			const persistedSnapshot = saveSnapshot(storage, fresh);
-			if (!isCurrent()) return;
-			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
-			authoritative = true;
+				const result = Promise.race([verify(label, controller.signal), timeout, aborted]);
+				void result.catch(() => {}); // The lock request may resolve after the verifier.
+				return { result };
+			});
+			if (!fence || !started) { refuse(); return; }
+			const matches = await started.result;
+			if (!await fence.run(() => {
+				if (!isCurrent() || controller.signal.aborted) return true;
+				if (!matches) return refuse(true);
+				establishVerifiedLibraryScope(storage, browserStorage('local'), label);
+				deviceScope = verifiedFavoritesKey(storage, label) ?? undefined;
+				verified = { binding: label, fence };
+				commit();
+				publish();
+				return true;
+			})) refuse();
 		} catch {
 			if (!isCurrent()) return;
-			// Do not trust a tab's snapshot until this page has verified its session.
-			const snapshot = authenticatedThisLoad
-				? (inMemorySnapshot ?? loadSnapshot(deps.sessionStorage()))
-				: null;
-			if (!isCurrent()) return;
-			if (snapshot) {
-				state.items = snapshot.items;
-				state.staleAt = snapshot.savedAt;
-			} else {
-				state.items = [];
-				state.staleAt = null;
-				state.loadError = 'Library is not reachable right now.';
-			}
+			const fallback = () => {
+				const snapshot = authenticatedThisLoad ? inMemorySnapshot ?? loadSnapshot(deps.sessionStorage()) : null;
+				if (!isCurrent()) return;
+				state.items = snapshot?.items ?? [];
+				state.staleAt = snapshot?.savedAt ?? null;
+				if (!snapshot) state.loadError = 'Library is not reachable right now.';
+			};
+			if (verified) {
+				if (!await verified.fence.run(() => { fallback(); publish(); return true; })) refuse();
+			} else if (binding) refuse(); else fallback();
 		} finally {
 			if (timeoutId !== undefined) clearTimeout(timeoutId);
 			controller.signal.removeEventListener('abort', onAbort);
 			activeResponse = null;
 			activeReader = null;
 			if (activeRequest === controller) activeRequest = null;
-			if (isCurrent()) {
-				const publishedFence = verified?.isStillAuth;
-				if ((binding && !isStillAuth()) || (publishedFence && !publishedFence())) {
-					applyAuthTransition();
-				} else {
-					state.loading = false;
-					deps.onStateChange?.(state, {
-						isCurrent: () => isCurrent() && (!publishedFence || publishedFence()),
-						authoritative,
-						authBoundary,
-						sessionBinding: authoritative ? binding ?? undefined : undefined,
-						deviceScope
-					});
-				}
-			}
+			if (state.loading) publish();
 		}
 	}
 
@@ -393,7 +403,12 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	 * status), drop snapshots and memory, and enter the sign-in-required
 	 * presentation. Never requests, rebroadcasts, navigates or retries.
 	 */
-	function applyAuthTransition(): void {
+	function notifyAccessRefused(): void {
+		if (deps.onAccessRefused) deps.onAccessRefused();
+		else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
+	}
+
+	function applyAuthTransition(replaced = true, notify = false): void {
 		if (disposed) return;
 		const isCurrent = startReceipt();
 		activeRequest?.abort();
@@ -402,7 +417,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		authenticatedThisLoad = false;
 		verified = undefined;
 		inMemorySnapshot = null;
-		clearSnapshot(deps.sessionStorage());
+		if (replaced) clearSnapshot(deps.sessionStorage());
+		if (notify) notifyAccessRefused();
 		if (!isCurrent()) return;
 		state.items = [];
 		state.staleAt = null;
