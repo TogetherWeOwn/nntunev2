@@ -160,6 +160,7 @@ for f in "${tests[@]}"; do
     -v lock_invite_issuer_sql="$(<"$root/workers/api/src/lock_invite_issuer_for_sanction.sql")" \
     -v sanction_invite_issuer_sql="$(<"$root/workers/api/src/sanction_invite_issuer.sql")" \
     -v ingest_session_reserve_sql="$(<"$root/workers/api/src/ingest_session_reserve.sql")" \
+    -v ingest_session_terminate_sql="$(<"$root/workers/api/src/ingest_session_terminate.sql")" \
     -v audio_classifications_store_sql="$(<"$root/workers/ingest/src/audio_classifications_store.sql")" -f "$f"
 done
 # Hosted-only concurrent fixtures are run separately by the migration CI job.

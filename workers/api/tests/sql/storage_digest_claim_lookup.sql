@@ -175,4 +175,5 @@ BEGIN
     END IF;
 END $$;
 \ir ../fixtures/ingest_session_reserve.sql
+\ir ../fixtures/ingest_session_terminate.sql
 ROLLBACK;

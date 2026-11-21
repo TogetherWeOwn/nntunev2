@@ -8,6 +8,11 @@ CREATE TABLE public.ingest_session_reservations (
     fingerprint BYTEA NOT NULL CHECK (octet_length(fingerprint) = 32),
     absolute_deadline TIMESTAMPTZ NOT NULL,
     idle_deadline TIMESTAMPTZ NOT NULL CHECK (idle_deadline <= absolute_deadline),
+    -- A permanent fence: checkpoint and publication writers must lock this row
+    -- and require a null terminal marker before advancing.
+    terminal_reason TEXT CHECK (terminal_reason IN ('aborted', 'expired')),
+    terminal_at TIMESTAMPTZ,
+    CHECK ((terminal_reason IS NULL) = (terminal_at IS NULL)),
     -- The library identity is globally unique and its environment is immutable.
     UNIQUE (library_id, principal_id, idempotency_key)
 );
