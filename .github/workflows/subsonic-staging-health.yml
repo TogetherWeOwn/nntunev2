@@ -1,0 +1,40 @@
+name: subsonic-staging-health
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_health_sha:
+        description: Exact build SHA from the staging API deployment record
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subsonic-staging-health
+  cancel-in-progress: false
+
+jobs:
+  health:
+    name: Read Subsonic staging build health
+    if: >-
+      ${{ github.repository == 'TogetherWeOwn/nntunev2' &&
+          github.ref == 'refs/heads/main' && github.ref_protected &&
+          github.workflow_sha == github.sha && github.run_attempt == 1 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    environment:
+      name: staging
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Sample build health (read-only; not measurement admission)
+        env:
+          EXPECTED_STAGING_BUILD_SHA: ${{ inputs.expected_health_sha }}
+          SUBSONIC_HEALTH_ACCESS_CLIENT_ID: ${{ secrets.SUBSONIC_HEALTH_ACCESS_CLIENT_ID }}
+          SUBSONIC_HEALTH_ACCESS_CLIENT_SECRET: ${{ secrets.SUBSONIC_HEALTH_ACCESS_CLIENT_SECRET }}
+        run: python3 -I .github/scripts/subsonic_staging_health.py
