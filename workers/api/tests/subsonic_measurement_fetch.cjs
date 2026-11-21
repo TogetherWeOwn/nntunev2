@@ -93,8 +93,10 @@ async function main() {
 
   // Accept startup on loopback but never send a PostgreSQL response.
   const sockets = new Set();
+  let connections = 0;
   let startups = 0;
   const peer = createServer((socket) => {
+    connections += 1;
     sockets.add(socket);
     socket.once('data', () => { startups += 1; });
     socket.on('error', () => socket.destroy());
@@ -110,6 +112,29 @@ async function main() {
       // the silent peer never requests authentication.
       `localConnectionString = "postgresql://fixture:unused@127.0.0.1:${peer.address().port}/fixture?sslmode=disable"`,
     );
+    // Keep the same enabled deployment and binding. Only the absolute UTC
+    // lease window changes; neither the runner nor cleanup supplies a clock.
+    const expired = config.replace(
+      /^(SUBSONIC_MEASUREMENT_LEASE = "v1:[a-f0-9]{40}:)\d+:\d+(:.*)$/m,
+      (_, prefix, suffix) => `${prefix}1000:2200${suffix}`,
+    );
+    assert.notEqual(expired, config, 'test must replace the UTC lease window');
+    writeFileSync('measurement-expired.toml', expired);
+    const expiredWorker = await start('expired');
+    try {
+      const response = await fetchWith(expiredWorker)('getAlbum.view', { f: 'json', apiKey: matching, id: release }, headers);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('cache-control'), 'private, no-store');
+      const result = (await response.json())['subsonic-response'];
+      assert.equal(result.status, 'failed');
+      assert.equal(result.error?.code, 44);
+      assert.equal(result.album, undefined);
+    } finally {
+      await expiredWorker.dispose();
+    }
+    assert.equal(connections, 0, 'expired lease must not open the measurement binding');
+    console.log('ok: armed release Fetch rejects past UTC lease without cleanup or a measurement socket');
+
     writeFileSync('measurement-stalled.toml', config);
     const worker = await start('stalled');
     try {
