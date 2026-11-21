@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import runpy
 import signal
 import subprocess
@@ -164,6 +165,8 @@ class RequestContractTests(unittest.TestCase):
 class TransportTests(unittest.TestCase):
     bearer = r'synthetic"\-bearer'
     api_key = RequestContractTests.api_key
+    access_client_id = "fixture-client-id.access"
+    access_client_secret = "fixture-client-secret"
     ok_head = b"HTTP/1.1 200 OK\r\n\r\n"
 
     def setUp(self):
@@ -188,8 +191,11 @@ class TransportTests(unittest.TestCase):
         child.stdout.close()
 
     def send(self, slot=1, seconds=4):
-        return self.transport.send(slot, self.bearer, self.api_key,
-                                   deadline=time.monotonic() + seconds, cancel=self.cancel)
+        return self.transport.send(
+            slot, self.bearer, self.api_key, deadline=time.monotonic() + seconds,
+            cancel=self.cancel, access_client_id=self.access_client_id,
+            access_client_secret=self.access_client_secret,
+        )
 
     def assert_reaped(self, returncode=None):
         child = self.children[-1]
@@ -198,23 +204,68 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(child.returncode, returncode)
 
     def test_fixed_https_post_passes_credentials_only_on_stdin(self):
-        self.program = f"out.write({self.ok_head!r} + config)"
-        result = self.send()
-        self.assertEqual(self.argv, (
-            "/usr/bin/curl", "--disable", "--globoff", "--proto", "=https", "--noproxy", "*",
-            "--no-location", "--retry", "0", "--http1.1", "--silent", "--no-buffer", "--include",
-            "--ignore-content-length", "--header", "Connection: close",
-            "--connect-timeout", "2.0", "--max-time", "10.0", "--request", "POST", "--config", "-",
-            "--url", "https://staging.nntune.com/rest/getArtists",
-        ))
-        self.assertEqual(result.body.decode().splitlines(), [
-            'header = "Content-Type: application/x-www-form-urlencoded"',
-            'header = "Accept-Encoding: identity"',
-            'header = "X-Subsonic-Measurement-Case: empty"',
-            r'header = "Authorization: Bearer synthetic\"\\-bearer"',
-            f'data-binary = "f=json&apiKey={quote_plus(self.api_key)}"',
-        ])
-        self.assertEqual(repr(result), "PostResponse(status=200)")
+        off = (
+            b"HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n"
+            b'Cache-Control: private, no-store\r\n\r\n<subsonic-response status="failed" version="1.16.1">'
+            b'<error code="70" message="Endpoint not supported in staging."/></subsonic-response>'
+        )
+        for slot, case, has_bearer, form, reply in (
+            (1, "empty", True, f"f=json&apiKey={quote_plus(self.api_key)}", self.ok_head),
+            (5, "small", False, "f=json", off),
+            (6, "small", True, "f=json", self.ok_head),
+        ):
+            with self.subTest(slot=slot):
+                lines = [
+                    'header = "Content-Type: application/x-www-form-urlencoded"',
+                    'header = "Accept-Encoding: identity"',
+                    f'header = "X-Subsonic-Measurement-Case: {case}"',
+                ]
+                if has_bearer:
+                    lines.append(r'header = "Authorization: Bearer synthetic\"\\-bearer"')
+                lines += [
+                    f'header = "CF-Access-Client-Id: {self.access_client_id}"',
+                    f'header = "CF-Access-Client-Secret: {self.access_client_secret}"',
+                    f'data-binary = "{form}"',
+                ]
+                digest = hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest()
+                self.program = (
+                    f"import hashlib\nassert hashlib.sha256(config).hexdigest() == {digest!r}\n"
+                    f"out.write({reply!r})"
+                )
+                result = self.send(slot)
+                self.assertEqual(self.argv, (
+                    "/usr/bin/curl", "--disable", "--globoff", "--proto", "=https", "--noproxy", "*",
+                    "--no-location", "--retry", "0", "--http1.1", "--silent", "--no-buffer", "--include",
+                    "--ignore-content-length", "--header", "Connection: close",
+                    "--connect-timeout", "2.0", "--max-time", "10.0", "--request", "POST", "--config", "-",
+                    "--url", "https://staging.nntune.com/rest/getArtists",
+                ))
+                if slot == 5:
+                    self.assertEqual(result, {"oracle": "fixed_staging_off", "http_status": 404})
+                else:
+                    self.assertEqual(repr(result), "PostResponse(status=200)")
+                    self.assertEqual(result.body, b"")
+                self.assert_reaped(0)
+
+    def test_missing_or_malformed_access_never_spawns(self):
+        valid = {"access_client_id": self.access_client_id,
+                 "access_client_secret": self.access_client_secret}
+        bad = (None, "", b"fixture", "has space", "a\r\nb", "a\tb", "a\x00b", "snow-雪",
+               '"quoted"', r"a\b", "a" * 513)
+        for field in valid:
+            for value in bad:
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    runner["Stop"], "^access-credential-shape$",
+                ):
+                    self.transport.send(1, self.bearer, self.api_key, deadline=time.monotonic() + 4,
+                                        cancel=self.cancel, **(valid | {field: value}))
+        ambient = {"CF_ACCESS_CLIENT_ID": self.access_client_id,
+                   "CF_ACCESS_CLIENT_SECRET": self.access_client_secret}
+        with (patch("os.environ", ambient),
+              self.assertRaisesRegex(runner["Stop"], "^access-credential-shape$")):
+            self.transport.send(1, self.bearer, self.api_key, deadline=time.monotonic() + 4,
+                                cancel=self.cancel)
+        self.assertEqual(self.children, [])
 
     def test_rejects_unreviewed_slot_and_alternative_destinations_before_spawn(self):
         for slot in (0, 49, True, "https://example.invalid/rest/getArtists"):
@@ -231,12 +282,47 @@ class TransportTests(unittest.TestCase):
                 self.send()
         self.assertEqual(self.children, [])
 
-    def test_redirect_refused_without_following_or_echoing_location(self):
-        head = b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://example.invalid/private\r\n\r\n"
-        self.program = f"out.write({head!r}); out.flush(); time.sleep(60)"
-        with self.assertRaisesRegex(runner["Stop"], "^redirect-refused$"):
-            self.send()
-        self.assert_reaped(-signal.SIGKILL)
+    def test_access_denial_and_redirect_are_terminal(self):
+        for status, reason in ((302, "redirect-refused"), (307, "redirect-refused"),
+                               (401, "access-refused"), (403, "access-refused")):
+            # A proxy reply may contain arbitrary text. Neither the location
+            # nor the echoed stdin should be carried out of a failed request.
+            head = (f"HTTP/1.1 {status} Refused\r\n"
+                    "Location: https://example.invalid/private\r\n\r\n").encode()
+            self.program = f"out.write({head!r} + config); out.flush(); time.sleep(60)"
+            for slot in (1, 5, 6):
+                with self.subTest(status=status, slot=slot):
+                    previous = len(self.children)
+                    with self.assertRaisesRegex(runner["Stop"], f"^{reason}$"):
+                        self.send(slot)
+                    self.assertEqual(len(self.children), previous + 1)
+                    self.assert_reaped(-signal.SIGKILL)
+
+    def test_reflected_credentials_are_not_returned(self):
+        self.bearer = "fixture-worker-bearer"
+        # Embed one value in each reply to catch both missing and exact-match checks.
+        for marker, decode, metadata in (
+            (b"CF-Access-Client-Id: ", False, True),
+            (b"CF-Access-Client-Secret: ", False, False),
+            (b"Authorization: Bearer ", False, False),
+            (b"&apiKey=", False, False),
+            (b"&apiKey=", True, False),
+        ):
+            with self.subTest(marker=marker, decode=decode):
+                if metadata:
+                    prefix = b'HTTP/1.1 200 OK\r\nCache-Control: private, sample="'
+                    suffix = b'", no-store\r\n\r\n'
+                else:
+                    prefix, suffix = self.ok_head + b"Sample: [", b"] (end)"
+                self.program = (
+                    "from urllib.parse import unquote_to_bytes\n"
+                    f"value = config.split({marker!r}, 1)[1].split(b'\"', 1)[0]\n"
+                    f"if {decode}: value = unquote_to_bytes(value)\n"
+                    f"out.write({prefix!r} + value + {suffix!r})"
+                )
+                with self.assertRaisesRegex(runner["Stop"], "^credential-reflected$"):
+                    self.send()
+                self.assert_reaped(0)
 
     def test_interim_headers_preserve_fixed_rejection_oracle_and_shared_budget(self):
         hint = b"HTTP/1.1 103 Early Hints\r\n\r\n"
