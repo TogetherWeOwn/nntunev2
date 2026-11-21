@@ -51,14 +51,12 @@ def version(*bindings, sha=SHA):
 
 class IdentityTests(unittest.TestCase):
     def test_current_version_build_and_default_off(self):
-        deployment = current()
+        deployment = identity.decode(json.dumps(current()).replace("100}", "100.0}").encode(), "bad fixture")
         deployment["deployments"] += current(OTHER, OTHER)["deployments"]
         read = MagicMock(side_effect=[deployment, version(), deployment])
         stream = io.StringIO()
         with TemporaryDirectory() as temp, patch.object(identity, "provider_result", read):
-            Path(temp, "wrangler-output-test.json").write_bytes(
-                b'{"type":"wrangler-session","version":1}\n' + output()
-            )
+            Path(temp, "wrangler-output-test.json").write_bytes(b'{"type":"wrangler-session","version":1}\n' + output())
             env = {
                 "WRANGLER_OUTPUT_FILE_DIRECTORY": temp,
                 "GITHUB_SHA": SHA,
@@ -67,18 +65,16 @@ class IdentityTests(unittest.TestCase):
             }
             with patch.dict(identity.os.environ, env, clear=True), redirect_stdout(stream):
                 self.assertEqual(identity.main(), 0)
-        self.assertEqual(
-            json.loads(stream.getvalue()),
-            {
-                "identity": "matched",
-                "deployment_id": DEPLOYMENT,
-                "version_id": VERSION,
-                "build_sha": SHA,
-                "enable_flag": "off",
-                "lease": "absent",
-                "measurement_db_binding": "absent",
-            },
-        )
+        expected = {
+            "identity": "matched",
+            "deployment_id": DEPLOYMENT,
+            "version_id": VERSION,
+            "build_sha": SHA,
+            "enable_flag": "off",
+            "lease": "absent",
+            "measurement_db_binding": "absent",
+        }
+        self.assertEqual(json.loads(stream.getvalue()), expected)
         path = f"/client/v4/accounts/{ACCOUNT}/workers/scripts/nntune-api-staging"
         self.assertEqual(
             [c.args[0] for c in read.call_args_list],
@@ -108,7 +104,9 @@ class IdentityTests(unittest.TestCase):
         split["deployments"][0]["versions"].append({"version_id": OTHER, "percentage": 1})
         ambiguous = current()
         ambiguous["deployments"] *= 2
+        near_miss = json.dumps(current()).replace("100}", "99.999999999999999}")
         for observed, reason in (
+            (identity.decode(near_miss.encode(), "bad fixture"), "deployment-traffic-shape"),
             (split, "deployment-not-single-version"),
             (ambiguous, "deployment-shape"),
             ({"deployments": []}, "deployment-shape"),
@@ -148,34 +146,32 @@ class IdentityTests(unittest.TestCase):
     @patch.object(identity.http.client, "HTTPSConnection")
     def test_provider_bounds_and_no_redirect_or_raw_response(self, connect):
         conn = connect.return_value
-        response = conn.getresponse.return_value.__enter__.return_value
-        for status, body, reason in (
-            (403, b"synthetic sensitive response", "version-auth-denied"),
-            (302, b"not followed", "provider-http-status"),
-            (200, b"x" * (identity.MAX_BODY + 1), "provider-body-limit"),
-            (200, b'{"success":true,"success":true}', "provider-response-shape"),
+        for status, body, missing, reason in (
+            (403, b"synthetic sensitive response", 0, "version-auth-denied"),
+            (302, b"not followed", 0, "provider-http-status"),
+            (200, b"x" * (identity.MAX_BODY + 1), 0, "provider-body-limit"),
+            (200, b'{"success":true,"success":true}', 0, "provider-response-shape"),
+            (200, b'{"success":true,"errors":[],"result":{}}', 1, "provider-transport"),
         ):
-            response.status, response.read.return_value = status, body
+            wire = f"HTTP/1.1 {status} Test\r\nContent-Length: {len(body) + missing}\r\n\r\n".encode() + body
+            response = identity.http.client.HTTPResponse(MagicMock(makefile=MagicMock(return_value=io.BytesIO(wire))))
+            response.begin()
+            conn.getresponse.return_value = response
             conn.request.reset_mock()
-            with self.assertRaises(identity.Unavailable) as exc:
+            with self.subTest(reason=reason), self.assertRaisesRegex(identity.Unavailable, f"^{reason}$"):
                 identity.provider_result("/mock", "synthetic-token")
-            self.assertEqual(str(exc.exception), reason)
             connect.assert_called_with("api.cloudflare.com", timeout=5)
-            conn.request.assert_called_once()
-            self.assertEqual(conn.request.call_args.args, ("GET", "/mock"))
-            self.assertEqual(
-                conn.request.call_args.kwargs["headers"]["Authorization"], "Bearer synthetic-token"
+            conn.request.assert_called_once_with(
+                "GET",
+                "/mock",
+                headers={"Authorization": "Bearer synthetic-token", "Cache-Control": "no-cache, no-store"},
             )
-        response.read.assert_called_with(identity.MAX_BODY + 1)
 
     def test_cli_unavailable_is_explicit_and_nonzero(self):
         stream = io.StringIO()
         with patch.dict(identity.os.environ, {}, clear=True), redirect_stdout(stream):
             self.assertEqual(identity.main(), 1)
-        self.assertEqual(
-            json.loads(stream.getvalue()),
-            {"identity": "unavailable", "reason": "credential-config"},
-        )
+        self.assertEqual(json.loads(stream.getvalue()), {"identity": "unavailable", "reason": "credential-config"})
 
 
 if __name__ == "__main__":

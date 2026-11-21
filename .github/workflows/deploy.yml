@@ -423,8 +423,8 @@ jobs:
           command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
           # Reuse the action's existing token and JSONL directory after deploy.
           postCommands: >-
-            timeout -k 2s 30s python3 -I ../../.github/scripts/staging_api_identity.py
-            > "$RUNNER_TEMP/staging-api-identity.json" 2>/dev/null || true
+            status=0; receipt=$(timeout -k 2s 30s python3 -I ../../.github/scripts/staging_api_identity.py 2>/dev/null) || status=$?;
+            [ "$status" -le 1 ] && printf '%s\n' "$receipt" > "$RUNNER_TEMP/staging-api-identity.json" || true
       # Always report the executed step outcomes, including safe config skips
       # and failures. A green job alone is not evidence of a deployed Worker.
       - name: Record API deployment outcome
@@ -471,7 +471,7 @@ jobs:
             fi
             echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
             printf '\n### staging-api provider identity\n'
-            if [ "$deployed" != true ] || ! jq -cse 'select(length == 1) | .[0]' "$RUNNER_TEMP/staging-api-identity.json" 2>/dev/null; then
+            if [ "$deployed" != true ] || [ -z "${RUNNER_TEMP:-}" ] || ! jq -cse 'select(length == 1) | .[0]' "$RUNNER_TEMP/staging-api-identity.json" 2>/dev/null; then
               echo 'identity=unavailable (no completed probe receipt)'
             fi
           } >> "$GITHUB_STEP_SUMMARY"

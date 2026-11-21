@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 SCRIPT = "nntune-api-staging"
@@ -38,9 +39,12 @@ def reject_constant(_):
 def decode(body, reason):
     try:
         return json.loads(
-            body.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=reject_constant
+            body.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+            parse_float=Decimal,
         )
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError, InvalidOperation):
         raise Unavailable(reason) from None
 
 
@@ -85,16 +89,15 @@ def provider_result(path, token):
         )
         with conn.getresponse() as response:
             if response.status in (401, 403):
-                raise Unavailable(
-                    "deployments-auth-denied" if path.endswith("/deployments") else "version-auth-denied"
-                )
+                raise Unavailable("deployments-auth-denied" if path.endswith("/deployments") else "version-auth-denied")
             require(response.status == 200, "provider-http-status")
             body = response.read(MAX_BODY + 1)
+            require(len(body) <= MAX_BODY, "provider-body-limit")
+            require(response.length in (None, 0), "provider-transport")
     except (http.client.HTTPException, OSError, ValueError):
         raise Unavailable("provider-transport") from None
     finally:
         conn.close()
-    require(len(body) <= MAX_BODY, "provider-body-limit")
     payload = decode(body, "provider-response-shape")
     require(
         field(payload, "success") is True
@@ -122,7 +125,7 @@ def current_deployment(result, version_id):
     percent = field(active, "percentage")
     active_id = field(active, "version_id")
     require(
-        type(percent) in (int, float) and percent == 100 and valid(UUID, active_id),
+        type(percent) in (int, Decimal) and percent == 100 and valid(UUID, active_id),
         "deployment-traffic-shape",
     )
     require(active_id == version_id, "deployed-version-mismatch")
