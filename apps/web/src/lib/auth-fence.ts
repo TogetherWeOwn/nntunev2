@@ -25,10 +25,14 @@ function receiptsBlocked(): boolean {
 }
 
 async function cacheReceiptsBlocked(): Promise<boolean> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		return (await caches.keys()).some(pendingMarker);
+		const blocked = new Promise<true>((resolve) => (timer = setTimeout(resolve, 500, true)));
+		return await Promise.race([caches.keys().then((keys) => keys.some(pendingMarker)), blocked]);
 	} catch {
 		return true;
+	} finally {
+		clearTimeout(timer);
 	}
 }
 
@@ -91,14 +95,10 @@ function invalidateGeneration(): boolean {
 
 async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 	try {
-		return await globalThis.navigator?.locks?.request(
-			AUTH_LOCK,
-			{ mode: 'shared', ifAvailable: true },
-			async (lock) => {
-				if (!lock || pending || (await cacheReceiptsBlocked()) || pending) return;
-				return work();
-			}
-		);
+		return await globalThis.navigator?.locks?.request(AUTH_LOCK, { mode: 'shared', ifAvailable: true }, async (lock) => {
+			if (!lock || pending || (await cacheReceiptsBlocked()) || pending) return;
+			return work();
+		});
 	} catch {
 		return undefined;
 	}
@@ -116,15 +116,13 @@ export function captureAuthFence() {
 		if (!generation())
 			await locks.request(`${AUTH_LOCK}.init`, () => {
 				try {
-					if (!generation() && !receiptsBlocked())
-						storage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID());
+					if (!generation() && !receiptsBlocked()) storage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID());
 				} catch {
 					/* No receipt while generation storage is unavailable. */
 				}
 			});
 		const id = generation();
-		const isCurrent = () =>
-			!!id && !pending && epoch === localEpoch && !receiptsBlocked() && generation() === id;
+		const isCurrent = () => !!id && !pending && epoch === localEpoch && !receiptsBlocked() && generation() === id;
 		if (!(await cacheReceiptsBlocked()) && isCurrent())
 			return {
 				isCurrent,
@@ -134,31 +132,38 @@ export function captureAuthFence() {
 }
 
 /** Mark before dispatch and hold until fetch settles (including response cookies). */
-export async function runAuthMutation<T>(
-	signal: AbortSignal,
-	dispatch: () => Promise<T>
-): Promise<T> {
+export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Promise<T>, stale?: Error): Promise<T> {
 	if (typeof window === 'undefined') return dispatch();
+	if (stale && pending) throw stale;
+	const confirmed = stale && generation();
 	localEpoch++;
 	pending++;
 	let dispatched = false;
 	const send = async (locked: boolean, clear?: ClearMarker) => {
-		let invalidated = false;
 		try {
 			signal.throwIfAborted();
-			invalidated = invalidateGeneration();
-			if (locked && !invalidated) clear = await markBeforeDispatch(signal);
+			if (!invalidateGeneration() && locked) {
+				if (stale) throw stale;
+				clear = await markBeforeDispatch(signal);
+			}
 			signal.throwIfAborted();
 			dispatched = true;
 			return await dispatch();
 		} finally {
-			// Retry before lock release or marker removal. An unguarded write always retries.
-			if (!dispatched || ((locked || clear) && invalidated) || invalidateGeneration())
-				clearLater(clear);
+			// Rotate at settlement too so an intent captured mid-write cannot survive it.
+			if (!dispatched || invalidateGeneration()) clearLater(clear);
 		}
 	};
 	try {
 		const locks = globalThis.navigator?.locks;
+		if (stale) {
+			// Account-wide revocation must never wait behind a cookie change or fall back unlocked.
+			if (!locks) throw stale;
+			return await locks.request(AUTH_LOCK, { ifAvailable: true }, async (lock) => {
+				if (!lock || (await cacheReceiptsBlocked()) || pending !== 1 || receiptsBlocked() || confirmed !== generation()) throw stale;
+				return send(true);
+			});
+		}
 		if (!locks) return await send(false, await markBeforeDispatch(signal));
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {

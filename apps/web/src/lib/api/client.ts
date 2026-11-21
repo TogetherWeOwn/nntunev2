@@ -459,14 +459,19 @@ export class ApiClient {
 		}, API_REQUEST_TIMEOUT_MS);
 		try {
 			callerSignal?.throwIfAborted();
-			const dispatch = () => this.fetchFn(`${this.baseUrl}${path}`, {
+			const url = `${this.baseUrl}${path}`;
+			const route = init.method === 'POST' && new URL(url, globalThis.document?.baseURI ?? 'http://localhost').pathname;
+			const dispatch = () => this.fetchFn(url, {
 				...init,
 				signal: controller.signal,
 				headers,
 				credentials: 'include'
 			});
-			const response = await (init.method === 'POST' && COOKIE_MUTATIONS.has(path)
-				? runAuthMutation(controller.signal, dispatch) : dispatch());
+			const stale = route === '/v1/session/revoke-all'
+				? new ApiError(409, 'conflict', 'Could not verify the current session. Confirm sign out everywhere again.')
+				: undefined;
+			const response = await (route && COOKIE_MUTATIONS.has(route)
+				? runAuthMutation(controller.signal, dispatch, stale) : dispatch());
 			// A transport may ignore abort; never publish an abandoned response.
 			callerSignal?.throwIfAborted();
 			if (!response.ok) {
