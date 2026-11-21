@@ -517,6 +517,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                     | "/v1/me/likes/session"
                     | "/v1/me/taste"
                     | "/v1/me/history"
+                    | MEMBER_INVITES_PATH
             ) {
                 return SessionOnly;
             }

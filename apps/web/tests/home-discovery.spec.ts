@@ -82,7 +82,18 @@ for (const { status, message, action } of [
 	});
 }
 
-test('Home shows loading and recovers from a transient catalogue failure', async ({ page }) => {
+test('Home keeps scoped recent searches hidden until a successful Retry', async ({ page }) => {
+	const context = 'home-discovery-retry';
+	const key = `nntune.library.recent-finds.v1.${context}`;
+	const recent = page.getByRole('region', { name: 'Recent searches' });
+	await page.addInitScript(({ context, key }) => {
+		sessionStorage.setItem('nntune.library.auth-context.v1', context);
+		localStorage.setItem(key, JSON.stringify(['Zulu & Echo']));
+	}, { context, key });
+	const deliverHistoryChange = (query: string) => page.evaluate(({ key, query }) => {
+		localStorage.setItem(key, JSON.stringify([query]));
+		window.dispatchEvent(new StorageEvent('storage', { key, storageArea: localStorage }));
+	}, { key, query });
 	const shelf = discovery(page);
 	await page.route('**/api/library', (route) => route.fulfill({ json: [rows[0]] }));
 	await page.route(
@@ -91,6 +102,9 @@ test('Home shows loading and recovers from a transient catalogue failure', async
 			await expect(shelf.getByRole('status')).toHaveText('Loading your library…');
 			await expect(shelf.getByRole('listitem')).toHaveCount(0);
 			await expect(shelf.getByRole('link', { name: 'Search your library' })).toHaveCount(0);
+			await expect(recent).toHaveCount(0);
+			await deliverHistoryChange('Pending query');
+			await expect(recent).toHaveCount(0);
 			await route.fulfill({ status: 503, body: '' });
 		},
 		{ times: 1 }
@@ -100,7 +114,16 @@ test('Home shows loading and recovers from a transient catalogue failure', async
 	await expect(shelf.getByRole('alert')).toContainText('Could not load your library');
 	await expect(shelf.getByRole('listitem')).toHaveCount(0);
 	await expect(shelf.getByRole('link', { name: 'Search your library' })).toHaveCount(0);
+	await expect(recent).toHaveCount(0);
+	await deliverHistoryChange('Retry & match');
+	await expect(recent).toHaveCount(0);
+
 	await shelf.getByRole('button', { name: 'Retry' }).click();
 	await expect(shelf.getByRole('listitem')).toHaveText('Zulu — Example Artist');
 	await expect(shelf.getByRole('alert')).toHaveCount(0);
+	await expect(recent.getByRole('link', { name: 'Retry & match' })).toHaveAttribute(
+		'href', '/search?q=Retry%20%26%20match'
+	);
+	await deliverHistoryChange('Updated query');
+	await expect(recent.getByRole('link')).toHaveText('Updated query');
 });

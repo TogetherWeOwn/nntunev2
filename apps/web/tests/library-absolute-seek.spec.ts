@@ -82,6 +82,10 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	await expectTime(sought.duration);
 	await expect(audio).toHaveJSProperty('paused', true);
 	await expect(slider).toHaveAttribute('aria-valuetext', '0:16 of 0:16');
+	await region.getByTestId('player-favorite').click();
+	await expect(region.getByTestId('player-favorite-status')).toHaveText('Starred Coral.');
+	await expectTime(sought.duration);
+	expect(await audio.evaluate((el, original) => el === original, firstAudio)).toBe(true);
 	expect(nonMedia).toEqual([]);
 	let release!: () => void;
 	const held = new Promise<void>((resolve) => { release = resolve; });

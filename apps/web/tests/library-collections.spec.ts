@@ -5,8 +5,9 @@ const artPath = `/v1/releases/${mbid(1)}/art`;
 const cafe = { mbid: mbid(1), title: 'Café', artist: 'North', art_url: artPath, release_type: 'Album' };
 const single = { mbid: mbid(2), title: 'Loose Track', release_type: 'Single' };
 const tracks = ['Track One', 'Track Two'].map((title, i) => ({ id: 'track-a', occurrence_key: `job:${i + 1}`, title }));
+const typeButton = (page: Page, name: string) => page.getByRole('group', { name: 'Library type' }).getByRole('button', { name, exact: true });
 const controls = (page: Page) => ({
-	choose: (name: string) => page.getByRole('group', { name: 'Library type' }).getByRole('button', { name, exact: true }).click(),
+	choose: (name: string) => typeButton(page, name).click(),
 	region: page.getByRole('region', { name: 'Library collections' })
 });
 const crossTabReset = (page: Page) => page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', { key: 'nntune.library.auth-transition.v1' })));
@@ -73,9 +74,9 @@ test('retries collection reads and renders single, empty and sign-in states', as
 });
 
 for (const boundary of [401, 403, 'cross-tab', 'filter'] as const) {
-	test(`discards an outstanding release response after ${boundary}`, async ({ page }) => {
+	test(`withholds collection rows across ${boundary}`, async ({ page }) => {
 		const tracksStatus = Promise.withResolvers<number>();
-		await page.route('**/api/library', async (route) => route.fulfill({ status: await tracksStatus.promise, json: [] }));
+		await page.route('**/api/library', async (route) => route.fulfill({ status: typeof boundary === 'number' ? await tracksStatus.promise : 200, json: [] }));
 		await page.route('**/v1/artists', (route) => route.fulfill({ json: [{ mbid: mbid(1), name: 'North' }] }));
 		await page.goto('/library');
 		const late = await page.evaluateHandle(() => {
@@ -90,9 +91,44 @@ for (const boundary of [401, 403, 'cross-tab', 'filter'] as const) {
 		});
 		const { choose, region } = controls(page);
 		await choose('Albums');
+		if (typeof boundary === 'number') {
+			await expect(page.getByRole('status').filter({ hasText: 'Loading your library…' })).toBeVisible();
+			await expect(region).toHaveCount(0);
+			tracksStatus.resolve(boundary);
+			if (boundary === 401) {
+				await expect(region.getByRole('link', { name: 'Sign in' })).toBeVisible();
+			} else {
+				await expect(page.getByRole('alert')).toHaveText('You do not have access to this library.');
+				await expect(page.getByRole('link', { name: 'Sign in', exact: true })).toHaveCount(0);
+			}
+			expect(await late.evaluate((read) => read.pending())).toBe(false);
+			const retryStarted = Promise.withResolvers<void>();
+			const retryReady = Promise.withResolvers<void>();
+			await page.route('**/api/library', async (route) => {
+				retryStarted.resolve();
+				await retryReady.promise;
+				await route.fulfill({ json: [] });
+			});
+			try {
+				const retry = page.getByRole('button', { name: 'Retry', exact: true });
+				await expect(retry).toBeVisible();
+				await retry.press('Enter');
+				await retryStarted.promise;
+				await expect(page.getByRole('status').filter({ hasText: 'Loading your library…' })).toBeVisible();
+				expect(await late.evaluate((read) => read.pending())).toBe(false);
+			} finally {
+				retryReady.resolve();
+			}
+			const albums = typeButton(page, 'Albums');
+			await expect(albums).toBeVisible();
+			await expect(albums).toBeFocused();
+			await expect.poll(() => late.evaluate((read) => read.pending())).toBe(true);
+			await late.evaluate((read, album) => read.reply([album]), cafe);
+			await expect(region.getByRole('listitem')).toHaveText([/Café/]);
+			return;
+		}
 		await region.getByRole('searchbox').fill('North');
 		await expect.poll(() => late.evaluate((read) => read.pending())).toBe(true);
-		tracksStatus.resolve(typeof boundary === 'number' ? boundary : 200);
 		if (boundary === 'cross-tab') await crossTabReset(page);
 		if (boundary === 'filter') await choose('Artists');
 		await expect.poll(() => late.evaluate((read) => read.aborted())).toBe(true);

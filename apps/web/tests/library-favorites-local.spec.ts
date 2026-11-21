@@ -514,7 +514,7 @@ test.describe('favorites storage regressions', () => {
 		// Recovery must not write the visit-only star along with the new edit.
 		await starButton(page, 'fav-alpha').click();
 		await expect.poll(async () => storedIds(await readFavoritesRaw(page, await readAuthContext(page)))).toEqual(['fav-alpha']);
-		await expectFavoriteIds(page, ['fav-alpha']);
+		await expectFavoriteIds(page, ['fav-alpha', 'fav-zulu']);
 		await page.reload();
 		await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 		await expectFavoriteIds(page, ['fav-alpha']);
