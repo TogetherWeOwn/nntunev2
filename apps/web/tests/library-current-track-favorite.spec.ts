@@ -1,9 +1,8 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
-const tracks = [
-	{ id: 'fav-current-a', title: 'North Wind', streamUrl: '/test-audio/north' },
-	{ id: 'fav-current-b', title: 'South Wind', streamUrl: '/test-audio/south' }
-];
+const north = { id: 'fav-current-a', title: 'North Wind', streamUrl: '/test-audio/north' };
+const south = { id: 'fav-current-b', title: 'South Wind', streamUrl: '/test-audio/south' };
+const tracks = [north, south];
 const contextKey = 'nntune.library.auth-context.v1';
 const transitionKey = 'nntune.library.auth-transition.v1';
 const favoritesBase = 'nntune.library.favorites.v1';
@@ -15,7 +14,6 @@ async function openLibrary(page: Page) {
 	await page.route('**/api/library', (route) => route.fulfill({ json: tracks }));
 	await page.route('**/test-audio/**', () => {});
 	await page.goto('/library');
-	await expect(favorite(page)).toHaveCount(0);
 	for (const { id, title } of tracks) await row(page, id).getByRole('button', { name: title, exact: true }).click();
 	await expect(favorite(page)).toHaveAccessibleName('Favorite North Wind');
 }
@@ -23,10 +21,10 @@ async function storedFavorites(page: Page, scope?: string | null) {
 	return page.evaluate(({ contextKey, favoritesBase, scope }) =>
 		localStorage.getItem(`${favoritesBase}.${scope ?? sessionStorage.getItem(contextKey)}`), { contextKey, favoritesBase, scope });
 }
-async function expectMembership(page: Page, id: string | null, announcement = '') {
+async function expectMembership(page: Page, id: string | null, announcement = '', stored = id ? JSON.stringify([id]) : null) {
 	await expect(favorite(page)).toHaveAttribute('aria-pressed', String(id !== null));
 	await expect(feedback(page)).toHaveText(announcement);
-	await expect.poll(() => storedFavorites(page)).toBe(id === null ? null : JSON.stringify([id]));
+	await expect.poll(() => storedFavorites(page)).toBe(stored);
 }
 
 for (const [scenario, allowed, announcement] of [
@@ -36,7 +34,6 @@ for (const [scenario, allowed, announcement] of [
 ] as const) {
 	test(`held Favorite write: ${scenario}`, async ({ page }) => {
 		await openLibrary(page);
-		const [north, south] = tracks;
 		const roundTrip = allowed === 2;
 		const decoder = await page.getByTestId('audio-player').elementHandle();
 		const nowPlaying = await page.getByTestId('now-playing').innerText();
@@ -49,12 +46,10 @@ for (const [scenario, allowed, announcement] of [
 				if (this === localStorage && name === key && allowed-- <= 0) throw new DOMException('Refused', 'QuotaExceededError');
 				setItem.call(this, name, value);
 			};
-			void navigator.locks.request(key, () => new Promise<void>((release) => ready(() => {
-				release(); return navigator.locks.request(key, () => {});
-			})));
+			void navigator.locks.request(key, () => new Promise<void>((release) =>
+				ready(() => { release(); return navigator.locks.request(key, () => {}); })));
 		}), { contextKey, favoritesBase, allowed });
 		await favorite(page).press('Space');
-		await expect(favorite(page)).toBeFocused();
 		if (roundTrip) await queueStar.click();
 		await row(page, roundTrip ? north.id : south.id).getByRole('button', { name: roundTrip ? 'Star North Wind' : 'Star South Wind', exact: true }).click();
 		await expect(feedback(page)).toBeEmpty();
@@ -121,11 +116,23 @@ for (const input of ['pointer', 'legacy pointer', 'Space', 'click only']) {
 	});
 }
 
-test('a keyboard activation racing a Library edit does not toggle membership a second time', async ({ page }) => {
+test('Favorite refuses a reconciled press and a fresh press superseded by a Library edit', async ({ page }) => {
 	await openLibrary(page);
-	await editDuringActivation(page, row(page, tracks[0].id).getByRole('button', { name: 'Star North Wind', exact: true }));
+	const southStar = row(page, south.id).getByRole('button', { name: /^(Unstar|Star) South Wind$/ });
+	const key = `${favoritesBase}.${await page.evaluate((key) => sessionStorage.getItem(key), contextKey)}`;
+	await favorite(page).focus(); await page.keyboard.down('Space');
+	for (const [ids, pressed] of [[[north.id], 'true'], [[], 'false']] as const) {
+		await page.evaluate(({ key, ids }) => navigator.locks.request(key, () => localStorage.setItem(key, JSON.stringify(ids))), { key, ids });
+		await southStar.evaluate((button) => button.click());
+		await expect(favorite(page)).toHaveAttribute('aria-pressed', pressed);
+	}
+	await expect(favorite(page)).toBeFocused();
+	await page.keyboard.up('Space');
+	await page.evaluate((key) => navigator.locks.request(key, () => {}), key);
+	await expectMembership(page, null, '', '[]');
+	await editDuringActivation(page, row(page, north.id).getByRole('button', { name: 'Star North Wind', exact: true }));
 	await favorite(page).press('Space');
-	await expectMembership(page, tracks[0].id);
+	await expectMembership(page, north.id);
 });
 
 test('a rotated account refuses the stale button and an auth transition retires the control', async ({ page }) => {

@@ -26,8 +26,7 @@ test('writes just the selected track, once per rendered intent, and reports only
 	const before = view()!;
 	const pending = favorite.activate(before);
 	expect(favorite.feedback(view())).toBeNull();
-	await favorite.activate(before);
-	await pending;
+	await Promise.all([favorite.activate(before), pending]);
 	expect(favorite.feedback(view())?.text).toBe('Starred Second Signal.');
 	await favorite.activate(view()!);
 	expect(write.mock.calls).toEqual([['second-signal', true], ['second-signal', false]]);
@@ -39,9 +38,8 @@ test.each(['selection round trip', 'owner refusal'] as const)('%s cannot write o
 	const before = view()!;
 	if (change === 'selection round trip') { select(1); select(0); }
 	else read.mockReturnValue(null);
-	favorite.activate(before);
-	expect(write).not.toHaveBeenCalled();
-	expect(favorite.feedback(view())).toBeNull();
+	void favorite.activate(before);
+	expect([write.mock.calls, favorite.feedback(view())]).toEqual([[], null]);
 });
 
 test('disposing the live owner prevents replay and late feedback across replacement', async () => {
@@ -54,8 +52,6 @@ test('disposing the live owner prevents replay and late feedback across replacem
 	expect(write).toHaveBeenCalledTimes(1);
 	const replacement = vi.fn(async () => null);
 	favorite.bind({ read: () => before, write: replacement });
-	await favorite.activate(before);
-	await pending;
-	expect(replacement).not.toHaveBeenCalled();
-	expect(favorite.feedback(view())).toBeNull();
+	await Promise.all([favorite.activate(before), pending]);
+	expect([replacement.mock.calls, favorite.feedback(view())]).toEqual([[], null]);
 });

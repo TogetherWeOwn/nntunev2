@@ -808,9 +808,12 @@
 		const edit = ++favoriteEdit;
 		const before = favorites;
 		const optimistic = update(before);
-		const selected = queueCurrentTrack(queueController.snapshot)?.id;
-		if (selected && before.includes(selected) !== optimistic.includes(selected)) currentFavoriteEdit = edit;
+		const notePublication = (previous: readonly string[], next: readonly string[]) => {
+			const selected = queueCurrentTrack(queueController.snapshot)?.id;
+			if (selected && previous.includes(selected) !== next.includes(selected)) currentFavoriteEdit++;
+		};
 		favorites = [...optimistic];
+		notePublication(before, favorites);
 		let base = before;
 		return updateStoredFavorites(session, browserStorage('local'), key, (latest) => {
 			base = latest;
@@ -825,6 +828,7 @@
 			if (!committed) { applied?.(before, optimistic); return 'visit'; }
 			const visitOnly = placement && !favoriteBaseline.includes(placement.id) && !committed.includes(placement.id)
 				? placement : undefined;
+			const published = favorites;
 			if (wrote) favorites = committed;
 			else if (JSON.stringify(favoriteBaseline) !== JSON.stringify(committed)) {
 				const baseline = new Set(favoriteBaseline);
@@ -851,6 +855,7 @@
 					favorites = reconciled.map((id) => moved.loaded.has(id) ? order[slot++] : id);
 				} else favorites = reconciled;
 			}
+			notePublication(published, favorites);
 			favoriteBaseline = committed;
 			const displayMove = visitOnly && favorites.includes(visitOnly.crossed);
 			applied?.(displayMove ? before : base, displayMove ? favorites : committed);

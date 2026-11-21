@@ -2,12 +2,10 @@
 	import type { Action } from 'svelte/action';
 	import type { createCurrentTrackFavorite } from './currentTrackFavorite.svelte.js';
 	import type { QueueState } from './queue.js';
-
 	let { currentFavorite, snapshot }: { currentFavorite: ReturnType<typeof createCurrentTrackFavorite>; snapshot: QueueState } = $props();
 	const target = $derived(currentFavorite.view(snapshot));
 	const feedback = $derived(currentFavorite.feedback(target));
 	$effect(() => { if (!feedback) currentFavorite.clearFeedback(); });
-
 	const activateRendered: Action<HTMLButtonElement, NonNullable<typeof target>> = (button, rendered) => {
 		const listeners = new AbortController();
 		const capture = { capture: true, signal: listeners.signal };
@@ -36,9 +34,7 @@
 			if (event.isTrusted && event.isPrimary && event.button === 0) released = hits(event) ? event : undefined;
 		}, capture);
 		window.addEventListener('keydown', (event) => {
-			if (event.key !== ' ' || event.repeat || !hits(event)) return;
-			clearSpace();
-			space = rendered;
+			if (event.key === ' ' && !event.repeat && hits(event)) { clearSpace(); space = rendered; }
 		}, capture);
 		button.addEventListener('blur', clearSpace, { signal: listeners.signal });
 		window.addEventListener('keyup', (event) => {
