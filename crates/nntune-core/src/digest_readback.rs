@@ -477,7 +477,7 @@ mod tests {
         }
     }
 
-    fn versioned_pin(object_key: &str, version: &'static str) -> ReadbackPin<'_> {
+    fn versioned_pin<'a>(object_key: &'a str, version: &'static str) -> ReadbackPin<'a> {
         ReadbackPin {
             version: Some(version),
             ..pin(object_key)
