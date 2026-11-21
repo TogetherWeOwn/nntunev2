@@ -94,7 +94,7 @@ fn remote(id: &str, item: &str, status: &str, invoices: &[(&str, &str)]) -> Remo
             serde_json::from_value(json!({
                 "id": invoice, "customer": customer, "subscription": id, "status": "paid",
                 "currency": currency, "amount_paid": 800, "status_transitions": { "paid_at": NOW + order as i64 },
-                "lines": { "data": [{ "id": "il_exact_target", "amount": 800, "price": PRICE,
+                "lines": { "has_more": false, "data": [{ "id": "il_exact_target", "amount": 800, "price": PRICE,
                     "period": { "start": NOW - 1, "end": END } }] }
             })).expect("fixed invoice fixture")
         }).collect(),

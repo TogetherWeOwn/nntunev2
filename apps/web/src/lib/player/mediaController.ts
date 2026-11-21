@@ -7,13 +7,15 @@ import type { createQueueController, QueuedPlaySource } from './queueController.
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
 import { createPendingShareSeek } from './pendingShareSeek.js';
 import { restartIsAvailable } from './restartAvailability.js';
+import { bindSystemTransport } from './systemTransport.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error';
 
 type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
-type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'revoke' | 'isCurrent' | 'purging'>;
+type QueueAuthority = Pick<ReturnType<typeof createQueueController>,
+	'snapshot' | 'subscribe' | 'revision' | 'revoke' | 'isCurrent' | 'purging'>;
 
 export type MediaSelection = {
 	commit: (queue: QueueState) => boolean;
@@ -545,12 +547,12 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			current = receipt;
 			previous?.listeners.abort();
 			if (previous) invalidatePlay();
-			const target = transportTarget();
+			const seekTarget = transportTarget();
 			const trackId = currentTrack(queue.snapshot)?.id;
 			const observePosition = (type?: string) => {
-				if (target?.audio !== audio) return;
+				if (seekTarget?.audio !== audio) return;
 				const intent = positionIntent;
-				const matches = () => target.matches(() => positionIntent === intent && currentTrack(queue.snapshot)?.id === trackId);
+				const matches = () => seekTarget.matches(() => positionIntent === intent && currentTrack(queue.snapshot)?.id === trackId);
 				if (matches()) observeAbsoluteSeek(audio, matches, undefined, false, type === 'seeking');
 			};
 			function listenForNativeEvents(): void {
@@ -623,7 +625,12 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			}
 			lastJumpTarget = undefined;
 			listenForNativeEvents();
-			if (target?.audio === audio) readPlayback(audio, target.matches, 'starting');
+			const target = transportTarget();
+			if (target?.attachment === receipt) {
+				readPlayback(audio, target.matches, 'starting');
+				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
+					{ playCurrent, pauseCurrent }, receipt.listeners.signal);
+			}
 			observePosition();
 			pause(previous?.audio);
 			return () => {

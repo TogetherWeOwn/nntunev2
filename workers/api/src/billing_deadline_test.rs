@@ -22,6 +22,7 @@ async fn fixture(setup: bool) -> Result<(), StoreError> {
                     include_str!("../../../migrations/0021_billing_schema.sql"),
                     include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
                     include_str!("../../../migrations/0029_paid_invoice_history.sql"),
+                    include_str!("../../../migrations/0059_paid_invoice_covered_periods.sql"),
                 ] {
                     client.batch_execute(migration).await.map_err(|_| StoreError)?;
                 }
@@ -166,6 +167,7 @@ fn test_outcome() -> ReconcileOutcome {
         amount_cents: amount,
         currency: "usd".into(),
         paid_at_unix: 1_786_032_000,
+        covered_periods: vec![(1_786_032_000, 1_786_032_100)],
     };
     ReconcileOutcome {
         row: ReconciledRow {
