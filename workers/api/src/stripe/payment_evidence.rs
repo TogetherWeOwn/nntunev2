@@ -94,9 +94,12 @@ pub(crate) enum PaymentSharing {
     Unknown,
 }
 
-/// Compare only observations from the same Stripe account. A match is a
-/// review hint, not grounds for enforcement; a non-match does not rule out
-/// a shared funding card (wallets can use different tokens, for example).
+/// Compare only observations from the same Stripe account. `SharedCustomer`
+/// describes equal verified customer IDs, not two users sharing a current
+/// billing binding: the unique binding rules that out. For distinct users
+/// with current bindings, only the card fingerprint can match.
+/// A match is a review hint, not grounds for enforcement; a non-match does
+/// not rule out a shared funding card (wallets can use different tokens).
 pub(crate) fn compare(
     issuer: Option<&ConfirmedCardPayment<'_>>,
     invitee: Option<&ConfirmedCardPayment<'_>>,
@@ -240,6 +243,7 @@ mod tests {
             ("/charge/customer", Value::Null),
             ("/id", json!("in_Other")),
             ("/charge/invoice", json!("in_Other")),
+            ("/livemode", json!(true)),
             ("/charge/livemode", json!(true)),
         ] {
             let mut invoice = fixture.clone();
