@@ -27,9 +27,8 @@ class Decoder extends EventTarget {
 	set currentTime(value: number) { this.write(value); }
 	get seekable() { return timeRanges(this.ranges); }
 	emit(...types: string[]) { for (const type of types) this.dispatchEvent(new Event(type)); }
-	setReady(ranges: [number, number][] = [[0, 60]]) {
+	setReady = (ranges: Decoder['ranges'] = [[0, 60]]) =>
 		Object.assign(this, { duration: 60, ranges, HAVE_METADATA: 1, readyState: 1, playbackRate: 1 }).emit('loadedmetadata');
-	}
 	constructor(readonly source: string) { super(); }
 	getAttribute() { return this.source; }
 	fastSeek = vi.fn();
@@ -210,22 +209,20 @@ function setup({ unsupported, connected = true, ranges }: { unsupported?: string
 	return { handler, session, media, audio, detach, queue, select: (track: typeof moss) => commit(createQueue([track])),
 		fire: (action: typeof actions[number], details: object = {}) => handler(action)!({ action, ...details }) };
 }
-
-test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 60, true, 0], ['extended', 75, true, 75],
-	['old end', 60, false, 75], ['rounded old end', 60.001, false, 60.035], ['short extension', 60.034, true, 60.035],
+test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 60, true, 0], ['interior natural end', 59.999, true, 0],
+	['extended', 75, true, 75], ['old end', 60, false, 75], ['rounded old end', 60.001, false, 60.035], ['short extension', 60.034, true, 60.035],
 	['overlapping extension', 60.035, true, 60.035, 60.02], ['historical range', 60.035, false, 60.035, 0], ['corrected down', 59.8, false, 0],
-	['interior corrected down', 59.8, false, 0], ['interior corrected down rounded', 59.839, false, 59.84], ['interior corrected down historical', 59.84, false, 59.84, 59.8],
+	['interior corrected down', 59.8, false, 0], ['interior corrected down rounded', 59.839, false, 59.84],
+	['interior corrected down historical', 59.84, false, 59.84, 59.8], ['interior corrected down replay', 59.84, true, 59.84, 59.8, 59.82],
 	['interior corrected down played', 59.84, true, 59.84], ['interior corrected down played rounded', 59.839, true, 59.84],
-	['interior rounded up', 60, false, 0], ['interior natural end', 59.999, true, 0],
+	['interior rounded up', 60, false, 0], ['interior rounded up settled', 60, false, 0, 59.98], ['interior rounded up replay', 60, true, 0, 59.98, 59.99],
 	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
-] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?) => {
+] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?, motion?) => {
 	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot, positionState = vi.mocked(session.setPositionState)!;
 	await media.playCurrent(); audio.emit('playing'); positionState.mockClear();
-	for (const [action, details, target] of [
-		['seekforward', {}, 30], ['seekbackward', { seekOffset: 2.5 }, 27.5], ['seekforward', { seekOffset: 100 }, 60],
-		['seekbackward', { seekOffset: 100 }, 0], ['seekto', { seekTime: 100 }, 60],
-		['seekto', { seekTime: 0 }, 0], ['seekto', { seekTime: 12.25, fastSeek: true }, 12.25]
-	] as const) {
+	for (const [action, details, target] of [['seekforward', {}, 30], ['seekbackward', { seekOffset: 2.5 }, 27.5],
+		['seekforward', { seekOffset: 100 }, 60], ['seekbackward', { seekOffset: 100 }, 0], ['seekto', { seekTime: 100 }, 60],
+		['seekto', { seekTime: 0 }, 0], ['seekto', { seekTime: 12.25, fastSeek: true }, 12.25]] as const) {
 		fire(action, details);
 		expect(audio).toMatchObject({ currentTime: target, paused: false });
 		if (action === 'seekto') expect(get(media.absoluteSeek).position).toBe(target);
@@ -234,7 +231,7 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	audio.emit('seeked');
 	expect(positionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
 	const ignored = scenario.endsWith('ignored'), unchanged = ignored || scenario.endsWith('unchanged'), endpoint = unchanged ? 60.035 : 60;
-	const forward = scenario === 'seekforward' || scenario.startsWith('forward'), rounded = scenario === 'interior rounded up';
+	const forward = scenario === 'seekforward' || scenario.startsWith('forward'), rounded = scenario.startsWith('interior rounded up');
 	const corrected = scenario.includes('corrected down'), target = scenario.startsWith('interior') ? (corrected ? 59.8 : 59.99) : endpoint;
 	if (unchanged) Object.assign(audio, { duration: endpoint, ranges: [[0, endpoint]], position: 60 });
 	if (priorStart !== undefined) audio.played = timeRanges([[priorStart, position]]);
@@ -245,10 +242,12 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	if (forward) expect(get(media.seekFeedback).jumpStatus).toBe(ignored ? 'The player did not accept that jump.' : 'Forward to the end, 1:00.');
 	if (scenario === 'compact') media.seek(get(media.absoluteSeek).attachment, 59.9999995);
 	else if (corrected) Object.assign(audio, { duration: revisedDuration || position, position: scenario.startsWith('interior') ? target : position }).emit('durationchange');
-	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('seeked'); }
+	if (rounded && priorStart !== undefined) audio.position = priorStart;
+	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('timeupdate', 'seeked'); }
 	if (revisedDuration && !corrected) Object.assign(audio, { duration: revisedDuration }).emit('durationchange');
-	if (scenario.endsWith('extension') || scenario === 'interior natural end' || (corrected && advances)) audio.played = timeRanges([[target, corrected ? revisedDuration : position]]);
-	if (rounded) media.setRepeat('one', null);
+	if (priorStart !== undefined && (corrected || rounded)) Object.assign(audio, { position: motion ?? audio.position }).emit('timeupdate');
+	if (scenario.endsWith('extension') || scenario === 'interior natural end' || (corrected && advances && !motion)) audio.played = timeRanges([[target, corrected ? revisedDuration : position]]);
+	if (rounded && priorStart === undefined) media.setRepeat('one', null);
 	media.sleepTimer.start({ kind: 'stop-after-tracks', count: 2 }, 'Sleep after two tracks');
 	Object.assign(audio, { position, ended: true, paused: true }).emit('pause', 'ended');
 	await Promise.resolve();
@@ -354,8 +353,7 @@ test('late publication binds supported seek actions and preserves both Play cont
 });
 
 test.each(['decoder', 'source', 'auth', 'detach'])('fences all queued callbacks across %s changes', (boundary) => {
-	const { audio, media, queue, select, detach, handler, fire } = setup();
-	const retired = actions.map((action) => handler(action)!);
+	const { audio, media, queue, select, detach, handler, fire } = setup(), retired = actions.map((action) => handler(action)!);
 	if (boundary === 'auth') {
 		queue.purgeAtAuthBoundary(() => media.purgeAtAuthBoundary(() => {}));
 		select(coral);
