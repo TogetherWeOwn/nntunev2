@@ -67,12 +67,15 @@ on `main`.
 | [Deploy run](https://github.com/TogetherWeOwn/nntunev2/actions/runs/44953848589) | [Web](https://github.com/TogetherWeOwn/nntunev2/actions/runs/44953848589/job/136997504911) and [API](https://github.com/TogetherWeOwn/nntunev2/actions/runs/44953848589/job/136997504894) executed their deploy steps successfully. The API cache-disabled, read-only schema and off-and-drained readback steps passed. [MB](https://github.com/TogetherWeOwn/nntunev2/actions/runs/44953848589/job/136997504919) and [ingest](https://github.com/TogetherWeOwn/nntunev2/actions/runs/44953848589/job/136997603536) skipped their deploy steps. |
 | Same-run post-deploy checks | [Synthetic health smoke](https://github.com/TogetherWeOwn/nntunev2/actions/runs/44953848589/job/136998802714) passed. The [full journey and its evidence gate](https://github.com/TogetherWeOwn/nntunev2/actions/runs/44953848589/job/136998928254) failed with 631 passed, 12 skipped and 1 failed. The [fresh-account Library case](../e2e/tests/catalogue.spec.ts) failed its empty-array response assertion. |
 
-1. Verify the fresh-account Library response against the staging publication
-   state and the [E2E evidence contract](../e2e/README.md#evidence).
+1. Reconcile the fresh-account Library response with the staging publication
+   state and the [E2E evidence contract](../e2e/README.md#evidence). The empty
+   Library assertion runs when `SHARED_CATALOGUE_PUBLISHED` is false or unset.
+   Enable that flag only after a real curated release is published.
 2. Supply a real admin-published matched release for staging. The populated
    catalogue, ingest, playback, seek and related parked checks need a curated
    staging source. Restore the applicable spec legs and evidence-gate entries
-   together, and cover active test-mode entitlement. The [M1 matrix](m1-exit-traceability.md#matrix)
+   together. Exercise owner-issued invite redemption and active test-mode
+   entitlement. The [M1 matrix](m1-exit-traceability.md#matrix)
    identifies each gap.
 3. For a promotion candidate, record the precise serving SHA at both ends of
    the Access-protected journey and retain its passing same-run result.
@@ -86,9 +89,15 @@ on `main`.
    An accepted rollback pointer and successful restore run are still outstanding
    in this readout.
 
-M1 exit remains open. Production has its own exact-head Release Manager and
-environment gates. See the [maintenance seed precondition](ops.md#production-seed-precondition-one-time),
-[production secret-shape gate](ops.md#production-worker-secret-shape-gate) and
-[promotion receipt and release procedure](ops.md#production-promotion-publishes-a-calver-release).
+M1 exit remains open. Production requires the full passing journey and an
+[attempt-bound candidate admission receipt](../ci/staging-admission.md).
+The [admission policy](../ci/staging-admission-policy.json) has no approvals.
+Product approval of the journey contract and separate QA approval of the
+executable evidence mapping are still required. Release Manager acceptance
+and environment gates also apply. See the
+[maintenance seed precondition](ops.md#production-seed-precondition-one-time)
+and [production secret-shape gate](ops.md#production-worker-secret-shape-gate).
+The [CalVer release receipt](ops.md#production-promotion-publishes-a-calver-release)
+is recorded after production promotion and smoke.
 Consult [GitHub releases](https://github.com/TogetherWeOwn/nntunev2/releases)
 for published release history.

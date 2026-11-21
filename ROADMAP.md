@@ -69,11 +69,6 @@ See [ADR 0015](docs/adr/0015-standard-s3-storage-boundary.md).
 
 ## Direction
 
-The programme order agreed on 2026-11-03 is R1 (shell and core playback),
-R2 (catalogue), R3 (discovery and video), then R4 (cross-device and
-conditional social features). The sections below describe the scope of each
-stage. M1 is a separate staging acceptance gate for launch consideration.
-
 ### Reliable everyday listening
 
 Focus on a coherent desktop and mobile web experience: browse the library,
@@ -104,12 +99,9 @@ Use [ADR 0007's amendment](docs/adr/0007-mb-mirror.md#2026-11-07-amendment-retir
 for the weekly core-CC0 mirror refresh plan. Genre browsing needs
 [measured coverage of at least 80% of playable artists](docs/genre-root-coverage.md#later-real-data-measurement-and-guardrails).
 
-The 2026-11-03 lyrics scope uses suitable embedded tags or sidecar files from
-the curated collection first, with a free, credited source as a conditional
-fallback and the panel hidden when lyrics are absent. Any lyric-line search
-is limited to lyrics held from the curated collection. Synced lyrics remain
-off pending a separate licensing decision. See the
-[attribution inventory](docs/attributions.md#scope-and-provenance).
+Lyrics depend on suitable sources and usage rights. The
+[handoff](docs/handoff.md#player) records the existing panel and the activation
+work that remains. See the [attribution inventory](docs/attributions.md#scope-and-provenance).
 
 ### Later, conditional possibilities
 
