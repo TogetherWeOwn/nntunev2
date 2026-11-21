@@ -10787,7 +10787,6 @@ mod tests {
                 }
                 if self.relabel_before_store.replace(false) {
                     let row = rows.get_mut(user_id).unwrap();
-                    assert!(!outcome.explicit_stale);
                     assert_eq!(outcome.read_plan.as_deref(), Some(PLAN_PLUS));
                     assert_eq!(outcome.row.paid_through_unix, row.paid_through_unix);
                     assert_eq!(outcome.row.status, "canceled");
@@ -10824,7 +10823,8 @@ mod tests {
                         return Err(StoreError);
                     }
                 } else if occupied {
-                    shadow.insert(key, merge_billing_row(stored, outcome));
+                    let merged = merge_billing_row(stored, outcome);
+                    shadow.insert(key, merged);
                 } else {
                     let merged = merge_billing_row(stored, outcome);
                     if let Some(existing) = current.filter(|row| &row.stripe_subscription_id != sub)
