@@ -36,9 +36,11 @@ function seekableCovers(ranges: TimeRanges, target: number): boolean {
  */
 export function jumpMedia(
 	media: JumpMedia & { readonly seeking?: boolean }, direction: JumpDirection, matches: () => boolean = () => true, assigned?: () => void,
-	seconds = RELATIVE_JUMP_SECONDS, onSystemUnavailable?: () => void, landed?: (target: number, duration: number) => void
+	seconds = RELATIVE_JUMP_SECONDS, onSystemUnavailable?: () => void, landed?: (target: number, duration: number, observed: number) => void
 ): JumpOutcome {
-	let duration: number, position: number, target: number, raw: number;
+	let duration: number, position: number;
+	let target: number;
+	let raw: number;
 	try {
 		({ duration, currentTime: position } = media);
 		if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(position) || (onSystemUnavailable && 'error' in media && media.error)) {
@@ -46,13 +48,14 @@ export function jumpMedia(
 			return { kind: 'unavailable' };
 		}
 		const back = direction === 'back';
+		const slack = onSystemUnavailable ? 0 : TOLERANCE;
+		if (back ? position <= slack : position >= duration - slack) {
+			if (onSystemUnavailable && !seekable(media, duration, undefined, onSystemUnavailable)) return { kind: 'unavailable' };
+			return { kind: 'boundary', edge: back ? 'start' : 'end' };
+		}
 		raw = position + (back ? -seconds : seconds);
 		target = Math.min(Math.max(raw, 0), duration);
-		const slack = onSystemUnavailable ? 0 : TOLERANCE;
-		const atEdge = back ? position <= slack : position >= duration - slack;
-		if (!(onSystemUnavailable ? seekable(media, duration, atEdge ? undefined : target, onSystemUnavailable)
-			: atEdge || seekableCovers(media.seekable, target))) return { kind: 'unavailable' };
-		if (atEdge) return { kind: 'boundary', edge: back ? 'start' : 'end' };
+		if (!(onSystemUnavailable ? seekable(media, duration, target, onSystemUnavailable) : seekableCovers(media.seekable, target))) return { kind: 'unavailable' };
 		if (onSystemUnavailable && target === position) return { kind: 'refused' };
 	} catch {
 		onSystemUnavailable?.();
@@ -67,8 +70,10 @@ export function jumpMedia(
 		const readback = media.currentTime;
 		const roundedEndpoint = readback === position && canStartEndpointSeek && media.seeking;
 		const tolerance = onSystemUnavailable && !roundedEndpoint ? Math.min(TOLERANCE, Math.abs(target - position) / 2) : TOLERANCE;
-		if (!Number.isFinite(readback) || Math.abs(readback - target) > tolerance) return { kind: 'refused' };
-		if (readback !== position || roundedEndpoint) landed?.(target, duration);
+		if (!Number.isFinite(readback) || Math.abs(readback - target) > tolerance) {
+			return { kind: 'refused' };
+		}
+		if (readback !== position || roundedEndpoint) landed?.(target, duration, readback);
 	} catch {
 		return { kind: 'refused' };
 	}

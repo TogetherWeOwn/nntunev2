@@ -212,45 +212,47 @@ function setup({ unsupported, connected = true, ranges }: { unsupported?: string
 }
 
 test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 60, true, 0], ['extended', 75, true, 75],
-	['old end', 60, false, 75], ['rounded old end', 60.001, false, 60.035], ['short extension', 60.035, true, 60.035],
+	['old end', 60, false, 75], ['rounded old end', 60.001, false, 60.035], ['short extension', 60.034, true, 60.035],
 	['overlapping extension', 60.035, true, 60.035, 60.02], ['historical range', 60.035, false, 60.035, 0], ['corrected down', 59.8, false, 0],
+	['interior corrected down', 59.8, false, 0], ['interior rounded up', 60, false, 0], ['interior natural end', 60, true, 0],
 	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
 ] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?) => {
 	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot, positionState = vi.mocked(session.setPositionState)!.mockClear();
+	await media.playCurrent();
 	for (const [action, details, target] of [
-		['seekto', { seekTime: 12.25, fastSeek: true }, 12.25], ['seekforward', {}, 22.25],
-		['seekbackward', { seekOffset: 2.5 }, 19.75], ['seekforward', { seekOffset: 100 }, 60],
-		['seekbackward', { seekOffset: 100 }, 0], ['seekto', { seekTime: 100 }, 60], ['seekto', { seekTime: 0 }, 0]
+		['seekforward', {}, 30], ['seekbackward', { seekOffset: 2.5 }, 27.5], ['seekforward', { seekOffset: 100 }, 60],
+		['seekbackward', { seekOffset: 100 }, 0], ['seekto', { seekTime: 100 }, 60],
+		['seekto', { seekTime: 0 }, 0], ['seekto', { seekTime: 12.25, fastSeek: true }, 12.25]
 	] as const) {
 		fire(action, details);
-		expect(audio).toMatchObject({ currentTime: target, paused: true });
+		expect(audio).toMatchObject({ currentTime: target, paused: false });
 		if (action === 'seekto') expect(get(media.absoluteSeek).position).toBe(target);
 	}
-	await media.playCurrent();
-	fire('seekforward');
-	expect(audio).toMatchObject({ currentTime: 10, paused: false });
-	fire('seekto', { seekTime: 12.25 });
 	for (const unused of [audio.pause, audio.fastSeek, positionState]) expect(unused).not.toHaveBeenCalled();
 	audio.emit('seeked');
 	expect(positionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
 	audio.emit('playing');
 	const ignored = scenario.endsWith('ignored'), unchanged = ignored || scenario.endsWith('unchanged'), endpoint = unchanged ? 60.035 : 60;
-	const forward = scenario === 'seekforward' || scenario.startsWith('forward');
+	const forward = scenario === 'seekforward' || scenario.startsWith('forward'), rounded = scenario === 'interior rounded up';
+	const target = scenario === 'interior corrected down' ? 59.8 : scenario.startsWith('interior') ? 59.99 : endpoint;
 	if (unchanged) Object.assign(audio, { duration: endpoint, ranges: [[0, endpoint]], position: 60 });
 	if (priorStart !== undefined) audio.played = timeRanges([[priorStart, position]]);
-	audio.write.mockImplementationOnce((target) => ignored ? undefined
-		: Object.assign(audio, { position: unchanged || scenario === 'corrected down' ? 60 : target - 0.000001, seeking: true }));
-	fire(forward ? 'seekforward' : 'seekto', { seekTime: endpoint, seekOffset: 100 });
-	expect(audio.write).toHaveBeenLastCalledWith(endpoint);
+	audio.write.mockImplementationOnce(() => ignored ? undefined : Object.assign(audio,
+		{ position: unchanged || rounded || scenario === 'corrected down' ? 60 : target - 0.000002, seeking: true }));
+	fire(forward || rounded ? 'seekforward' : 'seekto', { seekTime: target, seekOffset: rounded ? target - audio.position : 100 });
+	expect(audio.write).toHaveBeenLastCalledWith(target);
 	if (forward) expect(get(media.seekFeedback).jumpStatus).toBe(ignored ? 'The player did not accept that jump.' : 'Forward to the end, 1:00.');
 	if (scenario === 'compact') media.seek(get(media.absoluteSeek).attachment, 59.9999995);
-	else if (scenario === 'seekto' || scenario === 'seekforward') audio.position = 59.999998;
-	else if (scenario === 'corrected down') { audio.duration = audio.position = position; audio.emit('durationchange'); }
+	else if (scenario.endsWith('corrected down')) { audio.duration = audio.position = position; audio.emit('durationchange'); }
 	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('seeked'); }
-	if (revisedDuration) { audio.duration = revisedDuration; audio.emit('durationchange'); }
+	if (revisedDuration) Object.assign(audio, { duration: revisedDuration }).emit('durationchange');
 	if (scenario.endsWith('extension')) audio.played = timeRanges([[60, position]]);
+	if (rounded) media.setRepeat('one', null);
+	media.sleepTimer.start({ kind: 'stop-after-tracks', count: 2 }, 'Sleep after two tracks');
 	Object.assign(audio, { position, ended: true, paused: true }).emit('pause', 'ended');
+	await Promise.resolve();
 	if (advances) expect(queue.snapshot.currentIndex).toBe(1); else expect(queue.snapshot).toBe(initial);
+	expect(get(media.sleepTimer).remaining).toBe(advances ? '1 track remaining' : '2 tracks remaining');
 	expect([audio.play.mock.calls.length, audio.load.mock.calls.length]).toEqual([1, 0]);
 	expect(get(media.playbackStatus)).toBe('paused');
 });
@@ -286,7 +288,7 @@ test('invalid inputs leave time unchanged and native ranges govern seek registra
 	expect(get(media.absoluteSeek).feedback).toBe('That position is not seekable yet.');
 	fire('seekforward', { seekOffset: 4.02 });
 	expect(get(media.seekFeedback).jumpStatus).toBe('Cannot jump: this track cannot seek yet.');
-	expect(audio.write).not.toHaveBeenCalled();
+	for (const unused of [audio.write, audio.play]) expect(unused).not.toHaveBeenCalled();
 	for (const action of actions) expect(handler(action)).toBeTypeOf('function');
 });
 
