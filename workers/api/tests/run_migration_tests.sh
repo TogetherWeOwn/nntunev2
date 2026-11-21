@@ -162,6 +162,7 @@ for f in "${tests[@]}"; do
     -v ingest_session_reserve_sql="$(<"$root/workers/api/src/ingest_session_reserve.sql")" \
     -v ingest_session_terminate_sql="$(<"$root/workers/api/src/ingest_session_terminate.sql")" \
     -v ingest_session_advance_checkpoint_sql="$(<"$root/workers/api/src/ingest_session_advance_checkpoint.sql")" \
+    -v ingest_session_status_sql="$(<"$root/workers/api/src/ingest_session_status.sql")" \
     -v audio_classifications_store_sql="$(<"$root/workers/ingest/src/audio_classifications_store.sql")" -f "$f"
 done
 # Hosted-only concurrent fixtures are run separately by the migration CI job.
