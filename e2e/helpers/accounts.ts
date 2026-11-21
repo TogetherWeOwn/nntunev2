@@ -279,25 +279,6 @@ export async function apiPost(
   return res;
 }
 
-/** Credentialed, bodyless DELETE with the same no-follow contract as apiGet. */
-export async function apiDelete(
-  request: APIRequestContext,
-  url: string,
-  headers: Record<string, string>,
-  context: string,
-  opts?: { timeout?: number },
-): Promise<APIResponse> {
-  const res = await credentialedTransport('DELETE', () =>
-    request.delete(url, {
-      headers,
-      timeout: opts?.timeout ?? 30_000,
-      maxRedirects: 0,
-    }),
-  );
-  throwOnRedirect(res.status(), res.headers(), context);
-  return res;
-}
-
 /**
  * No-follow OPTIONS for CORS preflight probes. Same contract as apiGet:
  * fetches with maxRedirects: 0 so a staging 3xx is returned as-is (never
@@ -902,4 +883,23 @@ export async function submitPublicUiSignupToBilling(
     'authenticated billing action not visible after public UI signup',
   ).toBeVisible({ timeout: 15_000 });
   return { email, viaApi: false };
+}
+
+/** Credentialed, bodyless DELETE with the same no-follow contract as apiGet. */
+export async function apiDelete(
+  request: APIRequestContext,
+  url: string,
+  headers: Record<string, string>,
+  context: string,
+  opts?: { timeout?: number },
+): Promise<APIResponse> {
+  const res = await credentialedTransport('DELETE', () =>
+    request.delete(url, {
+      headers,
+      timeout: opts?.timeout ?? 30_000,
+      maxRedirects: 0,
+    }),
+  );
+  throwOnRedirect(res.status(), res.headers(), context);
+  return res;
 }

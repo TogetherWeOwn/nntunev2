@@ -238,8 +238,10 @@ Listed so it is not mistaken for (or double-counted as) M1 coverage:
   Skips pre-deploy and fails closed on CI without `QA_AUTH_TOKEN`, mirroring
   `e2e/tests/login-magic-link.spec.ts`. Session hardening, not journey coverage.
 - `e2e/tests/listen-history-privacy.spec.ts` is an empty-history privacy-route
-  smoke in the ordinary post-deploy journey with the exact API build. It mints
-  a disposable account and uses only the fresh session cookie and exact app
+  smoke in the ordinary post-deploy journey with the exact API build. This leg
+  is not applicable when the same-run API deploy explicitly reports
+  `unconfigured`; that run supplies no privacy-route evidence. It mints a
+  disposable account and uses only the fresh session cookie and exact app
   Origin for `POST /v1/plays/export` and `DELETE /v1/plays/events`; the QA token
   is setup-only. Both routes must reject a missing cookie and a mismatched
   Origin. The first export must be empty (`account_lifetime`, null cursor,

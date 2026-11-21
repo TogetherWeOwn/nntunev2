@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type APIRequestContext } from '@playwright/test';
 import { stagingBaseUrl } from '../helpers/access.js';
 import { assertServingBuildMatchesPromotion } from '../helpers/build-identity-live.js';
 import {
@@ -261,4 +261,41 @@ test('deployed build matches the promotion SHA (exact-head staging evidence)', a
   // API, logged as web=… api=… head=…) before the journey. The closing spec re-reads at the end through the same helper —
   // a mid-journey deploy reds the run instead of passing green.
   await assertServingBuildMatchesPromotion(request, baseURL, 'build-identity');
+});
+
+test('only the opening and closing build reads emit candidate-identity', async ({}, testInfo) => {
+  const head = 'a'.repeat(40);
+  const env = { EXPECTED_BUILD_SHA: head, API_DEPLOY_OUTCOME: 'deployed' };
+  const saved = Object.keys(env).map((key) => [key, process.env[key]] as const);
+  Object.assign(process.env, env);
+  const origin = 'https://staging.example.test';
+  const initialAnnotationCount = testInfo.annotations.length;
+  let apiSha = head;
+  const request = {
+    get: async (url: string) => ({
+      status: () => 200,
+      headers: () => ({}),
+      text: async () =>
+        JSON.stringify(url === `${origin}/api/build` ? { sha: head } : { ok: true, build_sha: apiSha }),
+    }),
+  } as unknown as APIRequestContext;
+  try {
+    for (const phase of ['build-identity', 'listen-history-privacy', 'build-identity-final']) {
+      await expect(assertServingBuildMatchesPromotion(request, origin, phase)).resolves.toBe(head);
+    }
+    apiSha = 'b'.repeat(40);
+    await expect(assertServingBuildMatchesPromotion(request, origin, 'listen-history-privacy'))
+      .rejects.toThrow(/API build identity mismatch/);
+    const phases = testInfo.annotations.slice(initialAnnotationCount)
+      .filter(({ type }) => type === 'candidate-identity')
+      .map(({ description }) => JSON.parse(description ?? '{}').phase);
+    expect(phases).toEqual(['build-identity', 'build-identity-final']);
+  } finally {
+    // This offline double also runs in the full journey; never report its fake SHAs.
+    testInfo.annotations.splice(initialAnnotationCount);
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });

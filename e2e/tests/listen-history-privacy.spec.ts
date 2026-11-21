@@ -1,4 +1,10 @@
-import { expect, request as playwrightRequest, test, type APIResponse } from '@playwright/test';
+import {
+  expect,
+  request as playwrightRequest,
+  test,
+  type APIRequestContext,
+  type APIResponse,
+} from '@playwright/test';
 import { accessHeaders, readApiBody, stagingBaseUrl } from '../helpers/access.js';
 import { apiDelete, apiPost, SESSION_COOKIE_NAME, tryMintTestAccount } from '../helpers/accounts.js';
 import { assertServingBuildMatchesPromotion } from '../helpers/build-identity-live.js';
@@ -49,7 +55,7 @@ async function expectAuthRejection(response: APIResponse, context: string): Prom
   ).toBe(true);
 }
 
-test('empty-history privacy-route smoke: export, reject, clear, export again', async ({ request }) => {
+async function emptyHistoryPrivacySmoke({ request }: { request: APIRequestContext }) {
   const baseURL = stagingBaseUrl('skip', CONTEXT);
   if (!baseURL) {
     test.skip(true, 'STAGING_BASE_URL not configured (pre-deploy) — see e2e/README.md.');
@@ -77,9 +83,9 @@ test('empty-history privacy-route smoke: export, reject, clear, export again', a
   const edgeHeaders = accessHeaders();
   const sessionHeaders = { ...edgeHeaders, Cookie: `${SESSION_COOKIE_NAME}=${account.session}` };
   const exactHeaders = { ...sessionHeaders, Origin: origin };
-  const exportHistory = (client: typeof request, headers: Headers, context: string) =>
+  const exportHistory = (client: APIRequestContext, headers: Headers, context: string) =>
     apiPost(client, `${origin}${EXPORT_PATH}`, headers, {}, context);
-  const clearHistory = (client: typeof request, headers: Headers, context: string) =>
+  const clearHistory = (client: APIRequestContext, headers: Headers, context: string) =>
     apiDelete(client, `${origin}${CLEAR_PATH}`, headers, context);
 
   // Stop before any DELETE if the fixture is unexpectedly populated. This
@@ -108,4 +114,10 @@ test('empty-history privacy-route smoke: export, reject, clear, export again', a
   expect(clear.ok === true, 'clear must confirm with ok:true').toBe(true);
   const after = await exportHistory(request, exactHeaders, 'post-clear export');
   await expectEmptyExport(after, 'post-clear export');
-});
+}
+
+// The ordinary journey can run with a prior API when staging-api is explicitly
+// unconfigured. This deploy-only leg is then not applicable, not a journey skip.
+if (apiDeployOutcome() !== 'unconfigured') {
+  test('empty-history privacy-route smoke: export, reject, clear, export again', emptyHistoryPrivacySmoke);
+}
