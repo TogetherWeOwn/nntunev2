@@ -214,7 +214,8 @@ function setup({ unsupported, connected = true, ranges }: { unsupported?: string
 test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 60, true, 0], ['extended', 75, true, 75],
 	['old end', 60, false, 75], ['rounded old end', 60.001, false, 60.035], ['short extension', 60.034, true, 60.035],
 	['overlapping extension', 60.035, true, 60.035, 60.02], ['historical range', 60.035, false, 60.035, 0], ['corrected down', 59.8, false, 0],
-	['interior corrected down', 59.8, false, 0], ['interior corrected down rounded', 59.8, false, 59.801],
+	['interior corrected down', 59.8, false, 0], ['interior corrected down rounded', 59.839, false, 59.84], ['interior corrected down historical', 59.84, false, 59.84, 59.8],
+	['interior corrected down played', 59.84, true, 59.84], ['interior corrected down played rounded', 59.839, true, 59.84],
 	['interior rounded up', 60, false, 0], ['interior natural end', 59.999, true, 0],
 	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
 ] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?) => {
@@ -243,10 +244,10 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	expect(audio.write).toHaveBeenLastCalledWith(target);
 	if (forward) expect(get(media.seekFeedback).jumpStatus).toBe(ignored ? 'The player did not accept that jump.' : 'Forward to the end, 1:00.');
 	if (scenario === 'compact') media.seek(get(media.absoluteSeek).attachment, 59.9999995);
-	else if (corrected) Object.assign(audio, { duration: revisedDuration || position, position }).emit('durationchange');
+	else if (corrected) Object.assign(audio, { duration: revisedDuration || position, position: scenario.startsWith('interior') ? target : position }).emit('durationchange');
 	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('seeked'); }
 	if (revisedDuration && !corrected) Object.assign(audio, { duration: revisedDuration }).emit('durationchange');
-	if (scenario.endsWith('extension') || scenario === 'interior natural end') audio.played = timeRanges([[target, position]]);
+	if (scenario.endsWith('extension') || scenario === 'interior natural end' || (corrected && advances)) audio.played = timeRanges([[target, corrected ? revisedDuration : position]]);
 	if (rounded) media.setRepeat('one', null);
 	media.sleepTimer.start({ kind: 'stop-after-tracks', count: 2 }, 'Sleep after two tracks');
 	Object.assign(audio, { position, ended: true, paused: true }).emit('pause', 'ended');
@@ -341,13 +342,11 @@ test('late publication binds supported seek actions and preserves both Play cont
 	const { audio, media, select, handler, fire } = setup({ unsupported: 'seekto', connected: false });
 	expect(handler('play')).toBeUndefined();
 	audio.isConnected = true;
-	select({ ...coral });
-	audio.setReady();
+	select({ ...coral }); audio.setReady();
 	expect(handler('seekto')).toBeUndefined();
 	fire('seekbackward');
 	expect(audio.currentTime).toBe(10);
-	await media.playCurrent();
-	expect(audio.play).toHaveBeenCalledOnce();
+	await media.playCurrent(); expect(audio.play).toHaveBeenCalledOnce();
 	media.pauseCurrent();
 	expect(audio.paused).toBe(true);
 	handler('play')!();
