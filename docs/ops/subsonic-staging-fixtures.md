@@ -97,8 +97,14 @@ It does not waive DB or health checks, and any reported resource exceedance or
 termination still stops admission. Reconciliation needs clean coverage through
 client termination within two minutes of load close (three seconds in live
 mode), without extending the five-minute job deadline or holding up restore.
-This policy has no collectors or live entrypoint; it does not prove provider
-coverage or cleanup.
+The read-only observer exposes a one-shot pressure sample for a future
+executor. It reuses the fixed query, validates the database clock and counts,
+and limits the call to the earlier of the caller's monotonic deadline and the
+three-second freshness bound. It reports the start of the query's local time
+bracket, not its receipt time: a query started at or before a drain fence
+cannot clear it by returning later. Nothing calls this helper in a live load
+window yet. Health and resource collectors, live provider coverage and live
+cleanup remain unverified.
 
 ### Version-fenced restore rehearsal (offline)
 

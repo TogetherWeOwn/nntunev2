@@ -104,6 +104,47 @@ class ObserverTests(unittest.TestCase):
                 monotonic=iter((0, 6)).__next__,
             )
 
+    def test_pressure_uses_query_start_and_remaining_budget(self):
+        run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout=VALID))
+        reading = OBSERVER["sample_pressure"](
+            ENV,
+            deadline_ms=1625,
+            run=run,
+            wall=iter((99, 100)).__next__,
+            monotonic=iter((1.125, 1.5)).__next__,
+        )
+        # A zero arriving at 1500 cannot by itself clear a fence at 1125.
+        self.assertEqual(reading.observed_ms, 1125)
+        self.assertEqual(reading.measurement, 0)
+        self.assertEqual(reading.ordinary_free, 2)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
+
+    def test_pressure_drops_expired_late_and_stale_samples(self):
+        for deadline, clocks, raw, calls, category in (
+            (1000, (1,), VALID, 0, "deadline"),
+            (1500, (1, 1.5), VALID, 1, "deadline"),
+            (9000, (1, 4), VALID, 1, "deadline"),
+            (9000, (1, 2), b"96\n0|20|1|25|3\n", 1, "stale"),
+        ):
+            run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout=raw))
+            with (
+                self.subTest(deadline=deadline, clocks=clocks, category=category),
+                self.assertRaisesRegex(UnsafeSample, f"^{category}$"),
+            ):
+                OBSERVER["sample_pressure"](
+                    ENV,
+                    deadline_ms=deadline,
+                    run=run,
+                    wall=lambda: 100,
+                    monotonic=iter(clocks).__next__,
+                )
+            self.assertEqual(run.call_count, calls)
+            if calls:
+                self.assertEqual(
+                    run.call_args.kwargs["timeout"], min(3, deadline / 1000 - 1)
+                )
+
     def test_bad_shape_identity_and_stale_telemetry_stop(self):
         for raw, category in (
             (b"wrong-observer-identity\n", "identity"),

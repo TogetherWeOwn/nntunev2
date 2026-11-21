@@ -112,9 +112,22 @@ def parse_sample(raw, since, now):
     return row
 
 
-def sample(env, run=subprocess.run, wall=time.time, monotonic=time.monotonic):
+class PressureObservation(NamedTuple):
+    observed_ms: int
+    measurement: int
+    ordinary_free: int
+
+
+def _sample(env, run, wall, monotonic, deadline_ms=None):
     child = connection_env(env)
-    started = monotonic()
+    started_ms = monotonic() * 1000
+    observed_ms = int(started_ms)
+    cutoff_ms = started_ms + DEADLINE_SECONDS * 1000
+    if deadline_ms is not None:
+        cutoff_ms = min(deadline_ms, observed_ms + MAX_SAMPLE_AGE_SECONDS * 1000)
+    timeout = (cutoff_ms - started_ms) / 1000
+    if timeout <= 0:
+        raise UnsafeSample("deadline")
     since = wall()
     try:
         result = run(
@@ -131,18 +144,36 @@ def sample(env, run=subprocess.run, wall=time.time, monotonic=time.monotonic):
             input=SQL.encode("ascii"),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=DEADLINE_SECONDS,
+            timeout=timeout,
             env=child,
         )
     except subprocess.TimeoutExpired:
         raise UnsafeSample("deadline") from None
     except (OSError, ValueError):
         raise UnsafeSample("client") from None
-    if monotonic() - started > DEADLINE_SECONDS:
+    finished_ms = monotonic() * 1000
+    if not started_ms <= finished_ms < cutoff_ms:
         raise UnsafeSample("deadline")
     if result.returncode != 0:
         raise UnsafeSample("query")
-    return parse_sample(result.stdout, since, wall())
+    return observed_ms, parse_sample(result.stdout, since, wall())
+
+
+def sample(env, run=subprocess.run, wall=time.time, monotonic=time.monotonic):
+    return _sample(env, run, wall, monotonic)[1]
+
+
+def sample_pressure(
+    env, *, deadline_ms, run=subprocess.run, wall=time.time, monotonic=time.monotonic
+):
+    """Read once, under an absolute monotonic deadline; do not admit or retry."""
+    if type(deadline_ms) is not int or deadline_ms < 0:
+        raise UnsafeSample("deadline")
+    observed_ms, row = _sample(env, run, wall, monotonic, deadline_ms)
+    # The timestamp and count came from a new connection. Using the start of
+    # that query's local time bracket is conservative: a query begun before a
+    # drain fence cannot provide post-fence evidence merely by returning later.
+    return PressureObservation(observed_ms, row.measurement, row.ordinary_free)
 
 
 def require_preflight(row):
