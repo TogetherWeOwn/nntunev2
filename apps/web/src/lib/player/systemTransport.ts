@@ -4,6 +4,7 @@ import {
 	applyMediaSession, clearMediaSession, getMediaSession, setMediaSessionPosition, type MediaSessionHandlers
 } from './mediaSession.js';
 import type { QueueState, Track } from './queue.js';
+import { bindSystemSeek, type SystemSeekOwner } from './systemSeek.js';
 
 /** The native attachment owns this registration, not a route or queue revision. */
 export function bindSystemTransport(
@@ -13,7 +14,7 @@ export function bindSystemTransport(
 	{ playCurrent, pauseCurrent, onNext, onPrevious }: Pick<MediaSessionHandlers, 'onNext' | 'onPrevious'> & {
 		playCurrent: () => Promise<void>; pauseCurrent: () => void;
 	},
-	signal: AbortSignal
+	signal: AbortSignal, seekOwner: SystemSeekOwner
 ): void {
 	const session = getMediaSession();
 	if (!session || signal.aborted) return;
@@ -50,9 +51,12 @@ export function bindSystemTransport(
 		'ratechange', 'playing', 'pause', 'ended', 'emptied', 'error']) {
 		audio.addEventListener(type, observePosition, { signal });
 	}
+	let systemSeek: ReturnType<typeof bindSystemSeek> | undefined;
 	unsubscribe = queue.subscribe(() => {
 		if (signal.aborted) return;
 		const track = readTrack();
+		systemSeek?.refresh();
+		if (signal.aborted) return;
 		if (!track) {
 			if (published && !signal.aborted) setMediaSessionPosition(null, options);
 			return;
@@ -61,9 +65,11 @@ export function bindSystemTransport(
 		const positionState = readPosition(track);
 		if (positionState === undefined) return;
 		published = track;
+		systemSeek ??= bindSystemSeek(session, seekOwner, signal);
+		if (signal.aborted) return;
 		// Match the compact identity; don't introduce OS requests for external cover art.
 		applyMediaSession({ ...track, title: displayTitle(track), artist: displayArtist(track) ?? '', artworkUrl: null },
-			handlers, { ...options, positionState });
+			{ ...handlers, ...systemSeek.handlers }, { ...options, positionState });
 	});
 	if (signal.aborted) unsubscribe();
 }
