@@ -2,10 +2,12 @@
 //!
 //! The frame verifier accepts externally framed bytes. The pinned adapter
 //! additionally checks full responses and EOF against an existing inventory.
-//! Success does not establish inventory trust, media validity, custody, or eligibility.
+//! The private enrolled path also validates FLAC, but neither path establishes
+//! inventory authority, custody, or eligibility.
 
 use crate::digest_enrollment::OriginManifest;
 use crate::digest_range::{DigestRange, RangeError};
+use crate::flac_stream::FlacStream;
 use crate::media::FileKey;
 use crate::media_envelope::{enrolled_scheme2_key, EnvelopeContext};
 use sha2::{Digest, Sha256};
@@ -34,6 +36,16 @@ impl MediaValidation for () {
 
     fn finish(self) -> Result<(), ()> {
         Ok(())
+    }
+}
+
+impl MediaValidation for FlacStream {
+    fn push(&mut self, plaintext: &[u8]) -> Result<(), ()> {
+        FlacStream::push(self, plaintext)
+    }
+
+    fn finish(self) -> Result<(), ()> {
+        self.finish_at_eof()
     }
 }
 
@@ -236,15 +248,16 @@ fn compact_uuid(id: &[u8; 16]) -> String {
 /// The inputs must come from one independently authorized custody and locator
 /// snapshot. Pins use logical keys relative to the trusted provider prefix.
 /// No caller-supplied file key or fallback is accepted on this path.
-/// Success authorizes neither publication nor reuse.
-#[allow(dead_code)] // Not mounted; a concrete validator and trusted snapshot are still required.
+/// Validates FLAC on the authenticated slices used for the plaintext digest,
+/// finalizing it only after body EOF and digest agreement. Success authorizes
+/// neither publication nor reuse.
+#[allow(dead_code)] // Not mounted; the caller must supply a trusted snapshot.
 async fn verify_enrolled_readback<'a, B: ReadbackBody>(
     manifest: &OriginManifest,
     envelope: EnrolledEnvelope<'_>,
     media: ReadbackPin<'a>,
     pages: &[(u32, ReadbackPin<'a>)],
     open: impl AsyncFnMut(ReadbackPin<'a>) -> std::io::Result<ReadbackResponse<B>>,
-    validation: impl MediaValidation,
 ) -> Result<(), EnrolledReadbackError> {
     let key = enrolled_scheme2_key(
         envelope.authorized_root,
@@ -269,9 +282,17 @@ async fn verify_enrolled_readback<'a, B: ReadbackBody>(
     {
         return Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory));
     }
-    verify_readback(manifest, &key, &identities, media, pages, open, validation)
-        .await
-        .map_err(EnrolledReadbackError::Body)
+    verify_readback(
+        manifest,
+        &key,
+        &identities,
+        media,
+        pages,
+        open,
+        FlacStream::default(),
+    )
+    .await
+    .map_err(EnrolledReadbackError::Body)
 }
 
 async fn verify_readback<'a, B: ReadbackBody>(
@@ -406,39 +427,69 @@ mod tests {
         .await
     }
 
-    #[tokio::test]
-    async fn enrolled_readback_requires_the_exact_authenticated_envelope() {
-        struct ExactMedia<'a>(&'a [u8]);
+    const MEDIA: &str = "media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd";
+    const PAGE: &str = concat!(
+        "media-digests/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd/",
+        "02020202020240028002020202020202/00000000",
+    );
+    const ROOT: [u8; 32] = [2; 32];
 
-        impl MediaValidation for ExactMedia<'_> {
-            fn push(&mut self, plaintext: &[u8]) -> Result<(), ()> {
-                self.0 = self.0.strip_prefix(plaintext).ok_or(())?;
-                Ok(())
-            }
+    fn split_flac() -> Vec<u8> {
+        // Mono, 8-bit, 19 constant samples at 44.1 kHz. Padding positions
+        // the first frame header across the authenticated chunk boundary.
+        let mut bytes = b"fLaC\0\0\0\x22\0\x10\0\x10\0\0\0\0\0\0".to_vec();
+        bytes.extend_from_slice(&((44_100_u64 << 44) | (7 << 36) | 19).to_be_bytes());
+        bytes.extend_from_slice(&0x46d2be275ed2dd86ab2b5388f7346d15_u128.to_be_bytes());
+        let frame_start = 65_536 - 5;
+        let padding = (frame_start - bytes.len() - 4) as u32;
+        bytes.extend_from_slice(&(0x8100_0000 | padding).to_be_bytes());
+        bytes.resize(frame_start, 0);
+        bytes.extend_from_slice(&[255, 248, 105, 2, 0, 15, 183, 0, 42, 122, 221]);
+        bytes.extend_from_slice(&[255, 248, 105, 2, 1, 2, 129, 0, 42, 157, 29]);
+        bytes
+    }
 
-            fn finish(self) -> Result<(), ()> {
-                self.0.is_empty().then_some(()).ok_or(())
-            }
-        }
-
-        const MEDIA: &str =
-            "media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd";
-        const PAGE: &str = concat!(
-            "media-digests/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd/",
-            "02020202020240028002020202020202/00000000",
-        );
-        let plaintext = b"synthetic media";
+    fn enrolled_fixture(plaintext: &[u8]) -> (Fixture, Vec<u8>, EnvelopeContext, [u8; 230]) {
         let f = fixture_with_identities(plaintext, [id(6), id(7), id(0xab), id(0xcd), id(1)]);
-        let mut media_bytes = f.header.to_vec();
-        media_bytes.extend_from_slice(&f.chunks[0]);
+        assert_eq!(f.chunks.len(), 2);
+        let mut media = f.header.to_vec();
+        media.extend(f.chunks.iter().flatten().copied());
         let context = EnvelopeContext {
             identities: [id(9), id(6), id(7), id(0xab), id(0xcd), id(1)],
             plaintext_len: plaintext.len() as u64,
             header: f.header,
         };
-        let root = [2; 32];
         let record =
-            crate::media_envelope::wrap_scheme2(&root, &context, f.key.expose_secret()).unwrap();
+            crate::media_envelope::wrap_scheme2(&ROOT, &context, f.key.expose_secret()).unwrap();
+        (f, media, context, record)
+    }
+
+    fn enrolled_response<'a>(
+        request: ReadbackPin<'_>,
+        media: &'a [u8],
+        page: &'a [u8],
+        media_len: u64,
+    ) -> ReadbackResponse<Body<'a>> {
+        let (bytes, length) = match request.object_key {
+            MEDIA => (media, media_len),
+            PAGE => (page, page.len() as u64),
+            _ => panic!("unexpected synthetic request"),
+        };
+        ReadbackResponse {
+            configuration: request.configuration,
+            object_key: request.object_key.into(),
+            version: Some("original".into()),
+            status: 200,
+            content_length: Some(length),
+            has_content_range: false,
+            has_content_encoding: false,
+            body: Body(bytes, false),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolled_readback_requires_the_exact_authenticated_envelope() {
+        let (f, media_bytes, context, record) = enrolled_fixture(&split_flac());
         let mut altered = record;
         altered[229] ^= 1;
         let bad_object = MEDIA.replacen("ab", "AB", 1);
@@ -448,12 +499,12 @@ mod tests {
         let envelope = || Err(EnrolledReadbackError::Envelope);
         let inventory = || Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory));
         for (root, trusted, retained, media, page, expected) in [
-            (&root, &record, &record, MEDIA, PAGE, Ok(())),
-            (&root, &record, &altered, MEDIA, PAGE, envelope()),
-            (&root, &altered, &altered, MEDIA, PAGE, envelope()),
+            (&ROOT, &record, &record, MEDIA, PAGE, Ok(())),
+            (&ROOT, &record, &altered, MEDIA, PAGE, envelope()),
+            (&ROOT, &altered, &altered, MEDIA, PAGE, envelope()),
             (&[3; 32], &record, &record, MEDIA, PAGE, envelope()),
             (
-                &root,
+                &ROOT,
                 &record,
                 &record,
                 bad_object.as_str(),
@@ -461,7 +512,7 @@ mod tests {
                 inventory(),
             ),
             (
-                &root,
+                &ROOT,
                 &record,
                 &record,
                 bad_generation.as_str(),
@@ -469,7 +520,7 @@ mod tests {
                 inventory(),
             ),
             (
-                &root,
+                &ROOT,
                 &record,
                 &record,
                 MEDIA,
@@ -477,7 +528,7 @@ mod tests {
                 inventory(),
             ),
             (
-                &root,
+                &ROOT,
                 &record,
                 &record,
                 MEDIA,
@@ -497,27 +548,62 @@ mod tests {
                 pin(media),
                 &[(0, pin(page))],
                 async |request: ReadbackPin<'_>| {
-                    let bytes = match request.object_key {
-                        MEDIA => media_bytes.as_slice(),
-                        PAGE => f.pages[0].as_slice(),
-                        _ => panic!("unexpected synthetic request"),
-                    };
                     opens += 1;
-                    Ok(ReadbackResponse {
-                        configuration: request.configuration,
-                        object_key: request.object_key.into(),
-                        version: Some("original".into()),
-                        status: 200,
-                        content_length: Some(bytes.len() as u64),
-                        has_content_range: false,
-                        has_content_encoding: false,
-                        body: Body(bytes, false),
-                    })
+                    Ok(enrolled_response(
+                        request,
+                        &media_bytes,
+                        &f.pages[0],
+                        f.manifest.geometry().sealed_len(),
+                    ))
                 },
-                ExactMedia(plaintext),
             )
             .await;
             assert_eq!(opens, if expected.is_ok() { 2 } else { 0 });
+            assert_eq!(result, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolled_readback_requires_valid_flac_and_clean_eof() {
+        let valid = split_flac();
+        let mut wrong_checksum = valid.clone();
+        wrong_checksum[26] ^= 1;
+        let invalid = || {
+            Err(EnrolledReadbackError::Body(BodyReadbackError::Content(
+                ReadbackError::MediaValidation,
+            )))
+        };
+        let trailing = Err(EnrolledReadbackError::Body(BodyReadbackError::Trailing));
+        for (plaintext, extra, expected) in [
+            (valid.as_slice(), false, Ok(())),
+            (&valid[..valid.len() - 1], false, invalid()),
+            (wrong_checksum.as_slice(), false, invalid()),
+            (wrong_checksum.as_slice(), true, trailing),
+        ] {
+            let (f, mut media, context, record) = enrolled_fixture(plaintext);
+            if extra {
+                media.push(0);
+            }
+            let result = verify_enrolled_readback(
+                &f.manifest,
+                EnrolledEnvelope {
+                    authorized_root: &ROOT,
+                    context: &context,
+                    trusted_record: &record,
+                    retained_record: &record,
+                },
+                pin(MEDIA),
+                &[(0, pin(PAGE))],
+                async |request| {
+                    Ok(enrolled_response(
+                        request,
+                        &media,
+                        &f.pages[0],
+                        f.manifest.geometry().sealed_len(),
+                    ))
+                },
+            )
+            .await;
             assert_eq!(result, expected);
         }
     }
