@@ -57,6 +57,7 @@ class TelemetryGate:
         self._opened = self._last = opened_ms
         self._version = serving_version
         self._delayed = delayed_resources
+        self._group_completed = None
         self._closed = None
         self._stop = None
 
@@ -121,18 +122,27 @@ class TelemetryGate:
             None if self._delayed else max(self._opened, now - MAX_SAMPLE_AGE_MS),
         )
 
+    def record_group_completion(self, now):
+        """Call once all clients in a group terminate, before admitting a new group."""
+        self._clock(now)
+        self._require(
+            self._closed is None and now <= self._opened + MAX_LOAD_MS, "load-window"
+        )
+        self._group_completed = now
+
     def observe(self, now, pressure, health, coverage, *, overlapping_pair=False):
-        """Check while clients run and immediately before a start. False means wait for DB drain."""
+        """Check live telemetry. False means wait; overlap is only for a pair's second client."""
         self._clock(now)
         self._require(
             self._closed is None and now < self._opened + MAX_LOAD_MS, "load-window"
         )
         self._require(type(overlapping_pair) is bool, "telemetry-config")
         self._check_live(now, pressure, health, coverage)
-        return (
-            pressure.measurement < MAX_BACKENDS
-            if overlapping_pair
-            else pressure.measurement == 0
+        if overlapping_pair:
+            return pressure.measurement < MAX_BACKENDS
+        return pressure.measurement == 0 and (
+            self._group_completed is None
+            or pressure.observed_ms > self._group_completed
         )
 
     def close_load(self, now, pressure, health, coverage):

@@ -81,10 +81,13 @@ serving version while clients run, just before each start and at load close.
 Collectors must validate the identity and source timestamp first, then map it
 onto the runner's monotonic timeline; receipt time cannot make an old signal
 fresh. DB and health samples must be inside the window and at most three seconds
-old. Keep room for two measurement sessions in total, and wait for independent
-DB drain before a new group. Only a scheduled overlapping pair can use the
-second slot before drain. A violated threshold or missing signal stops admission
-for the rest of the window, with a fixed classification.
+old. Keep room for two measurement sessions in total. After all clients in a
+request group terminate, record the group's completion on the monotonic timeline
+before checking admission for the next group. Only an independently observed
+zero DB count strictly after that fence proves drain; a fresh zero from before
+or at the fence is insufficient. Only the second client of a scheduled pair
+can use the overlap allowance. A violated threshold or missing signal stops
+admission for the rest of the window, with a fixed classification.
 
 Resource-event evidence must cover the pinned version continuously from window
 open, not just contain the most recent event. An empty or sampled response is

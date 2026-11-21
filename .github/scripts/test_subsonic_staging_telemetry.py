@@ -73,6 +73,23 @@ class TelemetryTests(unittest.TestCase):
             gate.observe(NOW, full, HEALTH, COVERED, overlapping_pair=True)
         )
 
+    def test_new_group_requires_zero_observed_after_previous_group_ends(self):
+        gate = Gate(OPEN, VERSION)
+        self.assertTrue(gate.observe(NOW, DB, HEALTH, COVERED))
+        ended = NOW + 1
+        gate.record_group_completion(ended)
+        for stamp in (NOW, ended):
+            with self.subTest(stamp=stamp):
+                self.assertFalse(
+                    gate.observe(ended + 1, Pressure(stamp, 0, 2), HEALTH, COVERED)
+                )
+        self.assertFalse(
+            gate.observe(ended + 1, Pressure(ended + 1, 1, 1), HEALTH, COVERED)
+        )
+        self.assertTrue(
+            gate.observe(ended + 2, Pressure(ended + 2, 0, 2), HEALTH, COVERED)
+        )
+
     def test_only_platform_resources_can_be_delayed(self):
         gate = Gate(OPEN, VERSION, delayed_resources=True)
         self.assertTrue(gate.observe(NOW, DB, HEALTH, None))
