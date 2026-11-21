@@ -175,6 +175,12 @@ class CleanupTest(unittest.TestCase):
                 self.assertIs(reads.verify(), expected)
                 self.assertEqual(reads.calls, ORDER[:4])
 
+        # Sample at 1300.5 ms is after the fence (1300.25), but before dispatch (1300.75).
+        reads = Reads(sample=PressureObservation(1300.5, 0, 1))
+        clock = iter((1, 1.1, 1.1, 1.2, 1.2, 1.3, 1.30025, 1.30075, 1.4, 1.4, 1.5, 1.5))
+        self.assertIs(reads.verify(monotonic=clock.__next__), Result.DRAIN_UNVERIFIED)
+        self.assertEqual(reads.calls, ORDER[:4])
+
     def test_sample_must_still_be_fresh_at_return_and_after_deployment_recheck(self):
         for late, expected_calls in (("sample", ORDER[:4]), ("after", ORDER)):
             with self.subTest(late=late):
