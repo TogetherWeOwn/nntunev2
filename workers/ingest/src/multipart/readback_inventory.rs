@@ -1,10 +1,17 @@
-//! Assemble exact completion pins for bounded readback before opening any objects.
+//! Assemble and verify exact completion pins at an unmounted readback boundary.
 
 use super::{sidecar::CompletedSidecar, CompletedVersionedMedia};
 use nntune_core::{
-    digest_enrollment::OriginManifest, digest_geometry::DigestGeometry,
-    digest_readback::ReadbackPin, media_envelope::EnvelopeContext, s3_locator::S3Binding,
+    digest_enrollment::OriginManifest,
+    digest_geometry::DigestGeometry,
+    digest_readback::{
+        verify_enrolled_readback, BodyReadbackError, CompletedInventory, EnrolledEnvelope,
+        EnrolledReadbackError, ReadbackBody, ReadbackPin, ReadbackResponse,
+    },
+    media_envelope::EnvelopeContext,
+    s3_locator::S3Binding,
 };
+use std::ops::AsyncFnMut;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InventoryError {
@@ -17,9 +24,40 @@ pub enum InventoryError {
 /// receipts supply canonical logical keys relative to the configuration and bucket.
 pub struct CompletedReadbackInventory<'a> {
     bucket: &'a str,
+    identities: [[u8; 16]; 5],
+    map_id: [u8; 16],
+    origin: &'a OriginManifest,
     geometry: DigestGeometry,
     media: ReadbackPin<'a>,
     pages: Vec<(u32, ReadbackPin<'a>)>,
+}
+
+/// Custody of the configured reader, established independently of the receipts.
+pub struct ReadbackScope<'a> {
+    pub bucket: &'a str,
+    pub configuration: [u8; 16],
+}
+
+pub struct BucketReadbackResponse<B> {
+    /// Bucket actually used for the request, established by the opener.
+    pub bucket: String,
+    pub response: ReadbackResponse<B>,
+}
+
+/// In-memory evidence for the exact inventory and sealer origin read to EOF.
+/// Publication and reuse require separate authorization and lifecycle fencing.
+pub struct VerifiedCompletedReadback<'inventory, 'receipts> {
+    inventory: &'inventory CompletedReadbackInventory<'receipts>,
+}
+
+impl<'inventory, 'receipts> VerifiedCompletedReadback<'inventory, 'receipts> {
+    pub fn inventory(&self) -> &'inventory CompletedReadbackInventory<'receipts> {
+        self.inventory
+    }
+
+    pub fn origin(&self) -> &'receipts OriginManifest {
+        self.inventory.origin
+    }
 }
 
 impl<'a> CompletedReadbackInventory<'a> {
@@ -31,7 +69,7 @@ impl<'a> CompletedReadbackInventory<'a> {
         configuration: [u8; 16],
         context: &EnvelopeContext,
         map_id: [u8; 16],
-        manifest: &OriginManifest,
+        manifest: &'a OriginManifest,
         media: &'a CompletedVersionedMedia,
         sidecars: &'a [CompletedSidecar<'_>],
     ) -> Result<Self, InventoryError> {
@@ -100,10 +138,64 @@ impl<'a> CompletedReadbackInventory<'a> {
         }
         Ok(Self {
             bucket,
+            identities,
+            map_id,
+            origin: manifest,
             geometry,
             media,
             pages,
         })
+    }
+
+    /// Read the receipt versions through an independently configured opener.
+    /// The opener must authenticate the request, use the exact bucket and pin,
+    /// apply deadlines, reject ambiguous metadata, and avoid redirects or decoding.
+    /// Report the actual request target and observed response metadata.
+    pub async fn verify<'inventory, B: ReadbackBody>(
+        &'inventory self,
+        scope: ReadbackScope<'_>,
+        envelope: EnrolledEnvelope<'_>,
+        mut open: impl AsyncFnMut(
+            &'a str,
+            ReadbackPin<'a>,
+        ) -> std::io::Result<BucketReadbackResponse<B>>,
+    ) -> Result<VerifiedCompletedReadback<'inventory, 'a>, EnrolledReadbackError> {
+        let inventory_error = || EnrolledReadbackError::Body(BodyReadbackError::Inventory);
+        if scope.bucket != self.bucket || scope.configuration != self.media.configuration {
+            return Err(inventory_error());
+        }
+        let media_version = self.media.version.ok_or_else(inventory_error)?;
+        let page_versions = self
+            .pages
+            .iter()
+            .map(|(_, pin)| pin.version)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(inventory_error)?;
+        let completed = CompletedInventory {
+            identities: self.identities,
+            map_id: self.map_id,
+            plaintext_len: self.geometry.plaintext_len(),
+            media_version,
+            page_versions: &page_versions,
+        };
+        verify_enrolled_readback(
+            self.origin,
+            envelope,
+            &completed,
+            self.media,
+            &self.pages,
+            async |pin| {
+                let opened = open(self.bucket, pin)
+                    .await
+                    .map_err(|_| BodyReadbackError::Transport)?;
+                if opened.bucket != self.bucket {
+                    return Err(BodyReadbackError::Response);
+                }
+                Ok(opened.response)
+            },
+        )
+        .await?;
+        Ok(VerifiedCompletedReadback { inventory: self })
     }
 
     pub fn bucket(&self) -> &str {
