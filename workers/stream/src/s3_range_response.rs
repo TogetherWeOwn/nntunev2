@@ -1,6 +1,8 @@
-//! Offline metadata check for a planned S3 ciphertext range. No transport or reader wiring.
+//! S3 ciphertext range validation and bounded body reading. No transport wiring.
 
-use nntune_core::{digest_geometry::RangeGeometry, s3_locator::S3Binding};
+use nntune_core::{
+    digest_geometry::RangeGeometry, digest_readback::ReadbackBody, s3_locator::S3Binding,
+};
 
 use crate::range::{content_range_value, ByteRange};
 
@@ -20,6 +22,43 @@ pub enum S3RangeResponseError {
     ContentRange,
     ObjectIdentity,
     Length,
+    Expired,
+    Body,
+}
+
+/// Read one planned sealed chunk, never the full covered range. `is_live`
+/// checks the committed read deadline; the transport must also cancel any
+/// pending read at that deadline. Success still requires digest/AEAD verification.
+pub async fn read_s3_range_chunk(
+    plan: RangeGeometry,
+    index: u32,
+    expected_binding: &S3Binding,
+    response: S3RangeResponse<'_>,
+    mut body: impl ReadbackBody,
+    mut is_live: impl FnMut() -> bool,
+) -> Result<Vec<u8>, S3RangeResponseError> {
+    use S3RangeResponseError::*;
+
+    let chunk = plan.sealed_chunk(index).ok_or(NoCiphertext)?;
+    let len = validate_s3_range_metadata(plan, chunk.ciphertext, expected_binding, response)?;
+    let mut bytes = vec![0; len as usize];
+    let mut remaining = bytes.as_mut_slice();
+    loop {
+        if !is_live() {
+            return Err(Expired);
+        }
+        if remaining.is_empty() {
+            if body.read(&mut [0]).await.map_err(|_| Body)? != 0 {
+                return Err(Length);
+            }
+            return is_live().then_some(bytes).ok_or(Expired);
+        }
+        let count = body.read(remaining).await.map_err(|_| Body)?;
+        if count == 0 {
+            return Err(Length);
+        }
+        remaining = remaining.get_mut(count..).ok_or(Body)?;
+    }
 }
 
 /// Check one completed response against the trusted plan and pinned version or ETag.
@@ -33,9 +72,25 @@ pub fn validate_s3_range_response(
     response: S3RangeResponse<'_>,
     body_bytes: u64,
 ) -> Result<(), S3RangeResponseError> {
+    let span = plan
+        .ciphertext_span()
+        .ok_or(S3RangeResponseError::NoCiphertext)?;
+    let len = validate_s3_range_metadata(plan, span, expected_binding, response)?;
+    if body_bytes != len {
+        return Err(S3RangeResponseError::Length);
+    }
+    Ok(())
+}
+
+/// Check headers before reading any of the body; return the exact read bound.
+fn validate_s3_range_metadata(
+    plan: RangeGeometry,
+    span: std::ops::Range<u64>,
+    expected_binding: &S3Binding,
+    response: S3RangeResponse<'_>,
+) -> Result<u64, S3RangeResponseError> {
     use S3RangeResponseError::*;
 
-    let span = plan.ciphertext_span().ok_or(NoCiphertext)?;
     if response.status != 206 {
         return Err(Status);
     }
@@ -51,10 +106,10 @@ pub fn validate_s3_range_response(
         return Err(ObjectIdentity);
     }
     let expected_len = range.len();
-    if response.content_length != Some(expected_len) || body_bytes != expected_len {
+    if response.content_length != Some(expected_len) {
         return Err(Length);
     }
-    Ok(())
+    Ok(expected_len)
 }
 
 #[cfg(test)]
@@ -62,6 +117,52 @@ mod tests {
     use super::*;
     use crate::range::plan_encrypted_range;
     use nntune_core::digest_geometry::DigestGeometry;
+
+    struct SliceBody<'a>(&'a [u8]);
+
+    impl ReadbackBody for SliceBody<'_> {
+        async fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.0, dst)
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_only_a_complete_chunk_before_expiry() {
+        use S3RangeResponseError::*;
+
+        let plan = DigestGeometry::new(65_537)
+            .unwrap()
+            .range(0, 65_537)
+            .unwrap();
+        let binding = S3Binding::VersionId("v1".into());
+        let response = S3RangeResponse {
+            status: 206,
+            content_range: Some("bytes 65600-65616/65617"),
+            content_length: Some(17),
+            binding: Some(&binding),
+        };
+        let data = [0xa5; 18];
+        for (len, expected) in [
+            (16, Err(Length)),
+            (17, Ok(data[..17].to_vec())),
+            (18, Err(Length)),
+        ] {
+            let actual =
+                read_s3_range_chunk(plan, 1, &binding, response, SliceBody(&data[..len]), || {
+                    true
+                })
+                .await;
+            assert_eq!(actual, expected);
+        }
+        let mut checks = 0;
+        let expired =
+            read_s3_range_chunk(plan, 1, &binding, response, SliceBody(&data[..17]), || {
+                checks += 1;
+                checks < 3 // Expire just as the EOF probe completes.
+            })
+            .await;
+        assert_eq!(expired, Err(Expired));
+    }
 
     #[test]
     fn accepts_complete_boundary_and_short_final_spans() {
