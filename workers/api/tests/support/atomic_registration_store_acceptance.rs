@@ -2501,19 +2501,13 @@ fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
                 .await
                 .unwrap();
             assert!(preflight.is_none(), "preflight: {case}");
-            assert!(
-                finish_with_invite(&mut client, &fixture).await.is_err(),
-                "{case}"
-            );
+            let enrollment = finish_with_invite(&mut client, &fixture).await;
+            assert!(enrollment.is_err(), "{case}");
+            let claim = SingleUseClaim::Invite {
+                record: &fixture.invite,
+            };
             assert_eq!(
-                claim_single_use_on(
-                    &client,
-                    SingleUseClaim::Invite {
-                        record: &fixture.invite
-                    }
-                )
-                .await
-                .unwrap(),
+                claim_single_use_on(&client, claim).await.unwrap(),
                 0,
                 "standalone claim must also refuse {case}"
             );
