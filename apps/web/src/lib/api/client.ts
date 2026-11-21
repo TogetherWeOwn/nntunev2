@@ -244,6 +244,16 @@ export interface CredentialsList {
 	credentials: ListedCredential[];
 }
 
+export interface IssuedMemberInvite {
+	code: string;
+	expires_at: number;
+}
+
+/** The Worker issues 16 random bytes encoded as unpadded base64url. */
+export function isMemberInviteCode(code: unknown): code is string {
+	return typeof code === 'string' && code.length === 22 && /^[A-Za-z0-9_-]{22}$/.test(code);
+}
+
 const REVOKE_ALL = '/v1/session/revoke-all';
 const LOGOUT = '/v1/session/logout';
 export class StaleSessionError extends ApiError {}
@@ -334,6 +344,19 @@ export class ApiClient {
 		return (await this.requestWithStatus<{ ok: true }>(REVOKE_ALL, {
 			method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
 		}, expected)).data;
+	}
+
+	/** Spend one invite from the browser session's current window. Do not retry automatically. */
+	async issueMemberInvite(signal: AbortSignal): Promise<IssuedMemberInvite> {
+		const { data, status } = await this.requestWithStatus<Partial<IssuedMemberInvite> | null>(
+			'/v1/me/invites', { method: 'POST', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 201 || !isMemberInviteCode(data?.code) ||
+			typeof data.expires_at !== 'number' || !Number.isSafeInteger(data.expires_at) ||
+			data.expires_at <= 0 || data.expires_at > 8_640_000_000_000) {
+			throw new ApiError(status, 'request_failed', 'Invalid invite response', null, false);
+		}
+		return { code: data.code, expires_at: data.expires_at };
 	}
 
 	/**
