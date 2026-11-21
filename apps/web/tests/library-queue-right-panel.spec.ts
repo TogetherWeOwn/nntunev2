@@ -7,10 +7,10 @@ const tracks = [
 ];
 const toggle = (page: Page) => page.getByRole('button', { name: 'Queue in side panel' });
 const panel = (page: Page) => page.getByTestId('right-panel');
-const close = (page: Page) => panel(page).getByRole('button', { name: 'Close queue panel' });
 const next = (page: Page) => page.getByTestId('player-next');
 const inline = (page: Page) => page.getByRole('main').getByTestId('player-next');
 const queued = (page: Page) => page.getByTestId('queue-item');
+const order = (page: Page) => queued(page).evaluateAll((rows) => rows.map((row) => row.getAttribute('data-track-id')));
 
 async function seed(page: Page, pauseRefresh?: Promise<void>): Promise<void> {
 	let requests = 0;
@@ -29,23 +29,17 @@ async function seed(page: Page, pauseRefresh?: Promise<void>): Promise<void> {
 async function keyboardOpen(page: Page): Promise<void> {
 	await toggle(page).focus();
 	await page.keyboard.press('Enter');
-	await expect(close(page)).toBeFocused();
+	await expect(panel(page).getByRole('button', { name: 'Close queue panel' })).toBeFocused();
 	await expect(toggle(page)).toHaveAttribute('aria-expanded', 'true');
 }
 
-function order(page: Page): Promise<(string | null)[]> {
-	return queued(page).evaluateAll((rows) => rows.map((row) => row.getAttribute('data-track-id')));
-}
-
 test('keyboard moves the same live queue to the right slot and back', async ({ page }) => {
-	await page.setViewportSize({ width: 1280, height: 800 });
 	await seed(page);
 	await expect(panel(page)).toHaveCount(0);
 	await expect(inline(page)).toBeVisible();
 	await page.getByRole('checkbox', { name: 'Select Fern for queue actions' }).check();
 	const originalNext = (await next(page).elementHandle())!;
 	const audio = page.getByTestId('audio-player');
-	await expect(audio).toHaveCount(1);
 	const originalAudio = (await audio.elementHandle())!;
 
 	await keyboardOpen(page);
@@ -85,11 +79,8 @@ test('keyboard moves the same live queue to the right slot and back', async ({ p
 });
 
 test('the panel keeps order actions, export fallback and loading behavior live', async ({ page }) => {
-	let finishRefresh!: () => void;
-	const pauseRefresh = new Promise<void>((resolve) => (finishRefresh = resolve));
-	await page.addInitScript(() => {
-		Object.defineProperty(navigator, 'clipboard', { value: undefined });
-	});
+	const { promise: pauseRefresh, resolve: finishRefresh } = Promise.withResolvers<void>();
+	await page.addInitScript(() => Object.defineProperty(navigator, 'clipboard', { value: undefined }));
 	await seed(page, pauseRefresh);
 	await keyboardOpen(page);
 	await panel(page).getByRole('button', { name: 'More actions for Fern' }).click();
@@ -106,7 +97,6 @@ test('the panel keeps order actions, export fallback and loading behavior live',
 	const download = page.waitForEvent('download');
 	await panel(page).getByRole('button', { name: 'Download queue (.m3u)' }).click();
 	expect((await download).suggestedFilename()).toBe('queue.m3u');
-
 	try {
 		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 		await expect(panel(page).getByTestId('now-playing')).not.toHaveAttribute('role', 'status');
@@ -138,7 +128,6 @@ test('small screens keep one inline queue and resizing recovers focus', async ({
 });
 
 test('resizing with a keyboard-opened row menu returns focus to its trigger', async ({ page }) => {
-	await page.setViewportSize({ width: 1280, height: 800 });
 	await seed(page);
 	await keyboardOpen(page);
 	const trigger = queued(page).getByRole('button', { name: 'More actions for Fern' });
@@ -146,7 +135,6 @@ test('resizing with a keyboard-opened row menu returns focus to its trigger', as
 	await page.keyboard.press('Enter');
 	const menu = page.getByRole('menu', { name: /Fern/ });
 	await expect(menu.locator(':focus')).toHaveCount(1);
-
 	await page.setViewportSize({ width: 799, height: 844 });
 	await expect(menu).toHaveCount(0);
 	await expect(trigger).toBeFocused();
@@ -179,23 +167,34 @@ test('the 800px layout fits both columns and falls back inline with larger text'
 	await expect(inline(page)).toBeVisible();
 });
 
-test('an auth boundary or leaving Library releases the panel slot', async ({ page }) => {
-	await seed(page);
-	await keyboardOpen(page);
-	const otherTab = await page.context().newPage();
-	await otherTab.goto('/login');
-	await otherTab.evaluate(() => window.localStorage.setItem('nntune.library.auth-transition.v1', 'fixture'));
-	await otherTab.close();
-	await expect(page.getByRole('alert')).toContainText(/session changed/i);
-	await expect(panel(page)).toHaveCount(0);
-	await expect(queued(page)).toHaveCount(0);
-
-	const retry = page.getByRole('button', { name: 'Retry' });
-	await expect(retry).toBeFocused();
-	await retry.click();
-	await keyboardOpen(page);
-	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home' }).click();
-	await expect(page).toHaveURL(/\/home$/);
-	await expect(panel(page)).toHaveCount(0);
-	await expect(next(page)).toHaveCount(0);
-});
+for (const view of ['Tracks', 'Albums', 'outside the panel'] as const) {
+	test(`auth teardown restores or preserves focus: ${view}`, async ({ page }) => {
+		await seed(page);
+		const home = page.getByTestId('shell-rail').getByRole('link', { name: 'Home' });
+		const retry = page.getByRole('button', { name: 'Retry', exact: true });
+		const collections = page.getByRole('region', { name: 'Library collections' });
+		if (view === 'Albums') {
+			await page.route('**/v1/releases', (route) => route.fulfill({ json: [] }));
+			await page.getByRole('button', { name: 'Albums', exact: true }).click();
+			await expect(collections.getByRole('status')).toHaveText('No albums in the loaded results.');
+		}
+		await keyboardOpen(page);
+		if (view === 'outside the panel') await home.focus();
+		const otherTab = await page.context().newPage();
+		await otherTab.goto('/login');
+		await otherTab.evaluate(() => window.localStorage.setItem('nntune.library.auth-transition.v1', 'fixture'));
+		await otherTab.close();
+		await expect(panel(page)).toHaveCount(0);
+		await expect(queued(page)).toHaveCount(0);
+		const recovery = view === 'Albums' ? collections.getByRole('link', { name: 'Sign in' }) : view === 'Tracks' ? retry : home;
+		await expect(recovery).toBeFocused();
+		if (view !== 'Tracks') return;
+		await expect(page.getByRole('alert')).toContainText(/session changed/i);
+		await retry.click();
+		await keyboardOpen(page);
+		await home.click();
+		await expect(page).toHaveURL(/\/home$/);
+		await expect(panel(page)).toHaveCount(0);
+		await expect(next(page)).toHaveCount(0);
+	});
+}

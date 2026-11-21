@@ -603,9 +603,10 @@
 	function resetShareAtAuthBoundary(): void {
 		if (typeof document !== 'undefined' && document.activeElement?.closest('#library-queue-panel')) {
 			void tick().then(() => {
-				if (shareAlive && document.activeElement === document.body) {
-					(showingTracks ? refreshButton : document.getElementById('library-density'))?.focus();
-				}
+				if (!shareAlive || document.activeElement !== document.body) return;
+				const recovery = showingTracks ? refreshButton
+					: document.querySelector<HTMLAnchorElement>('section[aria-label="Library collections"] a[href="/login"]');
+				recovery?.focus();
 			});
 		}
 		queueExportAuthGeneration += 1;
