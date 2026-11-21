@@ -71,6 +71,22 @@ class StreamExtractTest(unittest.TestCase):
         self.assertEqual(meta["skipped_members"], 1)
         self.assertEqual(meta["missing"], [])
 
+    def test_label_alias_requires_exact_archive_member(self):
+        extract = load("stream_extract", EXTRACT)
+        members = {f"mbdump/{table}": b"" for table in extract.REQUIRED_TABLES if table != "label_alias"}
+        members["mbdump/nested/label_alias"] = b"not the core member\n"
+        members["mbdump/label_alias_type"] = b"not the projection input\n"
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            result = subprocess.run([sys.executable, str(EXTRACT), str(out)],
+                                    input=tar_bytes(members), capture_output=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            meta = json.loads((out / "dump-meta.json").read_text())
+            self.assertEqual(meta["missing"], ["label_alias"])
+            self.assertEqual(meta["skipped_members"], 2)
+            self.assertFalse((out / "label_alias.gz").exists())
+            self.assertFalse((out / "label_alias_type.gz").exists())
+
     def test_missing_required_table_fails(self):
         result, out = self.run_extract({"mbdump/artist": b"x\n"})
         self.assertEqual(result.returncode, 1)
@@ -85,6 +101,7 @@ class StreamExtractTest(unittest.TestCase):
         self.assertIn("work_alias", missing)
         self.assertIn("work_type", missing)
         self.assertIn("l_recording_work", missing)
+        self.assertTrue({"l_artist_recording", "l_artist_release", "l_artist_work"} <= set(missing))
 
 
 class DuplicateMemberTest(unittest.TestCase):
@@ -501,7 +518,7 @@ class WorkProjectionTest(ProjectionTestCase):
 
         members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
         members["mbdump/work"] = b"".join(reversed(members["mbdump/work"].splitlines(keepends=True)))
-        excluded_tables = ("work_alias_type", "l_artist_work")
+        excluded_tables = ("work_alias_type", "l_artist_label")
         for table in excluded_tables:
             members[f"mbdump/{table}"] = b"not admitted\n"
         packed = self.tmp / "packed"
@@ -671,7 +688,7 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
             ("link", links.replace(b"216\t513", b"216\t999"), "references missing link_type 999"),
             ("link", links.replace(b"216\t513", b"216\t506"), "link_type 506 is not recording-to-work"),
             ("link", links.replace(b"216\t513", b"216\t+513"), "invalid link_type"),
-            ("link", links + links.splitlines(keepends=True)[-1], "UNIQUE constraint failed: recording_work_link.id"),
+            ("link", links + links.splitlines(keepends=True)[-1], "UNIQUE constraint failed: entity_relation_link.id"),
             ("link_type", types.replace(b"\n513\t", b"\n+513\t"), "invalid link_type id 513"),
             ("link_type", types.replace(b"\trecording\twork\tperformance", b"\t\\N\twork\tperformance"),
              "link_type 513 is not recording-to-work"),
@@ -691,6 +708,192 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
                 mode = {} if error.startswith("already has") else {"DUMP_TS": "2025-02-04T04:05:06Z"}
                 refused = self.run_etl(self.raw, **mode)
                 path.write_bytes(original)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
+
+
+class ArtistRelationProjectionTest(ProjectionTestCase):
+    timestamp = "2025-02-03T04:05:06Z"
+    edge_tail = "\t0\t2025-01-01 00:00:00+00\t0\t\t\n"
+
+    def setUp(self):
+        super().setUp()
+        self.targets = {
+            "recording": (50, 51, "88888888-8888-4888-8888-888888888888", "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD"),
+            "release": (30, 31, "55555555-5555-4555-8555-555555555555", "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB"),
+            "work": (80, 81, "80808080-8080-4808-8808-808080808080", "10101010-1010-4010-8010-101010101010"),
+        }
+        self.expected = {}
+        for index, (target, (first, second, gid1, gid2)) in enumerate(self.targets.items()):
+            link = 700 + 3 * index
+            with (self.raw / "link").open("a") as links, (self.raw / "link_type").open("a") as types:
+                for offset, name in enumerate(("credit", r"\143redit", "arrangement")):
+                    key = link + offset
+                    types.write(f"{key}\t\\N\t0\t00000000-0000-4000-8000-{key:012d}\tartist\t{target}\t{name}"
+                                "\tTest\tTest\tTest\tTest\t2025-01-01 00:00:00+00\tf\tt\t0\t0\n")
+                    links.write(f"{key}\t{key}" + "\t\\N" * 6 + "\t0\t2025-01-01 00:00:00+00\tf\n")
+            edges = ((link, 20, first), (link + 1, 10, first), (link, 10, first),
+                     (link + 2, 10, first), (link, 10, second))
+            (self.raw / f"l_artist_{target}").write_text("".join(
+                f"{key}\t{link_id}\t{artist}\t{entity}{self.edge_tail}"
+                for key, (link_id, artist, entity) in enumerate(edges, 1)
+            ))
+            a1 = "11111111-1111-4111-8111-111111111111"
+            a2 = "22222222-2222-4222-8222-222222222222"
+            rows = [(a1, gid1, "arrangement"), (a1, gid1, r"\143redit"),
+                    (a1, gid2, "credit"), (a2, gid1, "credit")]
+            self.expected[target] = "".join(
+                "\t".join((*row, self.timestamp)) + "\n" for row in sorted(rows, key=lambda row: row[:2])
+            ).encode()
+        # A sidecar-only link must not admit an otherwise orphaned URL or video edge.
+        for table, entity in (("l_artist_url", 10), ("l_recording_url", 50), ("l_recording_recording", 50)):
+            with (self.raw / table).open("a") as rows:
+                rows.write(f"800\t700\t{entity}\t999{self.edge_tail}")
+
+    def pack(self):
+        packed = self.tmp / "packed"
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        extracted = subprocess.run([sys.executable, str(EXTRACT), str(packed)], input=tar_bytes(members),
+                                   capture_output=True, check=False)
+        self.assertEqual(extracted.returncode, 0, extracted.stderr)
+        return packed
+
+    def check_outputs(self, expected):
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for table in ("link", "link_type", *(f"l_artist_{target}" for target in self.targets)):
+            path = self.raw / table
+            path.write_bytes(b"".join(reversed(path.read_bytes().splitlines(keepends=True))))
+        packed = self.pack()
+        result = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for target, contents in expected.items():
+            name = f"mbdump-artist_{target}.tsv"
+            self.assertEqual((self.curated / name).read_bytes(), contents)
+            self.assertEqual(gzip.decompress((packed / "curated" / (name + ".gz")).read_bytes()), contents)
+            self.assertFalse((packed / f"l_artist_{target}.gz").exists())
+        for legacy in ("artist_url", "recording_url", "recording_music_video"):
+            name = f"mbdump-{legacy}.tsv"
+            self.assertEqual((self.curated / name).read_bytes(), (ROOT / "tests" / "expected" / name).read_bytes())
+
+    def test_artist_relationships_are_deduplicated_and_match_streamed_gzip(self):
+        self.check_outputs(self.expected)
+
+    def test_empty_artist_relationships_emit_empty_sidecars(self):
+        for target in self.targets:
+            (self.raw / f"l_artist_{target}").write_bytes(b"")
+        self.check_outputs(dict.fromkeys(self.targets, b""))
+
+    def pack_published(self):
+        packed = self.pack()
+        result = self.run_etl(packed, MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return packed
+
+    def assert_refusal(self, raw, *diagnostics, gzip_output="1", consume="1"):
+        current = raw / "curated"
+        snapshot = current.readlink()
+        before = {p.name: p.read_bytes() for p in current.iterdir()}
+        mode = {"MB_ETL_GZIP_OUTPUT": gzip_output, "MB_ETL_CONSUME_INPUTS": consume}
+        refused = self.run_etl(raw, DUMP_TS="2025-02-04T04:05:06Z", **mode)
+        self.assertEqual(refused.returncode, 1, refused.stdout)
+        for diagnostic in diagnostics:
+            self.assertIn(diagnostic, refused.stderr)
+        self.assertEqual(current.readlink(), snapshot)
+        self.assertEqual({p.name: p.read_bytes() for p in current.iterdir()}, before)
+        self.assertEqual(list(raw.glob(".curated-*")), [raw / snapshot])
+
+    def test_bad_artist_relationship_inputs_refuse_before_consumption(self):
+        packed = self.pack_published()
+        plain, compressed = packed / "l_artist_work", packed / "l_artist_work.gz"
+        plain.touch()
+        for diagnostic, remove in (
+            (f"ambiguous input: both {plain} and {compressed} exist", ()),
+            (f"missing input file: {plain}", (plain, compressed)),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                for path in remove:
+                    path.unlink()
+                inputs = {p.name: p.read_bytes() for p in packed.iterdir() if p.is_file()}
+                self.assert_refusal(packed, diagnostic)
+                self.assertEqual({p.name: p.read_bytes() for p in packed.iterdir() if p.is_file()}, inputs)
+
+    def test_consuming_gzip_refuses_dangling_artist_relationship(self):
+        packed = self.pack_published()
+        path = packed / "l_artist_work.gz"
+        payload = gzip.decompress(path.read_bytes())
+        path.write_bytes(gzip.compress(payload.replace(b"\t20\t80\t", b"\t20\t999\t", 1)))
+        self.assert_refusal(packed, "l_artist_work: references missing work 999")
+        self.assertFalse(path.exists())
+
+    def test_refused_artist_references_preserve_published_snapshot(self):
+        packed = self.pack()
+        for raw, suffix, mode in ((self.raw, "", "0"), (packed, ".gz", "1")):
+            published = self.run_etl(raw, MB_ETL_GZIP_OUTPUT=mode)
+            self.assertEqual(published.returncode, 0, published.stderr)
+            for index, (target, (first, *_)) in enumerate(self.targets.items()):
+                key = 700 + 3 * index
+                for table, old, new, error in (
+                    (f"l_artist_{target}", f"\t20\t{first}\t", "\t20\t999\t", f"missing {target} 999"),
+                    (f"l_artist_{target}", f"\t20\t{first}\t", f"\t999\t{first}\t", "missing artist 999"),
+                    (f"l_artist_{target}", f"\t{key}\t20\t", "\t999\t20\t", "missing link 999"),
+                    ("link", f"\n{key}\t{key}\t", f"\n{key}\t999\t", "missing link_type 999"),
+                    ("link", f"\n{key}\t{key}\t", f"\n{key}\t506\t", f"is not artist-to-{target}"),
+                ):
+                    with self.subTest(mode=mode, target=target, error=error):
+                        path = raw / (table + suffix)
+                        original = path.read_bytes()
+                        payload = gzip.decompress(original) if suffix else original
+                        self.assertIn(old.encode(), payload)
+                        changed = payload.replace(old.encode(), new.encode(), 1)
+                        path.write_bytes(gzip.compress(changed) if suffix else changed)
+                        try:
+                            self.assert_refusal(raw, f"l_artist_{target}: ", error, gzip_output=mode, consume="0")
+                        finally:
+                            path.write_bytes(original)
+
+
+class LabelAliasProjectionTest(AliasProjectionTestCase):
+    entity = "label"
+
+    def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        self.assert_plain_and_streamed_output((ROOT / "tests" / "expected" / self.output).read_bytes())
+        alias_mbids = self.curated_mbids("label_alias")
+        self.assertLess(alias_mbids, self.curated_mbids("label"))
+        self.assertTrue(alias_mbids.isdisjoint(self.curated_mbids("release")))
+
+    def test_empty_label_alias_table_emits_empty_sidecar(self):
+        (self.raw / "label_alias").write_bytes(b"")
+        self.assert_plain_and_streamed_output(b"")
+
+    def test_label_alias_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        self.assertIn("label_alias=4,", published.stdout)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        path = self.raw / "label_alias"
+        aliases = path.read_bytes()
+        first_row = aliases.splitlines(keepends=True)[0]
+        for changed, error in (
+            (None, "missing input file:"),
+            (b"broken\n", "expected 16 fields"),
+            (aliases + first_row, "UNIQUE constraint failed: label_alias.id"),
+            # 30 exists as a release, not as a label. Other aliases stay valid.
+            (aliases.replace(b"930\t71\t", b"930\t30\t", 1), "label_alias references missing label 30"),
+            (aliases.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            (aliases.replace(rb"\303\x89tiquette", rb"\303tiquette", 1), "invalid COPY text in name or locale"),
+            (aliases.replace(rb"Quartz\tRecords", rb"Quartz\377", 1), "invalid COPY text in sort_name"),
+        ):
+            with self.subTest(error=error):
+                if changed is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-03T04:05:07Z")
                 self.assertEqual(refused.returncode, 1, refused.stdout)
                 self.assertIn(error, refused.stderr)
                 self.assertEqual(self.curated.readlink(), target)

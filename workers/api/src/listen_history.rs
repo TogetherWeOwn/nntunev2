@@ -32,7 +32,7 @@ impl ListenEvent {
     }
 }
 
-fn valid_playback_id(value: &str) -> bool {
+pub(crate) fn valid_playback_id(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| {
             if matches!(index, 8 | 13 | 18 | 23) {
@@ -183,7 +183,7 @@ pub async fn clear(client: &mut Client, owner: &str) -> Result<(), StoreError> {
 
 #[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
 #[path = "listen_history_postgres_tests.rs"]
-mod postgres_tests;
+pub(crate) mod postgres_tests;
 
 pub async fn export(
     client: &Client,

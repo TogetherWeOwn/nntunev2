@@ -982,6 +982,16 @@ pub trait Store {
         }
     }
 
+    /// Record client history only; the storage layer owns issued-play admission.
+    fn record_listen_event(
+        &self,
+        _owner: &str,
+        _event: &crate::listen_history::ListenEventBody,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::listen_history::WriteOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+
     fn export_listen_events(
         &self,
         _owner: &str,
@@ -4847,6 +4857,10 @@ where
 #[path = "listen_history_controls.rs"]
 mod listen_history_controls;
 
+#[allow(dead_code)] // Prepared, with no production route or caller.
+#[path = "listen_history_receiver.rs"]
+mod listen_history_receiver;
+
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
 
@@ -6187,6 +6201,63 @@ where
         Ok(AdminInviteRevokeOutcome::Missing | AdminInviteRevokeOutcome::ActorNotAdmin) => {
             not_found()
         }
+        Err(_) => internal(),
+    }
+}
+
+async fn admin_invite_windows<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let mutation = req.method == "POST";
+    let claims = match ctx.authenticate_admin(req, mutation).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    if !mutation {
+        return match ctx.store.admin_list_invite_windows().await {
+            Ok(windows) => json_response(200, serde_json::json!({"windows": windows})),
+            Err(_) => internal(),
+        };
+    }
+    let schedule;
+    let (write, status) = if req.path == crate::native_rest::ADMIN_INVITE_WINDOWS_PATH {
+        // Derived structs also accept positional arrays. Check the shape first,
+        // then parse the original bytes to preserve duplicate-field rejection.
+        let first = req.body.iter().copied().find(|b| !b.is_ascii_whitespace());
+        let Some(body) = (first == Some(b'{'))
+            .then(|| parse_body::<InviteWindowSchedule>(req))
+            .flatten()
+        else {
+            return validation_failed("invalid invite window schedule");
+        };
+        schedule = body;
+        (InviteWindowWrite::Schedule(&schedule), 201)
+    } else if let Some(id) = crate::native_rest::admin_invite_window_close_id(&req.path) {
+        (InviteWindowWrite::Close(id), 200)
+    } else {
+        return not_found();
+    };
+    match ctx
+        .store
+        .admin_write_invite_window(&claims.user_id, write, &ctx.source_ip, ctx.now)
+        .await
+    {
+        Ok(InviteWindowOutcome::Window(window)) => {
+            json_response(status, serde_json::json!({"window": window}))
+        }
+        Ok(InviteWindowOutcome::InvalidSchedule) => {
+            validation_failed("invalid invite window schedule")
+        }
+        Ok(InviteWindowOutcome::Overlap) => {
+            let error =
+                crate::api_error::ApiError::by_code("conflict", "invite windows cannot overlap");
+            json_response(error.status, serde_json::json!(error))
+        }
+        Ok(InviteWindowOutcome::Missing | InviteWindowOutcome::ActorNotAdmin) => not_found(),
         Err(_) => internal(),
     }
 }
@@ -7919,8 +7990,13 @@ where
             }
         }
     }
+    use crate::native_rest::{admin_invite_window_close_id, ADMIN_INVITE_WINDOWS_PATH};
     use listen_history_controls as listens;
     match (req.method.as_str(), req.path.as_str()) {
+        ("GET" | "POST", ADMIN_INVITE_WINDOWS_PATH) => admin_invite_windows(ctx, req).await,
+        ("POST", path) if admin_invite_window_close_id(path).is_some() => {
+            admin_invite_windows(ctx, req).await
+        }
         ("GET", "/healthz") => json_response(
             200,
             serde_json::json!({"ok": true, "build_sha": ctx.cfg.build_sha}),
@@ -8184,12 +8260,17 @@ mod tests {
         /// mailbox (mirrors the migration 0018 table).
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
+        invite_window_list: RefCell<Option<Vec<InviteWindow>>>,
+        invite_window_outcomes: RefCell<std::collections::VecDeque<InviteWindowOutcome>>,
+        invite_window_calls: RefCell<Vec<serde_json::Value>>,
         /// Next surrogate invite id to hand out (mirror of the
         /// migration 0033 identity column).
         next_invite_id: RefCell<i64>,
         /// Mirror of `users.invited_by` (migration 0033), keyed by the
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
+        listen_owners: RefCell<Vec<String>>,
+        listen_failure: std::cell::Cell<Option<&'static str>>,
         listen_rows: RefCell<Vec<(String, crate::listen_history::ListenRow)>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
@@ -8845,6 +8926,38 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn admin_list_invite_windows(&self) -> Result<Vec<InviteWindow>, StoreError> {
+            self.invite_window_calls
+                .borrow_mut()
+                .push(serde_json::json!("list"));
+            self.invite_window_list
+                .borrow_mut()
+                .take()
+                .ok_or(StoreError)
+        }
+
+        async fn admin_write_invite_window(
+            &self,
+            actor: &str,
+            write: InviteWindowWrite<'_>,
+            source_ip: &str,
+            now: u64,
+        ) -> Result<InviteWindowOutcome, StoreError> {
+            let write = match write {
+                InviteWindowWrite::Schedule(schedule) => {
+                    serde_json::json!([schedule.starts_at, schedule.ends_at, schedule.note])
+                }
+                InviteWindowWrite::Close(id) => serde_json::json!(id),
+            };
+            self.invite_window_calls
+                .borrow_mut()
+                .push(serde_json::json!([actor, source_ip, now, write]));
+            self.invite_window_outcomes
+                .borrow_mut()
+                .pop_front()
+                .ok_or(StoreError)
+        }
+
         async fn mark_private_play(
             &self,
             user_id: &str,
@@ -9227,6 +9340,19 @@ mod tests {
                 .unwrap_or(0))
         }
 
+        async fn record_listen_event(
+            &self,
+            owner: &str,
+            _event: &crate::listen_history::ListenEventBody,
+            _now: u64,
+        ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+            self.listen_owners.borrow_mut().push(owner.into());
+            if self.listen_failure.get() == Some("write") {
+                return Err(StoreError);
+            }
+            Ok(crate::listen_history::WriteOutcome::Written)
+        }
+
         async fn export_listen_events(
             &self,
             owner: &str,
@@ -9412,6 +9538,9 @@ mod tests {
             now: u64,
             window_secs: u64,
         ) -> Result<bool, StoreError> {
+            if self.listen_failure.get() == Some(action) {
+                return Err(StoreError);
+            }
             if limit == 0 || window_secs == 0 {
                 return Ok(false);
             }
@@ -18740,6 +18869,7 @@ mod tests {
     }
 
     include!("listen_history_control_tests.rs");
+    include!("listen_history_receiver_tests.rs");
 
     fn assert_play_bearer_refused(
         h: &Harness,
@@ -22844,6 +22974,204 @@ mod tests {
                 event.action
             );
         }
+    }
+
+    #[test]
+    fn admin_invite_window_routes_require_browser_admin_and_write_origin() {
+        use crate::native_rest::{scope_for_operation, RouteDecision, ADMIN_INVITE_WINDOWS_PATH};
+        let h = harness();
+        seed_user(&h, "member", "member@example.com");
+        let member = magic_login(&h, "member@example.com");
+        let admin = seed_admin(&h, "admin", "admin@example.com");
+        let stale_ctx = Ctx {
+            now: NOW + session::PRIVILEGE_REAUTH_WINDOW_SECS + 1,
+            ..h.ctx()
+        };
+        let assert_hidden = |response: Response| {
+            assert_eq!(response.status, 404);
+            assert_eq!(response.body, not_found().body);
+        };
+        for (method, path) in [
+            ("GET", ADMIN_INVITE_WINDOWS_PATH),
+            ("POST", ADMIN_INVITE_WINDOWS_PATH),
+            ("POST", "/v1/admin/invite-windows/1/close"),
+        ] {
+            assert_eq!(
+                scope_for_operation(method, path),
+                RouteDecision::SessionOnly
+            );
+            for cookie in [None, Some(member.clone())] {
+                assert_hidden(h.call_full(method, path, None, cookie, Some(ORIGIN)));
+            }
+            let mut request = Request {
+                method: method.into(),
+                path: path.into(),
+                cookie: None,
+                origin: Some(ORIGIN.into()),
+                authorization: Some("Bearer ntk_synthetic".into()),
+                stripe_signature: None,
+                body: br#"{"starts_at":100,"ends_at":200}"#.to_vec(),
+            };
+            assert_hidden(block_on(handle(&h.ctx(), &request)));
+            request.cookie = Some(admin.clone());
+            assert_hidden(block_on(handle(&h.ctx(), &request)));
+            request.authorization = None;
+            if method == "POST" {
+                for origin in [None, Some("https://foreign.example")] {
+                    assert_hidden(h.call_full(method, path, None, Some(admin.clone()), origin));
+                }
+                let stale = block_on(handle(&stale_ctx, &request));
+                assert_eq!(stale.status, 401);
+                assert!(stale.body.contains("\"code\":\"reauth_required\""));
+            }
+        }
+        assert!(h.store.invite_window_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn admin_invite_window_routes_reject_invalid_paths_and_bodies() {
+        use crate::native_rest::{scope_for_operation, RouteDecision, ADMIN_INVITE_WINDOWS_PATH};
+        let h = harness();
+        let admin = seed_admin(&h, "admin", "admin@example.com");
+        let close = "/v1/admin/invite-windows/1/close";
+        for (method, path) in [
+            ("GET", close),
+            ("DELETE", ADMIN_INVITE_WINDOWS_PATH),
+            ("POST", "/v1/admin/invite-windows/"),
+            ("POST", "/v1/admin/invite-windows//close"),
+            ("POST", "/v1/admin/invite-windows/0/close"),
+            ("POST", "/v1/admin/invite-windows/-1/close"),
+            ("POST", "/v1/admin/invite-windows/01/close"),
+            ("POST", "/v1/admin/invite-windows/%31/close"),
+            ("POST", "/v1/admin/invite-windows/9223372036854775808/close"),
+            ("POST", "/v1/admin/invite-windows/1/x/close"),
+            ("POST", "/v1/admin/invite-windows/1/close/"),
+        ] {
+            assert_eq!(scope_for_operation(method, path), RouteDecision::Deny);
+            let response = h.call_full(method, path, None, Some(admin.clone()), Some(ORIGIN));
+            assert_eq!(response.status, 404, "{method} {path}");
+            assert_eq!(response.body, not_found().body);
+        }
+        for body in [
+            "{",
+            "{}",
+            "[100,200,null]",
+            r#"{"starts_at":"100","ends_at":200}"#,
+            r#"{"starts_at":100,"starts_at":101,"ends_at":200}"#,
+            r#"{"starts_at":100,"ends_at":200,"actor":"someone"}"#,
+        ] {
+            let response = h.call_full(
+                "POST",
+                ADMIN_INVITE_WINDOWS_PATH,
+                Some(body.into()),
+                Some(admin.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(response.status, 422, "{body}");
+            assert!(response.body.contains("\"code\":\"validation_failed\""));
+        }
+        assert!(h.store.invite_window_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn admin_invite_window_routes_forward_writes_and_map_store_outcomes() {
+        use crate::native_rest::ADMIN_INVITE_WINDOWS_PATH;
+        use InviteWindowOutcome as Outcome;
+        let h = harness();
+        let admin = seed_admin(&h, "admin", "admin@example.com");
+        let window = |id, ends_at| InviteWindow {
+            id,
+            starts_at: 100,
+            ends_at,
+            created_by: Some("admin".into()),
+            note: Some("first cohort".into()),
+        };
+        let call = |method: &str, path: &str, body: Option<&str>, origin: Option<&str>| {
+            h.call_full(
+                method,
+                path,
+                body.map(str::to_owned),
+                Some(admin.clone()),
+                origin,
+            )
+        };
+        *h.store.invite_window_list.borrow_mut() = Some(vec![window(7, 200), window(3, 100)]);
+        let response = call("GET", ADMIN_INVITE_WINDOWS_PATH, None, None);
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+            serde_json::json!({"windows": [window(7, 200), window(3, 100)]})
+        );
+        assert_eq!(
+            call("GET", ADMIN_INVITE_WINDOWS_PATH, None, None).status,
+            500
+        );
+
+        h.store.invite_window_outcomes.borrow_mut().extend([
+            Outcome::Window(window(7, 200)),
+            Outcome::InvalidSchedule,
+            Outcome::Overlap,
+            Outcome::Window(window(7, 150)), // active close
+            Outcome::Window(window(3, 100)), // future cancellation
+            Outcome::Window(window(3, 100)), // idempotent return of retained row
+            Outcome::Missing,
+            Outcome::ActorNotAdmin, // store's locked recheck lost the role race
+        ]);
+        let schedule = |body| call("POST", ADMIN_INVITE_WINDOWS_PATH, Some(body), Some(ORIGIN));
+        let body = r#"{"starts_at":100,"ends_at":200,"note":"first cohort"}"#;
+        let body_with_whitespace = format!(" \n\t{body}");
+        let created = schedule(&body_with_whitespace);
+        assert_eq!(created.status, 201);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&created.body).unwrap(),
+            serde_json::json!({"window": window(7, 200)})
+        );
+        assert_eq!(schedule(r#"{"starts_at":200,"ends_at":100}"#).status, 422);
+        let overlap = schedule(body);
+        assert_eq!(overlap.status, 409);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&overlap.body).unwrap(),
+            serde_json::json!({"code": "conflict", "message": "invite windows cannot overlap", "retryable": false})
+        );
+
+        let close = |id| {
+            call(
+                "POST",
+                &format!("{ADMIN_INVITE_WINDOWS_PATH}/{id}/close"),
+                None,
+                Some(ORIGIN),
+            )
+        };
+        for (id, end) in [(7, 150), (3, 100), (3, 100)] {
+            let response = close(id);
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+                serde_json::json!({"window": window(id, end)})
+            );
+        }
+        for id in [404, 7] {
+            let response = close(id);
+            assert_eq!(response.status, 404);
+            assert_eq!(response.body, not_found().body);
+        }
+        assert_eq!(close(3).status, 500);
+        assert_eq!(
+            *h.store.invite_window_calls.borrow(),
+            [
+                serde_json::json!("list"),
+                serde_json::json!("list"),
+                serde_json::json!(["admin", "198.51.100.9", NOW, [100, 200, "first cohort"]]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, [200, 100, null]]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, [100, 200, "first cohort"]]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 7]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 3]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 3]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 404]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 7]),
+                serde_json::json!(["admin", "198.51.100.9", NOW, 3]),
+            ]
+        );
     }
 
     #[test]

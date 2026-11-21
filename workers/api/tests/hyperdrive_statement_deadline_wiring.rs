@@ -500,6 +500,7 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     ]
     .map(|name| (name, function_body(store, &format!("asyncfn{name}("))));
     let helpers = [
+        "invite_by_hash_on",
         "reap_unverified_users_on",
         "prune_expired_challenges_on",
         "delete_expired_rate_limit_slots",
@@ -511,7 +512,10 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     .map(|name| (name, function_body(&source, &format!("asyncfn{name}("))));
     for (name, body) in methods.iter().chain(helpers.iter()) {
         assert!(
-            body.contains(".query_typed("),
+            body.contains(match *name {
+                "invite_by_hash" => "invite_by_hash_on(&client,code_hash).await",
+                _ => ".query_typed(",
+            }),
             "{name} must run its statements unnamed via query_typed"
         );
         for named in [

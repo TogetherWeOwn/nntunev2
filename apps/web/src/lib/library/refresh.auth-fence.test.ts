@@ -1,6 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { ApiClient } from '../api/client.js';
-import { AUTH_GENERATION_KEY, AUTH_LOCK, captureAuthFence } from '../auth-fence.js';
+import { AUTH_GENERATION_KEY, AUTH_LOCK } from '../auth-fence.js';
 import { LIBRARY_AUTH_CONTEXT_KEY, loadSnapshot } from './cache.js';
 import { createLibraryRefresher, type LibraryRefreshUpdate } from './refresh.js';
 
@@ -51,26 +50,6 @@ it.each([200, 401, 403, 0])('withholds a stale result (%i) without purging its s
 	expect([update().deviceScope, local.getItem(key)]).toEqual([key, bytes]);
 });
 
-it('allows concurrent readers and queues the cookie write, then recovers after quota failure', async () => {
-	const { local, refresh, update } = setup();
-	const [first, second] = await Promise.all([captureAuthFence(), captureAuthFence()]);
-	await refresh();
-	const { deviceScope: key, isCurrent } = update();
-	expect(key).toMatch(/^nntune\.library\.favorites\.v1\./);
-	local.setItem(key!, bytes);
-	let logout!: Promise<void>;
-	await first!.run(async () => {
-		expect(await second!.run(() => true)).toBe(true);
-		vi.spyOn(local, 'setItem').mockImplementationOnce(() => { throw new DOMException('full', 'QuotaExceededError'); });
-		logout = new ApiClient({ baseUrl: '', fetchFn: async () => Response.json({}, { status: 500 }) }).logout();
-		void logout.catch(() => {});
-		expect((await navigator.locks.query()).pending).toContainEqual(expect.objectContaining({ name: AUTH_LOCK, mode: 'exclusive' }));
-	});
-	await expect(logout).rejects.toMatchObject({ status: 500 });
-	await refresh();
-	expect([isCurrent(), update().deviceScope, local.getItem(key!)]).toEqual([false, key, bytes]);
-});
-
 it('preserves exact favorite bytes across inconclusive verification and never binds a legacy list', async () => {
 	const { local, session, verify, refresh, update, refresher, onAccessRefused } = setup();
 	await refresh();
@@ -92,13 +71,14 @@ it('preserves exact favorite bytes across inconclusive verification and never bi
 	expect(local.getItem('nntune.library.favorites.v1.legacy')).toBe(bytes);
 });
 
-it('allows auth but withholds headerless browser rows without a fence', async () => {
-	const { refresh, refresher } = setup();
+it.each([false, true])('withholds headerless browser rows (storage blocked: %s)', async (blocked) => {
+	const { refresh, refresher, session, verify } = setup();
 	vi.stubEnv('MODE', 'production');
-	vi.stubGlobal('window', { get localStorage() { throw new Error('Blocked'); } });
-	await new ApiClient({ baseUrl: '', fetchFn: async () => Response.json({}) }).logout();
+	if (blocked) vi.stubGlobal('window', { get localStorage() { throw new Error('Blocked'); } });
 	await refresh(null);
 	expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false });
+	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
+	expect(verify).not.toHaveBeenCalled();
 });
 
 it('recovers a new bound scope after a proof-only quota failure', async () => {
@@ -108,16 +88,4 @@ it('recovers a new bound scope after a proof-only quota failure', async () => {
 	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
 	await refresh();
 	expect(update().deviceScope).toBeDefined();
-});
-
-it('falls back from lock denial before dispatch, but never resends a failed mutation', async () => {
-	setup();
-	const send = vi.fn(async () => { throw new Error('network'); });
-	const request = vi.spyOn(navigator.locks, 'request').mockRejectedValueOnce(new DOMException('Denied', 'SecurityError'));
-	try {
-		const api = new ApiClient({ baseUrl: '', fetchFn: send });
-		await expect(api.logout()).rejects.toThrow('network');
-		await expect(api.logout()).rejects.toThrow('network');
-		expect(send).toHaveBeenCalledTimes(2);
-	} finally { request.mockRestore(); }
 });

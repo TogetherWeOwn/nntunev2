@@ -39,6 +39,7 @@ test('a closed writer and verifier outage allow Retry; replacement retires local
 	await page.getByRole('link', { name: 'Liked', exact: true }).click();
 	await expect(retry).toBeVisible();
 	await expect(remove).toHaveCount(0);
+	await expect.poll(time).toBeGreaterThan(before);
 	await retry.click();
 	await remove.click();
 	await expect.poll(time).toBeGreaterThan(before);
@@ -47,6 +48,7 @@ test('a closed writer and verifier outage allow Retry; replacement retires local
 	await page.getByRole('link', { name: 'Back to Your Library' }).click();
 	await page.getByTestId('queue-copy-link').click();
 	await expect(page.getByTestId('queue-share-fallback')).toBeVisible();
+	await expect(undo).toBeVisible();
 	await page.evaluate((key) => {
 		localStorage.setItem(key, ' [ ] ');
 		const setItem = Storage.prototype.setItem;
