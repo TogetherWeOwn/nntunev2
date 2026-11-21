@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { MAX_JSON_BODY_BYTES } from '#lib/api/cappedJson.js';
 import { captureAuthFence } from '#lib/auth-fence.js';
 import { createRecentListensReader } from './recent-listens.js';
 
@@ -6,6 +7,7 @@ vi.mock('#lib/auth-fence.js', () => ({ captureAuthFence: vi.fn() }));
 
 const baseUrl = 'https://api.example.test';
 const playbackId = '10000000-0000-0000-0000-000000000000';
+const fixtureId = (i: number) => `${playbackId.slice(0, -2)}${i.toString(16).padStart(2, '0')}`;
 const row = { playback_id: playbackId, track_id: 'example-track', event: 'skip', recorded_at: 9 };
 const page = (events: unknown[], cursor: string | null = null) =>
 	Response.json({ events, next_cursor: cursor, retention: 'account_lifetime' });
@@ -23,13 +25,17 @@ beforeEach(() => {
 	});
 	vi.stubGlobal('fetch', fetchPage);
 });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+	vi.unstubAllGlobals();
+	vi.restoreAllMocks();
+	vi.useRealTimers();
+});
 
 it('posts one cookie-only first-page request and preserves server order, phases, and timestamps', async () => {
 	fetchPage.mockResolvedValue(page([
 		row,
 		{ ...row, event: 'start', recorded_at: 10 },
-		...Array.from({ length: 4 }, (_, i) => ({ ...row, playback_id: `${i + 2}${playbackId.slice(1)}` }))
+		...Array.from({ length: 98 }, (_, i) => ({ ...row, playback_id: fixtureId(i + 1) }))
 	], 'opaque-cursor'));
 	await createRecentListensReader(`${baseUrl}/`, publish).load();
 
@@ -42,7 +48,7 @@ it('posts one cookie-only first-page request and preserves server order, phases,
 	expect(publish).toHaveBeenLastCalledWith({ kind: 'ready', events: [
 		{ key: `${playbackId}:1`, track: 'example-track', event: 'skip', recordedAt: new Date(9000) },
 		{ key: `${playbackId}:0`, track: 'example-track', event: 'start', recordedAt: new Date(10000) },
-		...[2, 3, 4].map((i) => expect.objectContaining({ key: `${i}${playbackId.slice(1)}:1` }))
+		...[1, 2, 3].map((i) => expect.objectContaining({ key: `${fixtureId(i)}:1` }))
 	] });
 });
 
@@ -53,11 +59,45 @@ it.each([
 	['error', () => new Response(null, { status: 503 })],
 	['error', () => page([{ ...row, event: 'unknown' }])],
 	['error', () => page([row, { ...row, event: 'complete' }])],
-	['error', () => page(Array(101).fill(row))]
+	['error', () => page([], 'opaque-cursor')],
+	['error', () => page([row], 'opaque-cursor')],
+	['error', () => page(Array.from({ length: 101 }, (_, i) => ({ ...row, playback_id: fixtureId(i) })))]
 ] as const)('shows %s without listening rows', async (kind, response) => {
 	fetchPage.mockResolvedValue(response());
 	await createRecentListensReader(baseUrl, publish).load();
 	expect(publish).toHaveBeenLastCalledWith({ kind });
+});
+
+it('cancels a streamed export over the byte cap without publishing rows', async () => {
+	const bytes = new TextEncoder().encode(await page([row]).text() + ' '.repeat(MAX_JSON_BODY_BYTES));
+	const cancel = vi.fn();
+	fetchPage.mockResolvedValue(new Response(new ReadableStream({
+		start: (controller) => controller.enqueue(bytes),
+		pull: (controller) => controller.close(),
+		cancel
+	}, { highWaterMark: 0 })));
+	await createRecentListensReader(baseUrl, publish).load();
+	expect(cancel).toHaveBeenCalledOnce();
+	expect(publish.mock.calls).toEqual([[{ kind: 'loading' }], [{ kind: 'error' }]]);
+});
+
+it('keeps the request deadline active while reading a stalled 200 body', async () => {
+	vi.useFakeTimers();
+	vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+		const deadline = new AbortController();
+		setTimeout(() => deadline.abort(), ms);
+		return deadline.signal;
+	});
+	fetchPage.mockImplementation(async (_url, init) => new Response(new ReadableStream({
+		start: (controller) => init?.signal?.addEventListener('abort', () => controller.error(init.signal?.reason))
+	})));
+	const load = createRecentListensReader(baseUrl, publish).load();
+	await vi.advanceTimersByTimeAsync(9_999);
+	expect(publish.mock.calls).toEqual([[{ kind: 'loading' }]]);
+	await vi.advanceTimersByTimeAsync(1);
+	expect(fetchPage.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+	await load;
+	expect(publish.mock.calls).toEqual([[{ kind: 'loading' }], [{ kind: 'error' }]]);
 });
 
 it('drops a late prior-session response even before an invalidation event is delivered', async () => {

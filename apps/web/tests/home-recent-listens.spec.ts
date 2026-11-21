@@ -27,6 +27,7 @@ test('Home keeps a failed history read recoverable and distinguishes empty histo
 
 test('Home sends browser Origin and discards already rendered listens on a cross-tab session change', async ({ page, context }) => {
 	const shelf = page.getByRole('region', { name: 'Recent listens' });
+	const track = '<strong>outgoing-track</strong>';
 	await page.route(path, async (route) => {
 		const request = route.request();
 		expect(request.method()).toBe('POST');
@@ -34,12 +35,16 @@ test('Home sends browser Origin and discards already rendered listens on a cross
 		expect(await request.headerValue('authorization')).toBeNull();
 		expect(request.postDataJSON()).toEqual({});
 		await route.fulfill({ json: envelope([{
-			playback_id: '10000000-0000-0000-0000-000000000000', track_id: 'outgoing-track',
+			playback_id: '10000000-0000-0000-0000-000000000000', track_id: track,
 			event: 'complete', recorded_at: 1_700_000_000
 		}]) });
 	}, { times: 1 });
 	await page.goto('/home');
-	await expect(shelf.getByRole('listitem')).toContainText('Playback completed · Track reference: outgoing-track');
+	const row = shelf.getByRole('listitem');
+	await expect(row).toHaveCount(1);
+	await expect(row).toContainText(`Playback completed · Track reference: ${track}`);
+	await expect(row.locator('bdi')).toHaveText(track);
+	await expect(row.locator('a, strong')).toHaveCount(0);
 	await expect(shelf.locator('time')).toHaveAttribute('datetime', '2023-11-14T22:13:20.000Z');
 
 	const otherTab = await context.newPage();

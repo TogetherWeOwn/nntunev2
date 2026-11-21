@@ -40,8 +40,8 @@ async function readFirstPage(baseUrl: string, signal: AbortSignal): Promise<Rece
 		const page = (await readCappedJson(response)) as Record<string, unknown> | null;
 		if (
 			page?.retention !== 'account_lifetime' ||
-			(page.next_cursor !== null && typeof page.next_cursor !== 'string') ||
-			!Array.isArray(page.events) || page.events.length > PAGE_SIZE
+			!Array.isArray(page.events) || page.events.length > PAGE_SIZE ||
+			!(page.next_cursor === null || (typeof page.next_cursor === 'string' && page.events.length === PAGE_SIZE))
 		) return { kind: 'error' };
 
 		const keys = new Set<string>();
