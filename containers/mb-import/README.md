@@ -31,8 +31,8 @@ headerless MusicBrainz COPY files from the CC0 core dump: the entity files
 `recording` with `recording_alias`/`medium`/`track`, `work` with
 `work_alias`/`work_type`, `label` with `label_type`) plus the relationship files
 (`url`, `link_type`, `link`, `link_attribute_type`, `link_attribute`,
-`l_artist_url`, `l_recording_url`,
-`l_recording_recording`, `l_recording_work`, `release_label`, `isrc`) listed in
+`l_artist_url`, `l_recording_url`, `l_recording_recording`, `l_recording_work`,
+`l_artist_recording`, `l_artist_release`, `l_artist_work`, `release_label`, `isrc`) listed in
 `etl.py`. The ETL writes the ten curated import files and the sidecars below
 into an immutable snapshot and atomically swaps
 `<mbdump-dir>/curated` to point to it; previous snapshots
@@ -89,14 +89,22 @@ locale. Works without aliases produce no rows; an empty input produces an
 empty sidecar. Malformed projected fields or missing works refuse publication.
 Disk-bounded mode emits the same TSV content under `.tsv.gz`.
 
-The sidecar `mbdump-recording_work.tsv` contains recording MBID, work MBID,
-link-type name (raw COPY text), and dump timestamp. It sorts and deduplicates
-by recording MBID, work MBID, and the decoded type name, not the escaped TSV
-bytes. When multiple COPY spellings share a key, it writes the smallest raw
-spelling (`.tsv.gz` in disk-bounded mode). Missing references or malformed
-projection fields refuse publication; an empty `l_recording_work` file
-produces an empty sidecar. Its links are resolved separately from the URL and
-music-video allowlist.
+The `mbdump-artist_recording.tsv`, `mbdump-artist_release.tsv`, and
+`mbdump-artist_work.tsv` sidecars contain the artist MBID, the corresponding
+recording, release (not release-group), or work MBID, link-type name (raw COPY
+text), and dump timestamp. `mbdump-recording_work.tsv` uses recording and work
+MBIDs in the same shape. For each of these four families, the nine-field COPY
+row supplies link ID, source ID, and target ID in positions 2–4. The ETL
+resolves `link → link_type` and verifies the type's declared direction.
+
+The sidecars sort and deduplicate by source MBID, target MBID, and decoded
+type name, retaining the smallest raw COPY spelling for ties. Empty sources
+produce empty sidecars; missing endpoints, links or types, wrong direction,
+and malformed projection fields refuse publication. Disk-bounded mode emits
+the same TSV content under `.tsv.gz`. These links do not extend the URL or
+music-video allowlists, and the SQL importer still reads only its ten inputs.
+See upstream [core table membership](https://github.com/metabrainz/musicbrainz-server/blob/master/lib/MusicBrainz/Server/Constants.pm)
+and the [core export definition](https://github.com/metabrainz/musicbrainz-server/blob/master/admin/ExportAllTables).
 
 `mbdump-label.tsv` contains label MBID, name, label code, label-type name,
 and dump timestamp, ordered by upstream label ID. An absent code or type is
