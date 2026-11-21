@@ -217,7 +217,7 @@ async function beginSecurity(page: Page, kind: 'logout' | 'revoke-all') {
 }
 
 /** A real delegated anchor click, not page.goto/history-only URL replacement. */
-async function clientNavigate(page: Page, path: string) {
+async function clientNavigate(page: Page, path: string, requireHeld = true) {
 	await page.evaluate((href) => {
 		const link = document.createElement('a');
 		link.href = href;
@@ -230,7 +230,7 @@ async function clientNavigate(page: Page, path: string) {
 	await page.getByTestId('leave-held-action').evaluate((link) => link.remove());
 	// This exact probe lives only in the original JS realm. A full reload
 	// would lose the pending request and make the negative test meaningless.
-	expect(await page.evaluate(() => window.__transition.requests.length)).toBeGreaterThan(0);
+	if (requireHeld) expect(await page.evaluate(() => window.__transition.requests.length)).toBeGreaterThan(0);
 }
 
 async function release(page: Page, path: string, status: number, body: unknown) {
@@ -292,6 +292,146 @@ async function probeSnapshot(page: Page) {
 		rejections: window.__transition.rejections,
 		requests: window.__transition.requests
 	}));
+}
+
+const playbackFixture = { id: 'account-coral', title: 'Account Coral', artist: 'Fixture Artist', streamUrl: '/api/demo/audio?track=coral' };
+const servePlaybackLibrary = (page: Page, multi = false) => page.route('**/api/library', (route) =>
+	route.fulfill({ json: multi ? [playbackFixture, { id: 'moss', title: 'Moss' }] : [playbackFixture] }));
+
+async function startNativePlayback(page: Page) {
+	await page.getByRole('button', { name: 'Play displayed from the top' }).click();
+	const player = page.locator(`audio[data-testid="audio-player"][controls=""][src="${playbackFixture.streamUrl}"]`);
+	await expect(player).toBeVisible();
+	const audio = (await player.elementHandle())!;
+	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
+		!node.paused && node.seekable.length > 0 && node.currentTime > 0.2)).toBe(true);
+	return audio;
+}
+
+async function openHome(page: Page) {
+	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).click();
+	await expect(page).toHaveURL(/\/home$/);
+	await expect(page.getByRole('heading', { name: 'Home', exact: true })).toBeVisible();
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+}
+
+for (const mode of ['playing', 'demo', 'encoded demo', 'paused', '404 clear', '404 remove', '503 clear', 'timestamp Back']) {
+	const timestamp = mode === 'timestamp Back', status = Number.parseInt(mode, 10);
+	const paused = timestamp || mode === 'paused', demo = mode.endsWith('demo');
+	test(`Library → Home → Library keeps the native decoder (${mode})`, async ({ page }) => {
+		const errors: string[] = [];
+		page.on('pageerror', (error) => errors.push(error.message));
+		await servePlaybackLibrary(page, mode === '404 clear');
+		const share = `/library?track=${playbackFixture.id}&t=2`;
+		const time = () => page.getByTestId('audio-player').evaluate((node: HTMLAudioElement) => node.currentTime);
+		await page.goto(timestamp ? share : '/library');
+		if (timestamp) await expect.poll(time).toBeCloseTo(2);
+		const audio = await startNativePlayback(page);
+		const before = await audio.evaluate((node: HTMLAudioElement, { paused, timestamp }) => {
+			if (paused) node.pause();
+			if (timestamp) node.currentTime = 4;
+			const play = node.play.bind(node);
+			node.play = () => { node.dataset.replay = 'called'; return play(); };
+			node.addEventListener('play', () => { node.dataset.replay = 'event'; });
+			node.addEventListener('loadstart', () => { node.dataset.reload = 'event'; });
+			return { position: node.currentTime, source: node.currentSrc };
+		}, { paused, timestamp });
+		const inspect = async (position: number) => {
+			await expect(page.getByTestId('audio-player')).toBeVisible();
+			await expect(page.getByTestId('library-now-playing')).toHaveText('Account Coral — Fixture Artist');
+			await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => ({
+				count: document.querySelectorAll('audio').length, sameNode: node === document.querySelector('audio'),
+				source: node.currentSrc, paused: node.paused, replay: node.dataset.replay, reload: node.dataset.reload
+			}))).toEqual({ count: 1, sameNode: true, source: before.source, paused, replay: undefined, reload: undefined });
+			if (paused) expect(await time()).toBeCloseTo(position, 3);
+			else await expect.poll(time).toBeGreaterThan(position + 0.15);
+			return time();
+		};
+		const queueItem = page.getByTestId('queue-item');
+		if (status) await queueItem.getByRole('button', { name: `Star ${playbackFixture.title}` }).click();
+		await openHome(page);
+		const atHome = await inspect(before.position);
+		if (status) await page.route('**/api/library', (route) => route.fulfill({ status }), { times: 1 });
+		await (timestamp ? page.goBack() : page.getByRole('link', { name: 'Open Your Library', exact: true }).click());
+		await expect(status ? page.getByText(status === 404 ? 'Library listing is not available yet.' : 'Library is not reachable right now.') : page.getByTestId('library-item')).toBeVisible();
+		await expect(page.getByTestId('now-playing')).toContainText(playbackFixture.title);
+		await expect(page.getByTestId('player-next')).toBeVisible();
+		const atLibrary = await inspect(atHome);
+		if (timestamp) {
+			await openHome(page);
+			await clientNavigate(page, share, false);
+			await expect.poll(time).toBeCloseTo(2);
+		} else if (status) {
+			const clear = mode.endsWith('clear'), retry = Promise.withResolvers<void>();
+			const filter = page.getByRole('searchbox', { name: 'Filter queue' });
+			if (status === 503) {
+				await filter.fill('Coral');
+				await page.route('**/api/library', (route) => retry.promise.then(() => route.fulfill({ status })), { times: 1 });
+				await page.getByRole('button', { name: 'Retry' }).click();
+				await inspect(atLibrary);
+			}
+			await expect(queueItem).toHaveCount(mode === '404 clear' ? 2 : 1);
+			await expect(queueItem.getByRole('button', { name: /^(Unstar|Star) / })).toHaveCount(0);
+			await expect(queueItem.getByRole('checkbox')).toHaveCount(0);
+			if (clear) await page.getByRole('button', { name: 'Clear queue', exact: true }).press('Enter');
+			await page.getByRole('button', { name: clear ? 'Yes, clear queue' : 'Remove Account Coral from queue' }).press('Enter');
+			const emptyFocus = page.getByTestId('queue-empty-focus');
+			await expect(emptyFocus).toBeFocused();
+			await expect(page.locator('audio')).toHaveCount(0);
+			if (status === 503) {
+				await expect(page.getByText('Loading your library…')).toBeVisible();
+				retry.resolve();
+				await expect(page.getByText('Library is not reachable right now.')).toBeVisible();
+				await expect(filter).toHaveValue('Coral');
+				await expect(emptyFocus).toBeFocused();
+			}
+			await page.reload();
+			await expect(page.getByTestId('favorite-item')).toContainText(playbackFixture.title);
+		} else if (!paused) {
+			await clientNavigate(page, mode === 'encoded demo' ? '/d%65mo/player' : demo ? '/demo/player' : '/', false);
+			await expect(page.getByRole('heading', { name: demo ? 'Player resilience demo' : 'NNTune', exact: true })).toBeVisible();
+			if (demo) await expect(page.getByTestId('demo-audio')).toHaveCount(1);
+			await expect(page.locator('audio')).toHaveCount(demo ? 1 : 0);
+			await expect(page.getByText(playbackFixture.title).or(page.getByTestId('library-now-playing'))).toHaveCount(0);
+			expect(await audio.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);
+		}
+		expect(errors).toEqual([]);
+	});
+}
+
+for (const signal of ['local', 'cross-tab', 401, 403, 'Billing'] as const) {
+	const trigger = typeof signal === 'number' ? `Library HTTP ${signal}` : `${signal} sign-out`;
+	test(`${trigger} purges the native player while Library is absent`, async ({ page }) => {
+		await servePlaybackLibrary(page);
+		const endpoint = '/v1/session/logout';
+		if (signal === 'local') {
+			await fixtures(page, [endpoint]);
+			await beginSecurity(page, 'logout');
+			await clientNavigate(page, '/library');
+		} else await page.goto('/library');
+		const audio = await startNativePlayback(page);
+		if (typeof signal === 'number') await page.route('**/api/library', (route) => route.fulfill({ status: signal }), { times: 1 });
+		if (signal === 'Billing') {
+			await page.route(/\/v1\/me\/(subscription|usage)$/, (route) => route.fulfill({ status: 401, json: { error: 'unauthorized' } }));
+			await clientNavigate(page, '/account/billing', false);
+			await expect(page.getByRole('alert')).toContainText('You are signed out');
+		} else await openHome(page);
+		if (typeof signal === 'number') {
+			await expect(page.getByText(signal === 401 ? 'Sign in to see your library.' : 'You do not have access to this library.')).toBeVisible();
+		} else if (signal !== 'Billing') {
+			await expect(page.getByTestId('library-now-playing')).toContainText(playbackFixture.title);
+			if (signal === 'local') await release(page, endpoint, 200, { ok: true });
+			else await actorLogout(page);
+		}
+		await expect(page).toHaveURL(signal === 'Billing' ? /\/account\/billing$/ : /\/home$/);
+		await expect(page.locator('audio, [data-testid="library-now-playing"], [data-testid="mini-player"]')).toHaveCount(0);
+		expect(await audio.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);
+		await page.getByTestId('shell-rail').getByRole('link', { name: 'Your Library', exact: true }).click();
+		await expect(page.getByTestId('library-item')).toHaveCount(1);
+		await expect(page.getByTestId('now-playing')).toHaveText('Queue is empty');
+		await expect(page.getByTestId('player-next')).toBeDisabled();
+		await expect(page.locator('audio')).toHaveCount(0);
+	});
 }
 
 test('abandoned logout success resets the same-window replacement library and fences its late response', async ({

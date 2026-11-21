@@ -2084,6 +2084,180 @@ fn postgres_admin_simultaneous_opposing_demotions_keep_one_admin() {
     });
 }
 
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_invite_windows_are_bounded_and_audited_atomically() {
+    use super::{admin_list_invite_windows_on, admin_write_invite_window_on as write};
+    use crate::handlers::{
+        InviteWindowOutcome as Outcome, InviteWindowSchedule, InviteWindowWrite::*,
+    };
+    run_test(async {
+        let mut client = connect().await;
+        let (admin, member) = seed_admin_test_users(&client).await;
+        // The mutation harness reruns this serial suite on the same database.
+        // Start after any committed fixture ranges, which are global, not per actor.
+        let start: i64 = client
+            .query_one(
+                "SELECT GREATEST(MAX(ends_at), $1) FROM invite_windows",
+                &[&(NOW as i64)],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let now = u64::try_from(start).unwrap();
+        let schedule = |starts_at, ends_at| InviteWindowSchedule {
+            starts_at,
+            ends_at,
+            note: Some("not in audit".into()),
+        };
+        let ip = "198.51.100.9";
+        let first = schedule(start, start + 10);
+        assert!(matches!(
+            write(&mut client, &member, Schedule(&first), ip, now)
+                .await
+                .unwrap(),
+            Outcome::ActorNotAdmin
+        ));
+        for end in [start, start - 1] {
+            assert!(matches!(
+                write(
+                    &mut client,
+                    &admin,
+                    Schedule(&schedule(start, end)),
+                    ip,
+                    now
+                )
+                .await
+                .unwrap(),
+                Outcome::InvalidSchedule
+            ));
+        }
+        let Outcome::Window(open) = write(&mut client, &admin, Schedule(&first), ip, now)
+            .await
+            .unwrap()
+        else {
+            panic!("first schedule must commit");
+        };
+        assert!(matches!(
+            write(
+                &mut client,
+                &admin,
+                Schedule(&schedule(start + 9, start + 11)),
+                ip,
+                now
+            )
+            .await
+            .unwrap(),
+            Outcome::Overlap
+        ));
+        let Outcome::Window(future) = write(
+            &mut client,
+            &admin,
+            Schedule(&schedule(start + 10, start + 20)),
+            ip,
+            now,
+        )
+        .await
+        .unwrap() else {
+            panic!("adjacent schedule must commit");
+        };
+        assert!(matches!(
+            write(&mut client, &member, Close(open.id), ip, now)
+                .await
+                .unwrap(),
+            Outcome::ActorNotAdmin
+        ));
+
+        assert!(matches!(
+            write(&mut client, &admin, Close(0), ip, now).await.unwrap(),
+            Outcome::Missing
+        ));
+        let Outcome::Window(ended) = write(&mut client, &admin, Close(open.id), ip, now + 10)
+            .await
+            .unwrap()
+        else {
+            panic!("a naturally ended window must be returned unchanged");
+        };
+        assert_eq!(ended.ends_at, open.ends_at);
+
+        // A connection-local stand-in forces the audit insert to fail after each mutation.
+        client.batch_execute("CREATE TEMP TABLE audit_log (LIKE public.audit_log INCLUDING DEFAULTS, CHECK (false))").await.unwrap();
+        let failed_schedule = schedule(start + 20, start + 30);
+        for operation in [Close(open.id), Schedule(&failed_schedule)] {
+            assert!(write(&mut client, &admin, operation, ip, now + 1)
+                .await
+                .is_err());
+        }
+        client
+            .batch_execute("DROP TABLE pg_temp.audit_log")
+            .await
+            .unwrap();
+        let original = admin_list_invite_windows_on(&client).await.unwrap();
+        assert_eq!(
+            original
+                .iter()
+                .filter(|row| row.created_by.as_deref() == Some(admin.as_str()))
+                .count(),
+            2
+        );
+        assert_eq!(
+            original
+                .iter()
+                .find(|row| row.id == open.id)
+                .unwrap()
+                .ends_at,
+            start + 10
+        );
+
+        for offset in [2, 3, 1] {
+            // Retry both, including a stale request that reached the write lock late.
+            for (id, expected_end) in [(open.id, start + 2), (future.id, future.starts_at)] {
+                let Outcome::Window(window) =
+                    write(&mut client, &admin, Close(id), ip, now + offset)
+                        .await
+                        .unwrap()
+                else {
+                    panic!("close/cancel must return the retained window");
+                };
+                assert_eq!(window.ends_at, expected_end);
+            }
+        }
+        let audits = client
+            .query(
+                "SELECT action, at, details::text FROM audit_log WHERE user_id = $1 ORDER BY id",
+                &[&admin],
+            )
+            .await
+            .unwrap();
+        let expected = [
+            ("invite.window_scheduled", start, &open, open.ends_at),
+            ("invite.window_scheduled", start, &future, future.ends_at),
+            ("invite.window_closed", start + 2, &open, start + 2),
+            (
+                "invite.window_cancelled",
+                start + 2,
+                &future,
+                future.starts_at,
+            ),
+        ];
+        assert_eq!(audits.len(), expected.len());
+        for (row, (action, at, window, ends_at)) in audits.iter().zip(expected) {
+            assert_eq!(row.get::<_, String>(0), action);
+            assert_eq!(row.get::<_, i64>(1), at);
+            let details: serde_json::Value =
+                serde_json::from_str(&row.get::<_, String>(2)).unwrap();
+            assert_eq!(
+                details,
+                serde_json::json!({"window_id": window.id, "starts_at": window.starts_at, "ends_at": ends_at})
+            );
+        }
+        client.batch_execute("INSERT INTO invite_windows (starts_at, ends_at) SELECT 0, 0 FROM generate_series(1,201)").await.unwrap();
+        let bounded = admin_list_invite_windows_on(&client).await.unwrap();
+        assert_eq!(bounded.len(), 200);
+        assert!(bounded.windows(2).all(|pair| pair[0].id > pair[1].id));
+    });
+}
+
 // The production issue/revoke transactions (migration 0033): each
 // commits with exactly one audit row that references the invite by
 // surrogate row id — never by code plaintext or hash — and a demoted
