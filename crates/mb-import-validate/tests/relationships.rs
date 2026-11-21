@@ -41,55 +41,56 @@ fn reads_directed_song_golden_but_refuses_video_projection() {
 
 #[test]
 fn reads_typed_targets_and_orders_decoded_links() {
-    // Representative rows from the producer's artist/release/work test expectations.
-    for (projection, source, gid, target, link) in [
-        (
-            ArtistRecording,
-            ARTIST,
-            R1,
-            TargetMbid::Recording(R1.into()),
-            r"\143redit",
-        ),
-        (
-            ArtistRelease,
-            ARTIST,
-            RELEASE,
-            TargetMbid::Release(RELEASE.into()),
-            "credit",
-        ),
-        (
-            ArtistWork,
-            ARTIST,
-            WORK,
-            TargetMbid::Work(WORK.into()),
-            "credit",
-        ),
-        (
-            RecordingWork,
-            R1,
-            WORK,
-            TargetMbid::Work(WORK.into()),
-            "performance",
-        ),
-    ] {
-        let row = format!("{source}\t{gid}\t{link}\t{TS}\n");
-        let expected = if projection == RecordingWork {
-            "performance"
-        } else {
-            "credit"
-        };
-        assert_eq!(
-            lookup(projection, row.as_bytes(), source),
-            Ok(vec![edge(target, expected)])
-        );
-    }
+    // These goldens are also checked byte-for-byte by the ETL tests.
+    const ARTIST_RECORDING: &[u8] =
+        include_bytes!("../../../containers/mb-import/tests/expected/mbdump-artist_recording.tsv");
+    const ARTIST_RELEASE: &[u8] =
+        include_bytes!("../../../containers/mb-import/tests/expected/mbdump-artist_release.tsv");
+    const ARTIST_WORK: &[u8] =
+        include_bytes!("../../../containers/mb-import/tests/expected/mbdump-artist_work.tsv");
+    const RECORDING_WORK: &[u8] =
+        include_bytes!("../../../containers/mb-import/tests/expected/mbdump-recording_work.tsv");
     let other = "10101010-1010-4010-8010-101010101010";
+    let other_release = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    assert_eq!(
+        lookup(ArtistRecording, ARTIST_RECORDING, ARTIST),
+        Ok(vec![
+            edge(TargetMbid::Recording(R1.into()), "arrangement"),
+            edge(TargetMbid::Recording(R1.into()), "credit"),
+            edge(TargetMbid::Recording(R2.into()), "credit"),
+        ])
+    );
+    assert_eq!(
+        lookup(ArtistRelease, ARTIST_RELEASE, ARTIST),
+        Ok(vec![
+            edge(TargetMbid::Release(RELEASE.into()), "arrangement"),
+            edge(TargetMbid::Release(RELEASE.into()), "credit"),
+            edge(TargetMbid::Release(other_release.into()), "credit"),
+        ])
+    );
+    assert_eq!(
+        lookup(ArtistWork, ARTIST_WORK, ARTIST),
+        Ok(vec![
+            edge(TargetMbid::Work(other.into()), "credit"),
+            edge(TargetMbid::Work(WORK.into()), "arrangement"),
+            edge(TargetMbid::Work(WORK.into()), "credit"),
+        ])
+    );
+    assert_eq!(
+        lookup(RecordingWork, RECORDING_WORK, R1),
+        Ok(vec![
+            edge(TargetMbid::Work(other.into()), "performance"),
+            edge(TargetMbid::Work(WORK.into()), "medley"),
+            edge(TargetMbid::Work(WORK.into()), "performance"),
+        ])
+    );
+
     let rows = format!(
-        "{ARTIST}\t{WORK}\t\\143redit\t{TS}\n{ARTIST}\t{WORK}\tB\\303\\251\\t\\\\N\t{TS}\n{ARTIST}\t{other}\tcredit\t{TS}\n"
+        "{ARTIST}\t{WORK}\t\\143redit\t{TS}\n{ARTIST}\t{WORK}\tB\\303\\251\\t\\\\N\\034\t{TS}\n{ARTIST}\t{other}\tcredit\t{TS}\n"
     );
     let expected = Ok(vec![
         edge(TargetMbid::Work(other.into()), "credit"),
-        edge(TargetMbid::Work(WORK.into()), "Bé\t\\N"),
+        edge(TargetMbid::Work(WORK.into()), "Bé\t\\N\u{1c}"),
         edge(TargetMbid::Work(WORK.into()), "credit"),
     ]);
     assert_eq!(lookup(ArtistWork, rows.as_bytes(), ARTIST), expected);
@@ -116,6 +117,8 @@ fn validates_unmatched_rows_and_artifact_bounds() {
             "null_in_not_null",
         ),
         ("cover", r"\q", "bad_escape"),
+        ("cover", r"\034", "invalid_link_type"),
+        ("cover", r"\035\036\037\t", "invalid_link_type"),
         (TS, "2025-02-03T04:05:60Z", "bad_timestamp"),
     ] {
         let invalid = text.replacen(from, to, 1);

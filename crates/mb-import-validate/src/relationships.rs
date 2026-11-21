@@ -81,7 +81,10 @@ pub fn lookup(
             return Err(invalid(reason::NULL_IN_NOT_NULL));
         }
         let link_type = decode_copy_field(link_type).map_err(invalid)?;
-        if link_type.trim().is_empty()
+        // Python's str.strip() also treats these four separators as whitespace.
+        if link_type
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'))
             || (projection == Projection::RecordingRecording && link_type.chars().count() > 255)
         {
             return Err(invalid("invalid_link_type"));
