@@ -3,7 +3,7 @@ import { emptySeek, readAbsoluteSeek, writeAbsoluteSeek, type AbsoluteSeekState 
 import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { createPlayerSleepTimer } from './playerSleepTimer.js';
-import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode } from './queue.js';
+import { currentTrack, naturalEndPolicy, nextTrack, previousTrack, selectTrack, type QueueState, type RepeatMode } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
 import { createNativeSound } from './nativeSound.js';
@@ -182,6 +182,13 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!ownsPause()) return;
 		if (audio.paused || audio.ended) attachment.playing = false;
 		readPlayback(audio, ownsPause, get(playbackStatus));
+	}
+
+	function navigateQueue(step: (state: QueueState) => QueueState): void {
+		const base = queue.snapshot;
+		const next = step(base);
+		// Match Library Next: replace the selection, but don't play the new source.
+		if (next !== base) selection?.commit(next);
 	}
 
 	function clearJumpFeedback(): void {
@@ -685,7 +692,11 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				sound.connect(audio, target.matches, receipt.listeners.signal);
 				readPlayback(audio, target.matches, 'starting');
 				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
-					{ playCurrent, pauseCurrent }, receipt.listeners.signal);
+					{
+						playCurrent, pauseCurrent,
+						onNext: selection && (() => navigateQueue(nextTrack)),
+						onPrevious: selection && (() => navigateQueue(previousTrack))
+					}, receipt.listeners.signal);
 			}
 			observePosition();
 			pause(previous?.audio);

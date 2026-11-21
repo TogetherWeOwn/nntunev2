@@ -1,5 +1,6 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import { get } from 'svelte/store';
+import { createPlayerController } from './controller.svelte.js';
 import { createMediaController } from './mediaController.js';
 import type { MediaMetadataInit, MediaSessionLike } from './mediaSession.js';
 import { createQueue } from './queue.js';
@@ -158,4 +159,24 @@ test('compact controls work with Media Session absent or one action unsupported'
 	handler('pause')!();
 	expect(partial.status()).toBe('paused');
 	partial.media.destroy();
+});
+
+test.each(['nexttrack', 'previoustrack'] as const)('unsupported %s leaves the other queue action usable', (unsupported) => {
+	const { handler } = stubSession(unsupported);
+	const next = unsupported === 'previoustrack';
+	const base = { ...createQueue([coral, moss]), currentIndex: next ? 0 : 1 };
+	const { queue, media, purgeAtAuthBoundary, destroy } = createPlayerController(base, { flush: async () => {} }, () => true);
+	const audio = new Decoder(base.tracks[base.currentIndex].streamUrl);
+	try {
+		media.attach(audio.element);
+		expect(handler(unsupported)).toBeUndefined();
+		expect(queue.snapshot).toBe(base);
+		handler(next ? 'nexttrack' : 'previoustrack')!();
+		expect(queue.snapshot.currentIndex).toBe(next ? 1 : 0);
+		expect(queue.snapshot.tracks).toBe(base.tracks);
+		expect(audio.play).not.toHaveBeenCalled();
+	} finally {
+		purgeAtAuthBoundary();
+		destroy();
+	}
 });

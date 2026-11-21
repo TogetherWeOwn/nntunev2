@@ -1,13 +1,15 @@
 import type { Readable } from 'svelte/store';
 import { displayArtist, displayTitle } from '../library/order.js';
-import { applyMediaSession, clearMediaSession, getMediaSession } from './mediaSession.js';
+import { applyMediaSession, clearMediaSession, getMediaSession, type MediaSessionHandlers } from './mediaSession.js';
 import type { QueueState, Track } from './queue.js';
 
 /** The native attachment owns this registration, not a route or queue revision. */
 export function bindSystemTransport(
 	queue: Readable<QueueState>,
 	readTrack: () => Track | null,
-	{ playCurrent, pauseCurrent }: { playCurrent: () => Promise<void>; pauseCurrent: () => void },
+	{ playCurrent, pauseCurrent, onNext, onPrevious }: Pick<MediaSessionHandlers, 'onNext' | 'onPrevious'> & {
+		playCurrent: () => Promise<void>; pauseCurrent: () => void;
+	},
 	signal: AbortSignal
 ): void {
 	const session = getMediaSession();
@@ -17,7 +19,10 @@ export function bindSystemTransport(
 		// Unregistering cannot recall a callback already queued by the OS.
 		if (!signal.aborted && readTrack()) action();
 	};
-	const handlers = { onPlay: guard(() => void playCurrent()), onPause: guard(pauseCurrent) };
+	const handlers = {
+		onPlay: guard(() => void playCurrent()), onPause: guard(pauseCurrent),
+		onNext: onNext && guard(onNext), onPrevious: onPrevious && guard(onPrevious)
+	};
 	let published: Track | null = null;
 	let unsubscribe: (() => void) | undefined;
 	signal.addEventListener('abort', () => {
