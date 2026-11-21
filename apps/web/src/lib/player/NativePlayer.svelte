@@ -10,10 +10,9 @@
 		currentTrack, mediaRevision, streamUrl, attachNativeAudio,
 		playbackStatus, playCurrent, pauseCurrent, retryCurrent,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
-		jumpStatus, jumpStatusVersion, jumpRelative, volumeControls, speedControl
+		jumpStatus, jumpStatusVersion, jumpRelative, volumeControls
 	}: ComponentProps<typeof NativeAudio> & {
 		volumeControls: Snippet;
-		speedControl: Snippet;
 		currentTrack: Pick<Track, 'id' | 'title' | 'artist'> | null;
 		playbackStatus: PlaybackStatus;
 		playCurrent: () => Promise<void>;
@@ -71,7 +70,7 @@
 		</button>
 	</div>
 	{@render volumeControls()}
-	<p data-testid="player-transport-status" role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
+	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
 	{#if !restartCanSeek}
 		<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 	{/if}
@@ -97,7 +96,6 @@
 		</button>
 	</div>
 	<p data-testid="player-seek-feedback" aria-live="polite">{#key jumpStatusVersion}{jumpStatus}{/key}</p>
-	{@render speedControl()}
 </section>
 
 <style>

@@ -55,6 +55,25 @@ test('speed follows the current decoder and restores across source change and re
 	await expect(audio(page)).toHaveJSProperty('playbackRate', 1.3);
 });
 
+test('a demo restore and its ratechange leave a newer Library choice intact', async ({ page, context }) => {
+	const demo = await context.newPage();
+	await demo.goto('/demo/player');
+	await speed(demo).selectOption('1.25');
+	await openLibrary(page);
+	await enqueue(page, 0);
+	await speed(page).selectOption('1.75');
+	await demo.evaluate(() => document.addEventListener('ratechange', (event) => {
+		(event.target as HTMLAudioElement).dataset.rateChanged = 'yes';
+	}, true));
+	await demo.getByTestId('player-next').click();
+	const demoAudio = demo.getByTestId('demo-audio').and(demo.locator('audio[src$="track=second-signal"]'));
+	await expect(demoAudio).toHaveAttribute('data-rate-changed', 'yes');
+	await expect(demoAudio).toHaveJSProperty('playbackRate', 1.25);
+	expect(await stored(page)).toBe('1.75');
+	await speed(demo).selectOption('1.5');
+	await expect.poll(() => stored(page)).toBe('1.5');
+});
+
 for (const refusal of ['ignore', 'clamp', 'throw'] as const) {
 	test(`speed reports the observed rate when a write fails (${refusal})`, async ({ page }) => {
 		await openLibrary(page);
@@ -73,10 +92,18 @@ for (const refusal of ['ignore', 'clamp', 'throw'] as const) {
 		}, refusal);
 		const status = page.getByTestId('speed-status').and(page.getByRole('status'));
 		await expect(status).toBeEmpty();
+		await speed(page).focus();
 		await speed(page).selectOption('2');
 		const observed = refusal === 'clamp' ? '1.3' : '1';
 		await expect(status).toHaveText(`Speed 2x not applied — still ${observed}x`);
 		await expect(speed(page)).toHaveValue(observed);
+		await status.evaluate((node) => new MutationObserver(() => { node.dataset.refreshed = 'yes'; })
+			.observe(node, { childList: true, characterData: true, subtree: true }));
+		await speed(page).selectOption('2');
+		await expect(status).toHaveAttribute('data-refreshed', 'yes');
+		await expect(status).toHaveText(`Speed 2x not applied — still ${observed}x`);
+		await expect(speed(page)).toHaveValue(observed);
+		await expect(speed(page)).toBeFocused();
 		await expect(audio(page)).toHaveJSProperty('playbackRate', Number(observed));
 		expect(await stored(page)).toBe(observed);
 		await expect(audio(page)).toHaveJSProperty('paused', true);

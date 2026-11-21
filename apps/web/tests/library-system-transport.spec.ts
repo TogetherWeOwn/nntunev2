@@ -50,8 +50,7 @@ test('system Play and Pause control the same native decoder after leaving Librar
 	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).click();
 	await expect(page).toHaveURL(/\/home$/);
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
-	const status = page.getByRole('region', { name: 'Player', exact: true })
-		.getByRole('status').and(page.getByTestId('player-transport-status'));
+	const player = page.getByRole('region', { name: 'Player', exact: true });
 	await expect(native).toBeVisible();
 	expect(await audio.evaluate((el: HTMLAudioElement) => el === document.querySelector('audio') && el.controls && el.paused)).toBe(true);
 	const pausedAt = await time();
@@ -61,18 +60,18 @@ test('system Play and Pause control the same native decoder after leaving Librar
 		window.__librarySystemTransport.handlers.play!();
 	}));
 	expect(Math.abs(playedAt - pausedAt)).toBeLessThan(0.25);
-	await expect(status).toHaveText('Playing');
+	await expect(player.getByRole('status')).toHaveText('Playing');
 	await expect.poll(time).toBeGreaterThan(pausedAt + 0.1);
 	await systemAction(page, 'pause');
-	await expect(status).toHaveText('Paused');
+	await expect(player.getByRole('status')).toHaveText('Paused');
 	expect(await audio.evaluate((el: HTMLAudioElement) => el === document.querySelector('audio[controls]') && el.paused)).toBe(true);
 	await expect(page.locator('audio')).toHaveCount(1);
 
 	// Exercise the native media path independently of both sets of app actions.
 	await audio.evaluate((el: HTMLAudioElement) => el.play());
-	await expect(status).toHaveText('Playing');
+	await expect(player.getByRole('status')).toHaveText('Playing');
 	await audio.evaluate((el: HTMLAudioElement) => el.pause());
-	await expect(status).toHaveText('Paused');
+	await expect(player.getByRole('status')).toHaveText('Paused');
 
 	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', { key: 'nntune.library.auth-transition.v1' })));
 	await expect(native).toHaveCount(0);

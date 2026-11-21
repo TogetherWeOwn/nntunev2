@@ -23,7 +23,7 @@ export function parsePlaybackSpeed(raw: string | null): number {
 }
 
 export interface PlaybackSpeedDeps {
-	storage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+	storage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null;
 	/** Current audio element; null/undefined when none is mounted. */
 	audio: () => { playbackRate: number } | null | undefined;
 	storageKey?: string;
@@ -49,16 +49,20 @@ export function createPlaybackSpeed({
 	audio,
 	storageKey = PLAYBACK_SPEED_STORAGE_KEY
 }: PlaybackSpeedDeps): PlaybackSpeed {
+	let saved: string | null | undefined;
 	let current: number;
 	try {
-		current = parsePlaybackSpeed(storage.getItem(storageKey));
+		current = parsePlaybackSpeed((saved = storage?.getItem(storageKey) ?? null));
 	} catch {
 		current = DEFAULT_PLAYBACK_SPEED;
 	}
 
-	function persist(rate: number): void {
+	function persist(rate: number, passive = false): void {
 		try {
+			// A passive restore must not overwrite a newer choice from another tab.
+			if (!storage || (passive && storage.getItem(storageKey) !== saved)) return;
 			storage.setItem(storageKey, String(rate));
+			saved = String(rate);
 		} catch {
 			// Fail-soft: the rate still applies to audio below.
 		}
@@ -72,7 +76,7 @@ export function createPlaybackSpeed({
 	 * throwing getter or non-finite reading retains the previous rate,
 	 * leaves storage untouched and never throws.
 	 */
-	function writeAndVerify(request: number): number {
+	function writeAndVerify(request: number, passive = false): number {
 		let element: { playbackRate: number } | null | undefined;
 		try {
 			element = audio();
@@ -98,7 +102,7 @@ export function createPlaybackSpeed({
 		}
 		if (!Number.isFinite(applied)) return current;
 		current = clampPlaybackSpeed(applied);
-		persist(current);
+		persist(current, passive);
 		return current;
 	}
 
@@ -117,7 +121,7 @@ export function createPlaybackSpeed({
 				return current;
 			}
 			if (!element) return current;
-			return writeAndVerify(current);
+			return writeAndVerify(current, true);
 		},
 		adoptNativeRate(rate: number) {
 			if (!Number.isFinite(rate)) return current;

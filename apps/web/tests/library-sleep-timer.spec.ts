@@ -7,7 +7,7 @@ test('a duration armed in Library pauses the same player on return to a visible 
 	await page.route('**/api/library', (route) => route.fulfill({ json: [coral] }));
 	await page.goto('/library?track=coral&t=2');
 	const player = page.getByRole('region', { name: 'Player', exact: true });
-	const status = player.getByRole('status').and(player.getByTestId('player-transport-status'));
+	const status = player.getByRole('status');
 	const timer = page.getByRole('region', { name: 'Sleep timer' });
 	const audio = (await player.locator('audio[controls][data-testid="audio-player"]').elementHandle())!;
 	await audio.evaluate((node: HTMLAudioElement) => {

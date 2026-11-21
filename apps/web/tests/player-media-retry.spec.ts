@@ -11,7 +11,7 @@ async function openPlayer(page: Page) {
 	const audio = player.getByTestId('audio-player');
 	await expect(audio).toBeVisible();
 	return {
-		audio, status: player.getByRole('status').and(player.getByTestId('player-transport-status')),
+		audio, status: player.getByRole('status'),
 		retry: player.getByRole('button', { name: 'Retry playback', exact: true }),
 		play: player.getByRole('button', { name: 'Play', exact: true }),
 		pause: player.getByRole('button', { name: 'Pause', exact: true })
@@ -55,6 +55,11 @@ test('keyboard Retry resumes real audio on the same decoder without automatic or
 		await expect(retry).toBeFocused();
 		await page.keyboard.press('Enter');
 		await expect(audio).toHaveAttribute('data-loads', '1');
+		await page.keyboard.press('Shift+Slash');
+		await expect(page.getByTestId('shortcuts-close')).toBeFocused();
+		await page.keyboard.press('Escape');
+		await expect(page.getByTestId('shortcuts-button')).toBeFocused();
+		await retry.focus();
 		release.resolve();
 		await expect(status).toHaveText('Playing');
 		await expect(audio).toHaveAttribute('data-play-rate', '1.5');

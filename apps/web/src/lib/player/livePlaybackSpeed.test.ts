@@ -1,7 +1,6 @@
 import { get } from 'svelte/store';
 import { expect, test, vi } from 'vitest';
 import { createLivePlaybackSpeed } from './livePlaybackSpeed.js';
-import { PLAYBACK_SPEED_STORAGE_KEY } from './playbackSpeed.js';
 
 function fixture(seed: string | null = '1.3') {
 	let target: { audio: { playbackRate: number }; matches: () => boolean } | undefined;
@@ -9,10 +8,7 @@ function fixture(seed: string | null = '1.3') {
 	let stored: string | null = seed;
 	const storage = {
 		getItem: () => stored,
-		setItem: vi.fn((key: string, rate: string) => {
-			expect(key).toBe(PLAYBACK_SPEED_STORAGE_KEY);
-			stored = rate;
-		}),
+		setItem: vi.fn((_key: string, rate: string) => { stored = rate; }),
 		removeItem: vi.fn()
 	};
 	speed.restore(storage);

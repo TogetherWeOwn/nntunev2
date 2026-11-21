@@ -8,7 +8,7 @@ const unavailable: { rate: number | null; feedback: string } = { rate: null, fee
 export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 	const state = writable(unavailable);
 	let preference: ReturnType<typeof createPlaybackSpeed> | undefined;
-	let writePort: (RatePort & { passive: boolean }) | undefined;
+	let writePort: RatePort | undefined;
 
 	function read({ audio, matches }: RateTarget): number | null {
 		try {
@@ -24,7 +24,6 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 		const previousPort = writePort;
 		let observed: number | null | undefined;
 		writePort = {
-			passive: request === undefined,
 			get playbackRate() {
 				observed = read(current);
 				return observed ?? NaN;
@@ -52,21 +51,8 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 
 	return {
 		state: { subscribe: state.subscribe },
-		restore(storage: PlaybackSpeedDeps['storage'] | null): void {
-			let saved: string | null | undefined;
-			preference = createPlaybackSpeed({
-				audio: () => writePort,
-				storage: {
-					getItem: (key) => (saved = storage?.getItem(key) ?? null),
-					setItem(key, rate) {
-						// Passive restores must not overwrite a value saved by another tab.
-						if (!storage || (writePort?.passive && storage.getItem(key) !== saved)) return;
-						storage.setItem(key, rate);
-						saved = rate;
-					},
-					removeItem() {}
-				}
-			});
+		restore(storage: PlaybackSpeedDeps['storage']): void {
+			preference = createPlaybackSpeed({ audio: () => writePort, storage });
 			write();
 		},
 		attach(inherit?: () => number | null): void {
