@@ -43,10 +43,9 @@
 	<div class="nt-wrap">
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
+			retryCurrent={media.retryCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
 	</div>
-{/if}
-{#if streamUrl}
 	<section class="nt-wrap" aria-label="Sleep timer">
 		<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
 	</section>

@@ -295,3 +295,8 @@ sha256 = "a2a640bb557386b65f237083f9921503af999b987f34e0b488a13205cd5b9dff"
 file = "0058_playback_continuation_deadline.sql"
 target = "app"
 sha256 = "567a3838e2efdd1af0e45ffb17d52f41a47d03a0f7928f80d5c34db872d9d119"
+
+[[migration]]
+file = "0059_paid_invoice_covered_periods.sql"
+target = "app"
+sha256 = "cb8b5ff85c2d2ef3cf732f74e8a9baf3e9da143d76aa0c87045972695f8a1923"

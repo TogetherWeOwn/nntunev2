@@ -10,6 +10,8 @@ enum State {
     Repeat(i64),
     Verbatim,
     Warmup,
+    LpcSetup,
+    Coefficients { width: u8, shift: u8, next: usize },
     Predict,
     Rejected,
 }
@@ -27,7 +29,8 @@ pub(crate) struct SubframeSamples {
     emitted: u16,
     state: State,
     order: usize,
-    warmup: [i64; 4],
+    warmup: [i64; 32],
+    coefficients: [i16; 32],
     predictor: Option<Predictor>,
     residuals: ResidualReader,
 }
@@ -38,7 +41,9 @@ impl SubframeSamples {
             SubframeKind::Constant => (State::Constant, 0),
             SubframeKind::Verbatim => (State::Verbatim, 0),
             SubframeKind::Fixed(0) => (State::Predict, 0),
-            SubframeKind::Fixed(order @ 1..=4) => (State::Warmup, order),
+            SubframeKind::Fixed(order @ 1..=4) | SubframeKind::Lpc(order @ 1..=32) => {
+                (State::Warmup, order)
+            }
             _ => return Err(()),
         };
         if u16::from(order) >= block_size {
@@ -56,7 +61,8 @@ impl SubframeSamples {
             emitted: 0,
             state,
             order: usize::from(order),
-            warmup: [0; 4],
+            warmup: [0; 32],
+            coefficients: [0; 32],
             predictor,
             residuals: ResidualReader::new(block_size, order),
         })
@@ -84,34 +90,78 @@ impl SubframeSamples {
                 }
             };
         }
-        let sample = match self.state {
-            State::Constant => {
-                let value = signed(field!(width), width);
-                self.state = State::Repeat(value);
-                value
-            }
-            State::Repeat(value) => value,
-            State::Verbatim => signed(field!(width), width),
-            State::Warmup => {
-                let value = signed(field!(width), width);
-                let index = usize::from(self.emitted);
-                self.warmup[index] = value;
-                if index + 1 == self.order {
-                    let SubframeKind::Fixed(order) = self.header.kind else {
-                        return Err(());
-                    };
-                    self.predictor =
-                        Some(Predictor::fixed(order, &self.warmup[..self.order], width)?);
-                    self.state = State::Predict;
+        let sample = loop {
+            match self.state {
+                State::Constant => {
+                    let value = signed(field!(width), width);
+                    self.state = State::Repeat(value);
+                    break value;
                 }
-                value
+                State::Repeat(value) => break value,
+                State::Verbatim => break signed(field!(width), width),
+                State::Warmup => {
+                    let value = signed(field!(width), width);
+                    let index = usize::from(self.emitted);
+                    self.warmup[index] = value;
+                    if index + 1 == self.order {
+                        self.state = match self.header.kind {
+                            SubframeKind::Fixed(order) => {
+                                self.predictor = Some(Predictor::fixed(
+                                    order,
+                                    &self.warmup[..self.order],
+                                    width,
+                                )?);
+                                State::Predict
+                            }
+                            _ => State::LpcSetup,
+                        };
+                    }
+                    break value;
+                }
+                State::LpcSetup => {
+                    let setup = field!(9) as u16;
+                    let precision = (setup >> 5) as u8 + 1;
+                    let shift = (setup & 31) as u8;
+                    if precision == 16 || shift >= 16 {
+                        return Err(());
+                    }
+                    self.state = State::Coefficients {
+                        width: precision,
+                        shift,
+                        next: 0,
+                    };
+                }
+                State::Coefficients {
+                    width: precision,
+                    shift,
+                    next,
+                } => {
+                    self.coefficients[next] = signed(field!(precision), precision) as i16;
+                    self.state = if next + 1 == self.order {
+                        self.predictor = Some(Predictor::lpc(
+                            &self.coefficients[..self.order],
+                            shift,
+                            &self.warmup[..self.order],
+                            width,
+                        )?);
+                        State::Predict
+                    } else {
+                        State::Coefficients {
+                            width: precision,
+                            shift,
+                            next: next + 1,
+                        }
+                    };
+                }
+                State::Predict => match self.residuals.read(bits, input)? {
+                    Residual::Sample(value) => {
+                        break self.predictor.as_mut().ok_or(())?.restore(value)?
+                    }
+                    Residual::NeedInput => return Ok(Samples::NeedInput),
+                    Residual::End => return Err(()),
+                },
+                State::Rejected => return Err(()),
             }
-            State::Predict => match self.residuals.read(bits, input)? {
-                Residual::Sample(value) => self.predictor.as_mut().ok_or(())?.restore(value)?,
-                Residual::NeedInput => return Ok(Samples::NeedInput),
-                Residual::End => return Err(()),
-            },
-            State::Rejected => return Err(()),
         };
         let sample = restore_wasted(sample, width, self.header.wasted)?;
         self.emitted += 1;
@@ -182,5 +232,43 @@ mod tests {
         assert_eq!(reader.read(&mut bits, &mut input), Ok(Samples::Sample(0)));
         assert_eq!(reader.read(&mut bits, &mut input), Err(()));
         assert_eq!(reader.read(&mut bits, &mut [].as_slice()), Err(()));
+    }
+
+    #[test]
+    fn lpc_samples_survive_every_slice_boundary() {
+        let bytes = [0x05, 0x01, 0x20, 0xbc, 0x07, 0x89, 0x3b, 0xff];
+        for split in 0..bytes.len() {
+            let mut reader = decoder(SubframeKind::Lpc(2), 8, 0, 5);
+            let mut bits = BitInput::default();
+            let (mut input, rest) = bytes.split_at(split);
+            let mut rest = Some(rest);
+            for expected in [5, 1, -3, -6, -7] {
+                let mut value = reader.read(&mut bits, &mut input);
+                if value == Ok(Samples::NeedInput) {
+                    assert!(input.is_empty());
+                    input = rest.take().unwrap();
+                    value = reader.read(&mut bits, &mut input);
+                }
+                assert_eq!(value, Ok(Samples::Sample(expected)));
+            }
+            assert_eq!(reader.read(&mut bits, &mut input), Ok(Samples::End));
+            assert_eq!(bits.read(&mut input, 4), Ok(Some(0xb)));
+            assert_eq!(rest.unwrap_or(input), [0xff]);
+        }
+    }
+
+    #[test]
+    fn malformed_lpc_setup_refuses_stickily() {
+        for setup in [[0xf0, 0], [0x08, 0]] {
+            // Reserved precision and negative shift.
+            let mut reader = decoder(SubframeKind::Lpc(1), 8, 0, 2);
+            let mut bits = BitInput::default();
+            assert_eq!(
+                reader.read(&mut bits, &mut [0].as_slice()),
+                Ok(Samples::Sample(0))
+            );
+            assert_eq!(reader.read(&mut bits, &mut setup.as_slice()), Err(()));
+            assert_eq!(reader.read(&mut bits, &mut [].as_slice()), Err(()));
+        }
     }
 }

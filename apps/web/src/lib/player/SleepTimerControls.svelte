@@ -1,6 +1,5 @@
 <script lang="ts">
 	import type { SleepTimerMode } from './sleepTimer.js';
-
 	let { armed, remaining, announcement, start, cancel }: {
 		armed: boolean;
 		remaining: string;
