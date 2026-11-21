@@ -17,6 +17,7 @@ for (const status of [404, 500, 200]) test(`does not expose data or controls aft
 	await page.goto(path);
 	await expect(page.getByRole('alert')).toContainText('Invite windows are unavailable');
 	await expect(schedule(page)).toHaveCount(0);
+	await expect(page.getByRole('link', { name: 'Invite policy' })).toHaveCount(0);
 	await expect(page.getByText(future.note)).toHaveCount(0);
 });
 

@@ -16,6 +16,7 @@ export function createQueueController(initial: QueueState) {
 	let snapshot = initial;
 	let librarySources: LibrarySources = new Map();
 	let operation = 0;
+	let selectionGeneration = 0;
 	let alive = true;
 	let purging = false;
 	const revision = createQueueRevision();
@@ -27,6 +28,7 @@ export function createQueueController(initial: QueueState) {
 
 	return {
 		get snapshot() { return snapshot; },
+		get selectionGeneration() { return selectionGeneration; },
 		get purging() { return purging; },
 		get revision() { return revision.revision; },
 		subscribe: store.subscribe,
@@ -76,6 +78,7 @@ export function createQueueController(initial: QueueState) {
 			// Evidence is visible with the new queue, including to reentrant subscribers.
 			if (sources) librarySources = sources;
 			if (snapshot === next) return;
+			if (currentTrack(snapshot)?.id !== currentTrack(next)?.id) selectionGeneration++;
 			snapshot = next;
 			store.set(next);
 		},
@@ -86,6 +89,7 @@ export function createQueueController(initial: QueueState) {
 			revision.revoke();
 			librarySources = new Map();
 			const previous = snapshot;
+			selectionGeneration++;
 			if (previous.tracks.length || previous.currentIndex !== -1) snapshot = createQueue([]);
 			// Native cleanup sees the empty snapshot; subscribers only see it after cleanup.
 			try {

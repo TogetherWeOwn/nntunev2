@@ -98,7 +98,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			player.browseCopy.invalidate = () => { onInvalidateBrowseCopy(); return invalidate(); };
 			const clear = player.media.clearShareSeek;
 			player.media.clearShareSeek = () => { onClear(); clear(); };
-			return player;
+			return Object.assign(player, { currentFavorite: { bind: () => () => {} } });
 		},
 		tick, window: { location }, element, track, capture
 	};

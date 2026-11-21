@@ -567,27 +567,16 @@
 		}
 	}
 
-	/**
-	 * Reconcile a native-control rate change to state, display and
-	 * best-effort persistence. Reads only: never writes back into the
-	 * element (no feedback loop) and never implies play or seek. Detached,
-	 * stale, throwing or non-finite readings are ignored so they cannot
-	 * poison the last verified preference.
-	 */
 	function handleNativeRateChange(event: Event): void {
 		const element = event.currentTarget as HTMLAudioElement | null;
-		if (!element || element !== audioEl || !element.isConnected) return;
-		if (!speed) return;
-		let nativeRate: number;
-		try {
-			nativeRate = element.playbackRate;
-		} catch {
-			return;
-		}
-		if (!Number.isFinite(nativeRate)) return;
-		const effective = speed.adoptNativeRate(nativeRate);
-		speedValue = String(effective);
-		if (speedFeedbackRate !== null && effective !== speedFeedbackRate) {
+		if (!element?.isConnected) return;
+		const rate = speed?.observeNativeRate(element);
+		if (rate !== undefined) showVerifiedSpeed(rate);
+	}
+
+	function showVerifiedSpeed(rate: number): void {
+		speedValue = String(rate);
+		if (speedFeedbackRate !== null && rate !== speedFeedbackRate) {
 			speedFeedback = '';
 			speedFeedbackRate = null;
 		}
@@ -1426,13 +1415,11 @@
 		};
 	}
 
-	// A swapped-in element starts at 1x: re-apply the persisted speed.
-	// `apply` verifies against the element, so reconcile the display to
-	// the actual rate it reports (a rejecting/clamping element must not
-	// leave a false selection on screen).
+	// A swapped-in decoder starts at 1x. Restore this tab's cached speed
+	// and show what the new decoder actually applied.
 	$effect(() => {
 		audioEl;
-		if (speed) speedValue = String(speed.apply());
+		if (speed) showVerifiedSpeed(speed.apply());
 	});
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
@@ -1471,7 +1458,7 @@
 			store = memoryStorage();
 		}
 		speed = createPlaybackSpeed({ storage: store, audio: () => audioEl });
-		speedValue = String(speed.apply());
+		showVerifiedSpeed(speed.apply());
 		resumeStore = createResumeStore({ storage: store });
 		try {
 			recentStore = createRecentlyPlayedStore({ storage: sessionStorage });
