@@ -6,6 +6,8 @@ const BASE = 'https://api.example.test';
 const LIKES = `${BASE}/v1/me/likes`;
 const MBID = 'fedcba98-7654-3210-fedc-ba9876543210';
 const JOB = MBID.toUpperCase();
+const binding = 'A'.repeat(43);
+const run = async <T>(work: () => T) => work();
 
 function mockClient(...responses: Response[]) {
 	const fetchFn = vi.fn<typeof fetch>();
@@ -14,7 +16,7 @@ function mockClient(...responses: Response[]) {
 }
 
 function currentScope() {
-	return { isCurrent: () => true, retireConfirmed: vi.fn() };
+	return { binding, run, isCurrent: () => true, retireConfirmed: vi.fn(async () => true) };
 }
 
 function importReceipt(added: number, already = 0) {
@@ -23,16 +25,16 @@ function importReceipt(added: number, already = 0) {
 
 describe('server likes', () => {
 	it('keeps server order and distinct kinds and preserves exact job IDs', async () => {
-		const { client, fetchFn } = mockClient(Response.json({ items: [
+		const { client, fetchFn } = mockClient(Response.json({ session_binding: binding, items: [
 			{ kind: 'track', target_id: JOB, created_at: 10 },
 			{ kind: 'track', target_id: MBID, created_at: 9 },
 			{ kind: 'release', target_id: MBID, created_at: 8 }
 		] }));
-		await expect(loadLikes(client)).resolves.toEqual([
+		await expect(loadLikes(client)).resolves.toEqual({ binding, items: [
 			{ kind: 'track', targetId: JOB, createdAt: 10 },
 			{ kind: 'track', targetId: MBID, createdAt: 9 },
 			{ kind: 'release', targetId: MBID, createdAt: 8 }
-		]);
+		] });
 		expect(fetchFn).toHaveBeenCalledWith(LIKES, expect.objectContaining({
 			method: 'GET', credentials: 'include', headers: { accept: 'application/json' }
 		}));
@@ -41,11 +43,21 @@ describe('server likes', () => {
 	it('rejects over-cap lists, duplicates, and malformed typed targets', async () => {
 		const like = { kind: 'track', target_id: 'Job_A', created_at: 9 };
 		const { client } = mockClient(
-			Response.json({ items: Array.from({ length: 501 }, (_, i) => ({ ...like, target_id: `Job_${i}` })) }),
-			Response.json({ items: [like, like] }),
-			Response.json({ items: [{ ...like, kind: 'release' }] })
+			Response.json({ session_binding: binding, items: Array.from({ length: 501 }, (_, i) => ({ ...like, target_id: `Job_${i}` })) }),
+			Response.json({ session_binding: binding, items: [like, like] }),
+			Response.json({ session_binding: binding, items: [{ ...like, kind: 'release' }] })
 		);
 		for (let i = 0; i < 3; i++) await expect(loadLikes(client)).rejects.toThrow('Invalid likes list');
+	});
+
+	it.each([
+		['missing', {}],
+		['noncanonical', { session_binding: `${binding.slice(1)}B` }]
+	])('rejects an otherwise valid list with a %s binding', async (_case, fields) => {
+		const { client } = mockClient(Response.json({
+			...fields, items: [{ kind: 'track', target_id: JOB, created_at: 10 }]
+		}));
+		await expect(loadLikes(client)).rejects.toThrow('Invalid likes list');
 	});
 
 	it('sends exact IDs on both methods and returns the acknowledged identity', async () => {
@@ -84,10 +96,11 @@ describe('legacy likes import', () => {
 			added: 2, already: 1, rejected: [{ target_id: prefix, reason: 'not_member' }]
 		}));
 		const scope = currentScope();
-		await importDeviceLikes(client, [JOB, '', JOB, MBID, `${prefix}accepted`, `${prefix}rejected`], scope);
+		await expect(importDeviceLikes(client, [JOB, '', JOB, MBID, `${prefix}accepted`, `${prefix}rejected`], scope)).resolves.toBe('partial');
 		expect(fetchFn).toHaveBeenCalledOnce();
 		expect(fetchFn).toHaveBeenCalledWith(`${LIKES}/import`, expect.objectContaining({ method: 'POST' }));
 		expect(JSON.parse(String(fetchFn.mock.calls[0][1]?.body))).toEqual({
+			session_binding: binding,
 			items: [JOB, MBID, `${prefix}accepted`, `${prefix}rejected`].map((target_id) => ({ kind: 'track', target_id }))
 		});
 		expect(scope.retireConfirmed).toHaveBeenCalledExactlyOnceWith([JOB, MBID]);
@@ -95,12 +108,45 @@ describe('legacy likes import', () => {
 
 	it('retires complete bounded batches but keeps unconfirmed data for retry', async () => {
 		const ids = Array.from({ length: 53 }, (_, i) => `Job_${i}`);
-		const { client } = mockClient(importReceipt(0, 50), Response.json({}, { status: 503 }), importReceipt(2, 1));
+		const { client, fetchFn } = mockClient(importReceipt(0, 50), Response.json({}, { status: 503 }), importReceipt(2, 1));
 		const scope = currentScope();
 		await expect(importDeviceLikes(client, ids, scope)).rejects.toMatchObject({ status: 503 });
 		expect(scope.retireConfirmed).toHaveBeenCalledExactlyOnceWith(ids.slice(0, 50));
-		await importDeviceLikes(client, ids.slice(50), scope);
+		await expect(importDeviceLikes(client, ids.slice(50), scope)).resolves.toBe('complete');
 		expect(scope.retireConfirmed).toHaveBeenLastCalledWith(ids.slice(50));
+		expect(fetchFn.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).session_binding)).toEqual([binding, binding, binding]);
+	});
+
+	it('does not send or retire a batch denied by the verified runner', async () => {
+		const ids = Array.from({ length: 51 }, (_, i) => `Job_${i}`);
+		const { client, fetchFn } = mockClient(importReceipt(50), importReceipt(1));
+		const scope = currentScope();
+		let admissions = 0;
+		const admit = async <T>(work: () => T) => ++admissions === 1 ? work() : undefined;
+
+		await expect(importDeviceLikes(client, ids, { ...scope, run: admit })).resolves.toBeNull();
+		expect(admissions).toBe(2);
+		expect(fetchFn).toHaveBeenCalledOnce();
+		expect(scope.retireConfirmed).toHaveBeenCalledExactlyOnceWith(ids.slice(0, 50));
+	});
+
+	it('waits for cleanup and stops importing if device storage refuses retirement', async () => {
+		const ids = Array.from({ length: 51 }, (_, i) => `Job_${i}`);
+		const { client, fetchFn } = mockClient(importReceipt(50), importReceipt(1));
+		const started = Promise.withResolvers<void>();
+		const cleanup = Promise.withResolvers<boolean>();
+		const retireConfirmed = vi.fn((_ids: readonly string[]) => {
+			started.resolve();
+			return cleanup.promise;
+		});
+
+		const importing = importDeviceLikes(client, ids, { ...currentScope(), retireConfirmed });
+		await started.promise;
+		expect(fetchFn).toHaveBeenCalledOnce();
+		cleanup.resolve(false);
+		await expect(importing).resolves.toBe('cleanup-failed');
+		expect(fetchFn).toHaveBeenCalledOnce();
+		expect(retireConfirmed).toHaveBeenCalledExactlyOnceWith(ids.slice(0, 50));
 	});
 
 	it('does not trust incomplete counts or mismatched rejection identities', async () => {
@@ -119,13 +165,13 @@ describe('legacy likes import', () => {
 		let finish!: (response: Response) => void;
 		fetchFn.mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
 		let current = true;
-		const retireConfirmed = vi.fn();
+		const retireConfirmed = vi.fn(async () => true);
 		const ids = Array.from({ length: 51 }, (_, i) => `Job_${i}`);
-		const importing = importDeviceLikes(client, ids, { isCurrent: () => current, retireConfirmed });
+		const importing = importDeviceLikes(client, ids, { binding, run, isCurrent: () => current, retireConfirmed });
 		current = false;
 		finish(importReceipt(50));
 		await importing;
-		await importDeviceLikes(client, ids, { isCurrent: () => current, retireConfirmed });
+		await importDeviceLikes(client, ids, { binding, run, isCurrent: () => current, retireConfirmed });
 		expect(fetchFn).toHaveBeenCalledOnce();
 		expect(retireConfirmed).not.toHaveBeenCalled();
 	});

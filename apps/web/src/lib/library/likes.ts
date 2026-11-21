@@ -1,4 +1,5 @@
 import type { ApiClient } from '../api/client.js';
+import { validBinding } from './session-verification.js';
 
 type LikesClient = Pick<ApiClient, 'get' | 'put' | 'delete' | 'post'>;
 
@@ -29,11 +30,13 @@ function record(value: unknown): Record<string, unknown> {
 	return (value ?? {}) as Record<string, unknown>;
 }
 
-export async function loadLikes(client: Pick<LikesClient, 'get'>): Promise<LibraryLike[]> {
-	const { items } = record(await client.get<unknown>(LIKES_PATH));
-	if (!Array.isArray(items) || items.length > MAX_LIKES) throw new Error('Invalid likes list');
+export async function loadLikes(client: Pick<LikesClient, 'get'>) {
+	const { items, session_binding: binding } = record(await client.get<unknown>(LIKES_PATH));
+	if (!Array.isArray(items) || items.length > MAX_LIKES || !validBinding(binding)) {
+		throw new Error('Invalid likes list');
+	}
 	const seen = new Set<string>();
-	return items.map((item: unknown) => {
+	const likes = items.map((item: unknown): LibraryLike => {
 		const { kind, target_id, created_at } = record(item);
 		if ((kind !== 'track' && kind !== 'release') || !isTrackId(target_id) ||
 			(kind === 'release' && !RELEASE_ID.test(target_id)) || !isCount(created_at)) {
@@ -44,6 +47,7 @@ export async function loadLikes(client: Pick<LikesClient, 'get'>): Promise<Libra
 		seen.add(key);
 		return { kind, targetId: target_id, createdAt: created_at };
 	});
+	return { items: likes, binding };
 }
 
 /** Return the confirmed server identity, which can differ from the input MBID. */
@@ -101,19 +105,27 @@ export async function importDeviceLikes(
 	client: Pick<LikesClient, 'post'>,
 	ids: readonly string[],
 	scope: {
+		binding: string;
 		isCurrent: () => boolean;
-		retireConfirmed: (ids: readonly string[]) => void;
+		run: <T>(work: () => T) => Promise<T | undefined>;
+		retireConfirmed: (ids: readonly string[]) => Promise<boolean>;
 	}
-): Promise<void> {
+): Promise<'none-confirmed' | 'partial' | 'complete' | 'cleanup-failed' | null> {
 	const targets = [...new Set(ids.filter(isTrackId))];
+	let count = 0;
 	for (let start = 0; start < targets.length; start += IMPORT_BATCH_SIZE) {
-		if (!scope.isCurrent()) return;
+		if (!scope.isCurrent()) return null;
 		const batch = targets.slice(start, start + IMPORT_BATCH_SIZE);
-		const receipt = await client.post<unknown>(`${LIKES_PATH}/import`, {
+		const started = await scope.run(() => ({ receipt: client.post<unknown>(`${LIKES_PATH}/import`, {
+			session_binding: scope.binding,
 			items: batch.map((target_id) => ({ kind: 'track', target_id }))
-		});
-		if (!scope.isCurrent()) return;
+		}) }));
+		if (!started) return null;
+		const receipt = await started.receipt;
+		if (!scope.isCurrent()) return null;
 		const confirmed = confirmedIds(batch, receipt);
-		if (confirmed.length > 0) scope.retireConfirmed(confirmed);
+		count += confirmed.length;
+		if (confirmed.length && !(await scope.retireConfirmed(confirmed))) return 'cleanup-failed';
 	}
+	return count === 0 ? 'none-confirmed' : count < new Set(ids).size ? 'partial' : 'complete';
 }
