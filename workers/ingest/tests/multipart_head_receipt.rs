@@ -72,10 +72,10 @@ fn pins_only_the_exact_versioned_completion_response() {
     let pinned = check(&context, id(5), 200, &body, &[version]).unwrap();
     assert_eq!(pinned.metadata().locator().bucket(), BUCKET);
     assert_eq!(pinned.metadata().locator().key(), KEY);
-    assert_eq!(
+    assert!(matches!(
         pinned.metadata().locator().binding(),
-        &S3Binding::VersionId(version.into())
-    );
+        S3Binding::VersionId(actual) if actual == version
+    ));
     assert!(pinned.metadata().matches_context(&context));
     assert_eq!(
         pinned.metadata().ciphertext_len(),
