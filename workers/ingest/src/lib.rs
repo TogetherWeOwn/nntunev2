@@ -78,7 +78,8 @@ use api_error::ApiError;
 use caller_auth::Caller;
 use jobs::{validate_job_id, JobSource};
 use metering::{
-    emit_meter, MeterOutcome, MeterSink, MeterWriteError, METER_DATASET, METER_DATASET_BINDING,
+    emit_meter, MeterOutcome, MeterSink, MeterTransportReason, MeterWriteError, METER_DATASET,
+    METER_DATASET_BINDING,
 };
 use newznab::{MAX_CATEGORIES, MAX_LIMIT, MAX_PAGE};
 use nzb_intake::{estimate_nzb, IntakeRejection};
@@ -614,14 +615,18 @@ fn meter_entry_stage(source: JobSource) -> &'static str {
 ///
 /// A native binding success maps to 200; a binding call failure maps to
 /// `Err` (transport failure before any status existed). The event shape stays
-/// owned by `metering.rs`: the full [`meter_write_body`] JSON rides in blob1,
+/// owned by `metering.rs`: the full [`metering::meter_write_body`] JSON rides in blob1,
 /// with the stage as the single index and the attempt as double1 for queries.
 struct EdgeMeterSink<'a> {
     dataset: &'a worker::AnalyticsEngineDataset,
 }
 
 impl MeterSink for EdgeMeterSink<'_> {
-    fn send(&mut self, dataset: &str, body: serde_json::Value) -> Result<u16, String> {
+    fn send(
+        &mut self,
+        dataset: &str,
+        body: serde_json::Value,
+    ) -> Result<u16, MeterTransportReason> {
         debug_assert_eq!(dataset, METER_DATASET);
         let stage = body.get("stage").and_then(|v| v.as_str()).unwrap_or("");
         let attempt = body.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
@@ -634,65 +639,72 @@ impl MeterSink for EdgeMeterSink<'_> {
             .blobs([event_json.as_str(), job_id, user_id, outcome])
             .doubles([attempt])
             .build();
-        match self.dataset.write_data_point(&point) {
-            Ok(()) => Ok(200),
-            Err(_) => Err("meter_write_failed".to_string()),
-        }
+        MeterTransportReason::WriteFailed
+            .redact(self.dataset.write_data_point(&point))
+            .map(|()| 200)
     }
 }
 
+fn meter_failure_fields(err: &MeterWriteError, build_sha: String) -> serde_json::Value {
+    serde_json::json!({"build_sha": build_sha, "reason": err.reason_code()})
+}
+
 /// Write one stage-transition meter event through the `INGEST_METER` binding.
-///
-/// A missing binding or a failing write returns a retryable
-/// [`MeterWriteError`] (the route answers 503 + `Retry-After`, never
-/// 202-and-dropped). An unknown stage is returned before the binding is
-/// touched. The unused `_body_hint` keeps the shape-ownership link explicit:
-/// the wire body is always [`meter_write_body`], via [`emit_meter`].
+/// Binding and write failures are retryable; an unknown stage never writes.
 pub(crate) fn try_meter(
     env: &Env,
     msg: &QueueMsg,
     stage: &str,
     outcome: MeterOutcome,
 ) -> Result<(), MeterWriteError> {
-    let dataset = match env.analytics_engine(METER_DATASET_BINDING) {
+    let dataset = match MeterTransportReason::BindingMissing
+        .redact(env.analytics_engine(METER_DATASET_BINDING))
+    {
         Ok(dataset) => dataset,
-        Err(_) => {
+        Err(reason) => {
+            let err = MeterWriteError::Transport(reason);
             emit(
                 Level::Error,
                 &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
                 "ingest.meter.binding_missing",
-                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+                meter_failure_fields(&err, build_sha_from_env(env)),
             );
-            return Err(MeterWriteError::Transport(
-                "meter_binding_missing".to_string(),
-            ));
+            return Err(err);
         }
     };
     let mut sink = EdgeMeterSink { dataset: &dataset };
     match emit_meter(&mut sink, msg, stage, outcome) {
         Ok(()) => Ok(()),
-        Err(e) => {
+        Err(err) => {
             emit(
                 Level::Error,
                 &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
                 "ingest.meter.write_failed",
-                serde_json::json!({"build_sha": build_sha_from_env(env)}),
+                meter_failure_fields(&err, build_sha_from_env(env)),
             );
-            Err(e)
+            Err(err)
         }
     }
 }
 
-/// Answer a meter-write failure. The status is derived from
-/// [`MeterWriteError::http_status`] — the single source of truth — so the
-/// route mapping can never drift from the tested error mapping: retryable
-/// failures (missing/failing binding or ledger) surface 503 + `Retry-After`,
-/// never 202-and-dropped; an unknown stage is a caller bug and surfaces 400.
-fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
+/// Keep the public error generic while the log retains the fixed reason code.
+fn meter_failure_projection(err: &MeterWriteError) -> (ApiError, Option<&'static str>) {
     match err.http_status() {
-        503 => service_unavailable("meter unavailable; nothing was accepted, retry shortly"),
-        _ => json_error(ApiError::invalid_request("unknown meter stage")),
+        503 => (
+            ApiError::service_unavailable("service unavailable"),
+            Some("5"),
+        ),
+        _ => (ApiError::invalid_request("unknown meter stage"), None),
     }
+}
+
+fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
+    let (api_error, retry_after) = meter_failure_projection(err);
+    let mut response = json_error(api_error)?;
+    if let Some(seconds) = retry_after {
+        response.headers_mut().append("retry-after", seconds)?;
+    }
+    Ok(response)
 }
 
 /// Durable metered admission: the (`job_id`, `stage`) ledger owns the
@@ -944,7 +956,7 @@ impl PgAdmissionLedger {
     async fn client(&self) -> Result<tokio_postgres::Client, MeterWriteError> {
         library_db_client(&self.env, &self.trace_id)
             .await
-            .map_err(|()| MeterWriteError::Transport("admission ledger unavailable".to_string()))
+            .map_err(|()| MeterWriteError::AdmissionLedgerUnavailable)
     }
 }
 
@@ -954,7 +966,7 @@ impl AdmissionLedger for PgAdmissionLedger {
         job_id: &str,
         stage: &str,
     ) -> Result<AdmissionMark, MeterWriteError> {
-        let unavailable = || MeterWriteError::Transport("admission ledger unavailable".to_string());
+        let unavailable = || MeterWriteError::AdmissionLedgerUnavailable;
         // One short-lived connection for the whole claim sequence; it is
         // dropped before the queue/meter awaits, so no session state ever
         // crosses them. Atomicity comes from the single UPDATE claim below,
@@ -999,24 +1011,22 @@ impl AdmissionLedger for PgAdmissionLedger {
             worker::Delay::from(std::time::Duration::from_millis(
                 crate::library::LIBRARY_DB_DEADLINE_MS,
             )),
-            || MeterWriteError::Transport("admission ledger unavailable".to_string()),
+            || MeterWriteError::AdmissionLedgerUnavailable,
         )
         .await
     }
 
     async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError> {
-        let claim_epoch = self.claim_epoch.ok_or_else(|| {
-            MeterWriteError::Transport("admission ledger unavailable".to_string())
-        })?;
+        let claim_epoch = self
+            .claim_epoch
+            .ok_or(MeterWriteError::AdmissionLedgerUnavailable)?;
         // One deadline spans the connect plus the commit: a stalled
         // commit expires to the same detail-free transport error a
         // refused commit returns, with the SQLSTATE handling kept
         // inside the raced operation.
         crate::library::with_db_deadline(
             async {
-                let client = self.client().await.map_err(|_| {
-                    MeterWriteError::Transport("admission ledger unavailable".to_string())
-                })?;
+                let client = self.client().await?;
                 let updated = client
                     .execute(
                         admission_mark_queued_sql(),
@@ -1033,15 +1043,13 @@ impl AdmissionLedger for PgAdmissionLedger {
                                 "sqlstate": admission_commit_sqlstate(&e),
                             }),
                         );
-                        MeterWriteError::Transport("admission ledger unavailable".to_string())
+                        MeterWriteError::AdmissionLedgerUnavailable
                     })?;
                 if updated != 1 {
                     // Lost the claim (lease expired and someone else reclaimed) or
                     // already committed: fail closed so the retry converges instead
                     // of answering 202-and-unmarked.
-                    Err(MeterWriteError::Transport(
-                        "admission ledger unavailable".to_string(),
-                    ))
+                    Err(MeterWriteError::AdmissionLedgerUnavailable)
                 } else {
                     Ok(())
                 }
@@ -1049,7 +1057,7 @@ impl AdmissionLedger for PgAdmissionLedger {
             worker::Delay::from(std::time::Duration::from_millis(
                 crate::library::LIBRARY_DB_DEADLINE_MS,
             )),
-            || MeterWriteError::Transport("admission ledger unavailable".to_string()),
+            || MeterWriteError::AdmissionLedgerUnavailable,
         )
         .await
     }
@@ -1119,9 +1127,7 @@ where
     // Caller bug first, before the ledger is touched (mirrors
     // `emit_meter`: an unknown stage never causes a write).
     if !crate::queue::WORKFLOW_STEPS.contains(&stage) {
-        return AdmissionDecision::MeterUnavailable(MeterWriteError::UnknownStage(
-            "stage must be a pipeline workflow step",
-        ));
+        return AdmissionDecision::MeterUnavailable(MeterWriteError::UnknownStage);
     }
     let mark = match ledger.record_stage_once(&msg.job_id, stage).await {
         Ok(mark) => mark,
@@ -2318,9 +2324,7 @@ mod tests {
         ) -> Result<AdmissionMark, MeterWriteError> {
             self.record_calls += 1;
             if self.fail_record {
-                return Err(MeterWriteError::Transport(
-                    "injected commit_failure".to_string(),
-                ));
+                return Err(MeterWriteError::AdmissionLedgerUnavailable);
             }
             let key = (job_id.to_string(), stage.to_string());
             if self.marks.get(&key) == Some(&AdmissionMark::Queued) {
@@ -2336,15 +2340,11 @@ mod tests {
 
         async fn mark_queued(&mut self, job_id: &str, stage: &str) -> Result<(), MeterWriteError> {
             if self.fail_commit {
-                return Err(MeterWriteError::Transport(
-                    "injected commit_failure".to_string(),
-                ));
+                return Err(MeterWriteError::AdmissionLedgerUnavailable);
             }
             let key = (job_id.to_string(), stage.to_string());
             if !self.claimed.remove(&key) {
-                return Err(MeterWriteError::Transport(
-                    "ledger commit without a claim".to_string(),
-                ));
+                return Err(MeterWriteError::AdmissionLedgerUnavailable);
             }
             self.marks.insert(key, AdmissionMark::Queued);
             Ok(())
@@ -2440,9 +2440,7 @@ mod tests {
                     self.store(&rows);
                     Ok(())
                 }
-                None => Err(MeterWriteError::Transport(
-                    "ledger commit without a recorded intent".to_string(),
-                )),
+                None => Err(MeterWriteError::AdmissionLedgerUnavailable),
             }
         }
 
@@ -2509,18 +2507,86 @@ mod tests {
     }
 
     #[test]
-    fn meter_failure_status_mapping_is_single_sourced() {
-        // `meter_failure_response` derives from `http_status` (pinned by
-        // the admission acceptance contract); the mapping itself:
-        assert_eq!(
-            MeterWriteError::Transport("down".to_string()).http_status(),
-            503
+    fn meter_failures_project_fixed_codes_without_upstream_details() {
+        const CANARY: &str = "§~opaque-meter-canary~!";
+
+        struct Sink(Option<Result<u16, MeterTransportReason>>);
+        impl MeterSink for Sink {
+            fn send(
+                &mut self,
+                _: &str,
+                body: serde_json::Value,
+            ) -> Result<u16, MeterTransportReason> {
+                assert!(!body.to_string().contains(CANARY));
+                self.0.take().expect("meter must call the sink only once")
+            }
+        }
+
+        let msg = serde_json::from_value(serde_json::json!({
+            "job_id": "", "user_id": "", "idempotency_key": "", "source": "nzb_upload",
+            "state": "queued", "attempt": 1, "query": CANARY,
+        }))
+        .expect("synthetic queue message");
+        let binding = MeterTransportReason::BindingMissing
+            .redact(Err::<(), _>(CANARY))
+            .map_err(MeterWriteError::Transport)
+            .unwrap_err();
+        let run = |status, stage| {
+            let mut sink = Sink(Some(status));
+            let err = emit_meter(&mut sink, &msg, stage, MeterOutcome::Retry).unwrap_err();
+            assert_eq!(sink.0.is_some(), stage == CANARY);
+            err
+        };
+        let write = run(
+            MeterTransportReason::WriteFailed.redact(Err(CANARY)),
+            "probe",
         );
-        assert_eq!(MeterWriteError::Rejected { status: 500 }.http_status(), 503);
-        assert_eq!(MeterWriteError::UnknownStage("s").http_status(), 400);
-        assert!(MeterWriteError::Transport("down".to_string()).is_retryable());
-        assert!(MeterWriteError::Rejected { status: 500 }.is_retryable());
-        assert!(!MeterWriteError::UnknownStage("s").is_retryable());
+        for (err, reason, status, retry_after) in [
+            (binding, "meter_binding_missing", 503, Some("5")),
+            (write, "meter_write_failed", 503, Some("5")),
+            (
+                run(Ok(502), "probe"),
+                "meter_write_rejected",
+                503,
+                Some("5"),
+            ),
+            (run(Ok(200), CANARY), "meter_unknown_stage", 400, None),
+        ] {
+            assert_eq!(err.to_string(), reason);
+            assert!(!format!("{err:?}").contains(CANARY));
+            let fields = meter_failure_fields(&err, "unknown".to_string());
+            let line = LogRecord::new(
+                LogWorker::Ingest,
+                Level::Error,
+                &nntune_logging::resolve_trace_id(None),
+                "ingest.meter.write_failed",
+                nntune_logging::fields_from_json(fields).unwrap(),
+                0,
+            )
+            .expect("meter diagnostic must survive log field validation")
+            .to_json_line();
+            assert!(!line.contains(CANARY));
+            let log: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                log["fields"],
+                serde_json::json!({"reason": reason, "build_sha": "unknown"})
+            );
+
+            let (api_error, header) = meter_failure_projection(&err);
+            assert_eq!(api_error.status, status);
+            assert_eq!(header, retry_after);
+            let body = api_error.body_json();
+            assert!(!body.contains(CANARY));
+            let expected = if status == 503 {
+                serde_json::json!({"code": "service_unavailable", "message": "service unavailable", "retryable": true})
+            } else {
+                serde_json::json!({"code": "invalid_request", "message": "unknown meter stage", "retryable": false})
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2765,7 +2831,7 @@ mod tests {
             &mut meter_calls,
         );
         match &decision {
-            AdmissionDecision::MeterUnavailable(MeterWriteError::UnknownStage(_)) => {}
+            AdmissionDecision::MeterUnavailable(MeterWriteError::UnknownStage) => {}
             other => panic!("unknown stage is a caller bug, got {other:?}"),
         }
         assert_eq!(ledger.record_calls, 0);
@@ -2885,9 +2951,7 @@ mod tests {
             if self.own_epoch != Some(self.claim_epoch.load(Ordering::SeqCst))
                 || !self.claimed.swap(false, Ordering::SeqCst)
             {
-                return Err(MeterWriteError::Transport(
-                    "ledger commit without the current claim".to_string(),
-                ));
+                return Err(MeterWriteError::AdmissionLedgerUnavailable);
             }
             self.mark.store(1, Ordering::SeqCst);
             Ok(())

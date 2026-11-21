@@ -9,8 +9,8 @@
 //!
 //! Retain existing SQLSTATE handling and error shapes INSIDE that async block.
 //! For release_claim, discard the wrapper's Result (`let _ = ... .await;`).
-//! Expiry closures: `|| ()` for connect/release; `|| MeterWriteError::Transport(
-//! "admission ledger unavailable".to_string())` for admission; and
+//! Expiry closures: `|| ()` for connect/release;
+//! `|| MeterWriteError::AdmissionLedgerUnavailable` for admission; and
 //! `|| JobError::transient(ERR_WRITE_FAILED, "library database unavailable")`
 //! for upsert. Import the error types as the existing edge code does.
 //!
@@ -210,9 +210,7 @@ fn record_stage_once_bounds_ensure_claim_and_read_together() {
             "admission_read_mark_sql()",
         ],
     ));
-    assert!(
-        tail.contains("||MeterWriteError::Transport(\"admissionledgerunavailable\".to_string())")
-    );
+    assert!(tail.contains("||MeterWriteError::AdmissionLedgerUnavailable"));
 }
 
 #[test]
@@ -222,9 +220,7 @@ fn mark_queued_commit_is_deadline_bounded() {
         admission("mark_queued"),
         &[".client()", ".execute(", "admission_mark_queued_sql()"],
     ));
-    assert!(
-        tail.contains("||MeterWriteError::Transport(\"admissionledgerunavailable\".to_string())")
-    );
+    assert!(tail.contains("||MeterWriteError::AdmissionLedgerUnavailable"));
 }
 
 #[test]
