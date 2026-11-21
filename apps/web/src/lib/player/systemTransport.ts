@@ -35,7 +35,7 @@ export function bindSystemTransport(
 		return readTrack() === track && !signal.aborted ? state : undefined;
 	}
 	function observePosition(event: Event): void {
-		if (signal.aborted || event.currentTarget !== audio) return;
+		if (signal.aborted || event.target !== audio) return;
 		const track = readTrack();
 		if (!track || track !== published) return;
 		const state = readPosition(track);

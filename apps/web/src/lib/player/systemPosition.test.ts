@@ -23,6 +23,8 @@ class Decoder extends EventTarget {
 	set playbackRate(rate: number) { this.rate = rate; }
 	get currentTime() { return this.position; }
 	getAttribute() { return this.source; }
+	play = vi.fn(async () => { this.paused = false; });
+	pause = vi.fn(() => { this.paused = true; });
 	emit(type: string) { this.dispatchEvent(new Event(type)); }
 	get element() { return this as unknown as HTMLAudioElement; }
 }
@@ -159,13 +161,24 @@ test('drops a decoder snapshot if the attachment changes while reading it', () =
 	media.destroy();
 });
 
-test.each(['missing', 'throws'] as const)('a %s position API does not break metadata or teardown', (support) => {
-	const { audio, session, media } = setup(support);
+test.each(['missing', 'throws'] as const)('a %s position API does not break metadata, transport or teardown', (support) => {
+	const { audio, session, setPositionState, media } = setup(support);
+	setPositionState.mockClear();
 	audio.position = 15;
 	audio.emit('timeupdate');
+	if (support === 'throws') {
+		expect(setPositionState).toHaveBeenCalledExactlyOnceWith({ duration: 120, position: 15, playbackRate: 1 });
+	} else {
+		expect(setPositionState).not.toHaveBeenCalled();
+	}
 	expect(session.metadata).toMatchObject({ title: first.title });
-	expect(session.setActionHandler).toHaveBeenCalledWith('play', expect.any(Function));
+	const handlers = new Map(vi.mocked(session.setActionHandler).mock.calls);
+	handlers.get('play')!();
+	expect(audio.play).toHaveBeenCalledOnce();
+	handlers.get('pause')!();
+	expect(audio.pause).toHaveBeenCalledOnce();
 	media.destroy();
 	expect(session.metadata).toBeNull();
 	expect(session.setActionHandler).toHaveBeenCalledWith('play', null);
+	expect(session.setActionHandler).toHaveBeenCalledWith('pause', null);
 });
