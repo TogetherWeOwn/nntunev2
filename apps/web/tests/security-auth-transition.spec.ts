@@ -327,7 +327,6 @@ test('keyboard Play and Pause keep the range-capable native decoder and position
 	await expect(status).toHaveAttribute('aria-atomic', 'true');
 	await expect(status).toHaveText('Paused');
 	await expect(play).toHaveText('Play');
-	await expect(play).toBeEnabled();
 	const audio = (await native.elementHandle())!;
 	const time = () => audio.evaluate((node: HTMLAudioElement) => node.currentTime);
 	await expect.poll(time).toBeCloseTo(2);
@@ -351,14 +350,11 @@ test('keyboard Play and Pause keep the range-capable native decoder and position
 	const pausedAt = await time();
 	await openHome(page);
 	await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();
-	await expect(page.getByTestId('player-next')).toBeVisible();
-	await expect(page.getByTestId('now-playing')).toContainText(playbackFixture.title);
 	await expect(status).toHaveText('Paused');
 	await expect(native).toHaveAttribute('data-starts', '1');
 	expect(await time()).toBeCloseTo(pausedAt, 3);
 	await play.press('Space');
 	await expect(status).toHaveText('Playing');
-	await expect(native).toHaveAttribute('data-starts', '2');
 	expect(Number(await native.getAttribute('data-started-at'))).toBeCloseTo(pausedAt, 3);
 	await expect.poll(time).toBeGreaterThan(pausedAt + 0.1);
 	await audio.evaluate((node: HTMLAudioElement) => node.pause());

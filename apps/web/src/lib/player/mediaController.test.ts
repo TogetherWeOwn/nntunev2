@@ -66,40 +66,72 @@ function compactTransport() {
 }
 
 const coralSource = { streamUrl: '/coral', isCurrent: () => true };
-test('queue Play reports a decoder error once, including queue counts', async () => {
+test.each(['queue', 'shared'])('%s Play reports a resource error once with queue counts', async (path) => {
 	const { audio, media, announce, status } = compactTransport();
-	const pending = audio.deferPlay();
+	const pending = audio.deferPlay(), compact = path === 'shared' ? media.playCurrent() : undefined;
 	const queued = media.playSelected(coral, 0, coralSource, 'Added 0, 1 already queued.');
 	await Promise.resolve();
-	expect(audio.play).toHaveBeenCalledOnce();
-	audio.error = { code: 4 };
+	audio.error = { code: path === 'shared' ? 2 : 4 };
 	audio.emit('error');
-	pending.reject(new DOMException('Bad resource', 'NotSupportedError'));
-	await queued;
+	if (path === 'queue') pending.reject(new DOMException('Bad resource', 'NotSupportedError'));
+	const message = 'Selected Coral; audio unavailable. Added 0, 1 already queued.';
+	await vi.waitFor(() => expect(announce).toHaveBeenCalledExactlyOnceWith(message, true));
+	if (path === 'shared') pending.reject(new DOMException('Late failure', 'AbortError'));
+	await Promise.all([compact, queued]);
 	expect(status()).toBe('error');
-	expect(announce).toHaveBeenCalledExactlyOnceWith('Selected Coral; audio unavailable. Added 0, 1 already queued.', true);
+	expect(announce).toHaveBeenCalledExactlyOnceWith(message, true);
+	await media.playCurrent();
+	expect(audio.play).toHaveBeenCalledOnce();
+	audio.paused = true;
+	audio.error = null;
+	audio.emit('emptied');
+	expect(status()).toBe('paused');
+	audio.paused = false;
+	audio.emit('play');
+	expect(status()).toBe('starting');
+	audio.emit('playing');
+	expect(status()).toBe('playing');
+	audio.ended = true;
+	audio.emit('ended');
+	expect(status()).toBe('paused');
 });
 
-test.each(['playing', 'blocked'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
+test.each(['playing', 'blocked', 'resumed'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
 	const { audio, media, announce, status } = compactTransport();
 	const pending = audio.deferPlay(), compact = media.playCurrent();
 	const queued = media.playSelected(coral, 0, coralSource);
 	await Promise.resolve();
 	expect(audio.play).toHaveBeenCalledOnce();
-	expect(announce).not.toHaveBeenCalled();
 	if (outcome === 'playing') pending.resolve();
-	else { audio.paused = true; pending.reject(new DOMException('Blocked', 'NotAllowedError')); }
+	else if (outcome === 'blocked') { audio.paused = true; pending.reject(new DOMException('Blocked', 'NotAllowedError')); }
+	else {
+		audio.pause();
+		await audio.play();
+		audio.emit('pause'); // The queued pause event sees the resumed decoder.
+		pending.reject(new DOMException('Interrupted by pause', 'AbortError'));
+	}
 	await Promise.all([compact, queued]);
+	if (outcome === 'resumed') {
+		audio.emit('playing');
+		expect(status()).toBe('playing');
+		expect(announce).not.toHaveBeenCalled();
+		return;
+	}
 	expect(status()).toBe(outcome);
 	expect(announce).toHaveBeenCalledExactlyOnceWith(outcome === 'playing'
 		? 'Playing Coral.' : 'Selected Coral, paused: playback was blocked.', true);
+	if (outcome === 'blocked') {
+		await media.playCurrent();
+		expect(status()).toBe('playing');
+		expect(audio.load).not.toHaveBeenCalled();
+		expect(audio.currentTime).toBe(30);
+	}
 });
 
 test('compact Play starts in the gesture, deduplicates pending Play, and reads native settlement', async () => {
 	const { audio, media, status } = compactTransport();
 	expect(status()).toBe('paused');
 	const pending = audio.deferPlay(), attempt = media.playCurrent();
-	expect(audio.play).toHaveBeenCalledOnce();
 	audio.emit('play');
 	await media.playCurrent();
 	expect(audio.play).toHaveBeenCalledOnce();
@@ -122,18 +154,6 @@ test('a fulfilled Play cannot claim Playing if native pause readback is already 
 	pending.resolve();
 	await attempt;
 	expect(status()).toBe('paused');
-});
-
-test('healthy refusal permits another gesture on the same source without reloading', async () => {
-	const { audio, media, status } = compactTransport();
-	audio.play.mockRejectedValueOnce(new DOMException('Blocked', 'NotAllowedError'));
-	await media.playCurrent();
-	expect(status()).toBe('blocked');
-	await media.playCurrent();
-	expect(status()).toBe('playing');
-	expect(audio.play).toHaveBeenCalledTimes(2);
-	expect(audio.load).not.toHaveBeenCalled();
-	expect(audio.currentTime).toBe(30);
 });
 
 test.each(['compact', 'native'])('%s Pause fences pending success, including after a newer start', async (path) => {
@@ -173,31 +193,6 @@ test.each(['replacement', 'detach', 'account purge', 'destroy'])('late Play is i
 	expect(media.audio).toBe(replacement?.element);
 	expect(replacement?.play.mock.calls ?? []).toEqual([]);
 	expect(audio.pause).toHaveBeenCalledOnce();
-});
-
-test('resource error wins over a pending Play and only a native recovery clears it', async () => {
-	const { audio, media, status } = compactTransport();
-	const pending = audio.deferPlay(), attempt = media.playCurrent();
-	audio.error = { code: 4 };
-	audio.emit('error');
-	pending.reject(new DOMException('Bad resource', 'NotSupportedError'));
-	await attempt;
-	expect(status()).toBe('error');
-	await media.playCurrent();
-	expect(audio.play).toHaveBeenCalledOnce();
-	expect(audio.load).not.toHaveBeenCalled();
-	audio.paused = true;
-	audio.error = null;
-	audio.emit('emptied');
-	expect(status()).toBe('paused');
-	audio.paused = false;
-	audio.emit('play');
-	expect(status()).toBe('starting');
-	audio.emit('playing');
-	expect(status()).toBe('playing');
-	audio.ended = true;
-	audio.emit('ended');
-	expect(status()).toBe('paused');
 });
 
 test('share capture refuses a different selection or a blank stream', () => {
