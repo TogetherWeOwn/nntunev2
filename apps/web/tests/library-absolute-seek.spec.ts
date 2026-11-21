@@ -18,7 +18,6 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	await expect(audio).toHaveCount(1);
 	await expect(audio).toHaveJSProperty('controls', true);
 	const firstAudio = await audio.elementHandle();
-	if (!firstAudio) throw new Error('The sole native decoder did not mount.');
 	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => !el.seeking && el.paused &&
 		Math.abs(el.currentTime - 2) < 0.05)).toBe(true);
 	await audio.evaluate((el: HTMLAudioElement) => {
@@ -42,12 +41,11 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	await expect(slider).toHaveAttribute('aria-valuetext', `0:${String(Math.floor(sought.currentTime)).padStart(2, '0')} of 0:16`);
 
 	await slider.focus();
-	await page.keyboard.press('Home');
-	await expect.poll(async () => (await read()).currentTime).toBe(0);
-	await expect(slider).toHaveAttribute('aria-valuetext', '0:00 of 0:16');
-	await page.keyboard.press('ArrowRight');
-	await expect.poll(async () => (await read()).currentTime).toBe(1);
-	await expect(slider).toHaveAttribute('aria-valuetext', '0:01 of 0:16');
+	for (const [key, seconds] of [['Home', 0], ['ArrowRight', 1]] as const) {
+		await page.keyboard.press(key);
+		await expect.poll(async () => (await read()).currentTime).toBe(seconds);
+		await expect(slider).toHaveAttribute('aria-valuetext', `0:0${seconds} of 0:16`);
+	}
 	const expectTime = (seconds: number) => expect.poll(async () => {
 		const state = await read();
 		const value = Number(await slider.inputValue());
@@ -60,26 +58,26 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	for (let i = 0; i < 3; i++) await page.keyboard.press('ArrowRight');
 	await expectTime(4);
 	await expect(slider).toBeFocused();
-
 	await audio.evaluate((el: HTMLAudioElement) => {
 		Object.defineProperty(el, 'seekable', { configurable: true, get: () => ({ length: 1, start: () => 0, end: () => 5 }) });
 	});
 	const refusal = region.locator('p[aria-live="polite"][aria-atomic="true"] span:not([aria-hidden])');
-	await page.keyboard.press('End');
-	await expect(refusal).toHaveText('That position is not seekable yet.');
-	const firstRefusal = await refusal.elementHandle();
-	if (!firstRefusal) throw new Error('Seek feedback did not mount.');
-	await expectTime(4);
-	await page.keyboard.press('End');
-	await expect.poll(() => firstRefusal.evaluate((el) => el.isConnected)).toBe(false);
-	await expect(refusal).toHaveText('That position is not seekable yet.');
-	await expectTime(4);
+	for (const attempt of ['pointer', 'key', 'key', 'input', 'input']) {
+		const previous = attempt === 'pointer' ? null : await refusal.elementHandle();
+		if (attempt === 'pointer') expect((await seekViaPlayerUi(page, audio, 0.75)).surface).toBe('custom');
+		else if (attempt === 'key') await page.keyboard.press('End');
+		else await slider.evaluate((el: HTMLInputElement) => {
+			el.value = el.max;
+			el.dispatchEvent(new Event('input', { bubbles: true }));
+		});
+		if (previous) await expect.poll(() => previous.evaluate((el) => el.isConnected)).toBe(false);
+		await expect(refusal).toHaveText('That position is not seekable yet.');
+		await expectTime(4);
+		await expect(slider).toHaveAttribute('aria-valuetext', '0:04 of 0:16');
+	}
 	await audio.evaluate((el) => { Reflect.deleteProperty(el, 'seekable'); });
 	await page.keyboard.press('End');
-	await expect.poll(async () => {
-		const state = await read();
-		return !state.seeking && Math.abs(state.currentTime - state.duration) < 0.05;
-	}).toBe(true);
+	await expectTime(sought.duration);
 	await expect(audio).toHaveJSProperty('paused', true);
 	await expect(slider).toHaveAttribute('aria-valuetext', '0:16 of 0:16');
 	expect(nonMedia).toEqual([]);
