@@ -227,6 +227,26 @@ struct EnrolledEnvelope<'a> {
     retained_record: &'a [u8],
 }
 
+/// Complete version inventory from the trusted upload path, captured before
+/// readback. Page version at offset i belongs to canonical page i, not a
+/// provider listing position. The caller must establish custody independently;
+/// neither a GET response nor an inactive inventory row establishes it.
+#[derive(Clone, Copy)]
+struct CompletedInventory<'a> {
+    identities: [[u8; 16]; 5],
+    map_id: [u8; 16],
+    plaintext_len: u64,
+    media_version: &'a str,
+    page_versions: &'a [&'a str],
+}
+
+fn matches_version(pin: ReadbackPin<'_>, expected: &str) -> bool {
+    pin.version == Some(expected)
+        && expected != "null"
+        && (1..=1024).contains(&expected.len())
+        && expected.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum EnrolledReadbackError {
     Envelope,
@@ -245,8 +265,8 @@ fn compact_uuid(id: &[u8; 16]) -> String {
         .collect()
 }
 
-/// The inputs must come from one independently authorized custody and locator
-/// snapshot. Pins use logical keys relative to the trusted provider prefix.
+/// Bind the requested pins to the independently authorized, versioned
+/// completion inventory. Pins use logical keys relative to the trusted prefix.
 /// No caller-supplied file key or fallback is accepted on this path.
 /// Validates FLAC on the authenticated slices used for the plaintext digest,
 /// finalizing it only after body EOF and digest agreement. Success authorizes
@@ -255,6 +275,7 @@ fn compact_uuid(id: &[u8; 16]) -> String {
 async fn verify_enrolled_readback<'a, B: ReadbackBody>(
     manifest: &OriginManifest,
     envelope: EnrolledEnvelope<'_>,
+    completed: &CompletedInventory<'_>,
     media: ReadbackPin<'a>,
     pages: &[(u32, ReadbackPin<'a>)],
     open: impl AsyncFnMut(ReadbackPin<'a>) -> std::io::Result<ReadbackResponse<B>>,
@@ -274,11 +295,20 @@ async fn verify_enrolled_readback<'a, B: ReadbackBody>(
         "media-digests/{lifecycle}/{}",
         compact_uuid(manifest.map_id())
     );
-    if pages.len() != manifest.geometry().pages() as usize
+    if completed.identities != identities
+        || &completed.map_id != manifest.map_id()
+        || completed.plaintext_len != manifest.geometry().plaintext_len()
+        || pages.len() != manifest.geometry().pages() as usize
+        || pages.len() != completed.page_versions.len()
         || media.object_key != format!("media/{lifecycle}")
+        || !matches_version(media, completed.media_version)
         || !pages
             .iter()
-            .all(|(index, pin)| pin.object_key == format!("{map_prefix}/{index:08x}"))
+            .zip(completed.page_versions)
+            .all(|(&(index, pin), &version)| {
+                pin.object_key == format!("{map_prefix}/{index:08x}")
+                    && matches_version(pin, version)
+            })
     {
         return Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory));
     }
@@ -433,6 +463,26 @@ mod tests {
         "02020202020240028002020202020202/00000000",
     );
     const ROOT: [u8; 32] = [2; 32];
+    const MEDIA_VERSION: &str = "media-version";
+    const PAGE_VERSION: &str = "page-version";
+
+    fn completed_inventory(context: &EnvelopeContext) -> CompletedInventory<'static> {
+        let [_, identities @ ..] = context.identities;
+        CompletedInventory {
+            identities,
+            map_id: id(2),
+            plaintext_len: context.plaintext_len,
+            media_version: MEDIA_VERSION,
+            page_versions: &[PAGE_VERSION],
+        }
+    }
+
+    fn versioned_pin<'a>(object_key: &'a str, version: &'a str) -> ReadbackPin<'a> {
+        ReadbackPin {
+            version: Some(version),
+            ..pin(object_key)
+        }
+    }
 
     fn split_flac() -> Vec<u8> {
         // Mono, 8-bit, 19 constant samples at 44.1 kHz. Padding positions
@@ -449,11 +499,8 @@ mod tests {
         bytes
     }
 
-    fn enrolled_fixture(plaintext: &[u8]) -> (Fixture, Vec<u8>, EnvelopeContext, [u8; 230]) {
+    fn enrolled_origin(plaintext: &[u8]) -> (Fixture, EnvelopeContext, [u8; 230]) {
         let f = fixture_with_identities(plaintext, [id(6), id(7), id(0xab), id(0xcd), id(1)]);
-        assert_eq!(f.chunks.len(), 2);
-        let mut media = f.header.to_vec();
-        media.extend(f.chunks.iter().flatten().copied());
         let context = EnvelopeContext {
             identities: [id(9), id(6), id(7), id(0xab), id(0xcd), id(1)],
             plaintext_len: plaintext.len() as u64,
@@ -461,6 +508,14 @@ mod tests {
         };
         let record =
             crate::media_envelope::wrap_scheme2(&ROOT, &context, f.key.expose_secret()).unwrap();
+        (f, context, record)
+    }
+
+    fn enrolled_fixture(plaintext: &[u8]) -> (Fixture, Vec<u8>, EnvelopeContext, [u8; 230]) {
+        let (f, context, record) = enrolled_origin(plaintext);
+        assert_eq!(f.chunks.len(), 2);
+        let mut media = f.header.to_vec();
+        media.extend(f.chunks.iter().flatten().copied());
         (f, media, context, record)
     }
 
@@ -470,15 +525,15 @@ mod tests {
         page: &'a [u8],
         media_len: u64,
     ) -> ReadbackResponse<Body<'a>> {
-        let (bytes, length) = match request.object_key {
-            MEDIA => (media, media_len),
-            PAGE => (page, page.len() as u64),
+        let (bytes, length, version) = match request.object_key {
+            MEDIA => (media, media_len, MEDIA_VERSION),
+            PAGE => (page, page.len() as u64, PAGE_VERSION),
             _ => panic!("unexpected synthetic request"),
         };
         ReadbackResponse {
-            configuration: request.configuration,
+            configuration: id(1),
             object_key: request.object_key.into(),
-            version: Some("original".into()),
+            version: Some(version.into()),
             status: 200,
             content_length: Some(length),
             has_content_range: false,
@@ -545,8 +600,9 @@ mod tests {
                     trusted_record: trusted,
                     retained_record: retained,
                 },
-                pin(media),
-                &[(0, pin(page))],
+                &completed_inventory(&context),
+                versioned_pin(media, MEDIA_VERSION),
+                &[(0, versioned_pin(page, PAGE_VERSION))],
                 async |request: ReadbackPin<'_>| {
                     opens += 1;
                     Ok(enrolled_response(
@@ -560,6 +616,154 @@ mod tests {
             .await;
             assert_eq!(opens, if expected.is_ok() { 2 } else { 0 });
             assert_eq!(result, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolled_readback_refuses_pins_outside_completed_inventory_before_io() {
+        let (f, _, context, record) = enrolled_fixture(&split_flac());
+        let completed = completed_inventory(&context);
+        let media = versioned_pin(MEDIA, MEDIA_VERSION);
+        let page = versioned_pin(PAGE, PAGE_VERSION);
+        let wrong_identity = (0..completed.identities.len()).map(|field| {
+            let mut inventory = completed;
+            inventory.identities[field] = id(3);
+            inventory
+        });
+        let wrong_inventory = [
+            CompletedInventory {
+                map_id: id(3),
+                ..completed
+            },
+            CompletedInventory {
+                plaintext_len: completed.plaintext_len + 1,
+                ..completed
+            },
+            CompletedInventory {
+                page_versions: &[],
+                ..completed
+            },
+            CompletedInventory {
+                page_versions: &[PAGE_VERSION, "extra"],
+                ..completed
+            },
+        ];
+        let wrong_pins = [
+            (completed, versioned_pin(MEDIA, PAGE_VERSION), page),
+            (completed, media, versioned_pin(PAGE, MEDIA_VERSION)),
+            (
+                completed,
+                ReadbackPin {
+                    version: None,
+                    ..media
+                },
+                page,
+            ),
+            (
+                CompletedInventory {
+                    media_version: "null",
+                    ..completed
+                },
+                versioned_pin(MEDIA, "null"),
+                page,
+            ),
+        ];
+        let cases = wrong_identity
+            .chain(wrong_inventory)
+            .map(|inventory| (inventory, media, page))
+            .chain(wrong_pins);
+        for (inventory, media, page) in cases {
+            let result = verify_enrolled_readback::<Body<'_>>(
+                &f.manifest,
+                EnrolledEnvelope {
+                    authorized_root: &ROOT,
+                    context: &context,
+                    trusted_record: &record,
+                    retained_record: &record,
+                },
+                &inventory,
+                media,
+                &[(0, page)],
+                async |_| panic!("inventory mismatch opened an object"),
+            )
+            .await;
+            assert_eq!(
+                result,
+                Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolled_readback_refuses_matching_malformed_versions_before_io() {
+        let (f, context, record) = enrolled_origin(&split_flac());
+        let oversized = "v".repeat(1025);
+        for (case, version) in [("oversized", oversized.as_str()), ("non-graphic", "v 1")] {
+            let inventory = CompletedInventory {
+                media_version: version,
+                ..completed_inventory(&context)
+            };
+            let result = verify_enrolled_readback::<Body<'_>>(
+                &f.manifest,
+                EnrolledEnvelope {
+                    authorized_root: &ROOT,
+                    context: &context,
+                    trusted_record: &record,
+                    retained_record: &record,
+                },
+                &inventory,
+                versioned_pin(MEDIA, version),
+                &[(0, versioned_pin(PAGE, PAGE_VERSION))],
+                async |_| panic!("{case} version opened an object"),
+            )
+            .await;
+            assert_eq!(
+                result,
+                Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory)),
+                "{case} version"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolled_readback_refuses_swapped_page_versions_before_io() {
+        // One full digest page (256 chunks), then one byte on page 1.
+        let (f, context, record) = enrolled_origin(&vec![42; 256 * 65_536 + 1]);
+        assert_eq!(f.pages.len(), 2);
+        let second_page = PAGE.replacen("/00000000", "/00000001", 1);
+        let versions = [PAGE_VERSION, "second-page-version"];
+        let inventory = CompletedInventory {
+            page_versions: &versions,
+            ..completed_inventory(&context)
+        };
+        // The ordered control reaches the mock opener; no body is needed.
+        for (pin_versions, error, expected_opens) in [
+            (versions, BodyReadbackError::Transport, 1),
+            ([versions[1], versions[0]], BodyReadbackError::Inventory, 0),
+        ] {
+            let mut opens = 0;
+            let result = verify_enrolled_readback::<Body<'_>>(
+                &f.manifest,
+                EnrolledEnvelope {
+                    authorized_root: &ROOT,
+                    context: &context,
+                    trusted_record: &record,
+                    retained_record: &record,
+                },
+                &inventory,
+                versioned_pin(MEDIA, MEDIA_VERSION),
+                &[
+                    (0, versioned_pin(PAGE, pin_versions[0])),
+                    (1, versioned_pin(&second_page, pin_versions[1])),
+                ],
+                async |_| {
+                    opens += 1;
+                    Err(std::io::ErrorKind::UnexpectedEof.into())
+                },
+            )
+            .await;
+            assert_eq!(opens, expected_opens, "pin versions: {pin_versions:?}");
+            assert_eq!(result, Err(EnrolledReadbackError::Body(error)));
         }
     }
 
@@ -592,8 +796,9 @@ mod tests {
                     trusted_record: &record,
                     retained_record: &record,
                 },
-                pin(MEDIA),
-                &[(0, pin(PAGE))],
+                &completed_inventory(&context),
+                versioned_pin(MEDIA, MEDIA_VERSION),
+                &[(0, versioned_pin(PAGE, PAGE_VERSION))],
                 async |request| {
                     Ok(enrolled_response(
                         request,
