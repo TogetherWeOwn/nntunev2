@@ -16,6 +16,7 @@ import {
 
 export const LIBRARY_REQUEST_TIMEOUT_MS = 10_000;
 export const LIBRARY_ACCESS_REFUSED_EVENT = 'nntune:library-access-refused';
+const legacyFixture = () => import.meta.env.MODE === 'test' || import.meta.env.MODE === 'browser-fixtures';
 
 /** Largest library JSON body retained in memory (1 MiB, counted in UTF-8 bytes). */
 export const LIBRARY_BODY_MAX_BYTES = 1_048_576;
@@ -54,8 +55,6 @@ export interface LibraryRefresherDeps {
 	onStateChange?: (state: LibraryRefreshState, update: LibraryRefreshUpdate) => void;
 	timeoutMs?: number;
 }
-
-const legacyFixture = () => import.meta.env.MODE === 'test' || import.meta.env.MODE === 'browser-fixtures';
 
 export interface LibraryRefresher {
 	readonly state: LibraryRefreshState;

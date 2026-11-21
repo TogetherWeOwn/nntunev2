@@ -351,15 +351,15 @@
 			retainedQueueWithoutListing = !revoked && (state.loading || state.libraryUnavailable || !!state.loadError) &&
 				(retainedQueueWithoutListing || queueController.snapshot.tracks.length > 0);
 			requiresSignIn = state.requiresSignIn;
-			if (authBoundary) queueFilterQuery = '';
+			if (revoked) {
+				queueFilterQuery = '';
+				clearFavoritesExportFeedback();
+				releaseFavoritesDownload();
+				favoriteBaseline = favorites = [];
+				favoritesInitialized = false;
+				favoritesAnnouncement = '';
+			}
 			if (state.loadError && state.items.length === 0) {
-				if (revoked) {
-					clearFavoritesExportFeedback();
-					releaseFavoritesDownload();
-					favoriteBaseline = favorites = [];
-					favoritesInitialized = false;
-					favoritesAnnouncement = '';
-				}
 				findQuery = '';
 				findScope = 'both';
 				view = 'all';
