@@ -156,6 +156,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		}
 	}
 
+	function playCurrent(): Promise<void> {
+		return startCurrent(false);
+	}
+
 	function pauseCurrent(): void {
 		const target = transportTarget();
 		if (!target || !target.matches()) return;
@@ -504,7 +508,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		observeSound: sound.observe,
 		seekFeedback: { subscribe: seekFeedback.subscribe },
 		playbackStatus: { subscribe: playbackStatus.subscribe },
-		playCurrent: () => startCurrent(false), pauseCurrent, retryCurrent: () => startCurrent(true),
+		playCurrent, pauseCurrent, retryCurrent: () => startCurrent(true),
 		speed,
 		clearSeekFeedback,
 		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
@@ -611,7 +615,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				sound.connect(audio, target.matches, receipt.listeners.signal);
 				readPlayback(audio, target.matches, 'starting');
 				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
-					{ playCurrent: () => startCurrent(false), pauseCurrent }, receipt.listeners.signal);
+					{ playCurrent, pauseCurrent }, receipt.listeners.signal);
 			}
 			pause(previous?.audio);
 			return () => {
