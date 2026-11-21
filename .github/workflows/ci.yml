@@ -815,7 +815,8 @@ jobs:
           done
           inventory_billing="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres -- --list)"
           printf '%s\n' "$inventory_billing"
-          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 25
+          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 26
+          printf '%s\n' "$inventory_billing" | grep -Fx 'exact_paid_periods_preserve_gaps_and_only_hydrate_owned_history: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'parent_delete_waits_for_subscription_exclusion: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'coupled_fixture_waits_for_raw_insert_commit_or_rollback: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'coupled_sql_relation_is_transformed_only_for_the_trusted_schema: test'
