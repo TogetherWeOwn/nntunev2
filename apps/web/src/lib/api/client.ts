@@ -260,6 +260,7 @@ const invalidInviteWindows = (status: number) =>
 	new ApiError(status, 'request_failed', 'Invalid invite window response', null, false);
 
 export const ADMIN_INVITE_LIMIT = 200;
+export const ADMIN_INVITE_BATCH_MAX = 50;
 export const INVITE_STATUSES = ['active', 'expired', 'redeemed', 'revoked'] as const;
 type InviteStatus = (typeof INVITE_STATUSES)[number];
 export type AdminInvite = { id: number; status: InviteStatus; issued_by: string | null; expires_at: number };
@@ -275,6 +276,17 @@ function isAdminInvite(value: unknown): value is AdminInvite {
 		(row.issued_by === null || isInviteIssuerId(row.issued_by)) && isEpoch(row.expires_at);
 }
 
+export type AdminInviteTreePage = {
+	user_id: string;
+	inviter_id: string | null;
+	invitee_ids: string[];
+	next_cursor: string | null;
+};
+// Match the invite-tree route's ledger key bounds without rewriting the ID.
+export const isInviteTreeUserId = (id: unknown): id is string =>
+	typeof id === 'string' && id.length > 0 && id.length <= 128 && !/[^A-Za-z0-9_-]/.test(id);
+export const isAdminInviteTreeDenial = (status: number) => [401, 403, 404, 409].includes(status);
+
 export const INVITE_POLICY_BOUNDS = {
 	invite_member_min_paid_months: [0, 600],
 	invite_member_per_window: [0, 10_000],
@@ -289,6 +301,44 @@ export function isInvitePolicyValue(key: InvitePolicyKey, value: unknown): value
 }
 const invalidAdminSettings = (status: number) =>
 	new ApiError(status, 'request_failed', 'Invalid admin settings response');
+
+const MEMBER_INVITES = '/v1/me/invites';
+type MemberInviteBounds = Pick<InviteWindowSchedule, 'starts_at' | 'ends_at'>;
+type MemberInviteUsage = MemberInviteBounds & { used: number; remaining: number };
+export type MemberInviteSummary = {
+	paid_seconds: number;
+	required_paid_seconds: number;
+	entitled: boolean;
+	eligible: boolean;
+	per_window_limit: number;
+	open_window: MemberInviteUsage | null;
+	next_window: MemberInviteBounds | null;
+};
+
+const isCount = (value: unknown): value is number =>
+	typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+function hasInviteBounds(row: Partial<MemberInviteBounds> | null | undefined): row is MemberInviteBounds {
+	return row != null && isEpoch(row.starts_at) && isEpoch(row.ends_at) && row.starts_at < row.ends_at;
+}
+function isMemberInviteSummary(value: unknown): value is MemberInviteSummary {
+	const row = value as Partial<MemberInviteSummary> | null | undefined;
+	return row != null && isCount(row.paid_seconds) && isCount(row.required_paid_seconds) &&
+		typeof row.entitled === 'boolean' && typeof row.eligible === 'boolean' && isCount(row.per_window_limit) &&
+		(row.open_window === null || (hasInviteBounds(row.open_window) &&
+			isCount(row.open_window.used) && isCount(row.open_window.remaining))) &&
+		(row.next_window === null || hasInviteBounds(row.next_window));
+}
+
+export type MemberInviteHistory = {
+	invites: { id: number; created_at: number; expires_at: number; status: InviteStatus }[];
+	next_cursor: string | null;
+};
+
+function isMemberInviteHistoryRow(value: unknown): value is MemberInviteHistory['invites'][number] {
+	const row = value as Partial<MemberInviteHistory['invites'][number]> | null;
+	return row != null && isInviteId(row.id) && isEpoch(row.created_at) && isEpoch(row.expires_at) &&
+		row.status !== undefined && INVITE_STATUSES.includes(row.status);
+}
 
 export interface IssuedInvite {
 	code: string;
@@ -328,8 +378,8 @@ export class ApiClient {
 		this.token = token;
 	}
 
-	async get<T>(path: string): Promise<T> {
-		return this.request<T>(path, { method: 'GET' });
+	async get<T>(path: string, headers?: Record<string, string>): Promise<T> {
+		return this.request<T>(path, { method: 'GET', headers });
 	}
 
 	async post<T>(path: string, body: unknown): Promise<T> {
@@ -345,16 +395,18 @@ export class ApiClient {
 		});
 	}
 
-	async put<T>(path: string, body: unknown): Promise<T> {
+	async put<T>(path: string, body: unknown, headers?: Record<string, string>): Promise<T> {
 		return this.request<T>(path, {
 			method: 'PUT',
-			headers: { 'content-type': 'application/json' },
+			headers: { ...headers, 'content-type': 'application/json' },
 			body: JSON.stringify(body)
 		});
 	}
 
-	async delete<T>(path: string): Promise<T> {
-		return this.request<T>(path, { method: 'DELETE' });
+	async delete<T>(path: string, headers?: Record<string, string>, body?: unknown): Promise<T> {
+		return this.request<T>(path, body === undefined ? { method: 'DELETE', headers } : {
+			method: 'DELETE', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(body)
+		});
 	}
 
 	/**
@@ -389,7 +441,7 @@ export class ApiClient {
 		if (!confirm()) return;
 		return (await this.requestWithStatus<{ ok: true }>(REVOKE_ALL, {
 			method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
-		}, expected)).data;
+		}, { expected })).data;
 	}
 
 	async listInviteWindows(signal: AbortSignal) {
@@ -437,6 +489,22 @@ export class ApiClient {
 		return rows.map(({ id, status, issued_by, expires_at }) => ({ id, status, issued_by, expires_at }));
 	}
 
+	async readAdminInviteTree(id: string, cursor: string | null, signal: AbortSignal): Promise<AdminInviteTreePage> {
+		if (!isInviteTreeUserId(id)) throw new TypeError('Invalid user ID');
+		const query = cursor === null ? '' : `?${new URLSearchParams({ cursor })}`;
+		const { data, status } = await this.requestWithStatus<Partial<AdminInviteTreePage> | null>(
+			`/v1/admin/users/${id}/invite-tree${query}`, { method: 'GET', cache: 'no-store', redirect: 'error', signal },
+			{ statusOnly: isAdminInviteTreeDenial }
+		);
+		if (status !== 200 || data?.user_id !== id ||
+			(data.inviter_id !== null && !isInviteTreeUserId(data.inviter_id)) ||
+			!Array.isArray(data.invitee_ids) || data.invitee_ids.length > 50 || !data.invitee_ids.every(isInviteTreeUserId) ||
+			(data.next_cursor !== null && (typeof data.next_cursor !== 'string' || !data.next_cursor.length || data.next_cursor.length > 128)))
+			throw new ApiError(status, 'request_failed', 'Invalid invite tree response');
+		const { user_id, inviter_id, invitee_ids, next_cursor } = data;
+		return { user_id, inviter_id, invitee_ids, next_cursor };
+	}
+
 	/** Issue a single invite. The code is returned once; never retry or persist it. */
 	async issueAdminInvite(input: { email?: string; expires_in_days?: number }, signal: AbortSignal): Promise<IssuedInvite> {
 		const { data, status } = await this.requestWithStatus<{ code?: unknown; invite?: Record<string, unknown> } | null>(
@@ -448,6 +516,23 @@ export class ApiClient {
 			row?.kind !== 'admin' || row.status !== 'active' || !isEpoch(row.expires_at) || row.expires_at === 0)
 			throw new ApiError(status, 'request_failed', 'Invalid invite issuance response', null, false);
 		return { code: data.code, expires_at: row.expires_at };
+	}
+
+	/** Issue an atomic batch. Do not retry, even when the response is lost. */
+	async issueAdminInviteBatch(input: { count: number; expires_in_days?: number }, signal: AbortSignal): Promise<{ codes: string[]; expires_at: number }> {
+		const { count, expires_in_days } = input;
+		if (!Number.isInteger(count) || count < 1 || count > ADMIN_INVITE_BATCH_MAX ||
+			(expires_in_days !== undefined && !isInvitePolicyValue('invite_default_expiry_days', expires_in_days)))
+			throw new TypeError('Invalid invite batch options');
+		const { data, status } = await this.requestWithStatus<{ codes?: unknown; expires_at?: unknown } | null>(
+			`${ADMIN_INVITES}/batch`, { method: 'POST', cache: 'no-store', redirect: 'error', signal,
+				headers: { 'content-type': 'application/json' }, body: JSON.stringify({ count, expires_in_days }) }
+		);
+		const codes = data?.codes;
+		if (status !== 201 || !Array.isArray(codes) || codes.length !== count || !codes.every(isMemberInviteCode) ||
+			new Set(codes).size !== count || !isEpoch(data?.expires_at) || data.expires_at === 0)
+			throw new ApiError(status, 'request_failed', 'Invalid invite batch response', null, false);
+		return { codes, expires_at: data.expires_at };
 	}
 
 	/** Bodyless, once-only dispatch; the Worker owns the authorization and audited write. */
@@ -481,10 +566,35 @@ export class ApiClient {
 		return data.value;
 	}
 
+	/** Read only the browser member's current aggregate snapshot. */
+	async readMemberInvites(signal: AbortSignal): Promise<MemberInviteSummary> {
+		const { data, status } = await this.requestWithStatus<unknown>(
+			MEMBER_INVITES, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 200 || !isMemberInviteSummary(data))
+			throw new ApiError(status, 'request_failed', 'Invalid invite summary response', null, false);
+		return data;
+	}
+
+	/** Read one private history page in the browser session. The cursor is opaque. */
+	async readMemberInviteHistory(cursor: string | null, signal: AbortSignal): Promise<MemberInviteHistory> {
+		const query = cursor === null ? '' : `?cursor=${encodeURIComponent(cursor)}`;
+		const { data, status } = await this.requestWithStatus<{ invites?: unknown; next_cursor?: unknown } | null>(
+			`${MEMBER_INVITES}/history${query}`, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 200 || !Array.isArray(data?.invites) || !data.invites.every(isMemberInviteHistoryRow) ||
+			(data.next_cursor !== null && (typeof data.next_cursor !== 'string' || !data.next_cursor)))
+			throw new ApiError(status, 'request_failed', 'Invalid invite history response', null, false);
+		return {
+			invites: data.invites.map(({ id, created_at, expires_at, status }) => ({ id, created_at, expires_at, status })),
+			next_cursor: data.next_cursor
+		};
+	}
+
 	/** Spend one invite from the browser session's current window. Do not retry automatically. */
 	async issueMemberInvite(signal: AbortSignal): Promise<IssuedInvite> {
 		const { data, status } = await this.requestWithStatus<Partial<IssuedInvite> | null>(
-			'/v1/me/invites', { method: 'POST', cache: 'no-store', redirect: 'error', signal }
+			MEMBER_INVITES, { method: 'POST', cache: 'no-store', redirect: 'error', signal }
 		);
 		if (status !== 201 || !isMemberInviteCode(data?.code) ||
 			typeof data.expires_at !== 'number' || !Number.isSafeInteger(data.expires_at) ||
@@ -602,7 +712,7 @@ export class ApiClient {
 	private async requestWithStatus<T>(
 		path: string,
 		init: RequestInit,
-		expected?: string
+		{ expected, statusOnly }: { expected?: string; statusOnly?: (status: number) => boolean } = {}
 	): Promise<{ data: T; status: number; headers: Headers }> {
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
@@ -641,15 +751,22 @@ export class ApiClient {
 			// A transport may ignore abort; never publish an abandoned response.
 			callerSignal?.throwIfAborted();
 			if (!response.ok) {
+				// A known denial must clear private rows without waiting for its body.
+				if (statusOnly?.(response.status)) {
+					void response.body?.cancel().catch(() => undefined);
+					const { code, message } = parseErrorBody(null, response.status);
+					throw new ApiError(response.status, code, message, null, false);
+				}
 				// Read once (capped at 1 MiB) so the paywall and typed error
 				// share the structured contract.
 				let body: unknown = null;
 				try {
 					body = await readCappedJson(response);
 				} catch (error) {
-					// A body read cut short by the deadline surfaces the
-					// timeout, not a status default.
-					if (timedOut) throw this.timeoutError();
+					// Invite reads must not lose a known denial and retain private rows.
+					if (timedOut && !(init.method === 'GET' &&
+						[MEMBER_INVITES, `${MEMBER_INVITES}/history`].includes(path.split('?', 1)[0]) &&
+						[401, 403, 404, 409].includes(response.status))) throw this.timeoutError();
 					// An over-cap error body is never parsed: the generic
 					// status fallback applies, never retryable (an over-cap
 					// body does not become acceptable on retry), with no

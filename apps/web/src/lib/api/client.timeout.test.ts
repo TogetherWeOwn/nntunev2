@@ -155,7 +155,12 @@ describe('ApiClient request deadline', () => {
 		expect(signals[0]).toBeInstanceOf(AbortSignal);
 	});
 
-	it('aborts when the success body stalls after the headers arrive', async () => {
+	it.each([
+		{ read: 'session', status: 200, expected: 504 },
+		...['summary', 'history'].flatMap((read) => [401, 403, 404, 409, 500].map((status) => ({
+			read, status, expected: status === 500 ? 504 : status
+		})))
+	])('$read reports $expected when the $status response body stalls', async ({ read, status, expected }) => {
 		const signals: (AbortSignal | undefined)[] = [];
 		const fetchFn = vi.fn((_url: unknown, init?: RequestInit) => {
 			const signal = init?.signal ?? undefined;
@@ -163,8 +168,8 @@ describe('ApiClient request deadline', () => {
 			// Headers arrive immediately; the body read never completes on its
 			// own and, like a real response body, rejects when aborted.
 			const response = {
-				ok: true,
-				status: 200,
+				ok: status === 200,
+				status,
 				headers: new Headers({ 'content-type': 'application/json' }),
 				json: () =>
 					new Promise<unknown>((_resolve, reject) => {
@@ -178,15 +183,21 @@ describe('ApiClient request deadline', () => {
 			return Promise.resolve(response);
 		}) as unknown as typeof fetch;
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
-
-		const tracked = track(client.get('/v1/session/me'));
+		const signal = new AbortController().signal;
+		const tracked = track(read === 'history' ? client.readMemberInviteHistory('next', signal)
+			: read === 'summary' ? client.readMemberInvites(signal) : client.get('/v1/session/me'));
 
 		await vi.advanceTimersByTimeAsync(STILL_PENDING_MS);
 		expect(tracked.settled).toBe(false);
 
 		await vi.advanceTimersByTimeAsync(DEADLINE_CAP_MS);
 		expect(tracked.settled).toBe(true);
-		expectDeadlineApiError(tracked.failure);
+		if (expected === 504) expectDeadlineApiError(tracked.failure);
+		else {
+			expect(tracked.failure).toBeInstanceOf(ApiError);
+			expect(tracked.failure).toMatchObject({ status: expected, retryable: false, paywall: null });
+		}
+		expect(signals[0]?.aborted).toBe(true);
 		expect(fetchFn).toHaveBeenCalledTimes(1);
 	});
 

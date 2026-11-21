@@ -1,9 +1,10 @@
-//! Unmounted boundary reader for one independent-channel FLAC frame.
+//! Unmounted boundary reader for one FLAC frame.
 
 use crate::flac_frame_footer::{FrameCrc, FrameFooter};
 use crate::flac_frame_header::FrameHeader;
 use crate::flac_preamble::StreamInfo;
 use crate::flac_samples::{Samples, SubframeSamples};
+use crate::flac_stereo::Stereo;
 use crate::flac_subframe::{BitInput, SubframeHeaderReader};
 
 pub(crate) struct FrameReader {
@@ -11,6 +12,10 @@ pub(crate) struct FrameReader {
     channels_left: u8,
     channel: SubframeHeaderReader,
     samples: Option<SubframeSamples>,
+    stereo: Option<Stereo>,
+    first_channel: Vec<i64>,
+    sample_index: usize,
+    pcm: Option<Vec<i32>>,
     bits: BitInput,
     crc: FrameCrc,
     footer: Option<FrameFooter>,
@@ -19,16 +24,40 @@ pub(crate) struct FrameReader {
 
 impl FrameReader {
     /// The caller supplies the exact frame boundary and retains an incomplete
-    /// header (at most 16 bytes). This slice does not handle coupled stereo.
+    /// header (at most 16 bytes).
     pub(crate) fn start(input: &mut &[u8], info: &StreamInfo) -> Result<Option<Self>, ()> {
+        Self::start_with_pcm(input, info, &mut None)
+    }
+
+    /// Move reusable scratch into the frame only when its header is complete.
+    pub(crate) fn start_with_pcm(
+        input: &mut &[u8],
+        info: &StreamInfo,
+        scratch: &mut Option<Vec<i32>>,
+    ) -> Result<Option<Self>, ()> {
         let Some(header) = FrameHeader::parse(input, info)? else {
             return Ok(None);
         };
-        if header.channel_assignment > 7 {
-            return Err(());
+        let mut first_channel = Vec::new();
+        let (channels_left, first_width, stereo) = if header.channel_assignment <= 7 {
+            (header.channel_assignment + 1, header.bits_per_sample, None)
+        } else {
+            let stereo = Stereo::new(header.channel_assignment, header.bits_per_sample)?;
+            // Subframes are serialized, not interleaved. Retain only the
+            // first one, bounded by the checked u16 block size.
+            first_channel
+                .try_reserve_exact(usize::from(header.block_size))
+                .map_err(|_| ())?;
+            (2, stereo.coded_widths()[0], Some(stereo))
+        };
+        let mut pcm = scratch.take();
+        if let Some(pcm) = &mut pcm {
+            let len = usize::from(header.block_size) * usize::from(channels_left);
+            pcm.clear();
+            pcm.try_reserve_exact(len).map_err(|_| ())?;
+            pcm.resize(len, 0);
         }
-        let channels_left = header.channel_assignment + 1;
-        let channel = SubframeHeaderReader::new(header.bits_per_sample)?;
+        let channel = SubframeHeaderReader::new(first_width)?;
         let (prefix, rest) = input.split_at(header.len);
         let mut crc = FrameCrc::default();
         crc.update(prefix);
@@ -38,6 +67,10 @@ impl FrameReader {
             channels_left,
             channel,
             samples: None,
+            stereo,
+            first_channel,
+            sample_index: 0,
+            pcm,
             bits: BitInput::default(),
             crc,
             footer: None,
@@ -45,8 +78,8 @@ impl FrameReader {
         }))
     }
 
-    /// Decode channels only to locate the footer; this neither emits PCM nor
-    /// checks stream continuity. A completed frame leaves the next byte unread.
+    /// Decode subframes, check coupled PCM ranges, and verify the footer.
+    /// Leaves the byte after the frame unread; retained PCM stays private until finish.
     pub(crate) fn read(&mut self, input: &mut &[u8]) -> Result<bool, ()> {
         if self.failed {
             return Err(());
@@ -79,12 +112,45 @@ impl FrameReader {
             }
             let samples = self.samples.as_mut().ok_or(())?;
             match samples.read(&mut self.bits, input)? {
-                Samples::Sample(_) => {}
+                Samples::Sample(sample) => {
+                    if let Some(stereo) = &self.stereo {
+                        if self.channels_left == 2 {
+                            // SubframeSamples emits exactly block_size samples.
+                            self.first_channel.push(sample);
+                        } else {
+                            let (left, right) = stereo.restore(
+                                *self.first_channel.get(self.sample_index).ok_or(())?,
+                                sample,
+                            )?;
+                            if let Some(pcm) = &mut self.pcm {
+                                let offset = self.sample_index * 2;
+                                pcm.get_mut(offset..offset + 2)
+                                    .ok_or(())?
+                                    .copy_from_slice(&[left, right]);
+                            }
+                        }
+                    } else if let Some(pcm) = &mut self.pcm {
+                        let channels = self.header.channel_assignment + 1;
+                        let offset = self.sample_index * usize::from(channels)
+                            + usize::from(channels - self.channels_left);
+                        *pcm.get_mut(offset).ok_or(())? = i32::try_from(sample).map_err(|_| ())?;
+                    }
+                    self.sample_index += 1;
+                }
                 Samples::NeedInput => return Ok(false),
                 Samples::End => {
                     self.channels_left -= 1;
+                    self.sample_index = 0;
                     self.samples = None;
-                    self.channel = SubframeHeaderReader::new(self.header.bits_per_sample)?;
+                    if self.channels_left != 0 {
+                        let width = self
+                            .stereo
+                            .as_ref()
+                            .map_or(self.header.bits_per_sample, |stereo| {
+                                stereo.coded_widths()[1]
+                            });
+                        self.channel = SubframeHeaderReader::new(width)?;
+                    }
                 }
             }
         }
@@ -92,11 +158,15 @@ impl FrameReader {
     }
 
     pub(crate) fn finish(self) -> Result<FrameHeader, ()> {
+        self.finish_with_pcm().map(|(header, _)| header)
+    }
+
+    pub(crate) fn finish_with_pcm(self) -> Result<(FrameHeader, Option<Vec<i32>>), ()> {
         if self.failed {
             return Err(());
         }
         self.footer.ok_or(())?.finish_at_eof()?;
-        Ok(self.header)
+        Ok((self.header, self.pcm))
     }
 }
 
@@ -157,6 +227,83 @@ mod tests {
             assert!(input.is_empty());
         }
         assert_eq!(frame.finish().unwrap().channel_assignment, 1);
+    }
+
+    fn coupled_info(bits_per_sample: u8) -> StreamInfo {
+        StreamInfo {
+            min_block: 16,
+            max_block: 16,
+            channels: 2,
+            bits_per_sample,
+            total_samples: 16,
+            ..INFO
+        }
+    }
+
+    #[test]
+    fn checks_coupled_pairs_at_every_body_split() {
+        // Left/side alternates opposite PCM extrema; pairing either side
+        // with the wrong left sample overflows. Side/right and mid/side
+        // use opposite i32 extrema, requiring signed 33-bit coded sides.
+        let left_side = [
+            0xff, 0xf8, 0x69, 0x80, 0x00, 0x0f, 0x6a, 0x02, 0x87, 0x87, 0x87, 0x87, 0x87, 0x87,
+            0x87, 0x87, 0x02, 0x8b, 0xe2, 0xf8, 0xbe, 0x2f, 0x8b, 0xe2, 0xf8, 0xbe, 0x2f, 0x11,
+            0x44,
+        ];
+        let side_right = [
+            0xff, 0xf8, 0x69, 0x90, 0x00, 0x0f, 0xc8, 0x00, 0x7f, 0xff, 0xff, 0xff, 0x80, 0x40,
+            0x00, 0x00, 0x00, 0x00, 0x41, 0x10,
+        ];
+        let mid_side = [
+            0xff, 0xf8, 0x69, 0xa0, 0x00, 0x0f, 0x29, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x80,
+            0x00, 0x00, 0x00, 0x80, 0x35, 0x36,
+        ];
+        for (wire, depth, assignment) in [
+            (left_side.as_slice(), 4, 8),
+            (side_right.as_slice(), 32, 9),
+            (mid_side.as_slice(), 32, 10),
+        ] {
+            let joined = [wire, wire].concat();
+            for split in 7..=wire.len() {
+                let (mut prefix, mut rest) = joined.split_at(split);
+                let mut frame = FrameReader::start(&mut prefix, &coupled_info(depth))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(frame.read(&mut prefix), Ok(split == wire.len()));
+                assert!(prefix.is_empty());
+                if split < wire.len() {
+                    assert_eq!(frame.read(&mut rest), Ok(true));
+                }
+                assert_eq!(rest, wire);
+                assert_eq!(frame.finish().unwrap().channel_assignment, assignment);
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_coupled_pcm_overflow_even_with_matching_crc() {
+        // The inputs fit their coded widths in all three assignments; at
+        // least one reconstructed output is outside the signed 4-bit range.
+        let info = coupled_info(4);
+        for wire in [
+            [
+                0xff, 0xf8, 0x69, 0x80, 1, 0x0f, 0x7f, 0, 0x80, 0, 0x80, 0x16, 0x2c,
+            ],
+            [
+                0xff, 0xf8, 0x69, 0x90, 1, 0x0f, 0xdd, 0, 0x80, 0, 0, 0xa6, 0xb9,
+            ],
+            [
+                0xff, 0xf8, 0x69, 0xa0, 1, 0x0f, 0x3c, 0, 0x70, 0x0f, 0x80, 0x26, 0xa8,
+            ],
+        ] {
+            let mut input = wire.as_slice();
+            let mut frame = FrameReader::start(&mut input, &info).unwrap().unwrap();
+            assert_eq!(frame.read(&mut input), Err(()));
+            assert_eq!(input, &wire[11..]); // Refusal occurred before the CRC.
+            assert_eq!(frame.read(&mut input), Err(()));
+            assert_eq!(input, &wire[11..]);
+            assert!(frame.finish().is_err());
+        }
     }
 
     #[test]

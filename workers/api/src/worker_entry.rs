@@ -467,7 +467,10 @@ pub(crate) fn cors_headers(
         ));
         headers.push((
             "access-control-allow-headers",
-            "content-type, authorization".to_string(),
+            format!(
+                "content-type, authorization, {}",
+                handlers::SESSION_BINDING_HEADER
+            ),
         ));
         headers.push(("access-control-max-age", "86400".to_string()));
     }
@@ -1916,6 +1919,7 @@ fn catalogue_library_page_from_row(
         recording_mbids: row.try_get("recording_mbids").map_err(|_| StoreError)?,
         recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
         recording_ord: row.try_get("recording_ord").map_err(|_| StoreError)?,
+        recording_job_match: row.try_get("recording_job_match").map_err(|_| StoreError)?,
     })
 }
 
@@ -2046,12 +2050,17 @@ fn catalogue_release_track_from_row(
     })
 }
 
+enum ClaimOutcome {
+    Count(u64),
+    Expired(i64),
+}
+
 /// Shared by standalone claims and registration's transaction: keep every
 /// single-use predicate and its bind order identical across both paths.
 async fn claim_single_use_on(
     client: &impl GenericClient,
     candidate: SingleUseClaim<'_>,
-) -> Result<u64, StoreError> {
+) -> Result<ClaimOutcome, StoreError> {
     let statement = candidate.statement();
     // Unnamed via `query_typed` (TWO-434): registration finish runs these
     // claims through Hyperdrive, where a named `sN` statement can fail.
@@ -2100,31 +2109,100 @@ async fn claim_single_use_on(
         }
     }
     .map_err(|_| StoreError)?;
-    Ok(rows.len() as u64)
+    if matches!(candidate, SingleUseClaim::Invite { .. }) {
+        return match rows.as_slice() {
+            [] => Ok(ClaimOutcome::Count(0)),
+            [row] => match row.try_get("expired_id").map_err(|_| StoreError)? {
+                Some(id) => Ok(ClaimOutcome::Expired(id)),
+                None => Ok(ClaimOutcome::Count(1)),
+            },
+            _ => Err(StoreError),
+        };
+    }
+    Ok(ClaimOutcome::Count(rows.len() as u64))
+}
+
+async fn try_observe_invite_expiry(client: &mut tokio_postgres::Client, id: i64) {
+    // Isolate the audit from both enrollment and the outward denial. Bound
+    // the query server-side too, in case the client stops awaiting it.
+    const AUDIT_BUDGET_MS: u64 = 1_000;
+    let _ = PgStore::bounded(
+        async {
+            let tx = client.transaction().await.map_err(|_| StoreError)?;
+            tx.batch_execute("SET LOCAL statement_timeout = '500ms'")
+                .await
+                .map_err(|_| StoreError)?;
+            tx.query_typed(
+                include_str!("observe_invite_expiry.sql"),
+                &[(&id, Type::INT8)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+            tx.commit().await.map_err(|_| StoreError)
+        },
+        AUDIT_BUDGET_MS,
+    )
+    .await;
+}
+
+enum InviteLookup {
+    Active(tokio_postgres::Row),
+    Expired(i64),
+    Refused,
+}
+
+impl InviteLookup {
+    async fn resolve(
+        self,
+        client: &mut tokio_postgres::Client,
+    ) -> Result<Option<InviteRecord>, StoreError> {
+        match self {
+            Self::Active(row) => invite_from_row(&row).map(Some),
+            Self::Expired(id) => {
+                try_observe_invite_expiry(client, id).await;
+                Ok(None)
+            }
+            Self::Refused => Ok(None),
+        }
+    }
 }
 
 async fn invite_by_hash_on(
     client: &impl GenericClient,
     code_hash: &str,
-) -> Result<Option<InviteRecord>, StoreError> {
-    // Preflight only; the invite claim rechecks the bounds under lock.
+) -> Result<InviteLookup, StoreError> {
+    // Preflight only; both the claim and the audit recheck under lock.
     let statement = format!(
-        "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email FROM invite_codes \
+        "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email, invite_codes.expiry_observed_at, \
+                LEAST(invite_codes.expires_at, w.ends_at) <= live_now AS expired \
+         FROM invite_codes \
          LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
          LEFT JOIN invite_windows w ON w.id = invite_codes.window_id \
-         WHERE invite_codes.code_hash = $1 AND (invite_codes.kind = 'admin' OR \
-             (invite_codes.kind = 'member' AND w.id IS NOT NULL AND \
-              int8range(w.starts_at, w.ends_at, '[)') @> floor(extract(epoch FROM clock_timestamp()))::bigint))"
+         CROSS JOIN (SELECT floor(extract(epoch FROM clock_timestamp()))::bigint AS live_now) tick \
+         WHERE invite_codes.code_hash = $1 AND NOT invite_codes.used \
+           AND invite_codes.redeemed_at IS NULL AND invite_codes.revoked_at IS NULL \
+           AND (invite_codes.kind = 'admin' OR (invite_codes.kind = 'member' AND w.starts_at <= live_now))"
     );
-    let rows = client
+    let mut rows = client
         .query_typed(&statement, &[(&code_hash, Type::TEXT)])
         .await
         .map_err(|_| StoreError)?;
-    // `query_opt`'s rule: more than one row is an error.
     if rows.len() > 1 {
         return Err(StoreError);
     }
-    rows.first().map(invite_from_row).transpose()
+    let Some(row) = rows.pop() else {
+        return Ok(InviteLookup::Refused);
+    };
+    if !row.try_get::<_, bool>("expired").map_err(|_| StoreError)? {
+        return Ok(InviteLookup::Active(row));
+    }
+    let observed_at: Option<i64> = row.try_get("expiry_observed_at").map_err(|_| StoreError)?;
+    if observed_at.is_some() {
+        return Ok(InviteLookup::Refused);
+    }
+    Ok(InviteLookup::Expired(
+        row.try_get("id").map_err(|_| StoreError)?,
+    ))
 }
 
 async fn insert_credential_on(
@@ -2179,8 +2257,16 @@ async fn complete_registration_on(
         claims.push(SingleUseClaim::Invite { record });
     }
     for claim in claims {
-        if claim_single_use_on(&transaction, claim).await? != 1 {
-            return Err(StoreError);
+        match claim_single_use_on(&transaction, claim).await? {
+            ClaimOutcome::Expired(id) => {
+                // No credential or proof may survive the denial. The expiry
+                // audit is independent and must not keep these locks held.
+                transaction.rollback().await.map_err(|_| StoreError)?;
+                try_observe_invite_expiry(client, id).await;
+                return Err(StoreError);
+            }
+            ClaimOutcome::Count(n) if n != 1 => return Err(StoreError),
+            ClaimOutcome::Count(_) => {}
         }
     }
     if let Some(record) = invite {
@@ -2964,6 +3050,63 @@ async fn admin_issue_invite_on(
     Ok(AdminInviteIssueOutcome::Issued(invite_id))
 }
 
+/// Commit the whole batch under the same role lock as single issuance.
+async fn admin_issue_invite_batch_on(
+    client: &mut tokio_postgres::Client,
+    actor: &str,
+    hashes: &[String],
+    source_ip: &str,
+    now: u64,
+    expires_at: u64,
+) -> Result<handlers::AdminInviteBatchOutcome, StoreError> {
+    use handlers::AdminInviteBatchOutcome as Outcome;
+    if !(1..=handlers::ADMIN_INVITE_BATCH_MAX).contains(&hashes.len()) {
+        return Err(StoreError);
+    }
+    let transaction = client.transaction().await?;
+    if !admin_actor_locked(&transaction, actor).await? {
+        return Ok(Outcome::ActorNotAdmin);
+    }
+    // The guard already holds the actor row lock; deletion cannot mark it before commit.
+    let actor_row = transaction
+        .query_typed_one(
+            "SELECT deleting_at IS NOT NULL FROM users WHERE id = $1",
+            &[(&actor, Type::TEXT)],
+        )
+        .await?;
+    if actor_row.try_get::<_, bool>(0)? {
+        return Ok(Outcome::AccountDeleting);
+    }
+    let row = transaction
+        .query_typed_one(
+            "WITH issued AS (
+                 INSERT INTO invite_codes (code_hash, used, created_at, issued_by, kind, expires_at)
+                 SELECT hash, FALSE, $2, $3, $4, $5 FROM unnest($1::text[]) AS t(hash) RETURNING id
+             ), audited AS (
+                 INSERT INTO audit_log (user_id, action, ok, source_ip, at, details)
+                 SELECT $3, $6, TRUE, $7, $2, jsonb_build_object('invite_id', id) FROM issued RETURNING 1
+             ) SELECT count(*) FROM audited",
+            &[
+                (&hashes, Type::TEXT_ARRAY),
+                (&i64_of(now)?, Type::INT8),
+                (&actor, Type::TEXT),
+                (&crate::auth::INVITE_KIND_ADMIN, Type::TEXT),
+                (&i64_of(expires_at)?, Type::INT8),
+                (&crate::auth::INVITE_ISSUED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+            ],
+        )
+        .await?;
+    if row.try_get::<_, i64>(0)? != hashes.len() as i64 {
+        return Err(StoreError);
+    }
+    transaction.commit().await?;
+    Ok(Outcome::Issued)
+}
+
 impl From<tokio_postgres::Error> for StoreError {
     fn from(_: tokio_postgres::Error) -> Self {
         StoreError
@@ -3061,6 +3204,62 @@ async fn member_invite_summary_on(
             remaining: (per_window_limit - used).max(0),
         }),
         next_window: bounds("next_start", "next_end")?,
+    }))
+}
+
+async fn member_invite_history_on(
+    client: &impl GenericClient,
+    issuer: &str,
+    before: Option<i64>,
+) -> Result<Option<handlers::MemberInviteHistory>, StoreError> {
+    use handlers::{MemberInviteHistory, MemberInviteHistoryEntry};
+    const PAGE_SIZE: usize = 50;
+    // One statement fences deletion; a NULL invite distinguishes an empty page.
+    let rows = client
+        .query_typed(
+            "SELECT page.id, page.created_at, LEAST(page.expires_at, w.ends_at) AS expires_at,
+                    page.redeemed, page.revoked, floor(extract(epoch FROM now()))::bigint AS now
+             FROM users u LEFT JOIN LATERAL (
+                 SELECT i.id, i.created_at, i.expires_at, i.window_id,
+                        (i.used OR i.redeemed_at IS NOT NULL) AS redeemed,
+                        (i.revoked_at IS NOT NULL) AS revoked
+                 FROM invite_codes i
+                 WHERE i.issued_by = u.id AND i.kind = 'member' AND ($2 IS NULL OR i.id < $2)
+                 ORDER BY i.id DESC LIMIT $3
+             ) page ON TRUE
+             LEFT JOIN invite_windows w ON w.id = page.window_id
+             WHERE u.id = $1 AND u.deleting_at IS NULL
+             ORDER BY page.id DESC",
+            &[
+                (&issuer, Type::TEXT),
+                (&before, Type::INT8),
+                (&((PAGE_SIZE + 1) as i64), Type::INT8),
+            ],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut invites = Vec::with_capacity(rows.len().min(PAGE_SIZE));
+    for row in rows.iter().take(PAGE_SIZE) {
+        let Some(id) = row.try_get("id")? else { break };
+        let expires_at = u64_of(row.try_get("expires_at")?)?;
+        invites.push(MemberInviteHistoryEntry {
+            id,
+            created_at: u64_of(row.try_get("created_at")?)?,
+            expires_at,
+            status: crate::auth::InviteStatus::at(
+                u64_of(row.try_get("now")?)?,
+                expires_at,
+                row.try_get("redeemed")?,
+                row.try_get("revoked")?,
+            ),
+        });
+    }
+    let next_cursor = (rows.len() > PAGE_SIZE).then(|| invites[PAGE_SIZE - 1].id.to_string());
+    Ok(Some(MemberInviteHistory {
+        invites,
+        next_cursor,
     }))
 }
 
@@ -4790,14 +4989,17 @@ impl Store for PgStore {
     }
 
     async fn invite_by_hash(&self, code_hash: &str) -> Result<Option<InviteRecord>, StoreError> {
-        Self::bounded(
+        let (mut client, lookup) = Self::bounded(
             async {
                 let client = self.connect().await?;
-                invite_by_hash_on(&client, code_hash).await
+                let lookup = invite_by_hash_on(&client, code_hash).await?;
+                Ok((client, lookup))
             },
             TOTAL_TIMEOUT_MS,
         )
-        .await
+        .await?;
+        // An optional audit timeout must not turn an invite denial into a 500.
+        lookup.resolve(&mut client).await
     }
 
     async fn insert_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
@@ -6421,12 +6623,59 @@ impl Store for PgStore {
         .await
     }
 
+    async fn admin_issue_invite_batch(
+        &self,
+        actor: &str,
+        hashes: &[String],
+        source_ip: &str,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<handlers::AdminInviteBatchOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_issue_invite_batch_on(&mut client, actor, hashes, source_ip, now, expires_at)
+                    .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn member_invite_summary(
         &self,
         issuer: &str,
     ) -> Result<Option<handlers::MemberInviteSummary>, StoreError> {
         Self::bounded(
             async { member_invite_summary_on(&self.connect().await?, issuer).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn member_invite_history(
+        &self,
+        issuer: &str,
+        before: Option<i64>,
+    ) -> Result<Option<handlers::MemberInviteHistory>, StoreError> {
+        Self::bounded(
+            async { member_invite_history_on(&self.connect().await?, issuer, before).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_invite_tree(
+        &self,
+        actor_id: &str,
+        user_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<crate::admin_invite_tree::InviteTreeRead, StoreError> {
+        Self::bounded(
+            async {
+                crate::admin_invite_tree::read_on(&self.connect().await?, actor_id, user_id, cursor)
+                    .await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -6617,15 +6866,18 @@ impl Store for PgStore {
     }
 }
 
-/// Executes exactly the parameterized conditional UPDATE/RETURNING the
-/// core prepared (`SingleUseClaim::statement`) and reports how many rows
-/// it returned — autocommitted before the handler responds.
+/// Executes the conditional claim and reports only committed spends.
 impl SingleUseStore for PgStore {
     async fn claim(&self, candidate: SingleUseClaim<'_>) -> Result<u64, auth::AuthError> {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                claim_single_use_on(&client, candidate).await
+                // No mounted standalone invite caller. Preserve its count
+                // contract; only the signup paths write expiry observations.
+                Ok(match claim_single_use_on(&client, candidate).await? {
+                    ClaimOutcome::Count(n) => n,
+                    ClaimOutcome::Expired(_) => 0,
+                })
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -7357,8 +7609,8 @@ pub async fn collect_body_with_cap<S: BodyChunkStream>(
 /// Content-Length suffices — the stream is never polled). The route's
 /// own 413 (`admin_ingest_oversized`) lives only in the in-handler
 /// pre-gate, for direct-handle callers that reach it. The Worker
-/// entry passes a handler that calls `handlers::handle`, so a rejected
-/// body can cause no store, mailer, DNS, or dialer side effect.
+/// entry passes a handler that dispatches through the transport headers,
+/// so a rejected body can cause no store, mailer, DNS, or dialer side effect.
 pub async fn dispatch_collected<F, Fut>(
     collected: CollectedBody,
     mut request: handlers::Request,
@@ -7377,25 +7629,28 @@ where
     }
 }
 
-/// Shared runtime composition for the collected request: the bound-refresh
-/// transport guard runs before `handler`, so a marked request whose keyed
-/// body was lost in transport is rejected instead of downgrading to the
-/// ordinary empty-body rotation. Production dispatch and the transport
-/// tests both call this seam, so disabling the guard fails those tests
-/// behaviorally rather than only a source-shape pin.
-pub async fn handle_with_refresh_transport_guard<F, Fut>(
+/// Dispatch a collected request with the Worker's lowercased header map.
+/// The refresh marker survives a truncated body, and the Like binding is
+/// forwarded as a precondition, not as authentication.
+pub(crate) async fn handle_with_transport_headers<S, M, D, N>(
+    ctx: &handlers::Ctx<'_, S, M, D, N>,
     request: handlers::Request,
-    refresh_content_type: Option<&str>,
-    handler: F,
+    headers: &HashMap<String, String>,
 ) -> handlers::Response
 where
-    F: FnOnce(handlers::Request) -> Fut,
-    Fut: std::future::Future<Output = handlers::Response>,
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
 {
+    let refresh_content_type = headers.get("content-type").map(String::as_str);
     if let Some(rejection) = handlers::refresh_transport_rejection(&request, refresh_content_type) {
         return rejection;
     }
-    handler(request).await
+    let expected_session_binding = headers
+        .get(handlers::SESSION_BINDING_HEADER)
+        .map(String::as_str);
+    handlers::handle_with_session_binding(ctx, &request, expected_session_binding).await
 }
 
 /// Registry code for an error response: the envelope `code` when the body
@@ -7799,6 +8054,25 @@ pub async fn subsonic_mount(
     respond_document(&app.handle(method, path, query, body))
 }
 
+// The runtime path has no query; restore it only for list routes that use it.
+pub(crate) fn route_path(
+    method: Method,
+    path: String,
+    url: impl FnOnce() -> Option<url::Url>,
+) -> String {
+    use crate::native_rest::admin_invite_tree_user;
+    use crate::native_rest::MEMBER_INVITE_HISTORY_PATH;
+    match (method, path.as_str()) {
+        (Method::Get, "/v1/admin/ingest" | MEMBER_INVITE_HISTORY_PATH) => (),
+        (Method::Get, path) if admin_invite_tree_user(path).is_some() => (),
+        _ => return path,
+    }
+    match url().as_ref().and_then(url::Url::query) {
+        Some(query) if !query.is_empty() => format!("{path}?{query}"),
+        _ => path,
+    }
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.
@@ -7872,27 +8146,9 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // the gates never read). Server logs redact this header the way
     // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
     // module logs header values.
-    // The runtime path strips the query string everywhere; the admin
-    // ingest list route needs its `?status=&limit=&offset=` filters in
-    // production, so the entry reattaches the raw query for exactly
-    // `GET /v1/admin/ingest` (non-empty query only). Every other route
-    // keeps the bare path, so no new query surface appears elsewhere.
-    let bare_path = req.path();
-    let handler_path = if req.method() == Method::Get && bare_path == "/v1/admin/ingest" {
-        match req.url().ok().and_then(|url| {
-            url.query()
-                .filter(|query| !query.is_empty())
-                .map(|query| format!("{bare_path}?{query}"))
-        }) {
-            Some(with_query) => with_query,
-            None => bare_path,
-        }
-    } else {
-        bare_path
-    };
     let request = handlers::Request {
         method: req.method().to_string(),
-        path: handler_path,
+        path: route_path(req.method(), req.path(), || req.url().ok()),
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
         authorization: headers_map.get("authorization").cloned(),
@@ -7942,15 +8198,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     let served_method = request.method.clone();
     let served_path = served_display_path(&request.path);
-    // Preserve the header marker independently of any truncated upload bytes.
-    let refresh_content_type = headers_map.get("content-type").cloned();
-    let response = dispatch_collected(collected, request, |collected_request| async move {
-        handle_with_refresh_transport_guard(
-            collected_request,
-            refresh_content_type.as_deref(),
-            |guarded_request| async move { handlers::handle(&ctx, &guarded_request).await },
-        )
-        .await
+    let response = dispatch_collected(collected, request, |collected_request| {
+        handle_with_transport_headers(&ctx, collected_request, &headers_map)
     })
     .await;
     // One structured line per served request: route, status, latency, and
@@ -9604,7 +9853,7 @@ mod tests {
         )));
         assert!(headers.contains(&(
             "access-control-allow-headers",
-            "content-type, authorization".to_string()
+            "content-type, authorization, x-nntune-session-binding".to_string()
         )));
         assert!(headers.contains(&("access-control-max-age", "86400".to_string())));
         // Non-preflight statuses never carry the preflight grants.

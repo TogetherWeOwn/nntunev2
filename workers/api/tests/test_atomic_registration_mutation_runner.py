@@ -30,7 +30,10 @@ SOURCE_FIXTURE = b"""async fn unrelated() {
 async fn complete_registration_on(
 ) {
     claims.push(SingleUseClaim::Invite { record });
-    if claim_single_use_on(&transaction, claim).await? != 1 {}
+    match claim_single_use_on(&transaction, claim).await? {
+        ClaimOutcome::Count(n) if n != 1 => return Err(StoreError),
+        _ => {}
+    }
 }
 async fn cleanup() {}
 """
@@ -234,7 +237,10 @@ async fn cleanup() {}
 async fn complete_registration_on(
 ) {
     let _ = record;
-    if claim_single_use_on(&transaction, claim).await? != 1 {}
+    match claim_single_use_on(&transaction, claim).await? {
+        ClaimOutcome::Count(n) if n != 1 => return Err(StoreError),
+        _ => {}
+    }
 }
 async fn cleanup() {}
 """)

@@ -55,6 +55,13 @@ it('shares the read lock, queues logout and recovers after storage errors', asyn
 	expect(read()).not.toBe(initial);
 	expect(await first!.run(() => true)).toBeUndefined();
 });
+it.each([null, '', 'established'])('captures read-only only with an established generation (%s)', async (id) => {
+	const { setItem, removeItem, write } = setup();
+	if (id !== null) write(AUTH_GENERATION_KEY, id);
+	expect((await captureAuthFence({ readOnly: true }))?.generation).toBe(id || undefined);
+	expect(setItem).not.toHaveBeenCalled();
+	expect(removeItem).not.toHaveBeenCalled();
+});
 it('does not dispatch logout queued behind a second tab signing in', async () => {
 	const { api, send } = setup();
 	const finishSignIn = await startWriter();
@@ -114,6 +121,7 @@ it.each(['open', 'delete'] as const)('does not wait beyond the auth deadline for
 	try {
 		await vi.advanceTimersByTimeAsync(API_REQUEST_TIMEOUT_MS);
 		expect(await logout).toEqual(op === 'open' ? expect.objectContaining({ code: 'request_timeout' }) : undefined);
+		expect(caches[op]).toHaveBeenCalledOnce();
 	} finally { ready.resolve(); await vi.advanceTimersByTimeAsync(0); }
 	expect(send).toHaveBeenCalledTimes(op === 'open' ? 0 : 1);
 	expect(await caches.keys()).toHaveLength(0);

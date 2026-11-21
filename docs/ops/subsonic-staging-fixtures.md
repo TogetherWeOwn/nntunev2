@@ -131,6 +131,46 @@ does not expose an expected-current deployment precondition. A read followed by
 an unconditional rollback is not safe; do not arm or attempt that write without
 a fence that covers all writers.
 
+### Read-only off and drain verifier
+
+`verify_cleanup` in [the staging cleanup module](../../.github/scripts/subsonic_staging_cleanup.py)
+accepts a trusted deployment ID, version ID and build SHA. It checks fresh
+provider deployment and version results (not saved receipts) for 100% traffic
+on that exact deployment and for the default-off configuration. It then takes
+one independent `sample_pressure` reading. Its query start must be strictly
+later than the off readback, and a fresh zero measurement-session count must
+still hold as evidence when the final deployment read matches the pin.
+
+On a protected `main` push, [`deploy.yml`](../../.github/workflows/deploy.yml)
+checks off and drained state after `staging-api` deploys successfully and the
+same job validates a matched provider identity receipt for that build. A
+failed or skipped deploy (including a schema-gate failure) or a missing or bad
+pin skips the readback. The job records the readback step's raw outcome apart
+from the deploy result; readback failure does not change E2E eligibility. Do
+not dispatch or rerun a workflow to fill in missing post-deploy evidence.
+
+The deploy step and the separate manual
+[`subsonic-staging-off-drain`](../../.github/workflows/subsonic-staging-off-drain.yml)
+workflow both use the read-only adapter on protected `main`. It uses a dedicated
+`SUBSONIC_STAGING_WORKERS_READ_TOKEN` in the `staging` environment with Workers
+Scripts Read on the intended account, the configured `CLOUDFLARE_ACCOUNT_ID`, and
+that environment's `PLANETSCALE_OBSERVER_URL_STAGING`. Do not substitute the
+staging deploy token or the health-only Access token. The provider reads target
+only `nntune-api-staging`. All reads share a 30-second monotonic deadline;
+Actions also bounds the command and its children with an outer timeout.
+
+For a separate manual observation, dispatch once on `main` with
+`expected_deployment_id`, `expected_version_id`, and `expected_build_sha` from
+the **same** trusted staging deployment receipt. The manual workflow SHA can
+differ from the staging build SHA.
+
+In either lane, the receipt supplies the pin, not the evidence. Require the
+actual readback step to report `subsonic-staging-off-drain: verified` and have
+a successful raw outcome. Record the run/job link and the pinned receipt,
+or record that readback did not verify. This is point-in-time evidence only:
+it neither fences concurrent writers nor restores a deployment, cancels
+clients, proves recovery after runner loss, or authorizes measurement.
+
 ### Actions step finalization (synthetic only)
 
 The `public-text` CI job arms a synthetic deployment and starts a simulated

@@ -357,14 +357,39 @@ impl InviteRecord {
     /// `redeemed_at`, not `redeemed_by`: account deletion nulls the FK
     /// but must never free the code.
     pub fn status(&self, now: u64) -> &'static str {
-        if self.redeemed_at.is_some() || self.used {
-            "redeemed"
-        } else if self.revoked_at.is_some() {
-            "revoked"
-        } else if self.expires_at <= now {
-            "expired"
+        match InviteStatus::at(
+            now,
+            self.expires_at,
+            self.redeemed_at.is_some() || self.used,
+            self.revoked_at.is_some(),
+        ) {
+            InviteStatus::Redeemed => "redeemed",
+            InviteStatus::Revoked => "revoked",
+            InviteStatus::Expired => "expired",
+            InviteStatus::Active => "active",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteStatus {
+    Active,
+    Redeemed,
+    Revoked,
+    Expired,
+}
+
+impl InviteStatus {
+    pub(crate) fn at(now: u64, expires_at: u64, redeemed: bool, revoked: bool) -> Self {
+        if redeemed {
+            Self::Redeemed
+        } else if revoked {
+            Self::Revoked
+        } else if expires_at <= now {
+            Self::Expired
         } else {
-            "active"
+            Self::Active
         }
     }
 }
@@ -518,8 +543,9 @@ pub enum SingleUseClaim<'a> {
 }
 
 impl SingleUseClaim<'_> {
-    /// Execute this statement once and count its returned rows. The primary
-    /// key + conditional flag transition makes concurrent claims exclusive.
+    /// Execute this statement once and count only committed spends. The
+    /// invite statement also reports a typed expiry refusal (a non-null ID),
+    /// which must never count as a spend.
     pub fn statement(&self) -> &'static str {
         match self {
             Self::MagicLink { .. } => "UPDATE magic_link_tokens SET used = TRUE WHERE token_hash = $1 AND user_id = $2 AND email = $3 AND expires_at = $4 AND expires_at > $5 AND used = FALSE RETURNING token_hash",
@@ -530,11 +556,11 @@ impl SingleUseClaim<'_> {
             // Only project the wall clock after the lateral locking read;
             // materialization keeps the time predicates above that lock.
             Self::Invite { .. } => "WITH locked_invite AS MATERIALIZED (
-                SELECT kind, window_id FROM invite_codes
+                SELECT id, kind, window_id, expires_at, email, issued_by FROM invite_codes
                 WHERE code_hash = $1 AND used = FALSE AND redeemed_at IS NULL AND revoked_at IS NULL
                 FOR NO KEY UPDATE
             ), checked AS MATERIALIZED (
-                SELECT i.kind, w.starts_at, w.ends_at,
+                SELECT i.id, i.kind, i.expires_at, w.starts_at, w.ends_at,
                        floor(extract(epoch FROM clock_timestamp()))::bigint AS live_now
                 FROM locked_invite i
                 LEFT JOIN LATERAL (
@@ -542,24 +568,30 @@ impl SingleUseClaim<'_> {
                     WHERE id = i.window_id AND i.kind = 'member'
                     FOR SHARE
                 ) w ON TRUE
+                WHERE (i.email IS NULL OR EXISTS (SELECT 1 FROM users WHERE id = $2 AND lower(email) = lower(i.email)))
+                  AND NOT EXISTS (SELECT 1 FROM users issuer JOIN users redeemer ON lower(redeemer.email) = lower(issuer.email)
+                                  WHERE issuer.id = i.issued_by AND redeemer.id = $2)
+            ), claimed AS (
+                UPDATE invite_codes SET used = TRUE, redeemed_by = $2,
+                    redeemed_at = CASE WHEN checked.kind = 'member' THEN live_now ELSE $3 END
+                FROM checked
+                WHERE invite_codes.id = checked.id AND used = FALSE AND redeemed_at IS NULL AND revoked_at IS NULL
+                  AND ((checked.kind = 'admin' AND checked.expires_at > GREATEST(live_now, $3)) OR (checked.kind = 'member'
+                       AND starts_at <= live_now AND live_now < ends_at AND live_now < checked.expires_at))
+                RETURNING invite_codes.id
             )
-            UPDATE invite_codes SET used = TRUE, redeemed_by = $2,
-                redeemed_at = CASE WHEN checked.kind = 'member' THEN live_now ELSE $3 END
-            FROM checked
-            WHERE code_hash = $1 AND used = FALSE AND redeemed_at IS NULL AND revoked_at IS NULL
-              AND ((checked.kind = 'admin' AND expires_at > $3) OR (checked.kind = 'member'
-                   AND starts_at <= live_now AND live_now < ends_at AND live_now < expires_at))
-              AND (email IS NULL OR EXISTS (SELECT 1 FROM users WHERE id = $2 AND lower(email) = lower(invite_codes.email)))
-              AND NOT EXISTS (SELECT 1 FROM users issuer JOIN users redeemer ON lower(redeemer.email) = lower(issuer.email)
-                              WHERE issuer.id = invite_codes.issued_by AND redeemer.id = $2)
-            RETURNING code_hash",
+            SELECT NULL::bigint AS expired_id FROM claimed
+            UNION ALL
+            SELECT id FROM checked
+            WHERE (kind = 'admin' AND expires_at <= live_now)
+               OR (kind = 'member' AND starts_at <= live_now AND LEAST(expires_at, ends_at) <= live_now)",
         }
     }
 }
 
 /// Worker/Hyperdrive boundary. Implementations must execute the conditional
-/// UPDATE from [`SingleUseClaim::statement`] and return the number of rows
-/// it returned, NOT perform SELECT + unconditional UPDATE. Return an error
+/// UPDATE from [`SingleUseClaim::statement`] and return the number of spends,
+/// NOT perform SELECT + unconditional UPDATE. Return an error
 /// on storage failure. Success is usable only after the transaction commits;
 /// signup/session insertion may share that transaction, but nothing may be
 /// sent to the client before commit. An in-memory flag is not an implementation.

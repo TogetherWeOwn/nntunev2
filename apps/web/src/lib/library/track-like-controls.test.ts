@@ -35,6 +35,7 @@ function ownership() {
 		publish: (next?: LibraryRefreshUpdate) => { publication = next; },
 		owner: {
 			client: new ApiClient({ baseUrl, fetchFn }),
+			binding: 'A'.repeat(43),
 			readiness: () => publication,
 			liked: (id: string) => id === track.id ? liked : undefined,
 			confirm: vi.fn((_id: string, _confirmedId: string, value: boolean) => { liked = value; }),
@@ -127,7 +128,9 @@ describe('injected track and queue Like controls', () => {
 		const staleToggle = controls(track.id)!.toggle;
 		const request = staleToggle();
 		await controls(track.id)!.toggle();
-		expect(fetchFn).toHaveBeenCalledExactlyOnceWith(path, expect.objectContaining({ method: 'PUT' }));
+		expect(fetchFn).toHaveBeenCalledExactlyOnceWith(path, expect.objectContaining({
+			method: 'PUT', headers: expect.objectContaining({ 'x-nntune-session-binding': owner.binding })
+		}));
 		expectLikeButtons(controls, false, true);
 		reply.resolve(response());
 		await request;
@@ -140,12 +143,15 @@ describe('injected track and queue Like controls', () => {
 		expectLikeButtons(controls, false, false);
 	});
 
-	it('keeps confirmed state on an invalid confirmation and allows retry', async () => {
+	it.each([
+		['an invalid confirmation', () => Response.json({ target_id: 'other', liked_at: 1 })],
+		['a rejected binding', () => Response.json({ error: 'session binding mismatch' }, { status: 412 })]
+	] as const)('keeps confirmed state after %s and allows retry', async (_case, failure) => {
 		const { owner, fetchFn } = ownership();
-		fetchFn.mockResolvedValueOnce(Response.json({ target_id: 'other', liked_at: 1 })).mockResolvedValueOnce(response());
+		fetchFn.mockResolvedValueOnce(failure()).mockResolvedValueOnce(response());
 		const controls = createTrackLikeControls(() => owner);
 		await controls(track.id)!.toggle();
-		expect(owner.failed).toHaveBeenCalledExactlyOnceWith(track.id);
+		expect(owner.failed).toHaveBeenCalledExactlyOnceWith(track.id, expect.any(Error));
 		expect(owner.confirm).not.toHaveBeenCalled();
 		expectLikeButtons(controls, false, false);
 		await controls(track.id)!.toggle();

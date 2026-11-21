@@ -62,6 +62,8 @@ export interface LibraryRefresher {
 	handleAuthTransition: (event: Pick<StorageEvent, 'key'>) => void;
 	/** Same reset as a delivered transition, for same-window dispatch. */
 	handleLocalAuthTransition: () => void;
+	/** Hide unverified data without dropping the scope needed for Retry or purge. */
+	suspendVerification: () => void;
 	dispose: () => void;
 }
 
@@ -441,5 +443,6 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		activeRequest = null;
 	}
 
-	return { state, refresh, handleAuthTransition, handleLocalAuthTransition, dispose };
+	return { state, refresh, handleAuthTransition, handleLocalAuthTransition,
+		suspendVerification: () => { if (!state.requiresSignIn) applyAuthTransition(false); }, dispose };
 }

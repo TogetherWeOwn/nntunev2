@@ -2,10 +2,12 @@
 	import type { Action } from 'svelte/action';
 	import type { createCurrentTrackFavorite } from './currentTrackFavorite.svelte.js';
 	import type { QueueState } from './queue.js';
-	let { currentFavorite, snapshot }: { currentFavorite: ReturnType<typeof createCurrentTrackFavorite>; snapshot: QueueState } = $props();
+	let { currentFavorite, snapshot, statusOnly = false }: {
+		currentFavorite: ReturnType<typeof createCurrentTrackFavorite>; snapshot: QueueState; statusOnly?: boolean;
+	} = $props();
 	const target = $derived(currentFavorite.view(snapshot));
 	const feedback = $derived(currentFavorite.feedback(target));
-	$effect(() => currentFavorite.reconcileFeedback(target));
+	$effect(() => { if (statusOnly) currentFavorite.reconcileFeedback(target); });
 	const activateRendered: Action<HTMLButtonElement, NonNullable<typeof target>> = (button, rendered) => {
 		const listeners = new AbortController(), capture = { capture: true, signal: listeners.signal };
 		const hits = (event: Event) => event.composedPath().includes(button);
@@ -66,13 +68,14 @@
 		return { update(next) { rendered = next; }, destroy() { clearSpace(); listeners.abort(); } };
 	};
 </script>
-{#if target && !target.loading}
+{#if statusOnly}
+	<p aria-live="polite" aria-atomic="true" data-testid="player-favorite-status">{#if feedback}{#key feedback.edit}{feedback.text}{/key}{/if}</p>
+{:else if target && !target.loading}
 	<button type="button" class="nt-button nt-button--ghost" data-testid="player-favorite"
 		aria-label={`Favorite ${target.title}`} aria-pressed={target.pressed} use:activateRendered={target}>
 		<span aria-hidden="true">{target.pressed ? '★' : '☆'}</span> Favorite
 	</button>
 {/if}
-<p aria-live="polite" aria-atomic="true" data-testid="player-favorite-status">{#if feedback}{#key feedback.edit}{feedback.text}{/key}{/if}</p>
 <style>
 	button { min-height: 2.75rem; }
 	p { margin: 0; overflow-wrap: anywhere; }
