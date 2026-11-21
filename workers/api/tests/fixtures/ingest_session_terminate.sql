@@ -23,15 +23,28 @@ BEGIN
         RAISE EXCEPTION 'out-of-scope, early expiry or unsupported action changed a session';
     END IF;
 
+    IF EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+        WHERE session_id IN (active_id, expired_id) AND kind='terminal_reconcile') THEN
+        RAISE EXCEPTION 'refused terminal action recorded cleanup work';
+    END IF;
+
     BEGIN
         IF (SELECT pg_temp.terminate_session(f.environment_id, f.library_id, owner, active_id, 'abort'))
             IS DISTINCT FROM 'aborted' THEN
             RAISE EXCEPTION 'owned abort did not set the terminal fence';
         END IF;
+        IF NOT EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+            WHERE session_id=active_id AND kind='terminal_reconcile') THEN
+            RAISE EXCEPTION 'transaction did not see its own cleanup intent';
+        END IF;
         RAISE SQLSTATE 'Z0001';
     EXCEPTION WHEN SQLSTATE 'Z0001' THEN
         NULL;
     END;
+    IF EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+        WHERE session_id=active_id AND kind='terminal_reconcile') THEN
+        RAISE EXCEPTION 'rolled-back abort left cleanup work';
+    END IF;
     IF (SELECT pg_temp.terminate_session(f.environment_id, f.library_id, owner, active_id, 'abort'))
         IS DISTINCT FROM 'aborted' THEN
         RAISE EXCEPTION 'rolled-back abort left a terminal fence';
@@ -52,4 +65,11 @@ BEGIN
        EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, owner, expired_id, 'abort')) THEN
         RAISE EXCEPTION 'idle expiry did not win or a late abort rewrote it';
     END IF;
+    IF (SELECT count(*) FROM public.ingest_session_cleanup_intents AS intent
+        JOIN public.ingest_session_reservations AS session ON session.id=intent.session_id
+        WHERE session.id IN (active_id, expired_id) AND intent.kind='terminal_reconcile'
+          AND intent.due_at=session.terminal_at) <> 2 THEN
+        RAISE EXCEPTION 'abort and expiry did not each preserve one immediate reconciliation intent';
+    END IF;
 END $$;
+\echo ingest session cleanup intent assertions passed
