@@ -143,23 +143,23 @@ mod tests {
                 let blob = play
                     .blob(legacy, async |key| Some(objects.get(key)?.len() as u64))
                     .await?;
+                let size = blob.size;
                 blob.read(async |key| Some(objects.get(key.as_str())?.to_vec()))
                     .await
-                    .map(|bytes| (play.content_type(), bytes))
+                    .map(|bytes| (play.content_type(), size, bytes))
             }
             .now_or_never()
             .unwrap()
         };
-
         let legacy = grant::issue_v2("user-1", "track-9", "play-7", 42, 200, SECRET);
         assert_eq!(
             fetch(&objects, &legacy).unwrap(),
-            ("audio/flac", b"legacy".to_vec())
+            ("audio/flac", 6, b"legacy".to_vec())
         );
         pointer_reads.set(0);
         assert_eq!(
             fetch(&objects, TOKEN).unwrap(),
-            ("audio/ogg", b"rendition".to_vec())
+            ("audio/ogg", 9, b"rendition".to_vec())
         );
         objects.remove(rendition_key.as_str()).unwrap();
         let error = fetch(&objects, TOKEN).unwrap_err();
