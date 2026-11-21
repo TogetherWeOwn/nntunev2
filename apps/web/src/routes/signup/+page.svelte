@@ -53,8 +53,9 @@
 		} catch {
 			return;
 		}
+		// The invite is used only at registration finish, not when sending the email code.
 		if (!attempt.signal.aborted && window.location.href === url.href &&
-			status === 'idle' && codes.length === 1 && isMemberInviteCode(codes[0])) {
+			!finishLocked && codes.length === 1 && isMemberInviteCode(codes[0])) {
 			inviteCode = codes[0];
 		}
 	}

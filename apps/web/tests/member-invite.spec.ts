@@ -88,6 +88,59 @@ test('allows manual copy when the clipboard is blocked and clears the reveal on 
 	await expect(field).toHaveCount(0);
 });
 
+test('prefills an invite opened in the signup tab during email verification', async ({ page }) => {
+	await page.route('**/v1/auth/passkey/register/start', (route) =>
+		route.fulfill({ json: { challenge: 'Zmlyc3Q=', user_id: 'dXNlcg', rp_id: 'localhost' } })
+	);
+	await page.goto('/signup');
+	await page.getByRole('textbox', { name: 'Email', exact: true }).fill('friend@example.test');
+	await page.getByRole('button', { name: 'Create account with passkey' }).click();
+	const emailCode = page.getByRole('textbox', { name: 'Email code', exact: true });
+	await emailCode.fill('123456');
+	await page.evaluate((code) => { location.hash = `invite=${code}`; }, code);
+	await expect(page.getByRole('textbox', { name: 'Invite code', exact: false })).toHaveValue(code);
+	await expect(emailCode).toHaveValue('123456');
+	await expect(page).toHaveURL(/\/signup$/);
+	expect(await page.evaluate(() => JSON.stringify(history.state))).not.toContain(code);
+});
+
+test('an auth transition clears an invite and ignores a held successful response', async ({ page }) => {
+	await page.route('**/v1/me/invites', (route) => route.fulfill({ status: 201, json: issued }));
+	await page.goto('/account/invites');
+	const create = page.getByRole('button', { name: 'Create invite' });
+	const field = page.getByRole('textbox', { name: 'Signup link' });
+	const authTransition = () => page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', {
+		key: 'nntune.library.auth-transition.v1', newValue: 'synthetic-session-change', storageArea: localStorage
+	})));
+	await create.click();
+	await expect(field).toBeVisible();
+	await authTransition();
+	await expect(field).toHaveCount(0);
+
+	await page.evaluate((result) => {
+		const fetch = window.fetch;
+		// This transport deliberately ignores abort and delivers the 201 after the transition.
+		window.fetch = (input, init) => String(input).endsWith('/v1/me/invites')
+			? new Promise((resolve) => window.addEventListener('release-invite-fixture', () => {
+				document.documentElement.dataset.inviteFixture = 'released';
+				resolve(new Response(JSON.stringify(result), { status: 201 }));
+			}, { once: true }))
+			: fetch(input, init);
+	}, issued);
+	await create.click();
+	await expect(page.getByRole('button', { name: 'Creating invite…' })).toBeDisabled();
+	await authTransition();
+	await expect(create).toBeEnabled();
+	await page.evaluate(() => {
+		window.dispatchEvent(new Event('release-invite-fixture'));
+		return new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+	});
+	await expect(page.locator('html')).toHaveAttribute('data-invite-fixture', 'released');
+	await expect(page).toHaveURL(/\/account\/invites$/);
+	await expect(field).toHaveCount(0);
+	await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
 for (const [status, detail] of [
 	[401, 'Sign in to create an invite.'],
 	[403, 'You need an active membership'],
