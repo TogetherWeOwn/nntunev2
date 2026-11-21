@@ -34,23 +34,20 @@
 	// Library's pre-effect disposes route state before player teardown.
 	onMount(() => {
 		media.restoreRepeat(browserStorage('local'));
-		const tickOnVisible = () => { if (document.visibilityState === 'visible') sleepTimer.tick(); };
-		document.addEventListener('visibilitychange', tickOnVisible);
-		return () => {
-			document.removeEventListener('visibilitychange', tickOnVisible);
-			clearMiniPlayerHint();
-			player.destroy();
-		};
+		return () => { clearMiniPlayerHint(); player.destroy(); };
 	});
 </script>
+<svelte:document onvisibilitychange={() => { if (document.visibilityState === 'visible') sleepTimer.tick(); }} />
 {@render children()}
 {#if streamUrl}
 	<div class="nt-wrap">
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
-		<section aria-label="Sleep timer">
-			<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
-		</section>
 	</div>
+{/if}
+{#if streamUrl}
+	<section class="nt-wrap" aria-label="Sleep timer">
+		<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
+	</section>
 {/if}

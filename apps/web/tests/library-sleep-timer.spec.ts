@@ -1,7 +1,8 @@
 import { expect, test } from '@playwright/test';
 
 test('a duration armed in Library pauses the same native player on Home', async ({ page }) => {
-	await page.clock.install();
+	await page.clock.install({ time: '2026-01-01T00:00:00Z' });
+	await page.clock.pauseAt('2026-01-01T00:01:00Z');
 	await page.route('**/api/library', (route) => route.fulfill({ json: [
 		{ id: 'coral', title: 'Coral', streamUrl: '/api/demo/audio?track=coral' }
 	] }));
@@ -12,21 +13,36 @@ test('a duration armed in Library pauses the same native player on Home', async 
 	const native = player.locator('audio[controls][data-testid="audio-player"]');
 	await expect(native).toBeVisible();
 	const audio = (await native.elementHandle())!;
+	await audio.evaluate((node: HTMLAudioElement) => {
+		node.loop = true; // Keep the short fixture from ending on slow runners.
+		const pause = node.pause.bind(node);
+		node.pause = () => { node.dataset.pauses = String(Number(node.dataset.pauses ?? 0) + 1); pause(); };
+	});
+	const identity = player.getByTestId('library-now-playing');
+	await expect(identity).toHaveText('Coral');
 	await player.getByRole('button', { name: 'Play', exact: true }).press('Enter');
 	await expect(status).toHaveText('Playing');
 	const minutes = timer.getByRole('spinbutton', { name: 'Sleep timer (minutes)' });
+	const arm = timer.getByRole('button', { name: 'Sleep after duration' });
+	const timerStatus = timer.getByTestId('sleep-timer-status');
 	await minutes.fill('1');
-	await timer.getByRole('button', { name: 'Sleep after duration' }).press('Enter');
-	await expect(timer.getByTestId('sleep-timer-status')).toHaveText('Sleep in 1 minute');
+	await arm.press('Enter');
+	await page.clock.fastForward(30_000);
 	await minutes.fill('0');
-	await timer.getByRole('button', { name: 'Sleep after duration' }).press('Enter');
+	await arm.press('Enter');
 	await expect(minutes).toHaveAttribute('aria-invalid', 'true');
-	await expect(timer.getByRole('button', { name: 'Cancel sleep timer' })).toBeEnabled();
-	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).click();
+	await expect(minutes).toHaveAccessibleDescription(/positive finite number/);
+	await expect(timer.getByRole('alert')).toBeVisible();
+	await expect(timerStatus).toHaveText('Sleep in 1 minute');
+	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).press('Enter');
 	await expect(page).toHaveURL(/\/home$/);
-	await page.clock.fastForward(61_000);
-	await expect(timer.getByTestId('sleep-timer-status')).toHaveText('Sleep timer fired — playback paused');
+	await page.clock.fastForward(29_500);
+	await expect(timer.getByTestId('sleep-timer-remaining')).toHaveText('0:01');
+	expect(await audio.evaluate((node: HTMLAudioElement) => [node.paused, node.dataset.pauses ?? '0'])).toEqual([false, '0']);
+	await page.clock.fastForward(500);
+	await expect(timerStatus).toHaveText('Sleep timer fired — playback paused');
 	await expect(status).toHaveText('Paused');
+	await expect(identity).toHaveText('Coral');
 	await expect(page.getByTestId('audio-player')).toHaveCount(1);
-	expect(await audio.evaluate((node: HTMLAudioElement) => node.isConnected && node.controls && node.paused)).toBe(true);
+	expect(await audio.evaluate((node: HTMLAudioElement) => [node.isConnected, node.controls, node.paused, node.dataset.pauses])).toEqual([true, true, true, '1']);
 });

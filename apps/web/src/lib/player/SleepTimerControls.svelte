@@ -9,63 +9,44 @@
 		cancel: () => void;
 	} = $props();
 	const id = $props.id();
-	let minutesEl: HTMLInputElement;
-	let tracksEl: HTMLInputElement;
-	let minutesError = $state('');
-	let tracksError = $state('');
-
-	function clearErrors(): void {
-		minutesError = tracksError = '';
-	}
+	type Field = 'minutes' | 'tracks';
+	const errors = $state({ minutes: '', tracks: '' });
+	function clearErrors(): void { errors.minutes = errors.tracks = ''; }
 	function arm(mode: SleepTimerMode, message: string): void {
 		clearErrors();
 		start(mode, message);
 	}
-	function armDuration(): void {
-		const raw = minutesEl.value.trim();
-		const ms = Number(raw) * 60_000;
-		if (!Number.isFinite(ms) || ms <= 0) {
-			minutesError = 'Enter a positive finite number of minutes.';
-			return;
-		}
-		arm({ kind: 'duration', ms }, `Sleep in ${raw} minute${Number(raw) === 1 ? '' : 's'}`);
-	}
-	function armStopAfter(): void {
-		const count = Number(tracksEl.value);
-		if (!Number.isInteger(count) || count < 1) {
-			tracksError = 'Enter a whole positive integer count of tracks.';
-			return;
-		}
-		arm({ kind: 'stop-after-tracks', count }, `Sleep after ${count} track${count === 1 ? '' : 's'}`);
+	function submit(field: Field, raw: string): void {
+		const count = Number(raw);
+		const plural = count === 1 ? '' : 's';
+		if (field === 'minutes') {
+			const ms = count * 60_000;
+			if (!Number.isFinite(ms) || ms <= 0) errors.minutes = 'Enter a positive finite number of minutes.';
+			else arm({ kind: 'duration', ms }, `Sleep in ${raw} minute${plural}`);
+		} else if (!Number.isInteger(count) || count < 1) errors.tracks = 'Enter a whole positive integer count of tracks.';
+		else arm({ kind: 'stop-after-tracks', count }, `Sleep after ${count} track${plural}`);
 	}
 </script>
 
-<div class="sleep-row">
-	<label for={`${id}-minutes`}>Sleep timer (minutes)</label>
-	<input id={`${id}-minutes`} type="number" min="1" value="15" data-testid="sleep-timer-minutes"
-		bind:this={minutesEl} aria-invalid={minutesError ? 'true' : undefined}
-		aria-describedby={minutesError ? `${id}-minutes-error` : undefined}
-		aria-errormessage={minutesError ? `${id}-minutes-error` : undefined} />
-	<button class="nt-button nt-button--ghost" type="button" data-testid="sleep-timer-set-duration" onclick={armDuration}>
-		Sleep after duration
-	</button>
-	{#if minutesError}<p id={`${id}-minutes-error`} class="sleep-error" role="alert">{minutesError}</p>{/if}
-</div>
+{#snippet entry(field: Field, label: string, value: number, action: string, button: string)}
+	{@const errorId = errors[field] ? `${id}-${field}-error` : undefined}
+	<form class="sleep-row" novalidate onsubmit={(event) => {
+		event.preventDefault();
+		submit(field, String(new FormData(event.currentTarget).get(field) ?? '').trim());
+	}}>
+		<label for={`${id}-${field}`}>{label}</label>
+		<input id={`${id}-${field}`} name={field} type="number" min="1" {value} data-testid={`sleep-timer-${field}`}
+			aria-invalid={errorId ? 'true' : undefined} aria-describedby={errorId} aria-errormessage={errorId} />
+		<button class="nt-button nt-button--ghost" type="submit" data-testid={`sleep-timer-set-${action}`}>{button}</button>
+		{#if errorId}<p id={errorId} class="sleep-error" role="alert">{errors[field]}</p>{/if}
+	</form>
+{/snippet}
+{@render entry('minutes', 'Sleep timer (minutes)', 15, 'duration', 'Sleep after duration')}
 <button class="nt-button nt-button--ghost" type="button" data-testid="sleep-timer-set-end-of-track"
 	onclick={() => arm({ kind: 'end-of-track' }, 'Sleep at end of track')}>
 	Sleep at end of track
 </button>
-<div class="sleep-row">
-	<label for={`${id}-tracks`}>Stop after tracks</label>
-	<input id={`${id}-tracks`} type="number" min="1" step="1" value="2" data-testid="sleep-timer-tracks"
-		bind:this={tracksEl} aria-invalid={tracksError ? 'true' : undefined}
-		aria-describedby={tracksError ? `${id}-tracks-error` : undefined}
-		aria-errormessage={tracksError ? `${id}-tracks-error` : undefined} />
-	<button class="nt-button nt-button--ghost" type="button" data-testid="sleep-timer-set-stop-after" onclick={armStopAfter}>
-		Sleep after N tracks
-	</button>
-	{#if tracksError}<p id={`${id}-tracks-error`} class="sleep-error" role="alert">{tracksError}</p>{/if}
-</div>
+{@render entry('tracks', 'Stop after tracks', 2, 'stop-after', 'Sleep after N tracks')}
 <button class="nt-button nt-button--ghost" type="button" data-testid="sleep-timer-cancel"
 	disabled={!armed} onclick={() => { clearErrors(); cancel(); }}>
 	Cancel sleep timer

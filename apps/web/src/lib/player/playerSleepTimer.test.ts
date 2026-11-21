@@ -55,24 +55,23 @@ test('duration expiry pauses the current owner once without changing selection',
 	expect(vi.getTimerCount()).toBe(0);
 });
 
-test('cancel and rearm replace the deadline; duration runs while paused', async () => {
-	const { audio, sleepTimer, state, playCurrent, pauseCurrent } = setup();
+test('rearming replaces the deadline; manual pause preserves the countdown until canceled', async () => {
+	const { player, audio, sleepTimer, state, playCurrent, pauseCurrent } = setup();
+	await playCurrent();
 	sleepTimer.start(duration(500), 'old');
-	sleepTimer.start(duration(1000), 'new');
+	sleepTimer.start(duration(3000), 'new');
 	expect(vi.getTimerCount()).toBe(1);
-	vi.advanceTimersByTime(500);
-	expect(state()).toMatchObject({ armed: true, announcement: 'new' });
-	sleepTimer.cancel();
-	await playCurrent();
-	vi.advanceTimersByTime(1000);
-	expect(audio.paused).toBe(false);
+	expect(state().remaining).toBe('0:03');
 	pauseCurrent();
-	sleepTimer.start(duration(500), 'paused');
-	vi.advanceTimersByTime(500);
-	expect(state().announcement).toMatch(/fired/);
-	expect(audio.pause).toHaveBeenCalledOnce();
+	vi.advanceTimersByTime(1000);
+	expect(state()).toEqual({ armed: true, remaining: '0:02', announcement: 'new' });
+	expect(player.queue.snapshot).toBe(queue);
+	sleepTimer.cancel();
+	expect(state()).toEqual({ armed: false, remaining: '', announcement: 'Sleep timer off' });
+	expect(player.queue.snapshot).toBe(queue);
 	await playCurrent();
-	expect(audio.paused).toBe(false);
+	vi.advanceTimersByTime(3000);
+	expect(audio.pause).toHaveBeenCalledOnce();
 });
 
 test('a paused or retired decoder cannot consume a track end; a playable replacement inherits the timer', async () => {
@@ -108,6 +107,19 @@ test('stop after two counts natural advance once and stops before the next queue
 	expect(state().announcement).toMatch(/fired/);
 	expect(player.queue.snapshot.currentIndex).toBe(1);
 	expect(flush).toHaveBeenCalledOnce();
+});
+
+test('a duplicate end on the current decoder does not count while repeat-one replay waits', async () => {
+	const { player, audio, state, playCurrent, sleepTimer, flush } = setup();
+	flush.mockReturnValueOnce(Promise.withResolvers<void>().promise);
+	player.media.setRepeat('one', null);
+	await playCurrent();
+	sleepTimer.start({ kind: 'stop-after-tracks', count: 2 }, 'Sleep after 2 tracks');
+	audio.end();
+	expect(flush).toHaveBeenCalledOnce();
+	expect(player.media.audio).toBe(audio);
+	audio.end();
+	expect(state()).toMatchObject({ armed: true, remaining: '1 track remaining' });
 });
 
 test('expiry during natural advance revokes autoplay before the replacement attaches', async () => {
