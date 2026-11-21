@@ -543,6 +543,53 @@ test('abandoned logout success resets the same-window replacement library and fe
 	expect.soft(observed.navigations, 'no late navigation').toEqual([]);
 });
 
+for (const { path, signIn } of [
+	{ path: '/home', signIn: 'Sign in to see your library.' },
+	{ path: '/library/liked', signIn: 'Sign in to see your liked tracks.' },
+	{ path: '/search?q=Juniper', signIn: 'Sign in to search your library.' }
+]) {
+	for (const delivery of ['same-document', 'storage']) {
+		test(`${delivery} auth transition clears visible rows on ${path}`, async ({ page }) => {
+			await fixtures(page, ['/v1/session/logout']);
+			await page.route('**/api/library', (route) =>
+				route.fulfill({ json: [{ id: 'fixture-juniper', title: 'Juniper Track' }] })
+			);
+			let endpoint: string | null = null;
+			if (delivery === 'same-document') {
+				endpoint = await beginSecurity(page, 'logout');
+			} else {
+				await page.goto('/account/security');
+				await seedState(page);
+			}
+			await page.evaluate((contextKey) => {
+				const scope = sessionStorage.getItem(contextKey);
+				localStorage.setItem(`nntune.library.favorites.v1.${scope}`, '["fixture-juniper"]');
+				localStorage.setItem(`nntune.library.recent-finds.v1.${scope}`, '["Fixture search"]');
+			}, AUTH_CONTEXT);
+			await clientNavigate(page, path, endpoint !== null);
+
+			const main = page.getByRole('main');
+			const row = main.getByRole('listitem').filter({ hasText: 'Juniper Track' });
+			const recent = main.getByRole('link', { name: 'Fixture search', exact: true });
+			await expect(row).toBeVisible();
+			if (path === '/home') await expect(recent).toBeVisible();
+
+			if (endpoint !== null) {
+				await release(page, endpoint, 200, { ok: true });
+			} else {
+				await page.evaluate((key) => {
+					window.dispatchEvent(new StorageEvent('storage', { key, storageArea: localStorage }));
+				}, TRANSITION);
+			}
+
+			await expect(main.getByText(signIn, { exact: false })).toBeVisible();
+			await expect(row).toHaveCount(0);
+			await expect(recent).toHaveCount(0);
+			await expect(page).toHaveURL((url) => url.pathname + url.search === path);
+		});
+	}
+}
+
 test('abandoned revoke-all success resets the same-window replacement library and fences its late response', async ({
 	page
 }) => {

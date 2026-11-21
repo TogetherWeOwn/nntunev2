@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import {
 		browserStorage,
 		invalidateLibraryCache,
@@ -11,6 +12,7 @@
 		selectFavoriteItems
 	} from '#lib/library/favorites.js';
 	import { restoreFavoriteId } from '#lib/library/favorites-order.js';
+	import { mountLibraryRefresher } from '#lib/library/mount-refresher.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import { pushToast } from '#lib/shell/toasts.js';
@@ -36,10 +38,7 @@
 		}
 	});
 
-	$effect(() => {
-		void refresher.refresh();
-		return () => refresher.dispose();
-	});
+	onMount(() => mountLibraryRefresher(refresher));
 
 	const session = browserStorage('session');
 	const local = browserStorage('local');
