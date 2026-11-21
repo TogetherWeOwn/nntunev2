@@ -467,7 +467,10 @@ pub(crate) fn cors_headers(
         ));
         headers.push((
             "access-control-allow-headers",
-            "content-type, authorization".to_string(),
+            format!(
+                "content-type, authorization, {}",
+                handlers::SESSION_BINDING_HEADER
+            ),
         ));
         headers.push(("access-control-max-age", "86400".to_string()));
     }
@@ -7944,11 +7947,21 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     let served_path = served_display_path(&request.path);
     // Preserve the header marker independently of any truncated upload bytes.
     let refresh_content_type = headers_map.get("content-type").cloned();
+    let expected_session_binding = headers_map
+        .get(handlers::SESSION_BINDING_HEADER)
+        .map(String::as_str);
     let response = dispatch_collected(collected, request, |collected_request| async move {
         handle_with_refresh_transport_guard(
             collected_request,
             refresh_content_type.as_deref(),
-            |guarded_request| async move { handlers::handle(&ctx, &guarded_request).await },
+            |guarded_request| async move {
+                handlers::handle_with_session_binding(
+                    &ctx,
+                    &guarded_request,
+                    expected_session_binding,
+                )
+                .await
+            },
         )
         .await
     })
@@ -9604,7 +9617,7 @@ mod tests {
         )));
         assert!(headers.contains(&(
             "access-control-allow-headers",
-            "content-type, authorization".to_string()
+            "content-type, authorization, x-nntune-session-binding".to_string()
         )));
         assert!(headers.contains(&("access-control-max-age", "86400".to_string())));
         // Non-preflight statuses never carry the preflight grants.

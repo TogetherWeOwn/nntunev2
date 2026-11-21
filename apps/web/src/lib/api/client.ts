@@ -345,16 +345,16 @@ export class ApiClient {
 		});
 	}
 
-	async put<T>(path: string, body: unknown): Promise<T> {
+	async put<T>(path: string, body: unknown, headers?: Record<string, string>): Promise<T> {
 		return this.request<T>(path, {
 			method: 'PUT',
-			headers: { 'content-type': 'application/json' },
+			headers: { ...headers, 'content-type': 'application/json' },
 			body: JSON.stringify(body)
 		});
 	}
 
-	async delete<T>(path: string): Promise<T> {
-		return this.request<T>(path, { method: 'DELETE' });
+	async delete<T>(path: string, headers?: Record<string, string>): Promise<T> {
+		return this.request<T>(path, { method: 'DELETE', headers });
 	}
 
 	/**
