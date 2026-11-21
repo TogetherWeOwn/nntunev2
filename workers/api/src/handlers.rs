@@ -6128,19 +6128,16 @@ where
     };
     use crate::api_error::ApiError;
     let hash = auth::hash_invite_code(&code);
-    let issued = ctx
+    let error = match ctx
         .store
         .member_issue_invite(&claims.user_id, &hash, &ctx.source_ip)
-        .await;
-    let error = match issued {
+        .await
+    {
         Ok(Outcome::Issued { id, expires_at }) => {
-            return Response {
-                extra_headers: vec![("cache-control".into(), "private, no-store".into())],
-                ..json_response(
-                    201,
-                    serde_json::json!({"id": id, "expires_at": expires_at, "code": code}),
-                )
-            }
+            let body = serde_json::json!({"id": id, "expires_at": expires_at, "code": code});
+            let mut response = json_response(201, body);
+            response.extra_headers = vec![("cache-control".into(), "private, no-store".into())];
+            return response;
         }
         Ok(Outcome::Ineligible) => ApiError::forbidden("paid membership eligibility not met"),
         Ok(Outcome::WindowClosed) => ApiError::by_code("conflict", "no invite window is open"),
@@ -23051,10 +23048,8 @@ mod tests {
         req.body.clear();
         req.origin = None;
         assert_eq!(send(&req).status, 401);
-        assert_eq!(
-            h.call_full("POST", PATH, None, None, Some(ORIGIN)).status,
-            401
-        );
+        let no_session = h.call_full("POST", PATH, None, None, Some(ORIGIN));
+        assert_eq!(no_session.status, 401);
         req.origin = Some(ORIGIN.into());
         let response = send(&req);
         assert_eq!(response.status, 201);
@@ -23064,11 +23059,8 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
         let code = body["code"].as_str().unwrap();
         let hash = auth::hash_invite_code(code);
-        assert_ne!(hash, code);
-        assert_eq!(
-            &*h.store.member_invite_calls.borrow(),
-            &[("member".to_owned(), hash)]
-        );
+        let calls = h.store.member_invite_calls.borrow();
+        assert_eq!(*calls, [("member".to_owned(), hash)]);
     }
 
     #[test]

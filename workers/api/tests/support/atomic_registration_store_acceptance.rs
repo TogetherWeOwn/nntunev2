@@ -2468,7 +2468,7 @@ fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() 
         // 60 distinct paid days despite overlapping spans and a free term.
         let history = "INSERT INTO paid_invoice_history
             (stripe_invoice_id, user_id, stripe_subscription_id, plan_id, period_start, period_end, amount_cents, currency, paid_at)
-            SELECT u || s::text, u, u || '-old', 'plus', to_timestamp(s * 86400), to_timestamp(e * 86400), cents, to_timestamp(0)";
+            SELECT u || s::text, u, u || '-old', 'plus', to_timestamp(s * 86400), to_timestamp(e * 86400), cents, 'usd', to_timestamp(0)";
         let partial = format!(
             "{history} FROM (VALUES ($1::text,1,31,800),($1,15,45,800),
             ($1,16,46,800),($1,46,61,800),($1,61,91,0)) AS terms(u,s,e,cents)"
@@ -2526,27 +2526,33 @@ fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() 
             &[&window]).await.unwrap().get(0);
         let outcome = issue(&mut db, &issuer, unused_hash, ip).await.unwrap();
         assert!(matches!(outcome, Outcome::Issued { .. }));
-        // Delay the audit write through the scheduled end. The sequence is
-        // not rolled back, proving issuance reached the trigger.
-        let delay_trigger = "CREATE SEQUENCE member_issue_delay_seen;
+        // The sequence survives rollback and proves each attempt reached the audit write.
+        db.batch_execute("CREATE SEQUENCE member_issue_delay_seen;
             CREATE FUNCTION member_issue_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
                 PERFORM nextval('member_issue_delay_seen');
-                PERFORM pg_sleep_until(to_timestamp((SELECT ends_at FROM invite_windows
-                    WHERE id = (NEW.details->>'window_id')::bigint)));
+                PERFORM pg_sleep_until(LEAST((SELECT to_timestamp(ends_at) FROM invite_windows
+                    WHERE id = (NEW.details->>'window_id')::bigint), (SELECT paid_through_at FROM subscriptions WHERE user_id = NEW.user_id)));
                 RETURN NEW;
             END $$;
             CREATE TRIGGER member_issue_delay BEFORE INSERT ON audit_log FOR EACH ROW
-                WHEN (NEW.action = 'invite.issued') EXECUTE FUNCTION member_issue_delay();";
-        db.batch_execute(delay_trigger).await.unwrap();
-        db.execute("UPDATE invite_windows SET ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint + 4 WHERE id = $1", &[&next]).await.unwrap();
-        let outcome = issue(&mut other, &peer, &code(5), ip).await.unwrap();
-        assert_eq!(outcome, Outcome::WindowClosed);
-        let rolled_back: bool = db.query_one("SELECT is_called
-             AND NOT EXISTS (SELECT 1 FROM invite_codes WHERE issued_by = $1 AND window_id = $2)
-             AND NOT EXISTS (SELECT 1 FROM audit_log WHERE user_id = $1 AND action = 'invite.issued'
-                             AND details->>'window_id' = $2::bigint::text) FROM member_issue_delay_seen",
-             &[&peer, &next]).await.unwrap().get(0);
-        assert!(rolled_back, "delayed issuance and audit must roll back");
+                WHEN (NEW.action = 'invite.issued') EXECUTE FUNCTION member_issue_delay();").await.unwrap();
+        for (writes, window_secs, paid_secs, expected) in [
+            (1_i64, 4_i64, 600_i64, Outcome::WindowClosed),
+            (2, 600, 4, Outcome::Ineligible),
+        ] {
+            db.execute("WITH boundary AS (SELECT floor(extract(epoch FROM statement_timestamp()))::bigint AS t),
+                changed AS (UPDATE invite_windows SET ends_at = t + $3 FROM boundary WHERE id = $2)
+                UPDATE subscriptions SET cancel_at_period_end = true, paid_through_at = to_timestamp(t + $4)
+                FROM boundary WHERE user_id = $1", &[&peer, &next, &window_secs, &paid_secs]).await.unwrap();
+            let outcome = issue(&mut other, &peer, &code(5), ip).await.unwrap();
+            assert_eq!(outcome, expected);
+            let rolled_back: bool = db.query_one("SELECT is_called AND last_value = $3
+                 AND NOT EXISTS (SELECT 1 FROM invite_codes WHERE issued_by = $1 AND window_id = $2)
+                 AND NOT EXISTS (SELECT 1 FROM audit_log WHERE user_id = $1 AND action = 'invite.issued'
+                                 AND details->>'window_id' = $2::bigint::text) FROM member_issue_delay_seen",
+                 &[&peer, &next, &writes]).await.unwrap().get(0);
+            assert!(rolled_back, "rollback missing: {expected:?}");
+        }
         db.batch_execute("DROP TRIGGER member_issue_delay ON audit_log; DROP FUNCTION member_issue_delay(); DROP SEQUENCE member_issue_delay_seen;").await.unwrap();
         remove_member_window_fixture(&db, next).await;
         remove_member_window_fixture(&db, window).await;

@@ -6256,10 +6256,14 @@ impl Store for PgStore {
         code_hash: &str,
         source_ip: &str,
     ) -> Result<MemberInviteIssueOutcome, StoreError> {
-        let issue = async {
-            member_issue_invite_on(&mut self.connect().await?, issuer, code_hash, source_ip).await
-        };
-        Self::bounded(issue, TOTAL_TIMEOUT_MS).await
+        Self::bounded(
+            async {
+                member_issue_invite_on(&mut self.connect().await?, issuer, code_hash, source_ip)
+                    .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn admin_list_invites(
