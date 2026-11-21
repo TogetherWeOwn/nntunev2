@@ -32,8 +32,13 @@ test('app shortcuts act once on the live native audio across routes and stop at 
 	await expect(page).toHaveURL(/\/home$/);
 	await home.focus();
 	await expect(home).toBeFocused();
-	const restartStatus = page.getByTestId('library-restart-status');
 	for (const key of ['0', '?', 'k', 'j', 'l']) expect(await keyPasses(page, key)).toBe(true);
+	await home.evaluate((link) => link.addEventListener('keydown', () => {
+		document.querySelector<HTMLButtonElement>('[data-testid="shortcuts-button"]')!.focus();
+	}, { once: true }));
+	expect(await keyPasses(page, '0')).toBe(true);
+	await expect(help(page)).toBeFocused();
+	const restartStatus = page.getByTestId('library-restart-status');
 	expect(await time(page)).toBeCloseTo(pausedAt);
 	await expect(restartStatus).toBeEmpty();
 	const restart = page.getByTestId('library-restart');
@@ -104,21 +109,12 @@ test('app shortcut help lists only supported bindings, restores focus and respec
 		const send = (target: EventTarget, key: string, flags?: KeyboardEventInit) => target.dispatchEvent(
 			new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...flags })
 		);
-		const editable = document.createElement('div');
-		editable.contentEditable = 'true';
-		const child = editable.appendChild(document.createElement('span'));
-		const select = document.createElement('select');
-		const field = document.createElement('input');
-		document.body.append(editable, select, field);
 		const native = document.querySelector('audio[controls]')!;
-		const passed = [child, select, field, native].every((target) => send(target, '0')) &&
-			[' ', 'ArrowLeft', 'ArrowRight', 'Enter'].every((key) => send(native, key)) &&
+		return ['0', ' ', 'ArrowLeft', 'ArrowRight', 'Enter'].every((key) => send(native, key)) &&
 			['n', 'p', 'm', 's', 'r'].every((key) => send(document.activeElement!, key)) &&
 			['J', 'K', 'L', '0'].every((key) => send(document.activeElement!, key, { shiftKey: true })) &&
 			[{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { isComposing: true }, { repeat: true }]
 				.every((flags) => send(document.activeElement!, '0', flags));
-		for (const node of [editable, select, field]) node.remove();
-		return passed;
 	})).toBe(true);
 	expect(await time(page)).toBeCloseTo(12);
 	await play.press('Space');

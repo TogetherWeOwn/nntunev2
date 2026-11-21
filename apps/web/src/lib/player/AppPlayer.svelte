@@ -26,7 +26,10 @@
 	let shortcutHelp = $state.raw<ReturnType<typeof ShortcutHelp>>();
 	let shortcutScope = $state<HTMLDivElement>();
 	function onShortcutKeydown(event: KeyboardEvent) {
-		if (streamUrl && shortcutScope?.contains(document.activeElement)) handleAppShortcut(event, media, shortcutHelp);
+		const active = document.activeElement;
+		// Require the same player button to own focus and the keydown; native audio keeps its keys.
+		if (!streamUrl || !active?.matches('button') || !shortcutScope?.contains(active) || !event.composedPath().includes(active)) return;
+		handleAppShortcut(event, media, shortcutHelp);
 	}
 	$effect.pre(() => { if (signedOut) untrack(player.purgeAtAuthBoundary); });
 	// Retire the decoder before the mounted Library handles the same signal.

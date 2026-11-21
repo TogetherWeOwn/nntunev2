@@ -26,16 +26,15 @@
 		if (!opened) return;
 		shortcutsDialogEl?.close();
 		opened = false;
-		if (opener?.isConnected) opener.focus();
-		if (!opener || document.activeElement !== opener) button.focus();
+		const target = opener?.isConnected && !opener.matches(':disabled, [aria-disabled="true"]') ? opener : button;
+		target.focus();
+		if (document.activeElement !== target) button.focus();
 		opener = null;
 	}
 
 	// Native modality can send focus to the browser chrome at the ends of the tab order.
 	function trapShortcutsTab(event: KeyboardEvent): void {
-		if (event.key !== 'Tab') return;
-		if (event.defaultPrevented) return;
-		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		if (event.key !== 'Tab' || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
 		const root = shortcutsDialogEl;
 		if (!root) return;
 		const controls = [...root.querySelectorAll<HTMLElement>(

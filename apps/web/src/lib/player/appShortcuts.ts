@@ -27,10 +27,7 @@ export const appShortcutActions = [...Object.keys(handlers), 'close-shortcuts'] 
 
 export function handleAppShortcut(event: KeyboardEvent, media: Media, help: Help | undefined): void {
 	if (!help || help.isOpen() || event.repeat || (event.shiftKey && event.key !== '?')) return;
-	// Keep the native media widget's own keyboard handling, including shadow controls.
-	if (event.composedPath().some((node) => node instanceof Element && node.matches('audio[controls], video[controls]'))) return;
 	const action = actionForShortcutEvent(event, document);
-	if (!action) return;
-	const handler = handlers[action];
+	const handler = action ? handlers[action] : undefined;
 	if (handler && handler(media, help) !== false) event.preventDefault();
 }
