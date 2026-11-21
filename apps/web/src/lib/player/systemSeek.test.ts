@@ -1,7 +1,7 @@
 import { get } from 'svelte/store';
-import { afterEach, expect, test, vi } from 'vitest';
+import { expect, onTestFinished, test, vi } from 'vitest';
 import { createMediaController } from './mediaController.js';
-import type { MediaSessionLike, MediaSessionSeekDetails } from './mediaSession.js';
+import type { MediaSessionLike } from './mediaSession.js';
 import { createQueue } from './queue.js';
 import { createQueueController } from './queueController.js';
 
@@ -10,18 +10,22 @@ const track = { id: 'one', title: 'One', artist: '', streamUrl: '/one' };
 const other = { id: 'two', title: 'Two', artist: '', streamUrl: '/two' };
 
 class Decoder extends EventTarget {
-	isConnected = true;
 	paused = true;
 	ended = false;
 	error = null;
 	seeking = false;
-	currentTime = 20;
+	position = 20;
+	beforeRead?: () => void;
+	write = (value: number) => { this.position = value; };
+	get currentTime() { this.beforeRead?.(); return this.position; }
+	set currentTime(value: number) { this.write(value); }
 	duration = NaN;
 	ranges: [number, number][] = [];
 	get seekable() {
-		return { length: this.ranges.length, start: (i: number) => this.ranges[i]![0], end: (i: number) => this.ranges[i]![1] };
+		const { ranges } = this;
+		return { length: ranges.length, start: (i: number) => ranges[i]![0], end: (i: number) => ranges[i]![1] };
 	}
-	constructor(public source: string) { super(); }
+	constructor(public source: string, public isConnected = true) { super(); }
 	getAttribute() { return this.source; }
 	setReady(ranges: [number, number][] = [[0, 60]]) {
 		this.duration = 60;
@@ -35,7 +39,7 @@ class Decoder extends EventTarget {
 	get element() { return this as unknown as HTMLAudioElement; }
 }
 
-function setup(unsupported?: string) {
+function setup(unsupported?: string, connected = true) {
 	const handlers = new Map<string, Parameters<MediaSessionLike['setActionHandler']>[1]>();
 	const session: MediaSessionLike = {
 		metadata: null,
@@ -48,40 +52,31 @@ function setup(unsupported?: string) {
 	vi.stubGlobal('navigator', { mediaSession: session });
 	const queue = createQueueController(createQueue([track]));
 	const media = createMediaController(queue, undefined, () => true);
-	const audio = new Decoder(track.streamUrl);
+	const audio = new Decoder(track.streamUrl, connected);
 	const detach = media.attach(audio.element);
+	onTestFinished(() => { media.destroy(); vi.unstubAllGlobals(); });
 	const select = (selected: typeof track) => {
 		const next = createQueue([selected]);
 		queue.publish(next, queue.begin(next, 'replace'));
 	};
-	const fire = (action: typeof actions[number], details: object = {}) => {
-		expect(handlers.get(action)).toBeTypeOf('function');
-		handlers.get(action)!({ action, ...details } as MediaSessionSeekDetails);
-	};
+	const fire = (action: typeof actions[number], details: object = {}) => handlers.get(action)!({ action, ...details });
 	return { handlers, session, media, audio, detach, queue, select, fire };
 }
-
-afterEach(() => vi.unstubAllGlobals());
 
 test('system seeks use owner readback, clamping and feedback without starting or reloading audio', async () => {
 	const { audio, media, session, fire } = setup();
 	audio.setReady();
 	vi.mocked(session.setPositionState)!.mockClear();
-	fire('seekto', { seekTime: 12.25, fastSeek: true });
-	expect(get(media.absoluteSeek).position).toBe(12.25);
-	fire('seekforward');
-	expect(audio.currentTime).toBe(22.25);
-	fire('seekbackward', { seekOffset: 2.5 });
-	expect(audio.currentTime).toBe(19.75);
-	expect(get(media.seekFeedback).jumpStatus).toMatch(/^Back 2\.5 seconds/);
-	fire('seekforward', { seekOffset: 100 });
-	expect(audio.currentTime).toBe(60);
-	fire('seekbackward', { seekOffset: 100 });
-	expect(audio.currentTime).toBe(0);
-	fire('seekto', { seekTime: 100 });
-	expect(get(media.absoluteSeek).position).toBe(60);
-	fire('seekto', { seekTime: 0 });
-	expect(audio.currentTime).toBe(0);
+	for (const [action, details, target] of [
+		['seekto', { seekTime: 12.25, fastSeek: true }, 12.25], ['seekforward', {}, 22.25],
+		['seekbackward', { seekOffset: 2.5 }, 19.75], ['seekforward', { seekOffset: 100 }, 60],
+		['seekbackward', { seekOffset: 100 }, 0], ['seekto', { seekTime: 100 }, 60], ['seekto', { seekTime: 0 }, 0]
+	] as const) {
+		fire(action, details);
+		expect(audio.currentTime).toBe(target);
+		if (action === 'seekto') expect(get(media.absoluteSeek).position).toBe(target);
+		if (target === 19.75) expect(get(media.seekFeedback).jumpStatus).toMatch(/^Back 2\.5 seconds/);
+	}
 	expect(audio.paused).toBe(true);
 	expect(audio.play).not.toHaveBeenCalled();
 	await media.playCurrent();
@@ -89,31 +84,25 @@ test('system seeks use owner readback, clamping and feedback without starting or
 	expect(audio.currentTime).toBe(1);
 	expect(audio.paused).toBe(false);
 	expect(audio.play).toHaveBeenCalledOnce();
-	expect(audio.pause).not.toHaveBeenCalled();
-	expect(audio.load).not.toHaveBeenCalled();
-	expect(audio.fastSeek).not.toHaveBeenCalled();
-	expect(session.setPositionState).not.toHaveBeenCalled();
-	media.destroy();
+	for (const unused of [audio.pause, audio.load, audio.fastSeek, session.setPositionState]) expect(unused).not.toHaveBeenCalled();
 });
 
-test.each([['seekforward', 20.01, 'Forward'], ['seekbackward', 19.99, 'Back']] as const)(
-	'%s requires movement even when a fractional target is within readback tolerance', (action, target, word) => {
+test.each([['seekforward', 59.98, 1, 'Forward'], ['seekbackward', 0.02, -1, 'Back']] as const)(
+	'%s accepts small steps near edges but rejects drift or no-op readback', (action, edge, sign, word) => {
 		const { audio, media, fire } = setup();
 		audio.setReady();
-		let position = 20;
-		const write = vi.fn<(seconds: number) => void>();
-		Object.defineProperty(audio, 'currentTime', { get: () => position, set: write });
-
+		for (const drift of [0, 0.001]) {
+			audio.position = 20;
+			audio.write = vi.fn(() => { audio.position += sign * drift; });
+			fire(action, { seekOffset: 0.01 });
+			expect(audio.write).toHaveBeenCalledWith(20 + sign * 0.01);
+			expect(get(media.seekFeedback).jumpStatus).toBe('The player did not accept that jump.');
+		}
+		audio.position = edge;
+		audio.write = (value) => { audio.position = value; };
 		fire(action, { seekOffset: 0.01 });
-		expect(write).toHaveBeenCalledWith(target);
-		expect(audio.currentTime).toBe(20);
-		expect(get(media.seekFeedback).jumpStatus).toBe('The player did not accept that jump.');
-
-		write.mockImplementation((seconds) => { position = seconds; });
-		fire(action, { seekOffset: 0.01 });
-		expect(audio.currentTime).toBe(target);
+		expect(audio.currentTime).toBe(edge + sign * 0.01);
 		expect(get(media.seekFeedback).jumpStatus).toContain(`${word} 0.01 seconds`);
-		media.destroy();
 	}
 );
 
@@ -132,10 +121,9 @@ test('malformed details leave the native position and feedback unchanged', () =>
 	}
 	expect(get(media.seekFeedback)).toBe(feedback);
 	expect(audio.play).not.toHaveBeenCalled();
-	media.destroy();
 });
 
-test('unseekable media has no handlers and retired registrations cannot revive', () => {
+test('only positive-width ranges advertise and admit seeks', () => {
 	const { audio, media, handlers, fire } = setup();
 	for (const action of actions) expect(handlers.get(action)).toBeFalsy();
 	audio.setReady([[0, 0]]);
@@ -143,41 +131,66 @@ test('unseekable media has no handlers and retired registrations cannot revive',
 	audio.setReady([[0, 24], [40, 60]]);
 	fire('seekto', { seekTime: 30 });
 	expect(get(media.absoluteSeek).feedback).toBe('That position is not seekable yet.');
-	fire('seekforward');
+	fire('seekforward', { seekOffset: 4.02 });
 	expect(get(media.seekFeedback).jumpStatus).toBe('Cannot jump: this track cannot seek yet.');
-	const retired = handlers.get('seekto')!;
-	audio.ranges = [];
-	retired({ action: 'seekto', seekTime: 10 }); // Lost capability, before its native event.
 	expect(audio.currentTime).toBe(20);
-	audio.dispatchEvent(new Event('progress'));
-	for (const action of actions) expect(handlers.get(action)).toBeNull();
-	audio.setReady();
-	retired({ action: 'seekto', seekTime: 10 });
-	expect(audio.currentTime).toBe(20);
-	fire('seekto', { seekTime: 10 });
-	expect(audio.currentTime).toBe(10);
-	media.destroy();
+	for (const action of actions) expect(handlers.get(action)).toBeTypeOf('function');
 });
 
-test('a seek that observes lost capability retires the registration before the next native event', () => {
-	const { audio, media, handlers, fire } = setup();
-	audio.setReady();
-	const retired = actions.map((action) => handlers.get(action)!);
-	audio.ranges = [];
-	retired[0]!({ action: 'seekto', seekTime: 10 });
-	expect(audio.currentTime).toBe(20);
-	const clearedBeforeRecovery = actions.every((action) => handlers.get(action) === null);
-
-	audio.setReady(); // No native event ever published the loss.
-	for (const [i, action] of actions.entries()) {
-		retired[i]!({ action, seekTime: 10, seekOffset: 1 });
+test.each([['seekto', 0], ['seekto', 1], ['seekforward', 1]] as const)(
+	'%s retires all handlers after capability loss (%i valid range reads)', (action, validReads) => {
+		const { audio, handlers, fire } = setup();
+		audio.setReady();
+		const retired = actions.map((action) => handlers.get(action)!);
+		const ranges = audio.seekable;
+		let reads = 0;
+		const seekable = vi.spyOn(audio, 'seekable', 'get').mockImplementation(() => ({ ...ranges, length: ++reads <= validReads ? 1 : 0 }));
+		fire(action, { seekTime: 10, seekOffset: 3 });
 		expect(audio.currentTime).toBe(20);
-		expect(handlers.get(action)).not.toBe(retired[i]);
+		for (const action of actions) expect(handlers.get(action)).toBeNull();
+		seekable.mockRestore();
+		audio.setReady(); // No native event ever published the loss.
+		for (const [i, action] of actions.entries()) {
+			retired[i]!({ action, seekTime: 10, seekOffset: 1 });
+			expect(audio.currentTime).toBe(20);
+			expect(handlers.get(action)).not.toBe(retired[i]);
+		}
+		fire('seekto', { seekTime: 10 });
+		expect(audio.currentTime).toBe(10);
 	}
-	expect(clearedBeforeRecovery).toBe(true);
+);
+
+test.each(['seekto', 'seekforward'] as const)('%s respects registration and intent during reentrant seeks', (action) => {
+	const { audio, media, fire } = setup();
+	audio.setReady();
+	const compact = (target: number) => media.seek(get(media.absoluteSeek).attachment, target);
+	const system = () => fire(action, { seekTime: 10, seekOffset: 5 });
+	audio.beforeRead = () => { audio.beforeRead = undefined; compact(30); };
+	system();
+	expect(audio.currentTime).toBe(30); // Preflight cannot supersede the newer compact write.
+	const write = vi.fn((seconds: number) => {
+		if (seconds === 40) {
+			system();
+			for (const ranges of [[], undefined]) audio.setReady(ranges);
+		}
+		audio.position = seconds;
+	});
+	audio.write = write;
+	compact(40);
+	expect(write.mock.calls).toEqual([[40]]); // Recovery did not revive the queued write.
 	fire('seekto', { seekTime: 10 });
 	expect(audio.currentTime).toBe(10);
-	media.destroy();
+});
+
+test('a later queue publication binds seek on an initially disconnected attachment', () => {
+	const { audio, select, handlers, fire } = setup(undefined, false);
+	expect(handlers.get('play')).toBeUndefined();
+	audio.isConnected = true;
+	select({ ...track });
+	audio.setReady();
+	expect(handlers.get('play')).toBeTypeOf('function');
+	fire('seekto', { seekTime: 10 });
+	expect(audio.currentTime).toBe(10);
 });
 
 test('one unsupported action does not break another action or compact Play', async () => {
@@ -186,10 +199,12 @@ test('one unsupported action does not break another action or compact Play', asy
 	expect(handlers.get('seekto')).toBeUndefined();
 	fire('seekbackward');
 	expect(audio.currentTime).toBe(10);
-	handlers.get('play')!();
 	await media.playCurrent();
 	expect(audio.play).toHaveBeenCalledOnce();
-	media.destroy();
+	media.pauseCurrent();
+	expect(audio.paused).toBe(true);
+	handlers.get('play')!();
+	expect(audio.play).toHaveBeenCalledTimes(2);
 });
 
 test.each(['decoder', 'source', 'auth', 'detach'])('fences all queued callbacks across %s changes', (boundary) => {
@@ -203,9 +218,7 @@ test.each(['decoder', 'source', 'auth', 'detach'])('fences all queued callbacks 
 		select(other); // Source changes before the old audio detaches.
 		for (const action of actions) expect(handlers.get(action)).toBeNull();
 		select(track); // Round-trip must not revive old callbacks.
-	} else if (boundary === 'detach') {
-		detach();
-	}
+	} else if (boundary === 'detach') detach();
 	const current = boundary === 'source' ? audio : new Decoder(track.streamUrl);
 	if (current !== audio) {
 		media.attach(current.element);
@@ -219,5 +232,4 @@ test.each(['decoder', 'source', 'auth', 'detach'])('fences all queued callbacks 
 	}
 	fire('seekto', { seekTime: 6 });
 	expect(current.currentTime).toBe(6);
-	media.destroy();
 });

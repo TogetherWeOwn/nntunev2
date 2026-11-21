@@ -1,16 +1,17 @@
-import { derived, get, type Readable } from 'svelte/store';
+import { derived, get, type Writable } from 'svelte/store';
 import { readAbsoluteSeek, type AbsoluteSeekState } from './absoluteSeek.js';
 import { setSeekHandlers, type MediaSessionHandlers, type MediaSessionLike, type MediaSessionSeekDetails } from './mediaSession.js';
-import { RELATIVE_JUMP_SECONDS, type JumpDirection } from './relativeJump.js';
+import { RELATIVE_JUMP_SECONDS } from './relativeJump.js';
+
+export type SystemSeekGuard = { active: () => boolean; unavailable: () => void };
 
 export type SystemSeekOwner = {
 	audio: HTMLAudioElement;
 	attachment: number;
-	availability: Readable<AbsoluteSeekState>;
-	onUnavailable: () => void;
+	availability: Writable<AbsoluteSeekState>;
 	matches: () => boolean;
-	seek: (attachment: number, seconds: number) => void;
-	jump: (direction: JumpDirection, seconds: number) => void;
+	positionIntent: () => number;
+	dispatch: (action: 'seekto' | 'seekforward' | 'seekbackward', seconds: number, guard: SystemSeekGuard) => void;
 };
 
 type SeekHandlers = Pick<MediaSessionHandlers, 'onSeekTo' | 'onSeekForward' | 'onSeekBackward'>;
@@ -25,38 +26,31 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 		if (signal.aborted || enabled === !!handlers) return;
 		if (!enabled) handlers = undefined;
 		else {
-			const registration: SeekHandlers = {
-				onSeekTo(details) {
-					const seconds = details?.seekTime;
-					if (details?.action === 'seekto' && typeof seconds === 'number' &&
-						Number.isFinite(seconds) && seconds >= 0 && canDispatch()) {
-						// Use the exact seek and readback path even when fastSeek is suggested.
-						owner.seek(owner.attachment, seconds);
-					}
-				},
-				onSeekForward: relative('seekforward', 'forward'),
-				onSeekBackward: relative('seekbackward', 'back')
-			};
-			function canDispatch() {
-				// The OS can retain callbacks across both unregistration and attachment teardown.
-				const current = () => !signal.aborted && handlers === registration;
-				if (!current() || !owner.matches()) return false;
-				const enabled = readAbsoluteSeek(owner.audio).enabled;
-				if (!owner.matches() || !current()) return false;
-				if (enabled) return true;
+			// The OS can retain callbacks across unregistration and attachment teardown.
+			const active = () => !signal.aborted && handlers === registration;
+			const guard = { active, unavailable() {
+				if (!active()) return;
 				refresh(false);
-				owner.onUnavailable();
-				return false;
-			}
-			function relative(action: string, direction: JumpDirection) {
-				return (details: MediaSessionSeekDetails) => {
-					if (details?.action !== action) return;
-					const seconds = details.seekOffset === undefined ? RELATIVE_JUMP_SECONDS : details.seekOffset;
-					if (typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0 && canDispatch()) {
-						owner.jump(direction, seconds);
-					}
-				};
-			}
+				// Publish the loss so even an unchanged recovery observation can rebind.
+				if (!signal.aborted && !handlers) owner.availability.update((state) => state.enabled && state.attachment === owner.attachment
+					? { ...state, enabled: false } : state);
+			} };
+			const action = (name: Parameters<SystemSeekOwner['dispatch']>[0]) => (details: MediaSessionSeekDetails) => {
+				if (details?.action !== name || !active()) return;
+				const absolute = name === 'seekto';
+				const { seekTime, seekOffset = RELATIVE_JUMP_SECONDS } = details;
+				const seconds = absolute ? seekTime : seekOffset;
+				if (typeof seconds !== 'number' || !Number.isFinite(seconds) || (absolute ? seconds < 0 : seconds <= 0)) return;
+				const intent = owner.positionIntent();
+				if (!owner.matches() || !active() || owner.positionIntent() !== intent) return;
+				const { enabled } = readAbsoluteSeek(owner.audio);
+				if (!owner.matches() || !active() || owner.positionIntent() !== intent) return;
+				if (enabled) owner.dispatch(name, seconds, guard);
+				else guard.unavailable();
+			};
+			const registration: SeekHandlers = {
+				onSeekTo: action('seekto'), onSeekForward: action('seekforward'), onSeekBackward: action('seekbackward')
+			};
 			handlers = registration;
 		}
 		setSeekHandlers(session, handlers);

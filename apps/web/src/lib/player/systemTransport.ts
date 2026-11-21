@@ -9,8 +9,7 @@ export function bindSystemTransport(
 	queue: Readable<QueueState>,
 	readTrack: () => Track | null,
 	{ playCurrent, pauseCurrent }: { playCurrent: () => Promise<void>; pauseCurrent: () => void },
-	signal: AbortSignal,
-	seekOwner?: SystemSeekOwner
+	signal: AbortSignal, seekOwner: SystemSeekOwner
 ): void {
 	const session = getMediaSession();
 	if (!session || signal.aborted) return;
@@ -33,10 +32,11 @@ export function bindSystemTransport(
 		systemSeek?.refresh();
 		if (!track || track === published || signal.aborted) return;
 		published = track;
+		systemSeek ??= bindSystemSeek(session, seekOwner, signal);
+		if (signal.aborted) return;
 		// Match the compact identity; don't introduce OS requests for external cover art.
 		applyMediaSession({ ...track, title: displayTitle(track), artist: displayArtist(track) ?? '', artworkUrl: null },
-			{ ...handlers, ...systemSeek?.handlers }, options);
+			{ ...handlers, ...systemSeek.handlers }, options);
 	});
 	if (signal.aborted) unsubscribe();
-	else if (seekOwner && published) systemSeek = bindSystemSeek(session, seekOwner, signal);
 }

@@ -4,12 +4,17 @@ const emptyObservation = { position: 0, duration: 0, enabled: false, seeking: fa
 export const emptySeek = { ...emptyObservation, elapsed: 0, attachment: 0, feedback: '', feedbackVersion: 0 };
 export type AbsoluteSeekState = typeof emptySeek;
 
-function seekable(media: SeekMedia, duration: number, target?: number): boolean {
+export function seekable(media: Pick<SeekMedia, 'seekable'>, duration: number, target?: number, unavailable?: () => void): boolean {
 	const ranges = media.seekable;
+	let available = false;
 	for (let i = 0; i < ranges.length; i++) {
 		const start = Math.max(0, ranges.start(i)), end = Math.min(duration, ranges.end(i));
-		if (end > start && (target === undefined || (target >= start && target <= end))) return true;
+		if (end > start) {
+			available = true;
+			if (target === undefined || (target >= start && target <= end)) return true;
+		}
 	}
+	if (!available) unavailable?.();
 	return false;
 }
 
@@ -26,19 +31,24 @@ export function readAbsoluteSeek(media: SeekMedia): typeof emptyObservation {
 	}
 }
 
-export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: () => boolean): string {
+export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: () => boolean, unavailable?: () => void): string {
+	let validating = true;
 	try {
 		const { duration, currentTime, error } = media;
 		if (error || !Number.isFinite(duration) || duration <= 0 || !Number.isFinite(currentTime)) {
+			unavailable?.();
 			return 'Seeking is unavailable for this track.';
 		}
 		const target = Math.min(duration, Math.max(0, seconds));
-		if (!seekable(media, duration, target)) return 'That position is not seekable yet.';
+		if (!seekable(media, duration, target, unavailable)) return 'That position is not seekable yet.';
+		validating = false;
 		if (!matches() || target === currentTime) return '';
 		media.currentTime = target;
 		if (!matches()) return '';
 		const observed = media.currentTime;
 		if (Number.isFinite(observed) && Math.abs(observed - target) <= 0.05) return '';
-	} catch { /* A native refusal cannot count as a seek. */ }
+	} catch {
+		if (validating) unavailable?.();
+	}
 	return 'The player did not accept that seek.';
 }
