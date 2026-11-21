@@ -11,7 +11,7 @@ import type { ShareTarget } from './shareTimestamp.js';
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error';
 
-type PlayOutcome = 'playing' | 'error' | undefined;
+type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
 type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'revoke' | 'isCurrent' | 'purging'>;
 
 export type MediaSelection = {
@@ -122,7 +122,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (interrupted) invalidatePlay();
 			state = readPlayback(audio, interrupted ? matches : matchesAttempt, 'starting', interrupted ? 'paused' : 'blocked');
 		} finally {
-			if (pendingPlay === attempt) settlePlay(state === 'playing' || state === 'error' ? state : undefined);
+			if (pendingPlay === attempt) settlePlay(state === 'playing' || state === 'blocked' || state === 'error' ? state : undefined);
 		}
 	}
 
@@ -226,8 +226,13 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				if (audio?.isConnected && audio.getAttribute('src') === streamUrl && isCurrent()) {
 					if (sharedPlay) {
 						const outcome = await sharedPlay;
-						if (outcome === 'error') lead = `Selected ${title}; audio unavailable.`;
-						if (outcome === 'playing' && !audio.paused && !audio.ended) lead = `Playing ${title}.`;
+						if (!isCurrent()) return;
+						if (outcome === 'error' || audio.error) lead = `Selected ${title}; audio unavailable.`;
+						else if (!outcome) return;
+						else if (outcome === 'playing') {
+							if (audio.paused || audio.ended) return;
+							lead = `Playing ${title}.`;
+						}
 					} else {
 						const play = audio.play;
 						if (!isCurrent()) return;

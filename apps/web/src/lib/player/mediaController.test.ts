@@ -96,13 +96,14 @@ test.each(['queue', 'shared'])('%s Play reports a resource error once with queue
 	expect(status()).toBe('paused');
 });
 
-test.each(['playing', 'blocked', 'resumed'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
+test.each(['playing', 'blocked', 'paused', 'resumed'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
 	const { audio, media, announce, status } = compactTransport();
 	const pending = audio.deferPlay(), compact = media.playCurrent();
 	const queued = media.playSelected(coral, 0, coralSource);
 	await Promise.resolve();
 	expect(audio.play).toHaveBeenCalledOnce();
-	if (outcome === 'playing') pending.resolve();
+	if (outcome === 'paused') audio.pause(); // Do not dispatch the queued pause event before settlement.
+	if (outcome === 'playing' || outcome === 'paused') pending.resolve();
 	else if (outcome === 'blocked') { audio.paused = true; pending.reject(new DOMException('Blocked', 'NotAllowedError')); }
 	else {
 		audio.pause();
@@ -111,9 +112,9 @@ test.each(['playing', 'blocked', 'resumed'])('same-track queue Play shares a pen
 		pending.reject(new DOMException('Interrupted by pause', 'AbortError'));
 	}
 	await Promise.all([compact, queued]);
-	if (outcome === 'resumed') {
-		audio.emit('playing');
-		expect(status()).toBe('playing');
+	if (outcome === 'resumed' || outcome === 'paused') {
+		if (outcome === 'resumed') audio.emit('playing');
+		expect(status()).toBe(outcome === 'resumed' ? 'playing' : 'paused');
 		expect(announce).not.toHaveBeenCalled();
 		return;
 	}
@@ -145,15 +146,6 @@ test('compact Play starts in the gesture, deduplicates pending Play, and reads n
 	expect(media.audio).toBe(audio.element);
 	expect(audio.currentTime).toBe(30);
 	expect(audio.load).not.toHaveBeenCalled();
-});
-
-test('a fulfilled Play cannot claim Playing if native pause readback is already true', async () => {
-	const { audio, media, status } = compactTransport();
-	const pending = audio.deferPlay(), attempt = media.playCurrent();
-	audio.pause(); // The promise can settle before the queued native pause event.
-	pending.resolve();
-	await attempt;
-	expect(status()).toBe('paused');
 });
 
 test.each(['compact', 'native'])('%s Pause fences pending success, including after a newer start', async (path) => {
