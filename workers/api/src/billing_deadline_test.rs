@@ -427,11 +427,11 @@ pub(crate) async fn test_reconcile_before_raw_insert(commit: bool) -> Result<(),
             if before.1.is_some() || before.2.is_some() {
                 return Err(StoreError);
             }
-            phase.set("Worker-first INSERT: Worker did not reach pre-COMMIT gate holding exclusion");
+            phase.set("Worker-first INSERT: Worker did not reach pre-COMMIT gate with its billing writes and exclusion");
             db.query_one("SELECT pg_advisory_lock($1)", &[&PRECOMMIT_GATE])
                 .await.map_err(|_| StoreError)?;
             let injected = Rc::new(Cell::new(false));
-            let probe = ReconcileProbe::BeforeCommit((!commit).then(|| injected.clone()));
+            let probe = ReconcileProbe::BeforeInsertCommit((!commit).then(|| injected.clone()));
             let mut reconcile = Box::pin(store.store_reconcile_owned(
                 "worker_fault_user".into(), test_outcome(), probe,
             ));
@@ -442,6 +442,7 @@ pub(crate) async fn test_reconcile_before_raw_insert(commit: bool) -> Result<(),
                        AND l.mode = 'ShareRowExclusiveLock'
                        AND a.application_name = 'owned_billing_reconcile_test'
                        AND a.wait_event_type = 'Lock' AND a.wait_event = 'advisory'
+                       AND a.query = 'SELECT pg_advisory_xact_lock($1)'
                        AND pg_backend_pid() = ANY(pg_blocking_pids(l.pid))", &[],
                 ).await.map_err(|_| StoreError)?;
                 Ok(row.map(|row| row.get::<_, i32>(0)))
@@ -669,7 +670,7 @@ pub(crate) async fn test_reconcile_before_parent_delete(commit: bool) -> Result<
             // Keep samples in autocommit so pg_stat_activity is refreshed.
             db.query_one("SELECT pg_advisory_lock($1)", &[&PRECOMMIT_GATE])
                 .await.map_err(|_| StoreError)?;
-            let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, ReconcileProbe::BeforeCommit(None)));
+            let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, ReconcileProbe::BeforeCommit));
             let worker = match select(reconcile.as_mut(), Box::pin(wait_lock_cycle(|| async {
                 let row = db.query_opt(
                     "SELECT l.pid FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a USING (pid)
