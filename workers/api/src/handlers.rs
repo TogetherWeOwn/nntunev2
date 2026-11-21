@@ -27598,6 +27598,7 @@ mod tests {
             recording_mbids: vec![CAT_REC_A.to_string(), CAT_REC_B.to_string()],
             recording_mbid: Some(rec.to_string()),
             recording_ord: ord,
+            recording_job_match: false,
             recording_title: Some(format!("Track {ord}")),
             duration_ms: Some(200_000),
             medium_no: Some(1),
@@ -27615,6 +27616,7 @@ mod tests {
             recording_mbids: Vec::new(),
             recording_mbid: None,
             recording_ord: 0,
+            recording_job_match: false,
             recording_title: None,
             duration_ms: None,
             medium_no: None,
@@ -28004,6 +28006,7 @@ mod tests {
                 recording_mbids: vec![CAT_REC_A.into(), CAT_REC_A.into()],
                 recording_mbid: Some(CAT_REC_A.into()),
                 recording_ord: ord,
+                recording_job_match: false,
             })
             .collect();
         h.store.catalogue_library.borrow_mut().insert(

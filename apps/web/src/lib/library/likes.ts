@@ -30,6 +30,13 @@ function record(value: unknown): Record<string, unknown> {
 	return (value ?? {}) as Record<string, unknown>;
 }
 
+/** Only the Library server knows whether an uppercase MBID is also an exact job ID. */
+export function trackLikeTarget(id: string, resolved: unknown): string | undefined {
+	const lower = id.toLowerCase();
+	if (id === lower || !RELEASE_ID.test(lower)) return id;
+	return resolved === id || resolved === lower ? resolved : undefined;
+}
+
 export async function loadLikes(client: Pick<LikesClient, 'get'>) {
 	const { items, session_binding: binding } = record(await client.get<unknown>(LIKES_PATH));
 	if (!Array.isArray(items) || items.length > MAX_LIKES || !validBinding(binding)) {

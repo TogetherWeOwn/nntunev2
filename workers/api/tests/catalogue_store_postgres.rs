@@ -740,9 +740,10 @@ async fn member_target_queries_isolate_caller_and_kind() {
         app.batch_execute(
             "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES
              ('u1', 'Job_Own', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA', ARRAY['BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB', 'opaque-invalid']),
-             (NULL, 'Job_Shared', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', ARRAY['dddddddd-dddd-4ddd-8ddd-dddddddddddd']),
+             (NULL, 'Job_Shared', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', ARRAY['DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD']),
              ('other', 'Job_Private', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', ARRAY['ffffffff-ffff-4fff-8fff-ffffffffffff']),
-             ('u1', '11111111-1111-1111-1111-AAAAAAAAAAAA', NULL, ARRAY[]::text[])"
+             ('u1', '11111111-1111-1111-1111-AAAAAAAAAAAA', NULL, ARRAY[]::text[]),
+             ('u1', 'DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD', NULL, ARRAY[]::text[])"
         ).await.unwrap();
         app
     }
@@ -819,6 +820,11 @@ async fn member_target_queries_isolate_caller_and_kind() {
         Err(StoreError),
         Rc::new(Cell::new(0)),
     );
+    for (owner, expected) in [("u1", true), ("other", false)] {
+        let rows = store.catalogue_library(owner).await.unwrap();
+        let shared = rows.iter().find(|row| row.job_id == "Job_Shared").unwrap();
+        assert_eq!(shared.recording_job_match, expected);
+    }
     assert!(
         !store
             .catalogue_member_target("u1' OR true --", TargetKind::Track, "Job_Own")
@@ -1456,6 +1462,7 @@ async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
         },
         recording_mbid: recording.map(str::to_owned),
         recording_ord: if recording.is_some() { i as i64 + 1 } else { 0 },
+        recording_job_match: false,
     })
     .collect();
     assert_eq!(rows, assemble_library_rows(&page, &[], &[], &[]));

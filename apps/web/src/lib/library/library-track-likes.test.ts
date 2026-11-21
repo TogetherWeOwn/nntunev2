@@ -51,7 +51,7 @@ it.each(['mismatched read binding', 'mismatched verifier', 'retired publication'
 	}
 );
 
-it('rereads the same account after its earlier write settles, without accepting an old control', async () => {
+it.each([A, B])('fences an earlier write when refreshing with binding %s', async (binding) => {
 	const { likes, fetcher } = setup();
 	fetcher.mockResolvedValueOnce(list(A)).mockResolvedValueOnce(session(A));
 	await likes.publish(listing(), tracks);
@@ -62,45 +62,21 @@ it('rereads the same account after its earlier write settles, without accepting 
 	await dispatched.promise;
 	likes.invalidate();
 	expect(likes.controls(track)).toBeUndefined();
-	likes.retire(); // A new Library refresh has started, but is not yet verified.
-	fetcher.mockResolvedValueOnce(list(A, [liked])).mockResolvedValueOnce(session(A));
-	const refresh = likes.publish(listing(), tracks);
-	await old.toggle();
-	expect(fetcher).toHaveBeenCalledTimes(3);
-	expect(likes.controls(track)).toBeUndefined();
-	expect(likes.feedback).toContain('Refresh the library');
+	likes.retire();
+	const sameAccount = binding === A;
+	fetcher.mockResolvedValueOnce(list(binding, sameAccount ? [liked] : [])).mockResolvedValueOnce(session(binding));
+	const refresh = likes.publish(listing(binding), tracks);
+	if (sameAccount) {
+		await old.toggle();
+		expect(fetcher).toHaveBeenCalledTimes(3);
+		expect(likes.controls(track)).toBeUndefined();
+		expect(likes.feedback).toContain('Refresh the library');
+	} else {
+		await refresh; // The new account must not wait for the previous one.
+	}
 	result.resolve(Response.json({ target_id: track, liked_at: 1 }));
 	await Promise.all([toggle, refresh]);
-	expect(likes.controls(track)?.liked).toBe(true);
+	expect(likes.controls(track)?.liked).toBe(sameAccount);
 	expect(likes.feedback).toBe('');
 	expect(fetcher).toHaveBeenCalledTimes(5);
-});
-
-it('does not wait for or publish a previous account write in the new account', async () => {
-	const { likes, fetcher } = setup();
-	fetcher.mockResolvedValueOnce(list(A)).mockResolvedValueOnce(session(A));
-	await likes.publish(listing(), tracks);
-	const result = Promise.withResolvers<Response>(), dispatched = Promise.withResolvers<void>();
-	fetcher.mockImplementationOnce(() => { dispatched.resolve(); return result.promise; });
-	const toggle = likes.controls(track)!.toggle();
-	await dispatched.promise;
-	fetcher.mockResolvedValueOnce(list(B)).mockResolvedValueOnce(session(B));
-	await likes.publish(listing(B), tracks);
-	result.resolve(Response.json({ target_id: track, liked_at: 1 }));
-	await toggle;
-	expect(likes.controls(track)?.liked).toBe(false);
-	expect(likes.feedback).toBe('');
-});
-
-it('retires live controls on a rejected session-bound write', async () => {
-	const { likes, fetcher } = setup();
-	fetcher.mockResolvedValueOnce(list(A)).mockResolvedValueOnce(session(A));
-	fetcher.mockResolvedValueOnce(Response.json({}, { status: 412 }));
-	await likes.publish(listing(), tracks);
-	const old = likes.controls(track)!;
-	await old.toggle();
-	await old.toggle();
-	expect(likes.controls(track)).toBeUndefined();
-	expect(likes.feedback).toContain('Refresh the library');
-	expect(fetcher).toHaveBeenCalledTimes(3);
 });

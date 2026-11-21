@@ -2,7 +2,7 @@ import { PUBLIC_API_BASE_URL } from '$app/env/public';
 import { SvelteMap } from 'svelte/reactivity';
 import { ApiClient, ApiError } from '../api/client.js';
 import type { LibraryItem } from './cache.js';
-import { loadLikes, MAX_LIKES } from './likes.js';
+import { loadLikes, MAX_LIKES, trackLikeTarget } from './likes.js';
 import type { LibraryRefreshUpdate } from './refresh.js';
 import { verifyLibrarySession } from './session-verification.js';
 import { createTrackLikeControls, type TrackLikeOwner } from './track-like-controls.js';
@@ -15,7 +15,7 @@ function refused(error: unknown) {
 export function createLibraryTrackLikes() {
 	const retry = 'Account likes are unavailable. Refresh the library to try again.';
 	let active: AbortController | undefined;
-	let owner = $state.raw<TrackLikeOwner>();
+	let owner = $state.raw<TrackLikeOwner & { targets: Map<string, string | undefined> }>();
 	let feedback = $state('');
 	const writes = new Map<string, Set<Promise<unknown>>>();
 	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
@@ -71,17 +71,17 @@ export function createLibraryTrackLikes() {
 			if (!check) return;
 			if (!await check.response) throw new Error('Likes session could not be verified');
 			await guarded(() => {
-				const members = new Set(items.map((item) => item.id));
+				const targets = new Map(items.map(({ id, like_target_id }) => [id, trackLikeTarget(id, like_target_id)]));
 				const liked = new SvelteMap<string, boolean>();
 				for (const item of list.items) if (item.kind === 'track') liked.set(item.targetId, true);
 				// A full response cannot prove the absence of an older like.
 				const unlisted = list.items.length < MAX_LIKES ? false : undefined;
 				owner = {
-					binding, client, readiness: () => receipt,
-					liked: (id) => members.has(id) ? liked.get(id) ?? unlisted : undefined,
+					binding, client, targets, readiness: () => receipt,
+					liked: (id) => liked.get(id) ?? unlisted,
 					confirm: (id, confirmedId, value) => {
+						if (id !== confirmedId) return invalidate();
 						liked.set(id, value);
-						liked.set(confirmedId, value);
 						feedback = '';
 					},
 					failed: (_id, error) => {
@@ -96,5 +96,8 @@ export function createLibraryTrackLikes() {
 		}
 	}
 
-	return { controls, publish, clear, invalidate, retire, get feedback() { return feedback; } };
+	return { publish, clear, invalidate, retire, get feedback() { return feedback; }, controls(id: string) {
+		const target = owner?.targets.get(id);
+		return target ? controls(target) : undefined;
+	} };
 }

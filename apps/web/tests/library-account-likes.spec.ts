@@ -23,24 +23,29 @@ async function seedLibrary(page: Page, ids: string[] = [], verified = true): Pro
 	await page.route('**/v1/me/likes/session', (route) => route.fulfill({ json: likes() }));
 }
 
-test('Tracks and Queue share a session-bound Like and Unlike', async ({ page }) => {
+test('Tracks and Queue share a session-bound Like and Unlike across Refresh', async ({ page }) => {
 	await seedLibrary(page);
+	const recording = 'abcd0000-0000-4000-8000-000000000001';
+	await page.route('**/api/library', (route) => route.fulfill({
+		headers: { 'x-nntune-session-binding': BINDING },
+		json: [{ id: recording.toUpperCase(), like_target_id: recording, title: 'Coral Horizon' }]
+	}));
 	let saved = false;
 	const reply = Promise.withResolvers<void>();
 	const methods: string[] = [];
-	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes(saved ? [likedTrack] : []) }));
-	await page.route(`**/v1/me/likes/track/${TRACK}`, async (route) => {
+	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes(saved ? [{ ...likedTrack, target_id: recording }] : []) }));
+	await page.route((url) => url.pathname.toLowerCase() === `/v1/me/likes/track/${recording}`, async (route) => {
 		const request = route.request();
 		methods.push(request.method());
 		expect(request.headers()['x-nntune-session-binding']).toBe(BINDING);
 		if (request.method() === 'PUT') {
 			await reply.promise;
 			saved = true;
-			await route.fulfill({ json: { target_id: TRACK, liked_at: likedTrack.created_at } });
+			await route.fulfill({ json: { target_id: recording, liked_at: likedTrack.created_at } });
 		} else {
 			expect(request.method()).toBe('DELETE');
 			saved = false;
-			await route.fulfill({ json: { target_id: TRACK, liked: false } });
+			await route.fulfill({ json: { target_id: recording, liked: false } });
 		}
 	});
 	await page.goto('/library');
@@ -58,6 +63,10 @@ test('Tracks and Queue share a session-bound Like and Unlike', async ({ page }) 
 	await expect(trackLike).toHaveAttribute('aria-pressed', 'true');
 	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
 	await expect(trackRow.getByRole('button', { name: 'Star Coral Horizon', exact: true })).toHaveAttribute('aria-pressed', 'false');
+	const reread = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/me/likes');
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await reread;
+	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
 	await queueLike.click();
 	await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
 	await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
@@ -65,80 +74,63 @@ test('Tracks and Queue share a session-bound Like and Unlike', async ({ page }) 
 	await expect(page.getByTestId('usage-meter')).toHaveCount(1);
 });
 
-test('a refused Queue Like can be retried from Albums', async ({ page }) => {
-	await seedLibrary(page);
-	await page.route('**/v1/releases', (route) => route.fulfill({ json: [] }));
-	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes() }));
-	let writes = 0;
-	await page.route(`**/v1/me/likes/track/${TRACK}`, (route) => route.fulfill(++writes === 1
-		? { status: 412, json: {} }
-		: { json: { target_id: TRACK, liked_at: likedTrack.created_at } }));
-	await page.goto('/library');
-	await page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' }).getByRole('checkbox').check();
-	await page.getByRole('button', { name: 'Append selected', exact: true }).click();
-	const albums = page.getByRole('group', { name: 'Library type' }).getByRole('button', { name: 'Albums', exact: true });
-	await albums.click();
-	await expect(page.getByRole('region', { name: 'Library collections' }).getByRole('status'))
-		.toHaveText('No albums in the loaded results.');
-	const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
-	const queueLike = page.getByTestId('queue-item').getByRole('button', { name: 'Like Coral Horizon', exact: true });
-	await expect(refresh).toBeHidden();
-	await queueLike.click();
-	const feedback = page.getByText('Account likes are unavailable. Refresh the library to try again.', { exact: true });
-	await expect(feedback).toBeVisible();
-	await expect(queueLike).toHaveCount(0);
-	await refresh.click();
-	await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
-	await expect(feedback).toHaveCount(0);
-	await expect(refresh).toBeHidden();
-	await expect(albums).toHaveAttribute('aria-pressed', 'true');
-	expect(writes).toBe(1);
-	await queueLike.click();
-	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
-	expect(writes).toBe(2);
-});
-
-test('a failed sign-out retires Queue Likes until Refresh verifies the session on Albums', async ({ page }) => {
-	await seedLibrary(page);
-	await page.route('**/v1/releases', (route) => route.fulfill({ json: [] }));
-	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes([likedTrack]) }));
-	const writes: string[] = [];
-	await page.route(`**/v1/me/likes/track/${TRACK}`, (route) => {
-		writes.push(route.request().method());
-		return route.fulfill({ json: { target_id: TRACK, liked: false } });
+for (const cause of ['refused Like', 'failed sign-out']) {
+	test(`Albums can recover from a ${cause} without replaying a write`, async ({ page }) => {
+		await seedLibrary(page);
+		const signOut = cause === 'failed sign-out';
+		const verified = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+		let recovering = false;
+		const writes: string[] = [];
+		await page.route('**/v1/releases', (route) => route.fulfill({ json: [] }));
+		await page.route('**/v1/me/likes', async (route) => {
+			if (recovering) await verified.promise;
+			await route.fulfill({ json: likes(signOut ? [likedTrack] : []) });
+		});
+		await page.route(`**/v1/me/likes/track/${TRACK}`, (route) => {
+			writes.push(route.request().method());
+			if (!recovering) return route.fulfill({ status: 412, json: {} });
+			return route.fulfill({ json: signOut ? { target_id: TRACK, liked: false }
+				: { target_id: TRACK, liked_at: likedTrack.created_at } });
+		});
+		await page.route('**/v1/session/logout', async (route) => {
+			await finish.promise;
+			await route.fulfill({ status: 503, json: {} });
+		});
+		await page.goto('/library');
+		await page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' }).getByRole('checkbox').check();
+		await page.getByRole('button', { name: 'Append selected', exact: true }).click();
+		const albums = page.getByRole('button', { name: 'Albums', exact: true });
+		const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+		const queueLike = page.getByTestId('queue-item').getByRole('button', { name: 'Like Coral Horizon', exact: true });
+		await albums.click();
+		await expect(refresh).toBeHidden();
+		await expect(queueLike).toHaveAttribute('aria-pressed', String(signOut));
+		if (signOut) {
+			await page.getByRole('button', { name: 'Account menu' }).click();
+			await page.getByRole('menuitem', { name: 'Sign out' }).click();
+			try { await expect(queueLike).toHaveCount(0); } finally { finish.resolve(); }
+			await expect(page.getByText('Could not sign out. Please try again.')).toBeVisible();
+		} else {
+			await queueLike.click();
+			await expect(queueLike).toHaveCount(0);
+		}
+		await expect(page.getByText('Account likes are unavailable. Refresh the library to try again.')).toBeVisible();
+		recovering = true;
+		try {
+			const reread = page.waitForRequest('**/v1/me/likes');
+			await refresh.press('Enter');
+			await reread;
+			await expect(refresh).toBeFocused();
+		} finally { verified.resolve(); }
+		await expect(queueLike).toHaveAttribute('aria-pressed', String(signOut));
+		await expect(refresh).toBeHidden();
+		await expect(albums).toBeFocused();
+		expect(writes).toEqual(signOut ? [] : ['PUT']);
+		await queueLike.click();
+		await expect(queueLike).toHaveAttribute('aria-pressed', String(!signOut));
+		expect(writes).toEqual(signOut ? ['DELETE'] : ['PUT', 'PUT']);
 	});
-	const finish = Promise.withResolvers<void>();
-	await page.route('**/v1/session/logout', async (route) => {
-		await finish.promise;
-		await route.fulfill({ status: 503, json: {} });
-	});
-	await page.goto('/library');
-	await page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' }).getByRole('checkbox').check();
-	await page.getByRole('button', { name: 'Append selected', exact: true }).click();
-	const albums = page.getByRole('group', { name: 'Library type' }).getByRole('button', { name: 'Albums', exact: true });
-	await albums.click();
-	const queueLike = page.getByTestId('queue-item').getByRole('button', { name: 'Like Coral Horizon', exact: true });
-	const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
-	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
-	await expect(refresh).toBeHidden();
-	await page.getByRole('button', { name: 'Account menu' }).click();
-	await page.getByRole('menuitem', { name: 'Sign out' }).click();
-	try {
-		await expect(queueLike).toHaveCount(0);
-	} finally {
-		finish.resolve();
-	}
-	await expect(page.getByText('Could not sign out. Please try again.')).toBeVisible();
-	await expect(refresh).toBeVisible();
-	await refresh.click();
-	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
-	await expect(refresh).toBeHidden();
-	await expect(albums).toHaveAttribute('aria-pressed', 'true');
-	expect(writes).toEqual([]);
-	await queueLike.click();
-	await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
-	expect(writes).toEqual(['DELETE']);
-});
+}
 
 for (const status of [401, 503]) {
 	test(`Liked Songs handles a direct ${status}`, async ({ page }) => {

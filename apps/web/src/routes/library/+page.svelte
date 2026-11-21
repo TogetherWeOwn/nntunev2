@@ -244,6 +244,13 @@
 	let extendSelection = false;
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
+	const showRefresh = $derived(showingTracks || (!loading && (showRecovery || !!accountTrackLikes?.feedback)));
+	$effect.pre(() => {
+		// Likes can finish after listing Refresh has already restored focus.
+		if (!loading && !showRefresh && refreshButton && document.activeElement === refreshButton) {
+			libraryTypeGroup?.querySelector<HTMLButtonElement>('button[aria-pressed="true"]')?.focus({ preventScroll: true });
+		}
+	});
 	/**
 	 * Transient queue-only filter text, owned here (not in the panel) so
 	 * it survives the panel unmounting/remounting across library refresh
@@ -2060,7 +2067,7 @@
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
-			hidden={!showingTracks && (loading || (!showRecovery && !accountTrackLikes?.feedback))}
+			hidden={!showRefresh}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>
