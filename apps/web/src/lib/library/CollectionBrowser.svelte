@@ -5,8 +5,8 @@
 	import { displayCollections, loadCollections, type Collection, type CollectionFilter, type CollectionSort } from './collections.js';
 	import type { LibraryRefreshUpdate } from './refresh.js';
 
-	let { filter, accessRevoked, runIfCurrent, reverify }: {
-		filter: CollectionFilter; accessRevoked: boolean; runIfCurrent: LibraryRefreshUpdate['runIfCurrent']; reverify: () => Promise<void>;
+	let { filter, requiresSignIn, runIfCurrent, reverify }: {
+		filter: CollectionFilter; requiresSignIn: boolean; runIfCurrent: LibraryRefreshUpdate['runIfCurrent']; reverify: () => Promise<void>;
 	} = $props();
 	let query = $state('');
 	let searchInput = $state<HTMLInputElement>();
@@ -25,7 +25,7 @@
 		rows = [];
 		status = 'loading';
 		const run = runIfCurrent;
-		const current = () => !request.signal.aborted && run === runIfCurrent && !accessRevoked && selected === filter;
+		const current = () => !request.signal.aborted && run === runIfCurrent && !requiresSignIn && selected === filter;
 		const started = await run?.(() => {
 			if (!current()) return;
 			const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal });
@@ -46,7 +46,7 @@
 		if (current()) status = 'unverified';
 	}
 	$effect(() => {
-		if (accessRevoked) {
+		if (requiresSignIn) {
 			rows = [];
 			query = '';
 			status = 'sign-in';

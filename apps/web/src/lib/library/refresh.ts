@@ -231,6 +231,11 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			}, timeoutMs);
 		});
 
+		function runBeforeDeadline<T>(fence: NonNullable<typeof verified>['fence'], work: () => T) {
+			const admitted = fence.run(() => isCurrent() && !controller.signal.aborted ? work() : undefined);
+			return Promise.race([admitted, timeout, aborted]).catch(() => undefined);
+		}
+
 		function publish(sessionBinding?: string, deviceScope?: string): void {
 			if (!isCurrent()) return;
 			if (activeRequest === controller) activeRequest = null;
@@ -312,8 +317,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				return;
 			}
 			if (response.status === 401 || response.status === 403) {
-				const commitRefusal = () => !controller.signal.aborted && refuse(true, response.status);
-				if (!(fence ? await fence.run(commitRefusal) : legacyFixture() && !capture && commitRefusal())) refuse();
+				const commitRefusal = () => refuse(true, response.status);
+				if (!(fence ? await runBeforeDeadline(fence, commitRefusal) : legacyFixture() && !capture && commitRefusal())) refuse();
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
@@ -323,7 +328,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const previous = verified?.binding ?? libraryScopeBinding(storage);
 			if (!validBinding(label) && !(legacyFixture() && !previous && label === null)) return void refuse();
 			if (previous && previous !== label) {
-				if (await fence?.run(() => !controller.signal.aborted && refuse(true))) return;
+				if (fence && await runBeforeDeadline(fence, () => refuse(true))) return;
 				return void refuse();
 			}
 			const payload = await Promise.race([readJsonBody(response), timeout, aborted]);
@@ -346,16 +351,15 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			};
 			if (!label) return commit();
 			// Start verification under the lock, but never hold it over the wire.
-			const started = await fence?.run(() => {
-				if (!isCurrent() || controller.signal.aborted) return;
+			if (!fence) return void refuse();
+			const started = await runBeforeDeadline(fence, () => {
 				const result = Promise.race([verifyLibrarySession(label, controller.signal), timeout, aborted]);
 				void result.catch(() => {}); // The lock request may resolve after the verifier.
 				return { result };
 			});
-			if (!fence || !started) { refuse(); return; }
+			if (!started) return void refuse();
 			const matches = await started.result;
-			const finalCommit = fence.run(() => {
-				if (!isCurrent() || controller.signal.aborted) return;
+			const committed = await runBeforeDeadline(fence, () => {
 				if (!matches) return refuse(true);
 				const deviceScope = establishVerifiedLibraryScope(storage, label);
 				verified = { binding: label, fence };
@@ -363,12 +367,12 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				publish(label, deviceScope);
 				return true;
 			});
-			if (!await Promise.race([finalCommit, timeout, aborted])) refuse();
+			if (!committed) refuse();
 		} catch {
 			if (!isCurrent()) return;
 			if (state.verificationSuspended || binding !== null) return void refuse();
 			if (authenticatedThisLoad && verified) {
-				if (!await verified.fence.run(() => { restoreSnapshot(); publish(); return true; })) refuse();
+				if (!await runBeforeDeadline(verified.fence, () => { restoreSnapshot(); publish(); return true; })) refuse();
 			} else restoreSnapshot();
 		} finally {
 			if (timeoutId !== undefined) clearTimeout(timeoutId);

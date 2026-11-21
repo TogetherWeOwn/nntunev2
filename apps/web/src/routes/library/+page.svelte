@@ -94,9 +94,9 @@
 	] as const;
 	let collectionFilter = $state<CollectionFilter | 'tracks'>('tracks');
 	const showingTracks = $derived(collectionFilter === 'tracks');
-	let collectionsAccessRevoked = $state(false);
+	let libraryTypeGroup: HTMLDivElement | undefined = $state();
 	let collectionReceipt = $state<LibraryRefreshUpdate['runIfCurrent']>();
-	const showRecovery = $derived(showingTracks || (!collectionReceipt && !collectionsAccessRevoked));
+	const showRecovery = $derived(showingTracks || !collectionReceipt);
 
 	function readStoredDensity(): Density {
 		try {
@@ -334,7 +334,6 @@
 			if (!isCurrent()) return;
 			collectionReceipt = runIfCurrent;
 			const revoked = authBoundary && !state.verificationSuspended;
-			collectionsAccessRevoked = revoked;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -620,8 +619,9 @@
 		if (typeof document !== 'undefined' && document.activeElement?.closest('#library-queue-panel')) {
 			void tick().then(() => {
 				if (!shareAlive || document.activeElement !== document.body) return;
-				const recovery = showingTracks ? refreshButton
+				const signIn = showingTracks ? null
 					: document.querySelector<HTMLAnchorElement>('section[aria-label="Library collections"] a[href="/login"]');
+				const recovery = signIn ?? refreshButton;
 				recovery?.focus();
 			});
 		}
@@ -1435,8 +1435,8 @@
 	 * focus was lost that way — never when the user moved on, and never on
 	 * mount/auth/transition refreshes, which do not run through this handler.
 	 * Both the list-branch Refresh and the error-branch Retry bind the same
-	 * ref; the branches are mutually exclusive, so the ref always points at
-	 * the mounted successor (including a Refresh-to-401 landing on Retry).
+	 * ref, including a Refresh-to-401 landing on Retry. After a successful
+	 * collection Retry, Refresh is hidden; return to the selected Library type.
 	 */
 	async function refreshFromButton(): Promise<void> {
 		await refresh();
@@ -1445,7 +1445,9 @@
 		if (!loadError && !libraryUnavailable) recordFindQuery();
 		await tick();
 		if (document.activeElement === null || document.activeElement === document.body) {
-			refreshButton?.focus({ preventScroll: true });
+			const replacement = refreshButton && !refreshButton.hidden ? refreshButton
+				: libraryTypeGroup?.querySelector<HTMLButtonElement>('button[aria-pressed="true"]');
+			replacement?.focus({ preventScroll: true });
 		}
 	}
 
@@ -1554,21 +1556,20 @@
 		</select>
 	</div>
 
-	<div class="nt-library-types" role="group" aria-label="Library type">
+	<div class="nt-library-types" role="group" aria-label="Library type" bind:this={libraryTypeGroup}>
 		{#each libraryTypes as [type, label] (type)}
 			<button class="nt-button nt-button--ghost" type="button" aria-pressed={collectionFilter === type}
 				onclick={() => { collectionFilter = type; }}>{label}</button>
 		{/each}
 	</div>
-	{#if collectionFilter !== 'tracks' && (collectionReceipt || collectionsAccessRevoked)}
-		<CollectionBrowser filter={collectionFilter} accessRevoked={collectionsAccessRevoked}
+	{#if collectionFilter !== 'tracks' && (collectionReceipt || requiresSignIn)}
+		<CollectionBrowser filter={collectionFilter} {requiresSignIn}
 			runIfCurrent={collectionReceipt} reverify={refreshFromButton} />
 	{:else if !showingTracks && (loading ? items.length > 0 : libraryUnavailable || staleAt)}
 		{#if loading}
 			<p role="status">Loading your library…</p>
 		{:else}
 			<p role="status">Library listing is not available yet.</p>
-			<button class="nt-button" type="button" onclick={() => void refreshFromButton()}>Retry</button>
 		{/if}
 	{/if}
 
@@ -2039,11 +2040,11 @@
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
-			hidden={!showingTracks}
+			hidden={!showingTracks && (!showRecovery || loading)}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>
-			{staleAt ? 'Retry' : 'Refresh'}
+			{staleAt || (!showingTracks && libraryUnavailable) ? 'Retry' : 'Refresh'}
 		</button>
 	{/if}
 

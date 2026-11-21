@@ -11,14 +11,14 @@ function storage() {
 	return { getItem: (key: string) => map.get(key) ?? null, setItem: (key: string, value: string) => { map.set(key, value); },
 		removeItem: (key: string) => { map.delete(key); } };
 }
-function setup(finalAdmission?: () => Promise<void>) {
+function setup(beforeRead?: (read: number) => Promise<void> | undefined) {
 	const local = storage(), session = storage();
 	vi.stubGlobal('window', { localStorage: local, sessionStorage: session });
 	vi.stubGlobal('caches', { keys: async () => [] });
 	let writerHeld = false, reads = 0;
 	vi.stubGlobal('navigator', { locks: { async request<T>(name: string, options: LockOptions | LockGrantedCallback<T>, read: LockGrantedCallback<T>) {
 		if (typeof options !== 'function') {
-			if (++reads === 3) await finalAdmission?.();
+			await beforeRead?.(++reads);
 			return read(writerHeld ? null : {} as Lock);
 		}
 		writerHeld = name === AUTH_LOCK;
@@ -37,19 +37,22 @@ function setup(finalAdmission?: () => Promise<void>) {
 }
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
-it('suspends a verified refresh when final lock admission exceeds the deadline', async () => {
+it.each([2, 3])('suspends when verification lock admission %i exceeds the deadline', async (delayedRead) => {
 	vi.useFakeTimers();
 	const requested = Promise.withResolvers<void>(), admitted = Promise.withResolvers<void>();
-	const { refresh, refresher, session, update } = setup(() => { requested.resolve(); return admitted.promise; });
+	const { refresh, refresher, session, update, verify } = setup((read) => {
+		if (read === delayedRead) { requested.resolve(); return admitted.promise; }
+	});
 	const pending = refresh();
 	try {
-		await Promise.race([requested.promise, pending.then(() => { throw new Error('No final lock requested'); })]);
+		await Promise.race([requested.promise, pending.then(() => { throw new Error('No verification lock requested'); })]);
 		await vi.advanceTimersByTimeAsync(10_000);
 		expect(refresher.state).toMatchObject({ loading: false, items: [], verificationSuspended: true });
 	} finally {
 		admitted.resolve();
 		await pending;
 	}
+	expect(verify).toHaveBeenCalledTimes(delayedRead - 2);
 	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
 	await refresh();
 	expect(update().sessionBinding).toBe(label);
