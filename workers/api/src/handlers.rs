@@ -6224,19 +6224,15 @@ async fn member_invite_history(
             Ok(authenticated) => authenticated,
             Err(response) => return response,
         };
-        let before = if query.is_empty() {
-            None
-        } else {
-            let cursor = query.strip_prefix("cursor=").filter(|value| {
-                value.len() <= 19
-                    && !value.starts_with('0')
-                    && value.bytes().all(|b| b.is_ascii_digit())
-            });
-            let Some(id) = cursor.and_then(|value| value.parse::<i64>().ok()) else {
-                return validation_failed("invalid invite history cursor");
-            };
-            Some(id)
-        };
+        let cursor = query.strip_prefix("cursor=").filter(|value| {
+            value.len() <= 19
+                && !value.starts_with('0')
+                && value.bytes().all(|b| b.is_ascii_digit())
+        });
+        let before = cursor.and_then(|value| value.parse::<i64>().ok());
+        if !query.is_empty() && before.is_none() {
+            return validation_failed("invalid invite history cursor");
+        }
         let issuer = &claims.user_id;
         match ctx.store.member_invite_history(issuer, before).await {
             Ok(Some(page)) => json_response(200, serde_json::json!(page)),
@@ -8295,7 +8291,9 @@ where
         }
         ("GET", "/v1/admin/settings") => admin_settings_list(ctx, req).await,
         ("POST", "/v1/admin/ingest") => admin_ingest_upload(ctx, req).await,
-        // The entry preserves this route's status and window query parameters.
+        // The entry preserves the list query string for this
+        // route (the runtime strips it by default), so the status
+        // filter and window survive to the handler in production.
         ("GET", path) if path == "/v1/admin/ingest" || path.starts_with("/v1/admin/ingest?") => {
             admin_ingest_list(ctx, req).await
         }
@@ -9143,17 +9141,16 @@ mod tests {
             self.member_invite_history_calls
                 .borrow_mut()
                 .push((issuer.into(), before));
-            Ok(
-                (!self.deleting_users.borrow().contains(issuer)).then(|| MemberInviteHistory {
-                    invites: vec![MemberInviteHistoryEntry {
-                        id: 78,
-                        created_at: 10,
-                        expires_at: 20,
-                        status: auth::InviteStatus::Active,
-                    }],
-                    next_cursor: Some("78".into()),
-                }),
-            )
+            let page = MemberInviteHistory {
+                invites: vec![MemberInviteHistoryEntry {
+                    id: 78,
+                    created_at: 10,
+                    expires_at: 20,
+                    status: auth::InviteStatus::Active,
+                }],
+                next_cursor: Some("78".into()),
+            };
+            Ok((!self.deleting_users.borrow().contains(issuer)).then_some(page))
         }
 
         async fn member_invite_summary(
@@ -23387,9 +23384,14 @@ mod tests {
         let session = magic_login(&h, "member@example.com");
         let audits = h.store.audits.borrow().len();
         assert_eq!(scope_for_operation("GET", PATH), RouteDecision::SessionOnly);
+        let path_from_worker = |query| {
+            crate::worker_entry::route_path(worker::Method::Get, PATH.into(), || {
+                url::Url::parse(&format!("https://example.test{PATH}?{query}")).ok()
+            })
+        };
         let mut req = Request {
             method: "GET".into(),
-            path: format!("{PATH}?cursor=79"),
+            path: path_from_worker("cursor=79"),
             cookie: None,
             origin: None,
             authorization: None,
@@ -23418,13 +23420,13 @@ mod tests {
             "cursor=1&cursor=2",
             "issuer=other",
         ] {
-            req.path = format!("{PATH}?{query}");
+            req.path = path_from_worker(query);
             let response = call(&req);
             assert_eq!(response.status, 422, "{query}");
             assert!(response.body.contains("\"code\":\"validation_failed\""));
         }
         assert!(h.store.member_invite_history_calls.borrow().is_empty());
-        req.path = format!("{PATH}?cursor=79");
+        req.path = path_from_worker("cursor=79");
         let success = call(&req);
         assert_eq!(success.status, 200);
         assert_eq!(
@@ -23439,12 +23441,10 @@ mod tests {
         let deleting = call(&req);
         assert_eq!(deleting.status, 409);
         assert_eq!(deleting.body, account_deleting_response().body);
+        let expected_calls = [("member".to_owned(), Some(79)), ("member".to_owned(), None)];
         assert_eq!(
             *h.store.member_invite_history_calls.borrow(),
-            [
-                ("member".to_string(), Some(79)),
-                ("member".to_string(), None)
-            ]
+            expected_calls
         );
         assert_eq!(h.store.audits.borrow().len(), audits);
     }

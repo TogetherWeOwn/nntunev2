@@ -7867,6 +7867,23 @@ pub async fn subsonic_mount(
     respond_document(&app.handle(method, path, query, body))
 }
 
+// The runtime path has no query; restore it only for list routes that use it.
+pub(crate) fn route_path(
+    method: Method,
+    path: String,
+    url: impl FnOnce() -> Option<url::Url>,
+) -> String {
+    use crate::native_rest::MEMBER_INVITE_HISTORY_PATH;
+    match (method, path.as_str()) {
+        (Method::Get, "/v1/admin/ingest" | MEMBER_INVITE_HISTORY_PATH) => (),
+        _ => return path,
+    }
+    match url().as_ref().and_then(url::Url::query) {
+        Some(query) if !query.is_empty() => format!("{path}?{query}"),
+        _ => path,
+    }
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.
@@ -7940,27 +7957,9 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // the gates never read). Server logs redact this header the way
     // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
     // module logs header values.
-    // Only list routes that use a query get it back from the runtime URL.
-    let bare_path = req.path();
-    let handler_path = if req.method() == Method::Get
-        && matches!(
-            bare_path.as_str(),
-            "/v1/admin/ingest" | crate::native_rest::MEMBER_INVITE_HISTORY_PATH
-        ) {
-        match req.url().ok().and_then(|url| {
-            url.query()
-                .filter(|query| !query.is_empty())
-                .map(|query| format!("{bare_path}?{query}"))
-        }) {
-            Some(with_query) => with_query,
-            None => bare_path,
-        }
-    } else {
-        bare_path
-    };
     let request = handlers::Request {
         method: req.method().to_string(),
-        path: handler_path,
+        path: route_path(req.method(), req.path(), || req.url().ok()),
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
         authorization: headers_map.get("authorization").cloned(),
