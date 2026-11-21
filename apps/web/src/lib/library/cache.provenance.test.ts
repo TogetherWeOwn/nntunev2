@@ -6,6 +6,8 @@ import {
 	libraryScopeBinding,
 	LIBRARY_AUTH_CONTEXT_KEY,
 	LIBRARY_SESSION_BINDING_KEY,
+	loadSnapshot,
+	saveSnapshot,
 	verifiedFavoritesKey
 } from './cache.js';
 
@@ -37,6 +39,28 @@ function fixture() {
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+it('returns an in-memory snapshot when context creation is disabled and no scope exists', () => {
+	const { session } = fixture();
+	const items = [{ id: 'track' }];
+	const savedAt = '2026-01-01T00:00:00.000Z';
+
+	expect(saveSnapshot(session, items, Date.parse(savedAt), false)).toEqual({ savedAt, items });
+	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
+	expect(loadSnapshot(session)).toBeNull();
+});
+
+it.each([
+	{ name: 'a different auth context', tuple: ['ae44027c-2735-4fca-8e49-500579db79d1', binding] },
+	{ name: 'an extra tuple element', tuple: [context, binding, 'extra'] }
+])('rejects stored provenance with $name even when the binding matches', ({ tuple }) => {
+	const { session } = fixture();
+	session.setItem(LIBRARY_AUTH_CONTEXT_KEY, context);
+	session.setItem(LIBRARY_SESSION_BINDING_KEY, JSON.stringify(tuple));
+
+	expect(libraryScopeBinding(session)).toBeNull();
+	expect(verifiedFavoritesKey(session, binding)).toBeNull();
+});
 
 it('never binds an existing unbound scope or changes its exact favorites bytes', () => {
 	const { local, session } = fixture();
