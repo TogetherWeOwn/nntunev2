@@ -2,6 +2,7 @@
 	import type { ComponentProps } from 'svelte';
 	import { displayArtist, displayTitle } from '../library/order.js';
 	import NativeAudio from './NativeAudio.svelte';
+	import PlayerSeek from './PlayerSeek.svelte';
 	import type { PlaybackStatus } from './mediaController.js';
 	import type { Track } from './queue.js';
 	import type { JumpDirection } from './relativeJump.js';
@@ -9,10 +10,13 @@
 	let {
 		currentTrack, mediaRevision, streamUrl, attachNativeAudio,
 		playbackStatus, playCurrent, pauseCurrent,
+		seekState, seek,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
 		jumpStatus, jumpStatusVersion, jumpRelative
 	}: ComponentProps<typeof NativeAudio> & {
 		currentTrack: Pick<Track, 'id' | 'title' | 'artist'> | null;
+		seekState: ComponentProps<typeof PlayerSeek>['state'];
+		seek: ComponentProps<typeof PlayerSeek>['seek'];
 		playbackStatus: PlaybackStatus;
 		playCurrent: () => Promise<void>;
 		pauseCurrent: () => void;
@@ -60,6 +64,9 @@
 			Restart current track
 		</button>
 	</div>
+	{#key seekState.attachment}
+		<PlayerSeek state={seekState} {seek} />
+	{/key}
 	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
 	{#if !restartCanSeek}
 		<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>

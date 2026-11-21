@@ -1,4 +1,5 @@
 import { get, writable } from 'svelte/store';
+import { emptySeek, readAbsoluteSeek, writeAbsoluteSeek, type AbsoluteSeekState } from './absoluteSeek.js';
 import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode } from './queue.js';
@@ -51,6 +52,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	const repeat = writable<RepeatMode>('off');
 	const seekFeedback = writable({ restartCanSeek: false, restartStatus: '', restartStatusVersion: 0,
 		jumpStatus: '', jumpStatusVersion: 0 });
+	const absoluteSeek = writable<AbsoluteSeekState>({ ...emptySeek, attachment: 0, feedback: '' });
 	let lastJumpTarget: number | undefined;
 	let destroyed = false;
 	let positionIntent = 0;
@@ -164,6 +166,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		attachmentVersion += 1;
 		previous?.listeners.abort();
 		invalidatePlay();
+		absoluteSeek.set({ ...emptySeek, attachment: attachmentVersion, feedback: '' });
 		playbackStatus.set('unavailable');
 		return previous?.audio;
 	}
@@ -334,6 +337,37 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		});
 	}
 
+	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string): void {
+		const attachment = attachmentVersion;
+		const observation = readAbsoluteSeek(audio);
+		if (!matches()) return;
+		const previous = get(absoluteSeek);
+		const message = feedback ?? (previous.attachment === attachment ? previous.feedback : '');
+		if (previous.attachment !== attachment || previous.position !== observation.position ||
+			previous.duration !== observation.duration || previous.enabled !== observation.enabled || previous.feedback !== message) {
+			absoluteSeek.set({ ...observation, attachment, feedback: message });
+		}
+	}
+
+	function seek(attachment: number, seconds: number): void {
+		if (attachment !== attachmentVersion || !Number.isFinite(seconds)) return;
+		const target = transportTarget();
+		if (!target) return;
+		const { audio, matches } = target;
+		const before = positionIntent;
+		const track = currentTrack(queue.snapshot);
+		const sameSelection = () => currentTrack(queue.snapshot)?.id === track?.id;
+		if (!track || !matches(() => positionIntent === before && sameSelection())) return;
+		const intent = ++positionIntent;
+		pendingShare.supersede(track.id, resolveStreamUrl(track));
+		const isCurrent = () => matches(() => positionIntent === intent && sameSelection());
+		runPosition(() => {
+			if (!isCurrent()) return;
+			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent);
+			if (isCurrent()) observeAbsoluteSeek(audio, isCurrent, feedback);
+		});
+	}
+
 	function restart(): void {
 		const track = currentTrack(queue.snapshot);
 		const source = resolveStreamUrl(track);
@@ -454,6 +488,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	return {
 		repeat: { subscribe: repeat.subscribe },
 		seekFeedback: { subscribe: seekFeedback.subscribe },
+		absoluteSeek: { subscribe: absoluteSeek.subscribe }, seek,
 		playbackStatus: { subscribe: playbackStatus.subscribe }, playCurrent, pauseCurrent,
 		clearSeekFeedback,
 		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
@@ -556,7 +591,20 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			lastJumpTarget = undefined;
 			listenForNativeEvents();
 			const target = transportTarget();
-			if (target?.audio === audio) readPlayback(audio, target.matches, 'starting');
+			if (target?.audio === audio) {
+				readPlayback(audio, target.matches, 'starting');
+				const trackId = currentTrack(queue.snapshot)?.id;
+				const observePosition = () => {
+					const intent = positionIntent;
+					const matches = () => target.matches(() => positionIntent === intent && currentTrack(queue.snapshot)?.id === trackId);
+					if (matches()) observeAbsoluteSeek(audio, matches);
+				};
+				for (const type of ['emptied', 'error', 'loadedmetadata', 'durationchange', 'canplay',
+					'progress', 'timeupdate', 'seeking', 'seeked', 'ended']) {
+					audio.addEventListener(type, observePosition, { signal: receipt.listeners.signal });
+				}
+				observePosition();
+			}
 			pause(previous?.audio);
 			return () => {
 				if (current === receipt) reset();

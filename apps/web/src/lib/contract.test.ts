@@ -31,6 +31,7 @@ const routeForTestId: Record<ActiveTestId, string> = {
 	queueMore: './player/PlayerQueue.svelte',
 	queueSelectionToolbar: './player/PlayerQueue.svelte',
 	audioPlayer: './player/NativeAudio.svelte',
+	playerSeek: './player/PlayerSeek.svelte',
 	usageMeter: '../routes/library/+page.svelte',
 	// Today the demo player carries these; the player-bar build (design
 	// spec v1) moves them to the persistent player bar and repoints this

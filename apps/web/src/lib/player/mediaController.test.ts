@@ -359,3 +359,50 @@ test('destroy retires the active node and refuses later mounts', () => {
 	expect(media.audio).toBeUndefined();
 	expect(audio.pause).toHaveBeenCalledOnce();
 });
+
+
+test('absolute seek cancels deferred share and uses native time, including refused or unavailable targets', () => {
+	const media = createMediaController(() => true, coral);
+	const native = new SeekableAudio();
+	media.attach(native as unknown as HTMLAudioElement);
+	const state = () => get(media.absoluteSeek);
+	const { attachment } = state();
+	const ranges = vi.spyOn(native, 'seekable', 'get');
+	const setter = vi.spyOn(native, 'currentTime', 'set');
+	media.captureShareSeek(media.beginShareInput(), { trackId: 'coral', seconds: 100 }, () => true);
+	setter.mockImplementationOnce(() => {});
+	media.seek(attachment, 80);
+	expect(media.pendingShareSeek).toBeNull();
+	expect(state()).toMatchObject({ position: 30, feedback: 'The player did not accept that seek.' });
+	ranges.mockReturnValueOnce({ length: 1, start: () => 0, end: () => 40 });
+	media.seek(attachment, 80);
+	expect(setter).toHaveBeenCalledExactlyOnceWith(80);
+	expect(state()).toMatchObject({ position: 30, feedback: 'That position is not seekable yet.' });
+	media.seek(attachment, Infinity);
+	expect(setter).toHaveBeenCalledTimes(1);
+	media.seek(attachment, 200);
+	expect(setter).toHaveBeenLastCalledWith(120);
+	expect(state()).toMatchObject({ position: 120, duration: 120, enabled: true, feedback: '' });
+});
+
+test.each(['before write', 'during write'] as const)('absolute seek fences attachment retirement %s', (phase) => {
+	const media = createMediaController(() => true, coral);
+	const native = new SeekableAudio();
+	const replacement = new SeekableAudio();
+	replacement.position = 7;
+	const detach = media.attach(native as unknown as HTMLAudioElement);
+	const state = () => get(media.absoluteSeek);
+	const old = state().attachment;
+	const replace = () => { detach(); media.attach(replacement as unknown as HTMLAudioElement); };
+	const setter = vi.spyOn(native, 'currentTime', 'set');
+	if (phase === 'before write') vi.spyOn(native, 'duration', 'get').mockImplementationOnce(() => { replace(); return 120; });
+	else setter.mockImplementationOnce(() => { replace(); throw new Error('retired write'); });
+	media.seek(old, 80);
+	expect(setter).toHaveBeenCalledTimes(phase === 'before write' ? 0 : 1);
+	native.dispatchEvent(new Event('seeked'));
+	media.seek(old, 90);
+	expect(state()).toMatchObject({ position: 7, feedback: '' });
+	expect(replacement.currentTime).toBe(7);
+	media.reset();
+	expect(state()).toMatchObject({ position: 0, duration: 0, enabled: false, feedback: '' });
+});
