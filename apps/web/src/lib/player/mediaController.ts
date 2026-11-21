@@ -1,4 +1,5 @@
 import { get, writable } from 'svelte/store';
+import { emptySeek, readAbsoluteSeek, writeAbsoluteSeek, type AbsoluteSeekState } from './absoluteSeek.js';
 import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { createPlayerSleepTimer } from './playerSleepTimer.js';
@@ -57,6 +58,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	const repeat = writable<RepeatMode>('off');
 	const seekFeedback = writable({ restartCanSeek: false, restartStatus: '', restartStatusVersion: 0,
 		jumpStatus: '', jumpStatusVersion: 0 });
+	const absoluteSeek = writable<AbsoluteSeekState>(emptySeek);
+	let seekAnchor = 0;
 	let lastJumpTarget: number | undefined;
 	let destroyed = false;
 	let positionIntent = 0;
@@ -205,6 +208,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		attachmentVersion += 1;
 		previous?.listeners.abort();
 		invalidatePlay();
+		absoluteSeek.set({ ...emptySeek, attachment: attachmentVersion });
 		playbackStatus.set('unavailable');
 		return previous?.audio;
 	}
@@ -384,6 +388,43 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		});
 	}
 
+	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string, replay = false, nativeSeeking = false): void {
+		const attachment = attachmentVersion;
+		const observation = readAbsoluteSeek(audio);
+		if (!matches()) return;
+		const prior = get(absoluteSeek);
+		const previous = prior.attachment === attachment ? prior : emptySeek;
+		// In-flight time/progress updates move the thumb, not the seek comparison point.
+		const message = feedback ?? (nativeSeeking && observation.position !== seekAnchor ? '' : previous.feedback);
+		if (feedback !== undefined || nativeSeeking || !observation.seeking) seekAnchor = observation.position;
+		const elapsed = observation.seeking ? previous.elapsed : observation.position;
+		if (prior.attachment !== attachment || previous.position !== observation.position ||
+			previous.duration !== observation.duration || previous.enabled !== observation.enabled ||
+			previous.seeking !== observation.seeking || previous.feedback !== message || (replay && message)) {
+			absoluteSeek.set({ ...observation, attachment, elapsed, feedback: message,
+				feedbackVersion: previous.feedbackVersion + Number(!!message && (replay || message !== previous.feedback)) });
+		}
+	}
+
+	function seek(attachment: number, seconds: number, replay = true): void {
+		if (attachment !== attachmentVersion || !Number.isFinite(seconds)) return;
+		const target = transportTarget();
+		if (!target) return;
+		const { audio, matches } = target;
+		const before = positionIntent;
+		const track = currentTrack(queue.snapshot);
+		const sameSelection = () => currentTrack(queue.snapshot)?.id === track?.id;
+		if (!track || !matches(() => positionIntent === before && sameSelection())) return;
+		const intent = ++positionIntent;
+		pendingShare.supersede(track.id, resolveStreamUrl(track));
+		const isCurrent = () => matches(() => positionIntent === intent && sameSelection());
+		runPosition(() => {
+			if (!isCurrent()) return;
+			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent);
+			if (isCurrent()) observeAbsoluteSeek(audio, isCurrent, feedback, replay);
+		});
+	}
+
 	function restart(): void {
 		const track = currentTrack(queue.snapshot);
 		const source = resolveStreamUrl(track);
@@ -507,6 +548,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		sound: { state: sound.state, setVolume: sound.setVolume, toggleMute: sound.toggleMute },
 		observeSound: sound.observe,
 		seekFeedback: { subscribe: seekFeedback.subscribe },
+		absoluteSeek: { subscribe: absoluteSeek.subscribe }, seek,
 		playbackStatus: { subscribe: playbackStatus.subscribe },
 		playCurrent, pauseCurrent, retryCurrent: () => startCurrent(true),
 		clearSeekFeedback,
@@ -543,6 +585,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			current = receipt;
 			previous?.listeners.abort();
 			if (previous) invalidatePlay();
+			const seekTarget = transportTarget();
+			const trackId = currentTrack(queue.snapshot)?.id;
+			const observePosition = (type?: string) => {
+				if (seekTarget?.audio !== audio) return;
+				const intent = positionIntent;
+				const matches = () => seekTarget.matches(() => positionIntent === intent && currentTrack(queue.snapshot)?.id === trackId);
+				if (matches()) observeAbsoluteSeek(audio, matches, undefined, false, type === 'seeking');
+			};
 			function listenForNativeEvents(): void {
 				const observe = (event: Event) => {
 					if (current !== receipt || event.currentTarget !== audio) return;
@@ -577,6 +627,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 							if (audio.error === null) return;
 							break;
 						case 'ended': return handleEnded(receipt, source, matches);
+						case 'seeked': return;
 						case 'seeking': {
 							const { currentTime, duration } = audio;
 							if (!matches(intent)) return;
@@ -607,8 +658,12 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					readPlayback(audio, matches, get(playbackStatus));
 				};
 				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'emptied', 'seeking',
-					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate']) {
-					audio.addEventListener(type, observe, { signal: receipt.listeners.signal });
+					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate', 'seeked']) {
+					audio.addEventListener(type, (event) => {
+						const settlement = observe(event);
+						if (event.currentTarget === audio && type !== 'play' && type !== 'playing' && type !== 'pause') observePosition(type);
+						return settlement;
+					}, { signal: receipt.listeners.signal });
 				}
 			}
 			lastJumpTarget = undefined;
@@ -620,6 +675,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
 					{ playCurrent, pauseCurrent }, receipt.listeners.signal);
 			}
+			observePosition();
 			pause(previous?.audio);
 			return () => {
 				if (current === receipt) reset();

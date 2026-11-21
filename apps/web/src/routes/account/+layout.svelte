@@ -15,6 +15,10 @@
 			href="/account/security"
 			aria-current={page.url.pathname === '/account/security' ? 'page' : undefined}
 		>Security</a>
+		<a
+			href="/account/invites"
+			aria-current={page.url.pathname === '/account/invites' ? 'page' : undefined}
+		>Invites</a>
 	</nav>
 
 	{@render children()}

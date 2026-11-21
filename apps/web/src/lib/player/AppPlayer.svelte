@@ -23,7 +23,7 @@
 	const controller = createPlayerController(createQueue([]), { flush: tick });
 	const player = setAppPlayer(Object.assign(controller, { currentFavorite: createCurrentTrackFavorite(controller.queue),
 		claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
-	const { queue, media, media: { seekFeedback, playbackStatus } } = player;
+	const { queue, media, media: { seekFeedback, playbackStatus, absoluteSeek } } = player;
 	const attachNativeAudio = media.attach;
 	const sound = media.sound.state;
 	const currentTrack = $derived(queueCurrentTrack($queue));
@@ -65,6 +65,7 @@
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio} volumeControls={soundControls}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			retryCurrent={media.retryCurrent}
+			seekState={$absoluteSeek} seek={media.seek}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} {favoriteAction} />
 		<ShortcutHelp bind:this={shortcutHelp} actions={appShortcutActions} buttonClass="nt-button nt-button--ghost" playerScoped />
 	</div>

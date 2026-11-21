@@ -8,6 +8,15 @@ function withStorage<T>(read: (storage: Storage) => T, fallback: T): T {
 }
 const generation = () => withStorage((storage) => storage.getItem(AUTH_GENERATION_KEY), null);
 const pendingMarker = (key: string) => key.startsWith(PENDING_PREFIX);
+const invalidation = new EventTarget();
+
+export function subscribeAuthFenceInvalidation(clear: () => void, signal: AbortSignal) {
+	invalidation.addEventListener('invalidate', clear, { signal });
+	window.addEventListener('storage', ({ key }) => {
+		if (key === null || key === AUTH_GENERATION_KEY || pendingMarker(key)) clear();
+	}, { signal });
+}
+
 const receiptsBlocked = () => withStorage((storage) => Object.keys(storage).some(pendingMarker), true);
 async function cacheReceiptsBlocked(): Promise<boolean> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -94,6 +103,7 @@ export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Pr
 		}
 	};
 	try {
+		invalidation.dispatchEvent(new Event('invalidate'));
 		const locks = globalThis.navigator?.locks;
 		if (revocation) {
 			// Account-wide revocation requires immediate exclusive admission.

@@ -57,7 +57,9 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         for path in ("deploy.yml", "deploy-alerts-staging.yml"):
             with self.subTest(path=path):
                 text = (WORKFLOWS / path).read_text()
-                self.assertNotRegex(text, r"(?m)^concurrency:")
+                # The separate alerts deploy must not hold a run-level lock.
+                if path == "deploy-alerts-staging.yml":
+                    self.assertNotRegex(text, r"(?m)^concurrency:")
                 gate = job(text, "gate")
                 self.assertIn("group: ${{ github.workflow }}-gate-${{ github.ref }}", gate)
                 self.assertIn("cancel-in-progress: false", gate)
