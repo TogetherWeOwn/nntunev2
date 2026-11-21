@@ -130,10 +130,16 @@ fixture receipt (intentional exit or native interrupt), runs the restore
 rehearsal, and checks that the synthetic deployment is off and drained. The
 job uses no staging credentials, provider calls or live traffic.
 
-A step timeout is not cancellation of the entire job or workflow. Forced
-cancellation or runner loss can prevent finalizer execution. This test does
-not establish live restore or drain, and UTC expiry alone cannot supply that
-proof.
+The same CI job also kills a synthetic producer with `SIGKILL` after it writes
+its active state, before it can write a stop receipt. A fresh process reads that
+state and must observe synthetic off readback and a zero backend count after
+client cancellation. The backend remains busy through the first sample, so
+clearing local clients alone cannot pass the rehearsal.
+
+Neither rehearsal cancels the whole workflow or loses its runner. The
+synthetic state stays on the same filesystem; a live recovery path would need
+state available after runner loss and a restore fence that protects newer
+staging deployments. UTC expiry does not establish live restore or drain.
 
 ### Independent UTC expiry (disposable release Fetch)
 
