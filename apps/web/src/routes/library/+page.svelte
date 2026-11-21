@@ -36,6 +36,7 @@
 	} from '#lib/library/recent-finds.js';
 	import { moveFavoriteId, type FavoriteMoveDirection } from '#lib/library/favorites-order.js';
 	import { createLibraryRefresher, type LibraryRefreshUpdate } from '#lib/library/refresh.js';
+	import { createLibraryTrackLikes } from '#lib/library/library-track-likes.svelte.js';
 	import {
 		displayArtist,
 		displayTitle,
@@ -95,6 +96,8 @@
 	const showingTracks = $derived(collectionFilter === 'tracks');
 	let libraryTypeGroup: HTMLDivElement | undefined = $state();
 	let collectionReceipt = $state<LibraryRefreshUpdate['runIfCurrent']>();
+	let accountTrackLikes = $state.raw<ReturnType<typeof createLibraryTrackLikes>>();
+	const likeControls = (id: string) => accountTrackLikes?.controls(id);
 	const showRecovery = $derived(showingTracks || !collectionReceipt);
 
 	function readStoredDensity(): Density {
@@ -331,9 +334,14 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
-		onStateChange: (state, { isCurrent, authoritative, authBoundary, runIfCurrent, sessionBinding }) => {
+		onStateChange: (state, receipt) => {
+			const { isCurrent, authoritative, authBoundary, runIfCurrent, sessionBinding } = receipt;
 			if (!isCurrent()) return;
 			collectionReceipt = runIfCurrent;
+			if (sessionBinding && runIfCurrent) {
+				accountTrackLikes ??= createLibraryTrackLikes();
+				void accountTrackLikes.publish(receipt, state.items);
+			} else accountTrackLikes?.clear();
 			const revoked = authBoundary && !state.verificationSuspended;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
@@ -1534,6 +1542,7 @@
 			media.clearShareSeek();
 			favoritesExport.destroy();
 			refresher.dispose();
+			accountTrackLikes?.clear();
 			// Client-side navigation away with the query applied.
 			recordFindQuery();
 			unsubscribeLocal();
@@ -1551,6 +1560,7 @@
 
 <main class="nt-wrap" data-density={density}>
 	<h1>Library</h1>
+	{#if accountTrackLikes?.feedback}<p role="status">{accountTrackLikes.feedback}</p>{/if}
 
 	<div class="nt-library-density">
 		<label for="library-density">Density</label>
@@ -2011,6 +2021,7 @@
 				announcement={player.queueAnnouncement.text}
 				announcementVersion={player.queueAnnouncement.version}
 				{favoriteIds}
+				{likeControls}
 				ontogglefavorite={listingUnavailable ? undefined : toggleQueuedFavorite}
 				onfavoriteids={listingUnavailable ? undefined : (ids, remove) => favoriteInteractionIds(ids, remove, true)}
 				bind:filterQuery={queueFilterQuery}
@@ -2089,7 +2100,7 @@
 
 {#snippet trackRows(tracks: LibraryItem[])}
 	<TrackRows
-		{tracks} {queuedIds} {selectedIds} {favoriteIds}
+		{tracks} {queuedIds} {selectedIds} {favoriteIds} {likeControls}
 		onrowclick={libraryRowClick}
 		onselectionclick={libraryCheckboxClick}
 		onselectionchange={libraryCheckboxChange}

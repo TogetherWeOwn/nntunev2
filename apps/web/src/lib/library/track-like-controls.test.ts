@@ -151,7 +151,7 @@ describe('injected track and queue Like controls', () => {
 		fetchFn.mockResolvedValueOnce(failure()).mockResolvedValueOnce(response());
 		const controls = createTrackLikeControls(() => owner);
 		await controls(track.id)!.toggle();
-		expect(owner.failed).toHaveBeenCalledExactlyOnceWith(track.id);
+		expect(owner.failed).toHaveBeenCalledExactlyOnceWith(track.id, expect.any(Error));
 		expect(owner.confirm).not.toHaveBeenCalled();
 		expectLikeButtons(controls, false, false);
 		await controls(track.id)!.toggle();

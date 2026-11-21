@@ -10,7 +10,7 @@ export interface LibraryLike {
 }
 
 const LIKES_PATH = '/v1/me/likes';
-const MAX_LIKES = 500;
+export const MAX_LIKES = 500;
 // Import does catalogue resolution and a preference write per item. Keep each
 // request comfortably below the API's 500-item ceiling.
 const IMPORT_BATCH_SIZE = 50;

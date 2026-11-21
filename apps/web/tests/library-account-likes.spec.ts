@@ -23,6 +23,48 @@ async function seedLibrary(page: Page, ids: string[] = [], verified = true): Pro
 	await page.route('**/v1/me/likes/session', (route) => route.fulfill({ json: likes() }));
 }
 
+test('Tracks and Queue share a session-bound Like and Unlike', async ({ page }) => {
+	await seedLibrary(page);
+	let saved = false;
+	const reply = Promise.withResolvers<void>();
+	const methods: string[] = [];
+	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes(saved ? [likedTrack] : []) }));
+	await page.route(`**/v1/me/likes/track/${TRACK}`, async (route) => {
+		const request = route.request();
+		methods.push(request.method());
+		expect(request.headers()['x-nntune-session-binding']).toBe(BINDING);
+		if (request.method() === 'PUT') {
+			await reply.promise;
+			saved = true;
+			await route.fulfill({ json: { target_id: TRACK, liked_at: likedTrack.created_at } });
+		} else {
+			expect(request.method()).toBe('DELETE');
+			saved = false;
+			await route.fulfill({ json: { target_id: TRACK, liked: false } });
+		}
+	});
+	await page.goto('/library');
+	const button = { name: 'Like Coral Horizon', exact: true };
+	const trackRow = page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' });
+	const trackLike = trackRow.getByRole('button', button);
+	await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
+	await trackRow.getByRole('checkbox').check();
+	await page.getByRole('button', { name: 'Append selected', exact: true }).click();
+	const queueLike = page.getByTestId('queue-item').getByRole('button', button);
+	await trackLike.click();
+	await expect(queueLike).toHaveAttribute('aria-disabled', 'true');
+	await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
+	reply.resolve();
+	await expect(trackLike).toHaveAttribute('aria-pressed', 'true');
+	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
+	await expect(trackRow.getByRole('button', { name: 'Star Coral Horizon', exact: true })).toHaveAttribute('aria-pressed', 'false');
+	await queueLike.click();
+	await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
+	await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
+	expect(methods).toEqual(['PUT', 'DELETE']);
+	await expect(page.getByTestId('usage-meter')).toHaveCount(1);
+});
+
 for (const status of [401, 503]) {
 	test(`Liked Songs handles a direct ${status}`, async ({ page }) => {
 		await seedLibrary(page, [TRACK]);
