@@ -11,8 +11,7 @@
 	import { createPlayerController } from './controller.svelte.js';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
 	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & {
-		claimShareEntry?: () => boolean;
-		currentFavorite: ReturnType<typeof createCurrentTrackFavorite>;
+		claimShareEntry?: () => boolean; currentFavorite: ReturnType<typeof createCurrentTrackFavorite>;
 	}>();
 </script>
 <script lang="ts">
@@ -22,8 +21,7 @@
 	const currentFavorite = createCurrentTrackFavorite(controller.queue);
 	const purgePlayer = controller.purgeAtAuthBoundary;
 	const player = setAppPlayer(Object.assign(controller, {
-		currentFavorite,
-		claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true,
+		currentFavorite, claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true,
 		purgeAtAuthBoundary: () => { currentFavorite.clearFeedback(); purgePlayer(); }
 	}));
 	const { queue, media, media: { seekFeedback, playbackStatus } } = player;

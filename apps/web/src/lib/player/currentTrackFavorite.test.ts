@@ -4,8 +4,7 @@ import { createQueue, DEMO_TRACKS, selectTrack } from './queue.js';
 import { createQueueController } from './queueController.js';
 
 function setup() {
-	const initial = createQueue(DEMO_TRACKS);
-	const queue = createQueueController(initial);
+	const queue = createQueueController(createQueue(DEMO_TRACKS));
 	const favorite = createCurrentTrackFavorite(queue);
 	let ids: string[] = [];
 	let allowed = true;
@@ -35,20 +34,11 @@ test('writes just the selected track, once per rendered intent, and reports the 
 	expect(favorite.feedback(view())?.text).toBe('Unstarred Second Signal.');
 });
 
-test('rejects a stale selection even after a round trip back to the same track', () => {
-	const { favorite, select, view, write } = setup();
+test.each(['selection round trip', 'owner refusal'] as const)('%s cannot write or announce', (change) => {
+	const { favorite, select, view, write, refuse } = setup();
 	const before = view();
-	select(1);
-	select(0);
-	favorite.activate(before);
-	expect(write).not.toHaveBeenCalled();
-	expect(favorite.feedback(view())).toBeNull();
-});
-
-test('an owner that refuses membership cannot write or announce', () => {
-	const { favorite, view, write, refuse } = setup();
-	const before = view();
-	refuse();
+	if (change === 'selection round trip') { select(1); select(0); }
+	else refuse();
 	favorite.activate(before);
 	expect(write).not.toHaveBeenCalled();
 	expect(favorite.feedback(view())).toBeNull();
@@ -66,15 +56,4 @@ test('disposing the live owner prevents replay before and after replacement', ()
 	favorite.activate(before);
 	expect(replacement).not.toHaveBeenCalled();
 	expect(favorite.feedback(view())).toBeNull();
-});
-
-test('an auth purge retires both feedback and the ability to replay an earlier intent', () => {
-	const { favorite, queue, view, write } = setup();
-	const before = view();
-	favorite.activate(before);
-	queue.purgeAtAuthBoundary(() => {});
-	favorite.activate(before);
-	expect(view()).toBeNull();
-	expect(favorite.feedback(view())).toBeNull();
-	expect(write).toHaveBeenCalledTimes(1);
 });

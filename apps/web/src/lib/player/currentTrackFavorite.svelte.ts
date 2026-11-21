@@ -3,10 +3,7 @@ import { currentTrack, type QueueState } from './queue.js';
 import type { createQueueController } from './queueController.js';
 
 export type FavoriteWrite = 'saved' | 'visit' | null;
-type FavoriteOwner = {
-	read: (id: string) => readonly string[] | null;
-	write: (id: string, pressed: boolean) => FavoriteWrite;
-};
+type FavoriteOwner = { read(id: string): readonly string[] | null; write(id: string, pressed: boolean): FavoriteWrite };
 
 type FavoriteIntent = { id: string; receipt: string; membership: readonly string[] };
 

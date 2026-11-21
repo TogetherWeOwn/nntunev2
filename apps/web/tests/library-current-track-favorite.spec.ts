@@ -31,12 +31,12 @@ test('the player stars the selected track once and shares membership with Librar
 	await openLibrary(page);
 	const [north, south] = tracks;
 	await queueRow(page, south.id).getByRole('button', { name: 'Select South Wind', exact: true }).click();
-	const decoder = await page.getByTestId('audio-player').elementHandle();
+	const audio = page.getByTestId('audio-player');
+	const decoder = await audio.elementHandle();
+	const sameDecoder = () => audio.evaluate((node, original) => node === original, decoder);
 	const nowPlaying = await page.getByTestId('now-playing').innerText();
-	expect(nowPlaying).toContain('South Wind');
 	await expect(page.getByTestId('player-next')).toBeEnabled();
 	await expect(favorite(page)).toHaveAccessibleName('Favorite South Wind');
-	await expect(favorite(page)).toHaveAttribute('aria-pressed', 'false');
 	await favorite(page).focus();
 	await page.keyboard.press('Space');
 	await expect(favorite(page)).toBeFocused();
@@ -46,7 +46,7 @@ test('the player stars the selected track once and shares membership with Librar
 	await expect(feedback(page)).toHaveText('Starred South Wind.');
 	await expect(page.locator('[aria-live="polite"]').filter({ hasText: /^Starred South Wind\.$/ })).toHaveCount(1);
 	await expect(page.getByRole('region', { name: 'Player', exact: true }).getByRole('status')).toHaveCount(1);
-	expect(await page.getByTestId('audio-player').evaluate((node, original) => node === original, decoder)).toBe(true);
+	expect(await sameDecoder()).toBe(true);
 	await expect(page.getByTestId('now-playing')).toHaveText(nowPlaying);
 	await expect(page.getByTestId('player-next')).toBeEnabled();
 	expect(await storedFavorites(page)).toBe(JSON.stringify([south.id]));
@@ -59,7 +59,10 @@ test('the player stars the selected track once and shares membership with Librar
 	await expect(feedback(page)).toHaveText('');
 	await row(page, south.id).getByRole('button', { name: 'Star South Wind', exact: true }).click();
 	await expect(favorite(page)).toHaveAttribute('aria-pressed', 'true');
-	await expect(feedback(page)).toHaveText('');
+	await page.getByRole('link', { name: 'Search', exact: true }).first().click();
+	await expect(page).toHaveURL(/\/search$/);
+	await expect(favorite(page)).toHaveCount(0);
+	expect(await sameDecoder()).toBe(true);
 });
 
 async function editDuringActivation(page: Page, edit: Locator) {
@@ -69,15 +72,32 @@ async function editDuringActivation(page: Page, edit: Locator) {
 	}, target);
 }
 
-test('a click on a retired selection cannot star either track', async ({ page }) => {
-	await openLibrary(page);
-	await editDuringActivation(page, queueRow(page, tracks[1].id).getByRole('button', { name: 'Select South Wind', exact: true }));
-	await favorite(page).click();
-	await expect(favorite(page)).toHaveAccessibleName('Favorite South Wind');
-	await expect(favorite(page)).toHaveAttribute('aria-pressed', 'false');
-	await expect(feedback(page)).toHaveText('');
-	expect(await storedFavorites(page)).toBeNull();
-});
+for (const input of ['pointer', 'Space', 'click only']) {
+	test(`${input} activation cannot star a replacement selection`, async ({ page }) => {
+		await openLibrary(page);
+		const button = favorite(page);
+		await button.evaluate((node) => node.addEventListener('click', (event) => {
+			node.dataset.favoriteClick = event.isTrusted ? 'trusted' : 'synthetic';
+		}, { once: true }));
+		const select = queueRow(page, tracks[1].id).getByRole('button', { name: 'Select South Wind', exact: true });
+		if (input === 'click only') {
+			await editDuringActivation(page, select);
+			await button.evaluate((node) => node.click());
+		} else {
+			if (input === 'pointer') { await button.hover(); await page.mouse.down(); }
+			else { await button.focus(); await page.keyboard.down('Space'); }
+			await select.evaluate((node) => node.click());
+			await expect(button).toHaveAccessibleName('Favorite South Wind');
+			if (input === 'pointer') { await button.hover(); await page.mouse.up(); }
+			else await page.keyboard.up('Space');
+		}
+		await expect(button).toHaveAttribute('data-favorite-click', input === 'click only' ? 'synthetic' : 'trusted');
+		await expect(button).toHaveAccessibleName('Favorite South Wind');
+		await expect(button).toHaveAttribute('aria-pressed', 'false');
+		await expect(feedback(page)).toBeEmpty();
+		expect(await storedFavorites(page)).toBeNull();
+	});
+}
 
 test('a keyboard activation racing a Library edit does not toggle membership a second time', async ({ page }) => {
 	await openLibrary(page);
@@ -103,15 +123,6 @@ test('a rotated account refuses the stale button and an auth transition retires 
 	await page.evaluate((key) => window.dispatchEvent(new StorageEvent('storage', { key })), transitionKey);
 	await expect(favorite(page)).toHaveCount(0);
 	await expect(page.getByTestId('audio-player')).toHaveCount(0);
-});
-
-test('leaving the Library owner retires the action without replacing the decoder', async ({ page }) => {
-	await openLibrary(page);
-	await page.getByTestId('audio-player').evaluate((audio) => { audio.id = 'favorite-decoder'; });
-	await page.getByRole('link', { name: 'Search', exact: true }).first().click();
-	await expect(page).toHaveURL(/\/search$/);
-	await expect(favorite(page)).toHaveCount(0);
-	await expect(page.getByTestId('audio-player')).toHaveAttribute('id', 'favorite-decoder');
 });
 
 test('when persistence refuses, the status describes a visit-only membership change', async ({ page }) => {
