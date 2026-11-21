@@ -51,13 +51,12 @@ class IdentityTests(unittest.TestCase):
         stream = io.StringIO()
         with TemporaryDirectory() as temp, patch.object(identity, "provider_result", read):
             Path(temp, "wrangler-output-test.json").write_bytes(b'{"type":"wrangler-session","version":1}\n' + output())
-            env = {
+            with patch.dict(identity.os.environ, {
                 "WRANGLER_OUTPUT_FILE_DIRECTORY": temp,
                 "GITHUB_SHA": SHA,
                 "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
                 "CLOUDFLARE_API_TOKEN": "synthetic-token",
-            }
-            with patch.dict(identity.os.environ, env, clear=True), redirect_stdout(stream):
+            }, clear=True), redirect_stdout(stream):
                 self.assertEqual(identity.main(), 0)
         expected = {
             "identity": "matched",
@@ -142,23 +141,24 @@ class IdentityTests(unittest.TestCase):
         conn = connect.return_value
         valid = b'{"success":true,"errors":[],"result":{}}'
         chunked = "Transfer-Encoding: chunked"
-        chunk = b"".join(f"{len(part):x}\r\n".encode() + part + b"\r\n" for part in (valid[:5], valid[5:]))
-        chunk += b"0\r\n"
+        chunk = b"5\r\n" + valid[:5] + f"\r\n{len(valid) - 5:x}\r\n".encode() + valid[5:] + b"\r\n0\r\n"
         for status, body, framing, reason in (
-            (403, b"synthetic sensitive response", None, "version-auth-denied"),
-            (302, b"not followed", None, "provider-http-status"),
-            (200, b"x" * (identity.MAX_BODY + 1), None, "provider-body-limit"),
-            (200, b'{"success":true,"success":true}', None, "provider-response-shape"),
-            (200, valid, None, None),
-            (200, valid, f"Content-Length: {len(valid) + 1}", "provider-transport"),
-            (200, valid, "Connection: close", "provider-transport"),
-            (200, chunk, chunked, "provider-transport"),
-            (200, chunk + b"\r\n", chunked, None),
-            (200, chunk + b"\r\n", chunked + "\r\nContent-Length: 1", "provider-transport"),
-            (200, f"{identity.MAX_BODY + 1:x}\r\n".encode(), chunked, "provider-body-limit"),
+            ("1.1 403", b"synthetic sensitive response", None, "version-auth-denied"),
+            ("1.1 302", b"not followed", None, "provider-http-status"),
+            ("1.1 200", b"x" * (identity.MAX_BODY + 1), None, "provider-body-limit"),
+            ("1.1 200", b'{"success":true,"success":true}', None, "provider-response-shape"),
+            ("1.1 200", valid, None, None),
+            ("1.1 200", valid, f"Content-Length: {len(valid) + 1}", "provider-transport"),
+            ("1.1 200", valid, f"Content-Length: {len(valid)}\r\nMalformed header", "provider-transport"),
+            ("1.1 200", valid, "Connection: close", "provider-transport"),
+            ("1.1 200", chunk, chunked, "provider-transport"),
+            ("1.1 200", chunk + b"\r\n", chunked, None),
+            ("1.0 200", chunk + b"\r\n", chunked, "provider-transport"),
+            ("1.1 200", chunk + b"\r\n", chunked + "\r\nContent-Length: 1", "provider-transport"),
+            ("1.1 200", f"{identity.MAX_BODY + 1:x}\r\n".encode(), chunked, "provider-body-limit"),
         ):
             framing = framing or f"Content-Length: {len(body)}"
-            wire = f"HTTP/1.1 {status} Test\r\n{framing}\r\n\r\n".encode() + body
+            wire = f"HTTP/{status} Test\r\n{framing}\r\n\r\n".encode() + body
             response = identity.http.client.HTTPResponse(MagicMock(makefile=MagicMock(return_value=io.BytesIO(wire))))
             response.begin()
             conn.getresponse.return_value = response

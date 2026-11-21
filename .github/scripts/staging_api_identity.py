@@ -99,10 +99,11 @@ def provider_result(path, token):
             if response.status in (401, 403):
                 raise Unavailable("deployments-auth-denied" if path.endswith("/deployments") else "version-auth-denied")
             require(response.status == 200, "provider-http-status")
+            require(not response.headers.defects, "provider-transport")
             encodings = response.headers.get_all("Transfer-Encoding", [])
             lengths = response.headers.get_all("Content-Length", [])
             if response.chunked:
-                require(len(encodings) == 1 and not lengths, "provider-transport")
+                require(response.version == 11 and len(encodings) == 1 and not lengths, "provider-transport")
                 body = read_chunked(response.fp)
             else:
                 require(not encodings and len(lengths) == 1 and response.length is not None, "provider-transport")
@@ -165,8 +166,7 @@ def receipt(body, expected_sha, account, read):
     deployments = path + "/deployments"
     deployment_id = current_deployment(read(deployments), version_id)
     verify_version(read(path + "/versions/" + version_id), version_id, expected_sha)
-    confirmed = current_deployment(read(deployments), version_id)
-    require(confirmed == deployment_id, "deployment-changed-during-readback")
+    require(current_deployment(read(deployments), version_id) == deployment_id, "deployment-changed-during-readback")
     return {
         "identity": "matched",
         "deployment_id": deployment_id,
