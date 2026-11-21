@@ -16,7 +16,7 @@ SELECT n, ('ca000000-0000-4000-8000-' || lpad(n::text, 12, '0'))::uuid AS object
           'ea000000-0000-4000-8000-000000000002'::uuid AS root_id,
           CASE WHEN n=1 THEN 16777217 ELSE 1 END::bigint AS bytes,
           decode(lpad(to_hex(n), 64, '0'), 'hex') AS sha
-FROM generate_series(1, 7) AS n;
+FROM generate_series(1, 8) AS n;
 INSERT INTO public.storage_environments SELECT DISTINCT environment_id FROM digest_lookup_fixture;
 INSERT INTO public.storage_library_namespaces SELECT DISTINCT library_id, environment_id, NULL::text FROM digest_lookup_fixture;
 INSERT INTO public.storage_object_intents
@@ -48,11 +48,14 @@ SELECT object_id, environment_id, library_id, bytes, sha, root_id, '-infinity', 
 FROM digest_lookup_fixture WHERE n<>2;
 
 DO $$
-DECLARE f digest_lookup_fixture; fault text; pin record;
+DECLARE
+    f digest_lookup_fixture; other digest_lookup_fixture; fault text; pin record;
+    claim_ref CONSTANT uuid := 'ab000000-0000-4000-8000-000000000001';
+    other_ref CONSTANT uuid := 'ab000000-0000-4000-8000-000000000002';
 BEGIN
-    FOR f IN SELECT * FROM digest_lookup_fixture WHERE n<>1 LOOP
+    FOR f IN SELECT * FROM digest_lookup_fixture WHERE n BETWEEN 2 AND 7 LOOP
         IF EXISTS (SELECT FROM pg_temp.claim_lookup(f.environment_id, f.library_id, f.sha, f.bytes,
-            f.object_id, f.generation_id, f.root_id, f.object_id, 'infinity', f.provider_id)) THEN
+            f.object_id, f.generation_id, f.root_id, claim_ref, 'infinity', f.provider_id)) THEN
             RAISE EXCEPTION 'refused row returned a binding: %', f.n;
         END IF;
     END LOOP;
@@ -65,7 +68,7 @@ BEGIN
             f.bytes + (fault='size')::int,
             CASE WHEN fault='object' THEN gen_random_uuid() ELSE f.object_id END,
             CASE WHEN fault='generation' THEN gen_random_uuid() ELSE f.generation_id END,
-            CASE WHEN fault='root' THEN gen_random_uuid() ELSE f.root_id END, f.object_id,
+            CASE WHEN fault='root' THEN gen_random_uuid() ELSE f.root_id END, claim_ref,
             CASE WHEN fault='expired' THEN '-infinity' ELSE 'infinity' END::timestamptz,
             CASE WHEN fault='provider' THEN gen_random_uuid() ELSE f.provider_id END)) THEN
             RAISE EXCEPTION 'mismatched % returned a binding', fault;
@@ -75,15 +78,34 @@ BEGIN
         RAISE EXCEPTION 'refusal wrote a reference';
     END IF;
     SELECT * INTO STRICT pin FROM pg_temp.claim_lookup(f.environment_id, f.library_id, f.sha, f.bytes,
-        f.object_id, f.generation_id, f.root_id, f.object_id, 'infinity', f.provider_id);
+        f.object_id, f.generation_id, f.root_id, claim_ref, 'infinity', f.provider_id);
     IF (pin.object_id, pin.generation_id, pin.provider_configuration_version_id, pin.map_id,
         pin.root_version_id, pin.media_version, pin.page_versions) IS DISTINCT FROM
        (f.object_id, f.generation_id, f.provider_id, f.map_id, f.root_id, 'media-pin'::text, ARRAY['z-first','a-second'])
        OR NOT EXISTS (SELECT FROM public.storage_validated_digest_references
-           WHERE (environment_id, library_id, reference_id, object_id) = (f.environment_id,f.library_id,f.object_id,f.object_id))
-       OR EXISTS (SELECT FROM pg_temp.claim_lookup(f.environment_id, f.library_id, f.sha, f.bytes,
-           f.object_id, f.generation_id, f.root_id, f.object_id, 'infinity', f.provider_id)) THEN
-        RAISE EXCEPTION 'binding mismatch, missing attachment, or duplicate attachment returned a binding';
+           WHERE (environment_id, library_id, reference_id, object_id) = (f.environment_id,f.library_id,claim_ref,f.object_id)) THEN
+        RAISE EXCEPTION 'binding mismatch or missing exact reference attachment';
+    END IF;
+    IF EXISTS (SELECT FROM pg_temp.claim_lookup(f.environment_id, f.library_id, f.sha, f.bytes,
+        f.object_id, f.generation_id, f.root_id, claim_ref, 'infinity', f.provider_id)) THEN
+        RAISE EXCEPTION 'duplicate attachment returned a binding';
+    END IF;
+    SELECT * INTO STRICT other FROM digest_lookup_fixture WHERE n=8;
+    IF EXISTS (SELECT FROM pg_temp.claim_lookup(other.environment_id, other.library_id, other.sha, other.bytes,
+        other.object_id, other.generation_id, other.root_id, claim_ref, 'infinity', other.provider_id)) THEN
+        RAISE EXCEPTION 'reference held by another winner returned a binding';
+    END IF;
+    IF (SELECT count(*) FROM public.storage_validated_digest_references
+        WHERE (environment_id, library_id) = (f.environment_id, f.library_id)) <> 1
+       OR NOT EXISTS (SELECT FROM public.storage_validated_digest_references
+           WHERE (environment_id, library_id, reference_id, object_id) = (f.environment_id,f.library_id,claim_ref,f.object_id)) THEN
+        RAISE EXCEPTION 'reference conflict wrote or reassigned an attachment';
+    END IF;
+    -- The second winner is eligible; only the occupied reference blocked it.
+    PERFORM FROM pg_temp.claim_lookup(other.environment_id, other.library_id, other.sha, other.bytes,
+        other.object_id, other.generation_id, other.root_id, other_ref, 'infinity', other.provider_id);
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'second winner refused an unoccupied reference';
     END IF;
 END $$;
 ROLLBACK;
