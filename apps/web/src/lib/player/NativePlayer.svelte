@@ -1,16 +1,28 @@
 <script lang="ts">
-	import type { ComponentProps } from 'svelte';
+	import type { ComponentProps, Snippet } from 'svelte';
 	import { displayArtist, displayTitle } from '../library/order.js';
 	import NativeAudio from './NativeAudio.svelte';
+	import PlayerSeek from './PlayerSeek.svelte';
+	import type { PlaybackStatus } from './mediaController.js';
 	import type { Track } from './queue.js';
 	import type { JumpDirection } from './relativeJump.js';
 
 	let {
 		currentTrack, mediaRevision, streamUrl, attachNativeAudio,
+		playbackStatus, playCurrent, pauseCurrent, retryCurrent,
+		seekState, seek,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
-		jumpStatus, jumpStatusVersion, jumpRelative
+		favoriteAction,
+		jumpStatus, jumpStatusVersion, jumpRelative, volumeControls
 	}: ComponentProps<typeof NativeAudio> & {
+		volumeControls: Snippet;
 		currentTrack: Pick<Track, 'id' | 'title' | 'artist'> | null;
+		seekState: ComponentProps<typeof PlayerSeek>['state'];
+		seek: ComponentProps<typeof PlayerSeek>['seek'];
+		playbackStatus: PlaybackStatus;
+		playCurrent: () => Promise<void>;
+		pauseCurrent: () => void;
+		retryCurrent: () => Promise<void>;
 		restartCanSeek: boolean;
 		restartStatus: string;
 		restartStatusVersion: number;
@@ -18,7 +30,18 @@
 		jumpStatus: string;
 		jumpStatusVersion: number;
 		jumpRelative: (direction: JumpDirection) => void;
+		favoriteAction?: Snippet;
 	} = $props();
+	const canPause = $derived(playbackStatus === 'playing' || playbackStatus === 'starting');
+	const statusText: Record<PlaybackStatus, string> = {
+		unavailable: 'Playback is unavailable.',
+		paused: 'Paused',
+		starting: 'Starting playback…',
+		playing: 'Playing',
+		blocked: 'Playback was blocked. Press Play to try again.',
+		error: 'This audio could not be loaded or played. Retry playback or choose another track.',
+		retrying: 'Retrying playback…'
+	};
 </script>
 
 <section aria-label="Player">
@@ -29,6 +52,17 @@
 		</p>
 	{/if}
 	<div class="nt-library-player-controls">
+		<button class="nt-button nt-library-transport" type="button"
+			disabled={playbackStatus === 'unavailable'}
+			aria-disabled={playbackStatus === 'retrying' ? 'true' : undefined}
+			onclick={() => {
+				if (playbackStatus === 'retrying') return;
+				if (playbackStatus === 'error') void retryCurrent();
+				else if (canPause) pauseCurrent();
+				else void playCurrent();
+			}}>
+			{playbackStatus === 'error' || playbackStatus === 'retrying' ? 'Retry playback' : canPause ? 'Pause' : 'Play'}
+		</button>
 		<NativeAudio {mediaRevision} {streamUrl} {attachNativeAudio} />
 		<button
 			class="nt-button nt-library-restart"
@@ -40,7 +74,11 @@
 		>
 			Restart current track
 		</button>
+		{@render favoriteAction?.()}
 	</div>
+	{#key seekState.attachment}<PlayerSeek state={seekState} {seek} />{/key}
+	{@render volumeControls()}
+	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
 	{#if !restartCanSeek}
 		<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 	{/if}
@@ -78,6 +116,7 @@
 		flex-wrap: wrap;
 		gap: var(--nt-space-2) var(--nt-space-3);
 	}
+	.nt-library-transport,
 	.nt-library-restart {
 		flex: 0 0 auto;
 		min-height: 2.75rem;
@@ -85,6 +124,8 @@
 		cursor: pointer;
 		font: inherit;
 	}
+	.nt-library-transport:disabled,
+	.nt-library-transport[aria-disabled='true'],
 	.nt-library-restart:disabled {
 		cursor: default;
 		opacity: 0.5;

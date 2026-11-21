@@ -1,4 +1,5 @@
-import { ApiError, type ApiClient } from '../api/client.js';
+import type { ApiClient } from '../api/client.js';
+import { validBinding } from './session-verification.js';
 
 type LikesClient = Pick<ApiClient, 'get' | 'put' | 'delete' | 'post'>;
 
@@ -29,18 +30,9 @@ function record(value: unknown): Record<string, unknown> {
 	return (value ?? {}) as Record<string, unknown>;
 }
 
-export async function isLikesSession(client: Pick<LikesClient, 'get'>, binding: string): Promise<boolean> {
-	try {
-		return record(await client.get<unknown>(`${LIKES_PATH}/session`)).session_binding === binding;
-	} catch (error) {
-		if (error instanceof ApiError && error.status === 401) return false;
-		throw error;
-	}
-}
-
 export async function loadLikes(client: Pick<LikesClient, 'get'>) {
 	const { items, session_binding: binding } = record(await client.get<unknown>(LIKES_PATH));
-	if (!Array.isArray(items) || items.length > MAX_LIKES || typeof binding !== 'string' || !binding) {
+	if (!Array.isArray(items) || items.length > MAX_LIKES || !validBinding(binding)) {
 		throw new Error('Invalid likes list');
 	}
 	const seen = new Set<string>();
@@ -115,20 +107,25 @@ export async function importDeviceLikes(
 	scope: {
 		binding: string;
 		isCurrent: () => boolean;
+		run: <T>(work: () => T) => Promise<T | undefined>;
 		retireConfirmed: (ids: readonly string[]) => Promise<boolean>;
 	}
-): Promise<boolean> {
+): Promise<'none-confirmed' | 'partial' | 'complete' | 'cleanup-failed' | null> {
 	const targets = [...new Set(ids.filter(isTrackId))];
+	let count = 0;
 	for (let start = 0; start < targets.length; start += IMPORT_BATCH_SIZE) {
-		if (!scope.isCurrent()) return false;
+		if (!scope.isCurrent()) return null;
 		const batch = targets.slice(start, start + IMPORT_BATCH_SIZE);
-		const receipt = await client.post<unknown>(`${LIKES_PATH}/import`, {
+		const started = await scope.run(() => ({ receipt: client.post<unknown>(`${LIKES_PATH}/import`, {
 			session_binding: scope.binding,
 			items: batch.map((target_id) => ({ kind: 'track', target_id }))
-		});
-		if (!scope.isCurrent()) return false;
+		}) }));
+		if (!started) return null;
+		const receipt = await started.receipt;
+		if (!scope.isCurrent()) return null;
 		const confirmed = confirmedIds(batch, receipt);
-		if (confirmed.length && !(await scope.retireConfirmed(confirmed))) return false;
+		count += confirmed.length;
+		if (confirmed.length && !(await scope.retireConfirmed(confirmed))) return 'cleanup-failed';
 	}
-	return true;
+	return count === 0 ? 'none-confirmed' : count < new Set(ids).size ? 'partial' : 'complete';
 }

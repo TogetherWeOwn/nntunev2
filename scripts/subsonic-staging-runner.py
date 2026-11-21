@@ -4,9 +4,15 @@
 import argparse
 import hashlib
 import json
+import math
+import os
 import re
+import signal
+import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from selectors import EVENT_READ, EVENT_WRITE, DefaultSelector
 from urllib.parse import quote_plus, urlencode
 
 MATRIX = Path(__file__).resolve().parents[1] / "fixtures/subsonic/staging/matrix.json"
@@ -71,6 +77,11 @@ class PreparedPost:
 def prepare_requests(path, bearer, api_key):
     """Build unsent POSTs from only the reviewed schedule, with no live CLI."""
     matrix = load_matrix(path)
+    bearer, api_key = _validate_credentials(bearer, api_key)
+    return (_prepare_post(slot, bearer, api_key) for slot in matrix["slots"])
+
+
+def _validate_credentials(bearer, api_key):
     require(
         isinstance(bearer, str) and re.fullmatch(r"[!-~]{1,1024}", bearer),
         "credential-shape",
@@ -78,10 +89,10 @@ def prepare_requests(path, bearer, api_key):
     require(
         isinstance(api_key, str)
         and re.fullmatch(r"[!-~]{32,512}", api_key)
-        and len(quote_plus(api_key)) <= ENCODED_API_KEY_LIMIT,
+        and len(quote_plus(str.__str__(api_key))) <= ENCODED_API_KEY_LIMIT,
         "credential-shape",
     )
-    return (_prepare_post(slot, bearer, api_key) for slot in matrix["slots"])
+    return str.__str__(bearer), str.__str__(api_key)
 
 
 def _prepare_post(slot, bearer, api_key):
@@ -144,13 +155,222 @@ def classify_fixed_rejection(
     return sample
 
 
+@dataclass(frozen=True)
+class PostResponse:
+    status: int
+    body: bytes = field(repr=False)
+    content_type: str | None = field(repr=False)
+    cache_control: str | None = field(repr=False)
+    retry_after: str | None = field(repr=False)
+
+
+def _curl_config(post):
+    def quoted(value):
+        return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    lines = [f"header = {quoted(f'{name}: {value}')}" for name, value in post.headers]
+    lines.append(f"data-binary = {quoted(post.body.decode('ascii'))}")
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+_RESPONSE_FIELDS = (b"content-type", b"cache-control", b"retry-after")
+_RESPONSE_HEADER_LIMIT = 8192
+
+
+def _response_head(raw, cap):
+    status_line, *lines = bytes(raw).split(b"\r\n")
+    match = re.fullmatch(rb"HTTP/1\.[01] ([1-5][0-9]{2})(?: [ -~]*)?", status_line)
+    require(match, "response-headers")
+    status = int(match[1])
+    require(not 300 <= status < 400, "redirect-refused")
+    cap = min(cap, REJECTION_LIMIT) if status >= 400 else cap
+    fields = {}
+    for line in lines:
+        name, sep, value = line.partition(b":")
+        require(sep and re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name), "response-headers")
+        name = name.lower()
+        if name in (*_RESPONSE_FIELDS, b"content-length", b"content-encoding", b"transfer-encoding"):
+            require(name not in fields and re.fullmatch(rb"[\t -~]*", value), "response-headers")
+            fields[name] = value.strip().decode("ascii")
+    require(fields.get(b"content-encoding", "identity").lower() == "identity", "response-headers")
+    length = fields.get(b"content-length")
+    transfer = fields.get(b"transfer-encoding")
+    if status < 200:
+        require(status != 101 and length is None and transfer is None, "response-headers")
+        return None
+    if transfer is not None:
+        require(length is None and transfer.lower() == "chunked", "response-headers")
+    if length is not None:
+        require(length.isdecimal(), "response-headers")
+        length = length.lstrip("0") or "0"
+        require(len(length) <= len(str(cap)) and int(length) <= cap, "body-limit")
+        length = int(length)
+    return status, length, cap, tuple(fields.get(name) for name in _RESPONSE_FIELDS)
+
+
+class StagingPostTransport:
+    """One reviewed slot per call. The executor still owns scheduling and server evidence."""
+
+    def __init__(self, *, spawn=subprocess.Popen):
+        self._matrix = load_matrix(MATRIX)
+        self._spawn = spawn  # Trusted dependency injection for disposable clients only.
+
+    def _remaining(self, deadline, cancel):
+        require(not cancel.is_set(), "cancelled")
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "request-or-reader-timeout")
+        return min(0.05, remaining)
+
+    def send(self, number, bearer, api_key, *, deadline, cancel):
+        """Return a PostResponse or a sanitized fixed-rejection/client-ended sample.
+
+        deadline is the executor's absolute monotonic cutoff; cancel is a threading.Event.
+        Credentials are the staging measurement credentials, not health Access tokens.
+        """
+        slots, limits = self._matrix["slots"], self._matrix["limits"]
+        require(type(number) is int and 1 <= number <= len(slots), "unreviewed-slot")
+        require(type(deadline) is float and math.isfinite(deadline), "invalid-deadline")
+        slot = slots[number - 1]
+        post = _prepare_post(slot, *_validate_credentials(bearer, api_key))
+        require(post.method == "POST" and post.url == f"{STAGING_ORIGIN}/rest/{slot['endpoint']}",
+                "destination-refused")
+        reader = slot.get("reader", "normal")
+        timeout_ms = limits["request_timeout_ms"]
+        if reader != "normal":
+            timeout_ms = min(timeout_ms, limits["reader_hold_max_ms"])
+        start = time.monotonic()
+        end = min(deadline, start + timeout_ms / 1000)
+        # Withhold even pipe reads for paired legs; curl, TLS and kernel buffering still exist.
+        read_after = start + {"normal": 0, "held": 1.5, "disconnect": 1.1}[reader]
+        oracle = slot["expected"]["oracle"]
+        cap = REJECTION_LIMIT if oracle in REJECTION_ORACLES else limits["body_bytes"]
+        argv = (
+            "/usr/bin/curl", "--disable", "--globoff", "--proto", "=https", "--noproxy", "*",
+            "--no-location", "--retry", "0", "--http1.1", "--silent", "--no-buffer", "--include",
+            # Observe all bytes through connection close, not curl's Content-Length cutoff.
+            "--ignore-content-length", "--header", "Connection: close",
+            "--connect-timeout", str(limits["connect_timeout_ms"] / 1000),
+            "--max-time", str(timeout_ms / 1000), "--request", "POST", "--config", "-",
+            "--url", post.url,
+        )
+        self._remaining(end, cancel)
+        try:
+            process = self._spawn(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env={}, close_fds=True)
+            try:
+                response = self._exchange(process, _curl_config(post), cap, end, cancel,
+                                          read_after, reader == "disconnect")
+            finally:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=limits["cleanup_timeout_ms"] / 1000)
+                finally:
+                    process.stdin.close()
+                    process.stdout.close()
+        except subprocess.TimeoutExpired:
+            raise Stop("client-reap-timeout") from None
+        except OSError:
+            raise Stop("transport-io") from None
+        self._remaining(end, cancel)
+        if response is None:
+            require(process.returncode == -signal.SIGKILL, "disconnect-unconfirmed")
+            return {"oracle": "client-ended"}  # Local client only; never evidence of server drain.
+        if oracle in REJECTION_ORACLES:
+            return classify_fixed_rejection(slot, response.status, response.body,
+                                            response.content_type, response.cache_control,
+                                            response.retry_after)
+        return response
+
+    def _exchange(self, process, config, cap, end, cancel, read_after, disconnect):
+        head, body = bytearray(), bytearray()
+        header_budget = _RESPONSE_HEADER_LIMIT
+        response_head, eof, reading = None, False, False
+        with DefaultSelector() as selector:
+            os.set_blocking(process.stdin.fileno(), False)
+            os.set_blocking(process.stdout.fileno(), False)
+            selector.register(process.stdin, EVENT_WRITE)
+            while True:
+                wait = self._remaining(end, cancel)
+                until_read = read_after - time.monotonic()
+                if not reading and until_read <= 0:
+                    selector.register(process.stdout, EVENT_READ)
+                    reading = True
+                if eof and process.poll() is not None:
+                    break
+                if not reading and until_read > 0:
+                    wait = min(wait, until_read)
+                if not selector.get_map():
+                    cancel.wait(wait)
+                    continue
+                for key, _ in selector.select(wait):
+                    self._remaining(end, cancel)
+                    if key.fileobj is process.stdin:
+                        config = config[os.write(key.fd, config):]
+                        if not config:
+                            selector.unregister(key.fileobj)
+                            process.stdin.close()
+                        continue
+                    read_size = (min(8192, cap - len(body) + 1) if response_head
+                                 else min(REJECTION_LIMIT, header_budget - len(head)))
+                    chunk = os.read(key.fd, read_size)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        eof = True
+                        continue
+                    if not response_head:
+                        head.extend(chunk)
+                        while not response_head and (offset := head.find(b"\r\n\r\n")) >= 0:
+                            response_head = _response_head(head[:offset], cap)
+                            del head[:offset + 4]
+                            header_budget -= offset + 4
+                        if not response_head:
+                            require(len(head) < header_budget, "response-headers")
+                            continue
+                        status, length, cap, fields = response_head
+                        if disconnect:
+                            require(status == 200 and length != 0, "response-mismatch")
+                            require(process.poll() is None, "disconnect-unconfirmed")
+                            return None
+                        chunk = head
+                    require(len(body) + len(chunk) <= cap, "body-limit")
+                    body.extend(chunk)
+                    require(length is None or len(body) <= length, "transport-incomplete")
+        require(process.returncode != 28, "request-or-reader-timeout")  # CURLE_OPERATION_TIMEDOUT
+        require(process.returncode == 0 and response_head is not None, "transport-incomplete")
+        require(length is None or len(body) == length, "transport-incomplete")
+        return PostResponse(status, bytes(body), *fields)
+
+
+@dataclass(frozen=True)
+class Deployment:
+    deployment_id: str
+    version: str
+    serving_version: str
+    enabled: bool
+    lease: bool
+    measurement_binding: bool
+
+    def verified_off(self):
+        return (
+            bool(self.deployment_id and self.version)
+            and self.serving_version == self.version
+            and self.enabled is False
+            and self.lease is False
+            and self.measurement_binding is False
+        )
+
+
+BASELINE = Deployment("deploy-off", "baseline", "baseline", False, False, False)
+EXPERIMENT = Deployment("deploy-on", "experiment", "experiment", True, True, True)
+
+
 class StagingModel:
     """Synthetic clock, telemetry and readback; no transport or provider calls."""
 
     def __init__(self):
         self.now = 0
-        self.version = "baseline"
-        self.lease = False
+        self.state = BASELINE
         self.pending = {}
 
     def tick(self):
@@ -160,7 +380,8 @@ class StagingModel:
         return self.now, True, len(self.pending)
 
     def arm(self):
-        self.version, self.lease = "experiment", True
+        require(self.state == BASELINE, "preflight-not-off-and-idle")
+        self.state = EXPERIMENT
 
     def start(self, slot):
         delay = {"normal": 100, "held": 1500, "disconnect": 1100}[slot.get("reader", "normal")]
@@ -183,13 +404,16 @@ class StagingModel:
     def cancel_clients(self):
         self.pending.clear()
 
-    def restore(self, baseline):
-        # Do not overwrite a newer deployment; verify its off-state instead.
-        if self.version == "experiment":
-            self.version, self.lease = baseline, False
+    def restore_if_current(self, expected_deployment_id):
+        # Atomic only in this model. A provider read then unconditional write is not equivalent.
+        if self.state.deployment_id != expected_deployment_id:
+            return None
+        self.state = Deployment("deploy-restored", BASELINE.version, BASELINE.version,
+                                False, False, False)
+        return self.state.deployment_id
 
     def readback(self):
-        return self.version, self.lease
+        return self.state
 
 
 def advance(model):
@@ -272,20 +496,47 @@ def execute(model, matrix, report, cutoff):
             advance(model)
 
 
+def cleanup(model, limits):
+    deadline = model.now + limits["cleanup_timeout_ms"]
+    restored_id = None
+    try:
+        model.cancel_clients()
+    finally:
+        current = model.readback()
+        if (current.deployment_id, current.version) == (EXPERIMENT.deployment_id, EXPERIMENT.version):
+            restored_id = model.restore_if_current(EXPERIMENT.deployment_id)
+
+    off = model.readback()
+    require(off.verified_off() and off.version != EXPERIMENT.version
+            and off.deployment_id != EXPERIMENT.deployment_id, "restore-unverified")
+    owned = off.deployment_id in (BASELINE.deployment_id, restored_id)
+    require(not owned or off.version == BASELINE.version, "restore-unverified")
+    # Advance before sampling: a zero observed at/before the off readback is not drain evidence.
+    while model.now < deadline:
+        advance(model)
+        require(model.now <= deadline, "restore-unverified")
+        if pressure(model, limits) == 0:
+            require(model.readback() == off, "restore-unverified")
+            return "simulated-off-and-drained" if owned else "simulated-superseded-off-and-drained"
+    return "unverified"
+
+
 def rehearse(path, model):
     report = {"mode": "offline-simulation", "stop": "complete", "cleanup": "not-armed",
               "starts": 0, "max_simulated_clients": 0, "max_simulated_backends": None,
               "simulated_pair_overlap": {}, "slots": {}}
-    baseline = None
+    cleanup_needed = False
     try:
         matrix = load_matrix(path)
         report["slots"] = {slot["slot"]: {"state": "unstarted"} for slot in matrix["slots"]}
         limits = matrix["limits"]
-        version, lease = model.readback()
-        require(version and lease is False and pressure(model, limits) == 0, "preflight-not-off-and-idle")
-        baseline = version  # Arm can fail after changing state, so cleanup owns this first.
+        baseline = model.readback()
+        require(baseline == BASELINE and baseline.verified_off() and pressure(model, limits) == 0,
+                "preflight-not-off-and-idle")
+        cleanup_needed = True  # Even a failed arm can have changed state.
         start = model.now
         model.arm()
+        require(model.readback() == EXPERIMENT, "serving-version-unverified")
         cutoff = start + min(limits["load_window_ms"], limits["lease_max_ms"],
                              limits["job_timeout_ms"] - limits["cleanup_timeout_ms"])
         execute(model, matrix, report, cutoff)
@@ -296,21 +547,10 @@ def rehearse(path, model):
     except Exception:
         report["stop"] = "model-failure"
     finally:
-        if baseline is not None:
+        if cleanup_needed:
             report["cleanup"] = "unverified"
-            deadline = model.now + limits["cleanup_timeout_ms"]
             try:
-                try:
-                    model.cancel_clients()
-                finally:
-                    model.restore(baseline)
-                while model.now <= deadline:
-                    restored, live_lease = model.readback()
-                    require(restored and restored != "experiment" and live_lease is False, "restore-unverified")
-                    if pressure(model, limits) == 0:
-                        report["cleanup"] = "simulated-off-and-drained"
-                        break
-                    advance(model)
+                report["cleanup"] = cleanup(model, limits)
             except (Exception, KeyboardInterrupt):
                 pass  # Leave cleanup unverified; never echo adapter exceptions.
     return report

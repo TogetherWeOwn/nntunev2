@@ -33,8 +33,8 @@ use crate::auth::{
 use crate::handlers::{
     self, AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome, AsyncDns,
     ChallengeRow, Config, Dialer, InviteWindow, InviteWindowOutcome, InviteWindowWrite, Mailer,
-    NativeCredentialRow, PairAdmission, PlanRow, QaIssuedCode, RateLimitBudget, Store, StoreError,
-    SubscriptionRow, UserRecord,
+    MemberInviteIssueOutcome, NativeCredentialRow, PairAdmission, PlanRow, QaIssuedCode,
+    RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord,
 };
 #[allow(dead_code)] // Prepared for the separately qualified owned billing transport.
 #[path = "billing_budget.rs"]
@@ -527,6 +527,10 @@ async fn query_playback_lease_row(
             play_id: row.try_get("play_id").map_err(|_| StoreError)?,
             epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
             expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+            continuation_deadline: u64_of(
+                row.try_get("continuation_deadline")
+                    .map_err(|_| StoreError)?,
+            )?,
         })),
     }
 }
@@ -540,7 +544,7 @@ pub async fn acquire_playback_lease_on(
     track_id: &str,
     play_id: &str,
     now: u64,
-    expires_at: u64,
+    continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
     let rows = client
@@ -551,9 +555,13 @@ pub async fn acquire_playback_lease_on(
                 (&session_id, Type::TEXT),
                 (&track_id, Type::TEXT),
                 (&play_id, Type::TEXT),
-                (&i64_of(expires_at)?, Type::INT8),
+                (
+                    &i64_of(crate::playback::lease_expiry(now, continuation_deadline))?,
+                    Type::INT8,
+                ),
                 (&i64_of(now)?, Type::INT8),
                 (&takeover, Type::BOOL),
+                (&i64_of(continuation_deadline)?, Type::INT8),
             ],
         )
         .await
@@ -961,7 +969,7 @@ pub async fn private_aware_lease_for_postgres_test(
     track_id: &str,
     play_id: &str,
     now: u64,
-    expires_at: u64,
+    continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
     PgStore {
@@ -973,7 +981,13 @@ pub async fn private_aware_lease_for_postgres_test(
         test_mirror: None,
     }
     .acquire_playback_lease(
-        user_id, session_id, track_id, play_id, now, expires_at, takeover,
+        user_id,
+        session_id,
+        track_id,
+        play_id,
+        now,
+        continuation_deadline,
+        takeover,
     )
     .await
 }
@@ -1103,7 +1117,7 @@ impl PgStore {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
@@ -1174,7 +1188,14 @@ impl PgStore {
                     }
                 }
                 let result = acquire_playback_lease_on(
-                    &tx, user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                    &tx,
+                    user_id,
+                    session_id,
+                    track_id,
+                    play_id,
+                    now,
+                    continuation_deadline,
+                    takeover,
                 )
                 .await?;
                 if matches!(result, crate::playback::LeaseAcquire::Acquired { .. }) {
@@ -2082,6 +2103,30 @@ async fn claim_single_use_on(
     Ok(rows.len() as u64)
 }
 
+async fn invite_by_hash_on(
+    client: &impl GenericClient,
+    code_hash: &str,
+) -> Result<Option<InviteRecord>, StoreError> {
+    // Preflight only; the invite claim rechecks the bounds under lock.
+    let statement = format!(
+        "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email FROM invite_codes \
+         LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
+         LEFT JOIN invite_windows w ON w.id = invite_codes.window_id \
+         WHERE invite_codes.code_hash = $1 AND (invite_codes.kind = 'admin' OR \
+             (invite_codes.kind = 'member' AND w.id IS NOT NULL AND \
+              int8range(w.starts_at, w.ends_at, '[)') @> floor(extract(epoch FROM clock_timestamp()))::bigint))"
+    );
+    let rows = client
+        .query_typed(&statement, &[(&code_hash, Type::TEXT)])
+        .await
+        .map_err(|_| StoreError)?;
+    // `query_opt`'s rule: more than one row is an error.
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    rows.first().map(invite_from_row).transpose()
+}
+
 async fn insert_credential_on(
     client: &impl GenericClient,
     credential: &PasskeyCredential,
@@ -2163,7 +2208,8 @@ async fn complete_registration_on(
         transaction
             .query_typed(
                 "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+                 SELECT $1, $2, $3, $4, CASE WHEN kind = 'member' THEN redeemed_at ELSE $5 END, $6, $7::jsonb \
+                 FROM invite_codes WHERE code_hash = $8",
                 &[
                     (&audit.user_id, Type::TEXT),
                     (&audit.action, Type::TEXT),
@@ -2172,6 +2218,7 @@ async fn complete_registration_on(
                     (&i64_of(audit.at)?, Type::INT8),
                     (&audit.subject_user_id, Type::TEXT),
                     (&audit.details, Type::TEXT),
+                    (&record.code_hash, Type::TEXT),
                 ],
             )
             .await
@@ -2917,6 +2964,216 @@ async fn admin_issue_invite_on(
     Ok(AdminInviteIssueOutcome::Issued(invite_id))
 }
 
+impl From<tokio_postgres::Error> for StoreError {
+    fn from(_: tokio_postgres::Error) -> Self {
+        StoreError
+    }
+}
+
+// NULL coverage is unknown. Count the union, not the sum of invoice spans.
+const MEMBER_PAID_SECONDS_SQL: &str =
+    "(SELECT COALESCE(sum(extract(epoch FROM upper(span) - lower(span))), 0)
+    FROM unnest((SELECT range_agg(covered_periods) FROM paid_invoice_history
+      WHERE user_id = $1 AND amount_cents > 0 AND paid_at <= statement_timestamp())) AS span)";
+const MEMBER_PAID_MONTH_SECONDS: i64 = 30 * 86_400;
+
+fn member_invite_setting(
+    row: &tokio_postgres::Row,
+    key: crate::admin::SettingKey,
+) -> Result<i64, StoreError> {
+    key.resolve(row.try_get(key.as_str())?)
+        .map(i64::from)
+        .ok_or(StoreError)
+}
+
+fn member_invite_entitlement<'a>(
+    row: &'a tokio_postgres::Row,
+    plan_id: &'a str,
+) -> Result<crate::billing::SubscriptionView<'a>, StoreError> {
+    Ok(crate::billing::SubscriptionView {
+        plan_id,
+        status: row.try_get("status")?,
+        cancel_at_period_end: row.try_get("cancel_at_period_end")?,
+        paid_through_at_unix: row.try_get("paid_through_at_unix")?,
+        grace_until_unix: row.try_get("grace_until_unix")?,
+        current_period_end_unix: None,
+    })
+}
+
+async fn member_invite_summary_on(
+    client: &tokio_postgres::Client,
+    issuer: &str,
+) -> Result<Option<handlers::MemberInviteSummary>, StoreError> {
+    use crate::admin::SettingKey;
+    use handlers::{MemberInviteOpenWindow, MemberInviteSummary, MemberInviteWindowBounds};
+    let live = crate::billing::subscription_live_select_statement();
+    // A single statement supplies both the MVCC snapshot and clock. Do not
+    // take issuance locks or call any invite lookup that can audit expiry.
+    let sql = format!("WITH instant AS (SELECT floor(extract(epoch FROM statement_timestamp()))::bigint AS now),
+        entitlement AS ({live})
+        SELECT instant.now, e.*, w.starts_at AS open_start, w.ends_at AS open_end,
+          n.starts_at AS next_start, n.ends_at AS next_end,
+          (SELECT value FROM app_settings WHERE key = 'invite_member_min_paid_months') AS invite_member_min_paid_months,
+          (SELECT value FROM app_settings WHERE key = 'invite_member_per_window') AS invite_member_per_window,
+          floor({MEMBER_PAID_SECONDS_SQL})::bigint AS paid_seconds,
+          (SELECT count(*) FROM invite_codes WHERE window_id = w.id AND issued_by = $1) AS used
+        FROM instant LEFT JOIN entitlement e ON TRUE
+        LEFT JOIN invite_windows w ON int8range(w.starts_at, w.ends_at, '[)') @> instant.now
+        LEFT JOIN LATERAL (
+          SELECT starts_at, ends_at FROM invite_windows
+          WHERE starts_at > instant.now AND ends_at > starts_at ORDER BY starts_at LIMIT 1
+        ) n ON TRUE
+        WHERE EXISTS (SELECT 1 FROM users WHERE id = $1 AND deleting_at IS NULL)");
+    let Some(row) = client
+        .query_typed_opt(&sql, &[(&issuer, Type::TEXT)])
+        .await?
+    else {
+        return Ok(None);
+    };
+    let required_paid_seconds = member_invite_setting(&row, SettingKey::InviteMemberMinPaidMonths)?
+        * MEMBER_PAID_MONTH_SECONDS;
+    let per_window_limit = member_invite_setting(&row, SettingKey::InviteMemberPerWindow)?;
+    let paid_seconds = row.try_get("paid_seconds")?;
+    let view = row
+        .try_get::<_, Option<&str>>("plan_id")?
+        .map(|plan_id| member_invite_entitlement(&row, plan_id))
+        .transpose()?;
+    let entitled = crate::billing::resolve_effective_plan(view, row.try_get("now")?).entitled;
+    let bounds = |start, end| -> Result<_, StoreError> {
+        Ok(match row.try_get(start)? {
+            Some(starts_at) => Some(MemberInviteWindowBounds {
+                starts_at,
+                ends_at: row.try_get(end)?,
+            }),
+            None => None,
+        })
+    };
+    let used: i64 = row.try_get("used")?;
+    Ok(Some(MemberInviteSummary {
+        paid_seconds,
+        required_paid_seconds,
+        entitled,
+        eligible: entitled && paid_seconds >= required_paid_seconds,
+        per_window_limit,
+        open_window: bounds("open_start", "open_end")?.map(|bounds| MemberInviteOpenWindow {
+            bounds,
+            used,
+            remaining: (per_window_limit - used).max(0),
+        }),
+        next_window: bounds("next_start", "next_end")?,
+    }))
+}
+
+async fn member_issue_invite_on(
+    client: &mut tokio_postgres::Client,
+    issuer: &str,
+    code_hash: &str,
+    source_ip: &str,
+) -> Result<MemberInviteIssueOutcome, StoreError> {
+    use crate::admin::SettingKey;
+    use MemberInviteIssueOutcome as Outcome;
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .start()
+        .await?;
+    tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+        .await?;
+    // Serialize spending and fence erasure without blocking FK checks.
+    let issuer_lock =
+        "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR NO KEY UPDATE";
+    use tokio_postgres::types::ToSql;
+    let member: [(&(dyn ToSql + Sync), Type); 1] = [(&issuer, Type::TEXT)];
+    if tx.query_typed_opt(issuer_lock, &member).await?.is_none() {
+        return Ok(Outcome::AccountDeleting);
+    }
+    // Shared locks fence early close and billing updates without serializing issuers.
+    let live = crate::billing::subscription_live_select_statement();
+    let sql = format!("WITH open_window AS (
+          SELECT id, starts_at, ends_at FROM invite_windows
+          WHERE int8range(starts_at, ends_at, '[)') @> floor(extract(epoch FROM statement_timestamp()))::bigint FOR SHARE
+        ), entitlement AS ({live} FOR SHARE)
+        SELECT w.*, e.*,
+          (SELECT value FROM app_settings WHERE key = 'invite_member_min_paid_months' FOR SHARE) AS invite_member_min_paid_months,
+          (SELECT value FROM app_settings WHERE key = 'invite_member_per_window' FOR SHARE) AS invite_member_per_window,
+          (SELECT value FROM app_settings WHERE key = 'invite_default_expiry_days' FOR SHARE) AS invite_default_expiry_days
+        FROM open_window w LEFT JOIN entitlement e ON TRUE");
+    let Some(gate) = tx.query_typed_opt(&sql, &member).await? else {
+        return Ok(Outcome::WindowClosed);
+    };
+    let Some(plan_id) = gate.try_get("plan_id")? else {
+        return Ok(Outcome::Ineligible);
+    };
+    let setting = |key| member_invite_setting(&gate, key);
+    let window_id: i64 = gate.try_get("id")?;
+    let cap = setting(SettingKey::InviteMemberPerWindow)?;
+    let threshold = setting(SettingKey::InviteMemberMinPaidMonths)? * MEMBER_PAID_MONTH_SECONDS;
+    let policy = tx
+        .query_typed_one(
+            &format!("SELECT CASE
+           WHEN $3 = 0 OR EXISTS (SELECT 1 FROM invite_codes WHERE window_id = $2
+             AND issued_by = $1 OFFSET greatest($3 - 1, 0) LIMIT 1) THEN 'quota'
+           WHEN $4 > 0 AND {MEMBER_PAID_SECONDS_SQL} < $4 THEN 'history' END, floor(extract(epoch FROM clock_timestamp()))::bigint"),
+            &[
+                (&issuer, Type::TEXT),
+                (&window_id, Type::INT8),
+                (&cap, Type::INT8),
+                (&threshold, Type::INT8),
+            ],
+        )
+        .await?;
+    match policy.try_get(0)? {
+        Some("quota") => return Ok(Outcome::QuotaExhausted),
+        Some("history") => return Ok(Outcome::Ineligible),
+        None => (),
+        _ => return Err(StoreError),
+    }
+    let now: i64 = policy.try_get(1)?;
+    let starts_at: i64 = gate.try_get("starts_at")?;
+    let ends_at: i64 = gate.try_get("ends_at")?;
+    let view = member_invite_entitlement(&gate, plan_id)?;
+    use crate::billing::resolve_effective_plan;
+    let refuse = |at| {
+        if !(starts_at..ends_at).contains(&at) {
+            return Some(Outcome::WindowClosed);
+        }
+        (!resolve_effective_plan(Some(view), at).entitled).then_some(Outcome::Ineligible)
+    };
+    if let Some(reason) = refuse(now) {
+        return Ok(reason);
+    }
+    let expires_at = ends_at.min(now + setting(SettingKey::InviteDefaultExpiryDays)? * 86_400);
+    let ip = crate::vault::sanitize_source_ip(Some(source_ip));
+    let id = tx
+        .query_typed_one(
+            "WITH issued AS (
+           INSERT INTO invite_codes (code_hash, created_at, issued_by, kind, expires_at, window_id)
+           VALUES ($1, $2, $3, 'member', $4, $5) RETURNING id
+         ) INSERT INTO audit_log (user_id, action, ok, source_ip, at, details)
+          SELECT $3, 'invite.issued', TRUE, $6, $2, jsonb_build_object('invite_id', id, 'kind', 'member', 'window_id', $5)
+         FROM issued RETURNING (details->>'invite_id')::bigint",
+            &[
+                (&code_hash, Type::TEXT),
+                (&now, Type::INT8),
+                (&issuer, Type::TEXT),
+                (&expires_at, Type::INT8),
+                (&window_id, Type::INT8),
+                (&ip, Type::TEXT),
+            ],
+        )
+        .await?
+        .try_get(0)?;
+    // Writes can wait on locks. Check against the live DB clock before commit.
+    let clock = "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint";
+    let after = tx.query_typed_one(clock, &[]).await?;
+    if let Some(reason) = refuse(after.try_get(0)?) {
+        tx.rollback().await?;
+        return Ok(reason);
+    }
+    tx.commit().await?;
+    Ok(Outcome::Issued { id, expires_at })
+}
+
 /// Admin invite revoke (migration 0033): the conditional UPDATE and
 /// its `invite.revoked` audit row commit together. The invite row is
 /// locked first, so a redemption claim executing concurrently either
@@ -2996,6 +3253,52 @@ fn invite_window_from_row(row: &tokio_postgres::Row) -> Result<InviteWindow, Sto
         created_by: row.try_get("created_by").map_err(|_| StoreError)?,
         note: row.try_get("note").map_err(|_| StoreError)?,
     })
+}
+
+async fn admin_list_invites_on(
+    client: &impl GenericClient,
+    issuer: Option<&str>,
+    status: Option<&str>,
+    now: u64,
+    limit: usize,
+) -> Result<Vec<InviteRecord>, StoreError> {
+    // Match InviteRecord::status (redeemed > revoked > expired > active).
+    let status_predicate = match status {
+        Some("redeemed") => "(redeemed_at IS NOT NULL OR used)",
+        Some("revoked") => "(redeemed_at IS NULL AND NOT used AND revoked_at IS NOT NULL)",
+        Some("expired") => {
+            "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at <= $2)"
+        }
+        Some("active") => {
+            "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at > $2)"
+        }
+        _ => "TRUE",
+    };
+    // Project the current deadline once for both the filter and the returned row.
+    // The member's window is retained on close; stored invite expiry is untouched.
+    let statement = format!(
+        "SELECT * FROM (
+            SELECT i.id, i.code_hash, i.used, i.created_at, i.issued_by, i.kind, i.email,
+                   CASE WHEN i.kind = 'member' THEN LEAST(i.expires_at, w.ends_at)
+                        ELSE i.expires_at END AS expires_at,
+                   i.redeemed_by, i.redeemed_at, i.revoked_at, i.revoked_by, i.window_id
+            FROM invite_codes i LEFT JOIN invite_windows w ON w.id = i.window_id
+         ) ledger
+         WHERE ($1::text IS NULL OR issued_by = $1) AND {status_predicate}
+         ORDER BY id DESC LIMIT $3"
+    );
+    let rows = client
+        .query_typed(
+            &statement,
+            &[
+                (&issuer, Type::TEXT),
+                (&i64_of(now)?, Type::INT8),
+                (&i64::try_from(limit).map_err(|_| StoreError)?, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    rows.iter().map(invite_from_row).collect()
 }
 
 async fn admin_list_invite_windows_on(
@@ -4232,6 +4535,25 @@ impl Store for PgStore {
         .await
     }
 
+    async fn record_listen_event(
+        &self,
+        owner: &str,
+        event: &crate::listen_history::ListenEventBody,
+        now: u64,
+    ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let now = i64::try_from(now).map_err(|_| StoreError)?;
+                let mut client = self.connect().await?;
+                crate::listen_history::record(&mut client, owner, event, now)
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.listen_write"))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn export_listen_events(
         &self,
         owner: &str,
@@ -4284,11 +4606,17 @@ impl Store for PgStore {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         self.acquire_private_aware_lease(
-            user_id, session_id, track_id, play_id, now, expires_at, takeover,
+            user_id,
+            session_id,
+            track_id,
+            play_id,
+            now,
+            continuation_deadline,
+            takeover,
         )
         .await
     }
@@ -4329,10 +4657,11 @@ impl Store for PgStore {
         .await
     }
 
-    async fn track_meter_meta(
+    async fn track_meta(
         &self,
         user_id: &str,
         track_id: &str,
+        duration_only: bool,
     ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
         // A non-UUID track has no `tracks` row to read (and the cast
         // would fail the query besides): meter it on the fallback
@@ -4378,7 +4707,11 @@ impl Store for PgStore {
                 };
                 Ok(crate::meter_sink::TrackMeterMeta {
                     track_duration_ms,
-                    mb_duration_ms: self.mb_duration_for(track_mbid.as_deref()).await?,
+                    mb_duration_ms: if duration_only && track_duration_ms.is_some_and(|ms| ms > 0) {
+                        None
+                    } else {
+                        self.mb_duration_for(track_mbid.as_deref()).await?
+                    },
                     bitrate_kbps,
                     file_bytes,
                 })
@@ -4460,23 +4793,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // The issuer's current email rides along so the pure
-                // prepare can refuse self-invites before any claim.
-                let statement = format!(
-                    "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email \
-                     FROM invite_codes \
-                     LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
-                     WHERE invite_codes.code_hash = $1"
-                );
-                let rows = client
-                    .query_typed(&statement, &[(&code_hash, Type::TEXT)])
-                    .await
-                    .map_err(|_| StoreError)?;
-                // `query_opt`'s rule: more than one row is an error.
-                if rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                rows.first().map(invite_from_row).transpose()
+                invite_by_hash_on(&client, code_hash).await
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5600,6 +5917,7 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| failed())?;
                 for history in &outcome.history {
+                    let (starts, ends) = history.coverage_bounds();
                     transaction
                         .query_typed(
                             crate::billing_reconcile::insert_paid_invoice_history_statement(),
@@ -5613,6 +5931,8 @@ impl Store for PgStore {
                                 (&history.amount_cents, Type::INT8),
                                 (&history.currency, Type::TEXT),
                                 (&history.paid_at_unix, Type::INT8),
+                                (&starts, Type::INT8_ARRAY),
+                                (&ends, Type::INT8_ARRAY),
                             ],
                         )
                         .await
@@ -6101,6 +6421,33 @@ impl Store for PgStore {
         .await
     }
 
+    async fn member_invite_summary(
+        &self,
+        issuer: &str,
+    ) -> Result<Option<handlers::MemberInviteSummary>, StoreError> {
+        Self::bounded(
+            async { member_invite_summary_on(&self.connect().await?, issuer).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn member_issue_invite(
+        &self,
+        issuer: &str,
+        code_hash: &str,
+        source_ip: &str,
+    ) -> Result<MemberInviteIssueOutcome, StoreError> {
+        Self::bounded(
+            async {
+                member_issue_invite_on(&mut self.connect().await?, issuer, code_hash, source_ip)
+                    .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn admin_list_invites(
         &self,
         issuer: Option<&str>,
@@ -6110,41 +6457,11 @@ impl Store for PgStore {
     ) -> Result<Vec<InviteRecord>, StoreError> {
         Self::bounded(
             async {
-                let client = self.connect().await?;
-                // The status filter mirrors `InviteRecord::status`
-                // exactly (redeemed > revoked > expired > active).
-                let status_predicate = match status {
-                    Some("redeemed") => "(redeemed_at IS NOT NULL OR used)",
-                    Some("revoked") => {
-                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NOT NULL)"
-                    }
-                    Some("expired") => {
-                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at <= $2)"
-                    }
-                    Some("active") => {
-                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at > $2)"
-                    }
-                    _ => "TRUE",
-                };
-                let statement = format!(
-                    "SELECT {INVITE_COLUMNS} FROM invite_codes \
-                     WHERE ($1::text IS NULL OR issued_by = $1) AND {status_predicate} \
-                     ORDER BY id DESC LIMIT $3"
-                );
-                let rows = client
-                    .query_typed(
-                        &statement,
-                        &[
-                            (&issuer, Type::TEXT),
-                            (&i64_of(now)?, Type::INT8),
-                            (&i64::try_from(limit).map_err(|_| StoreError)?, Type::INT8),
-                        ],
-                    )
+                admin_list_invites_on(&self.connect().await?, issuer, status, now, limit)
                     .await
                     .map_err(|_| {
                         self.statement_failed("api.db.statement_failed.admin_list_invites")
-                    })?;
-                rows.iter().map(invite_from_row).collect()
+                    })
             },
             TOTAL_TIMEOUT_MS,
         )

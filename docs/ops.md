@@ -978,6 +978,33 @@ retrospective publication audit. No lifecycle-script exemption is granted.
 Retain the exact-head Actions job link and build-log artifact with review
 evidence; a skipped staging lane is not deployment evidence.
 
+For the staging API, keep `redact_query_string = true` under
+`[env.staging.observability]` in the deploy workflow's generated TOML. The
+upload check also reads the pinned Wrangler CLI's `--outfile` multipart body
+and requires `observability.redact_query_string` to be the boolean `true`
+in the `metadata` part for both mirror states. It never prints or publishes
+that body. This catches a CLI that accepts the TOML but drops the setting on
+upload. It does not prove Cloudflare applied the setting. Before any real
+Subsonic credentials are provisioned, the authorized operator must read back
+query-string redaction in the deployed staging API Worker's observability
+settings and verify it in that Worker's invocation log:
+
+1. Through the existing staging Access policy, send a read-only
+   `GET /v1/plans?redaction_probe=synthetic-only`. Include no application
+   session, authorization header or Subsonic credentials. An application
+   `401` is expected without a session; an Access denial is not a probe.
+2. Match the request by time, method and path in the **staging API Worker**
+   invocation logs. Do not use a web Worker event or treat a missing event
+   as a pass. The matching event must contain no query string. The API's
+   `/v1/*` route still matches with a query; its exact `/healthz` route does
+   not.
+
+Repeat both checks after relevant uploads or mount/configuration changes,
+which can change the effective setting. Record the deployed SHA and outcome,
+not the raw URL or log event. Keep raw request URLs and query strings out
+of application log fields independently, per the
+[logging standard](logging-standard.md).
+
 ## Staging promotion checklist
 
 Promotion is `main` HEAD → staging; production promotion is a later gated
@@ -1219,8 +1246,12 @@ environment exists on this repo.
   a green `staging-api` job may be an unconfigured skip, passed on as
   `api_deploy_outcome`), so a skipped/failed
   deploy cannot produce a full-journey PASS and no separate dispatch is
-  needed or accepted as evidence. Scheduled/manual `e2e-staging` runs are
-  synthetic monitoring only (the full-journey job is skipped there).
+  needed or accepted as evidence. `deploy-staging-main` queues later main
+  pushes until the entire deploy and verification finish. The
+  `e2e-staging-queued` group queues pending runs rather than replacing the
+  post-deploy call.
+  Scheduled/manual `e2e-staging` runs are synthetic monitoring only (the
+  full-journey job is skipped there).
   Record the deploy run and the `post-deploy-e2e` result, and call it
   same-build evidence only when staging `GET /api/build` returns the
   deploy SHA itself (a source SHA alone is not build identity; see the
@@ -1241,8 +1272,10 @@ environment exists on this repo.
   `success` (not `skipped`), before promoting. To accept rollback evidence,
   also require the rollback rerun's `staging-web` job conclusion to be `success`
   (not `skipped`); overall workflow success and staging health alone are
-  insufficient. To roll back `apps/web`, open that Actions run and choose
-  **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
+  insufficient. Follow the [staging deploy lock cutover and rollback
+  procedure](#staging-deploy-lock-cutover-and-rollback) before re-running
+  any known-good push. To roll back `apps/web`, open that Actions run and
+  choose **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
   `staging-web` is push-only and will be skipped. Verify the rerun's
   `staging-web` success and staging health. The rerun also redeploys the api,
   mb and ingest Workers through `staging-api`, `staging-mb` and
@@ -1251,6 +1284,29 @@ environment exists on this repo.
   Staging rollback is
   a redeploy, never a data restore; retain the UNDO blocks and consolidation
   receipt for infrastructure-specific rollback.
+
+### Staging deploy lock cutover and rollback
+
+Actions reruns use the workflow and reusable workflow from the original
+run. A deploy from before `deploy-staging-main` was added cannot acquire
+that lock, even if it is rerun after cutover. Pre-cutover smoke reruns
+stay in the old `e2e-staging` group and cannot replace a pending run in
+`e2e-staging-queued`.
+
+- **Cutover:** Coordinate a pause on other `main` merges/pushes and staging
+  deploy reruns. In Actions, wait for all active and queued `main`
+  `deploy.yml` runs to finish, including their post-deploy E2E. Then land
+  the lock change and let its deploy and post-deploy E2E finish before
+  resuming normal merges and reruns. Do not rerun a pre-lock deploy during
+  cutover.
+- **Rollback:** Pause new `main` merges/pushes and other staging deploy
+  reruns, and let all active and queued `main` deploy runs finish through
+  post-deploy E2E. Only then **Re-run all jobs** on the chosen push run.
+  Keep the pause in place through the rerun's deploy and post-deploy E2E
+  and verify that staging is serving the rollback SHA before resuming.
+  Draining first also keeps an already queued push from immediately
+  undoing the rollback. If the queue cannot be drained and kept clear, do
+  not start a pre-lock rerun.
 
 ## Future Worker deploy lanes: required rollback evidence
 
@@ -1427,8 +1483,10 @@ deploys either Worker — until every step below clears, in order:
    `.github/scripts/binding_manifest.toml`, and re-run binding-parity
    before the next staging deploy.
 8. **Rollback is a redeploy, never a data restore.** To roll back a Worker,
-   re-run the known-good push's `deploy.yml` run (**Re-run all jobs**;
-   never `workflow_dispatch` on an old SHA — the lanes are push-only and
-   would skip) and retain the per-Worker evidence in the table above. A
+   follow the [staging deploy lock cutover and rollback
+   procedure](#staging-deploy-lock-cutover-and-rollback), then re-run the
+   known-good push's `deploy.yml` run (**Re-run all jobs**; never
+   `workflow_dispatch` on an old SHA — the lanes are push-only and would
+   skip). Retain the per-Worker evidence in the table above. A
    rerun redeploys every configured lane; that is not verified per-Worker
    rollback unless each Worker's own outcome evidence is recorded.

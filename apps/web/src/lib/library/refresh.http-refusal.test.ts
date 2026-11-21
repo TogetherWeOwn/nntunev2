@@ -7,7 +7,7 @@ import {
 	saveSnapshot,
 	type SnapshotStorage
 } from './cache.js';
-import { createLibraryRefresher, type LibraryRefresher } from './refresh.js';
+import { createLibraryRefresher, type LibraryRefresher, type LibraryRefreshUpdate } from './refresh.js';
 
 // Ordinary HTTP refusals, not losing timeout/supersession races. Omitting
 // cancellation leaks the producer; draining its content or awaiting cleanup
@@ -48,7 +48,9 @@ function memoryStorage(): SnapshotStorage {
 function fixture() {
 	const storage = memoryStorage();
 	let invalidations = 0;
+	let update: LibraryRefreshUpdate | undefined;
 	const refresher = createLibraryRefresher({
+		onStateChange: (_state, next) => { update = next; },
 		sessionStorage: () => storage,
 		invalidateLibraryCache: () => {
 			invalidations += 1;
@@ -57,7 +59,7 @@ function fixture() {
 		timeoutMs: 60_000
 	});
 	refreshers.push(refresher);
-	return { refresher, storage, invalidations: () => invalidations };
+	return { refresher, storage, invalidations: () => invalidations, receipt: () => update?.runIfCurrent };
 }
 
 function refusal(status: number, mode: CancelMode = 'resolve') {
@@ -159,6 +161,28 @@ describe.each(CANCEL_MODES)('ordinary HTTP refusal with %s cancellation', (mode)
 		// the mechanism, but catch duplicate direct cancellation attempts.
 		expect(body.cancelBody.mock.calls.length).toBeLessThanOrEqual(1);
 	});
+});
+
+it.each(STATUSES)('withholds listing receipts during refresh and after %s', async (status) => {
+	const { refresher, receipt } = fixture();
+	const work = vi.fn(() => 'ran');
+	await expectSettled(refresher.refresh(okFetch('prior')));
+	const original = receipt();
+	await expect(original?.(work)).resolves.toBe('ran');
+
+	const refresh = refresher.refresh(refusal(status).fetchFn);
+	expect(receipt()).toBeUndefined();
+	await expect(original?.(work)).resolves.toBeUndefined();
+	await expectSettled(refresh);
+	expect(receipt()).toBeUndefined();
+	expect(refresher.state.staleAt !== null).toBe(status === 503);
+
+	await expectSettled(refresher.refresh(okFetch()));
+	const replacement = receipt();
+	await expect(replacement?.(work)).resolves.toBe('ran');
+	refresher.dispose();
+	await expect(replacement?.(work)).resolves.toBeUndefined();
+	expect(work).toHaveBeenCalledTimes(2);
 });
 
 describe('HTTP refusal preserves cache and state semantics', () => {

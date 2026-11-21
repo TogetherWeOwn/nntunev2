@@ -6,7 +6,8 @@ const BASE = 'https://api.example.test';
 const LIKES = `${BASE}/v1/me/likes`;
 const MBID = 'fedcba98-7654-3210-fedc-ba9876543210';
 const JOB = MBID.toUpperCase();
-const binding = 'fixture-session-a';
+const binding = 'A'.repeat(43);
+const run = async <T>(work: () => T) => work();
 
 function mockClient(...responses: Response[]) {
 	const fetchFn = vi.fn<typeof fetch>();
@@ -15,7 +16,7 @@ function mockClient(...responses: Response[]) {
 }
 
 function currentScope() {
-	return { binding, isCurrent: () => true, retireConfirmed: vi.fn(async () => true) };
+	return { binding, run, isCurrent: () => true, retireConfirmed: vi.fn(async () => true) };
 }
 
 function importReceipt(added: number, already = 0) {
@@ -85,7 +86,7 @@ describe('legacy likes import', () => {
 			added: 2, already: 1, rejected: [{ target_id: prefix, reason: 'not_member' }]
 		}));
 		const scope = currentScope();
-		await importDeviceLikes(client, [JOB, '', JOB, MBID, `${prefix}accepted`, `${prefix}rejected`], scope);
+		await expect(importDeviceLikes(client, [JOB, '', JOB, MBID, `${prefix}accepted`, `${prefix}rejected`], scope)).resolves.toBe('partial');
 		expect(fetchFn).toHaveBeenCalledOnce();
 		expect(fetchFn).toHaveBeenCalledWith(`${LIKES}/import`, expect.objectContaining({ method: 'POST' }));
 		expect(JSON.parse(String(fetchFn.mock.calls[0][1]?.body))).toEqual({
@@ -124,11 +125,11 @@ describe('legacy likes import', () => {
 		let current = true;
 		const retireConfirmed = vi.fn(async () => true);
 		const ids = Array.from({ length: 51 }, (_, i) => `Job_${i}`);
-		const importing = importDeviceLikes(client, ids, { binding, isCurrent: () => current, retireConfirmed });
+		const importing = importDeviceLikes(client, ids, { binding, run, isCurrent: () => current, retireConfirmed });
 		current = false;
 		finish(importReceipt(50));
 		await importing;
-		await importDeviceLikes(client, ids, { binding, isCurrent: () => current, retireConfirmed });
+		await importDeviceLikes(client, ids, { binding, run, isCurrent: () => current, retireConfirmed });
 		expect(fetchFn).toHaveBeenCalledOnce();
 		expect(retireConfirmed).not.toHaveBeenCalled();
 	});

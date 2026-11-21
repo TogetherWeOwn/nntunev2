@@ -181,7 +181,9 @@ def exercise_restricted_history(base, observe):
         snapshot() == [[], [], 0], "denied history write left committed billing rows"
     )
 
-    observe("GRANT INSERT ON public.paid_invoice_history TO billing_history_fixture")
+    observe("""GRANT INSERT, UPDATE (covered_periods),
+        SELECT (stripe_invoice_id, user_id, stripe_subscription_id, covered_periods, amount_cents, currency)
+        ON public.paid_invoice_history TO billing_history_fixture""")
     status, _, body = routing.http("POST", base + "/billing-restricted-history-proof")
     routing.check(status == 200 and body == "billing-restricted-history-ok", body)
     committed = snapshot()
@@ -393,6 +395,11 @@ def main():
                     routing.check(status == 200 and body == "billing-deadline-ok", body)
                     print("PASS: billing deadline after writes rolled back", flush=True)
                     print(
+                        "PASS: dormant billing Store refused changed equal-end terminal proof; "
+                        "fresh refold, uncancel and paid-end cutoff held",
+                        flush=True,
+                    )
+                    print(
                         "PASS: PostgreSQL watchdog rolled back abandoned billing writes",
                         flush=True,
                     )
@@ -436,6 +443,21 @@ def main():
                         )
                         print(
                             f"PASS: dormant store classified after preceding raw INSERT {finish}",
+                            flush=True,
+                        )
+                    finally:
+                        admin(f"DROP DATABASE {BILLING_DB}")
+                for finish in ("commit", "rollback"):
+                    admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                    try:
+                        url = f"http://127.0.0.1:{port}/billing-worker-first-insert-{finish}-proof"
+                        status, _, body = routing.http("POST", url)
+                        routing.check(
+                            status == 200 and body == "billing-worker-first-insert-ok",
+                            f"Worker-first raw INSERT {finish}: HTTP {status}: {body}",
+                        )
+                        print(
+                            f"PASS: raw INSERT waited on dormant Worker before {finish}",
                             flush=True,
                         )
                     finally:

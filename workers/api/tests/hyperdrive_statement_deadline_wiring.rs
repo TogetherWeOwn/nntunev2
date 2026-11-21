@@ -317,7 +317,7 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         } else if name == "acquire_playback_lease" {
             assert_eq!(
                 function_body(piece, name),
-                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,expires_at,takeover,).await}",
+                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,continuation_deadline,takeover,).await}",
                 "lease acquisition must delegate its entire operation to the bounded helper"
             );
             assert_bounded(
@@ -500,6 +500,7 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     ]
     .map(|name| (name, function_body(store, &format!("asyncfn{name}("))));
     let helpers = [
+        "invite_by_hash_on",
         "reap_unverified_users_on",
         "prune_expired_challenges_on",
         "delete_expired_rate_limit_slots",
@@ -511,7 +512,10 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     .map(|name| (name, function_body(&source, &format!("asyncfn{name}("))));
     for (name, body) in methods.iter().chain(helpers.iter()) {
         assert!(
-            body.contains(".query_typed("),
+            body.contains(match *name {
+                "invite_by_hash" => "invite_by_hash_on(&client,code_hash).await",
+                _ => ".query_typed(",
+            }),
             "{name} must run its statements unnamed via query_typed"
         );
         for named in [

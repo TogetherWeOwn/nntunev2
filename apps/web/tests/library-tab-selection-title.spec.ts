@@ -46,6 +46,7 @@ const test = base.extend<{ mountedLibrary: Page }, { libraryOrigin: string }>({
 	libraryOrigin: [async ({}, use) => {
 		const server = await createServer({
 			configFile: false,
+			mode: 'browser-fixtures',
 			root: fixtureRoot,
 			publicDir: false,
 			resolve: { alias: {

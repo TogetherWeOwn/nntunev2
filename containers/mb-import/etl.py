@@ -43,8 +43,9 @@ ATTR_TYPE_ID, ATTR_TYPE_GID = 1, 5
 LINK_ATTR_LINK_ID, LINK_ATTR_ATTR_TYPE_ID = 1, 2
 L_ARTIST_URL_LINK_ID, L_ARTIST_URL_ARTIST_ID, L_ARTIST_URL_URL_ID = 2, 3, 4
 L_RECORDING_URL_LINK_ID, L_RECORDING_URL_RECORDING_ID, L_RECORDING_URL_URL_ID = 2, 3, 4
-L_RR_LINK_ID, L_RR_E0_ID, L_RR_E1_ID = 2, 3, 4
-L_RW_LINK_ID, L_RW_RECORDING_ID, L_RW_WORK_ID = 2, 3, 4
+RELATION_LINK_ID, RELATION_ENTITY0_ID, RELATION_ENTITY1_ID = 2, 3, 4
+# Fixed SQL dispatch: never infer these identifiers from dump data.
+ENTITY_RELATIONS = (("artist", "recording"), ("artist", "release"), ("artist", "work"), ("recording", "work"))
 ISRC_RECORDING_ID, ISRC_CODE = 2, 3
 WORK_ID, WORK_GID, WORK_NAME, WORK_TYPE_ID = 1, 2, 3, 4
 WORK_TYPE_LOOKUP_ID, WORK_TYPE_NAME = 1, 2
@@ -78,7 +79,7 @@ FIELD_COUNTS = {
     "l_artist_url": 9,
     "l_recording_url": 9,
     "l_recording_recording": 9,
-    "l_recording_work": 9,
+    **{f"l_{source}_{target}": 9 for source, target in ENTITY_RELATIONS},
     # Upstream isrc is (id, recording, isrc, edits_pending, created): five
     # columns since upstream dropped `source` (the real 20261104 dump has
     # five). The curated projection only keeps the (recording, isrc) pair
@@ -89,6 +90,7 @@ FIELD_COUNTS = {
     "work_alias": 16,
     "work_type": 6,
     "label": 16,
+    "label_alias": 16,
     "label_type": 6,
     "release_label": 5,
 }
@@ -96,8 +98,8 @@ FIELD_COUNTS = {
 # Allowlisted relationship link-type GIDs (pinned from the MusicBrainz
 # relationship-type documentation; the ETL resolves them to table ids and
 # refuses a dump where any of them is absent). Only links of these types
-# reach the URL and music-video projections. The recording-work projection
-# resolves its own core-dump links without using this allowlist.
+# reach the URL and music-video projections. The entity relationship sidecars
+# resolve their own core-dump links without using this allowlist.
 ARTIST_URL_YOUTUBE_GID = "6a540e5b-58c6-4192-b6ba-dbc71ec8fcf0"
 # Verified against the live MusicBrainz web service (artist url-rels):
 # the "youtube music" relationship type is
@@ -144,15 +146,23 @@ GZIP_OUTPUT = os.environ.get("MB_ETL_GZIP_OUTPUT") == "1"
 OUTPUT_SUFFIX = ".tsv.gz" if GZIP_OUTPUT else ".tsv"
 
 
-def open_input(path: Path):
+def resolve_input(path: Path) -> Path:
     packed = path.with_name(path.name + ".gz")
-    if path.is_file() and packed.is_file():
+    plain_exists, packed_exists = path.is_file(), packed.is_file()
+    if plain_exists and packed_exists:
         raise ValueError(f"ambiguous input: both {path} and {packed} exist")
-    if path.is_file():
-        return path, path.open("r", encoding="utf-8", newline="")
-    if packed.is_file():
-        return packed, gzip.open(packed, "rt", encoding="utf-8", newline="")
+    if plain_exists:
+        return path
+    if packed_exists:
+        return packed
     raise ValueError(f"missing input file: {path}")
+
+
+def open_input(path: Path):
+    actual = resolve_input(path)
+    if actual == path:
+        return actual, actual.open("r", encoding="utf-8", newline="")
+    return actual, gzip.open(actual, "rt", encoding="utf-8", newline="")
 
 
 def open_output(path: Path):
@@ -394,16 +404,81 @@ def work_values(values, line_number):
             None if type_id is None else positive_key(type_id, context, "type_id"))
 
 
-def recording_work_values(values, line_number):
-    context = f"l_recording_work row {line_number}"
-    return tuple(positive_key(field, context, column)
-                 for field, column in zip(values, ("link", "recording", "work"), strict=True))
+def load_entity_relation(db, dump_dir, source, target):
+    table = f"l_{source}_{target}"
+
+    def convert(values, line_number):
+        context = f"{table} row {line_number}"
+        return (table, *(positive_key(field, context, column)
+                         for field, column in zip(values, ("link", source, target), strict=True)))
+
+    return load(
+        db, dump_dir / table, FIELD_COUNTS[table],
+        (RELATION_LINK_ID, RELATION_ENTITY0_ID, RELATION_ENTITY1_ID),
+        "entity_relation", "family,link,entity0,entity1", convert,
+    )
 
 
-def validate_recording_work_row(row):
-    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", row[0], re.IGNORECASE):
-        raise ValueError("l_recording_work: invalid recording MBID")
-    return row
+def project_entity_relation(db, source, target, output_dir, updated_at):
+    family = f"l_{source}_{target}"
+    # Work IDs are already validated by the work loader.
+    valid_target = "1" if target == "work" else "t.canonical_id"
+    joins = f"""
+        FROM entity_relation l
+        LEFT JOIN {source} s ON s.id=l.entity0
+        LEFT JOIN {target} t ON t.id=l.entity1
+        LEFT JOIN entity_relation_link k ON k.id=l.link
+        LEFT JOIN link_type lt ON lt.id=k.link_type
+    """
+    bad = db.execute(f"""
+        SELECT CASE
+            WHEN s.id IS NULL THEN 'references missing {source} ' || l.entity0
+            WHEN t.id IS NULL THEN 'references missing {target} ' || l.entity1
+            WHEN k.id IS NULL THEN 'references missing link ' || l.link
+            WHEN lt.id IS NULL THEN 'references missing link_type ' || k.link_type
+            WHEN NOT s.canonical_id THEN 'invalid {source} id ' || s.id
+            WHEN NOT {valid_target} THEN 'invalid {target} id ' || t.id
+            WHEN NOT lt.canonical_id THEN 'invalid link_type id ' || lt.id
+            ELSE 'link_type ' || lt.id || ' is not {source}-to-{target}'
+        END
+        {joins}
+        WHERE l.family='{family}' AND (
+            s.id IS NULL OR t.id IS NULL OR k.id IS NULL OR lt.id IS NULL
+            OR NOT s.canonical_id OR NOT {valid_target} OR NOT lt.canonical_id
+            OR lt.entity0 IS NOT '{source}' OR lt.entity1 IS NOT '{target}'
+        ) LIMIT 1
+    """).fetchone()
+    if bad:
+        raise ValueError(f"{family}: {bad[0]}")
+
+    # Decode only referenced type names. The URL/video projections still use
+    # the raw name and GID, never this sidecar-only key.
+    for type_id, name in db.execute("""
+        SELECT DISTINCT lt.id, lt.name FROM entity_relation_link k
+        JOIN link_type lt ON lt.id=k.link_type
+        WHERE lt.entity0=? AND lt.entity1=?
+    """, (source, target)).fetchall():
+        name_key = validate_copy_name(name, f"{family} link_type")
+        if not name_key.strip():
+            raise ValueError(f"{family} link_type: name must not be empty")
+        db.execute("UPDATE link_type SET name_key=? WHERE id=?", (name_key, type_id))
+
+    def validate_row(row):
+        for entity, gid in zip((source, target), row[:2], strict=True):
+            if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", gid, re.IGNORECASE):
+                raise ValueError(f"{family}: invalid {entity} MBID")
+        return row
+
+    # Collapse directed triples by decoded type name; retain deterministic
+    # COPY spelling rather than emitting decoded tabs/newlines.
+    query = f"""
+        SELECT s.gid,t.gid,MIN(lt.name)
+        {joins}
+        WHERE l.family='{family}'
+        GROUP BY s.gid,t.gid,lt.name_key
+        ORDER BY s.gid,t.gid,lt.name_key
+    """
+    return insert_select(db, query, output_dir / curated_name(f"{source}_{target}"), updated_at, validate_row)
 
 
 def label_type_values(values, line_number):
@@ -467,6 +542,10 @@ def main() -> int:
         curated_link = dump_dir / "curated"
         if curated_link.exists() and not curated_link.is_symlink():
             raise ValueError(f"refusing to replace non-symlink output path: {curated_link}")
+        if CONSUME_INPUTS:
+            # Reject incomplete or ambiguous relationship inputs before rows() can unlink anything.
+            for source, target in (*ENTITY_RELATIONS, ("recording", "recording")):
+                resolve_input(dump_dir / f"l_{source}_{target}")
 
         with tempfile.TemporaryDirectory(prefix="mb-etl-", dir=dump_dir) as work:
             work_dir = Path(work)
@@ -477,7 +556,7 @@ def main() -> int:
             try:
                 db.executescript("""
                     PRAGMA temp_store = FILE;
-                    CREATE TABLE artist (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, sort_name TEXT NOT NULL, type_id INTEGER, area_id INTEGER);
+                    CREATE TABLE artist (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, sort_name TEXT NOT NULL, type_id INTEGER, area_id INTEGER, canonical_id INTEGER NOT NULL);
                     CREATE TABLE artist_alias (
                         id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
                         locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
@@ -515,7 +594,7 @@ def main() -> int:
                     CREATE INDEX release_country_id ON release_country(release);
                     CREATE TABLE release_unknown_country (release INTEGER NOT NULL, year INTEGER);
                     CREATE INDEX release_unknown_country_id ON release_unknown_country(release);
-                    CREATE TABLE release (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, credit INTEGER NOT NULL, group_id INTEGER NOT NULL);
+                    CREATE TABLE release (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, credit INTEGER NOT NULL, group_id INTEGER NOT NULL, canonical_id INTEGER NOT NULL);
                     CREATE TABLE recording (id INTEGER PRIMARY KEY, gid TEXT NOT NULL, name TEXT NOT NULL, length INTEGER, canonical_id INTEGER NOT NULL);
                     CREATE TABLE medium (id INTEGER PRIMARY KEY, release INTEGER NOT NULL, position INTEGER NOT NULL);
                     CREATE TABLE track (id INTEGER PRIMARY KEY, recording INTEGER NOT NULL, medium INTEGER NOT NULL, position INTEGER NOT NULL);
@@ -533,9 +612,10 @@ def main() -> int:
                     CREATE INDEX l_artist_url_artist ON l_artist_url(artist);
                     CREATE TABLE l_recording_url (link INTEGER NOT NULL, recording INTEGER NOT NULL, url INTEGER NOT NULL);
                     CREATE INDEX l_recording_url_recording ON l_recording_url(recording);
-                    CREATE TABLE l_recording_recording (link INTEGER NOT NULL, e0 INTEGER NOT NULL, e1 INTEGER NOT NULL);
-                    CREATE TABLE l_recording_work (link INTEGER NOT NULL, recording INTEGER NOT NULL, work INTEGER NOT NULL);
-                    CREATE TABLE recording_work_link (id INTEGER PRIMARY KEY, link_type INTEGER NOT NULL);
+                    CREATE TABLE entity_relation (
+                        family TEXT NOT NULL, link INTEGER NOT NULL, entity0 INTEGER NOT NULL, entity1 INTEGER NOT NULL
+                    );
+                    CREATE TABLE entity_relation_link (id INTEGER PRIMARY KEY, link_type INTEGER NOT NULL);
                     CREATE TABLE isrc (recording INTEGER NOT NULL, code TEXT NOT NULL);
                     CREATE INDEX isrc_recording ON isrc(recording);
                     CREATE TABLE work_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
@@ -547,6 +627,11 @@ def main() -> int:
                     );
                     CREATE TABLE label_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                     CREATE TABLE label (id INTEGER PRIMARY KEY, gid TEXT NOT NULL UNIQUE, name TEXT NOT NULL, code INTEGER, type_id INTEGER);
+                    CREATE TABLE label_alias (
+                        id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
+                        locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
+                        name_key TEXT NOT NULL, locale_key TEXT NOT NULL
+                    );
                     CREATE TABLE release_label (id INTEGER PRIMARY KEY, release INTEGER NOT NULL, label INTEGER, number_key TEXT NOT NULL);
                 """)
 
@@ -554,7 +639,7 @@ def main() -> int:
                 counts["artist_type"] = load(db, dump_dir / "artist_type", FIELD_COUNTS["artist_type"], (ARTIST_TYPE_LOOKUP_ID, ARTIST_TYPE_NAME), "artist_type", "id,name", as_ints("artist_type.id", (0,)))
                 counts["area"] = load(db, dump_dir / "area", FIELD_COUNTS["area"], (AREA_ID,), "area", "id", as_ints("area.id", (0,)))
                 counts["iso_3166_1"] = load(db, dump_dir / "iso_3166_1", FIELD_COUNTS["iso_3166_1"], (ISO_AREA_ID, ISO_CODE), "iso_3166_1", "area,code", as_ints("iso_3166_1.area", (0,)))
-                counts["artist"] = load(db, dump_dir / "artist", FIELD_COUNTS["artist"], (ARTIST_ID, ARTIST_GID, ARTIST_NAME, ARTIST_SORT_NAME, ARTIST_TYPE_ID, ARTIST_AREA_ID), "artist", "id,gid,name,sort_name,type_id,area_id", as_ints("artist.id", (0, 4, 5), (4, 5)))
+                counts["artist"] = load(db, dump_dir / "artist", FIELD_COUNTS["artist"], (ARTIST_ID, ARTIST_GID, ARTIST_NAME, ARTIST_SORT_NAME, ARTIST_TYPE_ID, ARTIST_AREA_ID), "artist", "id,gid,name,sort_name,type_id,area_id,canonical_id", as_ints("artist.id", (0, 4, 5), (4, 5), mark_canonical_id=True))
                 counts["artist_alias"] = load_aliases(db, dump_dir, "artist")
                 counts["work_type"] = load(
                     db, dump_dir / "work_type", FIELD_COUNTS["work_type"],
@@ -574,6 +659,7 @@ def main() -> int:
                     (LABEL_ID, LABEL_GID, LABEL_NAME, LABEL_CODE, LABEL_TYPE_ID),
                     "label", "id,gid,name,code,type_id", label_values,
                 )
+                counts["label_alias"] = load_aliases(db, dump_dir, "label")
                 load(
                     db, dump_dir / "release_label", FIELD_COUNTS["release_label"],
                     (RELEASE_LABEL_ID, RELEASE_LABEL_RELEASE_ID, RELEASE_LABEL_LABEL_ID, RELEASE_LABEL_CATNO),
@@ -589,7 +675,7 @@ def main() -> int:
                 counts["release_group"] = load(db, dump_dir / "release_group", FIELD_COUNTS["release_group"], (GROUP_ID, GROUP_GID, GROUP_NAME, GROUP_CREDIT_ID, GROUP_TYPE_ID), "release_group", "id,gid,name,credit,type_id", as_ints("release_group.id", (0, 3, 4), (3, 4)))
                 counts["release_country"] = load(db, dump_dir / "release_country", FIELD_COUNTS["release_country"], (RELEASE_COUNTRY_RELEASE_ID, RELEASE_COUNTRY_YEAR), "release_country", "release,year", as_ints("release_country", (0, 1), (1,)))
                 counts["release_unknown_country"] = load(db, dump_dir / "release_unknown_country", FIELD_COUNTS["release_unknown_country"], (RELEASE_UNKNOWN_COUNTRY_RELEASE_ID, RELEASE_UNKNOWN_COUNTRY_YEAR), "release_unknown_country", "release,year", as_ints("release_unknown_country", (0, 1), (1,)))
-                counts["release"] = load(db, dump_dir / "release", FIELD_COUNTS["release"], (RELEASE_ID, RELEASE_GID, RELEASE_NAME, RELEASE_CREDIT_ID, RELEASE_GROUP_ID), "release", "id,gid,name,credit,group_id", as_ints("release.id", (0, 3, 4)))
+                counts["release"] = load(db, dump_dir / "release", FIELD_COUNTS["release"], (RELEASE_ID, RELEASE_GID, RELEASE_NAME, RELEASE_CREDIT_ID, RELEASE_GROUP_ID), "release", "id,gid,name,credit,group_id,canonical_id", as_ints("release.id", (0, 3, 4), mark_canonical_id=True))
                 counts["release_alias"] = load_aliases(db, dump_dir, "release")
                 counts["release_group_alias"] = load_aliases(db, dump_dir, "release_group")
                 counts["recording"] = load(
@@ -619,41 +705,46 @@ def main() -> int:
                         raise ValueError(f"pinned link type {what} ({gid}) absent from link_type input")
                     return found[0]
 
+                music_video_type_id = link_type_id(MUSIC_VIDEO_LINK_GID, "recording-recording music video")
                 allowlisted_type_ids = {
                     link_type_id(ARTIST_URL_YOUTUBE_GID, "artist-url youtube"),
                     link_type_id(ARTIST_URL_YOUTUBE_MUSIC_GID, "artist-url youtube music"),
                     link_type_id(ARTIST_URL_FREE_STREAMING_GID, "artist-url free streaming"),
                     link_type_id(ARTIST_URL_STREAMING_GID, "artist-url streaming"),
                     link_type_id(RECORDING_URL_FREE_STREAMING_GID, "recording-url free streaming"),
-                    link_type_id(MUSIC_VIDEO_LINK_GID, "recording-recording music video"),
+                    music_video_type_id,
                 }
                 video_attr = db.execute("SELECT id FROM link_attribute_type WHERE gid=?", (VIDEO_ATTR_GID,)).fetchone()
                 if video_attr is None:
                     raise ValueError(f'pinned link attribute "video" ({VIDEO_ATTR_GID}) absent from link_attribute_type input')
                 video_attr_id = video_attr[0]
 
-                counts["l_recording_work"] = load(
-                    db, dump_dir / "l_recording_work", FIELD_COUNTS["l_recording_work"],
-                    (L_RW_LINK_ID, L_RW_RECORDING_ID, L_RW_WORK_ID),
-                    "l_recording_work", "link,recording,work", recording_work_values,
-                )
-                db.execute("CREATE INDEX l_recording_work_link ON l_recording_work(link)")
+                relation_counts = {
+                    (source, target): load_entity_relation(db, dump_dir, source, target)
+                    for source, target in ENTITY_RELATIONS
+                }
+                counts["l_recording_recording"] = load_entity_relation(db, dump_dir, "recording", "recording")
+                db.execute("CREATE INDEX entity_relation_link_lookup ON entity_relation(link, family)")
+                db.execute("CREATE INDEX entity_relation_family ON entity_relation(family)")
+                any_relations = counts["l_recording_recording"] or any(relation_counts.values())
                 kept_link_ids: set[int] = set()
                 referenced_url_ids: set[int] = set()
 
                 def stage_link_and_keep_allowlisted(selected) -> bool:
                     link_id = required_int(selected[0], "link.id")
                     type_id = required_int(selected[1], "link.link_type")
-                    # Resolve recording-work links during the same scan, but
-                    # never add them to the URL/music-video allowlist by reference.
-                    if counts["l_recording_work"] and 0 < link_id <= 2**31 - 1 and db.execute(
-                        "SELECT 1 FROM l_recording_work WHERE link=? LIMIT 1", (link_id,),
-                    ).fetchone():
-                        context = "l_recording_work link"
-                        db.execute("INSERT INTO recording_work_link VALUES (?,?)", (
-                            positive_key(selected[0], context, "id"),
-                            positive_key(selected[1], context, "link_type"),
-                        ))
+                    # Resolve sidecar links during the same scan, but never
+                    # add them to the URL/music-video allowlist by reference.
+                    if any_relations and 0 < link_id <= 2**31 - 1:
+                        referenced = db.execute(
+                            "SELECT family FROM entity_relation WHERE link=? LIMIT 1", (link_id,),
+                        ).fetchone()
+                        if referenced:
+                            context = f"{referenced[0]} link"
+                            db.execute("INSERT INTO entity_relation_link VALUES (?,?)", (
+                                positive_key(selected[0], context, "id"),
+                                positive_key(selected[1], context, "link_type"),
+                            ))
                     if type_id in allowlisted_type_ids:
                         kept_link_ids.add(link_id)
                         return True
@@ -689,9 +780,6 @@ def main() -> int:
                     referenced_url_ids.add(required_int(selected[2], "l_recording_url.url"))
                     return True
 
-                def keep_l_recording_recording(selected) -> bool:
-                    return required_int(selected[0], "l_recording_recording.link") in kept_link_ids
-
                 counts["l_artist_url"] = load_filtered(
                     db, dump_dir / "l_artist_url", FIELD_COUNTS["l_artist_url"],
                     (L_ARTIST_URL_LINK_ID, L_ARTIST_URL_ARTIST_ID, L_ARTIST_URL_URL_ID),
@@ -703,12 +791,6 @@ def main() -> int:
                     (L_RECORDING_URL_LINK_ID, L_RECORDING_URL_RECORDING_ID, L_RECORDING_URL_URL_ID),
                     "l_recording_url", "link,recording,url", keep_l_recording_url,
                     as_ints("l_recording_url", (0, 1, 2)),
-                )
-                counts["l_recording_recording"] = load_filtered(
-                    db, dump_dir / "l_recording_recording", FIELD_COUNTS["l_recording_recording"],
-                    (L_RR_LINK_ID, L_RR_E0_ID, L_RR_E1_ID),
-                    "l_recording_recording", "link,e0,e1", keep_l_recording_recording,
-                    as_ints("l_recording_recording", (0, 1, 2)),
                 )
                 # Only URLs targeted by a kept relationship row are stored:
                 # the upstream url table is far larger than the allowlisted
@@ -750,7 +832,7 @@ def main() -> int:
                     entity_id, resolved_id = bad_recording_alias
                     reason = "missing recording" if resolved_id is None else "invalid recording id"
                     raise ValueError(f"recording_alias references {reason} {entity_id}")
-                for entity in ("release", "release_group", "work"):
+                for entity in ("release", "release_group", "work", "label"):
                     missing_alias_parent = db.execute(f"""
                         SELECT al.entity FROM {entity}_alias al LEFT JOIN {entity} e ON e.id=al.entity
                         WHERE e.id IS NULL LIMIT 1
@@ -823,41 +905,54 @@ def main() -> int:
                 bad_l_recording_url = db.execute("SELECT l.url FROM l_recording_url l LEFT JOIN url u ON u.id=l.url WHERE u.id IS NULL LIMIT 1").fetchone()
                 if bad_l_recording_url:
                     raise ValueError(f"recording-url link references missing url {bad_l_recording_url[0]}")
-                bad_l_rr = db.execute("SELECT l.e0,l.e1 FROM l_recording_recording l LEFT JOIN recording r0 ON r0.id=l.e0 LEFT JOIN recording r1 ON r1.id=l.e1 WHERE r0.id IS NULL OR r1.id IS NULL LIMIT 1").fetchone()
-                if bad_l_rr:
-                    raise ValueError(f"music-video link references missing recording ({bad_l_rr[0]}, {bad_l_rr[1]})")
-                bad_recording_work = db.execute("""
+                # Validate only referenced MBIDs, before either projection filters edges.
+                mbid_pattern = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
+                db.create_function("is_recording_mbid", 1,
+                                   lambda gid: gid is not None and mbid_pattern.fullmatch(gid) is not None,
+                                   deterministic=True)
+                bad_l_rr = db.execute("""
                     SELECT CASE
-                        WHEN r.id IS NULL THEN 'references missing recording ' || l.recording
-                        WHEN w.id IS NULL THEN 'references missing work ' || l.work
+                        WHEN r0.id IS NULL OR r1.id IS NULL THEN
+                            'references missing recording (' || l.entity0 || ', ' || l.entity1 || ')'
                         WHEN k.id IS NULL THEN 'references missing link ' || l.link
                         WHEN lt.id IS NULL THEN 'references missing link_type ' || k.link_type
-                        WHEN NOT r.canonical_id THEN 'invalid recording id ' || r.id
+                        WHEN NOT r0.canonical_id OR NOT r1.canonical_id THEN 'invalid recording id'
+                        WHEN NOT is_recording_mbid(r0.gid) OR NOT is_recording_mbid(r1.gid) THEN 'invalid recording MBID'
                         WHEN NOT lt.canonical_id THEN 'invalid link_type id ' || lt.id
-                        ELSE 'link_type ' || lt.id || ' is not recording-to-work'
+                        ELSE 'link_type ' || lt.id || ' is not recording-to-recording'
                     END
-                    FROM l_recording_work l
-                    LEFT JOIN recording r ON r.id=l.recording
-                    LEFT JOIN work w ON w.id=l.work
-                    LEFT JOIN recording_work_link k ON k.id=l.link
+                    FROM entity_relation l
+                    LEFT JOIN recording r0 ON r0.id=l.entity0
+                    LEFT JOIN recording r1 ON r1.id=l.entity1
+                    LEFT JOIN entity_relation_link k ON k.id=l.link
                     LEFT JOIN link_type lt ON lt.id=k.link_type
-                    WHERE r.id IS NULL OR w.id IS NULL OR k.id IS NULL OR lt.id IS NULL
-                        OR NOT r.canonical_id OR NOT lt.canonical_id
-                        OR lt.entity0 IS NOT 'recording' OR lt.entity1 IS NOT 'work'
+                    WHERE l.family='l_recording_recording' AND (
+                        r0.id IS NULL OR r1.id IS NULL OR k.id IS NULL OR lt.id IS NULL
+                        OR NOT r0.canonical_id OR NOT r1.canonical_id OR NOT lt.canonical_id
+                        OR NOT is_recording_mbid(r0.gid) OR NOT is_recording_mbid(r1.gid)
+                        OR lt.entity0 IS NOT 'recording' OR lt.entity1 IS NOT 'recording'
+                    )
                     LIMIT 1
                 """).fetchone()
-                if bad_recording_work:
-                    raise ValueError(f"l_recording_work: {bad_recording_work[0]}")
-                # Decode only referenced type names, once per type. Legacy URL
-                # and music-video projections still use the raw name and GIDs.
-                for type_id, name in db.execute("""
-                    SELECT id,name FROM link_type
-                    WHERE id IN (SELECT link_type FROM recording_work_link)
+                if bad_l_rr:
+                    raise ValueError(f"l_recording_recording: {bad_l_rr[0]}")
+                for type_id, gid, name in db.execute("""
+                    SELECT id,gid,name FROM link_type
+                    WHERE id IN (
+                        SELECT k.link_type FROM entity_relation l
+                        JOIN entity_relation_link k ON k.id=l.link
+                        WHERE l.family='l_recording_recording'
+                    )
                 """).fetchall():
-                    name_key = validate_copy_name(name, "l_recording_work link_type")
-                    if not name_key.strip():
-                        raise ValueError("l_recording_work link_type: name must not be empty")
-                    db.execute("UPDATE link_type SET name_key=? WHERE id=?", (name_key, type_id))
+                    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", gid):
+                        raise ValueError("l_recording_recording: invalid link_type GID")
+                    if gid == MUSIC_VIDEO_LINK_GID and type_id != music_video_type_id:
+                        raise ValueError("l_recording_recording: duplicate music-video link_type GID")
+                    if type_id != music_video_type_id:
+                        name_key = validate_copy_name(name, "l_recording_recording link_type")
+                        if not name_key.strip() or len(name_key) > 255:
+                            raise ValueError("l_recording_recording link_type: invalid name length")
+                        db.execute("UPDATE link_type SET name_key=? WHERE id=?", (name_key, type_id))
                 bad_isrc_recording = db.execute("SELECT i.recording FROM isrc i LEFT JOIN recording r ON r.id=i.recording WHERE r.id IS NULL LIMIT 1").fetchone()
                 if bad_isrc_recording:
                     raise ValueError(f"isrc references missing recording {bad_isrc_recording[0]}")
@@ -1007,17 +1102,39 @@ def main() -> int:
                 # so one undirected link is one row whichever side the dump
                 # lists first. The read join treats both sides
                 # symmetrically.
-                music_video_query = """
+                music_video_query = f"""
                     SELECT DISTINCT
                            CASE WHEN lower(r0.gid)<lower(r1.gid) THEN r0.gid ELSE r1.gid END,
                            CASE WHEN lower(r0.gid)<lower(r1.gid) THEN r1.gid ELSE r0.gid END
-                    FROM l_recording_recording l
-                    JOIN recording r0 ON r0.id=l.e0
-                    JOIN recording r1 ON r1.id=l.e1
-                    WHERE r0.id != r1.id
+                    FROM entity_relation l
+                    JOIN entity_relation_link k ON k.id=l.link
+                    JOIN recording r0 ON r0.id=l.entity0
+                    JOIN recording r1 ON r1.id=l.entity1
+                    WHERE l.family='l_recording_recording' AND r0.id != r1.id AND k.link_type={music_video_type_id}
                     ORDER BY 1,2
                 """
                 music_video_count = insert_select(db, music_video_query, output_dir / curated_name("recording_music_video"), updated_at)
+                music_video_input = db.execute("""
+                    SELECT COUNT(*) FROM entity_relation l JOIN entity_relation_link k ON k.id=l.link
+                    WHERE l.family='l_recording_recording' AND k.link_type=?
+                """, (music_video_type_id,)).fetchone()[0]
+                # Exclude by type, not endpoints: a pair can have a video and
+                # a separate directed song relation. Keep raw COPY spelling.
+                recording_recording_query = f"""
+                    SELECT r0.gid,r1.gid,MIN(lt.name)
+                    FROM entity_relation l
+                    JOIN entity_relation_link k ON k.id=l.link
+                    JOIN link_type lt ON lt.id=k.link_type
+                    JOIN recording r0 ON r0.id=l.entity0
+                    JOIN recording r1 ON r1.id=l.entity1
+                    WHERE l.family='l_recording_recording' AND k.link_type != {music_video_type_id}
+                    GROUP BY r0.gid,r1.gid,lt.name_key
+                    ORDER BY r0.gid,r1.gid,lt.name_key
+                """
+                recording_recording_count = insert_select(
+                    db, recording_recording_query, output_dir / curated_name("recording_recording"),
+                    updated_at,
+                )
                 # ISRCs, deduplicated and uppercased (the mirror CHECK
                 # requires the canonical 12-character uppercase form).
                 isrc_query = """
@@ -1036,22 +1153,13 @@ def main() -> int:
                 work_count = insert_select(db, work_query, output_dir / curated_name("work"), updated_at)
                 work_alias_count = project_aliases(db, "work", output_dir, updated_at)
 
-                # Group directed triples by decoded type name, choosing one
-                # deterministic COPY spelling without emitting raw delimiters.
-                recording_work_query = """
-                    SELECT r.gid,w.gid,MIN(lt.name)
-                    FROM l_recording_work l
-                    JOIN recording r ON r.id=l.recording
-                    JOIN work w ON w.id=l.work
-                    JOIN recording_work_link k ON k.id=l.link
-                    JOIN link_type lt ON lt.id=k.link_type
-                    GROUP BY r.gid,w.gid,lt.name_key
-                    ORDER BY r.gid,w.gid,lt.name_key
-                """
-                recording_work_count = insert_select(
-                    db, recording_work_query, output_dir / curated_name("recording_work"),
-                    updated_at, validate_recording_work_row,
-                )
+                relation_outputs = {}
+                for (source, target), input_count in relation_counts.items():
+                    name = f"{source}_{target}"
+                    output_count = project_entity_relation(db, source, target, output_dir, updated_at)
+                    if input_count and not output_count:
+                        raise ValueError(f"{name} input is non-empty but curated output is empty")
+                    relation_outputs[name] = output_count
 
                 label_query = """
                     SELECT l.gid,l.name,l.code,t.name
@@ -1059,6 +1167,7 @@ def main() -> int:
                     ORDER BY l.id
                 """
                 label_count = insert_select(db, label_query, output_dir / curated_name("label"), updated_at)
+                label_alias_count = project_aliases(db, "label", output_dir, updated_at)
 
                 # An absent label is not an edge. A real label with no number
                 # uses empty text. Sort and deduplicate before re-escaping COPY.
@@ -1095,11 +1204,12 @@ def main() -> int:
                     ("release_alias", counts["release_alias"], release_alias_count),
                     ("release_group_alias", counts["release_group_alias"], release_group_alias_count),
                     ("work_alias", counts["work_alias"], work_alias_count),
+                    ("label_alias", counts["label_alias"], label_alias_count),
                     ("recording_alias", counts["recording_alias"], recording_alias_count),
                     ("artist_url", counts["l_artist_url"], artist_url_count),
                     ("recording_url", counts["l_recording_url"], recording_url_count),
-                    ("recording_music_video", counts["l_recording_recording"], music_video_count),
-                    ("recording_work", counts["l_recording_work"], recording_work_count),
+                    ("recording_music_video", music_video_input, music_video_count),
+                    ("recording_recording", counts["l_recording_recording"] - music_video_input, recording_recording_count),
                     ("recording_isrc", counts["isrc"], isrc_count),
                 ):
                     if input_count and output_count == 0:
@@ -1125,9 +1235,11 @@ def main() -> int:
             os.symlink(snapshot_name, link_tmp)
             os.replace(link_tmp, curated_link)
 
-        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, artist_alias={artist_alias_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count}, work={work_count}, recording_work={recording_work_count}, "
+        relation_summary = ", ".join(f"{name}={count}" for name, count in relation_outputs.items())
+        print(f"etl: published {snapshot_name} via curated (artist={artist_count}, artist_alias={artist_alias_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count}, work={work_count}, "
               f"recording_alias={recording_alias_count}, release_alias={release_alias_count}, release_group_alias={release_group_alias_count}, "
-              f"work_alias={work_alias_count}, label={label_count}, release_label={release_label_count})")
+              f"work_alias={work_alias_count}, label={label_count}, label_alias={label_alias_count}, release_label={release_label_count}, {relation_summary}, "
+              f"recording_recording={recording_recording_count})")
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"etl: {exc}", file=sys.stderr)

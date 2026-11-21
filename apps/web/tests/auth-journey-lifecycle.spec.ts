@@ -304,7 +304,13 @@ for (const { journey, stage } of BOUNDARIES) {
 			await settle(page);
 
 			expect.soft((await calls(page)).map(({ stage, path }) => ({ stage, path })), 'stale completion launched another boundary').toEqual(before.map(({ stage, path }) => ({ stage, path })));
-			expect.soft(await storedState(page), 'stale completion changed display/library cache state').toEqual(storage);
+			const settled = await storedState(page);
+			if (stage === 'finish') {
+				const key = 'nntune.auth.generation.v1';
+				expect(settled[1][key] && settled[1][key] !== storage[1][key], 'finish rotates the auth generation').toBe(true);
+				storage[1][key] = settled[1][key];
+			}
+			expect.soft(settled, 'stale completion changed display/library cache state').toEqual(storage);
 			await expect.soft(page.getByRole('dialog')).toHaveCount(0);
 			await expect.soft(page.getByRole('alert')).toHaveCount(0);
 			await expect.soft(emailField(page, journey)).toHaveValue('new-visit@example.com');

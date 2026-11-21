@@ -52,6 +52,7 @@ const test = base.extend<{ libraryPage: Page }, { libraryOrigin: string }>({
 	libraryOrigin: [async ({}, use) => {
 		const server = await createServer({
 			configFile: false,
+			mode: 'browser-fixtures',
 			root: decodeURIComponent(new URL('./fixtures/library-now-playing/', import.meta.url).pathname),
 			publicDir: false,
 			resolve: { alias: {

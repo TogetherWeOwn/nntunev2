@@ -66,7 +66,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		get isConnected() { return this.connected; }
 		set isConnected(value: boolean) { this.connected = value; }
 		ended = false; paused = true; error: Pick<MediaError, 'code' | 'message'> | null = null;
-		volume = 0.6; muted = false; playbackRate = 1.25;
+		volume = 1; muted = false; playbackRate = 1.25;
 		play = () => Promise.resolve();
 		pause() { this.paused = true; }
 	}
@@ -98,7 +98,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			player.browseCopy.invalidate = () => { onInvalidateBrowseCopy(); return invalidate(); };
 			const clear = player.media.clearShareSeek;
 			player.media.clearShareSeek = () => { onClear(); clear(); };
-			return player;
+			return Object.assign(player, { currentFavorite: { bind: () => () => {} } });
 		},
 		tick, window: { location }, element, track, capture
 	};
@@ -1582,11 +1582,14 @@ test.each(['plays', 'refuses', 'pauses before pause dispatch'] as const)('queue 
 	const fixture = restartFixture();
 	const { page, element, track, remount, writes } = fixture;
 	page.replaceQueue(selectTrack(createQueue([pine, { ...track, artist: '' }]), 1));
+	// Native properties change immediately, before the queued volumechange event.
+	element.volume = 0.6;
 	element.muted = true;
 	signalNaturalEnd(fixture);
 	const continuation = page.end('queue');
 	const target = remount(pine.streamUrl);
-	target.volume = 1;
+	// Volume and mute are already restored by attachment, before native play.
+	expect(target).toMatchObject({ volume: 0.6, muted: true });
 	target.playbackRate = 1;
 	target.play = vi.fn(() => new Promise<void>((resolve, reject) => {
 		if (outcome !== 'refuses') target.paused = false;

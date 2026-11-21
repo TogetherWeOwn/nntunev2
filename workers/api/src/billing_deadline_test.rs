@@ -22,6 +22,7 @@ async fn fixture(setup: bool) -> Result<(), StoreError> {
                     include_str!("../../../migrations/0021_billing_schema.sql"),
                     include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
                     include_str!("../../../migrations/0029_paid_invoice_history.sql"),
+                    include_str!("../../../migrations/0059_paid_invoice_covered_periods.sql"),
                 ] {
                     client.batch_execute(migration).await.map_err(|_| StoreError)?;
                 }
@@ -166,6 +167,7 @@ fn test_outcome() -> ReconcileOutcome {
         amount_cents: amount,
         currency: "usd".into(),
         paid_at_unix: 1_786_032_000,
+        covered_periods: vec![(1_786_032_000, 1_786_032_100)],
     };
     ReconcileOutcome {
         row: ReconciledRow {
@@ -397,6 +399,150 @@ pub(crate) async fn test_reconcile_after_raw_insert(commit: bool) -> Result<(), 
     ).await.map_err(|_| diagnostic.get())
 }
 
+pub(crate) async fn test_reconcile_before_raw_insert(commit: bool) -> Result<(), &'static str> {
+    use crate::billing_transaction_sql::PRECOMMIT_GATE;
+    use futures_util::future::{join, select, Either};
+    use std::{cell::Cell, rc::Rc};
+    use tokio_postgres::error::SqlState;
+
+    setup_ack_fixture().await?;
+    let store = PgStore {
+        env: None,
+        trace_id: "worker-before-raw-insert-test".into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        work_deadline_observer: None,
+        cancel_token_observer: None,
+    };
+    let phase = Rc::new(Cell::new(
+        "Worker-first INSERT: connect independent observer",
+    ));
+    let diagnostic = phase.clone();
+    billing_budget::with_owned_connection(
+        "127.0.0.1", 5432, CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |db| Box::pin(async move {
+            phase.set("Worker-first INSERT: seed contender with an empty target");
+            db.batch_execute("INSERT INTO public.users (id, email, created_at)
+                              VALUES ('worker_insert_user', 'worker-insert@example.test', 1786032000)")
+                .await.map_err(|_| StoreError)?;
+            let before = parent_delete_snapshot(db, None).await?;
+            if before.1.is_some() || before.2.is_some() {
+                return Err(StoreError);
+            }
+            phase.set("Worker-first INSERT: Worker did not reach pre-COMMIT gate with its billing writes and exclusion");
+            db.query_one("SELECT pg_advisory_lock($1)", &[&PRECOMMIT_GATE])
+                .await.map_err(|_| StoreError)?;
+            let injected = Rc::new(Cell::new(false));
+            let probe = ReconcileProbe::BeforeInsertCommit((!commit).then(|| injected.clone()));
+            let mut reconcile = Box::pin(store.store_reconcile_owned(
+                "worker_fault_user".into(), test_outcome(), probe,
+            ));
+            let worker = match select(reconcile.as_mut(), Box::pin(wait_lock_cycle(|| async {
+                let row = db.query_opt(
+                    "SELECT l.pid FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a USING (pid)
+                     WHERE l.relation = 'public.subscriptions'::regclass AND l.granted
+                       AND l.mode = 'ShareRowExclusiveLock'
+                       AND a.application_name = 'owned_billing_reconcile_test'
+                       AND a.wait_event_type = 'Lock' AND a.wait_event = 'advisory'
+                       AND a.query = 'SELECT pg_advisory_xact_lock($1)'
+                       AND pg_backend_pid() = ANY(pg_blocking_pids(l.pid))", &[],
+                ).await.map_err(|_| StoreError)?;
+                Ok(row.map(|row| row.get::<_, i32>(0)))
+            }))).await {
+                Either::Left(_) => return Err(StoreError),
+                Either::Right((worker, _)) => worker?,
+            };
+
+            let writer_pid = Rc::new(Cell::new(None::<i32>));
+            let record_pid = writer_pid.clone();
+            let mut insert = Box::pin(billing_budget::with_owned_connection(
+                "127.0.0.1", 5432, CONNECTION,
+                |_| Box::pin(async { Ok(()) }),
+                move |raw| Box::pin(async move {
+                    raw.batch_execute("BEGIN; SET LOCAL statement_timeout = '5s'")
+                        .await.map_err(|_| StoreError)?;
+                    record_pid.set(Some(raw.query_one("SELECT pg_backend_pid()", &[])
+                        .await.map_err(|_| StoreError)?.get(0)));
+                    let inserted = raw.query_one(
+                        "INSERT INTO public.subscriptions AS s
+                            (user_id, stripe_subscription_id, stripe_customer_id,
+                             stripe_subscription_item_id, stripe_price_id, plan_id, status)
+                         VALUES ('worker_insert_user', 'sub_worker_fault', 'cus_worker_insert',
+                                 'si_worker_insert', 'price_worker_fault', 'plus', 'active')
+                         RETURNING jsonb_build_array(to_jsonb(s))::text", &[],
+                    ).await;
+                    match inserted {
+                        Ok(row) if !commit => {
+                            raw.batch_execute("COMMIT").await.map_err(|_| StoreError)?;
+                            Ok(Some(row.get::<_, String>(0)))
+                        }
+                        Err(error) if commit && error.as_db_error().is_some_and(|err|
+                            err.code() == &SqlState::UNIQUE_VIOLATION
+                                && err.constraint() == Some("subscriptions_stripe_subscription_id_key")) => {
+                            raw.batch_execute("ROLLBACK").await.map_err(|_| StoreError)?;
+                            Ok(None)
+                        }
+                        _ => Err(StoreError),
+                    }
+                }),
+                |_| {},
+            ));
+            phase.set("Worker-first INSERT: exact writer did not wait on Worker exclusion");
+            let writer = match select(insert.as_mut(), Box::pin(wait_lock_cycle(|| async {
+                let Some(pid) = writer_pid.get() else { return Ok(None); };
+                let waiting: bool = db.query_one(
+                    "SELECT $2 = ANY(pg_blocking_pids($1)) AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_locks WHERE pid = $1
+                          AND relation = 'public.subscriptions'::regclass
+                          AND mode = 'RowExclusiveLock' AND NOT granted)", &[&pid, &worker],
+                ).await.map_err(|_| StoreError)?.get(0);
+                Ok(waiting.then_some(pid))
+            }))).await {
+                Either::Left(_) => return Err(StoreError),
+                Either::Right((writer, _)) => writer?,
+            };
+            phase.set("Worker-first INSERT: a plain reader did not see the original empty snapshot");
+            if parent_delete_snapshot(db, None).await? != before {
+                return Err(StoreError);
+            }
+            let released: bool = db.query_one("SELECT pg_advisory_unlock($1)", &[&PRECOMMIT_GATE])
+                .await.map_err(|_| StoreError)?.get(0);
+            if !released {
+                return Err(StoreError);
+            }
+            phase.set("Worker-first INSERT: wrong Worker result or raw INSERT did not finish as expected");
+            let (reconciled, inserted) = join(reconcile, insert).await;
+            let inserted = inserted?;
+            if reconciled.is_ok() != commit || injected.get() == commit {
+                return Err(StoreError);
+            }
+            phase.set("Worker-first INSERT: wrong durable owner/history or retained billing locks");
+            let after = parent_delete_snapshot(db, None).await?;
+            let valid: bool = db.query_one(
+                "SELECT NOT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE pid IN ($1, $2)
+                    AND relation IN ('public.users'::regclass, 'public.subscriptions'::regclass,
+                                     'public.paid_invoice_history'::regclass))
+                    AND (NOT $3 OR (
+                        (SELECT count(*) = 1 AND bool_and(user_id = 'worker_fault_user'
+                             AND stripe_subscription_id = 'sub_worker_fault' AND status = 'active'
+                             AND paid_invoice_id = 'in_worker_second') FROM public.subscriptions)
+                        AND (SELECT count(*) = 2 AND bool_and(user_id = 'worker_fault_user'
+                             AND stripe_subscription_id = 'sub_worker_fault' AND plan_id = 'plus'
+                             AND amount_cents = 800 AND currency = 'usd')
+                             AND array_agg(stripe_invoice_id ORDER BY stripe_invoice_id)
+                                 = ARRAY['in_worker_first', 'in_worker_second']
+                             FROM public.paid_invoice_history)))",
+                &[&worker, &writer, &commit],
+            ).await.map_err(|_| StoreError)?.get::<_, Option<bool>>(0).unwrap_or(false);
+            if !valid || after.0 != before.0 || (!commit && (after.1 != inserted || after.2.is_some())) {
+                return Err(StoreError);
+            }
+            Ok(())
+        }),
+        |_| {},
+    ).await.map_err(|_| diagnostic.get())
+}
+
 pub(crate) async fn test_reconcile_raw_replace(commit: bool) -> Result<(), &'static str> {
     use futures_util::future::{select, Either};
     use std::{cell::Cell, rc::Rc};
@@ -491,7 +637,7 @@ pub(crate) async fn test_reconcile_raw_replace(commit: bool) -> Result<(), &'sta
 // An empty stale outcome takes exclusion without acquiring a history FK lock.
 // This isolates the cascade's child-table wait from the separate parent cycle.
 pub(crate) async fn test_reconcile_before_parent_delete(commit: bool) -> Result<(), &'static str> {
-    use crate::billing_transaction_sql::PARENT_CASCADE_GATE;
+    use crate::billing_transaction_sql::PRECOMMIT_GATE;
     use futures_util::future::{join, select, Either};
     use std::{cell::Cell, rc::Rc};
 
@@ -524,9 +670,9 @@ pub(crate) async fn test_reconcile_before_parent_delete(commit: bool) -> Result<
                 return Err(StoreError);
             }
             // Keep samples in autocommit so pg_stat_activity is refreshed.
-            db.query_one("SELECT pg_advisory_lock($1)", &[&PARENT_CASCADE_GATE])
+            db.query_one("SELECT pg_advisory_lock($1)", &[&PRECOMMIT_GATE])
                 .await.map_err(|_| StoreError)?;
-            let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, ReconcileProbe::ParentCascade));
+            let mut reconcile = Box::pin(store.store_reconcile_owned(user.into(), outcome, ReconcileProbe::BeforeCommit));
             let worker = match select(reconcile.as_mut(), Box::pin(wait_lock_cycle(|| async {
                 let row = db.query_opt(
                     "SELECT l.pid FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a USING (pid)
@@ -582,7 +728,7 @@ pub(crate) async fn test_reconcile_before_parent_delete(commit: bool) -> Result<
             if parent_delete_snapshot(db, None).await? != before {
                 return Err(StoreError);
             }
-            let released: bool = db.query_one("SELECT pg_advisory_unlock($1)", &[&PARENT_CASCADE_GATE])
+            let released: bool = db.query_one("SELECT pg_advisory_unlock($1)", &[&PRECOMMIT_GATE])
                 .await.map_err(|_| StoreError)?.get(0);
             if !released {
                 return Err(StoreError);

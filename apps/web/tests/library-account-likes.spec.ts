@@ -6,14 +6,15 @@ const TRACK = 'Job_A';
 const REJECTED = 'Job_B';
 const RELEASE = '00000000-0000-4000-8000-000000000001';
 const likedTrack = { kind: 'track', target_id: TRACK, created_at: 1_700_000_000 };
-const BINDING = 'fixture-session-a';
+const BINDING = 'A'.repeat(43);
 const likes = (items: unknown[] = []) => ({ session_binding: BINDING, items });
 
-async function seedLibrary(page: Page, ids: string[] = []): Promise<void> {
-	await page.addInitScript(({ context, key, ids }) => {
+async function seedLibrary(page: Page, ids: string[] = [], verified = true): Promise<void> {
+	await page.addInitScript(({ context, key, ids, verified, binding }) => {
 		sessionStorage.setItem('nntune.library.auth-context.v1', context);
+		if (verified) sessionStorage.setItem('nntune.library.session-binding.v1', JSON.stringify([context, binding]));
 		localStorage.setItem(key, JSON.stringify(ids));
-	}, { context: CONTEXT, key: KEY, ids });
+	}, { context: CONTEXT, key: KEY, ids, verified, binding: BINDING });
 	await page.route('**/api/library', (route) => route.fulfill({
 		headers: { 'x-nntune-session-binding': BINDING },
 		json: [{ id: TRACK, title: 'Coral Horizon' }, { id: REJECTED, title: 'Tidal Echo' }]
@@ -34,51 +35,69 @@ test('Liked Songs can retry a failed read and only lists confirmed track likes',
 	await shelf.getByRole('button', { name: 'Retry liked songs' }).click();
 	await expect(shelf.getByRole('listitem')).toHaveText(['Coral Horizon', 'Unknown track']);
 });
-
-for (const corrupt of [false, true]) {
-	test(`explicit import preserves ${corrupt ? 'corrupt storage' : 'rejected and concurrently added favorites'}`, async ({ page }) => {
+for (const result of ['partial', 'corrupt', 'all rejected'] as const) {
+	test(`explicit import reports ${result} and preserves unconfirmed device data`, async ({ page }) => {
 		await seedLibrary(page, [TRACK, REJECTED]);
-		const before = JSON.stringify([TRACK, REJECTED, 'New_Job']);
+		const before = result === 'partial' ? JSON.stringify([TRACK, REJECTED, 'New_Job']) : '{broken';
+		const accepted = result !== 'all rejected';
 		let posts = 0;
-		await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes(posts ? [likedTrack] : []) }));
+		await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes(posts && accepted ? [likedTrack] : []) }));
 		await page.route('**/v1/me/likes/import', async (route) => {
 			posts++;
 			expect(route.request().postDataJSON()).toEqual({ session_binding: BINDING, items: [TRACK, REJECTED]
 				.map((target_id) => ({ kind: 'track', target_id })) });
-			await page.evaluate(({ key, value }) => localStorage.setItem(key, value), { key: KEY, value: corrupt ? '{broken' : before });
-			await route.fulfill({ json: { added: 1, already: 0, rejected: [{ target_id: REJECTED, reason: 'not_member' }] } });
+			await page.evaluate(({ key, value }) => localStorage.setItem(key, value), { key: KEY, value: before });
+			const rejected = (accepted ? [REJECTED] : [TRACK, REJECTED]).map((target_id) => ({ target_id, reason: 'not_member' }));
+			await route.fulfill({ json: { added: Number(accepted), already: 0, rejected } });
 		});
 		await page.goto('/library/liked');
 		const shelf = page.getByRole('region', { name: 'Liked Songs' });
 		await expect(shelf.getByText('No songs saved to this account yet.')).toBeVisible();
 		expect(posts).toBe(0);
 		await shelf.getByRole('button', { name: 'Import device favorites' }).click();
-		await expect(shelf.getByText('Coral Horizon')).toBeVisible();
-		await expect(shelf.getByRole('status')).toHaveText(corrupt
-			? 'Favorites were saved to your account, but device cleanup could not finish.'
-			: 'Some favorites remain on this device.');
-		expect(await page.evaluate((key) => localStorage.getItem(key), KEY)).toBe(corrupt ? '{broken' : JSON.stringify([REJECTED, 'New_Job']));
+		await expect(shelf.getByRole('status')).toHaveText({
+			partial: 'Some favorites remain on this device.',
+			corrupt: 'Favorites were saved to your account, but device cleanup could not finish.',
+			'all rejected': 'No device favorites were confirmed by your account.'
+		}[result]);
+		await expect(shelf.getByText(accepted ? 'Coral Horizon' : 'No songs saved to this account yet.')).toBeVisible();
+		if (result === 'partial') await expect(page.getByRole('button', { name: /^Remove .+ from Liked$/ })).toHaveText(['Remove Tidal Echo from Liked']);
+		expect(await page.evaluate((key) => localStorage.getItem(key), KEY)).toBe(result === 'partial' ? JSON.stringify([REJECTED, 'New_Job']) : before);
 	});
 }
 
-for (const endpoint of ['likes', 'likes/import']) {
-	test(`a late ${endpoint} response cannot publish or retire after the session changes`, async ({ page }) => {
+test('an unbound legacy list stays device-only even when the shelf has verified titles', async ({ page }) => {
+	await seedLibrary(page, [TRACK], false);
+	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes([likedTrack]) }));
+	await page.goto('/library/liked');
+	const shelf = page.getByRole('region', { name: 'Liked Songs' });
+	await expect(shelf.getByRole('listitem')).toHaveText('Coral Horizon');
+	await expect(page.getByRole('button', { name: 'Remove Coral Horizon from Liked' })).toBeVisible();
+	await expect(shelf.getByRole('button', { name: 'Import device favorites' })).toHaveCount(0);
+	expect(await page.evaluate((key) => localStorage.getItem(key), KEY)).toBe(JSON.stringify([TRACK]));
+});
+for (const cause of ['shelf overlap', 'retirement overlap', 'server replacement'] as const) {
+	test(`an old receipt cannot publish or retire after ${cause}`, async ({ page }) => {
 		await seedLibrary(page, [TRACK]);
-		let binding = BINDING;
-		await page.route('**/v1/me/likes/session', (route) => route.fulfill({ json: { session_binding: binding } }));
-		await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes([likedTrack]) }));
-		let release!: () => void;
-		const delayed = new Promise<void>((resolve) => { release = resolve; });
-		await page.route(`**/v1/me/${endpoint}`, async (route) => {
-			await delayed;
-			// The response belongs to the earlier session; no storage event has arrived.
-			binding = 'fixture-session-b';
-			return route.fulfill({ json: endpoint === 'likes' ? likes([likedTrack]) : { added: 0, already: 1, rejected: [] } });
+		const checking = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+		const importing = cause !== 'shelf overlap';
+		let verifies = 0;
+		await page.route('**/v1/me/likes/session', async (route) => {
+			if (++verifies === (importing ? 3 : 2)) {
+				checking.resolve();
+				await finish.promise;
+			}
+			return route.fulfill({ json: { session_binding: verifies >= 3 && cause === 'server replacement' ? 'E'.repeat(43) : BINDING } });
 		});
+		await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes([likedTrack]) }));
+		await page.route('**/v1/me/likes/import', (route) => route.fulfill({ json: { added: 0, already: 1, rejected: [] } }));
 		await page.goto('/library/liked');
-		if (endpoint.endsWith('import')) await page.getByRole('button', { name: 'Import device favorites' }).click();
-		else await expect(page.getByRole('button', { name: 'Remove Coral Horizon from Liked' })).toBeVisible();
-		release();
+		if (importing) await page.getByRole('button', { name: 'Import device favorites' }).click();
+		await checking.promise;
+		// The writing context does not receive a storage event for its own change.
+		if (cause !== 'server replacement') await page.evaluate(() => navigator.locks.request('nntune.auth.cookie-transition.v1',
+			() => localStorage.setItem('nntune.auth.generation.v1', 'new-generation')));
+		finish.resolve();
 		await expect(page.getByRole('main').getByRole('link', { name: 'Sign in' })).toBeVisible();
 		await expect(page.getByText('Coral Horizon')).toHaveCount(0);
 		expect(await page.evaluate((key) => localStorage.getItem(key), KEY)).toBe(JSON.stringify([TRACK]));

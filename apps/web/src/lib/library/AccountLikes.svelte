@@ -2,101 +2,125 @@
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { onMount } from 'svelte';
 	import { ApiClient, ApiError } from '../api/client.js';
-	import { browserStorage } from './cache.js';
-	import { favoritesKey } from './favorites.js';
-	import { importDeviceLikes, isLikesSession, loadLikes, type LibraryLike } from './likes.js';
+	import { captureAuthFence, subscribeAuthFenceInvalidation } from '../auth-fence.js';
+	import { browserStorage, verifiedFavoritesKey } from './cache.js';
+	import { importDeviceLikes, loadLikes, type LibraryLike } from './likes.js';
+	import { verifyLibrarySession } from './session-verification.js';
 
-	let { titles, libraryBinding, deviceCount, readDeviceIds, retireDeviceIds, onSessionChanged }: {
+	type Fence = NonNullable<Awaited<ReturnType<typeof captureAuthFence>>>;
+	let { titles, libraryBinding, deviceScope, deviceCount, readDeviceIds, retireDeviceIds, onSessionChanged }: {
 		titles: ReadonlyMap<string, string>;
-		libraryBinding: string | undefined;
+		libraryBinding?: string;
+		deviceScope?: string;
 		deviceCount: number;
 		readDeviceIds: () => string[];
-		retireDeviceIds: (ids: readonly string[], verify: () => Promise<boolean>) => Promise<boolean>;
+		retireDeviceIds: (key: string, ids: readonly string[], verify: () => Promise<boolean>, run: Fence['run']) => Promise<boolean>;
 		onSessionChanged: () => void;
 	} = $props();
-
 	let phase = $state<'loading' | 'ready' | 'sign-in' | 'error'>('loading');
 	let likes = $state<LibraryLike[]>([]);
 	let shelfBinding = $state<string>();
-	let importing = $state(false);
-	let feedback = $state('');
+	let shelfFence: Fence | undefined;
+	let importing = $state(false), feedback = $state('');
 	let active: AbortController | undefined;
 	const songs = $derived(likes.filter((like) => like.kind === 'track'));
-	const canImport = $derived(!!shelfBinding && shelfBinding === libraryBinding && deviceCount > 0);
+	const canImport = $derived(!!shelfBinding && shelfBinding === libraryBinding && !!deviceScope && deviceCount > 0);
 
-	function clientFor(request: AbortController): ApiClient {
-		return new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal });
+	function begin() {
+		active?.abort();
+		const request = active = new AbortController();
+		return { signal: request.signal, client: new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal }) };
 	}
 
-	function sessionChanged(): void {
+	function sessionChanged() {
 		active?.abort();
 		onSessionChanged();
 	}
 
-	async function read(client: ApiClient, isCurrent: () => boolean, expected = libraryBinding): Promise<void> {
+	async function read({ client, signal }: ReturnType<typeof begin>, fence: Fence, expected?: string) {
+		const run: Fence['run'] = (work) => fence.run(() => signal.aborted ? undefined : work());
 		try {
-			const { items, binding } = await loadLikes(client);
-			const matches = (!expected || binding === expected) && await isLikesSession(client, binding);
-			if (!isCurrent()) return;
-			if (!matches) return sessionChanged();
-			shelfBinding = binding;
-			likes = items;
-			phase = 'ready';
+			const started = await run(() => ({ response: loadLikes(client) }));
+			if (!started) return;
+			const result = await started.response;
+			const matches = await verify(run, result.binding, signal);
+			if (matches === undefined) return;
+			await run(() => {
+				if (!matches || (expected && expected !== result.binding)) return sessionChanged();
+				shelfFence = fence;
+				shelfBinding = result.binding;
+				likes = result.items;
+				phase = 'ready';
+			});
 		} catch (error) {
-			if (!isCurrent()) return;
-			shelfBinding = undefined;
-			phase = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error';
+			await run(() => { phase = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error'; });
+		} finally {
+			if (!signal.aborted && !fence.isCurrent()) sessionChanged();
+			else if (!signal.aborted && phase === 'loading') phase = 'error';
 		}
 	}
 
-	async function load(): Promise<void> {
-		active?.abort();
-		const request = new AbortController();
-		active = request;
-		phase = 'loading';
-		await read(clientFor(request), () => !request.signal.aborted);
+	// Box the request so the lock covers dispatch, never the network wait.
+	async function verify(run: Fence['run'], binding: string, signal: AbortSignal) {
+		return (await run(() => ({ response: verifyLibrarySession(binding, signal) })))?.response;
 	}
 
-	async function importLikes(): Promise<void> {
-		const binding = shelfBinding;
-		if (phase !== 'ready' || importing || !canImport || !binding) return;
+	async function load() {
+		const request = begin(), expected = libraryBinding;
+		phase = 'loading';
+		const fence = await captureAuthFence();
+		if (request.signal.aborted) return;
+		if (!fence) { phase = 'error'; return; }
+		await read(request, fence, expected);
+	}
+
+	async function importLikes() {
+		const binding = shelfBinding, fence = shelfFence, key = deviceScope;
+		if (phase !== 'ready' || importing || !canImport || !binding || !fence || !key) return;
+		const request = begin();
+		const { signal, client } = request;
 		const session = browserStorage('session');
-		const key = favoritesKey(session);
-		const ids = readDeviceIds();
-		if (!key || !ids.length) return;
-		active?.abort();
-		const request = new AbortController();
-		active = request;
-		const isCurrent = () => !request.signal.aborted && libraryBinding === binding && favoritesKey(session) === key;
-		const client = clientFor(request);
+		const isCurrent = () => !signal.aborted && fence.isCurrent() && libraryBinding === binding &&
+			deviceScope === key && verifiedFavoritesKey(session, binding) === key;
+		const run: Fence['run'] = (work) => fence.run(() => isCurrent() ? work() : undefined);
 		importing = true;
 		feedback = '';
 		try {
-			const cleaned = await importDeviceLikes(client, ids, {
-				binding, isCurrent,
-				retireConfirmed: (confirmed) => retireDeviceIds(confirmed, async () => {
-					if (!isCurrent()) return false;
-					const matches = await isLikesSession(client, binding);
-					if (isCurrent() && !matches) sessionChanged();
-					return matches && isCurrent();
-				})
+			const ids = await run(readDeviceIds);
+			if (!ids?.length) return;
+			const outcome = await importDeviceLikes(client, ids, {
+				binding, isCurrent, run,
+				retireConfirmed: (confirmed) => retireDeviceIds(key, confirmed, async () => {
+					const matches = await verify(run, binding, signal);
+					if (matches === false && !signal.aborted) sessionChanged();
+					return matches === true;
+				}, run)
 			});
-			if (isCurrent()) feedback = !cleaned
-				? 'Favorites were saved to your account, but device cleanup could not finish.'
-				: readDeviceIds().length ? 'Some favorites remain on this device.' : 'Device favorites imported.';
+			await run(() => {
+				if (!outcome) return;
+				feedback = {
+					'cleanup-failed': 'Favorites were saved to your account, but device cleanup could not finish.',
+					'none-confirmed': 'No device favorites were confirmed by your account.',
+					partial: 'Some favorites remain on this device.',
+					complete: readDeviceIds().length ? 'Some favorites remain on this device.' : 'Device favorites imported.'
+				}[outcome];
+			});
 		} catch (error) {
-			if (!isCurrent()) return;
-			if (error instanceof ApiError && (error.status === 401 || error.status === 412)) return sessionChanged();
-			feedback = 'Import could not finish. Unconfirmed favorites are still on this device.';
+			if (signal.aborted) return;
+			if (error instanceof ApiError && (error.status === 401 || error.status === 412)) sessionChanged();
+			else await run(() => { feedback = 'Import could not finish. Unconfirmed favorites are still on this device.'; });
 		} finally {
-			if (isCurrent()) await read(client, isCurrent, binding);
-			if (active === request) importing = false;
+			if (!signal.aborted && !fence.isCurrent()) sessionChanged();
+			if (isCurrent()) await read(request, fence, binding);
+			if (active?.signal === signal) importing = false;
 		}
 	}
 
 	onMount(() => {
+		const lifetime = new AbortController();
+		subscribeAuthFenceInvalidation(sessionChanged, lifetime.signal);
 		void load();
-		return () => active?.abort();
+		return () => { lifetime.abort(); active?.abort(); };
 	});
 </script>
 
