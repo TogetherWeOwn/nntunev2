@@ -20,8 +20,8 @@ async function openLibrary(page: Page) {
 }
 const stored = async (page: Page, context?: string | null) =>
 	page.evaluate((key) => localStorage.getItem(key), `${favoritesBase}.${context ?? await scope(page)}`);
-async function holdWrites(page: Page, refuseNorth = false) {
-	return page.evaluateHandle(({ key, refuseNorth, id }) => new Promise<() => Promise<void>>((ready) => {
+const holdWrites = async (page: Page, refuseNorth: boolean) =>
+	page.evaluateHandle(({ key, refuseNorth, id }) => new Promise<() => Promise<void>>((ready) => {
 		const setItem = Storage.prototype.setItem;
 		Storage.prototype.setItem = function (name, value) {
 			if (refuseNorth && name === key && JSON.parse(value).includes(id)) throw new DOMException('Refused', 'QuotaExceededError');
@@ -30,25 +30,26 @@ async function holdWrites(page: Page, refuseNorth = false) {
 		void navigator.locks.request(key, () => new Promise<void>((release) =>
 			ready(() => { release(); return navigator.locks.request(key, () => {}); })));
 	}), { key: `${favoritesBase}.${await scope(page)}`, refuseNorth, id: north.id });
-}
-for (const scenario of ['append then Refresh', 'refusal then save', 'membership round trip', 'leave and return']) {
+for (const scenario of ['append then Refresh', 'Refresh fails after save', 'Refresh fails before save', 'refusal then save', 'membership round trip', 'leave and return']) {
 	test(`held Favorite write: ${scenario}`, async ({ page }) => {
 		await openLibrary(page);
-		const refused = scenario === 'refusal then save', refreshing = scenario === 'append then Refresh';
+		const refused = scenario === 'refusal then save', appended = scenario === 'append then Refresh';
+		const failed = scenario.startsWith('Refresh fails'), lateSave = scenario === 'Refresh fails before save';
 		const refresh = Promise.withResolvers<void>();
 		const [decoder, ownerScope] = await Promise.all([page.getByTestId('audio-player').elementHandle(), scope(page)]);
-		const queueStar = star(queueRow(page, north.id));
-		const southStar = star(row(page, south.id), south);
+		const queueStar = star(queueRow(page, north.id)), southStar = star(row(page, south.id), south);
 		if (refused) await southStar.click();
 		const release = await holdWrites(page, refused);
 		expect(await stored(page)).toBe(refused ? JSON.stringify([south.id]) : null);
 		await favorite(page).press('Space');
 		await expect(queueStar).toHaveAttribute('aria-pressed', 'true');
-		if (refreshing) {
+		if (appended) {
 			await row(page, east.id).getByTestId('track-more').click();
 			await page.getByRole('menuitem', { name: 'Add to queue', exact: true }).click();
 			await expect(queueRow(page, east.id)).toBeVisible();
-			await page.route('**/api/library', (route) => refresh.promise.then(() => route.fallback()), { times: 1 });
+		}
+		if (appended || failed) {
+			await page.route('**/api/library', (route) => refresh.promise.then(() => failed ? route.fulfill({ status: 500 }) : route.fallback()), { times: 1 });
 			await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 			await expect(favorite(page)).toHaveCount(0);
 		} else if (scenario === 'membership round trip') {
@@ -61,40 +62,45 @@ for (const scenario of ['append then Refresh', 'refusal then save', 'membership 
 			await expect(favorite(page)).toHaveAccessibleName('Favorite North Wind');
 		}
 		await expect(feedback(page)).toBeEmpty();
-		await release.evaluate((unlock) => unlock());
+		const left = scenario === 'leave and return', saved = JSON.stringify([north.id]);
+		if (!lateSave) await release.evaluate((unlock) => unlock());
 		if (refused) {
 			await expect(feedback(page)).toHaveText('Starred North Wind for this visit.');
 			await southStar.click();
-			await expect.poll(() => stored(page)).toBe('[]');
 		}
-		const left = scenario === 'leave and return';
-		expect([await stored(page), await scope(page)]).toEqual([refused ? '[]' : left ? null : JSON.stringify([north.id]), ownerScope]);
-		if (refreshing) await expect(feedback(page)).toBeEmpty();
+		await expect.poll(async () => [await stored(page), await scope(page)]).toEqual([refused ? '[]' : left || lateSave ? null : saved, ownerScope]);
+		if (appended || failed) await expect(feedback(page)).toBeEmpty();
 		refresh.resolve();
+		if (failed) {
+			const stale = page.getByTestId('library-stale-badge');
+			await expect(stale).toBeVisible();
+			await expect(feedback(page)).toBeEmpty();
+			await page.getByRole('button', { name: 'Retry', exact: true }).click();
+			await expect(stale).toHaveCount(0);
+			if (lateSave) await release.evaluate((unlock) => unlock());
+			expect(await stored(page)).toBe(saved);
+		}
 		for (const control of [favorite(page), queueStar, star(row(page, north.id))])
 			await expect(control).toHaveAttribute('aria-pressed', String(!left));
-		await expect(feedback(page)).toHaveText(refused ? 'Starred North Wind for this visit.' : refreshing ? 'Starred North Wind.' : '');
+		await expect(feedback(page)).toHaveText(refused ? 'Starred North Wind for this visit.' : appended ? 'Starred North Wind.' : '');
 		await expect(page.getByTestId('now-playing')).toContainText(north.title);
 		await expect(page.getByTestId('player-next')).toBeEnabled();
 		expect(await page.getByTestId('audio-player').evaluate((node, original) => node === original, decoder)).toBe(true);
 	});
 }
-async function editDuringActivation(button: Locator, edit: Locator) {
-	await button.evaluate((node, edit) => node.addEventListener('click',
+const editDuringActivation = async (button: Locator, edit: Locator) =>
+	button.evaluate((node, edit) => node.addEventListener('click',
 		() => (edit as HTMLButtonElement).click(), { capture: true, once: true }), await edit.elementHandle());
-}
 for (const input of ['pointer', 'legacy chord', 'Space', 'click only']) {
 	test(`${input} cannot star a replacement selection`, async ({ page }) => {
 		const chord = input === 'legacy chord';
 		if (chord) await page.addInitScript(() => window.addEventListener('click', (event) => {
-			// Model a legacy browser without making the click untrusted.
-			if (event.isTrusted && event.detail > 0) Object.setPrototypeOf(event, MouseEvent.prototype);
+			if (event.isTrusted && event.detail > 0) Object.setPrototypeOf(event, MouseEvent.prototype); // Keep native trust.
 		}, true));
 		await openLibrary(page);
 		const button = favorite(page);
 		const select = queueRow(page, south.id).getByRole('button', { name: 'Select South Wind', exact: true });
-		const mouse = chord || input === 'pointer';
-		const replacement = input === 'Space' ? north : south;
+		const mouse = chord || input === 'pointer', replacement = input === 'Space' ? north : south;
 		await button.evaluate((node) => {
 			node.addEventListener('pointerup', () => { node.dataset.pointerUp = 'yes'; });
 			node.addEventListener('click', (event) => {
@@ -121,8 +127,7 @@ for (const input of ['pointer', 'legacy chord', 'Space', 'click only']) {
 		await expect(button).toHaveAttribute('aria-pressed', 'false');
 		await expect(feedback(page)).toBeEmpty();
 		expect(await stored(page)).toBeNull();
-		if (input === 'click only') await button.evaluate((node) => node.click());
-		else await button.click();
+		await (input === 'click only' ? button.evaluate((node) => node.click()) : button.click());
 		await expect.poll(() => stored(page)).toBe(JSON.stringify([replacement.id]));
 		await expect(button).toHaveAttribute('aria-pressed', 'true');
 		await expect(page.locator('[aria-live="polite"]').filter({ hasText: `Starred ${replacement.title}.` })).toHaveCount(1);
@@ -160,8 +165,7 @@ test('authoritative Refresh recovers a missing scope, not an arbitrary replaceme
 	await page.evaluate(() => window.dispatchEvent(new Event('restore-storage')));
 	const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
 	await refresh.click();
-	for (const control of [favorite(page), star(row(page, north.id)), star(queueRow(page, north.id))])
-		await expect(control).toHaveAttribute('aria-pressed', 'true');
+	for (const control of [favorite(page), star(row(page, north.id)), star(queueRow(page, north.id))]) await expect(control).toHaveAttribute('aria-pressed', 'true');
 	const retired = await scope(page);
 	expect([Boolean(retired), await stored(page, retired)]).toEqual([true, null]);
 	await favorite(page).evaluate((button, key) => button.addEventListener('click',

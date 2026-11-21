@@ -1,7 +1,6 @@
 import { displayTitle } from '../library/order.js';
 import { currentTrack, type QueueState } from './queue.js';
 import type { createQueueController } from './queueController.js';
-
 export type FavoriteWrite = 'saved' | 'visit' | null;
 type Membership = { pressed: boolean; edit: number; loading: boolean };
 type FavoriteOwner = { read(id: string): Membership | null; write(id: string, pressed: boolean): Promise<FavoriteWrite> };
@@ -9,8 +8,7 @@ type Selection = Membership & { id: string; receipt: string };
 
 /** The player borrows the mounted Library's membership; it never owns a copy. */
 export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueController>) {
-	let owner = $state.raw<{ member: FavoriteOwner; version: number } | null>(null);
-	let ownerVersion = 0;
+	let owner = $state.raw<{ member: FavoriteOwner; version: number } | null>(null), ownerVersion = 0;
 	let outcome = $state.raw<(Selection & { text: string }) | null>(null);
 	function bind(member: FavoriteOwner): () => void {
 		const binding = owner = { member, version: ++ownerVersion };
@@ -29,12 +27,10 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 	async function activate(intent: Selection): Promise<void> {
 		const target = view(queue.snapshot);
 		if (!owner || !target || target.loading || !matches(target, intent)) return;
-		const pressed = !target.pressed;
-		const pending = owner.member.write(target.id, pressed);
+		const pressed = !target.pressed, pending = owner.member.write(target.id, pressed);
 		// The owner publishes the optimistic membership before awaiting the scoped lock.
 		const applied = view(queue.snapshot);
-		const result = await pending;
-		const completed = view(queue.snapshot);
+		const result = await pending, completed = view(queue.snapshot);
 		if (!result || !applied || !completed || applied.receipt !== intent.receipt || applied.id !== intent.id ||
 			applied.pressed !== pressed || !matches(completed, applied)) return;
 		outcome = { ...completed, text: `${pressed ? 'Starred' : 'Unstarred'} ${target.title}${result === 'visit' ? ' for this visit' : ''}.` };

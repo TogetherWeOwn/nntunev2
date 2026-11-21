@@ -7,8 +7,7 @@
 	const feedback = $derived(currentFavorite.feedback(target));
 	$effect(() => currentFavorite.reconcileFeedback(target));
 	const activateRendered: Action<HTMLButtonElement, NonNullable<typeof target>> = (button, rendered) => {
-		const listeners = new AbortController();
-		const capture = { capture: true, signal: listeners.signal };
+		const listeners = new AbortController(), capture = { capture: true, signal: listeners.signal };
 		const hits = (event: Event) => event.composedPath().includes(button);
 		// Touch and pen clicks must match the originating pointer.
 		const pointers = new Map<string, { id: number; intent: typeof rendered }>();
@@ -18,9 +17,8 @@
 			pointers.delete(pointerType);
 			return press.intent;
 		};
-		let mouse: typeof rendered | undefined, mouseRelease: typeof rendered | undefined;
-		let space: typeof rendered | undefined, legacyRelease: PointerEvent | undefined;
-		let release: ReturnType<typeof setTimeout> | undefined;
+		let mouse: typeof rendered | undefined, mouseRelease: typeof rendered | undefined, space: typeof rendered | undefined;
+		let legacyRelease: PointerEvent | undefined, release: ReturnType<typeof setTimeout> | undefined;
 		const clearSpace = () => { clearTimeout(release); release = space = undefined; };
 		const intents = new WeakMap<Event, typeof rendered>();
 		window.addEventListener('pointerdown', (event) => {

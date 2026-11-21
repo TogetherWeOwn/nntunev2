@@ -405,7 +405,7 @@
 					recentFindsInitialized = true;
 				}
 				applyShareLink();
-			}
+			} else if (!state.loading) currentFavoriteEdit++; // Retire results on terminal failures, including cached fallback.
 			if (!isCurrent()) return;
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
