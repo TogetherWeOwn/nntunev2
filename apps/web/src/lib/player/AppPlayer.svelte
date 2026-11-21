@@ -1,5 +1,5 @@
 <script module lang="ts">
-	import { createContext, onMount, tick, type Snippet } from 'svelte';
+	import { createContext, onMount, tick, untrack, type Snippet } from 'svelte';
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
 	import { browserStorage, LIBRARY_AUTH_TRANSITION_KEY } from '../library/cache.js';
 	import { LIBRARY_ACCESS_REFUSED_EVENT } from '../library/refresh.js';
@@ -11,7 +11,7 @@
 	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & { claimShareEntry?: () => boolean }>();
 </script>
 <script lang="ts">
-	let { children, claimShareEntry }: { children: Snippet; claimShareEntry?: (owner: string) => boolean } = $props();
+	let { children, claimShareEntry, signedOut }: { children: Snippet; claimShareEntry?: (owner: string) => boolean; signedOut?: boolean } = $props();
 	let shareOwner: string | undefined;
 	const player = setAppPlayer(Object.assign(createPlayerController(createQueue([]), { flush: tick }),
 		{ claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
@@ -19,6 +19,7 @@
 	const attachNativeAudio = media.attach;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	$effect.pre(() => { if (signedOut) untrack(player.purgeAtAuthBoundary); });
 	// Retire the decoder before the mounted Library handles the same signal.
 	$effect.pre(() => {
 		const offAuth = subscribeLocalAuthTransition(player.purgeAtAuthBoundary);

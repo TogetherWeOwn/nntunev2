@@ -388,20 +388,18 @@ for (const mode of ['playing', 'demo', 'encoded demo', 'paused', '404 clear', '4
 			await page.reload();
 			await expect(page.getByTestId('favorite-item')).toContainText(playbackFixture.title);
 		} else if (!paused) {
-			const path = mode === 'encoded demo' ? '/d%65mo/player' : demo ? '/demo/player' : '/';
-			await clientNavigate(page, path, false);
+			await clientNavigate(page, mode === 'encoded demo' ? '/d%65mo/player' : demo ? '/demo/player' : '/', false);
 			await expect(page.getByRole('heading', { name: demo ? 'Player resilience demo' : 'NNTune', exact: true })).toBeVisible();
 			if (demo) await expect(page.getByTestId('demo-audio')).toHaveCount(1);
 			await expect(page.locator('audio')).toHaveCount(demo ? 1 : 0);
-			await expect(page.getByText(playbackFixture.title)).toHaveCount(0);
-			await expect(page.getByTestId('library-now-playing')).toHaveCount(0);
+			await expect(page.getByText(playbackFixture.title).or(page.getByTestId('library-now-playing'))).toHaveCount(0);
 			expect(await audio.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);
 		}
 		expect(errors).toEqual([]);
 	});
 }
 
-for (const signal of ['local', 'cross-tab', 401, 403] as const) {
+for (const signal of ['local', 'cross-tab', 401, 403, 'Billing'] as const) {
 	const trigger = typeof signal === 'number' ? `Library HTTP ${signal}` : `${signal} sign-out`;
 	test(`${trigger} purges the native player while Library is absent`, async ({ page }) => {
 		await servePlaybackLibrary(page);
@@ -413,18 +411,20 @@ for (const signal of ['local', 'cross-tab', 401, 403] as const) {
 		} else await page.goto('/library');
 		const audio = await startNativePlayback(page);
 		if (typeof signal === 'number') await page.route('**/api/library', (route) => route.fulfill({ status: signal }), { times: 1 });
-		await openHome(page);
+		if (signal === 'Billing') {
+			await page.route(/\/v1\/me\/(subscription|usage)$/, (route) => route.fulfill({ status: 401, json: { error: 'unauthorized' } }));
+			await clientNavigate(page, '/account/billing', false);
+			await expect(page.getByRole('alert')).toContainText('You are signed out');
+		} else await openHome(page);
 		if (typeof signal === 'number') {
 			await expect(page.getByText(signal === 401 ? 'Sign in to see your library.' : 'You do not have access to this library.')).toBeVisible();
-		} else {
+		} else if (signal !== 'Billing') {
 			await expect(page.getByTestId('library-now-playing')).toContainText(playbackFixture.title);
 			if (signal === 'local') await release(page, endpoint, 200, { ok: true });
 			else await actorLogout(page);
 		}
-		await expect(page).toHaveURL(/\/home$/);
-		await expect(page.getByTestId('audio-player')).toHaveCount(0);
-		await expect(page.getByTestId('library-now-playing')).toHaveCount(0);
-		await expect(page.getByTestId('mini-player')).toHaveCount(0);
+		await expect(page).toHaveURL(signal === 'Billing' ? /\/account\/billing$/ : /\/home$/);
+		await expect(page.locator('audio, [data-testid="library-now-playing"], [data-testid="mini-player"]')).toHaveCount(0);
 		expect(await audio.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);
 		await page.getByTestId('shell-rail').getByRole('link', { name: 'Your Library', exact: true }).click();
 		await expect(page.getByTestId('library-item')).toHaveCount(1);

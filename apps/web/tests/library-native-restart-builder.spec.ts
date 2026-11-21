@@ -245,8 +245,7 @@ for (const outcome of ['Restarted', 'Already at the start of', 'Could not restar
 			Array.from(el.childNodes).find((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) !== previous,
 			previousText
 		)).toBe(true);
-		const player = page.getByRole('region', { name: 'Player', exact: true });
-		await expect(player.locator('[data-testid="library-restart-status"][aria-live="polite"]')).toHaveCount(1);
+		await expect(page.locator('section[aria-label="Player"] [data-testid="library-restart-status"][aria-live="polite"]')).toHaveCount(1);
 		await previousText.dispose();
 	});
 }

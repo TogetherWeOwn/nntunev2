@@ -503,7 +503,7 @@
 	{#if page.route.id === null}
 		{@render appBody()}
 	{:else}
-		<AppPlayer {claimShareEntry} children={appBody} />
+		<AppPlayer {claimShareEntry} children={appBody} signedOut={page.route.id === '/account/billing' && page.data.signedOut === true} />
 	{/if}
 	{#if rightSnippet}
 		<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
