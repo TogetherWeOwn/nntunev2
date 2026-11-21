@@ -25,27 +25,14 @@ diff -u "$expected/mbdump-recording_music_video.tsv" "$temp_dir/mbdump/curated/m
 diff -u "$expected/mbdump-recording_isrc.tsv" "$temp_dir/mbdump/curated/mbdump-recording_isrc.tsv"
 diff -u "$expected/mbdump-work_alias.tsv" "$temp_dir/mbdump/curated/mbdump-work_alias.tsv"
 
-# The preserved core-dump cover rows share endpoints with music-video rows.
-# Give one excluded edge a nonexistent endpoint so a mistaken admission cannot
-# hide behind duplicate canonicalization of the existing music-video pair.
-cp -R "$fixtures/mbdump" "$temp_dir/excluded-cover"
-python3 - "$temp_dir/excluded-cover/l_recording_recording" <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-lines = path.read_text().splitlines(keepends=True)
-if sum(line.startswith('323\t214\t50\t51\t') for line in lines) != 1:
-    raise ValueError('expected exactly one excluded cover row')
-lines = [line.replace('323\t214\t50\t51\t', '323\t214\t50\t99999\t') for line in lines]
-path.write_text(''.join(lines))
-PY
-DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/excluded-cover"
-diff -u "$expected/mbdump-recording_music_video.tsv" "$temp_dir/excluded-cover/curated/mbdump-recording_music_video.tsv"
+# Both directed core-dump cover rows share endpoints with the legacy video pair.
+diff -u "$expected/mbdump-recording_recording.tsv" "$temp_dir/mbdump/curated/mbdump-recording_recording.tsv"
 
-# Even an excluded relationship must have the upstream COPY row width.
+# Every relationship must have the upstream COPY row width.
 cp -R "$fixtures/mbdump" "$temp_dir/malformed-cover"
 printf '325\t214\t50\n' >> "$temp_dir/malformed-cover/l_recording_recording"
 if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/malformed-cover" 2>"$temp_dir/malformed-cover.err"; then
-  echo 'expected malformed excluded relationship failure' >&2
+  echo 'expected malformed recording relationship failure' >&2
   exit 1
 fi
 grep -q 'row 6: expected 9 fields, got 3' "$temp_dir/malformed-cover.err"

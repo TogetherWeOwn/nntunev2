@@ -98,6 +98,15 @@ projection fields refuse publication; an empty `l_recording_work` file
 produces an empty sidecar. Its links are resolved separately from the URL and
 music-video allowlist.
 
+`mbdump-recording_recording.tsv` contains `entity0` recording MBID, `entity1`
+recording MBID, link-type name (raw COPY text), and dump timestamp. It keeps
+both directions if present and deduplicates by directed MBID pair and decoded
+type name, retaining the smallest raw COPY spelling. It excludes the pinned
+music-video type, not the pair: a separate song relation on the same endpoints
+still appears. The existing undirected video projection is unchanged. Empty or
+video-only input yields an empty sidecar; malformed or dangling references
+refuse publication. Disk-bounded mode writes the same content as `.tsv.gz`.
+
 `mbdump-label.tsv` contains label MBID, name, label code, label-type name,
 and dump timestamp, ordered by upstream label ID. An absent code or type is
 `\N`. `mbdump-release_label.tsv` contains release MBID, label MBID, catalogue
@@ -185,7 +194,7 @@ field order; use an extract from the matching schema revision. Derivations:
   (canonical recording, membership rows); `migrations/0016_mb_track.sql`;
   `import.sh:538-545` (FK specs);
   `crates/mb-import-validate/src/lib.rs` (`Position` check).)
-- Relationship slices keep only allowlisted link types, resolved from their
+- Legacy URL and music-video slices keep only allowlisted link types, resolved from their
   pinned GIDs (artist `youtube` / `youtube music` / `free streaming` /
   `streaming`, recording `free streaming`, recording-recording
   `music video`); a dump missing any pinned GID fails closed, as does a
