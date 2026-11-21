@@ -120,18 +120,21 @@ class PressureObservation(NamedTuple):
 
 def _sample(env, run, wall, monotonic, deadline_ms=None):
     child = connection_env(env)
-    started_ms = monotonic() * 1000
+    started = monotonic()
+    started_ms = started * 1000
     observed_ms = int(started_ms)
-    cutoff_ms = started_ms + DEADLINE_SECONDS * 1000
-    if deadline_ms is not None:
+    timeout = DEADLINE_SECONDS
+    if deadline_ms is None:
+        since = wall()
+    else:
         cutoff_ms = min(deadline_ms, observed_ms + MAX_SAMPLE_AGE_SECONDS * 1000)
-    if not started_ms < cutoff_ms:
-        raise UnsafeSample("deadline")
-    since = wall()
-    dispatch_ms = started_ms if deadline_ms is None else monotonic() * 1000
-    if not started_ms <= dispatch_ms < cutoff_ms:
-        raise UnsafeSample("deadline")
-    timeout = (cutoff_ms - dispatch_ms) / 1000
+        if not started_ms < cutoff_ms:
+            raise UnsafeSample("deadline")
+        since = wall()
+        dispatch_ms = monotonic() * 1000
+        if not started_ms <= dispatch_ms < cutoff_ms:
+            raise UnsafeSample("deadline")
+        timeout = (cutoff_ms - dispatch_ms) / 1000
     try:
         result = run(
             [
@@ -154,15 +157,19 @@ def _sample(env, run, wall, monotonic, deadline_ms=None):
         raise UnsafeSample("deadline") from None
     except (OSError, ValueError):
         raise UnsafeSample("client") from None
-    finished_ms = monotonic() * 1000
-    if not dispatch_ms <= finished_ms < cutoff_ms:
+    finished = monotonic()
+    if deadline_ms is None:
+        # Keep the smoke CLI's original inclusive elapsed-time limit.
+        if finished - started > DEADLINE_SECONDS:
+            raise UnsafeSample("deadline")
+    elif not dispatch_ms <= finished * 1000 < cutoff_ms:
         raise UnsafeSample("deadline")
     if result.returncode != 0:
         raise UnsafeSample("query")
     row = parse_sample(result.stdout, since, wall())
     if deadline_ms is not None:
         validated_ms = monotonic() * 1000
-        if not finished_ms <= validated_ms < cutoff_ms:
+        if not finished * 1000 <= validated_ms < cutoff_ms:
             raise UnsafeSample("deadline")
     return observed_ms, row
 
