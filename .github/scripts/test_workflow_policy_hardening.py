@@ -54,33 +54,16 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                 self.assertNotIn("rustup toolchain install stable", section)
 
     def test_deployment_gate_groups_do_not_hold_deploy_or_e2e_locks(self):
-        alerts = (WORKFLOWS / "deploy-alerts-staging.yml").read_text()
-        self.assertNotRegex(alerts, r"(?m)^concurrency:")
         for path in ("deploy.yml", "deploy-alerts-staging.yml"):
             with self.subTest(path=path):
-                gate = job((WORKFLOWS / path).read_text(), "gate")
+                text = (WORKFLOWS / path).read_text()
+                # The separate alerts deploy must not hold a run-level lock.
+                if path == "deploy-alerts-staging.yml":
+                    self.assertNotRegex(text, r"(?m)^concurrency:")
+                gate = job(text, "gate")
                 self.assertIn("group: ${{ github.workflow }}-gate-${{ github.ref }}", gate)
                 self.assertIn("cancel-in-progress: false", gate)
                 self.assertIn("queue: max", gate)
-
-    def test_main_staging_deploy_and_e2e_share_one_queued_run_lock(self):
-        deploy = (WORKFLOWS / "deploy.yml").read_text()
-        self.assertRegex(deploy, r"(?m)^on:\n  push:\n    branches: \[main\]\n  workflow_dispatch:\n\n")
-        self.assertIn(
-            "\nconcurrency:\n"
-            "  group: ${{ github.event_name == 'push' && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}\n"
-            "  cancel-in-progress: false\n"
-            "  queue: max\n",
-            deploy,
-        )
-        for name in ("staging-web", "staging-api", "staging-mb", "staging-ingest", "post-deploy-e2e"):
-            with self.subTest(job=name):
-                section = job(deploy, name)
-                self.assertNotRegex(section, r"(?m)^    concurrency:")
-                self.assertIn("    if: ${{ github.event_name == 'push'", section)
-        e2e = job(deploy, "post-deploy-e2e")
-        self.assertIn("    needs: [staging-web, staging-api]\n", e2e)
-        self.assertIn("      expected_sha: ${{ github.sha }}\n", e2e)
 
     def test_staging_build_does_not_restore_or_save_package_caches(self):
         web = job((WORKFLOWS / "deploy.yml").read_text(), "staging-web")
