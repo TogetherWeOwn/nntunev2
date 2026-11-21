@@ -210,3 +210,69 @@ DROP FUNCTION public.digest_lookup_fixture(int);
 DROP FUNCTION public.digest_claim_statement(UUID, UUID, BYTEA, BIGINT, UUID, UUID, UUID, UUID, TIMESTAMPTZ, UUID);
 DROP FUNCTION public.digest_ref_fixture(int, bool, text, uuid, timestamptz);
 SQL
+
+# Reuse the disposable lookup fixture's namespace and owner, not its digest
+# winners. Load the inert schema only here, then run the actual SQL statements.
+psql_run -f "$tests_dir/../src/ingest_session_schema.sql"
+reserve="PREPARE reserve_session(uuid, uuid, text, text, bytea, uuid) AS $(<"$tests_dir/../src/ingest_session_reserve.sql")"
+abort="PREPARE abort_session(uuid, uuid, text, uuid, text) AS $(<"$tests_dir/../src/ingest_session_terminate.sql")"
+advance="PREPARE advance_checkpoint(uuid, uuid, text, uuid, bytea, uuid, bigint, bigint, bigint) AS $(<"$tests_dir/../src/ingest_session_advance_checkpoint.sql")"
+scope="'01000000-0000-4000-8000-000000000001', '11000000-0000-4000-8000-000000000001', 'digest-test-owner'"
+fp="decode(repeat('de', 32), 'hex')"
+gen="'41000000-0000-4000-8000-000000000001'"
+initial_idle="absolute_deadline - interval '23 hours 55 minutes'"
+
+# Exercise both lock orders and both possible holder dispositions. '-' denotes
+# a successful statement returning zero rows, not a database/transport error.
+for scenario in 'abort COMMIT aborted - 0 0' 'abort ROLLBACK aborted 1 1 100' \
+                'checkpoint COMMIT 1 aborted 1 100' 'checkpoint ROLLBACK 1 aborted 0 0'; do
+  read -r first finish holder_expected contender_expected rev offset <<<"$scenario"
+  sid="$(psql_run -Atc 'SELECT gen_random_uuid()')"
+  [[ "$sid" =~ ^[0-9a-f-]{36}$ ]]
+  [[ "$(psql_run -Atc "$reserve" -c "EXECUTE reserve_session($scope, 'race-$first-$finish', $fp, '$sid')")" == "$sid" ]]
+  psql_run -c "UPDATE public.ingest_session_reservations SET idle_deadline=$initial_idle WHERE id='$sid'"
+  abort_query="EXECUTE abort_session($scope, '$sid', 'abort');"
+  advance_query="EXECUTE advance_checkpoint($scope, '$sid', $fp, $gen, 0, 0, 100);"
+  holder_prepare="$abort"; holder_query="$abort_query"
+  contender_prepare="$advance"; contender_query="$advance_query"
+  terminal=aborted
+  if [[ "$first" == checkpoint ]]; then
+    holder_prepare="$advance"; holder_query="$advance_query"
+    contender_prepare="$abort"; contender_query="$abort_query"
+  elif [[ "$finish" == ROLLBACK ]]; then
+    terminal=active
+  fi
+
+  race="$dir/session-$first-$finish"
+  mkdir -- "$race"
+  mkfifo "$race/input"; exec 3<>"$race/input"
+  PGAPPNAME=ingest_session_holder psql_run -At <"$race/input" >"$race/holder" & holder=$!
+  printf "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout = '30s';\n%s\n%s\n\\! touch '%s/ready'\n" \
+    "$holder_prepare" "$holder_query" "$race" >&3
+  for _ in {1..100}; do [[ -e "$race/ready" ]] && break; sleep 0.1; done
+  [[ -e "$race/ready" ]] || { printf 'ingest session holder did not start: %s\n' "$scenario" >&2; exit 1; }
+  PGAPPNAME=ingest_session_contender psql_run -Atc "$contender_prepare" \
+    -c 'BEGIN ISOLATION LEVEL READ COMMITTED;' -c "$contender_query" -c 'COMMIT;' \
+    3>&- >"$race/contender" & contender=$!
+  blocked=0
+  for _ in {1..100}; do
+    if [[ "$(psql_run -Atc "SELECT count(*) FROM pg_stat_activity c JOIN pg_stat_activity h ON h.pid=ANY(pg_blocking_pids(c.pid)) WHERE c.application_name='ingest_session_contender' AND h.application_name='ingest_session_holder' AND c.wait_event='transactionid'")" == 1 ]]; then blocked=1; break; fi
+    sleep 0.1
+  done
+  [[ "$blocked" == 1 ]] || { printf 'ingest session contender did not wait on holder: %s\n' "$scenario" >&2; exit 1; }
+  printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
+  wait "$holder"; wait "$contender"
+  result="$(<"$race/contender")"
+  [[ "$(<"$race/holder")" == "$holder_expected" && "${result:--}" == "$contender_expected" ]] || {
+    printf 'unexpected checkpoint/abort statement result: %s\n' "$scenario" >&2; exit 1;
+  }
+  [[ "$(psql_run -Atc "SELECT COALESCE(terminal_reason, 'active'), checkpoint_revision, checkpoint_offset,
+       (terminal_at IS NULL) = ('$terminal' = 'active'),
+       checkpoint_generation IS NOT DISTINCT FROM CASE WHEN $rev = 0 THEN NULL ELSE $gen::uuid END,
+       CASE WHEN $rev = 0 THEN idle_deadline = $initial_idle ELSE idle_deadline > $initial_idle END
+     FROM public.ingest_session_reservations WHERE id='$sid'")" == "$terminal|$rev|$offset|t|t|t" ]] || {
+    printf 'unexpected committed checkpoint/abort state: %s\n' "$scenario" >&2; exit 1;
+  }
+  printf 'ingest session row fence passed: %s first, %s; checkpoint revision=%s, state=%s\n' "$first" "$finish" "$rev" "$terminal"
+done
+psql_run -c 'DROP TABLE public.ingest_session_reservations'
