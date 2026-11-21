@@ -86,6 +86,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		buildShareQuery, queueCurrentTrack: currentTrack, navigator: { clipboard },
 		$state: { raw: <T>(value: T) => value },
 		routeCleanup,
+		accountTrackLikes: { clear: () => routeCleanup.push('likes') },
 		createQueueShare: (...args: Parameters<typeof createQueueShare>) => {
 			const share = createQueueShare(...args);
 			return { ...share, dispose: () => { routeCleanup.push('share'); share.dispose(); } };
@@ -921,7 +922,7 @@ test('Library cleanup fences both copy receipts without pausing the shared decod
 	expect(page.currentAudio()).toBe(element);
 	expect(page.readCopy()).toEqual(afterCleanup);
 	expect(readMiniPlayerHint()?.trackId).toBe(track.id);
-	expect(routeCleanup).toEqual(['drag', 'share', 'export', 'refresh', 'query', 'local-auth', 'storage', 'pagehide']);
+	expect(routeCleanup).toEqual(['drag', 'share', 'export', 'refresh', 'likes', 'query', 'local-auth', 'storage', 'pagehide']);
 });
 
 test('route cleanup fences an explicit play waiting for tick', async () => {

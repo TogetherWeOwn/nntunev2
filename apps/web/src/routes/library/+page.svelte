@@ -2055,7 +2055,7 @@
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
-			hidden={!showingTracks && (!showRecovery || loading)}
+			hidden={!showingTracks && (loading || (!showRecovery && !accountTrackLikes?.feedback))}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>

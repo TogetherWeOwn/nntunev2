@@ -65,6 +65,39 @@ test('Tracks and Queue share a session-bound Like and Unlike', async ({ page }) 
 	await expect(page.getByTestId('usage-meter')).toHaveCount(1);
 });
 
+test('a refused Queue Like can be retried from Albums', async ({ page }) => {
+	await seedLibrary(page);
+	await page.route('**/v1/releases', (route) => route.fulfill({ json: [] }));
+	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes() }));
+	let writes = 0;
+	await page.route(`**/v1/me/likes/track/${TRACK}`, (route) => route.fulfill(++writes === 1
+		? { status: 412, json: {} }
+		: { json: { target_id: TRACK, liked_at: likedTrack.created_at } }));
+	await page.goto('/library');
+	await page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' }).getByRole('checkbox').check();
+	await page.getByRole('button', { name: 'Append selected', exact: true }).click();
+	const albums = page.getByRole('group', { name: 'Library type' }).getByRole('button', { name: 'Albums', exact: true });
+	await albums.click();
+	await expect(page.getByRole('region', { name: 'Library collections' }).getByRole('status'))
+		.toHaveText('No albums in the loaded results.');
+	const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+	const queueLike = page.getByTestId('queue-item').getByRole('button', { name: 'Like Coral Horizon', exact: true });
+	await expect(refresh).toBeHidden();
+	await queueLike.click();
+	const feedback = page.getByText('Account likes are unavailable. Refresh the library to try again.', { exact: true });
+	await expect(feedback).toBeVisible();
+	await expect(queueLike).toHaveCount(0);
+	await refresh.click();
+	await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
+	await expect(feedback).toHaveCount(0);
+	await expect(refresh).toBeHidden();
+	await expect(albums).toHaveAttribute('aria-pressed', 'true');
+	expect(writes).toBe(1);
+	await queueLike.click();
+	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
+	expect(writes).toBe(2);
+});
+
 for (const status of [401, 503]) {
 	test(`Liked Songs handles a direct ${status}`, async ({ page }) => {
 		await seedLibrary(page, [TRACK]);
