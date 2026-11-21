@@ -26,22 +26,29 @@ function setup() {
 	}));
 	return { local, session, verify, refresh, refresher, update: () => update, onAccessRefused };
 }
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
-it.each(['rotates generation', 'holds the lock'])('rejects even matching verification when a writer %s', async (event) => {
-	const { local, session, verify, refresh, update, refresher } = setup();
+it.each([200, 401, 403, 0])('withholds a stale result (%i) without purging its scope', async (status) => {
+	const { local, session, verify, refresh, update, refresher, onAccessRefused } = setup();
+	await refresh();
+	const key = update().deviceScope!;
+	local.setItem(key, bytes);
 	const started = Promise.withResolvers<void>(), reply = Promise.withResolvers<Response>();
-	verify.mockImplementationOnce(() => { started.resolve(); return reply.promise; });
-	const pending = refresh();
+	const deferred = () => { started.resolve(); return reply.promise; };
+	if (status < 400) verify.mockImplementationOnce(deferred);
+	const pending = status < 400 ? refresh() : refresher.refresh(deferred);
 	await started.promise;
-	if (event === 'rotates generation') {
+	if (status) {
 		local.setItem(AUTH_GENERATION_KEY, 'replacement');
-		reply.resolve(proof());
+		reply.resolve(status === 200 ? proof() : new Response(null, { status }));
 		await pending;
 	} else await navigator.locks.request(AUTH_LOCK, () => { reply.resolve(proof()); return pending; });
-	expect(loadSnapshot(session)).toBeNull();
-	expect(refresher.state.items).toEqual([]);
-	expect(update().sessionBinding).toBeUndefined();
+	expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false });
+	expect(update().deviceScope).toBeUndefined();
+	expect(onAccessRefused).not.toHaveBeenCalled();
+	expect(loadSnapshot(session)?.items).toEqual([{ id: 'track' }]);
+	await refresh();
+	expect([update().deviceScope, local.getItem(key)]).toEqual([key, bytes]);
 });
 
 it('allows concurrent readers and queues the cookie write, then recovers after quota failure', async () => {
@@ -69,7 +76,7 @@ it('preserves exact favorite bytes across inconclusive verification and never bi
 	await refresh();
 	const key = update().deviceScope!;
 	local.setItem(key, bytes);
-	for (const binding of [null, '', 'malformed', label]) {
+	for (const binding of [null, '', `${label.slice(1)}B`, label]) {
 		if (binding === label) verify.mockResolvedValueOnce(Response.json({}));
 		await refresh(binding);
 		expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false });
@@ -85,10 +92,32 @@ it('preserves exact favorite bytes across inconclusive verification and never bi
 	expect(local.getItem('nntune.library.favorites.v1.legacy')).toBe(bytes);
 });
 
-it('dispatches auth but withholds verified Library when storage is blocked', async () => {
-	const { refresh, verify } = setup();
+it('allows auth but withholds headerless browser rows without a fence', async () => {
+	const { refresh, refresher } = setup();
+	vi.stubEnv('MODE', 'production');
 	vi.stubGlobal('window', { get localStorage() { throw new Error('Blocked'); } });
 	await new ApiClient({ baseUrl: '', fetchFn: async () => Response.json({}) }).logout();
+	await refresh(null);
+	expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false });
+});
+
+it('recovers a new bound scope after a proof-only quota failure', async () => {
+	const { refresh, session, update } = setup();
+	vi.spyOn(session, 'setItem').mockImplementationOnce(() => { throw new Error('Quota'); });
 	await refresh();
-	expect(verify).not.toHaveBeenCalled();
+	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
+	await refresh();
+	expect(update().deviceScope).toBeDefined();
+});
+
+it('falls back from lock denial before dispatch, but never resends a failed mutation', async () => {
+	setup();
+	const send = vi.fn(async () => { throw new Error('network'); });
+	const request = vi.spyOn(navigator.locks, 'request').mockRejectedValueOnce(new DOMException('Denied', 'SecurityError'));
+	try {
+		const api = new ApiClient({ baseUrl: '', fetchFn: send });
+		await expect(api.logout()).rejects.toThrow('network');
+		await expect(api.logout()).rejects.toThrow('network');
+		expect(send).toHaveBeenCalledTimes(2);
+	} finally { request.mockRestore(); }
 });

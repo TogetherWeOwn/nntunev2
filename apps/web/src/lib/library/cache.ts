@@ -239,10 +239,11 @@ export function loadSnapshot(storage: SnapshotStorage | null): LibrarySnapshot |
 export function saveSnapshot(
 	storage: SnapshotStorage | null,
 	items: LibraryItem[],
-	nowMs: number = Date.now()
+	nowMs: number = Date.now(),
+	createContext = true
 ): LibrarySnapshot {
 	const snapshot = encodeSnapshot(items, nowMs);
-	const key = snapshotKey(storage, true);
+	const key = snapshotKey(storage, createContext);
 	try {
 		if (storage && key) storage.setItem(key, JSON.stringify(snapshot));
 	} catch {

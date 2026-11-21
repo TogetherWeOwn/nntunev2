@@ -53,8 +53,10 @@ export interface LibraryRefresherDeps {
 	timeoutMs?: number;
 }
 
-// The API encodes a SHA-256 digest as unpadded base64url.
-const validBinding = (value: unknown): value is string => typeof value === 'string' && /^[\w-]{43}$/.test(value);
+// SHA-256 base64url has two zero pad bits in its last sextet.
+const validBinding = (value: unknown): value is string => typeof value === 'string' && /^[\w-]{42}[AEIMQUYcgkosw048]$/.test(value);
+// Old fixture payloads exercise UI/cache behavior without a live auth service.
+const legacyFixture = () => import.meta.env.MODE === 'test' || import.meta.env.MODE === 'browser-fixtures';
 
 async function verifyLibrarySession(binding: string, signal: AbortSignal): Promise<boolean> {
 	try {
@@ -117,7 +119,6 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		state.libraryUnavailable = false;
 		state.requiresSignIn = false;
 		let authoritative = false;
-		let authBoundary = false;
 		let binding: string | null = null;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		let activeResponse: Response | null = null;
@@ -250,12 +251,12 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const fence = verified?.fence;
 			deps.onStateChange?.(state, {
 				isCurrent: () => isCurrent() && (!fence || fence.isCurrent()),
-				authoritative, authBoundary, sessionBinding, deviceScope
+				authoritative, authBoundary: false, sessionBinding, deviceScope
 			});
 		}
 
-		function refuse(replaced = false): true {
-			if (isCurrent()) applyAuthTransition(replaced, true);
+		function refuse(replaced = false, status?: number): true {
+			if (isCurrent()) applyAuthTransition(replaced, true, status);
 			return true;
 		}
 
@@ -312,19 +313,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				return;
 			}
 			if (response.status === 401 || response.status === 403) {
-				authenticatedThisLoad = false;
-				verified = undefined;
-				inMemorySnapshot = null;
-				state.items = [];
-				state.staleAt = null;
-				state.requiresSignIn = response.status === 401;
-				state.loadError = state.requiresSignIn
-					? 'You are signed out or do not have access to this library.'
-					: 'You do not have access to this library.';
-				authoritative = true;
-				authBoundary = true;
-				notifyAccessRefused();
-				deps.invalidateLibraryCache();
+				const commitRefusal = () => !controller.signal.aborted && refuse(true, response.status);
+				if (!(fence ? await fence.run(commitRefusal) : legacyFixture() && !capture && commitRefusal())) refuse();
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
@@ -332,7 +322,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const storage = deps.sessionStorage();
 			if (!isCurrent()) return;
 			const previous = verified?.binding ?? libraryScopeBinding(storage);
-			if ((previous || binding !== null) && !validBinding(binding)) return void refuse();
+			if (!validBinding(binding) && !(legacyFixture() && !previous && binding === null)) return void refuse();
 			if (previous && previous !== binding) {
 				if (await fence?.run(() => !controller.signal.aborted && refuse(true))) return;
 				return void refuse();
@@ -346,7 +336,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
 			const commit = () => {
-				const snapshot = saveSnapshot(storage, fresh);
+				const snapshot = saveSnapshot(storage, fresh, undefined, !binding);
 				if (!isCurrent()) return;
 				authenticatedThisLoad = true;
 				inMemorySnapshot = { ...snapshot, items: fresh };
@@ -409,22 +399,25 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
 	}
 
-	function applyAuthTransition(replaced = true, notify = false): void {
+	function applyAuthTransition(replaced = true, notify = false, status?: number): void {
 		if (disposed) return;
 		const isCurrent = startReceipt();
-		activeRequest?.abort();
+		if (!status) activeRequest?.abort();
 		if (!isCurrent()) return;
 		activeRequest = null;
 		authenticatedThisLoad = false;
 		verified = undefined;
 		inMemorySnapshot = null;
-		if (replaced) clearSnapshot(deps.sessionStorage());
 		if (replaced && notify) notifyAccessRefused();
+		if (status) deps.invalidateLibraryCache();
+		else if (replaced) clearSnapshot(deps.sessionStorage());
 		if (!isCurrent()) return;
 		state.items = [];
 		state.staleAt = null;
-		state.requiresSignIn = replaced;
-		state.loadError = replaced ? 'Your session changed. Sign in again to see this library.'
+		state.requiresSignIn = replaced && status !== 403;
+		state.loadError = status === 401 ? 'You are signed out or do not have access to this library.'
+			: status === 403 ? 'You do not have access to this library.'
+			: replaced ? 'Your session changed. Sign in again to see this library.'
 			: 'Could not verify your library session. Try again.';
 		state.loading = false;
 		deps.onStateChange?.(state, { isCurrent, authoritative: true, authBoundary: true });

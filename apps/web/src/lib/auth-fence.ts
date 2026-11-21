@@ -24,7 +24,8 @@ export function captureAuthFence() {
 	return readLock(async () => {
 		// Initialize once, while the outer shared lock excludes cookie writes.
 		if (!generation()) await locks.request(`${AUTH_LOCK}.init`, () => {
-			if (!generation()) window.localStorage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID());
+			try { if (!generation()) window.localStorage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID()); }
+			catch { /* No receipt while generation storage is unavailable. */ }
 		});
 		const id = generation();
 		const isCurrent = () => !!id && !pending && epoch === localEpoch && generation() === id;
@@ -37,6 +38,7 @@ export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Pr
 	if (typeof window === 'undefined') return dispatch();
 	localEpoch++;
 	pending++;
+	let dispatched = false;
 	const send = () => {
 		signal.throwIfAborted();
 		try { window.localStorage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID()); }
@@ -44,11 +46,14 @@ export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Pr
 			// Removal doesn't need quota. A later capture must initialize a NEW generation.
 			try { window.localStorage.removeItem(AUTH_GENERATION_KEY); } catch { /* Storage blocked. */ }
 		}
+		dispatched = true;
 		return dispatch();
 	};
 	try {
 		const locks = globalThis.navigator?.locks;
 		// Without Web Locks, auth remains available but trusted reads fail closed.
-		return await (locks ? locks.request(AUTH_LOCK, { signal }, send) : send());
+		if (!locks) return await send();
+		try { return await locks.request(AUTH_LOCK, { signal }, send); }
+		catch (error) { if (dispatched || signal.aborted) throw error; return await send(); }
 	} finally { pending--; }
 }
