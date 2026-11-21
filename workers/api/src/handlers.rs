@@ -10778,7 +10778,6 @@ mod tests {
             if !outcome.explicit_stale {
                 let mut rows = self.billing_rows.borrow_mut();
                 let mut shadow = self.billing_shadow.borrow_mut();
-                // Model a release after the caller's fold but before this write.
                 if self.release_live_slot_before_store.replace(false) {
                     let holder = rows.get_mut(user_id).expect("live holder before release");
                     assert_ne!(&holder.stripe_subscription_id, sub);
@@ -10818,7 +10817,6 @@ mod tests {
                     validate_terminal_provenance(outcome, &target).map_err(|_| StoreError)?;
                 }
                 if occupied && live(&outcome.row.status) {
-                    // Suppression is for proven existing targets, never new live inserts.
                     if stored.is_none() || !has_slot_suppression_proof(outcome) {
                         return Err(StoreError);
                     }
@@ -13145,6 +13143,7 @@ mod tests {
             amount_cents: 1_000,
             currency: "usd".to_string(),
             paid_at_unix: BILLING_NOW + 60,
+            covered_periods: vec![(BILLING_NOW, end)],
         };
         let fresh_grace = BILLING_NOW + BILLING_PERIOD + 7 * 24 * 3_600;
         let fresh = crate::billing_reconcile::ReconcileOutcome {
@@ -13465,6 +13464,7 @@ mod tests {
                     amount_cents: 1_000,
                     currency: "usd".into(),
                     paid_at_unix: 1,
+                    covered_periods: vec![(0, 100)],
                 });
             block_on(h.store.store_reconcile_outcome("u1", &owner)).unwrap();
             if shadow_only {
@@ -14203,6 +14203,7 @@ mod tests {
                 amount_cents: 1_000,
                 currency: "usd".to_string(),
                 paid_at_unix: BILLING_NOW,
+                covered_periods: vec![(BILLING_NOW - BILLING_PERIOD, e2)],
             },
         );
         // S reads stored E2/active with remote money E1 < E2: stale.
@@ -15963,7 +15964,12 @@ mod tests {
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
         let live = live_for(&h, "u1").expect("live row stored");
         assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
-        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history["in_test_1"].covered_periods,
+            vec![(BILLING_NOW, BILLING_NOW + BILLING_PERIOD)]
+        );
     }
 
     fn cookie_of(resp: &Response) -> String {
