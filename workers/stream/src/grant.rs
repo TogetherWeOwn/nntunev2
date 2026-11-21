@@ -13,13 +13,11 @@
 //!   `user_id` 1..=128 bytes, `track_id` and `play_id` 1..=512 bytes) so
 //!   a grant that verifies here can always be metered — the ledger key
 //!   `play:{user}:{track}:{play}` can always be derived from it —
-//!   anything else is [`GrantError::Malformed`]. The public play route
-//!   requires a metered grant.
-//!
-//! The R2 fetch adapter also accepts `v3`: the `v2` payload followed by
-//! `|artifact_sha256` (canonical lowercase hex). Its MAC covers `v3.`
-//! followed by the encoded payload. It authorizes only that normalized
-//! rendition, never a track pointer or an original source.
+//!   anything else is [`GrantError::Malformed`]. The portable play route
+//!   requires `v2`.
+//! - `v3` (R2 only): the `v2` payload plus `|artifact_sha256` (lowercase
+//!   hex). Its MAC covers `v3.` and the encoded payload. It authorizes
+//!   only that normalized rendition, not a track pointer.
 //!
 //! This module is the byte-exact format definition: the `api` Worker
 //! mirrors [`issue_v2_at`] when it mints grants at its issuance gate.
@@ -155,37 +153,25 @@ pub(crate) fn verify_with_user(
     secret: &[u8],
     now_unix: u64,
 ) -> Result<Grant, (GrantError, Option<String>)> {
-    verify_inner(token, secret, now_unix, false).map(|(grant, _)| grant)
+    if token.starts_with("v3.") {
+        return Err((GrantError::Malformed, None));
+    }
+    verify_for_r2(token, secret, now_unix).map(|(grant, _)| grant)
 }
 
-/// Only the R2 fetch adapter may opt in to a rendition grant. Other grant
-/// consumers must not reinterpret it as permission to serve another source.
-#[cfg(any(test, target_arch = "wasm32"))]
+/// Verify the legacy formats or an R2-only rendition grant.
 pub(crate) fn verify_for_r2(
     token: &str,
     secret: &[u8],
     now_unix: u64,
-) -> Result<(Grant, Option<String>), GrantError> {
-    verify_inner(token, secret, now_unix, true).map_err(|(err, _)| err)
-}
-
-fn verify_inner(
-    token: &str,
-    secret: &[u8],
-    now_unix: u64,
-    allow_rendition: bool,
 ) -> Result<(Grant, Option<String>), (GrantError, Option<String>)> {
-    // The legacy payload grammars have different exact field counts.
+    // The version prefix selects an exact payload grammar.
     let (version, rest) = match token
         .strip_prefix("v1.")
         .map(|r| (1u8, r))
         .or_else(|| token.strip_prefix("v2.").map(|r| (2u8, r)))
-        .or_else(|| {
-            token
-                .strip_prefix("v3.")
-                .filter(|_| allow_rendition)
-                .map(|r| (3u8, r))
-        }) {
+        .or_else(|| token.strip_prefix("v3.").map(|r| (3u8, r)))
+    {
         Some(pair) => pair,
         None => return Err((GrantError::Malformed, None)),
     };
@@ -209,11 +195,8 @@ fn verify_inner(
         let (identity, hash) = payload
             .rsplit_once('|')
             .ok_or((GrantError::Malformed, None))?;
-        if hash.len() != 64
-            || !hash
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        let lowercase_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        if hash.len() != 64 || !hash.bytes().all(lowercase_hex) {
             return Err((GrantError::Malformed, None));
         }
         (identity, Some(hash.to_string()))
@@ -263,16 +246,14 @@ fn verify_inner(
     if exp_unix - now_unix > MAX_GRANT_TTL + CLOCK_SKEW_SECS {
         return Err((GrantError::TtlTooLong, Some(user_id)));
     }
-    Ok((
-        Grant {
-            user_id,
-            track_id: track_id.to_string(),
-            play_id,
-            lease_epoch,
-            exp_unix,
-        },
-        artifact_sha256,
-    ))
+    let grant = Grant {
+        user_id,
+        track_id: track_id.to_string(),
+        play_id,
+        lease_epoch,
+        exp_unix,
+    };
+    Ok((grant, artifact_sha256))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

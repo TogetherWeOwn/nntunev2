@@ -31,15 +31,17 @@
 //! warm provider connection parked in the pool is reused by later requests.
 
 use std::cell::{OnceCell, RefCell};
+use std::pin::Pin;
+use std::task::{Context as PollContext, Poll};
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use nntune_core::nntp::NntpClient;
 use nntune_core::transports::WorkerTransport;
 use worker::wasm_bindgen::JsValue;
 use worker::{
-    durable_object, event, Context, Date, Delay, DurableObject, Env, Headers, Method, Range,
-    Request, RequestInit, Response, Result, State,
+    durable_object, event, ByteStream, Context, Date, Delay, DurableObject, Env, Headers, Method,
+    Range, Request, RequestInit, Response, Result, State,
 };
 
 use crate::api_error::ApiError;
@@ -99,12 +101,11 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 }
 
-/// Serve one `GET /play/{track_id}` from R2:
+/// Serve one `GET /play/{track_id}` from the R2 popularity cache:
 /// verify the metered grant before touching any source, resolve the HTTP
 /// range against the cached blob, stream exactly that slice, and report
 /// the client-written interval when the response stream settles.
 async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Result<Response> {
-    let unavailable = || api_error_response(&ApiError::upstream_unavailable(), None);
     let Ok(secret) = env.secret(PLAY_GRANT_SECRET_BINDING) else {
         return api_error_response(&ApiError::internal_error(), None);
     };
@@ -119,22 +120,63 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
         Ok(play) => play,
         Err(error) => return api_error_response(&error, None),
     };
-    let content_type = play.content_type();
     let Ok(bucket) = env.bucket(AUDIO_CACHE_BINDING) else {
         return api_error_response(&ApiError::internal_error(), None);
     };
-    let blob_key = if let Some(key) = play.artifact_key {
-        key
-    } else {
-        match legacy_blob_key(&bucket, track_id).await {
-            Ok(key) => key,
-            Err(error) => return api_error_response(&error, None),
-        }
+    let blob = match play
+        .blob(legacy_blob_key(&bucket, track_id), async |key| {
+            Some(bucket.head(key).await.ok()??.size())
+        })
+        .await
+    {
+        Ok(blob) => blob,
+        Err(error) => return api_error_response(&error, None),
     };
-    let blob_len = match bucket.head(blob_key.clone()).await {
-        Ok(Some(blob)) => blob.size(),
-        _ => return unavailable(),
+    serve_blob(req, env, ctx, track_id, play, bucket, blob).await
+}
+
+/// Resolve the old track pointer for a legacy grant only.
+async fn legacy_blob_key(
+    bucket: &worker::Bucket,
+    track_id: &str,
+) -> core::result::Result<String, ApiError> {
+    let unavailable = || Err(ApiError::upstream_unavailable());
+    let pointer = match bucket.get(format!("track/{track_id}")).execute().await {
+        Ok(pointer) => pointer,
+        Err(_) => return unavailable(),
     };
+    let Some(pointer) = pointer else {
+        // No cache pointer: a manifest means a known track the wasm NNTP
+        // adapter does not serve yet; no manifest means unknown track.
+        let manifest_key = format!("track/{track_id}{TRACK_MANIFEST_SUFFIX}");
+        return match bucket.head(manifest_key).await {
+            Ok(Some(_)) => unavailable(),
+            Ok(None) => Err(ApiError::not_found()),
+            Err(_) => unavailable(),
+        };
+    };
+    if pointer.size() > MAX_POINTER_BYTES {
+        return unavailable();
+    }
+    let Some(pointer_body) = pointer.body() else {
+        return unavailable();
+    };
+    let Ok(pointer_bytes) = pointer_body.bytes().await else {
+        return unavailable();
+    };
+    crate::cache::blob_key_for_pointer(&pointer_bytes).ok_or_else(ApiError::upstream_unavailable)
+}
+
+async fn serve_blob(
+    req: Request,
+    env: Env,
+    ctx: Context,
+    track_id: &str,
+    play: r2_play::Play,
+    bucket: worker::Bucket,
+    blob: r2_play::Blob,
+) -> Result<Response> {
+    let blob_len = blob.size;
 
     let range_header = req.headers().get("range").ok().flatten();
     let (start, expected, status, content_range) =
@@ -154,7 +196,7 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
             }
         };
     let headers = Headers::new();
-    headers.set("content-type", content_type)?;
+    headers.set("content-type", play.content_type())?;
     headers.set("cache-control", "private, no-store")?;
     headers.set("accept-ranges", "bytes")?;
     headers.set("content-length", &expected.to_string())?;
@@ -164,25 +206,23 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
     if expected == 0 {
         return Ok(Response::empty()?.with_status(status).with_headers(headers));
     }
-    let object = bucket
-        .get(blob_key)
-        .range(Range::OffsetWithLength {
-            offset: start,
-            length: expected,
+    let stream = match blob
+        .read(async |key| {
+            let object = bucket
+                .get(key)
+                .range(Range::OffsetWithLength {
+                    offset: start,
+                    length: expected,
+                })
+                .execute()
+                .await
+                .ok()??;
+            object.body()?.stream().ok()
         })
-        .execute()
-        .await;
-    let Some(object) = (match object {
-        Ok(object) => object,
-        Err(_) => return unavailable(),
-    }) else {
-        return unavailable();
-    };
-    let Some(body) = object.body() else {
-        return unavailable();
-    };
-    let Ok(stream) = body.stream() else {
-        return unavailable();
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => return api_error_response(&error, None),
     };
     let interval = DeliveredInterval {
         user_id: play.user_id,
@@ -192,45 +232,41 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
         end: start,
         file_bytes: Some(blob_len),
     };
-    let metered = r2_play::meter(stream, expected, move |written| {
-        let interval = DeliveredInterval {
-            end: start + written,
-            ..interval
-        };
-        ctx.wait_until(report_delivered(env, interval));
-    });
+    let metered = MeteredStream {
+        inner: Box::pin(stream),
+        delivery: r2_play::Delivery::new(expected, move |written| {
+            let mut interval = interval;
+            interval.end += written;
+            ctx.wait_until(report_delivered(env, interval));
+        }),
+    };
     Response::builder()
         .with_headers(headers)
         .with_status(status)
         .from_stream(metered)
 }
 
-/// Resolve the old track pointer for a legacy grant only. A missing signed
-/// rendition must never fall back to a pointer or an original source.
-async fn legacy_blob_key(
-    bucket: &worker::Bucket,
-    track_id: &str,
-) -> core::result::Result<String, ApiError> {
-    let unavailable = ApiError::upstream_unavailable;
-    let pointer = bucket
-        .get(format!("track/{track_id}"))
-        .execute()
-        .await
-        .map_err(|_| unavailable())?;
-    let Some(pointer) = pointer else {
-        // Known manifest-only tracks cannot be served by this adapter yet.
-        let manifest_key = format!("track/{track_id}{TRACK_MANIFEST_SUFFIX}");
-        return Err(match bucket.head(manifest_key).await {
-            Ok(None) => ApiError::not_found(),
-            _ => unavailable(),
-        });
-    };
-    if pointer.size() > MAX_POINTER_BYTES {
-        return Err(unavailable());
+/// Response-stream wrapper that counts bytes actually pulled toward the
+/// client and, when the stream settles (completed, errored, or dropped
+/// on client abort), reports the written interval exactly once. The
+/// report rides `wait_until`, so it survives the response finishing.
+struct MeteredStream<F: FnOnce(u64)> {
+    inner: Pin<Box<ByteStream>>,
+    delivery: r2_play::Delivery<F>,
+}
+
+impl<F: FnOnce(u64) + Unpin> Stream for MeteredStream<F> {
+    type Item = Result<Vec<u8>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.delivery.record(chunk.len());
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            other => other,
+        }
     }
-    let body = pointer.body().ok_or_else(unavailable)?;
-    let bytes = body.bytes().await.map_err(|_| unavailable())?;
-    crate::cache::blob_key_for_pointer(&bytes).ok_or_else(unavailable)
 }
 
 /// POST one delivered interval to the user's pool object. Bounded
