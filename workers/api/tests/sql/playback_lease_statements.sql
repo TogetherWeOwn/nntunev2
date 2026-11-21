@@ -65,7 +65,7 @@ SELECT epoch INTO TEMP TABLE pls_got4 FROM got;
 WITH touched AS (
     UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2100), updated_at = GREATEST(playback_leases.updated_at, 1980)
     FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE user_id = 'pls-user' AND session_id = 'sess-1' AND play_id = 'play-2' AND epoch = 2
+    WHERE user_id = 'pls-user' AND session_id = 'sess-1' AND play_id = 'play-2' AND epoch = 2 AND playback_leases.expires_at > 1980
     RETURNING expires_at
 )
 SELECT count(*) AS n INTO TEMP TABLE pls_touch_stale FROM touched;
@@ -74,7 +74,7 @@ SELECT count(*) AS n INTO TEMP TABLE pls_touch_stale FROM touched;
 WITH touched AS (
     UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2100), updated_at = GREATEST(playback_leases.updated_at, 1980)
     FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3
+    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3 AND playback_leases.expires_at > 1980
     RETURNING expires_at
 )
 SELECT expires_at INTO TEMP TABLE pls_touch_ok FROM touched;
@@ -85,10 +85,19 @@ SELECT expires_at INTO TEMP TABLE pls_touch_ok FROM touched;
 WITH touched AS (
     UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2050), updated_at = GREATEST(playback_leases.updated_at, 1970)
     FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3
+    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3 AND playback_leases.expires_at > 1970
     RETURNING expires_at
 )
 SELECT expires_at INTO TEMP TABLE pls_touch_reordered FROM touched;
+
+-- At expiry the row remains, but a touch may not extend it.
+WITH touched AS (
+    UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2145), updated_at = GREATEST(playback_leases.updated_at, 2100)
+    FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
+    WHERE user_id = 'pls-user' AND session_id = 'sess-2' AND play_id = 'play-3' AND epoch = 3 AND playback_leases.expires_at > 2100
+    RETURNING expires_at
+)
+SELECT count(*) AS n INTO TEMP TABLE pls_touch_expired FROM touched;
 
 -- After expiry (now past 2100) a third session acquires: epoch 4.
 WITH got AS (
@@ -127,9 +136,9 @@ WITH got AS (
 SELECT count(*) AS n INTO TEMP TABLE pls_acquire_deleting FROM got;
 
 WITH touched AS (
-    UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2400), updated_at = GREATEST(playback_leases.updated_at, 2260)
+    UPDATE playback_leases SET expires_at = GREATEST(playback_leases.expires_at, 2400), updated_at = GREATEST(playback_leases.updated_at, 2160)
     FROM (SELECT id FROM users WHERE id = 'pls-user' AND deleting_at IS NULL FOR SHARE) AS writer_fence
-    WHERE user_id = 'pls-user' AND session_id = 'sess-3' AND play_id = 'play-4' AND epoch = 4
+    WHERE user_id = 'pls-user' AND session_id = 'sess-3' AND play_id = 'play-4' AND epoch = 4 AND playback_leases.expires_at > 2160
     RETURNING expires_at
 )
 SELECT count(*) AS n INTO TEMP TABLE pls_touch_deleting FROM touched;
@@ -163,11 +172,14 @@ BEGIN
     IF (SELECT n FROM pls_touch_deleting) <> 0 THEN
         RAISE EXCEPTION 'touch must refuse a deleting account (zero rows)';
     END IF;
-    IF (SELECT epoch FROM pls_got5) <> 4 THEN
+    IF (SELECT n FROM pls_touch_expired) <> 0 THEN
+        RAISE EXCEPTION 'touch at expiry must not extend the lease';
+    END IF;
+    IF (SELECT epoch FROM pls_got5) IS DISTINCT FROM 4 THEN
         RAISE EXCEPTION 'post-expiry acquire must bump the epoch';
     END IF;
     IF (SELECT session_id || ':' || play_id FROM playback_leases
-        WHERE user_id = 'pls-user') <> 'sess-3:play-4' THEN
+        WHERE user_id = 'pls-user') IS DISTINCT FROM 'sess-3:play-4' THEN
         RAISE EXCEPTION 'final holder must be the post-expiry acquirer';
     END IF;
 

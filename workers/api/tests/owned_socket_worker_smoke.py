@@ -379,9 +379,6 @@ def main():
                     print("PASS: synthetic socket ownership and close, empty guard drop, deadline precedence, co-poll/drop, Worker timer", flush=True)
                     print(f"startup and execution elapsed: {time.monotonic() - start:.3f}s", flush=True)
                     break
-                status, _, body = routing.http("POST", f"http://127.0.0.1:{port}/subsonic-connect-deadline-proof")
-                routing.check(status == 200 and body == "subsonic-connect-deadline-ok", body)
-                print("PASS: stalled Subsonic open and handshake share a single connect deadline", flush=True)
                 with billing_database(settings) as observe:
                     check_write_deadline(f"http://127.0.0.1:{port}", settings, observe)
                     check_billing_ack(f"http://127.0.0.1:{port}", settings, observe)

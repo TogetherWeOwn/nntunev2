@@ -1,5 +1,3 @@
-import { mkdtemp, rm } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
 import { expect, test as base, type Locator, type Page } from '@playwright/test';
 import { createServer } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
@@ -35,27 +33,19 @@ import type {} from './fixtures/queue-filter/mount.js';
 
 const test = base.extend<{ componentPage: Page }, { componentOrigin: string }>({
 	componentOrigin: [async ({}, use) => {
-		// Keep generated deps under the existing fs.allow root, but never share
-		// optimizer metadata with another fixture server or Playwright run.
-		const cacheDir = await mkdtemp(fileURLToPath(new URL('../node_modules/.vite-queue-filter-', import.meta.url)));
+		const server = await createServer({
+			configFile: false,
+			root: decodeURIComponent(new URL('./fixtures/queue-filter/', import.meta.url).pathname),
+			publicDir: false,
+			plugins: [svelte({ configFile: false, compilerOptions: { runes: true } })],
+			server: { host: '127.0.0.1', port: 0, fs: { allow: [decodeURIComponent(new URL('../', import.meta.url).pathname)] } }
+		});
 		try {
-			const server = await createServer({
-				configFile: false,
-				root: decodeURIComponent(new URL('./fixtures/queue-filter/', import.meta.url).pathname),
-				cacheDir,
-				publicDir: false,
-				plugins: [svelte({ configFile: false, compilerOptions: { runes: true } })],
-				server: { host: '127.0.0.1', port: 0, fs: { allow: [decodeURIComponent(new URL('../', import.meta.url).pathname)] } }
-			});
-			try {
-				await server.listen();
-				const address = server.httpServer?.address();
-				if (!address || typeof address === 'string') throw new Error('component server has no TCP address');
-				await use(`http://127.0.0.1:${address.port}`);
-			} finally { await server.close(); }
-		} finally {
-			await rm(cacheDir, { recursive: true, force: true });
-		}
+			await server.listen();
+			const address = server.httpServer?.address();
+			if (!address || typeof address === 'string') throw new Error('component server has no TCP address');
+			await use(`http://127.0.0.1:${address.port}`);
+		} finally { await server.close(); }
 	}, { scope: 'worker' }],
 	componentPage: async ({ page, componentOrigin }, use) => {
 		await instrument(page);

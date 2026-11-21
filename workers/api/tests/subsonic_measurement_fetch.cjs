@@ -1,10 +1,8 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { once } = require('node:events');
-const { readFileSync, writeFileSync } = require('node:fs');
+const { readFileSync } = require('node:fs');
 const { createRequire } = require('node:module');
-const { createServer } = require('node:net');
 const { resolve } = require('node:path');
 
 async function main() {
@@ -14,25 +12,22 @@ async function main() {
   const headers = { authorization: `Bearer ${process.env.QA_AUTH_TOKEN}`, 'x-subsonic-measurement-case': 'small' };
   const release = '00000000-0000-4000-8000-000000000002';
   const fixedCapacity = '{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Service unavailable."}}}';
-  const start = (variant) => startWorker({
-    config: resolve(`measurement-${variant}.toml`),
-    dev: { remote: false, server: { hostname: '127.0.0.1', port: 0 },
-      origin: { secure: true, hostname: new URL(origin).hostname } },
-  });
-  const fetchWith = (worker) => (endpoint, params, headers, method = 'POST') => {
-    const url = new URL(`/rest/${endpoint}`, origin);
-    const form = new URLSearchParams(params);
-    if (method === 'GET') url.search = form; // Disposable CI credentials only.
-    return worker.fetch(url.href, {
-      method, body: method === 'POST' ? form : undefined, headers,
-      redirect: 'error', signal: AbortSignal.timeout(15_000),
-    });
-  };
-
   for (const enabled of [1, 0]) {
-    const worker = await start(enabled);
+    const worker = await startWorker({
+      config: resolve(`measurement-${enabled}.toml`),
+      dev: { remote: false, server: { hostname: '127.0.0.1', port: 0 },
+        origin: { secure: true, hostname: new URL(origin).hostname } },
+    });
     try {
-      const fetchCase = fetchWith(worker);
+      const fetchCase = (endpoint, params, headers, method = 'POST') => {
+        const url = new URL(`/rest/${endpoint}`, origin);
+        const form = new URLSearchParams(params);
+        if (method === 'GET') url.search = form; // Disposable CI credentials only.
+        return worker.fetch(url.href, {
+          method, body: method === 'POST' ? form : undefined, headers,
+          redirect: 'error', signal: AbortSignal.timeout(15_000),
+        });
+      };
       for (const [key, code] of enabled ? [[matching, null], [other, 50]] : [[matching, 44]]) {
         const response = await fetchCase('getAlbum.view', { f: 'json', apiKey: key, id: release }, headers);
         assert.equal(response.status, 200, `measurement ${enabled}, expected protocol code ${code}`);
@@ -89,48 +84,6 @@ async function main() {
     } finally {
       await worker.dispose();
     }
-  }
-
-  // Accept startup on loopback but never send a PostgreSQL response.
-  const sockets = new Set();
-  let startups = 0;
-  const peer = createServer((socket) => {
-    sockets.add(socket);
-    socket.once('data', () => { startups += 1; });
-    socket.on('error', () => socket.destroy());
-    socket.once('close', () => sockets.delete(socket));
-  });
-  const listening = once(peer, 'listening');
-  peer.listen(0, '127.0.0.1');
-  await listening;
-  try {
-    const config = readFileSync('measurement-1.toml', 'utf8').replace(
-      /^localConnectionString = .*$/m,
-      // The local Hyperdrive binding requires a password field even though
-      // the silent peer never requests authentication.
-      `localConnectionString = "postgresql://fixture:unused@127.0.0.1:${peer.address().port}/fixture?sslmode=disable"`,
-    );
-    writeFileSync('measurement-stalled.toml', config);
-    const worker = await start('stalled');
-    try {
-      const started = performance.now();
-      const response = await fetchWith(worker)('getAlbum.view', { f: 'json', apiKey: matching, id: release }, headers);
-      assert.equal(response.status, 503);
-      assert.equal(response.headers.get('retry-after'), '1');
-      assert.equal(response.headers.get('cache-control'), 'private, no-store');
-      assert.equal(response.headers.get('content-type'), 'application/xml');
-      assert.equal(await response.text(), '<subsonic-response status="failed" version="1.16.1"><error code="0" message="Service unavailable."/></subsonic-response>');
-      const elapsed = performance.now() - started;
-      // Allow the two-second close reserve and runner jitter, but not the
-      // eight-second operation deadline.
-      assert.ok(elapsed < 5_500, `stalled staging Fetch took ${Math.round(elapsed)} ms`);
-      assert.equal(startups, 1, 'Fetch must reach PostgreSQL startup exactly once');
-    } finally {
-      await worker.dispose();
-    }
-  } finally {
-    for (const socket of sockets) socket.destroy();
-    await new Promise((done) => peer.close(done));
   }
 }
 

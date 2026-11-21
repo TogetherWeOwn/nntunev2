@@ -29,6 +29,7 @@ use crate::worker_entry::{
     load_staging_account,
     subsonic_membership::load_staging_membership,
     subsonic_mirror::{load_staging_mirror, MirrorSelection},
+    with_deadline,
 };
 
 pub struct StagingDispatch {
@@ -72,8 +73,8 @@ pub enum CatalogueSource<C> {
     IsolatedMirror(C),
 }
 
-/// The caller must verify staging arming and app/mirror isolation and bound
-/// `open_app`. Source selection runs only after real auth, before account,
+/// The caller must first verify staging arming and app/mirror
+/// isolation. Source selection runs only after real auth, before account,
 /// fixture, membership or mirror reads. `None` denies access.
 pub async fn respond_staging<'a, K: KekSource + 'a, A, M, C>(
     request: &web_sys::Request,
@@ -111,7 +112,8 @@ where
         }
         Err(error) => return InputError::from(error).respond(),
     };
-    let mut app = match open_app().await {
+    let opened = with_deadline(async { open_app().await }, 2_000, BusyOrCapacity);
+    let mut app = match opened.await {
         Ok(app) => app,
         Err(reason) => return reject_xml(reason),
     };
@@ -286,7 +288,6 @@ fn request_format(params: &Params) -> Result<(Format<'_>, RejectionFormat), Docu
 mod wasm_test {
     use super::*;
     use crate::handlers::Config;
-    use crate::worker_entry::with_deadline;
     use worker::wasm_bindgen::{self, prelude::*};
     use worker::{js_sys, wasm_bindgen_futures::JsFuture};
 
@@ -308,20 +309,14 @@ mod wasm_test {
         respond_staging(
             &request,
             context,
-            || {
-                with_deadline(
-                    async {
-                        let ready = open_app.call0(&JsValue::UNDEFINED).unwrap();
-                        let result = JsFuture::from(js_sys::Promise::resolve(&ready))
-                            .await
-                            .unwrap();
-                        (result.as_bool() == Some(true))
-                            .then_some(StagingApp::<Config>::VerifiedFixture)
-                            .ok_or(StagingRejection::Unavailable)
-                    },
-                    2_000,
-                    BusyOrCapacity,
-                )
+            || async {
+                let ready = open_app.call0(&JsValue::UNDEFINED).unwrap();
+                let result = JsFuture::from(js_sys::Promise::resolve(&ready))
+                    .await
+                    .unwrap();
+                (result.as_bool() == Some(true))
+                    .then_some(StagingApp::<Config>::VerifiedFixture)
+                    .ok_or(StagingRejection::Unavailable)
             },
             |principal| {
                 assert_eq!(principal.user_id(), "fixture-user");

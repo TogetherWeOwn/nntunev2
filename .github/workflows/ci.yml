@@ -2020,15 +2020,6 @@ jobs:
           mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
           test "${#wranglers[@]}" -eq 1
           python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
-      - name: Exclude Subsonic deadline test markers from release WASM
-        run: |
-          if grep -aEq 'subsonic-connect-deadline-(proof|ok)' workers/api/build/index_bg.wasm; then
-            printf '%s\n' 'Subsonic deadline test marker found in release WASM' >&2
-            exit 1
-          else
-            # Only a clean no-match passes; a missing or unreadable bundle fails.
-            test "$?" -eq 1
-          fi
       - name: Rehearse the offline Subsonic staging schedule
         run: python3 -I scripts/test-subsonic-staging-runner.py
       - name: Exercise Worker routing with disposable PostgreSQL

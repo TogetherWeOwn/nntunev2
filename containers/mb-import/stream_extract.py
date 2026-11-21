@@ -30,7 +30,7 @@ from pathlib import Path
 # Must equal etl.FIELD_COUNTS keys (pinned by tests/test_stream_extract.py).
 REQUIRED_TABLES = (
     "artist", "artist_alias", "artist_type", "area", "iso_3166_1", "artist_credit_name",
-    "release", "release_alias", "release_group", "release_group_alias", "release_group_primary_type",
+    "release", "release_alias", "release_group", "release_group_primary_type",
     "release_country", "release_unknown_country", "recording", "recording_alias", "medium", "track", "url",
     "link_type", "link", "link_attribute_type", "link_attribute",
     "l_artist_url", "l_recording_url", "l_recording_recording", "l_recording_work",

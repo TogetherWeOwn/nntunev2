@@ -64,24 +64,12 @@ impl SocketGuard {
         set(&options, "secureTransport", &JsValue::from_str("starttls"))?;
         let raw = worker_sys::connect(address.into(), options.into())
             .map_err(|_| io::Error::other("socket connect failed"))?;
-        self.track(raw)
-    }
-
-    fn track(&self, raw: worker_sys::Socket) -> Result<TrackedSocket, io::Error> {
         let socket = self.register(raw.clone())?;
         Ok(TrackedSocket {
             socket,
             raw,
             owner: self.0.clone(),
         })
-    }
-
-    #[cfg(feature = "billing-owned-wasm-test")]
-    pub(crate) fn track_fixture(
-        &self,
-        raw: worker_sys::Socket,
-    ) -> Result<TrackedSocket, io::Error> {
-        self.track(raw)
     }
 
     pub(crate) fn tls(&self) -> TrackedTls {
@@ -183,8 +171,6 @@ impl TlsConnect<TrackedSocket> for TrackedTls {
 extern "C" {
     #[wasm_bindgen(js_name = socketFixture)]
     fn socket_fixture(acknowledged: bool) -> JsValue;
-    #[wasm_bindgen(js_name = stalledStartupFixture)]
-    pub(crate) fn stalled_startup_fixture(stall_open: bool) -> js_sys::Array;
 }
 
 // Synthetic JS handles verify registry ownership, not Worker network or TLS behavior.

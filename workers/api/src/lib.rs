@@ -236,13 +236,6 @@ pub async fn billing_owned_test_entry(
 ) -> worker::Result<worker::Response> {
     if req.method() == worker::Method::Post {
         match req.path().as_str() {
-            #[cfg(not(feature = "staging-body-wasm-test"))]
-            "/subsonic-connect-deadline-proof" => {
-                return match subsonic_measurement::test_connect_deadline().await {
-                    Ok(()) => worker::Response::ok("subsonic-connect-deadline-ok"),
-                    Err(message) => worker::Response::error(message, 500),
-                };
-            }
             "/billing-webhook-ack-proof" => {
                 return worker_entry::billing_webhook_ack_test::deliver(req, env, true).await;
             }
