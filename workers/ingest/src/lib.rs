@@ -2816,6 +2816,65 @@ mod tests {
     }
 
     #[test]
+    fn search_admission_meters_pending_retry_but_not_queued_replay() {
+        // Queue accepted but the meter write failed: 503 with the ledger
+        // still pending. Retry owes one successful write; a subsequent
+        // replay owes none.
+        let msg = crate::dispatch::build_search_dispatch(
+            "user_01",
+            "canary-9f1c",
+            "vault_idx_01-ab",
+            &[],
+            10,
+            0,
+        )
+        .unwrap();
+        let stage = meter_entry_stage(msg.source);
+        let mut ledger = MemLedger::new();
+        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+        let decision = drive_once(
+            &mut ledger,
+            &msg,
+            stage,
+            true,
+            true,
+            &mut queue_calls,
+            &mut meter_calls,
+        );
+        match &decision {
+            AdmissionDecision::MeterUnavailable(e) => assert_eq!(e.http_status(), 503),
+            other => panic!("meter failure must stay retryable, got {other:?}"),
+        }
+        assert_eq!((queue_calls, meter_calls), (1, 1));
+        assert_eq!(
+            ledger.mark_of(&msg.job_id, stage),
+            Some(AdmissionMark::Pending)
+        );
+        for (decision, total_calls) in [
+            (AdmissionDecision::Admitted, 2),
+            (AdmissionDecision::AlreadyQueued, 2),
+        ] {
+            assert_eq!(
+                drive_once(
+                    &mut ledger,
+                    &msg,
+                    stage,
+                    true,
+                    false,
+                    &mut queue_calls,
+                    &mut meter_calls,
+                ),
+                decision,
+            );
+            assert_eq!((queue_calls, meter_calls), (total_calls, total_calls));
+            assert_eq!(
+                ledger.mark_of(&msg.job_id, stage),
+                Some(AdmissionMark::Queued)
+            );
+        }
+    }
+
+    #[test]
     fn admission_unknown_stage_never_touches_ledger_or_queue() {
         let msg = admission_msg();
         let mut ledger = MemLedger::new();
