@@ -107,13 +107,15 @@
 	}
 </script>
 
-<svelte:window onpagehide={() => clear()} onstorage={({ key }) => { if (key === LIBRARY_AUTH_TRANSITION_KEY) clear(); }} />
+<svelte:window onpagehide={() => clear()} onpageshow={({ persisted }) => { if (persisted) { clear(''); load(null); } }}
+	onstorage={({ key }) => { if (key === LIBRARY_AUTH_TRANSITION_KEY) clear(); }} />
 <svelte:head><title>NNTune — Invite ledger</title></svelte:head>
 
 <main class="nt-wrap">
 	<h1 tabindex="-1" bind:this={heading}>Invite ledger</h1>
-	{#if error}<p role="alert">{error}</p>{/if}
-	{#if owner}
+	{#if error}<p role="alert">{error}</p>
+	{:else if !owner}<p role="status">Loading invites…</p>
+	{:else}
 		<p><a href="/admin/invite-windows">Invite windows</a></p>
 		<p>Up to {ADMIN_INVITE_LIMIT} matching invites, newest first. This is not a complete history.</p>
 		<form onsubmit={filterInvites}>
@@ -152,8 +154,6 @@
 				{/each}
 			</ul>
 		{/if}
-	{:else if !error}
-		<p role="status">Loading invites…</p>
 	{/if}
 </main>
 
