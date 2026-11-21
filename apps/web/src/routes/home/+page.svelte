@@ -9,6 +9,7 @@
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import { loadRecentFinds, recentFindsKey } from '#lib/library/recent-finds.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import RecentListens from './RecentListens.svelte';
 
 	// Home shows only the visitor's own data: their library snapshot, their
 	// favorites and their recent searches. Everything loads client-side with
@@ -105,6 +106,8 @@
 			<p><a href="/search">Search your library</a></p>
 		{/if}
 	</section>
+
+	<RecentListens />
 
 	{#if liked.length > 0}
 		<section aria-labelledby="home-liked-heading">
