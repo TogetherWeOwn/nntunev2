@@ -32,6 +32,11 @@ fn unmounted_history_context_tracks_cookie_refresh_and_key_rotation() {
     let first = magic_login(&h, "alice@example.com");
     let same = magic_login(&h, "alice@example.com");
     let mut req = receive_request(Some(first.clone()));
+    for origin in [None, Some("https://example.com:443")] {
+        req.origin = origin.map(str::to_owned);
+        assert_eq!(block_on(receiver::context(&h.ctx(), &req)).status, 401);
+    }
+    req.origin = Some(ORIGIN.into());
     let previous = bind_start(block_on(receiver::context(&h.ctx(), &req)));
     h.config.session_previous_secret =
         Some(std::mem::replace(&mut h.config.session_secret, vec![7; 32]));
