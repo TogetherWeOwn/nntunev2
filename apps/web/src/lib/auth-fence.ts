@@ -1,8 +1,8 @@
 export const AUTH_GENERATION_KEY = 'nntune.auth.generation.v1';
 // The browser releases this origin-wide lock even if a writer tab closes.
 export const AUTH_LOCK = 'nntune.auth.cookie-transition.v1';
-// An abandoned unlocked write can leave its marker; don't guess when its cookie settled.
-const UNLOCKED_PREFIX = 'nntune.auth.pending.v1.';
+// An abandoned write can leave its marker; don't guess when its cookie settled.
+const PENDING_PREFIX = 'nntune.auth.pending.v1.';
 let localEpoch = 0;
 let pending = 0;
 
@@ -14,7 +14,7 @@ function generation(): string | null {
 	}
 }
 
-const pendingMarker = (key: string) => key.startsWith(UNLOCKED_PREFIX);
+const pendingMarker = (key: string) => key.startsWith(PENDING_PREFIX);
 
 function receiptsBlocked(): boolean {
 	try {
@@ -32,25 +32,46 @@ async function cacheReceiptsBlocked(): Promise<boolean> {
 	}
 }
 
-async function markUnlockedMutation(): Promise<
-	(() => Promise<void>) | undefined
-> {
+type ClearMarker = () => unknown;
+const clearLater = (clear?: ClearMarker) => {
+	void Promise.resolve()
+		.then(clear)
+		.catch(() => {});
+};
+
+async function markMutation(): Promise<ClearMarker | undefined> {
 	try {
-		const key = `${UNLOCKED_PREFIX}${crypto.randomUUID()}`;
+		const key = `${PENDING_PREFIX}${crypto.randomUUID()}`;
 		try {
 			const storage = window.localStorage;
 			storage.setItem(key, '');
-			return async () => storage.removeItem(key);
+			return () => storage.removeItem(key);
 		} catch {
-			// Empty cache name only: separate from localStorage quota, no cached data.
+			// Empty cache name only: no cached data.
 			const storage = globalThis.caches;
 			await storage.open(key);
-			return async () => {
-				await storage.delete(key);
-			};
+			return () => storage.delete(key);
 		}
 	} catch {
-		/* A context denied both shared stores cannot announce its transition. */
+		/* Both stores denied the write. */
+	}
+}
+
+async function markBeforeDispatch(signal: AbortSignal) {
+	signal.throwIfAborted();
+	const marker = markMutation();
+	let onAbort!: () => void;
+	const aborted = new Promise<never>((_, reject) => {
+		onAbort = () => reject(signal.reason);
+		signal.addEventListener('abort', onAbort, { once: true });
+	});
+	try {
+		return await Promise.race([marker, aborted]);
+	} catch (error) {
+		void marker.then(clearLater); // Cache creation itself cannot be aborted.
+		throw error;
+	} finally {
+		signal.removeEventListener('abort', onAbort);
 	}
 }
 
@@ -74,8 +95,7 @@ async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 			AUTH_LOCK,
 			{ mode: 'shared', ifAvailable: true },
 			async (lock) => {
-				if (!lock || pending || (await cacheReceiptsBlocked()) || pending)
-					return;
+				if (!lock || pending || (await cacheReceiptsBlocked()) || pending) return;
 				return work();
 			}
 		);
@@ -87,8 +107,7 @@ async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 /** Use run() for trusted dispatch, publication and storage commits, not just a receipt check. */
 export function captureAuthFence() {
 	const locks = globalThis.navigator?.locks;
-	if (!locks || typeof window === 'undefined' || !('localStorage' in window))
-		return;
+	if (!locks || typeof window === 'undefined' || !('localStorage' in window)) return;
 	const epoch = localEpoch;
 	return readLock(async () => {
 		if (receiptsBlocked()) return;
@@ -105,16 +124,11 @@ export function captureAuthFence() {
 			});
 		const id = generation();
 		const isCurrent = () =>
-			!!id &&
-			!pending &&
-			epoch === localEpoch &&
-			!receiptsBlocked() &&
-			generation() === id;
+			!!id && !pending && epoch === localEpoch && !receiptsBlocked() && generation() === id;
 		if (!(await cacheReceiptsBlocked()) && isCurrent())
 			return {
 				isCurrent,
-				run: <T>(work: () => T) =>
-					readLock(() => (isCurrent() ? work() : undefined))
+				run: <T>(work: () => T) => readLock(() => (isCurrent() ? work() : undefined))
 			};
 	});
 }
@@ -128,41 +142,37 @@ export async function runAuthMutation<T>(
 	localEpoch++;
 	pending++;
 	let dispatched = false;
-	const send = async (unlocked = false) => {
-		signal.throwIfAborted();
-		const clearMarker = unlocked ? await markUnlockedMutation() : undefined;
+	const send = async (locked: boolean, clear?: ClearMarker) => {
 		let invalidated = false;
 		try {
 			signal.throwIfAborted();
 			invalidated = invalidateGeneration();
+			if (locked && !invalidated) clear = await markBeforeDispatch(signal);
+			signal.throwIfAborted();
 			dispatched = true;
 			return await dispatch();
 		} finally {
-			// Invalidate again if an unlocked write could not publish a guard.
-			if (unlocked && !clearMarker && dispatched) invalidateGeneration();
-			// Retry on recovery; never remove a guard that still protects old receipts.
-			if (
-				clearMarker &&
-				(!dispatched || invalidated || invalidateGeneration())
-			) {
-				try {
-					await clearMarker();
-				} catch {
-					/* Keep receipts withheld if cleanup is denied. */
-				}
-			}
+			// Retry before lock release or marker removal. An unguarded write always retries.
+			if (!dispatched || ((locked || clear) && invalidated) || invalidateGeneration())
+				clearLater(clear);
 		}
 	};
 	try {
 		const locks = globalThis.navigator?.locks;
-		// Without Web Locks, auth remains available but trusted reads fail closed.
-		if (!locks) return await send(true);
-		try {
-			return await locks.request(AUTH_LOCK, { signal }, () => send());
-		} catch (error) {
-			if (dispatched || signal.aborted) throw error;
-			return await send(true);
+		if (!locks) return await send(false, await markBeforeDispatch(signal));
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				return await locks.request(AUTH_LOCK, { signal }, () => send(true));
+			} catch (error) {
+				if (dispatched || signal.aborted) throw error;
+			}
+			if (!attempt) {
+				const clear = await markBeforeDispatch(signal);
+				if (clear) return await send(false, clear);
+			}
 		}
+		// No shared primitive was writable. Preserve ordinary auth's once-only fallback.
+		return await send(false);
 	} finally {
 		pending--;
 	}
