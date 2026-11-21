@@ -29,7 +29,7 @@ headerless MusicBrainz COPY files from the CC0 core dump: the entity files
 `release` with `release_alias` and `artist_credit_name`/`release_country`/`release_unknown_country`,
 `release_group` with `release_group_alias` and `release_group_primary_type`,
 `recording` with `recording_alias`/`medium`/`track`, `work` with
-`work_alias`/`work_type`, `label` with `label_type`) plus the relationship files
+`work_alias`/`work_type`, `label` with `label_alias`/`label_type`) plus the relationship files
 (`url`, `link_type`, `link`, `link_attribute_type`, `link_attribute`,
 `l_artist_url`, `l_recording_url`,
 `l_recording_recording`, `l_recording_work`, `release_label`, `isrc`) listed in
@@ -107,6 +107,14 @@ and deduplicated by release MBID, label MBID, and COPY-decoded number, then
 re-escaped without changing case or whitespace. Both sidecars use `.tsv.gz`
 in disk-bounded mode. Malformed fields and dangling references used by these
 projections refuse publication, even if other edges are valid.
+
+`mbdump-label_alias.tsv` uses the alias columns and whole-row tie-break above,
+keyed by the exact label MBID in `mbdump-label.tsv`. The CC0 archive member
+`mbdump/label_alias` has 16 COPY fields: alias ID, label ID, name, locale, sort
+name, and primary flag are at positions 1, 2, 3, 4, 8, and 15. Rows sort by
+label MBID, COPY-decoded name, and COPY-decoded locale. An empty input emits
+an empty sidecar; malformed projected fields or dangling label IDs refuse
+publication. Disk-bounded mode emits the same TSV content under `.tsv.gz`.
 
 `import.sh` still loads only its existing ten files; no database table or read
 route consumes the sidecars yet. To regenerate an older snapshot with the

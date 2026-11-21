@@ -22,9 +22,10 @@
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import {
 		clearFavoritesAtAuthBoundary,
+		favoritesKey,
 		loadFavorites,
-		saveFavorites,
-		selectFavoriteItems
+		selectFavoriteItems,
+		updateStoredFavorites
 	} from '#lib/library/favorites.js';
 	import {
 		clearRecentFindsAtAuthBoundary,
@@ -162,6 +163,8 @@
 	let queueConfirmGeneration = $state(0);
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
+	let favoriteEdit = 0;
+	let favoriteBaseline: readonly string[] = [];
 	let favoritesAnnouncement = $state('');
 	// One shared polite outcome for order, view and clear actions: a new
 	// outcome replaces the previous text (keyed re-announce), never queues.
@@ -384,7 +387,7 @@
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
 				if (!favoritesInitialized) {
-					favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
+					favoriteBaseline = favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
 					favoritesInitialized = true;
 				}
 				if (!recentFindsInitialized) {
@@ -777,18 +780,70 @@
 		player.announceQueue(`Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`);
 	}
 
+	function editFavorites(
+		update: (latest: readonly string[]) => readonly string[],
+		applied?: (before: readonly string[], after: readonly string[]) => void,
+		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection; loaded: ReadonlySet<string> }
+	): void {
+		const session = browserStorage('session');
+		const key = favoritesKey(session);
+		const edit = ++favoriteEdit;
+		const before = favorites;
+		const optimistic = update(before);
+		favorites = [...optimistic];
+		let base = before;
+		void updateStoredFavorites(session, browserStorage('local'), key, (latest) => {
+			base = latest;
+			return update(latest);
+		}).then((committed) => {
+			if (favoritesKey(session) !== key) return;
+			const wrote = committed !== null && JSON.stringify(base) !== JSON.stringify(committed);
+			if (edit !== favoriteEdit) {
+				if (wrote) favoriteBaseline = update(favoriteBaseline);
+				return;
+			}
+			if (!committed) return applied?.(before, optimistic);
+			const visitOnly = placement && !favoriteBaseline.includes(placement.id) && !committed.includes(placement.id)
+				? placement : undefined;
+			if (wrote) favorites = committed;
+			else if (JSON.stringify(favoriteBaseline) !== JSON.stringify(committed)) {
+				const baseline = new Set(favoriteBaseline);
+				const visit = new Set(optimistic);
+				const durable = committed.filter((id) => !baseline.has(id) || visit.has(id));
+				const visible = new Set(durable);
+				const survives = (id: string) => visible.has(id) || (!baseline.has(id) && visit.has(id));
+				const moved = visitOnly && survives(visitOnly.crossed) ? visitOnly : undefined;
+				const beforeNeighbor = new Map<string, string[]>();
+				let pending: string[] = [];
+				for (const id of moved ? before : optimistic) {
+					if (visible.has(id)) {
+						if (pending.length) beforeNeighbor.set(id, pending);
+						pending = [];
+					} else if (!baseline.has(id) && id !== moved?.id) pending.push(id);
+				}
+				const reconciled = [...durable.flatMap((id) => [...(beforeNeighbor.get(id) ?? []), id]), ...pending];
+				if (moved) {
+					const order = reconciled.filter((id) => moved.loaded.has(id));
+					order.splice(order.indexOf(moved.crossed) + Number(moved.direction === 'down'), 0, moved.id);
+					// Add a loaded slot without shifting the reconciled hidden slots.
+					reconciled.push(moved.id);
+					let slot = 0;
+					favorites = reconciled.map((id) => moved.loaded.has(id) ? order[slot++] : id);
+				} else favorites = reconciled;
+			}
+			favoriteBaseline = committed;
+			const displayMove = visitOnly && favorites.includes(visitOnly.crossed);
+			applied?.(displayMove ? before : base, displayMove ? favorites : committed);
+		});
+	}
+
 	function toggleFavorite(id: string): void {
-		// Toggle visible state, not the last successful write. The next write
-		// persists the full set, including edits made while storage failed.
-		const next = favorites.includes(id)
-			? favorites.filter((favorite) => favorite !== id)
-			: [...favorites, id];
-		favorites = next;
+		const remove = favorites.includes(id);
+		editFavorites((latest) => remove ? latest.filter((favorite) => favorite !== id) : [...new Set([...latest, id])]);
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), next);
 		// Favorites-only unmounts an unstarred row, including its focused button.
 		// All-tracks keeps that button mounted and must leave focus alone.
-		if (view === 'favorites' && !next.includes(id)) focusLibraryView();
+		if (view === 'favorites' && remove) focusLibraryView();
 	}
 
 	function focusLibraryView(): void {
@@ -840,53 +895,41 @@
 		player.announceQueue(`${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`);
 	}
 
-	/**
-	 * Move a visible favorite one slot up or down within the complete
-	 * stored order. No-ops (boundary activation, stale id) return the same
-	 * array and change nothing: no save, no announcement, no focus shift.
-	 * Real moves persist the full list through the existing seam, announce
-	 * the new visible position politely, and keep keyboard focus on the
-	 * moved track's controls. Never touches the queue, the library view,
-	 * stars, refresh or the network.
-	 */
-	async function moveFavorite(
-		id: string,
-		direction: FavoriteMoveDirection,
-		event: Event | HTMLElement
-	): Promise<void> {
+	function moveFavorite(id: string, direction: FavoriteMoveDirection, event: Event | HTMLElement): void {
 		const button = event instanceof HTMLElement ? event : event.currentTarget;
-		const visibleIds = favoriteTracks.map((track) => track.id);
-		const next = moveFavoriteId(favorites, visibleIds, id, direction);
-		if (next === favorites) return;
-		favorites = [...next];
-		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
-		const visible = new Set(visibleIds);
-		const position = next.filter((storedId) => visible.has(storedId)).indexOf(id) + 1;
-		const track = items.find((candidate) => candidate.id === id);
-		favoritesAnnouncement = `${track ? displayTitle(track) : id} moved to ${position} of ${visibleIds.length}`;
-		await tick();
-		// The keyed list preserves nodes, so an enabled button keeps focus
-		// on its own; a move onto a boundary disables the activated button
-		// and drops focus to the body, so land on the surviving move
-		// control of the same track instead. Runs only on explicit
-		// activation, so background refreshes cannot steal focus.
-		if (button instanceof HTMLButtonElement && typeof document !== 'undefined') {
-			if (!button.disabled && button.isConnected) {
-				button.focus({ preventScroll: true });
-			} else {
-				// Closest-ancestor lookup, never id interpolation: track ids
-				// are opaque server strings, and any quoting scheme risks an
-				// invalid selector (a trailing backslash throws inside this
-				// voided handler). The activated button is always inside its
-				// own favorite item.
-				const item = button.closest('[data-testid="favorite-item"]');
-				const fallback =
-					item?.querySelector<HTMLButtonElement>(
-						'button[aria-label^="Move favorite"]:not([disabled])'
-					) ?? item?.querySelector<HTMLButtonElement>('button:not([disabled])');
-				fallback?.focus({ preventScroll: true });
-			}
+		const item = button instanceof HTMLElement ? button.closest('[data-testid="favorite-item"]') : null;
+		function recoverFocus(): void {
+			const active = document.activeElement;
+			if (!(active instanceof HTMLButtonElement) || !item?.contains(active)) return;
+			if (active !== button && !active.matches('.nt-favorite-move')) return;
+			void tick().then(() => {
+				// Only recover focus lost to this render, not focus the user moved elsewhere.
+				if (document.activeElement !== document.body && document.activeElement !== active) return;
+				const target = active.isConnected && !active.disabled ? active
+					: item.isConnected ? item.querySelector<HTMLButtonElement>('.nt-favorite-move:not([disabled])')
+						?? item.querySelector<HTMLButtonElement>('button:not([disabled])') : shelfHeading;
+				target?.focus({ preventScroll: true });
+			});
 		}
+		const loaded = new Set(items.map((track) => track.id));
+		const visible = (ids: readonly string[]) => ids.filter((storedId) => loaded.has(storedId));
+		const move = (ids: readonly string[]) => moveFavoriteId(ids, visible(ids), id, direction);
+		const displayed = visible(favorites);
+		const index = displayed.indexOf(id);
+		const crossed = displayed[index + (direction === 'down' ? 1 : -1)];
+		if (index === -1 || crossed === undefined) return;
+		favoritesAnnouncement = '';
+		const track = items.find((candidate) => candidate.id === id);
+		recoverFocus();
+		editFavorites(move, (before, after) => {
+			recoverFocus();
+			const ids = visible(after), previous = visible(before);
+			const position = ids.indexOf(id), from = previous.indexOf(id);
+			const changedSide = (from < previous.indexOf(crossed)) !== (position < ids.indexOf(crossed));
+			if (position !== -1 && (position !== from || changedSide)) {
+				favoritesAnnouncement = `${track ? displayTitle(track) : id} moved to ${position + 1} of ${ids.length}`;
+			}
+		}, { id, crossed, direction, loaded });
 	}
 
 	function moveFavoriteLabel(track: LibraryItem, direction: FavoriteMoveDirection): string {
@@ -967,7 +1010,7 @@
 
 	/**
 	 * Shelf unstar: remove one id from the full visit state (hidden ids ride
-	 * along untouched) and persist the whole set through the existing saver.
+	 * along untouched) and remove that same id from durable storage.
 	 * Queue, ordering and refresh are untouched. Focus moves to the next
 	 * surviving shelf unstar control, or the shelf heading when none remains.
 	 */
@@ -975,9 +1018,8 @@
 		const removedIndex = favoriteTracks.findIndex((item) => item.id === id);
 		const track = items.find((item) => item.id === id);
 		const title = track ? displayTitle(track) : 'track';
-		favorites = favorites.filter((favorite) => favorite !== id);
+		editFavorites((latest) => latest.filter((favorite) => favorite !== id));
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
 		managementFeedback = `Removed ${title} from favorites.`;
 		void tick().then(() => {
 			const controls = shelfSection?.querySelectorAll<HTMLButtonElement>('[data-shelf-unstar]');
@@ -999,14 +1041,12 @@
 	}
 
 	/**
-	 * Confirmed clear: persist the entire empty scoped set (including ids
-	 * absent from this library) through the existing saver. Never touches
+	 * Confirmed clear removes every ID in the current scope. Never touches
 	 * the auth context, other accounts, the queue or the network.
 	 */
 	function confirmClearFavorites(): void {
-		favorites = [];
+		editFavorites(() => []);
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), []);
 		confirmClear = false;
 		managementFeedback = 'Cleared local favorites.';
 		void tick().then(() => clearButton?.focus({ preventScroll: true }));
@@ -1186,22 +1226,23 @@
 		player.announceQueue(appendResultLabel(result.added, result.skipped) + missingInteractionLabel(ids, surviving), true);
 	}
 
-	function favoriteInteractionIds(ids: readonly string[], queued = false, source: readonly LibraryItem[] = items): void {
+	function favoriteInteractionIds(ids: readonly string[], remove: boolean, queued: boolean, source: readonly LibraryItem[] = items): void {
 		const queue = queueController.snapshot;
 		const surviving = availableInteractionIds(ids, queued, source);
 		if (!surviving.length) return;
-		const remove = surviving.every((id) => favoriteIds.has(id));
-		const changed = surviving.filter((id) => favoriteIds.has(id) === remove);
-		favorites = remove ? favorites.filter((id) => !changed.includes(id)) : [...favorites, ...changed];
-		saveFavorites(browserStorage('session'), browserStorage('local'), favorites);
-		const already = surviving.length - changed.length;
-		const count = `${changed.length} ${changed.length === 1 ? 'track' : 'tracks'}`;
-		const track = (queued ? queue.tracks : source).find((track) => track.id === surviving[0]);
-		const subject = ids.length === 1 && track ? displayTitle(track) : count;
-		favoritesAnnouncement = (remove ? `Removed ${subject} from favorites.`
-			: `Starred ${subject}${already ? `; ${already} ${already === 1 ? 'was' : 'were'} already starred` : ''}.`) + missingInteractionLabel(ids, surviving);
+		const targets = new Set(surviving);
+		favoritesAnnouncement = '';
+		editFavorites((latest) => remove ? latest.filter((id) => !targets.has(id)) : [...new Set([...latest, ...targets])], (before) => {
+			const changed = surviving.filter((id) => before.includes(id) === remove).length;
+			const already = surviving.length - changed;
+			const count = `${changed} ${changed === 1 ? 'track' : 'tracks'}`;
+			const track = (queued ? queue.tracks : source).find((track) => track.id === surviving[0]);
+			const subject = ids.length === 1 && track ? displayTitle(track) : count;
+			favoritesAnnouncement = (remove ? `Removed ${subject} from favorites.`
+				: `Starred ${subject}${already ? `; ${already} ${already === 1 ? 'was' : 'were'} already starred` : ''}.`) + missingInteractionLabel(ids, surviving);
+		});
 		const focusedId = focusedLibraryRowId();
-		if (!queued && view === 'favorites' && remove && focusedId !== null && changed.includes(focusedId)) {
+		if (!queued && view === 'favorites' && remove && focusedId !== null && targets.has(focusedId)) {
 			focusAfterSelectedRowRemoval(null, null);
 		}
 	}
@@ -1278,7 +1319,7 @@
 		const starred = ids.every((id) => favoriteIds.has(id));
 		const actions = playbackMenuActions(ids, source);
 		actions.push(
-			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids, false, source()) },
+			{ label: `${starred ? 'Unstar' : 'Star'}${ids.length > 1 ? ' all' : ''}`, run: () => favoriteInteractionIds(ids, starred, false, source()) },
 			unavailablePlaylistAction
 		);
 		if (ids.length === 1) actions.push({ label: 'Copy link', run: () => {
@@ -1307,7 +1348,7 @@
 			if (direction === 'up' ? index === 0 : index === favoriteTracks.length - 1) continue;
 			actions.push({ label: direction === 'up' ? 'Move up' : 'Move down', run: () => {
 				if (!availableInteractionIds([id]).length || !favoriteIds.has(id)) return;
-				void moveFavorite(id, direction, target);
+				moveFavorite(id, direction, target);
 			} });
 		}
 		actions.push(
@@ -1594,7 +1635,7 @@
 								class="nt-favorite-move"
 								aria-label={moveFavoriteLabel(track, 'up')}
 								disabled={index === 0}
-								onclick={(event) => void moveFavorite(track.id, 'up', event)}
+								onclick={(event) => moveFavorite(track.id, 'up', event)}
 							>
 								Up
 							</button>
@@ -1603,7 +1644,7 @@
 								class="nt-favorite-move"
 								aria-label={moveFavoriteLabel(track, 'down')}
 								disabled={index === favoriteTracks.length - 1}
-								onclick={(event) => void moveFavorite(track.id, 'down', event)}
+								onclick={(event) => moveFavorite(track.id, 'down', event)}
 							>
 								Down
 							</button>
@@ -1927,7 +1968,7 @@
 				announcementVersion={player.queueAnnouncement.version}
 				{favoriteIds}
 				ontogglefavorite={listingUnavailable ? undefined : toggleQueuedFavorite}
-				onfavoriteids={(ids) => favoriteInteractionIds(ids, true)}
+				onfavoriteids={listingUnavailable ? undefined : (ids, remove) => favoriteInteractionIds(ids, remove, true)}
 				bind:filterQuery={queueFilterQuery}
 				liveRegions={!loading}
 				confirmDestructive
