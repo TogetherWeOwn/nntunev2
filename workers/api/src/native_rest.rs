@@ -458,6 +458,13 @@ pub(crate) const MEMBER_INVITES_PATH: &str = "/v1/me/invites";
 pub(crate) const MEMBER_INVITE_HISTORY_PATH: &str = "/v1/me/invites/history";
 pub(crate) const ADMIN_INVITE_WINDOWS_PATH: &str = "/v1/admin/invite-windows";
 
+pub(crate) fn admin_invite_tree_user(path: &str) -> Option<&str> {
+    let id = path
+        .strip_prefix("/v1/admin/users/")?
+        .strip_suffix("/invite-tree")?;
+    crate::ledger::is_valid_key_field(id, crate::ledger::MAX_USER_ID_LEN).then_some(id)
+}
+
 pub(crate) fn admin_invite_window_close_id(path: &str) -> Option<i64> {
     let id = path
         .strip_prefix(ADMIN_INVITE_WINDOWS_PATH)?
@@ -536,7 +543,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             // Admin surface (migration 0028): session + fresh DB role,
             // never bearer.
-            if matches!(path, "/v1/admin/settings" | ADMIN_INVITE_WINDOWS_PATH) {
+            if matches!(path, "/v1/admin/settings" | ADMIN_INVITE_WINDOWS_PATH)
+                || admin_invite_tree_user(path).is_some()
+            {
                 return SessionOnly;
             }
             // Admin ingest reads (migration 0034): the exact list path
