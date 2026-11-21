@@ -106,6 +106,26 @@ On success both methods return 200: PUT returns `{target_id, liked_at}` and
 DELETE returns `{target_id, liked: false}`. The receipt uses the resolved ID;
 exact member job IDs keep their case.
 
+### Bound web playback contract
+
+Send that same verified binding on `PUT /v1/me/private-session`,
+`POST /v1/plays`, and `POST /v1/plays/heartbeat`. A supplied mismatch returns
+412 before a privacy or lease write. Headerless callers keep existing behavior.
+The future web transport must always send the binding, and retire its
+in-memory playback session when the auth session changes.
+
+Use one browser-generated playback `session_id` for all three calls, distinct
+from the auth cookie and from the server-issued `play_id`. A new start omits
+`play_id`. A bound continuation with `play_id` either extends that exact play
+or returns 409 without a replacement grant. Privacy changes apply only to new
+starts; neither continuation nor heartbeat reclassifies a play.
+
+The Library's legacy and demo audio URLs are not protected playback sources.
+Do not expose a privacy toggle for them. The stream Worker requires a bearer
+header, which a native audio `src` cannot attach. Wiring needs an explicit
+protected source and byte transport that keeps the grant out of URLs, logs,
+queue data, and persisted storage. Catalogue refresh is not a grant request.
+
 Known limits of this slice: attestation `x5c` chains reject (no CA
 trust store yet); magic-link delivery needs the operator's
 `EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
