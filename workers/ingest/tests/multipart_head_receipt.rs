@@ -7,7 +7,7 @@ use nntune_core::{
 };
 use nntune_ingest::multipart::{
     head_receipt::{compare_head_receipt, HeadReceipt, HeadReceiptError::*},
-    MultipartError, Plan, UploadTarget,
+    MultipartError, Plan, UploadTarget, VersionedCompletionReply,
 };
 use sha2::{Digest, Sha256};
 
@@ -19,6 +19,122 @@ fn id(byte: u8) -> [u8; 16] {
     value[6] = 0x40;
     value[8] = 0x80;
     value
+}
+
+#[test]
+fn pins_only_the_exact_versioned_completion_response() {
+    use MultipartError::*;
+
+    let mut sealer = OriginSealer::new(1).unwrap();
+    let target = UploadTarget {
+        bucket: BUCKET,
+        key: KEY,
+        upload_id: "synthetic",
+    };
+    let plan = Plan::new(target, sealer.header(), 1).unwrap();
+    let mut partition = plan.partition();
+    assert!(partition
+        .push(&sealer.seal_chunk(&[42]).unwrap())
+        .unwrap()
+        .is_none());
+    let part = partition.finish().unwrap().unwrap();
+    let (_, _, bytes, checksum) = part.request();
+    let digest = STANDARD.encode(Sha256::digest(Sha256::digest(bytes)));
+    let completion = plan
+        .complete(vec![part
+            .verify_reply("opaque-part".into(), checksum)
+            .unwrap()])
+        .unwrap();
+    let bucket = format!("<Bucket>{BUCKET}</Bucket>");
+    let key = format!("<Key>{KEY}</Key>");
+    let response = |fields: &str| {
+        format!("<CompleteMultipartUploadResult>{fields}<ChecksumSHA256>{digest}-1</ChecksumSHA256></CompleteMultipartUploadResult>")
+    };
+    let body = response(&format!("{bucket}{key}"));
+    let context = EnvelopeContext {
+        identities: [0, 1, 2, 0xab, 0xcd, 5].map(id),
+        plaintext_len: 1,
+        header: sealer.header().to_bytes(),
+    };
+    let check =
+        |context: &EnvelopeContext, configuration, status, body: &str, version_headers: &[&str]| {
+            completion.verify_versioned_reply(
+                context,
+                VersionedCompletionReply {
+                    configuration,
+                    status,
+                    body: body.as_bytes(),
+                    version_headers,
+                },
+            )
+        };
+    let version = "Opaque+%2F/=";
+    let pinned = check(&context, id(5), 200, &body, &[version]).unwrap();
+    assert_eq!(pinned.metadata().locator().bucket(), BUCKET);
+    assert_eq!(pinned.metadata().locator().key(), KEY);
+    assert_eq!(
+        pinned.metadata().locator().binding(),
+        &S3Binding::VersionId(version.into())
+    );
+    assert!(pinned.metadata().matches_context(&context));
+    assert_eq!(
+        pinned.metadata().ciphertext_len(),
+        HEADER_SIZE + 1 + TAG_SIZE
+    );
+
+    let long = "v".repeat(1025);
+    for headers in [
+        &[][..],
+        &[version, version],
+        &[""],
+        &["null"],
+        &["v1, v2"],
+        &[" v1"],
+        &["é"],
+        &[long.as_str()],
+    ] {
+        assert_eq!(
+            check(&context, id(5), 200, &body, headers).err(),
+            Some(CompletionVersion)
+        );
+    }
+    for (reply_body, error) in [
+        (response(&bucket), CompletionIdentity),
+        (response(&key), CompletionIdentity),
+        (body.replace(BUCKET, "other-bucket"), CompletionBody),
+        (body.replace("-1</", "-2</"), Checksum),
+        ("<Error/>".into(), EmbeddedError),
+    ] {
+        assert_eq!(
+            check(&context, id(5), 200, &reply_body, &[version]).err(),
+            Some(error)
+        );
+    }
+    assert_eq!(
+        check(&context, id(5), 503, &body, &[version]).err(),
+        Some(CompletionStatus)
+    );
+    assert_eq!(
+        check(&context, id(6), 200, &body, &[version]).err(),
+        Some(CompletionIdentity)
+    );
+    let mut wrong_generation = EnvelopeContext { ..context };
+    wrong_generation.identities[4] = id(0xef);
+    let mut wrong_header = EnvelopeContext { ..context };
+    wrong_header.header[47] ^= 1;
+    for wrong_context in [
+        wrong_generation,
+        wrong_header,
+        EnvelopeContext {
+            plaintext_len: 2,
+            ..context
+        },
+    ] {
+        assert_eq!(
+            check(&wrong_context, id(5), 200, &body, &[version]).err(),
+            Some(CompletionIdentity)
+        );
+    }
 }
 
 #[test]
