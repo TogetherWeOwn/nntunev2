@@ -2,15 +2,20 @@
 	import type { ComponentProps } from 'svelte';
 	import { displayArtist, displayTitle } from '../library/order.js';
 	import NativeAudio from './NativeAudio.svelte';
+	import type { PlaybackStatus } from './mediaController.js';
 	import type { Track } from './queue.js';
 	import type { JumpDirection } from './relativeJump.js';
 
 	let {
 		currentTrack, mediaRevision, streamUrl, attachNativeAudio,
+		playbackStatus, playCurrent, pauseCurrent,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
 		jumpStatus, jumpStatusVersion, jumpRelative
 	}: ComponentProps<typeof NativeAudio> & {
 		currentTrack: Pick<Track, 'id' | 'title' | 'artist'> | null;
+		playbackStatus: PlaybackStatus;
+		playCurrent: () => Promise<void>;
+		pauseCurrent: () => void;
 		restartCanSeek: boolean;
 		restartStatus: string;
 		restartStatusVersion: number;
@@ -19,6 +24,15 @@
 		jumpStatusVersion: number;
 		jumpRelative: (direction: JumpDirection) => void;
 	} = $props();
+	const canPause = $derived(playbackStatus === 'playing' || playbackStatus === 'starting');
+	const statusText: Record<PlaybackStatus, string> = {
+		unavailable: 'Playback is unavailable.',
+		paused: 'Paused',
+		starting: 'Starting playback…',
+		playing: 'Playing',
+		blocked: 'Playback was blocked. Press Play to try again.',
+		error: 'This audio could not be loaded or played. Choose another track.'
+	};
 </script>
 
 <section aria-label="Player">
@@ -29,6 +43,11 @@
 		</p>
 	{/if}
 	<div class="nt-library-player-controls">
+		<button class="nt-button nt-library-transport" type="button"
+			disabled={playbackStatus === 'error' || playbackStatus === 'unavailable'}
+			onclick={() => canPause ? pauseCurrent() : void playCurrent()}>
+			{canPause ? 'Pause' : 'Play'}
+		</button>
 		<NativeAudio {mediaRevision} {streamUrl} {attachNativeAudio} />
 		<button
 			class="nt-button nt-library-restart"
@@ -41,6 +60,7 @@
 			Restart current track
 		</button>
 	</div>
+	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
 	{#if !restartCanSeek}
 		<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 	{/if}
@@ -78,6 +98,7 @@
 		flex-wrap: wrap;
 		gap: var(--nt-space-2) var(--nt-space-3);
 	}
+	.nt-library-transport,
 	.nt-library-restart {
 		flex: 0 0 auto;
 		min-height: 2.75rem;
@@ -85,6 +106,7 @@
 		cursor: pointer;
 		font: inherit;
 	}
+	.nt-library-transport:disabled,
 	.nt-library-restart:disabled {
 		cursor: default;
 		opacity: 0.5;
