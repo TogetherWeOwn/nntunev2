@@ -64,6 +64,7 @@ pub mod prefetch;
 pub mod probe;
 pub mod provider_response;
 pub mod range;
+mod response_delivery;
 pub mod routes;
 pub mod s3_range_response;
 pub mod trace;
