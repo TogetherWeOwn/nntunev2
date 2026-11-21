@@ -371,11 +371,11 @@ test.each([false, true])('absolute seek uses native time and clears stale refusa
 		native.dispatchEvent(new Event(event));
 		expect(state().feedback).toBe('That position is not seekable yet.');
 	}
-	native.currentTime = 60;
-	native.seeking = true;
+	Object.assign(native, { currentTime: 60, seeking: true });
 	if (early) native.dispatchEvent(new Event('timeupdate'));
 	expect(state()).toMatchObject({ position: early ? 60 : 32, elapsed: 32, feedback: 'That position is not seekable yet.' });
 	native.dispatchEvent(new Event('seeking'));
+	expect(state()).toMatchObject({ position: 60, elapsed: 32, seeking: true, feedback: '' });
 	native.seeking = false;
 	native.dispatchEvent(new Event('seeked'));
 	expect(state()).toMatchObject({ attachment, position: 60, elapsed: 60, feedback: '' });
