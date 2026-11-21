@@ -985,7 +985,8 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     assert_eq!(fx.history_rows("sub_test_1").await, 0);
     assert_eq!(fx.rows("u1").await, 2);
 
-    // The same named write-boundary cases are exercised by the handler test.
+    // The handler test exercises the same cases against the legacy upsert.
+    // The owned transaction refuses changed terminal proof before that write.
     for case in [
         "valid",
         "shared",
@@ -1033,7 +1034,16 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
             incoming.row.paid_through_unix = Some(150);
         }
         let stored_before = fx.snap(&sub).await.unwrap();
-        fx.put("u1", &incoming).await;
+        let changed_proof = matches!(case, "read-plan" | "read-anchor");
+        if changed_proof {
+            let result = fx.try_put("u1", &incoming).await;
+            assert!(
+                matches!(&result, Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "changed terminal read provenance"),
+                "{case}: {result:?}"
+            );
+        } else {
+            fx.put("u1", &incoming).await;
+        }
         let mut expected = Snap {
             user_id: "u1".into(),
             customer: "cus_new".into(),
@@ -1047,14 +1057,13 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
             anchor: Some("in_new".into()),
             grace: Some(20),
         };
-        if matches!(case, "read-plan" | "read-anchor" | "no-anchor" | "null-end") {
+        if changed_proof || case == "no-anchor" {
+            expected = stored_before;
+        } else if case == "null-end" {
             expected.plan = "plus".into();
             expected.anchor = Some("in_old".into());
         } else if case == "shared" || case == "advance-null-anchor" {
             expected.anchor = Some("in_old".into());
-        }
-        if case == "no-anchor" {
-            expected = stored_before;
         }
         if case == "advance-null-anchor" {
             expected.paid_through = Some(150);

@@ -2,7 +2,7 @@ use super::*;
 use std::time::Duration;
 use tokio_postgres::{config::Host, Config, NoTls};
 
-async fn connect() -> Client {
+pub(crate) async fn connect() -> Client {
     let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
         .expect("requires the disposable Actions database")
         .parse()
@@ -35,7 +35,7 @@ fn grant_play_id(number: u8) -> String {
     ])
 }
 
-async fn seed_owner(client: &Client, owner: &str) {
+pub(crate) async fn seed_owner(client: &Client, owner: &str) {
     client
         .execute(
             "INSERT INTO public.users (id,email,created_at) VALUES ($1,$2,1000)",
@@ -45,7 +45,7 @@ async fn seed_owner(client: &Client, owner: &str) {
         .unwrap();
 }
 
-async fn seed_lease(client: &Client, owner: &str, number: u8) {
+pub(crate) async fn seed_lease(client: &Client, owner: &str, number: u8) {
     client
         .execute(
             "INSERT INTO public.playback_leases (user_id,session_id,track_id,play_id,epoch,expires_at,updated_at)
