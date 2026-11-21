@@ -15,7 +15,6 @@
 	import { deriveTrackTime } from '#lib/format.js';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
-	import PlaybackSpeedControl from '#lib/player/PlaybackSpeedControl.svelte';
 	import ShuffleUpcoming from '#lib/player/ShuffleUpcoming.svelte';
 	import VolumeControls from '#lib/player/VolumeControls.svelte';
 	import {
@@ -429,6 +428,9 @@
 	let speedFeedback = $state('');
 	// Retain a mismatch through the ratechange emitted by the same media write.
 	let speedFeedbackRate: number | null = null;
+	const PRESET_SPEED_VALUES = ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
+	/** A restored or native non-preset rate renders as its own explicit option. */
+	const showCustomSpeed = $derived(!PRESET_SPEED_VALUES.includes(speedValue));
 	let resumeStore: ResumeStore | null = null;
 
 	// Session-local recently-played list (demo synthetic tracks only; the
@@ -565,26 +567,11 @@
 		}
 	}
 
-	/**
-	 * Reconcile a native-control rate change to state, display and
-	 * best-effort persistence. Reads only: never writes back into the
-	 * element (no feedback loop) and never implies play or seek. Detached,
-	 * stale, throwing or non-finite readings are ignored so they cannot
-	 * poison the last verified preference.
-	 */
 	function handleNativeRateChange(event: Event): void {
 		const element = event.currentTarget as HTMLAudioElement | null;
-		if (!element || element !== audioEl || !element.isConnected) return;
-		if (!speed) return;
-		let nativeRate: number;
-		try {
-			nativeRate = element.playbackRate;
-		} catch {
-			return;
-		}
-		// The queued event from our own restore has already been reconciled.
-		if (!Number.isFinite(nativeRate) || clampPlaybackSpeed(nativeRate) === speed.current()) return;
-		showVerifiedSpeed(speed.adoptNativeRate(nativeRate));
+		if (!element?.isConnected) return;
+		const rate = speed?.observeNativeRate(element);
+		if (rate !== undefined) showVerifiedSpeed(rate);
 	}
 
 	function showVerifiedSpeed(rate: number): void {
@@ -1428,10 +1415,8 @@
 		};
 	}
 
-	// A swapped-in element starts at 1x: re-apply the persisted speed.
-	// `apply` verifies against the element, so reconcile the display to
-	// the actual rate it reports (a rejecting/clamping element must not
-	// leave a false selection on screen).
+	// A swapped-in decoder starts at 1x. Restore this tab's cached speed
+	// and show what the new decoder actually applied.
 	$effect(() => {
 		audioEl;
 		if (speed) showVerifiedSpeed(speed.apply());
@@ -1473,7 +1458,7 @@
 			store = memoryStorage();
 		}
 		speed = createPlaybackSpeed({ storage: store, audio: () => audioEl });
-		speedValue = String(speed.apply());
+		showVerifiedSpeed(speed.apply());
 		resumeStore = createResumeStore({ storage: store });
 		try {
 			recentStore = createRecentlyPlayedStore({ storage: sessionStorage });
@@ -2039,7 +2024,29 @@
 		{/if}
 		<p data-testid="sleep-timer-status" aria-live="polite">{sleepAnnouncement}</p>
 		<p>Duration timers use wall-clock time and continue while paused.</p>
-		<PlaybackSpeedControl value={speedValue} feedback={speedFeedback} onchange={handleSpeedChange} />
+		<div>
+			<label for="playback-speed">Playback speed</label>
+			<select
+				id="playback-speed"
+				data-testid="playback-speed"
+				value={speedValue}
+				onchange={(event) => handleSpeedChange(event.currentTarget)}
+			>
+				{#if showCustomSpeed}
+					<option value={speedValue}>{speedValue}x</option>
+				{/if}
+				<option value="0.5">0.5x</option>
+				<option value="0.75">0.75x</option>
+				<option value="1">1x</option>
+				<option value="1.25">1.25x</option>
+				<option value="1.5">1.5x</option>
+				<option value="1.75">1.75x</option>
+				<option value="2">2x</option>
+			</select>
+			{#if speedFeedback}
+				<p data-testid="speed-status" role="status">{speedFeedback}</p>
+			{/if}
+		</div>
 	</section>
 
 	<button type="button" data-testid="seek-storm" onclick={() => void seekStorm()}>

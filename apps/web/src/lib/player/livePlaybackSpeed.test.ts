@@ -36,6 +36,16 @@ test('a passive attach in a stale tab leaves the newer shared preference untouch
 	expect(storage.getItem()).toBe('1.5');
 });
 
+test('keeps speed usable across decoder attachments when storage is unavailable', () => {
+	const { speed, storage, attach, retire } = fixture();
+	speed.restore(null);
+	expect(attach().audio.playbackRate).toBe(1);
+	expect(speed.set(1.5)).toBe(1.5);
+	retire();
+	expect(attach().audio.playbackRate).toBe(1.5);
+	expect(storage.setItem).not.toHaveBeenCalled();
+});
+
 test('renders clamped readback and keeps mismatch feedback through the write’s ratechange', () => {
 	const { speed, attach, storage } = fixture();
 	const { current, apply, native } = attach();

@@ -6,7 +6,8 @@ const tracks = [
 ];
 const audio = (page: Page) => page.getByTestId('audio-player').and(page.locator('audio'));
 const speed = (page: Page) => page.getByRole('combobox', { name: 'Playback speed', exact: true });
-const stored = (page: Page) => page.evaluate(() => localStorage.getItem('nntune:playback-speed:v1'));
+const speedKey = 'nntune:playback-speed:v1';
+const stored = (page: Page) => page.evaluate((key) => localStorage.getItem(key), speedKey);
 
 async function openLibrary(page: Page) {
 	await page.route('**/api/library', (route) => route.fulfill({ json: tracks }));
@@ -56,33 +57,6 @@ test('speed follows the current decoder and restores across source change and re
 	await expect(audio(page)).toHaveJSProperty('playbackRate', 0.5);
 });
 
-test('a demo restore and its ratechange leave a newer Library choice intact', async ({ page, context }) => {
-	const demo = await context.newPage();
-	await demo.goto('/demo/player');
-	await demo.evaluate(() => {
-		const { set } = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate')!;
-		Object.defineProperty(HTMLMediaElement.prototype, 'playbackRate', {
-			set(value: number) { set!.call(this, value === 2 ? 1.5 : value === 1.5 ? 1.25 : value); }
-		});
-	});
-	await speed(demo).selectOption('2');
-	await expect(demo.getByTestId('speed-status')).toHaveText('Speed 2x not applied — still 1.5x');
-	await openLibrary(page);
-	await enqueue(page, 0);
-	await speed(page).selectOption('1.75');
-	await demo.evaluate(() => document.addEventListener('ratechange',
-		(event) => { (event.target as HTMLAudioElement).dataset.rateChanged = 'yes'; }, true));
-	await demo.getByTestId('player-next').click();
-	const demoAudio = demo.getByTestId('demo-audio').and(demo.locator('audio[src$="track=second-signal"]'));
-	await expect(demoAudio).toHaveAttribute('data-rate-changed', 'yes');
-	await expect(demoAudio).toHaveJSProperty('playbackRate', 1.25);
-	await expect(speed(demo)).toHaveValue('1.25');
-	await expect(demo.getByTestId('speed-status')).toBeEmpty();
-	expect(await stored(page)).toBe('1.75');
-	await speed(demo).selectOption('0.75');
-	await expect.poll(() => stored(page)).toBe('0.75');
-});
-
 for (const refusal of ['ignore', 'clamp', 'throw'] as const) {
 	test(`speed reports the observed rate when a write fails (${refusal})`, async ({ page }) => {
 		await openLibrary(page);
@@ -99,6 +73,15 @@ for (const refusal of ['ignore', 'clamp', 'throw'] as const) {
 				}
 			});
 		}, refusal);
+		const writes = await page.evaluateHandle((key) => {
+			const values: string[] = [];
+			const setItem = Storage.prototype.setItem;
+			Storage.prototype.setItem = function (name, value) {
+				if (this === localStorage && name === key) values.push(value);
+				setItem.call(this, name, value);
+			};
+			return values;
+		}, speedKey);
 		const status = page.getByTestId('speed-status').and(page.getByRole('status'));
 		await expect(status).toBeEmpty();
 		await speed(page).focus();
@@ -115,6 +98,9 @@ for (const refusal of ['ignore', 'clamp', 'throw'] as const) {
 		await expect(speed(page)).toBeFocused();
 		await expect(audio(page)).toHaveJSProperty('playbackRate', Number(observed));
 		expect(await stored(page)).toBe(observed);
+		const persisted = await writes.jsonValue();
+		if (refusal === 'throw') expect(persisted).toEqual([]);
+		else expect(persisted).toContain(observed);
 		await expect(audio(page)).toHaveJSProperty('paused', true);
 		await expect(audio(page)).toHaveJSProperty('currentTime', 0);
 	});

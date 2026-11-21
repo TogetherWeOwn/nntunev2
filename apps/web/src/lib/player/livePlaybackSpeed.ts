@@ -47,8 +47,12 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 
 	return {
 		state: { subscribe: state.subscribe },
-		restore(storage: PlaybackSpeedDeps['storage']): void {
-			preference = createPlaybackSpeed({ audio: () => writePort, storage });
+		restore(storage: PlaybackSpeedDeps['storage'] | null): void {
+			preference = createPlaybackSpeed({
+				audio: () => writePort,
+				// The shared preference retains its live rate when browser storage is blocked.
+				storage: storage ?? { getItem: () => null, setItem() {}, removeItem() {} }
+			});
 			write();
 		},
 		handoff(inherit: () => number | null): void { replacementRate = inherit; },

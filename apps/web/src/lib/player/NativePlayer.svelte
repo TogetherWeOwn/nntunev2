@@ -12,6 +12,7 @@
 		playbackStatus, playCurrent, pauseCurrent, retryCurrent,
 		seekState, seek,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
+		favoriteAction,
 		jumpStatus, jumpStatusVersion, jumpRelative, volumeControls
 	}: ComponentProps<typeof NativeAudio> & {
 		volumeControls: Snippet;
@@ -29,6 +30,7 @@
 		jumpStatus: string;
 		jumpStatusVersion: number;
 		jumpRelative: (direction: JumpDirection) => void;
+		favoriteAction?: Snippet;
 	} = $props();
 	const canPause = $derived(playbackStatus === 'playing' || playbackStatus === 'starting');
 	const statusText: Record<PlaybackStatus, string> = {
@@ -72,6 +74,7 @@
 		>
 			Restart current track
 		</button>
+		{@render favoriteAction?.()}
 	</div>
 	{#key seekState.attachment}<PlayerSeek state={seekState} {seek} />{/key}
 	{@render volumeControls()}

@@ -36,5 +36,5 @@ test('keeps failure feedback through its matching native ratechange', async ({ p
 	await page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => {
 		(el as HTMLAudioElement & { setNativeRate?: (value: number) => void }).setNativeRate?.(1);
 	});
-	await expect(feedback).toBeEmpty();
+	await expect(feedback).toHaveCount(0);
 });

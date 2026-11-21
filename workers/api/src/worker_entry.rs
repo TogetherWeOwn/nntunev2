@@ -3175,6 +3175,52 @@ fn invite_window_from_row(row: &tokio_postgres::Row) -> Result<InviteWindow, Sto
     })
 }
 
+async fn admin_list_invites_on(
+    client: &impl GenericClient,
+    issuer: Option<&str>,
+    status: Option<&str>,
+    now: u64,
+    limit: usize,
+) -> Result<Vec<InviteRecord>, StoreError> {
+    // Match InviteRecord::status (redeemed > revoked > expired > active).
+    let status_predicate = match status {
+        Some("redeemed") => "(redeemed_at IS NOT NULL OR used)",
+        Some("revoked") => "(redeemed_at IS NULL AND NOT used AND revoked_at IS NOT NULL)",
+        Some("expired") => {
+            "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at <= $2)"
+        }
+        Some("active") => {
+            "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at > $2)"
+        }
+        _ => "TRUE",
+    };
+    // Project the current deadline once for both the filter and the returned row.
+    // The member's window is retained on close; stored invite expiry is untouched.
+    let statement = format!(
+        "SELECT * FROM (
+            SELECT i.id, i.code_hash, i.used, i.created_at, i.issued_by, i.kind, i.email,
+                   CASE WHEN i.kind = 'member' THEN LEAST(i.expires_at, w.ends_at)
+                        ELSE i.expires_at END AS expires_at,
+                   i.redeemed_by, i.redeemed_at, i.revoked_at, i.revoked_by, i.window_id
+            FROM invite_codes i LEFT JOIN invite_windows w ON w.id = i.window_id
+         ) ledger
+         WHERE ($1::text IS NULL OR issued_by = $1) AND {status_predicate}
+         ORDER BY id DESC LIMIT $3"
+    );
+    let rows = client
+        .query_typed(
+            &statement,
+            &[
+                (&issuer, Type::TEXT),
+                (&i64_of(now)?, Type::INT8),
+                (&i64::try_from(limit).map_err(|_| StoreError)?, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    rows.iter().map(invite_from_row).collect()
+}
+
 async fn admin_list_invite_windows_on(
     client: &tokio_postgres::Client,
 ) -> Result<Vec<InviteWindow>, StoreError> {
@@ -6320,41 +6366,11 @@ impl Store for PgStore {
     ) -> Result<Vec<InviteRecord>, StoreError> {
         Self::bounded(
             async {
-                let client = self.connect().await?;
-                // The status filter mirrors `InviteRecord::status`
-                // exactly (redeemed > revoked > expired > active).
-                let status_predicate = match status {
-                    Some("redeemed") => "(redeemed_at IS NOT NULL OR used)",
-                    Some("revoked") => {
-                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NOT NULL)"
-                    }
-                    Some("expired") => {
-                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at <= $2)"
-                    }
-                    Some("active") => {
-                        "(redeemed_at IS NULL AND NOT used AND revoked_at IS NULL AND expires_at > $2)"
-                    }
-                    _ => "TRUE",
-                };
-                let statement = format!(
-                    "SELECT {INVITE_COLUMNS} FROM invite_codes \
-                     WHERE ($1::text IS NULL OR issued_by = $1) AND {status_predicate} \
-                     ORDER BY id DESC LIMIT $3"
-                );
-                let rows = client
-                    .query_typed(
-                        &statement,
-                        &[
-                            (&issuer, Type::TEXT),
-                            (&i64_of(now)?, Type::INT8),
-                            (&i64::try_from(limit).map_err(|_| StoreError)?, Type::INT8),
-                        ],
-                    )
+                admin_list_invites_on(&self.connect().await?, issuer, status, now, limit)
                     .await
                     .map_err(|_| {
                         self.statement_failed("api.db.statement_failed.admin_list_invites")
-                    })?;
-                rows.iter().map(invite_from_row).collect()
+                    })
             },
             TOTAL_TIMEOUT_MS,
         )

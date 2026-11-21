@@ -31,6 +31,8 @@ export interface LibraryRefreshUpdate {
 	authoritative: boolean;
 	/** The account purge ran before this empty snapshot was published. */
 	authBoundary: boolean;
+	/** Run collection dispatch/publication only for the current listing. */
+	runIfCurrent?: <T>(work: () => T) => Promise<T | undefined>;
 }
 
 export interface LibraryRefresherDeps {
@@ -93,7 +95,6 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		state.libraryUnavailable = false;
 		state.requiresSignIn = false;
 		let authoritative = false;
-		let authBoundary = false;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -218,6 +219,25 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			}, timeoutMs);
 		});
 
+		function publish(): void {
+			if (!isCurrent()) return;
+			state.loading = false;
+			deps.onStateChange?.(state, {
+				isCurrent, authoritative, authBoundary: false,
+				runIfCurrent: authoritative && authenticatedThisLoad
+					? async (work) => isCurrent() ? work() : undefined
+					: undefined
+			});
+		}
+
+		function restoreSnapshot(): void {
+			const snapshot = authenticatedThisLoad ? inMemorySnapshot ?? loadSnapshot(deps.sessionStorage()) : null;
+			if (!isCurrent()) return;
+			state.items = snapshot?.items ?? [];
+			state.staleAt = snapshot?.savedAt ?? null;
+			if (!snapshot) state.loadError = 'Library is not reachable right now.';
+		}
+
 		try {
 			deps.onStateChange?.(state, { isCurrent, authoritative: false, authBoundary: false });
 			if (!isCurrent()) return;
@@ -267,19 +287,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				return;
 			}
 			if (response.status === 401 || response.status === 403) {
-				authenticatedThisLoad = false;
-				inMemorySnapshot = null;
-				state.items = [];
-				state.staleAt = null;
-				state.requiresSignIn = response.status === 401;
-				state.loadError = state.requiresSignIn
-					? 'You are signed out or do not have access to this library.'
-					: 'You do not have access to this library.';
-				authoritative = true;
-				authBoundary = true;
-				if (deps.onAccessRefused) deps.onAccessRefused();
-				else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
-				deps.invalidateLibraryCache();
+				applyAuthTransition(response.status);
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
@@ -302,52 +310,41 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			authoritative = true;
 		} catch {
 			if (!isCurrent()) return;
-			// Do not trust a tab's snapshot until this page has verified its session.
-			const snapshot = authenticatedThisLoad
-				? (inMemorySnapshot ?? loadSnapshot(deps.sessionStorage()))
-				: null;
-			if (!isCurrent()) return;
-			if (snapshot) {
-				state.items = snapshot.items;
-				state.staleAt = snapshot.savedAt;
-			} else {
-				state.items = [];
-				state.staleAt = null;
-				state.loadError = 'Library is not reachable right now.';
-			}
+			restoreSnapshot();
 		} finally {
 			if (timeoutId !== undefined) clearTimeout(timeoutId);
 			controller.signal.removeEventListener('abort', onAbort);
 			activeResponse = null;
 			activeReader = null;
 			if (activeRequest === controller) activeRequest = null;
-			if (isCurrent()) {
-				state.loading = false;
-				deps.onStateChange?.(state, { isCurrent, authoritative, authBoundary });
-			}
+			publish();
 		}
 	}
 
 	/**
-	 * Shared local/delivered-transition reset: fence in-flight work (a late
-	 * response can neither repopulate the view nor overwrite the replacement
-	 * status), drop snapshots and memory, and enter the sign-in-required
-	 * presentation. Never requests, rebroadcasts, navigates or retries.
+	 * Invalidate the old receipt before purging and publishing the reset.
+	 * Only HTTP refusal notifies other tabs; a delivered transition never rebroadcasts.
 	 */
-	function applyAuthTransition(): void {
+	function applyAuthTransition(status?: 401 | 403): void {
 		if (disposed) return;
 		const isCurrent = startReceipt();
-		activeRequest?.abort();
+		if (!status) activeRequest?.abort();
 		if (!isCurrent()) return;
 		activeRequest = null;
 		authenticatedThisLoad = false;
 		inMemorySnapshot = null;
-		clearSnapshot(deps.sessionStorage());
+		if (status) {
+			if (deps.onAccessRefused) deps.onAccessRefused();
+			else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
+			deps.invalidateLibraryCache();
+		} else clearSnapshot(deps.sessionStorage());
 		if (!isCurrent()) return;
 		state.items = [];
 		state.staleAt = null;
-		state.requiresSignIn = true;
-		state.loadError = 'Your session changed. Sign in again to see this library.';
+		state.requiresSignIn = status !== 403;
+		state.loadError = status === 401 ? 'You are signed out or do not have access to this library.'
+			: status === 403 ? 'You do not have access to this library.'
+			: 'Your session changed. Sign in again to see this library.';
 		state.loading = false;
 		deps.onStateChange?.(state, { isCurrent, authoritative: true, authBoundary: true });
 	}

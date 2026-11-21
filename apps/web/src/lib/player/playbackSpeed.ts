@@ -22,23 +22,27 @@ export function parsePlaybackSpeed(raw: string | null): number {
 	return clampPlaybackSpeed(parsed);
 }
 
+type RateTarget = { playbackRate: number };
+
 export interface PlaybackSpeedDeps {
-	storage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null;
+	storage: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 	/** Current audio element; null/undefined when none is mounted. */
-	audio: () => { playbackRate: number } | null | undefined;
+	audio: () => RateTarget | null | undefined;
 	storageKey?: string;
 }
 
 export interface PlaybackSpeed {
-	/** The effective rate (persisted-or-default, then sets). */
+	/** The bounded preference for a future decoder. */
 	current(): number;
-	/** Clamp, apply to the current element, persist; returns the effective rate. */
+	/** Clamp, apply to the current element, persist; returns the live rate. */
 	set(rate: number): number;
-	/** Re-apply the current rate (for element swaps); returns the effective rate. */
+	/** Restore the cached preference without overwriting a newer one; returns the live rate. */
 	apply(): number;
+	/** Accept a new raw rate from the current decoder, or return undefined for feedback. */
+	observeNativeRate(element: RateTarget): number | undefined;
 	/**
 	 * Adopt a verified native rate without touching media (for `ratechange`
-	 * reconciliation); persists best-effort and returns the effective rate.
+	 * reconciliation); persists best-effort and returns the bounded preference.
 	 * Non-finite input keeps the previous rate and leaves storage untouched.
 	 */
 	adoptNativeRate(rate: number): number;
@@ -49,85 +53,94 @@ export function createPlaybackSpeed({
 	audio,
 	storageKey = PLAYBACK_SPEED_STORAGE_KEY
 }: PlaybackSpeedDeps): PlaybackSpeed {
-	let saved: string | null | undefined;
-	let current: number;
+	let lastSaved: string | null | undefined;
+	let liveRate = DEFAULT_PLAYBACK_SPEED;
+	let lastVerified: { element: RateTarget; rate: number } | undefined;
 	try {
-		current = parsePlaybackSpeed((saved = storage?.getItem(storageKey) ?? null));
+		lastSaved = storage.getItem(storageKey);
+		liveRate = parsePlaybackSpeed(lastSaved);
 	} catch {
-		current = DEFAULT_PLAYBACK_SPEED;
+		// No known storage baseline; keep the default in memory.
 	}
 
-	function persist(rate: number, passive = false): void {
+	function persist(rate: number, restoring = false): void {
 		try {
-			// A passive restore must not overwrite a newer choice from another tab.
-			if (!storage || (passive && storage.getItem(storageKey) !== saved)) return;
-			storage.setItem(storageKey, String(rate));
-			saved = String(rate);
+			// Best-effort compare, not an atomic cross-tab write. A restore may
+			// reconcile storage only if the value we based it on is still visible.
+			if (restoring && (lastSaved === undefined || storage.getItem(storageKey) !== lastSaved)) {
+				return;
+			}
+			const saved = String(clampPlaybackSpeed(rate));
+			storage.setItem(storageKey, saved);
+			lastSaved = saved;
 		} catch {
-			// Fail-soft: the rate still applies to audio below.
+			// Storage is optional; the live rate still works.
 		}
 	}
 
-	/**
-	 * Write a rate to the element and read back what actually applied. A
-	 * finite readback (clamped into range) becomes current and is persisted,
-	 * even when media rejected or clamped the request: storage holds the
-	 * verified actual rate, never an unapplied request. A throwing setter,
-	 * throwing getter or non-finite reading retains the previous rate,
-	 * leaves storage untouched and never throws.
-	 */
-	function writeAndVerify(request: number, passive = false): number {
-		let element: { playbackRate: number } | null | undefined;
+	function readCurrentRate(element: RateTarget): number | undefined {
+		if (audio() !== element) return;
+		const rate = element.playbackRate;
+		if (Number.isFinite(rate) && audio() === element) return rate;
+	}
+
+	/** Keep the raw readback for display, but persist only a bounded rate. */
+	function writeAndVerify(request: number, restoring = false): number {
 		try {
-			element = audio();
+			const element = audio();
+			if (!element) {
+				lastVerified = undefined;
+				if (!restoring) {
+					liveRate = clampPlaybackSpeed(request);
+					persist(liveRate);
+				}
+				return liveRate;
+			}
+			element.playbackRate = clampPlaybackSpeed(request);
+			const rate = readCurrentRate(element);
+			if (rate !== undefined) {
+				lastVerified = { element, rate };
+				liveRate = rate;
+				persist(rate, restoring);
+			}
 		} catch {
-			return current;
+			// An unverifiable write leaves the last rate and storage untouched.
 		}
-		if (!element) {
-			current = clampPlaybackSpeed(request);
-			persist(current);
-			return current;
+		return liveRate;
+	}
+
+	function adoptNativeRate(rate: number): number {
+		if (Number.isFinite(rate)) {
+			liveRate = rate;
+			persist(rate);
 		}
-		const clampedRequest = clampPlaybackSpeed(request);
-		try {
-			element.playbackRate = clampedRequest;
-		} catch {
-			return current;
-		}
-		let applied: number;
-		try {
-			applied = element.playbackRate;
-		} catch {
-			return current;
-		}
-		if (!Number.isFinite(applied)) return current;
-		current = clampPlaybackSpeed(applied);
-		persist(current, passive);
-		return current;
+		return clampPlaybackSpeed(liveRate);
 	}
 
 	return {
 		current() {
-			return current;
+			return clampPlaybackSpeed(liveRate);
 		},
 		set(rate: number) {
 			return writeAndVerify(rate);
 		},
 		apply() {
-			let element: { playbackRate: number } | null | undefined;
-			try {
-				element = audio();
-			} catch {
-				return current;
-			}
-			if (!element) return current;
-			return writeAndVerify(current, true);
+			return writeAndVerify(liveRate, true);
 		},
-		adoptNativeRate(rate: number) {
-			if (!Number.isFinite(rate)) return current;
-			current = clampPlaybackSpeed(rate);
-			persist(current);
-			return current;
-		}
+		observeNativeRate(element: RateTarget) {
+			try {
+				const rate = readCurrentRate(element);
+				if (rate === undefined) return;
+				// A queued event from a verified write reports the same raw rate.
+				// Compare raw values so 0.5 -> 0.25 is not lost to clamping.
+				if (lastVerified?.element === element && lastVerified.rate === rate) return;
+				lastVerified = { element, rate };
+				adoptNativeRate(rate);
+				return rate;
+			} catch {
+				// The current native rate could not be verified.
+			}
+		},
+		adoptNativeRate
 	};
 }
