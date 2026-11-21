@@ -30,6 +30,9 @@ test('Home previews up to five catalogue rows in order and links to Search', asy
 		'Your account listening history is not used to select or rank them.'
 	);
 	await expect(shelf.getByRole('heading', { name: 'From your library (6)' })).toBeVisible();
+	await expect(
+		page.getByRole('main').getByRole('heading', { name: 'From your library (6)', exact: true })
+	).toHaveCount(1);
 	await expect(shelf.getByRole('listitem')).toHaveText([
 		'Zulu — Example Artist',
 		'Echo — Example Artist',
@@ -87,6 +90,7 @@ test('Home shows loading and recovers from a transient catalogue failure', async
 		async (route) => {
 			await expect(shelf.getByRole('status')).toHaveText('Loading your library…');
 			await expect(shelf.getByRole('listitem')).toHaveCount(0);
+			await expect(shelf.getByRole('link', { name: 'Search your library' })).toHaveCount(0);
 			await route.fulfill({ status: 503, body: '' });
 		},
 		{ times: 1 }
