@@ -6772,14 +6772,13 @@ where
     if let Err(response) = check_playback_binding(&claims, expected_session_binding) {
         return response;
     }
-    match issue_play(
-        ctx,
-        &claims.user_id,
-        parse_body::<PlayIssueBody>(req),
-        expected_session_binding.is_some(),
-    )
-    .await
-    {
+    let body = parse_body::<PlayIssueBody>(req);
+    let issued = if expected_session_binding.is_some() {
+        issue_play(ctx, &claims.user_id, body, true).await
+    } else {
+        issue_play_for_user(ctx, &claims.user_id, body).await
+    };
+    match issued {
         Ok(issued) => issued.into_response(),
         Err(response) => response,
     }
@@ -8857,6 +8856,8 @@ mod tests {
         plan_caps_rows: RefCell<HashMap<String, crate::plan_limits::PlanCaps>>,
         /// One `playback_leases` row per user.
         playback_leases: RefCell<HashMap<String, crate::playback::LeaseRow>>,
+        /// Install a replacement after the handler reads the old holder.
+        takeover_before_next_lease_touch: RefCell<Option<crate::playback::LeaseRow>>,
         /// Deletion-marker race pin: when set, the next lease write
         /// (`acquire_playback_lease` / `touch_playback_lease`) first
         /// lands the named user in `deleting_users`, mirroring a marker
@@ -10019,6 +10020,9 @@ mod tests {
                 return Ok(false);
             }
             let mut leases = self.playback_leases.borrow_mut();
+            if let Some(holder) = self.takeover_before_next_lease_touch.take() {
+                leases.insert(user_id.into(), holder);
+            }
             match leases.get_mut(user_id) {
                 Some(row)
                     if row.is_live(now)
@@ -18992,6 +18996,35 @@ mod tests {
             .is_none());
         assert_eq!(h.store.playback_leases.borrow()[user], expired);
         assert_eq!(h.store.private_play_marks.borrow().len(), 1);
+    }
+
+    #[test]
+    fn bound_grant_renewal_does_not_overwrite_a_racing_takeover() {
+        use serde_json::{json, Value};
+        let h = play_harness();
+        let user = "user-plays-1";
+        let cookie = play_user(&h);
+        seed_entitled(&h, user, "plus", 100);
+        let binding = current_likes_binding(&h, &cookie);
+        let play = |body| bound_play_request(&h, &cookie, &binding, "POST", "/v1/plays", body);
+        let initial = play(json!({"session_id":"old-tab", "track_id":"track"}));
+        assert_eq!(initial.status, 200);
+        let initial: Value = serde_json::from_str(&initial.body).unwrap();
+        let mut replacement = h.store.playback_leases.borrow()[user].clone();
+        replacement.session_id = "new-tab".into();
+        replacement.play_id = "replacement-play".into();
+        replacement.epoch += 1;
+        *h.store.takeover_before_next_lease_touch.borrow_mut() = Some(replacement.clone());
+
+        let refused = play(json!({"session_id":"old-tab", "track_id":"track",
+            "play_id":initial["play_id"], "takeover":true}));
+        assert_eq!(refused.status, 409);
+        assert!(serde_json::from_str::<Value>(&refused.body)
+            .unwrap()
+            .get("grant")
+            .is_none());
+        assert!(h.store.takeover_before_next_lease_touch.borrow().is_none());
+        assert_eq!(h.store.playback_leases.borrow()[user], replacement);
     }
 
     // Adapted from PR #982: no compensation over a newer concurrent holder.
