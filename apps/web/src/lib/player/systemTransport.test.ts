@@ -12,9 +12,10 @@ class Decoder extends EventTarget {
 	isConnected = true;
 	paused = true;
 	ended = false;
-	error = null;
+	error: { code: number } | null = null;
 	constructor(readonly source: string) { super(); }
 	getAttribute() { return this.source; }
+	load = vi.fn(() => { this.error = null; });
 	play = vi.fn(async () => { this.paused = false; });
 	pause = vi.fn(() => { this.paused = true; });
 	get element() { return this as unknown as HTMLAudioElement; }
@@ -66,6 +67,26 @@ test('the native attachment publishes only Play/Pause and updates its current me
 	handler('pause')!();
 	expect(audio.pause).toHaveBeenCalledOnce();
 	expect(status()).toBe('paused');
+	media.destroy();
+});
+
+test('native and compact Play leave a terminal error for explicit Retry', async () => {
+	const { handler } = stubSession();
+	const { media, audio, status } = player();
+	audio.error = { code: 4 };
+	audio.dispatchEvent(new Event('error'));
+	expect(status()).toBe('error');
+
+	handler('play')!();
+	await media.playCurrent();
+	expect(audio.load).not.toHaveBeenCalled();
+	expect(audio.play).not.toHaveBeenCalled();
+	expect(status()).toBe('error');
+
+	await media.retryCurrent();
+	expect(audio.load).toHaveBeenCalledOnce();
+	expect(audio.play).toHaveBeenCalledOnce();
+	expect(status()).toBe('playing');
 	media.destroy();
 });
 

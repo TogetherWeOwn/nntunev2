@@ -47,12 +47,21 @@ class ProcessLossModel(RUNNER["StagingModel"]):
 
     def __init__(self):
         super().__init__()
+        self.off_readback_at = None
         self.backend_samples = []
 
+    def readback(self):
+        deployment = super().readback()
+        if deployment.verified_off() and self.off_readback_at is None:
+            self.off_readback_at = self.now
+        return deployment
+
     def telemetry(self):
-        backends = int(self.now < self.drain_at)
         if self.pending or not self.state.verified_off():
             raise SystemExit("backend sampled before synthetic stop and restore")
+        if self.off_readback_at is None or self.now <= self.off_readback_at:
+            raise SystemExit("backend sampled at or before synthetic off readback")
+        backends = int(self.now < self.drain_at)
         self.backend_samples.append((self.now, backends))
         return self.now, True, backends
 

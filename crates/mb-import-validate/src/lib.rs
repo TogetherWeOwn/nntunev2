@@ -666,6 +666,7 @@ fn is_time(time: &str) -> bool {
 pub mod aliases;
 pub mod relationships;
 pub mod release_credits;
+pub mod works;
 
 #[cfg(test)]
 mod tests {
