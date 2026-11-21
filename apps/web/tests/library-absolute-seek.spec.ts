@@ -12,6 +12,7 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	const region = page.getByRole('region', { name: 'Player', exact: true });
 	const audio = page.getByTestId('audio-player');
 	const slider = region.getByRole('slider', { name: 'Seek', exact: true });
+	const favorite = region.getByTestId('player-favorite');
 	await rangeResponse;
 	await expect(slider).toBeEnabled();
 	await expect(audio).toHaveCount(1);
@@ -35,6 +36,7 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	const sought = await read();
 	expect(sought.currentTime / sought.duration).toBeCloseTo(0.55, 1);
 	await expect(slider).toHaveAttribute('aria-valuetext', `0:${String(Math.floor(sought.currentTime)).padStart(2, '0')} of 0:16`);
+	await expect(favorite).toBeEnabled();
 	await slider.focus();
 	for (const [key, seconds] of [['Home', 0], ['ArrowRight', 1]] as const) {
 		await page.keyboard.press(key);
@@ -82,6 +84,11 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	await expectTime(sought.duration);
 	await expect(audio).toHaveJSProperty('paused', true);
 	await expect(slider).toHaveAttribute('aria-valuetext', '0:16 of 0:16');
+	await favorite.click();
+	await expect(favorite).toHaveAttribute('aria-pressed', 'true');
+	await expect(region.getByTestId('player-favorite-status')).toHaveText('Starred Coral.');
+	await expectTime(sought.duration);
+	expect(await audio.evaluate((el, original) => el === original, firstAudio)).toBe(true);
 	expect(nonMedia).toEqual([]);
 	let release!: () => void;
 	const held = new Promise<void>((resolve) => { release = resolve; });

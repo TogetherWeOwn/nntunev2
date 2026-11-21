@@ -166,7 +166,7 @@
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = $state(false);
 	let favoritesAuthKey: string | null = null;
-	let currentFavoriteEdit = $state(0);
+	let currentFavoriteEdit = $state(0), favoriteRefreshFailures = $state(0);
 	let favoriteEdit = 0;
 	let favoriteBaseline: readonly string[] = [];
 	let favoritesAnnouncement = $state('');
@@ -405,7 +405,7 @@
 					recentFindsInitialized = true;
 				}
 				applyShareLink();
-			} else if (!state.loading) currentFavoriteEdit++; // Retire results on terminal failures, including cached fallback.
+			} else if (!state.loading) favoriteRefreshFailures++; // Retire feedback without invalidating pending writes.
 			if (!isCurrent()) return;
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
@@ -806,8 +806,7 @@
 		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection; loaded: ReadonlySet<string> },
 		playerWrite = false
 	): Promise<FavoriteWrite> {
-		const session = browserStorage('session');
-		const key = playerWrite ? favoritesAuthKey : favoritesKey(session);
+		const session = browserStorage('session'), key = playerWrite ? favoritesAuthKey : favoritesKey(session);
 		const ownsWrite = () => shareAlive && favoritesInitialized && favoritesAuthKey === key;
 		const edit = ++favoriteEdit;
 		const before = favorites;
@@ -818,12 +817,17 @@
 		};
 		favorites = [...optimistic];
 		notePublication(before, favorites);
-		let base = before;
+		const selection = queueController.selectionGeneration, membership = currentFavoriteEdit;
+		const stale = () => playerWrite && (selection !== queueController.selectionGeneration || membership !== currentFavoriteEdit);
+		let base = before, superseded = false;
 		return updateStoredFavorites(session, browserStorage('local'), key, (latest) => {
 			base = latest;
-			return !playerWrite || ownsWrite() ? update(latest) : latest;
+			return (superseded = stale() || (playerWrite && !ownsWrite())) ? latest : update(latest);
 		}).then((committed) => {
 			if ((playerWrite && !ownsWrite()) || favoritesKey(session) !== key) return null;
+			superseded ||= !committed && stale();
+			if (superseded && edit === favoriteEdit) { notePublication(favorites, before); favorites = before; }
+			if (superseded) return null;
 			const wrote = committed !== null && JSON.stringify(base) !== JSON.stringify(committed);
 			if (edit !== favoriteEdit) {
 				if (wrote) favoriteBaseline = update(favoriteBaseline);
@@ -866,17 +870,14 @@
 		});
 	}
 
-	function setFavorite(id: string, pressed: boolean, playerWrite = false): Promise<FavoriteWrite> {
-		favoritesAnnouncement = '';
-		return editFavorites((latest) => pressed ? [...new Set([...latest, id])] : latest.filter((favorite) => favorite !== id), undefined, undefined, playerWrite);
-	}
-
-	function toggleFavorite(id: string): void {
+	function toggleFavorite(id: string, playerWrite = false): Promise<FavoriteWrite> {
 		const remove = favorites.includes(id);
-		void setFavorite(id, !remove);
+		const write = editFavorites((latest) => remove ? latest.filter((favorite) => favorite !== id) : [...new Set([...latest, id])], undefined, undefined, playerWrite);
+		favoritesAnnouncement = '';
 		// Favorites-only unmounts an unstarred row, including its focused button.
 		// All-tracks keeps that button mounted and must leave focus alone.
-		if (view === 'favorites' && remove) focusLibraryView();
+		if (!playerWrite && view === 'favorites' && remove) focusLibraryView();
+		return write;
 	}
 
 	function focusLibraryView(): void {
@@ -1522,12 +1523,11 @@
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
-		const readPlayerFavorites = (id: string) => shareAlive && favoritesInitialized && !libraryUnavailable && loadError === null &&
-			queueController.hasLibraryTrack(id) && favoritesKey(browserStorage('session')) === favoritesAuthKey
-				? { pressed: favoriteIds.has(id), edit: currentFavoriteEdit, loading } : null;
 		const releaseFavoriteAction = player.currentFavorite.bind({
-			read: readPlayerFavorites,
-			write: async (id, pressed) => readPlayerFavorites(id)?.loading === false ? setFavorite(id, pressed, true) : null
+			read: (id) => shareAlive && favoritesInitialized && !libraryUnavailable && loadError === null &&
+				queueController.hasLibraryTrack(id) && favoritesKey(browserStorage('session')) === favoritesAuthKey
+					? { pressed: favoriteIds.has(id), edit: currentFavoriteEdit + favoriteRefreshFailures, loading } : null,
+			write: (id) => toggleFavorite(id, true)
 		});
 		disposeRoute = () => {
 			releaseFavoriteAction();
