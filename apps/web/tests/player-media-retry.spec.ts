@@ -52,6 +52,11 @@ test('keyboard Retry resumes real audio on the same decoder without automatic or
 		await expect(retry).toBeFocused();
 		await page.keyboard.press('Enter');
 		await expect(audio).toHaveAttribute('data-loads', '1');
+		await page.keyboard.press('Shift+Slash');
+		await expect(page.getByTestId('shortcuts-close')).toBeFocused();
+		await page.keyboard.press('Escape');
+		await expect(page.getByTestId('shortcuts-button')).toBeFocused();
+		await retry.focus();
 		release.resolve();
 		await expect(status).toHaveText('Playing');
 		await expect(pause).toBeFocused();

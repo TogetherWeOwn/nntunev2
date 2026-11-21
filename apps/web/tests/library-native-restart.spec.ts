@@ -42,7 +42,7 @@ import { expect, test, type ElementHandle, type Page, type TestInfo } from '@pla
  *   identity, `playbackRate` and `volume` are preserved; `play()`,
  *   `pause()` and `load()` are never called by the gesture; no track
  *   advance and no completion/ended accounting. NO global keyboard
- *   shortcut is added (the demo `0` binding does not exist here).
+ *   shortcut restarts the track outside the player.
  * - An explicit restart SUPERSEDES any pending/remembered inbound-share
  *   seek for that source: later loadedmetadata/durationchange/canplay
  *   events for the same source must not move the position away from 0.
