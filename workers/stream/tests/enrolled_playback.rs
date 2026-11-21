@@ -13,6 +13,9 @@ use nntune_stream::{
     s3_range_response::S3RangeResponse,
 };
 
+#[path = "enrolled_playback/refusals.rs"]
+mod refusals;
+
 struct Body<'a>(&'a [u8]);
 impl ReadbackBody for Body<'_> {
     async fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
