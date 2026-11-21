@@ -49,40 +49,34 @@ export const LIBRARY_FAVORITES_KEY = 'nntune.library.favorites.v1';
  */
 export const LIBRARY_RECENT_FINDS_KEY = 'nntune.library.recent-finds.v1';
 
-export function libraryScopeBinding(session: SnapshotStorage | null): string | null {
+function provenance(session: SnapshotStorage | null): [string, string] | null {
 	try {
 		const context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY);
 		const proof: unknown = JSON.parse(session?.getItem(LIBRARY_SESSION_BINDING_KEY) ?? 'null');
 		return context && Array.isArray(proof) && proof.length === 2 && proof[0] === context &&
-			typeof proof[1] === 'string' && proof[1] ? proof[1] : null;
+			typeof proof[1] === 'string' && proof[1] ? [context, proof[1]] : null;
 	} catch { return null; }
 }
 
-/** Recheck provenance at use time; a label binding alone never authorizes import. */
+export const libraryScopeBinding = (session: SnapshotStorage | null) => provenance(session)?.[1] ?? null;
+
+/** A verified account label alone never authorizes import. */
 export function verifiedFavoritesKey(session: SnapshotStorage | null, binding: string): string | null {
-	try {
-		const context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY);
-		return context && libraryScopeBinding(session) === binding
-			? `${LIBRARY_FAVORITES_KEY}.${context}` : null;
-	} catch {
-		return null;
-	}
+	const proof = provenance(session);
+	return proof && proof[1] === binding ? `${LIBRARY_FAVORITES_KEY}.${proof[0]}` : null;
 }
 
-/** After current-session verification, bind only a newly minted, unused scope. */
-export function establishVerifiedLibraryScope(
-	session: SnapshotStorage | null,
-	local: SnapshotStorage | null,
-	binding: string
-): void {
+/** After verification, bind only a newly minted, unused scope. */
+export function establishVerifiedLibraryScope(session: SnapshotStorage | null, binding: string): string | undefined {
 	try {
-		if (!session || session.getItem(LIBRARY_AUTH_CONTEXT_KEY)) return;
-		const context = crypto.randomUUID();
-		if (local?.getItem(`${LIBRARY_FAVORITES_KEY}.${context}`) !== null) return;
+		if (!session || session.getItem(LIBRARY_AUTH_CONTEXT_KEY)) return verifiedFavoritesKey(session, binding) ?? undefined;
+		const context = crypto.randomUUID(), key = `${LIBRARY_FAVORITES_KEY}.${context}`;
+		if (browserStorage('local')?.getItem(key) !== null) return;
 		// Publish the context last; a failed write leaves no usable provenance.
 		session.setItem(LIBRARY_SESSION_BINDING_KEY, JSON.stringify([context, binding]));
 		session.setItem(LIBRARY_AUTH_CONTEXT_KEY, context);
-	} catch { /* No import provenance without readable and writable storage. */ }
+		return verifiedFavoritesKey(session, binding) ?? undefined;
+	} catch { return undefined; }
 }
 
 function snapshotKey(storage: SnapshotStorage | null, createContext = false): string | null {

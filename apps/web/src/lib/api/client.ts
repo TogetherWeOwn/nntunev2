@@ -244,16 +244,10 @@ export interface CredentialsList {
 	credentials: ListedCredential[];
 }
 
-// These POSTs can install, rotate or clear the browser's session cookie.
-// Start/challenge requests and native bearer management do not change it.
+// Challenge starts and native bearer management do not change the browser cookie.
 const COOKIE_MUTATIONS = new Set([
-	'/v1/auth/magic/finish',
-	'/v1/auth/passkey/register/finish',
-	'/v1/auth/passkey/login/finish',
-	'/v1/session/reauthenticate/finish',
-	'/v1/session/refresh',
-	'/v1/session/logout',
-	'/v1/session/revoke-all'
+	'/v1/auth/magic/finish', '/v1/auth/passkey/register/finish', '/v1/auth/passkey/login/finish',
+	'/v1/session/reauthenticate/finish', '/v1/session/refresh', '/v1/session/logout', '/v1/session/revoke-all'
 ]);
 
 export class ApiClient {

@@ -6,6 +6,7 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import {
+		favoritesKey,
 		loadFavorites,
 		saveFavorites,
 		selectFavoriteItems
@@ -86,11 +87,13 @@
 			predecessor: previousIndex > 0 ? previous[previousIndex - 1] : null,
 			successor: previousIndex < previous.length - 1 ? previous[previousIndex + 1] : null
 		};
+		const key = favoritesKey(session);
 		persistChange(id, (ids) => ids.filter((entry) => entry !== id));
 		pushToast(`Removed “${title}” from Liked.`, {
 			action: {
 				label: 'Undo',
 				run: () => {
+					if (!key || key !== favoritesKey(session)) return;
 					// Restore only this track against the stored list, so a
 					// navigation or another tab's save is never overwritten,
 					// and anchor on the surviving successor so adjacent Undos

@@ -1,8 +1,8 @@
 import { PUBLIC_API_BASE_URL } from '$app/env/public';
 import { ApiClient, ApiError } from '../api/client.js';
 import { captureAuthFence } from '../auth-fence.js';
+import { clearToasts } from '../shell/toasts.js';
 import {
-	browserStorage,
 	clearSnapshot,
 	establishVerifiedLibraryScope,
 	LIBRARY_AUTH_TRANSITION_KEY,
@@ -10,7 +10,6 @@ import {
 	loadSnapshot,
 	saveSnapshot,
 	toLibraryItems,
-	verifiedFavoritesKey,
 	type LibraryItem,
 	type LibrarySnapshot,
 	type SnapshotStorage
@@ -38,10 +37,8 @@ export interface LibraryRefreshUpdate {
 	authoritative: boolean;
 	/** Library access is suspended or the scope was revoked. */
 	authBoundary: boolean;
-	/** Verified binding for these Library rows; not device import provenance. */
-	sessionBinding?: string;
-	/** Exact localStorage favorites key eligible for the verified binding. */
-	deviceScope?: string;
+	sessionBinding?: string; // Verified label for the rows, not import provenance.
+	deviceScope?: string; // Exact localStorage key eligible for the verified binding.
 }
 
 export interface LibraryRefresherDeps {
@@ -53,15 +50,18 @@ export interface LibraryRefresherDeps {
 	onAccessRefused?: () => void;
 	/** Called after state mutations so the page can mirror them reactively. */
 	onStateChange?: (state: LibraryRefreshState, update: LibraryRefreshUpdate) => void;
-	verifySession?: (binding: string, signal: AbortSignal) => Promise<boolean>;
 	timeoutMs?: number;
 }
 
+// The API encodes a SHA-256 digest as unpadded base64url.
+const validBinding = (value: unknown): value is string => typeof value === 'string' && /^[\w-]{43}$/.test(value);
+
 async function verifyLibrarySession(binding: string, signal: AbortSignal): Promise<boolean> {
 	try {
-		const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal });
-		const result = await client.get<{ session_binding?: unknown }>('/v1/me/likes/session');
-		return result?.session_binding === binding;
+		const result = await new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal })
+			.get<{ session_binding?: unknown }>('/v1/me/likes/session');
+		if (!validBinding(result?.session_binding)) throw new Error('Missing verified session binding');
+		return result.session_binding === binding;
 	} catch (error) {
 		if (error instanceof ApiError && (error.status === 401 || error.status === 403)) return false;
 		throw error;
@@ -119,7 +119,6 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		let authoritative = false;
 		let authBoundary = false;
 		let binding: string | null = null;
-		let deviceScope: string | undefined;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -244,16 +243,14 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			}, timeoutMs);
 		});
 
-		function publish(): void {
+		function publish(sessionBinding?: string, deviceScope?: string): void {
 			if (!isCurrent()) return;
 			if (activeRequest === controller) activeRequest = null;
 			state.loading = false;
 			const fence = verified?.fence;
 			deps.onStateChange?.(state, {
 				isCurrent: () => isCurrent() && (!fence || fence.isCurrent()),
-				authoritative, authBoundary,
-				sessionBinding: authoritative ? binding ?? undefined : undefined,
-				deviceScope
+				authoritative, authBoundary, sessionBinding, deviceScope
 			});
 		}
 
@@ -335,12 +332,16 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const storage = deps.sessionStorage();
 			if (!isCurrent()) return;
 			const previous = verified?.binding ?? libraryScopeBinding(storage);
+			if ((previous || binding !== null) && !validBinding(binding)) return void refuse();
 			if (previous && previous !== binding) {
-				if (!binding || !await fence?.run(() => !controller.signal.aborted && refuse(true))) refuse();
-				return;
+				if (await fence?.run(() => !controller.signal.aborted && refuse(true))) return;
+				return void refuse();
 			}
 			const payload = await Promise.race([readJsonBody(response), timeout, aborted]);
-			if (!isCurrent() || controller.signal.aborted) return;
+			if (!isCurrent() || controller.signal.aborted) {
+				cancelResponse(response);
+				return;
+			}
 			activeResponse = null;
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
@@ -355,11 +356,10 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			};
 			if (!binding) return commit();
 			const label = binding;
-			const verify = deps.verifySession ?? verifyLibrarySession;
 			// Start verification under the lock, but never hold it over the wire.
 			const started = await fence?.run(() => {
 				if (!isCurrent() || controller.signal.aborted) return;
-				const result = Promise.race([verify(label, controller.signal), timeout, aborted]);
+				const result = Promise.race([verifyLibrarySession(label, controller.signal), timeout, aborted]);
 				void result.catch(() => {}); // The lock request may resolve after the verifier.
 				return { result };
 			});
@@ -368,11 +368,10 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			if (!await fence.run(() => {
 				if (!isCurrent() || controller.signal.aborted) return true;
 				if (!matches) return refuse(true);
-				establishVerifiedLibraryScope(storage, browserStorage('local'), label);
-				deviceScope = verifiedFavoritesKey(storage, label) ?? undefined;
+				const deviceScope = establishVerifiedLibraryScope(storage, label);
 				verified = { binding: label, fence };
 				commit();
-				publish();
+				publish(label, deviceScope);
 				return true;
 			})) refuse();
 		} catch {
@@ -384,9 +383,10 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				state.staleAt = snapshot?.savedAt ?? null;
 				if (!snapshot) state.loadError = 'Library is not reachable right now.';
 			};
-			if (verified) {
+			if (binding !== null) refuse();
+			else if (verified) {
 				if (!await verified.fence.run(() => { fallback(); publish(); return true; })) refuse();
-			} else if (binding) refuse(); else fallback();
+			} else fallback();
 		} finally {
 			if (timeoutId !== undefined) clearTimeout(timeoutId);
 			controller.signal.removeEventListener('abort', onAbort);
@@ -404,6 +404,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	 * presentation. Never requests, rebroadcasts, navigates or retries.
 	 */
 	function notifyAccessRefused(): void {
+		clearToasts();
 		if (deps.onAccessRefused) deps.onAccessRefused();
 		else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
 	}
@@ -418,12 +419,13 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		verified = undefined;
 		inMemorySnapshot = null;
 		if (replaced) clearSnapshot(deps.sessionStorage());
-		if (notify) notifyAccessRefused();
+		if (replaced && notify) notifyAccessRefused();
 		if (!isCurrent()) return;
 		state.items = [];
 		state.staleAt = null;
-		state.requiresSignIn = true;
-		state.loadError = 'Your session changed. Sign in again to see this library.';
+		state.requiresSignIn = replaced;
+		state.loadError = replaced ? 'Your session changed. Sign in again to see this library.'
+			: 'Could not verify your library session. Try again.';
 		state.loading = false;
 		deps.onStateChange?.(state, { isCurrent, authoritative: true, authBoundary: true });
 	}

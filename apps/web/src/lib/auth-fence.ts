@@ -9,25 +9,26 @@ function generation(): string | null {
 	catch { return null; }
 }
 
-async function tryLock<T>(work: () => T): Promise<T | undefined> {
+async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 	try {
-		return await globalThis.navigator?.locks?.request(AUTH_LOCK, { ifAvailable: true },
+		return await globalThis.navigator?.locks?.request(AUTH_LOCK, { mode: 'shared', ifAvailable: true },
 			(lock) => lock && !pending ? work() : undefined);
 	} catch { return undefined; }
 }
 
 /** Use run() for trusted dispatch, publication and storage commits, not just a receipt check. */
 export function captureAuthFence() {
-	if (typeof window === 'undefined' || !globalThis.navigator?.locks) return;
-	return tryLock(() => {
-		let id = generation();
-		if (!id) {
-			id = crypto.randomUUID();
-			window.localStorage.setItem(AUTH_GENERATION_KEY, id);
-		}
-		const epoch = localEpoch;
-		const isCurrent = () => !pending && epoch === localEpoch && generation() === id;
-		return { isCurrent, run: <T>(work: () => T) => tryLock(() => isCurrent() ? work() : undefined) };
+	const locks = globalThis.navigator?.locks;
+	if (!locks || typeof window === 'undefined' || !('localStorage' in window)) return;
+	const epoch = localEpoch;
+	return readLock(async () => {
+		// Initialize once, while the outer shared lock excludes cookie writes.
+		if (!generation()) await locks.request(`${AUTH_LOCK}.init`, () => {
+			if (!generation()) window.localStorage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID());
+		});
+		const id = generation();
+		const isCurrent = () => !!id && !pending && epoch === localEpoch && generation() === id;
+		if (isCurrent()) return { isCurrent, run: <T>(work: () => T) => readLock(() => isCurrent() ? work() : undefined) };
 	});
 }
 
