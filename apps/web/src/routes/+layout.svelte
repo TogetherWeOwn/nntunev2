@@ -531,7 +531,8 @@
 	{#if page.route.id === null}
 		{@render appBody()}
 	{:else}
-		<AppPlayer {claimShareEntry} children={appBody} signedOut={page.route.id === '/account/billing' && page.data.signedOut === true} />
+		<AppPlayer {claimShareEntry} children={appBody} allowDesktopRow={page.route.id !== '/now-playing'}
+			signedOut={page.route.id === '/account/billing' && page.data.signedOut === true} />
 	{/if}
 	{#if miniHint && page.route.id !== '/now-playing'}
 		<div class="nt-miniplayer nt-wrap" data-testid="mini-player">

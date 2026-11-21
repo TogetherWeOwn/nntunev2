@@ -48,10 +48,6 @@
 		onpointerdown={() => { pointerReplay = true; }} oninput={input} onkeydown={keydown} />
 	<span aria-hidden="true">{total ?? '—'}</span>
 </div>
-<p class="nt-seek-feedback" aria-live="polite" aria-atomic="true">
-	{#if state.seeking}<span aria-hidden="true">Seeking… </span>{/if}
-	{#key state.feedbackVersion}{#if state.feedback}<span>{state.feedback}</span>{/if}{/key}
-</p>
 
 <style>
 	.nt-player-seek {
@@ -61,7 +57,6 @@
 		gap: var(--nt-space-2);
 		font-variant-numeric: tabular-nums;
 	}
-	.nt-seek-feedback:empty { margin: 0; }
 	input {
 		width: 100%;
 		min-height: 2.75rem;
