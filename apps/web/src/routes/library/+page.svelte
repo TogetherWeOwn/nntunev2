@@ -62,6 +62,7 @@
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
+	import LibraryQueueHost from './LibraryQueueHost.svelte';
 	import ContextMenu from '#lib/interactions/ContextMenu.svelte';
 	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '#lib/interactions/context-menu.js';
 	import { startTrackDrag, endTrackDrag } from '#lib/interactions/track-drag.js';
@@ -245,6 +246,8 @@
 	 * same-account refreshes preserve it. Never persisted or fetched.
 	 */
 	let queueFilterQuery = $state('');
+	let playerQueue = $state<ReturnType<typeof PlayerQueue>>();
+	const showQueue = $derived(queue.tracks.length > 0 || retainedQueueWithoutListing || (!libraryUnavailable && items.length > 0));
 	/**
 	 * True only when a refresh starts while the filter input holds focus.
 	 * A branch swap (error/empty) unmounts the panel, so completion restores
@@ -492,11 +495,13 @@
 	function queuedTrackFor(item: LibraryItem): Track {
 		// Library display fields only: the bulk append and the favorites
 		// export snapshot never carry a stream URL.
+		const album = typeof item.release === 'string' ? item.release.trim() : '';
 		return {
 			id: item.id,
 			title: displayTitle(item),
 			...(typeof item.title !== 'string' || !item.title.trim() ? { titleIsFallback: true } : {}),
 			artist: displayArtist(item) ?? '',
+			...(album ? { album } : {}),
 			streamUrl: ''
 		};
 	}
@@ -603,6 +608,14 @@
 	}
 
 	function resetShareAtAuthBoundary(): void {
+		if (typeof document !== 'undefined' && document.activeElement?.closest('#library-queue-panel')) {
+			void tick().then(() => {
+				if (!shareAlive || document.activeElement !== document.body) return;
+				const recovery = showingTracks ? refreshButton
+					: document.querySelector<HTMLAnchorElement>('section[aria-label="Library collections"] a[href="/login"]');
+				recovery?.focus();
+			});
+		}
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 		if (queueController.snapshot.tracks.length) queueConfirmGeneration += 1;
@@ -1583,7 +1596,8 @@
 		</div>
 	{/if}
 
-	<div data-testid="queue-share-status" aria-live="polite" aria-atomic="true">{queueShareStatus}</div>
+{#snippet queueShareFeedback()}
+	<div data-testid="queue-share-status" aria-live="polite" aria-atomic="true">{#key queueShareOutcome}{queueShareFallbackUrl ? 'Queued track link available to copy manually.' : queueShareStatus}{/key}</div>
 	{#if queueShareFallbackUrl}
 		<div class="nt-library-share-fallback">
 			<label for="queue-share-url">Queued track link</label>
@@ -1599,6 +1613,7 @@
 			</p>
 		</div>
 	{/if}
+{/snippet}
 
 	{#if loading && items.length === 0}
 		<p role="status" hidden={!showingTracks}>Loading your library…</p>
@@ -1976,7 +1991,8 @@
 		{/if}
 		</div>
 	{/if}
-		{#if queue.tracks.length > 0 || retainedQueueWithoutListing || (!libraryUnavailable && items.length > 0)}
+	<LibraryQueueHost available={showQueue} {density} dismissMenu={() => playerQueue?.dismissTrackMenu()}>
+		{#if showQueue}
 			<!--
 				The queue panel stays mounted across background refreshes (its
 				rows remain readable while the new list loads), but its four
@@ -1986,6 +2002,7 @@
 				focus are untouched; the roles return with the fresh list.
 			-->
 			<PlayerQueue
+				bind:this={playerQueue}
 				state={queue}
 				announcement={player.queueAnnouncement.text}
 				announcementVersion={player.queueAnnouncement.version}
@@ -2014,8 +2031,10 @@
 				onkeepcurrentandupcoming={trimPreviousTracks}
 				onclearupcoming={trimUpcomingTracks}
 			/>
-			<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />
 		{/if}
+		{@render queueShareFeedback()}
+		{#if showQueue}<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />{/if}
+	</LibraryQueueHost>
 
 	{#if (!loading && !loadError) || items.length > 0}
 		<button
@@ -2097,10 +2116,10 @@
 		white-space: nowrap;
 		border: 0;
 	}
-	main {
+	main, :global(.nt-library-queue) {
 		--nt-library-row-padding: 0.25rem;
 	}
-	main[data-density='compact'] {
+	main[data-density='compact'], :global(.nt-library-queue[data-density='compact']) {
 		--nt-library-row-padding: 0;
 	}
 	.nt-library-repeat {
@@ -2153,10 +2172,10 @@
 	}
 	/* Density only changes row whitespace, never the controls or their order.
 	 * The ancestor scope keeps the shared queue's other hosts unchanged. */
-	main :global(.queue-row) {
+	:global(.nt-library-queue .queue-row) {
 		padding-block: var(--nt-library-row-padding);
 	}
-	main :global(.queue-row button:not(.queue-star, .queue-grip, .queue-more)) {
+	:global(.nt-library-queue .queue-row button:not(.queue-star, .queue-grip, .queue-more)) {
 		min-width: 24px;
 		min-height: 24px;
 	}
@@ -2249,6 +2268,7 @@
 		flex-wrap: wrap;
 		padding: 0;
 	}
+	.nt-favorite-row, .nt-shelf-unstar { overflow-wrap: anywhere; }
 	.nt-favorite-row {
 		display: block;
 		flex: 1 1 auto;

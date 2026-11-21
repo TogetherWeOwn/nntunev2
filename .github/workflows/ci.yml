@@ -329,6 +329,27 @@ jobs:
         run: python3 scripts/test_genre_root_coverage.py
       - name: Test bounded process-group cleanup
         run: python3 workers/api/tests/test_process_group.py
+      # No staging environment or network. exec lets Actions signal the
+      # actual fixture process, not a shell waiting for its child.
+      - name: Fail an armed synthetic Subsonic step
+        id: subsonic_failure
+        continue-on-error: true
+        run: exec python3 -I scripts/test-subsonic-actions-cleanup.py arm failure "$RUNNER_TEMP/subsonic-failure.json"
+      - name: Verify Subsonic finalization after step failure
+        if: ${{ always() }}
+        env:
+          STEP_OUTCOME: ${{ steps.subsonic_failure.outcome }}
+        run: python3 -I scripts/test-subsonic-actions-cleanup.py finalize failure "$RUNNER_TEMP/subsonic-failure.json" --outcome "$STEP_OUTCOME"
+      - name: Time out an armed synthetic Subsonic step
+        id: subsonic_timeout
+        continue-on-error: true
+        timeout-minutes: 1
+        run: exec python3 -I scripts/test-subsonic-actions-cleanup.py arm timeout "$RUNNER_TEMP/subsonic-timeout.json"
+      - name: Verify Subsonic finalization after native step timeout
+        if: ${{ always() }}
+        env:
+          STEP_OUTCOME: ${{ steps.subsonic_timeout.outcome }}
+        run: python3 -I scripts/test-subsonic-actions-cleanup.py finalize timeout "$RUNNER_TEMP/subsonic-timeout.json" --outcome "$STEP_OUTCOME"
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -794,7 +815,8 @@ jobs:
           done
           inventory_billing="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres -- --list)"
           printf '%s\n' "$inventory_billing"
-          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 25
+          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 26
+          printf '%s\n' "$inventory_billing" | grep -Fx 'exact_paid_periods_preserve_gaps_and_only_hydrate_owned_history: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'parent_delete_waits_for_subscription_exclusion: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'coupled_fixture_waits_for_raw_insert_commit_or_rollback: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'coupled_sql_relation_is_transformed_only_for_the_trusted_schema: test'

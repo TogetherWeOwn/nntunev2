@@ -349,6 +349,7 @@ test('keyboard Play and Pause keep the range-capable native decoder and position
 	const pausedAt = await time();
 	await openHome(page);
 	await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();
+	await expect(page.getByTestId('library-item')).toBeVisible();
 	await expect(status).toHaveText('Paused');
 	await expect(native).toHaveAttribute('data-starts', '1');
 	expect(await time()).toBeCloseTo(pausedAt, 3);
@@ -363,13 +364,14 @@ test('keyboard Play and Pause keep the range-capable native decoder and position
 	await expect(page.locator('audio')).toHaveCount(1);
 });
 
-test('a terminal native resource error disables compact Play but keeps native controls', async ({ page }) => {
+test('a terminal native resource error offers explicit recovery and keeps native controls', async ({ page }) => {
 	await servePlaybackLibrary(page);
 	await page.route('**/api/demo/audio?track=coral', (route) => route.fulfill({ status: 404, body: '' }));
 	await page.goto(`/library?track=${playbackFixture.id}&t=2`);
 	const player = page.getByRole('region', { name: 'Player', exact: true });
-	await expect(player.getByRole('status')).toHaveText('This audio could not be loaded or played. Choose another track.');
-	await expect(player.getByRole('button', { name: 'Play', exact: true })).toBeDisabled();
+	await expect(player.getByRole('status')).toContainText('This audio could not be loaded or played.');
+	await expect(player.getByRole('button', { name: 'Play', exact: true })).toHaveCount(0);
+	await expect(player.getByRole('button', { name: 'Retry playback', exact: true })).toBeEnabled();
 	const native = player.locator('audio[controls][data-testid="audio-player"]');
 	await expect(native).toBeVisible();
 	expect(await native.evaluate((node: HTMLAudioElement) => node.error !== null)).toBe(true);
