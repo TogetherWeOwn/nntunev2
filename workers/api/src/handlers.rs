@@ -2176,17 +2176,51 @@ fn session_binding(claims: &SessionClaims) -> String {
     b64url_encode(&hash.finalize())
 }
 
-// Headerless callers keep their existing wire contract. The web player must
-// always send the binding from its verified Library receipt, not rebind to
-// whichever cookie happens to be current at the time of a write.
-fn check_playback_binding(claims: &SessionClaims, expected: Option<&str>) -> Result<(), Response> {
-    if expected.is_some_and(|value| value != session_binding(claims)) {
+fn require_session_binding(
+    claims: &SessionClaims,
+    expected: Option<&str>,
+) -> Result<String, Response> {
+    let binding = session_binding(claims);
+    if expected != Some(binding.as_str()) {
         return Err(json_response(
             412,
             serde_json::json!({"error": "session binding mismatch"}),
         ));
     }
+    Ok(binding)
+}
+
+// Headerless callers keep their existing wire contract. The web player must
+// always send the binding from its verified Library receipt, not rebind to
+// whichever cookie happens to be current at the time of a write.
+fn check_playback_binding(claims: &SessionClaims, expected: Option<&str>) -> Result<(), Response> {
+    if let Some(binding) = expected {
+        require_session_binding(claims, Some(binding))?;
+    }
     Ok(())
+}
+
+pub(crate) const BOUND_TASTE_PATH: &str = "/v1/me/taste/session";
+
+// The legacy route remains cookie-only. Never infer the contract from whether
+// the header arrived: on the Library path, a missing header must fail closed.
+fn taste_session_binding(
+    req: &Request,
+    claims: &SessionClaims,
+    expected: Option<&str>,
+) -> Result<Option<String>, Response> {
+    if req.path == BOUND_TASTE_PATH {
+        require_session_binding(claims, expected).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn taste_response(mut body: serde_json::Value, binding: Option<String>) -> Response {
+    if let Some(binding) = binding {
+        body["session_binding"] = serde_json::Value::String(binding);
+    }
+    json_response(200, body)
 }
 
 async fn me_likes_session<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -2238,7 +2272,11 @@ where
     }
 }
 
-async fn me_taste_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn me_taste_list<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected_session_binding: Option<&str>,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -2257,6 +2295,10 @@ where
         }
         Err(resp) => return resp,
     };
+    let binding = match taste_session_binding(req, &claims, expected_session_binding) {
+        Ok(binding) => binding,
+        Err(resp) => return resp,
+    };
     match ctx.store.taste_list(&claims.user_id, ctx.now).await {
         Ok(rows) => {
             let items: Vec<_> = rows
@@ -2271,7 +2313,7 @@ where
                     })
                 })
                 .collect();
-            json_response(200, serde_json::json!({"items": items}))
+            taste_response(serde_json::json!({"items": items}), binding)
         }
         Err(_) => unavailable(),
     }
@@ -2334,12 +2376,7 @@ where
     N: AsyncDns,
 {
     let (claims, _) = preference_authenticate(ctx, req, true).await?;
-    if expected_session_binding != Some(session_binding(&claims).as_str()) {
-        return Err(json_response(
-            412,
-            serde_json::json!({"error": "session binding mismatch"}),
-        ));
-    }
+    require_session_binding(&claims, expected_session_binding)?;
     Ok(claims)
 }
 
@@ -2554,7 +2591,11 @@ where
     )
 }
 
-async fn me_taste_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn me_taste_put<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected_session_binding: Option<&str>,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -2580,6 +2621,10 @@ where
 
     let (claims, _) = match preference_authenticate(ctx, req, true).await {
         Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let binding = match taste_session_binding(req, &claims, expected_session_binding) {
+        Ok(binding) => binding,
         Err(resp) => return resp,
     };
     let invalid = || validation_failed("invalid taste signal request");
@@ -2621,8 +2666,8 @@ where
         _ => return not_found(),
     };
     let target = match target {
-        Ok(Some(target)) => target,
-        Ok(None) => return not_found(),
+        Ok(Some(target)) if binding.is_none() || target == body.target_id => target,
+        Ok(_) => return not_found(),
         Err(_) => return unavailable(),
     };
     match ctx
@@ -2630,17 +2675,21 @@ where
         .taste_upsert(owner, kind, &target, signal, until, ctx.now)
         .await
     {
-        Ok(row) => json_response(
-            200,
+        Ok(row) => taste_response(
             serde_json::json!({
                 "kind": row.kind, "target_id": row.target_id, "signal": row.signal, "until": row.snooze_until,
             }),
+            binding,
         ),
         Err(_) => unavailable(),
     }
 }
 
-async fn me_taste_clear<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn me_taste_clear<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected_session_binding: Option<&str>,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -2658,6 +2707,10 @@ where
 
     let (claims, _) = match preference_authenticate(ctx, req, true).await {
         Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let binding = match taste_session_binding(req, &claims, expected_session_binding) {
+        Ok(binding) => binding,
         Err(resp) => return resp,
     };
     // Serde structs can also deserialize positional arrays; require an object.
@@ -2686,12 +2739,19 @@ where
         TargetKind::Release => return not_found(),
     };
     let target = match member {
-        Ok(Some(target)) => target,
-        Ok(None) => return not_found(),
+        Ok(Some(target)) if binding.is_none() || target == target_id => target,
+        Ok(_) => return not_found(),
         Err(_) => return unavailable(),
     };
     match ctx.store.taste_delete(owner, kind, &target).await {
-        Ok(cleared) => json_response(200, serde_json::json!({"cleared": cleared})),
+        Ok(cleared) => {
+            let mut body = serde_json::json!({"cleared": cleared});
+            if binding.is_some() {
+                body["kind"] = serde_json::json!(kind.as_str());
+                body["target_id"] = serde_json::json!(target);
+            }
+            taste_response(body, binding)
+        }
         Err(_) => unavailable(),
     }
 }
@@ -8224,6 +8284,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/me/likes/session"
             | "/v1/me/likes/import"
             | "/v1/me/taste"
+            | BOUND_TASTE_PATH
             | "/v1/me/history"
             | crate::native_rest::MEMBER_INVITE_HISTORY_PATH
             | "/v1/me/private-session"
@@ -8473,9 +8534,15 @@ where
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
         ("GET", "/v1/me/likes/session") => me_likes_session(ctx, req).await,
         ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
-        ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
-        ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
-        ("DELETE", "/v1/me/taste") => me_taste_clear(ctx, req).await,
+        ("GET", "/v1/me/taste" | BOUND_TASTE_PATH) => {
+            me_taste_list(ctx, req, expected_session_binding).await
+        }
+        ("PUT", "/v1/me/taste" | BOUND_TASTE_PATH) => {
+            me_taste_put(ctx, req, expected_session_binding).await
+        }
+        ("DELETE", "/v1/me/taste" | BOUND_TASTE_PATH) => {
+            me_taste_clear(ctx, req, expected_session_binding).await
+        }
         ("GET", "/v1/me/history") => me_history_list(ctx, req).await,
         ("PUT", "/v1/me/private-session") => {
             me_private_session(ctx, req, expected_session_binding).await
@@ -16768,7 +16835,7 @@ mod tests {
             if dispatch {
                 block_on(handle(ctx, req))
             } else {
-                block_on(me_taste_list(ctx, req))
+                block_on(me_taste_list(ctx, req, None))
             }
         };
         let call = |req: &Request| call_at(&h.ctx(), req);
@@ -17277,7 +17344,7 @@ mod tests {
                 body["snooze_seconds"] = json!(seconds);
             }
             req.body = body.to_string().into_bytes();
-            let res = block_on(me_taste_put(&ctx, &req));
+            let res = block_on(me_taste_put(&ctx, &req, None));
             let until = seconds.map(|s| ctx.now + s);
             let expected =
                 json!({"kind":"track", "target_id":"Job_A", "signal":signal, "until":until});
@@ -17293,7 +17360,7 @@ mod tests {
         }
         let alice_row = stored("alice");
         let bob = taste_put_request(&h, "bob");
-        assert_eq!(block_on(me_taste_put(&h.ctx(), &bob)).status, 200);
+        assert_eq!(block_on(me_taste_put(&h.ctx(), &bob, None)).status, 200);
         assert_eq!(stored("bob").signal, "love");
         assert_eq!(stored("alice"), alice_row);
     }
@@ -17319,7 +17386,7 @@ mod tests {
             req.body = json!({"kind":kind, "target_id":target, "signal":"hide"})
                 .to_string()
                 .into_bytes();
-            block_on(me_taste_put(&h.ctx(), &req))
+            block_on(me_taste_put(&h.ctx(), &req, None))
         };
         for (kind, input, resolved) in [
             ("track", "Job_A", "Job_A"),
@@ -17374,7 +17441,7 @@ mod tests {
             .catalogue_library
             .borrow_mut()
             .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
-        let call = |req: &Request| block_on(me_taste_put(&h.ctx(), req));
+        let call = |req: &Request| block_on(me_taste_put(&h.ctx(), req, None));
         let valid = req.body.clone();
         for body in [
             "{",
@@ -17463,7 +17530,7 @@ mod tests {
         let call = |req: &Request, body: &[u8]| {
             let mut req = req.clone();
             req.body = body.to_vec();
-            let resp = block_on(me_taste_clear(&h.ctx(), &req));
+            let resp = block_on(me_taste_clear(&h.ctx(), &req, None));
             assert_eq!((resp.set_cookie, resp.retry_after), (None, None));
             assert!(resp.extra_headers.is_empty());
             (resp.status, resp.body)
@@ -18461,6 +18528,162 @@ mod tests {
                     json!({"items":[{"kind":"track", "target_id":"Job_A", "signal":"love", "until":null, "updated_at":NOW}]})
                         .to_string()
                 )
+            );
+        }
+    }
+
+    #[test]
+    fn library_taste_refuses_missing_and_replaced_session_bindings() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+
+        let h = harness();
+        let mut req = taste_put_request(&h, "alice");
+        let original = current_likes_binding(&h, req.cookie.as_deref().unwrap());
+        // Pin the public browser URL independently of the routing constant.
+        req.path = "/v1/me/taste/session".into();
+        seed_user(&h, "bob", "bob@example.com");
+        // A valid request reaches these faults; a refused binding must not.
+        h.store.fail_taste_read.replace(true);
+        h.store
+            .preference_failure
+            .set(Some((PreferenceFailure::Member, "Job_A")));
+        let call = |req: &Request, expected: Option<&str>| {
+            let headers = expected
+                .map(|value| HashMap::from([(SESSION_BINDING_HEADER.into(), value.into())]))
+                .unwrap_or_default();
+            block_on(crate::worker_entry::handle_with_transport_headers(
+                &h.ctx(),
+                req.clone(),
+                &headers,
+            ))
+        };
+        for email in ["alice@example.com", "bob@example.com"] {
+            let cookie = magic_login(&h, email);
+            let current = current_likes_binding(&h, &cookie);
+            let duplicated = format!("{current}, {current}");
+            req.cookie = Some(cookie);
+            for (method, body) in [
+                ("GET", ""),
+                (
+                    "PUT",
+                    r#"{"kind":"track","target_id":"Job_A","signal":"hide"}"#,
+                ),
+                ("DELETE", r#"{"kind":"track","target_id":"Job_A"}"#),
+            ] {
+                req.method = method.into();
+                req.body = body.as_bytes().to_vec();
+                assert_eq!(
+                    scope_for_operation(method, &req.path),
+                    RouteDecision::SessionOnly
+                );
+                for expected in [
+                    None,
+                    Some(""),
+                    Some(original.as_str()),
+                    Some(duplicated.as_str()),
+                ] {
+                    let response = call(&req, expected);
+                    assert_eq!(
+                        (response.status, response.body.as_str()),
+                        (412, r#"{"error":"session binding mismatch"}"#)
+                    );
+                }
+                assert_eq!(call(&req, Some(&current)).status, 503);
+                req.authorization = Some("Bearer fixture".into());
+                assert_eq!(call(&req, Some(&current)).status, 404);
+                req.authorization = None;
+                if method != "GET" {
+                    req.origin = None;
+                    assert_eq!(call(&req, Some(&current)).status, 401);
+                    req.origin = Some(ORIGIN.into());
+                }
+            }
+        }
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+    }
+
+    #[test]
+    fn library_taste_receipts_bind_exact_identity_replacement_expiry_and_clear() {
+        use serde_json::{json, Value};
+
+        let h = harness();
+        let req = taste_put_request(&h, "alice");
+        let binding = current_likes_binding(&h, req.cookie.as_deref().unwrap());
+        let job = "ABCDEFAB-5678-1234-1234-ABcDEFABCDEF";
+        let recording = job.to_ascii_lowercase();
+        let mut matched = matched_library_row("Job_A", CAT_REC_A, 1);
+        matched.recording_mbids.push(recording.clone());
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![matched, unmatched_library_row(job)]);
+        let call = |method: &str, path: &str, body: Value, offset: u64| {
+            let mut ctx = h.ctx();
+            ctx.now += offset;
+            block_on(handle_with_session_binding(
+                &ctx,
+                &Request {
+                    method: method.into(),
+                    path: path.into(),
+                    body: if body.is_null() {
+                        Vec::new()
+                    } else {
+                        body.to_string().into_bytes()
+                    },
+                    ..req.clone()
+                },
+                Some(&binding),
+            ))
+        };
+        let ok = |response: Response| -> Value {
+            assert_eq!(response.status, 200, "{}", response.body);
+            serde_json::from_str(&response.body).unwrap()
+        };
+        let list = |offset| ok(call("GET", BOUND_TASTE_PATH, Value::Null, offset));
+        let put = |target: &str| {
+            call(
+                "PUT",
+                BOUND_TASTE_PATH,
+                json!({"kind":"track","target_id":target,"signal":"snooze","snooze_seconds":60}),
+                0,
+            )
+        };
+        let clear = |target: &str| {
+            call(
+                "DELETE",
+                BOUND_TASTE_PATH,
+                json!({"kind":"track","target_id":target}),
+                61,
+            )
+        };
+        let like = format!("/v1/me/likes/track/{recording}");
+        assert_eq!(
+            ok(call("PUT", &like, Value::Null, 0))["target_id"],
+            recording
+        );
+        assert_eq!(list(0)["items"][0]["signal"], "love");
+        assert_eq!(put(&job.to_ascii_uppercase()).status, 404);
+        assert_eq!(clear(&job.to_ascii_uppercase()).status, 404);
+        assert_eq!(list(0)["items"][0]["signal"], "love");
+
+        for target in [job, recording.as_str()] {
+            let mut receipt = json!({"kind":"track","target_id":target,"signal":"snooze","until":NOW+60,
+                "session_binding":binding});
+            assert_eq!(ok(put(target)), receipt);
+            receipt.as_object_mut().unwrap().remove("session_binding");
+            receipt["updated_at"] = json!(NOW);
+            assert!(list(59)["items"].as_array().unwrap().contains(&receipt));
+        }
+        assert_eq!(
+            ok(call("GET", "/v1/me/likes", Value::Null, 0))["items"],
+            json!([])
+        );
+        assert_eq!(list(60), json!({"items":[],"session_binding":binding}));
+        for cleared in [true, false] {
+            assert_eq!(
+                ok(clear(job)),
+                json!({"kind":"track","target_id":job,"cleared":cleared,
+                "session_binding":binding})
             );
         }
     }

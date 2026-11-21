@@ -525,6 +525,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                     | "/v1/me/likes"
                     | "/v1/me/likes/session"
                     | "/v1/me/taste"
+                    | crate::handlers::BOUND_TASTE_PATH
                     | "/v1/me/history"
                     | MEMBER_INVITES_PATH
                     | MEMBER_INVITE_HISTORY_PATH
@@ -651,8 +652,13 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if matches!(path, "/v1/me" | "/v1/me/private-session" | "/v1/me/taste")
-                || like_track_target(path).is_some()
+            if matches!(
+                path,
+                "/v1/me"
+                    | "/v1/me/private-session"
+                    | "/v1/me/taste"
+                    | crate::handlers::BOUND_TASTE_PATH
+            ) || like_track_target(path).is_some()
             {
                 return SessionOnly;
             }
@@ -685,7 +691,11 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
             }
-            if matches!(path, "/v1/account" | "/v1/me/taste") || like_track_target(path).is_some() {
+            if matches!(
+                path,
+                "/v1/account" | "/v1/me/taste" | crate::handlers::BOUND_TASTE_PATH
+            ) || like_track_target(path).is_some()
+            {
                 return SessionOnly;
             }
             if one_segment_after("/v1/subsonic-credentials/", path) {

@@ -260,6 +260,7 @@ const invalidInviteWindows = (status: number) =>
 	new ApiError(status, 'request_failed', 'Invalid invite window response', null, false);
 
 export const ADMIN_INVITE_LIMIT = 200;
+export const ADMIN_INVITE_BATCH_MAX = 50;
 export const INVITE_STATUSES = ['active', 'expired', 'redeemed', 'revoked'] as const;
 type InviteStatus = (typeof INVITE_STATUSES)[number];
 export type AdminInvite = { id: number; status: InviteStatus; issued_by: string | null; expires_at: number };
@@ -486,6 +487,23 @@ export class ApiClient {
 			row?.kind !== 'admin' || row.status !== 'active' || !isEpoch(row.expires_at) || row.expires_at === 0)
 			throw new ApiError(status, 'request_failed', 'Invalid invite issuance response', null, false);
 		return { code: data.code, expires_at: row.expires_at };
+	}
+
+	/** Issue an atomic batch. Do not retry, even when the response is lost. */
+	async issueAdminInviteBatch(input: { count: number; expires_in_days?: number }, signal: AbortSignal): Promise<{ codes: string[]; expires_at: number }> {
+		const { count, expires_in_days } = input;
+		if (!Number.isInteger(count) || count < 1 || count > ADMIN_INVITE_BATCH_MAX ||
+			(expires_in_days !== undefined && !isInvitePolicyValue('invite_default_expiry_days', expires_in_days)))
+			throw new TypeError('Invalid invite batch options');
+		const { data, status } = await this.requestWithStatus<{ codes?: unknown; expires_at?: unknown } | null>(
+			`${ADMIN_INVITES}/batch`, { method: 'POST', cache: 'no-store', redirect: 'error', signal,
+				headers: { 'content-type': 'application/json' }, body: JSON.stringify({ count, expires_in_days }) }
+		);
+		const codes = data?.codes;
+		if (status !== 201 || !Array.isArray(codes) || codes.length !== count || !codes.every(isMemberInviteCode) ||
+			new Set(codes).size !== count || !isEpoch(data?.expires_at) || data.expires_at === 0)
+			throw new ApiError(status, 'request_failed', 'Invalid invite batch response', null, false);
+		return { codes, expires_at: data.expires_at };
 	}
 
 	/** Bodyless, once-only dispatch; the Worker owns the authorization and audited write. */
