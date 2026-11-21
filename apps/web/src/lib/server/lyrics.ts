@@ -31,8 +31,8 @@ export function parseTimedLrc(input?: string | null): TimedLyrics | null {
 			end = stamp.lastIndex;
 		}
 		const text = line.slice(end).trimStart();
-		// Reject stamp-shaped suffixes, not bracketed lyric text such as [12:30 PM].
-		if (!end || /^\[\d+:[\d.]*\]/.test(text)) continue;
+		// Reject numeric stamp suffixes, even if truncated, but keep prose such as [12:30 PM].
+		if (!end || /^\[\d+:[\d.]*(?:\]|$)/.test(text)) continue;
 		for (const atMs of times) cues.push({ atMs, text });
 	}
 	if (!cues.some((cue) => cue.text !== '')) return null;

@@ -51,7 +51,7 @@ describe('lyrics resolution', () => {
 		expect(await resolve({ embedded: `[00:01] ${bracketed}`, mediaPath, sidecar }, track)).toEqual({
 			source: 'embedded', cues: [{ atMs: 1000, text: bracketed }]
 		});
-		for (const embedded of ['', 'Untimed', '[00:99]Bad stamp', '[00:01] [00:61]']) {
+		for (const embedded of ['', 'Untimed', '[00:99]Bad stamp', '[00:01] [00:61]', '[00:01] [00:61']) {
 			expect(await resolve({ embedded, mediaPath, sidecar }, track)).toMatchObject({ source: 'sidecar' });
 		}
 		expect(provider).not.toHaveBeenCalled();
