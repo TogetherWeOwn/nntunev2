@@ -5,11 +5,9 @@ import { RELATIVE_JUMP_SECONDS } from './relativeJump.js';
 
 export type SystemSeekGuard = { active: () => boolean; canReport: () => boolean; unavailable: () => void };
 export type SystemSeekOwner = {
-	audio: HTMLAudioElement;
-	attachment: number;
+	audio: HTMLAudioElement; attachment: number;
 	availability: Writable<AbsoluteSeekState>;
-	matches: () => boolean;
-	positionIntent: () => number;
+	matches: () => boolean; positionIntent: () => number;
 	dispatch: (action: 'seekto' | 'seekforward' | 'seekbackward', seconds: number, guard: SystemSeekGuard) => void;
 };
 
@@ -45,9 +43,7 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 				let retired = false;
 				owner.dispatch(name, seconds, { active, canReport: () => retired || active(), unavailable: () => { retired ||= retire(); } });
 			};
-			const registration = {
-				onSeekTo: action('seekto'), onSeekForward: action('seekforward'), onSeekBackward: action('seekbackward')
-			};
+			const registration = { onSeekTo: action('seekto'), onSeekForward: action('seekforward'), onSeekBackward: action('seekbackward') };
 			handlers = registration;
 		}
 		setSeekHandlers(session, handlers);

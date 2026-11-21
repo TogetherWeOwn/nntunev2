@@ -27,7 +27,7 @@ function seekableCovers(ranges: TimeRanges, target: number): boolean {
 }
 
 /**
- * Move native media by a step, clamped to [0, duration]. Media
+ * Move native media by the fixed step, clamped to [0, duration]. Media
  * without a finite positive duration, a finite position, or a native
  * seekable range covering the target is unavailable and left untouched (a
  * source served without range support reports only [0, 0]). Success needs
@@ -36,13 +36,12 @@ function seekableCovers(ranges: TimeRanges, target: number): boolean {
  */
 export function jumpMedia(
 	media: JumpMedia, direction: JumpDirection, matches: () => boolean = () => true, assigned?: () => void,
-	seconds = RELATIVE_JUMP_SECONDS, onSystemUnavailable?: () => void
+	seconds = RELATIVE_JUMP_SECONDS, onSystemUnavailable?: () => void,
+	assign = (target: number, _duration: number) => { media.currentTime = target; }
 ): JumpOutcome {
-	let position: number;
-	let target: number;
-	let raw: number;
+	let duration: number, position: number, target: number, raw: number;
 	try {
-		const duration = media.duration;
+		duration = media.duration;
 		position = media.currentTime;
 		if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(position) || (onSystemUnavailable && 'error' in media && media.error)) {
 			onSystemUnavailable?.();
@@ -51,10 +50,11 @@ export function jumpMedia(
 		const back = direction === 'back';
 		raw = position + (back ? -seconds : seconds);
 		target = Math.min(Math.max(raw, 0), duration);
-		const atEdge = onSystemUnavailable ? (back ? target >= position : target <= position)
-			: (back ? position <= TOLERANCE : position >= duration - TOLERANCE);
+		const slack = onSystemUnavailable ? 0 : TOLERANCE;
+		const atEdge = back ? position <= slack : position >= duration - slack;
 		if (onSystemUnavailable && !seekable(media, duration, atEdge ? undefined : target, onSystemUnavailable)) return { kind: 'unavailable' };
 		if (atEdge) return { kind: 'boundary', edge: back ? 'start' : 'end' };
+		if (onSystemUnavailable && target === position) return { kind: 'refused' };
 		if (!onSystemUnavailable && !seekableCovers(media.seekable, target)) return { kind: 'unavailable' };
 	} catch {
 		onSystemUnavailable?.();
@@ -62,7 +62,7 @@ export function jumpMedia(
 	}
 	try {
 		if (!matches()) return { kind: 'unavailable' };
-		media.currentTime = target;
+		assign(target, duration);
 		assigned?.();
 		if (!matches()) return { kind: 'unavailable' };
 		const readback = media.currentTime;
