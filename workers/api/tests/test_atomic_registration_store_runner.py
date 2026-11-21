@@ -122,8 +122,8 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
         extra.add(runner.PREFIX + "postgres_unlisted_surprise")
         self.assert_rejected_before_execution(extra)
 
-    def test_expected_inventory_has_thirty_four_db_cases_and_four_config_cases(self):
-        self.assertEqual(len(runner.EXPECTED), 34)
+    def test_expected_inventory_has_thirty_five_db_cases_and_four_config_cases(self):
+        self.assertEqual(len(runner.EXPECTED), 35)
         self.assertIn(
             runner.PREFIX + "postgres_magic_issuance_skips_locked_expired_proof_and_retries",
             runner.EXPECTED,
@@ -140,6 +140,7 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
             "postgres_admin_invite_windows_are_bounded_and_audited_atomically",
             "postgres_member_invite_requires_its_own_open_window_and_unexpired_code",
             "postgres_member_enrollment_rechecks_window_after_waiting",
+            "postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota",
             "postgres_invite_revocation_wins_against_stale_redemption_snapshot",
             "postgres_registration_invite_claim_stamps_spend_and_invited_by",
             "postgres_registration_invite_claim_survives_issuer_deletion",

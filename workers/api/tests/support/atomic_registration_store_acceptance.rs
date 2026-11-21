@@ -2446,6 +2446,110 @@ async fn remove_member_window_fixture(client: &Client, window: i64) {
 
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() {
+    use super::member_issue_invite_on as issue;
+    use crate::handlers::MemberInviteIssueOutcome as Outcome;
+
+    run_test(async {
+        let mut db = connect().await;
+        let mut other = connect().await;
+        let (_, issuer) = seed_admin_test_users(&db).await;
+        let ip = "198.51.100.9";
+        let first = format!("hash-{issuer}-1");
+        let second = format!("hash-{issuer}-2");
+        let third = format!("hash-{issuer}-3");
+        let closed = issue(&mut db, &issuer, &first, ip).await.unwrap();
+        assert_eq!(closed, Outcome::WindowClosed);
+        let (window, end) = seed_member_window(&db, 600).await;
+        db.execute("INSERT INTO subscriptions
+            (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, paid_through_at)
+            VALUES ($1, $1, $1, $1, 'price_fixture', 'plus', 'active', now() + interval '1 day')", &[&issuer]).await.unwrap();
+        // 60 distinct days, overlapping terms, and a zero-payment term.
+        let history = "INSERT INTO paid_invoice_history
+            (stripe_invoice_id, user_id, stripe_subscription_id, plan_id, period_start, period_end, amount_cents, currency, paid_at)
+            VALUES ($1 || $2::int::text, $1, $1 || '-old', 'plus',
+                    to_timestamp(($2::int * 86400)::double precision),
+                    to_timestamp(($3::int * 86400)::double precision), $4, 'usd', to_timestamp(0))";
+        let spans = [
+            (1, 31, 800_i64),
+            (15, 45, 800),
+            (16, 46, 800),
+            (46, 61, 800),
+            (61, 91, 0),
+        ];
+        for (start, stop, amount) in spans {
+            db.execute(history, &[&issuer, &start, &stop, &amount])
+                .await
+                .unwrap();
+        }
+        let denied = issue(&mut db, &issuer, &first, ip).await.unwrap();
+        assert_eq!(denied, Outcome::Ineligible);
+        // A disjoint paid term on an earlier subscription makes exactly 90 days.
+        db.execute(history, &[&issuer, &120_i32, &150_i32, &800_i64])
+            .await
+            .unwrap();
+        let status_sql = "UPDATE subscriptions SET status = $2 WHERE user_id = $1";
+        db.execute(status_sql, &[&issuer, &"unpaid"]).await.unwrap();
+        let denied = issue(&mut db, &issuer, &first, ip).await.unwrap();
+        assert_eq!(denied, Outcome::Ineligible);
+        db.execute(status_sql, &[&issuer, &"active"]).await.unwrap();
+        let Outcome::Issued { id, expires_at } = issue(&mut db, &issuer, &first, ip).await.unwrap()
+        else {
+            panic!("exact paid threshold should issue");
+        };
+        assert_eq!(expires_at, end);
+        let revoke = "UPDATE invite_codes SET revoked_at = created_at WHERE id = $1";
+        db.execute(revoke, &[&id]).await.unwrap();
+        let (a, b) = futures_util::future::join(
+            issue(&mut db, &issuer, &second, ip),
+            issue(&mut other, &issuer, &third, ip),
+        )
+        .await;
+        let (a, b) = (&a.unwrap(), &b.unwrap());
+        assert!(matches!(
+            (a, b),
+            (Outcome::Issued { .. }, Outcome::QuotaExhausted)
+                | (Outcome::QuotaExhausted, Outcome::Issued { .. })
+        ));
+        db.execute(
+            "UPDATE invite_codes SET expires_at = created_at
+                    WHERE issued_by = $1 AND revoked_at IS NULL",
+            &[&issuer],
+        )
+        .await
+        .unwrap();
+        let exhausted = issue(&mut db, &issuer, &third, ip).await.unwrap();
+        assert_eq!(exhausted, Outcome::QuotaExhausted);
+        let audited: i64 = db
+            .query_one(
+                "SELECT count(*) FROM audit_log a JOIN invite_codes i
+            ON a.details->>'invite_id' = i.id::text WHERE a.user_id = $1 AND i.issued_by = $1
+            AND a.action = 'invite.issued' AND a.at = i.created_at AND a.details =
+                jsonb_build_object('invite_id', i.id, 'kind', 'member', 'window_id', i.window_id)",
+                &[&issuer],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(audited, 2);
+        let next: i64 = db.query_one("WITH closed AS (UPDATE invite_windows SET
+            ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint WHERE id = $1 RETURNING ends_at)
+            INSERT INTO invite_windows (starts_at, ends_at) SELECT ends_at, ends_at + 600 FROM closed RETURNING id",
+            &[&window]).await.unwrap().get(0);
+        // The rejected hash has no persisted row and can be used in the fresh window.
+        let unused_hash = match a {
+            Outcome::QuotaExhausted => &second,
+            _ => &third,
+        };
+        let reset = issue(&mut db, &issuer, unused_hash, ip).await.unwrap();
+        assert!(matches!(reset, Outcome::Issued { .. }));
+        remove_member_window_fixture(&db, next).await;
+        remove_member_window_fixture(&db, window).await;
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
     use super::{claim_single_use_on, invite_by_hash_on};
     use crate::auth::SingleUseClaim;

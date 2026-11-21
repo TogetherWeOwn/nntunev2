@@ -562,6 +562,15 @@ pub enum AdminInviteRevokeOutcome {
     ActorNotAdmin,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum MemberInviteIssueOutcome {
+    Issued { id: i64, expires_at: i64 },
+    Ineligible,
+    WindowClosed,
+    QuotaExhausted,
+    AccountDeleting,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct InviteWindow {
     pub id: i64,
@@ -1512,6 +1521,14 @@ pub trait Store {
         _source_ip: &str,
         _now: u64,
     ) -> impl Future<Output = Result<AdminInviteIssueOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn member_issue_invite(
+        &self,
+        _issuer: &str,
+        _code_hash: &str,
+        _source_ip: &str,
+    ) -> impl Future<Output = Result<MemberInviteIssueOutcome, StoreError>> {
         async { Err(StoreError) }
     }
     /// Every invite row, newest first, for the admin list. `issuer`
@@ -6087,6 +6104,59 @@ where
     )
 }
 
+/// Browser-only, bodyless copy-link issuance. The issuer is always the
+/// authenticated principal, never a request parameter.
+async fn member_invite_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use MemberInviteIssueOutcome as Outcome;
+    if req.authorization.is_some() {
+        return not_found();
+    }
+    let (claims, _) = match ctx.authenticate(req, true).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    if !req.body.is_empty() {
+        return validation_failed("member invite issuance takes no request body");
+    }
+    let code = match auth::generate_invite_code() {
+        Ok(code) => code,
+        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
+        Err(_) => return internal(),
+    };
+    use crate::api_error::ApiError;
+    let error = match ctx
+        .store
+        .member_issue_invite(
+            &claims.user_id,
+            &auth::hash_invite_code(&code),
+            &ctx.source_ip,
+        )
+        .await
+    {
+        Ok(Outcome::Issued { id, expires_at }) => {
+            return Response {
+                extra_headers: vec![("cache-control".into(), "private, no-store".into())],
+                ..json_response(
+                    201,
+                    serde_json::json!({"id": id, "expires_at": expires_at, "code": code}),
+                )
+            }
+        }
+        Ok(Outcome::Ineligible) => ApiError::forbidden("paid membership eligibility not met"),
+        Ok(Outcome::WindowClosed) => ApiError::by_code("conflict", "no invite window is open"),
+        Ok(Outcome::QuotaExhausted) => ApiError::by_code("conflict", "invite quota exhausted"),
+        Ok(Outcome::AccountDeleting) => return account_deleting_response(),
+        Err(_) => return internal(),
+    };
+    json_response(error.status, serde_json::json!(error))
+}
+
 /// `GET /v1/admin/invites` — every invite (newest first, capped),
 /// optionally narrowed by `/status/{status}` or `/issuer/{user_id}`.
 /// Filters ride path segments: `Request` carries no query string and
@@ -8001,6 +8071,7 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
+        ("POST", crate::native_rest::MEMBER_INVITES_PATH) => member_invite_issue(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
         ("GET", "/v1/me/likes/session") => me_likes_session(ctx, req).await,
         ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
@@ -22941,6 +23012,41 @@ mod tests {
                 event.action
             );
         }
+    }
+
+    #[test]
+    fn member_invite_issue_requires_browser_identity() {
+        use crate::native_rest::{scope_for_operation, RouteDecision, MEMBER_INVITES_PATH as PATH};
+        let h = harness();
+        seed_user(&h, "member", "member@example.com");
+        let cookie = magic_login(&h, "member@example.com");
+        assert_eq!(
+            scope_for_operation("POST", PATH),
+            RouteDecision::SessionOnly
+        );
+        let mut req = Request {
+            method: "POST".into(),
+            path: PATH.into(),
+            cookie: Some(cookie),
+            origin: Some(ORIGIN.into()),
+            authorization: Some("Bearer ntk_synthetic".into()),
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let status = |req: &Request| block_on(handle(&h.ctx(), req)).status;
+        assert_eq!(status(&req), 404);
+        req.authorization = None;
+        // Only the authenticated bodyless request reaches the unavailable fake store.
+        assert_eq!(status(&req), 500);
+        req.body = br#"{"issuer":"other"}"#.to_vec();
+        assert_eq!(status(&req), 400);
+        req.body.clear();
+        req.origin = None;
+        assert_eq!(status(&req), 401);
+        assert_eq!(
+            h.call_full("POST", PATH, None, None, Some(ORIGIN)).status,
+            401
+        );
     }
 
     #[test]
