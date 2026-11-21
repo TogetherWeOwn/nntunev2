@@ -358,6 +358,14 @@ describe('selection append through queue dedupe', () => {
 		});
 	});
 
+	it('carries only a nonblank Library release into queued playback metadata', async () => {
+		const mod = await requireModule('queued release');
+		const { queue } = mod.appendSelection(createQueue([]), ['known', 'blank', 'missing'], [
+			{ id: 'known', release: ' Fixture Album ' }, { id: 'blank', release: ' ' }, { id: 'missing' }
+		]);
+		expect(queue.tracks.map((track) => track.album)).toEqual(['Fixture Album', undefined, undefined]);
+	});
+
 	it('SUB-U-14 append dedupes already-queued IDs and reports added vs skipped', async () => {
 		const mod = await requireModule('SUB-U-14');
 

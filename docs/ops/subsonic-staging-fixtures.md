@@ -119,8 +119,30 @@ and cleanup. That group does not fence dashboard or API writes. Cloudflare's
 [deployment create API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
 does not expose an expected-current deployment precondition. A read followed by
 an unconditional rollback is not safe; do not arm or attempt that write without
-a fence that covers all writers. The rehearsal does not exercise Actions
-cancellation or independent UTC lease expiry.
+a fence that covers all writers.
+
+### Actions step finalization (synthetic only)
+
+The `public-text` CI job arms a synthetic deployment and starts a simulated
+client in two disposable cases: a failing step and an Actions step timeout.
+The same-job `always()` finalizer requires the raw failure outcome and a
+fixture receipt (intentional exit or native interrupt), runs the restore
+rehearsal, and checks that the synthetic deployment is off and drained. The
+job uses no staging credentials, provider calls or live traffic.
+
+A step timeout is not cancellation of the entire job or workflow. Forced
+cancellation or runner loss can prevent finalizer execution. This test does
+not establish live restore or drain, and UTC expiry alone cannot supply that
+proof.
+
+### Independent UTC expiry (disposable release Fetch)
+
+The disposable release Fetch test checks the Worker's UTC clock:
+measurement remains enabled and the binding and exact SHA remain configured,
+but a valid lease with a past expiry must reach the inert staging response
+without opening the measurement socket. This checks expiry without running
+cleanup or injecting a runner clock. Expiry stops admission; it does not remove
+the lease or binding, restore a deployment, or prove DB drain.
 
 ### Charge triplet
 
