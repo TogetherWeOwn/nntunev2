@@ -2252,10 +2252,32 @@ where
     }
 }
 
+async fn track_like_authenticate<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected_session_binding: Option<&str>,
+) -> Result<SessionClaims, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = preference_authenticate(ctx, req, true).await?;
+    if expected_session_binding != Some(session_binding(&claims).as_str()) {
+        return Err(json_response(
+            412,
+            serde_json::json!({"error": "session binding mismatch"}),
+        ));
+    }
+    Ok(claims)
+}
+
 async fn me_like_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
     target: &str,
+    expected_session_binding: Option<&str>,
 ) -> Response
 where
     S: Store + SingleUseStore,
@@ -2266,8 +2288,8 @@ where
     use crate::target_identity::{valid_target_id, TargetKind};
     use crate::taste_signal::TasteSignal;
 
-    let (claims, _) = match preference_authenticate(ctx, req, true).await {
-        Ok(pair) => pair,
+    let claims = match track_like_authenticate(ctx, req, expected_session_binding).await {
+        Ok(claims) => claims,
         Err(resp) => return resp,
     };
     if !valid_target_id(target) {
@@ -2306,6 +2328,7 @@ async fn me_unlike_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
     target: &str,
+    expected_session_binding: Option<&str>,
 ) -> Response
 where
     S: Store + SingleUseStore,
@@ -2315,8 +2338,8 @@ where
 {
     use crate::target_identity::{valid_target_id, TargetKind};
 
-    let (claims, _) = match preference_authenticate(ctx, req, true).await {
-        Ok(pair) => pair,
+    let claims = match track_like_authenticate(ctx, req, expected_session_binding).await {
+        Ok(claims) => claims,
         Err(resp) => return resp,
     };
     if !valid_target_id(target) {
@@ -8087,11 +8110,30 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    // Keep the largest route's state out of every caller's future.
-    Box::pin(dispatch_request(ctx, req)).await
+    handle_with_session_binding(ctx, req, None).await
 }
 
-async fn dispatch_request<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+// Worker entry supplies the browser's request header alongside the bounded body.
+pub(crate) async fn handle_with_session_binding<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected_session_binding: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // Keep the largest route's state out of every caller's future.
+    Box::pin(dispatch_request(ctx, req, expected_session_binding)).await
+}
+
+async fn dispatch_request<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected_session_binding: Option<&str>,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -8263,11 +8305,11 @@ where
         // native paths); unserved shapes stay 404 on preflight too.
         ("OPTIONS", path) if options_preflight_served(path) => preflight_response(),
         ("PUT", path) => match crate::native_rest::like_track_target(path) {
-            Some(target) => me_like_track(ctx, req, target).await,
+            Some(target) => me_like_track(ctx, req, target, expected_session_binding).await,
             None => not_found(),
         },
         ("DELETE", path) => match crate::native_rest::like_track_target(path) {
-            Some(target) => me_unlike_track(ctx, req, target).await,
+            Some(target) => me_unlike_track(ctx, req, target, expected_session_binding).await,
             None => not_found(),
         },
         _ => not_found(),
@@ -16525,7 +16567,16 @@ mod tests {
             stripe_signature: None,
             body: br#"{"user_id":"bob"}"#.to_vec(),
         };
-        let call = |req: &Request, target: &str| block_on(me_like_track(&h.ctx(), req, target));
+        let alice_binding = current_likes_binding(&h, &alice);
+        let bob_binding = current_likes_binding(&h, &bob);
+        let call = |req: &Request, target: &str| {
+            let binding = if req.cookie.as_deref() == Some(bob.as_str()) {
+                &bob_binding
+            } else {
+                &alice_binding
+            };
+            block_on(me_like_track(&h.ctx(), req, target, Some(binding)))
+        };
         let first = call(&req, "Job_A");
         assert_eq!(first.status, 200);
         assert_eq!(
@@ -16540,7 +16591,7 @@ mod tests {
         let mut later = h.ctx();
         later.now += 100;
         assert_eq!(
-            block_on(me_like_track(&later, &req, "Job_A")).body,
+            block_on(me_like_track(&later, &req, "Job_A", Some(&alice_binding))).body,
             first.body
         );
         for (signal, until) in [(Hide, None), (Snooze, Some(NOW - 1))] {
@@ -16549,7 +16600,7 @@ mod tests {
                     .taste_upsert("alice", Track, "Job_A", signal, until, NOW - 2),
             )
             .unwrap();
-            let result = block_on(me_like_track(&later, &req, "Job_A"));
+            let result = block_on(me_like_track(&later, &req, "Job_A", Some(&alice_binding)));
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&result.body).unwrap()["liked_at"],
                 NOW + 100
@@ -16626,7 +16677,10 @@ mod tests {
         req.cookie = Some(alice);
         let mut expired = h.ctx();
         expired.now += 365 * 24 * 60 * 60;
-        assert_eq!(block_on(me_like_track(&expired, &req, "Job_A")).status, 401);
+        assert_eq!(
+            block_on(me_like_track(&expired, &req, "Job_A", Some(&alice_binding))).status,
+            401
+        );
         *h.store.fail_catalogue_reads.borrow_mut() = true;
         assert_eq!(call(&req, "Job_A").body, unavailable().body);
         *h.store.fail_catalogue_reads.borrow_mut() = false;
@@ -16687,7 +16741,16 @@ mod tests {
             stripe_signature: None,
             body: br#"{"user_id":"bob"}"#.to_vec(),
         };
-        let call = |req: &Request, target: &str| block_on(me_unlike_track(&h.ctx(), req, target));
+        let alice_binding = current_likes_binding(&h, &alice);
+        let bob_binding = current_likes_binding(&h, &bob);
+        let call = |req: &Request, target: &str| {
+            let binding = if req.cookie.as_deref() == Some(bob.as_str()) {
+                &bob_binding
+            } else {
+                &alice_binding
+            };
+            block_on(me_unlike_track(&h.ctx(), req, target, Some(binding)))
+        };
         for (user, kind) in [("alice", Track), ("alice", Release), ("bob", Track)] {
             block_on(h.store.taste_upsert(user, kind, "Job_A", Love, None, NOW)).unwrap();
         }
@@ -16756,7 +16819,7 @@ mod tests {
                 (missing.status, missing.body.clone())
             );
         }
-        req.cookie = Some(bob);
+        req.cookie = Some(bob.clone());
         assert_eq!(call(&req, "Private").status, 200);
         assert_eq!(call(&req, "CaseJob").body, missing.body);
         req.cookie = Some(alice.clone());
@@ -16778,7 +16841,13 @@ mod tests {
         let mut expired = h.ctx();
         expired.now += 365 * 24 * 60 * 60;
         assert_eq!(
-            block_on(me_unlike_track(&expired, &req, "Job_A")).status,
+            block_on(me_unlike_track(
+                &expired,
+                &req,
+                "Job_A",
+                Some(&alice_binding)
+            ))
+            .status,
             401
         );
         block_on(
@@ -18043,6 +18112,66 @@ mod tests {
     }
 
     #[test]
+    fn dispatched_track_like_mutations_require_the_current_session_binding() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let original = magic_login(&h, "alice@example.com");
+        let stale = current_likes_binding(&h, &original);
+        let replacement = magic_login(&h, "alice@example.com");
+        let other_account = magic_login(&h, "bob@example.com");
+
+        // A matching binding reaches this fault; a refused one must not.
+        h.store
+            .preference_failure
+            .set(Some((PreferenceFailure::Member, "Job_A")));
+        let mut req = Request {
+            method: String::new(),
+            path: "/v1/me/likes/track/Job_A".into(),
+            cookie: None,
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let ctx = h.ctx();
+        let transport = |req: &Request, binding: Option<&str>| {
+            let headers = binding
+                .map(|value| HashMap::from([("x-nntune-session-binding".into(), value.into())]))
+                .unwrap_or_default();
+            block_on(crate::worker_entry::handle_with_transport_headers(
+                &ctx,
+                req.clone(),
+                &headers,
+            ))
+        };
+        for cookie in [replacement, other_account] {
+            let current = current_likes_binding(&h, &cookie);
+            let combined = format!("{current}, {stale}");
+            req.cookie = Some(cookie);
+            for method in ["PUT", "DELETE"] {
+                req.method = method.into();
+                for expected in [
+                    None,
+                    Some(""),
+                    Some(stale.as_str()),
+                    Some(combined.as_str()),
+                ] {
+                    let resp = transport(&req, expected);
+                    assert_eq!(
+                        (resp.status, resp.body.as_str()),
+                        (412, r#"{"error":"session binding mismatch"}"#)
+                    );
+                }
+                let matched = transport(&req, Some(&current));
+                assert_eq!(matched.status, 503);
+            }
+        }
+        assert!(h.store.taste_rows.borrow().is_empty());
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+    }
+
+    #[test]
     fn dispatched_track_like_is_session_only_and_owner_scoped() {
         use crate::native_rest::{scope_for_operation, RouteDecision};
         use serde_json::json;
@@ -18070,7 +18199,9 @@ mod tests {
             stripe_signature: None,
             body: Vec::new(),
         };
-        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let binding = current_likes_binding(&h, &alice);
+        let call =
+            |req: &Request| block_on(handle_with_session_binding(&h.ctx(), req, Some(&binding)));
         let assert_not_found = |resp: Response| {
             assert_eq!((resp.status, resp.body), (404, not_found().body));
         };
@@ -18083,14 +18214,19 @@ mod tests {
         );
         let mut later = h.ctx();
         later.now += 100;
-        let replay = block_on(handle(&later, &req));
+        let replay = block_on(handle_with_session_binding(&later, &req, Some(&binding)));
         assert_eq!((replay.status, replay.body), (200, first.body));
         let saved = h.store.taste_rows.borrow().clone();
         assert_eq!(saved.len(), 1);
         assert!(saved.contains_key(&("alice".into(), "track".into(), "Job_A".into())));
 
+        let bob_binding = current_likes_binding(&h, &bob);
         req.cookie = Some(bob);
-        assert_not_found(call(&req));
+        assert_not_found(block_on(handle_with_session_binding(
+            &h.ctx(),
+            &req,
+            Some(&bob_binding),
+        )));
         req.cookie = Some(alice.clone());
         for target in ["Job.A", "Private", "Absent"] {
             req.path = format!("/v1/me/likes/track/{target}");
@@ -18136,6 +18272,12 @@ mod tests {
             if origin == Some(ORIGIN) {
                 assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
                 assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                assert!(cors.iter().any(|(name, headers)| {
+                    *name == "access-control-allow-headers"
+                        && headers
+                            .split(", ")
+                            .any(|header| header == SESSION_BINDING_HEADER)
+                }));
                 for method in ["PUT", "DELETE"] {
                     assert!(cors.iter().any(|(name, methods)| {
                         *name == "access-control-allow-methods"
@@ -18190,7 +18332,9 @@ mod tests {
             stripe_signature: None,
             body: Vec::new(),
         };
-        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let binding = current_likes_binding(&h, &alice);
+        let call =
+            |req: &Request| block_on(handle_with_session_binding(&h.ctx(), req, Some(&binding)));
         let assert_not_found = |resp: Response| {
             assert_eq!((resp.status, resp.body), (404, not_found().body));
         };
@@ -20903,16 +21047,18 @@ mod tests {
             stripe_signature: None,
             body: Vec::new(),
         };
+        let headers = media_type
+            .map(|value| HashMap::from([("content-type".into(), value.into())]))
+            .unwrap_or_default();
         block_on(crate::worker_entry::dispatch_collected(
             crate::worker_entry::CollectedBody::Complete(body.as_bytes().to_vec()),
             request,
-            |collected_request| async move {
-                crate::worker_entry::handle_with_refresh_transport_guard(
+            |collected_request| {
+                crate::worker_entry::handle_with_transport_headers(
+                    &ctx,
                     collected_request,
-                    media_type,
-                    |guarded_request| async move { handle(&ctx, &guarded_request).await },
+                    &headers,
                 )
-                .await
             },
         ))
     }
@@ -20996,16 +21142,17 @@ mod tests {
         assert_eq!(legacy.status, 200);
         assert!(h.store.refresh_retries.borrow().is_empty());
         let source = strip_line_comments(include_str!("worker_entry.rs"));
-        let dispatch = source.split_once("pub async fn dispatch(").unwrap().1;
-        assert!(dispatch.contains("headers_map.get(\"content-type\")"));
-        let normalized = dispatch.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(normalized.contains(
-            "handle_with_refresh_transport_guard( collected_request, refresh_content_type.as_deref(),"
-        ));
-        let guard = dispatch
-            .find("handle_with_refresh_transport_guard")
+        let transport = source
+            .split_once("async fn handle_with_transport_headers<")
+            .unwrap()
+            .1;
+        assert!(transport.contains("headers.get(\"content-type\")"));
+        let guard = transport
+            .find("handlers::refresh_transport_rejection(")
             .unwrap();
-        let handle = dispatch.find("handlers::handle(&ctx").unwrap();
+        let handle = transport
+            .find("handlers::handle_with_session_binding(")
+            .unwrap();
         assert!(
             guard < handle,
             "runtime must reject downgrade before calling handlers"

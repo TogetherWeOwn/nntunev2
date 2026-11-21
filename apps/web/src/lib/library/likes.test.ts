@@ -65,27 +65,37 @@ describe('server likes', () => {
 			Response.json({ target_id: JOB, liked_at: 1 }),
 			Response.json({ target_id: MBID, liked: false })
 		);
-		await expect(setTrackLike(client, JOB, true)).resolves.toBe(JOB);
-		await expect(setTrackLike(client, JOB, false)).resolves.toBe(MBID);
+		await expect(setTrackLike(client, JOB, true, binding)).resolves.toBe(JOB);
+		await expect(setTrackLike(client, JOB, false, binding)).resolves.toBe(MBID);
 		expect(fetchFn).toHaveBeenNthCalledWith(1, `${LIKES}/track/${JOB}`, expect.objectContaining({
-			method: 'PUT', credentials: 'include', body: '{}'
+			method: 'PUT', credentials: 'include', body: '{}',
+			headers: expect.objectContaining({ 'x-nntune-session-binding': binding })
 		}));
 		expect(fetchFn).toHaveBeenNthCalledWith(2, `${LIKES}/track/${JOB}`, expect.objectContaining({
-			method: 'DELETE', credentials: 'include'
+			method: 'DELETE', credentials: 'include',
+			headers: expect.objectContaining({ 'x-nntune-session-binding': binding })
 		}));
 		expect(fetchFn.mock.calls[1][1]?.body).toBeUndefined();
 	});
 
+	it.each([true, false])('does not fetch without a canonical binding when setting liked to %s', async (liked) => {
+		const { client, fetchFn } = mockClient();
+		// @ts-expect-error The transport requires a binding; untyped callers also fail closed.
+		await expect(setTrackLike(client, JOB, liked)).rejects.toThrow('verified session binding');
+		await expect(setTrackLike(client, JOB, liked, `${binding.slice(1)}B`)).rejects.toThrow('verified session binding');
+		expect(fetchFn).not.toHaveBeenCalled();
+	});
+
 	it.each([true, false])('rejects a contradictory receipt when setting liked to %s', async (liked) => {
 		const { client } = mockClient(Response.json({ target_id: JOB, liked_at: 1, liked: false }));
-		await expect(setTrackLike(client, JOB, liked)).rejects.toThrow('Invalid like confirmation');
+		await expect(setTrackLike(client, JOB, liked, binding)).rejects.toThrow('Invalid like confirmation');
 	});
 
 	it('never sends an occurrence key or accepts a different opaque job receipt', async () => {
 		const { client, fetchFn } = mockClient(Response.json({ target_id: 'job_a', liked_at: 1 }));
-		await expect(setTrackLike(client, 'Job_A:2', true)).rejects.toThrow('Invalid track ID');
+		await expect(setTrackLike(client, 'Job_A:2', true, binding)).rejects.toThrow('Invalid track ID');
 		expect(fetchFn).not.toHaveBeenCalled();
-		await expect(setTrackLike(client, 'Job_A', true)).rejects.toThrow('Invalid like confirmation');
+		await expect(setTrackLike(client, 'Job_A', true, binding)).rejects.toThrow('Invalid like confirmation');
 	});
 });
 

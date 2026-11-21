@@ -467,7 +467,10 @@ pub(crate) fn cors_headers(
         ));
         headers.push((
             "access-control-allow-headers",
-            "content-type, authorization".to_string(),
+            format!(
+                "content-type, authorization, {}",
+                handlers::SESSION_BINDING_HEADER
+            ),
         ));
         headers.push(("access-control-max-age", "86400".to_string()));
     }
@@ -7357,8 +7360,8 @@ pub async fn collect_body_with_cap<S: BodyChunkStream>(
 /// Content-Length suffices — the stream is never polled). The route's
 /// own 413 (`admin_ingest_oversized`) lives only in the in-handler
 /// pre-gate, for direct-handle callers that reach it. The Worker
-/// entry passes a handler that calls `handlers::handle`, so a rejected
-/// body can cause no store, mailer, DNS, or dialer side effect.
+/// entry passes a handler that dispatches through the transport headers,
+/// so a rejected body can cause no store, mailer, DNS, or dialer side effect.
 pub async fn dispatch_collected<F, Fut>(
     collected: CollectedBody,
     mut request: handlers::Request,
@@ -7377,25 +7380,28 @@ where
     }
 }
 
-/// Shared runtime composition for the collected request: the bound-refresh
-/// transport guard runs before `handler`, so a marked request whose keyed
-/// body was lost in transport is rejected instead of downgrading to the
-/// ordinary empty-body rotation. Production dispatch and the transport
-/// tests both call this seam, so disabling the guard fails those tests
-/// behaviorally rather than only a source-shape pin.
-pub async fn handle_with_refresh_transport_guard<F, Fut>(
+/// Dispatch a collected request with the Worker's lowercased header map.
+/// The refresh marker survives a truncated body, and the Like binding is
+/// forwarded as a precondition, not as authentication.
+pub(crate) async fn handle_with_transport_headers<S, M, D, N>(
+    ctx: &handlers::Ctx<'_, S, M, D, N>,
     request: handlers::Request,
-    refresh_content_type: Option<&str>,
-    handler: F,
+    headers: &HashMap<String, String>,
 ) -> handlers::Response
 where
-    F: FnOnce(handlers::Request) -> Fut,
-    Fut: std::future::Future<Output = handlers::Response>,
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
 {
+    let refresh_content_type = headers.get("content-type").map(String::as_str);
     if let Some(rejection) = handlers::refresh_transport_rejection(&request, refresh_content_type) {
         return rejection;
     }
-    handler(request).await
+    let expected_session_binding = headers
+        .get(handlers::SESSION_BINDING_HEADER)
+        .map(String::as_str);
+    handlers::handle_with_session_binding(ctx, &request, expected_session_binding).await
 }
 
 /// Registry code for an error response: the envelope `code` when the body
@@ -7942,15 +7948,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     let served_method = request.method.clone();
     let served_path = served_display_path(&request.path);
-    // Preserve the header marker independently of any truncated upload bytes.
-    let refresh_content_type = headers_map.get("content-type").cloned();
-    let response = dispatch_collected(collected, request, |collected_request| async move {
-        handle_with_refresh_transport_guard(
-            collected_request,
-            refresh_content_type.as_deref(),
-            |guarded_request| async move { handlers::handle(&ctx, &guarded_request).await },
-        )
-        .await
+    let response = dispatch_collected(collected, request, |collected_request| {
+        handle_with_transport_headers(&ctx, collected_request, &headers_map)
     })
     .await;
     // One structured line per served request: route, status, latency, and
@@ -9604,7 +9603,7 @@ mod tests {
         )));
         assert!(headers.contains(&(
             "access-control-allow-headers",
-            "content-type, authorization".to_string()
+            "content-type, authorization, x-nntune-session-binding".to_string()
         )));
         assert!(headers.contains(&("access-control-max-age", "86400".to_string())));
         // Non-preflight statuses never carry the preflight grants.
