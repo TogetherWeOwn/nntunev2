@@ -668,6 +668,7 @@ pub mod relationships;
 pub mod release_labels;
 
 pub mod release_credits;
+pub mod works;
 
 #[cfg(test)]
 mod tests {
