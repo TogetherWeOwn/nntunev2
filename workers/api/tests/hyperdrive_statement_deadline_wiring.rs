@@ -501,6 +501,7 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     .map(|name| (name, function_body(store, &format!("asyncfn{name}("))));
     let helpers = [
         "invite_by_hash_on",
+        "try_observe_invite_expiry",
         "reap_unverified_users_on",
         "prune_expired_challenges_on",
         "delete_expired_rate_limit_slots",
