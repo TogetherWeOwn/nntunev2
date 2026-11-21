@@ -419,7 +419,7 @@ export class ApiClient {
 			`${ADMIN_SETTINGS}/${key}`, { method: 'PUT', cache: 'no-store', redirect: 'error', signal,
 				headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value }) }
 		);
-		if (status !== 200 || data?.key !== key || !isInvitePolicyValue(key, data.value))
+		if (status !== 200 || data?.key !== key || data.value !== value || !isInvitePolicyValue(key, data.value))
 			throw invalidAdminSettings(status);
 		return data.value;
 	}

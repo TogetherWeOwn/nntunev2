@@ -45,7 +45,7 @@ test('opens from authorized windows and saves exactly one setting by keyboard at
 	const pending = Promise.withResolvers<void>();
 	const writes = await mock(page, async (route) => {
 		await pending.promise;
-		await route.fulfill({ json: { key: months, value: 11, previous_value: 9 } });
+		await route.fulfill({ json: { key: months, value: 10, previous_value: 9 } });
 	});
 	await page.goto('/admin/invite-windows');
 	await page.getByRole('link', { name: 'Invite policy', exact: true }).press('Enter');
@@ -65,9 +65,22 @@ test('opens from authorized windows and saves exactly one setting by keyboard at
 	await expect(page.getByText(/^Saved /)).toHaveCount(0);
 	await monthInput.evaluate((el) => el.closest('form')!.requestSubmit());
 	pending.resolve();
-	await expect(page.getByText('Saved 11 months.', { exact: true })).toBeVisible();
-	await expect(monthInput).toHaveValue('11');
+	await expect(page.getByText('Saved 10 months.', { exact: true })).toBeVisible();
+	await expect(monthInput).toHaveValue('10');
 	await expect(quotaInput).toHaveValue('24');
+	expect(writes).toEqual([{ key: months, body: { value: 10 } }]);
+});
+
+test('ignores an unchanged submission and still allows a later edit', async ({ page }) => {
+	const writes = await mock(page);
+	await page.goto(path);
+	const input = page.getByLabel(fields[0]);
+	await expect(input).toHaveValue('9');
+	await input.evaluate((el) => el.closest('form')!.requestSubmit());
+	await expect(page.getByText(/^Saved /)).toHaveCount(0);
+	await input.fill('10');
+	await input.press('Enter');
+	await expect(page.getByText('Saved 10 months.')).toBeVisible();
 	expect(writes).toEqual([{ key: months, body: { value: 10 } }]);
 });
 
@@ -91,12 +104,15 @@ test('rejects invalid input and accepts both inclusive endpoints for all setting
 	}
 });
 
-for (const [status, code, message] of [
-	[401, 'reauth_required', 'Sign out and sign in again'], [404, 'not_found', 'Invite policy is unavailable'],
-	[422, 'validation_failed', 'The server rejected this value'], [0, '', 'Reload and check the current value'],
-	[200, '', 'Reload and check the current value']
-] as const) test(`does not retry or report success after an unconfirmed write (${status})`, async ({ page }) => {
-	const writes = await mock(page, (route) => status === 0 ? route.abort() : route.fulfill({ status, json: { code, key: quota, value: 4 } }));
+for (const [name, status, code, message, key = months, value = 4] of [
+	['recent session required', 401, 'reauth_required', 'Sign out and sign in again'],
+	['admin refusal', 404, 'not_found', 'Invite policy is unavailable'],
+	['validation failure', 422, 'validation_failed', 'The server rejected this value'],
+	['network failure', 0, '', 'Reload and check the current value'],
+	['wrong key', 200, '', 'Reload and check the current value', quota],
+	['wrong value', 200, '', 'Reload and check the current value', months, 5]
+] as const) test(`does not retry or report success after ${name}`, async ({ page }) => {
+	const writes = await mock(page, (route) => status === 0 ? route.abort() : route.fulfill({ status, json: { code, key, value } }));
 	await page.goto(path);
 	const input = page.getByLabel(fields[0]);
 	await input.fill('4');
