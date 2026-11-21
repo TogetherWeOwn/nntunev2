@@ -202,7 +202,7 @@ test.each(['nexttrack', 'previoustrack'] as const)('unsupported %s leaves the ot
 	}
 });
 
-function setup({ unsupported, connected = true, ready = connected }: { unsupported?: string; connected?: boolean; ready?: boolean } = {}) {
+function setup({ unsupported, connected = true, ranges }: { unsupported?: string; connected?: boolean; ranges?: Decoder['ranges'] } = {}) {
 	const { session, handler } = stubSession(unsupported);
 	const queue = createQueueController(createQueue([coral, moss]));
 	const commit = (next: typeof queue.snapshot) => {
@@ -210,16 +210,15 @@ function setup({ unsupported, connected = true, ready = connected }: { unsupport
 		return queue.snapshot === next;
 	};
 	const media = createMediaController(queue, { commit, flush: async () => {}, browseCopy: { invalidate() {} }, announce() {} }, () => true);
-	const audio = new Decoder(coral.streamUrl);
-	audio.isConnected = connected;
+	const audio = Object.assign(new Decoder(coral.streamUrl), { isConnected: connected });
 	const detach = media.attach(audio.element);
-	if (ready) audio.setReady();
+	if (connected) audio.setReady(ranges);
 	onTestFinished(() => media.destroy());
 	return { handler, session, media, audio, detach, queue, select: (track: typeof moss) => commit(createQueue([track])),
 		fire: (action: typeof actions[number], details: object = {}) => handler(action)!({ action, ...details }) };
 }
 
-test.each([['seekto', false], ['seekforward', false], ['seekto', true]] as const)('system seek readback and %s endpoint (superseded: %s)', async (endpoint, superseded) => {
+test.each(['seekto', 'seekforward', 'compact', 'extended', 'old end'])('system seek readback and endpoint (%s)', async (scenario) => {
 	const { audio, media, session, fire, queue } = setup();
 	const initial = queue.snapshot;
 	vi.mocked(session.setPositionState)!.mockClear();
@@ -235,20 +234,24 @@ test.each([['seekto', false], ['seekforward', false], ['seekto', true]] as const
 	expect(audio.paused).toBe(true);
 	expect(audio.play).not.toHaveBeenCalled();
 	await media.playCurrent();
+	fire('seekforward');
+	expect(audio).toMatchObject({ currentTime: 10, paused: false });
 	fire('seekto', { seekTime: 12.25 });
-	expect(audio).toMatchObject({ currentTime: 12.25, paused: false });
 	for (const unused of [audio.pause, audio.fastSeek, session.setPositionState]) expect(unused).not.toHaveBeenCalled();
 	audio.emit('seeked');
 	expect(session.setPositionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
 	audio.emit('playing');
 	audio.write.mockImplementationOnce((target) => { audio.position = target - 0.000001; });
-	fire(endpoint, { seekTime: 60, seekOffset: 100 });
+	fire(scenario === 'seekforward' ? 'seekforward' : 'seekto', { seekTime: 60, seekOffset: 100 });
 	expect(audio.currentTime).toBe(59.999999);
-	if (superseded) media.seek(get(media.absoluteSeek).attachment, 59.9999995);
+	if (scenario === 'compact') media.seek(get(media.absoluteSeek).attachment, 59.9999995);
+	else if (scenario === 'seekto' || scenario === 'seekforward') audio.position = 59.999998;
 	audio.emit('seeking', 'seeked');
-	Object.assign(audio, { position: 60, ended: true, paused: true });
+	audio.duration = scenario === 'extended' || scenario === 'old end' ? 75 : 60;
+	if (audio.duration === 75) audio.emit('durationchange');
+	Object.assign(audio, { position: scenario === 'extended' ? 75 : 60, ended: true, paused: true });
 	audio.emit('pause', 'ended');
-	if (superseded) expect(queue.snapshot.currentIndex).toBe(1);
+	if (scenario === 'extended' || scenario === 'compact') expect(queue.snapshot.currentIndex).toBe(1);
 	else expect(queue.snapshot).toBe(initial);
 	expect(audio.play).toHaveBeenCalledOnce();
 	expect(audio.load).not.toHaveBeenCalled();
@@ -273,8 +276,7 @@ test.each([['seekforward', 59.98, 1, 'Forward'], ['seekbackward', 0.02, -1, 'Bac
 });
 
 test('invalid inputs leave time unchanged and native ranges govern seek registration', () => {
-	const { audio, media, handler, fire } = setup({ ready: false });
-	audio.setReady([[0, 0]]);
+	const { audio, media, handler, fire } = setup({ ranges: [[0, 0]] });
 	for (const action of actions) expect(handler(action)).toBeFalsy();
 	audio.setReady([[0, 24], [40, 60]]);
 	const before = get(media.seekFeedback);
@@ -283,14 +285,13 @@ test('invalid inputs leave time unchanged and native ranges govern seek registra
 		for (const value of [NaN, Infinity, -1, '5', null, true, {}, action === 'seekto' ? undefined : 0]) fire(action, { [field]: value });
 		fire(action, { action: 'play', seekTime: 5, seekOffset: 5 });
 	}
-	expect(audio.write).not.toHaveBeenCalled();
 	expect(get(media.seekFeedback)).toBe(before);
 	expect(audio.play).not.toHaveBeenCalled();
 	fire('seekto', { seekTime: 30 });
 	expect(get(media.absoluteSeek).feedback).toBe('That position is not seekable yet.');
 	fire('seekforward', { seekOffset: 4.02 });
 	expect(get(media.seekFeedback).jumpStatus).toBe('Cannot jump: this track cannot seek yet.');
-	expect(audio.currentTime).toBe(20);
+	expect(audio.write).not.toHaveBeenCalled();
 	for (const action of actions) expect(handler(action)).toBeTypeOf('function');
 });
 

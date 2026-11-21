@@ -1,5 +1,5 @@
 import { get, writable } from 'svelte/store';
-import { emptySeek, readAbsoluteSeek, writeAbsoluteSeek, type AbsoluteSeekState } from './absoluteSeek.js';
+import { emptySeek, readAbsoluteSeek, SEEK_READBACK_TOLERANCE, writeAbsoluteSeek, type AbsoluteSeekState } from './absoluteSeek.js';
 import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { createPlayerSleepTimer } from './playerSleepTimer.js';
@@ -389,11 +389,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function onSeekLanded(attachment: MediaAttachment, system?: SystemSeekGuard) {
-		if (!system && typeof attachment.soughtToEnd !== 'number') return;
-		// Keep the accepted endpoint readback, not the unrounded request.
-		return (target: number, duration: number, readback: number) => {
-			attachment.soughtToEnd = system && target === duration ? Math.min(readback, duration) : false;
-		};
+		if (system || typeof attachment.soughtToEnd === 'number')
+			return (target: number, duration: number) => { attachment.soughtToEnd = system && target === duration ? duration : false; };
 	}
 
 	function jump(direction: JumpDirection, seconds = RELATIVE_JUMP_SECONDS, system?: SystemSeekGuard): void {
@@ -530,14 +527,17 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const base = queue.snapshot;
 		if (!audio.ended || audio.error !== null || !attachment.playing || !ownsOrigin()) return;
 		const { soughtToEnd } = attachment;
+		// A duration revision alone does not make an old endpoint event natural.
+		const systemEnd = typeof soughtToEnd === 'number' && !(audio.duration > soughtToEnd && audio.currentTime > soughtToEnd);
+		if (!ownsOrigin()) return;
 		attachment.playing = attachment.soughtToEnd = false;
-		if (typeof soughtToEnd === 'number') return;
+		if (systemEnd) return;
 		generation = ++endGeneration;
 		announce('');
 		if (!ownsOrigin()) return;
 		const result = naturalEndPolicy(base, {
 			repeat: get(repeat), radioActive: false, continueRadio: false,
-			sleepComplete: sleepTimer.observeEnd(!soughtToEnd), playing: true, validEnd: true
+			sleepComplete: sleepTimer.observeEnd(soughtToEnd !== true), playing: true, validEnd: true
 		});
 		if (result.action !== 'play' || !ownsOrigin()) return;
 		const track = currentTrack(result.queue);
@@ -673,7 +673,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 						case 'seeking': {
 							const { currentTime, duration } = audio;
 							if (!matches(intent)) return;
-							if (!(typeof receipt.soughtToEnd === 'number' && currentTime >= receipt.soughtToEnd))
+							if (!(typeof receipt.soughtToEnd === 'number' && Math.abs(currentTime - receipt.soughtToEnd) <= SEEK_READBACK_TOLERANCE))
 								receipt.soughtToEnd = Number.isFinite(duration) && duration > 0 && currentTime >= duration;
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
 							return observeSeeking(audio, () => matches(intent));

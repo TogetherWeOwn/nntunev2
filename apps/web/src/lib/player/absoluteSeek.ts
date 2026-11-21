@@ -3,6 +3,7 @@ type SeekMedia = Pick<HTMLMediaElement, 'currentTime' | 'duration' | 'error' | '
 const emptyObservation = { position: 0, duration: 0, enabled: false, seeking: false };
 export const emptySeek = { ...emptyObservation, elapsed: 0, attachment: 0, feedback: '', feedbackVersion: 0 };
 export type AbsoluteSeekState = typeof emptySeek;
+export const SEEK_READBACK_TOLERANCE = 0.05;
 
 export function seekable(media: Pick<SeekMedia, 'seekable'>, duration: number, target?: number, unavailable?: () => void): boolean {
 	const ranges = media.seekable;
@@ -29,7 +30,7 @@ export function readAbsoluteSeek(media: SeekMedia): typeof emptyObservation {
 	}
 }
 
-export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: () => boolean, unavailable?: () => void, landed?: (target: number, duration: number, readback: number) => void): string {
+export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: () => boolean, unavailable?: () => void, landed?: (target: number, duration: number) => void): string {
 	let validating = true;
 	try {
 		const { duration, currentTime, error } = media;
@@ -44,11 +45,9 @@ export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: ()
 		media.currentTime = target;
 		if (!landed && !matches()) return '';
 		const observed = media.currentTime;
-		const accepted = Number.isFinite(observed) && Math.abs(observed - target) <= 0.05;
-		if (accepted && observed !== currentTime) landed?.(target, duration, observed);
+		const accepted = Number.isFinite(observed) && Math.abs(observed - target) <= SEEK_READBACK_TOLERANCE;
+		if (accepted && observed !== currentTime) landed?.(target, duration);
 		if (accepted) return '';
-	} catch {
-		if (validating) unavailable?.();
-	}
+	} catch { if (validating) unavailable?.(); }
 	return 'The player did not accept that seek.';
 }

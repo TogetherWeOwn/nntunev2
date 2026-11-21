@@ -5,8 +5,7 @@ import { RELATIVE_JUMP_SECONDS } from './relativeJump.js';
 
 export type SystemSeekGuard = { active: () => boolean; canReport: () => boolean; unavailable: () => void };
 export type SystemSeekOwner = {
-	audio: HTMLAudioElement; attachment: number;
-	availability: Writable<AbsoluteSeekState>;
+	audio: HTMLAudioElement; attachment: number; availability: Writable<AbsoluteSeekState>;
 	matches: () => boolean; positionIntent: () => number;
 	dispatch: (action: 'seekto' | 'seekforward' | 'seekbackward', seconds: number, guard: SystemSeekGuard) => void;
 };
@@ -31,10 +30,9 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 			};
 			const action = (name: Parameters<SystemSeekOwner['dispatch']>[0]) => (details: MediaSessionSeekDetails) => {
 				if (details?.action !== name || !active()) return;
-				const absolute = name === 'seekto';
 				const { seekTime, seekOffset = RELATIVE_JUMP_SECONDS } = details;
-				const seconds = absolute ? seekTime : seekOffset;
-				if (typeof seconds !== 'number' || !Number.isFinite(seconds) || (absolute ? seconds < 0 : seconds <= 0)) return;
+				const seconds = name === 'seekto' ? seekTime : seekOffset;
+				if (typeof seconds !== 'number' || !Number.isFinite(seconds) || (name === 'seekto' ? seconds < 0 : seconds <= 0)) return;
 				const intent = owner.positionIntent();
 				if (!owner.matches() || !active() || owner.positionIntent() !== intent) return;
 				if (!readAbsoluteSeek(owner.audio).enabled) { retire(); return; }
