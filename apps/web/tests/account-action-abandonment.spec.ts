@@ -22,6 +22,7 @@ import { expect, test, type Page } from '@playwright/test';
  * (other HTTP failures, network rejection, malformed bodies) purge nothing.
  * Pricing and billing abandonment keep the full preservation contract.
  */
+const AUTH_SETTLEMENT_WRITES = ['setItem:nntune.auth.generation.v1'];
 const SNAPSHOT = 'nntune.library.snapshot.v1';
 const AUTH_CONTEXT = 'nntune.library.auth-context.v1';
 const EMAIL = 'nntune:signed-in-email';
@@ -243,7 +244,7 @@ for (const action of ACTIONS) {
 				writes: window.__abandonment.writes, broadcasts: window.__abandonment.broadcasts,
 				rejections: window.__abandonment.rejections, requests: window.__abandonment.requests
 			}));
-			expect.soft(probe.writes, 'no stale storage write, including clear-and-restore').toEqual([]);
+			expect.soft(probe.writes, 'no stale storage write, including clear-and-restore').toEqual(action.path === '/account/security' ? AUTH_SETTLEMENT_WRITES : []);
 			expect.soft(probe.broadcasts, 'no stale cross-tab cache invalidation').toEqual([]);
 			expect.soft(probe.rejections).toEqual([]);
 			expect.soft(observed.pageErrors).toEqual([]);
@@ -373,7 +374,7 @@ for (const action of SECURITY_ACTIONS) {
 			writes: window.__abandonment.writes, broadcasts: window.__abandonment.broadcasts,
 			rejections: window.__abandonment.rejections, requests: window.__abandonment.requests
 		}));
-		expect.soft(probe.writes, 'no stale storage write').toEqual([]);
+		expect.soft(probe.writes, 'only the auth generation changes').toEqual(AUTH_SETTLEMENT_WRITES);
 		expect.soft(probe.broadcasts, 'no stale cross-tab invalidation').toEqual([]);
 		expect.soft(observed.navigations, 'no stale client navigation').toEqual([]);
 		expect.soft(new URL(page.url()).pathname).toBe(action.path);
@@ -406,7 +407,7 @@ for (const action of SECURITY_ACTIONS) {
 			writes: window.__abandonment.writes, broadcasts: window.__abandonment.broadcasts,
 			rejections: window.__abandonment.rejections, requests: window.__abandonment.requests
 		}));
-		expect.soft(probe.writes, 'no stale storage write').toEqual([]);
+		expect.soft(probe.writes, 'only the auth generation changes').toEqual(AUTH_SETTLEMENT_WRITES);
 		expect.soft(probe.broadcasts, 'no stale cross-tab invalidation').toEqual([]);
 		expect.soft(observed.navigations, 'no stale client navigation').toEqual([]);
 		expect.soft(new URL(page.url()).pathname).toBe(action.path);

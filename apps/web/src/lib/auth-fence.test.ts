@@ -14,9 +14,7 @@ function setup() {
 	const setItem = vi.fn(write), removeItem = vi.fn(remove);
 	vi.stubGlobal('window', { localStorage: Object.assign(entries, { setItem, removeItem, getItem: (key: string) => entries[key] ?? null }) });
 	const names = new Set<string>();
-	vi.stubGlobal('caches', {
-		keys: async () => [...names], open: async (name: string) => names.add(name), delete: async (name: string) => names.delete(name)
-	});
+	vi.stubGlobal('caches', { keys: async () => [...names], open: async (name: string) => names.add(name), delete: async (name: string) => names.delete(name) });
 	const send = vi.fn(async () => ok());
 	return { read: () => entries[AUTH_GENERATION_KEY] ?? null, setItem, removeItem, write, remove, send, api: new ApiClient({ baseUrl: '', fetchFn: send }) };
 }
@@ -88,9 +86,7 @@ it.each(['local', 'cache', 'lock retry'])('withholds cross-tab receipts via %s',
 			await (await startWriter(true))();
 			expect(await captureAuthFence()).toBeUndefined();
 		}
-	} finally {
-		await first();
-	}
+	} finally { await first(); }
 	expect((await captureAuthFence())?.isCurrent()).toBe(true);
 });
 it.each([true, false])('guards locked writes on generation failure (recovers: %s)', async (recovers) => {
@@ -155,10 +151,7 @@ it.each(['busy', 'changed', 'missing', 'unchanged', 'cancelled'])('checks revoca
 		else if (state === 'unchanged') expect(await result).toEqual({});
 		else expect(await result).toMatchObject({ code: 'conflict' });
 		expect(send).toHaveBeenCalledTimes(state === 'unchanged' ? 1 : 0);
-	} finally {
-		unlock.resolve();
-		await Promise.all([writer, result]);
-	}
+	} finally { unlock.resolve(); await Promise.all([writer, result]); }
 });
 it.each([0, 1])('releases the shared lock when cache enumeration %i stalls', async (check) => {
 	const { api, send } = setup();
