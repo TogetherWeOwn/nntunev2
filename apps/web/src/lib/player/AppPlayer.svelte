@@ -15,7 +15,7 @@
 	let shareOwner: string | undefined;
 	const player = setAppPlayer(Object.assign(createPlayerController(createQueue([]), { flush: tick }),
 		{ claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
-	const { queue, media, media: { seekFeedback } } = player;
+	const { queue, media, media: { seekFeedback, playbackStatus } } = player;
 	const attachNativeAudio = media.attach;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
@@ -39,6 +39,7 @@
 {#if streamUrl}
 	<div class="nt-wrap">
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
+			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
 	</div>
 {/if}
