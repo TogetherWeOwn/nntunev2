@@ -19,16 +19,16 @@ function validSound(value: unknown): value is SoundPreference {
 		sound.volume <= 1 && typeof sound.muted === 'boolean';
 }
 
-export function parseSoundPreference(raw: string | null): SoundPreference {
+export function parseSoundPreference(raw: string | null, fallback = defaults()): SoundPreference {
 	try {
 		const value: unknown = JSON.parse(raw ?? 'null');
 		if (validSound(value) && (value as { version?: unknown }).version === 1) {
 			return { volume: value.volume, muted: value.muted };
 		}
 	} catch {
-		// A malformed record defaults atomically, without clearing storage.
+		// Ignore the entire malformed record without clearing storage.
 	}
-	return defaults();
+	return fallback;
 }
 
 export function serializeSoundPreference(value: SoundPreference): string {
@@ -36,11 +36,11 @@ export function serializeSoundPreference(value: SoundPreference): string {
 	return JSON.stringify({ version: 1, volume: sound.volume, muted: sound.muted });
 }
 
-export function loadSoundPreference(storage: SoundStorage): SoundPreference {
+export function loadSoundPreference(storage: SoundStorage, fallback = defaults()): SoundPreference {
 	try {
-		return parseSoundPreference(storage?.getItem(SOUND_PREFERENCE_STORAGE_KEY) ?? null);
+		return parseSoundPreference(storage?.getItem(SOUND_PREFERENCE_STORAGE_KEY) ?? null, fallback);
 	} catch {
-		return defaults();
+		return fallback;
 	}
 }
 

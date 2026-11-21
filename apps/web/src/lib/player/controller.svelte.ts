@@ -101,6 +101,9 @@ export function createPlayerController(
 			if (!isCurrent()) return false;
 		}
 		if (trackChanged || resolveStreamUrl(before) !== resolveStreamUrl(after)) {
+			// Sample the live element before retiring its queued volumechange events.
+			media.observeSound();
+			if (!isCurrent()) return false;
 			version += 1;
 			retireNativeHost();
 			if (!isCurrent()) return false;

@@ -43,8 +43,8 @@ export interface MediaSessionLike {
 }
 
 export interface MediaSessionHandlers {
-	onNext: () => void;
-	onPrevious: () => void;
+	onNext?: () => void;
+	onPrevious?: () => void;
 	onPlay?: () => void;
 	onPause?: () => void;
 	onSeekTo?: (details: MediaSessionSeekDetails) => void;
@@ -91,9 +91,13 @@ export function buildMediaMetadataInit(track: Track, baseUrl: string): MediaMeta
 	};
 }
 
-function defaultSession(): MediaSessionLike | null {
-	if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return null;
-	return navigator.mediaSession as unknown as MediaSessionLike;
+export function getMediaSession(): MediaSessionLike | null {
+	if (typeof navigator === 'undefined') return null;
+	try {
+		return (navigator.mediaSession as unknown as MediaSessionLike | undefined) ?? null;
+	} catch {
+		return null;
+	}
 }
 
 function defaultMetadataCtor(): (new (init: MediaMetadataInit) => unknown) | null {
@@ -137,7 +141,7 @@ export function setMediaSessionPosition(
 	state: MediaSessionPosition | null,
 	options: Pick<ApplyMediaSessionOptions, 'session'> = {}
 ): void {
-	const session = options.session === undefined ? defaultSession() : options.session;
+	const session = options.session === undefined ? getMediaSession() : options.session;
 	if (session === null) return;
 	const valid =
 		state !== null &&
@@ -153,14 +157,12 @@ export function setMediaSessionPosition(
 	}
 }
 
-const NO_HANDLERS: MediaSessionHandlers = { onNext: () => {}, onPrevious: () => {} };
-
 /**
  * Drop metadata and every action handler. Call on player teardown: the
  * OS controls are global and would otherwise keep driving a destroyed page.
  */
 export function clearMediaSession(options: ApplyMediaSessionOptions = {}): boolean {
-	return applyMediaSession(null, NO_HANDLERS, options);
+	return applyMediaSession(null, {}, options);
 }
 
 /**
@@ -172,7 +174,7 @@ export function applyMediaSession(
 	handlers: MediaSessionHandlers,
 	options: ApplyMediaSessionOptions = {}
 ): boolean {
-	const session = options.session === undefined ? defaultSession() : options.session;
+	const session = options.session === undefined ? getMediaSession() : options.session;
 	if (session === null) return false;
 
 	if (track === null) {

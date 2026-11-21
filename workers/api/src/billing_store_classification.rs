@@ -19,6 +19,7 @@ pub struct ObservedTarget<'a> {
     pub identity: Identity<'a>,
     pub predicate_stale: bool,
     pub other_live_holder: bool,
+    pub equal_end_provenance_changed: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub enum Target {
     Owned {
         predicate_stale: bool,
         other_live_holder: bool,
+        equal_end_provenance_changed: bool,
     },
 }
 
@@ -67,6 +69,7 @@ pub fn classify_target(
         [row] if row.identity == *requested => Ok(Target::Owned {
             predicate_stale: row.predicate_stale,
             other_live_holder: row.other_live_holder,
+            equal_end_provenance_changed: row.equal_end_provenance_changed,
         }),
         _ => Err(Refused),
     }
@@ -88,6 +91,27 @@ pub fn validate_read_provenance(
     owned_target_exists: bool,
 ) -> Result<(), Refused> {
     if owned_target_exists && !outcome.explicit_stale && outcome.read_plan.is_none() {
+        return Err(Refused);
+    }
+    Ok(())
+}
+
+/// A non-explicit terminal fold cannot release an owned slot using proof
+/// that changed at the same paid end. The caller must refold from a fresh read.
+pub fn validate_terminal_provenance(
+    outcome: &ReconcileOutcome,
+    target: &Target,
+) -> Result<(), Refused> {
+    if !outcome.explicit_stale
+        && crate::billing_reconcile::is_terminal_status(&outcome.row.status)
+        && matches!(
+            target,
+            Target::Owned {
+                equal_end_provenance_changed: true,
+                ..
+            }
+        )
+    {
         return Err(Refused);
     }
     Ok(())
@@ -149,11 +173,13 @@ mod tests {
                 identity: identity("user-b", "sub-a"),
                 predicate_stale: true,
                 other_live_holder: false,
+                equal_end_provenance_changed: false,
             },
             ObservedTarget {
                 identity: identity("user-a", "sub-b"),
                 predicate_stale: false,
                 other_live_holder: false,
+                equal_end_provenance_changed: false,
             },
         ] {
             assert_eq!(classify_target(&requested, &[row]), Err(Refused));
@@ -163,11 +189,13 @@ mod tests {
                 identity: identity("user-a", "sub-a"),
                 predicate_stale: false,
                 other_live_holder: false,
+                equal_end_provenance_changed: false,
             },
             ObservedTarget {
                 identity: identity("user-a", "sub-a"),
                 predicate_stale: false,
                 other_live_holder: false,
+                equal_end_provenance_changed: false,
             },
         ];
         assert_eq!(classify_target(&requested, &rows), Err(Refused));
@@ -180,6 +208,7 @@ mod tests {
             identity: identity("user-a", "sub-a"),
             predicate_stale: false,
             other_live_holder: false,
+            equal_end_provenance_changed: true,
         }];
         let target = classify_target(&requested, &own).unwrap();
         assert_eq!(
@@ -206,10 +235,12 @@ mod tests {
         let own_stale = Target::Owned {
             predicate_stale: true,
             other_live_holder: false,
+            equal_end_provenance_changed: false,
         };
         let own_fresh = Target::Owned {
             predicate_stale: false,
             other_live_holder: false,
+            equal_end_provenance_changed: false,
         };
         assert_eq!(
             classify_write(
@@ -235,6 +266,7 @@ mod tests {
         let occupied = Target::Owned {
             predicate_stale: false,
             other_live_holder: true,
+            equal_end_provenance_changed: true,
         };
         assert_eq!(
             classify_write(&requested, &occupied, &[], true),
