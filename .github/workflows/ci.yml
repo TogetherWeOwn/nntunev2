@@ -771,7 +771,8 @@ jobs:
         run: |
           for test_name in \
             listen_history::postgres_tests::clear_and_terminal_write_share_owner_fence \
-            listen_history::postgres_tests::history_uses_the_grant_privacy_decision; do
+            listen_history::postgres_tests::history_uses_the_grant_privacy_decision \
+            handlers::tests::unmounted_history_receiver_writes_through_pg_store; do
             inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --list)"
             test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
             cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --exact

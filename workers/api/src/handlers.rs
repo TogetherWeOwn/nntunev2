@@ -982,6 +982,16 @@ pub trait Store {
         }
     }
 
+    /// Record client history only; the storage layer owns issued-play admission.
+    fn record_listen_event(
+        &self,
+        _owner: &str,
+        _event: &crate::listen_history::ListenEventBody,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::listen_history::WriteOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+
     fn export_listen_events(
         &self,
         _owner: &str,
@@ -1019,12 +1029,18 @@ pub trait Store {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> impl Future<Output = Result<crate::playback::LeaseAcquire, StoreError>> {
         async move {
             let _ = (
-                user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                user_id,
+                session_id,
+                track_id,
+                play_id,
+                now,
+                continuation_deadline,
+                takeover,
             );
             Err(StoreError)
         }
@@ -1059,8 +1075,17 @@ pub trait Store {
         user_id: &str,
         track_id: &str,
     ) -> impl Future<Output = Result<crate::meter_sink::TrackMeterMeta, StoreError>> {
+        self.track_meta(user_id, track_id, false)
+    }
+    /// With `duration_only`, a positive app duration is sufficient; skip the mirror.
+    fn track_meta(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        duration_only: bool,
+    ) -> impl Future<Output = Result<crate::meter_sink::TrackMeterMeta, StoreError>> {
         async move {
-            let _ = (user_id, track_id);
+            let _ = (user_id, track_id, duration_only);
             Err(StoreError)
         }
     }
@@ -4847,6 +4872,10 @@ where
 #[path = "listen_history_controls.rs"]
 mod listen_history_controls;
 
+#[allow(dead_code)] // Prepared, with no production route or caller.
+#[path = "listen_history_receiver.rs"]
+mod listen_history_receiver;
+
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
 
@@ -6348,7 +6377,7 @@ fn mint_play(
     play_id: &str,
     epoch: u64,
     now: u64,
-    lease_expires_at: u64,
+    continuation_deadline: u64,
 ) -> Result<IssuedPlay, Response> {
     match crate::play_grant::issue_v2_at(
         user_id,
@@ -6356,14 +6385,14 @@ fn mint_play(
         play_id,
         epoch,
         now,
-        crate::play_grant::MAX_GRANT_TTL,
+        continuation_deadline.saturating_sub(now),
         Some(secret),
     ) {
         Ok(grant) => Ok(IssuedPlay {
             grant,
             play_id: play_id.to_string(),
             lease_epoch: epoch,
-            lease_expires_at,
+            lease_expires_at: crate::playback::lease_expiry(now, continuation_deadline),
         }),
         Err(crate::play_grant::MintError::NotConfigured) => Err(internal()),
         Err(crate::play_grant::MintError::InvalidIdentity) => {
@@ -6455,7 +6484,8 @@ where
             {
                 return Err(validation_failed("invalid play_id"));
             }
-            let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+            let lease_expires_at =
+                crate::playback::lease_expiry(ctx.now, row.continuation_deadline);
             match ctx
                 .store
                 .touch_playback_lease(
@@ -6476,7 +6506,7 @@ where
                         play_id,
                         row.epoch,
                         ctx.now,
-                        lease_expires_at,
+                        row.continuation_deadline,
                     );
                 }
                 Ok(false) => {}
@@ -6548,7 +6578,12 @@ where
         Ok(id) => id,
         Err(_) => return Err(unavailable()),
     };
-    let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+    let meta = ctx
+        .store
+        .track_meta(user_id, &body.track_id, true)
+        .await
+        .map_err(|_| internal())?;
+    let continuation_deadline = crate::playback::continuation_deadline(ctx.now, meta);
     match ctx
         .store
         .acquire_playback_lease(
@@ -6557,7 +6592,7 @@ where
             &body.track_id,
             &play_id,
             ctx.now,
-            lease_expires_at,
+            continuation_deadline,
             body.takeover,
         )
         .await
@@ -6569,7 +6604,7 @@ where
             &play_id,
             epoch,
             ctx.now,
-            lease_expires_at,
+            continuation_deadline,
         ),
         // Preserve the typed 409 when deletion wins after the first check.
         Ok(crate::playback::LeaseAcquire::Held { .. }) | Err(_)
@@ -6636,7 +6671,11 @@ where
         ctx.now,
     );
     let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
-        let expires = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+        let deadline = lease
+            .as_ref()
+            .expect("active lease has a row")
+            .continuation_deadline;
+        let expires = crate::playback::lease_expiry(ctx.now, deadline);
         match ctx
             .store
             .touch_playback_lease(
@@ -8248,6 +8287,8 @@ mod tests {
         /// Mirror of `users.invited_by` (migration 0033), keyed by the
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
+        listen_owners: RefCell<Vec<String>>,
+        listen_failure: std::cell::Cell<Option<&'static str>>,
         listen_rows: RefCell<Vec<(String, crate::listen_history::ListenRow)>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
@@ -8311,6 +8352,7 @@ mod tests {
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
         remove_billing_row_after_read: std::cell::Cell<bool>,
         release_live_slot_before_store: std::cell::Cell<bool>,
+        relabel_before_store: std::cell::Cell<bool>,
         reconcile_outcome_attempts: std::cell::Cell<usize>,
         // Displaced rows are retained without changing the per-user projection.
         billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
@@ -8381,6 +8423,7 @@ mod tests {
         /// Derivation metadata keyed by `(user_id, track_id)`; absent
         /// pairs resolve to the all-`None` meta (the fallback rung),
         /// mirroring the production zero-row answer.
+        duration_lookups: std::cell::Cell<usize>,
         meter_meta: RefCell<HashMap<(String, String), crate::meter_sink::TrackMeterMeta>>,
         /// Stored play windows by idempotency key, mirroring the
         /// monotonic upsert (see `record_play_window`).
@@ -9318,6 +9361,19 @@ mod tests {
                 .unwrap_or(0))
         }
 
+        async fn record_listen_event(
+            &self,
+            owner: &str,
+            _event: &crate::listen_history::ListenEventBody,
+            _now: u64,
+        ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+            self.listen_owners.borrow_mut().push(owner.into());
+            if self.listen_failure.get() == Some("write") {
+                return Err(StoreError);
+            }
+            Ok(crate::listen_history::WriteOutcome::Written)
+        }
+
         async fn export_listen_events(
             &self,
             owner: &str,
@@ -9358,7 +9414,7 @@ mod tests {
             track_id: &str,
             play_id: &str,
             now: u64,
-            expires_at: u64,
+            continuation_deadline: u64,
             takeover: bool,
         ) -> Result<crate::playback::LeaseAcquire, StoreError> {
             // All checks precede the commit of the classification and holder.
@@ -9404,7 +9460,8 @@ mod tests {
                             track_id: track_id.to_string(),
                             play_id: play_id.to_string(),
                             epoch,
-                            expires_at,
+                            expires_at: crate::playback::lease_expiry(now, continuation_deadline),
+                            continuation_deadline,
                         },
                     );
                     if private {
@@ -9442,17 +9499,22 @@ mod tests {
                         && row.play_id == play_id
                         && row.epoch == epoch =>
                 {
-                    row.expires_at = row.expires_at.max(expires_at);
+                    row.expires_at = row
+                        .expires_at
+                        .max(expires_at)
+                        .min(row.continuation_deadline);
                     Ok(true)
                 }
                 _ => Ok(false),
             }
         }
-        async fn track_meter_meta(
+        async fn track_meta(
             &self,
             user_id: &str,
             track_id: &str,
+            _duration_only: bool,
         ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
+            self.duration_lookups.set(self.duration_lookups.get() + 1);
             Ok(self
                 .meter_meta
                 .borrow()
@@ -9503,6 +9565,9 @@ mod tests {
             now: u64,
             window_secs: u64,
         ) -> Result<bool, StoreError> {
+            if self.listen_failure.get() == Some(action) {
+                return Err(StoreError);
+            }
             if limit == 0 || window_secs == 0 {
                 return Ok(false);
             }
@@ -10684,7 +10749,7 @@ mod tests {
             }
             use crate::billing_store_classification::{
                 classify_explicit_stale, has_slot_suppression_proof, validate_history_target,
-                validate_read_provenance, Target,
+                validate_read_provenance, validate_terminal_provenance, Target,
             };
             validate_history_target(outcome).map_err(|_| StoreError)?;
             if outcome.explicit_stale {
@@ -10698,10 +10763,11 @@ mod tests {
                     .borrow()
                     .contains_key(&(user_id.to_string(), sub.clone()));
                 let target = if own_current || own_shadow {
-                    // Explicit stale ignores the numeric suppression predicate.
+                    // Explicit stale needs only the owned-target identity.
                     Target::Owned {
                         predicate_stale: false,
                         other_live_holder: false,
+                        equal_end_provenance_changed: false,
                     }
                 } else {
                     Target::Absent
@@ -10719,13 +10785,18 @@ mod tests {
                     assert_eq!(holder.status, "active");
                     holder.status = "canceled".into();
                 }
-                let key = (
-                    user_id.to_string(),
-                    outcome.row.stripe_subscription_id.clone(),
-                );
+                if self.relabel_before_store.replace(false) {
+                    let row = rows.get_mut(user_id).unwrap();
+                    assert!(!outcome.explicit_stale);
+                    assert_eq!(outcome.read_plan.as_deref(), Some(PLAN_PLUS));
+                    assert_eq!(outcome.row.paid_through_unix, row.paid_through_unix);
+                    assert_eq!(outcome.row.status, "canceled");
+                    row.plan_id = PLAN_PRO.into();
+                }
+                let key = (user_id.to_string(), sub.clone());
                 let current = rows.get(user_id);
                 let stored = current
-                    .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
+                    .filter(|row| &row.stripe_subscription_id == sub)
                     .or_else(|| shadow.get(&key));
                 validate_read_provenance(outcome, stored.is_some()).map_err(|_| StoreError)?;
                 let live = |status: &str| {
@@ -10736,6 +10807,17 @@ mod tests {
                 };
                 let occupied = current
                     .is_some_and(|row| &row.stripe_subscription_id != sub && live(&row.status));
+                if let Some(row) = stored {
+                    let target = Target::Owned {
+                        predicate_stale: false,
+                        other_live_holder: occupied,
+                        equal_end_provenance_changed: row.paid_through_unix.is_some()
+                            && row.paid_through_unix == outcome.row.paid_through_unix
+                            && (Some(row.plan_id.as_str()) != outcome.read_plan.as_deref()
+                                || row.paid_invoice_id != outcome.read_anchor),
+                    };
+                    validate_terminal_provenance(outcome, &target).map_err(|_| StoreError)?;
+                }
                 if occupied {
                     if live(&outcome.row.status) {
                         // Suppression is for proven existing targets, never new live inserts.
@@ -12050,42 +12132,49 @@ mod tests {
     }
 
     #[test]
-    fn billing_duplicate_checkout_recovers_nonlive_equal_end_state() {
-        for status in ["active", "past_due"] {
-            let h = stripe_harness();
+    fn billing_duplicate_checkout_refolds_equal_end_state() {
+        for status in ["active", "past_due", "canceled"] {
+            let mut h = stripe_harness();
             seed_billing_user(&h, "u1");
             let body = deliver_first_period(&h, "evt_test_1");
-            h.store
-                .billing_rows
-                .borrow_mut()
-                .get_mut("u1")
-                .unwrap()
-                .status = "trialing".into();
-            h.store
-                .checkout_ops
-                .borrow_mut()
-                .get_mut("op_test_1")
-                .unwrap()
-                .state = "needs_reconcile".into();
-            h.stripe
-                .subscriptions
-                .borrow_mut()
-                .get_mut("sub_test_1")
-                .unwrap()
-                .status = status.into();
+            let rows = h.store.billing_rows.get_mut();
+            let ops = h.store.checkout_ops.get_mut();
+            let subscriptions = h.stripe.subscriptions.get_mut();
+            let terminal = status == "canceled";
+            if !terminal {
+                rows.get_mut("u1").unwrap().status = "trialing".into();
+            }
+            ops.get_mut("op_test_1").unwrap().state = "needs_reconcile".into();
+            subscriptions.get_mut("sub_test_1").unwrap().status = status.into();
 
-            webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
-            let live = live_for(&h, "u1").expect("archived target recovered");
-            assert_eq!(live.status, status);
-            assert_eq!(live.plan_id, PLAN_PLUS);
-            assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
-            assert_eq!(live.paid_invoice_id.as_deref(), Some("in_test_1"));
-            assert_eq!(live.grace_until_unix.is_some(), status == "past_due");
-            assert_eq!(h.store.invoice_history.borrow().len(), 1);
-            let op = block_on(h.store.checkout_operation_by_id("op_test_1"))
-                .unwrap()
-                .unwrap();
-            assert_eq!(op.state, "succeeded");
+            let state = || h.store.checkout_ops.borrow()["op_test_1"].state.clone();
+            let deliver = || h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+            let history = h.store.invoice_history.borrow().clone();
+            let mut expected = h.store.billing_rows.borrow()["u1"].clone();
+            if terminal {
+                let attempts = h.store.reconcile_outcome_attempts.get();
+                let ops = h.store.checkout_ops.borrow().clone();
+                h.store.relabel_before_store.set(true);
+                assert_eq!(deliver().status, 500);
+                assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts + 1);
+                assert!(h.store.webhook_events.borrow().is_empty());
+                assert_eq!(*h.store.checkout_ops.borrow(), ops);
+                expected.plan_id = PLAN_PRO.into();
+                assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
+                assert!(h.store.billing_shadow.borrow().is_empty());
+                assert_eq!(*h.store.invoice_history.borrow(), history);
+            }
+            webhook_ok(&deliver());
+            let mut stored = h.store.billing_rows.borrow()["u1"].clone();
+            assert_eq!(
+                stored.grace_until_unix.take().is_some(),
+                status == "past_due"
+            );
+            expected.status = status.into();
+            assert_eq!(stored, expected);
+            assert_eq!(*h.store.invoice_history.borrow(), history);
+            assert_eq!(state(), "succeeded");
+            assert!(h.store.webhook_events.borrow().contains("evt_test_1"));
         }
     }
 
@@ -13075,18 +13164,13 @@ mod tests {
             read_plan: None,
             read_anchor: None,
         };
-        let mut terminal_without_read = fresh.clone();
-        terminal_without_read.row = stored_seed("free", "canceled", None, None, None).row;
-        terminal_without_read.history[0].stripe_invoice_id = "in_unseen".into();
-        let put = |outcome| block_on(h.store.store_reconcile_outcome("u1", outcome));
-        put(&fresh).expect("fresh stores");
-        let history_before = h.store.invoice_history.borrow().clone();
-        for _ in 0..2 {
-            assert!(put(&terminal_without_read).is_err());
-            assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
-            assert!(h.store.billing_shadow.borrow().is_empty());
-            assert_eq!(*h.store.invoice_history.borrow(), history_before);
-        }
+        block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
+        let mut terminal = stored_seed("free", "canceled", None, None, None);
+        terminal.history.push(history_row("in_unseen", BILLING_NOW));
+        assert!(block_on(h.store.store_reconcile_outcome("u1", &terminal)).is_err());
+        assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
+        assert!(h.store.billing_shadow.borrow().is_empty());
+        assert!(!h.store.invoice_history.borrow().contains_key("in_unseen"));
         let mut stale = crate::billing_reconcile::ReconcileOutcome {
             row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
@@ -13315,15 +13399,10 @@ mod tests {
         );
         assert!(!outcome.disable_new_purchases());
         assert_eq!((outcome.read_anchor, outcome.read_plan), (None, None));
-        assert_eq!(outcome.row.stripe_subscription_id, "sub_b");
-        assert_eq!(outcome.row.stripe_item_id, "si_test_1");
-        assert_eq!(outcome.row.stripe_price_id, PRICE_PLUS);
-        assert_eq!(outcome.row.plan_id, PLAN_PLUS);
-        assert_eq!(outcome.row.status, "active");
-        assert_eq!(outcome.row.grace_until_unix, None);
-        assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some("in_b"));
-        assert_eq!(outcome.row.paid_through_unix, Some(end));
-        assert_eq!(h.store.billing_rows.borrow()["u1"], outcome.row);
+        let mut expected = stored_seed(PLAN_PLUS, "active", Some(end), Some("in_b"), None).row;
+        expected.stripe_subscription_id = "sub_b".into();
+        assert_eq!(outcome.row, expected);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
         let history = h.store.invoice_history.borrow();
         assert_eq!(history.len(), 1);
         assert_eq!(history["in_b"].stripe_subscription_id, "sub_b");
@@ -13333,65 +13412,38 @@ mod tests {
     fn billing_shadow_preserves_per_user_projection() {
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
-        let first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
+        let mut first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
+        first.row.stripe_subscription_id = "sub_holder".into();
         block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
         let mut second = first.clone();
         second.row.stripe_subscription_id = "sub_second".into();
         block_on(h.store.store_reconcile_outcome("u2", &second)).unwrap();
         let rows = h.store.billing_rows.borrow().clone();
-        let reconcile = || block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_other"));
-        let select_remote = |status| {
-            h.stripe.subscriptions.borrow_mut().insert(
-                "sub_other".into(),
-                test_subscription("sub_other", "cus_test_1", status, PRICE_PLUS),
-            );
-        };
-
-        select_remote("canceled");
-        let terminal = reconcile().expect("new terminal target beside live holder");
-        assert_eq!(terminal.read_plan, None);
-        assert_eq!(terminal.read_anchor, None);
-        assert_eq!(terminal.row.plan_id, "free");
-        assert_eq!(terminal.row.paid_through_unix, None);
-        assert_eq!(terminal.row.paid_invoice_id, None);
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".into(),
+            test_subscription("sub_test_1", "cus_test_1", "canceled", PRICE_PLUS),
+        );
+        let terminal = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+            .expect("new terminal target beside live holder");
+        assert_eq!((terminal.read_plan, terminal.read_anchor), (None, None));
+        assert_eq!(
+            terminal.row,
+            stored_seed("free", "canceled", None, None, None).row
+        );
         assert_eq!(*h.store.billing_rows.borrow(), rows);
         let shadow = h.store.billing_shadow.borrow().clone();
         assert_eq!(shadow.len(), 1);
-        assert_eq!(shadow[&("u1".into(), "sub_other".into())], terminal.row);
+        assert_eq!(shadow[&("u1".into(), "sub_test_1".into())], terminal.row);
         assert!(h.store.invoice_history.borrow().is_empty());
 
-        select_remote("active");
-        h.stripe.invoices.borrow_mut().insert(
-            "in_other".into(),
-            test_invoice(
-                "in_other",
-                "cus_test_1",
-                "sub_other",
-                PRICE_PLUS,
-                BILLING_NOW,
-                BILLING_NOW + BILLING_PERIOD,
-                BILLING_NOW + 60,
-            ),
-        );
-        for _ in 0..2 {
-            let observed = reconcile().expect("owned target records history beside live holder");
-            assert!(!observed.explicit_stale);
-            assert_eq!(observed.read_plan.as_deref(), Some("free"));
-            assert_eq!(observed.row.status, "active");
-            assert_eq!(*h.store.billing_rows.borrow(), rows);
-            assert_eq!(*h.store.billing_shadow.borrow(), shadow);
-            let history = h.store.invoice_history.borrow();
-            assert_eq!(history.len(), 1);
-            assert_eq!(history["in_other"].stripe_subscription_id, "sub_other");
-        }
-        assert_eq!(
-            live_for(&h, "u1").unwrap().stripe_subscription_id,
-            "sub_test_1"
-        );
-        assert_eq!(
-            live_for(&h, "u2").unwrap().stripe_subscription_id,
-            "sub_second"
-        );
+        // A proven live fold beside the holder records only its own history.
+        let body = deliver_first_period(&h, "evt_other");
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(*h.store.billing_rows.borrow(), rows);
+        assert_eq!(*h.store.billing_shadow.borrow(), shadow);
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history["in_test_1"].stripe_subscription_id, "sub_test_1");
     }
 
     #[test]
@@ -13624,11 +13676,8 @@ mod tests {
             assert!(!h.store.webhook_events.borrow().contains("evt_row6"));
             assert_eq!(op(), submitted);
             assert_eq!(h.store.checkout_ops.borrow().len(), 1);
-            assert_eq!(
-                h.store.billing_rows.borrow().get("u1"),
-                wrong_id.then_some(&seed.row)
-            );
-            assert_eq!(h.store.billing_rows.borrow().is_empty(), !wrong_id);
+            let rows = wrong_id.then(|| ("u1".to_string(), seed.row.clone()));
+            assert_eq!(*h.store.billing_rows.borrow(), HashMap::from_iter(rows));
             assert!(h.store.billing_shadow.borrow().is_empty());
             assert!(h.store.invoice_history.borrow().is_empty());
         }
@@ -18477,6 +18526,118 @@ mod tests {
         assert_eq!(lease.session_id, "tab-a");
         assert_eq!(lease.track_id, "track-9");
         assert_eq!(lease.play_id, play_id);
+        assert_eq!(lease.continuation_deadline, NOW + 900);
+    }
+
+    #[test]
+    fn play_issue_caps_initial_grant_at_authoritative_duration_plus_slack() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store.meter_meta.borrow_mut().insert(
+            ("user-plays-1".into(), "track-9".into()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(180_001),
+                mb_duration_ms: Some(300_000),
+                ..Default::default()
+            },
+        );
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["expires_at"], NOW + 181 + 120);
+    }
+
+    #[test]
+    fn play_continues_before_deadline_and_applies_new_play_policy_at_deadline() {
+        let user = "user-plays-1";
+        for denial in [
+            None,
+            Some("subscription_required"),
+            Some("plan_limit_exceeded"),
+        ] {
+            let h = play_harness();
+            let cookie = play_user(&h);
+            seed_entitled(&h, user, "plus", 1);
+            let key = (user.into(), "track-9".into());
+            h.store.meter_meta.borrow_mut().insert(
+                key,
+                crate::meter_sink::TrackMeterMeta {
+                    track_duration_ms: Some(10_000),
+                    ..Default::default()
+                },
+            );
+            let first = shared_play_call(&h, user, "tab-a", "track-9", None).unwrap();
+            let deadline = NOW + 130;
+            if denial == Some("subscription_required") {
+                h.store.ever_paid_users.borrow_mut().insert(user.into());
+                h.store.playback_subscriptions.borrow_mut().remove(user);
+            } else if denial == Some("plan_limit_exceeded") {
+                h.store.stream_seconds.borrow_mut().insert(
+                    (user.into(), crate::ledger::period_month_for_timestamp(NOW)),
+                    3600,
+                );
+            }
+            let body = serde_json::json!({"track_id":"track-9", "session_id":"tab-a", "play_id":first.play_id});
+            let call = |now, path: &str, body: &serde_json::Value| {
+                let mut ctx = h.ctx();
+                ctx.now = now;
+                block_on(handle(
+                    &ctx,
+                    &Request {
+                        method: "POST".into(),
+                        path: path.into(),
+                        cookie: Some(cookie.clone()),
+                        origin: Some(ORIGIN.into()),
+                        authorization: None,
+                        stripe_signature: None,
+                        body: body.to_string().into_bytes(),
+                    },
+                ))
+            };
+            let beat = serde_json::json!({"session_id":"tab-a", "play_id":first.play_id, "lease_epoch":first.lease_epoch});
+            for t in [NOW + 40, NOW + 80, NOW + 120] {
+                let resp = call(t, "/v1/plays/heartbeat", &beat);
+                assert_eq!(resp.status, 200);
+                let resp: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+                assert_eq!(resp["lease"], "active");
+                assert_eq!(resp["lease_expires_at"], (t + 45).min(deadline));
+            }
+            let resumed = call(deadline - 1, "/v1/plays", &body);
+            assert_eq!(resumed.status, 200);
+            let resumed: serde_json::Value = serde_json::from_str(&resumed.body).unwrap();
+            assert_eq!(resumed["play_id"], first.play_id);
+            assert_eq!(resumed["lease_epoch"], first.lease_epoch);
+            assert_eq!(resumed["expires_at"], deadline);
+            let last = call(deadline, "/v1/plays/heartbeat", &beat);
+            assert_eq!(last.status, 200);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&last.body).unwrap()["lease"],
+                "expired"
+            );
+            assert_eq!(h.store.duration_lookups.get(), 1);
+            let next = call(deadline, "/v1/plays", &body);
+            let result: serde_json::Value = serde_json::from_str(&next.body).unwrap();
+            if let Some(code) = denial {
+                assert_eq!(next.status, 402);
+                assert_eq!(result["code"], code);
+                if code == "subscription_required" {
+                    assert_eq!(result["reason"], "lapsed");
+                }
+                assert_eq!(
+                    h.store.playback_leases.borrow()[user].continuation_deadline,
+                    deadline
+                );
+            } else {
+                assert_eq!(next.status, 200);
+                assert_ne!(result["play_id"], first.play_id);
+                assert_eq!(result["lease_epoch"], first.lease_epoch + 1);
+            }
+        }
     }
 
     #[test]
@@ -18711,6 +18872,7 @@ mod tests {
                 play_id: "play-seeded".to_string(),
                 epoch: 7,
                 expires_at: NOW + 10,
+                continuation_deadline: NOW + 900,
             },
         );
         let resp = h.call_full(
@@ -18794,6 +18956,7 @@ mod tests {
                 play_id: "play-seeded".to_string(),
                 epoch: 7,
                 expires_at: NOW + 10,
+                continuation_deadline: NOW + 900,
             },
         );
         // Same race on the touch: zero rows after the fence closes
@@ -18869,6 +19032,7 @@ mod tests {
                 play_id: "play-seeded".to_string(),
                 epoch: 7,
                 expires_at: NOW + 10,
+                continuation_deadline: NOW + 900,
             },
         );
         let resp = h.call_full(
@@ -18983,6 +19147,7 @@ mod tests {
     }
 
     include!("listen_history_control_tests.rs");
+    include!("listen_history_receiver_tests.rs");
 
     fn assert_play_bearer_refused(
         h: &Harness,

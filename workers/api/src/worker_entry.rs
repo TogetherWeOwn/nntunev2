@@ -527,6 +527,10 @@ async fn query_playback_lease_row(
             play_id: row.try_get("play_id").map_err(|_| StoreError)?,
             epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
             expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+            continuation_deadline: u64_of(
+                row.try_get("continuation_deadline")
+                    .map_err(|_| StoreError)?,
+            )?,
         })),
     }
 }
@@ -540,7 +544,7 @@ pub async fn acquire_playback_lease_on(
     track_id: &str,
     play_id: &str,
     now: u64,
-    expires_at: u64,
+    continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
     let rows = client
@@ -551,9 +555,13 @@ pub async fn acquire_playback_lease_on(
                 (&session_id, Type::TEXT),
                 (&track_id, Type::TEXT),
                 (&play_id, Type::TEXT),
-                (&i64_of(expires_at)?, Type::INT8),
+                (
+                    &i64_of(crate::playback::lease_expiry(now, continuation_deadline))?,
+                    Type::INT8,
+                ),
                 (&i64_of(now)?, Type::INT8),
                 (&takeover, Type::BOOL),
+                (&i64_of(continuation_deadline)?, Type::INT8),
             ],
         )
         .await
@@ -961,7 +969,7 @@ pub async fn private_aware_lease_for_postgres_test(
     track_id: &str,
     play_id: &str,
     now: u64,
-    expires_at: u64,
+    continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
     PgStore {
@@ -973,7 +981,13 @@ pub async fn private_aware_lease_for_postgres_test(
         test_mirror: None,
     }
     .acquire_playback_lease(
-        user_id, session_id, track_id, play_id, now, expires_at, takeover,
+        user_id,
+        session_id,
+        track_id,
+        play_id,
+        now,
+        continuation_deadline,
+        takeover,
     )
     .await
 }
@@ -1099,7 +1113,7 @@ impl PgStore {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
@@ -1170,7 +1184,14 @@ impl PgStore {
                     }
                 }
                 let result = acquire_playback_lease_on(
-                    &tx, user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                    &tx,
+                    user_id,
+                    session_id,
+                    track_id,
+                    play_id,
+                    now,
+                    continuation_deadline,
+                    takeover,
                 )
                 .await?;
                 if matches!(result, crate::playback::LeaseAcquire::Acquired { .. }) {
@@ -2078,6 +2099,30 @@ async fn claim_single_use_on(
     Ok(rows.len() as u64)
 }
 
+async fn invite_by_hash_on(
+    client: &impl GenericClient,
+    code_hash: &str,
+) -> Result<Option<InviteRecord>, StoreError> {
+    // Preflight only; the invite claim rechecks the bounds under lock.
+    let statement = format!(
+        "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email FROM invite_codes \
+         LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
+         LEFT JOIN invite_windows w ON w.id = invite_codes.window_id \
+         WHERE invite_codes.code_hash = $1 AND (invite_codes.kind = 'admin' OR \
+             (invite_codes.kind = 'member' AND w.id IS NOT NULL AND \
+              int8range(w.starts_at, w.ends_at, '[)') @> floor(extract(epoch FROM clock_timestamp()))::bigint))"
+    );
+    let rows = client
+        .query_typed(&statement, &[(&code_hash, Type::TEXT)])
+        .await
+        .map_err(|_| StoreError)?;
+    // `query_opt`'s rule: more than one row is an error.
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    rows.first().map(invite_from_row).transpose()
+}
+
 async fn insert_credential_on(
     client: &impl GenericClient,
     credential: &PasskeyCredential,
@@ -2159,7 +2204,8 @@ async fn complete_registration_on(
         transaction
             .query_typed(
                 "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+                 SELECT $1, $2, $3, $4, CASE WHEN kind = 'member' THEN redeemed_at ELSE $5 END, $6, $7::jsonb \
+                 FROM invite_codes WHERE code_hash = $8",
                 &[
                     (&audit.user_id, Type::TEXT),
                     (&audit.action, Type::TEXT),
@@ -2168,6 +2214,7 @@ async fn complete_registration_on(
                     (&i64_of(audit.at)?, Type::INT8),
                     (&audit.subject_user_id, Type::TEXT),
                     (&audit.details, Type::TEXT),
+                    (&record.code_hash, Type::TEXT),
                 ],
             )
             .await
@@ -4228,6 +4275,25 @@ impl Store for PgStore {
         .await
     }
 
+    async fn record_listen_event(
+        &self,
+        owner: &str,
+        event: &crate::listen_history::ListenEventBody,
+        now: u64,
+    ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let now = i64::try_from(now).map_err(|_| StoreError)?;
+                let mut client = self.connect().await?;
+                crate::listen_history::record(&mut client, owner, event, now)
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.listen_write"))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn export_listen_events(
         &self,
         owner: &str,
@@ -4280,11 +4346,17 @@ impl Store for PgStore {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         self.acquire_private_aware_lease(
-            user_id, session_id, track_id, play_id, now, expires_at, takeover,
+            user_id,
+            session_id,
+            track_id,
+            play_id,
+            now,
+            continuation_deadline,
+            takeover,
         )
         .await
     }
@@ -4325,10 +4397,11 @@ impl Store for PgStore {
         .await
     }
 
-    async fn track_meter_meta(
+    async fn track_meta(
         &self,
         user_id: &str,
         track_id: &str,
+        duration_only: bool,
     ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
         // A non-UUID track has no `tracks` row to read (and the cast
         // would fail the query besides): meter it on the fallback
@@ -4374,7 +4447,11 @@ impl Store for PgStore {
                 };
                 Ok(crate::meter_sink::TrackMeterMeta {
                     track_duration_ms,
-                    mb_duration_ms: self.mb_duration_for(track_mbid.as_deref()).await?,
+                    mb_duration_ms: if duration_only && track_duration_ms.is_some_and(|ms| ms > 0) {
+                        None
+                    } else {
+                        self.mb_duration_for(track_mbid.as_deref()).await?
+                    },
                     bitrate_kbps,
                     file_bytes,
                 })
@@ -4456,23 +4533,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // The issuer's current email rides along so the pure
-                // prepare can refuse self-invites before any claim.
-                let statement = format!(
-                    "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email \
-                     FROM invite_codes \
-                     LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
-                     WHERE invite_codes.code_hash = $1"
-                );
-                let rows = client
-                    .query_typed(&statement, &[(&code_hash, Type::TEXT)])
-                    .await
-                    .map_err(|_| StoreError)?;
-                // `query_opt`'s rule: more than one row is an error.
-                if rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                rows.first().map(invite_from_row).transpose()
+                invite_by_hash_on(&client, code_hash).await
             },
             TOTAL_TIMEOUT_MS,
         )
