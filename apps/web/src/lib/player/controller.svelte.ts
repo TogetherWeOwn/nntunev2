@@ -105,6 +105,8 @@ export function createPlayerController(
 			// Sample the live element before retiring its queued volumechange events.
 			media.observeSound();
 			if (!isCurrent()) return false;
+			media.speed.observe();
+			if (!isCurrent()) return false;
 			version += 1;
 			retireNativeHost();
 			if (!isCurrent()) return false;

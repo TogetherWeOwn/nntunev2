@@ -24,10 +24,7 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 		const previousPort = writePort;
 		let observed: number | null | undefined;
 		writePort = {
-			get playbackRate() {
-				observed = read(current);
-				return observed ?? NaN;
-			},
+			get playbackRate() { return (observed = read(current)) ?? NaN; },
 			set playbackRate(rate) {
 				if (!current.matches()) throw new Error('Audio attachment retired');
 				current.audio.playbackRate = rate;
@@ -66,8 +63,8 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 			if (preference && !writePort) write(rate);
 			return get(state).rate;
 		},
-		observe(current: RateTarget): number | null {
-			if (writePort) return null;
+		observe(current = target()): number | null {
+			if (!current || writePort) return null;
 			const rate = read(current);
 			// Same-rate events include the queued event from our own write. Keep its feedback.
 			if (!preference || rate === null || rate === get(state).rate) return rate;

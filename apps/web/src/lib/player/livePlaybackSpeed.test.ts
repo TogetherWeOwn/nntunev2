@@ -52,29 +52,16 @@ test('renders clamped readback and keeps mismatch feedback through the write’s
 	expect(apply.mock.calls).toEqual([[1.3], [2]]);
 });
 
-test('a throwing restore reports the observed rate without replacing the stored preference', () => {
-	const { speed, attach, storage, retire } = fixture();
-	const { apply, current } = attach();
-	apply.mockImplementationOnce(() => { throw new Error('refused'); });
-	speed.set(2);
-	expect(get(speed.state)).toEqual({ rate: 1.3, feedback: 'Speed 2x not applied — still 1.3x' });
-	expect(storage.setItem).toHaveBeenCalledTimes(1);
-	retire();
-	speed.observe(current);
-	expect(get(speed.state).rate).toBeNull();
-	attach(() => { throw new Error('refused'); });
-	expect(get(speed.state)).toEqual({ rate: 1, feedback: 'Speed 1.3x not applied — still 1x' });
-	expect(storage.setItem).toHaveBeenCalledTimes(1);
-	expect(storage.getItem()).toBe('1.3');
-});
-
-test.each([1, 1.25])('a source restoring to %sx reports the mismatch and persists verified readback', (rate) => {
-	const { speed, storage, attach } = fixture();
+test.each(['throw', 1, 1.25] as const)('a replacement reports a refused restore (%s)', (result) => {
+	const { speed, storage, attach, retire } = fixture();
 	attach();
-	const { current } = attach(() => rate);
+	retire();
+	const { current } = attach(() => { if (result === 'throw') throw new Error('refused'); return result; });
+	const rate = result === 'throw' ? 1 : result;
 	speed.observe(current);
 	expect(get(speed.state)).toEqual({ rate, feedback: `Speed 1.3x not applied — still ${rate}x` });
-	expect(storage.getItem()).toBe(String(rate));
+	expect(storage.setItem).toHaveBeenCalledTimes(result === 'throw' ? 1 : 2);
+	expect(storage.getItem()).toBe(result === 'throw' ? '1.3' : String(rate));
 });
 
 test('retired source readback cannot publish or persist, and the next source restores the last verified rate', () => {

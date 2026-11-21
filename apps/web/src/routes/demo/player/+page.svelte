@@ -584,9 +584,12 @@
 		}
 		// The queued event from our own restore has already been reconciled.
 		if (!Number.isFinite(nativeRate) || clampPlaybackSpeed(nativeRate) === speed.current()) return;
-		const effective = speed.adoptNativeRate(nativeRate);
-		speedValue = String(effective);
-		if (speedFeedbackRate !== null && effective !== speedFeedbackRate) {
+		showVerifiedSpeed(speed.adoptNativeRate(nativeRate));
+	}
+
+	function showVerifiedSpeed(rate: number): void {
+		speedValue = String(rate);
+		if (speedFeedbackRate !== null && rate !== speedFeedbackRate) {
 			speedFeedback = '';
 			speedFeedbackRate = null;
 		}
@@ -1431,7 +1434,7 @@
 	// leave a false selection on screen).
 	$effect(() => {
 		audioEl;
-		if (speed) speedValue = String(speed.apply());
+		if (speed) showVerifiedSpeed(speed.apply());
 	});
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
