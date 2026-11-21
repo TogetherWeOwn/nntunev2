@@ -25,7 +25,11 @@
 			<option value={preset}>{preset}x</option>
 		{/each}
 	</select>
-	{#if feedback}
-		<p data-testid="speed-status" role="status">{feedback}</p>
-	{/if}
+	<p data-testid="speed-status" role="status" aria-atomic="true">{feedback}</p>
 </div>
+
+<style>
+	p:empty {
+		margin: 0;
+	}
+</style>

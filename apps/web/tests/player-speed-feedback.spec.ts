@@ -25,8 +25,9 @@ test('keeps failure feedback through its matching native ratechange', async ({ p
 		};
 	});
 
+	const feedback = page.getByTestId('speed-status').and(page.getByRole('status'));
+	await expect(feedback).toBeEmpty();
 	await page.getByTestId('playback-speed').selectOption('1.5');
-	const feedback = page.getByTestId('speed-status');
 	await expect(feedback).toHaveText('Speed 1.5x not applied — still 1.25x');
 
 	// The event emitted by the clamped write must not immediately erase why
@@ -36,5 +37,5 @@ test('keeps failure feedback through its matching native ratechange', async ({ p
 	await page.getByTestId('demo-audio').evaluate((el: HTMLAudioElement) => {
 		(el as HTMLAudioElement & { setNativeRate?: (value: number) => void }).setNativeRate?.(1);
 	});
-	await expect(feedback).toHaveCount(0);
+	await expect(feedback).toBeEmpty();
 });

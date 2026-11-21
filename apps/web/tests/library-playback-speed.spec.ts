@@ -72,9 +72,11 @@ for (const refusal of ['ignore', 'clamp', 'throw'] as const) {
 				}
 			});
 		}, refusal);
+		const status = page.getByTestId('speed-status').and(page.getByRole('status'));
+		await expect(status).toBeEmpty();
 		await speed(page).selectOption('2');
 		const observed = refusal === 'clamp' ? '1.3' : '1';
-		await expect(page.getByTestId('speed-status')).toHaveText(`Speed 2x not applied — still ${observed}x`);
+		await expect(status).toHaveText(`Speed 2x not applied — still ${observed}x`);
 		await expect(speed(page)).toHaveValue(observed);
 		await expect(audio(page)).toHaveJSProperty('playbackRate', Number(observed));
 		expect(await stored(page)).toBe(observed);
