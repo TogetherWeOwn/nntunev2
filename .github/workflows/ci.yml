@@ -1129,7 +1129,7 @@ jobs:
         with:
           workspaces: workers/transcode
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --manifest-path workers/transcode/Cargo.toml --all-targets
+      - run: cargo test --locked --manifest-path workers/transcode/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path workers/transcode/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/transcode/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate (including the Container
