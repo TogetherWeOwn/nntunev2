@@ -91,6 +91,19 @@ test('a refused Retry on a successfully reset resource returns to Play, not relo
 	expect(status()).toBe('playing');
 });
 
+test('an interrupted Retry settles as paused and leaves the reset resource playable', async () => {
+	const { media, audio, status } = setup();
+	media.attach(audio.element);
+	audio.fail();
+	audio.play.mockRejectedValueOnce(new DOMException('Interrupted', 'AbortError'));
+	await media.retryCurrent();
+	expect(status()).toBe('paused');
+	await media.playCurrent();
+	expect(audio.load).toHaveBeenCalledOnce();
+	expect(audio.play).toHaveBeenCalledTimes(2);
+	expect(status()).toBe('playing');
+});
+
 test.each(['same URL replacement', 'auth purge'] as const)('stale Retry does not affect playback after %s', async (boundary) => {
 	const { media, queue, audio, status } = setup();
 	const detach = media.attach(audio.element);
