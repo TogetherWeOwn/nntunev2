@@ -3071,9 +3071,7 @@ async fn member_invite_history_on(
 ) -> Result<Option<handlers::MemberInviteHistory>, StoreError> {
     use handlers::{MemberInviteHistory, MemberInviteHistoryEntry};
     const PAGE_SIZE: usize = 50;
-    // One snapshot covers the deletion fence and the page. The production
-    // call is a standalone statement, so its transaction clock is fresh.
-    // LEFT JOIN returns a sentinel for an existing owner with no rows.
+    // One statement fences deletion; a NULL invite distinguishes an empty page.
     let rows = client
         .query_typed(
             "SELECT page.id, page.created_at, LEAST(page.expires_at, w.ends_at) AS expires_at,

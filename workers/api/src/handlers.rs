@@ -6211,7 +6211,6 @@ async fn member_invite_summary(
     response
 }
 
-/// GET history takes only an optional cursor produced by a previous page.
 async fn member_invite_history(
     ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
     req: &Request,
@@ -8296,8 +8295,7 @@ where
         }
         ("GET", "/v1/admin/settings") => admin_settings_list(ctx, req).await,
         ("POST", "/v1/admin/ingest") => admin_ingest_upload(ctx, req).await,
-        // The entry preserves this route's query so the status filter
-        // and window survive to the handler in production.
+        // The entry preserves this route's status and window query parameters.
         ("GET", path) if path == "/v1/admin/ingest" || path.starts_with("/v1/admin/ingest?") => {
             admin_ingest_list(ctx, req).await
         }
