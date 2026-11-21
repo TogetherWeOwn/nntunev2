@@ -3,6 +3,7 @@ const MAX_CUES = 1024;
 const CACHE_CAPACITY = 128;
 const HIT_TTL_MS = 60 * 60_000;
 const MISS_TTL_MS = 5 * 60_000;
+const PROVIDER_TIMEOUT_MS = 2000;
 
 export type LyricCue = Readonly<{ atMs: number; text: string }>;
 export type TimedLyrics = readonly LyricCue[];
@@ -29,8 +30,8 @@ export function parseTimedLrc(input?: string | null): TimedLyrics | null {
 			times.push(Number(minutes) * 60_000 + Number(seconds) * 1000 + Number(fraction.padEnd(3, '0')));
 			end = stamp.lastIndex;
 		}
-		if (!end || /^\[\d+:/.test(line.slice(end))) continue;
 		const text = line.slice(end).trimStart();
+		if (!end || /^\[\d+:/.test(text)) continue;
 		for (const atMs of times) cues.push({ atMs, text });
 	}
 	if (!cues.some((cue) => cue.text !== '')) return null;
@@ -69,8 +70,9 @@ type ProviderReply =
 
 /** Future adapter contract: LRCLIB /api/get-cached only, never search. Report
  * not-found only for a confirmed track miss; transport/decoding failures are unavailable.
+ * Pass the signal to the transport so a timed-out lookup can stop its work.
  */
-export type ExactLyricsProvider = (track: ExactTrack) => Promise<ProviderReply>;
+export type ExactLyricsProvider = (track: ExactTrack, signal: AbortSignal) => Promise<ProviderReply>;
 
 type LocalLyrics = {
 	embedded?: string | null;
@@ -135,11 +137,21 @@ export function createLyricsResolver(provider?: ExactLyricsProvider, now = Date.
 		const cached = cache.get(key);
 		if (cached) return cached.value;
 
-		let reply: ProviderReply;
+		const controller = new AbortController();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let reply: ProviderReply | null;
 		try {
-			reply = await provider(query);
+			const deadline = new Promise<null>((finish) => {
+				timer = setTimeout(() => {
+					finish(null);
+					controller.abort();
+				}, PROVIDER_TIMEOUT_MS);
+			});
+			reply = await Promise.race([deadline, provider(query, controller.signal)]);
 		} catch {
 			return null;
+		} finally {
+			clearTimeout(timer);
 		}
 		let value: ResolvedLyrics | null = null;
 		if (reply?.kind === 'match') {

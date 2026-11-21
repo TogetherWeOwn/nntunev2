@@ -47,7 +47,7 @@ describe('lyrics resolution', () => {
 		const provider = vi.fn<ExactLyricsProvider>().mockResolvedValue(match);
 		const resolve = createLyricsResolver(provider);
 		expect(await resolve({ embedded: lrc, mediaPath, sidecar }, track)).toMatchObject({ source: 'embedded' });
-		for (const embedded of ['', 'Untimed', '[00:99]Bad stamp']) {
+		for (const embedded of ['', 'Untimed', '[00:99]Bad stamp', '[00:01] [00:61]']) {
 			expect(await resolve({ embedded, mediaPath, sidecar }, track)).toMatchObject({ source: 'sidecar' });
 		}
 		expect(provider).not.toHaveBeenCalled();
@@ -83,7 +83,7 @@ describe('lyrics resolution', () => {
 		for (let i = 0; i < 4; i++) expect(await resolve({}, track)).toBeNull();
 		const withPrivateFields = { ...track, mediaPath, libraryId: 'fixture-library' };
 		const result = await resolve({}, withPrivateFields);
-		expect(provider).toHaveBeenLastCalledWith(track);
+		expect(provider).toHaveBeenLastCalledWith(track, expect.any(AbortSignal));
 		expect(result?.source).toBe('lrclib');
 		const id = result?.source === 'lrclib' ? result.attributionId : undefined;
 		expect(plannedAttributions.find((entry) => entry.id === id)).toMatchObject({
@@ -132,6 +132,29 @@ describe('lyrics resolution', () => {
 		for (let i = 0; i < 3; i++) expect(await resolve({}, track)).toBeNull();
 		expect(await resolve({}, track)).toMatchObject({ source: 'lrclib' });
 		expect(provider).toHaveBeenCalledTimes(4);
+	});
+
+	it('bounds a stalled lookup, signals cancellation and retries without caching a miss', async () => {
+		vi.useFakeTimers();
+		try {
+			let finishLate!: (reply: typeof match) => void;
+			const provider = vi.fn<ExactLyricsProvider>().mockReturnValueOnce(new Promise((done) => {
+				finishLate = done;
+			})).mockResolvedValue(match);
+			const resolve = createLyricsResolver(provider);
+			const pending = resolve({}, track);
+			const signal = provider.mock.calls[0]?.[1];
+			await vi.advanceTimersByTimeAsync(2000);
+			expect(signal?.aborted).toBe(true);
+			expect(await pending).toBeNull();
+			finishLate(match);
+			const hit = await resolve({}, track);
+			expect(hit?.source).toBe('lrclib');
+			expect(provider).toHaveBeenCalledTimes(2);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it('evicts the oldest entry when the shared hit/miss capacity is exceeded', async () => {
