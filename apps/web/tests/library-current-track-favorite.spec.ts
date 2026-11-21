@@ -79,7 +79,6 @@ async function editDuringActivation(button: Locator, edit: Locator) {
 	await button.evaluate((node, edit) => node.addEventListener('click',
 		() => (edit as HTMLButtonElement).click(), { capture: true, once: true }), await edit.elementHandle());
 }
-
 for (const input of ['pointer', 'legacy chord', 'Space', 'click only']) {
 	test(`${input} cannot star a replacement selection`, async ({ page }) => {
 		const chord = input === 'legacy chord';
@@ -126,7 +125,6 @@ for (const input of ['pointer', 'legacy chord', 'Space', 'click only']) {
 		await expect(page.getByRole('region', { name: 'Player', exact: true }).getByRole('status')).toHaveCount(1);
 	});
 }
-
 test('Favorite retires a press across reconciled membership and a same-click Library edit', async ({ page }) => {
 	await openLibrary(page);
 	const key = `${favoritesBase}.${await scope(page)}`;
@@ -145,7 +143,6 @@ test('Favorite retires a press across reconciled membership and a same-click Lib
 	await expect.poll(() => stored(page)).toBe(JSON.stringify([north.id]));
 	await expect(feedback(page)).toBeEmpty();
 });
-
 test('authoritative Refresh recovers a missing scope, not an arbitrary replacement', async ({ page }) => {
 	await page.addInitScript((key) => {
 		const setItem = Storage.prototype.setItem;
@@ -154,15 +151,21 @@ test('authoritative Refresh recovers a missing scope, not an arbitrary replaceme
 	}, contextKey);
 	await openLibrary(page);
 	expect(await scope(page)).toBeNull();
+	await favorite(page).click();
+	await expect(feedback(page)).toHaveText('Starred North Wind for this visit.');
 	await page.evaluate(() => window.dispatchEvent(new Event('restore-storage')));
 	const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
 	await refresh.click();
-	await expect.poll(() => scope(page)).not.toBeNull();
+	for (const control of [favorite(page), star(row(page, north.id)), star(queueRow(page, north.id))])
+		await expect(control).toHaveAttribute('aria-pressed', 'true');
 	const retired = await scope(page);
+	expect([Boolean(retired), await stored(page, retired)]).toEqual([true, null]);
 	await favorite(page).evaluate((button, key) => button.addEventListener('click',
 		() => sessionStorage.setItem(key, 'replacement-context'), { capture: true, once: true }), contextKey);
 	await favorite(page).click();
+	await page.route('**/api/library', (route) => route.fulfill({ json: [north, south, { ...east, id: 'refreshed' }] }), { times: 1 });
 	await refresh.click();
+	await expect(row(page, 'refreshed')).toBeVisible();
 	await expect(favorite(page)).toHaveCount(0);
 	await expect(feedback(page)).toBeEmpty();
 	expect(await Promise.all([stored(page, retired), stored(page)])).toEqual([null, null]);

@@ -27,7 +27,6 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 		const { pressed, edit } = membership;
 		return { pressed, edit, id: track.id, title: displayTitle(track), receipt: `${binding.version}:${generation}` };
 	}
-
 	const matches = (current: Selection | null, previous: Selection) => current?.receipt === previous.receipt &&
 		current.id === previous.id && current.edit === previous.edit && current.pressed === previous.pressed;
 	async function activate(intent: Selection): Promise<void> {
@@ -42,7 +41,6 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 			applied.pressed !== pressed || !matches(view(queue.snapshot), applied)) return;
 		outcome = { ...applied, text: `${pressed ? 'Starred' : 'Unstarred'} ${target.title}${result === 'visit' ? ' for this visit' : ''}.` };
 	}
-
 	return {
 		bind, view, activate,
 		clearFeedback: () => { outcome = null; },

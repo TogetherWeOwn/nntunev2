@@ -396,11 +396,12 @@
 				if (!favoritesInitialized || (!favoritesAuthKey && key)) {
 					favoritesAuthKey = key;
 					currentFavoriteEdit++;
-					favoriteBaseline = favorites = loadFavorites(session, browserStorage('local'));
+					favoriteBaseline = loadFavorites(session, browserStorage('local'));
+					favorites = favoritesInitialized ? [...new Set([...favoriteBaseline, ...favorites])] : [...favoriteBaseline];
 					favoritesInitialized = true;
 				}
 				if (!recentFindsInitialized) {
-					recentFinds = loadRecentFinds(session, browserStorage('local'));
+					recentFinds = loadRecentFinds(browserStorage('session'), browserStorage('local'));
 					recentFindsInitialized = true;
 				}
 				applyShareLink();
