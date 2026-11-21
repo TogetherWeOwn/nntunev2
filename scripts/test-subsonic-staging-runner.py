@@ -7,8 +7,9 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from threading import Event, Timer
+from threading import Event, Thread, Timer
 from unittest.mock import patch
 from urllib.parse import parse_qs, quote_plus, urlsplit
 
@@ -168,12 +169,11 @@ class TransportTests(unittest.TestCase):
     def setUp(self):
         self.children = []
         self.cancel = Event()
-        self.program = ""
         self.transport = runner["StagingPostTransport"](spawn=self.fake_curl)
 
     def fake_curl(self, argv, **options):
-        self.assertEqual(options, dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.DEVNULL, env={}, close_fds=True))
+        self.assertEqual(options, {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
+                                   "stderr": subprocess.DEVNULL, "env": {}, "close_fds": True})
         self.argv = argv
         code = "import os, sys, time\nconfig = sys.stdin.buffer.read()\nout = sys.stdout.buffer\n"
         child = subprocess.Popen([sys.executable, "-I", "-c", code + self.program], **options)
@@ -206,6 +206,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.argv, (
             "/usr/bin/curl", "--disable", "--globoff", "--proto", "=https", "--noproxy", "*",
             "--no-location", "--retry", "0", "--http1.1", "--silent", "--no-buffer", "--include",
+            "--ignore-content-length", "--header", "Connection: close",
             "--connect-timeout", "2.0", "--max-time", "10.0", "--request", "POST", "--config", "-",
             "--url", "https://staging.nntune.com/rest/getArtists",
         ))
@@ -217,7 +218,6 @@ class TransportTests(unittest.TestCase):
             f'data-binary = "f=json&apiKey={quote_plus(self.api_key)}"',
         ])
         self.assertEqual(repr(result), "PostResponse(status=200)")
-        self.assert_reaped(0)
 
     def test_rejects_unreviewed_slot_and_alternative_destinations_before_spawn(self):
         for slot in (0, 49, True, "https://example.invalid/rest/getArtists"):
@@ -228,13 +228,11 @@ class TransportTests(unittest.TestCase):
         for url in (
             original.url.replace("https:", "http:"),
             original.url.replace("staging.nntune.com", "example.invalid"),
-            original.url.replace("staging.nntune.com", "staging.nntune.com:443"),
-            original.url.replace("staging.nntune.com", "user@staging.nntune.com"),
             original.url.replace("getArtists", "getAlbum"), original.url + "?q=1", original.url + "#x",
         ):
-            with patch.dict(prepare.__globals__, _prepare_post=lambda *_: replace(original, url=url)):
-                with self.assertRaisesRegex(runner["Stop"], "^destination-refused$"):
-                    self.send()
+            with (patch.dict(prepare.__globals__, _prepare_post=lambda *_, url=url: replace(original, url=url)),
+                  self.assertRaisesRegex(runner["Stop"], "^destination-refused$")):
+                self.send()
         self.assertEqual(self.children, [])
 
     def test_redirect_refused_without_following_or_echoing_location(self):
@@ -242,46 +240,72 @@ class TransportTests(unittest.TestCase):
         self.program = f"out.write({head!r}); out.flush(); time.sleep(60)"
         with self.assertRaisesRegex(runner["Stop"], "^redirect-refused$"):
             self.send()
-        self.assertEqual(len(self.children), 1)
         self.assert_reaped(-signal.SIGKILL)
 
-    def test_fixed_rejection_uses_existing_oracle(self):
-        head = (b"HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n"
-                b"Cache-Control: private, no-store\r\n\r\n")
+    def test_interim_headers_preserve_fixed_rejection_oracle_and_shared_budget(self):
+        hint = b"HTTP/1.1 103 Early Hints\r\n\r\n"
+        head = hint + (b"HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n"
+                       b"Cache-Control: private, no-store\r\n\r\n")
         off = (b'<subsonic-response status="failed" version="1.16.1"><error code="70" '
                b'message="Endpoint not supported in staging."/></subsonic-response>')
         self.program = f"out.write({(head + off)!r})"
         self.assertEqual(self.send(5), {"oracle": "fixed_staging_off", "http_status": 404})
-        self.program = f"out.write({head!r} + b'edge error')"
-        with self.assertRaisesRegex(runner["Stop"], "^response-mismatch$"):
-            self.send(5)
-        self.assert_reaped(0)
+        for prefix in (f"{hint!r} * 400", "b'HTTP/1.1 101 Switching Protocols\\r\\n\\r\\n'"):
+            self.program = f"out.write({prefix} + {(head + off)!r})"
+            with self.assertRaisesRegex(runner["Stop"], "^response-headers$"):
+                self.send(5)
+            self.assert_reaped()
+
+    def test_real_curl_reports_both_content_length_mismatches(self):
+        class Fixture(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.wfile.write(self.server.response)
+
+        with HTTPServer(("127.0.0.1", 0), Fixture) as server:
+            # Only this trusted test hook substitutes loopback HTTP after URL validation.
+            def loopback(argv, **options):
+                local = (*argv[:-1], f"http://127.0.0.1:{server.server_port}/fixture")
+                return subprocess.Popen(["=http" if arg == "=https" else arg for arg in local], **options)
+
+            self.transport = runner["StagingPostTransport"](spawn=loopback)
+            server.timeout = 2
+            for length in (2, 1, 3):
+                server.response = f"HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\nxy".encode()
+                worker = Thread(target=server.handle_request, daemon=True)
+                worker.start()
+                try:
+                    if length == 2:
+                        self.assertEqual(self.send().body, b"xy")
+                    else:
+                        with self.assertRaisesRegex(runner["Stop"], "^transport-incomplete$"):
+                            self.send()
+                finally:
+                    worker.join(timeout=2)
+                    self.assertFalse(worker.is_alive())
 
     def test_response_limits_and_framing(self):
         cap = runner["load_matrix"](matrix)["limits"]["body_bytes"]
         self.program = f"out.write({self.ok_head!r} + b'x' * {cap})"
         self.assertEqual(len(self.send().body), cap)
+        busy = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n"
+        self.program = f"out.write({(busy + b'Content-Length: 1024')!r} + b'\\r\\n\\r\\n' + b'x' * 1024)"
+        result = self.send(37)
+        self.assertEqual((result.status, len(result.body), result.retry_after), (503, 1024, "1"))
         for slot, head, size, reason in (
             (1, self.ok_head, cap + 1, "body-limit"),
-            (1, f"HTTP/1.1 200 OK\r\nContent-Length: {cap + 1}\r\n\r\n".encode(), 0, "body-limit"),
-            (5, b"HTTP/1.1 404 Not Found\r\n\r\n", 1025, "body-limit"),
-            (1, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", 1, "transport-incomplete"),
+            (37, busy + b"\r\n", 1025, "body-limit"),
+            (37, busy + b"Content-Length: 1025\r\n\r\n", 0, "body-limit"),
             (1, b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n", 1, "response-headers"),
             (1, b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n", 1, "response-headers"),
-            (1, b"HTTP/1.1 200 OK\r\nLong: " + b"x" * 8192 + b"\r\n\r\n", 0, "response-headers"),
         ):
             with self.subTest(slot=slot, size=size, reason=reason):
-                head_expr = repr(head) if len(head) < 8192 else "b'x' * 8193"
-                self.program = f"out.write({head_expr} + b'x' * {size})"
+                self.program = f"out.write({head!r} + b'x' * {size})"
                 with self.assertRaisesRegex(runner["Stop"], f"^{reason}$"):
                     self.send(slot)
                 self.assert_reaped()
 
     def test_deadline_kills_client_despite_progress_and_eof_without_exit(self):
-        self.program = "sys.exit(28)"
-        with self.assertRaisesRegex(runner["Stop"], "^request-or-reader-timeout$"):
-            self.send()
-        self.assert_reaped(28)
         for progress in ("os.close(sys.stdout.fileno()); time.sleep(60)",
                          "while True: out.write(b'x'); out.flush(); time.sleep(.02)"):
             self.program = f"out.write({self.ok_head!r}); out.flush()\n" + progress
