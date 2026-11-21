@@ -2083,10 +2083,10 @@
 		white-space: nowrap;
 		border: 0;
 	}
-	:global(.nt-library-queue) {
+	main, :global(.nt-library-queue) {
 		--nt-library-row-padding: 0.25rem;
 	}
-	:global(.nt-library-queue[data-density='compact']) {
+	main[data-density='compact'], :global(.nt-library-queue[data-density='compact']) {
 		--nt-library-row-padding: 0;
 	}
 	.nt-library-repeat {
