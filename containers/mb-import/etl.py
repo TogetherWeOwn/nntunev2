@@ -406,13 +406,6 @@ def recording_recording_values(values, line_number):
                  for field, column in zip(values, ("link", "entity0", "entity1"), strict=True))
 
 
-def validate_recording_recording_row(row):
-    if any(not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", gid, re.IGNORECASE)
-           for gid in row[:2]):
-        raise ValueError("l_recording_recording: invalid recording MBID")
-    return row
-
-
 def validate_recording_work_row(row):
     if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", row[0], re.IGNORECASE):
         raise ValueError("l_recording_work: invalid recording MBID")
@@ -845,6 +838,11 @@ def main() -> int:
                 bad_l_recording_url = db.execute("SELECT l.url FROM l_recording_url l LEFT JOIN url u ON u.id=l.url WHERE u.id IS NULL LIMIT 1").fetchone()
                 if bad_l_recording_url:
                     raise ValueError(f"recording-url link references missing url {bad_l_recording_url[0]}")
+                # Validate only referenced MBIDs, before either projection filters edges.
+                mbid_pattern = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
+                db.create_function("is_recording_mbid", 1,
+                                   lambda gid: gid is not None and mbid_pattern.fullmatch(gid) is not None,
+                                   deterministic=True)
                 bad_l_rr = db.execute("""
                     SELECT CASE
                         WHEN r0.id IS NULL OR r1.id IS NULL THEN
@@ -852,6 +850,7 @@ def main() -> int:
                         WHEN k.id IS NULL THEN 'references missing link ' || l.link
                         WHEN lt.id IS NULL THEN 'references missing link_type ' || k.link_type
                         WHEN NOT r0.canonical_id OR NOT r1.canonical_id THEN 'invalid recording id'
+                        WHEN NOT is_recording_mbid(r0.gid) OR NOT is_recording_mbid(r1.gid) THEN 'invalid recording MBID'
                         WHEN NOT lt.canonical_id THEN 'invalid link_type id ' || lt.id
                         ELSE 'link_type ' || lt.id || ' is not recording-to-recording'
                     END
@@ -862,6 +861,7 @@ def main() -> int:
                     LEFT JOIN link_type lt ON lt.id=k.link_type
                     WHERE r0.id IS NULL OR r1.id IS NULL OR k.id IS NULL OR lt.id IS NULL
                         OR NOT r0.canonical_id OR NOT r1.canonical_id OR NOT lt.canonical_id
+                        OR NOT is_recording_mbid(r0.gid) OR NOT is_recording_mbid(r1.gid)
                         OR lt.entity0 IS NOT 'recording' OR lt.entity1 IS NOT 'recording'
                     LIMIT 1
                 """).fetchone()
@@ -1092,7 +1092,7 @@ def main() -> int:
                 """
                 recording_recording_count = insert_select(
                     db, recording_recording_query, output_dir / curated_name("recording_recording"),
-                    updated_at, validate_recording_recording_row,
+                    updated_at,
                 )
                 # ISRCs, deduplicated and uppercased (the mirror CHECK
                 # requires the canonical 12-character uppercase form).

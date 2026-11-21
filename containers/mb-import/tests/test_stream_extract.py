@@ -638,8 +638,9 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
 
     def test_empty_table_emits_empty_sidecar_in_both_modes(self):
         self.edges.write_bytes(b"")
-        # The alias sidecar also validates referenced recording IDs.
-        (self.raw / "recording_alias").write_bytes(b"")
+        # Keep these keys unreferenced by the other strict projections.
+        for name in ("recording_alias", "l_recording_recording"):
+            (self.raw / name).write_bytes(b"")
         # Unreferenced keys retain the legacy loaders' acceptance rules.
         for table, key in (("recording", b"50"), ("link_type", b"504")):
             path = self.raw / table
@@ -716,20 +717,27 @@ class RecordingRecordingProjectionTest(ProjectionTestCase):
             out.write(b"52\t" + third_mbid + b"\t" + recording.split(b"\t", 2)[2])
         links = self.raw / "link"
         types = self.raw / "link_type"
-        alias_type = types.read_bytes().splitlines(keepends=True)[-1].replace(b"512\t", b"513\t", 1)
+        type_row = types.read_bytes().splitlines(keepends=True)[-1]
+        link_row = links.read_bytes().splitlines(keepends=True)[-1]
         with types.open("ab") as out:
-            out.write(alias_type.replace(b"000000000005", b"000000000006").replace(b"\tcover\t", b"\t\\143over\t"))
+            for offset, name in ((1, b"\\143over"), (2, b"alternate take")):
+                out.write(type_row.replace(b"512\t", str(512 + offset).encode() + b"\t", 1)
+                          .replace(b"000000000005", f"{5 + offset:012d}".encode())
+                          .replace(b"\tcover\t", b"\t" + name + b"\t"))
         with links.open("ab") as out:
-            out.write(links.read_bytes().splitlines(keepends=True)[-1].replace(b"215\t512", b"216\t513", 1))
+            out.write(link_row.replace(b"215\t512", b"216\t513", 1))
+            out.write(link_row.replace(b"215\t512", b"217\t514", 1))
         edges = self.raw / self.source
         row = edges.read_bytes().splitlines(keepends=True)[-2]
         with edges.open("ab") as out:
             out.write(row.replace(b"323\t214", b"325\t216", 1))  # Equivalent type name.
+            out.write(row.replace(b"323\t214", b"327\t217", 1))  # Distinct type, same pair.
             out.write(row.replace(b"323\t214\t50\t51", b"326\t214\t50\t52", 1))
         a = b"88888888-8888-4888-8888-888888888888"
         b = b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD"
         tail = b"\t2025-02-03T04:05:06Z\n"
-        expected = (a + b"\t" + b + b"\t\\143over" + tail
+        # Decoded 'alternate take' sorts before 'cover', unlike the raw COPY spellings.
+        expected = (a + b"\t" + b + b"\talternate take" + tail + a + b"\t" + b + b"\t\\143over" + tail
                     + a + b"\t" + third_mbid + b"\tcover" + tail + b + b"\t" + a + b"\tcover" + tail)
         video = (ROOT / "tests" / "expected" / self.video).read_bytes()
         result = self.run_etl(self.raw)
@@ -763,6 +771,14 @@ class RecordingRecordingProjectionTest(ProjectionTestCase):
                         self.assertEqual((self.curated / self.output).read_bytes(), b"")
 
     def test_invalid_references_refuse_without_changing_published_snapshot(self):
+        # Recording 52 is referenced only by a video edge, never by an alias
+        # or a song relation that could mask missing video validation.
+        video_mbid = b"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        recording = (self.raw / "recording").read_bytes().splitlines(keepends=True)[-1]
+        with (self.raw / "recording").open("ab") as out:
+            out.write(b"52\t" + video_mbid + b"\t" + recording.split(b"\t", 2)[2])
+        edges = self.raw / self.source
+        edges.write_bytes(edges.read_bytes().replace(b"320\t205\t50\t51\t", b"320\t205\t50\t52\t", 1))
         packed = self.tmp / "packed"
         self.pack(packed)
         cases = (
@@ -772,7 +788,7 @@ class RecordingRecordingProjectionTest(ProjectionTestCase):
             ("link", b"214\t512", b"214\t999", "references missing link_type 999"),
             ("link", b"214\t512", b"214\t504", "not recording-to-recording"),
             ("link_type", b"\tcover\t", b"\t\\q\t", "invalid COPY text in name"),
-            ("recording", b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD", b"bad", "invalid recording MBID"),
+            ("recording", video_mbid, b"bad", "l_recording_recording: invalid recording MBID"),
         )
         for directory, compress in ((self.raw, False), (packed, True)):
             mode = {"MB_ETL_GZIP_OUTPUT": str(int(compress))}
