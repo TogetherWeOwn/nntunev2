@@ -217,6 +217,8 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	['interior corrected down historical', 59.84, false, 59.84, 59.8], ['interior corrected down replay', 59.84, true, 59.84, 59.8, 59.82],
 	['interior corrected down played', 59.84, true, 59.84], ['interior corrected down played rounded', 59.839, true, 59.84],
 	['interior rounded up', 60, false, 0], ['interior rounded up settled', 60, false, 0, 59.98], ['interior rounded up played', 60, true, 0], ['interior rounded up replay', 60, true, 0, 59.98, 59.99],
+	['late correction', 59.98, false, 59.99], ['late correction played', 59.99, true, 59.99],
+	['interior late correction', 59.8, false, 59.84], ['interior late correction played', 59.84, true, 59.84],
 	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
 ] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?, motion?) => {
 	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot, positionState = vi.mocked(session.setPositionState)!;
@@ -233,7 +235,7 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	expect(positionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
 	const ignored = scenario.endsWith('ignored'), unchanged = ignored || scenario.endsWith('unchanged'), endpoint = unchanged ? 60.035 : 60;
 	const forward = scenario === 'seekforward' || scenario.startsWith('forward'), rounded = scenario.startsWith('interior rounded up');
-	const corrected = scenario.includes('corrected down'), target = scenario.startsWith('interior') ? (corrected ? 59.8 : 59.99) : endpoint;
+	const late = scenario.includes('late correction'), corrected = scenario.includes('corrected down'), target = scenario.startsWith('interior') ? (corrected || late ? 59.8 : 59.99) : endpoint;
 	if (unchanged) Object.assign(audio, { duration: endpoint, ranges: [[0, endpoint]], position: 60 });
 	if (priorStart !== undefined) audio.played = timeRanges([[priorStart, position]]);
 	audio.write.mockImplementationOnce(() => ignored ? undefined : Object.assign(audio,
@@ -243,11 +245,12 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	if (forward) expect(get(media.seekFeedback).jumpStatus).toBe(ignored ? 'The player did not accept that jump.' : 'Forward to the end, 1:00.');
 	if (scenario === 'compact') media.seek(get(media.absoluteSeek).attachment, 59.9999995);
 	else if (corrected) Object.assign(audio, { duration: revisedDuration || position, position: 59.8 }).emit('durationchange');
+	if (late) audio.position = target === endpoint ? 59.98 : 59.8;
 	if (rounded && scenario !== 'interior rounded up') audio.position = 59.98;
 	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('timeupdate', 'seeked'); }
 	if (revisedDuration && !corrected) Object.assign(audio, { duration: revisedDuration }).emit('durationchange');
 	if (priorStart !== undefined && (corrected || rounded)) Object.assign(audio, { position: motion ?? audio.position }).emit('timeupdate');
-	if (scenario.endsWith('extension') || scenario === 'interior natural end' || scenario.includes('played')) audio.played = timeRanges([[corrected || rounded ? audio.position : target, corrected ? revisedDuration : position]]);
+	if (scenario.endsWith('extension') || scenario === 'interior natural end' || scenario.includes('played')) audio.played = timeRanges([[corrected || rounded || late ? audio.position : target, corrected ? revisedDuration : position]]);
 	if (scenario === 'interior rounded up') media.setRepeat('one', null);
 	media.sleepTimer.start({ kind: 'stop-after-tracks', count: 2 }, 'Sleep after two tracks');
 	Object.assign(audio, { position, ended: true, paused: true }).emit('pause', 'ended');

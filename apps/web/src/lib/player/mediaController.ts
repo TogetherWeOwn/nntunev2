@@ -538,7 +538,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const { soughtToEnd } = attachment;
 		if (typeof soughtToEnd === 'object') {
 			const { duration, currentTime } = audio, { end, seekDuration, played, progressed, tailProgress, settled } = soughtToEnd, slack = SEEK_READBACK_TOLERANCE;
-			const reachedNewEnd = duration > end
+			const correctedTail = duration < seekDuration && settled !== undefined && settled >= duration - slack;
+			const reachedNewEnd = correctedTail
+				? currentTime >= duration - slack && (tailProgress || playedNewTail(played, audio.played, settled, duration))
+				: duration > end
 				? end < seekDuration || (currentTime >= duration - slack && (currentTime > end + slack || progressed || playedNewTail(played, audio.played, end, duration)))
 				: duration === end && currentTime >= duration - slack && (tailProgress || (settled !== undefined && playedNewTail(played, audio.played, settled, duration)));
 			if (!ownsOrigin()) return;
@@ -668,7 +671,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 							if (Number.isFinite(duration) && duration > 0 && (duration < marker.seekDuration
 								? currentTime >= duration - SEEK_READBACK_TOLERANCE : marker.end < marker.seekDuration && currentTime >= duration)) marker.end = marker.seekDuration = duration;
 						} else if (!paused && !ended && currentTime > (marker.settled ?? Infinity) && currentTime < duration) {
-							if (duration === marker.end) marker.tailProgress = true; else marker.progressed ||= currentTime > marker.end;
+							marker.tailProgress = true;
+							marker.progressed ||= currentTime > marker.end;
 						}
 					}
 					switch (event.type) {
