@@ -1,8 +1,6 @@
 <script lang="ts">
 	let { value, feedback, onchange }: {
-		value: string | null;
-		feedback: string;
-		onchange: (control: HTMLSelectElement) => void;
+		value: string | null; feedback: string; onchange: (control: HTMLSelectElement) => void;
 	} = $props();
 	const presets = ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
 </script>
@@ -11,10 +9,8 @@
 	<label for="playback-speed">Playback speed</label>
 	<select id="playback-speed" data-testid="playback-speed" value={value ?? ''} disabled={value === null}
 		onchange={(event) => onchange(event.currentTarget)}>
-		{#if value === null}
-			<option value="">Unavailable</option>
-		{:else if !presets.includes(value)}
-			<option {value}>{value}x</option>
+		{#if value === null || !presets.includes(value)}
+			<option value={value ?? ''}>{value === null ? 'Unavailable' : `${value}x`}</option>
 		{/if}
 		{#each presets as preset}
 			<option value={preset}>{preset}x</option>

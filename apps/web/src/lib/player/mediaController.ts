@@ -128,6 +128,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					return;
 				}
 				load.call(audio);
+				speed.reapply({ audio, matches: matchesAttempt }); // load() resets playbackRate.
 				if (!matchesAttempt()) return;
 			}
 			// Stay in the gesture, on the same decoder. Only explicit Retry can reload it.

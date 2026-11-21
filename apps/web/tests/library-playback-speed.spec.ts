@@ -1,13 +1,12 @@
 import { expect, test, type Page } from '@playwright/test';
 
-const KEY = 'nntune:playback-speed:v1';
 const tracks = [
 	{ id: 'lib-coral', title: 'Coral Night', artist: 'Mira', streamUrl: '/test-audio/lib-coral' },
 	{ id: 'lib-pine', title: 'Pine Morning', artist: 'North', streamUrl: '/test-audio/lib-pine' }
 ];
 const audio = (page: Page) => page.getByTestId('audio-player').and(page.locator('audio'));
 const speed = (page: Page) => page.getByRole('combobox', { name: 'Playback speed', exact: true });
-const stored = (page: Page) => page.evaluate((key) => localStorage.getItem(key), KEY);
+const stored = (page: Page) => page.evaluate(() => localStorage.getItem('nntune:playback-speed:v1'));
 
 async function openLibrary(page: Page) {
 	await page.route('**/api/library', (route) => route.fulfill({ json: tracks }));

@@ -15,13 +15,10 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 			if (!matches()) return null;
 			const rate = audio.playbackRate;
 			return Number.isFinite(rate) && matches() ? rate : null;
-		} catch {
-			return null;
-		}
+		} catch { return null; }
 	}
 
-	function write(request?: number): void {
-		const current = target();
+	function write(request?: number, current = target()): void {
 		if (!preference || !current?.matches()) return;
 		const intended = request === undefined ? preference.current() : clampPlaybackSpeed(request);
 		const previousPort = writePort;
@@ -76,6 +73,7 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 			state.set(unavailable);
 			write();
 		},
+		reapply: (current: RateTarget) => write(undefined, current),
 		retire: () => state.set(unavailable),
 		set(rate: number): number | null {
 			if (!writePort) write(rate);
