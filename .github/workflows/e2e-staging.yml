@@ -86,9 +86,12 @@ on:
 permissions:
   contents: read
 
+# Smoke triggers share this group; do not let a new smoke replace a pending
+# post-deploy call while deploy.yml is holding the staging deploy lock.
 concurrency:
   group: e2e-staging
   cancel-in-progress: false
+  queue: max
 
 jobs:
   synthetic:

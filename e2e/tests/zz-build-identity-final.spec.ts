@@ -10,14 +10,14 @@ import { assertServingBuildMatchesPromotion } from '../helpers/build-identity-li
 // `e2e/tests/workflows.spec.ts`), so a green run proves the whole journey
 // ran against the promoted build — not just its first minutes.
 //
-// Why this exists: the deploy releases its job-level concurrency group when
-// the deploy finishes while E2E serializes separately, so a later main push
-// can deploy staging mid-journey after the opening read
-// (`e2e/tests/build-identity.spec.ts`) passes. That timing now fails here
-// with a "superseded by a newer deploy" message instead of passing green;
-// the reverse timing (a newer deploy lands before the opening read) fails
-// the opening leg. Either way no green run can cite a mixed-build journey
-// as same-build evidence. Deploy concurrency is intentionally unchanged.
+// The main deploy workflow holds its lock through this read, but the lock
+// does not cover pre-lock reruns. If staging is overwritten after the
+// opening read (`e2e/tests/build-identity.spec.ts`), this leg fails with
+// a "superseded by a newer deploy" message instead of passing green.
+// If staging is overwritten before the opening read, the opening leg fails.
+// Neither case can be used as same-build evidence. For the cutover and
+// rollback procedure that avoids overlapping pre-lock runs, see
+// `docs/ops.md` ("Staging deploy lock cutover and rollback").
 //
 // NO file-level skip by design (like the opening leg): the live test skips
 // green when STAGING_BASE_URL is unset and fails closed once configured.

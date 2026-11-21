@@ -1246,8 +1246,11 @@ environment exists on this repo.
   a green `staging-api` job may be an unconfigured skip, passed on as
   `api_deploy_outcome`), so a skipped/failed
   deploy cannot produce a full-journey PASS and no separate dispatch is
-  needed or accepted as evidence. Scheduled/manual `e2e-staging` runs are
-  synthetic monitoring only (the full-journey job is skipped there).
+  needed or accepted as evidence. `deploy-staging-main` queues later main
+  pushes until the entire deploy and verification finish. The `e2e-staging`
+  group also queues pending runs rather than replacing the post-deploy call.
+  Scheduled/manual `e2e-staging` runs are synthetic monitoring only (the
+  full-journey job is skipped there).
   Record the deploy run and the `post-deploy-e2e` result, and call it
   same-build evidence only when staging `GET /api/build` returns the
   deploy SHA itself (a source SHA alone is not build identity; see the
@@ -1268,8 +1271,10 @@ environment exists on this repo.
   `success` (not `skipped`), before promoting. To accept rollback evidence,
   also require the rollback rerun's `staging-web` job conclusion to be `success`
   (not `skipped`); overall workflow success and staging health alone are
-  insufficient. To roll back `apps/web`, open that Actions run and choose
-  **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
+  insufficient. Follow the [staging deploy lock cutover and rollback
+  procedure](#staging-deploy-lock-cutover-and-rollback) before re-running
+  any known-good push. To roll back `apps/web`, open that Actions run and
+  choose **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
   `staging-web` is push-only and will be skipped. Verify the rerun's
   `staging-web` success and staging health. The rerun also redeploys the api,
   mb and ingest Workers through `staging-api`, `staging-mb` and
@@ -1278,6 +1283,27 @@ environment exists on this repo.
   Staging rollback is
   a redeploy, never a data restore; retain the UNDO blocks and consolidation
   receipt for infrastructure-specific rollback.
+
+### Staging deploy lock cutover and rollback
+
+Actions reruns use the workflow and reusable workflow from the original
+push. A run from before `deploy-staging-main` was added cannot acquire
+that lock, even if it is rerun after cutover.
+
+- **Cutover:** Coordinate a pause on other `main` merges/pushes and staging
+  deploy reruns. In Actions, wait for all active and queued `main`
+  `deploy.yml` runs to finish, including their post-deploy E2E. Then land
+  the lock change and let its deploy and post-deploy E2E finish before
+  resuming normal merges and reruns. Do not rerun a pre-lock deploy during
+  cutover.
+- **Rollback:** Pause new `main` merges/pushes and other staging deploy
+  reruns, and let all active and queued `main` deploy runs finish through
+  post-deploy E2E. Only then **Re-run all jobs** on the chosen push run.
+  Keep the pause in place through the rerun's deploy and post-deploy E2E
+  and verify that staging is serving the rollback SHA before resuming.
+  Draining first also keeps an already queued push from immediately
+  undoing the rollback. If the queue cannot be drained and kept clear, do
+  not start a pre-lock rerun.
 
 ## Future Worker deploy lanes: required rollback evidence
 
@@ -1454,8 +1480,10 @@ deploys either Worker — until every step below clears, in order:
    `.github/scripts/binding_manifest.toml`, and re-run binding-parity
    before the next staging deploy.
 8. **Rollback is a redeploy, never a data restore.** To roll back a Worker,
-   re-run the known-good push's `deploy.yml` run (**Re-run all jobs**;
-   never `workflow_dispatch` on an old SHA — the lanes are push-only and
-   would skip) and retain the per-Worker evidence in the table above. A
+   follow the [staging deploy lock cutover and rollback
+   procedure](#staging-deploy-lock-cutover-and-rollback), then re-run the
+   known-good push's `deploy.yml` run (**Re-run all jobs**; never
+   `workflow_dispatch` on an old SHA — the lanes are push-only and would
+   skip). Retain the per-Worker evidence in the table above. A
    rerun redeploys every configured lane; that is not verified per-Worker
    rollback unless each Worker's own outcome evidence is recorded.
