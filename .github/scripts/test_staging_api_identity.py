@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import unittest
 from contextlib import redirect_stdout
@@ -155,7 +156,9 @@ class IdentityTests(unittest.TestCase):
         wiring = (Path(__file__).parents[1] / "workflows/deploy.yml").read_text()
         deploy, report = wiring.split("- name: Deploy api to staging\n", 1)[1].split("- name: Record API deployment outcome\n", 1)
         hook = " ".join(dedent(deploy.split("postCommands: >-\n", 1)[1].split("\n      #", 1)[0]).splitlines())
-        script = dedent(report.split("        run: |\n", 1)[1].split("\n\n", 1)[0])
+        # A YAML block ends at the next less-indented line, not a blank line.
+        block = report.split("        run: |\n", 1)[1]
+        script = dedent(re.split(r"\n(?= {0,9}\S)", block, maxsplit=1)[0])
         matched = json.dumps(MATCHED)
         missing = {"identity": "unavailable", "reason": "no-completed-probe-receipt"}
         denied = {"identity": "unavailable", "reason": "version-auth-denied"}
