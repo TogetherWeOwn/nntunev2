@@ -219,8 +219,8 @@ test('DORD-04 direction preserves favorites, queue current/membership, badges an
 	const api = await openLibrary(page);
 	await row(page, 'dir-echo').getByRole('button', { name: /star|favorite/i }).click();
 	await row(page, 'dir-zulu').getByRole('button', { name: /star|favorite/i }).click();
+	await expect.poll(() => storedFavorites(page)).toBe(JSON.stringify(['dir-echo', 'dir-zulu']));
 	const favorites = await storedFavorites(page);
-	expect(favorites).not.toBeNull();
 	const favoriteIds = await page.getByTestId('favorite-item').evaluateAll(
 		(rows) => rows.map((item) => item.getAttribute('data-id'))
 	);

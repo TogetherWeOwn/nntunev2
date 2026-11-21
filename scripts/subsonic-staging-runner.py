@@ -4,12 +4,31 @@
 import argparse
 import hashlib
 import json
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote_plus, urlencode
 
 MATRIX = Path(__file__).resolve().parents[1] / "fixtures/subsonic/staging/matrix.json"
 MATRIX_DIGEST = "18a076d2fc86f2a7dadf5efd2e1a1200c741b821379afeb158c4dac06ce80abb"
 MATRIX_LIMIT = 32 * 1024
+STAGING_ORIGIN = "https://staging.nntune.com"
+FORM_LIMIT = 8 * 1024
+ENCODED_API_KEY_LIMIT = 1024  # MAX_CREDENTIAL_VALUE_BYTES in subsonic_http.rs
+REJECTION_LIMIT = 1024
 TICK_MS = 50
+
+REJECTION_ORACLES = {
+    "fixed_staging_off": (404, "xml", 70, "Endpoint not supported in staging.", None),
+    "fixed_capacity_json": (503, "json", 0, "Service unavailable.", "1"),
+    "fixed_oversize_no_callback": (
+        413,
+        None,
+        0,
+        "Request or document too large.",
+        None,
+    ),
+}
 
 
 class Stop(Exception):
@@ -40,13 +59,120 @@ def load_matrix(path):
     return matrix
 
 
+@dataclass(frozen=True)
+class PreparedPost:
+    slot: int
+    url: str
+    headers: tuple[tuple[str, str], ...] = field(repr=False)
+    body: bytes = field(repr=False)
+    method: str = field(default="POST", init=False)
+
+
+def prepare_requests(path, bearer, api_key):
+    """Build unsent POSTs from only the reviewed schedule, with no live CLI."""
+    matrix = load_matrix(path)
+    require(
+        isinstance(bearer, str) and re.fullmatch(r"[!-~]{1,1024}", bearer),
+        "credential-shape",
+    )
+    require(
+        isinstance(api_key, str)
+        and re.fullmatch(r"[!-~]{32,512}", api_key)
+        and len(quote_plus(api_key)) <= ENCODED_API_KEY_LIMIT,
+        "credential-shape",
+    )
+    return (_prepare_post(slot, bearer, api_key) for slot in matrix["slots"])
+
+
+def _prepare_post(slot, bearer, api_key):
+    auth = slot.get("auth")
+    params = dict(slot["params"])
+    if auth is None:
+        params["apiKey"] = api_key
+    body = urlencode(params).encode("ascii")
+    require(len(body) <= FORM_LIMIT, "form-limit")
+    headers = (
+        ("Content-Type", "application/x-www-form-urlencoded"),
+        ("Accept-Encoding", "identity"),
+        ("X-Subsonic-Measurement-Case", slot["case"]),
+    )
+    if auth != "omit_both":
+        headers += (("Authorization", f"Bearer {bearer}"),)
+    return PreparedPost(
+        slot["slot"], f"{STAGING_ORIGIN}/rest/{slot['endpoint']}", headers, body
+    )
+
+
+def classify_fixed_rejection(
+    slot, status, body, content_type, cache_control, retry_after
+):
+    """Accept only the application's pinned rejection, not a proxy status or pair outcome."""
+    expected = slot["expected"]
+    oracle = expected["oracle"]
+    require(oracle in REJECTION_ORACLES, "response-mismatch")
+    wanted_status, fmt, code, message, wanted_retry = REJECTION_ORACLES[oracle]
+    if fmt is None:
+        # An over-cap JSONP response must be plain JSON, with no callback.
+        fmt = "json" if slot["params"].get("f") in ("json", "jsonp") else "xml"
+    if fmt == "json":
+        payload = {
+            "subsonic-response": {
+                "status": "failed",
+                "version": "1.16.1",
+                "error": {"code": code, "message": message},
+            }
+        }
+        wanted_body = json.dumps(payload, separators=(",", ":")).encode("ascii")
+    else:
+        wanted_body = (
+            f'<subsonic-response status="failed" version="1.16.1">'
+            f'<error code="{code}" message="{message}"/></subsonic-response>'
+        ).encode("ascii")
+    require(len(body) <= REJECTION_LIMIT, "body-limit")
+    require(
+        status == wanted_status == expected["http_status"]
+        and content_type == f"application/{fmt}"
+        and cache_control == "private, no-store"
+        and retry_after == wanted_retry
+        and body == wanted_body
+        and len(body) == expected.get("body_bytes", len(wanted_body)),
+        "response-mismatch",
+    )
+    sample = {"oracle": oracle, "http_status": status}
+    if "body_bytes" in expected:
+        sample["body_bytes"] = len(body)
+    return sample
+
+
+@dataclass(frozen=True)
+class Deployment:
+    deployment_id: str
+    version: str
+    serving_version: str
+    enabled: bool
+    lease: bool
+    measurement_binding: bool
+
+    def verified_off(self):
+        return (
+            bool(self.deployment_id and self.version)
+            and self.serving_version == self.version
+            and self.enabled is False
+            and self.lease is False
+            and self.measurement_binding is False
+        )
+
+
+BASELINE = Deployment("deploy-off", "baseline", "baseline", False, False, False)
+EXPERIMENT = Deployment("deploy-on", "experiment", "experiment", True, True, True)
+
+
 class StagingModel:
     """Synthetic clock, telemetry and readback; no transport or provider calls."""
 
     def __init__(self):
         self.now = 0
-        self.version = "baseline"
-        self.lease = False
+        self.state = BASELINE
         self.pending = {}
 
     def tick(self):
@@ -56,7 +182,8 @@ class StagingModel:
         return self.now, True, len(self.pending)
 
     def arm(self):
-        self.version, self.lease = "experiment", True
+        require(self.state == BASELINE, "preflight-not-off-and-idle")
+        self.state = EXPERIMENT
 
     def start(self, slot):
         delay = {"normal": 100, "held": 1500, "disconnect": 1100}[slot.get("reader", "normal")]
@@ -79,13 +206,16 @@ class StagingModel:
     def cancel_clients(self):
         self.pending.clear()
 
-    def restore(self, baseline):
-        # Do not overwrite a newer deployment; verify its off-state instead.
-        if self.version == "experiment":
-            self.version, self.lease = baseline, False
+    def restore_if_current(self, expected_deployment_id):
+        # Atomic only in this model. A provider read then unconditional write is not equivalent.
+        if self.state.deployment_id != expected_deployment_id:
+            return None
+        self.state = Deployment("deploy-restored", BASELINE.version, BASELINE.version,
+                                False, False, False)
+        return self.state.deployment_id
 
     def readback(self):
-        return self.version, self.lease
+        return self.state
 
 
 def advance(model):
@@ -168,20 +298,47 @@ def execute(model, matrix, report, cutoff):
             advance(model)
 
 
+def cleanup(model, limits):
+    deadline = model.now + limits["cleanup_timeout_ms"]
+    restored_id = None
+    try:
+        model.cancel_clients()
+    finally:
+        current = model.readback()
+        if (current.deployment_id, current.version) == (EXPERIMENT.deployment_id, EXPERIMENT.version):
+            restored_id = model.restore_if_current(EXPERIMENT.deployment_id)
+
+    off = model.readback()
+    require(off.verified_off() and off.version != EXPERIMENT.version
+            and off.deployment_id != EXPERIMENT.deployment_id, "restore-unverified")
+    owned = off.deployment_id in (BASELINE.deployment_id, restored_id)
+    require(not owned or off.version == BASELINE.version, "restore-unverified")
+    # Advance before sampling: a zero observed at/before the off readback is not drain evidence.
+    while model.now < deadline:
+        advance(model)
+        require(model.now <= deadline, "restore-unverified")
+        if pressure(model, limits) == 0:
+            require(model.readback() == off, "restore-unverified")
+            return "simulated-off-and-drained" if owned else "simulated-superseded-off-and-drained"
+    return "unverified"
+
+
 def rehearse(path, model):
     report = {"mode": "offline-simulation", "stop": "complete", "cleanup": "not-armed",
               "starts": 0, "max_simulated_clients": 0, "max_simulated_backends": None,
               "simulated_pair_overlap": {}, "slots": {}}
-    baseline = None
+    cleanup_needed = False
     try:
         matrix = load_matrix(path)
         report["slots"] = {slot["slot"]: {"state": "unstarted"} for slot in matrix["slots"]}
         limits = matrix["limits"]
-        version, lease = model.readback()
-        require(version and lease is False and pressure(model, limits) == 0, "preflight-not-off-and-idle")
-        baseline = version  # Arm can fail after changing state, so cleanup owns this first.
+        baseline = model.readback()
+        require(baseline == BASELINE and baseline.verified_off() and pressure(model, limits) == 0,
+                "preflight-not-off-and-idle")
+        cleanup_needed = True  # Even a failed arm can have changed state.
         start = model.now
         model.arm()
+        require(model.readback() == EXPERIMENT, "serving-version-unverified")
         cutoff = start + min(limits["load_window_ms"], limits["lease_max_ms"],
                              limits["job_timeout_ms"] - limits["cleanup_timeout_ms"])
         execute(model, matrix, report, cutoff)
@@ -192,21 +349,10 @@ def rehearse(path, model):
     except Exception:
         report["stop"] = "model-failure"
     finally:
-        if baseline is not None:
+        if cleanup_needed:
             report["cleanup"] = "unverified"
-            deadline = model.now + limits["cleanup_timeout_ms"]
             try:
-                try:
-                    model.cancel_clients()
-                finally:
-                    model.restore(baseline)
-                while model.now <= deadline:
-                    restored, live_lease = model.readback()
-                    require(restored and restored != "experiment" and live_lease is False, "restore-unverified")
-                    if pressure(model, limits) == 0:
-                        report["cleanup"] = "simulated-off-and-drained"
-                        break
-                    advance(model)
+                report["cleanup"] = cleanup(model, limits)
             except (Exception, KeyboardInterrupt):
                 pass  # Leave cleanup unverified; never echo adapter exceptions.
     return report

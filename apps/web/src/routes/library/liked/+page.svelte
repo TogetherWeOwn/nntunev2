@@ -1,7 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
-	import AccountLikes from '#lib/library/AccountLikes.svelte';
 	import {
 		browserStorage,
 		invalidateLibraryCache,
@@ -9,73 +6,49 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import {
-		favoritesKey,
 		loadFavorites,
-		retireStoredFavorites,
 		saveFavorites,
 		selectFavoriteItems
 	} from '#lib/library/favorites.js';
 	import { restoreFavoriteId } from '#lib/library/favorites-order.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
-	import { recentPlayTitles } from '#lib/library/recent-plays.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
 	import { pushToast } from '#lib/shell/toasts.js';
 
+	// Liked is the visitor's starred subset of their own library: loaded
+	// rows projected through the device-local favorites for this auth
+	// context. Removing a favorite persists immediately and offers Undo.
 	let items = $state<LibraryItem[]>([]);
 	let loading = $state(true);
 	let loadError = $state<string | null>(null);
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
-	let deviceScope = $state<string | null>(null);
-	const session = browserStorage('session');
-	const local = browserStorage('local');
-	let favoriteIds = $state<string[]>([]);
-	const liked = $derived(selectFavoriteItems(items, favoriteIds));
-	const titles = $derived(recentPlayTitles(items));
-
-	type FavoriteChange = (ids: readonly string[]) => readonly string[];
-	const pendingChanges = new Map<string, FavoriteChange>();
 
 	const refresher = createLibraryRefresher({
-		sessionStorage: () => session,
+		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache,
-		onStateChange: (state, { authoritative, authBoundary }) => {
+		onStateChange: (state) => {
 			items = state.items;
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			requiresSignIn = state.requiresSignIn;
-			if (authBoundary) {
-				deviceScope = null;
-				pendingChanges.clear();
-				favoriteIds = [];
-			} else if (authoritative && !loadError && !libraryUnavailable) {
-				deviceScope = favoritesKey(session);
-				favoriteIds = currentFavorites();
-			}
 		}
 	});
 
-	onMount(() => {
-		const unsubscribe = subscribeLocalAuthTransition(refresher.handleLocalAuthTransition);
-		window.addEventListener('storage', refresher.handleAuthTransition);
+	$effect(() => {
 		void refresher.refresh();
-		return () => {
-			unsubscribe();
-			window.removeEventListener('storage', refresher.handleAuthTransition);
-			refresher.dispose();
-		};
+		return () => refresher.dispose();
 	});
 
-	function readDeviceIds(): string[] {
-		return deviceScope && deviceScope === favoritesKey(session) ? currentFavorites() : [];
-	}
+	const session = browserStorage('session');
+	const local = browserStorage('local');
+	let favoriteIds = $state<string[]>(loadFavorites(session, local));
 
-	function retireDeviceIds(ids: readonly string[]): void {
-		if (!deviceScope || !retireStoredFavorites(session, local, deviceScope, ids)) return;
-		for (const id of ids) pendingChanges.delete(id);
-		favoriteIds = currentFavorites();
-	}
+	const liked = $derived(selectFavoriteItems(items, favoriteIds));
+
+	type FavoriteChange = (ids: readonly string[]) => readonly string[];
+	const pendingChanges = new Map<string, FavoriteChange>();
 
 	function currentFavorites(): string[] {
 		// Retry unsaved per-track changes against fresh storage, preserving
@@ -86,7 +59,6 @@
 	}
 
 	function persistChange(id: string, change: FavoriteChange): void {
-		if (!deviceScope || deviceScope !== favoritesKey(session)) return;
 		pendingChanges.delete(id);
 		pendingChanges.set(id, change);
 		favoriteIds = currentFavorites();
@@ -144,8 +116,9 @@
 		</div>
 	{:else if libraryUnavailable}
 		<p>Your library is not available yet.</p>
-	{:else if liked.length > 0}
-		<h2>Device favorites</h2>
+	{:else if liked.length === 0}
+		<p>No liked tracks yet. Star tracks in Your Library to find them here.</p>
+	{:else}
 		<ul>
 			{#each liked as item (libraryItemKey(item))}
 				<li>
@@ -156,13 +129,5 @@
 				</li>
 			{/each}
 		</ul>
-	{/if}
-	{#if !requiresSignIn}
-		<AccountLikes
-			{titles}
-			deviceCount={!loading && !loadError && !libraryUnavailable && deviceScope ? favoriteIds.length : 0}
-			{readDeviceIds}
-			{retireDeviceIds}
-		/>
 	{/if}
 </main>

@@ -124,7 +124,7 @@ async function openLibrary(page: Page, clipboard: ClipboardMode = 'fulfilled', s
 		await expect(main(page).getByTestId('queue-item')).toHaveCount(3);
 		expect(await order(page)).toEqual(INITIAL_IDS);
 		await expect(queueRow(page, 'export-mike')).toHaveAttribute('aria-current', 'true');
-		await expect(main(page).getByTestId('audio-player')).toHaveCount(1);
+		await expect(page.getByTestId('audio-player')).toHaveCount(1);
 	}
 	return downloads;
 }
@@ -188,7 +188,7 @@ async function expectPolite(page: Page) {
 /** Snapshot real observable state, not the formatters or a fake queue. */
 async function snapshot(page: Page) {
 	return main(page).evaluate((element) => {
-		const audio = element.querySelector<HTMLAudioElement>('[data-testid="audio-player"]');
+		const audio = element.ownerDocument.querySelector<HTMLAudioElement>('[data-testid="audio-player"]');
 		const dump = (storage: Storage) => Object.fromEntries(
 			Array.from({ length: storage.length }, (_, i) => storage.key(i)!)
 				.sort().map((key) => [key, storage.getItem(key)])
@@ -367,7 +367,7 @@ test('copy and download leave queue order, current track, checked selection, pla
 	await arrange(page);
 	const { copy, download } = await actions(page);
 	await main(page).getByRole('checkbox', { name: 'Select Alpha 🌊', exact: true }).check();
-	const audio = main(page).getByTestId('audio-player');
+	const audio = page.getByTestId('audio-player');
 	await audio.evaluate((element: HTMLAudioElement) => { element.currentTime = 37.25; element.playbackRate = 1.5; });
 	const before = await snapshot(page);
 	const mediaNode = await audio.elementHandle();

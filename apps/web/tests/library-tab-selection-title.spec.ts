@@ -51,7 +51,8 @@ const test = base.extend<{ mountedLibrary: Page }, { libraryOrigin: string }>({
 			resolve: { alias: {
 				'#lib': `${webRoot}src/lib`,
 				'$app/env/public': `${webRoot}tests/fixtures/library-public-env.ts`,
-				'$app/navigation': `${fixtureRoot}navigation.ts`
+				'$app/navigation': `${fixtureRoot}navigation.ts`,
+				'../../../src/routes/library/+page.svelte': `${webRoot}tests/fixtures/LibraryPlayerHarness.svelte`
 			} },
 			plugins: [{
 				name: 'acceptance-library-title-input', enforce: 'pre',
@@ -259,7 +260,7 @@ test('LIBTITLE-15 teardown cannot overwrite a newer route title', async ({ mount
 	await check(info, [CORAL_TITLE, 'Newer route — owned elsewhere'], [selected, await page.title()]);
 });
 
-test('LIBTITLE-16 SPA navigation owns the destination title and a new library visit starts empty', async ({ page, baseURL }, info) => {
+test('LIBTITLE-16 SPA navigation owns the destination title and returning restores the selection title', async ({ page, baseURL }, info) => {
 	await seed(page, baseURL!); await add(page, 'title-coral'); await settle(page);
 	const selected = await page.title();
 	await page.evaluate(() => { (window as unknown as { titleNavMarker: string }).titleNavMarker = 'same-document'; });
@@ -272,8 +273,8 @@ test('LIBTITLE-16 SPA navigation owns the destination title and a new library vi
 	const destination = await page.title();
 	await primary.getByRole('link', { name: 'Your Library', exact: true }).click();
 	await expect(page.getByTestId('library-item')).toHaveCount(3);
-	await expect(page.getByTestId('queue-item')).toHaveCount(0); await settle(page);
-	await check(info, { titles: [CORAL_TITLE, 'Billing — NNTune v2', BASELINE], marker: 'same-document' }, {
+	await expect(page.getByTestId('queue-item')).toHaveCount(1); await settle(page);
+	await check(info, { titles: [CORAL_TITLE, 'Billing — NNTune v2', CORAL_TITLE], marker: 'same-document' }, {
 		titles: [selected, destination, await page.title()],
 		marker: await page.evaluate(() => (window as unknown as { titleNavMarker: string }).titleNavMarker)
 	});

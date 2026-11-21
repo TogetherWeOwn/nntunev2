@@ -66,6 +66,11 @@ pub const REGISTRY: &[CodeSpec] = &[
         retryable: false,
     },
     CodeSpec {
+        code: "conflict",
+        status: 409,
+        retryable: false,
+    },
+    CodeSpec {
         code: "account_deleting",
         status: 409,
         retryable: false,

@@ -28,6 +28,41 @@ def steps(section):
 
 
 class WorkerBuildWorkflowTests(unittest.TestCase):
+    def test_upload_redaction_requires_boolean_true_in_metadata(self):
+        boundary = b"------formdata-undici-test"
+
+        def part(disposition, payload):
+            return (boundary + b'\r\nContent-Disposition: form-data; name="' + disposition
+                    + b'"\r\n\r\n' + payload + b'\r\n')
+
+        enabled = b'{"observability":{"redact_query_string":true}}'
+        metadata = part(b"metadata", enabled)
+        # A matching string buried in the bundle is never metadata evidence.
+        wasm = part(b"index.wasm", b"\x00asm\xff" + enabled)
+        close = boundary + b"--\r\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            body = Path(tmp) / "upload.multipart"
+            with self.assertRaisesRegex(UPLOAD.Failure, "did not write the upload body"):
+                UPLOAD.assert_upload_redaction(body, "api")
+            body.write_bytes(wasm + metadata + close)
+            UPLOAD.assert_upload_redaction(body, "api")
+
+            for name, data, error in (
+                ("no boundary", enabled, "multipart boundary"),
+                ("truncated", metadata, "malformed Wrangler upload body"),
+                ("no metadata", wasm + close, "exactly one"),
+                ("duplicate", metadata + metadata + close, "exactly one"),
+                ("invalid JSON", part(b"metadata", b"{") + close, "invalid .* JSON"),
+                ("missing observability", part(b"metadata", b"{}") + close, "must set"),
+                ("missing redaction", part(b"metadata", b'{"observability":{}}') + close, "must set"),
+                ("disabled", part(b"metadata", enabled.replace(b"true", b"false")) + close, "must set"),
+                ("not a boolean", part(b"metadata", enabled.replace(b"true", b"1")) + close, "must set"),
+            ):
+                with self.subTest(name=name):
+                    body.write_bytes(data)
+                    with self.assertRaisesRegex(UPLOAD.Failure, error):
+                        UPLOAD.assert_upload_redaction(body, "api")
+
     def test_upload_fixture_preserves_complete_build_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

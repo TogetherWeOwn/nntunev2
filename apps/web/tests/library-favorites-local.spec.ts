@@ -104,7 +104,7 @@ async function readAuthContext(page: Page): Promise<string | null> {
 
 async function readFavoritesRaw(page: Page, context: string | null): Promise<string | null> {
 	return page.evaluate(
-		({ base, ctx }) => (ctx ? window.localStorage.getItem(`${base}.${ctx}`) : null),
+		({ base, ctx }) => ctx ? navigator.locks.request(`${base}.${ctx}`, () => localStorage.getItem(`${base}.${ctx}`)) : null,
 		{ base: FAVORITES_KEY_BASE, ctx: context }
 	);
 }
@@ -226,10 +226,11 @@ test('[FAV-05] an auth transition clears favorites so the next account starts em
 	}, AUTH_TRANSITION_KEY);
 
 	await expect(page.getByRole('alert')).toContainText(/session changed/i);
-	expect(
-		await readFavoritesRaw(page, contextBefore),
-		'previous-account favorites must be cleared at the auth boundary'
-	).toBeNull();
+	await expect
+		.poll(() => readFavoritesRaw(page, contextBefore), {
+			message: 'previous-account favorites must be cleared at the auth boundary'
+		})
+		.toBeNull();
 	await otherTab.close();
 
 	// The next account refetches and starts with an empty Favorites section.
@@ -322,6 +323,7 @@ async function failFavoritesStorage(page: Page, operation: 'getItem' | 'setItem'
 			} else {
 				Storage.prototype.setItem = function (key, value) {
 					if (this === window.localStorage && key.startsWith(`${base}.`)) {
+						Reflect.set(window, '__favoritesWriteRejected', true);
 						throw new DOMException('Favorites writes unavailable', 'QuotaExceededError');
 					}
 					setItem.call(this, key, value);
@@ -342,6 +344,11 @@ async function failFavoritesStorage(page: Page, operation: 'getItem' | 'setItem'
 			return window.localStorage.getItem('test.unrelated-storage');
 		})
 	).toBe('available');
+}
+
+async function settleFavorites(page: Page): Promise<void> {
+	const key = `${FAVORITES_KEY_BASE}.${await readAuthContext(page)}`;
+	await page.evaluate((key) => navigator.locks.request(key, () => {}), key);
 }
 
 async function restoreFavoritesStorage(page: Page): Promise<void> {
@@ -435,6 +442,7 @@ test.describe('favorites storage regressions', () => {
 			await expectFavoriteIds(page, ['fav-zulu', 'fav-alpha']);
 			await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'true');
 			await starButton(page, 'fav-zulu').click();
+			await settleFavorites(page);
 			await expectFavoriteIds(page, ['fav-alpha']);
 			await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'false');
 			await expect(starButton(page, 'fav-alpha')).toHaveAttribute('aria-pressed', 'true');
@@ -496,23 +504,21 @@ test.describe('favorites storage regressions', () => {
 		});
 	}
 
-	test('[FAV-R06] recovered writes persist the full pending set and survive reload', async ({ page }) => {
+	test('[FAV-R06] recovered writes persist only the new intent', async ({ page }) => {
 		await seedLibrary(page);
 		await failFavoritesStorage(page, 'setItem');
 		await starButton(page, 'fav-zulu').click();
-		await expectFavoriteIds(page, ['fav-zulu']);
+		await settleFavorites(page);
+		expect(await page.evaluate(() => Reflect.get(window, '__favoritesWriteRejected'))).toBe(true);
 		await restoreFavoritesStorage(page);
-		// The next successful write must include the unpersisted first star,
-		// rather than rebuilding from the stale (empty) stored value.
+		// Recovery must not write the visit-only star along with the new edit.
 		await starButton(page, 'fav-alpha').click();
-		expect(storedIds(await readFavoritesRaw(page, await readAuthContext(page))).sort()).toEqual([
-			'fav-alpha', 'fav-zulu'
-		]);
-		await expectFavoriteIds(page, ['fav-alpha', 'fav-zulu']);
+		await expect.poll(async () => storedIds(await readFavoritesRaw(page, await readAuthContext(page)))).toEqual(['fav-alpha']);
+		await expectFavoriteIds(page, ['fav-alpha']);
 		await page.reload();
 		await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
-		await expectFavoriteIds(page, ['fav-alpha', 'fav-zulu']);
-		await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'true');
+		await expectFavoriteIds(page, ['fav-alpha']);
+		await expect(starButton(page, 'fav-zulu')).toHaveAttribute('aria-pressed', 'false');
 		await expect(starButton(page, 'fav-alpha')).toHaveAttribute('aria-pressed', 'true');
 	});
 });

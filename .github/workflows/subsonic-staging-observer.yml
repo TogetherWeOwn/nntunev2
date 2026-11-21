@@ -1,0 +1,33 @@
+name: subsonic-staging-observer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subsonic-staging-observer
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    name: Read Subsonic staging pressure
+    if: >-
+      ${{ github.repository == 'TogetherWeOwn/nntunev2' &&
+          github.ref == 'refs/heads/main' && github.ref_protected &&
+          github.workflow_sha == github.sha && github.run_attempt == 1 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    environment:
+      name: staging
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Sample observer (read-only; not measurement admission)
+        env:
+          PLANETSCALE_OBSERVER_URL_STAGING: ${{ secrets.PLANETSCALE_OBSERVER_URL_STAGING }}
+        run: python3 -I .github/scripts/subsonic_staging_observer.py

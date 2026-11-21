@@ -300,6 +300,10 @@ async fn configured_mirror_failure_never_degrades() {
     let (store, attempts) = meter_store(app, Err(StoreError));
     assert!(store.track_meter_meta(USER, LOCAL_TRACK).await.is_err());
     assert_eq!(attempts.get(), 1);
+    let (store, attempts) = meter_store(self::app().await, Err(StoreError));
+    let meta = store.track_meta(USER, LOCAL_TRACK, true).await.unwrap();
+    assert_eq!(meta.track_duration_ms, Some(60_000));
+    assert_eq!(attempts.get(), 0);
 }
 
 #[tokio::test]

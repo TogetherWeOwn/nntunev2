@@ -1,13 +1,13 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
 	import type { Snippet } from 'svelte';
-	import { afterNavigate, goto } from '$app/navigation';
+	import { afterNavigate, goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import favicon from '#lib/assets/favicon.svg';
 	import PaywallModal from '#lib/billing/PaywallModal.svelte';
 	import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
-	import { invalidateLibraryCache } from '#lib/library/cache.js';
+	import { invalidateLibraryCache, resumeFavoritesPurges } from '#lib/library/cache.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		notifyLocalAuthTransition,
@@ -27,10 +27,18 @@
 		type Toast
 	} from '#lib/shell/toasts.js';
 	import { onRightPanel } from '#lib/shell/right-panel.js';
+	import AppPlayer from '#lib/player/AppPlayer.svelte';
 	import '../app.css';
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
+
+	// Store only the current player's opaque receipt, never the share target or position.
+	function claimShareEntry(libraryShareOwner: string): boolean {
+		if ((page.state as { libraryShareOwner?: string }).libraryShareOwner === libraryShareOwner) return false;
+		replaceState(window.location.href, { ...page.state, libraryShareOwner });
+		return true;
+	}
 
 	type Appearance = 'system' | 'light' | 'dark';
 
@@ -165,7 +173,7 @@
 	const PUBLIC_BASES = ['/login', '/signup', '/pricing', '/demo', '/auth'];
 
 	const isPublicRoute = $derived.by((): boolean => {
-		const pathname = page.url.pathname;
+		const pathname = page.route.id ?? page.url.pathname;
 		return pathname === '/' || PUBLIC_BASES.some((base) => matchesBoundary(pathname, base));
 	});
 
@@ -267,15 +275,33 @@
 		menuOpener = null;
 	}
 
-	// SvelteKit resets focus after link navigation; use the destination main
-	// when Upgrade unmounted the original control, not a detached opener.
-	// Any navigation also drops an open menu.
-	afterNavigate(() => {
+	let miniLink: HTMLAnchorElement | undefined = $state();
+	let expandedFromMini = false;
+
+	// Keep the anchor's normal behavior for modified clicks and new tabs.
+	function openNowPlaying(event: MouseEvent): void {
+		if (
+			event.defaultPrevented || event.button !== 0 || event.altKey ||
+			event.ctrlKey || event.metaKey || event.shiftKey
+		) return;
+		event.preventDefault();
+		void goto('/now-playing', { state: { nowPlayingFromMini: true } });
+	}
+
+	// Any navigation drops an open menu. Restore focus after Kit's own focus reset.
+	afterNavigate((navigation) => {
 		openMenu = null;
 		menuOpener = null;
-		if (!restoreAfterNavigation) return;
-		restoreAfterNavigation = false;
-		restoreFocus();
+		const returnToMini = expandedFromMini && 'delta' in navigation && navigation.delta === -1;
+		expandedFromMini = navigation.to?.route.id === '/now-playing' && page.state.nowPlayingFromMini === true;
+		if (restoreAfterNavigation) {
+			restoreAfterNavigation = false;
+			restoreFocus();
+		} else if (returnToMini) {
+			miniLink?.focus({ preventScroll: true });
+			// The opener may have disappeared on a resize or auth teardown.
+			if (document.activeElement !== miniLink) focusMain();
+		}
 	});
 
 	// Top-bar search: plain navigation to the Search page, never
@@ -315,6 +341,7 @@
 		const offPanel = onRightPanel((panel) => {
 			rightSnippet = panel;
 		});
+		resumeFavoritesPurges();
 		const offAuth = subscribeLocalAuthTransition(clearShellAtAuthBoundary);
 		const onStorage = (event: StorageEvent): void => {
 			if (event.key === LIBRARY_AUTH_TRANSITION_KEY) clearShellAtAuthBoundary();
@@ -351,33 +378,30 @@
 			try {
 				await client.logout();
 			} catch (error) {
-				if (!(error instanceof ApiError) || error.status !== 401) {
-					pushToast('Could not sign out. Please try again.');
-					return;
-				}
+				if (!(error instanceof ApiError) || error.status !== 401) throw error;
 				// A 401 means the session is already gone: cross the boundary
 				// exactly like a successful sign-out.
 			}
 		} catch {
 			pushToast('Could not sign out. Please try again.');
-			return;
-		} finally {
 			signingOut = false;
+			return;
 		}
 		clearMiniPlayerHint();
 		clearToasts();
-		invalidateLibraryCache();
+		const purge = invalidateLibraryCache();
 		clearSignedInEmail();
 		notifyLocalAuthTransition();
+		await purge;
+		signingOut = false;
 		window.location.href = '/login';
 	}
 
-	// Skip link: move keyboard focus to the page's own <main> (each route
-	// renders exactly one) without adding nested landmarks.
-	function skipToContent(event: MouseEvent): void {
+	// Each route supplies its own main landmark.
+	function focusMain(event?: MouseEvent): void {
 		const main = document.querySelector('main');
 		if (!main) return;
-		event.preventDefault();
+		event?.preventDefault();
 		if (!main.hasAttribute('tabindex')) main.setAttribute('tabindex', '-1');
 		main.focus();
 	}
@@ -391,7 +415,7 @@
 
 <svelte:document onclick={onDocumentClick} />
 
-<a class="skip-link" href="#main-content" onclick={skipToContent}>Skip to content</a>
+<a class="skip-link" href="#main-content" onclick={focusMain}>Skip to content</a>
 
 {#if isPublicRoute}
 	<header class="nt-public nt-wrap" data-testid="shell-topbar">
@@ -469,6 +493,7 @@
 			{/if}
 		</div>
 	</div>
+	{#snippet appBody()}
 	<div class="nt-body">
 		<div class="nt-rail" data-testid="shell-rail">
 			<nav aria-label="Primary" class="nt-destinations nt-rail-nav">
@@ -490,19 +515,25 @@
 		</div>
 		{@render children()}
 	</div>
+	{/snippet}
+	{#if page.route.id === null}
+		{@render appBody()}
+	{:else}
+		<AppPlayer {claimShareEntry} children={appBody} signedOut={page.route.id === '/account/billing' && page.data.signedOut === true} />
+	{/if}
 	{#if rightSnippet}
 		<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
 			{@render rightSnippet()}
 		</aside>
 	{/if}
-	{#if miniHint}
+	{#if miniHint && page.route.id !== '/now-playing'}
 		<div class="nt-miniplayer nt-wrap" data-testid="mini-player">
-			<a href="/library">
+			<a href="/now-playing" bind:this={miniLink} onclick={openNowPlaying}>
 				<span class="nt-miniplayer-title">{miniHint.title}</span>
 				{#if miniHint.artist}
 					<span class="nt-miniplayer-artist">{miniHint.artist}</span>
 				{/if}
-				<span class="nt-miniplayer-context">Your Library</span>
+				<span class="nt-miniplayer-context">Now Playing</span>
 			</a>
 		</div>
 	{/if}

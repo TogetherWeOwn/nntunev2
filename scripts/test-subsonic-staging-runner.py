@@ -2,10 +2,14 @@
 import runpy
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 runner = runpy.run_path(str(Path(__file__).with_name("subsonic-staging-runner.py")))
 StagingModel, matrix, rehearse = (runner[key] for key in ("StagingModel", "MATRIX", "rehearse"))
+BASELINE, EXPERIMENT = runner["BASELINE"], runner["EXPERIMENT"]
+NEWER = replace(BASELINE, deployment_id="deploy-newer", version="newer", serving_version="newer")
 
 
 class RecordingModel(StagingModel):
@@ -14,6 +18,11 @@ class RecordingModel(StagingModel):
     def __init__(self):
         super().__init__()
         self.starts = []
+        self.cleanup_started_at = None
+
+    def cancel_clients(self):
+        self.cleanup_started_at = self.now
+        super().cancel_clients()
 
     def start(self, slot):
         number = slot["slot"]
@@ -21,6 +30,128 @@ class RecordingModel(StagingModel):
         super().start(slot)
         if number in self.delays:
             self.pending[number] = self.now + self.delays[number]
+
+
+class RequestContractTests(unittest.TestCase):
+    bearer = "synthetic-bearer"
+    api_key = "disposable+key/=with&reserved" * 16
+
+    def test_posts_use_staging_and_separate_credentials(self):
+        posts = list(runner["prepare_requests"](matrix, self.bearer, self.api_key))
+        slots = runner["load_matrix"](matrix)["slots"]
+        self.assertEqual([post.slot for post in posts], list(range(1, 49)))
+        for post, slot in zip(posts, slots):
+            with self.subTest(slot=post.slot):
+                headers = dict(post.headers)
+                url = urlsplit(post.url)
+                self.assertEqual(post.method, "POST")
+                self.assertEqual(
+                    (url.scheme, url.netloc), ("https", "staging.nntune.com")
+                )
+                self.assertEqual(
+                    (url.path, url.query, url.fragment),
+                    (f"/rest/{slot['endpoint']}", "", ""),
+                )
+                self.assertEqual(
+                    headers["Content-Type"], "application/x-www-form-urlencoded"
+                )
+                self.assertEqual(headers["Accept-Encoding"], "identity")
+                self.assertEqual(headers["X-Subsonic-Measurement-Case"], slot["case"])
+                auth = None if post.slot == 5 else f"Bearer {self.bearer}"
+                self.assertEqual(headers.get("Authorization"), auth)
+                self.assertNotIn(self.api_key, repr(post))
+                self.assertNotIn(self.bearer, repr(post))
+                self.assertLessEqual(len(post.body), 8192)
+                params = {key: [value] for key, value in slot["params"].items()}
+                if post.slot not in (5, 6):
+                    params["apiKey"] = [self.api_key]
+                self.assertEqual(
+                    parse_qs(
+                        post.body.decode("ascii"),
+                        keep_blank_values=True,
+                        strict_parsing=True,
+                    ),
+                    params,
+                )
+
+    def test_missing_or_unsafe_credentials_and_changed_matrix_refuse(self):
+        prepare = runner["prepare_requests"]
+        for bearer, key in (
+            ("", self.api_key),
+            ("a\r\nb", self.api_key),
+            ("a" * 1025, self.api_key),
+            (self.bearer, "a" * 31),
+            (self.bearer, "a" * 513),
+            (self.bearer, "a" * 32 + "雪"),
+        ):
+            with self.assertRaisesRegex(runner["Stop"], "^credential-shape$"):
+                prepare(matrix, bearer, key)
+        with tempfile.TemporaryDirectory() as tmp:
+            tampered = Path(tmp) / "matrix.json"
+            tampered.write_text(
+                matrix.read_text().replace('"getAlbum"', '"unreviewed"', 1)
+            )
+            with self.assertRaisesRegex(runner["Stop"], "^unreviewed-matrix$"):
+                prepare(tampered, self.bearer, self.api_key)
+
+    def test_api_key_respects_worker_encoded_value_limit(self):
+        prepare = runner["prepare_requests"]
+        key = "+" * 341 + "a"  # 1024 encoded bytes, not including the field name.
+        post = next(prepare(matrix, self.bearer, key))
+        self.assertEqual(parse_qs(post.body.decode("ascii"))["apiKey"], [key])
+        with self.assertRaisesRegex(runner["Stop"], "^credential-shape$"):
+            prepare(matrix, self.bearer, key + "a")
+
+    def test_fixed_rejections_require_exact_application_response(self):
+        classify = runner["classify_fixed_rejection"]
+        slots = runner["load_matrix"](matrix)["slots"]
+        off = (
+            b'<subsonic-response status="failed" version="1.16.1"><error code="70" '
+            b'message="Endpoint not supported in staging."/></subsonic-response>'
+        )
+        unavailable = (
+            b'{"subsonic-response":{"status":"failed","version":"1.16.1",'
+            b'"error":{"code":0,"message":"Service unavailable."}}}'
+        )
+        oversize = unavailable.replace(
+            b"Service unavailable.", b"Request or document too large."
+        )
+        oversize_xml = off.replace(b"70", b"0").replace(
+            b"Endpoint not supported in staging.",
+            b"Request or document too large.",
+        )
+        for number, status, fmt, retry, body in (
+            (5, 404, "xml", None, off),
+            *((n, 503, "json", "1", unavailable) for n in (9, 12, 15)),
+            (18, 413, "json", None, oversize),
+            (21, 413, "xml", None, oversize_xml),
+            (24, 413, "json", None, oversize),
+        ):
+            slot = slots[number - 1]
+            args = [status, body, f"application/{fmt}", "private, no-store", retry]
+            with self.subTest(slot=number):
+                self.assertEqual(classify(slot, *args), slot["expected"])
+                for i, replacement in enumerate(
+                    (302, b"x" * len(body), "text/javascript", "public", "2")
+                ):
+                    bad = args.copy()
+                    bad[i] = replacement
+                    with self.assertRaisesRegex(runner["Stop"], "^response-mismatch$"):
+                        classify(slot, *bad)
+                if retry is not None:
+                    with self.assertRaisesRegex(runner["Stop"], "^response-mismatch$"):
+                        classify(slot, *args[:-1], None)
+        with self.assertRaisesRegex(runner["Stop"], "^body-limit$"):
+            classify(
+                slots[23],
+                413,
+                b"x" * 1025,
+                "application/json",
+                "private, no-store",
+                None,
+            )
+        with self.assertRaisesRegex(runner["Stop"], "^response-mismatch$"):
+            classify(slots[36], 503, unavailable, "application/json", "private, no-store", "1")
 
 
 class RunnerTests(unittest.TestCase):
@@ -46,7 +177,7 @@ class RunnerTests(unittest.TestCase):
                 model = RecordingModel()
                 report = rehearse(tampered, model)
                 self.assertEqual((report["stop"], report["cleanup"]), ("unreviewed-matrix", "not-armed"))
-                self.assertEqual(model.readback(), ("baseline", False))
+                self.assertEqual(model.readback(), BASELINE)
                 self.assertEqual(model.starts, [])
 
     def test_telemetry_loss_and_pressure_stop_before_next_start(self):
@@ -55,7 +186,7 @@ class RunnerTests(unittest.TestCase):
                                             (1, (50, False, 1), "telemetry-stale-or-unsafe")):
             class Unsafe(RecordingModel):
                 def telemetry(self):
-                    return observation if self.lease and len(self.starts) >= starts else super().telemetry()
+                    return observation if self.state.lease and len(self.starts) >= starts else super().telemetry()
 
             report = rehearse(matrix, Unsafe())
             self.assertEqual((report["stop"], report["starts"]), (reason, starts))
@@ -90,7 +221,7 @@ class RunnerTests(unittest.TestCase):
         model.delays = {41: 6000, 42: 6000}
         report = rehearse(matrix, model)
         self.assertEqual((report["stop"], report["starts"]), ("request-or-reader-timeout", 42))
-        self.assertEqual(model.now - dict(model.starts)[41], 5000)
+        self.assertEqual(model.cleanup_started_at - dict(model.starts)[41], 5000)
         self.assertEqual(report["simulated_pair_overlap"], {1: False, 2: False, 3: True})
         self.assertEqual([report["slots"][i]["state"] for i in (41, 42, 43)],
                          ["unfinished", "unfinished", "unstarted"])
@@ -104,21 +235,102 @@ class RunnerTests(unittest.TestCase):
 
         class Cancelled(RecordingModel):
             def tick(self):
-                raise KeyboardInterrupt
-
-        class Superseded(Cancelled):
-            def tick(self):
-                self.version, self.lease = "new-default-off", False
+                if self.state == EXPERIMENT:
+                    raise KeyboardInterrupt
                 super().tick()
 
-        for model, reason, starts, version in (
-            (PartialArm(), "model-failure", 0, "baseline"), (Cancelled(), "cancelled", 1, "baseline"),
-            (Superseded(), "cancelled", 1, "new-default-off"),
+        for model, reason, starts in (
+            (PartialArm(), "model-failure", 0), (Cancelled(), "cancelled", 1),
         ):
             report = rehearse(matrix, model)
             self.assertEqual((report["stop"], report["starts"]), (reason, starts))
             self.assertEqual(report["cleanup"], "simulated-off-and-drained")
-            self.assertEqual(model.readback(), (version, False))
+            self.assertTrue(model.state.verified_off())
+            self.assertEqual(model.state.version, BASELINE.version)
+
+    def test_wrong_baseline_or_serving_version_cannot_start(self):
+        for state in (NEWER, replace(BASELINE, measurement_binding=True),
+                      replace(BASELINE, serving_version=EXPERIMENT.version)):
+            model = RecordingModel()
+            model.state = state
+            report = rehearse(matrix, model)
+            self.assertEqual((report["stop"], report["starts"], report["cleanup"]),
+                             ("preflight-not-off-and-idle", 0, "not-armed"))
+
+        class WrongServing(RecordingModel):
+            def arm(self):
+                self.state = replace(EXPERIMENT, serving_version=BASELINE.version)
+
+        report = rehearse(matrix, WrongServing())
+        self.assertEqual((report["stop"], report["starts"], report["cleanup"]),
+                         ("serving-version-unverified", 0, "simulated-off-and-drained"))
+
+    def test_restore_compares_deployment_identity_at_write(self):
+        class Race(RecordingModel):
+            def restore_if_current(self, expected_deployment_id):
+                self.state = self.successor
+                return super().restore_if_current(expected_deployment_id)
+
+        for successor, expected in (
+            (NEWER, "simulated-superseded-off-and-drained"),
+            (replace(EXPERIMENT, deployment_id=NEWER.deployment_id), "unverified"),
+        ):
+            model = Race()
+            model.successor = successor
+            self.assertEqual(rehearse(matrix, model)["cleanup"], expected)
+            self.assertEqual(model.state, successor)
+
+    def test_missing_fence_or_uncertain_off_state_leaves_cleanup_unverified(self):
+        class Uncertain(RecordingModel):
+            def restore_if_current(self, expected_deployment_id):
+                self.state = self.successor
+
+        for state in (
+            EXPERIMENT,
+            replace(NEWER, enabled=True),
+            replace(NEWER, lease=True),
+            replace(NEWER, measurement_binding=True),
+            replace(NEWER, serving_version=EXPERIMENT.version),
+        ):
+            model = Uncertain()
+            model.successor = state
+            self.assertEqual(rehearse(matrix, model)["cleanup"], "unverified")
+            self.assertEqual(model.state, state)
+
+    def test_restore_requires_drain_sample_after_off_readback(self):
+        class DrainFence(RecordingModel):
+            off_read_at = None
+            zero_sample_at = None
+
+            def readback(self):
+                state = super().readback()
+                if (self.cleanup_started_at is not None and state.verified_off()
+                        and self.off_read_at is None):
+                    self.off_read_at = self.now
+                return state
+
+            def telemetry(self):
+                at, healthy, backends = super().telemetry()
+                if (self.cleanup_started_at is not None and healthy and backends == 0
+                        and self.zero_sample_at is None):
+                    self.zero_sample_at = at
+                return at, healthy, backends
+
+        model = DrainFence()
+        report = rehearse(matrix, model)
+        self.assertEqual(report["cleanup"], "simulated-off-and-drained")
+        self.assertIsNotNone(model.off_read_at)
+        self.assertIsNotNone(model.zero_sample_at)
+        self.assertGreater(model.zero_sample_at, model.off_read_at)
+
+    def test_deployment_change_during_drain_invalidates_off_readback(self):
+        class ChangedDuringDrain(RecordingModel):
+            def telemetry(self):
+                if self.state.verified_off() and self.starts:
+                    self.state = replace(NEWER, measurement_binding=True)
+                return super().telemetry()
+
+        self.assertEqual(rehearse(matrix, ChangedDuringDrain())["cleanup"], "unverified")
 
     def test_client_cancellation_does_not_prove_backend_drain(self):
         class Lingering(RecordingModel):
@@ -129,7 +341,8 @@ class RunnerTests(unittest.TestCase):
         report = rehearse(matrix, model)
         self.assertEqual((report["stop"], report["starts"]), ("clock-or-window", 1))
         self.assertEqual(report["cleanup"], "unverified")
-        self.assertEqual(model.readback(), ("baseline", False))
+        self.assertTrue(model.state.verified_off())
+        self.assertEqual(model.state.version, BASELINE.version)
 
 
 if __name__ == "__main__":

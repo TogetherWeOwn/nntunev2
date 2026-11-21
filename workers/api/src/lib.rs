@@ -236,6 +236,13 @@ pub async fn billing_owned_test_entry(
 ) -> worker::Result<worker::Response> {
     if req.method() == worker::Method::Post {
         match req.path().as_str() {
+            #[cfg(not(feature = "staging-body-wasm-test"))]
+            "/subsonic-connect-deadline-proof" => {
+                return match subsonic_measurement::test_connect_deadline().await {
+                    Ok(()) => worker::Response::ok("subsonic-connect-deadline-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
             "/billing-webhook-ack-proof" => {
                 return worker_entry::billing_webhook_ack_test::deliver(req, env, true).await;
             }
@@ -258,6 +265,29 @@ pub async fn billing_owned_test_entry(
                     Err(message) => worker::Response::error(message, 500),
                 };
             }
+            path @ ("/billing-raw-insert-commit-proof" | "/billing-raw-insert-rollback-proof") => {
+                let commit = path == "/billing-raw-insert-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_after_raw_insert(
+                    commit,
+                )
+                .await
+                {
+                    Ok(()) => worker::Response::ok("billing-raw-insert-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            path @ ("/billing-worker-first-insert-commit-proof"
+            | "/billing-worker-first-insert-rollback-proof") => {
+                let commit = path == "/billing-worker-first-insert-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_before_raw_insert(
+                    commit,
+                )
+                .await
+                {
+                    Ok(()) => worker::Response::ok("billing-worker-first-insert-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
             path
             @ ("/billing-raw-replace-commit-proof" | "/billing-raw-replace-rollback-proof") => {
                 let commit = path == "/billing-raw-replace-commit-proof";
@@ -265,6 +295,26 @@ pub async fn billing_owned_test_entry(
                     .await
                 {
                     Ok(()) => worker::Response::ok("billing-raw-replace-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            path @ ("/billing-parent-delete-commit-proof"
+            | "/billing-parent-delete-rollback-proof") => {
+                let commit = path == "/billing-parent-delete-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_before_parent_delete(
+                    commit,
+                ).await {
+                    Ok(()) => worker::Response::ok("billing-parent-delete-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            path @ ("/billing-parent-first-delete-commit-proof"
+            | "/billing-parent-first-delete-rollback-proof") => {
+                let commit = path == "/billing-parent-first-delete-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_after_parent_delete(
+                    commit,
+                ).await {
+                    Ok(()) => worker::Response::ok("billing-parent-first-delete-ok"),
                     Err(message) => worker::Response::error(message, 500),
                 };
             }

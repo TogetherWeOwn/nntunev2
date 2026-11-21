@@ -1,6 +1,6 @@
 import { render } from 'svelte/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import Library from './+page.svelte';
+import Library from '../../../tests/fixtures/LibraryPlayerHarness.svelte';
 
 /** LIBTITLE protected SSR controls; paired with tests/library-tab-selection-title.spec.ts.
  * Breaks: accessing browser globals/storage or starting title timers/fetch during

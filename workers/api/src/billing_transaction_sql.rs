@@ -53,12 +53,18 @@ impl<'a> LookupBinds<'a> {
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReconcileProbe {
     None,
     WorkerDeadline,
     ServerWatchdog,
+    BeforeCommit,
+    BeforeInsertCommit(Option<std::rc::Rc<std::cell::Cell<bool>>>),
+    ObserveStaleRefusal(std::rc::Rc<std::cell::Cell<bool>>),
+    ObserveTargetRefusal(std::rc::Rc<std::cell::Cell<bool>>),
 }
+
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+pub(crate) const PRECOMMIT_GATE: i64 = 781349054;
 
 pub(crate) async fn apply_reconcile_transaction(
     transaction: &mut tokio_postgres::Client,
@@ -111,11 +117,23 @@ pub(crate) async fn apply_reconcile_transaction(
             user_id: &user_id,
             subscription_id: &row.stripe_subscription_id,
         };
-        let target = classify_target(&requested, &observed).map_err(|_| StoreError)?;
+        let target = classify_target(&requested, &observed).map_err(|_| {
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            if let ReconcileProbe::ObserveTargetRefusal(refused) = &probe {
+                refused.set(true);
+            }
+            StoreError
+        })?;
         crate::billing_store_classification::validate_history_target(&outcome)
             .map_err(|_| StoreError)?;
         if outcome.explicit_stale {
-            classify_explicit_stale(&target, outcome.history.is_empty()).map_err(|_| StoreError)?;
+            classify_explicit_stale(&target, outcome.history.is_empty()).map_err(|_| {
+                #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+                if let ReconcileProbe::ObserveStaleRefusal(refused) = &probe {
+                    refused.set(true);
+                }
+                StoreError
+            })?;
         } else {
             validate_read_provenance(&outcome, matches!(&target, Target::Owned { .. }))
                 .map_err(|_| StoreError)?;
@@ -179,16 +197,55 @@ pub(crate) async fn apply_reconcile_transaction(
                 .await
                 .map_err(|_| StoreError)?;
         }
-        // The probes run only after all billing writes and before COMMIT.
+        // The blocking probes run only after all billing writes and before COMMIT.
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-        if probe != ReconcileProbe::None {
+        if matches!(
+            probe,
+            ReconcileProbe::BeforeCommit | ReconcileProbe::BeforeInsertCommit(_)
+        ) {
+            if matches!(probe, ReconcileProbe::BeforeInsertCommit(_)) {
+                // The observer still sees empty tables even if the gate is too early.
+                // Require the writes on this backend before either INSERT case can wait.
+                let written: bool = transaction
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM public.subscriptions
+                              WHERE user_id = $1 AND stripe_subscription_id = $2
+                                AND status = 'active' AND paid_invoice_id = 'in_worker_second')
+                            AND (SELECT array_agg(stripe_invoice_id ORDER BY stripe_invoice_id)
+                                   FROM public.paid_invoice_history
+                                  WHERE user_id = $1 AND stripe_subscription_id = $2)
+                                IS NOT DISTINCT FROM ARRAY['in_worker_first', 'in_worker_second']",
+                        &[&user_id, &row.stripe_subscription_id],
+                    )
+                    .await
+                    .and_then(|row| row.try_get(0))
+                    .map_err(|_| StoreError)?;
+                if !written {
+                    return Err(StoreError);
+                }
+            }
+            transaction
+                .query_typed(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    &[(&PRECOMMIT_GATE, Type::INT8)],
+                )
+                .await
+                .map_err(|_| StoreError)?;
+            if let ReconcileProbe::BeforeInsertCommit(Some(observed)) = &probe {
+                observed.set(true);
+                return Err(StoreError);
+            }
+        } else if matches!(
+            probe,
+            ReconcileProbe::WorkerDeadline | ReconcileProbe::ServerWatchdog
+        ) {
             let written = transaction.query_one(
                 "SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[],
             ).await.map_err(|_| StoreError)?;
             if written.get::<_, i64>(0) != 1 || written.get::<_, i64>(1) != 2 {
                 return Err(StoreError);
             }
-            if probe == ReconcileProbe::WorkerDeadline {
+            if matches!(probe, ReconcileProbe::WorkerDeadline) {
                 transaction.batch_execute("SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0").await.map_err(|_| StoreError)?;
             }
             // Readiness follows acknowledgement of the timeout settings.

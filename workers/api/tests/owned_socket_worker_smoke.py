@@ -379,6 +379,9 @@ def main():
                     print("PASS: synthetic socket ownership and close, empty guard drop, deadline precedence, co-poll/drop, Worker timer", flush=True)
                     print(f"startup and execution elapsed: {time.monotonic() - start:.3f}s", flush=True)
                     break
+                status, _, body = routing.http("POST", f"http://127.0.0.1:{port}/subsonic-connect-deadline-proof")
+                routing.check(status == 200 and body == "subsonic-connect-deadline-ok", body)
+                print("PASS: stalled Subsonic open and handshake share a single connect deadline", flush=True)
                 with billing_database(settings) as observe:
                     check_write_deadline(f"http://127.0.0.1:{port}", settings, observe)
                     check_billing_ack(f"http://127.0.0.1:{port}", settings, observe)
@@ -423,6 +426,38 @@ def main():
                 for finish in ("commit", "rollback"):
                     admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
                     try:
+                        url = (
+                            f"http://127.0.0.1:{port}/billing-raw-insert-{finish}-proof"
+                        )
+                        status, _, body = routing.http("POST", url)
+                        routing.check(
+                            status == 200 and body == "billing-raw-insert-ok",
+                            f"preceding raw INSERT {finish}: HTTP {status}: {body}",
+                        )
+                        print(
+                            f"PASS: dormant store classified after preceding raw INSERT {finish}",
+                            flush=True,
+                        )
+                    finally:
+                        admin(f"DROP DATABASE {BILLING_DB}")
+                for finish in ("commit", "rollback"):
+                    admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                    try:
+                        url = f"http://127.0.0.1:{port}/billing-worker-first-insert-{finish}-proof"
+                        status, _, body = routing.http("POST", url)
+                        routing.check(
+                            status == 200 and body == "billing-worker-first-insert-ok",
+                            f"Worker-first raw INSERT {finish}: HTTP {status}: {body}",
+                        )
+                        print(
+                            f"PASS: raw INSERT waited on dormant Worker before {finish}",
+                            flush=True,
+                        )
+                    finally:
+                        admin(f"DROP DATABASE {BILLING_DB}")
+                for finish in ("commit", "rollback"):
+                    admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                    try:
                         url = f"http://127.0.0.1:{port}/billing-raw-replace-{finish}-proof"
                         status, _, body = routing.http("POST", url)
                         routing.check(
@@ -431,6 +466,36 @@ def main():
                         )
                         print(
                             f"PASS: dormant store classified after raw DELETE/reinsert {finish}",
+                            flush=True,
+                        )
+                    finally:
+                        admin(f"DROP DATABASE {BILLING_DB}")
+                for finish in ("commit", "rollback"):
+                    admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                    try:
+                        url = f"http://127.0.0.1:{port}/billing-parent-delete-{finish}-proof"
+                        status, _, body = routing.http("POST", url)
+                        routing.check(
+                            status == 200 and body == "billing-parent-delete-ok",
+                            f"Worker-first parent delete {finish}: HTTP {status}: {body}",
+                        )
+                        print(
+                            f"PASS: parent DELETE waited on dormant Worker before {finish}",
+                            flush=True,
+                        )
+                    finally:
+                        admin(f"DROP DATABASE {BILLING_DB}")
+                for finish in ("commit", "rollback"):
+                    admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                    try:
+                        url = f"http://127.0.0.1:{port}/billing-parent-first-delete-{finish}-proof"
+                        status, _, body = routing.http("POST", url)
+                        routing.check(
+                            status == 200 and body == "billing-parent-first-delete-ok",
+                            f"Parent-first delete {finish}: HTTP {status}: {body}",
+                        )
+                        print(
+                            f"PASS: dormant store classified after preceding parent DELETE {finish}",
                             flush=True,
                         )
                     finally:
