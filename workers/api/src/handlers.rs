@@ -7314,6 +7314,15 @@ where
 /// store failure (the caller 500s so the delivery retries); fail-closed
 /// passes still persist their observed row and return `Ok` with the
 /// marker set, so the caller can alert and disable.
+///
+/// Future invite review belongs after `store_reconcile_outcome` succeeds:
+/// select the relevant confirmed paid invoice from `outcome.history` and use
+/// the persisted unique customer binding (not the remote subscription's
+/// customer alone). Under that flow's read budget, verify the authenticated
+/// invoice with its Charge expanded via `stripe::payment_evidence`. Compare
+/// only confirmed issuer/invitee observations. Keep only the comparison and
+/// internal references in the private, idempotent audit; never gate access or
+/// add this work to signup. No evidence lookup runs here today.
 async fn reconcile_remote_subscription<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     user_id: &str,
