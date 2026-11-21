@@ -92,28 +92,6 @@ for (const width of [800, 1024, 1280]) {
 	}
 }
 
-test('desktop 800px: wrapped metadata and seek refusal do not separate Seek from the jumps', async ({ page }) => {
-	const fixture = { ...track, title: Array(12).fill(track.title).join(' '), artist: Array(4).fill(track.artist).join(' ') };
-	const { region, identity, audio, seek, back, forward } = await openPlayer(page, 800, 'light', fixture);
-	await audio.evaluate((el) => {
-		Object.defineProperty(el, 'seekable', { configurable: true, get: () => ({ length: 1, start: () => 0, end: () => 5 }) });
-	});
-	await seek.press('End');
-	const refusal = region.locator('p[aria-live="polite"][aria-atomic="true"]')
-		.filter({ hasText: 'That position is not seekable yet.' });
-	const visibleRefusal = await box(refusal);
-	await expect(seek).toBeFocused();
-	await expect(seek).toHaveAttribute('aria-valuetext', '0:02 of 0:16');
-	const [label, seekRow, backButton, forwardButton] = await Promise.all(
-		[identity, region.locator('.nt-player-seek'), back, forward].map(box)
-	);
-	expect(label.height).toBeGreaterThan(120);
-	for (const jump of [backButton, forwardButton]) {
-		expect(jump.y).toBeCloseTo(seekRow.y + seekRow.height + 8, 0);
-		expect(visibleRefusal.y).toBeGreaterThanOrEqual(jump.y + jump.height);
-	}
-});
-
 test('desktop Tab reaches named controls in order, with native stops and keyboard jump feedback', async ({ page }) => {
 	const { audio, favorite, play, restart, seek, back, forward, feedback, volume, mute } = await openPlayer(page, 1024);
 	await favorite.focus();
@@ -144,33 +122,59 @@ for (const width of [320, 360, 390, 799]) {
 	});
 }
 
-test('crossing the shell breakpoint keeps decoder, seek, feedback and accessory focus', async ({ page }) => {
-	const { region, audio, seek, favorite, restart, mute } = await openPlayer(page, 800);
+test('breakpoint changes preserve source order, jump spacing, live regions and focus', async ({ page }) => {
+	const fixture = { ...track, title: Array(12).fill(track.title).join(' '), artist: Array(4).fill(track.artist).join(' ') };
+	const { region, identity, audio, seek, favorite, restart, back, forward, feedback, mute } = await openPlayer(page, 800, 'light', fixture);
 	const decoder = await audio.elementHandle();
 	const slider = await seek.elementHandle();
 	await restart.click();
 	await favorite.click();
-	const live = [region.getByRole('status'), region.getByTestId('library-restart-status'),
-		region.getByTestId('player-favorite-status'), region.getByText('Use system volume controls.', { exact: true })];
-	await expect(live[0]).toHaveText('Paused');
-	await expect(live[1]).toHaveText('Restarted Coral Night.');
-	await expect(live[2]).toHaveText(/^Starred Coral Night/);
-	const announcements = await Promise.all(live.map((region) => region.elementHandle()));
-	const texts = await Promise.all(live.map((region) => region.textContent()));
-	const expectSameAnnouncements = async () => {
+	const passive = [region.locator('.nt-seek-feedback'), region.getByText('Use system volume controls.', { exact: true }),
+		region.getByRole('status'), region.getByTestId('library-restart-status')];
+	const starStatus = region.getByTestId('player-favorite-status');
+	await expect(passive[2]).toHaveText('Paused');
+	await expect(passive[3]).toHaveText(/^Restarted Coral Night.+…$/);
+	await expect(starStatus).toContainText(`Starred ${fixture.title}`);
+	await expect(seek).toHaveAttribute('aria-valuetext', '0:00 of 0:16');
+	await audio.evaluate((el) => {
+		Object.defineProperty(el, 'seekable', { configurable: true, get: () => ({ length: 1, start: () => 0, end: () => 5 }) });
+	});
+	await seek.press('End');
+	await expect(seek).toBeFocused();
+	await expect(seek).toHaveAttribute('aria-valuetext', '0:00 of 0:16');
+	await expect(passive[0]).toHaveText('That position is not seekable yet.');
+	const live = [...passive, feedback, starStatus];
+	const announcements = await Promise.all(live.map((node) => node.elementHandle()));
+	const texts = await Promise.all(live.map((node) => node.textContent()));
+	const expectPresentation = async (desktop: boolean) => {
 		for (const [i, node] of live.entries()) {
 			expect(await node.evaluate((el, original) => el === original, announcements[i])).toBe(true);
 			await expect(node).toHaveText(texts[i]!);
 		}
+		const afterSeek = [passive[0], mute, ...passive.slice(1)], jumps = [back, forward, feedback];
+		const order = [seek, ...(desktop ? [...jumps, mute, ...passive] : [...afterSeek, ...jumps])];
+		for (const [i, node] of order.slice(1).entries()) {
+			expect(await node.evaluate((el, prior) => prior!.compareDocumentPosition(el) === Node.DOCUMENT_POSITION_FOLLOWING,
+				await order[i].elementHandle())).toBe(true);
+		}
+		if (desktop) {
+			const [label, seekRow, refusal] = await Promise.all([identity, region.locator('.nt-player-seek'), passive[0]].map(box));
+			expect(label.height).toBeGreaterThan(120);
+			for (const jump of await Promise.all([back, forward].map(box))) {
+				expect(jump.y).toBeCloseTo(seekRow.y + seekRow.height + 8, 0);
+				expect(refusal.y).toBeGreaterThanOrEqual(jump.y + jump.height);
+			}
+		}
 	};
+	await expectPresentation(true);
 	await favorite.focus();
 	await page.setViewportSize({ width: 799, height: 900 });
 	await expect(favorite).toBeFocused();
-	await expectSameAnnouncements();
+	await expectPresentation(false);
 	await mute.focus();
 	await page.setViewportSize({ width: 800, height: 900 });
 	await expect(mute).toBeFocused();
-	await expectSameAnnouncements();
+	await expectPresentation(true);
 	expect(await audio.evaluate((node, original) => node === original, decoder)).toBe(true);
 	expect(await seek.evaluate((node, original) => node === original, slider)).toBe(true);
 	await expect(audio).toHaveJSProperty('currentTime', 0);

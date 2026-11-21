@@ -37,7 +37,15 @@
 	// Match the shell's mobile cutoff. Only the accessory controls change hosts.
 	const wideShell = new MediaQuery('(width > 799px)');
 	const desktop = $derived(allowDesktopRow && wideShell.current);
-	let row = $state<HTMLDivElement>();
+	let row = $state<HTMLDivElement>(), passive = $state<HTMLDivElement>(), jumps = $state<HTMLDivElement>();
+	$effect(() => {
+		if (!row || !passive || !jumps) return;
+		// Match reading order without remounting the live regions or moving Seek and the jumps.
+		const before = desktop ? null : jumps;
+		if (passive.nextElementSibling === before) return;
+		if (row.moveBefore) row.moveBefore(passive, before);
+		else row.insertBefore(passive, before);
+	});
 	let wasDesktop = false;
 	$effect.pre(() => {
 		if (desktop === wasDesktop) return;
@@ -78,11 +86,11 @@
 			{/if}
 			{#if desktop}{@render favoriteAction?.(false)}{/if}
 		</div>
-		<div class="nt-player-centre">
-			<div class="nt-player-primary">
-				{@render transport()}
-				{#key seekState.attachment}<PlayerSeek state={seekState} {seek} />{/key}
-			</div>
+		<div class="nt-player-primary">
+			{@render transport()}
+			{#key seekState.attachment}<PlayerSeek state={seekState} {seek} />{/key}
+		</div>
+		<div class="nt-player-passive" bind:this={passive}>
 			{#key seekState.attachment}
 				<p class="nt-seek-feedback" aria-live="polite" aria-atomic="true">
 					{#if seekState.seeking}<span aria-hidden="true">Seeking… </span>{/if}
@@ -91,8 +99,8 @@
 			{/key}
 			{#if !desktop}{@render volumeControls('controls')}{/if}
 			{@render statusLines()}
-			{@render jumpExtension()}
 		</div>
+		{@render jumpExtension()}
 		{#if desktop}
 			<div class="nt-player-right">{@render volumeControls('controls')}</div>
 		{/if}
@@ -140,7 +148,7 @@
 {/snippet}
 
 {#snippet jumpExtension()}
-	<div class="nt-player-jump">
+	<div class="nt-player-jump" bind:this={jumps}>
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
@@ -198,25 +206,19 @@
 	}
 
 	/* Ordinary mobile keeps its existing boxes and source order. */
-	.nt-player-row, .nt-player-left, .nt-player-centre, .nt-player-primary, .nt-player-status {
+	.nt-player-row, .nt-player-left, .nt-player-passive, .nt-player-primary, .nt-player-status {
 		display: contents;
 	}
 	.nt-player-row.desktop {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) minmax(0, 3fr) minmax(0, 1fr);
-		grid-template-rows: repeat(5, auto);
 		column-gap: var(--nt-shell-gap);
 	}
-	.desktop .nt-player-centre {
-		display: grid;
+	.desktop :is(.nt-player-primary, .nt-player-jump, [data-testid='player-seek-feedback'], .nt-seek-feedback, .nt-player-status) {
 		grid-column: 2;
-		grid-row: 1 / -1;
-		grid-template-rows: subgrid;
 	}
-	.nt-seek-feedback:empty { margin: 0; }
-	/* Passive feedback stays mounted; only the desktop layout moves it below the jumps. */
-	.desktop .nt-seek-feedback { order: 1; margin: 0; }
-	.desktop .nt-player-status { display: block; order: 2; }
+	.nt-seek-feedback:empty, .desktop .nt-seek-feedback { margin: 0; }
+	.desktop .nt-player-status { display: block; }
 	.desktop .nt-player-left, .desktop .nt-player-right {
 		display: block;
 		grid-row: 1;
