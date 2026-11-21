@@ -58,6 +58,8 @@ pub mod digest_readback;
 mod digest_test_fixture;
 pub mod digest_verifier;
 #[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_continuity;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
 mod flac_frame;
 #[allow(dead_code)] // Not mounted until full frame validation is available.
 mod flac_frame_footer;
