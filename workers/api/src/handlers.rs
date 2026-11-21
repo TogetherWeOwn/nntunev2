@@ -9076,6 +9076,10 @@ mod tests {
             self.member_invite_summary_calls
                 .borrow_mut()
                 .push(issuer.into());
+            if self.deleting_users.borrow().contains(issuer) {
+                return Ok(None);
+            }
+            let bounds = |starts_at, ends_at| MemberInviteWindowBounds { starts_at, ends_at };
             Ok(Some(MemberInviteSummary {
                 paid_seconds: 86_400,
                 required_paid_seconds: 7_776_000,
@@ -9083,17 +9087,11 @@ mod tests {
                 eligible: false,
                 per_window_limit: 2,
                 open_window: Some(MemberInviteOpenWindow {
-                    bounds: MemberInviteWindowBounds {
-                        starts_at: 1,
-                        ends_at: 2,
-                    },
+                    bounds: bounds(1, 2),
                     used: 1,
                     remaining: 1,
                 }),
-                next_window: Some(MemberInviteWindowBounds {
-                    starts_at: 3,
-                    ends_at: 4,
-                }),
+                next_window: Some(bounds(3, 4)),
             }))
         }
 
@@ -23309,7 +23307,13 @@ mod tests {
             stripe_signature: None,
             body: br#"{"issuer":"other"}"#.to_vec(),
         };
-        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let call = |req: &Request| {
+            let response = block_on(handle(&h.ctx(), req));
+            assert!(response
+                .extra_headers
+                .contains(&("cache-control".into(), "private, no-store".into())));
+            response
+        };
         assert_eq!(call(&req).status, 401);
         req.authorization = Some("Bearer ntk_synthetic".into());
         assert_eq!(call(&req).status, 404);
@@ -23319,9 +23323,6 @@ mod tests {
         req.authorization = None;
         let response = call(&req);
         assert_eq!(response.status, 200);
-        assert!(response
-            .extra_headers
-            .contains(&("cache-control".into(), "private, no-store".into())));
         assert!(response.set_cookie.is_none());
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
@@ -23332,10 +23333,11 @@ mod tests {
                 "next_window": {"starts_at": 3, "ends_at": 4},
             })
         );
-        assert_eq!(
-            *h.store.member_invite_summary_calls.borrow(),
-            ["member".to_owned()]
-        );
+        h.store.deleting_users.borrow_mut().insert("member".into());
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert_eq!(deleting.body, account_deleting_response().body);
+        assert_eq!(*h.store.member_invite_summary_calls.borrow(), ["member"; 2]);
         assert!(h.store.member_invite_calls.borrow().is_empty());
         assert_eq!(h.store.audits.borrow().len(), audits);
     }

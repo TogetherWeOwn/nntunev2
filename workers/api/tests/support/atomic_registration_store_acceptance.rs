@@ -2624,10 +2624,8 @@ fn assert_member_invite_issuance() {
             .await
             .unwrap();
         let summary = async |user: &str| {
-            member_invite_summary_on(&reader, user)
-                .await
-                .unwrap()
-                .unwrap()
+            let result = member_invite_summary_on(&reader, user).await;
+            result.unwrap().unwrap()
         };
         let initial = summary(&issuer).await;
         assert!(initial.open_window.is_none() && initial.next_window.is_none());
@@ -2651,10 +2649,8 @@ fn assert_member_invite_issuance() {
         let both = summary(&issuer).await;
         assert_eq!(both.open_window.unwrap().bounds.ends_at, window_end);
         let next = both.next_window.unwrap();
-        assert_eq!(
-            (next.starts_at, next.ends_at),
-            (future_start, future_start + 600)
-        );
+        assert_eq!(next.starts_at, future_start);
+        assert_eq!(next.ends_at, future_start + 600);
         let settings = "UPDATE app_settings SET value = v.value FROM (VALUES
             ('invite_member_min_paid_months', $1::text), ('invite_member_per_window', $2::text),
             ('invite_default_expiry_days', $3::text)) AS v(key, value) WHERE app_settings.key = v.key";
@@ -2723,16 +2719,11 @@ fn assert_member_invite_issuance() {
         assert!(matches!(issue(&mut db, &peer, 1).await, Issued { .. }));
         assert_eq!(db.execute(settings, &[&"2", &"1", &"1"]).await.unwrap(), 3);
         let inactive = summary(&issuer).await;
-        assert_eq!(
-            (inactive.paid_seconds, inactive.required_paid_seconds),
-            (60 * DAY, 60 * DAY)
-        );
+        assert_eq!(inactive.paid_seconds, 60 * DAY);
+        assert_eq!(inactive.required_paid_seconds, 60 * DAY);
         assert!(!inactive.entitled && !inactive.eligible);
-        assert_eq!(
-            inactive.open_window.unwrap().used,
-            0,
-            "does not count peer's spend"
-        );
+        let spend = inactive.open_window.unwrap().used;
+        assert_eq!(spend, 0, "does not count peer's spend");
         assert_eq!(issue(&mut db, &issuer, 1).await, Ineligible);
         db.execute(status, &[&issuer, &"active"]).await.unwrap();
         assert_eq!(db.execute(settings, &[&"2", &"0", &"1"]).await.unwrap(), 3);
@@ -2791,10 +2782,8 @@ fn assert_member_invite_issuance() {
             .unwrap();
         let (next, end): (i64, i64) = (replacement.get(0), replacement.get(1));
         let fresh = summary(&issuer).await.open_window.unwrap();
-        assert_eq!(
-            (fresh.bounds.starts_at, fresh.bounds.ends_at),
-            (closed_at, end)
-        );
+        assert_eq!(fresh.bounds.starts_at, closed_at);
+        assert_eq!(fresh.bounds.ends_at, end);
         assert_eq!((fresh.used, fresh.remaining), (0, 1));
         let outcome = issue(&mut db, &issuer, 2).await;
         assert!(matches!(outcome, Issued { expires_at, .. } if expires_at == end));
@@ -2826,6 +2815,19 @@ fn assert_member_invite_issuance() {
         assert_eq!(db.execute(settings, &[&"03", &"2", &"7"]).await.unwrap(), 3);
         assert!(member_invite_summary_on(&reader, &issuer).await.is_err());
         assert_eq!(db.execute(settings, &[&"3", &"2", &"7"]).await.unwrap(), 3);
+        let changed = db
+            .execute(
+                "UPDATE users SET deleting_at = now() WHERE id = $1",
+                &[&issuer],
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        let deleting = member_invite_summary_on(&reader, &issuer).await.unwrap();
+        assert!(
+            deleting.is_none(),
+            "do not return a deleting issuer's summary"
+        );
         for id in [next, window, future, cancelled, later] {
             remove_member_window_fixture(&db, id).await;
         }
