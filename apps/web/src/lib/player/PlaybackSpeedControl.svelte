@@ -5,8 +5,8 @@
 	let attempt = $state(0);
 </script>
 <div>
-	<label for="playback-speed">Playback speed</label>
-	<select id="playback-speed" data-testid="playback-speed" value={value ?? ''} disabled={value === null}
+	<label for="library-playback-speed">Playback speed</label>
+	<select id="library-playback-speed" data-testid="library-playback-speed" value={value ?? ''} disabled={value === null}
 		onchange={(event) => { onchange(event.currentTarget); attempt += 1; }}>
 		{#if value === null || !presets.includes(value)}
 			<option value={value ?? ''}>{value === null ? 'Unavailable' : `${value}x`}</option>
@@ -15,7 +15,7 @@
 			<option value={preset}>{preset}x</option>
 		{/each}
 	</select>
-	<p data-testid="speed-status" role="status" aria-atomic="true">{#key attempt}{feedback}{/key}</p>
+	<p data-testid="library-speed-status" role="status" aria-atomic="true">{#key attempt}{feedback}{/key}</p>
 </div>
 <style>
 	p:empty { margin: 0; }

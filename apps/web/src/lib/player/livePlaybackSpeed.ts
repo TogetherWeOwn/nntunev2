@@ -63,7 +63,8 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 			state.set(unavailable);
 			if (current) write(undefined, current, inherit?.());
 		},
-		reapply: (current: RateTarget, inherited?: number) => write(undefined, current, inherited),
+		read,
+		reapply: (current: RateTarget, inherited?: number | null) => write(undefined, current, inherited),
 		retire: () => { replacementRate = undefined; state.set(unavailable); },
 		set(rate: number): number | null {
 			if (preference && !writePort) write(rate);
