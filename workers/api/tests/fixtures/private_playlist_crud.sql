@@ -2,7 +2,9 @@
 -- `owner` must come from the authenticated principal, never the request body.
 CREATE SCHEMA private_playlist_rehearsal;
 SET LOCAL search_path = private_playlist_rehearsal, pg_catalog, pg_temp;
-CREATE TABLE member_tracks AS TABLE pg_temp.synthetic_memberships;
+CREATE VIEW member_tracks AS
+SELECT l.user_id AS owner_id, lt.track_id FROM public.libraries l
+JOIN public.library_tracks lt ON lt.library_id = l.id WHERE l.deleting_at IS NULL;
 
 -- Match library::check_name's Rust Unicode White_Space trim, regardless of locale.
 CREATE FUNCTION trim_name(title text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
@@ -67,8 +69,7 @@ CREATE FUNCTION add_track(owner text, handle text, track uuid) RETURNS uuid
 LANGUAGE plpgsql AS $$
 DECLARE target bigint := lock_playlist(owner, handle); entry uuid;
 BEGIN
-    -- Deduplicate under the playlist lock. Synthetic membership is rehearsal-only;
-    -- live code must check actual Library membership, not mere track existence.
+    -- Deduplicate under the playlist lock and require Library membership.
     INSERT INTO public.playlist_tracks (playlist_id, track_id, position)
     SELECT p.id, track, next.position
     FROM public.playlists p

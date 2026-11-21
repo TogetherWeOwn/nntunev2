@@ -4879,6 +4879,10 @@ mod listen_history_receiver;
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
 
+#[allow(dead_code)] // Draft only; not registered in dispatch or preflight.
+#[path = "private_playlists.rs"]
+mod private_playlists;
+
 // --- Native REST credentials (ADR 0010) ------------------------------------------------------
 //
 // Session-authenticated issuance surface only: `POST /v1/credentials`
