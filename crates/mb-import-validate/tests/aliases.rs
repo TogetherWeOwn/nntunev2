@@ -123,7 +123,7 @@ fn preserves_distinct_keys_in_deterministic_order() {
 }
 
 #[test]
-fn rejects_bad_rows_even_when_they_do_not_match() {
+fn rejects_bad_rows_with_or_without_a_prior_match() {
     let mbid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let stamp = "2025-02-03T04:05:06Z";
     let valid = format!("{mbid}\tCafé\ten\tSort\tf\t{stamp}\n");
@@ -141,13 +141,13 @@ fn rejects_bad_rows_even_when_they_do_not_match() {
         valid.replace("\tSort", ""),
     ] {
         let input = format!("{valid}{bad}");
-        assert!(
-            matches!(
-                lookup(input.as_bytes(), EntityKind::Label, "missing"),
-                Err(ReadError::InvalidRow { line: 2, .. })
-            ),
-            "accepted {bad:?}"
-        );
+        for query in ["missing", "Café"] {
+            let result = lookup(input.as_bytes(), EntityKind::Label, query);
+            assert!(
+                matches!(result, Err(ReadError::InvalidRow { line: 2, .. })),
+                "expected an invalid second row for {query:?} with {bad:?}, got {result:?}"
+            );
+        }
     }
 }
 
