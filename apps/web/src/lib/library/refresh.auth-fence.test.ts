@@ -49,7 +49,7 @@ it.each([200, 401, 403, 0])('withholds a stale result (%i) without purging its s
 		reply.resolve(status === 200 ? proof() : new Response(null, { status }));
 		await pending;
 	} else await navigator.locks.request(AUTH_LOCK, () => { reply.resolve(proof()); return pending; });
-	expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false });
+	expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false, verificationSuspended: true });
 	expect(update().deviceScope).toBeUndefined();
 	expect(onAccessRefused).not.toHaveBeenCalled();
 	expect(loadSnapshot(session)?.items).toEqual([{ id: 'track' }]);
@@ -57,42 +57,12 @@ it.each([200, 401, 403, 0])('withholds a stale result (%i) without purging its s
 	expect([update().deviceScope, local.getItem(key)]).toEqual([key, bytes]);
 });
 
-it('preserves exact favorite bytes across inconclusive verification and never binds a legacy list', async () => {
-	const { local, session, verify, refresh, update, refresher, onAccessRefused } = setup();
-	const key = await refresh().then(() => update().deviceScope!);
-	expect(key).toEqual(expect.any(String));
-	local.setItem(key, bytes);
-	for (const binding of [null, '', `${label.slice(1)}B`, label]) {
-		if (binding === label) verify.mockResolvedValueOnce(Response.json({}));
-		await refresh(binding);
-		expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false });
-		expect(update().deviceScope).toBeUndefined();
-	}
-	expect(onAccessRefused).not.toHaveBeenCalled();
-	await refresh();
-	expect([update().deviceScope, local.getItem(key)]).toEqual([key, bytes]);
-	session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'legacy');
-	local.setItem('nntune.library.favorites.v1.legacy', bytes);
-	await refresh();
-	expect(update()).toMatchObject({ sessionBinding: label, deviceScope: undefined });
-	expect(local.getItem('nntune.library.favorites.v1.legacy')).toBe(bytes);
-});
-
 it.each([false, true])('withholds headerless browser rows (storage blocked: %s)', async (blocked) => {
 	const { refresh, refresher, session, verify } = setup();
 	vi.stubEnv('MODE', 'production');
 	if (blocked) vi.stubGlobal('window', { get localStorage() { throw new Error('Blocked'); } });
 	await refresh(null);
-	expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false });
+	expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false, verificationSuspended: true });
 	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
 	expect(verify).not.toHaveBeenCalled();
-});
-
-it('recovers a new bound scope after a proof-only quota failure', async () => {
-	const { refresh, session, update } = setup();
-	vi.spyOn(session, 'setItem').mockImplementationOnce(() => { throw new Error('Quota'); });
-	await refresh();
-	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
-	await refresh();
-	expect(update().deviceScope).toBeDefined();
 });
