@@ -35,7 +35,7 @@
 		favoriteIds?: ReadonlySet<string>;
 		ontogglefavorite?: (id: string) => void;
 		/** Aggregate favorite mutation by stable ids (menus); preferred over ontogglefavorite when supplied. */
-		onfavoriteids?: (ids: readonly string[]) => void;
+		onfavoriteids?: (ids: readonly string[], remove: boolean) => void;
 		/**
 		 * Metadata-only direct selection: the host applies the validated
 		 * selectTrack transition and owns the announcement; the panel reports
@@ -455,6 +455,11 @@
 	 * host validates again and applies the selectTrack transition.
 	 */
 	let trackMenu = $state<MenuRequest | null>(null);
+	export function dismissTrackMenu(): HTMLElement | undefined {
+		const invoker = trackMenu?.invoker;
+		trackMenu = null;
+		return invoker;
+	}
 	let dropRow = $state<string | null>(null);
 	let dropAfter = $state(false);
 	let batchIds = $state<string[]>([]);
@@ -551,14 +556,11 @@
 		dropRow = null;
 	});
 
-	function toggleFavorites(ids: readonly string[]): void {
+	function toggleFavorites(ids: readonly string[], remove: boolean): void {
 		const live = ids.filter((id) => queue.tracks.some((track) => track.id === id));
 		if (live.length === 0) return;
-		if (onfavoriteids) onfavoriteids(live);
-		else {
-			const remove = live.every((id) => favoriteIds.has(id));
-			for (const id of live.filter((id) => favoriteIds.has(id) === remove)) ontogglefavorite?.(id);
-		}
+		if (onfavoriteids) onfavoriteids(live, remove);
+		else for (const id of live) if (favoriteIds.has(id) === remove) ontogglefavorite?.(id);
 	}
 
 	/** Next surviving More button, otherwise previous, otherwise the heading. */
@@ -595,7 +597,7 @@
 			if (!atBottom) actions.push({ label: 'Move to bottom', run: () => onreorder?.(ids, null) });
 			if (onfavoriteids || ontogglefavorite) {
 				const starred = ids.every((x) => favoriteIds.has(x));
-				actions.push({ label: starred ? 'Unstar all' : 'Star all', run: () => toggleFavorites(ids) });
+				actions.push({ label: starred ? 'Unstar all' : 'Star all', run: () => toggleFavorites(ids, starred) });
 			}
 			actions.push(unavailablePlaylistAction);
 			if (onremoveids) actions.push({ label: 'Remove from queue', destructive: true, run: () => {
@@ -618,7 +620,7 @@
 			}
 			if (onfavoriteids || ontogglefavorite) {
 				const starred = favoriteIds.has(id);
-				actions.push({ label: starred ? 'Unstar' : 'Star', run: () => toggleFavorites([id]) });
+				actions.push({ label: starred ? 'Unstar' : 'Star', run: () => toggleFavorites([id], starred) });
 			}
 			actions.push(unavailablePlaylistAction);
 			if (oncopylink) actions.push({ label: 'Copy link', run: () => { if (at() >= 0) oncopylink?.(id); } });

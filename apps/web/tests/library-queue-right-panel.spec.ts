@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 
 const tracks = [
-	{ id: 'coral', title: 'Coral', streamUrl: '/api/demo/audio?track=coral' },
+	{ id: 'coral', title: `Coral ${'É'.repeat(60)}`, streamUrl: '/api/demo/audio?track=coral' },
 	{ id: 'moss', title: 'Moss' },
 	{ id: 'fern', title: 'Fern' }
 ];
@@ -130,6 +130,37 @@ test('small screens keep one inline queue and resizing recovers focus', async ({
 	await expect(inline(page)).toBeFocused();
 	await expect(next(page)).toHaveCount(1);
 	await expect(page.getByTestId('now-playing')).toContainText('Moss');
+});
+
+test('resizing with a keyboard-opened row menu returns focus to its trigger', async ({ page }) => {
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await seed(page);
+	await keyboardOpen(page);
+	const trigger = page.getByRole('button', { name: 'More actions for Fern' });
+	await trigger.focus();
+	await page.keyboard.press('Enter');
+	const menu = page.getByRole('menu', { name: /Fern/ });
+	await expect(menu.locator(':focus')).toHaveCount(1);
+
+	await page.setViewportSize({ width: 799, height: 844 });
+	await expect(menu).toHaveCount(0);
+	await expect(page.getByRole('main').getByRole('button', { name: 'More actions for Fern' })).toBeFocused();
+	await page.keyboard.press('Enter');
+	await expect(menu.locator(':focus')).toHaveCount(1);
+});
+
+test('long Unicode titles fit the panel and leave the move dropdown focusable at 800px', async ({ page }) => {
+	await page.setViewportSize({ width: 800, height: 800 });
+	await seed(page);
+	await keyboardOpen(page);
+	await expect(panel(page).getByTestId('now-playing')).toContainText(tracks[0].title);
+	await page.getByRole('checkbox', { name: 'Select Fern for queue actions' }).check();
+	const moveBefore = panel(page).getByRole('combobox', { name: 'Move selected before' });
+	await moveBefore.focus();
+	await expect(moveBefore).toBeFocused();
+	const bounds = (await moveBefore.boundingBox())!;
+	expect(bounds.x + bounds.width + 4).toBeLessThanOrEqual(800);
+	expect(await panel(page).evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
 });
 
 test('an auth boundary or leaving Library releases the panel slot', async ({ page }) => {

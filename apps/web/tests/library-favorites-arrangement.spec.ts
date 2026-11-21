@@ -34,7 +34,7 @@ async function expectIds(page: Page, ids: string[]): Promise<void> {
 		nodes.map((node) => node.getAttribute('data-id')))).toEqual(ids);
 }
 async function stored(page: Page): Promise<unknown> {
-	return page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? 'null'), KEY);
+	return page.evaluate((key) => navigator.locks.request(key, () => JSON.parse(localStorage.getItem(key) ?? 'null')), KEY);
 }
 async function open(page: Page, ids: string[], items = ITEMS): Promise<void> {
 	await page.addInitScript(({ contextKey, context, key, ids }) => {
@@ -228,7 +228,7 @@ test('[FAVORDER-04] reload restores arrangement only after authenticated library
 
 for (const kind of ['getter', 'write'] as const) {
 	for (const recovery of ['move', 'toggle'] as const) {
-		test(`[FAVORDER-05:${kind}:${recovery}] storage failure keeps arrangement authoritative through refresh and later full-list save`, async ({ page }) => {
+		test(`[FAVORDER-05:${kind}:${recovery}] failed moves stay in memory until the next successful edit`, async ({ page }) => {
 			await open(page, ['arr-z', 'hidden', 'arr-a', 'arr-m']);
 			await faultStorage(page, kind);
 			await activate(page, 'Mike Song', 'up');
@@ -242,18 +242,17 @@ for (const kind of ['getter', 'write'] as const) {
 			await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 			await expect(page.locator('[data-testid="library-item"][data-id="arr-a"]')).toContainText('Refreshed artist');
 			await expectIds(page, ['arr-m', 'arr-z', 'arr-a']);
+			await page.evaluate((key) => navigator.locks.request(key, () => {}), KEY);
 			await page.evaluate(() => Reflect.get(window, '__restoreArrangementStorage')());
 			if (recovery === 'move') {
 				await activate(page, 'Alpha Song', 'up');
-				await expectIds(page, ['arr-m', 'arr-a', 'arr-z']);
-				expect(await stored(page)).toEqual(['arr-m', 'hidden', 'arr-a', 'arr-z']);
+				expect(await stored(page)).toEqual(['arr-a', 'hidden', 'arr-z', 'arr-m']);
 			} else {
 				await star(page, 'arr-z').click();
-				await expectIds(page, ['arr-m', 'arr-a']);
-				expect(await stored(page)).toEqual(['arr-m', 'hidden', 'arr-a']);
+				expect(await stored(page)).toEqual(['hidden', 'arr-a', 'arr-m']);
 			}
 			await page.reload();
-			await expectIds(page, recovery === 'move' ? ['arr-m', 'arr-a', 'arr-z'] : ['arr-m', 'arr-a']);
+			await expectIds(page, recovery === 'move' ? ['arr-a', 'arr-z', 'arr-m'] : ['arr-a', 'arr-m']);
 		});
 	}
 }
@@ -270,6 +269,118 @@ test('[FAVORDER-06] remove and re-star use the latest arranged membership withou
 	await activate(page, 'Zulu Song', 'up');
 	await expectIds(page, ['arr-m', 'arr-z', 'arr-a']);
 	expect(await stored(page)).toEqual(['arr-m', 'arr-z', 'arr-a']);
+});
+
+test('a retired move reconciles durable favorites without dropping a visit-only star', async ({ page }) => {
+	await open(page, ['arr-z', 'arr-m']);
+	await faultStorage(page, 'write');
+	await star(page, 'arr-a').click();
+	expect(await stored(page)).toEqual(['arr-z', 'arr-m']);
+	await open(await page.context().newPage(), ['arr-z']);
+	await activate(page, 'Mike Song', 'up');
+	await expectIds(page, ['arr-z', 'arr-a']);
+	await expect(page.getByTestId('favorites-announcement')).toBeEmpty();
+});
+
+for (const crossesVisitOnly of [false, true]) {
+	test(`a peer update preserves a move across a ${crossesVisitOnly ? 'visit-only' : 'saved'} favorite`, async ({ page }) => {
+		const initial = ['arr-z', 'hidden', 'arr-m'];
+		const items = [...ITEMS, { id: 'arr-b', title: 'Bravo Song', artist: '' }, { id: 'arr-c', title: 'Charlie Song', artist: '' }];
+		await open(page, initial, items);
+		await faultStorage(page, 'write');
+		await star(page, 'arr-a').click();
+		const announcement = page.getByTestId('favorites-announcement');
+		for (let i = 0; i < 2; i++) await activate(page, 'Alpha Song', 'up');
+		await expect(announcement).toHaveText('Alpha Song moved to 1 of 3');
+		if (crossesVisitOnly) {
+			await star(page, 'arr-b').click();
+			for (let i = 0; i < 2; i++) await activate(page, 'Bravo Song', 'up');
+			await expect(announcement).toHaveText('Bravo Song moved to 2 of 4');
+		}
+		expect(await stored(page)).toEqual(initial);
+		await page.evaluate(() => Reflect.get(window, '__restoreArrangementStorage')());
+		const saved = crossesVisitOnly ? ['arr-z', 'hidden', 'arr-c', 'arr-m'] : ['arr-m', 'hidden', 'arr-z', 'arr-b'];
+		await open(await page.context().newPage(), saved, items);
+		await activate(page, crossesVisitOnly ? 'Bravo Song' : 'Alpha Song', crossesVisitOnly ? 'up' : 'down');
+		await expect(announcement).toHaveText(crossesVisitOnly ? 'Bravo Song moved to 2 of 5' : 'Alpha Song moved to 3 of 4');
+		await page.route('**/api/library', (route) => route.fulfill({ json: [...items, { id: 'hidden', title: 'Hidden Song', artist: '' }] }));
+		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+		await expectIds(page, crossesVisitOnly ? ['arr-z', 'arr-b', 'hidden', 'arr-a', 'arr-c', 'arr-m'] : ['arr-m', 'hidden', 'arr-z', 'arr-a', 'arr-b']);
+		expect(await stored(page)).toEqual(saved);
+	});
+}
+
+async function holdFavorites(page: Page): Promise<() => Promise<void>> {
+	await page.evaluate((key) => new Promise<void>((ready) => {
+		void navigator.locks.request(key, () => new Promise<void>((release) => {
+			Reflect.set(window, 'releaseFavorites', release);
+			ready();
+		}));
+	}), KEY);
+	return () => page.evaluate(() => Reflect.get(window, 'releaseFavorites')());
+}
+
+for (const moveFocus of [false, true]) {
+	test(`a rebased move ${moveFocus ? 'does not steal focus' : 'restores focus at the durable boundary'}`, async ({ page }) => {
+		await open(page, ALL);
+		const release = await holdFavorites(page);
+		await page.evaluate((key) => localStorage.setItem(key, '["arr-a","arr-z","arr-m"]'), KEY);
+		const down = move(page, 'Zulu Song', 'down');
+		await down.press('Enter');
+		await expectIds(page, ['arr-a', 'arr-z', 'arr-m']);
+		await expect(down).toBeFocused();
+		const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+		if (moveFocus) await refresh.focus();
+		await release();
+		await expectIds(page, ['arr-a', 'arr-m', 'arr-z']);
+		await expect(moveFocus ? refresh : move(page, 'Zulu Song', 'up')).toBeFocused();
+	});
+}
+
+for (const unstar of [true, false]) {
+	test(`queue ${unstar ? 'Unstar all' : 'Star all'} retains its direction after reconciliation`, async ({ page }) => {
+		const both = ['arr-z', 'arr-m'], mixed = ['arr-z', 'arr-a'];
+		await page.setViewportSize({ width: 1280, height: 2400 }); // Scroll is a deliberate menu dismissal.
+		await open(page, unstar ? both : mixed);
+		const playButtons = page.getByTestId('library-item').getByRole('button', { name: /^(Zulu|Mike) Song/ });
+		for (const button of await playButtons.all()) await button.click();
+		const rows = page.getByTestId('queue-item');
+		await expect(rows).toHaveCount(2);
+		for (const checkbox of await rows.getByRole('checkbox').all()) await checkbox.check();
+		const release = await holdFavorites(page);
+		await activate(page, 'Zulu Song', 'down');
+		await expectIds(page, [...(unstar ? both : mixed)].reverse());
+		await rows.first().getByTestId('queue-more').click();
+		const action = page.getByRole('menuitem', { name: unstar ? 'Unstar all' : 'Star all', exact: true });
+		await action.focus();
+		const peerOrder = unstar ? mixed : both;
+		await page.evaluate(([key, ids]) => localStorage.setItem(key, JSON.stringify(ids)), [KEY, peerOrder] as const);
+		await release();
+		const rebased = [...peerOrder].reverse();
+		await expectIds(page, rebased);
+		await expect(action).toBeFocused();
+		await page.keyboard.press('Enter');
+		await expect(page.getByTestId('favorites-announcement')).toHaveText(unstar ? 'Removed 1 track from favorites.' : 'Starred 0 tracks; 2 were already starred.');
+		const expected = unstar ? ['arr-a'] : rebased;
+		expect(await stored(page)).toEqual(expected);
+		await expectIds(page, expected);
+	});
+}
+
+test('Library Star all sends the full selection when a peer removes a star', async ({ page }) => {
+	await open(page, ['arr-z']);
+	const peer = await page.context().newPage();
+	await open(peer, ['arr-z']);
+	await page.getByRole('button', { name: 'Select all', exact: true }).click();
+	await page.getByTestId('track-more').first().click();
+	await star(peer, 'arr-z').click();
+	await expect.poll(() => stored(peer)).toEqual([]);
+	const release = await holdFavorites(peer);
+	await page.getByRole('menuitem', { name: 'Star all', exact: true }).click();
+	await expect.poll(() => page.evaluate(async (key) => (await navigator.locks.query()).pending?.some((lock) => lock.name === key), KEY)).toBe(true);
+	expect(await peer.evaluate((key) => localStorage.getItem(key), KEY)).toBe('[]');
+	await release();
+	expect(((await stored(page)) as string[]).sort()).toEqual([...ALL].sort());
 });
 
 test('[FAVORDER-07] an auth transition purges a pending arrangement and never restores another account order', async ({ page }) => {

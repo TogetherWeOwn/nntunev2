@@ -2,7 +2,7 @@
 	import { onMount, tick, type Snippet } from 'svelte';
 	import { readRightPanel, setRightPanel } from '#lib/shell/right-panel.js';
 
-	let { children }: { children: Snippet } = $props();
+	let { children, dismissMenu }: { children: Snippet; dismissMenu: () => HTMLElement | undefined } = $props();
 
 	let wide = $state(false);
 	let expanded = $state(false);
@@ -32,14 +32,17 @@
 	function close(restoreToggle: boolean): void {
 		const active = document.activeElement;
 		const focusInPanel = panel?.contains(active);
+		const invoker = dismissMenu();
+		// Moving the subtree closes native popovers; recover to the menu trigger.
+		const target = active?.closest('[popover]') ? invoker : active;
 		if (projection.parentElement !== inline) inline.append(projection);
 		expanded = false;
 		releaseSlot();
 		if (restoreToggle) toggle.focus();
 		else if (focusInPanel || active === toggle) {
-			if (active instanceof HTMLElement && projection.contains(active)) active.focus();
-			else projection.focus();
-		}
+			if (target instanceof HTMLElement && projection.contains(target)) target.focus();
+			if (!projection.contains(document.activeElement)) projection.focus();
+	}
 	}
 
 	async function togglePanel(): Promise<void> {
@@ -106,4 +109,7 @@
 
 <style>
 	.nt-button[hidden] { display: none; }
+	#library-queue-panel { overflow-wrap: anywhere; }
+	#library-queue-panel :global(.queue-selection label),
+	#library-queue-panel :global(.queue-selection select) { max-inline-size: 100%; }
 </style>
