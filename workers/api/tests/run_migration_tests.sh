@@ -154,6 +154,7 @@ for f in "${tests[@]}"; do
   psql_run -v library_page_sql="$(<"$root/workers/api/src/library_page.sql")" \
     -v library_shared_upsert_sql="$(<"$root/workers/ingest/src/library_shared_upsert.sql")" \
     -v audio_manifest_store_sql="$(<"$root/workers/ingest/src/audio_manifest_store.sql")" \
+    -v storage_digest_claim_lookup_sql="$(<"$root/workers/api/src/storage_digest_claim_lookup.sql")" \
     -v audio_classifications_store_sql="$(<"$root/workers/ingest/src/audio_classifications_store.sql")" -f "$f"
 done
 # Hosted-only concurrent fixtures are run separately by the migration CI job.

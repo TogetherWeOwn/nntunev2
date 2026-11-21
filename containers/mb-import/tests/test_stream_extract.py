@@ -510,10 +510,7 @@ class WorkProjectionTest(ProjectionTestCase):
     def test_typed_and_untyped_works_match_streamed_gzip(self):
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
-        expected = (
-            "80808080-8080-4808-8808-808080808080\tA\\tSong\\\\N\tSong\\tSuite\t2025-02-03T04:05:06Z\n"
-            "10101010-1010-4010-8010-101010101010\tCafé\\nLive\t\\N\t2025-02-03T04:05:06Z\n"
-        ).encode()
+        expected = (ROOT / "tests" / "expected" / self.output).read_bytes()
         self.assertEqual((self.curated / self.output).read_bytes(), expected)
 
         members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}

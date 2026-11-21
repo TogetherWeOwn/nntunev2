@@ -7,6 +7,7 @@
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
 	import PlaybackSpeedControl from './PlaybackSpeedControl.svelte';
+	import VolumeControls from './VolumeControls.svelte';
 	import { createPlayerController } from './controller.svelte.js';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
 	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & { claimShareEntry?: () => boolean }>();
@@ -19,6 +20,7 @@
 	const { queue, media, media: { seekFeedback, playbackStatus } } = player;
 	const { speed, speed: { state: speedState } } = media;
 	const attachNativeAudio = media.attach;
+	const sound = media.sound.state;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	$effect.pre(() => { if (signedOut) untrack(player.purgeAtAuthBoundary); });
@@ -39,6 +41,9 @@
 		return () => { clearMiniPlayerHint(); player.destroy(); };
 	});
 </script>
+{#snippet soundControls()}
+	<VolumeControls {...$sound} onvolumeinput={media.sound.setVolume} ontogglemute={media.sound.toggleMute} />
+{/snippet}
 {#snippet speedControl()}
 	<PlaybackSpeedControl value={$speedState.rate === null ? null : String($speedState.rate)}
 		feedback={$speedState.feedback} onchange={(control) => {
@@ -49,7 +54,7 @@
 {@render children()}
 {#if streamUrl}
 	<div class="nt-wrap">
-		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
+		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio} volumeControls={soundControls}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			retryCurrent={media.retryCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} {speedControl} />
