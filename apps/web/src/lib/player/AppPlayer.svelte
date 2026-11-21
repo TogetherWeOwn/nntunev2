@@ -6,20 +6,26 @@
 	import { resolveStreamUrl } from '../library/stream-url.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
+	import PlaybackSpeedControl from './PlaybackSpeedControl.svelte';
 	import ShortcutHelp from './ShortcutHelp.svelte';
 	import SleepTimerControls from './SleepTimerControls.svelte';
 	import VolumeControls from './VolumeControls.svelte';
+	import CurrentTrackFavorite from './CurrentTrackFavorite.svelte';
+	import { createCurrentTrackFavorite } from './currentTrackFavorite.svelte.js';
 	import { appShortcutActions, handleAppShortcut } from './appShortcuts.js';
 	import { createPlayerController } from './controller.svelte.js';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
-	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & { claimShareEntry?: () => boolean }>();
+	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> &
+		{ claimShareEntry?: () => boolean; currentFavorite: ReturnType<typeof createCurrentTrackFavorite> }>();
 </script>
 <script lang="ts">
 	let { children, claimShareEntry, signedOut }: { children: Snippet; claimShareEntry?: (owner: string) => boolean; signedOut?: boolean } = $props();
 	let shareOwner: string | undefined;
-	const player = setAppPlayer(Object.assign(createPlayerController(createQueue([]), { flush: tick }),
-		{ claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
+	const controller = createPlayerController(createQueue([]), { flush: tick });
+	const player = setAppPlayer(Object.assign(controller, { currentFavorite: createCurrentTrackFavorite(controller.queue),
+		claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
 	const { queue, media, media: { seekFeedback, playbackStatus, absoluteSeek } } = player;
+	const { speed, speed: { state: speedState } } = media;
 	const attachNativeAudio = media.attach;
 	const sound = media.sound.state;
 	const currentTrack = $derived(queueCurrentTrack($queue));
@@ -45,7 +51,9 @@
 	});
 	// Library's pre-effect disposes route state before player teardown.
 	onMount(() => {
-		media.restoreRepeat(browserStorage('local'));
+		const storage = browserStorage('local');
+		media.restoreRepeat(storage);
+		media.speed.restore(storage);
 		return () => { clearMiniPlayerHint(); player.destroy(); };
 	});
 </script>
@@ -55,17 +63,22 @@
 {/snippet}
 <svelte:document onvisibilitychange={() => { if (document.visibilityState === 'visible') sleepTimer.tick(); }} />
 {@render children()}
+{#snippet favoriteAction()}<CurrentTrackFavorite currentFavorite={player.currentFavorite} snapshot={$queue} />{/snippet}
 {#if streamUrl}
 	<div class="nt-wrap" bind:this={shortcutScope}>
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio} volumeControls={soundControls}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			retryCurrent={media.retryCurrent}
 			seekState={$absoluteSeek} seek={media.seek}
-			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
+			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} {favoriteAction} />
 		<ShortcutHelp bind:this={shortcutHelp} actions={appShortcutActions} buttonClass="nt-button nt-button--ghost" playerScoped />
 	</div>
 {/if}
 {#if streamUrl}
+	<div class="nt-wrap">
+		<PlaybackSpeedControl value={$speedState.rate === null ? null : String($speedState.rate)}
+			feedback={$speedState.feedback} onchange={(control) => { control.value = String(speed.set(Number(control.value)) ?? ''); }} />
+	</div>
 	<section class="nt-wrap" aria-label="Sleep timer">
 		<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
 	</section>

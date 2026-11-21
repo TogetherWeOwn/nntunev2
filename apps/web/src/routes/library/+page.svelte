@@ -4,6 +4,7 @@
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
 	import { getAppPlayer } from '#lib/player/AppPlayer.svelte';
+	import type { FavoriteWrite } from '#lib/player/currentTrackFavorite.svelte.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
@@ -34,7 +35,7 @@
 		saveRecentFinds
 	} from '#lib/library/recent-finds.js';
 	import { moveFavoriteId, type FavoriteMoveDirection } from '#lib/library/favorites-order.js';
-	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import { createLibraryRefresher, type LibraryRefreshUpdate } from '#lib/library/refresh.js';
 	import {
 		displayArtist,
 		displayTitle,
@@ -94,7 +95,9 @@
 	] as const;
 	let collectionFilter = $state<CollectionFilter | 'tracks'>('tracks');
 	const showingTracks = $derived(collectionFilter === 'tracks');
-	let collectionsAccessRevoked = $state(false);
+	let libraryTypeGroup: HTMLDivElement | undefined = $state();
+	let collectionReceipt = $state<LibraryRefreshUpdate['runIfCurrent']>();
+	const showRecovery = $derived(showingTracks || !collectionReceipt);
 
 	function readStoredDensity(): Density {
 		try {
@@ -163,8 +166,11 @@
 	// Retain implicit invalidation even when prune + inbound share batch into a nonempty queue.
 	let queueConfirmGeneration = $state(0);
 	let favorites: string[] = $state([]);
-	let favoritesInitialized = false;
+	let favoritesInitialized = $state(false);
+	let favoritesAuthKey: string | null = null;
+	let currentFavoriteEdit = $state(0);
 	let favoriteEdit = 0;
+	const pendingPlayerFavorites = new Map<string, { index: number }>();
 	let favoriteBaseline: readonly string[] = [];
 	let favoritesAnnouncement = $state('');
 	// One shared polite outcome for order, view and clear actions: a new
@@ -327,9 +333,10 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
-		onStateChange: (state, { isCurrent, authoritative, authBoundary }) => {
+		onStateChange: (state, { isCurrent, authoritative, authBoundary, runIfCurrent, sessionBinding }) => {
 			if (!isCurrent()) return;
-			if (authBoundary || (authoritative && !state.libraryUnavailable)) collectionsAccessRevoked = !!authBoundary;
+			collectionReceipt = runIfCurrent;
+			const revoked = authBoundary && !state.verificationSuspended;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -341,10 +348,17 @@
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			// Keep the empty focus target even if the last queued row is removed during a retry.
-			retainedQueueWithoutListing = !authBoundary && (state.loading || state.libraryUnavailable || !!state.loadError) &&
+			retainedQueueWithoutListing = !revoked && (state.loading || state.libraryUnavailable || !!state.loadError) &&
 				(retainedQueueWithoutListing || queueController.snapshot.tracks.length > 0);
 			requiresSignIn = state.requiresSignIn;
-			if (authBoundary) queueFilterQuery = '';
+			if (revoked) {
+				queueFilterQuery = '';
+				clearFavoritesExportFeedback();
+				releaseFavoritesDownload();
+				favoriteBaseline = favorites = [];
+				favoritesInitialized = false;
+				favoritesAnnouncement = '';
+			}
 			if (state.loadError && state.items.length === 0) {
 				findQuery = '';
 				findScope = 'both';
@@ -357,7 +371,7 @@
 				recentFindsInitialized = false;
 				recentFindsAnnouncement = '';
 			}
-			if (!authBoundary && (state.loading || state.items.length === 0)) {
+			if (!revoked && (state.loading || state.items.length === 0)) {
 				player.browseCopy.invalidate();
 				clearFavoritesExportFeedback();
 				media.clearShareSeek();
@@ -389,8 +403,13 @@
 			// fails; Refresh must not overwrite pending edits with stale storage.
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
-				if (!favoritesInitialized) {
-					favoriteBaseline = favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
+				const session = browserStorage('session'), key = favoritesKey(session);
+				if (!favoritesInitialized || (sessionBinding ? key !== favoritesAuthKey : !favoritesAuthKey && key)) {
+					favoritesAuthKey = key;
+					currentFavoriteEdit++;
+					pendingPlayerFavorites.clear();
+					favoriteBaseline = loadFavorites(session, browserStorage('local'));
+					favorites = !sessionBinding && favoritesInitialized ? [...new Set([...favoriteBaseline, ...favorites])] : [...favoriteBaseline];
 					favoritesInitialized = true;
 				}
 				if (!recentFindsInitialized) {
@@ -398,7 +417,7 @@
 					recentFindsInitialized = true;
 				}
 				applyShareLink();
-			}
+			} else if (!state.loading) currentFavoriteEdit++; // Retire feedback without invalidating pending writes.
 			if (!isCurrent()) return;
 			// Same-account refresh completion: the panel may have remounted
 			// (branch swap), so hand focus back to the filter input the user
@@ -606,8 +625,9 @@
 		if (typeof document !== 'undefined' && document.activeElement?.closest('#library-queue-panel')) {
 			void tick().then(() => {
 				if (!shareAlive || document.activeElement !== document.body) return;
-				const recovery = showingTracks ? refreshButton
+				const signIn = showingTracks ? null
 					: document.querySelector<HTMLAnchorElement>('section[aria-label="Library collections"] a[href="/login"]');
+				const recovery = signIn ?? refreshButton;
 				recovery?.focus();
 			});
 		}
@@ -796,30 +816,56 @@
 	function editFavorites(
 		update: (latest: readonly string[]) => readonly string[],
 		applied?: (before: readonly string[], after: readonly string[]) => void,
-		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection; loaded: ReadonlySet<string> }
-	): void {
+		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection; loaded: ReadonlySet<string> },
+		playerId?: string
+	): Promise<FavoriteWrite> {
 		const session = browserStorage('session');
-		const key = favoritesKey(session);
+		const key = playerId ? favoritesAuthKey : favoritesKey(session);
 		const edit = ++favoriteEdit;
 		const before = favorites;
 		const optimistic = update(before);
+		const notePublication = (previous: readonly string[]) => {
+			const selected = queueCurrentTrack(queueController.snapshot)?.id;
+			if (selected && previous.includes(selected) !== favorites.includes(selected)) currentFavoriteEdit++;
+		};
+		// An explicit same-track edit supersedes the rollback, including an already-satisfied clear.
+		if (!playerId) for (const id of pendingPlayerFavorites.keys()) {
+			const pressed = optimistic.includes(id), alternate = pressed ? before.filter((value) => value !== id) : [...new Set([...before, id])];
+			if (update(alternate).includes(id) === pressed) pendingPlayerFavorites.delete(id);
+		}
+		const rollback = playerId ? { index: pendingPlayerFavorites.get(playerId)?.index ?? before.indexOf(playerId) } : null;
+		if (playerId && rollback) pendingPlayerFavorites.set(playerId, rollback);
 		favorites = [...optimistic];
-		let base = before;
-		void updateStoredFavorites(session, browserStorage('local'), key, (latest) => {
+		notePublication(before);
+		const selection = queueController.selectionGeneration, ownsWrite = () => shareAlive && favoritesInitialized && favoritesAuthKey === key;
+		const stale = () => !!playerId && (!ownsWrite() || selection !== queueController.selectionGeneration || pendingPlayerFavorites.get(playerId) !== rollback);
+		let base = before, superseded = false;
+		return updateStoredFavorites(session, browserStorage('local'), key, (latest) => {
 			base = latest;
-			return update(latest);
+			return (superseded = stale()) ? latest : update(latest);
 		}).then((committed) => {
-			if (favoritesKey(session) !== key) return;
+			if ((playerId && !ownsWrite()) || favoritesKey(session) !== key) return null;
+			superseded ||= !committed && stale();
+			if (playerId && rollback && pendingPlayerFavorites.get(playerId) === rollback) {
+				pendingPlayerFavorites.delete(playerId);
+				if (superseded && favorites.includes(playerId) !== (rollback.index >= 0)) {
+					const previous = favorites;
+					favorites = favorites.filter((id) => id !== playerId);
+					if (rollback.index >= 0) favorites.splice(rollback.index, 0, playerId);
+					notePublication(previous);
+				}
+			}
+			if (superseded) return null;
 			const wrote = committed !== null && JSON.stringify(base) !== JSON.stringify(committed);
 			if (edit !== favoriteEdit) {
 				if (wrote) favoriteBaseline = update(favoriteBaseline);
-				return;
+				return committed ? 'saved' : 'visit';
 			}
-			if (!committed) return applied?.(before, optimistic);
+			const optimistic = favorites; // Includes per-track rollbacks that settled ahead of this write.
+			if (!committed) { applied?.(before, optimistic); return 'visit'; }
 			const visitOnly = placement && !favoriteBaseline.includes(placement.id) && !committed.includes(placement.id)
 				? placement : undefined;
-			if (wrote) favorites = committed;
-			else if (JSON.stringify(favoriteBaseline) !== JSON.stringify(committed)) {
+			if (wrote || JSON.stringify(favoriteBaseline) !== JSON.stringify(committed)) {
 				const baseline = new Set(favoriteBaseline);
 				const visit = new Set(optimistic);
 				const durable = committed.filter((id) => !baseline.has(id) || visit.has(id));
@@ -844,19 +890,21 @@
 					favorites = reconciled.map((id) => moved.loaded.has(id) ? order[slot++] : id);
 				} else favorites = reconciled;
 			}
+			notePublication(optimistic);
 			favoriteBaseline = committed;
 			const displayMove = visitOnly && favorites.includes(visitOnly.crossed);
 			applied?.(displayMove ? before : base, displayMove ? favorites : committed);
+			return 'saved';
 		});
 	}
 
-	function toggleFavorite(id: string): void {
+	function toggleFavorite(id: string, playerWrite = false): Promise<FavoriteWrite> {
 		const remove = favorites.includes(id);
-		editFavorites((latest) => remove ? latest.filter((favorite) => favorite !== id) : [...new Set([...latest, id])]);
 		favoritesAnnouncement = '';
 		// Favorites-only unmounts an unstarred row, including its focused button.
 		// All-tracks keeps that button mounted and must leave focus alone.
-		if (view === 'favorites' && remove) focusLibraryView();
+		if (!playerWrite && view === 'favorites' && remove) focusLibraryView();
+		return editFavorites((latest) => remove ? latest.filter((favorite) => favorite !== id) : [...new Set([...latest, id])], undefined, undefined, playerWrite ? id : undefined);
 	}
 
 	function focusLibraryView(): void {
@@ -1421,8 +1469,8 @@
 	 * focus was lost that way — never when the user moved on, and never on
 	 * mount/auth/transition refreshes, which do not run through this handler.
 	 * Both the list-branch Refresh and the error-branch Retry bind the same
-	 * ref; the branches are mutually exclusive, so the ref always points at
-	 * the mounted successor (including a Refresh-to-401 landing on Retry).
+	 * ref, including a Refresh-to-401 landing on Retry. After a successful
+	 * collection Retry, Refresh is hidden; return to the selected Library type.
 	 */
 	async function refreshFromButton(): Promise<void> {
 		await refresh();
@@ -1431,7 +1479,9 @@
 		if (!loadError && !libraryUnavailable) recordFindQuery();
 		await tick();
 		if (document.activeElement === null || document.activeElement === document.body) {
-			refreshButton?.focus({ preventScroll: true });
+			const replacement = refreshButton && !refreshButton.hidden ? refreshButton
+				: libraryTypeGroup?.querySelector<HTMLButtonElement>('button[aria-pressed="true"]');
+			replacement?.focus({ preventScroll: true });
 		}
 	}
 
@@ -1502,7 +1552,14 @@
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
+		const releaseFavoriteAction = player.currentFavorite.bind({
+			read: (id) => shareAlive && favoritesInitialized && !libraryUnavailable && loadError === null &&
+				queueController.hasLibraryTrack(id) && favoritesKey(browserStorage('session')) === favoritesAuthKey
+					? { pressed: favoriteIds.has(id), edit: currentFavoriteEdit, loading } : null,
+			write: (id) => toggleFavorite(id, true)
+		});
 		disposeRoute = () => {
+			releaseFavoriteAction();
 			endTrackDrag();
 			// Restore only while this page still owns the title; a newer route's title wins.
 			if (priorDocumentTitle !== null && document.title === tabTitle) {
@@ -1540,14 +1597,21 @@
 		</select>
 	</div>
 
-	<div class="nt-library-types" role="group" aria-label="Library type">
+	<div class="nt-library-types" role="group" aria-label="Library type" bind:this={libraryTypeGroup}>
 		{#each libraryTypes as [type, label] (type)}
 			<button class="nt-button nt-button--ghost" type="button" aria-pressed={collectionFilter === type}
 				onclick={() => { collectionFilter = type; }}>{label}</button>
 		{/each}
 	</div>
-	{#if collectionFilter !== 'tracks'}
-		<CollectionBrowser filter={collectionFilter} accessRevoked={collectionsAccessRevoked} />
+	{#if collectionFilter !== 'tracks' && (collectionReceipt || requiresSignIn)}
+		<CollectionBrowser filter={collectionFilter} {requiresSignIn}
+			runIfCurrent={collectionReceipt} reverify={refreshFromButton} />
+	{:else if !showingTracks && (loading ? items.length > 0 : libraryUnavailable || staleAt)}
+		{#if loading}
+			<p role="status">Loading your library…</p>
+		{:else}
+			<p role="status">Library listing is not available yet.</p>
+		{/if}
 	{/if}
 
 	{#if shareInvalid}
@@ -1593,16 +1657,16 @@
 {/snippet}
 
 	{#if loading && items.length === 0}
-		<p role="status" hidden={!showingTracks}>Loading your library…</p>
+		<p role="status" hidden={!showRecovery}>Loading your library…</p>
 	{:else if loadError && items.length === 0}
-		<p role="alert" hidden={!showingTracks}>{loadError}</p>
+		<p role="alert" hidden={!showRecovery}>{loadError}</p>
 		{#if requiresSignIn}
 			<a class="nt-button" href="/login" hidden={!showingTracks}>Sign in</a>
 		{/if}
 		<button
 			class="nt-button"
 			type="button"
-			hidden={!showingTracks}
+			hidden={!showRecovery}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>
@@ -2017,11 +2081,11 @@
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
-			hidden={!showingTracks}
+			hidden={!showingTracks && (!showRecovery || loading)}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>
-			{staleAt ? 'Retry' : 'Refresh'}
+			{staleAt || (!showingTracks && libraryUnavailable) ? 'Retry' : 'Refresh'}
 		</button>
 	{/if}
 
