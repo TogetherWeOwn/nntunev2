@@ -23421,7 +23421,9 @@ mod tests {
             "issuer=other",
         ] {
             req.path = format!("{PATH}?{query}");
-            assert_eq!(call(&req).status, 400, "{query}");
+            let response = call(&req);
+            assert_eq!(response.status, 422, "{query}");
+            assert!(response.body.contains("\"code\":\"validation_failed\""));
         }
         assert!(h.store.member_invite_history_calls.borrow().is_empty());
         req.path = format!("{PATH}?cursor=79");
