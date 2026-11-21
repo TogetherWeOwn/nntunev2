@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 
 /**
- * Builder-owned remove/clear regressions supplementing the protected bank.
+ * Builder-owned move/remove/clear regressions supplementing the protected bank.
  * Run from apps/web with the production-build Playwright config:
  *   pnpm exec playwright test tests/library-queue-action-feedback.spec.ts --workers=1
  * All library responses are offline fixtures; no provider or audio requests.
@@ -33,6 +33,22 @@ function removeButton(page: Page, id: string) {
 		.locator(`[data-testid="queue-item"][data-track-id="${id}"]`)
 		.getByRole('button', { name: 'Remove Intro from queue', exact: true });
 }
+
+test('QF-R04 keyboard reorder keeps the current row and focus on its move control', async ({ page }) => {
+	await seedQueue(page);
+	const rows = page.getByTestId('queue-item');
+	const current = rows.and(page.locator('[data-track-id="intro-one"]'));
+	const move = current.getByRole('button', { name: 'Move Intro down', exact: true });
+	await expect(current).toHaveAttribute('aria-current', 'true');
+	await move.focus();
+	await page.keyboard.press('Enter');
+	await expect(rows.nth(0)).toHaveAttribute('data-track-id', 'intro-two');
+	await expect(rows.nth(1)).toHaveAttribute('data-track-id', 'intro-one');
+	await expect(rows.nth(2)).toHaveAttribute('data-track-id', 'outro');
+	await expect(current).toHaveAttribute('aria-current', 'true');
+	await expect(move).toBeFocused();
+	await expect(page.getByTestId('queue-announcement')).toHaveText('Intro moved to 2 of 3');
+});
 
 test('QF-R01 equal-title keyboard removals each update the same polite region once', async ({ page }) => {
 	await seedQueue(page);

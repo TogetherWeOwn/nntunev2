@@ -94,7 +94,6 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		createQueue: queueFunctions.createQueue,
 		createQueueShare, getAppPlayer: () => createPlayerController(queueFunctions.createQueue([]), { flush: () => Promise.resolve() }),
 		createFavoritesExport,
-		moveTrack: queueFunctions.moveTrack,
 		nextTrack: queueFunctions.nextTrack,
 		playNext: queueFunctions.playNext,
 		removeTrack: queueFunctions.removeTrack,
@@ -140,7 +139,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
 		return {
-			refresh, selectTrack, moveQueuedTrack, toggleFavorite,
+			refresh, selectTrack, moveQueuedTrack: player.moveQueuedTrack, toggleFavorite,
 			dispose: refresher.dispose, subscribeQueue: queueController.subscribe,
 			handleAuthTransition: (event) => {
 				if (event.key === LIBRARY_AUTH_TRANSITION_KEY) player.purgeAtAuthBoundary();
