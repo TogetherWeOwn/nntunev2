@@ -325,6 +325,8 @@ jobs:
         run: python3 -I .github/scripts/test_subsonic_staging_observer.py
       - name: Test Subsonic staging telemetry and health offline
         run: python3 -I .github/scripts/test_subsonic_staging_telemetry.py && python3 -I .github/scripts/test_subsonic_staging_health.py
+      - name: Test Cloudflare staging API identity offline
+        run: python3 -I .github/scripts/test_staging_api_identity.py
       - name: Test offline playable-artist root coverage (synthetic only)
         run: python3 scripts/test_genre_root_coverage.py
       - name: Test bounded process-group cleanup
