@@ -514,17 +514,17 @@
 			</div>
 		</div>
 		{@render children()}
+		{#if rightSnippet}
+			<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
+				{@render rightSnippet()}
+			</aside>
+		{/if}
 	</div>
 	{/snippet}
 	{#if page.route.id === null}
 		{@render appBody()}
 	{:else}
 		<AppPlayer {claimShareEntry} children={appBody} signedOut={page.route.id === '/account/billing' && page.data.signedOut === true} />
-	{/if}
-	{#if rightSnippet}
-		<aside class="nt-right-panel nt-wrap" data-testid="right-panel">
-			{@render rightSnippet()}
-		</aside>
 	{/if}
 	{#if miniHint && page.route.id !== '/now-playing'}
 		<div class="nt-miniplayer nt-wrap" data-testid="mini-player">
@@ -652,6 +652,7 @@
 	}
 
 	.nt-body {
+		container: shell / inline-size;
 		display: flex;
 		align-items: flex-start;
 	}
@@ -787,8 +788,16 @@
 		white-space: nowrap;
 	}
 
+	.nt-body:has(> .nt-right-panel) > :global(main) {
+		flex: 1 1 0;
+		min-width: 0;
+	}
+
 	.nt-right-panel {
-		border-top: 1px solid var(--nt-border);
+		box-sizing: border-box;
+		flex: 0 0 clamp(19rem, 30vw, 27rem);
+		min-width: 0;
+		border-inline-start: 1px solid var(--nt-border);
 		padding-block: var(--nt-space-3);
 	}
 
