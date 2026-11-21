@@ -2368,20 +2368,24 @@ fn postgres_admin_invite_batch_commits_together_or_not_at_all() {
     run_test(async {
         let mut client = connect().await;
         let (actor, _) = seed_admin_test_users(&client).await;
-        let expiry = NOW + 86_400;
         let ip = "198.51.100.9";
         let snapshot = "SELECT (SELECT count(*) FROM invite_codes WHERE issued_by = $1),
                                (SELECT count(*) FROM audit_log WHERE user_id = $1 AND action = 'invite.issued')";
-        let open: bool = client.query_one(
-            "SELECT EXISTS (SELECT 1 FROM invite_windows WHERE starts_at <= $1 AND ends_at > $1)",
+        // The mutation harness reuses this database, including committed windows.
+        let row = client.query_one(
+            "WITH clock AS (SELECT GREATEST(MAX(ends_at), $1) AS now FROM invite_windows)
+             SELECT now, EXISTS (SELECT 1 FROM invite_windows WHERE starts_at <= now AND ends_at > now)
+             FROM clock",
             &[&(NOW as i64)],
-        ).await.unwrap().get(0);
-        assert!(!open);
+        ).await.unwrap();
+        assert!(!row.get::<_, bool>(1));
+        let now = u64::try_from(row.get::<_, i64>(0)).unwrap();
+        let expiry = now + 86_400;
         for count in [1, 50] {
             let hashes: Vec<_> = (0..count)
                 .map(|idx| format!("{actor}-{count}-{idx}"))
                 .collect();
-            let outcome = issue(&mut client, &actor, &hashes, ip, NOW, expiry)
+            let outcome = issue(&mut client, &actor, &hashes, ip, now, expiry)
                 .await
                 .unwrap();
             assert!(matches!(outcome, Outcome::Issued));
@@ -2396,7 +2400,7 @@ fn postgres_admin_invite_batch_commits_together_or_not_at_all() {
         }
         // A fresh row preceding an already committed hash must not survive the failed insert.
         let hashes = [format!("{actor}-fresh"), format!("{actor}-1-0")];
-        let failed = issue(&mut client, &actor, &hashes, ip, NOW, expiry).await;
+        let failed = issue(&mut client, &actor, &hashes, ip, now, expiry).await;
         assert!(failed.is_err());
         for (update, expected) in [
             (
@@ -2409,7 +2413,7 @@ fn postgres_admin_invite_batch_commits_together_or_not_at_all() {
             ),
         ] {
             client.execute(update, &[&actor]).await.unwrap();
-            let outcome = issue(&mut client, &actor, &hashes[..1], ip, NOW, expiry)
+            let outcome = issue(&mut client, &actor, &hashes[..1], ip, now, expiry)
                 .await
                 .unwrap();
             assert_eq!(outcome, expected);
