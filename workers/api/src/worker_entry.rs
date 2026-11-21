@@ -526,6 +526,10 @@ async fn query_playback_lease_row(
             play_id: row.try_get("play_id").map_err(|_| StoreError)?,
             epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
             expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+            continuation_deadline: u64_of(
+                row.try_get("continuation_deadline")
+                    .map_err(|_| StoreError)?,
+            )?,
         })),
     }
 }
@@ -539,7 +543,7 @@ pub async fn acquire_playback_lease_on(
     track_id: &str,
     play_id: &str,
     now: u64,
-    expires_at: u64,
+    continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
     let rows = client
@@ -550,9 +554,13 @@ pub async fn acquire_playback_lease_on(
                 (&session_id, Type::TEXT),
                 (&track_id, Type::TEXT),
                 (&play_id, Type::TEXT),
-                (&i64_of(expires_at)?, Type::INT8),
+                (
+                    &i64_of(crate::playback::lease_expiry(now, continuation_deadline))?,
+                    Type::INT8,
+                ),
                 (&i64_of(now)?, Type::INT8),
                 (&takeover, Type::BOOL),
+                (&i64_of(continuation_deadline)?, Type::INT8),
             ],
         )
         .await
@@ -960,7 +968,7 @@ pub async fn private_aware_lease_for_postgres_test(
     track_id: &str,
     play_id: &str,
     now: u64,
-    expires_at: u64,
+    continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
     PgStore {
@@ -972,7 +980,13 @@ pub async fn private_aware_lease_for_postgres_test(
         test_mirror: None,
     }
     .acquire_playback_lease(
-        user_id, session_id, track_id, play_id, now, expires_at, takeover,
+        user_id,
+        session_id,
+        track_id,
+        play_id,
+        now,
+        continuation_deadline,
+        takeover,
     )
     .await
 }
@@ -1102,7 +1116,7 @@ impl PgStore {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
@@ -1173,7 +1187,14 @@ impl PgStore {
                     }
                 }
                 let result = acquire_playback_lease_on(
-                    &tx, user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                    &tx,
+                    user_id,
+                    session_id,
+                    track_id,
+                    play_id,
+                    now,
+                    continuation_deadline,
+                    takeover,
                 )
                 .await?;
                 if matches!(result, crate::playback::LeaseAcquire::Acquired { .. }) {
@@ -4153,11 +4174,17 @@ impl Store for PgStore {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         self.acquire_private_aware_lease(
-            user_id, session_id, track_id, play_id, now, expires_at, takeover,
+            user_id,
+            session_id,
+            track_id,
+            play_id,
+            now,
+            continuation_deadline,
+            takeover,
         )
         .await
     }
