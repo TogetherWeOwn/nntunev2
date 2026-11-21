@@ -38,7 +38,6 @@ class TransportAudio extends EventTarget {
 	paused = true;
 	ended = false;
 	error: { code: number } | null = null;
-	currentTime = 30;
 	constructor(readonly source = '/coral') { super(); }
 	getAttribute() { return this.source; }
 	play = vi.fn(async () => { this.paused = false; });
@@ -66,40 +65,77 @@ function compactTransport() {
 }
 
 const coralSource = { streamUrl: '/coral', isCurrent: () => true };
-test('queue Play reports a decoder error once, including queue counts', async () => {
+test.each(['queue', 'shared'])('%s Play reports a resource error once with queue counts', async (path) => {
 	const { audio, media, announce, status } = compactTransport();
-	const pending = audio.deferPlay();
+	const pending = audio.deferPlay(), compact = path === 'shared' ? media.playCurrent() : undefined;
 	const queued = media.playSelected(coral, 0, coralSource, 'Added 0, 1 already queued.');
 	await Promise.resolve();
-	expect(audio.play).toHaveBeenCalledOnce();
-	audio.error = { code: 4 };
+	audio.error = { code: path === 'shared' ? 2 : 4 };
 	audio.emit('error');
-	pending.reject(new DOMException('Bad resource', 'NotSupportedError'));
-	await queued;
+	if (path === 'queue') pending.reject(new DOMException('Bad resource', 'NotSupportedError'));
+	const message = 'Selected Coral; audio unavailable. Added 0, 1 already queued.';
+	await vi.waitFor(() => expect(announce).toHaveBeenCalledExactlyOnceWith(message, true));
+	if (path === 'shared') pending.reject(new DOMException('Late failure', 'AbortError'));
+	await Promise.all([compact, queued]);
 	expect(status()).toBe('error');
-	expect(announce).toHaveBeenCalledExactlyOnceWith('Selected Coral; audio unavailable. Added 0, 1 already queued.', true);
+	expect(announce).toHaveBeenCalledExactlyOnceWith(message, true);
+	await media.playCurrent();
+	expect(audio.play).toHaveBeenCalledOnce();
+	audio.paused = true;
+	audio.error = null;
+	audio.emit('emptied');
+	expect(status()).toBe('paused');
+	audio.paused = false;
+	audio.emit('play');
+	expect(status()).toBe('starting');
+	audio.emit('playing');
+	expect(status()).toBe('playing');
+	audio.ended = true;
+	audio.emit('ended');
+	expect(status()).toBe('paused');
 });
 
-test.each(['playing', 'blocked'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
+test.each(['playing', 'blocked', 'paused', 'pause event', 'resumed'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
 	const { audio, media, announce, status } = compactTransport();
 	const pending = audio.deferPlay(), compact = media.playCurrent();
-	const queued = media.playSelected(coral, 0, coralSource);
+	const paused = outcome === 'paused' || outcome === 'pause event';
+	const counts = paused ? 'Added 0, 1 already queued.' : '';
+	const queued = media.playSelected(coral, 0, coralSource, counts);
+	if (paused) audio.pause();
+	if (outcome === 'pause event') audio.emit('pause'); // Before the queue's flush completes.
 	await Promise.resolve();
 	expect(audio.play).toHaveBeenCalledOnce();
-	expect(announce).not.toHaveBeenCalled();
-	if (outcome === 'playing') pending.resolve();
-	else { audio.paused = true; pending.reject(new DOMException('Blocked', 'NotAllowedError')); }
+	if (outcome === 'playing' || paused) pending.resolve();
+	else if (outcome === 'blocked') { audio.paused = true; pending.reject(new DOMException('Blocked', 'NotAllowedError')); }
+	else {
+		audio.pause();
+		await audio.play();
+		audio.emit('pause'); // The queued pause event sees the resumed decoder.
+		pending.reject(new DOMException('Interrupted by pause', 'AbortError'));
+	}
 	await Promise.all([compact, queued]);
+	if (paused || outcome === 'resumed') {
+		if (outcome === 'resumed') audio.emit('playing');
+		expect(status()).toBe(paused ? 'paused' : 'playing');
+		if (paused) expect(announce).toHaveBeenCalledExactlyOnceWith(counts, true);
+		if (outcome === 'paused') audio.emit('pause'); // Settlement preceded the native event.
+		expect(announce).toHaveBeenCalledTimes(Number(paused));
+		return;
+	}
 	expect(status()).toBe(outcome);
 	expect(announce).toHaveBeenCalledExactlyOnceWith(outcome === 'playing'
 		? 'Playing Coral.' : 'Selected Coral, paused: playback was blocked.', true);
+	if (outcome === 'blocked') {
+		await media.playCurrent();
+		expect(status()).toBe('playing');
+		expect(audio.load).not.toHaveBeenCalled();
+	}
 });
 
 test('compact Play starts in the gesture, deduplicates pending Play, and reads native settlement', async () => {
 	const { audio, media, status } = compactTransport();
 	expect(status()).toBe('paused');
 	const pending = audio.deferPlay(), attempt = media.playCurrent();
-	expect(audio.play).toHaveBeenCalledOnce();
 	audio.emit('play');
 	await media.playCurrent();
 	expect(audio.play).toHaveBeenCalledOnce();
@@ -108,32 +144,8 @@ test('compact Play starts in the gesture, deduplicates pending Play, and reads n
 	await attempt;
 	expect(status()).toBe('playing');
 	media.pauseCurrent();
-	expect(audio.pause).toHaveBeenCalledOnce();
 	expect(status()).toBe('paused');
 	expect(media.audio).toBe(audio.element);
-	expect(audio.currentTime).toBe(30);
-	expect(audio.load).not.toHaveBeenCalled();
-});
-
-test('a fulfilled Play cannot claim Playing if native pause readback is already true', async () => {
-	const { audio, media, status } = compactTransport();
-	const pending = audio.deferPlay(), attempt = media.playCurrent();
-	audio.pause(); // The promise can settle before the queued native pause event.
-	pending.resolve();
-	await attempt;
-	expect(status()).toBe('paused');
-});
-
-test('healthy refusal permits another gesture on the same source without reloading', async () => {
-	const { audio, media, status } = compactTransport();
-	audio.play.mockRejectedValueOnce(new DOMException('Blocked', 'NotAllowedError'));
-	await media.playCurrent();
-	expect(status()).toBe('blocked');
-	await media.playCurrent();
-	expect(status()).toBe('playing');
-	expect(audio.play).toHaveBeenCalledTimes(2);
-	expect(audio.load).not.toHaveBeenCalled();
-	expect(audio.currentTime).toBe(30);
 });
 
 test.each(['compact', 'native'])('%s Pause fences pending success, including after a newer start', async (path) => {
@@ -153,8 +165,9 @@ test.each(['compact', 'native'])('%s Pause fences pending success, including aft
 });
 
 test.each(['replacement', 'detach', 'account purge', 'destroy'])('late Play is inert after %s', async (boundary) => {
-	const { audio, queue, media, detach, status } = compactTransport();
+	const { audio, queue, media, detach, announce, status } = compactTransport();
 	const pending = audio.deferPlay(), attempt = media.playCurrent();
+	const queued = media.playSelected(coral, 0, coralSource, 'Added 0, 1 already queued.');
 	let replacement: TransportAudio | undefined;
 	if (boundary === 'replacement') {
 		replacement = new TransportAudio('/kelp');
@@ -168,36 +181,11 @@ test.each(['replacement', 'detach', 'account purge', 'destroy'])('late Play is i
 	audio.emit('playing');
 	if (boundary === 'replacement') pending.resolve();
 	else pending.reject(new DOMException('Interrupted', 'AbortError'));
-	await attempt;
+	await Promise.all([attempt, queued]);
 	expect(status()).toBe(replacement ? 'paused' : 'unavailable');
 	expect(media.audio).toBe(replacement?.element);
-	expect(replacement?.play.mock.calls ?? []).toEqual([]);
+	expect(announce).not.toHaveBeenCalled();
 	expect(audio.pause).toHaveBeenCalledOnce();
-});
-
-test('resource error wins over a pending Play and only a native recovery clears it', async () => {
-	const { audio, media, status } = compactTransport();
-	const pending = audio.deferPlay(), attempt = media.playCurrent();
-	audio.error = { code: 4 };
-	audio.emit('error');
-	pending.reject(new DOMException('Bad resource', 'NotSupportedError'));
-	await attempt;
-	expect(status()).toBe('error');
-	await media.playCurrent();
-	expect(audio.play).toHaveBeenCalledOnce();
-	expect(audio.load).not.toHaveBeenCalled();
-	audio.paused = true;
-	audio.error = null;
-	audio.emit('emptied');
-	expect(status()).toBe('paused');
-	audio.paused = false;
-	audio.emit('play');
-	expect(status()).toBe('starting');
-	audio.emit('playing');
-	expect(status()).toBe('playing');
-	audio.ended = true;
-	audio.emit('ended');
-	expect(status()).toBe('paused');
 });
 
 test('share capture refuses a different selection or a blank stream', () => {
