@@ -305,8 +305,9 @@ How the suite uses them:
   names or segment lists in the repo or public logs.
 - Provider budget + 430 control: the staging NNTP provider is a shared
   account with production, so each run holds at most a trickle of
-  connections. The workflow concurrency group (`e2e-staging`,
-  cancel-in-progress: false) serializes provider runs, and
+  connections. The workflow concurrency group (`e2e-staging-queued`,
+  `cancel-in-progress: false`, `queue: max`) serializes new runs without
+  replacing pending verification; pre-cutover smoke reruns use the old group.
   `E2E_NNTP_MAX_CONNECTIONS` (default 2, hard max 10 —
   `helpers/provider-budget.ts`) caps each run so 8+ connections stay free.
   The provider 430 control reads the run budget through the same helper, so
@@ -329,14 +330,14 @@ How the suite uses them:
   job is not an api deployment: when staging is unconfigured it succeeds
   with `outcome=unconfigured`, which `deploy.yml` passes as
   `api_deploy_outcome` so build identity reports the api as not redeployed
-  instead of claiming web=API=head. A later main push can
-  still deploy staging mid-journey (deploy releases its job-level group
-  when the deploy finishes while E2E serializes separately) — that
-  timing fails the closing build-identity re-read instead of passing
-  green (see below). Manual dispatch and the
-  6-hour schedule run the synthetic smoke only (monitoring, not
-  post-deploy promotion evidence); dispatch defines no `post_deploy`
-  input, so it cannot mint that evidence by hand.
+  instead of claiming web=API=head. The `deploy-staging-main` workflow
+  lock in `deploy.yml` covers staging deploys through post-deploy E2E;
+  later locked main pushes wait for the whole run. The closing SHA read
+  still fails if staging is overwritten by a deploy outside the lock
+  (see the [cutover and rollback runbook](../docs/ops.md#staging-deploy-lock-cutover-and-rollback)).
+  Manual dispatch and the 6-hour schedule run the synthetic smoke only
+  (monitoring, not post-deploy promotion evidence); dispatch defines no
+  `post_deploy` input, so it cannot mint that evidence by hand.
   Missing `STAGING_BASE_URL` → the synthetic smoke skips with notice
   (pre-deploy); the post-deploy full journey fails in preflight, because a
   skipped journey after a real `staging-web` deploy would otherwise pass

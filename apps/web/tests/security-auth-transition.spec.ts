@@ -349,6 +349,7 @@ test('keyboard Play and Pause keep the range-capable native decoder and position
 	const pausedAt = await time();
 	await openHome(page);
 	await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();
+	await expect(page).toHaveURL(/\/library$/);
 	await expect(status).toHaveText('Paused');
 	await expect(native).toHaveAttribute('data-starts', '1');
 	expect(await time()).toBeCloseTo(pausedAt, 3);
