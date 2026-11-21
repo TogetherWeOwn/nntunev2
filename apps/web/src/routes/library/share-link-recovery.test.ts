@@ -25,6 +25,7 @@ const ITEMS = [{ id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/cora
  * in library-share-link-lifecycle.spec.ts cover navigation and rendered media.
  */
 function pageScript(search: string, tick = () => Promise.resolve()) {
+	vi.stubGlobal('navigator', {}); // Do not use Node's Web Locks with this partial window fixture.
 	vi.stubGlobal('window', { location: { search } });
 	const source = sources['./+page.svelte'];
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;

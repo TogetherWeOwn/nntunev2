@@ -55,7 +55,6 @@ export interface LibraryRefresherDeps {
 
 // SHA-256 base64url has two zero pad bits in its last sextet.
 const validBinding = (value: unknown): value is string => typeof value === 'string' && /^[\w-]{42}[AEIMQUYcgkosw048]$/.test(value);
-// Old fixture payloads exercise UI/cache behavior without a live auth service.
 const legacyFixture = () => import.meta.env.MODE === 'test' || import.meta.env.MODE === 'browser-fixtures';
 
 async function verifyLibrarySession(binding: string, signal: AbortSignal): Promise<boolean> {
