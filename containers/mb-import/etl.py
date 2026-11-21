@@ -62,6 +62,7 @@ FIELD_COUNTS = {
     "release": 14,
     "release_alias": 16,
     "release_group": 8,
+    "release_group_alias": 16,
     "release_group_primary_type": 6,
     "release_country": 5,
     "release_unknown_country": 4,
@@ -331,7 +332,7 @@ def project_aliases(db: sqlite3.Connection, entity: str, output_dir: Path, updat
     table = f"{entity}_alias"
     # Pick a whole raw COPY row for each decoded key. Prefer a primary
     # alias, then the greatest raw sort name, then the lowest alias ID.
-    # Release aliases use the exact MBID spelling of the curated release row.
+    # Match the corresponding curated entity's MBID spelling.
     gid = "LOWER(e.gid)" if entity == "recording" else "e.gid"
     query = f"""
         WITH ranked AS (
@@ -346,7 +347,7 @@ def project_aliases(db: sqlite3.Connection, entity: str, output_dir: Path, updat
     """
 
     mbid_pattern = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
-                              re.IGNORECASE if entity == "release" else 0)
+                              re.IGNORECASE if entity in ("release", "release_group") else 0)
 
     def validate_alias_row(row):
         if not mbid_pattern.fullmatch(row[0]):
@@ -486,6 +487,11 @@ def main() -> int:
                         locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
                         name_key TEXT NOT NULL, locale_key TEXT NOT NULL
                     );
+                    CREATE TABLE release_group_alias (
+                        id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
+                        locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
+                        name_key TEXT NOT NULL, locale_key TEXT NOT NULL
+                    );
                     CREATE TABLE recording_alias (
                         id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
                         locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
@@ -578,6 +584,7 @@ def main() -> int:
                 counts["release_unknown_country"] = load(db, dump_dir / "release_unknown_country", FIELD_COUNTS["release_unknown_country"], (RELEASE_UNKNOWN_COUNTRY_RELEASE_ID, RELEASE_UNKNOWN_COUNTRY_YEAR), "release_unknown_country", "release,year", as_ints("release_unknown_country", (0, 1), (1,)))
                 counts["release"] = load(db, dump_dir / "release", FIELD_COUNTS["release"], (RELEASE_ID, RELEASE_GID, RELEASE_NAME, RELEASE_CREDIT_ID, RELEASE_GROUP_ID), "release", "id,gid,name,credit,group_id", as_ints("release.id", (0, 3, 4)))
                 counts["release_alias"] = load_aliases(db, dump_dir, "release")
+                counts["release_group_alias"] = load_aliases(db, dump_dir, "release_group")
                 counts["recording"] = load(
                     db, dump_dir / "recording", FIELD_COUNTS["recording"],
                     (RECORDING_ID, RECORDING_GID, RECORDING_NAME, RECORDING_LENGTH),
@@ -736,12 +743,13 @@ def main() -> int:
                     entity_id, resolved_id = bad_recording_alias
                     reason = "missing recording" if resolved_id is None else "invalid recording id"
                     raise ValueError(f"recording_alias references {reason} {entity_id}")
-                bad_release_alias = db.execute("""
-                    SELECT al.entity FROM release_alias al LEFT JOIN release r ON r.id=al.entity
-                    WHERE r.id IS NULL LIMIT 1
-                """).fetchone()
-                if bad_release_alias:
-                    raise ValueError(f"release_alias references missing release {bad_release_alias[0]}")
+                for entity in ("release", "release_group"):
+                    missing_alias_parent = db.execute(f"""
+                        SELECT al.entity FROM {entity}_alias al LEFT JOIN {entity} e ON e.id=al.entity
+                        WHERE e.id IS NULL LIMIT 1
+                    """).fetchone()
+                    if missing_alias_parent:
+                        raise ValueError(f"{entity}_alias references missing {entity} {missing_alias_parent[0]}")
                 bad_work_type = db.execute("""
                     SELECT w.id,w.type_id FROM work w LEFT JOIN work_type t ON t.id=w.type_id
                     WHERE w.type_id IS NOT NULL AND t.id IS NULL LIMIT 1
@@ -868,6 +876,7 @@ def main() -> int:
                     ORDER BY g.id
                 """
                 release_group_count = insert_select(db, release_group_query, output_dir / curated_name("release_group"), updated_at)
+                release_group_alias_count = project_aliases(db, "release_group", output_dir, updated_at)
                 release_query = """
                     SELECT r.gid,a.gid,r.name,pt.name,
                            (SELECT MIN(year) FROM (SELECT rc.year FROM release_country rc WHERE rc.release=r.id UNION ALL SELECT ruc.year FROM release_unknown_country ruc WHERE ruc.release=r.id) WHERE year IS NOT NULL),
@@ -1076,6 +1085,7 @@ def main() -> int:
                 for table, input_count, output_count in (
                     ("artist_alias", counts["artist_alias"], artist_alias_count),
                     ("release_alias", counts["release_alias"], release_alias_count),
+                    ("release_group_alias", counts["release_group_alias"], release_group_alias_count),
                     ("recording_alias", counts["recording_alias"], recording_alias_count),
                     ("artist_url", counts["l_artist_url"], artist_url_count),
                     ("recording_url", counts["l_recording_url"], recording_url_count),
@@ -1107,7 +1117,8 @@ def main() -> int:
             os.replace(link_tmp, curated_link)
 
         print(f"etl: published {snapshot_name} via curated (artist={artist_count}, artist_alias={artist_alias_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count}, work={work_count}, recording_work={recording_work_count}, "
-              f"recording_alias={recording_alias_count}, release_alias={release_alias_count}, label={label_count}, release_label={release_label_count})")
+              f"recording_alias={recording_alias_count}, release_alias={release_alias_count}, release_group_alias={release_group_alias_count}, "
+              f"label={label_count}, release_label={release_label_count})")
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"etl: {exc}", file=sys.stderr)
