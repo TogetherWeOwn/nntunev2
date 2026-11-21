@@ -1530,7 +1530,6 @@ mod tests {
         // Poisoned stored MBIDs degrade too, and match nothing.
         let poisoned = &rows[3];
         assert_eq!(poisoned.recording_mbid.as_deref(), Some("also-not-a-uuid"));
-        assert_eq!(library_entry(poisoned).like_target_id, None);
         assert_eq!(poisoned.recording_title, None);
         assert_eq!(poisoned.release_title, None);
         // Unmatched upload: NULL recording, job-id identity downstream.
@@ -1538,6 +1537,16 @@ mod tests {
         assert_eq!(unmatched.recording_mbid, None);
         assert_eq!(unmatched.recording_ord, 0);
         assert!(unmatched.recording_mbids.is_empty());
+        let mut exact_job = upper.clone();
+        exact_job.recording_job_match = true;
+        let mut unmatched = unmatched.clone();
+        unmatched.job_id = GOOD_MBID_UPPER.to_owned();
+        let rows = [upper, &exact_job, &unmatched, poisoned];
+        let exact = Some(GOOD_MBID_UPPER);
+        for (row, id) in rows.into_iter().zip([Some(GOOD_MBID), exact, exact, None]) {
+            let json = serde_json::to_value(library_entry(row)).unwrap();
+            assert_eq!(json.get("like_target_id"), Some(&serde_json::json!(id)));
+        }
     }
 
     #[test]

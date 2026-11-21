@@ -684,7 +684,8 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
     use nntune_api::catalogue::*;
     let app = client(true).await;
     app.execute(
-        "INSERT INTO library VALUES (NULL, 'shared', $1, ARRAY[$2])",
+        "INSERT INTO library VALUES (NULL, 'shared', $1, ARRAY[upper($2)]),
+         ('u1', upper($2), NULL, ARRAY[]::text[])",
         &[&OTHER_RELEASE, &RECORDING],
     )
     .await
@@ -727,8 +728,13 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
             .query(library_page_statement(), &[&caller, &50_i64])
             .await
             .unwrap();
-        assert_eq!(page.len(), if caller == "u1" { 5 } else { 1 });
+        assert_eq!(page.len(), if caller == "u1" { 6 } else { 1 });
         assert!(page.iter().all(|r| r.get::<_, String>(0) != "private"));
+        let shared = page
+            .iter()
+            .find(|row| row.get::<_, &str>("job_id") == "shared")
+            .unwrap();
+        assert_eq!(shared.get::<_, bool>("recording_job_match"), caller == "u1");
     }
 }
 
@@ -740,10 +746,9 @@ async fn member_target_queries_isolate_caller_and_kind() {
         app.batch_execute(
             "INSERT INTO library (user_id, job_id, release_mbid, recording_mbids) VALUES
              ('u1', 'Job_Own', 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA', ARRAY['BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB', 'opaque-invalid']),
-             (NULL, 'Job_Shared', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', ARRAY['DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD']),
+             (NULL, 'Job_Shared', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', ARRAY['dddddddd-dddd-4ddd-8ddd-dddddddddddd']),
              ('other', 'Job_Private', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', ARRAY['ffffffff-ffff-4fff-8fff-ffffffffffff']),
-             ('u1', '11111111-1111-1111-1111-AAAAAAAAAAAA', NULL, ARRAY[]::text[]),
-             ('u1', 'DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD', NULL, ARRAY[]::text[])"
+             ('u1', '11111111-1111-1111-1111-AAAAAAAAAAAA', NULL, ARRAY[]::text[])"
         ).await.unwrap();
         app
     }
@@ -813,21 +818,6 @@ async fn member_target_queries_isolate_caller_and_kind() {
             "{kind:?} {target}"
         );
         assert_eq!(attempts.get(), 0);
-    }
-    let app = seeded().await;
-    for owner in ["u1", "other"] {
-        let page = app
-            .query(
-                nntune_api::catalogue::library_page_statement(),
-                &[&owner, &50_i64],
-            )
-            .await
-            .unwrap();
-        let shared = page
-            .iter()
-            .find(|row| row.get::<_, &str>("job_id") == "Job_Shared")
-            .unwrap();
-        assert_eq!(shared.get::<_, bool>("recording_job_match"), owner == "u1");
     }
     let store = catalogue_store_for_postgres_test(
         seeded().await,
