@@ -810,14 +810,14 @@
 			if (!committed) return applied?.(before, optimistic);
 			const visitOnly = placement && !favoriteBaseline.includes(placement.id) && !committed.includes(placement.id)
 				? placement : undefined;
-			// A no-op reconciles peer edits without replaying the visit-only overlay.
 			if (wrote) favorites = committed;
 			else if (JSON.stringify(favoriteBaseline) !== JSON.stringify(committed)) {
 				const baseline = new Set(favoriteBaseline);
 				const visit = new Set(optimistic);
 				const durable = committed.filter((id) => !baseline.has(id) || visit.has(id));
 				const visible = new Set(durable);
-				const moved = visitOnly && visible.has(visitOnly.crossed) ? visitOnly : undefined;
+				const survives = (id: string) => visible.has(id) || (!baseline.has(id) && visit.has(id));
+				const moved = visitOnly && survives(visitOnly.crossed) ? visitOnly : undefined;
 				const beforeNeighbor = new Map<string, string[]>();
 				let pending: string[] = [];
 				for (const id of moved ? before : optimistic) {
@@ -837,7 +837,6 @@
 				} else favorites = reconciled;
 			}
 			favoriteBaseline = committed;
-			// A visit-only move has a display outcome only if the crossed row survived.
 			const displayMove = visitOnly && favorites.includes(visitOnly.crossed);
 			applied?.(displayMove ? before : base, displayMove ? favorites : committed);
 		});
