@@ -315,8 +315,10 @@ def smoke(base, s, db, fx=None, mirror=False):
         fixture_inert(base, q, fx, mirror)
 
 
-def measurement_fetch(tmp, wrangler, env, s, db, sha, fx, redact):
+def measurement_fetch(tmp, wrangler, env, s, db, sha, fx, redact, runner, shared):
     now = int(time.time())
+    (tmp / ".dev.vars").write_text(dev_vars(fx) + f"QA_AUTH_TOKEN={shared}\n"
+                                   f"SUBSONIC_MEASUREMENT_RUNNER=v1:{now}:{now + 600}:{runner}\n")
     for enabled in (1, 0):
         extra = f'''QA_CODE_SEAM = "1"
 SUBSONIC_MEASUREMENT_STAGE = "staging"
@@ -330,7 +332,8 @@ SUBSONIC_MEASUREMENT_LEASE = "v1:{sha}:{now}:{now + 600}:ci-fixture-active;small
                             cwd=tmp, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
-        output, _ = proc.communicate(json.dumps([fx.keys[k] for k in ("active", "grace")]), timeout=150)
+        matching, other = (fx.keys[k] for k in ("active", "grace"))
+        output, _ = proc.communicate(json.dumps([matching, other, runner, shared]), timeout=150)
         check(proc.returncode == 0, "measurement Fetch failed:\n" + redact(output)[-4000:])
     finally:
         process_group.shutdown_process_group(proc)
@@ -408,12 +411,11 @@ def main(argv=None):
             break
         smoke(base, s, db, fx, args.mirror_fixture)
         if fx:
-            runner = b64(secrets.token_bytes(32))
-            secrets_out.append(runner)
+            runner, shared = (b64(secrets.token_bytes(32)) for _ in range(2))
+            secrets_out.extend((runner, shared))
             measurement = tmp / "measurement"
             measurement.mkdir()
-            (measurement / ".dev.vars").write_text(dev_vars(fx) + f"QA_AUTH_TOKEN={runner}\n")
-            measurement_fetch(measurement, wrangler, {**env, "QA_AUTH_TOKEN": runner}, s, db, sha, fx, redact)
+            measurement_fetch(measurement, wrangler, env, s, db, sha, fx, redact, runner, shared)
     except (Failure, subprocess.TimeoutExpired) as err:
         print(f"FAIL: {redact(str(err))}", file=sys.stderr)
         failed = True
