@@ -23309,7 +23309,7 @@ mod tests {
             stripe_signature: None,
             body: br#"{"issuer":"other"}"#.to_vec(),
         };
-        let call = |req| block_on(handle(&h.ctx(), req));
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
         assert_eq!(call(&req).status, 401);
         req.authorization = Some("Bearer ntk_synthetic".into());
         assert_eq!(call(&req).status, 404);
