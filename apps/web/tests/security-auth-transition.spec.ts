@@ -332,10 +332,13 @@ test('keyboard Play and Pause keep the range-capable native decoder and position
 	const time = () => audio.evaluate((node: HTMLAudioElement) => node.currentTime);
 	await expect.poll(time).toBeCloseTo(2);
 	await audio.evaluate((node: HTMLAudioElement) => {
-		node.addEventListener('play', () => {
+		const play = node.play;
+		// The queued play event can arrive after the media clock has advanced.
+		node.play = function () {
 			node.dataset.starts = String(Number(node.dataset.starts ?? '0') + 1);
 			node.dataset.startedAt = String(node.currentTime);
-		});
+			return play.call(this);
+		};
 	});
 	await play.press('Enter');
 	await expect(status).toHaveText('Playing');
@@ -353,11 +356,10 @@ test('keyboard Play and Pause keep the range-capable native decoder and position
 	await expect(status).toHaveText('Paused');
 	await expect(native).toHaveAttribute('data-starts', '1');
 	expect(await time()).toBeCloseTo(pausedAt, 3);
-
 	await play.press('Space');
 	await expect(status).toHaveText('Playing');
 	await expect(native).toHaveAttribute('data-starts', '2');
-	expect(Number(await native.getAttribute('data-started-at'))).toBeCloseTo(pausedAt, 1);
+	expect(Number(await native.getAttribute('data-started-at'))).toBeCloseTo(pausedAt, 3);
 	await expect.poll(time).toBeGreaterThan(pausedAt + 0.1);
 	await audio.evaluate((node: HTMLAudioElement) => node.pause());
 	await expect(status).toHaveText('Paused');
