@@ -2050,12 +2050,17 @@ fn catalogue_release_track_from_row(
     })
 }
 
+enum ClaimOutcome {
+    Count(u64),
+    Expired(i64),
+}
+
 /// Shared by standalone claims and registration's transaction: keep every
 /// single-use predicate and its bind order identical across both paths.
 async fn claim_single_use_on(
     client: &impl GenericClient,
     candidate: SingleUseClaim<'_>,
-) -> Result<u64, StoreError> {
+) -> Result<ClaimOutcome, StoreError> {
     let statement = candidate.statement();
     // Unnamed via `query_typed` (TWO-434): registration finish runs these
     // claims through Hyperdrive, where a named `sN` statement can fail.
@@ -2104,31 +2109,100 @@ async fn claim_single_use_on(
         }
     }
     .map_err(|_| StoreError)?;
-    Ok(rows.len() as u64)
+    if matches!(candidate, SingleUseClaim::Invite { .. }) {
+        return match rows.as_slice() {
+            [] => Ok(ClaimOutcome::Count(0)),
+            [row] => match row.try_get("expired_id").map_err(|_| StoreError)? {
+                Some(id) => Ok(ClaimOutcome::Expired(id)),
+                None => Ok(ClaimOutcome::Count(1)),
+            },
+            _ => Err(StoreError),
+        };
+    }
+    Ok(ClaimOutcome::Count(rows.len() as u64))
+}
+
+async fn try_observe_invite_expiry(client: &mut tokio_postgres::Client, id: i64) {
+    // Isolate the audit from both enrollment and the outward denial. Bound
+    // the query server-side too, in case the client stops awaiting it.
+    const AUDIT_BUDGET_MS: u64 = 1_000;
+    let _ = PgStore::bounded(
+        async {
+            let tx = client.transaction().await.map_err(|_| StoreError)?;
+            tx.batch_execute("SET LOCAL statement_timeout = '500ms'")
+                .await
+                .map_err(|_| StoreError)?;
+            tx.query_typed(
+                include_str!("observe_invite_expiry.sql"),
+                &[(&id, Type::INT8)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+            tx.commit().await.map_err(|_| StoreError)
+        },
+        AUDIT_BUDGET_MS,
+    )
+    .await;
+}
+
+enum InviteLookup {
+    Active(tokio_postgres::Row),
+    Expired(i64),
+    Refused,
+}
+
+impl InviteLookup {
+    async fn resolve(
+        self,
+        client: &mut tokio_postgres::Client,
+    ) -> Result<Option<InviteRecord>, StoreError> {
+        match self {
+            Self::Active(row) => invite_from_row(&row).map(Some),
+            Self::Expired(id) => {
+                try_observe_invite_expiry(client, id).await;
+                Ok(None)
+            }
+            Self::Refused => Ok(None),
+        }
+    }
 }
 
 async fn invite_by_hash_on(
     client: &impl GenericClient,
     code_hash: &str,
-) -> Result<Option<InviteRecord>, StoreError> {
-    // Preflight only; the invite claim rechecks the bounds under lock.
+) -> Result<InviteLookup, StoreError> {
+    // Preflight only; both the claim and the audit recheck under lock.
     let statement = format!(
-        "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email FROM invite_codes \
+        "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email, invite_codes.expiry_observed_at, \
+                LEAST(invite_codes.expires_at, w.ends_at) <= live_now AS expired \
+         FROM invite_codes \
          LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
          LEFT JOIN invite_windows w ON w.id = invite_codes.window_id \
-         WHERE invite_codes.code_hash = $1 AND (invite_codes.kind = 'admin' OR \
-             (invite_codes.kind = 'member' AND w.id IS NOT NULL AND \
-              int8range(w.starts_at, w.ends_at, '[)') @> floor(extract(epoch FROM clock_timestamp()))::bigint))"
+         CROSS JOIN (SELECT floor(extract(epoch FROM clock_timestamp()))::bigint AS live_now) tick \
+         WHERE invite_codes.code_hash = $1 AND NOT invite_codes.used \
+           AND invite_codes.redeemed_at IS NULL AND invite_codes.revoked_at IS NULL \
+           AND (invite_codes.kind = 'admin' OR (invite_codes.kind = 'member' AND w.starts_at <= live_now))"
     );
-    let rows = client
+    let mut rows = client
         .query_typed(&statement, &[(&code_hash, Type::TEXT)])
         .await
         .map_err(|_| StoreError)?;
-    // `query_opt`'s rule: more than one row is an error.
     if rows.len() > 1 {
         return Err(StoreError);
     }
-    rows.first().map(invite_from_row).transpose()
+    let Some(row) = rows.pop() else {
+        return Ok(InviteLookup::Refused);
+    };
+    if !row.try_get::<_, bool>("expired").map_err(|_| StoreError)? {
+        return Ok(InviteLookup::Active(row));
+    }
+    let observed_at: Option<i64> = row.try_get("expiry_observed_at").map_err(|_| StoreError)?;
+    if observed_at.is_some() {
+        return Ok(InviteLookup::Refused);
+    }
+    Ok(InviteLookup::Expired(
+        row.try_get("id").map_err(|_| StoreError)?,
+    ))
 }
 
 async fn insert_credential_on(
@@ -2183,8 +2257,16 @@ async fn complete_registration_on(
         claims.push(SingleUseClaim::Invite { record });
     }
     for claim in claims {
-        if claim_single_use_on(&transaction, claim).await? != 1 {
-            return Err(StoreError);
+        match claim_single_use_on(&transaction, claim).await? {
+            ClaimOutcome::Expired(id) => {
+                // No credential or proof may survive the denial. The expiry
+                // audit is independent and must not keep these locks held.
+                transaction.rollback().await.map_err(|_| StoreError)?;
+                try_observe_invite_expiry(client, id).await;
+                return Err(StoreError);
+            }
+            ClaimOutcome::Count(n) if n != 1 => return Err(StoreError),
+            ClaimOutcome::Count(_) => {}
         }
     }
     if let Some(record) = invite {
@@ -4907,14 +4989,17 @@ impl Store for PgStore {
     }
 
     async fn invite_by_hash(&self, code_hash: &str) -> Result<Option<InviteRecord>, StoreError> {
-        Self::bounded(
+        let (mut client, lookup) = Self::bounded(
             async {
                 let client = self.connect().await?;
-                invite_by_hash_on(&client, code_hash).await
+                let lookup = invite_by_hash_on(&client, code_hash).await?;
+                Ok((client, lookup))
             },
             TOTAL_TIMEOUT_MS,
         )
-        .await
+        .await?;
+        // An optional audit timeout must not turn an invite denial into a 500.
+        lookup.resolve(&mut client).await
     }
 
     async fn insert_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
@@ -6781,15 +6866,18 @@ impl Store for PgStore {
     }
 }
 
-/// Executes exactly the parameterized conditional UPDATE/RETURNING the
-/// core prepared (`SingleUseClaim::statement`) and reports how many rows
-/// it returned — autocommitted before the handler responds.
+/// Executes the conditional claim and reports only committed spends.
 impl SingleUseStore for PgStore {
     async fn claim(&self, candidate: SingleUseClaim<'_>) -> Result<u64, auth::AuthError> {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                claim_single_use_on(&client, candidate).await
+                // No mounted standalone invite caller. Preserve its count
+                // contract; only the signup paths write expiry observations.
+                Ok(match claim_single_use_on(&client, candidate).await? {
+                    ClaimOutcome::Count(n) => n,
+                    ClaimOutcome::Expired(_) => 0,
+                })
             },
             TOTAL_TIMEOUT_MS,
         )
