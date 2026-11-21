@@ -51,6 +51,7 @@ EXPECTED = {
         "postgres_member_invite_requires_its_own_open_window_and_unexpired_code",
         "postgres_member_enrollment_rechecks_window_after_waiting",
         "postgres_concurrent_expiry_observers_write_one_audit",
+        "postgres_member_expiry_observer_rechecks_window_after_waiting",
         "postgres_invite_revocation_wins_against_stale_redemption_snapshot",
         "postgres_registration_invite_claim_stamps_spend_and_invited_by",
         "postgres_registration_invite_claim_survives_issuer_deletion",

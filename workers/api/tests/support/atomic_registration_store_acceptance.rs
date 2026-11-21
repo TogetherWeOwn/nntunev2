@@ -741,10 +741,22 @@ async fn await_lock_wait(observer: &Client, blocked: i32, blocker: i32) {
     panic!("backend {blocked} never blocked on backend {blocker}");
 }
 
+const OBSERVE_EXPIRY: &str = include_str!("../../src/observe_invite_expiry.sql");
+
+async fn remove_expiry_audit(client: &Client, id: i64) {
+    client
+        .execute(
+            "DELETE FROM audit_log WHERE action = 'invite.expired'
+             AND details->'invite_id' = to_jsonb($1::bigint)",
+            &[&id],
+        )
+        .await
+        .unwrap();
+}
+
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_concurrent_expiry_observers_write_one_audit() {
-    const OBSERVE: &str = include_str!("../../src/observe_invite_expiry.sql");
     run_test(async {
         let observer = connect().await;
         let mut first = connect().await;
@@ -761,9 +773,9 @@ fn postgres_concurrent_expiry_observers_write_one_audit() {
             .unwrap()
             .get(0);
         let tx = first.transaction().await.unwrap();
-        assert_eq!(tx.query(OBSERVE, &[&id]).await.unwrap().len(), 1);
+        assert_eq!(tx.query(OBSERVE_EXPIRY, &[&id]).await.unwrap().len(), 1);
         let binds: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&id];
-        let (loser, ()) = futures_util::future::join(second.query(OBSERVE, &binds), async {
+        let (loser, ()) = futures_util::future::join(second.query(OBSERVE_EXPIRY, &binds), async {
             await_lock_wait(&observer, second_pid, first_pid).await;
             tx.commit().await.unwrap();
         })
@@ -779,18 +791,78 @@ fn postgres_concurrent_expiry_observers_write_one_audit() {
             .unwrap()
             .get(0);
         assert_eq!(audit_count, 1);
-        observer
-            .execute(
-                "DELETE FROM audit_log WHERE action = 'invite.expired'
-                 AND details->'invite_id' = to_jsonb($1::bigint)",
-                &[&id],
-            )
-            .await
-            .unwrap();
+        remove_expiry_audit(&observer, id).await;
         observer
             .execute("DELETE FROM invite_codes WHERE id = $1", &[&id])
             .await
             .unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_member_expiry_observer_rechecks_window_after_waiting() {
+    run_test(async {
+        let db = connect().await;
+        let mut closer = connect().await;
+        let observer = connect().await;
+        let closer_pid = backend_pid(&closer).await;
+        let observer_pid = backend_pid(&observer).await;
+        let (window, original_end) = seed_member_window(&db, 600).await;
+        let fixture = seed_member_claim(&db, window, original_end + 600).await;
+        let id = fixture.invite.id;
+
+        let close = closer.transaction().await.unwrap();
+        close
+            .query_one(
+                "SELECT id FROM invite_windows WHERE id = $1 FOR NO KEY UPDATE",
+                &[&window],
+            )
+            .await
+            .unwrap();
+        let binds: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&id];
+        let (observed, closed_at) = futures_util::future::join(observer.query(OBSERVE_EXPIRY, &binds), async {
+            await_lock_wait(&db, observer_pid, closer_pid).await;
+            // Choose a deadline strictly after any pre-wait clock sample.
+            let closed_at: i64 = close
+                .query_one(
+                    "UPDATE invite_windows SET ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint + 1
+                     WHERE id = $1 RETURNING ends_at",
+                    &[&window],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(closed_at < original_end, "the committed close must shorten the window");
+            close
+                .query_one(
+                    "SELECT pg_sleep_until(to_timestamp($1::bigint::double precision))",
+                    &[&closed_at],
+                )
+                .await
+                .unwrap();
+            close.commit().await.unwrap();
+            closed_at
+        })
+        .await;
+        assert_eq!(
+            observed.unwrap().len(),
+            1,
+            "the waiter must see the committed expiry"
+        );
+        let matches: bool = db
+            .query_one(
+                "SELECT a.at = i.expiry_observed_at AND a.at >= $2
+                 FROM audit_log a JOIN invite_codes i ON i.id = $1
+                 WHERE a.action = 'invite.expired' AND a.details->'invite_id' = to_jsonb(i.id)",
+                &[&id, &closed_at],
+            )
+            .await
+            .expect("exactly one committed expiry audit")
+            .get(0);
+        assert!(matches, "audit and marker must share a post-wait timestamp");
+        remove_expiry_audit(&db, id).await;
+        remove_member_window_fixture(&db, window).await;
     });
 }
 
