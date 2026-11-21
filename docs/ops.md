@@ -705,6 +705,14 @@ Flipping `INVITES_REQUIRED` on stays the last operator step, after
 the bootstrap above and after a first invite has been issued and
 redeemed end-to-end in that environment.
 
+`GET /v1/admin/users/{id}/invite-tree` is a private/no-store browser-admin
+read. It returns `user_id`, nullable `inviter_id`, up to 50 direct
+`invitee_ids` (bytewise ascending), and nullable `next_cursor`. Continue
+with `?cursor=<next_cursor>` on the same user; a stale or unrelated
+cursor returns 422. A missing node returns 404; a deleting admin or
+selected user is refused with 409. Hard deletion clears the recorded
+edge. The read never consults the invite ledger or writes audit events.
+
 ### Hyperdrive bindings
 
 | Config | ID / GitHub variable | Current PostgreSQL database | Intended binding |

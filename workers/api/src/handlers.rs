@@ -1603,6 +1603,14 @@ pub trait Store {
     ) -> impl Future<Output = Result<Option<MemberInviteHistory>, StoreError>> {
         async { Err(StoreError) }
     }
+    fn admin_invite_tree(
+        &self,
+        _actor_id: &str,
+        _user_id: &str,
+        _cursor: Option<&str>,
+    ) -> impl Future<Output = Result<crate::admin_invite_tree::InviteTreeRead, StoreError>> {
+        async { Err(StoreError) }
+    }
     fn member_issue_invite(
         &self,
         _issuer: &str,
@@ -6310,6 +6318,47 @@ async fn member_invite_issue(
     json_response(error.status, serde_json::json!(error))
 }
 
+/// `GET /v1/admin/users/{id}/invite-tree?cursor=…` — one node and one
+/// page of direct invitees. The opaque continuation is valid only while
+/// its anchor is still a direct child of this node; otherwise restart.
+async fn admin_invite_tree(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+    user_id: &str,
+    query: &str,
+) -> Response {
+    use crate::admin_invite_tree::InviteTreeRead::*;
+    use crate::ledger::{is_valid_key_field, MAX_USER_ID_LEN};
+
+    let claims = match ctx.authenticate_admin(req, false).await {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let cursor = query
+        .strip_prefix("cursor=")
+        .filter(|id| is_valid_key_field(id, MAX_USER_ID_LEN));
+    let mut response = if !query.is_empty() && cursor.is_none() {
+        validation_failed("invalid invite tree cursor")
+    } else {
+        match ctx
+            .store
+            .admin_invite_tree(&claims.user_id, user_id, cursor)
+            .await
+        {
+            Ok(NotAdmin) => return not_found(),
+            Ok(Missing) => not_found(),
+            Ok(AccountDeleting) => account_deleting_response(),
+            Ok(InvalidCursor) => validation_failed("invalid invite tree cursor"),
+            Ok(Page(page)) => json_response(200, serde_json::json!(page)),
+            Err(_) => internal(),
+        }
+    };
+    response
+        .extra_headers
+        .push(("cache-control".into(), "private, no-store".into()));
+    response
+}
+
 /// `GET /v1/admin/invites` — every invite (newest first, capped),
 /// optionally narrowed by `/status/{status}` or `/issuer/{user_id}`.
 /// Filters ride path segments: `Request` carries no query string and
@@ -8232,6 +8281,12 @@ where
     }
     use crate::native_rest::{admin_invite_window_close_id, ADMIN_INVITE_WINDOWS_PATH};
     use listen_history_controls as listens;
+    if let ("GET", Some(user_id)) = (
+        req.method.as_str(),
+        crate::native_rest::admin_invite_tree_user(bare_path),
+    ) {
+        return admin_invite_tree(ctx, req, user_id, query).await;
+    }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET" | "POST", ADMIN_INVITE_WINDOWS_PATH) => admin_invite_windows(ctx, req).await,
         ("POST", path) if admin_invite_window_close_id(path).is_some() => {
@@ -8508,6 +8563,7 @@ mod tests {
         member_invite_calls: RefCell<Vec<(String, String)>>,
         member_invite_summary_calls: RefCell<Vec<String>>,
         member_invite_history_calls: RefCell<Vec<(String, Option<i64>)>>,
+        invite_tree_calls: std::cell::Cell<usize>,
         invite_window_list: RefCell<Option<Vec<InviteWindow>>>,
         invite_window_outcomes: RefCell<std::collections::VecDeque<InviteWindowOutcome>>,
         invite_window_calls: RefCell<Vec<serde_json::Value>>,
@@ -9175,6 +9231,29 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn admin_invite_tree(
+            &self,
+            actor_id: &str,
+            user_id: &str,
+            cursor: Option<&str>,
+        ) -> Result<crate::admin_invite_tree::InviteTreeRead, StoreError> {
+            use crate::admin_invite_tree::{InviteTreePage, InviteTreeRead::*};
+            self.invite_tree_calls.set(self.invite_tree_calls.get() + 1);
+            let deleting = self.deleting_users.borrow();
+            Ok(match (user_id, cursor) {
+                _ if actor_id != "admin" => NotAdmin,
+                _ if deleting.contains(actor_id) || deleting.contains(user_id) => AccountDeleting,
+                ("selected", Some("anchor")) => Page(InviteTreePage {
+                    user_id: user_id.into(),
+                    inviter_id: Some("parent".into()),
+                    invitee_ids: vec!["child".into()],
+                    next_cursor: None,
+                }),
+                ("selected", _) => InvalidCursor,
+                _ => Missing,
+            })
+        }
+
         async fn member_invite_history(
             &self,
             issuer: &str,
@@ -23674,6 +23753,93 @@ mod tests {
         let hash = auth::hash_invite_code(body["code"].as_str().unwrap());
         let calls = h.store.member_invite_calls.borrow();
         assert_eq!(*calls, [("member".to_owned(), hash)]);
+    }
+
+    #[test]
+    fn admin_invite_tree_is_private_browser_only_and_read_only() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+        const PATH: &str = "/v1/admin/users/selected/invite-tree";
+        let h = harness();
+        seed_user(&h, "member", "member@example.com");
+        let member = magic_login(&h, "member@example.com");
+        let admin = seed_admin(&h, "admin", "admin@example.com");
+        let audits = h.store.audits.borrow().len();
+        assert_eq!(scope_for_operation("GET", PATH), RouteDecision::SessionOnly);
+        assert_eq!(scope_for_operation("POST", PATH), RouteDecision::Deny);
+        let path = |query: &str| {
+            crate::worker_entry::route_path(worker::Method::Get, PATH.into(), || {
+                url::Url::parse(&format!("https://example.test{PATH}?{query}")).ok()
+            })
+        };
+        let mut req = Request {
+            method: "GET".into(),
+            path: path("cursor=anchor"),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        for (cookie, bearer) in [
+            (None, None),
+            (Some(member), None),
+            (None, Some("Bearer ntk_synthetic")),
+            (Some(admin.clone()), Some("Bearer ntk_synthetic")),
+        ] {
+            req.cookie = cookie;
+            req.authorization = bearer.map(str::to_owned);
+            let denied = call(&req);
+            assert_eq!(
+                (denied.status, denied.body, denied.extra_headers),
+                (404, not_found().body, vec![])
+            );
+        }
+        req.authorization = None;
+        for query in ["cursor=anchor&cursor=another", "cursor=%00"] {
+            req.path = path(query);
+            assert_eq!(call(&req).status, 422);
+        }
+        req.path = PATH.replace("selected", &"u".repeat(129));
+        assert_eq!(call(&req).status, 404);
+        assert_eq!(h.store.invite_tree_calls.get(), 0);
+
+        req.path = path("cursor=anchor");
+        let page = call(&req);
+        assert_eq!(page.status, 200);
+        assert!(page.set_cookie.is_none());
+        assert!(page
+            .extra_headers
+            .contains(&("cache-control".into(), "private, no-store".into())));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&page.body).unwrap(),
+            serde_json::json!({
+                "user_id": "selected", "inviter_id": "parent", "invitee_ids": ["child"], "next_cursor": null,
+            })
+        );
+        assert_eq!(h.store.invite_tree_calls.get(), 1);
+        req.path = PATH.replace("selected", "missing");
+        assert_eq!(call(&req).status, 404);
+        req.path = path("cursor=foreign");
+        assert_eq!(call(&req).status, 422);
+        req.path = PATH.into();
+        for deleting in ["selected", "admin"] {
+            h.store.deleting_users.borrow_mut().insert(deleting.into());
+            let denied = call(&req);
+            assert_eq!(
+                (denied.status, denied.body),
+                (409, account_deleting_response().body)
+            );
+            h.store.deleting_users.borrow_mut().remove(deleting);
+        }
+        h.store.user_roles.borrow_mut().remove("admin");
+        assert_eq!(
+            call(&req).status,
+            404,
+            "the same cookie loses access after demotion"
+        );
+        assert_eq!(h.store.invite_tree_calls.get(), 5);
+        assert_eq!(h.store.audits.borrow().len(), audits);
     }
 
     #[test]
