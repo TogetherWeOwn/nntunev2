@@ -212,10 +212,11 @@ function setup({ unsupported, connected = true, ranges }: { unsupported?: string
 test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 60, true, 0], ['interior natural end', 59.999, true, 0],
 	['extended', 75, true, 75], ['old end', 60, false, 75], ['rounded old end', 60.001, false, 60.035], ['short extension', 60.034, true, 60.035],
 	['overlapping extension', 60.035, true, 60.035, 60.02], ['historical range', 60.035, false, 60.035, 0], ['corrected down', 59.8, false, 0],
+	['corrected down terminal', 59.84, false, 59.84, 59.8], ['corrected down terminal replay', 59.84, true, 59.84, 59.8, 59.82],
 	['interior corrected down', 59.8, false, 0], ['interior corrected down rounded', 59.839, false, 59.84],
 	['interior corrected down historical', 59.84, false, 59.84, 59.8], ['interior corrected down replay', 59.84, true, 59.84, 59.8, 59.82],
 	['interior corrected down played', 59.84, true, 59.84], ['interior corrected down played rounded', 59.839, true, 59.84],
-	['interior rounded up', 60, false, 0], ['interior rounded up settled', 60, false, 0, 59.98], ['interior rounded up replay', 60, true, 0, 59.98, 59.99],
+	['interior rounded up', 60, false, 0], ['interior rounded up settled', 60, false, 0, 59.98], ['interior rounded up played', 60, true, 0], ['interior rounded up replay', 60, true, 0, 59.98, 59.99],
 	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
 ] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?, motion?) => {
 	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot, positionState = vi.mocked(session.setPositionState)!;
@@ -236,18 +237,18 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	if (unchanged) Object.assign(audio, { duration: endpoint, ranges: [[0, endpoint]], position: 60 });
 	if (priorStart !== undefined) audio.played = timeRanges([[priorStart, position]]);
 	audio.write.mockImplementationOnce(() => ignored ? undefined : Object.assign(audio,
-		{ position: unchanged || rounded || scenario === 'corrected down' ? 60 : target - 0.000002, seeking: true }));
+		{ position: unchanged || rounded || (corrected && target === endpoint) ? 60 : target - 0.000002, seeking: true }));
 	fire(forward || rounded ? 'seekforward' : 'seekto', { seekTime: target, seekOffset: rounded ? target - audio.position : 100 });
 	expect(audio.write).toHaveBeenLastCalledWith(target);
 	if (forward) expect(get(media.seekFeedback).jumpStatus).toBe(ignored ? 'The player did not accept that jump.' : 'Forward to the end, 1:00.');
 	if (scenario === 'compact') media.seek(get(media.absoluteSeek).attachment, 59.9999995);
-	else if (corrected) Object.assign(audio, { duration: revisedDuration || position, position: scenario.startsWith('interior') ? target : position }).emit('durationchange');
-	if (rounded && priorStart !== undefined) audio.position = priorStart;
+	else if (corrected) Object.assign(audio, { duration: revisedDuration || position, position: 59.8 }).emit('durationchange');
+	if (rounded && scenario !== 'interior rounded up') audio.position = 59.98;
 	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('timeupdate', 'seeked'); }
 	if (revisedDuration && !corrected) Object.assign(audio, { duration: revisedDuration }).emit('durationchange');
 	if (priorStart !== undefined && (corrected || rounded)) Object.assign(audio, { position: motion ?? audio.position }).emit('timeupdate');
-	if (scenario.endsWith('extension') || scenario === 'interior natural end' || (corrected && advances && !motion)) audio.played = timeRanges([[target, corrected ? revisedDuration : position]]);
-	if (rounded && priorStart === undefined) media.setRepeat('one', null);
+	if (scenario.endsWith('extension') || scenario === 'interior natural end' || scenario.includes('played')) audio.played = timeRanges([[corrected || rounded ? audio.position : target, corrected ? revisedDuration : position]]);
+	if (scenario === 'interior rounded up') media.setRepeat('one', null);
 	media.sleepTimer.start({ kind: 'stop-after-tracks', count: 2 }, 'Sleep after two tracks');
 	Object.assign(audio, { position, ended: true, paused: true }).emit('pause', 'ended');
 	await Promise.resolve();
