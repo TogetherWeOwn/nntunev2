@@ -27,7 +27,11 @@
 		'signed-out': 'Sign in to see your invite summary.'
 	};
 	type ReadStatus = keyof typeof readMessages;
-	let summary = $state.raw<{ kind: ReadStatus } | { kind: 'ready'; data: MemberInviteSummary; fence: Fence }>({ kind: 'loading' });
+	let summary = $state.raw<
+		| { kind: 'loading' | 'failed'; fence?: Fence }
+		| { kind: Exclude<ReadStatus, 'loading' | 'failed'>; fence?: never }
+		| { kind: 'ready'; data: MemberInviteSummary; fence: Fence }
+	>({ kind: 'loading' });
 	let reading: AbortController | undefined;
 	let inviteHistory = $state.raw<MemberInviteHistory | null>(null);
 	let historyError = $state<'' | 'failed' | 'denied'>('');
@@ -44,7 +48,7 @@
 		return seconds > 0 && hundredths === 0 ? `<${monthFormat.format(0.01)}` : monthFormat.format(hundredths / 100);
 	}
 
-	function readFailure(cause: unknown): ReadStatus {
+	function readFailure(cause: unknown): Exclude<ReadStatus, 'loading' | 'retry'> {
 		if (cause instanceof ApiError) {
 			if (cause.code === 'account_deleting') return 'deleting';
 			if (cause.status === 401) return 'signed-out';
@@ -61,7 +65,7 @@
 	}
 
 	async function readHistory(fence: Fence) {
-		if (summary.kind !== 'ready' || summary.fence !== fence || historyRead ||
+		if (summary.fence !== fence || historyRead ||
 			historyError === 'denied' || inviteHistory?.next_cursor === null) return;
 		const cursor = inviteHistory?.next_cursor ?? null;
 		const attempt = new AbortController();
@@ -103,14 +107,16 @@
 		}
 	}
 
-	async function readSummary() {
+	async function readSummary(issuedFence?: Fence) {
 		clearHistory();
 		reading?.abort();
 		const attempt = new AbortController();
 		reading = attempt;
-		summary = { kind: 'loading' };
+		summary = { kind: 'loading', fence: issuedFence };
+		// A confirmed issuance can restart history without waiting for the quota refresh.
+		if (issuedFence) void readHistory(issuedFence);
 		try {
-			const fence = await captureAuthFence();
+			const fence = issuedFence ?? await captureAuthFence();
 			const sent = await fence?.run(() => attempt.signal.aborted ? undefined : {
 				result: client.readMemberInvites(attempt.signal).then(
 					(data) => ({ data }), (cause: unknown) => ({ status: readFailure(cause) })
@@ -120,14 +126,24 @@
 			const result = await sent.result;
 			await fence.run(() => {
 				if (attempt.signal.aborted) return;
-				if ('status' in result && (result.status === 'signed-out' || result.status === 'deleting')) clear();
-				summary = 'data' in result ? { kind: 'ready', data: result.data, fence } : { kind: result.status };
-				if (summary.kind === 'ready') void readHistory(fence);
+				if ('data' in result) {
+					summary = { kind: 'ready', data: result.data, fence };
+					if (!issuedFence) void readHistory(fence);
+				} else if (result.status === 'failed') {
+					summary = { kind: 'failed', fence: issuedFence };
+				} else {
+					if (result.status === 'signed-out' || result.status === 'deleting') clear();
+					else clearHistory();
+					summary = { kind: result.status };
+				}
 			});
 		} finally {
 			if (reading === attempt) {
 				reading = undefined;
-				if (summary.kind === 'loading') summary = { kind: 'retry' };
+				if (summary.kind === 'loading') {
+					clearHistory();
+					summary = { kind: 'retry' };
+				}
 			}
 		}
 	}
@@ -179,7 +195,7 @@
 			});
 			if (attempt.signal.aborted) return;
 			if (!invite) throw new Error('Invite was not published');
-			void readSummary();
+			void readSummary(fence);
 			await tick();
 			if (!attempt.signal.aborted) field?.focus();
 		} catch (cause) {
@@ -279,7 +295,7 @@
 			{#if summary.kind === 'signed-out'}
 				<a href="/login">Sign in</a>
 			{:else if summary.kind !== 'loading' && summary.kind !== 'deleting'}
-				<button class="nt-button nt-button--ghost" type="button" onclick={readSummary}>Refresh summary</button>
+				<button class="nt-button nt-button--ghost" type="button" onclick={() => readSummary()}>Refresh summary</button>
 			{/if}
 		{/if}
 	</section>
@@ -305,7 +321,8 @@
 	{/if}
 	<div role="status">{notice}</div>
 	{#if error}<p role="alert">{error}</p>{/if}
-	{#if summary.kind === 'ready'}
+	<!-- Don't show refreshed history until the parallel summary read rules out an access denial. -->
+	{#if summary.kind !== 'loading' && summary.fence}
 		{@const fence = summary.fence}
 		<section aria-labelledby="invite-history-heading">
 			<h2 id="invite-history-heading">Issued invites</h2>

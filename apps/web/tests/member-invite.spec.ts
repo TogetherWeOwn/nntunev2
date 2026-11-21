@@ -261,16 +261,41 @@ const readErrors = [
 	[500, {}, 'Couldn’t load your invite summary.']
 ] as const;
 
-for (const [status, json, detail] of readErrors) test(`handles a ${status} refresh after one issuance`, async ({ page }) => {
+for (const [status, json, detail] of [
+	...readErrors, [403, {}, 'Access to the invite summary was denied.']
+] as const) test(`handles a ${status} refresh after one issuance`, async ({ page }) => {
 	const methods: string[] = [];
-	await page.route(endpoint, (route) => {
+	const queries: string[] = [];
+	const finishSummary = Promise.withResolvers<void>();
+	await page.route(endpoint, async (route) => {
 		methods.push(route.request().method());
-		return methods.length === 3 ? route.fulfill({ status, json }) : mockInvite(route);
+		if (methods.length !== 3) return mockInvite(route);
+		await finishSummary.promise;
+		return route.fulfill({ status, json });
+	});
+	await page.route(historyEndpoint, (route) => {
+		queries.push(new URL(route.request().url()).search);
+		return route.fulfill({ json: queries.length === 1
+			? { invites: [historyRow(1, 'active')], next_cursor: opaqueCursor }
+			: { invites: [historyRow(2, 'redeemed')], next_cursor: null } });
 	});
 	await page.goto('/account/invites');
+	const region = historyRegion(page);
+	await expect(region.getByText('Active', { exact: true })).toBeVisible();
+	const refreshedHistory = page.waitForResponse((response) => historyEndpoint(new URL(response.url())));
 	await page.getByRole('button', { name: 'Create invite' }).click();
+	await refreshedHistory;
+	await expect(region).toHaveCount(0);
+	finishSummary.resolve();
 	await expect(page.getByText(detail, { exact: false })).toBeVisible();
-	await expect(page.getByRole('textbox', { name: 'Signup link' })).toHaveCount(status === 500 ? 1 : 0);
+	await expect(page.getByRole('textbox', { name: 'Signup link' })).toHaveCount(status === 500 || status === 403 ? 1 : 0);
+	if (status === 500) {
+		await expect(region.getByText('Redeemed', { exact: true })).toBeVisible();
+		await expect(region.getByRole('listitem')).toHaveCount(1);
+	} else {
+		await expect(region).toHaveCount(0);
+	}
+	expect(queries).toEqual(['', '']);
 	expect(methods).toEqual(['GET', 'POST', 'GET']);
 });
 
