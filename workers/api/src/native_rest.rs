@@ -454,6 +454,19 @@ pub(crate) fn like_track_target(path: &str) -> Option<&str> {
         .filter(|target| !target.is_empty() && !target.contains('/'))
 }
 
+pub(crate) const ADMIN_INVITE_WINDOWS_PATH: &str = "/v1/admin/invite-windows";
+
+pub(crate) fn admin_invite_window_close_id(path: &str) -> Option<i64> {
+    let id = path
+        .strip_prefix(ADMIN_INVITE_WINDOWS_PATH)?
+        .strip_prefix('/')?
+        .strip_suffix("/close")?;
+    if id.is_empty() || id.starts_with('0') || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    id.parse().ok()
+}
+
 /// The exhaustive default-deny map (ADR 0010). Methods match exact
 /// uppercase (`"get"` fails closed); paths match the listed collection
 /// roots plus subpaths. The HTTP layer passes the path without the query
@@ -519,7 +532,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             // Admin surface (migration 0028): session + fresh DB role,
             // never bearer.
-            if path == "/v1/admin/settings" {
+            if matches!(path, "/v1/admin/settings" | ADMIN_INVITE_WINDOWS_PATH) {
                 return SessionOnly;
             }
             // Admin ingest reads (migration 0034): the exact list path
@@ -599,6 +612,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                         return SessionOnly;
                     }
                 }
+            }
+            if path == ADMIN_INVITE_WINDOWS_PATH || admin_invite_window_close_id(path).is_some() {
+                return SessionOnly;
             }
             // Admin invite writes (migration 0033): issue at the bare
             // path, revoke at `{id}/revoke`. Session-only, like the

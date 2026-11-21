@@ -31,6 +31,9 @@ test('bulk queue activations never write to browser storage', async ({ page }) =
 	await seedLibrary(page);
 	await page.getByTestId('library-item').getByRole('button', { name: 'Star Builder Song' }).click();
 
+	await expect.poll(() => page.evaluate((contextKey) => localStorage.getItem(
+		`nntune.library.favorites.v1.${sessionStorage.getItem(contextKey)}`
+	), AUTH_CONTEXT_KEY)).toBe('["builder-track"]');
 	// Start after fixture writes; keep the real storage methods so even
 	// transient or idempotent persistence during queueing is observable.
 	await page.evaluate(() => {

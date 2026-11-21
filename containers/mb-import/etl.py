@@ -89,6 +89,7 @@ FIELD_COUNTS = {
     "work_alias": 16,
     "work_type": 6,
     "label": 16,
+    "label_alias": 16,
     "label_type": 6,
     "release_label": 5,
 }
@@ -554,6 +555,11 @@ def main() -> int:
                     );
                     CREATE TABLE label_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                     CREATE TABLE label (id INTEGER PRIMARY KEY, gid TEXT NOT NULL UNIQUE, name TEXT NOT NULL, code INTEGER, type_id INTEGER);
+                    CREATE TABLE label_alias (
+                        id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, name TEXT NOT NULL,
+                        locale TEXT NOT NULL, sort_name TEXT NOT NULL, primary_flag TEXT NOT NULL,
+                        name_key TEXT NOT NULL, locale_key TEXT NOT NULL
+                    );
                     CREATE TABLE release_label (id INTEGER PRIMARY KEY, release INTEGER NOT NULL, label INTEGER, number_key TEXT NOT NULL);
                 """)
 
@@ -581,6 +587,7 @@ def main() -> int:
                     (LABEL_ID, LABEL_GID, LABEL_NAME, LABEL_CODE, LABEL_TYPE_ID),
                     "label", "id,gid,name,code,type_id", label_values,
                 )
+                counts["label_alias"] = load_aliases(db, dump_dir, "label")
                 load(
                     db, dump_dir / "release_label", FIELD_COUNTS["release_label"],
                     (RELEASE_LABEL_ID, RELEASE_LABEL_RELEASE_ID, RELEASE_LABEL_LABEL_ID, RELEASE_LABEL_CATNO),
@@ -765,7 +772,7 @@ def main() -> int:
                     entity_id, resolved_id = bad_recording_alias
                     reason = "missing recording" if resolved_id is None else "invalid recording id"
                     raise ValueError(f"recording_alias references {reason} {entity_id}")
-                for entity in ("release", "release_group", "work"):
+                for entity in ("release", "release_group", "work", "label"):
                     missing_alias_parent = db.execute(f"""
                         SELECT al.entity FROM {entity}_alias al LEFT JOIN {entity} e ON e.id=al.entity
                         WHERE e.id IS NULL LIMIT 1
@@ -1135,6 +1142,7 @@ def main() -> int:
                     ORDER BY l.id
                 """
                 label_count = insert_select(db, label_query, output_dir / curated_name("label"), updated_at)
+                label_alias_count = project_aliases(db, "label", output_dir, updated_at)
 
                 # An absent label is not an edge. A real label with no number
                 # uses empty text. Sort and deduplicate before re-escaping COPY.
@@ -1171,6 +1179,7 @@ def main() -> int:
                     ("release_alias", counts["release_alias"], release_alias_count),
                     ("release_group_alias", counts["release_group_alias"], release_group_alias_count),
                     ("work_alias", counts["work_alias"], work_alias_count),
+                    ("label_alias", counts["label_alias"], label_alias_count),
                     ("recording_alias", counts["recording_alias"], recording_alias_count),
                     ("artist_url", counts["l_artist_url"], artist_url_count),
                     ("recording_url", counts["l_recording_url"], recording_url_count),
@@ -1204,7 +1213,7 @@ def main() -> int:
 
         print(f"etl: published {snapshot_name} via curated (artist={artist_count}, artist_alias={artist_alias_count}, release_group={release_group_count}, release={release_count}, release_credit={release_credit_count}, recording={recording_count}, track={track_count}, url={url_count}, artist_url={artist_url_count}, recording_url={recording_url_count}, recording_music_video={music_video_count}, recording_isrc={isrc_count}, work={work_count}, recording_work={recording_work_count}, "
               f"recording_alias={recording_alias_count}, release_alias={release_alias_count}, release_group_alias={release_group_alias_count}, "
-              f"work_alias={work_alias_count}, label={label_count}, release_label={release_label_count}, "
+              f"work_alias={work_alias_count}, label={label_count}, label_alias={label_alias_count}, release_label={release_label_count}, "
               f"recording_recording={recording_recording_count})")
         return 0
     except (OSError, sqlite3.Error, ValueError) as exc:
