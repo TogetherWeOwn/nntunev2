@@ -31,11 +31,16 @@ CREATE TABLE public.ingest_session_reservations (
     UNIQUE (library_id, principal_id, idempotency_key)
 );
 
--- Intent only, for the existing ingest queue. Not a delivery or deletion receipt.
--- Keep intent identities across replay; later dispatch state must not replace them.
+-- Durable intent and queue handoff state, never a deletion receipt.
+-- Keep the intent identity and due time unchanged across dispatch attempts.
 CREATE TABLE public.ingest_session_cleanup_intents (
     session_id UUID NOT NULL REFERENCES public.ingest_session_reservations (id),
     kind TEXT NOT NULL CHECK (kind IN ('absolute_expiry', 'terminal_reconcile')),
     due_at TIMESTAMPTZ NOT NULL,
+    delivery_claim_id UUID,
+    claimed_until TIMESTAMPTZ,
+    enqueued_at TIMESTAMPTZ,
+    CHECK ((delivery_claim_id IS NULL) = (claimed_until IS NULL)),
+    CHECK (enqueued_at IS NULL OR delivery_claim_id IS NULL),
     PRIMARY KEY (session_id, kind)
 );
