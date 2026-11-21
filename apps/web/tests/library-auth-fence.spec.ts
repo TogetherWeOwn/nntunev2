@@ -43,7 +43,7 @@ test('a closed writer and verifier outage allow Retry; replacement retires local
 		};
 		return { settled: failed.promise };
 	}, favoritesKey);
-	await page.getByRole('button', { name: 'Unstar Scoped track', exact: true }).click();
+	await page.getByTestId('favorites-section').getByRole('button', { name: 'Unstar Scoped track', exact: true }).click();
 	await failedSave.evaluate(({ settled }) => settled);
 	failNext = true;
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
@@ -94,26 +94,32 @@ test('a closed writer and verifier outage allow Retry; replacement retires local
 
 for (const view of ['Home', 'Albums', 'Artists']) {
 	test(`a verifier outage offers Retry in ${view}`, async ({ page }) => {
-		const fail = Promise.withResolvers<void>();
+		const fail = Promise.withResolvers<void>(), checking = Promise.withResolvers<void>();
 		let attempts = 0;
 		await page.route('**/api/library', (r) => r.fulfill({ headers: { 'x-nntune-session-binding': current },
 			json: [{ id: 'track', title: 'Scoped track' }] }));
 		await page.route('**/v1/me/likes/session', async (r) => {
 			if (++attempts > 1) return r.fulfill({ json: { session_binding: current } });
+			checking.resolve();
 			await fail.promise;
 			return r.fulfill({ status: 503, json: {} });
 		});
 		const home = view === 'Home';
-		await page.route('**/v1/releases', (r) => r.fulfill({ json: [] }));
-		await page.route('**/v1/artists', (r) => r.fulfill({ json: [] }));
+		const mbid = '11111111-1111-4111-8111-000000000001';
+		await page.route('**/v1/releases', (r) => r.fulfill({ json: [{ mbid, title: 'Scoped album', release_type: 'Album' }] }));
+		await page.route('**/v1/artists', (r) => r.fulfill({ json: [{ mbid, name: 'Scoped artist' }] }));
 		await page.goto(home ? '/home' : '/library');
 		if (!home) await page.getByRole('button', { name: view, exact: true }).click();
+		const row = page.getByText(home ? 'Scoped track' : view === 'Albums' ? 'Scoped album' : 'Scoped artist', { exact: true });
+		const collections = page.getByRole('region', { name: 'Library collections' });
+		await checking.promise;
+		await expect(collections).toHaveCount(0);
+		await expect(row).toHaveCount(0);
 		fail.resolve();
 		await expect(page.getByRole('alert')).toContainText('Could not verify your library session');
-		await expect(page.getByText('Scoped track', { exact: true })).toHaveCount(0);
-		await expect(page.getByRole('region', { name: 'Library collections' })).toHaveCount(0);
+		await expect(row).toHaveCount(0);
+		await expect(collections).toHaveCount(0);
 		await page.getByRole('button', { name: 'Retry', exact: true }).click();
-		if (home) await expect(page.getByText('Scoped track', { exact: true })).toBeVisible();
-		else await expect(page.getByText(`No ${view.toLowerCase()} in the loaded results.`)).toBeVisible();
+		await expect(row).toBeVisible();
 	});
 }

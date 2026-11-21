@@ -34,7 +34,7 @@
 		saveRecentFinds
 	} from '#lib/library/recent-finds.js';
 	import { moveFavoriteId, type FavoriteMoveDirection } from '#lib/library/favorites-order.js';
-	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import { createLibraryRefresher, type LibraryRefreshUpdate } from '#lib/library/refresh.js';
 	import {
 		displayArtist,
 		displayTitle,
@@ -95,8 +95,8 @@
 	let collectionFilter = $state<CollectionFilter | 'tracks'>('tracks');
 	const showingTracks = $derived(collectionFilter === 'tracks');
 	let collectionsAccessRevoked = $state(false);
-	let verificationSuspended = $state(false);
-	const showRecovery = $derived(showingTracks || verificationSuspended);
+	let collectionReceipt = $state<LibraryRefreshUpdate['runIfCurrent']>();
+	const showRecovery = $derived(showingTracks || (!collectionReceipt && !collectionsAccessRevoked));
 
 	function readStoredDensity(): Density {
 		try {
@@ -330,11 +330,11 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
-		onStateChange: (state, { isCurrent, authoritative, authBoundary }) => {
+		onStateChange: (state, { isCurrent, authoritative, authBoundary, runIfCurrent }) => {
 			if (!isCurrent()) return;
-			verificationSuspended = !!state.verificationSuspended;
-			const revoked = authBoundary && !verificationSuspended;
-			if (authBoundary || (authoritative && !state.libraryUnavailable)) collectionsAccessRevoked = revoked;
+			collectionReceipt = runIfCurrent;
+			const revoked = authBoundary && !state.verificationSuspended;
+			collectionsAccessRevoked = revoked;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -1560,8 +1560,16 @@
 				onclick={() => { collectionFilter = type; }}>{label}</button>
 		{/each}
 	</div>
-	{#if collectionFilter !== 'tracks' && !verificationSuspended}
-		<CollectionBrowser filter={collectionFilter} accessRevoked={collectionsAccessRevoked} />
+	{#if collectionFilter !== 'tracks' && (collectionReceipt || collectionsAccessRevoked)}
+		<CollectionBrowser filter={collectionFilter} accessRevoked={collectionsAccessRevoked}
+			runIfCurrent={collectionReceipt} reverify={refreshFromButton} />
+	{:else if !showingTracks && (loading ? items.length > 0 : libraryUnavailable || staleAt)}
+		{#if loading}
+			<p role="status">Loading your library…</p>
+		{:else}
+			<p role="status">Library listing is not available yet.</p>
+			<button class="nt-button" type="button" onclick={() => void refreshFromButton()}>Retry</button>
+		{/if}
 	{/if}
 
 	{#if shareInvalid}

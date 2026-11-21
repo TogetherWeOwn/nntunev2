@@ -39,6 +39,8 @@ export interface LibraryRefreshUpdate {
 	authBoundary: boolean;
 	sessionBinding?: string; // Verified label for the rows, not import provenance.
 	deviceScope?: string; // Exact localStorage key eligible for the verified binding.
+	/** Run collection dispatch/publication under the same receipt as the verified listing. */
+	runIfCurrent?: <T>(work: () => T) => Promise<T | undefined>;
 }
 
 export interface LibraryRefresherDeps {
@@ -236,7 +238,11 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const fence = authenticatedThisLoad ? verified?.fence : undefined;
 			deps.onStateChange?.(state, {
 				isCurrent: () => isCurrent() && (!fence || fence.isCurrent()),
-				authoritative, authBoundary: false, sessionBinding, deviceScope
+				authoritative, authBoundary: false, sessionBinding, deviceScope,
+				runIfCurrent: authoritative && authenticatedThisLoad ? async (work) => {
+					const commit = () => isCurrent() ? work() : undefined;
+					return fence ? fence.run(commit) : commit(); // Headerless test fixtures only.
+				} : undefined
 			});
 		}
 
@@ -348,15 +354,16 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			});
 			if (!fence || !started) { refuse(); return; }
 			const matches = await started.result;
-			if (!await fence.run(() => {
-				if (!isCurrent() || controller.signal.aborted) return true;
+			const finalCommit = fence.run(() => {
+				if (!isCurrent() || controller.signal.aborted) return;
 				if (!matches) return refuse(true);
 				const deviceScope = establishVerifiedLibraryScope(storage, label);
 				verified = { binding: label, fence };
 				commit();
 				publish(label, deviceScope);
 				return true;
-			})) refuse();
+			});
+			if (!await Promise.race([finalCommit, timeout, aborted])) refuse();
 		} catch {
 			if (!isCurrent()) return;
 			if (state.verificationSuspended || binding !== null) return void refuse();

@@ -73,9 +73,9 @@ test('retries collection reads and renders single, empty and sign-in states', as
 });
 
 for (const boundary of [401, 403, 'cross-tab', 'filter'] as const) {
-	test(`discards an outstanding release response after ${boundary}`, async ({ page }) => {
+	test(`withholds collection rows across ${boundary}`, async ({ page }) => {
 		const tracksStatus = Promise.withResolvers<number>();
-		await page.route('**/api/library', async (route) => route.fulfill({ status: await tracksStatus.promise, json: [] }));
+		await page.route('**/api/library', async (route) => route.fulfill({ status: typeof boundary === 'number' ? await tracksStatus.promise : 200, json: [] }));
 		await page.route('**/v1/artists', (route) => route.fulfill({ json: [{ mbid: mbid(1), name: 'North' }] }));
 		await page.goto('/library');
 		const late = await page.evaluateHandle(() => {
@@ -90,9 +90,15 @@ for (const boundary of [401, 403, 'cross-tab', 'filter'] as const) {
 		});
 		const { choose, region } = controls(page);
 		await choose('Albums');
+		if (typeof boundary === 'number') {
+			await expect(region).toHaveCount(0);
+			tracksStatus.resolve(boundary);
+			await expect(region.getByRole('link', { name: 'Sign in' })).toBeVisible();
+			expect(await late.evaluate((read) => read.pending())).toBe(false);
+			return;
+		}
 		await region.getByRole('searchbox').fill('North');
 		await expect.poll(() => late.evaluate((read) => read.pending())).toBe(true);
-		tracksStatus.resolve(typeof boundary === 'number' ? boundary : 200);
 		if (boundary === 'cross-tab') await crossTabReset(page);
 		if (boundary === 'filter') await choose('Artists');
 		await expect.poll(() => late.evaluate((read) => read.aborted())).toBe(true);

@@ -11,13 +11,16 @@ function storage() {
 	return { getItem: (key: string) => map.get(key) ?? null, setItem: (key: string, value: string) => { map.set(key, value); },
 		removeItem: (key: string) => { map.delete(key); } };
 }
-function setup() {
+function setup(finalAdmission?: () => Promise<void>) {
 	const local = storage(), session = storage();
 	vi.stubGlobal('window', { localStorage: local, sessionStorage: session });
 	vi.stubGlobal('caches', { keys: async () => [] });
-	let writerHeld = false;
+	let writerHeld = false, reads = 0;
 	vi.stubGlobal('navigator', { locks: { async request<T>(name: string, options: LockOptions | LockGrantedCallback<T>, read: LockGrantedCallback<T>) {
-		if (typeof options !== 'function') return read(writerHeld ? null : {} as Lock);
+		if (typeof options !== 'function') {
+			if (++reads === 3) await finalAdmission?.();
+			return read(writerHeld ? null : {} as Lock);
+		}
 		writerHeld = name === AUTH_LOCK;
 		try { return await options({} as Lock); } finally { writerHeld = false; }
 	} } });
@@ -32,7 +35,25 @@ function setup() {
 	}));
 	return { local, session, verify, refresh, refresher, update: () => update, onAccessRefused };
 }
-afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+
+it('suspends a verified refresh when final lock admission exceeds the deadline', async () => {
+	vi.useFakeTimers();
+	const requested = Promise.withResolvers<void>(), admitted = Promise.withResolvers<void>();
+	const { refresh, refresher, session, update } = setup(() => { requested.resolve(); return admitted.promise; });
+	const pending = refresh();
+	try {
+		await Promise.race([requested.promise, pending.then(() => { throw new Error('No final lock requested'); })]);
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(refresher.state).toMatchObject({ loading: false, items: [], verificationSuspended: true });
+	} finally {
+		admitted.resolve();
+		await pending;
+	}
+	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
+	await refresh();
+	expect(update().sessionBinding).toBe(label);
+});
 
 it.each([200, 401, 403, 0])('withholds a stale result (%i) without purging its scope', async (status) => {
 	const { local, session, verify, refresh, update, refresher, onAccessRefused } = setup();
