@@ -871,12 +871,6 @@
 		return editFavorites((latest) => pressed ? [...new Set([...latest, id])] : latest.filter((favorite) => favorite !== id), undefined, undefined, playerWrite);
 	}
 
-	function readPlayerFavorites(id: string) {
-		return shareAlive && favoritesInitialized && !listingUnavailable && queueController.hasLibraryTrack(id) &&
-			favoritesKey(browserStorage('session')) === favoritesAuthKey
-			? { pressed: favoriteIds.has(id), edit: currentFavoriteEdit } : null;
-	}
-
 	function toggleFavorite(id: string): void {
 		const remove = favorites.includes(id);
 		void setFavorite(id, !remove);
@@ -1528,9 +1522,12 @@
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
+		const readPlayerFavorites = (id: string) => shareAlive && favoritesInitialized && !libraryUnavailable && loadError === null &&
+			queueController.hasLibraryTrack(id) && favoritesKey(browserStorage('session')) === favoritesAuthKey
+				? { pressed: favoriteIds.has(id), edit: currentFavoriteEdit, loading } : null;
 		const releaseFavoriteAction = player.currentFavorite.bind({
 			read: readPlayerFavorites,
-			write: (id, pressed) => readPlayerFavorites(id) ? setFavorite(id, pressed, true) : Promise.resolve(null)
+			write: async (id, pressed) => readPlayerFavorites(id)?.loading === false ? setFavorite(id, pressed, true) : null
 		});
 		disposeRoute = () => {
 			releaseFavoriteAction();

@@ -8,7 +8,7 @@ const favoritesBase = 'nntune.library.favorites.v1';
 const row = (page: Page, id: string) => page.locator(`[data-testid="library-item"][data-id="${id}"]`);
 const queueRow = (page: Page, id: string) => page.locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
 const favorite = (page: Page) => page.getByTestId('player-favorite');
-const feedback = (page: Page) => page.getByTestId('player-favorite-status');
+const feedback = (page: Page) => page.getByTestId('player-favorite-status').and(page.locator('[aria-live="polite"]'));
 const scope = (page: Page) => page.evaluate((key) => sessionStorage.getItem(key), contextKey);
 const star = (parent: Locator, track = north) => parent.getByRole('button', { name: new RegExp(`^(Unstar|Star) ${track.title}$`) });
 async function openLibrary(page: Page) {
@@ -31,24 +31,26 @@ async function holdWrites(page: Page, refuseNorth = false) {
 			ready(() => { release(); return navigator.locks.request(key, () => {}); })));
 	}), { key: `${favoritesBase}.${await scope(page)}`, refuseNorth, id: north.id });
 }
-for (const scenario of ['append', 'refusal then save', 'membership round trip', 'leave and return']) {
+for (const scenario of ['append then Refresh', 'refusal then save', 'membership round trip', 'leave and return']) {
 	test(`held Favorite write: ${scenario}`, async ({ page }) => {
 		await openLibrary(page);
-		const refused = scenario === 'refusal then save';
+		const refused = scenario === 'refusal then save', refreshing = scenario === 'append then Refresh';
+		const refresh = Promise.withResolvers<void>();
 		const [decoder, ownerScope] = await Promise.all([page.getByTestId('audio-player').elementHandle(), scope(page)]);
 		const queueStar = star(queueRow(page, north.id));
 		const southStar = star(row(page, south.id), south);
-		if (refused) {
-			await southStar.click();
-			await expect.poll(() => stored(page)).toBe(JSON.stringify([south.id]));
-		}
+		if (refused) await southStar.click();
 		const release = await holdWrites(page, refused);
+		expect(await stored(page)).toBe(refused ? JSON.stringify([south.id]) : null);
 		await favorite(page).press('Space');
 		await expect(queueStar).toHaveAttribute('aria-pressed', 'true');
-		if (scenario === 'append') {
+		if (refreshing) {
 			await row(page, east.id).getByTestId('track-more').click();
 			await page.getByRole('menuitem', { name: 'Add to queue', exact: true }).click();
 			await expect(queueRow(page, east.id)).toBeVisible();
+			await page.route('**/api/library', (route) => refresh.promise.then(() => route.fallback()), { times: 1 });
+			await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+			await expect(favorite(page)).toHaveCount(0);
 		} else if (scenario === 'membership round trip') {
 			await queueStar.click();
 			await star(row(page, north.id)).click();
@@ -67,9 +69,11 @@ for (const scenario of ['append', 'refusal then save', 'membership round trip', 
 		}
 		const left = scenario === 'leave and return';
 		expect([await stored(page), await scope(page)]).toEqual([refused ? '[]' : left ? null : JSON.stringify([north.id]), ownerScope]);
+		if (refreshing) await expect(feedback(page)).toBeEmpty();
+		refresh.resolve();
 		for (const control of [favorite(page), queueStar, star(row(page, north.id))])
 			await expect(control).toHaveAttribute('aria-pressed', String(!left));
-		await expect(feedback(page)).toHaveText(refused ? 'Starred North Wind for this visit.' : scenario === 'append' ? 'Starred North Wind.' : '');
+		await expect(feedback(page)).toHaveText(refused ? 'Starred North Wind for this visit.' : refreshing ? 'Starred North Wind.' : '');
 		await expect(page.getByTestId('now-playing')).toContainText(north.title);
 		await expect(page.getByTestId('player-next')).toBeEnabled();
 		expect(await page.getByTestId('audio-player').evaluate((node, original) => node === original, decoder)).toBe(true);

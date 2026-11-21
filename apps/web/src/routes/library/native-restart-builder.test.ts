@@ -100,7 +100,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			player.media.clearShareSeek = () => { onClear(); clear(); };
 			return Object.assign(player, { currentFavorite: { bind: () => () => {} } });
 		},
-		tick, window: { location }, element, track, capture, readPlayerFavorites: () => null
+		tick, window: { location }, element, track, capture
 	};
 	const page = new Function(...Object.keys(bindings), `
 		let items = [track], queue = createQueue(items);

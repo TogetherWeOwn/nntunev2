@@ -5,7 +5,7 @@
 	let { currentFavorite, snapshot }: { currentFavorite: ReturnType<typeof createCurrentTrackFavorite>; snapshot: QueueState } = $props();
 	const target = $derived(currentFavorite.view(snapshot));
 	const feedback = $derived(currentFavorite.feedback(target));
-	$effect(() => { if (!feedback) currentFavorite.clearFeedback(); });
+	$effect(() => currentFavorite.reconcileFeedback(target));
 	const activateRendered: Action<HTMLButtonElement, NonNullable<typeof target>> = (button, rendered) => {
 		const listeners = new AbortController();
 		const capture = { capture: true, signal: listeners.signal };
@@ -71,7 +71,7 @@
 		return { update(next) { rendered = next; }, destroy() { clearSpace(); listeners.abort(); } };
 	};
 </script>
-{#if target}
+{#if target && !target.loading}
 	<button type="button" class="nt-button nt-button--ghost" data-testid="player-favorite"
 		aria-label={`Favorite ${target.title}`} aria-pressed={target.pressed} use:activateRendered={target}>
 		<span aria-hidden="true">{target.pressed ? '★' : '☆'}</span> Favorite

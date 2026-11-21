@@ -3,7 +3,7 @@ import { currentTrack, type QueueState } from './queue.js';
 import type { createQueueController } from './queueController.js';
 
 export type FavoriteWrite = 'saved' | 'visit' | null;
-type Membership = { pressed: boolean; edit: number };
+type Membership = { pressed: boolean; edit: number; loading: boolean };
 type FavoriteOwner = { read(id: string): Membership | null; write(id: string, pressed: boolean): Promise<FavoriteWrite> };
 type Selection = Membership & { id: string; receipt: string };
 
@@ -18,32 +18,33 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 		return () => { if (owner === binding) { owner = null; outcome = null; } };
 	}
 	function view(snapshot: QueueState) {
-		const binding = owner;
-		const track = currentTrack(snapshot);
-		const generation = queue.selectionGeneration;
+		const binding = owner, track = currentTrack(snapshot), generation = queue.selectionGeneration;
 		if (!binding || !track || queue.purging || snapshot !== queue.snapshot || !queue.isCurrent(queue.revision)) return null;
 		const membership = binding.member.read(track.id);
 		if (!membership || binding !== owner || queue.purging || queue.selectionGeneration !== generation) return null;
-		const { pressed, edit } = membership;
-		return { pressed, edit, id: track.id, title: displayTitle(track), receipt: `${binding.version}:${generation}` };
+		return { ...membership, id: track.id, title: displayTitle(track), receipt: `${binding.version}:${generation}` };
 	}
 	const matches = (current: Selection | null, previous: Selection) => current?.receipt === previous.receipt &&
 		current.id === previous.id && current.edit === previous.edit && current.pressed === previous.pressed;
 	async function activate(intent: Selection): Promise<void> {
 		const target = view(queue.snapshot);
-		if (!owner || !target || !matches(target, intent)) return;
+		if (!owner || !target || target.loading || !matches(target, intent)) return;
 		const pressed = !target.pressed;
 		const pending = owner.member.write(target.id, pressed);
 		// The owner publishes the optimistic membership before awaiting the scoped lock.
 		const applied = view(queue.snapshot);
 		const result = await pending;
-		if (!result || !applied || applied.receipt !== intent.receipt || applied.id !== intent.id ||
-			applied.pressed !== pressed || !matches(view(queue.snapshot), applied)) return;
-		outcome = { ...applied, text: `${pressed ? 'Starred' : 'Unstarred'} ${target.title}${result === 'visit' ? ' for this visit' : ''}.` };
+		const completed = view(queue.snapshot);
+		if (!result || !applied || !completed || applied.receipt !== intent.receipt || applied.id !== intent.id ||
+			applied.pressed !== pressed || !matches(completed, applied)) return;
+		outcome = { ...completed, text: `${pressed ? 'Starred' : 'Unstarred'} ${target.title}${result === 'visit' ? ' for this visit' : ''}.` };
 	}
 	return {
 		bind, view, activate,
-		clearFeedback: () => { outcome = null; },
-		feedback: (target: Selection | null) => outcome && matches(target, outcome) ? outcome : null
+		reconcileFeedback(target: Selection | null) {
+			if (outcome && !matches(target, outcome)) outcome = null;
+			else if (outcome?.loading && target && !target.loading) outcome = { ...outcome, loading: false };
+		},
+		feedback: (target: Selection | null) => outcome && !outcome.loading && matches(target, outcome) ? outcome : null
 	};
 }
