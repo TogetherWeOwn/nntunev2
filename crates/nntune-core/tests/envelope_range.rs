@@ -44,7 +44,15 @@ fn enrolled_key_envelope_and_range_compose() {
     );
     let unwrapped = unwrap_scheme2(&root, &context, &envelope).unwrap();
     let key = FileKey::from_bytes(*unwrapped);
-    let mut range = DigestRange::new(&manifest, &key, 65_530, 65_545).unwrap();
+    let mut range = DigestRange::from_enrolled(
+        &manifest,
+        &root,
+        &context,
+        &envelope,
+        &envelope,
+        65_530..65_545,
+    )
+    .unwrap();
     assert_eq!(range.next_indices(), Some((0, 0)));
     let first = range
         .open_next(0, &pages[0], chunks[0].clone(), Some(&header))
@@ -74,6 +82,17 @@ fn enrolled_key_envelope_and_range_compose() {
     ));
     let mut tampered_envelope = envelope;
     tampered_envelope[200] ^= 1;
+    assert!(matches!(
+        DigestRange::from_enrolled(
+            &manifest,
+            &root,
+            &context,
+            &envelope,
+            &tampered_envelope,
+            65_530..65_545,
+        ),
+        Err(RangeError::Envelope(EnrolledEnvelopeError::Mismatch))
+    ));
     assert!(matches!(
         unwrap_scheme2(&root, &context, &tampered_envelope),
         Err(EnvelopeError::Authentication)

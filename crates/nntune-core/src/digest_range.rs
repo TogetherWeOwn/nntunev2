@@ -7,8 +7,10 @@ pub use crate::digest_chunk::OpenPart;
 use crate::digest_chunk::{open_chunk_part, ChunkError};
 use crate::digest_cursor::{CursorError, RangeCursor};
 use crate::digest_enrollment::OriginManifest;
+use crate::digest_geometry::RangeGeometry;
 use crate::digest_verifier::PageError;
 use crate::media::{FileKey, Header, KeyMode, Profile, VerifiedHeader};
+use crate::media_envelope::{enrolled_scheme2_key, EnrolledEnvelopeError, EnvelopeContext};
 
 #[cfg(test)]
 #[path = "digest_range_tests.rs"]
@@ -19,15 +21,21 @@ pub enum RangeError {
     InvalidRange,
     InvalidChunk,
     Header,
+    Envelope(EnrolledEnvelopeError),
     Page(PageError),
     DigestMismatch,
     Authentication,
 }
 
+enum RangeKey<'a> {
+    Borrowed(&'a FileKey),
+    Enrolled(FileKey),
+}
+
 /// Sequential range cursor, retaining no page or plaintext between calls.
 pub struct DigestRange<'a> {
     manifest: &'a OriginManifest,
-    key: &'a FileKey,
+    key: RangeKey<'a>,
     cursor: RangeCursor,
     range: std::ops::Range<u64>,
 }
@@ -47,12 +55,56 @@ impl<'a> DigestRange<'a> {
         let header = Header::from_bytes(manifest.header_bytes());
         VerifiedHeader::verify(&Profile::nntune(), KeyMode::Random, key, &header)
             .map_err(|_| RangeError::Header)?;
-        Ok(Self {
+        Ok(Self::with_key(
+            manifest,
+            RangeKey::Borrowed(key),
+            plan,
+            start..end,
+        ))
+    }
+
+    /// Open a range against independently authorized custody and the origin
+    /// manifest. The checked key stays inside this cursor, not with the caller.
+    pub fn from_enrolled(
+        manifest: &'a OriginManifest,
+        authorized_root: &[u8; 32],
+        context: &EnvelopeContext,
+        trusted_record: &[u8; 230],
+        retained_record: &[u8],
+        range: std::ops::Range<u64>,
+    ) -> Result<Self, RangeError> {
+        let plan = manifest
+            .geometry()
+            .range(range.start, range.end)
+            .ok_or(RangeError::InvalidRange)?;
+        let key = enrolled_scheme2_key(
+            authorized_root,
+            context,
+            trusted_record,
+            retained_record,
+            manifest,
+        )
+        .map_err(RangeError::Envelope)?;
+        Ok(Self::with_key(
+            manifest,
+            RangeKey::Enrolled(key),
+            plan,
+            range,
+        ))
+    }
+
+    fn with_key(
+        manifest: &'a OriginManifest,
+        key: RangeKey<'a>,
+        plan: RangeGeometry,
+        range: std::ops::Range<u64>,
+    ) -> Self {
+        Self {
             manifest,
             key,
             cursor: RangeCursor::new(plan),
-            range: start..end,
-        })
+            range,
+        }
     }
 
     /// The next chunk and page indices, or `None` after completion/failure.
@@ -75,7 +127,10 @@ impl<'a> DigestRange<'a> {
             .advance(index, || {
                 open_chunk_part(
                     self.manifest,
-                    self.key,
+                    match &self.key {
+                        RangeKey::Borrowed(key) => key,
+                        RangeKey::Enrolled(key) => key,
+                    },
                     self.range.clone(),
                     index,
                     page,
