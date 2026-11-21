@@ -65,8 +65,9 @@ while IFS=$'\t' read -r target name; do
 done < "$tmp/migrations"
 
 fixtures="$root/workers/api/tests/fixtures"
-# psql receives quoted values, then runs the rehearsal in its disposable app DB only.
-psql_run -d nntune_app_ci \
+# Commit multi-session fixtures only in a throwaway clone; the meter test uses the original.
+psql_run -d nntune_ci -c 'CREATE DATABASE nntune_playlist_ci TEMPLATE nntune_app_ci'
+psql_run -d nntune_playlist_ci \
   -v corpus="$(<"$fixtures/legacy-playlists-v1.json")" \
   -v playlist_schema="$(<"$fixtures/private_playlist_schema.sql")" \
   -v playlist_crud="$(<"$fixtures/private_playlist_crud.sql")" \

@@ -10,7 +10,6 @@ CREATE TABLE public.playlist_tracks (
 );
 CREATE INDEX ON public.playlist_tracks (track_id);
 CREATE INDEX ON public.playlist_tracks (playlist_id, track_id);
-CREATE UNIQUE INDEX ON public.playlist_tracks (playlist_id, track_id) WHERE NOT is_legacy;
 
 -- The caller supplies an explicit, trusted mapping. There is no fallback from
 -- a legacy ref to a canonical id, including when the ref resembles a track id.
