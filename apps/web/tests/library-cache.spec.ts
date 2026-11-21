@@ -393,7 +393,7 @@ test('blocked storage retains a fresh list as stale after a failed refresh', asy
 	await expect(page.getByRole('alert')).toHaveCount(0);
 });
 
-test('blocked storage still shows the signed-out state on 401', async ({ page }) => {
+test('a 401 without an auth receipt withholds the library and offers Retry', async ({ page }) => {
 	await blockStorage(page);
 	await page.route('**/api/library', (route) =>
 		route.fulfill({
@@ -405,7 +405,8 @@ test('blocked storage still shows the signed-out state on 401', async ({ page })
 
 	await page.goto('/library');
 
-	await expect(page.getByRole('alert')).toContainText(/signed out|do not have access/i);
+	await expect(page.getByRole('alert')).toContainText('Could not verify your library session');
+	await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 });
 

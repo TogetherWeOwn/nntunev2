@@ -1,7 +1,7 @@
 import { expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import { get } from 'svelte/store';
-import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
+import { addTrack, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle, shortTitle } from '#lib/library/order.js';
 import { onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js';
@@ -21,8 +21,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clipboardWriter', 'copyTrackLink',
-		'applyShareLink', 'selectQueuedTrack', 'removeQueuedTrack',
-		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
+		'applyShareLink', 'selectQueuedTrack', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'resetShareAtAuthBoundary', 'onRepeatChange', 'playQueuedTrack'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
@@ -81,8 +80,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	let onInvalidateBrowseCopy = () => {};
 	const routeCleanup: string[] = [];
 	const bindings = {
-		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
-		selectQueueIndex: selectTrack, removeTrack,
+		addTrack, clearUpcoming, createQueue, keepCurrentAndUpcoming,
+		selectQueueIndex: selectTrack,
 		resolveStreamUrl, displayArtist, displayTitle, shortTitle, resolveShareTarget, get,
 		buildShareQuery, queueCurrentTrack: currentTrack, navigator: { clipboard },
 		$state: { raw: <T>(value: T) => value },
@@ -137,8 +136,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 				if (queueChanged) throw new Error('Expected a same-object refresh');
 			}),
 			readCopy: () => ({ browse: player.browseCopy.feedback, queue: queueShareOutcome }),
-			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
-			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
+			select: selectQueuedTrack, remove: player.removeQueuedTrack, playQueued: playQueuedTrack,
+			move: player.moveQueuedTrack, clear: player.clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
 			seeking: (target = element) => capture('seeking')(target), replaceQueue,
 			subscribe: queueController.subscribe, attach: media.attach, currentAudio: () => media.audio,

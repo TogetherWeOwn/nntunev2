@@ -259,6 +259,22 @@ function isInviteWindow(value: unknown): value is InviteWindow {
 const invalidInviteWindows = (status: number) =>
 	new ApiError(status, 'request_failed', 'Invalid invite window response', null, false);
 
+export const ADMIN_INVITE_LIMIT = 200;
+export const INVITE_STATUSES = ['active', 'expired', 'redeemed', 'revoked'] as const;
+type InviteStatus = (typeof INVITE_STATUSES)[number];
+export type AdminInvite = { id: number; status: InviteStatus; issued_by: string | null; expires_at: number };
+export type AdminInviteFilter = { status: InviteStatus } | { issuer: string } | null;
+const ADMIN_INVITES = '/v1/admin/invites';
+const invalidAdminInvites = (status: number) => new ApiError(status, 'request_failed', 'Invalid invite ledger response');
+const isInviteId = (id: unknown): id is number => typeof id === 'number' && Number.isSafeInteger(id) && id > 0;
+// Account IDs are minted from 16 random bytes in unpadded base64url.
+export const isInviteIssuerId = (id: unknown): id is string => typeof id === 'string' && /^[A-Za-z0-9_-]{22}$/.test(id);
+function isAdminInvite(value: unknown): value is AdminInvite {
+	const row = value as Partial<AdminInvite> | null;
+	return row != null && isInviteId(row.id) && row.status !== undefined && INVITE_STATUSES.includes(row.status) &&
+		(row.issued_by === null || isInviteIssuerId(row.issued_by)) && isEpoch(row.expires_at);
+}
+
 export const INVITE_POLICY_BOUNDS = {
 	invite_member_min_paid_months: [0, 600],
 	invite_member_per_window: [0, 10_000],
@@ -274,7 +290,7 @@ export function isInvitePolicyValue(key: InvitePolicyKey, value: unknown): value
 const invalidAdminSettings = (status: number) =>
 	new ApiError(status, 'request_failed', 'Invalid admin settings response');
 
-export interface IssuedMemberInvite {
+export interface IssuedInvite {
 	code: string;
 	expires_at: number;
 }
@@ -402,6 +418,47 @@ export class ApiClient {
 		return row;
 	}
 
+	async listAdminInvites(filter: AdminInviteFilter, signal: AbortSignal): Promise<AdminInvite[]> {
+		let path = ADMIN_INVITES;
+		if (filter && 'issuer' in filter) {
+			if (!isInviteIssuerId(filter.issuer)) throw new TypeError('Invalid issuer user ID');
+			path += `/issuer/${filter.issuer}`;
+		} else if (filter) {
+			if (!INVITE_STATUSES.includes(filter.status)) throw new TypeError('Invalid invite status');
+			path += `/status/${filter.status}`;
+		}
+		const { data, status } = await this.requestWithStatus<{ invites?: unknown } | null>(
+			path, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		const rows = data?.invites;
+		if (status !== 200 || !Array.isArray(rows) || rows.length > ADMIN_INVITE_LIMIT ||
+			!rows.every(isAdminInvite) || new Set(rows.map(({ id }) => id)).size !== rows.length)
+			throw invalidAdminInvites(status);
+		return rows.map(({ id, status, issued_by, expires_at }) => ({ id, status, issued_by, expires_at }));
+	}
+
+	/** Issue a single invite. The code is returned once; never retry or persist it. */
+	async issueAdminInvite(input: { email?: string; expires_in_days?: number }, signal: AbortSignal): Promise<IssuedInvite> {
+		const { data, status } = await this.requestWithStatus<{ code?: unknown; invite?: Record<string, unknown> } | null>(
+			ADMIN_INVITES, { method: 'POST', cache: 'no-store', redirect: 'error', signal,
+				headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }
+		);
+		const row = data?.invite;
+		if (status !== 201 || !isMemberInviteCode(data?.code) || !isInviteId(row?.id) ||
+			row?.kind !== 'admin' || row.status !== 'active' || !isEpoch(row.expires_at) || row.expires_at === 0)
+			throw new ApiError(status, 'request_failed', 'Invalid invite issuance response', null, false);
+		return { code: data.code, expires_at: row.expires_at };
+	}
+
+	/** Bodyless, once-only dispatch; the Worker owns the authorization and audited write. */
+	async revokeAdminInvite(id: number, signal: AbortSignal): Promise<void> {
+		if (!isInviteId(id)) throw new TypeError('Invalid invite ID');
+		const { data, status } = await this.requestWithStatus<{ id?: unknown; status?: unknown } | null>(
+			`${ADMIN_INVITES}/${id}/revoke`, { method: 'POST', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 200 || data?.id !== id || data.status !== 'revoked') throw invalidAdminInvites(status);
+	}
+
 	async readInvitePolicy(signal: AbortSignal): Promise<InvitePolicy> {
 		const { data, status } = await this.requestWithStatus<{ settings?: InvitePolicy } | null>(
 			ADMIN_SETTINGS, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
@@ -425,8 +482,8 @@ export class ApiClient {
 	}
 
 	/** Spend one invite from the browser session's current window. Do not retry automatically. */
-	async issueMemberInvite(signal: AbortSignal): Promise<IssuedMemberInvite> {
-		const { data, status } = await this.requestWithStatus<Partial<IssuedMemberInvite> | null>(
+	async issueMemberInvite(signal: AbortSignal): Promise<IssuedInvite> {
+		const { data, status } = await this.requestWithStatus<Partial<IssuedInvite> | null>(
 			'/v1/me/invites', { method: 'POST', cache: 'no-store', redirect: 'error', signal }
 		);
 		if (status !== 201 || !isMemberInviteCode(data?.code) ||

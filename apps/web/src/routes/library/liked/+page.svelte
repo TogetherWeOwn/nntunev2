@@ -7,6 +7,7 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import {
+		favoritesKey,
 		loadFavorites,
 		saveFavorites,
 		selectFavoriteItems
@@ -29,7 +30,17 @@
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache,
-		onStateChange: (state) => {
+		onStateChange: (state, { isCurrent, authBoundary, sessionBinding }) => {
+			if (!isCurrent()) return;
+			const key = favoritesKey(session);
+			if ((authBoundary && !state.verificationSuspended) || (sessionBinding && favoriteVisitKey !== key)) {
+				pendingChanges.clear();
+				favoriteIds = [];
+			}
+			if (sessionBinding) {
+				favoriteVisitKey = key;
+				favoriteIds = currentFavorites();
+			}
 			items = state.items;
 			loading = state.loading;
 			loadError = state.loadError;
@@ -43,6 +54,7 @@
 	const session = browserStorage('session');
 	const local = browserStorage('local');
 	let favoriteIds = $state<string[]>(loadFavorites(session, local));
+	let favoriteVisitKey = favoritesKey(session);
 
 	const liked = $derived(selectFavoriteItems(items, favoriteIds));
 
@@ -78,11 +90,13 @@
 			predecessor: previousIndex > 0 ? previous[previousIndex - 1] : null,
 			successor: previousIndex < previous.length - 1 ? previous[previousIndex + 1] : null
 		};
+		const key = favoritesKey(session);
 		persistChange(id, (ids) => ids.filter((entry) => entry !== id));
 		pushToast(`Removed “${title}” from Liked.`, {
 			action: {
 				label: 'Undo',
 				run: () => {
+					if (!key || key !== favoritesKey(session)) return;
 					// Restore only this track against the stored list, so a
 					// navigation or another tab's save is never overwritten,
 					// and anchor on the surviving successor so adjacent Undos

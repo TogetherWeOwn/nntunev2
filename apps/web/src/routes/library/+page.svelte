@@ -70,14 +70,12 @@
 	import QueueExport from '#lib/player/QueueExport.svelte';
 	import {
 		addTrack,
-		clearQueue,
 		clearUpcoming,
 		createQueue,
 		currentTrack as queueCurrentTrack,
 		keepCurrentAndUpcoming,
 		insertTracks,
 		insertTracksNext,
-		moveTrack,
 		nextTrack,
 		playNext,
 		removeTrack,
@@ -333,9 +331,10 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
-		onStateChange: (state, { isCurrent, authoritative, authBoundary, runIfCurrent }) => {
+		onStateChange: (state, { isCurrent, authoritative, authBoundary, runIfCurrent, sessionBinding }) => {
 			if (!isCurrent()) return;
 			collectionReceipt = runIfCurrent;
+			const revoked = authBoundary && !state.verificationSuspended;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -347,10 +346,17 @@
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			// Keep the empty focus target even if the last queued row is removed during a retry.
-			retainedQueueWithoutListing = !authBoundary && (state.loading || state.libraryUnavailable || !!state.loadError) &&
+			retainedQueueWithoutListing = !revoked && (state.loading || state.libraryUnavailable || !!state.loadError) &&
 				(retainedQueueWithoutListing || queueController.snapshot.tracks.length > 0);
 			requiresSignIn = state.requiresSignIn;
-			if (authBoundary) queueFilterQuery = '';
+			if (revoked) {
+				queueFilterQuery = '';
+				clearFavoritesExportFeedback();
+				releaseFavoritesDownload();
+				favoriteBaseline = favorites = [];
+				favoritesInitialized = false;
+				favoritesAnnouncement = '';
+			}
 			if (state.loadError && state.items.length === 0) {
 				findQuery = '';
 				findScope = 'both';
@@ -363,7 +369,7 @@
 				recentFindsInitialized = false;
 				recentFindsAnnouncement = '';
 			}
-			if (!authBoundary && (state.loading || state.items.length === 0)) {
+			if (!revoked && (state.loading || state.items.length === 0)) {
 				player.browseCopy.invalidate();
 				clearFavoritesExportFeedback();
 				media.clearShareSeek();
@@ -396,12 +402,12 @@
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
 				const session = browserStorage('session'), key = favoritesKey(session);
-				if (!favoritesInitialized || (!favoritesAuthKey && key)) {
+				if (!favoritesInitialized || (sessionBinding ? key !== favoritesAuthKey : !favoritesAuthKey && key)) {
 					favoritesAuthKey = key;
 					currentFavoriteEdit++;
 					pendingPlayerFavorites.clear();
 					favoriteBaseline = loadFavorites(session, browserStorage('local'));
-					favorites = favoritesInitialized ? [...new Set([...favoriteBaseline, ...favorites])] : [...favoriteBaseline];
+					favorites = !sessionBinding && favoritesInitialized ? [...new Set([...favoriteBaseline, ...favorites])] : [...favoriteBaseline];
 					favoritesInitialized = true;
 				}
 				if (!recentFindsInitialized) {
@@ -714,41 +720,6 @@
 
 	if (typeof window !== 'undefined') {
 		afterNavigate(() => applyShareLink());
-	}
-
-	function moveQueuedTrack(from: number, to: number): void {
-		const queue = queueController.snapshot;
-		const moved = queue.tracks[from];
-		if (moved === undefined) return;
-		const reordered = moveTrack(queue, from, to);
-		// Announce real moves only: a no-op reorder must not chatter the
-		// live region.
-		if (reordered === queue) return;
-		if (!commitQueue(reordered, 'move')) return;
-		player.announceQueue(`${moved.title} moved to ${to + 1} of ${reordered.tracks.length}`);
-	}
-
-	function removeQueuedTrack(index: number): void {
-		const queue = queueController.snapshot;
-		const removed = queue.tracks[index];
-		if (removed === undefined) return;
-		const next = removeTrack(queue, index);
-		// Announce real removals only, including distinct tracks with equal
-		// titles: the version refreshes the content inside the stable region.
-		if (next === queue) return;
-		const title = removed.title?.trim() ? removed.title : removed.id;
-		if (!commitQueue(next, 'remove')) return;
-		player.announceQueue(`${title} removed from the queue.`, true);
-	}
-
-	function clearQueuedTracks(): void {
-		const queue = queueController.snapshot;
-		const next = clearQueue(queue);
-		// Announce real clears only: a no-op clear must not chatter the live
-		// region.
-		if (next === queue) return;
-		if (!commitQueue(next, 'clear')) return;
-		player.announceQueue('Queue cleared.', true);
 	}
 
 	/**
@@ -2048,7 +2019,7 @@
 				confirmGeneration={queueConfirmGeneration}
 				onnext={() => replaceQueue(nextTrack(queueController.snapshot))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queueController.snapshot))}
-				onmove={moveQueuedTrack}
+				onmove={player.moveQueuedTrack}
 				oninsert={insertQueuedIds}
 				interactionsUnavailable={listingUnavailable}
 				onmenufocusfallback={focusLibraryRecovery}
@@ -2056,8 +2027,8 @@
 				onplaynextids={queueNextIds}
 				onremoveids={removeQueuedIds}
 				onplaynext={(index) => replaceQueue(playNext(queueController.snapshot, index))}
-				onremove={removeQueuedTrack}
-				onclear={clearQueuedTracks}
+				onremove={player.removeQueuedTrack}
+				onclear={player.clearQueuedTracks}
 				onselect={selectQueuedTrack}
 				onplaynow={(id) => void playQueuedTrack(id)}
 				oncopylink={(id) => void queueShare.copy(id)}
@@ -2208,7 +2179,7 @@
 	:global(.nt-library-queue .queue-row) {
 		padding-block: var(--nt-library-row-padding);
 	}
-	:global(.nt-library-queue .queue-row button:not(.queue-star, .queue-grip, .queue-more)) {
+	:global(.nt-library-queue .queue-row button:not(.queue-star, .nt-track-like, .queue-grip, .queue-more)) {
 		min-width: 24px;
 		min-height: 24px;
 	}
