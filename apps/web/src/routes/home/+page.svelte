@@ -37,7 +37,7 @@
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			requiresSignIn = state.requiresSignIn;
-			accessRefused = update.authBoundary && !state.requiresSignIn;
+			accessRefused = update.authBoundary && !state.verificationSuspended && !state.requiresSignIn;
 			if (update.authBoundary) {
 				readyRecentFindsKey = null;
 				recentQueries = [];
@@ -127,7 +127,7 @@
 		</section>
 	{/if}
 
-	{#if recentQueries.length > 0}
+	{#if !loading && !loadError && !libraryUnavailable && recentQueries.length > 0}
 		<section aria-labelledby="home-recent-heading">
 			<h2 id="home-recent-heading">Recent searches</h2>
 			<ul>
