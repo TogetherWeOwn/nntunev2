@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	actionForKey,
+	actionForShortcutEvent,
 	isModalOpen,
 	isTypingTarget,
 	SEEK_SECONDS,
@@ -34,6 +35,20 @@ describe('actionForKey', () => {
 		expect(actionForKey('Enter')).toBeNull();
 		expect(actionForKey('F1')).toBeNull();
 	});
+});
+
+it('resolves only unclaimed player keys outside editing surfaces and modals', () => {
+	const scope = (modal: boolean): ModalScope => ({ querySelector: () => modal, querySelectorAll: () => [] });
+	const resolve = (key: string, flags = {}, modal = false) => actionForShortcutEvent({ key, ...flags } as KeyboardEvent, scope(modal));
+	for (const flags of [{ defaultPrevented: true }, { ctrlKey: true }, { metaKey: true },
+		{ altKey: true }, { isComposing: true }, { keyCode: 229 }]) {
+		expect(resolve('k', flags)).toBeNull();
+		expect(resolve('Escape', flags, true)).toBeNull();
+	}
+	expect(resolve('?', { shiftKey: true })).toBe('open-shortcuts');
+	expect(resolve('0', { target: { tagName: 'SELECT' } })).toBeNull();
+	expect(resolve('j', {}, true)).toBeNull();
+	expect(resolve('Escape', {}, true)).toBe('close-shortcuts');
 });
 
 describe('isTypingTarget', () => {

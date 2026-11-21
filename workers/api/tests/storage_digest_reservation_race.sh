@@ -112,22 +112,35 @@ wait "$holder"
 wait "$contender"
 [[ "$(<"$dir/contender")" == $'1\nt' ]] || { printf 'rollback contender did not win an unexpired lease\n' >&2; exit 1; }
 
-psql_run -f "$(dirname -- "${BASH_SOURCE[0]}")/fixtures/storage_digest_reference.sql"
-# First test reference-key waits with expired and valid authorization, then both winner lock orders.
+tests_dir="$(dirname -- "${BASH_SOURCE[0]}")"
+psql_run -v storage_digest_claim_lookup_sql="$(<"$tests_dir/../src/storage_digest_claim_lookup.sql")" \
+  -f "$tests_dir/fixtures/storage_digest_reference.sql"
+# Keep the primitive's reference-key expiry cases; use the actual pin-returning
+# statement for both winner lock orders, with commit and rollback controls.
 for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false COMMIT f false' '10 true COMMIT f true' '11 false ROLLBACK t true' '12 true ROLLBACK t false'; do
   read -r id deleting finish expected tombstone other <<<"$scenario"
-  mkfifo "$dir/ref-$scenario"; exec 3<>"$dir/ref-$scenario"
-  PGAPPNAME=digest_ref_holder psql_run -At <"$dir/ref-$scenario" >"$dir/ref-holder" & holder=$!
-  printf "BEGIN; SELECT public.digest_ref_fixture(%s,%s);\n\\! touch '%s/ready-%s'\n" "$id" "$deleting" "$dir" "$scenario" >&3
-  for _ in {1..100}; do [[ -e "$dir/ready-$scenario" ]] && break; sleep 0.1; done
-  [[ -e "$dir/ready-$scenario" ]] || exit 1
   object="$(printf '21000000-0000-4000-8000-%012d' "$id")"
-  deadline=infinity; query="SELECT public.digest_ref_fixture($id, NOT $deleting)"
+  short_id="$(printf '%02d' "$id")"
+  pins="$object|media-$short_id|{page-$short_id}"
+  lookup="SELECT * FROM public.digest_lookup_fixture($id)"
+  delete="SELECT public.digest_ref_fixture($id, true)"
+  holder_expected=t; contender_expected="$expected"; deadline=infinity
   if [[ -n "$other" ]]; then
+    holder_query="SELECT public.digest_ref_fixture($id, false)"
     duration='1 minute'; [[ "$expected" != f ]] || duration='8 seconds'
     deadline="$(psql_run -Atc "SELECT clock_timestamp() + interval '$duration'")"
     query="SELECT public.digest_ref_fixture($other, false, '', '$object', '$deadline')"
+  elif [[ "$deleting" == true ]]; then
+    holder_query="$delete"; query="$lookup"; contender_expected=''
+    if [[ "$expected" == t ]]; then contender_expected="$pins"; fi
+  else
+    holder_query="$lookup"; query="$delete"; holder_expected="$pins"
   fi
+  mkfifo "$dir/ref-$scenario"; exec 3<>"$dir/ref-$scenario"
+  PGAPPNAME=digest_ref_holder psql_run -At <"$dir/ref-$scenario" >"$dir/ref-holder" & holder=$!
+  printf "BEGIN ISOLATION LEVEL READ COMMITTED; %s;\n\\! touch '%s/ready-%s'\n" "$holder_query" "$dir" "$scenario" >&3
+  for _ in {1..100}; do [[ -e "$dir/ready-$scenario" ]] && break; sleep 0.1; done
+  [[ -e "$dir/ready-$scenario" ]] || exit 1
   PGAPPNAME=digest_ref_contender psql_run -Atc "$query" >"$dir/ref-contender" & contender=$!
   blocked=0
   for _ in {1..100}; do
@@ -138,7 +151,7 @@ for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false C
   if [[ -n "$other" && "$expected" == f ]]; then psql_run -c "SELECT pg_sleep_until('$deadline')" >/dev/null; fi
   printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
   wait "$holder"; wait "$contender"
-  [[ "$(<"$dir/ref-holder")" == t && "$(<"$dir/ref-contender")" == "$expected" ]] || { printf 'unexpected reference race result: %s\n' "$scenario" >&2; exit 1; }
+  [[ "$(<"$dir/ref-holder")" == "$holder_expected" && "$(<"$dir/ref-contender")" == "$contender_expected" ]] || { printf 'unexpected reference race result: %s\n' "$scenario" >&2; exit 1; }
   if [[ -n "$other" ]]; then
     target=none
     if [[ "$expected" == t ]]; then target="$(printf '21000000-0000-4000-8000-%012d' "$other")"; fi
@@ -147,8 +160,10 @@ for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false C
     psql_run -c "DELETE FROM public.storage_validated_digest_references WHERE reference_id='$object'"
     printf 'reference-key lock case passed: holder rolled back; contender=%s committed reference target=%s\n' "$expected" "$target"
   else
-    [[ "$(psql_run -Atc "SELECT (deleting_at IS NOT NULL) = $tombstone AND EXISTS (SELECT FROM public.storage_validated_digest_references WHERE object_id=w.object_id) <> $tombstone FROM public.storage_validated_digest_winners w WHERE object_id='$object'")" == t ]] || exit 1
-    printf 'reference/delete lock case passed: delete-first=%s holder=%s contender=%s\n' "$deleting" "$finish" "$expected"
+    # Any pins seen before ROLLBACK are provisional. Verify the committed
+    # outcome has either the exact reference or a tombstone with no references.
+    [[ "$(psql_run -Atc "SELECT (deleting_at IS NOT NULL) = $tombstone AND ARRAY(SELECT r.reference_id FROM public.storage_validated_digest_references r WHERE r.object_id=w.object_id) = CASE WHEN $tombstone THEN ARRAY[]::uuid[] ELSE ARRAY[w.object_id] END FROM public.storage_validated_digest_winners w WHERE object_id='$object'")" == t ]] || exit 1
+    printf 'claim lookup/delete lock case passed: delete-first=%s holder=%s contender-won=%s\n' "$deleting" "$finish" "$expected"
   fi
 done
 psql_run <<'SQL'
@@ -165,5 +180,7 @@ DO $$ DECLARE attempt record; original jsonb; BEGIN
         RAISE NOTICE 'committed retirement preserved: %', attempt.assignment;
     END LOOP;
 END $$;
+DROP FUNCTION public.digest_lookup_fixture(int);
+DROP FUNCTION public.digest_claim_statement(UUID, UUID, BYTEA, BIGINT, UUID, UUID, UUID, UUID, TIMESTAMPTZ, UUID);
 DROP FUNCTION public.digest_ref_fixture(int, bool, text, uuid, timestamptz);
 SQL

@@ -8,6 +8,7 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
+import { captureAuthFence, runAuthMutation } from '../auth-fence.js';
 import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import { isJsonBodyTooLarge, readCappedJson } from './cappedJson.js';
 import { parseErrorBody } from './errors.js';
@@ -243,6 +244,15 @@ export interface CredentialsList {
 	credentials: ListedCredential[];
 }
 
+const REVOKE_ALL = '/v1/session/revoke-all';
+const LOGOUT = '/v1/session/logout';
+export class StaleSessionError extends ApiError {}
+const staleSession = () => new StaleSessionError(409, 'conflict', 'Could not verify the current session. Try signing out again.');
+const COOKIE_MUTATIONS = new Set([
+	'/v1/auth/magic/finish', '/v1/auth/passkey/register/finish', '/v1/auth/passkey/login/finish',
+	'/v1/session/reauthenticate/finish', '/v1/session/refresh', LOGOUT, REVOKE_ALL
+]);
+
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
@@ -316,9 +326,14 @@ export class ApiClient {
 		await this.post<unknown>('/v1/session/logout', {});
 	}
 
-	/** Revoke every session for the authenticated account. */
-	async revokeAllSessions(): Promise<{ ok: true }> {
-		return this.post<{ ok: true }>('/v1/session/revoke-all', {});
+	/** Bind the user confirmation to the browser's current auth generation. */
+	async revokeAllSessions(confirm: () => boolean): Promise<{ ok: true } | undefined> {
+		const expected = (await captureAuthFence())?.generation;
+		if (typeof window !== 'undefined' && !expected) throw staleSession();
+		if (!confirm()) return;
+		return (await this.requestWithStatus<{ ok: true }>(REVOKE_ALL, {
+			method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
+		}, expected)).data;
 	}
 
 	/**
@@ -428,7 +443,8 @@ export class ApiClient {
 
 	private async requestWithStatus<T>(
 		path: string,
-		init: RequestInit
+		init: RequestInit,
+		expected?: string
 	): Promise<{ data: T; status: number }> {
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
@@ -452,12 +468,18 @@ export class ApiClient {
 		}, API_REQUEST_TIMEOUT_MS);
 		try {
 			callerSignal?.throwIfAborted();
-			const response = await this.fetchFn(`${this.baseUrl}${path}`, {
+			const url = `${this.baseUrl}${path}`;
+			const route = init.method === 'POST' && new URL(url, globalThis.document?.baseURI ?? 'http://localhost').pathname;
+			const dispatch = () => this.fetchFn(url, {
 				...init,
 				signal: controller.signal,
 				headers,
 				credentials: 'include'
 			});
+			const intent = route === REVOKE_ALL ? { stale: staleSession(), revocation: { generation: expected } }
+				: route === LOGOUT ? { stale: staleSession() } : undefined;
+			const response = await (route && COOKIE_MUTATIONS.has(route)
+				? runAuthMutation(controller.signal, dispatch, intent) : dispatch());
 			// A transport may ignore abort; never publish an abandoned response.
 			callerSignal?.throwIfAborted();
 			if (!response.ok) {
