@@ -78,7 +78,7 @@ async function expectShelf(page: Page, want: string[]) {
 	await expect.poll(async () => (await ids(page, 'favorite-item')).sort()).toEqual([...want].sort());
 }
 async function stored(page: Page): Promise<string[]> {
-	return page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? '[]'), KEY);
+	return page.evaluate((key) => navigator.locks.request(key, () => JSON.parse(localStorage.getItem(key) ?? '[]')), KEY);
 }
 async function count(page: Page, matched: number, total = ITEMS.length) {
 	await expect(page.getByText(new RegExp(`\\b${matched}\\s*(?:of|/)\\s*${total}\\s+(?:loaded\\s+)?tracks?\\b`, 'i'))).toBeVisible();
@@ -206,7 +206,7 @@ async function expectActionFeedback(page: Page, action: RegExp) {
 async function fault(page: Page, operation: 'getItem' | 'setItem') {
 	await page.evaluate(({ operation, base }) => {
 		const original = Storage.prototype[operation];
-		Reflect.set(window, '__managementRestoreStorage', () => { Storage.prototype[operation] = original; });
+		Reflect.set(window, '__managementRestoreStorage', () => { Reflect.set(Storage.prototype, operation, original); });
 		if (operation === 'getItem') {
 			const get = Storage.prototype.getItem;
 			Storage.prototype.getItem = function (key) {
@@ -391,7 +391,7 @@ test('[FM-B04] Clear requires in-page confirmation; Cancel is a no-save and Conf
 });
 
 for (const operation of ['getItem', 'setItem'] as const) {
-	test(`[FM-B05:${operation}] unstar uses visit state during storage failure; a recovered save retains every pending and hidden ID`, async ({ page }) => {
+	test(`[FM-B05:${operation}] failed edits stay visit-only; recovery edits the durable membership`, async ({ page }) => {
 		const h = await setup(page);
 		await open(page);
 		await seedQueue(page);
@@ -406,14 +406,14 @@ for (const operation of ['getItem', 'setItem'] as const) {
 		await restore(page);
 		await localAction(page, h, () => mode(page, 'All tracks'));
 		await localAction(page, h, () => star(page, 'manage-bravo').click());
-		expect((await stored(page)).sort()).toEqual(['hidden-library-id', 'manage-alpha', 'manage-bravo', 'manage-mike']);
+		await expect.poll(() => stored(page)).toEqual([...SEEDED, 'manage-bravo']);
 		await page.reload();
 		await expectRows(page, ALL);
-		await expectShelf(page, ['manage-alpha', 'manage-bravo', 'manage-mike']);
+		await expectShelf(page, ['manage-bravo', 'manage-mike', 'manage-zulu']);
 	});
 }
 
-test('[FM-B06] Clear remains effective for this visit when writes fail; recovery never resurrects hidden or visible IDs', async ({ page }) => {
+test('[FM-B06] a failed clear does not erase durable favorites on a later edit', async ({ page }) => {
 	const h = await setup(page);
 	await open(page);
 	await seedQueue(page);
@@ -428,10 +428,10 @@ test('[FM-B06] Clear remains effective for this visit when writes fail; recovery
 	await restore(page);
 	await localAction(page, h, () => mode(page, 'All tracks'));
 	await localAction(page, h, () => star(page, 'manage-alpha').click());
-	expect(await stored(page)).toEqual(['manage-alpha']);
+	await expect.poll(() => stored(page)).toEqual([...SEEDED, 'manage-alpha']);
 	await page.reload();
 	await expectRows(page, ALL);
-	await expectShelf(page, ['manage-alpha']);
+	await expectShelf(page, ['manage-alpha', 'manage-mike', 'manage-zulu']);
 });
 
 test('[FM-B07] unavailable initial favorite reads leave a usable empty view and current-visit starring/filter/clear', async ({ page }) => {
