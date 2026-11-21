@@ -38,6 +38,7 @@
 	import { moveFavoriteId, type FavoriteMoveDirection } from '#lib/library/favorites-order.js';
 	import { createLibraryRefresher, type LibraryRefreshUpdate } from '#lib/library/refresh.js';
 	import { createLibraryTrackLikes } from '#lib/library/library-track-likes.svelte.js';
+	import { SNOOZE_DAYS } from '#lib/library/taste.js';
 	import {
 		displayArtist,
 		displayTitle,
@@ -1367,6 +1368,18 @@
 			const current = source().find((track) => track.id === id);
 			if (current && availableInteractionIds([id]).length) void copyTrackLink(id, current);
 		} });
+		const control = ids.length === 1 ? likeControls(id) : undefined;
+		if (control?.taste) {
+			const { set, saved } = control.taste;
+			const choices = [['dislike', 'Dislike'], ['hide', 'Hide'], ['ban', 'Ban'],
+				['snooze', `Snooze for ${SNOOZE_DAYS} days`]] as const;
+			const children: MenuAction[] = choices.map(([signal, label]) => ({
+				label, checked: saved === signal, run: () => void set(signal)
+			}));
+			if (saved) children.push({ label: 'Clear track preference', run: () => void set(null) });
+			actions.push({ label: 'Track preferences', disabled: control.pending,
+				hint: control.pending ? 'Saving an account change…' : undefined, children });
+		}
 		const target = invoker.matches('li') ? invoker.querySelector<HTMLElement>('[data-testid="track-more"]') ?? invoker : invoker;
 		const label = ids.length > 1 ? `${ids.length} selected tracks` : `Actions for ${displayTitle(item)}`;
 		const displayedIds = renderedItems.map((item) => item.id);
