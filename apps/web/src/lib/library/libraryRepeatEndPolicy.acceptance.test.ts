@@ -58,11 +58,12 @@ import {
 
 // Raw route markup via Vite glob: no node:fs, no @types/node needed.
 const sources = import.meta.glob(
-	['../../routes/library/+page.svelte', '../player/NativePlayer.svelte', '../player/NativeAudio.svelte', '../player/mediaController.ts'],
+	['../../routes/library/+page.svelte', '../player/AppPlayer.svelte', '../player/NativePlayer.svelte', '../player/NativeAudio.svelte', '../player/mediaController.ts'],
 	{ query: '?raw', import: 'default', eager: true }
 ) as Record<string, string>;
 
 const ROUTE = '../../routes/library/+page.svelte';
+const OWNER = '../player/AppPlayer.svelte';
 const PLAYER = '../player/NativePlayer.svelte';
 const HOST = '../player/NativeAudio.svelte';
 
@@ -160,7 +161,7 @@ describe('library repeat hooks are declared in the library markup', () => {
 	});
 
 	it('LIBREP-U03 wires the native ended event on the library audio', () => {
-		expect(routeSource()).toMatch(/<NativePlayer\b[^>]*\s\{attachNativeAudio\}/);
+		expect(sources[OWNER]).toMatch(/<NativePlayer\b[^>]*\s\{attachNativeAudio\}/);
 		expect(sources[PLAYER]).toMatch(/<NativeAudio\b[^>]*\s\{attachNativeAudio\}/);
 		const audio = sources[HOST].match(/<audio\b[^>]*\sdata-testid="audio-player"(?=\s|>)[^>]*>/)?.[0];
 		expect(
@@ -177,14 +178,14 @@ describe('library repeat hooks are declared in the library markup', () => {
 
 	it('LIBREP-U04 reuses naturalEndPolicy as the single end-of-track source', () => {
 		const authority = sources['../player/mediaController.ts'] ?? '';
-		expect(routeSource()).toMatch(/return media\.attach\(audio,/);
+		expect(sources[OWNER]).toMatch(/const attachNativeAudio = media\.attach;/);
 		expect(routeSource()).not.toMatch(/\b(?:naturalEndPolicy|handleEnded)\b/);
-		expect(authority).toMatch(/case 'ended': return handleEnded\(receipt, source\)/);
+		expect(authority).toMatch(/case 'ended': return handleEnded\(receipt, source, matches\)/);
 		expect(authority).toMatch(/const result = naturalEndPolicy\(base, \{/);
 	});
 
 	it('LIBREP-U05 never uses a native loop attribute (control: passes now, must stay green)', () => {
-		const source = [routeSource(), sources[PLAYER], sources[HOST]].join('\n');
+		const source = [routeSource(), sources[OWNER], sources[PLAYER], sources[HOST]].join('\n');
 		for (const forbidden of ['loop=', 'loop={true}', '.loop = true']) {
 			expect(
 				source,

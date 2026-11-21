@@ -62,7 +62,7 @@ async fn snapshot(observer: &Client) -> (Value, Value) {
 
 #[tokio::test]
 #[ignore = "requires the dedicated api-migrations fixture database"]
-async fn dormant_store_refuses_absent_history_and_replays_when_owned() {
+async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     let (mut observer, connection) = tokio_postgres::connect(CONNECTION, NoTls).await.unwrap();
     let driver = tokio::spawn(connection);
     let setup = observer.transaction().await.unwrap();
@@ -85,6 +85,7 @@ async fn dormant_store_refuses_absent_history_and_replays_when_owned() {
         include_str!("../../../migrations/0021_billing_schema.sql"),
         include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
         include_str!("../../../migrations/0029_paid_invoice_history.sql"),
+        include_str!("../../../migrations/0059_paid_invoice_covered_periods.sql"),
     ] {
         setup.batch_execute(migration).await.unwrap();
     }
@@ -131,6 +132,7 @@ async fn dormant_store_refuses_absent_history_and_replays_when_owned() {
         amount_cents: 800,
         currency: "usd".into(),
         paid_at_unix: NOW,
+        covered_periods: vec![(NOW, NOW + 100)],
     });
 
     dispatch(USER, &empty)

@@ -52,10 +52,12 @@ const test = base.extend<{ libraryPage: Page }, { libraryOrigin: string }>({
 	libraryOrigin: [async ({}, use) => {
 		const server = await createServer({
 			configFile: false,
+			mode: 'browser-fixtures',
 			root: decodeURIComponent(new URL('./fixtures/library-now-playing/', import.meta.url).pathname),
 			publicDir: false,
 			resolve: { alias: {
 				'#lib': `${webRoot}src/lib`,
+				'$app/env/public': `${webRoot}tests/fixtures/library-public-env.ts`,
 				'$app/navigation': decodeURIComponent(new URL('./fixtures/library-now-playing/navigation.ts', import.meta.url).pathname)
 			} },
 			plugins: [{

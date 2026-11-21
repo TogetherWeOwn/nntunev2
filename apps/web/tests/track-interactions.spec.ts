@@ -1,6 +1,10 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
 import { TESTIDS } from '../../../e2e/helpers/contract';
+import { syntheticBody } from '../src/lib/player/demoMedia.js';
+
+const mockInteractionAudio = (page: Page) => page.route('**/interaction-audio/*', (route) =>
+	route.fulfill({ contentType: 'audio/wav', body: Buffer.from(syntheticBody()) }));
 
 const ITEMS = [
 	{ id: 'coral', title: 'Coral Night', artist: 'Harbor Lights' },
@@ -151,7 +155,8 @@ test('Copy link is inline, restores focus and preserves whole-menu dismissal', a
 
 for (const scenario of ['outside-click', 'scroll-only', 'scroll-then-click', 'outside-focus', 'scroll-then-focus', 'explicit-focus', 'scroll-then-explicit-focus'] as const) {
 	test(`track menu focus contract: ${scenario}`, async ({ page }, testInfo) => {
-		await page.setViewportSize({ width: 1280, height: 1000 });
+		// The baseline and comparison clicks need both the heading and More in view before scrolling.
+		await page.setViewportSize({ width: 1280, height: scenario === 'scroll-then-click' ? 1200 : 1000 });
 		await seed(page);
 		// Ensure a real document scroll is available without changing the controls under test.
 		await page.evaluate(() => {
@@ -341,7 +346,7 @@ test('batch Play now keeps the old current track when it follows the first selec
 			return Promise.resolve();
 		};
 	});
-	await page.route('**/interaction-audio/*', (route) => route.fulfill({ status: 204 }));
+	await mockInteractionAudio(page);
 	await seed(page, ITEMS.map((item) => ({ ...item, streamUrl: `/interaction-audio/${item.id}` })));
 	await queueAll(page);
 	await queueRow(page, 'ember').getByRole('button', { name: /^Select Ember Sky/ }).click();
@@ -407,7 +412,7 @@ test('library batch Play now uses displayed order and hydrates only its first tr
 			return Promise.resolve();
 		};
 	});
-	await page.route('**/interaction-audio/*', (route) => route.fulfill({ status: 204 }));
+	await mockInteractionAudio(page);
 	await seed(page, ITEMS.map((item) => ({ ...item, streamUrl: `/interaction-audio/${item.id}` })));
 	await libraryRow(page, 'coral').locator('.nt-library-row').click();
 	await libraryRow(page, 'ember').getByRole('checkbox').check();
@@ -493,7 +498,7 @@ for (const outcome of ['accepted', 'blocked', 'no-stream', 'superseded'] as cons
 				return Promise.resolve();
 			};
 		}, outcome);
-		await page.route('**/interaction-audio/*', (route) => route.fulfill({ status: 204 }));
+		await mockInteractionAudio(page);
 		await seed(page, ITEMS.map((item) => ({ ...item,
 			...(item.id === 'dawn' && outcome !== 'no-stream' ? { streamUrl: '/interaction-audio/dawn' } : {})
 		})));
@@ -809,7 +814,7 @@ test('library Play now retains queued audio and plays once when refresh omits st
 			return Promise.resolve();
 		};
 	});
-	await page.route('**/interaction-audio/*', (route) => route.fulfill({ status: 204 }));
+	await mockInteractionAudio(page);
 	const withStream = ITEMS.map((item) => ({ ...item, streamUrl: `/interaction-audio/${item.id}` }));
 	let current: typeof ITEMS = withStream;
 	page.on('pageerror', (error) => pageErrors.push(error.message));

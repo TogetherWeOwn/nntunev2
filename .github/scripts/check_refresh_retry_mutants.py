@@ -66,8 +66,8 @@ CASES = (
     (
         "runtime header forwarding",
         WORKER,
-        "            refresh_content_type.as_deref(),\n",
-        "            refresh_content_type.as_deref().filter(|_| false),\n",
+        'headers.get("content-type").map(String::as_str);',
+        'headers.get("content-type").map(String::as_str).filter(|_| false);',
         ("--lib", "refresh_transport_"),
         "refresh_transport_requires_marked_recovery_but_preserves_legacy_empty_refresh",
     ),

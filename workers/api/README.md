@@ -96,6 +96,16 @@ again"}`, internal
 `500 {"error":"internal error"}`. Cookie-authenticated mutations also
 require an exact `Origin` header match.
 
+`PUT` and `DELETE /v1/me/likes/track/{target_id}` also require the
+`x-nntune-session-binding` request header. Use the `session_binding` verified
+for the initiating Library scope; the header is a precondition, not a
+credential. After the cookie and exact Origin checks, a missing or mismatched
+binding returns `412 {"error":"session binding mismatch"}` before looking up
+the track. Credentialed preflight for the configured origin allows the header.
+On success both methods return 200: PUT returns `{target_id, liked_at}` and
+DELETE returns `{target_id, liked: false}`. The receipt uses the resolved ID;
+exact member job IDs keep their case.
+
 Known limits of this slice: attestation `x5c` chains reject (no CA
 trust store yet); magic-link delivery needs the operator's
 `EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
@@ -603,7 +613,7 @@ cargo test -p nntune-subsonic --locked
 python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI jobs `api` (`.github/workflows/ci.yml:566-627`) and
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:593-654`) and
 `fixture-check` (`.github/workflows/ci.yml:93-102`); `fmt` takes no
 `--locked` (it resolves no dependencies), so the asymmetry is
 intentional. `cargo test -p nntune-subsonic` also runs under

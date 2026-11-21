@@ -10,8 +10,18 @@ routes it to the dead-letter table. It never touches the database:
 `containers/mb-import/import.sh:78,385`.)
 
 Container-job prose (chunking, cursor, upsert, prune, resume) lives with the
-job itself; this README pins only this crate's API and the `mb-validate`
-binary contract.
+job itself.
+
+## Offline release credits
+
+`release_credits::lookup` reads up to 1 MiB of uncompressed curated
+`mbdump-release_credit.tsv` bytes using the same COPY field decoder as the
+importer. It does not add an importer table, an HTTP route, or a backend.
+An empty result describes this artifact only. The integration test reads the
+synthetic golden artifact from [the merged producer](https://github.com/TogetherWeOwn/nntunev2/pull/1476).
+
+Alias lookup and ranked search, and typed relation traversal (including
+recording-to-work), still need separate read contracts and fixture coverage.
 
 ## Curated column contracts
 

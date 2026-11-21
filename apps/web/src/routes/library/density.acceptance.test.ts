@@ -43,7 +43,7 @@ vi.mock('#lib/library/refresh.js', async (importOriginal) => {
 	};
 });
 
-import Library from './+page.svelte';
+import Library from '../../../tests/fixtures/LibraryPlayerHarness.svelte';
 
 const ITEMS: LibraryItem[] = [
 	{ id: 'den-alpha', title: 'Alpha Waves', artist: 'The Densities' },

@@ -7,7 +7,7 @@ import { buildShareQuery, resolveShareTarget } from '../player/shareTimestamp.js
  * `apps/web/src/routes/library/+page.svelte` to satisfy this file plus
  * `apps/web/tests/library-share-link.spec.ts` and must not edit either file.
  *
- * LOCKED CONTRACT (`apps/web/src/routes/library/+page.svelte`):
+ * LOCKED CONTRACT (the Library page and its Tracks row renderer):
  * - Every library row (`library-item`) carries a NATIVE <button>
  *   `library-copy-link` whose accessible name matches /copy link/i and names
  *   the row's track title (per-track naming, like the star toggles).
@@ -67,6 +67,7 @@ const sources = import.meta.glob('../../routes/**/*.svelte', {
 }) as Record<string, string>;
 
 const ROUTE = '../../routes/library/+page.svelte';
+const TRACK_ROWS = '../../routes/library/TrackRows.svelte';
 
 function routeSource(): string {
 	const source = sources[ROUTE];
@@ -107,16 +108,17 @@ const LIBRARY_IDS = ['share-coral', 'share-pine', 'share-ember'];
 
 describe('library share hooks are declared in the library markup', () => {
 	it('LIBSHARE-U01 declares a per-row copy-link action (library-copy-link)', () => {
+		expect(routeSource()).toMatch(/<TrackRows\b/);
 		expect(
-			routeSource(),
+			sources[TRACK_ROWS] ?? '',
 			note(
 				'LIBSHARE-U01',
-				'data-testid="library-copy-link" in the library markup',
+				'a native button with data-testid="library-copy-link" in the Tracks row markup',
 				'missing',
 				'copy_action_missing',
-				'Builder adds a native per-row <button data-testid="library-copy-link">Copy link <title></button> (see library-share-link.spec.ts LOCKED CONTRACT).'
+				'Keep the native per-row copy button in TrackRows (see library-share-link.spec.ts LOCKED CONTRACT).'
 			)
-		).toContain('data-testid="library-copy-link"');
+		).toMatch(/<button\b[^>]*\bdata-testid="library-copy-link"/);
 	});
 
 	it('LIBSHARE-U02 declares the polite share status region (library-share-status)', () => {

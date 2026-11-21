@@ -1587,6 +1587,8 @@ fn owned_checkpoint<E>(
     }
 }
 
+pub mod multipart;
+
 #[cfg(test)]
 mod tests {
     use super::*;

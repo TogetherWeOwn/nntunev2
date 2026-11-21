@@ -231,6 +231,37 @@ fn sign(secret: &[u8], payload_b64: &str) -> Result<Vec<u8>, SessionError> {
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
+/// Bind history to an authenticated session row, not a cookie generation.
+/// The colon separates this signing input from session-token base64url.
+#[allow(dead_code)] // Used only by the unmounted history receiver.
+pub(crate) fn listen_context(
+    secret: &[u8],
+    claims: &SessionClaims,
+) -> Result<String, SessionError> {
+    let tag = sign(
+        secret,
+        &format!("nntune:listen-context:v1:{}", claims.session_id),
+    )?;
+    Ok(crate::b64::encode(&tag))
+}
+
+/// Check the primary and the same optional previous key accepted for cookies.
+#[allow(dead_code)] // Used only by the unmounted history receiver.
+pub(crate) fn verify_listen_context(
+    keys: &SessionKeys<'_>,
+    claims: &SessionClaims,
+    presented: Option<&str>,
+) -> bool {
+    let Some(presented) = presented.filter(|value| value.len() == 43) else {
+        return false;
+    };
+    let matches = |secret: &[u8]| {
+        listen_context(secret, claims)
+            .is_ok_and(|expected| bool::from(expected.as_bytes().ct_eq(presented.as_bytes())))
+    };
+    matches(keys.primary) || keys.previous.is_some_and(matches)
+}
+
 /// Issue a new session token for `user_id` valid for `ttl_secs` from `now`.
 /// Fails closed on a short secret — callers surface the error, never a
 /// token minted under a weak key.

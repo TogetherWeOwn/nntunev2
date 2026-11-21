@@ -4,18 +4,16 @@ import * as queueFunctions from '#lib/player/queue.js';
 import { createQueueShare } from '#lib/player/queueShare.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
-import { clearFavoritesAtAuthBoundary, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
+import { clearFavoritesAtAuthBoundary, favoritesKey, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
 import { clearRecentFindsAtAuthBoundary, loadRecentFinds } from '#lib/library/recent-finds.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
-import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { displayArtist, displayTitle, orderLibraryItems, shortTitle } from '#lib/library/order.js';
 import { createSelection, pruneSelection } from '#lib/library/selection.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
 import { survivingInteractionIds } from './interactionSelection.js';
-import { restartIsAvailable } from './restartAvailability.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -27,6 +25,7 @@ const ITEMS = [{ id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/cora
  * in library-share-link-lifecycle.spec.ts cover navigation and rendered media.
  */
 function pageScript(search: string, tick = () => Promise.resolve()) {
+	vi.stubGlobal('navigator', {}); // Do not use Node's Web Locks with this partial window fixture.
 	vi.stubGlobal('window', { location: { search } });
 	const source = sources['./+page.svelte'];
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
@@ -55,40 +54,44 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare, restartIsAvailable,
-		createPlayerController: (initial: queueFunctions.QueueState, end: Parameters<typeof createPlayerController>[1]) =>
-			createPlayerController(initial, end, (audio, source) => audio.isConnected && audio.getAttribute('src') === source),
+		createQueueShare,
+		getAppPlayer: () =>
+			createPlayerController(queueFunctions.createQueue([]), { flush: tick }, (audio, source) => audio.isConnected && audio.getAttribute('src') === source),
 		createFavoritesExport,
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
 		insertTracks: queueFunctions.insertTracks, survivingInteractionIds,
-		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
+		createLibraryRefresher, favoritesKey, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
-		clearMiniPlayerHint, setMiniPlayerHint,
 		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag,
 		browserStorage: () => null,
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
+		$effect: { pre: () => {} },
 		afterNavigate: () => {},
+		shortTitle,
 		tick,
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
 		let renderedItems, playDisplayedDisabled = false;
+		function endSession() { player.purgeAtAuthBoundary(); handleLocalAuthTransition(); }
 		return {
-			refresh, applyShareLink, handleLocalAuthTransition, selectTrack,
+			refresh, applyShareLink, handleLocalAuthTransition: endSession, selectTrack,
 			requiresSignIn: () => refresher.state.requiresSignIn,
-			attachNativeAudio, playQueuedTrack, subscribe: queueController.subscribe,
+			attachNativeAudio: media.attach, playQueuedTrack, subscribe: queueController.subscribe,
 			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
 			source: queueController.sourceForQueuedPlay,
-			endSession: refresher.handleLocalAuthTransition, dispose: refresher.dispose,
+			endSession, dispose: refresher.dispose,
 			setAudio: media.attach,
 			currentAudio: () => media.audio,
+			attachmentVersion: () => media.attachmentVersion,
+			authGeneration: () => queueExportAuthGeneration,
 			playTop: () => { renderedItems = items; return playDisplayedFromTop(); },
 			playIds: () => playLibraryIds(['coral']),
-			feedback: () => [queueAnnouncement, queueAnnouncementVersion],
+			feedback: () => [player.queueAnnouncement.text, player.queueAnnouncement.version],
 			read: () => ({ queue, shareInvalid, handledShareSearch, pendingShareSeek: media.pendingShareSeek, loadError })
 		};
 	`)(...Object.values(bindings)) as {
@@ -101,6 +104,8 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		setAudio: (element: Pick<HTMLAudioElement, 'currentTime' | 'duration'> &
 			Partial<Pick<HTMLAudioElement, 'isConnected' | 'getAttribute' | 'paused' | 'play' | 'pause'>>) => void;
 		currentAudio: () => unknown;
+		attachmentVersion: () => number;
+		authGeneration: () => number;
 		playTop: () => Promise<void>;
 		playIds: () => Promise<void>;
 		feedback: () => [string, number];
@@ -121,7 +126,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 }
 
 function playableAudio(play: () => Promise<void>, src = ITEMS[0].streamUrl) {
-	return { currentTime: 0, duration: 60, paused: true, isConnected: true, getAttribute: () => src, play };
+	return Object.assign(new EventTarget(), { currentTime: 0, duration: 60, paused: true, isConnected: true, getAttribute: () => src, play });
 }
 
 function serve(payload: { id: string; title: string; streamUrl?: string }[] = ITEMS) {
@@ -146,7 +151,7 @@ for (const status of [500, 404]) {
 		expect(queueFunctions.currentTrack(page.read().queue)?.id).toBe('coral');
 		expect(page.read().shareInvalid).toBe(false);
 		expect(page.read().pendingShareSeek?.seconds).toBe(90);
-		const audio = Object.assign(new EventTarget(), playableAudio(async () => {}));
+		const audio = playableAudio(async () => {});
 		page.attachNativeAudio(audio);
 		audio.dispatchEvent(new Event('loadedmetadata'));
 		expect(audio.currentTime).toBe(60);
@@ -275,8 +280,16 @@ for (const status of [200, 401, 403]) {
 		await page.refresh();
 		page.selectTrack('coral');
 		const old = page.source('coral');
+		const generation = page.authGeneration();
+		vi.stubGlobal('fetch', async () => new Response(null, { status: 500 }));
+		await page.refresh();
+		expect(page.authGeneration()).toBe(generation);
+		expect(page.read().queue.tracks).toHaveLength(1);
+		expect(old?.isCurrent()).toBe(true);
+
 		vi.stubGlobal('fetch', async () => new Response(status === 200 ? '[]' : null, { status }));
 		await page.refresh();
+		expect(page.authGeneration()).toBe(generation + Number(status !== 200));
 		expect(page.read().queue.tracks).toEqual([]);
 		expect(page.source('coral')).toBeNull();
 		serve([{ ...ITEMS[0], streamUrl: undefined }]);
@@ -322,15 +335,17 @@ test('queue publication exposes new evidence before a reentrant auth boundary', 
 		expect(queue.tracks[0].streamUrl).toBe(ITEMS[0].streamUrl);
 		expect(page.source('kelp')).toBeNull();
 		expect(page.source('coral')?.streamUrl).toBe('/test-audio/new');
-		const pause = vi.fn(() => {
-			expect(page.currentAudio()).toBeUndefined();
-			// Queue retirement alone would pause after the refresher changed state.
-			expect(page.requiresSignIn()).toBe(false);
-			expect(page.read().queue).toBe(queue);
-		});
-		page.setAudio({ currentTime: 0, duration: 60, paused: false, pause });
+		const pause = vi.fn(() => ({
+			audio: page.currentAudio(), source: page.source('coral'),
+			requiresSignIn: page.requiresSignIn(), queue: page.read().queue
+		}));
+		page.setAudio(Object.assign(new EventTarget(), { currentTime: 0, duration: 60, paused: false, pause }));
+		const version = page.attachmentVersion();
 		page.handleLocalAuthTransition();
 		expect(pause).toHaveBeenCalledOnce();
+		// The player purges before the refresher; the nested store delivery comes last.
+		expect(pause.mock.results[0]?.value).toEqual({ audio: undefined, source: null, requiresSignIn: false, queue });
+		expect(page.attachmentVersion()).toBe(version + 1);
 		expect(page.currentAudio()).toBeUndefined();
 		expect(page.requiresSignIn()).toBe(true);
 	});

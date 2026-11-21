@@ -7,8 +7,7 @@ created in (and dropped from) the service, migrated from migrations/manifest.tom
 Proves Worker -> PostgreSQL via POST /v1/auth/passkey/login/start (reads the
 inserted auth_challenges row back), marker-based magic admission and signup
 reaping, plus non-/rest and /rest routing controls.
-/rest is asserted against the inert main baseline; the two observed tables
-must not gain rows. This is NOT Subsonic activation proof. Missing prerequisites fail.
+/rest is checked inert and armed with synthetic credentials, not live staging.
 By default a synthetic API-key Subsonic fixture (synthetic_subsonic_fixture.py) is seeded
 into the same disposable database and /rest must stay inert against it (--no-fixture skips;
 --mirror-fixture also applies the mirror-target migrations and seeds mb_* rows).
@@ -71,7 +70,7 @@ def conn_string(s, db):
     return f"postgresql://{s['user']}:{pw}@{s['host']}:{s['port']}/{db}?sslmode=disable"
 
 
-def wrangler_toml(conn, sha, mirror=False):
+def wrangler_toml(conn, sha, mirror=False, *, vars_block="", binding="HYPERDRIVE"):
     check(re.fullmatch(r"[0-9a-f]{40}", sha), "build sha must be 40 lowercase hex")
     check('"' not in conn and "\\" not in conn and '"' not in str(BUNDLE), "unsupported characters")
     return f'''name = "nntune-api-routing-smoke"
@@ -85,9 +84,9 @@ BUILD_SHA = "{sha}"
 INVITES_REQUIRED = "1"
 # Local stand-in only: the real Hyperdrive cache gate is not exercised here.
 HYPERDRIVE_CACHING_DISABLED = "1"
-
+{vars_block}
 [[hyperdrive]]
-binding = "HYPERDRIVE"
+binding = "{binding}"
 id = "00000000000000000000000000000000"
 localConnectionString = "{conn}"
 ''' + (f'''
@@ -222,9 +221,13 @@ def fixture_inert(base, q, fx, mirror):
 
 def legacy_vault_cutover(base, q):
     """Exercise both production queries via HTTP on the disposable Worker DB."""
-    # Hide the retired relation in this fixture so even a redundant read fails.
+    check(q("""
+        SELECT to_regclass('public.provider_vaults') IS NULL
+           AND to_regclass('public.vault_test_leases') IS NULL
+           AND to_regclass('public.providers') IS NULL
+           AND to_regclass('public.user_cache_grants') IS NULL;
+    """) == "t", "legacy provider relations still exist in the migrated Worker database")
     q("""
-        ALTER TABLE provider_vaults RENAME TO smoke_retired_provider_vaults;
         INSERT INTO users (id, email, created_at, legacy_vault_established) VALUES
             ('smoke-marker', 'marker@example.test', 1, true),
             ('smoke-stale', 'stale@example.test', 1, false);
@@ -268,27 +271,7 @@ def legacy_vault_cutover(base, q):
           "cleanup must remove the stale signup's expired challenge")
     finish("smoke-marker", 200)
 
-    # Only test admission for owners: their foreign keys still restrict deletion.
-    # A grant needs a provider owned by the same user, so test both owner states.
-    q("""
-        INSERT INTO users (id, email, created_at) VALUES
-            ('smoke-provider', 'provider@example.test', 1),
-            ('smoke-grant', 'grant@example.test', 1);
-        INSERT INTO providers (user_id, label, encrypted_creds, creds_envelope_version, creds_kek_version,
-                               creds_dek_wrapped_nonce, creds_dek_wrapped, creds_payload_nonce,
-                               creds_payload_format, created_at, last_verified_at)
-        SELECT id, 'synthetic', decode('00', 'hex'), 2, 1,
-               decode(repeat('00', 12), 'hex'), decode(repeat('00', 48), 'hex'),
-               decode(repeat('00', 12), 'hex'), 1, 1, 1
-        FROM users WHERE id IN ('smoke-provider', 'smoke-grant');
-        INSERT INTO cache_objects (content_hash, byte_size, r2_bucket, r2_key, last_verified_at)
-        VALUES (repeat('0', 64), 1, 'synthetic', 'synthetic', 1);
-        INSERT INTO user_cache_grants (user_id, content_hash, provider_id, verified_at)
-        SELECT user_id, repeat('0', 64), id, 1 FROM providers WHERE user_id = 'smoke-grant';
-    """)
-    finish("smoke-provider", 401)
-    finish("smoke-grant", 401)
-    print("ok: PostgreSQL marker-only admission and reaping, stale cleanup, provider/grant denial", flush=True)
+    print("ok: PostgreSQL marker-only admission and reaping, stale cleanup after provider purge", flush=True)
 
 
 def smoke(base, s, db, fx=None, mirror=False):
@@ -330,6 +313,33 @@ def smoke(base, s, db, fx=None, mirror=False):
         q(fixture.seed_sql(fx, mirror))
         print("seeded synthetic Subsonic fixture", flush=True)
         fixture_inert(base, q, fx, mirror)
+
+
+def measurement_fetch(tmp, wrangler, env, s, db, sha, fx, redact):
+    now = int(time.time())
+    for enabled in (1, 0):
+        extra = f'''QA_CODE_SEAM = "1"
+SUBSONIC_MEASUREMENT_STAGE = "staging"
+SUBSONIC_MEASUREMENT_ENABLE = "{enabled}"
+SUBSONIC_MEASUREMENT_LEASE = "v1:{sha}:{now}:{now + 600}:ci-fixture-active;small,empty,charge-below,charge-exact,charge-over"
+'''
+        (tmp / f"measurement-{enabled}.toml").write_text(wrangler_toml(
+            conn_string(s, db), sha, vars_block=extra, binding="SUBSONIC_MEASUREMENT_DB"))
+    script = Path(__file__).with_name("subsonic_measurement_fetch.cjs")
+    proc = subprocess.Popen([shutil.which("node"), "--unhandled-rejections=strict", str(script), str(wrangler), ORIGIN],
+                            cwd=tmp, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        output, _ = proc.communicate(json.dumps([fx.keys[k] for k in ("active", "grace")]), timeout=150)
+        check(proc.returncode == 0, "measurement Fetch failed:\n" + redact(output)[-4000:])
+    finally:
+        process_group.shutdown_process_group(proc)
+    used = psql(s, db, "SELECT user_id FROM subsonic_credentials WHERE last_used_at IS NOT NULL ORDER BY user_id",
+                tuples=True)
+    check(used.splitlines() == ["ci-fixture-active", "ci-fixture-grace"],
+          "both armed requests must authenticate against the disposable app database")
+    print("ok: release Fetch verifies lease cases, auth, inert defaults, "
+          "the 4025/4024/4023 charge triplet and stalled startup", flush=True)
 
 
 def main(argv=None):
@@ -397,7 +407,14 @@ def main(argv=None):
             check(st == 200, f"/healthz answered {st} {b[:160]!r}\n" + tail())
             break
         smoke(base, s, db, fx, args.mirror_fixture)
-    except Failure as err:
+        if fx:
+            runner = b64(secrets.token_bytes(32))
+            secrets_out.append(runner)
+            measurement = tmp / "measurement"
+            measurement.mkdir()
+            (measurement / ".dev.vars").write_text(dev_vars(fx) + f"QA_AUTH_TOKEN={runner}\n")
+            measurement_fetch(measurement, wrangler, {**env, "QA_AUTH_TOKEN": runner}, s, db, sha, fx, redact)
+    except (Failure, subprocess.TimeoutExpired) as err:
         print(f"FAIL: {redact(str(err))}", file=sys.stderr)
         failed = True
     finally:

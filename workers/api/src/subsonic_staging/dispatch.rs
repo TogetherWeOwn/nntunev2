@@ -1,4 +1,4 @@
-//! Authenticated dispatch for the unmounted staging construction scope.
+//! Authenticated dispatch for the staging construction scope.
 
 use std::future::Future;
 
@@ -29,18 +29,27 @@ use crate::worker_entry::{
     load_staging_account,
     subsonic_membership::load_staging_membership,
     subsonic_mirror::{load_staging_mirror, MirrorSelection},
-    with_deadline,
 };
 
 pub struct StagingDispatch {
     pub now_millis: i64,
     pub order_work: OrderWork,
+    pub construction_headroom: Option<usize>,
+}
+
+impl StagingDispatch {
+    pub(crate) const FIXTURE_ORDER_WORK: OrderWork = OrderWork {
+        // Insertion-sort pairs and mapping lookups for at most four albums,
+        // one artist and 1,024 tracks (checked again by the snapshot builder).
+        comparisons: 532_000,
+        artist_row_probes: 0,
+    };
 }
 
 pub enum StagingApp<'a, K> {
     Postgres {
         client: Client,
-        peppers: &'a IndexKeyring<'a>,
+        peppers: IndexKeyring<'a>,
         keks: &'a K,
         now_seconds: u64,
     },
@@ -63,8 +72,8 @@ pub enum CatalogueSource<C> {
     IsolatedMirror(C),
 }
 
-/// Unmounted. The caller must first verify staging arming and app/mirror
-/// isolation. Source selection runs only after real auth, before account,
+/// The caller must verify staging arming and app/mirror isolation and bound
+/// `open_app`. Source selection runs only after real auth, before account,
 /// fixture, membership or mirror reads. `None` denies access.
 pub async fn respond_staging<'a, K: KekSource + 'a, A, M, C>(
     request: &web_sys::Request,
@@ -102,8 +111,7 @@ where
         }
         Err(error) => return InputError::from(error).respond(),
     };
-    let opened = with_deadline(async { open_app().await }, 2_000, BusyOrCapacity);
-    let mut app = match opened.await {
+    let mut app = match open_app().await {
         Ok(app) => app,
         Err(reason) => return reject_xml(reason),
     };
@@ -197,6 +205,15 @@ impl StagingConstruction {
         let params = self.dispatch_params()?;
         let (format, refusal) = request_format(&params)?;
         let reject = |reason| DocumentError::Rejected(reason, refusal);
+        if let Some(headroom) = context.construction_headroom {
+            if !matches!(&catalogue, CatalogueSource::Synthetic(_))
+                || name != "getArtists"
+                || !matches!(format, Format::Json)
+            {
+                return Err(reject(StagingRejection::Unavailable));
+            }
+            self.input.budget.restrict_remaining(headroom);
+        }
         let budget = &mut self.input.budget;
         let doc = if MemberBrowse::supports(name) {
             let (artists, releases, tracks) = match catalogue {
@@ -269,7 +286,7 @@ fn request_format(params: &Params) -> Result<(Format<'_>, RejectionFormat), Docu
 mod wasm_test {
     use super::*;
     use crate::handlers::Config;
-    use crate::subsonic_dispatch::snapshot_order::order_work;
+    use crate::worker_entry::with_deadline;
     use worker::wasm_bindgen::{self, prelude::*};
     use worker::{js_sys, wasm_bindgen_futures::JsFuture};
 
@@ -278,29 +295,33 @@ mod wasm_test {
         request: web_sys::Request,
         open_app: js_sys::Function,
         allowed: bool,
-        small: bool,
+        fixture_id: Option<String>,
     ) -> Result<web_sys::Response, JsValue> {
         type NoMirror = fn() -> std::future::Ready<Result<Client, StagingRejection>>;
         let context = StagingDispatch {
             now_millis: 0,
-            order_work: order_work(2, 2, 4, 2).unwrap(),
+            order_work: StagingDispatch::FIXTURE_ORDER_WORK,
+            construction_headroom: None,
         };
-        let fixture = if small {
-            SyntheticCatalogue::Small
-        } else {
-            SyntheticCatalogue::Empty
-        };
+        let fixture = SyntheticCatalogue::from_trusted_id(fixture_id.as_deref().unwrap_or("empty"))
+            .ok_or(JsValue::NULL)?;
         respond_staging(
             &request,
             context,
-            || async {
-                let ready = open_app.call0(&JsValue::UNDEFINED).unwrap();
-                let result = JsFuture::from(js_sys::Promise::resolve(&ready))
-                    .await
-                    .unwrap();
-                (result.as_bool() == Some(true))
-                    .then_some(StagingApp::<Config>::VerifiedFixture)
-                    .ok_or(StagingRejection::Unavailable)
+            || {
+                with_deadline(
+                    async {
+                        let ready = open_app.call0(&JsValue::UNDEFINED).unwrap();
+                        let result = JsFuture::from(js_sys::Promise::resolve(&ready))
+                            .await
+                            .unwrap();
+                        (result.as_bool() == Some(true))
+                            .then_some(StagingApp::<Config>::VerifiedFixture)
+                            .ok_or(StagingRejection::Unavailable)
+                    },
+                    2_000,
+                    BusyOrCapacity,
+                )
             },
             |principal| {
                 assert_eq!(principal.user_id(), "fixture-user");

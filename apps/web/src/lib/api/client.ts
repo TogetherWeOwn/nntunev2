@@ -8,6 +8,7 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
+import { captureAuthFence, runAuthMutation } from '../auth-fence.js';
 import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import { isJsonBodyTooLarge, readCappedJson } from './cappedJson.js';
 import { parseErrorBody } from './errors.js';
@@ -243,6 +244,109 @@ export interface CredentialsList {
 	credentials: ListedCredential[];
 }
 
+export type InviteWindowSchedule = { starts_at: number; ends_at: number; note: string | null };
+export type InviteWindow = InviteWindowSchedule & { id: number };
+export const INVITE_WINDOW_LIMIT = 200;
+const INVITE_WINDOWS = '/v1/admin/invite-windows';
+const isEpoch = (value: unknown): value is number =>
+	typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 8_640_000_000_000;
+function isInviteWindow(value: unknown): value is InviteWindow {
+	const row = value as Partial<InviteWindow> | null;
+	return typeof row?.id === 'number' && Number.isSafeInteger(row.id) && row.id > 0 &&
+		isEpoch(row.starts_at) && isEpoch(row.ends_at) && row.ends_at >= row.starts_at &&
+		(row.note === null || typeof row.note === 'string');
+}
+const invalidInviteWindows = (status: number) =>
+	new ApiError(status, 'request_failed', 'Invalid invite window response', null, false);
+
+export const ADMIN_INVITE_LIMIT = 200;
+export const INVITE_STATUSES = ['active', 'expired', 'redeemed', 'revoked'] as const;
+type InviteStatus = (typeof INVITE_STATUSES)[number];
+export type AdminInvite = { id: number; status: InviteStatus; issued_by: string | null; expires_at: number };
+export type AdminInviteFilter = { status: InviteStatus } | { issuer: string } | null;
+const ADMIN_INVITES = '/v1/admin/invites';
+const invalidAdminInvites = (status: number) => new ApiError(status, 'request_failed', 'Invalid invite ledger response');
+const isInviteId = (id: unknown): id is number => typeof id === 'number' && Number.isSafeInteger(id) && id > 0;
+// Account IDs are minted from 16 random bytes in unpadded base64url.
+export const isInviteIssuerId = (id: unknown): id is string => typeof id === 'string' && /^[A-Za-z0-9_-]{22}$/.test(id);
+function isAdminInvite(value: unknown): value is AdminInvite {
+	const row = value as Partial<AdminInvite> | null;
+	return row != null && isInviteId(row.id) && row.status !== undefined && INVITE_STATUSES.includes(row.status) &&
+		(row.issued_by === null || isInviteIssuerId(row.issued_by)) && isEpoch(row.expires_at);
+}
+
+export const INVITE_POLICY_BOUNDS = {
+	invite_member_min_paid_months: [0, 600],
+	invite_member_per_window: [0, 10_000],
+	invite_default_expiry_days: [1, 30]
+} as const;
+export type InvitePolicyKey = keyof typeof INVITE_POLICY_BOUNDS;
+export type InvitePolicy = Record<InvitePolicyKey, number>;
+const ADMIN_SETTINGS = '/v1/admin/settings';
+export function isInvitePolicyValue(key: InvitePolicyKey, value: unknown): value is number {
+	const [min, max] = INVITE_POLICY_BOUNDS[key];
+	return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
+}
+const invalidAdminSettings = (status: number) =>
+	new ApiError(status, 'request_failed', 'Invalid admin settings response');
+
+const MEMBER_INVITES = '/v1/me/invites';
+type MemberInviteBounds = Pick<InviteWindowSchedule, 'starts_at' | 'ends_at'>;
+type MemberInviteUsage = MemberInviteBounds & { used: number; remaining: number };
+export type MemberInviteSummary = {
+	paid_seconds: number;
+	required_paid_seconds: number;
+	entitled: boolean;
+	eligible: boolean;
+	per_window_limit: number;
+	open_window: MemberInviteUsage | null;
+	next_window: MemberInviteBounds | null;
+};
+
+const isCount = (value: unknown): value is number =>
+	typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+function hasInviteBounds(row: Partial<MemberInviteBounds> | null | undefined): row is MemberInviteBounds {
+	return row != null && isEpoch(row.starts_at) && isEpoch(row.ends_at) && row.starts_at < row.ends_at;
+}
+function isMemberInviteSummary(value: unknown): value is MemberInviteSummary {
+	const row = value as Partial<MemberInviteSummary> | null | undefined;
+	return row != null && isCount(row.paid_seconds) && isCount(row.required_paid_seconds) &&
+		typeof row.entitled === 'boolean' && typeof row.eligible === 'boolean' && isCount(row.per_window_limit) &&
+		(row.open_window === null || (hasInviteBounds(row.open_window) &&
+			isCount(row.open_window.used) && isCount(row.open_window.remaining))) &&
+		(row.next_window === null || hasInviteBounds(row.next_window));
+}
+
+export type MemberInviteHistory = {
+	invites: { id: number; created_at: number; expires_at: number; status: InviteStatus }[];
+	next_cursor: string | null;
+};
+
+function isMemberInviteHistoryRow(value: unknown): value is MemberInviteHistory['invites'][number] {
+	const row = value as Partial<MemberInviteHistory['invites'][number]> | null;
+	return row != null && isInviteId(row.id) && isEpoch(row.created_at) && isEpoch(row.expires_at) &&
+		row.status !== undefined && INVITE_STATUSES.includes(row.status);
+}
+
+export interface IssuedInvite {
+	code: string;
+	expires_at: number;
+}
+
+/** The Worker issues 16 random bytes encoded as unpadded base64url. */
+export function isMemberInviteCode(code: unknown): code is string {
+	return typeof code === 'string' && code.length === 22 && /^[A-Za-z0-9_-]{22}$/.test(code);
+}
+
+const REVOKE_ALL = '/v1/session/revoke-all';
+const LOGOUT = '/v1/session/logout';
+export class StaleSessionError extends ApiError {}
+const staleSession = () => new StaleSessionError(409, 'conflict', 'Could not verify the current session. Try signing out again.');
+const COOKIE_MUTATIONS = new Set([
+	'/v1/auth/magic/finish', '/v1/auth/passkey/register/finish', '/v1/auth/passkey/login/finish',
+	'/v1/session/reauthenticate/finish', '/v1/session/refresh', LOGOUT, REVOKE_ALL
+]);
+
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
@@ -279,12 +383,16 @@ export class ApiClient {
 		});
 	}
 
-	async put<T>(path: string, body: unknown): Promise<T> {
+	async put<T>(path: string, body: unknown, headers?: Record<string, string>): Promise<T> {
 		return this.request<T>(path, {
 			method: 'PUT',
-			headers: { 'content-type': 'application/json' },
+			headers: { ...headers, 'content-type': 'application/json' },
 			body: JSON.stringify(body)
 		});
+	}
+
+	async delete<T>(path: string, headers?: Record<string, string>): Promise<T> {
+		return this.request<T>(path, { method: 'DELETE', headers });
 	}
 
 	/**
@@ -312,9 +420,141 @@ export class ApiClient {
 		await this.post<unknown>('/v1/session/logout', {});
 	}
 
-	/** Revoke every session for the authenticated account. */
-	async revokeAllSessions(): Promise<{ ok: true }> {
-		return this.post<{ ok: true }>('/v1/session/revoke-all', {});
+	/** Bind the user confirmation to the browser's current auth generation. */
+	async revokeAllSessions(confirm: () => boolean): Promise<{ ok: true } | undefined> {
+		const expected = (await captureAuthFence())?.generation;
+		if (typeof window !== 'undefined' && !expected) throw staleSession();
+		if (!confirm()) return;
+		return (await this.requestWithStatus<{ ok: true }>(REVOKE_ALL, {
+			method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
+		}, expected)).data;
+	}
+
+	async listInviteWindows(signal: AbortSignal) {
+		const { data, status, headers } = await this.requestWithStatus<{ windows?: unknown } | null>(
+			INVITE_WINDOWS, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		const rows = data?.windows;
+		if (status !== 200 || !Array.isArray(rows) || rows.length > INVITE_WINDOW_LIMIT ||
+			!rows.every(isInviteWindow) || new Set(rows.map(({ id }) => id)).size !== rows.length)
+			throw invalidInviteWindows(status);
+		return { windows: rows.map(({ id, starts_at, ends_at, note }) => ({ id, starts_at, ends_at, note })),
+			serverTime: Date.parse(headers.get('date') ?? '') };
+	}
+
+	/** The Worker enforces admin role, Origin and fresh-session checks on every write. */
+	async writeInviteWindow(input: InviteWindowSchedule | number, signal: AbortSignal): Promise<InviteWindow> {
+		const close = typeof input === 'number';
+		const { data, status } = await this.requestWithStatus<{ window?: unknown } | null>(
+			close ? `${INVITE_WINDOWS}/${input}/close` : INVITE_WINDOWS,
+			{ method: 'POST', cache: 'no-store', redirect: 'error', signal,
+				...(close ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }) }
+		);
+		const row = data?.window;
+		if (status !== (close ? 200 : 201) || !isInviteWindow(row) || (close && row.id !== input))
+			throw invalidInviteWindows(status);
+		return row;
+	}
+
+	async listAdminInvites(filter: AdminInviteFilter, signal: AbortSignal): Promise<AdminInvite[]> {
+		let path = ADMIN_INVITES;
+		if (filter && 'issuer' in filter) {
+			if (!isInviteIssuerId(filter.issuer)) throw new TypeError('Invalid issuer user ID');
+			path += `/issuer/${filter.issuer}`;
+		} else if (filter) {
+			if (!INVITE_STATUSES.includes(filter.status)) throw new TypeError('Invalid invite status');
+			path += `/status/${filter.status}`;
+		}
+		const { data, status } = await this.requestWithStatus<{ invites?: unknown } | null>(
+			path, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		const rows = data?.invites;
+		if (status !== 200 || !Array.isArray(rows) || rows.length > ADMIN_INVITE_LIMIT ||
+			!rows.every(isAdminInvite) || new Set(rows.map(({ id }) => id)).size !== rows.length)
+			throw invalidAdminInvites(status);
+		return rows.map(({ id, status, issued_by, expires_at }) => ({ id, status, issued_by, expires_at }));
+	}
+
+	/** Issue a single invite. The code is returned once; never retry or persist it. */
+	async issueAdminInvite(input: { email?: string; expires_in_days?: number }, signal: AbortSignal): Promise<IssuedInvite> {
+		const { data, status } = await this.requestWithStatus<{ code?: unknown; invite?: Record<string, unknown> } | null>(
+			ADMIN_INVITES, { method: 'POST', cache: 'no-store', redirect: 'error', signal,
+				headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }
+		);
+		const row = data?.invite;
+		if (status !== 201 || !isMemberInviteCode(data?.code) || !isInviteId(row?.id) ||
+			row?.kind !== 'admin' || row.status !== 'active' || !isEpoch(row.expires_at) || row.expires_at === 0)
+			throw new ApiError(status, 'request_failed', 'Invalid invite issuance response', null, false);
+		return { code: data.code, expires_at: row.expires_at };
+	}
+
+	/** Bodyless, once-only dispatch; the Worker owns the authorization and audited write. */
+	async revokeAdminInvite(id: number, signal: AbortSignal): Promise<void> {
+		if (!isInviteId(id)) throw new TypeError('Invalid invite ID');
+		const { data, status } = await this.requestWithStatus<{ id?: unknown; status?: unknown } | null>(
+			`${ADMIN_INVITES}/${id}/revoke`, { method: 'POST', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 200 || data?.id !== id || data.status !== 'revoked') throw invalidAdminInvites(status);
+	}
+
+	async readInvitePolicy(signal: AbortSignal): Promise<InvitePolicy> {
+		const { data, status } = await this.requestWithStatus<{ settings?: InvitePolicy } | null>(
+			ADMIN_SETTINGS, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		const settings = data?.settings;
+		const keys = Object.keys(INVITE_POLICY_BOUNDS) as InvitePolicyKey[];
+		if (status !== 200 || !settings || !keys.every((key) => isInvitePolicyValue(key, settings[key])))
+			throw invalidAdminSettings(status);
+		return settings;
+	}
+
+	/** The Worker enforces admin role, Origin and fresh-session checks. Do not retry. */
+	async writeInvitePolicy(key: InvitePolicyKey, value: number, signal: AbortSignal): Promise<number> {
+		const { data, status } = await this.requestWithStatus<{ key?: unknown; value?: unknown } | null>(
+			`${ADMIN_SETTINGS}/${key}`, { method: 'PUT', cache: 'no-store', redirect: 'error', signal,
+				headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value }) }
+		);
+		if (status !== 200 || data?.key !== key || data.value !== value || !isInvitePolicyValue(key, data.value))
+			throw invalidAdminSettings(status);
+		return data.value;
+	}
+
+	/** Read only the browser member's current aggregate snapshot. */
+	async readMemberInvites(signal: AbortSignal): Promise<MemberInviteSummary> {
+		const { data, status } = await this.requestWithStatus<unknown>(
+			MEMBER_INVITES, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 200 || !isMemberInviteSummary(data))
+			throw new ApiError(status, 'request_failed', 'Invalid invite summary response', null, false);
+		return data;
+	}
+
+	/** Read one private history page in the browser session. The cursor is opaque. */
+	async readMemberInviteHistory(cursor: string | null, signal: AbortSignal): Promise<MemberInviteHistory> {
+		const query = cursor === null ? '' : `?cursor=${encodeURIComponent(cursor)}`;
+		const { data, status } = await this.requestWithStatus<{ invites?: unknown; next_cursor?: unknown } | null>(
+			`${MEMBER_INVITES}/history${query}`, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 200 || !Array.isArray(data?.invites) || !data.invites.every(isMemberInviteHistoryRow) ||
+			(data.next_cursor !== null && (typeof data.next_cursor !== 'string' || !data.next_cursor)))
+			throw new ApiError(status, 'request_failed', 'Invalid invite history response', null, false);
+		return {
+			invites: data.invites.map(({ id, created_at, expires_at, status }) => ({ id, created_at, expires_at, status })),
+			next_cursor: data.next_cursor
+		};
+	}
+
+	/** Spend one invite from the browser session's current window. Do not retry automatically. */
+	async issueMemberInvite(signal: AbortSignal): Promise<IssuedInvite> {
+		const { data, status } = await this.requestWithStatus<Partial<IssuedInvite> | null>(
+			MEMBER_INVITES, { method: 'POST', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 201 || !isMemberInviteCode(data?.code) ||
+			typeof data.expires_at !== 'number' || !Number.isSafeInteger(data.expires_at) ||
+			data.expires_at <= 0 || data.expires_at > 8_640_000_000_000) {
+			throw new ApiError(status, 'request_failed', 'Invalid invite response', null, false);
+		}
+		return { code: data.code, expires_at: data.expires_at };
 	}
 
 	/**
@@ -424,8 +664,9 @@ export class ApiClient {
 
 	private async requestWithStatus<T>(
 		path: string,
-		init: RequestInit
-	): Promise<{ data: T; status: number }> {
+		init: RequestInit,
+		expected?: string
+	): Promise<{ data: T; status: number; headers: Headers }> {
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
 			accept: 'application/json'
@@ -448,12 +689,18 @@ export class ApiClient {
 		}, API_REQUEST_TIMEOUT_MS);
 		try {
 			callerSignal?.throwIfAborted();
-			const response = await this.fetchFn(`${this.baseUrl}${path}`, {
+			const url = `${this.baseUrl}${path}`;
+			const route = init.method === 'POST' && new URL(url, globalThis.document?.baseURI ?? 'http://localhost').pathname;
+			const dispatch = () => this.fetchFn(url, {
 				...init,
 				signal: controller.signal,
 				headers,
 				credentials: 'include'
 			});
+			const intent = route === REVOKE_ALL ? { stale: staleSession(), revocation: { generation: expected } }
+				: route === LOGOUT ? { stale: staleSession() } : undefined;
+			const response = await (route && COOKIE_MUTATIONS.has(route)
+				? runAuthMutation(controller.signal, dispatch, intent) : dispatch());
 			// A transport may ignore abort; never publish an abandoned response.
 			callerSignal?.throwIfAborted();
 			if (!response.ok) {
@@ -463,9 +710,10 @@ export class ApiClient {
 				try {
 					body = await readCappedJson(response);
 				} catch (error) {
-					// A body read cut short by the deadline surfaces the
-					// timeout, not a status default.
-					if (timedOut) throw this.timeoutError();
+					// Invite reads must not lose a known denial and retain private rows.
+					if (timedOut && !(init.method === 'GET' &&
+						[MEMBER_INVITES, `${MEMBER_INVITES}/history`].includes(path.split('?', 1)[0]) &&
+						[401, 403, 404, 409].includes(response.status))) throw this.timeoutError();
 					// An over-cap error body is never parsed: the generic
 					// status fallback applies, never retryable (an over-cap
 					// body does not become acceptable on retry), with no
@@ -484,7 +732,7 @@ export class ApiClient {
 			try {
 				const data = (await readCappedJson(response)) as T;
 				callerSignal?.throwIfAborted();
-				return { data, status: response.status };
+				return { data, status: response.status, headers: response.headers };
 			} catch (error) {
 				if (timedOut) throw this.timeoutError();
 				// An over-cap 2xx never parses: surface the typed error, never

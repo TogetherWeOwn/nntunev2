@@ -177,16 +177,15 @@ test.describe('production preflight (exact checked-in block, offline)', () => {
     expect(result.output).toContain('bare hostname');
   });
 
-  test('accepts an enabled lane with a valid sha and domain', () => {
+  test('refuses promotion even with the enable flag, valid SHA and domain', () => {
     const result = runShell(script!, {
       ...STEP_ENV,
       INPUT_SHA: VALID_SHA,
       PRODUCTION_DEPLOY_ENABLED: 'true',
       PRODUCTION_DOMAIN: 'example.com',
     });
-    expect(result.status).toBe(0);
-    expect(result.output).toContain(`sha=${VALID_SHA}`);
-    expect(result.output).toContain('domain=example.com');
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('Application promotion is disabled');
   });
 });
 

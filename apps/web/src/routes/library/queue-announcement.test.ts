@@ -5,7 +5,7 @@ import { createQueueShare } from '#lib/player/queueShare.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
-import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary, selectFavoriteItems } from '#lib/library/favorites.js';
+import { loadFavorites, favoritesKey, clearFavoritesAtAuthBoundary, selectFavoriteItems, updateStoredFavorites } from '#lib/library/favorites.js';
 import {
 	clearRecentFindsAtAuthBoundary,
 	loadRecentFinds,
@@ -14,8 +14,7 @@ import {
 } from '#lib/library/recent-finds.js';
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
-import { displayArtist, displayTitle, orderLibraryItems } from '#lib/library/order.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { displayArtist, displayTitle, orderLibraryItems, shortTitle } from '#lib/library/order.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
 import { libraryTabTitle } from '#lib/library/tab-title.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
@@ -93,9 +92,8 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare, createPlayerController,
+		createQueueShare, getAppPlayer: () => createPlayerController(queueFunctions.createQueue([]), { flush: () => Promise.resolve() }),
 		createFavoritesExport,
-		moveTrack: queueFunctions.moveTrack,
 		nextTrack: queueFunctions.nextTrack,
 		playNext: queueFunctions.playNext,
 		removeTrack: queueFunctions.removeTrack,
@@ -103,7 +101,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		selectQueueIndex: queueFunctions.selectTrack,
 		shuffleUpcoming: queueFunctions.shuffleUpcoming,
 		loadFavorites,
-		saveFavorites,
+		favoritesKey, updateStoredFavorites,
 		clearFavoritesAtAuthBoundary,
 		clearRecentFindsAtAuthBoundary,
 		loadRecentFinds,
@@ -113,8 +111,6 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		createLibraryRefresher,
 		displayArtist,
 		displayTitle,
-		clearMiniPlayerHint,
-		setMiniPlayerHint,
 		orderLibraryItems,
 		filterLibraryItems,
 		libraryTabTitle,
@@ -135,16 +131,23 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		clearSignedInEmail: () => {},
 		resolveStreamUrl: () => null,
 		onMount: () => {},
+		$effect: { pre: () => {} },
+		shortTitle,
 		tick: () => Promise.resolve(),
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `${compiled}
 		return {
-			refresh, selectTrack, moveQueuedTrack, toggleFavorite,
+			refresh, selectTrack, moveQueuedTrack: player.moveQueuedTrack, toggleFavorite,
 			dispose: refresher.dispose, subscribeQueue: queueController.subscribe,
-			handleAuthTransition, handleLocalAuthTransition, unstarFromShelf, confirmClearFavorites,
-			read: () => ({ queue, announcement: queueAnnouncement, items, loadError }),
+			handleAuthTransition: (event) => {
+				if (event.key === LIBRARY_AUTH_TRANSITION_KEY) player.purgeAtAuthBoundary();
+				handleAuthTransition(event);
+			},
+			handleLocalAuthTransition: () => { player.purgeAtAuthBoundary(); handleLocalAuthTransition(); },
+			unstarFromShelf, confirmClearFavorites,
+			read: () => ({ queue, announcement: player.queueAnnouncement.text, items, loadError }),
 			readFavorites: () => ({ favorites, announcement: favoritesAnnouncement }),
 			// Fixture setup only: do not call a non-move page edit, which would
 			// clear the announcement before the handler under test ever runs.

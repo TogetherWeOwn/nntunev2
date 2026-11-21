@@ -41,6 +41,7 @@ export const TESTIDS = {
   // player) move to the persistent player bar. See helpers/player-ui.ts
   // and e2e/README.md ("Player contract migration").
   audioPlayer: 'audio-player',
+  playerSeek: 'player-seek',
   usageMeter: 'usage-meter',
   nowPlaying: 'now-playing',
   playerNext: 'player-next',
@@ -64,7 +65,6 @@ export const TESTIDS = {
 export const PENDING_TESTIDS = {
   playerBar: 'player-bar',
   playerPlayPause: 'player-play-pause',
-  playerSeek: 'player-seek',
   playerVolume: 'player-volume',
 } as const;
 

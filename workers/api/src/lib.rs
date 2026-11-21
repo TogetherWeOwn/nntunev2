@@ -26,6 +26,7 @@ static LEDGER_ALLOCATOR: std::alloc::System = std::alloc::System;
 pub mod account_deletion;
 pub mod admin;
 pub mod admin_ingest;
+pub mod admin_invite_tree;
 pub mod api_error;
 pub mod auth;
 pub mod b64;
@@ -48,6 +49,7 @@ pub mod ingest_session_request;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;
 pub mod library;
+pub mod listen_history;
 mod magic_redemption;
 pub mod meter_sink;
 pub mod native_rest;
@@ -192,6 +194,9 @@ mod ledger_wasm_test {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+mod subsonic_measurement;
+
 // The synthetic Node build exports only the adapter, not the Worker entry
 // whose database transport imports the Cloudflare-only sockets module.
 #[cfg(not(all(
@@ -204,14 +209,16 @@ mod ledger_wasm_test {
 )))]
 #[worker::event(fetch)]
 pub async fn main(
-    req: worker::Request,
+    req: worker::web_sys::Request,
     env: worker::Env,
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
-    // The Subsonic `/rest/*` surface (wasm32 only) adapts to the
-    // transport-free `nntune-subsonic` dispatcher. Every other path keeps
-    // `worker_entry::dispatch` behavior; the path peek only borrows, so an
-    // unclaimed request still moves into dispatch untouched.
+    // Admit measurement on the raw request before the SDK copies its URL.
+    #[cfg(target_arch = "wasm32")]
+    if let Some(response) = subsonic_measurement::mount(&req, &env).await {
+        return response;
+    }
+    let req = worker::Request::from(req);
     #[cfg(target_arch = "wasm32")]
     if is_subsonic_request(&req) {
         let mut req = req;
@@ -225,9 +232,107 @@ pub async fn main(
 #[worker::event(fetch)]
 pub async fn billing_owned_test_entry(
     req: worker::Request,
-    _env: worker::Env,
+    env: worker::Env,
     _ctx: worker::Context,
 ) -> worker::Result<worker::Response> {
+    if req.method() == worker::Method::Post {
+        match req.path().as_str() {
+            #[cfg(not(feature = "staging-body-wasm-test"))]
+            "/subsonic-connect-deadline-proof" => {
+                return match subsonic_measurement::test_connect_deadline().await {
+                    Ok(()) => worker::Response::ok("subsonic-connect-deadline-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            "/billing-webhook-ack-proof" => {
+                return worker_entry::billing_webhook_ack_test::deliver(req, env, true).await;
+            }
+            "/billing-webhook-retry-proof" => {
+                return worker_entry::billing_webhook_ack_test::deliver(req, env, false).await;
+            }
+            path @ ("/billing-restricted-history-proof" | "/billing-restricted-history-replay") => {
+                let replay = path == "/billing-restricted-history-replay";
+                return match worker_entry::billing_deadline_test::test_restricted_history(replay)
+                    .await
+                {
+                    Ok(()) => worker::Response::ok("billing-restricted-history-ok"),
+                    Err(_) => worker::Response::error("billing-restricted-history-failed", 500),
+                };
+            }
+            "/billing-raw-update-proof" => {
+                return match worker_entry::billing_deadline_test::test_reconcile_raw_update().await
+                {
+                    Ok(()) => worker::Response::ok("billing-raw-update-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            path @ ("/billing-raw-insert-commit-proof" | "/billing-raw-insert-rollback-proof") => {
+                let commit = path == "/billing-raw-insert-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_after_raw_insert(
+                    commit,
+                )
+                .await
+                {
+                    Ok(()) => worker::Response::ok("billing-raw-insert-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            path @ ("/billing-worker-first-insert-commit-proof"
+            | "/billing-worker-first-insert-rollback-proof") => {
+                let commit = path == "/billing-worker-first-insert-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_before_raw_insert(
+                    commit,
+                )
+                .await
+                {
+                    Ok(()) => worker::Response::ok("billing-worker-first-insert-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            path
+            @ ("/billing-raw-replace-commit-proof" | "/billing-raw-replace-rollback-proof") => {
+                let commit = path == "/billing-raw-replace-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_raw_replace(commit)
+                    .await
+                {
+                    Ok(()) => worker::Response::ok("billing-raw-replace-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            path @ ("/billing-parent-delete-commit-proof"
+            | "/billing-parent-delete-rollback-proof") => {
+                let commit = path == "/billing-parent-delete-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_before_parent_delete(
+                    commit,
+                ).await {
+                    Ok(()) => worker::Response::ok("billing-parent-delete-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            path @ ("/billing-parent-first-delete-commit-proof"
+            | "/billing-parent-first-delete-rollback-proof") => {
+                let commit = path == "/billing-parent-first-delete-commit-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_after_parent_delete(
+                    commit,
+                ).await {
+                    Ok(()) => worker::Response::ok("billing-parent-first-delete-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            "/billing-parent-cycle-proof" | "/billing-row-update-cycle-proof" => {
+                let row_update = req.path() == "/billing-row-update-cycle-proof";
+                return match worker_entry::billing_deadline_test::test_reconcile_lock_cycle(
+                    row_update,
+                )
+                .await
+                {
+                    Ok(()) => worker::Response::ok("billing-lock-cycle-ok"),
+                    Err(message) => worker::Response::error(message, 500),
+                };
+            }
+            _ => {}
+        }
+    }
     if req.method() == worker::Method::Post && req.path() == "/billing-ack-proof" {
         return match worker_entry::billing_budget::test_commit_ack().await {
             Ok(pid) => worker::Response::ok(format!("billing-ack-ok:{pid}")),

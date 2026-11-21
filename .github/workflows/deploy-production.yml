@@ -2,7 +2,7 @@ name: deploy-production
 
 # Production promotion for the web frontend (apps/web only).
 #
-# Cutover only. Never runs on push, PR, release, or another workflow.
+# Manual only; never runs on push, PR, release, or another workflow.
 # Disabled by default: the preflight job refuses unless the repo variable
 # PRODUCTION_DEPLOY_ENABLED is exactly "true". The production hostname is
 # decided at launch; until then the workflow builds against the placeholder
@@ -57,9 +57,9 @@ on:
         type: string
         default: ""
       mode:
-        description: "Promote the app"
+        description: "Seed unexposed maintenance (app promotion is disabled)"
         type: choice
-        options: [promote]
+        options: [promote, bootstrap-maintenance]
         default: promote
 
 permissions:
@@ -101,19 +101,14 @@ jobs:
           PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
           PRODUCTION_DOMAIN: ${{ vars.PRODUCTION_DOMAIN }}
           UNPROTECTED_ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+          UNPROTECTED_WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          UNPROTECTED_ROUTE_PROOF: ${{ vars.PRODUCTION_BOOTSTRAP_ROUTE_PROOF }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF" != refs/heads/main ] || [ -n "$UNPROTECTED_ACCEPTED_SHA" ]; then
             echo '::error::Dispatch on main; PRODUCTION_ACCEPTED_SHA must exist only in the production Environment'
             exit 1
           fi
-          case "$DEPLOY_MODE" in
-            bootstrap-maintenance)
-              echo '::error::Maintenance bootstrap unavailable: no verified Worker-scoped first-deploy operation that refuses an incumbent. See docs/ops.md.'
-              exit 1;;
-            promote) ;;
-            *) echo '::error::Unknown production deploy mode'; exit 1;;
-          esac
           if [ "${PRODUCTION_DEPLOY_ENABLED:-}" != "true" ]; then
             echo "::error::Production lane disabled: repo variable PRODUCTION_DEPLOY_ENABLED must be exactly true"
             exit 1
@@ -128,11 +123,16 @@ jobs:
             exit 1
           fi
           case "$domain" in
-            *\ *|*/*|*:*) echo "::error::PRODUCTION_DOMAIN must be a bare hostname (no scheme, path, port or spaces)"; exit 1;;
+            *[!a-zA-Z0-9.-]*) echo '::error::PRODUCTION_DOMAIN must be a bare hostname'; exit 1;;
           esac
+          [ "$DEPLOY_MODE" = bootstrap-maintenance ] ||
+            { echo '::error::Application promotion is disabled; only bootstrap-maintenance is supported'; exit 1; }
+          [ "$INPUT_SHA" = "${GITHUB_SHA:-}" ] ||
+            { echo '::error::Bootstrap SHA must match the dispatched main commit'; exit 1; }
+          [ -z "${UNPROTECTED_WORKER_ID:-}${UNPROTECTED_ROUTE_PROOF:-}" ] ||
+            { echo '::error::Worker ID and route proof must exist only in the production Environment'; exit 1; }
           echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
           echo "domain=$domain" >> "$GITHUB_OUTPUT"
-          echo "Promotion target: $INPUT_SHA -> $domain (lane enabled)"
 
   staging-evidence:
     name: staging-evidence
@@ -156,8 +156,12 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          # Check inheritance from outside production without passing secret values to this runner.
+          UNPROTECTED_CF_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' }}
         run: |
           set -euo pipefail
+          [ "${UNPROTECTED_CF_CONFIG:-}" = false ] ||
+            { echo '::error::Cloudflare credentials must exist only in the production Environment'; exit 1; }
           python3 - <<'PY'
           import json, os, sys, urllib.request
 
@@ -238,6 +242,7 @@ jobs:
 
   deploy-production:
     name: deploy-production
+    if: inputs.mode == 'promote'
     needs: [preflight, staging-evidence]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -459,6 +464,45 @@ jobs:
           path: ${{ runner.temp }}/promotion.json
           if-no-files-found: error
           retention-days: 30
+
+  bootstrap-maintenance:
+    name: bootstrap-maintenance
+    if: inputs.mode == 'bootstrap-maintenance'
+    needs: [preflight, staging-evidence]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    concurrency:
+      group: production-worker-mutation
+      cancel-in-progress: false
+    environment: production
+    steps:
+      - name: Require the exact Release Manager-accepted SHA
+        env:
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+        run: |
+          set -euo pipefail
+          # A partial rerun can reuse successful preflight and staging admission.
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 && -n "$ACCEPTED_SHA" && "$DEPLOY_SHA" == "$ACCEPTED_SHA" ]] ||
+            { echo '::error::Use a fresh dispatch whose SHA matches PRODUCTION_ACCEPTED_SHA in the production Environment'; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Seed only the pinned, empty maintenance Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          ROUTE_PROOF: ${{ vars.PRODUCTION_BOOTSTRAP_ROUTE_PROOF }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+        run: node ci/production-maintenance/seed.mjs
 
   release:
     name: release

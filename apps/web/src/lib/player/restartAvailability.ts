@@ -1,4 +1,4 @@
-import { seekableIncludesStart } from '#lib/player/seekableIncludesStart.js';
+import { seekableIncludesStart } from './seekableIncludesStart.js';
 
 export function restartIsAvailable(element: HTMLAudioElement, matches = () => true): boolean {
 	try {

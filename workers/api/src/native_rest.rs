@@ -448,6 +448,34 @@ pub enum RouteDecision {
     Deny,
 }
 
+/// Match the route shape; the handler validates the target's identity.
+pub(crate) fn like_track_target(path: &str) -> Option<&str> {
+    path.strip_prefix("/v1/me/likes/track/")
+        .filter(|target| !target.is_empty() && !target.contains('/'))
+}
+
+pub(crate) const MEMBER_INVITES_PATH: &str = "/v1/me/invites";
+pub(crate) const MEMBER_INVITE_HISTORY_PATH: &str = "/v1/me/invites/history";
+pub(crate) const ADMIN_INVITE_WINDOWS_PATH: &str = "/v1/admin/invite-windows";
+
+pub(crate) fn admin_invite_tree_user(path: &str) -> Option<&str> {
+    let id = path
+        .strip_prefix("/v1/admin/users/")?
+        .strip_suffix("/invite-tree")?;
+    crate::ledger::is_valid_key_field(id, crate::ledger::MAX_USER_ID_LEN).then_some(id)
+}
+
+pub(crate) fn admin_invite_window_close_id(path: &str) -> Option<i64> {
+    let id = path
+        .strip_prefix(ADMIN_INVITE_WINDOWS_PATH)?
+        .strip_prefix('/')?
+        .strip_suffix("/close")?;
+    if id.is_empty() || id.starts_with('0') || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    id.parse().ok()
+}
+
 /// The exhaustive default-deny map (ADR 0010). Methods match exact
 /// uppercase (`"get"` fails closed); paths match the listed collection
 /// roots plus subpaths. The HTTP layer passes the path without the query
@@ -491,7 +519,14 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             // Session-only reads (never reachable by bearer).
             if matches!(
                 path,
-                "/v1/me" | "/v1/indexers" | "/v1/me/likes" | "/v1/me/taste"
+                "/v1/me"
+                    | "/v1/indexers"
+                    | "/v1/me/likes"
+                    | "/v1/me/likes/session"
+                    | "/v1/me/taste"
+                    | "/v1/me/history"
+                    | MEMBER_INVITES_PATH
+                    | MEMBER_INVITE_HISTORY_PATH
             ) {
                 return SessionOnly;
             }
@@ -508,7 +543,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             // Admin surface (migration 0028): session + fresh DB role,
             // never bearer.
-            if path == "/v1/admin/settings" {
+            if matches!(path, "/v1/admin/settings" | ADMIN_INVITE_WINDOWS_PATH)
+                || admin_invite_tree_user(path).is_some()
+            {
                 return SessionOnly;
             }
             // Admin ingest reads (migration 0034): the exact list path
@@ -578,6 +615,8 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
                 || path == "/v1/admin/ingest"
+                || path == "/v1/me/likes/import"
+                || path == MEMBER_INVITES_PATH
             {
                 return SessionOnly;
             }
@@ -587,6 +626,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                         return SessionOnly;
                     }
                 }
+            }
+            if path == ADMIN_INVITE_WINDOWS_PATH || admin_invite_window_close_id(path).is_some() {
+                return SessionOnly;
             }
             // Admin invite writes (migration 0033): issue at the bare
             // path, revoke at `{id}/revoke`. Session-only, like the
@@ -610,7 +652,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/me" || path == "/v1/me/private-session" {
+            if matches!(path, "/v1/me" | "/v1/me/private-session" | "/v1/me/taste")
+                || like_track_target(path).is_some()
+            {
                 return SessionOnly;
             }
             // Admin writes (migration 0028): one setting key, or one
@@ -642,7 +686,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
             }
-            if path == "/v1/account" {
+            if matches!(path, "/v1/account" | "/v1/me/taste") || like_track_target(path).is_some() {
                 return SessionOnly;
             }
             if one_segment_after("/v1/subsonic-credentials/", path) {

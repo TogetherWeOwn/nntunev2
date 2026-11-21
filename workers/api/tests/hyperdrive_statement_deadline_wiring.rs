@@ -266,12 +266,8 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
     let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
-    let prototype = store.split_once(prototype_gate).expect("prototype gate").1;
-    let store = store.replacen(
-        function_body(prototype, "asyncfnstore_reconcile_outcome("),
-        "{}",
-        1,
-    );
+    let prototype = format!("{prototype_gate}asyncfnstore_reconcile_outcome(");
+    let store = store.replacen(function_body(store, &prototype), "{}", 1);
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
@@ -321,7 +317,7 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         } else if name == "acquire_playback_lease" {
             assert_eq!(
                 function_body(piece, name),
-                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,expires_at,takeover,).await}",
+                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,continuation_deadline,takeover,).await}",
                 "lease acquisition must delegate its entire operation to the bounded helper"
             );
             assert_bounded(
@@ -504,6 +500,7 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     ]
     .map(|name| (name, function_body(store, &format!("asyncfn{name}("))));
     let helpers = [
+        "invite_by_hash_on",
         "reap_unverified_users_on",
         "prune_expired_challenges_on",
         "delete_expired_rate_limit_slots",
@@ -515,7 +512,10 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     .map(|name| (name, function_body(&source, &format!("asyncfn{name}("))));
     for (name, body) in methods.iter().chain(helpers.iter()) {
         assert!(
-            body.contains(".query_typed("),
+            body.contains(match *name {
+                "invite_by_hash" => "invite_by_hash_on(&client,code_hash).await",
+                _ => ".query_typed(",
+            }),
             "{name} must run its statements unnamed via query_typed"
         );
         for named in [
@@ -622,6 +622,57 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
             !pg_impl.contains(named),
             "redemption transaction must not run a named prepared statement ({named})"
         );
+    }
+}
+
+#[test]
+fn history_controls_wire_to_postgres_storage() {
+    let source = production();
+    let dispatch = function_body(&source, "pubasyncfndispatch(");
+    assert!(dispatch.contains("store:&PgStore{"));
+    assert!(dispatch.contains("handle_with_transport_headers(&ctx,collected_request,&headers_map)"));
+    let store = source.split_once("implStoreforPgStore{").unwrap().1;
+    for (method, operation) in [
+        ("export_listen_events", "export(&client,owner,before)"),
+        ("clear_listen_events", "clear(&mutclient,owner)"),
+    ] {
+        let body = function_body(store, &format!("asyncfn{method}("));
+        assert!(body.contains("self.connect().await?"), "{method}");
+        assert!(
+            body.contains(&format!("crate::listen_history::{operation}.await")),
+            "{method}"
+        );
+    }
+}
+
+#[test]
+fn listen_history_statements_run_unnamed_through_query_typed() {
+    let source: String = include_str!("../src/listen_history.rs")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    for name in [
+        "owner_is_deleting",
+        "record",
+        "clear_in_transaction",
+        "export",
+    ] {
+        let body = function_body(&source, &format!("asyncfn{name}("));
+        assert!(
+            body.contains(".query_typed("),
+            "{name} must use unnamed statements"
+        );
+        for named in [
+            ".query(",
+            ".query_one(",
+            ".query_opt(",
+            ".query_raw(",
+            ".execute(",
+            ".execute_raw(",
+            ".prepare",
+        ] {
+            assert!(!body.contains(named), "{name} must not use {named}");
+        }
     }
 }
 

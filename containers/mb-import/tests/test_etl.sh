@@ -11,36 +11,29 @@ trap 'rm -rf "$temp_dir"' EXIT
 cp -R "$fixtures/mbdump" "$temp_dir/mbdump"
 DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/mbdump"
 diff -u "$expected/mbdump-artist.tsv" "$temp_dir/mbdump/curated/mbdump-artist.tsv"
+diff -u "$expected/mbdump-artist_alias.tsv" "$temp_dir/mbdump/curated/mbdump-artist_alias.tsv"
 diff -u "$expected/mbdump-release_group.tsv" "$temp_dir/mbdump/curated/mbdump-release_group.tsv"
+diff -u "$expected/mbdump-release_group_alias.tsv" "$temp_dir/mbdump/curated/mbdump-release_group_alias.tsv"
 diff -u "$expected/mbdump-release.tsv" "$temp_dir/mbdump/curated/mbdump-release.tsv"
+diff -u "$expected/mbdump-release_alias.tsv" "$temp_dir/mbdump/curated/mbdump-release_alias.tsv"
+diff -u "$expected/mbdump-release_credit.tsv" "$temp_dir/mbdump/curated/mbdump-release_credit.tsv"
 diff -u "$expected/mbdump-recording.tsv" "$temp_dir/mbdump/curated/mbdump-recording.tsv"
 diff -u "$expected/mbdump-url.tsv" "$temp_dir/mbdump/curated/mbdump-url.tsv"
 diff -u "$expected/mbdump-artist_url.tsv" "$temp_dir/mbdump/curated/mbdump-artist_url.tsv"
 diff -u "$expected/mbdump-recording_url.tsv" "$temp_dir/mbdump/curated/mbdump-recording_url.tsv"
 diff -u "$expected/mbdump-recording_music_video.tsv" "$temp_dir/mbdump/curated/mbdump-recording_music_video.tsv"
 diff -u "$expected/mbdump-recording_isrc.tsv" "$temp_dir/mbdump/curated/mbdump-recording_isrc.tsv"
+diff -u "$expected/mbdump-work_alias.tsv" "$temp_dir/mbdump/curated/mbdump-work_alias.tsv"
+diff -u "$expected/mbdump-label_alias.tsv" "$temp_dir/mbdump/curated/mbdump-label_alias.tsv"
 
-# The preserved core-dump cover rows share endpoints with music-video rows.
-# Give one excluded edge a nonexistent endpoint so a mistaken admission cannot
-# hide behind duplicate canonicalization of the existing music-video pair.
-cp -R "$fixtures/mbdump" "$temp_dir/excluded-cover"
-python3 - "$temp_dir/excluded-cover/l_recording_recording" <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-lines = path.read_text().splitlines(keepends=True)
-if sum(line.startswith('323\t214\t50\t51\t') for line in lines) != 1:
-    raise ValueError('expected exactly one excluded cover row')
-lines = [line.replace('323\t214\t50\t51\t', '323\t214\t50\t99999\t') for line in lines]
-path.write_text(''.join(lines))
-PY
-DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/excluded-cover"
-diff -u "$expected/mbdump-recording_music_video.tsv" "$temp_dir/excluded-cover/curated/mbdump-recording_music_video.tsv"
+# Both directed core-dump cover rows share endpoints with the legacy video pair.
+diff -u "$expected/mbdump-recording_recording.tsv" "$temp_dir/mbdump/curated/mbdump-recording_recording.tsv"
 
-# Even an excluded relationship must have the upstream COPY row width.
+# Every relationship must have the upstream COPY row width.
 cp -R "$fixtures/mbdump" "$temp_dir/malformed-cover"
 printf '325\t214\t50\n' >> "$temp_dir/malformed-cover/l_recording_recording"
 if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/malformed-cover" 2>"$temp_dir/malformed-cover.err"; then
-  echo 'expected malformed excluded relationship failure' >&2
+  echo 'expected malformed recording relationship failure' >&2
   exit 1
 fi
 grep -q 'row 6: expected 9 fields, got 3' "$temp_dir/malformed-cover.err"
@@ -98,7 +91,7 @@ if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/dangling-url"
 fi
 grep -q 'artist-url link references missing url' "$temp_dir/dangling-url.err"
 
-if DUMP_TS= "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/timestamp.err"; then
+if DUMP_TS='' "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/timestamp.err"; then
   echo 'expected missing timestamp failure' >&2
   exit 1
 fi
@@ -112,12 +105,42 @@ if DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/unknown-count
 fi
 grep -q 'missing input file: .*release_unknown_country' "$temp_dir/unknown-country-missing.err"
 
+# The disk-bounded path publishes the same credit bytes under the packed name.
+cp -R "$fixtures/mbdump" "$temp_dir/packed"
+MB_ETL_GZIP_OUTPUT=1 DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/packed"
+gzip -dc "$temp_dir/packed/curated/mbdump-release_credit.tsv.gz" > "$temp_dir/packed-credit.tsv"
+diff -u "$expected/mbdump-release_credit.tsv" "$temp_dir/packed-credit.tsv"
+
 # Publication survival: identical same-DUMP_TS reruns reuse the published
 # snapshot byte-for-byte; changed or failed reruns must leave the published
-# snapshot, its symlink target and all ten TSV hashes untouched.
+# snapshot, its symlink target and all TSV hashes untouched.
 published_target="$(readlink "$temp_dir/mbdump/curated")"
 published_hashes="$temp_dir/published.sha256"
-( cd "$temp_dir/mbdump/curated" && sha256sum mbdump-artist.tsv mbdump-release_group.tsv mbdump-release.tsv mbdump-recording.tsv mbdump-track.tsv mbdump-url.tsv mbdump-artist_url.tsv mbdump-recording_url.tsv mbdump-recording_music_video.tsv mbdump-recording_isrc.tsv > "$published_hashes" )
+( cd "$temp_dir/mbdump/curated" && sha256sum mbdump-*.tsv > "$published_hashes" )
+
+# Credit text can change without affecting the first-artist release projection.
+credit_names="$temp_dir/mbdump/artist_credit_name"
+cp "$credit_names" "$temp_dir/credits.bak"
+sed -i 's/Second Artist/Guest Artist/' "$credit_names"
+if DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/changed-credit.err"; then
+  echo 'expected same-timestamp changed-credit refusal' >&2
+  exit 1
+fi
+grep -q 'already has different curated output' "$temp_dir/changed-credit.err"
+[[ "$(readlink "$temp_dir/mbdump/curated")" == "$published_target" ]]
+( cd "$temp_dir/mbdump/curated" && sha256sum -c "$published_hashes" )
+
+# The same position for two artists is ambiguous even when it is not first.
+cp "$temp_dir/credits.bak" "$credit_names"
+printf '300\t1\t10\tGuest Artist\t\n' >> "$credit_names"
+if DUMP_TS=2025-02-03T04:05:08Z "$container_dir/etl.sh" "$temp_dir/mbdump" 2>"$temp_dir/duplicate-credit.err"; then
+  echo 'expected duplicate credit position failure' >&2
+  exit 1
+fi
+grep -q 'UNIQUE constraint failed: artist_credit_name.credit, artist_credit_name.position' "$temp_dir/duplicate-credit.err"
+[[ "$(readlink "$temp_dir/mbdump/curated")" == "$published_target" ]]
+( cd "$temp_dir/mbdump/curated" && sha256sum -c "$published_hashes" )
+cp "$temp_dir/credits.bak" "$credit_names"
 
 # Identical input at the same DUMP_TS reuses the existing snapshot.
 DUMP_TS=2025-02-03T04:05:07Z "$container_dir/etl.sh" "$temp_dir/mbdump"
