@@ -4,7 +4,7 @@ import { get } from 'svelte/store';
 import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle, shortTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint, onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 import { createQueueShare } from '#lib/player/queueShare.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
@@ -87,13 +87,12 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		buildShareQuery, queueCurrentTrack: currentTrack, navigator: { clipboard },
 		$state: { raw: <T>(value: T) => value },
 		routeCleanup,
-		clearMiniPlayerHint: () => { routeCleanup.push('hint'); clearMiniPlayerHint(); },
 		createQueueShare: (...args: Parameters<typeof createQueueShare>) => {
 			const share = createQueueShare(...args);
 			return { ...share, dispose: () => { routeCleanup.push('share'); share.dispose(); } };
 		},
-		createPlayerController: (_: ReturnType<typeof createQueue>, end: Parameters<typeof createPlayerController>[1]) => {
-			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), end,
+		getAppPlayer: () => {
+			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), { flush: tick },
 				(audio, source) => audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
 			const invalidate = player.browseCopy.invalidate;
 			player.browseCopy.invalidate = () => { onInvalidateBrowseCopy(); return invalidate(); };
@@ -130,7 +129,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		return {
 			detach: media.attach(element),
 			restart: media.restart, applyShareLink, retryShare: (type = 'loadedmetadata') => capture(type)(), jump: media.jump,
-			resetAuth: resetShareAtAuthBoundary,
+			resetAuth: () => { resetShareAtAuthBoundary(); player.purgeAtAuthBoundary(); },
+			destroyPlayer: player.destroy,
 			repopulateLibrary: () => player.reconcileLibrary(items, () => true) && selectTrack(track.id),
 			copyTrackLink, copyQueueLink: queueShare.copy,
 			refreshLibrary: () => player.reconcileLibrary(items, () => true, (queueChanged) => {
@@ -167,6 +167,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		move: (from: number, to: number) => void;
 		clear: () => void;
 		cleanup: () => void;
+		destroyPlayer: () => void;
 		trimPrevious: () => void;
 		trimUpcoming: () => void;
 		playQueued: (id: string) => Promise<void>;
@@ -900,7 +901,7 @@ test('a late rejection cannot report against a replacement attachment at the sam
 	expect(page.read()).toEqual(before);
 });
 
-test('Library cleanup fences queue copy before pausing and disposes the route once', async () => {
+test('Library cleanup fences both copy receipts without pausing the shared decoder', async () => {
 	const { page, element, track, clipboard, routeCleanup } = restartFixture();
 	page.replaceQueue(createQueue([{ ...track, artist: '' }]));
 	expect(readMiniPlayerHint()?.trackId).toBe(track.id);
@@ -909,25 +910,19 @@ test('Library cleanup fences queue copy before pausing and disposes the route on
 	clipboard.writeText.mockReturnValue(pending);
 	const copies = [page.copyTrackLink(track.id), page.copyQueueLink(track.id)];
 	expect(clipboard.writeText).toHaveBeenCalledTimes(2);
-	const before = page.readCopy();
 	element.paused = false;
-	const pause = vi.spyOn(element, 'pause').mockImplementation(() => {
-		expect(routeCleanup).toEqual(['drag', 'share']);
-		expect(page.currentAudio()).toBeUndefined();
-		expect(readMiniPlayerHint()?.trackId).toBe(track.id);
-		page.cleanup();
-		page.detach();
-		element.paused = true;
-	});
+	const pause = vi.spyOn(element, 'pause');
 
 	page.cleanup();
 	page.cleanup();
+	const afterCleanup = page.readCopy();
 	finish();
 	await Promise.all(copies);
-	expect(pause).toHaveBeenCalledOnce();
-	expect(page.readCopy()).toEqual(before);
-	expect(readMiniPlayerHint()).toBeNull();
-	expect(routeCleanup).toEqual(['drag', 'share', 'export', 'refresh', 'hint', 'query', 'local-auth', 'storage', 'pagehide']);
+	expect(pause).not.toHaveBeenCalled();
+	expect(page.currentAudio()).toBe(element);
+	expect(page.readCopy()).toEqual(afterCleanup);
+	expect(readMiniPlayerHint()?.trackId).toBe(track.id);
+	expect(routeCleanup).toEqual(['drag', 'share', 'export', 'refresh', 'query', 'local-auth', 'storage', 'pagehide']);
 });
 
 test('route cleanup fences an explicit play waiting for tick', async () => {
@@ -1523,7 +1518,7 @@ for (const refuses of [false, true]) {
 	);
 }
 
-test('route selection drives native repeat, and cleanup retires only its own player', async () => {
+test('route selection drives native repeat, and owner teardown retires only its own player', async () => {
 	let flush!: () => void;
 	const pending = new Promise<void>((resolve) => { flush = resolve; });
 	const selectedFlush = vi.fn(() => pending);
@@ -1543,6 +1538,8 @@ test('route selection drives native repeat, and cleanup retires only its own pla
 	expect(selectedFlush).toHaveBeenCalledOnce();
 	expect(leavingFlush).toHaveBeenCalledOnce();
 	leaving.page.cleanup();
+	expect(leaving.page.currentAudio()).toBe(leaving.element);
+	leaving.page.destroyPlayer();
 	flush();
 	await Promise.all([repeatSelection, retiredRepeat]);
 
