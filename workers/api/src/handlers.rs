@@ -1065,8 +1065,17 @@ pub trait Store {
         user_id: &str,
         track_id: &str,
     ) -> impl Future<Output = Result<crate::meter_sink::TrackMeterMeta, StoreError>> {
+        self.track_meta(user_id, track_id, false)
+    }
+    /// With `duration_only`, a positive app duration is sufficient; skip the mirror.
+    fn track_meta(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        duration_only: bool,
+    ) -> impl Future<Output = Result<crate::meter_sink::TrackMeterMeta, StoreError>> {
         async move {
-            let _ = (user_id, track_id);
+            let _ = (user_id, track_id, duration_only);
             Err(StoreError)
         }
     }
@@ -6500,7 +6509,7 @@ where
     };
     let meta = ctx
         .store
-        .track_meter_meta(user_id, &body.track_id)
+        .track_meta(user_id, &body.track_id, true)
         .await
         .map_err(|_| internal())?;
     let continuation_deadline = crate::playback::continuation_deadline(ctx.now, meta);
@@ -8338,6 +8347,7 @@ mod tests {
         /// Derivation metadata keyed by `(user_id, track_id)`; absent
         /// pairs resolve to the all-`None` meta (the fallback rung),
         /// mirroring the production zero-row answer.
+        duration_lookups: std::cell::Cell<usize>,
         meter_meta: RefCell<HashMap<(String, String), crate::meter_sink::TrackMeterMeta>>,
         /// Stored play windows by idempotency key, mirroring the
         /// monotonic upsert (see `record_play_window`).
@@ -9377,11 +9387,13 @@ mod tests {
                 _ => Ok(false),
             }
         }
-        async fn track_meter_meta(
+        async fn track_meta(
             &self,
             user_id: &str,
             track_id: &str,
+            _duration_only: bool,
         ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
+            self.duration_lookups.set(self.duration_lookups.get() + 1);
             Ok(self
                 .meter_meta
                 .borrow()
@@ -18310,8 +18322,6 @@ mod tests {
                     3600,
                 );
             }
-            // A metadata change must not change the deadline of an existing play.
-            h.store.meter_meta.borrow_mut().clear();
             let body = serde_json::json!({"track_id":"track-9", "session_id":"tab-a", "play_id":first.play_id});
             let call = |now, path: &str, body: &serde_json::Value| {
                 let mut ctx = h.ctx();
@@ -18349,6 +18359,7 @@ mod tests {
                 serde_json::from_str::<serde_json::Value>(&last.body).unwrap()["lease"],
                 "expired"
             );
+            assert_eq!(h.store.duration_lookups.get(), 1);
             let next = call(deadline, "/v1/plays", &body);
             let result: serde_json::Value = serde_json::from_str(&next.body).unwrap();
             if let Some(code) = denial {

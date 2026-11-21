@@ -1,8 +1,7 @@
--- Regression test for the previous Worker's idle-only lease statements,
--- the ever-paid probe from billing.rs, and the plans-row caps read from
--- plan_limits.rs. The current lease statements run directly in
--- session_refresh_postgres.rs. Run this script with its literal values
--- after all migrations (see ../run_migration_tests.sh) in one rolled-back
+-- Regression test for the previous Worker's idle-only lease statements, the ever-paid
+-- probe from billing.rs, and the plans-row caps read from
+-- plan_limits.rs — mirrored here with literal values. Run after ALL
+-- migrations (see ../run_migration_tests.sh) in one rolled-back
 -- transaction; any broken expectation RAISEs and fails the run.
 --
 -- Scope: first acquire lands at epoch 1; same-session re-acquire

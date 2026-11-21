@@ -250,7 +250,7 @@ impl LeaseHeartbeat {
 
 /// Parameters: user_id. The user's lease row, if any.
 pub fn playback_lease_select_statement() -> &'static str {
-    "SELECT session_id, track_id, play_id, epoch, expires_at, COALESCE(continuation_deadline, expires_at) AS continuation_deadline FROM playback_leases WHERE user_id = $1"
+    "SELECT session_id, track_id, play_id, epoch, expires_at, COALESCE(CASE WHEN continuation_epoch = epoch THEN continuation_deadline END, expires_at) AS continuation_deadline FROM playback_leases WHERE user_id = $1"
 }
 
 /// Parameters: user_id, session_id, track_id, play_id, expires_at, now,
@@ -264,7 +264,7 @@ pub fn playback_lease_select_statement() -> &'static str {
 /// row, never from a client-supplied value, so concurrent acquires
 /// cannot mint colliding epochs.
 pub fn playback_lease_acquire_statement() -> &'static str {
-    "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at, continuation_deadline) SELECT $1, $2, $3, $4, 1, LEAST($5, $8), $6, $8 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at, continuation_deadline = EXCLUDED.continuation_deadline WHERE playback_leases.expires_at <= $6 OR playback_leases.continuation_deadline <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
+    "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at, continuation_deadline, continuation_epoch) SELECT $1, $2, $3, $4, 1, LEAST($5, $8), $6, $8, 1 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at, continuation_deadline = EXCLUDED.continuation_deadline, continuation_epoch = playback_leases.epoch + 1 WHERE playback_leases.expires_at <= $6 OR (playback_leases.continuation_epoch = playback_leases.epoch AND playback_leases.continuation_deadline <= $6) OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
 }
 
 /// Parameters: user_id, session_id, play_id, epoch, expires_at, now.
@@ -273,7 +273,7 @@ pub fn playback_lease_acquire_statement() -> &'static str {
 /// refusal. Overlapping touches cannot shorten the idle expiry or
 /// move the per-play deadline. Legacy rows cannot extend their expiry.
 pub fn playback_lease_touch_statement() -> &'static str {
-    "UPDATE playback_leases SET expires_at = LEAST(GREATEST(playback_leases.expires_at, $5), COALESCE(playback_leases.continuation_deadline, playback_leases.expires_at)), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND playback_leases.expires_at > $6 AND COALESCE(playback_leases.continuation_deadline, playback_leases.expires_at) > $6 RETURNING expires_at"
+    "UPDATE playback_leases SET expires_at = LEAST(GREATEST(playback_leases.expires_at, $5), COALESCE(CASE WHEN playback_leases.continuation_epoch = playback_leases.epoch THEN playback_leases.continuation_deadline END, playback_leases.expires_at)), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND playback_leases.expires_at > $6 AND COALESCE(CASE WHEN playback_leases.continuation_epoch = playback_leases.epoch THEN playback_leases.continuation_deadline END, playback_leases.expires_at) > $6 RETURNING expires_at"
 }
 
 #[cfg(test)]
@@ -414,11 +414,11 @@ mod tests {
     fn statements_match_exact_text() {
         assert_eq!(
             playback_lease_select_statement(),
-            "SELECT session_id, track_id, play_id, epoch, expires_at, COALESCE(continuation_deadline, expires_at) AS continuation_deadline FROM playback_leases WHERE user_id = $1"
+            "SELECT session_id, track_id, play_id, epoch, expires_at, COALESCE(CASE WHEN continuation_epoch = epoch THEN continuation_deadline END, expires_at) AS continuation_deadline FROM playback_leases WHERE user_id = $1"
         );
         assert_eq!(
             playback_lease_acquire_statement(),
-            "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at, continuation_deadline) SELECT $1, $2, $3, $4, 1, LEAST($5, $8), $6, $8 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at, continuation_deadline = EXCLUDED.continuation_deadline WHERE playback_leases.expires_at <= $6 OR playback_leases.continuation_deadline <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
+            "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at, continuation_deadline, continuation_epoch) SELECT $1, $2, $3, $4, 1, LEAST($5, $8), $6, $8, 1 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at, continuation_deadline = EXCLUDED.continuation_deadline, continuation_epoch = playback_leases.epoch + 1 WHERE playback_leases.expires_at <= $6 OR (playback_leases.continuation_epoch = playback_leases.epoch AND playback_leases.continuation_deadline <= $6) OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch"
         );
     }
 
@@ -426,7 +426,7 @@ mod tests {
     fn touch_statement_requires_a_live_lease() {
         assert_eq!(
             playback_lease_touch_statement(),
-            "UPDATE playback_leases SET expires_at = LEAST(GREATEST(playback_leases.expires_at, $5), COALESCE(playback_leases.continuation_deadline, playback_leases.expires_at)), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND playback_leases.expires_at > $6 AND COALESCE(playback_leases.continuation_deadline, playback_leases.expires_at) > $6 RETURNING expires_at"
+            "UPDATE playback_leases SET expires_at = LEAST(GREATEST(playback_leases.expires_at, $5), COALESCE(CASE WHEN playback_leases.continuation_epoch = playback_leases.epoch THEN playback_leases.continuation_deadline END, playback_leases.expires_at)), updated_at = GREATEST(playback_leases.updated_at, $6) FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence WHERE user_id = $1 AND session_id = $2 AND play_id = $3 AND epoch = $4 AND playback_leases.expires_at > $6 AND COALESCE(CASE WHEN playback_leases.continuation_epoch = playback_leases.epoch THEN playback_leases.continuation_deadline END, playback_leases.expires_at) > $6 RETURNING expires_at"
         );
     }
 

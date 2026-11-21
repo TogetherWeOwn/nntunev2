@@ -294,4 +294,4 @@ sha256 = "a2a640bb557386b65f237083f9921503af999b987f34e0b488a13205cd5b9dff"
 [[migration]]
 file = "0058_playback_continuation_deadline.sql"
 target = "app"
-sha256 = "cc5922bd69a06b96b38898d9ecdfc97c4efd9dbe9cc21993d6a2e8fc7aacf7e6"
+sha256 = "567a3838e2efdd1af0e45ffb17d52f41a47d03a0f7928f80d5c34db872d9d119"

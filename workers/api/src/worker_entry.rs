@@ -4356,10 +4356,11 @@ impl Store for PgStore {
         .await
     }
 
-    async fn track_meter_meta(
+    async fn track_meta(
         &self,
         user_id: &str,
         track_id: &str,
+        duration_only: bool,
     ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
         // A non-UUID track has no `tracks` row to read (and the cast
         // would fail the query besides): meter it on the fallback
@@ -4405,7 +4406,11 @@ impl Store for PgStore {
                 };
                 Ok(crate::meter_sink::TrackMeterMeta {
                     track_duration_ms,
-                    mb_duration_ms: self.mb_duration_for(track_mbid.as_deref()).await?,
+                    mb_duration_ms: if duration_only && track_duration_ms.is_some_and(|ms| ms > 0) {
+                        None
+                    } else {
+                        self.mb_duration_for(track_mbid.as_deref()).await?
+                    },
                     bitrate_kbps,
                     file_bytes,
                 })
