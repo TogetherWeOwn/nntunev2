@@ -335,6 +335,9 @@ SUBSONIC_MEASUREMENT_LEASE = "v1:{sha}:{now}:{now + 600}:ci-fixture-active;small
         matching, other = (fx.keys[k] for k in ("active", "grace"))
         output, _ = proc.communicate(json.dumps([matching, other, runner, shared]), timeout=150)
         check(proc.returncode == 0, "measurement Fetch failed:\n" + redact(output)[-4000:])
+    except subprocess.TimeoutExpired as err:
+        partial = (err.output or b"").decode(errors="replace")
+        raise Failure("measurement Fetch timed out:\n" + redact(partial)[-4000:]) from None
     finally:
         process_group.shutdown_process_group(proc)
     used = psql(s, db, "SELECT user_id FROM subsonic_credentials WHERE last_used_at IS NOT NULL ORDER BY user_id",
@@ -411,6 +414,9 @@ def main(argv=None):
             break
         smoke(base, s, db, fx, args.mirror_fixture)
         if fx:
+            # Stop ordinary routing before reusing the test Worker name.
+            process_group.shutdown_process_group(proc)
+            proc = None
             runner, shared = (b64(secrets.token_bytes(32)) for _ in range(2))
             secrets_out.extend((runner, shared))
             measurement = tmp / "measurement"

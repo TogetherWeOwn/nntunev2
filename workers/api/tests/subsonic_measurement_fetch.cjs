@@ -15,11 +15,14 @@ async function main() {
   const artist = '00000000-0000-4000-8000-000000000001';
   const release = '00000000-0000-4000-8000-000000000002';
   const fixedCapacity = '{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Service unavailable."}}}';
-  const start = (variant) => startWorker({
-    config: resolve(`measurement-${variant}.toml`),
-    dev: { remote: false, server: { hostname: '127.0.0.1', port: 0 },
-      origin: { secure: true, hostname: new URL(origin).hostname } },
-  });
+  const start = (variant) => {
+    console.log(`measurement Fetch: starting ${variant}`);
+    return startWorker({
+      config: resolve(`measurement-${variant}.toml`),
+      dev: { remote: false, server: { hostname: '127.0.0.1', port: 0 },
+        origin: { secure: true, hostname: new URL(origin).hostname } },
+    });
+  };
   const fetchWith = (worker) => (endpoint, params, headers, method = 'POST') => {
     const url = new URL(`/rest/${endpoint}`, origin);
     const form = new URLSearchParams(params);
@@ -29,6 +32,16 @@ async function main() {
       redirect: 'error', signal: AbortSignal.timeout(15_000),
     });
   };
+
+  const albumParams = { f: 'json', apiKey: matching, id: release };
+  const refusedRoutes = [['getAlbum', 'GET'], ['getAlbum.view', 'POST'],
+    ['getAlbum/child', 'POST'], ['%67etAlbum', 'POST'], ['getalbum', 'POST']];
+  const refusedRoute = async (worker, endpoint, method) => {
+    const response = await fetchWith(worker)(endpoint, method === 'GET' ? { f: 'json' } : albumParams,
+      headers, method);
+    return [response.status, await response.text()];
+  };
+  const ordinary = [];
 
   for (const enabled of [1, 0]) {
     const worker = await start(enabled);
@@ -42,7 +55,13 @@ async function main() {
         assert.equal(result.error?.code ?? null, code);
         assert.equal(result.album?.song?.[0]?.title ?? null, code === null ? 'Fixture "Track"' : null);
       }
-      if (!enabled) continue;
+      if (!enabled) {
+        // Capture the ordinary responses without running two Wrangler sessions at once.
+        for (const [endpoint, method] of refusedRoutes) {
+          ordinary.push(await refusedRoute(worker, endpoint, method));
+        }
+        continue;
+      }
       const artistResponse = await fetchCase('getArtist', { f: 'json', apiKey: matching, id: artist }, headers);
       assert.equal(artistResponse.status, 200);
       assert.equal((await artistResponse.json())['subsonic-response'].artist.name, 'Fixture 雪 & Wind');
@@ -124,8 +143,6 @@ async function main() {
     );
     assert.notEqual(expired, config, 'test must replace the UTC lease window');
     writeFileSync('measurement-expired.toml', expired);
-    writeFileSync('measurement-off-peer.toml', config.replace('SUBSONIC_MEASUREMENT_ENABLE = "1"',
-      'SUBSONIC_MEASUREMENT_ENABLE = "0"'));
     const expiredWorker = await start('expired');
     try {
       const response = await fetchWith(expiredWorker)('getAlbum', { f: 'json', apiKey: matching, id: release }, headers);
@@ -165,25 +182,17 @@ async function main() {
     }
     const worker = await start('stalled');
     try {
-      const off = await start('off-peer');
-      try {
-        const params = { f: 'json', apiKey: matching, id: release };
-        for (const [endpoint, method] of [['getAlbum', 'GET'], ['getAlbum.view', 'POST'],
-          ['getAlbum/child', 'POST'], ['%67etAlbum', 'POST'], ['getalbum', 'POST']]) {
-          const active = await fetchWith(worker)(endpoint, params, headers, method);
-          const ordinary = await fetchWith(off)(endpoint, params, headers, method);
-          assert.equal(active.status, ordinary.status, `${method} ${endpoint}`);
-          assert.ok((await active.text()) === (await ordinary.text()), `${method} ${endpoint} changed ordinary response`);
-        }
-        for (const authorization of [undefined, `Bearer ${shared}`, `Bearer ${'W'.repeat(43)}`]) {
-          const attempt = { 'x-subsonic-measurement-case': 'small' };
-          if (authorization) attempt.authorization = authorization;
-          const response = await fetchWith(worker)('getAlbum', params, attempt);
-          assert.equal(response.status, 404);
-          assert.match(await response.text(), /Endpoint not supported in staging\./);
-        }
-      } finally {
-        await off.dispose();
+      for (const [index, [endpoint, method]] of refusedRoutes.entries()) {
+        const [status, body] = await refusedRoute(worker, endpoint, method);
+        assert.equal(status, ordinary[index][0], `${method} ${endpoint}`);
+        assert.ok(body === ordinary[index][1], `${method} ${endpoint} changed ordinary response`);
+      }
+      for (const authorization of [undefined, `Bearer ${shared}`, `Bearer ${'W'.repeat(43)}`]) {
+        const attempt = { 'x-subsonic-measurement-case': 'small' };
+        if (authorization) attempt.authorization = authorization;
+        const response = await fetchWith(worker)('getAlbum', albumParams, attempt);
+        assert.equal(response.status, 404);
+        assert.match(await response.text(), /Endpoint not supported in staging\./);
       }
       assert.equal(connections, 0, 'all refusals must leave the fixture DB untouched');
       const started = performance.now();
