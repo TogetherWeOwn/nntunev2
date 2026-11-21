@@ -33,8 +33,15 @@ impl FrameContinuity {
     /// Advance only after the reader accepts the full frame including its CRC.
     /// The caller starts each reader at the exact next boundary using the same STREAMINFO.
     pub(crate) fn accept(&mut self, frame: FrameReader) -> Result<(), ()> {
+        self.accept_with_pcm(frame).map(|_| ())
+    }
+
+    pub(crate) fn accept_with_pcm(
+        &mut self,
+        frame: FrameReader,
+    ) -> Result<(u8, Option<Vec<i32>>), ()> {
         let next = self.next.take().ok_or(())?;
-        let header = frame.finish()?;
+        let (header, pcm) = frame.finish_with_pcm()?;
         let block = header.block_size;
         if block == 0 || block > self.info.max_block {
             return Err(());
@@ -61,7 +68,7 @@ impl FrameContinuity {
         }
         self.next = Some(next);
         self.samples = samples;
-        Ok(())
+        Ok((header.bits_per_sample, pcm))
     }
 
     fn after_fixed(&self, number: u32, block: u16) -> Result<Next, ()> {

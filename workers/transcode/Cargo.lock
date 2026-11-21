@@ -530,6 +530,7 @@ dependencies = [
  "aes-gcm",
  "crc32fast",
  "hkdf",
+ "md5",
  "serde",
  "serde_json",
  "sha2",
