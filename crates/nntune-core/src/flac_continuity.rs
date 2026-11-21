@@ -11,19 +11,23 @@ enum Next {
     EndOnly,
 }
 
-pub(crate) struct FrameContinuity<'a> {
-    info: &'a StreamInfo,
+pub(crate) struct FrameContinuity {
+    info: StreamInfo,
     samples: u64,
     next: Option<Next>,
 }
 
-impl<'a> FrameContinuity<'a> {
-    pub(crate) fn new(info: &'a StreamInfo) -> Self {
+impl FrameContinuity {
+    pub(crate) fn new(info: &StreamInfo) -> Self {
         Self {
-            info,
+            info: *info,
             samples: 0,
             next: Some(Next::First),
         }
+    }
+
+    pub(crate) fn stream_info(&self) -> &StreamInfo {
+        &self.info
     }
 
     /// Advance only after the reader accepts the full frame including its CRC.
