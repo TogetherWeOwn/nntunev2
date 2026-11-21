@@ -66,6 +66,20 @@ fn reads_all_six_golden_sidecars_as_literal_text() {
 }
 
 #[test]
+fn reads_absent_locale_from_golden_label() {
+    let hits = lookup(golden!("label"), EntityKind::Label, "Quartz").unwrap();
+    let [hit] = hits.as_slice() else {
+        panic!("expected one exact label match, got {hits:?}");
+    };
+    assert_eq!(hit.entity.kind, EntityKind::Label);
+    assert_eq!(hit.entity.mbid, "71717171-7171-4717-8717-717171717171");
+    assert_eq!(hit.credited_name, "Quartz");
+    assert_eq!(hit.locale, None);
+    assert_eq!(hit.sort_name, "Quartz");
+    assert!(!hit.primary_for_locale);
+}
+
+#[test]
 fn preserves_distinct_keys_in_deterministic_order() {
     let bytes = golden!("artist");
     let hits = lookup(bytes, EntityKind::Artist, "Café").unwrap();
