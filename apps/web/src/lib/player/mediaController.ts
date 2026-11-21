@@ -50,6 +50,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let attachmentVersion = 0;
 	let endGeneration = 0;
+	let endRate: (() => number | null) | undefined;
 	let playIntent = 0;
 	let pendingPlay: { result: Promise<PlayOutcome>; finish: (outcome: PlayOutcome) => void } | undefined;
 	const playbackStatus = writable<PlaybackStatus>('unavailable');
@@ -455,9 +456,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const track = currentTrack(result.queue);
 		const streamUrl = resolveStreamUrl(track);
 		const replacing = currentTrack(base)?.id !== track?.id || source !== streamUrl;
-		// Capture a native rate even if its queued ratechange hasn't fired yet.
-		const playbackRate = speed.managed ? undefined : audio.playbackRate;
-		speed.observe({ audio, matches: ownsOrigin });
+		const playbackRate = speed.observe({ audio, matches: ownsOrigin });
 		if (!ownsOrigin()) return;
 		// Queue commit captures sound for replacements; replay keeps this attachment.
 		if (!replacing) sound.observe();
@@ -471,7 +470,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		// A keyed source change retires exactly one node and admits exactly one replacement.
 		// Resetting again (including auth reset before mount) cannot inherit this end.
 		if (attachmentVersion !== version + Number(replacing)) return;
+		const inheritedRate = () => ownsEnd() && attachmentVersion === version + 2 ? playbackRate : null;
+		if (replacing) endRate = inheritedRate;
 		await flush();
+		if (endRate === inheritedRate) endRate = undefined;
 		const replay = current;
 		const isCurrent = () => ownsEnd() && current === replay &&
 			attachmentVersion === version + (replacing ? 2 : 0);
@@ -480,8 +482,6 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const matches = () => matchesSource(target, streamUrl, isCurrent);
 		try {
 			if (!matches()) return;
-			// The live binding already restored and verified a replacement's rate.
-			if (playbackRate !== undefined) target.playbackRate = playbackRate;
 			runPosition(() => { if (matches()) target.currentTime = 0; });
 			if (!matches()) return;
 			clearJumpFeedback();
@@ -605,7 +605,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			}
 			lastJumpTarget = undefined;
 			listenForNativeEvents();
-			speed.attach();
+			speed.attach(endRate);
 			const target = transportTarget();
 			if (target?.attachment === receipt) {
 				sound.connect(audio, target.matches, receipt.listeners.signal);

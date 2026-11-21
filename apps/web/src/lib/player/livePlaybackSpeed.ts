@@ -18,9 +18,9 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 		} catch { return null; }
 	}
 
-	function write(request?: number, current = target()): void {
-		if (!preference || !current?.matches()) return;
-		const intended = request === undefined ? preference.current() : clampPlaybackSpeed(request);
+	function write(request?: number, current = target(), inherited?: number | null): void {
+		const intended = inherited ?? (request === undefined ? preference?.current() : clampPlaybackSpeed(request));
+		if (intended === undefined || !current?.matches()) return;
 		const previousPort = writePort;
 		let observed: number | null | undefined;
 		writePort = {
@@ -35,9 +35,10 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 			}
 		};
 		try {
-			if (request === undefined) preference.apply();
-			else preference.set(request);
-		} finally {
+			if (inherited != null) writePort.playbackRate = inherited; // Live handoff, not a preference write.
+			else if (request === undefined) preference?.apply();
+			else preference?.set(request);
+		} catch { /* A refused handoff still allows play at the observed rate. */ } finally {
 			writePort = previousPort;
 		}
 		// A throwing setter never persists, but its readable actual rate still belongs in the UI.
@@ -51,7 +52,6 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 
 	return {
 		state: { subscribe: state.subscribe },
-		get managed() { return preference !== undefined; },
 		restore(storage: PlaybackSpeedDeps['storage'] | null): void {
 			let saved: string | null | undefined;
 			preference = createPlaybackSpeed({
@@ -69,23 +69,25 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 			});
 			write();
 		},
-		attach(): void {
+		attach(inherit?: () => number | null): void {
+			const current = target();
 			state.set(unavailable);
-			write();
+			if (current) write(undefined, current, inherit?.());
 		},
 		reapply: (current: RateTarget) => write(undefined, current),
 		retire: () => state.set(unavailable),
 		set(rate: number): number | null {
-			if (!writePort) write(rate);
+			if (preference && !writePort) write(rate);
 			return get(state).rate;
 		},
-		observe(current: RateTarget): void {
-			if (!preference || writePort) return;
+		observe(current: RateTarget): number | null {
+			if (writePort) return null;
 			const rate = read(current);
 			// Same-rate events include the queued event from our own write. Keep its feedback.
-			if (rate === null || rate === get(state).rate) return;
+			if (!preference || rate === null || rate === get(state).rate) return rate;
 			preference.adoptNativeRate(rate);
 			if (current.matches()) state.set({ rate, feedback: '' });
+			return rate;
 		}
 	};
 }
