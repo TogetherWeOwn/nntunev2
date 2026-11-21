@@ -11,7 +11,7 @@ export interface TrackLikeOwner {
 	/** Undefined until the track and its confirmed Like state are known in this scope. */
 	liked: (id: string) => boolean | undefined;
 	confirm: (requestId: string, confirmedId: string, liked: boolean) => void;
-	failed: (id: string) => void;
+	failed: (id: string, error: unknown) => void;
 }
 
 export interface TrackLikeControl {
@@ -25,7 +25,8 @@ export type TrackLikeControls = (id: string) => TrackLikeControl | undefined;
 /** Share one instance across track and queue rows. An owner is unique to one
  * authorization epoch; currentOwner must stop returning it upon invalidation. */
 export function createTrackLikeControls(
-	currentOwner: () => TrackLikeOwner | undefined
+	currentOwner: () => TrackLikeOwner | undefined,
+	trackWrite?: (binding: string, result: Promise<unknown>) => void
 ): TrackLikeControls {
 	const pendingByOwner = new WeakMap<TrackLikeOwner, Set<string>>();
 
@@ -55,14 +56,18 @@ export function createTrackLikeControls(
 					const started = await run(() => {
 						if (!stillCurrent()) return;
 						// Return a container, not the network promise: release the auth fence before waiting.
-						return { result: setTrackLike(owner.client, id, !liked, binding).catch(() => undefined) };
+						const result = setTrackLike(owner.client, id, !liked, binding).then(
+							(confirmedId) => ({ confirmedId }), (error: unknown) => ({ error })
+						);
+						trackWrite?.(binding, result);
+						return { result };
 					}).catch(() => undefined);
 					if (!started) return;
-					const confirmedId = await started.result;
+					const result = await started.result;
 					await run(() => {
 						if (!stillCurrent()) return;
-						if (confirmedId === undefined) owner.failed(id);
-						else owner.confirm(id, confirmedId, !liked);
+						if ('error' in result) owner.failed(id, result.error);
+						else owner.confirm(id, result.confirmedId, !liked);
 					}).catch(() => undefined);
 				} finally {
 					inFlight.delete(id);

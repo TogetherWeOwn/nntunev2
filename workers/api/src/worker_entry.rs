@@ -1919,6 +1919,7 @@ fn catalogue_library_page_from_row(
         recording_mbids: row.try_get("recording_mbids").map_err(|_| StoreError)?,
         recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
         recording_ord: row.try_get("recording_ord").map_err(|_| StoreError)?,
+        recording_job_match: row.try_get("recording_job_match").map_err(|_| StoreError)?,
     })
 }
 

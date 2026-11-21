@@ -10,7 +10,7 @@ export interface LibraryLike {
 }
 
 const LIKES_PATH = '/v1/me/likes';
-const MAX_LIKES = 500;
+export const MAX_LIKES = 500;
 // Import does catalogue resolution and a preference write per item. Keep each
 // request comfortably below the API's 500-item ceiling.
 const IMPORT_BATCH_SIZE = 50;
@@ -28,6 +28,14 @@ function isCount(value: unknown): value is number {
 
 function record(value: unknown): Record<string, unknown> {
 	return (value ?? {}) as Record<string, unknown>;
+}
+
+/** Only the Library server knows whether an uppercase MBID is also an exact job ID. */
+export function trackLikeTarget(id: string, resolved: unknown): string | undefined {
+	if (!isTrackId(id)) return;
+	const lower = id.toLowerCase();
+	if (id === lower || !RELEASE_ID.test(lower)) return resolved === undefined || resolved === id ? id : undefined;
+	return resolved === id || resolved === lower ? resolved : undefined;
 }
 
 export async function loadLikes(client: Pick<LikesClient, 'get'>) {

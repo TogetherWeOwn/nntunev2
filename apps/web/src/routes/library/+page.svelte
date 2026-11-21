@@ -20,6 +20,7 @@
 		staleLabel,
 		type LibraryItem
 	} from '#lib/library/cache.js';
+	import { subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import {
 		clearFavoritesAtAuthBoundary,
@@ -36,6 +37,7 @@
 	} from '#lib/library/recent-finds.js';
 	import { moveFavoriteId, type FavoriteMoveDirection } from '#lib/library/favorites-order.js';
 	import { createLibraryRefresher, type LibraryRefreshUpdate } from '#lib/library/refresh.js';
+	import { createLibraryTrackLikes } from '#lib/library/library-track-likes.svelte.js';
 	import {
 		displayArtist,
 		displayTitle,
@@ -95,6 +97,8 @@
 	const showingTracks = $derived(collectionFilter === 'tracks');
 	let libraryTypeGroup: HTMLDivElement | undefined = $state();
 	let collectionReceipt = $state<LibraryRefreshUpdate['runIfCurrent']>();
+	let accountTrackLikes = $state.raw<ReturnType<typeof createLibraryTrackLikes>>();
+	const likeControls = (id: string) => accountTrackLikes?.controls(id);
 	const showRecovery = $derived(showingTracks || !collectionReceipt);
 
 	function readStoredDensity(): Density {
@@ -240,6 +244,13 @@
 	let extendSelection = false;
 	let queueExportAuthGeneration = $state(0);
 	let refreshButton: HTMLButtonElement | null = $state(null);
+	const showRefresh = $derived(showingTracks || (!loading && (showRecovery || !!accountTrackLikes?.feedback)));
+	$effect.pre(() => {
+		// Likes can finish after listing Refresh has already restored focus.
+		if (!loading && !showRefresh && refreshButton && document.activeElement === refreshButton) {
+			libraryTypeGroup?.querySelector<HTMLButtonElement>('button[aria-pressed="true"]')?.focus({ preventScroll: true });
+		}
+	});
 	/**
 	 * Transient queue-only filter text, owned here (not in the panel) so
 	 * it survives the panel unmounting/remounting across library refresh
@@ -331,10 +342,16 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
-		onStateChange: (state, { isCurrent, authoritative, authBoundary, runIfCurrent, sessionBinding }) => {
+		onStateChange: (state, receipt) => {
+			const { isCurrent, authoritative, authBoundary, runIfCurrent, sessionBinding } = receipt;
 			if (!isCurrent()) return;
 			collectionReceipt = runIfCurrent;
 			const revoked = authBoundary && !state.verificationSuspended;
+			if (sessionBinding && runIfCurrent) {
+				accountTrackLikes ??= createLibraryTrackLikes();
+				void accountTrackLikes.publish(receipt, state.items);
+			} else if (revoked) accountTrackLikes?.clear();
+			else accountTrackLikes?.retire();
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -1513,6 +1530,8 @@
 		// Leaving the page with a query applied (tab close, hard navigation).
 		window.addEventListener('pagehide', recordFindQuery);
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
+		const authFenceLifetime = new AbortController();
+		subscribeAuthFenceInvalidation(() => accountTrackLikes?.invalidate(), authFenceLifetime.signal);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
 		const releaseFavoriteAction = player.currentFavorite.bind({
@@ -1522,6 +1541,7 @@
 			write: (id) => toggleFavorite(id, true)
 		});
 		disposeRoute = () => {
+			authFenceLifetime.abort();
 			releaseFavoriteAction();
 			endTrackDrag();
 			// Restore only while this page still owns the title; a newer route's title wins.
@@ -1534,6 +1554,7 @@
 			media.clearShareSeek();
 			favoritesExport.destroy();
 			refresher.dispose();
+			accountTrackLikes?.clear();
 			// Client-side navigation away with the query applied.
 			recordFindQuery();
 			unsubscribeLocal();
@@ -1551,6 +1572,7 @@
 
 <main class="nt-wrap" data-density={density}>
 	<h1>Library</h1>
+	{#if accountTrackLikes?.feedback}<p role="status">{accountTrackLikes.feedback}</p>{/if}
 
 	<div class="nt-library-density">
 		<label for="library-density">Density</label>
@@ -2011,6 +2033,7 @@
 				announcement={player.queueAnnouncement.text}
 				announcementVersion={player.queueAnnouncement.version}
 				{favoriteIds}
+				{likeControls}
 				ontogglefavorite={listingUnavailable ? undefined : toggleQueuedFavorite}
 				onfavoriteids={listingUnavailable ? undefined : (ids, remove) => favoriteInteractionIds(ids, remove, true)}
 				bind:filterQuery={queueFilterQuery}
@@ -2044,7 +2067,7 @@
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
-			hidden={!showingTracks && (!showRecovery || loading)}
+			hidden={!showRefresh}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>
@@ -2089,7 +2112,7 @@
 
 {#snippet trackRows(tracks: LibraryItem[])}
 	<TrackRows
-		{tracks} {queuedIds} {selectedIds} {favoriteIds}
+		{tracks} {queuedIds} {selectedIds} {favoriteIds} {likeControls}
 		onrowclick={libraryRowClick}
 		onselectionclick={libraryCheckboxClick}
 		onselectionchange={libraryCheckboxChange}
