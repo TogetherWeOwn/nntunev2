@@ -11,8 +11,10 @@
 //! self.connect_mirror() the catalogue reads use, or (catalogue_library)
 //! both — plus all of its statements (connects and statements share one
 //! bound: finishing one statement must not unbind a later stalled one).
-//! Hyperdrive RESETs pooled backends, so this per-method race is what
-//! bounds statements where they run.
+//! Signup lookup then resolves explicit expiry through a separately bounded
+//! best-effort audit, so audit failure cannot overwrite a completed denial.
+//! Hyperdrive RESETs pooled backends, so these races bound statements where
+//! they run.
 //!
 //! Breaks caught: a new Store method that connects without the seam, a
 //! method that bounds an empty block while its statements run outside it,
@@ -169,11 +171,20 @@ fn method_name(piece: &str) -> &str {
 }
 
 fn assert_bounded(piece: &str, name: &str) {
-    let bounded = calls(piece, "Self::bounded");
+    let (seam, budget, connection) = if name == "try_observe_invite_expiry" {
+        (
+            "PgStore::bounded",
+            "AUDIT_BUDGET_MS",
+            "client.transaction()",
+        )
+    } else {
+        ("Self::bounded", "TOTAL_TIMEOUT_MS", "self.connect()")
+    };
+    let bounded = calls(piece, seam);
     assert_eq!(
         bounded.len(),
         1,
-        "{name} must race exactly one operation through Self::bounded"
+        "{name} must race exactly one operation through {seam}"
     );
     let call = &bounded[0];
     assert_eq!(
@@ -189,13 +200,11 @@ fn assert_bounded(piece: &str, name: &str) {
     // the method runs must sit inside the bound operation, sharing the one
     // TOTAL_TIMEOUT_MS race with the statements.
     assert!(
-        call.args[0].contains("self.connect()") || call.args[0].contains("self.connect_mirror()"),
-        "{name} must run its connect inside the bound operation"
+        call.args[0].contains(connection)
+            || (connection == "self.connect()" && call.args[0].contains("self.connect_mirror()")),
+        "{name} must connect or open the audit transaction inside the bound operation"
     );
-    assert_eq!(
-        call.args[1], "TOTAL_TIMEOUT_MS",
-        "{name} must use the shared vault total, not a fresh literal"
-    );
+    assert_eq!(call.args[1], budget, "{name} must use its named budget");
     assert!(
         call.after.starts_with(".await"),
         "{name} must await the bound operation"
@@ -323,6 +332,24 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             assert_bounded(
                 function_body(&source, "asyncfnacquire_private_aware_lease("),
                 "acquire_private_aware_lease",
+            );
+        } else if name == "invite_by_hash" {
+            let lookup = function_body(piece, name)
+                .strip_suffix("lookup.resolve(&mutclient).await}")
+                .expect("lookup must end by handing off to the bounded expiry resolver");
+            assert_bounded(lookup, name);
+            assert_eq!(
+                function_body(&source, "implInviteLookup{asyncfnresolve("),
+                concat!(
+                    "{matchself{Self::Active(row)=>invite_from_row(&row).map(Some),",
+                    "Self::Expired(id)=>{try_observe_invite_expiry(client,id).await;Ok(None)}",
+                    "Self::Refused=>Ok(None),}}",
+                ),
+                "the expiry resolver must await only the best-effort audit"
+            );
+            assert_bounded(
+                function_body(&source, "asyncfntry_observe_invite_expiry("),
+                "try_observe_invite_expiry",
             );
         } else {
             assert_bounded(piece, name);
@@ -501,6 +528,7 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     .map(|name| (name, function_body(store, &format!("asyncfn{name}("))));
     let helpers = [
         "invite_by_hash_on",
+        "try_observe_invite_expiry",
         "reap_unverified_users_on",
         "prune_expired_challenges_on",
         "delete_expired_rate_limit_slots",

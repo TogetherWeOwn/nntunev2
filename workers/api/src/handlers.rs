@@ -8833,6 +8833,7 @@ mod tests {
         native_credential_lookups: RefCell<usize>,
         fail_session_insert: RefCell<bool>,
         fail_magic_audit: RefCell<bool>,
+        expire_invite_before_claim: std::cell::Cell<bool>,
         /// Role-read outage pin: `user_role` fails like a production
         /// query error, which the admin guard must collapse to the
         /// plain 404 (never a distinguishing 500).
@@ -9756,6 +9757,13 @@ mod tests {
             credential: &PasskeyCredential,
             now: u64,
         ) -> Result<(), StoreError> {
+            if let Some(record) = invite.filter(|_| self.expire_invite_before_claim.replace(false))
+            {
+                // Simulate expiry after a successful lookup, before the transaction.
+                if let Some(stored) = self.invites.borrow_mut().get_mut(&record.code_hash) {
+                    stored.expires_at = now;
+                }
+            }
             // Mirror the production transaction, including rollback when a
             // later conditional claim loses or credential insertion fails.
             let challenges_before = self.challenges.borrow().clone();
@@ -26604,7 +26612,7 @@ mod tests {
     }
 
     #[test]
-    fn register_finish_wrong_invite_does_not_burn_challenge_or_token() {
+    fn register_finish_wrong_or_expired_invite_does_not_burn_proofs() {
         // A mistyped invite is pre-validated before either single-use
         // claim (like a mistyped emailed code), so correcting it against
         // the SAME challenge and token still enrolls — the signup page's
@@ -26622,6 +26630,12 @@ mod tests {
                 NOW + 604_800,
             ),
         );
+        let mut racing = h.store.invites.borrow()[&good_hash].clone();
+        racing.code_hash = auth::hash_invite_code("racing-invite");
+        h.store
+            .invites
+            .borrow_mut()
+            .insert(racing.code_hash.clone(), racing);
         let resp = h.call(
             "POST",
             "/v1/auth/passkey/register/start",
@@ -26652,6 +26666,22 @@ mod tests {
         );
         assert_eq!(resp.status, 401, "{}", resp.body);
         assert!(resp.set_cookie.is_none());
+        h.store.expire_invite_before_claim.set(true);
+        for _ in 0..2 {
+            // First refusal is at claim time; the same code fails preflight next.
+            let expired = h.call(
+                "POST",
+                "/v1/auth/passkey/register/finish",
+                finish("racing-invite"),
+            );
+            assert_eq!(expired.status, 401);
+            assert_eq!(expired.body, resp.body);
+            assert!(expired.set_cookie.is_none());
+            assert!(!h.store.challenges.borrow()[&challenge].challenge.consumed);
+            assert!(!h.store.magic.borrow()[&auth::hash_magic_token(&emailed)].used);
+            assert!(h.store.credentials.borrow().is_empty());
+        }
+        assert!(!h.store.expire_invite_before_claim.get());
         assert!(
             !h.store.invites.borrow().get(&good_hash).unwrap().used,
             "rejected attempt must not consume the invite"

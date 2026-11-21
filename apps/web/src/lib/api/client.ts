@@ -378,8 +378,8 @@ export class ApiClient {
 		this.token = token;
 	}
 
-	async get<T>(path: string): Promise<T> {
-		return this.request<T>(path, { method: 'GET' });
+	async get<T>(path: string, headers?: Record<string, string>): Promise<T> {
+		return this.request<T>(path, { method: 'GET', headers });
 	}
 
 	async post<T>(path: string, body: unknown): Promise<T> {
@@ -403,8 +403,10 @@ export class ApiClient {
 		});
 	}
 
-	async delete<T>(path: string, headers?: Record<string, string>): Promise<T> {
-		return this.request<T>(path, { method: 'DELETE', headers });
+	async delete<T>(path: string, headers?: Record<string, string>, body?: unknown): Promise<T> {
+		return this.request<T>(path, body === undefined ? { method: 'DELETE', headers } : {
+			method: 'DELETE', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(body)
+		});
 	}
 
 	/**

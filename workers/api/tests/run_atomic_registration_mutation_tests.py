@@ -41,8 +41,8 @@ MUTATIONS = (
     ),
     (
         "zero-row-claim-accepted",
-        "claim_single_use_on(&transaction, claim).await? != 1",
-        "claim_single_use_on(&transaction, claim).await? > 1",
+        "ClaimOutcome::Count(n) if n != 1",
+        "ClaimOutcome::Count(n) if n > 1",
         PREFIX + "postgres_registration_zero_row_magic_claim_rolls_back_earlier_challenge",
         "a zero-row later claim must abort enrollment",
         "async fn complete_registration_on(",
