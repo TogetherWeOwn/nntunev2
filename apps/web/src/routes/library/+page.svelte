@@ -487,11 +487,13 @@
 	function queuedTrackFor(item: LibraryItem): Track {
 		// Library display fields only: the bulk append and the favorites
 		// export snapshot never carry a stream URL.
+		const album = typeof item.release === 'string' ? item.release.trim() : '';
 		return {
 			id: item.id,
 			title: displayTitle(item),
 			...(typeof item.title !== 'string' || !item.title.trim() ? { titleIsFallback: true } : {}),
 			artist: displayArtist(item) ?? '',
+			...(album ? { album } : {}),
 			streamUrl: ''
 		};
 	}
