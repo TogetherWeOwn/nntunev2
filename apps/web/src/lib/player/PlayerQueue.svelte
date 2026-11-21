@@ -2,6 +2,8 @@
 	import { tick } from 'svelte';
 	import { currentTrack, type QueueState, type Track } from './queue.js';
 	import { matchesQueueQuery } from './queueFilter.js';
+	import TrackLikeButton from '../library/TrackLikeButton.svelte';
+	import type { TrackLikeControls } from '../library/track-like-controls.js';
 	import { pruneSelection, selectRange, selectAllDisplayed, toggleSelected } from '../library/selection.js';
 	import ShuffleUpcoming from './ShuffleUpcoming.svelte';
 	import ContextMenu from '../interactions/ContextMenu.svelte';
@@ -36,6 +38,7 @@
 		ontogglefavorite?: (id: string) => void;
 		/** Aggregate favorite mutation by stable ids (menus); preferred over ontogglefavorite when supplied. */
 		onfavoriteids?: (ids: readonly string[], remove: boolean) => void;
+		likeControls?: TrackLikeControls;
 		/**
 		 * Metadata-only direct selection: the host applies the validated
 		 * selectTrack transition and owns the announcement; the panel reports
@@ -109,6 +112,7 @@
 		favoriteIds = new Set<string>(),
 		ontogglefavorite,
 		onfavoriteids,
+		likeControls,
 		onkeepcurrentandupcoming,
 		onclearupcoming,
 		announcement = '',
@@ -515,7 +519,7 @@
 
 	function rowClick(event: MouseEvent, id: string): void {
 		if (!onreorder || (!event.ctrlKey && !event.metaKey && !event.shiftKey)) return;
-		if (event.target instanceof Element && event.target.closest('input, .queue-grip')) return;
+		if (event.target instanceof Element && event.target.closest('input, .queue-grip, .nt-track-like')) return;
 		event.preventDefault();
 		event.stopPropagation();
 		toggleBatch(id, event.shiftKey);
@@ -858,6 +862,10 @@
 					aria-label="More actions for {displayTitle(track)}" aria-disabled={interactionsUnavailable}
 					onclick={(event) => openTrackMenu(track.id, event.currentTarget)}
 				><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" /></svg></button>
+			{/if}
+			{#if likeControls}
+				{@const control = interactionsUnavailable ? undefined : likeControls(track.id)}
+				{#if control}<TrackLikeButton title={displayTitle(track)} {control} />{/if}
 			{/if}
 			{#if ontogglefavorite}
 				<button

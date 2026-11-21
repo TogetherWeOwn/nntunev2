@@ -2216,7 +2216,7 @@
 	:global(.nt-library-queue .queue-row) {
 		padding-block: var(--nt-library-row-padding);
 	}
-	:global(.nt-library-queue .queue-row button:not(.queue-star, .queue-grip, .queue-more)) {
+	:global(.nt-library-queue .queue-row button:not(.queue-star, .nt-track-like, .queue-grip, .queue-more)) {
 		min-width: 24px;
 		min-height: 24px;
 	}
