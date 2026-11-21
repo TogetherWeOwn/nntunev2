@@ -192,7 +192,7 @@ test('[FAV-04] starred tracks survive reload via scoped local storage', async ({
 
 	const context = await readAuthContext(page);
 	expect(context, 'library auth context must exist after a successful load').not.toBeNull();
-	expect(storedIds(await readFavoritesRaw(page, context))).toEqual(
+	await expect.poll(async () => storedIds(await readFavoritesRaw(page, context))).toEqual(
 		expect.arrayContaining(['fav-mike', 'fav-alpha'])
 	);
 
@@ -216,7 +216,7 @@ test('[FAV-05] an auth transition clears favorites so the next account starts em
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
 	const contextBefore = await readAuthContext(page);
 	expect(contextBefore).not.toBeNull();
-	expect(storedIds(await readFavoritesRaw(page, contextBefore))).toContain('fav-zulu');
+	await expect.poll(async () => storedIds(await readFavoritesRaw(page, contextBefore))).toContain('fav-zulu');
 
 	const otherTab = await page.context().newPage();
 	await otherTab.goto('/login');

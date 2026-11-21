@@ -125,7 +125,7 @@ for (const theme of ['light', 'dark'] as const) {
 			await move(page, 'Mike Song', direction).evaluate((node: HTMLButtonElement) => node.click());
 		}
 		await expectIds(page, ['arr-m']);
-		expect(await stored(page)).toEqual(['arr-m']);
+		await expect.poll(() => stored(page)).toEqual(['arr-m']);
 		expect(await section(page).locator('[aria-live], [role="status"]').allTextContents()).not.toEqual(
 			expect.arrayContaining([expect.stringMatching(/moved|position|1 of 1/i)])
 		);
@@ -190,13 +190,13 @@ test('[FAVORDER-03] swaps visible stable IDs in complete-array slots without dis
 	await open(page, ['gone-first', 'arr-z', 'gone-between', 'arr-a', 'arr-m', 'gone-last']);
 	await activate(page, 'Alpha Song', 'up');
 	await expectIds(page, ['arr-a', 'arr-z', 'arr-m']);
-	expect(await stored(page)).toEqual(['gone-first', 'arr-a', 'gone-between', 'arr-z', 'arr-m', 'gone-last']);
+	await expect.poll(() => stored(page)).toEqual(['gone-first', 'arr-a', 'gone-between', 'arr-z', 'arr-m', 'gone-last']);
 	await activate(page, 'Alpha Song', 'down');
 	await expectIds(page, ALL);
-	expect(await stored(page)).toEqual(['gone-first', 'arr-z', 'gone-between', 'arr-a', 'arr-m', 'gone-last']);
+	await expect.poll(() => stored(page)).toEqual(['gone-first', 'arr-z', 'gone-between', 'arr-a', 'arr-m', 'gone-last']);
 	await activate(page, 'Mike Song', 'up');
 	await expectIds(page, ['arr-z', 'arr-m', 'arr-a']);
-	expect(await stored(page)).toEqual(['gone-first', 'arr-z', 'gone-between', 'arr-m', 'arr-a', 'gone-last']);
+	await expect.poll(() => stored(page)).toEqual(['gone-first', 'arr-z', 'gone-between', 'arr-m', 'arr-a', 'gone-last']);
 	// Previously absent IDs become visible in their original complete-array slots.
 	const expanded = [...ITEMS, ...['gone-first', 'gone-between', 'gone-last'].map((id) => ({ id, title: id, artist: '' }))];
 	await page.route('**/api/library', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(expanded) }));
@@ -209,7 +209,7 @@ test('[FAVORDER-04] reload restores arrangement only after authenticated library
 	await open(page, ALL);
 	await activate(page, 'Mike Song', 'up');
 	await expectIds(page, ['arr-z', 'arr-m', 'arr-a']);
-	expect(await stored(page)).toEqual(['arr-z', 'arr-m', 'arr-a']);
+	await expect.poll(() => stored(page)).toEqual(['arr-z', 'arr-m', 'arr-a']);
 	let release!: () => void;
 	const pending = new Promise<void>((resolve) => { release = resolve; });
 	await page.route('**/api/library', async (route) => {
@@ -289,9 +289,9 @@ test('a retired move reconciles durable favorites without dropping a visit-only 
 });
 
 for (const crossesVisitOnly of [false, true]) {
-	test(`peer reorder preserves a move across a ${crossesVisitOnly ? 'visit-only' : 'saved'} favorite`, async ({ page }) => {
+	test(`a peer update preserves a move across a ${crossesVisitOnly ? 'visit-only' : 'saved'} favorite`, async ({ page }) => {
 		const initial = ['arr-z', 'hidden', 'arr-m'];
-		const items = [...ITEMS, { id: 'arr-b', title: 'Bravo Song', artist: 'Cedar' }];
+		const items = [...ITEMS, { id: 'arr-b', title: 'Bravo Song', artist: '' }, { id: 'arr-c', title: 'Charlie Song', artist: '' }];
 		await open(page, initial, items);
 		await faultStorage(page, 'write');
 		await star(page, 'arr-a').click();
@@ -307,13 +307,13 @@ for (const crossesVisitOnly of [false, true]) {
 		}
 		expect(await stored(page)).toEqual(initial);
 		await page.evaluate(() => Reflect.get(window, '__restoreArrangementStorage')());
-		const saved = crossesVisitOnly ? ['arr-m', 'arr-z', 'hidden'] : ['arr-m', 'hidden', 'arr-z'];
+		const saved = crossesVisitOnly ? ['arr-z', 'hidden', 'arr-c', 'arr-m'] : ['arr-m', 'hidden', 'arr-z', 'arr-b'];
 		await open(await page.context().newPage(), saved, items);
-		await activate(page, 'Alpha Song', 'down');
-		await expect(announcement).toHaveText(`Alpha Song moved to 3 of ${crossesVisitOnly ? 4 : 3}`);
+		await activate(page, crossesVisitOnly ? 'Bravo Song' : 'Alpha Song', crossesVisitOnly ? 'up' : 'down');
+		await expect(announcement).toHaveText(crossesVisitOnly ? 'Bravo Song moved to 2 of 5' : 'Alpha Song moved to 3 of 4');
 		await page.route('**/api/library', (route) => route.fulfill({ json: [...items, { id: 'hidden', title: 'Hidden Song', artist: '' }] }));
 		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-		await expectIds(page, crossesVisitOnly ? ['arr-m', 'arr-b', 'arr-a', 'hidden', 'arr-z'] : ['arr-m', 'hidden', 'arr-z', 'arr-a']);
+		await expectIds(page, crossesVisitOnly ? ['arr-z', 'arr-b', 'hidden', 'arr-a', 'arr-c', 'arr-m'] : ['arr-m', 'hidden', 'arr-z', 'arr-a', 'arr-b']);
 		expect(await stored(page)).toEqual(saved);
 	});
 }
@@ -358,7 +358,7 @@ for (const unstar of [true, false]) {
 		for (const checkbox of await rows.getByRole('checkbox').all()) await checkbox.check();
 		const release = await holdFavorites(page);
 		await activate(page, 'Zulu Song', 'down');
-		await frame(page);
+		await expectIds(page, [...(unstar ? both : mixed)].reverse());
 		await rows.first().getByTestId('queue-more').click();
 		const action = page.getByRole('menuitem', { name: unstar ? 'Unstar all' : 'Star all', exact: true });
 		await action.focus();
@@ -469,5 +469,5 @@ test('[FAVORDER-09] a refreshed-away favorite has no remaining move action and s
 	await expect(move(page, 'Mike Song', 'down')).toBeDisabled();
 	await activate(page, 'Mike Song', 'up');
 	await expectIds(page, ['arr-m', 'arr-z']);
-	expect(await stored(page)).toEqual(['arr-m', 'hidden', 'arr-a', 'arr-z']);
+	await expect.poll(() => stored(page)).toEqual(['arr-m', 'hidden', 'arr-a', 'arr-z']);
 });

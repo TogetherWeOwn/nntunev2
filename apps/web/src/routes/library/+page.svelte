@@ -928,9 +928,10 @@
 		recoverFocus();
 		editFavorites(move, (before, after) => {
 			recoverFocus();
-			const ids = visible(after);
-			const position = ids.indexOf(id);
-			if (position !== -1 && position !== visible(before).indexOf(id)) {
+			const ids = visible(after), previous = visible(before);
+			const position = ids.indexOf(id), from = previous.indexOf(id);
+			const changedSide = (from < previous.indexOf(crossed)) !== (position < ids.indexOf(crossed));
+			if (position !== -1 && (position !== from || changedSide)) {
 				favoritesAnnouncement = `${track ? displayTitle(track) : id} moved to ${position + 1} of ${ids.length}`;
 			}
 		}, { id, crossed, direction, loaded });
