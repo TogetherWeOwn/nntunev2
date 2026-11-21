@@ -477,7 +477,7 @@ mod tests {
         }
     }
 
-    fn versioned_pin<'a>(object_key: &'a str, version: &'static str) -> ReadbackPin<'a> {
+    fn versioned_pin<'a>(object_key: &'a str, version: &'a str) -> ReadbackPin<'a> {
         ReadbackPin {
             version: Some(version),
             ..pin(object_key)
@@ -499,11 +499,8 @@ mod tests {
         bytes
     }
 
-    fn enrolled_fixture(plaintext: &[u8]) -> (Fixture, Vec<u8>, EnvelopeContext, [u8; 230]) {
+    fn enrolled_origin(plaintext: &[u8]) -> (Fixture, EnvelopeContext, [u8; 230]) {
         let f = fixture_with_identities(plaintext, [id(6), id(7), id(0xab), id(0xcd), id(1)]);
-        assert_eq!(f.chunks.len(), 2);
-        let mut media = f.header.to_vec();
-        media.extend(f.chunks.iter().flatten().copied());
         let context = EnvelopeContext {
             identities: [id(9), id(6), id(7), id(0xab), id(0xcd), id(1)],
             plaintext_len: plaintext.len() as u64,
@@ -511,6 +508,14 @@ mod tests {
         };
         let record =
             crate::media_envelope::wrap_scheme2(&ROOT, &context, f.key.expose_secret()).unwrap();
+        (f, context, record)
+    }
+
+    fn enrolled_fixture(plaintext: &[u8]) -> (Fixture, Vec<u8>, EnvelopeContext, [u8; 230]) {
+        let (f, context, record) = enrolled_origin(plaintext);
+        assert_eq!(f.chunks.len(), 2);
+        let mut media = f.header.to_vec();
+        media.extend(f.chunks.iter().flatten().copied());
         (f, media, context, record)
     }
 
@@ -686,6 +691,79 @@ mod tests {
                 result,
                 Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory))
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolled_readback_refuses_matching_malformed_versions_before_io() {
+        let (f, context, record) = enrolled_origin(&split_flac());
+        let oversized = "v".repeat(1025);
+        for (case, version) in [("oversized", oversized.as_str()), ("non-graphic", "v 1")] {
+            let inventory = CompletedInventory {
+                media_version: version,
+                ..completed_inventory(&context)
+            };
+            let result = verify_enrolled_readback::<Body<'_>>(
+                &f.manifest,
+                EnrolledEnvelope {
+                    authorized_root: &ROOT,
+                    context: &context,
+                    trusted_record: &record,
+                    retained_record: &record,
+                },
+                &inventory,
+                versioned_pin(MEDIA, version),
+                &[(0, versioned_pin(PAGE, PAGE_VERSION))],
+                async |_| panic!("{case} version opened an object"),
+            )
+            .await;
+            assert_eq!(
+                result,
+                Err(EnrolledReadbackError::Body(BodyReadbackError::Inventory)),
+                "{case} version"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolled_readback_refuses_swapped_page_versions_before_io() {
+        // One full digest page (256 chunks), then one byte on page 1.
+        let (f, context, record) = enrolled_origin(&vec![42; 256 * 65_536 + 1]);
+        assert_eq!(f.pages.len(), 2);
+        let second_page = PAGE.replacen("/00000000", "/00000001", 1);
+        let versions = [PAGE_VERSION, "second-page-version"];
+        let inventory = CompletedInventory {
+            page_versions: &versions,
+            ..completed_inventory(&context)
+        };
+        // The ordered control reaches the mock opener; no body is needed.
+        for (pin_versions, error, expected_opens) in [
+            (versions, BodyReadbackError::Transport, 1),
+            ([versions[1], versions[0]], BodyReadbackError::Inventory, 0),
+        ] {
+            let mut opens = 0;
+            let result = verify_enrolled_readback::<Body<'_>>(
+                &f.manifest,
+                EnrolledEnvelope {
+                    authorized_root: &ROOT,
+                    context: &context,
+                    trusted_record: &record,
+                    retained_record: &record,
+                },
+                &inventory,
+                versioned_pin(MEDIA, MEDIA_VERSION),
+                &[
+                    (0, versioned_pin(PAGE, pin_versions[0])),
+                    (1, versioned_pin(&second_page, pin_versions[1])),
+                ],
+                async |_| {
+                    opens += 1;
+                    Err(std::io::ErrorKind::UnexpectedEof.into())
+                },
+            )
+            .await;
+            assert_eq!(opens, expected_opens, "pin versions: {pin_versions:?}");
+            assert_eq!(result, Err(EnrolledReadbackError::Body(error)));
         }
     }
 
