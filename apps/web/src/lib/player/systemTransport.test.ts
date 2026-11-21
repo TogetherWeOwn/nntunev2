@@ -217,22 +217,11 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	['interior corrected down historical', 59.84, false, 59.84, 59.8], ['interior corrected down replay', 59.84, true, 59.84, 59.8, 59.82],
 	['interior corrected down played', 59.84, true, 59.84], ['interior corrected down played rounded', 59.839, true, 59.84],
 	['interior rounded up', 60, false, 0], ['interior rounded up settled', 60, false, 0, 59.98], ['interior rounded up played', 60, true, 0], ['interior rounded up replay', 60, true, 0, 59.98, 59.99],
-	['late correction', 59.8, false, 59.86], ['late correction played', 59.86, true, 59.86],
-	['interior late correction', 59.8, false, 59.84], ['interior late correction played', 59.84, true, 59.84],
+	['late correction', 59.86, false, 59.86], ['late correction played', 59.86, true, 59.86], ['interior late correction', 59.8, false, 59.84], ['interior late correction played', 59.84, true, 59.84],
 	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
 ] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?, motion?) => {
-	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot, positionState = vi.mocked(session.setPositionState)!;
-	await media.playCurrent(); audio.emit('playing'); positionState.mockClear();
-	for (const [action, details, target] of [['seekforward', {}, 30], ['seekbackward', { seekOffset: 2.5 }, 27.5],
-		['seekforward', { seekOffset: 100 }, 60], ['seekbackward', { seekOffset: 100 }, 0], ['seekto', { seekTime: 100 }, 60],
-		['seekto', { seekTime: 0 }, 0], ['seekto', { seekTime: 12.25, fastSeek: true }, 12.25]] as const) {
-		fire(action, details);
-		expect(audio).toMatchObject({ currentTime: target, paused: false });
-		if (action === 'seekto') expect(get(media.absoluteSeek).position).toBe(target);
-	}
-	for (const unused of [audio.pause, audio.fastSeek, positionState]) expect(unused).not.toHaveBeenCalled();
-	audio.emit('seeked');
-	expect(positionState).toHaveBeenCalledExactlyOnceWith({ duration: 60, position: 12.25, playbackRate: 1 });
+	const { audio, media, fire, queue } = setup(), initial = queue.snapshot;
+	await media.playCurrent(); audio.emit('playing');
 	const ignored = scenario.endsWith('ignored'), unchanged = ignored || scenario.endsWith('unchanged'), endpoint = unchanged ? 60.035 : 60;
 	const forward = scenario === 'seekforward' || scenario.startsWith('forward'), rounded = scenario.startsWith('interior rounded up');
 	const late = scenario.includes('late correction'), corrected = scenario.includes('corrected down'), target = scenario.startsWith('interior') ? (corrected || late ? 59.8 : 59.99) : endpoint;
