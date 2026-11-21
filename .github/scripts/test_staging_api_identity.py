@@ -166,6 +166,15 @@ class IdentityTests(unittest.TestCase):
             ("success", 0, "synthetic unparseable output", missing),
             ("success", 0, '"synthetic non-object output"', missing),
             ("success", 0, f"{matched}\n{matched}", missing),
+            ("success", 0, '{"identity":"matched"}', missing),
+            ("success", 0, json.dumps(MATCHED | {"deployment_id": "not-an-id"}), missing),
+            ("success", 0, json.dumps(MATCHED | {"build_sha": "e" * 40}), missing),
+            ("success", 0, json.dumps(MATCHED | {"lease": "present"}), missing),
+            ("success", 0, json.dumps(MATCHED | {"unexpected": "synthetic private field"}), missing),
+            ("success", 0, matched.replace('"version_id":', '"version_id":null,"version_id":'), missing),
+            ("success", 1, json.dumps(denied | {"reason": "synthetic-private-detail"}), missing),
+            ("success", 1, json.dumps(denied | {"unexpected": "synthetic private field"}), missing),
+            ("success", 0, matched + " " * 512, missing),
             ("failure", 0, matched, missing),
             ("cancelled", 0, matched, missing),
         ):
@@ -179,7 +188,8 @@ class IdentityTests(unittest.TestCase):
                        "SCHEMA_OUTCOME": "success", "JOB_STATUS": status, "DEPLOY_OUTCOME": status, "SOURCE_SHA": SHA}
                 hook_result = subprocess.run(["bash", "-c", hook], check=True, env=env, capture_output=True, text=True)
                 self.assertEqual(hook_result.stdout, "")
-                report_result = subprocess.run(["bash", "-c", script], check=True, env=env, capture_output=True, text=True)
+                report_result = subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True,
+                                               env=env | {"PATH": identity.os.defpath})
                 deployed, outcome = status == "success", {"success": "deployed", "failure": "failed"}.get(status, status)
                 self.assertEqual(output.read_text(),
                                  f"deployed={str(deployed).lower()}\noutcome={outcome}\nsource_sha={SHA if deployed else ''}\n")

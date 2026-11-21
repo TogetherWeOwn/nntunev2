@@ -458,9 +458,10 @@ jobs:
             echo "outcome=$outcome"
             echo "source_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
-          # Read only the probe's redacted output, never Wrangler or provider responses.
+          # Validate the redacted receipt before publishing it; never read provider responses here.
           if [ "$deployed" != true ] || [ -z "${RUNNER_TEMP:-}" ] || \
-             ! receipt=$(jq -cse 'select(length == 1) | .[0] | objects' "$RUNNER_TEMP/staging-api-identity.json" 2>/dev/null); then
+             ! receipt=$(python3 -I .github/scripts/staging_api_identity.py --validate-receipt \
+               "$RUNNER_TEMP/staging-api-identity.json" "$source_sha" 2>/dev/null); then
             receipt='{"identity":"unavailable","reason":"no-completed-probe-receipt"}'
           fi
           {

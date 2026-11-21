@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import re
+import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -180,8 +181,49 @@ def receipt(body, expected_sha, account, read):
     deployment_id = current_deployment(read(deployments), version_id)
     verify_version(read(path + "/versions/" + version_id), version_id, expected_sha)
     require(current_deployment(read(deployments), version_id) == deployment_id, "deployment-changed-during-readback")
+    return matched_receipt(deployment_id, version_id, expected_sha)
+
+
+def matched_receipt(deployment_id, version_id, build_sha):
     return {"identity": "matched", "deployment_id": deployment_id, "version_id": version_id,
-            "build_sha": expected_sha, "enable_flag": "off", "lease": "absent", "measurement_db_binding": "absent"}
+            "build_sha": build_sha, "enable_flag": "off", "lease": "absent", "measurement_db_binding": "absent"}
+
+
+# Only static producer codes may cross the report boundary; new codes fail closed.
+REPORTABLE_REASONS = (
+    "account-config", "credential-config", "default-off-not-verified", "deploy-output-unavailable",
+    "deployed-version-mismatch", "deployment-changed-during-readback", "deployment-not-single-version",
+    "deployment-shape", "deployment-traffic-shape", "deployments-auth-denied", "expected-build-shape",
+    "provider-body-limit", "provider-http-status", "provider-response-shape", "provider-transport",
+    "provider-version-mismatch", "version-auth-denied", "version-bindings-shape",
+    "version-bindings-unavailable", "version-build-mismatch", "version-build-unavailable",
+)
+
+
+def report_receipt(path, expected_sha):
+    """Validate and re-encode a saved receipt without consulting the provider."""
+    limit = 512  # Both fixed receipt shapes fit comfortably in this bound.
+    try:
+        with Path(path).open("rb") as source:
+            body = source.read(limit + 1)
+        if len(body) > limit:
+            return 1
+        saved = decode(body, "invalid-receipt")
+    except (OSError, Unavailable):
+        return 1
+    if field(saved, "identity") == "matched":
+        deployment_id, version_id = saved.get("deployment_id"), saved.get("version_id")
+        if not (valid(UUID, deployment_id) and valid(UUID, version_id) and valid(SHA, expected_sha)):
+            return 1
+        redacted = matched_receipt(deployment_id, version_id, expected_sha)
+    elif field(saved, "identity") == "unavailable" and saved.get("reason") in REPORTABLE_REASONS:
+        redacted = {"identity": "unavailable", "reason": saved["reason"]}
+    else:
+        return 1
+    if saved != redacted:
+        return 1
+    print(json.dumps(redacted, separators=(",", ":")))
+    return 0
 
 
 def main():
@@ -204,4 +246,8 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if len(sys.argv) == 1:
+        raise SystemExit(main())
+    if len(sys.argv) == 4 and sys.argv[1] == "--validate-receipt":
+        raise SystemExit(report_receipt(sys.argv[2], sys.argv[3]))
+    raise SystemExit(2)
