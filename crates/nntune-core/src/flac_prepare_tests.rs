@@ -112,9 +112,8 @@ fn assert_bad_geometry(input: &[u8], frames: impl IntoIterator<Item = FrameSpan>
 
 #[test]
 fn refuses_truncated_metadata_missing_frames_and_inconsistent_geometry() {
-    let input = fixture(OLD_TITLE);
-    let bad_comment = fixture(&OLD_LFE[..OLD_LFE.len() - 1]);
-    for malformed in [&input[..43], &bad_comment] {
+    let mut input = fixture(OLD_TITLE);
+    for malformed in [&input[..43], &fixture(&OLD_LFE[..OLD_LFE.len() - 1])] {
         let error = prepare(malformed, &[], spans()).err();
         assert_eq!(error, Some(PrepareError::Preamble));
     }
@@ -127,6 +126,8 @@ fn refuses_truncated_metadata_missing_frames_and_inconsistent_geometry() {
     let mut gap = spans();
     gap[1].bytes.start += 1;
     assert_bad_geometry(&input, gap);
+    input[25] += 1; // Change only STREAMINFO's declared total: 12,000 -> 12,001.
+    assert_bad_geometry(&input, spans());
 }
 
 #[test]
