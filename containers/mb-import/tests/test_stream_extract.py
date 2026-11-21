@@ -1009,26 +1009,8 @@ class LabelProjectionTest(ProjectionTestCase):
         edges.write_bytes(edges.read_bytes() + f"11\t30\t71\t{boundary}\t\\N\n".encode())
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
-        ts = "2025-02-03T04:05:06Z"
-        quartz = "71717171-7171-4717-8717-717171717171"
-        untyped = "62626262-6262-4626-8626-626262626262"
-        first = "55555555-5555-4555-8555-555555555555"
-        second = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-        expected_labels = (
-            f"{quartz}\tQuartz\\tRecords\t12345\t{boundary}\t{ts}\n"
-            f"{untyped}\tUntyped Label\t\\N\t\\N\t{ts}\n"
-        )
-        expected_edges = (
-            f"{first}\t{untyped}\tCafé\\tDisc\\\\N\t{ts}\n"
-            f"{first}\t{quartz}\t\t{ts}\n"
-            f"{first}\t{quartz}\t QZ-1 \t{ts}\n"
-            f"{first}\t{quartz}\t qz-1 \t{ts}\n"
-            f"{first}\t{quartz}\t\\\\N\t{ts}\n"
-            f"{first}\t{quartz}\t{boundary}\t{ts}\n"
-            f"{second}\t{quartz}\t QZ-1 \t{ts}\n"
-        )
-        self.assertEqual((self.curated / "mbdump-label.tsv").read_bytes(), expected_labels.encode())
-        self.assertEqual((self.curated / "mbdump-release_label.tsv").read_bytes(), expected_edges.encode())
+        for name in ("mbdump-label.tsv", "mbdump-release_label.tsv"):
+            self.assertEqual((self.curated / name).read_bytes(), (ROOT / "tests" / "expected" / name).read_bytes())
 
         members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
         tables = ("label", "label_type", "release_label")

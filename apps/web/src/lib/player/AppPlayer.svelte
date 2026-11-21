@@ -7,6 +7,7 @@
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
 	import PlaybackSpeedControl from './PlaybackSpeedControl.svelte';
+	import SleepTimerControls from './SleepTimerControls.svelte';
 	import VolumeControls from './VolumeControls.svelte';
 	import { createPlayerController } from './controller.svelte.js';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
@@ -23,6 +24,7 @@
 	const sound = media.sound.state;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	const sleepTimer = media.sleepTimer;
 	$effect.pre(() => { if (signedOut) untrack(player.purgeAtAuthBoundary); });
 	// Retire the decoder before the mounted Library handles the same signal.
 	$effect.pre(() => {
@@ -47,10 +49,10 @@
 {#snippet speedControl()}
 	<PlaybackSpeedControl value={$speedState.rate === null ? null : String($speedState.rate)}
 		feedback={$speedState.feedback} onchange={(control) => {
-			const observed = speed.set(Number(control.value));
-			control.value = observed === null ? '' : String(observed);
+			control.value = String(speed.set(Number(control.value)) ?? '');
 		}} />
 {/snippet}
+<svelte:document onvisibilitychange={() => { if (document.visibilityState === 'visible') sleepTimer.tick(); }} />
 {@render children()}
 {#if streamUrl}
 	<div class="nt-wrap">
@@ -59,4 +61,9 @@
 			retryCurrent={media.retryCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} {speedControl} />
 	</div>
+{/if}
+{#if streamUrl}
+	<section class="nt-wrap" aria-label="Sleep timer">
+		<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
+	</section>
 {/if}

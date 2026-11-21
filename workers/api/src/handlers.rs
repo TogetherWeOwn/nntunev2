@@ -562,6 +562,15 @@ pub enum AdminInviteRevokeOutcome {
     ActorNotAdmin,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum MemberInviteIssueOutcome {
+    Issued { id: i64, expires_at: i64 },
+    Ineligible,
+    WindowClosed,
+    QuotaExhausted,
+    AccountDeleting,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct InviteWindow {
     pub id: i64,
@@ -1537,6 +1546,14 @@ pub trait Store {
         _source_ip: &str,
         _now: u64,
     ) -> impl Future<Output = Result<AdminInviteIssueOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn member_issue_invite(
+        &self,
+        _issuer: &str,
+        _code_hash: &str,
+        _source_ip: &str,
+    ) -> impl Future<Output = Result<MemberInviteIssueOutcome, StoreError>> {
         async { Err(StoreError) }
     }
     /// Every invite row, newest first, for the admin list. `issuer`
@@ -6116,6 +6133,46 @@ where
     )
 }
 
+/// Bodyless browser issuance for the authenticated principal.
+async fn member_invite_issue(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+) -> Response {
+    use {crate::api_error::ApiError, MemberInviteIssueOutcome as Outcome};
+    if req.authorization.is_some() {
+        return not_found();
+    }
+    let (claims, _) = match ctx.authenticate(req, true).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    if !req.body.is_empty() {
+        return validation_failed("member invite issuance takes no request body");
+    }
+    let Ok(code) = auth::generate_invite_code() else {
+        return unavailable();
+    };
+    let hash = auth::hash_invite_code(&code);
+    let issued = ctx
+        .store
+        .member_issue_invite(&claims.user_id, &hash, &ctx.source_ip)
+        .await;
+    let error = match issued {
+        Ok(Outcome::Issued { id, expires_at }) => {
+            let body = serde_json::json!({"id": id, "expires_at": expires_at, "code": code});
+            let mut response = json_response(201, body);
+            response.extra_headers = vec![("cache-control".into(), "private, no-store".into())];
+            return response;
+        }
+        Ok(Outcome::Ineligible) => ApiError::forbidden("paid membership eligibility not met"),
+        Ok(Outcome::WindowClosed) => ApiError::by_code("conflict", "no invite window is open"),
+        Ok(Outcome::QuotaExhausted) => ApiError::by_code("conflict", "invite quota exhausted"),
+        Ok(Outcome::AccountDeleting) => return account_deleting_response(),
+        Err(_) => return internal(),
+    };
+    json_response(error.status, serde_json::json!(error))
+}
+
 /// `GET /v1/admin/invites` — every invite (newest first, capped),
 /// optionally narrowed by `/status/{status}` or `/issuer/{user_id}`.
 /// Filters ride path segments: `Request` carries no query string and
@@ -8040,6 +8097,7 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
+        ("POST", crate::native_rest::MEMBER_INVITES_PATH) => member_invite_issue(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
         ("GET", "/v1/me/likes/session") => me_likes_session(ctx, req).await,
         ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
@@ -8285,6 +8343,7 @@ mod tests {
         /// mailbox (mirrors the migration 0018 table).
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
+        member_invite_calls: RefCell<Vec<(String, String)>>,
         invite_window_list: RefCell<Option<Vec<InviteWindow>>>,
         invite_window_outcomes: RefCell<std::collections::VecDeque<InviteWindowOutcome>>,
         invite_window_calls: RefCell<Vec<serde_json::Value>>,
@@ -8952,6 +9011,21 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn member_issue_invite(
+            &self,
+            issuer: &str,
+            hash: &str,
+            _: &str,
+        ) -> Result<MemberInviteIssueOutcome, StoreError> {
+            self.member_invite_calls
+                .borrow_mut()
+                .push((issuer.into(), hash.into()));
+            Ok(MemberInviteIssueOutcome::Issued {
+                id: 1,
+                expires_at: 2,
+            })
+        }
+
         async fn admin_list_invite_windows(&self) -> Result<Vec<InviteWindow>, StoreError> {
             self.invite_window_calls
                 .borrow_mut()
@@ -23130,6 +23204,34 @@ mod tests {
                 event.action
             );
         }
+    }
+
+    #[test]
+    fn member_invite_issue_requires_browser_identity() {
+        use crate::native_rest::MEMBER_INVITES_PATH as PATH;
+        let h = harness();
+        seed_user(&h, "member", "member@example.com");
+        let session = Some(magic_login(&h, "member@example.com"));
+        let origin = Some(ORIGIN);
+        let preflight = h.call_full("OPTIONS", PATH, None, None, origin);
+        assert_eq!(preflight.status, 204);
+        assert!(preflight.body.is_empty());
+        let call = |session, origin, body| h.call_full("POST", PATH, body, session, origin);
+        let bearer = Some("Bearer ntk_synthetic".into());
+        assert_eq!(h.call_bearer("POST", PATH, bearer).status, 404);
+        assert_eq!(call(None, origin, None).status, 401);
+        assert_eq!(call(session.clone(), None, None).status, 401);
+        let body = Some(r#"{"issuer":"other"}"#.into());
+        assert_eq!(call(session.clone(), origin, body).status, 422);
+        let response = call(session, origin, None);
+        assert_eq!(response.status, 201);
+        assert!(response
+            .extra_headers
+            .contains(&("cache-control".into(), "private, no-store".into())));
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let hash = auth::hash_invite_code(body["code"].as_str().unwrap());
+        let calls = h.store.member_invite_calls.borrow();
+        assert_eq!(*calls, [("member".to_owned(), hash)]);
     }
 
     #[test]
