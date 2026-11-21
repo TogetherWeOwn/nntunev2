@@ -14,7 +14,7 @@ import type { SystemSeekGuard } from './systemSeek.js';
 import { bindSystemTransport } from './systemTransport.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
-export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | { end: number; settled?: number; progressed?: boolean } };
+export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | { end: number; playedThrough: number; settled?: number; progressed?: boolean } };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error' | 'retrying';
 
 type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
@@ -29,6 +29,7 @@ export type MediaSelection = {
 };
 
 const REPEAT_KEY = 'nntune:library-repeat:v1';
+const playedEnd = ({ played }: HTMLAudioElement) => played?.length ? played.end(played.length - 1) : 0;
 
 function describeRestart(words: string, title: string): string {
 	const suffix = ` ${title}.`;
@@ -389,8 +390,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function onSeekLanded(attachment: MediaAttachment, system?: SystemSeekGuard) {
-		if (system || typeof attachment.soughtToEnd === 'object')
-			return (target: number, duration: number) => { attachment.soughtToEnd = system && target === duration ? { end: duration } : false; };
+		if (system || typeof attachment.soughtToEnd === 'object') return (target: number, end: number) => {
+			attachment.soughtToEnd = system && target === end ? { end, playedThrough: playedEnd(attachment.audio) } : false; };
 	}
 
 	function jump(direction: JumpDirection, seconds = RELATIVE_JUMP_SECONDS, system?: SystemSeekGuard): void {
@@ -527,10 +528,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!audio.ended || audio.error !== null || !attachment.playing || !ownsOrigin()) return;
 		const { soughtToEnd } = attachment;
 		if (typeof soughtToEnd === 'object') {
-			const { duration, currentTime } = audio, { end, progressed } = soughtToEnd, slack = SEEK_READBACK_TOLERANCE;
+			const { duration, currentTime } = audio, { end, playedThrough, progressed } = soughtToEnd, slack = SEEK_READBACK_TOLERANCE;
+			// A short extension can finish before the next timeupdate; seek rounding does not extend played ranges.
+			const leftEndpoint = currentTime > end + slack || (currentTime >= duration && (progressed || playedEnd(audio) > Math.max(end, playedThrough)));
 			if (!ownsOrigin()) return;
-			// Inside the old rounding tolerance, require progress after seeked and the revised end.
-			const leftEndpoint = currentTime > end + slack || (progressed && currentTime >= duration);
 			if (!(duration > end && currentTime >= duration - slack && leftEndpoint)) { attachment.playing = attachment.soughtToEnd = false; return; }
 		}
 		const natural = soughtToEnd !== true;

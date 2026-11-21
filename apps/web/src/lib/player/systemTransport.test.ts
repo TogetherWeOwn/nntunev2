@@ -19,6 +19,7 @@ class Decoder extends EventTarget {
 	seeking = false;
 	duration = NaN;
 	ranges: [number, number][] = [];
+	played: TimeRanges = { length: 0, start: () => 0, end: () => 0 };
 	beforeRead?: () => void;
 	write = vi.fn((value: number) => { this.position = value; });
 	get currentTime() { this.beforeRead?.(); return this.position; }
@@ -216,7 +217,7 @@ function setup({ unsupported, connected = true, ranges }: { unsupported?: string
 
 test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 60, true, 0], ['extended', 75, true, 75],
 	['old end', 60, false, 75], ['rounded old end', 60.001, false, 60.035], ['short extension', 60.035, true, 60.035],
-	['corrected down', 59.8, false, 0], ['unchanged', 60, false, 0],
+	['historical range', 60.035, false, 60.035], ['corrected down', 59.8, false, 0], ['unchanged', 60, false, 0],
 	['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
 ] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration) => {
 	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot, positionState = vi.mocked(session.setPositionState)!.mockClear();
@@ -226,10 +227,9 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 		['seekbackward', { seekOffset: 100 }, 0], ['seekto', { seekTime: 100 }, 60], ['seekto', { seekTime: 0 }, 0]
 	] as const) {
 		fire(action, details);
-		expect(audio.currentTime).toBe(target);
+		expect(audio).toMatchObject({ currentTime: target, paused: true });
 		if (action === 'seekto') expect(get(media.absoluteSeek).position).toBe(target);
 	}
-	expect(audio.paused).toBe(true);
 	await media.playCurrent();
 	fire('seekforward');
 	expect(audio).toMatchObject({ currentTime: 10, paused: false });
@@ -241,6 +241,7 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	const ignored = scenario.endsWith('ignored'), unchanged = ignored || scenario.endsWith('unchanged'), endpoint = unchanged ? 60.035 : 60;
 	const forward = scenario === 'seekforward' || scenario.startsWith('forward');
 	if (unchanged) Object.assign(audio, { duration: endpoint, ranges: [[0, endpoint]], position: 60 });
+	if (scenario === 'historical range') audio.played = { length: 1, start: () => 0, end: () => position };
 	audio.write.mockImplementationOnce((target) => ignored ? undefined
 		: Object.assign(audio, { position: unchanged || scenario === 'corrected down' ? 60 : target - 0.000001, seeking: true }));
 	fire(forward ? 'seekforward' : 'seekto', { seekTime: endpoint, seekOffset: 100 });
@@ -251,7 +252,7 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	else if (scenario === 'corrected down') { audio.duration = audio.position = position; audio.emit('durationchange'); }
 	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('seeked'); }
 	if (revisedDuration) { audio.duration = revisedDuration; audio.emit('durationchange'); }
-	if (scenario === 'short extension') { audio.position = 60.015; audio.emit('timeupdate'); }
+	if (scenario === 'short extension') audio.played = { length: 1, start: () => 60, end: () => position };
 	Object.assign(audio, { position, ended: true, paused: true }).emit('pause', 'ended');
 	if (advances) expect(queue.snapshot.currentIndex).toBe(1); else expect(queue.snapshot).toBe(initial);
 	expect([audio.play.mock.calls.length, audio.load.mock.calls.length]).toEqual([1, 0]);
@@ -294,8 +295,7 @@ test('invalid inputs leave time unchanged and native ranges govern seek registra
 	for (const action of actions) expect(handler(action)).toBeTypeOf('function');
 });
 
-test.each([
-	['seekto', 0, false], ['seekto', 1, false], ['seekforward', 1, false],
+test.each([['seekto', 0, false], ['seekto', 1, false], ['seekforward', 1, false],
 	['seekto', 0, true], ['seekto', 1, true], ['seekto', 2, true], ['seekforward', 1, true]
 ] as const)('%s retires after loss (%i valid reads, competing intent: %s)', (action, validReads, competing) => {
 	const { audio, media, handler, fire } = setup();
@@ -327,8 +327,7 @@ test.each([
 
 test.each(['seekto', 'seekforward'] as const)('%s respects registration and intent during reentrant seeks', (action) => {
 	const { audio, media, fire } = setup();
-	const compact = (target: number) => media.seek(get(media.absoluteSeek).attachment, target);
-	const system = () => fire(action, { seekTime: 10, seekOffset: 5 });
+	const compact = (target: number) => media.seek(get(media.absoluteSeek).attachment, target), system = () => fire(action, { seekTime: 10, seekOffset: 5 });
 	audio.beforeRead = () => { audio.beforeRead = undefined; compact(30); };
 	system();
 	expect(audio.currentTime).toBe(30); // Preflight cannot supersede the newer compact write.
