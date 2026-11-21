@@ -2444,114 +2444,142 @@ async fn remove_member_window_fixture(client: &Client, window: i64) {
         .unwrap();
 }
 
-#[test]
-#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
-fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() {
-    use super::member_issue_invite_on as issue;
-    use crate::handlers::MemberInviteIssueOutcome as Outcome;
+fn assert_member_invite_issuance() {
+    use super::{billing_budget::bootstrap_transaction, member_issue_invite_on};
+    use crate::handlers::MemberInviteIssueOutcome::*;
+    use crate::{billing_reconcile::*, billing_transaction_sql::apply_reconcile_transaction};
+    use serde_json::{from_value, json};
 
     run_test(async {
         let mut db = connect().await;
         let mut other = connect().await;
+        let locker = connect().await;
+        let db_pid = backend_pid(&db).await;
+        let other_pid = backend_pid(&other).await;
+        let locker_pid = backend_pid(&locker).await;
         let (_, issuer) = seed_admin_test_users(&db).await;
         let (_, peer) = seed_admin_test_users(&db).await;
-        let ip = "198.51.100.9";
-        let code = |n| format!("hash-{issuer}-{n}");
-        let (first, second, third) = (code(1), code(2), code(3));
-        let outcome = issue(&mut db, &issuer, &first, ip).await.unwrap();
-        assert_eq!(outcome, Outcome::WindowClosed);
-        let (window, end) = seed_member_window(&db, 600).await;
+        let issue = async |db: &mut Client, user: &str, n: u8| {
+            let hash = format!("hash-{user}-{n}");
+            let issued = member_issue_invite_on(db, user, &hash, "198.51.100.9").await;
+            issued.unwrap()
+        };
+        assert_eq!(issue(&mut db, &issuer, 1).await, WindowClosed);
+        let (window, _) = seed_member_window(&db, 2 * 86_400).await;
+        let settings = "UPDATE app_settings SET value = v.value FROM (VALUES
+            ('invite_member_min_paid_months', $1::text), ('invite_member_per_window', $2::text),
+            ('invite_default_expiry_days', $3::text)) AS v(key, value) WHERE app_settings.key = v.key";
+        let old = format!("{peer}-old");
+        let lines = [(7, 12), (20, 35), (0, 10), (10, 15)].map(|(lo, hi)| {
+            json!({"id": lo.to_string(), "price": if lo == 0 { "pro" } else { "plus" },
+                "amount": 200, "currency": "usd", "period": {"start": lo * 86400, "end": hi * 86400}})
+        });
+        let snapshot = RemoteSubscription {
+            subscription: from_value(json!({"id": old, "customer": peer, "status": "active",
+                "items": {"data": [{"id": "si_old", "price": "plus"}]}})).unwrap(),
+            invoices: vec![from_value(json!({"id": old, "customer": peer, "subscription": old,
+                "status": "paid", "amount_paid": 800, "currency": "usd", "status_transitions": {"paid_at": 0},
+                "lines": {"data": lines, "has_more": false}})).unwrap()],
+        };
+        let bindings = ["plus", "pro"].map(|plan| PriceBinding {
+            price_id: plan.into(),
+            plan_id: plan.into(),
+            selectable: true,
+            livemode: false,
+        });
+        let local = ReconcileInput {
+            stripe_customer_id: Some(peer.clone()),
+            live: None,
+            bindings: bindings.into(),
+        };
+        let outcome = reconcile_subscription(&local, &snapshot, NOW as i64);
+        bootstrap_transaction(&mut db).await.unwrap();
+        let write = apply_reconcile_transaction(&mut db, peer.clone(), outcome);
+        write.await.unwrap();
+        let status = "UPDATE subscriptions SET status = $2 WHERE stripe_subscription_id = $1";
+        db.execute(status, &[&old, &"canceled"]).await.unwrap();
         db.execute("INSERT INTO subscriptions
             (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, paid_through_at)
-            SELECT u, u, u, u, 'price_fixture', 'plus', 'active', now() + interval '1 day'
-            FROM (VALUES ($1::text), ($2::text)) AS members(u)", &[&issuer, &peer]).await.unwrap();
-        // 60 distinct paid days despite overlapping spans and a free term.
-        let history = "INSERT INTO paid_invoice_history
-            (stripe_invoice_id, user_id, stripe_subscription_id, plan_id, period_start, period_end, amount_cents, currency, paid_at)
-            SELECT u || s::text, u, u || '-old', 'plus', to_timestamp(s * 86400), to_timestamp(e * 86400), cents, 'usd', to_timestamp(0)";
-        let partial = format!(
-            "{history} FROM (VALUES ($1::text,1,31,800),($1,15,45,800),
-            ($1,16,46,800),($1,46,61,800),($1,61,91,0)) AS terms(u,s,e,cents)"
-        );
-        db.execute(&partial, &[&issuer]).await.unwrap();
-        let outcome = issue(&mut db, &issuer, &first, ip).await.unwrap();
-        assert_eq!(outcome, Outcome::Ineligible);
-        // A disjoint term on an older subscription makes exactly 90 days.
-        let terms = "($1::text,120,150,800),($2::text,1,91,800)";
-        let qualified = format!("{history} FROM (VALUES {terms}) AS terms(u,s,e,cents)");
-        db.execute(&qualified, &[&issuer, &peer]).await.unwrap();
-        let status_sql = "UPDATE subscriptions SET status = $2 WHERE user_id = $1";
-        db.execute(status_sql, &[&issuer, &"unpaid"]).await.unwrap();
-        let outcome = issue(&mut db, &issuer, &first, ip).await.unwrap();
-        assert_eq!(outcome, Outcome::Ineligible);
-        db.execute(status_sql, &[&issuer, &"active"]).await.unwrap();
-        let Outcome::Issued { id, expires_at } = issue(&mut db, &issuer, &first, ip).await.unwrap()
-        else {
-            panic!("exact paid threshold should issue");
+            SELECT u, u, u, u, 'price_fixture', 'plus', status, now() + interval '1 day'
+            FROM (VALUES ($1::text,'unpaid'), ($2::text,'active')) AS members(u,status)", &[&issuer, &peer]).await.unwrap();
+        // The mixed invoice covers 30 distinct days. The other verified term
+        // overlaps it by a day and leaves one second missing; a legacy span cannot fill it.
+        db.execute("INSERT INTO paid_invoice_history (stripe_invoice_id, user_id, stripe_subscription_id,
+            plan_id, amount_cents, currency, paid_at, period_start, period_end, covered_periods)
+            SELECT u || lo::text, u, u, 'plus', cents, 'usd', to_timestamp(0), to_timestamp(lo*86400), to_timestamp(hi*86400),
+                CASE WHEN exact THEN tstzmultirange(tstzrange(to_timestamp(lo*86400), to_timestamp(hi*86400-short), '[)')) END
+            FROM (VALUES ($1::text,1,61,800,true,0),($2::text,34,95,800,true,1),
+                         ($2,95,102,800,false,0),($2,102,103,0,true,0)) AS terms(u,lo,hi,cents,exact,short)", &[&issuer, &peer]).await.unwrap();
+        assert_eq!(issue(&mut db, &peer, 1).await, Ineligible);
+        db.execute("UPDATE paid_invoice_history SET covered_periods = tstzmultirange(tstzrange(period_start, period_end, '[)'))
+            WHERE stripe_invoice_id = $1 || '34'", &[&peer]).await.unwrap();
+        assert!(matches!(issue(&mut db, &peer, 1).await, Issued { .. }));
+        assert_eq!(db.execute(settings, &[&"2", &"1", &"1"]).await.unwrap(), 3);
+        assert_eq!(issue(&mut db, &issuer, 1).await, Ineligible);
+        db.execute(status, &[&issuer, &"active"]).await.unwrap();
+        // Stall the quota winner at the audit; the contender must wait on the winner.
+        let audit_lock = "BEGIN; LOCK TABLE audit_log IN SHARE MODE";
+        locker.batch_execute(audit_lock).await.unwrap();
+        let second = async {
+            await_lock_wait(&locker, db_pid, locker_pid).await;
+            issue(&mut other, &issuer, 2).await
         };
-        assert_eq!(expires_at, end);
-        let revoke = "UPDATE invite_codes SET revoked_at = created_at WHERE id = $1";
-        db.execute(revoke, &[&id]).await.unwrap();
-        let (a, b) = futures_util::future::join(
-            issue(&mut db, &issuer, &second, ip),
-            issue(&mut other, &issuer, &third, ip),
-        )
-        .await;
-        let (winner, unused_hash) = match (a.unwrap(), b.unwrap()) {
-            (Outcome::Issued { id, .. }, Outcome::QuotaExhausted) => (id, &third),
-            (Outcome::QuotaExhausted, Outcome::Issued { id, .. }) => (id, &second),
-            outcomes => panic!("expected one winner: {outcomes:?}"),
+        let release = async {
+            await_lock_wait(&locker, other_pid, db_pid).await;
+            locker.batch_execute("COMMIT").await.unwrap();
         };
+        let (first, second, ()) = tokio::join!(issue(&mut db, &issuer, 1), second, release);
+        let Issued { id, expires_at } = first else {
+            panic!("expected issued: {first:?}")
+        };
+        assert_eq!(second, QuotaExhausted);
+        let valid: bool = db.query_one("SELECT i.expires_at = i.created_at + 86400 AND i.expires_at = $2
+            AND (SELECT count(*) FROM audit_log a WHERE a.user_id = i.issued_by AND a.action = 'invite.issued'
+                AND a.at = i.created_at AND a.details = jsonb_build_object('invite_id', i.id, 'kind', 'member', 'window_id', i.window_id)) = 1
+            FROM invite_codes i WHERE id = $1", &[&id, &expires_at]).await.unwrap().get(0);
+        assert!(valid, "configured lifetime and exactly one matching audit");
         for stamp in [
-            "UPDATE invite_codes SET expires_at = created_at WHERE id = $1",
-            "UPDATE invite_codes SET expires_at = created_at + 600, redeemed_at = created_at, used = true WHERE id = $1",
+            "revoked_at = created_at",
+            "revoked_at = NULL, expires_at = created_at",
+            "expires_at = created_at + 600, redeemed_at = created_at, used = true",
         ] {
-            db.execute(stamp, &[&winner]).await.unwrap();
-            let outcome = issue(&mut db, &issuer, unused_hash, ip).await.unwrap();
-            assert_eq!(outcome, Outcome::QuotaExhausted);
+            let sql = format!("UPDATE invite_codes SET {stamp} WHERE id = $1");
+            db.execute(&sql, &[&id]).await.unwrap();
+            assert_eq!(issue(&mut db, &issuer, 2).await, QuotaExhausted);
         }
-        let outcome = issue(&mut db, &peer, &code(4), ip).await.unwrap();
-        assert!(matches!(outcome, Outcome::Issued { .. }));
-        let audit_sql = "SELECT count(*) FROM audit_log a JOIN invite_codes i
-            ON a.details->>'invite_id' = i.id::text WHERE a.user_id = $1 AND i.issued_by = $1
-            AND a.action = 'invite.issued' AND a.at = i.created_at AND a.details =
-                jsonb_build_object('invite_id', i.id, 'kind', 'member', 'window_id', i.window_id)";
-        let audited: i64 = db.query_one(audit_sql, &[&issuer]).await.unwrap().get(0);
-        assert_eq!(audited, 2);
-        let next: i64 = db.query_one("WITH closed AS (UPDATE invite_windows SET
+        let next = db.query_one("WITH closed AS (UPDATE invite_windows SET
             ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint WHERE id = $1 RETURNING ends_at)
-            INSERT INTO invite_windows (starts_at, ends_at) SELECT ends_at, ends_at + 600 FROM closed RETURNING id",
-            &[&window]).await.unwrap().get(0);
-        let outcome = issue(&mut db, &issuer, unused_hash, ip).await.unwrap();
-        assert!(matches!(outcome, Outcome::Issued { .. }));
-        // The sequence survives rollback and proves each attempt reached the audit write.
-        db.batch_execute("CREATE SEQUENCE member_issue_delay_seen;
-            CREATE FUNCTION member_issue_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
-                PERFORM nextval('member_issue_delay_seen');
-                PERFORM pg_sleep_until(LEAST((SELECT to_timestamp(ends_at) FROM invite_windows
-                    WHERE id = (NEW.details->>'window_id')::bigint), (SELECT paid_through_at FROM subscriptions WHERE user_id = NEW.user_id)));
-                RETURN NEW;
-            END $$;
-            CREATE TRIGGER member_issue_delay BEFORE INSERT ON audit_log FOR EACH ROW
-                WHEN (NEW.action = 'invite.issued') EXECUTE FUNCTION member_issue_delay();").await.unwrap();
-        for (writes, window_secs, paid_secs, expected) in [
-            (1_i64, 4_i64, 600_i64, Outcome::WindowClosed),
-            (2, 600, 4, Outcome::Ineligible),
-        ] {
-            db.execute("WITH boundary AS (SELECT floor(extract(epoch FROM statement_timestamp()))::bigint AS t),
+            INSERT INTO invite_windows (starts_at, ends_at) SELECT ends_at, ends_at + 600 FROM closed RETURNING id, ends_at",
+            &[&window]).await.unwrap();
+        let (next, end): (i64, i64) = (next.get(0), next.get(1));
+        let outcome = issue(&mut db, &issuer, 2).await;
+        assert!(matches!(outcome, Issued { expires_at, .. } if expires_at == end));
+        let relax_lock = "SET lock_timeout = '5s'";
+        let wait_until = "SELECT pg_sleep_until(to_timestamp($1))";
+        other.batch_execute(relax_lock).await.unwrap();
+        let cases = [(4_i64, 600_i64, WindowClosed), (600, 4, Ineligible)];
+        for (window_secs, paid_secs, expected) in cases {
+            let end: i64 = db.query_one("WITH boundary AS (SELECT floor(extract(epoch FROM now()))::bigint AS t),
                 changed AS (UPDATE invite_windows SET ends_at = t + $3 FROM boundary WHERE id = $2)
                 UPDATE subscriptions SET cancel_at_period_end = true, paid_through_at = to_timestamp(t + $4)
-                FROM boundary WHERE user_id = $1", &[&peer, &next, &window_secs, &paid_secs]).await.unwrap();
-            let outcome = issue(&mut other, &peer, &code(5), ip).await.unwrap();
+                FROM boundary WHERE user_id = $1 AND status = 'active' RETURNING t + least($3, $4)",
+                &[&peer, &next, &window_secs, &paid_secs]).await.unwrap().get(0);
+            locker.batch_execute(audit_lock).await.unwrap();
+            let release = async {
+                await_lock_wait(&locker, other_pid, locker_pid).await;
+                let at = end as f64;
+                locker.query_one(wait_until, &[&at]).await.unwrap();
+                locker.batch_execute("COMMIT").await.unwrap();
+            };
+            let (outcome, ()) = tokio::join!(issue(&mut other, &peer, 2), release);
             assert_eq!(outcome, expected);
-            let rolled_back: bool = db.query_one("SELECT is_called AND last_value = $3
-                 AND NOT EXISTS (SELECT 1 FROM invite_codes WHERE issued_by = $1 AND window_id = $2)
+            let rolled_back: bool = db.query_one("SELECT
+                 NOT EXISTS (SELECT 1 FROM invite_codes WHERE issued_by = $1 AND window_id = $2)
                  AND NOT EXISTS (SELECT 1 FROM audit_log WHERE user_id = $1 AND action = 'invite.issued'
-                                 AND details->>'window_id' = $2::bigint::text) FROM member_issue_delay_seen",
-                 &[&peer, &next, &writes]).await.unwrap().get(0);
+                                 AND details->>'window_id' = $2::bigint::text)", &[&peer, &next]).await.unwrap().get(0);
             assert!(rolled_back, "rollback missing: {expected:?}");
         }
-        db.batch_execute("DROP TRIGGER member_issue_delay ON audit_log; DROP FUNCTION member_issue_delay(); DROP SEQUENCE member_issue_delay_seen;").await.unwrap();
+        assert_eq!(db.execute(settings, &[&"3", &"2", &"7"]).await.unwrap(), 3);
         remove_member_window_fixture(&db, next).await;
         remove_member_window_fixture(&db, window).await;
     });
@@ -2562,6 +2590,8 @@ fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() 
 fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
     use super::{claim_single_use_on, invite_by_hash_on};
     use crate::auth::SingleUseClaim;
+
+    assert_member_invite_issuance();
 
     run_test(async {
         let mut client = connect().await;

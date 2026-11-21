@@ -402,6 +402,58 @@ async fn production_lease_connection_seam_and_adapter() {
 }
 
 #[tokio::test]
+async fn production_lease_touch_respects_fixed_deadline_and_legacy_expiry() {
+    use nntune_api::handlers::Store;
+    use nntune_api::playback::LeaseAcquire::{Acquired, Held};
+    use nntune_api::worker_entry::playback_store_for_postgres_test;
+
+    let accounts = disposable_accounts::Accounts::new(1).await;
+    let user = accounts.id(0);
+    let store = playback_store_for_postgres_test(|| async { Ok(lease_connection().await) });
+    assert_eq!(
+        store
+            .acquire_playback_lease(user, "session", "track", "play", 20, 75, false)
+            .await
+            .unwrap(),
+        Acquired { epoch: 1 },
+    );
+    for (now, proposed, expected) in [(55, 100, true), (25, 70, true), (75, 120, false)] {
+        assert_eq!(
+            store
+                .touch_playback_lease(user, "session", "play", 1, now, proposed)
+                .await
+                .unwrap(),
+            expected
+        );
+        let row = store.playback_lease(user).await.unwrap().unwrap();
+        assert_eq!((row.expires_at, row.continuation_deadline), (75, 75));
+    }
+    // Previous Worker's acquisition leaves the deadline columns untouched.
+    accounts.observer.query_one(
+        "INSERT INTO public.playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 FROM (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch",
+        &[&user, &"session", &"track", &"legacy", &125_i64, &80_i64, &false],
+    ).await.unwrap();
+    let row = store.playback_lease(user).await.unwrap().unwrap();
+    assert_eq!((row.epoch, row.continuation_deadline), (2, 125));
+    assert_eq!(
+        store
+            .acquire_playback_lease(user, "other", "track", "fresh", 90, 300, false)
+            .await
+            .unwrap(),
+        Held {
+            retry_after_secs: 35
+        }
+    );
+    assert!(store
+        .touch_playback_lease(user, "session", "legacy", 2, 90, 135)
+        .await
+        .unwrap());
+    let row = store.playback_lease(user).await.unwrap().unwrap();
+    assert_eq!((row.expires_at, row.continuation_deadline), (125, 125));
+    accounts.cleanup().await;
+}
+
+#[tokio::test]
 async fn private_aware_acquisition_commits_and_rolls_back() {
     use nntune_api::playback::LeaseAcquire::{Acquired, Held};
     use nntune_api::worker_entry::private_aware_lease_for_postgres_test as acquire;

@@ -315,6 +315,67 @@ async function openHome(page: Page) {
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 }
 
+test('keyboard Play and Pause keep the range-capable native decoder and position across app routes', async ({ page }) => {
+	await servePlaybackLibrary(page);
+	await page.goto(`/library?track=${playbackFixture.id}&t=2`);
+	const player = page.getByRole('region', { name: 'Player', exact: true });
+	const status = player.getByRole('status');
+	const play = player.getByRole('button', { name: 'Play', exact: true });
+	const pause = player.getByRole('button', { name: 'Pause', exact: true });
+	const native = player.locator('audio[controls][data-testid="audio-player"]');
+	await expect(native).toBeVisible();
+	await expect(status).toHaveAttribute('aria-atomic', 'true');
+	await expect(status).toHaveText('Paused');
+	await expect(play).toHaveText('Play');
+	const audio = (await native.elementHandle())!;
+	const time = () => audio.evaluate((node: HTMLAudioElement) => node.currentTime);
+	await expect.poll(time).toBeCloseTo(2);
+	await audio.evaluate((node: HTMLAudioElement) => {
+		const play = node.play;
+		// The queued play event can arrive after the media clock has advanced.
+		node.play = function () {
+			node.dataset.starts = String(Number(node.dataset.starts ?? '0') + 1);
+			node.dataset.startedAt = String(node.currentTime);
+			return play.call(this);
+		};
+	});
+	await play.press('Enter');
+	await expect(status).toHaveText('Playing');
+	await expect(pause).toHaveText('Pause');
+	await expect(pause).toBeFocused();
+	await expect.poll(time).toBeGreaterThan(2.1);
+	await pause.press('Space');
+	await expect(status).toHaveText('Paused');
+	const pausedAt = await time();
+	await openHome(page);
+	await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();
+	await expect(status).toHaveText('Paused');
+	await expect(native).toHaveAttribute('data-starts', '1');
+	expect(await time()).toBeCloseTo(pausedAt, 3);
+	await play.press('Space');
+	await expect(status).toHaveText('Playing');
+	expect(Number(await native.getAttribute('data-started-at'))).toBeCloseTo(pausedAt, 3);
+	await expect.poll(time).toBeGreaterThan(pausedAt + 0.1);
+	await audio.evaluate((node: HTMLAudioElement) => node.pause());
+	await expect(status).toHaveText('Paused');
+	expect(await audio.evaluate((node: HTMLAudioElement) =>
+		node === document.querySelector('audio') && node.controls && node.seekable.length > 0 && node.paused)).toBe(true);
+	await expect(page.locator('audio')).toHaveCount(1);
+});
+
+test('a terminal native resource error offers explicit recovery and keeps native controls', async ({ page }) => {
+	await servePlaybackLibrary(page);
+	await page.route('**/api/demo/audio?track=coral', (route) => route.fulfill({ status: 404, body: '' }));
+	await page.goto(`/library?track=${playbackFixture.id}&t=2`);
+	const player = page.getByRole('region', { name: 'Player', exact: true });
+	await expect(player.getByRole('status')).toContainText('This audio could not be loaded or played.');
+	await expect(player.getByRole('button', { name: 'Play', exact: true })).toHaveCount(0);
+	await expect(player.getByRole('button', { name: 'Retry playback', exact: true })).toBeEnabled();
+	const native = player.locator('audio[controls][data-testid="audio-player"]');
+	await expect(native).toBeVisible();
+	expect(await native.evaluate((node: HTMLAudioElement) => node.error !== null)).toBe(true);
+});
+
 for (const mode of ['playing', 'demo', 'encoded demo', 'paused', '404 clear', '404 remove', '503 clear', 'timestamp Back']) {
 	const timestamp = mode === 'timestamp Back', status = Number.parseInt(mode, 10);
 	const paused = timestamp || mode === 'paused', demo = mode.endsWith('demo');

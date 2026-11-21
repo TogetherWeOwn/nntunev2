@@ -527,6 +527,10 @@ async fn query_playback_lease_row(
             play_id: row.try_get("play_id").map_err(|_| StoreError)?,
             epoch: u64_of(row.try_get("epoch").map_err(|_| StoreError)?)?,
             expires_at: u64_of(row.try_get("expires_at").map_err(|_| StoreError)?)?,
+            continuation_deadline: u64_of(
+                row.try_get("continuation_deadline")
+                    .map_err(|_| StoreError)?,
+            )?,
         })),
     }
 }
@@ -540,7 +544,7 @@ pub async fn acquire_playback_lease_on(
     track_id: &str,
     play_id: &str,
     now: u64,
-    expires_at: u64,
+    continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
     let rows = client
@@ -551,9 +555,13 @@ pub async fn acquire_playback_lease_on(
                 (&session_id, Type::TEXT),
                 (&track_id, Type::TEXT),
                 (&play_id, Type::TEXT),
-                (&i64_of(expires_at)?, Type::INT8),
+                (
+                    &i64_of(crate::playback::lease_expiry(now, continuation_deadline))?,
+                    Type::INT8,
+                ),
                 (&i64_of(now)?, Type::INT8),
                 (&takeover, Type::BOOL),
+                (&i64_of(continuation_deadline)?, Type::INT8),
             ],
         )
         .await
@@ -961,7 +969,7 @@ pub async fn private_aware_lease_for_postgres_test(
     track_id: &str,
     play_id: &str,
     now: u64,
-    expires_at: u64,
+    continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
     PgStore {
@@ -973,7 +981,13 @@ pub async fn private_aware_lease_for_postgres_test(
         test_mirror: None,
     }
     .acquire_playback_lease(
-        user_id, session_id, track_id, play_id, now, expires_at, takeover,
+        user_id,
+        session_id,
+        track_id,
+        play_id,
+        now,
+        continuation_deadline,
+        takeover,
     )
     .await
 }
@@ -1103,7 +1117,7 @@ impl PgStore {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         Self::bounded(
@@ -1174,7 +1188,14 @@ impl PgStore {
                     }
                 }
                 let result = acquire_playback_lease_on(
-                    &tx, user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                    &tx,
+                    user_id,
+                    session_id,
+                    track_id,
+                    play_id,
+                    now,
+                    continuation_deadline,
+                    takeover,
                 )
                 .await?;
                 if matches!(result, crate::playback::LeaseAcquire::Acquired { .. }) {
@@ -2964,42 +2985,39 @@ async fn member_issue_invite_on(
         .await?;
     tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
         .await?;
-    use tokio_postgres::types::ToSql;
-    let member: [(&(dyn ToSql + Sync), Type); 1] = [(&issuer, Type::TEXT)];
     // Serialize spending and fence erasure without blocking FK checks.
     let issuer_lock =
         "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR NO KEY UPDATE";
+    use tokio_postgres::types::ToSql;
+    let member: [(&(dyn ToSql + Sync), Type); 1] = [(&issuer, Type::TEXT)];
     if tx.query_typed_opt(issuer_lock, &member).await?.is_none() {
         return Ok(Outcome::AccountDeleting);
     }
     // Shared locks fence early close and billing updates without serializing issuers.
-    let Some(window) = tx.query_typed_opt(
-        "SELECT id, starts_at, ends_at FROM invite_windows
-         WHERE int8range(starts_at, ends_at, '[)') @> floor(extract(epoch FROM statement_timestamp()))::bigint
-         FOR SHARE", &[],
-    ).await? else { return Ok(Outcome::WindowClosed); };
     let live = crate::billing::subscription_live_select_statement();
-    let Some(sub) = tx
-        .query_typed_opt(&format!("{live} FOR SHARE"), &member)
-        .await?
-    else {
+    let sql = format!("WITH open_window AS (
+          SELECT id, starts_at, ends_at FROM invite_windows
+          WHERE int8range(starts_at, ends_at, '[)') @> floor(extract(epoch FROM statement_timestamp()))::bigint FOR SHARE
+        ), entitlement AS ({live} FOR SHARE)
+        SELECT w.*, e.*,
+          (SELECT value FROM app_settings WHERE key = 'invite_member_min_paid_months' FOR SHARE) AS invite_member_min_paid_months,
+          (SELECT value FROM app_settings WHERE key = 'invite_member_per_window' FOR SHARE) AS invite_member_per_window,
+          (SELECT value FROM app_settings WHERE key = 'invite_default_expiry_days' FOR SHARE) AS invite_default_expiry_days
+        FROM open_window w LEFT JOIN entitlement e ON TRUE");
+    let Some(gate) = tx.query_typed_opt(&sql, &member).await? else {
+        return Ok(Outcome::WindowClosed);
+    };
+    let Some(plan_id) = gate.try_get("plan_id")? else {
         return Ok(Outcome::Ineligible);
     };
-    let mut settings = HashMap::new();
-    for row in tx.query_typed(
-        "SELECT key, value FROM app_settings WHERE key IN
-         ('invite_member_min_paid_months', 'invite_member_per_window', 'invite_default_expiry_days') FOR SHARE", &[],
-    ).await? {
-        settings.insert(row.try_get::<_, String>(0)?, row.try_get::<_, String>(1)?);
-    }
     let setting = |key: SettingKey| {
-        key.resolve(settings.get(key.as_str()).map(String::as_str))
+        key.resolve(gate.try_get(key.as_str())?)
             .map(i64::from)
             .ok_or(StoreError)
     };
-    let window_id: i64 = window.try_get(0)?;
+    let window_id: i64 = gate.try_get("id")?;
     let cap = setting(SettingKey::InviteMemberPerWindow)?;
-    // One paid month is 30 days of confirmed service. Union overlaps but not gaps.
+    // NULL coverage is unknown. Union exact periods across all paid invoices.
     let threshold = setting(SettingKey::InviteMemberMinPaidMonths)? * 30 * 86_400;
     let policy = tx
         .query_typed_one(
@@ -3007,11 +3025,8 @@ async fn member_issue_invite_on(
            WHEN $3 = 0 OR EXISTS (SELECT 1 FROM invite_codes WHERE window_id = $1
              AND issued_by = $2 OFFSET greatest($3 - 1, 0) LIMIT 1) THEN 'quota'
            WHEN $4 > 0 AND (SELECT COALESCE(sum(extract(epoch FROM upper(span) - lower(span))), 0)
-             FROM unnest((SELECT range_agg(tstzrange(period_start, period_end, '[)'))
-               FROM paid_invoice_history WHERE user_id = $2 AND amount_cents > 0
-                 AND paid_at <= statement_timestamp() AND period_start < period_end
-                 AND isfinite(period_start) AND isfinite(period_end))) AS span) < $4 THEN 'history'
-           ELSE 'eligible' END, floor(extract(epoch FROM clock_timestamp()))::bigint",
+             FROM unnest((SELECT range_agg(covered_periods) FROM paid_invoice_history
+               WHERE user_id = $2 AND amount_cents > 0 AND paid_at <= statement_timestamp())) AS span) < $4 THEN 'history' END, floor(extract(epoch FROM clock_timestamp()))::bigint",
             &[
                 (&window_id, Type::INT8),
                 (&issuer, Type::TEXT),
@@ -3021,44 +3036,41 @@ async fn member_issue_invite_on(
         )
         .await?;
     match policy.try_get(0)? {
-        "quota" => return Ok(Outcome::QuotaExhausted),
-        "history" => return Ok(Outcome::Ineligible),
-        "eligible" => (),
+        Some("quota") => return Ok(Outcome::QuotaExhausted),
+        Some("history") => return Ok(Outcome::Ineligible),
+        None => (),
         _ => return Err(StoreError),
     }
     let now: i64 = policy.try_get(1)?;
-    let starts_at: i64 = window.try_get(1)?;
-    let ends_at: i64 = window.try_get(2)?;
+    let starts_at: i64 = gate.try_get("starts_at")?;
+    let ends_at: i64 = gate.try_get("ends_at")?;
     let view = crate::billing::SubscriptionView {
-        plan_id: sub.try_get("plan_id")?,
-        status: sub.try_get("status")?,
-        cancel_at_period_end: sub.try_get("cancel_at_period_end")?,
-        paid_through_at_unix: sub.try_get("paid_through_at_unix")?,
-        grace_until_unix: sub.try_get("grace_until_unix")?,
+        plan_id,
+        status: gate.try_get("status")?,
+        cancel_at_period_end: gate.try_get("cancel_at_period_end")?,
+        paid_through_at_unix: gate.try_get("paid_through_at_unix")?,
+        grace_until_unix: gate.try_get("grace_until_unix")?,
         current_period_end_unix: None,
     };
+    use crate::billing::resolve_effective_plan;
     let refuse = |at| {
         if !(starts_at..ends_at).contains(&at) {
-            Some(Outcome::WindowClosed)
-        } else if !crate::billing::resolve_effective_plan(Some(view), at).entitled {
-            Some(Outcome::Ineligible)
-        } else {
-            None
+            return Some(Outcome::WindowClosed);
         }
+        (!resolve_effective_plan(Some(view), at).entitled).then_some(Outcome::Ineligible)
     };
     if let Some(reason) = refuse(now) {
         return Ok(reason);
     }
     let expires_at = ends_at.min(now + setting(SettingKey::InviteDefaultExpiryDays)? * 86_400);
     let ip = crate::vault::sanitize_source_ip(Some(source_ip));
-    let audit = tx
+    let id = tx
         .query_typed_one(
             "WITH issued AS (
            INSERT INTO invite_codes (code_hash, created_at, issued_by, kind, expires_at, window_id)
            VALUES ($1, $2, $3, 'member', $4, $5) RETURNING id
          ) INSERT INTO audit_log (user_id, action, ok, source_ip, at, details)
-         SELECT $3, 'invite.issued', TRUE, $6, $2,
-                jsonb_build_object('invite_id', id, 'kind', 'member', 'window_id', $5)
+          SELECT $3, 'invite.issued', TRUE, $6, $2, jsonb_build_object('invite_id', id, 'kind', 'member', 'window_id', $5)
          FROM issued RETURNING (details->>'invite_id')::bigint",
             &[
                 (&code_hash, Type::TEXT),
@@ -3069,8 +3081,8 @@ async fn member_issue_invite_on(
                 (&ip, Type::TEXT),
             ],
         )
-        .await?;
-    let id = audit.try_get(0)?;
+        .await?
+        .try_get(0)?;
     // Writes can wait on locks. Check against the live DB clock before commit.
     let clock = "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint";
     let after = tx.query_typed_one(clock, &[]).await?;
@@ -4397,6 +4409,25 @@ impl Store for PgStore {
         .await
     }
 
+    async fn record_listen_event(
+        &self,
+        owner: &str,
+        event: &crate::listen_history::ListenEventBody,
+        now: u64,
+    ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let now = i64::try_from(now).map_err(|_| StoreError)?;
+                let mut client = self.connect().await?;
+                crate::listen_history::record(&mut client, owner, event, now)
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.listen_write"))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn export_listen_events(
         &self,
         owner: &str,
@@ -4449,11 +4480,17 @@ impl Store for PgStore {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> Result<crate::playback::LeaseAcquire, StoreError> {
         self.acquire_private_aware_lease(
-            user_id, session_id, track_id, play_id, now, expires_at, takeover,
+            user_id,
+            session_id,
+            track_id,
+            play_id,
+            now,
+            continuation_deadline,
+            takeover,
         )
         .await
     }
@@ -4494,10 +4531,11 @@ impl Store for PgStore {
         .await
     }
 
-    async fn track_meter_meta(
+    async fn track_meta(
         &self,
         user_id: &str,
         track_id: &str,
+        duration_only: bool,
     ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
         // A non-UUID track has no `tracks` row to read (and the cast
         // would fail the query besides): meter it on the fallback
@@ -4543,7 +4581,11 @@ impl Store for PgStore {
                 };
                 Ok(crate::meter_sink::TrackMeterMeta {
                     track_duration_ms,
-                    mb_duration_ms: self.mb_duration_for(track_mbid.as_deref()).await?,
+                    mb_duration_ms: if duration_only && track_duration_ms.is_some_and(|ms| ms > 0) {
+                        None
+                    } else {
+                        self.mb_duration_for(track_mbid.as_deref()).await?
+                    },
                     bitrate_kbps,
                     file_bytes,
                 })
@@ -5749,6 +5791,7 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| failed())?;
                 for history in &outcome.history {
+                    let (starts, ends) = history.coverage_bounds();
                     transaction
                         .query_typed(
                             crate::billing_reconcile::insert_paid_invoice_history_statement(),
@@ -5762,6 +5805,8 @@ impl Store for PgStore {
                                 (&history.amount_cents, Type::INT8),
                                 (&history.currency, Type::TEXT),
                                 (&history.paid_at_unix, Type::INT8),
+                                (&starts, Type::INT8_ARRAY),
+                                (&ends, Type::INT8_ARRAY),
                             ],
                         )
                         .await

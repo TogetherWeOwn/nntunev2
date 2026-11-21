@@ -101,6 +101,7 @@ class StreamExtractTest(unittest.TestCase):
         self.assertIn("work_alias", missing)
         self.assertIn("work_type", missing)
         self.assertIn("l_recording_work", missing)
+        self.assertTrue({"l_artist_recording", "l_artist_release", "l_artist_work"} <= set(missing))
 
 
 class DuplicateMemberTest(unittest.TestCase):
@@ -509,15 +510,12 @@ class WorkProjectionTest(ProjectionTestCase):
     def test_typed_and_untyped_works_match_streamed_gzip(self):
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
-        expected = (
-            "80808080-8080-4808-8808-808080808080\tA\\tSong\\\\N\tSong\\tSuite\t2025-02-03T04:05:06Z\n"
-            "10101010-1010-4010-8010-101010101010\tCafé\\nLive\t\\N\t2025-02-03T04:05:06Z\n"
-        ).encode()
+        expected = (ROOT / "tests" / "expected" / self.output).read_bytes()
         self.assertEqual((self.curated / self.output).read_bytes(), expected)
 
         members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
         members["mbdump/work"] = b"".join(reversed(members["mbdump/work"].splitlines(keepends=True)))
-        excluded_tables = ("work_alias_type", "l_artist_work")
+        excluded_tables = ("work_alias_type", "l_artist_label")
         for table in excluded_tables:
             members[f"mbdump/{table}"] = b"not admitted\n"
         packed = self.tmp / "packed"
@@ -604,10 +602,9 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
                 b"404\t216\t50\t80", b"405\t216\t50\t81",
             )
         ))
-        # Referencing 216 above must not admit it to either existing slice.
-        for table, fields in (("l_recording_url", b"50\t999"), ("l_recording_recording", b"50\t999")):
-            with (self.raw / table).open("ab") as relations:
-                relations.write(b"499\t216\t" + fields + b"\t0\t" + timestamp + b"\t0\t\\N\t\\N\n")
+        # Referencing 216 above must not admit it to the URL slice.
+        with (self.raw / "l_recording_url").open("ab") as relations:
+            relations.write(b"499\t216\t50\t999\t0\t" + timestamp + b"\t0\t\\N\t\\N\n")
 
     def run_streamed_etl(self):
         packed = self.tmp / "packed"
@@ -624,12 +621,7 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
     def test_directed_typed_triples_are_deduplicated_and_match_streamed_gzip(self):
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
-        expected = (
-            b"88888888-8888-4888-8888-888888888888\t10101010-1010-4010-8010-101010101010\tperformance\t2025-02-03T04:05:06Z\n"
-            b"88888888-8888-4888-8888-888888888888\t80808080-8080-4808-8808-808080808080\tmedley\t2025-02-03T04:05:06Z\n"
-            b"88888888-8888-4888-8888-888888888888\t80808080-8080-4808-8808-808080808080\tperformance\t2025-02-03T04:05:06Z\n"
-            b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD\t80808080-8080-4808-8808-808080808080\tperformance\t2025-02-03T04:05:06Z\n"
-        )
+        expected = (ROOT / "tests" / "expected" / self.output).read_bytes()
         self.assertEqual((self.curated / self.output).read_bytes(), expected)
         for name in ("mbdump-recording_url.tsv", "mbdump-recording_music_video.tsv"):
             self.assertEqual((self.curated / name).read_bytes(), (ROOT / "tests" / "expected" / name).read_bytes())
@@ -655,8 +647,9 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
 
     def test_empty_table_emits_empty_sidecar_in_both_modes(self):
         self.edges.write_bytes(b"")
-        # The alias sidecar also validates referenced recording IDs.
-        (self.raw / "recording_alias").write_bytes(b"")
+        # Keep these keys unreferenced by the other strict projections.
+        for name in ("recording_alias", "l_recording_recording"):
+            (self.raw / name).write_bytes(b"")
         # Unreferenced keys retain the legacy loaders' acceptance rules.
         for table, key in (("recording", b"50"), ("link_type", b"504")):
             path = self.raw / table
@@ -687,7 +680,7 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
             ("link", links.replace(b"216\t513", b"216\t999"), "references missing link_type 999"),
             ("link", links.replace(b"216\t513", b"216\t506"), "link_type 506 is not recording-to-work"),
             ("link", links.replace(b"216\t513", b"216\t+513"), "invalid link_type"),
-            ("link", links + links.splitlines(keepends=True)[-1], "UNIQUE constraint failed: recording_work_link.id"),
+            ("link", links + links.splitlines(keepends=True)[-1], "UNIQUE constraint failed: entity_relation_link.id"),
             ("link_type", types.replace(b"\n513\t", b"\n+513\t"), "invalid link_type id 513"),
             ("link_type", types.replace(b"\trecording\twork\tperformance", b"\t\\N\twork\tperformance"),
              "link_type 513 is not recording-to-work"),
@@ -712,6 +705,253 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
                 self.assertEqual(self.curated.readlink(), target)
                 self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
                 self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
+
+
+class RecordingRecordingProjectionTest(ProjectionTestCase):
+    source = "l_recording_recording"
+    output = "mbdump-recording_recording.tsv"
+    video = "mbdump-recording_music_video.tsv"
+
+    def pack(self, directory):
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        result = subprocess.run([sys.executable, str(EXTRACT), str(directory)],
+                                input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((directory / (self.source + ".gz")).is_file())
+
+    def test_directed_deduplicated_edges_leave_legacy_video_bytes_unchanged(self):
+        recording = (self.raw / "recording").read_bytes().splitlines(keepends=True)[0]
+        third_mbid = b"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        with (self.raw / "recording").open("ab") as out:
+            out.write(b"52\t" + third_mbid + b"\t" + recording.split(b"\t", 2)[2])
+        links = self.raw / "link"
+        types = self.raw / "link_type"
+        type_row = types.read_bytes().splitlines(keepends=True)[-1]
+        link_row = links.read_bytes().splitlines(keepends=True)[-1]
+        with types.open("ab") as out:
+            for offset, name in ((1, b"\\143over"), (2, b"alternate take")):
+                out.write(type_row.replace(b"512\t", str(512 + offset).encode() + b"\t", 1)
+                          .replace(b"000000000005", f"{5 + offset:012d}".encode())
+                          .replace(b"\tcover\t", b"\t" + name + b"\t"))
+        with links.open("ab") as out:
+            out.write(link_row.replace(b"215\t512", b"216\t513", 1))
+            out.write(link_row.replace(b"215\t512", b"217\t514", 1))
+        edges = self.raw / self.source
+        row = edges.read_bytes().splitlines(keepends=True)[-2]
+        with edges.open("ab") as out:
+            out.write(row.replace(b"323\t214", b"325\t216", 1))  # Equivalent type name.
+            out.write(row.replace(b"323\t214", b"327\t217", 1))  # Distinct type, same pair.
+            out.write(row.replace(b"323\t214\t50\t51", b"326\t214\t50\t52", 1))
+        a = b"88888888-8888-4888-8888-888888888888"
+        b = b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD"
+        tail = b"\t2025-02-03T04:05:06Z\n"
+        # Decoded 'alternate take' sorts before 'cover', unlike the raw COPY spellings.
+        expected = (a + b"\t" + b + b"\talternate take" + tail + a + b"\t" + b + b"\t\\143over" + tail
+                    + a + b"\t" + third_mbid + b"\tcover" + tail + b + b"\t" + a + b"\tcover" + tail)
+        video = (ROOT / "tests" / "expected" / self.video).read_bytes()
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), expected)
+        self.assertEqual((self.curated / self.video).read_bytes(), video)
+        edges.write_bytes(b"".join(reversed(edges.read_bytes().splitlines(keepends=True))))
+        packed = self.tmp / "packed"
+        self.pack(packed)
+        result = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((packed / (self.source + ".gz")).exists())
+        for name, contents in ((self.output, expected), (self.video, video)):
+            self.assertEqual(gzip.decompress((packed / "curated" / (name + ".gz")).read_bytes()), contents)
+
+    def test_empty_and_video_only_inputs_emit_empty_song_sidecar(self):
+        edges = self.raw / self.source
+        cases = (b"", b"".join(edges.read_bytes().splitlines(keepends=True)[:3]))
+        for i, rows in enumerate(cases):
+            with self.subTest(video_only=bool(rows)):
+                edges.write_bytes(rows)
+                packed = self.tmp / f"packed-{i}"
+                self.pack(packed)
+                for directory, mode in ((self.raw, False), (packed, True)):
+                    result = self.run_etl(directory, MB_ETL_GZIP_OUTPUT=str(int(mode)),
+                                          DUMP_TS=f"2025-02-03T04:05:0{6+i}Z")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    if mode:
+                        self.assertEqual(gzip.decompress((directory / "curated" / (self.output + ".gz")).read_bytes()), b"")
+                    else:
+                        self.assertEqual((self.curated / self.output).read_bytes(), b"")
+
+    def test_invalid_references_refuse_without_changing_published_snapshot(self):
+        # Recording 52 is referenced only by a video edge, never by an alias
+        # or a song relation that could mask missing video validation.
+        video_mbid = b"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        recording = (self.raw / "recording").read_bytes().splitlines(keepends=True)[-1]
+        with (self.raw / "recording").open("ab") as out:
+            out.write(b"52\t" + video_mbid + b"\t" + recording.split(b"\t", 2)[2])
+        edges = self.raw / self.source
+        edges.write_bytes(edges.read_bytes().replace(b"320\t205\t50\t51\t", b"320\t205\t50\t52\t", 1))
+        packed = self.tmp / "packed"
+        self.pack(packed)
+        cases = (
+            (self.source, b"323\t214", b"323\t999", "references missing link 999"),
+            (self.source, b"323\t214\t50\t51", b"323\t214\t50\t999", "references missing recording (50, 999)"),
+            (self.source, b"323\t214\t50", b"323\t214\t+50", "l_recording_recording row 4: invalid recording"),
+            ("link", b"214\t512", b"214\t999", "references missing link_type 999"),
+            ("link", b"214\t512", b"214\t504", "not recording-to-recording"),
+            ("link_type", b"\tcover\t", b"\t\\q\t", "invalid COPY text in name"),
+            ("recording", video_mbid, b"bad", "l_recording_recording: invalid recording MBID"),
+        )
+        for directory, compress in ((self.raw, False), (packed, True)):
+            mode = {"MB_ETL_GZIP_OUTPUT": str(int(compress))}
+            result = self.run_etl(directory, **mode)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            curated = directory / "curated"
+            target = curated.readlink()
+            before = {path.name: path.read_bytes() for path in curated.iterdir()}
+            for name, old, new, diagnostic in cases:
+                with self.subTest(gzip=compress, input=name, diagnostic=diagnostic):
+                    path = directory / (name + ".gz" if compress else name)
+                    original = path.read_bytes()
+                    data = gzip.decompress(original) if compress else original
+                    self.assertIn(old, data)
+                    changed = data.replace(old, new, 1)
+                    path.write_bytes(gzip.compress(changed) if compress else changed)
+                    result = self.run_etl(directory, DUMP_TS="2025-02-04T04:05:06Z", **mode)
+                    path.write_bytes(original)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertEqual(curated.readlink(), target)
+                    self.assertEqual({path.name: path.read_bytes() for path in curated.iterdir()}, before)
+                    self.assertEqual(list(directory.glob(".curated-*")), [directory / target])
+
+
+class ArtistRelationProjectionTest(ProjectionTestCase):
+    edge_tail = "\t0\t2025-01-01 00:00:00+00\t0\t\t\n"
+
+    def setUp(self):
+        super().setUp()
+        self.targets = {"recording": (50, 51), "release": (30, 31), "work": (80, 81)}
+        self.expected = {}
+        for index, (target, (first, second)) in enumerate(self.targets.items()):
+            link = 700 + 3 * index
+            with (self.raw / "link").open("a") as links, (self.raw / "link_type").open("a") as types:
+                for offset, name in enumerate(("credit", r"\143redit", "arrangement")):
+                    key = link + offset
+                    types.write(f"{key}\t\\N\t0\t00000000-0000-4000-8000-{key:012d}\tartist\t{target}\t{name}"
+                                "\tTest\tTest\tTest\tTest\t2025-01-01 00:00:00+00\tf\tt\t0\t0\n")
+                    links.write(f"{key}\t{key}" + "\t\\N" * 6 + "\t0\t2025-01-01 00:00:00+00\tf\n")
+            edges = ((link, 20, first), (link + 1, 10, first), (link, 10, first),
+                     (link + 2, 10, first), (link, 10, second))
+            (self.raw / f"l_artist_{target}").write_text("".join(
+                f"{key}\t{link_id}\t{artist}\t{entity}{self.edge_tail}"
+                for key, (link_id, artist, entity) in enumerate(edges, 1)
+            ))
+            name = f"mbdump-artist_{target}.tsv"
+            self.expected[target] = (ROOT / "tests" / "expected" / name).read_bytes()
+        # A sidecar-only link must not admit an otherwise orphaned URL edge.
+        for table, entity in (("l_artist_url", 10), ("l_recording_url", 50)):
+            with (self.raw / table).open("a") as rows:
+                rows.write(f"800\t700\t{entity}\t999{self.edge_tail}")
+
+    def pack(self):
+        packed = self.tmp / "packed"
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        extracted = subprocess.run([sys.executable, str(EXTRACT), str(packed)], input=tar_bytes(members),
+                                   capture_output=True, check=False)
+        self.assertEqual(extracted.returncode, 0, extracted.stderr)
+        return packed
+
+    def check_outputs(self, expected):
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for table in ("link", "link_type", *(f"l_artist_{target}" for target in self.targets)):
+            path = self.raw / table
+            path.write_bytes(b"".join(reversed(path.read_bytes().splitlines(keepends=True))))
+        packed = self.pack()
+        result = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for target, contents in expected.items():
+            name = f"mbdump-artist_{target}.tsv"
+            self.assertEqual((self.curated / name).read_bytes(), contents)
+            self.assertEqual(gzip.decompress((packed / "curated" / (name + ".gz")).read_bytes()), contents)
+            self.assertFalse((packed / f"l_artist_{target}.gz").exists())
+        for legacy in ("artist_url", "recording_url", "recording_music_video"):
+            name = f"mbdump-{legacy}.tsv"
+            self.assertEqual((self.curated / name).read_bytes(), (ROOT / "tests" / "expected" / name).read_bytes())
+
+    def test_artist_relationships_are_deduplicated_and_match_streamed_gzip(self):
+        self.check_outputs(self.expected)
+
+    def test_empty_artist_relationships_emit_empty_sidecars(self):
+        for target in self.targets:
+            (self.raw / f"l_artist_{target}").write_bytes(b"")
+        self.check_outputs(dict.fromkeys(self.targets, b""))
+
+    def pack_published(self):
+        packed = self.pack()
+        result = self.run_etl(packed, MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return packed
+
+    def assert_refusal(self, raw, *diagnostics, gzip_output="1", consume="1"):
+        current = raw / "curated"
+        snapshot = current.readlink()
+        before = {p.name: p.read_bytes() for p in current.iterdir()}
+        mode = {"MB_ETL_GZIP_OUTPUT": gzip_output, "MB_ETL_CONSUME_INPUTS": consume}
+        refused = self.run_etl(raw, DUMP_TS="2025-02-04T04:05:06Z", **mode)
+        self.assertEqual(refused.returncode, 1, refused.stdout)
+        for diagnostic in diagnostics:
+            self.assertIn(diagnostic, refused.stderr)
+        self.assertEqual(current.readlink(), snapshot)
+        self.assertEqual({p.name: p.read_bytes() for p in current.iterdir()}, before)
+        self.assertEqual(list(raw.glob(".curated-*")), [raw / snapshot])
+
+    def test_bad_artist_relationship_inputs_refuse_before_consumption(self):
+        packed = self.pack_published()
+        plain, compressed = packed / "l_artist_work", packed / "l_artist_work.gz"
+        plain.touch()
+        for diagnostic, remove in (
+            (f"ambiguous input: both {plain} and {compressed} exist", ()),
+            (f"missing input file: {plain}", (plain, compressed)),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                for path in remove:
+                    path.unlink()
+                inputs = {p.name: p.read_bytes() for p in packed.iterdir() if p.is_file()}
+                self.assert_refusal(packed, diagnostic)
+                self.assertEqual({p.name: p.read_bytes() for p in packed.iterdir() if p.is_file()}, inputs)
+
+    def test_consuming_gzip_refuses_dangling_artist_relationship(self):
+        packed = self.pack_published()
+        path = packed / "l_artist_work.gz"
+        payload = gzip.decompress(path.read_bytes())
+        path.write_bytes(gzip.compress(payload.replace(b"\t20\t80\t", b"\t20\t999\t", 1)))
+        self.assert_refusal(packed, "l_artist_work: references missing work 999")
+        self.assertFalse(path.exists())
+
+    def test_refused_artist_references_preserve_published_snapshot(self):
+        packed = self.pack()
+        for raw, suffix, mode in ((self.raw, "", "0"), (packed, ".gz", "1")):
+            published = self.run_etl(raw, MB_ETL_GZIP_OUTPUT=mode)
+            self.assertEqual(published.returncode, 0, published.stderr)
+            for index, (target, (first, *_)) in enumerate(self.targets.items()):
+                key = 700 + 3 * index
+                for table, old, new, error in (
+                    (f"l_artist_{target}", f"\t20\t{first}\t", "\t20\t999\t", f"missing {target} 999"),
+                    (f"l_artist_{target}", f"\t20\t{first}\t", f"\t999\t{first}\t", "missing artist 999"),
+                    (f"l_artist_{target}", f"\t{key}\t20\t", "\t999\t20\t", "missing link 999"),
+                    ("link", f"\n{key}\t{key}\t", f"\n{key}\t999\t", "missing link_type 999"),
+                    ("link", f"\n{key}\t{key}\t", f"\n{key}\t506\t", f"is not artist-to-{target}"),
+                ):
+                    with self.subTest(mode=mode, target=target, error=error):
+                        path = raw / (table + suffix)
+                        original = path.read_bytes()
+                        payload = gzip.decompress(original) if suffix else original
+                        self.assertIn(old.encode(), payload)
+                        changed = payload.replace(old.encode(), new.encode(), 1)
+                        path.write_bytes(gzip.compress(changed) if suffix else changed)
+                        try:
+                            self.assert_refusal(raw, f"l_artist_{target}: ", error, gzip_output=mode, consume="0")
+                        finally:
+                            path.write_bytes(original)
 
 
 class LabelAliasProjectionTest(AliasProjectionTestCase):
@@ -769,26 +1009,8 @@ class LabelProjectionTest(ProjectionTestCase):
         edges.write_bytes(edges.read_bytes() + f"11\t30\t71\t{boundary}\t\\N\n".encode())
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
-        ts = "2025-02-03T04:05:06Z"
-        quartz = "71717171-7171-4717-8717-717171717171"
-        untyped = "62626262-6262-4626-8626-626262626262"
-        first = "55555555-5555-4555-8555-555555555555"
-        second = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-        expected_labels = (
-            f"{quartz}\tQuartz\\tRecords\t12345\t{boundary}\t{ts}\n"
-            f"{untyped}\tUntyped Label\t\\N\t\\N\t{ts}\n"
-        )
-        expected_edges = (
-            f"{first}\t{untyped}\tCafé\\tDisc\\\\N\t{ts}\n"
-            f"{first}\t{quartz}\t\t{ts}\n"
-            f"{first}\t{quartz}\t QZ-1 \t{ts}\n"
-            f"{first}\t{quartz}\t qz-1 \t{ts}\n"
-            f"{first}\t{quartz}\t\\\\N\t{ts}\n"
-            f"{first}\t{quartz}\t{boundary}\t{ts}\n"
-            f"{second}\t{quartz}\t QZ-1 \t{ts}\n"
-        )
-        self.assertEqual((self.curated / "mbdump-label.tsv").read_bytes(), expected_labels.encode())
-        self.assertEqual((self.curated / "mbdump-release_label.tsv").read_bytes(), expected_edges.encode())
+        for name in ("mbdump-label.tsv", "mbdump-release_label.tsv"):
+            self.assertEqual((self.curated / name).read_bytes(), (ROOT / "tests" / "expected" / name).read_bytes())
 
         members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
         tables = ("label", "label_type", "release_label")

@@ -991,6 +991,16 @@ pub trait Store {
         }
     }
 
+    /// Record client history only; the storage layer owns issued-play admission.
+    fn record_listen_event(
+        &self,
+        _owner: &str,
+        _event: &crate::listen_history::ListenEventBody,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::listen_history::WriteOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+
     fn export_listen_events(
         &self,
         _owner: &str,
@@ -1028,12 +1038,18 @@ pub trait Store {
         track_id: &str,
         play_id: &str,
         now: u64,
-        expires_at: u64,
+        continuation_deadline: u64,
         takeover: bool,
     ) -> impl Future<Output = Result<crate::playback::LeaseAcquire, StoreError>> {
         async move {
             let _ = (
-                user_id, session_id, track_id, play_id, now, expires_at, takeover,
+                user_id,
+                session_id,
+                track_id,
+                play_id,
+                now,
+                continuation_deadline,
+                takeover,
             );
             Err(StoreError)
         }
@@ -1068,8 +1084,17 @@ pub trait Store {
         user_id: &str,
         track_id: &str,
     ) -> impl Future<Output = Result<crate::meter_sink::TrackMeterMeta, StoreError>> {
+        self.track_meta(user_id, track_id, false)
+    }
+    /// With `duration_only`, a positive app duration is sufficient; skip the mirror.
+    fn track_meta(
+        &self,
+        user_id: &str,
+        track_id: &str,
+        duration_only: bool,
+    ) -> impl Future<Output = Result<crate::meter_sink::TrackMeterMeta, StoreError>> {
         async move {
-            let _ = (user_id, track_id);
+            let _ = (user_id, track_id, duration_only);
             Err(StoreError)
         }
     }
@@ -4864,6 +4889,10 @@ where
 #[path = "listen_history_controls.rs"]
 mod listen_history_controls;
 
+#[allow(dead_code)] // Prepared, with no production route or caller.
+#[path = "listen_history_receiver.rs"]
+mod listen_history_receiver;
+
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
 
@@ -6105,14 +6134,11 @@ where
 }
 
 /// Bodyless browser issuance for the authenticated principal.
-async fn member_invite_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    use MemberInviteIssueOutcome as Outcome;
+async fn member_invite_issue(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+) -> Response {
+    use {crate::api_error::ApiError, MemberInviteIssueOutcome as Outcome};
     if req.authorization.is_some() {
         return not_found();
     }
@@ -6126,13 +6152,12 @@ where
     let Ok(code) = auth::generate_invite_code() else {
         return unavailable();
     };
-    use crate::api_error::ApiError;
     let hash = auth::hash_invite_code(&code);
-    let error = match ctx
+    let issued = ctx
         .store
         .member_issue_invite(&claims.user_id, &hash, &ctx.source_ip)
-        .await
-    {
+        .await;
+    let error = match issued {
         Ok(Outcome::Issued { id, expires_at }) => {
             let body = serde_json::json!({"id": id, "expires_at": expires_at, "code": code});
             let mut response = json_response(201, body);
@@ -6409,7 +6434,7 @@ fn mint_play(
     play_id: &str,
     epoch: u64,
     now: u64,
-    lease_expires_at: u64,
+    continuation_deadline: u64,
 ) -> Result<IssuedPlay, Response> {
     match crate::play_grant::issue_v2_at(
         user_id,
@@ -6417,14 +6442,14 @@ fn mint_play(
         play_id,
         epoch,
         now,
-        crate::play_grant::MAX_GRANT_TTL,
+        continuation_deadline.saturating_sub(now),
         Some(secret),
     ) {
         Ok(grant) => Ok(IssuedPlay {
             grant,
             play_id: play_id.to_string(),
             lease_epoch: epoch,
-            lease_expires_at,
+            lease_expires_at: crate::playback::lease_expiry(now, continuation_deadline),
         }),
         Err(crate::play_grant::MintError::NotConfigured) => Err(internal()),
         Err(crate::play_grant::MintError::InvalidIdentity) => {
@@ -6516,7 +6541,8 @@ where
             {
                 return Err(validation_failed("invalid play_id"));
             }
-            let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+            let lease_expires_at =
+                crate::playback::lease_expiry(ctx.now, row.continuation_deadline);
             match ctx
                 .store
                 .touch_playback_lease(
@@ -6537,7 +6563,7 @@ where
                         play_id,
                         row.epoch,
                         ctx.now,
-                        lease_expires_at,
+                        row.continuation_deadline,
                     );
                 }
                 Ok(false) => {}
@@ -6609,7 +6635,12 @@ where
         Ok(id) => id,
         Err(_) => return Err(unavailable()),
     };
-    let lease_expires_at = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+    let meta = ctx
+        .store
+        .track_meta(user_id, &body.track_id, true)
+        .await
+        .map_err(|_| internal())?;
+    let continuation_deadline = crate::playback::continuation_deadline(ctx.now, meta);
     match ctx
         .store
         .acquire_playback_lease(
@@ -6618,7 +6649,7 @@ where
             &body.track_id,
             &play_id,
             ctx.now,
-            lease_expires_at,
+            continuation_deadline,
             body.takeover,
         )
         .await
@@ -6630,7 +6661,7 @@ where
             &play_id,
             epoch,
             ctx.now,
-            lease_expires_at,
+            continuation_deadline,
         ),
         // Preserve the typed 409 when deletion wins after the first check.
         Ok(crate::playback::LeaseAcquire::Held { .. }) | Err(_)
@@ -6697,7 +6728,11 @@ where
         ctx.now,
     );
     let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
-        let expires = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
+        let deadline = lease
+            .as_ref()
+            .expect("active lease has a row")
+            .continuation_deadline;
+        let expires = crate::playback::lease_expiry(ctx.now, deadline);
         match ctx
             .store
             .touch_playback_lease(
@@ -6900,7 +6935,7 @@ where
     let exact = ctx.store.webhook_ack_control();
     #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
     let exact = false;
-    if exact && subscription.id != subscription_id {
+    if subscription.id != subscription_id {
         return Err(());
     }
     let input = ctx
@@ -8318,6 +8353,8 @@ mod tests {
         /// Mirror of `users.invited_by` (migration 0033), keyed by the
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
+        listen_owners: RefCell<Vec<String>>,
+        listen_failure: std::cell::Cell<Option<&'static str>>,
         listen_rows: RefCell<Vec<(String, crate::listen_history::ListenRow)>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
@@ -8450,6 +8487,7 @@ mod tests {
         /// Derivation metadata keyed by `(user_id, track_id)`; absent
         /// pairs resolve to the all-`None` meta (the fallback rung),
         /// mirroring the production zero-row answer.
+        duration_lookups: std::cell::Cell<usize>,
         meter_meta: RefCell<HashMap<(String, String), crate::meter_sink::TrackMeterMeta>>,
         /// Stored play windows by idempotency key, mirroring the
         /// monotonic upsert (see `record_play_window`).
@@ -9402,6 +9440,19 @@ mod tests {
                 .unwrap_or(0))
         }
 
+        async fn record_listen_event(
+            &self,
+            owner: &str,
+            _event: &crate::listen_history::ListenEventBody,
+            _now: u64,
+        ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+            self.listen_owners.borrow_mut().push(owner.into());
+            if self.listen_failure.get() == Some("write") {
+                return Err(StoreError);
+            }
+            Ok(crate::listen_history::WriteOutcome::Written)
+        }
+
         async fn export_listen_events(
             &self,
             owner: &str,
@@ -9442,7 +9493,7 @@ mod tests {
             track_id: &str,
             play_id: &str,
             now: u64,
-            expires_at: u64,
+            continuation_deadline: u64,
             takeover: bool,
         ) -> Result<crate::playback::LeaseAcquire, StoreError> {
             // All checks precede the commit of the classification and holder.
@@ -9488,7 +9539,8 @@ mod tests {
                             track_id: track_id.to_string(),
                             play_id: play_id.to_string(),
                             epoch,
-                            expires_at,
+                            expires_at: crate::playback::lease_expiry(now, continuation_deadline),
+                            continuation_deadline,
                         },
                     );
                     if private {
@@ -9526,17 +9578,22 @@ mod tests {
                         && row.play_id == play_id
                         && row.epoch == epoch =>
                 {
-                    row.expires_at = row.expires_at.max(expires_at);
+                    row.expires_at = row
+                        .expires_at
+                        .max(expires_at)
+                        .min(row.continuation_deadline);
                     Ok(true)
                 }
                 _ => Ok(false),
             }
         }
-        async fn track_meter_meta(
+        async fn track_meta(
             &self,
             user_id: &str,
             track_id: &str,
+            _duration_only: bool,
         ) -> Result<crate::meter_sink::TrackMeterMeta, StoreError> {
+            self.duration_lookups.set(self.duration_lookups.get() + 1);
             Ok(self
                 .meter_meta
                 .borrow()
@@ -9587,6 +9644,9 @@ mod tests {
             now: u64,
             window_secs: u64,
         ) -> Result<bool, StoreError> {
+            if self.listen_failure.get() == Some(action) {
+                return Err(StoreError);
+            }
             if limit == 0 || window_secs == 0 {
                 return Ok(false);
             }
@@ -10781,10 +10841,11 @@ mod tests {
                     .borrow()
                     .contains_key(&(user_id.to_string(), sub.clone()));
                 let target = if own_current || own_shadow {
-                    // Explicit stale ignores the numeric suppression predicate.
+                    // Explicit stale needs only the owned-target identity.
                     Target::Owned {
                         predicate_stale: false,
                         other_live_holder: false,
+                        equal_end_provenance_changed: false,
                     }
                 } else {
                     Target::Absent
@@ -13091,6 +13152,7 @@ mod tests {
             amount_cents: 1_000,
             currency: "usd".to_string(),
             paid_at_unix: BILLING_NOW + 60,
+            covered_periods: vec![(BILLING_NOW, end)],
         };
         let fresh_grace = BILLING_NOW + BILLING_PERIOD + 7 * 24 * 3_600;
         let fresh = crate::billing_reconcile::ReconcileOutcome {
@@ -13374,6 +13436,7 @@ mod tests {
                     amount_cents: 1_000,
                     currency: "usd".into(),
                     paid_at_unix: 1,
+                    covered_periods: vec![(0, 100)],
                 });
             block_on(h.store.store_reconcile_outcome("u1", &owner)).unwrap();
             if shadow_only {
@@ -14086,6 +14149,7 @@ mod tests {
                 amount_cents: 1_000,
                 currency: "usd".to_string(),
                 paid_at_unix: BILLING_NOW,
+                covered_periods: vec![(BILLING_NOW - BILLING_PERIOD, e2)],
             },
         );
         // S reads stored E2/active with remote money E1 < E2: stale.
@@ -15846,7 +15910,12 @@ mod tests {
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
         let live = live_for(&h, "u1").expect("live row stored");
         assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
-        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history["in_test_1"].covered_periods,
+            vec![(BILLING_NOW, BILLING_NOW + BILLING_PERIOD)]
+        );
     }
 
     fn cookie_of(resp: &Response) -> String {
@@ -18409,6 +18478,118 @@ mod tests {
         assert_eq!(lease.session_id, "tab-a");
         assert_eq!(lease.track_id, "track-9");
         assert_eq!(lease.play_id, play_id);
+        assert_eq!(lease.continuation_deadline, NOW + 900);
+    }
+
+    #[test]
+    fn play_issue_caps_initial_grant_at_authoritative_duration_plus_slack() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store.meter_meta.borrow_mut().insert(
+            ("user-plays-1".into(), "track-9".into()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(180_001),
+                mb_duration_ms: Some(300_000),
+                ..Default::default()
+            },
+        );
+        let resp = play_call(
+            &h,
+            &cookie,
+            serde_json::json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["expires_at"], NOW + 181 + 120);
+    }
+
+    #[test]
+    fn play_continues_before_deadline_and_applies_new_play_policy_at_deadline() {
+        let user = "user-plays-1";
+        for denial in [
+            None,
+            Some("subscription_required"),
+            Some("plan_limit_exceeded"),
+        ] {
+            let h = play_harness();
+            let cookie = play_user(&h);
+            seed_entitled(&h, user, "plus", 1);
+            let key = (user.into(), "track-9".into());
+            h.store.meter_meta.borrow_mut().insert(
+                key,
+                crate::meter_sink::TrackMeterMeta {
+                    track_duration_ms: Some(10_000),
+                    ..Default::default()
+                },
+            );
+            let first = shared_play_call(&h, user, "tab-a", "track-9", None).unwrap();
+            let deadline = NOW + 130;
+            if denial == Some("subscription_required") {
+                h.store.ever_paid_users.borrow_mut().insert(user.into());
+                h.store.playback_subscriptions.borrow_mut().remove(user);
+            } else if denial == Some("plan_limit_exceeded") {
+                h.store.stream_seconds.borrow_mut().insert(
+                    (user.into(), crate::ledger::period_month_for_timestamp(NOW)),
+                    3600,
+                );
+            }
+            let body = serde_json::json!({"track_id":"track-9", "session_id":"tab-a", "play_id":first.play_id});
+            let call = |now, path: &str, body: &serde_json::Value| {
+                let mut ctx = h.ctx();
+                ctx.now = now;
+                block_on(handle(
+                    &ctx,
+                    &Request {
+                        method: "POST".into(),
+                        path: path.into(),
+                        cookie: Some(cookie.clone()),
+                        origin: Some(ORIGIN.into()),
+                        authorization: None,
+                        stripe_signature: None,
+                        body: body.to_string().into_bytes(),
+                    },
+                ))
+            };
+            let beat = serde_json::json!({"session_id":"tab-a", "play_id":first.play_id, "lease_epoch":first.lease_epoch});
+            for t in [NOW + 40, NOW + 80, NOW + 120] {
+                let resp = call(t, "/v1/plays/heartbeat", &beat);
+                assert_eq!(resp.status, 200);
+                let resp: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+                assert_eq!(resp["lease"], "active");
+                assert_eq!(resp["lease_expires_at"], (t + 45).min(deadline));
+            }
+            let resumed = call(deadline - 1, "/v1/plays", &body);
+            assert_eq!(resumed.status, 200);
+            let resumed: serde_json::Value = serde_json::from_str(&resumed.body).unwrap();
+            assert_eq!(resumed["play_id"], first.play_id);
+            assert_eq!(resumed["lease_epoch"], first.lease_epoch);
+            assert_eq!(resumed["expires_at"], deadline);
+            let last = call(deadline, "/v1/plays/heartbeat", &beat);
+            assert_eq!(last.status, 200);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&last.body).unwrap()["lease"],
+                "expired"
+            );
+            assert_eq!(h.store.duration_lookups.get(), 1);
+            let next = call(deadline, "/v1/plays", &body);
+            let result: serde_json::Value = serde_json::from_str(&next.body).unwrap();
+            if let Some(code) = denial {
+                assert_eq!(next.status, 402);
+                assert_eq!(result["code"], code);
+                if code == "subscription_required" {
+                    assert_eq!(result["reason"], "lapsed");
+                }
+                assert_eq!(
+                    h.store.playback_leases.borrow()[user].continuation_deadline,
+                    deadline
+                );
+            } else {
+                assert_eq!(next.status, 200);
+                assert_ne!(result["play_id"], first.play_id);
+                assert_eq!(result["lease_epoch"], first.lease_epoch + 1);
+            }
+        }
     }
 
     #[test]
@@ -18643,6 +18824,7 @@ mod tests {
                 play_id: "play-seeded".to_string(),
                 epoch: 7,
                 expires_at: NOW + 10,
+                continuation_deadline: NOW + 900,
             },
         );
         let resp = h.call_full(
@@ -18726,6 +18908,7 @@ mod tests {
                 play_id: "play-seeded".to_string(),
                 epoch: 7,
                 expires_at: NOW + 10,
+                continuation_deadline: NOW + 900,
             },
         );
         // Same race on the touch: zero rows after the fence closes
@@ -18801,6 +18984,7 @@ mod tests {
                 play_id: "play-seeded".to_string(),
                 epoch: 7,
                 expires_at: NOW + 10,
+                continuation_deadline: NOW + 900,
             },
         );
         let resp = h.call_full(
@@ -18915,6 +19099,7 @@ mod tests {
     }
 
     include!("listen_history_control_tests.rs");
+    include!("listen_history_receiver_tests.rs");
 
     fn assert_play_bearer_refused(
         h: &Harness,
@@ -23023,35 +23208,22 @@ mod tests {
 
     #[test]
     fn member_invite_issue_requires_browser_identity() {
-        use crate::native_rest::{scope_for_operation, RouteDecision, MEMBER_INVITES_PATH as PATH};
+        use crate::native_rest::MEMBER_INVITES_PATH as PATH;
         let h = harness();
         seed_user(&h, "member", "member@example.com");
-        let cookie = magic_login(&h, "member@example.com");
-        assert_eq!(
-            scope_for_operation("POST", PATH),
-            RouteDecision::SessionOnly
-        );
-        let mut req = Request {
-            method: "POST".into(),
-            path: PATH.into(),
-            cookie: Some(cookie),
-            origin: Some(ORIGIN.into()),
-            authorization: Some("Bearer ntk_synthetic".into()),
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        let send = |req: &Request| block_on(handle(&h.ctx(), req));
-        assert_eq!(send(&req).status, 404);
-        req.authorization = None;
-        req.body = br#"{"issuer":"other"}"#.to_vec();
-        assert_eq!(send(&req).status, 422);
-        req.body.clear();
-        req.origin = None;
-        assert_eq!(send(&req).status, 401);
-        let no_session = h.call_full("POST", PATH, None, None, Some(ORIGIN));
-        assert_eq!(no_session.status, 401);
-        req.origin = Some(ORIGIN.into());
-        let response = send(&req);
+        let session = Some(magic_login(&h, "member@example.com"));
+        let origin = Some(ORIGIN);
+        let preflight = h.call_full("OPTIONS", PATH, None, None, origin);
+        assert_eq!(preflight.status, 204);
+        assert!(preflight.body.is_empty());
+        let call = |session, origin, body| h.call_full("POST", PATH, body, session, origin);
+        let bearer = Some("Bearer ntk_synthetic".into());
+        assert_eq!(h.call_bearer("POST", PATH, bearer).status, 404);
+        assert_eq!(call(None, origin, None).status, 401);
+        assert_eq!(call(session.clone(), None, None).status, 401);
+        let body = Some(r#"{"issuer":"other"}"#.into());
+        assert_eq!(call(session.clone(), origin, body).status, 422);
+        let response = call(session, origin, None);
         assert_eq!(response.status, 201);
         assert!(response
             .extra_headers
