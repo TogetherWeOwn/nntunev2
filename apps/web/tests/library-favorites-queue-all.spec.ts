@@ -349,6 +349,8 @@ test('[FAVQ-09] queue-all issues no network mutations, storage writes, or playba
 
 	const context = await readAuthContext(page);
 	expect(context, 'library auth context must exist after a successful load').not.toBeNull();
+	// Both setup stars must be durable before observing queue-all for writes.
+	await expect.poll(() => readFavoritesRaw(page, context)).toBe(JSON.stringify(['favq-mike', 'favq-alpha']));
 	const storedBefore = await readFavoritesRaw(page, context);
 
 	await action.click();
