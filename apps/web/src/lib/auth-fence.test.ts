@@ -112,10 +112,11 @@ it.each([true, false])('guards locked writes on generation failure (recovers: %s
 	expect((await captureAuthFence())?.isCurrent()).toBe(recovers ? true : undefined);
 });
 it.each(['open', 'delete'] as const)('does not wait beyond the auth deadline for cache %s', async (op) => {
-	const { setItem, api, send } = setup();
+	const { setItem, write, api, send } = setup();
 	vi.useFakeTimers();
 	vi.spyOn(navigator.locks, 'request').mockRejectedValueOnce(denied());
 	setItem.mockImplementation(fail(full));
+	if (op === 'delete') send.mockImplementationOnce(async () => { setItem.mockImplementation(write); return ok(); });
 	const ready = Promise.withResolvers<void>();
 	const open = caches.open.bind(caches), remove = caches.delete.bind(caches);
 	if (op === 'open') vi.spyOn(caches, 'open').mockImplementation((key) => ready.promise.then(() => open(key)));
@@ -124,6 +125,7 @@ it.each(['open', 'delete'] as const)('does not wait beyond the auth deadline for
 	try {
 		await vi.advanceTimersByTimeAsync(API_REQUEST_TIMEOUT_MS);
 		expect(await logout).toEqual(op === 'open' ? expect.objectContaining({ code: 'request_timeout' }) : undefined);
+		expect(caches[op]).toHaveBeenCalledOnce();
 	} finally { ready.resolve(); await vi.advanceTimersByTimeAsync(0); }
 	expect(send).toHaveBeenCalledTimes(op === 'open' ? 0 : 1);
 	expect(await caches.keys()).toHaveLength(0);

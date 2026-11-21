@@ -1,8 +1,7 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
 
 test.use({ trace: 'off', screenshot: 'off', video: 'off' });
-const path = '/admin/invites/tree';
-const root = 'root-user';
+const path = '/admin/invites/tree', root = 'root-user';
 const branch = `branch-${'b'.repeat(121)}`;
 const leaf = 'leaf-user';
 const cursor = 'opaque_cursor';
@@ -23,8 +22,7 @@ const lookup = async (page: Page, id: string) => {
 async function mock(page: Page, respond: (route: Route, target: string) => Promise<void>) {
 	const calls: string[] = [];
 	await page.route('**/v1/**', async (route) => {
-		const request = route.request();
-		const { pathname, search } = new URL(request.url());
+		const request = route.request(), { pathname, search } = new URL(request.url());
 		expect(request.method()).toBe('GET');
 		expect(await request.headerValue('authorization')).toBeNull();
 		const target = pathname + search;
