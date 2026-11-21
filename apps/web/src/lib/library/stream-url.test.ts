@@ -39,14 +39,14 @@ describe('resolveStreamUrl', () => {
 // Builder-owned exact pins for the library player wiring, via the same Vite
 // raw-glob seam as the other route-markup pins. The exact binding and the
 // helper derivation are pinned here.
-const sources = import.meta.glob(['../../routes/library/+page.svelte', '../player/NativeAudio.svelte', '../player/NativePlayer.svelte'], {
+const sources = import.meta.glob(['../../routes/+layout.svelte', '../../routes/library/+page.svelte', '../player/AppPlayer.svelte', '../player/NativeAudio.svelte', '../player/NativePlayer.svelte'], {
 	query: '?raw',
 	import: 'default',
 	eager: true
 }) as Record<string, string>;
 
 describe('library player wiring', () => {
-	const source = sources['../../routes/library/+page.svelte'];
+	const source = sources['../player/AppPlayer.svelte'];
 	const player = sources['../player/NativePlayer.svelte'];
 	const host = sources['../player/NativeAudio.svelte'];
 
@@ -55,8 +55,10 @@ describe('library player wiring', () => {
 	});
 
 	it('renders audio only when a stream URL exists', () => {
-		expect(source).toMatch(/\{#if streamUrl\}\s*<NativePlayer\b[^>]*\/>\s*\{\/if\}/);
+		expect(source).toMatch(/\{#if streamUrl\}\s*<div class="nt-wrap">\s*<NativePlayer\b[^>]*\/>\s*<\/div>\s*\{\/if\}/);
 		expect(player).toMatch(/<section aria-label="Player">/);
+		expect(sources['../../routes/library/+page.svelte']).not.toContain('<NativePlayer');
+		expect(sources['../../routes/+layout.svelte']).toMatch(/\{#if page\.route\.id === null\}\s*\{@render appBody\(\)\}\s*\{:else\}\s*<AppPlayer\b/);
 		expect(source + player).not.toMatch(/<audio\b/);
 	});
 

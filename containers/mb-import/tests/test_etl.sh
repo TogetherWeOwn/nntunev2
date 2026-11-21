@@ -13,6 +13,7 @@ DUMP_TS=2025-02-03T04:05:06Z "$container_dir/etl.sh" "$temp_dir/mbdump"
 diff -u "$expected/mbdump-artist.tsv" "$temp_dir/mbdump/curated/mbdump-artist.tsv"
 diff -u "$expected/mbdump-artist_alias.tsv" "$temp_dir/mbdump/curated/mbdump-artist_alias.tsv"
 diff -u "$expected/mbdump-release_group.tsv" "$temp_dir/mbdump/curated/mbdump-release_group.tsv"
+diff -u "$expected/mbdump-release_group_alias.tsv" "$temp_dir/mbdump/curated/mbdump-release_group_alias.tsv"
 diff -u "$expected/mbdump-release.tsv" "$temp_dir/mbdump/curated/mbdump-release.tsv"
 diff -u "$expected/mbdump-release_alias.tsv" "$temp_dir/mbdump/curated/mbdump-release_alias.tsv"
 diff -u "$expected/mbdump-release_credit.tsv" "$temp_dir/mbdump/curated/mbdump-release_credit.tsv"
@@ -22,6 +23,7 @@ diff -u "$expected/mbdump-artist_url.tsv" "$temp_dir/mbdump/curated/mbdump-artis
 diff -u "$expected/mbdump-recording_url.tsv" "$temp_dir/mbdump/curated/mbdump-recording_url.tsv"
 diff -u "$expected/mbdump-recording_music_video.tsv" "$temp_dir/mbdump/curated/mbdump-recording_music_video.tsv"
 diff -u "$expected/mbdump-recording_isrc.tsv" "$temp_dir/mbdump/curated/mbdump-recording_isrc.tsv"
+diff -u "$expected/mbdump-work_alias.tsv" "$temp_dir/mbdump/curated/mbdump-work_alias.tsv"
 
 # The preserved core-dump cover rows share endpoints with music-video rows.
 # Give one excluded edge a nonexistent endpoint so a mistaken admission cannot

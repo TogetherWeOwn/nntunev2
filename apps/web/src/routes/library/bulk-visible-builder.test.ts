@@ -50,7 +50,7 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 		libraryUnavailable: false,
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
 		groupLibraryItems, resolveStreamUrl,
-		createQueue: () => queue, createPlayerController,
+		createQueue: () => queue, getAppPlayer: () => createPlayerController(queue, { flush: () => Promise.resolve() }),
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
 	};
