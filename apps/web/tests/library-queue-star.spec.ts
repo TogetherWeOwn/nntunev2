@@ -156,7 +156,7 @@ async function readAuthContext(page: Page): Promise<string | null> {
 
 async function readFavoritesRaw(page: Page, context: string | null): Promise<string | null> {
 	return page.evaluate(
-		({ base, ctx }) => (ctx ? window.localStorage.getItem(`${base}.${ctx}`) : null),
+		({ base, ctx }) => ctx ? navigator.locks.request(`${base}.${ctx}`, () => localStorage.getItem(`${base}.${ctx}`)) : null,
 		{ base: FAVORITES_KEY_BASE, ctx: context }
 	);
 }
@@ -296,8 +296,8 @@ test('[QSTAR-04] queue and shelf toggles share one favorites source across reloa
 	await toggle.click();
 	const context = await readAuthContext(page);
 	expect(context, 'library auth context must exist after a successful load').not.toBeNull();
-	expect(await favoriteKeys(page)).toEqual([`${FAVORITES_KEY_BASE}.${context}`]);
 	expect(storedIds(await readFavoritesRaw(page, context))).toEqual(['qstar-mike']);
+	expect(await favoriteKeys(page)).toEqual([`${FAVORITES_KEY_BASE}.${context}`]);
 
 	// Shelf unstar reaches the queue toggle through the same source.
 	await shelfStar(page, 'qstar-mike').click();
@@ -313,6 +313,7 @@ test('[QSTAR-04] queue and shelf toggles share one favorites source across reloa
 	expect(await favoriteKeys(page)).toEqual([`${FAVORITES_KEY_BASE}.${context}`]);
 
 	// A queue-starred favorite survives reload and still shows on the row.
+	expect(storedIds(await readFavoritesRaw(page, context))).toEqual(['qstar-alpha']);
 	await page.reload();
 	await expect(page.getByTestId('library-item')).toHaveCount(ITEMS.length);
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);

@@ -78,7 +78,7 @@ async function expectShelf(page: Page, want: string[]) {
 	await expect.poll(async () => (await ids(page, 'favorite-item')).sort()).toEqual([...want].sort());
 }
 async function stored(page: Page): Promise<string[]> {
-	return page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? '[]'), KEY);
+	return page.evaluate((key) => navigator.locks.request(key, () => JSON.parse(localStorage.getItem(key) ?? '[]')), KEY);
 }
 async function count(page: Page, matched: number, total = ITEMS.length) {
 	await expect(page.getByText(new RegExp(`\\b${matched}\\s*(?:of|/)\\s*${total}\\s+(?:loaded\\s+)?tracks?\\b`, 'i'))).toBeVisible();

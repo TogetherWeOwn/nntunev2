@@ -104,7 +104,7 @@ async function readAuthContext(page: Page): Promise<string | null> {
 
 async function readFavoritesRaw(page: Page, context: string | null): Promise<string | null> {
 	return page.evaluate(
-		({ base, ctx }) => (ctx ? window.localStorage.getItem(`${base}.${ctx}`) : null),
+		({ base, ctx }) => ctx ? navigator.locks.request(`${base}.${ctx}`, () => localStorage.getItem(`${base}.${ctx}`)) : null,
 		{ base: FAVORITES_KEY_BASE, ctx: context }
 	);
 }
@@ -192,7 +192,7 @@ test('[FAV-04] starred tracks survive reload via scoped local storage', async ({
 
 	const context = await readAuthContext(page);
 	expect(context, 'library auth context must exist after a successful load').not.toBeNull();
-	await expect.poll(async () => storedIds(await readFavoritesRaw(page, context))).toEqual(
+	expect(storedIds(await readFavoritesRaw(page, context))).toEqual(
 		expect.arrayContaining(['fav-mike', 'fav-alpha'])
 	);
 
@@ -216,7 +216,7 @@ test('[FAV-05] an auth transition clears favorites so the next account starts em
 	await expect(page.getByTestId('favorite-item')).toHaveCount(1);
 	const contextBefore = await readAuthContext(page);
 	expect(contextBefore).not.toBeNull();
-	await expect.poll(async () => storedIds(await readFavoritesRaw(page, contextBefore))).toContain('fav-zulu');
+	expect(storedIds(await readFavoritesRaw(page, contextBefore))).toContain('fav-zulu');
 
 	const otherTab = await page.context().newPage();
 	await otherTab.goto('/login');

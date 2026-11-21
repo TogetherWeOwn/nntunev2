@@ -338,7 +338,8 @@ SUBSONIC_MEASUREMENT_LEASE = "v1:{sha}:{now}:{now + 600}:ci-fixture-active;small
                 tuples=True)
     check(used.splitlines() == ["ci-fixture-active", "ci-fixture-grace"],
           "both armed requests must authenticate against the disposable app database")
-    print("ok: release Fetch verifies lease cases, auth, inert defaults and the 4025/4024/4023 charge triplet", flush=True)
+    print("ok: release Fetch verifies lease cases, auth, inert defaults, "
+          "the 4025/4024/4023 charge triplet and stalled startup", flush=True)
 
 
 def main(argv=None):

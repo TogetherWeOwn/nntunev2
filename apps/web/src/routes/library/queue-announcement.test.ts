@@ -15,7 +15,6 @@ import {
 import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 import { displayArtist, displayTitle, orderLibraryItems, shortTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
 import { libraryTabTitle } from '#lib/library/tab-title.js';
 import { endTrackDrag } from '#lib/interactions/track-drag.js';
@@ -93,7 +92,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		addTrack: queueFunctions.addTrack,
 		clearQueue: queueFunctions.clearQueue,
 		createQueue: queueFunctions.createQueue,
-		createQueueShare, createPlayerController,
+		createQueueShare, getAppPlayer: () => createPlayerController(queueFunctions.createQueue([]), { flush: () => Promise.resolve() }),
 		createFavoritesExport,
 		moveTrack: queueFunctions.moveTrack,
 		nextTrack: queueFunctions.nextTrack,
@@ -113,7 +112,6 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		createLibraryRefresher,
 		displayArtist,
 		displayTitle,
-		clearMiniPlayerHint,
 		orderLibraryItems,
 		filterLibraryItems,
 		libraryTabTitle,
@@ -144,7 +142,12 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		return {
 			refresh, selectTrack, moveQueuedTrack, toggleFavorite,
 			dispose: refresher.dispose, subscribeQueue: queueController.subscribe,
-			handleAuthTransition, handleLocalAuthTransition, unstarFromShelf, confirmClearFavorites,
+			handleAuthTransition: (event) => {
+				if (event.key === LIBRARY_AUTH_TRANSITION_KEY) player.purgeAtAuthBoundary();
+				handleAuthTransition(event);
+			},
+			handleLocalAuthTransition: () => { player.purgeAtAuthBoundary(); handleLocalAuthTransition(); },
+			unstarFromShelf, confirmClearFavorites,
 			read: () => ({ queue, announcement: player.queueAnnouncement.text, items, loadError }),
 			readFavorites: () => ({ favorites, announcement: favoritesAnnouncement }),
 			// Fixture setup only: do not call a non-move page edit, which would

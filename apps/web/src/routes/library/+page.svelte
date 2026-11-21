@@ -3,7 +3,7 @@
 	import { afterNavigate } from '$app/navigation';
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
-	import { createPlayerController } from '#lib/player/controller.svelte.js';
+	import { getAppPlayer } from '#lib/player/AppPlayer.svelte';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
@@ -60,8 +60,6 @@
 		toggleSelected
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
-	import { clearMiniPlayerHint } from '#lib/shell/mini-player.js';
-	import NativePlayer from '#lib/player/NativePlayer.svelte';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
 	import ContextMenu from '#lib/interactions/ContextMenu.svelte';
 	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '#lib/interactions/context-menu.js';
@@ -152,8 +150,10 @@
 	let loading = $state(true);
 	let loadError: string | null = $state(null);
 	let libraryUnavailable = $state(false);
+	let retainedQueueWithoutListing = $state(false);
 	let requiresSignIn = $state(false);
-	const player = createPlayerController(createQueue([]), { flush: () => tick() });
+	const listingUnavailable = $derived(loading || libraryUnavailable || loadError !== null);
+	const player = getAppPlayer();
 	const commitQueue = player.commitQueue;
 	const replaceQueue = player.replaceQueue;
 	const queueController = player.queue;
@@ -251,9 +251,6 @@
 	let restoreFilterFocus = false;
 	const repeat = media.repeat;
 
-	const seekFeedback = media.seekFeedback;
-	const attachNativeAudio = media.attach;
-
 	let shareInvalid = $state(false);
 	let shareAlive = true;
 	let draggedLibraryItem: LibraryItem | null = null;
@@ -317,8 +314,8 @@
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
+		onAccessRefused: () => { resetShareAtAuthBoundary(); player.purgeAtAuthBoundary(); },
 		invalidateLibraryCache: () => {
-			resetShareAtAuthBoundary();
 			clearFavoritesExportFeedback();
 			releaseFavoritesDownload();
 			favorites = [];
@@ -340,13 +337,12 @@
 			loading = state.loading;
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
+			// Keep the empty focus target even if the last queued row is removed during a retry.
+			retainedQueueWithoutListing = !authBoundary && (state.loading || state.libraryUnavailable || !!state.loadError) &&
+				(retainedQueueWithoutListing || queueController.snapshot.tracks.length > 0);
 			requiresSignIn = state.requiresSignIn;
-			// An access refusal that empties the library unmounts the queue
-			// panel (alert branch); the route-owned filter text must go with
-			// it so the next account never inherits the previous query.
-			// Successful same-account refreshes keep items and keep the query.
+			if (authBoundary) queueFilterQuery = '';
 			if (state.loadError && state.items.length === 0) {
-				queueFilterQuery = '';
 				findQuery = '';
 				findScope = 'both';
 				view = 'all';
@@ -364,7 +360,7 @@
 				media.clearShareSeek();
 			}
 			if (!isCurrent()) return;
-			if (authoritative && !authBoundary) {
+			if (authoritative && !authBoundary && !state.libraryUnavailable) {
 				player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
 					if (queueChanged) queueConfirmGeneration += 1;
 				});
@@ -447,7 +443,6 @@
 	// Play-from-top stays enabled while everything is queued: selecting the
 	// first displayed track's slot is still useful.
 	const playDisplayedDisabled = $derived(libraryUnavailable || renderedItems.length === 0);
-	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	const tabTitle = $derived(libraryTabTitle(currentTrack));
 	// Captured before any title effect runs; the browser-only guard keeps SSR free of document access.
 	const priorDocumentTitle = typeof document === 'undefined' ? null : document.title;
@@ -573,7 +568,7 @@
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
 		const counts = `Added ${missing.length}${skipped > 0 ? `, ${skipped} already queued` : ''}.`;
-		await media.playSelected(base, index, evidence, counts);
+		await media.playSelected(base, index, { ...evidence, isCurrent: () => shareAlive && evidence.isCurrent() }, counts);
 	}
 
 	let favoritesAction = 0;
@@ -606,7 +601,6 @@
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 		if (queueController.snapshot.tracks.length) queueConfirmGeneration += 1;
-		player.purgeAtAuthBoundary();
 		queueShare.reset();
 		shareInvalid = false;
 	}
@@ -659,13 +653,13 @@
 		if (search === handledShareSearch) return;
 		handledShareSearch = search;
 		const account = queueExportAuthGeneration;
-		const intent = media.beginShareInput();
 		// A native retry can run after the URL changes but before afterNavigate.
 		const inputIsCurrent = () => shareAlive && account === queueExportAuthGeneration &&
 			handledShareSearch === search && window.location.search === search;
 		shareInvalid = false;
 		const params = new URLSearchParams(search);
-		if (!params.has('track') && !params.has('t')) return;
+		if (!params.has('track') && !params.has('t')) return media.clearShareSeek();
+		const intent = media.beginShareInput();
 		const target = resolveShareTarget(
 			{ track: params.get('track'), t: params.get('t') },
 			items.map((track) => track.id)
@@ -679,6 +673,7 @@
 			shareInvalid = true;
 			return;
 		}
+		if (player.claimShareEntry?.() === false) return;
 		// A newly consumed navigation must not inherit consent for the old arrangement.
 		queueConfirmGeneration += 1;
 		if (!selectTrack(target.trackId) || !inputIsCurrent()) return;
@@ -759,7 +754,7 @@
 		if (!target) return;
 		const evidence = queueController.sourceForQueuedPlay(id, resolveStreamUrl(target) || undefined);
 		if (!evidence) return;
-		await media.playSelected(queue, index, evidence);
+		await media.playSelected(queue, index, { ...evidence, isCurrent: () => shareAlive && evidence.isCurrent() });
 	}
 
 	function trimPreviousTracks(): void {
@@ -894,7 +889,7 @@
 
 	function toggleQueuedFavorite(id: string): void {
 		const track = queueController.snapshot.tracks.find((track) => track.id === id);
-		if (!track) return;
+		if (!track || !favoritesInitialized || loading || loadError || libraryUnavailable) return;
 		const wasFavorite = favorites.includes(id);
 		toggleFavorite(id);
 		player.announceQueue(`${wasFavorite ? 'Unstarred' : 'Starred'} ${track.title}`);
@@ -1219,7 +1214,7 @@
 		const evidence = queueController.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || resolveStreamUrl({ streamUrl: first?.streamUrl }));
 		if (!evidence) return;
 		const counts = ids.length > 1 ? `Added ${added}${surviving.length > added ? `, ${surviving.length - added} already queued` : ''}.` : '';
-		await media.playSelected(base, index, evidence, (counts + missingInteractionLabel(ids, surviving)).trim());
+		await media.playSelected(base, index, { ...evidence, isCurrent: () => shareAlive && evidence.isCurrent() }, (counts + missingInteractionLabel(ids, surviving)).trim());
 	}
 
 	function appendInteractionIds(ids: readonly string[], source: readonly LibraryItem[] = items): void {
@@ -1478,7 +1473,7 @@
 	}
 
 	let disposeRoute: (() => void) | undefined;
-	// Register before template effects so the child's native detach cannot pause first.
+	// Fence route receipts before its template and event handlers are torn down.
 	$effect.pre(() => () => {
 		const dispose = disposeRoute;
 		disposeRoute = undefined;
@@ -1488,7 +1483,6 @@
 	onMount(() => {
 		// Restore only in the browser; SSR always renders Comfortable.
 		density = readStoredDensity();
-		media.restoreRepeat(browserStorage('local'));
 		window.addEventListener('storage', handleAuthTransition);
 		// Leaving the page with a query applied (tab close, hard navigation).
 		window.addEventListener('pagehide', recordFindQuery);
@@ -1503,13 +1497,10 @@
 			}
 			shareAlive = false;
 			queueShare.dispose();
-			player.destroy();
+			player.browseCopy.invalidate();
+			media.clearShareSeek();
 			favoritesExport.destroy();
 			refresher.dispose();
-			// The queue is page state but the mini-player hint is shell
-			// state: leaving the library empties the queue's visible hint
-			// until the player arrival moves the queue into the shell.
-			clearMiniPlayerHint();
 			// Client-side navigation away with the query applied.
 			recordFindQuery();
 			unsubscribeLocal();
@@ -1961,7 +1952,8 @@
 			{/if}
 		{/if}
 		</div>
-		{#if !libraryUnavailable && items.length > 0}
+	{/if}
+		{#if queue.tracks.length > 0 || retainedQueueWithoutListing || (!libraryUnavailable && items.length > 0)}
 			<!--
 				The queue panel stays mounted across background refreshes (its
 				rows remain readable while the new list loads), but its four
@@ -1975,8 +1967,8 @@
 				announcement={player.queueAnnouncement.text}
 				announcementVersion={player.queueAnnouncement.version}
 				{favoriteIds}
-				ontogglefavorite={toggleQueuedFavorite}
-				onfavoriteids={(ids, remove) => favoriteInteractionIds(ids, remove, true)}
+				ontogglefavorite={listingUnavailable ? undefined : toggleQueuedFavorite}
+				onfavoriteids={listingUnavailable ? undefined : (ids, remove) => favoriteInteractionIds(ids, remove, true)}
 				bind:filterQuery={queueFilterQuery}
 				liveRegions={!loading}
 				confirmDestructive
@@ -1985,9 +1977,9 @@
 				onshuffle={() => replaceQueue(shuffleUpcoming(queueController.snapshot))}
 				onmove={moveQueuedTrack}
 				oninsert={insertQueuedIds}
-				interactionsUnavailable={loading || libraryUnavailable}
+				interactionsUnavailable={listingUnavailable}
 				onmenufocusfallback={focusLibraryRecovery}
-				onreorder={reorderQueuedIds}
+				onreorder={listingUnavailable ? undefined : reorderQueuedIds}
 				onplaynextids={queueNextIds}
 				onremoveids={removeQueuedIds}
 				onplaynext={(index) => replaceQueue(playNext(queueController.snapshot, index))}
@@ -2002,6 +1994,7 @@
 			<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />
 		{/if}
 
+	{#if (!loading && !loadError) || items.length > 0}
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
@@ -2039,12 +2032,6 @@
 			</select>
 			<p data-testid="repeat-status" role="status" aria-atomic="true">Repeat: {$repeat === 'off' ? 'Off' : $repeat === 'one' ? 'One' : 'Queue'}</p>
 		</div>
-	{/if}
-	{#if streamUrl}
-		<NativePlayer
-			{currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
-			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump}
-		/>
 	{/if}
 </main>
 

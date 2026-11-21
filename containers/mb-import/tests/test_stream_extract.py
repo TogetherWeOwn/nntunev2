@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -77,6 +78,9 @@ class StreamExtractTest(unittest.TestCase):
         missing = json.loads((out / "dump-meta.json").read_text())["missing"]
         self.assertIn("track", missing)
         self.assertIn("artist_alias", missing)
+        self.assertIn("recording_alias", missing)
+        self.assertIn("release_alias", missing)
+        self.assertIn("release_group_alias", missing)
         self.assertIn("work", missing)
         self.assertIn("work_type", missing)
         self.assertIn("l_recording_work", missing)
@@ -210,6 +214,230 @@ class ArtistAliasProjectionTest(ProjectionTestCase):
                 self.assertIn(error, refused.stderr)
                 self.assertEqual(self.curated.readlink(), target)
                 self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+
+
+class RecordingAliasProjectionTest(ProjectionTestCase):
+    output = "mbdump-recording_alias.tsv"
+
+    def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        # Both English aliases survive: echo reprise sorts before Écho only
+        # after decoding the latter's escaped COPY spelling.
+        self.assert_alias_output_matches_in_both_modes()
+
+    def test_conflicting_primaries_break_ties_by_sort_name_then_id(self):
+        aliases = self.raw / "recording_alias"
+        rows = aliases.read_bytes().splitlines(keepends=True)
+        # MusicBrainz permits only one primary per non-null locale. Exercise
+        # the curator's fallback ordering separately from the normal fixture.
+        for index, row in enumerate(rows):
+            if row.startswith(b"708\t"):
+                # Echo\101 ranks below Echo\tMix raw, but above it decoded.
+                row = row.replace(b"\tAlternate\t", b"\tEcho\\101\t", 1)
+            if row.startswith((b"708\t", b"710\t")):
+                rows[index] = row.removesuffix(b"f\tf\n") + b"t\tf\n"
+        aliases.write_bytes(b"".join(rows))
+        self.assert_alias_output_matches_in_both_modes()
+
+    def test_alias_id_breaks_ties_independently_of_rowid(self):
+        etl = load("etl_alias_order", ROOT / "etl.py", {"MB_ETL_GZIP_OUTPUT": "0"})
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        # An INTEGER PRIMARY KEY aliases rowid and masks a missing ID sort.
+        db.executescript(r"""
+            CREATE TABLE recording (id INTEGER PRIMARY KEY, gid TEXT);
+            INSERT INTO recording VALUES (50, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd');
+            CREATE TABLE recording_alias (
+                id INTEGER NOT NULL, entity INTEGER, name TEXT, locale TEXT,
+                sort_name TEXT, primary_flag TEXT, name_key TEXT, locale_key TEXT
+            );
+            INSERT INTO recording_alias VALUES
+                (710, 50, 'Echo', 'en', 'Echo', 't', 'Echo', 'en'),
+                (709, 50, '\105cho', 'en', 'Echo', 't', 'Echo', 'en');
+        """)
+        stamp = "2025-02-03T04:05:06Z"
+        self.assertEqual(etl.project_aliases(db, "recording", self.tmp, stamp), 1)
+        self.assertEqual((self.tmp / self.output).read_text(encoding="utf-8"),
+                         f"dddddddd-dddd-4ddd-8ddd-dddddddddddd\t\\105cho\ten\tEcho\tt\t{stamp}\n")
+
+    def assert_alias_output_matches_in_both_modes(self):
+        expected = (ROOT / "tests" / "expected" / self.output).read_bytes()
+        plain = self.run_etl(self.raw)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), expected)
+
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        key = "mbdump/recording_alias"
+        members[key] = b"".join(reversed(members[key].splitlines(keepends=True)))
+        members["mbdump/recording_tag"] = b"not part of the CC0 core projection\n"
+        packed = self.tmp / "packed"
+        extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
+                                 input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        self.assertTrue((packed / "recording_alias.gz").is_file())
+        self.assertFalse((packed / "recording_tag.gz").exists())
+        gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
+        self.assertFalse((packed / "recording_alias.gz").exists())
+        self.assertEqual(gzip.decompress((packed / "curated" / (self.output + ".gz")).read_bytes()), expected)
+
+    def test_empty_recording_alias_table_emits_empty_sidecar(self):
+        (self.raw / "recording_alias").write_bytes(b"")
+        result = self.run_etl(self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), b"")
+
+    def test_recording_alias_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        aliases = (self.raw / "recording_alias").read_bytes()
+        recordings = (self.raw / "recording").read_bytes()
+        for table, changed, error in (
+            ("recording_alias", None, "missing input file:"),
+            ("recording_alias", b"broken\n", "expected 16 fields"),
+            ("recording_alias", aliases + aliases.splitlines(keepends=True)[0], "UNIQUE constraint failed"),
+            ("recording_alias", aliases.replace(b"710\t50\t", b"2147483648\t50\t", 1), "invalid id"),
+            ("recording_alias", aliases.replace(b"710\t50\t", b"710\t+50\t", 1), "invalid recording"),
+            ("recording_alias", aliases.replace(b"710\t50\t", b"710\t999\t", 1), "references missing recording 999"),
+            ("recording_alias", aliases.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            ("recording_alias", aliases.replace(rb"\303\x89cho", rb"\303cho"), "invalid COPY text in name or locale"),
+            ("recording_alias", aliases.replace(b"\ten\t", b"\t\\000\t", 1), "invalid COPY text in name or locale"),
+            ("recording_alias", aliases.replace(rb"Echo\tMix", rb"Echo\377", 1), "invalid COPY text in sort_name"),
+            ("recording_alias", aliases.replace(rb"Echo\tMix", rb"\N", 1), "sort_name must not be NULL"),
+            ("recording", recordings.replace(b"\n51\t", b"\n+51\t"), "references invalid recording id 51"),
+            ("recording", recordings.replace(b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD", b"bad-mbid"), "invalid recording MBID"),
+        ):
+            with self.subTest(table=table, error=error):
+                path = self.raw / table
+                if changed is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-03T04:05:07Z")
+                path.write_bytes(aliases if table == "recording_alias" else recordings)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+
+
+class ReleaseFamilyAliasProjectionTestCase(ProjectionTestCase):
+    @property
+    def output(self):
+        return f"mbdump-{self.entity}_alias.tsv"
+
+    def curated_mbids(self, table):
+        return {row.split(b"\t", 1)[0] for row in
+                (self.curated / f"mbdump-{table}.tsv").read_bytes().splitlines()}
+
+    def assert_plain_and_streamed_output(self, expected):
+        plain = self.run_etl(self.raw)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual((self.curated / self.output).read_bytes(), expected)
+
+        members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
+        alias_table, excluded_table = f"{self.entity}_alias", f"{self.entity}_tag"
+        key = f"mbdump/{alias_table}"
+        members[key] = b"".join(reversed(members[key].splitlines(keepends=True)))
+        members[f"mbdump/{excluded_table}"] = b"not part of the CC0 core projection\n"
+        packed = self.tmp / "packed"
+        extract = subprocess.run([sys.executable, str(EXTRACT), str(packed)],
+                                 input=tar_bytes(members), capture_output=True, check=False)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        alias_gzip = packed / f"{alias_table}.gz"
+        self.assertEqual(gzip.decompress(alias_gzip.read_bytes()), members[key])
+        self.assertFalse((packed / f"{excluded_table}.gz").exists())
+        gzip_etl = self.run_etl(packed, MB_ETL_CONSUME_INPUTS="1", MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(gzip_etl.returncode, 0, gzip_etl.stderr)
+        self.assertFalse(alias_gzip.exists())
+        self.assertEqual(gzip.decompress((packed / "curated" / (self.output + ".gz")).read_bytes()), expected)
+
+
+class ReleaseAliasProjectionTest(ReleaseFamilyAliasProjectionTestCase):
+    entity = "release"
+
+    def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        # English tests primary preference and preserves two distinct names;
+        # French tests raw sort-name order, then lowest ID for tied rows.
+        self.assert_plain_and_streamed_output((ROOT / "tests" / "expected" / self.output).read_bytes())
+        self.assertEqual(self.curated_mbids("release_alias"), self.curated_mbids("release"))
+
+    def test_empty_release_alias_table_emits_empty_sidecar(self):
+        (self.raw / "release_alias").write_bytes(b"")
+        self.assert_plain_and_streamed_output(b"")
+
+    def test_release_alias_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        alias_file = self.raw / "release_alias"
+        aliases = alias_file.read_bytes()
+        release_file = self.raw / "release"
+        releases = release_file.read_bytes()
+        for path, changed, error in (
+            (alias_file, b"broken\n", "expected 16 fields"),
+            (alias_file, aliases + aliases.splitlines(keepends=True)[0], "UNIQUE constraint failed: release_alias.id"),
+            (alias_file, aliases.replace(b"810\t30\t", b"810\t+30\t", 1), "invalid release (expected"),
+            (alias_file, aliases.replace(b"810\t30\t", b"810\t999\t", 1), "release_alias references missing release 999"),
+            (alias_file, aliases.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            (alias_file, aliases.replace(rb"\303\x89dition", rb"\303dition", 1), "invalid COPY text in name or locale"),
+            (alias_file, aliases.replace(rb"Edition\tBox", rb"Edition\377", 1), "invalid COPY text in sort_name"),
+            (release_file, releases.replace(b"BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB", b"bad-mbid"), "release_alias: invalid release MBID"),
+        ):
+            with self.subTest(error=error):
+                path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-03T04:05:07Z")
+                path.write_bytes(aliases if path == alias_file else releases)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
+
+
+class ReleaseGroupAliasProjectionTest(ReleaseFamilyAliasProjectionTestCase):
+    entity = "release_group"
+
+    def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        self.assert_plain_and_streamed_output((ROOT / "tests" / "expected" / self.output).read_bytes())
+        alias_mbids = self.curated_mbids("release_group_alias")
+        self.assertLess(alias_mbids, self.curated_mbids("release_group"))
+        self.assertTrue(alias_mbids.isdisjoint(self.curated_mbids("release")))
+
+    def test_empty_release_group_alias_table_emits_empty_sidecar(self):
+        (self.raw / "release_group_alias").write_bytes(b"")
+        self.assert_plain_and_streamed_output(b"")
+
+    def test_release_group_alias_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        alias_file = self.raw / "release_group_alias"
+        aliases = alias_file.read_bytes()
+        group_file = self.raw / "release_group"
+        groups = group_file.read_bytes()
+        for path, changed, error in (
+            (alias_file, b"broken\n", "expected 16 fields"),
+            # 31 exists as a release, not as a release group.
+            (alias_file, aliases.replace(b"910\t41\t", b"910\t31\t", 1),
+             "release_group_alias references missing release_group 31"),
+            (alias_file, aliases.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            (alias_file, aliases.replace(rb"\303\x89cho", rb"\303cho", 1), "invalid COPY text in name or locale"),
+            (group_file, groups.replace(b"CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC", b"bad-mbid"),
+             "release_group_alias: invalid release_group MBID"),
+        ):
+            with self.subTest(error=error):
+                path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-03T04:05:07Z")
+                path.write_bytes(aliases if path == alias_file else groups)
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
 
 
 class WorkProjectionTest(ProjectionTestCase):
@@ -362,6 +590,8 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
 
     def test_empty_table_emits_empty_sidecar_in_both_modes(self):
         self.edges.write_bytes(b"")
+        # The alias sidecar also validates referenced recording IDs.
+        (self.raw / "recording_alias").write_bytes(b"")
         # Unreferenced keys retain the legacy loaders' acceptance rules.
         for table, key in (("recording", b"50"), ("link_type", b"504")):
             path = self.raw / table
