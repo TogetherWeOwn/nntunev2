@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { flushSync, onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { ApiClient, ApiError, type MemberInviteSummary } from '#lib/api/client.js';
+	import { ApiClient, ApiError, type MemberInviteHistory, type MemberInviteSummary } from '#lib/api/client.js';
 	import { captureAuthFence, subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
@@ -27,8 +27,18 @@
 		'signed-out': 'Sign in to see your invite summary.'
 	};
 	type ReadStatus = keyof typeof readMessages;
-	let summary = $state.raw<{ kind: ReadStatus } | { kind: 'ready'; data: MemberInviteSummary; fence: Fence }>({ kind: 'loading' });
+	let summary = $state.raw<
+		| { kind: 'loading' | 'failed'; fence?: Fence }
+		| { kind: Exclude<ReadStatus, 'loading' | 'failed'>; fence?: never }
+		| { kind: 'ready'; data: MemberInviteSummary; fence: Fence }
+	>({ kind: 'loading' });
 	let reading: AbortController | undefined;
+	let inviteHistory = $state.raw<MemberInviteHistory | null>(null);
+	let historyError = $state<'' | 'failed' | 'denied'>('');
+	let historyRead = $state<AbortController>();
+	let historyButton = $state<HTMLButtonElement>();
+	let historyStatus = $state<HTMLParagraphElement>();
+	const statusLabels = { active: 'Active', redeemed: 'Redeemed', expired: 'Expired', revoked: 'Revoked' };
 
 	const monthFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
 	const secondsPerPolicyMonth = 30 * 86_400;
@@ -38,22 +48,76 @@
 		return seconds > 0 && hundredths === 0 ? `<${monthFormat.format(0.01)}` : monthFormat.format(hundredths / 100);
 	}
 
-	function readFailure(cause: unknown): ReadStatus {
+	function readFailure(cause: unknown): Exclude<ReadStatus, 'loading' | 'retry'> {
 		if (cause instanceof ApiError) {
-			if (cause.code === 'account_deleting') return 'deleting';
+			// On these two reads, conflict means the account is being deleted.
+			if (cause.status === 409 || cause.code === 'account_deleting') return 'deleting';
 			if (cause.status === 401) return 'signed-out';
 			if (cause.status === 403 || cause.status === 404) return 'denied';
 		}
 		return 'failed';
 	}
 
-	async function readSummary() {
+	function clearHistory() {
+		historyRead?.abort();
+		historyRead = undefined;
+		inviteHistory = null;
+		historyError = '';
+	}
+
+	async function readHistory(fence: Fence) {
+		if (summary.fence !== fence || historyRead ||
+			historyError === 'denied' || inviteHistory?.next_cursor === null) return;
+		const cursor = inviteHistory?.next_cursor ?? null;
+		const attempt = new AbortController();
+		historyRead = attempt;
+		try {
+			const sent = await fence.run(() => attempt.signal.aborted ? undefined : {
+				result: client.readMemberInviteHistory(cursor, attempt.signal).then(
+					(data) => ({ data }), (cause: unknown) => ({ status: readFailure(cause) })
+				)
+			});
+			if (!sent) {
+				if (!attempt.signal.aborted) clear();
+				return;
+			}
+			const result = await sent.result;
+			const applied = await fence.run(() => {
+				if (attempt.signal.aborted) return;
+				if ('data' in result) {
+					const { invites, next_cursor } = result.data;
+					// Keep keyboard focus in this section if the paging control goes away.
+					if (next_cursor === null && document.activeElement === historyButton) historyStatus?.focus();
+					inviteHistory = { invites: [...(inviteHistory?.invites ?? []), ...invites], next_cursor };
+					historyError = '';
+				} else if (result.status === 'signed-out' || result.status === 'deleting') {
+					clear();
+					summary = { kind: result.status };
+				} else if (result.status === 'denied') {
+					if (document.activeElement === historyButton) historyStatus?.focus();
+					clearHistory();
+					historyError = 'denied';
+				} else {
+					historyError = 'failed';
+				}
+				return true;
+			});
+			if (!applied && !attempt.signal.aborted) clear();
+		} finally {
+			if (historyRead === attempt) historyRead = undefined;
+		}
+	}
+
+	async function readSummary(issuedFence?: Fence) {
+		clearHistory();
 		reading?.abort();
 		const attempt = new AbortController();
 		reading = attempt;
-		summary = { kind: 'loading' };
+		summary = { kind: 'loading', fence: issuedFence };
+		// A confirmed issuance can restart history without waiting for the quota refresh.
+		if (issuedFence) void readHistory(issuedFence);
 		try {
-			const fence = await captureAuthFence();
+			const fence = issuedFence ?? await captureAuthFence();
 			const sent = await fence?.run(() => attempt.signal.aborted ? undefined : {
 				result: client.readMemberInvites(attempt.signal).then(
 					(data) => ({ data }), (cause: unknown) => ({ status: readFailure(cause) })
@@ -63,18 +127,30 @@
 			const result = await sent.result;
 			await fence.run(() => {
 				if (attempt.signal.aborted) return;
-				if ('status' in result && (result.status === 'signed-out' || result.status === 'deleting')) clear();
-				summary = 'data' in result ? { kind: 'ready', data: result.data, fence } : { kind: result.status };
+				if ('data' in result) {
+					summary = { kind: 'ready', data: result.data, fence };
+					if (!issuedFence) void readHistory(fence);
+				} else if (result.status === 'failed') {
+					summary = { kind: 'failed', fence: issuedFence };
+				} else {
+					if (result.status === 'signed-out' || result.status === 'deleting') clear();
+					else clearHistory();
+					summary = { kind: result.status };
+				}
 			});
 		} finally {
 			if (reading === attempt) {
 				reading = undefined;
-				if (summary.kind === 'loading') summary = { kind: 'retry' };
+				if (summary.kind === 'loading') {
+					clearHistory();
+					summary = { kind: 'retry' };
+				}
 			}
 		}
 	}
 
 	function clear() {
+		clearHistory();
 		reading?.abort();
 		reading = undefined;
 		summary = { kind: 'retry' };
@@ -105,6 +181,7 @@
 			const sent = await fence.run(() => attempt.signal.aborted ? undefined : { result: client.issueMemberInvite(attempt.signal) });
 			if (!sent) {
 				if (!attempt.signal.aborted) {
+					clearHistory();
 					summary = { kind: 'retry' };
 					error = 'Couldn’t verify this browser session. No invite was requested.';
 				}
@@ -119,18 +196,21 @@
 			});
 			if (attempt.signal.aborted) return;
 			if (!invite) throw new Error('Invite was not published');
-			void readSummary();
+			void readSummary(fence);
 			await tick();
 			if (!attempt.signal.aborted) field?.focus();
 		} catch (cause) {
 			if (attempt.signal.aborted) return;
 			if (!fence.isCurrent()) {
+				clearHistory();
 				summary = { kind: 'retry' };
 				error = 'No link was received. Another attempt could use another invite from your quota.';
 			} else if (cause instanceof ApiError && cause.status === 401) {
+				clearHistory();
 				summary = { kind: 'signed-out' };
 				error = 'Sign in to create an invite.';
 			} else if (cause instanceof ApiError && cause.code === 'account_deleting') {
+				clearHistory();
 				summary = { kind: 'deleting' };
 				error = 'You can’t create invites while your account is scheduled for deletion.';
 			} else if (cause instanceof ApiError && cause.status === 403) {
@@ -181,7 +261,7 @@
 
 <svelte:head><title>NNTune — Invites</title></svelte:head>
 
-{#snippet windowTime(seconds: number)}
+{#snippet timestamp(seconds: number)}
 	{@const date = new Date(seconds * 1000)}
 	<time datetime={date.toISOString()}>{dateFormat.format(date)}</time>
 {/snippet}
@@ -198,14 +278,14 @@
 			<p>{!entitled ? 'Your membership is not active.' : eligible ? 'You meet the membership and paid-time requirements.' : 'You haven’t reached the paid-time requirement.'}</p>
 			{#if open_window}
 				<h3>Current window</h3>
-				<p>Opened {@render windowTime(open_window.starts_at)} · Closes {@render windowTime(open_window.ends_at)}</p>
+				<p>Opened {@render timestamp(open_window.starts_at)} · Closes {@render timestamp(open_window.ends_at)}</p>
 				<p>Used: {open_window.used} · Remaining: {open_window.remaining}</p>
 			{:else}
 				<p>Invites are closed.</p>
 			{/if}
 			{#if next_window}
 				<h3>Next scheduled window</h3>
-				<p>Opens {@render windowTime(next_window.starts_at)} · Closes {@render windowTime(next_window.ends_at)}</p>
+				<p>Opens {@render timestamp(next_window.starts_at)} · Closes {@render timestamp(next_window.ends_at)}</p>
 			{:else}
 				<p>No upcoming window is scheduled.</p>
 			{/if}
@@ -216,7 +296,7 @@
 			{#if summary.kind === 'signed-out'}
 				<a href="/login">Sign in</a>
 			{:else if summary.kind !== 'loading' && summary.kind !== 'deleting'}
-				<button class="nt-button nt-button--ghost" type="button" onclick={readSummary}>Refresh summary</button>
+				<button class="nt-button nt-button--ghost" type="button" onclick={() => readSummary()}>Refresh summary</button>
 			{/if}
 		{/if}
 	</section>
@@ -242,6 +322,42 @@
 	{/if}
 	<div role="status">{notice}</div>
 	{#if error}<p role="alert">{error}</p>{/if}
+	<!-- Don't show refreshed history until the parallel summary read rules out an access denial. -->
+	{#if summary.kind !== 'loading' && summary.fence}
+		{@const fence = summary.fence}
+		<section aria-labelledby="invite-history-heading">
+			<h2 id="invite-history-heading">Issued invites</h2>
+			{#if inviteHistory?.invites.length}
+				<ul class="history-list" role="list">
+					{#each inviteHistory.invites as row}
+						<li>
+							<strong>{statusLabels[row.status]}</strong><br />
+							Issued {@render timestamp(row.created_at)}<br />
+							Expiry {@render timestamp(row.expires_at)}
+						</li>
+					{/each}
+				</ul>
+			{/if}
+			<p role="status" tabindex="-1" bind:this={historyStatus}>
+				{#if historyRead}
+					{inviteHistory ? 'Loading more invites…' : 'Loading issued invites…'}
+				{:else if historyError === 'denied'}
+					Access to issued invites was denied.
+				{:else if historyError === 'failed'}
+					{inviteHistory ? 'Couldn’t load more invites.' : 'Couldn’t load issued invites.'}
+				{:else if inviteHistory}
+					{inviteHistory.invites.length === 0 ? 'No invites issued yet.' :
+						`Showing ${inviteHistory.invites.length} ${inviteHistory.invites.length === 1 ? 'invite' : 'invites'}.`}
+				{/if}
+			</p>
+			{#if historyError === 'failed' || inviteHistory?.next_cursor != null}
+				<button class="nt-button nt-button--ghost" type="button" bind:this={historyButton}
+					aria-disabled={!!historyRead} onclick={() => readHistory(fence)}>
+					{historyError === 'failed' ? 'Retry loading invites' : 'Load more invites'}
+				</button>
+			{/if}
+		</section>
+	{/if}
 </main>
 
 <style>
@@ -259,6 +375,14 @@
 	}
 	button {
 		min-height: 44px;
+	}
+	.history-list {
+		list-style: none;
+		padding-inline-start: 0;
+	}
+	.history-list li {
+		border-block-end: 1px solid var(--nt-border);
+		padding-block: var(--nt-space-2);
 	}
 	.actions {
 		display: flex;
