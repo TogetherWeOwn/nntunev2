@@ -105,6 +105,12 @@ for (const view of ['Home', 'Albums', 'Artists']) {
 			return r.fulfill({ status: 503, json: {} });
 		});
 		const home = view === 'Home';
+		const recent = page.getByRole('region', { name: 'Recent searches' });
+		if (home) await page.addInitScript(({ current, contextKey }) => {
+			sessionStorage.setItem(contextKey, 'bound');
+			sessionStorage.setItem('nntune.library.session-binding.v1', JSON.stringify(['bound', current]));
+			localStorage.setItem('nntune.library.recent-finds.v1.bound', '["Scoped query"]');
+		}, { current, contextKey });
 		const mbid = '11111111-1111-4111-8111-000000000001';
 		await page.route('**/v1/releases', (r) => r.fulfill({ json: [{ mbid, title: 'Scoped album', release_type: 'Album' }] }));
 		await page.route('**/v1/artists', (r) => r.fulfill({ json: [{ mbid, name: 'Scoped artist' }] }));
@@ -115,11 +121,14 @@ for (const view of ['Home', 'Albums', 'Artists']) {
 		await checking.promise;
 		await expect(collections).toHaveCount(0);
 		await expect(row).toHaveCount(0);
+		if (home) await expect(recent).toHaveCount(0);
 		fail.resolve();
 		await expect(page.getByRole('alert')).toContainText('Could not verify your library session');
 		await expect(row).toHaveCount(0);
 		await expect(collections).toHaveCount(0);
+		if (home) await expect(recent).toHaveCount(0);
 		await page.getByRole('button', { name: 'Retry', exact: true }).click();
 		await expect(row).toBeVisible();
+		if (home) await expect(recent.getByRole('link', { name: 'Scoped query' })).toBeVisible();
 	});
 }

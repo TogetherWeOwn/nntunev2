@@ -11,15 +11,17 @@ function storage() {
 	return { getItem: (key: string) => map.get(key) ?? null, setItem: (key: string, value: string) => { map.set(key, value); },
 		removeItem: (key: string) => { map.delete(key); } };
 }
-function setup(beforeRead?: (read: number) => Promise<void> | undefined) {
+function setup(delayRead?: { number: number; wait: Promise<void>; requested: () => void; finished: () => void }) {
 	const local = storage(), session = storage();
 	vi.stubGlobal('window', { localStorage: local, sessionStorage: session });
 	vi.stubGlobal('caches', { keys: async () => [] });
 	let writerHeld = false, reads = 0;
 	vi.stubGlobal('navigator', { locks: { async request<T>(name: string, options: LockOptions | LockGrantedCallback<T>, read: LockGrantedCallback<T>) {
 		if (typeof options !== 'function') {
-			await beforeRead?.(++reads);
-			return read(writerHeld ? null : {} as Lock);
+			const delay = ++reads === delayRead?.number ? delayRead : undefined;
+			delay?.requested();
+			await delay?.wait;
+			try { return await read(writerHeld ? null : {} as Lock); } finally { delay?.finished(); }
 		}
 		writerHeld = name === AUTH_LOCK;
 		try { return await options({} as Lock); } finally { writerHeld = false; }
@@ -39,9 +41,9 @@ afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.unstubAllEnvs();
 
 it.each([2, 3])('suspends when verification lock admission %i exceeds the deadline', async (delayedRead) => {
 	vi.useFakeTimers();
-	const requested = Promise.withResolvers<void>(), admitted = Promise.withResolvers<void>();
-	const { refresh, refresher, session, update, verify } = setup((read) => {
-		if (read === delayedRead) { requested.resolve(); return admitted.promise; }
+	const requested = Promise.withResolvers<void>(), admitted = Promise.withResolvers<void>(), finished = Promise.withResolvers<void>();
+	const { refresh, refresher, session, update, verify } = setup({
+		number: delayedRead, wait: admitted.promise, requested: requested.resolve, finished: finished.resolve
 	});
 	const pending = refresh();
 	try {
@@ -52,8 +54,11 @@ it.each([2, 3])('suspends when verification lock admission %i exceeds the deadli
 		admitted.resolve();
 		await pending;
 	}
+	await finished.promise;
 	expect(verify).toHaveBeenCalledTimes(delayedRead - 2);
 	expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
+	expect(update()).toMatchObject({ authBoundary: true });
+	expect(refresher.state.items).toEqual([]);
 	await refresh();
 	expect(update().sessionBinding).toBe(label);
 });
