@@ -20,12 +20,12 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 	function view(snapshot: QueueState) {
 		const binding = owner;
 		const track = currentTrack(snapshot);
-		const revision = queue.revision;
-		if (!binding || !track || queue.purging || snapshot !== queue.snapshot || !queue.isCurrent(revision)) return null;
+		const generation = queue.selectionGeneration;
+		if (!binding || !track || queue.purging || snapshot !== queue.snapshot || !queue.isCurrent(queue.revision)) return null;
 		const membership = binding.member.read(track.id);
-		if (!membership || binding !== owner || !queue.isCurrent(revision)) return null;
+		if (!membership || binding !== owner || queue.purging || queue.selectionGeneration !== generation) return null;
 		const { pressed, edit } = membership;
-		return { pressed, edit, id: track.id, title: displayTitle(track), receipt: `${binding.version}:${revision}` };
+		return { pressed, edit, id: track.id, title: displayTitle(track), receipt: `${binding.version}:${generation}` };
 	}
 
 	const matches = (current: Selection | null, previous: Selection) => current?.receipt === previous.receipt &&

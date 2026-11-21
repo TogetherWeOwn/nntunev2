@@ -10,7 +10,7 @@
 		const listeners = new AbortController();
 		const capture = { capture: true, signal: listeners.signal };
 		const hits = (event: Event) => event.composedPath().includes(button);
-		// Each pointer type can have its own primary pointer; only its matching ID may consume the press.
+		// Touch and pen clicks must match the originating pointer.
 		const pointers = new Map<string, { id: number; intent: typeof rendered }>();
 		const takePointer = ({ pointerId, pointerType }: PointerEvent) => {
 			const press = pointers.get(pointerType);
@@ -18,20 +18,32 @@
 			pointers.delete(pointerType);
 			return press.intent;
 		};
-		let space: typeof rendered | undefined;
+		let mouse: typeof rendered | undefined, mouseRelease: typeof rendered | undefined;
+		let space: typeof rendered | undefined, legacyRelease: PointerEvent | undefined;
 		let release: ReturnType<typeof setTimeout> | undefined;
 		const clearSpace = () => { clearTimeout(release); release = space = undefined; };
 		const intents = new WeakMap<Event, typeof rendered>();
 		window.addEventListener('pointerdown', (event) => {
 			if (!event.isPrimary || event.button !== 0) return;
-			if (hits(event)) pointers.set(event.pointerType, { id: event.pointerId, intent: rendered });
+			if (event.isTrusted) mouseRelease = legacyRelease = undefined;
+			if (event.pointerType === 'mouse') mouse = hits(event) ? rendered : undefined;
+			else if (hits(event)) pointers.set(event.pointerType, { id: event.pointerId, intent: rendered });
 			else takePointer(event);
 		}, capture);
-		window.addEventListener('pointercancel', takePointer, capture);
-		// Older browsers send a trusted MouseEvent click without a pointer ID.
-		let released: PointerEvent | undefined;
+		window.addEventListener('pointercancel', (event) => {
+			if (event.pointerType === 'mouse') mouse = undefined; else takePointer(event);
+		}, capture);
+		// Chords emit mouse button events without another pointerdown/pointerup.
+		window.addEventListener('mousedown', (event) => {
+			if (event.isTrusted && event.button === 0 && (event.buttons !== 1 || !mouse)) mouse = hits(event) ? rendered : undefined;
+		}, capture);
+		window.addEventListener('mouseup', (event) => {
+			if (!event.isTrusted || event.button !== 0) return;
+			mouseRelease = hits(event) ? mouse : undefined;
+			mouse = undefined;
+		}, capture);
 		window.addEventListener('pointerup', (event) => {
-			if (event.isTrusted && event.isPrimary && event.button === 0) released = hits(event) ? event : undefined;
+			if (event.isTrusted && event.isPrimary && event.button === 0) legacyRelease = hits(event) ? event : undefined;
 		}, capture);
 		window.addEventListener('keydown', (event) => {
 			if (event.key === ' ' && !event.repeat && hits(event)) { clearSpace(); space = rendered; }
@@ -44,9 +56,10 @@
 		window.addEventListener('click', (event) => {
 			const fromPointer = event.isTrusted && (event.detail > 0 || ('pointerType' in event && !!event.pointerType));
 			const fromSpace = event.isTrusted && !fromPointer && release !== undefined;
-			const pointer = fromPointer ? (typeof PointerEvent !== 'undefined' && event instanceof PointerEvent ? event : released) : undefined;
-			const intent = pointer ? takePointer(pointer) : fromSpace ? space : undefined;
-			if (fromPointer) released = undefined;
+			const pointer = 'pointerType' in event ? event as PointerEvent : legacyRelease;
+			const intent = fromPointer ? (pointer && pointer.pointerType !== 'mouse' ? takePointer(pointer) : mouseRelease)
+				: fromSpace ? space : undefined;
+			if (fromPointer) mouseRelease = legacyRelease = undefined;
 			if (fromSpace) clearSpace();
 			if (hits(event)) intents.set(event, intent ?? rendered);
 		}, capture);

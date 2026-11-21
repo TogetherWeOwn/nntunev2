@@ -392,14 +392,15 @@
 			// fails; Refresh must not overwrite pending edits with stale storage.
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
-				if (!favoritesInitialized) {
-					const session = browserStorage('session');
-					favoritesAuthKey = favoritesKey(session);
+				const session = browserStorage('session'), key = favoritesKey(session);
+				if (!favoritesInitialized || (!favoritesAuthKey && key)) {
+					favoritesAuthKey = key;
+					currentFavoriteEdit++;
 					favoriteBaseline = favorites = loadFavorites(session, browserStorage('local'));
 					favoritesInitialized = true;
 				}
 				if (!recentFindsInitialized) {
-					recentFinds = loadRecentFinds(browserStorage('session'), browserStorage('local'));
+					recentFinds = loadRecentFinds(session, browserStorage('local'));
 					recentFindsInitialized = true;
 				}
 				applyShareLink();
@@ -801,10 +802,12 @@
 	function editFavorites(
 		update: (latest: readonly string[]) => readonly string[],
 		applied?: (before: readonly string[], after: readonly string[]) => void,
-		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection; loaded: ReadonlySet<string> }
+		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection; loaded: ReadonlySet<string> },
+		playerWrite = false
 	): Promise<FavoriteWrite> {
 		const session = browserStorage('session');
-		const key = favoritesKey(session);
+		const key = playerWrite ? favoritesAuthKey : favoritesKey(session);
+		const ownsWrite = () => shareAlive && favoritesInitialized && favoritesAuthKey === key;
 		const edit = ++favoriteEdit;
 		const before = favorites;
 		const optimistic = update(before);
@@ -817,9 +820,9 @@
 		let base = before;
 		return updateStoredFavorites(session, browserStorage('local'), key, (latest) => {
 			base = latest;
-			return update(latest);
+			return !playerWrite || ownsWrite() ? update(latest) : latest;
 		}).then((committed) => {
-			if (favoritesKey(session) !== key) return null;
+			if ((playerWrite && !ownsWrite()) || favoritesKey(session) !== key) return null;
 			const wrote = committed !== null && JSON.stringify(base) !== JSON.stringify(committed);
 			if (edit !== favoriteEdit) {
 				if (wrote) favoriteBaseline = update(favoriteBaseline);
@@ -829,8 +832,7 @@
 			const visitOnly = placement && !favoriteBaseline.includes(placement.id) && !committed.includes(placement.id)
 				? placement : undefined;
 			const published = favorites;
-			if (wrote) favorites = committed;
-			else if (JSON.stringify(favoriteBaseline) !== JSON.stringify(committed)) {
+			if (wrote || JSON.stringify(favoriteBaseline) !== JSON.stringify(committed)) {
 				const baseline = new Set(favoriteBaseline);
 				const visit = new Set(optimistic);
 				const durable = committed.filter((id) => !baseline.has(id) || visit.has(id));
@@ -863,9 +865,9 @@
 		});
 	}
 
-	function setFavorite(id: string, pressed: boolean): Promise<FavoriteWrite> {
+	function setFavorite(id: string, pressed: boolean, playerWrite = false): Promise<FavoriteWrite> {
 		favoritesAnnouncement = '';
-		return editFavorites((latest) => pressed ? [...new Set([...latest, id])] : latest.filter((favorite) => favorite !== id));
+		return editFavorites((latest) => pressed ? [...new Set([...latest, id])] : latest.filter((favorite) => favorite !== id), undefined, undefined, playerWrite);
 	}
 
 	function readPlayerFavorites(id: string) {
@@ -1527,7 +1529,7 @@
 		clearSnapshot(browserStorage('local'));
 		const releaseFavoriteAction = player.currentFavorite.bind({
 			read: readPlayerFavorites,
-			write: (id, pressed) => readPlayerFavorites(id) ? setFavorite(id, pressed) : Promise.resolve(null)
+			write: (id, pressed) => readPlayerFavorites(id) ? setFavorite(id, pressed, true) : Promise.resolve(null)
 		});
 		disposeRoute = () => {
 			releaseFavoriteAction();
