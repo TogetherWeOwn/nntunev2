@@ -137,7 +137,7 @@ test('only positive-width ranges advertise and admit seeks', () => {
 
 test.each([
 	['seekto', 0, false], ['seekto', 1, false], ['seekforward', 1, false],
-	['seekto', 0, true], ['seekto', 1, true], ['seekforward', 1, true]
+	['seekto', 0, true], ['seekto', 1, true], ['seekto', 2, true], ['seekforward', 1, true]
 ] as const)('%s retires after loss (%i valid reads, competing intent: %s)', (action, validReads, competing) => {
 	const { audio, media, handlers, fire } = setup();
 	fire('seekforward', { seekOffset: 1 }); // Seed a prior success message.

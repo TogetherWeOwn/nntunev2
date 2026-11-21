@@ -4,7 +4,6 @@ import { setSeekHandlers, type MediaSessionHandlers, type MediaSessionLike, type
 import { RELATIVE_JUMP_SECONDS } from './relativeJump.js';
 
 export type SystemSeekGuard = { active: () => boolean; canReport: () => boolean; unavailable: () => void };
-
 export type SystemSeekOwner = {
 	audio: HTMLAudioElement;
 	attachment: number;
@@ -14,15 +13,12 @@ export type SystemSeekOwner = {
 	dispatch: (action: 'seekto' | 'seekforward' | 'seekbackward', seconds: number, guard: SystemSeekGuard) => void;
 };
 
-type SeekHandlers = Pick<MediaSessionHandlers, 'onSeekTo' | 'onSeekForward' | 'onSeekBackward'>;
-
 /** Advertise only observed seekability, and recheck it before accepting a system gesture. */
 export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner, signal: AbortSignal) {
 	const eligible = derived(owner.availability, (state) => state.attachment === owner.attachment && state.enabled);
-	let handlers: SeekHandlers | undefined;
+	let handlers: Pick<MediaSessionHandlers, 'onSeekTo' | 'onSeekForward' | 'onSeekBackward'> | undefined;
 	const refresh = (seekable: boolean) => {
-		if (signal.aborted) return;
-		const enabled = seekable && owner.matches();
+		const enabled = !signal.aborted && seekable && owner.matches();
 		if (signal.aborted || enabled === !!handlers) return;
 		if (!enabled) handlers = undefined;
 		else {
@@ -49,7 +45,7 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 				let retired = false;
 				owner.dispatch(name, seconds, { active, canReport: () => retired || active(), unavailable: () => { retired ||= retire(); } });
 			};
-			const registration: SeekHandlers = {
+			const registration = {
 				onSeekTo: action('seekto'), onSeekForward: action('seekforward'), onSeekBackward: action('seekbackward')
 			};
 			handlers = registration;

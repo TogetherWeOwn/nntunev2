@@ -397,9 +397,11 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		});
 	}
 
-	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string, replay = false, nativeSeeking = false): void {
+	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string, replay = false, nativeSeeking = false,
+		onUnavailable?: () => void): void {
 		const attachment = attachmentVersion;
 		const observation = readAbsoluteSeek(audio);
+		if (!observation.enabled) onUnavailable?.();
 		if (!matches()) return;
 		const prior = get(absoluteSeek);
 		const previous = prior.attachment === attachment ? prior : emptySeek;
@@ -431,7 +433,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (!isCurrent()) return;
 			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent, system?.unavailable);
 			const canReport = () => isCurrent(system?.canReport);
-			if (canReport()) observeAbsoluteSeek(audio, canReport, feedback, replay);
+			if (canReport()) observeAbsoluteSeek(audio, canReport, feedback, replay, false, system?.unavailable);
 		});
 	}
 
