@@ -13,16 +13,18 @@
 	const unavailable = 'Invite windows are unavailable. Reload this page to check access again.';
 	let access = $state.raw<{ fence: Fence; windows: ListedWindow[] } | null>(null);
 	let request = $state<AbortController>();
-	let now = $state(Date.now() / 1000);
-	let loading = $state(true);
+	let now = $state(NaN);
+	let clockOffset = NaN;
+	const serverNow = () => (clockOffset + performance.now()) / 1000;
+	let heading: HTMLHeadingElement;
 	let error = $state('');
 	let notice = $state('');
 
 	function clear(message = unavailable) {
+		if (access && heading?.parentElement?.contains(document.activeElement)) heading.focus();
 		request?.abort();
 		request = undefined;
 		access = null;
-		loading = false;
 		notice = '';
 		error = message;
 	}
@@ -31,10 +33,12 @@
 		const lifetime = new AbortController();
 		subscribeAuthFenceInvalidation(() => clear(), lifetime.signal);
 		const unsubscribe = subscribeLocalAuthTransition(() => clear());
-		const clock = setInterval(() => { now = Date.now() / 1000; }, 1000);
-		void run(null, (signal) => client.listInviteWindows(signal), (windows, fence) => {
+		const clock = setInterval(() => { now = serverNow(); }, 1000);
+		void run(null, (signal) => client.listInviteWindows(signal), ({ windows, serverTime }, fence) => {
+			// Use the same-origin HTTP Date and monotonic elapsed time, not the device clock.
+			clockOffset = serverTime - performance.now();
+			now = serverNow();
 			access = { windows, fence };
-			loading = false;
 		}, () => clear());
 		return () => { lifetime.abort(); unsubscribe(); clearInterval(clock); clear(); };
 	});
@@ -109,23 +113,20 @@
 			error = 'Enter valid UTC times. The end must be after the start.';
 			return;
 		}
-		if (note.includes('\0') || new TextEncoder().encode(note).length > 512) {
-			error = 'Shorten the note to 512 bytes or less.';
-			return;
-		}
 		write({ starts_at, ends_at, note: note || null }, () => form.reset());
 	}
 
 	function stateOf(row: ListedWindow, at: number) {
 		if (row.starts_at === row.ends_at) return 'Canceled';
 		if (row.closed || row.ends_at <= at) return 'Ended';
+		if (!Number.isFinite(at)) return 'Status unavailable';
 		return row.starts_at > at ? 'Scheduled' : 'Open';
 	}
 
-	function close(row: InviteWindow, button: HTMLButtonElement) {
+	function close(row: ListedWindow, button: HTMLButtonElement) {
 		if (!access || request) return;
 		if (!access.fence.isCurrent()) return clear();
-		const state = stateOf(row, Date.now() / 1000);
+		const state = stateOf(row, serverNow());
 		if (state !== 'Scheduled' && state !== 'Open') return;
 		const verb = state === 'Scheduled' ? 'Cancel' : 'Close';
 		if (!window.confirm(`${verb} window #${row.id}? Unused member invites in this window will stop working.`)) return;
@@ -138,8 +139,8 @@
 <svelte:head><title>NNTune — Invite windows</title></svelte:head>
 
 <main class="nt-wrap">
-	<h1>Invite windows</h1>
-	{#if loading}<p role="status">Checking access…</p>{/if}
+	<h1 tabindex="-1" bind:this={heading}>Invite windows</h1>
+	{#if !access && !error}<p role="status">Checking access…</p>{/if}
 	{#if error}<p role="alert">{error}</p>{/if}
 	{#if access}
 		<section aria-labelledby="schedule-heading">

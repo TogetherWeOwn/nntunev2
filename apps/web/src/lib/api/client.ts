@@ -361,16 +361,16 @@ export class ApiClient {
 		}, expected)).data;
 	}
 
-	async listInviteWindows(signal: AbortSignal): Promise<InviteWindow[]> {
-		const { data, status } = await this.requestWithStatus<{ windows?: unknown } | null>(
+	async listInviteWindows(signal: AbortSignal) {
+		const { data, status, headers } = await this.requestWithStatus<{ windows?: unknown } | null>(
 			INVITE_WINDOWS, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
 		);
 		const rows = data?.windows;
 		if (status !== 200 || !Array.isArray(rows) || rows.length > INVITE_WINDOW_LIMIT ||
-			!rows.every(isInviteWindow) || new Set(rows.map(({ id }) => id)).size !== rows.length) {
+			!rows.every(isInviteWindow) || new Set(rows.map(({ id }) => id)).size !== rows.length)
 			throw invalidInviteWindows(status);
-		}
-		return rows.map(({ id, starts_at, ends_at, note }) => ({ id, starts_at, ends_at, note }));
+		return { windows: rows.map(({ id, starts_at, ends_at, note }) => ({ id, starts_at, ends_at, note })),
+			serverTime: Date.parse(headers.get('date') ?? '') };
 	}
 
 	/** The Worker enforces admin role, Origin and fresh-session checks on every write. */
@@ -382,9 +382,8 @@ export class ApiClient {
 				...(close ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }) }
 		);
 		const row = data?.window;
-		if (status !== (close ? 200 : 201) || !isInviteWindow(row) || (close && row.id !== input)) {
+		if (status !== (close ? 200 : 201) || !isInviteWindow(row) || (close && row.id !== input))
 			throw invalidInviteWindows(status);
-		}
 		return row;
 	}
 
@@ -510,7 +509,7 @@ export class ApiClient {
 		path: string,
 		init: RequestInit,
 		expected?: string
-	): Promise<{ data: T; status: number }> {
+	): Promise<{ data: T; status: number; headers: Headers }> {
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
 			accept: 'application/json'
@@ -575,7 +574,7 @@ export class ApiClient {
 			try {
 				const data = (await readCappedJson(response)) as T;
 				callerSignal?.throwIfAborted();
-				return { data, status: response.status };
+				return { data, status: response.status, headers: response.headers };
 			} catch (error) {
 				if (timedOut) throw this.timeoutError();
 				// An over-cap 2xx never parses: surface the typed error, never

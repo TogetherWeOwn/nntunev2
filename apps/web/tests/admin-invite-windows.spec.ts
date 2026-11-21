@@ -6,13 +6,14 @@ const start = '2099-01-01T12:00';
 const end = '2099-01-01T13:00';
 const future = { id: 201, starts_at: Date.parse(`${start}Z`) / 1000, ends_at: Date.parse(`${end}Z`) / 1000, note: 'Synthetic window' };
 const schedule = (page: Page) => page.getByRole('button', { name: 'Schedule window' });
+test.use({ locale: 'en-US', timezoneId: 'America/Los_Angeles' });
 async function fill(page: Page, stop = end) {
 	await page.getByLabel('Start (UTC)').fill(start);
 	await page.getByLabel('End (UTC)').fill(stop);
 }
 
 for (const status of [404, 500, 200]) test(`does not expose data or controls after an unusable GET (${status})`, async ({ page }) => {
-	await page.route(api, (route) => route.fulfill({ status, json: { windows: [future, { id: 1 }] } }));
+	await page.route(api, (route) => route.fulfill({ status, json: { windows: status === 200 ? [future, { id: 1 }] : [future] } }));
 	await page.goto(path);
 	await expect(page.getByRole('alert')).toContainText('Invite windows are unavailable');
 	await expect(schedule(page)).toHaveCount(0);
@@ -51,7 +52,7 @@ test('schedules once after an authorized empty read and renders the server resul
 	pending.resolve();
 	await expect(page.getByText('Window scheduled.')).toBeVisible();
 	await expect(page.getByText('Authoritative note')).toBeVisible();
-	await expect(page.locator('time').first()).toHaveText(/UTC$/);
+	await expect(page.locator('time').first()).toHaveText(/12:00:00\s+PM UTC$/);
 	await expect(page.locator('time').first()).toHaveAttribute('datetime', `${start}:00.000Z`);
 	expect(posts).toBe(1);
 });
@@ -78,7 +79,8 @@ for (const [status, code, message] of [
 
 for (const outcome of ['close', 'cancel', 'missing']) test(`confirms the right row on mobile and handles ${outcome}`, async ({ page }) => {
 	await page.setViewportSize({ width: 375, height: 812 });
-	const at = Math.floor(Date.now() / 1000);
+	const at = future.starts_at - 3600;
+	await page.clock.setFixedTime(at * 1000);
 	const active = { ...future, id: 200, starts_at: at - 60, ends_at: at + 600 };
 	const windows = [future, active, ...Array.from({ length: 198 }, (_, i) => ({
 		...active, id: 199 - i, ends_at: active.starts_at, note: '界'.repeat(170)
@@ -86,14 +88,17 @@ for (const outcome of ['close', 'cancel', 'missing']) test(`confirms the right r
 	const pending = Promise.withResolvers<void>();
 	const target = outcome === 'close' ? active : future;
 	let posts = 0;
-	await page.route(api, (route) => route.fulfill({ json: { windows } }));
+	let serverTime = at;
+	await page.route(api, (route) => route.fulfill({ headers: { date: new Date(serverTime * 1000).toUTCString() }, json: { windows } }));
 	await page.route(`${api}/*/close`, async (route) => {
 		posts++;
 		expect(new URL(route.request().url()).pathname).toBe(`/v1${path}/${target.id}/close`);
 		expect(route.request().method()).toBe('POST');
 		await pending.promise;
-		const ends_at = outcome === 'close' ? at + 20 : target.starts_at; // Simulate clock skew on close.
-		return route.fulfill({ status: outcome === 'missing' ? 404 : 200, json: { window: { ...target, ends_at } } });
+		if (outcome === 'missing') return route.fulfill({ status: 404, json: {} });
+		const row = { ...target, ends_at: outcome === 'close' ? (serverTime = at + 20) : target.starts_at };
+		windows[windows.indexOf(target)] = row;
+		return route.fulfill({ json: { window: row } });
 	});
 	await page.goto(path);
 	await expect(page.locator('main li')).toHaveCount(200);
@@ -108,16 +113,19 @@ for (const outcome of ['close', 'cancel', 'missing']) test(`confirms the right r
 		if (!accept) expect(posts).toBe(0);
 	}
 	await expect(button).toBeDisabled();
-	expect(await button.evaluate((el: HTMLButtonElement) => {
-		const confirm = window.confirm;
-		let prompts = 0;
-		window.confirm = () => { prompts++; return true; };
-		try { el.click(); return prompts; } finally { window.confirm = confirm; }
-	})).toBe(0);
+	await button.evaluate((el: HTMLButtonElement) => { window.confirm = () => true; el.click(); });
 	pending.resolve();
 	await expect(button).toHaveCount(0);
-	if (outcome === 'missing') await expect(page.getByRole('alert')).toContainText('This window is unavailable');
-	else await expect(page.locator('main li').filter({ hasText: `Window #${target.id} · ${outcome === 'close' ? 'Ended' : 'Canceled'}` })).toBeFocused();
+	if (outcome === 'missing') {
+		await expect(page.getByRole('alert')).toContainText('This window is unavailable');
+		await expect(page.getByRole('heading', { name: 'Invite windows', exact: true })).toBeFocused();
+	} else {
+		const row = page.getByRole('listitem', { name: `Window #${target.id} · ${outcome === 'close' ? 'Ended' : 'Canceled'}` });
+		await expect(row).toBeFocused();
+		await page.reload();
+		await expect(row).toBeVisible();
+		await expect(button).toHaveCount(0);
+	}
 	expect(posts).toBe(1);
 });
 
