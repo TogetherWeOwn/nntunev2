@@ -48,7 +48,7 @@ const markBeforeDispatch = (signal: AbortSignal) => new Promise<ClearMarker | un
 });
 function invalidateGeneration(removeOnFailure = true): boolean {
 	if (withStorage<void | false>((storage) => storage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID()), false) !== false) return true;
-	// Removal doesn't need quota. A later capture must initialize a new generation.
+	// Removal doesn't need quota. A later capture must have a new generation.
 	return removeOnFailure && withStorage<void | false>((storage) => storage.removeItem(AUTH_GENERATION_KEY), false) !== false;
 }
 async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
@@ -58,15 +58,15 @@ async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 		});
 	} catch { return undefined; }
 }
-/** Use run() for trusted dispatch, publication and storage commits, not just a receipt check. */
-export function captureAuthFence() {
+/** Use run() for trusted dispatch and publication. Read-only captures require an existing generation. */
+export function captureAuthFence({ readOnly = false } = {}) {
 	const locks = globalThis.navigator?.locks;
 	if (!locks || typeof window === 'undefined') return;
 	const epoch = localEpoch;
 	return readLock(async () => {
 		if (receiptsBlocked()) return;
 		// Initialize once, while the outer shared lock excludes locked writes.
-		if (!generation()) await locks.request(`${AUTH_LOCK}.init`, () => {
+		if (!readOnly && !generation()) await locks.request(`${AUTH_LOCK}.init`, () => {
 			if (!generation() && !receiptsBlocked()) invalidateGeneration(false);
 		});
 		const id = generation();

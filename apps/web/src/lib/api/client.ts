@@ -276,6 +276,17 @@ function isAdminInvite(value: unknown): value is AdminInvite {
 		(row.issued_by === null || isInviteIssuerId(row.issued_by)) && isEpoch(row.expires_at);
 }
 
+export type AdminInviteTreePage = {
+	user_id: string;
+	inviter_id: string | null;
+	invitee_ids: string[];
+	next_cursor: string | null;
+};
+// Match the invite-tree route's ledger key bounds without rewriting the ID.
+export const isInviteTreeUserId = (id: unknown): id is string =>
+	typeof id === 'string' && id.length > 0 && id.length <= 128 && !/[^A-Za-z0-9_-]/.test(id);
+export const isAdminInviteTreeDenial = (status: number) => [401, 403, 404, 409].includes(status);
+
 export const INVITE_POLICY_BOUNDS = {
 	invite_member_min_paid_months: [0, 600],
 	invite_member_per_window: [0, 10_000],
@@ -428,7 +439,7 @@ export class ApiClient {
 		if (!confirm()) return;
 		return (await this.requestWithStatus<{ ok: true }>(REVOKE_ALL, {
 			method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
-		}, expected)).data;
+		}, { expected })).data;
 	}
 
 	async listInviteWindows(signal: AbortSignal) {
@@ -474,6 +485,22 @@ export class ApiClient {
 			!rows.every(isAdminInvite) || new Set(rows.map(({ id }) => id)).size !== rows.length)
 			throw invalidAdminInvites(status);
 		return rows.map(({ id, status, issued_by, expires_at }) => ({ id, status, issued_by, expires_at }));
+	}
+
+	async readAdminInviteTree(id: string, cursor: string | null, signal: AbortSignal): Promise<AdminInviteTreePage> {
+		if (!isInviteTreeUserId(id)) throw new TypeError('Invalid user ID');
+		const query = cursor === null ? '' : `?${new URLSearchParams({ cursor })}`;
+		const { data, status } = await this.requestWithStatus<Partial<AdminInviteTreePage> | null>(
+			`/v1/admin/users/${id}/invite-tree${query}`, { method: 'GET', cache: 'no-store', redirect: 'error', signal },
+			{ statusOnly: isAdminInviteTreeDenial }
+		);
+		if (status !== 200 || data?.user_id !== id ||
+			(data.inviter_id !== null && !isInviteTreeUserId(data.inviter_id)) ||
+			!Array.isArray(data.invitee_ids) || data.invitee_ids.length > 50 || !data.invitee_ids.every(isInviteTreeUserId) ||
+			(data.next_cursor !== null && (typeof data.next_cursor !== 'string' || !data.next_cursor.length || data.next_cursor.length > 128)))
+			throw new ApiError(status, 'request_failed', 'Invalid invite tree response');
+		const { user_id, inviter_id, invitee_ids, next_cursor } = data;
+		return { user_id, inviter_id, invitee_ids, next_cursor };
 	}
 
 	/** Issue a single invite. The code is returned once; never retry or persist it. */
@@ -683,7 +710,7 @@ export class ApiClient {
 	private async requestWithStatus<T>(
 		path: string,
 		init: RequestInit,
-		expected?: string
+		{ expected, statusOnly }: { expected?: string; statusOnly?: (status: number) => boolean } = {}
 	): Promise<{ data: T; status: number; headers: Headers }> {
 		const headers: Record<string, string> = {
 			...((init.headers as Record<string, string> | undefined) ?? {}),
@@ -722,6 +749,12 @@ export class ApiClient {
 			// A transport may ignore abort; never publish an abandoned response.
 			callerSignal?.throwIfAborted();
 			if (!response.ok) {
+				// A known denial must clear private rows without waiting for its body.
+				if (statusOnly?.(response.status)) {
+					void response.body?.cancel().catch(() => undefined);
+					const { code, message } = parseErrorBody(null, response.status);
+					throw new ApiError(response.status, code, message, null, false);
+				}
 				// Read once (capped at 1 MiB) so the paywall and typed error
 				// share the structured contract.
 				let body: unknown = null;
