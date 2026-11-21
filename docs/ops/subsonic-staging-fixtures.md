@@ -120,9 +120,11 @@ and cleanup. That group does not fence dashboard or API writes. Cloudflare's
 does not expose an expected-current deployment precondition. A read followed by
 an unconditional rollback is not safe; do not arm or attempt that write without
 a fence that covers all writers. The rehearsal does not exercise Actions
-cancellation.
+cancellation or independent UTC lease expiry.
 
-The disposable release Fetch test separately checks the Worker's UTC clock:
+### Independent UTC expiry (disposable release Fetch)
+
+The disposable release Fetch test checks the Worker's UTC clock:
 measurement remains enabled and the binding and exact SHA remain configured,
 but a valid lease with a past expiry must reach the inert staging response
 without opening the measurement socket. This checks expiry without running
