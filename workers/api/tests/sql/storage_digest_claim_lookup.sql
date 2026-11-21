@@ -108,4 +108,70 @@ BEGIN
         RAISE EXCEPTION 'second winner refused an unoccupied reference';
     END IF;
 END $$;
+
+CREATE FUNCTION pg_temp.read_lookup(UUID, UUID, BYTEA, BIGINT, UUID, UUID, UUID, UUID, TIMESTAMPTZ, UUID, TIMESTAMPTZ)
+RETURNS TABLE (object_id UUID, generation_id UUID, provider_configuration_version_id UUID,
+               map_id UUID, root_version_id UUID, media_version TEXT, page_versions TEXT[], usable_until TIMESTAMPTZ)
+LANGUAGE sql VOLATILE AS :'storage_digest_read_lookup_sql';
+
+DO $$
+DECLARE
+    f digest_lookup_fixture; pin record; fault text;
+    ref CONSTANT uuid := 'ab000000-0000-4000-8000-000000000001';
+    cutoff CONSTANT timestamptz := clock_timestamp() + interval '5 minutes';
+BEGIN
+    -- Give each otherwise ineligible winner an existing reference to isolate its refusal.
+    INSERT INTO public.storage_validated_digest_references
+    SELECT environment_id, library_id, object_id, object_id FROM digest_lookup_fixture WHERE n BETWEEN 3 AND 7;
+    FOR f IN SELECT * FROM digest_lookup_fixture WHERE n BETWEEN 2 AND 8 LOOP
+        IF EXISTS (SELECT FROM pg_temp.read_lookup(f.environment_id, f.library_id, f.sha, f.bytes,
+            f.object_id, f.generation_id, f.root_id, CASE WHEN f.n=8 THEN ref ELSE f.object_id END,
+            cutoff, f.provider_id, cutoff)) THEN
+            RAISE EXCEPTION 'ineligible playback row returned a binding: %', f.n;
+        END IF;
+    END LOOP;
+    SELECT * INTO STRICT f FROM digest_lookup_fixture WHERE n=1;
+    FOREACH fault IN ARRAY ARRAY['environment','library','digest','size','object','generation','root',
+        'reference','provider','expired','beyond authorization','unbounded'] LOOP
+        IF EXISTS (SELECT FROM pg_temp.read_lookup(
+            CASE WHEN fault='environment' THEN gen_random_uuid() ELSE f.environment_id END,
+            CASE WHEN fault='library' THEN gen_random_uuid() ELSE f.library_id END,
+            CASE WHEN fault='digest' THEN decode(repeat('00',32),'hex') ELSE f.sha END,
+            f.bytes + (fault='size')::int,
+            CASE WHEN fault='object' THEN gen_random_uuid() ELSE f.object_id END,
+            CASE WHEN fault='generation' THEN gen_random_uuid() ELSE f.generation_id END,
+            CASE WHEN fault='root' THEN gen_random_uuid() ELSE f.root_id END,
+            CASE WHEN fault='reference' THEN gen_random_uuid() ELSE ref END,
+            CASE WHEN fault='unbounded' THEN 'infinity' ELSE cutoff END,
+            CASE WHEN fault='provider' THEN gen_random_uuid() ELSE f.provider_id END,
+            CASE fault WHEN 'expired' THEN cutoff - interval '6 minutes' WHEN 'unbounded' THEN 'infinity'
+                       WHEN 'beyond authorization' THEN cutoff + interval '1 second' ELSE cutoff END)) THEN
+            RAISE EXCEPTION 'playback accepted %', fault;
+        END IF;
+    END LOOP;
+    IF EXISTS (SELECT FROM public.storage_validated_digest_winners
+        WHERE environment_id=f.environment_id AND read_until <> '-infinity')
+       OR (SELECT count(*) FROM public.storage_validated_digest_references WHERE environment_id=f.environment_id) <> 7 THEN
+        RAISE EXCEPTION 'refused playback changed leases or references';
+    END IF;
+    SELECT * INTO STRICT pin FROM pg_temp.read_lookup(f.environment_id, f.library_id, f.sha, f.bytes,
+        f.object_id, f.generation_id, f.root_id, ref, cutoff, f.provider_id, cutoff);
+    IF (pin.object_id, pin.generation_id, pin.provider_configuration_version_id, pin.map_id,
+        pin.root_version_id, pin.media_version, pin.page_versions, pin.usable_until) IS DISTINCT FROM
+       (f.object_id, f.generation_id, f.provider_id, f.map_id, f.root_id, 'media-pin'::text, ARRAY['z-first','a-second'], cutoff) THEN
+        RAISE EXCEPTION 'wrong playback binding';
+    END IF;
+    SELECT * INTO STRICT pin FROM pg_temp.read_lookup(f.environment_id, f.library_id, f.sha, f.bytes,
+        f.object_id, f.generation_id, f.root_id, ref, cutoff, f.provider_id, cutoff - interval '1 minute');
+    IF pin.usable_until IS DISTINCT FROM cutoff - interval '1 minute'
+       OR (SELECT read_until FROM public.storage_validated_digest_winners WHERE object_id=f.object_id)
+        IS DISTINCT FROM cutoff THEN
+        RAISE EXCEPTION 'second read shortened the existing protection';
+    END IF;
+    DELETE FROM public.storage_validated_digest_references WHERE object_id=f.object_id;
+    IF NOT FOUND OR public.admit_storage_digest_delete(f.environment_id, f.library_id, f.sha, f.bytes,
+        f.object_id, f.generation_id, f.root_id) IS DISTINCT FROM false THEN
+        RAISE EXCEPTION 'delete bypassed live read protection after last reference removal';
+    END IF;
+END $$;
 ROLLBACK;
