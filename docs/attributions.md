@@ -48,7 +48,11 @@ This inventory is not a claim that all distribution obligations are discharged.
   import or activated product reads, so the core-data entry stays planned until
   a future integration PR verifies the consumed dataset. ListenBrainz dumps and
   LRCLIB stay planned too; LRCLIB's content rights remain unassessed, not
-  inferred from server code terms.
+  inferred from server code terms. The unmounted synced-lyrics resolver returns
+  the `lrclib` inventory ID for provider results; it installs no live transport
+  and writes no lyrics to persistent storage. Any future activation is for
+  private use only, with no spend or public rollout, and must visibly credit and
+  link LRCLIB through the existing attribution contract without claiming a content licence.
 - Referenced cover art stays explicitly rights-flagged, not openly licensed by
   assumption, and planned alongside the mirror. This work authorizes no copying,
   caching or redistribution.
