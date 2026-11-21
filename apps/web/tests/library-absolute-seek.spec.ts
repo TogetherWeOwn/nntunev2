@@ -7,8 +7,7 @@ const items = ['Coral', 'Pine'].map((title, i) => ({
 
 test('pointer and keyboard seek the real layout decoder and follow its readback', async ({ page }) => {
 	await page.route('**/api/library', (route) => route.fulfill({ json: items }));
-	const rangeResponse = page.waitForResponse((response) =>
-		response.url().endsWith(items[0].streamUrl) && response.status() === 206);
+	const rangeResponse = page.waitForResponse((r) => r.url().endsWith(items[0].streamUrl) && r.status() === 206);
 	await page.goto(`/library?track=${items[0].id}&t=2`);
 	const region = page.getByRole('region', { name: 'Player', exact: true });
 	const audio = page.getByTestId('audio-player');
@@ -20,10 +19,7 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	const firstAudio = await audio.elementHandle();
 	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => !el.seeking && el.paused &&
 		Math.abs(el.currentTime - 2) < 0.05)).toBe(true);
-	await audio.evaluate((el: HTMLAudioElement) => {
-		el.addEventListener('seeked', () => { el.dataset.seeked = 'yes'; }, { once: true });
-	});
-
+	await audio.evaluate((el: HTMLAudioElement) => el.addEventListener('seeked', () => { el.dataset.seeked = 'yes'; }, { once: true }));
 	const nonMedia: string[] = [];
 	page.on('request', (request) => { if (request.resourceType() !== 'media') nonMedia.push(request.url()); });
 	const target = await seekViaPlayerUi(page, audio, 0.55);
@@ -62,20 +58,24 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 		Object.defineProperty(el, 'seekable', { configurable: true, get: () => ({ length: 1, start: () => 0, end: () => 5 }) });
 	});
 	const refusal = region.locator('p[aria-live="polite"][aria-atomic="true"] span:not([aria-hidden])');
-	for (const attempt of ['pointer', 'key', 'key', 'input', 'input']) {
+	for (const attempt of ['pointer', 'drag', 'drag-repeat', 'held-key', 'key-repeat', 'key', 'input', 'input']) {
 		const previous = attempt === 'pointer' ? null : await refusal.elementHandle();
 		if (attempt === 'pointer') expect((await seekViaPlayerUi(page, audio, 0.75)).surface).toBe('custom');
+		else if (attempt === 'held-key' || attempt === 'key-repeat') await page.keyboard.down('End');
 		else if (attempt === 'key') await page.keyboard.press('End');
-		else await slider.evaluate((el: HTMLInputElement) => {
+		else await slider.evaluate((el: HTMLInputElement, startDrag) => {
+			if (startDrag) el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
 			el.value = el.max;
 			el.dispatchEvent(new Event('input', { bubbles: true }));
-		});
-		if (previous) await expect.poll(() => previous.evaluate((el) => el.isConnected)).toBe(false);
+		}, attempt === 'drag');
+		if (attempt === 'drag-repeat') await slider.dispatchEvent('pointerup', { bubbles: true });
+		if (attempt === 'key-repeat') await page.keyboard.up('End');
+		if (previous) await expect.poll(() => previous.evaluate((el) => el.isConnected)).toBe(attempt.endsWith('-repeat'));
 		await expect(refusal).toHaveText('That position is not seekable yet.');
 		await expectTime(4);
 		await expect(slider).toHaveAttribute('aria-valuetext', '0:04 of 0:16');
 	}
-	await audio.evaluate((el) => { Reflect.deleteProperty(el, 'seekable'); });
+	await audio.evaluate((el) => Reflect.deleteProperty(el, 'seekable'));
 	await page.keyboard.press('End');
 	await expectTime(sought.duration);
 	await expect(audio).toHaveJSProperty('paused', true);
