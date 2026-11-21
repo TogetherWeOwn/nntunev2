@@ -136,7 +136,7 @@ test('resizing with a keyboard-opened row menu returns focus to its trigger', as
 	await page.setViewportSize({ width: 1280, height: 800 });
 	await seed(page);
 	await keyboardOpen(page);
-	const trigger = page.getByRole('button', { name: 'More actions for Fern' });
+	const trigger = queued(page).getByRole('button', { name: 'More actions for Fern' });
 	await trigger.focus();
 	await page.keyboard.press('Enter');
 	const menu = page.getByRole('menu', { name: /Fern/ });
@@ -144,7 +144,7 @@ test('resizing with a keyboard-opened row menu returns focus to its trigger', as
 
 	await page.setViewportSize({ width: 799, height: 844 });
 	await expect(menu).toHaveCount(0);
-	await expect(page.getByRole('main').getByRole('button', { name: 'More actions for Fern' })).toBeFocused();
+	await expect(trigger).toBeFocused();
 	await page.keyboard.press('Enter');
 	await expect(menu.locator(':focus')).toHaveCount(1);
 });
