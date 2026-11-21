@@ -176,6 +176,7 @@ class IdentityTests(unittest.TestCase):
             ("success", 1, json.dumps(denied | {"unexpected": "synthetic private field"}), missing),
             ("success", 0, matched + " " * 512, missing),
             ("failure", 0, matched, missing),
+            ("skipped", 0, matched, missing),
             ("cancelled", 0, matched, missing),
         ):
             with self.subTest(status=status, rc=rc, payload=payload), TemporaryDirectory() as temp:
@@ -185,17 +186,21 @@ class IdentityTests(unittest.TestCase):
                 probe.chmod(0o700)
                 env = {"PATH": f"{temp}:{identity.os.defpath}", "RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(output),
                        "GITHUB_STEP_SUMMARY": str(summary), "CONFIGURED": "true", "HYPERDRIVE_OUTCOME": "success",
-                       "SCHEMA_OUTCOME": "success", "JOB_STATUS": status, "DEPLOY_OUTCOME": status, "SOURCE_SHA": SHA}
+                       "SCHEMA_OUTCOME": "success", "JOB_STATUS": "success" if status == "skipped" else status,
+                       "DEPLOY_OUTCOME": status, "SOURCE_SHA": SHA}
                 hook_result = subprocess.run(["bash", "-c", hook], check=True, env=env, capture_output=True, text=True)
                 self.assertEqual(hook_result.stdout, "")
                 report_result = subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True,
                                                env=env | {"PATH": identity.os.defpath})
-                deployed, outcome = status == "success", {"success": "deployed", "failure": "failed"}.get(status, status)
-                self.assertEqual(output.read_text(),
-                                 f"deployed={str(deployed).lower()}\noutcome={outcome}\nsource_sha={SHA if deployed else ''}\n")
+                deployed = status == "success"
+                outcome = {"success": "deployed", "cancelled": "cancelled"}.get(status, "failed")
                 receipt = summary.read_text().split("\n### staging-api provider identity\n", 1)[1].strip()
                 self.assertEqual(report_result.stdout.splitlines(), [f"staging-api provider identity: {receipt}"])
                 self.assertEqual(json.loads(receipt), expected)
+                outputs = f"deployed={str(deployed).lower()}\noutcome={outcome}\nsource_sha={SHA if deployed else ''}\n"
+                if deployed and expected == MATCHED:
+                    outputs += f"identity_pin={receipt}\n"
+                self.assertEqual(output.read_text(), outputs)
 
 
 if __name__ == "__main__":
