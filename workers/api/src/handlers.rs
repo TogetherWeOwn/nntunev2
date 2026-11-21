@@ -18191,6 +18191,29 @@ mod tests {
     }
 
     #[test]
+    fn play_issue_caps_initial_grant_at_authoritative_duration_plus_slack() {
+        let h = play_harness();
+        let cookie = play_user(&h);
+        seed_entitled(&h, "user-plays-1", "plus", 100);
+        h.store.meter_meta.borrow_mut().insert(
+            ("user-plays-1".into(), "track-9".into()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(180_001),
+                mb_duration_ms: Some(300_000),
+                ..Default::default()
+            },
+        );
+        let resp = play_call(
+            &h,
+            &cookie,
+            json!({"track_id": "track-9", "session_id": "tab-a"}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(body["expires_at"], NOW + 181 + 120);
+    }
+
+    #[test]
     fn play_issue_refuses_unsubscribed_with_reasons_and_no_lease() {
         let h = play_harness();
         let cookie = play_user(&h);
