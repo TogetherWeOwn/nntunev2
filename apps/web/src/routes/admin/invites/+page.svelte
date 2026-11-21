@@ -116,7 +116,7 @@
 	{#if error}<p role="alert">{error}</p>
 	{:else if !owner}<p role="status">Loading invites…</p>
 	{:else}
-		<p><a href="/admin/invite-windows">Invite windows</a></p>
+		<p><a href="/admin/invite-windows">Invite windows</a> · <a href="/admin/invites/issue">Create an invite</a></p>
 		<p>Up to {ADMIN_INVITE_LIMIT} matching invites, newest first. This is not a complete history.</p>
 		<form onsubmit={filterInvites}>
 			<label for="invite-filter">Filter by</label>
