@@ -125,7 +125,7 @@ export function chooseSeekSurface(
 
 /** Named failure for a player with no user-seekable control at all. */
 export function seekSurfaceFailure(
-  seekSliderUsable: boolean,
+  seekSliderVisible: boolean,
   nativeControlsPresent: boolean,
 ): string {
   return (

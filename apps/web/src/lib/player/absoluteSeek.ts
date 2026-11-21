@@ -1,7 +1,8 @@
-type SeekMedia = Pick<HTMLMediaElement, 'currentTime' | 'duration' | 'error' | 'seekable'>;
+type SeekMedia = Pick<HTMLMediaElement, 'currentTime' | 'duration' | 'error' | 'seekable' | 'seeking'>;
 
-export const emptySeek = { position: 0, duration: 0, enabled: false };
-export type AbsoluteSeekState = typeof emptySeek & { attachment: number; feedback: string };
+const emptyObservation = { position: 0, duration: 0, enabled: false, seeking: false };
+export const emptySeek = { ...emptyObservation, elapsed: 0, attachment: 0, feedback: '', feedbackVersion: 0 };
+export type AbsoluteSeekState = typeof emptySeek;
 
 function seekable(media: SeekMedia, duration: number, target?: number): boolean {
 	const ranges = media.seekable;
@@ -12,16 +13,16 @@ function seekable(media: SeekMedia, duration: number, target?: number): boolean 
 	return false;
 }
 
-export function readAbsoluteSeek(media: SeekMedia): typeof emptySeek {
+export function readAbsoluteSeek(media: SeekMedia): typeof emptyObservation {
 	try {
 		const { currentTime, duration, error } = media;
-		if (error) return emptySeek;
+		if (error) return emptyObservation;
 		const known = Number.isFinite(duration) && duration > 0;
 		const position = Number.isFinite(currentTime) ? Math.max(0, currentTime) : 0;
 		return { position: known ? Math.min(position, duration) : position, duration: known ? duration : 0,
-			enabled: known && Number.isFinite(currentTime) && seekable(media, duration) };
+			seeking: known && media.seeking === true, enabled: known && Number.isFinite(currentTime) && seekable(media, duration) };
 	} catch {
-		return emptySeek;
+		return emptyObservation;
 	}
 }
 

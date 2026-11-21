@@ -29,6 +29,7 @@ class SeekableAudio extends EventTarget {
 	get duration() { return 120; }
 	get seekable() { return { length: 1, start: () => 0, end: () => 120 }; }
 	position = 30;
+	seeking = false;
 	get currentTime() { return this.position; }
 	set currentTime(value: number) { this.position = value; }
 }
@@ -360,7 +361,6 @@ test('destroy retires the active node and refuses later mounts', () => {
 	expect(audio.pause).toHaveBeenCalledOnce();
 });
 
-
 test('absolute seek cancels deferred share and uses native time, including refused or unavailable targets', () => {
 	const media = createMediaController(() => true, coral);
 	const native = new SeekableAudio();
@@ -383,6 +383,24 @@ test('absolute seek cancels deferred share and uses native time, including refus
 	media.seek(attachment, 200);
 	expect(setter).toHaveBeenLastCalledWith(120);
 	expect(state()).toMatchObject({ position: 120, duration: 120, enabled: true, feedback: '' });
+});
+
+test('absolute seek keeps elapsed time settled while the decoder is seeking', () => {
+	const media = createMediaController(() => true, coral);
+	const native = new SeekableAudio();
+	media.attach(native as unknown as HTMLAudioElement);
+	const state = () => get(media.absoluteSeek);
+	native.seeking = true;
+	media.seek(state().attachment, 80);
+	native.dispatchEvent(new Event('seeking'));
+	expect(native.currentTime).toBe(80);
+	expect(state()).toMatchObject({ position: 80, elapsed: 30, seeking: true });
+	media.seek(state().attachment, 90);
+	native.dispatchEvent(new Event('seeked')); // A queued event cannot settle a newer in-flight seek.
+	expect(state()).toMatchObject({ position: 90, elapsed: 30, seeking: true });
+	native.seeking = false;
+	native.dispatchEvent(new Event('seeked'));
+	expect(state()).toMatchObject({ position: 90, elapsed: 90, seeking: false });
 });
 
 test.each(['before write', 'during write'] as const)('absolute seek fences attachment retirement %s', (phase) => {
