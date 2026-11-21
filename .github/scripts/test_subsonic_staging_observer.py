@@ -104,6 +104,20 @@ class ObserverTests(unittest.TestCase):
                 monotonic=iter((0, 6)).__next__,
             )
 
+    def test_pressure_rejects_invalid_deadlines_before_calling_client(self):
+        for deadline in (None, "1500", True, -1):
+            run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout=VALID))
+            with self.subTest(deadline=deadline):
+                with self.assertRaisesRegex(UnsafeSample, "^deadline$"):
+                    OBSERVER["sample_pressure"](
+                        ENV,
+                        deadline_ms=deadline,
+                        run=run,
+                        wall=lambda: 100,
+                        monotonic=lambda: 0,
+                    )
+                run.assert_not_called()
+
     def test_pressure_uses_query_start_and_remaining_budget(self):
         run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout=VALID))
         reading = OBSERVER["sample_pressure"](
