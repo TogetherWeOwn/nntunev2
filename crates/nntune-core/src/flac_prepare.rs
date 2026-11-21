@@ -8,6 +8,7 @@ use crate::flac_preamble::FlacPreamble;
 
 const MAX_COMMENT_BYTES: usize = 64 * 1024;
 const MAX_SEEK_POINTS: usize = 65_536;
+const CHANNEL_MASK: &str = "WAVEFORMATEXTENSIBLE_CHANNEL_MASK";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PrepareError {
@@ -119,7 +120,9 @@ pub(crate) fn prepare<'a>(
 
     // Emit only STREAMINFO, the replacement comment, and a rebuilt SEEKTABLE.
     // In particular, source PICTURE blocks and foreign offsets never survive.
-    let comments = vorbis_comments(tags)?;
+    let mask = source_channel_mask(&input[42..input.len() - audio.len()], info.channels)
+        .ok_or(PrepareError::Preamble)?;
+    let comments = vorbis_comments(tags, mask)?;
     let mut preamble = input[..42].to_vec();
     preamble[4] = 0;
     block_header(&mut preamble, 4, comments.len());
@@ -144,15 +147,66 @@ fn block_header(out: &mut Vec<u8>, flags: u8, len: usize) {
     out.extend_from_slice(&(len as u32).to_be_bytes()[1..]);
 }
 
-fn vorbis_comments(tags: &[(&str, &str)]) -> Result<Vec<u8>, PrepareError> {
+fn take_vorbis_field<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let (len, rest) = bytes.split_first_chunk::<4>()?;
+    let (field, rest) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
+    *bytes = rest;
+    Some(field)
+}
+
+// Layout describes the unchanged frames, not the replacement catalogue tags.
+fn source_channel_mask(mut blocks: &[u8], channels: u8) -> Option<Option<u32>> {
+    let mut mask = None;
+    while let Some(([kind, a, b, c], rest)) = blocks.split_first_chunk::<4>() {
+        let (mut payload, rest) =
+            rest.split_at_checked(u32::from_be_bytes([0, *a, *b, *c]) as usize)?;
+        blocks = rest;
+        if kind & 127 != 4 {
+            continue;
+        }
+        take_vorbis_field(&mut payload)?; // vendor
+        let (count, mut fields) = payload.split_first_chunk::<4>()?;
+        for _ in 0..u32::from_le_bytes(*count) {
+            let field = take_vorbis_field(&mut fields)?;
+            let mut parts = field.splitn(2, |&byte| byte == b'=');
+            if !parts.next()?.eq_ignore_ascii_case(CHANNEL_MASK.as_bytes()) {
+                continue;
+            }
+            let (prefix, hex) = parts.next()?.split_at_checked(2)?;
+            if !prefix.eq_ignore_ascii_case(b"0x") || !hex.first()?.is_ascii_hexdigit() {
+                return None;
+            }
+            let value = u32::from_str_radix(str::from_utf8(hex).ok()?, 16).ok()?;
+            if value >= 1 << 18
+                || value.count_ones() > u32::from(channels)
+                || mask.replace(value).is_some()
+            {
+                return None;
+            }
+        }
+    }
+    Some(mask)
+}
+
+fn vorbis_comments(tags: &[(&str, &str)], mask: Option<u32>) -> Result<Vec<u8>, PrepareError> {
     const VENDOR: &[u8] = b"NNTune";
-    if tags.len() > 256 {
+    let count = tags.len() + usize::from(mask.is_some());
+    if count > 256
+        || tags
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case(CHANNEL_MASK))
+    {
         return Err(PrepareError::Tags);
     }
     let mut out = (VENDOR.len() as u32).to_le_bytes().to_vec();
     out.extend_from_slice(VENDOR);
-    out.extend_from_slice(&(tags.len() as u32).to_le_bytes());
-    for &(key, value) in tags {
+    out.extend_from_slice(&(count as u32).to_le_bytes());
+    let layout = mask.map(|value| format!("0x{value:x}"));
+    for (key, value) in tags
+        .iter()
+        .copied()
+        .chain(layout.as_deref().map(|value| (CHANNEL_MASK, value)))
+    {
         let size = key.len().saturating_add(value.len()).saturating_add(1);
         if size.saturating_add(4) > MAX_COMMENT_BYTES - out.len()
             || key.is_empty()
