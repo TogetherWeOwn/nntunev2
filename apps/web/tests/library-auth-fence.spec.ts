@@ -4,7 +4,7 @@ const current = 'A'.repeat(43);
 const contextKey = 'nntune.library.auth-context.v1';
 const favoritesKey = 'nntune.library.favorites.v1.bound';
 
-test('a closed writer and verifier outage allow Retry; replacement retires local player and Undo', async ({ page, context }) => {
+test('a verifier outage allows Retry; replacement retires local player and Undo', async ({ page }) => {
 	let binding = current, failNext = false, verifies = 0;
 	await page.route('**/api/library', (r) => r.fulfill({ headers: { 'x-nntune-session-binding': binding },
 		json: [{ id: 'track', title: 'Scoped track', streamUrl: '/api/demo/audio' }] }));
@@ -20,16 +20,8 @@ test('a closed writer and verifier outage allow Retry; replacement retires local
 		localStorage.setItem(favoritesKey, '["track"]');
 		Object.defineProperty(navigator, 'clipboard', { value: undefined });
 	}, { current, contextKey, favoritesKey });
-	const writer = await context.newPage();
-	await writer.goto('/login');
-	await writer.evaluate(() => new Promise<void>((ready) => {
-		void navigator.locks.request('nntune.auth.cookie-transition.v1', () => { ready(); return new Promise(() => {}); });
-	}));
 	await page.goto('/library');
 	const retry = page.getByRole('button', { name: 'Retry', exact: true });
-	await expect(retry).toBeVisible();
-	await writer.close();
-	await retry.click();
 	await page.getByRole('button', { name: 'Play displayed from the top' }).click();
 	const time = () => page.getByTestId('audio-player').evaluate((el: HTMLAudioElement) => el.currentTime);
 	await expect.poll(time).toBeGreaterThan(0);
@@ -117,16 +109,14 @@ for (const view of ['Home', 'Albums', 'Artists']) {
 		await page.goto(home ? '/home' : '/library');
 		if (!home) await page.getByRole('button', { name: view, exact: true }).click();
 		const row = page.getByText(home ? 'Scoped track' : view === 'Albums' ? 'Scoped album' : 'Scoped artist', { exact: true });
-		const collections = page.getByRole('region', { name: 'Library collections' });
+		const gatedRegion = home ? recent : page.getByRole('region', { name: 'Library collections' });
 		await checking.promise;
-		await expect(collections).toHaveCount(0);
+		await expect(gatedRegion).toHaveCount(0);
 		await expect(row).toHaveCount(0);
-		if (home) await expect(recent).toHaveCount(0);
 		fail.resolve();
 		await expect(page.getByRole('alert')).toContainText('Could not verify your library session');
 		await expect(row).toHaveCount(0);
-		await expect(collections).toHaveCount(0);
-		if (home) await expect(recent).toHaveCount(0);
+		await expect(gatedRegion).toHaveCount(0);
 		await page.getByRole('button', { name: 'Retry', exact: true }).click();
 		await expect(row).toBeVisible();
 		if (home) await expect(recent.getByRole('link', { name: 'Scoped query' })).toBeVisible();

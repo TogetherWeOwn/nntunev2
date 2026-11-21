@@ -39,7 +39,7 @@ export interface LibraryRefreshUpdate {
 	authBoundary: boolean;
 	sessionBinding?: string; // Verified label for the rows, not import provenance.
 	deviceScope?: string; // Exact localStorage key eligible for the verified binding.
-	/** Run collection dispatch/publication under the same receipt as the verified listing. */
+	/** Run collection dispatch/publication only for the current listing. */
 	runIfCurrent?: <T>(work: () => T) => Promise<T | undefined>;
 }
 
@@ -111,6 +111,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 		let timeoutFired = false;
+		let awaitingListing = false;
 
 		function cancelResponse(resp: Response | null | undefined): void {
 			if (!resp) return;
@@ -270,6 +271,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const capture = captureAuthFence();
 			const fence = capture && await Promise.race([capture, timeout, aborted]);
 			if (!isCurrent()) return;
+			awaitingListing = true;
 			const fetchPromise = fetchFn('/api/library', {
 				credentials: 'include',
 				signal: controller.signal
@@ -292,6 +294,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				() => {}
 			);
 			const response = await Promise.race([fetchPromise, timeout, aborted]);
+			awaitingListing = false;
 			if (!isCurrent() || controller.signal.aborted) {
 				cancelResponse(response);
 				return;
@@ -372,7 +375,14 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			if (!isCurrent()) return;
 			if (state.verificationSuspended || binding !== null) return void refuse();
 			if (authenticatedThisLoad && verified) {
-				if (!await runBeforeDeadline(verified.fence, () => { restoreSnapshot(); publish(); return true; })) refuse();
+				const restore = () => { restoreSnapshot(); publish(); return true; };
+				if (timeoutFired && awaitingListing) {
+					// Only a listing with no headers gets a separate budget for the old receipt.
+					let open = true;
+					const expired = new Promise<void>((resolve) => { timeoutId = setTimeout(() => { open = false; resolve(); }, 500); });
+					if (await Promise.race([verified.fence.run(() => open && isCurrent() && restore()), expired])) return;
+				} else if (await runBeforeDeadline(verified.fence, restore)) return;
+				refuse();
 			} else restoreSnapshot();
 		} finally {
 			if (timeoutId !== undefined) clearTimeout(timeoutId);
@@ -385,10 +395,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	}
 
 	/**
-	 * Shared local/delivered-transition reset: fence in-flight work (a late
-	 * response can neither repopulate the view nor overwrite the replacement
-	 * status), drop snapshots and memory, and enter the sign-in-required
-	 * presentation. Never requests, rebroadcasts, navigates or retries.
+	 * Invalidate the old receipt before purging and publishing the reset.
+	 * Only HTTP refusal notifies other tabs; a delivered transition never rebroadcasts.
 	 */
 	function applyAuthTransition(replaced = true, notify = false, status?: number): void {
 		if (disposed) return;

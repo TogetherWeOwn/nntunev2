@@ -63,22 +63,32 @@ it.each([2, 3])('suspends when verification lock admission %i exceeds the deadli
 	expect(update().sessionBinding).toBe(label);
 });
 
-it.each([200, 401, 403, 0])('withholds a stale result (%i) without purging its scope', async (status) => {
+const deferredResults = [200, 401, 403, 'writer held', 'listing timeout', 'revoked listing timeout'] as const;
+it.each(deferredResults)('handles deferred refresh (%s) without purging its verified scope', async (result) => {
+	const timeout = result === 'listing timeout' || result === 'revoked listing timeout';
+	const canRestore = result === 'listing timeout';
+	if (timeout) vi.useFakeTimers();
 	const { local, session, verify, refresh, update, refresher, onAccessRefused } = setup();
-	const key = await refresh().then(() => update().deviceScope!);
-	expect(key).toEqual(expect.any(String));
+	await refresh();
+	const key = update().deviceScope!;
+	expect(update()).toMatchObject({ sessionBinding: label, deviceScope: expect.any(String) });
 	local.setItem(key, bytes);
 	const started = Promise.withResolvers<void>(), reply = Promise.withResolvers<Response>();
 	const deferred = () => { started.resolve(); return reply.promise; };
-	if (status < 400) verify.mockImplementationOnce(deferred);
-	const pending = status < 400 ? refresh() : refresher.refresh(deferred);
+	const verifying = result === 200 || result === 'writer held';
+	if (verifying) verify.mockImplementationOnce(deferred);
+	const pending = verifying ? refresh() : refresher.refresh(deferred);
 	await Promise.race([started.promise, pending.then(() => { throw new Error('Refresh ended before the deferred request'); })]);
-	if (status) {
-		local.setItem(AUTH_GENERATION_KEY, 'replacement');
-		reply.resolve(status === 200 ? proof() : new Response(null, { status }));
+	if (result === 'writer held') await navigator.locks.request(AUTH_LOCK, () => { reply.resolve(proof()); return pending; });
+	else {
+		if (!canRestore) local.setItem(AUTH_GENERATION_KEY, 'replacement');
+		if (timeout) await vi.advanceTimersByTimeAsync(10_000);
+		else reply.resolve(result === 200 ? proof() : new Response(null, { status: result }));
 		await pending;
-	} else await navigator.locks.request(AUTH_LOCK, () => { reply.resolve(proof()); return pending; });
-	expect(refresher.state).toMatchObject({ items: [], requiresSignIn: false, verificationSuspended: true });
+	}
+	expect(refresher.state).toMatchObject({ requiresSignIn: false, verificationSuspended: !canRestore,
+		items: canRestore ? [{ id: 'track' }] : [], staleAt: canRestore ? expect.any(String) : null });
+	expect(update()).toMatchObject({ authoritative: !canRestore, authBoundary: !canRestore });
 	expect(update().deviceScope).toBeUndefined();
 	expect(onAccessRefused).not.toHaveBeenCalled();
 	expect(loadSnapshot(session)?.items).toEqual([{ id: 'track' }]);
