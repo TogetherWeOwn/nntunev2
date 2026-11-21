@@ -43,14 +43,10 @@
 {/snippet}
 {@render entry('minutes', 'Sleep timer (minutes)', 15, 'duration', 'Sleep after duration')}
 <button class="nt-button nt-button--ghost" type="button" data-testid="sleep-timer-set-end-of-track"
-	onclick={() => arm({ kind: 'end-of-track' }, 'Sleep at end of track')}>
-	Sleep at end of track
-</button>
+	onclick={() => arm({ kind: 'end-of-track' }, 'Sleep at end of track')}>Sleep at end of track</button>
 {@render entry('tracks', 'Stop after tracks', 2, 'stop-after', 'Sleep after N tracks')}
 <button class="nt-button nt-button--ghost" type="button" data-testid="sleep-timer-cancel"
-	disabled={!armed} onclick={() => { clearErrors(); cancel(); }}>
-	Cancel sleep timer
-</button>
+	disabled={!armed} onclick={() => { clearErrors(); cancel(); }}>Cancel sleep timer</button>
 {#if armed && remaining}<p data-testid="sleep-timer-remaining">{remaining}</p>{/if}
 <p data-testid="sleep-timer-status" aria-live="polite">{announcement}</p>
 <p>Duration timers use wall-clock time and continue while paused.</p>
@@ -65,8 +61,7 @@
 	button, input { min-height: 2.75rem; }
 	input {
 		flex: 0 1 8rem;
-		min-width: 0;
-		max-width: 100%;
+		min-width: 0; max-width: 100%;
 		padding: var(--nt-space-2) var(--nt-space-3);
 		font: inherit;
 		color: var(--nt-fg);

@@ -14,6 +14,7 @@ function setup() {
 		const audio = Object.assign(new EventTarget(), {
 			isConnected: true, paused: true, ended: false, error: null,
 			getAttribute: () => source,
+			currentTime: 25, duration: 30, seekable: { length: 1, start: () => 0, end: () => 30 },
 			play: vi.fn(async () => {
 				audio.paused = audio.ended = false;
 				audio.dispatchEvent(new Event('playing'));
@@ -23,7 +24,7 @@ function setup() {
 				audio.dispatchEvent(new Event('pause'));
 			}),
 			end() {
-				audio.paused = audio.ended = true;
+				Object.assign(audio, { paused: true, ended: true, currentTime: audio.duration });
 				audio.dispatchEvent(new Event('pause'));
 				audio.dispatchEvent(new Event('ended'));
 			}
@@ -37,7 +38,6 @@ function setup() {
 }
 
 const duration = (ms: number) => ({ kind: 'duration' as const, ms });
-const endOfTrack = { kind: 'end-of-track' as const };
 afterEach(() => { vi.useRealTimers(); clearMiniPlayerHint(); });
 
 test('duration expiry pauses the current owner once without changing selection', async () => {
@@ -65,7 +65,6 @@ test('rearming replaces the deadline; manual pause preserves the countdown until
 	pauseCurrent();
 	vi.advanceTimersByTime(1000);
 	expect(state()).toEqual({ armed: true, remaining: '0:02', announcement: 'new' });
-	expect(player.queue.snapshot).toBe(queue);
 	sleepTimer.cancel();
 	expect(state()).toEqual({ armed: false, remaining: '', announcement: 'Sleep timer off' });
 	expect(player.queue.snapshot).toBe(queue);
@@ -76,7 +75,7 @@ test('rearming replaces the deadline; manual pause preserves the countdown until
 
 test('a paused or retired decoder cannot consume a track end; a playable replacement inherits the timer', async () => {
 	const { player, audio, state, playCurrent, attach, sleepTimer } = setup();
-	sleepTimer.start(endOfTrack, 'Sleep at end of track');
+	sleepTimer.start({ kind: 'end-of-track' }, 'Sleep at end of track');
 	audio.end();
 	expect(state().armed).toBe(true);
 	player.replaceQueue(selectTrack(queue, 1));
@@ -86,27 +85,30 @@ test('a paused or retired decoder cannot consume a track end; a playable replace
 	expect(state().armed).toBe(true);
 	player.media.setRepeat('one', null);
 	next.end();
-	await Promise.resolve();
 	expect(state().announcement).toMatch(/fired/);
 	expect(player.queue.snapshot.currentIndex).toBe(1);
 	expect(next.play).toHaveBeenCalledOnce();
 });
 
-test('stop after two counts natural advance once and stops before the next queue change', async () => {
+test('Forward to the endpoint advances the queue without consuming a track; two natural ends stop it', async () => {
 	const { player, audio, state, playCurrent, sleepTimer, flush } = setup();
+	const currentAudio = () => player.media.audio as unknown as typeof audio;
 	await playCurrent();
 	sleepTimer.start({ kind: 'stop-after-tracks', count: 2 }, 'Sleep after 2 tracks');
-	audio.end();
+	player.media.jump('forward');
+	expect(audio.currentTime).toBe(audio.duration);
+	audio.dispatchEvent(new Event('seeking'));
 	audio.end();
 	await Promise.resolve();
+	expect(state()).toMatchObject({ armed: true, remaining: '2 tracks remaining' });
+	expect(player.queue.snapshot.currentIndex).toBe(1);
+	currentAudio().end();
+	await Promise.resolve();
 	expect(state()).toMatchObject({ armed: true, remaining: '1 track remaining' });
-	expect(player.queue.snapshot.currentIndex).toBe(1);
-	player.media.audio!.dispatchEvent(new Event('seeking'));
-	expect(state().remaining).toBe('1 track remaining');
-	(player.media.audio as unknown as typeof audio).end();
+	currentAudio().end();
 	expect(state().announcement).toMatch(/fired/);
-	expect(player.queue.snapshot.currentIndex).toBe(1);
-	expect(flush).toHaveBeenCalledOnce();
+	expect(player.queue.snapshot.currentIndex).toBe(2);
+	expect(flush).toHaveBeenCalledTimes(2);
 });
 
 test('a duplicate end on the current decoder does not count while repeat-one replay waits', async () => {

@@ -1,26 +1,12 @@
 import { writable } from 'svelte/store';
-import { createSleepTimer, type SleepTimerMode, type SleepTimerProgress } from './sleepTimer.js';
-
-function formatSleepRemaining(progress: SleepTimerProgress | null): string {
-	if (!progress) return '';
-	if (progress.kind === 'end-of-track') return 'End of track';
-	if (progress.kind === 'stop-after-tracks') {
-		const n = progress.remainingTracks;
-		return `${n} track${n === 1 ? '' : 's'} remaining`;
-	}
-	const total = Math.ceil(progress.remainingMs / 1000);
-	const hours = Math.floor(total / 3600);
-	const minutes = Math.floor(total / 60) % 60;
-	const seconds = String(total % 60).padStart(2, '0');
-	return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`;
-}
+import { formatDuration } from '../format.js';
+import { createSleepTimer, type SleepTimerMode } from './sleepTimer.js';
 
 const off = { armed: false, announcement: 'Sleep timer off', remaining: '' };
 
 export function createPlayerSleepTimer(pause: () => void, canStart: () => boolean) {
 	let generation = 0;
 	let interval: ReturnType<typeof setInterval> | undefined;
-	let announcement = off.announcement;
 	const state = writable(off);
 	const timer = createSleepTimer({ now: Date.now, onFire() {
 		const receipt = stopTicking();
@@ -35,8 +21,15 @@ export function createPlayerSleepTimer(pause: () => void, canStart: () => boolea
 		interval = undefined;
 		return ++generation;
 	}
-	function publish(): void {
-		state.set({ armed: true, announcement, remaining: formatSleepRemaining(timer.progress) });
+	function publish(message?: string): void {
+		const progress = timer.progress;
+		if (!progress) return;
+		const count = progress.kind === 'stop-after-tracks' ? progress.remainingTracks : 0;
+		const tracks = `${count} track${count === 1 ? '' : 's'}`;
+		const remaining = progress.kind === 'duration' ? formatDuration(Math.ceil(progress.remainingMs / 1000))
+			: progress.kind === 'end-of-track' ? 'End of track' : `${tracks} remaining`;
+		state.update((prior) => ({ armed: true, remaining,
+			announcement: message ?? (count ? `Sleep after ${tracks}` : prior.announcement) }));
 	}
 	function tick(): boolean {
 		if (timer.mode?.kind !== 'duration') return false;
@@ -51,9 +44,8 @@ export function createPlayerSleepTimer(pause: () => void, canStart: () => boolea
 			if (!canStart()) return;
 			timer.start(mode);
 			const receipt = stopTicking();
-			announcement = message;
 			if (mode.kind === 'duration') interval = setInterval(() => { if (receipt === generation) tick(); }, 500);
-			publish();
+			publish(message);
 		},
 		cancel(): void {
 			stopTicking();
@@ -61,15 +53,11 @@ export function createPlayerSleepTimer(pause: () => void, canStart: () => boolea
 			state.set(off);
 		},
 		tick,
-		observeEnd(): boolean {
+		observeEnd(natural: boolean): boolean {
 			if (timer.mode?.kind === 'duration') return tick();
+			if (!natural) return false;
 			if (timer.trackEnded()) return true;
-			const progress = timer.progress;
-			if (progress?.kind === 'stop-after-tracks') {
-				const n = progress.remainingTracks;
-				announcement = `Sleep after ${n} track${n === 1 ? '' : 's'}`;
-				publish();
-			}
+			publish();
 			return false;
 		}
 	};

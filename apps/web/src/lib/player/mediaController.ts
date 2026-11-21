@@ -9,7 +9,7 @@ import { createPendingShareSeek } from './pendingShareSeek.js';
 import { restartIsAvailable } from './restartAvailability.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
-export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
+export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error';
 
 type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
@@ -419,17 +419,15 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			queue.isCurrent(revision);
 		const ownsOrigin = () => ownsEnd() && matchesOrigin() && ownsEnd();
 		const base = queue.snapshot;
-		const validEnd = audio.ended && audio.error === null;
-		const playing = attachment.playing;
-		if (!validEnd || !playing || !ownsOrigin()) return;
-		attachment.playing = false;
+		if (!audio.ended || audio.error !== null || !attachment.playing || !ownsOrigin()) return;
+		const natural = !attachment.soughtToEnd;
+		attachment.playing = attachment.soughtToEnd = false;
 		generation = ++endGeneration;
 		announce('');
 		if (!ownsOrigin()) return;
-		// Only this current, consumed native completion can advance the timer.
 		const result = naturalEndPolicy(base, {
 			repeat: get(repeat), radioActive: false, continueRadio: false,
-			sleepComplete: sleepTimer.observeEnd(), playing, validEnd
+			sleepComplete: sleepTimer.observeEnd(natural), playing: true, validEnd: true
 		});
 		if (result.action !== 'play' || !ownsOrigin()) return;
 		const track = currentTrack(result.queue);
@@ -510,7 +508,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (previous) pendingShare.clear();
 			attachmentVersion += 1;
 			// Node identity is not attachment identity, even for the same source.
-			const receipt = { audio, playing: false, listeners: new AbortController() };
+			const receipt = { audio, playing: false, soughtToEnd: false, listeners: new AbortController() };
 			current = receipt;
 			previous?.listeners.abort();
 			if (previous) invalidatePlay();
@@ -536,6 +534,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 							}
 							return;
 						case 'emptied':
+							receipt.soughtToEnd = false;
 							// A native recovery can clear a resource error; we never initiate a reload.
 							if (get(playbackStatus) === 'error') readPlayback(audio, matches, 'starting');
 							return;
@@ -547,9 +546,13 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 							if (audio.error === null) return;
 							break;
 						case 'ended': return handleEnded(receipt, source, matches);
-						case 'seeking':
+						case 'seeking': {
+							const { currentTime, duration } = audio;
+							if (!matches(intent)) return;
+							receipt.soughtToEnd = Number.isFinite(duration) && duration > 0 && currentTime >= duration;
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
 							return observeSeeking(audio, () => matches(intent));
+						}
 						case 'loadedmetadata':
 						case 'durationchange':
 							retryShare(audio, shareRevision);
