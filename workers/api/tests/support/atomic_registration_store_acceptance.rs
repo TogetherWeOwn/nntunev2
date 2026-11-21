@@ -741,6 +741,59 @@ async fn await_lock_wait(observer: &Client, blocked: i32, blocker: i32) {
     panic!("backend {blocked} never blocked on backend {blocker}");
 }
 
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_concurrent_expiry_observers_write_one_audit() {
+    const OBSERVE: &str = include_str!("../../src/observe_invite_expiry.sql");
+    run_test(async {
+        let observer = connect().await;
+        let mut first = connect().await;
+        let second = connect().await;
+        let first_pid = backend_pid(&first).await;
+        let second_pid = backend_pid(&second).await;
+        let key = format!("expiry-fixture-{:016x}", rand::random::<u64>());
+        let id: i64 = observer
+            .query_one(
+                "INSERT INTO invite_codes (code_hash, created_at, expires_at) VALUES ($1, 1, 2) RETURNING id",
+                &[&key],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let tx = first.transaction().await.unwrap();
+        assert_eq!(tx.query(OBSERVE, &[&id]).await.unwrap().len(), 1);
+        let binds: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&id];
+        let (loser, ()) = futures_util::future::join(second.query(OBSERVE, &binds), async {
+            await_lock_wait(&observer, second_pid, first_pid).await;
+            tx.commit().await.unwrap();
+        })
+        .await;
+        assert!(loser.unwrap().is_empty());
+        let audit_count: i64 = observer
+            .query_one(
+                "SELECT count(*) FROM audit_log WHERE action = 'invite.expired'
+                 AND details->'invite_id' = to_jsonb($1::bigint)",
+                &[&id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(audit_count, 1);
+        observer
+            .execute(
+                "DELETE FROM audit_log WHERE action = 'invite.expired'
+                 AND details->'invite_id' = to_jsonb($1::bigint)",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        observer
+            .execute("DELETE FROM invite_codes WHERE id = $1", &[&id])
+            .await
+            .unwrap();
+    });
+}
+
 struct BlockedEnrollment {
     fixture: Fixture,
     unrelated: Fixture,
