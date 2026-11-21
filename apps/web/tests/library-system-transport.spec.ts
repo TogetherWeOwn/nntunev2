@@ -130,6 +130,35 @@ test('system Previous and Next navigate the persistent queue without autoplay', 
 	await expect(native).toHaveCount(0);
 });
 
+test('system Next resolves a bulk-added source and keeps the live decoder for an unavailable slot', async ({ page }) => {
+	const second = { ...coral, id: 'system-second', title: 'System Second', streamUrl: '/api/demo/audio?track=second-signal' };
+	const unavailable = { ...coral, id: 'system-unavailable', title: 'System Unavailable', streamUrl: '' };
+	await openWithSystemControls(page, [coral, second, unavailable]);
+	await page.getByRole('button', { name: 'Add displayed tracks to queue', exact: true }).click();
+	await expect.poll(() => page.getByTestId('queue-item').evaluateAll(
+		(rows) => rows.map((row) => row.getAttribute('data-track-id'))
+	)).toEqual([coral.id, second.id, unavailable.id]);
+	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).click();
+	await expect(page).toHaveURL(/\/home$/);
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+
+	const native = page.getByTestId('audio-player');
+	await systemAction(page, 'nexttrack');
+	await expect(native).toHaveAttribute('src', second.streamUrl);
+	await expect(native).toHaveJSProperty('paused', true);
+	const title = () => page.evaluate(() => navigator.mediaSession.metadata?.title);
+	await expect.poll(title).toBe(second.title);
+
+	const secondAudio = (await native.elementHandle())!;
+	await systemAction(page, 'nexttrack');
+	expect(await secondAudio.evaluate((el) => el.isConnected && (el as HTMLAudioElement).paused)).toBe(true);
+	expect(await title()).toBe(second.title);
+	await systemAction(page, 'previoustrack');
+	await expect(native).toHaveAttribute('src', coral.streamUrl);
+	await expect(native).toHaveJSProperty('paused', true);
+	await expect.poll(title).toBe(coral.title);
+});
+
 for (const path of ['/pricing', '/demo/player']) {
 	test(`navigation to ${path} retires the app's system controls`, async ({ page }) => {
 		await openWithSystemControls(page);
