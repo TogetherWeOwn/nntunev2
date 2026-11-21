@@ -36,24 +36,24 @@ test('speed follows the current decoder and restores across source change and re
 	await expect.poll(() => stored(page)).toBe('1.3');
 	await enqueue(page, 1);
 	await old.evaluate((element) => {
-		(element as HTMLAudioElement).playbackRate = 1.4;
+		(element as HTMLAudioElement).playbackRate = 0.25;
 		document.querySelector<HTMLButtonElement>('[data-testid="player-next"]')!.click(); // Before the queued ratechange.
 	});
 	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
 	await expect(audio(page)).toHaveAttribute('src', tracks[1]!.streamUrl);
 	await expect(page.locator('audio')).toHaveCount(1);
 	await expect(audio(page)).toHaveJSProperty('controls', true);
-	await expect(audio(page)).toHaveJSProperty('playbackRate', 1.4);
+	await expect(audio(page)).toHaveJSProperty('playbackRate', 0.25);
 	await old.evaluate((element) => {
 		(element as HTMLAudioElement).playbackRate = 2;
 		element.dispatchEvent(new Event('ratechange'));
 	});
-	await expect(speed(page)).toHaveValue('1.4');
-	expect(await stored(page)).toBe('1.4');
+	await expect(speed(page)).toHaveValue('0.25');
+	expect(await stored(page)).toBe('0.5');
 	await page.reload();
 	await enqueue(page, 0);
-	await expect(speed(page)).toHaveValue('1.4');
-	await expect(audio(page)).toHaveJSProperty('playbackRate', 1.4);
+	await expect(speed(page)).toHaveValue('0.5');
+	await expect(audio(page)).toHaveJSProperty('playbackRate', 0.5);
 });
 
 test('a demo restore and its ratechange leave a newer Library choice intact', async ({ page, context }) => {

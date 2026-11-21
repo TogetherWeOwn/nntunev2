@@ -51,7 +51,6 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let attachmentVersion = 0;
 	let endGeneration = 0;
-	let endRate: (() => number | null) | undefined;
 	let playIntent = 0;
 	let pendingPlay: { result: Promise<PlayOutcome>; finish: (outcome: PlayOutcome) => void } | undefined;
 	const playbackStatus = writable<PlaybackStatus>('unavailable');
@@ -482,10 +481,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		// A keyed source change retires exactly one node and admits exactly one replacement.
 		// Resetting again (including auth reset before mount) cannot inherit this end.
 		if (attachmentVersion !== version + Number(replacing)) return;
-		const inheritedRate = () => ownsEnd() && attachmentVersion === version + 2 ? playbackRate : null;
-		if (replacing) endRate = inheritedRate;
 		await flush();
-		if (endRate === inheritedRate) endRate = undefined;
 		const replay = current;
 		const isCurrent = () => ownsEnd() && current === replay &&
 			attachmentVersion === version + (replacing ? 2 : 0);
@@ -624,7 +620,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			}
 			lastJumpTarget = undefined;
 			listenForNativeEvents();
-			speed.attach(endRate);
+			speed.attach();
 			const target = transportTarget();
 			if (target?.attachment === receipt) {
 				sound.connect(audio, target.matches, receipt.listeners.signal);

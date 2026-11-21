@@ -1,14 +1,14 @@
 import { get, writable } from 'svelte/store';
 import { clampPlaybackSpeed, createPlaybackSpeed, type PlaybackSpeedDeps } from './playbackSpeed.js';
 
-type RatePort = { playbackRate: number };
-type RateTarget = { audio: RatePort; matches: () => boolean };
+type RateTarget = { audio: { playbackRate: number }; matches: () => boolean };
 const unavailable: { rate: number | null; feedback: string } = { rate: null, feedback: '' };
 
 export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 	const state = writable(unavailable);
 	let preference: ReturnType<typeof createPlaybackSpeed> | undefined;
-	let writePort: RatePort | undefined;
+	let writePort: RateTarget['audio'] | undefined;
+	let replacementRate: (() => number | null) | undefined;
 
 	function read({ audio, matches }: RateTarget): number | null {
 		try {
@@ -41,8 +41,7 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 		const rate = observed === undefined ? read(current) : observed;
 		if (!current.matches()) return;
 		const feedback = rate === intended ? '' : rate === null
-			? `Could not verify speed ${intended}x.`
-			: `Speed ${intended}x not applied — still ${rate}x`;
+			? `Could not verify speed ${intended}x.` : `Speed ${intended}x not applied — still ${rate}x`;
 		state.set({ rate, feedback });
 	}
 
@@ -52,13 +51,16 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 			preference = createPlaybackSpeed({ audio: () => writePort, storage });
 			write();
 		},
-		attach(inherit?: () => number | null): void {
+		handoff(inherit: () => number | null): void { replacementRate = inherit; },
+		attach(): void {
+			const inherit = replacementRate;
+			replacementRate = undefined;
 			const current = target();
 			state.set(unavailable);
 			if (current) write(undefined, current, inherit?.());
 		},
 		reapply: (current: RateTarget, inherited?: number) => write(undefined, current, inherited),
-		retire: () => state.set(unavailable),
+		retire: () => { replacementRate = undefined; state.set(unavailable); },
 		set(rate: number): number | null {
 			if (preference && !writePort) write(rate);
 			return get(state).rate;
