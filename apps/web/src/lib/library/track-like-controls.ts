@@ -1,9 +1,13 @@
 import { SvelteSet } from 'svelte/reactivity';
 import { setTrackLike } from './likes.js';
+import type { LibraryRefreshUpdate } from './refresh.js';
 
 export interface TrackLikeOwner {
-	/** The host must bind requests to this ownership scope, not just ambient cookies. */
 	client: Parameters<typeof setTrackLike>[0];
+	/** The host supplies the server-verified binding for this authorization epoch. */
+	readonly binding: string;
+	/** Latest listing publication for this owner only. Return the published object, not a copy. */
+	readiness: () => LibraryRefreshUpdate | undefined;
 	/** Undefined until the track and its confirmed Like state are known in this scope. */
 	liked: (id: string) => boolean | undefined;
 	confirm: (requestId: string, confirmedId: string, liked: boolean) => void;
@@ -27,8 +31,12 @@ export function createTrackLikeControls(
 
 	return (id) => {
 		const owner = currentOwner();
-		const liked = owner?.liked(id);
-		if (!owner || liked === undefined) return;
+		const receipt = owner?.readiness();
+		const run = receipt?.runIfCurrent;
+		if (!owner || !receipt || !run || !receipt.authoritative || receipt.authBoundary || !receipt.isCurrent()) return;
+		const binding = owner.binding;
+		const liked = owner.liked(id);
+		if (liked === undefined) return;
 		let pending = pendingByOwner.get(owner);
 		if (!pending) {
 			pending = new SvelteSet();
@@ -39,19 +47,23 @@ export function createTrackLikeControls(
 			liked,
 			pending: inFlight.has(id),
 			async toggle() {
-				// A rendered control can outlive the state or owner that provided it.
-				const stillCurrent = () => currentOwner() === owner && owner.liked(id) === liked;
+				const stillCurrent = () => currentOwner() === owner && owner.readiness() === receipt &&
+					receipt.isCurrent() && owner.liked(id) === liked;
 				if (!stillCurrent() || inFlight.has(id)) return;
 				inFlight.add(id);
 				try {
-					let confirmedId: string;
-					try {
-						confirmedId = await setTrackLike(owner.client, id, !liked);
-					} catch {
-						if (stillCurrent()) owner.failed(id);
-						return;
-					}
-					if (stillCurrent()) owner.confirm(id, confirmedId, !liked);
+					const started = await run(() => {
+						if (!stillCurrent()) return;
+						// Return a container, not the network promise: release the auth fence before waiting.
+						return { result: setTrackLike(owner.client, id, !liked, binding).catch(() => undefined) };
+					}).catch(() => undefined);
+					if (!started) return;
+					const confirmedId = await started.result;
+					await run(() => {
+						if (!stillCurrent()) return;
+						if (confirmedId === undefined) owner.failed(id);
+						else owner.confirm(id, confirmedId, !liked);
+					}).catch(() => undefined);
 				} finally {
 					inFlight.delete(id);
 				}

@@ -1,0 +1,44 @@
+type SeekMedia = Pick<HTMLMediaElement, 'currentTime' | 'duration' | 'error' | 'seekable' | 'seeking'>;
+
+const emptyObservation = { position: 0, duration: 0, enabled: false, seeking: false };
+export const emptySeek = { ...emptyObservation, elapsed: 0, attachment: 0, feedback: '', feedbackVersion: 0 };
+export type AbsoluteSeekState = typeof emptySeek;
+
+function seekable(media: SeekMedia, duration: number, target?: number): boolean {
+	const ranges = media.seekable;
+	for (let i = 0; i < ranges.length; i++) {
+		const start = Math.max(0, ranges.start(i)), end = Math.min(duration, ranges.end(i));
+		if (end > start && (target === undefined || (target >= start && target <= end))) return true;
+	}
+	return false;
+}
+
+export function readAbsoluteSeek(media: SeekMedia): typeof emptyObservation {
+	try {
+		const { currentTime, duration, error } = media;
+		if (error) return emptyObservation;
+		const known = Number.isFinite(duration) && duration > 0;
+		const position = Number.isFinite(currentTime) ? Math.max(0, currentTime) : 0;
+		return { position: known ? Math.min(position, duration) : position, duration: known ? duration : 0,
+			seeking: known && media.seeking === true, enabled: known && Number.isFinite(currentTime) && seekable(media, duration) };
+	} catch {
+		return emptyObservation;
+	}
+}
+
+export function writeAbsoluteSeek(media: SeekMedia, seconds: number, matches: () => boolean): string {
+	try {
+		const { duration, currentTime, error } = media;
+		if (error || !Number.isFinite(duration) || duration <= 0 || !Number.isFinite(currentTime)) {
+			return 'Seeking is unavailable for this track.';
+		}
+		const target = Math.min(duration, Math.max(0, seconds));
+		if (!seekable(media, duration, target)) return 'That position is not seekable yet.';
+		if (!matches() || target === currentTime) return '';
+		media.currentTime = target;
+		if (!matches()) return '';
+		const observed = media.currentTime;
+		if (Number.isFinite(observed) && Math.abs(observed - target) <= 0.05) return '';
+	} catch { /* A native refusal cannot count as a seek. */ }
+	return 'The player did not accept that seek.';
+}

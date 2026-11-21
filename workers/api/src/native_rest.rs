@@ -454,6 +454,7 @@ pub(crate) fn like_track_target(path: &str) -> Option<&str> {
         .filter(|target| !target.is_empty() && !target.contains('/'))
 }
 
+pub(crate) const MEMBER_INVITES_PATH: &str = "/v1/me/invites";
 pub(crate) const ADMIN_INVITE_WINDOWS_PATH: &str = "/v1/admin/invite-windows";
 
 pub(crate) fn admin_invite_window_close_id(path: &str) -> Option<i64> {
@@ -516,6 +517,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                     | "/v1/me/likes/session"
                     | "/v1/me/taste"
                     | "/v1/me/history"
+                    | MEMBER_INVITES_PATH
             ) {
                 return SessionOnly;
             }
@@ -603,6 +605,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/billing/checkout"
                 || path == "/v1/admin/ingest"
                 || path == "/v1/me/likes/import"
+                || path == MEMBER_INVITES_PATH
             {
                 return SessionOnly;
             }

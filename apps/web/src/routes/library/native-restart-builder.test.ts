@@ -1,7 +1,7 @@
 import { expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import { get } from 'svelte/store';
-import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
+import { addTrack, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle, shortTitle } from '#lib/library/order.js';
 import { onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js';
@@ -21,8 +21,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clipboardWriter', 'copyTrackLink',
-		'applyShareLink', 'selectQueuedTrack', 'removeQueuedTrack',
-		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
+		'applyShareLink', 'selectQueuedTrack', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'resetShareAtAuthBoundary', 'onRepeatChange', 'playQueuedTrack'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
@@ -66,7 +65,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		get isConnected() { return this.connected; }
 		set isConnected(value: boolean) { this.connected = value; }
 		ended = false; paused = true; error: Pick<MediaError, 'code' | 'message'> | null = null;
-		volume = 0.6; muted = false; playbackRate = 1.25;
+		volume = 1; muted = false; playbackRate = 1.25;
 		play = () => Promise.resolve();
 		pause() { this.paused = true; }
 	}
@@ -81,8 +80,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	let onInvalidateBrowseCopy = () => {};
 	const routeCleanup: string[] = [];
 	const bindings = {
-		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
-		selectQueueIndex: selectTrack, removeTrack,
+		addTrack, clearUpcoming, createQueue, keepCurrentAndUpcoming,
+		selectQueueIndex: selectTrack,
 		resolveStreamUrl, displayArtist, displayTitle, shortTitle, resolveShareTarget, get,
 		buildShareQuery, queueCurrentTrack: currentTrack, navigator: { clipboard },
 		$state: { raw: <T>(value: T) => value },
@@ -98,7 +97,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			player.browseCopy.invalidate = () => { onInvalidateBrowseCopy(); return invalidate(); };
 			const clear = player.media.clearShareSeek;
 			player.media.clearShareSeek = () => { onClear(); clear(); };
-			return player;
+			return Object.assign(player, { currentFavorite: { bind: () => () => {} } });
 		},
 		tick, window: { location }, element, track, capture
 	};
@@ -137,8 +136,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 				if (queueChanged) throw new Error('Expected a same-object refresh');
 			}),
 			readCopy: () => ({ browse: player.browseCopy.feedback, queue: queueShareOutcome }),
-			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
-			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
+			select: selectQueuedTrack, remove: player.removeQueuedTrack, playQueued: playQueuedTrack,
+			move: player.moveQueuedTrack, clear: player.clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
 			seeking: (target = element) => capture('seeking')(target), replaceQueue,
 			subscribe: queueController.subscribe, attach: media.attach, currentAudio: () => media.audio,
@@ -1582,11 +1581,14 @@ test.each(['plays', 'refuses', 'pauses before pause dispatch'] as const)('queue 
 	const fixture = restartFixture();
 	const { page, element, track, remount, writes } = fixture;
 	page.replaceQueue(selectTrack(createQueue([pine, { ...track, artist: '' }]), 1));
+	// Native properties change immediately, before the queued volumechange event.
+	element.volume = 0.6;
 	element.muted = true;
 	signalNaturalEnd(fixture);
 	const continuation = page.end('queue');
 	const target = remount(pine.streamUrl);
-	target.volume = 1;
+	// Volume and mute are already restored by attachment, before native play.
+	expect(target).toMatchObject({ volume: 0.6, muted: true });
 	target.playbackRate = 1;
 	target.play = vi.fn(() => new Promise<void>((resolve, reject) => {
 		if (outcome !== 'refuses') target.paused = false;

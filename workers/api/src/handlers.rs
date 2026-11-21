@@ -562,6 +562,41 @@ pub enum AdminInviteRevokeOutcome {
     ActorNotAdmin,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum MemberInviteIssueOutcome {
+    Issued { id: i64, expires_at: i64 },
+    Ineligible,
+    WindowClosed,
+    QuotaExhausted,
+    AccountDeleting,
+}
+
+/// Informational only: eligibility excludes the window and quota gates.
+#[derive(Debug, serde::Serialize)]
+pub struct MemberInviteSummary {
+    pub paid_seconds: i64,
+    pub required_paid_seconds: i64,
+    pub entitled: bool,
+    pub eligible: bool,
+    pub per_window_limit: i64,
+    pub open_window: Option<MemberInviteOpenWindow>,
+    pub next_window: Option<MemberInviteWindowBounds>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MemberInviteWindowBounds {
+    pub starts_at: i64,
+    pub ends_at: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MemberInviteOpenWindow {
+    #[serde(flatten)]
+    pub bounds: MemberInviteWindowBounds,
+    pub used: i64,
+    pub remaining: i64,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct InviteWindow {
     pub id: i64,
@@ -1539,6 +1574,21 @@ pub trait Store {
     ) -> impl Future<Output = Result<AdminInviteIssueOutcome, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Read the issuer's summary; `None` means the issuer is absent or deleting.
+    fn member_invite_summary(
+        &self,
+        _issuer: &str,
+    ) -> impl Future<Output = Result<Option<MemberInviteSummary>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn member_issue_invite(
+        &self,
+        _issuer: &str,
+        _code_hash: &str,
+        _source_ip: &str,
+    ) -> impl Future<Output = Result<MemberInviteIssueOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Every invite row, newest first, for the admin list. `issuer`
     /// filters by exact `issued_by`; `status` filters by the derived
     /// [`InviteRecord::status`] at `now` (`active`, `expired`,
@@ -2202,10 +2252,32 @@ where
     }
 }
 
+async fn track_like_authenticate<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected_session_binding: Option<&str>,
+) -> Result<SessionClaims, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let (claims, _) = preference_authenticate(ctx, req, true).await?;
+    if expected_session_binding != Some(session_binding(&claims).as_str()) {
+        return Err(json_response(
+            412,
+            serde_json::json!({"error": "session binding mismatch"}),
+        ));
+    }
+    Ok(claims)
+}
+
 async fn me_like_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
     target: &str,
+    expected_session_binding: Option<&str>,
 ) -> Response
 where
     S: Store + SingleUseStore,
@@ -2216,8 +2288,8 @@ where
     use crate::target_identity::{valid_target_id, TargetKind};
     use crate::taste_signal::TasteSignal;
 
-    let (claims, _) = match preference_authenticate(ctx, req, true).await {
-        Ok(pair) => pair,
+    let claims = match track_like_authenticate(ctx, req, expected_session_binding).await {
+        Ok(claims) => claims,
         Err(resp) => return resp,
     };
     if !valid_target_id(target) {
@@ -2256,6 +2328,7 @@ async fn me_unlike_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
     target: &str,
+    expected_session_binding: Option<&str>,
 ) -> Response
 where
     S: Store + SingleUseStore,
@@ -2265,8 +2338,8 @@ where
 {
     use crate::target_identity::{valid_target_id, TargetKind};
 
-    let (claims, _) = match preference_authenticate(ctx, req, true).await {
-        Ok(pair) => pair,
+    let claims = match track_like_authenticate(ctx, req, expected_session_binding).await {
+        Ok(claims) => claims,
         Err(resp) => return resp,
     };
     if !valid_target_id(target) {
@@ -6116,6 +6189,69 @@ where
     )
 }
 
+/// Browser-session read only; do not use invite lookups that observe expiry.
+async fn member_invite_summary(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+) -> Response {
+    let mut response = if req.authorization.is_some() {
+        not_found()
+    } else {
+        match ctx.authenticate(req, false).await {
+            Ok((claims, _)) => match ctx.store.member_invite_summary(&claims.user_id).await {
+                Ok(Some(summary)) => json_response(200, serde_json::json!(summary)),
+                Ok(None) => account_deleting_response(),
+                Err(_) => internal(),
+            },
+            Err(response) => response,
+        }
+    };
+    response
+        .extra_headers
+        .push(("cache-control".into(), "private, no-store".into()));
+    response
+}
+
+/// Bodyless browser issuance for the authenticated principal.
+async fn member_invite_issue(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+) -> Response {
+    use {crate::api_error::ApiError, MemberInviteIssueOutcome as Outcome};
+    if req.authorization.is_some() {
+        return not_found();
+    }
+    let (claims, _) = match ctx.authenticate(req, true).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    if !req.body.is_empty() {
+        return validation_failed("member invite issuance takes no request body");
+    }
+    let Ok(code) = auth::generate_invite_code() else {
+        return unavailable();
+    };
+    let hash = auth::hash_invite_code(&code);
+    let issued = ctx
+        .store
+        .member_issue_invite(&claims.user_id, &hash, &ctx.source_ip)
+        .await;
+    let error = match issued {
+        Ok(Outcome::Issued { id, expires_at }) => {
+            let body = serde_json::json!({"id": id, "expires_at": expires_at, "code": code});
+            let mut response = json_response(201, body);
+            response.extra_headers = vec![("cache-control".into(), "private, no-store".into())];
+            return response;
+        }
+        Ok(Outcome::Ineligible) => ApiError::forbidden("paid membership eligibility not met"),
+        Ok(Outcome::WindowClosed) => ApiError::by_code("conflict", "no invite window is open"),
+        Ok(Outcome::QuotaExhausted) => ApiError::by_code("conflict", "invite quota exhausted"),
+        Ok(Outcome::AccountDeleting) => return account_deleting_response(),
+        Err(_) => return internal(),
+    };
+    json_response(error.status, serde_json::json!(error))
+}
+
 /// `GET /v1/admin/invites` — every invite (newest first, capped),
 /// optionally narrowed by `/status/{status}` or `/issuer/{user_id}`.
 /// Filters ride path segments: `Request` carries no query string and
@@ -6878,7 +7014,7 @@ where
     let exact = ctx.store.webhook_ack_control();
     #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
     let exact = false;
-    if exact && subscription.id != subscription_id {
+    if subscription.id != subscription_id {
         return Err(());
     }
     let input = ctx
@@ -7974,11 +8110,30 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    // Keep the largest route's state out of every caller's future.
-    Box::pin(dispatch_request(ctx, req)).await
+    handle_with_session_binding(ctx, req, None).await
 }
 
-async fn dispatch_request<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+// Worker entry supplies the browser's request header alongside the bounded body.
+pub(crate) async fn handle_with_session_binding<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected_session_binding: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // Keep the largest route's state out of every caller's future.
+    Box::pin(dispatch_request(ctx, req, expected_session_binding)).await
+}
+
+async fn dispatch_request<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected_session_binding: Option<&str>,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -8040,6 +8195,8 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
+        ("GET", crate::native_rest::MEMBER_INVITES_PATH) => member_invite_summary(ctx, req).await,
+        ("POST", crate::native_rest::MEMBER_INVITES_PATH) => member_invite_issue(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
         ("GET", "/v1/me/likes/session") => me_likes_session(ctx, req).await,
         ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
@@ -8148,11 +8305,11 @@ where
         // native paths); unserved shapes stay 404 on preflight too.
         ("OPTIONS", path) if options_preflight_served(path) => preflight_response(),
         ("PUT", path) => match crate::native_rest::like_track_target(path) {
-            Some(target) => me_like_track(ctx, req, target).await,
+            Some(target) => me_like_track(ctx, req, target, expected_session_binding).await,
             None => not_found(),
         },
         ("DELETE", path) => match crate::native_rest::like_track_target(path) {
-            Some(target) => me_unlike_track(ctx, req, target).await,
+            Some(target) => me_unlike_track(ctx, req, target, expected_session_binding).await,
             None => not_found(),
         },
         _ => not_found(),
@@ -8285,6 +8442,8 @@ mod tests {
         /// mailbox (mirrors the migration 0018 table).
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
+        member_invite_calls: RefCell<Vec<(String, String)>>,
+        member_invite_summary_calls: RefCell<Vec<String>>,
         invite_window_list: RefCell<Option<Vec<InviteWindow>>>,
         invite_window_outcomes: RefCell<std::collections::VecDeque<InviteWindowOutcome>>,
         invite_window_calls: RefCell<Vec<serde_json::Value>>,
@@ -8952,6 +9111,47 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn member_invite_summary(
+            &self,
+            issuer: &str,
+        ) -> Result<Option<MemberInviteSummary>, StoreError> {
+            self.member_invite_summary_calls
+                .borrow_mut()
+                .push(issuer.into());
+            if self.deleting_users.borrow().contains(issuer) {
+                return Ok(None);
+            }
+            let bounds = |starts_at, ends_at| MemberInviteWindowBounds { starts_at, ends_at };
+            Ok(Some(MemberInviteSummary {
+                paid_seconds: 86_400,
+                required_paid_seconds: 7_776_000,
+                entitled: true,
+                eligible: false,
+                per_window_limit: 2,
+                open_window: Some(MemberInviteOpenWindow {
+                    bounds: bounds(1, 2),
+                    used: 1,
+                    remaining: 1,
+                }),
+                next_window: Some(bounds(3, 4)),
+            }))
+        }
+
+        async fn member_issue_invite(
+            &self,
+            issuer: &str,
+            hash: &str,
+            _: &str,
+        ) -> Result<MemberInviteIssueOutcome, StoreError> {
+            self.member_invite_calls
+                .borrow_mut()
+                .push((issuer.into(), hash.into()));
+            Ok(MemberInviteIssueOutcome::Issued {
+                id: 1,
+                expires_at: 2,
+            })
+        }
+
         async fn admin_list_invite_windows(&self) -> Result<Vec<InviteWindow>, StoreError> {
             self.invite_window_calls
                 .borrow_mut()
@@ -10767,10 +10967,11 @@ mod tests {
                     .borrow()
                     .contains_key(&(user_id.to_string(), sub.clone()));
                 let target = if own_current || own_shadow {
-                    // Explicit stale ignores the numeric suppression predicate.
+                    // Explicit stale needs only the owned-target identity.
                     Target::Owned {
                         predicate_stale: false,
                         other_live_holder: false,
+                        equal_end_provenance_changed: false,
                     }
                 } else {
                     Target::Absent
@@ -13077,6 +13278,7 @@ mod tests {
             amount_cents: 1_000,
             currency: "usd".to_string(),
             paid_at_unix: BILLING_NOW + 60,
+            covered_periods: vec![(BILLING_NOW, end)],
         };
         let fresh_grace = BILLING_NOW + BILLING_PERIOD + 7 * 24 * 3_600;
         let fresh = crate::billing_reconcile::ReconcileOutcome {
@@ -13360,6 +13562,7 @@ mod tests {
                     amount_cents: 1_000,
                     currency: "usd".into(),
                     paid_at_unix: 1,
+                    covered_periods: vec![(0, 100)],
                 });
             block_on(h.store.store_reconcile_outcome("u1", &owner)).unwrap();
             if shadow_only {
@@ -14072,6 +14275,7 @@ mod tests {
                 amount_cents: 1_000,
                 currency: "usd".to_string(),
                 paid_at_unix: BILLING_NOW,
+                covered_periods: vec![(BILLING_NOW - BILLING_PERIOD, e2)],
             },
         );
         // S reads stored E2/active with remote money E1 < E2: stale.
@@ -15832,7 +16036,12 @@ mod tests {
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
         let live = live_for(&h, "u1").expect("live row stored");
         assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
-        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history["in_test_1"].covered_periods,
+            vec![(BILLING_NOW, BILLING_NOW + BILLING_PERIOD)]
+        );
     }
 
     fn cookie_of(resp: &Response) -> String {
@@ -16358,7 +16567,16 @@ mod tests {
             stripe_signature: None,
             body: br#"{"user_id":"bob"}"#.to_vec(),
         };
-        let call = |req: &Request, target: &str| block_on(me_like_track(&h.ctx(), req, target));
+        let alice_binding = current_likes_binding(&h, &alice);
+        let bob_binding = current_likes_binding(&h, &bob);
+        let call = |req: &Request, target: &str| {
+            let binding = if req.cookie.as_deref() == Some(bob.as_str()) {
+                &bob_binding
+            } else {
+                &alice_binding
+            };
+            block_on(me_like_track(&h.ctx(), req, target, Some(binding)))
+        };
         let first = call(&req, "Job_A");
         assert_eq!(first.status, 200);
         assert_eq!(
@@ -16373,7 +16591,7 @@ mod tests {
         let mut later = h.ctx();
         later.now += 100;
         assert_eq!(
-            block_on(me_like_track(&later, &req, "Job_A")).body,
+            block_on(me_like_track(&later, &req, "Job_A", Some(&alice_binding))).body,
             first.body
         );
         for (signal, until) in [(Hide, None), (Snooze, Some(NOW - 1))] {
@@ -16382,7 +16600,7 @@ mod tests {
                     .taste_upsert("alice", Track, "Job_A", signal, until, NOW - 2),
             )
             .unwrap();
-            let result = block_on(me_like_track(&later, &req, "Job_A"));
+            let result = block_on(me_like_track(&later, &req, "Job_A", Some(&alice_binding)));
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&result.body).unwrap()["liked_at"],
                 NOW + 100
@@ -16459,7 +16677,10 @@ mod tests {
         req.cookie = Some(alice);
         let mut expired = h.ctx();
         expired.now += 365 * 24 * 60 * 60;
-        assert_eq!(block_on(me_like_track(&expired, &req, "Job_A")).status, 401);
+        assert_eq!(
+            block_on(me_like_track(&expired, &req, "Job_A", Some(&alice_binding))).status,
+            401
+        );
         *h.store.fail_catalogue_reads.borrow_mut() = true;
         assert_eq!(call(&req, "Job_A").body, unavailable().body);
         *h.store.fail_catalogue_reads.borrow_mut() = false;
@@ -16520,7 +16741,16 @@ mod tests {
             stripe_signature: None,
             body: br#"{"user_id":"bob"}"#.to_vec(),
         };
-        let call = |req: &Request, target: &str| block_on(me_unlike_track(&h.ctx(), req, target));
+        let alice_binding = current_likes_binding(&h, &alice);
+        let bob_binding = current_likes_binding(&h, &bob);
+        let call = |req: &Request, target: &str| {
+            let binding = if req.cookie.as_deref() == Some(bob.as_str()) {
+                &bob_binding
+            } else {
+                &alice_binding
+            };
+            block_on(me_unlike_track(&h.ctx(), req, target, Some(binding)))
+        };
         for (user, kind) in [("alice", Track), ("alice", Release), ("bob", Track)] {
             block_on(h.store.taste_upsert(user, kind, "Job_A", Love, None, NOW)).unwrap();
         }
@@ -16589,7 +16819,7 @@ mod tests {
                 (missing.status, missing.body.clone())
             );
         }
-        req.cookie = Some(bob);
+        req.cookie = Some(bob.clone());
         assert_eq!(call(&req, "Private").status, 200);
         assert_eq!(call(&req, "CaseJob").body, missing.body);
         req.cookie = Some(alice.clone());
@@ -16611,7 +16841,13 @@ mod tests {
         let mut expired = h.ctx();
         expired.now += 365 * 24 * 60 * 60;
         assert_eq!(
-            block_on(me_unlike_track(&expired, &req, "Job_A")).status,
+            block_on(me_unlike_track(
+                &expired,
+                &req,
+                "Job_A",
+                Some(&alice_binding)
+            ))
+            .status,
             401
         );
         block_on(
@@ -17876,6 +18112,66 @@ mod tests {
     }
 
     #[test]
+    fn dispatched_track_like_mutations_require_the_current_session_binding() {
+        let h = harness();
+        seed_user(&h, "alice", "alice@example.com");
+        seed_user(&h, "bob", "bob@example.com");
+        let original = magic_login(&h, "alice@example.com");
+        let stale = current_likes_binding(&h, &original);
+        let replacement = magic_login(&h, "alice@example.com");
+        let other_account = magic_login(&h, "bob@example.com");
+
+        // A matching binding reaches this fault; a refused one must not.
+        h.store
+            .preference_failure
+            .set(Some((PreferenceFailure::Member, "Job_A")));
+        let mut req = Request {
+            method: String::new(),
+            path: "/v1/me/likes/track/Job_A".into(),
+            cookie: None,
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let ctx = h.ctx();
+        let transport = |req: &Request, binding: Option<&str>| {
+            let headers = binding
+                .map(|value| HashMap::from([("x-nntune-session-binding".into(), value.into())]))
+                .unwrap_or_default();
+            block_on(crate::worker_entry::handle_with_transport_headers(
+                &ctx,
+                req.clone(),
+                &headers,
+            ))
+        };
+        for cookie in [replacement, other_account] {
+            let current = current_likes_binding(&h, &cookie);
+            let combined = format!("{current}, {stale}");
+            req.cookie = Some(cookie);
+            for method in ["PUT", "DELETE"] {
+                req.method = method.into();
+                for expected in [
+                    None,
+                    Some(""),
+                    Some(stale.as_str()),
+                    Some(combined.as_str()),
+                ] {
+                    let resp = transport(&req, expected);
+                    assert_eq!(
+                        (resp.status, resp.body.as_str()),
+                        (412, r#"{"error":"session binding mismatch"}"#)
+                    );
+                }
+                let matched = transport(&req, Some(&current));
+                assert_eq!(matched.status, 503);
+            }
+        }
+        assert!(h.store.taste_rows.borrow().is_empty());
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+    }
+
+    #[test]
     fn dispatched_track_like_is_session_only_and_owner_scoped() {
         use crate::native_rest::{scope_for_operation, RouteDecision};
         use serde_json::json;
@@ -17903,7 +18199,9 @@ mod tests {
             stripe_signature: None,
             body: Vec::new(),
         };
-        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let binding = current_likes_binding(&h, &alice);
+        let call =
+            |req: &Request| block_on(handle_with_session_binding(&h.ctx(), req, Some(&binding)));
         let assert_not_found = |resp: Response| {
             assert_eq!((resp.status, resp.body), (404, not_found().body));
         };
@@ -17916,14 +18214,19 @@ mod tests {
         );
         let mut later = h.ctx();
         later.now += 100;
-        let replay = block_on(handle(&later, &req));
+        let replay = block_on(handle_with_session_binding(&later, &req, Some(&binding)));
         assert_eq!((replay.status, replay.body), (200, first.body));
         let saved = h.store.taste_rows.borrow().clone();
         assert_eq!(saved.len(), 1);
         assert!(saved.contains_key(&("alice".into(), "track".into(), "Job_A".into())));
 
+        let bob_binding = current_likes_binding(&h, &bob);
         req.cookie = Some(bob);
-        assert_not_found(call(&req));
+        assert_not_found(block_on(handle_with_session_binding(
+            &h.ctx(),
+            &req,
+            Some(&bob_binding),
+        )));
         req.cookie = Some(alice.clone());
         for target in ["Job.A", "Private", "Absent"] {
             req.path = format!("/v1/me/likes/track/{target}");
@@ -17969,6 +18272,12 @@ mod tests {
             if origin == Some(ORIGIN) {
                 assert!(cors.contains(&("access-control-allow-origin", ORIGIN.into())));
                 assert!(cors.contains(&("access-control-allow-credentials", "true".into())));
+                assert!(cors.iter().any(|(name, headers)| {
+                    *name == "access-control-allow-headers"
+                        && headers
+                            .split(", ")
+                            .any(|header| header == SESSION_BINDING_HEADER)
+                }));
                 for method in ["PUT", "DELETE"] {
                     assert!(cors.iter().any(|(name, methods)| {
                         *name == "access-control-allow-methods"
@@ -18023,7 +18332,9 @@ mod tests {
             stripe_signature: None,
             body: Vec::new(),
         };
-        let call = |req: &Request| block_on(handle(&h.ctx(), req));
+        let binding = current_likes_binding(&h, &alice);
+        let call =
+            |req: &Request| block_on(handle_with_session_binding(&h.ctx(), req, Some(&binding)));
         let assert_not_found = |resp: Response| {
             assert_eq!((resp.status, resp.body), (404, not_found().body));
         };
@@ -20736,16 +21047,18 @@ mod tests {
             stripe_signature: None,
             body: Vec::new(),
         };
+        let headers = media_type
+            .map(|value| HashMap::from([("content-type".into(), value.into())]))
+            .unwrap_or_default();
         block_on(crate::worker_entry::dispatch_collected(
             crate::worker_entry::CollectedBody::Complete(body.as_bytes().to_vec()),
             request,
-            |collected_request| async move {
-                crate::worker_entry::handle_with_refresh_transport_guard(
+            |collected_request| {
+                crate::worker_entry::handle_with_transport_headers(
+                    &ctx,
                     collected_request,
-                    media_type,
-                    |guarded_request| async move { handle(&ctx, &guarded_request).await },
+                    &headers,
                 )
-                .await
             },
         ))
     }
@@ -20829,16 +21142,17 @@ mod tests {
         assert_eq!(legacy.status, 200);
         assert!(h.store.refresh_retries.borrow().is_empty());
         let source = strip_line_comments(include_str!("worker_entry.rs"));
-        let dispatch = source.split_once("pub async fn dispatch(").unwrap().1;
-        assert!(dispatch.contains("headers_map.get(\"content-type\")"));
-        let normalized = dispatch.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(normalized.contains(
-            "handle_with_refresh_transport_guard( collected_request, refresh_content_type.as_deref(),"
-        ));
-        let guard = dispatch
-            .find("handle_with_refresh_transport_guard")
+        let transport = source
+            .split_once("async fn handle_with_transport_headers<")
+            .unwrap()
+            .1;
+        assert!(transport.contains("headers.get(\"content-type\")"));
+        let guard = transport
+            .find("handlers::refresh_transport_rejection(")
             .unwrap();
-        let handle = dispatch.find("handlers::handle(&ctx").unwrap();
+        let handle = transport
+            .find("handlers::handle_with_session_binding(")
+            .unwrap();
         assert!(
             guard < handle,
             "runtime must reject downgrade before calling handlers"
@@ -23121,6 +23435,86 @@ mod tests {
                 event.action
             );
         }
+    }
+
+    #[test]
+    fn member_invite_summary_is_private_and_session_scoped() {
+        use crate::native_rest::{scope_for_operation, RouteDecision, MEMBER_INVITES_PATH as PATH};
+        let h = harness();
+        seed_user(&h, "member", "member@example.com");
+        let session = magic_login(&h, "member@example.com");
+        let audits = h.store.audits.borrow().len();
+        assert_eq!(scope_for_operation("GET", PATH), RouteDecision::SessionOnly);
+        let mut req = Request {
+            method: "GET".into(),
+            path: PATH.into(),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: br#"{"issuer":"other"}"#.to_vec(),
+        };
+        let call = |req: &Request| {
+            let response = block_on(handle(&h.ctx(), req));
+            assert!(response
+                .extra_headers
+                .contains(&("cache-control".into(), "private, no-store".into())));
+            response
+        };
+        assert_eq!(call(&req).status, 401);
+        req.authorization = Some("Bearer ntk_synthetic".into());
+        assert_eq!(call(&req).status, 404);
+        req.cookie = Some(session);
+        assert_eq!(call(&req).status, 404, "never fall back to the cookie");
+        assert!(h.store.member_invite_summary_calls.borrow().is_empty());
+        req.authorization = None;
+        let response = call(&req);
+        assert_eq!(response.status, 200);
+        assert!(response.set_cookie.is_none());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.body).unwrap(),
+            serde_json::json!({
+                "paid_seconds": 86_400, "required_paid_seconds": 7_776_000,
+                "entitled": true, "eligible": false, "per_window_limit": 2,
+                "open_window": {"starts_at": 1, "ends_at": 2, "used": 1, "remaining": 1},
+                "next_window": {"starts_at": 3, "ends_at": 4},
+            })
+        );
+        h.store.deleting_users.borrow_mut().insert("member".into());
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert_eq!(deleting.body, account_deleting_response().body);
+        assert_eq!(*h.store.member_invite_summary_calls.borrow(), ["member"; 2]);
+        assert!(h.store.member_invite_calls.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audits);
+    }
+
+    #[test]
+    fn member_invite_issue_requires_browser_identity() {
+        use crate::native_rest::MEMBER_INVITES_PATH as PATH;
+        let h = harness();
+        seed_user(&h, "member", "member@example.com");
+        let session = Some(magic_login(&h, "member@example.com"));
+        let origin = Some(ORIGIN);
+        let preflight = h.call_full("OPTIONS", PATH, None, None, origin);
+        assert_eq!(preflight.status, 204);
+        assert!(preflight.body.is_empty());
+        let call = |session, origin, body| h.call_full("POST", PATH, body, session, origin);
+        let bearer = Some("Bearer ntk_synthetic".into());
+        assert_eq!(h.call_bearer("POST", PATH, bearer).status, 404);
+        assert_eq!(call(None, origin, None).status, 401);
+        assert_eq!(call(session.clone(), None, None).status, 401);
+        let body = Some(r#"{"issuer":"other"}"#.into());
+        assert_eq!(call(session.clone(), origin, body).status, 422);
+        let response = call(session, origin, None);
+        assert_eq!(response.status, 201);
+        assert!(response
+            .extra_headers
+            .contains(&("cache-control".into(), "private, no-store".into())));
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let hash = auth::hash_invite_code(body["code"].as_str().unwrap());
+        let calls = h.store.member_invite_calls.borrow();
+        assert_eq!(*calls, [("member".to_owned(), hash)]);
     }
 
     #[test]

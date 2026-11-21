@@ -53,11 +53,13 @@ on:
 permissions:
   contents: read
 
-# No workflow-level concurrency here: it would hold the deploy group for
-# the whole run, now including up to ~40 min of post-deploy E2E, so queued
-# main pushes would be cancelled before ever deploying. The deploy jobs
-# serialize on their own job-level groups below and release them when the
-# deploy finishes; E2E serializes separately on the e2e-staging group.
+# Hold the main staging lock until post-deploy E2E finishes checking this
+# run's SHA. Queue pending pushes instead of replacing them during E2E.
+# Non-push runs use separate groups so they do not wait on staging deploys.
+concurrency:
+  group: ${{ github.event_name == 'push' && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}
+  cancel-in-progress: false
+  queue: max
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -96,11 +98,6 @@ jobs:
     name: staging-web
     needs: [gate]
     if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
-    # Job-level (not workflow-level) so the group releases when the deploy
-    # finishes instead of being held through the post-deploy E2E tail.
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Push-to-main staging record (see the header): no rules, no secrets.
@@ -151,13 +148,6 @@ jobs:
     name: staging-api
     needs: [gate]
     if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
-    # Own deploy group (never shared with staging-web): GitHub allows one
-    # running plus one pending job per group, so sharing would let a push's
-    # own lanes cancel each other and leave web and api at different SHAs.
-    # Queued main pushes still deploy in order instead of racing wrangler.
-    concurrency:
-      group: ${{ github.workflow }}-staging-api-${{ github.ref }}
-      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
@@ -431,6 +421,10 @@ jobs:
           wranglerVersion: ${{ env.WRANGLER_VERSION }}
           workingDirectory: workers/api
           command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
+          # Reuse the action's existing token and JSONL directory after deploy.
+          postCommands: >-
+            status=0; receipt=$(timeout -k 2s 30s python3 -I ../../.github/scripts/staging_api_identity.py 2>/dev/null) || status=$?;
+            [ "$status" -le 1 ] && printf '%s\n' "$receipt" > "$RUNNER_TEMP/staging-api-identity.json" || true
       # Always report the executed step outcomes, including safe config skips
       # and failures. A green job alone is not evidence of a deployed Worker.
       - name: Record API deployment outcome
@@ -476,6 +470,10 @@ jobs:
               echo "BUILD_SHA var: $source_sha"
             fi
             echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
+            printf '\n### staging-api provider identity\n'
+            if [ "$deployed" != true ] || [ -z "${RUNNER_TEMP:-}" ] || ! jq -cse 'select(length == 1) | .[0]' "$RUNNER_TEMP/staging-api-identity.json" 2>/dev/null; then
+              echo 'identity=unavailable (no completed probe receipt)'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   # MB mirror Worker staging lane (staging only). Push to `main` only, gated
@@ -494,13 +492,6 @@ jobs:
     name: staging-mb
     needs: [gate]
     if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
-    # Own deploy group (never shared with the other lanes): GitHub allows one
-    # running plus one pending job per group, so sharing would let a push's
-    # own lanes cancel each other. Queued main pushes still deploy in order
-    # instead of racing wrangler.
-    concurrency:
-      group: ${{ github.workflow }}-staging-mb-${{ github.ref }}
-      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.
@@ -701,13 +692,6 @@ jobs:
     name: staging-ingest
     needs: [gate, staging-mb]
     if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
-    # Own deploy group (never shared with the other lanes): GitHub allows one
-    # running plus one pending job per group, so sharing would let a push's
-    # own lanes cancel each other. Queued main pushes still deploy in order
-    # instead of racing wrangler.
-    concurrency:
-      group: ${{ github.workflow }}-staging-ingest-${{ github.ref }}
-      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Push-to-main staging record (see the header): no rules, no secrets.

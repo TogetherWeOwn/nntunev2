@@ -50,7 +50,7 @@ impl StripeScript {
                 "id": id, "customer": CUSTOMER, "subscription": SUBSCRIPTION,
                 "status": "paid", "currency": currency, "amount_paid": 800,
                 "status_transitions": {"paid_at": NOW},
-                "lines": {"data": [{"id": format!("line_{id}"), "amount": 800,
+                "lines": {"has_more": false, "data": [{"id": format!("line_{id}"), "amount": 800,
                     "price": PRICE, "period": {"start": NOW, "end": NOW + 100}}]}
             })
         };

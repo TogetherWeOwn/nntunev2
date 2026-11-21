@@ -51,7 +51,11 @@
 			tabindex="-1"
 			data-selected={selected ? '' : undefined}
 			use:contextMenu={(invoker, point) => ontrackmenu(track, invoker, point)}
-			onclickcapture={(event) => onrowclick(event, track.id)}
+			onclickcapture={(event) => {
+				if (!(event.target instanceof Element && event.target.closest('.nt-track-like'))) {
+					onrowclick(event, track.id);
+				}
+			}}
 			draggable="true"
 			ondragstart={(event) => ontrackdragstart(event, track)}
 			ondragend={ontrackdragend}
@@ -99,17 +103,16 @@
 			{#if likeControls}
 				{@const control = likeControls(track.id)}
 				{#if control}<TrackLikeButton {title} {control} />{/if}
-			{:else}
-				<button
-					type="button"
-					class="nt-library-star"
-					aria-pressed={favorite}
-					aria-label={`${favorite ? 'Unstar' : 'Star'} ${title}`}
-					onclick={() => ontogglefavorite(track.id)}
-				>
-					<span aria-hidden="true">{favorite ? '★' : '☆'}</span>
-				</button>
 			{/if}
+			<button
+				type="button"
+				class="nt-library-star"
+				aria-pressed={favorite}
+				aria-label={`${favorite ? 'Unstar' : 'Star'} ${title}`}
+				onclick={() => ontogglefavorite(track.id)}
+			>
+				<span aria-hidden="true">{favorite ? '★' : '☆'}</span>
+			</button>
 		</li>
 	{/each}
 </ul>

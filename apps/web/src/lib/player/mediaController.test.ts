@@ -29,9 +29,165 @@ class SeekableAudio extends EventTarget {
 	get duration() { return 120; }
 	get seekable() { return { length: 1, start: () => 0, end: () => 120 }; }
 	position = 30;
+	seeking = false;
 	get currentTime() { return this.position; }
 	set currentTime(value: number) { this.position = value; }
 }
+
+class TransportAudio extends EventTarget {
+	isConnected = true;
+	paused = true;
+	ended = false;
+	error: { code: number } | null = null;
+	constructor(readonly source = '/coral') { super(); }
+	getAttribute() { return this.source; }
+	play = vi.fn(async () => { this.paused = false; });
+	pause = vi.fn(() => { this.paused = true; });
+	load = vi.fn();
+	get element() { return this as unknown as HTMLAudioElement; }
+	deferPlay() {
+		const attempt = Promise.withResolvers<void>();
+		this.play.mockImplementationOnce(() => { this.paused = false; return attempt.promise; });
+		return attempt;
+	}
+	emit(type: string) { this.dispatchEvent(new Event(type)); }
+}
+
+function compactTransport() {
+	const queue = createQueueController(coral);
+	const announce = vi.fn();
+	const media = createMedia(queue, {
+		commit: (next) => { queue.publish(next, queue.begin(next, 'replace')); return queue.snapshot === next; },
+		flush: async () => {}, browseCopy: { invalidate: () => {} }, announce
+	}, (audio, source) => audio.getAttribute('src') === source);
+	const audio = new TransportAudio();
+	const detach = media.attach(audio.element);
+	return { audio, queue, media, detach, announce, status: () => get(media.playbackStatus) };
+}
+
+const coralSource = { streamUrl: '/coral', isCurrent: () => true };
+test.each(['queue', 'shared'])('%s Play reports a resource error once with queue counts', async (path) => {
+	const { audio, media, announce, status } = compactTransport();
+	const pending = audio.deferPlay(), compact = path === 'shared' ? media.playCurrent() : undefined;
+	const queued = media.playSelected(coral, 0, coralSource, 'Added 0, 1 already queued.');
+	await Promise.resolve();
+	audio.error = { code: path === 'shared' ? 2 : 4 };
+	audio.emit('error');
+	if (path === 'queue') pending.reject(new DOMException('Bad resource', 'NotSupportedError'));
+	const message = 'Selected Coral; audio unavailable. Added 0, 1 already queued.';
+	await vi.waitFor(() => expect(announce).toHaveBeenCalledExactlyOnceWith(message, true));
+	if (path === 'shared') pending.reject(new DOMException('Late failure', 'AbortError'));
+	await Promise.all([compact, queued]);
+	expect(status()).toBe('error');
+	expect(announce).toHaveBeenCalledExactlyOnceWith(message, true);
+	await media.playCurrent();
+	expect(audio.play).toHaveBeenCalledOnce();
+	audio.paused = true;
+	audio.error = null;
+	audio.emit('emptied');
+	expect(status()).toBe('paused');
+	audio.paused = false;
+	audio.emit('play');
+	expect(status()).toBe('starting');
+	audio.emit('playing');
+	expect(status()).toBe('playing');
+	audio.ended = true;
+	audio.emit('ended');
+	expect(status()).toBe('paused');
+});
+
+test.each(['playing', 'blocked', 'paused', 'pause event', 'resumed'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
+	const { audio, media, announce, status } = compactTransport();
+	const pending = audio.deferPlay(), compact = media.playCurrent();
+	const paused = outcome === 'paused' || outcome === 'pause event';
+	const counts = paused ? 'Added 0, 1 already queued.' : '';
+	const queued = media.playSelected(coral, 0, coralSource, counts);
+	if (paused) audio.pause();
+	if (outcome === 'pause event') audio.emit('pause'); // Before the queue's flush completes.
+	await Promise.resolve();
+	expect(audio.play).toHaveBeenCalledOnce();
+	if (outcome === 'playing' || paused) pending.resolve();
+	else if (outcome === 'blocked') { audio.paused = true; pending.reject(new DOMException('Blocked', 'NotAllowedError')); }
+	else {
+		audio.pause();
+		await audio.play();
+		audio.emit('pause'); // The queued pause event sees the resumed decoder.
+		pending.reject(new DOMException('Interrupted by pause', 'AbortError'));
+	}
+	await Promise.all([compact, queued]);
+	if (paused || outcome === 'resumed') {
+		if (outcome === 'resumed') audio.emit('playing');
+		expect(status()).toBe(paused ? 'paused' : 'playing');
+		if (paused) expect(announce).toHaveBeenCalledExactlyOnceWith(counts, true);
+		if (outcome === 'paused') audio.emit('pause'); // Settlement preceded the native event.
+		expect(announce).toHaveBeenCalledTimes(Number(paused));
+		return;
+	}
+	expect(status()).toBe(outcome);
+	expect(announce).toHaveBeenCalledExactlyOnceWith(outcome === 'playing'
+		? 'Playing Coral.' : 'Selected Coral, paused: playback was blocked.', true);
+	if (outcome === 'blocked') {
+		await media.playCurrent();
+		expect(status()).toBe('playing');
+		expect(audio.load).not.toHaveBeenCalled();
+	}
+});
+
+test('compact Play starts in the gesture, deduplicates pending Play, and reads native settlement', async () => {
+	const { audio, media, status } = compactTransport();
+	expect(status()).toBe('paused');
+	const pending = audio.deferPlay(), attempt = media.playCurrent();
+	audio.emit('play');
+	await media.playCurrent();
+	expect(audio.play).toHaveBeenCalledOnce();
+	expect(status()).toBe('starting');
+	pending.resolve();
+	await attempt;
+	expect(status()).toBe('playing');
+	media.pauseCurrent();
+	expect(status()).toBe('paused');
+	expect(media.audio).toBe(audio.element);
+});
+
+test.each(['compact', 'native'])('%s Pause fences pending success, including after a newer start', async (path) => {
+	const { audio, media, status } = compactTransport();
+	const stale = audio.deferPlay(), first = media.playCurrent();
+	if (path === 'compact') media.pauseCurrent();
+	else { audio.pause(); audio.emit('pause'); }
+	expect(status()).toBe('paused');
+	const latest = audio.deferPlay(), second = media.playCurrent();
+	stale.resolve();
+	audio.emit('playing');
+	await first;
+	expect(status()).toBe('starting');
+	latest.resolve();
+	await second;
+	expect(status()).toBe('playing');
+});
+
+test.each(['replacement', 'detach', 'account purge', 'destroy'])('late Play is inert after %s', async (boundary) => {
+	const { audio, queue, media, detach, announce, status } = compactTransport();
+	const pending = audio.deferPlay(), attempt = media.playCurrent();
+	const queued = media.playSelected(coral, 0, coralSource, 'Added 0, 1 already queued.');
+	let replacement: TransportAudio | undefined;
+	if (boundary === 'replacement') {
+		replacement = new TransportAudio('/kelp');
+		const next = createQueue([{ ...coral.tracks[0]!, streamUrl: replacement.source }]);
+		queue.publish(next, queue.begin(next, 'replace'));
+		media.attach(replacement.element);
+		detach();
+	} else if (boundary === 'detach') detach();
+	else if (boundary === 'account purge') queue.purgeAtAuthBoundary(() => media.purgeAtAuthBoundary(() => {}));
+	else media.destroy();
+	audio.emit('playing');
+	if (boundary === 'replacement') pending.resolve();
+	else pending.reject(new DOMException('Interrupted', 'AbortError'));
+	await Promise.all([attempt, queued]);
+	expect(status()).toBe(replacement ? 'paused' : 'unavailable');
+	expect(media.audio).toBe(replacement?.element);
+	expect(announce).not.toHaveBeenCalled();
+	expect(audio.pause).toHaveBeenCalledOnce();
+});
 
 test('share capture refuses a different selection or a blank stream', () => {
 	const queue = createQueueController(coral);
@@ -189,4 +345,81 @@ test('destroy retires the active node and refuses later mounts', () => {
 	cleanup();
 	expect(media.audio).toBeUndefined();
 	expect(audio.pause).toHaveBeenCalledOnce();
+});
+
+test.each([false, true])('absolute seek uses native time and clears stale refusal (early timeupdate: %s)', (early) => {
+	const media = createMediaController(() => true, coral);
+	const native = new SeekableAudio();
+	media.attach(native as unknown as HTMLAudioElement);
+	const state = () => get(media.absoluteSeek);
+	const { attachment } = state();
+	const ranges = vi.spyOn(native, 'seekable', 'get');
+	const setter = vi.spyOn(native, 'currentTime', 'set');
+	media.captureShareSeek(media.beginShareInput(), { trackId: 'coral', seconds: 100 }, () => true);
+	setter.mockImplementationOnce(() => {});
+	media.seek(attachment, 80);
+	expect(media.pendingShareSeek).toBeNull();
+	expect(state()).toMatchObject({ position: 30, feedback: 'The player did not accept that seek.' });
+	ranges.mockReturnValueOnce({ length: 1, start: () => 0, end: () => 40 });
+	media.seek(attachment, 80);
+	expect(setter).toHaveBeenCalledExactlyOnceWith(80);
+	expect(state()).toMatchObject({ position: 30, feedback: 'That position is not seekable yet.' });
+	media.seek(attachment, Infinity);
+	expect(setter).toHaveBeenCalledTimes(1);
+	for (const event of ['seeking', 'timeupdate', 'seeked']) {
+		if (event !== 'seeking') native.position += 1;
+		native.dispatchEvent(new Event(event));
+		expect(state().feedback).toBe('That position is not seekable yet.');
+	}
+	Object.assign(native, { currentTime: 60, seeking: true });
+	if (early) native.dispatchEvent(new Event('timeupdate'));
+	expect(state()).toMatchObject({ position: early ? 60 : 32, elapsed: 32, feedback: 'That position is not seekable yet.' });
+	native.dispatchEvent(new Event('seeking'));
+	expect(state()).toMatchObject({ position: 60, elapsed: 32, seeking: true, feedback: '' });
+	native.seeking = false;
+	native.dispatchEvent(new Event('seeked'));
+	expect(state()).toMatchObject({ attachment, position: 60, elapsed: 60, feedback: '' });
+	media.seek(attachment, 200);
+	expect(setter).toHaveBeenLastCalledWith(120);
+	expect(state()).toMatchObject({ position: 120, duration: 120, enabled: true, feedback: '' });
+});
+
+test('absolute seek keeps elapsed time settled while the decoder is seeking', () => {
+	const media = createMediaController(() => true, coral);
+	const native = new SeekableAudio();
+	media.attach(native as unknown as HTMLAudioElement);
+	const state = () => get(media.absoluteSeek);
+	native.seeking = true;
+	media.seek(state().attachment, 80);
+	native.dispatchEvent(new Event('seeking'));
+	expect(native.currentTime).toBe(80);
+	expect(state()).toMatchObject({ position: 80, elapsed: 30, seeking: true });
+	media.seek(state().attachment, 90);
+	native.dispatchEvent(new Event('seeked')); // A queued event cannot settle a newer in-flight seek.
+	expect(state()).toMatchObject({ position: 90, elapsed: 30, seeking: true });
+	native.seeking = false;
+	native.dispatchEvent(new Event('seeked'));
+	expect(state()).toMatchObject({ position: 90, elapsed: 90, seeking: false });
+});
+
+test.each(['before write', 'during write'] as const)('absolute seek fences attachment retirement %s', (phase) => {
+	const media = createMediaController(() => true, coral);
+	const native = new SeekableAudio();
+	const replacement = new SeekableAudio();
+	replacement.position = 7;
+	const detach = media.attach(native as unknown as HTMLAudioElement);
+	const state = () => get(media.absoluteSeek);
+	const old = state().attachment;
+	const replace = () => { detach(); media.attach(replacement as unknown as HTMLAudioElement); };
+	const setter = vi.spyOn(native, 'currentTime', 'set');
+	if (phase === 'before write') vi.spyOn(native, 'duration', 'get').mockImplementationOnce(() => { replace(); return 120; });
+	else setter.mockImplementationOnce(() => { replace(); throw new Error('retired write'); });
+	media.seek(old, 80);
+	expect(setter).toHaveBeenCalledTimes(phase === 'before write' ? 0 : 1);
+	native.dispatchEvent(new Event('seeked'));
+	media.seek(old, 90);
+	expect(state()).toMatchObject({ position: 7, feedback: '' });
+	expect(replacement.currentTime).toBe(7);
+	media.reset();
+	expect(state()).toMatchObject({ position: 0, duration: 0, enabled: false, feedback: '' });
 });

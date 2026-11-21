@@ -315,6 +315,69 @@ async function openHome(page: Page) {
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
 }
 
+test('keyboard Play and Pause keep the range-capable native decoder and position across app routes', async ({ page }) => {
+	await servePlaybackLibrary(page);
+	await page.goto(`/library?track=${playbackFixture.id}&t=2`);
+	const player = page.getByRole('region', { name: 'Player', exact: true });
+	const status = player.getByRole('status');
+	const play = player.getByRole('button', { name: 'Play', exact: true });
+	const pause = player.getByRole('button', { name: 'Pause', exact: true });
+	const native = player.locator('audio[controls][data-testid="audio-player"]');
+	await expect(native).toBeVisible();
+	await expect(status).toHaveAttribute('aria-atomic', 'true');
+	await expect(status).toHaveText('Paused');
+	await expect(play).toHaveText('Play');
+	const audio = (await native.elementHandle())!;
+	const time = () => audio.evaluate((node: HTMLAudioElement) => node.currentTime);
+	await expect.poll(time).toBeCloseTo(2);
+	await audio.evaluate((node: HTMLAudioElement) => {
+		const play = node.play;
+		// The queued play event can arrive after the media clock has advanced.
+		node.play = function () {
+			node.dataset.starts = String(Number(node.dataset.starts ?? '0') + 1);
+			node.dataset.startedAt = String(node.currentTime);
+			return play.call(this);
+		};
+	});
+	await play.press('Enter');
+	await expect(status).toHaveText('Playing');
+	await expect(pause).toHaveText('Pause');
+	await expect(pause).toBeFocused();
+	await expect.poll(time).toBeGreaterThan(2.1);
+	await pause.press('Space');
+	await expect(status).toHaveText('Paused');
+	const pausedAt = await time();
+	await openHome(page);
+	await page.getByRole('link', { name: 'Open Your Library', exact: true }).click();
+	await expect(page).toHaveURL(/\/library$/);
+	await expect(page.getByTestId('library-item')).toBeVisible();
+	await expect(status).toHaveText('Paused');
+	await expect(native).toHaveAttribute('data-starts', '1');
+	expect(await time()).toBeCloseTo(pausedAt, 3);
+	await play.press('Space');
+	await expect(status).toHaveText('Playing');
+	expect(Number(await native.getAttribute('data-started-at'))).toBeCloseTo(pausedAt, 3);
+	await expect.poll(time).toBeGreaterThan(pausedAt + 0.1);
+	await audio.evaluate((node: HTMLAudioElement) => node.pause());
+	await expect(status).toHaveText('Paused');
+	expect(await audio.evaluate((node: HTMLAudioElement) =>
+		node === document.querySelector('audio') && node.controls && node.seekable.length > 0 && node.paused)).toBe(true);
+	await expect(page.locator('audio')).toHaveCount(1);
+});
+
+test('a terminal native resource error offers explicit recovery and keeps native controls', async ({ page }) => {
+	await servePlaybackLibrary(page);
+	await page.route('**/api/demo/audio?track=coral', (route) => route.fulfill({ status: 404, body: '' }));
+	await page.goto(`/library?track=${playbackFixture.id}&t=2`);
+	const player = page.getByRole('region', { name: 'Player', exact: true });
+	await expect(player.getByRole('status')).toContainText('This audio could not be loaded or played.');
+	await expect(player.getByRole('button', { name: 'Play', exact: true })).toHaveCount(0);
+	await expect(player.getByRole('button', { name: 'Retry playback', exact: true })).toBeEnabled();
+	const native = player.locator('audio[controls][data-testid="audio-player"]');
+	await expect(native).toBeVisible();
+	expect(await native.evaluate((node: HTMLAudioElement) => node.error !== null)).toBe(true);
+});
+
 for (const mode of ['playing', 'demo', 'encoded demo', 'paused', '404 clear', '404 remove', '503 clear', 'timestamp Back']) {
 	const timestamp = mode === 'timestamp Back', status = Number.parseInt(mode, 10);
 	const paused = timestamp || mode === 'paused', demo = mode.endsWith('demo');
@@ -479,6 +542,53 @@ test('abandoned logout success resets the same-window replacement library and fe
 	expect.soft(observed.pageErrors).toEqual([]);
 	expect.soft(observed.navigations, 'no late navigation').toEqual([]);
 });
+
+for (const { path, signIn } of [
+	{ path: '/home', signIn: 'Sign in to see your library.' },
+	{ path: '/library/liked', signIn: 'Sign in to see your liked tracks.' },
+	{ path: '/search?q=Juniper', signIn: 'Sign in to search your library.' }
+]) {
+	for (const delivery of ['same-document', 'storage']) {
+		test(`${delivery} auth transition clears visible rows on ${path}`, async ({ page }) => {
+			await fixtures(page, ['/v1/session/logout']);
+			await page.route('**/api/library', (route) =>
+				route.fulfill({ json: [{ id: 'fixture-juniper', title: 'Juniper Track' }] })
+			);
+			let endpoint: string | null = null;
+			if (delivery === 'same-document') {
+				endpoint = await beginSecurity(page, 'logout');
+			} else {
+				await page.goto('/account/security');
+				await seedState(page);
+			}
+			await page.evaluate((contextKey) => {
+				const scope = sessionStorage.getItem(contextKey);
+				localStorage.setItem(`nntune.library.favorites.v1.${scope}`, '["fixture-juniper"]');
+				localStorage.setItem(`nntune.library.recent-finds.v1.${scope}`, '["Fixture search"]');
+			}, AUTH_CONTEXT);
+			await clientNavigate(page, path, endpoint !== null);
+
+			const main = page.getByRole('main');
+			const row = main.getByRole('listitem').filter({ hasText: 'Juniper Track' });
+			const recent = main.getByRole('link', { name: 'Fixture search', exact: true });
+			await expect(row).toBeVisible();
+			if (path === '/home') await expect(recent).toBeVisible();
+
+			if (endpoint !== null) {
+				await release(page, endpoint, 200, { ok: true });
+			} else {
+				await page.evaluate((key) => {
+					window.dispatchEvent(new StorageEvent('storage', { key, storageArea: localStorage }));
+				}, TRANSITION);
+			}
+
+			await expect(main.getByText(signIn, { exact: false })).toBeVisible();
+			await expect(row).toHaveCount(0);
+			await expect(recent).toHaveCount(0);
+			await expect(page).toHaveURL((url) => url.pathname + url.search === path);
+		});
+	}
+}
 
 test('abandoned revoke-all success resets the same-window replacement library and fences its late response', async ({
 	page

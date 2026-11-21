@@ -229,6 +229,16 @@
 		);
 	}
 
+	async function reportMove(button: HTMLButtonElement, from: number, to: number): Promise<void> {
+		const heldFocus = document.activeElement === button;
+		onmove?.(from, to);
+		await tick();
+		// Moving a keyed row can detach and reinsert its focused control.
+		if (!button.isConnected || button.disabled || !focusStranded(heldFocus, button)) return;
+		button.focus({ preventScroll: true });
+		button.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+	}
+
 	/**
 	 * Report one remove intent, then land focus deterministically: the next
 	 * surviving displayed row's Remove, otherwise the previous, otherwise
@@ -459,6 +469,11 @@
 	 * host validates again and applies the selectTrack transition.
 	 */
 	let trackMenu = $state<MenuRequest | null>(null);
+	export function dismissTrackMenu(): HTMLElement | undefined {
+		const invoker = trackMenu?.invoker;
+		trackMenu = null;
+		return invoker;
+	}
 	let dropRow = $state<string | null>(null);
 	let dropAfter = $state(false);
 	let batchIds = $state<string[]>([]);
@@ -514,7 +529,7 @@
 
 	function rowClick(event: MouseEvent, id: string): void {
 		if (!onreorder || (!event.ctrlKey && !event.metaKey && !event.shiftKey)) return;
-		if (event.target instanceof Element && event.target.closest('input, .queue-grip')) return;
+		if (event.target instanceof Element && event.target.closest('input, .queue-grip, .nt-track-like')) return;
 		event.preventDefault();
 		event.stopPropagation();
 		toggleBatch(id, event.shiftKey);
@@ -765,7 +780,11 @@
 -->
 <div class="queue-filter">
 	<label for="queue-filter-input">Filter queue</label>
-	<input id="queue-filter-input" type="search" bind:value={filterQuery} />
+	<input id="queue-filter-input" type="search" bind:value={filterQuery} onkeydown={(event) => {
+		if (event.key !== 'Escape' || !filterQuery || event.isComposing) return;
+		event.preventDefault();
+		filterQuery = '';
+	}} />
 	<button type="button" onclick={() => (filterQuery = '')}>Clear queue filter</button>
 </div>
 
@@ -857,7 +876,8 @@
 			{#if likeControls}
 				{@const control = interactionsUnavailable ? undefined : likeControls(track.id)}
 				{#if control}<TrackLikeButton title={displayTitle(track)} {control} />{/if}
-			{:else if ontogglefavorite}
+			{/if}
+			{#if ontogglefavorite}
 				<button
 					type="button"
 					class="queue-star"
@@ -883,7 +903,7 @@
 				type="button"
 				aria-label="Move {displayTitle(track)} up"
 				disabled={index === 0}
-				onclick={() => onmove?.(index, index - 1)}
+				onclick={(event) => reportMove(event.currentTarget, index, index - 1)}
 			>
 				Up
 			</button>
@@ -891,7 +911,7 @@
 				type="button"
 				aria-label="Move {displayTitle(track)} down"
 				disabled={index === trackCount - 1}
-				onclick={() => onmove?.(index, index + 1)}
+				onclick={(event) => reportMove(event.currentTarget, index, index + 1)}
 			>
 				Down
 			</button>
