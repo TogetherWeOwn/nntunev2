@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+	<head><meta charset="utf-8"><title>Track Like button test host</title></head>
+	<body>
+		<main id="app"></main>
+		<output data-testid="toggle-count">0</output>
+		<script type="module">
+			import { mount } from 'svelte';
+			import TrackLikeButton from '../../../src/lib/library/TrackLikeButton.svelte';
+
+			let count = 0;
+			const toggle = async () => {
+				document.querySelector('output').textContent = String(++count);
+			};
+			for (const [title, pending] of [['Available track', false], ['Pending track', true]]) {
+				mount(TrackLikeButton, {
+					target: document.querySelector('#app'),
+					props: { title, control: { liked: false, pending, toggle } }
+				});
+			}
+		</script>
+	</body>
+</html>
