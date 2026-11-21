@@ -1,5 +1,6 @@
 <script lang="ts">
-	import type { ComponentProps, Snippet } from 'svelte';
+	import { tick, type ComponentProps, type Snippet } from 'svelte';
+	import { MediaQuery } from 'svelte/reactivity';
 	import { displayArtist, displayTitle } from '../library/order.js';
 	import NativeAudio from './NativeAudio.svelte';
 	import PlayerSeek from './PlayerSeek.svelte';
@@ -12,7 +13,7 @@
 		playbackStatus, playCurrent, pauseCurrent, retryCurrent,
 		seekState, seek,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
-		favoriteAction,
+		favoriteAction, allowDesktopRow = true,
 		jumpStatus, jumpStatusVersion, jumpRelative, volumeControls
 	}: ComponentProps<typeof NativeAudio> & {
 		volumeControls: Snippet;
@@ -31,7 +32,29 @@
 		jumpStatusVersion: number;
 		jumpRelative: (direction: JumpDirection) => void;
 		favoriteAction?: Snippet;
+		allowDesktopRow?: boolean;
 	} = $props();
+	// Match the shell's mobile cutoff. Only the accessory controls change hosts.
+	const wideShell = new MediaQuery('(width > 799px)');
+	const desktop = $derived(allowDesktopRow && wideShell.current);
+	let row = $state<HTMLDivElement>();
+	let wasDesktop = false;
+	$effect.pre(() => {
+		if (desktop === wasDesktop) return;
+		wasDesktop = desktop;
+		const active = document.activeElement;
+		const host = row;
+		if (!active || !host?.contains(active)) return;
+		const selector = ['[data-testid="player-favorite"]', '.nt-sound input', '.nt-sound button']
+			.find((candidate) => active.matches(candidate));
+		if (!selector) return;
+		void tick().then(() => {
+			// Don't steal focus if the user has already moved to a different control.
+			if (!active.isConnected && document.activeElement === document.body) {
+				host.querySelector<HTMLElement>(selector)?.focus();
+			}
+		});
+	});
 	const canPause = $derived(playbackStatus === 'playing' || playbackStatus === 'starting');
 	const statusText: Record<PlaybackStatus, string> = {
 		unavailable: 'Playback is unavailable.',
@@ -44,66 +67,88 @@
 	};
 </script>
 
-<section aria-label="Player">
-	<h2>Now playing</h2>
-	{#if currentTrack}
-		<p class="nt-player-identity" data-testid="library-now-playing">
-			{displayTitle(currentTrack)}{#if displayArtist(currentTrack)}{' — '}{displayArtist(currentTrack)}{/if}
-		</p>
-	{/if}
-	<div class="nt-library-player-controls">
-		<button class="nt-button nt-library-transport" type="button"
-			disabled={playbackStatus === 'unavailable'}
-			aria-disabled={playbackStatus === 'retrying' ? 'true' : undefined}
-			onclick={() => {
-				if (playbackStatus === 'retrying') return;
-				if (playbackStatus === 'error') void retryCurrent();
-				else if (canPause) pauseCurrent();
-				else void playCurrent();
-			}}>
-			{playbackStatus === 'error' || playbackStatus === 'retrying' ? 'Retry playback' : canPause ? 'Pause' : 'Play'}
-		</button>
-		<NativeAudio {mediaRevision} {streamUrl} {attachNativeAudio} />
-		<button
-			class="nt-button nt-library-restart"
-			type="button"
-			data-testid="library-restart"
-			disabled={!restartCanSeek}
-			aria-describedby={restartCanSeek ? undefined : 'library-restart-hint'}
-			onclick={restartCurrentTrack}
-		>
-			Restart current track
-		</button>
-		{@render favoriteAction?.()}
-	</div>
-	{#key seekState.attachment}<PlayerSeek state={seekState} {seek} />{/key}
-	{@render volumeControls()}
+{#snippet playbackStatusLine()}
 	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
+{/snippet}
+{#snippet restartDetails()}
 	{#if !restartCanSeek}
 		<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 	{/if}
 	<p data-testid="library-restart-status" aria-live="polite">{#key restartStatusVersion}{restartStatus}{/key}</p>
-	<div class="nt-player-jump">
-		<button
-			class="nt-button nt-button--ghost"
-			type="button"
-			data-testid="player-seek-back"
-			aria-label="Back 10 seconds"
-			onclick={() => jumpRelative('back')}
-		>
-			Back 10 s
-		</button>
-		<button
-			class="nt-button nt-button--ghost"
-			type="button"
-			data-testid="player-seek-forward"
-			aria-label="Forward 10 seconds"
-			onclick={() => jumpRelative('forward')}
-		>
-			Forward 10 s
-		</button>
+{/snippet}
+
+<section aria-label="Player">
+	<h2>Now playing</h2>
+	<div class="nt-player-row" class:desktop bind:this={row}>
+		<div class="nt-player-left">
+			{#if currentTrack}
+				<p class="nt-player-identity" data-testid="library-now-playing">
+					{displayTitle(currentTrack)}{#if displayArtist(currentTrack)}{' — '}{displayArtist(currentTrack)}{/if}
+				</p>
+			{/if}
+			{#if desktop}{@render favoriteAction?.()}{/if}
+		</div>
+		<div class="nt-player-centre">
+			<div class="nt-player-primary">
+				<div class="nt-library-player-controls">
+					<button class="nt-button nt-library-transport" type="button"
+						disabled={playbackStatus === 'unavailable'}
+						aria-disabled={playbackStatus === 'retrying' ? 'true' : undefined}
+						onclick={() => {
+							if (playbackStatus === 'retrying') return;
+							if (playbackStatus === 'error') void retryCurrent();
+							else if (canPause) pauseCurrent();
+							else void playCurrent();
+						}}>
+						{playbackStatus === 'error' || playbackStatus === 'retrying' ? 'Retry playback' : canPause ? 'Pause' : 'Play'}
+					</button>
+					<NativeAudio {mediaRevision} {streamUrl} {attachNativeAudio} />
+					<button
+						class="nt-button nt-library-restart"
+						type="button"
+						data-testid="library-restart"
+						disabled={!restartCanSeek}
+						aria-describedby={restartCanSeek ? undefined : 'library-restart-hint'}
+						onclick={restartCurrentTrack}
+					>
+						Restart current track
+					</button>
+					{#if desktop}{@render restartDetails()}{:else}{@render favoriteAction?.()}{/if}
+				</div>
+				{#key seekState.attachment}<PlayerSeek state={seekState} {seek} />{/key}
+			</div>
+			{#if !desktop}
+				{@render volumeControls()}
+				{@render playbackStatusLine()}
+				{@render restartDetails()}
+			{/if}
+			<div class="nt-player-jump">
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-back"
+					aria-label="Back 10 seconds"
+					onclick={() => jumpRelative('back')}
+				>
+					Back 10 s
+				</button>
+				<button
+					class="nt-button nt-button--ghost"
+					type="button"
+					data-testid="player-seek-forward"
+					aria-label="Forward 10 seconds"
+					onclick={() => jumpRelative('forward')}
+				>
+					Forward 10 s
+				</button>
+			</div>
+			<p data-testid="player-seek-feedback" aria-live="polite">{#key jumpStatusVersion}{jumpStatus}{/key}</p>
+		</div>
+		{#if desktop}
+			<div class="nt-player-right">{@render volumeControls()}</div>
+		{/if}
 	</div>
-	<p data-testid="player-seek-feedback" aria-live="polite">{#key jumpStatusVersion}{jumpStatus}{/key}</p>
+	{#if desktop}{@render playbackStatusLine()}{/if}
 </section>
 
 <style>
@@ -139,4 +184,51 @@
 	.nt-player-jump button {
 		min-height: 2.75rem;
 	}
+
+	/* Ordinary mobile keeps its existing boxes and source order. */
+	.nt-player-row, .nt-player-left, .nt-player-centre, .nt-player-primary {
+		display: contents;
+	}
+	.nt-player-row.desktop {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) minmax(0, 3fr) minmax(0, 1fr);
+		grid-template-rows: auto auto auto;
+		column-gap: var(--nt-shell-gap);
+	}
+	.desktop .nt-player-centre {
+		display: grid;
+		grid-column: 2;
+		grid-row: 1 / 4;
+		grid-template-rows: subgrid;
+	}
+	.desktop .nt-player-left, .desktop .nt-player-right {
+		display: block;
+		grid-row: 1;
+		align-self: center;
+	}
+	.desktop .nt-player-left { grid-column: 1; }
+	.desktop .nt-player-right { grid-column: 3; }
+	.desktop .nt-player-primary {
+		display: grid;
+		align-content: center;
+		min-block-size: var(--nt-player-h);
+	}
+	.desktop .nt-player-identity, .desktop .nt-library-player-controls p,
+	.desktop [data-testid='player-seek-feedback'], .desktop :global(.nt-sound) {
+		margin: 0;
+	}
+	.desktop .nt-library-player-controls p:empty { position: absolute; }
+	.desktop .nt-library-player-controls, .desktop .nt-player-jump { gap: var(--nt-space-2); }
+	.desktop .nt-player-jump { margin-block-end: 0; }
+	.desktop :is(.nt-library-player-controls, .nt-player-jump) button {
+		min-block-size: var(--nt-control);
+		min-inline-size: var(--nt-control);
+		max-inline-size: 100%;
+		padding-inline: var(--nt-space-2);
+	}
+	.desktop .nt-library-player-controls .nt-library-transport { min-block-size: var(--nt-control-lg); }
+	.desktop :global(audio[controls]), .desktop :global(.nt-sound input) { max-inline-size: 100%; }
+	.desktop :global(.nt-sound label) { display: grid; }
+	.desktop .nt-player-primary :global(.nt-player-seek) { line-height: 1; }
+	.desktop .nt-player-primary :global(.nt-player-seek input) { min-height: var(--nt-space-px-12); }
 </style>

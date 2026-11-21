@@ -19,7 +19,12 @@
 		{ claimShareEntry?: () => boolean; currentFavorite: ReturnType<typeof createCurrentTrackFavorite> }>();
 </script>
 <script lang="ts">
-	let { children, claimShareEntry, signedOut }: { children: Snippet; claimShareEntry?: (owner: string) => boolean; signedOut?: boolean } = $props();
+	let { children, claimShareEntry, signedOut, allowDesktopRow }: {
+		children: Snippet;
+		claimShareEntry?: (owner: string) => boolean;
+		signedOut?: boolean;
+		allowDesktopRow?: boolean;
+	} = $props();
 	let shareOwner: string | undefined;
 	const controller = createPlayerController(createQueue([]), { flush: tick });
 	const player = setAppPlayer(Object.assign(controller, { currentFavorite: createCurrentTrackFavorite(controller.queue),
@@ -68,7 +73,7 @@
 	<div class="nt-wrap" bind:this={shortcutScope}>
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio} volumeControls={soundControls}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
-			retryCurrent={media.retryCurrent}
+			retryCurrent={media.retryCurrent} {allowDesktopRow}
 			seekState={$absoluteSeek} seek={media.seek}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} {favoriteAction} />
 		<ShortcutHelp bind:this={shortcutHelp} actions={appShortcutActions} buttonClass="nt-button nt-button--ghost" playerScoped />
