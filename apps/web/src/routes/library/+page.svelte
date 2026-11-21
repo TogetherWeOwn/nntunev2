@@ -60,6 +60,7 @@
 	} from '#lib/library/selection.js';
 	import { clearSignedInEmail } from '#lib/signed-in-email.js';
 	import PlayerQueue from '#lib/player/PlayerQueue.svelte';
+	import LibraryQueueHost from './LibraryQueueHost.svelte';
 	import ContextMenu from '#lib/interactions/ContextMenu.svelte';
 	import { contextMenu, menuAt, unavailablePlaylistAction, type MenuRequest, type MenuAction } from '#lib/interactions/context-menu.js';
 	import { startTrackDrag, endTrackDrag } from '#lib/interactions/track-drag.js';
@@ -1921,36 +1922,40 @@
 				pin with an unfiltered role query. Content, controls and
 				focus are untouched; the roles return with the fresh list.
 			-->
-			<PlayerQueue
-				state={queue}
-				announcement={player.queueAnnouncement.text}
-				announcementVersion={player.queueAnnouncement.version}
-				{favoriteIds}
-				ontogglefavorite={listingUnavailable ? undefined : toggleQueuedFavorite}
-				onfavoriteids={(ids) => favoriteInteractionIds(ids, true)}
-				bind:filterQuery={queueFilterQuery}
-				liveRegions={!loading}
-				confirmDestructive
-				confirmGeneration={queueConfirmGeneration}
-				onnext={() => replaceQueue(nextTrack(queueController.snapshot))}
-				onshuffle={() => replaceQueue(shuffleUpcoming(queueController.snapshot))}
-				onmove={moveQueuedTrack}
-				oninsert={insertQueuedIds}
-				interactionsUnavailable={listingUnavailable}
-				onmenufocusfallback={focusLibraryRecovery}
-				onreorder={listingUnavailable ? undefined : reorderQueuedIds}
-				onplaynextids={queueNextIds}
-				onremoveids={removeQueuedIds}
-				onplaynext={(index) => replaceQueue(playNext(queueController.snapshot, index))}
-				onremove={removeQueuedTrack}
-				onclear={clearQueuedTracks}
-				onselect={selectQueuedTrack}
-				onplaynow={(id) => void playQueuedTrack(id)}
-				oncopylink={(id) => void queueShare.copy(id)}
-				onkeepcurrentandupcoming={trimPreviousTracks}
-				onclearupcoming={trimUpcomingTracks}
-			/>
-			<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />
+			<LibraryQueueHost>
+				<div class="nt-library-queue" data-density={density}>
+					<PlayerQueue
+						state={queue}
+						announcement={player.queueAnnouncement.text}
+						announcementVersion={player.queueAnnouncement.version}
+						{favoriteIds}
+						ontogglefavorite={listingUnavailable ? undefined : toggleQueuedFavorite}
+						onfavoriteids={(ids) => favoriteInteractionIds(ids, true)}
+						bind:filterQuery={queueFilterQuery}
+						liveRegions={!loading}
+						confirmDestructive
+						confirmGeneration={queueConfirmGeneration}
+						onnext={() => replaceQueue(nextTrack(queueController.snapshot))}
+						onshuffle={() => replaceQueue(shuffleUpcoming(queueController.snapshot))}
+						onmove={moveQueuedTrack}
+						oninsert={insertQueuedIds}
+						interactionsUnavailable={listingUnavailable}
+						onmenufocusfallback={focusLibraryRecovery}
+						onreorder={listingUnavailable ? undefined : reorderQueuedIds}
+						onplaynextids={queueNextIds}
+						onremoveids={removeQueuedIds}
+						onplaynext={(index) => replaceQueue(playNext(queueController.snapshot, index))}
+						onremove={removeQueuedTrack}
+						onclear={clearQueuedTracks}
+						onselect={selectQueuedTrack}
+						onplaynow={(id) => void playQueuedTrack(id)}
+						oncopylink={(id) => void queueShare.copy(id)}
+						onkeepcurrentandupcoming={trimPreviousTracks}
+						onclearupcoming={trimUpcomingTracks}
+					/>
+					<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />
+				</div>
+			</LibraryQueueHost>
 		{/if}
 
 	{#if (!loading && !loadError) || items.length > 0}
@@ -2033,10 +2038,10 @@
 		white-space: nowrap;
 		border: 0;
 	}
-	main {
+	main, .nt-library-queue {
 		--nt-library-row-padding: 0.25rem;
 	}
-	main[data-density='compact'] {
+	main[data-density='compact'], .nt-library-queue[data-density='compact'] {
 		--nt-library-row-padding: 0;
 	}
 	.nt-library-repeat {
@@ -2089,10 +2094,10 @@
 	}
 	/* Density only changes row whitespace, never the controls or their order.
 	 * The ancestor scope keeps the shared queue's other hosts unchanged. */
-	main :global(.queue-row) {
+	.nt-library-queue :global(.queue-row) {
 		padding-block: var(--nt-library-row-padding);
 	}
-	main :global(.queue-row button:not(.queue-star, .queue-grip, .queue-more)) {
+	.nt-library-queue :global(.queue-row button:not(.queue-star, .queue-grip, .queue-more)) {
 		min-width: 24px;
 		min-height: 24px;
 	}
