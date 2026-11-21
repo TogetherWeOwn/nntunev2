@@ -57,13 +57,14 @@ pub(crate) enum ReconcileProbe {
     None,
     WorkerDeadline,
     ServerWatchdog,
-    ParentCascade,
+    BeforeCommit,
+    BeforeInsertCommit(Option<std::rc::Rc<std::cell::Cell<bool>>>),
     ObserveStaleRefusal(std::rc::Rc<std::cell::Cell<bool>>),
     ObserveTargetRefusal(std::rc::Rc<std::cell::Cell<bool>>),
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-pub(crate) const PARENT_CASCADE_GATE: i64 = 781349054;
+pub(crate) const PRECOMMIT_GATE: i64 = 781349054;
 
 pub(crate) async fn apply_reconcile_transaction(
     transaction: &mut tokio_postgres::Client,
@@ -198,14 +199,42 @@ pub(crate) async fn apply_reconcile_transaction(
         }
         // The blocking probes run only after all billing writes and before COMMIT.
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-        if matches!(probe, ReconcileProbe::ParentCascade) {
+        if matches!(
+            probe,
+            ReconcileProbe::BeforeCommit | ReconcileProbe::BeforeInsertCommit(_)
+        ) {
+            if matches!(probe, ReconcileProbe::BeforeInsertCommit(_)) {
+                // The observer still sees empty tables even if the gate is too early.
+                // Require the writes on this backend before either INSERT case can wait.
+                let written: bool = transaction
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM public.subscriptions
+                              WHERE user_id = $1 AND stripe_subscription_id = $2
+                                AND status = 'active' AND paid_invoice_id = 'in_worker_second')
+                            AND (SELECT array_agg(stripe_invoice_id ORDER BY stripe_invoice_id)
+                                   FROM public.paid_invoice_history
+                                  WHERE user_id = $1 AND stripe_subscription_id = $2)
+                                IS NOT DISTINCT FROM ARRAY['in_worker_first', 'in_worker_second']",
+                        &[&user_id, &row.stripe_subscription_id],
+                    )
+                    .await
+                    .and_then(|row| row.try_get(0))
+                    .map_err(|_| StoreError)?;
+                if !written {
+                    return Err(StoreError);
+                }
+            }
             transaction
                 .query_typed(
                     "SELECT pg_advisory_xact_lock($1)",
-                    &[(&PARENT_CASCADE_GATE, Type::INT8)],
+                    &[(&PRECOMMIT_GATE, Type::INT8)],
                 )
                 .await
                 .map_err(|_| StoreError)?;
+            if let ReconcileProbe::BeforeInsertCommit(Some(observed)) = &probe {
+                observed.set(true);
+                return Err(StoreError);
+            }
         } else if matches!(
             probe,
             ReconcileProbe::WorkerDeadline | ReconcileProbe::ServerWatchdog
