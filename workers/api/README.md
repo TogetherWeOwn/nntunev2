@@ -106,6 +106,18 @@ On success both methods return 200: PUT returns `{target_id, liked_at}` and
 DELETE returns `{target_id, liked: false}`. The receipt uses the resolved ID;
 exact member job IDs keep their case.
 
+Library taste controls use `GET`, `PUT` and `DELETE /v1/me/taste/session`
+with the same binding header and `412` precondition. Mutations still require
+an exact Origin. Request bodies match the legacy `/v1/me/taste` contract, but
+submit the exact validated storage ID: the Library path refuses aliases that
+would resolve to a different ID. Use the resolved recording MBID when present;
+otherwise preserve the opaque member job ID verbatim. Every 200 response adds
+`session_binding` to the legacy JSON shape, and DELETE also echoes `kind` and
+`target_id` even when `cleared` is false. GET still filters expired snoozes.
+Validate the proof and receipt before publishing account state; do not fall
+back to `/v1/me/taste` or automatically retry a mutation. The legacy route's
+requests and receipts are unchanged.
+
 Known limits of this slice: attestation `x5c` chains reject (no CA
 trust store yet); magic-link delivery needs the operator's
 `EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
