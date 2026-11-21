@@ -2,6 +2,8 @@
 	import { libraryItemKey, type LibraryItem } from '#lib/library/cache.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import { contextMenu } from '#lib/interactions/context-menu.js';
+	import TrackLikeButton from '#lib/library/TrackLikeButton.svelte';
+	import type { TrackLikeControls } from '#lib/library/track-like-controls.js';
 
 	let {
 		tracks,
@@ -16,7 +18,8 @@
 		ontrackplay,
 		ontrackmenu,
 		oncopylink,
-		ontogglefavorite
+		ontogglefavorite,
+		likeControls
 	}: {
 		tracks: readonly LibraryItem[];
 		queuedIds: ReadonlySet<string>;
@@ -31,6 +34,7 @@
 		ontrackmenu: (track: LibraryItem, invoker: HTMLElement, point?: { x: number; y: number }) => void;
 		oncopylink: (track: LibraryItem) => void;
 		ontogglefavorite: (id: string) => void;
+		likeControls?: TrackLikeControls;
 	} = $props();
 </script>
 
@@ -47,7 +51,11 @@
 			tabindex="-1"
 			data-selected={selected ? '' : undefined}
 			use:contextMenu={(invoker, point) => ontrackmenu(track, invoker, point)}
-			onclickcapture={(event) => onrowclick(event, track.id)}
+			onclickcapture={(event) => {
+				if (!(event.target instanceof Element && event.target.closest('.nt-track-like'))) {
+					onrowclick(event, track.id);
+				}
+			}}
 			draggable="true"
 			ondragstart={(event) => ontrackdragstart(event, track)}
 			ondragend={ontrackdragend}
@@ -92,6 +100,10 @@
 			>
 				Copy link
 			</button>
+			{#if likeControls}
+				{@const control = likeControls(track.id)}
+				{#if control}<TrackLikeButton {title} {control} />{/if}
+			{/if}
 			<button
 				type="button"
 				class="nt-library-star"
