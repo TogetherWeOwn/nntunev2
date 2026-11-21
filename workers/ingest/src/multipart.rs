@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 
 pub mod head_receipt;
+pub mod readback_inventory;
 pub mod resume_checkpoint;
 pub mod sidecar;
 
