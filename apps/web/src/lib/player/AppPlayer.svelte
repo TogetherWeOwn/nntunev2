@@ -6,6 +6,7 @@
 	import { resolveStreamUrl } from '../library/stream-url.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
+	import VolumeControls from './VolumeControls.svelte';
 	import CurrentTrackFavorite from './CurrentTrackFavorite.svelte';
 	import { createCurrentTrackFavorite } from './currentTrackFavorite.svelte.js';
 	import { createPlayerController } from './controller.svelte.js';
@@ -21,6 +22,7 @@
 		claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
 	const { queue, media, media: { seekFeedback, playbackStatus } } = player;
 	const attachNativeAudio = media.attach;
+	const sound = media.sound.state;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	$effect.pre(() => { if (signedOut) untrack(player.purgeAtAuthBoundary); });
@@ -39,11 +41,14 @@
 		return () => { clearMiniPlayerHint(); player.destroy(); };
 	});
 </script>
+{#snippet soundControls()}
+	<VolumeControls {...$sound} onvolumeinput={media.sound.setVolume} ontogglemute={media.sound.toggleMute} />
+{/snippet}
 {@render children()}
 {#snippet favoriteAction()}<CurrentTrackFavorite currentFavorite={player.currentFavorite} snapshot={$queue} />{/snippet}
 {#if streamUrl}
 	<div class="nt-wrap">
-		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
+		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio} volumeControls={soundControls}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			retryCurrent={media.retryCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} {favoriteAction} />
