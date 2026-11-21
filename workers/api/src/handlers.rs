@@ -598,6 +598,20 @@ pub struct MemberInviteOpenWindow {
 }
 
 #[derive(Debug, serde::Serialize)]
+pub struct MemberInviteHistoryEntry {
+    pub id: i64,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub status: auth::InviteStatus,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MemberInviteHistory {
+    pub invites: Vec<MemberInviteHistoryEntry>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct InviteWindow {
     pub id: i64,
     pub starts_at: i64,
@@ -1579,6 +1593,14 @@ pub trait Store {
         &self,
         _issuer: &str,
     ) -> impl Future<Output = Result<Option<MemberInviteSummary>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Read member-issued rows in descending row-ID order; `None` means the issuer is absent or deleting.
+    fn member_invite_history(
+        &self,
+        _issuer: &str,
+        _before: Option<i64>,
+    ) -> impl Future<Output = Result<Option<MemberInviteHistory>, StoreError>> {
         async { Err(StoreError) }
     }
     fn member_issue_invite(
@@ -6212,6 +6234,42 @@ async fn member_invite_summary(
     response
 }
 
+async fn member_invite_history(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+    query: &str,
+) -> Response {
+    let mut response = async {
+        if req.authorization.is_some() {
+            return not_found();
+        }
+        let (claims, _) = match ctx.authenticate(req, false).await {
+            Ok(authenticated) => authenticated,
+            Err(response) => return response,
+        };
+        let cursor = query.strip_prefix("cursor=").filter(|value| {
+            value.len() <= 19
+                && !value.starts_with('0')
+                && value.bytes().all(|b| b.is_ascii_digit())
+        });
+        let before = cursor.and_then(|value| value.parse::<i64>().ok());
+        if !query.is_empty() && before.is_none() {
+            return validation_failed("invalid invite history cursor");
+        }
+        let issuer = &claims.user_id;
+        match ctx.store.member_invite_history(issuer, before).await {
+            Ok(Some(page)) => json_response(200, serde_json::json!(page)),
+            Ok(None) => account_deleting_response(),
+            Err(_) => internal(),
+        }
+    }
+    .await;
+    response
+        .extra_headers
+        .push(("cache-control".into(), "private, no-store".into()));
+    response
+}
+
 /// Bodyless browser issuance for the authenticated principal.
 async fn member_invite_issue(
     ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
@@ -7965,6 +8023,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/me/likes/import"
             | "/v1/me/taste"
             | "/v1/me/history"
+            | crate::native_rest::MEMBER_INVITE_HISTORY_PATH
             | "/v1/me/private-session"
             | "/v1/library"
             | "/api/library"
@@ -8157,8 +8216,9 @@ where
     // lookup budgets, so the arms reuse this row — never a second
     // `authorize_bearer` call, which would double-spend rate-limit budgets.
     let mut bearer_user: Option<String> = None;
+    let (bare_path, query) = req.path.split_once('?').unwrap_or((&req.path, ""));
     if let crate::native_rest::RouteDecision::Bearer(required) =
-        crate::native_rest::scope_for_operation(&req.method, &req.path)
+        crate::native_rest::scope_for_operation(&req.method, bare_path)
     {
         // Only a presented Authorization header enters the bearer gate:
         // header-absent callers (session cookies, anonymous) fall through
@@ -8195,6 +8255,9 @@ where
         ("GET", "/v1/plans") => plans_list(ctx, req).await,
         ("GET", "/v1/me/usage") => usage_get(ctx, req).await,
         ("GET", "/v1/me/subscription") => subscription_get(ctx, req).await,
+        ("GET", _) if bare_path == crate::native_rest::MEMBER_INVITE_HISTORY_PATH => {
+            member_invite_history(ctx, req, query).await
+        }
         ("GET", crate::native_rest::MEMBER_INVITES_PATH) => member_invite_summary(ctx, req).await,
         ("POST", crate::native_rest::MEMBER_INVITES_PATH) => member_invite_issue(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
@@ -8270,8 +8333,8 @@ where
         }
         ("GET", "/v1/admin/settings") => admin_settings_list(ctx, req).await,
         ("POST", "/v1/admin/ingest") => admin_ingest_upload(ctx, req).await,
-        // The entry preserves the list query string for exactly this
-        // route (the runtime strips it everywhere else), so the status
+        // The entry preserves the list query string for this
+        // route (the runtime strips it by default), so the status
         // filter and window survive to the handler in production.
         ("GET", path) if path == "/v1/admin/ingest" || path.starts_with("/v1/admin/ingest?") => {
             admin_ingest_list(ctx, req).await
@@ -8444,6 +8507,7 @@ mod tests {
         invites: RefCell<HashMap<String, InviteRecord>>,
         member_invite_calls: RefCell<Vec<(String, String)>>,
         member_invite_summary_calls: RefCell<Vec<String>>,
+        member_invite_history_calls: RefCell<Vec<(String, Option<i64>)>>,
         invite_window_list: RefCell<Option<Vec<InviteWindow>>>,
         invite_window_outcomes: RefCell<std::collections::VecDeque<InviteWindowOutcome>>,
         invite_window_calls: RefCell<Vec<serde_json::Value>>,
@@ -9111,6 +9175,26 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn member_invite_history(
+            &self,
+            issuer: &str,
+            before: Option<i64>,
+        ) -> Result<Option<MemberInviteHistory>, StoreError> {
+            self.member_invite_history_calls
+                .borrow_mut()
+                .push((issuer.into(), before));
+            let page = MemberInviteHistory {
+                invites: vec![MemberInviteHistoryEntry {
+                    id: 78,
+                    created_at: 10,
+                    expires_at: 20,
+                    status: auth::InviteStatus::Active,
+                }],
+                next_cursor: Some("78".into()),
+            };
+            Ok((!self.deleting_users.borrow().contains(issuer)).then_some(page))
+        }
+
         async fn member_invite_summary(
             &self,
             issuer: &str,
@@ -23435,6 +23519,81 @@ mod tests {
                 event.action
             );
         }
+    }
+
+    #[test]
+    fn member_invite_history_is_private_and_session_scoped() {
+        use crate::native_rest::{
+            scope_for_operation, RouteDecision, MEMBER_INVITE_HISTORY_PATH as PATH,
+        };
+        let h = harness();
+        seed_user(&h, "member", "member@example.com");
+        let session = magic_login(&h, "member@example.com");
+        let audits = h.store.audits.borrow().len();
+        assert_eq!(scope_for_operation("GET", PATH), RouteDecision::SessionOnly);
+        let path_from_worker = |query| {
+            crate::worker_entry::route_path(worker::Method::Get, PATH.into(), || {
+                url::Url::parse(&format!("https://example.test{PATH}?{query}")).ok()
+            })
+        };
+        let mut req = Request {
+            method: "GET".into(),
+            path: path_from_worker("cursor=79"),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let call = |req: &Request| {
+            let response = block_on(handle(&h.ctx(), req));
+            assert!(response
+                .extra_headers
+                .contains(&("cache-control".into(), "private, no-store".into())));
+            assert!(response.set_cookie.is_none());
+            response
+        };
+        assert_eq!(call(&req).status, 401);
+        req.authorization = Some("Bearer ntk_synthetic".into());
+        assert_eq!(call(&req).status, 404);
+        req.cookie = Some(session);
+        assert_eq!(call(&req).status, 404, "never fall back to the cookie");
+        req.authorization = None;
+        for query in [
+            "cursor=",
+            "cursor=0",
+            "cursor=01",
+            "cursor=9223372036854775808",
+            "cursor=1&cursor=2",
+            "issuer=other",
+        ] {
+            req.path = path_from_worker(query);
+            let response = call(&req);
+            assert_eq!(response.status, 422, "{query}");
+            assert!(response.body.contains("\"code\":\"validation_failed\""));
+        }
+        assert!(h.store.member_invite_history_calls.borrow().is_empty());
+        req.path = path_from_worker("cursor=79");
+        let success = call(&req);
+        assert_eq!(success.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&success.body).unwrap(),
+            serde_json::json!({
+                "invites": [{"id":78,"created_at":10,"expires_at":20,"status":"active"}],
+                "next_cursor": "78",
+            })
+        );
+        h.store.deleting_users.borrow_mut().insert("member".into());
+        req.path = PATH.into();
+        let deleting = call(&req);
+        assert_eq!(deleting.status, 409);
+        assert_eq!(deleting.body, account_deleting_response().body);
+        let expected_calls = [("member".to_owned(), Some(79)), ("member".to_owned(), None)];
+        assert_eq!(
+            *h.store.member_invite_history_calls.borrow(),
+            expected_calls
+        );
+        assert_eq!(h.store.audits.borrow().len(), audits);
     }
 
     #[test]

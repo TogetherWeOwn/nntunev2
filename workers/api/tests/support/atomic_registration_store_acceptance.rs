@@ -2362,6 +2362,89 @@ fn postgres_admin_invite_issue_and_revoke_audit_by_row_id() {
 
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_member_invite_history_is_scoped_paged_and_read_only() {
+    use super::member_invite_history_on as history;
+    use crate::auth::InviteStatus::*;
+    run_test(async {
+        let mut client = connect().await;
+        let tx = client.transaction().await.unwrap();
+        let (_, issuer) = seed_admin_test_users(&tx).await;
+        let (_, peer) = seed_admin_test_users(&tx).await;
+        let empty = history(&tx, &issuer, None).await.unwrap().unwrap();
+        assert!(empty.invites.is_empty() && empty.next_cursor.is_none());
+        // The enclosing transaction pins the DB clock for exact-boundary checks.
+        let clock = "SELECT floor(extract(epoch FROM now()))::bigint";
+        let now: i64 = tx.query_one(clock, &[]).await.unwrap().get(0);
+        let insert = "INSERT INTO invite_windows (starts_at, ends_at) VALUES ($1, $2) RETURNING id";
+        let row = tx
+            .query_one(insert, &[&(now - 60), &(now + 60)])
+            .await
+            .unwrap();
+        let window: i64 = row.get(0);
+        // The peer is oldest, and an admin invite by the caller is newest.
+        let insert = "WITH inserted AS (
+               INSERT INTO invite_codes (code_hash, kind, issued_by, window_id, created_at,
+                                         expires_at, used, redeemed_at, revoked_at)
+               SELECT $1::text || '-' || n, CASE WHEN n = 53 THEN 'admin' ELSE 'member' END,
+                      CASE WHEN n = 0 THEN $2::text ELSE $1 END,
+                      CASE WHEN n <> 53 THEN $3::bigint END, $4::bigint - 10,
+                      CASE WHEN n = 1 THEN $4 ELSE $4 + 120 END,
+                      n = 4, CASE WHEN n = 3 THEN $4 - 2 END,
+                      CASE WHEN n IN (2, 3, 4) THEN $4 - 1 END
+               FROM generate_series(0, 53) AS n ORDER BY n RETURNING id
+             ) SELECT id FROM inserted ORDER BY id DESC";
+        let rows = tx
+            .query(insert, &[&issuer, &peer, &window, &now])
+            .await
+            .unwrap();
+        let ids: Vec<i64> = rows[1..53].iter().map(|r| r.get(0)).collect();
+        let other: i64 = rows[53].get(0);
+        let snapshot_sql =
+            "SELECT (SELECT count(*) FROM audit_log), array_agg(ctid::text ORDER BY id)
+                            FROM invite_codes WHERE issued_by IN ($1, $2)";
+        let snapshot = async || {
+            let row = tx.query_one(snapshot_sql, &[&issuer, &peer]).await.unwrap();
+            (row.get::<_, i64>(0), row.get::<_, Vec<String>>(1))
+        };
+        let before_reads = snapshot().await;
+        let read = async |owner: &str, cursor| history(&tx, owner, cursor).await.unwrap();
+        let row_ids = |page: &crate::handlers::MemberInviteHistory| {
+            page.invites.iter().map(|r| r.id).collect::<Vec<_>>()
+        };
+        let first = read(&issuer, None).await.unwrap();
+        assert_eq!(row_ids(&first), ids[..50]);
+        for r in &first.invites[..48] {
+            assert_eq!((r.status, r.expires_at), (Active, (now + 60) as u64));
+        }
+        assert_eq!(first.invites[48].status, Redeemed, "legacy used flag wins");
+        assert_eq!(first.invites[49].status, Redeemed, "redemption stamp wins");
+        let cursor = first.next_cursor.unwrap().parse().unwrap();
+        assert_eq!(cursor, ids[49]);
+        let second = read(&issuer, Some(cursor)).await.unwrap();
+        assert_eq!(row_ids(&second), ids[50..]);
+        assert_eq!(second.invites[0].status, Revoked);
+        let boundary = &second.invites[1];
+        let expired_at_boundary = (Expired, now as u64);
+        assert_eq!((boundary.status, boundary.expires_at), expired_at_boundary);
+        assert!(second.next_cursor.is_none());
+        assert_eq!(row_ids(&read(&peer, Some(cursor)).await.unwrap()), [other]);
+
+        let close = "UPDATE invite_windows SET ends_at = $1 WHERE id = $2";
+        tx.execute(close, &[&now, &window]).await.unwrap();
+        let closed = read(&issuer, None).await.unwrap();
+        for r in &closed.invites[..48] {
+            assert_eq!((r.status, r.expires_at), expired_at_boundary);
+        }
+        let mark_deleting = "UPDATE users SET deleting_at = now() WHERE id = $1";
+        tx.execute(mark_deleting, &[&issuer]).await.unwrap();
+        assert!(read(&issuer, None).await.is_none());
+        assert_eq!(snapshot().await, before_reads, "history must not write");
+        tx.rollback().await.unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_admin_invite_ledger_uses_effective_expiry_before_limit() {
     use super::admin_list_invites_on as list;
     run_test(async {

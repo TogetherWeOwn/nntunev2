@@ -3067,6 +3067,62 @@ async fn member_invite_summary_on(
     }))
 }
 
+async fn member_invite_history_on(
+    client: &impl GenericClient,
+    issuer: &str,
+    before: Option<i64>,
+) -> Result<Option<handlers::MemberInviteHistory>, StoreError> {
+    use handlers::{MemberInviteHistory, MemberInviteHistoryEntry};
+    const PAGE_SIZE: usize = 50;
+    // One statement fences deletion; a NULL invite distinguishes an empty page.
+    let rows = client
+        .query_typed(
+            "SELECT page.id, page.created_at, LEAST(page.expires_at, w.ends_at) AS expires_at,
+                    page.redeemed, page.revoked, floor(extract(epoch FROM now()))::bigint AS now
+             FROM users u LEFT JOIN LATERAL (
+                 SELECT i.id, i.created_at, i.expires_at, i.window_id,
+                        (i.used OR i.redeemed_at IS NOT NULL) AS redeemed,
+                        (i.revoked_at IS NOT NULL) AS revoked
+                 FROM invite_codes i
+                 WHERE i.issued_by = u.id AND i.kind = 'member' AND ($2 IS NULL OR i.id < $2)
+                 ORDER BY i.id DESC LIMIT $3
+             ) page ON TRUE
+             LEFT JOIN invite_windows w ON w.id = page.window_id
+             WHERE u.id = $1 AND u.deleting_at IS NULL
+             ORDER BY page.id DESC",
+            &[
+                (&issuer, Type::TEXT),
+                (&before, Type::INT8),
+                (&((PAGE_SIZE + 1) as i64), Type::INT8),
+            ],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut invites = Vec::with_capacity(rows.len().min(PAGE_SIZE));
+    for row in rows.iter().take(PAGE_SIZE) {
+        let Some(id) = row.try_get("id")? else { break };
+        let expires_at = u64_of(row.try_get("expires_at")?)?;
+        invites.push(MemberInviteHistoryEntry {
+            id,
+            created_at: u64_of(row.try_get("created_at")?)?,
+            expires_at,
+            status: crate::auth::InviteStatus::at(
+                u64_of(row.try_get("now")?)?,
+                expires_at,
+                row.try_get("redeemed")?,
+                row.try_get("revoked")?,
+            ),
+        });
+    }
+    let next_cursor = (rows.len() > PAGE_SIZE).then(|| invites[PAGE_SIZE - 1].id.to_string());
+    Ok(Some(MemberInviteHistory {
+        invites,
+        next_cursor,
+    }))
+}
+
 async fn member_issue_invite_on(
     client: &mut tokio_postgres::Client,
     issuer: &str,
@@ -6435,6 +6491,18 @@ impl Store for PgStore {
         .await
     }
 
+    async fn member_invite_history(
+        &self,
+        issuer: &str,
+        before: Option<i64>,
+    ) -> Result<Option<handlers::MemberInviteHistory>, StoreError> {
+        Self::bounded(
+            async { member_invite_history_on(&self.connect().await?, issuer, before).await },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn member_issue_invite(
         &self,
         issuer: &str,
@@ -7805,6 +7873,23 @@ pub async fn subsonic_mount(
     respond_document(&app.handle(method, path, query, body))
 }
 
+// The runtime path has no query; restore it only for list routes that use it.
+pub(crate) fn route_path(
+    method: Method,
+    path: String,
+    url: impl FnOnce() -> Option<url::Url>,
+) -> String {
+    use crate::native_rest::MEMBER_INVITE_HISTORY_PATH;
+    match (method, path.as_str()) {
+        (Method::Get, "/v1/admin/ingest" | MEMBER_INVITE_HISTORY_PATH) => (),
+        _ => return path,
+    }
+    match url().as_ref().and_then(url::Url::query) {
+        Some(query) if !query.is_empty() => format!("{path}?{query}"),
+        _ => path,
+    }
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.
@@ -7878,27 +7963,9 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // the gates never read). Server logs redact this header the way
     // `/rest/*` logging redacts `u/p/t/s` material — nothing in this
     // module logs header values.
-    // The runtime path strips the query string everywhere; the admin
-    // ingest list route needs its `?status=&limit=&offset=` filters in
-    // production, so the entry reattaches the raw query for exactly
-    // `GET /v1/admin/ingest` (non-empty query only). Every other route
-    // keeps the bare path, so no new query surface appears elsewhere.
-    let bare_path = req.path();
-    let handler_path = if req.method() == Method::Get && bare_path == "/v1/admin/ingest" {
-        match req.url().ok().and_then(|url| {
-            url.query()
-                .filter(|query| !query.is_empty())
-                .map(|query| format!("{bare_path}?{query}"))
-        }) {
-            Some(with_query) => with_query,
-            None => bare_path,
-        }
-    } else {
-        bare_path
-    };
     let request = handlers::Request {
         method: req.method().to_string(),
-        path: handler_path,
+        path: route_path(req.method(), req.path(), || req.url().ok()),
         cookie: headers_map.get("cookie").cloned(),
         origin: headers_map.get("origin").cloned(),
         authorization: headers_map.get("authorization").cloned(),
