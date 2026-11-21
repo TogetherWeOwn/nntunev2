@@ -96,8 +96,21 @@ for (const boundary of [401, 403, 'cross-tab', 'filter'] as const) {
 			tracksStatus.resolve(boundary);
 			await expect(region.getByRole('link', { name: 'Sign in' })).toBeVisible();
 			expect(await late.evaluate((read) => read.pending())).toBe(false);
-			await page.route('**/api/library', (route) => route.fulfill({ json: [] }));
-			await page.getByRole('button', { name: 'Retry', exact: true }).click();
+			const retryStarted = Promise.withResolvers<void>();
+			const retryReady = Promise.withResolvers<void>();
+			await page.route('**/api/library', async (route) => {
+				retryStarted.resolve();
+				await retryReady.promise;
+				await route.fulfill({ json: [] });
+			});
+			try {
+				await page.getByRole('button', { name: 'Retry', exact: true }).click();
+				await retryStarted.promise;
+				await expect(page.getByRole('status').filter({ hasText: 'Loading your library…' })).toBeVisible();
+				expect(await late.evaluate((read) => read.pending())).toBe(false);
+			} finally {
+				retryReady.resolve();
+			}
 			await expect.poll(() => late.evaluate((read) => read.pending())).toBe(true);
 			await late.evaluate((read, album) => read.reply([album]), cafe);
 			await expect(region.getByRole('listitem')).toHaveText([/Café/]);
