@@ -37,11 +37,10 @@ async function cacheReceiptsBlocked(): Promise<boolean> {
 }
 
 type ClearMarker = () => unknown;
-const clearLater = (clear?: ClearMarker) => {
+const clearLater = (clear?: ClearMarker) =>
 	void Promise.resolve()
 		.then(clear)
-		.catch(() => {});
-};
+		.catch(() => undefined);
 
 async function markMutation(): Promise<ClearMarker | undefined> {
 	try {
@@ -50,39 +49,31 @@ async function markMutation(): Promise<ClearMarker | undefined> {
 			const storage = window.localStorage;
 			storage.setItem(key, '');
 			return () => storage.removeItem(key);
-		} catch {
-			// Empty cache name only: no cached data.
-			const storage = globalThis.caches;
-			await storage.open(key);
-			return () => storage.delete(key);
-		}
-	} catch {
-		/* Both stores denied the write. */
-	}
+		} catch {} // Try the fallback store.
+		await caches.open(key); // Empty cache name only: no cached data.
+		return () => caches.delete(key);
+	} catch {} // Neither store recorded a marker.
 }
 
-async function markBeforeDispatch(signal: AbortSignal) {
-	signal.throwIfAborted();
-	const marker = markMutation();
-	let onAbort!: () => void;
-	const aborted = new Promise<never>((_, reject) => {
-		onAbort = () => reject(signal.reason);
+function markBeforeDispatch(signal: AbortSignal) {
+	return new Promise<ClearMarker | undefined>((resolve, reject) => {
+		signal.throwIfAborted();
+		const onAbort = () => reject(signal.reason);
 		signal.addEventListener('abort', onAbort, { once: true });
+		void markMutation().then((clear) => {
+			signal.removeEventListener('abort', onAbort);
+			// Cache creation itself cannot be aborted.
+			if (signal.aborted) clearLater(clear);
+			else resolve(clear);
+		});
 	});
-	try {
-		return await Promise.race([marker, aborted]);
-	} catch (error) {
-		void marker.then(clearLater); // Cache creation itself cannot be aborted.
-		throw error;
-	} finally {
-		signal.removeEventListener('abort', onAbort);
-	}
 }
 
-function invalidateGeneration(): boolean {
+function invalidateGeneration(removeOnFailure = true): boolean {
 	try {
 		window.localStorage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID());
 	} catch {
+		if (!removeOnFailure) return false;
 		// Removal doesn't need quota. A later capture must initialize a NEW generation.
 		try {
 			window.localStorage.removeItem(AUTH_GENERATION_KEY);
@@ -96,8 +87,7 @@ function invalidateGeneration(): boolean {
 async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 	try {
 		return await globalThis.navigator?.locks?.request(AUTH_LOCK, { mode: 'shared', ifAvailable: true }, async (lock) => {
-			if (!lock || pending || (await cacheReceiptsBlocked()) || pending) return;
-			return work();
+			if (lock && !pending && !(await cacheReceiptsBlocked()) && !pending) return work();
 		});
 	} catch {
 		return undefined;
@@ -107,24 +97,20 @@ async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 /** Use run() for trusted dispatch, publication and storage commits, not just a receipt check. */
 export function captureAuthFence() {
 	const locks = globalThis.navigator?.locks;
-	if (!locks || typeof window === 'undefined' || !('localStorage' in window)) return;
+	if (!locks || typeof window === 'undefined') return;
 	const epoch = localEpoch;
 	return readLock(async () => {
 		if (receiptsBlocked()) return;
-		const storage = window.localStorage;
 		// Initialize once, while the outer shared lock excludes locked writes.
 		if (!generation())
 			await locks.request(`${AUTH_LOCK}.init`, () => {
-				try {
-					if (!generation() && !receiptsBlocked()) storage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID());
-				} catch {
-					/* No receipt while generation storage is unavailable. */
-				}
+				if (!generation() && !receiptsBlocked()) invalidateGeneration(false);
 			});
 		const id = generation();
-		const isCurrent = () => !!id && !pending && epoch === localEpoch && !receiptsBlocked() && generation() === id;
-		if (!(await cacheReceiptsBlocked()) && isCurrent())
+		const isCurrent = () => !pending && epoch === localEpoch && !receiptsBlocked() && generation() === id;
+		if (id && !(await cacheReceiptsBlocked()) && isCurrent())
 			return {
+				generation: id,
 				isCurrent,
 				run: <T>(work: () => T) => readLock(() => (isCurrent() ? work() : undefined))
 			};
@@ -132,10 +118,9 @@ export function captureAuthFence() {
 }
 
 /** Mark before dispatch and hold until fetch settles (including response cookies). */
-export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Promise<T>, stale?: Error): Promise<T> {
+export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Promise<T>, stale?: Error, expected?: string): Promise<T> {
 	if (typeof window === 'undefined') return dispatch();
-	if (stale && pending) throw stale;
-	const confirmed = stale && generation();
+	if (stale && (!expected || pending)) throw stale;
 	localEpoch++;
 	pending++;
 	let dispatched = false;
@@ -160,7 +145,7 @@ export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Pr
 			// Account-wide revocation must never wait behind a cookie change or fall back unlocked.
 			if (!locks) throw stale;
 			return await locks.request(AUTH_LOCK, { ifAvailable: true }, async (lock) => {
-				if (!lock || (await cacheReceiptsBlocked()) || pending !== 1 || receiptsBlocked() || confirmed !== generation()) throw stale;
+				if (!lock || (await cacheReceiptsBlocked()) || pending !== 1 || receiptsBlocked() || expected !== generation()) throw stale;
 				return send(true);
 			});
 		}

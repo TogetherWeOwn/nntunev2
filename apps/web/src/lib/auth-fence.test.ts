@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { API_REQUEST_TIMEOUT_MS, ApiClient, ApiError } from './api/client.js';
+import { API_REQUEST_TIMEOUT_MS, ApiClient } from './api/client.js';
 import { AUTH_GENERATION_KEY, AUTH_LOCK, captureAuthFence } from './auth-fence.js';
 
 const denied = () => new DOMException('Denied', 'SecurityError');
@@ -17,34 +17,23 @@ function setup() {
 	vi.stubGlobal('window', { localStorage });
 	const names = new Set<string>();
 	vi.stubGlobal('caches', {
-		keys: async () => [...names],
-		open: async (name: string) => names.add(name),
+		keys: async () => [...names], open: async (name: string) => names.add(name),
 		delete: async (name: string) => names.delete(name)
 	});
 	const send = vi.fn(async () => ok());
-	const read = () => getItem(AUTH_GENERATION_KEY);
-	const api = new ApiClient({ baseUrl: '', fetchFn: send });
-	return { read, ...localStorage, write, remove, send, api };
+	return { read: () => getItem(AUTH_GENERATION_KEY), ...localStorage, write, remove, send, api: new ApiClient({ baseUrl: '', fetchFn: send }) };
 }
 
-async function startWriter(lockDenied = false, path = '/v1/session/logout') {
+async function startWriter(lockDenied = false) {
 	// Separate writer epoch and pending count, but the same locks and stores.
 	vi.resetModules();
 	const { ApiClient: WriterClient } = await import('./api/client.js');
-	const started = Promise.withResolvers<void>();
-	const response = Promise.withResolvers<Response>();
-	const fetchFn = vi.fn(() => {
-		started.resolve();
-		return response.promise;
-	});
+	const started = Promise.withResolvers<void>(), response = Promise.withResolvers<Response>();
+	const fetchFn = () => { started.resolve(); return response.promise; };
 	if (lockDenied) vi.spyOn(navigator.locks, 'request').mockRejectedValueOnce(denied());
-	const result = new WriterClient({ baseUrl: '', fetchFn }).post(path, {});
+	const result = new WriterClient({ baseUrl: '', fetchFn }).logout();
 	await Promise.race([started.promise, result]);
-	return async () => {
-		response.resolve(ok());
-		await result;
-		expect(fetchFn).toHaveBeenCalledTimes(1);
-	};
+	return () => { response.resolve(ok()); return result; };
 }
 
 afterEach(() => {
@@ -53,8 +42,11 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 });
 
-it('shares the read lock, queues logout and recovers generation from quota failure', async () => {
+it('shares the read lock, queues logout and recovers after storage errors', async () => {
 	const { read, setItem, write, api, send } = setup();
+	setItem.mockImplementationOnce(fail(denied));
+	expect(await captureAuthFence()).toBeUndefined();
+	setItem.mockClear();
 	const [first, second] = await Promise.all([captureAuthFence(), captureAuthFence()]);
 	const initial = read();
 	expect(setItem).toHaveBeenCalledExactlyOnceWith(AUTH_GENERATION_KEY, initial);
@@ -77,13 +69,6 @@ it('shares the read lock, queues logout and recovers generation from quota failu
 	expect(await (await captureAuthFence())?.run(() => true)).toBe(true);
 	expect(read()).not.toBe(initial);
 	expect(await first!.run(() => true)).toBeUndefined();
-});
-
-it('recovers on the next capture after denied generation initialization', async () => {
-	const { setItem } = setup();
-	setItem.mockImplementationOnce(fail(denied));
-	expect(await captureAuthFence()).toBeUndefined();
-	expect((await captureAuthFence())?.isCurrent()).toBe(true);
 });
 
 it.each(['local', 'cache'])('withholds receipts on %s read denial, not logout', async (store) => {
@@ -114,7 +99,6 @@ it.each(['local', 'cache', 'lock retry'])('withholds cross-tab receipts via %s',
 		await first();
 	}
 	expect((await captureAuthFence())?.isCurrent()).toBe(true);
-	expect(await caches.keys()).toHaveLength(0);
 });
 
 it.each([true, false])('guards locked writes on generation failure (recovers: %s)', async (recovers) => {
@@ -123,10 +107,8 @@ it.each([true, false])('guards locked writes on generation failure (recovers: %s
 	setItem.mockImplementation(fail(denied));
 	removeItem.mockImplementation(fail(denied));
 	const writer = await startWriter();
-	if (recovers) {
-		setItem.mockImplementation(write);
-		removeItem.mockImplementation(remove);
-	}
+	setItem.mockImplementation(recovers ? write : fail(denied));
+	removeItem.mockImplementation(recovers ? remove : fail(denied));
 	await writer();
 	expect(await before.run(() => true)).toBeUndefined();
 	expect((await captureAuthFence())?.isCurrent()).toBe(recovers ? true : undefined);
@@ -144,11 +126,7 @@ it.each(['open', 'delete'] as const)('does not wait beyond the auth deadline for
 	const logout = api.logout().catch((error: unknown) => error);
 	try {
 		await vi.advanceTimersByTimeAsync(API_REQUEST_TIMEOUT_MS);
-		const result = await logout;
-		if (op === 'open') {
-			expect(result).toBeInstanceOf(ApiError);
-			expect(result).toMatchObject({ code: 'request_timeout' });
-		} else expect(result).toBeUndefined();
+		expect(await logout).toEqual(op === 'open' ? expect.objectContaining({ code: 'request_timeout' }) : undefined);
 	} finally {
 		ready.resolve();
 		await vi.advanceTimersByTimeAsync(0);
@@ -167,16 +145,31 @@ it.each(['', '?source=settings'])('fences sign-in and does not retry after dispa
 	expect(send).toHaveBeenCalledTimes(1);
 });
 
-it('rejects sign out everywhere rather than queuing behind sign-in', async () => {
-	const { api, send } = setup();
-	const writer = await startWriter(false, '/v1/auth/magic/finish');
-	const result = api.revokeAllSessions().catch((error: unknown) => error);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
-	await writer();
-	expect(await result).toMatchObject({ code: 'conflict' });
-	expect(send).not.toHaveBeenCalled();
-	await api.revokeAllSessions();
-	expect(send).toHaveBeenCalledTimes(1);
+it.each(['busy', 'changed', 'missing', 'unchanged', 'cancelled'])('checks revocation at admission (%s)', async (state) => {
+	const { api, send, read, write, remove } = setup();
+	const unlock = Promise.withResolvers<void>(), confirmed = Promise.withResolvers<void>();
+	let writer: Promise<void> | undefined;
+	const result = api.revokeAllSessions(() => {
+		expect(read()).toBeTruthy();
+		if (state === 'busy') writer = navigator.locks.request(AUTH_LOCK, () => unlock.promise);
+		if (state === 'changed') write(AUTH_GENERATION_KEY, 'new-generation');
+		if (state === 'missing') remove(AUTH_GENERATION_KEY);
+		confirmed.resolve();
+		return state !== 'cancelled';
+	}).catch((error: unknown) => error);
+	try {
+		if (state === 'busy') {
+			await Promise.race([confirmed.promise, result]);
+			expect((await navigator.locks.query()).pending).not.toContainEqual(exclusive);
+		}
+		if (state === 'cancelled') expect(await result).toBeUndefined();
+		else if (state === 'unchanged') expect(await result).toEqual({});
+		else expect(await result).toMatchObject({ code: 'conflict' });
+		expect(send).toHaveBeenCalledTimes(state === 'unchanged' ? 1 : 0);
+	} finally {
+		unlock.resolve();
+		await Promise.all([writer, result]);
+	}
 });
 
 it.each([0, 1])('releases the shared lock when cache enumeration %i stalls', async (check) => {

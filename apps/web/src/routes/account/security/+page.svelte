@@ -67,12 +67,15 @@
 	}
 
 	async function signOutEverywhere() {
-		if (!alive || busy !== null || !window.confirm('Sign out on every device?')) return;
+		if (!alive || busy !== null) return;
 		busy = 'everywhere';
 		actionError = null;
 		revokeIncomplete = false;
 		try {
-			await client.revokeAllSessions();
+			if (!(await client.revokeAllSessions(() => alive && window.confirm('Sign out on every device?')))) {
+				busy = null;
+				return;
+			}
 		} catch (error) {
 			if (error instanceof ApiError && error.status === 401) {
 				// A 401 means this request was rejected before any session
