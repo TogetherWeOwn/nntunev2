@@ -7,6 +7,7 @@ export type SystemSeekOwner = {
 	audio: HTMLAudioElement;
 	attachment: number;
 	availability: Readable<AbsoluteSeekState>;
+	onUnavailable: () => void;
 	matches: () => boolean;
 	seek: (attachment: number, seconds: number) => void;
 	jump: (direction: JumpDirection, seconds: number) => void;
@@ -39,7 +40,13 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 			function canDispatch() {
 				// The OS can retain callbacks across both unregistration and attachment teardown.
 				const current = () => !signal.aborted && handlers === registration;
-				return current() && owner.matches() && readAbsoluteSeek(owner.audio).enabled && owner.matches() && current();
+				if (!current() || !owner.matches()) return false;
+				const enabled = readAbsoluteSeek(owner.audio).enabled;
+				if (!owner.matches() || !current()) return false;
+				if (enabled) return true;
+				refresh(false);
+				owner.onUnavailable();
+				return false;
 			}
 			function relative(action: string, direction: JumpDirection) {
 				return (details: MediaSessionSeekDetails) => {

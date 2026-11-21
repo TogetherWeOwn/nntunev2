@@ -684,10 +684,18 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (target?.attachment === receipt) {
 				sound.connect(audio, target.matches, receipt.listeners.signal);
 				readPlayback(audio, target.matches, 'starting');
+				const attachment = attachmentVersion;
+				const matchesSeek = () => target.matches(() => currentTrack(queue.snapshot)?.id === trackId);
 				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
 					{ playCurrent, pauseCurrent }, receipt.listeners.signal, {
-						audio, attachment: attachmentVersion, availability: absoluteSeek, seek, jump,
-						matches: () => target.matches(() => currentTrack(queue.snapshot)?.id === trackId)
+						audio, attachment, availability: absoluteSeek, seek, jump, matches: matchesSeek,
+						onUnavailable() {
+							// Publish the loss so an otherwise unchanged recovery observation can rebind.
+							const state = get(absoluteSeek);
+							if (state.enabled && state.attachment === attachment && matchesSeek()) {
+								absoluteSeek.set({ ...state, enabled: false });
+							}
+						}
 					});
 			}
 			observePosition();

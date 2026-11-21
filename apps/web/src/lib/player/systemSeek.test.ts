@@ -159,6 +159,27 @@ test('unseekable media has no handlers and retired registrations cannot revive',
 	media.destroy();
 });
 
+test('a seek that observes lost capability retires the registration before the next native event', () => {
+	const { audio, media, handlers, fire } = setup();
+	audio.setReady();
+	const retired = actions.map((action) => handlers.get(action)!);
+	audio.ranges = [];
+	retired[0]!({ action: 'seekto', seekTime: 10 });
+	expect(audio.currentTime).toBe(20);
+	const clearedBeforeRecovery = actions.every((action) => handlers.get(action) === null);
+
+	audio.setReady(); // No native event ever published the loss.
+	for (const [i, action] of actions.entries()) {
+		retired[i]!({ action, seekTime: 10, seekOffset: 1 });
+		expect(audio.currentTime).toBe(20);
+		expect(handlers.get(action)).not.toBe(retired[i]);
+	}
+	expect(clearedBeforeRecovery).toBe(true);
+	fire('seekto', { seekTime: 10 });
+	expect(audio.currentTime).toBe(10);
+	media.destroy();
+});
+
 test('one unsupported action does not break another action or compact Play', async () => {
 	const { audio, media, handlers, fire } = setup('seekto');
 	audio.setReady();
