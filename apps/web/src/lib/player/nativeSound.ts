@@ -36,7 +36,13 @@ export function createNativeSound(
 				volume: saveVolume ? observed.volume : preference.volume,
 				muted: muteChanged ? observed.muted : preference.muted
 			};
-			saveSoundPreference(getStorage(), preference);
+			// Merge for storage only; replacement still uses this tab's accepted choices.
+			const storage = getStorage();
+			const saved = loadSoundPreference(storage, preference);
+			saveSoundPreference(storage, {
+				volume: saveVolume ? preference.volume : saved.volume,
+				muted: muteChanged ? preference.muted : saved.muted
+			});
 		}
 		observed.restricted ||= actual.restricted;
 		if (volumeChanged || muteChanged || observed.restricted !== actual.restricted) {

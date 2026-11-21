@@ -66,6 +66,26 @@ test('keyboard and native sound stay in sync across routes, replacement and relo
 	await expect(mute).toHaveAttribute('aria-pressed', 'false');
 });
 
+test('separate tabs preserve both sound choices across reload', async ({ page, context }) => {
+	const first = await openLibrary(page);
+	const otherTab = await context.newPage();
+	const second = await openLibrary(otherTab);
+	await expect(second.volume).toHaveValue('100');
+	await first.volume.fill('30');
+	await expect.poll(() => stored(page)).toEqual({ version: 1, volume: 0.3, muted: false });
+	await second.mute.press('Space');
+	await expect(second.audio).toHaveJSProperty('muted', true);
+	await expect(second.audio).toHaveJSProperty('volume', 1);
+
+	await otherTab.reload();
+	await otherTab.getByTestId('library-item').filter({ hasText: 'Sound A' }).click();
+	await expect(second.audio).toHaveJSProperty('muted', true);
+	await expect(second.volume).toHaveValue('30');
+	await second.mute.press('Space');
+	await expect(second.audio).toHaveJSProperty('muted', false);
+	await expect(second.audio).toHaveJSProperty('volume', 0.3);
+});
+
 test('restricted volume falls back to system controls and auth purge fences the outgoing audio', async ({ page }) => {
 	await page.addInitScript(() => {
 		const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'volume')!;

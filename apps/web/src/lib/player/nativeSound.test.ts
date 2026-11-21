@@ -52,6 +52,22 @@ describe('persistent native sound', () => {
 		expect(storage.setItem).toHaveBeenLastCalledWith(SOUND_PREFERENCE_STORAGE_KEY, stored(0.42, false));
 	});
 
+	it('merges into valid storage without adopting another tab’s mute on replacement', () => {
+		const { storage, sound, connect } = setup(stored(1, false));
+		const old = connect(new Audio());
+		storage.getItem.mockReturnValue(stored(1, true));
+		sound.setVolume(0.3);
+		expect(storage.setItem).toHaveBeenLastCalledWith(SOUND_PREFERENCE_STORAGE_KEY, stored(0.3, true));
+		old.abort();
+		const replacement = new Audio();
+		connect(replacement);
+		expect(replacement.muted).toBe(false);
+		storage.getItem.mockReturnValue('{"version":1,"volume":99,"muted":false}');
+		sound.toggleMute();
+		expect(storage.setItem).toHaveBeenCalledTimes(2);
+		expect(storage.setItem).toHaveBeenLastCalledWith(SOUND_PREFERENCE_STORAGE_KEY, stored(0.3, true));
+	});
+
 	it.each(['ignore', 'throw'] as const)('keeps mute usable without overwriting a saved volume when setters %s', (mode) => {
 		const { storage, sound, connect, read } = setup(stored(0.35, true));
 		const audio = new Audio();
