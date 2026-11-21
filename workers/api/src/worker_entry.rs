@@ -2943,8 +2943,11 @@ async fn admin_issue_invite_on(
     Ok(AdminInviteIssueOutcome::Issued(invite_id))
 }
 
-// A paid month is 30 days of purchased service, not a count of invoices.
-const MEMBER_INVITE_PAID_MONTH_SECS: i64 = 30 * 86_400;
+impl From<tokio_postgres::Error> for StoreError {
+    fn from(_: tokio_postgres::Error) -> Self {
+        StoreError
+    }
+}
 
 async fn member_issue_invite_on(
     client: &mut tokio_postgres::Client,
@@ -2958,44 +2961,27 @@ async fn member_issue_invite_on(
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
         .start()
-        .await
-        .map_err(|_| StoreError)?;
+        .await?;
     tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
-        .await
-        .map_err(|_| StoreError)?;
+        .await?;
     use tokio_postgres::types::ToSql;
     let member: [(&(dyn ToSql + Sync), Type); 1] = [(&issuer, Type::TEXT)];
-    // The issuer lock serializes quota spending without blocking others'
-    // FK checks. It also fences account erasure/scheduling. The subsequent
-    // READ COMMITTED statements see the previous spender's committed row.
-    if tx
-        .query_typed_opt(
-            "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR NO KEY UPDATE",
-            &member,
-        )
-        .await
-        .map_err(|_| StoreError)?
-        .is_none()
-    {
+    // Serialize spending and fence erasure without blocking FK checks.
+    let issuer_lock =
+        "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR NO KEY UPDATE";
+    if tx.query_typed_opt(issuer_lock, &member).await?.is_none() {
         return Ok(Outcome::AccountDeleting);
     }
-    // Shared locks admit unrelated issuers concurrently but fence early close
-    // and billing reconciliation until this issuance finishes.
+    // Shared locks fence early close and billing updates without serializing issuers.
     let Some(window) = tx.query_typed_opt(
         "SELECT id, starts_at, ends_at FROM invite_windows
          WHERE int8range(starts_at, ends_at, '[)') @> floor(extract(epoch FROM statement_timestamp()))::bigint
          FOR SHARE", &[],
-    ).await.map_err(|_| StoreError)? else { return Ok(Outcome::WindowClosed); };
+    ).await? else { return Ok(Outcome::WindowClosed); };
+    let live = crate::billing::subscription_live_select_statement();
     let Some(sub) = tx
-        .query_typed_opt(
-            &format!(
-                "{} FOR SHARE",
-                crate::billing::subscription_live_select_statement()
-            ),
-            &member,
-        )
-        .await
-        .map_err(|_| StoreError)?
+        .query_typed_opt(&format!("{live} FOR SHARE"), &member)
+        .await?
     else {
         return Ok(Outcome::Ineligible);
     };
@@ -3003,21 +2989,20 @@ async fn member_issue_invite_on(
     for row in tx.query_typed(
         "SELECT key, value FROM app_settings WHERE key IN
          ('invite_member_min_paid_months', 'invite_member_per_window', 'invite_default_expiry_days') FOR SHARE", &[],
-    ).await.map_err(|_| StoreError)? {
-        settings.insert(row.try_get::<_, String>(0).map_err(|_| StoreError)?, row.try_get::<_, String>(1).map_err(|_| StoreError)?);
+    ).await? {
+        settings.insert(row.try_get::<_, String>(0)?, row.try_get::<_, String>(1)?);
     }
     let setting = |key: SettingKey| {
         key.resolve(settings.get(key.as_str()).map(String::as_str))
             .map(i64::from)
             .ok_or(StoreError)
     };
-    let window_id: i64 = window.try_get(0).map_err(|_| StoreError)?;
+    let window_id: i64 = window.try_get(0)?;
     let cap = setting(SettingKey::InviteMemberPerWindow)?;
-    let threshold = setting(SettingKey::InviteMemberMinPaidMonths)? * MEMBER_INVITE_PAID_MONTH_SECS;
-    // Evaluate quota first, then union paid spans without bridging gaps. A
-    // finite, nonempty service range on a positive confirmed invoice counts.
+    // One paid month is 30 days of confirmed service. Union overlaps but not gaps.
+    let threshold = setting(SettingKey::InviteMemberMinPaidMonths)? * 30 * 86_400;
     let policy = tx
-        .query_typed_opt(
+        .query_typed_one(
             "SELECT CASE
            WHEN $3 = 0 OR EXISTS (SELECT 1 FROM invite_codes WHERE window_id = $1
              AND issued_by = $2 OFFSET greatest($3 - 1, 0) LIMIT 1) THEN 'quota'
@@ -3026,7 +3011,7 @@ async fn member_issue_invite_on(
                FROM paid_invoice_history WHERE user_id = $2 AND amount_cents > 0
                  AND paid_at <= statement_timestamp() AND period_start < period_end
                  AND isfinite(period_start) AND isfinite(period_end))) AS span) < $4 THEN 'history'
-           ELSE 'eligible' END",
+           ELSE 'eligible' END, floor(extract(epoch FROM clock_timestamp()))::bigint",
             &[
                 (&window_id, Type::INT8),
                 (&issuer, Type::TEXT),
@@ -3034,52 +3019,40 @@ async fn member_issue_invite_on(
                 (&threshold, Type::INT8),
             ],
         )
-        .await
-        .map_err(|_| StoreError)?
-        .ok_or(StoreError)?;
-    match policy.try_get(0).map_err(|_| StoreError)? {
+        .await?;
+    match policy.try_get(0)? {
         "quota" => return Ok(Outcome::QuotaExhausted),
         "history" => return Ok(Outcome::Ineligible),
         "eligible" => (),
         _ => return Err(StoreError),
     }
-    // Sample the live clock after potentially blocking reads; the originally
-    // selected window may now be closed even though its row is locked.
-    let now: i64 = tx
-        .query_typed_opt(
-            "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint",
-            &[],
-        )
-        .await
-        .map_err(|_| StoreError)?
-        .ok_or(StoreError)?
-        .try_get(0)
-        .map_err(|_| StoreError)?;
-    let starts_at: i64 = window.try_get(1).map_err(|_| StoreError)?;
-    let ends_at: i64 = window.try_get(2).map_err(|_| StoreError)?;
-    if !(starts_at..ends_at).contains(&now) {
-        return Ok(Outcome::WindowClosed);
-    }
+    let now: i64 = policy.try_get(1)?;
+    let starts_at: i64 = window.try_get(1)?;
+    let ends_at: i64 = window.try_get(2)?;
     let view = crate::billing::SubscriptionView {
-        plan_id: sub.try_get("plan_id").map_err(|_| StoreError)?,
-        status: sub.try_get("status").map_err(|_| StoreError)?,
-        cancel_at_period_end: sub
-            .try_get("cancel_at_period_end")
-            .map_err(|_| StoreError)?,
-        paid_through_at_unix: sub
-            .try_get("paid_through_at_unix")
-            .map_err(|_| StoreError)?,
-        grace_until_unix: sub.try_get("grace_until_unix").map_err(|_| StoreError)?,
+        plan_id: sub.try_get("plan_id")?,
+        status: sub.try_get("status")?,
+        cancel_at_period_end: sub.try_get("cancel_at_period_end")?,
+        paid_through_at_unix: sub.try_get("paid_through_at_unix")?,
+        grace_until_unix: sub.try_get("grace_until_unix")?,
         current_period_end_unix: None,
     };
-    if !crate::billing::resolve_effective_plan(Some(view), now).entitled {
-        return Ok(Outcome::Ineligible);
+    let refuse = |at| {
+        if !(starts_at..ends_at).contains(&at) {
+            Some(Outcome::WindowClosed)
+        } else if !crate::billing::resolve_effective_plan(Some(view), at).entitled {
+            Some(Outcome::Ineligible)
+        } else {
+            None
+        }
+    };
+    if let Some(reason) = refuse(now) {
+        return Ok(reason);
     }
-    let expires_at =
-        ends_at.min(now.saturating_add(setting(SettingKey::InviteDefaultExpiryDays)? * 86_400));
+    let expires_at = ends_at.min(now + setting(SettingKey::InviteDefaultExpiryDays)? * 86_400);
     let ip = crate::vault::sanitize_source_ip(Some(source_ip));
     let audit = tx
-        .query_typed_opt(
+        .query_typed_one(
             "WITH issued AS (
            INSERT INTO invite_codes (code_hash, created_at, issued_by, kind, expires_at, window_id)
            VALUES ($1, $2, $3, 'member', $4, $5) RETURNING id
@@ -3096,11 +3069,16 @@ async fn member_issue_invite_on(
                 (&ip, Type::TEXT),
             ],
         )
-        .await
-        .map_err(|_| StoreError)?
-        .ok_or(StoreError)?;
-    let id = audit.try_get(0).map_err(|_| StoreError)?;
-    tx.commit().await.map_err(|_| StoreError)?;
+        .await?;
+    let id = audit.try_get(0)?;
+    // Writes can wait on locks. Check against the live DB clock before commit.
+    let clock = "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint";
+    let after = tx.query_typed_one(clock, &[]).await?;
+    if let Some(reason) = refuse(after.try_get(0)?) {
+        tx.rollback().await?;
+        return Ok(reason);
+    }
+    tx.commit().await?;
     Ok(Outcome::Issued { id, expires_at })
 }
 
@@ -6278,14 +6256,10 @@ impl Store for PgStore {
         code_hash: &str,
         source_ip: &str,
     ) -> Result<MemberInviteIssueOutcome, StoreError> {
-        Self::bounded(
-            async {
-                member_issue_invite_on(&mut self.connect().await?, issuer, code_hash, source_ip)
-                    .await
-            },
-            TOTAL_TIMEOUT_MS,
-        )
-        .await
+        let issue = async {
+            member_issue_invite_on(&mut self.connect().await?, issuer, code_hash, source_ip).await
+        };
+        Self::bounded(issue, TOTAL_TIMEOUT_MS).await
     }
 
     async fn admin_list_invites(

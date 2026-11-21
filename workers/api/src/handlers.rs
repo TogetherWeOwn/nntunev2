@@ -6104,8 +6104,7 @@ where
     )
 }
 
-/// Browser-only, bodyless copy-link issuance. The issuer is always the
-/// authenticated principal, never a request parameter.
+/// Bodyless browser issuance for the authenticated principal.
 async fn member_invite_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -6124,21 +6123,16 @@ where
     if !req.body.is_empty() {
         return validation_failed("member invite issuance takes no request body");
     }
-    let code = match auth::generate_invite_code() {
-        Ok(code) => code,
-        Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
-        Err(_) => return internal(),
+    let Ok(code) = auth::generate_invite_code() else {
+        return unavailable();
     };
     use crate::api_error::ApiError;
-    let error = match ctx
+    let hash = auth::hash_invite_code(&code);
+    let issued = ctx
         .store
-        .member_issue_invite(
-            &claims.user_id,
-            &auth::hash_invite_code(&code),
-            &ctx.source_ip,
-        )
-        .await
-    {
+        .member_issue_invite(&claims.user_id, &hash, &ctx.source_ip)
+        .await;
+    let error = match issued {
         Ok(Outcome::Issued { id, expires_at }) => {
             return Response {
                 extra_headers: vec![("cache-control".into(), "private, no-store".into())],
@@ -8317,6 +8311,7 @@ mod tests {
         /// mailbox (mirrors the migration 0018 table).
         qa_codes: RefCell<HashMap<String, QaIssuedCode>>,
         invites: RefCell<HashMap<String, InviteRecord>>,
+        member_invite_calls: RefCell<Vec<(String, String)>>,
         invite_window_list: RefCell<Option<Vec<InviteWindow>>>,
         invite_window_outcomes: RefCell<std::collections::VecDeque<InviteWindowOutcome>>,
         invite_window_calls: RefCell<Vec<serde_json::Value>>,
@@ -8981,6 +8976,21 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn member_issue_invite(
+            &self,
+            issuer: &str,
+            hash: &str,
+            _: &str,
+        ) -> Result<MemberInviteIssueOutcome, StoreError> {
+            self.member_invite_calls
+                .borrow_mut()
+                .push((issuer.into(), hash.into()));
+            Ok(MemberInviteIssueOutcome::Issued {
+                id: 1,
+                expires_at: 2,
+            })
+        }
+
         async fn admin_list_invite_windows(&self) -> Result<Vec<InviteWindow>, StoreError> {
             self.invite_window_calls
                 .borrow_mut()
@@ -23033,19 +23043,31 @@ mod tests {
             stripe_signature: None,
             body: Vec::new(),
         };
-        let status = |req: &Request| block_on(handle(&h.ctx(), req)).status;
-        assert_eq!(status(&req), 404);
+        let send = |req: &Request| block_on(handle(&h.ctx(), req));
+        assert_eq!(send(&req).status, 404);
         req.authorization = None;
-        // Only the authenticated bodyless request reaches the unavailable fake store.
-        assert_eq!(status(&req), 500);
         req.body = br#"{"issuer":"other"}"#.to_vec();
-        assert_eq!(status(&req), 400);
+        assert_eq!(send(&req).status, 422);
         req.body.clear();
         req.origin = None;
-        assert_eq!(status(&req), 401);
+        assert_eq!(send(&req).status, 401);
         assert_eq!(
             h.call_full("POST", PATH, None, None, Some(ORIGIN)).status,
             401
+        );
+        req.origin = Some(ORIGIN.into());
+        let response = send(&req);
+        assert_eq!(response.status, 201);
+        assert!(response
+            .extra_headers
+            .contains(&("cache-control".into(), "private, no-store".into())));
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let code = body["code"].as_str().unwrap();
+        let hash = auth::hash_invite_code(code);
+        assert_ne!(hash, code);
+        assert_eq!(
+            &*h.store.member_invite_calls.borrow(),
+            &[("member".to_owned(), hash)]
         );
     }
 
