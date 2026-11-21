@@ -148,3 +148,175 @@ test('a logout in another tab drops identity and stops the decoder while expande
 	await expect(page.locator('audio')).toHaveCount(0);
 	expect(await decoder.evaluate((node) => node.paused && !node.isConnected)).toBe(true);
 });
+
+const enterFullscreen = (page: Page) => page.getByRole('button', { name: 'Full screen', exact: true });
+const exitFullscreen = (page: Page) => page.getByRole('button', { name: 'Exit full screen', exact: true });
+const back = (page: Page) => page.getByRole('main').getByRole('button', { name: 'Back', exact: true });
+const noFullscreen = (page: Page) => page.evaluate(() => document.fullscreenElement === null);
+
+async function openDesktopExpanded(page: Page) {
+	// The currently shipped entry point is the narrow layout's mini-player.
+	await page.setViewportSize({ width: 390, height: 844 });
+	const decoder = await startPlayback(page);
+	await expect(enterFullscreen(page)).toBeHidden();
+	await miniLink(page).click();
+	await expectExpanded(page);
+	await expect(enterFullscreen(page)).toBeHidden();
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await expect(enterFullscreen(page)).toBeVisible();
+	return decoder;
+}
+
+for (const paused of [true, false]) {
+	test(`native fullscreen preserves the ${paused ? 'paused' : 'playing'} decoder across entry, exit and Back`, async ({ page }) => {
+		const decoder = await openDesktopExpanded(page);
+		if (paused) {
+			await decoder.evaluate((node) => new Promise<void>((resolve) => {
+				node.addEventListener('pause', () => resolve(), { once: true });
+				node.pause();
+			}));
+		}
+		const before = await decoder.evaluate((node) => {
+			for (const event of ['loadstart', 'play', 'pause', 'seeking']) {
+				node.addEventListener(event, () => { node.dataset.fullscreenMediaEvent = event; });
+			}
+			return { source: node.currentSrc, position: node.currentTime };
+		});
+		let position = before.position;
+		const time = () => decoder.evaluate((node) => node.currentTime);
+		const expectSamePlayback = async () => {
+			await expect(audio(page)).toHaveCount(1);
+			expect(await decoder.evaluate((node) => ({
+				sameNode: document.querySelector('audio[data-testid="audio-player"]') === node,
+				source: node.currentSrc,
+				paused: node.paused,
+				event: node.dataset.fullscreenMediaEvent,
+				insideFullscreen: document.fullscreenElement?.contains(node) ?? false
+			}))).toEqual({ sameNode: true, source: before.source, paused, event: undefined, insideFullscreen: false });
+			if (paused) expect(await time()).toBeCloseTo(position, 3);
+			else await expect.poll(time).toBeGreaterThan(position + 0.1);
+			position = await time();
+		};
+
+		const enter = enterFullscreen(page);
+		const exit = exitFullscreen(page);
+		await enter.press('Enter');
+		await expect(exit).toBeFocused();
+		await expect.poll(() => page.evaluate(() => {
+			const surface = document.fullscreenElement;
+			return surface?.matches('main#main-content') === true &&
+				surface.contains(document.elementFromPoint(8, 8));
+		})).toBe(true);
+		await expectSamePlayback();
+
+		await exit.click();
+		await expect.poll(() => noFullscreen(page)).toBe(true);
+		await expect(enter).toBeFocused();
+		await expectSamePlayback();
+
+		await enter.click();
+		await expect(exit).toBeVisible();
+		await back(page).focus();
+		// Headless Chromium does not reliably route Escape through browser chrome.
+		// A native exit outside the app exercises that same fullscreenchange path.
+		await page.evaluate(() => document.exitFullscreen());
+		await expect(enter).toBeFocused();
+		await expectSamePlayback();
+
+		await enter.click();
+		await expect(exit).toBeVisible();
+		await back(page).click();
+		await expect(page).toHaveURL(/\/library$/);
+		await expect.poll(() => noFullscreen(page)).toBe(true);
+		await expect(enter).toHaveCount(0);
+		await expectSamePlayback();
+		await expect(page.getByTestId('now-playing')).toContainText(track.title);
+		await expect(page.getByTestId('player-next')).toBeVisible();
+	});
+}
+
+test('unavailable fullscreen leaves the expanded view and Back usable', async ({ page }) => {
+	await page.addInitScript(() => {
+		Object.defineProperty(document, 'fullscreenEnabled', { get: () => false });
+	});
+	await openDesktopExpanded(page);
+	await expect(enterFullscreen(page)).toBeDisabled();
+	await expect(page.getByText('Full screen is unavailable in this browser.')).toBeVisible();
+	await expect.poll(() => noFullscreen(page)).toBe(true);
+	await back(page).click();
+	await expect(page).toHaveURL(/\/library$/);
+});
+
+test('refused fullscreen entry and exit are truthful and retryable', async ({ page }) => {
+	await page.addInitScript(() => {
+		const request = Element.prototype.requestFullscreen;
+		const exit = Document.prototype.exitFullscreen;
+		let refuseEntry = true;
+		let refuseExit = true;
+		Element.prototype.requestFullscreen = function (options) {
+			if (!refuseEntry) return request.call(this, options);
+			refuseEntry = false;
+			return Promise.reject(new TypeError('Fixture refused entry'));
+		};
+		Document.prototype.exitFullscreen = function () {
+			if (!refuseExit) return exit.call(this);
+			refuseExit = false;
+			return Promise.reject(new TypeError('Fixture refused exit'));
+		};
+	});
+	await openDesktopExpanded(page);
+	const enter = enterFullscreen(page);
+	const exit = exitFullscreen(page);
+	await enter.click();
+	await expect(page.getByText('Could not enter full screen.')).toBeVisible();
+	await expect.poll(() => noFullscreen(page)).toBe(true);
+	await expect(enter).toBeFocused();
+
+	await enter.click();
+	await expect(exit).toBeFocused();
+	await expect(page.getByText('Could not enter full screen.')).toHaveCount(0);
+	await exit.click();
+	await expect(page.getByText('Could not exit full screen.')).toBeVisible();
+	await expect(exit).toBeFocused();
+	await expect.poll(() => noFullscreen(page)).toBe(false);
+
+	await exit.click();
+	await expect(enter).toBeFocused();
+	await expect.poll(() => noFullscreen(page)).toBe(true);
+	await expect(page.getByText('Could not exit full screen.')).toHaveCount(0);
+});
+
+test('leaving with entry pending retires the fullscreen request without affecting the next visit', async ({ page }) => {
+	await page.addInitScript(() => {
+		const request = Element.prototype.requestFullscreen;
+		let hold = true;
+		Element.prototype.requestFullscreen = function (options) {
+			if (!hold) return request.call(this, options);
+			this.setAttribute('data-held-fullscreen-requests', String(
+				Number(this.getAttribute('data-held-fullscreen-requests')) + 1
+			));
+			return new Promise<void>((_, reject) => {
+				document.addEventListener('release-fullscreen-fixture', () => {
+					hold = false;
+					reject(new TypeError('Fixture request retired'));
+				}, { once: true });
+			});
+		};
+	});
+	await openDesktopExpanded(page);
+	const enter = enterFullscreen(page);
+	await enter.click();
+	await expect(enter).toBeDisabled();
+	await enter.evaluate((button) => (button as HTMLButtonElement).click());
+	await expect(page.getByRole('main')).toHaveAttribute('data-held-fullscreen-requests', '1');
+	await back(page).click();
+	await expect(page).toHaveURL(/\/library$/);
+	await page.goForward();
+	await expectExpanded(page);
+	await page.evaluate(() => document.dispatchEvent(new Event('release-fullscreen-fixture')));
+	await expect(enter).toBeEnabled();
+	await expect(heading(page)).toBeFocused();
+	await expect(page.getByText('Could not enter full screen.')).toHaveCount(0);
+	await enter.click();
+	await expect(exitFullscreen(page)).toBeFocused();
+});
