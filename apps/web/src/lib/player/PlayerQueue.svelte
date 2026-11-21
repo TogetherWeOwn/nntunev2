@@ -225,6 +225,16 @@
 		);
 	}
 
+	async function reportMove(button: HTMLButtonElement, from: number, to: number): Promise<void> {
+		const heldFocus = document.activeElement === button;
+		onmove?.(from, to);
+		await tick();
+		// Moving a keyed row can detach and reinsert its focused control.
+		if (!button.isConnected || button.disabled || !focusStranded(heldFocus, button)) return;
+		button.focus({ preventScroll: true });
+		button.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+	}
+
 	/**
 	 * Report one remove intent, then land focus deterministically: the next
 	 * surviving displayed row's Remove, otherwise the previous, otherwise
@@ -885,7 +895,7 @@
 				type="button"
 				aria-label="Move {displayTitle(track)} up"
 				disabled={index === 0}
-				onclick={() => onmove?.(index, index - 1)}
+				onclick={(event) => reportMove(event.currentTarget, index, index - 1)}
 			>
 				Up
 			</button>
@@ -893,7 +903,7 @@
 				type="button"
 				aria-label="Move {displayTitle(track)} down"
 				disabled={index === trackCount - 1}
-				onclick={() => onmove?.(index, index + 1)}
+				onclick={(event) => reportMove(event.currentTarget, index, index + 1)}
 			>
 				Down
 			</button>

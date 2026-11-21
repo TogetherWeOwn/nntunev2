@@ -165,9 +165,10 @@ test.each(['nexttrack', 'previoustrack'] as const)('unsupported %s leaves the ot
 	const { handler } = stubSession(unsupported);
 	const next = unsupported === 'previoustrack';
 	const base = { ...createQueue([coral, moss]), currentIndex: next ? 0 : 1 };
-	const { queue, media, purgeAtAuthBoundary, destroy } = createPlayerController(base, { flush: async () => {} }, () => true);
+	const { queue, media, reconcileLibrary, purgeAtAuthBoundary, destroy } = createPlayerController(base, { flush: async () => {} }, () => true);
 	const audio = new Decoder(base.tracks[base.currentIndex].streamUrl);
 	try {
+		expect(reconcileLibrary(base.tracks, () => true)).toBe(true);
 		media.attach(audio.element);
 		expect(handler(unsupported)).toBeUndefined();
 		expect(queue.snapshot).toBe(base);
