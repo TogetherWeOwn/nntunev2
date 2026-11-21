@@ -64,6 +64,14 @@ while IFS=$'\t' read -r target name; do
   psql_run -d "nntune_${target}_ci" < "$root/migrations/$name"
 done < "$tmp/migrations"
 
+fixtures="$root/workers/api/tests/fixtures"
+# psql receives quoted values, then runs the rehearsal in its disposable app DB only.
+psql_run -d nntune_app_ci \
+  -v corpus="$(<"$fixtures/legacy-playlists-v1.json")" \
+  -v playlist_schema="$(<"$fixtures/private_playlist_schema.sql")" \
+  -v playlist_crud="$(<"$fixtures/private_playlist_crud.sql")" \
+  < "$fixtures/private_playlist_rehearsal.sql"
+
 port="$(docker_clean port "$id" 5432/tcp)"
 [[ "$port" =~ ^127\.0\.0\.1:([0-9]+)$ ]]
 port="${BASH_REMATCH[1]}"
