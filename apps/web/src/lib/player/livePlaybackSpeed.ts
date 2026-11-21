@@ -25,6 +25,7 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 	function write(request?: number): void {
 		const current = target();
 		if (!preference || !current?.matches()) return;
+		const intended = request === undefined ? preference.current() : clampPlaybackSpeed(request);
 		const previousPort = writePort;
 		let observed: number | null | undefined;
 		writePort = {
@@ -46,9 +47,9 @@ export function createLivePlaybackSpeed(target: () => RateTarget | undefined) {
 		// A throwing setter never persists, but its readable actual rate still belongs in the UI.
 		const rate = observed === undefined ? read(current) : observed;
 		if (!current.matches()) return;
-		const feedback = request !== undefined && rate !== clampPlaybackSpeed(request)
-			? rate === null ? `Could not verify speed ${request}x.` : `Speed ${request}x not applied — still ${rate}x`
-			: '';
+		const feedback = rate === intended ? '' : rate === null
+			? `Could not verify speed ${intended}x.`
+			: `Speed ${intended}x not applied — still ${rate}x`;
 		state.set({ rate, feedback });
 	}
 

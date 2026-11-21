@@ -16,9 +16,9 @@ function fixture(seed = '1.3') {
 		removeItem: vi.fn()
 	};
 	speed.restore(storage);
-	function attach() {
+	function attach(accept = (rate: number) => rate) {
 		let rate = 1;
-		const apply = vi.fn((value: number) => { rate = value; });
+		const apply = vi.fn((value: number) => { rate = accept(value); });
 		const audio = { get playbackRate() { return rate; }, set playbackRate(value) { apply(value); } };
 		const current = { audio, matches: () => target === current };
 		target = current;
@@ -44,7 +44,7 @@ test('renders clamped readback and keeps mismatch feedback through the write’s
 	expect(apply.mock.calls).toEqual([[1.3], [2]]);
 });
 
-test('a throwing restore displays native truth without replacing the stored preference', () => {
+test('a throwing restore reports the observed rate without replacing the stored preference', () => {
 	const { speed, attach, storage, retire } = fixture();
 	const { apply, current } = attach();
 	apply.mockImplementationOnce(() => { throw new Error('refused'); });
@@ -58,10 +58,20 @@ test('a throwing restore displays native truth without replacing the stored pref
 	});
 	const restored = createLivePlaybackSpeed(() => replacement);
 	restored.restore(storage);
-	expect(get(restored.state)).toEqual({ rate: 1, feedback: '' });
+	expect(get(restored.state)).toEqual({ rate: 1, feedback: 'Speed 1.3x not applied — still 1x' });
+	expect(storage.setItem).toHaveBeenCalledTimes(1);
 	expect(storage.getItem()).toBe('1.3');
 	speed.observe(current);
 	expect(get(speed.state).rate).toBeNull();
+});
+
+test.each([1, 1.25])('a source restoring to %sx reports the mismatch and persists verified readback', (rate) => {
+	const { speed, storage, attach } = fixture();
+	attach();
+	const { current } = attach(() => rate);
+	speed.observe(current);
+	expect(get(speed.state)).toEqual({ rate, feedback: `Speed 1.3x not applied — still ${rate}x` });
+	expect(storage.getItem()).toBe(String(rate));
 });
 
 test('retired source readback cannot publish or persist, and the next source restores the last verified rate', () => {
