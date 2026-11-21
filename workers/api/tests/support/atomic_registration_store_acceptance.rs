@@ -2596,7 +2596,9 @@ async fn remove_member_window_fixture(client: &Client, window: i64) {
 }
 
 fn assert_member_invite_issuance() {
-    use super::{billing_budget::bootstrap_transaction, member_issue_invite_on};
+    use super::{
+        billing_budget::bootstrap_transaction, member_invite_summary_on, member_issue_invite_on,
+    };
     use crate::handlers::MemberInviteIssueOutcome::*;
     use crate::{billing_reconcile::*, billing_transaction_sql::apply_reconcile_transaction};
     use serde_json::{from_value, json};
@@ -2615,8 +2617,40 @@ fn assert_member_invite_issuance() {
             let issued = member_issue_invite_on(db, user, &hash, "198.51.100.9").await;
             issued.unwrap()
         };
+        const DAY: i64 = 86_400;
+        let reader = connect().await;
+        reader
+            .batch_execute("SET default_transaction_read_only = on")
+            .await
+            .unwrap();
+        let summary = async |user: &str| {
+            let result = member_invite_summary_on(&reader, user).await;
+            result.unwrap().unwrap()
+        };
+        let initial = summary(&issuer).await;
+        assert!(initial.open_window.is_none() && initial.next_window.is_none());
+        assert_eq!(initial.paid_seconds, 0);
+        assert_eq!(initial.required_paid_seconds, 90 * DAY);
+        assert_eq!(initial.per_window_limit, 2);
+        assert!(!initial.entitled && !initial.eligible);
         assert_eq!(issue(&mut db, &issuer, 1).await, WindowClosed);
-        let (window, _) = seed_member_window(&db, 2 * 86_400).await;
+        let (window, window_end) = seed_member_window(&db, 2 * DAY).await;
+        let future_start = window_end + DAY;
+        let future: i64 = db.query_one("INSERT INTO invite_windows (starts_at, ends_at) VALUES ($1::bigint, $1 + 600) RETURNING id", &[&future_start]).await.unwrap().get(0);
+        let cancelled: i64 = db
+            .query_one(
+                "INSERT INTO invite_windows (starts_at, ends_at) VALUES ($1, $1) RETURNING id",
+                &[&window_end],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let later: i64 = db.query_one("INSERT INTO invite_windows (starts_at, ends_at) VALUES ($1::bigint + 600, $1 + 1200) RETURNING id", &[&future_start]).await.unwrap().get(0);
+        let both = summary(&issuer).await;
+        assert_eq!(both.open_window.unwrap().bounds.ends_at, window_end);
+        let next = both.next_window.unwrap();
+        assert_eq!(next.starts_at, future_start);
+        assert_eq!(next.ends_at, future_start + 600);
         let settings = "UPDATE app_settings SET value = v.value FROM (VALUES
             ('invite_member_min_paid_months', $1::text), ('invite_member_per_window', $2::text),
             ('invite_default_expiry_days', $3::text)) AS v(key, value) WHERE app_settings.key = v.key";
@@ -2651,23 +2685,51 @@ fn assert_member_invite_issuance() {
         db.execute(status, &[&old, &"canceled"]).await.unwrap();
         db.execute("INSERT INTO subscriptions
             (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, paid_through_at)
-            SELECT u, u, u, u, 'price_fixture', 'plus', status, now() + interval '1 day'
-            FROM (VALUES ($1::text,'unpaid'), ($2::text,'active')) AS members(u,status)", &[&issuer, &peer]).await.unwrap();
+            SELECT u, u, u, u, 'price_fixture', 'plus', 'active', now() + interval '1 day'
+            FROM (VALUES ($1::text), ($2::text)) AS members(u)", &[&issuer, &peer]).await.unwrap();
+        assert_eq!(db.execute(settings, &[&"0", &"0", &"7"]).await.unwrap(), 3);
+        let disabled = summary(&issuer).await;
+        assert!(disabled.eligible);
+        assert_eq!(disabled.paid_seconds, 0);
+        assert_eq!(disabled.required_paid_seconds, 0);
+        assert_eq!(disabled.per_window_limit, 0);
+        assert_eq!(disabled.open_window.unwrap().remaining, 0);
+        assert_eq!(issue(&mut db, &issuer, 1).await, QuotaExhausted);
+        assert_eq!(db.execute(settings, &[&"3", &"2", &"7"]).await.unwrap(), 3);
+        db.execute(status, &[&issuer, &"unpaid"]).await.unwrap();
         // The mixed invoice covers 30 distinct days. The other verified term
-        // overlaps it by a day and leaves one second missing; a legacy span cannot fill it.
+        // overlaps it by a day and leaves one second missing; legacy, zero-dollar and future-settled terms cannot fill it.
         db.execute("INSERT INTO paid_invoice_history (stripe_invoice_id, user_id, stripe_subscription_id,
             plan_id, amount_cents, currency, paid_at, period_start, period_end, covered_periods)
-            SELECT u || lo::text, u, u, 'plus', cents, 'usd', to_timestamp(0), to_timestamp(lo*86400), to_timestamp(hi*86400),
+            SELECT u || lo::text, u, u, 'plus', cents, 'usd',
+                CASE WHEN future THEN now() + interval '1 day' ELSE to_timestamp(0) END, to_timestamp(lo*86400), to_timestamp(hi*86400),
                 CASE WHEN exact THEN tstzmultirange(tstzrange(to_timestamp(lo*86400), to_timestamp(hi*86400-short), '[)')) END
-            FROM (VALUES ($1::text,1,61,800,true,0),($2::text,34,95,800,true,1),
-                         ($2,95,102,800,false,0),($2,102,103,0,true,0)) AS terms(u,lo,hi,cents,exact,short)", &[&issuer, &peer]).await.unwrap();
+            FROM (VALUES ($1::text,1,61,800,true,0,false),($2::text,34,95,800,true,1,false),
+                         ($2,95,102,800,false,0,false),($2,102,103,0,true,0,false),
+                         ($2,103,104,800,true,86399,true)) AS terms(u,lo,hi,cents,exact,short,future)", &[&issuer, &peer]).await.unwrap();
+        let below = summary(&peer).await;
+        assert_eq!(below.paid_seconds, 90 * DAY - 1);
+        assert!(below.entitled && !below.eligible);
         assert_eq!(issue(&mut db, &peer, 1).await, Ineligible);
         db.execute("UPDATE paid_invoice_history SET covered_periods = tstzmultirange(tstzrange(period_start, period_end, '[)'))
             WHERE stripe_invoice_id = $1 || '34'", &[&peer]).await.unwrap();
+        let exact = summary(&peer).await;
+        assert_eq!(exact.paid_seconds, 90 * DAY);
+        assert!(exact.eligible);
         assert!(matches!(issue(&mut db, &peer, 1).await, Issued { .. }));
         assert_eq!(db.execute(settings, &[&"2", &"1", &"1"]).await.unwrap(), 3);
+        let inactive = summary(&issuer).await;
+        assert_eq!(inactive.paid_seconds, 60 * DAY);
+        assert_eq!(inactive.required_paid_seconds, 60 * DAY);
+        assert!(!inactive.entitled && !inactive.eligible);
+        let spend = inactive.open_window.unwrap().used;
+        assert_eq!(spend, 0, "does not count peer's spend");
         assert_eq!(issue(&mut db, &issuer, 1).await, Ineligible);
         db.execute(status, &[&issuer, &"active"]).await.unwrap();
+        assert_eq!(db.execute(settings, &[&"2", &"0", &"1"]).await.unwrap(), 3);
+        let over_cap = summary(&peer).await.open_window.unwrap();
+        assert_eq!((over_cap.used, over_cap.remaining), (1, 0));
+        assert_eq!(db.execute(settings, &[&"2", &"1", &"1"]).await.unwrap(), 3);
         // Stall the quota winner at the audit; the contender must wait on the winner.
         let audit_lock = "BEGIN; LOCK TABLE audit_log IN SHARE MODE";
         locker.batch_execute(audit_lock).await.unwrap();
@@ -2689,6 +2751,8 @@ fn assert_member_invite_issuance() {
                 AND a.at = i.created_at AND a.details = jsonb_build_object('invite_id', i.id, 'kind', 'member', 'window_id', i.window_id)) = 1
             FROM invite_codes i WHERE id = $1", &[&id, &expires_at]).await.unwrap().get(0);
         assert!(valid, "configured lifetime and exactly one matching audit");
+        let active = summary(&issuer).await.open_window.unwrap();
+        assert_eq!((active.used, active.remaining), (1, 0));
         for stamp in [
             "revoked_at = created_at",
             "revoked_at = NULL, expires_at = created_at",
@@ -2697,12 +2761,30 @@ fn assert_member_invite_issuance() {
             let sql = format!("UPDATE invite_codes SET {stamp} WHERE id = $1");
             db.execute(&sql, &[&id]).await.unwrap();
             assert_eq!(issue(&mut db, &issuer, 2).await, QuotaExhausted);
+            // In particular, reading the expired invite's spend must succeed
+            // on the read-only connection without observing expiry in the audit.
+            let spend = summary(&issuer).await.open_window.unwrap();
+            assert_eq!((spend.used, spend.remaining), (1, 0), "{stamp}");
         }
-        let next = db.query_one("WITH closed AS (UPDATE invite_windows SET
-            ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint WHERE id = $1 RETURNING ends_at)
-            INSERT INTO invite_windows (starts_at, ends_at) SELECT ends_at, ends_at + 600 FROM closed RETURNING id, ends_at",
-            &[&window]).await.unwrap();
-        let (next, end): (i64, i64) = (next.get(0), next.get(1));
+        let closed_at: i64 = db.query_one("UPDATE invite_windows SET
+            ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint WHERE id = $1 RETURNING ends_at",
+            &[&window]).await.unwrap().get(0);
+        let closed = summary(&issuer).await;
+        assert!(closed.open_window.is_none());
+        assert_eq!(closed.next_window.unwrap().starts_at, future_start);
+        let replacement = db
+            .query_one(
+                "INSERT INTO invite_windows (starts_at, ends_at)
+            VALUES ($1::bigint, $1 + 600) RETURNING id, ends_at",
+                &[&closed_at],
+            )
+            .await
+            .unwrap();
+        let (next, end): (i64, i64) = (replacement.get(0), replacement.get(1));
+        let fresh = summary(&issuer).await.open_window.unwrap();
+        assert_eq!(fresh.bounds.starts_at, closed_at);
+        assert_eq!(fresh.bounds.ends_at, end);
+        assert_eq!((fresh.used, fresh.remaining), (0, 1));
         let outcome = issue(&mut db, &issuer, 2).await;
         assert!(matches!(outcome, Issued { expires_at, .. } if expires_at == end));
         let relax_lock = "SET lock_timeout = '5s'";
@@ -2730,9 +2812,25 @@ fn assert_member_invite_issuance() {
                                  AND details->>'window_id' = $2::bigint::text)", &[&peer, &next]).await.unwrap().get(0);
             assert!(rolled_back, "rollback missing: {expected:?}");
         }
+        assert_eq!(db.execute(settings, &[&"03", &"2", &"7"]).await.unwrap(), 3);
+        assert!(member_invite_summary_on(&reader, &issuer).await.is_err());
         assert_eq!(db.execute(settings, &[&"3", &"2", &"7"]).await.unwrap(), 3);
-        remove_member_window_fixture(&db, next).await;
-        remove_member_window_fixture(&db, window).await;
+        let changed = db
+            .execute(
+                "UPDATE users SET deleting_at = now() WHERE id = $1",
+                &[&issuer],
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        let deleting = member_invite_summary_on(&reader, &issuer).await.unwrap();
+        assert!(
+            deleting.is_none(),
+            "do not return a deleting issuer's summary"
+        );
+        for id in [next, window, future, cancelled, later] {
+            remove_member_window_fixture(&db, id).await;
+        }
     });
 }
 

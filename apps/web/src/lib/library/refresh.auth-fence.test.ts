@@ -63,8 +63,8 @@ it.each([2, 3])('suspends when verification lock admission %i exceeds the deadli
 	expect(update().sessionBinding).toBe(label);
 });
 
-const deferredResults = [200, 401, 403, 'writer held', 'listing timeout', 'revoked listing timeout'] as const;
-it.each(deferredResults)('handles deferred refresh (%s) without purging its verified scope', async (result) => {
+const deferredResults = [200, 401, 403, 'verifier 401', 'writer held', 'listing timeout', 'revoked listing timeout'] as const;
+it.each(deferredResults)('handles deferred refresh (%s) without rewriting favorites', async (result) => {
 	const timeout = result === 'listing timeout' || result === 'revoked listing timeout';
 	const canRestore = result === 'listing timeout';
 	if (timeout) vi.useFakeTimers();
@@ -75,25 +75,27 @@ it.each(deferredResults)('handles deferred refresh (%s) without purging its veri
 	local.setItem(key, bytes);
 	const started = Promise.withResolvers<void>(), reply = Promise.withResolvers<Response>();
 	const deferred = () => { started.resolve(); return reply.promise; };
-	const verifying = result === 200 || result === 'writer held';
+	const refused = result === 'verifier 401';
+	const verifying = refused || result === 200 || result === 'writer held';
 	if (verifying) verify.mockImplementationOnce(deferred);
 	const pending = verifying ? refresh() : refresher.refresh(deferred);
 	await Promise.race([started.promise, pending.then(() => { throw new Error('Refresh ended before the deferred request'); })]);
 	if (result === 'writer held') await navigator.locks.request(AUTH_LOCK, () => { reply.resolve(proof()); return pending; });
 	else {
-		if (!canRestore) local.setItem(AUTH_GENERATION_KEY, 'replacement');
+		if (!canRestore && !refused) local.setItem(AUTH_GENERATION_KEY, 'replacement');
 		if (timeout) await vi.advanceTimersByTimeAsync(10_000);
-		else reply.resolve(result === 200 ? proof() : new Response(null, { status: result }));
+		else reply.resolve(result === 200 ? proof() : new Response(null, { status: refused ? 401 : result }));
 		await pending;
 	}
-	expect(refresher.state).toMatchObject({ requiresSignIn: false, verificationSuspended: !canRestore,
+	expect(refresher.state).toMatchObject({ requiresSignIn: refused, verificationSuspended: !canRestore && !refused,
 		items: canRestore ? [{ id: 'track' }] : [], staleAt: canRestore ? expect.any(String) : null });
 	expect(update()).toMatchObject({ authoritative: !canRestore, authBoundary: !canRestore });
 	expect(update().deviceScope).toBeUndefined();
-	expect(onAccessRefused).not.toHaveBeenCalled();
-	expect(loadSnapshot(session)?.items).toEqual([{ id: 'track' }]);
-	await refresh();
-	expect([update().deviceScope, local.getItem(key)]).toEqual([key, bytes]);
+	expect(onAccessRefused).toHaveBeenCalledTimes(refused ? 1 : 0);
+	expect(loadSnapshot(session)?.items).toEqual(refused ? undefined : [{ id: 'track' }]);
+	if (refused) expect(session.getItem(LIBRARY_AUTH_CONTEXT_KEY)).toBeNull();
+	else await refresh();
+	expect([update().deviceScope, local.getItem(key)]).toEqual([refused ? undefined : key, bytes]);
 });
 
 it.each([false, true])('withholds headerless browser rows (storage blocked: %s)', async (blocked) => {
