@@ -115,6 +115,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		const readStoredDensity = () => 'comfortable';
 		const handleAuthTransition = () => {}, recordFindQuery = () => routeCleanup.push('query');
 		const subscribeLocalAuthTransition = () => () => routeCleanup.push('local-auth'), handleLocalAuthTransition = () => {};
+		const subscribeAuthFenceInvalidation = (_invalidate, signal) =>
+			signal.addEventListener('abort', () => routeCleanup.push('auth-fence'), { once: true });
 		const clearSnapshot = () => {}, browserStorage = () => null, refresh = () => {};
 		const endTrackDrag = () => routeCleanup.push('drag'), document = { title: '' };
 		let queueExportAuthGeneration = 0;
@@ -922,7 +924,7 @@ test('Library cleanup fences both copy receipts without pausing the shared decod
 	expect(page.currentAudio()).toBe(element);
 	expect(page.readCopy()).toEqual(afterCleanup);
 	expect(readMiniPlayerHint()?.trackId).toBe(track.id);
-	expect(routeCleanup).toEqual(['drag', 'share', 'export', 'refresh', 'likes', 'query', 'local-auth', 'storage', 'pagehide']);
+	expect(routeCleanup).toEqual(['auth-fence', 'drag', 'share', 'export', 'refresh', 'likes', 'query', 'local-auth', 'storage', 'pagehide']);
 });
 
 test('route cleanup fences an explicit play waiting for tick', async () => {

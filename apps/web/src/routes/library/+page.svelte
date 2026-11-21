@@ -20,6 +20,7 @@
 		staleLabel,
 		type LibraryItem
 	} from '#lib/library/cache.js';
+	import { subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import {
 		clearFavoritesAtAuthBoundary,
@@ -338,11 +339,12 @@
 			const { isCurrent, authoritative, authBoundary, runIfCurrent, sessionBinding } = receipt;
 			if (!isCurrent()) return;
 			collectionReceipt = runIfCurrent;
+			const revoked = authBoundary && !state.verificationSuspended;
 			if (sessionBinding && runIfCurrent) {
 				accountTrackLikes ??= createLibraryTrackLikes();
 				void accountTrackLikes.publish(receipt, state.items);
-			} else accountTrackLikes?.clear();
-			const revoked = authBoundary && !state.verificationSuspended;
+			} else if (revoked) accountTrackLikes?.clear();
+			else accountTrackLikes?.retire();
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -1521,6 +1523,8 @@
 		// Leaving the page with a query applied (tab close, hard navigation).
 		window.addEventListener('pagehide', recordFindQuery);
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
+		const authFenceLifetime = new AbortController();
+		subscribeAuthFenceInvalidation(() => accountTrackLikes?.invalidate(), authFenceLifetime.signal);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
 		const releaseFavoriteAction = player.currentFavorite.bind({
@@ -1530,6 +1534,7 @@
 			write: (id) => toggleFavorite(id, true)
 		});
 		disposeRoute = () => {
+			authFenceLifetime.abort();
 			releaseFavoriteAction();
 			endTrackDrag();
 			// Restore only while this page still owns the title; a newer route's title wins.

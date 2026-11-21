@@ -60,14 +60,19 @@ it('rereads the same account after its earlier write settles, without accepting 
 	const old = likes.controls(track)!;
 	const toggle = old.toggle();
 	await dispatched.promise;
+	likes.invalidate();
+	expect(likes.controls(track)).toBeUndefined();
+	likes.retire(); // A new Library refresh has started, but is not yet verified.
 	fetcher.mockResolvedValueOnce(list(A, [liked])).mockResolvedValueOnce(session(A));
 	const refresh = likes.publish(listing(), tracks);
 	await old.toggle();
 	expect(fetcher).toHaveBeenCalledTimes(3);
 	expect(likes.controls(track)).toBeUndefined();
+	expect(likes.feedback).toContain('Refresh the library');
 	result.resolve(Response.json({ target_id: track, liked_at: 1 }));
 	await Promise.all([toggle, refresh]);
 	expect(likes.controls(track)?.liked).toBe(true);
+	expect(likes.feedback).toBe('');
 	expect(fetcher).toHaveBeenCalledTimes(5);
 });
 

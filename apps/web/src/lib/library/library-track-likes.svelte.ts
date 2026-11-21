@@ -13,6 +13,7 @@ function refused(error: unknown) {
 
 /** One owner per verified Library listing, shared by Tracks and Queue. */
 export function createLibraryTrackLikes() {
+	const retry = 'Account likes are unavailable. Refresh the library to try again.';
 	let active: AbortController | undefined;
 	let owner = $state.raw<TrackLikeOwner>();
 	let feedback = $state('');
@@ -28,15 +29,25 @@ export function createLibraryTrackLikes() {
 		});
 	});
 
-	function clear() {
+	function retire() {
 		active?.abort();
 		active = undefined;
 		owner = undefined;
+	}
+
+	function clear() {
+		retire();
 		feedback = '';
 	}
 
+	function invalidate() {
+		if (!active && !feedback) return;
+		retire();
+		feedback = retry;
+	}
+
 	async function publish(receipt: LibraryRefreshUpdate, items: readonly LibraryItem[]) {
-		clear();
+		retire();
 		const { sessionBinding: binding, runIfCurrent: run } = receipt;
 		if (!binding || !run || !receipt.isCurrent() || !receipt.authoritative || receipt.authBoundary) return;
 		const { signal } = active = new AbortController();
@@ -44,7 +55,6 @@ export function createLibraryTrackLikes() {
 		const guarded = <T,>(work: () => T) => run(() => {
 			if (!signal.aborted && receipt.isCurrent()) return work();
 		});
-		const retry = 'Account likes are unavailable. Refresh the library to try again.';
 		try {
 			// Retire the old owner immediately, but let its already-dispatched
 			// writes settle before reading the same account again.
@@ -79,11 +89,12 @@ export function createLibraryTrackLikes() {
 						feedback = refused(error) ? retry : 'Could not confirm that Like change. Try again or refresh the library.';
 					}
 				};
+				feedback = '';
 			});
 		} catch {
 			await guarded(() => { feedback = retry; }).catch(() => {});
 		}
 	}
 
-	return { controls, publish, clear, get feedback() { return feedback; } };
+	return { controls, publish, clear, invalidate, retire, get feedback() { return feedback; } };
 }
