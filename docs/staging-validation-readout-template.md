@@ -212,7 +212,7 @@ Copy the standing non-goals and add run-specific ones. A readout that omits
 this section is incomplete.
 
 - No production activation, production migration, or production data.
-- No real users, real provider accounts, or real content.
+- Use synthetic accounts and [approved staged audio](fixture-audio-licences.md).
 - No demand, pricing, or willingness-to-pay conclusion (see "must never
   contain").
 - No load, soak, or multi-region claim beyond the single synthetic journey
