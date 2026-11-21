@@ -1,17 +1,10 @@
 export const AUTH_GENERATION_KEY = 'nntune.auth.generation.v1';
-// The browser releases this origin-wide lock even if a writer tab closes.
 export const AUTH_LOCK = 'nntune.auth.cookie-transition.v1';
 // An abandoned write can leave its marker; don't guess when its cookie settled.
 const PENDING_PREFIX = 'nntune.auth.pending.v1.';
-let localEpoch = 0;
-let pending = 0;
-
+let localEpoch = 0, pending = 0;
 function withStorage<T>(read: (storage: Storage) => T, fallback: T): T {
-	try {
-		return read(window.localStorage);
-	} catch {
-		return fallback;
-	}
+	try { return read(window.localStorage); } catch { return fallback; }
 }
 const generation = () => withStorage((storage) => storage.getItem(AUTH_GENERATION_KEY), null);
 const pendingMarker = (key: string) => key.startsWith(PENDING_PREFIX);
@@ -23,56 +16,38 @@ async function cacheReceiptsBlocked(): Promise<boolean> {
 		return await Promise.race([caches.keys().then((keys) => keys.some(pendingMarker)), blocked]);
 	} catch { return true; } finally { clearTimeout(timer); }
 }
-
 type ClearMarker = () => unknown;
 const clearLater = (clear?: ClearMarker) => void Promise.resolve().then(clear).catch(() => undefined);
 async function markMutation(): Promise<ClearMarker | undefined> {
 	try {
 		const key = `${PENDING_PREFIX}${crypto.randomUUID()}`;
-		try {
-			const storage = window.localStorage;
+		return withStorage((storage) => {
 			storage.setItem(key, '');
 			return () => storage.removeItem(key);
-		} catch {} // Try the fallback store.
-		await caches.open(key); // Empty cache name only: no cached data.
-		return () => caches.delete(key);
+		}, undefined) ?? await caches.open(key).then(() => () => caches.delete(key)); // Empty name only.
 	} catch {} // Neither store recorded a marker.
 }
-function markBeforeDispatch(signal: AbortSignal) {
-	return new Promise<ClearMarker | undefined>((resolve, reject) => {
-		signal.throwIfAborted();
-		const onAbort = () => reject(signal.reason);
-		signal.addEventListener('abort', onAbort, { once: true });
-		void markMutation().then((clear) => {
-			signal.removeEventListener('abort', onAbort);
-			// Cache creation itself cannot be aborted.
-			if (signal.aborted) clearLater(clear);
-			else resolve(clear);
-		});
+const markBeforeDispatch = (signal: AbortSignal) => new Promise<ClearMarker | undefined>((resolve, reject) => {
+	signal.throwIfAborted();
+	const onAbort = () => reject(signal.reason);
+	signal.addEventListener('abort', onAbort, { once: true });
+	void markMutation().then((clear) => {
+		signal.removeEventListener('abort', onAbort);
+		if (signal.aborted) clearLater(clear); // Cache creation itself cannot be aborted.
+		else resolve(clear);
 	});
-}
-
+});
 function invalidateGeneration(removeOnFailure = true): boolean {
-	try {
-		window.localStorage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID());
-		return true;
-	} catch {
-		// Removal doesn't need quota. A later capture must initialize a new generation.
-		return removeOnFailure && withStorage((storage) => {
-			storage.removeItem(AUTH_GENERATION_KEY);
-			return true;
-		}, false);
-	}
+	if (withStorage<void | false>((storage) => storage.setItem(AUTH_GENERATION_KEY, crypto.randomUUID()), false) !== false) return true;
+	// Removal doesn't need quota. A later capture must initialize a new generation.
+	return removeOnFailure && withStorage<void | false>((storage) => storage.removeItem(AUTH_GENERATION_KEY), false) !== false;
 }
-
 async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 	try {
 		return await globalThis.navigator?.locks?.request(AUTH_LOCK, { mode: 'shared', ifAvailable: true }, async (lock) => {
 			if (lock && !pending && !(await cacheReceiptsBlocked()) && !pending) return work();
 		});
-	} catch {
-		return undefined;
-	}
+	} catch { return undefined; }
 }
 /** Use run() for trusted dispatch, publication and storage commits, not just a receipt check. */
 export function captureAuthFence() {
@@ -91,7 +66,6 @@ export function captureAuthFence() {
 		return { generation: id, isCurrent, run: <T>(work: () => T) => readLock(() => isCurrent() ? work() : undefined) };
 	});
 }
-
 type AuthIntent = { stale: Error; revocation?: { generation: string | undefined } };
 /** Mark before dispatch and hold until fetch settles (including response cookies). */
 export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Promise<T>, intent?: AuthIntent): Promise<T> {
@@ -136,14 +110,10 @@ export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Pr
 			} catch (error) {
 				if (dispatched || signal.aborted || (stale && error === stale)) throw error;
 			}
-			if (!attempt) {
-				const clear = await markBeforeDispatch(signal);
-				if (clear) return await send(false, clear);
-			}
+			const clear = !attempt && await markBeforeDispatch(signal);
+			if (clear) return await send(false, clear);
 		}
 		// No shared primitive was writable. Preserve ordinary auth's once-only fallback.
 		return await send(false);
-	} finally {
-		pending--;
-	}
+	} finally { pending--; }
 }

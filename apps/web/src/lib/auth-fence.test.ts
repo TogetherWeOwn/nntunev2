@@ -22,17 +22,13 @@ async function startWriter(lockDenied = false) {
 	vi.resetModules();
 	const { ApiClient: WriterClient } = await import('./api/client.js');
 	const started = Promise.withResolvers<void>(), response = Promise.withResolvers<Response>();
-	const fetchFn = () => { started.resolve(); return response.promise; };
 	if (lockDenied) vi.spyOn(navigator.locks, 'request').mockRejectedValueOnce(denied());
-	const result = new WriterClient({ baseUrl: '', fetchFn }).post('/v1/auth/passkey/login/finish', {});
+	const client = new WriterClient({ baseUrl: '', fetchFn: () => { started.resolve(); return response.promise; } });
+	const result = client.post('/v1/auth/passkey/login/finish', {});
 	await Promise.race([started.promise, result]);
 	return () => { response.resolve(ok()); return result; };
 }
-afterEach(() => {
-	vi.useRealTimers();
-	vi.restoreAllMocks();
-	vi.unstubAllGlobals();
-});
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 it('shares the read lock, queues logout and recovers after storage errors', async () => {
 	const { read, setItem, write, api, send } = setup();
 	setItem.mockImplementationOnce(fail(denied));
@@ -118,10 +114,7 @@ it.each(['open', 'delete'] as const)('does not wait beyond the auth deadline for
 	try {
 		await vi.advanceTimersByTimeAsync(API_REQUEST_TIMEOUT_MS);
 		expect(await logout).toEqual(op === 'open' ? expect.objectContaining({ code: 'request_timeout' }) : undefined);
-	} finally {
-		ready.resolve();
-		await vi.advanceTimersByTimeAsync(0);
-	}
+	} finally { ready.resolve(); await vi.advanceTimersByTimeAsync(0); }
 	expect(send).toHaveBeenCalledTimes(op === 'open' ? 0 : 1);
 	expect(await caches.keys()).toHaveLength(0);
 });

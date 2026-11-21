@@ -76,10 +76,7 @@
 				revokeIncomplete = false;
 				return true;
 			});
-			if (!revoked) {
-				busy = null;
-				return;
-			}
+			if (!revoked) { busy = null; return; }
 		} catch (error) {
 			if (error instanceof ApiError && error.status === 401) {
 				// A 401 means this request was rejected before any session

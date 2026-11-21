@@ -246,7 +246,8 @@ export interface CredentialsList {
 
 const REVOKE_ALL = '/v1/session/revoke-all';
 const LOGOUT = '/v1/session/logout';
-const staleSession = () => new ApiError(409, 'conflict', 'Could not verify the current session. Try signing out again.');
+export class StaleSessionError extends ApiError {}
+const staleSession = () => new StaleSessionError(409, 'conflict', 'Could not verify the current session. Try signing out again.');
 const COOKIE_MUTATIONS = new Set([
 	'/v1/auth/magic/finish', '/v1/auth/passkey/register/finish', '/v1/auth/passkey/login/finish',
 	'/v1/session/reauthenticate/finish', '/v1/session/refresh', LOGOUT, REVOKE_ALL
