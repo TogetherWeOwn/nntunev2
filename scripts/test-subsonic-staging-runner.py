@@ -299,17 +299,27 @@ class TransportTests(unittest.TestCase):
                     self.assert_reaped(-signal.SIGKILL)
 
     def test_reflected_credentials_are_not_returned(self):
-        for output in (
-            f"out.write({self.ok_head!r} + config)",
-            (
-                "client_id = config.split(b'CF-Access-Client-Id: ')[1].split(b'\"')[0]\n"
-                "out.write(b'HTTP/1.1 200 OK\\r\\nCache-Control: ' + client_id + b'\\r\\n\\r\\n')"
-            ),
+        self.bearer = "fixture-worker-bearer"
+        # Reflect exactly one value per reply, so no check can mask a missing one.
+        for marker, decode, metadata in (
+            (b"CF-Access-Client-Id: ", False, True),
+            (b"CF-Access-Client-Secret: ", False, False),
+            (b"Authorization: Bearer ", False, False),
+            (b"&apiKey=", False, False),
+            (b"&apiKey=", True, False),
         ):
-            self.program = output
-            with self.assertRaisesRegex(runner["Stop"], "^credential-reflected$"):
-                self.send()
-            self.assert_reaped(0)
+            with self.subTest(marker=marker, decode=decode):
+                head = b"HTTP/1.1 200 OK\r\nCache-Control: " if metadata else self.ok_head
+                end = b"\r\n\r\n" if metadata else b""
+                self.program = (
+                    "from urllib.parse import unquote_to_bytes\n"
+                    f"value = config.split({marker!r}, 1)[1].split(b'\"', 1)[0]\n"
+                    f"if {decode}: value = unquote_to_bytes(value)\n"
+                    f"out.write({head!r} + value + {end!r})"
+                )
+                with self.assertRaisesRegex(runner["Stop"], "^credential-reflected$"):
+                    self.send()
+                self.assert_reaped(0)
 
     def test_interim_headers_preserve_fixed_rejection_oracle_and_shared_budget(self):
         hint = b"HTTP/1.1 103 Early Hints\r\n\r\n"
