@@ -10703,10 +10703,11 @@ mod tests {
                     .borrow()
                     .contains_key(&(user_id.to_string(), sub.clone()));
                 let target = if own_current || own_shadow {
-                    // Explicit stale ignores the numeric suppression predicate.
+                    // Explicit stale needs only the owned-target identity.
                     Target::Owned {
                         predicate_stale: false,
                         other_live_holder: false,
+                        equal_end_provenance_changed: false,
                     }
                 } else {
                     Target::Absent
