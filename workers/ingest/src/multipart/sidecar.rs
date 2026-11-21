@@ -25,6 +25,7 @@ pub struct SidecarTarget<'a> {
 pub struct SidecarPut<'a> {
     target: SidecarTarget<'a>,
     body: &'a [u8],
+    origin_hash: [u8; 32],
 }
 
 /// Authenticated transport must correlate this reply to the exact request,
@@ -42,11 +43,17 @@ pub struct SidecarPutReply<'a> {
 pub struct CompletedSidecar<'a> {
     target: SidecarTarget<'a>,
     version: String,
+    encoded_len: usize,
+    origin_hash: [u8; 32],
 }
 
 impl<'a> CompletedSidecar<'a> {
     pub fn pin(&self) -> (&SidecarTarget<'a>, &str) {
         (&self.target, &self.version)
+    }
+
+    pub(super) fn matches_origin(&self, encoded_len: u32, hash: &[u8; 32]) -> bool {
+        self.encoded_len == encoded_len as usize && &self.origin_hash == hash
     }
 }
 
@@ -81,7 +88,11 @@ impl<'a> SidecarPut<'a> {
             map_id,
             index,
         };
-        Ok(Self { target, body })
+        Ok(Self {
+            target,
+            body,
+            origin_hash: *expected,
+        })
     }
 
     pub fn request(&self) -> (&SidecarTarget<'a>, &'a [u8]) {
@@ -112,6 +123,8 @@ impl<'a> SidecarPut<'a> {
         Ok(CompletedSidecar {
             target: self.target,
             version: (*version).into(),
+            encoded_len: self.body.len(),
+            origin_hash: self.origin_hash,
         })
     }
 }
@@ -202,6 +215,10 @@ mod tests {
         let completed = put().verify_reply(reply()).unwrap();
         assert_eq!(completed.pin().1, "A%2Fb+/=");
         assert_eq!(completed.pin().0.key, key);
+        let hash = page_hash(&page).unwrap();
+        assert!(completed.matches_origin(page.len() as u32, &hash));
+        assert!(!completed.matches_origin(page.len() as u32 + 1, &hash));
+        assert!(!completed.matches_origin(page.len() as u32, &[0; 32]));
         macro_rules! rejects {
             ($error:ident, $field:ident: $value:expr) => {
                 let changed = SidecarPutReply {
