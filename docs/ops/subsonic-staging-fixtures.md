@@ -106,6 +106,10 @@ cannot clear it by returning later. Nothing calls this helper in a live load
 window yet. Health and resource collectors, live provider coverage and live
 cleanup remain unverified.
 
+Dispatch `subsonic-staging-health` on protected `main` with `expected_health_sha`
+from the staging API deployment record. Require the probe step to report the
+verified SHA, not a green run with a skipped job. This proves build liveness only.
+
 ### Version-fenced restore rehearsal (offline)
 
 The rehearsal pins a known-off deployment and checks that the serving version

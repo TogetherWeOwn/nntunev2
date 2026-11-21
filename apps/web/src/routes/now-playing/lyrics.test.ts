@@ -26,7 +26,7 @@ afterEach(() => {
 
 function draw() {
 	const player = createPlayerController(createQueue(tracks), { flush: async () => {} });
-	vi.mocked(getAppPlayer).mockReturnValue(player);
+	vi.mocked(getAppPlayer, { partial: true }).mockReturnValue({ queue: player.queue });
 	return { player, body: (lyrics?: TrackLyrics) => render(NowPlaying, { props: { lyrics } }).body };
 }
 

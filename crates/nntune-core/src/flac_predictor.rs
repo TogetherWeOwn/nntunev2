@@ -82,7 +82,7 @@ impl Predictor {
     }
 }
 
-fn fits_signed(sample: i64, bits: u8) -> bool {
+pub(crate) fn fits_signed(sample: i64, bits: u8) -> bool {
     (1..=33).contains(&bits) && {
         let half = 1_i64 << (bits - 1);
         (-half..half).contains(&sample)
