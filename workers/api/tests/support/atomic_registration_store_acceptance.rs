@@ -714,28 +714,31 @@ async fn challenge_count(client: &Client, challenge_id: &str) -> i64 {
     .await
 }
 
-/// Poll until the production enrollment backend reports an ungranted lock.
-/// The invite row is the only contended lock in this setup, and program
-/// order in `complete_registration_on` (parent lock, challenge claim, magic
-/// claim, invite claim) then proves the earlier statements have executed in
-/// the actual production function. This synchronizes on the lock wait
-/// itself; elapsed time alone would prove nothing.
-async fn await_enrollment_lock_wait(observer: &Client, enrollment_pid: i32) {
+async fn backend_pid(client: &Client) -> i32 {
+    client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("identify disposable PostgreSQL backend")
+        .get(0)
+}
+
+/// Synchronize on PostgreSQL's reported blocker, not on elapsed time.
+async fn await_lock_wait(observer: &Client, blocked: i32, blocker: i32) {
     for _ in 0..500 {
         let waiting = observer
             .query_one(
-                "SELECT count(*) FROM pg_locks WHERE pid = $1 AND NOT granted",
-                &[&enrollment_pid],
+                "SELECT $2 = ANY(pg_blocking_pids($1))",
+                &[&blocked, &blocker],
             )
             .await
-            .expect("observe the enrollment backend's lock wait")
-            .get::<_, i64>(0);
-        if waiting > 0 {
+            .expect("observe the backend's lock wait")
+            .get::<_, bool>(0);
+        if waiting {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("production enrollment never blocked on the contended invite claim");
+    panic!("backend {blocked} never blocked on backend {blocker}");
 }
 
 struct BlockedEnrollment {
@@ -776,11 +779,7 @@ async fn blocked_enrollment() -> BlockedEnrollment {
         .batch_execute("SET statement_timeout = '12s'; SET lock_timeout = '10s'")
         .await
         .expect("bound the deliberately blocked enrollment claim");
-    let enrollment_pid = enrollment_client
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .expect("identify the enrollment backend")
-        .get::<_, i32>(0);
+    let enrollment_pid = backend_pid(&enrollment_client).await;
     let (challenge, magic, invite, invite_audit, credential) = (
         fixture.challenge.clone(),
         fixture.magic.clone(),
@@ -802,7 +801,8 @@ async fn blocked_enrollment() -> BlockedEnrollment {
         .map_err(|_| ());
         (enrollment_client, result)
     });
-    await_enrollment_lock_wait(&cleanup, enrollment_pid).await;
+    // Reaching the contended invite lock proves the earlier proof claims ran.
+    await_lock_wait(&cleanup, enrollment_pid, backend_pid(&locker).await).await;
     BlockedEnrollment {
         fixture,
         unrelated,
@@ -2084,6 +2084,180 @@ fn postgres_admin_simultaneous_opposing_demotions_keep_one_admin() {
     });
 }
 
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_invite_windows_are_bounded_and_audited_atomically() {
+    use super::{admin_list_invite_windows_on, admin_write_invite_window_on as write};
+    use crate::handlers::{
+        InviteWindowOutcome as Outcome, InviteWindowSchedule, InviteWindowWrite::*,
+    };
+    run_test(async {
+        let mut client = connect().await;
+        let (admin, member) = seed_admin_test_users(&client).await;
+        // The mutation harness reruns this serial suite on the same database.
+        // Start after any committed fixture ranges, which are global, not per actor.
+        let start: i64 = client
+            .query_one(
+                "SELECT GREATEST(MAX(ends_at), $1) FROM invite_windows",
+                &[&(NOW as i64)],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let now = u64::try_from(start).unwrap();
+        let schedule = |starts_at, ends_at| InviteWindowSchedule {
+            starts_at,
+            ends_at,
+            note: Some("not in audit".into()),
+        };
+        let ip = "198.51.100.9";
+        let first = schedule(start, start + 10);
+        assert!(matches!(
+            write(&mut client, &member, Schedule(&first), ip, now)
+                .await
+                .unwrap(),
+            Outcome::ActorNotAdmin
+        ));
+        for end in [start, start - 1] {
+            assert!(matches!(
+                write(
+                    &mut client,
+                    &admin,
+                    Schedule(&schedule(start, end)),
+                    ip,
+                    now
+                )
+                .await
+                .unwrap(),
+                Outcome::InvalidSchedule
+            ));
+        }
+        let Outcome::Window(open) = write(&mut client, &admin, Schedule(&first), ip, now)
+            .await
+            .unwrap()
+        else {
+            panic!("first schedule must commit");
+        };
+        assert!(matches!(
+            write(
+                &mut client,
+                &admin,
+                Schedule(&schedule(start + 9, start + 11)),
+                ip,
+                now
+            )
+            .await
+            .unwrap(),
+            Outcome::Overlap
+        ));
+        let Outcome::Window(future) = write(
+            &mut client,
+            &admin,
+            Schedule(&schedule(start + 10, start + 20)),
+            ip,
+            now,
+        )
+        .await
+        .unwrap() else {
+            panic!("adjacent schedule must commit");
+        };
+        assert!(matches!(
+            write(&mut client, &member, Close(open.id), ip, now)
+                .await
+                .unwrap(),
+            Outcome::ActorNotAdmin
+        ));
+
+        assert!(matches!(
+            write(&mut client, &admin, Close(0), ip, now).await.unwrap(),
+            Outcome::Missing
+        ));
+        let Outcome::Window(ended) = write(&mut client, &admin, Close(open.id), ip, now + 10)
+            .await
+            .unwrap()
+        else {
+            panic!("a naturally ended window must be returned unchanged");
+        };
+        assert_eq!(ended.ends_at, open.ends_at);
+
+        // A connection-local stand-in forces the audit insert to fail after each mutation.
+        client.batch_execute("CREATE TEMP TABLE audit_log (LIKE public.audit_log INCLUDING DEFAULTS, CHECK (false))").await.unwrap();
+        let failed_schedule = schedule(start + 20, start + 30);
+        for operation in [Close(open.id), Schedule(&failed_schedule)] {
+            assert!(write(&mut client, &admin, operation, ip, now + 1)
+                .await
+                .is_err());
+        }
+        client
+            .batch_execute("DROP TABLE pg_temp.audit_log")
+            .await
+            .unwrap();
+        let original = admin_list_invite_windows_on(&client).await.unwrap();
+        assert_eq!(
+            original
+                .iter()
+                .filter(|row| row.created_by.as_deref() == Some(admin.as_str()))
+                .count(),
+            2
+        );
+        assert_eq!(
+            original
+                .iter()
+                .find(|row| row.id == open.id)
+                .unwrap()
+                .ends_at,
+            start + 10
+        );
+
+        for offset in [2, 3, 1] {
+            // Retry both, including a stale request that reached the write lock late.
+            for (id, expected_end) in [(open.id, start + 2), (future.id, future.starts_at)] {
+                let Outcome::Window(window) =
+                    write(&mut client, &admin, Close(id), ip, now + offset)
+                        .await
+                        .unwrap()
+                else {
+                    panic!("close/cancel must return the retained window");
+                };
+                assert_eq!(window.ends_at, expected_end);
+            }
+        }
+        let audits = client
+            .query(
+                "SELECT action, at, details::text FROM audit_log WHERE user_id = $1 ORDER BY id",
+                &[&admin],
+            )
+            .await
+            .unwrap();
+        let expected = [
+            ("invite.window_scheduled", start, &open, open.ends_at),
+            ("invite.window_scheduled", start, &future, future.ends_at),
+            ("invite.window_closed", start + 2, &open, start + 2),
+            (
+                "invite.window_cancelled",
+                start + 2,
+                &future,
+                future.starts_at,
+            ),
+        ];
+        assert_eq!(audits.len(), expected.len());
+        for (row, (action, at, window, ends_at)) in audits.iter().zip(expected) {
+            assert_eq!(row.get::<_, String>(0), action);
+            assert_eq!(row.get::<_, i64>(1), at);
+            let details: serde_json::Value =
+                serde_json::from_str(&row.get::<_, String>(2)).unwrap();
+            assert_eq!(
+                details,
+                serde_json::json!({"window_id": window.id, "starts_at": window.starts_at, "ends_at": ends_at})
+            );
+        }
+        client.batch_execute("INSERT INTO invite_windows (starts_at, ends_at) SELECT 0, 0 FROM generate_series(1,201)").await.unwrap();
+        let bounded = admin_list_invite_windows_on(&client).await.unwrap();
+        assert_eq!(bounded.len(), 200);
+        assert!(bounded.windows(2).all(|pair| pair[0].id > pair[1].id));
+    });
+}
+
 // The production issue/revoke transactions (migration 0033): each
 // commits with exactly one audit row that references the invite by
 // surrogate row id — never by code plaintext or hash — and a demoted
@@ -2183,6 +2357,263 @@ fn postgres_admin_invite_issue_and_revoke_audit_by_row_id() {
             .expect("read revoked invite");
         assert_eq!(row.get::<_, i64>(0), NOW as i64);
         assert_eq!(row.get::<_, String>(1), actor);
+    });
+}
+
+async fn seed_member_window(client: &Client, duration: i64) -> (i64, i64) {
+    let row = client
+        .query_one(
+            "WITH t AS (SELECT floor(extract(epoch FROM clock_timestamp()))::bigint AS now)
+             INSERT INTO invite_windows (starts_at, ends_at) SELECT now - 600, now + $1 FROM t
+             RETURNING id, ends_at",
+            &[&duration],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1))
+}
+
+async fn seed_member_claim(client: &Client, window: i64, expires: i64) -> Fixture {
+    let mut fixture = Fixture::seed(client).await;
+    let id: i64 = client
+        .query_one(
+            "UPDATE invite_codes SET kind = 'member', window_id = $1, expires_at = $2
+             WHERE code_hash = $3 RETURNING id",
+            &[&window, &expires, &fixture.invite.code_hash],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    fixture.invite.id = id;
+    fixture.invite.kind = crate::auth::INVITE_KIND_MEMBER.to_string();
+    fixture.invite.window_id = Some(window);
+    fixture.invite.expires_at = expires.try_into().unwrap();
+    fixture.invite_audit.details = Some(serde_json::json!({"invite_id": id}).to_string());
+    fixture
+}
+
+async fn finish_with_invite(
+    client: &mut Client,
+    fixture: &Fixture,
+) -> Result<(), crate::handlers::StoreError> {
+    complete_registration_on(
+        client,
+        &fixture.challenge,
+        &fixture.magic,
+        Some(&fixture.invite),
+        Some(&fixture.invite_audit),
+        &fixture.credential,
+        NOW,
+    )
+    .await
+}
+
+async fn assert_member_enrollment(client: &Client, fixture: &Fixture, accepted: bool) {
+    fixture
+        .assert_state(client, (accepted, accepted, accepted, i64::from(accepted)))
+        .await;
+    let audits = client
+        .query(
+            "SELECT a.details::text, a.at = i.redeemed_at AND i.redeemed_at >= w.starts_at AND i.redeemed_at < w.ends_at
+             FROM audit_log a, invite_codes i JOIN invite_windows w ON w.id = i.window_id
+             WHERE a.action = 'invite.redeemed' AND a.subject_user_id = $1 AND i.id = $2",
+            &[&fixture.credential.user_id, &fixture.invite.id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(audits.len(), usize::from(accepted));
+    if let Some(audit) = audits.first() {
+        let details: serde_json::Value = serde_json::from_str(audit.get(0)).unwrap();
+        assert_eq!(details, serde_json::json!({"invite_id": fixture.invite.id}));
+        assert!(
+            audit.get::<_, bool>(1),
+            "redemption and audit must share a time inside the window"
+        );
+    }
+}
+
+// Leave no globally exclusive fixture range behind for another harness run.
+async fn remove_member_window_fixture(client: &Client, window: i64) {
+    client
+        .execute("DELETE FROM invite_codes WHERE window_id = $1", &[&window])
+        .await
+        .unwrap();
+    client
+        .execute("DELETE FROM invite_windows WHERE id = $1", &[&window])
+        .await
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
+    use super::{claim_single_use_on, invite_by_hash_on};
+    use crate::auth::SingleUseClaim;
+
+    run_test(async {
+        let mut client = connect().await;
+        let (window, end) = seed_member_window(&client, 600).await;
+        let now = end - 600;
+        let admin = Fixture::seed(&client).await;
+        let open = seed_member_claim(&client, window, end + 600).await;
+        for code in [&admin.invite.code_hash, &open.invite.code_hash] {
+            assert!(invite_by_hash_on(&client, code).await.unwrap().is_some());
+        }
+        finish_with_invite(&mut client, &open).await.unwrap();
+        assert_member_enrollment(&client, &open, true).await;
+        assert!(finish_with_invite(&mut client, &open).await.is_err());
+
+        let expired = seed_member_claim(&client, window, now).await;
+        assert!(finish_with_invite(&mut client, &expired).await.is_err());
+        assert_member_enrollment(&client, &expired, false).await;
+
+        let own = seed_member_claim(&client, window, end + 600).await;
+        client
+            .execute(
+                "UPDATE invite_codes SET issued_by = $1 WHERE code_hash = $2",
+                &[&own.credential.user_id, &own.invite.code_hash],
+            )
+            .await
+            .unwrap();
+        assert!(finish_with_invite(&mut client, &own).await.is_err());
+        assert_member_enrollment(&client, &own, false).await;
+
+        for (case, start, end) in [
+            ("future", now + 600, now + 1200),
+            ("scheduled end", now - 600, now),
+            ("cancelled", now - 600, now - 600),
+        ] {
+            client
+                .execute(
+                    "UPDATE invite_windows SET starts_at = $2, ends_at = $3 WHERE id = $1",
+                    &[&window, &start, &end],
+                )
+                .await
+                .unwrap();
+            // The future invite must not borrow the independently open window.
+            let unrelated = if case == "future" {
+                Some(seed_member_window(&client, 60).await.0)
+            } else {
+                None
+            };
+            let fixture = seed_member_claim(&client, window, now + 1800).await;
+            let preflight = invite_by_hash_on(&client, &fixture.invite.code_hash)
+                .await
+                .unwrap();
+            assert!(preflight.is_none(), "preflight: {case}");
+            let enrollment = finish_with_invite(&mut client, &fixture).await;
+            assert!(enrollment.is_err(), "{case}");
+            let claim = SingleUseClaim::Invite {
+                record: &fixture.invite,
+            };
+            assert_eq!(
+                claim_single_use_on(&client, claim).await.unwrap(),
+                0,
+                "standalone claim must also refuse {case}"
+            );
+            assert_member_enrollment(&client, &fixture, false).await;
+            if let Some(other) = unrelated {
+                remove_member_window_fixture(&client, other).await;
+            }
+        }
+        remove_member_window_fixture(&client, window).await;
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_member_enrollment_rechecks_window_after_waiting() {
+    use super::admin_write_invite_window_on as write;
+    use crate::handlers::{InviteWindowOutcome, InviteWindowWrite};
+
+    run_test(async {
+        let observer = connect().await;
+        let holder = connect().await;
+        let mut close = connect().await;
+        let mut enroll = connect().await;
+        enroll
+            .batch_execute("SET statement_timeout = '9s'; SET lock_timeout = '8s'")
+            .await
+            .unwrap();
+        let holder_pid = backend_pid(&holder).await;
+        let close_pid = backend_pid(&close).await;
+        let enroll_pid = backend_pid(&enroll).await;
+        let (admin, _) = seed_admin_test_users(&observer).await;
+
+        for blocked_on in ["close", "window", "invite"] {
+            let (window, end) = seed_member_window(&observer, 600).await;
+            let fixture = seed_member_claim(&observer, window, end + 600).await;
+            holder.batch_execute("BEGIN").await.unwrap();
+            if blocked_on == "close" {
+                // Stall the real close on its audit INSERT after its UPDATE takes
+                // the window row lock. SHARE on the table allows the audit read.
+                holder
+                    .batch_execute("LOCK TABLE audit_log IN SHARE MODE")
+                    .await
+                    .unwrap();
+                let close_at = (end - 600) as u64;
+                let (closed, enrolled) = futures_util::future::join(
+                    write(
+                        &mut close,
+                        &admin,
+                        InviteWindowWrite::Close(window),
+                        "198.51.100.9",
+                        close_at,
+                    ),
+                    async {
+                        await_lock_wait(&observer, close_pid, holder_pid).await;
+                        let (result, ()) = futures_util::future::join(
+                            finish_with_invite(&mut enroll, &fixture),
+                            async {
+                                await_lock_wait(&observer, enroll_pid, close_pid).await;
+                                holder.batch_execute("COMMIT").await.unwrap();
+                            },
+                        )
+                        .await;
+                        result
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(closed.unwrap(), InviteWindowOutcome::Window(w) if w.ends_at == close_at as i64)
+                );
+                assert!(enrolled.is_err(), "the committed early close must win");
+            } else {
+                // Set the short deadline only after seeding all enrollment rows.
+                let end: i64 = observer.query_one(
+                    "UPDATE invite_windows SET ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint + 4
+                     WHERE id = $1 RETURNING ends_at", &[&window],
+                ).await.unwrap().get(0);
+                let lock = if blocked_on == "window" {
+                    "SELECT w.id FROM invite_windows w JOIN invite_codes i ON i.window_id = w.id
+                     WHERE i.code_hash = $1 FOR NO KEY UPDATE OF w"
+                } else {
+                    "SELECT id FROM invite_codes WHERE code_hash = $1 FOR NO KEY UPDATE"
+                };
+                holder
+                    .query_one(lock, &[&fixture.invite.code_hash])
+                    .await
+                    .unwrap();
+                let (enrolled, ()) = futures_util::future::join(
+                    finish_with_invite(&mut enroll, &fixture),
+                    async {
+                        await_lock_wait(&observer, enroll_pid, holder_pid).await;
+                        let before_end: bool = observer.query_one(
+                            "SELECT clock_timestamp() < to_timestamp($1::bigint::double precision)", &[&end],
+                        ).await.unwrap().get(0);
+                        assert!(before_end, "enrollment must have reached the lock before the scheduled end");
+                        holder.query_one("SELECT pg_sleep_until(to_timestamp($1::bigint::double precision))", &[&end]).await.unwrap();
+                        holder.batch_execute("COMMIT").await.unwrap();
+                    },
+                ).await;
+                assert!(
+                    enrolled.is_err(),
+                    "a wait through the scheduled end must refuse enrollment"
+                );
+            }
+            assert_member_enrollment(&observer, &fixture, false).await;
+            remove_member_window_fixture(&observer, window).await;
+        }
     });
 }
 
