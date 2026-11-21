@@ -1,7 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { API_REQUEST_TIMEOUT_MS, ApiClient } from './api/client.js';
 import { AUTH_GENERATION_KEY, AUTH_LOCK, captureAuthFence } from './auth-fence.js';
-
 const denied = () => new DOMException('Denied', 'SecurityError');
 const full = () => new DOMException('Storage full', 'QuotaExceededError');
 const fail = (error: () => Error) => () => { throw error(); };
@@ -18,7 +17,6 @@ function setup() {
 	const send = vi.fn(async () => ok());
 	return { read: () => entries[AUTH_GENERATION_KEY] ?? null, setItem, removeItem, write, remove, send, api: new ApiClient({ baseUrl: '', fetchFn: send }) };
 }
-
 async function startWriter(lockDenied = false) {
 	// Separate writer epoch and pending count, but the same locks and stores.
 	vi.resetModules();
@@ -30,13 +28,11 @@ async function startWriter(lockDenied = false) {
 	await Promise.race([started.promise, result]);
 	return () => { response.resolve(ok()); return result; };
 }
-
 afterEach(() => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
 	vi.unstubAllGlobals();
 });
-
 it('shares the read lock, queues logout and recovers after storage errors', async () => {
 	const { read, setItem, write, api, send } = setup();
 	setItem.mockImplementationOnce(fail(denied));

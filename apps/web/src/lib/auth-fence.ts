@@ -6,23 +6,16 @@ const PENDING_PREFIX = 'nntune.auth.pending.v1.';
 let localEpoch = 0;
 let pending = 0;
 
-function generation(): string | null {
+function readStorage<T>(read: (storage: Storage) => T, fallback: T): T {
 	try {
-		return window.localStorage.getItem(AUTH_GENERATION_KEY);
+		return read(window.localStorage);
 	} catch {
-		return null;
+		return fallback;
 	}
 }
-
+const generation = () => readStorage((storage) => storage.getItem(AUTH_GENERATION_KEY), null);
 const pendingMarker = (key: string) => key.startsWith(PENDING_PREFIX);
-function receiptsBlocked(): boolean {
-	try {
-		return Object.keys(window.localStorage).some(pendingMarker);
-	} catch {
-		return true;
-	}
-}
-
+const receiptsBlocked = () => readStorage((storage) => Object.keys(storage).some(pendingMarker), true);
 async function cacheReceiptsBlocked(): Promise<boolean> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -40,7 +33,6 @@ const clearLater = (clear?: ClearMarker) =>
 	void Promise.resolve()
 		.then(clear)
 		.catch(() => undefined);
-
 async function markMutation(): Promise<ClearMarker | undefined> {
 	try {
 		const key = `${PENDING_PREFIX}${crypto.randomUUID()}`;
@@ -53,7 +45,6 @@ async function markMutation(): Promise<ClearMarker | undefined> {
 		return () => caches.delete(key);
 	} catch {} // Neither store recorded a marker.
 }
-
 function markBeforeDispatch(signal: AbortSignal) {
 	return new Promise<ClearMarker | undefined>((resolve, reject) => {
 		signal.throwIfAborted();
@@ -92,7 +83,6 @@ async function readLock<T>(work: () => T | Promise<T>): Promise<T | undefined> {
 		return undefined;
 	}
 }
-
 /** Use run() for trusted dispatch, publication and storage commits, not just a receipt check. */
 export function captureAuthFence() {
 	const locks = globalThis.navigator?.locks;
