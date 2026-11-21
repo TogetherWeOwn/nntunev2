@@ -34,9 +34,7 @@ async fn dispatch(user: &str, outcome: &ReconcileOutcome) -> Result<(), StoreErr
         })),
         test_mirror: None,
     };
-    let result = store
-        .store_reconcile_owned(user.to_owned(), outcome.clone())
-        .await;
+    let result = crate::handlers::Store::store_reconcile_outcome(&store, user, outcome).await;
     // Join before discarding the store: the call must have released its client.
     let driver = driver.take().expect("store must acquire one connection");
     tokio::time::timeout(Duration::from_secs(5), driver)

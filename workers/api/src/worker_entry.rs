@@ -994,7 +994,6 @@ impl DriverErrorCode for tokio_postgres::Error {
 
 impl PgStore {
     #[cfg(target_arch = "wasm32")]
-    #[allow(dead_code)] // Not called by release reconciliation until activation.
     async fn store_reconcile_owned(
         &self,
         user_id: String,
@@ -1061,10 +1060,7 @@ impl PgStore {
         .map_err(|_| failed())
     }
 
-    // Native acceptance injects connection acquisition only. This entry is not
-    // wired to Store; its client stays inside the budgeted operation.
     #[cfg(not(target_arch = "wasm32"))]
-    #[allow(dead_code)]
     async fn store_reconcile_owned(
         &self,
         user_id: String,
@@ -5421,91 +5417,15 @@ impl Store for PgStore {
         .await
     }
 
-    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
     async fn store_reconcile_outcome(
         &self,
         user_id: &str,
         outcome: &crate::billing_reconcile::ReconcileOutcome,
     ) -> Result<(), StoreError> {
-        Self::bounded(
-            async {
-                let failed =
-                    || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
-                let mut client = self.connect().await?;
-                let transaction = client.transaction().await.map_err(|_| failed())?;
-                // One transaction under the per-user advisory lock: coverage
-                // advances monotonically while history inserts converge on
-                // the invoice id — duplicates and out-of-order replays land
-                // the same stored state.
-                transaction
-                    .query_typed(
-                        crate::billing_reconcile::reconcile_lock_statement(),
-                        &[(&user_id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| failed())?;
-                let row = &outcome.row;
-                transaction
-                    .query_typed(
-                        crate::billing_reconcile::store_reconciled_subscription_statement(),
-                        &[
-                            (&user_id, Type::TEXT),
-                            (&row.stripe_subscription_id, Type::TEXT),
-                            (&row.stripe_customer_id, Type::TEXT),
-                            (&row.stripe_item_id, Type::TEXT),
-                            (&row.stripe_price_id, Type::TEXT),
-                            (&row.plan_id, Type::TEXT),
-                            (&row.status, Type::TEXT),
-                            (&row.current_period_end_unix, Type::INT8),
-                            (&row.cancel_at_period_end, Type::BOOL),
-                            (&row.paid_through_unix, Type::INT8),
-                            (&row.paid_invoice_id, Type::TEXT),
-                            (&row.grace_until_unix, Type::INT8),
-                            (&outcome.read_anchor, Type::TEXT),
-                            (&outcome.read_plan, Type::TEXT),
-                            (&outcome.explicit_stale, Type::BOOL),
-                        ],
-                    )
-                    .await
-                    .map_err(|_| failed())?;
-                for history in &outcome.history {
-                    transaction
-                        .query_typed(
-                            crate::billing_reconcile::insert_paid_invoice_history_statement(),
-                            &[
-                                (&user_id, Type::TEXT),
-                                (&history.stripe_invoice_id, Type::TEXT),
-                                (&history.stripe_subscription_id, Type::TEXT),
-                                (&history.plan_id, Type::TEXT),
-                                (&history.period_start_unix, Type::INT8),
-                                (&history.period_end_unix, Type::INT8),
-                                (&history.amount_cents, Type::INT8),
-                                (&history.currency, Type::TEXT),
-                                (&history.paid_at_unix, Type::INT8),
-                            ],
-                        )
-                        .await
-                        .map_err(|_| failed())?;
-                }
-                transaction.commit().await.map_err(|_| failed())?;
-                Ok(())
-            },
-            TOTAL_TIMEOUT_MS,
-        )
-        .await
-    }
-
-    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-    async fn store_reconcile_outcome(
-        &self,
-        user_id: &str,
-        outcome: &crate::billing_reconcile::ReconcileOutcome,
-    ) -> Result<(), StoreError> {
-        let user_id = user_id.to_owned();
-        let outcome = outcome.clone();
         self.store_reconcile_owned(
-            user_id,
-            outcome,
+            user_id.to_owned(),
+            outcome.clone(),
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
             crate::billing_transaction_sql::ReconcileProbe::None,
         )
         .await

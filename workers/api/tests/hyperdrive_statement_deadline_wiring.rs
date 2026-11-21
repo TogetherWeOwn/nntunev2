@@ -6,7 +6,7 @@
 //! Builder contract: PgStore::bounded(operation, timeout_ms) races one store
 //! operation against the shared with_deadline helper, expiring to the opaque
 //! StoreError. Every `Store for PgStore` method and `SingleUseStore::claim`
-//! must await exactly one Self::bounded call with TOTAL_TIMEOUT_MS whose
+//! except billing reconciliation must await exactly one Self::bounded call with TOTAL_TIMEOUT_MS whose
 //! async block contains that method's connects — self.connect(), the
 //! self.connect_mirror() the catalogue reads use, or (catalogue_library)
 //! both — plus all of its statements (connects and statements share one
@@ -265,12 +265,7 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
-    let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
-    let prototype = format!("{prototype_gate}asyncfnstore_reconcile_outcome(");
-    let store = store.replacen(function_body(store, &prototype), "{}", 1);
-    let mut pieces = store.split("asyncfn");
-    pieces.next().expect("preamble before the first method");
-    let pieces: Vec<&str> = pieces.collect();
+    let pieces: Vec<&str> = store.split("asyncfn").skip(1).collect();
     let names: Vec<&str> = pieces.iter().map(|piece| method_name(piece)).collect();
     // Anchors prove the splitter saw the whole impl, first method to last.
     for anchor in [
@@ -284,26 +279,24 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             "Store impl slice must contain {anchor}"
         );
     }
-    let release_gate =
-        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
     assert_eq!(
         names
             .iter()
-            .filter(|&&n| n == "store_reconcile_outcome")
+            .filter(|&&name| name == "store_reconcile_outcome")
             .count(),
-        2
+        1
     );
-    for gate in [prototype_gate, release_gate] {
-        assert_eq!(
-            store
-                .matches(&format!("{gate}asyncfnstore_reconcile_outcome("))
-                .count(),
-            1
-        );
-    }
-    for (index, piece) in pieces.iter().enumerate() {
+    for piece in pieces {
         let name = method_name(piece);
-        if name == "store_reconcile_outcome" && pieces[index - 1].ends_with(prototype_gate) {
+        if name == "store_reconcile_outcome" {
+            assert_eq!(
+                function_body(piece, name),
+                concat!(
+                    "{self.store_reconcile_owned(user_id.to_owned(),outcome.clone(),",
+                    "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]",
+                    "crate::billing_transaction_sql::ReconcileProbe::None,).await}"
+                )
+            );
             continue;
         }
         if matches!(name, "like_delete" | "taste_delete") {
