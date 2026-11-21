@@ -1572,7 +1572,7 @@
 	{/if}
 
 {#snippet queueShareFeedback()}
-	<div data-testid="queue-share-status" aria-live="polite" aria-atomic="true">{queueShareFallbackUrl ? 'Queued track link available to copy manually.' : queueShareStatus}</div>
+	<div data-testid="queue-share-status" aria-live="polite" aria-atomic="true">{#key queueShareOutcome}{queueShareFallbackUrl ? 'Queued track link available to copy manually.' : queueShareStatus}{/key}</div>
 	{#if queueShareFallbackUrl}
 		<div class="nt-library-share-fallback">
 			<label for="queue-share-url">Queued track link</label>
@@ -1968,6 +1968,14 @@
 	{/if}
 	<LibraryQueueHost available={showQueue} {density} dismissMenu={() => playerQueue?.dismissTrackMenu()}>
 		{#if showQueue}
+			<!--
+				The queue panel stays mounted across background refreshes (its
+				rows remain readable while the new list loads), but its four
+				live statuses suspend while loading so the inline loading
+				indicator keeps the single-status transient the ordering specs
+				pin with an unfiltered role query. Content, controls and
+				focus are untouched; the roles return with the fresh list.
+			-->
 			<PlayerQueue
 				bind:this={playerQueue}
 				state={queue}

@@ -67,7 +67,7 @@
 	}
 
 	function escape(event: KeyboardEvent): void {
-		if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || !expanded) return;
+		if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || event.repeat || !expanded) return;
 		if (!(event.target instanceof Node) || !panel?.contains(event.target)) return;
 		event.preventDefault();
 		close(true);

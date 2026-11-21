@@ -41,7 +41,6 @@ test('keyboard moves the same live queue to the right slot and back', async ({ p
 	const originalNext = (await next(page).elementHandle())!;
 	const audio = page.getByTestId('audio-player');
 	const originalAudio = (await audio.elementHandle())!;
-
 	await keyboardOpen(page);
 	await expect(inline(page)).toHaveCount(0);
 	await expect(next(page)).toHaveCount(1);
@@ -61,8 +60,10 @@ test('keyboard moves the same live queue to the right slot and back', async ({ p
 
 	const filter = panel(page).getByRole('searchbox', { name: 'Filter queue' });
 	await filter.fill('Fern');
-	await filter.press('Escape');
+	await page.keyboard.down('Escape');
 	await expect(filter).toHaveValue('');
+	await page.keyboard.down('Escape'); // Repeat while the key is still held.
+	await page.keyboard.up('Escape');
 	await expect(filter).toBeFocused();
 	await page.keyboard.press('Escape');
 	await expect(toggle(page)).toBeFocused();
@@ -86,12 +87,19 @@ test('the panel keeps order actions, export fallback and loading behavior live',
 	await panel(page).getByRole('button', { name: 'More actions for Fern' }).click();
 	await panel(page).getByRole('menuitem', { name: 'Move to top' }).click();
 	expect(await order(page)).toEqual(['fern', 'coral', 'moss']);
-	await panel(page).getByRole('button', { name: 'More actions for Fern' }).click();
-	await panel(page).getByRole('menuitem', { name: 'Copy link' }).click();
-	await expect(panel(page).getByTestId('queue-share-fallback')).toHaveValue(/\/library\?track=fern/);
 	const cue = panel(page).locator('[data-testid="queue-share-status"][aria-live="polite"]');
-	await expect(cue).toContainText('available to copy manually');
-	await expect(panel(page).getByRole('button', { name: 'More actions for Fern' })).toBeFocused();
+	const copyLink = async (title: string, id: string) => {
+		const trigger = panel(page).getByRole('button', { name: `More actions for ${title}` });
+		await trigger.click();
+		await panel(page).getByRole('menuitem', { name: 'Copy link' }).click();
+		await expect(panel(page).getByTestId('queue-share-fallback')).toHaveValue(new RegExp(`/library\\?track=${id}`));
+		await expect(cue).toHaveText('Queued track link available to copy manually.');
+		await expect(trigger).toBeFocused();
+	};
+	await copyLink('Fern', 'fern');
+	const firstAnnouncement = await cue.evaluateHandle((node) => [...node.childNodes].find((child) => child.textContent?.trim())!);
+	await copyLink('Moss', 'moss');
+	expect(await firstAnnouncement.evaluate((node) => node.isConnected)).toBe(false);
 	await panel(page).getByRole('button', { name: 'Copy queue as text' }).click();
 	await expect(panel(page).getByTestId('queue-export-fallback')).toHaveValue(/Fern[\s\S]*Coral[\s\S]*Moss/);
 	const download = page.waitForEvent('download');
