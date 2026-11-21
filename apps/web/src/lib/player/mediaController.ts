@@ -14,7 +14,7 @@ import type { SystemSeekGuard } from './systemSeek.js';
 import { bindSystemTransport } from './systemTransport.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
-export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | { end: number; playedThrough: number; settled?: number; progressed?: boolean } };
+export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | { end: number; played: TimeRanges; settled?: number; progressed?: boolean } };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error' | 'retrying';
 
 type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
@@ -29,7 +29,15 @@ export type MediaSelection = {
 };
 
 const REPEAT_KEY = 'nntune:library-repeat:v1';
-const playedEnd = ({ played }: HTMLAudioElement) => played?.length ? played.end(played.length - 1) : 0;
+// Native played snapshots are static and normalized (ordered, disjoint, non-touching ranges).
+function playedNewTail(before: TimeRanges, after: TimeRanges, end: number, duration: number): boolean {
+	for (let i = 0, j = 0; i < (after?.length ?? 0); i++) {
+		const start = Math.max(end, after.start(i)), stop = Math.min(duration, after.end(i));
+		while (before && j < before.length && before.end(j) <= start) j++;
+		if (stop > start && (!before || j === before.length || before.start(j) > start || before.end(j) < stop)) return true;
+	}
+	return false;
+}
 
 function describeRestart(words: string, title: string): string {
 	const suffix = ` ${title}.`;
@@ -390,8 +398,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function onSeekLanded(attachment: MediaAttachment, system?: SystemSeekGuard) {
-		if (system || typeof attachment.soughtToEnd === 'object') return (target: number, end: number) => {
-			attachment.soughtToEnd = system && target === end ? { end, playedThrough: playedEnd(attachment.audio) } : false; };
+		if (!system && typeof attachment.soughtToEnd !== 'object') return;
+		return (target: number, end: number) => { attachment.soughtToEnd = system && target === end ? { end, played: attachment.audio.played } : false; };
 	}
 
 	function jump(direction: JumpDirection, seconds = RELATIVE_JUMP_SECONDS, system?: SystemSeekGuard): void {
@@ -410,9 +418,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			positionIntent === intent && pendingShare.revision === revision && guard?.() !== false;
 		runPosition(() => {
 			const matches = (guard = system?.active) => !!audio && !!source && matchesSource(audio, source, () => isCurrent(guard));
-			const outcome = attachment && audio && matches() ? jumpMedia(audio, direction, matches, () => {
-				if (current === attachment) clearJumpFeedback();
-			}, seconds, system?.unavailable, onSeekLanded(attachment, system)) : undefined;
+			const outcome = attachment && audio && matches() ? jumpMedia(audio, direction, matches, () => { if (current === attachment) clearJumpFeedback(); },
+				seconds, system?.unavailable, onSeekLanded(attachment, system)) : undefined;
 			if (outcome ? !matches(system?.canReport) : !isCurrent()) return;
 			if (outcome?.kind === 'jumped') lastJumpTarget = outcome.target;
 			seekFeedback.update((feedback) => ({
@@ -528,9 +535,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!audio.ended || audio.error !== null || !attachment.playing || !ownsOrigin()) return;
 		const { soughtToEnd } = attachment;
 		if (typeof soughtToEnd === 'object') {
-			const { duration, currentTime } = audio, { end, playedThrough, progressed } = soughtToEnd, slack = SEEK_READBACK_TOLERANCE;
-			// A short extension can finish before the next timeupdate; seek rounding does not extend played ranges.
-			const leftEndpoint = currentTime > end + slack || (currentTime >= duration && (progressed || playedEnd(audio) > Math.max(end, playedThrough)));
+			const { duration, currentTime } = audio, { end, played, progressed } = soughtToEnd, slack = SEEK_READBACK_TOLERANCE;
+			const leftEndpoint = currentTime > end + slack || (currentTime >= duration && (progressed || playedNewTail(played, audio.played, end, duration)));
 			if (!ownsOrigin()) return;
 			if (!(duration > end && currentTime >= duration - slack && leftEndpoint)) { attachment.playing = attachment.soughtToEnd = false; return; }
 		}
@@ -654,8 +660,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 						const { currentTime, duration, paused, ended } = audio;
 						if (!matches(intent)) return;
 						if (event.type === 'seeked') marker.settled = currentTime;
-						else if (!paused && !ended && marker.settled !== undefined)
-							marker.progressed ||= currentTime > Math.max(marker.end, marker.settled) && currentTime < duration;
+						else marker.progressed ||= !paused && !ended && currentTime > Math.max(marker.end, marker.settled ?? Infinity) && currentTime < duration;
 					}
 					switch (event.type) {
 						case 'play':

@@ -7,6 +7,7 @@ import { createQueue } from './queue.js';
 import { createQueueController } from './queueController.js';
 
 const actions = ['seekto', 'seekforward', 'seekbackward'] as const;
+const timeRanges = (ranges: [number, number][]): TimeRanges => ({ length: ranges.length, start: (i) => ranges[i]![0], end: (i) => ranges[i]![1] });
 const coral = { id: 'coral', title: 'Coral 🎵', artist: 'Fixture Artist', album: 'Fixture Album', streamUrl: '/coral' };
 const moss = { id: 'moss', title: ' ', artist: ' ', streamUrl: '/moss' };
 
@@ -19,19 +20,15 @@ class Decoder extends EventTarget {
 	seeking = false;
 	duration = NaN;
 	ranges: [number, number][] = [];
-	played: TimeRanges = { length: 0, start: () => 0, end: () => 0 };
+	played = timeRanges([]);
 	beforeRead?: () => void;
 	write = vi.fn((value: number) => { this.position = value; });
 	get currentTime() { this.beforeRead?.(); return this.position; }
 	set currentTime(value: number) { this.write(value); }
-	get seekable() {
-		const { ranges } = this;
-		return { length: ranges.length, start: (i: number) => ranges[i]![0], end: (i: number) => ranges[i]![1] };
-	}
+	get seekable() { return timeRanges(this.ranges); }
 	emit(...types: string[]) { for (const type of types) this.dispatchEvent(new Event(type)); }
 	setReady(ranges: [number, number][] = [[0, 60]]) {
-		Object.assign(this, { duration: 60, ranges, HAVE_METADATA: 1, readyState: 1, playbackRate: 1 });
-		this.emit('loadedmetadata');
+		Object.assign(this, { duration: 60, ranges, HAVE_METADATA: 1, readyState: 1, playbackRate: 1 }).emit('loadedmetadata');
 	}
 	constructor(readonly source: string) { super(); }
 	getAttribute() { return this.source; }
@@ -204,8 +201,7 @@ test.each(['nexttrack', 'previoustrack'] as const)('unsupported %s leaves the ot
 });
 
 function setup({ unsupported, connected = true, ranges }: { unsupported?: string; connected?: boolean; ranges?: Decoder['ranges'] } = {}) {
-	const { session, handler } = stubSession(unsupported);
-	const queue = createQueueController(createQueue([coral, moss]));
+	const { session, handler } = stubSession(unsupported), queue = createQueueController(createQueue([coral, moss]));
 	const commit = (next: typeof queue.snapshot) => { queue.publish(next, queue.begin(next, 'replace')); return queue.snapshot === next; };
 	const media = createMediaController(queue, { commit, flush: async () => {}, browseCopy: { invalidate() {} }, announce() {} }, () => true);
 	const audio = Object.assign(new Decoder(coral.streamUrl), { isConnected: connected }), detach = media.attach(audio.element);
@@ -217,9 +213,9 @@ function setup({ unsupported, connected = true, ranges }: { unsupported?: string
 
 test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 60, true, 0], ['extended', 75, true, 75],
 	['old end', 60, false, 75], ['rounded old end', 60.001, false, 60.035], ['short extension', 60.035, true, 60.035],
-	['historical range', 60.035, false, 60.035], ['corrected down', 59.8, false, 0], ['unchanged', 60, false, 0],
-	['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
-] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration) => {
+	['overlapping extension', 60.035, true, 60.035, 60.02], ['historical range', 60.035, false, 60.035, 0], ['corrected down', 59.8, false, 0],
+	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
+] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?) => {
 	const { audio, media, session, fire, queue } = setup(), initial = queue.snapshot, positionState = vi.mocked(session.setPositionState)!.mockClear();
 	for (const [action, details, target] of [
 		['seekto', { seekTime: 12.25, fastSeek: true }, 12.25], ['seekforward', {}, 22.25],
@@ -241,7 +237,7 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	const ignored = scenario.endsWith('ignored'), unchanged = ignored || scenario.endsWith('unchanged'), endpoint = unchanged ? 60.035 : 60;
 	const forward = scenario === 'seekforward' || scenario.startsWith('forward');
 	if (unchanged) Object.assign(audio, { duration: endpoint, ranges: [[0, endpoint]], position: 60 });
-	if (scenario === 'historical range') audio.played = { length: 1, start: () => 0, end: () => position };
+	if (priorStart !== undefined) audio.played = timeRanges([[priorStart, position]]);
 	audio.write.mockImplementationOnce((target) => ignored ? undefined
 		: Object.assign(audio, { position: unchanged || scenario === 'corrected down' ? 60 : target - 0.000001, seeking: true }));
 	fire(forward ? 'seekforward' : 'seekto', { seekTime: endpoint, seekOffset: 100 });
@@ -252,7 +248,7 @@ test.each([['seekto', 60, false, 0], ['seekforward', 60, false, 0], ['compact', 
 	else if (scenario === 'corrected down') { audio.duration = audio.position = position; audio.emit('durationchange'); }
 	if (audio.seeking) { audio.emit('seeking'); audio.seeking = false; audio.emit('seeked'); }
 	if (revisedDuration) { audio.duration = revisedDuration; audio.emit('durationchange'); }
-	if (scenario === 'short extension') audio.played = { length: 1, start: () => 60, end: () => position };
+	if (scenario.endsWith('extension')) audio.played = timeRanges([[60, position]]);
 	Object.assign(audio, { position, ended: true, paused: true }).emit('pause', 'ended');
 	if (advances) expect(queue.snapshot.currentIndex).toBe(1); else expect(queue.snapshot).toBe(initial);
 	expect([audio.play.mock.calls.length, audio.load.mock.calls.length]).toEqual([1, 0]);
@@ -281,8 +277,7 @@ test('invalid inputs leave time unchanged and native ranges govern seek registra
 	for (const action of actions) expect(handler(action)).toBeFalsy();
 	audio.setReady([[0, 24], [40, 60]]);
 	const before = get(media.seekFeedback);
-	for (const action of actions) {
-		const field = action === 'seekto' ? 'seekTime' : 'seekOffset';
+	for (const [action, field] of [['seekto', 'seekTime'], ['seekforward', 'seekOffset'], ['seekbackward', 'seekOffset']] as const) {
 		for (const value of [NaN, Infinity, -1, '5', null, true, {}, action === 'seekto' ? undefined : 0]) fire(action, { [field]: value });
 		fire(action, { action: 'play', seekTime: 5, seekOffset: 5 });
 	}

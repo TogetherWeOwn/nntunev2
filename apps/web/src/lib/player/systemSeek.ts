@@ -21,8 +21,7 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 			const active = () => !signal.aborted && handlers === registration;
 			const action = (name: MediaSessionSeekDetails['action']) => (details: MediaSessionSeekDetails) => {
 				if (details?.action !== name || !active()) return;
-				const { seekTime, seekOffset = RELATIVE_JUMP_SECONDS } = details;
-				const seconds = name === 'seekto' ? seekTime : seekOffset;
+				const { seekTime, seekOffset = RELATIVE_JUMP_SECONDS } = details, seconds = name === 'seekto' ? seekTime : seekOffset;
 				if (typeof seconds !== 'number' || !Number.isFinite(seconds) || (name === 'seekto' ? seconds < 0 : seconds <= 0)) return;
 				const intent = owner.positionIntent(), ownsIntent = () => owner.matches() && active() && owner.positionIntent() === intent;
 				let retired = false; // Loss retires the registration, but this attempt may still report it.
@@ -42,7 +41,6 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 		setSeekHandlers(session, handlers);
 	};
 	const unsubscribe = eligible.subscribe(refresh);
-	if (signal.aborted) unsubscribe();
-	else signal.addEventListener('abort', unsubscribe, { once: true });
+	if (signal.aborted) unsubscribe(); else signal.addEventListener('abort', unsubscribe, { once: true });
 	return { refresh: () => refresh(get(eligible)), get handlers() { return handlers; } };
 }
