@@ -2,7 +2,7 @@
 	import { tick } from 'svelte';
 	import { actionForKey, SHORTCUT_ROWS, type ShortcutAction } from './shortcuts.js';
 
-	let { actions, buttonClass }: { actions?: readonly ShortcutAction[]; buttonClass?: string } = $props();
+	let { actions, buttonClass, playerScoped }: { actions?: readonly ShortcutAction[]; buttonClass?: string; playerScoped?: boolean } = $props();
 	const rows = $derived(SHORTCUT_ROWS.filter(({ key }) =>
 		!actions || actions.some((action) => action === actionForKey(key))));
 	let opened = $state(false);
@@ -60,6 +60,7 @@
 	<dialog bind:this={shortcutsDialogEl} data-testid="shortcuts-dialog" aria-label="Keyboard shortcuts"
 		onkeydown={trapShortcutsTab} oncancel={(event) => { event.preventDefault(); close(); }}>
 		<h2>Keyboard shortcuts</h2>
+		{#if playerScoped}<p>Focus a player button to use the character shortcuts. The audio controls keep their own keys.</p>{/if}
 		<ul>
 			{#each rows as row (row.key)}
 				<li><kbd>{row.key}</kbd> {row.label}</li>

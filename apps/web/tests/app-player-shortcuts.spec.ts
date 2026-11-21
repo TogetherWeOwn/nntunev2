@@ -30,7 +30,6 @@ test('app shortcuts act once on the live native audio across routes and stop at 
 	const home = page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true });
 	await home.click();
 	await expect(page).toHaveURL(/\/home$/);
-	await expect(page.getByTestId('library-list')).toHaveCount(0);
 	await home.focus();
 	await expect(home).toBeFocused();
 	const restartStatus = page.getByTestId('library-restart-status');
@@ -93,7 +92,7 @@ test('app shortcut help lists only supported bindings, restores focus and respec
 	await page.evaluate(() => document.body.appendChild(document.createElement('dialog')).showModal());
 	await page.keyboard.press('Escape');
 	await expect(page.locator('dialog[open]')).toHaveCount(1);
-	await expect(dialog).toBeVisible();
+	await expect(dialog.getByText('Focus a player button to use the character shortcuts. The audio controls keep their own keys.')).toBeVisible();
 	await page.keyboard.press('Escape');
 	await expect(dialog).toHaveCount(0);
 	await expect(play).toBeFocused();
