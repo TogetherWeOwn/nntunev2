@@ -137,7 +137,9 @@ for (const boundary of ['new selection', 'auth transition'] as const) {
 				await expect(page.getByTestId('now-playing')).toContainText('Moss');
 				await expect(page.locator('audio')).toHaveCount(1);
 			} else {
-				await expect(page.getByTestId('now-playing')).toHaveText('Queue is empty');
+				await expect(page.getByRole('alert')).toContainText(/session changed/i);
+				await expect(page.getByRole('link', { name: 'Sign in', exact: true })).toHaveAttribute('href', '/login');
+				await expect(page.getByTestId('now-playing')).toHaveCount(0);
 				await expect(page.locator('audio')).toHaveCount(0);
 			}
 		} finally {
