@@ -131,8 +131,16 @@ impl<'a> SidecarPut<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        readback_inventory::{CompletedReadbackInventory, InventoryError},
+        CompletedVersionedMedia,
+    };
     use super::*;
-    use nntune_core::{digest_enrollment::DigestEnrollment, media::PLAIN_CHUNK_SIZE};
+    use nntune_core::{
+        digest_enrollment::DigestEnrollment,
+        media::PLAIN_CHUNK_SIZE,
+        s3_locator::{S3Binding, S3Locator, S3MediaMetadata},
+    };
 
     fn id(byte: u8) -> [u8; 16] {
         let mut result = [byte; 16];
@@ -212,13 +220,40 @@ mod tests {
             body: b"",
             version_headers: &["A%2Fb+/="],
         };
-        let completed = put().verify_reply(reply()).unwrap();
+        let mut completed = put().verify_reply(reply()).unwrap();
         assert_eq!(completed.pin().1, "A%2Fb+/=");
         assert_eq!(completed.pin().0.key, key);
         let hash = page_hash(&page).unwrap();
         assert!(completed.matches_origin(page.len() as u32, &hash));
         assert!(!completed.matches_origin(page.len() as u32 + 1, &hash));
         assert!(!completed.matches_origin(page.len() as u32, &[0; 32]));
+
+        let locator = S3Locator::new(
+            "synthetic".into(),
+            format!("media/{}/{}", hex::encode(id(4)), hex::encode(id(5))),
+            S3Binding::VersionId("media-version".into()),
+        )
+        .unwrap();
+        let media = CompletedVersionedMedia(
+            S3MediaMetadata::from_trusted_context(locator, &context).unwrap(),
+        );
+        let assemble_error = |receipt: &CompletedSidecar<'_>| {
+            CompletedReadbackInventory::assemble(
+                "synthetic",
+                id(6),
+                &context,
+                id(7),
+                &manifest,
+                &media,
+                std::slice::from_ref(receipt),
+            )
+            .err()
+        };
+        assert!(assemble_error(&completed).is_none());
+        // Preserve every other receipt field to isolate the assembly check.
+        completed.origin_hash[0] ^= 1;
+        assert_eq!(assemble_error(&completed), Some(InventoryError::Sidecars));
+
         macro_rules! rejects {
             ($error:ident, $field:ident: $value:expr) => {
                 let changed = SidecarPutReply {
