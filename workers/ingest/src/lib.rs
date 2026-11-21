@@ -47,7 +47,6 @@ pub mod audio_selection;
 pub mod audio_tags;
 pub mod caller_auth;
 pub mod checkpoint;
-pub mod cleanup_dispatch;
 pub mod digest_candidate_identity;
 pub mod digest_candidate_store;
 pub mod dispatch;
@@ -1588,6 +1587,7 @@ fn owned_checkpoint<E>(
     }
 }
 
+pub mod cleanup_dispatch;
 pub mod multipart;
 
 #[cfg(test)]
