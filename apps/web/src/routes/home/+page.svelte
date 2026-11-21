@@ -19,6 +19,7 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let accessRefused = $state(false);
+	let verificationSuspended = $state(false);
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -29,7 +30,8 @@
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			requiresSignIn = state.requiresSignIn;
-			accessRefused = update.authBoundary === true && !state.requiresSignIn;
+			verificationSuspended = !!state.verificationSuspended;
+			accessRefused = update.authBoundary && !verificationSuspended && !state.requiresSignIn;
 		}
 	});
 
@@ -113,7 +115,7 @@
 		</section>
 	{/if}
 
-	{#if recentQueries.length > 0}
+	{#if !verificationSuspended && !accessRefused && !requiresSignIn && recentQueries.length > 0}
 		<section aria-labelledby="home-recent-heading">
 			<h2 id="home-recent-heading">Recent searches</h2>
 			<ul>

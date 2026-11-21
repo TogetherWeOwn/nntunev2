@@ -95,6 +95,8 @@
 	let collectionFilter = $state<CollectionFilter | 'tracks'>('tracks');
 	const showingTracks = $derived(collectionFilter === 'tracks');
 	let collectionsAccessRevoked = $state(false);
+	let verificationSuspended = $state(false);
+	const showRecovery = $derived(showingTracks || verificationSuspended);
 
 	function readStoredDensity(): Density {
 		try {
@@ -164,6 +166,7 @@
 	let queueConfirmGeneration = $state(0);
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = false;
+	let favoriteVisitKey: string | null = null;
 	let favoriteEdit = 0;
 	let favoriteBaseline: readonly string[] = [];
 	let favoritesAnnouncement = $state('');
@@ -329,7 +332,9 @@
 		},
 		onStateChange: (state, { isCurrent, authoritative, authBoundary }) => {
 			if (!isCurrent()) return;
-			if (authBoundary || (authoritative && !state.libraryUnavailable)) collectionsAccessRevoked = !!authBoundary;
+			verificationSuspended = !!state.verificationSuspended;
+			const revoked = authBoundary && !verificationSuspended;
+			if (authBoundary || (authoritative && !state.libraryUnavailable)) collectionsAccessRevoked = revoked;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -341,12 +346,12 @@
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			// Keep the empty focus target even if the last queued row is removed during a retry.
-			retainedQueueWithoutListing = !authBoundary && (state.loading || state.libraryUnavailable || !!state.loadError) &&
+			retainedQueueWithoutListing = !revoked && (state.loading || state.libraryUnavailable || !!state.loadError) &&
 				(retainedQueueWithoutListing || queueController.snapshot.tracks.length > 0);
 			requiresSignIn = state.requiresSignIn;
 			if (authBoundary) queueFilterQuery = '';
 			if (state.loadError && state.items.length === 0) {
-				if (authBoundary) {
+				if (revoked) {
 					clearFavoritesExportFeedback();
 					releaseFavoritesDownload();
 					favoriteBaseline = favorites = [];
@@ -364,7 +369,7 @@
 				recentFindsInitialized = false;
 				recentFindsAnnouncement = '';
 			}
-			if (!authBoundary && (state.loading || state.items.length === 0)) {
+			if (!revoked && (state.loading || state.items.length === 0)) {
 				player.browseCopy.invalidate();
 				clearFavoritesExportFeedback();
 				media.clearShareSeek();
@@ -396,8 +401,10 @@
 			// fails; Refresh must not overwrite pending edits with stale storage.
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
-				if (!favoritesInitialized) {
-					favoriteBaseline = favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
+				const session = browserStorage('session'), key = favoritesKey(session);
+				if (!favoritesInitialized || key !== favoriteVisitKey) {
+					favoriteVisitKey = key;
+					favoriteBaseline = favorites = loadFavorites(session, browserStorage('local'));
 					favoritesInitialized = true;
 				}
 				if (!recentFindsInitialized) {
@@ -1553,7 +1560,7 @@
 				onclick={() => { collectionFilter = type; }}>{label}</button>
 		{/each}
 	</div>
-	{#if collectionFilter !== 'tracks'}
+	{#if collectionFilter !== 'tracks' && !verificationSuspended}
 		<CollectionBrowser filter={collectionFilter} accessRevoked={collectionsAccessRevoked} />
 	{/if}
 
@@ -1600,16 +1607,16 @@
 {/snippet}
 
 	{#if loading && items.length === 0}
-		<p role="status" hidden={!showingTracks}>Loading your library…</p>
+		<p role="status" hidden={!showRecovery}>Loading your library…</p>
 	{:else if loadError && items.length === 0}
-		<p role="alert" hidden={!showingTracks}>{loadError}</p>
+		<p role="alert" hidden={!showRecovery}>{loadError}</p>
 		{#if requiresSignIn}
 			<a class="nt-button" href="/login" hidden={!showingTracks}>Sign in</a>
 		{/if}
 		<button
 			class="nt-button"
 			type="button"
-			hidden={!showingTracks}
+			hidden={!showRecovery}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>

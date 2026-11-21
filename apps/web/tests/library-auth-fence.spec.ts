@@ -33,6 +33,24 @@ test('a closed writer and verifier outage allow Retry; replacement retires local
 	await page.getByRole('button', { name: 'Play displayed from the top' }).click();
 	const time = () => page.getByTestId('audio-player').evaluate((el: HTMLAudioElement) => el.currentTime);
 	await expect.poll(time).toBeGreaterThan(0);
+	const restoreWrites = await page.evaluateHandle((key) => {
+		const write = Storage.prototype.setItem;
+		Storage.prototype.setItem = function (name, value) {
+			if (name === key) throw new DOMException('Favorites quota', 'QuotaExceededError');
+			write.call(this, name, value);
+		};
+		return () => { Storage.prototype.setItem = write; };
+	}, favoritesKey);
+	const unstar = page.getByRole('button', { name: 'Unstar Scoped track', exact: true });
+	await unstar.click();
+	failNext = true;
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(retry).toBeVisible();
+	await expect(page.getByTestId('library-item')).toHaveCount(0);
+	await retry.click();
+	await expect(page.getByTestId('favorites-empty')).toBeVisible();
+	expect(await page.evaluate((key) => localStorage.getItem(key), favoritesKey)).toBe('["track"]');
+	await restoreWrites.evaluate((restore) => restore());
 	failNext = true;
 	const remove = page.getByRole('button', { name: 'Remove Scoped track from Liked' });
 	await page.getByRole('link', { name: 'Liked', exact: true }).click();
@@ -70,5 +88,31 @@ test('a closed writer and verifier outage allow Retry; replacement retires local
 	const persisted = await page.evaluate((key) => [localStorage.getItem(key),
 		localStorage.getItem('nntune.library.favorites.v1.replacement'), document.body.dataset.authBroadcast], favoritesKey);
 	expect(persisted).toEqual([' [ ] ', null, undefined]);
-	expect(verifies).toBe(4);
+	expect(verifies).toBe(6);
 });
+
+for (const view of ['Home', 'Albums', 'Artists']) {
+	test(`a verifier outage offers Retry in ${view}`, async ({ page }) => {
+		const fail = Promise.withResolvers<void>();
+		let attempts = 0;
+		await page.route('**/api/library', (r) => r.fulfill({ headers: { 'x-nntune-session-binding': current },
+			json: [{ id: 'track', title: 'Scoped track' }] }));
+		await page.route('**/v1/me/likes/session', async (r) => {
+			if (++attempts > 1) return r.fulfill({ json: { session_binding: current } });
+			await fail.promise;
+			return r.fulfill({ status: 503, json: {} });
+		});
+		const home = view === 'Home';
+		await page.route('**/v1/releases', (r) => r.fulfill({ json: [] }));
+		await page.route('**/v1/artists', (r) => r.fulfill({ json: [] }));
+		await page.goto(home ? '/home' : '/library');
+		if (!home) await page.getByRole('button', { name: view, exact: true }).click();
+		fail.resolve();
+		await expect(page.getByRole('alert')).toContainText('Could not verify your library session');
+		await expect(page.getByText('Scoped track', { exact: true })).toHaveCount(0);
+		await expect(page.getByRole('region', { name: 'Library collections' })).toHaveCount(0);
+		await page.getByRole('button', { name: 'Retry', exact: true }).click();
+		if (home) await expect(page.getByText('Scoped track', { exact: true })).toBeVisible();
+		else await expect(page.getByText(`No ${view.toLowerCase()} in the loaded results.`)).toBeVisible();
+	});
+}

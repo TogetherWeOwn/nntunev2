@@ -1,7 +1,6 @@
-import { PUBLIC_API_BASE_URL } from '$app/env/public';
-import { ApiClient, ApiError } from '../api/client.js';
 import { captureAuthFence } from '../auth-fence.js';
 import { clearToasts } from '../shell/toasts.js';
+import { validBinding, verifyLibrarySession } from './session-verification.js';
 import {
 	clearSnapshot,
 	establishVerifiedLibraryScope,
@@ -28,6 +27,7 @@ export interface LibraryRefreshState {
 	loadError: string | null;
 	libraryUnavailable: boolean;
 	requiresSignIn: boolean;
+	verificationSuspended?: boolean;
 }
 
 export interface LibraryRefreshUpdate {
@@ -53,21 +53,7 @@ export interface LibraryRefresherDeps {
 	timeoutMs?: number;
 }
 
-// SHA-256 base64url has two zero pad bits in its last sextet.
-const validBinding = (value: unknown): value is string => typeof value === 'string' && /^[\w-]{42}[AEIMQUYcgkosw048]$/.test(value);
 const legacyFixture = () => import.meta.env.MODE === 'test' || import.meta.env.MODE === 'browser-fixtures';
-
-async function verifyLibrarySession(binding: string, signal: AbortSignal): Promise<boolean> {
-	try {
-		const result = await new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal })
-			.get<{ session_binding?: unknown }>('/v1/me/likes/session');
-		if (!validBinding(result?.session_binding)) throw new Error('Missing verified session binding');
-		return result.session_binding === binding;
-	} catch (error) {
-		if (error instanceof ApiError && (error.status === 401 || error.status === 403)) return false;
-		throw error;
-	}
-}
 
 export interface LibraryRefresher {
 	readonly state: LibraryRefreshState;
@@ -247,11 +233,19 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			if (!isCurrent()) return;
 			if (activeRequest === controller) activeRequest = null;
 			state.loading = false;
-			const fence = verified?.fence;
+			const fence = authenticatedThisLoad ? verified?.fence : undefined;
 			deps.onStateChange?.(state, {
 				isCurrent: () => isCurrent() && (!fence || fence.isCurrent()),
 				authoritative, authBoundary: false, sessionBinding, deviceScope
 			});
+		}
+
+		function restoreSnapshot(): void {
+			const snapshot = authenticatedThisLoad ? inMemorySnapshot ?? loadSnapshot(deps.sessionStorage()) : null;
+			if (!isCurrent()) return;
+			state.items = snapshot?.items ?? [];
+			state.staleAt = snapshot?.savedAt ?? null;
+			if (!snapshot) state.loadError = 'Library is not reachable right now.';
 		}
 
 		function refuse(replaced = false, status?: number): true {
@@ -300,10 +294,10 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				if (!isCurrent()) return;
 			}
 			if (response.status === 404) {
+				if (state.verificationSuspended) return void refuse();
 				// The list endpoint has not landed yet. Do not treat a 404 as
 				// session verification or expose a previously saved snapshot.
 				authenticatedThisLoad = false;
-				verified = undefined;
 				inMemorySnapshot = null;
 				state.items = [];
 				state.staleAt = null;
@@ -338,6 +332,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				const snapshot = saveSnapshot(storage, fresh, undefined, !label);
 				if (!isCurrent()) return;
 				authenticatedThisLoad = true;
+				state.verificationSuspended = false;
 				inMemorySnapshot = { ...snapshot, items: fresh };
 				state.items = fresh;
 				state.staleAt = null;
@@ -364,17 +359,10 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			})) refuse();
 		} catch {
 			if (!isCurrent()) return;
-			const fallback = () => {
-				const snapshot = authenticatedThisLoad ? inMemorySnapshot ?? loadSnapshot(deps.sessionStorage()) : null;
-				if (!isCurrent()) return;
-				state.items = snapshot?.items ?? [];
-				state.staleAt = snapshot?.savedAt ?? null;
-				if (!snapshot) state.loadError = 'Library is not reachable right now.';
-			};
-			if (binding !== null) refuse();
-			else if (verified) {
-				if (!await verified.fence.run(() => { fallback(); publish(); return true; })) refuse();
-			} else fallback();
+			if (state.verificationSuspended || binding !== null) return void refuse();
+			if (authenticatedThisLoad && verified) {
+				if (!await verified.fence.run(() => { restoreSnapshot(); publish(); return true; })) refuse();
+			} else restoreSnapshot();
 		} finally {
 			if (timeoutId !== undefined) clearTimeout(timeoutId);
 			controller.signal.removeEventListener('abort', onAbort);
@@ -398,7 +386,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		if (!isCurrent()) return;
 		activeRequest = null;
 		authenticatedThisLoad = false;
-		verified = undefined;
+		if (replaced) verified = undefined;
+		state.verificationSuspended = !replaced;
 		inMemorySnapshot = null;
 		if (replaced && notify) {
 			clearToasts();

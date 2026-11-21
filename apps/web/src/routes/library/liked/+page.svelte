@@ -30,11 +30,14 @@
 		invalidateLibraryCache,
 		onStateChange: (state, { isCurrent, authBoundary, sessionBinding }) => {
 			if (!isCurrent()) return;
-			if (authBoundary) {
+			const key = favoritesKey(session);
+			if ((authBoundary && !state.verificationSuspended) || (sessionBinding && favoriteVisitKey !== key)) {
 				pendingChanges.clear();
 				favoriteIds = [];
-			} else if (sessionBinding && pendingChanges.size === 0) {
-				favoriteIds = loadFavorites(session, local, favoriteIds);
+			}
+			if (sessionBinding) {
+				favoriteVisitKey = key;
+				favoriteIds = currentFavorites();
 			}
 			items = state.items;
 			loading = state.loading;
@@ -52,6 +55,7 @@
 	const session = browserStorage('session');
 	const local = browserStorage('local');
 	let favoriteIds = $state<string[]>(loadFavorites(session, local));
+	let favoriteVisitKey = favoritesKey(session);
 
 	const liked = $derived(selectFavoriteItems(items, favoriteIds));
 

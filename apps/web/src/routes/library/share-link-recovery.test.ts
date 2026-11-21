@@ -4,7 +4,7 @@ import * as queueFunctions from '#lib/player/queue.js';
 import { createQueueShare } from '#lib/player/queueShare.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
-import { clearFavoritesAtAuthBoundary, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
+import { clearFavoritesAtAuthBoundary, favoritesKey, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
 import { clearRecentFindsAtAuthBoundary, loadRecentFinds } from '#lib/library/recent-finds.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
 import { displayArtist, displayTitle, orderLibraryItems, shortTitle } from '#lib/library/order.js';
@@ -61,7 +61,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		queueCurrentTrack: queueFunctions.currentTrack,
 		selectQueueIndex: queueFunctions.selectTrack,
 		insertTracks: queueFunctions.insertTracks, survivingInteractionIds,
-		createLibraryRefresher, loadFavorites, selectFavoriteItems, loadRecentFinds,
+		createLibraryRefresher, favoritesKey, loadFavorites, selectFavoriteItems, loadRecentFinds,
 		displayArtist, displayTitle, orderLibraryItems, createSelection, pruneSelection,
 		clearSignedInEmail, clearFavoritesAtAuthBoundary, clearRecentFindsAtAuthBoundary,
 		resolveStreamUrl, resolveShareTarget, endTrackDrag,
