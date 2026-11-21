@@ -652,6 +652,7 @@
 	}
 
 	.nt-body {
+		container: shell / inline-size;
 		display: flex;
 		align-items: flex-start;
 	}

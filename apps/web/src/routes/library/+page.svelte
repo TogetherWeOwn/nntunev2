@@ -244,6 +244,7 @@
 	 */
 	let queueFilterQuery = $state('');
 	let playerQueue = $state<ReturnType<typeof PlayerQueue>>();
+	const showQueue = $derived(queue.tracks.length > 0 || retainedQueueWithoutListing || (!libraryUnavailable && items.length > 0));
 	/**
 	 * True only when a refresh starts while the filter input holds focus.
 	 * A branch swap (error/empty) unmounts the panel, so completion restores
@@ -600,6 +601,13 @@
 	}
 
 	function resetShareAtAuthBoundary(): void {
+		if (typeof document !== 'undefined' && document.activeElement?.closest('#library-queue-panel')) {
+			void tick().then(() => {
+				if (shareAlive && document.activeElement === document.body) {
+					(showingTracks ? refreshButton : document.getElementById('library-density'))?.focus();
+				}
+			});
+		}
 		queueExportAuthGeneration += 1;
 		if (typeof window !== 'undefined') handledShareSearch = window.location.search;
 		if (queueController.snapshot.tracks.length) queueConfirmGeneration += 1;
@@ -1562,7 +1570,8 @@
 		</div>
 	{/if}
 
-	<div data-testid="queue-share-status" aria-live="polite" aria-atomic="true">{queueShareStatus}</div>
+{#snippet queueShareFeedback()}
+	<div data-testid="queue-share-status" aria-live="polite" aria-atomic="true">{queueShareFallbackUrl ? 'Queued track link available to copy manually.' : queueShareStatus}</div>
 	{#if queueShareFallbackUrl}
 		<div class="nt-library-share-fallback">
 			<label for="queue-share-url">Queued track link</label>
@@ -1578,6 +1587,7 @@
 			</p>
 		</div>
 	{/if}
+{/snippet}
 
 	{#if loading && items.length === 0}
 		<p role="status" hidden={!showingTracks}>Loading your library…</p>
@@ -1955,51 +1965,42 @@
 		{/if}
 		</div>
 	{/if}
-		{#if queue.tracks.length > 0 || retainedQueueWithoutListing || (!libraryUnavailable && items.length > 0)}
-			<!--
-				The queue panel stays mounted across background refreshes (its
-				rows remain readable while the new list loads), but its four
-				live statuses suspend while loading so the inline loading
-				indicator keeps the single-status transient the ordering specs
-				pin with an unfiltered role query. Content, controls and
-				focus are untouched; the roles return with the fresh list.
-			-->
-			<LibraryQueueHost dismissMenu={() => playerQueue?.dismissTrackMenu()}>
-				<div class="nt-library-queue" data-density={density}>
-					<PlayerQueue
-						bind:this={playerQueue}
-						state={queue}
-						announcement={player.queueAnnouncement.text}
-						announcementVersion={player.queueAnnouncement.version}
-						{favoriteIds}
-						ontogglefavorite={listingUnavailable ? undefined : toggleQueuedFavorite}
-						onfavoriteids={listingUnavailable ? undefined : (ids, remove) => favoriteInteractionIds(ids, remove, true)}
-						bind:filterQuery={queueFilterQuery}
-						liveRegions={!loading}
-						confirmDestructive
-						confirmGeneration={queueConfirmGeneration}
-						onnext={() => replaceQueue(nextTrack(queueController.snapshot))}
-						onshuffle={() => replaceQueue(shuffleUpcoming(queueController.snapshot))}
-						onmove={moveQueuedTrack}
-						oninsert={insertQueuedIds}
-						interactionsUnavailable={listingUnavailable}
-						onmenufocusfallback={focusLibraryRecovery}
-						onreorder={listingUnavailable ? undefined : reorderQueuedIds}
-						onplaynextids={queueNextIds}
-						onremoveids={removeQueuedIds}
-						onplaynext={(index) => replaceQueue(playNext(queueController.snapshot, index))}
-						onremove={removeQueuedTrack}
-						onclear={clearQueuedTracks}
-						onselect={selectQueuedTrack}
-						onplaynow={(id) => void playQueuedTrack(id)}
-						oncopylink={(id) => void queueShare.copy(id)}
-						onkeepcurrentandupcoming={trimPreviousTracks}
-						onclearupcoming={trimUpcomingTracks}
-					/>
-					<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />
-				</div>
-			</LibraryQueueHost>
+	<LibraryQueueHost available={showQueue} {density} dismissMenu={() => playerQueue?.dismissTrackMenu()}>
+		{#if showQueue}
+			<PlayerQueue
+				bind:this={playerQueue}
+				state={queue}
+				announcement={player.queueAnnouncement.text}
+				announcementVersion={player.queueAnnouncement.version}
+				{favoriteIds}
+				ontogglefavorite={listingUnavailable ? undefined : toggleQueuedFavorite}
+				onfavoriteids={listingUnavailable ? undefined : (ids, remove) => favoriteInteractionIds(ids, remove, true)}
+				bind:filterQuery={queueFilterQuery}
+				liveRegions={!loading}
+				confirmDestructive
+				confirmGeneration={queueConfirmGeneration}
+				onnext={() => replaceQueue(nextTrack(queueController.snapshot))}
+				onshuffle={() => replaceQueue(shuffleUpcoming(queueController.snapshot))}
+				onmove={moveQueuedTrack}
+				oninsert={insertQueuedIds}
+				interactionsUnavailable={listingUnavailable}
+				onmenufocusfallback={focusLibraryRecovery}
+				onreorder={listingUnavailable ? undefined : reorderQueuedIds}
+				onplaynextids={queueNextIds}
+				onremoveids={removeQueuedIds}
+				onplaynext={(index) => replaceQueue(playNext(queueController.snapshot, index))}
+				onremove={removeQueuedTrack}
+				onclear={clearQueuedTracks}
+				onselect={selectQueuedTrack}
+				onplaynow={(id) => void playQueuedTrack(id)}
+				oncopylink={(id) => void queueShare.copy(id)}
+				onkeepcurrentandupcoming={trimPreviousTracks}
+				onclearupcoming={trimUpcomingTracks}
+			/>
 		{/if}
+		{@render queueShareFeedback()}
+		{#if showQueue}<QueueExport {queue} authGeneration={queueExportAuthGeneration} {loading} />{/if}
+	</LibraryQueueHost>
 
 	{#if (!loading && !loadError) || items.length > 0}
 		<button
@@ -2081,10 +2082,10 @@
 		white-space: nowrap;
 		border: 0;
 	}
-	main, .nt-library-queue {
+	:global(.nt-library-queue) {
 		--nt-library-row-padding: 0.25rem;
 	}
-	main[data-density='compact'], .nt-library-queue[data-density='compact'] {
+	:global(.nt-library-queue[data-density='compact']) {
 		--nt-library-row-padding: 0;
 	}
 	.nt-library-repeat {
@@ -2137,10 +2138,10 @@
 	}
 	/* Density only changes row whitespace, never the controls or their order.
 	 * The ancestor scope keeps the shared queue's other hosts unchanged. */
-	.nt-library-queue :global(.queue-row) {
+	:global(.nt-library-queue .queue-row) {
 		padding-block: var(--nt-library-row-padding);
 	}
-	.nt-library-queue :global(.queue-row button:not(.queue-star, .queue-grip, .queue-more)) {
+	:global(.nt-library-queue .queue-row button:not(.queue-star, .queue-grip, .queue-more)) {
 		min-width: 24px;
 		min-height: 24px;
 	}
@@ -2233,6 +2234,7 @@
 		flex-wrap: wrap;
 		padding: 0;
 	}
+	.nt-favorite-row, .nt-shelf-unstar { overflow-wrap: anywhere; }
 	.nt-favorite-row {
 		display: block;
 		flex: 1 1 auto;

@@ -2,7 +2,9 @@
 	import { onMount, tick, type Snippet } from 'svelte';
 	import { readRightPanel, setRightPanel } from '#lib/shell/right-panel.js';
 
-	let { children, dismissMenu }: { children: Snippet; dismissMenu: () => HTMLElement | undefined } = $props();
+	let { children, available, density, dismissMenu }: {
+		children: Snippet; available: boolean; density: string; dismissMenu: () => HTMLElement | undefined;
+	} = $props();
 
 	let wide = $state(false);
 	let expanded = $state(false);
@@ -11,6 +13,7 @@
 	let panel: HTMLDivElement;
 	let inline: HTMLDivElement;
 	let projection: HTMLDivElement;
+	let fit: HTMLSpanElement;
 
 	// Move the route-owned subtree as a unit: re-rendering the snippet in a
 	// second host would reset queue selection, confirmation and copy feedback.
@@ -45,9 +48,16 @@
 	}
 	}
 
+	$effect(() => {
+		if (!available && expanded) {
+			expanded = false;
+			releaseSlot();
+		}
+	});
+
 	async function togglePanel(): Promise<void> {
 		if (expanded) return close(true);
-		if (!wide || readRightPanel()) return;
+		if (!available || !wide || readRightPanel()) return;
 		expanded = true;
 		setRightPanel(queuePanel);
 		await tick();
@@ -57,23 +67,20 @@
 	}
 
 	function escape(event: KeyboardEvent): void {
-		if (event.key !== 'Escape' || event.defaultPrevented || !expanded) return;
+		if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || !expanded) return;
 		if (!(event.target instanceof Node) || !panel?.contains(event.target)) return;
 		event.preventDefault();
 		close(true);
 	}
 
 	onMount(() => {
-		// Match the shell's breakpoint, with inline as the safe initial host.
-		const narrow = window.matchMedia('(max-width: 799px)');
-		const resize = () => {
-			if (narrow.matches && (expanded || document.activeElement === toggle)) close(false);
-			wide = !narrow.matches;
-		};
-		resize();
-		narrow.addEventListener('change', resize);
+		const sizing = new ResizeObserver(() => {
+			wide = fit.offsetWidth > 0;
+			if (!wide && (expanded || document.activeElement === toggle)) close(false);
+		});
+		sizing.observe(fit);
 		return () => {
-			narrow.removeEventListener('change', resize);
+			sizing.disconnect();
 			releaseSlot();
 		};
 	});
@@ -81,10 +88,11 @@
 
 <svelte:window onkeydown={escape} />
 
+<span class="queue-fit" bind:this={fit}></span>
 <button
 	type="button"
 	class="nt-button"
-	hidden={!wide}
+	hidden={!wide || !available}
 	bind:this={toggle}
 	aria-expanded={expanded}
 	aria-controls={expanded ? 'library-queue-panel' : undefined}
@@ -93,7 +101,7 @@
 	Queue in side panel
 </button>
 <div bind:this={inline}>
-	<div bind:this={projection} tabindex="-1">
+	<div class="nt-library-queue" data-density={density} bind:this={projection} tabindex="-1">
 		{@render children()}
 	</div>
 </div>
@@ -108,6 +116,11 @@
 {/snippet}
 
 <style>
+	/* Reserve 12rem for navigation, 19rem for queue and 19rem for Library. */
+	.queue-fit { position: absolute; inline-size: 0; visibility: hidden; }
+	@container shell (min-width: max(800px, 50rem)) {
+		.queue-fit { inline-size: 1px; }
+	}
 	.nt-button[hidden] { display: none; }
 	#library-queue-panel { overflow-wrap: anywhere; }
 	#library-queue-panel :global(.queue-selection label),

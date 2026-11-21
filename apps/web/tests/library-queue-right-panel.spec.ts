@@ -58,9 +58,6 @@ test('keyboard moves the same live queue to the right slot and back', async ({ p
 	await expect(page.getByRole('checkbox', { name: 'Select Fern for queue actions' })).toBeChecked();
 	expect(await order(page)).toEqual(['coral', 'moss', 'fern']);
 
-	const sidebar = (await panel(page).boundingBox())!;
-	const main = (await page.getByRole('main').boundingBox())!;
-	expect(sidebar.x).toBeGreaterThanOrEqual(main.x + main.width - 1);
 	await page.keyboard.press('Tab');
 	await expect(next(page)).toBeFocused();
 	await page.keyboard.press('Enter');
@@ -68,6 +65,11 @@ test('keyboard moves the same live queue to the right slot and back', async ({ p
 	await expect(panel(page).locator('[data-testid="queue-item"][aria-current="true"]')).toHaveAttribute('data-track-id', 'moss');
 	expect(await order(page)).toEqual(['coral', 'moss', 'fern']);
 
+	const filter = panel(page).getByRole('searchbox', { name: 'Filter queue' });
+	await filter.fill('Fern');
+	await filter.press('Escape');
+	await expect(filter).toHaveValue('');
+	await expect(filter).toBeFocused();
 	await page.keyboard.press('Escape');
 	await expect(toggle(page)).toBeFocused();
 	await expect(toggle(page)).toHaveAttribute('aria-expanded', 'false');
@@ -95,7 +97,10 @@ test('the panel keeps order actions, export fallback and loading behavior live',
 	expect(await order(page)).toEqual(['fern', 'coral', 'moss']);
 	await panel(page).getByRole('button', { name: 'More actions for Fern' }).click();
 	await panel(page).getByRole('menuitem', { name: 'Copy link' }).click();
-	await expect(page.getByTestId('queue-share-fallback')).toHaveValue(/\/library\?track=fern/);
+	await expect(panel(page).getByTestId('queue-share-fallback')).toHaveValue(/\/library\?track=fern/);
+	const cue = panel(page).locator('[data-testid="queue-share-status"][aria-live="polite"]');
+	await expect(cue).toContainText('available to copy manually');
+	await expect(panel(page).getByRole('button', { name: 'More actions for Fern' })).toBeFocused();
 	await panel(page).getByRole('button', { name: 'Copy queue as text' }).click();
 	await expect(panel(page).getByTestId('queue-export-fallback')).toHaveValue(/Fern[\s\S]*Coral[\s\S]*Moss/);
 	const download = page.waitForEvent('download');
@@ -149,18 +154,29 @@ test('resizing with a keyboard-opened row menu returns focus to its trigger', as
 	await expect(menu.locator(':focus')).toHaveCount(1);
 });
 
-test('long Unicode titles fit the panel and leave the move dropdown focusable at 800px', async ({ page }) => {
+test('the 800px layout fits both columns and falls back inline with larger text', async ({ page }) => {
 	await page.setViewportSize({ width: 800, height: 800 });
 	await seed(page);
+	await queued(page).getByRole('button', { name: `Star ${tracks[0].title}`, exact: true }).click();
 	await keyboardOpen(page);
 	await expect(panel(page).getByTestId('now-playing')).toContainText(tracks[0].title);
 	await page.getByRole('checkbox', { name: 'Select Fern for queue actions' }).check();
 	const moveBefore = panel(page).getByRole('combobox', { name: 'Move selected before' });
 	await moveBefore.focus();
 	await expect(moveBefore).toBeFocused();
-	const bounds = (await moveBefore.boundingBox())!;
-	expect(bounds.x + bounds.width + 4).toBeLessThanOrEqual(800);
-	expect(await panel(page).evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
+	const sidebar = (await panel(page).boundingBox())!;
+	const main = page.getByRole('main');
+	const library = (await main.boundingBox())!;
+	expect(sidebar.x).toBeGreaterThanOrEqual(library.x + library.width - 1);
+	expect(sidebar.x + sidebar.width).toBeLessThanOrEqual(800);
+	await expect(page.getByTestId('favorite-item')).toContainText(tracks[0].title);
+	for (const column of [panel(page), main]) {
+		expect(await column.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
+	}
+	await page.evaluate(() => { document.documentElement.style.fontSize = '26px'; });
+	await expect(toggle(page)).toBeHidden();
+	await expect(panel(page)).toHaveCount(0);
+	await expect(inline(page)).toBeVisible();
 });
 
 test('an auth boundary or leaving Library releases the panel slot', async ({ page }) => {
@@ -174,7 +190,9 @@ test('an auth boundary or leaving Library releases the panel slot', async ({ pag
 	await expect(panel(page)).toHaveCount(0);
 	await expect(queued(page)).toHaveCount(0);
 
-	await page.getByRole('button', { name: 'Retry' }).click();
+	const retry = page.getByRole('button', { name: 'Retry' });
+	await expect(retry).toBeFocused();
+	await retry.click();
 	await keyboardOpen(page);
 	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home' }).click();
 	await expect(page).toHaveURL(/\/home$/);

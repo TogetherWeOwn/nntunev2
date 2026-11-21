@@ -766,7 +766,11 @@
 -->
 <div class="queue-filter">
 	<label for="queue-filter-input">Filter queue</label>
-	<input id="queue-filter-input" type="search" bind:value={filterQuery} />
+	<input id="queue-filter-input" type="search" bind:value={filterQuery} onkeydown={(event) => {
+		if (event.key !== 'Escape' || !filterQuery || event.isComposing) return;
+		event.preventDefault();
+		filterQuery = '';
+	}} />
 	<button type="button" onclick={() => (filterQuery = '')}>Clear queue filter</button>
 </div>
 
