@@ -37,24 +37,18 @@ describe('actionForKey', () => {
 	});
 });
 
-describe('actionForShortcutEvent', () => {
+it('resolves only unclaimed player keys outside editing surfaces and modals', () => {
 	const scope = (modal: boolean): ModalScope => ({ querySelector: () => modal, querySelectorAll: () => [] });
-	const keydown = (key: string, overrides: object = {}) => ({ key, ...overrides }) as KeyboardEvent;
-
-	it.each([
-		{ defaultPrevented: true }, { ctrlKey: true }, { metaKey: true },
-		{ altKey: true }, { isComposing: true }, { keyCode: 229 }
-	])('leaves owned chords to their original handler: %o', (flags) => {
-		expect(actionForShortcutEvent(keydown('k', flags), scope(false))).toBeNull();
-		expect(actionForShortcutEvent(keydown('Escape', flags), scope(true))).toBeNull();
-	});
-
-	it('allows shifted help but leaves editing and other modals alone', () => {
-		expect(actionForShortcutEvent(keydown('?', { shiftKey: true }), scope(false))).toBe('open-shortcuts');
-		expect(actionForShortcutEvent(keydown('0', { target: { tagName: 'SELECT' } }), scope(false))).toBeNull();
-		expect(actionForShortcutEvent(keydown('j'), scope(true))).toBeNull();
-		expect(actionForShortcutEvent(keydown('Escape'), scope(true))).toBe('close-shortcuts');
-	});
+	const resolve = (key: string, flags = {}, modal = false) => actionForShortcutEvent({ key, ...flags } as KeyboardEvent, scope(modal));
+	for (const flags of [{ defaultPrevented: true }, { ctrlKey: true }, { metaKey: true },
+		{ altKey: true }, { isComposing: true }, { keyCode: 229 }]) {
+		expect(resolve('k', flags)).toBeNull();
+		expect(resolve('Escape', flags, true)).toBeNull();
+	}
+	expect(resolve('?', { shiftKey: true })).toBe('open-shortcuts');
+	expect(resolve('0', { target: { tagName: 'SELECT' } })).toBeNull();
+	expect(resolve('j', {}, true)).toBeNull();
+	expect(resolve('Escape', {}, true)).toBe('close-shortcuts');
 });
 
 describe('isTypingTarget', () => {

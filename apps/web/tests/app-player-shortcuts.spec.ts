@@ -32,10 +32,22 @@ test('app shortcuts act once on the live native audio across routes and stop at 
 	await expect.poll(() => time(page)).toBeCloseTo(pausedAt + 10);
 	await page.keyboard.press('0');
 	await expect.poll(() => time(page)).toBeCloseTo(0);
-	await expect(page.getByTestId('library-restart-status')).toContainText('Restarted Keys Coral');
-	await expect(audio(page)).toHaveCount(1);
+	const restartStatus = page.getByTestId('library-restart-status');
+	await expect(restartStatus).toContainText('Restarted Keys Coral');
 	expect(await native.evaluate((node: HTMLAudioElement) =>
 		node === document.querySelector('audio') && node.controls && node.paused)).toBe(true);
+
+	await audio(page).evaluate((node: HTMLAudioElement) => {
+		node.currentTime = 7;
+		Object.defineProperty(node, 'seekable', { value: { length: 0 } });
+		node.dispatchEvent(new Event('progress'));
+	});
+	await expect(page.getByTestId('library-restart')).toBeDisabled();
+	expect(await page.evaluate(() => document.body.dispatchEvent(
+		new KeyboardEvent('keydown', { key: '0', bubbles: true, cancelable: true })
+	))).toBe(true);
+	expect(await time(page)).toBeCloseTo(7);
+	await expect(restartStatus).toHaveText('Restarted Keys Coral.');
 
 	// A delegated link leaves the app shell without replacing the JS realm.
 	await page.evaluate(() => {
@@ -58,15 +70,19 @@ test('app shortcut help lists only supported bindings, restores focus and respec
 	await openLibrary(page);
 	const play = page.getByRole('button', { name: 'Play', exact: true });
 	await play.focus();
-	await page.keyboard.press('?');
+	await page.keyboard.press('Shift+Slash');
 	const dialog = page.getByRole('dialog', { name: 'Keyboard shortcuts' });
 	const close = dialog.getByRole('button', { name: 'Close' });
 	await expect(dialog.locator('kbd')).toHaveText(['k', 'j', 'l', '0', '?', 'Escape']);
 	await expect(close).toBeFocused();
-	for (const key of ['Tab', 'Shift+Tab', 'j', 'k', '0']) await page.keyboard.press(key);
-	await expect(close).toBeFocused();
-	await expect(status(page)).toHaveText('Paused');
-	expect(await time(page)).toBeCloseTo(12);
+	for (const key of ['Tab', 'Shift+Tab', 'j', 'k', '0']) {
+		await page.keyboard.press(key);
+		await expect(close).toBeFocused();
+	}
+	await page.evaluate(() => document.body.appendChild(document.createElement('dialog')).showModal());
+	await page.keyboard.press('Escape');
+	await expect(page.locator('dialog[open]')).toHaveCount(1);
+	await expect(dialog).toBeVisible();
 	await page.keyboard.press('Escape');
 	await expect(dialog).toHaveCount(0);
 	await expect(play).toBeFocused();
@@ -83,19 +99,16 @@ test('app shortcut help lists only supported bindings, restores focus and respec
 		const child = editable.appendChild(document.createElement('span'));
 		const select = document.createElement('select');
 		const field = document.createElement('input');
-		const modal = document.createElement('dialog');
-		document.body.append(editable, select, field, modal);
+		document.body.append(editable, select, field);
 		const native = document.querySelector('audio[controls]')!;
 		const passed = [child, select, field, native].every((target) => send(target, '0')) &&
 			[' ', 'ArrowLeft', 'ArrowRight', 'Enter'].every((key) => send(native, key)) &&
 			['n', 'p', 'm', 's', 'r'].every((key) => send(document.body, key)) &&
+			['J', 'K', 'L', '0'].every((key) => send(document.body, key, { shiftKey: true })) &&
 			[{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { isComposing: true }, { repeat: true }]
 				.every((flags) => send(document.body, '0', flags));
-		modal.showModal();
-		const yielded = send(modal, '0') && send(modal, '?') && send(modal, 'Escape');
-		modal.close();
-		for (const node of [editable, select, field, modal]) node.remove();
-		return passed && yielded;
+		for (const node of [editable, select, field]) node.remove();
+		return passed;
 	})).toBe(true);
 	expect(await time(page)).toBeCloseTo(12);
 	await play.press('Space');

@@ -55,7 +55,7 @@ describe('library player wiring', () => {
 	});
 
 	it('renders audio only when a stream URL exists', () => {
-		expect(source).toMatch(/\{#if streamUrl\}\s*<div class="nt-wrap">\s*<NativePlayer\b[^>]*\/>\s*<\/div>\s*\{\/if\}/);
+		expect(source).toMatch(/\{#if streamUrl\}\s*<div class="nt-wrap">\s*<NativePlayer\b[^>]*\/>\s*<ShortcutHelp\b[^>]*\/>\s*<\/div>\s*\{\/if\}/);
 		expect(player).toMatch(/<section aria-label="Player">/);
 		expect(sources['../../routes/library/+page.svelte']).not.toContain('<NativePlayer');
 		expect(sources['../../routes/+layout.svelte']).toMatch(/\{#if page\.route\.id === null\}\s*\{@render appBody\(\)\}\s*\{:else\}\s*<AppPlayer\b/);

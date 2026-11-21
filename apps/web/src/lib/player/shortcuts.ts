@@ -1,6 +1,10 @@
 /**
- * Shared transport shortcut map and guards. Each player owns its listener
- * and binds only the actions its transport supports.
+ * Shared transport keyboard shortcuts for the app and demo players.
+ *
+ * Pure key/guard helpers only — no DOM globals, no listeners — so unit
+ * tests can pin the map with plain fakes. Each player owns the listener and
+ * the transport calls. Guards are structural (tag names, rect counts) on
+ * purpose: real DOM nodes satisfy them and so do test doubles.
  */
 
 export type ShortcutAction =

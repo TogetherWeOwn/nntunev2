@@ -19,18 +19,18 @@ const handlers: Partial<Record<ShortcutAction, (media: Media, help: Help) => boo
 	},
 	'seek-back': (media) => media.jump('back'),
 	'seek-forward': (media) => media.jump('forward'),
-	'open-shortcuts': (_, help) => { void help.open(); },
-	'close-shortcuts': (_, help) => help.close()
+	'open-shortcuts': (_, help) => { void help.open(); }
 };
 
-export const appShortcutActions = Object.keys(handlers) as ShortcutAction[];
+// Escape is listed but handled by the topmost native dialog's cancel event.
+export const appShortcutActions = [...Object.keys(handlers), 'close-shortcuts'] as ShortcutAction[];
 
 export function handleAppShortcut(event: KeyboardEvent, media: Media, help: Help | undefined): void {
-	if (!help || event.repeat) return;
+	if (!help || help.isOpen() || event.repeat || (event.shiftKey && event.key !== '?')) return;
 	// Keep the native media widget's own keyboard handling, including shadow controls.
 	if (event.composedPath().some((node) => node instanceof Element && node.matches('audio[controls], video[controls]'))) return;
 	const action = actionForShortcutEvent(event, document);
-	if (!action || (help.isOpen() && action !== 'close-shortcuts')) return;
+	if (!action) return;
 	const handler = handlers[action];
 	if (handler && handler(media, help) !== false) event.preventDefault();
 }
