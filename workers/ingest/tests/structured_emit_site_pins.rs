@@ -535,7 +535,7 @@ fn migrated_events_fire_from_their_own_call_site_with_its_trace() {
         );
         assert!(
             call.contains("\"build_sha\":")
-                || (func == "try_meter"
+                || (*func == "try_meter"
                     && call.contains("meter_failure_fields(")
                     && call.contains("build_sha_from_env(env)")),
             "{rel}::{func} must carry the build SHA for {event}: {call}"
