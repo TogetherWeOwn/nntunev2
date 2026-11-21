@@ -2425,6 +2425,106 @@ fn postgres_admin_invite_batch_commits_together_or_not_at_all() {
 
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_invite_tree_is_scoped_paged_and_read_only() {
+    use crate::admin_invite_tree::{read_on, InviteTreeRead::*};
+    run_test(async {
+        let mut client = connect().await;
+        let tx = client.transaction().await.unwrap();
+        let (admin, member) = seed_admin_test_users(&tx).await;
+        tx.batch_execute(
+            "INSERT INTO users (id, email, created_at, invited_by, invite_code_hash)
+             SELECT id, id || '@example.invalid', 1, parent, 'synthetic-invite-hash'
+             FROM (VALUES ('tree-root-a', NULL), ('tree-root-b', NULL),
+                          ('tree-b-child', 'tree-root-b'), ('tree-a-deep', 'tree-a-000')
+                   UNION ALL
+                   SELECT 'tree-a-' || lpad(n::text, 3, '0'), 'tree-root-a'
+                   FROM generate_series(0, 51) n) AS fixture(id, parent)",
+        )
+        .await
+        .unwrap();
+        let read = async |user: &str, cursor: Option<&str>| {
+            read_on(&tx, &admin, user, cursor).await.unwrap()
+        };
+        let page = |result| match result {
+            Page(page) => page,
+            other => panic!("expected page, got {other:?}"),
+        };
+        let snapshot_sql = "SELECT json_build_array(array_agg(ctid::text ORDER BY id),
+            (SELECT count(*) FROM audit_log), (SELECT count(*) FROM invite_codes))::text
+            FROM users WHERE id LIKE 'tree-%' OR id = $1";
+        let snapshot = async || {
+            tx.query_one(snapshot_sql, &[&admin])
+                .await
+                .unwrap()
+                .get::<_, String>(0)
+        };
+        let before = snapshot().await;
+        for actor in [member.as_str(), "absent-admin"] {
+            assert_eq!(
+                read_on(&tx, actor, "tree-root-a", None).await.unwrap(),
+                NotAdmin
+            );
+        }
+        assert_eq!(read("tree-missing", None).await, Missing);
+        let first = page(read("tree-root-a", None).await);
+        assert_eq!(first.user_id, "tree-root-a");
+        assert_eq!(first.inviter_id, None);
+        assert_eq!(
+            first.invitee_ids,
+            (0..50)
+                .map(|n| format!("tree-a-{n:03}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(first.next_cursor.as_deref(), Some("tree-a-049"));
+        assert_eq!(page(read("tree-root-a", None).await), first);
+        let cursor = first.next_cursor.as_deref();
+        let second = page(read("tree-root-a", cursor).await);
+        assert_eq!(second.invitee_ids, ["tree-a-050", "tree-a-051"]);
+        assert_eq!(second.next_cursor, None);
+        assert_eq!(read("tree-root-b", cursor).await, InvalidCursor);
+        let peer = page(read("tree-root-b", None).await);
+        assert_eq!(peer.invitee_ids, ["tree-b-child"]);
+        let middle = page(read("tree-a-000", None).await);
+        assert_eq!(middle.inviter_id.as_deref(), Some("tree-root-a"));
+        assert_eq!(middle.invitee_ids, ["tree-a-deep"]);
+        let leaf = page(read("tree-a-deep", None).await);
+        assert_eq!(leaf.inviter_id.as_deref(), Some("tree-a-000"));
+        assert!(leaf.invitee_ids.is_empty() && leaf.next_cursor.is_none());
+        assert_eq!(snapshot().await, before, "no user, audit or invite writes");
+
+        let mark = "UPDATE users SET deleting_at = now() WHERE id = $1";
+        tx.execute("DELETE FROM users WHERE id = 'tree-b-child'", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            read("tree-root-b", Some("tree-b-child")).await,
+            InvalidCursor
+        );
+        assert!(page(read("tree-root-b", None).await).invitee_ids.is_empty());
+        tx.execute(mark, &[&"tree-root-b"]).await.unwrap();
+        assert_eq!(read("tree-root-b", None).await, AccountDeleting);
+        tx.execute("DELETE FROM users WHERE id = 'tree-root-a'", &[])
+            .await
+            .unwrap();
+        assert_eq!(read("tree-root-a", None).await, Missing);
+        let orphan = page(read("tree-a-000", None).await);
+        assert_eq!(
+            orphan.inviter_id, None,
+            "hard deletion clears the recorded edge"
+        );
+        assert_eq!(orphan.invitee_ids, ["tree-a-deep"]);
+        tx.execute(mark, &[&admin]).await.unwrap();
+        assert_eq!(read("tree-a-000", None).await, AccountDeleting);
+        tx.execute("UPDATE users SET role = 'member' WHERE id = $1", &[&admin])
+            .await
+            .unwrap();
+        assert_eq!(read("tree-a-000", None).await, NotAdmin);
+        tx.rollback().await.unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_member_invite_history_is_scoped_paged_and_read_only() {
     use super::member_invite_history_on as history;
     use crate::auth::InviteStatus::*;

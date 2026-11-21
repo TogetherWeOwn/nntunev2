@@ -26,6 +26,7 @@ static LEDGER_ALLOCATOR: std::alloc::System = std::alloc::System;
 pub mod account_deletion;
 pub mod admin;
 pub mod admin_ingest;
+pub mod admin_invite_tree;
 pub mod api_error;
 pub mod auth;
 pub mod b64;

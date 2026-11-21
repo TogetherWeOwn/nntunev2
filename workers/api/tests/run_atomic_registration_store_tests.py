@@ -46,6 +46,7 @@ EXPECTED = {
         "postgres_admin_invite_batch_commits_together_or_not_at_all",
         "postgres_admin_invite_windows_are_bounded_and_audited_atomically",
         "postgres_admin_invite_ledger_uses_effective_expiry_before_limit",
+        "postgres_admin_invite_tree_is_scoped_paged_and_read_only",
         "postgres_member_invite_history_is_scoped_paged_and_read_only",
         "postgres_member_invite_requires_its_own_open_window_and_unexpired_code",
         "postgres_member_enrollment_rechecks_window_after_waiting",

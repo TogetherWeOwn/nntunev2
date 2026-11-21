@@ -6579,6 +6579,22 @@ impl Store for PgStore {
         .await
     }
 
+    async fn admin_invite_tree(
+        &self,
+        actor_id: &str,
+        user_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<crate::admin_invite_tree::InviteTreeRead, StoreError> {
+        Self::bounded(
+            async {
+                crate::admin_invite_tree::read_on(&self.connect().await?, actor_id, user_id, cursor)
+                    .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn member_issue_invite(
         &self,
         issuer: &str,
@@ -7955,9 +7971,11 @@ pub(crate) fn route_path(
     path: String,
     url: impl FnOnce() -> Option<url::Url>,
 ) -> String {
+    use crate::native_rest::admin_invite_tree_user;
     use crate::native_rest::MEMBER_INVITE_HISTORY_PATH;
     match (method, path.as_str()) {
         (Method::Get, "/v1/admin/ingest" | MEMBER_INVITE_HISTORY_PATH) => (),
+        (Method::Get, path) if admin_invite_tree_user(path).is_some() => (),
         _ => return path,
     }
     match url().as_ref().and_then(url::Url::query) {

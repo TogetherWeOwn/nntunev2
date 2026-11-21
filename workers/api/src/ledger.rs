@@ -144,7 +144,7 @@ pub fn new_idempotency_key() -> Result<String, LedgerError> {
 /// `is_valid_key_field` exactly: non-empty, at most `max_bytes` bytes, and
 /// containing only ASCII alphanumerics, `-`, or `_`, matching the persisted
 /// ledger key alphabet. Colons delimit fields; identities are never rewritten.
-fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
+pub(crate) fn is_valid_key_field(field: &str, max_bytes: usize) -> bool {
     !field.is_empty()
         && field.len() <= max_bytes
         && field
