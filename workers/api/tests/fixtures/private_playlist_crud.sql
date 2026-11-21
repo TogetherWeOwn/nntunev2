@@ -41,9 +41,7 @@ RETURNS TABLE (id text, name text, legacy_items jsonb, entries jsonb) LANGUAGE s
     ), '[]'::jsonb)
     FROM owned_playlists(owner) p WHERE p.public_id = handle;
 $$;
-
--- Lock in user -> playlist order. The append runs its position/duplicate
--- query in a separate statement after the lock (fresh READ COMMITTED snapshot).
+-- Lock user then playlist before the append takes a fresh READ COMMITTED snapshot.
 CREATE FUNCTION lock_playlist(owner text, handle text, include_deleting boolean DEFAULT false)
 RETURNS bigint LANGUAGE plpgsql AS $$
 BEGIN
@@ -69,9 +67,8 @@ CREATE FUNCTION add_track(owner text, handle text, track uuid) RETURNS uuid
 LANGUAGE plpgsql AS $$
 DECLARE target bigint := lock_playlist(owner, handle); entry uuid;
 BEGIN
-    -- Synthetic stand-in for the Library membership predicate. Never use
-    -- track existence alone, or this fixture relation, in a live adapter.
-    -- Deduplicate this append under the playlist lock, not as a storage constraint.
+    -- Deduplicate under the playlist lock. Synthetic membership is rehearsal-only;
+    -- live code must check actual Library membership, not mere track existence.
     INSERT INTO public.playlist_tracks (playlist_id, track_id, position)
     SELECT p.id, track, next.position
     FROM public.playlists p
@@ -86,7 +83,6 @@ BEGIN
     RETURN entry;
 END;
 $$;
-
 -- Request fenced deletion; physical removal and cleanup belong to the
 -- cutover's existing ADR delete-operation protocol, not a bare DELETE/FK cascade.
 CREATE FUNCTION delete_playlist(owner text, handle text) RETURNS uuid LANGUAGE plpgsql AS $$

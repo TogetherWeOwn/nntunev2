@@ -12,7 +12,6 @@ SELECT playlist_id, playlist->>'public_id', playlist->>'owner_user_id', playlist
     playlist->'items', (playlist->>'is_public')::boolean, 1
 FROM fixture_cases;
 CREATE TEMP TABLE legacy_before AS SELECT to_jsonb(p) AS row FROM public.playlists p;
-
 CREATE TEMP TABLE fixture_tracks AS
 SELECT handle, gen_random_uuid() AS id FROM (
     SELECT e->>'track_public_id' AS handle FROM fixture_cases c, jsonb_array_elements(c.entries) e
@@ -30,9 +29,7 @@ UNION ALL SELECT 9002, 1, 'not-the-original-ref', id FROM fixture_tracks WHERE h
 CREATE TEMP TABLE synthetic_memberships AS
 SELECT 'fixture-user-owner'::text AS owner_id, id AS track_id FROM fixture_tracks
 WHERE handle IN ('new-track', 'trkRpRepeat00000000000', 'trkFrAlpha000000000000')
-UNION ALL SELECT 'fixture-user-other', id FROM fixture_tracks
-WHERE handle IN ('new-track', 'trkRpMiddle00000000000');
-
+UNION ALL SELECT 'fixture-user-other', id FROM fixture_tracks WHERE handle IN ('new-track', 'trkRpMiddle00000000000');
 CREATE TEMP TABLE sequence_before AS SELECT last_value, is_called FROM public.playlists_id_seq;
 SAVEPOINT applied_legacy;
 -- RESTART makes allocation transactional; plain nextval survives rollback.
@@ -43,7 +40,6 @@ CREATE TEMP VIEW crud_state AS
 SELECT 'playlist' AS kind, to_jsonb(p) AS data FROM public.playlists p
 UNION ALL SELECT 'entry', to_jsonb(e) FROM public.playlist_tracks e
 UNION ALL SELECT 'operation', to_jsonb(d) FROM public.delete_operations d;
-
 DO $$
 DECLARE
     owner constant text := 'fixture-user-owner';
@@ -52,6 +48,8 @@ DECLARE
     fresh constant text := 'zzPrivatePlaylist00000';
     unresolved constant text := 'plAllUnresolved0000000';
     missing constant text := 'noSuchPlaylist00000000';
+    shared constant text := 'plMixedResUnres0000000';
+    denied record;
     new_track uuid := (SELECT id FROM pg_temp.fixture_tracks WHERE handle = 'new-track');
     old_track uuid := (SELECT id FROM pg_temp.fixture_tracks WHERE handle = 'trkRpRepeat00000000000');
     middle_track uuid := (SELECT id FROM pg_temp.fixture_tracks WHERE handle = 'trkRpMiddle00000000000');
@@ -60,6 +58,7 @@ DECLARE
     entry uuid;
     second_entry uuid;
     operation uuid;
+    renamed text;
     snapshot jsonb;
 BEGIN
     IF (SELECT count(*) FROM pg_temp.fixture_cases) < 8
@@ -82,18 +81,16 @@ BEGIN
         RAISE EXCEPTION 'backfill lost a resolved position or invented a resolution';
     END IF;
     SELECT jsonb_agg(s ORDER BY s.kind, s.data) INTO snapshot FROM pg_temp.crud_state s;
-    IF EXISTS (SELECT FROM read_playlist(other, repeated))
-        OR EXISTS (SELECT FROM read_playlist(other, missing))
-        OR EXISTS (SELECT FROM read_playlist(other, 'plMixedResUnres0000000'))
-        OR EXISTS (SELECT FROM list_playlists(other, NULL, 50) p WHERE p.id = repeated)
-        OR rename_playlist(other, repeated, 'Not allowed') IS NOT NULL
-        OR rename_playlist(other, missing, 'Not allowed') IS NOT NULL
-        OR add_track(other, repeated, new_track) IS NOT NULL
-        OR add_track(other, missing, new_track) IS NOT NULL
-        OR delete_playlist(other, repeated) IS NOT NULL
-        OR delete_playlist(other, missing) IS NOT NULL THEN
-        RAISE EXCEPTION 'non-owner operation differed from missing';
-    END IF;
+    FOR denied IN SELECT * FROM (VALUES (other, repeated), (other, missing), (other, shared),
+        (owner, shared)) AS cases(actor, handle) LOOP
+        IF EXISTS (SELECT FROM read_playlist(denied.actor, denied.handle))
+            OR EXISTS (SELECT FROM list_playlists(denied.actor, NULL, 50) WHERE id = denied.handle)
+            OR rename_playlist(denied.actor, denied.handle, 'Not allowed') IS NOT NULL
+            OR add_track(denied.actor, denied.handle, new_track) IS NOT NULL
+            OR delete_playlist(denied.actor, denied.handle) IS NOT NULL THEN
+            RAISE EXCEPTION 'private CRUD exposed a foreign, public or missing playlist';
+        END IF;
+    END LOOP;
     IF (SELECT jsonb_agg(s ORDER BY s.kind, s.data) FROM pg_temp.crud_state s) IS DISTINCT FROM snapshot THEN
         RAISE EXCEPTION 'denied operation changed a playlist, entry or deletion operation';
     END IF;
@@ -110,9 +107,10 @@ BEGIN
         RAISE EXCEPTION 'repeats must persist in order without allowing a duplicate append';
     END IF;
     entry := add_track(owner, unresolved, new_track);
-    IF entry IS NULL OR (SELECT r.entries->0->>'position' FROM read_playlist(owner, unresolved) r)
-            IS DISTINCT FROM '2' THEN
-        RAISE EXCEPTION 'append must not reuse an unresolved legacy position';
+    IF entry IS NULL OR NOT EXISTS (SELECT FROM read_playlist(owner, unresolved) r
+        JOIN pg_temp.fixture_cases c ON c.playlist->>'public_id' = r.id
+        WHERE r.entries->0->>'position' = '2' AND r.legacy_items = c.playlist->'items') THEN
+        RAISE EXCEPTION 'owner read must keep unresolved refs and append after the legacy positions';
     END IF;
     INSERT INTO public.playlist_tracks (playlist_id, track_id, position)
     SELECT 9003, new_track, position FROM generate_series(3, 498) AS series(position);
@@ -133,10 +131,8 @@ BEGIN
             AND r.legacy_items = '[]'::jsonb) THEN
         RAISE EXCEPTION 'empty playlist did not persist or page correctly';
     END IF;
-    IF rename_playlist(owner, fresh, 'Updated') IS DISTINCT FROM fresh THEN
-        RAISE EXCEPTION 'rename did not return the same opaque handle';
-    END IF;
-    IF rename_playlist(owner, fresh, blank) IS NOT NULL
+    renamed := rename_playlist(owner, fresh, blank || 'Updated' || blank);
+    IF renamed IS DISTINCT FROM fresh OR rename_playlist(owner, fresh, blank) IS NOT NULL
         OR (SELECT r.name FROM read_playlist(owner, fresh) r) IS DISTINCT FROM 'Updated'
         OR add_track(owner, fresh, middle_track) IS NOT NULL THEN
         RAISE EXCEPTION 'rename did not persist or foreign membership was accepted';
@@ -176,7 +172,10 @@ BEGIN
         RAISE EXCEPTION 'normalized CRUD rewrote the legacy items array';
     END IF;
     UPDATE public.users SET deleting_at = now() WHERE id = owner;
-    IF EXISTS (SELECT FROM list_playlists(owner, NULL, 50))
+    renamed := rename_playlist(owner, repeated, 'Too late');
+    IF renamed IS NOT NULL OR NOT EXISTS (SELECT FROM public.playlists p JOIN pg_temp.fixture_cases c
+        ON p.id = c.playlist_id WHERE p.public_id = repeated AND p.name = c.playlist->>'name')
+        OR EXISTS (SELECT FROM list_playlists(owner, NULL, 50))
         OR create_playlist(owner, 'newPrivatePlaylist0001', 'Too late') IS NOT NULL
         OR delete_playlist(owner, repeated) IS NOT NULL THEN
         RAISE EXCEPTION 'account deletion did not fence playlist access';
@@ -185,7 +184,6 @@ END;
 $$;
 SET CONSTRAINTS ALL IMMEDIATE;
 ROLLBACK TO applied_legacy;
-
 DO $$
 BEGIN
     IF to_regclass('public.playlist_tracks') IS NOT NULL
@@ -200,7 +198,6 @@ BEGIN
     END IF;
 END;
 $$;
-
 -- Reapply and commit only in the throwaway clone, so a second session can see the fixture.
 SELECT :'playlist_schema' \gexec
 SELECT :'playlist_crud' \gexec
@@ -211,14 +208,16 @@ SELECT m.owner_id, create_playlist(m.owner_id, rpad(m.owner_id, 22, '0'), 'Fence
 FROM member_tracks m JOIN fixture_tracks t ON t.id = m.track_id
 WHERE t.handle IN ('trkRpRepeat00000000000', 'trkRpMiddle00000000000');
 COMMIT;
-
 CREATE EXTENSION dblink WITH SCHEMA public;
 SET search_path = private_playlist_rehearsal, pg_catalog;
 SET statement_timeout = '20s';
 SELECT public.dblink_connect('writer', 'dbname=nntune_playlist_ci connect_timeout=5');
 SELECT public.dblink_exec('writer', 'SET search_path = private_playlist_rehearsal, pg_catalog; SET statement_timeout = 5000');
 DO $$
-DECLARE c record;
+DECLARE
+    c record;
+    writer_pid integer := (SELECT pid FROM public.dblink('writer', 'SELECT pg_backend_pid()') AS w(pid integer));
+    deadline timestamptz;
 BEGIN
     IF (SELECT count(DISTINCT account_scope) FROM pg_temp.race_cases) <> 2 THEN
         RAISE EXCEPTION 'both deletion scopes must be tested';
@@ -245,11 +244,20 @@ BEGIN
         ELSIF delete_playlist(c.owner_id, c.handle) IS NULL THEN
             RAISE EXCEPTION 'playlist fence could not be committed';
         END IF;
-        COMMIT;
-        IF (SELECT id FROM public.dblink('writer', format('SELECT add_track(%L,%L,%L)',
-            c.owner_id, c.handle, c.late)) AS r(id uuid)) IS NOT NULL THEN
-            RAISE EXCEPTION 'append crossed the committed deletion fence';
+        IF public.dblink_send_query('writer', format('SELECT add_track(%L,%L,%L)', c.owner_id, c.handle, c.late)) <> 1 THEN
+            RAISE EXCEPTION 'could not send late append';
         END IF;
+        -- Prove the writer is queued behind this transaction, rather than timing by sleeps alone.
+        deadline := clock_timestamp() + interval '3 seconds';
+        WHILE NOT pg_backend_pid() = ANY(pg_blocking_pids(writer_pid)) LOOP
+            IF clock_timestamp() >= deadline THEN RAISE EXCEPTION 'late append did not wait (account=%)', c.account_scope; END IF;
+            PERFORM pg_sleep(0.01);
+        END LOOP;
+        COMMIT;
+        IF NOT EXISTS (SELECT FROM public.dblink_get_result('writer') AS r(id uuid) WHERE id IS NULL) THEN
+            RAISE EXCEPTION 'queued append crossed the committed deletion fence (account=%)', c.account_scope;
+        END IF;
+        PERFORM FROM public.dblink_get_result('writer') AS r(id uuid); -- drain before reusing the connection
         IF (SELECT array_agg(e.track_id) FROM public.playlist_tracks e JOIN public.playlists p ON p.id = e.playlist_id
             WHERE p.public_id = c.handle) IS DISTINCT FROM ARRAY[c.admitted] THEN
             RAISE EXCEPTION 'fenced playlist must retain only the pre-fence append';

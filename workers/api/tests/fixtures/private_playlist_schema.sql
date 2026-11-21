@@ -11,8 +11,7 @@ CREATE TABLE public.playlist_tracks (
 CREATE INDEX ON public.playlist_tracks (track_id);
 CREATE INDEX ON public.playlist_tracks (playlist_id, track_id);
 
--- The caller supplies an explicit, trusted mapping. There is no fallback from
--- a legacy ref to a canonical id, including when the ref resembles a track id.
+-- Require an explicit trusted mapping even when the legacy ref resembles a canonical ID.
 INSERT INTO public.playlist_tracks (playlist_id, track_id, position, is_legacy)
 SELECT p.id, r.track_id, r.position, true
 FROM public.playlists p
