@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { apiGet, apiOptions, apiPost } from '../helpers/accounts.js';
+import { apiDelete, apiGet, apiOptions, apiPost } from '../helpers/accounts.js';
 
 // Acceptance: credentialed redirect diagnostics must never echo URLs.
 //
@@ -218,6 +218,26 @@ test.describe('redirect diagnostics redact URLs (real request)', () => {
         '127.0.0.1',
         ...credentialValues(),
       ]);
+      expect(fx.foreignHits, 'foreign origin received a follow-up request').toHaveLength(0);
+    } finally {
+      await fx.close();
+    }
+  });
+
+  test('DELETE ordinary 307: refuses to follow with the session cookie', async ({ request }) => {
+    const fx = await startFixture({
+      '/clear': (foreignOrigin) => ({ status: 307, location: `${foreignOrigin}/${SENT.locPath}` }),
+    });
+    try {
+      const message = await errorMessage(() =>
+        apiDelete(request, `${fx.stagingOrigin}/clear?token=${SENT.reqQuery}`, {
+          'CF-Access-Client-Id': SENT.accessId,
+          'CF-Access-Client-Secret': SENT.accessSecret,
+          Cookie: `__Host-nntune-session=${SENT.session}`,
+        }, CONTEXT),
+      );
+      expectActionableOrdinary(message, 307);
+      expectAbsent(message, [SENT.reqQuery, SENT.locPath, fx.foreignOrigin, ...credentialValues()]);
       expect(fx.foreignHits, 'foreign origin received a follow-up request').toHaveLength(0);
     } finally {
       await fx.close();
@@ -508,6 +528,8 @@ const transports = [
     apiGet(request, url, credentialed, CONTEXT, { timeout }) },
   { method: 'POST', send: (request: APIRequestContext, url: string, timeout?: number) =>
     apiPost(request, url, credentialed, { token: SENT.session }, CONTEXT, { timeout }) },
+  { method: 'DELETE', send: (request: APIRequestContext, url: string, timeout?: number) =>
+    apiDelete(request, url, credentialed, CONTEXT, { timeout }) },
   { method: 'OPTIONS', send: (request: APIRequestContext, url: string, timeout?: number) =>
     apiOptions(request, url, credentialed, CONTEXT, { timeout }) },
 ];
@@ -603,7 +625,7 @@ test.describe('credentialed transport diagnostics (offline)', () => {
       });
       raw.stack = `raw-transport-marker ${SENT.accessId}`;
       const fail = () => { throw raw; };
-      const request = { get: fail, post: fail, fetch: fail } as unknown as APIRequestContext;
+      const request = { get: fail, post: fail, delete: fail, fetch: fail } as unknown as APIRequestContext;
       expectSafeTransport(await transportError(() => send(request, 'malformed URL')), method);
     });
 
@@ -614,7 +636,7 @@ test.describe('credentialed transport diagnostics (offline)', () => {
         calls.push({ url, opts });
         return response;
       };
-      const request = { get: respond, post: respond, fetch: respond } as unknown as APIRequestContext;
+      const request = { get: respond, post: respond, delete: respond, fetch: respond } as unknown as APIRequestContext;
       const url = 'https://fixture.invalid/probe';
       expect(await send(request, url)).toBe(response);
       expect(await send(request, url, 1234)).toBe(response);
