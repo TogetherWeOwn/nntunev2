@@ -122,6 +122,15 @@ an unconditional rollback is not safe; do not arm or attempt that write without
 a fence that covers all writers. The rehearsal does not exercise Actions
 cancellation or independent UTC lease expiry.
 
+### Independent UTC expiry (disposable release Fetch)
+
+The disposable release Fetch test checks the Worker's UTC clock:
+measurement remains enabled and the binding and exact SHA remain configured,
+but a valid lease with a past expiry must reach the inert staging response
+without opening the measurement socket. This checks expiry without running
+cleanup or injecting a runner clock. Expiry stops admission; it does not remove
+the lease or binding, restore a deployment, or prove DB drain.
+
 ### Charge triplet
 
 Use the same `POST /rest/getArtists` with form-encoded `f=json` and credentials
