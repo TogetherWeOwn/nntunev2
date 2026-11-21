@@ -92,15 +92,25 @@ for (const width of [800, 1024, 1280]) {
 	}
 }
 
-test('desktop 800px: wrapped metadata does not separate Seek from the jump buttons', async ({ page }) => {
+test('desktop 800px: wrapped metadata and seek refusal do not separate Seek from the jumps', async ({ page }) => {
 	const fixture = { ...track, title: Array(12).fill(track.title).join(' '), artist: Array(4).fill(track.artist).join(' ') };
-	const { region, identity, back, forward } = await openPlayer(page, 800, 'light', fixture);
+	const { region, identity, audio, seek, back, forward } = await openPlayer(page, 800, 'light', fixture);
+	await audio.evaluate((el) => {
+		Object.defineProperty(el, 'seekable', { configurable: true, get: () => ({ length: 1, start: () => 0, end: () => 5 }) });
+	});
+	await seek.press('End');
+	const refusal = region.locator('p[aria-live="polite"][aria-atomic="true"]')
+		.filter({ hasText: 'That position is not seekable yet.' });
+	const visibleRefusal = await box(refusal);
+	await expect(seek).toBeFocused();
+	await expect(seek).toHaveAttribute('aria-valuetext', '0:02 of 0:16');
 	const [label, seekRow, backButton, forwardButton] = await Promise.all(
 		[identity, region.locator('.nt-player-seek'), back, forward].map(box)
 	);
 	expect(label.height).toBeGreaterThan(120);
 	for (const jump of [backButton, forwardButton]) {
 		expect(jump.y).toBeCloseTo(seekRow.y + seekRow.height + 8, 0);
+		expect(visibleRefusal.y).toBeGreaterThanOrEqual(jump.y + jump.height);
 	}
 });
 

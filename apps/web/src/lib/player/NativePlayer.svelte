@@ -117,6 +117,12 @@
 				</div>
 				{#key seekState.attachment}<PlayerSeek state={seekState} {seek} />{/key}
 			</div>
+			{#key seekState.attachment}
+				<p class="nt-seek-feedback" aria-live="polite" aria-atomic="true">
+					{#if seekState.seeking}<span aria-hidden="true">Seeking… </span>{/if}
+					{#key seekState.feedbackVersion}{#if seekState.feedback}<span>{seekState.feedback}</span>{/if}{/key}
+				</p>
+			{/key}
 			{#if !desktop}
 				{@render volumeControls()}
 				{@render playbackStatusLine()}
@@ -192,15 +198,18 @@
 	.nt-player-row.desktop {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) minmax(0, 3fr) minmax(0, 1fr);
-		grid-template-rows: auto auto auto;
+		grid-template-rows: auto auto auto auto;
 		column-gap: var(--nt-shell-gap);
 	}
 	.desktop .nt-player-centre {
 		display: grid;
 		grid-column: 2;
-		grid-row: 1 / 4;
+		grid-row: 1 / -1;
 		grid-template-rows: subgrid;
 	}
+	.nt-seek-feedback:empty { margin: 0; }
+	/* Keep the same live node on resize, with desktop feedback below the jumps. */
+	.desktop .nt-seek-feedback { order: 1; margin: 0; }
 	.desktop .nt-player-left, .desktop .nt-player-right {
 		display: block;
 		grid-row: 1;
