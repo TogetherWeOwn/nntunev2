@@ -11,23 +11,38 @@ sample = HEALTH["sample_build_health"]
 UnsafeHealth = HEALTH["UnsafeHealth"]
 SHA = "a" * 40
 BODY = b'{"ok":true,"build_sha":"' + SHA.encode() + b'"}'
-FOOTER = b"\n200\nno-store\nDYNAMIC\n"
+VERSION = b"curl 8.4.0 (test) libcurl/8.4.0\n"
+FOOTER = b'\x1e200\x1e{"cache-control":["no-store"],\n"cf-cache-status":["DYNAMIC"]}'
+
+
+def process(output, returncode=0):
+    return subprocess.CompletedProcess([], returncode, stdout=output)
 
 
 def curl(output=BODY + FOOTER, returncode=0):
-    return Mock(return_value=subprocess.CompletedProcess([], returncode, stdout=output))
+    return Mock(side_effect=[process(VERSION), process(output, returncode)])
 
 
 class HealthTests(unittest.TestCase):
     def test_single_fixed_origin_probe_uses_start_time_and_caller_deadline(self):
         run = curl()
         observed = sample(
-            SHA, deadline_ms=1_500, run=run, monotonic=iter((1.0, 1.2, 1.3)).__next__
+            SHA,
+            deadline_ms=1_500,
+            run=run,
+            monotonic=iter((1.0, 1.1, 1.2, 1.3)).__next__,
         )
-        self.assertEqual((observed.observed_ms, observed.build_sha), (1_000, SHA))
-        self.assertEqual(run.call_count, 1)
-        (argv,), kwargs = run.call_args
+        self.assertEqual((observed.observed_ms, observed.build_sha), (1_100, SHA))
+        self.assertEqual(run.call_count, 2)
+        preflight, probe = run.call_args_list
+        self.assertEqual(preflight.args[0], ["curl", "--disable", "--version"])
+        self.assertEqual(preflight.kwargs["timeout"], 0.5)
+        (argv,), kwargs = probe
         self.assertEqual(argv[:2], ["curl", "--disable"])
+        self.assertIn("--http1.1", argv)
+        self.assertEqual(
+            argv[argv.index("--write-out") + 1], "\x1e%{http_code}\x1e%{header_json}"
+        )
         self.assertRegex(
             argv[-1], r"^https://staging\.nntune\.com/healthz\?probe=[a-f0-9]{32}$"
         )
@@ -37,17 +52,25 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--noproxy") + 1], "*")
         self.assertNotIn("--location", argv)
         self.assertNotIn("--retry", argv)
-        self.assertEqual(kwargs["timeout"], 0.5)
+        self.assertEqual(kwargs["timeout"], 0.4)
         self.assertEqual(set(kwargs["env"]), {"PATH", "LC_ALL"})
         self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
 
     def test_status_and_cache_fail_closed(self):
         for footer, reason in (
-            (b"\n302\nno-store\nDYNAMIC\n", "status"),
-            (b"\n200\nno-store\nHIT\n0", "cache-unverified"),
-            (b"\n200\nno-store\nDYNAMIC\n0", "cache-unverified"),
-            (b"\n200\nno-store\n\n", "cache-unverified"),
-            (b"\n200\nmax-age=60\nDYNAMIC\n", "cache-unverified"),
+            (FOOTER.replace(b"200", b"302"), "status"),
+            (FOOTER.replace(b"DYNAMIC", b"HIT"), "cache-unverified"),
+            (FOOTER[:-1] + b',"age":["0"]}', "cache-unverified"),
+            (FOOTER[:-1] + b',"age":[""]}', "cache-unverified"),
+            (FOOTER.replace(b'"DYNAMIC"', b'"DYNAMIC","HIT"'), "cache-unverified"),
+            (
+                FOOTER.replace(b'"no-store"', b'"no-store","max-age=60"'),
+                "cache-unverified",
+            ),
+            (FOOTER.replace(b'"DYNAMIC"', b""), "cache-unverified"),
+            (FOOTER.replace(b"no-store", b"max-age=60"), "cache-unverified"),
+            (FOOTER[:-1] + b',"cf-cache-status":["HIT"]}', "cache-unverified"),
+            (FOOTER[:-1], "cache-unverified"),
         ):
             with (
                 self.subTest(footer=footer),
@@ -74,10 +97,11 @@ class HealthTests(unittest.TestCase):
                 )
 
     def test_deadline_includes_validation_and_caps_freshness(self):
-        for deadline, clocks, timeout in (
-            (1_200, (1, 1.2), 0.2),
-            (1_200, (1, 1.1, 1.2), 0.2),
-            (9_000, (1, 3.9, 4), 3),
+        for deadline, clocks, calls, timeout in (
+            (1_200, (1, 1.2), 1, 0.2),
+            (1_200, (1, 1.1, 1.2), 2, 0.1),
+            (1_200, (1, 1.025, 1.1, 1.2), 2, 0.175),
+            (9_000, (1, 1.1, 3.9, 4), 2, 2.9),
         ):
             run = curl()
             with (
@@ -87,7 +111,8 @@ class HealthTests(unittest.TestCase):
                 sample(
                     SHA, deadline_ms=deadline, run=run, monotonic=iter(clocks).__next__
                 )
-            self.assertEqual(run.call_args.kwargs["timeout"], timeout)
+            self.assertEqual(run.call_count, calls)
+            self.assertAlmostEqual(run.call_args.kwargs["timeout"], timeout)
         run = curl()
         with self.assertRaisesRegex(UnsafeHealth, "^deadline$"):
             sample(SHA, deadline_ms=1_000, run=run, monotonic=lambda: 1)
@@ -110,18 +135,42 @@ class HealthTests(unittest.TestCase):
                 sample(sha, deadline_ms=deadline, run=run, monotonic=lambda: 1)
         run.assert_not_called()
 
+    def test_old_or_unreadable_curl_cannot_dispatch(self):
+        for version in (
+            process(b"curl 8.3.0 (test) libcurl/8.3.0\n"),
+            process(b"curl 8.4.0 (test) libcurl/8.3.0\n"),
+            process(b"unrecognized version output"),
+            process(VERSION, returncode=1),
+        ):
+            with self.subTest(version=version):
+                run = Mock(return_value=version)
+                with self.assertRaisesRegex(UnsafeHealth, "^curl-version$"):
+                    sample(SHA, deadline_ms=2_000, run=run, monotonic=lambda: 1)
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(
+                    run.call_args.args[0], ["curl", "--disable", "--version"]
+                )
+
     def test_client_errors_are_sanitized_and_not_retried(self):
         for run, reason in (
             (curl(b"raw-response", returncode=63), "transport"),
-            (Mock(side_effect=OSError("raw-transport")), "transport"),
-            (Mock(side_effect=subprocess.TimeoutExpired("curl", 1)), "deadline"),
+            (
+                Mock(side_effect=[process(VERSION), OSError("raw-transport")]),
+                "transport",
+            ),
+            (
+                Mock(
+                    side_effect=[process(VERSION), subprocess.TimeoutExpired("curl", 1)]
+                ),
+                "deadline",
+            ),
         ):
             with (
                 self.subTest(reason=reason),
                 self.assertRaisesRegex(UnsafeHealth, f"^{reason}$"),
             ):
                 sample(SHA, deadline_ms=2_000, run=run, monotonic=lambda: 1)
-            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_count, 2)
 
 
 if __name__ == "__main__":

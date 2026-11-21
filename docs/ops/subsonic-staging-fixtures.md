@@ -104,13 +104,14 @@ three-second freshness bound. It reports the start of the query's local time
 bracket, not its receipt time: a query started at or before a drain fence
 cannot clear it by returning later.
 
-The separate build-health helper prepares one credential-free staging
-`/healthz` probe, without redirects or retries. It requires an uncached 200
-with `ok: true` and the expected build SHA, records probe start, and enforces
-the caller deadline and three-second freshness limit through validation. It
-requires curl 8.4 or later for the streaming response-size cap. Build SHA is
-not a Cloudflare version or deployment ID: redeploying the same build can change
-bindings, so this sample alone cannot satisfy the serving-version fence.
+The separate build-health helper prepares one credential-free HTTP/1.1 staging
+`/healthz` probe, without redirects or retries. An offline preflight requires
+curl and libcurl 8.4 or later for the streaming response-size cap. The helper
+requires a 200 with unambiguous uncached response headers, `ok: true`, and the
+expected build SHA. It records probe start and bounds preflight, transfer, and
+validation by the caller deadline and three-second freshness limit. Build SHA
+is not a Cloudflare version or deployment ID: redeploying the same build can
+change bindings, so this sample alone cannot satisfy the serving-version fence.
 Neither helper is wired to a live load window. Resource-event coverage and live
 cleanup remain unverified.
 
