@@ -705,6 +705,14 @@ Flipping `INVITES_REQUIRED` on stays the last operator step, after
 the bootstrap above and after a first invite has been issued and
 redeemed end-to-end in that environment.
 
+`POST /v1/admin/invites/batch` accepts a JSON object with `count` (1–50)
+and optional `expires_in_days` (the same bounds and default as single issue).
+Batch invites are not email-bound and don't consume member-window quota.
+The entire batch and its per-invite audits commit together. The one-time
+`201` response is `private, no-store` and contains `expires_at` (epoch
+seconds) and `codes` (an array of plaintext codes). If the response is lost,
+issuance may have committed: check the invite list, and don't retry automatically.
+
 `GET /v1/admin/users/{id}/invite-tree` is a private/no-store browser-admin
 read. It returns `user_id`, nullable `inviter_id`, up to 50 direct
 `invitee_ids` (bytewise ascending), and nullable `next_cursor`. Continue

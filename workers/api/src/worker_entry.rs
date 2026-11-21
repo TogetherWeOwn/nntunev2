@@ -2967,6 +2967,63 @@ async fn admin_issue_invite_on(
     Ok(AdminInviteIssueOutcome::Issued(invite_id))
 }
 
+/// Commit the whole batch under the same role lock as single issuance.
+async fn admin_issue_invite_batch_on(
+    client: &mut tokio_postgres::Client,
+    actor: &str,
+    hashes: &[String],
+    source_ip: &str,
+    now: u64,
+    expires_at: u64,
+) -> Result<handlers::AdminInviteBatchOutcome, StoreError> {
+    use handlers::AdminInviteBatchOutcome as Outcome;
+    if !(1..=handlers::ADMIN_INVITE_BATCH_MAX).contains(&hashes.len()) {
+        return Err(StoreError);
+    }
+    let transaction = client.transaction().await?;
+    if !admin_actor_locked(&transaction, actor).await? {
+        return Ok(Outcome::ActorNotAdmin);
+    }
+    // The guard already holds the actor row lock; deletion cannot mark it before commit.
+    let actor_row = transaction
+        .query_typed_one(
+            "SELECT deleting_at IS NOT NULL FROM users WHERE id = $1",
+            &[(&actor, Type::TEXT)],
+        )
+        .await?;
+    if actor_row.try_get::<_, bool>(0)? {
+        return Ok(Outcome::AccountDeleting);
+    }
+    let row = transaction
+        .query_typed_one(
+            "WITH issued AS (
+                 INSERT INTO invite_codes (code_hash, used, created_at, issued_by, kind, expires_at)
+                 SELECT hash, FALSE, $2, $3, $4, $5 FROM unnest($1::text[]) AS t(hash) RETURNING id
+             ), audited AS (
+                 INSERT INTO audit_log (user_id, action, ok, source_ip, at, details)
+                 SELECT $3, $6, TRUE, $7, $2, jsonb_build_object('invite_id', id) FROM issued RETURNING 1
+             ) SELECT count(*) FROM audited",
+            &[
+                (&hashes, Type::TEXT_ARRAY),
+                (&i64_of(now)?, Type::INT8),
+                (&actor, Type::TEXT),
+                (&crate::auth::INVITE_KIND_ADMIN, Type::TEXT),
+                (&i64_of(expires_at)?, Type::INT8),
+                (&crate::auth::INVITE_ISSUED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+            ],
+        )
+        .await?;
+    if row.try_get::<_, i64>(0)? != hashes.len() as i64 {
+        return Err(StoreError);
+    }
+    transaction.commit().await?;
+    Ok(Outcome::Issued)
+}
+
 impl From<tokio_postgres::Error> for StoreError {
     fn from(_: tokio_postgres::Error) -> Self {
         StoreError
@@ -6474,6 +6531,25 @@ impl Store for PgStore {
             async {
                 let mut client = self.connect().await?;
                 admin_issue_invite_on(&mut client, actor_user_id, record, source_ip, now).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn admin_issue_invite_batch(
+        &self,
+        actor: &str,
+        hashes: &[String],
+        source_ip: &str,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<handlers::AdminInviteBatchOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_issue_invite_batch_on(&mut client, actor, hashes, source_ip, now, expires_at)
+                    .await
             },
             TOTAL_TIMEOUT_MS,
         )

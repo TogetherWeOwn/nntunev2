@@ -506,6 +506,15 @@ impl Config {
 #[derive(Debug, Clone, Copy)]
 pub struct StoreError;
 
+pub(crate) const ADMIN_INVITE_BATCH_MAX: usize = 50;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdminInviteBatchOutcome {
+    Issued,
+    ActorNotAdmin,
+    AccountDeleting,
+}
+
 /// Outcome of one admin write transaction (migration 0028). The
 /// transaction serializes every admin write and re-reads the actor's
 /// role under its locks, so a write authorized by the guard can still
@@ -1586,6 +1595,17 @@ pub trait Store {
         _source_ip: &str,
         _now: u64,
     ) -> impl Future<Output = Result<AdminInviteIssueOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Atomically issue unbound admin invites and write one audit per row.
+    fn admin_issue_invite_batch(
+        &self,
+        _actor: &str,
+        _hashes: &[String],
+        _source_ip: &str,
+        _now: u64,
+        _expires_at: u64,
+    ) -> impl Future<Output = Result<AdminInviteBatchOutcome, StoreError>> {
         async { Err(StoreError) }
     }
     /// Read the issuer's summary; `None` means the issuer is absent or deleting.
@@ -6117,6 +6137,13 @@ struct AdminInviteIssueBody {
     expires_in_days: Option<u32>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminInviteBatchBody {
+    count: usize,
+    expires_in_days: Option<u32>,
+}
+
 /// One invite as the admin API reports it: lifecycle fields only —
 /// the code and its hash are never in any response.
 fn invite_admin_json(record: &InviteRecord, now: u64) -> serde_json::Value {
@@ -6160,26 +6187,9 @@ where
         },
         None => None,
     };
-    let expiry_key = crate::admin::SettingKey::InviteDefaultExpiryDays;
-    let expires_in_days = match body.expires_in_days {
-        Some(days) => match expiry_key.validate(days) {
-            Some(days) => days,
-            None => return validation_failed("invite expiry out of range"),
-        },
-        None => {
-            let rows = match ctx.store.app_settings().await {
-                Ok(rows) => rows,
-                Err(_) => return internal(),
-            };
-            let stored = rows
-                .iter()
-                .find(|(name, _)| name == expiry_key.as_str())
-                .map(|(_, value)| value.as_str());
-            match expiry_key.resolve(stored) {
-                Some(days) => days,
-                None => return internal(),
-            }
-        }
+    let expires_at = match admin_invite_expiry(ctx.store, body.expires_in_days, ctx.now).await {
+        Ok(expires_at) => expires_at,
+        Err(response) => return response,
     };
     let code = match auth::generate_invite_code() {
         Ok(code) => code,
@@ -6192,8 +6202,7 @@ where
         auth::INVITE_KIND_ADMIN,
         email,
         ctx.now,
-        ctx.now
-            .saturating_add(u64::from(expires_in_days).saturating_mul(86_400)),
+        expires_at,
     );
     let invite_id = match ctx
         .store
@@ -6217,6 +6226,87 @@ where
             "code": code,
         }),
     )
+}
+
+async fn admin_invite_expiry(
+    store: &impl Store,
+    override_days: Option<u32>,
+    now: u64,
+) -> Result<u64, Response> {
+    let key = crate::admin::SettingKey::InviteDefaultExpiryDays;
+    let days = match override_days {
+        Some(days) => key
+            .validate(days)
+            .ok_or_else(|| validation_failed("invite expiry out of range"))?,
+        None => {
+            let rows = store.app_settings().await.map_err(|_| internal())?;
+            let stored = rows
+                .iter()
+                .find(|(name, _)| name == key.as_str())
+                .map(|(_, value)| value.as_str());
+            key.resolve(stored).ok_or_else(internal)?
+        }
+    };
+    Ok(now.saturating_add(u64::from(days).saturating_mul(86_400)))
+}
+
+async fn admin_invite_batch_issue(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+) -> Response {
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    // Serde also accepts positional arrays for structs; this contract is object-only.
+    if req.body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return validation_failed("invalid request");
+    }
+    let Some(body) = parse_body::<AdminInviteBatchBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    if !(1..=ADMIN_INVITE_BATCH_MAX).contains(&body.count) {
+        return validation_failed("invite count out of range");
+    }
+    let expires_at = match admin_invite_expiry(ctx.store, body.expires_in_days, ctx.now).await {
+        Ok(expires_at) => expires_at,
+        Err(response) => return response,
+    };
+    let mut codes = Vec::with_capacity(body.count);
+    let mut hashes = Vec::with_capacity(body.count);
+    for _ in 0..body.count {
+        let code = match auth::generate_invite_code() {
+            Ok(code) => code,
+            Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
+            Err(_) => return internal(),
+        };
+        hashes.push(auth::hash_invite_code(&code));
+        codes.push(code);
+    }
+    match ctx
+        .store
+        .admin_issue_invite_batch(
+            &claims.user_id,
+            &hashes,
+            &ctx.source_ip,
+            ctx.now,
+            expires_at,
+        )
+        .await
+    {
+        Ok(AdminInviteBatchOutcome::Issued) => {}
+        Ok(AdminInviteBatchOutcome::ActorNotAdmin) => return not_found(),
+        Ok(AdminInviteBatchOutcome::AccountDeleting) => return account_deleting_response(),
+        Err(_) => return internal(),
+    }
+    let mut response = json_response(
+        201,
+        serde_json::json!({"expires_at": expires_at, "codes": codes}),
+    );
+    response
+        .extra_headers
+        .push(("cache-control".into(), "private, no-store".into()));
+    response
 }
 
 /// Browser-session read only; do not use invite lookups that observe expiry.
@@ -8279,7 +8369,9 @@ where
             }
         }
     }
-    use crate::native_rest::{admin_invite_window_close_id, ADMIN_INVITE_WINDOWS_PATH};
+    use crate::native_rest::{
+        admin_invite_window_close_id, ADMIN_INVITE_BATCH_PATH, ADMIN_INVITE_WINDOWS_PATH,
+    };
     use listen_history_controls as listens;
     if let ("GET", Some(user_id)) = (
         req.method.as_str(),
@@ -8411,6 +8503,7 @@ where
         // `/status/{s}` and `/issuer/{id}` segment filters), revoke.
         // Same non-enumerable posture as the rest of the namespace.
         ("POST", "/v1/admin/invites") => admin_invite_issue(ctx, req).await,
+        ("POST", ADMIN_INVITE_BATCH_PATH) => admin_invite_batch_issue(ctx, req).await,
         ("GET", "/v1/admin/invites") => admin_invite_list(ctx, req).await,
         ("GET", path) if path.starts_with("/v1/admin/invites/") => {
             admin_invite_list(ctx, req).await
@@ -11486,6 +11579,34 @@ mod tests {
                 }),
             ));
             Ok(AdminInviteIssueOutcome::Issued(id))
+        }
+        async fn admin_issue_invite_batch(
+            &self,
+            actor: &str,
+            hashes: &[String],
+            source_ip: &str,
+            now: u64,
+            expires_at: u64,
+        ) -> Result<AdminInviteBatchOutcome, StoreError> {
+            if !crate::admin::is_admin_role(self.user_role(actor).await?.as_deref()) {
+                return Ok(AdminInviteBatchOutcome::ActorNotAdmin);
+            }
+            if self.deleting_users.borrow().contains(actor) {
+                return Ok(AdminInviteBatchOutcome::AccountDeleting);
+            }
+            for hash in hashes {
+                let record = InviteRecord::new_issued(
+                    hash.clone(),
+                    Some(actor.into()),
+                    auth::INVITE_KIND_ADMIN,
+                    None,
+                    now,
+                    expires_at,
+                );
+                self.admin_issue_invite(actor, &record, source_ip, now)
+                    .await?;
+            }
+            Ok(AdminInviteBatchOutcome::Issued)
         }
         async fn admin_list_invites(
             &self,
@@ -24038,6 +24159,77 @@ mod tests {
                 serde_json::json!(["admin", "198.51.100.9", NOW, 3]),
             ]
         );
+    }
+
+    #[test]
+    fn admin_invite_batch_is_bounded_private_and_browser_only() {
+        use crate::native_rest::ADMIN_INVITE_BATCH_PATH as PATH;
+        let h = harness();
+        let admin = seed_admin(&h, "issuer", "admin@example.com");
+        seed_user(&h, "member", "member@example.com");
+        let member = magic_login(&h, "member@example.com");
+        let valid = r#"{"count":1}"#;
+        let call = |body: &str, cookie, origin| {
+            h.call_full("POST", PATH, Some(body.into()), cookie, origin)
+        };
+        let audit_count = h.store.audits.borrow().len();
+        for (cookie, origin) in [
+            (None, Some(ORIGIN)),
+            (Some(member), Some(ORIGIN)),
+            (Some(admin.clone()), None),
+            (Some(admin.clone()), Some("https://other.example")),
+        ] {
+            assert_eq!(call(valid, cookie, origin).status, 404);
+        }
+        assert_eq!(
+            h.call_bearer("POST", PATH, Some("Bearer ntk_synthetic".into()))
+                .status,
+            404
+        );
+        let post = |body: &str| call(body, Some(admin.clone()), Some(ORIGIN));
+        for body in [
+            "{",
+            "[1,null]",
+            r#"{"count":0}"#,
+            r#"{"count":51}"#,
+            r#"{"count":1.5}"#,
+            r#"{"count":1,"count":2}"#,
+            r#"{"count":1,"email":"a@example.com"}"#,
+            r#"{"count":1,"expires_in_days":31}"#,
+        ] {
+            assert_eq!(post(body).status, 422, "{body}");
+        }
+        assert_eq!(post(&" ".repeat(MAX_BODY_BYTES + 1)).status, 400);
+        h.store.deleting_users.borrow_mut().insert("issuer".into());
+        assert_eq!(post(valid).body, account_deleting_response().body);
+        assert!(h.store.invites.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audit_count);
+        h.store.deleting_users.borrow_mut().clear();
+        h.store
+            .app_settings_rows
+            .borrow_mut()
+            .insert("invite_default_expiry_days".into(), "9".into());
+        for (body, count, days) in [
+            (valid, 1, 9),
+            (r#"{"count":50,"expires_in_days":2}"#, 50, 2),
+        ] {
+            let response = post(body);
+            assert_eq!(response.status, 201);
+            assert!(response
+                .extra_headers
+                .contains(&("cache-control".into(), "private, no-store".into())));
+            let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+            let expires_at = NOW + days * 86_400;
+            assert_eq!(json["expires_at"], expires_at);
+            let codes = json["codes"].as_array().unwrap();
+            assert_eq!(codes.len(), count);
+            for code in codes {
+                let hash = auth::hash_invite_code(code.as_str().unwrap());
+                assert!(!response.body.contains(&hash));
+                assert_eq!(h.store.invites.borrow()[&hash].expires_at, expires_at);
+            }
+        }
+        assert_eq!(h.store.invites.borrow().len(), 51);
     }
 
     #[test]
