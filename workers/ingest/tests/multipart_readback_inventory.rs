@@ -1,25 +1,264 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use nntune_core::{
-    digest_enrollment::DigestEnrollment, media::PLAIN_CHUNK_SIZE, media_envelope::EnvelopeContext,
+    digest_enrollment::{DigestEnrollment, OriginManifest},
+    digest_readback::{
+        BodyReadbackError, EnrolledEnvelope, EnrolledReadbackError, ReadbackBody, ReadbackError,
+        ReadbackPin, ReadbackResponse,
+    },
+    media::PLAIN_CHUNK_SIZE,
+    media_envelope::{wrap_scheme2, EnvelopeContext},
     origin_sealer::SealedChunk,
 };
 use nntune_ingest::multipart::{
-    readback_inventory::{CompletedReadbackInventory, InventoryError},
-    sidecar::{SidecarPut, SidecarPutReply},
-    Plan, UploadTarget, VersionedCompletionReply,
+    readback_inventory::{
+        BucketReadbackResponse, CompletedReadbackInventory, InventoryError, ReadbackScope,
+    },
+    sidecar::{CompletedSidecar, SidecarPut, SidecarPutReply},
+    CompletedVersionedMedia, Plan, UploadTarget, VersionedCompletionReply,
 };
 use sha2::{Digest, Sha256};
+use std::io;
 
 const BUCKET: &str = "test-bucket";
 const KEY: &str = "media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd";
 const SHARED_VERSION: &str = "Opaque+%2F/=";
 const FINAL_VERSION: &str = "Final%2f+==";
 
-fn id(byte: u8) -> [u8; 16] {
+const fn id(byte: u8) -> [u8; 16] {
     let mut value = [byte; 16];
     value[6] = 0x40;
     value[8] = 0x80;
     value
+}
+
+const PAGE_KEY: &str = concat!(
+    "media-digests/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd/",
+    "06060606060640068006060606060606/00000000",
+);
+const ROOT: [u8; 32] = [17; 32];
+const CONFIGURATION: [u8; 16] = id(5);
+const MAP_ID: [u8; 16] = id(6);
+const SCOPE: ReadbackScope<'_> = ReadbackScope {
+    bucket: BUCKET,
+    configuration: CONFIGURATION,
+};
+// Mono, 8-bit, 19 constant samples at 44.1 kHz.
+const FLAC: &[u8] = b"fLaC\x80\0\0\x22\0\x10\0\x10\0\0\0\0\0\0\x0a\xc4\x40\x70\0\0\0\x13\
+    \x46\xd2\xbe\x27\x5e\xd2\xdd\x86\xab\x2b\x53\x88\xf7\x34\x6d\x15\
+    \xff\xf8\x69\x02\0\x0f\xb7\0\x2a\x7a\xdd\xff\xf8\x69\x02\x01\x02\x81\0\x2a\x9d\x1d";
+
+struct MemoryBody<'a>(Option<&'a [u8]>);
+
+impl ReadbackBody for MemoryBody<'_> {
+    async fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(self.0.as_mut().expect("rejected response was read"), dst)
+    }
+}
+
+struct ReadbackFixture {
+    origin: OriginManifest,
+    context: EnvelopeContext,
+    record: [u8; 230],
+    media: CompletedVersionedMedia,
+    media_bytes: Vec<u8>,
+    page_bytes: Vec<u8>,
+}
+
+impl ReadbackFixture {
+    fn new(plaintext: &[u8]) -> Self {
+        let identities = [0, 1, 2, 0xab, 0xcd, 5].map(id);
+        let plaintext_len = plaintext.len() as u64;
+        let mut enrollment =
+            DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), MAP_ID)
+                .unwrap();
+        let context = EnvelopeContext {
+            identities,
+            plaintext_len,
+            header: enrollment.header().to_bytes(),
+        };
+        let record = wrap_scheme2(&ROOT, &context, enrollment.key().expose_secret()).unwrap();
+        let plan = Plan::new(
+            UploadTarget {
+                bucket: BUCKET,
+                key: KEY,
+                upload_id: "synthetic",
+            },
+            enrollment.header(),
+            plaintext_len,
+        )
+        .unwrap();
+        let sealed = enrollment.seal_chunk(plaintext).unwrap();
+        let mut partition = plan.partition();
+        assert!(partition
+            .push(&SealedChunk {
+                digest: Sha256::digest(&sealed.bytes).into(),
+                bytes: sealed.bytes,
+                final_chunk: true,
+            })
+            .unwrap()
+            .is_none());
+        let part = partition.finish().unwrap().unwrap();
+        let (_, _, bytes, checksum) = part.request();
+        let composite = STANDARD.encode(Sha256::digest(STANDARD.decode(checksum).unwrap()));
+        let body = format!(
+            "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key>\
+             <ChecksumSHA256>{composite}-1</ChecksumSHA256></CompleteMultipartUploadResult>"
+        );
+        let reply = VersionedCompletionReply {
+            configuration: CONFIGURATION,
+            status: 200,
+            body: body.as_bytes(),
+            version_headers: &[SHARED_VERSION],
+        };
+        let uploaded = part.verify_reply("synthetic".into(), checksum).unwrap();
+        let completion = plan.complete(vec![uploaded]).unwrap();
+        let media = completion.verify_versioned_reply(&context, reply).unwrap();
+        Self {
+            origin: enrollment.finish().unwrap(),
+            context,
+            record,
+            media,
+            media_bytes: bytes.to_vec(),
+            page_bytes: sealed.page.unwrap(),
+        }
+    }
+
+    fn sidecar(&self) -> CompletedSidecar<'_> {
+        let reply = SidecarPutReply {
+            configuration: CONFIGURATION,
+            bucket: BUCKET,
+            key: PAGE_KEY,
+            status: 200,
+            body: b"",
+            version_headers: &[FINAL_VERSION],
+        };
+        let page = &self.page_bytes;
+        let put = SidecarPut::new(BUCKET, &self.context, &self.origin, MAP_ID, 0, page).unwrap();
+        put.verify_reply(reply).unwrap()
+    }
+
+    fn inventory<'a>(
+        &'a self,
+        sidecars: &'a [CompletedSidecar<'_>],
+    ) -> CompletedReadbackInventory<'a> {
+        CompletedReadbackInventory::assemble(
+            BUCKET,
+            CONFIGURATION,
+            &self.context,
+            MAP_ID,
+            &self.origin,
+            &self.media,
+            sidecars,
+        )
+        .unwrap()
+    }
+
+    fn envelope(&self) -> EnrolledEnvelope<'_> {
+        EnrolledEnvelope {
+            authorized_root: &ROOT,
+            context: &self.context,
+            trusted_record: &self.record,
+            retained_record: &self.record,
+        }
+    }
+
+    fn response(&self, pin: ReadbackPin<'_>) -> BucketReadbackResponse<MemoryBody<'_>> {
+        let (key, version, bytes) = match pin.object_key {
+            KEY => (KEY, SHARED_VERSION, &self.media_bytes),
+            PAGE_KEY => (PAGE_KEY, FINAL_VERSION, &self.page_bytes),
+            _ => panic!("unexpected readback key"),
+        };
+        assert_eq!(pin.configuration, CONFIGURATION);
+        assert_eq!(pin.version, Some(version));
+        BucketReadbackResponse {
+            bucket: BUCKET.into(),
+            response: ReadbackResponse {
+                configuration: CONFIGURATION,
+                object_key: key.into(),
+                version: Some(version.into()),
+                status: 200,
+                content_length: Some(bytes.len() as u64),
+                has_content_range: false,
+                has_content_encoding: false,
+                body: MemoryBody(Some(bytes)),
+            },
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_readback_binds_the_exact_inventory_after_flac_and_eof() {
+    for (plaintext, complete) in [(FLAC, true), (&FLAC[..FLAC.len() - 1], false)] {
+        let fixture = ReadbackFixture::new(plaintext);
+        let receipts = [fixture.sidecar()];
+        let inventory = fixture.inventory(&receipts);
+        let result = inventory
+            .verify(SCOPE, fixture.envelope(), async |bucket, pin| {
+                assert_eq!(bucket, BUCKET);
+                Ok(fixture.response(pin))
+            })
+            .await;
+        if complete {
+            let verified = result.unwrap();
+            assert!(std::ptr::eq(verified.inventory(), &inventory));
+            assert!(std::ptr::eq(verified.origin(), &fixture.origin));
+        } else {
+            assert_eq!(
+                result.err(),
+                Some(EnrolledReadbackError::Body(BodyReadbackError::Content(
+                    ReadbackError::MediaValidation
+                ),))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_readback_rejects_foreign_scope_and_response_pins() {
+    use EnrolledReadbackError::{Body, Envelope};
+
+    let fixture = ReadbackFixture::new(FLAC);
+    let foreign = ReadbackFixture::new(FLAC);
+    let receipts = [fixture.sidecar()];
+    let inventory = fixture.inventory(&receipts);
+    let foreign_bucket = "other-bucket";
+    let bad_scope = || Body(BodyReadbackError::Inventory);
+    for (bucket, configuration, envelope, expected) in [
+        (
+            foreign_bucket,
+            CONFIGURATION,
+            fixture.envelope(),
+            bad_scope(),
+        ),
+        (BUCKET, id(8), fixture.envelope(), bad_scope()),
+        (BUCKET, CONFIGURATION, foreign.envelope(), Envelope),
+    ] {
+        let scope = ReadbackScope {
+            bucket,
+            configuration,
+        };
+        let result = inventory
+            .verify::<MemoryBody<'_>>(scope, envelope, async |_, _| {
+                panic!("scope or origin mismatch opened an object")
+            })
+            .await;
+        assert_eq!(result.err(), Some(expected));
+    }
+
+    for (bucket, version) in [(foreign_bucket, FINAL_VERSION), (BUCKET, SHARED_VERSION)] {
+        let result = inventory
+            .verify(SCOPE, fixture.envelope(), async |_, pin| {
+                let mut response = fixture.response(pin);
+                if pin.object_key == PAGE_KEY {
+                    response.bucket = bucket.into();
+                    response.response.version = Some(version.into());
+                    response.response.body = MemoryBody(None);
+                }
+                Ok(response)
+            })
+            .await;
+        assert_eq!(result.err(), Some(Body(BodyReadbackError::Response)));
+    }
 }
 
 #[test]
