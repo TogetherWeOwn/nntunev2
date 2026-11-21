@@ -34,19 +34,13 @@ def output(**changes):
 
 
 def current(deployment_id=DEPLOYMENT, version_id=VERSION, percentage=100):
-    active = {
-        "id": deployment_id,
-        "strategy": "percentage",
-        "versions": [{"version_id": version_id, "percentage": percentage}],
-    }
-    return {"deployments": [active]}
+    versions = [{"version_id": version_id, "percentage": percentage}]
+    return {"deployments": [{"id": deployment_id, "strategy": "percentage", "versions": versions}]}
 
 
 def version(*bindings, sha=SHA):
-    return {
-        "id": VERSION,
-        "resources": {"bindings": [{"name": "BUILD_SHA", "type": "plain_text", "text": sha}, *bindings]},
-    }
+    build = {"name": "BUILD_SHA", "type": "plain_text", "text": sha}
+    return {"id": VERSION, "resources": {"bindings": [build, *bindings]}}
 
 
 class IdentityTests(unittest.TestCase):
@@ -146,20 +140,35 @@ class IdentityTests(unittest.TestCase):
     @patch.object(identity.http.client, "HTTPSConnection")
     def test_provider_bounds_and_no_redirect_or_raw_response(self, connect):
         conn = connect.return_value
-        for status, body, missing, reason in (
-            (403, b"synthetic sensitive response", 0, "version-auth-denied"),
-            (302, b"not followed", 0, "provider-http-status"),
-            (200, b"x" * (identity.MAX_BODY + 1), 0, "provider-body-limit"),
-            (200, b'{"success":true,"success":true}', 0, "provider-response-shape"),
-            (200, b'{"success":true,"errors":[],"result":{}}', 1, "provider-transport"),
+        valid = b'{"success":true,"errors":[],"result":{}}'
+        chunked = "Transfer-Encoding: chunked"
+        chunk = b"".join(f"{len(part):x}\r\n".encode() + part + b"\r\n" for part in (valid[:5], valid[5:]))
+        chunk += b"0\r\n"
+        for status, body, framing, reason in (
+            (403, b"synthetic sensitive response", None, "version-auth-denied"),
+            (302, b"not followed", None, "provider-http-status"),
+            (200, b"x" * (identity.MAX_BODY + 1), None, "provider-body-limit"),
+            (200, b'{"success":true,"success":true}', None, "provider-response-shape"),
+            (200, valid, None, None),
+            (200, valid, f"Content-Length: {len(valid) + 1}", "provider-transport"),
+            (200, valid, "Connection: close", "provider-transport"),
+            (200, chunk, chunked, "provider-transport"),
+            (200, chunk + b"\r\n", chunked, None),
+            (200, chunk + b"\r\n", chunked + "\r\nContent-Length: 1", "provider-transport"),
+            (200, f"{identity.MAX_BODY + 1:x}\r\n".encode(), chunked, "provider-body-limit"),
         ):
-            wire = f"HTTP/1.1 {status} Test\r\nContent-Length: {len(body) + missing}\r\n\r\n".encode() + body
+            framing = framing or f"Content-Length: {len(body)}"
+            wire = f"HTTP/1.1 {status} Test\r\n{framing}\r\n\r\n".encode() + body
             response = identity.http.client.HTTPResponse(MagicMock(makefile=MagicMock(return_value=io.BytesIO(wire))))
             response.begin()
             conn.getresponse.return_value = response
             conn.request.reset_mock()
-            with self.subTest(reason=reason), self.assertRaisesRegex(identity.Unavailable, f"^{reason}$"):
-                identity.provider_result("/mock", "synthetic-token")
+            with self.subTest(reason=reason):
+                if reason:
+                    with self.assertRaisesRegex(identity.Unavailable, f"^{reason}$"):
+                        identity.provider_result("/mock", "synthetic-token")
+                else:
+                    self.assertEqual(identity.provider_result("/mock", "synthetic-token"), {})
             connect.assert_called_with("api.cloudflare.com", timeout=5)
             conn.request.assert_called_once_with(
                 "GET",

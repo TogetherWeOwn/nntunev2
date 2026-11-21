@@ -38,12 +38,8 @@ def reject_constant(_):
 
 def decode(body, reason):
     try:
-        return json.loads(
-            body.decode("utf-8"),
-            object_pairs_hook=unique_object,
-            parse_constant=reject_constant,
-            parse_float=Decimal,
-        )
+        return json.loads(body.decode("utf-8"), object_pairs_hook=unique_object,
+                          parse_constant=reject_constant, parse_float=Decimal)
     except (ValueError, RecursionError, InvalidOperation):
         raise Unavailable(reason) from None
 
@@ -67,15 +63,27 @@ def deployed_version(body):
     require(len(deploys) == 1, reason)
     deploy = deploys[0]
     version_id = deploy.get("version_id")
-    require(
-        type(deploy.get("version")) is int
-        and deploy["version"] == 1
-        and deploy.get("worker_name") == SCRIPT
-        and deploy.get("wrangler_environment") == "staging"
-        and valid(UUID, version_id),
-        reason,
-    )
+    require(type(deploy.get("version")) is int and deploy["version"] == 1, reason)
+    require(deploy.get("worker_name") == SCRIPT and deploy.get("wrangler_environment") == "staging", reason)
+    require(valid(UUID, version_id), reason)
     return version_id
+
+
+def read_chunked(stream):
+    # http.client tolerates EOF at the end of a chunked message. Require
+    # complete framing and fail closed on unsupported extensions/trailers.
+    body = bytearray()
+    while True:
+        line = stream.readline(19)
+        require(re.fullmatch(rb"[0-9a-fA-F]{1,16}\r\n", line), "provider-transport")
+        size = int(line, 16)
+        if size == 0:
+            require(stream.read(2) == b"\r\n", "provider-transport")
+            return body
+        require(len(body) + size <= MAX_BODY, "provider-body-limit")
+        chunk = stream.read(size)
+        require(len(chunk) == size and stream.read(2) == b"\r\n", "provider-transport")
+        body.extend(chunk)
 
 
 def provider_result(path, token):
@@ -91,21 +99,25 @@ def provider_result(path, token):
             if response.status in (401, 403):
                 raise Unavailable("deployments-auth-denied" if path.endswith("/deployments") else "version-auth-denied")
             require(response.status == 200, "provider-http-status")
-            body = response.read(MAX_BODY + 1)
-            require(len(body) <= MAX_BODY, "provider-body-limit")
-            require(response.length in (None, 0), "provider-transport")
+            encodings = response.headers.get_all("Transfer-Encoding", [])
+            lengths = response.headers.get_all("Content-Length", [])
+            if response.chunked:
+                require(len(encodings) == 1 and not lengths, "provider-transport")
+                body = read_chunked(response.fp)
+            else:
+                require(not encodings and len(lengths) == 1 and response.length is not None, "provider-transport")
+                require(re.fullmatch(r"[0-9]+", lengths[0].strip(" \t")), "provider-transport")
+                require(response.length <= MAX_BODY, "provider-body-limit")
+                body = response.read()  # Exact declared length or IncompleteRead.
     except (http.client.HTTPException, OSError, ValueError):
         raise Unavailable("provider-transport") from None
     finally:
         conn.close()
     payload = decode(body, "provider-response-shape")
-    require(
-        field(payload, "success") is True
-        and field(payload, "errors") == []
-        and isinstance(field(payload, "result"), dict),
-        "provider-response-shape",
-    )
-    return payload["result"]
+    result = field(payload, "result")
+    ok = field(payload, "success") is True and field(payload, "errors") == []
+    require(ok and isinstance(result, dict), "provider-response-shape")
+    return result
 
 
 def current_deployment(result, version_id):
@@ -117,17 +129,10 @@ def current_deployment(result, version_id):
     require(all(valid(UUID, value) for value in ids) and len(set(ids)) == len(ids), "deployment-shape")
     deployment = deployments[0]
     versions = field(deployment, "versions")
-    require(
-        deployment.get("strategy") == "percentage" and isinstance(versions, list) and len(versions) == 1,
-        "deployment-not-single-version",
-    )
-    active = versions[0]
-    percent = field(active, "percentage")
-    active_id = field(active, "version_id")
-    require(
-        type(percent) in (int, Decimal) and percent == 100 and valid(UUID, active_id),
-        "deployment-traffic-shape",
-    )
+    single = deployment.get("strategy") == "percentage" and isinstance(versions, list) and len(versions) == 1
+    require(single, "deployment-not-single-version")
+    percent, active_id = field(versions[0], "percentage"), field(versions[0], "version_id")
+    require(type(percent) in (int, Decimal) and percent == 100 and valid(UUID, active_id), "deployment-traffic-shape")
     require(active_id == version_id, "deployed-version-mismatch")
     return ids[0]
 
@@ -145,18 +150,11 @@ def verify_version(result, version_id, expected_sha):
         )
         by_name[name] = binding
     build = by_name.get("BUILD_SHA")
-    require(
-        field(build, "type") == "plain_text" and valid(SHA, field(build, "text")),
-        "version-build-unavailable",
-    )
+    require(field(build, "type") == "plain_text" and valid(SHA, field(build, "text")), "version-build-unavailable")
     require(build["text"] == expected_sha, "version-build-mismatch")
     enable = by_name.get(PREFIX + "ENABLE")
-    require(
-        (enable is None or (enable["type"] == "plain_text" and enable.get("text") == "0"))
-        and PREFIX + "LEASE" not in by_name
-        and PREFIX + "DB" not in by_name,
-        "default-off-not-verified",
-    )
+    off = enable is None or (enable["type"] == "plain_text" and enable.get("text") == "0")
+    require(off and PREFIX + "LEASE" not in by_name and PREFIX + "DB" not in by_name, "default-off-not-verified")
 
 
 def receipt(body, expected_sha, account, read):
@@ -167,10 +165,8 @@ def receipt(body, expected_sha, account, read):
     deployments = path + "/deployments"
     deployment_id = current_deployment(read(deployments), version_id)
     verify_version(read(path + "/versions/" + version_id), version_id, expected_sha)
-    require(
-        current_deployment(read(deployments), version_id) == deployment_id,
-        "deployment-changed-during-readback",
-    )
+    confirmed = current_deployment(read(deployments), version_id)
+    require(confirmed == deployment_id, "deployment-changed-during-readback")
     return {
         "identity": "matched",
         "deployment_id": deployment_id,
@@ -192,12 +188,8 @@ def main():
                 body = source.read(MAX_DEPLOY_OUTPUT + 1)
         except (OSError, KeyError, ValueError):
             raise Unavailable("deploy-output-unavailable") from None
-        result = receipt(
-            body,
-            os.environ.get("GITHUB_SHA", ""),
-            os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""),
-            lambda path: provider_result(path, token),
-        )
+        result = receipt(body, os.getenv("GITHUB_SHA"), os.getenv("CLOUDFLARE_ACCOUNT_ID"),
+                         lambda path: provider_result(path, token))
     except Unavailable as exc:
         print(json.dumps({"identity": "unavailable", "reason": str(exc)}))
         return 1
