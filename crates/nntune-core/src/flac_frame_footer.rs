@@ -72,38 +72,61 @@ impl FrameFooter {
 mod tests {
     use super::*;
 
-    // RFC 9639 Appendix D.2: second audio frame, 0xcc..=0xe2, with two
-    // alignment bits in 0x7c. The published footer is 0x1330.
-    const PADDED: [u8; 21] = [
-        0xff, 0xf8, 0x69, 0x18, 0x01, 0x02, 0xa4, 0x02, 0xc3, 0x82, 0xc4, 0x0b, 0xc1, 0x4a, 0x03,
-        0xee, 0x48, 0xdd, 0x03, 0xb6, 0x7c,
-    ];
-    const CRC: [u8; 2] = [0x13, 0x30];
+    // CRC-8 (x^8 + x^2 + x + 1) and CRC-16 (x^16 + x^15 + x^2 + 1)
+    // pins were derived by polynomial long division, not FrameCrc.
+    const PADDED_CRC: [u8; 2] = 0x7f33u16.to_be_bytes();
+    const ALIGNED_CRC: [u8; 2] = 0x5623u16.to_be_bytes();
 
-    fn padded_footer(body: &[u8; 21], split: usize) -> Result<FrameFooter, ()> {
+    fn constant_frame_body(sample_size_code: u8, header_crc: u8, packed_sample: u16) -> [u8; 9] {
+        // Original synthetic mono frame: fixed blocking, 192 samples at
+        // 44.1 kHz, frame number 0, one constant subframe. The sample is
+        // left-aligned in its two bytes and any low bits are zero padding.
+        let [high, low] = packed_sample.to_be_bytes();
+        [
+            0xff,
+            0xf8,
+            0x19,
+            sample_size_code << 1,
+            0,
+            header_crc,
+            0, // Constant subframe header, no wasted bits.
+            high,
+            low,
+        ]
+    }
+
+    fn padded_frame_body() -> [u8; 9] {
+        constant_frame_body(2, 0x46, 0x05ab << 4) // 12-bit sample, four padding bits.
+    }
+
+    fn padded_footer(body: &[u8; 9], split: usize) -> Result<FrameFooter, ()> {
         let mut crc = FrameCrc::default();
         crc.update(&body[..split]);
         crc.update(&body[split..]);
-        // Advance the real bit cursor to the published subframe endpoint.
+        // Read the 12-bit sample with the real cursor, leaving its four pad bits.
         let mut bits = BitInput::default();
-        let mut last = &body[20..];
-        assert_eq!(bits.read(&mut last, 6), Ok(Some(0b011111)));
-        assert!(last.is_empty());
+        let mut sample = &body[7..];
+        assert_eq!(bits.read(&mut sample, 12), Ok(Some(0x05ab)));
+        assert!(sample.is_empty());
         let footer = crc.into_footer(&mut bits)?;
         assert_eq!(bits.read(&mut [0xa5].as_slice(), 8), Ok(Some(0xa5)));
         Ok(footer)
     }
 
     #[test]
-    fn published_padded_crc_survives_splits_and_leaves_following_bytes() {
-        let wire = [CRC[0], CRC[1], 0xff, 0xf8, 0x11];
-        for body_split in 0..=PADDED.len() {
-            for footer_split in 0..=CRC.len() {
-                let mut footer = padded_footer(&PADDED, body_split).unwrap();
+    fn padded_crc_survives_splits_and_leaves_following_bytes() {
+        let body = padded_frame_body();
+        let wire = [PADDED_CRC[0], PADDED_CRC[1], 0xff, 0xf8, 0x11];
+        for body_split in 0..=body.len() {
+            for footer_split in 0..=PADDED_CRC.len() {
+                let mut footer = padded_footer(&body, body_split).unwrap();
                 let (mut first, mut rest) = wire.split_at(footer_split);
-                assert_eq!(footer.read(&mut first), Ok(footer_split == CRC.len()));
+                assert_eq!(
+                    footer.read(&mut first),
+                    Ok(footer_split == PADDED_CRC.len())
+                );
                 assert!(first.is_empty());
-                if footer_split != CRC.len() {
+                if footer_split != PADDED_CRC.len() {
                     assert_eq!(footer.read(&mut rest), Ok(true));
                 }
                 assert_eq!(rest, &wire[2..]);
@@ -115,23 +138,21 @@ mod tests {
     }
 
     #[test]
-    fn published_byte_aligned_frame_needs_no_padding() {
-        // RFC 9639 Appendix D.1: frame 0x2a..=0x38, with footer 0xaa9a.
+    fn byte_aligned_frame_needs_no_padding() {
+        let body = constant_frame_body(4, 0xba, 0x2ec7); // 16-bit sample.
         let mut crc = FrameCrc::default();
-        crc.update(&[
-            0xff, 0xf8, 0x69, 0x18, 0x00, 0x00, 0xbf, 0x03, 0x58, 0xfd, 0x03, 0x12, 0x8b,
-        ]);
+        crc.update(&body);
         let mut bits = BitInput::default();
-        assert_eq!(bits.read(&mut [0x8b].as_slice(), 8), Ok(Some(0x8b)));
+        assert_eq!(bits.read(&mut &body[7..], 16), Ok(Some(0x2ec7)));
         let mut footer = crc.into_footer(&mut bits).unwrap();
-        assert_eq!(footer.read(&mut [0xaa, 0x9a].as_slice()), Ok(true));
+        assert_eq!(footer.read(&mut ALIGNED_CRC.as_slice()), Ok(true));
     }
 
     #[test]
     fn rejects_each_nonzero_padding_bit_before_reading_crc() {
-        for mask in [1, 2] {
-            let mut body = PADDED;
-            body[20] |= mask;
+        for mask in [1, 2, 4, 8] {
+            let mut body = padded_frame_body();
+            *body.last_mut().unwrap() |= mask;
             assert!(padded_footer(&body, body.len()).is_err());
         }
     }
@@ -145,15 +166,17 @@ mod tests {
 
     #[test]
     fn rejects_wrong_and_truncated_crc() {
-        for wrong in [[CRC[0] ^ 1, CRC[1]], [CRC[0], CRC[1] ^ 1]] {
-            let mut footer = padded_footer(&PADDED, PADDED.len()).unwrap();
+        let body = padded_frame_body();
+        let [high, low] = PADDED_CRC;
+        for wrong in [[high ^ 1, low], [high, low ^ 1]] {
+            let mut footer = padded_footer(&body, body.len()).unwrap();
             assert_eq!(footer.read(&mut wrong.as_slice()), Err(()));
-            assert_eq!(footer.read(&mut CRC.as_slice()), Err(()));
+            assert_eq!(footer.read(&mut PADDED_CRC.as_slice()), Err(()));
             assert_eq!(footer.finish_at_eof(), Err(()));
         }
-        for len in 0..CRC.len() {
-            let mut footer = padded_footer(&PADDED, PADDED.len()).unwrap();
-            assert_eq!(footer.read(&mut &CRC[..len]), Ok(false));
+        for len in 0..PADDED_CRC.len() {
+            let mut footer = padded_footer(&body, body.len()).unwrap();
+            assert_eq!(footer.read(&mut &PADDED_CRC[..len]), Ok(false));
             assert_eq!(footer.finish_at_eof(), Err(()));
         }
     }
