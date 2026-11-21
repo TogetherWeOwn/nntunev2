@@ -61,7 +61,7 @@
 			Restart current track
 		</button>
 	</div>
-	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
+	<p data-testid="player-transport-status" role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
 	{#if !restartCanSeek}
 		<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>
 	{/if}
