@@ -40,7 +40,9 @@ impl<'a> FrameContinuity<'a> {
             (Next::Fixed(expected), Position::Frame(n)) if n == expected => {
                 self.after_fixed(n, block)?
             }
-            (Next::First | Next::Variable, Position::Sample(n)) if n == self.samples => {
+            (Next::First | Next::Variable, Position::Sample(n))
+                if n == self.samples && self.info.min_block != self.info.max_block =>
+            {
                 if block < self.info.min_block {
                     Next::EndOnly
                 } else {
@@ -158,19 +160,39 @@ mod tests {
         assert_eq!(check(&info, &[VARIABLE, SHORT]), Ok(()));
         assert_eq!(check(&info, &[VARIABLE, GAP]), Err(()));
         assert_eq!(check(&info, &[VARIABLE, SHORT, AFTER_SHORT]), Err(()));
+        let fixed_bounds = StreamInfo {
+            min_block: 24,
+            total_samples: 24,
+            ..info
+        };
+        assert_eq!(check(&fixed_bounds, &[VARIABLE]), Err(()));
     }
 
     #[test]
     fn unfinished_or_corrupt_frames_poison_continuity() {
-        let mut damaged = FIXED.to_vec();
-        damaged[10] ^= 1;
-        for (mut wire, result) in [(&FIXED[..10], Ok(false)), (damaged.as_slice(), Err(()))] {
-            let mut stream = FrameContinuity::new(&INFO);
-            let mut frame = FrameReader::start(&mut wire, &INFO).unwrap().unwrap();
+        let unknown = StreamInfo {
+            total_samples: 0,
+            ..INFO
+        };
+        assert_eq!(check(&unknown, &[FIXED]), Ok(()));
+
+        let mut damaged = TAIL.to_vec();
+        *damaged.last_mut().unwrap() ^= 1;
+        for (mut wire, result) in [
+            (&TAIL[..TAIL.len() - 1], Ok(false)),
+            (damaged.as_slice(), Err(())),
+        ] {
+            let mut stream = FrameContinuity::new(&unknown);
+            let mut prefix = FIXED;
+            let mut frame = FrameReader::start(&mut prefix, &unknown).unwrap().unwrap();
+            assert_eq!(frame.read(&mut prefix), Ok(true));
+            assert_eq!(stream.accept(frame), Ok(()));
+
+            let mut frame = FrameReader::start(&mut wire, &unknown).unwrap().unwrap();
             assert_eq!(frame.read(&mut wire), result);
             assert_eq!(stream.accept(frame), Err(()));
-            let mut valid = FIXED;
-            let mut frame = FrameReader::start(&mut valid, &INFO).unwrap().unwrap();
+            let mut valid = TAIL;
+            let mut frame = FrameReader::start(&mut valid, &unknown).unwrap().unwrap();
             assert_eq!(frame.read(&mut valid), Ok(true));
             assert_eq!(stream.accept(frame), Err(()));
             assert_eq!(stream.finish_at_frame_boundary(), Err(()));
