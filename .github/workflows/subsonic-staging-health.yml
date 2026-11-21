@@ -32,7 +32,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Sample build health (read-only; not measurement admission)
+      - name: Sample staging build health
         env:
           EXPECTED_STAGING_BUILD_SHA: ${{ inputs.expected_health_sha }}
           SUBSONIC_HEALTH_ACCESS_CLIENT_ID: ${{ secrets.SUBSONIC_HEALTH_ACCESS_CLIENT_ID }}

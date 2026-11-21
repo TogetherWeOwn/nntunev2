@@ -102,14 +102,13 @@ executor. It reuses the fixed query, validates the database clock and counts,
 and limits the call to the earlier of the caller's monotonic deadline and the
 three-second freshness bound. It reports the start of the query's local time
 bracket, not its receipt time: a query started at or before a drain fence
-cannot clear it by returning later.
+cannot clear it by returning later. Nothing calls this helper in a live load
+window yet. Health and resource collectors, live provider coverage and live
+cleanup remain unverified.
 
-Dispatch `subsonic-staging-health` on protected `main` with
-`expected_health_sha` from the staging API deployment record. The job sends the
-dedicated health-only Access headers to curl via stdin. It rejects redirects,
-unverified cache evidence, wrong or unhealthy builds, and late responses.
-This identifies only the responding build, not the deployment or bindings.
-Neither observer is wired to load; resource coverage and cleanup are unverified.
+Dispatch `subsonic-staging-health` on protected `main` with `expected_health_sha`
+from the staging API deployment record. Require the probe step to report the
+verified SHA, not a green run with a skipped job. This proves build liveness only.
 
 ### Version-fenced restore rehearsal (offline)
 

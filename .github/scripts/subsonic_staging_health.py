@@ -3,7 +3,6 @@
 import json
 import os
 import re
-import secrets
 import subprocess
 import time
 from typing import NamedTuple
@@ -51,7 +50,7 @@ def _validate(response, expected_sha):
     # Direct Worker responses have no CF cache status; a present one must agree.
     if (
         headers.get("cache-control") != ["no-store"]
-        or "age" in headers
+        or {"age", "cache-status"} & headers.keys()
         or headers.get("cf-cache-status", ["DYNAMIC"]) not in (["DYNAMIC"], ["BYPASS"])
     ):
         raise UnsafeHealth("cache-unverified")
@@ -74,32 +73,41 @@ def _access_headers(access):
     return f"CF-Access-Client-Id: {client_id}\nCF-Access-Client-Secret: {secret}\n".encode()
 
 
-def _run_curl(run, args, timeout_ms, headers=None):
+def _run_curl(popen, args, monotonic, cutoff_ms, headers=None):
     try:
-        return run(
+        with popen(
             ["curl", "--disable", *args],
-            stdin=subprocess.DEVNULL if headers is None else None,
-            input=headers,
+            stdin=subprocess.DEVNULL if headers is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=timeout_ms / 1000,
             env={"PATH": os.defpath, "LC_ALL": "C"},
-        )
+        ) as proc:
+            try:
+                # Curl reads @- before transfer. Recheck before releasing credentials.
+                remaining_ms = cutoff_ms - monotonic() * 1000
+                if remaining_ms <= 0:
+                    raise UnsafeHealth("deadline")
+                output, _ = proc.communicate(headers, timeout=remaining_ms / 1000)
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+        return proc.returncode, output
     except subprocess.TimeoutExpired:
         raise UnsafeHealth("deadline") from None
     except (OSError, ValueError):
         raise UnsafeHealth("transport") from None
 
 
-def _require_streaming_cap(result):
+def _require_streaming_cap(returncode, output):
     # Before 8.4, --max-filesize only worked when the size was known upfront.
-    first_line = result.stdout.partition(b"\n")[0]
+    first_line = output.partition(b"\n")[0]
     for prefix in (rb"^curl ", rb" libcurl/"):
         version = re.search(
             prefix + rb"(\d{1,3})\.(\d{1,3})\.\d{1,3}(?:\s|$)", first_line
         )
         if (
-            result.returncode != 0
+            returncode != 0
             or version is None
             or tuple(map(int, version.groups())) < (8, 4)
         ):
@@ -111,7 +119,7 @@ def sample_build_health(
     *,
     deadline_ms,
     access=None,
-    run=subprocess.run,
+    popen=subprocess.Popen,
     monotonic=time.monotonic,
 ):
     """Take one uncached sample with curl >=8.4, timestamped at probe start."""
@@ -121,42 +129,34 @@ def sample_build_health(
         raise UnsafeHealth("expected-build")
     if type(deadline_ms) is not int or deadline_ms < 0:
         raise UnsafeHealth("deadline")
+    # HTTP/1.1 avoids refused-stream retries; the Worker route is queryless.
     args = [
-        "--silent",
-        "--proto",
-        "=https",
-        # A fresh HTTP/1.1 transfer avoids HTTP/2 refused-stream retries.
-        "--http1.1",
-        "--noproxy",
-        "*",
-        "--max-filesize",
-        str(MAX_BODY_BYTES),
-        "--header",
-        "@-",
-        "--header",
-        "Accept-Encoding: identity",
-        "--header",
-        "Cache-Control: no-cache, no-store",
-        "--write-out",
-        "\x1e%{http_code}\x1e%{header_json}",
-        f"{HEALTH_URL}?probe={secrets.token_hex(16)}",
-    ]
+        "--silent", "--http1.1",
+        "--proto", "=https",
+        "--noproxy", "*",
+        "--max-filesize", str(MAX_BODY_BYTES),
+        "--header", "@-",
+        "--header", "Accept-Encoding: identity",
+        "--header", "Cache-Control: no-cache, no-store",
+        "--write-out", "\x1e%{http_code}\x1e%{header_json}",
+        HEALTH_URL,
+    ]  # fmt: skip
     headers = _access_headers(os.environ if access is None else access)
     preflight_ms = monotonic() * 1000
     cutoff_ms = min(deadline_ms, int(preflight_ms) + MAX_SAMPLE_AGE_MS)
     if not preflight_ms < cutoff_ms:
         raise UnsafeHealth("deadline")
-    _require_streaming_cap(_run_curl(run, ("--version",), cutoff_ms - preflight_ms))
+    _require_streaming_cap(*_run_curl(popen, ("--version",), monotonic, cutoff_ms))
     started_ms = monotonic() * 1000
     if not preflight_ms <= started_ms < cutoff_ms:
         raise UnsafeHealth("deadline")
-    result = _run_curl(run, args, cutoff_ms - started_ms, headers)
+    returncode, output = _run_curl(popen, args, monotonic, cutoff_ms, headers)
     returned_ms = monotonic() * 1000
     if not started_ms <= returned_ms < cutoff_ms:
         raise UnsafeHealth("deadline")
-    if result.returncode != 0:
+    if returncode != 0:
         raise UnsafeHealth("transport")
-    _validate(result.stdout, expected_sha)
+    _validate(output, expected_sha)
     if not returned_ms <= monotonic() * 1000 < cutoff_ms:
         raise UnsafeHealth("deadline")
     return BuildHealth(int(started_ms), expected_sha)

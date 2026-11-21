@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from functools import partial
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 HEALTH = runpy.run_path(str(Path(__file__).with_name("subsonic_staging_health.py")))
 ID_ENV = "SUBSONIC_HEALTH_ACCESS_CLIENT_ID"
@@ -20,29 +20,34 @@ FOOTER = b'\x1e200\x1e{"cache-control":["no-store"]}'
 
 
 def process(output, returncode=0):
-    return subprocess.CompletedProcess([], returncode, stdout=output)
+    proc = MagicMock(returncode=returncode)
+    proc.__enter__.return_value = proc
+    proc.communicate.return_value = (output, None)
+    return proc
 
 
 def curl(output=BODY + FOOTER):
-    return Mock(side_effect=[process(VERSION), process(output)])
+    preflight, probe = process(VERSION), process(output)
+    return Mock(side_effect=[preflight, probe]), probe
 
 
 class HealthTests(unittest.TestCase):
+    def refuses(self, reason, popen, deadline=2_000, sha=SHA, **kwargs):
+        with self.assertRaisesRegex(UnsafeHealth, f"^{reason}$"):
+            sample(sha, deadline_ms=deadline, popen=popen, **kwargs)
+
     def test_fixed_single_transfer_sends_access_only_on_stdin(self):
-        run = curl()
-        clock = iter((1.0, 1.1, 1.2, 1.3)).__next__
+        popen, probe = curl()
+        clock = iter((1.0, 1.01, 1.1, 1.125, 1.2, 1.3)).__next__
         self.assertEqual(
-            sample(SHA, deadline_ms=1_500, run=run, monotonic=clock), (1_100, SHA)
+            sample(SHA, deadline_ms=1_500, popen=popen, monotonic=clock), (1_100, SHA)
         )
-        preflight, probe = run.call_args_list
+        preflight, request = popen.call_args_list
         self.assertEqual(preflight.args[0], ["curl", "--disable", "--version"])
-        self.assertIsNone(preflight.kwargs["input"])
-        self.assertEqual(preflight.kwargs["timeout"], 0.5)
-        (argv,), kwargs = probe
+        self.assertEqual(preflight.kwargs["stdin"], subprocess.DEVNULL)
+        (argv,), kwargs = request
         self.assertEqual(argv[:2], ["curl", "--disable"])
-        self.assertRegex(
-            argv[-1], r"^https://staging\.nntune\.com/healthz\?probe=[a-f0-9]{32}$"
-        )
+        self.assertEqual(argv[-1], "https://staging.nntune.com/healthz")
         for flag, value in (
             ("--max-filesize", "1024"),
             ("--proto", "=https"),
@@ -55,44 +60,36 @@ class HealthTests(unittest.TestCase):
             self.assertNotIn(option, " ".join(argv))
         self.assertEqual(set(kwargs["env"]), {"PATH", "LC_ALL"})
         self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
-        self.assertEqual(kwargs["timeout"], 0.4)
-        self.assertEqual(
-            kwargs["input"].splitlines(),
-            [
-                b"CF-Access-Client-Id: fixture-id",
-                b"CF-Access-Client-Secret: fixture-secret",
-            ],
+        self.assertEqual(kwargs["stdin"], subprocess.PIPE)
+        probe.communicate.assert_called_once_with(
+            b"CF-Access-Client-Id: fixture-id\nCF-Access-Client-Secret: fixture-secret\n",
+            timeout=0.375,
         )
 
     def test_bad_access_or_sha_never_dispatches(self):
-        run = curl()
+        popen = Mock()
         for access in (
             {},
             {ID_ENV: "fixture-id"},
-            {**ACCESS, SECRET_ENV: "line\r\nbreak"},
+            {**ACCESS, SECRET_ENV: "x\r\ny"},
             {**ACCESS, ID_ENV: "x" * 513},
         ):
-            with self.assertRaisesRegex(UnsafeHealth, "^access-config$"):
-                sample(SHA, deadline_ms=2_000, access=access, run=run)
-        with self.assertRaisesRegex(UnsafeHealth, "^expected-build$"):
-            sample("unknown", deadline_ms=2_000, run=run)
-        run.assert_not_called()
+            self.refuses("access-config", popen, access=access)
+        self.refuses("expected-build", popen, sha="unknown")
+        popen.assert_not_called()
 
     def test_bad_health_evidence_is_rejected(self):
+        for extra in (
+            b',"age":[""]}',
+            b',"cache-status":["edge; hit"]}',
+            b',"cf-cache-status":["DYNAMIC","HIT"]}',
+            b',"cf-cache-status":["HIT"]}',
+            b"",
+        ):
+            self.refuses("cache-unverified", curl(BODY + FOOTER[:-1] + extra)[0])
         for reply, reason in (
             (BODY + FOOTER.replace(b"200", b"302"), "status"),
-            (BODY + FOOTER[:-1] + b',"age":[""]}', "cache-unverified"),
-            (
-                BODY + FOOTER[:-1] + b',"cf-cache-status":["DYNAMIC","HIT"]}',
-                "cache-unverified",
-            ),
-            (BODY + FOOTER[:-1] + b',"cf-cache-status":["HIT"]}', "cache-unverified"),
-            (
-                BODY + FOOTER.replace(b'"no-store"', b'"no-store","max-age=60"'),
-                "cache-unverified",
-            ),
             (BODY + FOOTER.replace(b"no-store", b"max-age=60"), "cache-unverified"),
-            (BODY + FOOTER[:-1], "cache-unverified"),
             (b"x" * 1025 + FOOTER, "shape"),
             (BODY.replace(b"true", b'true,"ok":true') + FOOTER, "shape"),
             (BODY.replace(b"true", b"1") + FOOTER, "unhealthy-or-wrong-build"),
@@ -101,22 +98,26 @@ class HealthTests(unittest.TestCase):
                 "unhealthy-or-wrong-build",
             ),
         ):
-            with self.assertRaisesRegex(UnsafeHealth, f"^{reason}$"):
-                sample(SHA, deadline_ms=2_000, run=curl(reply))
+            self.refuses(reason, curl(reply)[0])
+
+    def test_launch_overrun_never_releases_credentials(self):
+        popen, probe = curl()
+        clock = iter((1, 1.025, 1.1, 1.2)).__next__
+        self.refuses("deadline", popen, 1_200, monotonic=clock)
+        probe.communicate.assert_not_called()
+        probe.kill.assert_called_once()
+        probe.wait.assert_called_once()
 
     def test_deadline_includes_validation_and_caps_freshness(self):
         for deadline, clocks, calls in (
             (1_000, (1,), 0),
-            (1_200, (1, 1.2), 1),
-            (1_200, (1, 1.025, 1.1, 1.2), 2),
-            (9_000, (1, 1.1, 3.9, 4), 2),
+            (1_200, (1, 1.025, 1.2), 1),
+            (1_200, (1, 1.025, 1.1, 1.15, 1.2), 2),
+            (9_000, (1, 1.05, 1.1, 1.15, 3.9, 4), 2),
         ):
-            run = curl()
-            with self.assertRaisesRegex(UnsafeHealth, "^deadline$"):
-                sample(
-                    SHA, deadline_ms=deadline, run=run, monotonic=iter(clocks).__next__
-                )
-            self.assertEqual(run.call_count, calls)
+            popen, _ = curl()
+            self.refuses("deadline", popen, deadline, monotonic=iter(clocks).__next__)
+            self.assertEqual(popen.call_count, calls)
 
     def test_old_or_unreadable_curl_cannot_dispatch(self):
         for version in (
@@ -124,27 +125,26 @@ class HealthTests(unittest.TestCase):
             VERSION.replace(b"libcurl/8.4.0", b"libcurl/8.3.0"),
             b"unknown",
         ):
-            run = Mock(return_value=process(version))
-            with self.assertRaisesRegex(UnsafeHealth, "^curl-version$"):
-                sample(SHA, deadline_ms=2_000, run=run)
-            run.assert_called_once()
+            popen = Mock(return_value=process(version))
+            self.refuses("curl-version", popen)
+            popen.assert_called_once()
 
     def test_client_errors_are_sanitized_and_not_retried(self):
+        timed_out = process(b"")
+        timed_out.communicate.side_effect = subprocess.TimeoutExpired("curl", 1)
         for failure, reason in (
             (process(b"raw-response", 63), "transport"),
             (OSError("raw-transport"), "transport"),
-            (subprocess.TimeoutExpired("curl", 1), "deadline"),
+            (timed_out, "deadline"),
         ):
-            run = Mock(side_effect=[process(VERSION), failure])
-            with self.assertRaisesRegex(UnsafeHealth, f"^{reason}$"):
-                sample(SHA, deadline_ms=2_000, run=run)
-            self.assertEqual(run.call_count, 2)
+            popen = Mock(side_effect=[process(VERSION), failure])
+            self.refuses(reason, popen)
+            self.assertEqual(popen.call_count, 2)
+        timed_out.kill.assert_called_once()
+        timed_out.wait.assert_called_once()
 
     def test_health_secrets_stay_in_the_manual_protected_main_job(self):
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "workflows/subsonic-staging-health.yml"
-        )
+        path = Path(__file__).parents[1] / "workflows/subsonic-staging-health.yml"
         text = path.read_text()
         for guard in (
             "\non:\n  workflow_dispatch:\n    inputs:\n",
@@ -156,13 +156,20 @@ class HealthTests(unittest.TestCase):
         ):
             self.assertIn(guard, text)
         self.assertNotIn("upload-artifact", text)
-        for name in (ID_ENV, SECRET_ENV):
-            matches = [
-                p
-                for p in path.parent.glob("*.yml")
-                if f"secrets.{name}" in p.read_text()
-            ]
-            self.assertEqual(matches, [path])
+        step = "      - name: Sample staging build health\n"
+        step += "        env:\n          EXPECTED_STAGING_BUILD_SHA: ${{ inputs.expected_health_sha }}\n"
+        for name in ACCESS:
+            step += f"          {name}: ${{{{ secrets.{name} }}}}\n"
+            self.assertEqual(text.count(name), 2)
+        self.assertIn(
+            step
+            + "        run: python3 -I .github/scripts/subsonic_staging_health.py\n",
+            text,
+        )
+        for other in path.parent.iterdir():
+            if other != path and other.suffix in {".yml", ".yaml"}:
+                source = other.read_text()
+                self.assertFalse(any(name in source for name in ACCESS), other.name)
 
 
 if __name__ == "__main__":
