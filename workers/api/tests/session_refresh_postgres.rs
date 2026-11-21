@@ -430,7 +430,7 @@ async fn production_lease_touch_respects_fixed_deadline_and_legacy_expiry() {
     }
     // Previous Worker's acquisition leaves the deadline columns untouched.
     accounts.observer.query_one(
-        "INSERT INTO playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 FROM (SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch",
+        "INSERT INTO public.playback_leases (user_id, session_id, track_id, play_id, epoch, expires_at, updated_at) SELECT $1, $2, $3, $4, 1, $5, $6 FROM (SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE) AS writer_fence ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id, track_id = EXCLUDED.track_id, play_id = EXCLUDED.play_id, epoch = playback_leases.epoch + 1, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at WHERE playback_leases.expires_at <= $6 OR playback_leases.session_id = EXCLUDED.session_id OR $7 RETURNING epoch",
         &[&user, &"session", &"track", &"legacy", &125_i64, &80_i64, &false],
     ).await.unwrap();
     let row = store.playback_lease(user).await.unwrap().unwrap();
