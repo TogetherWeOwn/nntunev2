@@ -43,6 +43,7 @@ EXPECTED = {
         "postgres_admin_write_refused_after_actor_demotion",
         "postgres_admin_simultaneous_opposing_demotions_keep_one_admin",
         "postgres_admin_invite_issue_and_revoke_audit_by_row_id",
+        "postgres_admin_invite_windows_are_bounded_and_audited_atomically",
         "postgres_invite_revocation_wins_against_stale_redemption_snapshot",
         "postgres_registration_invite_claim_stamps_spend_and_invited_by",
         "postgres_registration_invite_claim_survives_issuer_deletion",

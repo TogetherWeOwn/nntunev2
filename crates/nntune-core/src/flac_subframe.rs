@@ -26,6 +26,35 @@ impl BitInput {
         self.value &= (1 << self.available) - 1;
         Ok(Some(value))
     }
+
+    /// Count unary zeroes by byte, retaining the count across slices.
+    pub(crate) fn unary(
+        &mut self,
+        input: &mut &[u8],
+        count: &mut u32,
+        max: u32,
+    ) -> Result<bool, ()> {
+        loop {
+            if self.available == 0 {
+                let Some((&byte, rest)) = input.split_first() else {
+                    return Ok(false);
+                };
+                *input = rest;
+                self.value = u64::from(byte);
+                self.available = 8;
+            }
+            let run = (self.value << (64 - self.available))
+                .leading_zeros()
+                .min(u32::from(self.available));
+            *count = count.checked_add(run).filter(|&n| n <= max).ok_or(())?;
+            let terminated = run < u32::from(self.available);
+            self.available -= run as u8 + u8::from(terminated);
+            self.value &= (1 << self.available) - 1;
+            if terminated {
+                return Ok(true);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +147,33 @@ impl SubframeHeaderReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unary_count_spans_slices_and_preserves_the_next_field() {
+        let mut bits = BitInput::default();
+        let mut first = [0xa0, 0].as_slice();
+        let mut count = 0;
+        assert_eq!(bits.read(&mut first, 3), Ok(Some(0b101)));
+        assert_eq!(bits.unary(&mut first, &mut count, 15), Ok(false));
+        assert_eq!(count, 13);
+        assert!(first.is_empty());
+        let mut rest = [0x35, 0xff].as_slice();
+        assert_eq!(bits.unary(&mut rest, &mut count, 15), Ok(true));
+        assert_eq!(count, 15);
+        assert_eq!(bits.read(&mut rest, 5), Ok(Some(0b10101)));
+        assert_eq!(rest, [0xff]);
+
+        let mut bits = BitInput::default();
+        let mut count = 13;
+        assert_eq!(bits.unary(&mut [0x35].as_slice(), &mut count, 14), Err(()));
+
+        let mut bits = BitInput::default();
+        let mut count = u32::MAX - 1;
+        assert_eq!(
+            bits.unary(&mut [0x20].as_slice(), &mut count, u32::MAX),
+            Err(())
+        );
+    }
 
     #[test]
     fn subframe_type_boundaries() {

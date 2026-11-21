@@ -32,3 +32,30 @@ export function socketFixture(acknowledged) {
   original.startTls = () => { calls.upgrades++; return replacement; };
   return { original, replacement, calls };
 }
+
+export function stalledStartupFixture(stallOpen) {
+  const calls = { reads: 0, writes: 0, closes: 0 };
+  let finishOpen;
+  const opened = new Promise((resolve) => { finishOpen = () => resolve({}); });
+  let reader;
+  const readable = new ReadableStream({
+    start(controller) { reader = controller; },
+    pull() {
+      calls.reads++;
+      return new Promise(() => {}); // Accept startup, but never answer it.
+    },
+  }, { highWaterMark: 0 });
+  const writable = new WritableStream({ write() { calls.writes++; } });
+  if (!stallOpen) setTimeout(finishOpen, 1000);
+  return [{
+    opened, readable, writable,
+    close() {
+      if (++calls.closes === 1) {
+        finishOpen(); // Late readiness must not start a cancelled handshake.
+        reader.close();
+      }
+      return Promise.resolve();
+    },
+    closed: Promise.resolve(),
+  }, calls];
+}
