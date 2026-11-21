@@ -37,6 +37,9 @@ test('issues once with server defaults and copies a fragment link that works at 
 	await page.getByRole('link', { name: 'Create an invite' }).press('Enter');
 	await expect(create(page)).toBeEnabled();
 	expect(posts).toEqual([]);
+	const expiry = page.getByRole('spinbutton', { name: 'Expiry in days (optional)' });
+	await expiry.fill('7');
+	await expiry.fill('');
 	await create(page).press('Enter');
 	await expect(page.getByRole('button', { name: 'Creating invite…' })).toBeDisabled();
 	await page.locator('main form').evaluate((form: HTMLFormElement) => form.requestSubmit());
@@ -88,6 +91,27 @@ test('validates fields, sends only explicit options, and hides the one-time resu
 	await expect(create(page)).toBeFocused();
 });
 
+test('hides the link by keyboard while the clipboard write is pending', async ({ page }) => {
+	await page.setViewportSize({ width: 320, height: 800 });
+	await page.addInitScript(() => Object.defineProperty(navigator, 'clipboard', { value: {
+		writeText: () => new Promise<void>((resolve) => addEventListener('test-clipboard-resolve', () => resolve(), { once: true }))
+	} }));
+	const posts = await mock(page);
+	await page.goto(path);
+	await create(page).press('Enter');
+	await expect(link(page)).toBeFocused();
+	const copy = page.getByRole('button', { name: 'Copy link' });
+	await copy.press('Enter');
+	await expect(copy).toBeDisabled();
+	await page.getByRole('button', { name: 'Hide link' }).press('Enter');
+	await expect(link(page)).toHaveCount(0);
+	await expect(create(page)).toBeFocused();
+	await page.evaluate(() => dispatchEvent(new Event('test-clipboard-resolve')));
+	await expect(page.getByRole('main').getByRole('status')).toHaveText('Invite link hidden.');
+	await expect(link(page)).toHaveCount(0);
+	expect(posts).toEqual([{}]);
+});
+
 test('does not show issuance controls without an authorized read', async ({ page }) => {
 	const posts = await mock(page, success, (route) => route.fulfill({ status: 404 }));
 	await page.goto(path);
@@ -111,7 +135,7 @@ test('clears a revealed link on pagehide and restores access with a read only', 
 	expect(posts).toEqual([{}]);
 });
 
-for (const phase of ['before dispatch', 'before response', 'after reveal']) test(`discards authorization changed ${phase}`, async ({ page }) => {
+for (const phase of ['before dispatch', 'before response', 'before response with storage event', 'after reveal']) test(`discards authorization changed ${phase}`, async ({ page }) => {
 	const release = Promise.withResolvers<void>();
 	const posts = await mock(page, async (route) => { await release.promise; await success(route); });
 	await page.goto(path);
@@ -124,13 +148,19 @@ for (const phase of ['before dispatch', 'before response', 'after reveal']) test
 		release.resolve();
 		await expect(link(page)).toBeVisible();
 	}
-	await page.evaluate(({ generation, phase }) => {
+	const delivered = phase.endsWith('storage event');
+	const alert = page.getByRole('alert');
+	await page.evaluate(({ generation, deliver }) => {
 		localStorage.setItem(generation, 'fixture-new-generation');
-		if (phase === 'after reveal') dispatchEvent(new StorageEvent('storage', { key: generation }));
-	}, { generation, phase });
+		if (deliver) {
+			dispatchEvent(new StorageEvent('storage', { key: generation }));
+			dispatchEvent(new StorageEvent('storage', { key: generation }));
+		}
+	}, { generation, deliver: delivered || phase === 'after reveal' });
 	if (phase === 'before dispatch') await create(page).click();
+	if (delivered) await expect(alert).toContainText('Check the invite ledger before trying again');
 	release.resolve();
-	await expect(page.getByRole('alert')).toContainText(phase === 'before response' ? 'An invite may have been created' : 'check admin access');
+	await expect(alert).toContainText(phase.startsWith('before response') ? 'An invite may have been created' : 'check admin access');
 	await expect(create(page)).toHaveCount(0);
 	await expect(link(page)).toHaveCount(0);
 	expect(posts).toEqual(phase === 'before dispatch' ? [] : [{}]);

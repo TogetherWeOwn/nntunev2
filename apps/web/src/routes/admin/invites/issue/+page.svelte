@@ -14,8 +14,9 @@
 	const unconfirmed = 'No link was received. An invite may have been created. Check the invite ledger before trying again.';
 	let owner = $state.raw<Fence>();
 	let request = $state<AbortController>();
+	let writeInFlight = false;
 	let email = $state('');
-	let expiry = $state<number>();
+	let expiry = $state<number | null>();
 	let invite = $state.raw<{ link: string; expires: Date }>();
 	let copying = $state(false);
 	let error = $state('');
@@ -24,9 +25,10 @@
 	let field = $state<HTMLInputElement>();
 	let submitButton = $state<HTMLButtonElement>();
 
-	function clear(message = unavailable) {
+	function clear(message = writeInFlight || error === unconfirmed ? unconfirmed : unavailable) {
 		if (owner && heading?.parentElement?.contains(document.activeElement)) heading.focus();
 		request?.abort();
+		writeInFlight = false;
 		request = owner = undefined;
 		if (field) field.value = '';
 		invite = expiry = undefined;
@@ -44,7 +46,7 @@
 	});
 
 	async function run<T>(send: (signal: AbortSignal) => Promise<T>, apply: (value: T, fence: Fence) => void,
-		fail: (cause: unknown) => void, fallback: string) {
+		fail: (cause: unknown) => void) {
 		const attempt = new AbortController();
 		request = attempt;
 		try {
@@ -55,10 +57,12 @@
 			});
 			const publish = sent && await sent.result;
 			const applied = publish && await fence?.run(() => {
-				if (!attempt.signal.aborted) publish();
+				if (attempt.signal.aborted) return;
+				publish();
+				writeInFlight = false;
 				return true;
 			});
-			if (!applied && !attempt.signal.aborted) clear(sent ? fallback : unavailable);
+			if (!applied && !attempt.signal.aborted) clear();
 		} finally {
 			if (request === attempt) request = undefined;
 		}
@@ -67,7 +71,7 @@
 	function authorize() {
 		clear('');
 		return run((signal) => client.listAdminInvites(null, signal), (_, fence) => { owner = fence; },
-			() => clear(), unavailable);
+			() => clear());
 	}
 
 	async function issue(event: SubmitEvent) {
@@ -80,12 +84,16 @@
 			error = 'Enter a full email address, such as name@example.test.';
 			return;
 		}
-		if (expiry !== undefined && !isInvitePolicyValue('invite_default_expiry_days', expiry)) {
+		const days = expiry ?? undefined;
+		if (days !== undefined && !isInvitePolicyValue('invite_default_expiry_days', days)) {
 			error = `Enter a whole number from ${min} to ${max}, or leave expiry blank.`;
 			return;
 		}
-		const input = { ...(address ? { email: address } : {}), ...(expiry === undefined ? {} : { expires_in_days: expiry }) };
-		await run((signal) => client.issueAdminInvite(input, signal), ({ code, expires_at }) => {
+		const input = { ...(address ? { email: address } : {}), ...(days === undefined ? {} : { expires_in_days: days }) };
+		await run((signal) => {
+			writeInFlight = true;
+			return client.issueAdminInvite(input, signal);
+		}, ({ code, expires_at }) => {
 			const url = new URL('/signup', location.origin);
 			url.hash = new URLSearchParams({ invite: code }).toString();
 			invite = { link: url.href, expires: new Date(expires_at * 1000) };
@@ -94,14 +102,14 @@
 		}, (cause) => {
 			if (cause instanceof ApiError) {
 				if (cause.code === 'reauth_required') return clear('Sign out and sign in again, then reopen this page to create an invite.');
-				if ([401, 403, 404].includes(cause.status)) return clear();
+				if ([401, 403, 404].includes(cause.status)) return clear(unavailable);
 				if (cause.status === 422) {
 					error = 'The server rejected the invite. Check the email and expiry.';
 					return;
 				}
 			}
 			clear(unconfirmed);
-		}, unconfirmed);
+		});
 		await tick();
 		field?.focus();
 	}
@@ -110,6 +118,7 @@
 		if (!owner?.isCurrent()) return clear();
 		if (field) field.value = '';
 		invite = undefined;
+		copying = false;
 		error = '';
 		notice = message;
 		await tick();
@@ -132,12 +141,12 @@
 			field?.focus();
 			field?.select();
 		} finally {
-			if (invite === current || !invite) copying = false;
+			if (invite === current) copying = false;
 		}
 	}
 </script>
 
-<svelte:window onpagehide={() => clear()} onpageshow={({ persisted }) => { if (persisted) void authorize(); }}
+<svelte:window onpagehide={() => clear()} onpageshow={({ persisted }) => { if (persisted && error !== unconfirmed) void authorize(); }}
 	onstorage={({ key }) => { if (key === LIBRARY_AUTH_TRANSITION_KEY) clear(); }} />
 <svelte:head><title>NNTune — Create an invite</title></svelte:head>
 
@@ -153,7 +162,7 @@
 			<input id="invite-link" bind:this={field} value={invite.link} readonly autocomplete="off" aria-describedby="link-help" />
 			<div class="actions">
 				<button class="nt-button" type="button" onclick={copy} disabled={copying}>Copy link</button>
-				<button class="nt-button nt-button--ghost" type="button" onclick={() => hide('Invite link hidden.')} disabled={copying}>Hide link</button>
+				<button class="nt-button nt-button--ghost" type="button" onclick={() => hide('Invite link hidden.')}>Hide link</button>
 			</div>
 		</section>
 	{:else if owner}
