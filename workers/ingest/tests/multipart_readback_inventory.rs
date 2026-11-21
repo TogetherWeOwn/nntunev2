@@ -366,6 +366,7 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         append_inventory(&mut tx, &intent, SCOPE, &verified).await,
         Err(Indeterminate)
     );
+    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_none());
     tx.rollback().await.unwrap();
 
     let mut tx = writer.transaction().await.unwrap();
