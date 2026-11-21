@@ -29,7 +29,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	);
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
 	const lifecycle = parsed.statements.filter((node) => ts.isExpressionStatement(node) &&
-		ts.isCallExpression(node.expression) && ['$effect.pre', 'onMount'].includes(node.expression.expression.getText(parsed)));
+		ts.isCallExpression(node.expression) && (node.expression.expression.getText(parsed) === 'onMount' ||
+			node.expression.getText(parsed).startsWith('$effect.pre(() => () =>')));
 	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'queueShareOutcome', 'queueShare', 'disposeRoute']);
 	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
 		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));

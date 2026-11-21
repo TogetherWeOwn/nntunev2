@@ -7,10 +7,6 @@ import type { LibraryRefreshUpdate } from './refresh.js';
 import { verifyLibrarySession } from './session-verification.js';
 import { createTrackLikeControls, type TrackLikeOwner } from './track-like-controls.js';
 
-function refused(error: unknown) {
-	return error instanceof ApiError && [401, 403, 412].includes(error.status);
-}
-
 /** One owner per verified Library listing, shared by Tracks and Queue. */
 export function createLibraryTrackLikes() {
 	const retry = 'Account likes are unavailable. Refresh the library to try again.';
@@ -35,11 +31,6 @@ export function createLibraryTrackLikes() {
 		owner = undefined;
 	}
 
-	function clear() {
-		retire();
-		feedback = '';
-	}
-
 	function invalidate() {
 		if (!active && !feedback) return;
 		retire();
@@ -59,14 +50,10 @@ export function createLibraryTrackLikes() {
 			// Retire the old owner immediately, but let its already-dispatched
 			// writes settle before reading the same account again.
 			await Promise.all(writes.get(binding) ?? []);
-			const read = await guarded(() => ({ response: loadLikes(readClient).then(
-				(value) => ({ value }), (error: unknown) => ({ error })
-			) }));
+			const read = await guarded(() => ({ response: loadLikes(readClient).catch(() => undefined) }));
 			if (!read) return;
-			const result = await read.response;
-			if ('error' in result) throw result.error;
-			const list = result.value;
-			if (list.binding !== binding) throw new Error('Likes session changed');
+			const list = await read.response;
+			if (list?.binding !== binding) throw new Error('Likes session could not be verified');
 			const check = await guarded(() => ({ response: verifyLibrarySession(binding, signal).catch(() => false) }));
 			if (!check) return;
 			if (!await check.response) throw new Error('Likes session could not be verified');
@@ -85,8 +72,8 @@ export function createLibraryTrackLikes() {
 						feedback = '';
 					},
 					failed: (_id, error) => {
-						if (refused(error)) owner = undefined;
-						feedback = refused(error) ? retry : 'Could not confirm that Like change. Try again or refresh the library.';
+						if (error instanceof ApiError && [401, 403, 412].includes(error.status)) invalidate();
+						else feedback = 'Could not confirm that Like change. Try again or refresh the library.';
 					}
 				};
 				feedback = '';
@@ -96,7 +83,7 @@ export function createLibraryTrackLikes() {
 		}
 	}
 
-	return { publish, clear, invalidate, retire, get feedback() { return feedback; }, controls(id: string) {
+	return { publish, clear: () => { retire(); feedback = ''; }, invalidate, retire, get feedback() { return feedback; }, controls(id: string) {
 		const target = owner?.targets.get(id);
 		return target ? controls(target) : undefined;
 	} };

@@ -1,6 +1,6 @@
-SELECT page.*, (recording_mbid <> lower(recording_mbid) AND recording_mbid IN (
-    SELECT job_id FROM library WHERE user_id = $1 OR user_id IS NULL
-)) IS TRUE AS recording_job_match
+SELECT page.*, EXISTS (
+    SELECT 1 FROM library WHERE job_id = page.recording_mbid AND (user_id = $1 OR user_id IS NULL)
+) AS recording_job_match
 FROM (
 SELECT l.job_id, l.release_mbid, l.recording_mbids, u.recording_mbid, u.recording_ord,
        (l.release_mbid IS NULL) AS matched_last, l.idempotency_key

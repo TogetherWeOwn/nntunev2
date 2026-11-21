@@ -23,56 +23,59 @@ async function seedLibrary(page: Page, ids: string[] = [], verified = true): Pro
 	await page.route('**/v1/me/likes/session', (route) => route.fulfill({ json: likes() }));
 }
 
-test('Tracks and Queue share a session-bound Like and Unlike across Refresh', async ({ page }) => {
-	await seedLibrary(page);
-	const recording = 'abcd0000-0000-4000-8000-000000000001';
-	await page.route('**/api/library', (route) => route.fulfill({
-		headers: { 'x-nntune-session-binding': BINDING },
-		json: [{ id: recording.toUpperCase(), like_target_id: recording, title: 'Coral Horizon' }]
-	}));
-	let saved = false;
-	const reply = Promise.withResolvers<void>();
-	const methods: string[] = [];
-	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes(saved ? [{ ...likedTrack, target_id: recording }] : []) }));
-	await page.route((url) => url.pathname.toLowerCase() === `/v1/me/likes/track/${recording}`, async (route) => {
-		const request = route.request();
-		methods.push(request.method());
-		expect(request.headers()['x-nntune-session-binding']).toBe(BINDING);
-		if (request.method() === 'PUT') {
-			await reply.promise;
-			saved = true;
-			await route.fulfill({ json: { target_id: recording, liked_at: likedTrack.created_at } });
-		} else {
-			expect(request.method()).toBe('DELETE');
-			saved = false;
-			await route.fulfill({ json: { target_id: recording, liked: false } });
-		}
+for (const exactJob of [false, true]) {
+	test(`Tracks and Queue share a session-bound Like across Refresh (${exactJob ? 'exact job' : 'recording'})`, async ({ page }) => {
+		await seedLibrary(page);
+		const recording = 'abcd0000-0000-4000-8000-000000000001';
+		const id = recording.toUpperCase(), target = exactJob ? id : recording;
+		await page.route('**/api/library', (route) => route.fulfill({
+			headers: { 'x-nntune-session-binding': BINDING },
+			json: [{ id, like_target_id: target, title: 'Coral Horizon' },
+				{ id: 'opaque-invalid', like_target_id: null, title: 'Legacy Track' }]
+		}));
+		let saved = false;
+		const reply = Promise.withResolvers<void>();
+		const methods: string[] = [];
+		await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes(saved ? [{ ...likedTrack, target_id: target }] : []) }));
+		await page.route((url) => url.pathname === `/v1/me/likes/track/${target}`, async (route) => {
+			const request = route.request();
+			methods.push(request.method());
+			expect(request.headers()['x-nntune-session-binding']).toBe(BINDING);
+			const putting = request.method() === 'PUT';
+			if (putting) await reply.promise;
+			saved = putting;
+			await route.fulfill({ json: { target_id: target, ...(saved ? { liked_at: likedTrack.created_at } : { liked: false }) } });
+		});
+		await page.goto('/library');
+		const button = { name: 'Like Coral Horizon', exact: true };
+		const trackRow = page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' });
+		const trackLike = trackRow.getByRole('button', button);
+		await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
+		const legacy = page.getByTestId('library-item').filter({ hasText: 'Legacy Track' });
+		await expect(legacy).toBeVisible();
+		await expect(legacy.getByRole('button', { name: 'Like Legacy Track' })).toHaveCount(0);
+		await trackRow.getByRole('checkbox').check();
+		await page.getByRole('button', { name: 'Append selected', exact: true }).click();
+		const queueLike = page.getByTestId('queue-item').getByRole('button', button);
+		await trackLike.click();
+		await expect(queueLike).toHaveAttribute('aria-disabled', 'true');
+		await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
+		reply.resolve();
+		await expect(trackLike).toHaveAttribute('aria-pressed', 'true');
+		await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
+		await expect(trackRow.getByRole('button', { name: 'Star Coral Horizon', exact: true })).toHaveAttribute('aria-pressed', 'false');
+		const reread = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/me/likes');
+		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+		await reread;
+		await expect(trackLike).toHaveAttribute('aria-pressed', 'true');
+		await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
+		await queueLike.click();
+		await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
+		await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
+		expect(methods).toEqual(['PUT', 'DELETE']);
+		await expect(page.getByTestId('usage-meter')).toHaveCount(1);
 	});
-	await page.goto('/library');
-	const button = { name: 'Like Coral Horizon', exact: true };
-	const trackRow = page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' });
-	const trackLike = trackRow.getByRole('button', button);
-	await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
-	await trackRow.getByRole('checkbox').check();
-	await page.getByRole('button', { name: 'Append selected', exact: true }).click();
-	const queueLike = page.getByTestId('queue-item').getByRole('button', button);
-	await trackLike.click();
-	await expect(queueLike).toHaveAttribute('aria-disabled', 'true');
-	await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
-	reply.resolve();
-	await expect(trackLike).toHaveAttribute('aria-pressed', 'true');
-	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
-	await expect(trackRow.getByRole('button', { name: 'Star Coral Horizon', exact: true })).toHaveAttribute('aria-pressed', 'false');
-	const reread = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/me/likes');
-	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-	await reread;
-	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
-	await queueLike.click();
-	await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
-	await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
-	expect(methods).toEqual(['PUT', 'DELETE']);
-	await expect(page.getByTestId('usage-meter')).toHaveCount(1);
-});
+}
 
 for (const cause of ['refused Like', 'failed sign-out']) {
 	test(`Albums can recover from a ${cause} without replaying a write`, async ({ page }) => {

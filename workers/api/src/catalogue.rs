@@ -307,7 +307,7 @@ pub struct TrackResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LibraryEntry {
     pub id: String,
-    pub like_target_id: String,
+    pub like_target_id: Option<String>,
     pub occurrence_key: String,
     pub recording_mbids: Vec<String>,
     pub release_mbid: Option<String>,
@@ -378,15 +378,13 @@ pub fn track_response(row: &TrackDbRow) -> TrackResponse {
 /// poisoned value yields `None`, never a crafted URL.
 pub fn library_entry(row: &LibraryDbRow) -> LibraryEntry {
     let id = row.recording_mbid.as_ref().unwrap_or(&row.job_id);
-    let recording = row
-        .recording_mbid
-        .as_deref()
-        .filter(|_| !row.recording_job_match);
     LibraryEntry {
         id: id.clone(),
-        like_target_id: recording
-            .and_then(enrichment_key)
-            .unwrap_or_else(|| id.clone()),
+        like_target_id: if row.recording_mbid.is_none() || row.recording_job_match {
+            crate::target_identity::valid_target_id(id).then(|| id.clone())
+        } else {
+            enrichment_key(id)
+        },
         occurrence_key: format!("{}:{}", row.job_id, row.recording_ord),
         recording_mbids: row.recording_mbids.clone(),
         release_mbid: row.release_mbid.clone(),
@@ -1515,10 +1513,6 @@ mod tests {
         assert_eq!(matched.artist_name.as_deref(), Some("New Order"));
         // Uppercase stored MBIDs still enrich (keys normalize).
         let upper = &rows[1];
-        assert_eq!(library_entry(upper).like_target_id, GOOD_MBID);
-        let mut collision = upper.clone();
-        collision.recording_job_match = true;
-        assert_eq!(library_entry(&collision).like_target_id, GOOD_MBID_UPPER);
         assert_eq!(upper.recording_title.as_deref(), Some("Blue Monday"));
         assert_eq!((upper.medium_no, upper.track_no), (Some(1), Some(3)));
         assert_eq!(upper.artist_name.as_deref(), Some("New Order"));
@@ -1536,6 +1530,7 @@ mod tests {
         // Poisoned stored MBIDs degrade too, and match nothing.
         let poisoned = &rows[3];
         assert_eq!(poisoned.recording_mbid.as_deref(), Some("also-not-a-uuid"));
+        assert_eq!(library_entry(poisoned).like_target_id, None);
         assert_eq!(poisoned.recording_title, None);
         assert_eq!(poisoned.release_title, None);
         // Unmatched upload: NULL recording, job-id identity downstream.

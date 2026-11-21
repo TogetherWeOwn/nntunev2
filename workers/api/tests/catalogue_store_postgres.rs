@@ -814,17 +814,27 @@ async fn member_target_queries_isolate_caller_and_kind() {
         );
         assert_eq!(attempts.get(), 0);
     }
+    let app = seeded().await;
+    for owner in ["u1", "other"] {
+        let page = app
+            .query(
+                nntune_api::catalogue::library_page_statement(),
+                &[&owner, &50_i64],
+            )
+            .await
+            .unwrap();
+        let shared = page
+            .iter()
+            .find(|row| row.get::<_, &str>("job_id") == "Job_Shared")
+            .unwrap();
+        assert_eq!(shared.get::<_, bool>("recording_job_match"), owner == "u1");
+    }
     let store = catalogue_store_for_postgres_test(
         seeded().await,
         false,
         Err(StoreError),
         Rc::new(Cell::new(0)),
     );
-    for (owner, expected) in [("u1", true), ("other", false)] {
-        let rows = store.catalogue_library(owner).await.unwrap();
-        let shared = rows.iter().find(|row| row.job_id == "Job_Shared").unwrap();
-        assert_eq!(shared.recording_job_match, expected);
-    }
     assert!(
         !store
             .catalogue_member_target("u1' OR true --", TargetKind::Track, "Job_Own")

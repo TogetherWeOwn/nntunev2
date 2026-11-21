@@ -32,8 +32,9 @@ function record(value: unknown): Record<string, unknown> {
 
 /** Only the Library server knows whether an uppercase MBID is also an exact job ID. */
 export function trackLikeTarget(id: string, resolved: unknown): string | undefined {
+	if (!isTrackId(id)) return;
 	const lower = id.toLowerCase();
-	if (id === lower || !RELEASE_ID.test(lower)) return id;
+	if (id === lower || !RELEASE_ID.test(lower)) return resolved === undefined || resolved === id ? id : undefined;
 	return resolved === id || resolved === lower ? resolved : undefined;
 }
 
