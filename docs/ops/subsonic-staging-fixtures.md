@@ -100,6 +100,56 @@ mode), without extending the five-minute job deadline or holding up restore.
 This policy has no collectors or live entrypoint; it does not prove provider
 coverage or cleanup.
 
+### Version-fenced restore rehearsal (offline)
+
+The rehearsal pins a known-off deployment and checks that the serving version
+agrees with the deployment version. On cleanup it cancels clients, then attempts
+restore only for the experiment's exact deployment identity. The simulated write
+compares that identity atomically; even a newer deployment of the same version
+must survive. A separately verified newer off deployment is not a restoration
+of the pinned baseline.
+
+Off requires disabled measurement, no lease, and no measurement DB binding.
+The independent zero DB count must follow the off readback and the deployment
+must still match after that sample. Missing proof leaves cleanup unverified.
+
+This is not a Cloudflare adapter. Ordinary staging API deployment and a future
+live executor must share a GitHub concurrency group across activation, load,
+and cleanup. That group does not fence dashboard or API writes. Cloudflare's
+[deployment create API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
+does not expose an expected-current deployment precondition. A read followed by
+an unconditional rollback is not safe; do not arm or attempt that write without
+a fence that covers all writers.
+
+### Actions step finalization (synthetic only)
+
+The `public-text` CI job arms a synthetic deployment and starts a simulated
+client in two disposable cases: a failing step and an Actions step timeout.
+The same-job `always()` finalizer requires the raw failure outcome and a
+fixture receipt (intentional exit or native interrupt), runs the restore
+rehearsal, and checks that the synthetic deployment is off and drained. The
+job uses no staging credentials, provider calls or live traffic.
+
+The same CI job also kills a synthetic producer with `SIGKILL` after it writes
+its active state, before it can write a stop receipt. A fresh process reads that
+state and must observe synthetic off readback and a zero backend count after
+client cancellation. The backend remains busy through the first sample, so
+clearing local clients alone cannot pass the rehearsal.
+
+Neither rehearsal cancels the whole workflow or loses its runner. The
+synthetic state stays on the same filesystem; a live recovery path would need
+state available after runner loss and a restore fence that protects newer
+staging deployments. UTC expiry does not establish live restore or drain.
+
+### Independent UTC expiry (disposable release Fetch)
+
+The disposable release Fetch test checks the Worker's UTC clock:
+measurement remains enabled and the binding and exact SHA remain configured,
+but a valid lease with a past expiry must reach the inert staging response
+without opening the measurement socket. This checks expiry without running
+cleanup or injecting a runner clock. Expiry stops admission; it does not remove
+the lease or binding, restore a deployment, or prove DB drain.
+
 ### Charge triplet
 
 Use the same `POST /rest/getArtists` with form-encoded `f=json` and credentials

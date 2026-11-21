@@ -94,7 +94,7 @@ fn remote(id: &str, item: &str, status: &str, invoices: &[(&str, &str)]) -> Remo
             serde_json::from_value(json!({
                 "id": invoice, "customer": customer, "subscription": id, "status": "paid",
                 "currency": currency, "amount_paid": 800, "status_transitions": { "paid_at": NOW + order as i64 },
-                "lines": { "data": [{ "id": "il_exact_target", "amount": 800, "price": PRICE,
+                "lines": { "has_more": false, "data": [{ "id": "il_exact_target", "amount": 800, "price": PRICE,
                     "period": { "start": NOW - 1, "end": END } }] }
             })).expect("fixed invoice fixture")
         }).collect(),
@@ -403,7 +403,176 @@ pub(super) async fn check() -> Result<(), &'static str> {
     {
         return Err("fresh exact-target retry did not recover state and history");
     }
-    check_existing_target_suppression(&store).await
+    check_existing_target_suppression(&store).await?;
+    check_terminal_provenance(&store).await
+}
+
+async fn check_terminal_provenance(store: &PgStore) -> Result<(), &'static str> {
+    const OLD_ANCHOR: &str = "in_worker_terminal_recovery";
+    const NEW_ANCHOR: &str = "in_worker_terminal_new_anchor";
+    const NEW_PRICE: &str = "price_worker_terminal_relabel";
+    const OLD_ITEM: &str = "si_worker_terminal";
+    const NEW_ITEM: &str = "si_worker_terminal_relabel";
+
+    let mut listing = remote(TERMINAL, OLD_ITEM, "active", &[(OLD_ANCHOR, "usd")]);
+    let mut local = input(state(TERMINAL, None).await?.row);
+    local.bindings.push(PriceBinding {
+        price_id: NEW_PRICE.into(),
+        plan_id: "max".into(),
+        selectable: true,
+        livemode: false,
+    });
+    for (status, read_plan, read_anchor, plan) in [
+        ("canceled", "plus", OLD_ANCHOR, "plus"),
+        ("incomplete_expired", "plus", NEW_ANCHOR, "max"),
+    ] {
+        let mut terminal = listing.clone();
+        terminal.subscription.status = status.into();
+        terminal.subscription.current_period_end = Some(END - 1);
+        terminal.subscription.cancel_at_period_end = false;
+        let mut delayed = reconcile_exact_target(TERMINAL, local.clone(), &terminal, NOW)
+            .ok_or("delayed terminal fold missing")?;
+        if delayed.explicit_stale || delayed.fail_closed.is_some() || !delayed.history.is_empty() {
+            return Err("terminal fold was not fresh for its original read");
+        }
+        // Terminal folds emit no history. Inject independently confirmed, new
+        // history to prove that a refused transaction does not append it.
+        delayed.history = fold(
+            TERMINAL,
+            None,
+            &remote(
+                TERMINAL,
+                OLD_ITEM,
+                "active",
+                &[("in_worker_refused_terminal", "usd")],
+            ),
+        )?
+        .history;
+        if plan == "plus" {
+            listing = remote(
+                TERMINAL,
+                OLD_ITEM,
+                "active",
+                &[(OLD_ANCHOR, "usd"), (NEW_ANCHOR, "usd")],
+            );
+        } else {
+            // Same shared anchor and paid end, with a qualifying line for the new price.
+            let item = &mut listing.subscription.items.as_mut().unwrap().data[0];
+            item.id = NEW_ITEM.into();
+            item.price = Some(NEW_PRICE.into());
+            let lines = &mut listing.invoices[1].lines.as_mut().unwrap().data;
+            let mut relabel_line = lines[0].clone();
+            relabel_line.id = "il_terminal_relabel".into();
+            relabel_line.price = Some(NEW_PRICE.into());
+            lines.push(relabel_line);
+        }
+        listing.subscription.cancel_at_period_end = true;
+        let newer = reconcile_exact_target(TERMINAL, local.clone(), &listing, NOW)
+            .ok_or("newer active fold missing")?;
+        store
+            .store_reconcile_owned(USER.into(), newer, ReconcileProbe::None)
+            .await
+            .map_err(|_| "newer equal-end active fold was refused")?;
+        let committed = state(TERMINAL, None).await?;
+        let row = committed.row.as_ref().ok_or("newer row missing")?;
+        if row.plan_id != plan
+            || row.paid_invoice_id.as_deref() != Some(NEW_ANCHOR)
+            || row.paid_through_unix != Some(END)
+            || delayed.row.paid_through_unix != Some(END)
+            || delayed.read_plan.as_deref() != Some(read_plan)
+            || delayed.read_anchor.as_deref() != Some(read_anchor)
+        {
+            return Err("fixture did not isolate one changed proof field at equal paid end");
+        }
+        let refused = std::rc::Rc::new(std::cell::Cell::new(false));
+        if store
+            .store_reconcile_owned(
+                USER.into(),
+                delayed,
+                ReconcileProbe::ObserveTerminalProvenanceRefusal(refused.clone()),
+            )
+            .await
+            .is_ok()
+            || !refused.get()
+            || state(TERMINAL, None).await? != committed
+        {
+            return Err("changed terminal proof did not refuse without row/history writes");
+        }
+        if !entitled_at(END - 1).await? || entitled_at(END).await? {
+            return Err("scheduled cancellation did not preserve the exact paid-end cutoff");
+        }
+        local.live = committed.row;
+    }
+
+    listing.subscription.cancel_at_period_end = false;
+    let uncancel = reconcile_exact_target(TERMINAL, local.clone(), &listing, NOW)
+        .ok_or("uncancel fold missing")?;
+    store
+        .store_reconcile_owned(USER.into(), uncancel, ReconcileProbe::None)
+        .await
+        .map_err(|_| "same-proof uncancel was refused")?;
+    if !entitled_at(END).await? {
+        return Err("fresh uncancel did not restore the ordinary settlement allowance");
+    }
+
+    let before = state(TERMINAL, None).await?;
+    local.live = before.row.clone();
+    listing.subscription.status = "incomplete_expired".into();
+    let fresh = reconcile_exact_target(TERMINAL, local, &listing, NOW)
+        .ok_or("fresh terminal refold missing")?;
+    if fresh.explicit_stale
+        || fresh.fail_closed.is_some()
+        || fresh.read_plan.as_deref() != Some("max")
+        || fresh.read_anchor.as_deref() != Some(NEW_ANCHOR)
+    {
+        return Err("fresh terminal refold lacked matching provenance");
+    }
+    store
+        .store_reconcile_owned(USER.into(), fresh, ReconcileProbe::None)
+        .await
+        .map_err(|_| "fresh terminal refold was refused")?;
+    let after = state(TERMINAL, None).await?;
+    let mut expected = before.row.ok_or("active row missing before fresh refold")?;
+    expected.status = "incomplete_expired".into();
+    if after.row != Some(expected)
+        || after.history != before.history
+        || entitled_at(END - 1).await?
+    {
+        return Err("fresh terminal refold failed to release entitlement or changed paid history");
+    }
+    Ok(())
+}
+
+async fn entitled_at(now: i64) -> Result<bool, &'static str> {
+    use crate::billing::{
+        resolve_effective_plan, subscription_live_select_statement, SubscriptionView,
+    };
+    billing_budget::with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |client| {
+            Box::pin(async move {
+                let row = client
+                    .query_opt(subscription_live_select_statement(), &[&USER])
+                    .await
+                    .map_err(|_| StoreError)?;
+                let view = row.as_ref().map(|row| SubscriptionView {
+                    plan_id: row.get("plan_id"),
+                    status: row.get("status"),
+                    cancel_at_period_end: row.get("cancel_at_period_end"),
+                    paid_through_at_unix: row.get("paid_through_at_unix"),
+                    grace_until_unix: row.get("grace_until_unix"),
+                    current_period_end_unix: row.get("current_period_end_unix"),
+                });
+                Ok(resolve_effective_plan(view, now).entitled)
+            })
+        },
+        |_| {},
+    )
+    .await
+    .map_err(|_| "live entitlement fixture query failed")
 }
 
 async fn check_existing_target_suppression(store: &PgStore) -> Result<(), &'static str> {

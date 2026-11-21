@@ -181,7 +181,9 @@ def exercise_restricted_history(base, observe):
         snapshot() == [[], [], 0], "denied history write left committed billing rows"
     )
 
-    observe("GRANT INSERT ON public.paid_invoice_history TO billing_history_fixture")
+    observe("""GRANT INSERT, UPDATE (covered_periods),
+        SELECT (stripe_invoice_id, user_id, stripe_subscription_id, covered_periods, amount_cents, currency)
+        ON public.paid_invoice_history TO billing_history_fixture""")
     status, _, body = routing.http("POST", base + "/billing-restricted-history-proof")
     routing.check(status == 200 and body == "billing-restricted-history-ok", body)
     committed = snapshot()
@@ -392,6 +394,11 @@ def main():
                     status, _, body = routing.http("POST", url)
                     routing.check(status == 200 and body == "billing-deadline-ok", body)
                     print("PASS: billing deadline after writes rolled back", flush=True)
+                    print(
+                        "PASS: dormant billing Store refused changed equal-end terminal proof; "
+                        "fresh refold, uncancel and paid-end cutoff held",
+                        flush=True,
+                    )
                     print(
                         "PASS: PostgreSQL watchdog rolled back abandoned billing writes",
                         flush=True,
