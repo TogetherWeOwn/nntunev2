@@ -5661,6 +5661,7 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| failed())?;
                 for history in &outcome.history {
+                    let (starts, ends) = history.coverage_bounds();
                     transaction
                         .query_typed(
                             crate::billing_reconcile::insert_paid_invoice_history_statement(),
@@ -5674,6 +5675,8 @@ impl Store for PgStore {
                                 (&history.amount_cents, Type::INT8),
                                 (&history.currency, Type::TEXT),
                                 (&history.paid_at_unix, Type::INT8),
+                                (&starts, Type::INT8_ARRAY),
+                                (&ends, Type::INT8_ARRAY),
                             ],
                         )
                         .await

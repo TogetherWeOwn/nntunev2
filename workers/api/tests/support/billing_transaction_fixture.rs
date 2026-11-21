@@ -184,11 +184,14 @@ pub async fn run(
                 Type::INT8,
                 Type::TEXT,
                 Type::INT8,
+                Type::INT8_ARRAY,
+                Type::INT8_ARRAY,
             ],
         )
         .await
         .map_err(e)?;
     for h in &o.history {
+        let (starts, ends) = h.coverage_bounds();
         tx.execute(
             &history,
             &[
@@ -201,6 +204,8 @@ pub async fn run(
                 &h.amount_cents,
                 &h.currency,
                 &h.paid_at_unix,
+                &starts,
+                &ends,
             ],
         )
         .await

@@ -67,10 +67,13 @@ pub(super) async fn try_put(
                 Type::INT8,
                 Type::TEXT,
                 Type::INT8,
+                Type::INT8_ARRAY,
+                Type::INT8_ARRAY,
             ],
         )
         .await?;
     for h in &outcome.history {
+        let (starts, ends) = h.coverage_bounds();
         tx.execute(
             &history,
             &[
@@ -83,6 +86,8 @@ pub(super) async fn try_put(
                 &h.amount_cents,
                 &h.currency,
                 &h.paid_at_unix,
+                &starts,
+                &ends,
             ],
         )
         .await?;

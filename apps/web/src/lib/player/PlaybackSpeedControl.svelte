@@ -9,13 +9,8 @@
 
 <div>
 	<label for="playback-speed">Playback speed</label>
-	<select
-		id="playback-speed"
-		data-testid="playback-speed"
-		value={value ?? ''}
-		disabled={value === null}
-		onchange={(event) => onchange(event.currentTarget)}
-	>
+	<select id="playback-speed" data-testid="playback-speed" value={value ?? ''} disabled={value === null}
+		onchange={(event) => onchange(event.currentTarget)}>
 		{#if value === null}
 			<option value="">Unavailable</option>
 		{:else if !presets.includes(value)}
@@ -29,7 +24,5 @@
 </div>
 
 <style>
-	p:empty {
-		margin: 0;
-	}
+	p:empty { margin: 0; }
 </style>

@@ -64,17 +64,12 @@ test('a throwing restore reports the observed rate without replacing the stored 
 	expect(get(speed.state)).toEqual({ rate: 1.3, feedback: 'Speed 2x not applied — still 1.3x' });
 	expect(storage.setItem).toHaveBeenCalledTimes(1);
 	retire();
-	const replacement = { audio: { playbackRate: 1 }, matches: () => true };
-	Object.defineProperty(replacement.audio, 'playbackRate', {
-		get: () => 1, set: () => { throw new Error('refused'); }
-	});
-	const restored = createLivePlaybackSpeed(() => replacement);
-	restored.restore(storage);
-	expect(get(restored.state)).toEqual({ rate: 1, feedback: 'Speed 1.3x not applied — still 1x' });
-	expect(storage.setItem).toHaveBeenCalledTimes(1);
-	expect(storage.getItem()).toBe('1.3');
 	speed.observe(current);
 	expect(get(speed.state).rate).toBeNull();
+	attach(() => { throw new Error('refused'); });
+	expect(get(speed.state)).toEqual({ rate: 1, feedback: 'Speed 1.3x not applied — still 1x' });
+	expect(storage.setItem).toHaveBeenCalledTimes(1);
+	expect(storage.getItem()).toBe('1.3');
 });
 
 test.each([1, 1.25])('a source restoring to %sx reports the mismatch and persists verified readback', (rate) => {

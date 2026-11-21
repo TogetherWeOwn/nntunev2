@@ -396,9 +396,7 @@ test('[LIBREP-02] Off advances mid-queue from zero with one announcement and no 
 	const guards = await snapshotGuards(page);
 	const before = await mediaCalls(page);
 	// Change the outgoing readback without delivering a ratechange event.
-	await page.getByTestId('audio-player').evaluate((el) => {
-		Object.defineProperty(el, 'playbackRate', { value: 1.5 });
-	});
+	await page.getByTestId('audio-player').evaluate((el) => void Object.defineProperty(el, 'playbackRate', { value: 1.5 }));
 	await fireEnded(page);
 	await expect(
 		page.getByTestId('now-playing'),
