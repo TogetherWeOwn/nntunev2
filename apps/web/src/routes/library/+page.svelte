@@ -44,7 +44,6 @@
 	import { filterLibraryItems, type FindScope } from '#lib/library/filter.js';
 	import { groupLibraryItems } from '#lib/library/group.js';
 	import { libraryTabTitle } from '#lib/library/tab-title.js';
-	import { queuedTrackFor } from '#lib/library/queueTrack.js';
 	import { resolveStreamUrl } from '#lib/library/stream-url.js';
 	import {
 		appendResultLabel,
@@ -480,6 +479,20 @@
 			knownIds.add(track.id);
 			return true;
 		});
+	}
+
+	function queuedTrackFor(item: LibraryItem): Track {
+		// Library display fields only: the bulk append and the favorites
+		// export snapshot never carry a stream URL.
+		const album = typeof item.release === 'string' ? item.release.trim() : '';
+		return {
+			id: item.id,
+			title: displayTitle(item),
+			...(typeof item.title !== 'string' || !item.title.trim() ? { titleIsFallback: true } : {}),
+			artist: displayArtist(item) ?? '',
+			...(album ? { album } : {}),
+			streamUrl: ''
+		};
 	}
 
 	// The play path carries the item's stream URL like row selection does.

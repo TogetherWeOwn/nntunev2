@@ -9,7 +9,7 @@
  */
 
 import type { LibraryItem } from './cache.js';
-import { queuedTrackFor } from './queueTrack.js';
+import { displayArtist, displayTitle } from './order.js';
 import { addTrack, type QueueState } from '../player/queue.js';
 
 export interface SelectionAppendResult {
@@ -174,7 +174,7 @@ export function hiddenSelectedCount(
  * through the existing queue dedupe semantics (first loaded occurrence
  * wins; already-queued IDs are skipped, never duplicated). Missing IDs
  * are ignored — neither added nor counted as skipped. New tracks carry
- * `{ id, title, artist, streamUrl: '' }` (the metadata-only contract).
+ * display metadata (including a known album) and an empty stream URL.
  * Existing entries, order and current track are preserved; an empty queue
  * selects its first added ID under current queue semantics. Returns
  * `{ queue, added, skipped }`; when `added` is 0 the same queue
@@ -203,7 +203,15 @@ export function appendSelection(
 			skipped += 1;
 			continue;
 		}
-		next = addTrack(next, queuedTrackFor(item));
+		const album = typeof item.release === 'string' ? item.release.trim() : '';
+		next = addTrack(next, {
+			id: item.id,
+			title: displayTitle(item),
+			...(typeof item.title !== 'string' || !item.title.trim() ? { titleIsFallback: true } : {}),
+			artist: displayArtist(item) ?? '',
+			...(album ? { album } : {}),
+			streamUrl: ''
+		});
 		added += 1;
 	}
 	return { queue: next, added, skipped };
