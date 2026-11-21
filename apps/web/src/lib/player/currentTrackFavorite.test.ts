@@ -45,18 +45,27 @@ test('rejects a stale selection even after a round trip back to the same track',
 	expect(favorite.feedback(view())).toBeNull();
 });
 
-test('a refused owner cannot write or announce, and replacing it invalidates old intents', () => {
-	const { favorite, view, write, refuse, dispose } = setup();
+test('an owner that refuses membership cannot write or announce', () => {
+	const { favorite, view, write, refuse } = setup();
 	const before = view();
 	refuse();
 	favorite.activate(before);
-	expect(view()).toBeNull();
 	expect(write).not.toHaveBeenCalled();
-	const replacement = vi.fn(() => null);
-	favorite.bind({ read: () => [], write: replacement });
+	expect(favorite.feedback(view())).toBeNull();
+});
+
+test('disposing the live owner prevents replay before and after replacement', () => {
+	const { favorite, view, write, dispose } = setup();
+	const before = view();
 	dispose();
 	favorite.activate(before);
+	expect([view(), favorite.feedback(view())]).toEqual([null, null]);
+	expect(write).not.toHaveBeenCalled();
+	const replacement = vi.fn(() => null);
+	favorite.bind({ read: () => before.membership, write: replacement });
+	favorite.activate(before);
 	expect(replacement).not.toHaveBeenCalled();
+	expect(favorite.feedback(view())).toBeNull();
 });
 
 test('an auth purge retires both feedback and the ability to replay an earlier intent', () => {

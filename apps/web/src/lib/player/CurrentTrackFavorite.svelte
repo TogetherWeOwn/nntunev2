@@ -10,14 +10,26 @@
 	const target = $derived(currentFavorite.view(snapshot));
 	const feedback = $derived(currentFavorite.feedback(target));
 
-	// Keep the intent paired with what's rendered, not with a lazy read of
-	// the latest selection during a click dispatched before the DOM updates.
+	// Pin the rendered intent at click entry; another handler can flush a
+	// selection or membership change before the event reaches the button.
 	const activateRendered: Action<HTMLButtonElement, NonNullable<typeof target>> = (button, rendered) => {
-		const click = () => currentFavorite.activate(rendered);
+		const intents = new WeakMap<Event, typeof rendered>();
+		const capture = (event: Event) => {
+			if (event.composedPath().includes(button)) intents.set(event, rendered);
+		};
+		const click = (event: Event) => {
+			const intent = intents.get(event);
+			intents.delete(event);
+			if (intent && !event.defaultPrevented) currentFavorite.activate(intent);
+		};
+		window.addEventListener('click', capture, true);
 		button.addEventListener('click', click);
 		return {
 			update(next) { rendered = next; },
-			destroy() { button.removeEventListener('click', click); }
+			destroy() {
+				window.removeEventListener('click', capture, true);
+				button.removeEventListener('click', click);
+			}
 		};
 	};
 </script>
@@ -28,7 +40,7 @@
 		<span aria-hidden="true">{target.pressed ? '★' : '☆'}</span> Favorite
 	</button>
 {/if}
-<p role="status" aria-atomic="true" data-testid="player-favorite-status">{#if feedback}{#key feedback.version}{feedback.text}{/key}{/if}</p>
+<p aria-live="polite" aria-atomic="true" data-testid="player-favorite-status">{#if feedback}{#key feedback.version}{feedback.text}{/key}{/if}</p>
 
 <style>
 	button { min-height: 2.75rem; }
