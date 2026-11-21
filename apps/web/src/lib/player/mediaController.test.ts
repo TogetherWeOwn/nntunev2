@@ -55,11 +55,46 @@ class TransportAudio extends EventTarget {
 
 function compactTransport() {
 	const queue = createQueueController(coral);
-	const media = createMedia(queue, undefined, (audio, source) => audio.getAttribute('src') === source);
+	const announce = vi.fn();
+	const media = createMedia(queue, {
+		commit: (next) => { queue.publish(next, queue.begin(next, 'replace')); return queue.snapshot === next; },
+		flush: async () => {}, browseCopy: { invalidate: () => {} }, announce
+	}, (audio, source) => audio.getAttribute('src') === source);
 	const audio = new TransportAudio();
 	const detach = media.attach(audio.element);
-	return { audio, queue, media, detach, status: () => get(media.playbackStatus) };
+	return { audio, queue, media, detach, announce, status: () => get(media.playbackStatus) };
 }
+
+const coralSource = { streamUrl: '/coral', isCurrent: () => true };
+
+test('queue Play reports a decoder error once, including queue counts', async () => {
+	const { audio, media, announce, status } = compactTransport();
+	const pending = audio.deferPlay();
+	const queued = media.playSelected(coral, 0, coralSource, 'Added 0, 1 already queued.');
+	await Promise.resolve();
+	expect(audio.play).toHaveBeenCalledOnce();
+	audio.error = { code: 4 };
+	audio.emit('error');
+	pending.reject(new DOMException('Bad resource', 'NotSupportedError'));
+	await queued;
+	expect(status()).toBe('error');
+	expect(announce).toHaveBeenCalledExactlyOnceWith('Selected Coral; audio unavailable. Added 0, 1 already queued.', true);
+});
+
+test.each(['playing', 'blocked'])('same-track queue Play shares a pending compact outcome: %s', async (outcome) => {
+	const { audio, media, announce, status } = compactTransport();
+	const pending = audio.deferPlay(), compact = media.playCurrent();
+	const queued = media.playSelected(coral, 0, coralSource);
+	await Promise.resolve();
+	expect(audio.play).toHaveBeenCalledOnce();
+	expect(announce).not.toHaveBeenCalled();
+	if (outcome === 'playing') pending.resolve();
+	else { audio.paused = true; pending.reject(new DOMException('Blocked', 'NotAllowedError')); }
+	await Promise.all([compact, queued]);
+	expect(status()).toBe(outcome);
+	expect(announce).toHaveBeenCalledExactlyOnceWith(outcome === 'playing'
+		? 'Playing Coral.' : 'Selected Coral, paused: playback was blocked.', true);
+});
 
 test('compact Play starts in the gesture, deduplicates pending Play, and reads native settlement', async () => {
 	const { audio, media, status } = compactTransport();
