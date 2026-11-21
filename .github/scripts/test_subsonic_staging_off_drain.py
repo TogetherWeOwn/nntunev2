@@ -158,8 +158,55 @@ class ReadbackTests(unittest.TestCase):
             + "        run: exec timeout -k 2s 32s python3 -I .github/scripts/subsonic_staging_off_drain.py 2>/dev/null\n",
         )
         for other in path.parent.iterdir():
-            if other != path and other.suffix in {".yml", ".yaml"}:
+            if other not in {path, path.with_name("deploy.yml")} and other.suffix in {
+                ".yml",
+                ".yaml",
+            }:
                 self.assertNotIn(READ_TOKEN, other.read_text(), other.name)
+
+    def test_deploy_readback_is_isolated_and_requires_a_same_job_pin(self):
+        text = (Path(__file__).parents[1] / "workflows/deploy.yml").read_text()
+        prefix, api = text.split("\n  staging-api:\n", 1)
+        deploy, readback = api.split(
+            "      - name: Read staging off and drained state after API deploy\n", 1
+        )
+        step, suffix = readback.split(
+            "      - name: Record Subsonic staging readback outcome\n", 1
+        )
+        for secret in (READ_TOKEN, OBSERVER):
+            self.assertNotIn(secret, prefix + deploy + suffix)
+        self.assertIn("environment:\n      name: staging\n", deploy)
+        self.assertIn("id: deployment\n", deploy)
+        self.assertEqual(
+            step,
+            """        id: subsonic_readback
+        if: >-
+          ${{ success() && github.event_name == 'push' &&
+              github.repository == 'TogetherWeOwn/nntunev2' &&
+              github.ref == 'refs/heads/main' && github.ref_protected &&
+              github.workflow_sha == github.sha && github.run_attempt == 1 &&
+              steps.deploy.outcome == 'success' && steps.deployment.outputs.deployed == 'true' &&
+              steps.deployment.outputs.identity_pin != '' }}
+        # Evidence only: a readback failure does not change deploy or E2E eligibility.
+        continue-on-error: true
+        env:
+          EXPECTED_STAGING_DEPLOYMENT_ID: ${{ fromJSON(steps.deployment.outputs.identity_pin).deployment_id }}
+          EXPECTED_STAGING_VERSION_ID: ${{ fromJSON(steps.deployment.outputs.identity_pin).version_id }}
+          EXPECTED_STAGING_BUILD_SHA: ${{ fromJSON(steps.deployment.outputs.identity_pin).build_sha }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SUBSONIC_STAGING_WORKERS_READ_TOKEN: ${{ secrets.SUBSONIC_STAGING_WORKERS_READ_TOKEN }}
+          PLANETSCALE_OBSERVER_URL_STAGING: ${{ secrets.PLANETSCALE_OBSERVER_URL_STAGING }}
+        run: exec timeout -k 2s 32s python3 -I .github/scripts/subsonic_staging_off_drain.py 2>/dev/null
+""",
+        )
+        self.assertTrue(
+            suffix.startswith(
+                "        if: ${{ !cancelled() }}\n        continue-on-error: true\n"
+            )
+        )
+        self.assertIn(
+            "READBACK_OUTCOME: ${{ steps.subsonic_readback.outcome }}", suffix
+        )
 
 
 if __name__ == "__main__":
