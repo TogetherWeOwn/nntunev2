@@ -2419,8 +2419,8 @@ fn postgres_admin_invite_ledger_uses_effective_expiry_before_limit() {
                 .get(0);
             ids.push(id);
         }
-        let [long, short, admin_invite, stamped, legacy, revoked]: [i64; 6] =
-            ids.try_into().unwrap();
+        let fixture_ids: [i64; 6] = ids.try_into().unwrap();
+        let [long, short, admin_invite, stamped, legacy, revoked] = fixture_ids;
         tx.execute(
             "UPDATE invite_windows SET ends_at = $1 WHERE id = $2",
             &[&closed_at, &window_id],
@@ -2435,7 +2435,7 @@ fn postgres_admin_invite_ledger_uses_effective_expiry_before_limit() {
             (expiry, "expired"),
             (expiry + 1, "expired"),
         ] {
-            let rows = list(&tx, None, None, now, 6).await.unwrap();
+            let rows = list(&tx, None, None, now, fixture_ids.len()).await.unwrap();
             let states: Vec<_> = rows
                 .iter()
                 .map(|r| (r.id, r.status(now), r.expires_at))
@@ -2467,14 +2467,15 @@ fn postgres_admin_invite_ledger_uses_effective_expiry_before_limit() {
                 ("redeemed", vec![legacy, stamped]),
                 ("revoked", vec![revoked]),
             ] {
-                let rows = list(&tx, None, Some(status), now, expected.len())
+                // Leave room for every fixture so the limit cannot hide extra matches.
+                let rows = list(&tx, None, Some(status), now, fixture_ids.len())
                     .await
                     .unwrap();
-                assert_eq!(invite_ids(&rows), expected, "{status} at {now}");
+                let mut matched = invite_ids(&rows);
+                matched.retain(|id| fixture_ids.contains(id));
+                assert_eq!(matched, expected, "{status} at {now}");
             }
         }
-        let rows = list(&tx, Some(&member), None, expiry, 200).await.unwrap();
-        assert_eq!(invite_ids(&rows), [revoked, legacy, stamped, short, long]);
         let rows = list(&tx, Some(&admin), None, expiry, 200).await.unwrap();
         assert_eq!(invite_ids(&rows), [admin_invite]);
 
@@ -2493,6 +2494,8 @@ fn postgres_admin_invite_ledger_uses_effective_expiry_before_limit() {
         newer_ids.sort_unstable_by(|a, b| b.cmp(a));
         let rows = list(&tx, None, None, expiry, 200).await.unwrap();
         assert_eq!(invite_ids(&rows), newer_ids[..200]);
+        let rows = list(&tx, Some(&member), None, expiry, 200).await.unwrap();
+        assert_eq!(invite_ids(&rows), [revoked, legacy, stamped, short, long]);
         let rows = list(&tx, None, Some("expired"), expiry, 200).await.unwrap();
         assert!(invite_ids(&rows).starts_with(&[short, long]));
         let stored: i64 = tx
