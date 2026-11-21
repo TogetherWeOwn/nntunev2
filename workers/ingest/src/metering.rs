@@ -187,6 +187,90 @@ mod tests {
         }
     }
 
+    struct RecordingSink {
+        status: u16,
+        writes: Vec<(String, serde_json::Value)>,
+    }
+
+    impl MeterSink for RecordingSink {
+        fn send(
+            &mut self,
+            dataset: &str,
+            body: serde_json::Value,
+        ) -> Result<u16, MeterTransportReason> {
+            self.writes.push((dataset.to_owned(), body));
+            Ok(self.status)
+        }
+    }
+
+    #[test]
+    fn existing_stages_emit_one_exact_event_for_each_supported_outcome() {
+        let upload = build_upload_dispatch("user_01", SMALL_NZB).unwrap();
+        let search = crate::dispatch::build_search_dispatch(
+            "user_01",
+            "synthetic query",
+            "vault_idx_01-ab",
+            &[3000],
+            10,
+            0,
+        )
+        .unwrap();
+        // These are the wire values accepted by the meter. Individual callers
+        // choose which stages and outcomes to emit.
+        for mut msg in [upload, search] {
+            msg.attempt = 3;
+            for stage in WORKFLOW_STEPS {
+                for (outcome, wire_outcome) in [
+                    (MeterOutcome::Ok, "ok"),
+                    (MeterOutcome::Retry, "retry"),
+                    (MeterOutcome::Failed, "failed"),
+                ] {
+                    let mut sink = RecordingSink {
+                        status: 204,
+                        writes: Vec::new(),
+                    };
+                    assert_eq!(emit_meter(&mut sink, &msg, stage, outcome), Ok(()));
+                    assert_eq!(
+                        sink.writes,
+                        [(
+                            METER_DATASET.to_owned(),
+                            serde_json::json!({
+                                "job_id": msg.job_id,
+                                "user_id": msg.user_id,
+                                "stage": stage,
+                                "outcome": wire_outcome,
+                                "attempt": 3,
+                            })
+                        )],
+                        "{:?} {stage}/{wire_outcome} must emit exactly one five-field event",
+                        msg.source,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn meter_accepts_only_2xx_at_status_boundaries() {
+        let msg = build_upload_dispatch("user_01", SMALL_NZB).unwrap();
+        for (status, expected) in [
+            (199, Err(MeterWriteError::Rejected { status: 199 })),
+            (200, Ok(())),
+            (299, Ok(())),
+            (300, Err(MeterWriteError::Rejected { status: 300 })),
+        ] {
+            let mut sink = RecordingSink {
+                status,
+                writes: Vec::new(),
+            };
+            assert_eq!(
+                emit_meter(&mut sink, &msg, "probe", MeterOutcome::Ok),
+                expected
+            );
+            assert_eq!(sink.writes.len(), 1, "no inline retry for {status}");
+        }
+    }
+
     #[test]
     fn dataset_names_match_wrangler_example() {
         assert_eq!(METER_DATASET_BINDING, "INGEST_METER");
