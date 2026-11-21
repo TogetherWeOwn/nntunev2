@@ -6,30 +6,9 @@
 //! `Retry-After`, never 202-and-dropped); the event shape stays owned by
 //! `metering.rs`; the stage allowlist (`WORKFLOW_STEPS`) is unchanged.
 //!
-//! Builder contract: implement these four items in
-//! `src/metering.rs` WITHOUT editing this file:
-//!
-//! 1. `pub fn meter_write_body(event: &MeterEvent) -> serde_json::Value` —
-//!    the exact wire body for one event. It must round-trip back to the same
-//!    `MeterEvent` and carry exactly the shape `meter_event` built.
-//! 2. `pub enum MeterWriteError { UnknownStage(&'static str), Transport(String),
-//!    Rejected { status: u16 } }` with `pub fn is_retryable(&self) -> bool`
-//!    (`Transport`/`Rejected` retry, `UnknownStage` does not) and
-//!    `pub fn http_status(&self) -> u16` (retryable maps to 503,
-//!    `UnknownStage` maps to 400).
-//! 3. `pub trait MeterSink { fn send(&mut self, dataset: &str, body:
-//!    serde_json::Value) -> Result<u16, String>; }` — deliver one body to the
-//!    named dataset; the `u16` is the HTTP-equivalent status of the dataset
-//!    write and `Err` means the binding/transport failed before any status
-//!    existed. (At the edge this is the `INGEST_METER` binding call; a native
-//!    binding success maps to 2xx.)
-//! 4. `pub fn emit_meter<S: MeterSink>(sink: &mut S, msg: &QueueMsg, stage:
-//!    &str, outcome: MeterOutcome) -> Result<(), MeterWriteError>` — build the
-//!    event with `meter_event` (unknown stage returns `UnknownStage` BEFORE
-//!    touching the sink), deliver exactly one body shaped like the
-//!    `MeterEvent`, and classify the result: 2xx is `Ok`, anything else
-//!    (transport `Err` or non-2xx) is a retryable `Err`. Never `Ok`
-//!    on failure: a dropped event must never look accepted.
+//! `metering.rs` owns the wire body and accepts only typed sink failures.
+//! An unknown stage never touches the sink; a non-2xx response remains a
+//! rejection, distinct from binding and transport failures.
 //!
 //! These tests speak plain HTTP to a fake dataset-binding endpoint
 //! (std-only `TcpListener`, no new dependencies): the fake asserts the exact
@@ -48,8 +27,8 @@ use std::time::Duration;
 use nntune_ingest::dispatch::build_upload_dispatch;
 use nntune_ingest::fixtures::SMALL_NZB;
 use nntune_ingest::metering::{
-    emit_meter, meter_event, meter_write_body, MeterOutcome, MeterSink, MeterWriteError,
-    METER_DATASET,
+    emit_meter, meter_event, meter_write_body, MeterOutcome, MeterSink, MeterTransportReason,
+    MeterWriteError, METER_DATASET,
 };
 use nntune_ingest::queue::QueueMsg;
 
@@ -211,9 +190,14 @@ impl HttpDatasetSink {
 }
 
 impl MeterSink for HttpDatasetSink {
-    fn send(&mut self, dataset: &str, body: serde_json::Value) -> Result<u16, String> {
+    fn send(
+        &mut self,
+        dataset: &str,
+        body: serde_json::Value,
+    ) -> Result<u16, MeterTransportReason> {
         self.last_dataset = Some(dataset.to_string());
         post_json(self.addr, &format!("/{dataset}/write"), &body.to_string())
+            .map_err(|_| MeterTransportReason::BindingMissing)
     }
 }
 
@@ -272,6 +256,8 @@ fn meter_failing_write_surfaces_retryable_failure() {
     let err = emit_meter(&mut sink, &msg, "probe", MeterOutcome::Ok)
         .expect_err("a 500 dataset write must never report success");
 
+    assert_eq!(err, MeterWriteError::Rejected { status: 500 });
+
     // The write WAS attempted with the exact shape — then surfaced, not
     // dropped: 202-and-dropped would have returned Ok here.
     assert_eq!(
@@ -316,8 +302,11 @@ fn meter_missing_binding_surfaces_retryable_failure() {
         "a missing binding maps to 503 + Retry-After, never 202"
     );
     assert!(
-        !matches!(err, MeterWriteError::UnknownStage(_)),
-        "a transport failure is not a stage error: {err:?}"
+        matches!(
+            err,
+            MeterWriteError::Transport(MeterTransportReason::BindingMissing)
+        ),
+        "a missing binding has its own transport reason: {err:?}"
     );
 }
 
@@ -331,7 +320,7 @@ fn meter_unknown_stage_rejected_before_any_write() {
         .expect_err("an unknown stage must be rejected");
 
     assert!(
-        matches!(err, MeterWriteError::UnknownStage(_)),
+        matches!(err, MeterWriteError::UnknownStage),
         "unknown stage keeps its stage error, got: {err:?}"
     );
     assert!(
