@@ -54,6 +54,7 @@ class TelemetryTests(unittest.TestCase):
         for resource in (
             Coverage("different", OPEN, NOW, 0),
             Coverage(VERSION, OPEN + 1, NOW, 0),
+            Coverage(VERSION, OPEN, OPEN - 1, 0),
             Coverage(VERSION, OPEN, NOW + 1, 0),
         ):
             with (
@@ -115,6 +116,24 @@ class TelemetryTests(unittest.TestCase):
         gate.close_load(NOW, DB, HEALTH, None)
         with self.assertRaisesRegex(Stop, "^resource-event$"):
             gate.reconcile(NOW + 1, Coverage(VERSION, OPEN, NOW, 1))
+
+    def test_delayed_reconciliation_waits_for_coverage_to_reach_load_window(self):
+        gate = Gate(OPEN, VERSION, delayed_resources=True)
+        gate.close_load(NOW, DB, HEALTH, None)
+        self.assertFalse(
+            gate.reconcile(NOW + 1_000, Coverage(VERSION, 0, OPEN - 100, 0))
+        )
+        self.assertTrue(gate.reconcile(NOW + 2_000, Coverage(VERSION, 0, NOW, 0)))
+
+    def test_live_reconciliation_deadline_is_three_seconds(self):
+        gate = Gate(OPEN, VERSION)
+        gate.close_load(NOW, DB, HEALTH, COVERED)
+        self.assertTrue(gate.reconcile(NOW + 3_000, COVERED))
+
+        gate = Gate(OPEN, VERSION)
+        gate.close_load(NOW, DB, HEALTH, COVERED)
+        with self.assertRaisesRegex(Stop, "^resource-reconcile-deadline$"):
+            gate.reconcile(NOW + 3_001, COVERED)
 
     def test_load_edges_refuse_prior_samples_clock_regression_and_late_starts(self):
         with self.assertRaisesRegex(Stop, "^db-telemetry-missing-or-stale$"):

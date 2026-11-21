@@ -81,10 +81,8 @@ class TelemetryGate:
                 and coverage.serving_version == self._version
                 and nat(coverage.covered_from_ms)
                 and nat(coverage.covered_through_ms)
-                and coverage.covered_from_ms
-                <= self._opened
-                <= coverage.covered_through_ms
-                <= now
+                and coverage.covered_from_ms <= self._opened
+                and coverage.covered_from_ms <= coverage.covered_through_ms <= now
                 and nat(coverage.exceeded_or_terminated),
                 "resource-coverage-invalid",
             )
