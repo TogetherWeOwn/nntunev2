@@ -20,7 +20,8 @@ SHA = "b" * 40
 DEPLOYMENT = "11111111-1111-4111-8111-111111111111"
 VERSION = "22222222-2222-4222-8222-222222222222"
 OTHER = "33333333-3333-4333-8333-333333333333"
-PREFIX = "SUBSONIC_MEASUREMENT_"
+MATCHED = {"identity": "matched", "deployment_id": DEPLOYMENT, "version_id": VERSION, "build_sha": SHA,
+           "enable_flag": "off", "lease": "absent", "measurement_db_binding": "absent"}
 
 
 def output(**changes):
@@ -51,10 +52,7 @@ class IdentityTests(unittest.TestCase):
                    "CLOUDFLARE_ACCOUNT_ID": ACCOUNT, "CLOUDFLARE_API_TOKEN": "synthetic-token"}
             with patch.dict(identity.os.environ, env, clear=True), redirect_stdout(stream):
                 self.assertEqual(identity.main(), 0)
-        self.assertEqual(json.loads(stream.getvalue()), {
-            "identity": "matched", "deployment_id": DEPLOYMENT, "version_id": VERSION, "build_sha": SHA,
-            "enable_flag": "off", "lease": "absent", "measurement_db_binding": "absent",
-        })
+        self.assertEqual(json.loads(stream.getvalue()), MATCHED)
         path = f"/client/v4/accounts/{ACCOUNT}/workers/scripts/nntune-api-staging"
         self.assertEqual([c.args[0] for c in read.call_args_list],
                          [path + endpoint for endpoint in ("/deployments", f"/versions/{VERSION}", "/deployments")])
@@ -114,7 +112,7 @@ class IdentityTests(unittest.TestCase):
             ("DB", {"type": "hyperdrive"}),
         ):
             with self.subTest(name=name), self.assertRaisesRegex(identity.Unavailable, "default-off-not-verified"):
-                identity.verify_version(version(dict(binding, name=PREFIX + name)), VERSION, SHA)
+                identity.verify_version(version(dict(binding, name="SUBSONIC_MEASUREMENT_" + name)), VERSION, SHA)
 
     @patch.object(identity.http.client, "HTTPSConnection")
     def test_provider_bounds_and_no_redirect_or_raw_response(self, connect):
@@ -154,27 +152,29 @@ class IdentityTests(unittest.TestCase):
             })
 
     def test_workflow_keeps_deploy_marker_separate_from_identity(self):
-        workflows = Path(__file__).parents[1] / "workflows"
-        wiring = (workflows / "deploy.yml").read_text().split("- name: Deploy api to staging\n", 1)[1]
-        deploy, report = wiring.split("- name: Record API deployment outcome\n", 1)
-        hook = " ".join(deploy.split("postCommands: >-\n", 1)[1].splitlines()[:2]).strip()
+        wiring = (Path(__file__).parents[1] / "workflows/deploy.yml").read_text()
+        deploy, report = wiring.split("- name: Deploy api to staging\n", 1)[1].split("- name: Record API deployment outcome\n", 1)
+        hook = " ".join(dedent(deploy.split("postCommands: >-\n", 1)[1].split("\n      #", 1)[0]).splitlines())
         script = dedent(report.split("        run: |\n", 1)[1].split("\n\n", 1)[0])
-        matched = '{"identity":"matched"}'
         for status, rc in (("success", 124), ("success", 0), ("failure", 0), ("cancelled", 0)):
             with self.subTest(status=status, rc=rc), TemporaryDirectory() as temp:
                 output, summary, probe = (Path(temp, name) for name in ("output", "summary", "python3"))
                 probe.write_text(f"#!/bin/sh\n[ \"$*\" = '-I ../../.github/scripts/staging_api_identity.py' ] || exit 2\n"
-                                 f"printf '%s\\n' '{matched}'\nexit {rc}\n")
+                                 f"printf '%s\\n' '{json.dumps(MATCHED)}'\nexit {rc}\n")
                 probe.chmod(0o700)
                 env = {"PATH": f"{temp}:{identity.os.defpath}", "RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(output),
                        "GITHUB_STEP_SUMMARY": str(summary), "CONFIGURED": "true", "HYPERDRIVE_OUTCOME": "success",
                        "SCHEMA_OUTCOME": "success", "JOB_STATUS": status, "DEPLOY_OUTCOME": status, "SOURCE_SHA": SHA}
-                subprocess.run(["bash", "-c", f"{hook}\n{script}"], check=True, env=env)
+                for command in (hook, script):
+                    subprocess.run(["bash", "-c", command], check=True, env=env)
                 deployed, outcome = status == "success", {"success": "deployed", "failure": "failed"}.get(status, status)
                 self.assertEqual(output.read_text(),
                                  f"deployed={str(deployed).lower()}\noutcome={outcome}\nsource_sha={SHA if deployed else ''}\n")
-                text, expect_match = summary.read_text(), deployed and rc == 0
-                self.assertEqual((matched in text, "identity=unavailable" in text), (expect_match, not expect_match))
+                receipt = summary.read_text().split("\n### staging-api provider identity\n", 1)[1].strip()
+                if deployed and rc == 0:
+                    self.assertEqual(json.loads(receipt), MATCHED)
+                else:
+                    self.assertEqual(receipt, "identity=unavailable (no completed probe receipt)")
 
 
 if __name__ == "__main__":
