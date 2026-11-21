@@ -15,6 +15,7 @@
 	import { deriveTrackTime } from '#lib/format.js';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
+	import PlaybackSpeedControl from '#lib/player/PlaybackSpeedControl.svelte';
 	import ShuffleUpcoming from '#lib/player/ShuffleUpcoming.svelte';
 	import VolumeControls from '#lib/player/VolumeControls.svelte';
 	import {
@@ -435,9 +436,6 @@
 	let speedFeedback = $state('');
 	// Retain a mismatch through the ratechange emitted by the same media write.
 	let speedFeedbackRate: number | null = null;
-	const PRESET_SPEED_VALUES = ['0.5', '0.75', '1', '1.25', '1.5', '1.75', '2'];
-	/** A restored or native non-preset rate renders as its own explicit option. */
-	const showCustomSpeed = $derived(!PRESET_SPEED_VALUES.includes(speedValue));
 	let resumeStore: ResumeStore | null = null;
 
 	// Session-local recently-played list (demo synthetic tracks only; the
@@ -2138,29 +2136,7 @@
 		{/if}
 		<p data-testid="sleep-timer-status" aria-live="polite">{sleepAnnouncement}</p>
 		<p>Duration timers use wall-clock time and continue while paused.</p>
-		<div>
-			<label for="playback-speed">Playback speed</label>
-			<select
-				id="playback-speed"
-				data-testid="playback-speed"
-				value={speedValue}
-				onchange={(event) => handleSpeedChange(event.currentTarget)}
-			>
-				{#if showCustomSpeed}
-					<option value={speedValue}>{speedValue}x</option>
-				{/if}
-				<option value="0.5">0.5x</option>
-				<option value="0.75">0.75x</option>
-				<option value="1">1x</option>
-				<option value="1.25">1.25x</option>
-				<option value="1.5">1.5x</option>
-				<option value="1.75">1.75x</option>
-				<option value="2">2x</option>
-			</select>
-			{#if speedFeedback}
-				<p data-testid="speed-status" role="status">{speedFeedback}</p>
-			{/if}
-		</div>
+		<PlaybackSpeedControl value={speedValue} feedback={speedFeedback} onchange={handleSpeedChange} />
 	</section>
 
 	<button type="button" data-testid="seek-storm" onclick={() => void seekStorm()}>

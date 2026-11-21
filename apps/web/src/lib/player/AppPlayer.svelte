@@ -6,6 +6,7 @@
 	import { resolveStreamUrl } from '../library/stream-url.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
+	import PlaybackSpeedControl from './PlaybackSpeedControl.svelte';
 	import { createPlayerController } from './controller.svelte.js';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
 	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & { claimShareEntry?: () => boolean }>();
@@ -16,6 +17,7 @@
 	const player = setAppPlayer(Object.assign(createPlayerController(createQueue([]), { flush: tick }),
 		{ claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
 	const { queue, media, media: { seekFeedback, playbackStatus } } = player;
+	const { speed, speed: { state: speedState } } = media;
 	const attachNativeAudio = media.attach;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
@@ -31,15 +33,24 @@
 	});
 	// Library's pre-effect disposes route state before player teardown.
 	onMount(() => {
-		media.restoreRepeat(browserStorage('local'));
+		const storage = browserStorage('local');
+		media.restoreRepeat(storage);
+		media.speed.restore(storage);
 		return () => { clearMiniPlayerHint(); player.destroy(); };
 	});
 </script>
+{#snippet speedControl()}
+	<PlaybackSpeedControl value={$speedState.rate === null ? null : String($speedState.rate)}
+		feedback={$speedState.feedback} onchange={(control) => {
+			const observed = speed.set(Number(control.value));
+			control.value = observed === null ? '' : String(observed);
+		}} />
+{/snippet}
 {@render children()}
 {#if streamUrl}
 	<div class="nt-wrap">
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
-			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
+			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} {speedControl} />
 	</div>
 {/if}

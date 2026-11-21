@@ -5,6 +5,7 @@ import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type Repe
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
 import { createPendingShareSeek } from './pendingShareSeek.js';
+import { createLivePlaybackSpeed } from './livePlaybackSpeed.js';
 import { restartIsAvailable } from './restartAvailability.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
@@ -89,6 +90,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		return { audio, attachment, matches };
 	}
 
+	const speed = createLivePlaybackSpeed(transportTarget);
+
 	async function playCurrent(): Promise<void> {
 		const target = transportTarget();
 		if (!target || pendingPlay) return;
@@ -165,6 +168,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		previous?.listeners.abort();
 		invalidatePlay();
 		playbackStatus.set('unavailable');
+		speed.retire();
 		return previous?.audio;
 	}
 
@@ -410,7 +414,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const track = currentTrack(result.queue);
 		const streamUrl = resolveStreamUrl(track);
 		const replacing = currentTrack(base)?.id !== track?.id || source !== streamUrl;
-		const { volume, muted, playbackRate } = audio;
+		const { volume, muted } = audio;
+		// Capture a native rate even if its queued ratechange hasn't fired yet.
+		const playbackRate = speed.managed ? undefined : audio.playbackRate;
+		speed.observe({ audio, matches: ownsOrigin });
 		if (!ownsOrigin()) return;
 		// Replay supersedes a deferred share even when the native source survives.
 		browseCopy.invalidate();
@@ -434,7 +441,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (!matches()) return;
 			target.muted = muted;
 			if (!matches()) return;
-			target.playbackRate = playbackRate;
+			// The live binding already restored and verified a replacement's rate.
+			if (playbackRate !== undefined) target.playbackRate = playbackRate;
 			runPosition(() => { if (matches()) target.currentTime = 0; });
 			if (!matches()) return;
 			clearJumpFeedback();
@@ -455,6 +463,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		repeat: { subscribe: repeat.subscribe },
 		seekFeedback: { subscribe: seekFeedback.subscribe },
 		playbackStatus: { subscribe: playbackStatus.subscribe }, playCurrent, pauseCurrent,
+		speed,
 		clearSeekFeedback,
 		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
 			let value: string | null | undefined;
@@ -522,6 +531,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 						case 'error':
 							if (audio.error === null) return;
 							break;
+						case 'ratechange': return speed.observe({ audio, matches });
 						case 'ended': return handleEnded(receipt, source, matches);
 						case 'seeking':
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
@@ -548,13 +558,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					else invalidatePlay();
 					readPlayback(audio, matches, get(playbackStatus));
 				};
-				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'emptied', 'seeking',
+				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'emptied', 'seeking', 'ratechange',
 					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate']) {
 					audio.addEventListener(type, observe, { signal: receipt.listeners.signal });
 				}
 			}
 			lastJumpTarget = undefined;
 			listenForNativeEvents();
+			speed.attach();
 			const target = transportTarget();
 			if (target?.audio === audio) readPlayback(audio, target.matches, 'starting');
 			pause(previous?.audio);

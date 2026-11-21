@@ -1,0 +1,80 @@
+import { get } from 'svelte/store';
+import { expect, test, vi } from 'vitest';
+import { createLivePlaybackSpeed } from './livePlaybackSpeed.js';
+import { PLAYBACK_SPEED_STORAGE_KEY } from './playbackSpeed.js';
+
+function fixture(seed = '1.3') {
+	let target: { audio: { playbackRate: number }; matches: () => boolean } | undefined;
+	const speed = createLivePlaybackSpeed(() => target);
+	let stored: string | null = seed;
+	const storage = {
+		getItem: () => stored,
+		setItem: vi.fn((key: string, rate: string) => {
+			expect(key).toBe(PLAYBACK_SPEED_STORAGE_KEY);
+			stored = rate;
+		}),
+		removeItem: vi.fn()
+	};
+	speed.restore(storage);
+	function attach() {
+		let rate = 1;
+		const apply = vi.fn((value: number) => { rate = value; });
+		const audio = { get playbackRate() { return rate; }, set playbackRate(value) { apply(value); } };
+		const current = { audio, matches: () => target === current };
+		target = current;
+		speed.attach();
+		return { current, audio, apply, native: (next: number) => { rate = next; speed.observe(current); } };
+	}
+	return { speed, storage, attach, retire: () => { target = undefined; speed.retire(); } };
+}
+
+test('renders clamped readback and keeps mismatch feedback through the write’s ratechange', () => {
+	const { speed, attach, storage } = fixture();
+	const { current, apply, native } = attach();
+	apply.mockImplementationOnce(() => native(1.25));
+	expect(speed.set(2)).toBe(1.25);
+	expect(storage.getItem()).toBe('1.25');
+	const mismatch = { rate: 1.25, feedback: 'Speed 2x not applied — still 1.25x' };
+	expect(get(speed.state)).toEqual(mismatch);
+	speed.observe(current);
+	expect(get(speed.state)).toEqual(mismatch);
+	native(1.75);
+	expect(get(speed.state)).toEqual({ rate: 1.75, feedback: '' });
+	expect(storage.getItem()).toBe('1.75');
+	expect(apply.mock.calls).toEqual([[1.3], [2]]);
+});
+
+test('a throwing restore displays native truth without replacing the stored preference', () => {
+	const { speed, attach, storage, retire } = fixture();
+	const { apply, current } = attach();
+	apply.mockImplementationOnce(() => { throw new Error('refused'); });
+	speed.set(2);
+	expect(get(speed.state)).toEqual({ rate: 1.3, feedback: 'Speed 2x not applied — still 1.3x' });
+	expect(storage.setItem).toHaveBeenCalledTimes(1);
+	retire();
+	const replacement = { audio: { playbackRate: 1 }, matches: () => true };
+	Object.defineProperty(replacement.audio, 'playbackRate', {
+		get: () => 1, set: () => { throw new Error('refused'); }
+	});
+	const restored = createLivePlaybackSpeed(() => replacement);
+	restored.restore(storage);
+	expect(get(restored.state)).toEqual({ rate: 1, feedback: '' });
+	expect(storage.getItem()).toBe('1.3');
+	speed.observe(current);
+	expect(get(speed.state).rate).toBeNull();
+});
+
+test('retired source readback cannot publish or persist, and the next source restores the last verified rate', () => {
+	const { speed, storage, attach, retire } = fixture();
+	const old = attach();
+	speed.set(1.75);
+	old.apply.mockImplementationOnce(retire);
+	expect(speed.set(2)).toBeNull();
+	expect(speed.set(0.5)).toBeNull();
+	expect(storage.setItem).toHaveBeenCalledTimes(2);
+	const fresh = attach();
+	old.native(0.5);
+	expect(fresh.audio.playbackRate).toBe(1.75);
+	expect(get(speed.state)).toEqual({ rate: 1.75, feedback: '' });
+	expect(storage.getItem()).toBe('1.75');
+});

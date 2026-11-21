@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ComponentProps } from 'svelte';
+	import type { ComponentProps, Snippet } from 'svelte';
 	import { displayArtist, displayTitle } from '../library/order.js';
 	import NativeAudio from './NativeAudio.svelte';
 	import type { PlaybackStatus } from './mediaController.js';
@@ -10,8 +10,9 @@
 		currentTrack, mediaRevision, streamUrl, attachNativeAudio,
 		playbackStatus, playCurrent, pauseCurrent,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
-		jumpStatus, jumpStatusVersion, jumpRelative
+		jumpStatus, jumpStatusVersion, jumpRelative, speedControl
 	}: ComponentProps<typeof NativeAudio> & {
+		speedControl: Snippet;
 		currentTrack: Pick<Track, 'id' | 'title' | 'artist'> | null;
 		playbackStatus: PlaybackStatus;
 		playCurrent: () => Promise<void>;
@@ -86,6 +87,7 @@
 		</button>
 	</div>
 	<p data-testid="player-seek-feedback" aria-live="polite">{#key jumpStatusVersion}{jumpStatus}{/key}</p>
+	{@render speedControl()}
 </section>
 
 <style>
