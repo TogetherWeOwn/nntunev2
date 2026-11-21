@@ -5,15 +5,15 @@ const track = {
 	streamUrl: '/api/demo/audio?track=compact-coral'
 };
 
-async function openPlayer(page: Page, width: number, theme: 'dark' | 'light' = 'light') {
+async function openPlayer(page: Page, width: number, theme: 'dark' | 'light' = 'light', fixture = track) {
 	await page.setViewportSize({ width, height: 900 });
 	await page.emulateMedia({ colorScheme: theme });
-	await page.route('**/api/library', (route) => route.fulfill({ json: [track] }));
-	await page.goto(`/library?track=${track.id}&t=2`);
+	await page.route('**/api/library', (route) => route.fulfill({ json: [fixture] }));
+	await page.goto(`/library?track=${fixture.id}&t=2`);
 	const region = page.getByRole('region', { name: 'Player', exact: true });
 	const audio = region.locator('audio[controls][data-testid="audio-player"]');
 	const identity = region.getByTestId('library-now-playing');
-	const favorite = region.getByRole('button', { name: 'Favorite Coral Night', exact: true });
+	const favorite = region.getByRole('button', { name: `Favorite ${fixture.title}`, exact: true });
 	const play = region.getByRole('button', { name: 'Play', exact: true });
 	const restart = region.getByRole('button', { name: 'Restart current track', exact: true });
 	const seek = region.getByRole('slider', { name: 'Seek', exact: true });
@@ -22,7 +22,7 @@ async function openPlayer(page: Page, width: number, theme: 'dark' | 'light' = '
 	const feedback = region.getByTestId('player-seek-feedback');
 	const volume = region.getByRole('slider', { name: 'Volume 100%', exact: true });
 	const mute = region.getByRole('button', { name: 'Mute', exact: true });
-	await expect(identity).toHaveText('Coral Night — Fixture Artist');
+	await expect(identity).toHaveText(`${fixture.title} — ${fixture.artist}`);
 	await expect(play).toBeEnabled();
 	await expect(restart).toBeEnabled();
 	await expect(seek).toHaveAttribute('aria-valuetext', '0:02 of 0:16');
@@ -77,7 +77,8 @@ for (const width of [800, 1024, 1280]) {
 			expect(native.width).toBeGreaterThanOrEqual(300);
 			expect(slider.height).toBeGreaterThanOrEqual(12);
 			expect(slider.y).toBeGreaterThanOrEqual(restartButton.y + restartButton.height);
-			expect(backButton.y).toBeCloseTo(primary.y + primary.height + 8, 0);
+			const seekRow = await box(region.locator('.nt-player-seek'));
+			expect(backButton.y).toBeCloseTo(seekRow.y + seekRow.height + 8, 0);
 			expect(forwardButton.y).toBe(backButton.y);
 			expect(forwardButton.x).toBeCloseTo(backButton.x + backButton.width + 8, 0);
 			for (const jump of [back, forward]) {
@@ -90,6 +91,18 @@ for (const width of [800, 1024, 1280]) {
 		});
 	}
 }
+
+test('desktop 800px: wrapped metadata does not separate Seek from the jump buttons', async ({ page }) => {
+	const fixture = { ...track, title: Array(12).fill(track.title).join(' '), artist: Array(4).fill(track.artist).join(' ') };
+	const { region, identity, back, forward } = await openPlayer(page, 800, 'light', fixture);
+	const [label, seekRow, backButton, forwardButton] = await Promise.all(
+		[identity, region.locator('.nt-player-seek'), back, forward].map(box)
+	);
+	expect(label.height).toBeGreaterThan(120);
+	for (const jump of [backButton, forwardButton]) {
+		expect(jump.y).toBeCloseTo(seekRow.y + seekRow.height + 8, 0);
+	}
+});
 
 test('desktop Tab reaches named controls in order, with native stops and keyboard jump feedback', async ({ page }) => {
 	const { audio, favorite, play, restart, seek, back, forward, feedback, volume, mute } = await openPlayer(page, 1024);

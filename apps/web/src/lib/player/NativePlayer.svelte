@@ -210,7 +210,8 @@
 	.desktop .nt-player-right { grid-column: 3; }
 	.desktop .nt-player-primary {
 		display: grid;
-		align-content: center;
+		/* Side metadata may grow the row; keep seek flush to the jump extension. */
+		align-content: end;
 		min-block-size: var(--nt-player-h);
 	}
 	.desktop .nt-player-identity, .desktop .nt-library-player-controls p,
@@ -227,7 +228,9 @@
 		padding-inline: var(--nt-space-2);
 	}
 	.desktop .nt-library-player-controls .nt-library-transport { min-block-size: var(--nt-control-lg); }
-	.desktop :global(audio[controls]), .desktop :global(.nt-sound input) { max-inline-size: 100%; }
+	/* Wrap at the browser's native control width, not the narrow flex basis. */
+	.desktop .nt-library-player-controls :global(audio[controls]) { flex-basis: auto; }
+	.desktop :global(.nt-sound input) { max-inline-size: 100%; }
 	.desktop :global(.nt-sound label) { display: grid; }
 	.desktop .nt-player-primary :global(.nt-player-seek) { line-height: 1; }
 	.desktop .nt-player-primary :global(.nt-player-seek input) { min-height: var(--nt-space-px-12); }
