@@ -43,7 +43,11 @@ it('shares the read lock, queues logout and recovers a new generation after a qu
 	]);
 	const initial = localStorage.getItem(AUTH_GENERATION_KEY);
 	expect(initial).not.toBeNull();
-	expect(localStorage.setItem).toHaveBeenCalledTimes(1);
+	expect(
+		localStorage.setItem.mock.calls.filter(
+			([key]) => key === AUTH_GENERATION_KEY
+		)
+	).toHaveLength(1);
 	let logout: Promise<void> | undefined;
 	try {
 		const read = await first!.run(async () => {
@@ -81,9 +85,11 @@ it('shares the read lock, queues logout and recovers a new generation after a qu
 
 it('withholds receipts when generation initialization cannot write, and retries on the next capture', async () => {
 	const { localStorage } = setup();
-	localStorage.setItem.mockImplementationOnce(() => {
-		throw new DOMException('Storage denied', 'SecurityError');
-	});
+	localStorage.setItem
+		.mockImplementationOnce(localStorage.setItem.getMockImplementation()!)
+		.mockImplementationOnce(() => {
+			throw new DOMException('Storage denied', 'SecurityError');
+		});
 	expect(await captureAuthFence()).toBeUndefined();
 	expect((await captureAuthFence())?.isCurrent()).toBe(true);
 });
@@ -101,9 +107,10 @@ it('keeps logout available but withholds receipts when access to storage is bloc
 	expect(await captureAuthFence()).toBeUndefined();
 });
 
-it.each([false, true])(
-	'withholds cross-tab receipts through overlapping fallback writes (quota retry: %s)',
-	async (quotaRetry) => {
+it.each(['normal', 'retry', 'exhausted', 'exhausted from empty storage'])(
+	'withholds cross-tab receipts through overlapping fallback writes (%s)',
+	async (quota) => {
+		const exhausted = quota.startsWith('exhausted');
 		const { localStorage } = setup();
 		const before = await captureAuthFence();
 		expect(before?.isCurrent()).toBe(true);
@@ -125,10 +132,28 @@ it.each([false, true])(
 			return { response, logout, fetchFn };
 		}
 
-		if (quotaRetry)
+		if (quota === 'retry')
 			localStorage.setItem.mockImplementationOnce(() => {
 				throw new DOMException('Storage full', 'QuotaExceededError');
 			});
+		if (exhausted) {
+			const size = (items: object) =>
+				Object.entries(items).reduce(
+					(sum, [key, value]) =>
+						sum + (typeof value === 'string' ? key.length + value.length : 0),
+					0
+				);
+			const limit = size(localStorage);
+			if (quota === 'exhausted from empty storage')
+				for (const [key, value] of Object.entries(localStorage))
+					if (typeof value === 'string') localStorage.removeItem(key);
+			const write = localStorage.setItem.getMockImplementation()!;
+			localStorage.setItem.mockImplementation((key, value) => {
+				if (size({ ...localStorage, [key]: value }) > limit)
+					throw new DOMException('Storage full', 'QuotaExceededError');
+				write(key, value);
+			});
+		}
 		const first = await startLogout();
 		try {
 			expect(before?.isCurrent()).toBe(false);
@@ -152,7 +177,9 @@ it.each([false, true])(
 		}
 		expect(first.fetchFn).toHaveBeenCalledTimes(1);
 		expect(before?.isCurrent()).toBe(false);
-		expect((await captureAuthFence())?.isCurrent()).toBe(true);
+		expect((await captureAuthFence())?.isCurrent()).toBe(
+			exhausted ? undefined : true
+		);
 	}
 );
 
