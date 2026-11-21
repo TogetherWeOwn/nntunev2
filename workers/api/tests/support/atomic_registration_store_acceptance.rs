@@ -2362,6 +2362,65 @@ fn postgres_admin_invite_issue_and_revoke_audit_by_row_id() {
 
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_invite_batch_commits_together_or_not_at_all() {
+    use super::admin_issue_invite_batch_on as issue;
+    use crate::handlers::AdminInviteBatchOutcome as Outcome;
+    run_test(async {
+        let mut client = connect().await;
+        let (actor, _) = seed_admin_test_users(&client).await;
+        let expiry = NOW + 86_400;
+        let ip = "198.51.100.9";
+        let snapshot = "SELECT (SELECT count(*) FROM invite_codes WHERE issued_by = $1),
+                               (SELECT count(*) FROM audit_log WHERE user_id = $1 AND action = 'invite.issued')";
+        let open: bool = client.query_one(
+            "SELECT EXISTS (SELECT 1 FROM invite_windows WHERE starts_at <= $1 AND ends_at > $1)",
+            &[&(NOW as i64)],
+        ).await.unwrap().get(0);
+        assert!(!open);
+        for count in [1, 50] {
+            let hashes: Vec<_> = (0..count)
+                .map(|idx| format!("{actor}-{count}-{idx}"))
+                .collect();
+            let outcome = issue(&mut client, &actor, &hashes, ip, NOW, expiry)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, Outcome::Issued));
+            let row = client.query_one(
+                "SELECT count(DISTINCT i.id) FROM invite_codes i JOIN audit_log a ON a.user_id = i.issued_by
+                   AND a.action = 'invite.issued' AND a.ok AND a.details = jsonb_build_object('invite_id', i.id)
+                 WHERE i.issued_by = $1 AND i.kind = 'admin' AND i.email IS NULL AND i.code_hash = ANY($2)
+                   AND i.window_id IS NULL AND NOT i.used AND i.expires_at = $3",
+                &[&actor, &hashes, &(expiry as i64)],
+            ).await.unwrap();
+            assert_eq!(row.get::<_, i64>(0), count);
+        }
+        // A fresh row preceding an already committed hash must not survive the failed insert.
+        let hashes = [format!("{actor}-fresh"), format!("{actor}-1-0")];
+        let failed = issue(&mut client, &actor, &hashes, ip, NOW, expiry).await;
+        assert!(failed.is_err());
+        for (update, expected) in [
+            (
+                "UPDATE users SET deleting_at = now() WHERE id = $1",
+                Outcome::AccountDeleting,
+            ),
+            (
+                "UPDATE users SET role = 'member', deleting_at = NULL WHERE id = $1",
+                Outcome::ActorNotAdmin,
+            ),
+        ] {
+            client.execute(update, &[&actor]).await.unwrap();
+            let outcome = issue(&mut client, &actor, &hashes[..1], ip, NOW, expiry)
+                .await
+                .unwrap();
+            assert_eq!(outcome, expected);
+        }
+        let row = client.query_one(snapshot, &[&actor]).await.unwrap();
+        assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (51, 51));
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_member_invite_history_is_scoped_paged_and_read_only() {
     use super::member_invite_history_on as history;
     use crate::auth::InviteStatus::*;
