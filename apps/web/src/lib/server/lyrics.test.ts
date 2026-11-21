@@ -47,6 +47,10 @@ describe('lyrics resolution', () => {
 		const provider = vi.fn<ExactLyricsProvider>().mockResolvedValue(match);
 		const resolve = createLyricsResolver(provider);
 		expect(await resolve({ embedded: lrc, mediaPath, sidecar }, track)).toMatchObject({ source: 'embedded' });
+		const bracketed = '[12:30 PM] Meet me';
+		expect(await resolve({ embedded: `[00:01] ${bracketed}`, mediaPath, sidecar }, track)).toEqual({
+			source: 'embedded', cues: [{ atMs: 1000, text: bracketed }]
+		});
 		for (const embedded of ['', 'Untimed', '[00:99]Bad stamp', '[00:01] [00:61]']) {
 			expect(await resolve({ embedded, mediaPath, sidecar }, track)).toMatchObject({ source: 'sidecar' });
 		}
