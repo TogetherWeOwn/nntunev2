@@ -18472,7 +18472,8 @@ mod tests {
         let h = harness();
         let mut req = taste_put_request(&h, "alice");
         let original = current_likes_binding(&h, req.cookie.as_deref().unwrap());
-        req.path = BOUND_TASTE_PATH.into();
+        // Pin the public browser URL independently of the routing constant.
+        req.path = "/v1/me/taste/session".into();
         seed_user(&h, "bob", "bob@example.com");
         // A valid request reaches these faults; a refused binding must not.
         h.store.fail_taste_read.replace(true);
