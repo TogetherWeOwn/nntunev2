@@ -181,10 +181,8 @@ class TransportTests(unittest.TestCase):
         self.addCleanup(self.reap_on_failure, child)
         return child
 
-    @staticmethod
-    def reap_on_failure(child):
-        if child.poll() is None:
-            child.kill()
+    def reap_on_failure(self, child):
+        child.kill()  # Popen does not signal an already-reaped process.
         child.wait(timeout=2)
         child.stdin.close()
         child.stdout.close()
@@ -195,8 +193,7 @@ class TransportTests(unittest.TestCase):
 
     def assert_reaped(self, returncode=None):
         child = self.children[-1]
-        self.assertIsNotNone(child.returncode)  # Don't poll: the transport must have reaped it.
-        self.assertTrue(child.stdin.closed and child.stdout.closed)
+        self.assertTrue(child.returncode is not None and child.stdin.closed and child.stdout.closed)
         if returncode is not None:
             self.assertEqual(child.returncode, returncode)
 
@@ -223,14 +220,13 @@ class TransportTests(unittest.TestCase):
         for slot in (0, 49, True, "https://example.invalid/rest/getArtists"):
             with self.assertRaisesRegex(runner["Stop"], "^unreviewed-slot$"):
                 self.send(slot)
-        prepare = runner["_prepare_post"]
         original = next(runner["prepare_requests"](matrix, self.bearer, self.api_key))
         for url in (
             original.url.replace("https:", "http:"),
             original.url.replace("staging.nntune.com", "example.invalid"),
             original.url.replace("getArtists", "getAlbum"), original.url + "?q=1", original.url + "#x",
         ):
-            with (patch.dict(prepare.__globals__, _prepare_post=lambda *_, url=url: replace(original, url=url)),
+            with (patch.dict(runner["_prepare_post"].__globals__, _prepare_post=lambda *_, url=url: replace(original, url=url)),
                   self.assertRaisesRegex(runner["Stop"], "^destination-refused$")):
                 self.send()
         self.assertEqual(self.children, [])
@@ -244,20 +240,23 @@ class TransportTests(unittest.TestCase):
 
     def test_interim_headers_preserve_fixed_rejection_oracle_and_shared_budget(self):
         hint = b"HTTP/1.1 103 Early Hints\r\n\r\n"
-        head = hint + (b"HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n"
-                       b"Cache-Control: private, no-store\r\n\r\n")
+        head = (hint + b"HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n"
+                b"Cache-Control: private, no-store\r\n\r\n")
         off = (b'<subsonic-response status="failed" version="1.16.1"><error code="70" '
                b'message="Endpoint not supported in staging."/></subsonic-response>')
         self.program = f"out.write({(head + off)!r})"
         self.assertEqual(self.send(5), {"oracle": "fixed_staging_off", "http_status": 404})
-        for prefix in (f"{hint!r} * 400", "b'HTTP/1.1 101 Switching Protocols\\r\\n\\r\\n'"):
-            self.program = f"out.write({prefix} + {(head + off)!r})"
-            with self.assertRaisesRegex(runner["Stop"], "^response-headers$"):
+        for payload, reason in ((head + b"wrong body", "response-mismatch"),
+                                (hint * 400 + head + off, "response-headers"),
+                                (b"HTTP/1.1 101 Switching Protocols\r\n\r\n", "response-headers")):
+            self.program = f"out.write({payload!r})"
+            with self.assertRaisesRegex(runner["Stop"], f"^{reason}$"):
                 self.send(5)
             self.assert_reaped()
 
     def test_real_curl_reports_both_content_length_mismatches(self):
         class Fixture(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
             def do_POST(self):
                 self.rfile.read(int(self.headers["Content-Length"]))
                 self.wfile.write(self.server.response)
@@ -305,17 +304,19 @@ class TransportTests(unittest.TestCase):
                     self.send(slot)
                 self.assert_reaped()
 
-    def test_deadline_kills_client_despite_progress_and_eof_without_exit(self):
-        for progress in ("os.close(sys.stdout.fileno()); time.sleep(60)",
-                         "while True: out.write(b'x'); out.flush(); time.sleep(.02)"):
-            self.program = f"out.write({self.ok_head!r}); out.flush()\n" + progress
+    def test_runner_deadline_and_curl_exit_28_are_both_timeouts(self):
+        head = f"out.write({self.ok_head!r}); out.flush()\n"
+        for program, seconds, returncode in (
+            (head + "os.close(sys.stdout.fileno()); time.sleep(60)", .35, -signal.SIGKILL),
+            (head + "while True: out.write(b'x'); out.flush(); time.sleep(.02)", .35, -signal.SIGKILL),
+            ("sys.exit(28)", 4, 28)):
+            self.program = program
             with self.assertRaisesRegex(runner["Stop"], "^request-or-reader-timeout$"):
-                self.send(seconds=.35)
-            self.assert_reaped(-signal.SIGKILL)
+                self.send(seconds=seconds)
+            self.assert_reaped(returncode)
 
     def test_cancellation_reaps_live_client_even_during_hold(self):
         self.program = "time.sleep(60)"
-        spawn = self.fake_curl
         self.cancel.set()
         with self.assertRaisesRegex(runner["Stop"], "^cancelled$"):
             self.send()
@@ -323,16 +324,15 @@ class TransportTests(unittest.TestCase):
         self.cancel.clear()
 
         def spawn_then_cancel(*args, **kwargs):
-            child = spawn(*args, **kwargs)
+            child = self.fake_curl(*args, **kwargs)
             timer = Timer(.05, self.cancel.set)
             timer.start()
             self.addCleanup(timer.join)
             return child
 
-        transport = runner["StagingPostTransport"](spawn=spawn_then_cancel)
+        self.transport = runner["StagingPostTransport"](spawn=spawn_then_cancel)
         with self.assertRaisesRegex(runner["Stop"], "^cancelled$"):
-            transport.send(41, self.bearer, self.api_key, deadline=time.monotonic() + 4,
-                           cancel=self.cancel)
+            self.send(41)
         self.assert_reaped(-signal.SIGKILL)
 
     def test_held_reader_and_disconnect_are_distinct_client_outcomes(self):
