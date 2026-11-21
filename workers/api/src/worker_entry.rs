@@ -2082,6 +2082,30 @@ async fn claim_single_use_on(
     Ok(rows.len() as u64)
 }
 
+async fn invite_by_hash_on(
+    client: &impl GenericClient,
+    code_hash: &str,
+) -> Result<Option<InviteRecord>, StoreError> {
+    // Preflight only; the invite claim rechecks the bounds under lock.
+    let statement = format!(
+        "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email FROM invite_codes \
+         LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
+         LEFT JOIN invite_windows w ON w.id = invite_codes.window_id \
+         WHERE invite_codes.code_hash = $1 AND (invite_codes.kind = 'admin' OR \
+             (invite_codes.kind = 'member' AND w.id IS NOT NULL AND \
+              int8range(w.starts_at, w.ends_at, '[)') @> floor(extract(epoch FROM clock_timestamp()))::bigint))"
+    );
+    let rows = client
+        .query_typed(&statement, &[(&code_hash, Type::TEXT)])
+        .await
+        .map_err(|_| StoreError)?;
+    // `query_opt`'s rule: more than one row is an error.
+    if rows.len() > 1 {
+        return Err(StoreError);
+    }
+    rows.first().map(invite_from_row).transpose()
+}
+
 async fn insert_credential_on(
     client: &impl GenericClient,
     credential: &PasskeyCredential,
@@ -2163,7 +2187,8 @@ async fn complete_registration_on(
         transaction
             .query_typed(
                 "INSERT INTO audit_log (user_id, action, ok, source_ip, at, subject_user_id, details) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+                 SELECT $1, $2, $3, $4, CASE WHEN kind = 'member' THEN redeemed_at ELSE $5 END, $6, $7::jsonb \
+                 FROM invite_codes WHERE code_hash = $8",
                 &[
                     (&audit.user_id, Type::TEXT),
                     (&audit.action, Type::TEXT),
@@ -2172,6 +2197,7 @@ async fn complete_registration_on(
                     (&i64_of(audit.at)?, Type::INT8),
                     (&audit.subject_user_id, Type::TEXT),
                     (&audit.details, Type::TEXT),
+                    (&record.code_hash, Type::TEXT),
                 ],
             )
             .await
@@ -4460,27 +4486,7 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                // Preflight only: the shared claim rechecks the window under lock.
-                // Pass the issuer's current email along for self-invite refusal.
-                let statement = format!(
-                    "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email \
-                     FROM invite_codes \
-                     LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
-                     WHERE invite_codes.code_hash = $1 \
-                     AND (invite_codes.kind = 'admin' OR (invite_codes.kind = 'member' AND EXISTS ( \
-                         SELECT 1 FROM invite_windows w WHERE w.id = invite_codes.window_id \
-                         AND int8range(w.starts_at, w.ends_at, '[)') \
-                             @> floor(extract(epoch FROM clock_timestamp()))::bigint)))"
-                );
-                let rows = client
-                    .query_typed(&statement, &[(&code_hash, Type::TEXT)])
-                    .await
-                    .map_err(|_| StoreError)?;
-                // `query_opt`'s rule: more than one row is an error.
-                if rows.len() > 1 {
-                    return Err(StoreError);
-                }
-                rows.first().map(invite_from_row).transpose()
+                invite_by_hash_on(&client, code_hash).await
             },
             TOTAL_TIMEOUT_MS,
         )

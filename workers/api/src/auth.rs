@@ -543,11 +543,11 @@ impl SingleUseClaim<'_> {
                     FOR SHARE
                 ) w ON TRUE
             )
-            UPDATE invite_codes SET used = TRUE, redeemed_by = $2, redeemed_at = $3
+            UPDATE invite_codes SET used = TRUE, redeemed_by = $2,
+                redeemed_at = CASE WHEN checked.kind = 'member' THEN live_now ELSE $3 END
             FROM checked
             WHERE code_hash = $1 AND used = FALSE AND redeemed_at IS NULL AND revoked_at IS NULL
-              AND expires_at > $3
-              AND (checked.kind = 'admin' OR (checked.kind = 'member'
+              AND ((checked.kind = 'admin' AND expires_at > $3) OR (checked.kind = 'member'
                    AND starts_at <= live_now AND live_now < ends_at AND live_now < expires_at))
               AND (email IS NULL OR EXISTS (SELECT 1 FROM users WHERE id = $2 AND lower(email) = lower(invite_codes.email)))
               AND NOT EXISTS (SELECT 1 FROM users issuer JOIN users redeemer ON lower(redeemer.email) = lower(issuer.email)

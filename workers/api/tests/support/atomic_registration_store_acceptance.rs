@@ -2414,8 +2414,10 @@ async fn assert_member_enrollment(client: &Client, fixture: &Fixture, accepted: 
         .await;
     let audits = client
         .query(
-            "SELECT details::text FROM audit_log WHERE action = 'invite.redeemed' AND subject_user_id = $1",
-            &[&fixture.credential.user_id],
+            "SELECT a.details::text, a.at = i.redeemed_at AND i.redeemed_at >= w.starts_at AND i.redeemed_at < w.ends_at
+             FROM audit_log a, invite_codes i JOIN invite_windows w ON w.id = i.window_id
+             WHERE a.action = 'invite.redeemed' AND a.subject_user_id = $1 AND i.id = $2",
+            &[&fixture.credential.user_id, &fixture.invite.id],
         )
         .await
         .unwrap();
@@ -2423,6 +2425,10 @@ async fn assert_member_enrollment(client: &Client, fixture: &Fixture, accepted: 
     if let Some(audit) = audits.first() {
         let details: serde_json::Value = serde_json::from_str(audit.get(0)).unwrap();
         assert_eq!(details, serde_json::json!({"invite_id": fixture.invite.id}));
+        assert!(
+            audit.get::<_, bool>(1),
+            "redemption and audit must share a time inside the window"
+        );
     }
 }
 
@@ -2441,14 +2447,18 @@ async fn remove_member_window_fixture(client: &Client, window: i64) {
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
-    use super::claim_single_use_on;
+    use super::{claim_single_use_on, invite_by_hash_on};
     use crate::auth::SingleUseClaim;
 
     run_test(async {
         let mut client = connect().await;
         let (window, end) = seed_member_window(&client, 600).await;
         let now = end - 600;
+        let admin = Fixture::seed(&client).await;
         let open = seed_member_claim(&client, window, end + 600).await;
+        for code in [&admin.invite.code_hash, &open.invite.code_hash] {
+            assert!(invite_by_hash_on(&client, code).await.unwrap().is_some());
+        }
         finish_with_invite(&mut client, &open).await.unwrap();
         assert_member_enrollment(&client, &open, true).await;
         assert!(finish_with_invite(&mut client, &open).await.is_err());
@@ -2487,6 +2497,10 @@ fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
                 None
             };
             let fixture = seed_member_claim(&client, window, now + 1800).await;
+            let preflight = invite_by_hash_on(&client, &fixture.invite.code_hash)
+                .await
+                .unwrap();
+            assert!(preflight.is_none(), "preflight: {case}");
             assert!(
                 finish_with_invite(&mut client, &fixture).await.is_err(),
                 "{case}"
@@ -2532,21 +2546,18 @@ fn postgres_member_enrollment_rechecks_window_after_waiting() {
         let enroll_pid = backend_pid(&enroll).await;
         let (admin, _) = seed_admin_test_users(&observer).await;
 
-        for early_close in [true, false] {
-            let (window, end) =
-                seed_member_window(&observer, if early_close { 600 } else { 4 }).await;
-            let mut fixture = seed_member_claim(&observer, window, end + 600).await;
-            let prepared = if early_close { end - 601 } else { end - 4 };
-            fixture.invite.redeemed_at = Some(prepared.try_into().unwrap());
+        for blocked_on in ["close", "window", "invite"] {
+            let (window, end) = seed_member_window(&observer, 600).await;
+            let fixture = seed_member_claim(&observer, window, end + 600).await;
             holder.batch_execute("BEGIN").await.unwrap();
-            if early_close {
+            if blocked_on == "close" {
                 // Stall the real close on its audit INSERT after its UPDATE takes
                 // the window row lock. SHARE on the table allows the audit read.
                 holder
                     .batch_execute("LOCK TABLE audit_log IN SHARE MODE")
                     .await
                     .unwrap();
-                let close_at = prepared as u64 + 1;
+                let close_at = (end - 600) as u64;
                 let (closed, enrolled) = futures_util::future::join(
                     write(
                         &mut close,
@@ -2574,11 +2585,19 @@ fn postgres_member_enrollment_rechecks_window_after_waiting() {
                 );
                 assert!(enrolled.is_err(), "the committed early close must win");
             } else {
+                // Set the short deadline only after seeding all enrollment rows.
+                let end: i64 = observer.query_one(
+                    "UPDATE invite_windows SET ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint + 4
+                     WHERE id = $1 RETURNING ends_at", &[&window],
+                ).await.unwrap().get(0);
+                let lock = if blocked_on == "window" {
+                    "SELECT w.id FROM invite_windows w JOIN invite_codes i ON i.window_id = w.id
+                     WHERE i.code_hash = $1 FOR NO KEY UPDATE OF w"
+                } else {
+                    "SELECT id FROM invite_codes WHERE code_hash = $1 FOR NO KEY UPDATE"
+                };
                 holder
-                    .query_one(
-                        "SELECT id FROM invite_windows WHERE id = $1 FOR NO KEY UPDATE",
-                        &[&window],
-                    )
+                    .query_one(lock, &[&fixture.invite.code_hash])
                     .await
                     .unwrap();
                 let (enrolled, ()) = futures_util::future::join(
