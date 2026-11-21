@@ -40,21 +40,33 @@ test('signed-in route replacement and pause/resume keep the same listen until co
 	expect(await audio?.evaluate((node) => node === document.querySelector('audio'))).toBe(true);
 	await page.evaluate(() => window.sharedListenFixture.media('playing'));
 	expect(await journal(page)).toEqual([row(0, 'start')]);
-	await page.evaluate(() => {
+	await page.evaluate((next) => {
 		const f = window.sharedListenFixture;
-		f.media('ended'); f.media('ended'); f.abandon(); f.detach();
-	});
-	expect(await journal(page)).toEqual([row(0, 'start'), row(0, 'complete')]);
+		f.media('ended'); f.media('ended'); f.abandon();
+		f.issue(next); f.media('playing');
+		// Source teardown clears audio.ended before the ended event arrives.
+		f.setEnded(true); f.media('timeupdate'); f.setEnded(false);
+		f.media('emptied'); f.detach();
+	}, ids[1]);
+	expect(await journal(page)).toEqual([row(0, 'start'), row(0, 'complete'), row(1, 'start'), row(1, 'complete')]);
 });
 
 test('missing identity and initial error are silent; error and abandonment each end once', async ({ page }) => {
-	await page.evaluate(([first, next]) => {
+	const checkpoints = await page.evaluate(([first, next]) => {
 		const f = window.sharedListenFixture;
 		f.media('playing'); f.issue(first); f.media('error');
-		f.media('playing'); f.media('error'); f.media('playing'); f.media('emptied');
-		f.issue(next); f.media('playing'); f.abandon(); f.abandon(); f.detach();
+		const beforeStart = f.read();
+		f.media('playing'); f.media('error');
+		const afterError = f.read();
+		f.media('playing'); f.media('emptied');
+		f.issue(next); f.media('playing'); f.abandon(); f.abandon();
+		const afterAbandon = f.read();
+		f.detach();
+		return { beforeStart, afterError, afterAbandon };
 	}, ids);
-	expect(await journal(page)).toEqual([row(0, 'start'), row(0, 'skip'), row(1, 'start'), row(1, 'skip')]);
+	const skipped = [row(0, 'start'), row(0, 'skip'), row(1, 'start'), row(1, 'skip')];
+	expect(checkpoints).toEqual({ beforeStart: [], afterError: skipped.slice(0, 2), afterAbandon: skipped });
+	expect(await journal(page)).toEqual(skipped);
 });
 
 test('persisted pagehide ends the listen and restoration needs fresh identity and playing', async ({ page }) => {

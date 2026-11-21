@@ -35,6 +35,7 @@ const fixture = {
 	read,
 	issue: (id: string) => { grant = id; },
 	media: (name: string) => audio.dispatchEvent(new Event(name)),
+	setEnded: (ended: boolean) => Object.defineProperty(audio, 'ended', { configurable: true, value: ended }),
 	abandon: () => observer.finish(audio),
 	detach,
 	hold: () => { held = true; },
