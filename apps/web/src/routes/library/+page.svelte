@@ -341,7 +341,15 @@
 			retainedQueueWithoutListing = !authBoundary && (state.loading || state.libraryUnavailable || !!state.loadError) &&
 				(retainedQueueWithoutListing || queueController.snapshot.tracks.length > 0);
 			requiresSignIn = state.requiresSignIn;
-			if (authBoundary) queueFilterQuery = '';
+			if (authBoundary) {
+				queueFilterQuery = '';
+				// A verification refusal can precede the route's storage event.
+				clearFavoritesExportFeedback();
+				releaseFavoritesDownload();
+				favorites = [];
+				favoritesInitialized = false;
+				favoritesAnnouncement = '';
+			}
 			if (state.loadError && state.items.length === 0) {
 				findQuery = '';
 				findScope = 'both';

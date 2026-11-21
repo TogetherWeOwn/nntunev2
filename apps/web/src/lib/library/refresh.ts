@@ -1,9 +1,15 @@
+import { PUBLIC_API_BASE_URL } from '$app/env/public';
+import { ApiClient, ApiError } from '../api/client.js';
+import { captureAuthFence } from '../auth-fence.js';
 import {
+	browserStorage,
 	clearSnapshot,
+	establishVerifiedLibraryScope,
 	LIBRARY_AUTH_TRANSITION_KEY,
 	loadSnapshot,
 	saveSnapshot,
 	toLibraryItems,
+	verifiedFavoritesKey,
 	type LibraryItem,
 	type LibrarySnapshot,
 	type SnapshotStorage
@@ -29,8 +35,12 @@ export interface LibraryRefreshUpdate {
 	isCurrent: () => boolean;
 	/** A successful response or an explicit invalidation, never cached fallback. */
 	authoritative: boolean;
-	/** The account purge ran before this empty snapshot was published. */
+	/** The Library scope was revoked before publishing this empty view. */
 	authBoundary: boolean;
+	/** Verified binding for these Library rows; not device import provenance. */
+	sessionBinding?: string;
+	/** Exact localStorage favorites key eligible for the verified binding. */
+	deviceScope?: string;
 }
 
 export interface LibraryRefresherDeps {
@@ -42,7 +52,19 @@ export interface LibraryRefresherDeps {
 	onAccessRefused?: () => void;
 	/** Called after state mutations so the page can mirror them reactively. */
 	onStateChange?: (state: LibraryRefreshState, update: LibraryRefreshUpdate) => void;
+	verifySession?: (binding: string, signal: AbortSignal) => Promise<boolean>;
 	timeoutMs?: number;
+}
+
+async function verifyLibrarySession(binding: string, signal: AbortSignal): Promise<boolean> {
+	try {
+		const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal });
+		const result = await client.get<{ session_binding?: unknown }>('/v1/me/likes/session');
+		return result?.session_binding === binding;
+	} catch (error) {
+		if (error instanceof ApiError && (error.status === 401 || error.status === 403)) return false;
+		throw error;
+	}
 }
 
 export interface LibraryRefresher {
@@ -73,6 +95,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		requiresSignIn: false
 	};
 	let authenticatedThisLoad = false;
+	let verified: { binding: string; isStillAuth: () => boolean } | undefined;
 	let inMemorySnapshot: LibrarySnapshot | null = null;
 	let activeRequest: AbortController | null = null;
 	let requestGeneration = 0;
@@ -86,6 +109,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	async function refresh(fetchFn: typeof fetch = fetch): Promise<void> {
 		if (disposed || activeRequest) return;
 		const isCurrent = startReceipt();
+		const isStillAuth = captureAuthFence();
 		const controller = new AbortController();
 		activeRequest = controller;
 		state.loading = true;
@@ -94,6 +118,8 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		state.requiresSignIn = false;
 		let authoritative = false;
 		let authBoundary = false;
+		let binding: string | null = null;
+		let deviceScope: string | undefined;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -259,6 +285,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				// The list endpoint has not landed yet. Do not treat a 404 as
 				// session verification or expose a previously saved snapshot.
 				authenticatedThisLoad = false;
+				verified = undefined;
 				inMemorySnapshot = null;
 				state.items = [];
 				state.staleAt = null;
@@ -268,6 +295,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			}
 			if (response.status === 401 || response.status === 403) {
 				authenticatedThisLoad = false;
+				verified = undefined;
 				inMemorySnapshot = null;
 				state.items = [];
 				state.staleAt = null;
@@ -291,11 +319,31 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			activeResponse = null;
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
+			binding = response.headers?.get('x-nntune-session-binding') ?? null;
+			if (binding) {
+				if (!isStillAuth()) return applyAuthTransition();
+				const verify = deps.verifySession ?? verifyLibrarySession;
+				const matches = await Promise.race([verify(binding, controller.signal), timeout, aborted]);
+				if (!isCurrent() || controller.signal.aborted) return;
+				if (!matches || !isStillAuth() || (verified && verified.binding !== binding)) {
+					return applyAuthTransition();
+				}
+			} else if (verified) {
+				throw new Error('library response lost its session binding');
+			}
+			const storage = deps.sessionStorage();
+			if (!isCurrent()) return;
+			if (binding) {
+				if (!isStillAuth() || establishVerifiedLibraryScope(storage, browserStorage('local'), binding) === 'replaced') {
+					return applyAuthTransition();
+				}
+				deviceScope = verifiedFavoritesKey(storage, binding) ?? undefined;
+				if (!isStillAuth()) return applyAuthTransition();
+				verified = { binding, isStillAuth };
+			}
 			authenticatedThisLoad = true;
 			state.items = fresh;
 			state.staleAt = null;
-			const storage = deps.sessionStorage();
-			if (!isCurrent()) return;
 			const persistedSnapshot = saveSnapshot(storage, fresh);
 			if (!isCurrent()) return;
 			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
@@ -322,8 +370,19 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			activeReader = null;
 			if (activeRequest === controller) activeRequest = null;
 			if (isCurrent()) {
-				state.loading = false;
-				deps.onStateChange?.(state, { isCurrent, authoritative, authBoundary });
+				const publishedFence = verified?.isStillAuth;
+				if ((binding && !isStillAuth()) || (publishedFence && !publishedFence())) {
+					applyAuthTransition();
+				} else {
+					state.loading = false;
+					deps.onStateChange?.(state, {
+						isCurrent: () => isCurrent() && (!publishedFence || publishedFence()),
+						authoritative,
+						authBoundary,
+						sessionBinding: authoritative ? binding ?? undefined : undefined,
+						deviceScope
+					});
+				}
 			}
 		}
 	}
@@ -341,6 +400,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		if (!isCurrent()) return;
 		activeRequest = null;
 		authenticatedThisLoad = false;
+		verified = undefined;
 		inMemorySnapshot = null;
 		clearSnapshot(deps.sessionStorage());
 		if (!isCurrent()) return;

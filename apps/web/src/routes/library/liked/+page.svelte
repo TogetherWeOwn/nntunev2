@@ -27,7 +27,12 @@
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache,
-		onStateChange: (state) => {
+		onStateChange: (state, { isCurrent, authBoundary }) => {
+			if (!isCurrent()) return;
+			if (authBoundary) {
+				pendingChanges.clear();
+				favoriteIds = [];
+			}
 			items = state.items;
 			loading = state.loading;
 			loadError = state.loadError;
