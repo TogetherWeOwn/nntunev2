@@ -54,6 +54,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	const seekFeedback = writable({ restartCanSeek: false, restartStatus: '', restartStatusVersion: 0,
 		jumpStatus: '', jumpStatusVersion: 0 });
 	const absoluteSeek = writable<AbsoluteSeekState>(emptySeek);
+	let seekAnchor = 0;
 	let lastJumpTarget: number | undefined;
 	let destroyed = false;
 	let positionIntent = 0;
@@ -358,8 +359,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!matches()) return;
 		const prior = get(absoluteSeek);
 		const previous = prior.attachment === attachment ? prior : emptySeek;
-		// Only a new seek with changed native readback can supersede a refusal.
-		const message = feedback ?? (nativeSeeking && observation.position !== previous.position ? '' : previous.feedback);
+		// In-flight time/progress updates move the thumb, not the seek comparison point.
+		const message = feedback ?? (nativeSeeking && observation.position !== seekAnchor ? '' : previous.feedback);
+		if (feedback !== undefined || nativeSeeking || !observation.seeking) seekAnchor = observation.position;
 		const elapsed = observation.seeking ? previous.elapsed : observation.position;
 		if (prior.attachment !== attachment || previous.position !== observation.position ||
 			previous.duration !== observation.duration || previous.enabled !== observation.enabled ||

@@ -347,7 +347,7 @@ test('destroy retires the active node and refuses later mounts', () => {
 	expect(audio.pause).toHaveBeenCalledOnce();
 });
 
-test('absolute seek cancels deferred share and uses native time, including refused or unavailable targets', () => {
+test.each([false, true])('absolute seek uses native time and clears stale refusal (early timeupdate: %s)', (early) => {
 	const media = createMediaController(() => true, coral);
 	const native = new SeekableAudio();
 	media.attach(native as unknown as HTMLAudioElement);
@@ -373,6 +373,8 @@ test('absolute seek cancels deferred share and uses native time, including refus
 	}
 	native.currentTime = 60;
 	native.seeking = true;
+	if (early) native.dispatchEvent(new Event('timeupdate'));
+	expect(state()).toMatchObject({ position: early ? 60 : 32, elapsed: 32, feedback: 'That position is not seekable yet.' });
 	native.dispatchEvent(new Event('seeking'));
 	native.seeking = false;
 	native.dispatchEvent(new Event('seeked'));

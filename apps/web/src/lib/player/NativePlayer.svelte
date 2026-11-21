@@ -64,9 +64,7 @@
 			Restart current track
 		</button>
 	</div>
-	{#key seekState.attachment}
-		<PlayerSeek state={seekState} {seek} />
-	{/key}
+	{#key seekState.attachment}<PlayerSeek state={seekState} {seek} />{/key}
 	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
 	{#if !restartCanSeek}
 		<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>

@@ -7,7 +7,6 @@ const items = ['Coral', 'Pine'].map((title, i) => ({
 
 test('pointer and keyboard seek the real layout decoder and follow its readback', async ({ page }) => {
 	await page.route('**/api/library', (route) => route.fulfill({ json: items }));
-	// This route serves a real generated WAV with HTTP Range responses.
 	const rangeResponse = page.waitForResponse((response) =>
 		response.url().endsWith(items[0].streamUrl) && response.status() === 206);
 	await page.goto(`/library?track=${items[0].id}&t=2`);
@@ -62,7 +61,6 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	await expectTime(4);
 	await expect(slider).toBeFocused();
 
-	// Simulate a partial seekable range without modifying the decoder time.
 	await audio.evaluate((el: HTMLAudioElement) => {
 		Object.defineProperty(el, 'seekable', { configurable: true, get: () => ({ length: 1, start: () => 0, end: () => 5 }) });
 	});
