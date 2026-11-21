@@ -14,7 +14,7 @@ export interface TrackLikeOwner {
 	confirm: (requestId: string, confirmedId: string, liked: boolean) => void;
 	failed: (id: string, error: unknown, taste?: boolean) => void;
 	taste?: {
-		read: (id: string) => TrackTaste | null;
+		read: (id: string) => TrackTaste | null | undefined;
 		confirm: (id: string, value: TrackTaste | null) => void;
 		verify: () => Promise<boolean>;
 		invalidate: () => void;
@@ -94,7 +94,7 @@ export function createTrackLikeControls(
 			pending: inFlight.has(id),
 			toggle: () => write(() => setTrackLike(owner.client, id, !liked, binding),
 				(confirmedId) => owner.confirm(id, confirmedId, !liked)),
-			taste: taste ? {
+			taste: taste && saved !== undefined ? {
 				saved: visible?.signal,
 				set: (signal: TasteSignal | null) => signal === null && !visible ? Promise.resolve() :
 					write(() => saveTrackTaste(owner.client, binding, id, signal), (value) => taste.confirm(id, value), taste)

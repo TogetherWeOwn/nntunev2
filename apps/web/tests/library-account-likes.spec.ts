@@ -307,3 +307,26 @@ test('track preferences replace a Like in Tracks, Queue and Liked Songs without 
 	await expect(page.getByText('Track preference cleared.')).toBeVisible();
 	await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
 });
+
+test('an auth fence invalidation dismisses the open preference menu without refreshing Library', async ({ page }) => {
+	await seedLibrary(page);
+	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes() }));
+	await page.route('**/v1/me/taste/session', (route) => route.fulfill({
+		json: likes([{ kind: 'track', target_id: TRACK, signal: 'hide', until: null }])
+	}));
+	await page.goto('/library');
+	const row = page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' });
+	await expect(row.getByRole('button', { name: 'Like Coral Horizon', exact: true })).toBeVisible();
+	await row.getByTestId('track-more').click();
+	await page.getByRole('menuitem', { name: 'Track preferences', exact: true }).press('Enter');
+	await expect(page.getByRole('menuitemcheckbox', { name: 'Hide', exact: true })).toHaveAttribute('aria-checked', 'true');
+	const reloads: string[] = [];
+	page.on('request', (request) => {
+		if (new URL(request.url()).pathname === '/api/library') reloads.push(request.url());
+	});
+	// Deliver only the fence event, not a Library auth-transition notification.
+	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', { key: 'nntune.auth.generation.v1' })));
+	await expect(page.getByTestId('track-context-menu')).toHaveCount(0);
+	await expect(row).toBeVisible();
+	expect(reloads).toEqual([]);
+});

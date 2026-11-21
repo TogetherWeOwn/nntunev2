@@ -88,6 +88,17 @@ const target = { kind: 'track', target_id: track };
 const hide = { ...target, signal: 'hide', until: null };
 const tasteReply = (row = hide, binding = A) => Response.json({ ...row, session_binding: binding });
 
+it('keeps an explicit Hide editable but does not infer absence from full lists', async () => {
+	const { likes, fetcher, tasteRead } = setup();
+	const others = Array.from({ length: 500 }, (_, i) => ({ ...liked, target_id: `Other_${i}` }));
+	fetcher.mockResolvedValueOnce(list(A, [liked, ...others.slice(1)])).mockResolvedValueOnce(session(A));
+	tasteRead.mockResolvedValueOnce(list(A, [{ ...hide, target_id: tracks[1].id },
+		...others.slice(1).map((item) => ({ ...item, signal: 'love', until: null }))]));
+	await likes.publish(listing(), tracks);
+	expect(likes.controls(track)).toMatchObject({ liked: true, taste: undefined });
+	expect(likes.controls(tracks[1].id)).toMatchObject({ taste: { saved: 'hide' } });
+});
+
 it('withholds taste data from a mismatched read without changing verified Likes', async () => {
 	const { likes, fetcher, tasteRead } = setup();
 	tasteRead.mockResolvedValueOnce(list(B, [hide]));

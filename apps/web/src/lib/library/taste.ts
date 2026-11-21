@@ -5,6 +5,7 @@ export type TasteSignal = 'dislike' | 'hide' | 'ban' | 'snooze';
 export type TrackTaste = { signal: TasteSignal; until: number | null };
 
 const PATH = '/v1/me/taste/session';
+const MAX_TASTE_ROWS = 500;
 export const SNOOZE_DAYS = 30;
 const headers = (binding: string) => {
 	if (!validBinding(binding)) throw new Error('Missing verified session binding');
@@ -29,7 +30,7 @@ function preference({ signal, until }: Record<string, unknown>): TrackTaste | nu
 
 export async function loadTrackTaste(client: Pick<ApiClient, 'get'>, binding: string) {
 	const result = record(await client.get<unknown>(PATH, headers(binding)));
-	if (result.session_binding !== binding || !Array.isArray(result.items) || result.items.length > 500) {
+	if (result.session_binding !== binding || !Array.isArray(result.items) || result.items.length > MAX_TASTE_ROWS) {
 		throw new Error('Invalid taste list');
 	}
 	const tracks = new Map<string, TrackTaste | null>();
@@ -42,7 +43,7 @@ export async function loadTrackTaste(client: Pick<ApiClient, 'get'>, binding: st
 		}
 		tracks.set(id, preference(item));
 	}
-	return tracks;
+	return { tracks, complete: result.items.length < MAX_TASTE_ROWS };
 }
 
 /** Only exact, session-bound receipts can update the Library's confirmed state. */

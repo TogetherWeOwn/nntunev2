@@ -9,7 +9,7 @@ import { createTrackLikeControls, type TrackLikeOwner } from './track-like-contr
 import { loadTrackTaste } from './taste.js';
 
 /** One owner per verified Library listing, shared by Tracks and Queue. */
-export function createLibraryTrackLikes() {
+export function createLibraryTrackLikes(onInvalidated?: () => void) {
 	const retry = 'Account likes are unavailable. Refresh the library to try again.';
 	let active: AbortController | undefined;
 	let owner = $state.raw<TrackLikeOwner & { targets: Map<string, string | undefined> }>();
@@ -35,6 +35,7 @@ export function createLibraryTrackLikes() {
 	function invalidate() {
 		if (!active && !feedback) return;
 		retire();
+		onInvalidated?.();
 		feedback = retry;
 	}
 
@@ -68,14 +69,14 @@ export function createLibraryTrackLikes() {
 				for (const item of list.items) if (item.kind === 'track') liked.set(item.targetId, true);
 				// A full response cannot prove the absence of an older like.
 				const unlisted = list.items.length < MAX_LIKES ? false : undefined;
-				const preferences = saved && new SvelteMap(saved);
+				const preferences = saved && new SvelteMap(saved.tracks);
 				owner = {
 					binding, client, targets, readiness: () => receipt,
-					liked: (id) => liked.get(id) ?? unlisted,
+					liked: (id) => liked.get(id) ?? (preferences?.get(id) ? false : unlisted),
 					confirm: (id, confirmedId, value) => {
 						if (id !== confirmedId) return invalidate();
 						liked.set(id, value);
-						if (value) preferences?.delete(id);
+						if (value) preferences?.set(id, null);
 						feedback = '';
 					},
 					failed: (_id, error, taste) => {
@@ -83,12 +84,11 @@ export function createLibraryTrackLikes() {
 						else feedback = `Could not confirm that ${taste ? 'track preference' : 'Like'} change. Try again or refresh the library.`;
 					},
 					taste: preferences && {
-						read: (id) => preferences.get(id) ?? null,
+						read: (id) => preferences.has(id) ? preferences.get(id) : saved?.complete ? null : undefined,
 						verify: () => verifyLibrarySession(binding, signal),
 						invalidate,
 						confirm: (id, value) => {
-							if (value) preferences.set(id, value);
-							else preferences.delete(id);
+							preferences.set(id, value);
 							// These actions replace/delete the same row that backs Like.
 							liked.set(id, false);
 							feedback = value ? 'Track preference saved to your account.' : 'Track preference cleared.';

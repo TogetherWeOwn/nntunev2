@@ -349,7 +349,8 @@
 			collectionReceipt = runIfCurrent;
 			const revoked = authBoundary && !state.verificationSuspended;
 			if (sessionBinding && runIfCurrent) {
-				accountTrackLikes ??= createLibraryTrackLikes();
+				// The menu snapshots checked preferences; retire it with the verified controls.
+				accountTrackLikes ??= createLibraryTrackLikes(() => { trackMenu = null; });
 				void accountTrackLikes.publish(receipt, state.items);
 			} else if (revoked) accountTrackLikes?.clear();
 			else accountTrackLikes?.retire();
