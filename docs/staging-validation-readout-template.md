@@ -44,8 +44,9 @@ synthetic sample data only and must never be cited as a real run.
 - **Production facts presented as staging facts** (or the reverse):
   extrapolated production cost or load must be labelled an estimate with
   its formula, never "measured".
-- **Real content identifiers:** real NZB names, release names, or library
-  contents. The synthetic flow uses checked-in synthetic fixtures only.
+- **Private content identifiers:** production library contents and private
+  filenames. Staging uses [approved audio fixtures](fixture-audio-licences.md)
+  with a tracked manifest and licensed audio bytes stored outside Git.
 
 If any of the above is found in a draft readout, the readout is withdrawn,
 redacted, and re-reviewed before any verdict is recorded.
@@ -145,10 +146,10 @@ evidence IDs. Rows marked † are must-pass for a `GO`.
 | 3† | Test-mode subscription | The synthetic listener subscribes in test mode and has active playback entitlement | | |
 | 4† | Admin publication | An admin publishes a matched curated FLAC release and entitled accounts see it in the shared catalogue | | |
 | 5† | Play / seek | The shared track plays in the web player and continues after a player seek | | |
-| 6† | Metering and limits | Playback accrues usage, and the cap and lapse controls refuse new playback | | |
+| 6 | Metering and limits | Optional evidence for the separate metering milestone, including accrual, cap and lapse behavior | | |
 | 7† | Rollback | Record the last-good push deploy before promotion, then verify the rerun, restored SHA, health and separate Worker outcomes | | |
 
-Record the exact serving SHA at the start and end of the post-deploy journey
+Row 6 tracks separate milestone evidence. Record the exact serving SHA at the start and end of the post-deploy journey
 and cite the associated passing run. For row 7, cite both the last-good
 push deploy and the successful rollback rerun. Follow the
 [staging promotion checklist](ops.md#staging-promotion-checklist).

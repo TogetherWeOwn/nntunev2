@@ -89,8 +89,10 @@ on `main`.
    An accepted rollback pointer and successful restore run are still outstanding
    in this readout.
 
-M1 exit remains open. Production requires the full passing journey and an
-[attempt-bound candidate admission receipt](../ci/staging-admission.md).
+M1 exit remains open. The [current production preflight](../.github/workflows/deploy-production.yml#L128)
+accepts only `bootstrap-maintenance` and refuses application promotion even
+when the lane is enabled. Application promotion also requires the full
+passing journey and an [attempt-bound candidate admission receipt](../ci/staging-admission.md).
 The [admission policy](../ci/staging-admission-policy.json) has no approvals.
 Product approval of the journey contract and separate QA approval of the
 executable evidence mapping are still required. Release Manager acceptance
