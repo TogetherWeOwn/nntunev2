@@ -24,6 +24,13 @@ const P: i64 = 30 * 24 * 60 * 60;
 const CUS: &str = "cus_a";
 const PRICE: &str = "price_plus_test";
 
+fn paid_coverage_fixture_migration() -> &'static str {
+    // Keep DDL in the fixture's isolated schema rather than public.
+    include_str!("../../../migrations/0059_paid_invoice_covered_periods.sql")
+        .strip_prefix("SET search_path = public, pg_catalog;")
+        .expect("migration must pin its production search path")
+}
+
 fn disposable_config(url: &str) -> Result<Config, &'static str> {
     let config: Config = url.parse().map_err(|_| "invalid test database URL")?;
     if config.get_dbname() != Some("nntune_ci") {
@@ -101,7 +108,7 @@ impl Fx {
             include_str!("../../../migrations/0021_billing_schema.sql"),
             include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
             include_str!("../../../migrations/0029_paid_invoice_history.sql"),
-            include_str!("../../../migrations/0059_paid_invoice_covered_periods.sql"),
+            paid_coverage_fixture_migration(),
         ] {
             db.batch_execute(migration).await.unwrap();
         }
@@ -410,15 +417,18 @@ async fn exact_paid_periods_preserve_gaps_and_only_hydrate_owned_history() {
         livemode: false,
     });
     let snapshot = remote("sub_a", &[paid]);
-    let o = reconcile_subscription(
-        &ReconcileInput {
-            stripe_customer_id: Some(CUS.into()),
-            live: None,
-            bindings: prices,
-        },
-        &snapshot,
-        T,
-    );
+    let fold = |live| {
+        reconcile_subscription(
+            &ReconcileInput {
+                stripe_customer_id: Some(CUS.into()),
+                live,
+                bindings: prices.clone(),
+            },
+            &snapshot,
+            T,
+        )
+    };
+    let o = fold(None);
     let reported = &o.history[0];
     assert_eq!(reported.plan_id, "plus");
     assert_eq!(
@@ -468,12 +478,13 @@ async fn exact_paid_periods_preserve_gaps_and_only_hydrate_owned_history() {
         }
         let before = fx.db.query_one(read, &[&(T as f64)]).await.unwrap();
         assert_eq!(before.get::<_, Option<bool>>(1), None);
-        fx.put("u1", &o).await;
+        let replay = fold(fx.select("u1", Some("sub_a")).await);
+        fx.put("u1", &replay).await;
         let after = fx.db.query_one(read, &[&(T as f64)]).await.unwrap();
         assert_eq!(before.get::<_, String>(0), after.get::<_, String>(0));
         assert_eq!(after.get::<_, Option<bool>>(1), exact);
     }
-    let mut changed_replay = o;
+    let mut changed_replay = fold(fx.select("u1", Some("sub_a")).await);
     changed_replay.history[0].covered_periods = vec![(T + 20, T + 22)];
     fx.put("u1", &changed_replay).await;
     assert!(fx
@@ -1207,7 +1218,7 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
             include_str!("../../../migrations/0021_billing_schema.sql"),
             include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
             include_str!("../../../migrations/0029_paid_invoice_history.sql"),
-            include_str!("../../../migrations/0059_paid_invoice_covered_periods.sql"),
+            paid_coverage_fixture_migration(),
         ] {
             db.batch_execute(migration).await?;
         }

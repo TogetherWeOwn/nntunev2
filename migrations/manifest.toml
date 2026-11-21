@@ -299,4 +299,4 @@ sha256 = "567a3838e2efdd1af0e45ffb17d52f41a47d03a0f7928f80d5c34db872d9d119"
 [[migration]]
 file = "0059_paid_invoice_covered_periods.sql"
 target = "app"
-sha256 = "07a03a7a2210f223ac3a1a2b1427e4d58d8dcdd4c53245ed38ec88ae2507f0ae"
+sha256 = "cb8b5ff85c2d2ef3cf732f74e8a9baf3e9da143d76aa0c87045972695f8a1923"
