@@ -194,20 +194,21 @@ pub(crate) fn audio_bucket_from_env(env: &Env) -> Option<String> {
 /// plus opaque IDs and counters, so the drop branch only fires on a code bug.
 pub(crate) fn emit(level: Level, trace_id: &str, event: &str, fields: serde_json::Value) {
     let ts_millis = worker::Date::now().as_millis();
-    let Ok(field_map) = nntune_logging::fields_from_json(fields) else {
-        return;
-    };
-    let Ok(record) = LogRecord::new(
-        LogWorker::Ingest,
-        level,
-        trace_id,
-        event,
-        field_map,
-        ts_millis,
-    ) else {
+    let Some(record) = log_record(level, trace_id, event, fields, ts_millis) else {
         return;
     };
     console_log!("{}", record.to_json_line());
+}
+
+fn log_record(
+    level: Level,
+    trace_id: &str,
+    event: &str,
+    fields: serde_json::Value,
+    ts_millis: u64,
+) -> Option<LogRecord> {
+    let fields = nntune_logging::fields_from_json(fields).ok()?;
+    LogRecord::new(LogWorker::Ingest, level, trace_id, event, fields, ts_millis).ok()
 }
 
 /// Echo the request trace on a response so callers can correlate.
@@ -618,7 +619,7 @@ fn meter_entry_stage(source: JobSource) -> &'static str {
 /// owned by `metering.rs`: the full [`metering::meter_write_body`] JSON rides in blob1,
 /// with the stage as the single index and the attempt as double1 for queries.
 struct EdgeMeterSink<'a> {
-    dataset: &'a worker::AnalyticsEngineDataset,
+    env: &'a Env,
 }
 
 impl MeterSink for EdgeMeterSink<'_> {
@@ -628,6 +629,8 @@ impl MeterSink for EdgeMeterSink<'_> {
         body: serde_json::Value,
     ) -> Result<u16, MeterTransportReason> {
         debug_assert_eq!(dataset, METER_DATASET);
+        let dataset = MeterTransportReason::BindingMissing
+            .redact(self.env.analytics_engine(METER_DATASET_BINDING))?;
         let stage = body.get("stage").and_then(|v| v.as_str()).unwrap_or("");
         let attempt = body.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
         let job_id = body.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -639,9 +642,8 @@ impl MeterSink for EdgeMeterSink<'_> {
             .blobs([event_json.as_str(), job_id, user_id, outcome])
             .doubles([attempt])
             .build();
-        MeterTransportReason::WriteFailed
-            .redact(self.dataset.write_data_point(&point))
-            .map(|()| 200)
+        MeterTransportReason::WriteFailed.redact(dataset.write_data_point(&point))?;
+        Ok(200)
     }
 }
 
@@ -650,31 +652,25 @@ fn meter_failure_fields(err: &MeterWriteError, build_sha: String) -> serde_json:
 }
 
 /// Write one stage-transition meter event through the `INGEST_METER` binding.
-/// Binding and write failures are retryable; an unknown stage never writes.
+/// Reject unknown stages before looking up the binding. Binding and write failures are retryable.
 pub(crate) fn try_meter(
     env: &Env,
     msg: &QueueMsg,
     stage: &str,
     outcome: MeterOutcome,
 ) -> Result<(), MeterWriteError> {
-    let dataset = match MeterTransportReason::BindingMissing
-        .redact(env.analytics_engine(METER_DATASET_BINDING))
-    {
-        Ok(dataset) => dataset,
-        Err(reason) => {
-            let err = MeterWriteError::Transport(reason);
+    let mut sink = EdgeMeterSink { env };
+    match emit_meter(&mut sink, msg, stage, outcome) {
+        Ok(()) => Ok(()),
+        Err(err @ MeterWriteError::Transport(MeterTransportReason::BindingMissing)) => {
             emit(
                 Level::Error,
                 &nntune_logging::resolve_trace_id(msg.trace_id.as_deref()),
                 "ingest.meter.binding_missing",
                 meter_failure_fields(&err, build_sha_from_env(env)),
             );
-            return Err(err);
+            Err(err)
         }
-    };
-    let mut sink = EdgeMeterSink { dataset: &dataset };
-    match emit_meter(&mut sink, msg, stage, outcome) {
-        Ok(()) => Ok(()),
         Err(err) => {
             emit(
                 Level::Error,
@@ -689,12 +685,13 @@ pub(crate) fn try_meter(
 
 /// Keep the public error generic while the log retains the fixed reason code.
 fn meter_failure_projection(err: &MeterWriteError) -> (ApiError, Option<&'static str>) {
-    match err.http_status() {
-        503 => (
+    if err.is_retryable() {
+        (
             ApiError::service_unavailable("service unavailable"),
             Some("5"),
-        ),
-        _ => (ApiError::invalid_request("unknown meter stage"), None),
+        )
+    } else {
+        (ApiError::invalid_request("unknown meter stage"), None)
     }
 }
 
@@ -2522,58 +2519,52 @@ mod tests {
             }
         }
 
-        let msg = serde_json::from_value(serde_json::json!({
-            "job_id": "", "user_id": "", "idempotency_key": "", "source": "nzb_upload",
-            "state": "queued", "attempt": 1, "query": CANARY,
-        }))
-        .expect("synthetic queue message");
-        let binding = MeterTransportReason::BindingMissing
-            .redact(Err::<(), _>(CANARY))
-            .map_err(MeterWriteError::Transport)
-            .unwrap_err();
+        let mut msg = admission_msg();
+        msg.query = Some(CANARY.to_owned());
         let run = |status, stage| {
             let mut sink = Sink(Some(status));
             let err = emit_meter(&mut sink, &msg, stage, MeterOutcome::Retry).unwrap_err();
             assert_eq!(sink.0.is_some(), stage == CANARY);
             err
         };
-        let write = run(
-            MeterTransportReason::WriteFailed.redact(Err(CANARY)),
-            "probe",
-        );
-        for (err, reason, status, retry_after) in [
-            (binding, "meter_binding_missing", 503, Some("5")),
-            (write, "meter_write_failed", 503, Some("5")),
+        let binding = MeterTransportReason::BindingMissing.redact(Err(CANARY));
+        let write = MeterTransportReason::WriteFailed.redact(Err(CANARY));
+        for (err, reason, status) in [
+            (run(binding, "probe"), "meter_binding_missing", 503),
+            (run(write, "probe"), "meter_write_failed", 503),
+            (run(Ok(502), "probe"), "meter_write_rejected", 503),
+            (run(binding, CANARY), "meter_unknown_stage", 400),
             (
-                run(Ok(502), "probe"),
-                "meter_write_rejected",
+                MeterWriteError::AdmissionLedgerUnavailable,
+                "admission_ledger_unavailable",
                 503,
-                Some("5"),
             ),
-            (run(Ok(200), CANARY), "meter_unknown_stage", 400, None),
         ] {
             assert_eq!(err.to_string(), reason);
             assert!(!format!("{err:?}").contains(CANARY));
-            let fields = meter_failure_fields(&err, "unknown".to_string());
-            let line = LogRecord::new(
-                LogWorker::Ingest,
-                Level::Error,
-                &nntune_logging::resolve_trace_id(None),
-                "ingest.meter.write_failed",
-                nntune_logging::fields_from_json(fields).unwrap(),
-                0,
-            )
-            .expect("meter diagnostic must survive log field validation")
-            .to_json_line();
-            assert!(!line.contains(CANARY));
-            let log: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(
-                log["fields"],
-                serde_json::json!({"reason": reason, "build_sha": "unknown"})
-            );
+            if err != MeterWriteError::AdmissionLedgerUnavailable {
+                let event = if reason == "meter_binding_missing" {
+                    "ingest.meter.binding_missing"
+                } else {
+                    "ingest.meter.write_failed"
+                };
+                let fields = meter_failure_fields(&err, "unknown".to_string());
+                let trace = "0123456789abcdef0123456789abcdef";
+                let line = log_record(Level::Error, trace, event, fields, 0)
+                    .expect("meter diagnostic must survive log field validation")
+                    .to_json_line();
+                assert!(!line.contains(CANARY));
+                let log: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(log["event"], event);
+                assert_eq!(
+                    log["fields"],
+                    serde_json::json!({"reason": reason, "build_sha": "unknown"})
+                );
+            }
             let (api_error, header) = meter_failure_projection(&err);
             assert_eq!(api_error.status, status);
-            assert_eq!(header, retry_after);
+            assert_eq!(err.http_status(), status);
+            assert_eq!(header, (status == 503).then_some("5"));
             let body = api_error.body_json();
             assert!(!body.contains(CANARY));
             let expected = if status == 503 {

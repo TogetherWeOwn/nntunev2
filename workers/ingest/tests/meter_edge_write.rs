@@ -6,9 +6,27 @@
 //! `Retry-After`, never 202-and-dropped); the event shape stays owned by
 //! `metering.rs`; the stage allowlist (`WORKFLOW_STEPS`) is unchanged.
 //!
-//! `metering.rs` owns the wire body and accepts only typed sink failures.
-//! An unknown stage never touches the sink; a non-2xx response remains a
-//! rejection, distinct from binding and transport failures.
+//! Meter builder and delivery contract:
+//!
+//! 1. `pub fn meter_write_body(event: &MeterEvent) -> serde_json::Value` —
+//!    the exact wire body for one event. It must round-trip back to the same
+//!    `MeterEvent` and carry exactly the shape `meter_event` built.
+//! 2. `MeterWriteError` uses a fixed reason vocabulary and exposes
+//!    `pub fn http_status(&self) -> u16` (retryable maps to 503,
+//!    `UnknownStage` maps to 400).
+//! 3. `pub trait MeterSink { fn send(&mut self, dataset: &str, body:
+//!    serde_json::Value) -> Result<u16, MeterTransportReason>; }` — deliver one body to the
+//!    named dataset; the `u16` is the HTTP-equivalent status of the dataset
+//!    write and `Err` means the binding/transport failed before any status
+//!    existed. (At the edge this is the `INGEST_METER` binding call; a native
+//!    binding success maps to 2xx.)
+//! 4. `pub fn emit_meter<S: MeterSink>(sink: &mut S, msg: &QueueMsg, stage:
+//!    &str, outcome: MeterOutcome) -> Result<(), MeterWriteError>` — build the
+//!    event with `meter_event` (unknown stage returns `UnknownStage` BEFORE
+//!    touching the sink), deliver exactly one body shaped like the
+//!    `MeterEvent`, and classify the result: 2xx is `Ok`, anything else
+//!    (transport `Err` or non-2xx) is a retryable `Err`. Never `Ok`
+//!    on failure: a dropped event must never look accepted.
 //!
 //! These tests speak plain HTTP to a fake dataset-binding endpoint
 //! (std-only `TcpListener`, no new dependencies): the fake asserts the exact

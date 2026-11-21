@@ -78,12 +78,16 @@ impl MeterTransportReason {
     }
 }
 
-/// How metered admission failed. Retryable failures map to 503 + `Retry-After`;
-/// an unknown stage is a caller bug and maps to 400.
+/// How a meter write or admission ledger failed. A dropped event must never look accepted:
+/// retryable failures map to HTTP 503 + `Retry-After` at the route, while an
+/// unknown stage is a caller bug and maps to 400.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeterWriteError {
-    /// `stage` was not in [`WORKFLOW_STEPS`]; no write was attempted.
+    /// `stage` was not in [`WORKFLOW_STEPS`]. Returned before any write is
+    /// attempted, so the sink is never touched.
     UnknownStage,
+    /// The binding/transport failed before any dataset status existed
+    /// (missing `INGEST_METER` binding, connection refused, timeout).
     Transport(MeterTransportReason),
     /// The dataset endpoint answered with a non-2xx HTTP-equivalent status.
     Rejected {
@@ -151,13 +155,11 @@ pub fn emit_meter<S: MeterSink>(
     outcome: MeterOutcome,
 ) -> Result<(), MeterWriteError> {
     let event = meter_event(msg, stage, outcome)?;
-    let status = sink
-        .send(METER_DATASET, meter_write_body(&event))
-        .map_err(MeterWriteError::Transport)?;
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(MeterWriteError::Rejected { status })
+    let body = meter_write_body(&event);
+    match sink.send(METER_DATASET, body) {
+        Ok(status) if (200..300).contains(&status) => Ok(()),
+        Ok(status) => Err(MeterWriteError::Rejected { status }),
+        Err(reason) => Err(MeterWriteError::Transport(reason)),
     }
 }
 
