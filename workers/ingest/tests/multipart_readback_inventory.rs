@@ -370,24 +370,24 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
 
     let mut tx = writer.transaction().await.unwrap();
     let release = async {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !observer
-                .query_one("SELECT cardinality(pg_blocking_pids($1)) > 0", &[&pid])
-                .await
-                .unwrap()
-                .get::<_, bool>(0)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("append must wait for the previous holder");
+        while !observer
+            .query_one("SELECT cardinality(pg_blocking_pids($1)) > 0", &[&pid])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         held.commit().await.unwrap();
     };
-    let (result, ()) = tokio::join!(
-        append_inventory(&mut tx, &intent, SCOPE, &verified),
-        release
-    );
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            append_inventory(&mut tx, &intent, SCOPE, &verified),
+            release
+        )
+    })
+    .await
+    .expect("append must resume after the previous holder commits");
     assert_eq!(result, Err(MissingOrFenced));
     assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_none());
     tx.rollback().await.unwrap();
