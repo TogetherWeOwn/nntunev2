@@ -26,7 +26,7 @@ function seekableCovers(ranges: TimeRanges, target: number): boolean {
 }
 
 /**
- * Move native media by the fixed step, clamped to [0, duration]. Media
+ * Move native media by the requested step, clamped to [0, duration]. Media
  * without a finite positive duration, a finite position, or a native
  * seekable range covering the target is unavailable and left untouched (a
  * source served without range support reports only [0, 0]). Success needs
@@ -34,7 +34,8 @@ function seekableCovers(ranges: TimeRanges, target: number): boolean {
  * unchanged.
  */
 export function jumpMedia(
-	media: JumpMedia, direction: JumpDirection, matches: () => boolean = () => true, assigned?: () => void
+	media: JumpMedia, direction: JumpDirection, matches: () => boolean = () => true, assigned?: () => void,
+	seconds = RELATIVE_JUMP_SECONDS
 ): JumpOutcome {
 	let target: number;
 	let raw: number;
@@ -48,7 +49,7 @@ export function jumpMedia(
 		if (back ? position <= TOLERANCE : position >= duration - TOLERANCE) {
 			return { kind: 'boundary', edge: back ? 'start' : 'end' };
 		}
-		raw = position + (back ? -RELATIVE_JUMP_SECONDS : RELATIVE_JUMP_SECONDS);
+		raw = position + (back ? -seconds : seconds);
 		target = Math.min(Math.max(raw, 0), duration);
 		if (!seekableCovers(media.seekable, target)) return { kind: 'unavailable' };
 	} catch {
@@ -70,7 +71,7 @@ export function jumpMedia(
 }
 
 /** Polite status text; only a jump that happened is described as one. */
-export function describeJump(direction: JumpDirection, outcome: JumpOutcome): string {
+export function describeJump(direction: JumpDirection, outcome: JumpOutcome, seconds = RELATIVE_JUMP_SECONDS): string {
 	const back = direction === 'back';
 	const word = back ? 'Back' : 'Forward';
 	switch (outcome.kind) {
@@ -78,7 +79,7 @@ export function describeJump(direction: JumpDirection, outcome: JumpOutcome): st
 			const at = formatDuration(outcome.target);
 			return outcome.clamped
 				? `${word} to the ${back ? 'start' : 'end'}, ${at}.`
-				: `${word} ${RELATIVE_JUMP_SECONDS} seconds, now at ${at}.`;
+				: `${word} ${seconds} ${seconds === 1 ? 'second' : 'seconds'}, now at ${at}.`;
 		}
 		case 'boundary':
 			return `Already at the ${outcome.edge}.`;

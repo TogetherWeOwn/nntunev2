@@ -5,7 +5,7 @@ import { resolveStreamUrl } from '../library/stream-url.js';
 import { createPlayerSleepTimer } from './playerSleepTimer.js';
 import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
-import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
+import { describeJump, jumpMedia, RELATIVE_JUMP_SECONDS, type JumpDirection } from './relativeJump.js';
 import { createNativeSound } from './nativeSound.js';
 import { createPendingShareSeek } from './pendingShareSeek.js';
 import { createLivePlaybackSpeed } from './livePlaybackSpeed.js';
@@ -368,7 +368,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		return () => retryShare(current?.audio, revision);
 	}
 
-	function jump(direction: JumpDirection): void {
+	function jump(direction: JumpDirection, seconds = RELATIVE_JUMP_SECONDS): void {
 		if (destroyed || queue.purging) return;
 		const track = currentTrack(queue.snapshot);
 		const source = resolveStreamUrl(track);
@@ -386,11 +386,11 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			const matches = () => !!audio && !!source && matchesSource(audio, source, isCurrent);
 			const outcome = audio && matches() ? jumpMedia(audio, direction, matches, () => {
 				if (current === attachment) clearJumpFeedback();
-			}) : undefined;
+			}, seconds) : undefined;
 			if (outcome ? !matches() : !isCurrent()) return;
 			if (outcome?.kind === 'jumped') lastJumpTarget = outcome.target;
 			seekFeedback.update((feedback) => ({
-				...feedback, jumpStatus: describeJump(direction, outcome ?? { kind: 'unavailable' }),
+				...feedback, jumpStatus: describeJump(direction, outcome ?? { kind: 'unavailable' }, seconds),
 				jumpStatusVersion: feedback.jumpStatusVersion + 1
 			}));
 		});
@@ -685,7 +685,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				sound.connect(audio, target.matches, receipt.listeners.signal);
 				readPlayback(audio, target.matches, 'starting');
 				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
-					{ playCurrent, pauseCurrent }, receipt.listeners.signal);
+					{ playCurrent, pauseCurrent }, receipt.listeners.signal, {
+						audio, attachment: attachmentVersion, availability: absoluteSeek, seek, jump,
+						matches: () => target.matches(() => currentTrack(queue.snapshot)?.id === trackId)
+					});
 			}
 			observePosition();
 			pause(previous?.audio);
