@@ -119,13 +119,42 @@ impl<'a> SidecarPut<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nntune_core::digest_enrollment::DigestEnrollment;
+    use nntune_core::{digest_enrollment::DigestEnrollment, media::PLAIN_CHUNK_SIZE};
 
     fn id(byte: u8) -> [u8; 16] {
         let mut result = [byte; 16];
         result[6] = 0x40;
         result[8] = 0x80;
         result
+    }
+
+    #[test]
+    fn sidecar_binds_the_second_page_to_its_index() {
+        const CHUNKS_PER_PAGE: u64 = 256;
+        let identities = [id(1), id(2), id(3), id(4), id(5), id(6)];
+        let map_id = id(7);
+        let plaintext_len = CHUNKS_PER_PAGE * PLAIN_CHUNK_SIZE + 1;
+        let mut enrollment =
+            DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), map_id)
+                .unwrap();
+        let context = EnvelopeContext {
+            identities,
+            plaintext_len,
+            header: enrollment.header().to_bytes(),
+        };
+        let chunk = vec![42; PLAIN_CHUNK_SIZE as usize];
+        for _ in 1..CHUNKS_PER_PAGE {
+            enrollment.seal_chunk(&chunk).unwrap();
+        }
+        let first_page = enrollment.seal_chunk(&chunk).unwrap().page.unwrap();
+        let second_page = enrollment.seal_chunk(&[43]).unwrap().page.unwrap();
+        let manifest = enrollment.finish().unwrap();
+
+        let put = |page| SidecarPut::new("synthetic", &context, &manifest, map_id, 1, page);
+        let plan = put(&second_page).unwrap();
+        let (target, _) = plan.request();
+        assert!(target.key.ends_with("/00000001"));
+        assert_eq!(put(&first_page).err(), Some(SidecarError::Origin));
     }
 
     #[test]
