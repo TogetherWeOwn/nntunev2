@@ -6874,16 +6874,12 @@ where
         .retrieve_subscription(subscription_id.to_string())
         .await
         .map_err(|_| ())?;
-    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-    let exact = ctx.store.webhook_ack_control();
-    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
-    let exact = false;
     if subscription.id != subscription_id {
         return Err(());
     }
     let input = ctx
         .store
-        .load_reconcile_input(user_id, exact.then_some(subscription_id))
+        .load_reconcile_input(user_id, Some(subscription_id))
         .await
         .map_err(|_| ())?;
     let listed = ctx
@@ -6940,12 +6936,9 @@ where
         invoices,
     };
     let now = billing_now_i64(ctx.now);
-    let outcome = if exact {
+    let outcome =
         crate::billing_reconcile::reconcile_exact_target(subscription_id, input, &remote, now)
-            .ok_or(())?
-    } else {
-        crate::billing_reconcile::reconcile_subscription(&input, &remote, now)
-    };
+            .ok_or(())?;
     ctx.store
         .store_reconcile_outcome(user_id, &outcome)
         .await
@@ -8358,6 +8351,8 @@ mod tests {
         billing_customers: RefCell<HashMap<String, String>>,
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
         remove_billing_row_after_read: std::cell::Cell<bool>,
+        release_live_slot_before_store: std::cell::Cell<bool>,
+        relabel_before_store: std::cell::Cell<bool>,
         reconcile_outcome_attempts: std::cell::Cell<usize>,
         // Displaced rows are retained without changing the per-user projection.
         billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
@@ -10753,7 +10748,8 @@ mod tests {
                 return Err(StoreError);
             }
             use crate::billing_store_classification::{
-                classify_explicit_stale, validate_history_target, Target,
+                classify_explicit_stale, has_slot_suppression_proof, validate_history_target,
+                validate_read_provenance, validate_terminal_provenance, Target,
             };
             validate_history_target(outcome).map_err(|_| StoreError)?;
             if outcome.explicit_stale {
@@ -10782,43 +10778,65 @@ mod tests {
             if !outcome.explicit_stale {
                 let mut rows = self.billing_rows.borrow_mut();
                 let mut shadow = self.billing_shadow.borrow_mut();
-                let key = (
-                    user_id.to_string(),
-                    outcome.row.stripe_subscription_id.clone(),
-                );
+                if self.release_live_slot_before_store.replace(false) {
+                    let holder = rows.get_mut(user_id).expect("live holder before release");
+                    assert_ne!(&holder.stripe_subscription_id, sub);
+                    assert_eq!(holder.status, "active");
+                    holder.status = "canceled".into();
+                }
+                if self.relabel_before_store.replace(false) {
+                    let row = rows.get_mut(user_id).unwrap();
+                    assert_eq!(outcome.read_plan.as_deref(), Some(PLAN_PLUS));
+                    assert_eq!(outcome.row.paid_through_unix, row.paid_through_unix);
+                    assert_eq!(outcome.row.status, "canceled");
+                    row.plan_id = PLAN_PRO.into();
+                }
+                let key = (user_id.to_string(), sub.clone());
                 let current = rows.get(user_id);
                 let stored = current
-                    .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
+                    .filter(|row| &row.stripe_subscription_id == sub)
                     .or_else(|| shadow.get(&key));
-                let merged = merge_billing_row(stored, outcome);
-                // Mirrors `uq_subscriptions_live_slot`: a different live
-                // subscription holding the slot aborts the write before any
-                // row or history mutation.
+                validate_read_provenance(outcome, stored.is_some()).map_err(|_| StoreError)?;
                 let live = |status: &str| {
                     matches!(
                         status,
                         "incomplete" | "active" | "past_due" | "unpaid" | "paused"
                     )
                 };
-                if current.is_some_and(|row| {
-                    row.stripe_subscription_id != merged.stripe_subscription_id
-                        && live(&row.status)
-                        && live(&merged.status)
-                }) {
-                    return Err(StoreError);
+                let occupied = current
+                    .is_some_and(|row| &row.stripe_subscription_id != sub && live(&row.status));
+                if let Some(row) = stored {
+                    let target = Target::Owned {
+                        predicate_stale: false,
+                        other_live_holder: occupied,
+                        equal_end_provenance_changed: row.paid_through_unix.is_some()
+                            && row.paid_through_unix == outcome.row.paid_through_unix
+                            && (Some(row.plan_id.as_str()) != outcome.read_plan.as_deref()
+                                || row.paid_invoice_id != outcome.read_anchor),
+                    };
+                    validate_terminal_provenance(outcome, &target).map_err(|_| StoreError)?;
                 }
-                if let Some(existing) = current {
-                    if existing.stripe_subscription_id != merged.stripe_subscription_id {
+                if occupied && live(&outcome.row.status) {
+                    if stored.is_none() || !has_slot_suppression_proof(outcome) {
+                        return Err(StoreError);
+                    }
+                } else if occupied {
+                    let merged = merge_billing_row(stored, outcome);
+                    shadow.insert(key, merged);
+                } else {
+                    let merged = merge_billing_row(stored, outcome);
+                    if let Some(existing) = current.filter(|row| &row.stripe_subscription_id != sub)
+                    {
                         shadow.insert(
                             (user_id.to_string(), existing.stripe_subscription_id.clone()),
                             existing.clone(),
                         );
                     }
+                    if let Some(retained) = shadow.get_mut(&key) {
+                        *retained = merged.clone();
+                    }
+                    rows.insert(user_id.to_string(), merged);
                 }
-                if let Some(retained) = shadow.get_mut(&key) {
-                    *retained = merged.clone();
-                }
-                rows.insert(user_id.to_string(), merged);
             }
             let mut history = self.invoice_history.borrow_mut();
             for row in &outcome.history {
@@ -12109,6 +12127,53 @@ mod tests {
     }
 
     #[test]
+    fn billing_duplicate_checkout_refolds_equal_end_state() {
+        for status in ["active", "past_due", "canceled"] {
+            let mut h = stripe_harness();
+            seed_billing_user(&h, "u1");
+            let body = deliver_first_period(&h, "evt_test_1");
+            let rows = h.store.billing_rows.get_mut();
+            let ops = h.store.checkout_ops.get_mut();
+            let subscriptions = h.stripe.subscriptions.get_mut();
+            let terminal = status == "canceled";
+            if !terminal {
+                rows.get_mut("u1").unwrap().status = "trialing".into();
+            }
+            ops.get_mut("op_test_1").unwrap().state = "needs_reconcile".into();
+            subscriptions.get_mut("sub_test_1").unwrap().status = status.into();
+
+            let state = || h.store.checkout_ops.borrow()["op_test_1"].state.clone();
+            let deliver = || h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+            let history = h.store.invoice_history.borrow().clone();
+            let mut expected = h.store.billing_rows.borrow()["u1"].clone();
+            if terminal {
+                let attempts = h.store.reconcile_outcome_attempts.get();
+                let ops = h.store.checkout_ops.borrow().clone();
+                h.store.relabel_before_store.set(true);
+                assert_eq!(deliver().status, 500);
+                assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts + 1);
+                assert!(h.store.webhook_events.borrow().is_empty());
+                assert_eq!(*h.store.checkout_ops.borrow(), ops);
+                expected.plan_id = PLAN_PRO.into();
+                assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
+                assert!(h.store.billing_shadow.borrow().is_empty());
+                assert_eq!(*h.store.invoice_history.borrow(), history);
+            }
+            webhook_ok(&deliver());
+            let mut stored = h.store.billing_rows.borrow()["u1"].clone();
+            assert_eq!(
+                stored.grace_until_unix.take().is_some(),
+                status == "past_due"
+            );
+            expected.status = status.into();
+            assert_eq!(stored, expected);
+            assert_eq!(*h.store.invoice_history.borrow(), history);
+            assert_eq!(state(), "succeeded");
+            assert!(h.store.webhook_events.borrow().contains("evt_test_1"));
+        }
+    }
+
+    #[test]
     fn billing_webhook_out_of_order_invoices_never_regress() {
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
@@ -13096,6 +13161,12 @@ mod tests {
             read_anchor: None,
         };
         block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
+        let mut terminal = stored_seed("free", "canceled", None, None, None);
+        terminal.history.push(history_row("in_unseen", BILLING_NOW));
+        assert!(block_on(h.store.store_reconcile_outcome("u1", &terminal)).is_err());
+        assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
+        assert!(h.store.billing_shadow.borrow().is_empty());
+        assert!(!h.store.invoice_history.borrow().contains_key("in_unseen"));
         let mut stale = crate::billing_reconcile::ReconcileOutcome {
             row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
@@ -13273,12 +13344,16 @@ mod tests {
                     let rows = h.store.billing_rows.borrow().clone();
                     let shadow = h.store.billing_shadow.borrow().clone();
                     let history = h.store.invoice_history.borrow().clone();
+                    let ops = h.store.checkout_ops.borrow().clone();
+                    let attempts = h.store.reconcile_outcome_attempts.get();
                     let case = format!("{a_status}/{b_status}/webhook={webhook}");
                     if webhook {
                         let body = checkout_completed_body("evt_b", "cs_b", false);
-                        let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
-                        assert_eq!(resp.status, 500, "{case}");
-                        assert!(h.store.webhook_events.borrow().is_empty(), "{case}");
+                        for _ in 0..2 {
+                            let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+                            assert_eq!(resp.status, 500, "{case}");
+                            assert!(h.store.webhook_events.borrow().is_empty(), "{case}");
+                        }
                     } else {
                         // `ensure_checkout_session` refuses a live A before
                         // reaching its completed-session branch, so drive
@@ -13286,58 +13361,85 @@ mod tests {
                         let result = block_on(reconcile_checkout_session(&h.ctx(), "cs_b"));
                         assert_eq!(result, Err(()), "{case}");
                     }
+                    assert_eq!(
+                        h.store.reconcile_outcome_attempts.get() - attempts,
+                        if webhook { 2 } else { 1 },
+                        "{case}: refusal must come from persistence"
+                    );
                     let op = block_on(h.store.checkout_operation_by_id("op_b"))
                         .expect("op lookup")
                         .expect("op stored");
                     assert_eq!(op.state, "submitted", "{case}: not succeeded");
+                    assert_eq!(*h.store.checkout_ops.borrow(), ops, "{case}");
                     assert_eq!(*h.store.billing_rows.borrow(), rows, "{case}");
                     assert_eq!(*h.store.billing_shadow.borrow(), shadow, "{case}");
                     assert_eq!(*h.store.invoice_history.borrow(), history, "{case}");
                     assert_eq!(*h.stripe.sessions_created.borrow(), 0, "{case}");
+                    if (a_status, b_status, webhook) == ("active", "active", false) {
+                        assert_billing_retry_after_fold(&h, end + BILLING_PERIOD);
+                    }
                 }
             }
         }
     }
 
+    fn assert_billing_retry_after_fold(h: &Harness, end: i64) {
+        let mut canceled = h.store.billing_rows.borrow()["u1"].clone();
+        canceled.status = "canceled".into();
+        h.store.release_live_slot_before_store.set(true);
+        let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_b"))
+            .expect("slot released after fresh fold accepts exact target");
+        assert_eq!(
+            h.store.billing_shadow.borrow()[&("u1".into(), "sub_test_1".into())],
+            canceled
+        );
+        assert!(!outcome.disable_new_purchases());
+        assert_eq!((outcome.read_anchor, outcome.read_plan), (None, None));
+        let mut expected = stored_seed(PLAN_PLUS, "active", Some(end), Some("in_b"), None).row;
+        expected.stripe_subscription_id = "sub_b".into();
+        assert_eq!(outcome.row, expected);
+        assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history["in_b"].stripe_subscription_id, "sub_b");
+    }
+
     #[test]
     fn billing_shadow_preserves_per_user_projection() {
         let h = stripe_harness();
-        let first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
+        seed_billing_user(&h, "u1");
+        let mut first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
+        first.row.stripe_subscription_id = "sub_holder".into();
         block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
         let mut second = first.clone();
         second.row.stripe_subscription_id = "sub_second".into();
         block_on(h.store.store_reconcile_outcome("u2", &second)).unwrap();
-
-        let mut replacement = stored_seed(PLAN_PLUS, "canceled", None, None, None);
-        replacement.row.stripe_subscription_id = "sub_other".to_string();
-        block_on(h.store.store_reconcile_outcome("u1", &replacement)).unwrap();
-        assert!(
-            live_for(&h, "u1").is_none(),
-            "terminal projection remains hidden"
+        let rows = h.store.billing_rows.borrow().clone();
+        h.stripe.subscriptions.borrow_mut().insert(
+            "sub_test_1".into(),
+            test_subscription("sub_test_1", "cus_test_1", "canceled", PRICE_PLUS),
         );
+        let terminal = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
+            .expect("new terminal target beside live holder");
+        assert_eq!((terminal.read_plan, terminal.read_anchor), (None, None));
         assert_eq!(
-            live_for(&h, "u2").unwrap().stripe_subscription_id,
-            "sub_second"
+            terminal.row,
+            stored_seed("free", "canceled", None, None, None).row
         );
-        let shadow = h.store.billing_shadow.borrow();
-        let displaced = &shadow[&(String::from("u1"), String::from("sub_test_1"))];
-        assert_eq!(displaced.status, "active");
-        assert_eq!(displaced.paid_through_unix, Some(BILLING_NOW));
-        assert_eq!(displaced.paid_invoice_id.as_deref(), Some("in_1"));
+        assert_eq!(*h.store.billing_rows.borrow(), rows);
+        let shadow = h.store.billing_shadow.borrow().clone();
         assert_eq!(shadow.len(), 1);
-        drop(shadow);
+        assert_eq!(shadow[&("u1".into(), "sub_test_1".into())], terminal.row);
+        assert!(h.store.invoice_history.borrow().is_empty());
 
-        block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
-        assert_eq!(
-            live_for(&h, "u1").unwrap().stripe_subscription_id,
-            "sub_test_1"
-        );
-        let shadow = h.store.billing_shadow.borrow();
-        assert_eq!(
-            shadow[&(String::from("u1"), String::from("sub_other"))].status,
-            "canceled"
-        );
-        assert_eq!(shadow.len(), 2);
+        // A proven live fold beside the holder records only its own history.
+        let body = deliver_first_period(&h, "evt_other");
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(*h.store.billing_rows.borrow(), rows);
+        assert_eq!(*h.store.billing_shadow.borrow(), shadow);
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history["in_test_1"].stripe_subscription_id, "sub_test_1");
     }
 
     #[test]
@@ -13551,20 +13653,33 @@ mod tests {
         };
         let submitted = op();
         assert_eq!(submitted.state, "submitted");
-        for _ in 0..2 {
+        let return_id = |id: &str| {
+            let mut responses = h.stripe.subscriptions.borrow_mut();
+            responses.get_mut("sub_test_1").unwrap().id = id.into();
+        };
+        for wrong_id in [false, false, true] {
             block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
-            h.store.remove_billing_row_after_read.set(true);
+            h.store.remove_billing_row_after_read.set(!wrong_id);
+            if wrong_id {
+                return_id("sub_wrong");
+            }
+            let attempts = h.store.reconcile_outcome_attempts.get();
             assert_eq!(deliver("evt_row6").status, 500);
+            assert_eq!(
+                h.store.reconcile_outcome_attempts.get() - attempts,
+                if wrong_id { 0 } else { 1 }
+            );
             assert!(!h.store.remove_billing_row_after_read.get());
             assert!(!h.store.webhook_events.borrow().contains("evt_row6"));
             assert_eq!(op(), submitted);
             assert_eq!(h.store.checkout_ops.borrow().len(), 1);
-            assert!(h.store.billing_rows.borrow().is_empty());
+            let rows = wrong_id.then(|| ("u1".to_string(), seed.row.clone()));
+            assert_eq!(*h.store.billing_rows.borrow(), HashMap::from_iter(rows));
             assert!(h.store.billing_shadow.borrow().is_empty());
             assert!(h.store.invoice_history.borrow().is_empty());
         }
-        // An independently restored own target makes that stale fold safe to retry.
-        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
+        // The own target is restored; correcting the returned ID permits retry.
+        return_id("sub_test_1");
         for _ in 0..2 {
             let attempts = h.store.reconcile_outcome_attempts.get();
             webhook_ok(&deliver("evt_row6"));
@@ -13587,8 +13702,13 @@ mod tests {
         let mut b = stored_seed(PLAN_PLUS, "active", Some(200), Some("in_200"), None);
         b.row.stripe_subscription_id = "sub_other".into();
         let mut stale = a.clone();
+        stale.read_plan = Some(a.row.plan_id.clone());
+        stale.read_anchor = a.row.paid_invoice_id.clone();
         stale.row.paid_through_unix = Some(50);
-        for row in [&a, &b, &stale, &b] {
+        let mut replay = b.clone();
+        replay.read_plan = Some(b.row.plan_id.clone());
+        replay.read_anchor = b.row.paid_invoice_id.clone();
+        for row in [&a, &b, &stale, &replay] {
             block_on(h.store.store_reconcile_outcome("u1", row)).unwrap();
         }
         let select = |user, target| {
@@ -13639,7 +13759,7 @@ mod tests {
     #[test]
     fn billing_shadow_retains_rows_across_repeated_displacement() {
         let h = stripe_harness();
-        let a = stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_100"), Some(10));
+        let mut a = stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_100"), Some(10));
         let mut b = stored_seed(PLAN_PLUS, "canceled", None, None, None);
         b.row.stripe_subscription_id = "sub_other".to_string();
         let mut other = a.clone();
@@ -13652,6 +13772,9 @@ mod tests {
         put("u1", &a);
         put("u2", &other);
         put("u1", &b);
+        a.read_plan = Some(a.row.plan_id.clone());
+        a.read_anchor = a.row.paid_invoice_id.clone();
+        b.read_plan = Some(b.row.plan_id.clone());
         assert!(live_for(&h, "u1").is_none());
         let before_rows = h.store.billing_rows.borrow().clone();
         let before_shadow = h.store.billing_shadow.borrow().clone();
@@ -13717,6 +13840,8 @@ mod tests {
             let h = stripe_harness();
             let stored = stored_seed(PLAN_PLUS, stored_status, Some(100), Some("in_100"), None);
             let mut incoming = stored.clone();
+            incoming.read_plan = Some(stored.row.plan_id.clone());
+            incoming.read_anchor = stored.row.paid_invoice_id.clone();
             incoming.row.status = incoming_status.into();
             incoming.row.paid_through_unix = Some(50);
             for outcome in [&stored, &b, &incoming] {
@@ -13755,6 +13880,9 @@ mod tests {
                 Some("in_new"),
                 Some(20),
             );
+            if matches!(case, "read-plan" | "read-anchor") {
+                incoming.row.status = "active".into();
+            }
             incoming.row.stripe_customer_id = "cus_new".into();
             incoming.row.stripe_item_id = "si_new".into();
             incoming.row.stripe_price_id = "price_new".into();
