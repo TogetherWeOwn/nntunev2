@@ -9,24 +9,32 @@
 
 	const activateRendered: Action<HTMLButtonElement, NonNullable<typeof target>> = (button, rendered) => {
 		const listeners = new AbortController();
-		const { signal } = listeners;
-		const capture = { capture: true, signal };
+		const capture = { capture: true, signal: listeners.signal };
 		const hits = (event: Event) => event.composedPath().includes(button);
-		let pointer: typeof rendered | undefined;
+		// Each pointer type can have its own primary pointer; only its matching ID may consume the press.
+		const pointers = new Map<string, { id: number; intent: typeof rendered }>();
+		const takePointer = ({ pointerId, pointerType }: PointerEvent) => {
+			const press = pointers.get(pointerType);
+			if (press?.id !== pointerId) return;
+			pointers.delete(pointerType);
+			return press.intent;
+		};
 		let space: typeof rendered | undefined;
 		let release: ReturnType<typeof setTimeout> | undefined;
 		const clearSpace = () => { clearTimeout(release); release = space = undefined; };
 		const intents = new WeakMap<Event, typeof rendered>();
 		window.addEventListener('pointerdown', (event) => {
-			if (event.isPrimary && event.button === 0) pointer = hits(event) ? rendered : undefined;
+			if (!event.isPrimary || event.button !== 0) return;
+			if (hits(event)) pointers.set(event.pointerType, { id: event.pointerId, intent: rendered });
+			else takePointer(event);
 		}, capture);
-		window.addEventListener('pointercancel', (event) => { if (event.isPrimary) pointer = undefined; }, capture);
+		window.addEventListener('pointercancel', takePointer, capture);
 		window.addEventListener('keydown', (event) => {
 			if (event.key !== ' ' || event.repeat || !hits(event)) return;
 			clearSpace();
 			space = rendered;
 		}, capture);
-		button.addEventListener('blur', clearSpace, { signal });
+		button.addEventListener('blur', clearSpace, { signal: listeners.signal });
 		window.addEventListener('keyup', (event) => {
 			// Space clicks after keyup; expire a press whose click was canceled.
 			if (event.key === ' ' && space) release = setTimeout(clearSpace, 0);
@@ -35,8 +43,7 @@
 			// Pin at press start, or at click entry for click-only activation.
 			const fromPointer = event.isTrusted && (event.detail > 0 || ('pointerType' in event && !!event.pointerType));
 			const fromSpace = event.isTrusted && !fromPointer && release !== undefined;
-			const intent = fromPointer ? pointer : fromSpace ? space : undefined;
-			if (fromPointer) pointer = undefined;
+			const intent = fromPointer && event instanceof PointerEvent ? takePointer(event) : fromSpace ? space : undefined;
 			if (fromSpace) clearSpace();
 			if (hits(event)) intents.set(event, intent ?? rendered);
 		}, capture);
@@ -44,11 +51,10 @@
 			const intent = intents.get(event);
 			intents.delete(event);
 			if (intent && !event.defaultPrevented) currentFavorite.activate(intent);
-		}, { signal });
+		}, { signal: listeners.signal });
 		return { update(next) { rendered = next; }, destroy() { clearSpace(); listeners.abort(); } };
 	};
 </script>
-
 {#if target}
 	<button type="button" class="nt-button nt-button--ghost" data-testid="player-favorite"
 		aria-label={`Favorite ${target.title}`} aria-pressed={target.pressed} use:activateRendered={target}>
@@ -56,7 +62,6 @@
 	</button>
 {/if}
 <p aria-live="polite" aria-atomic="true" data-testid="player-favorite-status">{#if feedback}{#key feedback.version}{feedback.text}{/key}{/if}</p>
-
 <style>
 	button { min-height: 2.75rem; }
 	p { margin: 0; overflow-wrap: anywhere; }

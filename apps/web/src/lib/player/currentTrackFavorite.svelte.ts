@@ -35,10 +35,8 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 			receipt: `${binding.version}:${revision}`, membership };
 	}
 
-	function matches(current: FavoriteIntent | null, intent: FavoriteIntent): boolean {
-		return current !== null && current.receipt === intent.receipt && current.id === intent.id &&
-			current.membership === intent.membership;
-	}
+	const matches = (current: FavoriteIntent | null, intent: FavoriteIntent) =>
+		current?.receipt === intent.receipt && current.id === intent.id && current.membership === intent.membership;
 
 	function activate(intent: FavoriteIntent): void {
 		const target = view(queue.snapshot);
