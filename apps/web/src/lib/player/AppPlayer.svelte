@@ -7,6 +7,7 @@
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
 	import ShortcutHelp from './ShortcutHelp.svelte';
+	import SleepTimerControls from './SleepTimerControls.svelte';
 	import VolumeControls from './VolumeControls.svelte';
 	import { appShortcutActions, handleAppShortcut } from './appShortcuts.js';
 	import { createPlayerController } from './controller.svelte.js';
@@ -23,6 +24,7 @@
 	const sound = media.sound.state;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	const sleepTimer = media.sleepTimer;
 	let shortcutHelp = $state.raw<ReturnType<typeof ShortcutHelp>>();
 	let shortcutScope = $state<HTMLDivElement>();
 	function onShortcutKeydown(event: KeyboardEvent) {
@@ -51,6 +53,7 @@
 {#snippet soundControls()}
 	<VolumeControls {...$sound} onvolumeinput={media.sound.setVolume} ontogglemute={media.sound.toggleMute} />
 {/snippet}
+<svelte:document onvisibilitychange={() => { if (document.visibilityState === 'visible') sleepTimer.tick(); }} />
 {@render children()}
 {#if streamUrl}
 	<div class="nt-wrap" bind:this={shortcutScope}>
@@ -60,4 +63,9 @@
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
 		<ShortcutHelp bind:this={shortcutHelp} actions={appShortcutActions} buttonClass="nt-button nt-button--ghost" playerScoped />
 	</div>
+{/if}
+{#if streamUrl}
+	<section class="nt-wrap" aria-label="Sleep timer">
+		<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
+	</section>
 {/if}
