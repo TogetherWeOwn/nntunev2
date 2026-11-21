@@ -343,6 +343,13 @@
 			requiresSignIn = state.requiresSignIn;
 			if (authBoundary) queueFilterQuery = '';
 			if (state.loadError && state.items.length === 0) {
+				if (authBoundary) {
+					clearFavoritesExportFeedback();
+					releaseFavoritesDownload();
+					favoriteBaseline = favorites = [];
+					favoritesInitialized = false;
+					favoritesAnnouncement = '';
+				}
 				findQuery = '';
 				findScope = 'both';
 				view = 'all';

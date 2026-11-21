@@ -1,6 +1,12 @@
+import { PUBLIC_API_BASE_URL } from '$app/env/public';
+import { ApiClient, ApiError } from '../api/client.js';
+import { captureAuthFence } from '../auth-fence.js';
+import { clearToasts } from '../shell/toasts.js';
 import {
 	clearSnapshot,
+	establishVerifiedLibraryScope,
 	LIBRARY_AUTH_TRANSITION_KEY,
+	libraryScopeBinding,
 	loadSnapshot,
 	saveSnapshot,
 	toLibraryItems,
@@ -29,8 +35,10 @@ export interface LibraryRefreshUpdate {
 	isCurrent: () => boolean;
 	/** A successful response or an explicit invalidation, never cached fallback. */
 	authoritative: boolean;
-	/** The account purge ran before this empty snapshot was published. */
+	/** Library access is suspended or the scope was revoked. */
 	authBoundary: boolean;
+	sessionBinding?: string; // Verified label for the rows, not import provenance.
+	deviceScope?: string; // Exact localStorage key eligible for the verified binding.
 }
 
 export interface LibraryRefresherDeps {
@@ -43,6 +51,21 @@ export interface LibraryRefresherDeps {
 	/** Called after state mutations so the page can mirror them reactively. */
 	onStateChange?: (state: LibraryRefreshState, update: LibraryRefreshUpdate) => void;
 	timeoutMs?: number;
+}
+
+// The API encodes a SHA-256 digest as unpadded base64url.
+const validBinding = (value: unknown): value is string => typeof value === 'string' && /^[\w-]{43}$/.test(value);
+
+async function verifyLibrarySession(binding: string, signal: AbortSignal): Promise<boolean> {
+	try {
+		const result = await new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal })
+			.get<{ session_binding?: unknown }>('/v1/me/likes/session');
+		if (!validBinding(result?.session_binding)) throw new Error('Missing verified session binding');
+		return result.session_binding === binding;
+	} catch (error) {
+		if (error instanceof ApiError && (error.status === 401 || error.status === 403)) return false;
+		throw error;
+	}
 }
 
 export interface LibraryRefresher {
@@ -73,6 +96,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		requiresSignIn: false
 	};
 	let authenticatedThisLoad = false;
+	let verified: { binding: string; fence: NonNullable<Awaited<ReturnType<typeof captureAuthFence>>> } | undefined;
 	let inMemorySnapshot: LibrarySnapshot | null = null;
 	let activeRequest: AbortController | null = null;
 	let requestGeneration = 0;
@@ -94,6 +118,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		state.requiresSignIn = false;
 		let authoritative = false;
 		let authBoundary = false;
+		let binding: string | null = null;
 		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 		let activeResponse: Response | null = null;
 		let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -218,8 +243,27 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			}, timeoutMs);
 		});
 
+		function publish(sessionBinding?: string, deviceScope?: string): void {
+			if (!isCurrent()) return;
+			if (activeRequest === controller) activeRequest = null;
+			state.loading = false;
+			const fence = verified?.fence;
+			deps.onStateChange?.(state, {
+				isCurrent: () => isCurrent() && (!fence || fence.isCurrent()),
+				authoritative, authBoundary, sessionBinding, deviceScope
+			});
+		}
+
+		function refuse(replaced = false): true {
+			if (isCurrent()) applyAuthTransition(replaced, true);
+			return true;
+		}
+
 		try {
 			deps.onStateChange?.(state, { isCurrent, authoritative: false, authBoundary: false });
+			if (!isCurrent()) return;
+			const capture = captureAuthFence();
+			const fence = capture && await Promise.race([capture, timeout, aborted]);
 			if (!isCurrent()) return;
 			const fetchPromise = fetchFn('/api/library', {
 				credentials: 'include',
@@ -259,6 +303,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				// The list endpoint has not landed yet. Do not treat a 404 as
 				// session verification or expose a previously saved snapshot.
 				authenticatedThisLoad = false;
+				verified = undefined;
 				inMemorySnapshot = null;
 				state.items = [];
 				state.staleAt = null;
@@ -268,6 +313,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			}
 			if (response.status === 401 || response.status === 403) {
 				authenticatedThisLoad = false;
+				verified = undefined;
 				inMemorySnapshot = null;
 				state.items = [];
 				state.staleAt = null;
@@ -277,12 +323,20 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 					: 'You do not have access to this library.';
 				authoritative = true;
 				authBoundary = true;
-				if (deps.onAccessRefused) deps.onAccessRefused();
-				else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
+				notifyAccessRefused();
 				deps.invalidateLibraryCache();
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
+			binding = response.headers?.get('x-nntune-session-binding') ?? null;
+			const storage = deps.sessionStorage();
+			if (!isCurrent()) return;
+			const previous = verified?.binding ?? libraryScopeBinding(storage);
+			if ((previous || binding !== null) && !validBinding(binding)) return void refuse();
+			if (previous && previous !== binding) {
+				if (await fence?.run(() => !controller.signal.aborted && refuse(true))) return;
+				return void refuse();
+			}
 			const payload = await Promise.race([readJsonBody(response), timeout, aborted]);
 			if (!isCurrent() || controller.signal.aborted) {
 				cancelResponse(response);
@@ -291,40 +345,55 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			activeResponse = null;
 			const fresh = toLibraryItems(payload);
 			if (fresh === null) throw new Error('library response has an invalid shape');
-			authenticatedThisLoad = true;
-			state.items = fresh;
-			state.staleAt = null;
-			const storage = deps.sessionStorage();
-			if (!isCurrent()) return;
-			const persistedSnapshot = saveSnapshot(storage, fresh);
-			if (!isCurrent()) return;
-			inMemorySnapshot = { ...persistedSnapshot, items: fresh };
-			authoritative = true;
+			const commit = () => {
+				const snapshot = saveSnapshot(storage, fresh);
+				if (!isCurrent()) return;
+				authenticatedThisLoad = true;
+				inMemorySnapshot = { ...snapshot, items: fresh };
+				state.items = fresh;
+				state.staleAt = null;
+				authoritative = true;
+			};
+			if (!binding) return commit();
+			const label = binding;
+			// Start verification under the lock, but never hold it over the wire.
+			const started = await fence?.run(() => {
+				if (!isCurrent() || controller.signal.aborted) return;
+				const result = Promise.race([verifyLibrarySession(label, controller.signal), timeout, aborted]);
+				void result.catch(() => {}); // The lock request may resolve after the verifier.
+				return { result };
+			});
+			if (!fence || !started) { refuse(); return; }
+			const matches = await started.result;
+			if (!await fence.run(() => {
+				if (!isCurrent() || controller.signal.aborted) return true;
+				if (!matches) return refuse(true);
+				const deviceScope = establishVerifiedLibraryScope(storage, label);
+				verified = { binding: label, fence };
+				commit();
+				publish(label, deviceScope);
+				return true;
+			})) refuse();
 		} catch {
 			if (!isCurrent()) return;
-			// Do not trust a tab's snapshot until this page has verified its session.
-			const snapshot = authenticatedThisLoad
-				? (inMemorySnapshot ?? loadSnapshot(deps.sessionStorage()))
-				: null;
-			if (!isCurrent()) return;
-			if (snapshot) {
-				state.items = snapshot.items;
-				state.staleAt = snapshot.savedAt;
-			} else {
-				state.items = [];
-				state.staleAt = null;
-				state.loadError = 'Library is not reachable right now.';
-			}
+			const fallback = () => {
+				const snapshot = authenticatedThisLoad ? inMemorySnapshot ?? loadSnapshot(deps.sessionStorage()) : null;
+				if (!isCurrent()) return;
+				state.items = snapshot?.items ?? [];
+				state.staleAt = snapshot?.savedAt ?? null;
+				if (!snapshot) state.loadError = 'Library is not reachable right now.';
+			};
+			if (binding !== null) refuse();
+			else if (verified) {
+				if (!await verified.fence.run(() => { fallback(); publish(); return true; })) refuse();
+			} else fallback();
 		} finally {
 			if (timeoutId !== undefined) clearTimeout(timeoutId);
 			controller.signal.removeEventListener('abort', onAbort);
 			activeResponse = null;
 			activeReader = null;
 			if (activeRequest === controller) activeRequest = null;
-			if (isCurrent()) {
-				state.loading = false;
-				deps.onStateChange?.(state, { isCurrent, authoritative, authBoundary });
-			}
+			if (state.loading) publish();
 		}
 	}
 
@@ -334,20 +403,29 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 	 * status), drop snapshots and memory, and enter the sign-in-required
 	 * presentation. Never requests, rebroadcasts, navigates or retries.
 	 */
-	function applyAuthTransition(): void {
+	function notifyAccessRefused(): void {
+		clearToasts();
+		if (deps.onAccessRefused) deps.onAccessRefused();
+		else globalThis.window?.dispatchEvent?.(new Event(LIBRARY_ACCESS_REFUSED_EVENT));
+	}
+
+	function applyAuthTransition(replaced = true, notify = false): void {
 		if (disposed) return;
 		const isCurrent = startReceipt();
 		activeRequest?.abort();
 		if (!isCurrent()) return;
 		activeRequest = null;
 		authenticatedThisLoad = false;
+		verified = undefined;
 		inMemorySnapshot = null;
-		clearSnapshot(deps.sessionStorage());
+		if (replaced) clearSnapshot(deps.sessionStorage());
+		if (replaced && notify) notifyAccessRefused();
 		if (!isCurrent()) return;
 		state.items = [];
 		state.staleAt = null;
-		state.requiresSignIn = true;
-		state.loadError = 'Your session changed. Sign in again to see this library.';
+		state.requiresSignIn = replaced;
+		state.loadError = replaced ? 'Your session changed. Sign in again to see this library.'
+			: 'Could not verify your library session. Try again.';
 		state.loading = false;
 		deps.onStateChange?.(state, { isCurrent, authoritative: true, authBoundary: true });
 	}

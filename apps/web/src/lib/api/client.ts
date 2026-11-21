@@ -8,6 +8,7 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
+import { runAuthMutation } from '../auth-fence.js';
 import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import { isJsonBodyTooLarge, readCappedJson } from './cappedJson.js';
 import { parseErrorBody } from './errors.js';
@@ -243,6 +244,12 @@ export interface CredentialsList {
 	credentials: ListedCredential[];
 }
 
+// Challenge starts and native bearer management do not change the browser cookie.
+const COOKIE_MUTATIONS = new Set([
+	'/v1/auth/magic/finish', '/v1/auth/passkey/register/finish', '/v1/auth/passkey/login/finish',
+	'/v1/session/reauthenticate/finish', '/v1/session/refresh', '/v1/session/logout', '/v1/session/revoke-all'
+]);
+
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
@@ -452,12 +459,14 @@ export class ApiClient {
 		}, API_REQUEST_TIMEOUT_MS);
 		try {
 			callerSignal?.throwIfAborted();
-			const response = await this.fetchFn(`${this.baseUrl}${path}`, {
+			const dispatch = () => this.fetchFn(`${this.baseUrl}${path}`, {
 				...init,
 				signal: controller.signal,
 				headers,
 				credentials: 'include'
 			});
+			const response = await (init.method === 'POST' && COOKIE_MUTATIONS.has(path)
+				? runAuthMutation(controller.signal, dispatch) : dispatch());
 			// A transport may ignore abort; never publish an abandoned response.
 			callerSignal?.throwIfAborted();
 			if (!response.ok) {
