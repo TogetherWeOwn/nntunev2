@@ -2,11 +2,14 @@
 import runpy
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 runner = runpy.run_path(str(Path(__file__).with_name("subsonic-staging-runner.py")))
 StagingModel, matrix, rehearse = (runner[key] for key in ("StagingModel", "MATRIX", "rehearse"))
+BASELINE, EXPERIMENT = runner["BASELINE"], runner["EXPERIMENT"]
+NEWER = replace(BASELINE, deployment_id="deploy-newer", version="newer", serving_version="newer")
 
 
 class RecordingModel(StagingModel):
@@ -15,6 +18,11 @@ class RecordingModel(StagingModel):
     def __init__(self):
         super().__init__()
         self.starts = []
+        self.cleanup_started_at = None
+
+    def cancel_clients(self):
+        self.cleanup_started_at = self.now
+        super().cancel_clients()
 
     def start(self, slot):
         number = slot["slot"]
@@ -169,7 +177,7 @@ class RunnerTests(unittest.TestCase):
                 model = RecordingModel()
                 report = rehearse(tampered, model)
                 self.assertEqual((report["stop"], report["cleanup"]), ("unreviewed-matrix", "not-armed"))
-                self.assertEqual(model.readback(), ("baseline", False))
+                self.assertEqual(model.readback(), BASELINE)
                 self.assertEqual(model.starts, [])
 
     def test_telemetry_loss_and_pressure_stop_before_next_start(self):
@@ -178,7 +186,7 @@ class RunnerTests(unittest.TestCase):
                                             (1, (50, False, 1), "telemetry-stale-or-unsafe")):
             class Unsafe(RecordingModel):
                 def telemetry(self):
-                    return observation if self.lease and len(self.starts) >= starts else super().telemetry()
+                    return observation if self.state.lease and len(self.starts) >= starts else super().telemetry()
 
             report = rehearse(matrix, Unsafe())
             self.assertEqual((report["stop"], report["starts"]), (reason, starts))
@@ -213,7 +221,7 @@ class RunnerTests(unittest.TestCase):
         model.delays = {41: 6000, 42: 6000}
         report = rehearse(matrix, model)
         self.assertEqual((report["stop"], report["starts"]), ("request-or-reader-timeout", 42))
-        self.assertEqual(model.now - dict(model.starts)[41], 5000)
+        self.assertEqual(model.cleanup_started_at - dict(model.starts)[41], 5000)
         self.assertEqual(report["simulated_pair_overlap"], {1: False, 2: False, 3: True})
         self.assertEqual([report["slots"][i]["state"] for i in (41, 42, 43)],
                          ["unfinished", "unfinished", "unstarted"])
@@ -227,21 +235,102 @@ class RunnerTests(unittest.TestCase):
 
         class Cancelled(RecordingModel):
             def tick(self):
-                raise KeyboardInterrupt
-
-        class Superseded(Cancelled):
-            def tick(self):
-                self.version, self.lease = "new-default-off", False
+                if self.state == EXPERIMENT:
+                    raise KeyboardInterrupt
                 super().tick()
 
-        for model, reason, starts, version in (
-            (PartialArm(), "model-failure", 0, "baseline"), (Cancelled(), "cancelled", 1, "baseline"),
-            (Superseded(), "cancelled", 1, "new-default-off"),
+        for model, reason, starts in (
+            (PartialArm(), "model-failure", 0), (Cancelled(), "cancelled", 1),
         ):
             report = rehearse(matrix, model)
             self.assertEqual((report["stop"], report["starts"]), (reason, starts))
             self.assertEqual(report["cleanup"], "simulated-off-and-drained")
-            self.assertEqual(model.readback(), (version, False))
+            self.assertTrue(model.state.verified_off())
+            self.assertEqual(model.state.version, BASELINE.version)
+
+    def test_wrong_baseline_or_serving_version_cannot_start(self):
+        for state in (NEWER, replace(BASELINE, measurement_binding=True),
+                      replace(BASELINE, serving_version=EXPERIMENT.version)):
+            model = RecordingModel()
+            model.state = state
+            report = rehearse(matrix, model)
+            self.assertEqual((report["stop"], report["starts"], report["cleanup"]),
+                             ("preflight-not-off-and-idle", 0, "not-armed"))
+
+        class WrongServing(RecordingModel):
+            def arm(self):
+                self.state = replace(EXPERIMENT, serving_version=BASELINE.version)
+
+        report = rehearse(matrix, WrongServing())
+        self.assertEqual((report["stop"], report["starts"], report["cleanup"]),
+                         ("serving-version-unverified", 0, "simulated-off-and-drained"))
+
+    def test_restore_compares_deployment_identity_at_write(self):
+        class Race(RecordingModel):
+            def restore_if_current(self, expected_deployment_id):
+                self.state = self.successor
+                return super().restore_if_current(expected_deployment_id)
+
+        for successor, expected in (
+            (NEWER, "simulated-superseded-off-and-drained"),
+            (replace(EXPERIMENT, deployment_id=NEWER.deployment_id), "unverified"),
+        ):
+            model = Race()
+            model.successor = successor
+            self.assertEqual(rehearse(matrix, model)["cleanup"], expected)
+            self.assertEqual(model.state, successor)
+
+    def test_missing_fence_or_uncertain_off_state_leaves_cleanup_unverified(self):
+        class Uncertain(RecordingModel):
+            def restore_if_current(self, expected_deployment_id):
+                self.state = self.successor
+
+        for state in (
+            EXPERIMENT,
+            replace(NEWER, enabled=True),
+            replace(NEWER, lease=True),
+            replace(NEWER, measurement_binding=True),
+            replace(NEWER, serving_version=EXPERIMENT.version),
+        ):
+            model = Uncertain()
+            model.successor = state
+            self.assertEqual(rehearse(matrix, model)["cleanup"], "unverified")
+            self.assertEqual(model.state, state)
+
+    def test_restore_requires_drain_sample_after_off_readback(self):
+        class DrainFence(RecordingModel):
+            off_read_at = None
+            zero_sample_at = None
+
+            def readback(self):
+                state = super().readback()
+                if (self.cleanup_started_at is not None and state.verified_off()
+                        and self.off_read_at is None):
+                    self.off_read_at = self.now
+                return state
+
+            def telemetry(self):
+                at, healthy, backends = super().telemetry()
+                if (self.cleanup_started_at is not None and healthy and backends == 0
+                        and self.zero_sample_at is None):
+                    self.zero_sample_at = at
+                return at, healthy, backends
+
+        model = DrainFence()
+        report = rehearse(matrix, model)
+        self.assertEqual(report["cleanup"], "simulated-off-and-drained")
+        self.assertIsNotNone(model.off_read_at)
+        self.assertIsNotNone(model.zero_sample_at)
+        self.assertGreater(model.zero_sample_at, model.off_read_at)
+
+    def test_deployment_change_during_drain_invalidates_off_readback(self):
+        class ChangedDuringDrain(RecordingModel):
+            def telemetry(self):
+                if self.state.verified_off() and self.starts:
+                    self.state = replace(NEWER, measurement_binding=True)
+                return super().telemetry()
+
+        self.assertEqual(rehearse(matrix, ChangedDuringDrain())["cleanup"], "unverified")
 
     def test_client_cancellation_does_not_prove_backend_drain(self):
         class Lingering(RecordingModel):
@@ -252,7 +341,8 @@ class RunnerTests(unittest.TestCase):
         report = rehearse(matrix, model)
         self.assertEqual((report["stop"], report["starts"]), ("clock-or-window", 1))
         self.assertEqual(report["cleanup"], "unverified")
-        self.assertEqual(model.readback(), ("baseline", False))
+        self.assertTrue(model.state.verified_off())
+        self.assertEqual(model.state.version, BASELINE.version)
 
 
 if __name__ == "__main__":

@@ -978,6 +978,33 @@ retrospective publication audit. No lifecycle-script exemption is granted.
 Retain the exact-head Actions job link and build-log artifact with review
 evidence; a skipped staging lane is not deployment evidence.
 
+For the staging API, keep `redact_query_string = true` under
+`[env.staging.observability]` in the deploy workflow's generated TOML. The
+upload check also reads the pinned Wrangler CLI's `--outfile` multipart body
+and requires `observability.redact_query_string` to be the boolean `true`
+in the `metadata` part for both mirror states. It never prints or publishes
+that body. This catches a CLI that accepts the TOML but drops the setting on
+upload. It does not prove Cloudflare applied the setting. Before any real
+Subsonic credentials are provisioned, the authorized operator must read back
+query-string redaction in the deployed staging API Worker's observability
+settings and verify it in that Worker's invocation log:
+
+1. Through the existing staging Access policy, send a read-only
+   `GET /v1/plans?redaction_probe=synthetic-only`. Include no application
+   session, authorization header or Subsonic credentials. An application
+   `401` is expected without a session; an Access denial is not a probe.
+2. Match the request by time, method and path in the **staging API Worker**
+   invocation logs. Do not use a web Worker event or treat a missing event
+   as a pass. The matching event must contain no query string. The API's
+   `/v1/*` route still matches with a query; its exact `/healthz` route does
+   not.
+
+Repeat both checks after relevant uploads or mount/configuration changes,
+which can change the effective setting. Record the deployed SHA and outcome,
+not the raw URL or log event. Keep raw request URLs and query strings out
+of application log fields independently, per the
+[logging standard](logging-standard.md).
+
 ## Staging promotion checklist
 
 Promotion is `main` HEAD → staging; production promotion is a later gated
