@@ -26,7 +26,8 @@
 		if (!opened) return;
 		shortcutsDialogEl?.close();
 		opened = false;
-		(opener?.isConnected ? opener : button).focus();
+		if (opener?.isConnected) opener.focus();
+		if (!opener || document.activeElement !== opener) button.focus();
 		opener = null;
 	}
 
@@ -40,21 +41,12 @@
 		const controls = [...root.querySelectorAll<HTMLElement>(
 			'a[href], button:not([disabled]), input, select, textarea, [tabindex]:not([tabindex="-1"])'
 		)].filter((control) => control.getClientRects().length > 0);
-		if (controls.length === 0) {
-			event.preventDefault();
-			return;
-		}
 		const first = controls[0];
 		const last = controls[controls.length - 1];
 		const active = document.activeElement;
-		if (event.shiftKey) {
-			if (active === first || !root.contains(active)) {
-				event.preventDefault();
-				last.focus();
-			}
-		} else if (active === last || !root.contains(active)) {
+		if (!controls.length || !root.contains(active) || active === (event.shiftKey ? first : last)) {
 			event.preventDefault();
-			first.focus();
+			(event.shiftKey ? last : first)?.focus();
 		}
 	}
 </script>

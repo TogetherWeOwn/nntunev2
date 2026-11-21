@@ -37,12 +37,18 @@ test('app shortcuts act once on the live native audio across routes and stop at 
 	expect(await native.evaluate((node: HTMLAudioElement) =>
 		node === document.querySelector('audio') && node.controls && node.paused)).toBe(true);
 
+	const restart = page.getByTestId('library-restart');
+	await restart.focus();
+	await page.keyboard.press('Shift+Slash');
+	await expect(page.getByTestId('shortcuts-close')).toBeFocused();
 	await audio(page).evaluate((node: HTMLAudioElement) => {
 		node.currentTime = 7;
 		Object.defineProperty(node, 'seekable', { value: { length: 0 } });
 		node.dispatchEvent(new Event('progress'));
 	});
-	await expect(page.getByTestId('library-restart')).toBeDisabled();
+	await expect(restart).toBeDisabled();
+	await page.keyboard.press('Escape');
+	await expect(help(page)).toBeFocused();
 	expect(await page.evaluate(() => document.body.dispatchEvent(
 		new KeyboardEvent('keydown', { key: '0', bubbles: true, cancelable: true })
 	))).toBe(true);
