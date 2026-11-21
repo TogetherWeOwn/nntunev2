@@ -4,7 +4,11 @@
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import { getAppPlayer } from '#lib/player/AppPlayer.svelte';
+	import LyricsPanel, { type TrackLyrics } from '#lib/player/LyricsPanel.svelte';
 	import { currentTrack } from '#lib/player/queue.js';
+
+	// No route loader supplies lyrics yet. This is a presentation input only.
+	let { lyrics = null }: { lyrics?: TrackLyrics | null } = $props();
 
 	// Presentation only: the layout keeps the existing native controls and decoder.
 	const { queue } = getAppPlayer();
@@ -35,6 +39,7 @@
 		</div>
 		<h2>{displayTitle(track)}</h2>
 		{#if artist}<p class="artist">{artist}</p>{/if}
+		<LyricsPanel trackId={track.id} {lyrics} />
 	{:else}
 		<p>Nothing playing. Choose a track in Your Library.</p>
 	{/if}
