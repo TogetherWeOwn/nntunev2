@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ComponentProps } from 'svelte';
+	import type { ComponentProps, Snippet } from 'svelte';
 	import { displayArtist, displayTitle } from '../library/order.js';
 	import NativeAudio from './NativeAudio.svelte';
 	import type { PlaybackStatus } from './mediaController.js';
@@ -10,8 +10,9 @@
 		currentTrack, mediaRevision, streamUrl, attachNativeAudio,
 		playbackStatus, playCurrent, pauseCurrent, retryCurrent,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
-		jumpStatus, jumpStatusVersion, jumpRelative
+		jumpStatus, jumpStatusVersion, jumpRelative, volumeControls
 	}: ComponentProps<typeof NativeAudio> & {
+		volumeControls: Snippet;
 		currentTrack: Pick<Track, 'id' | 'title' | 'artist'> | null;
 		playbackStatus: PlaybackStatus;
 		playCurrent: () => Promise<void>;
@@ -68,6 +69,7 @@
 			Restart current track
 		</button>
 	</div>
+	{@render volumeControls()}
 	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
 	{#if !restartCanSeek}
 		<p id="library-restart-hint">Restart is unavailable until this track can seek.</p>

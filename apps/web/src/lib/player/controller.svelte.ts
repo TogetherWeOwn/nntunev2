@@ -102,6 +102,9 @@ export function createPlayerController(
 		}
 		const nextSource = resolveStreamUrl(after);
 		if (trackChanged || resolveStreamUrl(before) !== nextSource) {
+			// Sample the live element before retiring its queued volumechange events.
+			media.observeSound();
+			if (!isCurrent()) return false;
 			version += 1;
 			retireNativeHost();
 			if (!isCurrent()) return false;
