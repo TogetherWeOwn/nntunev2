@@ -1,4 +1,25 @@
 import { expect, test } from '@playwright/test';
+import { AUTH_GENERATION_KEY, AUTH_LOCK } from '../src/lib/auth-fence.js';
+
+test('a rejected stale sign-out requires a fresh click for the current browser session', async ({ page }) => {
+	let logoutPosts = 0;
+	await page.route('**/v1/session/logout', (route) => { logoutPosts++; return route.fulfill({ json: {} }); });
+	await page.addInitScript(({ lock, key }) => {
+		sessionStorage.setItem('nntune:signed-in-email', 'stale@example.com');
+		const finish = new Promise<void>((release) => addEventListener('finish-session-change', () => release(), { once: true }));
+		void navigator.locks.request(lock, async () => { await finish; localStorage.setItem(key, 'replacement'); });
+	}, { lock: AUTH_LOCK, key: AUTH_GENERATION_KEY });
+	await page.goto('/auth/magic');
+	await page.getByRole('button', { name: 'Sign out stale@example.com' }).click();
+	await expect(page.getByRole('button', { name: 'Signing out…' })).toBeDisabled();
+	await page.evaluate(() => { window.dispatchEvent(new Event('finish-session-change')); });
+	await expect(page.getByText('The browser session changed. Nothing was signed out.')).toBeVisible();
+	await expect(page.getByText('stale@example.com')).toHaveCount(0);
+	expect(logoutPosts).toBe(0);
+	await page.getByRole('button', { name: 'Sign out the current browser session' }).click();
+	await expect(page.getByText(/signed out\. if that link/i)).toBeVisible();
+	expect(logoutPosts).toBe(1);
+});
 
 /**
  * Login-CSRF gate pin (PR #30 review): the `/auth/magic` landing must never
