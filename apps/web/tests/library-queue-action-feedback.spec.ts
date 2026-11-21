@@ -50,6 +50,24 @@ test('QF-R04 keyboard reorder keeps the current row and focus on its move contro
 	await expect(page.getByTestId('queue-announcement')).toHaveText('Intro moved to 2 of 3');
 });
 
+test('QF-R05 newer focus after keyboard reorder wins over recovery', async ({ page }) => {
+	await seedQueue(page);
+	const rows = page.getByTestId('queue-item');
+	const move = rows.and(page.locator('[data-track-id="intro-one"]'))
+		.getByRole('button', { name: 'Move Intro down', exact: true });
+	const filter = page.getByRole('searchbox', { name: 'Filter queue', exact: true });
+	await move.focus();
+	await expect(move).toBeFocused();
+	await filter.evaluate((element) => {
+		// The delegated Move handler runs before this later click listener.
+		document.addEventListener('click', () => (element as HTMLInputElement).focus(), { once: true });
+	});
+	await page.keyboard.press('Enter');
+	await expect(rows.nth(1)).toHaveAttribute('data-track-id', 'intro-one');
+	await expect(page.getByTestId('queue-announcement')).toHaveText('Intro moved to 2 of 3');
+	await expect(filter).toBeFocused();
+});
+
 test('QF-R01 equal-title keyboard removals each update the same polite region once', async ({ page }) => {
 	await seedQueue(page);
 	const region = page.getByTestId('queue-announcement');
