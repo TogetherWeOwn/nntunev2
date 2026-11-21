@@ -3,8 +3,7 @@ use tokio_postgres::{error::SqlState, Error, Transaction};
 use super::{candidate_hashes, uuid, CandidateIntent, LOCK_SQL};
 use crate::multipart::readback_inventory::{ReadbackScope, VerifiedCompletedReadback};
 
-// The reservation FK binds the claim digest. Map/page constraints bind geometry
-// and distinct page indices, so a complete ordered hash match binds every page.
+// The claim FK binds the digest, and ordered hashes bind the constrained map pages.
 const APPEND_SQL: &str = "WITH matching_candidate AS MATERIALIZED (
     SELECT m.map_id, r.expires_at
     FROM public.storage_digest_reservations r
@@ -52,10 +51,9 @@ impl InventoryAppendError {
 /// The caller must already authorize the exact candidate and supply independently
 /// established bucket/configuration custody. This helper takes or retains the
 /// digest reservation lock and checks the live holder before appending.
-///
-/// The caller sets transaction deadlines, rolls back on error or cancellation,
-/// and owns commit and its outcome. Success only describes a staged append.
-/// Conflict and indeterminate results grant no retry, reuse or publication authority.
+/// The caller owns deadlines and commit. Roll back on cancellation or an
+/// indeterminate result. Success only stages a row. Failures grant no retry,
+/// reuse or publication authority.
 pub async fn append_inventory(
     tx: &mut Transaction<'_>,
     intent: &CandidateIntent,
@@ -86,37 +84,39 @@ pub async fn append_inventory(
     let digest = origin.plaintext_sha256().as_slice();
     let length = i64::try_from(intent.plaintext_len).map_err(|_| Identity)?;
 
-    tx.query_opt(LOCK_SQL, &[&environment, &library, &digest, &length])
-        .await
-        .map_err(InventoryAppendError::from_db)?
-        .ok_or(MissingOrFenced)?;
-
-    // READ COMMITTED sees the prior lock holder's changes after a wait.
     let append = tx
         .transaction()
         .await
         .map_err(InventoryAppendError::from_db)?;
-    let result = append
-        .query_opt(
-            APPEND_SQL,
-            &[
-                &environment,
-                &library,
-                &digest,
-                &length,
-                &object,
-                &intent.reservation_generation,
-                &sealing_generation,
-                &provider,
-                &intent.header.as_slice(),
-                &uuid(&intent.map_id),
-                &hashes,
-                &media_version,
-                &page_versions,
-            ],
-        )
-        .await
-        .and_then(|row| row.map(|row| row.try_get::<_, bool>(0)).transpose());
+    let held = append
+        .query_opt(LOCK_SQL, &[&environment, &library, &digest, &length])
+        .await;
+    // READ COMMITTED sees the prior holder's changes after the lock wait.
+    let result = match held {
+        Ok(Some(_)) => append
+            .query_opt(
+                APPEND_SQL,
+                &[
+                    &environment,
+                    &library,
+                    &digest,
+                    &length,
+                    &object,
+                    &intent.reservation_generation,
+                    &sealing_generation,
+                    &provider,
+                    &intent.header.as_slice(),
+                    &uuid(&intent.map_id),
+                    &hashes,
+                    &media_version,
+                    &page_versions,
+                ],
+            )
+            .await
+            .and_then(|row| row.map(|row| row.try_get::<_, bool>(0)).transpose()),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+    };
     if matches!(result, Ok(Some(true))) {
         return append.commit().await.map_err(InventoryAppendError::from_db);
     }

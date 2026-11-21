@@ -397,8 +397,8 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         append_inventory(&mut tx, &intent, SCOPE, &verified).await,
         Err(Conflict)
     );
+    let row = tx.query_one(lookup, &[&map]).await.unwrap();
     tx.rollback().await.unwrap();
-    let row = observer.query_one(lookup, &[&map]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), SHARED_VERSION);
     assert_eq!(
         row.get::<_, Vec<String>>(1),
