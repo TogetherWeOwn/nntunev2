@@ -63,6 +63,7 @@
 			const result = await sent.result;
 			await fence.run(() => {
 				if (attempt.signal.aborted) return;
+				if ('status' in result && (result.status === 'signed-out' || result.status === 'deleting')) clear();
 				summary = 'data' in result ? { kind: 'ready', data: result.data, fence } : { kind: result.status };
 			});
 		} finally {

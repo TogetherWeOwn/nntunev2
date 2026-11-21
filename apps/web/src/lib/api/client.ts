@@ -306,7 +306,7 @@ export type MemberInviteSummary = {
 const isCount = (value: unknown): value is number =>
 	typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 function hasInviteBounds(row: Partial<MemberInviteBounds> | null | undefined): row is MemberInviteBounds {
-	return row != null && isEpoch(row.starts_at) && isEpoch(row.ends_at) && row.starts_at <= row.ends_at;
+	return row != null && isEpoch(row.starts_at) && isEpoch(row.ends_at) && row.starts_at < row.ends_at;
 }
 function isMemberInviteSummary(value: unknown): value is MemberInviteSummary {
 	const row = value as Partial<MemberInviteSummary> | null | undefined;

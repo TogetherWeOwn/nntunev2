@@ -102,6 +102,7 @@ test('creates one invite on demand and hands the copied link to signup', async (
 });
 
 test('allows manual copy and restores only a freshly read snapshot', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
 	await mockClipboard(page, true);
 	let restored = false;
 	const methods: string[] = [];
@@ -118,9 +119,15 @@ test('allows manual copy and restores only a freshly read snapshot', async ({ pa
 	const field = page.getByRole('textbox', { name: 'Signup link' });
 	await expect(field).toBeFocused();
 	expect(await field.evaluate((input: HTMLInputElement) => input.selectionEnd)).toBe((await field.inputValue()).length);
-	await page.getByRole('button', { name: 'Hide link' }).click();
+	await expect(page.getByText('Used: 0 · Remaining: 1')).toBeVisible();
+	await page.keyboard.press('Tab');
+	await page.keyboard.press('Tab');
+	await expect(page.getByRole('button', { name: 'Hide link' })).toBeFocused();
+	await page.keyboard.press('Enter');
 	await expect(field).toHaveCount(0);
-	await page.getByRole('button', { name: 'Create invite' }).click();
+	const create = page.getByRole('button', { name: 'Create invite' });
+	await expect(create).toBeFocused();
+	await create.click();
 	await expect(field).toBeVisible();
 	const paid = page.getByText('Paid progress: 3 of 3 months.', { exact: false });
 	await expect(paid).toBeVisible();
@@ -235,13 +242,31 @@ for (const zero of [false, true]) test(`shows closed and upcoming policy with ${
 	await expect(page.getByText('Remaining:', { exact: false })).toHaveCount(0);
 });
 
-for (const [status, json, detail] of [
+const readErrors = [
 	[401, {}, 'Sign in to see your invite summary.'],
-	[403, {}, 'Access to the invite summary was denied.'],
 	[409, { code: 'account_deleting', message: 'Fixture account is being deleted', retryable: false }, 'scheduled for deletion'],
-	[500, {}, 'Couldn’t load your invite summary.'],
-	[200, { ...snapshot, open_window: { ...bounds, used: 0 } }, 'Couldn’t load your invite summary.']
-] as const) test(`does not show aggregates while loading or after an unusable ${status} read`, async ({ page }) => {
+	[500, {}, 'Couldn’t load your invite summary.']
+] as const;
+
+for (const [status, json, detail] of readErrors) test(`handles a ${status} refresh after one issuance`, async ({ page }) => {
+	const methods: string[] = [];
+	await page.route(endpoint, (route) => {
+		methods.push(route.request().method());
+		return methods.length === 3 ? route.fulfill({ status, json }) : mockInvite(route);
+	});
+	await page.goto('/account/invites');
+	await page.getByRole('button', { name: 'Create invite' }).click();
+	await expect(page.getByText(detail, { exact: false })).toBeVisible();
+	await expect(page.getByRole('textbox', { name: 'Signup link' })).toHaveCount(status === 500 ? 1 : 0);
+	expect(methods).toEqual(['GET', 'POST', 'GET']);
+});
+
+for (const [status, json, detail, label = status] of [
+	...readErrors,
+	[403, {}, 'Access to the invite summary was denied.'],
+	[200, { ...snapshot, open_window: { ...bounds, used: 0 } }, 'Couldn’t load your invite summary.', 'missing count'],
+	[200, { ...snapshot, next_window: { ...bounds, ends_at: bounds.starts_at } }, 'Couldn’t load your invite summary.', 'empty window']
+] as const) test(`does not show aggregates while loading or after an unusable read (${label})`, async ({ page }) => {
 	const pending = Promise.withResolvers<void>();
 	await page.route(endpoint, async (route) => {
 		expect(route.request().method()).toBe('GET');
