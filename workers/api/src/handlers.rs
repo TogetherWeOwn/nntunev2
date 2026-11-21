@@ -6878,7 +6878,7 @@ where
     let exact = ctx.store.webhook_ack_control();
     #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
     let exact = false;
-    if exact && subscription.id != subscription_id {
+    if subscription.id != subscription_id {
         return Err(());
     }
     let input = ctx
@@ -13077,6 +13077,7 @@ mod tests {
             amount_cents: 1_000,
             currency: "usd".to_string(),
             paid_at_unix: BILLING_NOW + 60,
+            covered_periods: vec![(BILLING_NOW, end)],
         };
         let fresh_grace = BILLING_NOW + BILLING_PERIOD + 7 * 24 * 3_600;
         let fresh = crate::billing_reconcile::ReconcileOutcome {
@@ -13360,6 +13361,7 @@ mod tests {
                     amount_cents: 1_000,
                     currency: "usd".into(),
                     paid_at_unix: 1,
+                    covered_periods: vec![(0, 100)],
                 });
             block_on(h.store.store_reconcile_outcome("u1", &owner)).unwrap();
             if shadow_only {
@@ -14072,6 +14074,7 @@ mod tests {
                 amount_cents: 1_000,
                 currency: "usd".to_string(),
                 paid_at_unix: BILLING_NOW,
+                covered_periods: vec![(BILLING_NOW - BILLING_PERIOD, e2)],
             },
         );
         // S reads stored E2/active with remote money E1 < E2: stale.
@@ -15832,7 +15835,12 @@ mod tests {
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
         let live = live_for(&h, "u1").expect("live row stored");
         assert_eq!(live.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
-        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        let history = h.store.invoice_history.borrow();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history["in_test_1"].covered_periods,
+            vec![(BILLING_NOW, BILLING_NOW + BILLING_PERIOD)]
+        );
     }
 
     fn cookie_of(resp: &Response) -> String {
