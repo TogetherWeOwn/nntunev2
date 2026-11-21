@@ -83,7 +83,6 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	await expect(audio).toHaveJSProperty('paused', true);
 	await expect(slider).toHaveAttribute('aria-valuetext', '0:16 of 0:16');
 	expect(nonMedia).toEqual([]);
-
 	let release!: () => void;
 	const held = new Promise<void>((resolve) => { release = resolve; });
 	await page.route(/\/api\/demo\/audio\?track=seek-1$/, async (route) => {
