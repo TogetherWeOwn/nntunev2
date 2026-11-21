@@ -188,6 +188,7 @@ impl ReadbackFixture {
 
 #[tokio::test]
 async fn completed_readback_binds_the_exact_inventory_after_flac_and_eof() {
+    use EnrolledReadbackError::Body;
     for (plaintext, complete) in [(FLAC, true), (&FLAC[..FLAC.len() - 1], false)] {
         let fixture = ReadbackFixture::new(plaintext);
         let receipts = [fixture.sidecar()];
@@ -203,29 +204,24 @@ async fn completed_readback_binds_the_exact_inventory_after_flac_and_eof() {
             assert!(std::ptr::eq(verified.inventory(), &inventory));
             assert!(std::ptr::eq(verified.origin(), &fixture.origin));
         } else {
-            assert_eq!(
-                result.err(),
-                Some(EnrolledReadbackError::Body(BodyReadbackError::Content(
-                    ReadbackError::MediaValidation
-                ),))
-            );
+            let invalid_flac = BodyReadbackError::Content(ReadbackError::MediaValidation);
+            assert_eq!(result.err(), Some(Body(invalid_flac)));
         }
     }
 }
 
 #[tokio::test]
 async fn completed_readback_rejects_foreign_scope_and_response_pins() {
+    use BodyReadbackError::{Response, Transport};
     use EnrolledReadbackError::{Body, Envelope};
-
     let fixture = ReadbackFixture::new(FLAC);
     let foreign = ReadbackFixture::new(FLAC);
     let receipts = [fixture.sidecar()];
     let inventory = fixture.inventory(&receipts);
-    let foreign_bucket = "other-bucket";
     let bad_scope = || Body(BodyReadbackError::Inventory);
     for (bucket, configuration, envelope, expected) in [
         (
-            foreign_bucket,
+            "other-bucket",
             CONFIGURATION,
             fixture.envelope(),
             bad_scope(),
@@ -245,19 +241,23 @@ async fn completed_readback_rejects_foreign_scope_and_response_pins() {
         assert_eq!(result.err(), Some(expected));
     }
 
-    for (bucket, version) in [(foreign_bucket, FINAL_VERSION), (BUCKET, SHARED_VERSION)] {
+    for version in [Some(FINAL_VERSION), Some(SHARED_VERSION), None] {
         let result = inventory
             .verify(SCOPE, fixture.envelope(), async |_, pin| {
                 let mut response = fixture.response(pin);
                 if pin.object_key == PAGE_KEY {
-                    response.bucket = bucket.into();
+                    let version = version.ok_or(io::ErrorKind::TimedOut)?;
+                    if version == FINAL_VERSION {
+                        response.bucket = "other-bucket".into();
+                    }
                     response.response.version = Some(version.into());
                     response.response.body = MemoryBody(None);
                 }
                 Ok(response)
             })
             .await;
-        assert_eq!(result.err(), Some(Body(BodyReadbackError::Response)));
+        let expected = version.map_or(Transport, |_| Response);
+        assert_eq!(result.err(), Some(Body(expected)));
     }
 }
 
