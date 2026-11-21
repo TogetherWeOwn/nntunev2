@@ -1,5 +1,5 @@
 import { mount, tick } from 'svelte';
-import Library from '../../../src/routes/library/+page.svelte';
+import Library from '../LibraryPlayerHarness.svelte';
 import { moveTrack, restoreQueue, selectTrack, type QueueState, type Track } from '../../../src/lib/player/queue.js';
 import '../../../src/app.css';
 

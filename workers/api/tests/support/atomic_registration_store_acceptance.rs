@@ -2094,7 +2094,17 @@ fn postgres_admin_invite_windows_are_bounded_and_audited_atomically() {
     run_test(async {
         let mut client = connect().await;
         let (admin, member) = seed_admin_test_users(&client).await;
-        let start = NOW as i64;
+        // The mutation harness reruns this serial suite on the same database.
+        // Start after any committed fixture ranges, which are global, not per actor.
+        let start: i64 = client
+            .query_one(
+                "SELECT GREATEST(MAX(ends_at), $1) FROM invite_windows",
+                &[&(NOW as i64)],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let now = u64::try_from(start).unwrap();
         let schedule = |starts_at, ends_at| InviteWindowSchedule {
             starts_at,
             ends_at,
@@ -2103,7 +2113,7 @@ fn postgres_admin_invite_windows_are_bounded_and_audited_atomically() {
         let ip = "198.51.100.9";
         let first = schedule(start, start + 10);
         assert!(matches!(
-            write(&mut client, &member, Schedule(&first), ip, NOW)
+            write(&mut client, &member, Schedule(&first), ip, now)
                 .await
                 .unwrap(),
             Outcome::ActorNotAdmin
@@ -2115,14 +2125,14 @@ fn postgres_admin_invite_windows_are_bounded_and_audited_atomically() {
                     &admin,
                     Schedule(&schedule(start, end)),
                     ip,
-                    NOW
+                    now
                 )
                 .await
                 .unwrap(),
                 Outcome::InvalidSchedule
             ));
         }
-        let Outcome::Window(open) = write(&mut client, &admin, Schedule(&first), ip, NOW)
+        let Outcome::Window(open) = write(&mut client, &admin, Schedule(&first), ip, now)
             .await
             .unwrap()
         else {
@@ -2134,7 +2144,7 @@ fn postgres_admin_invite_windows_are_bounded_and_audited_atomically() {
                 &admin,
                 Schedule(&schedule(start + 9, start + 11)),
                 ip,
-                NOW
+                now
             )
             .await
             .unwrap(),
@@ -2145,24 +2155,24 @@ fn postgres_admin_invite_windows_are_bounded_and_audited_atomically() {
             &admin,
             Schedule(&schedule(start + 10, start + 20)),
             ip,
-            NOW,
+            now,
         )
         .await
         .unwrap() else {
             panic!("adjacent schedule must commit");
         };
         assert!(matches!(
-            write(&mut client, &member, Close(open.id), ip, NOW)
+            write(&mut client, &member, Close(open.id), ip, now)
                 .await
                 .unwrap(),
             Outcome::ActorNotAdmin
         ));
 
         assert!(matches!(
-            write(&mut client, &admin, Close(0), ip, NOW).await.unwrap(),
+            write(&mut client, &admin, Close(0), ip, now).await.unwrap(),
             Outcome::Missing
         ));
-        let Outcome::Window(ended) = write(&mut client, &admin, Close(open.id), ip, NOW + 10)
+        let Outcome::Window(ended) = write(&mut client, &admin, Close(open.id), ip, now + 10)
             .await
             .unwrap()
         else {
@@ -2174,7 +2184,7 @@ fn postgres_admin_invite_windows_are_bounded_and_audited_atomically() {
         client.batch_execute("CREATE TEMP TABLE audit_log (LIKE public.audit_log INCLUDING DEFAULTS, CHECK (false))").await.unwrap();
         let failed_schedule = schedule(start + 20, start + 30);
         for operation in [Close(open.id), Schedule(&failed_schedule)] {
-            assert!(write(&mut client, &admin, operation, ip, NOW + 1)
+            assert!(write(&mut client, &admin, operation, ip, now + 1)
                 .await
                 .is_err());
         }
@@ -2203,7 +2213,7 @@ fn postgres_admin_invite_windows_are_bounded_and_audited_atomically() {
             // Retry both, including a stale request that reached the write lock late.
             for (id, expected_end) in [(open.id, start + 2), (future.id, future.starts_at)] {
                 let Outcome::Window(window) =
-                    write(&mut client, &admin, Close(id), ip, NOW + offset)
+                    write(&mut client, &admin, Close(id), ip, now + offset)
                         .await
                         .unwrap()
                 else {

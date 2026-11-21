@@ -1029,10 +1029,10 @@ pub trait Store {
             Err(StoreError)
         }
     }
-    /// Extend the exact holder's lease (`playback::playback_lease_
-    /// touch_statement`): true iff the (`session_id`, `play_id`,
-    /// `epoch`) triple still names the stored row. Default `Err` fails
-    /// closed like [`Store::live_subscription`].
+    /// Extend the exact holder's live lease. Returns true only if the
+    /// (`session_id`, `play_id`, `epoch`) triple still names a live row
+    /// at `now` and the deletion fence allows the write. Default `Err`
+    /// fails closed like [`Store::live_subscription`].
     fn touch_playback_lease(
         &self,
         user_id: &str,
@@ -6450,7 +6450,7 @@ where
     // lost the lease between the read and now, in which case this is
     // simply a new start through the gates below.
     if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
-        if row.is_continuation(&body.session_id, play_id, &body.track_id) {
+        if row.is_continuation(&body.session_id, play_id, &body.track_id, ctx.now) {
             if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, play_id).is_err()
             {
                 return Err(validation_failed("invalid play_id"));
@@ -6585,10 +6585,10 @@ where
 }
 
 /// Heartbeat: the holder's keepalive and the takeover signal in one.
-/// Always 200 for lease state (`active` extends, `superseded` tells the
-/// displaced player to pause, `expired` means no row) — lease state is
-/// an answer, not an error. No subscription or cap gates: a current
-/// play finishes even when a new start would be refused.
+/// Always 200 for lease state (`active` extends, `superseded` signals
+/// displacement, and `expired` means the matching lease ended or no
+/// row exists). No subscription or cap gates: a current play finishes
+/// even when a new start would be refused.
 async fn play_heartbeat<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -6633,6 +6633,7 @@ where
         &body.session_id,
         &body.play_id,
         body.lease_epoch,
+        ctx.now,
     );
     let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
         let expires = ctx.now.saturating_add(crate::playback::LEASE_TTL_SECS);
@@ -9427,13 +9428,12 @@ mod tests {
             session_id: &str,
             play_id: &str,
             epoch: u64,
-            _now: u64,
+            now: u64,
             expires_at: u64,
         ) -> Result<bool, StoreError> {
-            // Mirror the conditional UPDATE: only the exact
-            // (session, play, epoch) holder extends, monotonically
-            // (an out-of-order older deadline never shortens), and
-            // never for a deleting account (in-statement fence).
+            // Mirror the conditional UPDATE: only the exact holder of a
+            // live lease extends, monotonically, and never for a deleting
+            // account (in-statement fence).
             if let Some(marker) = self.mark_deleting_before_next_lease_write.take() {
                 self.deleting_users.borrow_mut().insert(marker);
             }
@@ -9443,7 +9443,8 @@ mod tests {
             let mut leases = self.playback_leases.borrow_mut();
             match leases.get_mut(user_id) {
                 Some(row)
-                    if row.session_id == session_id
+                    if row.is_live(now)
+                        && row.session_id == session_id
                         && row.play_id == play_id
                         && row.epoch == epoch =>
                 {
@@ -23085,7 +23086,8 @@ mod tests {
         ]);
         let schedule = |body| call("POST", ADMIN_INVITE_WINDOWS_PATH, Some(body), Some(ORIGIN));
         let body = r#"{"starts_at":100,"ends_at":200,"note":"first cohort"}"#;
-        let created = schedule(&format!(" \n\t{body}"));
+        let body_with_whitespace = format!(" \n\t{body}");
+        let created = schedule(&body_with_whitespace);
         assert_eq!(created.status, 201);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&created.body).unwrap(),
