@@ -174,4 +174,5 @@ BEGIN
         RAISE EXCEPTION 'delete bypassed live read protection after last reference removal';
     END IF;
 END $$;
+\ir ../fixtures/ingest_session_reserve.sql
 ROLLBACK;
