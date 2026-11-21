@@ -1045,13 +1045,17 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   test('post-deploy E2E and smoke runs queue without replacing pending verification', () => {
     const assertStagingQueue = (body: string) => {
       expect(body.split('\njobs:\n')[0]!).toMatch(
-        /^concurrency:\n  group: e2e-staging\n  cancel-in-progress: false\n  queue: max$/m,
+        /^concurrency:\n  group: e2e-staging-queued\n  cancel-in-progress: false\n  queue: max$/m,
       );
     };
     assertStagingQueue(stagingWorkflow);
-    const withoutQueue = stagingWorkflow.replace('  queue: max\n', '');
-    expect(withoutQueue).not.toBe(stagingWorkflow);
-    expect(() => assertStagingQueue(withoutQueue)).toThrow();
+    for (const mutant of [
+      stagingWorkflow.replace('  queue: max\n', ''),
+      stagingWorkflow.replace('group: e2e-staging-queued\n', 'group: e2e-staging\n'),
+    ]) {
+      expect(mutant, 'mutation must change the workflow').not.toBe(stagingWorkflow);
+      expect(() => assertStagingQueue(mutant)).toThrow();
+    }
   });
 
   test('deploy.yml is the only reusable-workflow caller of e2e-staging', () => {

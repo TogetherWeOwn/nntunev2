@@ -1247,8 +1247,9 @@ environment exists on this repo.
   `api_deploy_outcome`), so a skipped/failed
   deploy cannot produce a full-journey PASS and no separate dispatch is
   needed or accepted as evidence. `deploy-staging-main` queues later main
-  pushes until the entire deploy and verification finish. The `e2e-staging`
-  group also queues pending runs rather than replacing the post-deploy call.
+  pushes until the entire deploy and verification finish. The
+  `e2e-staging-queued` group queues pending runs rather than replacing the
+  post-deploy call.
   Scheduled/manual `e2e-staging` runs are synthetic monitoring only (the
   full-journey job is skipped there).
   Record the deploy run and the `post-deploy-e2e` result, and call it
@@ -1287,8 +1288,10 @@ environment exists on this repo.
 ### Staging deploy lock cutover and rollback
 
 Actions reruns use the workflow and reusable workflow from the original
-push. A run from before `deploy-staging-main` was added cannot acquire
-that lock, even if it is rerun after cutover.
+run. A deploy from before `deploy-staging-main` was added cannot acquire
+that lock, even if it is rerun after cutover. Pre-cutover smoke reruns
+stay in the old `e2e-staging` group and cannot replace a pending run in
+`e2e-staging-queued`.
 
 - **Cutover:** Coordinate a pause on other `main` merges/pushes and staging
   deploy reruns. In Actions, wait for all active and queued `main`

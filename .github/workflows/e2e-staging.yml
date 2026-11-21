@@ -86,10 +86,10 @@ on:
 permissions:
   contents: read
 
-# Smoke triggers share this group; do not let a new smoke replace a pending
-# post-deploy call while deploy.yml is holding the staging deploy lock.
+# Smoke and post-deploy calls share this queue. Use a new group so reruns of
+# historical smoke workflows keep their single-pending policy on e2e-staging.
 concurrency:
-  group: e2e-staging
+  group: e2e-staging-queued
   cancel-in-progress: false
   queue: max
 

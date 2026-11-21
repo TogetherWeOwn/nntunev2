@@ -305,9 +305,9 @@ How the suite uses them:
   names or segment lists in the repo or public logs.
 - Provider budget + 430 control: the staging NNTP provider is a shared
   account with production, so each run holds at most a trickle of
-  connections. The workflow concurrency group (`e2e-staging`,
-  `cancel-in-progress: false`, `queue: max`) serializes runs without
-  replacing a pending post-deploy call when a smoke run arrives, and
+  connections. The workflow concurrency group (`e2e-staging-queued`,
+  `cancel-in-progress: false`, `queue: max`) serializes new runs without
+  replacing pending verification; pre-cutover smoke reruns use the old group.
   `E2E_NNTP_MAX_CONNECTIONS` (default 2, hard max 10 —
   `helpers/provider-budget.ts`) caps each run so 8+ connections stay free.
   The provider 430 control reads the run budget through the same helper, so
