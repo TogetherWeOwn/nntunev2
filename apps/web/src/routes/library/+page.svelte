@@ -804,7 +804,7 @@
 			const wrote = committed !== null && JSON.stringify(base) !== JSON.stringify(committed);
 			if (edit !== favoriteEdit) {
 				if (wrote) favoriteBaseline = update(favoriteBaseline);
-				return null;
+				return committed ? 'saved' : null;
 			}
 			if (!committed) { applied?.(before, optimistic); return 'visit'; }
 			const visitOnly = placement && !favoriteBaseline.includes(placement.id) && !committed.includes(placement.id)

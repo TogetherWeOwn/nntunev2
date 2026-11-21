@@ -29,7 +29,7 @@ async function expectMembership(page: Page, id: string | null, announcement = ''
 	await expect.poll(() => storedFavorites(page)).toBe(id === null || visitOnly ? null : JSON.stringify([id]));
 }
 
-test('the player stars the selected track once and shares membership with Library and queue controls', async ({ page }) => {
+test('the selected Favorite announces once after its held write, even with a later Library edit', async ({ page }) => {
 	await openLibrary(page);
 	const [north, south] = tracks;
 	await queueRow(page, south.id).getByRole('button', { name: 'Select South Wind', exact: true }).click();
@@ -38,23 +38,27 @@ test('the player stars the selected track once and shares membership with Librar
 	const sameDecoder = () => audio.evaluate((node, original) => node === original, decoder);
 	const nowPlaying = await page.getByTestId('now-playing').innerText();
 	await expect(page.getByTestId('player-next')).toBeEnabled();
+	await expect(queueRow(page, north.id).getByRole('button', { name: 'Star North Wind', exact: true })).toHaveAttribute('aria-pressed', 'false');
+	const release = await page.evaluateHandle(({ contextKey, favoritesBase }) => new Promise<() => void>((ready) => {
+		void navigator.locks.request(`${favoritesBase}.${sessionStorage.getItem(contextKey)}`, () => new Promise<void>((release) => ready(release)));
+	}), { contextKey, favoritesBase });
 	await favorite(page).and(page.getByRole('button', { name: 'Favorite South Wind', exact: true })).press('Space');
 	await expect(favorite(page)).toBeFocused();
-	await expectMembership(page, south.id, 'Starred South Wind.');
+	await row(page, north.id).getByRole('button', { name: 'Star North Wind', exact: true }).click();
+	await expect(feedback(page)).toBeEmpty();
+	expect(await storedFavorites(page)).toBeNull();
+	await release.evaluate((release) => release());
+	await expect.poll(() => storedFavorites(page)).toBe(JSON.stringify([south.id, north.id]));
+	await expect(favorite(page)).toHaveAttribute('aria-pressed', 'true');
 	await expect(row(page, south.id).getByRole('button', { name: 'Unstar South Wind', exact: true })).toHaveAttribute('aria-pressed', 'true');
 	await expect(page.locator('[aria-live="polite"]').filter({ hasText: /^Starred South Wind\.$/ })).toHaveCount(1);
 	await expect(page.getByRole('region', { name: 'Player', exact: true }).getByRole('status')).toHaveCount(1);
 	expect(await sameDecoder()).toBe(true);
 	await expect(page.getByTestId('now-playing')).toHaveText(nowPlaying);
 	await expect(page.getByTestId('player-next')).toBeEnabled();
-
-	await expect(queueRow(page, north.id).getByRole('button', { name: 'Star North Wind', exact: true })).toHaveAttribute('aria-pressed', 'false');
-	const unstar = queueRow(page, south.id).getByRole('button', { name: 'Unstar South Wind', exact: true, pressed: true });
-	await unstar.click();
+	await queueRow(page, south.id).getByRole('button', { name: 'Unstar South Wind', exact: true, pressed: true }).click();
 	await expect(favorite(page)).toHaveAttribute('aria-pressed', 'false');
-	await expect(feedback(page)).toHaveText('');
-	await row(page, south.id).getByRole('button', { name: 'Star South Wind', exact: true }).click();
-	await expect(favorite(page)).toHaveAttribute('aria-pressed', 'true');
+	await expect(feedback(page)).toBeEmpty();
 	await page.getByRole('link', { name: 'Search', exact: true }).first().click();
 	await expect(page).toHaveURL(/\/search$/);
 	await expect(favorite(page)).toHaveCount(0);

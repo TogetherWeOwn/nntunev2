@@ -6,6 +6,7 @@
 	let { currentFavorite, snapshot }: { currentFavorite: ReturnType<typeof createCurrentTrackFavorite>; snapshot: QueueState } = $props();
 	const target = $derived(currentFavorite.view(snapshot));
 	const feedback = $derived(currentFavorite.feedback(target));
+	$effect(() => { if (!feedback) currentFavorite.clearFeedback(); });
 
 	const activateRendered: Action<HTMLButtonElement, NonNullable<typeof target>> = (button, rendered) => {
 		const listeners = new AbortController();

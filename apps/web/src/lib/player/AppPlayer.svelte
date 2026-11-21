@@ -18,11 +18,8 @@
 	let shareOwner: string | undefined;
 	const controller = createPlayerController(createQueue([]), { flush: tick });
 	const currentFavorite = createCurrentTrackFavorite(controller.queue);
-	const purgePlayer = controller.purgeAtAuthBoundary;
-	const player = setAppPlayer(Object.assign(controller, {
-		currentFavorite, claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true,
-		purgeAtAuthBoundary: () => { currentFavorite.clearFeedback(); purgePlayer(); }
-	}));
+	const player = setAppPlayer(Object.assign(controller,
+		{ currentFavorite, claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
 	const { queue, media, media: { seekFeedback, playbackStatus } } = player;
 	const attachNativeAudio = media.attach;
 	const currentTrack = $derived(queueCurrentTrack($queue));

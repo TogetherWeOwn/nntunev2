@@ -4,14 +4,13 @@ import type { createQueueController } from './queueController.js';
 
 export type FavoriteWrite = 'saved' | 'visit' | null;
 type FavoriteOwner = { read(id: string): readonly string[] | null; write(id: string, pressed: boolean): Promise<FavoriteWrite> };
-
-type FavoriteIntent = { id: string; receipt: string; membership: readonly string[] };
+type Selection = { id: string; receipt: string; pressed: boolean };
 
 /** The player borrows the mounted Library's membership; it never owns a copy. */
 export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueController>) {
 	let owner = $state.raw<{ member: FavoriteOwner; version: number } | null>(null);
-	let ownerVersion = 0;
-	let outcome = $state.raw<(FavoriteIntent & { text: string; version: number }) | null>(null);
+	let ownerVersion = 0, actionVersion = 0;
+	let outcome = $state.raw<(Selection & { text: string; version: number }) | null>(null);
 
 	function bind(member: FavoriteOwner): () => void {
 		const binding = { member, version: ++ownerVersion };
@@ -35,20 +34,19 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 			receipt: `${binding.version}:${revision}`, membership };
 	}
 
-	const matches = (current: FavoriteIntent | null, intent: FavoriteIntent) =>
-		current?.receipt === intent.receipt && current.id === intent.id && current.membership === intent.membership;
+	const sameTrack = (current: Selection | null, previous: Selection) =>
+		current?.receipt === previous.receipt && current.id === previous.id;
 
-	async function activate(intent: FavoriteIntent): Promise<void> {
+	async function activate(intent: Selection & { membership: readonly string[] }): Promise<void> {
 		const target = view(queue.snapshot);
-		if (!owner || target === null || !matches(target, intent)) return;
+		if (!owner || !target || !sameTrack(target, intent) || target.membership !== intent.membership) return;
 		const pressed = !target.pressed;
+		const version = ++actionVersion;
 		const result = await owner.member.write(target.id, pressed);
-		if (!result) return;
-		// A retired selection or owner cannot publish a success message.
 		const updated = view(queue.snapshot);
-		if (!updated || updated.receipt !== intent.receipt || updated.pressed !== pressed) return;
+		if (!result || version !== actionVersion || !sameTrack(updated, intent) || updated?.pressed !== pressed) return;
 		outcome = {
-			...updated, version: (outcome?.version ?? 0) + 1,
+			id: intent.id, receipt: intent.receipt, pressed, version,
 			text: `${pressed ? 'Starred' : 'Unstarred'} ${target.title}${result === 'visit' ? ' for this visit' : ''}.`
 		};
 	}
@@ -56,6 +54,6 @@ export function createCurrentTrackFavorite(queue: ReturnType<typeof createQueueC
 	return {
 		bind, view, activate,
 		clearFeedback: () => { outcome = null; },
-		feedback: (target: FavoriteIntent | null) => outcome && matches(target, outcome) ? outcome : null
+		feedback: (target: Selection | null) => outcome && sameTrack(target, outcome) && target?.pressed === outcome.pressed ? outcome : null
 	};
 }
