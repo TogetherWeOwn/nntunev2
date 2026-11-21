@@ -174,6 +174,19 @@ Do not extend the spike, and do not copy its approach into new code.
   `nntune/<version> ( <contact> )`. Serve product reads from the
   mirror, not the live API.
 
+## Modern web platform guidance
+
+Before writing or changing browser-facing code in the SvelteKit app under `apps/web/` (`.svelte` components, CSS, HTML, client-side TypeScript), consult Modern Web Guidance. It covers current HTML, CSS and DOM APIs, accessibility, forms and performance. Skip it for server-only code, Rust crates and workers. The clean-room, YouTube and MetaBrainz guardrails above still win over any guide.
+
+1. If your agent harness provides the `modern-web-guidance` skill, use it. Otherwise run the CLI directly (Node 22+):
+   `DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest search "<2-5 word capability>"`, then
+   `DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest retrieve "<id>"`.
+   Search one capability at a time (for example `"light dismiss dialog"`), without framework or app names.
+2. Apply only the retrieved guidance that fits the task. Keep existing behavior, copy, design tokens and
+   the stack the route already uses; record any guide you followed in the PR body.
+3. The guidance never overrides this file, an ADR, or a project decision. If they
+   conflict, follow the project and note the conflict in the PR.
+
 ## Contributing
 
 PRs follow the org contract in `TogetherWeOwn/.github` CONTRIBUTING + this repo's overrides; use this repo's PR template, which replaces the org template; its Attestation section is mandatory.
