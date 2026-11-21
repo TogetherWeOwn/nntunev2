@@ -2462,7 +2462,9 @@ fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() 
         let (_, peer) = seed_admin_test_users(&db).await;
         let issue = async |db: &mut Client, user: &str, n: u8| {
             let hash = format!("hash-{user}-{n}");
-            member_issue_invite_on(db, user, &hash, "198.51.100.9").await.unwrap()
+            member_issue_invite_on(db, user, &hash, "198.51.100.9")
+                .await
+                .unwrap()
         };
         assert_eq!(issue(&mut db, &issuer, 1).await, WindowClosed);
         let (window, _) = seed_member_window(&db, 2 * 86_400).await;
@@ -2505,10 +2507,10 @@ fn postgres_member_invite_issue_counts_paid_union_and_serializes_window_quota() 
         };
         assert_eq!(second, QuotaExhausted);
         let valid: bool = db.query_one("SELECT i.expires_at = i.created_at + 86400 AND i.expires_at = $2
-            AND EXISTS (SELECT 1 FROM audit_log a WHERE a.user_id = i.issued_by AND a.action = 'invite.issued'
-                AND a.at = i.created_at AND a.details = jsonb_build_object('invite_id', i.id, 'kind', 'member', 'window_id', i.window_id))
+            AND (SELECT count(*) FROM audit_log a WHERE a.user_id = i.issued_by AND a.action = 'invite.issued'
+                AND a.at = i.created_at AND a.details = jsonb_build_object('invite_id', i.id, 'kind', 'member', 'window_id', i.window_id)) = 1
             FROM invite_codes i WHERE id = $1", &[&id, &expires_at]).await.unwrap().get(0);
-        assert!(valid, "configured lifetime and matching audit");
+        assert!(valid, "configured lifetime and exactly one matching audit");
         for stamp in [
             "revoked_at = created_at",
             "revoked_at = NULL, expires_at = created_at",
