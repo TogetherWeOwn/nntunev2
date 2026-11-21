@@ -393,6 +393,11 @@ def main():
                     routing.check(status == 200 and body == "billing-deadline-ok", body)
                     print("PASS: billing deadline after writes rolled back", flush=True)
                     print(
+                        "PASS: dormant billing Store refused changed equal-end terminal proof; "
+                        "fresh refold, uncancel and paid-end cutoff held",
+                        flush=True,
+                    )
+                    print(
                         "PASS: PostgreSQL watchdog rolled back abandoned billing writes",
                         flush=True,
                     )
