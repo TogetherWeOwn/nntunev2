@@ -5,7 +5,7 @@ import { createQueueShare } from '#lib/player/queueShare.js';
 import { createPlayerController } from '#lib/player/controller.svelte.js';
 import { createFavoritesExport } from './favoritesExport.js';
 import { createLibraryRefresher } from '#lib/library/refresh.js';
-import { loadFavorites, saveFavorites, clearFavoritesAtAuthBoundary, selectFavoriteItems } from '#lib/library/favorites.js';
+import { loadFavorites, favoritesKey, clearFavoritesAtAuthBoundary, selectFavoriteItems, updateStoredFavorites } from '#lib/library/favorites.js';
 import {
 	clearRecentFindsAtAuthBoundary,
 	loadRecentFinds,
@@ -102,7 +102,7 @@ function pageScript(onEndTrackDrag = endTrackDrag) {
 		selectQueueIndex: queueFunctions.selectTrack,
 		shuffleUpcoming: queueFunctions.shuffleUpcoming,
 		loadFavorites,
-		saveFavorites,
+		favoritesKey, updateStoredFavorites,
 		clearFavoritesAtAuthBoundary,
 		clearRecentFindsAtAuthBoundary,
 		loadRecentFinds,

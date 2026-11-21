@@ -24,6 +24,7 @@ diff -u "$expected/mbdump-recording_url.tsv" "$temp_dir/mbdump/curated/mbdump-re
 diff -u "$expected/mbdump-recording_music_video.tsv" "$temp_dir/mbdump/curated/mbdump-recording_music_video.tsv"
 diff -u "$expected/mbdump-recording_isrc.tsv" "$temp_dir/mbdump/curated/mbdump-recording_isrc.tsv"
 diff -u "$expected/mbdump-work_alias.tsv" "$temp_dir/mbdump/curated/mbdump-work_alias.tsv"
+diff -u "$expected/mbdump-label_alias.tsv" "$temp_dir/mbdump/curated/mbdump-label_alias.tsv"
 
 # The preserved core-dump cover rows share endpoints with music-video rows.
 # Give one excluded edge a nonexistent endpoint so a mistaken admission cannot

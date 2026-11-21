@@ -29,7 +29,7 @@ headerless MusicBrainz COPY files from the CC0 core dump: the entity files
 `release` with `release_alias` and `artist_credit_name`/`release_country`/`release_unknown_country`,
 `release_group` with `release_group_alias` and `release_group_primary_type`,
 `recording` with `recording_alias`/`medium`/`track`, `work` with
-`work_alias`/`work_type`, `label` with `label_type`) plus the relationship files
+`work_alias`/`work_type`, `label` with `label_alias`/`label_type`) plus the relationship files
 (`url`, `link_type`, `link`, `link_attribute_type`, `link_attribute`,
 `l_artist_url`, `l_recording_url`, `l_recording_recording`, `l_recording_work`,
 `l_artist_recording`, `l_artist_release`, `l_artist_work`, `release_label`, `isrc`) listed in
@@ -92,17 +92,15 @@ Disk-bounded mode emits the same TSV content under `.tsv.gz`.
 The `mbdump-artist_recording.tsv`, `mbdump-artist_release.tsv`, and
 `mbdump-artist_work.tsv` sidecars contain the artist MBID, the corresponding
 recording, release (not release-group), or work MBID, link-type name (raw COPY
-text), and dump timestamp. `mbdump-recording_work.tsv` uses recording and work
-MBIDs in the same shape. For each of these four families, the nine-field COPY
-row supplies link ID, source ID, and target ID in positions 2–4. The ETL
-resolves `link → link_type` and verifies the type's declared direction.
+text), and dump timestamp. `mbdump-recording_work.tsv` has the same shape.
+Nine-field COPY rows supply link, source, and target IDs at positions 2–4.
+The ETL resolves `link → link_type` and verifies the declared direction.
 
-The sidecars sort and deduplicate by source MBID, target MBID, and decoded
-type name, retaining the smallest raw COPY spelling for ties. Empty sources
-produce empty sidecars; missing endpoints, links or types, wrong direction,
-and malformed projection fields refuse publication. Disk-bounded mode emits
-the same TSV content under `.tsv.gz`. These links do not extend the URL or
-music-video allowlists, and the SQL importer still reads only its ten inputs.
+Rows sort and deduplicate by source MBID, target MBID, and decoded type name,
+keeping the smallest raw COPY spelling for ties. Empty sources emit empty
+sidecars; malformed fields, missing endpoints, links or types, and wrong
+direction refuse publication. Disk-bounded mode writes `.tsv.gz`. URL/video
+allowlists and the SQL importer's ten inputs are unchanged.
 See upstream [core table membership](https://github.com/metabrainz/musicbrainz-server/blob/master/lib/MusicBrainz/Server/Constants.pm)
 and the [core export definition](https://github.com/metabrainz/musicbrainz-server/blob/master/admin/ExportAllTables).
 
@@ -115,6 +113,14 @@ and deduplicated by release MBID, label MBID, and COPY-decoded number, then
 re-escaped without changing case or whitespace. Both sidecars use `.tsv.gz`
 in disk-bounded mode. Malformed fields and dangling references used by these
 projections refuse publication, even if other edges are valid.
+
+`mbdump-label_alias.tsv` uses the alias columns and whole-row tie-break above,
+keyed by the exact label MBID in `mbdump-label.tsv`. The CC0 archive member
+`mbdump/label_alias` has 16 COPY fields: alias ID, label ID, name, locale, sort
+name, and primary flag are at positions 1, 2, 3, 4, 8, and 15. Rows sort by
+label MBID, COPY-decoded name, and COPY-decoded locale. An empty input emits
+an empty sidecar; malformed projected fields or dangling label IDs refuse
+publication. Disk-bounded mode emits the same TSV content under `.tsv.gz`.
 
 `import.sh` still loads only its existing ten files; no database table or read
 route consumes the sidecars yet. To regenerate an older snapshot with the

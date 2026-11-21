@@ -71,6 +71,22 @@ class StreamExtractTest(unittest.TestCase):
         self.assertEqual(meta["skipped_members"], 1)
         self.assertEqual(meta["missing"], [])
 
+    def test_label_alias_requires_exact_archive_member(self):
+        extract = load("stream_extract", EXTRACT)
+        members = {f"mbdump/{table}": b"" for table in extract.REQUIRED_TABLES if table != "label_alias"}
+        members["mbdump/nested/label_alias"] = b"not the core member\n"
+        members["mbdump/label_alias_type"] = b"not the projection input\n"
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            result = subprocess.run([sys.executable, str(EXTRACT), str(out)],
+                                    input=tar_bytes(members), capture_output=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            meta = json.loads((out / "dump-meta.json").read_text())
+            self.assertEqual(meta["missing"], ["label_alias"])
+            self.assertEqual(meta["skipped_members"], 2)
+            self.assertFalse((out / "label_alias.gz").exists())
+            self.assertFalse((out / "label_alias_type.gz").exists())
+
     def test_missing_required_table_fails(self):
         result, out = self.run_extract({"mbdump/artist": b"x\n"})
         self.assertEqual(result.returncode, 1)
@@ -777,30 +793,39 @@ class ArtistRelationProjectionTest(ProjectionTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return packed
 
-    def assert_refusal(self, packed, diagnostic):
-        current = packed / "curated"
+    def assert_refusal(self, raw, *diagnostics, gzip_output="1", consume="1"):
+        current = raw / "curated"
         snapshot = current.readlink()
         before = {p.name: p.read_bytes() for p in current.iterdir()}
-        mode = {"MB_ETL_CONSUME_INPUTS": "1", "MB_ETL_GZIP_OUTPUT": "1"}
-        refused = self.run_etl(packed, DUMP_TS="2025-02-04T04:05:06Z", **mode)
+        mode = {"MB_ETL_GZIP_OUTPUT": gzip_output, "MB_ETL_CONSUME_INPUTS": consume}
+        refused = self.run_etl(raw, DUMP_TS="2025-02-04T04:05:06Z", **mode)
         self.assertEqual(refused.returncode, 1, refused.stdout)
-        self.assertIn(diagnostic, refused.stderr)
+        for diagnostic in diagnostics:
+            self.assertIn(diagnostic, refused.stderr)
         self.assertEqual(current.readlink(), snapshot)
         self.assertEqual({p.name: p.read_bytes() for p in current.iterdir()}, before)
+        self.assertEqual(list(raw.glob(".curated-*")), [raw / snapshot])
 
-    def test_missing_artist_relationship_refuses_before_consumption(self):
+    def test_bad_artist_relationship_inputs_refuse_before_consumption(self):
         packed = self.pack_published()
-        (packed / "l_artist_work.gz").unlink()
-        inputs = {p.name: p.read_bytes() for p in packed.glob("*.gz")}
-        self.assert_refusal(packed, f"missing input file: {packed / 'l_artist_work'}")
-        self.assertEqual({p.name: p.read_bytes() for p in packed.glob("*.gz")}, inputs)
+        plain, compressed = packed / "l_artist_work", packed / "l_artist_work.gz"
+        plain.touch()
+        for diagnostic, remove in (
+            (f"ambiguous input: both {plain} and {compressed} exist", ()),
+            (f"missing input file: {plain}", (plain, compressed)),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                for path in remove:
+                    path.unlink()
+                inputs = {p.name: p.read_bytes() for p in packed.iterdir() if p.is_file()}
+                self.assert_refusal(packed, diagnostic)
+                self.assertEqual({p.name: p.read_bytes() for p in packed.iterdir() if p.is_file()}, inputs)
 
     def test_consuming_gzip_refuses_dangling_artist_relationship(self):
         packed = self.pack_published()
         path = packed / "l_artist_work.gz"
         payload = gzip.decompress(path.read_bytes())
-        changed = payload.replace(b"\t20\t80\t", b"\t20\t999\t", 1)
-        path.write_bytes(gzip.compress(changed))
+        path.write_bytes(gzip.compress(payload.replace(b"\t20\t80\t", b"\t20\t999\t", 1)))
         self.assert_refusal(packed, "l_artist_work: references missing work 999")
         self.assertFalse(path.exists())
 
@@ -809,9 +834,6 @@ class ArtistRelationProjectionTest(ProjectionTestCase):
         for raw, suffix, mode in ((self.raw, "", "0"), (packed, ".gz", "1")):
             published = self.run_etl(raw, MB_ETL_GZIP_OUTPUT=mode)
             self.assertEqual(published.returncode, 0, published.stderr)
-            current = raw / "curated"
-            snapshot = current.readlink()
-            before = {p.name: p.read_bytes() for p in current.iterdir()}
             for index, (target, (first, *_)) in enumerate(self.targets.items()):
                 key = 700 + 3 * index
                 for table, old, new, error in (
@@ -828,14 +850,55 @@ class ArtistRelationProjectionTest(ProjectionTestCase):
                         self.assertIn(old.encode(), payload)
                         changed = payload.replace(old.encode(), new.encode(), 1)
                         path.write_bytes(gzip.compress(changed) if suffix else changed)
-                        refused = self.run_etl(raw, DUMP_TS="2025-02-04T04:05:06Z", MB_ETL_GZIP_OUTPUT=mode)
-                        path.write_bytes(original)
-                        self.assertEqual(refused.returncode, 1, refused.stdout)
-                        self.assertIn(f"l_artist_{target}: ", refused.stderr)
-                        self.assertIn(error, refused.stderr)
-                        self.assertEqual(current.readlink(), snapshot)
-                        self.assertEqual({p.name: p.read_bytes() for p in current.iterdir()}, before)
-                        self.assertEqual(list(raw.glob(".curated-*")), [raw / snapshot])
+                        try:
+                            self.assert_refusal(raw, f"l_artist_{target}: ", error, gzip_output=mode, consume="0")
+                        finally:
+                            path.write_bytes(original)
+
+
+class LabelAliasProjectionTest(AliasProjectionTestCase):
+    entity = "label"
+
+    def test_decoded_keys_and_raw_winners_match_streamed_gzip(self):
+        self.assert_plain_and_streamed_output((ROOT / "tests" / "expected" / self.output).read_bytes())
+        alias_mbids = self.curated_mbids("label_alias")
+        self.assertLess(alias_mbids, self.curated_mbids("label"))
+        self.assertTrue(alias_mbids.isdisjoint(self.curated_mbids("release")))
+
+    def test_empty_label_alias_table_emits_empty_sidecar(self):
+        (self.raw / "label_alias").write_bytes(b"")
+        self.assert_plain_and_streamed_output(b"")
+
+    def test_label_alias_refusals_preserve_published_snapshot(self):
+        published = self.run_etl(self.raw)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        self.assertIn("label_alias=4,", published.stdout)
+        target = self.curated.readlink()
+        before = {p.name: p.read_bytes() for p in self.curated.iterdir()}
+        path = self.raw / "label_alias"
+        aliases = path.read_bytes()
+        first_row = aliases.splitlines(keepends=True)[0]
+        for changed, error in (
+            (None, "missing input file:"),
+            (b"broken\n", "expected 16 fields"),
+            (aliases + first_row, "UNIQUE constraint failed: label_alias.id"),
+            # 30 exists as a release, not as a label. Other aliases stay valid.
+            (aliases.replace(b"930\t71\t", b"930\t30\t", 1), "label_alias references missing label 30"),
+            (aliases.replace(b"\tt\tf\n", b"\ttrue\tf\n", 1), "invalid primary_for_locale"),
+            (aliases.replace(rb"\303\x89tiquette", rb"\303tiquette", 1), "invalid COPY text in name or locale"),
+            (aliases.replace(rb"Quartz\tRecords", rb"Quartz\377", 1), "invalid COPY text in sort_name"),
+        ):
+            with self.subTest(error=error):
+                if changed is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(changed)
+                refused = self.run_etl(self.raw, DUMP_TS="2025-02-03T04:05:07Z")
+                self.assertEqual(refused.returncode, 1, refused.stdout)
+                self.assertIn(error, refused.stderr)
+                self.assertEqual(self.curated.readlink(), target)
+                self.assertEqual({p.name: p.read_bytes() for p in self.curated.iterdir()}, before)
+                self.assertEqual(list(self.raw.glob(".curated-*")), [self.raw / target])
 
 
 class LabelProjectionTest(ProjectionTestCase):
