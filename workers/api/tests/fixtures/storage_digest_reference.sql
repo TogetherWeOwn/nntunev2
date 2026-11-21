@@ -1,6 +1,14 @@
 -- Synthetic eligibility for the hosted race only; there is no application publication writer.
 INSERT INTO public.storage_digest_map_intents (map_id, object_id, environment_id, library_id, plaintext_bytes)
 SELECT gen_random_uuid(), object_id, environment_id, library_id, plaintext_bytes FROM public.storage_object_intents WHERE object_id::text LIKE '21000000-%';
+-- Four single-page winners have distinct pins for the lookup/delete races.
+INSERT INTO public.storage_digest_map_page_intents (map_id, chunk_count, page_index, expected_hash)
+SELECT map_id, chunk_count, 0, decode(repeat('cd',32),'hex') FROM public.storage_digest_map_intents
+WHERE object_id::text LIKE '21000000-%' AND right(object_id::text,2) IN ('09','10','11','12');
+INSERT INTO public.storage_digest_inventory_intents (map_id, media_version, page_versions)
+SELECT map_id, 'media-' || right(object_id::text,2), ARRAY['page-' || right(object_id::text,2)]
+FROM public.storage_digest_map_intents
+WHERE object_id::text LIKE '21000000-%' AND right(object_id::text,2) IN ('09','10','11','12');
 INSERT INTO public.storage_object_envelope_intents
 SELECT object_id, '51000000-0000-4000-8000-000000000001', decode('4e4e544d454430310002','hex')
     || uuid_send('51000000-0000-4000-8000-000000000001') || uuid_send(environment_id) || uuid_send(library_id)
@@ -26,6 +34,24 @@ ELSE public.attach_storage_digest_reference(
     CASE WHEN fault='expired' THEN '-infinity'::timestamptz ELSE deadline END)
 END FROM public.storage_plaintext_digest_claim_intents c JOIN public.storage_object_intents i USING (object_id)
 JOIN public.storage_object_envelope_intents e USING (object_id) WHERE c.object_id = ('21000000-0000-4000-8000-' || lpad(n::text,12,'0'))::uuid $$;
+
+CREATE FUNCTION public.digest_claim_statement(UUID, UUID, BYTEA, BIGINT, UUID, UUID, UUID, UUID, TIMESTAMPTZ, UUID)
+RETURNS TABLE (object_id UUID, generation_id UUID, provider_configuration_version_id UUID,
+               map_id UUID, root_version_id UUID, media_version TEXT, page_versions TEXT[])
+LANGUAGE sql VOLATILE AS :'storage_digest_claim_lookup_sql';
+
+CREATE FUNCTION public.digest_lookup_fixture(n int)
+RETURNS TABLE (object_id UUID, media_version TEXT, page_versions TEXT[])
+LANGUAGE sql VOLATILE AS $$
+SELECT b.object_id, b.media_version, b.page_versions
+FROM public.storage_plaintext_digest_claim_intents c
+JOIN public.storage_object_intents i USING (object_id)
+JOIN public.storage_object_envelope_intents e USING (object_id)
+CROSS JOIN LATERAL public.digest_claim_statement(c.environment_id, c.library_id, c.plaintext_sha256,
+    c.plaintext_bytes, c.object_id, i.generation_id, e.root_version_id, c.object_id,
+    'infinity', i.provider_configuration_version_id) b
+WHERE c.object_id = ('21000000-0000-4000-8000-' || lpad(n::text,12,'0'))::uuid
+$$;
 
 DO $$ DECLARE field text; BEGIN
     FOREACH field IN ARRAY ARRAY['environment','library','digest','size','generation','revision','expired'] LOOP
