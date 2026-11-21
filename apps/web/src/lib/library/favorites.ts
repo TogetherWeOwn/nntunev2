@@ -73,12 +73,12 @@ export async function updateStoredFavorites(
 	local: SnapshotStorage | null,
 	key: string | null,
 	update: (latest: string[]) => readonly string[],
-	verify?: () => Promise<boolean>
+	verify?: () => Promise<boolean>,
+	runIfCurrent?: <T>(commit: () => T) => Promise<T | undefined>
 ): Promise<string[] | null> {
 	if (!local || !key || favoritesKey(session) !== key) return null;
-	return withFavoritesLock(key, async () => {
+	const commit = () => {
 		if (favoritesKey(session) !== key) return null;
-		if (verify && (!(await verify()) || favoritesKey(session) !== key)) return null;
 		const raw = local.getItem(key);
 		const parsed: unknown = raw === null ? [] : JSON.parse(raw);
 		if (!Array.isArray(parsed) || !parsed.every(isStoredId)) return null;
@@ -88,6 +88,10 @@ export async function updateStoredFavorites(
 		const encoded = JSON.stringify(committed);
 		if (encoded !== JSON.stringify(latest)) local.setItem(key, encoded);
 		return committed;
+	};
+	return withFavoritesLock(key, async () => {
+		if (favoritesKey(session) !== key || (verify && !(await verify()))) return null;
+		return runIfCurrent ? (await runIfCurrent(commit)) ?? null : commit();
 	});
 }
 
