@@ -34,7 +34,8 @@ pub const LOOKUP_TARGET: &str = "SELECT user_id, stripe_subscription_id, \
 pub const WRITE_SUBSCRIPTION: &str = include_str!("billing_transaction_write.sql");
 
 // The coupled store pins history to the same schema as the lock and target.
-const WRITE_HISTORY: &str = "INSERT INTO public.paid_invoice_history (user_id, stripe_invoice_id, stripe_subscription_id, plan_id, period_start, period_end, amount_cents, currency, paid_at) VALUES ($1, $2, $3, $4, to_timestamp($5::bigint), to_timestamp($6::bigint), $7, $8, to_timestamp($9::bigint)) ON CONFLICT DO NOTHING";
+const WRITE_HISTORY: &str =
+    crate::billing_reconcile::write_paid_invoice_history!("public.paid_invoice_history");
 
 /// Ordered parameters for the global lookup: key, incoming paid-through epoch,
 /// incoming paid invoice ID, read anchor, read plan. Do not filter on owner.
@@ -205,6 +206,7 @@ pub(crate) async fn apply_reconcile_transaction(
             .map_err(|_| StoreError)?;
         }
         for history in &outcome.history {
+            let (starts, ends) = history.coverage_bounds();
             transaction
                 .query_typed(
                     WRITE_HISTORY,
@@ -218,6 +220,8 @@ pub(crate) async fn apply_reconcile_transaction(
                         (&history.amount_cents, Type::INT8),
                         (&history.currency, Type::TEXT),
                         (&history.paid_at_unix, Type::INT8),
+                        (&starts, Type::INT8_ARRAY),
+                        (&ends, Type::INT8_ARRAY),
                     ],
                 )
                 .await

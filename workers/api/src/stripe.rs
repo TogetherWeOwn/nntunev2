@@ -474,11 +474,10 @@ pub struct InvoiceLine {
     pub period: Option<InvoiceLinePeriod>,
 }
 
+/// Both fields must be present: an omitted field is not evidence of a complete page.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct InvoiceLines {
-    #[serde(default)]
     pub data: Vec<InvoiceLine>,
-    #[serde(default = "default_false")]
     pub has_more: bool,
 }
 
@@ -1145,6 +1144,17 @@ mod tests {
         assert_eq!(lines.data.len(), 1);
         assert_eq!(lines.data[0].price.as_deref(), Some("price_plus_test"));
         assert!(!lines.has_more);
+    }
+
+    #[test]
+    fn invoice_line_pages_require_explicit_pagination_metadata() {
+        let missing_completion = serde_json::json!({"data": [{"id": "il_1"}]});
+        let missing_data = serde_json::json!({"has_more": false});
+        for page in [missing_completion, missing_data] {
+            assert!(serde_json::from_value::<InvoiceLines>(page.clone()).is_err());
+            let invoice = serde_json::json!({"id": "in_1", "lines": page});
+            assert!(serde_json::from_value::<Invoice>(invoice).is_err());
+        }
     }
 
     #[test]
