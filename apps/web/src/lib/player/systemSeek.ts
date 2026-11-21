@@ -3,7 +3,7 @@ import { readAbsoluteSeek, type AbsoluteSeekState } from './absoluteSeek.js';
 import { setSeekHandlers, type MediaSessionHandlers, type MediaSessionLike, type MediaSessionSeekDetails } from './mediaSession.js';
 import { RELATIVE_JUMP_SECONDS } from './relativeJump.js';
 
-export type SystemSeekGuard = { active: () => boolean; unavailable: () => void };
+export type SystemSeekGuard = { active: () => boolean; canReport: () => boolean; unavailable: () => void };
 
 export type SystemSeekOwner = {
 	audio: HTMLAudioElement;
@@ -28,13 +28,13 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 		else {
 			// The OS can retain callbacks across unregistration and attachment teardown.
 			const active = () => !signal.aborted && handlers === registration;
-			const guard = { active, unavailable() {
-				if (!active()) return;
+			const retire = () => {
+				if (!active() || !owner.matches() || !active()) return false;
 				refresh(false);
-				// Publish the loss so even an unchanged recovery observation can rebind.
 				if (!signal.aborted && !handlers) owner.availability.update((state) => state.enabled && state.attachment === owner.attachment
 					? { ...state, enabled: false } : state);
-			} };
+				return true;
+			};
 			const action = (name: Parameters<SystemSeekOwner['dispatch']>[0]) => (details: MediaSessionSeekDetails) => {
 				if (details?.action !== name || !active()) return;
 				const absolute = name === 'seekto';
@@ -43,10 +43,11 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 				if (typeof seconds !== 'number' || !Number.isFinite(seconds) || (absolute ? seconds < 0 : seconds <= 0)) return;
 				const intent = owner.positionIntent();
 				if (!owner.matches() || !active() || owner.positionIntent() !== intent) return;
-				const { enabled } = readAbsoluteSeek(owner.audio);
+				if (!readAbsoluteSeek(owner.audio).enabled) { retire(); return; }
 				if (!owner.matches() || !active() || owner.positionIntent() !== intent) return;
-				if (enabled) owner.dispatch(name, seconds, guard);
-				else guard.unavailable();
+				// Loss retires the registration, but this attempt may still report it.
+				let retired = false;
+				owner.dispatch(name, seconds, { active, canReport: () => retired || active(), unavailable: () => { retired ||= retire(); } });
 			};
 			const registration: SeekHandlers = {
 				onSeekTo: action('seekto'), onSeekForward: action('seekforward'), onSeekBackward: action('seekbackward')

@@ -9,10 +9,8 @@ export function seekable(media: Pick<SeekMedia, 'seekable'>, duration: number, t
 	let available = false;
 	for (let i = 0; i < ranges.length; i++) {
 		const start = Math.max(0, ranges.start(i)), end = Math.min(duration, ranges.end(i));
-		if (end > start) {
-			available = true;
-			if (target === undefined || (target >= start && target <= end)) return true;
-		}
+		available ||= end > start;
+		if (end > start && (target === undefined || (target >= start && target <= end))) return true;
 	}
 	if (!available) unavailable?.();
 	return false;

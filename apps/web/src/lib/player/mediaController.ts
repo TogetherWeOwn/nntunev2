@@ -381,14 +381,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		// Cancel on acceptance, even if the native seek is deferred or refused.
 		if (track) pendingShare.supersede(track.id, source);
 		const revision = pendingShare.revision;
-		const isCurrent = () => !destroyed && attachmentVersion === version && queue.isCurrent(queueRevision) &&
-			positionIntent === intent && pendingShare.revision === revision && system?.active() !== false;
+		const isCurrent = (guard = system?.active) => !destroyed && attachmentVersion === version && queue.isCurrent(queueRevision) &&
+			positionIntent === intent && pendingShare.revision === revision && guard?.() !== false;
 		runPosition(() => {
-			const matches = () => !!audio && !!source && matchesSource(audio, source, isCurrent);
+			const matches = (guard = system?.active) => !!audio && !!source && matchesSource(audio, source, () => isCurrent(guard));
 			const outcome = audio && matches() ? jumpMedia(audio, direction, matches, () => {
 				if (current === attachment) clearJumpFeedback();
-			}, seconds, system && (() => { if (matches()) system.unavailable(); })) : undefined;
-			if (outcome ? !matches() : !isCurrent()) return;
+			}, seconds, system?.unavailable) : undefined;
+			if (outcome ? !matches(system?.canReport) : !isCurrent()) return;
 			if (outcome?.kind === 'jumped') lastJumpTarget = outcome.target;
 			seekFeedback.update((feedback) => ({
 				...feedback, jumpStatus: describeJump(direction, outcome ?? { kind: 'unavailable' }, seconds),
@@ -422,15 +422,16 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const { audio, matches } = target;
 		const before = positionIntent;
 		const track = currentTrack(queue.snapshot);
-		const ownsSelection = () => currentTrack(queue.snapshot)?.id === track?.id && system?.active() !== false;
+		const ownsSelection = (guard = system?.active) => currentTrack(queue.snapshot)?.id === track?.id && guard?.() !== false;
 		if (!track || !matches(() => positionIntent === before && ownsSelection())) return;
 		const intent = ++positionIntent;
 		pendingShare.supersede(track.id, resolveStreamUrl(track));
-		const isCurrent = () => matches(() => positionIntent === intent && ownsSelection());
+		const isCurrent = (guard = system?.active) => matches(() => positionIntent === intent && ownsSelection(guard));
 		runPosition(() => {
 			if (!isCurrent()) return;
-			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent, system && (() => { if (isCurrent()) system.unavailable(); }));
-			if (isCurrent()) observeAbsoluteSeek(audio, isCurrent, feedback, replay);
+			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent, system?.unavailable);
+			const canReport = () => isCurrent(system?.canReport);
+			if (canReport()) observeAbsoluteSeek(audio, canReport, feedback, replay);
 		});
 	}
 

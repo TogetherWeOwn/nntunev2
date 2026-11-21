@@ -38,8 +38,6 @@ export function jumpMedia(
 	media: JumpMedia, direction: JumpDirection, matches: () => boolean = () => true, assigned?: () => void,
 	seconds = RELATIVE_JUMP_SECONDS, onSystemUnavailable?: () => void
 ): JumpOutcome {
-	const back = direction === 'back';
-	const boundary = { kind: 'boundary', edge: back ? 'start' : 'end' } as const;
 	let position: number;
 	let target: number;
 	let raw: number;
@@ -50,14 +48,14 @@ export function jumpMedia(
 			onSystemUnavailable?.();
 			return { kind: 'unavailable' };
 		}
-		if (!onSystemUnavailable && (back ? position <= TOLERANCE : position >= duration - TOLERANCE)) return boundary;
+		const back = direction === 'back';
 		raw = position + (back ? -seconds : seconds);
 		target = Math.min(Math.max(raw, 0), duration);
-		const atEdge = onSystemUnavailable && (back ? target >= position : target <= position);
-		const covered = onSystemUnavailable ? seekable(media, duration, atEdge ? undefined : target, onSystemUnavailable)
-			: seekableCovers(media.seekable, target);
-		if (!covered) return { kind: 'unavailable' };
-		if (atEdge) return boundary;
+		const atEdge = onSystemUnavailable ? (back ? target >= position : target <= position)
+			: (back ? position <= TOLERANCE : position >= duration - TOLERANCE);
+		if (onSystemUnavailable && !seekable(media, duration, atEdge ? undefined : target, onSystemUnavailable)) return { kind: 'unavailable' };
+		if (atEdge) return { kind: 'boundary', edge: back ? 'start' : 'end' };
+		if (!onSystemUnavailable && !seekableCovers(media.seekable, target)) return { kind: 'unavailable' };
 	} catch {
 		onSystemUnavailable?.();
 		return { kind: 'unavailable' };
