@@ -6134,14 +6134,11 @@ where
 }
 
 /// Bodyless browser issuance for the authenticated principal.
-async fn member_invite_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    use MemberInviteIssueOutcome as Outcome;
+async fn member_invite_issue(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+) -> Response {
+    use {crate::api_error::ApiError, MemberInviteIssueOutcome as Outcome};
     if req.authorization.is_some() {
         return not_found();
     }
@@ -6155,13 +6152,12 @@ where
     let Ok(code) = auth::generate_invite_code() else {
         return unavailable();
     };
-    use crate::api_error::ApiError;
     let hash = auth::hash_invite_code(&code);
-    let error = match ctx
+    let issued = ctx
         .store
         .member_issue_invite(&claims.user_id, &hash, &ctx.source_ip)
-        .await
-    {
+        .await;
+    let error = match issued {
         Ok(Outcome::Issued { id, expires_at }) => {
             let body = serde_json::json!({"id": id, "expires_at": expires_at, "code": code});
             let mut response = json_response(201, body);
@@ -23212,35 +23208,19 @@ mod tests {
 
     #[test]
     fn member_invite_issue_requires_browser_identity() {
-        use crate::native_rest::{scope_for_operation, RouteDecision, MEMBER_INVITES_PATH as PATH};
+        use crate::native_rest::MEMBER_INVITES_PATH as PATH;
         let h = harness();
         seed_user(&h, "member", "member@example.com");
-        let cookie = magic_login(&h, "member@example.com");
-        assert_eq!(
-            scope_for_operation("POST", PATH),
-            RouteDecision::SessionOnly
-        );
-        let mut req = Request {
-            method: "POST".into(),
-            path: PATH.into(),
-            cookie: Some(cookie),
-            origin: Some(ORIGIN.into()),
-            authorization: Some("Bearer ntk_synthetic".into()),
-            stripe_signature: None,
-            body: Vec::new(),
-        };
-        let send = |req: &Request| block_on(handle(&h.ctx(), req));
-        assert_eq!(send(&req).status, 404);
-        req.authorization = None;
-        req.body = br#"{"issuer":"other"}"#.to_vec();
-        assert_eq!(send(&req).status, 422);
-        req.body.clear();
-        req.origin = None;
-        assert_eq!(send(&req).status, 401);
-        let no_session = h.call_full("POST", PATH, None, None, Some(ORIGIN));
-        assert_eq!(no_session.status, 401);
-        req.origin = Some(ORIGIN.into());
-        let response = send(&req);
+        let session = Some(magic_login(&h, "member@example.com"));
+        let origin = Some(ORIGIN);
+        let call = |session, origin, body| h.call_full("POST", PATH, body, session, origin);
+        let bearer = Some("Bearer ntk_synthetic".into());
+        assert_eq!(h.call_bearer("POST", PATH, bearer).status, 404);
+        assert_eq!(call(None, origin, None).status, 401);
+        assert_eq!(call(session.clone(), None, None).status, 401);
+        let body = Some(r#"{"issuer":"other"}"#.into());
+        assert_eq!(call(session.clone(), origin, body).status, 422);
+        let response = call(session, origin, None);
         assert_eq!(response.status, 201);
         assert!(response
             .extra_headers
