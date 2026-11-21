@@ -26,7 +26,7 @@ FROM fixture_cases c CROSS JOIN LATERAL jsonb_array_elements(c.entries) e
 JOIN fixture_tracks t ON t.handle = e->>'track_public_id' WHERE e->>'status' = 'resolved'
 -- A stale mapping for the wrong ref must not fill an unresolved slot.
 UNION ALL SELECT 9002, 1, 'not-the-original-ref', id FROM fixture_tracks WHERE handle = 'new-track';
-CREATE TEMP TABLE synthetic_memberships AS
+CREATE TEMP TABLE fixture_memberships AS
 SELECT 'fixture-user-owner'::text AS owner_id, id AS track_id FROM fixture_tracks
 WHERE handle IN ('new-track', 'trkRpRepeat00000000000', 'trkFrAlpha000000000000')
 UNION ALL SELECT 'fixture-user-other', id FROM fixture_tracks WHERE handle IN ('new-track', 'trkRpMiddle00000000000');
@@ -187,6 +187,7 @@ ROLLBACK TO applied_legacy;
 DO $$
 BEGIN
     IF to_regclass('public.playlist_tracks') IS NOT NULL
+        OR to_regclass('public.libraries') IS NOT NULL OR to_regclass('public.library_tracks') IS NOT NULL
         OR to_regnamespace('private_playlist_rehearsal') IS NOT NULL
         OR EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'public.playlists'::regclass
             AND attname = 'deleting_at' AND NOT attisdropped)
@@ -266,4 +267,6 @@ BEGIN
 END;
 $$;
 SELECT public.dblink_disconnect('writer');
+-- Restore the synthetic second owner for the Rust store's cross-owner checks.
+UPDATE public.users SET deleting_at = NULL WHERE id = 'fixture-user-other';
 \echo Private playlist rehearsal: upgrade, owner CRUD, concurrent fences and rollback passed
