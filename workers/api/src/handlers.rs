@@ -982,6 +982,16 @@ pub trait Store {
         }
     }
 
+    /// Record client history only; the storage layer owns issued-play admission.
+    fn record_listen_event(
+        &self,
+        _owner: &str,
+        _event: &crate::listen_history::ListenEventBody,
+        _now: u64,
+    ) -> impl Future<Output = Result<crate::listen_history::WriteOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+
     fn export_listen_events(
         &self,
         _owner: &str,
@@ -4847,6 +4857,10 @@ where
 #[path = "listen_history_controls.rs"]
 mod listen_history_controls;
 
+#[allow(dead_code)] // Prepared, with no production route or caller.
+#[path = "listen_history_receiver.rs"]
+mod listen_history_receiver;
+
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
 
@@ -8190,6 +8204,7 @@ mod tests {
         /// Mirror of `users.invited_by` (migration 0033), keyed by the
         /// invited user's id.
         invited_by: RefCell<HashMap<String, Option<String>>>,
+        listen_owners: RefCell<Vec<String>>,
         listen_rows: RefCell<Vec<(String, crate::listen_history::ListenRow)>>,
         sessions: RefCell<HashMap<String, SessionRecord>>,
         refresh_retries: RefCell<HashMap<String, (String, u64)>>,
@@ -9225,6 +9240,16 @@ mod tests {
                 .get(&(user_id.to_string(), period_month.to_string()))
                 .copied()
                 .unwrap_or(0))
+        }
+
+        async fn record_listen_event(
+            &self,
+            owner: &str,
+            _event: &crate::listen_history::ListenEventBody,
+            _now: u64,
+        ) -> Result<crate::listen_history::WriteOutcome, StoreError> {
+            self.listen_owners.borrow_mut().push(owner.into());
+            Ok(crate::listen_history::WriteOutcome::Written)
         }
 
         async fn export_listen_events(
@@ -18740,6 +18765,7 @@ mod tests {
     }
 
     include!("listen_history_control_tests.rs");
+    include!("listen_history_receiver_tests.rs");
 
     fn assert_play_bearer_refused(
         h: &Harness,
