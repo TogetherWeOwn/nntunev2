@@ -68,7 +68,7 @@
 		<span aria-hidden="true">{target.pressed ? '★' : '☆'}</span> Favorite
 	</button>
 {/if}
-<p aria-live="polite" aria-atomic="true" data-testid="player-favorite-status">{#if feedback}{#key feedback.version}{feedback.text}{/key}{/if}</p>
+<p aria-live="polite" aria-atomic="true" data-testid="player-favorite-status">{#if feedback}{#key feedback.edit}{feedback.text}{/key}{/if}</p>
 <style>
 	button { min-height: 2.75rem; }
 	p { margin: 0; overflow-wrap: anywhere; }

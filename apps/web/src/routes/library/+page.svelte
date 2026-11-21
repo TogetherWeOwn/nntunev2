@@ -165,6 +165,7 @@
 	let favorites: string[] = $state([]);
 	let favoritesInitialized = $state(false);
 	let favoritesAuthKey: string | null = null;
+	let currentFavoriteEdit = $state(0);
 	let favoriteEdit = 0;
 	let favoriteBaseline: readonly string[] = [];
 	let favoritesAnnouncement = $state('');
@@ -794,6 +795,8 @@
 		const edit = ++favoriteEdit;
 		const before = favorites;
 		const optimistic = update(before);
+		const selected = queueCurrentTrack(queueController.snapshot)?.id;
+		if (selected && before.includes(selected) !== optimistic.includes(selected)) currentFavoriteEdit = edit;
 		favorites = [...optimistic];
 		let base = before;
 		return updateStoredFavorites(session, browserStorage('local'), key, (latest) => {
@@ -804,7 +807,7 @@
 			const wrote = committed !== null && JSON.stringify(base) !== JSON.stringify(committed);
 			if (edit !== favoriteEdit) {
 				if (wrote) favoriteBaseline = update(favoriteBaseline);
-				return committed ? 'saved' : null;
+				return committed ? 'saved' : 'visit';
 			}
 			if (!committed) { applied?.(before, optimistic); return 'visit'; }
 			const visitOnly = placement && !favoriteBaseline.includes(placement.id) && !committed.includes(placement.id)
@@ -847,9 +850,10 @@
 		return editFavorites((latest) => pressed ? [...new Set([...latest, id])] : latest.filter((favorite) => favorite !== id));
 	}
 
-	function readPlayerFavorites(id: string): readonly string[] | null {
+	function readPlayerFavorites(id: string) {
 		return shareAlive && favoritesInitialized && !listingUnavailable && queueController.hasLibraryTrack(id) &&
-			favoritesKey(browserStorage('session')) === favoritesAuthKey ? favorites : null;
+			favoritesKey(browserStorage('session')) === favoritesAuthKey
+			? { pressed: favoriteIds.has(id), edit: currentFavoriteEdit } : null;
 	}
 
 	function toggleFavorite(id: string): void {

@@ -6,12 +6,12 @@ import { createQueueController } from './queueController.js';
 function setup() {
 	const queue = createQueueController(createQueue(DEMO_TRACKS));
 	const favorite = createCurrentTrackFavorite(queue);
-	let ids: string[] = [];
+	const edits = new Map<string, { pressed: boolean; edit: number }>();
+	const read = vi.fn((id: string): { pressed: boolean; edit: number } | null => edits.get(id) ?? { pressed: false, edit: 0 });
 	const write = vi.fn(async (id: string, pressed: boolean) => {
-		ids = pressed ? [...ids, id] : ids.filter((item) => item !== id);
+		edits.set(id, { pressed, edit: (edits.get(id)?.edit ?? 0) + 1 });
 		return 'saved' as const;
 	});
-	const read = vi.fn((): string[] | null => ids);
 	const dispose = favorite.bind({ read, write });
 	const select = (index: number) => {
 		const next = selectTrack(queue.snapshot, index);
@@ -28,7 +28,6 @@ test('writes just the selected track, once per rendered intent, and reports only
 	expect(favorite.feedback(view())).toBeNull();
 	await favorite.activate(before);
 	await pending;
-	expect(write.mock.calls).toEqual([['second-signal', true]]);
 	expect(favorite.feedback(view())?.text).toBe('Starred Second Signal.');
 	await favorite.activate(view()!);
 	expect(write.mock.calls).toEqual([['second-signal', true], ['second-signal', false]]);
@@ -54,7 +53,7 @@ test('disposing the live owner prevents replay and late feedback across replacem
 	expect([view(), favorite.feedback(view())]).toEqual([null, null]);
 	expect(write).toHaveBeenCalledTimes(1);
 	const replacement = vi.fn(async () => null);
-	favorite.bind({ read: () => before.membership, write: replacement });
+	favorite.bind({ read: () => before, write: replacement });
 	await favorite.activate(before);
 	await pending;
 	expect(replacement).not.toHaveBeenCalled();
