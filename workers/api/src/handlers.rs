@@ -6211,7 +6211,13 @@ where
     }
     let schedule;
     let (write, status) = if req.path == crate::native_rest::ADMIN_INVITE_WINDOWS_PATH {
-        let Some(body) = parse_body::<InviteWindowSchedule>(req) else {
+        // Derived structs also accept positional arrays. Check the shape first,
+        // then parse the original bytes to preserve duplicate-field rejection.
+        let first = req.body.iter().copied().find(|b| !b.is_ascii_whitespace());
+        let Some(body) = (first == Some(b'{'))
+            .then(|| parse_body::<InviteWindowSchedule>(req))
+            .flatten()
+        else {
             return validation_failed("invalid invite window schedule");
         };
         schedule = body;
@@ -23015,7 +23021,9 @@ mod tests {
         for body in [
             "{",
             "{}",
+            "[100,200,null]",
             r#"{"starts_at":"100","ends_at":200}"#,
+            r#"{"starts_at":100,"starts_at":101,"ends_at":200}"#,
             r#"{"starts_at":100,"ends_at":200,"actor":"someone"}"#,
         ] {
             let response = h.call_full(
@@ -23077,7 +23085,7 @@ mod tests {
         ]);
         let schedule = |body| call("POST", ADMIN_INVITE_WINDOWS_PATH, Some(body), Some(ORIGIN));
         let body = r#"{"starts_at":100,"ends_at":200,"note":"first cohort"}"#;
-        let created = schedule(body);
+        let created = schedule(&format!(" \n\t{body}"));
         assert_eq!(created.status, 201);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&created.body).unwrap(),
