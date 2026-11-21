@@ -23213,6 +23213,9 @@ mod tests {
         seed_user(&h, "member", "member@example.com");
         let session = Some(magic_login(&h, "member@example.com"));
         let origin = Some(ORIGIN);
+        let preflight = h.call_full("OPTIONS", PATH, None, None, origin);
+        assert_eq!(preflight.status, 204);
+        assert!(preflight.body.is_empty());
         let call = |session, origin, body| h.call_full("POST", PATH, body, session, origin);
         let bearer = Some("Bearer ntk_synthetic".into());
         assert_eq!(h.call_bearer("POST", PATH, bearer).status, 404);
