@@ -146,15 +146,23 @@ GZIP_OUTPUT = os.environ.get("MB_ETL_GZIP_OUTPUT") == "1"
 OUTPUT_SUFFIX = ".tsv.gz" if GZIP_OUTPUT else ".tsv"
 
 
-def open_input(path: Path):
+def resolve_input(path: Path) -> Path:
     packed = path.with_name(path.name + ".gz")
-    if path.is_file() and packed.is_file():
+    plain_exists, packed_exists = path.is_file(), packed.is_file()
+    if plain_exists and packed_exists:
         raise ValueError(f"ambiguous input: both {path} and {packed} exist")
-    if path.is_file():
-        return path, path.open("r", encoding="utf-8", newline="")
-    if packed.is_file():
-        return packed, gzip.open(packed, "rt", encoding="utf-8", newline="")
+    if plain_exists:
+        return path
+    if packed_exists:
+        return packed
     raise ValueError(f"missing input file: {path}")
+
+
+def open_input(path: Path):
+    actual = resolve_input(path)
+    if actual == path:
+        return actual, actual.open("r", encoding="utf-8", newline="")
+    return actual, gzip.open(actual, "rt", encoding="utf-8", newline="")
 
 
 def open_output(path: Path):
@@ -534,6 +542,10 @@ def main() -> int:
         curated_link = dump_dir / "curated"
         if curated_link.exists() and not curated_link.is_symlink():
             raise ValueError(f"refusing to replace non-symlink output path: {curated_link}")
+        if CONSUME_INPUTS:
+            # Reject incomplete or ambiguous relationship inputs before rows() can unlink anything.
+            for source, target in ENTITY_RELATIONS:
+                resolve_input(dump_dir / f"l_{source}_{target}")
 
         with tempfile.TemporaryDirectory(prefix="mb-etl-", dir=dump_dir) as work:
             work_dir = Path(work)

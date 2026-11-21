@@ -771,6 +771,39 @@ class ArtistRelationProjectionTest(ProjectionTestCase):
             (self.raw / f"l_artist_{target}").write_bytes(b"")
         self.check_outputs(dict.fromkeys(self.targets, b""))
 
+    def pack_published(self):
+        packed = self.pack()
+        result = self.run_etl(packed, MB_ETL_GZIP_OUTPUT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return packed
+
+    def assert_refusal(self, packed, diagnostic):
+        current = packed / "curated"
+        snapshot = current.readlink()
+        before = {p.name: p.read_bytes() for p in current.iterdir()}
+        mode = {"MB_ETL_CONSUME_INPUTS": "1", "MB_ETL_GZIP_OUTPUT": "1"}
+        refused = self.run_etl(packed, DUMP_TS="2025-02-04T04:05:06Z", **mode)
+        self.assertEqual(refused.returncode, 1, refused.stdout)
+        self.assertIn(diagnostic, refused.stderr)
+        self.assertEqual(current.readlink(), snapshot)
+        self.assertEqual({p.name: p.read_bytes() for p in current.iterdir()}, before)
+
+    def test_missing_artist_relationship_refuses_before_consumption(self):
+        packed = self.pack_published()
+        (packed / "l_artist_work.gz").unlink()
+        inputs = {p.name: p.read_bytes() for p in packed.glob("*.gz")}
+        self.assert_refusal(packed, f"missing input file: {packed / 'l_artist_work'}")
+        self.assertEqual({p.name: p.read_bytes() for p in packed.glob("*.gz")}, inputs)
+
+    def test_consuming_gzip_refuses_dangling_artist_relationship(self):
+        packed = self.pack_published()
+        path = packed / "l_artist_work.gz"
+        payload = gzip.decompress(path.read_bytes())
+        changed = payload.replace(b"\t20\t80\t", b"\t20\t999\t", 1)
+        path.write_bytes(gzip.compress(changed))
+        self.assert_refusal(packed, "l_artist_work: references missing work 999")
+        self.assertFalse(path.exists())
+
     def test_refused_artist_references_preserve_published_snapshot(self):
         packed = self.pack()
         for raw, suffix, mode in ((self.raw, "", "0"), (packed, ".gz", "1")):
