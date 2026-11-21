@@ -29,6 +29,11 @@
 			else takePointer(event);
 		}, capture);
 		window.addEventListener('pointercancel', takePointer, capture);
+		// Older browsers send a trusted MouseEvent click without a pointer ID.
+		let released: PointerEvent | undefined;
+		window.addEventListener('pointerup', (event) => {
+			if (event.isTrusted && event.isPrimary && event.button === 0) released = hits(event) ? event : undefined;
+		}, capture);
 		window.addEventListener('keydown', (event) => {
 			if (event.key !== ' ' || event.repeat || !hits(event)) return;
 			clearSpace();
@@ -40,10 +45,11 @@
 			if (event.key === ' ' && space) release = setTimeout(clearSpace, 0);
 		}, capture);
 		window.addEventListener('click', (event) => {
-			// Pin at press start, or at click entry for click-only activation.
 			const fromPointer = event.isTrusted && (event.detail > 0 || ('pointerType' in event && !!event.pointerType));
 			const fromSpace = event.isTrusted && !fromPointer && release !== undefined;
-			const intent = fromPointer && event instanceof PointerEvent ? takePointer(event) : fromSpace ? space : undefined;
+			const pointer = fromPointer ? (typeof PointerEvent !== 'undefined' && event instanceof PointerEvent ? event : released) : undefined;
+			const intent = pointer ? takePointer(pointer) : fromSpace ? space : undefined;
+			if (fromPointer) released = undefined;
 			if (fromSpace) clearSpace();
 			if (hits(event)) intents.set(event, intent ?? rendered);
 		}, capture);

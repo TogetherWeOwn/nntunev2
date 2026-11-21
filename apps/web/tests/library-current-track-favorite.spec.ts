@@ -11,7 +11,6 @@ const row = (page: Page, id: string) => page.locator(`[data-testid="library-item
 const queueRow = (page: Page, id: string) => page.locator(`[data-testid="queue-item"][data-track-id="${id}"]`);
 const favorite = (page: Page) => page.getByTestId('player-favorite');
 const feedback = (page: Page) => page.getByTestId('player-favorite-status');
-
 async function openLibrary(page: Page) {
 	await page.route('**/api/library', (route) => route.fulfill({ json: tracks }));
 	await page.route('**/test-audio/**', () => {});
@@ -20,10 +19,14 @@ async function openLibrary(page: Page) {
 	for (const { id, title } of tracks) await row(page, id).getByRole('button', { name: title, exact: true }).click();
 	await expect(favorite(page)).toHaveAccessibleName('Favorite North Wind');
 }
-
 async function storedFavorites(page: Page, scope?: string | null) {
 	return page.evaluate(({ contextKey, favoritesBase, scope }) =>
 		localStorage.getItem(`${favoritesBase}.${scope ?? sessionStorage.getItem(contextKey)}`), { contextKey, favoritesBase, scope });
+}
+async function expectMembership(page: Page, id: string | null, announcement = '', visitOnly = false) {
+	await expect(favorite(page)).toHaveAttribute('aria-pressed', String(id !== null));
+	await expect(feedback(page)).toHaveText(announcement);
+	expect(await storedFavorites(page)).toBe(id === null || visitOnly ? null : JSON.stringify([id]));
 }
 
 test('the player stars the selected track once and shares membership with Library and queue controls', async ({ page }) => {
@@ -37,14 +40,13 @@ test('the player stars the selected track once and shares membership with Librar
 	await expect(page.getByTestId('player-next')).toBeEnabled();
 	await favorite(page).and(page.getByRole('button', { name: 'Favorite South Wind', exact: true })).press('Space');
 	await expect(favorite(page)).toBeFocused();
-	await expect(favorite(page)).toHaveAttribute('aria-pressed', 'true');
+	await expectMembership(page, south.id, 'Starred South Wind.');
 	await expect(row(page, south.id).getByRole('button', { name: 'Unstar South Wind', exact: true })).toHaveAttribute('aria-pressed', 'true');
 	await expect(page.locator('[aria-live="polite"]').filter({ hasText: /^Starred South Wind\.$/ })).toHaveCount(1);
 	await expect(page.getByRole('region', { name: 'Player', exact: true }).getByRole('status')).toHaveCount(1);
 	expect(await sameDecoder()).toBe(true);
 	await expect(page.getByTestId('now-playing')).toHaveText(nowPlaying);
 	await expect(page.getByTestId('player-next')).toBeEnabled();
-	expect(await storedFavorites(page)).toBe(JSON.stringify([south.id]));
 
 	await expect(queueRow(page, north.id).getByRole('button', { name: 'Star North Wind', exact: true })).toHaveAttribute('aria-pressed', 'false');
 	const unstar = queueRow(page, south.id).getByRole('button', { name: 'Unstar South Wind', exact: true, pressed: true });
@@ -60,24 +62,28 @@ test('the player stars the selected track once and shares membership with Librar
 });
 
 async function editDuringActivation(page: Page, edit: Locator) {
-	await favorite(page).evaluate((button, edit) => {
-		button.addEventListener('click', () => (edit as HTMLButtonElement).click(), { capture: true, once: true });
-	}, await edit.elementHandle());
+	await favorite(page).evaluate((button, edit) => button.addEventListener('click',
+		() => (edit as HTMLButtonElement).click(), { capture: true, once: true }), await edit.elementHandle());
 }
 
-for (const input of ['pointer', 'Space', 'click only']) {
-	test(`${input === 'pointer' ? 'interleaved pointer' : input} activation cannot star a replacement selection`, async ({ page }) => {
+for (const input of ['pointer', 'legacy pointer', 'Space', 'click only']) {
+	test(`${input} activation cannot star a replacement selection`, async ({ page }) => {
+		if (input === 'legacy pointer') await page.addInitScript(() => window.addEventListener('click', (event) => {
+			// Model older Safari: preserve trust and MouseEvent fields, but remove pointer identity.
+			if (event.isTrusted && event.detail > 0) Object.setPrototypeOf(event, MouseEvent.prototype);
+		}, true));
 		await openLibrary(page);
 		const button = favorite(page);
 		await button.evaluate((node) => node.addEventListener('click', (event) => {
-			node.dataset.favoriteClick = event.isTrusted ? 'trusted' : 'synthetic';
+			node.dataset.favoriteClick = !event.isTrusted ? 'synthetic' : 'pointerId' in event ? 'pointer' : 'legacy';
 		}, { once: true }));
 		const select = queueRow(page, tracks[1].id).getByRole('button', { name: 'Select South Wind', exact: true });
+		const pointer = input.endsWith('pointer');
 		if (input === 'click only') {
 			await editDuringActivation(page, select);
 			await button.evaluate((node) => node.click());
 		} else {
-			if (input === 'pointer') {
+			if (pointer) {
 				await button.hover(); await page.mouse.down();
 				await page.evaluate(() => {
 					const touch = { bubbles: true, isPrimary: true, pointerId: 42, pointerType: 'touch' };
@@ -86,13 +92,15 @@ for (const input of ['pointer', 'Space', 'click only']) {
 			} else { await button.focus(); await page.keyboard.down('Space'); }
 			await select.evaluate((node) => node.click());
 			await expect(button).toHaveAccessibleName('Favorite South Wind');
-			if (input === 'pointer') { await button.hover(); await page.mouse.up(); }
+			if (pointer) { await button.hover(); await page.mouse.up(); }
 			else await page.keyboard.up('Space');
 		}
-		await expect(button).toHaveAttribute('data-favorite-click', input === 'click only' ? 'synthetic' : 'trusted');
-		await expect(button.and(page.getByRole('button', { name: 'Favorite South Wind', exact: true }))).toHaveAttribute('aria-pressed', 'false');
-		await expect(feedback(page)).toBeEmpty();
-		expect(await storedFavorites(page)).toBeNull();
+		await expect(button).toHaveAttribute('data-favorite-click', input === 'click only' ? 'synthetic' : input === 'legacy pointer' ? 'legacy' : /^(pointer|legacy)$/);
+		await expectMembership(page, null);
+		if (input !== 'click only') return;
+		await button.evaluate((node) => node.click());
+		await expectMembership(page, tracks[1].id, 'Starred South Wind.');
+		await expect(page.locator('[aria-live="polite"]').filter({ hasText: /^Starred South Wind\.$/ })).toHaveCount(1);
 	});
 }
 
@@ -100,23 +108,17 @@ test('a keyboard activation racing a Library edit does not toggle membership a s
 	await openLibrary(page);
 	await editDuringActivation(page, row(page, tracks[0].id).getByRole('button', { name: 'Star North Wind', exact: true }));
 	await favorite(page).press('Space');
-	await expect(favorite(page)).toHaveAttribute('aria-pressed', 'true');
-	await expect(feedback(page)).toBeEmpty();
-	expect(await storedFavorites(page)).toBe(JSON.stringify([tracks[0].id]));
+	await expectMembership(page, tracks[0].id);
 });
 
 test('a rotated account refuses the stale button and an auth transition retires the control', async ({ page }) => {
 	await openLibrary(page);
 	const retired = await page.evaluate((key) => sessionStorage.getItem(key), contextKey);
-	const scopes = () => Promise.all([storedFavorites(page, retired), storedFavorites(page, 'replacement-context')]);
-	const before = await scopes();
-	await favorite(page).evaluate((button, key) => {
-		button.addEventListener('click', () => sessionStorage.setItem(key, 'replacement-context'),
-			{ capture: true, once: true });
-	}, contextKey);
+	await favorite(page).evaluate((button, key) => button.addEventListener('click',
+		() => sessionStorage.setItem(key, 'replacement-context'), { capture: true, once: true }), contextKey);
 	await favorite(page).click();
 	await expect(feedback(page)).toBeEmpty();
-	expect(await scopes()).toEqual(before);
+	expect(await Promise.all([storedFavorites(page, retired), storedFavorites(page, 'replacement-context')])).toEqual([null, null]);
 	await page.evaluate((key) => window.dispatchEvent(new StorageEvent('storage', { key })), transitionKey);
 	await expect(favorite(page)).toHaveCount(0);
 	await expect(page.getByTestId('audio-player')).toHaveCount(0);
@@ -132,7 +134,5 @@ test('when persistence refuses, the status describes a visit-only membership cha
 		};
 	}, favoritesBase);
 	await favorite(page).click();
-	await expect(favorite(page)).toHaveAttribute('aria-pressed', 'true');
-	await expect(feedback(page)).toHaveText('Starred North Wind for this visit.');
-	expect(await storedFavorites(page)).toBeNull();
+	await expectMembership(page, tracks[0].id, 'Starred North Wind for this visit.', true);
 });

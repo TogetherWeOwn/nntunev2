@@ -10,9 +10,8 @@
 	import { createCurrentTrackFavorite } from './currentTrackFavorite.svelte.js';
 	import { createPlayerController } from './controller.svelte.js';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
-	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> & {
-		claimShareEntry?: () => boolean; currentFavorite: ReturnType<typeof createCurrentTrackFavorite>;
-	}>();
+	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> &
+		{ claimShareEntry?: () => boolean; currentFavorite: ReturnType<typeof createCurrentTrackFavorite> }>();
 </script>
 <script lang="ts">
 	let { children, claimShareEntry, signedOut }: { children: Snippet; claimShareEntry?: (owner: string) => boolean; signedOut?: boolean } = $props();
@@ -45,9 +44,7 @@
 	});
 </script>
 {@render children()}
-{#snippet favoriteAction()}
-	<CurrentTrackFavorite {currentFavorite} snapshot={$queue} />
-{/snippet}
+{#snippet favoriteAction()}<CurrentTrackFavorite {currentFavorite} snapshot={$queue} />{/snippet}
 {#if streamUrl}
 	<div class="nt-wrap">
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}

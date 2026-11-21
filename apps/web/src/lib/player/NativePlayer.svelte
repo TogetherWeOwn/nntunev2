@@ -10,7 +10,8 @@
 		currentTrack, mediaRevision, streamUrl, attachNativeAudio,
 		playbackStatus, playCurrent, pauseCurrent,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
-		jumpStatus, jumpStatusVersion, jumpRelative, favoriteAction
+		favoriteAction,
+		jumpStatus, jumpStatusVersion, jumpRelative
 	}: ComponentProps<typeof NativeAudio> & {
 		currentTrack: Pick<Track, 'id' | 'title' | 'artist'> | null;
 		playbackStatus: PlaybackStatus;

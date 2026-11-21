@@ -784,17 +784,14 @@
 
 	function setFavorite(id: string, pressed: boolean): FavoriteWrite {
 		if (favorites.includes(id) === pressed) return null;
-		// Memory is authoritative for the visit. Retry the full list on each write.
-		const next = pressed ? [...favorites, id] : favorites.filter((favorite) => favorite !== id);
-		favorites = next;
+		favorites = pressed ? [...favorites, id] : favorites.filter((favorite) => favorite !== id);
 		favoritesAnnouncement = '';
-		return saveFavorites(browserStorage('session'), browserStorage('local'), next) ? 'saved' : 'visit';
+		return saveFavorites(browserStorage('session'), browserStorage('local'), favorites) ? 'saved' : 'visit';
 	}
 
 	function toggleFavorite(id: string): void {
 		const pressed = !favorites.includes(id);
-		// Preserve the row/queue affordances' existing focus behavior. The
-		// player button itself does not unmount when unstarred.
+		// Unstarring can unmount a focused Library row, but not the player button.
 		if (setFavorite(id, pressed) && !pressed && view === 'favorites') focusLibraryView();
 	}
 
