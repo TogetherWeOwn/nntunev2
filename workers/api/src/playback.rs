@@ -44,6 +44,22 @@ pub const LEASE_TTL_SECS: u64 = 45;
 /// seconds: a superseded player learns within one interval.
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 
+const CONTINUATION_SLACK_SECS: u64 = 120;
+const UNKNOWN_DURATION_WINDOW_SECS: u64 = 900;
+
+/// Use the identity-safe app/mirror durations, never bitrate estimates.
+/// Round up to a whole second and allow time for startup and rebuffering.
+pub(crate) fn continuation_deadline(now: u64, meta: crate::meter_sink::TrackMeterMeta) -> u64 {
+    let window = meta
+        .track_duration_ms
+        .filter(|&ms| ms > 0)
+        .or_else(|| meta.mb_duration_ms.filter(|&ms| ms > 0))
+        .map_or(UNKNOWN_DURATION_WINDOW_SECS, |ms| {
+            ms.div_ceil(1000) + CONTINUATION_SLACK_SECS
+        });
+    now.saturating_add(window)
+}
+
 /// Why an unentitled account was refused, carried as the `reason` field
 /// of the `402 subscription_required` body so the client can word the
 /// paywall ("subscribe" vs "resubscribe") without another round trip.
@@ -270,6 +286,30 @@ mod tests {
             epoch: 3,
             expires_at: NOW + 30,
         }
+    }
+
+    #[test]
+    fn deadline_prefers_positive_app_then_mirror_duration() {
+        let mut meta = crate::meter_sink::TrackMeterMeta {
+            track_duration_ms: Some(180_001),
+            mb_duration_ms: Some(240_000),
+            ..Default::default()
+        };
+        assert_eq!(continuation_deadline(NOW, meta), NOW + 181 + 120);
+        meta.track_duration_ms = Some(0);
+        assert_eq!(continuation_deadline(NOW, meta), NOW + 240 + 120);
+    }
+
+    #[test]
+    fn deadline_uses_finite_fallback_without_authoritative_duration() {
+        let meta = crate::meter_sink::TrackMeterMeta {
+            mb_duration_ms: Some(0),
+            bitrate_kbps: Some(1),
+            file_bytes: Some(50_000_000),
+            ..Default::default()
+        };
+        assert_eq!(continuation_deadline(NOW, meta), NOW + 900);
+        assert_eq!(continuation_deadline(u64::MAX - 1, meta), u64::MAX);
     }
 
     #[test]
