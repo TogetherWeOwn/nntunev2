@@ -33,16 +33,18 @@ test('a closed writer and verifier outage allow Retry; replacement retires local
 	await page.getByRole('button', { name: 'Play displayed from the top' }).click();
 	const time = () => page.getByTestId('audio-player').evaluate((el: HTMLAudioElement) => el.currentTime);
 	await expect.poll(time).toBeGreaterThan(0);
-	const restoreWrites = await page.evaluateHandle((key) => {
-		const write = Storage.prototype.setItem;
+	const failedSave = await page.evaluateHandle((key) => {
+		const write = Storage.prototype.setItem, failed = Promise.withResolvers<void>();
 		Storage.prototype.setItem = function (name, value) {
-			if (name === key) throw new DOMException('Favorites quota', 'QuotaExceededError');
-			write.call(this, name, value);
+			if (name !== key) return write.call(this, name, value);
+			Storage.prototype.setItem = write;
+			failed.resolve();
+			throw new DOMException('Favorites quota', 'QuotaExceededError');
 		};
-		return () => { Storage.prototype.setItem = write; };
+		return { settled: failed.promise };
 	}, favoritesKey);
-	const unstar = page.getByRole('button', { name: 'Unstar Scoped track', exact: true });
-	await unstar.click();
+	await page.getByRole('button', { name: 'Unstar Scoped track', exact: true }).click();
+	await failedSave.evaluate(({ settled }) => settled);
 	failNext = true;
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
 	await expect(retry).toBeVisible();
@@ -50,7 +52,6 @@ test('a closed writer and verifier outage allow Retry; replacement retires local
 	await retry.click();
 	await expect(page.getByTestId('favorites-empty')).toBeVisible();
 	expect(await page.evaluate((key) => localStorage.getItem(key), favoritesKey)).toBe('["track"]');
-	await restoreWrites.evaluate((restore) => restore());
 	failNext = true;
 	const remove = page.getByRole('button', { name: 'Remove Scoped track from Liked' });
 	await page.getByRole('link', { name: 'Liked', exact: true }).click();
