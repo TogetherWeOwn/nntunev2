@@ -300,7 +300,7 @@ class TransportTests(unittest.TestCase):
 
     def test_reflected_credentials_are_not_returned(self):
         self.bearer = "fixture-worker-bearer"
-        # Reflect exactly one value per reply, so no check can mask a missing one.
+        # Embed one value in each reply to catch both missing and exact-match checks.
         for marker, decode, metadata in (
             (b"CF-Access-Client-Id: ", False, True),
             (b"CF-Access-Client-Secret: ", False, False),
@@ -309,13 +309,16 @@ class TransportTests(unittest.TestCase):
             (b"&apiKey=", True, False),
         ):
             with self.subTest(marker=marker, decode=decode):
-                head = b"HTTP/1.1 200 OK\r\nCache-Control: " if metadata else self.ok_head
-                end = b"\r\n\r\n" if metadata else b""
+                if metadata:
+                    prefix = b'HTTP/1.1 200 OK\r\nCache-Control: private, sample="'
+                    suffix = b'", no-store\r\n\r\n'
+                else:
+                    prefix, suffix = self.ok_head + b"Sample: [", b"] (end)"
                 self.program = (
                     "from urllib.parse import unquote_to_bytes\n"
                     f"value = config.split({marker!r}, 1)[1].split(b'\"', 1)[0]\n"
                     f"if {decode}: value = unquote_to_bytes(value)\n"
-                    f"out.write({head!r} + value + {end!r})"
+                    f"out.write({prefix!r} + value + {suffix!r})"
                 )
                 with self.assertRaisesRegex(runner["Stop"], "^credential-reflected$"):
                     self.send()
