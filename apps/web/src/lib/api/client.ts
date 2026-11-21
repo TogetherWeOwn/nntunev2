@@ -290,6 +290,33 @@ export function isInvitePolicyValue(key: InvitePolicyKey, value: unknown): value
 const invalidAdminSettings = (status: number) =>
 	new ApiError(status, 'request_failed', 'Invalid admin settings response');
 
+const MEMBER_INVITES = '/v1/me/invites';
+type MemberInviteBounds = Pick<InviteWindowSchedule, 'starts_at' | 'ends_at'>;
+type MemberInviteUsage = MemberInviteBounds & { used: number; remaining: number };
+export type MemberInviteSummary = {
+	paid_seconds: number;
+	required_paid_seconds: number;
+	entitled: boolean;
+	eligible: boolean;
+	per_window_limit: number;
+	open_window: MemberInviteUsage | null;
+	next_window: MemberInviteBounds | null;
+};
+
+const isCount = (value: unknown): value is number =>
+	typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+function hasInviteBounds(row: Partial<MemberInviteBounds> | null | undefined): row is MemberInviteBounds {
+	return row != null && isEpoch(row.starts_at) && isEpoch(row.ends_at) && row.starts_at <= row.ends_at;
+}
+function isMemberInviteSummary(value: unknown): value is MemberInviteSummary {
+	const row = value as Partial<MemberInviteSummary> | null | undefined;
+	return row != null && isCount(row.paid_seconds) && isCount(row.required_paid_seconds) &&
+		typeof row.entitled === 'boolean' && typeof row.eligible === 'boolean' && isCount(row.per_window_limit) &&
+		(row.open_window === null || (hasInviteBounds(row.open_window) &&
+			isCount(row.open_window.used) && isCount(row.open_window.remaining))) &&
+		(row.next_window === null || hasInviteBounds(row.next_window));
+}
+
 export interface IssuedMemberInvite {
 	code: string;
 	expires_at: number;
@@ -468,10 +495,20 @@ export class ApiClient {
 		return data.value;
 	}
 
+	/** Read only the browser member's current aggregate snapshot. */
+	async readMemberInvites(signal: AbortSignal): Promise<MemberInviteSummary> {
+		const { data, status } = await this.requestWithStatus<unknown>(
+			MEMBER_INVITES, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		if (status !== 200 || !isMemberInviteSummary(data))
+			throw new ApiError(status, 'request_failed', 'Invalid invite summary response', null, false);
+		return data;
+	}
+
 	/** Spend one invite from the browser session's current window. Do not retry automatically. */
 	async issueMemberInvite(signal: AbortSignal): Promise<IssuedMemberInvite> {
 		const { data, status } = await this.requestWithStatus<Partial<IssuedMemberInvite> | null>(
-			'/v1/me/invites', { method: 'POST', cache: 'no-store', redirect: 'error', signal }
+			MEMBER_INVITES, { method: 'POST', cache: 'no-store', redirect: 'error', signal }
 		);
 		if (status !== 201 || !isMemberInviteCode(data?.code) ||
 			typeof data.expires_at !== 'number' || !Number.isSafeInteger(data.expires_at) ||

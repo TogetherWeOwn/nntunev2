@@ -1,7 +1,20 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type Route } from '@playwright/test';
+
+test.use({ locale: 'en-US' });
 
 const code = 'synthetic_invite_codeA';
 const issued = { id: '1', code, expires_at: 1_893_456_000 };
+const endpoint = '**/v1/me/invites';
+const month = 30 * 86_400;
+const bounds = { starts_at: 1_893_456_000, ends_at: 1_894_060_800 };
+const snapshot = {
+	paid_seconds: 3 * month, required_paid_seconds: 3 * month,
+	entitled: true, eligible: true, per_window_limit: 1,
+	open_window: { ...bounds, used: 0, remaining: 1 }, next_window: null
+};
+const mockInvite = (route: Route) => route.request().method() === 'GET'
+	? route.fulfill({ json: snapshot })
+	: route.fulfill({ status: 201, json: issued });
 
 async function mockClipboard(page: Page, blocked = false) {
 	await page.addInitScript((blocked) => {
@@ -19,13 +32,21 @@ async function mockClipboard(page: Page, blocked = false) {
 }
 
 test('creates one invite on demand and hands the copied link to signup', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
 	await mockClipboard(page);
 	const pending = Promise.withResolvers<void>();
-	let posts = 0;
-	await page.route('**/v1/me/invites', async (route) => {
-		posts++;
-		await pending.promise;
-		await route.fulfill({ status: 201, json: issued });
+	const refresh = Promise.withResolvers<void>();
+	const methods: string[] = [];
+	await page.route(endpoint, async (route) => {
+		const method = route.request().method();
+		methods.push(method);
+		if (method === 'GET') expect(await route.request().headerValue('authorization')).toBeNull();
+		if (method === 'GET' && methods.length > 1) {
+			await refresh.promise;
+			return route.fulfill({ json: { ...snapshot, open_window: { ...bounds, used: 1, remaining: 0 } } });
+		}
+		if (method === 'POST') await pending.promise;
+		return mockInvite(route);
 	});
 	await page.route('**/v1/auth/passkey/register/start', async (route) => {
 		// Only the email goes to registration start; opening a link spends nothing.
@@ -36,9 +57,13 @@ test('creates one invite on demand and hands the copied link to signup', async (
 	await expect(page.getByRole('link', { name: 'Invites' })).toHaveAttribute('aria-current', 'page');
 	const create = page.getByRole('button', { name: 'Create invite' });
 	await expect(create).toBeEnabled();
-	expect(posts).toBe(0);
-	const sent = page.waitForRequest('**/v1/me/invites');
-	await create.click();
+	await expect(page.getByText('Paid progress: 3 of 3 months.', { exact: false })).toBeVisible();
+	await expect(page.getByText('You meet the membership and paid-time requirements.')).toBeVisible();
+	await expect(page.getByText('Used: 0 · Remaining: 1')).toBeVisible();
+	await expect(page.getByRole('region', { name: 'Invite summary' }).locator('time')).toHaveCount(2);
+	expect(methods).toEqual(['GET']);
+	const sent = page.waitForRequest(endpoint);
+	await create.press('Enter');
 	const request = await sent;
 	expect(request.method()).toBe('POST');
 	expect(request.postData()).toBeNull();
@@ -50,13 +75,20 @@ test('creates one invite on demand and hands the copied link to signup', async (
 	const field = page.getByRole('textbox', { name: 'Signup link' });
 	await expect(field).toHaveValue(link);
 	await expect(field).toBeFocused();
-	await expect(page.locator('time')).toHaveAttribute('datetime', new Date(issued.expires_at * 1000).toISOString());
-	await page.getByRole('button', { name: 'Copy link' }).click();
+	await expect(page.getByRole('region', { name: 'Your invite link' }).locator('time'))
+		.toHaveAttribute('datetime', new Date(issued.expires_at * 1000).toISOString());
+	await expect(page.getByText('Loading invite summary…')).toBeVisible();
+	refresh.resolve();
+	await expect(page.getByText('Used: 1 · Remaining: 0')).toBeVisible();
+	await expect(field).toHaveValue(link);
+	await page.keyboard.press('Tab');
+	await expect(page.getByRole('button', { name: 'Copy link' })).toBeFocused();
+	await page.keyboard.press('Enter');
 	await expect(field).toHaveCount(0);
 	await expect(page.getByText('Invite link copied.')).toBeVisible();
 	await expect(create).toBeFocused();
 	expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(link);
-	expect(posts).toBe(1);
+	expect(methods).toEqual(['GET', 'POST', 'GET']);
 
 	await page.goto(link);
 	await expect(page).toHaveURL(new URL('/signup', link).href);
@@ -69,9 +101,16 @@ test('creates one invite on demand and hands the copied link to signup', async (
 	await expect(page.getByText('Invite link added.', { exact: false })).toHaveCount(0);
 });
 
-test('allows manual copy when the clipboard is blocked and clears the reveal on page exit', async ({ page }) => {
+test('allows manual copy and restores only a freshly read snapshot', async ({ page }) => {
 	await mockClipboard(page, true);
-	await page.route('**/v1/me/invites', (route) => route.fulfill({ status: 201, json: issued }));
+	let restored = false;
+	const methods: string[] = [];
+	await page.route(endpoint, (route) => {
+		methods.push(route.request().method());
+		return restored && route.request().method() === 'GET'
+			? route.fulfill({ json: { ...snapshot, paid_seconds: 0, entitled: false, eligible: false, open_window: null } })
+			: mockInvite(route);
+	});
 	await page.goto('/account/invites');
 	await page.getByRole('button', { name: 'Create invite' }).click();
 	await page.getByRole('button', { name: 'Copy link' }).click();
@@ -83,9 +122,19 @@ test('allows manual copy when the clipboard is blocked and clears the reveal on 
 	await expect(field).toHaveCount(0);
 	await page.getByRole('button', { name: 'Create invite' }).click();
 	await expect(field).toBeVisible();
-	// Simulate the lifecycle event that precedes a back/forward cache snapshot.
+	const paid = page.getByText('Paid progress: 3 of 3 months.', { exact: false });
+	await expect(paid).toBeVisible();
 	await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })));
 	await expect(field).toHaveCount(0);
+	await expect(paid).toHaveCount(0);
+	restored = true;
+	await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
+	await expect(page.getByText('Paid progress: 0 of 3 months.', { exact: false })).toBeVisible();
+	await expect(page.getByText('Your membership is not active.')).toBeVisible();
+	await expect(page.getByText('Invites are closed.')).toBeVisible();
+	await expect(page.getByText('No upcoming window is scheduled.')).toBeVisible();
+	await expect(field).toHaveCount(0);
+	expect(methods).toEqual(['GET', 'POST', 'GET', 'POST', 'GET', 'GET']);
 });
 
 test('prefills an invite opened in the signup tab during email verification', async ({ page }) => {
@@ -104,8 +153,31 @@ test('prefills an invite opened in the signup tab during email verification', as
 	expect(await page.evaluate(() => JSON.stringify(history.state))).not.toContain(code);
 });
 
-for (const boundary of ['library signal', 'auth fence']) test(`${boundary} clears an invite and ignores a held success`, async ({ page }) => {
-	await page.route('**/v1/me/invites', (route) => route.fulfill({ status: 201, json: issued }));
+async function holdResponse(page: Page, method: 'GET' | 'POST', result: unknown) {
+	await page.evaluate(({ method, result }) => {
+		const fetch = window.fetch;
+		let held = false;
+		// Deliberately ignore abort and deliver the response after invalidation.
+		window.fetch = (input, init) => {
+			if (held || !String(input).endsWith('/v1/me/invites') || init?.method !== method) return fetch(input, init);
+			held = true;
+			document.documentElement.dataset.inviteFixture = method;
+			return new Promise((resolve) => window.addEventListener(`release-invite-${method}`, () => {
+				resolve(new Response(JSON.stringify(result), { status: method === 'GET' ? 200 : 201 }));
+			}, { once: true }));
+		};
+	}, { method, result });
+}
+
+async function releaseResponse(page: Page, method: 'GET' | 'POST') {
+	await page.evaluate((method) => {
+		window.dispatchEvent(new Event(`release-invite-${method}`));
+		return new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+	}, method);
+}
+
+for (const boundary of ['library signal', 'auth fence']) test(`${boundary} clears an invite and ignores held responses`, async ({ page }) => {
+	await page.route(endpoint, mockInvite);
 	await page.route('**/v1/session/logout', (route) => route.fulfill({ status: 200, body: '{' }));
 	await page.goto('/account/invites');
 	const create = page.getByRole('button', { name: 'Create invite' });
@@ -119,32 +191,71 @@ for (const boundary of ['library signal', 'auth fence']) test(`${boundary} clear
 		await page.getByRole('menuitem', { name: 'Sign out' }).click();
 		await expect(page.getByText('Could not sign out. Please try again.')).toHaveCount(++signOuts);
 	}
+	const paid = page.getByText('Paid progress:', { exact: false });
+	await expect(paid).toBeVisible();
+	await holdResponse(page, 'GET', { ...snapshot, paid_seconds: 19 * month });
 	await create.click();
 	await expect(field).toBeVisible();
+	await expect(page.locator('html')).toHaveAttribute('data-invite-fixture', 'GET');
 	await authTransition();
 	await expect(field).toHaveCount(0);
+	await expect(paid).toHaveCount(0);
+	await page.getByRole('button', { name: 'Refresh summary' }).click();
+	await expect(paid).toContainText('3 of 3 months');
+	await releaseResponse(page, 'GET');
+	await expect(paid).toContainText('3 of 3 months');
 
-	await page.evaluate((result) => {
-		const fetch = window.fetch;
-		// This transport deliberately ignores abort and delivers the 201 after the transition.
-		window.fetch = (input, init) => String(input).endsWith('/v1/me/invites') ? new Promise((resolve) => {
-			document.documentElement.dataset.inviteFixture = 'held';
-			window.addEventListener('release-invite-fixture', () => {
-					resolve(new Response(JSON.stringify(result), { status: 201 }));
-			}, { once: true });
-		}) : fetch(input, init);
-	}, issued);
+	await holdResponse(page, 'POST', issued);
 	await create.click();
-	await expect(page.locator('html')).toHaveAttribute('data-invite-fixture', 'held');
+	await expect(page.locator('html')).toHaveAttribute('data-invite-fixture', 'POST');
 	await authTransition();
-	await expect(create).toBeEnabled();
-	await page.evaluate(() => {
-		window.dispatchEvent(new Event('release-invite-fixture'));
-		return new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-	});
+	await releaseResponse(page, 'POST');
 	await expect(page).toHaveURL(/\/account\/invites$/);
 	await expect(field).toHaveCount(0);
+	await expect(paid).toHaveCount(0);
 	await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+for (const zero of [false, true]) test(`shows closed and upcoming policy with ${zero ? 'zero' : 'unmet'} requirements`, async ({ page }) => {
+	await page.route(endpoint, (route) => {
+		expect(route.request().method()).toBe('GET');
+		return route.fulfill({ json: {
+			...snapshot, paid_seconds: zero ? 0 : 3 * month - 1, required_paid_seconds: zero ? 0 : 3 * month,
+			per_window_limit: zero ? 0 : 1, eligible: zero, open_window: null, next_window: bounds
+		} });
+	});
+	await page.goto('/account/invites');
+	await expect(page.getByText(zero ? 'Paid progress: 0 of 0 months.' : 'Paid progress: 2.99 of 3 months.', { exact: false })).toBeVisible();
+	await expect(page.getByText(zero ? 'You meet the membership and paid-time requirements.' : 'You haven’t reached the paid-time requirement.')).toBeVisible();
+	await expect(page.getByText('Invites are closed.')).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Next scheduled window' })).toBeVisible();
+	await expect(page.locator('time').first()).toHaveAttribute('datetime', new Date(bounds.starts_at * 1000).toISOString());
+	await expect(page.locator('time').last()).toHaveAttribute('datetime', new Date(bounds.ends_at * 1000).toISOString());
+	await expect(page.getByText(`Policy: up to ${zero ? 0 : 1} per member per window.`, { exact: false })).toBeVisible();
+	await expect(page.getByText('Remaining:', { exact: false })).toHaveCount(0);
+});
+
+for (const [status, json, detail] of [
+	[401, {}, 'Sign in to see your invite summary.'],
+	[403, {}, 'Access to the invite summary was denied.'],
+	[409, { code: 'account_deleting', message: 'Fixture account is being deleted', retryable: false }, 'scheduled for deletion'],
+	[500, {}, 'Couldn’t load your invite summary.'],
+	[200, { ...snapshot, open_window: { ...bounds, used: 0 } }, 'Couldn’t load your invite summary.']
+] as const) test(`does not show aggregates while loading or after an unusable ${status} read`, async ({ page }) => {
+	const pending = Promise.withResolvers<void>();
+	await page.route(endpoint, async (route) => {
+		expect(route.request().method()).toBe('GET');
+		await pending.promise;
+		await route.fulfill({ status, json });
+	});
+	await page.goto('/account/invites');
+	await expect(page.getByText('Loading invite summary…')).toBeVisible();
+	const paid = page.getByText('Paid progress:', { exact: false });
+	await expect(paid).toHaveCount(0);
+	pending.resolve();
+	await expect(page.getByText(detail, { exact: false })).toBeVisible();
+	await expect(paid).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'Create invite' })).toHaveCount(0);
 });
 
 for (const [status, detail] of [
@@ -156,7 +267,8 @@ for (const [status, detail] of [
 ] as const) {
 	test(`shows no link for an unusable ${status} issuance response`, async ({ page }) => {
 		let posts = 0;
-		await page.route('**/v1/me/invites', (route) => {
+		await page.route(endpoint, (route) => {
+			if (route.request().method() === 'GET') return mockInvite(route);
 			posts++;
 			return route.fulfill({ status, json: { ...issued, code: 'malformed' } });
 		});
