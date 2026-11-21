@@ -162,13 +162,20 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         etag: "opaque-part",
         digest,
     };
+    let context = EnvelopeContext {
+        identities: [0, 1, 2, 0xab, 0xcd, 5].map(id),
+        plaintext_len: 1,
+        header: sealer.header().to_bytes(),
+    };
+    let [environment, library, object, generation] =
+        [1, 2, 0xab, 0xcd].map(|byte| hex::encode(id(byte)));
     let binding = ResumeBinding {
         plan,
-        environment: "test",
-        library: "library",
+        environment: &environment,
+        library: &library,
         session: "session",
-        object: "object",
-        generation: "generation",
+        object: &object,
+        generation: &generation,
         envelope_scheme: 2,
     };
     let parts = [saved];
@@ -180,6 +187,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
     assert!(matches!(
         SessionCompletion::prepare(
             binding,
+            &context,
             receipts(),
             &ResumeCheckpoint {
                 binding: ResumeBinding {
@@ -196,6 +204,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
     assert!(matches!(
         SessionCompletion::prepare(
             binding,
+            &context,
             receipts(),
             &ResumeCheckpoint {
                 parts: &[stale_part],
@@ -207,6 +216,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
     assert!(matches!(
         SessionCompletion::prepare(
             binding,
+            &context,
             vec![],
             &ResumeCheckpoint {
                 parts: &[],
@@ -215,17 +225,21 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         ),
         Err(PrepareError::Parts(MultipartError::Geometry))
     ));
-    let completion = SessionCompletion::prepare(binding, receipts(), &checkpoint).unwrap();
+    for index in [1, 2] {
+        let mut wrong_scope = EnvelopeContext { ..context };
+        wrong_scope.identities[index] = id(9);
+        assert!(matches!(
+            SessionCompletion::prepare(binding, &wrong_scope, receipts(), &checkpoint),
+            Err(PrepareError::EnvelopeContextMismatch)
+        ));
+    }
+    let completion =
+        SessionCompletion::prepare(binding, &context, receipts(), &checkpoint).unwrap();
     assert!(completion.manifest().eq([(1, saved.etag, checksum)]));
     let body = format!(
         "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key><ChecksumSHA256>{}-1</ChecksumSHA256></CompleteMultipartUploadResult>",
         STANDARD.encode(Sha256::digest(digest))
     );
-    let context = EnvelopeContext {
-        identities: [0, 1, 2, 0xab, 0xcd, 5].map(id),
-        plaintext_len: 1,
-        header: sealer.header().to_bytes(),
-    };
     let locate = |version: &str| {
         S3Locator::new(
             BUCKET.into(),
@@ -242,15 +256,12 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         content_length: Some(HEADER_SIZE + 1 + TAG_SIZE),
     };
     let verify = |body: &[u8], version_headers: &[&str]| {
-        completion.verify_completion(
-            &context,
-            VersionedCompletionReply {
-                configuration: id(5),
-                status: 200,
-                body,
-                version_headers,
-            },
-        )
+        completion.verify_completion(VersionedCompletionReply {
+            configuration: id(5),
+            status: 200,
+            body,
+            version_headers,
+        })
     };
     let completed = verify(body.as_bytes(), &["pinned-version"]).unwrap();
     assert_eq!(completed.metadata().locator(), &observed);
