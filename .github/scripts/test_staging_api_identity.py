@@ -154,26 +154,26 @@ class IdentityTests(unittest.TestCase):
             })
 
     def test_workflow_keeps_deploy_marker_separate_from_identity(self):
-        workflow = Path(__file__).parents[1] / "workflows" / "deploy.yml"
-        step = workflow.read_text().split("- name: Record API deployment outcome\n", 1)[1]
-        script = dedent(step.split("        run: |\n", 1)[1].split("\n\n", 1)[0])
-        for status, has_receipt, outcome, deployed in (
-            ("success", False, "deployed", "true"), ("success", True, "deployed", "true"),
-            ("failure", True, "failed", "false"), ("cancelled", True, "cancelled", "false"),
-        ):
-            with self.subTest(status=status, has_receipt=has_receipt), TemporaryDirectory() as temp:
-                output_file, summary = Path(temp, "output"), Path(temp, "summary")
-                matched = '{"identity":"matched"}'
-                if has_receipt:
-                    Path(temp, "staging-api-identity.json").write_text(matched)
-                env = {"PATH": identity.os.defpath, "RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(output_file),
+        workflows = Path(__file__).parents[1] / "workflows"
+        wiring = (workflows / "deploy.yml").read_text().split("- name: Deploy api to staging\n", 1)[1]
+        deploy, report = wiring.split("- name: Record API deployment outcome\n", 1)
+        hook = " ".join(deploy.split("postCommands: >-\n", 1)[1].splitlines()[:2]).strip()
+        script = dedent(report.split("        run: |\n", 1)[1].split("\n\n", 1)[0])
+        matched = '{"identity":"matched"}'
+        for status, rc in (("success", 124), ("success", 0), ("failure", 0), ("cancelled", 0)):
+            with self.subTest(status=status, rc=rc), TemporaryDirectory() as temp:
+                output, summary, probe = (Path(temp, name) for name in ("output", "summary", "python3"))
+                probe.write_text(f"#!/bin/sh\n[ \"$*\" = '-I ../../.github/scripts/staging_api_identity.py' ] || exit 2\n"
+                                 f"printf '%s\\n' '{matched}'\nexit {rc}\n")
+                probe.chmod(0o700)
+                env = {"PATH": f"{temp}:{identity.os.defpath}", "RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(output),
                        "GITHUB_STEP_SUMMARY": str(summary), "CONFIGURED": "true", "HYPERDRIVE_OUTCOME": "success",
                        "SCHEMA_OUTCOME": "success", "JOB_STATUS": status, "DEPLOY_OUTCOME": status, "SOURCE_SHA": SHA}
-                subprocess.run(["bash", "-c", script], check=True, env=env)
-                sha = SHA if deployed == "true" else ""
-                self.assertEqual(output_file.read_text(), f"deployed={deployed}\noutcome={outcome}\nsource_sha={sha}\n")
-                text = summary.read_text()
-                expect_match = deployed == "true" and has_receipt
+                subprocess.run(["bash", "-c", f"{hook}\n{script}"], check=True, env=env)
+                deployed, outcome = status == "success", {"success": "deployed", "failure": "failed"}.get(status, status)
+                self.assertEqual(output.read_text(),
+                                 f"deployed={str(deployed).lower()}\noutcome={outcome}\nsource_sha={SHA if deployed else ''}\n")
+                text, expect_match = summary.read_text(), deployed and rc == 0
                 self.assertEqual((matched in text, "identity=unavailable" in text), (expect_match, not expect_match))
 
 
