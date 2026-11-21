@@ -2631,14 +2631,9 @@ fn assert_member_invite_issuance() {
         };
         let initial = summary(&issuer).await;
         assert!(initial.open_window.is_none() && initial.next_window.is_none());
-        assert_eq!(
-            (
-                initial.paid_seconds,
-                initial.required_paid_seconds,
-                initial.per_window_limit
-            ),
-            (0, 90 * DAY, 2)
-        );
+        assert_eq!(initial.paid_seconds, 0);
+        assert_eq!(initial.required_paid_seconds, 90 * DAY);
+        assert_eq!(initial.per_window_limit, 2);
         assert!(!initial.entitled && !initial.eligible);
         assert_eq!(issue(&mut db, &issuer, 1).await, WindowClosed);
         let (window, window_end) = seed_member_window(&db, 2 * DAY).await;
@@ -2699,26 +2694,23 @@ fn assert_member_invite_issuance() {
         assert_eq!(db.execute(settings, &[&"0", &"0", &"7"]).await.unwrap(), 3);
         let disabled = summary(&issuer).await;
         assert!(disabled.eligible);
-        assert_eq!(
-            (
-                disabled.paid_seconds,
-                disabled.required_paid_seconds,
-                disabled.per_window_limit
-            ),
-            (0, 0, 0)
-        );
+        assert_eq!(disabled.paid_seconds, 0);
+        assert_eq!(disabled.required_paid_seconds, 0);
+        assert_eq!(disabled.per_window_limit, 0);
         assert_eq!(disabled.open_window.unwrap().remaining, 0);
         assert_eq!(issue(&mut db, &issuer, 1).await, QuotaExhausted);
         assert_eq!(db.execute(settings, &[&"3", &"2", &"7"]).await.unwrap(), 3);
         db.execute(status, &[&issuer, &"unpaid"]).await.unwrap();
         // The mixed invoice covers 30 distinct days. The other verified term
-        // overlaps it by a day and leaves one second missing; a legacy span cannot fill it.
+        // overlaps it by a day and leaves one second missing; legacy, zero-dollar and future-settled terms cannot fill it.
         db.execute("INSERT INTO paid_invoice_history (stripe_invoice_id, user_id, stripe_subscription_id,
             plan_id, amount_cents, currency, paid_at, period_start, period_end, covered_periods)
-            SELECT u || lo::text, u, u, 'plus', cents, 'usd', to_timestamp(0), to_timestamp(lo*86400), to_timestamp(hi*86400),
+            SELECT u || lo::text, u, u, 'plus', cents, 'usd',
+                CASE WHEN future THEN now() + interval '1 day' ELSE to_timestamp(0) END, to_timestamp(lo*86400), to_timestamp(hi*86400),
                 CASE WHEN exact THEN tstzmultirange(tstzrange(to_timestamp(lo*86400), to_timestamp(hi*86400-short), '[)')) END
-            FROM (VALUES ($1::text,1,61,800,true,0),($2::text,34,95,800,true,1),
-                         ($2,95,102,800,false,0),($2,102,103,0,true,0)) AS terms(u,lo,hi,cents,exact,short)", &[&issuer, &peer]).await.unwrap();
+            FROM (VALUES ($1::text,1,61,800,true,0,false),($2::text,34,95,800,true,1,false),
+                         ($2,95,102,800,false,0,false),($2,102,103,0,true,0,false),
+                         ($2,103,104,800,true,86399,true)) AS terms(u,lo,hi,cents,exact,short,future)", &[&issuer, &peer]).await.unwrap();
         let below = summary(&peer).await;
         assert_eq!(below.paid_seconds, 90 * DAY - 1);
         assert!(below.entitled && !below.eligible);
