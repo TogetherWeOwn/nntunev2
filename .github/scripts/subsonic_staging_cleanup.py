@@ -99,9 +99,9 @@ def verify_cleanup(
         dispatched_ms, row = read(sample_pressure)
         if (
             type(row) is not PressureObservation
-            or type(row.observed_ms) is not int
+            or type(row.observed_ms) not in (int, float)
             or not off_fence_ms < row.observed_ms <= now_ms
-            or row.observed_ms < int(dispatched_ms)
+            or row.observed_ms < dispatched_ms
             or not fresh(row)
             or type(row.measurement) is not int
             or row.measurement < 0

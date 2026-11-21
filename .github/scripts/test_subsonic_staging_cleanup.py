@@ -110,6 +110,7 @@ class CleanupTest(unittest.TestCase):
                 self.assertEqual(reads.deadlines, [5000] * len(ORDER))
 
         reads = Reads()
+        reads.now_ms += 0.412  # Off readback ends at 1300.412 ms.
         queries = []
 
         def run(argv, *, input, **kwargs):
@@ -119,7 +120,7 @@ class CleanupTest(unittest.TestCase):
 
         def sample(*, deadline_ms):
             self.assertEqual(reads.calls, ORDER[:3])
-            reads.now_ms += 100
+            reads.now_ms += 0.035  # Start strictly later in the same millisecond.
             return sample_pressure(
                 {
                     "PLANETSCALE_OBSERVER_URL_STAGING": "postgresql://nntune_staging_observer.fake:synthetic@database.invalid/postgres"
