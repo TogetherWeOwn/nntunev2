@@ -55,15 +55,12 @@ it('shares the read lock, queues logout and recovers after storage errors', asyn
 	expect(read()).not.toBe(initial);
 	expect(await first!.run(() => true)).toBeUndefined();
 });
-it('fences a read-only capture with no generation when a writer hits quota', async () => {
-	const { setItem, removeItem } = setup();
-	const capture = await captureAuthFence({ readOnly: true });
-	expect(capture?.generation).toBeNull();
+it.each([null, '', 'established'])('captures read-only only with an established generation (%s)', async (id) => {
+	const { setItem, removeItem, write } = setup();
+	if (id !== null) write(AUTH_GENERATION_KEY, id);
+	expect((await captureAuthFence({ readOnly: true }))?.generation).toBe(id || undefined);
 	expect(setItem).not.toHaveBeenCalled();
 	expect(removeItem).not.toHaveBeenCalled();
-	setItem.mockImplementation(fail(full));
-	await (await startWriter())();
-	expect(await capture!.run(() => true)).toBeUndefined();
 });
 it('does not dispatch logout queued behind a second tab signing in', async () => {
 	const { api, send } = setup();
@@ -112,11 +109,10 @@ it.each([true, false])('guards locked writes on generation failure (recovers: %s
 	expect((await captureAuthFence())?.isCurrent()).toBe(recovers ? true : undefined);
 });
 it.each(['open', 'delete'] as const)('does not wait beyond the auth deadline for cache %s', async (op) => {
-	const { setItem, write, api, send } = setup();
+	const { setItem, api, send } = setup();
 	vi.useFakeTimers();
 	vi.spyOn(navigator.locks, 'request').mockRejectedValueOnce(denied());
 	setItem.mockImplementation(fail(full));
-	if (op === 'delete') send.mockImplementationOnce(async () => { setItem.mockImplementation(write); return ok(); });
 	const ready = Promise.withResolvers<void>();
 	const open = caches.open.bind(caches), remove = caches.delete.bind(caches);
 	if (op === 'open') vi.spyOn(caches, 'open').mockImplementation((key) => ready.promise.then(() => open(key)));

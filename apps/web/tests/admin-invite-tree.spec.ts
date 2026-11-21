@@ -6,6 +6,8 @@ const branch = `branch-${'b'.repeat(121)}`;
 const leaf = 'leaf-user';
 const cursor = 'opaque_cursor';
 const ledger = '/v1/admin/invites';
+const generationKey = 'nntune.auth.generation.v1';
+test.beforeEach(({ page }) => page.addInitScript((key) => localStorage.setItem(key, 'test-session'), generationKey));
 const tree = (id: string) => `/v1/admin/users/${id}/invite-tree`;
 const result = (id: string, inviter: string | null, children: string[], next: string | null = null) => ({
 	user_id: id, inviter_id: inviter, invitee_ids: children, next_cursor: next
@@ -95,8 +97,12 @@ for (const continuation of [false, true]) test(`ignores a late ${continuation ? 
 	const delayed = continuation ? `${tree(root)}?cursor=${cursor}` : tree(root);
 	await page.addInitScript((delayed) => {
 		const fetchNormally = window.fetch.bind(window);
-		window.fetch = (input, init) => fetchNormally(input,
-			String(input).endsWith(delayed) ? { ...init, signal: null } : init);
+		window.fetch = async (input, init) => {
+			if (!String(input).endsWith(delayed)) return fetchNormally(input, init);
+			const response = await fetchNormally(input, { ...init, signal: null });
+			Reflect.set(window, 'lateInviteResponse', response);
+			return response;
+		};
 	}, delayed);
 	const hold = Promise.withResolvers<void>();
 	const calls = await mock(page, async (route, target) => {
@@ -114,9 +120,10 @@ for (const continuation of [false, true]) test(`ignores a late ${continuation ? 
 	if (continuation) await list(page).getByRole('button', { name: branch }).press('Enter');
 	else await lookup(page, branch);
 	await expect(page.getByText('No direct invitees.')).toBeVisible();
-	const completed = page.waitForResponse((response) => response.url().endsWith(delayed));
 	hold.resolve();
-	await (await completed).finished();
+	// Wait for JS delivery, then verify the client discarded it without reading its body.
+	await page.waitForFunction(() => !!Reflect.get(window, 'lateInviteResponse'));
+	expect(await page.evaluate(() => Reflect.get(window, 'lateInviteResponse').bodyUsed)).toBe(false);
 	await expect(page.getByText(branch, { exact: true })).toBeVisible();
 	await expect(page.getByText(root, { exact: true }).or(page.getByText(leaf, { exact: true }))).toHaveCount(0);
 	expect(calls).toEqual(continuation ? [tree(root), delayed, tree(branch)] : [delayed, tree(branch)]);
@@ -166,13 +173,22 @@ test('rejects a successful response for a different node without displaying its 
 	expect(calls).toEqual([tree(root)]);
 });
 
-test('clears IDs on an auth transition or page restore without replaying the lookup', async ({ page }) => {
+test('clears IDs on cross-tab generation loss or page restore without replaying the lookup', async ({ page, context }) => {
 	const calls = await mock(page, (route) => route.fulfill({ json: result(root, null, [leaf]) }));
 	await page.goto(path);
 	await lookup(page, root);
 	await expect(selected(page)).toBeVisible();
-	await page.evaluate(() => dispatchEvent(new StorageEvent('storage', { key: 'nntune.auth.generation.v1' })));
+	const otherTab = await context.newPage();
+	await otherTab.route(`**${path}`, (route) => route.fulfill({ contentType: 'text/html', body: '' }));
+	await otherTab.goto(path);
+	await otherTab.evaluate((key) => localStorage.removeItem(key), generationKey);
 	await expect(selected(page)).toHaveCount(0);
+	await lookup(page, root);
+	await expect(page.getByRole('alert')).toContainText('unavailable');
+	await expect(page.getByLabel('Exact user ID')).toHaveValue('');
+	await expect(selected(page)).toHaveCount(0);
+	expect(calls).toEqual([tree(root)]);
+	await page.evaluate((key) => localStorage.setItem(key, 'new-session'), generationKey);
 	await lookup(page, root);
 	await expect(selected(page)).toBeVisible();
 	await page.evaluate(() => dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })));
