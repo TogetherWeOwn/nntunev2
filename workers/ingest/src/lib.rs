@@ -2571,7 +2571,6 @@ mod tests {
                 log["fields"],
                 serde_json::json!({"reason": reason, "build_sha": "unknown"})
             );
-
             let (api_error, header) = meter_failure_projection(&err);
             assert_eq!(api_error.status, status);
             assert_eq!(header, retry_after);
@@ -3390,12 +3389,12 @@ mod build_sha_tests {
         // substring: `let build_sha = …` alone must never satisfy this.
         // The four fetch lines plus the migrated operational emits carry
         // the key, so a dropped key at any one of them drops the count
-        // below eighteen. The detached library-db failure line owns its
+        // below seventeen (meter emits share one). The DB failure line owns its
         // build string under a different binding and is pinned separately.
         assert_eq!(
             production.matches("\"build_sha\": build_sha").count(),
-            18,
-            "all eighteen keyed lines must carry the build_sha key"
+            17,
+            "all seventeen field constructors must carry the build_sha key"
         );
         assert_eq!(
             production
