@@ -562,6 +562,37 @@ pub enum AdminInviteRevokeOutcome {
     ActorNotAdmin,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct InviteWindow {
+    pub id: i64,
+    pub starts_at: i64,
+    pub ends_at: i64,
+    pub created_by: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InviteWindowSchedule {
+    pub starts_at: i64,
+    pub ends_at: i64,
+    pub note: Option<String>,
+}
+
+pub enum InviteWindowWrite<'a> {
+    Schedule(&'a InviteWindowSchedule),
+    Close(i64),
+}
+
+#[derive(Debug)]
+pub enum InviteWindowOutcome {
+    Window(InviteWindow),
+    InvalidSchedule,
+    Overlap,
+    Missing,
+    ActorNotAdmin,
+}
+
 impl From<auth::AuthError> for StoreError {
     fn from(_: auth::AuthError) -> Self {
         StoreError
@@ -1510,6 +1541,21 @@ pub trait Store {
         _source_ip: &str,
         _now: u64,
     ) -> impl Future<Output = Result<AdminInviteRevokeOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
+    fn admin_list_invite_windows(
+        &self,
+    ) -> impl Future<Output = Result<Vec<InviteWindow>, StoreError>> {
+        async { Err(StoreError) }
+    }
+    /// Recheck admin under the write lock, then atomically commit the transition and audit.
+    fn admin_write_invite_window(
+        &self,
+        _actor: &str,
+        _write: InviteWindowWrite<'_>,
+        _source_ip: &str,
+        _now: u64,
+    ) -> impl Future<Output = Result<InviteWindowOutcome, StoreError>> {
         async { Err(StoreError) }
     }
     /// Compatibility lifecycle is native-session-only. Implementations must
