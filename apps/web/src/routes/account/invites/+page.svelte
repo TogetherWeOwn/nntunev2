@@ -50,7 +50,8 @@
 
 	function readFailure(cause: unknown): Exclude<ReadStatus, 'loading' | 'retry'> {
 		if (cause instanceof ApiError) {
-			if (cause.code === 'account_deleting') return 'deleting';
+			// On these two reads, conflict means the account is being deleted.
+			if (cause.status === 409 || cause.code === 'account_deleting') return 'deleting';
 			if (cause.status === 401) return 'signed-out';
 			if (cause.status === 403 || cause.status === 404) return 'denied';
 		}

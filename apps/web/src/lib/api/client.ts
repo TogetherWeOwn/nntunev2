@@ -710,9 +710,10 @@ export class ApiClient {
 				try {
 					body = await readCappedJson(response);
 				} catch (error) {
-					// A body read cut short by the deadline surfaces the
-					// timeout, not a status default.
-					if (timedOut) throw this.timeoutError();
+					// Invite reads must not lose a known denial and retain private rows.
+					if (timedOut && !(init.method === 'GET' &&
+						[MEMBER_INVITES, `${MEMBER_INVITES}/history`].includes(path.split('?', 1)[0]) &&
+						[401, 403, 404, 409].includes(response.status))) throw this.timeoutError();
 					// An over-cap error body is never parsed: the generic
 					// status fallback applies, never retryable (an over-cap
 					// body does not become acceptable on retry), with no
