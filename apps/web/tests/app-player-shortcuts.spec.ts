@@ -5,6 +5,9 @@ const audio = (page: Page) => page.getByTestId('audio-player');
 const help = (page: Page) => page.getByTestId('shortcuts-button');
 const status = (page: Page) => page.getByRole('region', { name: 'Player', exact: true }).getByRole('status');
 const time = (page: Page) => audio(page).evaluate((node: HTMLAudioElement) => node.currentTime);
+const keyPasses = (page: Page, key: string) => page.evaluate((key) => document.activeElement!.dispatchEvent(
+	new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+), key);
 
 async function openLibrary(page: Page) {
 	await page.route('**/api/library', (route) => route.fulfill({ json: [track] }));
@@ -17,29 +20,33 @@ async function openLibrary(page: Page) {
 test('app shortcuts act once on the live native audio across routes and stop at teardown', async ({ page }) => {
 	await openLibrary(page);
 	const native = (await audio(page).elementHandle())!;
-	await page.keyboard.press('j');
+	await help(page).press('j');
 	await expect.poll(() => time(page)).toBeCloseTo(2);
 	await page.keyboard.press('k');
 	await expect(status(page)).toHaveText('Playing');
 	await page.keyboard.press('k');
 	await expect(status(page)).toHaveText('Paused');
 	const pausedAt = await time(page);
-
-	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).click();
+	const home = page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true });
+	await home.click();
 	await expect(page).toHaveURL(/\/home$/);
 	await expect(page.getByTestId('library-list')).toHaveCount(0);
-	await page.keyboard.press('l');
+	await home.focus();
+	await expect(home).toBeFocused();
+	const restartStatus = page.getByTestId('library-restart-status');
+	for (const key of ['0', '?', 'k', 'j', 'l']) expect(await keyPasses(page, key)).toBe(true);
+	expect(await time(page)).toBeCloseTo(pausedAt);
+	await expect(restartStatus).toBeEmpty();
+	const restart = page.getByTestId('library-restart');
+	await restart.press('l');
 	await expect.poll(() => time(page)).toBeCloseTo(pausedAt + 10);
 	await page.keyboard.press('0');
 	await expect.poll(() => time(page)).toBeCloseTo(0);
-	const restartStatus = page.getByTestId('library-restart-status');
-	await expect(restartStatus).toContainText('Restarted Keys Coral');
+	await expect(restartStatus).toHaveText('Restarted Keys Coral.');
 	expect(await native.evaluate((node: HTMLAudioElement) =>
 		node === document.querySelector('audio') && node.controls && node.paused)).toBe(true);
 
-	const restart = page.getByTestId('library-restart');
-	await restart.focus();
-	await page.keyboard.press('Shift+Slash');
+	await restart.press('Shift+Slash');
 	await expect(page.getByTestId('shortcuts-close')).toBeFocused();
 	await audio(page).evaluate((node: HTMLAudioElement) => {
 		node.currentTime = 7;
@@ -49,9 +56,7 @@ test('app shortcuts act once on the live native audio across routes and stop at 
 	await expect(restart).toBeDisabled();
 	await page.keyboard.press('Escape');
 	await expect(help(page)).toBeFocused();
-	expect(await page.evaluate(() => document.body.dispatchEvent(
-		new KeyboardEvent('keydown', { key: '0', bubbles: true, cancelable: true })
-	))).toBe(true);
+	expect(await keyPasses(page, '0')).toBe(true);
 	expect(await time(page)).toBeCloseTo(7);
 	await expect(restartStatus).toHaveText('Restarted Keys Coral.');
 
@@ -109,10 +114,10 @@ test('app shortcut help lists only supported bindings, restores focus and respec
 		const native = document.querySelector('audio[controls]')!;
 		const passed = [child, select, field, native].every((target) => send(target, '0')) &&
 			[' ', 'ArrowLeft', 'ArrowRight', 'Enter'].every((key) => send(native, key)) &&
-			['n', 'p', 'm', 's', 'r'].every((key) => send(document.body, key)) &&
-			['J', 'K', 'L', '0'].every((key) => send(document.body, key, { shiftKey: true })) &&
+			['n', 'p', 'm', 's', 'r'].every((key) => send(document.activeElement!, key)) &&
+			['J', 'K', 'L', '0'].every((key) => send(document.activeElement!, key, { shiftKey: true })) &&
 			[{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { isComposing: true }, { repeat: true }]
-				.every((flags) => send(document.body, '0', flags));
+				.every((flags) => send(document.activeElement!, '0', flags));
 		for (const node of [editable, select, field]) node.remove();
 		return passed;
 	})).toBe(true);

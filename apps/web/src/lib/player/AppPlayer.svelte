@@ -22,8 +22,9 @@
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(resolveStreamUrl(currentTrack));
 	let shortcutHelp = $state.raw<ReturnType<typeof ShortcutHelp>>();
+	let shortcutScope = $state<HTMLDivElement>();
 	function onShortcutKeydown(event: KeyboardEvent) {
-		if (streamUrl) handleAppShortcut(event, media, shortcutHelp);
+		if (streamUrl && shortcutScope?.contains(document.activeElement)) handleAppShortcut(event, media, shortcutHelp);
 	}
 	$effect.pre(() => { if (signedOut) untrack(player.purgeAtAuthBoundary); });
 	// Retire the decoder before the mounted Library handles the same signal.
@@ -44,7 +45,7 @@
 <svelte:window onkeydown={onShortcutKeydown} />
 {@render children()}
 {#if streamUrl}
-	<div class="nt-wrap">
+	<div class="nt-wrap" bind:this={shortcutScope}>
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio}
 			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} />
