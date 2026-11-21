@@ -19,27 +19,25 @@ export function bindSystemSeek(session: MediaSessionLike, owner: SystemSeekOwner
 		if (!enabled) handlers = undefined;
 		else {
 			const active = () => !signal.aborted && handlers === registration;
-			const retire = () => {
-				if (!active() || !owner.matches() || !active()) return false;
-				refresh(false);
-				if (!signal.aborted && !handlers) owner.availability.update((state) => state.enabled && state.attachment === owner.attachment
-					? { ...state, enabled: false } : state);
-				return true;
-			};
-			const action = (name: Parameters<SystemSeekOwner['dispatch']>[0]) => (details: MediaSessionSeekDetails) => {
+			const action = (name: MediaSessionSeekDetails['action']) => (details: MediaSessionSeekDetails) => {
 				if (details?.action !== name || !active()) return;
 				const { seekTime, seekOffset = RELATIVE_JUMP_SECONDS } = details;
 				const seconds = name === 'seekto' ? seekTime : seekOffset;
 				if (typeof seconds !== 'number' || !Number.isFinite(seconds) || (name === 'seekto' ? seconds < 0 : seconds <= 0)) return;
-				const intent = owner.positionIntent();
-				if (!owner.matches() || !active() || owner.positionIntent() !== intent) return;
-				if (!readAbsoluteSeek(owner.audio).enabled) { retire(); return; }
-				if (!owner.matches() || !active() || owner.positionIntent() !== intent) return;
+				const intent = owner.positionIntent(), ownsIntent = () => owner.matches() && active() && owner.positionIntent() === intent;
 				let retired = false; // Loss retires the registration, but this attempt may still report it.
-				owner.dispatch(name, seconds, { active, canReport: () => retired || active(), unavailable: () => { retired ||= retire(); } });
+				const unavailable = () => {
+					if (!active() || !owner.matches() || !active()) return;
+					refresh(false);
+					if (!signal.aborted && !handlers) owner.availability.update((state) => state.enabled && state.attachment === owner.attachment
+						? { ...state, enabled: false } : state);
+					retired = true;
+				};
+				if (!ownsIntent()) return;
+				if (!readAbsoluteSeek(owner.audio).enabled) return unavailable();
+				if (ownsIntent()) owner.dispatch(name, seconds, { active, canReport: () => retired || active(), unavailable });
 			};
-			const registration = { onSeekTo: action('seekto'), onSeekForward: action('seekforward'), onSeekBackward: action('seekbackward') };
-			handlers = registration;
+			const registration = handlers = { onSeekTo: action('seekto'), onSeekForward: action('seekforward'), onSeekBackward: action('seekbackward') };
 		}
 		setSeekHandlers(session, handlers);
 	};

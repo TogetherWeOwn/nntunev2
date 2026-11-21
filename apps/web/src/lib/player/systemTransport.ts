@@ -53,10 +53,9 @@ export function bindSystemTransport(
 	}
 	let systemSeek: ReturnType<typeof bindSystemSeek> | undefined;
 	unsubscribe = queue.subscribe(() => {
-		if (signal.aborted) return;
-		const track = readTrack();
 		systemSeek?.refresh();
 		if (signal.aborted) return;
+		const track = readTrack();
 		if (!track) {
 			if (published && !signal.aborted) setMediaSessionPosition(null, options);
 			return;
