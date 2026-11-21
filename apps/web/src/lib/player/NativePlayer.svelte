@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { ComponentProps } from 'svelte';
+	import type { ComponentProps, Snippet } from 'svelte';
 	import { displayArtist, displayTitle } from '../library/order.js';
 	import NativeAudio from './NativeAudio.svelte';
 	import type { PlaybackStatus } from './mediaController.js';
@@ -10,7 +10,7 @@
 		currentTrack, mediaRevision, streamUrl, attachNativeAudio,
 		playbackStatus, playCurrent, pauseCurrent,
 		restartCanSeek, restartStatus, restartStatusVersion, restartCurrentTrack,
-		jumpStatus, jumpStatusVersion, jumpRelative
+		jumpStatus, jumpStatusVersion, jumpRelative, favoriteAction
 	}: ComponentProps<typeof NativeAudio> & {
 		currentTrack: Pick<Track, 'id' | 'title' | 'artist'> | null;
 		playbackStatus: PlaybackStatus;
@@ -23,6 +23,7 @@
 		jumpStatus: string;
 		jumpStatusVersion: number;
 		jumpRelative: (direction: JumpDirection) => void;
+		favoriteAction?: Snippet;
 	} = $props();
 	const canPause = $derived(playbackStatus === 'playing' || playbackStatus === 'starting');
 	const statusText: Record<PlaybackStatus, string> = {
@@ -59,6 +60,7 @@
 		>
 			Restart current track
 		</button>
+		{@render favoriteAction?.()}
 	</div>
 	<p role="status" aria-atomic="true">{statusText[playbackStatus]}</p>
 	{#if !restartCanSeek}

@@ -4,6 +4,7 @@
 	import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
 	import { createQueueShare } from '#lib/player/queueShare.js';
 	import { getAppPlayer } from '#lib/player/AppPlayer.svelte';
+	import type { FavoriteWrite } from '#lib/player/currentTrackFavorite.svelte.js';
 	import { createFavoritesExport } from './favoritesExport.js';
 	import { projectInteractionIds, survivingInteractionIds } from './interactionSelection.js';
 	import { selectedRowRecoveryIds } from './selectedRowRecovery.js';
@@ -22,6 +23,7 @@
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import {
 		clearFavoritesAtAuthBoundary,
+		favoritesKey,
 		loadFavorites,
 		saveFavorites,
 		selectFavoriteItems
@@ -161,7 +163,8 @@
 	// Retain implicit invalidation even when prune + inbound share batch into a nonempty queue.
 	let queueConfirmGeneration = $state(0);
 	let favorites: string[] = $state([]);
-	let favoritesInitialized = false;
+	let favoritesInitialized = $state(false);
+	let favoritesAuthKey: string | null = null;
 	let favoritesAnnouncement = $state('');
 	// One shared polite outcome for order, view and clear actions: a new
 	// outcome replaces the previous text (keyed re-announce), never queues.
@@ -384,7 +387,9 @@
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
 				if (!favoritesInitialized) {
-					favorites = loadFavorites(browserStorage('session'), browserStorage('local'));
+					const session = browserStorage('session');
+					favoritesAuthKey = session && favoritesKey(session);
+					favorites = loadFavorites(session, browserStorage('local'));
 					favoritesInitialized = true;
 				}
 				if (!recentFindsInitialized) {
@@ -777,18 +782,26 @@
 		player.announceQueue(`Removed ${removed} upcoming ${removed === 1 ? 'track' : 'tracks'}.`);
 	}
 
-	function toggleFavorite(id: string): void {
-		// Toggle visible state, not the last successful write. The next write
-		// persists the full set, including edits made while storage failed.
-		const next = favorites.includes(id)
-			? favorites.filter((favorite) => favorite !== id)
-			: [...favorites, id];
+	function setFavorite(id: string, pressed: boolean): FavoriteWrite {
+		if (favorites.includes(id) === pressed) return null;
+		// Memory is authoritative for the visit. Retry the full list on each write.
+		const next = pressed ? [...favorites, id] : favorites.filter((favorite) => favorite !== id);
 		favorites = next;
 		favoritesAnnouncement = '';
-		saveFavorites(browserStorage('session'), browserStorage('local'), next);
-		// Favorites-only unmounts an unstarred row, including its focused button.
-		// All-tracks keeps that button mounted and must leave focus alone.
-		if (view === 'favorites' && !next.includes(id)) focusLibraryView();
+		return saveFavorites(browserStorage('session'), browserStorage('local'), next) ? 'saved' : 'visit';
+	}
+
+	function toggleFavorite(id: string): void {
+		const pressed = !favorites.includes(id);
+		// Preserve the row/queue affordances' existing focus behavior. The
+		// player button itself does not unmount when unstarred.
+		if (setFavorite(id, pressed) && !pressed && view === 'favorites') focusLibraryView();
+	}
+
+	function readPlayerFavorites(id: string): readonly string[] | null {
+		if (!shareAlive || !favoritesInitialized || listingUnavailable || !queueController.hasLibraryTrack(id) ||
+			favoritesKey(browserStorage('session')) !== favoritesAuthKey) return null;
+		return favorites;
 	}
 
 	function focusLibraryView(): void {
@@ -1448,7 +1461,12 @@
 		const unsubscribeLocal = subscribeLocalAuthTransition(handleLocalAuthTransition);
 		// Discard the old shared localStorage snapshot from earlier versions.
 		clearSnapshot(browserStorage('local'));
+		const releaseFavoriteAction = player.currentFavorite.bind({
+			read: readPlayerFavorites,
+			write: (id, pressed) => readPlayerFavorites(id) ? setFavorite(id, pressed) : null
+		});
 		disposeRoute = () => {
+			releaseFavoriteAction();
 			endTrackDrag();
 			// Restore only while this page still owns the title; a newer route's title wins.
 			if (priorDocumentTitle !== null && document.title === tabTitle) {
