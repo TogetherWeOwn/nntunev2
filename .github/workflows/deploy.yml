@@ -458,6 +458,11 @@ jobs:
             echo "outcome=$outcome"
             echo "source_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
+          # Read only the probe's redacted output, never Wrangler or provider responses.
+          if [ "$deployed" != true ] || [ -z "${RUNNER_TEMP:-}" ] || \
+             ! receipt=$(jq -cse 'select(length == 1) | .[0] | objects' "$RUNNER_TEMP/staging-api-identity.json" 2>/dev/null); then
+            receipt='{"identity":"unavailable","reason":"no-completed-probe-receipt"}'
+          fi
           {
             echo "### staging-api deployment outcome: $outcome"
             echo "Worker: nntune-api-staging (env staging)"
@@ -470,11 +475,9 @@ jobs:
               echo "BUILD_SHA var: $source_sha"
             fi
             echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
-            printf '\n### staging-api provider identity\n'
-            if [ "$deployed" != true ] || [ -z "${RUNNER_TEMP:-}" ] || ! jq -cse 'select(length == 1) | .[0]' "$RUNNER_TEMP/staging-api-identity.json" 2>/dev/null; then
-              echo 'identity=unavailable (no completed probe receipt)'
-            fi
+            printf '\n### staging-api provider identity\n%s\n' "$receipt"
           } >> "$GITHUB_STEP_SUMMARY"
+          printf 'staging-api provider identity: %s\n' "$receipt"
 
   # MB mirror Worker staging lane (staging only). Push to `main` only, gated
   # on the same token gate as staging-web. Deploys the mb Worker to its

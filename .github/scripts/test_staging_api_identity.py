@@ -156,25 +156,36 @@ class IdentityTests(unittest.TestCase):
         deploy, report = wiring.split("- name: Deploy api to staging\n", 1)[1].split("- name: Record API deployment outcome\n", 1)
         hook = " ".join(dedent(deploy.split("postCommands: >-\n", 1)[1].split("\n      #", 1)[0]).splitlines())
         script = dedent(report.split("        run: |\n", 1)[1].split("\n\n", 1)[0])
-        for status, rc in (("success", 124), ("success", 0), ("failure", 0), ("cancelled", 0)):
-            with self.subTest(status=status, rc=rc), TemporaryDirectory() as temp:
+        matched = json.dumps(MATCHED)
+        missing = {"identity": "unavailable", "reason": "no-completed-probe-receipt"}
+        denied = {"identity": "unavailable", "reason": "version-auth-denied"}
+        for status, rc, payload, expected in (
+            ("success", 0, matched, MATCHED),
+            ("success", 1, json.dumps(denied), denied),
+            ("success", 124, matched, missing),
+            ("success", 0, "synthetic unparseable output", missing),
+            ("success", 0, '"synthetic non-object output"', missing),
+            ("success", 0, f"{matched}\n{matched}", missing),
+            ("failure", 0, matched, missing),
+            ("cancelled", 0, matched, missing),
+        ):
+            with self.subTest(status=status, rc=rc, payload=payload), TemporaryDirectory() as temp:
                 output, summary, probe = (Path(temp, name) for name in ("output", "summary", "python3"))
                 probe.write_text(f"#!/bin/sh\n[ \"$*\" = '-I ../../.github/scripts/staging_api_identity.py' ] || exit 2\n"
-                                 f"printf '%s\\n' '{json.dumps(MATCHED)}'\nexit {rc}\n")
+                                 f"printf '%s\\n' '{payload}'\nexit {rc}\n")
                 probe.chmod(0o700)
                 env = {"PATH": f"{temp}:{identity.os.defpath}", "RUNNER_TEMP": temp, "GITHUB_OUTPUT": str(output),
                        "GITHUB_STEP_SUMMARY": str(summary), "CONFIGURED": "true", "HYPERDRIVE_OUTCOME": "success",
                        "SCHEMA_OUTCOME": "success", "JOB_STATUS": status, "DEPLOY_OUTCOME": status, "SOURCE_SHA": SHA}
-                for command in (hook, script):
-                    subprocess.run(["bash", "-c", command], check=True, env=env)
+                hook_result = subprocess.run(["bash", "-c", hook], check=True, env=env, capture_output=True, text=True)
+                self.assertEqual(hook_result.stdout, "")
+                report_result = subprocess.run(["bash", "-c", script], check=True, env=env, capture_output=True, text=True)
                 deployed, outcome = status == "success", {"success": "deployed", "failure": "failed"}.get(status, status)
                 self.assertEqual(output.read_text(),
                                  f"deployed={str(deployed).lower()}\noutcome={outcome}\nsource_sha={SHA if deployed else ''}\n")
                 receipt = summary.read_text().split("\n### staging-api provider identity\n", 1)[1].strip()
-                if deployed and rc == 0:
-                    self.assertEqual(json.loads(receipt), MATCHED)
-                else:
-                    self.assertEqual(receipt, "identity=unavailable (no completed probe receipt)")
+                self.assertEqual(report_result.stdout.splitlines(), [f"staging-api provider identity: {receipt}"])
+                self.assertEqual(json.loads(receipt), expected)
 
 
 if __name__ == "__main__":
