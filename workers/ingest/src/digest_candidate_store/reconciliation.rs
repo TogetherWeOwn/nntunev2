@@ -4,14 +4,8 @@ use std::future::Future;
 
 use tokio_postgres::{Client, Error, IsolationLevel, Row};
 
-use super::{candidate_hashes, uuid, CandidateIntent, OriginManifest};
+use super::{candidate_hashes, uuid, CandidateIntent, OriginManifest, LOCK_SQL};
 use crate::digest_candidate_identity::{candidate_pages_match, CandidatePage};
-
-// Lock the whole digest key before looking at holder, generation, or expiry.
-// Filtering by those here could skip a competing writer or a successor.
-const LOCK_SQL: &str = "SELECT 1 FROM public.storage_digest_reservations
- WHERE environment_id = $1::text::uuid AND library_id = $2::text::uuid
-   AND plaintext_sha256 = $3 AND plaintext_bytes = $4 FOR UPDATE";
 
 const OBSERVE_SQL: &str = "SELECT r.generation,
     r.object_id = i.object_id AND r.expires_at > clock_timestamp(),
