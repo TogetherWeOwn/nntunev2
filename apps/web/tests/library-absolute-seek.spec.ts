@@ -35,7 +35,6 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 	const sought = await read();
 	expect(sought.currentTime / sought.duration).toBeCloseTo(0.55, 1);
 	await expect(slider).toHaveAttribute('aria-valuetext', `0:${String(Math.floor(sought.currentTime)).padStart(2, '0')} of 0:16`);
-
 	await slider.focus();
 	for (const [key, seconds] of [['Home', 0], ['ArrowRight', 1]] as const) {
 		await page.keyboard.press(key);
@@ -58,7 +57,8 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 		Object.defineProperty(el, 'seekable', { configurable: true, get: () => ({ length: 1, start: () => 0, end: () => 5 }) });
 	});
 	const refusal = region.locator('p[aria-live="polite"][aria-atomic="true"] span:not([aria-hidden])');
-	for (const attempt of ['pointer', 'drag', 'drag-repeat', 'held-key', 'key-repeat', 'key', 'input', 'input']) {
+	for (const attempt of ['pointer', 'drag', 'drag-repeat', 'input', 'pointercancel', 'input', 'blur', 'input',
+		'held-key', 'key-repeat', 'key', 'input', 'input']) {
 		const previous = attempt === 'pointer' ? null : await refusal.elementHandle();
 		if (attempt === 'pointer') expect((await seekViaPlayerUi(page, audio, 0.75)).surface).toBe('custom');
 		else if (attempt === 'held-key' || attempt === 'key-repeat') await page.keyboard.down('End');
@@ -67,8 +67,10 @@ test('pointer and keyboard seek the real layout decoder and follow its readback'
 			if (startDrag) el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
 			el.value = el.max;
 			el.dispatchEvent(new Event('input', { bubbles: true }));
-		}, attempt === 'drag');
+		}, ['drag', 'pointercancel', 'blur'].includes(attempt));
 		if (attempt === 'drag-repeat') await slider.dispatchEvent('pointerup', { bubbles: true });
+		if (attempt === 'pointercancel') await slider.dispatchEvent(attempt, { bubbles: true });
+		if (attempt === 'blur') await page.evaluate(() => window.dispatchEvent(new Event('blur')));
 		if (attempt === 'key-repeat') await page.keyboard.up('End');
 		if (previous) await expect.poll(() => previous.evaluate((el) => el.isConnected)).toBe(attempt.endsWith('-repeat'));
 		await expect(refusal).toHaveText('That position is not seekable yet.');
