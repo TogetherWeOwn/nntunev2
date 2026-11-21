@@ -9,7 +9,7 @@
  */
 
 import type { LibraryItem } from './cache.js';
-import { displayArtist, displayTitle } from './order.js';
+import { queuedTrackFor } from './queueTrack.js';
 import { addTrack, type QueueState } from '../player/queue.js';
 
 export interface SelectionAppendResult {
@@ -203,13 +203,7 @@ export function appendSelection(
 			skipped += 1;
 			continue;
 		}
-		next = addTrack(next, {
-			id: item.id,
-			title: displayTitle(item),
-			...(typeof item.title !== 'string' || !item.title.trim() ? { titleIsFallback: true } : {}),
-			artist: displayArtist(item) ?? '',
-			streamUrl: ''
-		});
+		next = addTrack(next, queuedTrackFor(item));
 		added += 1;
 	}
 	return { queue: next, added, skipped };

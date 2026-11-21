@@ -99,10 +99,14 @@ test.each(['replacement', 'detach', 'account purge', 'destroy'])('revokes captur
 		detach();
 		expect(session.metadata).toMatchObject({ title: moss.id, artist: '' });
 		expect(session.metadata).not.toHaveProperty('album');
-		await media.playCurrent();
+		play();
+		expect(newer.play).not.toHaveBeenCalled();
+		handler('play')!();
+		expect(newer.play).toHaveBeenCalledOnce();
+	} else {
+		play();
 	}
 	pause();
-	play();
 	pending.resolve();
 	await pending.promise;
 	expect(audio.play).toHaveBeenCalledOnce();
@@ -124,6 +128,10 @@ test('compact controls work with Media Session absent or one action unsupported'
 
 	const { handler } = stubSession('play');
 	const partial = player();
+	await partial.media.playCurrent();
+	expect(partial.status()).toBe('playing');
+	partial.media.pauseCurrent();
+	expect(partial.status()).toBe('paused');
 	await partial.media.playCurrent();
 	expect(partial.status()).toBe('playing');
 	handler('pause')!();
