@@ -77,8 +77,9 @@ on `main`.
    together. Exercise owner-issued invite redemption and active test-mode
    entitlement. The [M1 matrix](m1-exit-traceability.md#matrix)
    identifies each gap.
-3. For a promotion candidate, record the precise serving SHA at both ends of
-   the Access-protected journey and retain its passing same-run result.
+3. For a promotion candidate, record the serving web and API SHAs at the
+   start and end of the Access-protected journey. Match both identities to
+   the promotion SHA and retain the passing same-run result.
    Record Worker identity and outcome for each deployed lane. Use the
    [staging readout template](staging-validation-readout-template.md) and the
    [promotion checklist](ops.md#staging-promotion-checklist).
@@ -91,7 +92,8 @@ on `main`.
 
 M1 exit remains open. The [current production preflight](../.github/workflows/deploy-production.yml#L128)
 accepts only `bootstrap-maintenance` and refuses application promotion even
-when the lane is enabled. Application promotion also requires the full
+when the lane is enabled. The staging-evidence gate applies to both
+maintenance bootstrap and application promotion. It requires the full
 passing journey and an [attempt-bound candidate admission receipt](../ci/staging-admission.md).
 The [admission policy](../ci/staging-admission-policy.json) has no approvals.
 Product approval of the journey contract and separate QA approval of the

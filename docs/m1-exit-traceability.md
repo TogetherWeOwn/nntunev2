@@ -6,9 +6,9 @@ invite takes a listener through signup to the plan picker and active test-mode
 subscription. An admin publishes a matched curated release. The entitled
 listener sees it in the shared catalogue, plays a track and seeks with
 playback continuing. Access must remain enabled and deny anonymous requests
-to health, readiness and the app shell. The serving build must match the
-promotion SHA at journey start and end, and the passing post-deploy run and
-successful rollback must be recorded.
+to health, readiness and the app shell. The serving web and API builds
+must each match the promotion SHA at journey start and end. Record the
+passing post-deploy run and successful rollback.
 
 The provider-connect step is retired. Users bring no provider credentials
 or NZBs. See the [roadmap](../ROADMAP.md#storage-direction) for curated ingest

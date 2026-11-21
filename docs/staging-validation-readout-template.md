@@ -149,9 +149,10 @@ evidence IDs. Rows marked † are must-pass for a `GO`.
 | 6 | Metering and limits | Optional evidence for the separate metering milestone, including accrual, cap and lapse behavior | | |
 | 7† | Rollback | Record the last-good push deploy before promotion, then verify the rerun, restored SHA, health and separate Worker outcomes | | |
 
-Row 6 tracks separate milestone evidence. Record the exact serving SHA at the start and end of the post-deploy journey
-and cite the associated passing run. For row 7, cite both the last-good
-push deploy and the successful rollback rerun. Follow the
+Row 6 tracks separate milestone evidence. Record the serving web and API
+SHAs at the start and end of the post-deploy journey. Match both identities
+to the promotion SHA and cite the passing run. For row 7, cite both the
+last-good push deploy and the successful rollback rerun. Follow the
 [staging promotion checklist](ops.md#staging-promotion-checklist).
 
 ### 2. User-visible failures
