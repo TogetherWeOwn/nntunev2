@@ -1,5 +1,5 @@
 CREATE FUNCTION pg_temp.claim_cleanup(UUID, UUID, TEXT, UUID)
-RETURNS TABLE (session_id UUID, kind TEXT, delivery_claim_id UUID, delay_seconds INTEGER)
+RETURNS TABLE (session_id TEXT, kind TEXT, delivery_claim_id TEXT, delay_seconds INTEGER)
 LANGUAGE sql VOLATILE AS :'ingest_session_claim_cleanup_sql';
 CREATE FUNCTION pg_temp.ack_cleanup_enqueue(UUID, UUID, TEXT, UUID, TEXT, UUID)
 RETURNS SETOF TIMESTAMPTZ LANGUAGE sql VOLATILE AS :'ingest_session_ack_cleanup_enqueue_sql';
@@ -31,10 +31,10 @@ BEGIN
     END;
     -- Transaction rollback made both intents claimable again.
     WITH claimed AS MATERIALIZED (SELECT * FROM pg_temp.claim_cleanup(f.environment_id, f.library_id, owner, sid))
-    SELECT e.delivery_claim_id, t.delivery_claim_id INTO STRICT expiry_id, terminal_id
+    SELECT e.delivery_claim_id::uuid, t.delivery_claim_id::uuid INTO STRICT expiry_id, terminal_id
     FROM claimed AS e CROSS JOIN claimed AS t
-    WHERE e.session_id=sid AND e.kind='absolute_expiry' AND e.delay_seconds BETWEEN 1 AND 86400
-      AND t.session_id=sid AND t.kind='terminal_reconcile' AND t.delay_seconds=0;
+    WHERE e.session_id=sid::text AND e.kind='absolute_expiry' AND e.delay_seconds BETWEEN 1 AND 86400
+      AND t.session_id=sid::text AND t.kind='terminal_reconcile' AND t.delay_seconds=0;
 
     IF EXISTS (SELECT FROM pg_temp.claim_cleanup(f.environment_id, f.library_id, owner, sid)) OR
        EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(gen_random_uuid(), f.library_id, owner, sid, 'absolute_expiry', expiry_id)) OR
@@ -53,7 +53,7 @@ BEGIN
     IF EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(f.environment_id, f.library_id, owner, sid, 'terminal_reconcile', terminal_id)) THEN
         RAISE EXCEPTION 'expired claim acknowledged';
     END IF;
-    SELECT delivery_claim_id INTO STRICT retry_id FROM pg_temp.claim_cleanup(f.environment_id, f.library_id, owner, sid)
+    SELECT delivery_claim_id::uuid INTO STRICT retry_id FROM pg_temp.claim_cleanup(f.environment_id, f.library_id, owner, sid)
     WHERE kind='terminal_reconcile' AND delay_seconds=0;
     IF retry_id IS NULL OR retry_id=terminal_id OR
        EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(f.environment_id, f.library_id, owner, sid, 'terminal_reconcile', terminal_id)) THEN

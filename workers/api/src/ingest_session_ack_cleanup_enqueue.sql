@@ -6,9 +6,9 @@ WITH locked AS MATERIALIZED (
     FROM public.ingest_session_reservations AS session
     JOIN public.storage_library_namespaces AS library ON library.id = session.library_id
     JOIN public.ingest_session_cleanup_intents AS intent ON intent.session_id = session.id
-    WHERE library.environment_id = $1 AND session.library_id = $2
-      AND session.principal_id = $3 AND session.id = $4 AND intent.kind = $5
-      AND intent.delivery_claim_id = $6 AND intent.enqueued_at IS NULL
+    WHERE library.environment_id = $1::text::uuid AND session.library_id = $2::text::uuid
+      AND session.principal_id = $3 AND session.id = $4::text::uuid AND intent.kind = $5
+      AND intent.delivery_claim_id = $6::text::uuid AND intent.enqueued_at IS NULL
     FOR UPDATE OF intent
 ), observed AS MATERIALIZED (
     SELECT locked.*, clock_timestamp() AS ts FROM locked

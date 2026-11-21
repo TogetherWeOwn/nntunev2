@@ -6,6 +6,9 @@ use std::future::Future;
 use serde::Serialize;
 use worker::{Env, MessageBuilder};
 
+mod postgres;
+pub use postgres::{dispatch_scope, CleanupScope, DispatchError};
+
 const MAX_DELAY_SECONDS: u32 = 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
