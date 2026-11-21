@@ -33,6 +33,7 @@
 		| 'error'
 	>('idle');
 
+	const finishLocked = $derived(status === 'finishing' || status === 'created');
 	const passkeysSupported =
 		typeof window !== 'undefined' &&
 		typeof window.PublicKeyCredential !== 'undefined';
@@ -103,7 +104,7 @@
 		if (
 			attempt.signal.aborted ||
 			pending === null ||
-			status === 'finishing' ||
+			finishLocked ||
 			magicCode.trim().length === 0
 		) return;
 		status = 'finishing';
@@ -147,10 +148,11 @@
 				attempt.signal
 			);
 			if (attempt.signal.aborted) return;
-			invalidateLibraryCache();
+			const purge = invalidateLibraryCache();
 			status = 'created';
 			stashSignedInEmail(email.trim());
-			window.location.href = '/account/billing';
+			await purge;
+			if (!attempt.signal.aborted) window.location.href = '/account/billing';
 		} catch (error) {
 			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {
@@ -219,7 +221,7 @@
 					aria-invalid={status === 'code-error'}
 					aria-describedby={`signup-code-guidance${status === 'code-error' ? ' signup-code-error' : status === 'dismissed' ? ' signup-dismissal' : ''}`}
 					bind:value={magicCode}
-					disabled={status === 'finishing'}
+					disabled={finishLocked}
 				/>
 			</label>
 			<label>
@@ -230,10 +232,10 @@
 					autocomplete="off"
 					aria-describedby={status === 'code-error' ? 'signup-code-error' : undefined}
 					bind:value={inviteCode}
-					disabled={status === 'finishing'}
+					disabled={finishLocked}
 				/>
 			</label>
-			<button class="nt-button" type="submit" disabled={status === 'finishing'}>
+			<button class="nt-button" type="submit" disabled={finishLocked}>
 				{status === 'finishing' ? 'Creating…' : 'Finish creating account'}
 			</button>
 		</form>

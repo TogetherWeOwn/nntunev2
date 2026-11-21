@@ -18,6 +18,12 @@ use self::schedule::Schedule;
 mod connection;
 mod schedule;
 
+#[cfg(all(
+    feature = "billing-owned-wasm-test",
+    not(feature = "staging-body-wasm-test")
+))]
+pub(crate) use connection::test_connect_deadline;
+
 fn var(env: &Env, name: &str) -> Option<String> {
     env.var(name).ok().map(|value| value.to_string())
 }
