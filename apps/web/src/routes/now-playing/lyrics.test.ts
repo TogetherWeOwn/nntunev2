@@ -54,12 +54,16 @@ it('omits Lyrics without a matching non-empty result', () => {
 
 it('renders supplied lines in order as text in a closed native disclosure', () => {
 	const { body } = draw();
-	const html = body(supplied('first', 'Paper moon', '', '<em>Blue signal</em>', 'Last mirror'));
-	expect(html).toMatch(/<summary\b[^>]*>Lyrics<\/summary>/);
-	expect(html).not.toMatch(/<details\b[^>]*\sopen\b/);
-	expect(Array.from(html.matchAll(/<li\b[^>]*>(.*?)<\/li>/g), ([, text]) => text)).toEqual([
+	const html = body(
+		supplied('first', 'Paper moon', '', '<em>Blue signal\nNorth window</em>', 'Last mirror')
+	);
+	const [, attributes = '', content = ''] = html.match(/<details\b([^>]*)>(.*?)<\/details>/s) ?? [];
+	expect(attributes).not.toMatch(/\sopen\b/);
+	expect(content).toMatch(/<summary\b[^>]*>Lyrics<\/summary>/);
+	const list = content.match(/<ol\b[^>]*>(.*?)<\/ol>/s)?.[1] ?? '';
+	expect(Array.from(list.matchAll(/<li\b[^>]*>(.*?)<\/li>/gs), ([, text]) => text)).toEqual([
 		'Paper moon',
-		expect.stringMatching(/^&lt;em(?:>|&gt;)Blue signal&lt;\/em(?:>|&gt;)$/),
+		expect.stringMatching(/^&lt;em(?:>|&gt;)Blue signal\nNorth window&lt;\/em(?:>|&gt;)$/),
 		'Last mirror'
 	]);
 	expect(html).not.toContain('<em>');
