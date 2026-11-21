@@ -34,7 +34,7 @@
 		saveRecentFinds
 	} from '#lib/library/recent-finds.js';
 	import { moveFavoriteId, type FavoriteMoveDirection } from '#lib/library/favorites-order.js';
-	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import { createLibraryRefresher, type LibraryRefreshUpdate } from '#lib/library/refresh.js';
 	import {
 		displayArtist,
 		displayTitle,
@@ -95,6 +95,8 @@
 	let collectionFilter = $state<CollectionFilter | 'tracks'>('tracks');
 	const showingTracks = $derived(collectionFilter === 'tracks');
 	let collectionsAccessRevoked = $state(false);
+	let collectionReceipt = $state<LibraryRefreshUpdate['runIfCurrent']>();
+	const showRecovery = $derived(showingTracks || !collectionReceipt);
 
 	function readStoredDensity(): Density {
 		try {
@@ -327,9 +329,10 @@
 			resetRecentFinds();
 			invalidateLibraryCache();
 		},
-		onStateChange: (state, { isCurrent, authoritative, authBoundary }) => {
+		onStateChange: (state, { isCurrent, authoritative, authBoundary, runIfCurrent }) => {
 			if (!isCurrent()) return;
-			if (authBoundary || (authoritative && !state.libraryUnavailable)) collectionsAccessRevoked = !!authBoundary;
+			collectionReceipt = runIfCurrent;
+			collectionsAccessRevoked = authBoundary;
 			// Refreshed/auth-boundary snapshots invalidate captured intents.
 			trackMenu = null;
 			endTrackDrag();
@@ -1546,8 +1549,15 @@
 				onclick={() => { collectionFilter = type; }}>{label}</button>
 		{/each}
 	</div>
-	{#if collectionFilter !== 'tracks'}
-		<CollectionBrowser filter={collectionFilter} accessRevoked={collectionsAccessRevoked} />
+	{#if collectionFilter !== 'tracks' && (collectionReceipt || collectionsAccessRevoked)}
+		<CollectionBrowser filter={collectionFilter} accessRevoked={collectionsAccessRevoked}
+			runIfCurrent={collectionReceipt} reverify={refreshFromButton} />
+	{:else if !showingTracks && (loading ? items.length > 0 : libraryUnavailable || staleAt)}
+		{#if loading}
+			<p role="status">Loading your library…</p>
+		{:else}
+			<p role="status">Library listing is not available yet.</p>
+		{/if}
 	{/if}
 
 	{#if shareInvalid}
@@ -1593,16 +1603,16 @@
 {/snippet}
 
 	{#if loading && items.length === 0}
-		<p role="status" hidden={!showingTracks}>Loading your library…</p>
+		<p role="status" hidden={!showRecovery}>Loading your library…</p>
 	{:else if loadError && items.length === 0}
-		<p role="alert" hidden={!showingTracks}>{loadError}</p>
+		<p role="alert" hidden={!showRecovery}>{loadError}</p>
 		{#if requiresSignIn}
 			<a class="nt-button" href="/login" hidden={!showingTracks}>Sign in</a>
 		{/if}
 		<button
 			class="nt-button"
 			type="button"
-			hidden={!showingTracks}
+			hidden={!showRecovery}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>
@@ -2017,11 +2027,11 @@
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
-			hidden={!showingTracks}
+			hidden={!showingTracks && (!showRecovery || loading)}
 			bind:this={refreshButton}
 			onclick={() => void refreshFromButton()}
 		>
-			{staleAt ? 'Retry' : 'Refresh'}
+			{staleAt || (!showingTracks && libraryUnavailable) ? 'Retry' : 'Refresh'}
 		</button>
 	{/if}
 
