@@ -53,6 +53,24 @@ CROSS JOIN LATERAL public.digest_claim_statement(c.environment_id, c.library_id,
 WHERE c.object_id = ('21000000-0000-4000-8000-' || lpad(n::text,12,'0'))::uuid
 $$;
 
+CREATE FUNCTION public.digest_read_statement(UUID, UUID, BYTEA, BIGINT, UUID, UUID, UUID, UUID, TIMESTAMPTZ, UUID, TIMESTAMPTZ)
+RETURNS TABLE (object_id UUID, generation_id UUID, provider_configuration_version_id UUID,
+               map_id UUID, root_version_id UUID, media_version TEXT, page_versions TEXT[], usable_until TIMESTAMPTZ)
+LANGUAGE sql VOLATILE AS :'storage_digest_read_lookup_sql';
+
+CREATE FUNCTION public.digest_read_lookup_fixture(n int, deadline timestamptz)
+RETURNS TABLE (object_id UUID, media_version TEXT, page_versions TEXT[])
+LANGUAGE sql VOLATILE AS $$
+SELECT b.object_id, b.media_version, b.page_versions
+FROM public.storage_plaintext_digest_claim_intents c
+JOIN public.storage_object_intents i USING (object_id)
+JOIN public.storage_object_envelope_intents e USING (object_id)
+CROSS JOIN LATERAL public.digest_read_statement(c.environment_id, c.library_id, c.plaintext_sha256,
+    c.plaintext_bytes, c.object_id, i.generation_id, e.root_version_id, c.object_id,
+    deadline, i.provider_configuration_version_id, deadline) b
+WHERE c.object_id = ('21000000-0000-4000-8000-' || lpad(n::text,12,'0'))::uuid
+$$;
+
 DO $$ DECLARE field text; BEGIN
     FOREACH field IN ARRAY ARRAY['environment','library','digest','size','generation','revision','expired'] LOOP
         IF public.digest_ref_fixture(1,false,field) IS DISTINCT FROM false THEN RAISE EXCEPTION 'attach accepted %', field; END IF;
