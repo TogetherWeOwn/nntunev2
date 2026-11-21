@@ -244,6 +244,21 @@ export interface CredentialsList {
 	credentials: ListedCredential[];
 }
 
+export type InviteWindowSchedule = { starts_at: number; ends_at: number; note: string | null };
+export type InviteWindow = InviteWindowSchedule & { id: number };
+export const INVITE_WINDOW_LIMIT = 200;
+const INVITE_WINDOWS = '/v1/admin/invite-windows';
+const isEpoch = (value: unknown): value is number =>
+	typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 8_640_000_000_000;
+function isInviteWindow(value: unknown): value is InviteWindow {
+	const row = value as Partial<InviteWindow> | null;
+	return typeof row?.id === 'number' && Number.isSafeInteger(row.id) && row.id > 0 &&
+		isEpoch(row.starts_at) && isEpoch(row.ends_at) && row.ends_at >= row.starts_at &&
+		(row.note === null || typeof row.note === 'string');
+}
+const invalidInviteWindows = (status: number) =>
+	new ApiError(status, 'request_failed', 'Invalid invite window response', null, false);
+
 export interface IssuedMemberInvite {
 	code: string;
 	expires_at: number;
@@ -344,6 +359,33 @@ export class ApiClient {
 		return (await this.requestWithStatus<{ ok: true }>(REVOKE_ALL, {
 			method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
 		}, expected)).data;
+	}
+
+	async listInviteWindows(signal: AbortSignal): Promise<InviteWindow[]> {
+		const { data, status } = await this.requestWithStatus<{ windows?: unknown } | null>(
+			INVITE_WINDOWS, { method: 'GET', cache: 'no-store', redirect: 'error', signal }
+		);
+		const rows = data?.windows;
+		if (status !== 200 || !Array.isArray(rows) || rows.length > INVITE_WINDOW_LIMIT ||
+			!rows.every(isInviteWindow) || new Set(rows.map(({ id }) => id)).size !== rows.length) {
+			throw invalidInviteWindows(status);
+		}
+		return rows.map(({ id, starts_at, ends_at, note }) => ({ id, starts_at, ends_at, note }));
+	}
+
+	/** The Worker enforces admin role, Origin and fresh-session checks on every write. */
+	async writeInviteWindow(input: InviteWindowSchedule | number, signal: AbortSignal): Promise<InviteWindow> {
+		const close = typeof input === 'number';
+		const { data, status } = await this.requestWithStatus<{ window?: unknown } | null>(
+			close ? `${INVITE_WINDOWS}/${input}/close` : INVITE_WINDOWS,
+			{ method: 'POST', cache: 'no-store', redirect: 'error', signal,
+				...(close ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }) }
+		);
+		const row = data?.window;
+		if (status !== (close ? 200 : 201) || !isInviteWindow(row) || (close && row.id !== input)) {
+			throw invalidInviteWindows(status);
+		}
+		return row;
 	}
 
 	/** Spend one invite from the browser session's current window. Do not retry automatically. */
