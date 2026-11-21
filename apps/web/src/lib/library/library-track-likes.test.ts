@@ -103,9 +103,9 @@ it('uses explicit Hide over conflicting Likes and explicit Love outside a full L
 	fetcher.mockResolvedValueOnce(Response.json({ ...target, cleared: true, session_binding: A })).mockResolvedValueOnce(session(A));
 	await likes.controls(track)!.taste!.set(null);
 	expect(likes.controls(track)).toMatchObject({ liked: false, taste: { saved: undefined } });
-	fetcher.mockResolvedValueOnce(Response.json({ target_id: loved, liked: false }));
-	await likes.controls(loved)!.toggle();
-	expect(likes.controls(loved)).toMatchObject({ liked: false, taste: { saved: undefined } });
+	fetcher.mockResolvedValueOnce(Response.json({ target_id: omitted, liked: false }));
+	await likes.controls(omitted)!.toggle();
+	expect(likes.controls(omitted)).toMatchObject({ liked: false, taste: { saved: undefined } });
 });
 
 it('withholds taste data from a mismatched read without changing verified Likes', async () => {
