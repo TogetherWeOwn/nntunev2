@@ -433,11 +433,14 @@ test('live revoke-all 401 keeps the explicit not-revoked notice and sign-in link
 	const observed = await fixtures(page, action);
 	await begin(page, action);
 	await release(page, action, 401);
+	const retry = page.getByRole('button', { name: action.button });
+	await Promise.all([page.waitForEvent('dialog').then((dialog) => dialog.dismiss()), retry.click()]);
+	await expect(retry).toBeEnabled();
+	expect(await page.evaluate(() => window.__abandonment.requests.length)).toBe(1);
 	const alert = page.getByRole('alert');
 	await expect(alert).toContainText(/session expired before other devices were signed out/i);
 	await expect(alert.getByRole('link', { name: /sign in again/i })).toHaveAttribute('href', '/login');
 	expect(observed.pageErrors).toEqual([]);
-	await expect(page.getByRole('button', { name: action.button })).toBeEnabled();
 	expect(new URL(page.url()).pathname).toBe('/account/security');
 	expect(await storedState(page)).toEqual({
 		areas: [{ context: null, scoped: null, legacy: null }, { context: null, scoped: null, legacy: null }], email: null

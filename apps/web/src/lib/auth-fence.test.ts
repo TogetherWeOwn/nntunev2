@@ -7,21 +7,18 @@ const full = () => new DOMException('Storage full', 'QuotaExceededError');
 const fail = (error: () => Error) => () => { throw error(); };
 const exclusive = expect.objectContaining({ name: AUTH_LOCK, mode: 'exclusive' });
 const ok = () => Response.json({});
-
 function setup() {
 	const entries: Record<string, string> = Object.create(null);
 	const write = (key: string, value: string) => void Reflect.set(entries, key, value);
 	const remove = (key: string) => void Reflect.deleteProperty(entries, key);
-	const getItem = (key: string) => entries[key] ?? null;
-	const localStorage = Object.assign(entries, { getItem, setItem: vi.fn(write), removeItem: vi.fn(remove) });
-	vi.stubGlobal('window', { localStorage });
+	const setItem = vi.fn(write), removeItem = vi.fn(remove);
+	vi.stubGlobal('window', { localStorage: Object.assign(entries, { setItem, removeItem, getItem: (key: string) => entries[key] ?? null }) });
 	const names = new Set<string>();
 	vi.stubGlobal('caches', {
-		keys: async () => [...names], open: async (name: string) => names.add(name),
-		delete: async (name: string) => names.delete(name)
+		keys: async () => [...names], open: async (name: string) => names.add(name), delete: async (name: string) => names.delete(name)
 	});
 	const send = vi.fn(async () => ok());
-	return { read: () => getItem(AUTH_GENERATION_KEY), ...localStorage, write, remove, send, api: new ApiClient({ baseUrl: '', fetchFn: send }) };
+	return { read: () => entries[AUTH_GENERATION_KEY] ?? null, setItem, removeItem, write, remove, send, api: new ApiClient({ baseUrl: '', fetchFn: send }) };
 }
 
 async function startWriter(lockDenied = false) {
@@ -51,18 +48,16 @@ it('shares the read lock, queues logout and recovers after storage errors', asyn
 	const initial = read();
 	expect(setItem).toHaveBeenCalledExactlyOnceWith(AUTH_GENERATION_KEY, initial);
 	let logout: Promise<void> | undefined;
-	try {
-		await first!.run(async () => {
-			expect(await second!.run(() => true)).toBe(true);
-			setItem.mockImplementation(fail(full));
-			logout = api.logout();
-			expect((await navigator.locks.query()).pending).toContainEqual(exclusive);
-			expect(send).not.toHaveBeenCalled();
-			expect(first!.isCurrent()).toBe(false);
-		});
-	} finally {
-		await logout;
-	}
+	const shared = await first!.run(async () => {
+		expect(await second!.run(() => true)).toBe(true);
+		setItem.mockImplementation(fail(full));
+		logout = api.logout();
+		expect((await navigator.locks.query()).pending).toContainEqual(exclusive);
+		expect(send).not.toHaveBeenCalled();
+		return !first!.isCurrent();
+	});
+	await logout;
+	expect(shared).toBe(true);
 	expect(send).toHaveBeenCalledTimes(1);
 	expect(read()).toBeNull();
 	setItem.mockImplementation(write);
@@ -70,7 +65,6 @@ it('shares the read lock, queues logout and recovers after storage errors', asyn
 	expect(read()).not.toBe(initial);
 	expect(await first!.run(() => true)).toBeUndefined();
 });
-
 it.each(['local', 'cache'])('withholds receipts on %s read denial, not logout', async (store) => {
 	const { send, api } = setup();
 	const before = (await captureAuthFence())!;
@@ -81,7 +75,6 @@ it.each(['local', 'cache'])('withholds receipts on %s read denial, not logout', 
 	await api.logout();
 	expect(send).toHaveBeenCalledTimes(1);
 });
-
 it.each(['local', 'cache', 'lock retry'])('withholds cross-tab receipts via %s', async (guard) => {
 	const { setItem, write } = setup();
 	if (guard !== 'local') setItem.mockImplementation(fail(full));
@@ -100,7 +93,6 @@ it.each(['local', 'cache', 'lock retry'])('withholds cross-tab receipts via %s',
 	}
 	expect((await captureAuthFence())?.isCurrent()).toBe(true);
 });
-
 it.each([true, false])('guards locked writes on generation failure (recovers: %s)', async (recovers) => {
 	const { setItem, write, removeItem, remove } = setup();
 	const before = (await captureAuthFence())!;
@@ -113,7 +105,6 @@ it.each([true, false])('guards locked writes on generation failure (recovers: %s
 	expect(await before.run(() => true)).toBeUndefined();
 	expect((await captureAuthFence())?.isCurrent()).toBe(recovers ? true : undefined);
 });
-
 it.each(['open', 'delete'] as const)('does not wait beyond the auth deadline for cache %s', async (op) => {
 	const { setItem, api, send } = setup();
 	vi.useFakeTimers();
@@ -134,7 +125,6 @@ it.each(['open', 'delete'] as const)('does not wait beyond the auth deadline for
 	expect(send).toHaveBeenCalledTimes(op === 'open' ? 0 : 1);
 	expect(await caches.keys()).toHaveLength(0);
 });
-
 it.each(['', '?source=settings'])('fences sign-in and does not retry after dispatch (%s)', async (suffix) => {
 	const { api, send } = setup();
 	send.mockImplementationOnce(async () => {
@@ -144,7 +134,6 @@ it.each(['', '?source=settings'])('fences sign-in and does not retry after dispa
 	await expect(api.post(`/v1/auth/magic/finish${suffix}`, {})).rejects.toThrow('network');
 	expect(send).toHaveBeenCalledTimes(1);
 });
-
 it.each(['busy', 'changed', 'missing', 'unchanged', 'cancelled'])('checks revocation at admission (%s)', async (state) => {
 	const { api, send, read, write, remove } = setup();
 	const unlock = Promise.withResolvers<void>(), confirmed = Promise.withResolvers<void>();
@@ -171,7 +160,6 @@ it.each(['busy', 'changed', 'missing', 'unchanged', 'cancelled'])('checks revoca
 		await Promise.all([writer, result]);
 	}
 });
-
 it.each([0, 1])('releases the shared lock when cache enumeration %i stalls', async (check) => {
 	const { api, send } = setup();
 	vi.useFakeTimers();

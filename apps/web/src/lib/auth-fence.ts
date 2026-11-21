@@ -15,7 +15,6 @@ function generation(): string | null {
 }
 
 const pendingMarker = (key: string) => key.startsWith(PENDING_PREFIX);
-
 function receiptsBlocked(): boolean {
 	try {
 		return Object.keys(window.localStorage).some(pendingMarker);

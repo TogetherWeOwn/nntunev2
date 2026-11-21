@@ -69,10 +69,14 @@
 	async function signOutEverywhere() {
 		if (!alive || busy !== null) return;
 		busy = 'everywhere';
-		actionError = null;
-		revokeIncomplete = false;
 		try {
-			if (!(await client.revokeAllSessions(() => alive && window.confirm('Sign out on every device?')))) {
+			const revoked = await client.revokeAllSessions(() => {
+				if (!alive || !window.confirm('Sign out on every device?')) return false;
+				actionError = null;
+				revokeIncomplete = false;
+				return true;
+			});
+			if (!revoked) {
 				busy = null;
 				return;
 			}
