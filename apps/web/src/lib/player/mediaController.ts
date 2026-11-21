@@ -414,8 +414,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const replacing = currentTrack(base)?.id !== track?.id || source !== streamUrl;
 		const { playbackRate } = audio;
 		if (!ownsOrigin()) return;
-		// Capture readback before replacement even if the native event is still queued.
-		sound.observe();
+		// Queue commit captures sound for replacements; replay keeps this attachment.
+		if (!replacing) sound.observe();
 		if (!ownsOrigin()) return;
 		// Replay supersedes a deferred share even when the native source survives.
 		browseCopy.invalidate();
@@ -455,6 +455,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	return {
 		repeat: { subscribe: repeat.subscribe },
 		sound: { state: sound.state, setVolume: sound.setVolume, toggleMute: sound.toggleMute },
+		observeSound: sound.observe,
 		seekFeedback: { subscribe: seekFeedback.subscribe },
 		playbackStatus: { subscribe: playbackStatus.subscribe }, playCurrent, pauseCurrent,
 		clearSeekFeedback,

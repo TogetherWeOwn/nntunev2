@@ -6,11 +6,12 @@ import { SOUND_PREFERENCE_STORAGE_KEY } from './soundPreference.js';
 class Audio extends EventTarget {
 	level = 1;
 	muted = false;
-	mode: 'accept' | 'ignore' | 'throw' = 'accept';
+	mode: 'accept' | 'ignore' | 'throw' | 'clamp' = 'accept';
 	get volume() { return this.level; }
 	set volume(value: number) {
 		if (this.mode === 'throw') throw new Error('System volume only');
 		if (this.mode === 'accept') this.level = value;
+		if (this.mode === 'clamp') this.level = Math.max(0.5, value);
 	}
 	changed() { this.dispatchEvent(new Event('volumechange')); }
 }
@@ -67,6 +68,25 @@ describe('persistent native sound', () => {
 		connect(replacement);
 		expect(replacement.volume).toBe(0.35);
 		expect(read()).toMatchObject({ volume: 0.35, muted: false, restricted: true });
+	});
+
+	it('reports a clamped volume without replacing the saved choice', () => {
+		const { storage, sound, connect, read } = setup(stored(0.8, false));
+		const audio = new Audio();
+		audio.mode = 'clamp';
+		const old = connect(audio);
+		expect(sound.setVolume(0.35)).toBe(0.5);
+		expect(read()).toMatchObject({ volume: 0.5, muted: false, restricted: true });
+		audio.changed();
+		expect(storage.setItem).not.toHaveBeenCalled();
+		sound.toggleMute();
+		expect(read()).toMatchObject({ volume: 0.5, muted: true, restricted: true });
+		expect(storage.setItem).toHaveBeenCalledExactlyOnceWith(SOUND_PREFERENCE_STORAGE_KEY, stored(0.8, true));
+		old.abort();
+		const replacement = new Audio();
+		connect(replacement);
+		expect(replacement.volume).toBe(0.8);
+		expect(replacement.muted).toBe(true);
 	});
 
 	it('fences stale events and callbacks around retirement and replacement, even with denied storage', () => {

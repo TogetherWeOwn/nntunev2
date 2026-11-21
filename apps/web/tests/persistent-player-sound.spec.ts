@@ -25,6 +25,10 @@ test('keyboard and native sound stay in sync across routes, replacement and relo
 	const { audio, volume, mute } = await openLibrary(page);
 	await expect(volume).toHaveValue('100');
 	await volume.press('Home');
+	await expect(audio).toHaveJSProperty('volume', 0);
+	await volume.press('End');
+	await expect(audio).toHaveJSProperty('volume', 1);
+	await volume.press('Home');
 	await volume.press('ArrowRight');
 	await mute.press('Space');
 	await expect(audio).toHaveJSProperty('volume', 0.01);
@@ -46,15 +50,20 @@ test('keyboard and native sound stay in sync across routes, replacement and relo
 	expect(await old.evaluate((node) => node === document.querySelector('[data-testid="audio-player"]'))).toBe(true);
 
 	await page.getByTestId('library-item').filter({ hasText: 'Sound B' }).click();
-	await page.getByTestId('player-next').click();
+	await audio.evaluate((node: HTMLAudioElement) => {
+		node.volume = 0.37;
+		node.muted = false;
+		// Retire this element before its queued volumechange event can run.
+		document.querySelector<HTMLButtonElement>('[data-testid="player-next"]')!.click();
+	});
 	await expect(page.getByTestId('now-playing')).toContainText('Sound B');
-	await expect(audio).toHaveJSProperty('volume', 0.42);
-	await expect(audio).toHaveJSProperty('muted', true);
+	await expect(audio).toHaveJSProperty('volume', 0.37);
+	await expect(audio).toHaveJSProperty('muted', false);
 	expect(await old.evaluate((node) => node.isConnected)).toBe(false);
 	await page.reload();
 	await page.getByTestId('library-item').filter({ hasText: 'Sound A' }).click();
-	await expect(volume).toHaveValue('42');
-	await expect(mute).toHaveAttribute('aria-pressed', 'true');
+	await expect(volume).toHaveValue('37');
+	await expect(mute).toHaveAttribute('aria-pressed', 'false');
 });
 
 test('restricted volume falls back to system controls and auth purge fences the outgoing audio', async ({ page }) => {

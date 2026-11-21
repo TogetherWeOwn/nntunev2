@@ -28,11 +28,12 @@ export function createNativeSound(
 		if (!target.owns()) return;
 		const volumeChanged = observed.volume !== actual.volume;
 		const muteChanged = observed.muted !== actual.muted;
-		// Failed restores or setup events must not replace a saved choice. Persist
-		// only fields that actually changed under the live attachment.
-		if (volumeChanged || muteChanged) {
+		// Publish clamped readback, but don't save it as an accepted request.
+		// Native changes can still persist independently of the sticky fallback UI.
+		const saveVolume = volumeChanged && !observed.restricted;
+		if (saveVolume || muteChanged) {
 			preference = {
-				volume: volumeChanged ? observed.volume : preference.volume,
+				volume: saveVolume ? observed.volume : preference.volume,
 				muted: muteChanged ? observed.muted : preference.muted
 			};
 			saveSoundPreference(getStorage(), preference);
