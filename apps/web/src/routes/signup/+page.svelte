@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { onDestroy, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { afterNavigate, goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { invalidateLibraryCache } from '#lib/library/cache.js';
-	import { ApiClient, ApiError, type RegisterStartResponse } from '#lib/api/client.js';
+	import { ApiClient, ApiError, isMemberInviteCode, type RegisterStartResponse } from '#lib/api/client.js';
 	import { stashSignedInEmail } from '#lib/signed-in-email.js';
 	import {
 		serializePublicKeyCredential,
@@ -37,6 +39,28 @@
 	const passkeysSupported =
 		typeof window !== 'undefined' &&
 		typeof window.PublicKeyCredential !== 'undefined';
+
+	async function captureInvite() {
+		const url = new URL(window.location.href);
+		const params = new URLSearchParams(url.hash.slice(1));
+		if (!params.has('invite')) return;
+		const codes = params.getAll('invite');
+		// A shallow replace retains the old URL in router history state. Use a
+		// regular same-route replacement so neither the address nor state keeps it.
+		url.hash = '';
+		try {
+			await goto(url, { replace: true, reset: false, state: { ...page.state } });
+		} catch {
+			return;
+		}
+		// The invite is used only at registration finish, not when sending the email code.
+		if (!attempt.signal.aborted && window.location.href === url.href &&
+			!finishLocked && codes.length === 1 && isMemberInviteCode(codes[0])) {
+			inviteCode = codes[0];
+		}
+	}
+
+	afterNavigate(() => { void captureInvite(); });
 
 	async function startAccount(event: SubmitEvent) {
 		event.preventDefault();
@@ -175,6 +199,8 @@
 	}
 </script>
 
+<svelte:window onhashchange={captureInvite} />
+
 <svelte:head>
 	<title>NNTune — get started</title>
 	<meta name="description" content="Create your NNTune account, then choose an account plan." />
@@ -240,6 +266,7 @@
 			</button>
 		</form>
 	{:else}
+		{#if inviteCode}<p role="status">Invite link added. Enter your email to get started.</p>{/if}
 		<form onsubmit={startAccount}>
 			<label>
 				Email

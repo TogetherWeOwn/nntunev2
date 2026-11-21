@@ -33,8 +33,8 @@ use crate::auth::{
 use crate::handlers::{
     self, AdminInviteIssueOutcome, AdminInviteRevokeOutcome, AdminWriteOutcome, AsyncDns,
     ChallengeRow, Config, Dialer, InviteWindow, InviteWindowOutcome, InviteWindowWrite, Mailer,
-    NativeCredentialRow, PairAdmission, PlanRow, QaIssuedCode, RateLimitBudget, Store, StoreError,
-    SubscriptionRow, UserRecord,
+    MemberInviteIssueOutcome, NativeCredentialRow, PairAdmission, PlanRow, QaIssuedCode,
+    RateLimitBudget, Store, StoreError, SubscriptionRow, UserRecord,
 };
 #[allow(dead_code)] // Prepared for the separately qualified owned billing transport.
 #[path = "billing_budget.rs"]
@@ -2964,6 +2964,136 @@ async fn admin_issue_invite_on(
     Ok(AdminInviteIssueOutcome::Issued(invite_id))
 }
 
+impl From<tokio_postgres::Error> for StoreError {
+    fn from(_: tokio_postgres::Error) -> Self {
+        StoreError
+    }
+}
+
+async fn member_issue_invite_on(
+    client: &mut tokio_postgres::Client,
+    issuer: &str,
+    code_hash: &str,
+    source_ip: &str,
+) -> Result<MemberInviteIssueOutcome, StoreError> {
+    use crate::admin::SettingKey;
+    use MemberInviteIssueOutcome as Outcome;
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .start()
+        .await?;
+    tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+        .await?;
+    // Serialize spending and fence erasure without blocking FK checks.
+    let issuer_lock =
+        "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR NO KEY UPDATE";
+    use tokio_postgres::types::ToSql;
+    let member: [(&(dyn ToSql + Sync), Type); 1] = [(&issuer, Type::TEXT)];
+    if tx.query_typed_opt(issuer_lock, &member).await?.is_none() {
+        return Ok(Outcome::AccountDeleting);
+    }
+    // Shared locks fence early close and billing updates without serializing issuers.
+    let live = crate::billing::subscription_live_select_statement();
+    let sql = format!("WITH open_window AS (
+          SELECT id, starts_at, ends_at FROM invite_windows
+          WHERE int8range(starts_at, ends_at, '[)') @> floor(extract(epoch FROM statement_timestamp()))::bigint FOR SHARE
+        ), entitlement AS ({live} FOR SHARE)
+        SELECT w.*, e.*,
+          (SELECT value FROM app_settings WHERE key = 'invite_member_min_paid_months' FOR SHARE) AS invite_member_min_paid_months,
+          (SELECT value FROM app_settings WHERE key = 'invite_member_per_window' FOR SHARE) AS invite_member_per_window,
+          (SELECT value FROM app_settings WHERE key = 'invite_default_expiry_days' FOR SHARE) AS invite_default_expiry_days
+        FROM open_window w LEFT JOIN entitlement e ON TRUE");
+    let Some(gate) = tx.query_typed_opt(&sql, &member).await? else {
+        return Ok(Outcome::WindowClosed);
+    };
+    let Some(plan_id) = gate.try_get("plan_id")? else {
+        return Ok(Outcome::Ineligible);
+    };
+    let setting = |key: SettingKey| {
+        key.resolve(gate.try_get(key.as_str())?)
+            .map(i64::from)
+            .ok_or(StoreError)
+    };
+    let window_id: i64 = gate.try_get("id")?;
+    let cap = setting(SettingKey::InviteMemberPerWindow)?;
+    // NULL coverage is unknown. Union exact periods across all paid invoices.
+    let threshold = setting(SettingKey::InviteMemberMinPaidMonths)? * 30 * 86_400;
+    let policy = tx
+        .query_typed_one(
+            "SELECT CASE
+           WHEN $3 = 0 OR EXISTS (SELECT 1 FROM invite_codes WHERE window_id = $1
+             AND issued_by = $2 OFFSET greatest($3 - 1, 0) LIMIT 1) THEN 'quota'
+           WHEN $4 > 0 AND (SELECT COALESCE(sum(extract(epoch FROM upper(span) - lower(span))), 0)
+             FROM unnest((SELECT range_agg(covered_periods) FROM paid_invoice_history
+               WHERE user_id = $2 AND amount_cents > 0 AND paid_at <= statement_timestamp())) AS span) < $4 THEN 'history' END, floor(extract(epoch FROM clock_timestamp()))::bigint",
+            &[
+                (&window_id, Type::INT8),
+                (&issuer, Type::TEXT),
+                (&cap, Type::INT8),
+                (&threshold, Type::INT8),
+            ],
+        )
+        .await?;
+    match policy.try_get(0)? {
+        Some("quota") => return Ok(Outcome::QuotaExhausted),
+        Some("history") => return Ok(Outcome::Ineligible),
+        None => (),
+        _ => return Err(StoreError),
+    }
+    let now: i64 = policy.try_get(1)?;
+    let starts_at: i64 = gate.try_get("starts_at")?;
+    let ends_at: i64 = gate.try_get("ends_at")?;
+    let view = crate::billing::SubscriptionView {
+        plan_id,
+        status: gate.try_get("status")?,
+        cancel_at_period_end: gate.try_get("cancel_at_period_end")?,
+        paid_through_at_unix: gate.try_get("paid_through_at_unix")?,
+        grace_until_unix: gate.try_get("grace_until_unix")?,
+        current_period_end_unix: None,
+    };
+    use crate::billing::resolve_effective_plan;
+    let refuse = |at| {
+        if !(starts_at..ends_at).contains(&at) {
+            return Some(Outcome::WindowClosed);
+        }
+        (!resolve_effective_plan(Some(view), at).entitled).then_some(Outcome::Ineligible)
+    };
+    if let Some(reason) = refuse(now) {
+        return Ok(reason);
+    }
+    let expires_at = ends_at.min(now + setting(SettingKey::InviteDefaultExpiryDays)? * 86_400);
+    let ip = crate::vault::sanitize_source_ip(Some(source_ip));
+    let id = tx
+        .query_typed_one(
+            "WITH issued AS (
+           INSERT INTO invite_codes (code_hash, created_at, issued_by, kind, expires_at, window_id)
+           VALUES ($1, $2, $3, 'member', $4, $5) RETURNING id
+         ) INSERT INTO audit_log (user_id, action, ok, source_ip, at, details)
+          SELECT $3, 'invite.issued', TRUE, $6, $2, jsonb_build_object('invite_id', id, 'kind', 'member', 'window_id', $5)
+         FROM issued RETURNING (details->>'invite_id')::bigint",
+            &[
+                (&code_hash, Type::TEXT),
+                (&now, Type::INT8),
+                (&issuer, Type::TEXT),
+                (&expires_at, Type::INT8),
+                (&window_id, Type::INT8),
+                (&ip, Type::TEXT),
+            ],
+        )
+        .await?
+        .try_get(0)?;
+    // Writes can wait on locks. Check against the live DB clock before commit.
+    let clock = "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint";
+    let after = tx.query_typed_one(clock, &[]).await?;
+    if let Some(reason) = refuse(after.try_get(0)?) {
+        tx.rollback().await?;
+        return Ok(reason);
+    }
+    tx.commit().await?;
+    Ok(Outcome::Issued { id, expires_at })
+}
+
 /// Admin invite revoke (migration 0033): the conditional UPDATE and
 /// its `invite.revoked` audit row commit together. The invite row is
 /// locked first, so a redemption claim executing concurrently either
@@ -5661,6 +5791,7 @@ impl Store for PgStore {
                     .await
                     .map_err(|_| failed())?;
                 for history in &outcome.history {
+                    let (starts, ends) = history.coverage_bounds();
                     transaction
                         .query_typed(
                             crate::billing_reconcile::insert_paid_invoice_history_statement(),
@@ -5674,6 +5805,8 @@ impl Store for PgStore {
                                 (&history.amount_cents, Type::INT8),
                                 (&history.currency, Type::TEXT),
                                 (&history.paid_at_unix, Type::INT8),
+                                (&starts, Type::INT8_ARRAY),
+                                (&ends, Type::INT8_ARRAY),
                             ],
                         )
                         .await
@@ -6156,6 +6289,22 @@ impl Store for PgStore {
             async {
                 let mut client = self.connect().await?;
                 admin_issue_invite_on(&mut client, actor_user_id, record, source_ip, now).await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn member_issue_invite(
+        &self,
+        issuer: &str,
+        code_hash: &str,
+        source_ip: &str,
+    ) -> Result<MemberInviteIssueOutcome, StoreError> {
+        Self::bounded(
+            async {
+                member_issue_invite_on(&mut self.connect().await?, issuer, code_hash, source_ip)
+                    .await
             },
             TOTAL_TIMEOUT_MS,
         )

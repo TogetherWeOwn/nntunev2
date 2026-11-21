@@ -510,10 +510,7 @@ class WorkProjectionTest(ProjectionTestCase):
     def test_typed_and_untyped_works_match_streamed_gzip(self):
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
-        expected = (
-            "80808080-8080-4808-8808-808080808080\tA\\tSong\\\\N\tSong\\tSuite\t2025-02-03T04:05:06Z\n"
-            "10101010-1010-4010-8010-101010101010\tCafé\\nLive\t\\N\t2025-02-03T04:05:06Z\n"
-        ).encode()
+        expected = (ROOT / "tests" / "expected" / self.output).read_bytes()
         self.assertEqual((self.curated / self.output).read_bytes(), expected)
 
         members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
@@ -624,12 +621,7 @@ class RecordingWorkProjectionTest(ProjectionTestCase):
     def test_directed_typed_triples_are_deduplicated_and_match_streamed_gzip(self):
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
-        expected = (
-            b"88888888-8888-4888-8888-888888888888\t10101010-1010-4010-8010-101010101010\tperformance\t2025-02-03T04:05:06Z\n"
-            b"88888888-8888-4888-8888-888888888888\t80808080-8080-4808-8808-808080808080\tmedley\t2025-02-03T04:05:06Z\n"
-            b"88888888-8888-4888-8888-888888888888\t80808080-8080-4808-8808-808080808080\tperformance\t2025-02-03T04:05:06Z\n"
-            b"DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD\t80808080-8080-4808-8808-808080808080\tperformance\t2025-02-03T04:05:06Z\n"
-        )
+        expected = (ROOT / "tests" / "expected" / self.output).read_bytes()
         self.assertEqual((self.curated / self.output).read_bytes(), expected)
         for name in ("mbdump-recording_url.tsv", "mbdump-recording_music_video.tsv"):
             self.assertEqual((self.curated / name).read_bytes(), (ROOT / "tests" / "expected" / name).read_bytes())
@@ -832,18 +824,13 @@ class RecordingRecordingProjectionTest(ProjectionTestCase):
 
 
 class ArtistRelationProjectionTest(ProjectionTestCase):
-    timestamp = "2025-02-03T04:05:06Z"
     edge_tail = "\t0\t2025-01-01 00:00:00+00\t0\t\t\n"
 
     def setUp(self):
         super().setUp()
-        self.targets = {
-            "recording": (50, 51, "88888888-8888-4888-8888-888888888888", "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD"),
-            "release": (30, 31, "55555555-5555-4555-8555-555555555555", "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB"),
-            "work": (80, 81, "80808080-8080-4808-8808-808080808080", "10101010-1010-4010-8010-101010101010"),
-        }
+        self.targets = {"recording": (50, 51), "release": (30, 31), "work": (80, 81)}
         self.expected = {}
-        for index, (target, (first, second, gid1, gid2)) in enumerate(self.targets.items()):
+        for index, (target, (first, second)) in enumerate(self.targets.items()):
             link = 700 + 3 * index
             with (self.raw / "link").open("a") as links, (self.raw / "link_type").open("a") as types:
                 for offset, name in enumerate(("credit", r"\143redit", "arrangement")):
@@ -857,13 +844,8 @@ class ArtistRelationProjectionTest(ProjectionTestCase):
                 f"{key}\t{link_id}\t{artist}\t{entity}{self.edge_tail}"
                 for key, (link_id, artist, entity) in enumerate(edges, 1)
             ))
-            a1 = "11111111-1111-4111-8111-111111111111"
-            a2 = "22222222-2222-4222-8222-222222222222"
-            rows = [(a1, gid1, "arrangement"), (a1, gid1, r"\143redit"),
-                    (a1, gid2, "credit"), (a2, gid1, "credit")]
-            self.expected[target] = "".join(
-                "\t".join((*row, self.timestamp)) + "\n" for row in sorted(rows, key=lambda row: row[:2])
-            ).encode()
+            name = f"mbdump-artist_{target}.tsv"
+            self.expected[target] = (ROOT / "tests" / "expected" / name).read_bytes()
         # A sidecar-only link must not admit an otherwise orphaned URL edge.
         for table, entity in (("l_artist_url", 10), ("l_recording_url", 50)):
             with (self.raw / table).open("a") as rows:
@@ -1027,26 +1009,8 @@ class LabelProjectionTest(ProjectionTestCase):
         edges.write_bytes(edges.read_bytes() + f"11\t30\t71\t{boundary}\t\\N\n".encode())
         plain = self.run_etl(self.raw)
         self.assertEqual(plain.returncode, 0, plain.stderr)
-        ts = "2025-02-03T04:05:06Z"
-        quartz = "71717171-7171-4717-8717-717171717171"
-        untyped = "62626262-6262-4626-8626-626262626262"
-        first = "55555555-5555-4555-8555-555555555555"
-        second = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-        expected_labels = (
-            f"{quartz}\tQuartz\\tRecords\t12345\t{boundary}\t{ts}\n"
-            f"{untyped}\tUntyped Label\t\\N\t\\N\t{ts}\n"
-        )
-        expected_edges = (
-            f"{first}\t{untyped}\tCafé\\tDisc\\\\N\t{ts}\n"
-            f"{first}\t{quartz}\t\t{ts}\n"
-            f"{first}\t{quartz}\t QZ-1 \t{ts}\n"
-            f"{first}\t{quartz}\t qz-1 \t{ts}\n"
-            f"{first}\t{quartz}\t\\\\N\t{ts}\n"
-            f"{first}\t{quartz}\t{boundary}\t{ts}\n"
-            f"{second}\t{quartz}\t QZ-1 \t{ts}\n"
-        )
-        self.assertEqual((self.curated / "mbdump-label.tsv").read_bytes(), expected_labels.encode())
-        self.assertEqual((self.curated / "mbdump-release_label.tsv").read_bytes(), expected_edges.encode())
+        for name in ("mbdump-label.tsv", "mbdump-release_label.tsv"):
+            self.assertEqual((self.curated / name).read_bytes(), (ROOT / "tests" / "expected" / name).read_bytes())
 
         members = {f"mbdump/{p.name}": p.read_bytes() for p in self.raw.iterdir() if p.is_file()}
         tables = ("label", "label_type", "release_label")

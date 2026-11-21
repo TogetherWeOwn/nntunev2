@@ -1,16 +1,23 @@
 import { get, writable } from 'svelte/store';
+import { emptySeek, readAbsoluteSeek, writeAbsoluteSeek, type AbsoluteSeekState } from './absoluteSeek.js';
 import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
+import { createPlayerSleepTimer } from './playerSleepTimer.js';
 import { currentTrack, naturalEndPolicy, selectTrack, type QueueState, type RepeatMode } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
+import { createNativeSound } from './nativeSound.js';
 import { createPendingShareSeek } from './pendingShareSeek.js';
 import { restartIsAvailable } from './restartAvailability.js';
+import { bindSystemTransport } from './systemTransport.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
-export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean };
+export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean };
+export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error' | 'retrying';
 
-type QueueAuthority = Pick<ReturnType<typeof createQueueController>, 'snapshot' | 'revision' | 'revoke' | 'isCurrent' | 'purging'>;
+type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
+type QueueAuthority = Pick<ReturnType<typeof createQueueController>,
+	'snapshot' | 'subscribe' | 'revision' | 'revoke' | 'isCurrent' | 'purging'>;
 
 export type MediaSelection = {
 	commit: (queue: QueueState) => boolean;
@@ -44,9 +51,15 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
 	let attachmentVersion = 0;
 	let endGeneration = 0;
+	let playIntent = 0;
+	let pendingPlay: { result: Promise<PlayOutcome>; finish: (outcome: PlayOutcome) => void } | undefined;
+	const playbackStatus = writable<PlaybackStatus>('unavailable');
+	const sound = createNativeSound();
 	const repeat = writable<RepeatMode>('off');
 	const seekFeedback = writable({ restartCanSeek: false, restartStatus: '', restartStatusVersion: 0,
 		jumpStatus: '', jumpStatusVersion: 0 });
+	const absoluteSeek = writable<AbsoluteSeekState>(emptySeek);
+	let seekAnchor = 0;
 	let lastJumpTarget: number | undefined;
 	let destroyed = false;
 	let positionIntent = 0;
@@ -57,6 +70,111 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	function pause(audio: HTMLAudioElement | undefined): void {
 		if (audio && !audio.paused) audio.pause();
+	}
+
+	const selectedSource = () => resolveStreamUrl(currentTrack(queue.snapshot));
+	const sleepTimer = createPlayerSleepTimer(pauseCurrent, () => !destroyed && !queue.purging && !!selectedSource());
+
+	function settlePlay(outcome?: PlayOutcome): void {
+		pendingPlay?.finish(outcome);
+		pendingPlay = undefined;
+	}
+
+	function invalidatePlay(): void {
+		++playIntent;
+		settlePlay();
+	}
+
+	function readPlayback(
+		audio: HTMLAudioElement, matches: () => boolean, active: PlaybackStatus, stopped: PlaybackStatus = 'paused'
+	): PlaybackStatus | undefined {
+		const state = audio.error ? 'error' : audio.paused || audio.ended ? stopped : active;
+		if (!matches()) return;
+		playbackStatus.set(state);
+		return state;
+	}
+
+	function transportTarget() {
+		const attachment = current;
+		const source = selectedSource();
+		if (!attachment || !source) return;
+		const { audio } = attachment;
+		const matches = (ownsIntent = () => true) => matchesSource(audio, source, () =>
+			current === attachment && !destroyed && !queue.purging && selectedSource() === source && ownsIntent());
+		return { audio, attachment, matches };
+	}
+
+	async function startCurrent(retry: boolean): Promise<void> {
+		const target = transportTarget();
+		if (!target || pendingPlay) return;
+		const { audio, matches } = target;
+		const trackId = retry ? currentTrack(queue.snapshot)?.id : undefined;
+		const sameTrack = () => !retry || currentTrack(queue.snapshot)?.id === trackId;
+		const previousIntent = playIntent;
+		if (!matches() || (retry ? get(playbackStatus) !== 'error' || !audio.error
+			: audio.error || (!audio.paused && !audio.ended)) ||
+			!matches(() => playIntent === previousIntent && sameTrack())) return;
+		++playIntent;
+		if (retry) ++endGeneration;
+		let finish!: (outcome: PlayOutcome) => void;
+		const result = new Promise<PlayOutcome>((resolve) => { finish = resolve; });
+		const attempt = pendingPlay = { result, finish };
+		const matchesAttempt = () => matches(() => pendingPlay === attempt && sameTrack());
+		let state: PlaybackStatus | undefined;
+		try {
+			playbackStatus.set(retry ? 'retrying' : 'starting');
+			if (retry) {
+				const load = audio.load;
+				const stillFailed = audio.error !== null;
+				if (!matchesAttempt()) return;
+				if (!stillFailed) {
+					readPlayback(audio, matchesAttempt, 'starting');
+					return;
+				}
+				load.call(audio);
+				if (!matchesAttempt()) return;
+			}
+			// Stay in the gesture, on the same decoder. Only explicit Retry can reload it.
+			const play = audio.play;
+			if (!matchesAttempt()) return;
+			await play.call(audio);
+			if (matchesAttempt()) state = readPlayback(audio, matchesAttempt, 'playing');
+		} catch (error) {
+			if (!matchesAttempt()) return;
+			// The queued native pause event may already see a resumed decoder.
+			const interrupted = error instanceof DOMException && error.name === 'AbortError' && !audio.error;
+			let matchesOutcome = matchesAttempt;
+			if (interrupted) {
+				if (retry && !matchesAttempt()) return;
+				invalidatePlay();
+				const intent = playIntent;
+				matchesOutcome = retry ? () => matches(() => playIntent === intent && sameTrack()) : matches;
+			}
+			state = readPlayback(audio, matchesOutcome, 'starting', interrupted ? 'paused' : 'blocked');
+		} finally {
+			if (pendingPlay === attempt) settlePlay(state === 'playing' || state === 'blocked' || state === 'error' ? state : undefined);
+		}
+	}
+
+	function playCurrent(): Promise<void> {
+		return startCurrent(false);
+	}
+
+	function pauseCurrent(): void {
+		if (destroyed || queue.purging) return;
+		const target = transportTarget();
+		if (target && !target.matches()) return;
+		invalidatePlay();
+		endGeneration += 1;
+		// An accepted pause also revokes autoplay waiting for a new attachment.
+		if (!target) return;
+		const { audio, attachment, matches } = target;
+		const intent = playIntent;
+		const ownsPause = () => matches(() => playIntent === intent);
+		pause(audio);
+		if (!ownsPause()) return;
+		if (audio.paused || audio.ended) attachment.playing = false;
+		readPlayback(audio, ownsPause, get(playbackStatus));
 	}
 
 	function clearJumpFeedback(): void {
@@ -89,6 +207,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		// Retire the native receipt without imposing replacement's share-clear policy on remove/clear.
 		attachmentVersion += 1;
 		previous?.listeners.abort();
+		invalidatePlay();
+		absoluteSeek.set({ ...emptySeek, attachment: attachmentVersion });
+		playbackStatus.set('unavailable');
 		return previous?.audio;
 	}
 
@@ -97,6 +218,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function purgeAtAuthBoundary(clearHint: () => void): void {
+		sleepTimer.cancel();
 		pendingShare.clear();
 		positionIntent += 1;
 		nextPosition = undefined;
@@ -123,33 +245,49 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const receipt = queue.revoke();
 		let attachment = current;
 		let version = attachmentVersion;
-		const ownsAttempt = () => !destroyed && queue.isCurrent(receipt) && source.isCurrent();
-		const isCurrent = () => ownsAttempt() && current === attachment && attachmentVersion === version;
+		const intent = playIntent;
+		const ownsQueue = () => !destroyed && source.isCurrent() && queue.isCurrent(receipt);
+		const isCurrent = () => ownsQueue() && current === attachment && attachmentVersion === version;
+		const ownsPlay = () => isCurrent() && playIntent === intent;
 		const title = Array.from(target.title.trim() || target.id).slice(0, 60).join('');
 		let lead = `Selected ${title}; no stream to play.`;
 		if (streamUrl) {
+			// A same-attachment gesture shares the compact outcome, even if it settles during flush.
+			const sharedPlay = pendingPlay?.result;
 			await selection.flush();
 			// A source change retires the old node before commit. In that case
 			// flush can admit one attachment, but not a reset or replacement while waiting.
-			if (!ownsAttempt() || attachmentVersion !== version + Number(!attachment && !!current)) return;
+			if (!ownsQueue() || attachmentVersion !== version + Number(!attachment && !!current)) return;
 			attachment = current;
 			version = attachmentVersion;
 			const audio = attachment?.audio;
 			lead = `Selected ${title}, paused: playback was blocked.`;
+			if (sharedPlay && audio) {
+				const outcome = await sharedPlay;
+				if (!matchesSource(audio, streamUrl, isCurrent)) return;
+				if (outcome === 'error' || audio.error) lead = `Selected ${title}; audio unavailable.`;
+				else if (outcome !== 'blocked') lead = outcome && !audio.paused && !audio.ended ? `Playing ${title}.` : '';
+				// An interrupted Play can still own the committed queue result.
+				if (!isCurrent()) return;
+				const message = [playIntent === intent && lead, suffix].filter(Boolean).join(' ');
+				if (message) selection.announce(message, true);
+				return;
+			}
+			if (!ownsPlay()) return;
 			try {
-				if (audio?.isConnected && audio.getAttribute('src') === streamUrl && isCurrent()) {
+				if (audio?.isConnected && audio.getAttribute('src') === streamUrl && ownsPlay()) {
 					const play = audio.play;
-					if (!isCurrent()) return;
+					if (!ownsPlay()) return;
 					await play.call(audio);
 					lead = `Playing ${title}.`;
 				}
 			} catch {
 				// No retry and no pause or selection change on a retired receipt.
-				if (isCurrent() && attachment) attachment.playing = false;
+				if (ownsPlay() && attachment) attachment.playing = false;
 			}
+			if (ownsPlay() && audio?.error) lead = `Selected ${title}; audio unavailable.`;
 		}
-		if (!isCurrent()) return;
-		selection.announce(suffix ? `${lead} ${suffix}` : lead, true);
+		if (ownsPlay()) selection.announce(suffix ? `${lead} ${suffix}` : lead, true);
 	}
 
 	function matchesSource(audio: HTMLAudioElement, source: string, isCurrent: () => boolean): boolean {
@@ -250,6 +388,43 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		});
 	}
 
+	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string, replay = false, nativeSeeking = false): void {
+		const attachment = attachmentVersion;
+		const observation = readAbsoluteSeek(audio);
+		if (!matches()) return;
+		const prior = get(absoluteSeek);
+		const previous = prior.attachment === attachment ? prior : emptySeek;
+		// In-flight time/progress updates move the thumb, not the seek comparison point.
+		const message = feedback ?? (nativeSeeking && observation.position !== seekAnchor ? '' : previous.feedback);
+		if (feedback !== undefined || nativeSeeking || !observation.seeking) seekAnchor = observation.position;
+		const elapsed = observation.seeking ? previous.elapsed : observation.position;
+		if (prior.attachment !== attachment || previous.position !== observation.position ||
+			previous.duration !== observation.duration || previous.enabled !== observation.enabled ||
+			previous.seeking !== observation.seeking || previous.feedback !== message || (replay && message)) {
+			absoluteSeek.set({ ...observation, attachment, elapsed, feedback: message,
+				feedbackVersion: previous.feedbackVersion + Number(!!message && (replay || message !== previous.feedback)) });
+		}
+	}
+
+	function seek(attachment: number, seconds: number, replay = true): void {
+		if (attachment !== attachmentVersion || !Number.isFinite(seconds)) return;
+		const target = transportTarget();
+		if (!target) return;
+		const { audio, matches } = target;
+		const before = positionIntent;
+		const track = currentTrack(queue.snapshot);
+		const sameSelection = () => currentTrack(queue.snapshot)?.id === track?.id;
+		if (!track || !matches(() => positionIntent === before && sameSelection())) return;
+		const intent = ++positionIntent;
+		pendingShare.supersede(track.id, resolveStreamUrl(track));
+		const isCurrent = () => matches(() => positionIntent === intent && sameSelection());
+		runPosition(() => {
+			if (!isCurrent()) return;
+			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent);
+			if (isCurrent()) observeAbsoluteSeek(audio, isCurrent, feedback, replay);
+		});
+	}
+
 	function restart(): void {
 		const track = currentTrack(queue.snapshot);
 		const source = resolveStreamUrl(track);
@@ -299,6 +474,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	async function handleEnded(attachment: MediaAttachment, source: string, matchesOrigin: () => boolean): Promise<void> {
+		if (attachment.audio.ended && matchesOrigin()) {
+			invalidatePlay();
+			readPlayback(attachment.audio, matchesOrigin, 'playing');
+		}
 		if (!selection) return;
 		const { commit, flush, browseCopy, announce } = selection;
 		const { audio } = attachment;
@@ -310,19 +489,24 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			queue.isCurrent(revision);
 		const ownsOrigin = () => ownsEnd() && matchesOrigin() && ownsEnd();
 		const base = queue.snapshot;
-		const result = naturalEndPolicy(base, {
-			repeat: get(repeat), radioActive: false, continueRadio: false, sleepComplete: false,
-			playing: attachment.playing, validEnd: audio.ended && audio.error === null
-		});
-		if (result.action === 'ignore' || !ownsOrigin()) return;
-		attachment.playing = false;
+		if (!audio.ended || audio.error !== null || !attachment.playing || !ownsOrigin()) return;
+		const natural = !attachment.soughtToEnd;
+		attachment.playing = attachment.soughtToEnd = false;
 		generation = ++endGeneration;
 		announce('');
-		if (result.action !== 'play') return;
+		if (!ownsOrigin()) return;
+		const result = naturalEndPolicy(base, {
+			repeat: get(repeat), radioActive: false, continueRadio: false,
+			sleepComplete: sleepTimer.observeEnd(natural), playing: true, validEnd: true
+		});
+		if (result.action !== 'play' || !ownsOrigin()) return;
 		const track = currentTrack(result.queue);
 		const streamUrl = resolveStreamUrl(track);
 		const replacing = currentTrack(base)?.id !== track?.id || source !== streamUrl;
-		const { volume, muted, playbackRate } = audio;
+		const { playbackRate } = audio;
+		if (!ownsOrigin()) return;
+		// Queue commit captures sound for replacements; replay keeps this attachment.
+		if (!replacing) sound.observe();
 		if (!ownsOrigin()) return;
 		// Replay supersedes a deferred share even when the native source survives.
 		browseCopy.invalidate();
@@ -341,10 +525,6 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const target = replay.audio;
 		const matches = () => matchesSource(target, streamUrl, isCurrent);
 		try {
-			if (!matches()) return;
-			target.volume = volume;
-			if (!matches()) return;
-			target.muted = muted;
 			if (!matches()) return;
 			target.playbackRate = playbackRate;
 			runPosition(() => { if (matches()) target.currentTime = 0; });
@@ -365,7 +545,12 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	return {
 		repeat: { subscribe: repeat.subscribe },
+		sound: { state: sound.state, setVolume: sound.setVolume, toggleMute: sound.toggleMute },
+		observeSound: sound.observe,
 		seekFeedback: { subscribe: seekFeedback.subscribe },
+		absoluteSeek: { subscribe: absoluteSeek.subscribe }, seek,
+		playbackStatus: { subscribe: playbackStatus.subscribe },
+		playCurrent, pauseCurrent, retryCurrent: () => startCurrent(true),
 		clearSeekFeedback,
 		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
 			let value: string | null | undefined;
@@ -377,6 +562,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			repeat.set(value);
 			try { storage?.setItem(REPEAT_KEY, value); } catch { /* Keep the choice for this visit. */ }
 		},
+		sleepTimer,
 		playSelected,
 		restart,
 		jump,
@@ -395,11 +581,19 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (previous) pendingShare.clear();
 			attachmentVersion += 1;
 			// Node identity is not attachment identity, even for the same source.
-			const receipt = { audio, playing: false, listeners: new AbortController() };
+			const receipt = { audio, playing: false, soughtToEnd: false, listeners: new AbortController() };
 			current = receipt;
 			previous?.listeners.abort();
+			if (previous) invalidatePlay();
+			const seekTarget = transportTarget();
+			const trackId = currentTrack(queue.snapshot)?.id;
+			const observePosition = (type?: string) => {
+				if (seekTarget?.audio !== audio) return;
+				const intent = positionIntent;
+				const matches = () => seekTarget.matches(() => positionIntent === intent && currentTrack(queue.snapshot)?.id === trackId);
+				if (matches()) observeAbsoluteSeek(audio, matches, undefined, false, type === 'seeking');
+			};
 			function listenForNativeEvents(): void {
-				const selectedSource = () => resolveStreamUrl(currentTrack(queue.snapshot));
 				const observe = (event: Event) => {
 					if (current !== receipt || event.currentTarget !== audio) return;
 					const shareRevision = pendingShare.revision;
@@ -413,7 +607,17 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					switch (event.type) {
 						case 'play':
 						case 'playing':
-							if (!audio.paused && !audio.ended && matches()) receipt.playing = true;
+							if (!audio.paused && !audio.ended && matches()) {
+								receipt.playing = true;
+								if (!pendingPlay && (event.type === 'playing' || get(playbackStatus) !== 'playing')) {
+									readPlayback(audio, matches, event.type === 'playing' ? 'playing' : 'starting');
+								}
+							}
+							return;
+						case 'emptied':
+							receipt.soughtToEnd = false;
+							// A native recovery outside the compact action can also clear a resource error.
+							if (get(playbackStatus) === 'error') readPlayback(audio, matches, 'starting');
 							return;
 						case 'pause':
 							// Native completion pauses before `ended`; retain that intent.
@@ -423,9 +627,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 							if (audio.error === null) return;
 							break;
 						case 'ended': return handleEnded(receipt, source, matches);
-						case 'seeking':
+						case 'seeked': return;
+						case 'seeking': {
+							const { currentTime, duration } = audio;
+							if (!matches(intent)) return;
+							receipt.soughtToEnd = Number.isFinite(duration) && duration > 0 && currentTime >= duration;
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
 							return observeSeeking(audio, () => matches(intent));
+						}
 						case 'loadedmetadata':
 						case 'durationchange':
 							retryShare(audio, shareRevision);
@@ -443,14 +652,30 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					if (!matches()) return;
 					receipt.playing = false;
 					endGeneration += 1;
+					// A fatal decoder error may never settle the native play promise.
+					if (audio.error) settlePlay('error');
+					else invalidatePlay();
+					readPlayback(audio, matches, get(playbackStatus));
 				};
-				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'seeking',
-					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate']) {
-					audio.addEventListener(type, observe, { signal: receipt.listeners.signal });
+				for (const type of ['play', 'playing', 'pause', 'error', 'ended', 'emptied', 'seeking',
+					'loadedmetadata', 'durationchange', 'canplay', 'progress', 'timeupdate', 'seeked']) {
+					audio.addEventListener(type, (event) => {
+						const settlement = observe(event);
+						if (event.currentTarget === audio && type !== 'play' && type !== 'playing' && type !== 'pause') observePosition(type);
+						return settlement;
+					}, { signal: receipt.listeners.signal });
 				}
 			}
 			lastJumpTarget = undefined;
 			listenForNativeEvents();
+			const target = transportTarget();
+			if (target?.attachment === receipt) {
+				sound.connect(audio, target.matches, receipt.listeners.signal);
+				readPlayback(audio, target.matches, 'starting');
+				bindSystemTransport(queue, () => target.matches() ? currentTrack(queue.snapshot) : null,
+					{ playCurrent, pauseCurrent }, receipt.listeners.signal);
+			}
+			observePosition();
 			pause(previous?.audio);
 			return () => {
 				if (current === receipt) reset();
@@ -459,6 +684,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		reset, purgeAtAuthBoundary,
 		destroy() {
 			destroyed = true;
+			sleepTimer.cancel();
 			pendingShare.clear();
 			reset();
 		}
