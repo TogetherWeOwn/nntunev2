@@ -326,7 +326,7 @@ class OtherEventBaselineTests(Graph):
     def test_queue_requires_pinned_head_and_ancestor_base(self):
         env = {"GITHUB_EVENT_NAME": "merge_group", "GITHUB_SHA": self.merge}
         result = self.helper(**env)
-        self.assert_base(result, self.old)
+        self.assertEqual(self.outputs(result), dict(merge_sha=self.merge, base_sha=self.old, head_sha=self.merge))
         unrelated = git(self.root, "commit-tree", f"{self.merge}^{{tree}}", "-m", "unrelated")
         self.assert_closed(self.helper(**env, QUEUE_BASE_SHA=unrelated))
         self.assert_closed(self.helper(**env, QUEUE_HEAD_SHA=self.main_tip))

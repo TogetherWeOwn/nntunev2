@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 CHECK = Path(__file__).with_name("check_workflow_pr_shas.py")
+FIXTURES = CHECK.parent / "fixtures/workflow-pr-shas"
 
 
 class WorkflowReadRatchet(unittest.TestCase):
@@ -19,10 +20,10 @@ class WorkflowReadRatchet(unittest.TestCase):
             def git(*args):
                 return run("git", *args).stdout.strip()
 
-            def commit(message, contents):
-                workflow.write_text(contents)
+            def commit(case):
+                workflow.write_bytes((FIXTURES / f"{case}.yaml").read_bytes())
                 git("add", ".github/workflows")
-                git("-c", "commit.gpgsign=false", "commit", "-qm", message)
+                git("-c", "commit.gpgsign=false", "commit", "-qm", case)
                 return git("rev-parse", "HEAD")
 
             git("init", "-q")
@@ -30,22 +31,14 @@ class WorkflowReadRatchet(unittest.TestCase):
             git("config", "user.email", "workflow@example.invalid")
             workflow = root / ".github/workflows/sample.yaml"
             workflow.parent.mkdir(parents=True)
-            good = "      SHA: ${{ needs.ci-commits.outputs.base_sha }}\n"
-            old = "      OLD: ${{ github.event.pull_request.base.sha }}\n"
-            prefix = "name: sample\non: pull_request\njobs:\n  sample:\n    env:\n"
-            stale = commit("earlier base", prefix + good)
-            base = commit("actual first parent", prefix + old)
-            tested = commit("resolved consumer with old read", prefix + old.rstrip() + " # retained\n"
-                            + good + "      # Example: ${{ github.event.pull_request.head.sha }}\n")
-            bad = commit("added raw reads", prefix + old + good
-                         + "      BAD: ${{ GitHub['event'].pull_request['HEAD'].sha }}\n"
-                         + "    if: >-\n      github.event.pull_request\n        .base.sha != ''\n")
+            stale, base, tested, moved, bad = map(commit, ("stale", "base", "resolved", "moved", "bad"))
 
             def compare(against, candidate):
                 return run(sys.executable, str(CHECK), "--base", against, "--tested", candidate, check=False)
 
             self.assertEqual(0, compare(base, tested).returncode)
             self.assertEqual(1, compare(stale, tested).returncode)
+            self.assertEqual(1, compare(base, moved).returncode)
             rejected = compare(base, bad)
             self.assertEqual(1, rejected.returncode, rejected.stderr)
             self.assertIn("['HEAD'].sha", rejected.stderr)
