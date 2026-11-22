@@ -246,7 +246,7 @@ async fn completed_readback_binds_the_exact_inventory_after_flac_and_eof() {
 #[ignore = "requires a migrated disposable PostgreSQL database"]
 async fn postgres_append_stages_only_exact_live_candidate_inventory() {
     use tokio_postgres::{Client, NoTls, Transaction};
-    use InventoryAppendError::{Conflict, Identity, MissingOrFenced};
+    use InventoryAppendError::{Conflict, Identity, Indeterminate, MissingOrFenced};
     async fn connect(url: &str) -> Client {
         let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
         tokio::spawn(async move { connection.await.unwrap() });
@@ -296,7 +296,7 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         })
         .await
         .unwrap();
-    let intent = CandidateIntent {
+    let mut intent = CandidateIntent {
         identities: fixture.context.identities[1..].try_into().unwrap(),
         plaintext_len: fixture.context.plaintext_len,
         map_id: MAP_ID,
@@ -350,6 +350,50 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
     tx.commit().await.unwrap();
 
     let lookup = "SELECT media_version, page_versions FROM public.storage_digest_inventory_intents WHERE map_id = $1::text::uuid";
+    let pid: i32 = writer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let mut locker = connect(&url).await;
+    let held = locker.transaction().await.unwrap();
+    held.execute("UPDATE public.storage_digest_reservations SET generation = 2 WHERE object_id = $1::text::uuid", &[&ids[2]]).await.unwrap();
+    let mut tx = writer.transaction().await.unwrap();
+    tx.batch_execute("SET LOCAL lock_timeout = '250ms'")
+        .await
+        .unwrap();
+    assert_eq!(
+        append_inventory(&mut tx, &intent, SCOPE, &verified).await,
+        Err(Indeterminate)
+    );
+    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+
+    let mut tx = writer.transaction().await.unwrap();
+    let release = async {
+        while !observer
+            .query_one("SELECT cardinality(pg_blocking_pids($1)) > 0", &[&pid])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        held.commit().await.unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            append_inventory(&mut tx, &intent, SCOPE, &verified),
+            release
+        )
+    })
+    .await
+    .expect("append must resume after the previous holder commits");
+    assert_eq!(result, Err(MissingOrFenced));
+    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+    intent.reservation_generation = 2;
+
     let mut tx = writer.transaction().await.unwrap();
     // The insert trigger flips the fixture clock within this transaction.
     tx.batch_execute(
