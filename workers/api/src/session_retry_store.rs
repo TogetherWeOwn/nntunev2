@@ -3,6 +3,7 @@
 use tokio_postgres::types::Type;
 
 use crate::handlers::StoreError;
+use crate::postgres::{PgConnect, PgQuery};
 use crate::session::{
     SessionClaims, MAX_SESSION_SECS, REFRESH_RETRY_SECS, ROTATE_SESSION_WITH_RETRY_SQL,
 };
@@ -20,7 +21,7 @@ fn valid_token_times(claims: &SessionClaims) -> bool {
 /// The lock, clock, parameter binding, row decoding and commit live here so the
 /// native PostgreSQL contention tests execute the production adapter itself.
 pub async fn rotate_with_retry(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     previous: &SessionClaims,
     next: &SessionClaims,
     retry_hash: &str,

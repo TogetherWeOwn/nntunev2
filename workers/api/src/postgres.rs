@@ -83,6 +83,8 @@ pub trait PgConnect: PgQuery {
     fn read_only_snapshot(
         &mut self,
     ) -> impl Future<Output = Result<PgTransaction<'_>, Error>> + Send;
+
+    fn read_committed(&mut self) -> impl Future<Output = Result<PgTransaction<'_>, Error>> + Send;
 }
 
 // Forward to the inherent driver methods without boxing each query future.
@@ -131,6 +133,15 @@ macro_rules! impl_pg_connect {
                     .map(PgTransaction)
             }
 
+            async fn read_committed(&mut self) -> Result<PgTransaction<'_>, Error> {
+                self$(.$inner)?
+                    .build_transaction()
+                    .isolation_level(IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map(PgTransaction)
+            }
+
         }
     };
 }
@@ -146,13 +157,21 @@ impl_pg_connect!(PgClient, 0);
     all(feature = "billing-owned-wasm-test", target_arch = "wasm32"),
 ))]
 impl_pg_query!(Client);
-#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[cfg(all(any(test, feature = "postgres-tests"), not(target_arch = "wasm32")))]
 impl_pg_connect!(Client);
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+impl_pg_query!(Transaction<'_>);
 
 impl PgClient {
     /// Wrap an established connection's client. The caller still drives the connection.
     pub fn new(client: Client) -> Self {
         Self(client)
+    }
+
+    pub(crate) async fn set_statement_timeout(&self, ms: u64) -> Result<(), Error> {
+        self.0
+            .batch_execute(&format!("SET statement_timeout = {ms}"))
+            .await
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
@@ -236,5 +255,9 @@ impl PgTransaction<'_> {
 
     pub(crate) async fn commit(self) -> Result<(), Error> {
         self.0.commit().await
+    }
+
+    pub(crate) async fn rollback(self) -> Result<(), Error> {
+        self.0.rollback().await
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 use std::time::Duration;
-use tokio_postgres::{config::Host, Config, NoTls};
+use tokio_postgres::{config::Host, Client, Config, NoTls};
 
 pub(crate) async fn connect() -> Client {
     let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")

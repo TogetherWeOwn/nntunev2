@@ -1,7 +1,7 @@
 //! Hyperdrive persistence for the production credential core. Not an HTTP mount.
 use super::{PgStore, StoreError, TOTAL_TIMEOUT_MS};
 use crate::field_envelope::FieldEnvelope;
-use crate::postgres::{PgClient, PgConnect, PgQuery, PgTransaction};
+use crate::postgres::{PgConnect, PgQuery, PgTransaction};
 use crate::subsonic_auth::{
     AuthError, AuthMode, CredentialRecord, CredentialStore, Principal, Reindex, TokenEnvelope,
 };
@@ -522,12 +522,6 @@ async fn mutate_transaction(
     Ok(true)
 }
 
-impl PgStore {
-    pub(super) async fn connect_subsonic(&self) -> Result<PgClient, StoreError> {
-        self.connect().await.map(PgClient::new)
-    }
-}
-
 impl CredentialStore for PgStore {
     async fn by_key(
         &self,
@@ -535,7 +529,7 @@ impl CredentialStore for PgStore {
         digest: &str,
     ) -> Result<Option<CredentialRecord>, AuthError> {
         Self::bounded(
-            async { lookup(&mut self.connect_subsonic().await?, Some(version), digest).await },
+            async { lookup(&mut self.connect().await?, Some(version), digest).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -543,7 +537,7 @@ impl CredentialStore for PgStore {
     }
     async fn by_username(&self, username: &str) -> Result<Option<CredentialRecord>, AuthError> {
         Self::bounded(
-            async { lookup(&mut self.connect_subsonic().await?, None, username).await },
+            async { lookup(&mut self.connect().await?, None, username).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -555,7 +549,7 @@ impl CredentialStore for PgStore {
         now: u64,
     ) -> Result<bool, AuthError> {
         Self::bounded(
-            async { mutate(&mut self.connect_subsonic().await?, selected, None, now).await },
+            async { mutate(&mut self.connect().await?, selected, None, now).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -568,15 +562,7 @@ impl CredentialStore for PgStore {
         now: u64,
     ) -> Result<bool, AuthError> {
         Self::bounded(
-            async {
-                mutate(
-                    &mut self.connect_subsonic().await?,
-                    selected,
-                    Some(reindex),
-                    now,
-                )
-                .await
-            },
+            async { mutate(&mut self.connect().await?, selected, Some(reindex), now).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
