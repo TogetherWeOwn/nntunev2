@@ -98,6 +98,32 @@ function deferred<T>() {
 	return { promise, resolve };
 }
 
+it('drops a pending usage response when its account session retires', async () => {
+	const account = new AbortController();
+	const makeOwner = ({ signal }: AbortController) => ({
+		generation: 'fixture', signal, isCurrent: () => !signal.aborted,
+		run: async <T>(work: () => T) => signal.aborted ? undefined : work()
+	});
+	const received = deferred<AbortSignal | null | undefined>();
+	const old = deferred<Response>();
+	const fetchFn = vi.fn<typeof fetch>((_path, init) => {
+		received.resolve(init?.signal);
+		return old.promise;
+	});
+	const owner = makeOwner(account);
+	const result = fetchUsage(fetchFn, owner).catch((error: unknown) => error);
+	const transport = await received.promise;
+	account.abort();
+	expect(transport?.aborted).toBe(true);
+	expect(await result).toMatchObject({ name: 'AbortError' });
+
+	old.resolve(jsonResponse(USAGE));
+	await expect(fetchUsage(fetchFn, owner)).rejects.toMatchObject({ name: 'AbortError' });
+	expect(fetchFn).toHaveBeenCalledTimes(1);
+	fetchFn.mockResolvedValueOnce(jsonResponse(USAGE));
+	await expect(fetchUsage(fetchFn, makeOwner(new AbortController()))).resolves.toEqual(USAGE);
+});
+
 function track(promise: Promise<unknown>) {
 	const state = { settled: false, value: undefined as unknown, failure: undefined as unknown };
 	void promise.then(

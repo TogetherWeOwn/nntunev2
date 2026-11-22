@@ -2,6 +2,32 @@ import { expect, test } from '@playwright/test';
 
 const PERIOD_END = '2026-11-15T12:00:00Z';
 
+test('billing hides an earlier account statement and reloads under the replacement session', async ({ page }) => {
+	let planId = 'pro';
+	await page.route('**/v1/me/subscription', (route) => route.fulfill({ json: {
+		state: 'active', planId, status: 'active', currentPeriodEnd: PERIOD_END,
+		graceUntil: null, cancelAtPeriodEnd: false
+	} }));
+	await page.route('**/v1/me/usage', (route) => route.fulfill({ json: {
+		period: '2026-10', streamSecondsMonth: 3600, resetsAt: '2026-11-01T00:00:00Z'
+	} }));
+	await page.route('**/v1/plans', (route) => route.fulfill({ json: { plans: [] } }));
+	await page.goto('/account/billing');
+
+	const earlier = page.getByRole('heading', { name: 'Current plan: Pro' });
+	await expect(earlier).toBeVisible();
+	planId = 'plus';
+	await page.evaluate(() => {
+		const key = 'nntune.auth.generation.v1';
+		localStorage.setItem(key, 'replacement-session');
+		window.dispatchEvent(new StorageEvent('storage', { key }));
+	});
+	await expect(earlier).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'Manage billing', exact: true })).toHaveCount(0);
+	await page.getByRole('button', { name: 'Retry' }).click();
+	await expect(page.getByRole('heading', { name: 'Current plan: Plus' })).toBeVisible();
+});
+
 for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
 	test.describe(`${viewport.width}px billing period-end copy`, () => {
 		test.use({ viewport, locale: 'en-US', timezoneId: 'America/Los_Angeles' });

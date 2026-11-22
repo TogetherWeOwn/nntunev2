@@ -1,4 +1,5 @@
 import type { PageLoad } from './$types';
+import { captureAuthFence } from '#lib/auth-fence.js';
 import {
 	BillingApiError,
 	fetchSubscription,
@@ -80,11 +81,17 @@ export const ssr = false;
 let loadSequence = 0;
 
 export const load: PageLoad = async ({ fetch }) => {
+	const owner = await captureAuthFence();
 	// Independent reads share one deadline window; loadOne keeps failures isolated.
-	const [sub, use] = await Promise.all([
-		loadOne(() => fetchSubscription(fetch)),
-		loadOne(() => fetchUsage(fetch))
-	]);
+	const sent = owner && await owner.run(() => ({
+		reads: Promise.all([
+			loadOne(() => fetchSubscription(fetch, owner)),
+			loadOne(() => fetchUsage(fetch, owner))
+		] as const)
+	}));
+	const reads = await sent?.reads;
+	const unavailable = { value: null, status: null, failed: true } as const;
+	const [sub, use] = reads && owner?.isCurrent() ? reads : [unavailable, unavailable];
 
 	// The subscription endpoint answers 200 with a server-derived state
 	// for every session — a missing record is `no_subscription`, not a
@@ -151,6 +158,7 @@ export const load: PageLoad = async ({ fetch }) => {
 	const billingPlan =
 		manageBillingOnly && subscription?.planId ? getPlan(subscription.planId) : undefined;
 	return {
+		owner,
 		loadSeq: ++loadSequence,
 		planId: billingPlan?.id ?? plan.id,
 		planUnknown,

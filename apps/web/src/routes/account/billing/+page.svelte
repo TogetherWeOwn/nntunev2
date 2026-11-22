@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
 	import { invalidateAll } from '$app/navigation';
+	import type { AccountSession } from '#lib/auth-fence.js';
 	import { BillingApiError } from '#lib/billing/billingClient.js';
 	import { getPlan, planFromDTO, type Plan } from '#lib/billing/plans.js';
 	import { evaluateUsage, formatResetInstant } from '#lib/billing/usage.js';
@@ -11,6 +12,22 @@
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
+	let retired = $state.raw<AccountSession>();
+	const accountEnded = $derived(!!data.owner && (retired === data.owner || !data.owner.isCurrent()));
+
+	$effect.pre(() => {
+		const owner = data.owner;
+		if (!owner) return;
+		const clear = () => {
+			retired = owner;
+			warningThreshold = null;
+			actionError = null;
+			busy = null;
+		};
+		if (!owner.isCurrent()) clear();
+		owner.signal.addEventListener('abort', clear, { once: true });
+		return () => owner.signal.removeEventListener('abort', clear);
+	});
 
 	// Caps render from plan data, not only the static mirror: hydrate the
 	// loader's plan from GET /v1/plans (same merge as the pricing page) so
@@ -83,7 +100,7 @@
 	// never scored (and permanently marked) against a stale mirror cap.
 	let warningThreshold = $state<number | null>(null);
 	$effect(() => {
-		if (!planHydrationDone || !data.usage || !status) return;
+		if (!data.owner?.isCurrent() || !planHydrationDone || !data.usage || !status) return;
 		const pending = pendingUsageWarnings(data.usage.period, status.streamFraction);
 		if (pending.length === 0) return;
 		warningThreshold = pending[pending.length - 1];
@@ -97,44 +114,30 @@
 		alive = false;
 	});
 
-	async function checkout() {
+	async function billingAction(action: 'checkout' | 'portal') {
 		// Belt and braces with the loader (which nulls upgradeTo for
 		// portal-only subscriptions): never start a checkout from here when
 		// the subscriber already holds a plan that needs the portal instead.
-		if (!alive || !status?.upgradeTo || data.manageBillingOnly) return;
+		const owner = data.owner, upgrade = status?.upgradeTo;
+		if (!alive || busy || !owner?.isCurrent() || (action === 'checkout' && (!upgrade || data.manageBillingOnly))) return;
+		const current = () => alive && owner === data.owner && owner.isCurrent();
 		actionError = null;
-		busy = 'checkout';
+		busy = action;
 		try {
-			const { startCheckout } = await import('#lib/billing/billingClient.js');
-			if (!alive) return;
-			const url = await startCheckout(status.upgradeTo);
-			if (!alive) return;
-			window.location.href = url;
+			const { startCheckout, openPortal } = await import('#lib/billing/billingClient.js');
+			const sent = await owner.run(() => current() ? {
+				result: (action === 'checkout' && upgrade ? startCheckout(upgrade, fetch, owner) : openPortal(fetch, owner))
+					.then((url) => ({ url }), (cause: unknown) => ({ cause }))
+			} : undefined);
+			const result = await sent?.result;
+			if (!current()) return;
+			if (!result) throw new Error('Could not verify your billing session.');
+			if ('cause' in result) throw result.cause;
+			window.location.href = result.url;
 		} catch (err) {
-			if (!alive) return;
+			if (!current()) return;
 			if (!(err instanceof BillingApiError && err.paywall)) {
-				actionError = err instanceof Error ? err.message : 'Checkout failed';
-			}
-			busy = null;
-		} finally {
-			if (!alive) busy = null;
-		}
-	}
-
-	async function portal() {
-		if (!alive) return;
-		actionError = null;
-		busy = 'portal';
-		try {
-			const { openPortal } = await import('#lib/billing/billingClient.js');
-			if (!alive) return;
-			const url = await openPortal();
-			if (!alive) return;
-			window.location.href = url;
-		} catch (err) {
-			if (!alive) return;
-			if (!(err instanceof BillingApiError && err.paywall)) {
-				actionError = err instanceof Error ? err.message : 'Portal failed';
+				actionError = err instanceof Error ? err.message : action === 'checkout' ? 'Checkout failed' : 'Portal failed';
 			}
 			busy = null;
 		} finally {
@@ -150,6 +153,10 @@
 <main>
 	<h1>Billing</h1>
 
+	{#if accountEnded}
+		<p role="status">Your session changed. Retry to see your current billing details.</p>
+		<button onclick={() => invalidateAll()}>Retry</button>
+	{:else}
 	{#if data.loadError}
 		<p role="alert">{data.loadError}</p>
 	{/if}
@@ -228,10 +235,10 @@
 		<p role="alert">{actionError}</p>
 	{/if}
 
-	{#if !data.signedOut}
+	{#if data.owner && !data.signedOut}
 		<div>
 			{#if status?.upgradeTo && !data.manageBillingOnly}
-				<button disabled={busy !== null} onclick={checkout}>
+				<button disabled={busy !== null} onclick={() => billingAction('checkout')}>
 					{busy === 'checkout' ? 'Starting…' : `Upgrade to ${status.upgradeTo}`}
 				</button>
 			{/if}
@@ -241,7 +248,7 @@
 				     record to manage yet. -->
 				<a href="/pricing">See plans</a>
 			{:else}
-				<button disabled={busy !== null} onclick={portal}>
+				<button disabled={busy !== null} onclick={() => billingAction('portal')}>
 					{busy === 'portal'
 						? 'Opening…'
 						: data.manageBillingOnly
@@ -250,6 +257,7 @@
 				</button>
 			{/if}
 		</div>
+	{/if}
 	{/if}
 
 	<p><a href="/pricing">Compare all plans</a></p>
