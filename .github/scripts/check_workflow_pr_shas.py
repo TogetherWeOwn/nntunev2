@@ -32,24 +32,24 @@ def scalar_fields(node, location, seen):
                 raise yaml.YAMLError("workflow keys must be scalars")
             yield from scalar_fields(child, (*location, key.value), seen)
     elif isinstance(node, yaml.SequenceNode):
-        for index, child in enumerate(node.value):
-            label = next((value.value for key, value in child.value
-                          if key.value == "id" and isinstance(value, yaml.ScalarNode)),
-                         str(index)) if isinstance(child, yaml.MappingNode) else str(index)
-            yield from scalar_fields(child, (*location, f"[{label}]"), seen)
+        for child in node.value:
+            fields = {key.value: value for key, value in child.value} if isinstance(child, yaml.MappingNode) else {}
+            role = next((fields[key].value for key in ("id", "uses", "working-directory") if key in fields), "")
+            inputs = fields.get("with")
+            destination = next((value.value for key, value in inputs.value if key.value == "path"),
+                               "") if isinstance(inputs, yaml.MappingNode) else ""
+            yield from scalar_fields(child, (*location, repr((role, destination))), seen)
 
 
 def workflow_reads(root, commit):
     reads = Counter()
-    for entry in git(root, "ls-tree", "-rz", commit, "--", ".github/workflows").split("\0"):
-        if not entry:
-            continue
+    entries = git(root, "ls-tree", "-rz", commit, "--", ".github/workflows").split("\0")
+    for entry in filter(None, entries):
         header, path = entry.split("\t", 1)
         if not path.endswith((".yml", ".yaml")):
             continue
         _, _, oid = header.split()
-        source = git(root, "cat-file", "blob", oid)
-        tree = yaml.compose(source, Loader=yaml.SafeLoader)
+        tree = yaml.compose(git(root, "cat-file", "blob", oid), Loader=yaml.SafeLoader)
         for location, scalar in scalar_fields(tree, (), set()):
             reads.update((path, location, match) for match in RAW_SHA.findall(scalar))
     return reads
