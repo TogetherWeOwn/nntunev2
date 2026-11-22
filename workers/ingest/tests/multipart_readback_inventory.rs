@@ -9,12 +9,15 @@ use nntune_core::{
     media_envelope::{wrap_scheme2, EnvelopeContext},
     origin_sealer::SealedChunk,
 };
-use nntune_ingest::multipart::{
-    readback_inventory::{
-        BucketReadbackResponse, CompletedReadbackInventory, InventoryError, ReadbackScope,
+use nntune_ingest::{
+    digest_candidate_store::{append_inventory, CandidateIntent, InventoryAppendError},
+    multipart::{
+        readback_inventory::{
+            BucketReadbackResponse, CompletedReadbackInventory, InventoryError, ReadbackScope,
+        },
+        sidecar::{CompletedSidecar, SidecarPut, SidecarPutReply},
+        CompletedVersionedMedia, Plan, UploadTarget, VersionedCompletionReply,
     },
-    sidecar::{CompletedSidecar, SidecarPut, SidecarPutReply},
-    CompletedVersionedMedia, Plan, UploadTarget, VersionedCompletionReply,
 };
 use sha2::{Digest, Sha256};
 use std::io;
@@ -35,6 +38,11 @@ const PAGE_KEY: &str = concat!(
     "media-digests/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd/",
     "06060606060640068006060606060606/00000000",
 );
+const PAGE_ONE_KEY: &str = concat!(
+    "media-digests/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd/",
+    "06060606060640068006060606060606/00000001",
+);
+const PAGE_ONE_VERSION: &str = "second\\\"%2F+=";
 const ROOT: [u8; 32] = [17; 32];
 const CONFIGURATION: [u8; 16] = id(5);
 const MAP_ID: [u8; 16] = id(6);
@@ -61,7 +69,7 @@ struct ReadbackFixture {
     record: [u8; 230],
     media: CompletedVersionedMedia,
     media_bytes: Vec<u8>,
-    page_bytes: Vec<u8>,
+    page_bytes: Vec<Vec<u8>>,
 }
 
 impl ReadbackFixture {
@@ -87,22 +95,41 @@ impl ReadbackFixture {
             plaintext_len,
         )
         .unwrap();
-        let sealed = enrollment.seal_chunk(plaintext).unwrap();
         let mut partition = plan.partition();
-        assert!(partition
-            .push(&SealedChunk {
-                digest: Sha256::digest(&sealed.bytes).into(),
-                bytes: sealed.bytes,
-                final_chunk: true,
+        let mut parts = Vec::new();
+        let mut page_bytes = Vec::new();
+        let chunks = plaintext.chunks(PLAIN_CHUNK_SIZE as usize);
+        let chunk_count = chunks.len();
+        for (index, chunk) in chunks.enumerate() {
+            let sealed = enrollment.seal_chunk(chunk).unwrap();
+            page_bytes.extend(sealed.page);
+            parts.extend(
+                partition
+                    .push(&SealedChunk {
+                        digest: Sha256::digest(&sealed.bytes).into(),
+                        bytes: sealed.bytes,
+                        final_chunk: index + 1 == chunk_count,
+                    })
+                    .unwrap(),
+            );
+        }
+        parts.extend(partition.finish().unwrap());
+        let mut media_bytes = Vec::new();
+        let mut composite = Sha256::new();
+        let uploads = parts
+            .iter()
+            .map(|part| {
+                let (_, _, bytes, checksum) = part.request();
+                media_bytes.extend_from_slice(bytes);
+                composite.update(STANDARD.decode(checksum).unwrap());
+                part.verify_reply("synthetic".into(), checksum).unwrap()
             })
-            .unwrap()
-            .is_none());
-        let part = partition.finish().unwrap().unwrap();
-        let (_, _, bytes, checksum) = part.request();
-        let composite = STANDARD.encode(Sha256::digest(STANDARD.decode(checksum).unwrap()));
+            .collect();
+        let composite = STANDARD.encode(composite.finalize());
         let body = format!(
             "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key>\
-             <ChecksumSHA256>{composite}-1</ChecksumSHA256></CompleteMultipartUploadResult>"
+             <ChecksumSHA256>{composite}-{}</ChecksumSHA256></CompleteMultipartUploadResult>",
+            parts.len()
         );
         let reply = VersionedCompletionReply {
             configuration: CONFIGURATION,
@@ -110,30 +137,34 @@ impl ReadbackFixture {
             body: body.as_bytes(),
             version_headers: &[SHARED_VERSION],
         };
-        let uploaded = part.verify_reply("synthetic".into(), checksum).unwrap();
-        let completion = plan.complete(vec![uploaded]).unwrap();
+        let completion = plan.complete(uploads).unwrap();
         let media = completion.verify_versioned_reply(&context, reply).unwrap();
         Self {
             origin: enrollment.finish().unwrap(),
             context,
             record,
             media,
-            media_bytes: bytes.to_vec(),
-            page_bytes: sealed.page.unwrap(),
+            media_bytes,
+            page_bytes,
         }
     }
 
     fn sidecar(&self) -> CompletedSidecar<'_> {
+        self.sidecar_at(0, PAGE_KEY, FINAL_VERSION)
+    }
+
+    fn sidecar_at(&self, index: u32, key: &str, version: &str) -> CompletedSidecar<'_> {
         let reply = SidecarPutReply {
             configuration: CONFIGURATION,
             bucket: BUCKET,
-            key: PAGE_KEY,
+            key,
             status: 200,
             body: b"",
-            version_headers: &[FINAL_VERSION],
+            version_headers: &[version],
         };
-        let page = &self.page_bytes;
-        let put = SidecarPut::new(BUCKET, &self.context, &self.origin, MAP_ID, 0, page).unwrap();
+        let page = &self.page_bytes[index as usize];
+        let put =
+            SidecarPut::new(BUCKET, &self.context, &self.origin, MAP_ID, index, page).unwrap();
         put.verify_reply(reply).unwrap()
     }
 
@@ -165,7 +196,8 @@ impl ReadbackFixture {
     fn response(&self, pin: ReadbackPin<'_>) -> BucketReadbackResponse<MemoryBody<'_>> {
         let (key, version, bytes) = match pin.object_key {
             KEY => (KEY, SHARED_VERSION, &self.media_bytes),
-            PAGE_KEY => (PAGE_KEY, FINAL_VERSION, &self.page_bytes),
+            PAGE_KEY => (PAGE_KEY, FINAL_VERSION, &self.page_bytes[0]),
+            PAGE_ONE_KEY => (PAGE_ONE_KEY, PAGE_ONE_VERSION, &self.page_bytes[1]),
             _ => panic!("unexpected readback key"),
         };
         assert_eq!(pin.configuration, CONFIGURATION);
@@ -208,6 +240,214 @@ async fn completed_readback_binds_the_exact_inventory_after_flac_and_eof() {
             assert_eq!(result.err(), Some(Body(invalid_flac)));
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn postgres_append_stages_only_exact_live_candidate_inventory() {
+    use tokio_postgres::{Client, NoTls, Transaction};
+    use InventoryAppendError::{Conflict, Identity, Indeterminate, MissingOrFenced};
+    async fn connect(url: &str) -> Client {
+        let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
+        tokio::spawn(async move { connection.await.unwrap() });
+        client
+    }
+
+    async fn insert_candidate(
+        tx: &Transaction<'_>,
+        ids: &[String; 5],
+        map: &str,
+        hashes: &[Vec<u8>],
+    ) {
+        tx.query_one(
+            "SELECT public.store_storage_digest_candidate(
+                $1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid, 1, $5)",
+            &[&ids[0], &ids[1], &ids[2], &map, &hashes],
+        )
+        .await
+        .unwrap();
+    }
+
+    let url = std::env::var("NNTUNE_TEST_DATABASE_URL").expect("scratch database URL");
+    assert!(
+        std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+            && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
+            && url == "postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci",
+        "disposable GitHub-hosted migration database required"
+    );
+    let observer = connect(&url).await;
+    let mut writer = connect(&url).await;
+
+    // Put the audio frames after the first digest page boundary using FLAC padding.
+    let mut plaintext = FLAC[..42].to_vec();
+    plaintext[4] = 0;
+    plaintext.extend_from_slice(&[0x81, 0xff, 0xff, 0xff]);
+    plaintext.resize(46 + 0xff_ffff, 0);
+    plaintext.extend_from_slice(&FLAC[42..]);
+    let fixture = ReadbackFixture::new(&plaintext);
+    let receipts = [
+        fixture.sidecar_at(1, PAGE_ONE_KEY, PAGE_ONE_VERSION),
+        fixture.sidecar(),
+    ];
+    let inventory = fixture.inventory(&receipts);
+    let verified = inventory
+        .verify(SCOPE, fixture.envelope(), async |_, pin| {
+            Ok(fixture.response(pin))
+        })
+        .await
+        .unwrap();
+    let mut intent = CandidateIntent {
+        identities: fixture.context.identities[1..].try_into().unwrap(),
+        plaintext_len: fixture.context.plaintext_len,
+        map_id: MAP_ID,
+        header: fixture.context.header,
+        reservation_generation: 1,
+    };
+    let ids = intent.identities.map(hex::encode);
+    let map = hex::encode(MAP_ID);
+    let length = intent.plaintext_len;
+    let envelope = inventory.geometry().sealed_len();
+    let header = hex::encode(intent.header);
+    let digest = hex::encode(fixture.origin.plaintext_sha256());
+    observer.batch_execute(&format!(
+        "INSERT INTO public.storage_environments VALUES ('{0}');
+         INSERT INTO public.storage_library_namespaces VALUES ('{1}', '{0}', NULL);
+         INSERT INTO public.storage_object_intents VALUES ('{2}', '{3}', '{0}', '{1}', '{4}', {length}, {envelope}, decode('{header}', 'hex'));
+         INSERT INTO public.storage_plaintext_digest_claim_intents VALUES ('{2}', '{0}', '{1}', {length}, decode('{digest}', 'hex'));
+         SELECT public.reserve_storage_digest('{2}', 3600);",
+        ids[0], ids[1], ids[2], ids[3], ids[4],
+    )).await.unwrap();
+    let mut hashes: Vec<_> = fixture
+        .origin
+        .candidate_page_hashes(&intent.identities, length, &MAP_ID, &intent.header)
+        .unwrap()
+        .iter()
+        .map(|hash| hash.to_vec())
+        .collect();
+
+    let mut tx = writer.transaction().await.unwrap();
+    for (bucket, configuration) in [("other-bucket", CONFIGURATION), (BUCKET, id(8))] {
+        let scope = ReadbackScope {
+            bucket,
+            configuration,
+        };
+        assert_eq!(
+            append_inventory(&mut tx, &intent, scope, &verified).await,
+            Err(Identity)
+        );
+    }
+    hashes.swap(0, 1);
+    insert_candidate(&tx, &ids, &map, &hashes).await;
+    assert_eq!(
+        append_inventory(&mut tx, &intent, SCOPE, &verified).await,
+        Err(MissingOrFenced)
+    );
+    tx.rollback().await.unwrap();
+
+    hashes.swap(0, 1);
+    let tx = writer.transaction().await.unwrap();
+    insert_candidate(&tx, &ids, &map, &hashes).await;
+    tx.commit().await.unwrap();
+
+    let lookup = "SELECT media_version, page_versions FROM public.storage_digest_inventory_intents WHERE map_id = $1::text::uuid";
+    let pid: i32 = writer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let mut locker = connect(&url).await;
+    let held = locker.transaction().await.unwrap();
+    held.execute("UPDATE public.storage_digest_reservations SET generation = 2 WHERE object_id = $1::text::uuid", &[&ids[2]]).await.unwrap();
+    let mut tx = writer.transaction().await.unwrap();
+    tx.batch_execute("SET LOCAL lock_timeout = '250ms'")
+        .await
+        .unwrap();
+    assert_eq!(
+        append_inventory(&mut tx, &intent, SCOPE, &verified).await,
+        Err(Indeterminate)
+    );
+    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+
+    let mut tx = writer.transaction().await.unwrap();
+    let release = async {
+        while !observer
+            .query_one("SELECT cardinality(pg_blocking_pids($1)) > 0", &[&pid])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        held.commit().await.unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            append_inventory(&mut tx, &intent, SCOPE, &verified),
+            release
+        )
+    })
+    .await
+    .expect("append must resume after the previous holder commits");
+    assert_eq!(result, Err(MissingOrFenced));
+    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+    intent.reservation_generation = 2;
+
+    let mut tx = writer.transaction().await.unwrap();
+    // The insert trigger flips the fixture clock within this transaction.
+    tx.batch_execute(
+        "CREATE TEMP SEQUENCE inventory_insert_attempt;
+         CREATE FUNCTION public.clock_timestamp() RETURNS timestamptz LANGUAGE sql VOLATILE AS $$
+             SELECT CASE WHEN is_called THEN 'infinity' ELSE '-infinity' END::timestamptz
+               FROM pg_temp.inventory_insert_attempt
+         $$;
+         CREATE FUNCTION public.test_mark_inventory_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM nextval('pg_temp.inventory_insert_attempt'); RETURN NEW; END $$;
+         CREATE TRIGGER mark_inventory_insert BEFORE INSERT ON public.storage_digest_inventory_intents
+         FOR EACH ROW EXECUTE FUNCTION public.test_mark_inventory_insert();
+         SET LOCAL search_path = public, pg_catalog;",
+    ).await.unwrap();
+    assert_eq!(
+        append_inventory(&mut tx, &intent, SCOPE, &verified).await,
+        Err(MissingOrFenced)
+    );
+    assert!(tx
+        .query_one(
+            "SELECT is_called FROM pg_temp.inventory_insert_attempt",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+
+    let mut tx = writer.transaction().await.unwrap();
+    append_inventory(&mut tx, &intent, SCOPE, &verified)
+        .await
+        .unwrap();
+    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_some());
+    assert!(observer.query_opt(lookup, &[&map]).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+
+    let mut tx = writer.transaction().await.unwrap();
+    append_inventory(&mut tx, &intent, SCOPE, &verified)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = writer.transaction().await.unwrap();
+    assert_eq!(
+        append_inventory(&mut tx, &intent, SCOPE, &verified).await,
+        Err(Conflict)
+    );
+    let row = tx.query_one(lookup, &[&map]).await.unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(row.get::<_, String>(0), SHARED_VERSION);
+    assert_eq!(
+        row.get::<_, Vec<String>>(1),
+        [FINAL_VERSION, PAGE_ONE_VERSION]
+    );
 }
 
 #[tokio::test]
