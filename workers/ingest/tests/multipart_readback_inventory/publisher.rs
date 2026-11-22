@@ -139,15 +139,15 @@ async fn postgres_stages_completed_candidate_atomically() {
          CREATE TRIGGER wait_for_retention_expiry AFTER INSERT ON public.storage_validated_digest_winners
          FOR EACH ROW EXECUTE FUNCTION pg_temp.wait_for_retention_expiry();",
     ).await.unwrap();
-    let deadline: i64 = tx
-        .query_one(
-            "SELECT floor(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp()))::bigint + 3",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    for (deadline, attempted_insert) in [(0, false), (deadline, true)] {
+    for attempted_insert in [false, true] {
+        let deadline: i64 = tx
+            .query_one(
+                "SELECT CASE WHEN $1 THEN floor(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp()))::bigint + 4 ELSE 0 END",
+                &[&attempted_insert],
+            )
+            .await
+            .unwrap()
+            .get(0);
         assert_eq!(
             stage_completed_candidate(&mut tx, &intent, SCOPE, &verified, deadline).await,
             Err(MissingOrFenced)
