@@ -46,7 +46,8 @@ target. Use the project default for routine implementation and pair GPT
 models, including Sol, with the Codex provider and Claude models with the
 Claude provider. Apply any task-specific model choice when dispatching the
 thread. Follow the independent cross-family review requirements in
-[CONTRIBUTING.md](CONTRIBUTING.md#merge-policy).
+[CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) and include
+[REVIEW.md](REVIEW.md) in each independent review brief.
 
 Use high effort by default. Use xhigh only when the task brief justifies it.
 Never use max or ultra effort.
