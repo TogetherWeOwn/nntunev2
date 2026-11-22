@@ -79,7 +79,7 @@ describe('login page initial state', () => {
 
 		expect(input).toMatch(/\sid="login-email"/);
 		expect(input).toContain('type="email"');
-		expect(input).toMatch(/\srequired(?:\s|>)/);
+		expect(input).toMatch(/\srequired(?=\s|=|\/?>)/);
 		expect(input).toContain('autocomplete="username"');
 	});
 

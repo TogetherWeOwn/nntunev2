@@ -55,7 +55,7 @@ describe('signup page initial state', () => {
 
 		expect(input).toMatch(/\sid="signup-email"/);
 		expect(input).toContain('type="email"');
-		expect(input).toMatch(/\srequired(?:\s|>)/);
+		expect(input).toMatch(/\srequired(?=\s|=|\/?>)/);
 		expect(input).toContain('autocomplete="username"');
 	});
 });
