@@ -54,9 +54,44 @@ test('Home previews up to five catalogue rows in order and links to Search', asy
 	expect(catalogueRequests).toBe(1);
 	await shelf.getByRole('link', { name: 'Search your library' }).click();
 	await expect(page).toHaveURL(/\/search$/);
-	await page.getByLabel('Search your library').fill('Charlie');
-	await page.getByRole('search').getByRole('button', { name: 'Search' }).click();
-	await expect(page.getByRole('main').getByRole('listitem')).toHaveText('Charlie — Example Artist');
+
+	const main = page.getByRole('main');
+	const topBarSearch = page
+		.getByTestId('shell-topbar')
+		.getByRole('search', { name: 'Top bar', exact: true });
+	const librarySearch = main.getByRole('search', { name: 'Search your library', exact: true });
+	await expect(page.getByRole('search')).toHaveCount(2);
+	await expect(topBarSearch).toBeVisible();
+	await expect(librarySearch).toBeVisible();
+
+	await expect(main.getByText('Type above to search your library by title or artist.')).toBeVisible();
+	const status = main.getByRole('status');
+	await expect(status).toBeEmpty();
+	const mountedStatus = await status.elementHandle();
+	const field = librarySearch.getByRole('searchbox', { name: 'Search your library' });
+	const results = main.getByRole('listitem');
+	await field.fill('Charlie');
+	await librarySearch.getByRole('button', { name: 'Search', exact: true }).click();
+	await expect(page).toHaveURL('/search?q=Charlie');
+	await expect(status).toHaveText('1 result for “Charlie”.');
+	await expect(results).toHaveText('Charlie — Example Artist');
+	expect(await status.evaluate((current, original) => current === original, mountedStatus)).toBe(true);
+
+	await field.fill('No such track');
+	await expect(page).toHaveURL('/search?q=Charlie');
+	await expect(status).toHaveText('1 result for “Charlie”.');
+	await field.press('Enter');
+	await expect(status).toHaveText('No results for “No such track”.');
+	await expect(results).toHaveCount(0);
+	expect(await status.evaluate((current, original) => current === original, mountedStatus)).toBe(true);
+
+	const topBarField = topBarSearch.getByRole('searchbox', { name: 'Search', exact: true });
+	await topBarField.fill('Example Artist');
+	await topBarField.press('Enter');
+	await expect(field).toHaveValue('Example Artist');
+	await expect(status).toHaveText('6 results for “Example Artist”.');
+	await expect(results).toHaveCount(6);
+	expect(await status.evaluate((current, original) => current === original, mountedStatus)).toBe(true);
 });
 
 for (const { status, message, action } of [
