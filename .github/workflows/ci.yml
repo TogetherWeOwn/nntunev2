@@ -31,6 +31,29 @@ env:
   PNPM_VERSION: 10.34.7
 
 jobs:
+  ci-commits:
+    name: ci-commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      merge_sha: ${{ steps.commits.outputs.merge_sha }}
+      base_sha: ${{ steps.commits.outputs.base_sha }}
+      head_sha: ${{ steps.commits.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve tested commit and comparison range
+        id: commits
+        run: python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"
+      - name: Reject added direct PR SHA reads
+        env:
+          BASE_SHA: ${{ steps.commits.outputs.base_sha }}
+          MERGE_SHA: ${{ steps.commits.outputs.merge_sha }}
+        run: python3 .github/scripts/check_workflow_pr_shas.py --base "$BASE_SHA" --tested "$MERGE_SHA"
+      - name: Test the workflow SHA ratchet
+        run: python3 .github/scripts/test_workflow_pr_shas.py
   # PR-only public security caller; never scan push/queue/dispatch events.
   # Keep this in the ci-ok dependency graph rather than waiting across workflows.
   public-pr-security:
@@ -452,9 +475,7 @@ jobs:
     name: migrations-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      MIGRATIONS_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      MIGRATIONS_PUSH_BEFORE: ${{ github.event.before }}
+    needs: ci-commits
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -462,15 +483,9 @@ jobs:
           persist-credentials: false
       - name: Verify Python version
         run: python3 -c "import sys, tomllib; assert sys.version_info >= (3, 11), sys.version"
-      # Keep the default PR integration checkout. Its first parent pairs
-      # with that exact tree; the payload's base.sha can be stale. Pushes
-      # still compare event.before, including pushes of merge commits.
-      - name: Select migration comparison base
-        id: migrations-base
-        run: python3 .github/scripts/migrations_base.py --root . >> "$GITHUB_OUTPUT"
       - name: Check migration manifest and drift
         env:
-          MIGRATIONS_BASE_REF: ${{ steps.migrations-base.outputs.base_ref }}
+          MIGRATIONS_BASE_REF: ${{ needs.ci-commits.outputs.base_sha }}
         run: python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"
       - name: Test migration comparison selection and workflow wiring
         run: python3 .github/scripts/test_migrations_base.py
@@ -1352,9 +1367,9 @@ jobs:
     name: docs-links
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Compare pushes with their previous tip; comparing main to itself would miss drift.
+    needs: ci-commits
     env:
-      DOCS_LINKS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
+      DOCS_LINKS_BASE_REF: ${{ needs.ci-commits.outputs.base_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2114,7 +2129,7 @@ jobs:
   # names job IDs, not matrix legs: the web-e2e entry covers both shards.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
+    needs: [ci-commits, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
