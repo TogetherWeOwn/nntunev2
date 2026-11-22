@@ -60,10 +60,10 @@ import {
 //     page's (non-)identity for account-specific browser assertions.
 //   - With a session: the minted session is planted as the `__Host-`
 //     session cookie (pinned name, host-only origin scope, `Path=/`,
-//     `Secure`, `HttpOnly`, `SameSite=Lax` — the only credential session
-//     routes accept), and staging-origin requests are fetched with
-//     maxRedirects: 0 carrying `Bearer <session>` (never the QA token);
-//     foreign-origin requests continue unmodified (origin scoping and
+//     `Secure`, `HttpOnly`, `SameSite=Lax`) on HTTPS. Staging-origin
+//     requests carry the Access pair with maxRedirects: 0 and authenticate
+//     with the cookie. HTTP doubles use `Bearer <session>` for identity.
+//     Foreign-origin requests continue unmodified (origin scoping and
 //     no-follow protections preserved).
 //   - Non-https origins (the offline http doubles) get no cookie plant:
 //     `__Host-` is Secure-only and the browser would reject it there.
