@@ -202,17 +202,20 @@ async fn postgres_presence_keeps_authority_and_replay_state_together() {
     run(&mut db, &foreign, START, Heartbeat(2)).await.unwrap();
     let tx = db.read_committed().await.unwrap();
     apply(&tx, &second, START + 1, Heartbeat(10)).await.unwrap();
-    assert_eq!(
-        writer
-            .query_one(
-                "SELECT id FROM sessions WHERE id = $1 FOR UPDATE NOWAIT",
-                &[&peer.session_id]
-            )
-            .await
-            .unwrap_err()
-            .code(),
-        Some(&SqlState::LOCK_NOT_AVAILABLE)
-    );
+    // Match another login's account lock and a non-key session UPDATE.
+    let owner_probe = "SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE NOWAIT";
+    let session_probe = "SELECT id FROM sessions WHERE id = $1 FOR NO KEY UPDATE NOWAIT";
+    for (probe, id) in [
+        (owner_probe, &peer.user_id),
+        (session_probe, &peer.session_id),
+    ] {
+        let blocked = writer.query_one(probe, &[id]).await.unwrap_err();
+        assert_eq!(
+            blocked.code(),
+            Some(&SqlState::LOCK_NOT_AVAILABLE),
+            "{probe}"
+        );
+    }
     tx.rollback().await.unwrap();
     run(&mut writer, &second, START + 1, Heartbeat(10))
         .await
