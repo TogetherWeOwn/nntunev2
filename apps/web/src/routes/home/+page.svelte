@@ -23,9 +23,9 @@
 	let requiresSignIn = $state(false);
 	let accessRefused = $state(false);
 
-	const session = browserStorage('session');
+	let session: ReturnType<typeof browserStorage> = null;
 	const local = browserStorage('local');
-	let favoriteIds = $state(loadFavorites(session, local));
+	let favoriteIds = $state<string[]>([]);
 	let recentQueries = $state<string[]>([]);
 	let readyRecentFindsKey: string | null = null;
 
@@ -40,11 +40,15 @@
 			requiresSignIn = state.requiresSignIn;
 			accessRefused = update.authBoundary && !state.verificationSuspended && !state.requiresSignIn;
 			if (update.authBoundary) {
+				session = null;
+				favoriteIds = [];
 				readyRecentFindsKey = null;
 				recentQueries = [];
 			}
 			// Only a current successful listing may make its history scope ready.
 			void update.runIfCurrent?.(() => {
+				session = update.storageScope ?? null;
+				favoriteIds = loadFavorites(session, local);
 				readyRecentFindsKey = recentFindsKey(session);
 				recentQueries = loadRecentFinds(session, local);
 			});

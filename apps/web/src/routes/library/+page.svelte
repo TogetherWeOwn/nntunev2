@@ -330,6 +330,8 @@
 	const downloadFavoritesM3U = favoritesExport.downloadM3U;
 
 	let trackMenu = $state<MenuRequest | null>(null);
+	let libraryStorage: ReturnType<typeof browserStorage> = null;
+	let librarySession: LibraryRefreshUpdate['accountSession'];
 
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
@@ -346,6 +348,14 @@
 		onStateChange: (state, receipt) => {
 			const { isCurrent, authoritative, authBoundary, runIfCurrent, sessionBinding } = receipt;
 			if (!isCurrent()) return;
+			if (receipt.storageScope !== undefined) {
+				libraryStorage = receipt.storageScope;
+				librarySession = receipt.accountSession;
+			}
+			if (authBoundary && !state.verificationSuspended) {
+				libraryStorage = null;
+				librarySession = undefined;
+			}
 			collectionReceipt = runIfCurrent;
 			const revoked = authBoundary && !state.verificationSuspended;
 			if (sessionBinding && runIfCurrent) {
@@ -420,7 +430,7 @@
 			// fails; Refresh must not overwrite pending edits with stale storage.
 			// Auth transitions and access refusals reset both memory and bootstrap.
 			if (authoritative && !state.loadError && !state.libraryUnavailable) {
-				const session = browserStorage('session'), key = favoritesKey(session);
+				const session = libraryStorage, key = favoritesKey(session);
 				if (!favoritesInitialized || (sessionBinding ? key !== favoritesAuthKey : !favoritesAuthKey && key)) {
 					favoritesAuthKey = key;
 					currentFavoriteEdit++;
@@ -430,7 +440,7 @@
 					favoritesInitialized = true;
 				}
 				if (!recentFindsInitialized) {
-					recentFinds = loadRecentFinds(browserStorage('session'), browserStorage('local'));
+					recentFinds = loadRecentFinds(libraryStorage, browserStorage('local'));
 					recentFindsInitialized = true;
 				}
 				applyShareLink();
@@ -801,7 +811,8 @@
 		placement?: { id: string; crossed: string; direction: FavoriteMoveDirection; loaded: ReadonlySet<string> },
 		playerId?: string
 	): Promise<FavoriteWrite> {
-		const session = browserStorage('session');
+		const session = libraryStorage, owner = librarySession;
+		if (owner && !owner.isCurrent()) return Promise.resolve(null);
 		const key = playerId ? favoritesAuthKey : favoritesKey(session);
 		const edit = ++favoriteEdit;
 		const before = favorites;
@@ -825,8 +836,8 @@
 		return updateStoredFavorites(session, browserStorage('local'), key, (latest) => {
 			base = latest;
 			return (superseded = stale()) ? latest : update(latest);
-		}).then((committed) => {
-			if ((playerId && !ownsWrite()) || favoritesKey(session) !== key) return null;
+		}, undefined, owner?.run).then((committed) => {
+			if ((playerId && !ownsWrite()) || (owner && !owner.isCurrent()) || favoritesKey(session) !== key) return null;
 			superseded ||= !committed && stale();
 			if (playerId && rollback && pendingPlayerFavorites.get(playerId) === rollback) {
 				pendingPlayerFavorites.delete(playerId);
@@ -1016,7 +1027,7 @@
 		const next = recordRecentFind(recentFinds, findQuery);
 		if (next === recentFinds) return;
 		recentFinds = [...next];
-		saveRecentFinds(browserStorage('session'), browserStorage('local'), recentFinds);
+		saveRecentFinds(libraryStorage, browserStorage('local'), recentFinds);
 		recentFindsAnnouncement = announceRecentFind('Saved', recentFinds[0]);
 	}
 
@@ -1028,14 +1039,14 @@
 		const next = recordRecentFind(recentFinds, query);
 		if (next !== recentFinds) {
 			recentFinds = [...next];
-			saveRecentFinds(browserStorage('session'), browserStorage('local'), recentFinds);
+			saveRecentFinds(libraryStorage, browserStorage('local'), recentFinds);
 		}
 		recentFindsAnnouncement = announceRecentFind('Applied', query);
 	}
 
 	function clearRecentFinds(): void {
 		recentFinds = [];
-		saveRecentFinds(browserStorage('session'), browserStorage('local'), []);
+		saveRecentFinds(libraryStorage, browserStorage('local'), []);
 		recentFindsAnnouncement = 'Cleared recent searches.';
 		// The focused clear button unmounts with the list; keep focus in the section.
 		void tick().then(() => recentFindsEmpty?.focus({ preventScroll: true }));
@@ -1550,7 +1561,8 @@
 		clearSnapshot(browserStorage('local'));
 		const releaseFavoriteAction = player.currentFavorite.bind({
 			read: (id) => shareAlive && favoritesInitialized && !libraryUnavailable && loadError === null &&
-				queueController.hasLibraryTrack(id) && favoritesKey(browserStorage('session')) === favoritesAuthKey
+				queueController.hasLibraryTrack(id) && (!librarySession || librarySession.isCurrent()) &&
+				favoritesKey(libraryStorage) === favoritesAuthKey
 					? { pressed: favoriteIds.has(id), edit: currentFavoriteEdit, loading } : null,
 			write: (id) => toggleFavorite(id, true)
 		});
