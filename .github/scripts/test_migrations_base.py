@@ -109,7 +109,7 @@ class Graph(unittest.TestCase):
             "pull_request": {"base": {"sha": self.old},
                              "head": {"sha": env.pop("MIGRATIONS_PR_HEAD_SHA", self.pr_tip)}},
             "merge_group": {"base_sha": env.pop("QUEUE_BASE_SHA", self.old),
-                            "head_sha": self.merge},
+                            "head_sha": env.pop("QUEUE_HEAD_SHA", self.merge)},
         }
         before = env.pop("MIGRATIONS_PUSH_BEFORE", None)
         if before is not None:
@@ -323,13 +323,13 @@ class OtherEventBaselineTests(Graph):
                 env = {"GITHUB_EVENT_NAME": event, "GITHUB_REF": "refs/heads/x", "GITHUB_SHA": self.merge}
                 self.assert_base(self.helper(**env), self.main_tip)
 
-    def test_queue_uses_pinned_base_and_rejects_wrong_checkout(self):
+    def test_queue_requires_pinned_head_and_ancestor_base(self):
         env = {"GITHUB_EVENT_NAME": "merge_group", "GITHUB_SHA": self.merge}
         result = self.helper(**env)
         self.assert_base(result, self.old)
-        self.assertEqual(self.merge, self.outputs(result)["head_sha"])
-        self.assert_closed(self.helper(**env, QUEUE_BASE_SHA="3" * 40))
-        self.assert_closed(self.helper(**{**env, "GITHUB_SHA": self.main_tip}))
+        unrelated = git(self.root, "commit-tree", f"{self.merge}^{{tree}}", "-m", "unrelated")
+        self.assert_closed(self.helper(**env, QUEUE_BASE_SHA=unrelated))
+        self.assert_closed(self.helper(**env, QUEUE_HEAD_SHA=self.main_tip))
 
     def test_local_main_preferred_then_origin_main(self):
         env = {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": self.merge}
