@@ -57,6 +57,16 @@ keep repository harness configuration free of model pins, model-selection
 environment variables and model-forcing hooks. The root `CLAUDE.md` imports
 these shared instructions.
 
+## Shell cleanup
+
+Never use forced `rm`, including `rm -f`, `rm -rf` or `rm --force`. This
+applies inside trap cleanups, `bash -lc` strings and all other wrappers.
+Use `rm -r -- "$dir"` for a directory and `rm -- "$file"` for a file. If
+cleanup is optional and the path might be absent, check for it first.
+
+Report shell approval prompts to the task lead with the exact command
+shape. Preserve the flags and wrapper and redact sensitive literals.
+
 ## CI and verification location
 
 Full test suites and CI gates run on GitHub Actions, never as local
