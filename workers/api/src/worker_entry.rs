@@ -7901,15 +7901,14 @@ fn subsonic_catalogue_error(query: &str) -> nntune_subsonic::HttpResponse {
     )
 }
 
-pub(crate) fn begin_production_snapshot(
+pub(crate) async fn with_production_snapshot<T>(
     query: &str,
-) -> Result<
-    nntune_subsonic::construction_permit::ConstructionPermit<'static>,
-    nntune_subsonic::HttpResponse,
-> {
-    nntune_subsonic::construction_permit::CONSTRUCTION_SLOT
+    prepare_response: impl Future<Output = T>,
+) -> Result<T, nntune_subsonic::HttpResponse> {
+    let _permit = nntune_subsonic::construction_permit::CONSTRUCTION_SLOT
         .try_acquire()
-        .ok_or_else(|| subsonic_catalogue_error(query))
+        .ok_or_else(|| subsonic_catalogue_error(query))?;
+    Ok(prepare_response.await)
 }
 
 fn construct_production_subsonic_snapshot(
@@ -8008,69 +8007,60 @@ pub async fn subsonic_mount(
         .await
         .map_err(|err| core::auth_error_response(&merged, err))
     };
-    // Keep the shared slot through account lookup and Worker response preparation.
-    let (principal, _snapshot_permit, (artist_rows, release_rows, track_rows)) =
-        match after_auth(auth, |principal| {
-            let store = &store;
-            let merged = &merged;
-            async move {
-                let permit = begin_production_snapshot(merged)?;
-                let rows = catalogue_for_route(path, || async {
-                    store
-                        .subsonic_member_catalogue(principal.user_id())
-                        .await
-                        .map_err(|_| subsonic_catalogue_error(merged))
-                })
-                .await?;
-                Ok((principal, permit, rows))
-            }
+    let response = after_auth(auth, |principal| {
+        let store = &store;
+        let merged = &merged;
+        with_production_snapshot(merged, async move {
+            let catalogue = catalogue_for_route(path, || {
+                store.subsonic_member_catalogue(principal.user_id())
+            })
+            .await;
+            let (artist_rows, release_rows, track_rows) = match catalogue {
+                Ok(rows) => rows,
+                Err(_) => return respond_document(&subsonic_catalogue_error(merged)),
+            };
+            let (email, role) = match store.subsonic_account(principal.user_id()).await {
+                Ok(Some(pair)) => pair,
+                _ => return respond_document(&subsonic_catalogue_error(merged)),
+            };
+            let is_admin = role == "admin";
+            let identity = Identity {
+                username: principal.username().to_string(),
+                email: email.clone(),
+                is_admin,
+            };
+            let account = UserAccount {
+                email,
+                is_admin,
+                is_manager: role == "manager",
+            };
+            let (artists, albums, songs) = match construct_production_subsonic_snapshot(
+                &artist_rows,
+                &release_rows,
+                &track_rows,
+                merged,
+                PRODUCTION_SNAPSHOT_LIMITS,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(response) => return respond_document(&response),
+            };
+            let app = SubsonicApp::production(core::ProductionStore::new(
+                identity,
+                account,
+                artists,
+                albums,
+                songs,
+                track_rows,
+                now_millis as i64,
+            ));
+            respond_document(&app.handle(method, path, query, body))
         })
-        .await
-        {
-            Ok(result) => result,
-            Err(response) => return respond_document(&response),
-        };
-    let (email, role) = match store.subsonic_account(principal.user_id()).await {
-        Ok(Some(pair)) => pair,
-        _ => {
-            return respond_document(&core::render_error(
-                &merged,
-                code::GENERIC,
-                "Internal server error.",
-            ))
-        }
-    };
-    let is_admin = role == "admin";
-    let identity = Identity {
-        username: principal.username().to_string(),
-        email: email.clone(),
-        is_admin,
-    };
-    let account = UserAccount {
-        email,
-        is_admin,
-        is_manager: role == "manager",
-    };
-    let (artists, albums, songs) = match construct_production_subsonic_snapshot(
-        &artist_rows,
-        &release_rows,
-        &track_rows,
-        &merged,
-        PRODUCTION_SNAPSHOT_LIMITS,
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(response) => return respond_document(&response),
-    };
-    let app = SubsonicApp::production(core::ProductionStore::new(
-        identity,
-        account,
-        artists,
-        albums,
-        songs,
-        track_rows,
-        now_millis as i64,
-    ));
-    respond_document(&app.handle(method, path, query, body))
+    })
+    .await;
+    match response {
+        Ok(response) => response,
+        Err(response) => respond_document(&response),
+    }
 }
 
 // The runtime path has no query; restore it only for list routes that use it.
@@ -8319,52 +8309,30 @@ mod tests {
             .1
             .split_once("\n}\n")
             .expect("production mount must have a closing brace");
-        let (before_store, before_dispatch) = mount
+        let (before_admission, admitted) = mount
+            .split_once("with_production_snapshot(merged, async move {")
+            .expect("mount delegates preparation to the construction guard");
+        assert!(before_admission.contains("after_auth(auth, |principal| {"));
+        assert!(!before_admission.contains("catalogue_for_route("));
+        assert!(!before_admission.contains("subsonic_account("));
+        let (admitted, finish) = admitted
+            .split_once("\n        })\n    })")
+            .expect("construction guard ends inside the authentication callback");
+        assert!(admitted.contains("catalogue_for_route("));
+        assert!(admitted.contains("subsonic_account("));
+        assert!(admitted.ends_with("respond_document(&app.handle(method, path, query, body))"));
+        assert!(!finish.contains("app.handle("));
+
+        let (before_store, before_dispatch) = admitted
             .split_once("ProductionStore::new(")
             .expect("dispatch store");
         assert!(!before_store.contains("app.handle("));
         assert!(before_dispatch.contains("app.handle("));
         assert!(!mount.contains("build_snapshot("));
 
-        let admission: String = before_store
-            .split_once("let (principal, _snapshot_permit,")
-            .expect("mount retains its construction permit")
-            .1
-            .split_once("let (email, role)")
-            .expect("account read follows construction admission")
-            .0
-            .split_ascii_whitespace()
-            .collect();
-        let expected: String = r#"
-            (artist_rows, release_rows, track_rows)) =
-            match after_auth(auth, |principal| {
-                let store = &store;
-                let merged = &merged;
-                async move {
-                    let permit = begin_production_snapshot(merged)?;
-                    let rows = catalogue_for_route(path, || async {
-                        store
-                            .subsonic_member_catalogue(principal.user_id())
-                            .await
-                            .map_err(|_| subsonic_catalogue_error(merged))
-                    })
-                    .await?;
-                    Ok((principal, permit, rows))
-                }
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(response) => return respond_document(&response),
-            };
-        "#
-        .split_ascii_whitespace()
-        .collect();
-        assert_eq!(admission, expected);
-
         // Compare the entire account-to-store span, not a substring that could be commented out.
         let construction: String = before_store
-            .split_once("\n    let account = UserAccount {")
+            .split_once("let account = UserAccount {")
             .expect("account setup")
             .1
             .split_ascii_whitespace()
@@ -8373,7 +8341,7 @@ mod tests {
             email, is_admin, is_manager: role == "manager",
             };
             let (artists, albums, songs) = match construct_production_subsonic_snapshot(
-                &artist_rows, &release_rows, &track_rows, &merged, PRODUCTION_SNAPSHOT_LIMITS,
+                &artist_rows, &release_rows, &track_rows, merged, PRODUCTION_SNAPSHOT_LIMITS,
             ) {
                 Ok(snapshot) => snapshot,
                 Err(response) => return respond_document(&response),

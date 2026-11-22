@@ -76,7 +76,7 @@ impl StagingConstruction {
 mod tests {
     use super::*;
     use crate::subsonic_http::{StagingBody, STAGING_SOURCE_BYTES};
-    use crate::worker_entry::begin_production_snapshot;
+    use crate::worker_entry::with_production_snapshot;
 
     fn empty_input(limit: usize) -> StagingInput {
         StagingInput {
@@ -89,8 +89,8 @@ mod tests {
     }
 
     // Exercise both cases in one test so they do not race for the real slot.
-    #[test]
-    fn construction_refuses_busy_and_credentials_use_the_carried_budget() {
+    #[tokio::test]
+    async fn construction_refuses_busy_and_credentials_use_the_carried_budget() {
         let mut expected = ConstructionBudget::new(usize::MAX);
         expected.charge(STAGING_SOURCE_BYTES, 1, 1).unwrap();
         let form_charge = expected.charged();
@@ -107,7 +107,7 @@ mod tests {
                 StagingConstruction::begin(empty_input(0)),
                 Err(StagingRejection::BusyOrCapacity)
             ));
-            assert!(begin_production_snapshot("f=json").is_err());
+            assert_production_snapshot_is_busy().await;
             assert_eq!(scope.input.budget.charged(), form_charge);
             let result = scope.parse_credentials();
             if limit < charge {
@@ -120,14 +120,43 @@ mod tests {
             }
             assert!(CONSTRUCTION_SLOT.try_acquire().is_none());
             drop(scope);
-            let production = begin_production_snapshot("f=json").unwrap();
-            assert!(begin_production_snapshot("f=json").is_err());
-            assert!(matches!(
-                StagingConstruction::begin(empty_input(0)),
-                Err(StagingRejection::BusyOrCapacity)
-            ));
-            drop(production);
-            assert!(StagingConstruction::begin(empty_input(0)).is_ok());
         }
+
+        // An in-flight production read blocks admission. Dropping that future
+        // releases the slot, even though response preparation never ran.
+        {
+            let mut production = std::pin::pin!(with_production_snapshot(
+                "f=json",
+                std::future::pending::<()>(),
+            ));
+            assert!(futures_util::poll!(production.as_mut()).is_pending());
+            assert_production_snapshot_is_busy().await;
+            assert_staging_snapshot_is_busy();
+        }
+        let prepared = with_production_snapshot("f=json", async {
+            tokio::task::yield_now().await;
+            assert_production_snapshot_is_busy().await;
+            assert_staging_snapshot_is_busy();
+            "prepared"
+        })
+        .await
+        .unwrap();
+        assert_eq!(prepared, "prepared");
+        assert!(StagingConstruction::begin(empty_input(0)).is_ok());
+    }
+
+    async fn assert_production_snapshot_is_busy() {
+        let refusal = with_production_snapshot::<()>("f=json", async {
+            panic!("a busy snapshot must skip response preparation");
+        })
+        .await;
+        assert!(refusal.is_err());
+    }
+
+    fn assert_staging_snapshot_is_busy() {
+        assert!(matches!(
+            StagingConstruction::begin(empty_input(0)),
+            Err(StagingRejection::BusyOrCapacity)
+        ));
     }
 }

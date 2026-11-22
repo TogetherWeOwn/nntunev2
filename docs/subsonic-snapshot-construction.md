@@ -17,6 +17,10 @@ reads. It holds the slot through mapping, dispatch and Worker response
 preparation. This limits authenticated construction to one at a time per
 isolate. Input and authentication happen before admission, and the runtime
 can retain response buffers after the permit drops.
+Dropping a pending Rust future releases its permit. Candidate liveness still
+depends on the Worker runtime's handling of disconnects, cancellation and
+traps, including whether an affected isolate can continue serving with the
+slot occupied.
 
 The Worker manifest pins Rust 1.98.1 and its wasm32 standard library. The
 construction ledger computes a provisional charge for each nonempty allocation
