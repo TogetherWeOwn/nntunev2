@@ -48,8 +48,13 @@ dispatch. Follow the independent cross-family review requirements in
 [CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) based on the model that ran
 each review. Include [REVIEW.md](REVIEW.md) in each independent review brief.
 
-Use high effort by default. Use xhigh only when the task brief justifies it.
-Never use max or ultra effort.
+- Use `claude-opus-5-5` whenever selecting Opus. Name that exact model ID
+  in task, review and child briefs that request Opus, and set the effort
+  explicitly. Use `medium` effort by default for tasks and reviews. Use
+  `high` or `xhigh` only when the brief documents why the task needs it.
+- Use `high` effort by default for Sol. Use `xhigh` only when the brief
+  justifies it.
+- Never use `max`, `ultra` or `ultrathink` on any model.
 
 Keep model and effort policy here. Leave model selection to T3 Code and
 keep repository harness configuration free of model pins, model-selection
