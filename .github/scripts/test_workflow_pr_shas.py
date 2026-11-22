@@ -31,11 +31,12 @@ class WorkflowReadRatchet(unittest.TestCase):
             git("config", "user.email", "workflow@example.invalid")
             workflow = root / ".github/workflows/sample.yaml"
             workflow.parent.mkdir(parents=True)
-            stale, base, tested, moved, bad = map(commit, ("stale", "base", "resolved", "moved", "bad"))
+            stale, base, renamed, tested, moved, bad = map(commit, ("stale", "base", "renamed", "resolved", "moved", "bad"))
 
             def compare(against, candidate):
                 return run(sys.executable, str(CHECK), "--base", against, "--tested", candidate, check=False)
 
+            self.assertEqual(0, compare(base, renamed).returncode)
             self.assertEqual(0, compare(base, tested).returncode)
             self.assertEqual(1, compare(stale, tested).returncode)
             self.assertEqual(1, compare(base, moved).returncode)

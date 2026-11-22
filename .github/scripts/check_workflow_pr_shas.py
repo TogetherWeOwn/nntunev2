@@ -34,7 +34,7 @@ def scalar_fields(node, location, seen):
     elif isinstance(node, yaml.SequenceNode):
         for index, child in enumerate(node.value):
             label = next((value.value for key, value in child.value
-                          if key.value in ("id", "name") and isinstance(value, yaml.ScalarNode)),
+                          if key.value == "id" and isinstance(value, yaml.ScalarNode)),
                          str(index)) if isinstance(child, yaml.MappingNode) else str(index)
             yield from scalar_fields(child, (*location, f"[{label}]"), seen)
 
