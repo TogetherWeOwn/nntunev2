@@ -216,9 +216,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for required checks and the
 review/merge policy. `ci-ok`, `gitleaks`, `pr-lint`, `migrations-staging`
 and `Devin Review` must pass, and review findings must be fixed or answered.
 CodeRabbit is advisory. Answer its findings without waiting for it. The task
-owner merges the pinned head after the review and CI gates pass. A merge that
-could reach production or a production promotion needs the repository
-owner's authorization for the exact commit.
+owner merges the pinned head after the review and CI gates pass. A change
+that could deploy to production follows the separate
+[production release process](CONTRIBUTING.md#production-releases).
 
 ## Security
 

@@ -222,16 +222,18 @@ plan and evidence before making the production change.
    change.
 4. Commission a separate cross-family production release review. Obtain the
    reviewer's explicit approval for the exact candidate after they review the
-   plan and evidence. If they block the release, address the findings and obtain
-   a fresh review. This decision supplies the Release Manager acceptance named
-   in existing workflows and runbooks. The release task owner coordinates
-   dispatch with the existing credential and environment custodians.
+   plan and evidence. Record the reviewer, decision and accepted SHA in the
+   release task. If they block the release, address the findings and obtain a
+   fresh review. This decision supplies the Release Manager acceptance named in
+   existing workflows and runbooks. The release task owner coordinates dispatch
+   with the existing credential and environment custodians.
 5. Use the existing protected workflow for the action. Meet its exact-SHA
    admission, environment protection, credential custody and approval-reference
    requirements, where applicable. For `deploy-production`, the GitHub
-   custodian records the approved commit in `PRODUCTION_ACCEPTED_SHA` in the
-   `production` Environment only. Stop if no protected workflow supports the
-   action or if the workflow's enablement gates are closed.
+   custodian verifies the recorded approval for the exact commit before
+   setting `PRODUCTION_ACCEPTED_SHA` in the `production` Environment only.
+   Stop if no protected workflow supports the action or if the workflow's
+   enablement gates are closed.
 6. Watch production health and errors for at least 30 minutes after release.
    Roll back immediately on a regression and record the outcome.
 
