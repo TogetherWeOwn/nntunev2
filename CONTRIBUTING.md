@@ -138,9 +138,14 @@ labels are the durable record behind it.
 The task thread owns the PR and its follow-through without separate role
 handoffs for ordinary PRs. Follow the risk floors and Attestation format
 in the [PR template](.github/pull_request_template.md).
-Instruction changes in `AGENTS.md`, `CONTRIBUTING.md`, `REVIEW.md`,
-`.claude/**` or `.github/**` require at least T1 review, including when the
-validator permits a docs-only T2 Attestation for root Markdown files.
+Instruction changes in `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`,
+`REVIEW.md`, `.claude/**` or `.github/**` require at least T1 review,
+including when the validator permits a docs-only T2 Attestation for root
+Markdown files. Keep T0 review for sensitive paths and content triggers in
+the [review map](.github/review-tiers.yml), including CI gates and tool
+permissions. The four root instruction documents and `.claude/agents/*.md`
+may use T1 for Markdown-only guidance changes when no content trigger applies.
+Use the review counts below where the map refers to named review stages.
 
 | Review tier | Independent read-only review before merge |
 | --- | --- |
@@ -161,10 +166,11 @@ without changing the PR or merging it.
   is the PR title.
 - Delete the branch on merge (automatic repo setting).
 - Verify the effective branch rules before merging. Require **`ci-ok`,
-  `gitleaks`, `pr-lint`, `pr-size-gate / gate`, `migrations-staging` and
-  `Devin Review`** alongside the required org PR-standards workflow and
-  CodeQL rules. CodeRabbit is advisory. Answer its findings when it reviews
-  without waiting for it or triggering it manually.
+  `gitleaks`, `pr-lint`, `pr-size-gate / gate` and `migrations-staging`**
+  alongside the required org PR-standards workflow and CodeQL rules.
+  Verify **`Devin Review`** separately on the final head, even if GitHub
+  already allows the merge. CodeRabbit is advisory. Answer its findings
+  when it reviews without waiting for it or triggering it manually.
 - `main` currently deploys staging. Recheck automatic deployment paths and
   default-head provider deployments/checks before merging. Stop if a merge
   could reach production or the deployment path is uncertain, even for
@@ -182,8 +188,9 @@ without changing the PR or merging it.
   in the PR body (what it catches that tests cannot).
 - For [staging migrations](docs/ops.md#staging-migrations), applies are
   recorded in `schema_migrations` and the staging deploy gate compares them
-  with `migrations/manifest.toml`. Obtain and record the required DDL approval
-  before dispatching `.github/workflows/migrations-staging-apply.yml` from `main`.
+  with `migrations/manifest.toml`. Obtain and record the DDL's board approval
+  as specified in the runbook before dispatching
+  `.github/workflows/migrations-staging-apply.yml` from `main`.
   Supply the approved full commit `ref`, migration `file`, `applied_by` and
   the recorded approval reference required by `board_approval`. If the
   approval or its required evidence is unavailable, stop before dispatch.

@@ -18,12 +18,13 @@ thread when the work is complete.
 [CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) defines review
 tiers, exact-commit evidence and merge authority.
 
-The repository owner decides class-B design and policy changes and is the
-sole production approver. Stop and ask for explicit authorization for the
-exact commit before any production action or any merge that could reach
-production. This includes uncertain deployment paths, deploys, migrations,
-secrets and grants. Follow the production admission and access gates in
-[the operations runbook](docs/ops.md#staging-promotion-checklist).
+The repository owner decides class-B design and policy changes. The owner
+is the sole production approver and holds the Release Manager authority
+named in the runbook and workflows. Stop and ask for explicit authorization
+for the exact commit before any production action or any merge that could
+reach production. This includes uncertain deployment paths, deploys,
+migrations, secrets and grants. Follow the production admission and access
+gates in [the operations runbook](docs/ops.md#staging-promotion-checklist).
 
 Keep staging and production storage separate, and keep scratch data out of
 archive buckets. Existing access, retention and deletion controls apply to
