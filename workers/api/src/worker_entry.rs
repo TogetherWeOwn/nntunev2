@@ -4247,7 +4247,7 @@ impl Store for PgStore {
                     "SELECT {CREDENTIAL_COLUMNS} FROM webauthn_credentials WHERE cred_id = $1"
                 );
                 let row = client
-                    .query_opt(&sql, &[&cred_id_b64url])
+                    .query_typed_opt(&sql, &[(&cred_id_b64url, Type::TEXT)])
                     .await
                     .map_err(|_| StoreError)?;
                 row.map(|r| credential_from_row(&r)).transpose()
@@ -4288,10 +4288,14 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 let rows = client
-                    .query(
+                    .query_typed(
                         "UPDATE webauthn_credentials SET sign_count = $3 \
                  WHERE cred_id = $1 AND sign_count = $2 RETURNING cred_id",
-                        &[&cred_id_b64url, &i64::from(expected), &i64::from(new)],
+                        &[
+                            (&cred_id_b64url, Type::TEXT),
+                            (&i64::from(expected), Type::INT8),
+                            (&i64::from(new), Type::INT8),
+                        ],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -4931,18 +4935,21 @@ impl Store for PgStore {
                 let file_bytes = window.file_bytes.map(i64_of).transpose()?;
                 let duration_ms = window.duration_ms.map(i64_of).transpose()?;
                 let affected = client
-                    .execute(
+                    .execute_typed(
                         crate::ledger::ledger_play_window_upsert_statement(),
                         &[
-                            &window.idempotency_key,
-                            &window.user_id,
-                            &window.track_id,
-                            &window.period_month,
-                            &i32::try_from(window.stream_seconds).map_err(|_| StoreError)?,
-                            &i64_of(window.bytes_served)?,
-                            &i64_of(window.recorded_at)?,
-                            &file_bytes,
-                            &duration_ms,
+                            (&window.idempotency_key, Type::TEXT),
+                            (&window.user_id, Type::TEXT),
+                            (&window.track_id, Type::TEXT),
+                            (&window.period_month, Type::TEXT),
+                            (
+                                &i32::try_from(window.stream_seconds).map_err(|_| StoreError)?,
+                                Type::INT4,
+                            ),
+                            (&i64_of(window.bytes_served)?, Type::INT8),
+                            (&i64_of(window.recorded_at)?, Type::INT8),
+                            (&file_bytes, Type::INT8),
+                            (&duration_ms, Type::INT8),
                         ],
                     )
                     .await
@@ -5114,15 +5121,21 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 let rows = client
-                    .query(
+                    .query_typed(
                         "UPDATE sessions SET rotation_counter = $3, expires_at = $4, \
                  refresh_retry_hash = NULL, refresh_issued_at = NULL, refresh_claimed_at = NULL \
                  WHERE id = $1 AND rotation_counter = $2 AND revoked = FALSE RETURNING id",
                         &[
-                            &id,
-                            &i32::try_from(expected_counter).map_err(|_| StoreError)?,
-                            &i32::try_from(new_counter).map_err(|_| StoreError)?,
-                            &i64_of(new_expires_at)?,
+                            (&id, Type::TEXT),
+                            (
+                                &i32::try_from(expected_counter).map_err(|_| StoreError)?,
+                                Type::INT4,
+                            ),
+                            (
+                                &i32::try_from(new_counter).map_err(|_| StoreError)?,
+                                Type::INT4,
+                            ),
+                            (&i64_of(new_expires_at)?, Type::INT8),
                         ],
                     )
                     .await
@@ -5173,9 +5186,13 @@ impl Store for PgStore {
         let mut client = self.connect().await?;
         let transaction = client.transaction().await.map_err(|_| StoreError)?;
         let rows = transaction
-            .query(
+            .query_typed(
                 claim.statement(),
-                &[&params[0], &params[1], &rotation_counter],
+                &[
+                    (&params[0], Type::TEXT),
+                    (&params[1], Type::TEXT),
+                    (&rotation_counter, Type::INT4),
+                ],
             )
             .await
             .map_err(|_| StoreError)?;
@@ -5184,15 +5201,15 @@ impl Store for PgStore {
             return Ok(false);
         }
         if transaction
-            .execute(
+            .execute_typed(
                 "INSERT INTO sessions (id, user_id, created_at, expires_at, rotation_counter, revoked) \
                  VALUES ($1, $2, $3, $4, $5, FALSE)",
                 &[
-                    &replacement.new_record.id,
-                    &replacement.new_record.user_id,
-                    &created_at,
-                    &expires_at,
-                    &new_counter,
+                    (&replacement.new_record.id, Type::TEXT),
+                    (&replacement.new_record.user_id, Type::TEXT),
+                    (&created_at, Type::INT8),
+                    (&expires_at, Type::INT8),
+                    (&new_counter, Type::INT4),
                 ],
             )
             .await
@@ -5211,7 +5228,10 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 client
-                    .execute("UPDATE sessions SET revoked = TRUE WHERE id = $1", &[&id])
+                    .execute_typed(
+                        "UPDATE sessions SET revoked = TRUE WHERE id = $1",
+                        &[(&id, Type::TEXT)],
+                    )
                     .await
                     .map_err(|_| StoreError)?;
                 Ok(())
@@ -5230,7 +5250,10 @@ impl Store for PgStore {
                     user_id,
                 };
                 let rows = client
-                    .query(claim.statement(), &[&id, &user_id])
+                    .query_typed(
+                        claim.statement(),
+                        &[(&id, Type::TEXT), (&user_id, Type::TEXT)],
+                    )
                     .await
                     .map_err(|_| StoreError)?;
                 Ok(rows.len() == 1)
@@ -5347,7 +5370,7 @@ impl Store for PgStore {
              WHERE user_id = $1 ORDER BY created_at, id"
                 );
                 let rows = client
-                    .query(&sql, &[&user_id])
+                    .query_typed(&sql, &[(&user_id, Type::TEXT)])
                     .await
                     .map_err(|_| StoreError)?;
                 rows.iter().map(native_credential_from_row).collect()
@@ -5370,11 +5393,14 @@ impl Store for PgStore {
              WHERE pepper_version = $1 AND key_hmac = $2"
                 );
                 let row = client
-                    .query_opt(
+                    .query_typed_opt(
                         &sql,
                         &[
-                            &i32::try_from(pepper_version).map_err(|_| StoreError)?,
-                            &key_hmac,
+                            (
+                                &i32::try_from(pepper_version).map_err(|_| StoreError)?,
+                                Type::INT4,
+                            ),
+                            (&key_hmac, Type::TEXT),
                         ],
                     )
                     .await
@@ -5398,10 +5424,14 @@ impl Store for PgStore {
                 // Owner-scoped and sticky: only a live row of this user
                 // transitions; an already-revoked row keeps its timestamp.
                 let transitioned = client
-                    .execute(
+                    .execute_typed(
                         "UPDATE native_rest_credentials SET revoked_at = $3 \
                  WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
-                        &[&id, &user_id, &i64_of(now)?],
+                        &[
+                            (&id, Type::TEXT),
+                            (&user_id, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -5411,9 +5441,9 @@ impl Store for PgStore {
                 // No transition: report whether the row exists at all (unknown
                 // and foreign ids both report false — no existence oracle).
                 let exists = client
-                    .query_opt(
+                    .query_typed_opt(
                         "SELECT id FROM native_rest_credentials WHERE id = $1 AND user_id = $2",
-                        &[&id, &user_id],
+                        &[(&id, Type::TEXT), (&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -5429,9 +5459,9 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 client
-                    .execute(
+                    .execute_typed(
                         "UPDATE native_rest_credentials SET last_used_at = $2 WHERE id = $1",
-                        &[&id, &i64_of(now)?],
+                        &[(&id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
