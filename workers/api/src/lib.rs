@@ -60,6 +60,7 @@ pub mod playback;
 pub mod preference_rows;
 pub mod random;
 pub mod rate_limit;
+pub mod realtime_presence;
 pub mod rotation;
 pub mod session;
 pub mod session_retry_store;
