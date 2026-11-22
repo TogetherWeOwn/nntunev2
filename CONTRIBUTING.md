@@ -90,9 +90,9 @@ verify the associated PR head (check-suite/PR metadata) matches the reviewed
 head. A green run for an older head, a local transcript, a successful workflow
 with skipped required jobs, or a formatting check is not CI evidence.
 
-Reviewers and the owner use those Actions links as CI evidence. Keep exact-SHA
-production authorization and admission, staging and deployed-build identity,
-migration and rollback evidence, and review and merge gates. Follow
+Reviewers and the task owner use those Actions links as CI evidence. Keep
+exact-SHA production approval and admission, staging and deployed-build
+identity, migration and rollback evidence, and review and merge gates. Follow
 [the staging promotion checklist](docs/ops.md#staging-promotion-checklist)
 for release evidence. Explicitly state what was not run.
 
@@ -136,7 +136,9 @@ labels are the durable record behind it.
 ## Merge policy
 
 The task thread owns the PR and its follow-through without separate role
-handoffs for ordinary PRs. Follow the risk floors and Attestation format
+handoffs for ordinary PRs. The task owner makes ordinary technical and
+staging decisions, makes conservative UI decisions, and describes user-visible
+changes in the PR. Follow the risk floors and Attestation format
 in the [PR template](.github/pull_request_template.md).
 Apply the highest tier required by the change, the PR template or the
 [review map](.github/review-tiers.yml). Map low to T2 for eligible docs-only
@@ -173,12 +175,10 @@ coverage without changing the PR or merging it.
   already allows the merge. CodeRabbit is advisory. Answer its findings
   when it reviews without waiting for it or triggering it manually.
 - `main` currently deploys staging. Recheck automatic deployment paths and
-  default-head provider deployments/checks before merging. Stop if a merge
-  could reach production or the deployment path is uncertain, even for
-  docs-only changes. Obtain the repository owner's exact-head authorization
-  before proceeding. Manual production promotion through `deploy-production`
-  requires its own exact-SHA owner authorization and the
-  [promotion gates](docs/ops.md#staging-promotion-checklist).
+  default-head provider deployments and checks before merging, including for
+  docs-only changes. Resolve any uncertainty before merging. If merging
+  could deploy to production, stop and handle the change through the separate
+  [production release process](#production-releases).
 - Fix each bot-review finding, or answer it in the thread with evidence
   from the code. Check a suggested fix before applying it (the disproof
   pass in `REVIEW.md`). Use the first-line reply format from the
@@ -203,3 +203,34 @@ coverage without changing the PR or merging it.
 - Never commit secrets. The `gitleaks` gate (`.github/workflows/gitleaks.yml`,
   full-history scan) and push protection (secret scanning + push protection
   enabled) enforce this.
+
+## Production releases
+
+A production deploy, migration, secret or grant change, or configuration or
+flag change is a separate release task. The release task owner records the
+plan and evidence before making the production change.
+
+1. Identify the exact commit and, where applicable, the artifact to release.
+   Verify that all required checks passed on that candidate and that each
+   included PR received the reviews required by its risk tier.
+2. Verify that the same build ran first on staging. Record its deployed-build
+   identity and passing health and post-deploy journey checks using the
+   [staging promotion checklist](docs/ops.md#staging-promotion-checklist).
+3. Resolve any unknowns that could make recovery unsafe. Document the rollback
+   target and steps, and rehearse the rollback where the repository supports
+   it. Take and verify a backup or snapshot before any production data or schema
+   change.
+4. Commission a separate cross-family production release review. Obtain the
+   reviewer's explicit approval for the exact candidate after they review the
+   plan and evidence. If they block the release, address the findings and obtain
+   a fresh review.
+5. Use the existing protected release workflow for the action. Meet its
+   exact-SHA admission, environment protection, credential custody and
+   recorded approval-reference requirements. Respect the workflow's supported
+   modes and enablement gates.
+6. Watch production health and errors for at least 30 minutes after release.
+   Roll back immediately on a regression and record the outcome.
+
+Escalate to the repository owner only for spending beyond approved budgets,
+permanent deletion of member data, shutting down a member-facing service,
+or genuine legal, terms-of-service or privacy questions.

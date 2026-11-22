@@ -634,9 +634,10 @@ operator-verified staging state). The three pre-merge applies from
 equivalently via `apply_migration.py --record-only`), so the gate is
 green immediately after the app backfill. A future shared mirror would couple
 staging and production reads; the replacement is not activated and these
-historical backfill files do not prove its migration state. Its backfill — and
-creating the table on production at all — requires a Release Manager decision;
-production applies use the same `apply_migration.py` path once their gate opens.
+historical backfill files do not prove its migration state. A production
+backfill or table creation requires a separate approved
+[production release task](../CONTRIBUTING.md#production-releases). Production
+applies use the same `apply_migration.py` path once their gate opens.
 
 ### Admin bootstrap (owner promotion)
 
@@ -1163,14 +1164,18 @@ and [deployment creation](https://developers.cloudflare.com/api/resources/worker
 do not document a deploy-only-if-undeployed condition. Actions serialization
 cannot stop a concurrent provider write between the empty read and deployment.
 
-1. **Release Manager:** Accept the exact launch SHA after M1, staging
-   admission, Security → QA, exact-head CI and migration ledger review.
-   Accept the seed explicitly. Verify `production` Environment protection with the GitHub custodian; configure the hostname and `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
+1. **Release task owner and independent release reviewer.** Apply the
+   [production release process](../CONTRIBUTING.md#production-releases).
+   The reviewer explicitly accepts the seed and exact launch SHA after M1,
+   staging admission, Security → QA, exact-head CI and migration ledger review.
+   The release task owner verifies `production` Environment protection with
+   the GitHub custodian and coordinates configuration of the hostname and
+   `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
    Keep `PRODUCTION_ACCEPTED_SHA`, `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID), Worker-scoped bearer and matching account in `production` only; a presence-only check during staging admission rejects inherited Cloudflare secrets.
 2. **Route custodian:** Immediately before dispatch, inventory every applicable zone and page, including wildcards, with existing read-only access. Refuse gaps; record zones, Worker ID, SHA, read time and zero matches.
    The GitHub custodian sets `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in `production`: JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`) and numeric `route_count: 0`.
    Freeze routes and keep this lane the sole Worker writer through readback. The Worker token cannot list zone routes.
-3. **Release Manager:** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`; Actions reruns are refused.
+3. **Release task owner.** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`. Actions reruns are refused.
    Under the mutation lock, require proof ≤30 minutes old, empty deployment/version/binding inventories and no custom domain, workers.dev or previews.
    One [upload by immutable ID with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/) installs `worker.mjs` at 100%. Record verified readback.
 4. **Close/undo:** Disable `PRODUCTION_DEPLOY_ENABLED` and clear the accepted SHA and route proof. To abort an in-flight run, cancel it too and reconcile Worker, deployment and route state before any retry.
@@ -1216,7 +1221,7 @@ environment exists on this repo.
 - [ ] Exact-head CI: record the promotion SHA and GitHub Actions run/job
   URLs showing `ci-ok`, `gitleaks` and `pr-lint` green on that SHA.
   CI is `.github/workflows/ci.yml`; full suites and CI gates run in Actions,
-  never in a local CI mirror. Reviewers and the Release Manager accept
+  never in a local CI mirror. The release task owner and reviewers accept
   these exact-head links as CI evidence, not local full-suite transcripts
   ([verification contract](../CONTRIBUTING.md#evidence-for-review-and-release)).
   `migrations-staging` and `Devin Review` report on pull requests, not on
