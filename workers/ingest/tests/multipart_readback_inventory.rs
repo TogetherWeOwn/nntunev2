@@ -409,18 +409,19 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
     intent.reservation_generation = 2;
 
     let mut tx = writer.transaction().await.unwrap();
-    // The insert trigger flips the fixture clock within this transaction.
+    // Expire the reservation in a deferred-to-end-of-statement row trigger.
     tx.batch_execute(
         "CREATE TEMP SEQUENCE inventory_insert_attempt;
-         CREATE FUNCTION public.clock_timestamp() RETURNS timestamptz LANGUAGE sql VOLATILE AS $$
-             SELECT CASE WHEN is_called THEN 'infinity' ELSE '-infinity' END::timestamptz
-               FROM pg_temp.inventory_insert_attempt
-         $$;
          CREATE FUNCTION public.test_mark_inventory_insert() RETURNS trigger LANGUAGE plpgsql AS $$
-         BEGIN PERFORM nextval('pg_temp.inventory_insert_attempt'); RETURN NEW; END $$;
-         CREATE TRIGGER mark_inventory_insert BEFORE INSERT ON public.storage_digest_inventory_intents
-         FOR EACH ROW EXECUTE FUNCTION public.test_mark_inventory_insert();
-         SET LOCAL search_path = public, pg_catalog;",
+         BEGIN
+            PERFORM nextval('pg_temp.inventory_insert_attempt');
+            UPDATE public.storage_digest_reservations
+                SET expires_at = '-infinity'
+                WHERE object_id = (SELECT object_id FROM public.storage_digest_map_intents WHERE map_id = NEW.map_id);
+            RETURN NEW;
+         END $$;
+         CREATE TRIGGER mark_inventory_insert AFTER INSERT ON public.storage_digest_inventory_intents
+         FOR EACH ROW EXECUTE FUNCTION public.test_mark_inventory_insert();",
     ).await.unwrap();
     assert_eq!(
         append_inventory(&mut tx, &intent, SCOPE, &verified).await,
@@ -463,22 +464,15 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
 
     let mut wrong_record = fixture.record;
     wrong_record[229] ^= 1;
+    let page_versions = [FINAL_VERSION, PAGE_ONE_VERSION];
     for (media, pages, record) in [
-        (
-            FINAL_VERSION,
-            [FINAL_VERSION, PAGE_ONE_VERSION],
-            fixture.record,
-        ),
+        (FINAL_VERSION, page_versions, fixture.record),
         (
             SHARED_VERSION,
             [PAGE_ONE_VERSION, FINAL_VERSION],
             fixture.record,
         ),
-        (
-            SHARED_VERSION,
-            [FINAL_VERSION, PAGE_ONE_VERSION],
-            wrong_record,
-        ),
+        (SHARED_VERSION, page_versions, wrong_record),
     ] {
         let mut tx = writer.transaction().await.unwrap();
         tx.execute(
@@ -490,13 +484,8 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         insert_envelope(&tx, &ids[2], &root, &record).await;
         assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
         assert!(tx.query_opt(winner, key).await.unwrap().is_none());
-        assert_eq!(
-            tx.query_one(lookup, &[&map])
-                .await
-                .unwrap()
-                .get::<_, String>(0),
-            media
-        );
+        let row = tx.query_one(lookup, &[&map]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), media);
         tx.rollback().await.unwrap();
     }
 
@@ -585,13 +574,28 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
     }
 
     let held = locker.transaction().await.unwrap();
-    let set_expiry = "UPDATE public.storage_digest_reservations
-                      SET expires_at = clock_timestamp() + make_interval(secs => $2)
-                      WHERE object_id = $1::text::uuid";
-    held.execute(set_expiry, &[&ids[2], &0.0_f64])
-        .await
-        .unwrap();
+    held.query_one(
+        "SELECT 1 FROM public.storage_object_envelope_intents
+         WHERE object_id = $1::text::uuid AND root_version_id = $2::text::uuid FOR UPDATE",
+        &[&ids[2], &root],
+    )
+    .await
+    .unwrap();
     let mut tx = writer.transaction().await.unwrap();
+    // The foreign-key check waits for the envelope row. The test trigger
+    // crosses the deadline during the statement without using wall-clock sleeps.
+    tx.batch_execute(
+        "CREATE TEMP SEQUENCE winner_insert_attempt;
+         CREATE FUNCTION public.test_expire_winner_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+            PERFORM nextval('pg_temp.winner_insert_attempt');
+            UPDATE public.storage_digest_reservations SET expires_at = '-infinity'
+                WHERE object_id = NEW.object_id;
+            RETURN NEW;
+         END $$;
+         CREATE TRIGGER zz_expire_winner_insert AFTER INSERT ON public.storage_validated_digest_winners
+         FOR EACH ROW EXECUTE FUNCTION public.test_expire_winner_insert();",
+    ).await.unwrap();
     let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         tokio::join!(stage(&mut tx), async {
             wait_for_writer().await;
@@ -599,30 +603,8 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         })
     })
     .await
-    .expect("winner staging must resume after the reservation lock wait");
+    .expect("winner insert must wait for the envelope lock");
     assert_eq!(result, Err(MissingOrFenced));
-    assert!(tx.query_opt(winner, key).await.unwrap().is_none());
-    tx.rollback().await.unwrap();
-    observer
-        .execute(set_expiry, &[&ids[2], &3600.0_f64])
-        .await
-        .unwrap();
-
-    let mut tx = writer.transaction().await.unwrap();
-    tx.batch_execute(
-        "CREATE TEMP SEQUENCE winner_insert_attempt;
-         CREATE FUNCTION public.test_wait_for_winner_expiry() RETURNS trigger LANGUAGE plpgsql AS $$
-         BEGIN
-            PERFORM nextval('pg_temp.winner_insert_attempt');
-            PERFORM pg_sleep_until((SELECT expires_at FROM public.storage_digest_reservations
-                                    WHERE object_id = NEW.object_id));
-            RETURN NEW;
-         END $$;
-         CREATE TRIGGER wait_for_winner_expiry BEFORE INSERT ON public.storage_validated_digest_winners
-         FOR EACH ROW EXECUTE FUNCTION public.test_wait_for_winner_expiry();",
-    ).await.unwrap();
-    tx.execute(set_expiry, &[&ids[2], &3.0_f64]).await.unwrap();
-    assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
     assert!(tx
         .query_one("SELECT is_called FROM pg_temp.winner_insert_attempt", &[])
         .await

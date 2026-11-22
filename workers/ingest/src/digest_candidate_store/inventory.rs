@@ -21,22 +21,18 @@ const MATCH_SQL: &str = "WITH matching_candidate AS MATERIALIZED (
       AND m.page_count = cardinality($11::bytea[])
       AND ARRAY(SELECT p.expected_hash FROM public.storage_digest_map_page_intents p
                 WHERE p.map_id = m.map_id ORDER BY p.page_index) = $11
-), ";
+) ";
 
-const APPEND_SQL: &str = "appended AS (
-    INSERT INTO public.storage_digest_inventory_intents (map_id, media_version, page_versions)
+const APPEND_SQL: &str =
+    "INSERT INTO public.storage_digest_inventory_intents (map_id, media_version, page_versions)
     SELECT map_id, $12::text, $13::text[] FROM matching_candidate c
-    WHERE expires_at > clock_timestamp()
+    WHERE expires_at > pg_catalog.clock_timestamp()
       AND NOT EXISTS (SELECT FROM public.storage_validated_digest_winners w
                       WHERE w.object_id = c.object_id)
-    RETURNING map_id
-)
-SELECT expires_at > clock_timestamp() FROM appended JOIN matching_candidate USING (map_id)";
+    RETURNING 1";
 
 // A conflicting object or active scoped winner violates the existing unique keys.
-// Recheck liveness after the insert, which can itself wait on database locks.
-const STAGE_WINNER_SQL: &str = "staged AS (
-    INSERT INTO public.storage_validated_digest_winners
+const STAGE_WINNER_SQL: &str = "INSERT INTO public.storage_validated_digest_winners
         (object_id, environment_id, library_id, plaintext_bytes, plaintext_sha256,
          root_version_id, retain_until)
     SELECT c.object_id, c.environment_id, c.library_id, c.plaintext_bytes, c.plaintext_sha256,
@@ -47,19 +43,24 @@ const STAGE_WINNER_SQL: &str = "staged AS (
     WHERE p.media_version = $12::text AND p.page_versions = $13::text[]
       AND e.root_version_id = $14::text::uuid AND e.wrapped_record = $15::bytea
       AND c.expires_at > pg_catalog.clock_timestamp()
-    RETURNING object_id
-)
-SELECT expires_at > pg_catalog.clock_timestamp() FROM staged JOIN matching_candidate USING (object_id)";
+    RETURNING 1";
+
+// This separate statement runs after all insert triggers and foreign-key checks.
+const STILL_LIVE_SQL: &str = "SELECT 1 FROM public.storage_digest_reservations
+    WHERE environment_id = $1::text::uuid AND library_id = $2::text::uuid
+      AND plaintext_sha256 = $3 AND plaintext_bytes = $4
+      AND object_id = $5::text::uuid AND generation = $6
+      AND expires_at > pg_catalog.clock_timestamp()";
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum VerifiedWriteError {
+pub enum InventoryAppendError {
     Identity,
     MissingOrFenced,
     Conflict,
     Indeterminate,
 }
 
-impl VerifiedWriteError {
+impl InventoryAppendError {
     fn from_db(error: Error) -> Self {
         if error.code() == Some(&SqlState::UNIQUE_VIOLATION) {
             Self::Conflict
@@ -71,7 +72,7 @@ impl VerifiedWriteError {
 
 enum Write {
     AppendInventory,
-    StageWinner { retain_until_unix_seconds: i64 },
+    StageWinner(i64),
 }
 
 /// Stage an inactive inventory row in the caller's READ COMMITTED write transaction.
@@ -86,7 +87,7 @@ pub async fn append_inventory(
     intent: &CandidateIntent,
     scope: ReadbackScope<'_>,
     verified: &VerifiedCompletedReadback<'_, '_>,
-) -> Result<(), VerifiedWriteError> {
+) -> Result<(), InventoryAppendError> {
     write_verified(tx, intent, scope, verified, Write::AppendInventory).await
 }
 
@@ -102,15 +103,13 @@ pub async fn stage_validated_winner(
     scope: ReadbackScope<'_>,
     verified: &VerifiedCompletedReadback<'_, '_>,
     retain_until_unix_seconds: i64,
-) -> Result<(), VerifiedWriteError> {
+) -> Result<(), InventoryAppendError> {
     write_verified(
         tx,
         intent,
         scope,
         verified,
-        Write::StageWinner {
-            retain_until_unix_seconds,
-        },
+        Write::StageWinner(retain_until_unix_seconds),
     )
     .await
 }
@@ -121,8 +120,8 @@ async fn write_verified(
     scope: ReadbackScope<'_>,
     verified: &VerifiedCompletedReadback<'_, '_>,
     write: Write,
-) -> Result<(), VerifiedWriteError> {
-    use VerifiedWriteError::{Identity, MissingOrFenced};
+) -> Result<(), InventoryAppendError> {
+    use InventoryAppendError::{Identity, MissingOrFenced};
 
     let inventory = verified.inventory();
     if scope.bucket != inventory.bucket() || scope.configuration != intent.identities[4] {
@@ -168,9 +167,7 @@ async fn write_verified(
     let wrapped_record = record.as_slice();
     let action = match &write {
         Write::AppendInventory => APPEND_SQL,
-        Write::StageWinner {
-            retain_until_unix_seconds,
-        } => {
+        Write::StageWinner(retain_until_unix_seconds) => {
             params.extend([
                 &root_version as &(dyn ToSql + Sync),
                 &wrapped_record,
@@ -183,30 +180,35 @@ async fn write_verified(
     let savepoint = tx
         .transaction()
         .await
-        .map_err(VerifiedWriteError::from_db)?;
-    let held = savepoint
-        .query_opt(LOCK_SQL, &[&environment, &library, &digest, &length])
-        .await;
-    // READ COMMITTED sees the prior holder's changes after the lock wait.
-    let result = match held {
-        Ok(Some(_)) => savepoint
-            .query_opt(&format!("{MATCH_SQL}{action}"), &params)
-            .await
-            .and_then(|row| row.map(|row| row.try_get::<_, bool>(0)).transpose()),
-        Ok(None) => Ok(None),
-        Err(error) => Err(error),
-    };
-    if matches!(result, Ok(Some(true))) {
+        .map_err(InventoryAppendError::from_db)?;
+    let result = async {
+        let held = savepoint.query_opt(LOCK_SQL, &params[..4]).await?;
+        // READ COMMITTED refreshes the snapshot after the holder releases the lock.
+        if held.is_none()
+            || savepoint
+                .query_opt(&format!("{MATCH_SQL}{action}"), &params)
+                .await?
+                .is_none()
+        {
+            return Ok(false);
+        }
+        Ok(savepoint
+            .query_opt(STILL_LIVE_SQL, &params[..6])
+            .await?
+            .is_some())
+    }
+    .await;
+    if matches!(result, Ok(true)) {
         return savepoint
             .commit()
             .await
-            .map_err(VerifiedWriteError::from_db);
+            .map_err(InventoryAppendError::from_db);
     }
     savepoint
         .rollback()
         .await
-        .map_err(VerifiedWriteError::from_db)?;
+        .map_err(InventoryAppendError::from_db)?;
     Err(result
         .err()
-        .map_or(MissingOrFenced, VerifiedWriteError::from_db))
+        .map_or(MissingOrFenced, InventoryAppendError::from_db))
 }
