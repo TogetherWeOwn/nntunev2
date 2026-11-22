@@ -50,7 +50,14 @@ test('opens from authorized windows and saves exactly one setting by keyboard at
 	await page.goto('/admin/invite-windows');
 	await page.getByRole('link', { name: 'Invite policy', exact: true }).press('Enter');
 	await expect(page).toHaveURL(path);
-	for (const [index, value] of ['9', '17', '12'].entries()) await expect(page.getByLabel(fields[index])).toHaveValue(value);
+	await expect(page.getByRole('form')).toHaveCount(3);
+	for (const [index, [value, saveLabel]] of [
+		['9', 'Save required paid months'], ['17', 'Save per-window quota'], ['12', 'Save default invite expiry']
+	].entries()) {
+		const form = page.getByRole('form', { name: fields[index], exact: true });
+		await expect(form.getByRole('textbox', { name: fields[index], exact: true })).toHaveValue(value);
+		await expect(form.getByRole('button', { name: saveLabel, exact: true })).toHaveText('Save');
+	}
 	expect(await page.locator('main').evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
 	const monthInput = page.getByLabel(fields[0]);
 	const quotaInput = page.getByLabel(fields[1]);

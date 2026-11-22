@@ -109,8 +109,8 @@
 		<p>Save each setting separately.</p>
 		{#each rows as row (row.key)}
 			{@const [min, max] = INVITE_POLICY_BOUNDS[row.key]}
-			<form onsubmit={(event) => save(event, row)}>
-				<label for={row.key}>{row.label} ({row.unit})</label>
+			<form aria-labelledby={`${row.key}-label`} onsubmit={(event) => save(event, row)}>
+				<label id={`${row.key}-label`} for={row.key}>{row.label} ({row.unit})</label>
 				<div id={`${row.key}-help`}>{row.help} Range: {min}–{max}.</div>
 				<div class="controls">
 					<input id={row.key} inputmode="numeric" bind:value={row.draft} readonly={saving === row.key}
