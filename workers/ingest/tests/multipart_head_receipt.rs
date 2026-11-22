@@ -226,11 +226,20 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         ),
         Err(PrepareError::Parts(MultipartError::Geometry))
     ));
-    for index in [1, 2, 3, 4] {
+    let wrong_scopes = [1, 2, 3, 4].map(|index| {
         let mut wrong_scope = EnvelopeContext { ..context };
         wrong_scope.identities[index] = id(9);
+        wrong_scope
+    });
+    let mut wrong_header = EnvelopeContext { ..context };
+    wrong_header.header[47] ^= 1;
+    let wrong_length = EnvelopeContext {
+        plaintext_len: 2,
+        ..context
+    };
+    for wrong_context in wrong_scopes.into_iter().chain([wrong_header, wrong_length]) {
         assert!(matches!(
-            SessionCompletion::prepare(binding, &wrong_scope, receipts(), &checkpoint),
+            SessionCompletion::prepare(binding, &wrong_context, receipts(), &checkpoint),
             Err(PrepareError::EnvelopeContextMismatch)
         ));
     }
