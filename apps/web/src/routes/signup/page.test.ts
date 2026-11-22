@@ -46,6 +46,18 @@ describe('signup page initial state', () => {
 		expect(body).toContain('data-testid="signup-submit"');
 		expect(body).not.toContain('role="alert"');
 	});
+
+	it('labels the required account email for username autofill', () => {
+		const { body } = render(SignupPage);
+		const input = body.match(
+			/<label\b[^>]*\sfor="signup-email"[^>]*>\s*Email\s*(<input\b[^>]*>)/
+		)?.[1];
+
+		expect(input).toMatch(/\sid="signup-email"/);
+		expect(input).toContain('type="email"');
+		expect(input).toMatch(/\srequired(?:\s|>)/);
+		expect(input).toContain('autocomplete="username"');
+	});
 });
 
 describe('signup code-error and start-over rendering', () => {

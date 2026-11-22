@@ -70,6 +70,29 @@ describe('login page initial state', () => {
 		expect(body).not.toContain('role="alert"');
 		expect(body).not.toContain(LOGIN_GENERIC);
 	});
+
+	it('labels the required account email for username autofill', () => {
+		const { body } = render(LoginPage);
+		const input = body.match(
+			/<label\b[^>]*\sfor="login-email"[^>]*>\s*Email\s*(<input\b[^>]*>)/
+		)?.[1];
+
+		expect(input).toMatch(/\sid="login-email"/);
+		expect(input).toContain('type="email"');
+		expect(input).toMatch(/\srequired(?:\s|>)/);
+		expect(input).toContain('autocomplete="username"');
+	});
+
+	it('uses the visible email prerequisite as the passkey button description', () => {
+		const { body } = render(LoginPage);
+		const button = body.match(/(<button\b[^>]*>)\s*Sign in with passkey\s*<\/button>/)?.[1];
+
+		expect(button).toContain('type="button"');
+		expect(button).toContain('aria-describedby="passkey-instructions"');
+		expect(body).toContain(
+			'<p id="passkey-instructions">Enter your email below, then use your passkey.</p>'
+		);
+	});
 });
 
 describe('login passkey in-flight re-click', () => {
