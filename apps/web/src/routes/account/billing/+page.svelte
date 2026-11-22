@@ -13,6 +13,9 @@
 
 	let { data }: { data: PageData } = $props();
 	let retired = $state.raw<AccountSession>();
+	let warningThreshold = $state<number | null>(null);
+	let actionError = $state<string | null>(null);
+	let busy = $state<'checkout' | 'portal' | null>(null);
 	const accountEnded = $derived(!!data.owner && (retired === data.owner || !data.owner.isCurrent()));
 
 	$effect.pre(() => {
@@ -98,7 +101,6 @@
 	// and all of them are marked shown so a lower one never fires late.
 	// The check waits for the plan-data read to settle so a threshold is
 	// never scored (and permanently marked) against a stale mirror cap.
-	let warningThreshold = $state<number | null>(null);
 	$effect(() => {
 		if (!data.owner?.isCurrent() || !planHydrationDone || !data.usage || !status) return;
 		const pending = pendingUsageWarnings(data.usage.period, status.streamFraction);
@@ -107,8 +109,6 @@
 		markUsageWarningsShown(data.usage.period, pending);
 	});
 
-	let actionError: string | null = $state(null);
-	let busy: 'checkout' | 'portal' | null = $state(null);
 	let alive = true;
 	onDestroy(() => {
 		alive = false;

@@ -28,6 +28,37 @@ test('billing hides an earlier account statement and reloads under the replaceme
 	await expect(page.getByRole('heading', { name: 'Current plan: Plus' })).toBeVisible();
 });
 
+test('billing offers retry when its account retires during the initial load', async ({ page }) => {
+	await page.addInitScript(() => {
+		const original = window.fetch.bind(window);
+		window.fetch = (input, init) => {
+			if (typeof input !== 'string' || !input.endsWith('/v1/me/usage')) return original(input, init);
+			document.documentElement.dataset.usagePending = 'true';
+			return new Promise<Response>((resolve) => {
+				window.addEventListener('release-usage', () => resolve(Response.json({
+					period: '2026-10', streamSecondsMonth: 3600, resetsAt: '2026-11-01T00:00:00Z'
+				})), { once: true });
+			});
+		};
+	});
+	await page.route('**/v1/me/subscription', (route) => route.fulfill({ json: {
+		state: 'active', planId: 'pro', status: 'active', currentPeriodEnd: PERIOD_END,
+		graceUntil: null, cancelAtPeriodEnd: false
+	} }));
+	await page.route('**/v1/plans', (route) => route.fulfill({ json: { plans: [] } }));
+	await page.goto('/account/billing', { waitUntil: 'domcontentloaded' });
+	await expect(page.locator('html')).toHaveAttribute('data-usage-pending', 'true');
+	await page.evaluate(() => {
+		const key = 'nntune.auth.generation.v1';
+		localStorage.setItem(key, 'replacement-session');
+		window.dispatchEvent(new StorageEvent('storage', { key }));
+	});
+	await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+	await page.evaluate(() => window.dispatchEvent(new Event('release-usage')));
+	await expect(page.getByText('Your session changed.', { exact: false })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Current plan: Pro' })).toHaveCount(0);
+});
+
 for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
 	test.describe(`${viewport.width}px billing period-end copy`, () => {
 		test.use({ viewport, locale: 'en-US', timezoneId: 'America/Los_Angeles' });

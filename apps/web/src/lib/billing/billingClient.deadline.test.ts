@@ -98,7 +98,7 @@ function deferred<T>() {
 	return { promise, resolve };
 }
 
-it('drops a pending usage response when its account session retires', async () => {
+it.each([200, 402])('drops a pending usage response (%i) when its account session retires', async (status) => {
 	const account = new AbortController();
 	const makeOwner = ({ signal }: AbortController) => ({
 		generation: 'fixture', signal, isCurrent: () => !signal.aborted,
@@ -117,11 +117,12 @@ it('drops a pending usage response when its account session retires', async () =
 	expect(transport?.aborted).toBe(true);
 	expect(await result).toMatchObject({ name: 'AbortError' });
 
-	old.resolve(jsonResponse(USAGE));
+	old.resolve(jsonResponse(status === 200 ? USAGE : { code: 'plan_limit_exceeded' }, status));
 	await expect(fetchUsage(fetchFn, owner)).rejects.toMatchObject({ name: 'AbortError' });
 	expect(fetchFn).toHaveBeenCalledTimes(1);
 	fetchFn.mockResolvedValueOnce(jsonResponse(USAGE));
 	await expect(fetchUsage(fetchFn, makeOwner(new AbortController()))).resolves.toEqual(USAGE);
+	expect(models).toEqual([]);
 });
 
 function track(promise: Promise<unknown>) {
