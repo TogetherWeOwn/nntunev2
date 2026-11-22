@@ -370,7 +370,9 @@ describe('billing period-end wording', () => {
 
 	it.each([
 		['2028-02-29T00:15:00.123456789+05:30', '2028-02-29T00:15:00.123+05:30'],
+		['2028-02-29T00:15:00+0530', '2028-02-29T00:15:00+0530'],
 		['2026-11-15T12:00:00-00:00', '2026-11-15T12:00:00Z'],
+		['2026-11-15T12:00:00-0000', '2026-11-15T12:00:00Z'],
 		['0000-11-15', null]
 	] as const)('keeps the local date for %s with datetime %s', async (currentPeriodEnd, datetime) => {
 		const data = await loadPage(fetchWithSubscription({ ...PAID_SUBSCRIPTION, currentPeriodEnd }));

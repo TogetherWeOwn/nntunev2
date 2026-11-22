@@ -12,7 +12,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					label: 'dated',
 					currentPeriodEnd: PERIOD_END,
 					displayDate: '11/15/2026',
-					cancelAtPeriodEnd: false
+					cancelAtPeriodEnd: status === 'active'
 				},
 				{ label: 'null', currentPeriodEnd: null, displayDate: '', cancelAtPeriodEnd: false }
 			];
@@ -21,8 +21,9 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					{
 						label: 'date-only',
 						currentPeriodEnd: '2026-11-15',
+						// Existing display treats a date-only string as UTC midnight.
 						displayDate: '11/14/2026',
-						cancelAtPeriodEnd: true
+						cancelAtPeriodEnd: false
 					},
 					{
 						label: 'offset',
