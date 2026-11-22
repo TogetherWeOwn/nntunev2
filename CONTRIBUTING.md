@@ -141,24 +141,26 @@ in the [PR template](.github/pull_request_template.md).
 Apply the highest tier required by the change, the PR template or the
 [review map](.github/review-tiers.yml). Map low to T2 for eligible docs-only
 changes and T1 otherwise, ordinary to T1, and sensitive or unclassified to
-T0. Content triggers can raise the tier. Instruction changes in `AGENTS.md`,
-`CLAUDE.md`, `CONTRIBUTING.md`, `REVIEW.md`, `.claude/**` or `.github/**`
-require at least T1 review. When the map classifies the path or content as
-sensitive, require T0 even if the Attestation validator permits a lower tier.
+T0. Content triggers can raise the tier. Changes to `AGENTS.md`, `CLAUDE.md`,
+`CONTRIBUTING.md`, `README.md`, `REVIEW.md`, `ROADMAP.md`, `.claude/**` or
+`.github/**` require at least T1 review. When the map classifies the path or
+content as sensitive, require T0 even if the Attestation validator permits
+a lower tier.
 
 | Review tier | Independent read-only review before merge |
 | --- | --- |
 | T2, eligible docs-only changes | Task author self-check |
-| T1, standard changes and sensitive instructions | One reviewer from a different model family than the author |
+| T1, standard changes | One reviewer from a different model family than the author |
 | T0, critical changes | Two independent reviewers from a different model family than the author, one general and one security-focused, in parallel |
 
-In T3 Code, delegate review of the full PR head SHA and its diff. Record the
-reviewed SHA and resolve findings before merging. After a push, verify the new
-head is equivalent to the reviewed patch or obtain a new independent review
-for material changes. Required checks must pass on the final head in either
-case. The task owner merges through branch protection with the expected head
-SHA once the review and CI gates pass. Reviewers report findings and coverage
-without changing the PR or merging it.
+In T3 Code, delegate review of the full PR head SHA and its diff. Reviewers
+independently verify the required tier and report the SHA, model used and
+findings. Resolve or answer the findings before merging. After a push, verify
+the new head is equivalent to the reviewed patch or obtain a new independent
+review for material changes. Required checks must pass on the final head in
+either case. The task owner merges through branch protection with the expected
+head SHA once the review and CI gates pass. Reviewers report findings and
+coverage without changing the PR or merging it.
 
 - Squash-merge only (repo allows squash only; `protect-main` ruleset allows
   only `squash`, merge queue merges with `SQUASH`); the squash commit title

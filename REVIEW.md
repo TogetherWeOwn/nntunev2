@@ -4,8 +4,10 @@
 
 Review in English. Find defects this PR introduces or makes reachable.
 The task thread commissions independent read-only review according to
-[the review tier](CONTRIBUTING.md#merge-policy). Review the
-supplied full PR head SHA and diff independently before sharing findings.
+[the review tier](CONTRIBUTING.md#merge-policy). Review the supplied full PR
+head SHA and diff independently before sharing findings. Verify the required
+tier against the template and review map and flag any escalation. Record
+the reviewed SHA, verified model and tier with the findings.
 Do not approve, merge, enable auto-merge, edit code or start fix sessions.
 The task owner acts on findings and verifies the required GitHub checks.
 
@@ -39,10 +41,10 @@ check that the rules agree across files and supported entry points:
   Attestation, review, CI, merge and production approval. Check cited gates
   against their workflow definitions and the effective branch rules.
 - For Modern Web Guidance, read the installed skill's commands and check
-  that each invocation can receive `DISABLE_TELEMETRY=1`. Follow the
-  documented decision path for skills that cannot guarantee it and inspect
-  the fallback commands for that setting. No guide lookup is needed for
-  this check.
+  whether each invocation can use the required version, environment and
+  telemetry opt-out. Follow the documented decision path for skills that
+  cannot guarantee those settings and inspect the fallback commands.
+  No guide lookup is needed for this check.
 
 Record the reviewed SHA, observations and checks that did not apply or run.
 

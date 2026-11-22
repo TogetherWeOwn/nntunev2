@@ -201,14 +201,17 @@ Do not extend the spike, and do not copy its approach into new code.
 
 Before writing or changing browser-facing code in the SvelteKit app under `apps/web/` (`.svelte` components, CSS, HTML, client-side TypeScript), consult Modern Web Guidance. It covers current HTML, CSS and DOM APIs, accessibility, forms and performance. Skip it for server-only code, Rust crates and workers. The clean-room, YouTube and MetaBrainz guardrails above still win over any guide.
 
-1. Set `DISABLE_TELEMETRY=1` for every Modern Web Guidance invocation.
-   Use the installed `modern-web-guidance` skill only if you can ensure
-   each CLI process receives that setting. Otherwise use the CLI directly
+1. Run every Modern Web Guidance invocation with `DISABLE_TELEMETRY=1`
+   and an environment limited to the runner settings shown below. Use the
+   installed `modern-web-guidance` skill only if you can apply those controls
+   and the same CLI version to its commands. Otherwise use the CLI directly
    (Node 22+):
 
    ```sh
-   DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest search "<2-5 word capability>"
-   DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest retrieve "<id>"
+   env -i PATH="$PATH" HOME="$HOME" DISABLE_TELEMETRY=1 \
+     npx -y modern-web-guidance@1.0.1 search "<2-5 word capability>"
+   env -i PATH="$PATH" HOME="$HOME" DISABLE_TELEMETRY=1 \
+     npx -y modern-web-guidance@1.0.1 retrieve "<id>"
    ```
 
    Search one capability at a time (for example `"light dismiss dialog"`),
