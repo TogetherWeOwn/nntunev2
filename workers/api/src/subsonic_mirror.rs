@@ -3,7 +3,7 @@
 use super::subsonic_pg_page::{admit_page, fetch_page, Param};
 use super::{with_deadline, StoreError};
 use crate::catalogue::{self, ArtistDbRow, ReleaseDbRow, TrackDbRow};
-use crate::postgres::{PgConnect, PgQuery, PgTransaction};
+use crate::postgres::{PgClient, PgConnect, PgQuery, PgTransaction};
 use nntune_subsonic::{
     construction_budget::ConstructionBudget, staging_rejection::StagingRejection,
 };
@@ -221,14 +221,13 @@ async fn read_mirror(
     Ok((artists, releases, tracks))
 }
 
-pub(crate) async fn load_staging_mirror<F, C>(
+pub(crate) async fn load_staging_mirror<F>(
     budget: &mut ConstructionBudget,
     member: MirrorSelection<'_>,
     connect_isolated: impl FnOnce() -> F,
 ) -> Result<CatalogueRows, StagingRejection>
 where
-    F: Future<Output = Result<C, StagingRejection>>,
-    C: PgConnect,
+    F: Future<Output = Result<PgClient, StagingRejection>>,
 {
     if member.releases.is_empty() && member.pairs.is_empty() {
         return Ok(CatalogueRows::default());

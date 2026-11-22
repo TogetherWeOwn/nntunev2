@@ -1,5 +1,7 @@
 //! Statement execution on Hyperdrive uses the driver's unnamed protocol.
 //! Connection and transaction control expose only the operations that callers need.
+//! Project result columns as built-in PostgreSQL types. The driver can prepare
+//! a named catalog lookup when decoding an unfamiliar result type.
 
 use std::future::Future;
 
@@ -11,10 +13,11 @@ use tokio_postgres::{
 /// A connection that can execute only SQL with explicit parameter types.
 ///
 /// ```no_run
-/// use nntune_api::postgres::{PgClient, PgQuery};
+/// use nntune_api::postgres::{PgClient, PgQuery, PgTransaction};
 /// use tokio_postgres::types::Type;
-/// async fn typed_query(client: &PgClient) {
+/// async fn typed_query(client: &PgClient, tx: &PgTransaction<'_>) {
 ///     client.query_typed_one("SELECT $1::int4", &[(&1i32, Type::INT4)]).await.unwrap();
+///     tx.query_typed_one("SELECT $1::int4", &[(&1i32, Type::INT4)]).await.unwrap();
 /// }
 /// ```
 ///
