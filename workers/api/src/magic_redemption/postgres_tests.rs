@@ -3,11 +3,13 @@
 //! tests do not require a database or silently substitute SQLite.
 
 use super::*;
+use crate::postgres::PgConnect;
 use futures_util::future::{select, Either};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use tokio_postgres::types::Type;
 use tokio_postgres::{config::Host, Client, Config, NoTls};
 
 fn runtime() -> Runtime {
@@ -276,7 +278,7 @@ fn postgres_claim_uses_database_time() {
             .await
             .unwrap();
         let audit = fixture.audit();
-        let transaction = fixture.client.transaction().await.unwrap();
+        let transaction = PgConnect::transaction(&mut fixture.client).await.unwrap();
         assert!(matches!(
             redeem(transaction, &fixture.magic, &fixture.session, Some(&audit)).await,
             Ok(false)
@@ -292,10 +294,10 @@ fn postgres_claim_rejects_link_expiring_after_transaction_start() {
     runtime().block_on(async {
         let mut fixture = Fixture::new().await;
         let audit = fixture.audit();
-        let transaction = fixture.client.transaction().await.unwrap();
+        let transaction = PgConnect::transaction(&mut fixture.client).await.unwrap();
         transaction.apply_statement_timeout().await.unwrap();
         let expires_at: i64 = transaction
-            .query_one(
+            .query_typed_one(
                 "UPDATE magic_link_tokens
                  SET expires_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + 2
                  RETURNING expires_at",
@@ -309,16 +311,16 @@ fn postgres_claim_rejects_link_expiring_after_transaction_start() {
         // open. A frozen transaction_timestamp() claim would now accept it.
         tokio::time::timeout(
             Duration::from_secs(5),
-            transaction.batch_execute("SELECT pg_sleep(2)"),
+            transaction.query_typed_one("SELECT pg_sleep(2)", &[]),
         )
         .await
         .expect("database-time expiry wait must be bounded")
         .unwrap();
         let clocks = transaction
-            .query_one(
+            .query_typed_one(
                 "SELECT FLOOR(EXTRACT(EPOCH FROM transaction_timestamp()))::BIGINT < $1,
                         FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT >= $1",
-                &[&expires_at],
+                &[(&expires_at, Type::INT8)],
             )
             .await
             .unwrap();
@@ -355,7 +357,7 @@ fn postgres_claim_locks_user_before_token() {
             .await
             .unwrap()
             .get(0);
-        let transaction = fixture.client.transaction().await.unwrap();
+        let transaction = PgConnect::transaction(&mut fixture.client).await.unwrap();
         transaction.apply_statement_timeout().await.unwrap();
         {
             let claim = std::pin::pin!(transaction.claim(&fixture.magic));
@@ -417,10 +419,10 @@ fn postgres_claim_locks_user_before_token() {
 fn postgres_local_timeout_aborts_audit_and_rolls_back_both_writes() {
     runtime().block_on(async {
         let mut fixture = Fixture::new().await;
-        let transaction = fixture.client.transaction().await.unwrap();
+        let transaction = PgConnect::transaction(&mut fixture.client).await.unwrap();
         transaction.apply_statement_timeout().await.unwrap();
         let effective_ms: i64 = transaction
-            .query_one(
+            .query_typed_one(
                 "SELECT setting::BIGINT FROM pg_settings WHERE name = 'statement_timeout'",
                 &[],
             )
@@ -457,7 +459,7 @@ fn postgres_local_timeout_aborts_audit_and_rolls_back_both_writes() {
             .await
             .unwrap();
         let audit = fixture.audit();
-        let transaction = fixture.client.transaction().await.unwrap();
+        let transaction = PgConnect::transaction(&mut fixture.client).await.unwrap();
         let started = Instant::now();
         let result = tokio::time::timeout(
             Duration::from_millis(crate::vault::TOTAL_TIMEOUT_MS + 10_000),
@@ -474,13 +476,13 @@ fn postgres_local_timeout_aborts_audit_and_rolls_back_both_writes() {
             .batch_execute("DROP TRIGGER stall_audit ON audit_log")
             .await
             .unwrap();
-        let transaction = fixture.client.transaction().await.unwrap();
+        let transaction = PgConnect::transaction(&mut fixture.client).await.unwrap();
         assert!(matches!(
             redeem(transaction, &fixture.magic, &fixture.session, Some(&audit)).await,
             Ok(true)
         ));
         assert_eq!(fixture.persisted().await, (true, 1, 1));
-        let transaction = fixture.client.transaction().await.unwrap();
+        let transaction = PgConnect::transaction(&mut fixture.client).await.unwrap();
         assert!(matches!(
             redeem(transaction, &fixture.magic, &fixture.session, Some(&audit)).await,
             Ok(false)
