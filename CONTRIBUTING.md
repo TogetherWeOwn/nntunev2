@@ -138,14 +138,13 @@ labels are the durable record behind it.
 The task thread owns the PR and its follow-through without separate role
 handoffs for ordinary PRs. Follow the risk floors and Attestation format
 in the [PR template](.github/pull_request_template.md).
-Instruction changes in `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`,
-`REVIEW.md`, `.claude/**` or `.github/**` require at least T1 review,
-including when the validator permits a docs-only T2 Attestation for root
-Markdown files. Keep T0 review for sensitive paths and content triggers in
-the [review map](.github/review-tiers.yml), including CI gates and tool
-permissions. The four root instruction documents and `.claude/agents/*.md`
-may use T1 for Markdown-only guidance changes when no content trigger applies.
-Use the review counts below where the map refers to named review stages.
+Apply the highest tier required by the change, the PR template or the
+[review map](.github/review-tiers.yml). Map low to T2 for eligible docs-only
+changes and T1 otherwise, ordinary to T1, and sensitive or unclassified to
+T0. Content triggers can raise the tier. Instruction changes in `AGENTS.md`,
+`CLAUDE.md`, `CONTRIBUTING.md`, `REVIEW.md`, `.claude/**` or `.github/**`
+require at least T1 review. When the map classifies the path or content as
+sensitive, require T0 even if the Attestation validator permits a lower tier.
 
 | Review tier | Independent read-only review before merge |
 | --- | --- |
