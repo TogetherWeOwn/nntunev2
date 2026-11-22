@@ -44,10 +44,12 @@ pub struct BucketReadbackResponse<B> {
     pub response: ReadbackResponse<B>,
 }
 
-/// In-memory evidence for the exact inventory and sealer origin read to EOF.
+/// In-memory evidence for the authenticated envelope and exact inventory read to EOF.
 /// Publication and reuse require separate authorization and lifecycle fencing.
 pub struct VerifiedCompletedReadback<'inventory, 'receipts> {
     inventory: &'inventory CompletedReadbackInventory<'receipts>,
+    root_version: [u8; 16],
+    wrapped_record: [u8; 230],
 }
 
 impl<'inventory, 'receipts> VerifiedCompletedReadback<'inventory, 'receipts> {
@@ -57,6 +59,10 @@ impl<'inventory, 'receipts> VerifiedCompletedReadback<'inventory, 'receipts> {
 
     pub fn origin(&self) -> &'receipts OriginManifest {
         self.inventory.origin
+    }
+
+    pub(crate) fn authenticated_envelope(&self) -> (&[u8; 16], &[u8; 230]) {
+        (&self.root_version, &self.wrapped_record)
     }
 }
 
@@ -178,6 +184,8 @@ impl<'a> CompletedReadbackInventory<'a> {
             media_version,
             page_versions: &page_versions,
         };
+        let root_version = envelope.context.identities[0];
+        let wrapped_record = *envelope.trusted_record;
         verify_enrolled_readback(
             self.origin,
             envelope,
@@ -195,7 +203,11 @@ impl<'a> CompletedReadbackInventory<'a> {
             },
         )
         .await?;
-        Ok(VerifiedCompletedReadback { inventory: self })
+        Ok(VerifiedCompletedReadback {
+            inventory: self,
+            root_version,
+            wrapped_record,
+        })
     }
 
     pub fn bucket(&self) -> &str {

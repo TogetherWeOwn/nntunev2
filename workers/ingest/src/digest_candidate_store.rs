@@ -1,13 +1,14 @@
 //! Unmounted persistence of inactive sealer-origin candidate hashes.
 //!
-//! This seam does not authorize a namespace, publish a map, or enable reuse.
+//! This seam stages storage state for separately authorized callers.
 //! Callers must obtain identities from an authorized immutable intent, not from
 //! a provider or an untrusted request.
 
 use nntune_core::digest_enrollment::OriginManifest;
 
 mod inventory;
-pub use inventory::{append_inventory, InventoryAppendError};
+pub use inventory::VerifiedWriteError as InventoryAppendError;
+pub use inventory::{append_inventory, stage_validated_winner, VerifiedWriteError};
 
 // Not wired until authority and custody can be established by the caller.
 #[allow(dead_code)]

@@ -10,7 +10,9 @@ use nntune_core::{
     origin_sealer::SealedChunk,
 };
 use nntune_ingest::{
-    digest_candidate_store::{append_inventory, CandidateIntent, InventoryAppendError},
+    digest_candidate_store::{
+        append_inventory, stage_validated_winner, CandidateIntent, InventoryAppendError,
+    },
     multipart::{
         readback_inventory::{
             BucketReadbackResponse, CompletedReadbackInventory, InventoryError, ReadbackScope,
@@ -268,6 +270,16 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         .unwrap();
     }
 
+    async fn insert_envelope(tx: &Transaction<'_>, object: &str, root: &str, record: &[u8]) {
+        tx.execute(
+            "INSERT INTO public.storage_object_envelope_intents
+             VALUES ($1::text::uuid, $2::text::uuid, $3)",
+            &[&object, &root, &record],
+        )
+        .await
+        .unwrap();
+    }
+
     let url = std::env::var("NNTUNE_TEST_DATABASE_URL").expect("scratch database URL");
     assert!(
         std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
@@ -370,7 +382,7 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
     tx.rollback().await.unwrap();
 
     let mut tx = writer.transaction().await.unwrap();
-    let release = async {
+    let wait_for_writer = || async {
         while !observer
             .query_one("SELECT cardinality(pg_blocking_pids($1)) > 0", &[&pid])
             .await
@@ -379,12 +391,14 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        held.commit().await.unwrap();
     };
     let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         tokio::join!(
             append_inventory(&mut tx, &intent, SCOPE, &verified),
-            release
+            async {
+                wait_for_writer().await;
+                held.commit().await.unwrap();
+            }
         )
     })
     .await
@@ -423,18 +437,97 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
     assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_none());
     tx.rollback().await.unwrap();
 
+    const RETAIN_UNTIL: i64 = 2_000_000_000;
+    let root = hex::encode(fixture.context.identities[0]);
+    let winner = "SELECT environment_id = $2::text::uuid AND library_id = $3::text::uuid
+                         AND plaintext_sha256 = decode($4, 'hex') AND plaintext_bytes = $5
+                         AND root_version_id = $6::text::uuid AND retain_until = to_timestamp($7)
+                  FROM public.storage_validated_digest_winners WHERE object_id = $1::text::uuid";
+    let key: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+        &ids[2],
+        &ids[0],
+        &ids[1],
+        &digest,
+        &(length as i64),
+        &root,
+        &(RETAIN_UNTIL as f64),
+    ];
+    let stage = async |tx: &mut Transaction<'_>| {
+        stage_validated_winner(tx, &intent, SCOPE, &verified, RETAIN_UNTIL).await
+    };
+
     let mut tx = writer.transaction().await.unwrap();
-    append_inventory(&mut tx, &intent, SCOPE, &verified)
+    insert_envelope(&tx, &ids[2], &root, &fixture.record).await;
+    assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
+    tx.rollback().await.unwrap();
+
+    let mut wrong_record = fixture.record;
+    wrong_record[229] ^= 1;
+    for (media, pages, record) in [
+        (
+            FINAL_VERSION,
+            [FINAL_VERSION, PAGE_ONE_VERSION],
+            fixture.record,
+        ),
+        (
+            SHARED_VERSION,
+            [PAGE_ONE_VERSION, FINAL_VERSION],
+            fixture.record,
+        ),
+        (
+            SHARED_VERSION,
+            [FINAL_VERSION, PAGE_ONE_VERSION],
+            wrong_record,
+        ),
+    ] {
+        let mut tx = writer.transaction().await.unwrap();
+        tx.execute(
+            "INSERT INTO public.storage_digest_inventory_intents VALUES ($1::text::uuid, $2, $3)",
+            &[&map, &media, &pages.as_slice()],
+        )
         .await
         .unwrap();
-    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_some());
-    assert!(observer.query_opt(lookup, &[&map]).await.unwrap().is_none());
-    tx.rollback().await.unwrap();
+        insert_envelope(&tx, &ids[2], &root, &record).await;
+        assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
+        assert!(tx.query_opt(winner, key).await.unwrap().is_none());
+        assert_eq!(
+            tx.query_one(lookup, &[&map])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            media
+        );
+        tx.rollback().await.unwrap();
+    }
 
     let mut tx = writer.transaction().await.unwrap();
     append_inventory(&mut tx, &intent, SCOPE, &verified)
         .await
         .unwrap();
+    assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
+    insert_envelope(&tx, &ids[2], &root, &fixture.record).await;
+    let stale = CandidateIntent {
+        reservation_generation: 1,
+        ..intent
+    };
+    assert_eq!(
+        stage_validated_winner(&mut tx, &stale, SCOPE, &verified, RETAIN_UNTIL).await,
+        Err(MissingOrFenced)
+    );
+    stage(&mut tx).await.unwrap();
+    assert_eq!(stage(&mut tx).await, Err(Conflict));
+    assert!(tx.query_one(winner, key).await.unwrap().get::<_, bool>(0));
+    assert!(observer.query_opt(winner, key).await.unwrap().is_none());
+    assert!(tx.query_opt(lookup, &[&map]).await.unwrap().is_some());
+    assert!(observer.query_opt(lookup, &[&map]).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+    assert!(observer.query_opt(winner, key).await.unwrap().is_none());
+
+    let mut tx = writer.transaction().await.unwrap();
+    append_inventory(&mut tx, &intent, SCOPE, &verified)
+        .await
+        .unwrap();
+    insert_envelope(&tx, &ids[2], &root, &fixture.record).await;
     tx.commit().await.unwrap();
     let mut tx = writer.transaction().await.unwrap();
     assert_eq!(
@@ -448,6 +541,114 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         row.get::<_, Vec<String>>(1),
         [FINAL_VERSION, PAGE_ONE_VERSION]
     );
+
+    let competitor = hex::encode(id(9));
+    let other_environment = hex::encode(id(12));
+    let other_library = hex::encode(id(10));
+    let other_generation = hex::encode(id(11));
+    for (environment, library, expected) in [
+        (&ids[0], &ids[1], Err(Conflict)),
+        (&other_environment, &other_library, Ok(())),
+    ] {
+        let mut tx = writer.transaction().await.unwrap();
+        // Seed a second object with the same digest in a selected library.
+        tx.batch_execute(&format!(
+            "INSERT INTO public.storage_environments VALUES ('{environment}') ON CONFLICT DO NOTHING;
+             INSERT INTO public.storage_library_namespaces VALUES ('{library}', '{environment}', NULL) ON CONFLICT DO NOTHING;
+             INSERT INTO public.storage_object_intents
+             SELECT '{competitor}', '{other_generation}', '{environment}', '{library}',
+                    provider_configuration_version_id, plaintext_bytes, envelope_bytes, header_tag
+             FROM public.storage_object_intents WHERE object_id = '{}';
+             INSERT INTO public.storage_plaintext_digest_claim_intents
+             SELECT '{competitor}', '{environment}', '{library}', plaintext_bytes, plaintext_sha256
+             FROM public.storage_plaintext_digest_claim_intents WHERE object_id = '{}';
+             INSERT INTO public.storage_digest_map_intents (map_id, object_id, environment_id, library_id, plaintext_bytes)
+             SELECT gen_random_uuid(), object_id, environment_id, library_id, plaintext_bytes
+             FROM public.storage_plaintext_digest_claim_intents WHERE object_id = '{competitor}';
+             INSERT INTO public.storage_object_envelope_intents
+             SELECT '{competitor}', root_version_id,
+                    overlay(wrapped_record placing uuid_send('{environment}') || uuid_send('{library}')
+                        || uuid_send('{competitor}') || uuid_send('{other_generation}') from 27 for 64)
+             FROM public.storage_object_envelope_intents WHERE object_id = '{}';
+             INSERT INTO public.storage_validated_digest_winners
+                 (object_id, environment_id, library_id, plaintext_bytes, plaintext_sha256, root_version_id, retain_until)
+             SELECT c.*, '{root}', '-infinity' FROM public.storage_plaintext_digest_claim_intents c
+             WHERE c.object_id = '{competitor}';",
+            ids[2], ids[2], ids[2],
+        )).await.unwrap();
+        assert_eq!(stage(&mut tx).await, expected);
+        assert_eq!(
+            tx.query_opt(winner, key).await.unwrap().is_some(),
+            expected.is_ok()
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    let held = locker.transaction().await.unwrap();
+    let set_expiry = "UPDATE public.storage_digest_reservations
+                      SET expires_at = clock_timestamp() + make_interval(secs => $2)
+                      WHERE object_id = $1::text::uuid";
+    held.execute(set_expiry, &[&ids[2], &0.0_f64])
+        .await
+        .unwrap();
+    let mut tx = writer.transaction().await.unwrap();
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(stage(&mut tx), async {
+            wait_for_writer().await;
+            held.commit().await.unwrap();
+        })
+    })
+    .await
+    .expect("winner staging must resume after the reservation lock wait");
+    assert_eq!(result, Err(MissingOrFenced));
+    assert!(tx.query_opt(winner, key).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+    observer
+        .execute(set_expiry, &[&ids[2], &3600.0_f64])
+        .await
+        .unwrap();
+
+    let mut tx = writer.transaction().await.unwrap();
+    tx.batch_execute(
+        "CREATE TEMP SEQUENCE winner_insert_attempt;
+         CREATE FUNCTION public.test_wait_for_winner_expiry() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+            PERFORM nextval('pg_temp.winner_insert_attempt');
+            PERFORM pg_sleep_until((SELECT expires_at FROM public.storage_digest_reservations
+                                    WHERE object_id = NEW.object_id));
+            RETURN NEW;
+         END $$;
+         CREATE TRIGGER wait_for_winner_expiry BEFORE INSERT ON public.storage_validated_digest_winners
+         FOR EACH ROW EXECUTE FUNCTION public.test_wait_for_winner_expiry();",
+    ).await.unwrap();
+    tx.execute(set_expiry, &[&ids[2], &3.0_f64]).await.unwrap();
+    assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
+    assert!(tx
+        .query_one("SELECT is_called FROM pg_temp.winner_insert_attempt", &[])
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    assert!(tx.query_opt(winner, key).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+
+    let mut tx = writer
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .start()
+        .await
+        .unwrap();
+    assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
+    tx.rollback().await.unwrap();
+
+    let mut tx = writer.transaction().await.unwrap();
+    stage(&mut tx).await.unwrap();
+    assert!(observer.query_opt(winner, key).await.unwrap().is_none());
+    tx.commit().await.unwrap();
+    assert!(observer
+        .query_one(winner, key)
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
 }
 
 #[tokio::test]
