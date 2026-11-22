@@ -11,7 +11,9 @@ function setup() {
 	const write = (key: string, value: string) => void Reflect.set(entries, key, value);
 	const remove = (key: string) => void Reflect.deleteProperty(entries, key);
 	const setItem = vi.fn(write), removeItem = vi.fn(remove);
-	vi.stubGlobal('window', { localStorage: Object.assign(entries, { setItem, removeItem, getItem: (key: string) => entries[key] ?? null }) });
+	vi.stubGlobal('window', Object.assign(new EventTarget(), {
+		localStorage: Object.assign(entries, { setItem, removeItem, getItem: (key: string) => entries[key] ?? null })
+	}));
 	const names = new Set<string>();
 	vi.stubGlobal('caches', { keys: async () => [...names], open: async (name: string) => names.add(name), delete: async (name: string) => names.delete(name) });
 	const send = vi.fn(async () => ok());
@@ -54,6 +56,64 @@ it('shares the read lock, queues logout and recovers after storage errors', asyn
 	expect(await (await captureAuthFence())?.run(() => true)).toBe(true);
 	expect(read()).not.toBe(initial);
 	expect(await first!.run(() => true)).toBeUndefined();
+});
+it.each([null, '', 'established'])('captures read-only only with an established generation (%s)', async (id) => {
+	const { setItem, removeItem, write } = setup();
+	if (id !== null) write(AUTH_GENERATION_KEY, id);
+	expect((await captureAuthFence({ readOnly: true }))?.generation).toBe(id || undefined);
+	expect(setItem).not.toHaveBeenCalled();
+	expect(removeItem).not.toHaveBeenCalled();
+});
+
+it.each(['sign-out', 'cross-tab account switch', 'missed storage event'])('retires bound requests and refuses late results after %s', async (transition) => {
+	const { api, write } = setup();
+	const owner = (await captureAuthFence())!;
+	expect(await captureAuthFence()).toBe(owner);
+	const path = '/v1/me/taste/session';
+	const binding = 'A'.repeat(43);
+	const late = Promise.withResolvers<Response>();
+	const fetchFn = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ session_binding: binding }))
+		.mockReturnValueOnce(late.promise);
+	const page = new AbortController();
+	const client = new ApiClient({ baseUrl: '', fetchFn, signal: page.signal, session: { owner, binding } });
+
+	expect(() => client.setToken('synthetic')).toThrow('Account requests use the browser session');
+	await expect(client.get(path, { Authorization: 'Bearer synthetic' })).rejects.toThrow('Account requests use the browser session');
+	expect(fetchFn).not.toHaveBeenCalled();
+	await expect(client.get(path)).resolves.toEqual({ session_binding: binding });
+	const pending = client.get(path).catch((error: unknown) => error);
+	const request = fetchFn.mock.calls[1][1];
+	expect(request).toMatchObject({
+		credentials: 'include', cache: 'no-store', redirect: 'error',
+		headers: { 'x-nntune-session-binding': binding }
+	});
+
+	if (transition === 'sign-out') await api.logout();
+	else {
+		write(AUTH_GENERATION_KEY, 'next-account');
+		if (transition === 'cross-tab account switch') {
+			window.dispatchEvent(Object.assign(new Event('storage'), { key: AUTH_GENERATION_KEY }));
+		} else {
+			await expect(client.get(path)).rejects.toMatchObject({ name: 'AbortError' });
+			expect(request?.signal?.aborted).toBe(false);
+			expect(await captureAuthFence()).not.toBe(owner);
+		}
+	}
+	expect(request?.signal?.aborted).toBe(true);
+	expect(page.signal.aborted).toBe(false);
+	late.resolve(Response.json({ session_binding: binding }));
+	expect(await pending).toMatchObject({ name: 'AbortError' });
+	await expect(client.get(path)).rejects.toMatchObject({ name: 'AbortError' });
+	expect(fetchFn).toHaveBeenCalledTimes(2);
+
+	if (transition !== 'sign-out') {
+		const next = (await captureAuthFence())!;
+		const nextBinding = 'E'.repeat(43);
+		fetchFn.mockResolvedValueOnce(Response.json({ session_binding: nextBinding }));
+		const replacement = new ApiClient({ baseUrl: '', fetchFn, session: { owner: next, binding: nextBinding } });
+		await expect(replacement.get(path)).resolves.toEqual({ session_binding: nextBinding });
+		expect(fetchFn.mock.calls[2][1]?.headers).toMatchObject({ 'x-nntune-session-binding': nextBinding });
+	}
 });
 it('does not dispatch logout queued behind a second tab signing in', async () => {
 	const { api, send } = setup();
@@ -114,6 +174,7 @@ it.each(['open', 'delete'] as const)('does not wait beyond the auth deadline for
 	try {
 		await vi.advanceTimersByTimeAsync(API_REQUEST_TIMEOUT_MS);
 		expect(await logout).toEqual(op === 'open' ? expect.objectContaining({ code: 'request_timeout' }) : undefined);
+		expect(caches[op]).toHaveBeenCalledOnce();
 	} finally { ready.resolve(); await vi.advanceTimersByTimeAsync(0); }
 	expect(send).toHaveBeenCalledTimes(op === 'open' ? 0 : 1);
 	expect(await caches.keys()).toHaveLength(0);

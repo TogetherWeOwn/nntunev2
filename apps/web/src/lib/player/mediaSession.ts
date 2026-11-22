@@ -125,7 +125,7 @@ const SEEK_HANDLERS = [
 ] as const;
 const seekingSessions = new WeakSet<MediaSessionLike>();
 
-function setSeekHandlers(session: MediaSessionLike, handlers?: MediaSessionHandlers): void {
+export function setSeekHandlers(session: MediaSessionLike, handlers?: MediaSessionHandlers): void {
 	// Legacy consumers need not opt into seeking. Once opted in, every seek
 	// action is replaced/cleared, even if one registration was unsupported.
 	if (!seekingSessions.has(session) && !SEEK_HANDLERS.some(([, key]) => handlers?.[key])) return;

@@ -1,5 +1,6 @@
 """Check the synthetic graph workflow's intended execution boundary."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -34,14 +35,9 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
         self.assertEqual("python3 .github/scripts/test_preserved_source_graph_workflow.py -v",
                          step_field(wiring, "run"))
         self.assertEqual("${{ github.sha }}", step_field(checkout, "ref"))
-        self.assertEqual("2", step_field(checkout, "fetch-depth"))
+        self.assertEqual("0", step_field(checkout, "fetch-depth"))
         self.assertEqual("false", step_field(checkout, "persist-credentials"))
-        for name, expression in (
-            ("EXPECTED_MERGE", "github.sha"),
-            ("EVENT_BASE", "github.event.pull_request.base.sha"),
-            ("EXPECTED_HEAD", "github.event.pull_request.head.sha"),
-        ):
-            self.assertIn(f"{name}: ${{{{ {expression} }}}}", identity)
+        self.assertIn('python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"', identity)
         self.assertIn("git --version", identity)
         self.assertIn("GitFixture.test_preserved_source_requires_original_graph_and_data_objects", graph)
         self.assertNotIn("continue-on-error:", job)
@@ -73,18 +69,27 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
             git("merge", "--no-ff", "-qm", "merge", head)
             merge = git("rev-parse", "HEAD")
 
+            scripts = root / ".github/scripts"
+            scripts.mkdir(parents=True)
+            shutil.copy2(ROOT / ".github/scripts/migrations_base.py", scripts)
+            event, output = root / "event.json", root / "output"
+
             def run(expected_merge=merge, expected_head=head, event_base=stale):
-                env = {**os.environ, "EXPECTED_MERGE": expected_merge,
-                       "EXPECTED_HEAD": expected_head, "EVENT_BASE": event_base}
+                event.write_text(json.dumps({"pull_request": {
+                    "base": {"sha": event_base}, "head": {"sha": expected_head},
+                }}))
+                output.write_text("")
+                env = {**os.environ, "GITHUB_SHA": expected_merge, "GITHUB_REF": "refs/pull/1/merge",
+                       "GITHUB_EVENT_NAME": "pull_request", "GITHUB_EVENT_PATH": str(event),
+                       "GITHUB_OUTPUT": str(output)}
                 return subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=root,
                                       env=env, capture_output=True, text=True)
 
             for event_base in (stale, base):
                 result = run(event_base=event_base)
                 self.assertEqual(0, result.returncode, result.stderr)
-                self.assertIn(f"base={base}\n", result.stdout)
-                self.assertIn(f"event_base={event_base}\n", result.stdout)
-                self.assertIn(f"head={head}\n", result.stdout)
+                self.assertEqual({"merge_sha": merge, "base_sha": base, "head_sha": head},
+                                 dict(line.split("=") for line in output.read_text().splitlines()))
                 self.assertIn("git version", result.stdout)
             self.assertNotEqual(0, run(expected_merge=base).returncode)
             self.assertNotEqual(0, run(expected_head=base).returncode)

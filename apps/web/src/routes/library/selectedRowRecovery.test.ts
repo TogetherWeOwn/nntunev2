@@ -17,6 +17,20 @@ test('handles missing, first, last and only removed rows', () => {
 		.toEqual({ nextId: null, previousId: null });
 });
 
+test('returns no neighbors when the display is empty or survivors are hidden', () => {
+	expect(selectedRowRecoveryIds([], 'removed', ['hidden']))
+		.toEqual({ nextId: null, previousId: null });
+	expect(selectedRowRecoveryIds(['a', 'removed', 'b'], 'removed', ['hidden']))
+		.toEqual({ nextId: null, previousId: null });
+});
+
+test('finds the nearest neighbors of the first exact removed occurrence', () => {
+	const displayed = ['earlier', 'Removed', 'skip', 'removed', 'next', 'removed', 'later'];
+	const selected = ['later', 'earlier', 'next', 'Removed'];
+	expect(selectedRowRecoveryIds(displayed, 'removed', selected))
+		.toEqual({ nextId: 'next', previousId: 'Removed' });
+});
+
 test('uses the first removed occurrence and exact survivor membership without mutating inputs', () => {
 	const displayed = ['A', 'removed', 'a', 'removed', 'A'];
 	const selected = ['A', 'A', 'hidden'];

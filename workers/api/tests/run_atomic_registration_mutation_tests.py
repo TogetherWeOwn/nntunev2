@@ -41,8 +41,8 @@ MUTATIONS = (
     ),
     (
         "zero-row-claim-accepted",
-        "claim_single_use_on(&transaction, claim).await? != 1",
-        "claim_single_use_on(&transaction, claim).await? > 1",
+        "ClaimOutcome::Count(n) if n != 1",
+        "ClaimOutcome::Count(n) if n > 1",
         PREFIX + "postgres_registration_zero_row_magic_claim_rolls_back_earlier_challenge",
         "a zero-row later claim must abort enrollment",
         "async fn complete_registration_on(",
@@ -78,9 +78,7 @@ MUTATIONS = (
         "    reaper_selection_pause().await;",
         "        .collect::<Result<Vec<_>, _>>()?;\n"
         "    transaction.commit().await.map_err(|_| StoreError)?;\n"
-        "    let transaction = client.build_transaction()"
-        ".isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)"
-        ".start().await.map_err(|_| StoreError)?;\n"
+        "    let transaction = client.read_committed().await.map_err(|_| StoreError)?;\n"
         '    #[cfg(all(test, not(target_arch = "wasm32")))]\n'
         "    reaper_selection_pause().await;",
         PREFIX + "postgres_reap_holds_selected_parent_lock_through_delete",

@@ -1,5 +1,7 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
 
+test.use({ locale: 'en-US', timezoneId: 'America/Los_Angeles' });
+
 const path = '/admin/invites';
 const api = '/v1/admin/invites';
 const issuer = 'Abcdefghijkl01234-__gA';
@@ -55,6 +57,9 @@ test('reauthorizes a restored ledger before showing rows and applies one server-
 	await expect(results(page).getByRole('listitem')).toHaveCount(3);
 	await expect(page.getByText(/Up to 200 matching invites.*not a complete history/)).toBeVisible();
 	await expect(results(page)).toContainText('Effective expiry (UTC): Jan 1, 1970');
+	const times = results(page).locator('time');
+	await expect(times).toHaveText(fixture.map(() => 'Jan 1, 1970, 12:00:00 AM'));
+	await expect(results(page).locator('time[datetime="1970-01-01T00:00:00.000Z"]')).toHaveCount(fixture.length);
 	await expect(results(page)).not.toContainText(/fixture-code|fixture-hash/);
 	await expect(results(page).getByRole('button')).toHaveCount(1);
 	expect(await page.locator('main').evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
@@ -69,6 +74,15 @@ test('reauthorizes a restored ledger before showing rows and applies one server-
 	await search.press('Enter');
 	await expect(page.getByText('No invites match this filter.')).toBeVisible();
 	expect(calls).toEqual([`GET ${api}`, `GET ${api}`, `GET ${api}/status/redeemed`, `GET ${api}/issuer/${issuer}`]);
+});
+
+test('renders the maximum accepted expiry as an HTML datetime', async ({ page }) => {
+	await mock(page, (route) => route.fulfill({ json: { invites: [{ ...row, issued_by: null, expires_at: 8_640_000_000_000 }] } }));
+	await page.goto(path);
+	await expect(results(page)).toContainText('Issuer: Not recorded');
+	const expiry = results(page).locator('time');
+	await expect(expiry).toHaveAttribute('datetime', '275760-09-13T00:00:00.000Z');
+	await expect(expiry).toHaveText('Sep 13, 275760, 12:00:00 AM');
 });
 
 for (const status of [404, 500, 200]) test(`does not expose ledger controls after an invalid read (${status})`, async ({ page }) => {

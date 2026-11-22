@@ -1,19 +1,20 @@
 import { get, writable } from 'svelte/store';
-import { emptySeek, readAbsoluteSeek, writeAbsoluteSeek, type AbsoluteSeekState } from './absoluteSeek.js';
+import { emptySeek, readAbsoluteSeek, SEEK_READBACK_TOLERANCE, writeAbsoluteSeek, type AbsoluteSeekState } from './absoluteSeek.js';
 import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { createPlayerSleepTimer } from './playerSleepTimer.js';
 import { currentTrack, naturalEndPolicy, nextTrack, previousTrack, selectTrack, type QueueState, type RepeatMode } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
-import { describeJump, jumpMedia, type JumpDirection } from './relativeJump.js';
+import { describeJump, jumpMedia, RELATIVE_JUMP_SECONDS, type JumpDirection } from './relativeJump.js';
 import { createNativeSound } from './nativeSound.js';
 import { createPendingShareSeek } from './pendingShareSeek.js';
 import { createLivePlaybackSpeed } from './livePlaybackSpeed.js';
 import { restartIsAvailable } from './restartAvailability.js';
+import type { SystemSeekGuard } from './systemSeek.js';
 import { bindSystemTransport } from './systemTransport.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
-export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean };
+export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | { end: number; seekDuration: number; played: TimeRanges; settled?: number; progressed?: boolean; tailProgress?: boolean } };
 export type PlaybackStatus = 'unavailable' | 'paused' | 'starting' | 'playing' | 'blocked' | 'error' | 'retrying';
 
 type PlayOutcome = 'playing' | 'blocked' | 'error' | undefined;
@@ -28,6 +29,15 @@ export type MediaSelection = {
 };
 
 const REPEAT_KEY = 'nntune:library-repeat:v1';
+// Native played snapshots are static and normalized (ordered, disjoint, non-touching ranges).
+function playedNewTail(before: TimeRanges, after: TimeRanges, end: number, duration: number): boolean {
+	for (let i = 0, j = 0; i < (after?.length ?? 0); i++) {
+		const start = Math.max(end, after.start(i)), stop = Math.min(duration, after.end(i));
+		while (before && j < before.length && before.end(j) <= start) j++;
+		if (stop > start && (!before || j === before.length || before.start(j) > start || before.end(j) < stop)) return true;
+	}
+	return false;
+}
 
 function describeRestart(words: string, title: string): string {
 	const suffix = ` ${title}.`;
@@ -387,8 +397,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		return () => retryShare(current?.audio, revision);
 	}
 
-	function jump(direction: JumpDirection): void {
-		if (destroyed || queue.purging) return;
+	function onSeekLanded(attachment: MediaAttachment, system?: SystemSeekGuard) {
+		if (system || typeof attachment.soughtToEnd === 'object') return (target: number, duration: number, observed: number) => {
+			attachment.soughtToEnd = system ? { end: Math.min(duration, Math.max(target, observed)), seekDuration: duration, played: attachment.audio.played } : false;
+		};
+	}
+
+	function jump(direction: JumpDirection, seconds = RELATIVE_JUMP_SECONDS, system?: SystemSeekGuard): void {
+		if (destroyed || queue.purging || system?.active() === false) return;
 		const track = currentTrack(queue.snapshot);
 		const source = resolveStreamUrl(track);
 		const attachment = current;
@@ -399,25 +415,26 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		// Cancel on acceptance, even if the native seek is deferred or refused.
 		if (track) pendingShare.supersede(track.id, source);
 		const revision = pendingShare.revision;
-		const isCurrent = () => !destroyed && attachmentVersion === version && queue.isCurrent(queueRevision) &&
-			positionIntent === intent && pendingShare.revision === revision;
+		const isCurrent = (guard = system?.active) => !destroyed && attachmentVersion === version && queue.isCurrent(queueRevision) &&
+			positionIntent === intent && pendingShare.revision === revision && guard?.() !== false;
 		runPosition(() => {
-			const matches = () => !!audio && !!source && matchesSource(audio, source, isCurrent);
-			const outcome = audio && matches() ? jumpMedia(audio, direction, matches, () => {
+			const matches = (guard = system?.active) => !!audio && !!source && matchesSource(audio, source, () => isCurrent(guard));
+			const outcome = attachment && audio && matches() ? jumpMedia(audio, direction, matches, () => {
 				if (current === attachment) clearJumpFeedback();
-			}) : undefined;
-			if (outcome ? !matches() : !isCurrent()) return;
+			}, seconds, system?.unavailable, onSeekLanded(attachment, system)) : undefined;
+			if (outcome ? !matches(system?.canReport) : !isCurrent()) return;
 			if (outcome?.kind === 'jumped') lastJumpTarget = outcome.target;
 			seekFeedback.update((feedback) => ({
-				...feedback, jumpStatus: describeJump(direction, outcome ?? { kind: 'unavailable' }),
+				...feedback, jumpStatus: describeJump(direction, outcome ?? { kind: 'unavailable' }, seconds),
 				jumpStatusVersion: feedback.jumpStatusVersion + 1
 			}));
 		});
 	}
 
-	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string, replay = false, nativeSeeking = false): void {
+	function observeAbsoluteSeek(audio: HTMLAudioElement, matches: () => boolean, feedback?: string, replay = false, nativeSeeking = false, onUnavailable?: () => void): void {
 		const attachment = attachmentVersion;
 		const observation = readAbsoluteSeek(audio);
+		if (!observation.enabled) onUnavailable?.();
 		if (!matches()) return;
 		const prior = get(absoluteSeek);
 		const previous = prior.attachment === attachment ? prior : emptySeek;
@@ -433,7 +450,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		}
 	}
 
-	function seek(attachment: number, seconds: number, replay = true): void {
+	function seek(attachment: number, seconds: number, replay = true, system?: SystemSeekGuard): void {
 		if (attachment !== attachmentVersion || !Number.isFinite(seconds)) return;
 		const target = transportTarget();
 		if (!target) return;
@@ -441,14 +458,15 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const before = positionIntent;
 		const track = currentTrack(queue.snapshot);
 		const sameSelection = () => currentTrack(queue.snapshot)?.id === track?.id;
-		if (!track || !matches(() => positionIntent === before && sameSelection())) return;
+		if (!track || !matches(() => positionIntent === before && sameSelection() && system?.active() !== false)) return;
 		const intent = ++positionIntent;
 		pendingShare.supersede(track.id, resolveStreamUrl(track));
-		const isCurrent = () => matches(() => positionIntent === intent && sameSelection());
+		const isCurrent = (guard = system?.active) => matches(() => positionIntent === intent && sameSelection() && guard?.() !== false);
 		runPosition(() => {
 			if (!isCurrent()) return;
-			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent);
-			if (isCurrent()) observeAbsoluteSeek(audio, isCurrent, feedback, replay);
+			const feedback = writeAbsoluteSeek(audio, seconds, isCurrent, system?.unavailable, onSeekLanded(target.attachment, system));
+			const canReport = () => isCurrent(system?.canReport);
+			if (canReport()) observeAbsoluteSeek(audio, canReport, feedback, replay, false, system?.unavailable);
 		});
 	}
 
@@ -517,7 +535,19 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const ownsOrigin = () => ownsEnd() && matchesOrigin() && ownsEnd();
 		const base = queue.snapshot;
 		if (!audio.ended || audio.error !== null || !attachment.playing || !ownsOrigin()) return;
-		const natural = !attachment.soughtToEnd;
+		const { soughtToEnd } = attachment;
+		if (typeof soughtToEnd === 'object') {
+			const { duration, currentTime } = audio, { end, seekDuration, played, progressed, tailProgress, settled } = soughtToEnd, slack = SEEK_READBACK_TOLERANCE;
+			const correctedTail = duration < seekDuration && settled !== undefined && (end >= seekDuration || settled >= duration - slack);
+			const reachedNewEnd = correctedTail
+				? currentTime >= duration - slack && (tailProgress || playedNewTail(played, audio.played, settled, duration))
+				: duration > end
+				? end < seekDuration || (currentTime >= duration - slack && (currentTime > end + slack || progressed || playedNewTail(played, audio.played, end, duration)))
+				: duration === end && currentTime >= duration - slack && (tailProgress || (settled !== undefined && playedNewTail(played, audio.played, settled, duration)));
+			if (!ownsOrigin()) return;
+			if (!reachedNewEnd) { attachment.playing = attachment.soughtToEnd = false; return; }
+		}
+		const natural = soughtToEnd !== true;
 		attachment.playing = attachment.soughtToEnd = false;
 		generation = ++endGeneration;
 		announce('');
@@ -609,7 +639,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (previous) pendingShare.clear();
 			attachmentVersion += 1;
 			// Node identity is not attachment identity, even for the same source.
-			const receipt = { audio, playing: false, soughtToEnd: false, listeners: new AbortController() };
+			const receipt: NonNullable<typeof current> = { audio, playing: false, soughtToEnd: false, listeners: new AbortController() };
 			current = receipt;
 			previous?.listeners.abort();
 			if (previous) invalidatePlay();
@@ -632,6 +662,19 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					const matches = (generation?: number) => matchesSource(audio, source, () =>
 						current === receipt && selectedSource() === source && (generation === undefined || positionIntent === generation));
 					if (!matches()) return;
+					const marker = receipt.soughtToEnd;
+					if (typeof marker === 'object' && (event.type === 'seeked' || event.type === 'timeupdate') && !audio.seeking) {
+						const { currentTime, duration, paused, ended } = audio;
+						if (!matches(intent)) return;
+						if (event.type === 'seeked') {
+							Object.assign(marker, { settled: currentTime, tailProgress: false });
+							if (Number.isFinite(duration) && duration > 0 && (duration < marker.seekDuration
+								? currentTime >= duration - SEEK_READBACK_TOLERANCE : marker.end < marker.seekDuration && currentTime >= duration)) marker.end = marker.seekDuration = duration;
+						} else if (!paused && !ended && currentTime > (marker.settled ?? Infinity) && currentTime < duration) {
+							marker.tailProgress = true;
+							marker.progressed ||= currentTime > marker.end;
+						}
+					}
 					switch (event.type) {
 						case 'play':
 						case 'playing':
@@ -660,7 +703,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 						case 'seeking': {
 							const { currentTime, duration } = audio;
 							if (!matches(intent)) return;
-							receipt.soughtToEnd = Number.isFinite(duration) && duration > 0 && currentTime >= duration;
+							const hasEnd = Number.isFinite(duration) && duration > 0, slack = SEEK_READBACK_TOLERANCE;
+							if (typeof marker !== 'object' || !(Math.abs(currentTime - marker.end) <= slack ||
+								(marker.settled === undefined && hasEnd && duration < marker.end && Math.abs(currentTime - duration) <= slack)))
+								receipt.soughtToEnd = hasEnd && currentTime >= duration;
 							if (shareRevision === pendingShare.revision) pendingShare.observeSeeking(audio);
 							return observeSeeking(audio, () => matches(intent));
 						}
@@ -703,12 +749,18 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (target?.attachment === receipt) {
 				sound.connect(audio, target.matches, receipt.listeners.signal);
 				readPlayback(audio, target.matches, 'starting');
+				const attachment = attachmentVersion;
 				bindSystemTransport(queue, audio, () => target.matches() ? currentTrack(queue.snapshot) : null,
 					{
 						playCurrent, pauseCurrent,
 						onNext: selection && (() => navigateQueue(nextTrack)),
 						onPrevious: selection && (() => navigateQueue(previousTrack))
-					}, receipt.listeners.signal);
+					}, receipt.listeners.signal, {
+						audio, attachment, availability: absoluteSeek, positionIntent: () => positionIntent,
+						matches: () => target.matches(() => currentTrack(queue.snapshot)?.id === trackId),
+						dispatch: (action, seconds, guard) => action === 'seekto' ? seek(attachment, seconds, true, guard)
+							: jump(action === 'seekforward' ? 'forward' : 'back', seconds, guard)
+					});
 			}
 			observePosition();
 			pause(previous?.audio);

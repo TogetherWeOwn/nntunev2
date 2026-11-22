@@ -456,6 +456,7 @@ pub(crate) fn like_track_target(path: &str) -> Option<&str> {
 
 pub(crate) const MEMBER_INVITES_PATH: &str = "/v1/me/invites";
 pub(crate) const MEMBER_INVITE_HISTORY_PATH: &str = "/v1/me/invites/history";
+pub(crate) const ADMIN_INVITE_BATCH_PATH: &str = "/v1/admin/invites/batch";
 pub(crate) const ADMIN_INVITE_WINDOWS_PATH: &str = "/v1/admin/invite-windows";
 
 pub(crate) fn admin_invite_tree_user(path: &str) -> Option<&str> {
@@ -524,6 +525,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                     | "/v1/me/likes"
                     | "/v1/me/likes/session"
                     | "/v1/me/taste"
+                    | crate::handlers::BOUND_TASTE_PATH
                     | "/v1/me/history"
                     | MEMBER_INVITES_PATH
                     | MEMBER_INVITE_HISTORY_PATH
@@ -630,10 +632,8 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == ADMIN_INVITE_WINDOWS_PATH || admin_invite_window_close_id(path).is_some() {
                 return SessionOnly;
             }
-            // Admin invite writes (migration 0033): issue at the bare
-            // path, revoke at `{id}/revoke`. Session-only, like the
-            // rest of the admin surface.
-            if path == "/v1/admin/invites" {
+            // Single and batch issue, plus `{id}/revoke`, are session-only.
+            if matches!(path, "/v1/admin/invites" | ADMIN_INVITE_BATCH_PATH) {
                 return SessionOnly;
             }
             if let Some(rest) = path.strip_prefix("/v1/admin/invites/") {
@@ -652,8 +652,13 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if matches!(path, "/v1/me" | "/v1/me/private-session" | "/v1/me/taste")
-                || like_track_target(path).is_some()
+            if matches!(
+                path,
+                "/v1/me"
+                    | "/v1/me/private-session"
+                    | "/v1/me/taste"
+                    | crate::handlers::BOUND_TASTE_PATH
+            ) || like_track_target(path).is_some()
             {
                 return SessionOnly;
             }
@@ -686,7 +691,11 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
             }
-            if matches!(path, "/v1/account" | "/v1/me/taste") || like_track_target(path).is_some() {
+            if matches!(
+                path,
+                "/v1/account" | "/v1/me/taste" | crate::handlers::BOUND_TASTE_PATH
+            ) || like_track_target(path).is_some()
+            {
                 return SessionOnly;
             }
             if one_segment_after("/v1/subsonic-credentials/", path) {

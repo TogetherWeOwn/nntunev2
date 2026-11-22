@@ -31,6 +31,35 @@ env:
   PNPM_VERSION: 10.34.7
 
 jobs:
+  ci-commits:
+    name: ci-commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      merge_sha: ${{ steps.commits.outputs.merge_sha }}
+      base_sha: ${{ steps.commits.outputs.base_sha }}
+      head_sha: ${{ steps.commits.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve tested commit and comparison range
+        id: commits
+        run: python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"
+      - name: Install the pinned workflow YAML scanner
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/ci-python"
+          "$RUNNER_TEMP/ci-python/bin/pip" --isolated install --no-deps --only-binary=:all: --require-hashes \
+            -r /dev/stdin <<<'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc'
+          echo "$RUNNER_TEMP/ci-python/bin" >> "$GITHUB_PATH"
+      - name: Reject added direct PR SHA reads
+        env:
+          BASE_SHA: ${{ steps.commits.outputs.base_sha }}
+          MERGE_SHA: ${{ steps.commits.outputs.merge_sha }}
+        run: python3 .github/scripts/check_workflow_pr_shas.py --base "$BASE_SHA" --tested "$MERGE_SHA"
+      - name: Test the workflow SHA ratchet
+        run: python3 -m unittest discover -s .github/scripts -p test_workflow_pr_shas.py
   # PR-only public security caller; never scan push/queue/dispatch events.
   # Keep this in the ci-ok dependency graph rather than waiting across workflows.
   public-pr-security:
@@ -323,6 +352,8 @@ jobs:
         run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 .github/scripts/test_staging_apply.py && python3 scripts/test_account_export.py
       - name: Test the read-only Subsonic staging observer offline
         run: python3 -I .github/scripts/test_subsonic_staging_observer.py
+      - name: Test Subsonic staging off-and-drained verifier and adapter offline
+        run: python3 -I .github/scripts/test_subsonic_staging_cleanup.py && python3 -I .github/scripts/test_subsonic_staging_off_drain.py
       - name: Test Subsonic staging telemetry, health and API identity offline
         run: python3 -I .github/scripts/test_subsonic_staging_telemetry.py && python3 -I .github/scripts/test_subsonic_staging_health.py && python3 -I .github/scripts/test_staging_api_identity.py
       - name: Test offline playable-artist root coverage (synthetic only)
@@ -450,9 +481,7 @@ jobs:
     name: migrations-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      MIGRATIONS_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      MIGRATIONS_PUSH_BEFORE: ${{ github.event.before }}
+    needs: ci-commits
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -463,12 +492,9 @@ jobs:
       # Keep the default PR integration checkout. Its first parent pairs
       # with that exact tree; the payload's base.sha can be stale. Pushes
       # still compare event.before, including pushes of merge commits.
-      - name: Select migration comparison base
-        id: migrations-base
-        run: python3 .github/scripts/migrations_base.py --root . >> "$GITHUB_OUTPUT"
       - name: Check migration manifest and drift
         env:
-          MIGRATIONS_BASE_REF: ${{ steps.migrations-base.outputs.base_ref }}
+          MIGRATIONS_BASE_REF: ${{ needs.ci-commits.outputs.base_sha }}
         run: python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"
       - name: Test migration comparison selection and workflow wiring
         run: python3 .github/scripts/test_migrations_base.py
@@ -643,6 +669,12 @@ jobs:
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+      - name: Enforce unnamed Postgres statements in the API Worker
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/workers/api/clippy
+        run: python3 workers/api/tests/check_hyperdrive_clippy.py
+      - name: Check typed Postgres interface
+        run: cargo test --locked --manifest-path workers/api/Cargo.toml --doc 'postgres::'
       # The Hyperdrive cache gate fails closed without credentials; pin its
       # exit codes with the built-in shim self-test (no network, no secrets).
       - run: bash workers/api/check_hyperdrive_cache.sh --self-test
@@ -788,6 +820,10 @@ jobs:
           inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name" -- --list)"
           test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
           cargo test --locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name" -- --exact --ignored
+          test_name='postgres_append_stages_only_exact_live_candidate_inventory'
+          inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --list)"
+          test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
+          cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --exact --ignored
       - name: Exercise listen history on disposable PostgreSQL
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
@@ -1129,7 +1165,7 @@ jobs:
         with:
           workspaces: workers/transcode
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --manifest-path workers/transcode/Cargo.toml --all-targets
+      - run: cargo test --locked --manifest-path workers/transcode/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path workers/transcode/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/transcode/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate (including the Container
@@ -1340,9 +1376,9 @@ jobs:
     name: docs-links
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Compare pushes with their previous tip; comparing main to itself would miss drift.
+    needs: ci-commits
     env:
-      DOCS_LINKS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
+      DOCS_LINKS_BASE_REF: ${{ needs.ci-commits.outputs.base_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2102,7 +2138,7 @@ jobs:
   # names job IDs, not matrix legs: the web-e2e entry covers both shards.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
+    needs: [ci-commits, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

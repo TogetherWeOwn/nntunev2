@@ -204,7 +204,7 @@ impl Fixture {
             crate::auth::INVITE_KIND_ADMIN,
             None,
             NOW - 10,
-            NOW + 604_800,
+            i64::MAX as u64, // Keep the invite live against the database clock.
         );
         invite.used = true;
         invite.redeemed_by = Some(user_id.clone());
@@ -739,6 +739,152 @@ async fn await_lock_wait(observer: &Client, blocked: i32, blocker: i32) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("backend {blocked} never blocked on backend {blocker}");
+}
+
+const OBSERVE_EXPIRY: &str = include_str!("../../src/observe_invite_expiry.sql");
+
+async fn assert_expiry_audits(client: &Client, id: i64, expected: usize) {
+    let marker: Option<i64> = client
+        .query_one(
+            "SELECT expiry_observed_at FROM invite_codes WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let audits = client
+        .query(
+            "SELECT at FROM audit_log WHERE action = 'invite.expired'
+             AND details->'invite_id' = to_jsonb($1::bigint)",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(audits.len(), expected, "expiry audits for invite {id}");
+    assert_eq!(audits.first().map(|row| row.get::<_, i64>(0)), marker);
+}
+
+async fn remove_expiry_audit(client: &Client, id: i64) {
+    client
+        .execute(
+            "DELETE FROM audit_log WHERE action = 'invite.expired'
+             AND details->'invite_id' = to_jsonb($1::bigint)",
+            &[&id],
+        )
+        .await
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_concurrent_expiry_observers_write_one_audit() {
+    run_test(async {
+        let observer = connect().await;
+        let mut first = connect().await;
+        let second = connect().await;
+        let first_pid = backend_pid(&first).await;
+        let second_pid = backend_pid(&second).await;
+        let key = format!("expiry-fixture-{:016x}", rand::random::<u64>());
+        let id: i64 = observer
+            .query_one(
+                "INSERT INTO invite_codes (code_hash, created_at, expires_at) VALUES ($1, 1, 2) RETURNING id",
+                &[&key],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let tx = first.transaction().await.unwrap();
+        assert_eq!(tx.query(OBSERVE_EXPIRY, &[&id]).await.unwrap().len(), 1);
+        let binds: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&id];
+        let (loser, ()) = futures_util::future::join(second.query(OBSERVE_EXPIRY, &binds), async {
+            await_lock_wait(&observer, second_pid, first_pid).await;
+            tx.commit().await.unwrap();
+        })
+        .await;
+        assert!(loser.unwrap().is_empty());
+        let audit_count: i64 = observer
+            .query_one(
+                "SELECT count(*) FROM audit_log WHERE action = 'invite.expired'
+                 AND details->'invite_id' = to_jsonb($1::bigint)",
+                &[&id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(audit_count, 1);
+        remove_expiry_audit(&observer, id).await;
+        observer
+            .execute("DELETE FROM invite_codes WHERE id = $1", &[&id])
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_member_expiry_observer_rechecks_window_after_waiting() {
+    run_test(async {
+        let db = connect().await;
+        let mut closer = connect().await;
+        let observer = connect().await;
+        let closer_pid = backend_pid(&closer).await;
+        let observer_pid = backend_pid(&observer).await;
+        let (window, original_end) = seed_member_window(&db, 600).await;
+        let fixture = seed_member_claim(&db, window, original_end + 600).await;
+        let id = fixture.invite.id;
+
+        let close = closer.transaction().await.unwrap();
+        close
+            .query_one(
+                "SELECT id FROM invite_windows WHERE id = $1 FOR NO KEY UPDATE",
+                &[&window],
+            )
+            .await
+            .unwrap();
+        let binds: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&id];
+        let (observed, closed_at) = futures_util::future::join(observer.query(OBSERVE_EXPIRY, &binds), async {
+            await_lock_wait(&db, observer_pid, closer_pid).await;
+            // Choose a deadline strictly after any pre-wait clock sample.
+            let closed_at: i64 = close
+                .query_one(
+                    "UPDATE invite_windows SET ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint + 1
+                     WHERE id = $1 RETURNING ends_at",
+                    &[&window],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(closed_at < original_end, "the committed close must shorten the window");
+            close
+                .query_one(
+                    "SELECT pg_sleep_until(to_timestamp($1::bigint::double precision))",
+                    &[&closed_at],
+                )
+                .await
+                .unwrap();
+            close.commit().await.unwrap();
+            closed_at
+        })
+        .await;
+        assert_eq!(
+            observed.unwrap().len(),
+            1,
+            "the waiter must see the committed expiry"
+        );
+        let matches: bool = db
+            .query_one(
+                "SELECT a.at = i.expiry_observed_at AND a.at >= $2
+                 FROM audit_log a JOIN invite_codes i ON i.id = $1
+                 WHERE a.action = 'invite.expired' AND a.details->'invite_id' = to_jsonb(i.id)",
+                &[&id, &closed_at],
+            )
+            .await
+            .expect("exactly one committed expiry audit")
+            .get(0);
+        assert!(matches, "audit and marker must share a post-wait timestamp");
+        remove_expiry_audit(&db, id).await;
+        remove_member_window_fixture(&db, window).await;
+    });
 }
 
 struct BlockedEnrollment {
@@ -2362,6 +2508,69 @@ fn postgres_admin_invite_issue_and_revoke_audit_by_row_id() {
 
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_admin_invite_batch_commits_together_or_not_at_all() {
+    use super::admin_issue_invite_batch_on as issue;
+    use crate::handlers::AdminInviteBatchOutcome as Outcome;
+    run_test(async {
+        let mut client = connect().await;
+        let (actor, _) = seed_admin_test_users(&client).await;
+        let ip = "198.51.100.9";
+        let snapshot = "SELECT (SELECT count(*) FROM invite_codes WHERE issued_by = $1),
+                               (SELECT count(*) FROM audit_log WHERE user_id = $1 AND action = 'invite.issued')";
+        // The mutation harness reuses this database, including committed windows.
+        let row = client.query_one(
+            "WITH clock AS (SELECT GREATEST(MAX(ends_at), $1) AS now FROM invite_windows)
+             SELECT now, EXISTS (SELECT 1 FROM invite_windows WHERE starts_at <= now AND ends_at > now)
+             FROM clock",
+            &[&(NOW as i64)],
+        ).await.unwrap();
+        assert!(!row.get::<_, bool>(1));
+        let now = u64::try_from(row.get::<_, i64>(0)).unwrap();
+        let expiry = now + 86_400;
+        for count in [1, 50] {
+            let hashes: Vec<_> = (0..count)
+                .map(|idx| format!("{actor}-{count}-{idx}"))
+                .collect();
+            let outcome = issue(&mut client, &actor, &hashes, ip, now, expiry)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, Outcome::Issued));
+            let row = client.query_one(
+                "SELECT count(DISTINCT i.id) FROM invite_codes i JOIN audit_log a ON a.user_id = i.issued_by
+                   AND a.action = 'invite.issued' AND a.ok AND a.details = jsonb_build_object('invite_id', i.id)
+                 WHERE i.issued_by = $1 AND i.kind = 'admin' AND i.email IS NULL AND i.code_hash = ANY($2)
+                   AND i.window_id IS NULL AND NOT i.used AND i.expires_at = $3",
+                &[&actor, &hashes, &(expiry as i64)],
+            ).await.unwrap();
+            assert_eq!(row.get::<_, i64>(0), count);
+        }
+        // A fresh row preceding an already committed hash must not survive the failed insert.
+        let hashes = [format!("{actor}-fresh"), format!("{actor}-1-0")];
+        let failed = issue(&mut client, &actor, &hashes, ip, now, expiry).await;
+        assert!(failed.is_err());
+        for (update, expected) in [
+            (
+                "UPDATE users SET deleting_at = now() WHERE id = $1",
+                Outcome::AccountDeleting,
+            ),
+            (
+                "UPDATE users SET role = 'member', deleting_at = NULL WHERE id = $1",
+                Outcome::ActorNotAdmin,
+            ),
+        ] {
+            client.execute(update, &[&actor]).await.unwrap();
+            let outcome = issue(&mut client, &actor, &hashes[..1], ip, now, expiry)
+                .await
+                .unwrap();
+            assert_eq!(outcome, expected);
+        }
+        let row = client.query_one(snapshot, &[&actor]).await.unwrap();
+        assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (51, 51));
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_admin_invite_tree_is_scoped_paged_and_read_only() {
     use crate::admin_invite_tree::{read_on, InviteTreeRead::*};
     run_test(async {
@@ -3020,7 +3229,7 @@ fn assert_member_invite_issuance() {
 #[test]
 #[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
 fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
-    use super::{claim_single_use_on, invite_by_hash_on};
+    use super::{claim_single_use_on, invite_by_hash_on, ClaimOutcome};
     use crate::auth::SingleUseClaim;
 
     assert_member_invite_issuance();
@@ -3032,15 +3241,18 @@ fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
         let admin = Fixture::seed(&client).await;
         let open = seed_member_claim(&client, window, end + 600).await;
         for code in [&admin.invite.code_hash, &open.invite.code_hash] {
-            assert!(invite_by_hash_on(&client, code).await.unwrap().is_some());
+            let lookup = invite_by_hash_on(&client, code).await.unwrap();
+            assert!(lookup.resolve(&mut client).await.unwrap().is_some());
         }
         finish_with_invite(&mut client, &open).await.unwrap();
         assert_member_enrollment(&client, &open, true).await;
         assert!(finish_with_invite(&mut client, &open).await.is_err());
+        assert_expiry_audits(&client, open.invite.id, 0).await;
 
         let expired = seed_member_claim(&client, window, now).await;
         assert!(finish_with_invite(&mut client, &expired).await.is_err());
         assert_member_enrollment(&client, &expired, false).await;
+        assert_expiry_audits(&client, expired.invite.id, 1).await;
 
         let own = seed_member_claim(&client, window, end + 600).await;
         client
@@ -3052,6 +3264,7 @@ fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
             .unwrap();
         assert!(finish_with_invite(&mut client, &own).await.is_err());
         assert_member_enrollment(&client, &own, false).await;
+        assert_expiry_audits(&client, own.invite.id, 0).await;
 
         for (case, start, end) in [
             ("future", now + 600, now + 1200),
@@ -3075,17 +3288,24 @@ fn postgres_member_invite_requires_its_own_open_window_and_unexpired_code() {
             let preflight = invite_by_hash_on(&client, &fixture.invite.code_hash)
                 .await
                 .unwrap();
-            assert!(preflight.is_none(), "preflight: {case}");
+            assert!(
+                preflight.resolve(&mut client).await.unwrap().is_none(),
+                "preflight: {case}"
+            );
+            assert_expiry_audits(&client, fixture.invite.id, usize::from(case != "future")).await;
             let enrollment = finish_with_invite(&mut client, &fixture).await;
             assert!(enrollment.is_err(), "{case}");
             let claim = SingleUseClaim::Invite {
                 record: &fixture.invite,
             };
-            assert_eq!(
-                claim_single_use_on(&client, claim).await.unwrap(),
-                0,
+            assert!(
+                matches!(
+                    claim_single_use_on(&client, claim).await.unwrap(),
+                    ClaimOutcome::Count(0) | ClaimOutcome::Expired(_)
+                ),
                 "standalone claim must also refuse {case}"
             );
+            assert_expiry_audits(&client, fixture.invite.id, usize::from(case != "future")).await;
             assert_member_enrollment(&client, &fixture, false).await;
             if let Some(other) = unrelated {
                 remove_member_window_fixture(&client, other).await;
@@ -3120,6 +3340,7 @@ fn postgres_member_enrollment_rechecks_window_after_waiting() {
             let fixture = seed_member_claim(&observer, window, end + 600).await;
             holder.batch_execute("BEGIN").await.unwrap();
             if blocked_on == "close" {
+                let untouched = seed_member_claim(&observer, window, end + 600).await;
                 // Stall the real close on its audit INSERT after its UPDATE takes
                 // the window row lock. SHARE on the table allows the audit read.
                 holder
@@ -3153,6 +3374,7 @@ fn postgres_member_enrollment_rechecks_window_after_waiting() {
                     matches!(closed.unwrap(), InviteWindowOutcome::Window(w) if w.ends_at == close_at as i64)
                 );
                 assert!(enrolled.is_err(), "the committed early close must win");
+                assert_expiry_audits(&observer, untouched.invite.id, 0).await;
             } else {
                 // Set the short deadline only after seeding all enrollment rows.
                 let end: i64 = observer.query_one(
@@ -3187,8 +3409,75 @@ fn postgres_member_enrollment_rechecks_window_after_waiting() {
                 );
             }
             assert_member_enrollment(&observer, &fixture, false).await;
+            assert_expiry_audits(&observer, fixture.invite.id, 1).await;
             remove_member_window_fixture(&observer, window).await;
         }
+    });
+}
+
+#[test]
+#[ignore = "requires migrated disposable PostgreSQL; required by api-migrations"]
+fn postgres_signup_expiry_audit_failure_and_timeout_are_retryable() {
+    use super::invite_by_hash_on;
+
+    run_test(async {
+        let mut db = connect().await;
+        let holder = connect().await;
+        let fixture = Fixture::seed(&db).await;
+        let hash = &fixture.invite.code_hash;
+        let lookup = invite_by_hash_on(&db, hash).await.unwrap();
+        assert!(lookup.resolve(&mut db).await.unwrap().is_some());
+        // Keep the prepared snapshot live, but expire the source row before claim.
+        let id: i64 = db
+            .query_one(
+                "UPDATE invite_codes SET expires_at = $2 WHERE code_hash = $1 RETURNING id",
+                &[&hash, &((NOW + 1) as i64)],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        db.execute(
+            "UPDATE invite_codes SET email = 'other@example.com' WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+        assert!(finish_with_invite(&mut db, &fixture).await.is_err());
+        assert_expiry_audits(&db, id, 0).await;
+        db.execute("UPDATE invite_codes SET email = NULL WHERE id = $1", &[&id])
+            .await
+            .unwrap();
+        db.batch_execute(
+            "ALTER TABLE audit_log ADD CONSTRAINT signup_expiry_fault CHECK (action <> 'invite.expired') NOT VALID",
+        ).await.unwrap();
+        assert!(finish_with_invite(&mut db, &fixture).await.is_err());
+        let lookup = invite_by_hash_on(&db, hash).await.unwrap();
+        assert!(lookup.resolve(&mut db).await.unwrap().is_none());
+        fixture.assert_state(&db, (false, false, false, 0)).await;
+        assert_expiry_audits(&db, id, 0).await;
+        db.batch_execute("ALTER TABLE audit_log DROP CONSTRAINT signup_expiry_fault")
+            .await
+            .unwrap();
+
+        holder
+            .batch_execute("BEGIN; LOCK TABLE audit_log IN SHARE MODE")
+            .await
+            .unwrap();
+        let lookup = invite_by_hash_on(&db, hash).await.unwrap();
+        let denial = tokio::time::timeout(CLEANUP_BOUND, lookup.resolve(&mut db)).await;
+        assert!(denial
+            .expect("audit wait must be bounded")
+            .unwrap()
+            .is_none());
+        assert_expiry_audits(&db, id, 0).await;
+        holder.batch_execute("COMMIT").await.unwrap();
+
+        assert!(finish_with_invite(&mut db, &fixture).await.is_err());
+        let lookup = invite_by_hash_on(&db, hash).await.unwrap();
+        assert!(lookup.resolve(&mut db).await.unwrap().is_none());
+        fixture.assert_state(&db, (false, false, false, 0)).await;
+        assert_expiry_audits(&db, id, 1).await;
+        remove_expiry_audit(&db, id).await;
     });
 }
 

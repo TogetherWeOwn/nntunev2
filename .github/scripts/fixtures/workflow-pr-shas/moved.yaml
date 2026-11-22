@@ -1,0 +1,16 @@
+name: sample
+on: pull_request
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.ci-commits.outputs.base_sha }}
+      - name: Check SHA evidence
+        env:
+          MOVED_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          echo '${{ github.event.pull_request.base.sha }}'
+          echo '${{ github.event.pull_request.head.sha }}'

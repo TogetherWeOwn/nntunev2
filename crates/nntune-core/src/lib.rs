@@ -77,6 +77,8 @@ mod flac_residual;
 mod flac_samples;
 #[allow(dead_code)] // Not mounted until full frame validation is available.
 mod flac_stereo;
+#[allow(dead_code)] // Not mounted at the authenticated readback boundary yet.
+mod flac_stream;
 #[allow(dead_code)] // Not mounted until full frame validation is available.
 mod flac_subframe;
 pub mod media_envelope;

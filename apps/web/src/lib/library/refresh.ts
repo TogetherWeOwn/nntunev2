@@ -1,4 +1,4 @@
-import { captureAuthFence } from '../auth-fence.js';
+import { captureAuthFence, SESSION_BINDING_HEADER, type AccountSession } from '../auth-fence.js';
 import { clearToasts } from '../shell/toasts.js';
 import { validBinding, verifyLibrarySession } from './session-verification.js';
 import {
@@ -39,6 +39,7 @@ export interface LibraryRefreshUpdate {
 	/** Library access is suspended or the scope was revoked. */
 	authBoundary: boolean;
 	sessionBinding?: string; // Verified label for the rows, not import provenance.
+	accountSession?: AccountSession;
 	deviceScope?: string; // Exact localStorage key eligible for the verified binding.
 	/** Run collection dispatch/publication only for the current listing. */
 	runIfCurrent?: <T>(work: () => T) => Promise<T | undefined>;
@@ -86,7 +87,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 		requiresSignIn: false
 	};
 	let authenticatedThisLoad = false;
-	let verified: { binding: string; fence: NonNullable<Awaited<ReturnType<typeof captureAuthFence>>> } | undefined;
+	let verified: { binding: string; fence: AccountSession } | undefined;
 	let inMemorySnapshot: LibrarySnapshot | null = null;
 	let activeRequest: AbortController | null = null;
 	let requestGeneration = 0;
@@ -245,7 +246,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			const fence = authenticatedThisLoad ? verified?.fence : undefined;
 			deps.onStateChange?.(state, {
 				isCurrent: () => isCurrent() && (!fence || fence.isCurrent()),
-				authoritative, authBoundary: false, sessionBinding, deviceScope,
+				authoritative, authBoundary: false, sessionBinding, deviceScope, accountSession: fence,
 				runIfCurrent: authoritative && authenticatedThisLoad ? async (work) => {
 					const commit = () => isCurrent() ? work() : undefined;
 					return fence ? fence.run(commit) : commit(); // Headerless test fixtures only.
@@ -326,7 +327,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 				return;
 			}
 			if (!response.ok) throw new Error(`library request failed (${response.status})`);
-			const label = (binding = response.headers?.get('x-nntune-session-binding') ?? null);
+			const label = (binding = response.headers?.get(SESSION_BINDING_HEADER) ?? null);
 			const storage = deps.sessionStorage();
 			if (!isCurrent()) return;
 			const previous = verified?.binding ?? libraryScopeBinding(storage);
@@ -357,7 +358,7 @@ export function createLibraryRefresher(deps: LibraryRefresherDeps): LibraryRefre
 			// Start verification under the lock, but never hold it over the wire.
 			if (!fence) return void refuse();
 			const started = await runBeforeDeadline(fence, () => {
-				const result = Promise.race([verifyLibrarySession(label, controller.signal), timeout, aborted]);
+				const result = Promise.race([verifyLibrarySession(label, controller.signal, fence), timeout, aborted]);
 				void result.catch(() => {}); // The lock request may resolve after the verifier.
 				return { result };
 			});

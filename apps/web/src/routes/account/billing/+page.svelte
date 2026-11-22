@@ -169,10 +169,19 @@
 	<section aria-labelledby="plan">
 		<h2 id="plan">Current plan: {headingPlan.name}</h2>
 		{#if data.subscription?.status}
+			{@const periodEnd = data.subscription.currentPeriodEnd}
 			<p>
 				Status: {data.subscription.status}
-				{#if data.subscription.currentPeriodEnd}
-					· period ends {new Date(data.subscription.currentPeriodEnd).toLocaleDateString()}
+				{#if periodEnd}
+					{@const displayDate = new Date(periodEnd).toLocaleDateString()}
+					<!-- HTML datetime requires a positive year and at most millisecond precision. -->
+					{#if periodEnd.startsWith('0000-')}
+						· period ends {displayDate}
+					{:else}
+						<!-- HTML also requires a nonnegative sign for a zero offset. -->
+						{@const datetime = periodEnd.replace(/(\.\d{3})\d+/, '$1').replace(/-00:?00$/, 'Z')}
+						· period ends <time {datetime}>{displayDate}</time>
+					{/if}
 				{/if}
 				{#if data.subscription.cancelAtPeriodEnd}
 					· cancels at period end

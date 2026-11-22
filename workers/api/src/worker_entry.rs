@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio_postgres::types::Type;
-use tokio_postgres::GenericClient;
 use worker::{
     Delay, Env, Fetch, Headers, Method, Request, RequestInit, Response, ResponseBody,
     Result as WorkerResult,
@@ -49,6 +48,7 @@ pub(crate) mod billing_deadline_test;
 #[path = "billing_webhook_ack_test.rs"]
 pub(crate) mod billing_webhook_ack_test;
 
+use crate::postgres::{PgClient, PgConnect, PgQuery};
 use crate::session::SessionRecord;
 use crate::vault::{
     AuditEvent, ValidatedTarget, DIAL_TIMEOUT_MS, MAX_DIAL_ADDRESSES, TOTAL_TIMEOUT_MS,
@@ -509,7 +509,7 @@ fn u32_of(v: i64) -> Result<u32, StoreError> {
 /// the 429's `Retry-After`). More than one row is impossible (user PK)
 /// and errors rather than picking one.
 async fn query_playback_lease_row(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     user_id: &str,
 ) -> Result<Option<crate::playback::LeaseRow>, StoreError> {
     let rows = client
@@ -541,7 +541,7 @@ async fn query_playback_lease_row(
 /// Acquire on the caller's connection; refusal reads the incumbent on that same connection.
 #[allow(clippy::too_many_arguments)]
 pub async fn acquire_playback_lease_on(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     user_id: &str,
     session_id: &str,
     track_id: &str,
@@ -599,7 +599,7 @@ fn rate_limit_budget_admissible(budget: &RateLimitBudget<'_>) -> bool {
 }
 
 async fn delete_expired_rate_limit_slots(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     now: i64,
 ) -> Result<(), StoreError> {
     client
@@ -636,7 +636,7 @@ static CLAIM_DISPERSAL: AtomicU32 = AtomicU32::new(0);
 /// release), `Ok(None)` is an exhausted budget. Caller has already
 /// deleted expired rows for `now_i`.
 async fn claim_rate_limit_slot(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     budget: &RateLimitBudget<'_>,
     now: u64,
     now_i: i64,
@@ -804,7 +804,7 @@ type TestConnectFuture =
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 struct CatalogueTestMirror {
-    client: std::cell::RefCell<Option<Result<tokio_postgres::Client, StoreError>>>,
+    client: std::cell::RefCell<Option<Result<PgClient, StoreError>>>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
     membership_hook: std::cell::RefCell<Option<MembershipTestHook>>,
     mirror_hook: std::cell::RefCell<Option<MembershipTestHook>>,
@@ -919,7 +919,7 @@ pub fn catalogue_store_for_postgres_test(
         test_client: std::cell::RefCell::new(Some(app)),
         test_connect: None,
         test_mirror: Some(CatalogueTestMirror {
-            client: std::cell::RefCell::new(Some(mirror)),
+            client: std::cell::RefCell::new(Some(mirror.map(PgClient::new))),
             attempts,
             membership_hook: std::cell::RefCell::new(None),
             mirror_hook: std::cell::RefCell::new(None),
@@ -1132,13 +1132,8 @@ impl PgStore {
                     return Err(StoreError);
                 }
                 let mut client = self.connect().await?;
-                let tx = client
-                    .build_transaction()
-                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-                    .start()
-                    .await
-                    .map_err(|_| StoreError)?;
-                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                let tx = client.read_committed().await.map_err(|_| StoreError)?;
+                tx.set_local_statement_timeout(TOTAL_TIMEOUT_MS)
                     .await
                     .map_err(|_| StoreError)?;
                 if tx
@@ -1336,10 +1331,8 @@ impl PgStore {
                 let membership_limit = membership_cap.checked_add(1).ok_or(StoreError)?;
                 let limit = cap.checked_add(1).ok_or(StoreError)?;
                 let mut client = self.connect().await?;
-                let tx = client.build_transaction()
-                    .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
-                    .read_only(true).start().await.map_err(|_| StoreError)?;
-                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                let tx = client.read_only_snapshot().await.map_err(|_| StoreError)?;
+                tx.set_local_statement_timeout(TOTAL_TIMEOUT_MS)
                     .await.map_err(|_| StoreError)?;
                 let releases_sql = format!(
                     "SELECT CASE WHEN octet_length(release_mbid) <= 36 THEN release_mbid ELSE '' END AS release_mbid FROM ({}) AS membership LIMIT $2",
@@ -1420,10 +1413,8 @@ impl PgStore {
                 }
                 self.require_mirror()?;
                 let mut mirror = self.connect_mirror().await?;
-                let tx = mirror.build_transaction()
-                    .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
-                    .read_only(true).start().await.map_err(|_| StoreError)?;
-                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                let tx = mirror.read_only_snapshot().await.map_err(|_| StoreError)?;
+                tx.set_local_statement_timeout(TOTAL_TIMEOUT_MS)
                     .await.map_err(|_| StoreError)?;
                 let statement_failed =
                     || self.statement_failed("api.db.statement_failed.subsonic_member_catalogue");
@@ -1535,18 +1526,18 @@ impl PgStore {
         Ok(())
     }
 
-    async fn connect(&self) -> Result<tokio_postgres::Client, StoreError> {
+    async fn connect(&self) -> Result<PgClient, StoreError> {
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         if self.webhook_ack_control() {
             return Self::bounded(billing_webhook_ack_test::connect(), TOTAL_TIMEOUT_MS).await;
         }
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(client) = self.test_client.borrow_mut().take() {
-            return Ok(client);
+            return Ok(PgClient::new(client));
         }
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(connect) = &self.test_connect {
-            return connect().await;
+            return connect().await.map(PgClient::new);
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -1582,6 +1573,7 @@ impl PgStore {
                 let (client, connection) = config
                     .connect_raw(socket, worker::postgres_tls::PassthroughTls)
                     .await
+                    .map(|(client, connection)| (PgClient::new(client), connection))
                     .map_err(|_| StoreError)?;
                 // The driver outlives the handler but still belongs to this request.
                 // Own its resolved trace and normalized build identity in the task.
@@ -1595,7 +1587,7 @@ impl PgStore {
                 // its statements through Self::bounded.
                 reached.set("api.db.connect_failed.set_timeout");
                 client
-                    .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
+                    .set_statement_timeout(TOTAL_TIMEOUT_MS)
                     .await
                     .map_err(|_| StoreError)?;
                 Ok(client)
@@ -1627,7 +1619,7 @@ impl PgStore {
     /// against the `MB_DB` binding instead of `HYPERDRIVE`. Failure phases
     /// are the `mirror_*` literals so an incident names the cluster that
     /// refused; empty app results never need a mirror connection.
-    async fn connect_mirror(&self) -> Result<tokio_postgres::Client, StoreError> {
+    async fn connect_mirror(&self) -> Result<PgClient, StoreError> {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(mirror) = &self.test_mirror {
             mirror.attempts.set(mirror.attempts.get() + 1);
@@ -1663,6 +1655,7 @@ impl PgStore {
                 let (client, connection) = config
                     .connect_raw(socket, worker::postgres_tls::PassthroughTls)
                     .await
+                    .map(|(client, connection)| (PgClient::new(client), connection))
                     .map_err(|_| StoreError)?;
                 let trace_id = self.trace_id.clone();
                 let build_sha = build_sha_from_env(env);
@@ -1671,7 +1664,7 @@ impl PgStore {
                 });
                 reached.set("api.db.connect_failed.mirror_set_timeout");
                 client
-                    .batch_execute(&format!("SET statement_timeout = {}", TOTAL_TIMEOUT_MS))
+                    .set_statement_timeout(TOTAL_TIMEOUT_MS)
                     .await
                     .map_err(|_| StoreError)?;
                 Ok(client)
@@ -1919,6 +1912,7 @@ fn catalogue_library_page_from_row(
         recording_mbids: row.try_get("recording_mbids").map_err(|_| StoreError)?,
         recording_mbid: row.try_get("recording_mbid").map_err(|_| StoreError)?,
         recording_ord: row.try_get("recording_ord").map_err(|_| StoreError)?,
+        recording_job_match: row.try_get("recording_job_match").map_err(|_| StoreError)?,
     })
 }
 
@@ -2049,12 +2043,17 @@ fn catalogue_release_track_from_row(
     })
 }
 
+enum ClaimOutcome {
+    Count(u64),
+    Expired(i64),
+}
+
 /// Shared by standalone claims and registration's transaction: keep every
 /// single-use predicate and its bind order identical across both paths.
 async fn claim_single_use_on(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     candidate: SingleUseClaim<'_>,
-) -> Result<u64, StoreError> {
+) -> Result<ClaimOutcome, StoreError> {
     let statement = candidate.statement();
     // Unnamed via `query_typed` (TWO-434): registration finish runs these
     // claims through Hyperdrive, where a named `sN` statement can fail.
@@ -2103,35 +2102,104 @@ async fn claim_single_use_on(
         }
     }
     .map_err(|_| StoreError)?;
-    Ok(rows.len() as u64)
+    if matches!(candidate, SingleUseClaim::Invite { .. }) {
+        return match rows.as_slice() {
+            [] => Ok(ClaimOutcome::Count(0)),
+            [row] => match row.try_get("expired_id").map_err(|_| StoreError)? {
+                Some(id) => Ok(ClaimOutcome::Expired(id)),
+                None => Ok(ClaimOutcome::Count(1)),
+            },
+            _ => Err(StoreError),
+        };
+    }
+    Ok(ClaimOutcome::Count(rows.len() as u64))
+}
+
+async fn try_observe_invite_expiry(client: &mut impl PgConnect, id: i64) {
+    // Isolate the audit from both enrollment and the outward denial. Bound
+    // the query server-side too, in case the client stops awaiting it.
+    const AUDIT_BUDGET_MS: u64 = 1_000;
+    let _ = PgStore::bounded(
+        async {
+            let tx = client.transaction().await.map_err(|_| StoreError)?;
+            tx.set_local_statement_timeout(500)
+                .await
+                .map_err(|_| StoreError)?;
+            tx.query_typed(
+                include_str!("observe_invite_expiry.sql"),
+                &[(&id, Type::INT8)],
+            )
+            .await
+            .map_err(|_| StoreError)?;
+            tx.commit().await.map_err(|_| StoreError)
+        },
+        AUDIT_BUDGET_MS,
+    )
+    .await;
+}
+
+enum InviteLookup {
+    Active(tokio_postgres::Row),
+    Expired(i64),
+    Refused,
+}
+
+impl InviteLookup {
+    async fn resolve(
+        self,
+        client: &mut impl PgConnect,
+    ) -> Result<Option<InviteRecord>, StoreError> {
+        match self {
+            Self::Active(row) => invite_from_row(&row).map(Some),
+            Self::Expired(id) => {
+                try_observe_invite_expiry(client, id).await;
+                Ok(None)
+            }
+            Self::Refused => Ok(None),
+        }
+    }
 }
 
 async fn invite_by_hash_on(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     code_hash: &str,
-) -> Result<Option<InviteRecord>, StoreError> {
-    // Preflight only; the invite claim rechecks the bounds under lock.
+) -> Result<InviteLookup, StoreError> {
+    // Preflight only; both the claim and the audit recheck under lock.
     let statement = format!(
-        "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email FROM invite_codes \
+        "SELECT {INVITE_COLUMNS}, issuer.email AS issuer_email, invite_codes.expiry_observed_at, \
+                LEAST(invite_codes.expires_at, w.ends_at) <= live_now AS expired \
+         FROM invite_codes \
          LEFT JOIN users issuer ON issuer.id = invite_codes.issued_by \
          LEFT JOIN invite_windows w ON w.id = invite_codes.window_id \
-         WHERE invite_codes.code_hash = $1 AND (invite_codes.kind = 'admin' OR \
-             (invite_codes.kind = 'member' AND w.id IS NOT NULL AND \
-              int8range(w.starts_at, w.ends_at, '[)') @> floor(extract(epoch FROM clock_timestamp()))::bigint))"
+         CROSS JOIN (SELECT floor(extract(epoch FROM clock_timestamp()))::bigint AS live_now) tick \
+         WHERE invite_codes.code_hash = $1 AND NOT invite_codes.used \
+           AND invite_codes.redeemed_at IS NULL AND invite_codes.revoked_at IS NULL \
+           AND (invite_codes.kind = 'admin' OR (invite_codes.kind = 'member' AND w.starts_at <= live_now))"
     );
-    let rows = client
+    let mut rows = client
         .query_typed(&statement, &[(&code_hash, Type::TEXT)])
         .await
         .map_err(|_| StoreError)?;
-    // `query_opt`'s rule: more than one row is an error.
     if rows.len() > 1 {
         return Err(StoreError);
     }
-    rows.first().map(invite_from_row).transpose()
+    let Some(row) = rows.pop() else {
+        return Ok(InviteLookup::Refused);
+    };
+    if !row.try_get::<_, bool>("expired").map_err(|_| StoreError)? {
+        return Ok(InviteLookup::Active(row));
+    }
+    let observed_at: Option<i64> = row.try_get("expiry_observed_at").map_err(|_| StoreError)?;
+    if observed_at.is_some() {
+        return Ok(InviteLookup::Refused);
+    }
+    Ok(InviteLookup::Expired(
+        row.try_get("id").map_err(|_| StoreError)?,
+    ))
 }
 
 async fn insert_credential_on(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     credential: &PasskeyCredential,
 ) -> Result<(), StoreError> {
     client.query_typed(
@@ -2149,7 +2217,7 @@ async fn insert_credential_on(
 }
 
 async fn complete_registration_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     challenge: &PasskeyChallenge,
     magic: &MagicLinkRecord,
     invite: Option<&InviteRecord>,
@@ -2182,8 +2250,16 @@ async fn complete_registration_on(
         claims.push(SingleUseClaim::Invite { record });
     }
     for claim in claims {
-        if claim_single_use_on(&transaction, claim).await? != 1 {
-            return Err(StoreError);
+        match claim_single_use_on(&transaction, claim).await? {
+            ClaimOutcome::Expired(id) => {
+                // No credential or proof may survive the denial. The expiry
+                // audit is independent and must not keep these locks held.
+                transaction.rollback().await.map_err(|_| StoreError)?;
+                try_observe_invite_expiry(client, id).await;
+                return Err(StoreError);
+            }
+            ClaimOutcome::Count(n) if n != 1 => return Err(StoreError),
+            ClaimOutcome::Count(_) => {}
         }
     }
     if let Some(record) = invite {
@@ -2234,19 +2310,14 @@ async fn complete_registration_on(
 }
 
 async fn reap_unverified_users_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     now: u64,
     ttl_secs: u64,
     protected_user_id: Option<&str>,
 ) -> Result<(), StoreError> {
     let cutoff = i64_of(now.saturating_sub(ttl_secs))?;
     let now = i64_of(now)?;
-    let transaction = client
-        .build_transaction()
-        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-        .start()
-        .await
-        .map_err(|_| StoreError)?;
+    let transaction = client.read_committed().await.map_err(|_| StoreError)?;
     // Signup-path statements run unnamed via `query_typed` (TWO-434, same
     // Hyperdrive reason as the mint path): no `sN` prepared statement can
     // collide on, or go missing from, a pooled backend between round-trips.
@@ -2287,10 +2358,7 @@ async fn reap_unverified_users_on(
     transaction.commit().await.map_err(|_| StoreError)
 }
 
-async fn prune_expired_challenges_on(
-    client: &impl GenericClient,
-    now: u64,
-) -> Result<(), StoreError> {
+async fn prune_expired_challenges_on(client: &impl PgQuery, now: u64) -> Result<(), StoreError> {
     // Enrollment may hold a challenge while waiting on a later claim. Do not
     // stall unrelated auth starts once it expires; a later prune retries it.
     client
@@ -2327,7 +2395,7 @@ async fn prune_expired_challenges_on(
 /// a role granted here would stay effective (the admin guard reads
 /// the role fresh per request) until erasure.
 async fn admin_set_user_role_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     actor_user_id: &str,
     subject_user_id: &str,
     new_role: &str,
@@ -2429,7 +2497,7 @@ async fn admin_set_user_role_on(
 /// row and the response. An actor demoted before the re-check writes
 /// and audits nothing.
 async fn admin_set_app_setting_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     actor_user_id: &str,
     key: &str,
     new_value: &str,
@@ -2560,7 +2628,7 @@ fn stored_admin_ingest_job_from(
 /// writes nothing new except its own audit row; only the first attempt
 /// inserts the job, the original and the accepted audit shape.
 async fn admin_ingest_upload_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     attempt: &AdminIngestAttempt,
 ) -> Result<AdminIngestUploadOutcome, StoreError> {
     let transaction = client.transaction().await.map_err(|_| StoreError)?;
@@ -2820,7 +2888,7 @@ async fn admin_ingest_upload_on(
 /// reports `Missing`; a re-upload afterwards lands a fresh row. No
 /// audit row: deletion writes no new observable state.
 async fn admin_ingest_delete_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     actor_user_id: &str,
     job_id: &str,
 ) -> Result<AdminIngestDeleteOutcome, StoreError> {
@@ -2881,7 +2949,7 @@ async fn admin_ingest_delete_on(
 /// lock fences against any other writer of the actor's role until
 /// commit (see `admin_set_user_role_on` for the full lock order).
 async fn admin_actor_locked(
-    transaction: &tokio_postgres::Transaction<'_>,
+    transaction: &impl PgQuery,
     actor_user_id: &str,
 ) -> Result<bool, StoreError> {
     transaction
@@ -2913,7 +2981,7 @@ async fn admin_actor_locked(
 /// admin-write locks. The audit row references the invite by the
 /// returned row id only — code plaintext and hash never appear in it.
 async fn admin_issue_invite_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     actor_user_id: &str,
     record: &InviteRecord,
     source_ip: &str,
@@ -2967,6 +3035,63 @@ async fn admin_issue_invite_on(
     Ok(AdminInviteIssueOutcome::Issued(invite_id))
 }
 
+/// Commit the whole batch under the same role lock as single issuance.
+async fn admin_issue_invite_batch_on(
+    client: &mut impl PgConnect,
+    actor: &str,
+    hashes: &[String],
+    source_ip: &str,
+    now: u64,
+    expires_at: u64,
+) -> Result<handlers::AdminInviteBatchOutcome, StoreError> {
+    use handlers::AdminInviteBatchOutcome as Outcome;
+    if !(1..=handlers::ADMIN_INVITE_BATCH_MAX).contains(&hashes.len()) {
+        return Err(StoreError);
+    }
+    let transaction = client.transaction().await?;
+    if !admin_actor_locked(&transaction, actor).await? {
+        return Ok(Outcome::ActorNotAdmin);
+    }
+    // The guard already holds the actor row lock; deletion cannot mark it before commit.
+    let actor_row = transaction
+        .query_typed_one(
+            "SELECT deleting_at IS NOT NULL FROM users WHERE id = $1",
+            &[(&actor, Type::TEXT)],
+        )
+        .await?;
+    if actor_row.try_get::<_, bool>(0)? {
+        return Ok(Outcome::AccountDeleting);
+    }
+    let row = transaction
+        .query_typed_one(
+            "WITH issued AS (
+                 INSERT INTO invite_codes (code_hash, used, created_at, issued_by, kind, expires_at)
+                 SELECT hash, FALSE, $2, $3, $4, $5 FROM unnest($1::text[]) AS t(hash) RETURNING id
+             ), audited AS (
+                 INSERT INTO audit_log (user_id, action, ok, source_ip, at, details)
+                 SELECT $3, $6, TRUE, $7, $2, jsonb_build_object('invite_id', id) FROM issued RETURNING 1
+             ) SELECT count(*) FROM audited",
+            &[
+                (&hashes, Type::TEXT_ARRAY),
+                (&i64_of(now)?, Type::INT8),
+                (&actor, Type::TEXT),
+                (&crate::auth::INVITE_KIND_ADMIN, Type::TEXT),
+                (&i64_of(expires_at)?, Type::INT8),
+                (&crate::auth::INVITE_ISSUED_AUDIT_ACTION, Type::TEXT),
+                (
+                    &crate::vault::sanitize_source_ip(Some(source_ip)),
+                    Type::TEXT,
+                ),
+            ],
+        )
+        .await?;
+    if row.try_get::<_, i64>(0)? != hashes.len() as i64 {
+        return Err(StoreError);
+    }
+    transaction.commit().await?;
+    Ok(Outcome::Issued)
+}
+
 impl From<tokio_postgres::Error> for StoreError {
     fn from(_: tokio_postgres::Error) -> Self {
         StoreError
@@ -3004,7 +3129,7 @@ fn member_invite_entitlement<'a>(
 }
 
 async fn member_invite_summary_on(
-    client: &tokio_postgres::Client,
+    client: &impl PgQuery,
     issuer: &str,
 ) -> Result<Option<handlers::MemberInviteSummary>, StoreError> {
     use crate::admin::SettingKey;
@@ -3068,7 +3193,7 @@ async fn member_invite_summary_on(
 }
 
 async fn member_invite_history_on(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     issuer: &str,
     before: Option<i64>,
 ) -> Result<Option<handlers::MemberInviteHistory>, StoreError> {
@@ -3124,20 +3249,15 @@ async fn member_invite_history_on(
 }
 
 async fn member_issue_invite_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     issuer: &str,
     code_hash: &str,
     source_ip: &str,
 ) -> Result<MemberInviteIssueOutcome, StoreError> {
     use crate::admin::SettingKey;
     use MemberInviteIssueOutcome as Outcome;
-    let tx = client
-        .build_transaction()
-        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-        .start()
-        .await?;
-    tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
-        .await?;
+    let tx = client.read_committed().await?;
+    tx.set_local_statement_timeout(TOTAL_TIMEOUT_MS).await?;
     // Serialize spending and fence erasure without blocking FK checks.
     let issuer_lock =
         "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR NO KEY UPDATE";
@@ -3240,7 +3360,7 @@ async fn member_issue_invite_on(
 /// then loses to the committed `revoked_at` — revocation wins the
 /// race whenever it commits before the claim's UPDATE.
 async fn admin_revoke_invite_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     actor_user_id: &str,
     invite_id: i64,
     source_ip: &str,
@@ -3315,7 +3435,7 @@ fn invite_window_from_row(row: &tokio_postgres::Row) -> Result<InviteWindow, Sto
 }
 
 async fn admin_list_invites_on(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     issuer: Option<&str>,
     status: Option<&str>,
     now: u64,
@@ -3361,7 +3481,7 @@ async fn admin_list_invites_on(
 }
 
 async fn admin_list_invite_windows_on(
-    client: &tokio_postgres::Client,
+    client: &impl PgQuery,
 ) -> Result<Vec<InviteWindow>, StoreError> {
     let rows = client
         .query_typed(
@@ -3374,7 +3494,7 @@ async fn admin_list_invite_windows_on(
 }
 
 async fn admin_write_invite_window_on(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl PgConnect,
     actor: &str,
     write: InviteWindowWrite<'_>,
     source_ip: &str,
@@ -3506,13 +3626,8 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                let tx = client
-                    .build_transaction()
-                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-                    .start()
-                    .await
-                    .map_err(|_| StoreError)?;
-                tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                let tx = client.read_committed().await.map_err(|_| StoreError)?;
+                tx.set_local_statement_timeout(TOTAL_TIMEOUT_MS)
                     .await
                     .map_err(|_| StoreError)?;
                 let rows = tx
@@ -3636,14 +3751,9 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                let transaction = client
-                    .build_transaction()
-                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-                    .start()
-                    .await
-                    .map_err(|_| StoreError)?;
+                let transaction = client.read_committed().await.map_err(|_| StoreError)?;
                 transaction
-                    .batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .set_local_statement_timeout(TOTAL_TIMEOUT_MS)
                     .await
                     .map_err(|_| StoreError)?;
                 if transaction
@@ -3686,14 +3796,9 @@ impl Store for PgStore {
         Self::bounded(
             async {
                 let mut client = self.connect().await?;
-                let transaction = client
-                    .build_transaction()
-                    .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-                    .start()
-                    .await
-                    .map_err(|_| StoreError)?;
+                let transaction = client.read_committed().await.map_err(|_| StoreError)?;
                 transaction
-                    .batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+                    .set_local_statement_timeout(TOTAL_TIMEOUT_MS)
                     .await
                     .map_err(|_| StoreError)?;
                 if transaction
@@ -4107,7 +4212,7 @@ impl Store for PgStore {
                     "SELECT {CREDENTIAL_COLUMNS} FROM webauthn_credentials WHERE cred_id = $1"
                 );
                 let row = client
-                    .query_opt(&sql, &[&cred_id_b64url])
+                    .query_typed_opt(&sql, &[(&cred_id_b64url, Type::TEXT)])
                     .await
                     .map_err(|_| StoreError)?;
                 row.map(|r| credential_from_row(&r)).transpose()
@@ -4148,10 +4253,14 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 let rows = client
-                    .query(
+                    .query_typed(
                         "UPDATE webauthn_credentials SET sign_count = $3 \
                  WHERE cred_id = $1 AND sign_count = $2 RETURNING cred_id",
-                        &[&cred_id_b64url, &i64::from(expected), &i64::from(new)],
+                        &[
+                            (&cred_id_b64url, Type::TEXT),
+                            (&i64::from(expected), Type::INT8),
+                            (&i64::from(new), Type::INT8),
+                        ],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -4791,18 +4900,21 @@ impl Store for PgStore {
                 let file_bytes = window.file_bytes.map(i64_of).transpose()?;
                 let duration_ms = window.duration_ms.map(i64_of).transpose()?;
                 let affected = client
-                    .execute(
+                    .execute_typed(
                         crate::ledger::ledger_play_window_upsert_statement(),
                         &[
-                            &window.idempotency_key,
-                            &window.user_id,
-                            &window.track_id,
-                            &window.period_month,
-                            &i32::try_from(window.stream_seconds).map_err(|_| StoreError)?,
-                            &i64_of(window.bytes_served)?,
-                            &i64_of(window.recorded_at)?,
-                            &file_bytes,
-                            &duration_ms,
+                            (&window.idempotency_key, Type::TEXT),
+                            (&window.user_id, Type::TEXT),
+                            (&window.track_id, Type::TEXT),
+                            (&window.period_month, Type::TEXT),
+                            (
+                                &i32::try_from(window.stream_seconds).map_err(|_| StoreError)?,
+                                Type::INT4,
+                            ),
+                            (&i64_of(window.bytes_served)?, Type::INT8),
+                            (&i64_of(window.recorded_at)?, Type::INT8),
+                            (&file_bytes, Type::INT8),
+                            (&duration_ms, Type::INT8),
                         ],
                     )
                     .await
@@ -4849,14 +4961,17 @@ impl Store for PgStore {
     }
 
     async fn invite_by_hash(&self, code_hash: &str) -> Result<Option<InviteRecord>, StoreError> {
-        Self::bounded(
+        let (mut client, lookup) = Self::bounded(
             async {
                 let client = self.connect().await?;
-                invite_by_hash_on(&client, code_hash).await
+                let lookup = invite_by_hash_on(&client, code_hash).await?;
+                Ok((client, lookup))
             },
             TOTAL_TIMEOUT_MS,
         )
-        .await
+        .await?;
+        // An optional audit timeout must not turn an invite denial into a 500.
+        lookup.resolve(&mut client).await
     }
 
     async fn insert_session(&self, record: &SessionRecord) -> Result<(), StoreError> {
@@ -4971,15 +5086,21 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 let rows = client
-                    .query(
+                    .query_typed(
                         "UPDATE sessions SET rotation_counter = $3, expires_at = $4, \
                  refresh_retry_hash = NULL, refresh_issued_at = NULL, refresh_claimed_at = NULL \
                  WHERE id = $1 AND rotation_counter = $2 AND revoked = FALSE RETURNING id",
                         &[
-                            &id,
-                            &i32::try_from(expected_counter).map_err(|_| StoreError)?,
-                            &i32::try_from(new_counter).map_err(|_| StoreError)?,
-                            &i64_of(new_expires_at)?,
+                            (&id, Type::TEXT),
+                            (
+                                &i32::try_from(expected_counter).map_err(|_| StoreError)?,
+                                Type::INT4,
+                            ),
+                            (
+                                &i32::try_from(new_counter).map_err(|_| StoreError)?,
+                                Type::INT4,
+                            ),
+                            (&i64_of(new_expires_at)?, Type::INT8),
                         ],
                     )
                     .await
@@ -5030,9 +5151,13 @@ impl Store for PgStore {
         let mut client = self.connect().await?;
         let transaction = client.transaction().await.map_err(|_| StoreError)?;
         let rows = transaction
-            .query(
+            .query_typed(
                 claim.statement(),
-                &[&params[0], &params[1], &rotation_counter],
+                &[
+                    (&params[0], Type::TEXT),
+                    (&params[1], Type::TEXT),
+                    (&rotation_counter, Type::INT4),
+                ],
             )
             .await
             .map_err(|_| StoreError)?;
@@ -5041,15 +5166,15 @@ impl Store for PgStore {
             return Ok(false);
         }
         if transaction
-            .execute(
+            .execute_typed(
                 "INSERT INTO sessions (id, user_id, created_at, expires_at, rotation_counter, revoked) \
                  VALUES ($1, $2, $3, $4, $5, FALSE)",
                 &[
-                    &replacement.new_record.id,
-                    &replacement.new_record.user_id,
-                    &created_at,
-                    &expires_at,
-                    &new_counter,
+                    (&replacement.new_record.id, Type::TEXT),
+                    (&replacement.new_record.user_id, Type::TEXT),
+                    (&created_at, Type::INT8),
+                    (&expires_at, Type::INT8),
+                    (&new_counter, Type::INT4),
                 ],
             )
             .await
@@ -5068,7 +5193,10 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 client
-                    .execute("UPDATE sessions SET revoked = TRUE WHERE id = $1", &[&id])
+                    .execute_typed(
+                        "UPDATE sessions SET revoked = TRUE WHERE id = $1",
+                        &[(&id, Type::TEXT)],
+                    )
                     .await
                     .map_err(|_| StoreError)?;
                 Ok(())
@@ -5087,7 +5215,10 @@ impl Store for PgStore {
                     user_id,
                 };
                 let rows = client
-                    .query(claim.statement(), &[&id, &user_id])
+                    .query_typed(
+                        claim.statement(),
+                        &[(&id, Type::TEXT), (&user_id, Type::TEXT)],
+                    )
                     .await
                     .map_err(|_| StoreError)?;
                 Ok(rows.len() == 1)
@@ -5123,7 +5254,10 @@ impl Store for PgStore {
         session: &crate::session::SessionClaims,
     ) -> Result<bool, StoreError> {
         Self::bounded(
-            async { subsonic_pg::insert(&mut self.connect().await?, row, session).await },
+            async {
+                let mut client = self.connect().await?;
+                subsonic_pg::insert(&mut client, row, session).await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -5133,7 +5267,10 @@ impl Store for PgStore {
         user_id: &str,
     ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
         Self::bounded(
-            async { subsonic_pg::list(&mut self.connect().await?, user_id).await },
+            async {
+                let mut client = self.connect().await?;
+                subsonic_pg::list(&mut client, user_id).await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -5146,7 +5283,8 @@ impl Store for PgStore {
     ) -> Result<bool, StoreError> {
         Self::bounded(
             async {
-                subsonic_pg::revoke(&mut self.connect().await?, Some(id), user_id, now)
+                let mut client = self.connect().await?;
+                subsonic_pg::revoke(&mut client, Some(id), user_id, now)
                     .await
                     .map(|count| count == 1)
             },
@@ -5160,7 +5298,10 @@ impl Store for PgStore {
         now: u64,
     ) -> Result<u64, StoreError> {
         Self::bounded(
-            async { subsonic_pg::revoke(&mut self.connect().await?, None, user_id, now).await },
+            async {
+                let mut client = self.connect().await?;
+                subsonic_pg::revoke(&mut client, None, user_id, now).await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -5204,7 +5345,7 @@ impl Store for PgStore {
              WHERE user_id = $1 ORDER BY created_at, id"
                 );
                 let rows = client
-                    .query(&sql, &[&user_id])
+                    .query_typed(&sql, &[(&user_id, Type::TEXT)])
                     .await
                     .map_err(|_| StoreError)?;
                 rows.iter().map(native_credential_from_row).collect()
@@ -5227,11 +5368,14 @@ impl Store for PgStore {
              WHERE pepper_version = $1 AND key_hmac = $2"
                 );
                 let row = client
-                    .query_opt(
+                    .query_typed_opt(
                         &sql,
                         &[
-                            &i32::try_from(pepper_version).map_err(|_| StoreError)?,
-                            &key_hmac,
+                            (
+                                &i32::try_from(pepper_version).map_err(|_| StoreError)?,
+                                Type::INT4,
+                            ),
+                            (&key_hmac, Type::TEXT),
                         ],
                     )
                     .await
@@ -5255,10 +5399,14 @@ impl Store for PgStore {
                 // Owner-scoped and sticky: only a live row of this user
                 // transitions; an already-revoked row keeps its timestamp.
                 let transitioned = client
-                    .execute(
+                    .execute_typed(
                         "UPDATE native_rest_credentials SET revoked_at = $3 \
                  WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
-                        &[&id, &user_id, &i64_of(now)?],
+                        &[
+                            (&id, Type::TEXT),
+                            (&user_id, Type::TEXT),
+                            (&i64_of(now)?, Type::INT8),
+                        ],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -5268,9 +5416,9 @@ impl Store for PgStore {
                 // No transition: report whether the row exists at all (unknown
                 // and foreign ids both report false — no existence oracle).
                 let exists = client
-                    .query_opt(
+                    .query_typed_opt(
                         "SELECT id FROM native_rest_credentials WHERE id = $1 AND user_id = $2",
-                        &[&id, &user_id],
+                        &[(&id, Type::TEXT), (&user_id, Type::TEXT)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -5286,9 +5434,9 @@ impl Store for PgStore {
             async {
                 let client = self.connect().await?;
                 client
-                    .execute(
+                    .execute_typed(
                         "UPDATE native_rest_credentials SET last_used_at = $2 WHERE id = $1",
-                        &[&id, &i64_of(now)?],
+                        &[(&id, Type::TEXT), (&i64_of(now)?, Type::INT8)],
                     )
                     .await
                     .map_err(|_| StoreError)?;
@@ -6480,6 +6628,25 @@ impl Store for PgStore {
         .await
     }
 
+    async fn admin_issue_invite_batch(
+        &self,
+        actor: &str,
+        hashes: &[String],
+        source_ip: &str,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<handlers::AdminInviteBatchOutcome, StoreError> {
+        Self::bounded(
+            async {
+                let mut client = self.connect().await?;
+                admin_issue_invite_batch_on(&mut client, actor, hashes, source_ip, now, expires_at)
+                    .await
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     async fn member_invite_summary(
         &self,
         issuer: &str,
@@ -6704,15 +6871,18 @@ impl Store for PgStore {
     }
 }
 
-/// Executes exactly the parameterized conditional UPDATE/RETURNING the
-/// core prepared (`SingleUseClaim::statement`) and reports how many rows
-/// it returned — autocommitted before the handler responds.
+/// Executes the conditional claim and reports only committed spends.
 impl SingleUseStore for PgStore {
     async fn claim(&self, candidate: SingleUseClaim<'_>) -> Result<u64, auth::AuthError> {
         Self::bounded(
             async {
                 let client = self.connect().await?;
-                claim_single_use_on(&client, candidate).await
+                // No mounted standalone invite caller. Preserve its count
+                // contract; only the signup paths write expiry observations.
+                Ok(match claim_single_use_on(&client, candidate).await? {
+                    ClaimOutcome::Count(n) => n,
+                    ClaimOutcome::Expired(_) => 0,
+                })
             },
             TOTAL_TIMEOUT_MS,
         )

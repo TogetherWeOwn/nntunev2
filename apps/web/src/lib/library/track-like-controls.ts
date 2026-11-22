@@ -1,6 +1,7 @@
 import { SvelteSet } from 'svelte/reactivity';
 import { setTrackLike } from './likes.js';
 import type { LibraryRefreshUpdate } from './refresh.js';
+import { saveTrackTaste, type TasteSignal, type TrackTaste } from './taste.js';
 
 export interface TrackLikeOwner {
 	client: Parameters<typeof setTrackLike>[0];
@@ -11,7 +12,13 @@ export interface TrackLikeOwner {
 	/** Undefined until the track and its confirmed Like state are known in this scope. */
 	liked: (id: string) => boolean | undefined;
 	confirm: (requestId: string, confirmedId: string, liked: boolean) => void;
-	failed: (id: string) => void;
+	failed: (id: string, error: unknown, taste?: boolean) => void;
+	taste?: {
+		read: (id: string) => TrackTaste | null | undefined;
+		confirm: (id: string, value: TrackTaste | null) => void;
+		verify: () => Promise<boolean>;
+		invalidate: () => void;
+	};
 }
 
 export interface TrackLikeControl {
@@ -25,11 +32,12 @@ export type TrackLikeControls = (id: string) => TrackLikeControl | undefined;
 /** Share one instance across track and queue rows. An owner is unique to one
  * authorization epoch; currentOwner must stop returning it upon invalidation. */
 export function createTrackLikeControls(
-	currentOwner: () => TrackLikeOwner | undefined
-): TrackLikeControls {
+	currentOwner: () => TrackLikeOwner | undefined,
+	trackWrite?: (binding: string, result: Promise<unknown>) => void
+) {
 	const pendingByOwner = new WeakMap<TrackLikeOwner, Set<string>>();
 
-	return (id) => {
+	return (id: string) => {
 		const owner = currentOwner();
 		const receipt = owner?.readiness();
 		const run = receipt?.runIfCurrent;
@@ -43,31 +51,54 @@ export function createTrackLikeControls(
 			pendingByOwner.set(owner, pending);
 		}
 		const inFlight = pending;
+		const taste = owner.taste;
+		const saved = taste?.read(id);
+		const visible = saved?.signal === 'love' || (saved?.until != null && saved.until <= Date.now() / 1000) ? null : saved;
+		const stillCurrent = () => currentOwner() === owner && owner.readiness() === receipt &&
+			receipt.isCurrent() && owner.liked(id) === liked && taste?.read(id) === saved;
+		const write = async <T,>(start: () => Promise<T>, confirm: (value: T) => void, preference?: typeof taste) => {
+			if (!stillCurrent() || inFlight.has(id)) return;
+			inFlight.add(id);
+			try {
+				const started = await run(() => {
+					if (!stillCurrent()) return;
+					// Box network work so it never holds the auth fence.
+					const result = start().then((value) => ({ value }), (error: unknown) => ({ error }));
+					trackWrite?.(binding, result);
+					return { result };
+				});
+				if (!started) return;
+				const result = await started.result;
+				let verified = true;
+				if (!('error' in result) && preference) {
+					const proof = await run(() => stillCurrent() ? { result: preference.verify().catch(() => false) } : undefined);
+					if (!proof) return;
+					verified = await proof.result;
+				}
+				await run(() => {
+					if (!stillCurrent()) return;
+					if ('error' in result) {
+						if (preference) owner.failed(id, result.error, true);
+						else owner.failed(id, result.error);
+					} else if (!verified) preference?.invalidate();
+					else confirm(result.value);
+				});
+			} catch {
+				// A lost auth fence is not a reason to replay or report against a new scope.
+			} finally {
+				inFlight.delete(id);
+			}
+		};
 		return {
 			liked,
 			pending: inFlight.has(id),
-			async toggle() {
-				const stillCurrent = () => currentOwner() === owner && owner.readiness() === receipt &&
-					receipt.isCurrent() && owner.liked(id) === liked;
-				if (!stillCurrent() || inFlight.has(id)) return;
-				inFlight.add(id);
-				try {
-					const started = await run(() => {
-						if (!stillCurrent()) return;
-						// Return a container, not the network promise: release the auth fence before waiting.
-						return { result: setTrackLike(owner.client, id, !liked, binding).catch(() => undefined) };
-					}).catch(() => undefined);
-					if (!started) return;
-					const confirmedId = await started.result;
-					await run(() => {
-						if (!stillCurrent()) return;
-						if (confirmedId === undefined) owner.failed(id);
-						else owner.confirm(id, confirmedId, !liked);
-					}).catch(() => undefined);
-				} finally {
-					inFlight.delete(id);
-				}
-			}
+			toggle: () => write(() => setTrackLike(owner.client, id, !liked),
+				(confirmedId) => owner.confirm(id, confirmedId, !liked)),
+			taste: taste && saved !== undefined ? {
+				saved: visible?.signal,
+				set: (signal: TasteSignal | null) => signal === null && !visible ? Promise.resolve() :
+					write(() => saveTrackTaste(owner.client, binding, id, signal), (value) => taste.confirm(id, value), taste)
+			} : undefined
 		};
 	};
 }
