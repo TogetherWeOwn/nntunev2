@@ -1092,7 +1092,10 @@ impl PgStore {
         crate::billing_store_classification::validate_history_target(&outcome)
             .map_err(|_| failed())?;
         billing_budget::BillingBudget::run(|budget| async move {
-            let mut client = budget.connect(|| self.connect()).await?;
+            let mut client = budget
+                .connect(|| self.connect())
+                .await
+                .map(crate::postgres::PgClient::new)?;
             budget
                 .bootstrap(|| billing_budget::bootstrap_transaction(&mut client))
                 .await?;
