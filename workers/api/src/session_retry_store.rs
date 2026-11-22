@@ -1,5 +1,7 @@
 //! PostgreSQL refresh receipt execution, shared by Hyperdrive and native tests.
 
+use tokio_postgres::types::Type;
+
 use crate::handlers::StoreError;
 use crate::session::{
     SessionClaims, MAX_SESSION_SECS, REFRESH_RETRY_SECS, ROTATE_SESSION_WITH_RETRY_SQL,
@@ -35,9 +37,9 @@ pub async fn rotate_with_retry(
     }
     let transaction = client.transaction().await.map_err(|_| StoreError)?;
     if transaction
-        .query_opt(
+        .query_typed_opt(
             "SELECT id FROM sessions WHERE id = $1 FOR UPDATE",
-            &[&previous.session_id],
+            &[(&previous.session_id, Type::TEXT)],
         )
         .await
         .map_err(|_| StoreError)?
@@ -57,18 +59,36 @@ pub async fn rotate_with_retry(
             .replace("$10", "(SELECT at FROM claim_clock)")
     );
     let row = transaction
-        .query_opt(
+        .query_typed_opt(
             &claim_sql,
             &[
-                &previous.session_id,
-                &previous.user_id,
-                &i64::try_from(previous.created_at).map_err(|_| StoreError)?,
-                &i32::try_from(previous.rotation_counter).map_err(|_| StoreError)?,
-                &i64::try_from(previous.expires_at).map_err(|_| StoreError)?,
-                &i32::try_from(next.rotation_counter).map_err(|_| StoreError)?,
-                &i64::try_from(next.expires_at).map_err(|_| StoreError)?,
-                &retry_hash,
-                &i64::try_from(next.issued_at).map_err(|_| StoreError)?,
+                (&previous.session_id, Type::TEXT),
+                (&previous.user_id, Type::TEXT),
+                (
+                    &i64::try_from(previous.created_at).map_err(|_| StoreError)?,
+                    Type::INT8,
+                ),
+                (
+                    &i32::try_from(previous.rotation_counter).map_err(|_| StoreError)?,
+                    Type::INT4,
+                ),
+                (
+                    &i64::try_from(previous.expires_at).map_err(|_| StoreError)?,
+                    Type::INT8,
+                ),
+                (
+                    &i32::try_from(next.rotation_counter).map_err(|_| StoreError)?,
+                    Type::INT4,
+                ),
+                (
+                    &i64::try_from(next.expires_at).map_err(|_| StoreError)?,
+                    Type::INT8,
+                ),
+                (&retry_hash, Type::TEXT),
+                (
+                    &i64::try_from(next.issued_at).map_err(|_| StoreError)?,
+                    Type::INT8,
+                ),
             ],
         )
         .await
