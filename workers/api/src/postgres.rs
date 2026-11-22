@@ -159,7 +159,7 @@ impl_pg_connect!(PgClient, 0);
 impl_pg_query!(Client);
 #[cfg(all(any(test, feature = "postgres-tests"), not(target_arch = "wasm32")))]
 impl_pg_connect!(Client);
-#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[cfg(all(any(test, feature = "postgres-tests"), not(target_arch = "wasm32")))]
 impl_pg_query!(Transaction<'_>);
 
 impl PgClient {
