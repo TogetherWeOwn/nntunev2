@@ -5289,7 +5289,14 @@ impl Store for PgStore {
         session: &crate::session::SessionClaims,
     ) -> Result<bool, StoreError> {
         Self::bounded(
-            async { subsonic_pg::insert(&mut self.connect_subsonic().await?, row, session).await },
+            async {
+                subsonic_pg::insert(
+                    &mut crate::postgres::PgClient::new(self.connect().await?),
+                    row,
+                    session,
+                )
+                .await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -5299,7 +5306,13 @@ impl Store for PgStore {
         user_id: &str,
     ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
         Self::bounded(
-            async { subsonic_pg::list(&mut self.connect_subsonic().await?, user_id).await },
+            async {
+                subsonic_pg::list(
+                    &mut crate::postgres::PgClient::new(self.connect().await?),
+                    user_id,
+                )
+                .await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -5312,9 +5325,14 @@ impl Store for PgStore {
     ) -> Result<bool, StoreError> {
         Self::bounded(
             async {
-                subsonic_pg::revoke(&mut self.connect_subsonic().await?, Some(id), user_id, now)
-                    .await
-                    .map(|count| count == 1)
+                subsonic_pg::revoke(
+                    &mut crate::postgres::PgClient::new(self.connect().await?),
+                    Some(id),
+                    user_id,
+                    now,
+                )
+                .await
+                .map(|count| count == 1)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -5327,7 +5345,13 @@ impl Store for PgStore {
     ) -> Result<u64, StoreError> {
         Self::bounded(
             async {
-                subsonic_pg::revoke(&mut self.connect_subsonic().await?, None, user_id, now).await
+                subsonic_pg::revoke(
+                    &mut crate::postgres::PgClient::new(self.connect().await?),
+                    None,
+                    user_id,
+                    now,
+                )
+                .await
             },
             TOTAL_TIMEOUT_MS,
         )

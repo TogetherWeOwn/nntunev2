@@ -141,7 +141,8 @@ impl_pg_query!(Client);
 impl_pg_connect!(Client);
 
 impl PgClient {
-    pub(crate) fn new(client: Client) -> Self {
+    /// Wrap an established connection's client. The caller still drives the connection.
+    pub fn new(client: Client) -> Self {
         Self(client)
     }
 }
