@@ -21,8 +21,10 @@ for (const status of [503, 200]) test(`recent searches withholds queries after v
 	await page.route(verifier, (route) => route.fulfill({ status, json: { session_binding: 'E'.repeat(43) } }), { times: 1 });
 	await page.goto('/library/recent');
 	const searches = page.getByRole('region', { name: 'Recent searches' });
+	const retry = searches.getByRole('button', { name: 'Retry recent searches' });
+	await expect(retry).toBeVisible();
 	await expect(searches.getByRole('link', { name: 'Scoped query' })).toHaveCount(0);
-	await searches.getByRole('button', { name: 'Retry recent searches' }).click();
+	await retry.click();
 	await expect(searches.getByRole('link', { name: 'Scoped query' })).toBeVisible();
 	await searches.getByRole('button', { name: 'Clear recent searches' }).click();
 	const stored = () => page.evaluate((key) => localStorage.getItem(key), key);
