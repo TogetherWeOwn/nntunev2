@@ -23,11 +23,8 @@ fn hit(id: &str, title: &str, score: f32) -> MbSearchHit {
 }
 
 fn select(query: &str, hits: Vec<MbSearchHit>) -> Result<ReleaseCandidate, NeedsReview> {
-    let lookup = release_lookup(query)?;
-    let evidence = CompleteReleaseCandidates {
-        lookup: &lookup,
-        hits,
-    };
+    let lookup = &release_lookup(query)?;
+    let evidence = CompleteReleaseCandidates { lookup, hits };
     select_release(query, Some(evidence))
 }
 
@@ -96,16 +93,15 @@ fn cleaned_subject_keeps_edition_and_requires_unique_exact_artist_album() {
     let live = hit(RELEASE, "Tin Skies (Live)", 1.0);
     let rival = hit(OTHER, "Tin Sk'ies (Live)", 0.2);
     assert_eq!(select(&query, vec![live.clone()]).unwrap().mbid(), RELEASE);
-    assert_eq!(
-        select(&query, vec![live, rival]).unwrap_err(),
-        ReleaseUnresolved
-    );
+    let result = select(&query, vec![live, rival]);
+    assert_eq!(result.unwrap_err(), ReleaseUnresolved);
 }
 
 #[test]
 fn inconsistent_search_evidence_returns_a_fixed_reason() {
     let h = hit(RELEASE, ALBUM, 1.0);
-    let lookup = release_lookup("source-subject-canary").unwrap();
+    let mut lookup = release_lookup(ALBUM).unwrap();
+    lookup.score_query = "source-subject-canary".into();
     let wrong = CompleteReleaseCandidates {
         lookup: &lookup,
         hits: vec![h.clone()],
@@ -121,6 +117,11 @@ fn inconsistent_search_evidence_returns_a_fixed_reason() {
     ] {
         let rival = hit(OTHER, ALBUM, score);
         assert_eq!(select(ALBUM, vec![h.clone(), rival]).unwrap_err(), reason);
+    }
+    for (count, reason) in [(25, ReleaseUnresolved), (26, SearchEvidence)] {
+        let candidates =
+            (0..count).map(|n| hit(&format!("{n:08x}-0000-4000-8000-000000000000"), ALBUM, 1.0));
+        assert_eq!(select(ALBUM, candidates.collect()).unwrap_err(), reason);
     }
 }
 
@@ -151,18 +152,20 @@ fn unproven_numbering_count_or_topology_requires_review() {
 
 #[test]
 fn incomplete_or_foreign_recordings_require_review() {
-    let rows = listing(&[(1, 1)]);
+    let rows = listing(&[(1, 1), (1, 2)]);
     let foreign = json!(OTHER);
     for (pointer, value, reason) in [
         ("/release_mbid", foreign.clone(), RecordingEvidence),
         ("/recordings/0/release_mbid", foreign, RecordingEvidence),
         ("/recordings/0/mbid", json!("invalid"), RecordingEvidence),
+        ("/recordings/1/title", json!("Conflict"), RecordingEvidence),
         ("/recordings/0/medium_no", Value::Null, PositionMismatch),
         ("/recordings/0/track_no", json!("1"), RecordingEvidence),
     ] {
         let mut invalid = rows.clone();
         *invalid.pointer_mut(pointer).unwrap() = value;
-        assert_eq!(decide(&[(None, "1")], 1, invalid).err(), Some(reason));
+        let result = decide(&[(None, "1"), (None, "2")], 2, invalid);
+        assert_eq!(result.err(), Some(reason));
     }
 }
 
