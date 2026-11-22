@@ -7,7 +7,7 @@
 use nntune_core::digest_enrollment::OriginManifest;
 
 mod inventory;
-pub use inventory::{append_inventory, InventoryAppendError};
+pub use inventory::{append_inventory, stage_validated_winner, InventoryAppendError};
 
 // Not wired until authority and custody can be established by the caller.
 #[allow(dead_code)]
