@@ -25,13 +25,15 @@ including any checks they skipped. Search and triage helpers use read-only
 inspection and report findings with file and line references, including where
 they looked when evidence is missing.
 
-The repository owner decides class-B design and policy changes. The owner
-is the sole production approver and holds the Release Manager authority
-named in the runbook and workflows. Stop and ask for explicit authorization
-for the exact commit before any production action or any merge that could
-reach production. This includes uncertain deployment paths, deploys,
-migrations, secrets and grants. Follow the production admission and access
-gates in [the operations runbook](docs/ops.md#staging-promotion-checklist).
+The task owner makes ordinary technical and staging decisions and takes a
+conservative approach to UI decisions. Describe any user-visible changes in
+the PR. Escalate to the repository owner only for spending beyond approved
+budgets, permanent deletion of member data, shutting down a member-facing
+service, or genuine legal, terms-of-service or privacy questions.
+
+Handle production changes as separate [release tasks](CONTRIBUTING.md#production-releases).
+Follow the exact-commit admission, approval and access gates in the
+[operations runbook](docs/ops.md#staging-promotion-checklist).
 
 Keep staging and production storage separate, and keep scratch data out of
 archive buckets. Existing access, retention and deletion controls apply to

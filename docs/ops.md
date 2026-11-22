@@ -353,13 +353,14 @@ this documentation update, nor evidence of separate compute/failure domains.
 
 ### Staging migrations
 
-The scheduled/CI deploy path never applies `migrations/*.sql`. Staging
-migrations are applied **before** merge, after board approval for the
-DDL, by the authoring agent itself: once board approval is recorded on
-the card, the agent dispatches the `migrations-staging-apply` workflow
-(`.github/workflows/migrations-staging-apply.yml`) with the exact
-40-hex commit `ref`, the migration `file`, an `applied_by` identity and
-the Paperclip board-approval interaction id. The workflow checks out
+The scheduled/CI deploy path never applies `migrations/*.sql`. The task owner
+applies staging migrations **before** merge. Obtain explicit approval of
+the exact DDL for the staging apply from the independent reviewers required
+by the PR's risk tier. Record the approval and commit before dispatching the
+[`migrations-staging-apply` workflow](../.github/workflows/migrations-staging-apply.yml) with the exact
+40-hex commit `ref`, the migration `file`, and an `applied_by` identity.
+In the dispatch form's `board_approval` field, enter the recorded public-safe
+approval reference on a single line of at most 200 characters. The workflow checks out
 that exact ref as data only (migration bytes and manifest) and runs
 the trusted `.github/scripts/apply_migration.py` from the workflow's
 own ref — never code from the dispatch-supplied ref — with
@@ -371,15 +372,16 @@ migrator credential
 (`PLANETSCALE_MIGRATOR_URL_STAGING`, the `staging` environment secret)
 is read only inside the job and never reaches the agent. Any
 manifest/sha mismatch refuses exactly as the migrator does. Mode
-`all-pending` applies every unrecorded manifest entry up to `file` in
-manifest order, refusing on the first failure. The recorded
-`schema_migrations` row lands in the job summary; post it on the card
-before merging. Only a row from a successful apply counts as merge
-evidence — on a failed run, rows are diagnostic, and the receipt and
-effects must be reconciled before retrying (an older row for the same
-filename is not proof that the failed apply landed). The `board_approval` input is an audit record of the
-card's own gate, not a workflow-side call — the workflow cannot call
-Paperclip. Prerequisites before the first dispatch: (a)
+`all-pending` selects app migrations through `file` from the pinned manifest
+in manifest order. Include the pending app migrations in that range in the
+approval. The migrator skips matching records and refuses on the first
+failure. The recorded `schema_migrations` row lands in the job
+summary. Link that receipt in the PR before merging. Only a row from a
+successful apply counts as merge evidence. On a failed run, rows are
+diagnostic, and the receipt and effects must be reconciled before retrying
+(an older row for the same filename is not proof that the failed apply landed). The workflow logs the
+required `board_approval` input in the job summary for audit. Prerequisites
+before the first dispatch: (a)
 `PLANETSCALE_MIGRATOR_URL_STAGING` must be scoped to the `staging`
 environment, and (b) the `staging` environment's deployment-branch
 policy must restrict deployments to the protected branch (`main`) so
@@ -634,9 +636,10 @@ operator-verified staging state). The three pre-merge applies from
 equivalently via `apply_migration.py --record-only`), so the gate is
 green immediately after the app backfill. A future shared mirror would couple
 staging and production reads; the replacement is not activated and these
-historical backfill files do not prove its migration state. Its backfill — and
-creating the table on production at all — requires a Release Manager decision;
-production applies use the same `apply_migration.py` path once their gate opens.
+historical backfill files do not prove its migration state. A production
+backfill or table creation requires a separate approved
+[production release task](../CONTRIBUTING.md#production-releases). Production
+applies use the same `apply_migration.py` path once their gate opens.
 
 ### Admin bootstrap (owner promotion)
 
@@ -1163,14 +1166,23 @@ and [deployment creation](https://developers.cloudflare.com/api/resources/worker
 do not document a deploy-only-if-undeployed condition. Actions serialization
 cannot stop a concurrent provider write between the empty read and deployment.
 
-1. **Release Manager:** Accept the exact launch SHA after M1, staging
-   admission, Security → QA, exact-head CI and migration ledger review.
-   Accept the seed explicitly. Verify `production` Environment protection with the GitHub custodian; configure the hostname and `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
+1. **Release task owner and independent release reviewer.** Apply the
+   [production release process](../CONTRIBUTING.md#production-releases).
+   The reviewer explicitly accepts the seed and exact launch SHA after M1,
+   staging admission, security and QA evidence, exact-head CI and migration
+   ledger review. The application staging run supplies admission evidence.
+   Record same-build staging evidence for the pinned maintenance artifact
+   separately. For this first deployment, rehearse the close/undo procedure
+   below where supported. Stop before dispatch if staging has no supported
+   lane for the maintenance artifact or the required evidence is incomplete.
+   The release task owner verifies `production` Environment protection with
+   the GitHub custodian and coordinates configuration of the hostname and
+   `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
    Keep `PRODUCTION_ACCEPTED_SHA`, `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID), Worker-scoped bearer and matching account in `production` only; a presence-only check during staging admission rejects inherited Cloudflare secrets.
 2. **Route custodian:** Immediately before dispatch, inventory every applicable zone and page, including wildcards, with existing read-only access. Refuse gaps; record zones, Worker ID, SHA, read time and zero matches.
    The GitHub custodian sets `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in `production`: JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`) and numeric `route_count: 0`.
    Freeze routes and keep this lane the sole Worker writer through readback. The Worker token cannot list zone routes.
-3. **Release Manager:** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`; Actions reruns are refused.
+3. **Release task owner.** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`. Actions reruns are refused.
    Under the mutation lock, require proof ≤30 minutes old, empty deployment/version/binding inventories and no custom domain, workers.dev or previews.
    One [upload by immutable ID with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/) installs `worker.mjs` at 100%. Record verified readback.
 4. **Close/undo:** Disable `PRODUCTION_DEPLOY_ENABLED` and clear the accepted SHA and route proof. To abort an in-flight run, cancel it too and reconcile Worker, deployment and route state before any retry.
@@ -1208,15 +1220,14 @@ and publishes a calendar version (`vYYYY.MDD.P`, e.g. `v2026.1102.1`)
 through the shared `TogetherWeOwn/.github` CalVer releaser (policy
 `production-promotion`; notes grouped by `release-please-config.json`
 changelog-sections). A re-promote of an already-tagged commit skips green
-without a tag. Production therefore only ever deploys on the release path
-(`environment: production`, human-gated); push to `main` deploys staging
-only (`environment: staging` on both deploy jobs). No other GitHub
-environment exists on this repo.
+without a tag. The production deploy uses the `production` Environment and
+requires independent release approval. A push to `main` deploys to the
+`staging` Environment only.
 
 - [ ] Exact-head CI: record the promotion SHA and GitHub Actions run/job
   URLs showing `ci-ok`, `gitleaks` and `pr-lint` green on that SHA.
   CI is `.github/workflows/ci.yml`; full suites and CI gates run in Actions,
-  never in a local CI mirror. Reviewers and the Release Manager accept
+  never in a local CI mirror. The release task owner and reviewers accept
   these exact-head links as CI evidence, not local full-suite transcripts
   ([verification contract](../CONTRIBUTING.md#evidence-for-review-and-release)).
   `migrations-staging` and `Devin Review` report on pull requests, not on

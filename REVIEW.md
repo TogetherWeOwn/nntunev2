@@ -10,8 +10,12 @@ Verify the required tier against the template and review map and flag any
 escalation. Record the reviewed SHA, verified model and tier with the
 findings, and flag any uncertainty about which model ran.
 Use read-only inspection and Actions evidence for independent review. Route
-any focused reproduction to the task owner. Do not approve, merge, enable
-auto-merge, edit code or start fix sessions.
+any focused reproduction to the task owner. PR reviewers do not submit merge
+approvals, merge, enable auto-merge, edit code or start fix sessions. Reviewers
+record separate approval for exact staging DDL when the
+[staging migration runbook](docs/ops.md#staging-migrations) requires it. An
+independent production release reviewer gives a separate decision under the
+[production release process](CONTRIBUTING.md#production-releases).
 The task owner acts on findings and verifies the required GitHub checks.
 
 Read `README.md` (architecture choices are normative there), `AGENTS.md`,
@@ -28,8 +32,8 @@ heavy focused work and any fallback retain the guarded Boat/pool limits in
 [CONTRIBUTING.md](CONTRIBUTING.md#verification-github-actions-first).
 A stale-head run or a skipped required job does not prove the gate passed.
 Actions evidence changes no required check or review/release gate, and
-never replaces same-build staging, migrations, rollback or exact-head
-production authorization from the owner.
+never replaces same-build staging, migrations, rollback or independent
+production release approval for the exact candidate.
 
 ### Manual verification for instruction changes
 
