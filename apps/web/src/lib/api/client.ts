@@ -783,13 +783,8 @@ export class ApiClient {
 				: route === LOGOUT ? { stale: staleSession() } : undefined;
 			const response = await (route && COOKIE_MUTATIONS.has(route)
 				? runAuthMutation(controller.signal, dispatch, intent) : dispatch());
-			// A transport may ignore abort; never publish an abandoned response.
-			try {
-				assertCurrent();
-			} catch (error) {
-				void response.body?.cancel().catch(() => undefined);
-				throw error;
-			}
+			// A transport may ignore abort; refuse its response before touching the body.
+			assertCurrent();
 			if (!response.ok) {
 				// A known denial must clear private rows without waiting for its body.
 				if (statusOnly?.(response.status)) {
