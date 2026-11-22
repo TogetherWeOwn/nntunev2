@@ -4,11 +4,36 @@ const PERIOD_END = '2026-11-15T12:00:00Z';
 
 for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
 	test.describe(`${viewport.width}px billing period-end copy`, () => {
-		test.use({ viewport, locale: 'en-US', timezoneId: 'UTC' });
+		test.use({ viewport, locale: 'en-US', timezoneId: 'America/Los_Angeles' });
 
 		for (const status of ['active', 'trialing', 'canceled', 'paused', 'unpaid', 'incomplete_expired']) {
-			for (const currentPeriodEnd of [PERIOD_END, null]) {
-				test(`${status} with ${currentPeriodEnd ? 'dated' : 'null'} period end`, async ({ page }, testInfo) => {
+			const periodEnds = [
+				{
+					label: 'dated',
+					currentPeriodEnd: PERIOD_END,
+					displayDate: '11/15/2026',
+					cancelAtPeriodEnd: false
+				},
+				{ label: 'null', currentPeriodEnd: null, displayDate: '', cancelAtPeriodEnd: false }
+			];
+			if (status === 'active') {
+				periodEnds.push(
+					{
+						label: 'date-only',
+						currentPeriodEnd: '2026-11-15',
+						displayDate: '11/14/2026',
+						cancelAtPeriodEnd: true
+					},
+					{
+						label: 'offset',
+						currentPeriodEnd: '2026-11-15T00:30:00-02:00',
+						displayDate: '11/14/2026',
+						cancelAtPeriodEnd: false
+					}
+				);
+			}
+			for (const { label, currentPeriodEnd, displayDate, cancelAtPeriodEnd } of periodEnds) {
+				test(`${status} with ${label} period end`, async ({ page }, testInfo) => {
 					const calls: Array<{ path: string; method: string }> = [];
 					// Only a stored `active` folds to the server's active state;
 					// every other stored status (trialing included) is lapsed.
@@ -20,7 +45,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 							return route.fulfill({ json: {
 								state: confirmed ? 'active' : 'lapsed',
 								planId: 'pro', status, currentPeriodEnd,
-								graceUntil: null, cancelAtPeriodEnd: false
+								graceUntil: null, cancelAtPeriodEnd
 							} });
 						}
 						if (path === '/v1/me/usage') {
@@ -50,10 +75,19 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					await page.screenshot({ path: screenshot, fullPage: true });
 					await testInfo.attach('billing-page', { path: screenshot, contentType: 'image/png' });
 					await expect(plan).not.toContainText(/renews/i);
+					const periodEnd = plan.locator('time');
 					if (currentPeriodEnd) {
-						await expect(plan).toContainText('period ends 11/15/2026');
+						await expect(plan).toContainText(`period ends ${displayDate}`);
+						await expect(periodEnd).toHaveText(displayDate);
+						await expect(periodEnd).toHaveAttribute('datetime', currentPeriodEnd);
 					} else {
 						await expect(plan).not.toContainText('period ends');
+						await expect(periodEnd).toHaveCount(0);
+					}
+					if (cancelAtPeriodEnd) {
+						await expect(plan).toContainText('· cancels at period end');
+					} else {
+						await expect(plan).not.toContainText('cancels at period end');
 					}
 					// No trial product state exists: trial wording never renders,
 					// including for a legacy stored `trialing`.
