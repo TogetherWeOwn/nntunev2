@@ -36,7 +36,7 @@ class TestMigrationWorkflow(unittest.TestCase):
         for name in ("docs-links", "migrations-gate"):
             self.assertIn("ci-commits", job_needs(self.jobs[name]))
             self.assertIn("${{ needs.ci-commits.outputs.base_sha }}", self.jobs[name])
-        checkout, selector, ratchet, _ = split_steps(job)
+        checkout, selector, _, ratchet, _ = split_steps(job)
         self.assertEqual("0", step_field(checkout, "fetch-depth"))
         self.assertIsNone(step_field(checkout, "ref"), "retain the default integration checkout")
         self.assertEqual("commits", step_field(selector, "id"))

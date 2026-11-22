@@ -2,9 +2,10 @@
 """Reject added direct PR SHA reads in workflow YAML against the resolved base."""
 import argparse
 from collections import Counter
-from pathlib import Path
 import re
 import sys
+
+import yaml
 
 from migrations_base import IdentityError, event_sha, git, require_commit
 
@@ -29,12 +30,9 @@ def workflow_reads(root, commit):
             continue
         _, _, oid = header.split()
         source = git(root, "cat-file", "blob", oid)
-        for match in RAW_SHA.finditer(source):
-            start = source.rfind("\n", 0, match.start()) + 1
-            end = source.find("\n", match.end())
-            line = source[start:end if end >= 0 else len(source)].strip()
-            if not line.startswith("#") or "${{" in line:
-                reads[path, line] += 1
+        for token in yaml.scan(source, Loader=yaml.SafeLoader):
+            if isinstance(token, yaml.ScalarToken) and (count := len(RAW_SHA.findall(token.value))):
+                reads[path, token.value] += count
     return reads
 
 
@@ -42,23 +40,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True)
     parser.add_argument("--tested", required=True)
-    parser.add_argument("--root", type=Path, default=Path.cwd())
     args = parser.parse_args()
     try:
-        base = require_commit(args.root, event_sha(args.base, "comparison base"))
-        tested = require_commit(args.root, event_sha(args.tested, "tested commit"))
-        added = workflow_reads(args.root, tested) - workflow_reads(args.root, base)
-    except (IdentityError, UnicodeError) as exc:
-        print(f"workflow-pr-shas: unable to compare pinned workflow trees: {exc}", file=sys.stderr)
+        base = require_commit(".", event_sha(args.base, "comparison base"))
+        tested = require_commit(".", event_sha(args.tested, "tested commit"))
+        added = workflow_reads(".", tested) - workflow_reads(".", base)
+    except (IdentityError, UnicodeError, yaml.YAMLError) as exc:
+        print(f"workflow-pr-shas: unable to compare pinned workflow trees ({type(exc).__name__})", file=sys.stderr)
         return 2
-    for (path, line), count in sorted(added.items()):
-        print(f"workflow-pr-shas: {path!r} adds {count} direct PR SHA read(s): {line!r}",
-              file=sys.stderr)
-    if added:
-        print("workflow-pr-shas: use the pinned ci-commits outputs.", file=sys.stderr)
-        return 1
-    print(f"workflow-pr-shas: no added direct PR SHA reads ({base}..{tested})")
-    return 0
+    for (path, scalar), count in sorted(added.items()):
+        print(f"workflow-pr-shas: {path!r} adds {count} direct PR SHA read(s): {RAW_SHA.findall(scalar)!r}. "
+              "Use the ci-commits outputs.", file=sys.stderr)
+    return 1 if added else 0
 
 
 if __name__ == "__main__":

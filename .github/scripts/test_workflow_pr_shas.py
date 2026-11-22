@@ -1,6 +1,7 @@
 """Exercise the blocking ratchet on pinned workflow trees."""
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -34,19 +35,20 @@ class WorkflowReadRatchet(unittest.TestCase):
             prefix = "name: sample\non: pull_request\njobs:\n  sample:\n    env:\n"
             stale = commit("earlier base", prefix + good)
             base = commit("actual first parent", prefix + old)
-            tested = commit("resolved consumer with old read", prefix + old + good)
+            tested = commit("resolved consumer with old read", prefix + old.rstrip() + " # retained\n"
+                            + good + "      # Example: ${{ github.event.pull_request.head.sha }}\n")
             bad = commit("added raw reads", prefix + old + good
                          + "      BAD: ${{ GitHub['event'].pull_request['HEAD'].sha }}\n"
                          + "    if: >-\n      github.event.pull_request\n        .base.sha != ''\n")
 
             def compare(against, candidate):
-                return run("python3", str(CHECK), "--base", against, "--tested", candidate, check=False)
+                return run(sys.executable, str(CHECK), "--base", against, "--tested", candidate, check=False)
 
             self.assertEqual(0, compare(base, tested).returncode)
             self.assertEqual(1, compare(stale, tested).returncode)
             rejected = compare(base, bad)
             self.assertEqual(1, rejected.returncode, rejected.stderr)
-            self.assertIn("BAD:", rejected.stderr)
+            self.assertIn("['HEAD'].sha", rejected.stderr)
             self.assertIn(".base.sha", rejected.stderr)
-            self.assertNotIn("OLD:", rejected.stderr)
+            self.assertNotIn("github.event.pull_request.base.sha", rejected.stderr)
             self.assertEqual(2, compare("1" * 40, tested).returncode)

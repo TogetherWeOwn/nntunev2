@@ -33,7 +33,7 @@ env:
 jobs:
   ci-commits:
     name: ci-commits
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       merge_sha: ${{ steps.commits.outputs.merge_sha }}
@@ -47,6 +47,12 @@ jobs:
       - name: Resolve tested commit and comparison range
         id: commits
         run: python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"
+      - name: Install the pinned workflow YAML scanner
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/ci-python"
+          "$RUNNER_TEMP/ci-python/bin/pip" --isolated install --no-deps --only-binary=:all: --require-hashes \
+            -r /dev/stdin <<<'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc'
+          echo "$RUNNER_TEMP/ci-python/bin" >> "$GITHUB_PATH"
       - name: Reject added direct PR SHA reads
         env:
           BASE_SHA: ${{ steps.commits.outputs.base_sha }}
