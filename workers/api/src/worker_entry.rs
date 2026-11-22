@@ -5289,7 +5289,7 @@ impl Store for PgStore {
         session: &crate::session::SessionClaims,
     ) -> Result<bool, StoreError> {
         Self::bounded(
-            async { subsonic_pg::insert(&mut self.connect().await?, row, session).await },
+            async { subsonic_pg::insert(&mut self.connect_subsonic().await?, row, session).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -5299,7 +5299,7 @@ impl Store for PgStore {
         user_id: &str,
     ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
         Self::bounded(
-            async { subsonic_pg::list(&mut self.connect().await?, user_id).await },
+            async { subsonic_pg::list(&mut self.connect_subsonic().await?, user_id).await },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -5312,7 +5312,7 @@ impl Store for PgStore {
     ) -> Result<bool, StoreError> {
         Self::bounded(
             async {
-                subsonic_pg::revoke(&mut self.connect().await?, Some(id), user_id, now)
+                subsonic_pg::revoke(&mut self.connect_subsonic().await?, Some(id), user_id, now)
                     .await
                     .map(|count| count == 1)
             },
@@ -5326,7 +5326,9 @@ impl Store for PgStore {
         now: u64,
     ) -> Result<u64, StoreError> {
         Self::bounded(
-            async { subsonic_pg::revoke(&mut self.connect().await?, None, user_id, now).await },
+            async {
+                subsonic_pg::revoke(&mut self.connect_subsonic().await?, None, user_id, now).await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await
