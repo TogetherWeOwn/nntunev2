@@ -133,7 +133,7 @@ remain unchanged.
 
 Record the reviewed head SHA and exact-head **Actions run/job links** with
 conclusions as CI evidence, not local transcripts. Reviewers and the
-owner use those links without waiving staging, rollback or
+task owner use those links without waiving staging, rollback or
 production approval gates. Live staging runs stay in Actions — see below.
 
 For a documentation-only change, focused static/diff checks are sufficient

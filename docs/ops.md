@@ -358,8 +358,9 @@ applies staging migrations **before** merge. Obtain explicit approval of
 the exact DDL for the staging apply from the independent reviewers required
 by the PR's risk tier. Record the approval and commit before dispatching the
 [`migrations-staging-apply` workflow](../.github/workflows/migrations-staging-apply.yml) with the exact
-40-hex commit `ref`, the migration `file`, an `applied_by` identity and
-the public-safe approval reference in `board_approval`. The workflow checks out
+40-hex commit `ref`, the migration `file`, and an `applied_by` identity.
+In the dispatch form's `board_approval` field, enter the recorded public-safe
+approval reference on a single line of at most 200 characters. The workflow checks out
 that exact ref as data only (migration bytes and manifest) and runs
 the trusted `.github/scripts/apply_migration.py` from the workflow's
 own ref — never code from the dispatch-supplied ref — with
@@ -371,13 +372,14 @@ migrator credential
 (`PLANETSCALE_MIGRATOR_URL_STAGING`, the `staging` environment secret)
 is read only inside the job and never reaches the agent. Any
 manifest/sha mismatch refuses exactly as the migrator does. Mode
-`all-pending` applies every unrecorded manifest entry up to `file` in
-manifest order, refusing on the first failure. Include each of those entries
-in the approval. The recorded `schema_migrations` row lands in the job
+`all-pending` selects app migrations through `file` from the pinned manifest
+in manifest order. Include the pending app migrations in that range in the
+approval. The migrator skips matching records and refuses on the first
+failure. The recorded `schema_migrations` row lands in the job
 summary. Link that receipt in the PR before merging. Only a row from a
 successful apply counts as merge evidence. On a failed run, rows are
-diagnostic, and the receipt and effects must be reconciled before retrying (an older row for the same
-filename is not proof that the failed apply landed). The workflow logs the
+diagnostic, and the receipt and effects must be reconciled before retrying
+(an older row for the same filename is not proof that the failed apply landed). The workflow logs the
 required `board_approval` input in the job summary for audit. Prerequisites
 before the first dispatch: (a)
 `PLANETSCALE_MIGRATOR_URL_STAGING` must be scoped to the `staging`
@@ -1171,8 +1173,8 @@ cannot stop a concurrent provider write between the empty read and deployment.
    ledger review. The application staging run supplies admission evidence.
    Record same-build staging evidence for the pinned maintenance artifact
    separately. For this first deployment, rehearse the close/undo procedure
-   below where supported. Stop before dispatch if the required evidence is
-   incomplete.
+   below where supported. Stop before dispatch if staging has no supported
+   lane for the maintenance artifact or the required evidence is incomplete.
    The release task owner verifies `production` Environment protection with
    the GitHub custodian and coordinates configuration of the hostname and
    `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.

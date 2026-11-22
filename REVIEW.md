@@ -11,7 +11,9 @@ escalation. Record the reviewed SHA, verified model and tier with the
 findings, and flag any uncertainty about which model ran.
 Use read-only inspection and Actions evidence for independent review. Route
 any focused reproduction to the task owner. PR reviewers do not submit merge
-approvals, merge, enable auto-merge, edit code or start fix sessions. An
+approvals, merge, enable auto-merge, edit code or start fix sessions. Reviewers
+record separate approval for exact staging DDL when the
+[staging migration runbook](docs/ops.md#staging-migrations) requires it. An
 independent production release reviewer gives a separate decision under the
 [production release process](CONTRIBUTING.md#production-releases).
 The task owner acts on findings and verifies the required GitHub checks.

@@ -232,8 +232,8 @@ plan and evidence before making the production change.
    requirements, where applicable. For `deploy-production`, the GitHub
    custodian verifies the recorded approval for the exact commit before
    setting `PRODUCTION_ACCEPTED_SHA` in the `production` Environment only.
-   Stop if no protected workflow supports the action or if the workflow's
-   enablement gates are closed.
+   Stop before dispatch if no protected workflow supports the action or if
+   the workflow's enablement gates are closed.
 6. Watch production health and errors for at least 30 minutes after release.
    Roll back immediately on a regression and record the outcome.
 
