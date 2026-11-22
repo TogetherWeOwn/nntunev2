@@ -649,6 +649,8 @@ jobs:
         env:
           CLIPPY_CONF_DIR: ${{ github.workspace }}/workers/api/clippy
         run: python3 workers/api/tests/check_hyperdrive_clippy.py
+      - name: Check typed Postgres interface
+        run: cargo test --locked --manifest-path workers/api/Cargo.toml --doc 'postgres::'
       # The Hyperdrive cache gate fails closed without credentials; pin its
       # exit codes with the built-in shim self-test (no network, no secrets).
       - run: bash workers/api/check_hyperdrive_cache.sh --self-test

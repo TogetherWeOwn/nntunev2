@@ -1,18 +1,19 @@
 //! Project admitted staging pages without retaining a caller-owned row list.
 
 use super::StoreError;
+use crate::postgres::{PgQuery, PgTransaction};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use nntune_subsonic::construction_budget::ConstructionBudget;
 use std::{future::Future, pin::pin};
 use tokio_postgres::{
     types::{ToSql, Type},
-    Row, Transaction,
+    Row,
 };
 
 pub(super) type Param<'a> = (&'a (dyn ToSql + Sync), Type);
 
 pub(super) async fn admit_page(
-    tx: &Transaction<'_>,
+    tx: &PgTransaction<'_>,
     query: &str,
     params: &[Param<'_>],
     limit: i64,
@@ -36,7 +37,7 @@ pub(super) async fn admit_page(
 
 // The count must come from a probe over the same rows in the same snapshot.
 pub(super) async fn fetch_page<T>(
-    tx: &Transaction<'_>,
+    tx: &PgTransaction<'_>,
     budget: &mut ConstructionBudget,
     query: &str,
     params: &[Param<'_>],

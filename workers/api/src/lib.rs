@@ -57,6 +57,7 @@ pub mod original_source;
 pub mod plan_limits;
 pub mod play_grant;
 pub mod playback;
+pub mod postgres;
 pub mod preference_rows;
 pub mod random;
 pub mod rate_limit;

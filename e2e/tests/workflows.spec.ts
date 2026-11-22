@@ -1383,10 +1383,10 @@ test.describe('locked-dependency ci builds (static pin)', () => {
     // Every mutation must change exactly one real command, then exercise
     // the same guard as the live workflow. A stale replacement cannot pass
     // just because another command already violates the policy.
-    const replaceCommand = (command: string, replacement: string): string => {
-      expect(ciCode.split(command), `unique mutation target: ${command}`).toHaveLength(2);
+    const replaceCommand = (command: string, replacement: string, workflow = ciCode): string => {
+      expect(workflow.split(command), `unique mutation target: ${command}`).toHaveLength(2);
       expect(replacement).not.toBe(command);
-      return ciCode.replace(command, () => replacement);
+      return workflow.replace(command, () => replacement);
     };
     // Wrappers must not hide an unlocked sibling while a plain locked
     // command still satisfies verb presence. Correctly locked wrappers
@@ -1436,12 +1436,16 @@ test.describe('locked-dependency ci builds (static pin)', () => {
       const testCommand = `cargo test --locked ${manifest} --all-targets`;
       const lockedCommand = `cargo test --locked ${manifest} --lib`;
       const unlockedCommand = `cargo test ${manifest} --doc`;
+      const typedDoctests = `cargo test --locked ${manifest} --doc 'postgres::'`;
+      const singleTestWorkflow =
+        crate === 'api' ? replaceCommand(typedDoctests, 'echo omit doctests in this control') : ciCode;
       const assertLocked = (workflow: string) => assertJobLocked(workflow, job, crate);
 
       // Mutate every compiling invocation independently. In repair this
       // includes BOTH clippy invocations, not just the first/native one.
       const compilingCommands = [
         testCommand,
+        ...(crate === 'api' ? [typedDoctests] : []),
         `cargo clippy --locked ${manifest} --all-targets -- -D warnings`,
         `cargo check --locked ${manifest} --target wasm32-unknown-unknown`,
         ...(crate === 'repair'
@@ -1494,7 +1498,7 @@ test.describe('locked-dependency ci builds (static pin)', () => {
         for (const separator of [';', '&&', '||', '&', '|', '|&']) {
           for (const locked of [false, true]) {
             const echoOnly = `echo ${quote}note${separator} cargo test ${locked ? '--locked ' : ''}${manifest}${quote}`;
-            const mutant = replaceCommand(testCommand, echoOnly);
+            const mutant = replaceCommand(testCommand, echoOnly, singleTestWorkflow);
             expect(
               () => assertLocked(mutant),
               `literal echo is not a ${job} test step: ${echoOnly}`,
@@ -1506,7 +1510,7 @@ test.describe('locked-dependency ci builds (static pin)', () => {
         // Full-line comments cannot supply a missing verb. Remove all
         // clippy steps together so repair's second step cannot mask it.
         const commented = ciCode.replace(
-          new RegExp(`^([ \\t]*)- run: cargo ${verb}[^\\n]*workers/${crate}/Cargo\\.toml[^\\n]*$`, 'gm'),
+          new RegExp(`^([ \\t]*)(?:- )?run: cargo ${verb}[^\\n]*workers/${crate}/Cargo\\.toml[^\\n]*$`, 'gm'),
           '$1# removed compiling/formatting step',
         );
         expect(commented, `${job} ${verb} comment mutation must change the workflow`).not.toBe(ciCode);
