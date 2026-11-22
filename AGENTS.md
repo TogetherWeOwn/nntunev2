@@ -42,12 +42,11 @@ and [bucket inventory](docs/ops.md#cloudflare).
 
 T3 Code selects the provider, model and effort for each thread through the
 project default, a thread's launch selection or an independent reviewer's
-target. Use the project default for routine implementation and pair GPT
-models, including Sol, with the Codex provider and Claude models with the
-Claude provider. Apply any task-specific model choice when dispatching the
-thread. Follow the independent cross-family review requirements in
-[CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) and include
-[REVIEW.md](REVIEW.md) in each independent review brief.
+target. The repository owner chooses the harness. Use the project default
+when launching task threads and apply any task-specific model choice at
+dispatch. Follow the independent cross-family review requirements in
+[CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) based on the model that ran
+each review. Include [REVIEW.md](REVIEW.md) in each independent review brief.
 
 Use high effort by default. Use xhigh only when the task brief justifies it.
 Never use max or ultra effort.
