@@ -5,8 +5,9 @@
 	import { displayCollections, loadCollections, type Collection, type CollectionFilter, type CollectionSort } from './collections.js';
 	import type { LibraryRefreshUpdate } from './refresh.js';
 
-	let { filter, requiresSignIn, runIfCurrent, reverify }: {
-		filter: CollectionFilter; requiresSignIn: boolean; runIfCurrent: LibraryRefreshUpdate['runIfCurrent']; reverify: () => Promise<void>;
+	let { filter, requiresSignIn, runIfCurrent, accountSession, reverify }: {
+		filter: CollectionFilter; requiresSignIn: boolean; runIfCurrent: LibraryRefreshUpdate['runIfCurrent'];
+		accountSession?: LibraryRefreshUpdate['accountSession']; reverify: () => Promise<void>;
 	} = $props();
 	let query = $state('');
 	let searchInput = $state<HTMLInputElement>();
@@ -25,10 +26,12 @@
 		rows = [];
 		status = 'loading';
 		const run = runIfCurrent;
-		const current = () => !request.signal.aborted && run === runIfCurrent && !requiresSignIn && selected === filter;
+		const owner = accountSession;
+		const current = () => !request.signal.aborted && run === runIfCurrent && owner === accountSession &&
+			(!owner || owner.isCurrent()) && !requiresSignIn && selected === filter;
 		const started = await run?.(() => {
 			if (!current()) return;
-			const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal });
+			const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal, session: owner && { owner } });
 			// Settle the request outside the receipt lock, including early failures.
 			return { result: loadCollections(client, selected).then(
 				(rows) => ({ rows, error: undefined }), (error: unknown) => ({ rows: undefined, error })
@@ -52,8 +55,17 @@
 			status = 'sign-in';
 			return;
 		}
+		const owner = accountSession;
+		const retire = () => {
+			active?.abort();
+			rows = [];
+			query = '';
+			status = 'unverified';
+		};
+		if (owner && !owner.isCurrent()) return retire();
+		owner?.signal.addEventListener('abort', retire, { once: true });
 		void load(filter);
-		return () => active?.abort();
+		return () => { owner?.signal.removeEventListener('abort', retire); active?.abort(); };
 	});
 </script>
 <section aria-label="Library collections">

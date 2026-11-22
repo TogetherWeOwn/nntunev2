@@ -98,6 +98,7 @@
 	const showingTracks = $derived(collectionFilter === 'tracks');
 	let libraryTypeGroup: HTMLDivElement | undefined = $state();
 	let collectionReceipt = $state<LibraryRefreshUpdate['runIfCurrent']>();
+	let collectionAccount = $state.raw<LibraryRefreshUpdate['accountSession']>();
 	let accountTrackLikes = $state.raw<ReturnType<typeof createLibraryTrackLikes>>();
 	const likeControls = (id: string) => accountTrackLikes?.controls(id);
 	const showRecovery = $derived(showingTracks || !collectionReceipt);
@@ -357,6 +358,7 @@
 				librarySession = undefined;
 			}
 			collectionReceipt = runIfCurrent;
+			collectionAccount = receipt.accountSession;
 			const revoked = authBoundary && !state.verificationSuspended;
 			if (sessionBinding && runIfCurrent) {
 				// The menu snapshots checked preferences; retire it with the verified controls.
@@ -1616,7 +1618,7 @@
 	</div>
 	{#if collectionFilter !== 'tracks' && (collectionReceipt || requiresSignIn)}
 		<CollectionBrowser filter={collectionFilter} {requiresSignIn}
-			runIfCurrent={collectionReceipt} reverify={refreshFromButton} />
+			runIfCurrent={collectionReceipt} accountSession={collectionAccount} reverify={refreshFromButton} />
 	{:else if !showingTracks && (loading ? items.length > 0 : libraryUnavailable || staleAt)}
 		{#if loading}
 			<p role="status">Loading your library…</p>
