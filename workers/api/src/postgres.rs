@@ -10,6 +10,14 @@ use tokio_postgres::{
 
 /// A connection that can execute only SQL with explicit parameter types.
 ///
+/// ```no_run
+/// use nntune_api::postgres::{PgClient, PgQuery};
+/// use tokio_postgres::types::Type;
+/// async fn typed_query(client: &PgClient) {
+///     client.query_typed_one("SELECT $1::int4", &[(&1i32, Type::INT4)]).await.unwrap();
+/// }
+/// ```
+///
 /// ```compile_fail
 /// use nntune_api::postgres::PgClient;
 /// async fn named_query(client: &PgClient) {
@@ -66,11 +74,6 @@ pub trait PgConnect: PgQuery {
     fn read_only_snapshot(
         &mut self,
     ) -> impl Future<Output = Result<PgTransaction<'_>, Error>> + Send;
-
-    fn transaction_with_isolation(
-        &mut self,
-        level: IsolationLevel,
-    ) -> impl Future<Output = Result<PgTransaction<'_>, Error>> + Send;
 }
 
 // Forward to the inherent driver methods without boxing each query future.
@@ -119,17 +122,6 @@ macro_rules! impl_pg_connect {
                     .map(PgTransaction)
             }
 
-            async fn transaction_with_isolation(
-                &mut self,
-                level: IsolationLevel,
-            ) -> Result<PgTransaction<'_>, Error> {
-                self$(.$inner)?
-                    .build_transaction()
-                    .isolation_level(level)
-                    .start()
-                    .await
-                    .map(PgTransaction)
-            }
         }
     };
 }
