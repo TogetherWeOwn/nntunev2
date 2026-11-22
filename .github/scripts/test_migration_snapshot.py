@@ -678,6 +678,12 @@ class PreparedCLI(unittest.TestCase):
         self.assertEqual(evidence["attempt"], 2)
         self.assertEqual(evidence["event"]["base"]["sha"], self.base)
 
+        self.args[self.args.index("--base-sha") + 1] = advanced
+        self.args.append("--integration-base")
+        result, out, err = self.check()
+        self.assertEqual(result, 0, out + err)
+        self.assertEqual(json.loads((self.evidence_dir / "validation.json").read_text()), outcomes)
+
     def test_original_range_cannot_be_hidden_by_effective_base(self):
         self.write("0001_old.sql")
         self.commit("birth")

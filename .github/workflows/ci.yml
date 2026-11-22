@@ -53,7 +53,7 @@ jobs:
           MERGE_SHA: ${{ steps.commits.outputs.merge_sha }}
         run: python3 .github/scripts/check_workflow_pr_shas.py --base "$BASE_SHA" --tested "$MERGE_SHA"
       - name: Test the workflow SHA ratchet
-        run: python3 .github/scripts/test_workflow_pr_shas.py
+        run: python3 -m unittest discover -s .github/scripts -p test_workflow_pr_shas.py
   # PR-only public security caller; never scan push/queue/dispatch events.
   # Keep this in the ci-ok dependency graph rather than waiting across workflows.
   public-pr-security:

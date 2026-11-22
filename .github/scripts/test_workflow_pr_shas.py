@@ -50,7 +50,3 @@ class WorkflowReadRatchet(unittest.TestCase):
             self.assertIn(".base.sha", rejected.stderr)
             self.assertNotIn("OLD:", rejected.stderr)
             self.assertEqual(2, compare("1" * 40, tested).returncode)
-
-
-if __name__ == "__main__":
-    unittest.main()

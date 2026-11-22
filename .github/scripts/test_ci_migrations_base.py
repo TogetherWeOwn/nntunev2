@@ -27,7 +27,7 @@ class TestMigrationWorkflow(unittest.TestCase):
 
     def test_selector_output_is_required_gate_input(self):
         job = self.jobs["ci-commits"]
-        for command in (SELECT, "python3 .github/scripts/test_workflow_pr_shas.py"):
+        for command in (SELECT, "python3 -m unittest discover -s .github/scripts -p test_workflow_pr_shas.py"):
             self.assertEqual([], check_required_step("ci-commits", job, command))
         for command in (GATE, "python3 .github/scripts/test_migrations_base.py",
                         "python3 .github/scripts/test_ci_migrations_base.py"):
