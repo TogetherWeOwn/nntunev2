@@ -804,7 +804,7 @@ type TestConnectFuture =
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 struct CatalogueTestMirror {
-    client: std::cell::RefCell<Option<Result<tokio_postgres::Client, StoreError>>>,
+    client: std::cell::RefCell<Option<Result<PgClient, StoreError>>>,
     attempts: std::rc::Rc<std::cell::Cell<usize>>,
     membership_hook: std::cell::RefCell<Option<MembershipTestHook>>,
     mirror_hook: std::cell::RefCell<Option<MembershipTestHook>>,
@@ -919,7 +919,7 @@ pub fn catalogue_store_for_postgres_test(
         test_client: std::cell::RefCell::new(Some(app)),
         test_connect: None,
         test_mirror: Some(CatalogueTestMirror {
-            client: std::cell::RefCell::new(Some(mirror)),
+            client: std::cell::RefCell::new(Some(mirror.map(PgClient::new))),
             attempts,
             membership_hook: std::cell::RefCell::new(None),
             mirror_hook: std::cell::RefCell::new(None),
@@ -1623,12 +1623,7 @@ impl PgStore {
         #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
         if let Some(mirror) = &self.test_mirror {
             mirror.attempts.set(mirror.attempts.get() + 1);
-            return mirror
-                .client
-                .borrow_mut()
-                .take()
-                .ok_or(StoreError)?
-                .map(PgClient::new);
+            return mirror.client.borrow_mut().take().ok_or(StoreError)?;
         }
         let env = self.env.as_ref().ok_or(StoreError)?;
         // The phase in progress when the connect fails (or the deadline
@@ -5259,7 +5254,10 @@ impl Store for PgStore {
         session: &crate::session::SessionClaims,
     ) -> Result<bool, StoreError> {
         Self::bounded(
-            async { subsonic_pg::insert(&mut self.connect().await?, row, session).await },
+            async {
+                let mut client = self.connect().await?;
+                subsonic_pg::insert(&mut client, row, session).await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -5269,7 +5267,10 @@ impl Store for PgStore {
         user_id: &str,
     ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
         Self::bounded(
-            async { subsonic_pg::list(&mut self.connect().await?, user_id).await },
+            async {
+                let mut client = self.connect().await?;
+                subsonic_pg::list(&mut client, user_id).await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await
@@ -5282,7 +5283,8 @@ impl Store for PgStore {
     ) -> Result<bool, StoreError> {
         Self::bounded(
             async {
-                subsonic_pg::revoke(&mut self.connect().await?, Some(id), user_id, now)
+                let mut client = self.connect().await?;
+                subsonic_pg::revoke(&mut client, Some(id), user_id, now)
                     .await
                     .map(|count| count == 1)
             },
@@ -5296,7 +5298,10 @@ impl Store for PgStore {
         now: u64,
     ) -> Result<u64, StoreError> {
         Self::bounded(
-            async { subsonic_pg::revoke(&mut self.connect().await?, None, user_id, now).await },
+            async {
+                let mut client = self.connect().await?;
+                subsonic_pg::revoke(&mut client, None, user_id, now).await
+            },
             TOTAL_TIMEOUT_MS,
         )
         .await

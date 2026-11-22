@@ -235,14 +235,9 @@ fn total_budget_encloses_dial_handshake_and_statement_setup_without_reset() {
         );
     }
     assert!(operation.find("socket.opened()").unwrap() < operation.find(".connect_raw(").unwrap());
-    assert!(
-        operation.find(".connect_raw(").unwrap()
-            < operation.find("client.set_statement_timeout(").unwrap()
-    );
-    assert!(
-        operation.find("client.set_statement_timeout(").unwrap()
-            < operation.find("Ok(client)").unwrap()
-    );
+    let timeout_at = operation.find("client.set_statement_timeout(").unwrap();
+    assert!(operation.find(".connect_raw(").unwrap() < timeout_at);
+    assert!(timeout_at < operation.find("Ok(client)").unwrap());
 }
 
 #[test]
@@ -266,12 +261,9 @@ fn returned_client_finishes_setting_statement_timeout_to_the_overall_budget() {
     let sets = calls(operation, "client.set_statement_timeout");
     assert_eq!(sets.len(), 1);
     assert_eq!(sets[0].args, ["TOTAL_TIMEOUT_MS"]);
-    let wrapper: String = include_str!("../src/postgres.rs")
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect();
-    let setter = function_body(&wrapper, "asyncfnset_statement_timeout(");
-    assert!(setter.contains("self.0.batch_execute(&format!(\"SETstatement_timeout={ms}\"))"));
+    let wrapper = include_str!("../src/postgres.rs");
+    let setter = function_body(wrapper, "async fn set_statement_timeout(");
+    assert!(setter.contains(".batch_execute(&format!(\"SET statement_timeout = {ms}\"))"));
     assert!(
         sets[0].after.starts_with(".await.map_err(|_|StoreError)?"),
         "SET must finish or fail before returning the client"
@@ -345,7 +337,17 @@ fn expiry_never_formats_host_role_or_connection_string() {
             "no formatted driver detail on expiry"
         );
     }
-    assert!(calls(connect, "format!").is_empty());
+    // PgStore may format the numeric SET, but nothing else. In particular both
+    // Debug spellings (:? and :#?) and interpolated host/role/DSN are refused.
+    for call in calls(connect, "format!") {
+        assert!(
+            (call.args.len() == 1 && call.args[0] == "\"SETstatement_timeout={TOTAL_TIMEOUT_MS}\"")
+                || (call.args.len() == 2
+                    && call.args[0] == "\"SETstatement_timeout={}\""
+                    && budget_is(call.args[1], "TOTAL_TIMEOUT_MS")),
+            "the only allowed connection formatting is the numeric statement timeout"
+        );
+    }
     for forbidden in [
         "dbg!",
         "println!",
