@@ -1,5 +1,7 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
 
+test.use({ locale: 'en-US', timezoneId: 'America/Los_Angeles' });
+
 const path = '/admin/invites';
 const api = '/v1/admin/invites';
 const issuer = 'Abcdefghijkl01234-__gA';

@@ -59,8 +59,8 @@ test('opens from authorized windows and saves exactly one setting by keyboard at
 		await expect(form.getByRole('button', { name: saveLabel, exact: true })).toHaveText('Save');
 	}
 	expect(await page.locator('main').evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
-	const monthInput = page.getByLabel(fields[0]);
-	const quotaInput = page.getByLabel(fields[1]);
+	const monthInput = page.getByRole('textbox', { name: fields[0], exact: true });
+	const quotaInput = page.getByRole('textbox', { name: fields[1], exact: true });
 	await quotaInput.fill('24');
 	await monthInput.fill('10');
 	await monthInput.press('Tab');
@@ -81,7 +81,7 @@ test('opens from authorized windows and saves exactly one setting by keyboard at
 test('ignores an unchanged submission and still allows a later edit', async ({ page }) => {
 	const writes = await mock(page);
 	await page.goto(path);
-	const input = page.getByLabel(fields[0]);
+	const input = page.getByRole('textbox', { name: fields[0], exact: true });
 	await expect(input).toHaveValue('9');
 	await input.evaluate((el) => el.closest('form')!.requestSubmit());
 	await expect(page.getByText(/^Saved /)).toHaveCount(0);
@@ -96,7 +96,7 @@ test('rejects invalid input and accepts both inclusive endpoints for all setting
 	await page.goto(path);
 	const endpoints = [[months, 0, 600], [quota, 0, 10_000], [expiry, 1, 30]] as const;
 	for (const [index, [key, min, max]] of endpoints.entries()) {
-		const input = page.getByLabel(fields[index]);
+		const input = page.getByRole('textbox', { name: fields[index], exact: true });
 		for (const invalid of ['', '1.5', '1e1', 'abc', String(min - 1), String(max + 1)]) {
 			await input.fill(invalid);
 			await input.press('Enter');
@@ -121,7 +121,7 @@ for (const [name, status, code, message, key = months, value = 4] of [
 ] as const) test(`does not retry or report success after ${name}`, async ({ page }) => {
 	const writes = await mock(page, (route) => status === 0 ? route.abort() : route.fulfill({ status, json: { code, key, value } }));
 	await page.goto(path);
-	const input = page.getByLabel(fields[0]);
+	const input = page.getByRole('textbox', { name: fields[0], exact: true });
 	await input.fill('4');
 	await input.press('Enter');
 	await expect(page.getByRole('alert')).toContainText(message);
@@ -134,7 +134,7 @@ for (const [name, status, code, message, key = months, value = 4] of [
 test('does not dispatch a write using an old generation, even before the storage event', async ({ page }) => {
 	const writes = await mock(page);
 	await page.goto(path);
-	const input = page.getByLabel(fields[0]);
+	const input = page.getByRole('textbox', { name: fields[0], exact: true });
 	await input.fill('4');
 	await input.evaluate((el, key) => {
 		localStorage.setItem(key, 'different fixture generation');
@@ -148,7 +148,7 @@ test('does not dispatch a write using an old generation, even before the storage
 test('removes the editor and unsaved drafts on a delivered auth transition', async ({ page }) => {
 	const writes = await mock(page);
 	await page.goto(path);
-	await page.getByLabel(fields[0]).fill('4');
+	await page.getByRole('textbox', { name: fields[0], exact: true }).fill('4');
 	await page.evaluate((key) => window.dispatchEvent(new StorageEvent('storage', { key, storageArea: localStorage })), generation);
 	await expect(controls(page)).toHaveCount(0);
 	await expect(page.getByRole('heading', { name: 'Invite policy' })).toBeFocused();
@@ -172,7 +172,7 @@ for (const method of ['GET', 'PUT']) test(`ignores late ${method} data across an
 	}, { method, api, months, settings });
 	await page.goto(path);
 	if (method === 'PUT') {
-		const input = page.getByLabel(fields[0]);
+		const input = page.getByRole('textbox', { name: fields[0], exact: true });
 		await input.fill('4');
 		await input.press('Enter');
 	}
