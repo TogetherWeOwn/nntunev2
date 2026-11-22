@@ -51,8 +51,7 @@ def workflow_reads(root, commit):
         source = git(root, "cat-file", "blob", oid)
         tree = yaml.compose(source, Loader=yaml.SafeLoader)
         for location, scalar in scalar_fields(tree, (), set()):
-            if count := len(RAW_SHA.findall(scalar)):
-                reads[path, location, scalar] += count
+            reads.update((path, location, match) for match in RAW_SHA.findall(scalar))
     return reads
 
 
@@ -68,8 +67,8 @@ def main():
     except (BaseError, RecursionError, UnicodeError, yaml.YAMLError) as exc:
         print(f"workflow-pr-shas: unable to compare pinned workflow trees ({type(exc).__name__})", file=sys.stderr)
         return 2
-    for (path, _, scalar), count in sorted(added.items()):
-        print(f"workflow-pr-shas: {path!r} adds {count} direct PR SHA read(s): {RAW_SHA.findall(scalar)!r}. "
+    for (path, _, match), count in sorted(added.items()):
+        print(f"workflow-pr-shas: {path!r} adds {count} direct PR SHA read(s): {match!r}. "
               "Use the ci-commits outputs.", file=sys.stderr)
     return 1 if added else 0
 

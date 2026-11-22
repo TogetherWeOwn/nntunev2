@@ -12,3 +12,7 @@ jobs:
         env:
           SHA: ${{ github.event.pull_request.base.sha }}
         run: test -n "$SHA"
+      - name: Check SHA evidence
+        run: |
+          echo '${{ github.event.pull_request.base.sha }}'
+          echo '${{ github.event.pull_request.head.sha }}'

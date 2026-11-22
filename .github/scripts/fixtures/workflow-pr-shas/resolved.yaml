@@ -13,3 +13,7 @@ jobs:
           SHA: ${{ needs.ci-commits.outputs.base_sha }}
           # Example: ${{ github.event.pull_request.head.sha }}
         run: test -n "$SHA"
+      - name: Check SHA evidence
+        run: |
+          echo '${{ needs.ci-commits.outputs.base_sha }}'
+          echo '${{ github.event.pull_request.head.sha }}'
