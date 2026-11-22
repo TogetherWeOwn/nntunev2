@@ -1,6 +1,5 @@
 use super::{
-    id, BucketReadbackResponse, MemoryBody, ReadbackFixture, ReadbackResponse, BUCKET,
-    CONFIGURATION, FINAL_VERSION, FLAC, SCOPE, SHARED_VERSION,
+    id, ReadbackFixture, BUCKET, CONFIGURATION, FINAL_VERSION, FLAC, SCOPE, SHARED_VERSION,
 };
 use nntune_ingest::{
     digest_candidate_store::{
@@ -53,26 +52,7 @@ async fn postgres_stages_completed_candidate_atomically() {
     let verified = inventory
         .verify(SCOPE, fixture.envelope(), async |bucket, pin| {
             assert_eq!(bucket, BUCKET);
-            let (bytes, version) = if pin.object_key == key {
-                (&fixture.media_bytes, SHARED_VERSION)
-            } else {
-                assert_eq!(pin.object_key, page_key);
-                (&fixture.page_bytes[0], FINAL_VERSION)
-            };
-            assert_eq!(pin.version, Some(version));
-            Ok(BucketReadbackResponse {
-                bucket: BUCKET.into(),
-                response: ReadbackResponse {
-                    configuration: CONFIGURATION,
-                    object_key: pin.object_key.into(),
-                    version: Some(version.into()),
-                    status: 200,
-                    content_length: Some(bytes.len() as u64),
-                    has_content_range: false,
-                    has_content_encoding: false,
-                    body: MemoryBody(Some(bytes)),
-                },
-            })
+            Ok(fixture.response_with_keys(pin, &key, &page_key))
         })
         .await
         .unwrap();
@@ -120,11 +100,6 @@ async fn postgres_stages_completed_candidate_atomically() {
     assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
     assert!(tx.query_opt(INVENTORY, &[&map]).await.unwrap().is_none());
     tx.commit().await.unwrap();
-    assert!(observer
-        .query_opt(INVENTORY, &[&map])
-        .await
-        .unwrap()
-        .is_none());
 
     observer.execute(
         "INSERT INTO public.storage_object_envelope_intents VALUES ($1::text::uuid, $2::text::uuid, $3)",
@@ -139,10 +114,6 @@ async fn postgres_stages_completed_candidate_atomically() {
         stage_completed_candidate(&mut tx, &intent, scope, &verified, RETAIN_UNTIL).await,
         Err(Identity)
     );
-    assert_eq!(
-        stage_completed_candidate(&mut tx, &intent, SCOPE, &verified, 0).await,
-        Err(MissingOrFenced)
-    );
     tx.execute(
         "UPDATE public.storage_digest_reservations SET expires_at = '-infinity'
         WHERE object_id = $1::text::uuid",
@@ -152,6 +123,50 @@ async fn postgres_stages_completed_candidate_atomically() {
     .unwrap();
     assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
     assert!(tx.query_opt(INVENTORY, &[&map]).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+
+    let mut tx = writer.transaction().await.unwrap();
+    // Count an actual winner insert even when the staging savepoint rolls back.
+    tx.batch_execute(
+        "CREATE TEMP SEQUENCE retention_insert_attempt;
+         CREATE FUNCTION pg_temp.wait_for_retention_expiry() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM nextval('pg_temp.retention_insert_attempt');
+             PERFORM pg_catalog.pg_sleep(LEAST(4, GREATEST(0, EXTRACT(EPOCH FROM
+                 NEW.retain_until - pg_catalog.clock_timestamp())))::double precision);
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER wait_for_retention_expiry AFTER INSERT ON public.storage_validated_digest_winners
+         FOR EACH ROW EXECUTE FUNCTION pg_temp.wait_for_retention_expiry();",
+    ).await.unwrap();
+    let deadline: i64 = tx
+        .query_one(
+            "SELECT floor(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp()))::bigint + 3",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    for (deadline, attempted_insert) in [(0, false), (deadline, true)] {
+        assert_eq!(
+            stage_completed_candidate(&mut tx, &intent, SCOPE, &verified, deadline).await,
+            Err(MissingOrFenced)
+        );
+        let row = tx
+            .query_one(
+                "SELECT is_called FROM pg_temp.retention_insert_attempt",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, bool>(0), attempted_insert);
+    }
+    assert!(tx.query_opt(INVENTORY, &[&map]).await.unwrap().is_none());
+    assert!(tx
+        .query_opt(WINNERS, &[&environment, &library])
+        .await
+        .unwrap()
+        .is_none());
     tx.rollback().await.unwrap();
 
     // The underlying guard must reject mismatched pre-existing pins and preserve them.

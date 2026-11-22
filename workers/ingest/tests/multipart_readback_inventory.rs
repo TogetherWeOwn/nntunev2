@@ -211,10 +211,19 @@ impl ReadbackFixture {
     }
 
     fn response(&self, pin: ReadbackPin<'_>) -> BucketReadbackResponse<MemoryBody<'_>> {
-        let (key, version, bytes) = match pin.object_key {
-            KEY => (KEY, SHARED_VERSION, &self.media_bytes),
-            PAGE_KEY => (PAGE_KEY, FINAL_VERSION, &self.page_bytes[0]),
-            PAGE_ONE_KEY => (PAGE_ONE_KEY, PAGE_ONE_VERSION, &self.page_bytes[1]),
+        self.response_with_keys(pin, KEY, PAGE_KEY)
+    }
+
+    fn response_with_keys(
+        &self,
+        pin: ReadbackPin<'_>,
+        media_key: &str,
+        first_page_key: &str,
+    ) -> BucketReadbackResponse<MemoryBody<'_>> {
+        let (version, bytes) = match pin.object_key {
+            key if key == media_key => (SHARED_VERSION, &self.media_bytes),
+            key if key == first_page_key => (FINAL_VERSION, &self.page_bytes[0]),
+            PAGE_ONE_KEY => (PAGE_ONE_VERSION, &self.page_bytes[1]),
             _ => panic!("unexpected readback key"),
         };
         assert_eq!(pin.configuration, CONFIGURATION);
@@ -223,7 +232,7 @@ impl ReadbackFixture {
             bucket: BUCKET.into(),
             response: ReadbackResponse {
                 configuration: CONFIGURATION,
-                object_key: key.into(),
+                object_key: pin.object_key.into(),
                 version: Some(version.into()),
                 status: 200,
                 content_length: Some(bytes.len() as u64),
