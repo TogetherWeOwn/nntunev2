@@ -76,7 +76,7 @@ pub(crate) enum ReconcileProbe {
 pub(crate) const PRECOMMIT_GATE: i64 = 781349054;
 
 pub(crate) async fn apply_reconcile_transaction(
-    transaction: &mut tokio_postgres::Client,
+    transaction: &mut impl crate::postgres::PgBilling,
     user_id: String,
     outcome: crate::billing_reconcile::ReconcileOutcome,
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))] probe: ReconcileProbe,
@@ -237,7 +237,7 @@ pub(crate) async fn apply_reconcile_transaction(
                 // The observer still sees empty tables even if the gate is too early.
                 // Require the writes on this backend before either INSERT case can wait.
                 let written: bool = transaction
-                    .query_one(
+                    .query_typed_one(
                         "SELECT EXISTS (SELECT 1 FROM public.subscriptions
                               WHERE user_id = $1 AND stripe_subscription_id = $2
                                 AND status = 'active' AND paid_invoice_id = 'in_worker_second')
@@ -245,7 +245,10 @@ pub(crate) async fn apply_reconcile_transaction(
                                    FROM public.paid_invoice_history
                                   WHERE user_id = $1 AND stripe_subscription_id = $2)
                                 IS NOT DISTINCT FROM ARRAY['in_worker_first', 'in_worker_second']",
-                        &[&user_id, &row.stripe_subscription_id],
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&row.stripe_subscription_id, Type::TEXT),
+                        ],
                     )
                     .await
                     .and_then(|row| row.try_get(0))
@@ -269,18 +272,24 @@ pub(crate) async fn apply_reconcile_transaction(
             probe,
             ReconcileProbe::WorkerDeadline | ReconcileProbe::ServerWatchdog
         ) {
-            let written = transaction.query_one(
+            let written = transaction.query_typed_one(
                 "SELECT (SELECT count(*) FROM public.subscriptions WHERE stripe_subscription_id = 'sub_worker_fault'), (SELECT count(*) FROM public.paid_invoice_history WHERE stripe_subscription_id = 'sub_worker_fault')", &[],
             ).await.map_err(|_| StoreError)?;
             if written.get::<_, i64>(0) != 1 || written.get::<_, i64>(1) != 2 {
                 return Err(StoreError);
             }
             if matches!(probe, ReconcileProbe::WorkerDeadline) {
-                transaction.batch_execute("SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0").await.map_err(|_| StoreError)?;
+                transaction
+                    .disable_billing_watchdogs()
+                    .await
+                    .map_err(|_| StoreError)?;
             }
             // Readiness follows acknowledgement of the timeout settings.
             transaction
-                .batch_execute("SELECT pg_advisory_xact_lock(781349053)")
+                .query_typed(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    &[(&781349053_i64, Type::INT8)],
+                )
                 .await
                 .map_err(|_| StoreError)?;
             std::future::pending::<()>().await;
@@ -289,13 +298,10 @@ pub(crate) async fn apply_reconcile_transaction(
     };
     // A failed COMMIT acknowledgement remains an unknown outcome.
     if let Err(error) = work.await {
-        let _ = transaction.batch_execute("ROLLBACK").await;
+        let _ = transaction.rollback_billing().await;
         return Err(error);
     }
-    transaction
-        .batch_execute("COMMIT")
-        .await
-        .map_err(|_| StoreError)
+    transaction.commit_billing().await.map_err(|_| StoreError)
 }
 
 #[cfg(test)]

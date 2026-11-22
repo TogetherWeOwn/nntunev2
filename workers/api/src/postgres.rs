@@ -27,6 +27,12 @@ use tokio_postgres::{
 ///     client.query_one("SELECT 1", &[]).await.unwrap();
 /// }
 /// ```
+/// ```compile_fail
+/// use nntune_api::postgres::PgClient;
+/// async fn arbitrary_batch(client: &PgClient) {
+///     client.batch_execute("SELECT 1").await.unwrap();
+/// }
+/// ```
 pub struct PgClient(Client);
 
 /// A transaction with the same typed statement interface as the connection.
@@ -135,7 +141,10 @@ impl_pg_connect!(PgClient, 0);
 
 // Native Postgres fixtures can set up and inspect disposable databases with
 // the driver while exercising the same typed adapters as the Worker.
-#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[cfg(any(
+    all(feature = "postgres-tests", not(target_arch = "wasm32")),
+    all(feature = "billing-owned-wasm-test", target_arch = "wasm32"),
+))]
 impl_pg_query!(Client);
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 impl_pg_connect!(Client);
@@ -145,7 +154,60 @@ impl PgClient {
     pub fn new(client: Client) -> Self {
         Self(client)
     }
+
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    pub(crate) fn cancel_token(&self) -> tokio_postgres::CancelToken {
+        self.0.cancel_token()
+    }
 }
+
+// The owned billing transport drives one connection across separate phase
+// timers. Keep BEGIN and the local watchdog settings in one wire batch.
+pub(crate) trait PgBilling: PgQuery {
+    fn begin_billing(&self, remaining_ms: u64) -> impl Future<Output = Result<(), Error>> + Send;
+    fn commit_billing(&self) -> impl Future<Output = Result<(), Error>> + Send;
+    fn rollback_billing(&self) -> impl Future<Output = Result<(), Error>> + Send;
+
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    fn disable_billing_watchdogs(&self) -> impl Future<Output = Result<(), Error>> + Send;
+}
+
+macro_rules! impl_pg_billing {
+    ($pg:ty $(, $inner:tt)?) => {
+        impl PgBilling for $pg {
+            async fn begin_billing(&self, remaining_ms: u64) -> Result<(), Error> {
+                let lock_ms = remaining_ms.min(4_000);
+                let statement_ms = remaining_ms.min(5_000);
+                let idle_ms = remaining_ms.min(5_000);
+                self$(.$inner)?.batch_execute(&format!(
+                    "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL transaction_timeout = {remaining_ms}; SET LOCAL lock_timeout = {lock_ms}; SET LOCAL statement_timeout = {statement_ms}; SET LOCAL idle_in_transaction_session_timeout = {idle_ms}"
+                )).await
+            }
+
+            async fn commit_billing(&self) -> Result<(), Error> {
+                self$(.$inner)?.batch_execute("COMMIT").await
+            }
+
+            async fn rollback_billing(&self) -> Result<(), Error> {
+                self$(.$inner)?.batch_execute("ROLLBACK").await
+            }
+
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            async fn disable_billing_watchdogs(&self) -> Result<(), Error> {
+                self$(.$inner)?.batch_execute(
+                    "SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL transaction_timeout = 0",
+                ).await
+            }
+        }
+    };
+}
+
+impl_pg_billing!(PgClient, 0);
+#[cfg(any(
+    all(feature = "postgres-tests", not(target_arch = "wasm32")),
+    all(feature = "billing-owned-wasm-test", target_arch = "wasm32"),
+))]
+impl_pg_billing!(Client);
 
 impl PgTransaction<'_> {
     pub(crate) async fn query_typed_raw<P, I>(
