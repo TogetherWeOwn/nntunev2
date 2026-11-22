@@ -536,14 +536,14 @@ in the trusted checker, pinned to the repository, PR, reviewed Git parent,
 paths, digest and target. Both passes require exact Git lineage and an
 unchanged accepted prefix; neither accepts a new applied alias for the
 recorded identity, even in a different PR. Trigger a fresh PR event after
-the checker lands; rerunning a prior event uses its old base. If the slot
+the checker lands; rerunning a prior event tests its original integration commit. If the slot
 changes, reconcile the new path with the checker owner before retrying.
 
-The secretless PR gate loads its checker and its stdlib-only
-`migration_history.py` import from a separate checkout of the event's full
-trusted **base SHA**. The PR **head SHA** is checked out with full Git
-history under a different root, used only as evidence through `--root`;
-no PR setup, scripts or builds run in this job. Python isolated mode (`-I`)
+The secretless PR gate pins the tested integration commit and runs the
+resolver blob from its first parent. It loads the checker and its imports
+from a separate checkout of that **tested base SHA**. The validated second
+parent supplies the source head and manifest. That checkout retains full
+Git history and serves only as evidence through `--root`. Python isolated mode (`-I`)
 excludes the working directory, `PYTHONPATH` and user-site imports, then
 adds only the trusted checker directory. The checker runs outside both
 checkouts with no API token in its environment; Git ignores global/system
@@ -571,14 +571,15 @@ The API collector retains projected metadata before and after a complete
 file-list attempt, including every page and non-migration record. Both
 samples must agree on PR number, repository IDs/names, refs, commits and
 file count. An observed head change or retarget fails; it never adopts a
-live head. A recorded effective base B1 may equal the event base B0 or be
-its Git-verified descendant in the same repository/ref. Every observed base
-must also equal or descend from the preceding observation across brackets
-and attempts; an observed rewind or divergent transition is a hard failure.
+live head. Git must prove the original event base B0 is the tested first
+parent or its ancestor. A recorded effective base B1 must equal or descend
+from the tested first parent in the same repository/ref. Every observed base
+must equal or descend from the preceding observation across brackets and
+attempts. An observed rewind or divergent transition fails the check.
 B1 need not be an ancestor of H. Its immutable object must be available in the full data
 checkout; missing objects or ambiguous ancestry fail, with no mutable-ref
-fetch or trust-pin substitution. Missing/incompatible trusted B0 code also
-still fails; advancing the evidence base cannot recover absent executables.
+fetch or trust-pin substitution. Missing or incompatible first-parent code
+fails the check.
 
 Validation independently runs the existing verifier on **both B0/H and
 B1/H**, each with its own unique merge-base manifest baseline. Only the
