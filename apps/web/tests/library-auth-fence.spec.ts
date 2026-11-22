@@ -13,12 +13,12 @@ test.beforeEach(({ page }) => page.addInitScript(({ current, contextKey, favorit
 	Object.defineProperty(navigator, 'clipboard', { value: undefined });
 }, { current, contextKey, favoritesKey }));
 
-test('recent searches retry verification and Undo follows the original tab scope', async ({ page }) => {
+for (const status of [503, 200]) test(`recent searches withholds queries after verifier response ${status} and keeps Undo scoped`, async ({ page }) => {
 	const key = 'nntune.library.recent-finds.v1.bound';
 	await page.route('**/v1/me/history', (route) => route.fulfill({ json: { items: [] } }));
 	await page.route('**/api/library', (route) => route.fulfill({ headers: { 'x-nntune-session-binding': current }, json: [] }));
 	await page.route(verifier, (route) => route.fulfill({ json: { session_binding: current } }));
-	await page.route(verifier, (route) => route.fulfill({ status: 503, json: {} }), { times: 1 });
+	await page.route(verifier, (route) => route.fulfill({ status, json: { session_binding: 'E'.repeat(43) } }), { times: 1 });
 	await page.goto('/library/recent');
 	const searches = page.getByRole('region', { name: 'Recent searches' });
 	await expect(searches.getByRole('link', { name: 'Scoped query' })).toHaveCount(0);
@@ -183,5 +183,14 @@ for (const view of ['Home', 'Albums', 'Artists']) {
 		await page.getByRole('button', { name: 'Retry', exact: true }).click();
 		await expect(row).toBeVisible();
 		if (home) await expect(gatedRegion.getByRole('link', { name: 'Scoped query' })).toBeVisible();
+		else {
+			await page.evaluate(() => {
+				const key = 'nntune.auth.generation.v1';
+				localStorage.setItem(key, 'replacement-generation');
+				window.dispatchEvent(new StorageEvent('storage', { key }));
+			});
+			await expect(row).toHaveCount(0);
+			await expect(gatedRegion.getByRole('button', { name: 'Retry collections' })).toBeVisible();
+		}
 	});
 }
