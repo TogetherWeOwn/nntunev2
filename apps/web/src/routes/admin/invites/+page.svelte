@@ -143,10 +143,12 @@
 		{#if rows.length}
 			<ul aria-label="Invite results">
 				{#each rows as row (row.id)}
+					{@const expiry = new Date(row.expires_at * 1000)}
 					<li>
 						<strong>Invite #{row.id}</strong> — {label(row.status)}
 						<div>Issuer: {row.issued_by ?? 'Not recorded'}</div>
-						<div>Effective expiry (UTC): {dateFormat.format(row.expires_at * 1000)}</div>
+						<!-- HTML datetime omits the leading plus sign on expanded years. -->
+						<div>Effective expiry (UTC): <time datetime={expiry.toISOString().replace(/^\+/, '')}>{dateFormat.format(expiry)}</time></div>
 						{#if row.status === 'active' || row.status === 'expired'}
 							<button class="nt-button" aria-label={`Revoke invite #${row.id}`} disabled={writing} onclick={() => revoke(row)}>Revoke</button>
 						{/if}
