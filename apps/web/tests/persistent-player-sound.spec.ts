@@ -23,6 +23,11 @@ function stored(page: Page) {
 
 test('keyboard and native sound stay in sync across routes, replacement and reload', async ({ page }) => {
 	const { audio, volume, mute } = await openLibrary(page);
+	await expect(volume).toHaveAccessibleName('Volume 100%');
+	expect(await volume.evaluate((slider: HTMLInputElement) => {
+		const label = slider.labels?.[0];
+		return Boolean(label?.htmlFor && label.htmlFor === slider.id);
+	})).toBe(true);
 	await expect(volume).toHaveValue('100');
 	await volume.press('Home');
 	await expect(audio).toHaveJSProperty('volume', 0);
@@ -38,6 +43,7 @@ test('keyboard and native sound stay in sync across routes, replacement and relo
 
 	await audio.evaluate((node: HTMLAudioElement) => { node.volume = 0.42; });
 	await expect(volume).toHaveValue('42');
+	await expect(volume).toHaveAccessibleName('Volume 42%');
 	await expect(mute).toHaveAttribute('aria-pressed', 'true');
 	const old = (await audio.elementHandle())!;
 	const nav = page.getByRole('navigation', { name: 'Primary', exact: true });

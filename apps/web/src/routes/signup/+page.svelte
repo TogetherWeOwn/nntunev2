@@ -268,14 +268,15 @@
 	{:else}
 		{#if inviteCode}<p role="status">Invite link added. Enter your email to get started.</p>{/if}
 		<form onsubmit={startAccount}>
-			<label>
+			<label for="signup-email">
 				Email
 				<input
+					id="signup-email"
 					data-testid="signup-email"
 					type="email"
 					name="email"
 					required
-					autocomplete="email"
+					autocomplete="username"
 					bind:this={emailInput}
 					aria-invalid={status === 'error'}
 					aria-describedby={status === 'error' ? 'signup-email-error' : undefined}

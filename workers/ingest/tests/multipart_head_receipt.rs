@@ -148,12 +148,13 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         upload_id: "synthetic",
     };
     let plan = Plan::new(target, sealer.header(), 1).unwrap();
-    let mut partition = plan.partition();
-    assert!(partition
-        .push(&sealer.seal_chunk(&[42]).unwrap())
-        .unwrap()
-        .is_none());
-    let part = partition.finish().unwrap().unwrap();
+    let chunk = sealer.seal_chunk(&[42]).unwrap();
+    let make_part = |plan: Plan<'static>| {
+        let mut partition = plan.partition();
+        assert!(partition.push(&chunk).unwrap().is_none());
+        partition.finish().unwrap().unwrap()
+    };
+    let part = make_part(plan);
     let (_, number, bytes, checksum) = part.request();
     let digest: [u8; 32] = Sha256::digest(bytes).into();
     let saved = CheckpointPart {
@@ -173,7 +174,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         plan,
         environment: &environment,
         library: &library,
-        session: "session",
+        session: "03030303-0303-4003-8003-030303030303",
         object: &object,
         generation: &generation,
         envelope_scheme: 2,
@@ -191,7 +192,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
             receipts(),
             &ResumeCheckpoint {
                 binding: ResumeBinding {
-                    session: "other-session",
+                    session: "09090909-0909-4009-8009-090909090909",
                     ..binding
                 },
                 ..checkpoint
@@ -225,7 +226,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         ),
         Err(PrepareError::Parts(MultipartError::Geometry))
     ));
-    for index in [1, 2] {
+    for index in [1, 2, 3, 4] {
         let mut wrong_scope = EnvelopeContext { ..context };
         wrong_scope.identities[index] = id(9);
         assert!(matches!(
@@ -233,6 +234,30 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
             Err(PrepareError::EnvelopeContextMismatch)
         ));
     }
+    let wrong_target = UploadTarget {
+        key: "media/efefefefefef40ef80efefefefefefef/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd",
+        ..target
+    };
+    let wrong_plan = Plan::new(wrong_target, sealer.header(), 1).unwrap();
+    let wrong_part = make_part(wrong_plan);
+    let wrong_binding = ResumeBinding {
+        plan: wrong_plan,
+        ..binding
+    };
+    assert!(matches!(
+        SessionCompletion::prepare(
+            wrong_binding,
+            &context,
+            vec![wrong_part
+                .verify_reply(saved.etag.into(), checksum)
+                .unwrap()],
+            &ResumeCheckpoint {
+                binding: wrong_binding,
+                ..checkpoint
+            }
+        ),
+        Err(PrepareError::EnvelopeContextMismatch)
+    ));
     let completion =
         SessionCompletion::prepare(binding, &context, receipts(), &checkpoint).unwrap();
     assert!(completion.manifest().eq([(1, saved.etag, checksum)]));
@@ -264,7 +289,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         })
     };
     let completed = verify(body.as_bytes(), &["pinned-version"]).unwrap();
-    assert_eq!(completed.metadata().locator(), &observed);
+    assert!(completed.metadata().locator() == &observed);
     assert_eq!(
         completed.verify_head(&context, Some(head(&observed))),
         Ok(())

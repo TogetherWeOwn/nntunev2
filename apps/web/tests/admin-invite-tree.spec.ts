@@ -173,6 +173,28 @@ test('rejects a successful response for a different node without displaying its 
 	expect(calls).toEqual([tree(root)]);
 });
 
+for (const action of [branch, 'Load more', 'Restart lookup']) test(`refuses stale tree action ${action} before storage delivery`, async ({ page }) => {
+	const next = `${tree(root)}?cursor=${cursor}`;
+	const calls = await mock(page, (route, target) => target === next
+		? route.fulfill({ status: 422, json: {} })
+		: route.fulfill({ json: target === tree(root) ? result(root, null, [branch], cursor) : result(leaf, null, []) }));
+	await page.goto(path);
+	await lookup(page, root);
+	await expect(selected(page)).toBeVisible();
+	if (action === 'Restart lookup') await more(page).click();
+	const stale = page.getByRole('button', { name: action, exact: true });
+	await stale.evaluate((button: HTMLButtonElement, key) => {
+		localStorage.setItem(key, 'replacement-session');
+		button.click();
+	}, generationKey);
+	await expect(page.getByRole('alert')).toContainText('Invite tree unavailable');
+	await expect(selected(page)).toHaveCount(0);
+	await lookup(page, leaf);
+	await expect(selected(page)).toBeVisible();
+	expect(calls).toEqual(action === 'Restart lookup'
+		? [tree(root), next, tree(leaf)] : [tree(root), tree(leaf)]);
+});
+
 test('clears IDs on cross-tab generation loss or page restore without replaying the lookup', async ({ page, context }) => {
 	const calls = await mock(page, (route) => route.fulfill({ json: result(root, null, [leaf]) }));
 	await page.goto(path);

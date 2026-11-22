@@ -3,12 +3,11 @@
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { beforeNavigate } from '$app/navigation';
 	import { ADMIN_INVITE_BATCH_MAX, ApiClient, ApiError, INVITE_POLICY_BOUNDS, isInvitePolicyValue } from '#lib/api/client.js';
-	import { captureAuthFence, subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
+	import { observeAccountSession, type AccountSession as Fence } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 
-	type Fence = NonNullable<Awaited<ReturnType<typeof captureAuthFence>>>;
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	const account = observeAccountSession(clear);
 	const [min, max] = INVITE_POLICY_BOUNDS.invite_default_expiry_days;
 	const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 	const unavailable = 'Invite creation is unavailable. Reopen this page to check admin access.';
@@ -44,24 +43,25 @@
 	}
 
 	onMount(() => {
-		const lifetime = new AbortController();
-		subscribeAuthFenceInvalidation(() => clear(), lifetime.signal);
 		const unsubscribe = subscribeLocalAuthTransition(() => clear());
 		void authorize();
-		return () => { lifetime.abort(); unsubscribe(); clear(); };
+		return () => { account.dispose(); unsubscribe(); clear(); };
 	});
 
 	beforeNavigate(() => clear());
 
-	async function run<T>(send: (signal: AbortSignal) => Promise<T>, apply: (value: T, fence: Fence) => void,
+	async function run<T>(send: (client: ApiClient, signal: AbortSignal) => Promise<T>, apply: (value: T, fence: Fence) => void,
 		fail: (cause: unknown) => void) {
+		const previous = owner;
+		account.prepare();
 		const attempt = new AbortController();
 		request = attempt;
 		try {
-			const fence = owner ?? await captureAuthFence();
+			const fence = previous ?? await account.capture();
 			// Box the promise: hold the auth lock for dispatch and publication, not the network wait.
 			const sent = fence && await fence.run(() => attempt.signal.aborted ? undefined : {
-				result: send(attempt.signal).then((value) => () => apply(value, fence), (cause) => () => fail(cause))
+				result: send(new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session: { owner: fence } }), attempt.signal)
+					.then((value) => () => apply(value, fence), (cause) => () => fail(cause))
 			});
 			const publish = sent && await sent.result;
 			const applied = publish && await fence?.run(() => {
@@ -78,7 +78,7 @@
 
 	function authorize() {
 		clear('');
-		return run((signal) => client.listAdminInvites(null, signal), (_, fence) => { owner = fence; },
+		return run((client, signal) => client.listAdminInvites(null, signal), (_, fence) => { owner = fence; },
 			() => clear());
 	}
 
@@ -109,7 +109,7 @@
 			error = `Enter a whole number from ${min} to ${max}, or leave expiry blank.`;
 			return;
 		}
-		await run(async (signal) => {
+		await run(async (client, signal) => {
 			writeInFlight = true;
 			if (isBatch) return client.issueAdminInviteBatch({ count: size, expires_in_days: days }, signal);
 			const { code, expires_at } = await client.issueAdminInvite({ email: address || undefined, expires_in_days: days }, signal);

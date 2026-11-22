@@ -20,9 +20,11 @@ pub enum PrepareError {
 }
 
 impl<'a> SessionCompletion<'a> {
-    /// Use the binding from the authorized session and locally verified parts.
-    /// A matching prefix alone is insufficient: completion needs every part.
-    /// Scope and lifecycle IDs in the binding use compact lowercase UUIDs.
+    /// Use the binding from the authorized session, its trusted checkpoint and
+    /// locally verified parts. The caller enforces reservation ownership,
+    /// request fingerprint, lease and expiry before any provider operation.
+    /// Environment, library, object and generation use compact lowercase UUIDs.
+    /// The session ID is the exact identity from the trusted reservation.
     pub fn prepare(
         expected: ResumeBinding<'a>,
         context: &'a EnvelopeContext,
@@ -33,10 +35,17 @@ impl<'a> SessionCompletion<'a> {
             return Err(PrepareError::CheckpointMismatch);
         }
         let [_, environment, library, object, generation, _] = context.identities;
+        let media_key = expected
+            .plan
+            .target
+            .key
+            .strip_prefix("media/")
+            .and_then(|key| key.split_once('/'));
         if expected.environment != hex::encode(environment)
             || expected.library != hex::encode(library)
             || expected.object != hex::encode(object)
             || expected.generation != hex::encode(generation)
+            || media_key != Some((expected.object, expected.generation))
             || expected.plan.header != context.header
             || expected.plan.plaintext_len != context.plaintext_len
         {
@@ -57,7 +66,9 @@ impl<'a> SessionCompletion<'a> {
     }
 
     /// Capture the media version from the same completion response as the
-    /// checksum. Use the trusted session's context and issue HEAD against this pin.
+    /// checksum, using the trusted session's context. Use this exact pin for
+    /// subsequent HEAD and authenticated readback. The receipt conveys no
+    /// publication authority.
     pub fn verify_completion(
         &self,
         reply: VersionedCompletionReply<'_>,

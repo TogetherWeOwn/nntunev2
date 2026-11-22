@@ -15,7 +15,6 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 	let owner = $state.raw<TrackLikeOwner & { targets: Map<string, string | undefined> }>();
 	let feedback = $state('');
 	const writes = new Map<string, Set<Promise<unknown>>>();
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
 	const controls = createTrackLikeControls(() => owner, (binding, result) => {
 		const pending = writes.get(binding) ?? new Set();
 		writes.set(binding, pending);
@@ -41,10 +40,11 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 
 	async function publish(receipt: LibraryRefreshUpdate, items: readonly LibraryItem[]) {
 		retire();
-		const { sessionBinding: binding, runIfCurrent: run } = receipt;
-		if (!binding || !run || !receipt.isCurrent() || !receipt.authoritative || receipt.authBoundary) return;
+		const { sessionBinding: binding, accountSession, runIfCurrent: run } = receipt;
+		if (!binding || !accountSession || !run || !receipt.isCurrent() || !receipt.authoritative || receipt.authBoundary) return;
 		const { signal } = active = new AbortController();
-		const readClient = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal });
+		const session = { owner: accountSession, binding };
+		const readClient = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal, session });
 		const guarded = <T,>(work: () => T) => run(() => {
 			if (!signal.aborted && receipt.isCurrent()) return work();
 		});
@@ -60,7 +60,8 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 			const list = await read.likes;
 			if (list?.binding !== binding) throw new Error('Likes session could not be verified');
 			const saved = await read.taste;
-			const check = await guarded(() => ({ response: verifyLibrarySession(binding, signal).catch(() => false) }));
+			const verify = () => verifyLibrarySession(binding, signal, accountSession).catch(() => false);
+			const check = await guarded(() => ({ response: verify() }));
 			if (!check) return;
 			if (!await check.response) throw new Error('Likes session could not be verified');
 			await guarded(() => {
@@ -71,7 +72,7 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 				// Explicit taste rows and confirmed writes take precedence over the Likes snapshot.
 				const preferences = new SvelteMap<string, TrackTaste | null>(saved?.tracks);
 				owner = {
-					binding, client, targets, readiness: () => receipt,
+					binding, client: new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session }), targets, readiness: () => receipt,
 					liked: (id) => preferences.has(id) ? preferences.get(id)?.signal === 'love' : liked.has(id) || unlisted,
 					confirm: (id, confirmedId, value) => {
 						if (id !== confirmedId) return invalidate();
@@ -84,7 +85,7 @@ export function createLibraryTrackLikes(onInvalidated?: () => void) {
 					},
 					taste: saved && {
 						read: (id) => preferences.has(id) ? preferences.get(id) : saved.complete ? null : undefined,
-						verify: () => verifyLibrarySession(binding, signal),
+						verify,
 						invalidate,
 						confirm: (id, value) => {
 							preferences.set(id, value);

@@ -619,10 +619,9 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         }
     }
     // The production redemption transaction lives outside worker_entry:
-    // slice its `tokio_postgres::Transaction` impl (comments stripped,
+    // slice its `PgTransaction` impl (comments stripped,
     // whitespace normalized, like `production()` above) and pin the
-    // same rule. `SET LOCAL` stays on `batch_execute` (simple-query
-    // protocol, never a named prepared statement).
+    // same rule. The wrapper owns the fixed `SET LOCAL` command.
     let redemption: String = include_str!("../src/magic_redemption.rs")
         .split_once("#[cfg(all(test,")
         .expect("magic_redemption test-module boundary")
@@ -634,7 +633,7 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         .filter(|ch| !ch.is_whitespace())
         .collect();
     let pg_impl = redemption
-        .split_once("implRedemptionTransactionfortokio_postgres::Transaction<'_>{")
+        .split_once("implRedemptionTransactionforPgTransaction<'_>{")
         .expect("production redemption transaction impl")
         .1
         .split_once("pub(crate)asyncfnredeem(")
