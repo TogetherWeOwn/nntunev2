@@ -489,6 +489,9 @@ jobs:
           persist-credentials: false
       - name: Verify Python version
         run: python3 -c "import sys, tomllib; assert sys.version_info >= (3, 11), sys.version"
+      # Keep the default PR integration checkout. Its first parent pairs
+      # with that exact tree; the payload's base.sha can be stale. Pushes
+      # still compare event.before, including pushes of merge commits.
       - name: Check migration manifest and drift
         env:
           MIGRATIONS_BASE_REF: ${{ needs.ci-commits.outputs.base_sha }}
