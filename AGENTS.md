@@ -18,6 +18,13 @@ thread when the work is complete.
 [CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) defines review
 tiers, exact-commit evidence and merge authority.
 
+Delegated implementation stays within the assigned worktree and file scope.
+The task owner handles commits, pushes, PRs and integration. Implementation
+helpers report changed files, dependencies, integration risks and verification,
+including any checks they skipped. Search and triage helpers use read-only
+inspection and report findings with file and line references, including where
+they looked when evidence is missing.
+
 The repository owner decides class-B design and policy changes. The owner
 is the sole production approver and holds the Release Manager authority
 named in the runbook and workflows. Stop and ask for explicit authorization
@@ -30,6 +37,39 @@ Keep staging and production storage separate, and keep scratch data out of
 archive buckets. Existing access, retention and deletion controls apply to
 all environments. See the [storage boundary ADR](docs/adr/0015-standard-s3-storage-boundary.md)
 and [bucket inventory](docs/ops.md#cloudflare).
+
+### Model selection and effort
+
+T3 Code selects the provider, model and effort for each thread through the
+project default, a thread's launch selection or an independent reviewer's
+target. The repository owner chooses the harness. Use the project default
+when launching task threads and apply any task-specific model choice at
+dispatch. Follow the independent cross-family review requirements in
+[CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) based on the model that ran
+each review. Include [REVIEW.md](REVIEW.md) in each independent review brief.
+
+- Use `claude-opus-5-5` whenever selecting Opus. Name that exact model ID
+  in task, review and child briefs that request Opus, and set the effort
+  explicitly. Use `medium` effort by default for tasks and reviews. Use
+  `high` or `xhigh` only when the brief documents why the task needs it.
+- Use `high` effort by default for Sol. Use `xhigh` only when the brief
+  justifies it.
+- Never use `max`, `ultra` or `ultrathink` on any model.
+
+Keep model and effort policy here. Leave model selection to T3 Code and
+keep repository harness configuration free of model pins, model-selection
+environment variables and model-forcing hooks. The root `CLAUDE.md` imports
+these shared instructions.
+
+## Shell cleanup
+
+Never use forced `rm`, including `rm -f`, `rm -rf` or `rm --force`. This
+applies inside trap cleanups, `bash -lc` strings and all other wrappers.
+Use `rm -r -- "$dir"` for a directory and `rm -- "$file"` for a file. If
+cleanup is optional and the path might be absent, check for it first.
+
+Report shell approval prompts to the task lead with the exact command
+shape. Preserve the flags and wrapper and redact sensitive literals.
 
 ## CI and verification location
 

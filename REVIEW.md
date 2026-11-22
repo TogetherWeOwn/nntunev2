@@ -5,10 +5,13 @@
 Review in English. Find defects this PR introduces or makes reachable.
 The task thread commissions independent read-only review according to
 [the review tier](CONTRIBUTING.md#merge-policy). Review the supplied full PR
-head SHA and diff independently before sharing findings. Verify the required
-tier against the template and review map and flag any escalation. Record
-the reviewed SHA, verified model and tier with the findings.
-Do not approve, merge, enable auto-merge, edit code or start fix sessions.
+head SHA and its diff against the base independently before sharing findings.
+Verify the required tier against the template and review map and flag any
+escalation. Record the reviewed SHA, verified model and tier with the
+findings, and flag any uncertainty about which model ran.
+Use read-only inspection and Actions evidence for independent review. Route
+any focused reproduction to the task owner. Do not approve, merge, enable
+auto-merge, edit code or start fix sessions.
 The task owner acts on findings and verifies the required GitHub checks.
 
 Read `README.md` (architecture choices are normative there), `AGENTS.md`,
@@ -34,9 +37,11 @@ At the reviewed head, compare the changed instructions with the PR base,
 the PR template and any workflows they reference. For the sections touched,
 check that the rules agree across files and supported entry points:
 
-- Open `CLAUDE.md` and verify its root import resolves to `AGENTS.md`.
-  Inspect changed `.claude/agents` front matter and tool lists for valid
-  settings and the intended scope of each helper.
+- Verify that `CLAUDE.md` contains only `@AGENTS.md` and a terminating
+  newline, and that the import resolves to the root `AGENTS.md`. Check
+  that shared instructions cover the affected roles, model selection
+  follows [the AGENTS.md policy](AGENTS.md#model-selection-and-effort),
+  and tracked harness files introduce no overrides.
 - Trace the review and release instructions from task ownership through
   Attestation, review, CI, merge and production approval. Check cited gates
   against their workflow definitions and the effective branch rules.
