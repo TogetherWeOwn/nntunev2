@@ -2133,12 +2133,36 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
+  changed-lines-mutation:
+    name: changed-lines-mutation
+    needs: ci-commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove the mutation verdict on synthetic PR diffs
+        if: github.event_name == 'pull_request'
+        run: python3 -B .github/scripts/test_check_changed_lines_mutants.py
+      - name: Report the rollout phase and evaluate the tested PR diff
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: python3 -B .github/scripts/check_changed_lines_mutants.py
+        env:
+          MUTATION_BASE_SHA: ${{ needs.ci-commits.outputs.base_sha }}
+          MUTATION_MERGE_SHA: ${{ needs.ci-commits.outputs.merge_sha }}
+      - name: Record the non-PR skip
+        if: github.event_name != 'pull_request' && !(github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: echo 'Mutation skipped because this run has no pull request diff.' | tee -a "$GITHUB_STEP_SUMMARY"
+
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped. GitHub's needs
   # names job IDs, not matrix legs: the web-e2e entry covers both shards.
   ci-ok:
     name: ci-ok
-    needs: [ci-commits, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
+    needs: [ci-commits, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds, changed-lines-mutation]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

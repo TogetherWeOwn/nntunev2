@@ -96,6 +96,17 @@ identity, migration and rollback evidence, and review and merge gates. Follow
 [the staging promotion checklist](docs/ops.md#staging-promotion-checklist)
 for release evidence. Explicitly state what was not run.
 
+### Changed-lines mutation gate
+
+`changed-lines-mutation` checks new single-line boundaries in `scripts/account_export.py`
+and `scripts/genre_root_coverage.py` against the tested PR merge's first parent.
+
+The UTC warning window runs for seven days from the first gate commit on
+`main`, then new survivors fail `ci-ok`. Baseline and runner failures always
+block. Push after retargeting or to refresh a warning verdict once enforcement
+starts. Add the standalone context only after passing runs on merged `main`
+and two later PRs. Record all three job URLs.
+
 ## Pull-request size
 
 Keep each PR to about **400 counted lines** or fewer, counted as the
