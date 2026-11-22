@@ -759,9 +759,10 @@ export class ApiClient {
 			if (session && !session.owner.isCurrent()) throw new DOMException('Account session ended', 'AbortError');
 		};
 		assertCurrent();
-		const onAbort = (event: Event) => controller.abort((event.currentTarget as AbortSignal).reason);
-		callerSignal?.addEventListener('abort', onAbort, { once: true });
-		retirement?.addEventListener('abort', onAbort, { once: true });
+		const onCallerAbort = () => controller.abort(callerSignal?.reason);
+		const onRetire = () => controller.abort(retirement?.reason);
+		callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
+		retirement?.addEventListener('abort', onRetire, { once: true });
 		let timedOut = false;
 		const timer = setTimeout(() => {
 			timedOut = true;
@@ -855,8 +856,8 @@ export class ApiClient {
 			throw error;
 		} finally {
 			clearTimeout(timer);
-			callerSignal?.removeEventListener('abort', onAbort);
-			retirement?.removeEventListener('abort', onAbort);
+			callerSignal?.removeEventListener('abort', onCallerAbort);
+			retirement?.removeEventListener('abort', onRetire);
 		}
 	}
 
