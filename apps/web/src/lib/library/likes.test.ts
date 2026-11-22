@@ -12,7 +12,9 @@ const run = async <T>(work: () => T) => work();
 function mockClient(...responses: Response[]) {
 	const fetchFn = vi.fn<typeof fetch>();
 	for (const response of responses) fetchFn.mockResolvedValueOnce(response);
-	return { client: new ApiClient({ baseUrl: BASE, fetchFn }), fetchFn };
+	const owner = { generation: 'test', signal: new AbortController().signal, isCurrent: () => true, run };
+	const boundClient = (binding?: string) => new ApiClient({ baseUrl: BASE, fetchFn, session: { owner, binding } });
+	return { client: boundClient(), boundClient, fetchFn };
 }
 
 function currentScope() {
@@ -61,12 +63,13 @@ describe('server likes', () => {
 	});
 
 	it('sends exact IDs on both methods and returns the acknowledged identity', async () => {
-		const { client, fetchFn } = mockClient(
+		const { boundClient, fetchFn } = mockClient(
 			Response.json({ target_id: JOB, liked_at: 1 }),
 			Response.json({ target_id: MBID, liked: false })
 		);
-		await expect(setTrackLike(client, JOB, true, binding)).resolves.toBe(JOB);
-		await expect(setTrackLike(client, JOB, false, binding)).resolves.toBe(MBID);
+		const client = boundClient(binding);
+		await expect(setTrackLike(client, JOB, true)).resolves.toBe(JOB);
+		await expect(setTrackLike(client, JOB, false)).resolves.toBe(MBID);
 		expect(fetchFn).toHaveBeenNthCalledWith(1, `${LIKES}/track/${JOB}`, expect.objectContaining({
 			method: 'PUT', credentials: 'include', body: '{}',
 			headers: expect.objectContaining({ 'x-nntune-session-binding': binding })
@@ -79,23 +82,23 @@ describe('server likes', () => {
 	});
 
 	it.each([true, false])('does not fetch without a canonical binding when setting liked to %s', async (liked) => {
-		const { client, fetchFn } = mockClient();
-		// @ts-expect-error The transport requires a binding; untyped callers also fail closed.
+		const { client, boundClient, fetchFn } = mockClient();
 		await expect(setTrackLike(client, JOB, liked)).rejects.toThrow('verified session binding');
-		await expect(setTrackLike(client, JOB, liked, `${binding.slice(1)}B`)).rejects.toThrow('verified session binding');
+		expect(() => boundClient(`${binding.slice(1)}B`)).toThrow('verified session binding');
 		expect(fetchFn).not.toHaveBeenCalled();
 	});
 
 	it.each([true, false])('rejects a contradictory receipt when setting liked to %s', async (liked) => {
-		const { client } = mockClient(Response.json({ target_id: JOB, liked_at: 1, liked: false }));
-		await expect(setTrackLike(client, JOB, liked, binding)).rejects.toThrow('Invalid like confirmation');
+		const { boundClient } = mockClient(Response.json({ target_id: JOB, liked_at: 1, liked: false }));
+		await expect(setTrackLike(boundClient(binding), JOB, liked)).rejects.toThrow('Invalid like confirmation');
 	});
 
 	it('never sends an occurrence key or accepts a different opaque job receipt', async () => {
-		const { client, fetchFn } = mockClient(Response.json({ target_id: 'job_a', liked_at: 1 }));
-		await expect(setTrackLike(client, 'Job_A:2', true, binding)).rejects.toThrow('Invalid track ID');
+		const { boundClient, fetchFn } = mockClient(Response.json({ target_id: 'job_a', liked_at: 1 }));
+		const client = boundClient(binding);
+		await expect(setTrackLike(client, 'Job_A:2', true)).rejects.toThrow('Invalid track ID');
 		expect(fetchFn).not.toHaveBeenCalled();
-		await expect(setTrackLike(client, 'Job_A', true, binding)).rejects.toThrow('Invalid like confirmation');
+		await expect(setTrackLike(client, 'Job_A', true)).rejects.toThrow('Invalid like confirmation');
 	});
 });
 

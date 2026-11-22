@@ -11,7 +11,9 @@ const session = (binding: string) => Response.json({ session_binding: binding })
 const list = (binding: string, items: unknown[] = []) => Response.json({ session_binding: binding, items });
 
 function listing(sessionBinding = A): LibraryRefreshUpdate {
-	return { sessionBinding, authoritative: true, authBoundary: false, isCurrent: () => true, runIfCurrent: async (work) => work() };
+	const isCurrent = () => true, runIfCurrent = async <T,>(work: () => T) => work();
+	const accountSession = { generation: sessionBinding, signal: new AbortController().signal, isCurrent, run: runIfCurrent };
+	return { sessionBinding, accountSession, authoritative: true, authBoundary: false, isCurrent, runIfCurrent };
 }
 
 function setup() {

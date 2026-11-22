@@ -2,26 +2,25 @@
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { onMount } from 'svelte';
 	import { ApiClient, ApiError } from '../api/client.js';
-	import { captureAuthFence } from '../auth-fence.js';
+	import { captureAuthFence, type AccountSession } from '../auth-fence.js';
 	import { browserStorage, verifiedFavoritesKey } from './cache.js';
 	import { importDeviceLikes, loadLikes, type LibraryLike } from './likes.js';
 	import { verifyLibrarySession } from './session-verification.js';
 
-	type Fence = NonNullable<Awaited<ReturnType<typeof captureAuthFence>>>;
 	let { titles, libraryBinding, deviceScope, deviceCount, readDeviceIds, retireDeviceIds, onSessionChanged, onVerificationSuspended }: {
 		titles: ReadonlyMap<string, string>;
 		libraryBinding?: string;
 		deviceScope?: string;
 		deviceCount: number;
 		readDeviceIds: () => string[];
-		retireDeviceIds: (key: string, ids: readonly string[], verify: () => Promise<boolean>, run: Fence['run']) => Promise<boolean>;
+		retireDeviceIds: (key: string, ids: readonly string[], verify: () => Promise<boolean>, run: AccountSession['run']) => Promise<boolean>;
 		onSessionChanged: () => void;
 		onVerificationSuspended: () => void;
 	} = $props();
 	let phase = $state<'loading' | 'ready' | 'sign-in' | 'error'>('loading');
 	let likes = $state<LibraryLike[]>([]);
 	let shelfBinding = $state<string>();
-	let shelfFence: Fence | undefined;
+	let shelfSession: AccountSession | undefined;
 	let importing = $state(false), feedback = $state('');
 	let active: AbortController | undefined;
 	const songs = $derived(likes.filter((like) => like.kind === 'track'));
@@ -29,8 +28,12 @@
 
 	function begin() {
 		active?.abort();
-		const request = active = new AbortController();
-		return { signal: request.signal, client: new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal }) };
+		active = new AbortController();
+		return active.signal;
+	}
+
+	function clientFor(owner: AccountSession, signal: AbortSignal) {
+		return new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal, session: { owner } });
 	}
 
 	function sessionChanged() {
@@ -38,17 +41,17 @@
 		onSessionChanged();
 	}
 
-	async function read({ client, signal }: ReturnType<typeof begin>, fence: Fence, expected?: string) {
-		const run: Fence['run'] = (work) => fence.run(() => signal.aborted ? undefined : work());
+	async function read(signal: AbortSignal, owner: AccountSession, expected?: string) {
+		const run: AccountSession['run'] = (work) => owner.run(() => signal.aborted ? undefined : work());
 		try {
-			const started = await run(() => ({ response: loadLikes(client) }));
+			const started = await run(() => ({ response: loadLikes(clientFor(owner, signal)) }));
 			if (!started) return;
 			const result = await started.response;
-			const matches = await verify(run, result.binding, signal);
+			const matches = await verify(run, result.binding, signal, owner);
 			if (matches === undefined) return;
 			await run(() => {
 				if (!matches || (expected && expected !== result.binding)) return sessionChanged();
-				shelfFence = fence;
+				shelfSession = owner;
 				shelfBinding = result.binding;
 				likes = result.items;
 				phase = 'ready';
@@ -56,43 +59,42 @@
 		} catch (error) {
 			await run(() => { phase = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error'; });
 		} finally {
-			if (!signal.aborted && !fence.isCurrent()) onVerificationSuspended();
+			if (!signal.aborted && !owner.isCurrent()) onVerificationSuspended();
 			else if (!signal.aborted && phase === 'loading') phase = 'error';
 		}
 	}
 
 	// Box the request so the lock covers dispatch, never the network wait.
-	async function verify(run: Fence['run'], binding: string, signal: AbortSignal) {
-		return (await run(() => ({ response: verifyLibrarySession(binding, signal) })))?.response;
+	async function verify(run: AccountSession['run'], binding: string, signal: AbortSignal, owner: AccountSession) {
+		return (await run(() => ({ response: verifyLibrarySession(binding, signal, owner) })))?.response;
 	}
 
 	async function load() {
-		const request = begin(), expected = libraryBinding;
+		const signal = begin(), expected = libraryBinding;
 		phase = 'loading';
-		const fence = await captureAuthFence();
-		if (request.signal.aborted) return;
-		if (!fence) { phase = 'error'; return; }
-		await read(request, fence, expected);
+		const owner = await captureAuthFence();
+		if (signal.aborted) return;
+		if (!owner) { phase = 'error'; return; }
+		await read(signal, owner, expected);
 	}
 
 	async function importLikes() {
-		const binding = shelfBinding, fence = shelfFence, key = deviceScope;
-		if (phase !== 'ready' || importing || !canImport || !binding || !fence || !key) return;
-		const request = begin();
-		const { signal, client } = request;
+		const binding = shelfBinding, owner = shelfSession, key = deviceScope;
+		if (phase !== 'ready' || importing || !canImport || !binding || !owner || !key) return;
+		const signal = begin();
 		const session = browserStorage('session');
-		const isCurrent = () => !signal.aborted && fence.isCurrent() && libraryBinding === binding &&
+		const isCurrent = () => !signal.aborted && owner.isCurrent() && libraryBinding === binding &&
 			deviceScope === key && verifiedFavoritesKey(session, binding) === key;
-		const run: Fence['run'] = (work) => fence.run(() => isCurrent() ? work() : undefined);
+		const run: AccountSession['run'] = (work) => owner.run(() => isCurrent() ? work() : undefined);
 		importing = true;
 		feedback = '';
 		try {
 			const ids = await run(readDeviceIds);
 			if (!ids?.length) return;
-			const outcome = await importDeviceLikes(client, ids, {
+			const outcome = await importDeviceLikes(clientFor(owner, signal), ids, {
 				binding, isCurrent, run,
 				retireConfirmed: (confirmed) => retireDeviceIds(key, confirmed, async () => {
-					const matches = await verify(run, binding, signal);
+					const matches = await verify(run, binding, signal, owner);
 					if (matches === false && !signal.aborted) sessionChanged();
 					return matches === true;
 				}, run)
@@ -111,8 +113,8 @@
 			if (error instanceof ApiError && (error.status === 401 || error.status === 412)) sessionChanged();
 			else await run(() => { feedback = 'Import could not finish. Unconfirmed favorites are still on this device.'; });
 		} finally {
-			if (!signal.aborted && !fence.isCurrent()) onVerificationSuspended();
-			if (isCurrent()) await read(request, fence, binding);
+			if (!signal.aborted && !owner.isCurrent()) onVerificationSuspended();
+			if (isCurrent()) await read(signal, owner, binding);
 			if (active?.signal === signal) importing = false;
 		}
 	}
