@@ -1,7 +1,9 @@
 //! S3 ciphertext range validation and bounded body reading. No transport wiring.
 
 use nntune_core::{
-    digest_geometry::RangeGeometry, digest_readback::ReadbackBody, s3_locator::S3Binding,
+    digest_geometry::RangeGeometry,
+    digest_readback::ReadbackBody,
+    s3_locator::{S3Binding, S3Locator},
 };
 
 use crate::range::{content_range_value, ByteRange};
@@ -26,38 +28,54 @@ pub enum S3RangeResponseError {
     Body,
 }
 
-/// Read one planned sealed chunk, never the full covered range. `is_live`
-/// checks the committed read deadline; the transport must also cancel any
-/// pending read at that deadline. Success still requires digest/AEAD verification.
+/// Read one planned sealed chunk. For protected playback, the expected locator
+/// must come from the authorized reference's confirmed lookup commit. The
+/// request locator records what the transport actually used with the trusted
+/// provider configuration. Supply the binding observed in the response.
+/// `is_live` must require time strictly before the returned `usable_until`;
+/// the transport must cancel pending I/O at that deadline. Verify digest/AEAD
+/// before releasing plaintext.
 pub async fn read_s3_range_chunk(
     plan: RangeGeometry,
     index: u32,
-    expected_binding: &S3Binding,
+    expected_locator: &S3Locator,
+    requested_locator: &S3Locator,
     response: S3RangeResponse<'_>,
     mut body: impl ReadbackBody,
     mut is_live: impl FnMut() -> bool,
 ) -> Result<Vec<u8>, S3RangeResponseError> {
     use S3RangeResponseError::*;
 
+    if !is_live() {
+        return Err(Expired);
+    }
+    if requested_locator != expected_locator {
+        return Err(ObjectIdentity);
+    }
     let chunk = plan.sealed_chunk(index).ok_or(NoCiphertext)?;
-    let len = validate_s3_range_metadata(plan, chunk.ciphertext, expected_binding, response)?;
+    let len =
+        validate_s3_range_metadata(plan, chunk.ciphertext, expected_locator.binding(), response)?;
     let mut bytes = vec![0; len as usize];
     let mut remaining = bytes.as_mut_slice();
-    loop {
+    while !remaining.is_empty() {
+        let result = body.read(remaining).await;
         if !is_live() {
             return Err(Expired);
         }
-        if remaining.is_empty() {
-            if body.read(&mut [0]).await.map_err(|_| Body)? != 0 {
-                return Err(Length);
-            }
-            return is_live().then_some(bytes).ok_or(Expired);
-        }
-        let count = body.read(remaining).await.map_err(|_| Body)?;
+        let count = result.map_err(|_| Body)?;
         if count == 0 {
             return Err(Length);
         }
         remaining = remaining.get_mut(count..).ok_or(Body)?;
+    }
+    let eof = body.read(&mut [0]).await;
+    if !is_live() {
+        return Err(Expired);
+    }
+    match eof {
+        Ok(0) => Ok(bytes),
+        Ok(1) => Err(Length),
+        _ => Err(Body),
     }
 }
 
@@ -116,12 +134,20 @@ fn validate_s3_range_metadata(
 mod tests {
     use super::*;
     use crate::range::plan_encrypted_range;
-    use nntune_core::digest_geometry::DigestGeometry;
+    use nntune_core::{
+        digest_enrollment::DigestEnrollment,
+        digest_geometry::DigestGeometry,
+        digest_range::DigestRange,
+        media_envelope::{wrap_scheme2, EnvelopeContext},
+        s3_locator::S3MediaMetadata,
+    };
+    use std::cell::Cell;
 
-    struct SliceBody<'a>(&'a [u8]);
+    struct SliceBody<'a>(&'a [u8], &'a Cell<usize>);
 
     impl ReadbackBody for SliceBody<'_> {
         async fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+            self.1.set(self.1.get() + 1);
             std::io::Read::read(&mut self.0, dst)
         }
     }
@@ -130,38 +156,147 @@ mod tests {
     async fn reads_only_a_complete_chunk_before_expiry() {
         use S3RangeResponseError::*;
 
-        let plan = DigestGeometry::new(65_537)
+        let id = |n| {
+            let mut bytes = [n; 16];
+            bytes[6] = 0x40;
+            bytes[8] = 0x80;
+            bytes
+        };
+        let mut enrollment =
+            DigestEnrollment::new(65_537, [id(1), id(2), id(3), id(4), id(5)], id(6)).unwrap();
+        let context = EnvelopeContext {
+            identities: [id(7), id(1), id(2), id(3), id(4), id(5)],
+            plaintext_len: 65_537,
+            header: enrollment.header().to_bytes(),
+        };
+        let root = [0xa5; 32];
+        let record = wrap_scheme2(&root, &context, enrollment.key().expose_secret()).unwrap();
+        enrollment.seal_chunk(&vec![0; 65_536]).unwrap();
+        let final_chunk = enrollment.seal_chunk(b"x").unwrap();
+        let manifest = enrollment.finish().ok().unwrap();
+
+        let key = "media/03030303030340038003030303030303/04040404040440048004040404040404";
+        let locate = |bucket: &str, key: &str, version: &str| {
+            S3Locator::new(
+                bucket.into(),
+                key.into(),
+                S3Binding::VersionId(version.into()),
+            )
             .unwrap()
-            .range(0, 65_537)
+        };
+        let media = S3MediaMetadata::from_trusted_context(
+            locate("fixture-media", key, "media-pin"),
+            &context,
+        )
+        .unwrap();
+        let expected = media.locator();
+        let plan = DigestGeometry::new(media.plaintext_len())
+            .unwrap()
+            .range(65_536, 65_537)
             .unwrap();
-        let binding = S3Binding::VersionId("v1".into());
         let response = S3RangeResponse {
             status: 206,
             content_range: Some("bytes 65600-65616/65617"),
             content_length: Some(17),
-            binding: Some(&binding),
+            binding: Some(expected.binding()),
         };
-        let data = [0xa5; 18];
-        for (len, expected) in [
-            (16, Err(Length)),
-            (17, Ok(data[..17].to_vec())),
-            (18, Err(Length)),
-        ] {
-            let actual =
-                read_s3_range_chunk(plan, 1, &binding, response, SliceBody(&data[..len]), || {
-                    true
-                })
-                .await;
-            assert_eq!(actual, expected);
+        let reads = Cell::new(0);
+        let data = &final_chunk.bytes;
+        let mut trailing = data.clone();
+        trailing.push(0);
+        for incomplete_body in [&data[..16], &trailing] {
+            assert_eq!(
+                read_s3_range_chunk(
+                    plan,
+                    1,
+                    expected,
+                    expected,
+                    response,
+                    SliceBody(incomplete_body, &reads),
+                    || true,
+                )
+                .await,
+                Err(Length)
+            );
         }
-        let mut checks = 0;
-        let expired =
-            read_s3_range_chunk(plan, 1, &binding, response, SliceBody(&data[..17]), || {
-                checks += 1;
-                checks < 3 // Expire just as the EOF probe completes.
-            })
-            .await;
-        assert_eq!(expired, Err(Expired));
+
+        let other_object = key.replacen("030303", "050505", 1);
+        let wrong_version = S3Binding::VersionId("other-version".into());
+        for (requested, observed) in [
+            (locate("other-bucket", key, "media-pin"), response),
+            (
+                locate("fixture-media", &other_object, "media-pin"),
+                response,
+            ),
+            (locate("fixture-media", key, "other-version"), response),
+            (
+                expected.clone(),
+                S3RangeResponse {
+                    binding: Some(&wrong_version),
+                    ..response
+                },
+            ),
+        ] {
+            reads.set(0);
+            assert_eq!(
+                read_s3_range_chunk(
+                    plan,
+                    1,
+                    expected,
+                    &requested,
+                    observed,
+                    SliceBody(data, &reads),
+                    || true
+                )
+                .await,
+                Err(ObjectIdentity)
+            );
+            assert_eq!(reads.get(), 0);
+        }
+
+        // Expire before the first read, after the body, and at completion of the EOF probe.
+        for deadline in 0..=2 {
+            reads.set(0);
+            assert_eq!(
+                read_s3_range_chunk(
+                    plan,
+                    1,
+                    expected,
+                    expected,
+                    response,
+                    SliceBody(data, &reads),
+                    || reads.get() < deadline
+                )
+                .await,
+                Err(Expired)
+            );
+            assert_eq!(reads.get(), deadline);
+        }
+        let sealed = read_s3_range_chunk(
+            plan,
+            1,
+            expected,
+            expected,
+            response,
+            SliceBody(data, &reads),
+            || true,
+        )
+        .await
+        .unwrap();
+        let mut cursor = DigestRange::from_enrolled(
+            &manifest,
+            &root,
+            &context,
+            &record,
+            &record,
+            65_536..65_537,
+        )
+        .unwrap();
+        let opened = cursor
+            .open_next(1, &final_chunk.page.unwrap(), sealed, None)
+            .unwrap();
+        assert_eq!(opened.as_slice(), b"x");
+        assert_eq!(cursor.next_indices(), None);
     }
 
     #[test]
