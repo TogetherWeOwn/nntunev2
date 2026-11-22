@@ -43,8 +43,7 @@ The [disposable PostgreSQL fixture](../../workers/api/src/realtime_presence_post
 uses the auth and deletion migrations, two synthetic accounts, signed
 logins, and the production single-session revoke SQL across connections.
 
-Before wiring, qualify a durable account checkpoint in the same transaction
-as session reads. Include schema, grants, erasure, idle cleanup, post-lock
-clock, transaction budget and a restore fence. If replay state is lost, fence
-affected operations until those logins are invalidated or past their deadlines.
-Any future Durable Object can route operations to this authority.
+Before wiring, qualify the transactional checkpoint, erasure, idle cleanup,
+post-lock clock and runtime budget. Fence lost checkpoints until their logins
+are invalidated or past deadline. Qualify lock ordering with account-wide
+revokes, which can acquire session locks without the user lock.
