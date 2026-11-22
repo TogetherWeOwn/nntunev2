@@ -142,7 +142,7 @@ impl_pg_connect!(PgClient, 0);
 // Native Postgres fixtures can set up and inspect disposable databases with
 // the driver while exercising the same typed adapters as the Worker.
 #[cfg(any(
-    all(feature = "postgres-tests", not(target_arch = "wasm32")),
+    all(any(test, feature = "postgres-tests"), not(target_arch = "wasm32")),
     all(feature = "billing-owned-wasm-test", target_arch = "wasm32"),
 ))]
 impl_pg_query!(Client);
@@ -204,7 +204,7 @@ macro_rules! impl_pg_billing {
 
 impl_pg_billing!(PgClient, 0);
 #[cfg(any(
-    all(feature = "postgres-tests", not(target_arch = "wasm32")),
+    all(any(test, feature = "postgres-tests"), not(target_arch = "wasm32")),
     all(feature = "billing-owned-wasm-test", target_arch = "wasm32"),
 ))]
 impl_pg_billing!(Client);
