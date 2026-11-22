@@ -10,9 +10,9 @@ const liked = { kind: 'track', target_id: track, created_at: 1 };
 const session = (binding: string) => Response.json({ session_binding: binding });
 const list = (binding: string, items: unknown[] = []) => Response.json({ session_binding: binding, items });
 
-function listing(sessionBinding = A): LibraryRefreshUpdate {
+function listing(sessionBinding = A, signal = new AbortController().signal): LibraryRefreshUpdate {
 	const isCurrent = () => true, runIfCurrent = async <T,>(work: () => T) => work();
-	const accountSession = { generation: sessionBinding, signal: new AbortController().signal, isCurrent, run: runIfCurrent };
+	const accountSession = { generation: sessionBinding, signal, isCurrent, run: runIfCurrent };
 	return { sessionBinding, accountSession, authoritative: true, authBoundary: false, isCurrent, runIfCurrent };
 }
 
@@ -59,12 +59,14 @@ it.each(['mismatched read binding', 'mismatched verifier', 'retired publication'
 it.each([A, B])('fences an earlier write when refreshing with binding %s', async (binding) => {
 	const { likes, fetcher } = setup();
 	fetcher.mockResolvedValueOnce(list(A)).mockResolvedValueOnce(session(A));
-	await likes.publish(listing(), tracks);
+	const account = new AbortController();
+	await likes.publish(listing(A, account.signal), tracks);
 	const result = Promise.withResolvers<Response>(), dispatched = Promise.withResolvers<void>();
 	fetcher.mockImplementationOnce(() => { dispatched.resolve(); return result.promise; });
 	const old = likes.controls(track)!;
 	const toggle = old.toggle();
 	await dispatched.promise;
+	account.abort();
 	likes.invalidate();
 	expect(likes.controls(track)).toBeUndefined();
 	likes.retire();
@@ -74,6 +76,7 @@ it.each([A, B])('fences an earlier write when refreshing with binding %s', async
 	if (sameAccount) {
 		await old.toggle();
 		expect(fetcher).toHaveBeenCalledTimes(3);
+		expect(fetcher.mock.calls[2][1]?.signal?.aborted).toBe(false);
 		expect(likes.controls(track)).toBeUndefined();
 		expect(likes.feedback).toContain('Refresh the library');
 	} else {

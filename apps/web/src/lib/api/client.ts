@@ -739,7 +739,8 @@ export class ApiClient {
 		if (session && Object.keys(headers).some((name) => name.toLowerCase() === 'authorization')) {
 			throw new Error('Account requests use the browser session');
 		}
-		if (requiresSessionBinding(path, init.method)) {
+		const bound = requiresSessionBinding(path, init.method);
+		if (bound) {
 			if (!session?.binding) throw new Error('Missing verified session binding');
 			headers[SESSION_BINDING_HEADER] = session.binding;
 		}
@@ -748,17 +749,19 @@ export class ApiClient {
 		// auth spinners always settle. The timer is cleared on settle so
 		// fast requests never wait for it and later requests are unaffected.
 		const controller = new AbortController();
-		const signal = init.signal ?? this.signal;
-		const callerSignal = session && signal ? AbortSignal.any([session.owner.signal, signal])
-			: session?.owner.signal ?? signal;
+		const callerSignal = init.signal ?? this.signal;
+		// A same-binding refresh must wait for an already-dispatched preference
+		// write, including after a failed logout. Retirement still refuses its result.
+		const retirement = session && (!bound || init.method === 'GET') ? session.owner.signal : undefined;
 		const assertCurrent = () => {
 			callerSignal?.throwIfAborted();
+			session?.owner.signal.throwIfAborted();
 			if (session && !session.owner.isCurrent()) throw new DOMException('Account session ended', 'AbortError');
 		};
 		assertCurrent();
-		const onCallerAbort = (): void => controller.abort(callerSignal?.reason);
-		if (callerSignal?.aborted) controller.abort(callerSignal.reason);
-		else callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
+		const onAbort = (event: Event) => controller.abort((event.currentTarget as AbortSignal).reason);
+		callerSignal?.addEventListener('abort', onAbort, { once: true });
+		retirement?.addEventListener('abort', onAbort, { once: true });
 		let timedOut = false;
 		const timer = setTimeout(() => {
 			timedOut = true;
@@ -852,7 +855,8 @@ export class ApiClient {
 			throw error;
 		} finally {
 			clearTimeout(timer);
-			callerSignal?.removeEventListener('abort', onCallerAbort);
+			callerSignal?.removeEventListener('abort', onAbort);
+			retirement?.removeEventListener('abort', onAbort);
 		}
 	}
 

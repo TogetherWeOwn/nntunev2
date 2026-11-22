@@ -74,7 +74,8 @@ it.each(['sign-out', 'cross-tab account switch', 'missed storage event'])('retir
 	const late = Promise.withResolvers<Response>();
 	const fetchFn = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ session_binding: binding }))
 		.mockReturnValueOnce(late.promise);
-	const client = new ApiClient({ baseUrl: '', fetchFn, session: { owner, binding } });
+	const page = new AbortController();
+	const client = new ApiClient({ baseUrl: '', fetchFn, signal: page.signal, session: { owner, binding } });
 
 	expect(() => client.setToken('synthetic')).toThrow('Account requests use the browser session');
 	await expect(client.get(path, { Authorization: 'Bearer synthetic' })).rejects.toThrow('Account requests use the browser session');
@@ -99,6 +100,7 @@ it.each(['sign-out', 'cross-tab account switch', 'missed storage event'])('retir
 		}
 	}
 	expect(request?.signal?.aborted).toBe(true);
+	expect(page.signal.aborted).toBe(false);
 	late.resolve(Response.json({ session_binding: binding }));
 	expect(await pending).toMatchObject({ name: 'AbortError' });
 	await expect(client.get(path)).rejects.toMatchObject({ name: 'AbortError' });
