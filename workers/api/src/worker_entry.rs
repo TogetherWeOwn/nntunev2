@@ -7901,6 +7901,17 @@ fn subsonic_catalogue_error(query: &str) -> nntune_subsonic::HttpResponse {
     )
 }
 
+pub(crate) fn begin_production_snapshot(
+    query: &str,
+) -> Result<
+    nntune_subsonic::construction_permit::ConstructionPermit<'static>,
+    nntune_subsonic::HttpResponse,
+> {
+    nntune_subsonic::construction_permit::CONSTRUCTION_SLOT
+        .try_acquire()
+        .ok_or_else(|| subsonic_catalogue_error(query))
+}
+
 fn construct_production_subsonic_snapshot(
     artists: &[crate::catalogue::ArtistDbRow],
     releases: &[crate::catalogue::ReleaseDbRow],
@@ -7997,25 +8008,28 @@ pub async fn subsonic_mount(
         .await
         .map_err(|err| core::auth_error_response(&merged, err))
     };
-    let (principal, (artist_rows, release_rows, track_rows)) = match after_auth(auth, |principal| {
-        let store = &store;
-        let merged = &merged;
-        async move {
-            let rows = catalogue_for_route(path, || async {
-                store
-                    .subsonic_member_catalogue(principal.user_id())
-                    .await
-                    .map_err(|_| subsonic_catalogue_error(merged))
-            })
-            .await?;
-            Ok((principal, rows))
-        }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(response) => return respond_document(&response),
-    };
+    // Keep the shared slot through account lookup and Worker response preparation.
+    let (principal, _snapshot_permit, (artist_rows, release_rows, track_rows)) =
+        match after_auth(auth, |principal| {
+            let store = &store;
+            let merged = &merged;
+            async move {
+                let permit = begin_production_snapshot(merged)?;
+                let rows = catalogue_for_route(path, || async {
+                    store
+                        .subsonic_member_catalogue(principal.user_id())
+                        .await
+                        .map_err(|_| subsonic_catalogue_error(merged))
+                })
+                .await?;
+                Ok((principal, permit, rows))
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(response) => return respond_document(&response),
+        };
     let (email, role) = match store.subsonic_account(principal.user_id()).await {
         Ok(Some(pair)) => pair,
         _ => {
@@ -8311,6 +8325,42 @@ mod tests {
         assert!(!before_store.contains("app.handle("));
         assert!(before_dispatch.contains("app.handle("));
         assert!(!mount.contains("build_snapshot("));
+
+        let admission: String = before_store
+            .split_once("let (principal, _snapshot_permit,")
+            .expect("mount retains its construction permit")
+            .1
+            .split_once("let (email, role)")
+            .expect("account read follows construction admission")
+            .0
+            .split_ascii_whitespace()
+            .collect();
+        let expected: String = r#"
+            (artist_rows, release_rows, track_rows)) =
+            match after_auth(auth, |principal| {
+                let store = &store;
+                let merged = &merged;
+                async move {
+                    let permit = begin_production_snapshot(merged)?;
+                    let rows = catalogue_for_route(path, || async {
+                        store
+                            .subsonic_member_catalogue(principal.user_id())
+                            .await
+                            .map_err(|_| subsonic_catalogue_error(merged))
+                    })
+                    .await?;
+                    Ok((principal, permit, rows))
+                }
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(response) => return respond_document(&response),
+            };
+        "#
+        .split_ascii_whitespace()
+        .collect();
+        assert_eq!(admission, expected);
 
         // Compare the entire account-to-store span, not a substring that could be commented out.
         let construction: String = before_store

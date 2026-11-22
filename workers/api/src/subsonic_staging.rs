@@ -76,6 +76,7 @@ impl StagingConstruction {
 mod tests {
     use super::*;
     use crate::subsonic_http::{StagingBody, STAGING_SOURCE_BYTES};
+    use crate::worker_entry::begin_production_snapshot;
 
     fn empty_input(limit: usize) -> StagingInput {
         StagingInput {
@@ -106,6 +107,7 @@ mod tests {
                 StagingConstruction::begin(empty_input(0)),
                 Err(StagingRejection::BusyOrCapacity)
             ));
+            assert!(begin_production_snapshot("f=json").is_err());
             assert_eq!(scope.input.budget.charged(), form_charge);
             let result = scope.parse_credentials();
             if limit < charge {
@@ -118,7 +120,14 @@ mod tests {
             }
             assert!(CONSTRUCTION_SLOT.try_acquire().is_none());
             drop(scope);
-            assert!(CONSTRUCTION_SLOT.try_acquire().is_some());
+            let production = begin_production_snapshot("f=json").unwrap();
+            assert!(begin_production_snapshot("f=json").is_err());
+            assert!(matches!(
+                StagingConstruction::begin(empty_input(0)),
+                Err(StagingRejection::BusyOrCapacity)
+            ));
+            drop(production);
+            assert!(StagingConstruction::begin(empty_input(0)).is_ok());
         }
     }
 }
