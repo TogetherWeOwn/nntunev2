@@ -1,6 +1,6 @@
 //! Inactive composition of the local checkpoint and transport receipt checks.
 
-use nntune_core::media_envelope::EnvelopeContext;
+use nntune_core::{media_envelope::EnvelopeContext, s3_locator::S3MediaMetadata};
 
 use super::{
     resume_checkpoint::{matches_checkpoint, ResumeBinding, ResumeCheckpoint},
@@ -35,19 +35,14 @@ impl<'a> SessionCompletion<'a> {
             return Err(PrepareError::CheckpointMismatch);
         }
         let [_, environment, library, object, generation, _] = context.identities;
-        let media_key = expected
-            .plan
-            .target
-            .key
-            .strip_prefix("media/")
-            .and_then(|key| key.split_once('/'));
+        let target = expected.plan.target;
         if expected.environment != hex::encode(environment)
             || expected.library != hex::encode(library)
             || expected.object != hex::encode(object)
             || expected.generation != hex::encode(generation)
-            || media_key != Some((expected.object, expected.generation))
             || expected.plan.header != context.header
             || expected.plan.plaintext_len != context.plaintext_len
+            || !S3MediaMetadata::matches_target(target.bucket, target.key, context)
         {
             return Err(PrepareError::EnvelopeContextMismatch);
         }
@@ -68,7 +63,8 @@ impl<'a> SessionCompletion<'a> {
     /// Capture the media version from the same completion response as the
     /// checksum, using the trusted session's context. Use this exact pin for
     /// subsequent HEAD and authenticated readback. The receipt conveys no
-    /// publication authority.
+    /// publication authority. An ambiguous post-dispatch outcome requires
+    /// fenced reconciliation before further upload actions.
     pub fn verify_completion(
         &self,
         reply: VersionedCompletionReply<'_>,

@@ -237,36 +237,46 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         plaintext_len: 2,
         ..context
     };
-    for wrong_context in wrong_scopes.into_iter().chain([wrong_header, wrong_length]) {
+    let mut invalid_configuration = EnvelopeContext { ..context };
+    invalid_configuration.identities[5][6] = 0;
+    let invalid_metadata = [wrong_header, wrong_length, invalid_configuration];
+    for wrong_context in wrong_scopes.into_iter().chain(invalid_metadata) {
         assert!(matches!(
             SessionCompletion::prepare(binding, &wrong_context, receipts(), &checkpoint),
             Err(PrepareError::EnvelopeContextMismatch)
         ));
     }
-    let wrong_target = UploadTarget {
-        key: "media/efefefefefef40ef80efefefefefefef/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd",
-        ..target
-    };
-    let wrong_plan = Plan::new(wrong_target, sealer.header(), 1).unwrap();
-    let wrong_part = make_part(wrong_plan);
-    let wrong_binding = ResumeBinding {
-        plan: wrong_plan,
-        ..binding
-    };
-    assert!(matches!(
-        SessionCompletion::prepare(
-            wrong_binding,
-            &context,
-            vec![wrong_part
-                .verify_reply(saved.etag.into(), checksum)
-                .unwrap()],
-            &ResumeCheckpoint {
-                binding: wrong_binding,
-                ..checkpoint
-            }
-        ),
-        Err(PrepareError::EnvelopeContextMismatch)
-    ));
+    for wrong_target in [
+        UploadTarget {
+            key: "media/efefefefefef40ef80efefefefefefef/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd",
+            ..target
+        },
+        UploadTarget {
+            bucket: "invalid_bucket",
+            ..target
+        },
+    ] {
+        let wrong_plan = Plan::new(wrong_target, sealer.header(), 1).unwrap();
+        let wrong_part = make_part(wrong_plan);
+        let wrong_binding = ResumeBinding {
+            plan: wrong_plan,
+            ..binding
+        };
+        assert!(matches!(
+            SessionCompletion::prepare(
+                wrong_binding,
+                &context,
+                vec![wrong_part
+                    .verify_reply(saved.etag.into(), checksum)
+                    .unwrap()],
+                &ResumeCheckpoint {
+                    binding: wrong_binding,
+                    ..checkpoint
+                }
+            ),
+            Err(PrepareError::EnvelopeContextMismatch)
+        ));
+    }
     let completion =
         SessionCompletion::prepare(binding, &context, receipts(), &checkpoint).unwrap();
     assert!(completion.manifest().eq([(1, saved.etag, checksum)]));
