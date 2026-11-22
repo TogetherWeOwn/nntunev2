@@ -8,6 +8,28 @@
   [staging promotion checklist](docs/ops.md#staging-promotion-checklist) for acceptance and rollback.
 - Consult the [architecture decision records](docs/adr/README.md) for design decisions and amendments.
 
+## Working in T3 Code
+
+The lead prioritizes and dispatches work, with up to four active task threads
+per project. One task thread owns each PR-sized change in its own worktree,
+from implementation through review, CI, merge and settlement. Continue an
+existing PR on its branch. Use the PR watch for GitHub updates and settle the
+thread when the work is complete.
+[CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) defines review
+tiers, exact-commit evidence and merge authority.
+
+The repository owner decides class-B design and policy changes and is the
+sole production approver. Stop and ask for explicit authorization for the
+exact commit before any production action or any merge that could reach
+production. This includes uncertain deployment paths, deploys, migrations,
+secrets and grants. Follow the production admission and access gates in
+[the operations runbook](docs/ops.md#staging-promotion-checklist).
+
+Keep staging and production storage separate, and keep scratch data out of
+archive buckets. Existing access, retention and deletion controls apply to
+all environments. See the [storage boundary ADR](docs/adr/0015-standard-s3-storage-boundary.md)
+and [bucket inventory](docs/ops.md#cloudflare).
+
 ## CI and verification location
 
 Full test suites and CI gates run on GitHub Actions, never as local
@@ -16,7 +38,7 @@ and open a draft PR while incomplete; the actual workflow is
 `.github/workflows/ci.yml` with the aggregate `ci-ok` gate.
 [CONTRIBUTING.md](CONTRIBUTING.md#verification-github-actions-first)
 defines focused reproduction, guarded Boat use and exact-head Actions
-run/job evidence for reviewers and the Release Manager. Local transcripts
+run/job evidence for reviewers and the owner. Local transcripts
 are not CI evidence; required checks and review/release gates stay intact.
 
 Local test execution is allowed only for focused reproduction of one
@@ -58,7 +80,7 @@ Pool facts:
 - Two slots, each with a sampled byte budget (see
   `scripts/cargo_pool_policy.json`, provisioned on the host under
   `/paperclip/.cache/nntunev2-bounded`). The hard aggregate bound is a
-  host-enforced filesystem quota, attested by the Operator receipt in
+  host-enforced filesystem quota, attested by the operator receipt in
   the pool policy — not by the script.
 - The wrapper adds `--offline --locked`, redirects `CARGO_TARGET_DIR`
   and `TMPDIR` into per-worktree subdirs (`ws-<hash>`) under the leased
@@ -69,7 +91,7 @@ Pool facts:
   material refuses the slot, leaving it unchanged); legacy
   shared-target slots migrate automatically after the same check.
 - Exit 75 means refused: both slots busy, a slot over budget, a stale
-  lease needing Operator inspection, a missing/bad pool, or low
+  lease needing host operator inspection, a missing/bad pool, or low
   filesystem headroom. Retry later. Never fall back to a per-worktree
   `target/`, never set `CARGO_TARGET_DIR` manually, and never run a
   direct compiling `cargo` command to dodge the pool.
@@ -79,7 +101,7 @@ Pool facts:
   do not compile and run directly.
 - One interrupted run keeps its `lease.json` sentinel; a stale
   under-budget lease with a dead Cargo process group is recovered on
-  the next acquire, anything else stays for Operator inspection.
+  the next acquire, anything else stays for host operator inspection.
 
 ## Clean-room, YouTube and MetaBrainz guardrails
 
@@ -178,10 +200,18 @@ Do not extend the spike, and do not copy its approach into new code.
 
 Before writing or changing browser-facing code in the SvelteKit app under `apps/web/` (`.svelte` components, CSS, HTML, client-side TypeScript), consult Modern Web Guidance. It covers current HTML, CSS and DOM APIs, accessibility, forms and performance. Skip it for server-only code, Rust crates and workers. The clean-room, YouTube and MetaBrainz guardrails above still win over any guide.
 
-1. If your agent harness provides the `modern-web-guidance` skill, use it. Otherwise run the CLI directly (Node 22+):
-   `DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest search "<2-5 word capability>"`, then
-   `DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest retrieve "<id>"`.
-   Search one capability at a time (for example `"light dismiss dialog"`), without framework or app names.
+1. Set `DISABLE_TELEMETRY=1` for every Modern Web Guidance invocation.
+   Use the installed `modern-web-guidance` skill only if you can ensure
+   each CLI process receives that setting. Otherwise use the CLI directly
+   (Node 22+):
+
+   ```sh
+   DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest search "<2-5 word capability>"
+   DISABLE_TELEMETRY=1 npx -y modern-web-guidance@latest retrieve "<id>"
+   ```
+
+   Search one capability at a time (for example `"light dismiss dialog"`),
+   without framework or app names.
 2. Apply only the retrieved guidance that fits the task. Keep existing behavior, copy, design tokens and
    the stack the route already uses; record any guide you followed in the PR body.
 3. The guidance never overrides this file, an ADR, or a project decision. If they

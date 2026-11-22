@@ -16,8 +16,9 @@ trailing period. The `pr-lint` job (`.github/workflows/pr-lint.yml`)
 enforces the shape, the 12-type list, the 100-char limit and the
 no-trailing-period rule.
 
-No tracker IDs (e.g. `TOG-*`) are required in PR titles or bodies — this is a
-public repo. Do not paste internal links or card IDs. The `public-text` CI
+Use public GitHub references or describe the problem in the PR. Keep
+private links, tracker identifiers, handoff paths and audit artifacts out of
+public work. The `public-text` CI
 job (`.github/workflows/ci.yml`, in `ci-ok`'s `needs`, which fails when any
 needed job does not succeed; scan script
 `.github/scripts/public_text_lint.py`) enforces this on all tracked file
@@ -89,11 +90,9 @@ verify the associated PR head (check-suite/PR metadata) matches the reviewed
 head. A green run for an older head, a local transcript, a successful workflow
 with skipped required jobs, or a formatting check is not CI evidence.
 
-Reviewers and the Release Manager accept those Actions links as CI evidence;
-they do not require a local full-suite transcript. This changes execution
-location only: exact-head production authorization, staging/deployed-build
-identity, migrations, rollback evidence and normal review/merge gates remain
-mandatory. CI success alone is not staging or production acceptance. Follow
+Reviewers and the owner use those Actions links as CI evidence. Keep exact-SHA
+production authorization and admission, staging and deployed-build identity,
+migration and rollback evidence, and review and merge gates. Follow
 [the staging promotion checklist](docs/ops.md#staging-promotion-checklist)
 for release evidence. Explicitly state what was not run.
 
@@ -136,42 +135,62 @@ labels are the durable record behind it.
 
 ## Merge policy
 
+The task thread owns the PR and its follow-through without separate role
+handoffs for ordinary PRs. Follow the risk floors and Attestation format
+in the [PR template](.github/pull_request_template.md).
+Instruction changes in `AGENTS.md`, `CONTRIBUTING.md`, `REVIEW.md`,
+`.claude/**` or `.github/**` require at least T1 review, including when the
+validator permits a docs-only T2 Attestation for root Markdown files.
+
+| Review tier | Independent read-only review before merge |
+| --- | --- |
+| T2, eligible docs-only changes | Task author self-check |
+| T1, standard changes and sensitive instructions | One reviewer from a different model family than the author |
+| T0, critical changes | Two independent reviewers from a different model family than the author, one general and one security-focused, in parallel |
+
+In T3 Code, delegate review of the full PR head SHA and its diff. Record the
+reviewed SHA and resolve findings before merging. After a push, verify the new
+head is equivalent to the reviewed patch or obtain a new independent review
+for material changes. Required checks must pass on the final head in either
+case. The task owner merges through branch protection with the expected head
+SHA once the review and CI gates pass. Reviewers report findings and coverage
+without changing the PR or merging it.
+
 - Squash-merge only (repo allows squash only; `protect-main` ruleset allows
   only `squash`, merge queue merges with `SQUASH`); the squash commit title
   is the PR title.
 - Delete the branch on merge (automatic repo setting).
-- Every PR must pass the required status checks on `main` (the
-  `protect-main` ruleset): **`ci-ok`, `gitleaks`, `pr-lint`,
-  `pr-size-gate / gate`,
-  `migrations-staging` and `Devin Review`**. CodeRabbit is advisory: answer
-  its findings when it reviews, but never wait for it or trigger it manually.
-- A PR merges once every required check is green and every review finding
-  is fixed or answered with evidence. The final-stage reviewer merges the
-  pinned, settled head before approving; the author merges only when there
-  is no review stage. `main` currently deploys staging, not production.
-  Recheck both automatic deployment paths and default-head provider
-  deployments/checks before classifying a merge as non-production. A merge
-  that reaches production, including docs-only changes or an uncertain
-  deployment path, needs the Release Manager's exact-head authorization.
-  Manual production promotion through `deploy-production` separately needs
-  that authorization; merging staging-only changes does not authorize it.
+- Verify the effective branch rules before merging. Require **`ci-ok`,
+  `gitleaks`, `pr-lint`, `pr-size-gate / gate`, `migrations-staging` and
+  `Devin Review`** alongside the required org PR-standards workflow and
+  CodeQL rules. CodeRabbit is advisory. Answer its findings when it reviews
+  without waiting for it or triggering it manually.
+- `main` currently deploys staging. Recheck automatic deployment paths and
+  default-head provider deployments/checks before merging. Stop if a merge
+  could reach production or the deployment path is uncertain, even for
+  docs-only changes. Obtain the repository owner's exact-head authorization
+  before proceeding. Manual production promotion through `deploy-production`
+  requires its own exact-SHA owner authorization and the
+  [promotion gates](docs/ops.md#staging-promotion-checklist).
 - Fix each bot-review finding, or answer it in the thread with evidence
   from the code. Check a suggested fix before applying it (the disproof
-  pass in `REVIEW.md`).
+  pass in `REVIEW.md`). Use the first-line reply format from the
+  [org contract](https://github.com/TogetherWeOwn/.github/blob/main/CONTRIBUTING.md#4-reviews)
+  and resolve threads after answering them.
 - Tests prove behaviour. Do not add bespoke oracle or proof scripts just to
   satisfy a reviewer; a new guard or gate script needs its own justification
   in the PR body (what it catches that tests cannot).
-- Staging migrations: staging is verified against the database itself —
-  applies are recorded in `schema_migrations` and the staging deploy gate
-  compares them with `migrations/manifest.toml`; see "Staging migrations"
-  in `docs/ops.md`. Green checks are not enough for such a PR: once the
-  DDL has board approval on its card, the authoring agent dispatches
-  `.github/workflows/migrations-staging-apply.yml` with the approved
-  commit `ref`, migration `file`, `applied_by` and the board-approval
-  interaction id (the ref supplies migration data only; the workflow runs
-  the trusted `.github/scripts/apply_migration.py` from `main`), and the
-  PR merges only once the apply is recorded in the job summary. A PR that renames a migration must rename it
-  byte-identically and carry its `renamed_from` manifest history
+- For [staging migrations](docs/ops.md#staging-migrations), applies are
+  recorded in `schema_migrations` and the staging deploy gate compares them
+  with `migrations/manifest.toml`. Obtain and record the required DDL approval
+  before dispatching `.github/workflows/migrations-staging-apply.yml` from `main`.
+  Supply the approved full commit `ref`, migration `file`, `applied_by` and
+  the recorded approval reference required by `board_approval`. If the
+  approval or its required evidence is unavailable, stop before dispatch.
+  The supplied ref is migration data only. The workflow uses trusted code
+  from `main` and the staging-scoped credential. Merge only once a successful
+  apply is recorded in the job summary. A PR that renames a migration must
+  keep its bytes identical and carry its `renamed_from` manifest history
   (`migrations-staging` enforces it).
 - Never commit secrets. The `gitleaks` gate (`.github/workflows/gitleaks.yml`,
   full-history scan) and push protection (secret scanning + push protection

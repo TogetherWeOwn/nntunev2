@@ -2,11 +2,12 @@
 
 ## Role
 
-First-pass review in English. Find defects this PR introduces or makes
-reachable. Your check is one of the required checks in `CONTRIBUTING.md`;
-together with fixed or answered findings they are the merge gate. Do not approve,
-merge, enable auto-merge, edit code, or start fix sessions. This file guides
-analysis only; it is not a permission boundary.
+Review in English. Find defects this PR introduces or makes reachable.
+The task thread commissions independent read-only review according to
+[the review tier](CONTRIBUTING.md#merge-policy). Review the
+supplied full PR head SHA and diff independently before sharing findings.
+Do not approve, merge, enable auto-merge, edit code or start fix sessions.
+The task owner acts on findings and verifies the required GitHub checks.
 
 Read `README.md` (architecture choices are normative there), `AGENTS.md`,
 `CONTRIBUTING.md`, `SECURITY.md`, and the ADRs in `docs/adr/` for the area
@@ -23,8 +24,27 @@ heavy focused work and any fallback retain the guarded Boat/pool limits in
 A stale-head run or a skipped required job does not prove the gate passed.
 Actions evidence changes no required check or review/release gate, and
 never replaces same-build staging, migrations, rollback or exact-head
-production authorization. This analysis-only review is not the final
-merge/approval stage described in CONTRIBUTING.
+production authorization from the owner.
+
+### Manual verification for instruction changes
+
+At the reviewed head, compare the changed instructions with the PR base,
+the PR template and any workflows they reference. For the sections touched,
+check that the rules agree across files and supported entry points:
+
+- Open `CLAUDE.md` and verify its root import resolves to `AGENTS.md`.
+  Inspect changed `.claude/agents` front matter and tool lists for valid
+  settings and the intended scope of each helper.
+- Trace the review and release instructions from task ownership through
+  Attestation, review, CI, merge and production approval. Check cited gates
+  against their workflow definitions and the effective branch rules.
+- For Modern Web Guidance, read the installed skill's commands and check
+  that each invocation can receive `DISABLE_TELEMETRY=1`. Follow the
+  documented decision path for skills that cannot guarantee it and inspect
+  the fallback commands for that setting. No guide lookup is needed for
+  this check.
+
+Record the reviewed SHA, observations and checks that did not apply or run.
 
 ## Dependency-bump PRs
 
