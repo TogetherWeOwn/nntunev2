@@ -459,7 +459,7 @@ test.describe('applyAccountToPage browser credential scoping', () => {
     QA_AUTH_TOKEN: QA_SENTINEL,
   };
 
-  test('session account: staging origin gets its bearer (no QA token), foreign origin continues clean', async () => {
+  test('HTTPS session account: browser uses its cookie and stages only Access headers', async () => {
     await withEnvAsync(pageEnv, async () => {
       const { page, handler, cookies, cleared } = fakePage();
       await applyAccountToPage(page, sessionAccount(), BASE);
@@ -480,10 +480,22 @@ test.describe('applyAccountToPage browser credential scoping', () => {
 
       const staging = fakeRoute(`${BASE}/library`);
       await routeHandler!(staging.route);
-      expect(staging.record.fetched?.headers.Authorization).toBe('Bearer sentinel-session-a');
+      expect(staging.record.fetched?.headers.Authorization).toBeUndefined();
+      expect(staging.record.fetched?.headers['CF-Access-Client-Id']).toBe('dummy-client-id');
       expect(staging.record.fetched?.maxRedirects).toBe(0);
       expect(JSON.stringify(staging.record.fetched?.headers)).not.toContain(QA_SENTINEL);
       expect(staging.record.fulfilled).toBe(true);
+
+      const library = fakeRoute(`${BASE}/api/library`);
+      await routeHandler!(library.route);
+      expect(library.record.fetched?.headers.Authorization).toBeUndefined();
+      expect(library.record.fetched?.headers['CF-Access-Client-Id']).toBe('dummy-client-id');
+      expect(library.record.fetched?.maxRedirects).toBe(0);
+      expect(library.record.fulfilled).toBe(true);
+
+      const verifier = fakeRoute(`${BASE}/v1/me/likes/session`);
+      await routeHandler!(verifier.route);
+      expect(verifier.record.fetched?.headers.Authorization).toBeUndefined();
 
       const foreign = fakeRoute('https://foreign.example/asset');
       await routeHandler!(foreign.route);
