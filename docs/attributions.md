@@ -64,6 +64,91 @@ This inventory is not a claim that all distribution obligations are discharged.
   than replaces them.
 
 Follow [AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails](../AGENTS.md#clean-room-youtube-and-metabrainz-guardrails).
+
+## Synced lyrics provenance and activation
+
+The server bindings and the Now Playing panel are exercised with invented
+text in separate unit tests. The panel accepts `{ trackId, result }` for the
+current queue entry. The Library may reuse the playback ID across occurrences,
+so that ID is only the presentation key. The existing system seek stays under
+the native player. The Subsonic compatibility methods use artist and title
+for their lyric lookup, and the mounted store supplies no text. See the
+[Library entry contract](../workers/api/src/catalogue.rs),
+[Now Playing panel](../apps/web/src/lib/player/LyricsPanel.svelte),
+[system seek change](https://github.com/TogetherWeOwn/nntunev2/pull/1605) and
+[Subsonic store](../workers/api/src/subsonic_dispatch.rs).
+
+### Verified tags and sidecars
+
+A future server reader must resolve the occurrence through the current
+authenticated Library access rules and verify the published source bundle
+before reading lyrics. `bindVerifiedLocalLyrics` compares the evidence's
+library scope, playback ID, occurrence key and source revision with the
+server's current selection. Use an in-process scope unique to the verified
+access context, with nonblank identity strings of at most 256 UTF-16 code
+units. Read provenance from the verified media or sidecar record. The
+source revision pins both the media and any associated sidecar to immutable
+versions. A matching filename, client request, MusicBrainz ID or display
+metadata alone cannot establish that relationship. Use the existing
+[storage and publication boundary](adr/0015-standard-s3-storage-boundary.md).
+
+Capture an immutable selection at request start and compare it with the live
+one at delivery. Clearing the selection or losing access retires it.
+Changing occurrence or source revision, replacing the access context, or
+returning to the same track uses a fresh object. A future response consumer
+must also discard late replies before giving the panel lyrics, including
+when the same playback ID is selected again. Only the playback ID, source
+kind and parsed cues pass through the binding. Paths, revisions and access
+scope stay server-side. The fixture binding takes already-verified evidence.
+Source verification and the authorization check belong to the future reader.
+See the [server binding](../apps/web/src/lib/server/lyrics.ts) and
+[synthetic cases](../apps/web/src/lib/server/lyrics.test.ts).
+
+Use a valid embedded tag first, then a verified `.lrc` sidecar in the same
+namespace, directory and stem. Bound reads before acquiring text and use
+the existing parser's 64 Ki UTF-16 code unit and 1,024 cue limits. Known
+instrumentals, absent evidence and documents with no usable nonempty timed
+cue return absence. These rules establish identity and provenance. Permission
+to display the text is a separate prerequisite.
+
+### Future LRCLIB fallback and rights decision
+
+If authorized, use a confirmed cached-only exact lookup after verified local
+lyrics are absent. Send only verified title, artist, album and duration,
+with a 1–3,600 second duration for the upstream API. Require matching
+metadata, at most two seconds of duration difference and nonempty synced
+cues. Treat unresolved or ambiguous editions as absent. Recheck access,
+occurrence, revision and selection at delivery. Keep any permitted cache in
+memory, scoped to the authorized library and verified occurrence/revision.
+The existing synthetic resolver gives an upper bound of 128 entries, one
+hour for hits, five minutes for confirmed absence and two seconds for a
+lookup. Transport errors, rate limits, malformed replies and timeouts stay
+out of the miss cache. If activated, show and link the existing `lrclib`
+credit wherever its lyrics appear. Apply upstream client identification,
+throttling and retry guidance in any authorized adapter. [LRCLIB API documentation](https://lrclib.net/docs.md)
+
+**Recommendation for the rights decision.** Keep real synced lyrics off,
+including for private use, until the rights holder or qualified counsel
+confirms the permissions for copying, displaying and serving lyrics from
+embedded tags and sidecars. Ask LRCLIB to confirm its API terms, whether it
+can authorize in-memory copying and private display of the lyrics it serves,
+and how updates, withdrawals and takedowns must be handled. Confirm a
+supported lookup that cannot trigger upstream acquisition. The current
+public docs and published router list `/api/get` and omit `/api/get-cached`.
+The docs describe possible background acquisition after a miss on `/api/get`.
+Keep the fallback off until a supported
+cached-only contract is established. [LRCLIB endpoint docs](https://lrclib.net/docs#get-lyrics-with-a-tracks-signature)
+[Published router revision](https://github.com/tranxuanthang/lrclib/blob/ffdfed4dd8288f9065f5562508c13705cbe0436c/server/src/router.rs#L29-L63)
+
+LRCLIB's MIT licence covers its server software. Its public API docs describe
+API access and copyright flags but do not state a lyric-content licence.
+The US Copyright Office identifies lyrics as part of the musical composition,
+which has rights separate from the sound recording. Any later permission
+must cover the intended private use, with no spend or public rollout under
+the current product decision. [LRCLIB software licence](https://github.com/tranxuanthang/lrclib/blob/ffdfed4dd8288f9065f5562508c13705cbe0436c/LICENSE)
+[LRCLIB reporting docs](https://lrclib.net/docs#flag-a-lyrics)
+[US Copyright Office Circular 56A](https://www.copyright.gov/circs/circ56a.pdf)
+[ADR 0012](adr/0012-compliant-youtube-video-and-brainz-data.md#5-metabrainz-licence-correction--free-cc0-only-owner-decision-2026-11-03)
 REA angle: reuse our shipped manifests, font licence record and original icon
 provenance; no external product analysis or assets are needed.
 
