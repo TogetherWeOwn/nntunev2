@@ -65,9 +65,12 @@ This inventory is not a claim that all distribution obligations are discharged.
 
 Follow [AGENTS.md — Clean-room, YouTube and MetaBrainz guardrails](../AGENTS.md#clean-room-youtube-and-metabrainz-guardrails).
 
+REA angle: reuse our shipped manifests, font licence record and original icon
+provenance; no external product analysis or assets are needed.
+
 ## Synced lyrics provenance and activation
 
-The server bindings and the Now Playing panel are exercised with invented
+The server binding and the Now Playing panel are exercised with invented
 text in separate unit tests. The panel accepts `{ trackId, result }` for the
 current queue entry. The Library may reuse the playback ID across occurrences,
 so that ID is only the presentation key. The existing system seek stays under
@@ -108,16 +111,18 @@ Use a valid embedded tag first, then a verified `.lrc` sidecar in the same
 namespace, directory and stem. Bound reads before acquiring text and use
 the existing parser's 64 Ki UTF-16 code unit and 1,024 cue limits. Known
 instrumentals, absent evidence and documents with no usable nonempty timed
-cue return absence. These rules establish identity and provenance. Permission
-to display the text is a separate prerequisite.
+cue return absence. The parser skips malformed rows and may keep valid cues
+from other rows. These rules establish identity and provenance. Permission to
+display the text is a separate prerequisite.
 
 ### Future LRCLIB fallback and rights decision
 
 If authorized, use a confirmed cached-only exact lookup after verified local
-lyrics are absent. Send only verified title, artist, album and duration,
-with a 1–3,600 second duration for the upstream API. Require matching
-metadata, at most two seconds of duration difference and nonempty synced
-cues. Treat unresolved or ambiguous editions as absent. Recheck access,
+lyrics are absent. Send only verified title, artist, album and duration.
+The future adapter must skip lookup when the true duration is outside the
+upstream range of 1–3,600 seconds. Require matching metadata, at most two
+seconds of duration difference and nonempty synced cues. Treat unresolved
+or ambiguous editions as absent. Recheck access,
 occurrence, revision and selection at delivery. Keep any permitted cache in
 memory, scoped to the authorized library and verified occurrence/revision.
 The existing synthetic resolver gives an upper bound of 128 entries, one
@@ -136,8 +141,8 @@ and how updates, withdrawals and takedowns must be handled. Confirm a
 supported lookup that cannot trigger upstream acquisition. The current
 public docs and published router list `/api/get` and omit `/api/get-cached`.
 The docs describe possible background acquisition after a miss on `/api/get`.
-Keep the fallback off until a supported
-cached-only contract is established. [LRCLIB endpoint docs](https://lrclib.net/docs#get-lyrics-with-a-tracks-signature)
+Keep the fallback off until a supported cached-only contract is established.
+[LRCLIB endpoint docs](https://lrclib.net/docs#get-lyrics-with-a-tracks-signature)
 [Published router revision](https://github.com/tranxuanthang/lrclib/blob/ffdfed4dd8288f9065f5562508c13705cbe0436c/server/src/router.rs#L29-L63)
 
 LRCLIB's MIT licence covers its server software. Its public API docs describe
@@ -147,10 +152,8 @@ which has rights separate from the sound recording. Any later permission
 must cover the intended private use, with no spend or public rollout under
 the current product decision. [LRCLIB software licence](https://github.com/tranxuanthang/lrclib/blob/ffdfed4dd8288f9065f5562508c13705cbe0436c/LICENSE)
 [LRCLIB reporting docs](https://lrclib.net/docs#flag-a-lyrics)
-[US Copyright Office Circular 56A](https://www.copyright.gov/circs/circ56a.pdf)
+[US Copyright Office registration guide](https://www.copyright.gov/circs/circ56a.pdf)
 [ADR 0012](adr/0012-compliant-youtube-video-and-brainz-data.md#5-metabrainz-licence-correction--free-cc0-only-owner-decision-2026-11-03)
-REA angle: reuse our shipped manifests, font licence record and original icon
-provenance; no external product analysis or assets are needed.
 
 ## Validation and upkeep
 
