@@ -80,7 +80,7 @@ test('Recent offers sign-in when the initial history request returns 401', async
 	await expect(history.getByRole('listitem')).toHaveCount(0);
 });
 
-test('Recent offers retry after a read failure and distinguishes an empty result', async ({ page }) => {
+for (const missedEvent of [false, true]) test(`Recent retries once after a read failure (missed storage event: ${missedEvent})`, async ({ page }) => {
 	let requests = 0;
 	await page.route('**/v1/me/history', (route) => ++requests === 1
 		? route.fulfill({ status: 503, json: {} })
@@ -89,9 +89,11 @@ test('Recent offers retry after a read failure and distinguishes an empty result
 
 	const history = page.getByRole('region', { name: 'Recently played' });
 	await expect(history.getByRole('alert')).toContainText('Could not load');
+	if (missedEvent) await page.evaluate(() => localStorage.setItem('nntune.auth.generation.v1', 'replacement-session'));
 	await history.getByRole('button', { name: 'Retry' }).click();
 	await expect(history.getByText('No recent plays yet.')).toBeVisible();
 	await expect(history.getByRole('listitem')).toHaveCount(0);
+	expect(requests).toBe(2);
 });
 
 test('Recent refuses a pending history response from the previous account', async ({ page }) => {
@@ -122,7 +124,31 @@ test('Recent refuses a pending history response from the previous account', asyn
 	await expect(page.locator('html')).toHaveAttribute('data-history-aborted', 'true');
 	await history.getByRole('button', { name: 'Retry' }).click();
 	await expect(history.getByText('No recent plays yet.')).toBeVisible();
-	await page.evaluate(() => window.dispatchEvent(new Event('release-old-history')));
+	await page.evaluate(() => new Promise<void>((resolve) => {
+		window.dispatchEvent(new Event('release-old-history'));
+		const channel = new MessageChannel();
+		channel.port1.onmessage = () => {
+			channel.port1.close();
+			channel.port2.close();
+			resolve();
+		};
+		channel.port2.postMessage(null);
+	}));
 	await expect(history.getByText('No recent plays yet.')).toBeVisible();
 	await expect(history.getByRole('listitem')).toHaveCount(0);
+});
+
+test('Recent clears already-rendered history when the account session retires', async ({ page }) => {
+	await page.route('**/v1/me/history', (route) => route.fulfill({ json: { items: plays } }));
+	await page.route('**/v1/library', (route) => route.fulfill({ json: catalogue }));
+	await page.goto('/library/recent');
+	const history = page.getByRole('region', { name: 'Recently played' });
+	await expect(history.getByRole('listitem')).toHaveCount(3);
+	await page.evaluate(() => {
+		const key = 'nntune.auth.generation.v1';
+		localStorage.setItem(key, 'replacement-session');
+		window.dispatchEvent(new StorageEvent('storage', { key }));
+	});
+	await expect(history.getByRole('listitem')).toHaveCount(0);
+	await expect(history.getByRole('button', { name: 'Retry' })).toBeVisible();
 });

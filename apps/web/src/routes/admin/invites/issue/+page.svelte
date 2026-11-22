@@ -52,10 +52,12 @@
 
 	async function run<T>(send: (client: ApiClient, signal: AbortSignal) => Promise<T>, apply: (value: T, fence: Fence) => void,
 		fail: (cause: unknown) => void) {
+		const previous = owner;
+		account.prepare();
 		const attempt = new AbortController();
 		request = attempt;
 		try {
-			const fence = owner ?? await account.capture();
+			const fence = previous ?? await account.capture();
 			// Box the promise: hold the auth lock for dispatch and publication, not the network wait.
 			const sent = fence && await fence.run(() => attempt.signal.aborted ? undefined : {
 				result: send(new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session: { owner: fence } }), attempt.signal)

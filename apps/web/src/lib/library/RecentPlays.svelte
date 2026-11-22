@@ -19,6 +19,7 @@
 	const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 
 	async function load(): Promise<void> {
+		account.prepare();
 		active?.abort();
 		const request = new AbortController();
 		active = request;

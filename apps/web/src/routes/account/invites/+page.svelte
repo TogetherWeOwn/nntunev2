@@ -109,6 +109,7 @@
 	}
 
 	async function readSummary(issuedFence?: Fence) {
+		account.prepare();
 		clearHistory();
 		reading?.abort();
 		const attempt = new AbortController();

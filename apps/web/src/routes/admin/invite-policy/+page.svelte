@@ -41,6 +41,7 @@
 
 	async function run<T>(fence: Fence | undefined, send: (client: ApiClient, signal: AbortSignal) => Promise<T>,
 		apply: (result: T, fence: Fence) => void, fail: (cause: unknown) => void) {
+		account.prepare();
 		const attempt = new AbortController();
 		request = attempt;
 		try {

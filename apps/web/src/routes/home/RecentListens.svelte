@@ -11,10 +11,14 @@
 	let view = $state<RecentListensView>({ kind: 'loading' });
 	const account = observeAccountSession(() => reader.invalidate());
 	const reader = createRecentListensReader(PUBLIC_API_BASE_URL, (next) => (view = next), account.capture);
+	const load = () => {
+		account.prepare();
+		return reader.load();
+	};
 
 	onMount(() => {
 		const unsubscribe = subscribeLocalAuthTransition(reader.invalidate);
-		void reader.load();
+		void load();
 		return () => {
 			account.dispose();
 			unsubscribe();
@@ -46,7 +50,7 @@
 				? 'Listening history is hidden until you check the current session again.'
 				: 'Could not load listening history.'}
 		</p>
-		<button type="button" onclick={reader.load}>Retry loading listening history</button>
+		<button type="button" onclick={load}>Retry loading listening history</button>
 	{:else if view.kind === 'ready'}
 		<p>Up to five recorded playback events, in the order returned by your listening history.</p>
 		<ul>

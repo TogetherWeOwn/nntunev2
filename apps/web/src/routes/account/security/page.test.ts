@@ -107,6 +107,7 @@ describe('account security page', () => {
 		// window.* — both must be the same session store, as in a browser.
 		vi.stubGlobal('sessionStorage', session);
 		vi.stubGlobal('window', { sessionStorage: session, localStorage: watchedLocal });
+		vi.stubGlobal('navigator', {}); // The status probe also serves browsers without Web Locks.
 		const requests: string[] = [];
 		const fetchFn = (async (input: RequestInfo | URL) => {
 			requests.push(String(input));
@@ -147,5 +148,17 @@ describe('account security page', () => {
 		expect(body).toContain('Could not verify your sign-in status.');
 		expect(body).toContain('Sign out everywhere');
 		expect(body).toContain('Sign out');
+	});
+
+	it('keeps sign-out controls available when the shared auth lock is busy', async () => {
+		vi.stubGlobal('window', {});
+		vi.stubGlobal('navigator', { locks: { request: async (_name: string, _options: LockOptions, run: LockGrantedCallback<unknown>) => run(null) } });
+		const fetch = vi.fn<typeof globalThis.fetch>();
+		try {
+			await expect(load({ fetch } as never)).resolves.toEqual({ sessionCheckFailed: true });
+			expect(fetch).not.toHaveBeenCalled();
+		} finally {
+			vi.unstubAllGlobals();
+		}
 	});
 });

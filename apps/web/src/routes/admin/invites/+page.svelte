@@ -42,11 +42,13 @@
 
 	async function run<T>(send: (client: ApiClient, signal: AbortSignal) => Promise<T>, apply: (result: T, fence: Fence) => void,
 		fail: (cause: unknown) => void) {
+		const previous = owner;
+		account.prepare();
 		request?.abort();
 		const attempt = new AbortController();
 		request = attempt;
 		try {
-			const fence = owner ?? await account.capture();
+			const fence = previous ?? await account.capture();
 			// Guard dispatch and publication, not the intervening network wait.
 			const sent = fence && await fence.run(() => attempt.signal.aborted ? undefined : {
 				result: send(new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session: { owner: fence } }), attempt.signal)

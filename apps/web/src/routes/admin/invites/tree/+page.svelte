@@ -44,6 +44,8 @@
 	}
 
 	async function load(id: string, previous?: AdminInviteTreePage) {
+		account.prepare();
+		if (previous && node !== previous) return;
 		if (!previous) {
 			heading.focus();
 			reset();

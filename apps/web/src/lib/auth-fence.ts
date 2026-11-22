@@ -118,14 +118,23 @@ export function captureAuthFence({ readOnly = false } = {}) {
 export function observeAccountSession(clear: () => void) {
 	const lifetime = new AbortController();
 	let observed: AccountSession | undefined;
+	const retire = () => {
+		observed?.signal.removeEventListener('abort', retire);
+		observed = undefined;
+		clear();
+	};
 	return {
+		/** Clear stale data before creating a new attempt, even if an event was missed. */
+		prepare() {
+			if (observed && !observed.isCurrent()) retire();
+		},
 		async capture(options?: Parameters<typeof captureAuthFence>[0]) {
 			if (lifetime.signal.aborted) return;
 			const scope = await captureAuthFence(options);
 			if (lifetime.signal.aborted || !scope?.isCurrent()) return;
 			if (scope !== observed) {
 				observed = scope;
-				scope.signal.addEventListener('abort', clear, { signal: lifetime.signal, once: true });
+				scope.signal.addEventListener('abort', retire, { signal: lifetime.signal, once: true });
 			}
 			return scope;
 		},

@@ -12,20 +12,21 @@ export const ssr = false;
 
 export const load: PageLoad = async ({ fetch }) => {
 	const owner = await captureAuthFence();
-	if (!owner) return { sessionCheckFailed: true };
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, fetchFn: fetch, session: { owner } });
+	// Keep the status-only check on browsers without Web Locks. With a
+	// fence available, a refused capture may indicate an active transition.
+	if (!owner && typeof window !== 'undefined' && globalThis.navigator?.locks) return { sessionCheckFailed: true };
+	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, fetchFn: fetch, session: owner && { owner } });
 	// One account snapshot, independent of subscription entitlement.
-	const sent = await owner.run(() => ({
-		result: client.get<unknown>('/v1/me/subscription').then(() => true, (error: unknown) => error)
-	}));
-	const result = await sent?.result;
+	const probe = () => client.get<unknown>('/v1/me/subscription').then(() => true, (error: unknown) => error);
+	const result = owner ? await (await owner.run(() => ({ result: probe() })))?.result : await probe();
 	if (result instanceof ApiError && result.status === 401) {
-		const signedOut = await owner.run(() => {
+		const clear = () => {
 			invalidateLibraryCache();
 			clearSignedInEmail();
 			return true;
-		});
+		};
+		const signedOut = owner ? await owner.run(clear) : clear();
 		if (signedOut) throw redirect(307, '/login');
 	}
-	return { sessionCheckFailed: result !== true || !owner.isCurrent() };
+	return { sessionCheckFailed: result !== true || (owner !== undefined && !owner.isCurrent()) };
 };

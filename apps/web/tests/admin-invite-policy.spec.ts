@@ -149,7 +149,10 @@ test('removes the editor and unsaved drafts on a delivered auth transition', asy
 	const writes = await mock(page);
 	await page.goto(path);
 	await page.getByRole('textbox', { name: fields[0], exact: true }).fill('4');
-	await page.evaluate((key) => window.dispatchEvent(new StorageEvent('storage', { key, storageArea: localStorage })), generation);
+	await page.evaluate((key) => {
+		localStorage.setItem(key, 'replacement-session');
+		window.dispatchEvent(new StorageEvent('storage', { key, storageArea: localStorage }));
+	}, generation);
 	await expect(controls(page)).toHaveCount(0);
 	await expect(page.getByRole('heading', { name: 'Invite policy' })).toBeFocused();
 	expect(writes).toEqual([]);
