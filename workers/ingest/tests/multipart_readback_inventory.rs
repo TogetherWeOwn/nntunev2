@@ -623,6 +623,57 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
     tx.rollback().await.unwrap();
 
     let mut tx = writer.transaction().await.unwrap();
+    // Count candidate rows before insertion. Sequence increments survive
+    // savepoint rollback, so an empty winner table alone cannot mask an attempt.
+    tx.batch_execute(
+        "CREATE TEMP SEQUENCE winner_row_insert_attempts;
+         CREATE FUNCTION pg_temp.test_count_winner_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+            PERFORM nextval('pg_temp.winner_row_insert_attempts');
+            RETURN NEW;
+         END $$;
+         CREATE TRIGGER count_winner_insert BEFORE INSERT ON public.storage_validated_digest_winners
+         FOR EACH ROW EXECUTE FUNCTION pg_temp.test_count_winner_insert();",
+    )
+    .await
+    .unwrap();
+    let attempts = async |tx: &Transaction<'_>| {
+        tx.query_one(
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END
+             FROM pg_temp.winner_row_insert_attempts",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0)
+    };
+
+    let mut expired = tx.transaction().await.unwrap();
+    assert_eq!(
+        expired
+            .execute(
+                "UPDATE public.storage_digest_reservations SET expires_at = '-infinity'
+                 WHERE object_id = $1::text::uuid AND generation = $2",
+                &[&ids[2], &intent.reservation_generation],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(stage(&mut expired).await, Err(MissingOrFenced));
+    assert_eq!(attempts(&expired).await, 0, "already-expired reservation");
+    assert!(expired.query_opt(winner, key).await.unwrap().is_none());
+    expired.rollback().await.unwrap();
+
+    // Restoring the same reservation makes the otherwise identical input valid.
+    let mut live = tx.transaction().await.unwrap();
+    stage(&mut live).await.unwrap();
+    live.rollback().await.unwrap();
+    assert_eq!(attempts(&tx).await, 1, "rolled-back live insert");
+    assert!(tx.query_opt(winner, key).await.unwrap().is_none());
+    tx.rollback().await.unwrap();
+
+    let mut tx = writer.transaction().await.unwrap();
     stage(&mut tx).await.unwrap();
     assert!(observer.query_opt(winner, key).await.unwrap().is_none());
     tx.commit().await.unwrap();
