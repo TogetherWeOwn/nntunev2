@@ -33,6 +33,7 @@ pub struct CompletedReadbackInventory<'a> {
 }
 
 /// Custody of the configured reader, established independently of the receipts.
+#[derive(Clone, Copy)]
 pub struct ReadbackScope<'a> {
     pub bucket: &'a str,
     pub configuration: [u8; 16],
