@@ -13,6 +13,26 @@ test.beforeEach(({ page }) => page.addInitScript(({ current, contextKey, favorit
 	Object.defineProperty(navigator, 'clipboard', { value: undefined });
 }, { current, contextKey, favoritesKey }));
 
+test('recent searches retry verification and Undo follows the original tab scope', async ({ page }) => {
+	const key = 'nntune.library.recent-finds.v1.bound';
+	await page.route('**/v1/me/history', (route) => route.fulfill({ json: { items: [] } }));
+	await page.route('**/api/library', (route) => route.fulfill({ headers: { 'x-nntune-session-binding': current }, json: [] }));
+	await page.route(verifier, (route) => route.fulfill({ json: { session_binding: current } }));
+	await page.route(verifier, (route) => route.fulfill({ status: 503, json: {} }), { times: 1 });
+	await page.goto('/library/recent');
+	const searches = page.getByRole('region', { name: 'Recent searches' });
+	await expect(searches.getByRole('link', { name: 'Scoped query' })).toHaveCount(0);
+	await searches.getByRole('button', { name: 'Retry recent searches' }).click();
+	await expect(searches.getByRole('link', { name: 'Scoped query' })).toBeVisible();
+	await searches.getByRole('button', { name: 'Clear recent searches' }).click();
+	const stored = () => page.evaluate((key) => localStorage.getItem(key), key);
+	expect(await stored()).toBe('[]');
+	await page.getByRole('link', { name: 'Back to Your Library' }).click();
+	await expect(page).toHaveURL(/\/library$/);
+	await page.getByRole('button', { name: 'Undo' }).click();
+	expect(await stored()).toBe('["Scoped query"]');
+});
+
 for (const view of ['Library', 'Liked']) test(`${view} keeps a local favorite edit in its original visit`, async ({ page }) => {
 	await page.route('**/api/library', (route) => route.fulfill({ headers: { 'x-nntune-session-binding': current },
 		json: [{ id: 'track', title: 'Scoped track' }] }));

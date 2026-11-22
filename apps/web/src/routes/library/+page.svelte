@@ -817,7 +817,7 @@
 		const retired = () => owner && !owner.isCurrent();
 		const key = playerId || retired() ? favoritesAuthKey : favoritesKey(session);
 		const sameVisit = () => shareAlive && favoritesInitialized && favoritesAuthKey === key &&
-			(!key || favoritesKey(browserStorage('session')) === key);
+			favoritesKey(browserStorage('session')) === key;
 		if (retired() && (playerId || !sameVisit())) return Promise.resolve(null);
 		const edit = ++favoriteEdit;
 		const before = favorites;
