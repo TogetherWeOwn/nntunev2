@@ -65,7 +65,7 @@ it.each([null, '', 'established'])('captures read-only only with an established 
 	expect(removeItem).not.toHaveBeenCalled();
 });
 
-it.each(['sign-out', 'cross-tab account switch'])('retires bound requests and refuses late results after %s', async (transition) => {
+it.each(['sign-out', 'cross-tab account switch', 'missed storage event'])('retires bound requests and refuses late results after %s', async (transition) => {
 	const { api, write } = setup();
 	const owner = (await captureAuthFence())!;
 	expect(await captureAuthFence()).toBe(owner);
@@ -76,15 +76,27 @@ it.each(['sign-out', 'cross-tab account switch'])('retires bound requests and re
 		.mockReturnValueOnce(late.promise);
 	const client = new ApiClient({ baseUrl: '', fetchFn, session: { owner, binding } });
 
+	expect(() => client.setToken('synthetic')).toThrow('Account requests use the browser session');
+	await expect(client.get(path, { Authorization: 'Bearer synthetic' })).rejects.toThrow('Account requests use the browser session');
+	expect(fetchFn).not.toHaveBeenCalled();
 	await expect(client.get(path)).resolves.toEqual({ session_binding: binding });
 	const pending = client.get(path).catch((error: unknown) => error);
 	const request = fetchFn.mock.calls[1][1];
-	expect(request).toMatchObject({ credentials: 'include', headers: { 'x-nntune-session-binding': binding } });
+	expect(request).toMatchObject({
+		credentials: 'include', cache: 'no-store', redirect: 'error',
+		headers: { 'x-nntune-session-binding': binding }
+	});
 
 	if (transition === 'sign-out') await api.logout();
 	else {
 		write(AUTH_GENERATION_KEY, 'next-account');
-		window.dispatchEvent(Object.assign(new Event('storage'), { key: AUTH_GENERATION_KEY }));
+		if (transition === 'cross-tab account switch') {
+			window.dispatchEvent(Object.assign(new Event('storage'), { key: AUTH_GENERATION_KEY }));
+		} else {
+			await expect(client.get(path)).rejects.toMatchObject({ name: 'AbortError' });
+			expect(request?.signal?.aborted).toBe(false);
+			expect(await captureAuthFence()).not.toBe(owner);
+		}
 	}
 	expect(request?.signal?.aborted).toBe(true);
 	late.resolve(Response.json({ session_binding: binding }));
@@ -92,7 +104,7 @@ it.each(['sign-out', 'cross-tab account switch'])('retires bound requests and re
 	await expect(client.get(path)).rejects.toMatchObject({ name: 'AbortError' });
 	expect(fetchFn).toHaveBeenCalledTimes(2);
 
-	if (transition === 'cross-tab account switch') {
+	if (transition !== 'sign-out') {
 		const next = (await captureAuthFence())!;
 		const nextBinding = 'E'.repeat(43);
 		fetchFn.mockResolvedValueOnce(Response.json({ session_binding: nextBinding }));
