@@ -24,6 +24,9 @@ use nntune_ingest::{
 use sha2::{Digest, Sha256};
 use std::io;
 
+#[path = "multipart_readback_inventory/publisher.rs"]
+mod publisher;
+
 const BUCKET: &str = "test-bucket";
 const KEY: &str = "media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd";
 const SHARED_VERSION: &str = "Opaque+%2F/=";
@@ -66,6 +69,7 @@ impl ReadbackBody for MemoryBody<'_> {
 }
 
 struct ReadbackFixture {
+    map_id: [u8; 16],
     origin: OriginManifest,
     context: EnvelopeContext,
     record: [u8; 230],
@@ -76,10 +80,13 @@ struct ReadbackFixture {
 
 impl ReadbackFixture {
     fn new(plaintext: &[u8]) -> Self {
-        let identities = [0, 1, 2, 0xab, 0xcd, 5].map(id);
+        Self::in_scope(plaintext, [0, 1, 2, 0xab, 0xcd, 5].map(id), MAP_ID, KEY)
+    }
+
+    fn in_scope(plaintext: &[u8], identities: [[u8; 16]; 6], map_id: [u8; 16], key: &str) -> Self {
         let plaintext_len = plaintext.len() as u64;
         let mut enrollment =
-            DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), MAP_ID)
+            DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), map_id)
                 .unwrap();
         let context = EnvelopeContext {
             identities,
@@ -90,7 +97,7 @@ impl ReadbackFixture {
         let plan = Plan::new(
             UploadTarget {
                 bucket: BUCKET,
-                key: KEY,
+                key,
                 upload_id: "synthetic",
             },
             enrollment.header(),
@@ -129,7 +136,7 @@ impl ReadbackFixture {
             .collect();
         let composite = STANDARD.encode(composite.finalize());
         let body = format!(
-            "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key>\
+            "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{key}</Key>\
              <ChecksumSHA256>{composite}-{}</ChecksumSHA256></CompleteMultipartUploadResult>",
             parts.len()
         );
@@ -142,6 +149,7 @@ impl ReadbackFixture {
         let completion = plan.complete(uploads).unwrap();
         let media = completion.verify_versioned_reply(&context, reply).unwrap();
         Self {
+            map_id,
             origin: enrollment.finish().unwrap(),
             context,
             record,
@@ -165,8 +173,15 @@ impl ReadbackFixture {
             version_headers: &[version],
         };
         let page = &self.page_bytes[index as usize];
-        let put =
-            SidecarPut::new(BUCKET, &self.context, &self.origin, MAP_ID, index, page).unwrap();
+        let put = SidecarPut::new(
+            BUCKET,
+            &self.context,
+            &self.origin,
+            self.map_id,
+            index,
+            page,
+        )
+        .unwrap();
         put.verify_reply(reply).unwrap()
     }
 
@@ -178,7 +193,7 @@ impl ReadbackFixture {
             BUCKET,
             CONFIGURATION,
             &self.context,
-            MAP_ID,
+            self.map_id,
             &self.origin,
             &self.media,
             sidecars,
@@ -196,10 +211,19 @@ impl ReadbackFixture {
     }
 
     fn response(&self, pin: ReadbackPin<'_>) -> BucketReadbackResponse<MemoryBody<'_>> {
-        let (key, version, bytes) = match pin.object_key {
-            KEY => (KEY, SHARED_VERSION, &self.media_bytes),
-            PAGE_KEY => (PAGE_KEY, FINAL_VERSION, &self.page_bytes[0]),
-            PAGE_ONE_KEY => (PAGE_ONE_KEY, PAGE_ONE_VERSION, &self.page_bytes[1]),
+        self.response_with_keys(pin, KEY, PAGE_KEY)
+    }
+
+    fn response_with_keys(
+        &self,
+        pin: ReadbackPin<'_>,
+        media_key: &str,
+        first_page_key: &str,
+    ) -> BucketReadbackResponse<MemoryBody<'_>> {
+        let (version, bytes) = match pin.object_key {
+            key if key == media_key => (SHARED_VERSION, &self.media_bytes),
+            key if key == first_page_key => (FINAL_VERSION, &self.page_bytes[0]),
+            PAGE_ONE_KEY => (PAGE_ONE_VERSION, &self.page_bytes[1]),
             _ => panic!("unexpected readback key"),
         };
         assert_eq!(pin.configuration, CONFIGURATION);
@@ -208,7 +232,7 @@ impl ReadbackFixture {
             bucket: BUCKET.into(),
             response: ReadbackResponse {
                 configuration: CONFIGURATION,
-                object_key: key.into(),
+                object_key: pin.object_key.into(),
                 version: Some(version.into()),
                 status: 200,
                 content_length: Some(bytes.len() as u64),
