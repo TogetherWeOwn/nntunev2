@@ -189,8 +189,8 @@ coverage without changing the PR or merging it.
   in the PR body (what it catches that tests cannot).
 - For [staging migrations](docs/ops.md#staging-migrations), applies are
   recorded in `schema_migrations` and the staging deploy gate compares them
-  with `migrations/manifest.toml`. Obtain and record the DDL's board approval
-  as specified in the runbook before dispatching
+  with `migrations/manifest.toml`. Obtain and record independent approval of
+  the exact DDL as specified in the runbook before dispatching
   `.github/workflows/migrations-staging-apply.yml` from `main`.
   Supply the approved full commit `ref`, migration `file`, `applied_by` and
   the recorded approval reference required by `board_approval`. If the
@@ -223,11 +223,15 @@ plan and evidence before making the production change.
 4. Commission a separate cross-family production release review. Obtain the
    reviewer's explicit approval for the exact candidate after they review the
    plan and evidence. If they block the release, address the findings and obtain
-   a fresh review.
-5. Use the existing protected release workflow for the action. Meet its
-   exact-SHA admission, environment protection, credential custody and
-   recorded approval-reference requirements. Respect the workflow's supported
-   modes and enablement gates.
+   a fresh review. This decision supplies the Release Manager acceptance named
+   in existing workflows and runbooks. The release task owner coordinates
+   dispatch with the existing credential and environment custodians.
+5. Use the existing protected workflow for the action. Meet its exact-SHA
+   admission, environment protection, credential custody and approval-reference
+   requirements, where applicable. For `deploy-production`, the GitHub
+   custodian records the approved commit in `PRODUCTION_ACCEPTED_SHA` in the
+   `production` Environment only. Stop if no protected workflow supports the
+   action or if the workflow's enablement gates are closed.
 6. Watch production health and errors for at least 30 minutes after release.
    Roll back immediately on a regression and record the outcome.
 
