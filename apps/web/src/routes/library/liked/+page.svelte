@@ -48,6 +48,7 @@
 			const key = favoritesKey(session);
 			if ((authBoundary && !state.verificationSuspended) || (sessionBinding && favoriteVisitKey !== key)) {
 				pendingChanges.clear();
+				retryPending = false;
 				favoriteVisitKey = null;
 				favoriteIds = [];
 			}
@@ -56,6 +57,7 @@
 			if (authoritative && !authBoundary && !state.libraryUnavailable) {
 				favoriteVisitKey = key;
 				favoriteIds = currentFavorites();
+				if (retryPending) void persistPendingChanges();
 			}
 			items = state.items;
 			loading = state.loading;
@@ -84,6 +86,7 @@
 
 	type FavoriteChange = (ids: readonly string[]) => readonly string[];
 	const pendingChanges = new Map<string, FavoriteChange>();
+	let retryPending = false;
 
 	async function retireDeviceIds(scope: string, ids: readonly string[], verify: () => Promise<boolean>,
 		run: NonNullable<LibraryRefreshUpdate['runIfCurrent']>): Promise<boolean> {
@@ -106,18 +109,39 @@
 		return applyChanges(loadFavorites(session, local, favoriteIds));
 	}
 
-	async function persistChange(id: string, change: FavoriteChange): Promise<void> {
+	function persistChange(id: string, change: FavoriteChange): void {
 		const scope = favoriteVisitKey, receipt = owner;
 		if (!scope || (receipt && !receipt.isCurrent()) || refresher.state.verificationSuspended || scope !== favoritesKey(session)) return;
 		pendingChanges.delete(id);
 		pendingChanges.set(id, change);
 		favoriteIds = currentFavorites();
+		void persistPendingChanges();
+	}
+
+	async function persistPendingChanges(): Promise<void> {
+		const scope = favoriteVisitKey, receipt = owner, storage = session;
+		if (!scope || !pendingChanges.size || scope !== favoritesKey(storage)) return;
+		retryPending = false;
 		let changes = pendingChanges;
-		const stored = await updateStoredFavorites(session, local, scope, (ids) => {
+		let guarded = false, admitted = false;
+		const run: LibraryRefreshUpdate['runIfCurrent'] = receipt && ((work) => {
+			guarded = true;
+			return receipt.run(() => {
+				admitted = true;
+				return work();
+			});
+		});
+		const stored = await updateStoredFavorites(storage, local, scope, (ids) => {
 			changes = new Map(pendingChanges);
 			return applyChanges(ids, changes);
-		}, undefined, receipt?.run);
-		if (!stored || scope !== favoriteVisitKey || (receipt && !receipt.isCurrent())) return;
+		}, undefined, run);
+		if (scope !== favoriteVisitKey) return;
+		if (!stored && receipt && (!receipt.isCurrent() || (guarded && !admitted))) {
+			retryPending = true;
+			if (owner !== receipt && owner?.isCurrent()) void persistPendingChanges();
+			return;
+		}
+		if (!stored || (receipt && !receipt.isCurrent())) return;
 		for (const [id, saved] of changes) if (pendingChanges.get(id) === saved) pendingChanges.delete(id);
 		favoriteIds = currentFavorites();
 	}

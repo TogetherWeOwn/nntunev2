@@ -814,8 +814,11 @@
 		playerId?: string
 	): Promise<FavoriteWrite> {
 		const session = libraryStorage, owner = librarySession;
-		if (owner && !owner.isCurrent()) return Promise.resolve(null);
-		const key = playerId ? favoritesAuthKey : favoritesKey(session);
+		const retired = () => owner && !owner.isCurrent();
+		const key = playerId || retired() ? favoritesAuthKey : favoritesKey(session);
+		const sameVisit = () => shareAlive && favoritesInitialized && favoritesAuthKey === key &&
+			(!key || favoritesKey(browserStorage('session')) === key);
+		if (retired() && (playerId || !sameVisit())) return Promise.resolve(null);
 		const edit = ++favoriteEdit;
 		const before = favorites;
 		const optimistic = update(before);
@@ -839,7 +842,10 @@
 			base = latest;
 			return (superseded = stale()) ? latest : update(latest);
 		}, undefined, owner?.run).then((committed) => {
-			if ((playerId && !ownsWrite()) || (owner && !owner.isCurrent()) || favoritesKey(session) !== key) return null;
+			if (retired()) {
+				if (playerId || !sameVisit()) return null;
+				committed = null;
+			} else if ((playerId && !ownsWrite()) || favoritesKey(session) !== key) return null;
 			superseded ||= !committed && stale();
 			if (playerId && rollback && pendingPlayerFavorites.get(playerId) === rollback) {
 				pendingPlayerFavorites.delete(playerId);
