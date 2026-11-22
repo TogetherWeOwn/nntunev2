@@ -1,9 +1,6 @@
 //! Off-route MusicBrainz evidence for an admin publish decision.
 
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    fmt,
-};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,9 +11,9 @@ use super::{
 };
 use crate::queue::validate_mbid;
 
-// The mirror defaults to one 25-hit search page and caps recording listings
-// at 1000 occurrences. A full page/listing cannot establish completeness.
-const SEARCH_LIMIT: usize = 25;
+const MAX_RELEASE_CANDIDATES: usize = 25;
+const MAX_LABEL_BYTES: usize = 4096;
+// The mirror truncates listings at this length.
 const RECORDINGS_LIMIT: usize = 1000;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
@@ -33,20 +30,37 @@ pub enum NeedsReview {
     PositionMismatch,
 }
 
-#[derive(Deserialize)]
-struct SearchPage {
-    q: String,
-    #[serde(rename = "type")]
-    kind: String,
-    limit: usize,
-    offset: usize,
-    results: Vec<SearchRow>,
+/// Exact-title scope and scoring query for the trusted mirror lookup.
+#[derive(PartialEq, Eq)]
+pub struct ReleaseLookup {
+    pub normalized_title: String,
+    pub score_query: String,
 }
 
-#[derive(Deserialize)]
-struct SearchRow {
-    #[serde(flatten)]
-    hit: MbSearchHit,
+pub fn release_lookup(query: &str) -> Result<ReleaseLookup, NeedsReview> {
+    let query = validate_match_query(query).ok_or(NeedsReview::InvalidQuery)?;
+    let normalized_title =
+        split_artist_album(&query).map_or_else(|| normalize_match_text(&query), |(_, album)| album);
+    if normalized_title.is_empty() {
+        return Err(NeedsReview::InvalidQuery);
+    }
+    let retrieval = album_retrieval_query(&query).unwrap_or(query);
+    let score_query = retrieval
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    Ok(ReleaseLookup {
+        normalized_title,
+        score_query,
+    })
+}
+
+/// Every release with this normalized title from a trusted CC0 mirror lookup.
+/// Pass no evidence for failed lookups or trigram pages, which can omit rivals.
+pub struct CompleteReleaseCandidates<'a> {
+    pub lookup: &'a ReleaseLookup,
+    pub hits: Vec<MbSearchHit>,
 }
 
 #[derive(Debug)]
@@ -58,61 +72,40 @@ impl ReleaseCandidate {
     }
 }
 
-/// Check the original response to the default release search for this
-/// query. The caller obtains it from the trusted CC0 mirror.
+/// Select a release from complete title evidence for this query.
 pub fn select_release(
     query: &str,
-    status: u16,
-    body: &str,
+    evidence: Option<CompleteReleaseCandidates<'_>>,
 ) -> Result<ReleaseCandidate, NeedsReview> {
-    let query = validate_match_query(query).ok_or(NeedsReview::InvalidQuery)?;
-    let page: SearchPage = mirror_body(status, body).ok_or(NeedsReview::SearchEvidence)?;
-    let retrieval = album_retrieval_query(&query);
-    let expected_q = retrieval
-        .as_deref()
-        .unwrap_or(&query)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    if page.q != expected_q
-        || page.kind != "release"
-        || page.limit != SEARCH_LIMIT
-        || page.offset != 0
-        || page.results.len() >= SEARCH_LIMIT
-    {
+    let lookup = release_lookup(query)?;
+    let evidence = evidence.ok_or(NeedsReview::SearchEvidence)?;
+    if evidence.lookup != &lookup || evidence.hits.len() > MAX_RELEASE_CANDIDATES {
         return Err(NeedsReview::SearchEvidence);
     }
 
-    let artist_album = split_artist_album(&query);
-    let mut hits = HashMap::new();
-    for SearchRow { mut hit } in page.results {
-        let title = normalize_match_text(&hit.title);
+    let has_artist = split_artist_album(query.trim()).is_some();
+    let mut scores = HashMap::new();
+    let mut seen = HashMap::new();
+    let mut hits = evidence.hits;
+    for hit in &mut hits {
+        hit.mbid.make_ascii_lowercase();
+        let hit = &*hit;
         let artist = hit.artist_name.as_deref().unwrap_or_default();
-        let exact_album = matches!(&artist_album, Some((_, album)) if *album == title);
         if !validate_mbid(&hit.mbid)
-            || title.is_empty()
+            || hit.title.len().max(artist.len()) > MAX_LABEL_BYTES
+            || normalize_match_text(&hit.title) != lookup.normalized_title
             || hit.title.chars().any(char::is_control)
             || !(0.0..=1.0).contains(&hit.score)
             || matches!(&hit.artist_mbid, Some(id) if !validate_mbid(id))
             || artist.chars().any(char::is_control)
-            || (exact_album && normalize_match_text(artist).is_empty())
+            || (has_artist && normalize_match_text(artist).is_empty())
+            || matches!(scores.insert(&hit.title, hit.score), Some(prior) if prior != hit.score)
+            || matches!(seen.insert(&hit.mbid, hit), Some(prior) if prior != hit)
         {
             return Err(NeedsReview::SearchEvidence);
         }
-        hit.mbid.make_ascii_lowercase();
-        match hits.entry(hit.mbid.clone()) {
-            Entry::Occupied(prior) if prior.get() != &hit => {
-                return Err(NeedsReview::SearchEvidence)
-            }
-            Entry::Occupied(_) => {}
-            Entry::Vacant(slot) => {
-                slot.insert(hit);
-            }
-        }
     }
-    let hits: Vec<_> = hits.into_values().collect();
-    pick_release_mbid(&query, &hits)
+    pick_release_mbid(query.trim(), &hits)
         .map(ReleaseCandidate)
         .ok_or(NeedsReview::ReleaseUnresolved)
 }
@@ -130,13 +123,6 @@ struct RecordingRow {
     recording: MbRecording,
 }
 
-fn mirror_body<'a, T: Deserialize<'a>>(status: u16, body: &'a str) -> Option<T> {
-    if status != 200 || body.len() > MAX_BODY_BYTES || !body.trim_start().starts_with('{') {
-        return None;
-    }
-    serde_json::from_str(body).ok()
-}
-
 /// The caller passes the explicit track and optional disc number for each
 /// verified audio file, in pairing order. Decimal digits with zero padding
 /// are accepted. A missing disc must represent an absent claim.
@@ -152,18 +138,11 @@ fn parse_number(raw: &str) -> Result<i16, NeedsReview> {
         .ok_or(NeedsReview::FileNumbering)
 }
 
-/// Exact release and recording occurrences in the verified files' pairing
-/// order. The caller still owes a trusted, immutable input binding and an
-/// authorized atomic publish transaction.
+/// Exact release and occurrences in pairing order. The publisher must bind
+/// them to the immutable inputs in an authorized atomic transaction.
 pub struct PublishMatch {
     release: ReleaseCandidate,
     recordings: Vec<MbRecording>,
-}
-
-impl fmt::Debug for PublishMatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PublishMatch").finish_non_exhaustive()
-    }
 }
 
 impl PublishMatch {
@@ -176,9 +155,7 @@ impl PublishMatch {
     }
 }
 
-/// Check the unmodified response for the selected release. Preserve all
-/// occurrences in wire order so filtering, deduplication or sorting cannot
-/// hide invalid evidence.
+/// Check the original recording rows in wire order for the selected release.
 pub fn decide_publish_match(
     release: ReleaseCandidate,
     audio_file_count: usize,
@@ -186,15 +163,21 @@ pub fn decide_publish_match(
     status: u16,
     body: &str,
 ) -> Result<PublishMatch, NeedsReview> {
+    if status != 200 || body.len() > MAX_BODY_BYTES || !body.trim_start().starts_with('{') {
+        return Err(NeedsReview::RecordingEvidence);
+    }
     let listing: ReleaseRecordings =
-        mirror_body(status, body).ok_or(NeedsReview::RecordingEvidence)?;
+        serde_json::from_str(body).map_err(|_| NeedsReview::RecordingEvidence)?;
+    let mut titles = HashMap::new();
     if !listing.release_mbid.eq_ignore_ascii_case(release.mbid())
         || listing.recordings.len() >= RECORDINGS_LIMIT
         || listing.recordings.iter().any(|row| {
+            let MbRecording { mbid, title, .. } = &row.recording;
             !row.release_mbid.eq_ignore_ascii_case(release.mbid())
-                || !validate_mbid(&row.recording.mbid)
-                || row.recording.title.trim().is_empty()
-                || row.recording.title.chars().any(char::is_control)
+                || !validate_mbid(mbid)
+                || title.trim().is_empty()
+                || title.chars().any(char::is_control)
+                || matches!(titles.insert(mbid.to_ascii_lowercase(), title), Some(prior) if prior != title)
         })
     {
         return Err(NeedsReview::RecordingEvidence);
