@@ -93,3 +93,36 @@ test('Recent offers retry after a read failure and distinguishes an empty result
 	await expect(history.getByText('No recent plays yet.')).toBeVisible();
 	await expect(history.getByRole('listitem')).toHaveCount(0);
 });
+
+test('Recent refuses a pending history response from the previous account', async ({ page }) => {
+	await page.addInitScript((items) => {
+		const original = window.fetch.bind(window);
+		let first = true;
+		window.fetch = (input, init) => {
+			if (typeof input !== 'string' || !input.endsWith('/v1/me/history') || !first) return original(input, init);
+			first = false;
+			const dataset = document.documentElement.dataset;
+			dataset.historyPending = 'true';
+			init?.signal?.addEventListener('abort', () => (dataset.historyAborted = 'true'), { once: true });
+			return new Promise<Response>((resolve) => {
+				window.addEventListener('release-old-history', () => resolve(Response.json({ items })), { once: true });
+			});
+		};
+	}, plays);
+	await page.route('**/v1/me/history', (route) => route.fulfill({ json: { items: [] } }));
+	await page.route('**/v1/library', (route) => route.fulfill({ json: catalogue }));
+	await page.goto('/library/recent');
+	const history = page.getByRole('region', { name: 'Recently played' });
+	await expect(page.locator('html')).toHaveAttribute('data-history-pending', 'true');
+	await page.evaluate(() => {
+		const key = 'nntune.auth.generation.v1';
+		localStorage.setItem(key, 'replacement-session');
+		window.dispatchEvent(new StorageEvent('storage', { key }));
+	});
+	await expect(page.locator('html')).toHaveAttribute('data-history-aborted', 'true');
+	await history.getByRole('button', { name: 'Retry' }).click();
+	await expect(history.getByText('No recent plays yet.')).toBeVisible();
+	await page.evaluate(() => window.dispatchEvent(new Event('release-old-history')));
+	await expect(history.getByText('No recent plays yet.')).toBeVisible();
+	await expect(history.getByRole('listitem')).toHaveCount(0);
+});

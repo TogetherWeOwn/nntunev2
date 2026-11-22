@@ -2,6 +2,7 @@ import { redirect } from '@sveltejs/kit';
 import type { PageLoad } from './$types';
 import { PUBLIC_API_BASE_URL } from '$app/env/public';
 import { ApiClient, ApiError } from '#lib/api/client.js';
+import { captureAuthFence } from '#lib/auth-fence.js';
 import { clearSignedInEmail } from '#lib/signed-in-email.js';
 import { invalidateLibraryCache } from '#lib/library/cache.js';
 
@@ -10,20 +11,21 @@ import { invalidateLibraryCache } from '#lib/library/cache.js';
 export const ssr = false;
 
 export const load: PageLoad = async ({ fetch }) => {
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, fetchFn: fetch });
-	let sessionCheckFailed = false;
-	try {
-		// One account snapshot, not the unbounded credential history. A session
-		// without a subscription still receives 200; entitlement is irrelevant.
-		await client.get<unknown>('/v1/me/subscription');
-	} catch (error) {
-		if (error instanceof ApiError && error.status === 401) {
+	const owner = await captureAuthFence();
+	if (!owner) return { sessionCheckFailed: true };
+	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, fetchFn: fetch, session: { owner } });
+	// One account snapshot, independent of subscription entitlement.
+	const sent = await owner.run(() => ({
+		result: client.get<unknown>('/v1/me/subscription').then(() => true, (error: unknown) => error)
+	}));
+	const result = await sent?.result;
+	if (result instanceof ApiError && result.status === 401) {
+		const signedOut = await owner.run(() => {
 			invalidateLibraryCache();
 			clearSignedInEmail();
-			throw redirect(307, '/login');
-		}
-		sessionCheckFailed = true;
+			return true;
+		});
+		if (signedOut) throw redirect(307, '/login');
 	}
-
-	return { sessionCheckFailed };
+	return { sessionCheckFailed: result !== true || !owner.isCurrent() };
 };

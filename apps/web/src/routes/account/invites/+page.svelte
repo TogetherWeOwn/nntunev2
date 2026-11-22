@@ -2,11 +2,12 @@
 	import { flushSync, onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError, type MemberInviteHistory, type MemberInviteSummary } from '#lib/api/client.js';
-	import { captureAuthFence, subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
+	import { observeAccountSession, type AccountSession as Fence } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	const account = observeAccountSession(clear);
+	const clientFor = (owner: Fence) => new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session: { owner } });
 	const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 	let copying = $state(false);
 	let invite = $state<{ link: string; expires: Date; isCurrent: () => boolean } | null>(null);
@@ -17,7 +18,6 @@
 	let createButton = $state<HTMLButtonElement>();
 	let heading = $state<HTMLHeadingElement>();
 
-	type Fence = NonNullable<Awaited<ReturnType<typeof captureAuthFence>>>;
 	const readMessages = {
 		loading: 'Loading invite summary…',
 		retry: 'Check your current session to see your invite summary.',
@@ -73,7 +73,7 @@
 		historyRead = attempt;
 		try {
 			const sent = await fence.run(() => attempt.signal.aborted ? undefined : {
-				result: client.readMemberInviteHistory(cursor, attempt.signal).then(
+				result: clientFor(fence).readMemberInviteHistory(cursor, attempt.signal).then(
 					(data) => ({ data }), (cause: unknown) => ({ status: readFailure(cause) })
 				)
 			});
@@ -117,9 +117,9 @@
 		// A confirmed issuance can restart history without waiting for the quota refresh.
 		if (issuedFence) void readHistory(issuedFence);
 		try {
-			const fence = issuedFence ?? await captureAuthFence();
-			const sent = await fence?.run(() => attempt.signal.aborted ? undefined : {
-				result: client.readMemberInvites(attempt.signal).then(
+			const fence = issuedFence ?? await account.capture();
+			const sent = fence && await fence.run(() => attempt.signal.aborted ? undefined : {
+				result: clientFor(fence).readMemberInvites(attempt.signal).then(
 					(data) => ({ data }), (cause: unknown) => ({ status: readFailure(cause) })
 				)
 			});
@@ -163,11 +163,9 @@
 	}
 
 	onMount(() => {
-		const lifetime = new AbortController();
-		subscribeAuthFenceInvalidation(clear, lifetime.signal);
 		const unsubscribe = subscribeLocalAuthTransition(clear);
 		void readSummary();
-		return () => { lifetime.abort(); unsubscribe(); clear(); };
+		return () => { account.dispose(); unsubscribe(); clear(); };
 	});
 
 	async function issue() {
@@ -178,7 +176,7 @@
 		error = notice = '';
 		try {
 			// Box the promise so the shared lock covers dispatch, not the network wait.
-			const sent = await fence.run(() => attempt.signal.aborted ? undefined : { result: client.issueMemberInvite(attempt.signal) });
+			const sent = await fence.run(() => attempt.signal.aborted ? undefined : { result: clientFor(fence).issueMemberInvite(attempt.signal) });
 			if (!sent) {
 				if (!attempt.signal.aborted) {
 					clearHistory();

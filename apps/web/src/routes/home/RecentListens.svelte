@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
-	import { subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
+	import { observeAccountSession } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 	import { createRecentListensReader, type RecentListensView } from './recent-listens.js';
@@ -9,15 +9,14 @@
 	const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 	const eventLabel = { start: 'Playback started', complete: 'Playback completed', skip: 'Playback skipped' };
 	let view = $state<RecentListensView>({ kind: 'loading' });
-	const reader = createRecentListensReader(PUBLIC_API_BASE_URL, (next) => (view = next));
+	const account = observeAccountSession(() => reader.invalidate());
+	const reader = createRecentListensReader(PUBLIC_API_BASE_URL, (next) => (view = next), account.capture);
 
 	onMount(() => {
-		const lifetime = new AbortController();
-		subscribeAuthFenceInvalidation(reader.invalidate, lifetime.signal);
 		const unsubscribe = subscribeLocalAuthTransition(reader.invalidate);
 		void reader.load();
 		return () => {
-			lifetime.abort();
+			account.dispose();
 			unsubscribe();
 			reader.cancel();
 		};

@@ -2,18 +2,17 @@
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError, INVITE_POLICY_BOUNDS, isInvitePolicyValue, type InvitePolicyKey } from '#lib/api/client.js';
-	import { captureAuthFence, subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
+	import { observeAccountSession, type AccountSession as Fence } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 
-	type Fence = NonNullable<Awaited<ReturnType<typeof captureAuthFence>>>;
 	const fields = [
 		{ key: 'invite_member_min_paid_months', label: 'Required paid months', unit: 'months', help: 'Cumulative paid months required to issue member invites.' },
 		{ key: 'invite_member_per_window', label: 'Per-window quota', unit: 'invites', help: 'Invites each member can issue per window. Zero turns off member issuance.' },
 		{ key: 'invite_default_expiry_days', label: 'Default invite expiry', unit: 'days', help: 'Member invites stop working when their window ends, even if they have time left.' }
 	] as const;
 	type Row = (typeof fields)[number] & { confirmed: number; draft: string; error: string; saved: boolean };
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	const account = observeAccountSession(clear);
 	const unavailable = 'Invite policy is unavailable. Reload this page to check access again.';
 	let owner: Fence | undefined;
 	let rows = $state<Row[]>([]);
@@ -32,25 +31,24 @@
 	}
 
 	onMount(() => {
-		const lifetime = new AbortController();
-		subscribeAuthFenceInvalidation(() => clear(), lifetime.signal);
 		const unsubscribe = subscribeLocalAuthTransition(() => clear());
-		void run(undefined, (signal) => client.readInvitePolicy(signal), (policy, fence) => {
+		void run(undefined, (client, signal) => client.readInvitePolicy(signal), (policy, fence) => {
 			owner = fence;
 			rows = fields.map((field) => ({ ...field, confirmed: policy[field.key], draft: String(policy[field.key]), error: '', saved: false }));
 		}, () => clear());
-		return () => { lifetime.abort(); unsubscribe(); clear(); };
+		return () => { account.dispose(); unsubscribe(); clear(); };
 	});
 
-	async function run<T>(fence: Fence | undefined, send: (signal: AbortSignal) => Promise<T>,
+	async function run<T>(fence: Fence | undefined, send: (client: ApiClient, signal: AbortSignal) => Promise<T>,
 		apply: (result: T, fence: Fence) => void, fail: (cause: unknown) => void) {
 		const attempt = new AbortController();
 		request = attempt;
 		try {
-			const guard = fence ?? await captureAuthFence();
+			const guard = fence ?? await account.capture();
 			// Box the settled outcome: hold the auth lock for dispatch, not the network wait.
 			const sent = guard && await guard.run(() => attempt.signal.aborted ? undefined : {
-				result: send(attempt.signal).then((value) => () => apply(value, guard), (cause) => () => fail(cause))
+				result: send(new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session: { owner: guard } }), attempt.signal)
+					.then((value) => () => apply(value, guard), (cause) => () => fail(cause))
 			});
 			const publish = sent && await sent.result;
 			if (attempt.signal.aborted) return;
@@ -80,7 +78,7 @@
 		row.error = '';
 		row.saved = false;
 		saving = key;
-		void run(owner, (signal) => client.writeInvitePolicy(key, value, signal), (confirmed) => {
+		void run(owner, (client, signal) => client.writeInvitePolicy(key, value, signal), (confirmed) => {
 			row.confirmed = confirmed;
 			row.draft = String(confirmed);
 			row.saved = true;

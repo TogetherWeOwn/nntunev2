@@ -113,6 +113,26 @@ export function captureAuthFence({ readOnly = false } = {}) {
 		return scope;
 	});
 }
+
+/** Own the account data a mounted view publishes, including data kept after a request settles. */
+export function observeAccountSession(clear: () => void) {
+	const lifetime = new AbortController();
+	let observed: AccountSession | undefined;
+	return {
+		async capture(options?: Parameters<typeof captureAuthFence>[0]) {
+			if (lifetime.signal.aborted) return;
+			const scope = await captureAuthFence(options);
+			if (lifetime.signal.aborted || !scope?.isCurrent()) return;
+			if (scope !== observed) {
+				observed = scope;
+				scope.signal.addEventListener('abort', clear, { signal: lifetime.signal, once: true });
+			}
+			return scope;
+		},
+		dispose: () => lifetime.abort()
+	};
+}
+
 type AuthIntent = { stale: Error; revocation?: { generation: string | undefined } };
 /** Mark before dispatch and hold until fetch settles (including response cookies). */
 export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Promise<T>, intent?: AuthIntent): Promise<T> {

@@ -2,11 +2,12 @@
 	import { flushSync, onMount, tick } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError, isAdminInviteTreeDenial, isInviteTreeUserId, type AdminInviteTreePage } from '#lib/api/client.js';
-	import { captureAuthFence, subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
+	import { observeAccountSession } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	const invalidate = () => reset(unavailable);
+	const account = observeAccountSession(invalidate);
 	const unavailable = 'Invite tree unavailable for this lookup. Check the user ID and your admin session.';
 	let ready = $state(false);
 	let input = $state('');
@@ -28,12 +29,9 @@
 	}
 
 	onMount(() => {
-		const lifetime = new AbortController();
-		const invalidate = () => reset(unavailable);
-		subscribeAuthFenceInvalidation(invalidate, lifetime.signal);
 		const unsubscribe = subscribeLocalAuthTransition(invalidate);
 		ready = true;
-		return () => { lifetime.abort(); unsubscribe(); pending?.abort(); };
+		return () => { account.dispose(); unsubscribe(); pending?.abort(); };
 	});
 
 	function lookup(event: SubmitEvent) {
@@ -54,10 +52,11 @@
 		pending = attempt;
 		const current = () => pending === attempt && !attempt.signal.aborted;
 		try {
-			const fence = await captureAuthFence({ readOnly: true });
+			const fence = await account.capture({ readOnly: true });
 			// Do not hold the shared auth lock while waiting for the network.
-			const sent = await fence?.run(() => current() ? {
-				result: client.readAdminInviteTree(id, previous?.next_cursor ?? null, attempt.signal).then(
+			const sent = fence && await fence.run(() => current() ? {
+				result: new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session: { owner: fence } })
+					.readAdminInviteTree(id, previous?.next_cursor ?? null, attempt.signal).then(
 					(page) => ({ page, cause: null }), (cause: unknown) => ({ page: null, cause })
 				)
 			} : undefined);
