@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { render } from 'svelte/server';
+import * as authFence from '#lib/auth-fence.js';
 import SecurityPage from './+page.svelte';
 import { load } from './+page';
 import {
@@ -160,5 +161,18 @@ describe('account security page', () => {
 		} finally {
 			vi.unstubAllGlobals();
 		}
+	});
+	it('never redirects on a 401 from a retired scoped probe', async () => {
+		const controller = new AbortController();
+		const { signal } = controller;
+		const capture = vi.spyOn(authFence, 'captureAuthFence').mockResolvedValue({
+			generation: 'test-session', signal, isCurrent: () => !signal.aborted,
+			run: async (work) => signal.aborted ? undefined : work()
+		});
+		const fetch = vi.fn(async () => { controller.abort(); return new Response(null, { status: 401 }); });
+		try {
+			await expect(load({ fetch } as never)).resolves.toEqual({ sessionCheckFailed: true });
+			expect(fetch).toHaveBeenCalledOnce();
+		} finally { capture.mockRestore(); }
 	});
 });

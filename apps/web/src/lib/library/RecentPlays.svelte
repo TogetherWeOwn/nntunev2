@@ -7,7 +7,7 @@
 	import { loadRecentPlays, recentPlayTitles, type RecentPlay } from './recent-plays.js';
 
 	type View =
-		| { kind: 'loading' | 'sign-in' | 'error' }
+		| { kind: 'loading' | 'sign-in' | 'error' | 'unsupported' }
 		| { kind: 'ready'; plays: RecentPlay[]; titles: Map<string, string> };
 
 	let view = $state<View>({ kind: 'loading' });
@@ -28,7 +28,7 @@
 		const owner = await account.capture();
 		if (signal.aborted) return;
 		if (!owner?.isCurrent()) {
-			view = { kind: 'error' };
+			view = { kind: navigator.locks ? 'error' : 'unsupported' };
 			return;
 		}
 		const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal, session: { owner } });
@@ -88,6 +88,8 @@
 		<p role="status">Loading listening history…</p>
 	{:else if view.kind === 'sign-in'}
 		<p><a href="/login">Sign in</a> to see your listening history.</p>
+	{:else if view.kind === 'unsupported'}
+		<p role="status">Listening history requires a browser with Web Locks support.</p>
 	{:else if view.kind === 'error'}
 		<p role="alert">Could not load your listening history.</p>
 		<button type="button" onclick={load}>Retry</button>

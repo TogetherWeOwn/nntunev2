@@ -80,6 +80,17 @@ test('Recent offers sign-in when the initial history request returns 401', async
 	await expect(history.getByRole('listitem')).toHaveCount(0);
 });
 
+test('Recent explains when the browser cannot verify history', async ({ page }) => {
+	await page.addInitScript(() => Object.defineProperty(navigator, 'locks', { value: undefined }));
+	let requests = 0;
+	await page.route('**/v1/me/history', (route) => { requests++; return route.fulfill({ json: { items: plays } }); });
+	await page.goto('/library/recent');
+	const history = page.getByRole('region', { name: 'Recently played' });
+	await expect(history.getByRole('status')).toContainText('Web Locks support');
+	await expect(history.getByRole('button', { name: 'Retry' })).toHaveCount(0);
+	expect(requests).toBe(0);
+});
+
 for (const missedEvent of [false, true]) test(`Recent retries once after a read failure (missed storage event: ${missedEvent})`, async ({ page }) => {
 	let requests = 0;
 	await page.route('**/v1/me/history', (route) => ++requests === 1

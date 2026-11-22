@@ -73,6 +73,7 @@
 			if (result.some(({ id, status }) => id === confirmedId && status !== 'revoked')) return clear('The refreshed list didn’t confirm revocation. Reload for a fresh list.');
 			owner = fence;
 			rows = result;
+			error = '';
 			if (confirmedId !== undefined) notice = `Invite #${confirmedId} revoked.`;
 			writing = false;
 		}, () => clear());
