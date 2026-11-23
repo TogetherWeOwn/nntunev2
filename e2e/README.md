@@ -205,10 +205,12 @@ from the post-deploy staging journey:
    remain useful for upload and readback checks.
 4. Select the curated rows in rendered order, capture browser playback
    advancement before seeking, and drive a paused seek using
-   [the player UI driver](helpers/player-ui.ts). Observe `seeked`, resume
-   advancement, and verify media delivery and the authorized Range response
-   against the served representation. Compare rendered queue IDs and use Next
-   to verify the active track ID changes to the second selection.
+   [the player UI driver](helpers/player-ui.ts). Observe `seeked` and start
+   a fresh playback sampler before resuming. Record the minimum position
+   across time updates and polling to catch a restart. Verify media delivery
+   and the authorized Range response against the served representation.
+   Compare rendered queue IDs and use Next to verify the active track ID
+   changes to the second selection.
 5. Revoke the redeemed invitee's cohort access while keeping private mode
    configured. Check Library, play issuance and heartbeat refusal using the
    same previously working session. Refresh Library and check that the

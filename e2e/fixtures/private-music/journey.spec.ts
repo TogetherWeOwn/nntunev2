@@ -56,14 +56,19 @@ test('synthetic transport observations require advancement, paused seek and queu
   const order = ['fixture-track-1', 'fixture-track-0'];
   // These observations model longer audio. The 93 ms upload clips above
   // cannot establish an informative mid-track seek in a browser.
+  const playing = {
+    sawPlaying: true, maxCurrentTime: 1, paused: false, ended: false,
+    currentTime: 1, duration: 12, readyState: 4, errorCode: null, hasSource: true,
+  };
   const observed = {
     firstTrackId: order[0]!,
     baselineTime: 0,
-    playback: {
-      sawPlaying: true, maxCurrentTime: 1, paused: false, ended: false,
-      currentTime: 1, duration: 12, readyState: 4, errorCode: null, hasSource: true,
-    },
+    playback: playing,
     seek: { currentTime: 6, duration: 12, paused: true, fraction: 0.55, sawSeekedEvent: true },
+    resume: {
+      minimumTime: 6,
+      playback: { ...playing, currentTime: 7, maxCurrentTime: 7 },
+    },
     queueOrder: order,
     nextTrackId: order[1]!,
   };
@@ -78,6 +83,13 @@ test('synthetic transport observations require advancement, paused seek and queu
     { ...observed.seek, duration: NaN },
   ]) {
     expect(() => assertPrivateTransport(order, { ...observed, seek })).toThrow('mid-track seek');
+  }
+  for (const resume of [
+    { ...observed.resume, minimumTime: 0 },
+    { ...observed.resume, minimumTime: Infinity },
+    { ...observed.resume, playback: { ...playing, currentTime: 6, maxCurrentTime: 6 } },
+  ]) {
+    expect(() => assertPrivateTransport(order, { ...observed, resume })).toThrow('advance from the sought position');
   }
   expect(() => assertPrivateTransport(order, { ...observed, queueOrder: null })).toThrow('Queue must match');
   expect(() => assertPrivateTransport(order, {

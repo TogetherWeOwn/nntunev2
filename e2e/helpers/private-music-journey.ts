@@ -1,6 +1,6 @@
 import { API, TESTIDS } from './contract.js';
 import { playbackFailure, type PlaybackEvidence } from './playback.js';
-import { seekProofFailure, type TimedPlayer } from './player-ui.js';
+import { resumeFloorAfterSeek, seekProofFailure, type TimedPlayer } from './player-ui.js';
 import { queueOrderFailure } from './queue-order.js';
 
 // Existing hooks only. The owner upload and publish routes will supply their
@@ -97,6 +97,7 @@ export function assertPrivateTransport(selectionOrder: string[], observed: {
   baselineTime: number;
   playback: PlaybackEvidence;
   seek: TimedPlayer & { fraction: number; sawSeekedEvent: boolean };
+  resume: { minimumTime: number; playback: PlaybackEvidence };
   queueOrder: string[] | null;
   nextTrackId: string | null;
 }): void {
@@ -124,6 +125,15 @@ export function assertPrivateTransport(selectionOrder: string[], observed: {
     seekProofFailure(seek, seek.fraction, seek.sawSeekedEvent)
   ) {
     throw new Error('The player seek control must produce a completed mid-track seek while paused');
+  }
+  const { resume } = observed;
+  if (
+    !Number.isFinite(resume.minimumTime) ||
+    resume.minimumTime < resumeFloorAfterSeek(seek.currentTime, seek.duration) ||
+    resume.minimumTime > resume.playback.maxCurrentTime ||
+    playbackFailure(resume.playback, seek.currentTime)
+  ) {
+    throw new Error('Playback must resume and advance from the sought position');
   }
 }
 
