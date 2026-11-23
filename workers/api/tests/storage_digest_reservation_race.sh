@@ -225,7 +225,7 @@ gen="'41000000-0000-4000-8000-000000000001'"
 # a successful statement returning zero rows, not a database/transport error.
 for scenario in 'abort COMMIT aborted - 0 0' 'abort ROLLBACK aborted 1 1 100' \
                 'checkpoint COMMIT 1 aborted 1 100' 'checkpoint ROLLBACK 1 aborted 0 0' \
-                'checkpoint ROLLBACK 1 expired 0 0 expire'; do
+                'checkpoint ROLLBACK 1 expired 0 0 expire' 'lease COMMIT - - 0 0 grant'; do
   read -r first finish holder_expected contender_expected rev offset action <<<"$scenario"
   action="${action:-abort}"
   initial_idle="absolute_deadline - interval '23 hours 55 minutes'"
@@ -238,15 +238,27 @@ for scenario in 'abort COMMIT aborted - 0 0' 'abort ROLLBACK aborted 1 1 100' \
   psql_run -c "UPDATE public.ingest_session_reservations SET idle_deadline=$initial_idle WHERE id='$sid'"
   lease_id="$(psql_run -Atc 'SELECT gen_random_uuid()')"
   [[ "$lease_id" =~ ^[0-9a-f-]{36}$ ]]
-  [[ "$(psql_run -Atc "$lease" -c "EXECUTE acquire_write_lease($scope, '$sid', $fp, $gen, 0, 0, '$lease_id')")" == "$lease_id" ]]
+  if [[ "$action" != grant ]]; then
+    [[ "$(psql_run -Atc "$lease" -c "EXECUTE acquire_write_lease($scope, '$sid', $fp, $gen, 0, 0, '$lease_id')")" == "$lease_id" ]]
+  fi
   abort_query="EXECUTE abort_session($scope, '$sid', 'abort');"
   advance_query="EXECUTE advance_checkpoint($scope, '$sid', $fp, $gen, 0, 0, 100, '$lease_id');"
   holder_prepare="$abort"; holder_query="$abort_query"
   contender_prepare="$advance"; contender_query="$advance_query"
   terminal=aborted
+  lease_before="write_lease_id='$lease_id' AND write_lease_generation=$gen::uuid"
+  lease_after='write_lease_id IS NULL'
   if [[ "$first" == checkpoint ]]; then
     holder_prepare="$advance"; holder_query="$advance_query"
     contender_prepare="$abort"; contender_query="$abort_query"
+  elif [[ "$action" == grant ]]; then
+    holder_prepare="$lease"; holder_expected="$lease_id"
+    holder_query="EXECUTE acquire_write_lease($scope, '$sid', $fp, $gen, 0, 0, '$lease_id');"
+    contender_prepare="$lease"
+    contender_query="EXECUTE acquire_write_lease($scope, '$sid', $fp, $gen, 0, 0, gen_random_uuid());"
+    terminal=active
+    lease_after="$lease_before"
+    lease_before='write_lease_id IS NULL'
   elif [[ "$finish" == ROLLBACK ]]; then
     terminal=active
   fi
@@ -286,7 +298,7 @@ for scenario in 'abort COMMIT aborted - 0 0' 'abort ROLLBACK aborted 1 1 100' \
   # A separate connection must see only the committed reservation and expiry intent.
   [[ "$(psql_run -Atc "SELECT checkpoint_revision=0 AND checkpoint_offset=0
        AND checkpoint_generation IS NULL AND terminal_reason IS NULL AND terminal_at IS NULL
-       AND write_lease_id='$lease_id' AND write_lease_generation=$gen::uuid
+       AND ($lease_before)
        AND idle_deadline=$initial_idle
        AND EXISTS (SELECT FROM public.ingest_session_cleanup_intents
          WHERE session_id=session.id AND kind='absolute_expiry' AND due_at=session.absolute_deadline)
@@ -302,7 +314,7 @@ for scenario in 'abort COMMIT aborted - 0 0' 'abort ROLLBACK aborted 1 1 100' \
     printf 'unexpected checkpoint/abort statement result: %s\n' "$scenario" >&2; exit 1;
   }
   [[ "$(psql_run -Atc "SELECT COALESCE(terminal_reason, 'active'), checkpoint_revision, checkpoint_offset,
-       (terminal_at IS NULL) = ('$terminal' = 'active'), write_lease_id IS NULL,
+       (terminal_at IS NULL) = ('$terminal' = 'active'), ($lease_after),
        checkpoint_generation IS NOT DISTINCT FROM CASE WHEN $rev = 0 THEN NULL ELSE $gen::uuid END,
        CASE WHEN $rev = 0 THEN idle_deadline = $initial_idle ELSE idle_deadline > $initial_idle END,
        EXISTS (SELECT FROM public.ingest_session_cleanup_intents
