@@ -11,9 +11,7 @@ import time
 from pathlib import Path
 
 from database_bootstrap_preflight import (
-    BootstrapPreflightError,
-    catalog_probe_sql,
-    require_absent_catalog_result,
+    BootstrapPreflightError, catalog_probe_sql, require_absent_catalog_result,
 )
 
 IMAGE = "postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336"
@@ -22,7 +20,7 @@ CREATOR, OWNER = "fixture_creator", "fixture_owner"
 MIGRATOR, RUNTIME, READER = "fixture_migrator", "fixture_runtime", "fixture_reader"
 STAGING = "fixture_staging"
 MAINTENANCE, LAUNCH, SIBLING = "postgres", "launch_fixture", "staging_fixture"
-interrupted = None
+received_signals = set()
 
 
 class FixtureFailure(Exception):
@@ -35,13 +33,12 @@ class Interrupted(Exception):
 
 def remember_signal(signum, _frame):
     # Let a Docker mutation finish before entering teardown.
-    global interrupted
-    interrupted = signum
+    received_signals.add(signum)
 
 
-def check_interruption(drill=False):
-    if interrupted is not None:
-        raise Interrupted(interrupted, drill)
+def check_interruption():
+    if received_signals - {signal.SIGUSR1}:
+        raise Interrupted()
 
 
 def require(condition, verdict):
@@ -62,14 +59,17 @@ def command(*args, input_text=None, timeout=20, cleanup=False, interrupt=False):
                 require(readable and process.stdout.readline() == "ready\n" and process.poll() is None,
                         "start an in-flight Docker interruption drill")
                 check_interruption()
-                signal.raise_signal(signal.SIGTERM)
+                signal.raise_signal(signal.SIGUSR1)
             stdout, stderr = process.communicate(input_text, timeout=timeout)
         finally:
             if process.poll() is None:
                 process.kill()
-    require(not interrupt or process.returncode == 0, "finish the in-flight Docker command")
     if not cleanup:
-        check_interruption(drill=interrupt)
+        check_interruption()
+    if interrupt:
+        require(process.returncode == 0 and signal.SIGUSR1 in received_signals,
+                "record the drill signal and finish the active command")
+        raise Interrupted(signal.SIGUSR1)
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
@@ -93,8 +93,7 @@ class Cluster:
         self.directory = directory
 
     def start(self):
-        server = self.directory / "server"
-        client = self.directory / "client"
+        server, client = self.directory / "server", self.directory / "client"
         server.mkdir()
         client.mkdir()
         for ca in ("trusted", "other"):
@@ -168,9 +167,7 @@ class Cluster:
         require(result.returncode != 0 and result.stdout == "" and reason in result.stderr, verdict)
 
     def create_fenced(self, target=LAUNCH, expected_refusal=None, *, port=PORT, **connection):
-        if port != PORT:
-            require(expected_refusal == "unapproved-port", "refuse unapproved port")
-            return
+        require(port == PORT, "refuse unapproved port")
         connection.setdefault("role", CREATOR)
         probe = catalog_probe_sql(MAINTENANCE, target, CREATOR)
         result = self.sql(probe, **connection)
@@ -229,7 +226,12 @@ def refuse_before_create(cluster):
                f"REVOKE ALL ON DATABASE {SIBLING} FROM PUBLIC;")
     cluster.create_fenced(host=cluster.bad_host, expected_refusal="does not match host name")
     cluster.create_fenced(ca="other", expected_refusal="certificate verify failed")
-    cluster.create_fenced(port=PORT + 1, expected_refusal="unapproved-port")
+    try:
+        cluster.create_fenced(port=PORT + 1)
+    except FixtureFailure as error:
+        require(error.args == ("refuse unapproved port",), "verify explicit port refusal")
+    else:
+        raise FixtureFailure("wrong port was admitted")
     cluster.create_fenced(switch=OWNER, expected_refusal="wrong-session\n")
     cluster.create_fenced(role=MIGRATOR, expected_refusal="wrong-session\n")
     cluster.create_fenced(target=SIBLING, expected_refusal="already-exists\n")
@@ -335,7 +337,6 @@ def verify_launch_grants(cluster):
 
 
 def exercise(*, interrupt):
-    global interrupted
     try:
         with tempfile.TemporaryDirectory(prefix="database-bootstrap-") as temp:
             cluster = Cluster(Path(temp))
@@ -353,16 +354,15 @@ def exercise(*, interrupt):
             finally:
                 cluster.teardown()
     except Interrupted as error:
-        if error.args != (signal.SIGTERM, True):
+        if error.args != (signal.SIGUSR1,):
             raise
-        interrupted = None
     require(not Path(temp).exists(), "verify generated files were removed")
 
 
 def main():
     require(len(sys.argv) == 1, "fixture accepts no arguments")
-    signal.signal(signal.SIGINT, remember_signal)
-    signal.signal(signal.SIGTERM, remember_signal)
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1):
+        signal.signal(signum, remember_signal)
     if docker("image", "inspect", IMAGE).returncode != 0:
         checked(docker("pull", IMAGE, timeout=180), "pull pinned PostgreSQL image")
     exercise(interrupt=False)
