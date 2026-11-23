@@ -24477,6 +24477,15 @@ mod tests {
         assert_eq!(play_call(&h, &owner, play.clone()).status, 404);
         let issued = play_call(&h, &friend, play.clone());
         assert_eq!(issued.status, 200);
+        let conflict = play_call(
+            &h,
+            &friend,
+            json!({"track_id": CAT_REC_A, "session_id": "other-tab"}),
+        );
+        assert_eq!(conflict.status, 429);
+        assert!(conflict
+            .extra_headers
+            .contains(&("x-plan-limit".into(), "concurrent_streams=1".into())));
         let state: Value = serde_json::from_str(&issued.body).unwrap();
         assert_eq!(state["expires_at"], expires_at);
         let renewal =
