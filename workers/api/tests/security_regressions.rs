@@ -840,13 +840,14 @@ fn claim_statements_are_conditional_parameterized_updates() {
         "used = FALSE",
         "redeemed_at IS NULL",
         "revoked_at IS NULL",
-        "expires_at > $3",
+        "checked.expires_at > GREATEST(live_now, $3)",
         "email IS NULL OR EXISTS",
-        "lower(email) = lower(invite_codes.email)",
+        "lower(email) = lower(i.email)",
         "NOT EXISTS",
-        "issuer.id = invite_codes.issued_by",
+        "issuer.id = i.issued_by",
         "redeemer.id = $2",
-        "RETURNING code_hash",
+        "RETURNING invite_codes.id",
+        "SELECT NULL::bigint AS expired_id FROM claimed",
     ] {
         assert!(sql.contains(fragment), "missing {fragment:?} in {sql}");
     }

@@ -1,7 +1,7 @@
 //! Unmounted FLAC frame order and sample-count checks (RFC 9639 §§8.2, 9.1).
 
 use crate::flac_frame::FrameReader;
-use crate::flac_frame_header::Position;
+use crate::flac_frame_header::{FrameHeader, Position};
 use crate::flac_preamble::StreamInfo;
 
 enum Next {
@@ -11,37 +11,48 @@ enum Next {
     EndOnly,
 }
 
-pub(crate) struct FrameContinuity<'a> {
-    info: &'a StreamInfo,
+pub(crate) struct FrameContinuity {
+    info: StreamInfo,
     samples: u64,
     next: Option<Next>,
 }
 
-impl<'a> FrameContinuity<'a> {
-    pub(crate) fn new(info: &'a StreamInfo) -> Self {
+impl FrameContinuity {
+    pub(crate) fn new(info: &StreamInfo) -> Self {
         Self {
-            info,
+            info: *info,
             samples: 0,
             next: Some(Next::First),
         }
     }
 
+    pub(crate) fn stream_info(&self) -> &StreamInfo {
+        &self.info
+    }
+
     /// Advance only after the reader accepts the full frame including its CRC.
     /// The caller starts each reader at the exact next boundary using the same STREAMINFO.
     pub(crate) fn accept(&mut self, frame: FrameReader) -> Result<(), ()> {
+        self.accept_with_pcm(frame).map(|_| ())
+    }
+
+    pub(crate) fn accept_with_pcm(
+        &mut self,
+        frame: FrameReader,
+    ) -> Result<(FrameHeader, Option<Vec<i32>>), ()> {
         let next = self.next.take().ok_or(())?;
-        let header = frame.finish()?;
+        let (header, pcm) = frame.finish_with_pcm()?;
         let block = header.block_size;
         if block == 0 || block > self.info.max_block {
             return Err(());
         }
-        let next = match (next, header.position) {
+        let next = match (next, &header.position) {
             (Next::First, Position::Frame(0)) => self.after_fixed(0, block)?,
-            (Next::Fixed(expected), Position::Frame(n)) if n == expected => {
-                self.after_fixed(n, block)?
+            (Next::Fixed(expected), Position::Frame(n)) if *n == expected => {
+                self.after_fixed(*n, block)?
             }
             (Next::First | Next::Variable, Position::Sample(n))
-                if n == self.samples && self.info.min_block != self.info.max_block =>
+                if *n == self.samples && self.info.min_block != self.info.max_block =>
             {
                 if block < self.info.min_block {
                     Next::EndOnly
@@ -57,7 +68,7 @@ impl<'a> FrameContinuity<'a> {
         }
         self.next = Some(next);
         self.samples = samples;
-        Ok(())
+        Ok((header, pcm))
     }
 
     fn after_fixed(&self, number: u32, block: u16) -> Result<Next, ()> {

@@ -1,12 +1,12 @@
 //! Default-off staging fixture mount. There is no catalogue DB connector here.
 
 use nntune_subsonic::staging_rejection::{RejectionFormat, StagingRejection, StagingRejection::*};
+use subtle::ConstantTimeEq;
 use worker::js_sys::{Function, JsString};
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::{web_sys, Env, Response, Result as WorkerResult};
 use zeroize::Zeroizing;
 
-use crate::handlers::qa_bearer_ok;
 use crate::subsonic_experiment_gate::{Deployment, Lease};
 use crate::subsonic_request_metadata::{is_ascii_literal, property, request_url};
 use crate::subsonic_staging::respond_fixed_rejection;
@@ -41,9 +41,16 @@ fn admitted<'a>(
     }
     let stage_host = var(env, "RP_ID")?;
     let sha = var(env, "BUILD_SHA")?;
+    let method: JsString = property(request.as_ref(), "method").ok()?;
+    if !is_ascii_literal(&method, "POST") {
+        return None;
+    }
     let url = request_url(request).ok()?;
     let path: JsString = property(&url, "pathname").ok()?;
-    if !is_ascii_literal(&path, "/rest") && !path.starts_with("/rest/", 0) {
+    if !["/rest/getArtists", "/rest/getArtist", "/rest/getAlbum"]
+        .iter()
+        .any(|literal| is_ascii_literal(&path, literal))
+    {
         return None;
     }
     let scheme: JsString = property(&url, "protocol").ok()?;
@@ -64,19 +71,44 @@ fn admitted<'a>(
     Some((lease, Schedule::parse(cases)?))
 }
 
-fn authorized_runner(request: &web_sys::Request, env: &Env) -> Option<()> {
+// Store the bearer and its UTC window atomically, independently of QA auth.
+const MAX_RUNNER_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
+const RUNNER_BEARER_LEN: usize = 43; // Unpadded base64url of 32 random bytes.
+
+fn authorized_runner(request: &web_sys::Request, env: &Env, now: u64) -> Option<()> {
     (var(env, "QA_CODE_SEAM").as_deref() == Some("1")).then_some(())?;
-    let token = Zeroizing::new(env.secret("QA_AUTH_TOKEN").ok()?.to_string());
-    if token.trim().is_empty() || token.len() > 1024 {
+    let binding = Zeroizing::new(env.secret("SUBSONIC_MEASUREMENT_RUNNER").ok()?.to_string());
+    // v1:<issued>:<expires>:<bearer>, with at most two 20-digit u64s.
+    let mut fields = (binding.len() <= 45 + RUNNER_BEARER_LEN)
+        .then_some(binding.strip_prefix("v1:")?)?
+        .splitn(3, ':');
+    let timestamp = |raw: &str| {
+        raw.bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| raw.parse::<u64>().ok())
+            .flatten()
+    };
+    let issued = timestamp(fields.next()?)?;
+    let expires = timestamp(fields.next()?)?;
+    let token = fields.next()?;
+    if !(issued..expires).contains(&now)
+        || expires - issued > MAX_RUNNER_AGE_SECONDS
+        || token.len() != RUNNER_BEARER_LEN
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return None;
     }
-    // Match the QA bearer without copying an unbounded header into Rust.
+    // Cap the normalized JS header before copying into Rust. Compare only
+    // the fixed-length bearer bytes in constant time.
     let value = header(request, "authorization")?;
-    if value.length() as usize != "Bearer ".len() + token.len() {
+    if value.length() as usize != "Bearer ".len() + RUNNER_BEARER_LEN {
         return None;
     }
     let value = Zeroizing::new(String::from(value));
-    qa_bearer_ok(value.strip_prefix("Bearer "), &token).then_some(())
+    let candidate = value.strip_prefix("Bearer ")?;
+    bool::from(candidate.as_bytes().ct_eq(token.as_bytes())).then_some(())
 }
 
 fn header(request: &web_sys::Request, name: &str) -> Option<JsString> {
@@ -92,8 +124,9 @@ fn runner_case(
     request: &web_sys::Request,
     env: &Env,
     schedule: Schedule,
+    now: u64,
 ) -> Option<schedule::Case> {
-    authorized_runner(request, env)?;
+    authorized_runner(request, env, now)?;
     // Match only a scheduled literal in JS; do not copy selector values into Rust.
     schedule.resolve(&header(request, "x-subsonic-measurement-case")?)
 }
@@ -115,8 +148,9 @@ fn reject(reason: StagingRejection) -> WorkerResult<Response> {
 pub(super) async fn mount(request: &web_sys::Request, env: &Env) -> Option<WorkerResult<Response>> {
     let raw = var(env, "SUBSONIC_MEASUREMENT_LEASE")?;
     let now_ms = worker::Date::now().as_millis();
-    let (lease, schedule) = admitted(request, env, now_ms / 1000, &raw)?;
-    let Some(case) = runner_case(request, env, schedule) else {
+    let now = now_ms / 1000;
+    let (lease, schedule) = admitted(request, env, now, &raw)?;
+    let Some(case) = runner_case(request, env, schedule, now) else {
         return Some(crate::subsonic_staging_response::finish_document(Ok(None)));
     };
     Some(connection::respond(request, env, lease, case, now_ms).await)
@@ -135,8 +169,9 @@ mod wasm_test {
         now: u32,
     ) -> Option<Array> {
         let raw = var(&env, "SUBSONIC_MEASUREMENT_LEASE")?;
-        let (_, schedule) = admitted(&request, &env, u64::from(now), &raw)?;
-        let case = runner_case(&request, &env, schedule)?;
+        let now = u64::from(now);
+        let (_, schedule) = admitted(&request, &env, now, &raw)?;
+        let case = runner_case(&request, &env, schedule, now)?;
         case.catalogue()?;
         Some(Array::of2(
             &JsValue::from_str(case.fixture_id()),

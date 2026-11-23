@@ -1587,6 +1587,7 @@ fn owned_checkpoint<E>(
     }
 }
 
+pub mod catalogue_publication;
 pub mod multipart;
 
 #[cfg(test)]

@@ -195,6 +195,7 @@ pub struct LibraryPageRow {
     pub recording_mbids: Vec<String>,
     pub recording_mbid: Option<String>,
     pub recording_ord: i64,
+    pub recording_job_match: bool,
 }
 
 /// One mirror recording hit for library assembly: title and duration by
@@ -241,6 +242,7 @@ pub struct LibraryDbRow {
     pub recording_mbids: Vec<String>,
     pub recording_mbid: Option<String>,
     pub recording_ord: i64,
+    pub recording_job_match: bool,
     pub recording_title: Option<String>,
     pub duration_ms: Option<i32>,
     pub medium_no: Option<i16>,
@@ -305,6 +307,7 @@ pub struct TrackResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LibraryEntry {
     pub id: String,
+    pub like_target_id: Option<String>,
     pub occurrence_key: String,
     pub recording_mbids: Vec<String>,
     pub release_mbid: Option<String>,
@@ -374,11 +377,14 @@ pub fn track_response(row: &TrackDbRow) -> TrackResponse {
 /// an error. The art path is gated on the stored release MBID's shape: a
 /// poisoned value yields `None`, never a crafted URL.
 pub fn library_entry(row: &LibraryDbRow) -> LibraryEntry {
+    let id = row.recording_mbid.as_ref().unwrap_or(&row.job_id);
     LibraryEntry {
-        id: row
-            .recording_mbid
-            .clone()
-            .unwrap_or_else(|| row.job_id.clone()),
+        id: id.clone(),
+        like_target_id: if row.recording_mbid.is_none() || row.recording_job_match {
+            crate::target_identity::valid_target_id(id).then(|| id.clone())
+        } else {
+            enrichment_key(id)
+        },
         occurrence_key: format!("{}:{}", row.job_id, row.recording_ord),
         recording_mbids: row.recording_mbids.clone(),
         release_mbid: row.release_mbid.clone(),
@@ -521,6 +527,7 @@ pub fn assemble_library_rows(
                 recording_mbids: row.recording_mbids.clone(),
                 recording_mbid: row.recording_mbid.clone(),
                 recording_ord: row.recording_ord,
+                recording_job_match: row.recording_job_match,
                 recording_title: recording_hit.and_then(|hit| hit.title.clone()),
                 duration_ms: recording_hit.and_then(|hit| hit.duration_ms),
                 medium_no: track_hit.and_then(|hit| hit.medium_no),
@@ -887,6 +894,7 @@ mod tests {
             recording_mbids: vec![GOOD_MBID.to_string()],
             recording_mbid: Some(GOOD_MBID.to_string()),
             recording_ord: 1,
+            recording_job_match: false,
             recording_title: Some("Blue Monday".to_string()),
             duration_ms: Some(420_000),
             medium_no: Some(1),
@@ -987,6 +995,7 @@ mod tests {
             recording_mbids: Vec::new(),
             recording_mbid: None,
             recording_ord: 0,
+            recording_job_match: false,
             recording_title: None,
             duration_ms: None,
             medium_no: None,
@@ -1427,6 +1436,7 @@ mod tests {
             recording_mbids: rec.map(|m| vec![m.to_string()]).unwrap_or_default(),
             recording_mbid: rec.map(str::to_string),
             recording_ord: ord,
+            recording_job_match: false,
         }
     }
 
@@ -1527,6 +1537,16 @@ mod tests {
         assert_eq!(unmatched.recording_mbid, None);
         assert_eq!(unmatched.recording_ord, 0);
         assert!(unmatched.recording_mbids.is_empty());
+        let mut exact_job = upper.clone();
+        exact_job.recording_job_match = true;
+        let mut unmatched = unmatched.clone();
+        unmatched.job_id = GOOD_MBID_UPPER.to_owned();
+        let rows = [upper, &exact_job, &unmatched, poisoned];
+        let exact = Some(GOOD_MBID_UPPER);
+        for (row, id) in rows.into_iter().zip([Some(GOOD_MBID), exact, exact, None]) {
+            let json = serde_json::to_value(library_entry(row)).unwrap();
+            assert_eq!(json.get("like_target_id"), Some(&serde_json::json!(id)));
+        }
     }
 
     #[test]

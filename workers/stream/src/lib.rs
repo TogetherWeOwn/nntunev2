@@ -64,6 +64,8 @@ pub mod pool;
 pub mod prefetch;
 pub mod probe;
 pub mod provider_response;
+#[cfg(any(test, target_arch = "wasm32"))]
+mod r2_play;
 pub mod range;
 mod response_delivery;
 pub mod routes;

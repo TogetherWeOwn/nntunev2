@@ -1,7 +1,7 @@
 //! Rust handoff acceptance on the disposable reservation race fixture.
 
 use super::*;
-use std::{cell::Cell, time::Duration};
+use std::time::Duration;
 use tokio_postgres::NoTls;
 
 const OBJECT: &str = "21000000-0000-4000-8000-000000000012";
@@ -27,7 +27,7 @@ async fn observed_deadline(client: &Client) -> SystemTime {
         .get(0)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pins_require_authorization_and_live_committed_protection() {
     let url = std::env::var("NNTUNE_TEST_DATABASE_URL").expect("disposable database URL");
     assert!(
@@ -170,7 +170,6 @@ async fn pins_require_authorization_and_live_committed_protection() {
     assert_eq!(observed_deadline(&observer).await, requested);
 
     let later = requested + Duration::from_secs(1);
-    let checks = Cell::new(0);
     let fixed_now = SystemTime::now();
     assert!(
         protect_digest_read(
@@ -179,11 +178,14 @@ async fn pins_require_authorization_and_live_committed_protection() {
             later,
             async |_| Some(later),
             || {
-                checks.set(checks.get() + 1);
-                if checks.get() < 3 {
-                    fixed_now
-                } else {
+                // Advance only once the other session can see the committed hold.
+                let deadline = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(observed_deadline(&observer))
+                });
+                if deadline == later {
                     later
+                } else {
+                    fixed_now
                 }
             }
         )

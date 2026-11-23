@@ -64,7 +64,9 @@ impl<'a> DigestRange<'a> {
     }
 
     /// Open a range against independently authorized custody and the origin
-    /// manifest. The checked key stays inside this cursor, not with the caller.
+    /// manifest. The checked key stays inside this cursor. Protected playback
+    /// also requires a confirmed lookup commit for the authorized reference
+    /// and exact manifest, with reads limited by its returned deadline.
     pub fn from_enrolled(
         manifest: &'a OriginManifest,
         authorized_root: &[u8; 32],
