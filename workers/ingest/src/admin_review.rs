@@ -14,9 +14,8 @@ pub const READ_SCOPE: &str = "ingest:review:read";
 pub const RETRY_SCOPE: &str = "ingest:review:retry";
 pub const RETRY_BODY_LIMIT: usize = 128;
 
-/// Synthetic callers use the existing caller-grant format with a fixture key.
-/// A future app proxy must independently check current admin status, with
-/// step-up for retries, before issuing either scoped grant.
+/// Synthetic grants use the existing caller-grant format. A future app proxy
+/// must check current admin status and retry step-up before issuing grants.
 pub struct Authorization<'a> {
     pub bearer: Option<&'a str>,
     pub secret: Option<&'a str>,
@@ -62,15 +61,14 @@ pub struct JobView {
     pub reason: Option<NeedsReview>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct QueueView {
     pub jobs: Vec<JobView>,
     pub limit: u16,
     pub offset: u32,
 }
 
-/// Private reference from verified ingest state. Media metadata binds the
-/// versioned locator and its immutable envelope context.
+/// Private reference binding the versioned locator and immutable envelope context.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ObjectRef {
     pub media: S3MediaMetadata,
@@ -132,12 +130,11 @@ pub async fn detail(
 /// `get` and `verify` use the scope specified by [`detail`]. Verify the
 /// exact version and return its readback reference, or Conflict if gone.
 ///
-/// `publish` runs validation/matching on the pinned input. At commit, recheck
-/// current admin authority and the account fence, owner, revision, state and
-/// object. Atomically commit any publication, audit and outcome at revision + 1.
-/// Return the same committed row for a concurrent repeat. Use Conflict for
-/// obsolete input and MissingOrFenced for lost authority. After an uncertain
-/// commit, return Unavailable and reconcile on replay.
+/// `publish` matches pinned input and rechecks admin authority, account fence,
+/// owner, revision, state and object at commit. Commit publication, audit and
+/// outcome at revision + 1 atomically. Return the committed row for concurrent
+/// repeats, Conflict for stale input, MissingOrFenced for lost authority, or
+/// Unavailable on uncertainty so the next retry can reconcile.
 pub async fn retry(
     auth: &Authorization<'_>,
     get: impl AsyncFn(&str, &str) -> Result<Option<ReviewJob>, BoundaryError>,
