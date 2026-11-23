@@ -96,7 +96,8 @@ COMMIT;
              AND m.set_option AND NOT (m.inherit_option OR m.admin_option)
        ) OR EXISTS (
            SELECT FROM pg_auth_members WHERE roleid = target
-             AND (member <> current_user::regrole OR NOT admin_option OR inherit_option OR set_option)
+             AND (member <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                  OR NOT admin_option OR inherit_option OR set_option)
        ) THEN
         RAISE EXCEPTION 'issuance readback failed';
     END IF;
@@ -125,6 +126,7 @@ COMMIT;
         # Signalling survives rollback. DROP ROLE refuses outstanding database
         # dependencies and removes memberships only when it succeeds.
         return self._cleanup(oid, f"""
+        PERFORM pg_stat_clear_snapshot();
         FOR session_pid IN SELECT pid FROM pg_stat_activity WHERE usesysid = target LOOP
             IF NOT pg_terminate_backend(session_pid, 2000) THEN
                 RAISE EXCEPTION 'session termination failed';

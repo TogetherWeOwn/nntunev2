@@ -256,6 +256,9 @@ def prove_issuance(cluster, lifecycle):
     cluster.ok("authorize the non-superuser issuer to grant only the owner membership", f"""
         GRANT {OWNER} TO {ISSUER} WITH ADMIN TRUE, SET FALSE, INHERIT FALSE;
         """)
+    for connection in ({"role": ISSUER, "database": "template1"}, {"switch": ISSUER}):
+        cluster.denied("refuse an eligible issuer in the wrong custodian session", issue,
+                       "ERROR:  P0001: wrong custodian session", **connection)
     for expiry in (int(time.time()) - 1, int(time.time()) + 7300):
         cluster.denied("refuse issuance outside the native expiry window",
                        lifecycle.issue(expiry, cluster.passwords[CREATOR]),
@@ -297,39 +300,48 @@ def prove_expiry_and_drain(cluster, lifecycle, old_oid):
     cluster.denied("refuse to fence a replacement role with a stale receipt", lifecycle.fence(old_oid),
                    "ERROR:  P0001:", role=ISSUER)
     env = {"PATH": os.defpath, "LC_ALL": "C", "PGHOST": cluster.address, "PGPORT": str(PORT),
-           "PGDATABASE": MAINTENANCE, "PGUSER": CREATOR, "PGPASSWORD": cluster.passwords[CREATOR],
+           "PGDATABASE": MAINTENANCE,
            "PGSSLMODE": "verify-full", "PGGSSENCMODE": "disable", "PGCONNECT_TIMEOUT": "2",
            "PGSSLROOTCERT": str(cluster.directory / "client" / "trusted.crt")}
-    with subprocess.Popen(["/usr/bin/psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"], env=env,
-                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as holder:
-        def readback(sql, expected, timeout=3):
-            holder.stdin.write((sql + "\n").encode())
-            holder.stdin.flush()
-            ready, _, _ = select.select([holder.stdout], [], [], timeout)
-            require(ready and holder.stdout.readline() == expected, "read back the existing setup session")
 
+    def start_session(role):
+        return subprocess.Popen(["/usr/bin/psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"],
+                                env=env | {"PGUSER": role, "PGPASSWORD": cluster.passwords[role]},
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def readback(session, sql, expected, timeout=3):
+        session.stdin.write((sql + "\n").encode())
+        session.stdin.flush()
+        ready, _, _ = select.select([session.stdout], [], [], timeout)
+        require(ready and session.stdout.readline() == expected, "read back a held TLS session")
+
+    with start_session(CREATOR) as holder, start_session(READER) as reader:
         try:
-            readback(f"SELECT session_user = '{CREATOR}' AND current_user = '{CREATOR}';", b"t\n")
+            readback(holder, f"SELECT session_user = '{CREATOR}' AND current_user = '{CREATOR}';", b"t\n")
+            reader_identity = f"SELECT session_user = '{READER}' AND current_user = '{READER}';"
+            readback(reader, reader_identity, b"t\n")
             cluster.denied("cap concurrent setup sessions", "SELECT 1;",
                            "too many connections for role", role=CREATOR)
             # PostgreSQL checks password validity only at authentication.
-            readback(f"SELECT pg_sleep(GREATEST(0, extract(epoch FROM to_timestamp({expiry})"
+            readback(holder, f"SELECT pg_sleep(GREATEST(0, extract(epoch FROM to_timestamp({expiry})"
                      " - clock_timestamp()) + 0.1));", b"\n", timeout=12)
             cluster.denied("deny fresh password authentication after native expiry", "SELECT 1;",
                            "password authentication failed", role=CREATOR)
-            readback(f"SET ROLE {OWNER}; SELECT current_user = '{OWNER}';", b"t\n")
+            readback(holder, f"SET ROLE {OWNER}; SELECT current_user = '{OWNER}';", b"t\n")
             for _ in range(2):
                 cluster.ok("commit the login fence independently of session cleanup", lifecycle.fence(oid),
                            role=ISSUER)
-            readback("SELECT 1;", b"1\n")
+            readback(holder, "SELECT 1;", b"1\n")
             for _ in range(2):
                 cluster.ok("terminate existing sessions and verify role removal", lifecycle.retire(oid),
                            "retired\n", role=ISSUER)
             stdout, _ = holder.communicate(b"SELECT 1;\n", timeout=3)
             require(holder.returncode != 0 and not stdout, "observe the terminated TLS client")
+            readback(reader, reader_identity, b"t\n")
         finally:
-            if holder.poll() is None:
-                holder.kill()
+            for session in (holder, reader):
+                if session.poll() is None:
+                    session.kill()
 
 
 def refuse_before_create(cluster):
@@ -593,6 +605,10 @@ def exercise(*, interrupt):
                 if not interrupt:
                     verify_launch_grants(cluster)
                 cluster.ok("revoke setup login and password", lifecycle.fence(oid), role=ISSUER)
+                cluster.ok("read back the login fence and cleared password", f"""
+                    SELECT NOT rolcanlogin AND NOT rolcreatedb AND rolpassword IS NULL
+                       AND rolvaliduntil = 'epoch'::timestamptz FROM pg_authid WHERE oid = {oid};
+                    """, "t\n")
                 cluster.denied("refuse setup authentication after revocation", "SELECT 1;",
                                "password authentication failed", role=CREATOR)
                 if interrupt:

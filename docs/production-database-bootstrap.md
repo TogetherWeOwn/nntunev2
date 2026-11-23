@@ -226,13 +226,13 @@ supplies an approved absolute expiry within two hours and a freshly
 generated password. SQL carries a SCRAM verifier derived from that password.
 Keep the verifier private with the other issuance inputs. Issuance commits
 the setup role and its single SET-only, non-inherited, non-admin owner
-membership together. It grants LOGIN and CREATEDB, limits connections to
-one and reads back the exact
-attributes, expiry and membership. PostgreSQL gives a non-superuser issuer
-an administrative grant on the new role. Issuance checks that this grant
-carries neither SET nor INHERIT. CREATEDB is cluster-wide during the
-window. The protected setup caller pins the target database name. The
-aggregate reader keeps its own credential and grants.
+membership together. It grants LOGIN and CREATEDB, caps concurrent
+connections at one and reads back the exact attributes, expiry and
+membership. PostgreSQL gives a non-superuser issuer an administrative
+grant on the new role. Issuance checks that this grant carries neither
+SET nor INHERIT. CREATEDB is cluster-wide during the window. The protected
+setup caller pins the target database name. The aggregate reader keeps its
+own credential and grants.
 
 Keep the private issuance OID and require exclusive custody of the role
 through retirement. A duplicate issuance refuses. After ambiguous issuance,
@@ -266,10 +266,10 @@ issuer uses `pg_signal_backend`, which can signal other non-superuser
 sessions. Cleanup selects sessions by the issued role's OID before sending
 signals. Protected live proof must establish that the custodian can issue
 and retire this exact role and that the routed endpoint enforces native
-password expiry, exposes
-both bare SQL identities, admits the caller's sequential connections under
-the connection limit and lets the custodian terminate and read back its
-sessions. [PlanetScale roles](https://planetscale.com/docs/postgres/connecting/roles)
+password expiry, exposes both bare SQL identities, admits the caller's
+sequential connections under the connection limit and lets the custodian
+terminate and read back its sessions.
+[PlanetScale roles](https://planetscale.com/docs/postgres/connecting/roles)
 · [Managed Roles API](https://planetscale.com/docs/api/reference/create_role)
 · [PostgreSQL CREATE ROLE](https://www.postgresql.org/docs/current/sql-createrole.html)
 
