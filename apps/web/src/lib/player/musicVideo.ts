@@ -27,6 +27,7 @@ export interface YouTubePlayer {
 
 interface YouTubeApi {
 	Player: new (frame: HTMLIFrameElement, options: {
+		host: string;
 		events: {
 			onReady: (event: { target: YouTubePlayer }) => void;
 			onError: () => void;

@@ -240,14 +240,6 @@ on…" links from artist URL relationships) are part of the same
 contract and, per §8, are the primary surface — per-track video is
 opportunistic until coverage grows.
 
-The paid, invite-only launch ships with video off. Now Playing exercises the
-player only in the browser fixture build with a synthetic batch result. A
-normal build cannot enable the fixture with a URL parameter and keeps the
-existing CSP. The artist Videos shelf is an explicit successor that needs
-an artist page and a read model for pre-verified artist video records. It
-shares the launch-off decision with Now Playing. The raw mirror
-relationships supply candidates for a future curation job.
-
 ### 3. Web security surface (CSP and embed)
 
 Today's CSP (`apps/web/vite.config.ts`) is nonce-mode with

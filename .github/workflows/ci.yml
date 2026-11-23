@@ -1685,11 +1685,11 @@ jobs:
           printf 'Locked Wrangler: %s\n' "$wrangler_version"
           test "$wrangler_version" = "$(node -p 'require("./apps/web/package.json").devDependencies.wrangler')"
           timeout 120 npx wrangler rollback 12345678-1234-1234-1234-123456789abc --name nntune-web --yes --help
-      - name: Exclude history instrumentation from ordinary output
+      - name: Exclude browser fixtures and YouTube sources from ordinary output
         run: |
           test -d .svelte-kit/output/client && test -d .svelte-kit/output/server
-          if grep -R -l -E '__nntuneHistoryFixture|acceptance-history-live-store' .svelte-kit/output/client .svelte-kit/output/server; then
-            echo 'Test-only history instrumentation found in ordinary output'
+          if grep -R -l -E '__nntuneHistoryFixture|acceptance-history-live-store|music-video-fixture|fixture0001|www\.youtube(-nocookie)?\.com' .svelte-kit/output/client .svelte-kit/output/server; then
+            echo 'Test-only browser fixtures or YouTube sources found in ordinary output'
             exit 1
           else
             result=$?

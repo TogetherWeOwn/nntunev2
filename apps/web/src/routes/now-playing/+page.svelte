@@ -4,6 +4,7 @@
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import Artwork from '#lib/player/Artwork.svelte';
 	import { getAppPlayer } from '#lib/player/AppPlayer.svelte';
+	import { fixtureLink } from '#lib/player/fixtures/music-video.js';
 	import LyricsPanel, { type TrackLyrics } from '#lib/player/LyricsPanel.svelte';
 	import { verifiedVideoId } from '#lib/player/musicVideo.js';
 	import MusicVideoDialog from '#lib/player/MusicVideoDialog.svelte';
@@ -16,29 +17,19 @@
 	const { queue, media } = getAppPlayer();
 	const track = $derived(currentTrack($queue));
 	const artist = $derived(track ? displayArtist(track) : null);
-	// Synthetic result from a successful batch check. Only the browser fixture
-	// build can admit it. No catalogue/URL candidate is a verified result.
-	const fixtureLink = {
-		recordingId: 'cfa3bd0c-52a8-4b00-8f28-993d00001601',
-		videoId: 'fixture0001',
-		verifiedAt: Date.now()
-	};
-	const videoEnabled = $derived(import.meta.env.MODE === 'browser-fixtures' &&
-		page.url.searchParams.get('music-video-fixture') === 'on');
 	function getVideoId() {
-		return videoEnabled && track ? verifiedVideoId(fixtureLink, track.id) : null;
+		if (import.meta.env.MODE !== 'browser-fixtures' || !track ||
+			page.url.searchParams.get('music-video-fixture') !== 'on') return null;
+		return verifiedVideoId(fixtureLink, track.id);
 	}
 	let showVideo = $state(false);
 	let audioTab: HTMLButtonElement;
 	let videoTab: HTMLButtonElement;
 
 	function handleTabKey(event: KeyboardEvent) {
-		const tab = event.currentTarget;
-		const other = tab === audioTab ? videoTab : audioTab;
-		if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') other.focus();
-		else if (event.key === 'Home') audioTab.focus();
-		else if (event.key === 'End') videoTab.focus();
-		else return;
+		if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
+		const other = event.currentTarget === audioTab ? videoTab : audioTab;
+		other.focus();
 		event.preventDefault();
 	}
 
@@ -154,7 +145,7 @@
 	{/if}
 
 	{#if track}
-		{#if getVideoId()}
+		{#if import.meta.env.MODE === 'browser-fixtures' && getVideoId()}
 			<div class="playback-tabs" role="tablist" aria-label="Now Playing views">
 				<button type="button" role="tab" id="now-playing-audio-tab" bind:this={audioTab}
 					class="nt-button nt-button--ghost" aria-selected={!showVideo} tabindex={showVideo ? -1 : 0}
