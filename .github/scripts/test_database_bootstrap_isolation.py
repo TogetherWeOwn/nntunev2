@@ -2,6 +2,7 @@
 
 import os
 import secrets
+import select
 import signal
 import subprocess
 import sys
@@ -17,11 +18,8 @@ from database_bootstrap_preflight import (
 
 IMAGE = "postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336"
 PORT = 5432
-CREATOR = "fixture_creator"
-OWNER = "fixture_owner"
-MIGRATOR = "fixture_migrator"
-RUNTIME = "fixture_runtime"
-READER = "fixture_reader"
+CREATOR, OWNER = "fixture_creator", "fixture_owner"
+MIGRATOR, RUNTIME, READER = "fixture_migrator", "fixture_runtime", "fixture_reader"
 STAGING = "fixture_staging"
 MAINTENANCE, LAUNCH, SIBLING = "postgres", "launch_fixture", "staging_fixture"
 interrupted = None
@@ -41,9 +39,9 @@ def remember_signal(signum, _frame):
     interrupted = signum
 
 
-def check_interruption():
+def check_interruption(drill=False):
     if interrupted is not None:
-        raise Interrupted(interrupted)
+        raise Interrupted(interrupted, drill)
 
 
 def require(condition, verdict):
@@ -51,16 +49,28 @@ def require(condition, verdict):
         raise FixtureFailure(verdict)
 
 
-def command(*args, input_text=None, timeout=20, cleanup=False):
+def command(*args, input_text=None, timeout=20, cleanup=False, interrupt=False):
     if not cleanup:
         check_interruption()
-    result = subprocess.run(
-        args, input=input_text, capture_output=True, text=True, timeout=timeout,
+    with subprocess.Popen(
+        args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         env={"PATH": os.defpath, "LC_ALL": "C"}, start_new_session=True,
-    )
+    ) as process:
+        try:
+            if interrupt:
+                readable, _, _ = select.select([process.stdout], [], [], timeout)
+                require(readable and process.stdout.readline() == "ready\n" and process.poll() is None,
+                        "start an in-flight Docker interruption drill")
+                check_interruption()
+                signal.raise_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(input_text, timeout=timeout)
+        finally:
+            if process.poll() is None:
+                process.kill()
+    require(not interrupt or process.returncode == 0, "finish the in-flight Docker command")
     if not cleanup:
-        check_interruption()
-    return result
+        check_interruption(drill=interrupt)
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
 def docker(*args, **kwargs):
@@ -106,7 +116,6 @@ class Cluster:
         password_file.touch(mode=0o600)
         password_file.write_text(self.passwords["postgres"] + "\n")
         (server / "pg_hba.conf").write_text("local all all trust\nhostssl all all all scram-sha-256\n")
-
         checked(docker("network", "create", "--internal", self.network), "create internal network")
         common = ["run", "--detach", "--pull=never", "--log-driver=none",
                   "--network", self.network, "--tmpfs", "/var/lib/postgresql"]
@@ -137,13 +146,11 @@ class Cluster:
             time.sleep(0.25)
         raise FixtureFailure("verify TLS readiness")
 
-    def sql(self, sql, *, role="postgres", database=MAINTENANCE, host=None,
-            ca="trusted", port=PORT, switch=""):
-        require(port == PORT, "refuse unapproved port")
+    def sql(self, sql, *, role="postgres", database=MAINTENANCE, host=None, ca="trusted", switch=""):
         sql = (f"SET ROLE {switch};\n" if switch else "") + sql
         return docker("exec", "-i", self.client, "env", "-i",
                       "PATH=/usr/local/bin:/usr/bin:/bin", "LC_ALL=C",
-                      f"PGHOST={host or self.server}", f"PGPORT={port}", f"PGDATABASE={database}",
+                      f"PGHOST={host or self.server}", f"PGPORT={PORT}", f"PGDATABASE={database}",
                       f"PGUSER={role}", "PGSSLMODE=verify-full", "PGGSSENCMODE=disable",
                       f"PGSSLROOTCERT=/fixture/{ca}.crt", "PGCONNECT_TIMEOUT=2",
                       "PGOPTIONS=-c statement_timeout=5000 -c lock_timeout=2000",
@@ -160,7 +167,10 @@ class Cluster:
         result = self.sql(sql, **connection)
         require(result.returncode != 0 and result.stdout == "" and reason in result.stderr, verdict)
 
-    def create_fenced(self, target=LAUNCH, expected_refusal=None, **connection):
+    def create_fenced(self, target=LAUNCH, expected_refusal=None, *, port=PORT, **connection):
+        if port != PORT:
+            require(expected_refusal == "unapproved-port", "refuse unapproved port")
+            return
         connection.setdefault("role", CREATOR)
         probe = catalog_probe_sql(MAINTENANCE, target, CREATOR)
         result = self.sql(probe, **connection)
@@ -214,16 +224,12 @@ def provision_roles(cluster):
 
 
 def refuse_before_create(cluster):
-    cluster.ok("create synthetic staging sibling", f"CREATE DATABASE {SIBLING} OWNER {STAGING} TEMPLATE template0;")
-    cluster.ok("fence staging grants", f"REVOKE ALL ON DATABASE {SIBLING} FROM PUBLIC;")
+    cluster.ok("create and restrict the synthetic staging sibling",
+               f"CREATE DATABASE {SIBLING} OWNER {STAGING} TEMPLATE template0;\n"
+               f"REVOKE ALL ON DATABASE {SIBLING} FROM PUBLIC;")
     cluster.create_fenced(host=cluster.bad_host, expected_refusal="does not match host name")
     cluster.create_fenced(ca="other", expected_refusal="certificate verify failed")
-    try:
-        cluster.create_fenced(port=PORT + 1)
-    except FixtureFailure as error:
-        require(str(error) == "refuse unapproved port", "verify port refusal")
-    else:
-        raise FixtureFailure("wrong port was admitted")
+    cluster.create_fenced(port=PORT + 1, expected_refusal="unapproved-port")
     cluster.create_fenced(switch=OWNER, expected_refusal="wrong-session\n")
     cluster.create_fenced(role=MIGRATOR, expected_refusal="wrong-session\n")
     cluster.create_fenced(target=SIBLING, expected_refusal="already-exists\n")
@@ -278,7 +284,6 @@ def verify_launch_grants(cluster):
         SELECT NOT pg_has_role(current_user, '{OWNER}', 'SET')
            AND NOT has_database_privilege(current_user, '{LAUNCH}', 'CONNECT');
         """, "t\n", role=CREATOR)
-
     cluster.ok("verify runtime CRUD and sequence defaults", f"""
         BEGIN;
         SELECT session_user = '{RUNTIME}' AND current_user = '{RUNTIME}'
@@ -331,7 +336,6 @@ def verify_launch_grants(cluster):
 
 def exercise(*, interrupt):
     global interrupted
-    injected = False
     try:
         with tempfile.TemporaryDirectory(prefix="database-bootstrap-") as temp:
             cluster = Cluster(Path(temp))
@@ -342,16 +346,14 @@ def exercise(*, interrupt):
                     refuse_before_create(cluster)
                 cluster.create_fenced()
                 if interrupt:
-                    check_interruption()
-                    injected = True
-                    signal.raise_signal(signal.SIGTERM)
-                    check_interruption()
+                    docker("exec", "-i", cluster.client, "sh", "-ec", "echo ready; read -r line",
+                           input_text="continue\n", timeout=3, interrupt=True)
                     raise FixtureFailure("interruption did not stop the fixture")
                 verify_launch_grants(cluster)
             finally:
                 cluster.teardown()
     except Interrupted as error:
-        if not injected or error.args != (signal.SIGTERM,):
+        if error.args != (signal.SIGTERM, True):
             raise
         interrupted = None
     require(not Path(temp).exists(), "verify generated files were removed")
@@ -367,8 +369,7 @@ def main():
     exercise(interrupt=True)
     check_interruption()
     if output := os.environ.get("GITHUB_OUTPUT"):
-        with open(output, "a", encoding="utf-8") as stream:
-            stream.write("verdict=passed\n")
+        Path(output).write_text("verdict=passed\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
