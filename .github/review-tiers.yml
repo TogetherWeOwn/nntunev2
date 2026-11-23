@@ -10,9 +10,10 @@
 # SQL/schema/migrations; dependency or lockfile changes; CI/workflow
 # changes; weakened test assertions, deleted tests/snapshots or lowered
 # gates in test files.
-# Review per tier: low -> QA; ordinary -> QA;
-# sensitive/unclassified -> Security -> QA.
-# QA verifies the author's risk_tier attestation and may escalate any PR.
+# CONTRIBUTING.md defines review counts and merge authority. Low maps to
+# T2 for eligible docs-only changes and to T1 otherwise. Ordinary maps to
+# T1, and sensitive/unclassified maps to T0. The task owner verifies the
+# Attestation and follows the higher tier when a content trigger applies.
 # This file itself is always sensitive.
 #
 # Sensitive floor (never downgraded): .github/workflows/**, this file,

@@ -20,6 +20,7 @@ beforeEach(() => {
 	current = true;
 	vi.mocked(captureAuthFence).mockResolvedValue({
 		generation: 'test',
+		signal: new AbortController().signal,
 		isCurrent: () => current,
 		run: async (work) => current ? work() : undefined
 	});

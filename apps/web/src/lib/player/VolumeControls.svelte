@@ -11,6 +11,7 @@
 	}
 
 	let { volume, muted, restricted = false, part = 'both', ready, onvolumeinput, ontogglemute }: Props = $props();
+	const volumeId = $props.id();
 
 	function handleInput(event: Event & { currentTarget: HTMLInputElement }): void {
 		const input = event.currentTarget;
@@ -22,9 +23,10 @@
 
 {#if part !== 'status'}
 	<div class="nt-sound">
-		<label>
+		<label for={volumeId}>
 			Volume {Math.round(volume * 100)}%
 			<input
+				id={volumeId}
 				type="range"
 				min="0"
 				max="100"
@@ -37,3 +39,15 @@
 	</div>
 {/if}
 {#if part !== 'controls'}<p role="status" hidden={!restricted}>Use system volume controls.</p>{/if}
+
+<style>
+	@media (pointer: coarse) {
+		.nt-sound :is(input, button) {
+			min-block-size: 44px;
+			min-inline-size: 44px;
+		}
+		.nt-sound input {
+			vertical-align: middle;
+		}
+	}
+</style>
