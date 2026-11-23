@@ -230,9 +230,13 @@ async fn postgres_scoped_completion_exposes_missing_retry_outcome() {
     let mut tx = writer.transaction().await.unwrap();
     for (index, wrong) in [
         (0, &library as &(dyn ToSql + Sync)),
+        (1, &environment),
         (2, &"foreign-owner"),
+        (3, &proposed_retry),
         (4, &&[0xff_u8; 32][..]),
+        (5, &object),
         (6, &0_i64),
+        (7, &0_i64),
         (8, &first_lease),
     ] {
         let mut mismatch = complete;
@@ -263,4 +267,7 @@ async fn postgres_scoped_completion_exposes_missing_retry_outcome() {
     assert_publication(&observer, &map, &scope, Some(&object)).await;
     reserve(&proposed_retry).await;
     assert_eq!(status().await, rolled_back_status);
+    let tx = writer.transaction().await.unwrap();
+    assert!(lock_completion(&tx, &complete).await.is_some());
+    tx.rollback().await.unwrap();
 }
