@@ -105,6 +105,31 @@ fn seeks_in_prepared_plaintext_and_maps_complete_sealed_chunks() {
     assert!(last.final_chunk);
 }
 
+#[test]
+fn streamed_seek_ignores_source_offsets_at_every_input_split() {
+    let input = fixture(OLD_TITLE);
+    let audio_start = (input.len() - AUDIO.len()) as u64;
+    for split in 0..=input.len() {
+        let mut stream = crate::flac_stream::FlacStream::new(true);
+        stream.push(&input[..split]).unwrap();
+        stream.push(&input[split..]).unwrap();
+        let seek = stream.finish_with_index().unwrap().unwrap();
+        assert_eq!(
+            seek.plaintext_range(4999..5001),
+            Some(audio_start..audio_start + 56)
+        );
+        assert_eq!(
+            seek.plaintext_range(5000..10_000),
+            Some(audio_start + 28..audio_start + 56)
+        );
+        assert_eq!(
+            seek.plaintext_range(11_999..u64::MAX),
+            Some(audio_start + 56..input.len() as u64)
+        );
+        assert_eq!(seek.plaintext_range(12_000..12_001), None);
+    }
+}
+
 fn assert_bad_geometry(input: &[u8], frames: impl IntoIterator<Item = FrameSpan>) {
     let error = prepare(input, &[], frames).err();
     assert_eq!(error, Some(PrepareError::FrameGeometry));
