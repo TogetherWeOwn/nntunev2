@@ -28,6 +28,11 @@ BEGIN
         RAISE EXCEPTION 'unleased progress or foreign lease was accepted';
     END IF;
     BEGIN
+        UPDATE public.ingest_session_reservations SET idle_deadline='-infinity' WHERE id=sid;
+        IF EXISTS (SELECT FROM pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 0, 0, lease_id)) THEN
+            RAISE EXCEPTION 'an expired session without a lease acquired one';
+        END IF;
+        UPDATE public.ingest_session_reservations SET idle_deadline=original_idle WHERE id=sid;
         IF (SELECT pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 0, 0, lease_id))
             IS DISTINCT FROM lease_id THEN
             RAISE EXCEPTION 'fixture failed to acquire the lease before rollback';
