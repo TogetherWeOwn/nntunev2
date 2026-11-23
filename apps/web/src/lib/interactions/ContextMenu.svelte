@@ -13,15 +13,15 @@
 	let menu: HTMLDivElement;
 	let opening: MenuRequest;
 	let active = $state(0);
-	let left = $state(0);
-	let top = $state(0);
 	let ready = $state(false);
 	let sheet = $state(false);
 	let prefix = '';
 	let typedAt = 0;
 	let closed = false;
 	let child = $state<MenuRequest | null>(null);
+	let hovered: EventTarget | null = null;
 	let hover: ReturnType<typeof setTimeout> | undefined;
+	let menuScrollTop = 0;
 	let history = $state<Array<{ request: MenuRequest; parentIndex: number }>>([]);
 	const current = $derived(history.at(-1)?.request ?? request);
 	const actions = $derived<MenuAction[]>(history.length
@@ -49,11 +49,20 @@
 		} else child = next;
 	}
 
-	function enter(event: PointerEvent, index: number) {
-		if (event.pointerType !== 'mouse') return;
+	function hoverItem(event: PointerEvent, index: number) {
+		// A viewport pan can move a sibling under a stationary mouse.
+		// Wait for a pointer move before treating that as hover intent.
+		if (event.pointerType !== 'mouse' || hovered === event.currentTarget) return;
+		hovered = event.currentTarget;
 		clearTimeout(hover);
-		if (child?.invoker !== event.currentTarget) dismissSubmenu();
+		if (child?.invoker !== hovered) dismissSubmenu();
 		if (!actions[index].disabled && actions[index].children) hover = setTimeout(() => openSubmenu(index), 300);
+	}
+
+	function leaveItem(event: PointerEvent) {
+		if (event.pointerType !== 'mouse' || hovered !== event.currentTarget) return;
+		hovered = null;
+		clearTimeout(hover);
 	}
 
 	function dismissSubmenu() {
@@ -87,23 +96,47 @@
 	}
 
 	function place() {
-		sheet = window.matchMedia('(max-width: 767px) and (pointer: coarse)').matches;
-		const rect = menu.getBoundingClientRect();
 		const viewport = window.visualViewport;
-		const width = viewport?.width ?? window.innerWidth;
-		const height = viewport?.height ?? window.innerHeight;
+		const width = viewport?.width ?? document.documentElement.clientWidth;
+		const height = viewport?.height ?? document.documentElement.clientHeight;
 		const offsetX = viewport?.offsetLeft ?? 0;
 		const offsetY = viewport?.offsetTop ?? 0;
-		const anchor = opening.invoker.getBoundingClientRect();
-		const point = menuPosition(submenu ? anchor.right - offsetX : opening.x - offsetX,
-			submenu ? anchor.top - offsetY : opening.y - offsetY, rect.width, rect.height, width, height);
-		if (submenu) {
-			point.left = Math.max(0, Math.min(anchor.right - offsetX + rect.width > width
-				? anchor.left - offsetX - rect.width : anchor.right - offsetX, width - rect.width));
-			point.top = Math.max(0, Math.min(anchor.top - offsetY, height - rect.height));
+		menu.style.setProperty('--menu-viewport-width', `${width}px`);
+		menu.style.setProperty('--menu-viewport-height', `${height}px`);
+		if (sheet) {
+			// The sheet rises from this edge as its contents change.
+			menu.style.left = `${offsetX}px`;
+			menu.style.top = `${offsetY + height}px`;
+			return;
 		}
-		left = point.left + offsetX;
-		top = point.top + offsetY;
+
+		// Measure with the new size limits. Write the position synchronously
+		// so each open flyout measures its parent at its updated position.
+		const rect = menu.getBoundingClientRect();
+		let point;
+		if (submenu) {
+			const anchor = opening.invoker.getBoundingClientRect();
+			const right = anchor.right - offsetX;
+			const x = right + rect.width > width ? anchor.left - offsetX - rect.width : right;
+			point = {
+				left: Math.max(0, Math.min(x, width - rect.width)),
+				top: Math.max(0, Math.min(anchor.top - offsetY, height - rect.height))
+			};
+		} else {
+			point = menuPosition(opening.x - offsetX, opening.y - offsetY, rect.width, rect.height, width, height);
+		}
+		menu.style.left = `${point.left + offsetX}px`;
+		menu.style.top = `${point.top + offsetY}px`;
+		// Growing the viewport can clamp the menu's scroll position.
+		menuScrollTop = menu.scrollTop;
+	}
+
+	function reveal(item: HTMLButtonElement) {
+		if (item.offsetTop < menu.scrollTop) menu.scrollTop = item.offsetTop;
+		else if (item.offsetTop + item.offsetHeight > menu.scrollTop + menu.clientHeight) {
+			menu.scrollTop = item.offsetTop + item.offsetHeight - menu.clientHeight;
+		}
+		menuScrollTop = menu.scrollTop;
 	}
 
 	async function focus(index: number) {
@@ -113,10 +146,9 @@
 		await tick();
 		if (closed) return;
 		const item = menu.querySelectorAll<HTMLButtonElement>(':scope > button')[index];
-		item?.focus({ preventScroll: true });
-		if (item && item.offsetTop < menu.scrollTop) menu.scrollTop = item.offsetTop;
-		else if (item && item.offsetTop + item.offsetHeight > menu.scrollTop + menu.clientHeight) {
-			menu.scrollTop = item.offsetTop + item.offsetHeight - menu.clientHeight;
+		if (item) {
+			item.focus({ preventScroll: true });
+			reveal(item);
 		}
 	}
 
@@ -146,6 +178,9 @@
 		// The parent can clear its request before teardown or the recovery tick.
 		opening = request;
 		const { invoker, fallbackFocus } = opening;
+		// Keep the open tree's presentation through a resize so an open
+		// flyout or a sheet's Back history keeps the same navigation model.
+		sheet = !submenu && window.matchMedia('(max-width: 767px) and (pointer: coarse)').matches;
 		menu.showPopover();
 		place();
 		ready = true;
@@ -154,7 +189,8 @@
 			? initial : actions.findIndex((action) => !action.disabled);
 		void focus(Math.max(0, firstEnabled));
 		const outside = (event: MouseEvent) => {
-			if (event.target instanceof Node && !menu.contains(event.target)) close();
+			// Sheet navigation can replace the clicked item during bubbling.
+			if (!event.composedPath().includes(menu)) close();
 		};
 		const focusOutside = (event: FocusEvent) => {
 			if (event.target instanceof Node && !menu.contains(event.target)) close(false);
@@ -163,7 +199,10 @@
 		const scrollY = window.scrollY;
 		const scroll = (event: Event) => {
 			if (event.target instanceof Node && menu.contains(event.target)) {
-				if (event.target === menu) dismissSubmenu();
+				if (event.target === menu && menu.scrollTop !== menuScrollTop) {
+					menuScrollTop = menu.scrollTop;
+					dismissSubmenu();
+				}
 				return;
 			}
 			// A click can scroll its invoker before this listener mounts, with
@@ -175,14 +214,21 @@
 		// A child must not restore focus into a root that is being dismissed.
 		// Let the opening click finish bubbling before listening. Bubble phase
 		// also lets the row consume a long-press's synthesized click first.
-		const listeners = [listen(window, 'resize', place)];
+		const resize = () => {
+			place();
+			const item = document.activeElement;
+			if (item instanceof HTMLButtonElement && item.parentElement === menu) reveal(item);
+		};
+		const listeners = [listen(window, 'resize', resize)];
 		const openingClick = setTimeout(() => {
 			if (!submenu && !closed) listeners.push(listen(document, 'click', outside));
 		}, 0);
 		if (!submenu) {
 			listeners.push(listen(document, 'focusin', focusOutside), listen(window, 'scroll', scroll, true));
 		}
-		if (window.visualViewport) listeners.push(listen(window.visualViewport, 'resize', place));
+		if (window.visualViewport) {
+			listeners.push(listen(window.visualViewport, 'resize', resize), listen(window.visualViewport, 'scroll', place));
+		}
 		return () => {
 			// Snapshot invalidation can unmount the menu without an activation.
 			// Recover only focus that belonged to it, never a newer user choice.
@@ -208,8 +254,6 @@
 	tabindex="-1"
 	data-testid="track-context-menu"
 	class:sheet
-	style:left="{left}px"
-	style:top="{top}px"
 	style:visibility={ready ? 'visible' : 'hidden'}
 	onkeydown={keydown}
 >
@@ -225,8 +269,8 @@
 			tabindex={active === index && !child ? 0 : -1}
 			class:destructive={action.destructive}
 			onfocus={() => (active = index)}
-			onpointerenter={(event) => enter(event, index)}
-			onpointerleave={() => clearTimeout(hover)}
+			onpointermove={(event) => hoverItem(event, index)}
+			onpointerleave={leaveItem}
 			onclick={() => activate(action, index)}
 		>
 			{action.label}{#if action.checked}<span aria-hidden="true"> ✓</span>{/if}{#if action.children}<span aria-hidden="true"> ▸</span>{/if}
@@ -243,11 +287,13 @@
 <style>
 	[role='menu'] {
 		position: fixed;
+		inset: auto;
 		margin: 0;
 		padding: var(--nt-space-1);
-		min-width: min(200px, 100vw);
-		max-width: 100vw;
-		max-height: 80dvh;
+		width: max-content;
+		min-width: min(200px, var(--menu-viewport-width, 100vw));
+		max-width: var(--menu-viewport-width, 100vw);
+		max-height: min(80dvh, calc(var(--menu-viewport-height, 100dvh) * .8));
 		overflow-y: auto;
 		box-sizing: border-box;
 		border: 1px solid var(--nt-border);
@@ -265,6 +311,7 @@
 		color: inherit;
 		font: inherit;
 		text-align: start;
+		overflow-wrap: anywhere;
 		cursor: pointer;
 	}
 	button:not([aria-disabled='true']):hover, button:not([aria-disabled='true']):focus-visible { background: var(--nt-border); }
@@ -273,6 +320,10 @@
 	button[aria-disabled='true'], .hint { color: var(--nt-fg-muted); }
 	button[aria-disabled='true'] { cursor: default; }
 	.hint { display: block; }
-	.sheet { inset: auto 0 0 !important; width: 100%; border-radius: var(--nt-radius) var(--nt-radius) 0 0; }
+	.sheet {
+		width: var(--menu-viewport-width, 100vw);
+		transform: translateY(-100%);
+		border-radius: var(--nt-radius) var(--nt-radius) 0 0;
+	}
 	@media (pointer: coarse) { button { min-height: 48px; } }
 </style>
