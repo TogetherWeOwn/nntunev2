@@ -13,21 +13,40 @@ DECLARE
     fp CONSTANT bytea := decode(repeat('de', 32), 'hex');
     original_idle CONSTANT timestamptz := clock_timestamp() + interval '10 minutes';
     cap CONSTANT timestamptz := clock_timestamp() + interval '15 minutes';
+    original_absolute timestamptz;
     renewed_idle timestamptz;
     lease_id uuid := gen_random_uuid();
     next_lease CONSTANT uuid := gen_random_uuid();
 BEGIN
     SELECT * INTO STRICT f FROM digest_lookup_fixture WHERE n=1;
     PERFORM pg_temp.reserve_session(f.environment_id, f.library_id, owner, 'checkpoint', fp, sid);
-    UPDATE public.ingest_session_reservations SET idle_deadline=original_idle WHERE id=sid;
+    UPDATE public.ingest_session_reservations SET idle_deadline=original_idle WHERE id=sid
+        RETURNING absolute_deadline INTO STRICT original_absolute;
 
     IF EXISTS (SELECT FROM pg_temp.advance_checkpoint(f.environment_id, f.library_id, owner, sid, fp, gen, 0, 0, 100, lease_id)) OR
        EXISTS (SELECT FROM pg_temp.acquire_write_lease(f.environment_id, f.library_id, 'session-other', sid, fp, gen, 0, 0, lease_id)) THEN
         RAISE EXCEPTION 'unleased progress or foreign lease was accepted';
     END IF;
+    BEGIN
+        IF (SELECT pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 0, 0, lease_id))
+            IS DISTINCT FROM lease_id THEN
+            RAISE EXCEPTION 'fixture failed to acquire the lease before rollback';
+        END IF;
+        RAISE SQLSTATE 'Z0001';
+    EXCEPTION WHEN SQLSTATE 'Z0001' THEN NULL;
+    END;
+    IF NOT EXISTS (SELECT FROM public.ingest_session_reservations WHERE id=sid AND write_lease_id IS NULL
+                   AND idle_deadline=original_idle AND absolute_deadline=original_absolute) THEN
+        RAISE EXCEPTION 'rolled-back acquisition left a lease or deadline change';
+    END IF;
     IF (SELECT pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 0, 0, lease_id))
         IS DISTINCT FROM lease_id THEN
         RAISE EXCEPTION 'first lease missing';
+    END IF;
+    IF NOT EXISTS (SELECT FROM public.ingest_session_reservations WHERE id=sid AND write_lease_id=lease_id
+                   AND write_lease_generation=gen AND checkpoint_revision=0 AND checkpoint_offset=0
+                   AND idle_deadline=original_idle AND absolute_deadline=original_absolute) THEN
+        RAISE EXCEPTION 'acquisition changed the checkpoint or renewed a deadline';
     END IF;
     IF EXISTS (SELECT FROM pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 0, 0, next_lease)) THEN
         RAISE EXCEPTION 'outstanding lease was replaced';
@@ -56,6 +75,11 @@ BEGIN
         RAISE EXCEPTION 'accepted progress did not consume the lease and renew the idle deadline';
     END IF;
 
+    IF EXISTS (SELECT FROM pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 0, 100, next_lease)) OR
+       EXISTS (SELECT FROM pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 1, 0, next_lease)) OR
+       EXISTS (SELECT FROM pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen_random_uuid(), 1, 100, next_lease)) THEN
+        RAISE EXCEPTION 'a stale checkpoint acquired a lease';
+    END IF;
     IF (SELECT pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 1, 100, next_lease))
         IS DISTINCT FROM next_lease THEN
         RAISE EXCEPTION 'next lease missing';
