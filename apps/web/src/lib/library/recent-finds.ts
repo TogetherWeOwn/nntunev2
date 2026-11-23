@@ -16,8 +16,8 @@
  */
 
 import {
-	LIBRARY_AUTH_CONTEXT_KEY,
 	LIBRARY_RECENT_FINDS_KEY,
+	libraryContextKey,
 	type SnapshotStorage
 } from './cache.js';
 
@@ -28,13 +28,7 @@ export const MAX_RECENT_FIND_LENGTH = 120;
 
 /** Scoped recent-finds key for the current auth context, or null without one. */
 export function recentFindsKey(session: SnapshotStorage | null): string | null {
-	if (!session) return null;
-	try {
-		const context = session.getItem(LIBRARY_AUTH_CONTEXT_KEY);
-		return context ? `${LIBRARY_RECENT_FINDS_KEY}.${context}` : null;
-	} catch {
-		return null;
-	}
+	return libraryContextKey(session, LIBRARY_RECENT_FINDS_KEY);
 }
 
 function isStoredQuery(value: unknown): value is string {

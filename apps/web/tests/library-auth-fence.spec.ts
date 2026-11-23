@@ -13,6 +13,74 @@ test.beforeEach(({ page }) => page.addInitScript(({ current, contextKey, favorit
 	Object.defineProperty(navigator, 'clipboard', { value: undefined });
 }, { current, contextKey, favoritesKey }));
 
+for (const status of [503, 200]) test(`recent searches withholds queries after verifier response ${status} and keeps Undo scoped`, async ({ page }) => {
+	const key = 'nntune.library.recent-finds.v1.bound';
+	await page.route('**/v1/me/history', (route) => route.fulfill({ json: { items: [] } }));
+	await page.route('**/api/library', (route) => route.fulfill({ headers: { 'x-nntune-session-binding': current }, json: [] }));
+	await page.route(verifier, (route) => route.fulfill({ json: { session_binding: current } }));
+	await page.route(verifier, (route) => route.fulfill({ status, json: { session_binding: 'E'.repeat(43) } }), { times: 1 });
+	await page.goto('/library/recent');
+	const searches = page.getByRole('region', { name: 'Recent searches' });
+	const retry = searches.getByRole('button', { name: 'Retry recent searches' });
+	await expect(retry).toBeVisible();
+	await expect(searches.getByRole('link', { name: 'Scoped query' })).toHaveCount(0);
+	await retry.click();
+	await expect(searches.getByRole('link', { name: 'Scoped query' })).toBeVisible();
+	await searches.getByRole('button', { name: 'Clear recent searches' }).click();
+	const stored = () => page.evaluate((key) => localStorage.getItem(key), key);
+	expect(await stored()).toBe('[]');
+	await page.getByRole('link', { name: 'Back to Your Library' }).click();
+	await expect(page).toHaveURL(/\/library$/);
+	await page.getByRole('button', { name: 'Undo' }).click();
+	expect(await stored()).toBe('["Scoped query"]');
+});
+
+for (const view of ['Library', 'Liked']) test(`${view} keeps a local favorite edit in its original visit`, async ({ page }) => {
+	await page.route('**/api/library', (route) => route.fulfill({ headers: { 'x-nntune-session-binding': current },
+		json: [{ id: 'track', title: 'Scoped track' }] }));
+	await page.route(verifier, (route) => route.fulfill({ json: { session_binding: current } }));
+	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: { session_binding: current, items: [] } }));
+	await page.route('**/v1/me/taste/session', (route) => route.fulfill({ json: { session_binding: current, items: [] } }));
+	const liked = view === 'Liked';
+	await page.goto(liked ? '/library/liked' : '/library');
+	const edit = liked ? page.getByRole('button', { name: 'Remove Scoped track from Liked' })
+		: page.getByTestId('favorites-section').getByRole('button', { name: 'Unstar Scoped track', exact: true });
+	await expect(edit).toBeVisible();
+	const held = liked && await page.evaluateHandle(async (key) => {
+		const acquired = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+		const finished = navigator.locks.request(key, () => {
+			acquired.resolve();
+			return release.promise;
+		});
+		await acquired.promise;
+		return { release: release.resolve, finished };
+	}, favoritesKey);
+	if (held) {
+		await edit.click();
+		await expect(edit).toHaveCount(0);
+	}
+	await page.evaluate(() => {
+		const key = 'nntune.auth.generation.v1';
+		localStorage.setItem(key, 'replacement-generation');
+		window.dispatchEvent(new StorageEvent('storage', { key }));
+	});
+	const stored = () => page.evaluate((key) => localStorage.getItem(key), favoritesKey);
+	if (held) {
+		await held.evaluate(async ({ release, finished }, key) => {
+			release();
+			await finished;
+			await navigator.locks.request(key, () => {});
+		}, favoritesKey);
+		expect(await stored()).toBe('["track"]');
+		await page.getByRole('button', { name: 'Retry', exact: true }).click();
+		await expect.poll(stored).toBe('[]');
+	} else {
+		await edit.click();
+		await expect(edit).toHaveCount(0);
+		expect(await stored()).toBe('["track"]');
+	}
+});
+
 test('a verifier outage allows Retry; replacement retires local player and Undo', async ({ page }) => {
 	let binding = current, failNext = false, verifies = 0;
 	await page.route('**/api/library', (r) => r.fulfill({ headers: { 'x-nntune-session-binding': binding },
@@ -117,5 +185,14 @@ for (const view of ['Home', 'Albums', 'Artists']) {
 		await page.getByRole('button', { name: 'Retry', exact: true }).click();
 		await expect(row).toBeVisible();
 		if (home) await expect(gatedRegion.getByRole('link', { name: 'Scoped query' })).toBeVisible();
+		else {
+			await page.evaluate(() => {
+				const key = 'nntune.auth.generation.v1';
+				localStorage.setItem(key, 'replacement-generation');
+				window.dispatchEvent(new StorageEvent('storage', { key }));
+			});
+			await expect(row).toHaveCount(0);
+			await expect(gatedRegion.getByRole('button', { name: 'Retry collections' })).toBeVisible();
+		}
 	});
 }

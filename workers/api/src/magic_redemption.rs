@@ -13,6 +13,7 @@
 
 use crate::auth::MagicLinkRecord;
 use crate::handlers::StoreError;
+use crate::postgres::{PgQuery, PgTransaction};
 use crate::session::SessionRecord;
 use crate::vault::AuditEvent;
 use tokio_postgres::types::Type;
@@ -130,17 +131,14 @@ fn pg_params<'a>(
         .collect()
 }
 
-impl RedemptionTransaction for tokio_postgres::Transaction<'_> {
+impl RedemptionTransaction for PgTransaction<'_> {
     async fn apply_statement_timeout(&self) -> Result<(), StoreError> {
         // `SET LOCAL` is scoped to this transaction, so it lands on the one
         // backend the transaction pins — unlike the connect-time `SET`,
         // which transaction-mode pooling may apply to a different backend.
-        self.batch_execute(&format!(
-            "SET LOCAL statement_timeout = {}",
-            crate::vault::TOTAL_TIMEOUT_MS
-        ))
-        .await
-        .map_err(|_| StoreError)
+        self.set_local_statement_timeout(crate::vault::TOTAL_TIMEOUT_MS)
+            .await
+            .map_err(|_| StoreError)
     }
 
     async fn claim(&self, magic: &MagicLinkRecord) -> Result<usize, StoreError> {
@@ -172,15 +170,11 @@ impl RedemptionTransaction for tokio_postgres::Transaction<'_> {
     }
 
     async fn commit(self) -> Result<(), StoreError> {
-        tokio_postgres::Transaction::commit(self)
-            .await
-            .map_err(|_| StoreError)
+        PgTransaction::commit(self).await.map_err(|_| StoreError)
     }
 
     async fn rollback(self) -> Result<(), StoreError> {
-        tokio_postgres::Transaction::rollback(self)
-            .await
-            .map_err(|_| StoreError)
+        PgTransaction::rollback(self).await.map_err(|_| StoreError)
     }
 }
 

@@ -31,6 +31,35 @@ env:
   PNPM_VERSION: 10.34.7
 
 jobs:
+  ci-commits:
+    name: ci-commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      merge_sha: ${{ steps.commits.outputs.merge_sha }}
+      base_sha: ${{ steps.commits.outputs.base_sha }}
+      head_sha: ${{ steps.commits.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve tested commit and comparison range
+        id: commits
+        run: python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"
+      - name: Install the pinned workflow YAML scanner
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/ci-python"
+          "$RUNNER_TEMP/ci-python/bin/pip" --isolated install --no-deps --only-binary=:all: --require-hashes \
+            -r /dev/stdin <<<'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc'
+          echo "$RUNNER_TEMP/ci-python/bin" >> "$GITHUB_PATH"
+      - name: Reject added direct PR SHA reads
+        env:
+          BASE_SHA: ${{ steps.commits.outputs.base_sha }}
+          MERGE_SHA: ${{ steps.commits.outputs.merge_sha }}
+        run: python3 .github/scripts/check_workflow_pr_shas.py --base "$BASE_SHA" --tested "$MERGE_SHA"
+      - name: Test the workflow SHA ratchet
+        run: python3 -m unittest discover -s .github/scripts -p test_workflow_pr_shas.py
   # PR-only public security caller; never scan push/queue/dispatch events.
   # Keep this in the ci-ok dependency graph rather than waiting across workflows.
   public-pr-security:
@@ -452,9 +481,7 @@ jobs:
     name: migrations-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      MIGRATIONS_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      MIGRATIONS_PUSH_BEFORE: ${{ github.event.before }}
+    needs: ci-commits
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -465,12 +492,9 @@ jobs:
       # Keep the default PR integration checkout. Its first parent pairs
       # with that exact tree; the payload's base.sha can be stale. Pushes
       # still compare event.before, including pushes of merge commits.
-      - name: Select migration comparison base
-        id: migrations-base
-        run: python3 .github/scripts/migrations_base.py --root . >> "$GITHUB_OUTPUT"
       - name: Check migration manifest and drift
         env:
-          MIGRATIONS_BASE_REF: ${{ steps.migrations-base.outputs.base_ref }}
+          MIGRATIONS_BASE_REF: ${{ needs.ci-commits.outputs.base_sha }}
         run: python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"
       - name: Test migration comparison selection and workflow wiring
         run: python3 .github/scripts/test_migrations_base.py
@@ -645,6 +669,12 @@ jobs:
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+      - name: Enforce unnamed Postgres statements in the API Worker
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/workers/api/clippy
+        run: python3 workers/api/tests/check_hyperdrive_clippy.py
+      - name: Check typed Postgres interface
+        run: cargo test --locked --manifest-path workers/api/Cargo.toml --doc 'postgres::'
       # The Hyperdrive cache gate fails closed without credentials; pin its
       # exit codes with the built-in shim self-test (no network, no secrets).
       - run: bash workers/api/check_hyperdrive_cache.sh --self-test
@@ -790,6 +820,14 @@ jobs:
           inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name" -- --list)"
           test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
           cargo test --locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name" -- --exact --ignored
+          test_name='postgres_append_stages_only_exact_live_candidate_inventory'
+          inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --list)"
+          test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
+          cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --exact --ignored
+          test_name='publisher::postgres_stages_completed_candidate_atomically'
+          inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --list)"
+          test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
+          cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --exact --ignored
       - name: Exercise listen history on disposable PostgreSQL
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
@@ -802,6 +840,15 @@ jobs:
             test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
             cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --exact
           done
+      - name: Exercise the off-route presence boundary on disposable PostgreSQL
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+        run: |
+          test_name='realtime_presence::postgres_tests::postgres_presence_keeps_authority_and_replay_state_together'
+          args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name")
+          inventory="$(cargo test "${args[@]}" -- --list --exact)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          cargo test "${args[@]}" -- --exact
       # Meter-metadata boundary runs below against independently migrated
       # app/mirror stores (their own env vars); it must not run here on the
       # single shared database, where the split-store env vars are absent.
@@ -1342,9 +1389,9 @@ jobs:
     name: docs-links
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Compare pushes with their previous tip; comparing main to itself would miss drift.
+    needs: ci-commits
     env:
-      DOCS_LINKS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
+      DOCS_LINKS_BASE_REF: ${{ needs.ci-commits.outputs.base_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1638,11 +1685,11 @@ jobs:
           printf 'Locked Wrangler: %s\n' "$wrangler_version"
           test "$wrangler_version" = "$(node -p 'require("./apps/web/package.json").devDependencies.wrangler')"
           timeout 120 npx wrangler rollback 12345678-1234-1234-1234-123456789abc --name nntune-web --yes --help
-      - name: Exclude history instrumentation from ordinary output
+      - name: Exclude browser fixtures and YouTube sources from ordinary output
         run: |
           test -d .svelte-kit/output/client && test -d .svelte-kit/output/server
-          if grep -R -l -E '__nntuneHistoryFixture|acceptance-history-live-store' .svelte-kit/output/client .svelte-kit/output/server; then
-            echo 'Test-only history instrumentation found in ordinary output'
+          if grep -R -l -E '__nntuneHistoryFixture|acceptance-history-live-store|music-video-fixture|fixture0001|www\.youtube(-nocookie)?\.com' .svelte-kit/output/client .svelte-kit/output/server; then
+            echo 'Test-only browser fixtures or YouTube sources found in ordinary output'
             exit 1
           else
             result=$?
@@ -2099,12 +2146,36 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
+  changed-lines-mutation:
+    name: changed-lines-mutation
+    needs: ci-commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove the mutation verdict on synthetic PR diffs
+        if: github.event_name == 'pull_request'
+        run: python3 -B .github/scripts/test_check_changed_lines_mutants.py
+      - name: Report the rollout phase and evaluate the tested PR diff
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: python3 -B .github/scripts/check_changed_lines_mutants.py
+        env:
+          MUTATION_BASE_SHA: ${{ needs.ci-commits.outputs.base_sha }}
+          MUTATION_MERGE_SHA: ${{ needs.ci-commits.outputs.merge_sha }}
+      - name: Record the non-PR skip
+        if: github.event_name != 'pull_request' && !(github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: echo 'Mutation skipped because this run has no pull request diff.' | tee -a "$GITHUB_STEP_SUMMARY"
+
   # Aggregate required check: every dependency must succeed, including
   # when a required job fails, is cancelled, or is skipped. GitHub's needs
   # names job IDs, not matrix legs: the web-e2e entry covers both shards.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
+    needs: [ci-commits, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds, changed-lines-mutation]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
