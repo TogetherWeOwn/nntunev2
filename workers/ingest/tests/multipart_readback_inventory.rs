@@ -17,8 +17,6 @@ use nntune_ingest::{
         readback_inventory::{
             BucketReadbackResponse, CompletedReadbackInventory, InventoryError, ReadbackScope,
         },
-        resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
-        session_completion::SessionCompletion,
         sidecar::{CompletedSidecar, SidecarPut, SidecarPutReply},
         CompletedVersionedMedia, Plan, UploadTarget, VersionedCompletionReply,
     },
@@ -28,8 +26,6 @@ use std::io;
 
 #[path = "multipart_readback_inventory/publisher.rs"]
 mod publisher;
-#[path = "multipart_readback_inventory/session.rs"]
-mod session;
 
 const BUCKET: &str = "test-bucket";
 const KEY: &str = "media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd";
@@ -88,16 +84,6 @@ impl ReadbackFixture {
     }
 
     fn in_scope(plaintext: &[u8], identities: [[u8; 16]; 6], map_id: [u8; 16], key: &str) -> Self {
-        Self::with_session(plaintext, identities, map_id, key, None)
-    }
-
-    fn with_session(
-        plaintext: &[u8],
-        identities: [[u8; 16]; 6],
-        map_id: [u8; 16],
-        key: &str,
-        session: Option<&str>,
-    ) -> Self {
         let plaintext_len = plaintext.len() as u64;
         let mut enrollment =
             DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), map_id)
@@ -160,44 +146,8 @@ impl ReadbackFixture {
             body: body.as_bytes(),
             version_headers: &[SHARED_VERSION],
         };
-        let media = if let Some(session) = session {
-            let [_, environment, library, object, generation, _] = identities.map(hex::encode);
-            let binding = ResumeBinding {
-                plan,
-                environment: &environment,
-                library: &library,
-                session,
-                object: &object,
-                generation: &generation,
-                envelope_scheme: 2,
-            };
-            let saved = parts
-                .iter()
-                .map(|part| {
-                    let (_, number, bytes, _) = part.request();
-                    CheckpointPart {
-                        number,
-                        len: bytes.len(),
-                        etag: "synthetic",
-                        digest: Sha256::digest(bytes).into(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            let checkpoint = ResumeCheckpoint {
-                binding,
-                parts: &saved,
-            };
-            let completion =
-                SessionCompletion::prepare(binding, &context, uploads, &checkpoint).unwrap();
-            assert!(completion.manifest().eq(parts.iter().map(|part| {
-                let (_, number, _, checksum) = part.request();
-                (number, "synthetic", checksum)
-            })));
-            completion.verify_completion(reply).unwrap()
-        } else {
-            let completion = plan.complete(uploads).unwrap();
-            completion.verify_versioned_reply(&context, reply).unwrap()
-        };
+        let completion = plan.complete(uploads).unwrap();
+        let media = completion.verify_versioned_reply(&context, reply).unwrap();
         Self {
             map_id,
             origin: enrollment.finish().unwrap(),
