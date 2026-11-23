@@ -1,0 +1,31 @@
+#!/usr/bin/python3
+"""Fixture-only psql shim for exercising the caller's child I/O and cancellation."""
+
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+directory = Path(__file__).parent
+mode, canary, address = (directory / "fault").read_text().split()
+args = ["/usr/bin/psql", *sys.argv[1:]]
+if mode == "resolve":
+    # Route the test DNS name on the isolated network while libpq verifies PGHOST.
+    os.environ["PGHOSTADDR"] = address
+    os.execv(args[0], args)
+
+sql = sys.stdin.buffer.read()
+if mode == "error":
+    trace = ("+ PGPASSWORD=" + os.environ["PGPASSWORD"] + " PGHOST=" + os.environ["PGHOST"] + " psql\n").encode()
+    result = subprocess.run(args, input=f"SELECT missing_{canary};\n".encode() + sql,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    (directory / "diagnostics").write_bytes(trace + result.stderr)
+    os.write(2, trace + result.stderr)
+    sys.exit(result.returncode)
+
+with tempfile.TemporaryFile() as script:
+    script.write(sql.replace(b"ALTER DATABASE", b"SELECT pg_sleep(30);\nALTER DATABASE", 1))
+    script.seek(0)
+    os.dup2(script.fileno(), 0)
+    os.execv(args[0], args)

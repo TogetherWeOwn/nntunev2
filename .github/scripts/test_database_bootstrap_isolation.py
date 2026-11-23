@@ -1,9 +1,11 @@
 """Disposable PostgreSQL qualification. No connection or credential inputs."""
 
 import io
+import ipaddress
 import os
 import secrets
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -12,6 +14,8 @@ import time
 from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
+import database_bootstrap_setup as setup
+from fixtures.database_bootstrap.authorization import caller_env
 from database_bootstrap_preflight import (
     BootstrapPreflightError, catalog_probe_sql, require_absent_catalog_result,
 )
@@ -94,12 +98,17 @@ class Cluster:
         self.client = self.network + "-client"
         roles = ("postgres", CREATOR, MIGRATOR, RUNTIME, READER, STAGING)
         self.passwords = {role: secrets.token_hex(24) for role in roles}
+        self.expiry = int(time.time()) + 300
         self.directory = directory
 
     def start(self):
         server, client = self.directory / "server", self.directory / "client"
         server.mkdir()
         client.mkdir()
+        checked(docker("network", "create", "--internal", self.network), "create internal network")
+        subnet = docker("network", "inspect", "--format", "{{(index .IPAM.Config 0).Subnet}}", self.network)
+        checked(subnet, "read the disposable subnet")
+        self.address = str(ipaddress.IPv4Network(subnet.stdout.strip())[2])
         for ca in ("trusted", "other"):
             checked(command("openssl", "req", "-x509", "-newkey", "ec",
                             "-pkeyopt", "ec_paramgen_curve:P-256", "-noenc", "-days", "1",
@@ -109,7 +118,7 @@ class Cluster:
         request = self.directory / "server.csr"
         checked(command("openssl", "req", "-new", "-newkey", "ec", "-pkeyopt",
                         "ec_paramgen_curve:P-256", "-noenc", "-subj", f"/CN={self.server}",
-                        "-addext", f"subjectAltName=DNS:{self.server}",
+                        "-addext", f"subjectAltName=DNS:{self.server},IP:{self.address}",
                         "-keyout", server / "server.key", "-out", request), "generate TLS request")
         checked(command("openssl", "x509", "-req", "-in", request, "-days", "1",
                         "-CA", client / "trusted.crt", "-CAkey", self.directory / "trusted.key",
@@ -117,7 +126,6 @@ class Cluster:
                 "sign fixture server certificate")
         (server / "password").write_text(self.passwords["postgres"] + "\n")
         (server / "pg_hba.conf").write_text("local all all trust\nhostssl all all all scram-sha-256\n")
-        checked(docker("network", "create", "--internal", self.network), "create internal network")
         common = ["run", "--detach", "--pull=never", "--log-driver=none",
                   "--network", self.network, "--tmpfs", "/var/lib/postgresql"]
         checked(docker(*common, "--name", self.server, "--network-alias", f"wrong-{self.server}",
@@ -133,6 +141,8 @@ class Cluster:
                 "start isolated client")
         checked(docker("network", "inspect", "--format", "{{.Internal}}", self.network),
                 "verify an internal network", "true\n")
+        checked(docker("inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", self.server),
+                "verify the certificate address belongs to the disposable server", self.address + "\n")
         for name in (self.server, self.client):
             checked(docker("inspect", "--format", "{{.HostConfig.PublishAllPorts}} {{len .HostConfig.PortBindings}}",
                            name), "verify no published PostgreSQL ports", "false 0\n")
@@ -208,8 +218,9 @@ class Cluster:
 
 
 def provision_roles(cluster):
+    valid_until = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cluster.expiry))
     cluster.ok("create distinct fixture roles", f"""
-        CREATE ROLE {CREATOR} LOGIN CREATEDB PASSWORD '{cluster.passwords[CREATOR]}';
+        CREATE ROLE {CREATOR} LOGIN CREATEDB PASSWORD '{cluster.passwords[CREATOR]}' VALID UNTIL '{valid_until}';
         CREATE ROLE {OWNER} NOLOGIN;
         GRANT {OWNER} TO {CREATOR} WITH INHERIT FALSE, SET TRUE;
         """ + "\n".join(
@@ -253,20 +264,100 @@ def verify_quiet_failure(cluster):
             "capture result, error and credential trace without publishing them")
 
 
+def start_caller(env):
+    return subprocess.Popen([sys.executable, "-EsB", setup.__file__], env=env,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def caller_verdict(process, expected, timeout=45):
+    stdout, stderr = process.communicate(timeout=timeout)
+    status = f"database-bootstrap-setup: {expected}\n".encode()
+    result = (0, status, b"") if expected == "complete" else (1, b"", status)
+    require((process.returncode, stdout, stderr) == result, f"emit only the caller's {expected} verdict")
+
+
+def traced_client(cluster, mode):
+    shim = cluster.directory / "psql"
+    shutil.copyfile(Path(__file__).parent / "fixtures/database_bootstrap/psql", shim)
+    shim.chmod(0o700)
+    (cluster.directory / "fault").write_text(f"{mode} {cluster.canary} {cluster.address}")
+    return f"{cluster.directory}:/usr/bin:/bin"
+
+
+def prove_setup_caller(cluster, *, interrupt):
+    def run(env, expected):
+        with start_caller(env) as process:
+            try:
+                caller_verdict(process, expected)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+
+    cluster.canary = secrets.token_hex(20)
+    roles = CREATOR, OWNER, MIGRATOR, READER
+    env = caller_env(cluster, roles)
+    if not interrupt:
+        for overrides in (
+            {"GITHUB_RUN_ATTEMPT": "2"}, {"BOOTSTRAP_STEP_DEBUG": "true"},
+            {"BOOTSTRAP_PLAN_DIGEST": secrets.token_hex(32)},
+            {"GITHUB_SHA": secrets.token_hex(20)}, {"GITHUB_REPOSITORY": "fixture/fork"},
+        ):
+            run(env | overrides, "refused")
+        for changes in (
+            {"port": PORT + 1}, {"reader_role": CREATOR}, {"reader_role": "missing_reader"},
+            {"ca_pem": (cluster.directory / "client" / "other.crt").read_text()},
+        ):
+            run(caller_env(cluster, roles, **changes), "refused")
+        run(caller_env(cluster, roles, setup_role=READER, reader_role=CREATOR)
+            | {"BOOTSTRAP_SETUP_PASSWORD": cluster.passwords[READER]}, "refused")
+        run(env | {"PATH": traced_client(cluster, "error")}, "refused")
+        diagnostics = (cluster.directory / "diagnostics").read_bytes()
+        require(all(value.encode() in diagnostics for value in
+                    (cluster.passwords[CREATOR], cluster.address, "ERROR:", cluster.canary)),
+                "exercise generated credential trace, endpoint and SQL error containment")
+        dns = {"PATH": traced_client(cluster, "resolve")}
+        run(caller_env(cluster, roles, host=f"wrong-{cluster.server}") | dns, "refused")
+        env = caller_env(cluster, roles, host=cluster.server) | dns
+        run(env | {"BOOTSTRAP_EXPIRY": str(cluster.expiry - 60)}, "refused")
+        cluster.ok("verify all caller refusals leave the target absent",
+                   f"SELECT NOT EXISTS (SELECT FROM pg_database WHERE datname = '{LAUNCH}');", "t\n")
+        run(env, "complete")
+        run(env, "refused")  # The name collision stops any second write.
+        return
+
+    def wait_for(verdict, sql):
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+            check_interruption()
+            if cluster.sql(sql).stdout == "t\n":
+                return
+            time.sleep(0.1)
+        raise FixtureFailure(verdict)
+
+    sessions = f"SELECT FROM pg_stat_activity WHERE usename = '{CREATOR}'"
+    with start_caller(env | {"PATH": traced_client(cluster, "interrupt")}) as process:
+        try:
+            wait_for("observe the caller inside the setup transaction",
+                     f"SELECT EXISTS ({sessions} AND wait_event = 'PgSleep');")
+            process.terminate()
+            caller_verdict(process, "outcome-uncertain", timeout=3)
+        finally:
+            if process.poll() is None:
+                process.kill()
+    wait_for("verify the interrupted SQL session closed", f"SELECT NOT EXISTS ({sessions});")
+    cluster.ok("verify interruption rolled back the grants and left the create fenced", f"""
+        SELECT NOT datallowconn AND datdba = '{CREATOR}'::regrole AND datacl IS NULL
+        FROM pg_database WHERE datname = '{LAUNCH}';
+        """, "t\n")
+    require(not list(cluster.directory.glob("database-bootstrap-ca-*")), "remove the caller's temporary CA")
+
+
 def verify_launch_grants(cluster):
-    cluster.ok("revoke PUBLIC database privileges and transfer ownership", f"""
-        REVOKE ALL ON DATABASE {LAUNCH} FROM PUBLIC;
-        ALTER DATABASE {LAUNCH} OWNER TO {OWNER};
-        """, role=CREATOR)
-    cluster.ok("verify revoked PUBLIC access and transferred ownership before admission", f"""
-        SELECT NOT datallowconn AND datdba = '{OWNER}'::regrole
+    cluster.ok("verify revoked PUBLIC access and transferred ownership on admission", f"""
+        SELECT datallowconn AND datdba = '{OWNER}'::regrole
            AND NOT EXISTS (SELECT FROM aclexplode(datacl) WHERE grantee = 0)
         FROM pg_database WHERE datname = '{LAUNCH}' AND datacl IS NOT NULL;
         """, "t\n", role=CREATOR)
-    cluster.ok("admit only the migrator for setup", f"""
-        GRANT CONNECT, CREATE ON DATABASE {LAUNCH} TO {MIGRATOR};
-        ALTER DATABASE {LAUNCH} ALLOW_CONNECTIONS true;
-        """, role=CREATOR, switch=OWNER)
     for role in (RUNTIME, READER, STAGING):
         cluster.denied("refuse connection during migrator-only setup", "SELECT 1;",
                        "permission denied for database", role=role, database=LAUNCH)
@@ -357,7 +448,7 @@ def exercise(*, interrupt):
                 if not interrupt:
                     refuse_before_create(cluster)
                     verify_quiet_failure(cluster)
-                cluster.create_fenced()
+                prove_setup_caller(cluster, interrupt=interrupt)
                 if interrupt:
                     docker("exec", "-i", cluster.client, "sh", "-exc",
                            'echo ready; read -r line; printf "%s" "$line"',
