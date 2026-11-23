@@ -39,12 +39,10 @@ where
     N: AsyncDns,
 {
     let grant = committed.ok_or_else(not_found)?;
-    if req.method != "GET"
-        || fetch_site != Some("same-origin")
-        || range.is_some_and(|value| {
-            value.len() > 128 || !value.bytes().all(|b| (b' '..=b'~').contains(&b))
-        })
-    {
+    let valid_range = |value: &str| {
+        value.len() <= 128 && value.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+    };
+    if req.method != "GET" || fetch_site != Some("same-origin") || !range.is_none_or(valid_range) {
         return Err(not_found());
     }
     let (claims, _) = preference_authenticate(ctx, req, false).await?;

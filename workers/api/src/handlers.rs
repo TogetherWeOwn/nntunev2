@@ -19128,8 +19128,8 @@ mod tests {
             bitrate_kbps: Some(1_000),
             ..Default::default()
         };
-        let key = (user_id.into(), track_id.into());
-        h.store.meter_meta.borrow_mut().insert(key, meta);
+        let key = (user_id.to_owned(), track_id.to_owned());
+        h.store.meter_meta.borrow_mut().insert(key.clone(), meta);
         assert_eq!(block_on(handle(&ctx, &req)).status, 404);
         let range = Some("bytes=2-7");
         block_on(relay(
@@ -19188,13 +19188,14 @@ mod tests {
         refused_grant(&receipt);
         assert_eq!(h.store.playback_leases.borrow()[user_id], newer);
         set_lease(lease.clone());
+        let missing_duration = TrackMeterMeta {
+            track_duration_ms: None,
+            ..meta
+        };
         h.store
             .meter_meta
             .borrow_mut()
-            .values_mut()
-            .next()
-            .unwrap()
-            .track_duration_ms = None;
+            .insert(key, missing_duration);
         refused_grant(&receipt);
     }
 

@@ -234,7 +234,6 @@ it.each([0, 1])('releases the shared lock when cache enumeration %i stalls', asy
 
 const playbackBinding = 'A'.repeat(43);
 const signal = () => new AbortController().signal;
-const current = () => true;
 const candidate = { trackId: 'next' };
 
 it('only a matching owner, track and continuation can publish an uncredentialed media locator', async () => {
@@ -243,28 +242,27 @@ it('only a matching owner, track and continuation can publish an uncredentialed 
 		({ ...req, playId: 'play-7', durationMs: 120_000 }));
 	const scope = createBrowserPlaybackGrant((await captureAuthFence())!, playbackBinding, prepare);
 	const publish = vi.fn<(_source: QueuedPlaySource, _duration: number) => void>();
-	const result = { sessionBinding: playbackBinding, playbackSessionId: scope.playbackSessionId, trackId: 'next', playId: 'play-7', durationMs: 120_000 };
 	for (const bad of [{ trackId: 'old' }, { playbackSessionId: 'another-tab' }, { sessionBinding: 'B'.repeat(42) + 'A' },
 		{ durationMs: 0 }, { durationMs: 1.5 }, { playId: 'different' }, { playId: '../escape' }]) {
-		prepare.mockResolvedValueOnce({ ...result, ...bad });
-		expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), current, publish)).toBe(false);
+		prepare.mockImplementationOnce(async (req) => ({ ...req, playId: 'play-7', durationMs: 120_000, ...bad }));
+		expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), () => true, publish)).toBe(false);
 	}
-	expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), current, publish)).toBe(true);
-	expect(prepare).toHaveBeenLastCalledWith({ ...candidate, sessionBinding: playbackBinding, playbackSessionId: scope.playbackSessionId, playId: 'play-7' }, expect.any(AbortSignal));
+	expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), () => true, publish)).toBe(true);
 	expect(publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
 		streamUrl: `/v1/plays/media/next/${scope.playbackSessionId}/play-7`
 	}), 120_000);
 });
 
-it.each(['disabled', 'denied', 'superseded', 'cancelled', 'account switch', 'reset'] as const)('%s cannot publish a replacement source', async (reason) => {
+it.each(['accepted', 'disabled', 'denied', 'superseded', 'cancelled', 'account switch', 'reset'] as const)('%s respects the live player and queue receipts', async (reason) => {
 	const { api } = setup();
 	const owner = (await captureAuthFence())!;
 	const initial = createQueue(['current', 'next'].map((id) => ({ id, title: id, artist: '', streamUrl: `/${id}` })));
-	const player = createPlayerController(initial, { flush: async () => {} });
+	const flush = vi.fn(async () => {});
+	const player = createPlayerController(initial, { flush });
 	const audio = Object.assign(new EventTarget(), { paused: false, ended: false, error: null,
 		getAttribute: () => '/current', pause: vi.fn() });
 	player.media.attach(audio as unknown as HTMLAudioElement);
-	const publish = vi.fn((source: QueuedPlaySource) => { void player.media.playSelected(initial, 1, source); });
+	const publish = (source: QueuedPlaySource) => { void player.media.playSelected(initial, 1, source); };
 	const started = Promise.withResolvers<AbortSignal>();
 	const finish = Promise.withResolvers<void>();
 	const prepare = vi.fn(async (req: { sessionBinding: string; playbackSessionId: string; trackId: string }, transportSignal: AbortSignal) => {
@@ -291,8 +289,10 @@ it.each(['disabled', 'denied', 'superseded', 'cancelled', 'account switch', 'res
 			expect(transportSignal.aborted).toBe(['cancelled', 'account switch', 'reset'].includes(reason));
 		}
 		finish.resolve();
-		expect(await opening).toBe(false);
-		expect(publish).not.toHaveBeenCalled();
+		const accepted = reason === 'accepted';
+		expect(await opening).toBe(accepted);
+		expect(flush).toHaveBeenCalledTimes(Number(accepted));
+		if (accepted) return;
 		if (reason === 'account switch') {
 			expect(player.queue.snapshot).toEqual(createQueue([]));
 			expect(player.media.audio).toBeUndefined();

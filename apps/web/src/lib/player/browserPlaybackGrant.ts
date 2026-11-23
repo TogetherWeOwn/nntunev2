@@ -23,7 +23,8 @@ export function createBrowserPlaybackGrant(owner: AccountSession, sessionBinding
 			publish: (source: QueuedPlaySource, durationMs: number) => void
 		): Promise<boolean> {
 			const signal = AbortSignal.any([owner.signal, lifetime.signal, cancellation]);
-			const current = () => !signal.aborted && owner.isCurrent() && isCurrent();
+			const ownsAccount = () => !signal.aborted && owner.isCurrent();
+			const current = () => ownsAccount() && isCurrent();
 			if (opening || !prepare || !current() || !validSessionBinding(sessionBinding) || !validId(trackId) ||
 				(playId !== undefined && !validId(playId))) return false;
 			opening = true;
@@ -41,7 +42,7 @@ export function createBrowserPlaybackGrant(owner: AccountSession, sessionBinding
 				const { playId: issuedPlayId, durationMs } = reply;
 				return (await owner.run(() => {
 					if (!current()) return false;
-					publish({ streamUrl: `/v1/plays/media/${trackId}/${playbackSessionId}/${issuedPlayId}`, isCurrent: current }, durationMs);
+					publish({ streamUrl: `/v1/plays/media/${trackId}/${playbackSessionId}/${issuedPlayId}`, isCurrent: ownsAccount }, durationMs);
 					return true;
 				})) ?? false;
 			} finally {
