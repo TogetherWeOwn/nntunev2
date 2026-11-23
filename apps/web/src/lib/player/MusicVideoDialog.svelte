@@ -143,6 +143,7 @@
 		overscroll-behavior: contain;
 	}
 	.video-slot {
+		inline-size: 100%;
 		margin-block-start: var(--nt-space-3);
 		aspect-ratio: 16 / 9;
 		min-block-size: 200px;

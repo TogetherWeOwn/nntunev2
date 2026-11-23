@@ -22,8 +22,7 @@ const buildSha =
 	'unknown';
 
 export default defineConfig(({ command, mode }) => {
-	// The hosted browser fixtures stub both origins. Deployed builds keep the
-	// existing CSP until the separate video activation decision.
+	// Only browser fixtures bundle the video view and allow its stubbed origins.
 	const videoFixtures = mode === 'browser-fixtures';
 	// SvelteKit's `csp` option is baked in at build time, so the API origin
 	// must come from the build environment (process env or an `.env` file),

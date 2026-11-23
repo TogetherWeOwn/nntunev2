@@ -10,8 +10,8 @@
 	let { track, children }: { track: Track; children: Snippet } = $props();
 	const { media } = getAppPlayer();
 	let showVideo = $state(false);
-	let audioTab: HTMLButtonElement;
-	let videoTab: HTMLButtonElement;
+	let audioTab = $state<HTMLButtonElement>();
+	let videoTab = $state<HTMLButtonElement>();
 
 	function getVideoId() {
 		if (page.url.searchParams.get('music-video-fixture') !== 'on') return null;
@@ -22,7 +22,7 @@
 
 	function moveFocus(event: KeyboardEvent) {
 		if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
-		(event.currentTarget === audioTab ? videoTab : audioTab).focus();
+		(event.currentTarget === audioTab ? videoTab : audioTab)?.focus();
 		event.preventDefault();
 	}
 </script>
