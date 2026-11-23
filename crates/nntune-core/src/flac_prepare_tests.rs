@@ -107,7 +107,16 @@ fn seeks_in_prepared_plaintext_and_maps_complete_sealed_chunks() {
 
 #[test]
 fn streamed_seek_ignores_source_offsets_at_every_input_split() {
-    let input = fixture(OLD_TITLE);
+    let mut input = STREAMINFO.to_vec();
+    block_header(&mut input, 0x83, 36);
+    // Well-formed entries. The second offset points to frame 1, but sample
+    // 5000 starts at frame 2, byte 28 relative to the audio.
+    for (sample, offset) in [(0_u64, 0_u64), (5000, 14)] {
+        input.extend_from_slice(&sample.to_be_bytes());
+        input.extend_from_slice(&offset.to_be_bytes());
+        input.extend_from_slice(&2500_u16.to_be_bytes());
+    }
+    input.extend_from_slice(AUDIO);
     let audio_start = (input.len() - AUDIO.len()) as u64;
     for split in 0..=input.len() {
         let mut stream = crate::flac_stream::FlacStream::new(true);
