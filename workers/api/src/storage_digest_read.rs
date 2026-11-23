@@ -142,6 +142,10 @@ impl<'a> FromSql<'a> for ReadUuid {
     }
 }
 
+#[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[path = "storage_digest_read_postgres.rs"]
+mod postgres_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
