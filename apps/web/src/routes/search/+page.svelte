@@ -49,6 +49,13 @@
 
 	const trimmed = $derived(applied.trim());
 	const results = $derived(filterLibraryItems(items, trimmed));
+	const statusMessage = $derived.by(() => {
+		if (loading) return 'Loading your library…';
+		if (requiresSignIn || loadError || libraryUnavailable || trimmed.length === 0) return '';
+		const count = results.length;
+		if (count === 0) return `No results for “${trimmed}”.`;
+		return `${count} ${count === 1 ? 'result' : 'results'} for “${trimmed}”.`;
+	});
 
 	function onSubmit(event: SubmitEvent): void {
 		event.preventDefault();
@@ -64,8 +71,8 @@
 <main class="nt-wrap" id="main-content">
 	<h1>Search</h1>
 
-	<form role="search" onsubmit={onSubmit}>
-		<label for="search-field">Search your library</label>
+	<form role="search" aria-labelledby="library-search-label" onsubmit={onSubmit}>
+		<label id="library-search-label" for="search-field">Search your library</label>
 		<input
 			id="search-field"
 			name="q"
@@ -76,31 +83,41 @@
 		<button type="submit">Search</button>
 	</form>
 
-	{#if loading}
-		<p role="status">Loading your library…</p>
-	{:else if requiresSignIn}
-		<p>
-			Sign in to search your library. <a href="/login">Sign in</a>
-		</p>
-	{:else if loadError}
-		<div role="alert">
-			<p>Could not load your library: {loadError}</p>
-			<button type="button" onclick={() => refresher.refresh()}>Retry</button>
-		</div>
-	{:else if libraryUnavailable}
-		<p>Your library is not available yet.</p>
-	{:else if trimmed.length === 0}
-		<p>Type above to search your library by title or artist.</p>
-	{:else if results.length === 0}
-		<p role="status">No results for “{trimmed}”.</p>
-	{:else}
-		<p role="status">
-			{results.length} {results.length === 1 ? 'result' : 'results'} for “{trimmed}”.
-		</p>
-		<ul>
-			{#each results as item (libraryItemKey(item))}
-				<li>{displayTitle(item)}{displayArtist(item) ? ` — ${displayArtist(item)}` : ''}</li>
-			{/each}
-		</ul>
+	<p role="status" aria-atomic="true" class:nt-visually-hidden={!statusMessage}>{statusMessage}</p>
+	{#if !loading}
+		{#if requiresSignIn}
+			<p>
+				Sign in to search your library. <a href="/login">Sign in</a>
+			</p>
+		{:else if loadError}
+			<div role="alert">
+				<p>Could not load your library: {loadError}</p>
+				<button type="button" onclick={() => refresher.refresh()}>Retry</button>
+			</div>
+		{:else if libraryUnavailable}
+			<p>Your library is not available yet.</p>
+		{:else if trimmed.length === 0}
+			<p>Type above to search your library by title or artist.</p>
+		{:else if results.length > 0}
+			<ul>
+				{#each results as item (libraryItemKey(item))}
+					<li>{displayTitle(item)}{displayArtist(item) ? ` — ${displayArtist(item)}` : ''}</li>
+				{/each}
+			</ul>
+		{/if}
 	{/if}
 </main>
+
+<style>
+	.nt-visually-hidden {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		margin: -1px;
+		padding: 0;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+		border: 0;
+	}
+</style>

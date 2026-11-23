@@ -100,41 +100,44 @@
 		<p role="alert">{checkoutError}</p>
 	{/if}
 
-	<table>
-		<caption>Monthly plans. Every plan includes the full catalogue; plans differ in listening hours.</caption>
-		<thead>
-			<tr>
-				<th scope="col">Plan</th>
-				<th scope="col">Price</th>
-				<th scope="col">Stream hrs/mo</th>
-				<th scope="col">Concurrent</th>
-				<th scope="col"><span class="visually-hidden">Action</span></th>
-			</tr>
-		</thead>
-		<tbody>
-			{#each plans as plan (plan.id)}
+	<!-- svelte-ignore a11y_no_noninteractive_tabindex (Keyboard users need to scroll the comparison.) -->
+	<div class="plan-table-scroll" role="region" aria-labelledby="plan-table-caption" tabindex="0">
+		<table>
+			<caption id="plan-table-caption">Monthly plans. Every plan includes the full catalogue; plans differ in listening hours.</caption>
+			<thead>
 				<tr>
-					<th scope="row">{plan.name}<br /><small>{plan.blurb}</small></th>
-					<!-- Trailing {' '} keeps cell values separated in textContent (Svelte
-						strips inter-element whitespace, so without it text extraction
-						jams cells and word-boundary matching on the values fails).
-						Rendered output is unchanged: HTML collapses the spaces. -->
-					<td>{formatPricePerMonth(plan)}{' '}</td>
-					<td>{plan.streamHoursMonth}{' '}</td>
-					<td>{plan.maxConcurrentStreams}{' '}</td>
-					<td>
-						<button
-							aria-label={planButtonName(plan, pendingPlan)}
-							disabled={!mounted || pendingPlan !== null}
-							onclick={() => choose(plan.id)}
-						>
-							{pendingPlan === plan.id ? 'Starting…' : 'Choose'}
-						</button>
-					</td>
+					<th scope="col">Plan</th>
+					<th scope="col">Price</th>
+					<th scope="col">Stream hrs/mo</th>
+					<th scope="col">Concurrent</th>
+					<th scope="col"><span class="visually-hidden">Action</span></th>
 				</tr>
-			{/each}
-		</tbody>
-	</table>
+			</thead>
+			<tbody>
+				{#each plans as plan (plan.id)}
+					<tr>
+						<th scope="row">{plan.name}<br /><small>{plan.blurb}</small></th>
+						<!-- Trailing {' '} keeps cell values separated in textContent (Svelte
+							strips inter-element whitespace, so without it text extraction
+							jams cells and word-boundary matching on the values fails).
+							Rendered output is unchanged: HTML collapses the spaces. -->
+						<td>{formatPricePerMonth(plan)}{' '}</td>
+						<td>{plan.streamHoursMonth}{' '}</td>
+						<td>{plan.maxConcurrentStreams}{' '}</td>
+						<td>
+							<button
+								aria-label={planButtonName(plan, pendingPlan)}
+								disabled={!mounted || pendingPlan !== null}
+								onclick={() => choose(plan.id)}
+							>
+								{pendingPlan === plan.id ? 'Starting…' : 'Choose'}
+							</button>
+						</td>
+					</tr>
+				{/each}
+			</tbody>
+		</table>
+	</div>
 
 	<section aria-labelledby="cap">
 		<h2 id="cap">What happens at the cap</h2>
@@ -155,10 +158,15 @@
 		padding: 0 1rem;
 		font-family: system-ui, sans-serif;
 	}
+	.plan-table-scroll {
+		/* Keep the visually hidden Action header inside the scroll container. */
+		position: relative;
+		margin-block: 1.5rem;
+		overflow-x: auto;
+	}
 	table {
 		width: 100%;
 		border-collapse: collapse;
-		margin: 1.5rem 0;
 	}
 	th,
 	td {

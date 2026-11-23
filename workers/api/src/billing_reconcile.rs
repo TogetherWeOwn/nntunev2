@@ -1092,33 +1092,45 @@ pub fn store_reconciled_subscription_statement() -> &'static str {
     "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) SELECT $1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint) WHERE NOT $15::boolean ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END WHERE (EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL))) IS NOT TRUE"
 }
 
-// The coupled writer pins its relation to public; the legacy writer and
-// native test fixtures use their connection's search path.
-macro_rules! write_paid_invoice_history {
-    ($relation:literal) => {
+macro_rules! paid_invoice_coverage {
+    () => {
+        "(SELECT range_agg(tstzrange(to_timestamp(lo), to_timestamp(hi), '[)'))
+                      FROM unnest($10::bigint[], $11::bigint[]) AS bounds(lo, hi))"
+    };
+}
+pub(crate) use paid_invoice_coverage;
+
+macro_rules! insert_paid_invoice_history {
+    ($relation:literal, $conflict:literal) => {
         concat!(
-            "INSERT INTO ", $relation, " AS history (user_id, stripe_invoice_id,
+            "INSERT INTO ",
+            $relation,
+            " AS history (user_id, stripe_invoice_id,
              stripe_subscription_id, plan_id, period_start, period_end, amount_cents,
              currency, paid_at, covered_periods)
              VALUES ($1, $2, $3, $4, to_timestamp($5::bigint), to_timestamp($6::bigint),
                      $7, $8, to_timestamp($9::bigint),
-                     (SELECT range_agg(tstzrange(to_timestamp(lo), to_timestamp(hi), '[)'))
-                      FROM unnest($10::bigint[], $11::bigint[]) AS bounds(lo, hi)))
-             ON CONFLICT (stripe_invoice_id) DO UPDATE SET covered_periods = EXCLUDED.covered_periods
-             WHERE history.covered_periods IS NULL AND EXCLUDED.covered_periods IS NOT NULL
-               AND history.user_id = EXCLUDED.user_id
-               AND history.stripe_subscription_id = EXCLUDED.stripe_subscription_id
-               AND history.amount_cents > 0 AND history.currency = EXCLUDED.currency"
+                     ",
+            $crate::billing_reconcile::paid_invoice_coverage!(),
+            ")\n             ",
+            $conflict
         )
     };
 }
-pub(crate) use write_paid_invoice_history;
+pub(crate) use insert_paid_invoice_history;
 
 /// Parameters: user_id · invoice_id · subscription_id · plan_id ·
 /// period_start epoch · period_end epoch · amount_cents · currency ·
 /// paid_at epoch · covered start epochs[] · covered end epochs[].
 pub fn insert_paid_invoice_history_statement() -> &'static str {
-    write_paid_invoice_history!("paid_invoice_history")
+    insert_paid_invoice_history!(
+        "paid_invoice_history",
+        "ON CONFLICT (stripe_invoice_id) DO UPDATE SET covered_periods = EXCLUDED.covered_periods
+             WHERE history.covered_periods IS NULL AND EXCLUDED.covered_periods IS NOT NULL
+               AND history.user_id = EXCLUDED.user_id
+               AND history.stripe_subscription_id = EXCLUDED.stripe_subscription_id
+               AND history.amount_cents > 0 AND history.currency = EXCLUDED.currency"
+    )
 }
 
 #[cfg(test)]

@@ -17,7 +17,20 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 # resolves wherever the caller's role points. This wrapper (not a one-off) is
 # the required way to apply any pre-convention file in every environment;
 # new migrations carry their own in-file SET (see migrations/README.md).
-psql_run() { PGOPTIONS='-c search_path=public,pg_catalog' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
+psql_options='-c search_path=public,pg_catalog'
+psql_command=(env "PGOPTIONS=$psql_options" psql "$DATABASE_URL")
+session_fixture=()
+if [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]; then
+  hosted_url='postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci'
+  if [[ "$DATABASE_URL" != "$hosted_url" ]]; then
+    printf 'disposable GitHub-hosted migration database required\n' >&2
+    exit 1
+  fi
+  # Pin the address and clear libpq environment overrides before loading session fixtures.
+  psql_command=(env -i "PATH=$PATH" "PGOPTIONS=$psql_options" psql "$hosted_url?hostaddr=127.0.0.1")
+  session_fixture=(-v hosted_ingest_session_fixture=true)
+fi
+psql_run() { "${psql_command[@]}" -X -q -v ON_ERROR_STOP=1 "${session_fixture[@]}" "$@"; }
 
 shopt -s nullglob
 migrations=("$root"/migrations/*.sql)
