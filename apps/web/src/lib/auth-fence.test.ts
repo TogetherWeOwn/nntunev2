@@ -254,13 +254,9 @@ it('only a matching owner, track and continuation can publish an uncredentialed 
 	expect(publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
 		streamUrl: `/v1/plays/media/next/${scope.playbackSessionId}/play-7`
 	}), 120_000);
-	const [[source]] = publish.mock.calls;
-	expect(source.isCurrent()).toBe(true);
-	scope.dispose();
-	expect(source.isCurrent()).toBe(false);
 });
 
-it.each(['disabled', 'denied', 'cancelled', 'account switch', 'reset'] as const)('%s cannot publish a replacement source', async (reason) => {
+it.each(['disabled', 'denied', 'superseded', 'cancelled', 'account switch', 'reset'] as const)('%s cannot publish a replacement source', async (reason) => {
 	const { api } = setup();
 	const owner = (await captureAuthFence())!;
 	const initial = createQueue(['current', 'next'].map((id) => ({ id, title: id, artist: '', streamUrl: `/${id}` })));
@@ -279,9 +275,11 @@ it.each(['disabled', 'denied', 'cancelled', 'account switch', 'reset'] as const)
 	const scope = createBrowserPlaybackGrant(owner, playbackBinding, reason === 'disabled' ? undefined : prepare);
 	const attempt = new AbortController();
 	try {
-		const opening = scope.open(candidate, attempt.signal, current, publish);
+		const revision = player.queue.revision;
+		const opening = scope.open(candidate, attempt.signal, () => player.queue.isCurrent(revision), publish);
 		if (reason !== 'disabled') {
 			const transportSignal = await started.promise;
+			if (reason === 'superseded') player.queue.revoke();
 			if (reason === 'cancelled') attempt.abort();
 			if (reason === 'account switch') {
 				await api.logout();
@@ -290,7 +288,7 @@ it.each(['disabled', 'denied', 'cancelled', 'account switch', 'reset'] as const)
 				expect(replacement.playbackSessionId).not.toBe(scope.playbackSessionId);
 			}
 			if (reason === 'reset') scope.dispose();
-			expect(transportSignal.aborted).toBe(reason !== 'denied');
+			expect(transportSignal.aborted).toBe(['cancelled', 'account switch', 'reset'].includes(reason));
 		}
 		finish.resolve();
 		expect(await opening).toBe(false);

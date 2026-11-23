@@ -19080,7 +19080,8 @@ mod tests {
         h.config = cfg().with_play_grant_secret(b"test only, not a deployed secret".to_vec());
         let mut ctx = h.ctx();
         ctx.now = 199;
-        let (user_id, track_id, play_id) = ("user-1", "track-9", "play-7");
+        let (user_id, track_id, play_id) =
+            ("user-1", "22222222-2222-2222-2222-222222222222", "play-7");
         seed_user(&h, user_id, "play@example.com");
         let start_session = |id| block_on(ctx.start_session(id)).unwrap().set_cookie.unwrap();
         let cookie = start_session(user_id);
@@ -19112,23 +19113,23 @@ mod tests {
             session_binding: &binding,
             lease: &lease,
             artifact_sha256: "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734",
-            duration_ms: 120_000.try_into().unwrap(),
+            duration_ms: 60_000.try_into().unwrap(),
             grant: &token,
         };
         let set_lease = |row| {
             h.store
                 .playback_leases
                 .borrow_mut()
-                .insert(user_id.into(), row);
+                .insert(user_id.into(), row)
         };
+        set_lease(lease.clone());
         let meta = TrackMeterMeta {
-            track_duration_ms: Some(120_000),
+            track_duration_ms: Some(60_000),
             bitrate_kbps: Some(1_000),
             ..Default::default()
         };
         let key = (user_id.into(), track_id.into());
         h.store.meter_meta.borrow_mut().insert(key, meta);
-        set_lease(lease.clone());
         assert_eq!(block_on(handle(&ctx, &req)).status, 404);
         let range = Some("bytes=2-7");
         block_on(relay(
