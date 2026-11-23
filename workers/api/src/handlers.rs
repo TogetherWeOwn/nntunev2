@@ -4993,6 +4993,10 @@ mod listen_history_controls;
 #[path = "listen_history_receiver.rs"]
 mod listen_history_receiver;
 
+#[allow(dead_code)] // Callable only after a browser media route is admitted.
+#[path = "browser_playback_relay.rs"]
+mod browser_playback_relay;
+
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
 
@@ -19066,6 +19070,128 @@ mod tests {
             req,
             &headers,
         ))
+    }
+
+    #[test]
+    fn browser_relay_requires_the_exact_cookie_lease_token_and_duration() {
+        use super::browser_playback_relay::{relay, BrowserGrant, StreamGet};
+        use crate::{meter_sink::TrackMeterMeta, play_grant::IssuedGrant, playback::LeaseRow};
+        let mut h = harness();
+        h.config = cfg().with_play_grant_secret(b"test only, not a deployed secret".to_vec());
+        let mut ctx = h.ctx();
+        ctx.now = 199;
+        let (user_id, track_id, play_id) =
+            ("user-1", "22222222-2222-2222-2222-222222222222", "play-7");
+        seed_user(&h, user_id, "play@example.com");
+        let start_session = |id| block_on(ctx.start_session(id)).unwrap().set_cookie.unwrap();
+        let cookie = start_session(user_id);
+        let token = IssuedGrant {
+            token: include_str!("../../../fixtures/play-grant/browser-rendition.token").into(),
+            exp_unix: 200,
+        };
+        let lease = LeaseRow {
+            session_id: "tab-1".into(),
+            track_id: track_id.into(),
+            play_id: play_id.into(),
+            epoch: 42,
+            expires_at: ctx.now + 45,
+            continuation_deadline: ctx.now + 120,
+        };
+        let req = Request {
+            method: "GET".into(),
+            path: format!("/v1/plays/media/{track_id}/tab-1/{play_id}"),
+            cookie: Some(cookie),
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: vec![],
+        };
+        let (claims, _) = block_on(ctx.authenticate(&req, false)).unwrap();
+        let binding = session_binding(&claims);
+        let receipt = BrowserGrant {
+            user_id,
+            session_binding: &binding,
+            lease: &lease,
+            artifact_sha256: "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734",
+            duration_ms: 60_000.try_into().unwrap(),
+            grant: &token,
+        };
+        let leases = &h.store.playback_leases;
+        leases.borrow_mut().insert(user_id.into(), lease.clone());
+        let meta = TrackMeterMeta {
+            track_duration_ms: Some(60_000),
+            bitrate_kbps: Some(1_000),
+            ..Default::default()
+        };
+        let key = (user_id.to_owned(), track_id.to_owned());
+        h.store.meter_meta.borrow_mut().insert(key.clone(), meta);
+        assert_eq!(block_on(handle(&ctx, &req)).status, 404);
+        let range = Some("bytes=2-7");
+        block_on(relay(
+            &ctx,
+            &req,
+            Some(&receipt),
+            Some("same-origin"),
+            range,
+            async |upstream: StreamGet<'_>| {
+                assert_eq!(upstream.path, format!("/play/{track_id}"));
+                assert!(upstream.authorization == crate::play_grant::bearer(&token.token));
+                assert_eq!(upstream.range, range);
+            },
+        ))
+        .unwrap();
+
+        let refused = |req: &Request, receipt: Option<&BrowserGrant<'_>>, site: Option<&str>| {
+            let result: Result<(), Response> =
+                block_on(relay(&ctx, req, receipt, site, range, async |_| {
+                    panic!("refusal contacted the receiver")
+                }));
+            assert_eq!(result.unwrap_err().status, 404);
+        };
+        refused(&req, None, Some("same-origin"));
+        refused(&req, Some(&receipt), Some("same-site"));
+
+        seed_user(&h, "other-user", "other@example.com");
+        for id in [user_id, "other-user"] {
+            let mut stale = req.clone();
+            stale.cookie = Some(start_session(id));
+            refused(&stale, Some(&receipt), Some("same-origin"));
+        }
+        for component in [track_id, "tab-1", play_id] {
+            let mut different = req.clone();
+            different.path = req.path.replace(component, "other");
+            refused(&different, Some(&receipt), Some("same-origin"));
+        }
+        let refused_grant =
+            |grant: &BrowserGrant<'_>| refused(&req, Some(grant), Some("same-origin"));
+        refused_grant(&BrowserGrant {
+            artifact_sha256: &"a".repeat(64),
+            ..receipt
+        });
+        refused_grant(&BrowserGrant {
+            grant: &IssuedGrant {
+                exp_unix: ctx.now,
+                ..token.clone()
+            },
+            ..receipt
+        });
+        let newer = LeaseRow {
+            epoch: lease.epoch + 1,
+            ..lease.clone()
+        };
+        leases.borrow_mut().insert(user_id.into(), newer.clone());
+        refused_grant(&receipt);
+        assert_eq!(leases.borrow()[user_id], newer);
+        leases.borrow_mut().insert(user_id.into(), lease.clone());
+        let missing_duration = TrackMeterMeta {
+            track_duration_ms: None,
+            ..meta
+        };
+        h.store
+            .meter_meta
+            .borrow_mut()
+            .insert(key, missing_duration);
+        refused_grant(&receipt);
     }
 
     #[test]
