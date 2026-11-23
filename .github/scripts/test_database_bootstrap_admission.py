@@ -67,7 +67,15 @@ def exercise(event_path):
         check(False, **{key: value})
 
     check(False, GITHUB_REF="refs/heads/topic")
+    check(False, GITHUB_WORKFLOW_REF=f"{admission.REPOSITORY}/{admission.WORKFLOW}@refs/heads/topic")
+    check(False, GITHUB_WORKFLOW_REF=f"fixture/fork/{admission.WORKFLOW}@{admission.MAIN}")
     check(False, BOOTSTRAP_EXPIRY=str(int(time.time()) + admission.MAX_WINDOW_SECONDS + 60))
+    check(False, BOOTSTRAP_PLAN_B64="AB==", BOOTSTRAP_PLAN_DIGEST=hashlib.sha256(b"\0").hexdigest())
+    oversized = secrets.token_bytes(admission.MAX_PLAN_BYTES + 1)
+    check(False, BOOTSTRAP_PLAN_B64=base64.b64encode(oversized).decode("ascii"),
+          BOOTSTRAP_PLAN_DIGEST=hashlib.sha256(oversized).hexdigest())
+    check(False, BOOTSTRAP_PLAN_B64=base64.b64encode(oversized + plan).decode("ascii"),
+          BOOTSTRAP_PLAN_DIGEST=hashlib.sha256(oversized + plan).hexdigest())
     check(False, args=(secrets.token_hex(20),))
     check(False, event=json.dumps({"inputs": {"value": secrets.token_hex(20)}}).encode())
     check(False, event=b'{"inputs":[]}')

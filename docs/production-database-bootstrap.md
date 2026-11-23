@@ -81,8 +81,8 @@ is disabled at the job boundary and contains only an admission check. The
 existing [disposable CI job](../.github/workflows/ci.yml) exercises that
 check with generated pins and uses an isolated, ephemeral PostgreSQL server
 on the same standard Ubuntu runner class. It exercises verified TCP/TLS,
-wrong CA and hostname, separate creator and reader roles, command and trace
-redaction, and signal-driven disposal. It needs no Environment or real
+wrong CA and hostname, separate creator and reader roles, private capture of
+command output and traces, and signal-driven disposal. It needs no Environment or real
 credentials. The fixture's private Docker network tests the client path.
 It supplies no evidence of specific public-origin reachability, provider
 role authority or actual deployment approval.
@@ -107,8 +107,8 @@ production Environment has only a branch restriction. Under separate release
 admission, configure `production-db-bootstrap` **before** enabling the job.
 GitHub can create a missing Environment from a workflow reference without
 protection. In Settings and the [environment REST readback](https://docs.github.com/en/rest/deployments/environments),
-verify the required independent reviewer or team, `prevent_self_review`,
-and disabled administrator bypass. Use a custom policy with the sole typed
+verify the required independent reviewer or team, `prevent_self_review: true`
+and `can_admins_bypass: false`. Use a custom policy with the sole typed
 branch `main`, no tag policy. Verify the list through
 [deployment branch policies](https://docs.github.com/en/rest/deployments/branch-policies).
 Keep Environment administration with the custodian and check rule changes
@@ -169,11 +169,11 @@ approved custody, included compute balance and paid overage policy before
 using it. No larger runner, new repository or paid service is needed for
 the disposable proof. [GitHub Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions)
 
-For an independently verified empty first release, prefer the ordinary
-native backup cycle if a successful snapshot of the exact branch can be
-verified after the relevant empty-state and setup evidence and before the
-first schema change. Coordinate the release window with that schedule and
-read back completion, restore scope and expiry. Keep the ordinary retention
+For an independently verified empty first release, prefer a successful
+ordinary native snapshot of the exact branch before the first protected
+write. Coordinate the release window with that schedule and read back the
+capture time, completion, restore scope and expiry. Verify the first-release
+empty-state separately, before migration. Keep the ordinary retention
 policy. If the release gate needs a different snapshot, verify eligibility,
 retention and budget separately. Each expired backup releases its own
 storage, and the oldest retained backup pins the WAL window across the

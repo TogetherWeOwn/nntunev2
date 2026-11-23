@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   admit:
+    name: Admit first-launch database setup
     # Deliberately disabled. Enabling this job requires a separate reviewed
     # change and a readback of the Environment before dispatch.
     if: >-

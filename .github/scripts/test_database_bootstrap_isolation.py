@@ -1,5 +1,6 @@
 """Disposable PostgreSQL qualification. No connection or credential inputs."""
 
+import io
 import os
 import secrets
 import select
@@ -8,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import suppress
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
 from database_bootstrap_preflight import (
@@ -68,7 +69,10 @@ def command(*args, input_text=None, timeout=20, cleanup=False, interrupt=False):
         finally:
             if process.poll() is None:
                 process.kill()
-    require(not interrupt or process.returncode == 0, "finish the in-flight Docker command")
+    if interrupt:
+        canary = input_text.rstrip("\n")
+        require(process.returncode == 0 and stdout == canary and canary in stderr,
+                "capture the in-flight command output and trace during interruption")
     if not cleanup:
         check_interruption(include_drill=interrupt)
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
@@ -154,7 +158,7 @@ class Cluster:
                       "PGOPTIONS=-c statement_timeout=5000 -c lock_timeout=2000",
                       "sh", "-exc" if trace else "-ec", """
                       IFS= read -r PGPASSWORD
-                      export PGPASSWORD
+                      export PGPASSWORD="$PGPASSWORD"
                       exec psql -XqAtw -v ON_ERROR_STOP=1 -v VERBOSITY=verbose
                       """, input_text=self.passwords[role] + "\n" + sql)
 
@@ -243,7 +247,7 @@ def refuse_before_create(cluster):
 
 def verify_quiet_failure(cluster):
     token = secrets.token_hex(20)
-    result = cluster.sql(f"SELECT '{token}'; SELECT missing_{token};", role=CREATOR, trace=True)
+    result = cluster.sql(f"SELECT '{token}';\nSELECT missing_{token};", role=CREATOR, trace=True)
     require(result.returncode != 0 and token in result.stdout and token in result.stderr
             and cluster.passwords[CREATOR] in result.stderr,
             "capture result, error and credential trace without publishing them")
@@ -385,7 +389,10 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output):
+            main()
+        require(output.tell() == 0, "keep child diagnostics out of the fixture output")
     except FixtureFailure as error:
         sys.exit(f"database-bootstrap-fixture: failed to {error}")
     except Exception:
