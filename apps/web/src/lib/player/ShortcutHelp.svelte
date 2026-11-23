@@ -3,6 +3,7 @@
 	import { actionForKey, SHORTCUT_ROWS, type ShortcutAction } from './shortcuts.js';
 
 	let { actions, buttonClass, playerScoped }: { actions?: readonly ShortcutAction[]; buttonClass?: string; playerScoped?: boolean } = $props();
+	const headingId = $props.id();
 	const rows = $derived(SHORTCUT_ROWS.filter(({ key }) =>
 		!actions || actions.some((action) => action === actionForKey(key))));
 	let opened = $state(false);
@@ -56,9 +57,9 @@
 </button>
 
 {#if opened}
-	<dialog bind:this={shortcutsDialogEl} data-testid="shortcuts-dialog" aria-label="Keyboard shortcuts"
+	<dialog bind:this={shortcutsDialogEl} data-testid="shortcuts-dialog" aria-labelledby={headingId}
 		onkeydown={trapShortcutsTab} oncancel={(event) => { event.preventDefault(); close(); }}>
-		<h2>Keyboard shortcuts</h2>
+		<h2 id={headingId}>Keyboard shortcuts</h2>
 		{#if playerScoped}<p>Focus a player button to use the character shortcuts. The audio controls keep their own keys.</p>{/if}
 		<ul>
 			{#each rows as row (row.key)}

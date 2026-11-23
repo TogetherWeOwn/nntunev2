@@ -51,15 +51,18 @@ def project_metadata(data):
         raise HistoryError("invalid PR repository/ref/commit identity") from exc
 
 
-def event_metadata(event_file, base, head):
+def event_metadata(event_file, base, head, *, root=None, budget=None):
     event = decode(read_input(event_file))
     try:
         expected = project_metadata(event["pull_request"])
-        if (expected["base"]["sha"] != base or expected["head"]["sha"] != head
+        if ((root is None and expected["base"]["sha"] != base)
+                or expected["head"]["sha"] != head
                 or event["number"] != expected["number"]
                 or event["repository"]["id"] != expected["base"]["repo"]["id"]
                 or event["repository"]["full_name"] != expected["base"]["repo"]["full_name"]):
             raise HistoryError("event identity differs from pinned commits/repository")
+        if expected["base"]["sha"] != base:
+            check_base(root, expected["base"]["sha"], head, base, budget)
         return expected
     except (KeyError, TypeError) as exc:
         raise HistoryError("missing pinned event identity") from exc
@@ -122,21 +125,21 @@ def compact(value):
     return text
 
 
-def collect(root, expected, budget):
+def collect(root, expected, budget, *, base=None):
     shared_deadline = budget.deadline
     collection_deadline = time.monotonic() + budget.remaining(COLLECTION_TIMEOUT)
     budget.deadline = min(shared_deadline, collection_deadline)
     try:
-        pages, snapshot = collect_attempts(root, expected, budget, collection_deadline)
+        pages, snapshot = collect_attempts(root, expected, budget, collection_deadline, base)
         snapshot["deadline"] = shared_deadline
         return pages, snapshot
     finally:
         budget.deadline = shared_deadline
 
 
-def collect_attempts(root, expected, budget, collection_deadline):
+def collect_attempts(root, expected, budget, collection_deadline, base):
     endpoint = f"repos/{expected['base']['repo']['full_name']}/pulls/{expected['number']}"
-    observed_base = expected["base"]["sha"]
+    observed_base = base or expected["base"]["sha"]
     for attempt in range(1, MAX_ATTEMPTS + 1):
         budget.remaining(COLLECTION_TIMEOUT)
         before = project_metadata(request(endpoint, budget))
@@ -216,13 +219,15 @@ def main(argv=None):
     parser.add_argument("--root", type=pathlib.Path, required=True)
     parser.add_argument("--base-sha", required=True)
     parser.add_argument("--head-sha", required=True)
+    parser.add_argument("--integration-base", action="store_true")
     parser.add_argument("--event-file", required=True)
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
     try:
         budget = EvidenceBudget()
-        expected = event_metadata(args.event_file, args.base_sha, args.head_sha)
-        pages, snapshot = collect(args.root, expected, budget)
+        expected = event_metadata(args.event_file, args.base_sha, args.head_sha,
+                                  root=args.root if args.integration_base else None, budget=budget)
+        pages, snapshot = collect(args.root, expected, budget, base=args.base_sha)
         (args.output_dir / "pr-files.json").write_text(compact(pages), encoding="utf-8")
         (args.output_dir / "pr-metadata.json").write_text(compact(snapshot), encoding="utf-8")
     except (HistoryError, OSError, UnicodeError) as exc:

@@ -23,7 +23,7 @@ function requireRouteProof(raw, worker, sha, now) {
   }
 }
 
-function requireCompletePage(response, items, count, label) {
+export function requireCompletePage(response, items, count, label) {
   const info = response.result_info;
   const pages = info?.total_pages;
   if (!Array.isArray(items) || items.length !== count || info?.page !== 1 || info.count !== count ||
@@ -32,14 +32,9 @@ function requireCompletePage(response, items, count, label) {
   }
 }
 
-export async function seedMaintenance({ account, token, worker, sha, routeProof, request = fetch, now = Date.now }) {
-  if (!hexId.test(account ?? '') || !hexId.test(worker ?? '') || !token || !shaPattern.test(sha ?? '')) {
-    throw new Error('Missing or invalid production account, immutable Worker ID, token or SHA');
-  }
+export function cloudflare(account, token, request) {
   const root = `https://api.cloudflare.com/client/v4/accounts/${account}/workers`;
-  const pinned = `/workers/${worker}`;
-  const script = `/scripts/${name}`;
-  async function api(path, label, data) {
+  return async function api(path, label, data) {
     let response;
     let body;
     try {
@@ -57,7 +52,16 @@ export async function seedMaintenance({ account, token, worker, sha, routeProof,
       throw new Error(`${label}: Cloudflare returned no confirmed result`);
     }
     return body;
+  };
+}
+
+export async function seedMaintenance({ account, token, worker, sha, routeProof, request = fetch, now = Date.now }) {
+  if (!hexId.test(account ?? '') || !hexId.test(worker ?? '') || !token || !shaPattern.test(sha ?? '')) {
+    throw new Error('Missing or invalid production account, immutable Worker ID, token or SHA');
   }
+  const pinned = `/workers/${worker}`;
+  const script = `/scripts/${name}`;
+  const api = cloudflare(account, token, request);
 
   async function workerState(deployed) {
     const { result } = await api(pinned, 'Worker identity');

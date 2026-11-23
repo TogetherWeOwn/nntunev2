@@ -122,8 +122,8 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
         extra.add(runner.PREFIX + "postgres_unlisted_surprise")
         self.assert_rejected_before_execution(extra)
 
-    def test_expected_inventory_has_thirty_seven_db_cases_and_four_config_cases(self):
-        self.assertEqual(len(runner.EXPECTED), 37)
+    def test_expected_inventory_has_forty_one_db_cases_and_four_config_cases(self):
+        self.assertEqual(len(runner.EXPECTED), 41)
         self.assertIn(
             runner.PREFIX + "postgres_magic_issuance_skips_locked_expired_proof_and_retries",
             runner.EXPECTED,
@@ -137,6 +137,7 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
             "postgres_admin_role_change_on_a_deleting_subject_writes_nothing",
             "postgres_admin_role_change_rolls_back_when_the_audit_insert_fails",
             "postgres_admin_invite_issue_and_revoke_audit_by_row_id",
+            "postgres_admin_invite_batch_commits_together_or_not_at_all",
             "postgres_admin_invite_windows_are_bounded_and_audited_atomically",
             "postgres_admin_invite_ledger_uses_effective_expiry_before_limit",
             "postgres_admin_invite_tree_is_scoped_paged_and_read_only",
@@ -144,6 +145,9 @@ class StoreRunnerInventoryGuardTests(unittest.TestCase):
             "postgres_member_invite_requires_its_own_open_window_and_unexpired_code",
             "postgres_member_enrollment_rechecks_window_after_waiting",
             "postgres_invite_revocation_wins_against_stale_redemption_snapshot",
+            "postgres_concurrent_expiry_observers_write_one_audit",
+            "postgres_member_expiry_observer_rechecks_window_after_waiting",
+            "postgres_signup_expiry_audit_failure_and_timeout_are_retryable",
             "postgres_registration_invite_claim_stamps_spend_and_invited_by",
             "postgres_registration_invite_claim_survives_issuer_deletion",
             "postgres_admin_ingest_upload_accept_then_duplicate_converges",

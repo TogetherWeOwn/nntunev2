@@ -2,13 +2,96 @@ import { expect, test } from '@playwright/test';
 
 const PERIOD_END = '2026-11-15T12:00:00Z';
 
+test('billing hides an earlier account statement and reloads under the replacement session', async ({ page }) => {
+	let planId = 'pro';
+	await page.route('**/v1/me/subscription', (route) => route.fulfill({ json: {
+		state: 'active', planId, status: 'active', currentPeriodEnd: PERIOD_END,
+		graceUntil: null, cancelAtPeriodEnd: false
+	} }));
+	await page.route('**/v1/me/usage', (route) => route.fulfill({ json: {
+		period: '2026-10', streamSecondsMonth: 3600, resetsAt: '2026-11-01T00:00:00Z'
+	} }));
+	await page.route('**/v1/plans', (route) => route.fulfill({ json: { plans: [] } }));
+	await page.goto('/account/billing');
+
+	const earlier = page.getByRole('heading', { name: 'Current plan: Pro' });
+	await expect(earlier).toBeVisible();
+	planId = 'plus';
+	await page.evaluate(() => {
+		const key = 'nntune.auth.generation.v1';
+		localStorage.setItem(key, 'replacement-session');
+		window.dispatchEvent(new StorageEvent('storage', { key }));
+	});
+	await expect(earlier).toHaveCount(0);
+	await expect(page.getByRole('button', { name: 'Manage billing', exact: true })).toHaveCount(0);
+	await page.getByRole('button', { name: 'Retry' }).click();
+	await expect(page.getByRole('heading', { name: 'Current plan: Plus' })).toBeVisible();
+});
+
+test('billing offers retry when its account retires during the initial load', async ({ page }) => {
+	await page.addInitScript(() => {
+		const original = window.fetch.bind(window);
+		window.fetch = (input, init) => {
+			if (typeof input !== 'string' || !input.endsWith('/v1/me/usage')) return original(input, init);
+			document.documentElement.dataset.usagePending = 'true';
+			return new Promise<Response>((resolve) => {
+				window.addEventListener('release-usage', () => resolve(Response.json({
+					period: '2026-10', streamSecondsMonth: 3600, resetsAt: '2026-11-01T00:00:00Z'
+				})), { once: true });
+			});
+		};
+	});
+	await page.route('**/v1/me/subscription', (route) => route.fulfill({ json: {
+		state: 'active', planId: 'pro', status: 'active', currentPeriodEnd: PERIOD_END,
+		graceUntil: null, cancelAtPeriodEnd: false
+	} }));
+	await page.route('**/v1/plans', (route) => route.fulfill({ json: { plans: [] } }));
+	await page.goto('/account/billing', { waitUntil: 'domcontentloaded' });
+	await expect(page.locator('html')).toHaveAttribute('data-usage-pending', 'true');
+	await page.evaluate(() => {
+		const key = 'nntune.auth.generation.v1';
+		localStorage.setItem(key, 'replacement-session');
+		window.dispatchEvent(new StorageEvent('storage', { key }));
+	});
+	await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+	await page.evaluate(() => window.dispatchEvent(new Event('release-usage')));
+	await expect(page.getByText('Your session changed.', { exact: false })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Current plan: Pro' })).toHaveCount(0);
+});
+
 for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
 	test.describe(`${viewport.width}px billing period-end copy`, () => {
-		test.use({ viewport, locale: 'en-US', timezoneId: 'UTC' });
+		test.use({ viewport, locale: 'en-US', timezoneId: 'America/Los_Angeles' });
 
 		for (const status of ['active', 'trialing', 'canceled', 'paused', 'unpaid', 'incomplete_expired']) {
-			for (const currentPeriodEnd of [PERIOD_END, null]) {
-				test(`${status} with ${currentPeriodEnd ? 'dated' : 'null'} period end`, async ({ page }, testInfo) => {
+			const periodEnds = [
+				{
+					label: 'dated',
+					currentPeriodEnd: PERIOD_END,
+					displayDate: '11/15/2026',
+					cancelAtPeriodEnd: status === 'active'
+				},
+				{ label: 'null', currentPeriodEnd: null, displayDate: '', cancelAtPeriodEnd: false }
+			];
+			if (status === 'active') {
+				periodEnds.push(
+					{
+						label: 'date-only',
+						currentPeriodEnd: '2026-11-15',
+						// Existing display treats a date-only string as UTC midnight.
+						displayDate: '11/14/2026',
+						cancelAtPeriodEnd: false
+					},
+					{
+						label: 'offset',
+						currentPeriodEnd: '2026-11-15T00:30:00-02:00',
+						displayDate: '11/14/2026',
+						cancelAtPeriodEnd: false
+					}
+				);
+			}
+			for (const { label, currentPeriodEnd, displayDate, cancelAtPeriodEnd } of periodEnds) {
+				test(`${status} with ${label} period end`, async ({ page }, testInfo) => {
 					const calls: Array<{ path: string; method: string }> = [];
 					// Only a stored `active` folds to the server's active state;
 					// every other stored status (trialing included) is lapsed.
@@ -20,7 +103,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 							return route.fulfill({ json: {
 								state: confirmed ? 'active' : 'lapsed',
 								planId: 'pro', status, currentPeriodEnd,
-								graceUntil: null, cancelAtPeriodEnd: false
+								graceUntil: null, cancelAtPeriodEnd
 							} });
 						}
 						if (path === '/v1/me/usage') {
@@ -50,10 +133,19 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					await page.screenshot({ path: screenshot, fullPage: true });
 					await testInfo.attach('billing-page', { path: screenshot, contentType: 'image/png' });
 					await expect(plan).not.toContainText(/renews/i);
+					const periodEnd = plan.locator('time');
 					if (currentPeriodEnd) {
-						await expect(plan).toContainText('period ends 11/15/2026');
+						await expect(plan).toContainText(`period ends ${displayDate}`);
+						await expect(periodEnd).toHaveText(displayDate);
+						await expect(periodEnd).toHaveAttribute('datetime', currentPeriodEnd);
 					} else {
 						await expect(plan).not.toContainText('period ends');
+						await expect(periodEnd).toHaveCount(0);
+					}
+					if (cancelAtPeriodEnd) {
+						await expect(plan).toContainText('· cancels at period end');
+					} else {
+						await expect(plan).not.toContainText('cancels at period end');
 					}
 					// No trial product state exists: trial wording never renders,
 					// including for a legacy stored `trialing`.

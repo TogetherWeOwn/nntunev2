@@ -1,0 +1,50 @@
+name: subsonic-staging-off-drain
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_deployment_id:
+        description: Deployment ID from the trusted staging API receipt
+        type: string
+        required: true
+      expected_version_id:
+        description: Version ID from the same receipt
+        type: string
+        required: true
+      expected_build_sha:
+        description: Build SHA from the same receipt (not the workflow SHA)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  readback:
+    name: Verify Subsonic staging is off and drained
+    if: >-
+      ${{ github.repository == 'TogetherWeOwn/nntunev2' &&
+          github.ref == 'refs/heads/main' && github.ref_protected &&
+          github.workflow_sha == github.sha && github.run_attempt == 1 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    concurrency:
+      group: subsonic-staging-off-drain
+      cancel-in-progress: false
+    environment:
+      name: staging
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read staging off and drained state (no restore)
+        env:
+          EXPECTED_STAGING_DEPLOYMENT_ID: ${{ inputs.expected_deployment_id }}
+          EXPECTED_STAGING_VERSION_ID: ${{ inputs.expected_version_id }}
+          EXPECTED_STAGING_BUILD_SHA: ${{ inputs.expected_build_sha }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SUBSONIC_STAGING_WORKERS_READ_TOKEN: ${{ secrets.SUBSONIC_STAGING_WORKERS_READ_TOKEN }}
+          PLANETSCALE_OBSERVER_URL_STAGING: ${{ secrets.PLANETSCALE_OBSERVER_URL_STAGING }}
+        run: exec timeout -k 2s 32s python3 -I .github/scripts/subsonic_staging_off_drain.py 2>/dev/null

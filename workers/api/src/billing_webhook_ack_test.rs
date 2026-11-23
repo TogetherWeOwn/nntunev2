@@ -1,5 +1,6 @@
 //! Hosted disposable Worker control for caller recovery after a lost COMMIT reply.
 use super::{handlers, DohDns, MirrorBinding, PgStore, SocketDialer, StoreError, WebhookMailer};
+use crate::postgres::PgClient;
 use crate::stripe::{self, StripeError, StripeRequest, StripeResult};
 use serde_json::{json, Value};
 use std::cell::Cell;
@@ -12,7 +13,7 @@ pub(super) const SUBSCRIPTION: &str = "sub_worker_fault";
 const PRICE: &str = "price_worker_fault";
 const SESSION: &str = "cs_worker_fault";
 
-pub(super) async fn connect() -> Result<tokio_postgres::Client, StoreError> {
+pub(super) async fn connect() -> Result<PgClient, StoreError> {
     // Ancillary reads, claims and checkout marks never cross the COMMIT relay.
     let socket = worker::Socket::builder()
         .connect("127.0.0.1", 5432)
@@ -24,15 +25,13 @@ pub(super) async fn connect() -> Result<tokio_postgres::Client, StoreError> {
     let (client, driver) = config
         .connect_raw(socket, tokio_postgres::NoTls)
         .await
+        .map(|(client, driver)| (PgClient::new(client), driver))
         .map_err(|_| StoreError)?;
     wasm_bindgen_futures::spawn_local(async move {
         let _ = driver.await;
     });
     client
-        .batch_execute(&format!(
-            "SET statement_timeout = {}",
-            super::TOTAL_TIMEOUT_MS
-        ))
+        .set_statement_timeout(super::TOTAL_TIMEOUT_MS)
         .await
         .map_err(|_| StoreError)?;
     Ok(client)

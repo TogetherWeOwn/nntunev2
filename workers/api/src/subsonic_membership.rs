@@ -4,6 +4,7 @@ use super::{with_deadline, StoreError};
 use crate::catalogue::{
     catalogue_member_releases_statement, catalogue_member_track_pairs_statement, is_catalogue_mbid,
 };
+use crate::postgres::{PgConnect, PgQuery, PgTransaction};
 use crate::subsonic_auth::Principal;
 use futures_util::TryStreamExt;
 use nntune_subsonic::{
@@ -11,7 +12,7 @@ use nntune_subsonic::{
 };
 use tokio_postgres::{
     types::{ToSql, Type},
-    Client, Row, Transaction,
+    Row,
 };
 
 const MEMBERSHIP_ROWS: i64 = 1_024;
@@ -46,7 +47,7 @@ const PROJECT_RECORDING: &str =
     ", CASE WHEN octet_length(recording_mbid) <= 36 THEN recording_mbid ELSE '' END";
 
 async fn preflight(
-    tx: &Transaction<'_>,
+    tx: &PgTransaction<'_>,
     budget: &mut ConstructionBudget,
     statement: &str,
     user_id: &str,
@@ -89,7 +90,7 @@ async fn preflight(
 }
 
 async fn fetch<T: Ord>(
-    tx: &Transaction<'_>,
+    tx: &PgTransaction<'_>,
     budget: &mut ConstructionBudget,
     statement: &str,
     user_id: &str,
@@ -153,7 +154,7 @@ fn normalize_order<T: Ord>(ids: &mut Vec<T>) {
 }
 
 pub(super) async fn read_membership(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     budget: &mut ConstructionBudget,
     user_id: &str,
     cap: i64,
@@ -164,14 +165,8 @@ pub(super) async fn read_membership(
         .checked_add(1)
         .filter(|_| (0..=MEMBERSHIP_ROWS).contains(&cap))
         .ok_or(StoreError)?;
-    let tx = client
-        .build_transaction()
-        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
-        .read_only(true)
-        .start()
-        .await
-        .map_err(|_| StoreError)?;
-    tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '1s'")
+    let tx = client.read_only_snapshot().await.map_err(|_| StoreError)?;
+    tx.set_local_subsonic_timeouts()
         .await
         .map_err(|_| StoreError)?;
     let releases = catalogue_member_releases_statement();
@@ -226,7 +221,7 @@ pub(super) async fn read_membership(
 
 pub(crate) async fn load_staging_membership(
     budget: &mut ConstructionBudget,
-    client: &mut Client,
+    client: &mut impl PgConnect,
     principal: &Principal,
 ) -> Result<StagingMembership, StagingRejection> {
     // The existing authenticated app client is reused. The deadline does not

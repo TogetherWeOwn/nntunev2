@@ -1,6 +1,6 @@
 //! Disposable PostgreSQL only, invoked by the required Actions migration job.
 use super::*;
-use tokio_postgres::{Config, NoTls};
+use tokio_postgres::{Client, Config, NoTls};
 
 const USER: &str = "subsonic-test-owner";
 const ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";

@@ -205,6 +205,12 @@
 
 	.paywall::backdrop {
 		background: rgb(0 0 0 / 0.55);
+		overflow: hidden;
+		overscroll-behavior: contain;
+	}
+
+	.paywall:modal {
+		overscroll-behavior: contain;
 	}
 
 	.paywall h2 {

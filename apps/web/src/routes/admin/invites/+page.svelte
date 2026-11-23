@@ -2,12 +2,11 @@
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ADMIN_INVITE_LIMIT, ApiClient, ApiError, INVITE_STATUSES, isInviteIssuerId, type AdminInvite, type AdminInviteFilter } from '#lib/api/client.js';
-	import { captureAuthFence, subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
+	import { observeAccountSession, type AccountSession as Fence } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 
-	type Fence = NonNullable<Awaited<ReturnType<typeof captureAuthFence>>>;
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	const account = observeAccountSession(clear);
 	const dateFormat = new Intl.DateTimeFormat(undefined, { timeZone: 'UTC', dateStyle: 'medium', timeStyle: 'medium' });
 	const label = (status: AdminInvite['status']) => status[0].toUpperCase() + status.slice(1);
 	const unavailable = 'Invite ledger is unavailable. Reload this page to check access and get a fresh list.';
@@ -36,23 +35,24 @@
 	}
 
 	onMount(() => {
-		const lifetime = new AbortController();
-		subscribeAuthFenceInvalidation(() => clear(), lifetime.signal);
 		const unsubscribe = subscribeLocalAuthTransition(() => clear());
 		load(null);
-		return () => { lifetime.abort(); unsubscribe(); clear(); };
+		return () => { account.dispose(); unsubscribe(); clear(); };
 	});
 
-	async function run<T>(send: (signal: AbortSignal) => Promise<T>, apply: (result: T, fence: Fence) => void,
+	async function run<T>(send: (client: ApiClient, signal: AbortSignal) => Promise<T>, apply: (result: T, fence: Fence) => void,
 		fail: (cause: unknown) => void) {
+		const previous = owner;
+		account.prepare();
 		request?.abort();
 		const attempt = new AbortController();
 		request = attempt;
 		try {
-			const fence = owner ?? await captureAuthFence();
+			const fence = previous ?? await account.capture();
 			// Guard dispatch and publication, not the intervening network wait.
 			const sent = fence && await fence.run(() => attempt.signal.aborted ? undefined : {
-				result: send(attempt.signal).then((value) => () => apply(value, fence), (cause) => () => fail(cause))
+				result: send(new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session: { owner: fence } }), attempt.signal)
+					.then((value) => () => apply(value, fence), (cause) => () => fail(cause))
 			});
 			const publish = sent && await sent.result;
 			if (attempt.signal.aborted) return;
@@ -69,10 +69,11 @@
 	function load(filter: AdminInviteFilter, confirmedId?: number) {
 		applied = filter;
 		rows = [];
-		void run((signal) => client.listAdminInvites(filter, signal), (result, fence) => {
+		void run((client, signal) => client.listAdminInvites(filter, signal), (result, fence) => {
 			if (result.some(({ id, status }) => id === confirmedId && status !== 'revoked')) return clear('The refreshed list didn’t confirm revocation. Reload for a fresh list.');
 			owner = fence;
 			rows = result;
+			error = '';
 			if (confirmedId !== undefined) notice = `Invite #${confirmedId} revoked.`;
 			writing = false;
 		}, () => clear());
@@ -96,7 +97,7 @@
 		heading.focus();
 		writing = true;
 		notice = '';
-		void run((signal) => client.revokeAdminInvite(row.id, signal), () => load(applied, row.id), (cause) => {
+		void run((client, signal) => client.revokeAdminInvite(row.id, signal), () => load(applied, row.id), (cause) => {
 			if (cause instanceof ApiError) {
 				if (cause.code === 'reauth_required') return clear('Sign out and sign in again, then reopen the ledger for a fresh list.');
 				if ([401, 403, 404].includes(cause.status)) return clear(unavailable);
@@ -116,7 +117,7 @@
 	{#if error}<p role="alert">{error}</p>
 	{:else if !owner}<p role="status">Loading invites…</p>
 	{:else}
-		<p><a href="/admin/invite-windows">Invite windows</a> · <a href="/admin/invites/issue">Create an invite</a></p>
+		<p><a href="/admin/invite-windows">Invite windows</a> · <a href="/admin/invites/issue">Create an invite</a> · <a href="/admin/invites/tree">Invite tree</a></p>
 		<p>Up to {ADMIN_INVITE_LIMIT} matching invites, newest first. This is not a complete history.</p>
 		<form onsubmit={filterInvites}>
 			<label for="invite-filter">Filter by</label>
@@ -143,10 +144,12 @@
 		{#if rows.length}
 			<ul aria-label="Invite results">
 				{#each rows as row (row.id)}
+					{@const expiry = new Date(row.expires_at * 1000)}
 					<li>
 						<strong>Invite #{row.id}</strong> — {label(row.status)}
 						<div>Issuer: {row.issued_by ?? 'Not recorded'}</div>
-						<div>Effective expiry (UTC): {dateFormat.format(row.expires_at * 1000)}</div>
+						<!-- HTML datetime omits the leading plus sign on expanded years. -->
+						<div>Effective expiry (UTC): <time datetime={expiry.toISOString().replace(/^\+/, '')}>{dateFormat.format(expiry)}</time></div>
 						{#if row.status === 'active' || row.status === 'expired'}
 							<button class="nt-button" aria-label={`Revoke invite #${row.id}`} disabled={writing} onclick={() => revoke(row)}>Revoke</button>
 						{/if}
