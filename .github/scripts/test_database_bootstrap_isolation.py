@@ -317,9 +317,11 @@ def prove_setup_caller(cluster, *, interrupt):
                 "exercise generated credential trace, endpoint and SQL error containment")
         dns = {"PATH": traced_client(cluster, "resolve")}
         run(caller_env(cluster, roles, host=f"wrong-{cluster.server}") | dns, "refused")
+        env = caller_env(cluster, roles, host=cluster.server) | dns
+        run(env | {"BOOTSTRAP_EXPIRY": str(cluster.expiry - 60)}, "refused")
         cluster.ok("verify all caller refusals leave the target absent",
                    f"SELECT NOT EXISTS (SELECT FROM pg_database WHERE datname = '{LAUNCH}');", "t\n")
-        run(caller_env(cluster, roles, host=cluster.server) | dns, "complete")
+        run(env, "complete")
         run(env, "refused")  # The name collision stops any second write.
         return
 
