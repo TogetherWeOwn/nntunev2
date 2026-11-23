@@ -1,5 +1,4 @@
-use super::{Client, ReadbackFixture};
-use crate::{id, FINAL_VERSION};
+use super::{id, Client, ReadbackFixture, FINAL_VERSION};
 use nntune_core::s3_locator::{S3Binding, S3Locator};
 use nntune_ingest::{
     catalogue_publication::{
@@ -24,12 +23,11 @@ pub(super) async fn exercise(
     first: &ReadbackFixture,
     old_intent: &CandidateIntent,
 ) {
-    db.batch_execute(concat!(
+    let schema = concat!(
         include_str!("../../../api/tests/fixtures/storage_s3_locator_schema.sql"),
         include_str!("../fixtures/catalogue_publication.sql")
-    ))
-    .await
-    .unwrap();
+    );
+    db.batch_execute(schema).await.unwrap();
 
     let [root, environment, library, _, _, configuration] = first.context.identities;
     let old = PublishedObject {

@@ -1587,6 +1587,7 @@ fn owned_checkpoint<E>(
     }
 }
 
+pub mod catalogue_publication;
 pub mod multipart;
 
 #[cfg(test)]
@@ -3358,5 +3359,3 @@ mod build_sha_tests {
         );
     }
 }
-
-pub mod catalogue_publication;
