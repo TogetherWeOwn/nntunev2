@@ -2,11 +2,14 @@ use super::{Client, ReadbackFixture};
 use crate::{id, FINAL_VERSION};
 use nntune_core::s3_locator::{S3Binding, S3Locator};
 use nntune_ingest::{
-    catalogue_publication::{stage, PublicationError, PublishedObject, VerifiedOccurrence},
+    catalogue_publication::{
+        stage,
+        PublicationError::{Indeterminate, Refused},
+        PublishedObject, VerifiedOccurrence,
+    },
     digest_candidate_store::CandidateIntent,
     track_writers::TrackRow,
 };
-use std::time::Duration;
 use tokio_postgres::Transaction;
 
 const RELEASE: &str = "ab310000-0000-4000-8000-000000000000";
@@ -29,18 +32,6 @@ pub(super) async fn exercise(
     .unwrap();
 
     let [root, environment, library, _, _, configuration] = first.context.identities;
-    let [object, generation, map_id] = [0x76, 0x77, 0x78].map(id);
-    let new_intent = CandidateIntent {
-        identities: [environment, library, object, generation, configuration],
-        map_id,
-        ..*old_intent
-    };
-    let new_locator = S3Locator::new(
-        first.media.metadata().locator().bucket().into(),
-        format!("media/{}/{}", hex::encode(object), hex::encode(generation)),
-        S3Binding::VersionId("new-media-pin".into()),
-    )
-    .unwrap();
     let old = PublishedObject {
         intent: old_intent,
         locator: first.media.metadata().locator(),
@@ -48,13 +39,36 @@ pub(super) async fn exercise(
         root_version_id: root,
         page_versions: &[FINAL_VERSION],
     };
-    let new = PublishedObject {
-        intent: &new_intent,
-        locator: &new_locator,
-        plaintext_sha256: &[0xfd; 32],
-        page_versions: &["new-page-pin"],
-        ..old
-    };
+    let injected = [
+        (environment, library, 0x76),
+        (id(0x7f), id(0x80), 0x79),
+        (environment, id(0x81), 0x7c),
+    ]
+    .map(|(environment, library, seed)| {
+        let [object, generation, map_id] = [seed, seed + 1, seed + 2].map(id);
+        let key = format!("media/{}/{}", hex::encode(object), hex::encode(generation));
+        let locator = S3Locator::new(
+            old.locator.bucket().into(),
+            key,
+            S3Binding::VersionId("new-media-pin".into()),
+        )
+        .unwrap();
+        let intent = CandidateIntent {
+            identities: [environment, library, object, generation, configuration],
+            map_id,
+            ..*old_intent
+        };
+        (intent, locator)
+    });
+    let [new, foreign, private] = injected
+        .each_ref()
+        .map(|(intent, locator)| PublishedObject {
+            intent,
+            locator,
+            plaintext_sha256: &[0xfd; 32],
+            page_versions: &["new-page-pin"],
+            ..old
+        });
 
     let occurrence = |job_id, object_id, track_no| VerifiedOccurrence {
         job_id,
@@ -71,6 +85,7 @@ pub(super) async fn exercise(
     };
     let old_object = old_intent.identities[2];
     let first_match = occurrence("catalogue-old", old_object, 1);
+    let object = new.intent.identities[2];
     let next_match = occurrence("catalogue-new", object, 1);
 
     let mut tx = writer.transaction().await.unwrap();
@@ -82,38 +97,35 @@ pub(super) async fn exercise(
         locator: new.locator,
         ..old
     };
+    let mut foreign_owner = occurrence("catalogue-old", old_object, 1);
+    foreign_owner.owner_id = "catalogue-other";
     for (matched, receipt) in [
         (&first_match, &bad_pin),
         (&first_match, &wrong_locator),
         (&first_match, &new),
         (
-            &VerifiedOccurrence {
-                owner_id: "catalogue-other",
-                ..first_match.clone()
-            },
-            &old,
+            &occurrence("catalogue-new", private.intent.identities[2], 1),
+            &private,
         ),
-        (
-            &VerifiedOccurrence {
-                job_id: "catalogue-queued",
-                ..first_match.clone()
-            },
-            &old,
-        ),
+        (&foreign_owner, &old),
+        (&occurrence("catalogue-queued", old_object, 1), &old),
     ] {
         refuse(&mut tx, matched, receipt).await;
     }
+    tx.batch_execute(
+        "UPDATE public.users SET deleting_at = clock_timestamp() WHERE id = 'catalogue-owner'",
+    )
+    .await
+    .unwrap();
+    refuse(&mut tx, &first_match, &old).await;
     assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
-    tx.commit().await.unwrap();
+    tx.rollback().await.unwrap();
 
     let mut tx = writer.transaction().await.unwrap();
     tx.batch_execute("ALTER TABLE public.catalogue_s3_sources ADD CHECK (accepted_seq < 0)")
         .await
         .unwrap();
-    assert_eq!(
-        stage(&mut tx, &first_match, &old).await,
-        Err(PublicationError::Indeterminate)
-    );
+    assert_eq!(stage(&mut tx, &first_match, &old).await, Err(Indeterminate));
     assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
     tx.rollback().await.unwrap();
 
@@ -128,11 +140,10 @@ pub(super) async fn exercise(
     tx.commit().await.unwrap();
     let mut tx = writer.transaction().await.unwrap();
     assert_eq!(stage(&mut tx, &first_match, &old).await.unwrap(), track_id);
-    let conflicting = VerifiedOccurrence {
-        object_id: new_intent.identities[2],
-        ..first_match.clone()
-    };
+    let conflicting = occurrence("catalogue-old", object, 1);
     refuse(&mut tx, &conflicting, &new).await;
+    let cross_scope = occurrence("catalogue-new", foreign.intent.identities[2], 1);
+    refuse(&mut tx, &cross_scope, &foreign).await;
     assert_eq!(stage(&mut tx, &next_match, &new).await.unwrap(), track_id);
     refuse(&mut tx, &first_match, &old).await;
     tx.commit().await.unwrap();
@@ -147,23 +158,14 @@ pub(super) async fn exercise(
         .unwrap()
         .get(0);
     let late = occurrence("catalogue-old", old_object, 2);
-    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(4), async {
-        tokio::join!(stage(&mut competing, &late, &old), async {
-            while !db
-                .query_one("SELECT cardinality(pg_blocking_pids($1)) > 0", &[&pid])
-                .await
-                .unwrap()
-                .get::<_, bool>(0)
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert_eq!(db.query(ROWS, &[&RELEASE]).await.unwrap().len(), 1);
-            tx.commit().await.unwrap();
-        })
-    })
-    .await
-    .expect("competing publisher must wait on the canonical occurrence");
-    assert_eq!(outcome, Err(PublicationError::Refused));
+    let (outcome, ()) = tokio::join!(stage(&mut competing, &late, &old), async {
+        db.execute("SELECT pg_temp.wait_for_catalogue_lock($1)", &[&pid])
+            .await
+            .unwrap();
+        assert_eq!(db.query(ROWS, &[&RELEASE]).await.unwrap().len(), 1);
+        tx.commit().await.unwrap();
+    });
+    assert_eq!(outcome, Err(Refused));
     competing.commit().await.unwrap();
     let rows = db.query(ROWS, &[&RELEASE]).await.unwrap();
     assert_eq!(rows.len(), 2);
@@ -173,11 +175,18 @@ pub(super) async fn exercise(
         assert_eq!(row.get::<_, String>(2).replace('-', ""), object);
     }
 
-    let mut tx = writer.transaction().await.unwrap();
-    tx.execute("UPDATE public.storage_validated_digest_winners SET retain_until = '-infinity' WHERE object_id = $1::text::uuid",
-        &[&object]).await.unwrap();
-    refuse(&mut tx, &next_match, &new).await;
-    tx.rollback().await.unwrap();
+    for edit in [
+        "quarantined = true",
+        "deleting_at = now()",
+        "retain_until = '-infinity'",
+        "delete_until = 'infinity'",
+    ] {
+        let mut tx = writer.transaction().await.unwrap();
+        let sql = format!("UPDATE public.storage_validated_digest_winners SET {edit} WHERE object_id = $1::text::uuid");
+        tx.execute(&sql, &[&object]).await.unwrap();
+        refuse(&mut tx, &next_match, &new).await;
+        tx.rollback().await.unwrap();
+    }
 }
 
 async fn refuse(
@@ -185,8 +194,5 @@ async fn refuse(
     matched: &VerifiedOccurrence<'_>,
     receipt: &PublishedObject<'_>,
 ) {
-    assert_eq!(
-        stage(tx, matched, receipt).await,
-        Err(PublicationError::Refused)
-    );
+    assert_eq!(stage(tx, matched, receipt).await, Err(Refused));
 }

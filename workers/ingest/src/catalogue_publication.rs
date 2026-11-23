@@ -12,7 +12,6 @@ use crate::{
 
 /// Trusted handoff binding an already authorized, verified job to the
 /// matched occurrence and the exact object that backed the match.
-#[derive(Clone)]
 pub struct VerifiedOccurrence<'a> {
     pub job_id: &'a str,
     pub owner_id: &'a str,
@@ -39,15 +38,15 @@ pub enum PublicationError {
 
 /// Stage a canonical track and its current S3 binding, returning the local
 /// track UUID on first publication, replacement or exact replay. Use trusted
-/// evidence in a bounded READ COMMITTED transaction. Commit before using the
-/// ID and roll back on cancellation or uncertainty. Live use also requires
-/// an authorized storage reference for object retention.
+/// evidence in a bounded READ COMMITTED transaction for one occurrence.
+/// Commit before using the ID and roll back on cancellation or uncertainty.
+/// Live use also requires an authorized storage reference for retention.
 pub async fn stage(
     tx: &mut Transaction<'_>,
     matched: &VerifiedOccurrence<'_>,
     result: &PublishedObject<'_>,
 ) -> Result<String, PublicationError> {
-    use PublicationError::{Indeterminate, Refused};
+    use PublicationError::Refused;
     let track = &matched.track;
     let S3Binding::VersionId(version) = result.locator.binding() else {
         return Err(Refused);
@@ -69,45 +68,32 @@ pub async fn stage(
         return Err(Refused);
     }
 
-    let position: [&(dyn ToSql + Sync); 4] = [
+    let track_params: [&(dyn ToSql + Sync); 7] = [
         &track.release_id,
         &track.medium_no,
         &track.track_no,
         &track.mbid,
+        &track.title,
+        &matched.job_id,
+        &matched.owner_id,
     ];
-    let [release, medium, number, recording] = position;
-    let savepoint = tx.transaction().await.map_err(|_| Indeterminate)?;
+    let savepoint = tx.transaction().await?;
     let staged = async {
         let job = savepoint
             .query_opt(
-                "SELECT j.accepted_seq FROM public.ingest_jobs j
-             JOIN (SELECT id FROM public.users WHERE id = $2 AND deleting_at IS NULL
-                   FOR SHARE) owner ON owner.id = j.user_id
-             WHERE j.id = $1 AND j.status = 'done'
-               AND current_setting('transaction_isolation') = 'read committed'
-             FOR SHARE OF j",
-                &[&matched.job_id, &matched.owner_id],
+                include_str!("catalogue_publication/track.sql"),
+                &track_params,
             )
             .await?
             .ok_or(Refused)?;
         let seq: i64 = job.get(0);
-
-        // The unique occurrence key arbitrates first insertion. A new
-        // statement then sees the committed row after any conflict wait.
-        savepoint
-            .execute(
-                "INSERT INTO public.tracks (release_id, medium_no, track_no, mbid, title)
-             VALUES ($1::text::uuid, $2, $3, $4::text::uuid, $5)
-             ON CONFLICT (release_id, medium_no, track_no) DO NOTHING",
-                &[release, medium, number, recording, &track.title],
-            )
-            .await?;
+        // A fresh snapshot sees the canonical row after a conflicting insert.
         let row = savepoint
             .query_opt(
                 "SELECT id::text FROM public.tracks
              WHERE release_id = $1::text::uuid AND medium_no = $2 AND track_no = $3
-               AND mbid = $4::text::uuid FOR UPDATE",
-                &position,
+               AND mbid = $4::text::uuid FOR NO KEY UPDATE",
+                &track_params[..4],
             )
             .await?
             .ok_or(Refused)?;
@@ -115,7 +101,7 @@ pub async fn stage(
         let object = hex::encode(object);
         savepoint
             .query_opt(
-                include_str!("catalogue_publication/object.sql"),
+                include_str!("catalogue_publication/source.sql"),
                 &[
                     &object,
                     &hex::encode(environment),
@@ -131,18 +117,14 @@ pub async fn stage(
                     version,
                     &result.page_versions,
                     &result.intent.header.as_slice(),
+                    &track_id,
+                    &matched.job_id,
+                    &seq,
                 ],
             )
             .await?
             .ok_or(Refused)?;
 
-        savepoint
-            .query_opt(
-                include_str!("catalogue_publication/source.sql"),
-                &[&track_id, &matched.job_id, &seq, &object],
-            )
-            .await?
-            .ok_or(Refused)?;
         Ok(track_id)
     }
     .await;
