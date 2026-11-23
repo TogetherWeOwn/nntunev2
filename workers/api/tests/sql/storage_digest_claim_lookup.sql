@@ -174,5 +174,11 @@ BEGIN
         RAISE EXCEPTION 'delete bypassed live read protection after last reference removal';
     END IF;
 END $$;
+-- Require the runner's pinned disposable connection for session fixtures.
+\if :{?hosted_ingest_session_fixture}
+\else
+ROLLBACK;
+\quit
+\endif
 \ir ../fixtures/ingest_session_reserve.sql
 ROLLBACK;
