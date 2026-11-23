@@ -223,10 +223,14 @@ attempted creation is uncertain. The caller stops without retry or deletion.
 The dormant [role SQL](../.github/scripts/database_bootstrap_role.py)
 uses the same plan's bare setup and owner roles. The separate custodian
 supplies an approved absolute expiry within two hours and a freshly
-generated password. Issuance commits the setup role and its single
-SET-only, non-inherited, non-admin owner membership together. It grants
-LOGIN and CREATEDB, limits connections to one and reads back the exact
-attributes, expiry and membership. CREATEDB is cluster-wide during the
+generated password. SQL carries a SCRAM verifier derived from that password.
+Keep the verifier private with the other issuance inputs. Issuance commits
+the setup role and its single SET-only, non-inherited, non-admin owner
+membership together. It grants LOGIN and CREATEDB, limits connections to
+one and reads back the exact
+attributes, expiry and membership. PostgreSQL gives a non-superuser issuer
+an administrative grant on the new role. Issuance checks that this grant
+carries neither SET nor INHERIT. CREATEDB is cluster-wide during the
 window. The protected setup caller pins the target database name. The
 aggregate reader keeps its own credential and grants.
 
@@ -257,11 +261,16 @@ The SQL route requires PostgreSQL 16+ membership options, a custodian with
 effective `CREATEROLE` and `CREATEDB`, authority to grant the owner role
 and terminate the setup role's sessions, and the routed primary username
 on the approved direct endpoint with hostname verification. The provider
-documents SQL-created roles under its default administrator. Protected live
-proof must establish that this custodian can issue and retire this exact
-role, and that the routed endpoint enforces native password expiry, exposes
-both bare SQL identities and lets the custodian terminate and read back its
+documents SQL-created roles under its default administrator. The fixture
+issuer uses `pg_signal_backend`, which can signal other non-superuser
+sessions. Cleanup selects sessions by the issued role's OID before sending
+signals. Protected live proof must establish that the custodian can issue
+and retire this exact role and that the routed endpoint enforces native
+password expiry, exposes
+both bare SQL identities, admits the caller's sequential connections under
+the connection limit and lets the custodian terminate and read back its
 sessions. [PlanetScale roles](https://planetscale.com/docs/postgres/connecting/roles)
+· [Managed Roles API](https://planetscale.com/docs/api/reference/create_role)
 · [PostgreSQL CREATE ROLE](https://www.postgresql.org/docs/current/sql-createrole.html)
 
 ### Snapshot and metering

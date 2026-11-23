@@ -1,10 +1,27 @@
 """Dormant SQL for a protected setup-role custodian. No connection entry point."""
 
+import base64
+import hashlib
+import hmac
 import re
+import secrets
 from datetime import datetime, timezone
 
 from database_bootstrap_preflight import catalog_probe_sql
 from database_bootstrap_setup import setup_plan
+
+
+def scram_verifier(password):
+    # PostgreSQL accepts a precomputed verifier. Keep the login password out
+    # of SQL text, including statement diagnostics and activity snapshots.
+    salt = secrets.token_bytes(16)
+    iterations = 4096
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode("ascii"), salt, iterations)
+    client = hmac.digest(salted, b"Client Key", "sha256")
+    stored = hashlib.sha256(client).digest()
+    server = hmac.digest(salted, b"Server Key", "sha256")
+    salt64, stored64, server64 = (base64.b64encode(value).decode("ascii") for value in (salt, stored, server))
+    return f"SCRAM-SHA-256${iterations}:{salt64}${stored64}:{server64}"
 
 
 class SetupRoleLifecycle:
@@ -28,9 +45,10 @@ class SetupRoleLifecycle:
 SET LOCAL search_path = pg_catalog;
 SET LOCAL statement_timeout = '10s';
 SET LOCAL lock_timeout = '2s';
-SET LOCAL password_encryption = 'scram-sha-256';
 DO $lifecycle$
-DECLARE target oid;
+DECLARE
+    target oid;
+    session_pid integer;
 BEGIN
     IF current_database() <> '{self.maintenance}' OR session_user <> current_user
        OR current_user = '{self.name}'
@@ -66,8 +84,9 @@ COMMIT;
        ) THEN
         RAISE EXCEPTION 'issuance refused';
     END IF;
+    SET LOCAL createrole_self_grant = '';
     CREATE ROLE {self.role} LOGIN CREATEDB NOINHERIT NOSUPERUSER NOCREATEROLE
-        NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 1 PASSWORD '{password}' VALID UNTIL '{until}';
+        NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 1 PASSWORD '{scram_verifier(password)}' VALID UNTIL '{until}';
     GRANT "{self.owner}" TO {self.role} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE;
     SELECT oid INTO STRICT target FROM pg_roles WHERE rolname = '{self.name}' AND {exact};
     IF (SELECT count(*) FROM pg_auth_members WHERE member = target) <> 1
@@ -75,6 +94,9 @@ COMMIT;
            SELECT FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid
            WHERE m.member = target AND r.rolname = '{self.owner}'
              AND m.set_option AND NOT (m.inherit_option OR m.admin_option)
+       ) OR EXISTS (
+           SELECT FROM pg_auth_members WHERE roleid = target
+             AND (member <> current_user::regrole OR NOT admin_option OR inherit_option OR set_option)
        ) THEN
         RAISE EXCEPTION 'issuance readback failed';
     END IF;
@@ -103,16 +125,17 @@ COMMIT;
         # Signalling survives rollback. DROP ROLE refuses outstanding database
         # dependencies and removes memberships only when it succeeds.
         return self._cleanup(oid, f"""
-        IF EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = target
-                   AND NOT pg_terminate_backend(pid, 2000)) THEN
-            RAISE EXCEPTION 'session termination failed';
-        END IF;
+        FOR session_pid IN SELECT pid FROM pg_stat_activity WHERE usesysid = target LOOP
+            IF NOT pg_terminate_backend(session_pid, 2000) THEN
+                RAISE EXCEPTION 'session termination failed';
+            END IF;
+        END LOOP;
         PERFORM pg_stat_clear_snapshot();
         IF EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = target) THEN
             RAISE EXCEPTION 'session closure unconfirmed';
         END IF;
         DROP ROLE {self.role};
-""", f"""
+""", result=f"""
 SELECT 'retired' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE oid = {oid}::oid OR rolname = '{self.name}')
   AND NOT EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = {oid}::oid);
 """)

@@ -230,6 +230,7 @@ def provision_roles(cluster):
         GRANT {OWNER} TO {DECOY} WITH INHERIT FALSE, SET TRUE;
         CREATE ROLE {ISSUER} LOGIN CREATEDB CREATEROLE PASSWORD '{cluster.passwords[ISSUER]}';
         GRANT pg_signal_backend TO {ISSUER};
+        ALTER ROLE {ISSUER} SET createrole_self_grant = 'set, inherit';
         """ + "\n".join(
             f"CREATE ROLE {role} LOGIN PASSWORD '{cluster.passwords[role]}';"
             for role in (MIGRATOR, RUNTIME, READER, STAGING)
@@ -246,7 +247,7 @@ def issue_role(cluster, lifecycle, expiry):
 
 
 def prove_issuance(cluster, lifecycle):
-    issue = lifecycle.issue(cluster.expiry, cluster.passwords[CREATOR])
+    issue = lifecycle.issue(cluster.expiry, secrets.token_hex(24))
     cluster.denied("roll back role creation when the issuer cannot grant the owner", issue,
                    "ERROR:  42501:", role=ISSUER)
     cluster.ok("verify failed issuance left no role", f"""
@@ -268,7 +269,9 @@ def prove_issuance(cluster, lifecycle):
                     (rolinherit OR rolsuper OR rolcreaterole OR rolreplication OR rolbypassrls)
                     AND rolvaliduntil = to_timestamp({cluster.expiry}) FROM pg_roles WHERE oid = {oid})
            AND (SELECT count(*) = 1 AND bool_and(roleid = '{OWNER}'::regrole AND set_option
-                    AND NOT (admin_option OR inherit_option)) FROM pg_auth_members WHERE member = {oid});
+                    AND NOT (admin_option OR inherit_option)) FROM pg_auth_members WHERE member = {oid})
+           AND (SELECT count(*) = 1 AND bool_and(member = '{ISSUER}'::regrole AND admin_option
+                    AND NOT (set_option OR inherit_option)) FROM pg_auth_members WHERE roleid = {oid});
         """, "t\n", role=CREATOR)
     cluster.ok("allow switching to the loginless owner without inheriting its rights", f"""
         SELECT session_user = '{CREATOR}' AND current_user = '{OWNER}';
