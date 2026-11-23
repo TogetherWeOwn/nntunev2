@@ -67,7 +67,7 @@ jobs:
       contents: read # Org reusable reads this repo at the pinned ref.
       issues: write # Advisory labeler posts the size comment.
       pull-requests: write # Advisory labeler reads the PR and its labels.
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@8059ac2b121b63443db656b1e10e927b8af8133c # v0.12.1
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       # This repo's generated paths, excluded on top of the script's
@@ -85,7 +85,7 @@ jobs:
       contents: read # Org reusable reads this repo at the pinned ref.
       issues: write # Gate posts the pass/fail size comment.
       pull-requests: write # Gate reads the PR size and exception label.
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@8059ac2b121b63443db656b1e10e927b8af8133c # v0.12.1
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       exclude-extra: ""
@@ -97,4 +97,4 @@ jobs:
       contents: read # Org reusable reads this repo at the pinned ref.
       issues: read # Weekly tally reads the exception label.
       pull-requests: read # Weekly tally reads open PRs and sizes.
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@8059ac2b121b63443db656b1e10e927b8af8133c # v0.12.1
