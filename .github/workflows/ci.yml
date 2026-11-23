@@ -786,6 +786,8 @@ jobs:
         run: bash workers/api/tests/test_storage_digest_target.sh
       - name: Check scratch migration runner offline
         run: bash workers/api/tests/test_migration_runner.sh
+      - name: Exercise first-launch catalog preflight on disposable PostgreSQL
+        run: python3 .github/scripts/test_database_bootstrap_preflight_postgres.py
       - run: bash workers/api/tests/run_migration_tests.sh
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
