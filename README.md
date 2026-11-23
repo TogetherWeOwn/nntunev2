@@ -133,7 +133,7 @@ remain unchanged.
 
 Record the reviewed head SHA and exact-head **Actions run/job links** with
 conclusions as CI evidence, not local transcripts. Reviewers and the
-Release Manager use those links without waiving staging, rollback or
+task owner use those links without waiving staging, rollback or
 production approval gates. Live staging runs stay in Actions — see below.
 
 For a documentation-only change, focused static/diff checks are sufficient
@@ -215,9 +215,10 @@ review for personal data or the policy keeping the full account ID private.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for required checks and the
 review/merge policy. `ci-ok`, `gitleaks`, `pr-lint`, `migrations-staging`
 and `Devin Review` must pass, and review findings must be fixed or answered.
-CodeRabbit is advisory; answer its findings without waiting for it. The
-final-stage reviewer merges the pinned head before approval; production
-merges/promotions still require exact-head Release Manager authorization.
+CodeRabbit is advisory. Answer its findings without waiting for it. The task
+owner merges the pinned head after the review and CI gates pass. A change
+that could deploy to production follows the separate
+[production release process](CONTRIBUTING.md#production-releases).
 
 ## Security
 

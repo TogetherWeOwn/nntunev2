@@ -30,12 +30,14 @@ function ownership() {
 	let liked = false;
 	let publication: LibraryRefreshUpdate | undefined = readiness();
 	const fetchFn = vi.fn<typeof fetch>();
+	const binding = 'A'.repeat(43);
+	const account = { generation: 'test', signal: new AbortController().signal, isCurrent: () => true, run: async <T,>(work: () => T) => work() };
 	return {
 		fetchFn,
 		publish: (next?: LibraryRefreshUpdate) => { publication = next; },
 		owner: {
-			client: new ApiClient({ baseUrl, fetchFn }),
-			binding: 'A'.repeat(43),
+			client: new ApiClient({ baseUrl, fetchFn, session: { owner: account, binding } }),
+			binding,
 			readiness: () => publication,
 			liked: (id: string) => id === track.id ? liked : undefined,
 			confirm: vi.fn((_id: string, _confirmedId: string, value: boolean) => { liked = value; }),

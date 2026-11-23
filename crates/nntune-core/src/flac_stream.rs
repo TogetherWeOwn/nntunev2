@@ -108,6 +108,8 @@ fn hash_pcm(md5: &mut md5::Context, depth: u8, pcm: &[i32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::{collections::HashSet, fs, path::Path};
 
     // Synthetic 16-sample mono constant frame followed by a three-sample tail.
     const FIRST: &[u8] = &[255, 248, 105, 2, 0, 15, 183, 0, 42, 122, 221];
@@ -136,6 +138,68 @@ mod tests {
             stream.push(byte).unwrap();
         }
         assert_eq!(stream.finish_at_eof(), Ok(()));
+    }
+
+    fn admin_upload_clips() -> Vec<Vec<u8>> {
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            tracks: Vec<Track>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Track {
+            file: String,
+            bytes: usize,
+            sha256: String,
+        }
+
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic-flac/admin-upload");
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest.tracks.len(), 10);
+        let mut digests = HashSet::new();
+        manifest
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(index, track)| {
+                assert_eq!(track.file, format!("fixture-{}.flac", index + 1));
+                let clip = fs::read(directory.join(&track.file)).unwrap();
+                assert_eq!(clip.len(), track.bytes, "{}", track.file);
+                let digest: String = Sha256::digest(&clip)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                assert_eq!(digest, track.sha256, "{}", track.file);
+                assert!(digests.insert(digest), "duplicate fixture {}", track.file);
+                clip
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accepts_each_admin_upload_clip_as_a_complete_flac_stream() {
+        for (index, clip) in admin_upload_clips().iter().enumerate() {
+            let mut stream = FlacStream::default();
+            assert_eq!(
+                stream.push(clip).and_then(|()| stream.finish_at_eof()),
+                Ok(()),
+                "fixture-{}.flac",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_two_admin_upload_clips_concatenated_as_one_flac_stream() {
+        let clips = admin_upload_clips();
+        let mut stream = FlacStream::default();
+        stream.push(&clips[0]).unwrap();
+        assert_eq!(
+            stream.push(&clips[1]).and_then(|()| stream.finish_at_eof()),
+            Err(())
+        );
     }
 
     #[test]
