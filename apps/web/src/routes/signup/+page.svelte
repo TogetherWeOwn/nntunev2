@@ -22,6 +22,7 @@
 	let email = $state('');
 	let magicCode = $state('');
 	let inviteCode = $state('');
+	let inviteFromLink = $state(false);
 	let privateListening = $state(false);
 	let pending: RegisterStartResponse | null = $state(null);
 	let status = $state<
@@ -58,6 +59,7 @@
 		if (!attempt.signal.aborted && window.location.href === url.href &&
 			!finishLocked && codes.length === 1 && isMemberInviteCode(codes[0])) {
 			inviteCode = codes[0];
+			inviteFromLink = true;
 		}
 	}
 
@@ -118,6 +120,7 @@
 		pending = null;
 		magicCode = '';
 		inviteCode = '';
+		inviteFromLink = false;
 		status = 'idle';
 		await tick();
 		if (attempt.signal.aborted) return;
@@ -208,7 +211,7 @@
 
 <svelte:head>
 	<title>NNTune — get started</title>
-	<meta name="description" content="Create your NNTune account with a passkey." />
+	<meta name="description" content="Create your NNTune account with a passkey. If you need a subscription, choose an account plan after signup." />
 </svelte:head>
 
 <main class="nt-wrap">
@@ -217,7 +220,7 @@
 		Create your account with a passkey. If you received an invite, enter its code before requesting an email code.
 	</p>
 	{#if status === 'code-sent' || status === 'finishing' || status === 'code-error' || status === 'dismissed' || status === 'created'}
-		<form onsubmit={finishAccount}>
+		<form method="post" onsubmit={finishAccount}>
 			<p id="signup-code-guidance" role="status">
 				We emailed a sign-in link and a code to {email.trim()} — enter the code here to
 				prove the address is yours, then touch your security key when asked. (Don't use
@@ -271,8 +274,8 @@
 			</button>
 		</form>
 	{:else}
-		{#if inviteCode}<p role="status">Invite link added. Enter your email to get started.</p>{/if}
-		<form onsubmit={startAccount}>
+		{#if inviteFromLink}<p role="status">Invite link added. Enter your email to get started.</p>{/if}
+		<form method="post" onsubmit={startAccount}>
 			<label for="signup-email">
 				Email
 				<input
@@ -289,9 +292,10 @@
 					disabled={status === 'working'}
 				/>
 			</label>
-			<label>
+			<label for="signup-invite">
 				Invite code (if you have one)
-				<input type="text" name="invite_code" autocomplete="off" bind:value={inviteCode}
+				<input id="signup-invite" type="text" autocomplete="off" bind:value={inviteCode}
+					oninput={() => { inviteFromLink = false; }}
 					disabled={status === 'working'} />
 			</label>
 			<button
