@@ -67,6 +67,7 @@ async fn reads_are_scoped_and_redacted() {
     assert_eq!(to_value(view).unwrap(), public);
     let list = async |owner: &str, status, limit, offset| {
         assert_eq!((owner, status), ("owner", Some(pending)));
+        assert!((1..=100).contains(&limit));
         let mut row = job(pending);
         match offset {
             1 => row.owner_id = "other".into(),
@@ -83,11 +84,9 @@ async fn reads_are_scoped_and_redacted() {
         let request = serde_json::from_value(input).unwrap();
         queue(&auth(&grant("owner", READ_SCOPE)), &list, request).await
     };
-    let queue_view = json!({"jobs":[public],"limit":100,"offset":0});
-    assert_eq!(
-        to_value(read_queue(200, 0).await.unwrap()).unwrap(),
-        queue_view
-    );
+    let expected = json!({"jobs":[public],"limit":100,"offset":0});
+    let view = read_queue(200, 0).await.unwrap();
+    assert_eq!(to_value(view).unwrap(), expected);
     for (limit, offset) in [(1, 0), (50, 1), (50, 2)] {
         assert_eq!(read_queue(limit, offset).await.unwrap_err().status, 503);
     }
