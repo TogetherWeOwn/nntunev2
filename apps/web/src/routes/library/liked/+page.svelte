@@ -35,11 +35,20 @@
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache,
-		onStateChange: (state, { isCurrent, authoritative, authBoundary, sessionBinding, deviceScope: verifiedScope }) => {
+		onStateChange: (state, { isCurrent, authoritative, authBoundary, sessionBinding, deviceScope: verifiedScope, storageScope, accountSession }) => {
 			if (!isCurrent()) return;
+			if (storageScope !== undefined) {
+				session = storageScope;
+				owner = accountSession;
+			}
+			if (authBoundary && !state.verificationSuspended) {
+				session = null;
+				owner = undefined;
+			}
 			const key = favoritesKey(session);
 			if ((authBoundary && !state.verificationSuspended) || (sessionBinding && favoriteVisitKey !== key)) {
 				pendingChanges.clear();
+				retryPending = false;
 				favoriteVisitKey = null;
 				favoriteIds = [];
 			}
@@ -48,6 +57,7 @@
 			if (authoritative && !authBoundary && !state.libraryUnavailable) {
 				favoriteVisitKey = key;
 				favoriteIds = currentFavorites();
+				if (retryPending) void persistPendingChanges();
 			}
 			items = state.items;
 			loading = state.loading;
@@ -64,10 +74,11 @@
 		return () => { lifetime.abort(); dispose(); };
 	});
 
-	const session = browserStorage('session');
+	let session = $state.raw<ReturnType<typeof browserStorage>>(null);
+	let owner: LibraryRefreshUpdate['accountSession'];
 	const local = browserStorage('local');
-	let favoriteIds = $state<string[]>(loadFavorites(session, local));
-	let favoriteVisitKey = favoritesKey(session);
+	let favoriteIds = $state<string[]>([]);
+	let favoriteVisitKey: string | null = null;
 
 	const liked = $derived(selectFavoriteItems(items, favoriteIds));
 
@@ -75,6 +86,7 @@
 
 	type FavoriteChange = (ids: readonly string[]) => readonly string[];
 	const pendingChanges = new Map<string, FavoriteChange>();
+	let retryPending = false;
 
 	async function retireDeviceIds(scope: string, ids: readonly string[], verify: () => Promise<boolean>,
 		run: NonNullable<LibraryRefreshUpdate['runIfCurrent']>): Promise<boolean> {
@@ -97,18 +109,39 @@
 		return applyChanges(loadFavorites(session, local, favoriteIds));
 	}
 
-	async function persistChange(id: string, change: FavoriteChange): Promise<void> {
-		const scope = favoriteVisitKey;
-		if (!scope || refresher.state.verificationSuspended || scope !== favoritesKey(session)) return;
+	function persistChange(id: string, change: FavoriteChange): void {
+		const scope = favoriteVisitKey, receipt = owner;
+		if (!scope || (receipt && !receipt.isCurrent()) || refresher.state.verificationSuspended || scope !== favoritesKey(session)) return;
 		pendingChanges.delete(id);
 		pendingChanges.set(id, change);
 		favoriteIds = currentFavorites();
+		void persistPendingChanges();
+	}
+
+	async function persistPendingChanges(): Promise<void> {
+		const scope = favoriteVisitKey, receipt = owner, storage = session;
+		if (!scope || !pendingChanges.size || scope !== favoritesKey(storage)) return;
+		retryPending = false;
 		let changes = pendingChanges;
-		const stored = await updateStoredFavorites(session, local, scope, (ids) => {
+		let guarded = false, admitted = false;
+		const run: LibraryRefreshUpdate['runIfCurrent'] = receipt && ((work) => {
+			guarded = true;
+			return receipt.run(() => {
+				admitted = true;
+				return work();
+			});
+		});
+		const stored = await updateStoredFavorites(storage, local, scope, (ids) => {
 			changes = new Map(pendingChanges);
 			return applyChanges(ids, changes);
-		});
-		if (!stored || scope !== favoriteVisitKey) return;
+		}, undefined, run);
+		if (scope !== favoriteVisitKey) return;
+		if (!stored && receipt && (!receipt.isCurrent() || (guarded && !admitted))) {
+			retryPending = true;
+			if (owner !== receipt && owner?.isCurrent()) void persistPendingChanges();
+			return;
+		}
+		if (!stored || (receipt && !receipt.isCurrent())) return;
 		for (const [id, saved] of changes) if (pendingChanges.get(id) === saved) pendingChanges.delete(id);
 		favoriteIds = currentFavorites();
 	}
@@ -182,7 +215,7 @@
 		</ul>
 	{/if}
 	{#if !loading && !requiresSignIn && !loadError}
-		<AccountLikes {titles} {libraryBinding} {deviceScope} readDeviceIds={currentFavorites} {retireDeviceIds}
+		<AccountLikes {titles} {libraryBinding} {deviceScope} storageScope={session} readDeviceIds={currentFavorites} {retireDeviceIds}
 			deviceCount={deviceScope ? favoriteIds.length : 0} onSessionChanged={refresher.handleLocalAuthTransition}
 			onVerificationSuspended={refresher.suspendVerification} />
 	{/if}

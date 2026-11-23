@@ -7,6 +7,7 @@ by a native two-parent merge commit.
 """
 
 import hashlib
+import json
 import os
 import pathlib
 import subprocess
@@ -99,11 +100,23 @@ class Graph(unittest.TestCase):
         if base_ref is None:
             selected = self.helper(**self.pr_env(MIGRATIONS_PR_HEAD_SHA=self.pr_tip))
             self.assert_base(selected, self.main_tip)
-            base_ref = selected.stdout.strip().split("=", 1)[1]
+            base_ref = self.outputs(selected)["base_sha"]
         return run(["python3", str(GATE), "--root", str(self.root), "--base-ref", base_ref], REPO_ROOT)
 
     def helper(self, **env):
         clean = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "MIGRATIONS_"))}
+        payload = {
+            "pull_request": {"base": {"sha": self.old},
+                             "head": {"sha": env.pop("MIGRATIONS_PR_HEAD_SHA", self.pr_tip)}},
+            "merge_group": {"base_sha": env.pop("QUEUE_BASE_SHA", self.old),
+                            "head_sha": env.pop("QUEUE_HEAD_SHA", self.merge)},
+        }
+        before = env.pop("MIGRATIONS_PUSH_BEFORE", None)
+        if before is not None:
+            payload["before"] = before
+        event_file = self.root / "event.json"
+        event_file.write_text(json.dumps(payload))
+        clean.update(GITHUB_EVENT_PATH=str(event_file))
         clean.update({k: v for k, v in env.items() if v is not None})
         return run(["python3", str(BASE), "--root", str(self.root)], REPO_ROOT, clean)
 
@@ -112,15 +125,18 @@ class Graph(unittest.TestCase):
         env.update(over)
         return env
 
+    def outputs(self, result):
+        return dict(line.split("=", 1) for line in result.stdout.splitlines())
+
     def assert_base(self, result, sha):
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual(f"base_ref={sha}\n", result.stdout)
+        self.assertEqual(sha, self.outputs(result)["base_sha"])
         self.assertIn(sha, result.stderr)
 
     def assert_closed(self, result):
         self.assertEqual(2, result.returncode, result.stdout + result.stderr)
         self.assertEqual("", result.stdout)
-        self.assertIn("No comparison base was selected", result.stderr)
+        self.assertIn("No commit identities emitted", result.stderr)
         self.assertIn("fetch-depth: 0", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
@@ -143,6 +159,8 @@ class GateWithBaselineTests(Graph):
     def test_correct_base_passes_and_stale_base_fails(self):
         result = self.helper(**self.pr_env())
         self.assert_base(result, self.main_tip)
+        self.assertEqual({"merge_sha": self.merge, "base_sha": self.main_tip,
+                          "head_sha": self.pr_tip}, self.outputs(result))
         good = self.gate()
         self.assertEqual(0, good.returncode, good.stdout + good.stderr)
         stale = self.gate(self.old)
@@ -217,7 +235,7 @@ class GateWithBaselineTests(Graph):
         result = self.helper(GITHUB_EVENT_NAME="push", GITHUB_SHA=tip,
                              MIGRATIONS_PUSH_BEFORE=self.merge)
         self.assert_base(result, self.merge)
-        drift = self.gate(result.stdout.strip().split("=", 1)[1])
+        drift = self.gate(self.outputs(result)["base_sha"])
         self.assertEqual(1, drift.returncode, drift.stderr)
         self.assertIn("applied-edited: 0030_m30.sql", drift.stdout)
 
@@ -239,6 +257,7 @@ class PullRequestBaselineTests(Graph):
         other = "1" * 40
         cases = {
             "head mismatch": self.pr_env(MIGRATIONS_PR_HEAD_SHA=other),
+            "head missing": self.pr_env(MIGRATIONS_PR_HEAD_SHA=None),
             "sha missing": {k: v for k, v in self.pr_env().items() if k != "GITHUB_SHA"},
             "sha short": self.pr_env(GITHUB_SHA=self.merge[:12]),
             "sha nonhex": self.pr_env(GITHUB_SHA="z" * 40),
@@ -299,10 +318,18 @@ class OtherEventBaselineTests(Graph):
                 self.assert_base(self.helper(**self.push_env(before)), self.main_tip)
 
     def test_other_events_use_main(self):
-        for event in ("workflow_dispatch", "merge_group", "schedule"):
+        for event in ("workflow_dispatch", "workflow_call", "schedule"):
             with self.subTest(event):
                 env = {"GITHUB_EVENT_NAME": event, "GITHUB_REF": "refs/heads/x", "GITHUB_SHA": self.merge}
                 self.assert_base(self.helper(**env), self.main_tip)
+
+    def test_queue_requires_pinned_head_and_ancestor_base(self):
+        env = {"GITHUB_EVENT_NAME": "merge_group", "GITHUB_SHA": self.merge}
+        result = self.helper(**env)
+        self.assertEqual(self.outputs(result), dict(merge_sha=self.merge, base_sha=self.old, head_sha=self.merge))
+        unrelated = git(self.root, "commit-tree", f"{self.merge}^{{tree}}", "-m", "unrelated")
+        self.assert_closed(self.helper(**env, QUEUE_BASE_SHA=unrelated))
+        self.assert_closed(self.helper(**env, QUEUE_HEAD_SHA=self.main_tip))
 
     def test_local_main_preferred_then_origin_main(self):
         env = {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": self.merge}

@@ -282,6 +282,23 @@ class TransportTests(unittest.TestCase):
                 self.send()
         self.assertEqual(self.children, [])
 
+    def test_only_three_pinned_post_destinations_even_if_endpoint_input_changes(self):
+        self.program = f"out.write({self.ok_head!r})"
+        for slot, path in ((1, "getArtists"), (2, "getAlbum"), (7, "getArtist")):
+            self.assertEqual(self.send(slot).status, 200)
+            self.assertEqual(self.argv[-3:], ("-", "--url", f"https://staging.nntune.com/rest/{path}"))
+        # Make the prepared URL and the input endpoint agree. That alone must not authorize it.
+        for endpoint in ("ping", "getArtists.view", "getArtists/child", "%67etArtists", "getartists"):
+            with (patch.dict(self.transport._matrix["slots"][0], endpoint=endpoint),
+                  self.assertRaisesRegex(runner["Stop"], "^destination-refused$")):
+                self.send()
+        original = next(runner["prepare_requests"](matrix, self.bearer, self.api_key))
+        object.__setattr__(original, "method", "GET")
+        with (patch.dict(runner["_prepare_post"].__globals__, _prepare_post=lambda *_: original),
+              self.assertRaisesRegex(runner["Stop"], "^destination-refused$")):
+            self.send()
+        self.assertEqual(len(self.children), 3)
+
     def test_access_denial_and_redirect_are_terminal(self):
         for status, reason in ((302, "redirect-refused"), (307, "redirect-refused"),
                                (401, "access-refused"), (403, "access-refused")):

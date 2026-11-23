@@ -2,13 +2,12 @@
 	import { onMount } from 'svelte';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import { ApiClient, ApiError, INVITE_WINDOW_LIMIT, type InviteWindow, type InviteWindowSchedule } from '#lib/api/client.js';
-	import { captureAuthFence, subscribeAuthFenceInvalidation } from '#lib/auth-fence.js';
+	import { observeAccountSession, type AccountSession as Fence } from '#lib/auth-fence.js';
 	import { subscribeLocalAuthTransition } from '#lib/auth-transition.js';
 	import { LIBRARY_AUTH_TRANSITION_KEY } from '#lib/library/cache.js';
 
-	type Fence = NonNullable<Awaited<ReturnType<typeof captureAuthFence>>>;
 	type ListedWindow = InviteWindow & { closed?: boolean };
-	const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL });
+	const account = observeAccountSession(clear);
 	const dateFormat = new Intl.DateTimeFormat(undefined, { timeZone: 'UTC', dateStyle: 'medium', timeStyle: 'medium' });
 	const unavailable = 'Invite windows are unavailable. Reload this page to check access again.';
 	let access = $state.raw<{ fence: Fence; windows: ListedWindow[] } | null>(null);
@@ -30,30 +29,31 @@
 	}
 
 	onMount(() => {
-		const lifetime = new AbortController();
-		subscribeAuthFenceInvalidation(() => clear(), lifetime.signal);
 		const unsubscribe = subscribeLocalAuthTransition(() => clear());
 		const clock = setInterval(() => { now = serverNow(); }, 1000);
-		void run(null, (signal) => client.listInviteWindows(signal), ({ windows, serverTime }, fence) => {
+		void run(null, (client, signal) => client.listInviteWindows(signal), ({ windows, serverTime }, fence) => {
 			// Use the same-origin HTTP Date and monotonic elapsed time, not the device clock.
 			clockOffset = serverTime - performance.now();
 			now = serverNow();
 			access = { windows, fence };
 		}, () => clear());
-		return () => { lifetime.abort(); unsubscribe(); clearInterval(clock); clear(); };
+		return () => { account.dispose(); unsubscribe(); clearInterval(clock); clear(); };
 	});
 
-	async function run<T>(owner: Fence | null, send: (signal: AbortSignal) => Promise<T>,
+	async function run<T>(owner: Fence | null, send: (client: ApiClient, signal: AbortSignal) => Promise<T>,
 		apply: (result: T, fence: Fence) => void, fail: (cause: unknown) => void) {
+		account.prepare();
 		if (request) return;
 		const attempt = new AbortController();
 		request = attempt;
 		error = notice = '';
 		try {
-			const fence = owner ?? await captureAuthFence();
+			const fence = owner ?? await account.capture();
 			// Use the same generation for the read, user intent, dispatch and publication.
 			// Box the promise so the shared lock does not cover the network wait.
-			const sent = await fence?.run(() => attempt.signal.aborted ? undefined : { result: send(attempt.signal) });
+			const sent = fence && await fence.run(() => attempt.signal.aborted ? undefined : {
+				result: send(new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, session: { owner: fence } }), attempt.signal)
+			});
 			if (!fence || !sent) {
 				if (!attempt.signal.aborted) clear();
 				return;
@@ -76,7 +76,7 @@
 		if (!access || request) return;
 		const { fence, windows } = access;
 		const close = typeof input === 'number';
-		void run(fence, (signal) => client.writeInviteWindow(input, signal), (row) => {
+		void run(fence, (client, signal) => client.writeInviteWindow(input, signal), (row) => {
 			// A confirmed close stays ended even if the browser clock lags the server.
 			access = { fence, windows: [{ ...row, closed: close }, ...windows.filter(({ id }) => id !== row.id)]
 				.sort((a, b) => b.id - a.id).slice(0, INVITE_WINDOW_LIMIT) };

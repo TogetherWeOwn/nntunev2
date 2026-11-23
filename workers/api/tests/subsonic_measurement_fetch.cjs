@@ -10,15 +10,19 @@ const { resolve } = require('node:path');
 async function main() {
   const [, , wrangler, origin] = process.argv;
   const { unstable_startWorker: startWorker } = createRequire(wrangler)('wrangler');
-  const [matching, other] = JSON.parse(readFileSync(0, 'utf8'));
-  const headers = { authorization: `Bearer ${process.env.QA_AUTH_TOKEN}`, 'x-subsonic-measurement-case': 'small' };
+  const [matching, other, runner, shared] = JSON.parse(readFileSync(0, 'utf8'));
+  const headers = { authorization: `Bearer ${runner}`, 'x-subsonic-measurement-case': 'small' };
+  const artist = '00000000-0000-4000-8000-000000000001';
   const release = '00000000-0000-4000-8000-000000000002';
   const fixedCapacity = '{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Service unavailable."}}}';
-  const start = (variant) => startWorker({
-    config: resolve(`measurement-${variant}.toml`),
-    dev: { remote: false, server: { hostname: '127.0.0.1', port: 0 },
-      origin: { secure: true, hostname: new URL(origin).hostname } },
-  });
+  const start = (variant) => {
+    console.log(`measurement Fetch: starting ${variant}`);
+    return startWorker({
+      config: resolve(`measurement-${variant}.toml`),
+      dev: { remote: false, server: { hostname: '127.0.0.1', port: 0 },
+        origin: { secure: true, hostname: new URL(origin).hostname } },
+    });
+  };
   const fetchWith = (worker) => (endpoint, params, headers, method = 'POST') => {
     const url = new URL(`/rest/${endpoint}`, origin);
     const form = new URLSearchParams(params);
@@ -29,19 +33,38 @@ async function main() {
     });
   };
 
+  const albumParams = { f: 'json', apiKey: matching, id: release };
+  const refusedRoutes = [['getAlbum', 'GET'], ['getAlbum.view', 'POST'],
+    ['getAlbum/child', 'POST'], ['%67etAlbum', 'POST'], ['getalbum', 'POST']];
+  const refusedRoute = async (worker, endpoint, method) => {
+    const response = await fetchWith(worker)(endpoint, method === 'GET' ? { f: 'json' } : albumParams,
+      headers, method);
+    return [response.status, await response.text()];
+  };
+  const ordinary = [];
+
   for (const enabled of [1, 0]) {
     const worker = await start(enabled);
     try {
       const fetchCase = fetchWith(worker);
       for (const [key, code] of enabled ? [[matching, null], [other, 50]] : [[matching, 44]]) {
-        const response = await fetchCase('getAlbum.view', { f: 'json', apiKey: key, id: release }, headers);
+        const response = await fetchCase('getAlbum', { f: 'json', apiKey: key, id: release }, headers);
         assert.equal(response.status, 200, `measurement ${enabled}, expected protocol code ${code}`);
         const result = (await response.json())['subsonic-response'];
         assert.equal(result.status, code === null ? 'ok' : 'failed');
         assert.equal(result.error?.code ?? null, code);
         assert.equal(result.album?.song?.[0]?.title ?? null, code === null ? 'Fixture "Track"' : null);
       }
-      if (!enabled) continue;
+      if (!enabled) {
+        // Capture the ordinary responses without running two Wrangler sessions at once.
+        for (const [endpoint, method] of refusedRoutes) {
+          ordinary.push(await refusedRoute(worker, endpoint, method));
+        }
+        continue;
+      }
+      const artistResponse = await fetchCase('getArtist', { f: 'json', apiKey: matching, id: artist }, headers);
+      assert.equal(artistResponse.status, 200);
+      assert.equal((await artistResponse.json())['subsonic-response'].artist.name, 'Fixture 雪 & Wind');
       const select = (id) => ({ ...headers, 'x-subsonic-measurement-case': id });
       for (const requestHeaders of [{ authorization: headers.authorization }, select('rows-exact'),
         select('small, small'), { 'x-subsonic-measurement-case': 'small' }]) {
@@ -57,7 +80,7 @@ async function main() {
       assert.equal(empty.status, 200);
       assert.deepEqual((await empty.json())['subsonic-response'].artists.index, []);
       for (const [endpoint, params] of [
-        ['getAlbum.view', { f: 'json', id: release }],
+        ['getAlbum', { f: 'json', id: release }],
         ['getArtists', { f: 'jsonp', callback: 'fixture.cb' }],
       ]) {
         const rejected = await fetchCase(endpoint, { ...params, apiKey: matching }, select('charge-exact'));
@@ -67,8 +90,8 @@ async function main() {
       }
       let complete;
       const cases = [['small', 200], ['charge-below', 200], ['charge-exact', 200], ['charge-over', 503]];
-      for (const [method, id, status] of ['POST', 'GET'].flatMap((method) => cases.map((c) => [method, ...c]))) {
-        const response = await fetchCase('getArtists', { f: 'json', apiKey: matching }, select(id), method);
+      for (const [id, status] of cases) {
+        const response = await fetchCase('getArtists', { f: 'json', apiKey: matching }, select(id));
         assert.equal(response.status, status, id);
         assert.equal(response.headers.get('retry-after'), status === 503 ? '1' : null, id);
         assert.equal(response.headers.get('cache-control'), 'private, no-store', id);
@@ -122,7 +145,7 @@ async function main() {
     writeFileSync('measurement-expired.toml', expired);
     const expiredWorker = await start('expired');
     try {
-      const response = await fetchWith(expiredWorker)('getAlbum.view', { f: 'json', apiKey: matching, id: release }, headers);
+      const response = await fetchWith(expiredWorker)('getAlbum', { f: 'json', apiKey: matching, id: release }, headers);
       assert.equal(response.status, 200);
       assert.equal(response.headers.get('cache-control'), 'private, no-store');
       const envelope = await response.json();
@@ -140,10 +163,40 @@ async function main() {
     assert.equal(connections, 0, 'expired lease must not open the measurement binding');
 
     writeFileSync('measurement-stalled.toml', config);
+    const devVars = readFileSync('.dev.vars', 'utf8');
+    const expiredBearer = devVars.replace(/^SUBSONIC_MEASUREMENT_RUNNER=v1:\d+:\d+:/m,
+      'SUBSONIC_MEASUREMENT_RUNNER=v1:1000:1600:');
+    assert.notEqual(expiredBearer, devVars, 'test must expire the dedicated bearer');
+    writeFileSync('.dev.vars', expiredBearer);
+    try {
+      const expiredRunnerWorker = await start('stalled');
+      try {
+        const response = await fetchWith(expiredRunnerWorker)('getArtists', { apiKey: matching }, headers);
+        assert.equal(response.status, 404);
+        assert.match(await response.text(), /Endpoint not supported in staging\./);
+      } finally {
+        await expiredRunnerWorker.dispose();
+      }
+    } finally {
+      writeFileSync('.dev.vars', devVars);
+    }
     const worker = await start('stalled');
     try {
+      for (const [index, [endpoint, method]] of refusedRoutes.entries()) {
+        const [status, body] = await refusedRoute(worker, endpoint, method);
+        assert.equal(status, ordinary[index][0], `${method} ${endpoint}`);
+        assert.ok(body === ordinary[index][1], `${method} ${endpoint} changed ordinary response`);
+      }
+      for (const authorization of [undefined, `Bearer ${shared}`, `Bearer ${'W'.repeat(43)}`]) {
+        const attempt = { 'x-subsonic-measurement-case': 'small' };
+        if (authorization) attempt.authorization = authorization;
+        const response = await fetchWith(worker)('getAlbum', albumParams, attempt);
+        assert.equal(response.status, 404);
+        assert.match(await response.text(), /Endpoint not supported in staging\./);
+      }
+      assert.equal(connections, 0, 'all refusals must leave the fixture DB untouched');
       const started = performance.now();
-      const response = await fetchWith(worker)('getAlbum.view', { f: 'json', apiKey: matching, id: release }, headers);
+      const response = await fetchWith(worker)('getAlbum', { f: 'json', apiKey: matching, id: release }, headers);
       assert.equal(response.status, 503);
       assert.equal(response.headers.get('retry-after'), '1');
       assert.equal(response.headers.get('cache-control'), 'private, no-store');
@@ -163,7 +216,7 @@ async function main() {
   }
   // Catch late connection callbacks even if a socket sent no startup bytes.
   assert.equal(connections, 1, 'only the active stalled control may connect');
-  console.log('ok: armed release Fetch rejects past UTC lease without cleanup or a measurement socket');
+  console.log('ok: refused scope, expired lease and expired bearer never open a measurement socket');
 }
 
 void main();
