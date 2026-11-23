@@ -279,6 +279,17 @@ for scenario in 'abort COMMIT aborted - 0 0' 'abort ROLLBACK aborted 1 1 100' \
     done
     [[ "$expired" == 1 ]] || { printf 'idle cutoff did not pass while the contender waited\n' >&2; exit 1; }
   fi
+  # A separate connection must see only the committed reservation and expiry intent.
+  [[ "$(psql_run -Atc "SELECT checkpoint_revision=0 AND checkpoint_offset=0
+       AND checkpoint_generation IS NULL AND terminal_reason IS NULL AND terminal_at IS NULL
+       AND idle_deadline=$initial_idle
+       AND EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+         WHERE session_id=session.id AND kind='absolute_expiry' AND due_at=session.absolute_deadline)
+       AND NOT EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+         WHERE session_id=session.id AND kind='terminal_reconcile')
+     FROM public.ingest_session_reservations AS session WHERE session.id='$sid'")" == t ]] || {
+    printf 'observer saw uncommitted session progress or cleanup work: %s\n' "$scenario" >&2; exit 1;
+  }
   printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
   wait "$holder"; wait "$contender"
   result="$(<"$race/contender")"
