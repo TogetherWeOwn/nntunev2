@@ -3,39 +3,18 @@
 	import { page } from '$app/state';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import Artwork from '#lib/player/Artwork.svelte';
+	import PlaybackView from '#lib/player/AudioPlaybackView.svelte';
 	import { getAppPlayer } from '#lib/player/AppPlayer.svelte';
-	import { fixtureLink } from '#lib/player/fixtures/music-video.js';
 	import LyricsPanel, { type TrackLyrics } from '#lib/player/LyricsPanel.svelte';
-	import { verifiedVideoId } from '#lib/player/musicVideo.js';
-	import MusicVideoDialog from '#lib/player/MusicVideoDialog.svelte';
-	import { currentTrack, type Track } from '#lib/player/queue.js';
+	import { currentTrack } from '#lib/player/queue.js';
 
 	// No route loader supplies lyrics yet. This is a presentation input only.
 	let { lyrics = null }: { lyrics?: TrackLyrics | null } = $props();
 
 	// Presentation only: the layout keeps the existing native controls and decoder.
-	const { queue, media } = getAppPlayer();
+	const { queue } = getAppPlayer();
 	const track = $derived(currentTrack($queue));
 	const artist = $derived(track ? displayArtist(track) : null);
-	function getVideoId() {
-		if (import.meta.env.MODE !== 'browser-fixtures' || !track ||
-			page.url.searchParams.get('music-video-fixture') !== 'on') return null;
-		return verifiedVideoId(fixtureLink, track.id);
-	}
-	let showVideo = $state(false);
-	let audioTab: HTMLButtonElement;
-	let videoTab: HTMLButtonElement;
-
-	function handleTabKey(event: KeyboardEvent) {
-		if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
-		const other = event.currentTarget === audioTab ? videoTab : audioTab;
-		other.focus();
-		event.preventDefault();
-	}
-
-	$effect(() => {
-		if (!getVideoId()) showVideo = false;
-	});
 	let heading: HTMLHeadingElement | undefined = $state();
 	let fullscreenButton: HTMLButtonElement | undefined = $state();
 	let fullscreenAvailable = $state(false);
@@ -115,15 +94,6 @@
 	<title>Now Playing — NNTune</title>
 </svelte:head>
 
-{#snippet audioContent(item: Track)}
-	<div class="artwork">
-		<Artwork />
-	</div>
-	<h2>{displayTitle(item)}</h2>
-	{#if artist}<p class="artist">{artist}</p>{/if}
-	<LyricsPanel trackId={item.id} {lyrics} />
-{/snippet}
-
 <main class="nt-wrap expanded" id="main-content" use:observeFullscreen>
 	<h1 tabindex="-1" bind:this={heading}>Now Playing</h1>
 	{#if page.state.nowPlayingFromMini === true}
@@ -145,27 +115,14 @@
 	{/if}
 
 	{#if track}
-		{#if import.meta.env.MODE === 'browser-fixtures' && getVideoId()}
-			<div class="playback-tabs" role="tablist" aria-label="Now Playing views">
-				<button type="button" role="tab" id="now-playing-audio-tab" bind:this={audioTab}
-					class="nt-button nt-button--ghost" aria-selected={!showVideo} tabindex={showVideo ? -1 : 0}
-					onkeydown={handleTabKey} onclick={() => { showVideo = false; }}>Audio</button>
-				<button type="button" role="tab" id="now-playing-video-tab" bind:this={videoTab}
-					class="nt-button nt-button--ghost" aria-selected={showVideo} tabindex={showVideo ? 0 : -1}
-					onkeydown={handleTabKey} onclick={() => { showVideo = true; }}>Music Video</button>
+		<PlaybackView {track}>
+			<div class="artwork">
+				<Artwork />
 			</div>
-			<div role="tabpanel" aria-labelledby="now-playing-audio-tab" hidden={showVideo} tabindex={showVideo ? undefined : 0}>
-				{@render audioContent(track)}
-			</div>
-			<div role="tabpanel" aria-labelledby="now-playing-video-tab" hidden={!showVideo}>
-				{#if showVideo}
-					<MusicVideoDialog title={displayTitle(track)} {getVideoId}
-						pauseAudio={media.pauseCurrent} audioStatus={media.playbackStatus} />
-				{/if}
-			</div>
-		{:else}
-			{@render audioContent(track)}
-		{/if}
+			<h2>{displayTitle(track)}</h2>
+			{#if artist}<p class="artist">{artist}</p>{/if}
+			<LyricsPanel trackId={track.id} {lyrics} />
+		</PlaybackView>
 	{:else}
 		<p>Nothing playing. Choose a track in Your Library.</p>
 	{/if}
@@ -194,17 +151,6 @@
 	}
 	.status {
 		margin-block: 0;
-	}
-	.playback-tabs {
-		display: flex;
-		overflow-x: auto;
-	}
-	.playback-tabs button {
-		flex: none;
-		border-block-end: 2px solid transparent;
-	}
-	.playback-tabs button[aria-selected='true'] {
-		border-block-end-color: currentColor;
 	}
 	.route-button {
 		display: inline-flex;

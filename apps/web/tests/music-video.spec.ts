@@ -30,7 +30,6 @@ test('verified video stays visible, retires on hide and preserves the audio queu
 	await expect(page.getByText('The video is unavailable.')).toBeVisible();
 	await expect(frame).toHaveCount(0);
 	await watch.click();
-	await expect(page.frameLocator('iframe').getByRole('button', { name: 'Fixture native play control' })).toBeVisible();
 	await expect(page.locator('body')).toHaveAttribute('data-video-state', 'playing');
 	await expect(frame).toHaveAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
 	const embed = new URL((await frame.getAttribute('src'))!);

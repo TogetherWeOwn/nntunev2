@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy } from 'svelte';
 	import type { Readable } from 'svelte/store';
 	import { onPaywall } from '#lib/billing/planLimit.js';
 	import type { PlaybackStatus } from './mediaController.js';
@@ -89,13 +89,12 @@
 				if (!fits() || getVideoId() !== videoId) return close();
 				pauseAudio();
 				if (audioActive) return close();
-				const embed = new URL(`/embed/${videoId}`, YOUTUBE_EMBED_ORIGIN);
-				embed.search = new URLSearchParams({ enablejsapi: '1', origin: window.location.origin }).toString();
+				const query = new URLSearchParams({ enablejsapi: '1', origin: window.location.origin });
 				frame = document.createElement('iframe');
 				frame.title = `${title} on YouTube`;
 				frame.referrerPolicy = 'strict-origin-when-cross-origin';
 				frame.allow = "autoplay; fullscreen; picture-in-picture 'none'";
-				frame.src = embed.href;
+				frame.src = `${YOUTUBE_EMBED_ORIGIN}/embed/${videoId}?${query}`;
 				slot.append(frame);
 				player = new api.Player(frame, { host: YOUTUBE_EMBED_ORIGIN, events: {
 					onReady: ({ target }) => {
@@ -112,10 +111,8 @@
 		}
 	}
 
-	onMount(() => {
-		const offPaywall = onPaywall(() => { if (dialog.open) close(); });
-		return () => { offPaywall(); stop?.(); };
-	});
+	$effect(() => onPaywall(() => { if (dialog.open) close(); }));
+	onDestroy(() => stop?.());
 </script>
 
 <button type="button" class="nt-button nt-button--ghost" aria-haspopup="dialog" onclick={watch}>Watch video</button>
@@ -123,8 +120,7 @@
 <a href="https://policies.google.com/privacy" rel="noreferrer">Google Privacy Policy</a>
 <p role="status">{status}</p>
 
-<dialog bind:this={dialog} aria-label={title} oncancel={() => stop?.()}
-	onclose={() => { if (!dialog.open) stop?.(); }}>
+<dialog bind:this={dialog} aria-label={title} oncancel={() => stop?.()}>
 	<form method="dialog" onsubmit={() => stop?.()}>
 		<button type="submit" class="nt-button nt-button--ghost">Close video</button>
 	</form>
@@ -137,7 +133,6 @@
 		inline-size: min(480px, calc(100% - 3rem));
 		padding: var(--nt-space-3);
 		border: 0;
-		border-radius: var(--nt-radius);
 		background: var(--nt-bg);
 		color: var(--nt-fg);
 	}

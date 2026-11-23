@@ -50,6 +50,9 @@ export default defineConfig(({ command, mode }) => {
 	);
 
 	return {
+		resolve: videoFixtures ? { alias: {
+			'#lib/player/AudioPlaybackView.svelte': `${envDir}src/lib/player/MusicVideoPlaybackView.svelte`
+		} } : undefined,
 		define: {
 			__BUILD_SHA__: JSON.stringify(buildSha)
 		},
