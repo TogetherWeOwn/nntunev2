@@ -786,7 +786,11 @@ jobs:
         run: bash workers/api/tests/test_storage_digest_target.sh
       - name: Check scratch migration runner offline
         run: bash workers/api/tests/test_migration_runner.sh
-      - run: bash workers/api/tests/run_migration_tests.sh
+      - name: Run migration tests and verify the scoped reservation fixture
+        run: |
+          set -euo pipefail
+          bash workers/api/tests/run_migration_tests.sh | tee "$RUNNER_TEMP/migration-tests.log"
+          grep -Fxq 'test (hosted): ingest_session_reserve passed' "$RUNNER_TEMP/migration-tests.log"
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - name: Exercise hosted reservation race fixture

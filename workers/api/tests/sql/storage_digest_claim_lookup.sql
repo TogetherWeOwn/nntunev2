@@ -177,6 +177,7 @@ END $$;
 -- Require the runner's pinned disposable connection for session fixtures.
 \if :{?hosted_ingest_session_fixture}
 \else
+\echo 'skip: ingest session fixtures require the hosted disposable database'
 ROLLBACK;
 \quit
 \endif
