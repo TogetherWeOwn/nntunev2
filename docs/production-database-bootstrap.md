@@ -106,9 +106,10 @@ GitHub supports required reviewers on this public repository. The existing
 production Environment has only a branch restriction. Under separate release
 admission, configure `production-db-bootstrap` **before** enabling the job.
 GitHub can create a missing Environment from a workflow reference without
-protection. In Settings and the [environment REST readback](https://docs.github.com/en/rest/deployments/environments),
-verify the required independent reviewer or team, `prevent_self_review: true`
-and `can_admins_bypass: false`. Use a custom policy with the sole typed
+protection. In Settings, verify the required independent reviewer or team,
+prevent self-review and disabled administrator bypass. Cross-check the
+reviewer and `prevent_self_review` in the [environment REST readback](https://docs.github.com/en/rest/deployments/environments)
+and `can_admins_bypass` when returned. Use a custom policy with the sole typed
 branch `main`, no tag policy. Verify the list through
 [deployment branch policies](https://docs.github.com/en/rest/deployments/branch-policies).
 Keep Environment administration with the custodian and check rule changes
@@ -172,9 +173,13 @@ the disposable proof. [GitHub Actions billing](https://docs.github.com/en/billin
 For an independently verified empty first release, prefer a successful
 ordinary native snapshot of the exact branch before the first protected
 write. Coordinate the release window with that schedule and read back the
-capture time, completion, restore scope and expiry. Verify the first-release
-empty-state separately, before migration. Keep the ordinary retention
-policy. If the release gate needs a different snapshot, verify eligibility,
+capture time, completion, restore scope and expiry. The pre-bootstrap
+snapshot recovers the branch before the launch database and grants exist.
+After setup, verify the launch empty-state separately. If migration recovery
+needs to preserve the new database and grants, verify a successful snapshot
+after setup and before migration. Prefer the next ordinary snapshot when
+its timing and scope satisfy that recovery objective. Keep the ordinary
+retention policy. If the gate needs a different snapshot, verify eligibility,
 retention and budget separately. Each expired backup releases its own
 storage, and the oldest retained backup pins the WAL window across the
 whole branch. A retention limit controls time. It does not bound snapshot
