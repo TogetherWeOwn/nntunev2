@@ -21,6 +21,119 @@ async function seedLibrary(page: Page, ids: string[] = [], verified = true): Pro
 		json: [{ id: TRACK, title: 'Coral Horizon' }, { id: REJECTED, title: 'Tidal Echo' }]
 	}));
 	await page.route('**/v1/me/likes/session', (route) => route.fulfill({ json: likes() }));
+	await page.route('**/v1/me/taste/session', (route) => route.fulfill({ json: likes() }));
+}
+
+for (const exactJob of [false, true]) {
+	test(`Tracks and Queue share a session-bound Like across Refresh (${exactJob ? 'exact job' : 'recording'})`, async ({ page }) => {
+		await seedLibrary(page);
+		const recording = 'abcd0000-0000-4000-8000-000000000001';
+		const id = recording.toUpperCase(), target = exactJob ? id : recording;
+		await page.route('**/api/library', (route) => route.fulfill({
+			headers: { 'x-nntune-session-binding': BINDING },
+			json: [{ id, like_target_id: target, title: 'Coral Horizon' },
+				{ id: 'opaque-invalid', like_target_id: null, title: 'Legacy Track' }]
+		}));
+		let saved = false;
+		const reply = Promise.withResolvers<void>();
+		const methods: string[] = [];
+		await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes(saved ? [{ ...likedTrack, target_id: target }] : []) }));
+		await page.route((url) => url.pathname === `/v1/me/likes/track/${target}`, async (route) => {
+			const request = route.request();
+			methods.push(request.method());
+			expect(request.headers()['x-nntune-session-binding']).toBe(BINDING);
+			const putting = request.method() === 'PUT';
+			if (putting) await reply.promise;
+			saved = putting;
+			await route.fulfill({ json: { target_id: target, ...(saved ? { liked_at: likedTrack.created_at } : { liked: false }) } });
+		});
+		await page.goto('/library');
+		const button = { name: 'Like Coral Horizon', exact: true };
+		const trackRow = page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' });
+		const trackLike = trackRow.getByRole('button', button);
+		await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
+		const legacy = page.getByTestId('library-item').filter({ hasText: 'Legacy Track' });
+		await expect(legacy).toBeVisible();
+		await expect(legacy.getByRole('button', { name: 'Like Legacy Track' })).toHaveCount(0);
+		await trackRow.getByRole('checkbox').check();
+		await page.getByRole('button', { name: 'Append selected', exact: true }).click();
+		const queueLike = page.getByTestId('queue-item').getByRole('button', button);
+		await trackLike.click();
+		await expect(queueLike).toHaveAttribute('aria-disabled', 'true');
+		await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
+		reply.resolve();
+		await expect(trackLike).toHaveAttribute('aria-pressed', 'true');
+		await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
+		await expect(trackRow.getByRole('button', { name: 'Star Coral Horizon', exact: true })).toHaveAttribute('aria-pressed', 'false');
+		const reread = page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/me/likes');
+		await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+		await reread;
+		await expect(trackLike).toHaveAttribute('aria-pressed', 'true');
+		await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
+		await queueLike.click();
+		await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
+		await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
+		expect(methods).toEqual(['PUT', 'DELETE']);
+		await expect(page.getByTestId('usage-meter')).toHaveCount(1);
+	});
+}
+
+for (const cause of ['refused Like', 'failed sign-out']) {
+	test(`Albums can recover from a ${cause} without replaying a write`, async ({ page }) => {
+		await seedLibrary(page);
+		const signOut = cause === 'failed sign-out';
+		const verified = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+		let recovering = false;
+		const writes: string[] = [];
+		await page.route('**/v1/releases', (route) => route.fulfill({ json: [] }));
+		await page.route('**/v1/me/likes', async (route) => {
+			if (recovering) await verified.promise;
+			await route.fulfill({ json: likes(signOut ? [likedTrack] : []) });
+		});
+		await page.route(`**/v1/me/likes/track/${TRACK}`, (route) => {
+			writes.push(route.request().method());
+			if (!recovering) return route.fulfill({ status: 412, json: {} });
+			return route.fulfill({ json: signOut ? { target_id: TRACK, liked: false }
+				: { target_id: TRACK, liked_at: likedTrack.created_at } });
+		});
+		await page.route('**/v1/session/logout', async (route) => {
+			await finish.promise;
+			await route.fulfill({ status: 503, json: {} });
+		});
+		await page.goto('/library');
+		await page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' }).getByRole('checkbox').check();
+		await page.getByRole('button', { name: 'Append selected', exact: true }).click();
+		const albums = page.getByRole('button', { name: 'Albums', exact: true });
+		const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+		const queueLike = page.getByTestId('queue-item').getByRole('button', { name: 'Like Coral Horizon', exact: true });
+		await albums.click();
+		await expect(refresh).toBeHidden();
+		await expect(queueLike).toHaveAttribute('aria-pressed', String(signOut));
+		if (signOut) {
+			await page.getByRole('button', { name: 'Account menu' }).click();
+			await page.getByRole('menuitem', { name: 'Sign out' }).click();
+			try { await expect(queueLike).toHaveCount(0); } finally { finish.resolve(); }
+			await expect(page.getByText('Could not sign out. Please try again.')).toBeVisible();
+		} else {
+			await queueLike.click();
+			await expect(queueLike).toHaveCount(0);
+		}
+		await expect(page.getByText('Account likes are unavailable. Refresh the library to try again.')).toBeVisible();
+		recovering = true;
+		try {
+			const reread = page.waitForRequest('**/v1/me/likes');
+			await refresh.press('Enter');
+			await reread;
+			await expect(refresh).toBeFocused();
+		} finally { verified.resolve(); }
+		await expect(queueLike).toHaveAttribute('aria-pressed', String(signOut));
+		await expect(refresh).toBeHidden();
+		await expect(albums).toBeFocused();
+		expect(writes).toEqual(signOut ? [] : ['PUT']);
+		await queueLike.click();
+		await expect(queueLike).toHaveAttribute('aria-pressed', String(!signOut));
+		expect(writes).toEqual(signOut ? ['DELETE'] : ['PUT', 'PUT']);
+	});
 }
 
 for (const status of [401, 503]) {
@@ -140,3 +253,80 @@ for (const cause of ['shelf overlap', 'retirement overlap', 'shelf mismatch', 'r
 		expect(await page.evaluate((key) => localStorage.getItem(key), KEY)).toBe(JSON.stringify([TRACK]));
 	});
 }
+
+
+test('track preferences replace a Like in Tracks, Queue and Liked Songs without changing the device Star', async ({ page }) => {
+	await seedLibrary(page);
+	let signal: string | null = 'love';
+	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes(signal === 'love' ? [likedTrack] : []) }));
+	await page.route('**/v1/me/taste/session', async (route) => {
+		const request = route.request();
+		const target = { kind: 'track', target_id: TRACK };
+		const row = () => ({ ...target, signal, until: null });
+		expect(request.headers()['x-nntune-session-binding']).toBe(BINDING);
+		if (request.method() === 'GET') return route.fulfill({ json: likes(signal ? [row()] : []) });
+		if (request.method() === 'PUT') {
+			expect(request.postDataJSON()).toEqual({ ...target, signal: 'hide' });
+			signal = 'hide';
+			return route.fulfill({ json: { ...row(), session_binding: BINDING } });
+		}
+		expect(request.method()).toBe('DELETE');
+		expect(request.postDataJSON()).toEqual(target);
+		signal = null;
+		return route.fulfill({ json: { ...target, cleared: true, session_binding: BINDING } });
+	});
+	await page.goto('/library');
+	const row = page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' });
+	const button = { name: 'Like Coral Horizon', exact: true };
+	const trackLike = row.getByRole('button', button);
+	await expect(trackLike).toHaveAttribute('aria-pressed', 'true');
+	await row.getByRole('checkbox').check();
+	await page.getByRole('button', { name: 'Append selected', exact: true }).click();
+	const queueLike = page.getByTestId('queue-item').getByRole('button', button);
+	await expect(queueLike).toHaveAttribute('aria-pressed', 'true');
+	const star = row.getByRole('button', { name: 'Star Coral Horizon', exact: true });
+	const more = row.getByTestId('track-more');
+	async function preferences() {
+		await more.click();
+		await page.getByRole('menuitem', { name: 'Track preferences', exact: true }).press('Enter');
+	}
+	await preferences();
+	await page.getByRole('menuitemcheckbox', { name: 'Hide', exact: true }).press('Enter');
+	await expect(page.getByText('Track preference saved to your account.')).toBeVisible();
+	await expect(more).toBeFocused();
+	await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
+	await expect(queueLike).toHaveAttribute('aria-pressed', 'false');
+	await expect(star).toHaveAttribute('aria-pressed', 'false');
+	await page.goto('/library/liked');
+	await expect(page.getByText('No songs saved to this account yet.')).toBeVisible();
+	await page.goto('/library');
+	await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
+	await preferences();
+	await expect(page.getByRole('menuitemcheckbox', { name: 'Hide', exact: true })).toHaveAttribute('aria-checked', 'true');
+	await page.getByRole('menuitem', { name: 'Clear track preference' }).press('Enter');
+	await expect(page.getByText('Track preference cleared.')).toBeVisible();
+	await expect(trackLike).toHaveAttribute('aria-pressed', 'false');
+});
+
+test('an auth fence invalidation dismisses the open preference menu without refreshing Library', async ({ page }) => {
+	await seedLibrary(page);
+	await page.route('**/v1/me/likes', (route) => route.fulfill({ json: likes() }));
+	await page.route('**/v1/me/taste/session', (route) => route.fulfill({
+		json: likes([{ kind: 'track', target_id: TRACK, signal: 'hide', until: null }])
+	}));
+	await page.goto('/library');
+	const row = page.getByTestId('library-item').filter({ hasText: 'Coral Horizon' });
+	await expect(row.getByRole('button', { name: 'Like Coral Horizon', exact: true })).toBeVisible();
+	await row.getByTestId('track-more').click();
+	await page.getByRole('menuitem', { name: 'Track preferences', exact: true }).press('Enter');
+	await expect(page.getByRole('menuitemcheckbox', { name: 'Hide', exact: true })).toHaveAttribute('aria-checked', 'true');
+	const reloads: string[] = [];
+	page.on('request', (request) => {
+		if (new URL(request.url()).pathname === '/api/library') reloads.push(request.url());
+	});
+	// Deliver only the fence event, not a Library auth-transition notification.
+	await page.evaluate(() => window.dispatchEvent(new StorageEvent('storage', { key: 'nntune.auth.generation.v1' })));
+	await expect(page.getByTestId('track-context-menu')).toHaveCount(0);
+	await expect(row).toBeVisible();
+	expect(reloads).toEqual([]);
+});

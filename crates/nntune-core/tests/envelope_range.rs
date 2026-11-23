@@ -77,6 +77,17 @@ fn enrolled_key_envelope_and_range_compose() {
         Err(EnvelopeError::InvalidContext)
     ));
     assert!(matches!(
+        DigestRange::from_enrolled(
+            &manifest,
+            &root,
+            &wrong_context,
+            &envelope,
+            &envelope,
+            65_530..65_545,
+        ),
+        Err(RangeError::Envelope(EnrolledEnvelopeError::Mismatch))
+    ));
+    assert!(matches!(
         unwrap_scheme2(&[8; 32], &context, &envelope),
         Err(EnvelopeError::Authentication)
     ));

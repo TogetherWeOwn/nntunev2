@@ -13,8 +13,8 @@
  */
 
 import {
-	LIBRARY_AUTH_CONTEXT_KEY,
 	LIBRARY_FAVORITES_KEY,
+	libraryContextKey,
 	purgeFavorites,
 	withFavoritesLock,
 	type SnapshotStorage
@@ -22,13 +22,7 @@ import {
 
 /** Scoped favorites key for the current auth context, or null without one. */
 export function favoritesKey(session: SnapshotStorage | null): string | null {
-	if (!session) return null;
-	try {
-		const context = session.getItem(LIBRARY_AUTH_CONTEXT_KEY);
-		return context ? `${LIBRARY_FAVORITES_KEY}.${context}` : null;
-	} catch {
-		return null;
-	}
+	return libraryContextKey(session, LIBRARY_FAVORITES_KEY);
 }
 
 function isStoredId(value: unknown): value is string {

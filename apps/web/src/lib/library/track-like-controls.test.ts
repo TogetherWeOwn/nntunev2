@@ -30,12 +30,14 @@ function ownership() {
 	let liked = false;
 	let publication: LibraryRefreshUpdate | undefined = readiness();
 	const fetchFn = vi.fn<typeof fetch>();
+	const binding = 'A'.repeat(43);
+	const account = { generation: 'test', signal: new AbortController().signal, isCurrent: () => true, run: async <T,>(work: () => T) => work() };
 	return {
 		fetchFn,
 		publish: (next?: LibraryRefreshUpdate) => { publication = next; },
 		owner: {
-			client: new ApiClient({ baseUrl, fetchFn }),
-			binding: 'A'.repeat(43),
+			client: new ApiClient({ baseUrl, fetchFn, session: { owner: account, binding } }),
+			binding,
 			readiness: () => publication,
 			liked: (id: string) => id === track.id ? liked : undefined,
 			confirm: vi.fn((_id: string, _confirmedId: string, value: boolean) => { liked = value; }),
@@ -151,7 +153,7 @@ describe('injected track and queue Like controls', () => {
 		fetchFn.mockResolvedValueOnce(failure()).mockResolvedValueOnce(response());
 		const controls = createTrackLikeControls(() => owner);
 		await controls(track.id)!.toggle();
-		expect(owner.failed).toHaveBeenCalledExactlyOnceWith(track.id);
+		expect(owner.failed).toHaveBeenCalledExactlyOnceWith(track.id, expect.any(Error));
 		expect(owner.confirm).not.toHaveBeenCalled();
 		expectLikeButtons(controls, false, false);
 		await controls(track.id)!.toggle();

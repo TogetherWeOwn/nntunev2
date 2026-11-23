@@ -8,27 +8,44 @@ const admits = (...args) => resolveCase(...args) !== undefined;
 const request = (path) => new Request(`https://example.test/rest/${path}`);
 const neverOpen = () => assert.fail('app connector must not run');
 
-test('only the exact armed staging deployment admits the QA runner', () => {
+test('only exact POSTs on the armed staging deployment admit the dedicated runner', () => {
   const sha = 'abcd'.repeat(10);
   const lease = `v1:${sha}:1000:2200:fixture-user`;
+  const bearer = 'R'.repeat(43);
+  const shared = 'S'.repeat(43);
   const env = {
-    RP_ID: 'example.test', BUILD_SHA: sha, QA_CODE_SEAM: '1', QA_AUTH_TOKEN: 'fixture',
+    RP_ID: 'example.test', BUILD_SHA: sha, QA_CODE_SEAM: '1', QA_AUTH_TOKEN: shared,
+    SUBSONIC_MEASUREMENT_RUNNER: `v1:1000:2200:${bearer}`,
     SUBSONIC_MEASUREMENT_STAGE: 'staging', SUBSONIC_MEASUREMENT_ENABLE: '1',
     SUBSONIC_MEASUREMENT_LEASE: `${lease};empty,small,charge-below,charge-exact,charge-over`,
   };
-  const url = 'https://example.test/rest/ping';
-  const req = (target = url, bearer = 'Bearer fixture', id = 'small') => new Request(target, {
-    headers: { authorization: bearer, 'x-subsonic-measurement-case': id, 'x-forwarded-host': 'example.test' },
+  const url = 'https://example.test/rest/getArtists';
+  const req = (target = url, auth = `Bearer ${bearer}`, id = 'small', method = 'POST') => new Request(target, {
+    method, headers: { authorization: auth, 'x-subsonic-measurement-case': id, 'x-forwarded-host': 'example.test' },
   });
-  for (const [now, expected] of [[1000, true], [2199, true], [2200, false]])
+  for (const route of ['getArtists', 'getArtist', 'getAlbum'])
+    assert.equal(admits(req(`https://example.test/rest/${route}`), env, 1000), true, route);
+  for (const [now, expected] of [[999, false], [1000, true], [2199, true], [2200, false]])
     assert.equal(admits(req(), env, now), expected);
-  assert.equal(admits(req(url, 'Bearer wrongxx'), env, 1000), false);
-  assert.equal(admits(new Request(url), env, 1000), false);
-  for (const target of ['http://example.test/rest/ping', 'https://other.example.test/rest/ping',
-    'https://example.test:444/rest/ping', 'https://example.test/restless']) {
-    assert.equal(admits(req(target), env, 1000), false);
+  for (const candidate of [shared, 'W'.repeat(43), bearer + ',', 'x'.repeat(8192)])
+    assert.equal(admits(req(url, `Bearer ${candidate}`), env, 1000), false);
+  assert.equal(admits(new Request(url, { method: 'POST' }), env, 1000), false);
+  for (const method of ['GET', 'HEAD', 'PUT'])
+    assert.equal(admits(req(url, undefined, 'small', method), env, 1000), false, method);
+  for (const target of ['http://example.test/rest/getArtists', 'https://other.example.test/rest/getArtists',
+    'https://example.test:444/rest/getArtists', 'https://example.test/restless',
+    ...['getArtists.view', 'getArtists/child', 'getArtists/', '%67etArtists', 'getartists', 'ping']
+      .map((path) => `https://example.test/rest/${path}`)]) {
+    assert.equal(admits(req(target), env, 1000), false, target);
   }
   assert.equal(admits(req(), {}, 1000), false);
+  for (const binding of [undefined, '', bearer, `v2:1000:2200:${bearer}`, `v1:999:1000:${bearer}`,
+    `v1:1001:2200:${bearer}`, `v1:1000:${1001 + 30 * 86400}:${bearer}`, `v1:+1000:2200:${bearer}`,
+    `v1:1000:2200:${bearer}:extra`]) {
+    assert.equal(admits(req(), { ...env, SUBSONIC_MEASUREMENT_RUNNER: binding }, 1000), false);
+  }
+  assert.equal(admits(req(), { ...env, SUBSONIC_MEASUREMENT_RUNNER: `v1:1000:${1000 + 30 * 86400}:${bearer}` }, 1000), true);
+  assert.equal(admits(req(), { ...env, QA_AUTH_TOKEN: undefined }, 1000), true);
   const chargeHeadroom = { 'charge-below': 4025, 'charge-exact': 4024, 'charge-over': 4023 };
   const fullMatrix = ['empty', 'small', 'large-mixed', ...Object.keys(chargeHeadroom),
     ...['rows', 'text', 'output-json', 'output-xml', 'output-jsonp']
@@ -50,8 +67,9 @@ test('only the exact armed staging deployment admits the QA runner', () => {
     assert.equal(admits(req(), { ...env, SUBSONIC_MEASUREMENT_LEASE: value }, 1000), false);
   }
   for (const overrides of [{ SUBSONIC_MEASUREMENT_STAGE: 'production' },
-    { SUBSONIC_MEASUREMENT_STAGE: undefined }, { QA_CODE_SEAM: '0' }, { QA_AUTH_TOKEN: undefined },
-    { SUBSONIC_MEASUREMENT_ENABLE: '0' }, { BUILD_SHA: 'f'.repeat(40) }]) {
+    { SUBSONIC_MEASUREMENT_STAGE: undefined }, { QA_CODE_SEAM: '0' },
+    { SUBSONIC_MEASUREMENT_ENABLE: '0' }, { SUBSONIC_MEASUREMENT_ENABLE: undefined },
+    { BUILD_SHA: 'f'.repeat(40) }]) {
     assert.equal(admits(req(), { ...env, ...overrides }, 1000), false);
   }
 });

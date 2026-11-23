@@ -165,6 +165,16 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     assert_eq!(invoices[0]["user_id"], USER);
     assert_eq!(invoices[0]["amount_cents"], 800);
 
+    let mut conflict = stale.clone();
+    conflict.explicit_stale = false;
+    conflict.read_plan = Some("plus".into());
+    let mut preceding = conflict.history[0].clone();
+    preceding.stripe_invoice_id = "in_native_before_conflict".into();
+    conflict.history[0].amount_cents += 1;
+    conflict.history.insert(0, preceding);
+    assert!(dispatch(USER, &conflict).await.is_err());
+    assert_eq!(snapshot(&observer).await, committed);
+
     dispatch(USER, &stale)
         .await
         .expect("replay against owned target");

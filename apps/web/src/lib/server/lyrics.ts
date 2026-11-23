@@ -1,5 +1,6 @@
 const MAX_LRC_LENGTH = 64 * 1024; // UTF-16 code units
 const MAX_CUES = 1024;
+const MAX_IDENTITY_LENGTH = 256;
 const CACHE_CAPACITY = 128;
 const HIT_TTL_MS = 60 * 60_000;
 const MISS_TTL_MS = 5 * 60_000;
@@ -69,8 +70,8 @@ type ProviderReply =
 	| { kind: 'not-found' }
 	| { kind: 'unavailable' };
 
-/** Future adapter contract: LRCLIB /api/get-cached only, never search. Report
- * not-found only for a confirmed track miss; transport/decoding failures are unavailable.
+/** Future adapter needs a supported cached-only exact lookup. Report not-found
+ * only for a confirmed track miss; transport/decoding failures are unavailable.
  * Pass the signal to the transport so a timed-out lookup can stop its work.
  */
 export type ExactLyricsProvider = (track: ExactTrack, signal: AbortSignal) => Promise<ProviderReply>;
@@ -83,10 +84,18 @@ type LocalLyrics = {
 	sidecar?: { path: string; lrc: string };
 };
 
-export type ResolvedLyrics = Readonly<{ cues: TimedLyrics } & (
-	| { source: 'embedded' | 'sidecar' }
-	| { source: 'lrclib'; attributionId: 'lrclib' }
-)>;
+type LocalResolvedLyrics = Readonly<{ source: 'embedded' | 'sidecar'; cues: TimedLyrics }>;
+export type ResolvedLyrics = LocalResolvedLyrics |
+	Readonly<{ source: 'lrclib'; attributionId: 'lrclib'; cues: TimedLyrics }>;
+
+export type LyricsTrackIdentity = Readonly<{
+	libraryScope: symbol;
+	trackId: string;
+	occurrenceKey: string;
+	sourceRevision: string;
+}>;
+
+export type VerifiedLocalLyrics = Readonly<LocalLyrics & { identity: LyricsTrackIdentity }>;
 
 type CacheEntry = { value: ResolvedLyrics | null; savedAt: number; expiresAt: number };
 
@@ -100,6 +109,36 @@ function parseSidecar({ mediaPath, sidecar }: LocalLyrics): TimedLyrics | null {
 	const stem = dot > mediaPath.lastIndexOf('/') + 1 ? mediaPath.slice(0, dot) : mediaPath;
 	const expected = `${stem}.lrc`;
 	return expected !== mediaPath && sidecar.path === expected ? parseTimedLrc(sidecar.lrc) : null;
+}
+
+function resolveLocal(local: LocalLyrics): LocalResolvedLyrics | null {
+	const embedded = parseTimedLrc(local.embedded);
+	if (embedded) return { source: 'embedded', cues: embedded };
+	const sidecar = parseSidecar(local);
+	return sidecar ? { source: 'sidecar', cues: sidecar } : null;
+}
+
+/** At delivery, compare the captured selection with the current authorized one.
+ * The owner keeps one immutable object per selection and retires it on every
+ * replacement, including reselecting the same track. Evidence identity comes
+ * from the verified source read. Only the presentation fields leave this seam.
+ */
+export function bindVerifiedLocalLyrics(
+	requested: LyricsTrackIdentity,
+	current: LyricsTrackIdentity | null,
+	evidence: VerifiedLocalLyrics | null
+) {
+	if (!current || requested !== current || !evidence || evidence.instrumental) return null;
+	const { libraryScope, trackId, occurrenceKey, sourceRevision } = current;
+	if (typeof libraryScope !== 'symbol' || [trackId, occurrenceKey, sourceRevision].some((key) =>
+		typeof key !== 'string' || key.length > MAX_IDENTITY_LENGTH || !key.trim()
+	)) return null;
+	const identity = evidence.identity;
+	if (!identity || identity.libraryScope !== libraryScope || identity.trackId !== trackId ||
+		identity.occurrenceKey !== occurrenceKey || identity.sourceRevision !== sourceRevision) return null;
+
+	const result = resolveLocal(evidence);
+	return result ? { trackId, result } : null;
 }
 
 function validDuration(seconds: number): boolean {
@@ -118,10 +157,8 @@ export function createLyricsResolver(provider?: ExactLyricsProvider, now = Date.
 	const cache = new Map<string, CacheEntry>();
 	return async function resolve(local: LocalLyrics, track?: ExactTrack): Promise<ResolvedLyrics | null> {
 		if (local.instrumental) return null;
-		const embedded = parseTimedLrc(local.embedded);
-		if (embedded) return { source: 'embedded', cues: embedded };
-		const sidecar = parseSidecar(local);
-		if (sidecar) return { source: 'sidecar', cues: sidecar };
+		const localResult = resolveLocal(local);
+		if (localResult) return localResult;
 		if (!provider || !track) return null;
 
 		// Project only the exact lookup fields; never pass file paths or library IDs.

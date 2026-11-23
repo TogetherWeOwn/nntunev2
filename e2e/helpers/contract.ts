@@ -474,6 +474,31 @@ export function isMbid(value: unknown): value is string {
   return typeof value === 'string' && MBID_RE.test(value);
 }
 
+type CatalogueLibraryRow = Record<string, unknown> & { id: string };
+
+function isCatalogueLibraryRow(value: unknown): value is CatalogueLibraryRow {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const id = (value as Record<string, unknown>).id;
+  return typeof id === 'string' && id.trim().length > 0;
+}
+
+/** The catalogue routes serve a bare array. Keep staging evidence strict and redact row values. */
+export function catalogueLibraryRows(body: unknown, sharedPublished: boolean): CatalogueLibraryRow[] {
+  if (!Array.isArray(body) || !body.every(isCatalogueLibraryRow)) {
+    throw new Error('Library must return a bare array of rows with string IDs (body withheld).');
+  }
+  if (!sharedPublished && body.length !== 0) {
+    throw new Error('Fresh Library must be empty before shared publication (rows withheld).');
+  }
+  if (sharedPublished && !body.some((row) => ['release_mbid', 'title', 'release', 'artist'].every((key) => {
+    const text = row[key];
+    return typeof text === 'string' && text.trim().length > 0;
+  }))) {
+    throw new Error('Published Library must contain a mirror-enriched row (rows withheld).');
+  }
+  return body;
+}
+
 /**
  * Normalize a /api/library payload into its track rows. Accepts either a
  * bare array (the documented shape) or `{ items: [...] }` (the shape the

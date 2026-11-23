@@ -69,7 +69,7 @@ async function readFirstPage(baseUrl: string, signal: AbortSignal): Promise<Rece
 	}
 }
 
-export function createRecentListensReader(baseUrl: string, publish: (view: RecentListensView) => void) {
+export function createRecentListensReader(baseUrl: string, publish: (view: RecentListensView) => void, capture = captureAuthFence) {
 	let active: AbortController | undefined;
 	let isCurrent: (() => boolean) | undefined;
 
@@ -95,10 +95,10 @@ export function createRecentListensReader(baseUrl: string, publish: (view: Recen
 			const attempt = new AbortController();
 			active = attempt;
 			publish({ kind: 'loading' });
-			const fence = await captureAuthFence();
+			const fence = await capture();
 			// Release the shared lock after dispatch so logout can proceed while fetch is pending.
-			const sent = await fence?.run(() => attempt.signal.aborted ? undefined : {
-				result: readFirstPage(baseUrl, attempt.signal)
+			const sent = fence && await fence.run(() => attempt.signal.aborted ? undefined : {
+				result: readFirstPage(baseUrl, AbortSignal.any([attempt.signal, fence.signal]))
 			});
 			if (!fence || !sent) {
 				if (!attempt.signal.aborted) invalidate();
