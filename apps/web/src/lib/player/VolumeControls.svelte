@@ -39,3 +39,15 @@
 	</div>
 {/if}
 {#if part !== 'controls'}<p role="status" hidden={!restricted}>Use system volume controls.</p>{/if}
+
+<style>
+	@media (pointer: coarse) {
+		.nt-sound :is(input, button) {
+			min-block-size: 44px;
+			min-inline-size: 44px;
+		}
+		.nt-sound input {
+			vertical-align: middle;
+		}
+	}
+</style>
