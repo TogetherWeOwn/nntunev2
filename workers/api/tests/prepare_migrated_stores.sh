@@ -73,6 +73,14 @@ psql_run -d nntune_playlist_ci \
   -v playlist_crud="$(<"$fixtures/private_playlist_crud.sql")" \
   < "$fixtures/private_playlist_rehearsal.sql"
 
+# Both rehearsals roll back the unregistered locator schema and fixture rows.
+locator_schema="$(<"$fixtures/storage_s3_locator_schema.sql")"
+locator_fixture="$fixtures/storage_s3_locator_upgrade.sql"
+echo 'test (populated upgrade): storage_s3_locator_upgrade.sql'
+psql_run -d nntune_app_ci -v locator_schema="$locator_schema" -v replay=false < "$locator_fixture"
+echo 'test (after replay): storage_s3_locator_upgrade.sql'
+psql_run -d nntune_app_ci -v locator_schema="$locator_schema" -v replay=true < "$locator_fixture"
+
 port="$(docker_clean port "$id" 5432/tcp)"
 [[ "$port" =~ ^127\.0\.0\.1:([0-9]+)$ ]]
 port="${BASH_REMATCH[1]}"
