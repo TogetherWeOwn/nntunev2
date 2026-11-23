@@ -1037,6 +1037,8 @@ links and actual cohort configuration in private custody. Keep
 The cohort setting restricts Library, catalogue and play grants to the named
 cohort while set. Regular account and billing routes retain their own access
 rules. Unset the cohort setting to use the regular paid playback gate.
+When the deadline expires, the cohort setting continues to refuse Library
+and playback until a qualified configuration change restores access.
 
 Open `/admin/invites/issue`, choose **Single invite**, enter the recipient's
 email, and use **Create invite** and **Signup link**. Find the resulting row
