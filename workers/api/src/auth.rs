@@ -323,6 +323,9 @@ pub struct InviteRecord {
     /// issuer is unknown or their account is gone.
     #[serde(default, skip_serializing)]
     pub issuer_email: Option<String>,
+    /// Set by private signup after validating the configured invite.
+    #[serde(skip)]
+    pub require_active_admin_issuer: bool,
 }
 
 impl InviteRecord {
@@ -350,6 +353,7 @@ impl InviteRecord {
             revoked_by: None,
             window_id: None,
             issuer_email: None,
+            require_active_admin_issuer: false,
         }
     }
 

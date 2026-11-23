@@ -170,6 +170,7 @@ for f in "${tests[@]}"; do
     -v storage_digest_claim_lookup_sql="$(<"$root/workers/api/src/storage_digest_claim_lookup.sql")" \
     -v storage_digest_read_lookup_sql="$(<"$root/workers/api/src/storage_digest_read_lookup.sql")" \
     -v observe_invite_expiry_sql="$(<"$root/workers/api/src/observe_invite_expiry.sql")" \
+    -v private_listening_access_sql="$(<"$root/workers/api/src/private_listening_access.sql")" \
     -v lock_invite_issuer_sql="$(<"$root/workers/api/src/lock_invite_issuer_for_sanction.sql")" \
     -v sanction_invite_issuer_sql="$(<"$root/workers/api/src/sanction_invite_issuer.sql")" \
     -v ingest_session_reserve_sql="$(<"$root/workers/api/src/ingest_session_reserve.sql")" \

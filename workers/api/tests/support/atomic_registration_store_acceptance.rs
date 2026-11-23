@@ -347,7 +347,39 @@ fn postgres_registration_commit_without_invite_is_single_use() {
 fn postgres_registration_commit_consumes_optional_invite() {
     run_test(async {
         let mut client = connect().await;
-        let fixture = Fixture::seed(&client).await;
+        let mut fixture = Fixture::seed(&client).await;
+        let issuer = Fixture::seed(&client).await.credential.user_id;
+        client
+            .execute(
+                "UPDATE invite_codes SET issued_by = $1, email = $2 WHERE code_hash = $3",
+                &[&issuer, &fixture.magic.email, &fixture.invite.code_hash],
+            )
+            .await
+            .expect("bind the invite to a distinct issuer and inbox");
+        fixture.invite.issued_by = Some(issuer.clone());
+        fixture.invite.email = Some(fixture.magic.email.clone());
+        fixture.invite.require_active_admin_issuer = true;
+        let denied = complete_registration_on(
+            &mut client,
+            &fixture.challenge,
+            &fixture.magic,
+            Some(&fixture.invite),
+            Some(&fixture.invite_audit),
+            &fixture.credential,
+            NOW,
+        )
+        .await;
+        assert!(
+            denied.is_err(),
+            "private invite from a non-admin issuer was accepted"
+        );
+        fixture
+            .assert_state(&client, (false, false, false, 0))
+            .await;
+        client
+            .execute("UPDATE users SET role = 'admin' WHERE id = $1", &[&issuer])
+            .await
+            .expect("restore the synthetic issuer's admin role");
         complete_registration_on(
             &mut client,
             &fixture.challenge,
@@ -358,7 +390,7 @@ fn postgres_registration_commit_consumes_optional_invite() {
             NOW,
         )
         .await
-        .expect("registration with invite commits");
+        .expect("the unchanged invite and proofs commit once the issuer is an admin");
         // In particular, removing the production invite claim fails here.
         fixture.assert_state(&client, (true, true, true, 1)).await;
         fixture.assert_credential(&client).await;
