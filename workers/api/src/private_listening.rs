@@ -15,21 +15,14 @@ impl PrivateListening {
         if raw.len() > 1024 {
             return None;
         }
-        let mut policy: Self = serde_json::from_str(raw).ok()?;
-        let owner = &policy.owner_user_id;
-        if owner.is_empty()
-            || owner.len() > 128
-            || !owner
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        let policy: Self = serde_json::from_str(raw).ok()?;
+        if !crate::ledger::is_valid_key_field(&policy.owner_user_id, 128)
             || policy.expires_at == 0
             || policy.invite_ids.len() > 8
             || policy.invite_ids.iter().any(|id| *id <= 0)
         {
             return None;
         }
-        policy.invite_ids.sort_unstable();
-        policy.invite_ids.dedup();
         Some(policy)
     }
 

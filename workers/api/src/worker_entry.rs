@@ -1844,6 +1844,7 @@ fn invite_from_row(row: &tokio_postgres::Row) -> Result<InviteRecord, StoreError
         revoked_by: row.try_get("revoked_by").map_err(|_| StoreError)?,
         window_id: row.try_get("window_id").map_err(|_| StoreError)?,
         issuer_email: row.try_get("issuer_email").ok().flatten(),
+        require_active_admin_issuer: false,
     })
 }
 
@@ -2241,6 +2242,16 @@ async fn complete_registration_on(
     // `query_opt`'s rule: exactly one parent row, else the claim fails.
     if parent.len() != 1 {
         return Err(StoreError);
+    }
+    if let Some(record) = invite.filter(|record| record.require_active_admin_issuer) {
+        let issuer = record.issued_by.as_deref().ok_or(StoreError)?;
+        let owner = transaction.query_typed(
+            "SELECT id FROM users WHERE id = $1 AND role = 'admin' AND deleting_at IS NULL FOR SHARE",
+            &[(&issuer, Type::TEXT)],
+        ).await.map_err(|_| StoreError)?;
+        if owner.len() != 1 {
+            return Err(StoreError);
+        }
     }
     let mut claims = vec![
         SingleUseClaim::Challenge {

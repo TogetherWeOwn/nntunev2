@@ -3819,10 +3819,11 @@ where
             issuer_email: issuer_email.as_deref(),
             now: ctx.now,
         };
-        let prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
+        let mut prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
             Ok(prepared) => prepared,
             Err(_) => return generic_auth(),
         };
+        prepared.require_active_admin_issuer = ctx.cfg.private_listening.is_some();
         // The `invite.redeemed` audit rides the enrollment transaction
         // inside `complete_registration`, so it can never be separated
         // from the claim it records. It references the invite by row
@@ -3887,12 +3888,8 @@ where
         Err(_) => return generic_auth(),
     }
     ctx.audit(&user_id, "auth.register", true).await;
-    let private_listening = match ctx.private_listening_deadline(&user_id).await {
-        Ok(deadline) => deadline.is_some(),
-        Err(resp) => return resp,
-    };
     match ctx.start_session(&user_id).await {
-        Ok(mut resp) if private_listening => {
+        Ok(mut resp) if ctx.cfg.private_listening.is_some() => {
             resp.body = serde_json::json!({"ok": true, "private_listening": true}).to_string();
             resp
         }
@@ -6960,7 +6957,11 @@ where
         return Err(json_response(error.status, serde_json::json!(error)));
     }
     if private_deadline.is_some() {
-        return acquire_new_play(ctx, user_id, body, secret, None, private_deadline).await;
+        let caps = crate::plan_limits::PlanCaps {
+            stream_seconds_month: 0,
+            max_concurrent_streams: 1,
+        };
+        return acquire_new_play(ctx, user_id, body, secret, caps, private_deadline).await;
     }
     // New start, gate 1: subscription. `now` saturates into i64 rather
     // than wrapping — an absurd clock reads as far-future (closed),
@@ -7018,7 +7019,7 @@ where
             ),
         ));
     }
-    acquire_new_play(ctx, user_id, body, secret, Some(caps), None).await
+    acquire_new_play(ctx, user_id, body, secret, caps, None).await
 }
 
 async fn acquire_new_play<S, M, D, N>(
@@ -7026,7 +7027,7 @@ async fn acquire_new_play<S, M, D, N>(
     user_id: &str,
     body: PlayIssueBody,
     secret: &[u8],
-    caps: Option<crate::plan_limits::PlanCaps>,
+    caps: crate::plan_limits::PlanCaps,
     private_deadline: Option<u64>,
 ) -> Result<IssuedPlay, Response>
 where
@@ -7079,18 +7080,9 @@ where
         {
             Err(account_deleting_response())
         }
-        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => match caps {
-            Some(caps) => Err(plan_limit_refusal(
-                crate::plan_limits::deny_concurrent_lease(&caps, retry_after_secs),
-            )),
-            None => {
-                let error =
-                    crate::api_error::ApiError::by_code("rate_limited", "one stream per account");
-                let mut response = json_response(error.status, serde_json::json!(error));
-                response.retry_after = Some(retry_after_secs);
-                Err(response)
-            }
-        },
+        Ok(crate::playback::LeaseAcquire::Held { retry_after_secs }) => Err(plan_limit_refusal(
+            crate::plan_limits::deny_concurrent_lease(&caps, retry_after_secs),
+        )),
         Err(_) => Err(unavailable()),
     }
 }

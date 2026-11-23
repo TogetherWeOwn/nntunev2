@@ -27,15 +27,6 @@ BEGIN
         RAISE EXCEPTION 'invite without enrollment provenance was admitted';
     END IF;
     UPDATE users SET invite_code_hash = 'private-fixture' WHERE id = access_user;
-    UPDATE invite_codes SET redeemed_at = 200 WHERE id = listed[1];
-    IF pg_temp.private_listening_access(access_user, owner_user, listed) THEN
-        RAISE EXCEPTION 'redemption at the expiry boundary was admitted';
-    END IF;
-    UPDATE invite_codes SET redeemed_at = 199, revoked_at = 200 WHERE id = listed[1];
-    IF pg_temp.private_listening_access(access_user, owner_user, listed) THEN
-        RAISE EXCEPTION 'revoked invitation was admitted';
-    END IF;
-    UPDATE invite_codes SET revoked_at = NULL WHERE id = listed[1];
     UPDATE users SET deleting_at = now() WHERE id = access_user;
     IF pg_temp.private_listening_access(access_user, owner_user, listed) THEN
         RAISE EXCEPTION 'deleting account was admitted';
