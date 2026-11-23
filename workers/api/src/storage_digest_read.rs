@@ -1,5 +1,6 @@
 //! Unmounted, protected lookup for a previously authorized playback reference.
 
+use nntune_core::digest_read_snapshot::DigestReadSnapshot;
 use std::time::SystemTime;
 use tokio_postgres::{
     types::{FromSql, Type},
@@ -40,6 +41,25 @@ impl CommittedDigestRead {
 
     pub fn pins(&self) -> &DigestReadPins {
         &self.pins
+    }
+
+    /// Borrow the pins for playback; the consumer still checks the deadline.
+    pub fn playback_snapshot(&self) -> Result<DigestReadSnapshot<'_>, StoreError> {
+        Ok(DigestReadSnapshot {
+            environment_id: self.target.environment,
+            library_id: self.target.library,
+            reference_id: self.target.reference,
+            object_id: self.target.object,
+            generation_id: self.target.generation,
+            provider_configuration: self.target.provider_configuration,
+            root_version_id: self.target.root_version,
+            plaintext_len: u64::try_from(self.target.plaintext_bytes).map_err(|_| StoreError)?,
+            plaintext_sha256: self.target.plaintext_sha256,
+            map_id: self.pins.map_id,
+            media_version: &self.pins.media_version,
+            page_versions: &self.pins.page_versions,
+            usable_until: self.pins.usable_until,
+        })
     }
 }
 
