@@ -1,4 +1,4 @@
-//! Unused SQL primitives for a future coupled billing transaction.
+//! SQL and execution for the owned billing transaction.
 //!
 //! These statements alone do not implement a transaction or protect history.
 //! The lock and lookup must run on the same explicitly READ COMMITTED backend,
@@ -26,16 +26,39 @@ pub const LOOKUP_TARGET: &str = "SELECT user_id, stripe_subscription_id, \
     IS TRUE AS equal_end_provenance_changed \
     FROM public.subscriptions WHERE stripe_subscription_id = $1";
 
-/// Unused production write for the future transaction. It has the same 15
+/// The production subscription write has the same 15
 /// parameters as `store_reconciled_subscription_statement`, and returns the
 /// written owner and subscription key for caller-side identity checking. A
 /// missing row is not itself a classification of the reason for suppression.
 /// This statement alone does not couple the write to the lock, lookup or history.
 pub const WRITE_SUBSCRIPTION: &str = include_str!("billing_transaction_write.sql");
 
-// The coupled store pins history to the same schema as the lock and target.
-const WRITE_HISTORY: &str =
-    crate::billing_reconcile::write_paid_invoice_history!("public.paid_invoice_history");
+// A conflict may hydrate legacy coverage only after proving all immutable
+// fields match. Exact replays don't update the row.
+const WRITE_HISTORY: &str = crate::billing_reconcile::insert_paid_invoice_history!(
+    "public.paid_invoice_history",
+    "ON CONFLICT (stripe_invoice_id) DO UPDATE SET covered_periods = EXCLUDED.covered_periods
+     WHERE history.covered_periods IS NULL AND EXCLUDED.covered_periods IS NOT NULL
+       AND history.amount_cents > 0
+       AND (history.user_id, history.stripe_subscription_id, history.plan_id,
+            history.period_start, history.period_end, history.amount_cents,
+            history.currency, history.paid_at)
+         = (EXCLUDED.user_id, EXCLUDED.stripe_subscription_id, EXCLUDED.plan_id,
+            EXCLUDED.period_start, EXCLUDED.period_end, EXCLUDED.amount_cents,
+            EXCLUDED.currency, EXCLUDED.paid_at)
+     RETURNING 1"
+);
+
+const MATCH_HISTORY_REPLAY: &str = concat!(
+    "SELECT 1 FROM public.paid_invoice_history
+     WHERE stripe_invoice_id = $2
+       AND (user_id, stripe_subscription_id, plan_id, period_start, period_end,
+            amount_cents, currency, paid_at)
+         = ($1, $3, $4, to_timestamp($5::bigint), to_timestamp($6::bigint),
+            $7, $8, to_timestamp($9::bigint))
+       AND covered_periods IS NOT DISTINCT FROM ",
+    crate::billing_reconcile::paid_invoice_coverage!()
+);
 
 /// Ordered parameters for the global lookup: key, incoming paid-through epoch,
 /// incoming paid invoice ID, read anchor, read plan. Do not filter on owner.
@@ -86,7 +109,7 @@ pub(crate) async fn apply_reconcile_transaction(
         validate_read_provenance, validate_terminal_provenance, Identity, ObservedTarget, Target,
     };
     use crate::{billing_reconcile::reconcile_lock_statement, handlers::StoreError};
-    use tokio_postgres::types::Type;
+    use tokio_postgres::types::{ToSql, Type};
     let row = &outcome.row;
     let work = async {
         transaction
@@ -207,25 +230,35 @@ pub(crate) async fn apply_reconcile_transaction(
         }
         for history in &outcome.history {
             let (starts, ends) = history.coverage_bounds();
-            transaction
-                .query_typed(
-                    WRITE_HISTORY,
-                    &[
-                        (&user_id, Type::TEXT),
-                        (&history.stripe_invoice_id, Type::TEXT),
-                        (&history.stripe_subscription_id, Type::TEXT),
-                        (&history.plan_id, Type::TEXT),
-                        (&history.period_start_unix, Type::INT8),
-                        (&history.period_end_unix, Type::INT8),
-                        (&history.amount_cents, Type::INT8),
-                        (&history.currency, Type::TEXT),
-                        (&history.paid_at_unix, Type::INT8),
-                        (&starts, Type::INT8_ARRAY),
-                        (&ends, Type::INT8_ARRAY),
-                    ],
-                )
+            let params: &[(&(dyn ToSql + Sync), Type)] = &[
+                (&user_id, Type::TEXT),
+                (&history.stripe_invoice_id, Type::TEXT),
+                (&history.stripe_subscription_id, Type::TEXT),
+                (&history.plan_id, Type::TEXT),
+                (&history.period_start_unix, Type::INT8),
+                (&history.period_end_unix, Type::INT8),
+                (&history.amount_cents, Type::INT8),
+                (&history.currency, Type::TEXT),
+                (&history.paid_at_unix, Type::INT8),
+                (&starts, Type::INT8_ARRAY),
+                (&ends, Type::INT8_ARRAY),
+            ];
+            let written = transaction
+                .query_typed_opt(WRITE_HISTORY, params)
                 .await
                 .map_err(|_| StoreError)?;
+            // ON CONFLICT locks the conflicting row even if its WHERE fails.
+            // A separate READ COMMITTED statement sees that version, including
+            // an insert that won the unique key after the upsert's snapshot.
+            if written.is_none()
+                && transaction
+                    .query_typed_opt(MATCH_HISTORY_REPLAY, params)
+                    .await
+                    .map_err(|_| StoreError)?
+                    .is_none()
+            {
+                return Err(StoreError);
+            }
         }
         // The blocking probes run only after all billing writes and before COMMIT.
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
@@ -347,15 +380,9 @@ mod tests {
     }
 
     #[test]
-    fn history_write_only_changes_the_legacy_relation() {
-        assert_eq!(
-            WRITE_HISTORY,
-            crate::billing_reconcile::insert_paid_invoice_history_statement().replacen(
-                "INSERT INTO paid_invoice_history ",
-                "INSERT INTO public.paid_invoice_history ",
-                1,
-            ),
-        );
+    fn history_uses_the_fixed_relation_for_inserts_and_replay() {
+        assert!(WRITE_HISTORY.starts_with("INSERT INTO public.paid_invoice_history "));
+        assert!(MATCH_HISTORY_REPLAY.starts_with("SELECT 1 FROM public.paid_invoice_history"));
     }
 
     #[test]
