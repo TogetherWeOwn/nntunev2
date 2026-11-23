@@ -143,7 +143,8 @@ class Cluster:
             time.sleep(0.25)
         raise FixtureFailure("verify TLS readiness")
 
-    def sql(self, sql, *, role="postgres", database=MAINTENANCE, host=None, ca="trusted", switch=""):
+    def sql(self, sql, *, role="postgres", database=MAINTENANCE, host=None, ca="trusted", switch="",
+            trace=False):
         sql = (f"SET ROLE {switch};\n" if switch else "") + sql
         return docker("exec", "-i", self.client, "env", "-i",
                       "PATH=/usr/local/bin:/usr/bin:/bin", "LC_ALL=C",
@@ -151,7 +152,7 @@ class Cluster:
                       f"PGUSER={role}", "PGSSLMODE=verify-full", "PGGSSENCMODE=disable",
                       f"PGSSLROOTCERT=/fixture/{ca}.crt", "PGCONNECT_TIMEOUT=2",
                       "PGOPTIONS=-c statement_timeout=5000 -c lock_timeout=2000",
-                      "sh", "-ec", """
+                      "sh", "-exc" if trace else "-ec", """
                       IFS= read -r PGPASSWORD
                       export PGPASSWORD
                       exec psql -XqAtw -v ON_ERROR_STOP=1 -v VERBOSITY=verbose
@@ -238,6 +239,14 @@ def refuse_before_create(cluster):
            AND EXISTS (SELECT FROM pg_database WHERE datname = '{SIBLING}'
                        AND datdba = '{STAGING}'::regrole AND datallowconn);
         """, "t\n", role=CREATOR)
+
+
+def verify_quiet_failure(cluster):
+    token = secrets.token_hex(20)
+    result = cluster.sql(f"SELECT '{token}'; SELECT missing_{token};", role=CREATOR, trace=True)
+    require(result.returncode != 0 and token in result.stdout and token in result.stderr
+            and cluster.passwords[CREATOR] in result.stderr,
+            "capture result, error and credential trace without publishing them")
 
 
 def verify_launch_grants(cluster):
@@ -343,10 +352,12 @@ def exercise(*, interrupt):
                 provision_roles(cluster)
                 if not interrupt:
                     refuse_before_create(cluster)
+                    verify_quiet_failure(cluster)
                 cluster.create_fenced()
                 if interrupt:
-                    docker("exec", "-i", cluster.client, "sh", "-ec", "echo ready; read -r line",
-                           input_text="continue\n", timeout=3, interrupt=True)
+                    docker("exec", "-i", cluster.client, "sh", "-exc",
+                           'echo ready; read -r line; printf "%s" "$line"',
+                           input_text=secrets.token_hex(24) + "\n", timeout=3, interrupt=True)
                     raise FixtureFailure("interruption did not stop the fixture")
                 verify_launch_grants(cluster)
             finally:
