@@ -46,7 +46,7 @@ def valid_host(host):
         return True
     except ValueError:
         label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-        return len(host) <= 253 and re.fullmatch(rf"{label}(?:\.{label})*\.[a-z]{2,63}", host)
+        return len(host) <= 253 and re.fullmatch(rf"{label}(?:\.{label})*\.[a-z]{{2,63}}", host)
 
 
 def setup_plan(raw):

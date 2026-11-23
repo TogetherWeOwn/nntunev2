@@ -280,7 +280,7 @@ def traced_client(cluster, mode):
     shim = cluster.directory / "psql"
     shutil.copyfile(Path(__file__).parent / "fixtures/database_bootstrap/psql", shim)
     shim.chmod(0o700)
-    (cluster.directory / "fault").write_text(f"{mode} {cluster.canary}")
+    (cluster.directory / "fault").write_text(f"{mode} {cluster.canary} {cluster.address}")
     return f"{cluster.directory}:/usr/bin:/bin"
 
 
@@ -315,9 +315,11 @@ def prove_setup_caller(cluster, *, interrupt):
         require(all(value.encode() in diagnostics for value in
                     (cluster.passwords[CREATOR], cluster.address, "ERROR:", cluster.canary)),
                 "exercise generated credential trace, endpoint and SQL error containment")
+        dns = {"PATH": traced_client(cluster, "resolve")}
+        run(caller_env(cluster, roles, host=f"wrong-{cluster.server}") | dns, "refused")
         cluster.ok("verify all caller refusals leave the target absent",
                    f"SELECT NOT EXISTS (SELECT FROM pg_database WHERE datname = '{LAUNCH}');", "t\n")
-        run(env, "complete")
+        run(caller_env(cluster, roles, host=cluster.server) | dns, "complete")
         run(env, "refused")  # The name collision stops any second write.
         return
 

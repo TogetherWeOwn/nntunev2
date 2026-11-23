@@ -8,8 +8,13 @@ import tempfile
 from pathlib import Path
 
 directory = Path(__file__).parent
-mode, canary = (directory / "fault").read_text().split()
+mode, canary, address = (directory / "fault").read_text().split()
 args = ["/usr/bin/psql", *sys.argv[1:]]
+if mode == "resolve":
+    # Route the test DNS name on the isolated network while libpq verifies PGHOST.
+    os.environ["PGHOSTADDR"] = address
+    os.execv(args[0], args)
+
 sql = sys.stdin.buffer.read()
 if mode == "error":
     trace = ("+ PGPASSWORD=" + os.environ["PGPASSWORD"] + " PGHOST=" + os.environ["PGHOST"] + " psql\n").encode()
