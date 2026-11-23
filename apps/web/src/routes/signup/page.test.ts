@@ -46,6 +46,18 @@ describe('signup page initial state', () => {
 		expect(body).toContain('data-testid="signup-submit"');
 		expect(body).not.toContain('role="alert"');
 	});
+
+	it('labels the required account email for username autofill', () => {
+		const { body } = render(SignupPage);
+		const input = body.match(
+			/<label\b[^>]*\sfor="signup-email"[^>]*>\s*Email\s*(<input\b[^>]*>)/
+		)?.[1];
+
+		expect(input).toMatch(/\sid="signup-email"/);
+		expect(input).toContain('type="email"');
+		expect(input).toMatch(/\srequired(?=\s|=|\/?>)/);
+		expect(input).toContain('autocomplete="username"');
+	});
 });
 
 describe('signup code-error and start-over rendering', () => {
@@ -73,7 +85,7 @@ describe('signup code-error and start-over rendering', () => {
 		// outer condition turns the spec red instead of matching the inner
 		// alert condition.
 		expect(source).toMatch(
-			/\{#if status === 'code-sent'[^}]*\|\| status === 'code-error'[^}]*\}[\s\S]*?<form onsubmit=\{finishAccount\}[\s\S]*?name="magic_code"/
+			/\{#if status === 'code-sent'[^}]*\|\| status === 'code-error'[^}]*\}[\s\S]*?<form\b(?=[^>]*\bmethod="post")[^>]*\bonsubmit=\{finishAccount\}[\s\S]*?name="magic_code"/
 		);
 	});
 

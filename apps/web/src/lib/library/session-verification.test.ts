@@ -6,7 +6,10 @@ vi.mock('$app/env/public', () => ({ PUBLIC_API_BASE_URL: 'https://api.example.te
 
 const binding = 'A'.repeat(43);
 const otherBinding = 'E'.repeat(43);
-const verify = () => verifyLibrarySession(binding, new AbortController().signal);
+const verify = () => {
+	const { signal } = new AbortController();
+	return verifyLibrarySession(binding, signal, { generation: 'test', signal, isCurrent: () => true, run: async (work) => work() });
+};
 
 function reply(response: Response) {
 	const fetch = vi.fn().mockResolvedValue(response);

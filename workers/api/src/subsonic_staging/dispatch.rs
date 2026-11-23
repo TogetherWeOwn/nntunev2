@@ -10,12 +10,12 @@ use nntune_subsonic::staging_endpoints::basic_document;
 use nntune_subsonic::staging_rejection::StagingRejection::BusyOrCapacity;
 use nntune_subsonic::staging_rejection::{RejectionFormat, StagingRejection};
 use nntune_subsonic::Params;
-use tokio_postgres::Client;
 use worker::{web_sys, Response, Result as WorkerResult};
 
 use super::{
     InputError, StagingConstruction, StagingInput, SyntheticCatalogue, CONSTRUCTION_BYTES,
 };
+use crate::postgres::PgClient;
 use crate::rotation::KekSource;
 use crate::subsonic_auth::{self, AuthError, IndexKeyring, Principal};
 use crate::subsonic_dispatch::{snapshot_order::OrderWork, ProductionStore};
@@ -48,7 +48,7 @@ impl StagingDispatch {
 
 pub enum StagingApp<'a, K> {
     Postgres {
-        client: Client,
+        client: PgClient,
         peppers: IndexKeyring<'a>,
         keks: &'a K,
         now_seconds: u64,
@@ -58,7 +58,7 @@ pub enum StagingApp<'a, K> {
 }
 
 impl<K> StagingApp<'_, K> {
-    fn postgres(&mut self) -> &mut Client {
+    fn postgres(&mut self) -> &mut PgClient {
         match self {
             Self::Postgres { client, .. } => client,
             #[cfg(feature = "staging-body-wasm-test")]
@@ -84,7 +84,7 @@ pub async fn respond_staging<'a, K: KekSource + 'a, A, M, C>(
 where
     A: Future<Output = Result<StagingApp<'a, K>, StagingRejection>>,
     C: FnOnce() -> M,
-    M: Future<Output = Result<Client, StagingRejection>>,
+    M: Future<Output = Result<PgClient, StagingRejection>>,
 {
     let reject_xml = |reason| respond_fixed_rejection(reason, RejectionFormat::Xml);
     let input = match StagingInput::collect(request).await {
@@ -194,7 +194,7 @@ impl StagingConstruction {
         finish_document(document.map(Some))
     }
 
-    async fn dispatch_document<F: Future<Output = Result<Client, StagingRejection>>>(
+    async fn dispatch_document<F: Future<Output = Result<PgClient, StagingRejection>>>(
         &mut self,
         app: &mut StagingApp<'_, impl KekSource>,
         principal: &Principal,
@@ -297,7 +297,7 @@ mod wasm_test {
         allowed: bool,
         fixture_id: Option<String>,
     ) -> Result<web_sys::Response, JsValue> {
-        type NoMirror = fn() -> std::future::Ready<Result<Client, StagingRejection>>;
+        type NoMirror = fn() -> std::future::Ready<Result<PgClient, StagingRejection>>;
         let context = StagingDispatch {
             now_millis: 0,
             order_work: StagingDispatch::FIXTURE_ORDER_WORK,

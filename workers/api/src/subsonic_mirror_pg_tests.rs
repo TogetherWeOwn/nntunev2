@@ -1,6 +1,6 @@
 //! Disposable PostgreSQL only, invoked by the required Actions migration job.
 use super::*;
-use tokio_postgres::{Config, NoTls};
+use tokio_postgres::{Client, Config, NoTls};
 
 async fn database(name: &str) -> Client {
     let mut config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")

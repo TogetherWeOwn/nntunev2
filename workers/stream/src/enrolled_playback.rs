@@ -155,12 +155,17 @@ impl<'a> EnrolledPlayback<'a> {
         {
             return Err(PlaybackError::Binding);
         }
-        let sealed =
-            read_s3_range_chunk(self.plan, index, locator.binding(), response, body, || {
-                now() < self.pins.usable_until
-            })
-            .await
-            .map_err(PlaybackError::Response)?;
+        let sealed = read_s3_range_chunk(
+            self.plan,
+            index,
+            self.locator,
+            locator,
+            response,
+            body,
+            || now() < self.pins.usable_until,
+        )
+        .await
+        .map_err(PlaybackError::Response)?;
         let part = reader
             .open_next(index, page.1, sealed, wire_header)
             .map_err(PlaybackError::Frame)?;

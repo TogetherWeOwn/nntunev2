@@ -3,7 +3,7 @@
 //!
 //! Token shape: `v<n>.<base64url(payload)>.<base64url(hmac-sha256)>` where
 //! the HMAC covers the base64url payload segment exactly as spelled (never
-//! the version prefix). Two payload versions exist:
+//! the version prefix) for the two legacy payload versions:
 //!
 //! - `v1`: `user_id|track_id|exp_unix` (the original play authorization).
 //! - `v2`: `user_id|track_id|play_id|lease_epoch|exp_unix` — adds the play
@@ -13,8 +13,11 @@
 //!   `user_id` 1..=128 bytes, `track_id` and `play_id` 1..=512 bytes) so
 //!   a grant that verifies here can always be metered — the ledger key
 //!   `play:{user}:{track}:{play}` can always be derived from it —
-//!   anything else is [`GrantError::Malformed`]. The public play route
+//!   anything else is [`GrantError::Malformed`]. The portable play route
 //!   requires `v2`.
+//! - `v3` (R2 only): the `v2` payload plus `|artifact_sha256` (lowercase
+//!   hex). Its MAC covers `v3.` and the encoded payload. It authorizes
+//!   only that normalized rendition, not a track pointer.
 //!
 //! This module is the byte-exact format definition: the `api` Worker
 //! mirrors [`issue_v2_at`] when it mints grants at its issuance gate.
@@ -150,14 +153,24 @@ pub(crate) fn verify_with_user(
     secret: &[u8],
     now_unix: u64,
 ) -> Result<Grant, (GrantError, Option<String>)> {
-    // The version prefix selects the payload grammar. The signature covers
-    // only the payload segment, but relabeling cannot smuggle a payload
-    // across versions: each grammar demands its exact field count, so a
-    // `v1` payload under a `v2.` prefix (or the reverse) is malformed.
+    if token.starts_with("v3.") {
+        return Err((GrantError::Malformed, None));
+    }
+    verify_for_r2(token, secret, now_unix).map(|(grant, _)| grant)
+}
+
+/// Verify the legacy formats or an R2-only rendition grant.
+pub(crate) fn verify_for_r2(
+    token: &str,
+    secret: &[u8],
+    now_unix: u64,
+) -> Result<(Grant, Option<String>), (GrantError, Option<String>)> {
+    // The version prefix selects an exact payload grammar.
     let (version, rest) = match token
         .strip_prefix("v1.")
         .map(|r| (1u8, r))
         .or_else(|| token.strip_prefix("v2.").map(|r| (2u8, r)))
+        .or_else(|| token.strip_prefix("v3.").map(|r| (3u8, r)))
     {
         Some(pair) => pair,
         None => return Err((GrantError::Malformed, None)),
@@ -167,13 +180,30 @@ pub(crate) fn verify_with_user(
         return Err((GrantError::Malformed, None));
     }
     let sig = base64url_decode(sig_b64).ok_or((GrantError::Malformed, None))?;
-    let expected = hmac_sha256(secret, payload_b64.as_bytes());
+    let mac_input = if version == 3 {
+        &token[..3 + payload_b64.len()]
+    } else {
+        payload_b64
+    };
+    let expected = hmac_sha256(secret, mac_input.as_bytes());
     if sig.len() != expected.len() || !constant_time_eq(&sig, &expected) {
         return Err((GrantError::BadSignature, None));
     }
     let payload = base64url_decode(payload_b64).ok_or((GrantError::Malformed, None))?;
     let payload = String::from_utf8(payload).map_err(|_| (GrantError::Malformed, None))?;
-    let mut parts = payload.split('|');
+    let (identity, artifact_sha256) = if version == 3 {
+        let (identity, hash) = payload
+            .rsplit_once('|')
+            .ok_or((GrantError::Malformed, None))?;
+        let lowercase_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        if hash.len() != 64 || !hash.bytes().all(lowercase_hex) {
+            return Err((GrantError::Malformed, None));
+        }
+        (identity, Some(hash.to_string()))
+    } else {
+        (payload.as_str(), None)
+    };
+    let mut parts = identity.split('|');
     let (user_id, track_id, play_id, lease_epoch, exp) = match version {
         1 => match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some(u), Some(t), Some(e), None) => (u, t, None, None, e),
@@ -216,13 +246,14 @@ pub(crate) fn verify_with_user(
     if exp_unix - now_unix > MAX_GRANT_TTL + CLOCK_SKEW_SECS {
         return Err((GrantError::TtlTooLong, Some(user_id)));
     }
-    Ok(Grant {
+    let grant = Grant {
         user_id,
         track_id: track_id.to_string(),
         play_id,
         lease_epoch,
         exp_unix,
-    })
+    };
+    Ok((grant, artifact_sha256))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

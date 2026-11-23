@@ -17,7 +17,20 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 # resolves wherever the caller's role points. This wrapper (not a one-off) is
 # the required way to apply any pre-convention file in every environment;
 # new migrations carry their own in-file SET (see migrations/README.md).
-psql_run() { PGOPTIONS='-c search_path=public,pg_catalog' psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
+psql_options='-c search_path=public,pg_catalog'
+psql_command=(env "PGOPTIONS=$psql_options" psql "$DATABASE_URL")
+session_fixture=()
+if [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]; then
+  hosted_url='postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci'
+  if [[ "$DATABASE_URL" != "$hosted_url" ]]; then
+    printf 'disposable GitHub-hosted migration database required\n' >&2
+    exit 1
+  fi
+  # Pin the address and clear libpq environment overrides before loading session fixtures.
+  psql_command=(env -i "PATH=$PATH" "PGOPTIONS=$psql_options" psql "$hosted_url?hostaddr=127.0.0.1")
+  session_fixture=(-v hosted_ingest_session_fixture=true)
+fi
+psql_run() { "${psql_command[@]}" -X -q -v ON_ERROR_STOP=1 "${session_fixture[@]}" "$@"; }
 
 shopt -s nullglob
 migrations=("$root"/migrations/*.sql)
@@ -156,6 +169,11 @@ for f in "${tests[@]}"; do
     -v audio_manifest_store_sql="$(<"$root/workers/ingest/src/audio_manifest_store.sql")" \
     -v storage_digest_claim_lookup_sql="$(<"$root/workers/api/src/storage_digest_claim_lookup.sql")" \
     -v storage_digest_read_lookup_sql="$(<"$root/workers/api/src/storage_digest_read_lookup.sql")" \
+    -v observe_invite_expiry_sql="$(<"$root/workers/api/src/observe_invite_expiry.sql")" \
+    -v private_listening_access_sql="$(<"$root/workers/api/src/private_listening_access.sql")" \
+    -v lock_invite_issuer_sql="$(<"$root/workers/api/src/lock_invite_issuer_for_sanction.sql")" \
+    -v sanction_invite_issuer_sql="$(<"$root/workers/api/src/sanction_invite_issuer.sql")" \
+    -v ingest_session_reserve_sql="$(<"$root/workers/api/src/ingest_session_reserve.sql")" \
     -v audio_classifications_store_sql="$(<"$root/workers/ingest/src/audio_classifications_store.sql")" -f "$f"
 done
 # Hosted-only concurrent fixtures are run separately by the migration CI job.

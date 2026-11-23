@@ -22,6 +22,7 @@
 //! [`recording_mbids_or_fallback`].
 
 pub mod admin_policy;
+pub mod admin_publish_match;
 
 use serde::Deserialize;
 

@@ -10,7 +10,7 @@ export interface LibraryLike {
 }
 
 const LIKES_PATH = '/v1/me/likes';
-const MAX_LIKES = 500;
+export const MAX_LIKES = 500;
 // Import does catalogue resolution and a preference write per item. Keep each
 // request comfortably below the API's 500-item ceiling.
 const IMPORT_BATCH_SIZE = 50;
@@ -28,6 +28,14 @@ function isCount(value: unknown): value is number {
 
 function record(value: unknown): Record<string, unknown> {
 	return (value ?? {}) as Record<string, unknown>;
+}
+
+/** Only the Library server knows whether an uppercase MBID is also an exact job ID. */
+export function trackLikeTarget(id: string, resolved: unknown): string | undefined {
+	if (!isTrackId(id)) return;
+	const lower = id.toLowerCase();
+	if (id === lower || !RELEASE_ID.test(lower)) return resolved === undefined || resolved === id ? id : undefined;
+	return resolved === id || resolved === lower ? resolved : undefined;
 }
 
 export async function loadLikes(client: Pick<LikesClient, 'get'>) {
@@ -54,15 +62,12 @@ export async function loadLikes(client: Pick<LikesClient, 'get'>) {
 export async function setTrackLike(
 	client: Pick<LikesClient, 'put' | 'delete'>,
 	id: string,
-	liked: boolean,
-	binding: string
+	liked: boolean
 ): Promise<string> {
 	if (!isTrackId(id)) throw new Error('Invalid track ID');
-	if (!validBinding(binding)) throw new Error('Missing or invalid verified session binding');
 	// The server checks exact member job IDs before resolving recording MBIDs.
 	const path = `${LIKES_PATH}/track/${id}`;
-	const headers = { 'x-nntune-session-binding': binding };
-	const receipt = record(liked ? await client.put<unknown>(path, {}, headers) : await client.delete<unknown>(path, headers));
+	const receipt = record(liked ? await client.put<unknown>(path, {}) : await client.delete<unknown>(path));
 	if (!isTrackId(receipt.target_id) ||
 		(receipt.target_id !== id && (!RELEASE_ID.test(receipt.target_id) || receipt.target_id !== id.toLowerCase())) ||
 		(liked

@@ -14,7 +14,8 @@ pub(crate) struct FrameReader {
     samples: Option<SubframeSamples>,
     stereo: Option<Stereo>,
     first_channel: Vec<i64>,
-    pair_index: usize,
+    sample_index: usize,
+    pcm: Option<Vec<i32>>,
     bits: BitInput,
     crc: FrameCrc,
     footer: Option<FrameFooter>,
@@ -25,6 +26,15 @@ impl FrameReader {
     /// The caller supplies the exact frame boundary and retains an incomplete
     /// header (at most 16 bytes).
     pub(crate) fn start(input: &mut &[u8], info: &StreamInfo) -> Result<Option<Self>, ()> {
+        Self::start_with_pcm(input, info, &mut None)
+    }
+
+    /// Move reusable scratch into the frame only when its header is complete.
+    pub(crate) fn start_with_pcm(
+        input: &mut &[u8],
+        info: &StreamInfo,
+        scratch: &mut Option<Vec<i32>>,
+    ) -> Result<Option<Self>, ()> {
         let Some(header) = FrameHeader::parse(input, info)? else {
             return Ok(None);
         };
@@ -40,6 +50,13 @@ impl FrameReader {
                 .map_err(|_| ())?;
             (2, stereo.coded_widths()[0], Some(stereo))
         };
+        let mut pcm = scratch.take();
+        if let Some(pcm) = &mut pcm {
+            let len = usize::from(header.block_size) * usize::from(channels_left);
+            pcm.clear();
+            pcm.try_reserve_exact(len).map_err(|_| ())?;
+            pcm.resize(len, 0);
+        }
         let channel = SubframeHeaderReader::new(first_width)?;
         let (prefix, rest) = input.split_at(header.len);
         let mut crc = FrameCrc::default();
@@ -52,7 +69,8 @@ impl FrameReader {
             samples: None,
             stereo,
             first_channel,
-            pair_index: 0,
+            sample_index: 0,
+            pcm,
             bits: BitInput::default(),
             crc,
             footer: None,
@@ -61,7 +79,7 @@ impl FrameReader {
     }
 
     /// Decode subframes, check coupled PCM ranges, and verify the footer.
-    /// This emits no PCM and leaves the byte after the frame unread.
+    /// Leaves the byte after the frame unread; retained PCM stays private until finish.
     pub(crate) fn read(&mut self, input: &mut &[u8]) -> Result<bool, ()> {
         if self.failed {
             return Err(());
@@ -100,17 +118,29 @@ impl FrameReader {
                             // SubframeSamples emits exactly block_size samples.
                             self.first_channel.push(sample);
                         } else {
-                            stereo.restore(
-                                *self.first_channel.get(self.pair_index).ok_or(())?,
+                            let (left, right) = stereo.restore(
+                                *self.first_channel.get(self.sample_index).ok_or(())?,
                                 sample,
                             )?;
-                            self.pair_index += 1;
+                            if let Some(pcm) = &mut self.pcm {
+                                let offset = self.sample_index * 2;
+                                pcm.get_mut(offset..offset + 2)
+                                    .ok_or(())?
+                                    .copy_from_slice(&[left, right]);
+                            }
                         }
+                    } else if let Some(pcm) = &mut self.pcm {
+                        let channels = self.header.channel_assignment + 1;
+                        let offset = self.sample_index * usize::from(channels)
+                            + usize::from(channels - self.channels_left);
+                        *pcm.get_mut(offset).ok_or(())? = i32::try_from(sample).map_err(|_| ())?;
                     }
+                    self.sample_index += 1;
                 }
                 Samples::NeedInput => return Ok(false),
                 Samples::End => {
                     self.channels_left -= 1;
+                    self.sample_index = 0;
                     self.samples = None;
                     if self.channels_left != 0 {
                         let width = self
@@ -128,11 +158,15 @@ impl FrameReader {
     }
 
     pub(crate) fn finish(self) -> Result<FrameHeader, ()> {
+        self.finish_with_pcm().map(|(header, _)| header)
+    }
+
+    pub(crate) fn finish_with_pcm(self) -> Result<(FrameHeader, Option<Vec<i32>>), ()> {
         if self.failed {
             return Err(());
         }
         self.footer.ok_or(())?.finish_at_eof()?;
-        Ok(self.header)
+        Ok((self.header, self.pcm))
     }
 }
 
