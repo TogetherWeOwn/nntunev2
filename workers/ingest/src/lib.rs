@@ -30,6 +30,7 @@ use futures_util::StreamExt;
 use nntune_logging::{Level, LogRecord, Worker as LogWorker};
 use worker::{console_log, Env, Request, Response, Result, RouteContext, Router};
 
+pub mod admin_review;
 pub mod api_error;
 pub mod audio_acceptance;
 pub mod audio_classifications;
