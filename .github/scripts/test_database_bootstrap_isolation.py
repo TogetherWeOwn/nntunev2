@@ -347,6 +347,9 @@ def prove_setup_caller(cluster, *, interrupt):
             {"ca_pem": (cluster.directory / "client" / "other.crt").read_text()},
         ):
             run(caller_env(cluster, roles, **changes) | route, "refused", 1)
+        cluster.ok("remove the canonical role's database creation privilege", f"ALTER ROLE {CREATOR} NOCREATEDB;")
+        run(env, "refused", 1)
+        cluster.ok("restore the canonical role's database creation privilege", f"ALTER ROLE {CREATOR} CREATEDB;")
         run(env | {"PATH": routed_client(cluster, "wrong-role"),
                    "BOOTSTRAP_SETUP_PASSWORD": cluster.passwords[DECOY]}, "refused", 1)
         require((cluster.directory / "probe-result").read_bytes() == b"wrong-session\nroles-ready\n",
