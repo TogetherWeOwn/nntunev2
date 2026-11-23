@@ -128,8 +128,7 @@ class Cluster:
         (server / "pg_hba.conf").write_text("local all all trust\nhostssl all all all scram-sha-256\n")
         common = ["run", "--detach", "--pull=never", "--log-driver=none",
                   "--network", self.network, "--tmpfs", "/var/lib/postgresql"]
-        checked(docker(*common, "--name", self.server, "--ip", self.address,
-                       "--network-alias", f"wrong-{self.server}",
+        checked(docker(*common, "--name", self.server, "--network-alias", f"wrong-{self.server}",
                        "--mount", f"type=bind,src={server},dst=/fixture,readonly",
                        "-e", "POSTGRES_PASSWORD_FILE=/fixture/password", "--entrypoint", "sh", IMAGE,
                        "-ec", """
@@ -142,6 +141,8 @@ class Cluster:
                 "start isolated client")
         checked(docker("network", "inspect", "--format", "{{.Internal}}", self.network),
                 "verify an internal network", "true\n")
+        checked(docker("inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", self.server),
+                "verify the certificate address belongs to the disposable server", self.address + "\n")
         for name in (self.server, self.client):
             checked(docker("inspect", "--format", "{{.HostConfig.PublishAllPorts}} {{len .HostConfig.PortBindings}}",
                            name), "verify no published PostgreSQL ports", "false 0\n")
