@@ -1,6 +1,10 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { API_REQUEST_TIMEOUT_MS, ApiClient } from './api/client.js';
 import { AUTH_GENERATION_KEY, AUTH_LOCK, captureAuthFence } from './auth-fence.js';
+import { createBrowserPlaybackGrant } from './player/browserPlaybackGrant.js';
+import { createPlayerController } from './player/controller.svelte.js';
+import { createQueue } from './player/queue.js';
+import type { QueuedPlaySource } from './player/queueController.js';
 const denied = () => new DOMException('Denied', 'SecurityError');
 const full = () => new DOMException('Storage full', 'QuotaExceededError');
 const fail = (error: () => Error) => () => { throw error(); };
@@ -226,4 +230,79 @@ it.each([0, 1])('releases the shared lock when cache enumeration %i stalls', asy
 		expect(await receipt).toBeUndefined();
 		expect(send).toHaveBeenCalledTimes(1);
 	} finally { unblock.resolve([]); await receipt; }
+});
+
+const playbackBinding = 'A'.repeat(43);
+const signal = () => new AbortController().signal;
+const current = () => true;
+const candidate = { trackId: 'next' };
+
+it('only a matching owner, track and continuation can publish an uncredentialed media locator', async () => {
+	setup();
+	const prepare = vi.fn(async (req: { sessionBinding: string; playbackSessionId: string; trackId: string }) =>
+		({ ...req, playId: 'play-7', durationMs: 120_000 }));
+	const scope = createBrowserPlaybackGrant((await captureAuthFence())!, playbackBinding, prepare);
+	const publish = vi.fn<(_source: QueuedPlaySource, _duration: number) => void>();
+	const result = { sessionBinding: playbackBinding, playbackSessionId: scope.playbackSessionId, trackId: 'next', playId: 'play-7', durationMs: 120_000 };
+	for (const bad of [{ trackId: 'old' }, { playbackSessionId: 'another-tab' }, { sessionBinding: 'B'.repeat(42) + 'A' },
+		{ durationMs: 0 }, { durationMs: 1.5 }, { playId: 'different' }, { playId: '../escape' }]) {
+		prepare.mockResolvedValueOnce({ ...result, ...bad });
+		expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), current, publish)).toBe(false);
+	}
+	expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), current, publish)).toBe(true);
+	expect(prepare).toHaveBeenLastCalledWith({ ...candidate, sessionBinding: playbackBinding, playbackSessionId: scope.playbackSessionId, playId: 'play-7' }, expect.any(AbortSignal));
+	expect(publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+		streamUrl: `/v1/plays/media/next/${scope.playbackSessionId}/play-7`
+	}), 120_000);
+	const [[source]] = publish.mock.calls;
+	expect(source.isCurrent()).toBe(true);
+	scope.dispose();
+	expect(source.isCurrent()).toBe(false);
+});
+
+it.each(['disabled', 'denied', 'cancelled', 'account switch', 'reset'] as const)('%s cannot publish a replacement source', async (reason) => {
+	const { api } = setup();
+	const owner = (await captureAuthFence())!;
+	const initial = createQueue(['current', 'next'].map((id) => ({ id, title: id, artist: '', streamUrl: `/${id}` })));
+	const player = createPlayerController(initial, { flush: async () => {} });
+	const audio = Object.assign(new EventTarget(), { paused: false, ended: false, error: null,
+		getAttribute: () => '/current', pause: vi.fn() });
+	player.media.attach(audio as unknown as HTMLAudioElement);
+	const publish = vi.fn((source: QueuedPlaySource) => { void player.media.playSelected(initial, 1, source); });
+	const started = Promise.withResolvers<AbortSignal>();
+	const finish = Promise.withResolvers<void>();
+	const prepare = vi.fn(async (req: { sessionBinding: string; playbackSessionId: string; trackId: string }, transportSignal: AbortSignal) => {
+		started.resolve(transportSignal);
+		await finish.promise;
+		return reason === 'denied' ? undefined : { ...req, playId: 'play-7', durationMs: 120_000 };
+	});
+	const scope = createBrowserPlaybackGrant(owner, playbackBinding, reason === 'disabled' ? undefined : prepare);
+	const attempt = new AbortController();
+	try {
+		const opening = scope.open(candidate, attempt.signal, current, publish);
+		if (reason !== 'disabled') {
+			const transportSignal = await started.promise;
+			if (reason === 'cancelled') attempt.abort();
+			if (reason === 'account switch') {
+				await api.logout();
+				player.purgeAtAuthBoundary();
+				const replacement = createBrowserPlaybackGrant((await captureAuthFence())!, 'B'.repeat(42) + 'A', prepare);
+				expect(replacement.playbackSessionId).not.toBe(scope.playbackSessionId);
+			}
+			if (reason === 'reset') scope.dispose();
+			expect(transportSignal.aborted).toBe(reason !== 'denied');
+		}
+		finish.resolve();
+		expect(await opening).toBe(false);
+		expect(publish).not.toHaveBeenCalled();
+		if (reason === 'account switch') {
+			expect(player.queue.snapshot).toEqual(createQueue([]));
+			expect(player.media.audio).toBeUndefined();
+			expect(audio.pause).toHaveBeenCalledOnce();
+		} else {
+			expect(player.queue.snapshot).toBe(initial);
+			expect(player.media.audio).toBe(audio);
+			expect(audio.pause).not.toHaveBeenCalled();
+		}
+	} finally { player.destroy(); scope.dispose(); }
 });

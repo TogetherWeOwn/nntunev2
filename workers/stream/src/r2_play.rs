@@ -116,8 +116,7 @@ mod tests {
     const HASH: &str = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
     const SECRET: &[u8] = b"test only, not a deployed secret";
     // Independently generated HMAC-SHA256 wire vector for this fixture.
-    const TOKEN: &str = concat!("v3.dXNlci0xfHRyYWNrLTl8cGxheS03fDQyfDIwMHw5ZDcwZjExYmM3NTlkNzM0",
-        "ZWJiMzQzZjU5MzJmMDA1Y2ViYjM0M2Y1OTMyZjAwNWM5ZDcwZjExYmM3NTlkNzM0.RscNSYHWhiP5Byo3P0kFFPdrWczsJIjsb8kBReUuDRk");
+    const TOKEN: &str = include_str!("../../../fixtures/play-grant/browser-rendition.token");
 
     #[test]
     fn signed_rendition_is_served_without_legacy_fallback() {
