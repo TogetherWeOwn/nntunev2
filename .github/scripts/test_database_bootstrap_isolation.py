@@ -1,7 +1,9 @@
 """Disposable PostgreSQL qualification. No connection or credential inputs."""
 
+import base64
 import io
 import ipaddress
+import json
 import os
 import secrets
 import select
@@ -15,7 +17,7 @@ from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
 import database_bootstrap_setup as setup
-from fixtures.database_bootstrap.authorization import caller_env
+from fixtures.database_bootstrap.authorization import caller_env, plan_binding
 from database_bootstrap_preflight import (
     BootstrapPreflightError, catalog_probe_sql, require_absent_catalog_result,
 )
@@ -23,7 +25,7 @@ from database_bootstrap_preflight import (
 IMAGE = "postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336"
 PORT = 5432
 DRILL_SIGNAL = signal.SIGUSR1
-CREATOR, OWNER = "fixture_creator", "fixture_owner"
+CREATOR, OWNER, DECOY = "fixture_creator", "fixture_owner", "fixture_decoy"
 MIGRATOR, RUNTIME, READER = "fixture_migrator", "fixture_runtime", "fixture_reader"
 STAGING = "fixture_staging"
 MAINTENANCE, LAUNCH, SIBLING = "postgres", "launch_fixture", "staging_fixture"
@@ -91,12 +93,13 @@ def checked(result, verdict, expected=None):
 
 
 class Cluster:
-    def __init__(self, directory):
+    def __init__(self, directory, branch_id):
         token = secrets.token_hex(8)
         self.network = "bootstrap-" + token
         self.server = self.network + ".test"
         self.client = self.network + "-client"
-        roles = ("postgres", CREATOR, MIGRATOR, RUNTIME, READER, STAGING)
+        self.branch_id = branch_id
+        roles = ("postgres", CREATOR, DECOY, MIGRATOR, RUNTIME, READER, STAGING)
         self.passwords = {role: secrets.token_hex(24) for role in roles}
         self.expiry = int(time.time()) + 300
         self.directory = directory
@@ -221,8 +224,9 @@ def provision_roles(cluster):
     valid_until = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cluster.expiry))
     cluster.ok("create distinct fixture roles", f"""
         CREATE ROLE {CREATOR} LOGIN CREATEDB PASSWORD '{cluster.passwords[CREATOR]}' VALID UNTIL '{valid_until}';
+        CREATE ROLE {DECOY} LOGIN CREATEDB PASSWORD '{cluster.passwords[DECOY]}' VALID UNTIL '{valid_until}';
         CREATE ROLE {OWNER} NOLOGIN;
-        GRANT {OWNER} TO {CREATOR} WITH INHERIT FALSE, SET TRUE;
+        GRANT {OWNER} TO {CREATOR}, {DECOY} WITH INHERIT FALSE, SET TRUE;
         """ + "\n".join(
             f"CREATE ROLE {role} LOGIN PASSWORD '{cluster.passwords[role]}';"
             for role in (MIGRATOR, RUNTIME, READER, STAGING)
@@ -276,53 +280,93 @@ def caller_verdict(process, expected, timeout=45):
     require((process.returncode, stdout, stderr) == result, f"emit only the caller's {expected} verdict")
 
 
-def traced_client(cluster, mode):
+def routed_client(cluster, mode):
     shim = cluster.directory / "psql"
     shutil.copyfile(Path(__file__).parent / "fixtures/database_bootstrap/psql", shim)
     shim.chmod(0o700)
-    (cluster.directory / "fault").write_text(f"{mode} {cluster.canary} {cluster.address}")
+    (cluster.directory / "route").write_text(
+        f"{mode} {cluster.canary} {cluster.address} {CREATOR}.{cluster.branch_id} {CREATOR} {DECOY}"
+    )
     return f"{cluster.directory}:/usr/bin:/bin"
 
 
 def prove_setup_caller(cluster, *, interrupt):
-    def run(env, expected):
+    calls = cluster.directory / "invocations"
+    calls.touch()
+
+    def run(env, expected, invocations):
+        before = calls.stat().st_size
         with start_caller(env) as process:
             try:
                 caller_verdict(process, expected)
             finally:
                 if process.poll() is None:
                     process.kill()
+        require(calls.stat().st_size - before == invocations, "verify the expected routed client calls")
 
     cluster.canary = secrets.token_hex(20)
     roles = CREATOR, OWNER, MIGRATOR, READER
     env = caller_env(cluster, roles)
     if not interrupt:
+        route = {"PATH": routed_client(cluster, "route")}
+        env |= route
         for overrides in (
-            {"GITHUB_RUN_ATTEMPT": "2"}, {"BOOTSTRAP_STEP_DEBUG": "true"},
+            {"GITHUB_RUN_ATTEMPT": "2"}, {"GITHUB_RUN_ID": "0"}, {"BOOTSTRAP_STEP_DEBUG": "true"},
             {"BOOTSTRAP_PLAN_DIGEST": secrets.token_hex(32)},
             {"GITHUB_SHA": secrets.token_hex(20)}, {"GITHUB_REPOSITORY": "fixture/fork"},
         ):
-            run(env | overrides, "refused")
+            run(env | overrides, "refused", 0)
+        branch = cluster.branch_id
+        other_branch = ("1" if branch.startswith("0") else "0") + branch[1:]
+        login = f"{CREATOR}.{branch}"
         for changes in (
-            {"port": PORT + 1}, {"reader_role": CREATOR}, {"reader_role": "missing_reader"},
+            {"version": 1}, {"version": "2"}, {"version": 3},
+            {"setup_login": f"{CREATOR}.{other_branch}"}, {"setup_login": f"{DECOY}.{branch}"},
+            {"setup_login": CREATOR}, {"setup_login": f"{login}|replica"},
+            {"setup_login": login + "\n"}, {"setup_login": None},
+            {"setup_role": login, "setup_login": f"{login}.{branch}"},
+            {"port": PORT + 1}, {"reader_role": CREATOR},
+        ):
+            run(caller_env(cluster, roles, **changes) | route, "refused", 0)
+        for malformed in ("a" * 9, "a" * 11, "a" * 13, "A" * 12, "á" * 12):
+            run(caller_env(cluster, roles, branch_id=malformed, setup_login=f"{CREATOR}.{malformed}") | route,
+                "refused", 0)
+        changed_branch = caller_env(cluster, roles, branch_id=other_branch, setup_login=f"{CREATOR}.{other_branch}")
+        run(env | {"BOOTSTRAP_PLAN_B64": changed_branch["BOOTSTRAP_PLAN_B64"]}, "refused", 0)
+        raw = base64.b64decode(env["BOOTSTRAP_PLAN_B64"])
+        run(env | plan_binding(b'{"setup_login":"ambiguous",' + raw[1:]), "refused", 0)
+        plan = json.loads(raw)
+        del plan["branch_id"]
+        run(env | plan_binding(json.dumps(plan).encode()), "refused", 0)
+        del plan["setup_login"]
+        plan["version"] = 1
+        run(env | plan_binding(json.dumps(plan).encode()), "refused", 0)
+
+        for changes in (
+            {"reader_role": "missing_reader"},
             {"ca_pem": (cluster.directory / "client" / "other.crt").read_text()},
         ):
-            run(caller_env(cluster, roles, **changes), "refused")
-        run(caller_env(cluster, roles, setup_role=READER, reader_role=CREATOR)
-            | {"BOOTSTRAP_SETUP_PASSWORD": cluster.passwords[READER]}, "refused")
-        run(env | {"PATH": traced_client(cluster, "error")}, "refused")
+            run(caller_env(cluster, roles, **changes) | route, "refused", 1)
+        cluster.ok("remove the canonical role's database creation privilege", f"ALTER ROLE {CREATOR} NOCREATEDB;")
+        run(env, "refused", 1)
+        cluster.ok("restore the canonical role's database creation privilege", f"ALTER ROLE {CREATOR} CREATEDB;")
+        run(env | {"PATH": routed_client(cluster, "wrong-role"),
+                   "BOOTSTRAP_SETUP_PASSWORD": cluster.passwords[DECOY]}, "refused", 1)
+        require((cluster.directory / "probe-result").read_bytes() == b"wrong-session\nroles-ready\n",
+                "observe a different eligible SQL identity on the approved route")
+        run(env | {"PATH": routed_client(cluster, "error")}, "refused", 1)
         diagnostics = (cluster.directory / "diagnostics").read_bytes()
         require(all(value.encode() in diagnostics for value in
                     (cluster.passwords[CREATOR], cluster.address, "ERROR:", cluster.canary)),
                 "exercise generated credential trace, endpoint and SQL error containment")
-        dns = {"PATH": traced_client(cluster, "resolve")}
-        run(caller_env(cluster, roles, host=f"wrong-{cluster.server}") | dns, "refused")
+        dns = {"PATH": routed_client(cluster, "resolve")}
+        run(caller_env(cluster, roles, host=f"wrong-{cluster.server}") | dns, "refused", 1)
         env = caller_env(cluster, roles, host=cluster.server) | dns
-        run(env | {"BOOTSTRAP_EXPIRY": str(cluster.expiry - 60)}, "refused")
+        run(env | {"BOOTSTRAP_EXPIRY": str(cluster.expiry - 60)}, "refused", 1)
         cluster.ok("verify all caller refusals leave the target absent",
                    f"SELECT NOT EXISTS (SELECT FROM pg_database WHERE datname = '{LAUNCH}');", "t\n")
-        run(env, "complete")
-        run(env, "refused")  # The name collision stops any second write.
+        run(env, "complete", 3)
+        run(env, "refused", 1)  # The name collision stops any second write.
         return
 
     def wait_for(verdict, sql):
@@ -335,7 +379,7 @@ def prove_setup_caller(cluster, *, interrupt):
         raise FixtureFailure(verdict)
 
     sessions = f"SELECT FROM pg_stat_activity WHERE usename = '{CREATOR}'"
-    with start_caller(env | {"PATH": traced_client(cluster, "interrupt")}) as process:
+    with start_caller(env | {"PATH": routed_client(cluster, "interrupt")}) as process:
         try:
             wait_for("observe the caller inside the setup transaction",
                      f"SELECT EXISTS ({sessions} AND wait_event = 'PgSleep');")
@@ -441,7 +485,7 @@ def verify_launch_grants(cluster):
 def exercise(*, interrupt):
     try:
         with tempfile.TemporaryDirectory(prefix="database-bootstrap-") as temp:
-            cluster = Cluster(Path(temp))
+            cluster = Cluster(Path(temp), branch_id=secrets.token_hex(5 if interrupt else 6))
             try:
                 cluster.start()
                 provision_roles(cluster)
@@ -488,4 +532,4 @@ if __name__ == "__main__":
         sys.exit(f"database-bootstrap-fixture: failed to {error}")
     except Exception:
         sys.exit("database-bootstrap-fixture: failed")
-    print("database-bootstrap-fixture: TLS, fencing, grants and teardown passed")
+    print("database-bootstrap-fixture: routed login, SQL identity, TLS, fencing, grants and teardown passed")

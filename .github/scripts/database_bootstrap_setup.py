@@ -23,7 +23,7 @@ MAX_RESULT_BYTES = 64
 PORT = 5432
 FIELDS = {
     "version", "host", "port", "ca_pem", "maintenance", "launch",
-    "setup_role", "owner_role", "migrator_role", "reader_role",
+    "branch_id", "setup_login", "setup_role", "owner_role", "migrator_role", "reader_role",
 }
 interrupted = False
 
@@ -52,7 +52,7 @@ def valid_host(host):
 def setup_plan(raw):
     data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
     if (not isinstance(data, dict) or data.keys() != FIELDS
-            or type(data["version"]) is not int or data["version"] != 1
+            or type(data["version"]) is not int or data["version"] != 2
             or type(data["port"]) is not int or data["port"] != PORT
             or any(not isinstance(data[key], str) for key in FIELDS - {"port", "version"})
             or not valid_host(data["host"])):
@@ -63,6 +63,10 @@ def setup_plan(raw):
         or role.lower().startswith("pg_") or role.lower() == "public"
         for role in roles
     ):
+        raise ValueError
+    setup_role, branch_id = data["setup_role"], data["branch_id"]
+    if ("." in setup_role or not re.fullmatch(r"(?:[a-z0-9]{10}|[a-z0-9]{12})", branch_id)
+            or data["setup_login"] != f"{setup_role}.{branch_id}"):
         raise ValueError
     ca = data["ca_pem"]
     if not re.fullmatch(r"-----BEGIN CERTIFICATE-----\n(?:[A-Za-z0-9+/=]+\n)+"
@@ -172,7 +176,7 @@ def setup():
             env = {
                 "PATH": os.environ["PATH"], "LC_ALL": "C", "HOME": private,
                 "PGHOST": plan.host, "PGPORT": str(plan.port), "PGDATABASE": plan.maintenance,
-                "PGUSER": plan.setup_role, "PGPASSWORD": password, "PGCONNECT_TIMEOUT": "3",
+                "PGUSER": plan.setup_login, "PGPASSWORD": password, "PGCONNECT_TIMEOUT": "3",
                 "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(ca), "PGGSSENCMODE": "disable",
                 "PGOPTIONS": "-c search_path=pg_catalog -c statement_timeout=10000 -c lock_timeout=2000 "
                              "-c transaction_timeout=15000 -c idle_session_timeout=5000 "
