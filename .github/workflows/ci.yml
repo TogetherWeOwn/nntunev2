@@ -744,7 +744,7 @@ jobs:
           persist-credentials: false
       - name: Prove synthetic run authorization and fixed diagnostics
         run: exec python3 -B .github/scripts/test_database_bootstrap_admission.py
-      - name: Prove synthetic TLS, role isolation and teardown
+      - name: Prove the setup caller on disposable PostgreSQL
         id: bootstrap
         run: exec python3 -B .github/scripts/test_database_bootstrap_isolation.py
       - name: Require the post-teardown execution marker

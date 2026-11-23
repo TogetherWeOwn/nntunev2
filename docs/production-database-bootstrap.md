@@ -77,15 +77,12 @@ custody across the observation and creation window.
 ## Hosted execution candidate
 
 The [manual workflow](../.github/workflows/deploy-database-bootstrap.yml)
-is disabled at the job boundary and contains only an admission check. The
-existing [disposable CI job](../.github/workflows/ci.yml) exercises that
-check with generated pins and uses an isolated, ephemeral PostgreSQL server
-on the same standard Ubuntu runner class. It exercises verified TCP/TLS,
-wrong CA and hostname, separate creator and reader roles, private capture of
-command output and traces, and signal-driven disposal. It needs no Environment or real
-credentials. The fixture's private Docker network tests the client path.
-It supplies no evidence of specific public-origin reachability, provider
-role authority or actual deployment approval.
+is disabled at the job boundary. The [disposable CI job](../.github/workflows/ci.yml)
+runs the [setup caller](../.github/scripts/database_bootstrap_setup.py)
+on standard Ubuntu with generated authorization and an isolated PostgreSQL
+server. It checks admission, TLS, roles, fixed verdicts and interrupted
+grant rollback. Live reachability, managed role authority and deployment
+approval require protected readback.
 
 GitHub assigns these VMs without a region or static outbound IP guarantee.
 The documented provider direct endpoint uses a public TLS path on TCP 5432
@@ -134,8 +131,7 @@ and T0 code reviews are separate from this deployment approval.
    provisioning paths separately. A canceled or ambiguous attempt requires
    read-only reconciliation and fresh approval for any later run.
    [GitHub concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
-3. A separately reviewed live caller must validate the authorization in the
-   process that performs the work and consume the exact bytes it validates.
+3. The setup process consumes the exact bytes returned by admission.
    Keep the invoker and approver separate from SQL custody. Scope the writer
    to the setup step and the separate aggregate reader to the baseline path.
    The release task owns live role validation. Use no workflow inputs or
@@ -156,11 +152,37 @@ and T0 code reviews are separate from this deployment approval.
    Environment and secure custody, that the temporary roles are gone, and
    that their server sessions are closed. A hard kill can skip runner
    cleanup. Cancel the run, verify the final job state and hosted disposal,
-   revoke and terminate any surviving database sessions through the protected
-   custodian, and reconcile catalog and grant state before considering a new
-   attempt. An incomplete readback keeps the release closed.
+   revoke temporary authority and terminate surviving sessions through the
+   protected custodian. Read back target existence, connection fence,
+   ownership, effective grants and sibling isolation. An incomplete
+   readback keeps the release closed. A later run requires fresh approval.
    [Job cancellation](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-cancellation)
    · [Provider role management](https://planetscale.com/docs/postgres/connecting/roles)
+
+### Setup plan and enforced limits
+
+Version 1 is one UTF-8 JSON object with exactly `version`, `host`, `port`,
+`ca_pem`, `maintenance`, `launch`, `setup_role`, `owner_role`,
+`migrator_role` and `reader_role`. The caller checks the entire plan
+before connecting. It requires a single DNS name or IPv4 address, port
+5432, one PEM trust certificate, distinct roles and verified TLS. The
+password is separate. The catalog check requires a non-admin `CREATEDB`
+login expiring within the authorization, a loginless owner and a reader
+outside the writer roles. After fenced creation, one transaction revokes
+PUBLIC, admits the migrator and transfers ownership. Reader and serving
+grants and migrations use separate protected paths.
+
+Admission limits the event to 256 KiB, the decoded plan to 4 KiB and
+the remaining authorization to two hours. The caller accepts up to 1 KiB
+of password bytes, submits at most three fixed scripts of up to 4 KiB
+each, retains at most 64 stdout bytes per script and discards stderr.
+The shared client deadline is 60 seconds or the remaining authorization,
+whichever is shorter. GitHub caps the step at two minutes and the job at
+five. The client requests a three-second connect timeout. PostgreSQL
+receives 10-second statement, two-second lock and 15-second transaction
+timeouts. Server processing, wire bytes, provider metering and hard-kill
+session closure require separate evidence. A failure from the point of
+attempted creation is uncertain. The caller stops without retry or deletion.
 
 ### Snapshot and metering
 

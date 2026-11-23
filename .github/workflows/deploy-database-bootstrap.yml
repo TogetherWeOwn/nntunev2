@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   admit:
-    name: Admit first-launch database setup
+    name: Run authorized first-launch database setup
     # Deliberately disabled. Enabling this job requires a separate reviewed
     # change and a readback of the Environment before dispatch.
     if: >-
@@ -27,13 +27,16 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: Check private run authorization
+      - name: Apply the privately authorized database setup plan
+        timeout-minutes: 2
         env:
+          PATH: /usr/bin:/bin
           BOOTSTRAP_SHA: ${{ secrets.BOOTSTRAP_SHA }}
           BOOTSTRAP_RUN_ID: ${{ secrets.BOOTSTRAP_RUN_ID }}
           BOOTSTRAP_EXPIRY: ${{ secrets.BOOTSTRAP_EXPIRY }}
           BOOTSTRAP_PLAN_B64: ${{ secrets.BOOTSTRAP_PLAN_B64 }}
           BOOTSTRAP_PLAN_DIGEST: ${{ secrets.BOOTSTRAP_PLAN_DIGEST }}
+          BOOTSTRAP_SETUP_PASSWORD: ${{ secrets.BOOTSTRAP_SETUP_PASSWORD }}
           BOOTSTRAP_RUNNER_DEBUG: ${{ secrets.ACTIONS_RUNNER_DEBUG || vars.ACTIONS_RUNNER_DEBUG }}
           BOOTSTRAP_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG || vars.ACTIONS_STEP_DEBUG }}
-        run: exec python3 -IB .github/scripts/database_bootstrap_admission.py
+        run: exec python3 -EsB .github/scripts/database_bootstrap_setup.py

@@ -16,7 +16,7 @@ MAX_PLAN_BYTES = 4096
 MAX_WINDOW_SECONDS = 7200
 
 
-def authorized(env, event, now):
+def authorized_plan(env, event, now):
     sha = env.get("BOOTSTRAP_SHA", "")
     run_id = env.get("BOOTSTRAP_RUN_ID", "")
     expiry = env.get("BOOTSTRAP_EXPIRY", "")
@@ -43,29 +43,33 @@ def authorized(env, event, now):
         and re.fullmatch(r"[0-9a-f]{64}", digest)
         and 0 < len(encoded) <= 4 * ((MAX_PLAN_BYTES + 2) // 3)
     ):
-        return False
+        return None
     try:
         plan = base64.b64decode(encoded, validate=True)
     except ValueError:
-        return False
-    return (
+        return None
+    if (
         0 < len(plan) <= MAX_PLAN_BYTES
         and base64.b64encode(plan).decode("ascii") == encoded
         and hashlib.sha256(plan).hexdigest() == digest
-    )
+    ):
+        return plan
+    return None
 
 
-def main():
+def read_authorized_plan(env):
     if len(sys.argv) != 1:
-        return False
-    with open(os.environ["GITHUB_EVENT_PATH"], "rb") as source:
+        return None
+    with open(env["GITHUB_EVENT_PATH"], "rb") as source:
         raw = source.read(MAX_EVENT_BYTES + 1)
-    return len(raw) <= MAX_EVENT_BYTES and authorized(os.environ, json.loads(raw), time.time())
+    if len(raw) <= MAX_EVENT_BYTES:
+        return authorized_plan(env, json.loads(raw), time.time())
+    return None
 
 
 if __name__ == "__main__":
     try:
-        admitted = main()
+        admitted = read_authorized_plan(os.environ)
     except Exception:
         admitted = False
     if not admitted:
