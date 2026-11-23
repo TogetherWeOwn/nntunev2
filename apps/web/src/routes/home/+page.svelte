@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import {
 		browserStorage,
 		invalidateLibraryCache,
@@ -6,9 +7,11 @@
 		type LibraryItem
 	} from '#lib/library/cache.js';
 	import { favoritesKey, loadFavorites, selectFavoriteItems } from '#lib/library/favorites.js';
+	import { mountLibraryRefresher } from '#lib/library/mount-refresher.js';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import { loadRecentFinds, recentFindsKey } from '#lib/library/recent-finds.js';
 	import { createLibraryRefresher } from '#lib/library/refresh.js';
+	import RecentListens from './RecentListens.svelte';
 
 	// Home shows only the visitor's own data: their library snapshot, their
 	// favorites and their recent searches. Everything loads client-side with
@@ -20,6 +23,12 @@
 	let requiresSignIn = $state(false);
 	let accessRefused = $state(false);
 
+	let session: ReturnType<typeof browserStorage> = null;
+	const local = browserStorage('local');
+	let favoriteIds = $state<string[]>([]);
+	let recentQueries = $state<string[]>([]);
+	let readyRecentFindsKey: string | null = null;
+
 	const refresher = createLibraryRefresher({
 		sessionStorage: () => browserStorage('session'),
 		invalidateLibraryCache,
@@ -29,34 +38,44 @@
 			loadError = state.loadError;
 			libraryUnavailable = state.libraryUnavailable;
 			requiresSignIn = state.requiresSignIn;
-			accessRefused = update.authBoundary === true && !state.requiresSignIn;
+			accessRefused = update.authBoundary && !state.verificationSuspended && !state.requiresSignIn;
+			if (update.authBoundary) {
+				session = null;
+				favoriteIds = [];
+				readyRecentFindsKey = null;
+				recentQueries = [];
+			}
+			// Only a current successful listing may make its history scope ready.
+			void update.runIfCurrent?.(() => {
+				session = update.storageScope ?? null;
+				favoriteIds = loadFavorites(session, local);
+				readyRecentFindsKey = recentFindsKey(session);
+				recentQueries = loadRecentFinds(session, local);
+			});
 		}
 	});
 
-	const session = browserStorage('session');
-	const local = browserStorage('local');
-	let favoriteIds = $state(loadFavorites(session, local));
-	let recentQueries = $state(loadRecentFinds(session, local));
+	onMount(() => {
+		const unmountRefresher = mountLibraryRefresher(refresher);
+		// A null storage key means the area was cleared.
 
-	$effect(() => {
-		void refresher.refresh();
-		return () => refresher.dispose();
-	});
-
-	// Another tab's write leaves the Liked count and recent list stale until
-	// Home remounts; reload the changed list when its storage key changes
-	// (a null key means the area was cleared, so reload both lists).
-	$effect(() => {
 		const onStorage = (event: StorageEvent): void => {
 			if (event.key === null || event.key === favoritesKey(session)) {
 				favoriteIds = loadFavorites(session, local);
 			}
-			if (event.key === null || event.key === recentFindsKey(session)) {
+			if (
+				readyRecentFindsKey !== null &&
+				(event.key === null || event.key === readyRecentFindsKey) &&
+				readyRecentFindsKey === recentFindsKey(session)
+			) {
 				recentQueries = loadRecentFinds(session, local);
 			}
 		};
 		window.addEventListener('storage', onStorage);
-		return () => window.removeEventListener('storage', onStorage);
+		return () => {
+			window.removeEventListener('storage', onStorage);
+			unmountRefresher();
+		};
 	});
 
 	const preview = $derived(items.slice(0, 5));
@@ -106,6 +125,8 @@
 		{/if}
 	</section>
 
+	<RecentListens />
+
 	{#if liked.length > 0}
 		<section aria-labelledby="home-liked-heading">
 			<h2 id="home-liked-heading">Liked ({liked.length})</h2>
@@ -113,7 +134,7 @@
 		</section>
 	{/if}
 
-	{#if recentQueries.length > 0}
+	{#if !loading && !loadError && !libraryUnavailable && recentQueries.length > 0}
 		<section aria-labelledby="home-recent-heading">
 			<h2 id="home-recent-heading">Recent searches</h2>
 			<ul>

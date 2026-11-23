@@ -35,14 +35,21 @@ test('keyboard Retry resumes real audio on the same decoder without automatic or
 	const { audio, status, retry, pause } = await openPlayer(page);
 	try {
 		await expect(retry).toBeEnabled();
+		const speed = page.getByRole('combobox', { name: 'Playback speed', exact: true });
+		await speed.selectOption('0.5');
 		const node = (await audio.elementHandle())!;
 		await node.evaluate((element: HTMLAudioElement) => {
+			element.playbackRate = 0.25;
+			const play = element.play.bind(element);
+			element.play = () => { element.dataset.playRate = String(element.playbackRate); return play(); };
 			const load = element.load.bind(element);
 			element.load = () => {
 				element.dataset.loads = String(Number(element.dataset.loads ?? '0') + 1);
 				load();
+				element.playbackRate = 1; // Make the reload reset explicit in the fixture.
 			};
 		});
+		await expect(speed).toHaveValue('0.25');
 		expect(await node.evaluate((el: HTMLAudioElement) => !!el.error)).toBe(true);
 		expect(retryRequests).toBe(0);
 		await retry.press('Enter');
@@ -52,8 +59,16 @@ test('keyboard Retry resumes real audio on the same decoder without automatic or
 		await expect(retry).toBeFocused();
 		await page.keyboard.press('Enter');
 		await expect(audio).toHaveAttribute('data-loads', '1');
+		await page.keyboard.press('Shift+Slash');
+		await expect(page.getByTestId('shortcuts-close')).toBeFocused();
+		await page.keyboard.press('Escape');
+		await expect(page.getByTestId('shortcuts-button')).toBeFocused();
+		await retry.focus();
 		release.resolve();
 		await expect(status).toHaveText('Playing');
+		await expect(audio).toHaveAttribute('data-play-rate', '0.25');
+		await expect(audio).toHaveJSProperty('playbackRate', 0.25);
+		expect(await page.evaluate(() => localStorage.getItem('nntune:playback-speed:v1'))).toBe('0.5');
 		await expect(pause).toBeFocused();
 		await expect.poll(() => node.evaluate((el: HTMLAudioElement) => el.currentTime)).toBeGreaterThan(0.2);
 		expect(await node.evaluate((el: HTMLAudioElement) =>

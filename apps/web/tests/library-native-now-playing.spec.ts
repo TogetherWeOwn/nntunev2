@@ -1,8 +1,8 @@
 import { expect, test as base, type Page, type TestInfo } from '@playwright/test';
-import { createServer } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import type { QueueState, Track } from '../src/lib/player/queue.js';
 import type {} from './fixtures/library-now-playing/mount.js';
+import { withIsolatedViteFixture } from './vite-fixture.helpers.js';
 
 /**
  * LIBNOWPLAY — native library player identity acceptance, tests-only handoff.
@@ -50,8 +50,9 @@ const routePath = decodeURIComponent(new URL('../src/routes/library/+page.svelte
 const webRoot = decodeURIComponent(new URL('../', import.meta.url).pathname);
 const test = base.extend<{ libraryPage: Page }, { libraryOrigin: string }>({
 	libraryOrigin: [async ({}, use) => {
-		const server = await createServer({
+		await withIsolatedViteFixture({
 			configFile: false,
+			mode: 'browser-fixtures',
 			root: decodeURIComponent(new URL('./fixtures/library-now-playing/', import.meta.url).pathname),
 			publicDir: false,
 			resolve: { alias: {
@@ -68,13 +69,7 @@ const test = base.extend<{ libraryPage: Page }, { libraryOrigin: string }>({
 				}
 			}, svelte({ configFile: false, compilerOptions: { runes: true } })],
 			server: { host: '127.0.0.1', port: 0, fs: { allow: [webRoot] } }
-		});
-		try {
-			await server.listen();
-			const address = server.httpServer?.address();
-			if (!address || typeof address === 'string') throw new Error('no fixture TCP address');
-			await use(`http://127.0.0.1:${address.port}`);
-		} finally { await server.close(); }
+		}, use);
 	}, { scope: 'worker' }],
 	libraryPage: async ({ page, libraryOrigin }, use) => {
 		await localOnly(page, libraryOrigin);

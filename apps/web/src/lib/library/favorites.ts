@@ -13,8 +13,8 @@
  */
 
 import {
-	LIBRARY_AUTH_CONTEXT_KEY,
 	LIBRARY_FAVORITES_KEY,
+	libraryContextKey,
 	purgeFavorites,
 	withFavoritesLock,
 	type SnapshotStorage
@@ -22,13 +22,7 @@ import {
 
 /** Scoped favorites key for the current auth context, or null without one. */
 export function favoritesKey(session: SnapshotStorage | null): string | null {
-	if (!session) return null;
-	try {
-		const context = session.getItem(LIBRARY_AUTH_CONTEXT_KEY);
-		return context ? `${LIBRARY_FAVORITES_KEY}.${context}` : null;
-	} catch {
-		return null;
-	}
+	return libraryContextKey(session, LIBRARY_FAVORITES_KEY);
 }
 
 function isStoredId(value: unknown): value is string {
@@ -73,12 +67,12 @@ export async function updateStoredFavorites(
 	local: SnapshotStorage | null,
 	key: string | null,
 	update: (latest: string[]) => readonly string[],
-	verify?: () => Promise<boolean>
+	verify?: () => Promise<boolean>,
+	runIfCurrent?: <T>(commit: () => T) => Promise<T | undefined>
 ): Promise<string[] | null> {
 	if (!local || !key || favoritesKey(session) !== key) return null;
-	return withFavoritesLock(key, async () => {
+	const commit = () => {
 		if (favoritesKey(session) !== key) return null;
-		if (verify && (!(await verify()) || favoritesKey(session) !== key)) return null;
 		const raw = local.getItem(key);
 		const parsed: unknown = raw === null ? [] : JSON.parse(raw);
 		if (!Array.isArray(parsed) || !parsed.every(isStoredId)) return null;
@@ -88,6 +82,10 @@ export async function updateStoredFavorites(
 		const encoded = JSON.stringify(committed);
 		if (encoded !== JSON.stringify(latest)) local.setItem(key, encoded);
 		return committed;
+	};
+	return withFavoritesLock(key, async () => {
+		if (favoritesKey(session) !== key || (verify && !(await verify()))) return null;
+		return runIfCurrent ? (await runIfCurrent(commit)) ?? null : commit();
 	});
 }
 

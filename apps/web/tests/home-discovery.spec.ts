@@ -54,9 +54,44 @@ test('Home previews up to five catalogue rows in order and links to Search', asy
 	expect(catalogueRequests).toBe(1);
 	await shelf.getByRole('link', { name: 'Search your library' }).click();
 	await expect(page).toHaveURL(/\/search$/);
-	await page.getByLabel('Search your library').fill('Charlie');
-	await page.getByRole('search').getByRole('button', { name: 'Search' }).click();
-	await expect(page.getByRole('main').getByRole('listitem')).toHaveText('Charlie — Example Artist');
+
+	const main = page.getByRole('main');
+	const topBarSearch = page
+		.getByTestId('shell-topbar')
+		.getByRole('search', { name: 'Top bar', exact: true });
+	const librarySearch = main.getByRole('search', { name: 'Search your library', exact: true });
+	await expect(page.getByRole('search')).toHaveCount(2);
+	await expect(topBarSearch).toBeVisible();
+	await expect(librarySearch).toBeVisible();
+
+	await expect(main.getByText('Type above to search your library by title or artist.')).toBeVisible();
+	const status = main.getByRole('status');
+	await expect(status).toBeEmpty();
+	const mountedStatus = await status.elementHandle();
+	const field = librarySearch.getByRole('searchbox', { name: 'Search your library' });
+	const results = main.getByRole('listitem');
+	await field.fill('Charlie');
+	await librarySearch.getByRole('button', { name: 'Search', exact: true }).click();
+	await expect(page).toHaveURL('/search?q=Charlie');
+	await expect(status).toHaveText('1 result for “Charlie”.');
+	await expect(results).toHaveText('Charlie — Example Artist');
+	expect(await status.evaluate((current, original) => current === original, mountedStatus)).toBe(true);
+
+	await field.fill('No such track');
+	await expect(page).toHaveURL('/search?q=Charlie');
+	await expect(status).toHaveText('1 result for “Charlie”.');
+	await field.press('Enter');
+	await expect(status).toHaveText('No results for “No such track”.');
+	await expect(results).toHaveCount(0);
+	expect(await status.evaluate((current, original) => current === original, mountedStatus)).toBe(true);
+
+	const topBarField = topBarSearch.getByRole('searchbox', { name: 'Search', exact: true });
+	await topBarField.fill('Example Artist');
+	await topBarField.press('Enter');
+	await expect(field).toHaveValue('Example Artist');
+	await expect(status).toHaveText('6 results for “Example Artist”.');
+	await expect(results).toHaveCount(6);
+	expect(await status.evaluate((current, original) => current === original, mountedStatus)).toBe(true);
 });
 
 for (const { status, message, action } of [
@@ -82,7 +117,18 @@ for (const { status, message, action } of [
 	});
 }
 
-test('Home shows loading and recovers from a transient catalogue failure', async ({ page }) => {
+test('Home keeps scoped recent searches hidden until a successful Retry', async ({ page }) => {
+	const context = 'home-discovery-retry';
+	const key = `nntune.library.recent-finds.v1.${context}`;
+	const recent = page.getByRole('region', { name: 'Recent searches' });
+	await page.addInitScript(({ context, key }) => {
+		sessionStorage.setItem('nntune.library.auth-context.v1', context);
+		localStorage.setItem(key, JSON.stringify(['Zulu & Echo']));
+	}, { context, key });
+	const deliverHistoryChange = (query: string) => page.evaluate(({ key, query }) => {
+		localStorage.setItem(key, JSON.stringify([query]));
+		window.dispatchEvent(new StorageEvent('storage', { key, storageArea: localStorage }));
+	}, { key, query });
 	const shelf = discovery(page);
 	await page.route('**/api/library', (route) => route.fulfill({ json: [rows[0]] }));
 	await page.route(
@@ -91,6 +137,9 @@ test('Home shows loading and recovers from a transient catalogue failure', async
 			await expect(shelf.getByRole('status')).toHaveText('Loading your library…');
 			await expect(shelf.getByRole('listitem')).toHaveCount(0);
 			await expect(shelf.getByRole('link', { name: 'Search your library' })).toHaveCount(0);
+			await expect(recent).toHaveCount(0);
+			await deliverHistoryChange('Pending query');
+			await expect(recent).toHaveCount(0);
 			await route.fulfill({ status: 503, body: '' });
 		},
 		{ times: 1 }
@@ -100,7 +149,16 @@ test('Home shows loading and recovers from a transient catalogue failure', async
 	await expect(shelf.getByRole('alert')).toContainText('Could not load your library');
 	await expect(shelf.getByRole('listitem')).toHaveCount(0);
 	await expect(shelf.getByRole('link', { name: 'Search your library' })).toHaveCount(0);
+	await expect(recent).toHaveCount(0);
+	await deliverHistoryChange('Retry & match');
+	await expect(recent).toHaveCount(0);
+
 	await shelf.getByRole('button', { name: 'Retry' }).click();
 	await expect(shelf.getByRole('listitem')).toHaveText('Zulu — Example Artist');
 	await expect(shelf.getByRole('alert')).toHaveCount(0);
+	await expect(recent.getByRole('link', { name: 'Retry & match' })).toHaveAttribute(
+		'href', '/search?q=Retry%20%26%20match'
+	);
+	await deliverHistoryChange('Updated query');
+	await expect(recent.getByRole('link')).toHaveText('Updated query');
 });

@@ -14,7 +14,7 @@ const coral = {
 	streamUrl: '/api/demo/audio?track=coral'
 };
 
-async function openWithSystemControls(page: Page) {
+async function openWithSystemControls(page: Page, items = [coral]) {
 	await page.addInitScript(() => {
 		const handlers: Probe['handlers'] = {};
 		window.__librarySystemTransport = { handlers, retired: {}, retiredPlays: 0 };
@@ -25,7 +25,7 @@ async function openWithSystemControls(page: Page) {
 			}, configurable: true
 		});
 	});
-	await page.route('**/api/library', (route) => route.fulfill({ json: [coral] }));
+	await page.route('**/api/library', (route) => route.fulfill({ json: items }));
 	await page.goto(`/library?track=${coral.id}&t=2`);
 	await expect(page.getByTestId('audio-player')).toBeVisible();
 	await expect.poll(() => page.evaluate(() => {
@@ -38,7 +38,7 @@ async function openWithSystemControls(page: Page) {
 	});
 }
 
-const systemAction = (page: Page, action: 'play' | 'pause') =>
+const systemAction = (page: Page, action: 'play' | 'pause' | 'nexttrack' | 'previoustrack') =>
 	page.evaluate((key) => window.__librarySystemTransport.handlers[key]!(), action);
 
 test('system Play and Pause control the same native decoder after leaving Library', async ({ page }) => {
@@ -79,6 +79,84 @@ test('system Play and Pause control the same native decoder after leaving Librar
 		const { play, pause } = window.__librarySystemTransport.handlers;
 		return [navigator.mediaSession.metadata, play, pause];
 	})).toEqual([null, null, null]);
+});
+
+test('system Previous and Next navigate the persistent queue without autoplay', async ({ page }) => {
+	const second = { ...coral, id: 'system-second', title: 'System Second', streamUrl: '/api/demo/audio?track=second-signal' };
+	await openWithSystemControls(page, [coral, second]);
+	await page.getByTestId('library-item').and(page.locator(`[data-id="${second.id}"]`)).click();
+	await expect(page.getByTestId('queue-item')).toHaveCount(2);
+	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).click();
+	await expect(page).toHaveURL(/\/home$/);
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+
+	const native = page.getByTestId('audio-player');
+	const firstAudio = (await native.elementHandle())!;
+	await systemAction(page, 'previoustrack');
+	expect(await firstAudio.evaluate((el) => el.isConnected && (el as HTMLAudioElement).paused)).toBe(true);
+
+	await systemAction(page, 'nexttrack');
+	await expect(native).toHaveAttribute('src', second.streamUrl);
+	await expect(native).toHaveJSProperty('paused', true);
+	const title = () => page.evaluate(() => navigator.mediaSession.metadata?.title);
+	await expect.poll(title).toBe(second.title);
+	const secondAudio = (await native.elementHandle())!;
+	await page.evaluate(() => window.__librarySystemTransport.retired.previoustrack!());
+	await expect(native).toHaveAttribute('src', second.streamUrl);
+
+	await systemAction(page, 'play');
+	const status = page.getByRole('region', { name: 'Player', exact: true }).getByRole('status');
+	await expect(status).toHaveText('Playing');
+	await systemAction(page, 'nexttrack');
+	expect(await secondAudio.evaluate((el) => el.isConnected && !(el as HTMLAudioElement).paused)).toBe(true);
+
+	await systemAction(page, 'previoustrack');
+	await expect(native).toHaveAttribute('src', coral.streamUrl);
+	await expect(status).toHaveText('Paused');
+	await expect(native).toHaveJSProperty('paused', true);
+	expect(await secondAudio.evaluate((el) => !el.isConnected && (el as HTMLAudioElement).paused)).toBe(true);
+	await expect.poll(title).toBe(coral.title);
+	await expect(page.locator('audio')).toHaveCount(1);
+
+	const afterPurge = await page.evaluate(() => {
+		const { handlers } = window.__librarySystemTransport;
+		const { nexttrack, previoustrack } = handlers;
+		window.dispatchEvent(new StorageEvent('storage', { key: 'nntune.library.auth-transition.v1' }));
+		nexttrack!();
+		previoustrack!();
+		return [navigator.mediaSession.metadata, handlers.nexttrack, handlers.previoustrack];
+	});
+	expect(afterPurge).toEqual([null, null, null]);
+	await expect(native).toHaveCount(0);
+});
+
+test('system Next resolves a bulk-added source and keeps the live decoder for an unavailable slot', async ({ page }) => {
+	const second = { ...coral, id: 'system-second', title: 'System Second', streamUrl: '/api/demo/audio?track=second-signal' };
+	const unavailable = { ...coral, id: 'system-unavailable', title: 'System Unavailable', streamUrl: '' };
+	await openWithSystemControls(page, [coral, second, unavailable]);
+	await page.getByRole('button', { name: 'Add displayed tracks to queue', exact: true }).click();
+	await expect.poll(() => page.getByTestId('queue-item').evaluateAll(
+		(rows) => rows.map((row) => row.getAttribute('data-track-id'))
+	)).toEqual([coral.id, second.id, unavailable.id]);
+	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).click();
+	await expect(page).toHaveURL(/\/home$/);
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+
+	const native = page.getByTestId('audio-player');
+	await systemAction(page, 'nexttrack');
+	await expect(native).toHaveAttribute('src', second.streamUrl);
+	await expect(native).toHaveJSProperty('paused', true);
+	const title = () => page.evaluate(() => navigator.mediaSession.metadata?.title);
+	await expect.poll(title).toBe(second.title);
+
+	const secondAudio = (await native.elementHandle())!;
+	await systemAction(page, 'nexttrack');
+	expect(await secondAudio.evaluate((el) => el.isConnected && (el as HTMLAudioElement).paused)).toBe(true);
+	expect(await title()).toBe(second.title);
+	await systemAction(page, 'previoustrack');
+	await expect(native).toHaveAttribute('src', coral.streamUrl);
+	await expect(native).toHaveJSProperty('paused', true);
+	await expect.poll(title).toBe(coral.title);
 });
 
 for (const path of ['/pricing', '/demo/player']) {

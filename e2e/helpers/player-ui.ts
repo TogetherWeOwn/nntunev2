@@ -1,5 +1,5 @@
 import type { Locator, Page } from '@playwright/test';
-import { PENDING_TESTIDS } from './contract.js';
+import { PENDING_TESTIDS, TESTIDS } from './contract.js';
 
 /**
  * Player-UI actions for the player-contract migration.
@@ -110,15 +110,15 @@ export function seekProofFailure(
 
 /**
  * Choose the seek surface the user would find: the custom seek slider wins
- * when present; the native timeline is only usable while `controls` is
+ * when visible and enabled; the native timeline is only usable while `controls` is
  * rendered. Returns null when neither exists — the caller must fail by
  * name (via {@link seekSurfaceFailure}) rather than fake the seek.
  */
 export function chooseSeekSurface(
-  seekSliderVisible: boolean,
+  seekSliderUsable: boolean,
   nativeControlsPresent: boolean,
 ): SeekSurface | null {
-  if (seekSliderVisible) return 'custom';
+  if (seekSliderUsable) return 'custom';
   if (nativeControlsPresent) return 'native';
   return null;
 }
@@ -129,7 +129,7 @@ export function seekSurfaceFailure(
   nativeControlsPresent: boolean,
 ): string {
   return (
-    'No seekable player UI: the custom player-seek slider is absent ' +
+    'No seekable player UI: the custom player-seek slider is unavailable ' +
     `(visible=${seekSliderVisible}) and the audio element renders no native ` +
     `controls (controls=${nativeControlsPresent}) — a non-seekable player ` +
     'cannot pass the play/seek milestone'
@@ -223,8 +223,8 @@ export async function togglePlayViaPlayerUi(page: Page, player: Locator): Promis
 /**
  * Seek to `fraction` of the duration through the player UI and return the
  * player state after the click. The click is a real pointer press at the
- * proportional position — on the `player-seek` slider when the custom bar
- * is present, otherwise on the native `<audio controls>` timeline —
+ * proportional position — on the `player-seek` slider when it
+ * is enabled, otherwise on the native `<audio controls>` timeline —
  * identical in kind to what a user clicking the bar does. Never sets
  * `currentTime` directly. Fails by name when no seekable control exists.
  * Seek PROOF is the caller's job (see {@link seekProofFailure}).
@@ -234,13 +234,14 @@ export async function seekViaPlayerUi(
   player: Locator,
   fraction: number,
 ): Promise<SeekTarget> {
-  const slider = page.getByTestId(PENDING_TESTIDS.playerSeek);
+  const slider = page.getByTestId(TESTIDS.playerSeek);
   const sliderVisible =
     (await slider.count()) > 0 ? await slider.isVisible() : false;
+  const sliderEnabled = sliderVisible && (await slider.isEnabled());
   const hasControls = await player.evaluate((el) => (el as HTMLAudioElement).controls);
-  const surface = chooseSeekSurface(sliderVisible, hasControls);
+  const surface = chooseSeekSurface(sliderEnabled, hasControls);
   if (surface === null) {
-    throw new Error(seekSurfaceFailure(sliderVisible, hasControls));
+    throw new Error(`${seekSurfaceFailure(sliderVisible, hasControls)} Custom slider enabled=${sliderEnabled}.`);
   }
   const target: SeekTarget = { fraction, surface };
   const seekControl = surface === 'custom' ? slider : player;

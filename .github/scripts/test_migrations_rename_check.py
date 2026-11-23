@@ -689,7 +689,7 @@ class GitFixture(unittest.TestCase):
         return {"number": 1, "repository": metadata["base"]["repo"], "pull_request": metadata}
 
     def run_workflow(self, pages, metadata, api_exit=0, *, samples=None, event=None,
-                     missing_code=False, poison=False, reviewed_unapplied=None):
+                     missing_code=False, poison=False, reviewed_unapplied=None, integration_base=None):
         from test_ci_pnpm_retry import split_jobs, split_steps, step_field
 
         source = pathlib.Path(__file__).resolve().parents[2]
@@ -749,7 +749,7 @@ class GitFixture(unittest.TestCase):
         stub.chmod(0o755)
         env = {**os.environ, "PATH": str(api) + os.pathsep + os.environ["PATH"],
                "BASH_ENV": "/dev/null", "RUNNER_TEMP": str(api), "REPO": "example/project", "PR_NUMBER": "1",
-               "BASE_SHA": self.base, "HEAD_SHA": self.git("rev-parse", "HEAD"),
+               "BASE_SHA": integration_base or self.base, "HEAD_SHA": self.git("rev-parse", "HEAD"),
                "GITHUB_WORKSPACE": str(workspace), "GITHUB_EVENT_PATH": str(api / "event.json"),
                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
                "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "core.hooksPath",
@@ -841,6 +841,68 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(outcomes["effective"]["base"], advanced)
         self.assertEqual(outcomes["event"]["merge_base"], self.base)
         self.assertEqual(outcomes["effective"]["merge_base"], self.base)
+
+    def test_workflow_requires_api_and_event_ancestry_of_tested_base(self):
+        pages, original = self.workflow_inputs()
+        head = original["head"]["sha"]
+        self.git("checkout", "-qb", "integration-base", self.base)
+        (self.root / "README.md").write_text("independent base advance\n")
+        tested_base = self.commit("tested first parent")
+        self.git("checkout", "--detach", head)
+        live = copy.deepcopy(original)
+        live["base"]["sha"] = tested_base
+        result = self.run_workflow(pages, live, integration_base=tested_base)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+        self.assertEqual(self.base, outcomes["event"]["base"])
+        self.assertEqual(tested_base, outcomes["effective"]["base"])
+
+        rewound = self.run_workflow(pages, original, integration_base=tested_base)
+        self.assertEqual(1, rewound.returncode, rewound.stdout + rewound.stderr)
+        self.assertIn("not a descendant", rewound.stderr)
+        event = self.event(self.full_metadata(original))
+        event["pull_request"]["base"]["sha"] = head
+        divergent = self.run_workflow(pages, live, event=event, integration_base=tested_base)
+        self.assertEqual(1, divergent.returncode, divergent.stdout + divergent.stderr)
+        self.assertIn("not a descendant", divergent.stderr)
+
+    def test_staging_resolver_loads_only_the_first_parent_blob(self):
+        workflow = pathlib.Path(__file__).resolve().parents[1] / "workflows/migrations-staging.yml"
+        step = workflow.read_text().split("      - name: Resolve commits with trusted first-parent code")[1]
+        command = textwrap.dedent(step.split("        run: |\n", 1)[1].split("      - name:")[0])
+        resolver = self.root / ".github/scripts/migrations_base.py"
+        resolver.parent.mkdir(parents=True)
+        shutil.copyfile(pathlib.Path(__file__).with_name(resolver.name), resolver)
+        base = self.commit("trusted resolver")
+        self.git("checkout", "-qb", "feature")
+        resolver.write_text("raise RuntimeError('untrusted resolver must not run')\n")
+        head = self.commit("feature modifies resolver")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "--no-ff", "-qm", "integration", head)
+        merge = self.git("rev-parse", "HEAD")
+        with tempfile.TemporaryDirectory() as scratch:
+            workspace = pathlib.Path(scratch)
+            (workspace / "pr-data").symlink_to(self.root, target_is_directory=True)
+            event, output = workspace / "event.json", workspace / "output"
+            event.write_text(json.dumps({"pull_request": {
+                "base": {"sha": self.base}, "head": {"sha": head},
+            }}))
+            env = {**os.environ, "GITHUB_WORKSPACE": scratch, "GITHUB_OUTPUT": str(output),
+                   "GITHUB_SHA": merge, "GITHUB_EVENT_NAME": "pull_request",
+                   "GITHUB_REF": "refs/pull/1/merge", "GITHUB_EVENT_PATH": str(event)}
+
+            def run():
+                return subprocess.run(["bash", "-eo", "pipefail", "-c", command], cwd=workspace,
+                                      env=env, capture_output=True, text=True, timeout=30)
+
+            result = run()
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(f"merge_sha={merge}\nbase_sha={base}\nhead_sha={head}\n", output.read_text())
+            trusted_blob = self.git("rev-parse", f"{base}:.github/scripts/migrations_base.py")
+            (self.root / ".git/objects" / trusted_blob[:2] / trusted_blob[2:]).unlink()
+            result = run()
+            self.assertNotEqual(0, result.returncode)
+            self.assertEqual(f"merge_sha={merge}\nbase_sha={base}\nhead_sha={head}\n", output.read_text())
 
     def unapplied_restack(self, *, duplicate=False):
         manifest_path = self.root / "migrations/manifest.toml"
@@ -1283,29 +1345,38 @@ class WorkflowBoundary(unittest.TestCase):
     def test_separate_immutable_code_and_data_pins(self):
         workflow = (pathlib.Path(__file__).resolve().parents[1] /
                     "workflows/migrations-staging.yml").read_text()
-        code, data = workflow.split("      - name: Check out pinned PR evidence")
-        self.assertIn("ref: ${{ github.event.pull_request.base.sha }}", code)
-        self.assertIn("path: trusted-checker", code)
-        self.assertIn("ref: ${{ github.event.pull_request.head.sha }}", data)
+        prefix, data = workflow.split("      - name: Check out pinned integration evidence")
+        data, resolve = data.split("      - name: Resolve commits with trusted first-parent code")
+        resolve, code = resolve.split("      - name: Check out trusted checker")
+        code, select = code.split("      - name: Select the pinned source head for evidence")
+        select, collect = select.split("      - name: Collect pinned PR API evidence")
+        collect, check = collect.split("      - name: Check migration rename history")
+        self.assertIn("ref: ${{ github.sha }}", data)
         self.assertIn("path: pr-data", data)
         self.assertIn("fetch-depth: 0", data)
+        self.assertIn("id: commits", resolve)
+        self.assertIn('"$GITHUB_SHA^1:.github/scripts/migrations_base.py"', resolve)
+        self.assertIn('python3 -I - --root "$GITHUB_WORKSPACE/pr-data"', resolve)
+        self.assertIn("ref: ${{ steps.commits.outputs.base_sha }}", code)
+        self.assertIn("path: trusted-checker", code)
+        self.assertIn('checkout --detach "$HEAD_SHA"', select)
+        self.assertIn("HEAD_SHA: ${{ steps.commits.outputs.head_sha }}", select)
         self.assertEqual(workflow.count("persist-credentials: false"), 2)
-        collect = data.split("      - name: Collect pinned PR API evidence")[1].split(
-            "      - name: Check migration rename history")[0]
-        self.assertIn("working-directory: ${{ runner.temp }}", collect)
+        for step in (resolve, select, collect, check):
+            self.assertIn("GIT_CONFIG_GLOBAL: /dev/null", step)
+        self.assertIn("GIT_CONFIG_KEY_0: core.hooksPath", prefix)
+        self.assertIn("GIT_CONFIG_KEY_1: core.fsmonitor", prefix)
+        for step in (collect, check):
+            self.assertIn("working-directory: ${{ runner.temp }}", step)
+            self.assertIn('"$GITHUB_WORKSPACE/trusted-checker/.github/scripts"', step)
+            self.assertIn('--root "$GITHUB_WORKSPACE/pr-data"', step)
+            self.assertIn('--event-file "$GITHUB_EVENT_PATH"', step)
+            self.assertIn("--integration-base", step)
+            self.assertIn("BASE_SHA: ${{ steps.commits.outputs.base_sha }}", step)
+            self.assertIn("HEAD_SHA: ${{ steps.commits.outputs.head_sha }}", step)
         self.assertIn("python3 -I -c", collect)
-        self.assertIn('"$GITHUB_WORKSPACE/trusted-checker/.github/scripts"', collect)
-        self.assertIn('--event-file "$GITHUB_EVENT_PATH"', collect)
-        self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha }}", collect)
-        self.assertIn("HEAD_SHA: ${{ github.event.pull_request.head.sha }}", collect)
-        self.assertIn("GIT_CONFIG_GLOBAL: /dev/null", collect)
-        check = workflow.split("      - name: Check migration rename history")[1]
-        self.assertIn("working-directory: ${{ runner.temp }}", check)
         self.assertIn('python3 -I - "$GITHUB_WORKSPACE/trusted-checker/.github/scripts"', check)
-        self.assertIn('--root "$GITHUB_WORKSPACE/pr-data"', check)
-        self.assertIn("GIT_CONFIG_GLOBAL: /dev/null", check)
-        self.assertIn("GIT_CONFIG_KEY_0: core.hooksPath", check)
-        self.assertIn("GIT_CONFIG_KEY_1: core.fsmonitor", check)
+        self.assertNotIn("GH_TOKEN", resolve)
         self.assertNotIn("GH_TOKEN", check)
         self.assertNotIn("secrets.", check)
         self.assertNotIn("pull_request_target", workflow)

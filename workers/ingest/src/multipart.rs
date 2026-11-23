@@ -2,12 +2,16 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use nntune_core::media::{ciphertext_size, Header, HEADER_SIZE, PLAIN_CHUNK_SIZE, TAG_SIZE};
+use nntune_core::media_envelope::EnvelopeContext;
 use nntune_core::origin_sealer::{SealedChunk, MAX_NEW_PLAINTEXT};
+use nntune_core::s3_locator::{S3Binding, S3Locator, S3MediaMetadata};
 use sha2::{Digest, Sha256};
 use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 
 pub mod head_receipt;
+pub mod readback_inventory;
 pub mod resume_checkpoint;
+pub mod sidecar;
 
 pub const PART_BYTES: usize = 5_244_160;
 pub const MAX_COMPLETION_BODY: usize = 16 * 1024;
@@ -20,6 +24,8 @@ pub enum MultipartError {
     CompletionBody,
     EmbeddedError,
     Checksum,
+    CompletionIdentity,
+    CompletionVersion,
 }
 
 type Result<T> = std::result::Result<T, MultipartError>;
@@ -189,6 +195,26 @@ pub struct Completion<'a> {
     checksum: String,
 }
 
+/// One response to the exact completion request. The transport supplies the
+/// configuration it used, not a value taken from a response header or the caller.
+/// Pass raw `x-amz-version-id` occurrences from this response, not a HEAD or GET.
+pub struct VersionedCompletionReply<'a> {
+    pub configuration: [u8; 16],
+    pub status: u16,
+    pub body: &'a [u8],
+    pub version_headers: &'a [&'a str],
+}
+
+/// Media portion of a completed inventory. Does not establish sidecar
+/// completion, byte validity, provider qualification, or publication authority.
+pub struct CompletedVersionedMedia(S3MediaMetadata);
+
+impl CompletedVersionedMedia {
+    pub fn metadata(&self) -> &S3MediaMetadata {
+        &self.0
+    }
+}
+
 impl<'a> Completion<'a> {
     /// Target and exact total ciphertext length for the completion request.
     pub fn object(&self) -> (UploadTarget<'a>, u64) {
@@ -204,6 +230,52 @@ impl<'a> Completion<'a> {
 
     /// Verify the bounded receipt's composite checksum and any included bucket/key.
     pub fn verify_reply(&self, status: u16, body: &[u8]) -> Result<()> {
+        self.verify_reply_target(status, body).map(|_| ())
+    }
+
+    /// Capture the exact version returned by a successful multipart completion.
+    /// The caller must dispatch this plan against the authorized configuration
+    /// and supply the unmodified response for that request with a trusted intent.
+    pub fn verify_versioned_reply(
+        &self,
+        context: &EnvelopeContext,
+        reply: VersionedCompletionReply<'_>,
+    ) -> Result<CompletedVersionedMedia> {
+        use MultipartError::{CompletionIdentity, CompletionVersion};
+        if reply.configuration != context.identities[5]
+            || self.plan.header != context.header
+            || self.plan.plaintext_len != context.plaintext_len
+            || !self.verify_reply_target(reply.status, reply.body)?
+        {
+            return Err(CompletionIdentity);
+        }
+        let [version] = reply.version_headers else {
+            return Err(CompletionVersion);
+        };
+        // Bound the allocation and refuse coalesced field values. Do not trim,
+        // decode or replace an opaque version (including with an ETag).
+        if version.len() > 1024 || version.contains(',') {
+            return Err(CompletionVersion);
+        }
+        let (target, ciphertext_len) = self.object();
+        let locator = S3Locator::new(
+            target.bucket.into(),
+            target.key.into(),
+            S3Binding::VersionId((*version).into()),
+        )
+        .map_err(|error| match error {
+            nntune_core::s3_locator::S3LocatorError::Binding => CompletionVersion,
+            _ => CompletionIdentity,
+        })?;
+        S3MediaMetadata::from_trusted_context(locator, context)
+            .filter(|metadata| metadata.ciphertext_len() == ciphertext_len)
+            .map(CompletedVersionedMedia)
+            .ok_or(CompletionIdentity)
+    }
+
+    // Returns whether both target fields were present, in addition to the
+    // existing checksum and identity checks applied to all replies.
+    fn verify_reply_target(&self, status: u16, body: &[u8]) -> Result<bool> {
         if status != 200 {
             return Err(MultipartError::CompletionStatus);
         }
@@ -275,7 +347,7 @@ impl<'a> Completion<'a> {
                 Characters(_) if depth == 2 => {}
                 StartDocument { .. } | Whitespace(_) => {}
                 EndElement { .. } => depth -= 1,
-                EndDocument => return matched.then_some(()).ok_or(Checksum),
+                EndDocument => return matched.then_some(saw_bucket && saw_key).ok_or(Checksum),
                 _ => return Err(CompletionBody),
             }
         }

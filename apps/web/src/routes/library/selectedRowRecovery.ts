@@ -11,6 +11,6 @@ export function selectedRowRecoveryIds(
 			: (displayedIds.slice(removedIndex + 1).find((id) => survivors.has(id)) ?? null),
 		previousId: removedIndex <= 0
 			? null
-			: ([...displayedIds.slice(0, removedIndex)].reverse().find((id) => survivors.has(id)) ?? null)
+			: (displayedIds.slice(0, removedIndex).findLast((id) => survivors.has(id)) ?? null)
 	};
 }

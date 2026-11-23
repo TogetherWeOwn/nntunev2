@@ -2,11 +2,21 @@
 
 ## Role
 
-First-pass review in English. Find defects this PR introduces or makes
-reachable. Your check is one of the required checks in `CONTRIBUTING.md`;
-together with fixed or answered findings they are the merge gate. Do not approve,
-merge, enable auto-merge, edit code, or start fix sessions. This file guides
-analysis only; it is not a permission boundary.
+Review in English. Find defects this PR introduces or makes reachable.
+The task thread commissions independent read-only review according to
+[the review tier](CONTRIBUTING.md#merge-policy). Review the supplied full PR
+head SHA and its diff against the base independently before sharing findings.
+Verify the required tier against the template and review map and flag any
+escalation. Record the reviewed SHA, verified model and tier with the
+findings, and flag any uncertainty about which model ran.
+Use read-only inspection and Actions evidence for independent review. Route
+any focused reproduction to the task owner. PR reviewers do not submit merge
+approvals, merge, enable auto-merge, edit code or start fix sessions. Reviewers
+record separate approval for exact staging DDL when the
+[staging migration runbook](docs/ops.md#staging-migrations) requires it. An
+independent production release reviewer gives a separate decision under the
+[production release process](CONTRIBUTING.md#production-releases).
+The task owner acts on findings and verifies the required GitHub checks.
 
 Read `README.md` (architecture choices are normative there), `AGENTS.md`,
 `CONTRIBUTING.md`, `SECURITY.md`, and the ADRs in `docs/adr/` for the area
@@ -22,9 +32,30 @@ heavy focused work and any fallback retain the guarded Boat/pool limits in
 [CONTRIBUTING.md](CONTRIBUTING.md#verification-github-actions-first).
 A stale-head run or a skipped required job does not prove the gate passed.
 Actions evidence changes no required check or review/release gate, and
-never replaces same-build staging, migrations, rollback or exact-head
-production authorization. This analysis-only review is not the final
-merge/approval stage described in CONTRIBUTING.
+never replaces same-build staging, migrations, rollback or independent
+production release approval for the exact candidate.
+
+### Manual verification for instruction changes
+
+At the reviewed head, compare the changed instructions with the PR base,
+the PR template and any workflows they reference. For the sections touched,
+check that the rules agree across files and supported entry points:
+
+- Verify that `CLAUDE.md` contains only `@AGENTS.md` and a terminating
+  newline, and that the import resolves to the root `AGENTS.md`. Check
+  that shared instructions cover the affected roles, model selection
+  follows [the AGENTS.md policy](AGENTS.md#model-selection-and-effort),
+  and tracked harness files introduce no overrides.
+- Trace the review and release instructions from task ownership through
+  Attestation, review, CI, merge and production approval. Check cited gates
+  against their workflow definitions and the effective branch rules.
+- For Modern Web Guidance, read the installed skill's commands and check
+  whether each invocation can use the required version, environment and
+  telemetry opt-out. Follow the documented decision path for skills that
+  cannot guarantee those settings and inspect the fallback commands.
+  No guide lookup is needed for this check.
+
+Record the reviewed SHA, observations and checks that did not apply or run.
 
 ## Dependency-bump PRs
 

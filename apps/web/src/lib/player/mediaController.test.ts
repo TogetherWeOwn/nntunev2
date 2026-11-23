@@ -29,6 +29,7 @@ class SeekableAudio extends EventTarget {
 	get duration() { return 120; }
 	get seekable() { return { length: 1, start: () => 0, end: () => 120 }; }
 	position = 30;
+	seeking = false;
 	get currentTime() { return this.position; }
 	set currentTime(value: number) { this.position = value; }
 }
@@ -344,4 +345,81 @@ test('destroy retires the active node and refuses later mounts', () => {
 	cleanup();
 	expect(media.audio).toBeUndefined();
 	expect(audio.pause).toHaveBeenCalledOnce();
+});
+
+test.each([false, true])('absolute seek uses native time and clears stale refusal (early timeupdate: %s)', (early) => {
+	const media = createMediaController(() => true, coral);
+	const native = new SeekableAudio();
+	media.attach(native as unknown as HTMLAudioElement);
+	const state = () => get(media.absoluteSeek);
+	const { attachment } = state();
+	const ranges = vi.spyOn(native, 'seekable', 'get');
+	const setter = vi.spyOn(native, 'currentTime', 'set');
+	media.captureShareSeek(media.beginShareInput(), { trackId: 'coral', seconds: 100 }, () => true);
+	setter.mockImplementationOnce(() => {});
+	media.seek(attachment, 80);
+	expect(media.pendingShareSeek).toBeNull();
+	expect(state()).toMatchObject({ position: 30, feedback: 'The player did not accept that seek.' });
+	ranges.mockReturnValueOnce({ length: 1, start: () => 0, end: () => 40 });
+	media.seek(attachment, 80);
+	expect(setter).toHaveBeenCalledExactlyOnceWith(80);
+	expect(state()).toMatchObject({ position: 30, feedback: 'That position is not seekable yet.' });
+	media.seek(attachment, Infinity);
+	expect(setter).toHaveBeenCalledTimes(1);
+	for (const event of ['seeking', 'timeupdate', 'seeked']) {
+		if (event !== 'seeking') native.position += 1;
+		native.dispatchEvent(new Event(event));
+		expect(state().feedback).toBe('That position is not seekable yet.');
+	}
+	Object.assign(native, { currentTime: 60, seeking: true });
+	if (early) native.dispatchEvent(new Event('timeupdate'));
+	expect(state()).toMatchObject({ position: early ? 60 : 32, elapsed: 32, feedback: 'That position is not seekable yet.' });
+	native.dispatchEvent(new Event('seeking'));
+	expect(state()).toMatchObject({ position: 60, elapsed: 32, seeking: true, feedback: '' });
+	native.seeking = false;
+	native.dispatchEvent(new Event('seeked'));
+	expect(state()).toMatchObject({ attachment, position: 60, elapsed: 60, feedback: '' });
+	media.seek(attachment, 200);
+	expect(setter).toHaveBeenLastCalledWith(120);
+	expect(state()).toMatchObject({ position: 120, duration: 120, enabled: true, feedback: '' });
+});
+
+test('absolute seek keeps elapsed time settled while the decoder is seeking', () => {
+	const media = createMediaController(() => true, coral);
+	const native = new SeekableAudio();
+	media.attach(native as unknown as HTMLAudioElement);
+	const state = () => get(media.absoluteSeek);
+	native.seeking = true;
+	media.seek(state().attachment, 80);
+	native.dispatchEvent(new Event('seeking'));
+	expect(native.currentTime).toBe(80);
+	expect(state()).toMatchObject({ position: 80, elapsed: 30, seeking: true });
+	media.seek(state().attachment, 90);
+	native.dispatchEvent(new Event('seeked')); // A queued event cannot settle a newer in-flight seek.
+	expect(state()).toMatchObject({ position: 90, elapsed: 30, seeking: true });
+	native.seeking = false;
+	native.dispatchEvent(new Event('seeked'));
+	expect(state()).toMatchObject({ position: 90, elapsed: 90, seeking: false });
+});
+
+test.each(['before write', 'during write'] as const)('absolute seek fences attachment retirement %s', (phase) => {
+	const media = createMediaController(() => true, coral);
+	const native = new SeekableAudio();
+	const replacement = new SeekableAudio();
+	replacement.position = 7;
+	const detach = media.attach(native as unknown as HTMLAudioElement);
+	const state = () => get(media.absoluteSeek);
+	const old = state().attachment;
+	const replace = () => { detach(); media.attach(replacement as unknown as HTMLAudioElement); };
+	const setter = vi.spyOn(native, 'currentTime', 'set');
+	if (phase === 'before write') vi.spyOn(native, 'duration', 'get').mockImplementationOnce(() => { replace(); return 120; });
+	else setter.mockImplementationOnce(() => { replace(); throw new Error('retired write'); });
+	media.seek(old, 80);
+	expect(setter).toHaveBeenCalledTimes(phase === 'before write' ? 0 : 1);
+	native.dispatchEvent(new Event('seeked'));
+	media.seek(old, 90);
+	expect(state()).toMatchObject({ position: 7, feedback: '' });
+	expect(replacement.currentTime).toBe(7);
+	media.reset();
+	expect(state()).toMatchObject({ position: 0, duration: 0, enabled: false, feedback: '' });
 });

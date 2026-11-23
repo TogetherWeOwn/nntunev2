@@ -3,14 +3,18 @@
 	import { ApiClient, ApiError } from '../api/client.js';
 	import { ARTWORK_PLACEHOLDER_SRC } from '../player/artwork.js';
 	import { displayCollections, loadCollections, type Collection, type CollectionFilter, type CollectionSort } from './collections.js';
+	import type { LibraryRefreshUpdate } from './refresh.js';
 
-	let { filter, accessRevoked }: { filter: CollectionFilter; accessRevoked: boolean } = $props();
+	let { filter, requiresSignIn, runIfCurrent, accountSession, reverify }: {
+		filter: CollectionFilter; requiresSignIn: boolean; runIfCurrent: LibraryRefreshUpdate['runIfCurrent'];
+		accountSession?: LibraryRefreshUpdate['accountSession']; reverify: () => Promise<void>;
+	} = $props();
 	let query = $state('');
 	let searchInput = $state<HTMLInputElement>();
 	let sort = $state<CollectionSort>('catalogue');
 	let reverse = $state(false);
 	let layout = $state<'list' | 'grid'>('list');
-	let status = $state<'loading' | 'ready' | 'sign-in' | 'error'>('loading');
+	let status = $state<'loading' | 'ready' | 'sign-in' | 'error' | 'unverified'>('loading');
 	let rows = $state<Collection[]>([]);
 	let active: AbortController | undefined;
 	const visible = $derived(displayCollections(rows, query, sort, reverse));
@@ -21,28 +25,47 @@
 		active = request;
 		rows = [];
 		status = 'loading';
-		try {
-			const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal });
-			const result = await loadCollections(client, selected);
-			if (request.signal.aborted || accessRevoked || selected !== filter) return;
-			rows = result;
-			status = 'ready';
-		} catch (error) {
-			if (request.signal.aborted || accessRevoked || selected !== filter) return;
-			status = error instanceof ApiError && error.status === 401 ? 'sign-in' : 'error';
+		const run = runIfCurrent;
+		const owner = accountSession;
+		const current = () => !request.signal.aborted && run === runIfCurrent && owner === accountSession &&
+			(!owner || owner.isCurrent()) && !requiresSignIn && selected === filter;
+		const started = await run?.(() => {
+			if (!current()) return;
+			const client = new ApiClient({ baseUrl: PUBLIC_API_BASE_URL, signal: request.signal, session: owner && { owner } });
+			// Settle the request outside the receipt lock, including early failures.
+			return { result: loadCollections(client, selected).then(
+				(rows) => ({ rows, error: undefined }), (error: unknown) => ({ rows: undefined, error })
+			) };
+		});
+		const result = await started?.result;
+		if (result && await run?.(() => {
+			if (!current()) return;
+			rows = result.rows ?? [];
+			status = result.rows ? 'ready' : result.error instanceof ApiError && result.error.status === 401 ? 'sign-in' : 'error';
 			if (status === 'sign-in') query = '';
-			request.abort();
-		}
+			if (!result.rows) request.abort();
+			return true;
+		})) return;
+		if (current()) status = 'unverified';
 	}
 	$effect(() => {
-		if (accessRevoked) {
+		if (requiresSignIn) {
 			rows = [];
 			query = '';
 			status = 'sign-in';
 			return;
 		}
+		const owner = accountSession;
+		const retire = () => {
+			active?.abort();
+			rows = [];
+			query = '';
+			status = 'unverified';
+		};
+		if (owner && !owner.isCurrent()) return retire();
+		owner?.signal.addEventListener('abort', retire, { once: true });
 		void load(filter);
-		return () => active?.abort();
+		return () => { owner?.signal.removeEventListener('abort', retire); active?.abort(); };
 	});
 </script>
 <section aria-label="Library collections">
@@ -68,9 +91,9 @@
 		<p role="status">Loading your collections…</p>
 	{:else if status === 'sign-in'}
 		<p><a href="/login">Sign in</a> to see your collections.</p>
-	{:else if status === 'error'}
+	{:else if status === 'error' || status === 'unverified'}
 		<p role="alert">Could not load your collections.</p>
-		<button class="nt-button" type="button" onclick={() => void load(filter)}>Retry collections</button>
+		<button class="nt-button" type="button" onclick={() => void (status === 'unverified' ? reverify() : load(filter))}>Retry collections</button>
 	{:else}
 		<p role="status">{rows.length ? `Showing ${visible.length} of ${rows.length} loaded items.` : `No ${filter === 'all' ? 'collections' : filter} in the loaded results.`}</p>
 		{#if visible.length > 0}

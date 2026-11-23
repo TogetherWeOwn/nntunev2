@@ -22,6 +22,7 @@ import { expect, test, type Page } from '@playwright/test';
  * (other HTTP failures, network rejection, malformed bodies) purge nothing.
  * Pricing and billing abandonment keep the full preservation contract.
  */
+const AUTH_SETTLEMENT_WRITES = ['setItem:nntune.auth.generation.v1'];
 const SNAPSHOT = 'nntune.library.snapshot.v1';
 const AUTH_CONTEXT = 'nntune.library.auth-context.v1';
 const EMAIL = 'nntune:signed-in-email';
@@ -209,6 +210,25 @@ async function releaseReject(page: Page) {
 	});
 }
 
+for (const action of ACTIONS.filter(({ path }) => path === '/account/billing')) {
+	test(`${action.name}: a retired account cannot follow a held payment redirect`, async ({ page }) => {
+		const observed = await fixtures(page, action);
+		await begin(page, action);
+		await page.evaluate(() => {
+			const key = 'nntune.auth.generation.v1';
+			localStorage.setItem(key, 'replacement-generation');
+			window.dispatchEvent(new StorageEvent('storage', { key }));
+		});
+		await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+		await release(page, action, 200);
+		// Observe navigation attempts after the deliberately deferred response settles.
+		await page.waitForTimeout(350);
+		expect(observed.external).toEqual([]);
+		expect(observed.pageErrors).toEqual([]);
+		await expect(page).toHaveURL((url) => url.pathname === action.path);
+	});
+}
+
 for (const action of ACTIONS) {
 	// Qualifying security results (200/401) purge even when abandoned, so only
 	// the non-qualifying 500 keeps the preservation contract there. Pricing
@@ -243,7 +263,7 @@ for (const action of ACTIONS) {
 				writes: window.__abandonment.writes, broadcasts: window.__abandonment.broadcasts,
 				rejections: window.__abandonment.rejections, requests: window.__abandonment.requests
 			}));
-			expect.soft(probe.writes, 'no stale storage write, including clear-and-restore').toEqual([]);
+			expect.soft(probe.writes, 'no stale storage write, including clear-and-restore').toEqual(action.path === '/account/security' ? AUTH_SETTLEMENT_WRITES : []);
 			expect.soft(probe.broadcasts, 'no stale cross-tab cache invalidation').toEqual([]);
 			expect.soft(probe.rejections).toEqual([]);
 			expect.soft(observed.pageErrors).toEqual([]);
@@ -373,7 +393,7 @@ for (const action of SECURITY_ACTIONS) {
 			writes: window.__abandonment.writes, broadcasts: window.__abandonment.broadcasts,
 			rejections: window.__abandonment.rejections, requests: window.__abandonment.requests
 		}));
-		expect.soft(probe.writes, 'no stale storage write').toEqual([]);
+		expect.soft(probe.writes, 'only the auth generation changes').toEqual(AUTH_SETTLEMENT_WRITES);
 		expect.soft(probe.broadcasts, 'no stale cross-tab invalidation').toEqual([]);
 		expect.soft(observed.navigations, 'no stale client navigation').toEqual([]);
 		expect.soft(new URL(page.url()).pathname).toBe(action.path);
@@ -406,7 +426,7 @@ for (const action of SECURITY_ACTIONS) {
 			writes: window.__abandonment.writes, broadcasts: window.__abandonment.broadcasts,
 			rejections: window.__abandonment.rejections, requests: window.__abandonment.requests
 		}));
-		expect.soft(probe.writes, 'no stale storage write').toEqual([]);
+		expect.soft(probe.writes, 'only the auth generation changes').toEqual(AUTH_SETTLEMENT_WRITES);
 		expect.soft(probe.broadcasts, 'no stale cross-tab invalidation').toEqual([]);
 		expect.soft(observed.navigations, 'no stale client navigation').toEqual([]);
 		expect.soft(new URL(page.url()).pathname).toBe(action.path);
@@ -433,11 +453,14 @@ test('live revoke-all 401 keeps the explicit not-revoked notice and sign-in link
 	const observed = await fixtures(page, action);
 	await begin(page, action);
 	await release(page, action, 401);
+	const retry = page.getByRole('button', { name: action.button });
+	await Promise.all([page.waitForEvent('dialog').then((dialog) => dialog.dismiss()), retry.click()]);
+	await expect(retry).toBeEnabled();
+	expect(await page.evaluate(() => window.__abandonment.requests.length)).toBe(1);
 	const alert = page.getByRole('alert');
 	await expect(alert).toContainText(/session expired before other devices were signed out/i);
 	await expect(alert.getByRole('link', { name: /sign in again/i })).toHaveAttribute('href', '/login');
 	expect(observed.pageErrors).toEqual([]);
-	await expect(page.getByRole('button', { name: action.button })).toBeEnabled();
 	expect(new URL(page.url()).pathname).toBe('/account/security');
 	expect(await storedState(page)).toEqual({
 		areas: [{ context: null, scoped: null, legacy: null }, { context: null, scoped: null, legacy: null }], email: null

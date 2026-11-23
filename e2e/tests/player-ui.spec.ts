@@ -74,7 +74,7 @@ test.describe('resumeFloorAfterSeek (no-restart floor)', () => {
 });
 
 test.describe('chooseSeekSurface (which player UI drives the seek)', () => {
-  test('the custom seek slider wins when visible', () => {
+  test('the custom seek slider wins when usable', () => {
     expect(chooseSeekSurface(true, true)).toBe('custom');
     expect(chooseSeekSurface(true, false)).toBe('custom');
   });
@@ -151,7 +151,8 @@ test.describe('DOM driver (off-viewport player still receives the clicks)', () =
   }) => {
     await page.setContent(
       `<div style="height:3000px"></div>` +
-        `<audio controls data-testid="audio-player" src="${silentWavDataUri()}"></audio>`,
+        `<audio controls data-testid="audio-player" src="${silentWavDataUri()}"></audio>` +
+        `<input type="range" data-testid="player-seek" disabled>`,
     );
     const player = page.getByTestId('audio-player');
     const state = () =>
@@ -198,6 +199,9 @@ test.describe('DOM driver (off-viewport player still receives the clicks)', () =
         a.__sawSeeked = true;
       });
     });
+    // The disabled custom slider must not replace the working native fallback.
+    await expect(page.getByTestId('player-seek')).toBeVisible();
+    await expect(page.getByTestId('player-seek')).toBeDisabled();
     const target = await seekViaPlayerUi(page, player, 0.55);
     expect(target).toEqual({ fraction: 0.55, surface: 'native' });
     await expect

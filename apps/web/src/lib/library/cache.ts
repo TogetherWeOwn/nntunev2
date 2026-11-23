@@ -15,6 +15,7 @@
  */
 
 import { clearUsageWarnings } from '../billing/usageWarnings.js';
+import type { AccountSession } from '../auth-fence.js';
 
 export interface LibraryItem {
 	id: string;
@@ -32,6 +33,8 @@ export interface LibrarySnapshot {
 /** Base key for snapshots; the tab's authentication context scopes each value. */
 export const LIBRARY_SNAPSHOT_KEY = 'nntune.library.snapshot.v1';
 export const LIBRARY_AUTH_CONTEXT_KEY = 'nntune.library.auth-context.v1';
+/** Session-only provenance: JSON [auth-context, verified session binding]. */
+export const LIBRARY_SESSION_BINDING_KEY = 'nntune.library.session-binding.v1';
 export const LIBRARY_AUTH_TRANSITION_KEY = 'nntune.library.auth-transition.v1';
 /**
  * Base key for device-local favorites. Values live in `localStorage` under
@@ -46,6 +49,60 @@ export const LIBRARY_FAVORITES_KEY = 'nntune.library.favorites.v1';
  * and legacy-base-key handling as favorites (see `recent-finds.ts`).
  */
 export const LIBRARY_RECENT_FINDS_KEY = 'nntune.library.recent-finds.v1';
+
+function libraryContext(session: SnapshotStorage | null): string | null {
+	try { return session?.getItem(LIBRARY_AUTH_CONTEXT_KEY) || null; } catch { return null; }
+}
+
+export function libraryContextKey(session: SnapshotStorage | null, base: string): string | null {
+	const context = libraryContext(session);
+	return context ? `${base}.${context}` : null;
+}
+
+/** Pin the existing tab context to the account that verified the listing. */
+export function scopeLibraryStorage(session: SnapshotStorage | null, owner?: AccountSession): SnapshotStorage | null {
+	const context = libraryContext(session);
+	if (!session || !context) return null;
+	const current = () => (!owner || owner.isCurrent()) && libraryContext(session) === context;
+	const requireCurrent = () => {
+		if (!current()) throw new DOMException('Library storage scope ended', 'AbortError');
+	};
+	return {
+		getItem: (key) => current() ? session.getItem(key) : null,
+		setItem: (key, value) => { requireCurrent(); session.setItem(key, value); },
+		removeItem: (key) => { requireCurrent(); session.removeItem(key); }
+	};
+}
+
+function provenance(session: SnapshotStorage | null): [string, string] | null {
+	try {
+		const context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY);
+		const proof: unknown = JSON.parse(session?.getItem(LIBRARY_SESSION_BINDING_KEY) ?? 'null');
+		return context && Array.isArray(proof) && proof.length === 2 && proof[0] === context &&
+			typeof proof[1] === 'string' && proof[1] ? [context, proof[1]] : null;
+	} catch { return null; }
+}
+
+export const libraryScopeBinding = (session: SnapshotStorage | null) => provenance(session)?.[1] ?? null;
+
+/** A verified account label alone never authorizes import. */
+export function verifiedFavoritesKey(session: SnapshotStorage | null, binding: string): string | null {
+	const proof = provenance(session);
+	return proof && proof[1] === binding ? `${LIBRARY_FAVORITES_KEY}.${proof[0]}` : null;
+}
+
+/** After verification, bind only a newly minted, unused scope. */
+export function establishVerifiedLibraryScope(session: SnapshotStorage | null, binding: string): string | undefined {
+	try {
+		if (!session || session.getItem(LIBRARY_AUTH_CONTEXT_KEY)) return verifiedFavoritesKey(session, binding) ?? undefined;
+		const context = crypto.randomUUID(), key = `${LIBRARY_FAVORITES_KEY}.${context}`;
+		if (browserStorage('local')?.getItem(key) !== null) return;
+		// Publish the context last; a failed write leaves no usable provenance.
+		session.setItem(LIBRARY_SESSION_BINDING_KEY, JSON.stringify([context, binding]));
+		session.setItem(LIBRARY_AUTH_CONTEXT_KEY, context);
+		return verifiedFavoritesKey(session, binding) ?? undefined;
+	} catch { return undefined; }
+}
 
 function snapshotKey(storage: SnapshotStorage | null, createContext = false): string | null {
 	if (!storage) return null;
@@ -207,10 +264,11 @@ export function loadSnapshot(storage: SnapshotStorage | null): LibrarySnapshot |
 export function saveSnapshot(
 	storage: SnapshotStorage | null,
 	items: LibraryItem[],
-	nowMs: number = Date.now()
+	nowMs: number = Date.now(),
+	createContext = true
 ): LibrarySnapshot {
 	const snapshot = encodeSnapshot(items, nowMs);
-	const key = snapshotKey(storage, true);
+	const key = snapshotKey(storage, createContext);
 	try {
 		if (storage && key) storage.setItem(key, JSON.stringify(snapshot));
 	} catch {
@@ -226,6 +284,7 @@ export function clearSnapshot(storage: SnapshotStorage | null): void {
 		const key = snapshotKey(storage);
 		// Revoke access to the snapshot before attempting to remove its bytes.
 		storage.removeItem(LIBRARY_AUTH_CONTEXT_KEY);
+		storage.removeItem(LIBRARY_SESSION_BINDING_KEY);
 		if (key) storage.removeItem(key);
 		storage.removeItem(LIBRARY_SNAPSHOT_KEY);
 	} catch {

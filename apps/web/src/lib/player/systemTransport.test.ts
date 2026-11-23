@@ -1,10 +1,13 @@
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, expect, onTestFinished, test, vi } from 'vitest';
 import { get } from 'svelte/store';
+import { createPlayerController } from './controller.svelte.js';
 import { createMediaController } from './mediaController.js';
 import type { MediaMetadataInit, MediaSessionLike } from './mediaSession.js';
 import { createQueue } from './queue.js';
 import { createQueueController } from './queueController.js';
 
+const actions = ['seekto', 'seekforward', 'seekbackward'] as const;
+const timeRanges = (ranges: [number, number][]): TimeRanges => ({ length: ranges.length, start: (i) => ranges[i]![0], end: (i) => ranges[i]![1] });
 const coral = { id: 'coral', title: 'Coral 🎵', artist: 'Fixture Artist', album: 'Fixture Album', streamUrl: '/coral' };
 const moss = { id: 'moss', title: ' ', artist: ' ', streamUrl: '/moss' };
 
@@ -13,6 +16,19 @@ class Decoder extends EventTarget {
 	paused = true;
 	ended = false;
 	error: { code: number } | null = null;
+	position = 20;
+	seeking = false;
+	duration = NaN;
+	ranges: [number, number][] = [];
+	played = timeRanges([]);
+	beforeRead?: () => void;
+	write = vi.fn((value: number) => { this.position = value; });
+	get currentTime() { this.beforeRead?.(); return this.position; }
+	set currentTime(value: number) { this.write(value); }
+	get seekable() { return timeRanges(this.ranges); }
+	emit(...types: string[]) { for (const type of types) this.dispatchEvent(new Event(type)); }
+	setReady = (ranges: Decoder['ranges'] = [[0, 60]]) =>
+		Object.assign(this, { duration: 60, ranges, HAVE_METADATA: 1, readyState: 1, playbackRate: 1 }).emit('loadedmetadata');
 	constructor(readonly source: string) { super(); }
 	getAttribute() { return this.source; }
 	load = vi.fn(() => { this.error = null; });
@@ -30,10 +46,11 @@ function player() {
 }
 
 function stubSession(unsupported?: string) {
-	const handlers = new Map<string, (() => void) | null>();
+	const handlers = new Map<string, Parameters<MediaSessionLike['setActionHandler']>[1]>();
 	const activeActions = new Set<string>();
 	const session: MediaSessionLike = {
 		metadata: null,
+		setPositionState: vi.fn(),
 		setActionHandler(action, handler) {
 			if (action === unsupported) throw new DOMException('unsupported', 'NotSupportedError');
 			if (handler) activeActions.add(action);
@@ -158,4 +175,196 @@ test('compact controls work with Media Session absent or one action unsupported'
 	handler('pause')!();
 	expect(partial.status()).toBe('paused');
 	partial.media.destroy();
+});
+
+test.each(['nexttrack', 'previoustrack'] as const)('unsupported %s leaves the other queue action usable', (unsupported) => {
+	const { handler } = stubSession(unsupported);
+	const next = unsupported === 'previoustrack';
+	const base = { ...createQueue([coral, moss]), currentIndex: next ? 0 : 1 };
+	const { queue, media, reconcileLibrary, purgeAtAuthBoundary, destroy } = createPlayerController(base, { flush: async () => {} }, () => true);
+	const audio = new Decoder(base.tracks[base.currentIndex].streamUrl);
+	try {
+		expect(reconcileLibrary(base.tracks, () => true)).toBe(true);
+		media.attach(audio.element);
+		expect(handler(unsupported)).toBeUndefined();
+		expect(queue.snapshot).toBe(base);
+		handler(next ? 'nexttrack' : 'previoustrack')!();
+		expect(queue.snapshot.currentIndex).toBe(next ? 1 : 0);
+		expect(queue.snapshot.tracks).toBe(base.tracks);
+		expect(audio.play).not.toHaveBeenCalled();
+	} finally {
+		purgeAtAuthBoundary();
+		destroy();
+	}
+});
+
+function setup({ unsupported, connected = true, ranges }: { unsupported?: string; connected?: boolean; ranges?: Decoder['ranges'] } = {}) {
+	const { session, handler } = stubSession(unsupported), queue = createQueueController(createQueue([coral, moss]));
+	const commit = (next: typeof queue.snapshot) => { queue.publish(next, queue.begin(next, 'replace')); return queue.snapshot === next; };
+	const media = createMediaController(queue, { commit, flush: async () => {}, browseCopy: { invalidate() {} }, announce() {} }, () => true);
+	const audio = Object.assign(new Decoder(coral.streamUrl), { isConnected: connected }), detach = media.attach(audio.element);
+	if (connected) audio.setReady(ranges);
+	onTestFinished(() => media.destroy());
+	return { handler, session, media, audio, detach, queue, select: (track: typeof moss) => commit(createQueue([track])),
+		fire: (action: typeof actions[number], details: object = {}) => handler(action)!({ action, ...details }) };
+}
+test.each([['seekto', 60, false, 0], ['seekto played', 60, true, 0], ['seekforward', 60, false, 0], ['compact', 60, true, 0], ['interior natural end', 59.999, true, 0],
+	['extended', 75, true, 75], ['old end', 60, false, 75], ['rounded old end', 60.001, false, 60.035], ['short extension', 60.034, true, 60.035],
+	['overlapping extension', 60.035, true, 60.035, 60.02], ['historical range', 60.035, false, 60.035, 0], ['corrected down', 59.8, false, 0],
+	['corrected down terminal', 59.84, false, 59.84, 59.8], ['corrected down terminal replay', 59.84, true, 59.84, 59.8, 59.82],
+	['interior corrected down', 59.8, false, 0], ['interior corrected down rounded', 59.839, false, 59.84],
+	['interior corrected down historical', 59.84, false, 59.84, 59.8], ['interior corrected down replay', 59.84, true, 59.84, 59.8, 59.82],
+	['interior corrected down played', 59.84, true, 59.84], ['interior corrected down played rounded', 59.839, true, 59.84],
+	['interior rounded up', 60, false, 0], ['interior rounded up settled', 60, false, 0, 59.98], ['interior rounded up played', 60, true, 0], ['interior rounded up replay', 60, true, 0, 59.98, 59.99],
+	['late correction', 59.86, false, 59.86], ['late correction played', 59.86, true, 59.86], ['interior late correction', 59.8, false, 59.84], ['interior late correction played', 59.84, true, 59.84],
+	['unchanged', 60, false, 0], ['ignored', 60.035, true, 0], ['forward unchanged', 60, false, 0], ['forward ignored', 60.035, true, 0]
+] as const)('system seek readback and endpoint (%s)', async (scenario, position, advances, revisedDuration, priorStart?, motion?) => {
+	const { audio, media, fire, queue, session } = setup(), initial = queue.snapshot;
+	await media.playCurrent(); audio.emit('playing'); vi.mocked(session.setPositionState)!.mockClear();
+	const ignored = scenario.endsWith('ignored'), unchanged = ignored || scenario.endsWith('unchanged'), endpoint = unchanged ? 60.035 : 60;
+	const forward = scenario === 'seekforward' || scenario.startsWith('forward'), rounded = scenario.startsWith('interior rounded up');
+	const late = scenario.includes('late correction'), corrected = scenario.includes('corrected down'), target = scenario.startsWith('interior') ? (corrected || late ? 59.8 : 59.99) : endpoint;
+	if (unchanged) Object.assign(audio, { duration: endpoint, ranges: [[0, endpoint]], position: 60 });
+	if (priorStart !== undefined) audio.played = timeRanges([[priorStart, position]]);
+	audio.write.mockImplementationOnce(() => ignored ? undefined : Object.assign(audio,
+		{ position: unchanged || rounded || (corrected && target === endpoint) ? 60 : target - 0.000002, seeking: true }));
+	fire(forward || rounded ? 'seekforward' : 'seekto', { seekTime: target, seekOffset: rounded ? target - audio.position : 100 });
+	expect(audio.write).toHaveBeenLastCalledWith(target);
+	for (const call of [audio.pause, session.setPositionState]) expect(call).not.toHaveBeenCalled();
+	if (forward) expect(get(media.seekFeedback).jumpStatus).toBe(ignored ? 'The player did not accept that jump.' : 'Forward to the end, 1:00.');
+	if (scenario === 'compact') media.seek(get(media.absoluteSeek).attachment, 59.9999995);
+	else if (corrected) Object.assign(audio, { duration: revisedDuration || position, position: 59.8 }).emit('durationchange');
+	if (rounded && scenario !== 'interior rounded up') audio.position = 59.98;
+	if (audio.seeking) {
+		audio.emit('seeking');
+		if (late || scenario.startsWith('seekto')) audio.position = late ? 59.8 : 59.98;
+		audio.seeking = false;
+		audio.emit('seeked');
+		expect(session.setPositionState).toHaveBeenLastCalledWith({ duration: audio.duration, position: audio.position, playbackRate: 1 });
+	}
+	if (revisedDuration && !corrected) Object.assign(audio, { duration: revisedDuration }).emit('durationchange');
+	if (priorStart !== undefined && (corrected || rounded)) Object.assign(audio, { position: motion ?? audio.position }).emit('timeupdate');
+	if (scenario.endsWith('extension') || scenario === 'interior natural end' || scenario.includes('played')) audio.played = timeRanges([[scenario.includes('played') ? audio.position : target, corrected ? revisedDuration : position]]);
+	if (scenario === 'interior rounded up') media.setRepeat('one', null);
+	media.sleepTimer.start({ kind: 'stop-after-tracks', count: 2 }, 'Sleep after two tracks');
+	Object.assign(audio, { position, ended: true, paused: true }).emit('pause', 'ended');
+	await Promise.resolve();
+	if (advances) expect(queue.snapshot.currentIndex).toBe(1); else expect(queue.snapshot).toBe(initial);
+	expect([get(media.playbackStatus), get(media.sleepTimer).remaining]).toEqual(['paused', advances ? '1 track remaining' : '2 tracks remaining']);
+	expect([audio.play.mock.calls.length, audio.load.mock.calls.length]).toEqual([1, 0]);
+});
+
+test.each([['seekforward', 59.98, 1, 'Forward'], ['seekbackward', 0.02, -1, 'Back']] as const)('%s distinguishes a fractional move from a no-op', (action, edge, sign, word) => {
+	const { audio, media, fire } = setup();
+	fire(action, { seekOffset: 1e-16 });
+	expect(audio.write).not.toHaveBeenCalled();
+	expect(get(media.seekFeedback).jumpStatus).toBe('The player did not accept that jump.');
+	for (const drift of [0, 0.001]) {
+		audio.write.mockClear().mockImplementationOnce(() => { audio.position += sign * drift; });
+		fire(action, { seekOffset: 0.01 });
+		expect(audio.write).toHaveBeenCalledExactlyOnceWith(20 + sign * 0.01);
+		expect(get(media.seekFeedback).jumpStatus).toBe('The player did not accept that jump.');
+	}
+	audio.position = edge;
+	fire(action, { seekOffset: 0.01 });
+	expect(audio.currentTime).toBe(edge + sign * 0.01);
+	expect(get(media.seekFeedback).jumpStatus).toContain(`${word} 0.01 seconds`);
+});
+
+test('invalid inputs leave time unchanged and native ranges govern seek registration', () => {
+	const { audio, media, handler, fire } = setup({ ranges: [[0, 0]] });
+	for (const action of actions) expect(handler(action)).toBeFalsy();
+	audio.setReady([[0, 24], [40, 60]]);
+	const before = get(media.seekFeedback);
+	for (const [action, field] of [['seekto', 'seekTime'], ['seekforward', 'seekOffset'], ['seekbackward', 'seekOffset']] as const) {
+		for (const value of [NaN, Infinity, -1, '5', null, true, {}, action === 'seekto' ? undefined : 0]) fire(action, { [field]: value });
+		fire(action, { action: 'play', seekTime: 5, seekOffset: 5 });
+	}
+	expect(get(media.seekFeedback)).toBe(before);
+	fire('seekto', { seekTime: 30 });
+	expect(get(media.absoluteSeek).feedback).toBe('That position is not seekable yet.');
+	fire('seekforward', { seekOffset: 4.02 });
+	expect(get(media.seekFeedback).jumpStatus).toBe('Cannot jump: this track cannot seek yet.');
+	for (const unused of [audio.write, audio.play]) expect(unused).not.toHaveBeenCalled();
+	for (const action of actions) expect(handler(action)).toBeTypeOf('function');
+});
+
+test.each([['seekto', 0, false], ['seekto', 1, false], ['seekforward', 1, false],
+	['seekto', 0, true], ['seekto', 1, true], ['seekto', 2, true], ['seekforward', 1, true]
+] as const)('%s retires after loss (%i valid reads, competing intent: %s)', (action, validReads, competing) => {
+	const { audio, media, handler, fire } = setup();
+	fire('seekforward', { seekOffset: 1 }); // Seed a prior success message.
+	audio.position = 20;
+	const retired = actions.map((action) => handler(action)!), ranges = audio.seekable;
+	let reads = 0;
+	const seekable = vi.spyOn(audio, 'seekable', 'get').mockImplementation(() => {
+		const read = reads++;
+		if (competing && read === validReads) media.seek(get(media.absoluteSeek).attachment, 30);
+		return { ...ranges, length: Number(read < validReads || (competing && read > validReads)) };
+	});
+	fire(action, { seekTime: 10, seekOffset: 3 });
+	const position = competing ? 30 : 20;
+	expect(audio.currentTime).toBe(position);
+	if (!competing) for (const action of actions) expect(handler(action)).toBeNull();
+	if (validReads && !competing && action === 'seekto') expect(get(media.absoluteSeek).feedback).toBe('That position is not seekable yet.');
+	if (validReads && !competing && action === 'seekforward') expect(get(media.seekFeedback).jumpStatus).toBe('Cannot jump: this track cannot seek yet.');
+	seekable.mockRestore();
+	audio.setReady(); // No native event ever published the loss.
+	for (const [i, action] of actions.entries()) {
+		retired[i]!({ action, seekTime: 10, seekOffset: 1 });
+		expect(audio.currentTime).toBe(position);
+		expect(handler(action)).not.toBe(retired[i]);
+	}
+	fire('seekto', { seekTime: 10 });
+	expect(audio.currentTime).toBe(10);
+});
+
+test.each(['seekto', 'seekforward'] as const)('%s respects registration and intent during reentrant seeks', (action) => {
+	const { audio, media, fire } = setup();
+	const compact = (target: number) => media.seek(get(media.absoluteSeek).attachment, target), system = () => fire(action, { seekTime: 10, seekOffset: 5 });
+	audio.beforeRead = () => { audio.beforeRead = undefined; compact(30); };
+	system();
+	expect(audio.currentTime).toBe(30); // Preflight cannot supersede the newer compact write.
+	audio.write.mockClear().mockImplementationOnce((seconds) => {
+		system();
+		audio.setReady([]); audio.setReady();
+		audio.position = seconds;
+	});
+	compact(40);
+	expect(audio.write.mock.calls).toEqual([[40]]); // Recovery did not revive the queued write.
+});
+
+test('late publication binds supported seek actions and preserves both Play controls', async () => {
+	const { audio, media, select, handler, fire } = setup({ unsupported: 'seekto', connected: false });
+	expect(handler('play')).toBeUndefined();
+	audio.isConnected = true;
+	select({ ...coral }); audio.setReady();
+	expect(handler('seekto')).toBeUndefined();
+	fire('seekbackward');
+	expect(audio.currentTime).toBe(10);
+	await media.playCurrent(); expect(audio.play).toHaveBeenCalledOnce();
+	media.pauseCurrent();
+	expect(audio.paused).toBe(true);
+	handler('play')!();
+	expect(audio.play).toHaveBeenCalledTimes(2);
+});
+
+test.each(['decoder', 'source', 'auth', 'detach'])('fences all queued callbacks across %s changes', (boundary) => {
+	const { audio, media, queue, select, detach, handler, fire } = setup(), retired = actions.map((action) => handler(action)!);
+	if (boundary === 'auth') {
+		queue.purgeAtAuthBoundary(() => media.purgeAtAuthBoundary(() => {}));
+		select(coral);
+	} else if (boundary === 'source') select(moss); // Source changes before the old audio detaches.
+	else if (boundary === 'detach') detach();
+	const current = boundary === 'source' ? audio : new Decoder(coral.streamUrl);
+	if (current !== audio) media.attach(current.element);
+	for (const action of actions) expect(handler(action)).toBeNull();
+	if (boundary === 'source') select(coral); // Round-trip must not revive old callbacks.
+	current.setReady();
+	for (const [i, action] of actions.entries()) {
+		retired[i]!({ action, seekTime: 2, seekOffset: 5 });
+		expect([audio.currentTime, current.currentTime]).toEqual([20, 20]);
+	}
+	fire('seekto', { seekTime: 6 });
+	expect(current.currentTime).toBe(6);
 });

@@ -300,3 +300,13 @@ sha256 = "567a3838e2efdd1af0e45ffb17d52f41a47d03a0f7928f80d5c34db872d9d119"
 file = "0059_paid_invoice_covered_periods.sql"
 target = "app"
 sha256 = "cb8b5ff85c2d2ef3cf732f74e8a9baf3e9da143d76aa0c87045972695f8a1923"
+
+[[migration]]
+file = "0060_invite_expiry_observation.sql"
+target = "app"
+sha256 = "3740b481e83ae13387f8e8169c2ad0f0c5b37e0c34f8a5182f3faa5d21897f00"
+
+[[migration]]
+file = "0061_invite_issuer_restriction.sql"
+target = "app"
+sha256 = "5b37d57a74e1f9c3b0e134aac28059a73e0f879d0aa5e97597ae79bc1db813b0"

@@ -96,6 +96,48 @@ again"}`, internal
 `500 {"error":"internal error"}`. Cookie-authenticated mutations also
 require an exact `Origin` header match.
 
+`PUT` and `DELETE /v1/me/likes/track/{target_id}` also require the
+`x-nntune-session-binding` request header. Use the `session_binding` verified
+for the initiating Library scope; the header is a precondition, not a
+credential. After the cookie and exact Origin checks, a missing or mismatched
+binding returns `412 {"error":"session binding mismatch"}` before looking up
+the track. Credentialed preflight for the configured origin allows the header.
+On success both methods return 200: PUT returns `{target_id, liked_at}` and
+DELETE returns `{target_id, liked: false}`. The receipt uses the resolved ID;
+exact member job IDs keep their case.
+
+Library taste controls use `GET`, `PUT` and `DELETE /v1/me/taste/session`
+with the same binding header and `412` precondition. Mutations still require
+an exact Origin. Request bodies match the legacy `/v1/me/taste` contract, but
+submit the exact validated storage ID: the Library path refuses aliases that
+would resolve to a different ID. Use the resolved recording MBID when present;
+otherwise preserve the opaque member job ID verbatim. Every 200 response adds
+`session_binding` to the legacy JSON shape, and DELETE also echoes `kind` and
+`target_id` even when `cleared` is false. GET still filters expired snoozes.
+Validate the proof and receipt before publishing account state; do not fall
+back to `/v1/me/taste` or automatically retry a mutation. The legacy route's
+requests and receipts are unchanged.
+
+### Bound web playback contract
+
+Send that same verified binding on `PUT /v1/me/private-session`,
+`POST /v1/plays`, and `POST /v1/plays/heartbeat`. A supplied mismatch returns
+412 before a privacy or lease write. Headerless callers keep existing behavior.
+The future web transport must always send the binding, and retire its
+in-memory playback session when the auth session changes.
+
+Use one browser-generated playback `session_id` for all three calls, distinct
+from the auth cookie and from the server-issued `play_id`. A new start omits
+`play_id`. A bound continuation with `play_id` either extends that exact play
+or returns 409 without a replacement grant. Privacy changes apply only to new
+starts; neither continuation nor heartbeat reclassifies a play.
+
+The Library's legacy and demo audio URLs are not protected playback sources.
+Do not expose a privacy toggle for them. The stream Worker requires a bearer
+header, which a native audio `src` cannot attach. Wiring needs an explicit
+protected source and byte transport that keeps the grant out of URLs, logs,
+queue data, and persisted storage. Catalogue refresh is not a grant request.
+
 Known limits of this slice: attestation `x5c` chains reject (no CA
 trust store yet); magic-link delivery needs the operator's
 `EMAIL_WEBHOOK_URL` (without it links are issued but not delivered, and
@@ -603,8 +645,8 @@ cargo test -p nntune-subsonic --locked
 python3 scripts/check-subsonic-fixtures.py
 ```
 
-(Mirrors CI jobs `api` (`.github/workflows/ci.yml:591-652`) and
-`fixture-check` (`.github/workflows/ci.yml:93-102`); `fmt` takes no
+(Mirrors CI jobs `api` (`.github/workflows/ci.yml:619-686`) and
+`fixture-check` (`.github/workflows/ci.yml:122-131`); `fmt` takes no
 `--locked` (it resolves no dependencies), so the asymmetry is
 intentional. `cargo test -p nntune-subsonic` also runs under
 `rust-test --workspace`.)

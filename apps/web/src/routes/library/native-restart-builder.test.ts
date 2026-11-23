@@ -1,7 +1,7 @@
 import { expect, test, vi } from 'vitest';
 import ts from 'typescript';
 import { get } from 'svelte/store';
-import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, removeTrack, selectTrack } from '#lib/player/queue.js';
+import { addTrack, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
 import { displayArtist, displayTitle, shortTitle } from '#lib/library/order.js';
 import { onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js';
@@ -21,8 +21,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
 		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clipboardWriter', 'copyTrackLink',
-		'applyShareLink', 'selectQueuedTrack', 'removeQueuedTrack',
-		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
+		'applyShareLink', 'selectQueuedTrack', 'trimPreviousTracks', 'trimUpcomingTracks',
 		'resetShareAtAuthBoundary', 'onRepeatChange', 'playQueuedTrack'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
@@ -30,7 +29,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	);
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
 	const lifecycle = parsed.statements.filter((node) => ts.isExpressionStatement(node) &&
-		ts.isCallExpression(node.expression) && ['$effect.pre', 'onMount'].includes(node.expression.expression.getText(parsed)));
+		ts.isCallExpression(node.expression) && (node.expression.expression.getText(parsed) === 'onMount' ||
+			node.expression.getText(parsed).startsWith('$effect.pre(() => () =>')));
 	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'queueShareOutcome', 'queueShare', 'disposeRoute']);
 	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
 		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));
@@ -81,12 +81,13 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	let onInvalidateBrowseCopy = () => {};
 	const routeCleanup: string[] = [];
 	const bindings = {
-		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
-		selectQueueIndex: selectTrack, removeTrack,
+		addTrack, clearUpcoming, createQueue, keepCurrentAndUpcoming,
+		selectQueueIndex: selectTrack,
 		resolveStreamUrl, displayArtist, displayTitle, shortTitle, resolveShareTarget, get,
 		buildShareQuery, queueCurrentTrack: currentTrack, navigator: { clipboard },
 		$state: { raw: <T>(value: T) => value },
 		routeCleanup,
+		accountTrackLikes: { clear: () => routeCleanup.push('likes') },
 		createQueueShare: (...args: Parameters<typeof createQueueShare>) => {
 			const share = createQueueShare(...args);
 			return { ...share, dispose: () => { routeCleanup.push('share'); share.dispose(); } };
@@ -98,7 +99,7 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			player.browseCopy.invalidate = () => { onInvalidateBrowseCopy(); return invalidate(); };
 			const clear = player.media.clearShareSeek;
 			player.media.clearShareSeek = () => { onClear(); clear(); };
-			return player;
+			return Object.assign(player, { currentFavorite: { bind: () => () => {} } });
 		},
 		tick, window: { location }, element, track, capture
 	};
@@ -115,6 +116,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		const readStoredDensity = () => 'comfortable';
 		const handleAuthTransition = () => {}, recordFindQuery = () => routeCleanup.push('query');
 		const subscribeLocalAuthTransition = () => () => routeCleanup.push('local-auth'), handleLocalAuthTransition = () => {};
+		const subscribeAuthFenceInvalidation = (_invalidate, signal) =>
+			signal.addEventListener('abort', () => routeCleanup.push('auth-fence'), { once: true });
 		const clearSnapshot = () => {}, browserStorage = () => null, refresh = () => {};
 		const endTrackDrag = () => routeCleanup.push('drag'), document = { title: '' };
 		let queueExportAuthGeneration = 0;
@@ -137,8 +140,8 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 				if (queueChanged) throw new Error('Expected a same-object refresh');
 			}),
 			readCopy: () => ({ browse: player.browseCopy.feedback, queue: queueShareOutcome }),
-			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
-			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
+			select: selectQueuedTrack, remove: player.removeQueuedTrack, playQueued: playQueuedTrack,
+			move: player.moveQueuedTrack, clear: player.clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
 			seeking: (target = element) => capture('seeking')(target), replaceQueue,
 			subscribe: queueController.subscribe, attach: media.attach, currentAudio: () => media.audio,
@@ -922,7 +925,7 @@ test('Library cleanup fences both copy receipts without pausing the shared decod
 	expect(page.currentAudio()).toBe(element);
 	expect(page.readCopy()).toEqual(afterCleanup);
 	expect(readMiniPlayerHint()?.trackId).toBe(track.id);
-	expect(routeCleanup).toEqual(['drag', 'share', 'export', 'refresh', 'query', 'local-auth', 'storage', 'pagehide']);
+	expect(routeCleanup).toEqual(['auth-fence', 'drag', 'share', 'export', 'refresh', 'likes', 'query', 'local-auth', 'storage', 'pagehide']);
 });
 
 test('route cleanup fences an explicit play waiting for tick', async () => {

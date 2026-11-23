@@ -103,7 +103,15 @@ function assertWiring(source: string) {
   expect(source.indexOf('- name: Verify actual staging migration schema (read-only)'))
     .toBeLessThan(source.indexOf('- name: Deploy api to staging'));
   expect(step('Generate staging wrangler.toml', source)).toContain("        if: steps.config.outputs.configured == 'true'\n");
-  expect(source).not.toContain('continue-on-error:');
+  // Only the two post-deploy evidence steps may fail without failing the job.
+  const softFailures = source.split(/^      - /m).flatMap((section) =>
+    Array.from(section.matchAll(/^[ \t]*continue-on-error[ \t]*:[^\n]*$/gm),
+      ([setting]) => [section.split('\n', 1)[0], setting]),
+  );
+  expect(softFailures).toEqual([
+    ['name: Read staging off and drained state after API deploy', '        continue-on-error: true'],
+    ['name: Record Subsonic staging readback outcome', '        continue-on-error: true'],
+  ]);
   expect(step('Hyperdrive cache-disabled gate', source)).toContain('working-directory: workers/api');
   expect(step('Generate staging wrangler.toml', source)).toContain('working-directory: workers/api');
   expect(step('Hyperdrive cache-disabled gate', source)).not.toContain('--allow-skip');
@@ -120,6 +128,7 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
       ['steps.schema.outcome', 'steps.schema.conclusion'],
       [" && steps.schema.outcome == 'success'", ''],
       ['id: schema\n', 'id: renamed\n'],
+      ['id: schema\n', 'id: schema\n        continue-on-error: true\n'],
       ['steps.deployment.outputs.deployed', 'steps.config.outputs.configured'],
       ['id: deploy\n', 'id: renamed\n'],
     ]) {

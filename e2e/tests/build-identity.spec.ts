@@ -17,16 +17,16 @@ import {
 // `expected_sha` from `github.sha`) — never a local source checkout.
 //
 // This file holds the OPENING read plus the offline verdict pins. A single
-// point-in-time read cannot bind a ~30 min journey: a later main push may
-// deploy staging mid-journey after this read passes. The CLOSING read
+// point-in-time read cannot bind a ~30 min journey: a deploy outside the
+// main workflow lock could overwrite staging after this read. The CLOSING read
 // (`e2e/tests/zz-build-identity-final.spec.ts`, `zz-` prefix sorts it last
 // under the serial `workers: 1` config) re-reads `/api/build` after every
 // other spec through the same shared helper below and fails with a
 // "superseded by a newer deploy" message when the serving build changed —
 // so a green run proves the whole journey ran against the promoted SHA.
-// Deploy concurrency is intentionally unchanged (job-level groups release
-// when the deploy finishes); the closing read turns the race into a red
-// run instead of a false pass.
+// The main deploy lock now covers the whole journey. The closing read
+// still detects an overwrite from outside that lock, such as a pre-lock
+// rollback rerun (see the cutover and rollback procedure in `docs/ops.md`).
 //
 // NO file-level skip by design: the offline describe below pins the verdict
 // contract on every PR (via `npm run test:unit`) with no staging, while the

@@ -11,9 +11,11 @@
 //! self.connect_mirror() the catalogue reads use, or (catalogue_library)
 //! both — plus all of its statements (connects and statements share one
 //! bound: finishing one statement must not unbind a later stalled one).
-//! Hyperdrive RESETs pooled backends, so this per-method race is what
-//! bounds statements where they run. Billing reconciliation is the sole
-//! exception: it delegates to the owned, budgeted transaction instead.
+//! Signup lookup then resolves explicit expiry through a separately bounded
+//! best-effort audit, so audit failure cannot overwrite a completed denial.
+//! Hyperdrive RESETs pooled backends, so these races bound statements where
+//! they run. Billing reconciliation delegates to the owned, budgeted
+//! transaction.
 //!
 //! Breaks caught: a new Store method that connects without the seam, a
 //! method that bounds an empty block while its statements run outside it,
@@ -170,11 +172,20 @@ fn method_name(piece: &str) -> &str {
 }
 
 fn assert_bounded(piece: &str, name: &str) {
-    let bounded = calls(piece, "Self::bounded");
+    let (seam, budget, connection) = if name == "try_observe_invite_expiry" {
+        (
+            "PgStore::bounded",
+            "AUDIT_BUDGET_MS",
+            "client.transaction()",
+        )
+    } else {
+        ("Self::bounded", "TOTAL_TIMEOUT_MS", "self.connect()")
+    };
+    let bounded = calls(piece, seam);
     assert_eq!(
         bounded.len(),
         1,
-        "{name} must race exactly one operation through Self::bounded"
+        "{name} must race exactly one operation through {seam}"
     );
     let call = &bounded[0];
     assert_eq!(
@@ -190,13 +201,11 @@ fn assert_bounded(piece: &str, name: &str) {
     // the method runs must sit inside the bound operation, sharing the one
     // TOTAL_TIMEOUT_MS race with the statements.
     assert!(
-        call.args[0].contains("self.connect()") || call.args[0].contains("self.connect_mirror()"),
-        "{name} must run its connect inside the bound operation"
+        call.args[0].contains(connection)
+            || (connection == "self.connect()" && call.args[0].contains("self.connect_mirror()")),
+        "{name} must connect or open the audit transaction inside the bound operation"
     );
-    assert_eq!(
-        call.args[1], "TOTAL_TIMEOUT_MS",
-        "{name} must use the shared vault total, not a fresh literal"
-    );
+    assert_eq!(call.args[1], budget, "{name} must use its named budget");
     assert!(
         call.after.starts_with(".await"),
         "{name} must await the bound operation"
@@ -319,6 +328,24 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             assert_bounded(
                 function_body(&source, "asyncfnacquire_private_aware_lease("),
                 "acquire_private_aware_lease",
+            );
+        } else if name == "invite_by_hash" {
+            let lookup = function_body(piece, name)
+                .strip_suffix("lookup.resolve(&mutclient).await}")
+                .expect("lookup must end by handing off to the bounded expiry resolver");
+            assert_bounded(lookup, name);
+            assert_eq!(
+                function_body(&source, "implInviteLookup{asyncfnresolve("),
+                concat!(
+                    "{matchself{Self::Active(row)=>invite_from_row(&row).map(Some),",
+                    "Self::Expired(id)=>{try_observe_invite_expiry(client,id).await;Ok(None)}",
+                    "Self::Refused=>Ok(None),}}",
+                ),
+                "the expiry resolver must await only the best-effort audit"
+            );
+            assert_bounded(
+                function_body(&source, "asyncfntry_observe_invite_expiry("),
+                "try_observe_invite_expiry",
             );
         } else {
             assert_bounded(piece, name);
@@ -497,6 +524,7 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     .map(|name| (name, function_body(store, &format!("asyncfn{name}("))));
     let helpers = [
         "invite_by_hash_on",
+        "try_observe_invite_expiry",
         "reap_unverified_users_on",
         "prune_expired_challenges_on",
         "delete_expired_rate_limit_slots",
@@ -587,10 +615,9 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         }
     }
     // The production redemption transaction lives outside worker_entry:
-    // slice its `tokio_postgres::Transaction` impl (comments stripped,
+    // slice its `PgTransaction` impl (comments stripped,
     // whitespace normalized, like `production()` above) and pin the
-    // same rule. `SET LOCAL` stays on `batch_execute` (simple-query
-    // protocol, never a named prepared statement).
+    // same rule. The wrapper owns the fixed `SET LOCAL` command.
     let redemption: String = include_str!("../src/magic_redemption.rs")
         .split_once("#[cfg(all(test,")
         .expect("magic_redemption test-module boundary")
@@ -602,7 +629,7 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         .filter(|ch| !ch.is_whitespace())
         .collect();
     let pg_impl = redemption
-        .split_once("implRedemptionTransactionfortokio_postgres::Transaction<'_>{")
+        .split_once("implRedemptionTransactionforPgTransaction<'_>{")
         .expect("production redemption transaction impl")
         .1
         .split_once("pub(crate)asyncfnredeem(")
@@ -626,7 +653,7 @@ fn history_controls_wire_to_postgres_storage() {
     let source = production();
     let dispatch = function_body(&source, "pubasyncfndispatch(");
     assert!(dispatch.contains("store:&PgStore{"));
-    assert!(dispatch.contains("handlers::handle(&ctx,&guarded_request).await"));
+    assert!(dispatch.contains("handle_with_transport_headers(&ctx,collected_request,&headers_map)"));
     let store = source.split_once("implStoreforPgStore{").unwrap().1;
     for (method, operation) in [
         ("export_listen_events", "export(&client,owner,before)"),
