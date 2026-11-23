@@ -684,7 +684,8 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
     use nntune_api::catalogue::*;
     let app = client(true).await;
     app.execute(
-        "INSERT INTO library VALUES (NULL, 'shared', $1, ARRAY[$2])",
+        "INSERT INTO library VALUES (NULL, 'shared', $1, ARRAY[upper($2)]),
+         ('u1', upper($2), NULL, ARRAY[]::text[])",
         &[&OTHER_RELEASE, &RECORDING],
     )
     .await
@@ -727,8 +728,13 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
             .query(library_page_statement(), &[&caller, &50_i64])
             .await
             .unwrap();
-        assert_eq!(page.len(), if caller == "u1" { 5 } else { 1 });
+        assert_eq!(page.len(), if caller == "u1" { 6 } else { 1 });
         assert!(page.iter().all(|r| r.get::<_, String>(0) != "private"));
+        let shared = page
+            .iter()
+            .find(|row| row.get::<_, &str>("job_id") == "shared")
+            .unwrap();
+        assert_eq!(shared.get::<_, bool>("recording_job_match"), caller == "u1");
     }
 }
 
@@ -1456,6 +1462,7 @@ async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
         },
         recording_mbid: recording.map(str::to_owned),
         recording_ord: if recording.is_some() { i as i64 + 1 } else { 0 },
+        recording_job_match: false,
     })
     .collect();
     assert_eq!(rows, assemble_library_rows(&page, &[], &[], &[]));

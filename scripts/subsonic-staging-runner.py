@@ -19,6 +19,9 @@ MATRIX = Path(__file__).resolve().parents[1] / "fixtures/subsonic/staging/matrix
 MATRIX_DIGEST = "18a076d2fc86f2a7dadf5efd2e1a1200c741b821379afeb158c4dac06ce80abb"
 MATRIX_LIMIT = 32 * 1024
 STAGING_ORIGIN = "https://staging.nntune.com"
+STAGING_TARGETS = frozenset(STAGING_ORIGIN + path for path in (
+    "/rest/getArtists", "/rest/getArtist", "/rest/getAlbum",
+))
 FORM_LIMIT = 8 * 1024
 ENCODED_API_KEY_LIMIT = 1024  # MAX_CREDENTIAL_VALUE_BYTES in subsonic_http.rs
 REJECTION_LIMIT = 1024
@@ -237,8 +240,8 @@ class StagingPostTransport:
         """Return a PostResponse or a sanitized fixed-rejection/client-ended sample.
 
         deadline is the executor's absolute monotonic cutoff; cancel is a threading.Event.
-        The caller must inject a separately authorized Access pair for staging /rest,
-        not a health-only token. There is no credential discovery or fallback.
+        The caller must inject the dedicated staging measurement Access pair and bearer.
+        Do not use shared QA, health or deploy credentials. There is no credential discovery or fallback.
         """
         slots, limits = self._matrix["slots"], self._matrix["limits"]
         require(type(number) is int and 1 <= number <= len(slots), "unreviewed-slot")
@@ -247,8 +250,6 @@ class StagingPostTransport:
         bearer, api_key = _validate_credentials(bearer, api_key)
         slot = slots[number - 1]
         post = _prepare_post(slot, bearer, api_key)
-        require(post.method == "POST" and post.url == f"{STAGING_ORIGIN}/rest/{slot['endpoint']}",
-                "destination-refused")
         reader = slot.get("reader", "normal")
         timeout_ms = limits["request_timeout_ms"]
         if reader != "normal":
@@ -259,6 +260,8 @@ class StagingPostTransport:
         read_after = start + {"normal": 0, "held": 1.5, "disconnect": 1.1}[reader]
         oracle = slot["expected"]["oracle"]
         cap = REJECTION_LIMIT if oracle in REJECTION_ORACLES else limits["body_bytes"]
+        require(post.method == "POST" and post.url in STAGING_TARGETS
+                and post.url == f"{STAGING_ORIGIN}/rest/{slot['endpoint']}", "destination-refused")
         argv = (
             "/usr/bin/curl", "--disable", "--globoff", "--proto", "=https", "--noproxy", "*",
             "--no-location", "--retry", "0", "--http1.1", "--silent", "--no-buffer", "--include",

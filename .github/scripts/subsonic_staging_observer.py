@@ -113,7 +113,7 @@ def parse_sample(raw, since, now):
 
 
 class PressureObservation(NamedTuple):
-    observed_ms: int
+    observed_ms: float
     measurement: int
     ordinary_free: int
 
@@ -122,12 +122,11 @@ def _sample(env, run, wall, monotonic, deadline_ms=None):
     child = connection_env(env)
     started = monotonic()
     started_ms = started * 1000
-    observed_ms = int(started_ms)
     timeout = DEADLINE_SECONDS
     if deadline_ms is None:
         since = wall()
     else:
-        cutoff_ms = min(deadline_ms, observed_ms + MAX_SAMPLE_AGE_SECONDS * 1000)
+        cutoff_ms = min(deadline_ms, started_ms + MAX_SAMPLE_AGE_SECONDS * 1000)
         if not started_ms < cutoff_ms:
             raise UnsafeSample("deadline")
         since = wall()
@@ -171,7 +170,7 @@ def _sample(env, run, wall, monotonic, deadline_ms=None):
         validated_ms = monotonic() * 1000
         if not finished * 1000 <= validated_ms < cutoff_ms:
             raise UnsafeSample("deadline")
-    return observed_ms, row
+    return started_ms, row
 
 
 def sample(env, run=subprocess.run, wall=time.time, monotonic=time.monotonic):

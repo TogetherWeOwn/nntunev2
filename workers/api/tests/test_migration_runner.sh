@@ -6,7 +6,10 @@ dir="$(mktemp -d)"
 trap 'rm -rf -- "$dir"' EXIT
 cat >"$dir/psql" <<'STUB'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >>"$PSQL_LOG"
+if [[ $1 == *'hostaddr=127.0.0.1' && ( ${PGHOSTADDR+x} == x || ${PGSERVICE+x} == x ) ]]; then
+  exit 99
+fi
+printf '%s\n' "$*" >>"${PSQL_LOG:-$(dirname "$0")/hosted-calls}"
 if [[ -n "${PSQL_EXIT:-}" ]]; then
   exit "$PSQL_EXIT"
 fi
@@ -46,6 +49,9 @@ env -i PATH="$dir:$PATH" DATABASE_URL=postgresql://scratch/db PSQL_LOG="$dir/cal
 grep -q 'migration tests passed' "$dir/output"
 grep -q 'migrations/0001_' "$dir/calls"
 grep -q 'workers/api/tests/sql/' "$dir/calls"
+if grep -Fq 'hosted_ingest_session_fixture=' "$dir/calls"; then
+  printf 'non-hosted runner loaded the session fixture\n' >&2; exit 1
+fi
 for table in users cache_objects; do
   grep -Fq "purge with a reader on $table: ERROR: 55P03: could not obtain lock on relation" "$dir/output"
 done
@@ -60,6 +66,20 @@ grep -Fq -- '-v purge_case=allow -c BEGIN;' "$dir/calls"
 grep -Fq 'workers/api/tests/fixtures/invite_windows_upgrade.sql' "$dir/calls"
 grep -Fq 'uncommitted invite window: ERROR: 55P03:' "$dir/output"
 grep -Fq 'committed invite window: ERROR: 23P01:' "$dir/output"
+
+run_hosted() {
+  env -i PATH="$dir:$PATH" GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+    PGHOSTADDR=192.0.2.1 PGSERVICE=other DATABASE_URL="$1" \
+    bash "$root/workers/api/tests/run_migration_tests.sh"
+}
+if run_hosted 'postgresql://example.invalid/nntune_ci' >"$dir/output" 2>&1; then
+  printf 'hosted runner accepted a foreign database\n' >&2; exit 1
+fi
+grep -Fq 'disposable GitHub-hosted migration database required' "$dir/output"
+[[ ! -e "$dir/hosted-calls" ]]
+run_hosted 'postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci' >"$dir/output"
+grep -Fq 'nntune_ci?hostaddr=127.0.0.1' "$dir/hosted-calls"
+grep -Fq 'hosted_ingest_session_fixture=true' "$dir/hosted-calls"
 
 # A psql error must still stop the runner before the success message.
 status=0

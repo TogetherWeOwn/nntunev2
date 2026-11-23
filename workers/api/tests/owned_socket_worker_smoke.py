@@ -182,7 +182,8 @@ def exercise_restricted_history(base, observe):
     )
 
     observe("""GRANT INSERT, UPDATE (covered_periods),
-        SELECT (stripe_invoice_id, user_id, stripe_subscription_id, covered_periods, amount_cents, currency)
+        SELECT (stripe_invoice_id, user_id, stripe_subscription_id, plan_id,
+                period_start, period_end, amount_cents, currency, paid_at, covered_periods)
         ON public.paid_invoice_history TO billing_history_fixture""")
     status, _, body = routing.http("POST", base + "/billing-restricted-history-proof")
     routing.check(status == 200 and body == "billing-restricted-history-ok", body)
@@ -394,6 +395,11 @@ def main():
                     status, _, body = routing.http("POST", url)
                     routing.check(status == 200 and body == "billing-deadline-ok", body)
                     print("PASS: billing deadline after writes rolled back", flush=True)
+                    print(
+                        "PASS: changed archived invoice evidence and attribution rolled back; "
+                        "exact replay, legacy coverage hydration and fresh refold held",
+                        flush=True,
+                    )
                     print(
                         "PASS: dormant billing Store refused changed equal-end terminal proof; "
                         "fresh refold, uncancel and paid-end cutoff held",

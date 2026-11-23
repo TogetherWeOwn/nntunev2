@@ -6,12 +6,76 @@ remains off by default. In a separately authorized window, the trusted
 allowlist of case IDs to the existing v1 lease fields. The entire value is
 bounded to 640 bytes. Unknown, duplicate or empty entries invalidate the whole
 schedule. The SHA, expiry, exact HTTPS staging host and runner bearer checks
-remain in force. The runner selects one listed case with the
+remain in force. The measurement mount admits only the three POST routes
+below. The runner selects one listed case with the
 `X-Subsonic-Measurement-Case` header; missing, malformed and unlisted selectors
 on an armed mount receive the same fixed 404 as a missing runner bearer.
 Fixture selection follows real auth against the dedicated binding and the
 lease-principal match. No request can supply a recipe, ceiling or identity;
 no case falls back to ordinary staging Hyperdrive or a catalogue database.
+
+## Draft: dedicated staging runner identity and Access scope
+
+Review only. Do not apply this draft, provision or bind credentials, arm the
+mount, extend a lease, or make live requests as part of this change. This uses
+existing staging infrastructure with no new service or spend.
+
+| Literal Access application path | Measurement admission |
+| --- | --- |
+| `staging.nntune.com/rest/getArtists` | `POST /rest/getArtists` |
+| `staging.nntune.com/rest/getArtist` | `POST /rest/getArtist` |
+| `staging.nntune.com/rest/getAlbum` | `POST /rest/getAlbum` |
+
+- Add the same **one dedicated service-token identity** as a Service Auth entry
+  on each of these literal paths only. No broad `/rest/*`, alias, bypass,
+  host-wide edit or production change. The [Access path rules][access-paths]
+  can cover descendants, and a more specific application takes precedence
+  rather than inheriting the parent's policies. Before any placement, compare
+  effective policies on all three paths and their covered descendants. Retain
+  the existing Allowed identities (including the Owner OTP and agent QA
+  identity documented in [staging Access](../ops.md#cloudflare-access-staging)),
+  other applicable policy conditions, order and session behavior. Do not change
+  any pre-existing stricter descendant or encode a guessed copy of the baseline.
+- Access is not an exact HTTP method/path guard: it cannot distinguish the
+  allowed POST from another method on the same path, and a literal app can
+  also match subpaths. The Worker checks the exact `POST` and serialized
+  pathname and HTTPS staging host before body reads or fixture DB access. No
+  alias or pathname decoding in the mount. Off/unsupported requests stay with
+  the ordinary adapter, so Worker refusal of measurement admission does not
+  restrict the dedicated identity's access to ordinary routes. Before placement,
+  verify effective Access denies that identity on other methods, descendants,
+  aliases and sibling paths while preserving existing callers' access. Check
+  both edge normalization and Fetch URL parsing, which can normalize a path
+  before the Worker compares it. The runner independently pins the whole HTTPS
+  URL and method before curl spawns, without redirects. If either boundary
+  cannot be enforced, leave the draft unapplied.
+- Name-only placement metadata (source task, after reviews and separate
+  authorization): service token `nntune-subsonic-staging-runner`, runner inputs
+  `access_client_id`, `access_client_secret` and `bearer`, Worker staging secret
+  `SUBSONIC_MEASUREMENT_RUNNER`. Measurement admission also requires the
+  existing Worker staging flag `QA_CODE_SEAM=1`. Verify it only during a
+  separately authorized measurement window. This draft leaves the flag unset
+  wherever it is currently off. No workflow consumes these inputs in this slice.
+  The Operator stages the dedicated Worker binding and runner inputs through
+  approved secret handling, never in repo config, logs, argv or cards. No
+  fallback to shared QA, health or deploy credentials; those stay unchanged.
+- Use the shortest practical lifetime, at most 30 days for **each** of the
+  Access token and the independent bearer. The Worker secret has the shape
+  `v1:<issued-utc-seconds>:<expires-utc-seconds>:<bearer>`, with a fresh
+  32-byte random bearer encoded as 43 unpadded base64url characters. Send
+  only the bearer field in Authorization. Worker UTC enforces the half-open
+  window and rejects durations over 30 days. Do not extend the same bearer or
+  renew the Access token. Verify that Access session settings do not grant the
+  new identity access beyond its credential window without changing existing
+  callers' session behavior; otherwise leave the draft unapplied. Expiry does
+  not disarm the deployment, remove bindings, or prove drain.
+- Rollback (only if later placed): remove only the added Service Auth entries
+  and any new path applications created for them so the original effective
+  policies resume. Revoke only the dedicated Access token and remove only the
+  dedicated Worker secret and runner copies. Leave existing identities,
+  applications, secrets, and the separate off/drain procedure untouched.
+
+[access-paths]: https://developers.cloudflare.com/cloudflare-one/access-controls/policies/app-paths/
 
 ## Fixture-to-boundary map
 
@@ -130,6 +194,46 @@ and cleanup. That group does not fence dashboard or API writes. Cloudflare's
 does not expose an expected-current deployment precondition. A read followed by
 an unconditional rollback is not safe; do not arm or attempt that write without
 a fence that covers all writers.
+
+### Read-only off and drain verifier
+
+`verify_cleanup` in [the staging cleanup module](../../.github/scripts/subsonic_staging_cleanup.py)
+accepts a trusted deployment ID, version ID and build SHA. It checks fresh
+provider deployment and version results (not saved receipts) for 100% traffic
+on that exact deployment and for the default-off configuration. It then takes
+one independent `sample_pressure` reading. Its query start must be strictly
+later than the off readback, and a fresh zero measurement-session count must
+still hold as evidence when the final deployment read matches the pin.
+
+On a protected `main` push, [`deploy.yml`](../../.github/workflows/deploy.yml)
+checks off and drained state after `staging-api` deploys successfully and the
+same job validates a matched provider identity receipt for that build. A
+failed or skipped deploy (including a schema-gate failure) or a missing or bad
+pin skips the readback. The job records the readback step's raw outcome apart
+from the deploy result; readback failure does not change E2E eligibility. Do
+not dispatch or rerun a workflow to fill in missing post-deploy evidence.
+
+The deploy step and the separate manual
+[`subsonic-staging-off-drain`](../../.github/workflows/subsonic-staging-off-drain.yml)
+workflow both use the read-only adapter on protected `main`. It uses a dedicated
+`SUBSONIC_STAGING_WORKERS_READ_TOKEN` in the `staging` environment with Workers
+Scripts Read on the intended account, the configured `CLOUDFLARE_ACCOUNT_ID`, and
+that environment's `PLANETSCALE_OBSERVER_URL_STAGING`. Do not substitute the
+staging deploy token or the health-only Access token. The provider reads target
+only `nntune-api-staging`. All reads share a 30-second monotonic deadline;
+Actions also bounds the command and its children with an outer timeout.
+
+For a separate manual observation, dispatch once on `main` with
+`expected_deployment_id`, `expected_version_id`, and `expected_build_sha` from
+the **same** trusted staging deployment receipt. The manual workflow SHA can
+differ from the staging build SHA.
+
+In either lane, the receipt supplies the pin, not the evidence. Require the
+actual readback step to report `subsonic-staging-off-drain: verified` and have
+a successful raw outcome. Record the run/job link and the pinned receipt,
+or record that readback did not verify. This is point-in-time evidence only:
+it neither fences concurrent writers nor restores a deployment, cancels
+clients, proves recovery after runner loss, or authorizes measurement.
 
 ### Actions step finalization (synthetic only)
 

@@ -1,9 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { captureAuthFence } from '#lib/auth-fence.js';
 import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
 import { load } from './+page';
+import { useSessionFixture } from './page.fixture.js';
 import type { PageData } from './$types';
 
+useSessionFixture();
+
 afterEach(() => vi.unstubAllGlobals());
+
+it('withholds billing data when no account scope can be captured', async () => {
+	vi.mocked(captureAuthFence).mockResolvedValueOnce(undefined);
+	const fetch = vi.fn<typeof globalThis.fetch>();
+	await expect(load({ fetch } as never)).resolves.toMatchObject({
+		subscription: null, usage: null, hadFetchError: true
+	});
+	expect(fetch).not.toHaveBeenCalled();
+});
 
 function mockFetch(
 	routes: Record<string, { status: number; body: unknown; headers?: HeadersInit }>
@@ -351,9 +364,11 @@ describe('billing period-end wording', () => {
 				expect(body).not.toMatch(/renews/i);
 				expect(body).not.toContain('trial ends');
 				if (currentPeriodEnd) {
-					expect(body).toContain(`period ends ${new Date(currentPeriodEnd).toLocaleDateString()}`);
+					const displayDate = new Date(currentPeriodEnd).toLocaleDateString();
+					expect(body).toContain(`period ends <time datetime="${currentPeriodEnd}">${displayDate}</time>`);
 				} else {
 					expect(body).not.toContain('period ends');
+					expect(body).not.toContain('<time');
 				}
 				const confirmed = status === 'active';
 				expect(data.planUnknown).toBe(!confirmed);
@@ -364,6 +379,26 @@ describe('billing period-end wording', () => {
 				expect(body).not.toContain('Invalid Date');
 			}
 		);
+	});
+
+	it.each([
+		['2028-02-29T00:15:00.123456789+05:30', '2028-02-29T00:15:00.123+05:30'],
+		['2028-02-29T00:15:00+0530', '2028-02-29T00:15:00+0530'],
+		['2026-11-15T12:00:00-00:00', '2026-11-15T12:00:00Z'],
+		['2026-11-15T12:00:00-0000', '2026-11-15T12:00:00Z'],
+		['0000-11-15', null]
+	] as const)('keeps the local date for %s with datetime %s', async (currentPeriodEnd, datetime) => {
+		const data = await loadPage(fetchWithSubscription({ ...PAID_SUBSCRIPTION, currentPeriodEnd }));
+		const body = await renderPage(data);
+		const displayDate = new Date(currentPeriodEnd).toLocaleDateString();
+
+		expect(data.subscription?.currentPeriodEnd).toBe(currentPeriodEnd);
+		if (datetime) {
+			expect(body).toContain(`period ends <time datetime="${datetime}">${displayDate}</time>`);
+		} else {
+			expect(body).toContain(`period ends ${displayDate}`);
+			expect(body).not.toContain('<time');
+		}
 	});
 });
 
@@ -376,6 +411,7 @@ describe('billing loader rejects malformed successful subscription payloads reco
 		['local expired status', { ...PAID_SUBSCRIPTION, status: 'expired' }],
 		['unknown status', { ...PAID_SUBSCRIPTION, status: 'banana' }],
 		['missing required dates', { planId: 'pro', status: 'active' }],
+		['missing period end', { ...PAID_SUBSCRIPTION, currentPeriodEnd: undefined }],
 		['wrong-typed date', { ...PAID_SUBSCRIPTION, currentPeriodEnd: 1794745800000 }],
 		['unparseable date', { ...PAID_SUBSCRIPTION, currentPeriodEnd: 'garbage' }]
 	])('keeps %s out of subscription state and rendering', async (_label, subscription) => {
@@ -391,6 +427,7 @@ describe('billing loader rejects malformed successful subscription payloads reco
 		const body = await renderPage(data);
 		expect(body).toMatch(/could not load (?:your )?subscription/i);
 		expect(body).toContain('Retry');
+		expect(body).not.toContain('<time');
 		expect(body).not.toContain('Invalid Date');
 		expect(body).not.toContain('Upgrade to');
 	});
