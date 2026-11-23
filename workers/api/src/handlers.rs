@@ -24432,19 +24432,15 @@ mod tests {
         let owner = seed_admin(&h, "owner", "owner@example.test");
         seed_user(&h, "outsider", "outsider@example.test");
         let outsider = magic_login(&h, "outsider@example.test");
-        let issue = |email: &str| {
-            let resp = h.call_full(
-                "POST",
-                "/v1/admin/invites",
-                Some(json!({"email": email}).to_string()),
-                Some(owner.clone()),
-                Some(ORIGIN),
-            );
-            assert_eq!(resp.status, 201);
-            serde_json::from_str::<Value>(&resp.body).unwrap()
-        };
         let invited_email = "friend@example.test";
-        let selected = issue(invited_email);
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(json!({"email": invited_email}).to_string()),
+            Some(owner.clone()),
+            Some(ORIGIN),
+        );
+        let selected: Value = serde_json::from_str(&issued.body).unwrap();
         let code = selected["code"].as_str().unwrap();
         let expires_at = NOW + 30;
         h.config.private_listening = crate::private_listening::PrivateListening::parse(&json!({
@@ -24464,7 +24460,7 @@ mod tests {
 
         let (finish, friend_id) =
             signup_with_invite(&h, invited_email, b"fixture-private-cred", 21, Some(code));
-        assert_eq!(finish.status, 200);
+        assert_eq!(finish.body, r#"{"ok":true,"private_listening":true}"#);
         let friend = cookie_of(&finish);
         assert_eq!(
             start(json!({"email": invited_email, "invite_code": code})).status,
@@ -24484,41 +24480,40 @@ mod tests {
             h.store.playback_subscriptions.borrow().is_empty()
                 && h.store.invoice_history.borrow().is_empty()
         );
-        let play = |cookie: &str, track: &str| {
-            play_call(&h, cookie, json!({"track_id": track, "session_id": "tab"}))
-        };
-        assert_eq!(play(&outsider, CAT_REC_A).status, 403);
-        assert_eq!(
-            play(&owner, CAT_REC_A).status,
-            404,
-            "owner cannot use a friend's private track"
-        );
-        let issued = play(&friend, CAT_REC_A);
+        let play = json!({"track_id": CAT_REC_A, "session_id": "tab"});
+        assert_eq!(play_call(&h, &outsider, play.clone()).status, 403);
+        assert_eq!(play_call(&h, &owner, play.clone()).status, 404);
+        let issued = play_call(&h, &friend, play.clone());
         assert_eq!(issued.status, 200);
         let state: Value = serde_json::from_str(&issued.body).unwrap();
         assert_eq!(state["expires_at"], expires_at);
         let renewal =
             json!({"track_id": CAT_REC_A, "session_id": "tab", "play_id": state["play_id"]});
-        h.store
-            .invites
-            .borrow_mut()
-            .get_mut(&auth::hash_invite_code(code))
+        let heartbeat = |h: &Harness| {
+            h.call_full(
+            "POST", "/v1/plays/heartbeat",
+            Some(json!({"session_id": "tab", "play_id": state["play_id"], "lease_epoch": state["lease_epoch"]}).to_string()),
+            Some(friend.clone()), Some(ORIGIN),
+        )
+        };
+        assert_eq!(heartbeat(&h).status, 200);
+        h.config
+            .private_listening
+            .as_mut()
             .unwrap()
-            .revoked_at = Some(NOW);
-        assert_eq!(library("/api/library", Some(friend.clone())).status, 403);
+            .invite_ids
+            .clear();
+        assert_eq!(
+            h.call_full("GET", "/api/library", None, Some(friend.clone()), None)
+                .status,
+            403
+        );
         assert_eq!(play_call(&h, &friend, renewal.clone()).status, 403);
-
+        assert_eq!(heartbeat(&h).status, 403);
         h.config.private_listening = None;
         assert_eq!(play_call(&h, &friend, renewal).status, 404);
-        assert_eq!(
-            play_call(
-                &h,
-                &friend,
-                json!({"track_id": CAT_REC_A, "session_id": "tab"})
-            )
-            .status,
-            402
-        );
+        assert_eq!(heartbeat(&h).status, 404);
+        assert_eq!(play_call(&h, &friend, play).status, 402);
     }
 
     fn audits_with_action(h: &Harness, action: &str) -> Vec<vault::AuditEvent> {
