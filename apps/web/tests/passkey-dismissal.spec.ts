@@ -262,6 +262,7 @@ test('private listening invite opens Library and refusal clears it', async ({ pa
 	const code = 'synthetic_invite_codeA';
 	const email = 'friend@example.test';
 	const binding = 'A'.repeat(43);
+	const session = 'fixture_private_session=synthetic';
 	let revoked = false;
 	await page.route('**/v1/auth/passkey/register/start', (route) => {
 		const input = route.request().postDataJSON();
@@ -271,12 +272,20 @@ test('private listening invite opens Library and refusal clears it', async ({ pa
 	});
 	await page.route('**/v1/auth/passkey/register/finish', (route) => {
 		expect(route.request().postDataJSON()).toMatchObject({ invite_code: code, magic_token: 'fixture-code' });
-		return route.fulfill({ json: { ok: true, private_listening: true } });
+		return route.fulfill({
+			headers: { 'set-cookie': `${session}; Path=/; HttpOnly; SameSite=Lax` },
+			json: { ok: true, private_listening: true }
+		});
 	});
-	await page.route('**/v1/me/likes/session', (route) => route.fulfill({ json: { session_binding: binding } }));
-	await page.route('**/api/library', (route) => revoked
-		? route.fulfill({ status: 403, json: { code: 'forbidden' } })
-		: route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [{ id: 'fixture-track', title: 'Synthetic track' }] }));
+	await page.route('**/v1/me/likes/session', async (route) => {
+		if (!(await route.request().headerValue('cookie'))?.includes(session)) return route.fulfill({ status: 401 });
+		return route.fulfill({ json: { session_binding: binding } });
+	});
+	await page.route('**/api/library', async (route) => {
+		if (!(await route.request().headerValue('cookie'))?.includes(session)) return route.fulfill({ status: 401 });
+		if (revoked) return route.fulfill({ status: 403, json: { code: 'forbidden' } });
+		return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [{ id: 'fixture-track', title: 'Synthetic track' }] });
+	});
 	await page.goto('/signup');
 	await page.getByTestId('signup-email').fill(email);
 	await page.getByTestId('signup-submit').click();

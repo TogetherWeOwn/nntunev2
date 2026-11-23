@@ -1057,7 +1057,9 @@ their expiry, up to 15 minutes. Confirm an empty payment history and no
 Stripe credentials for the synthetic cohort. Keep the music-video interface
 off. Exclude payment checkout, paid renewal/grace, member-issued invitations,
 real media delivery, range/seek behavior and consumption metering from this
-access-only evidence. These retain their own qualification requirements.
+access-only evidence. Run the existing paid signup-arrival case with the
+cohort setting absent, since it expects the Billing destination. Preserve the
+same serving build identity when qualifying the two configurations.
 Apply the existing staging promotion checklist to any release candidate.
 
 ## Staging promotion checklist
