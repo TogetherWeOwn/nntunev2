@@ -1,6 +1,7 @@
 """Pin and execute the migration selector -> output -> gate workflow contract."""
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -14,7 +15,7 @@ from test_ci_pnpm_retry import (
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SELECT = 'python3 .github/scripts/migrations_base.py --root . >> "$GITHUB_OUTPUT"'
+SELECT = 'python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"'
 GATE = 'python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"'
 
 
@@ -25,23 +26,25 @@ class TestMigrationWorkflow(unittest.TestCase):
         self.steps = split_steps(self.job)
 
     def test_selector_output_is_required_gate_input(self):
-        for command in (SELECT, GATE,
-                        "python3 .github/scripts/test_migrations_base.py",
+        job = self.jobs["ci-commits"]
+        for command in (SELECT, "python3 -m unittest discover -s .github/scripts -p test_workflow_pr_shas.py"):
+            self.assertEqual([], check_required_step("ci-commits", job, command))
+        for command in (GATE, "python3 .github/scripts/test_migrations_base.py",
                         "python3 .github/scripts/test_ci_migrations_base.py"):
             self.assertEqual([], check_required_step("migrations-gate", self.job, command))
-        self.assertIn("migrations-gate", job_needs(self.jobs["ci-ok"]))
-        checkout = next(step for step in self.steps if "actions/checkout@" in step)
+        self.assertTrue({"migrations-gate", "docs-links", "ci-commits"} <= set(job_needs(self.jobs["ci-ok"])))
+        for name in ("docs-links", "migrations-gate"):
+            self.assertIn("ci-commits", job_needs(self.jobs[name]))
+            self.assertIn("${{ needs.ci-commits.outputs.base_sha }}", self.jobs[name])
+        checkout, selector, _, ratchet, _ = split_steps(job)
         self.assertEqual("0", step_field(checkout, "fetch-depth"))
         self.assertIsNone(step_field(checkout, "ref"), "retain the default integration checkout")
-        selector = next(step for step in self.steps if step_field(step, "run") == SELECT)
-        gate = next(step for step in self.steps if step_field(step, "run") == GATE)
-        self.assertEqual("migrations-base", step_field(selector, "id"))
-        self.assertLess(self.steps.index(checkout), self.steps.index(selector))
-        self.assertLess(self.steps.index(selector), self.steps.index(gate))
-        self.assertIn("        env:\n          MIGRATIONS_BASE_REF: ${{ steps.migrations-base.outputs.base_ref }}", gate)
-        self.assertNotIn("github.event.pull_request.base.sha", self.job)
-        self.assertIn("MIGRATIONS_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", self.job)
-        self.assertIn("MIGRATIONS_PUSH_BEFORE: ${{ github.event.before }}", self.job)
+        self.assertEqual("commits", step_field(selector, "id"))
+        self.assertIn('check_workflow_pr_shas.py --base "$BASE_SHA" --tested "$MERGE_SHA"', ratchet)
+        self.assertIn("BASE_SHA: ${{ steps.commits.outputs.base_sha }}", ratchet)
+        self.assertIn("MERGE_SHA: ${{ steps.commits.outputs.merge_sha }}", ratchet)
+        self.assertNotIn("continue-on-error:", ratchet)
+        self.assertIsNone(step_field(ratchet, "if"))
 
     def test_real_workflow_commands_pass_selected_base_and_propagate_failure(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -84,16 +87,18 @@ class TestMigrationWorkflow(unittest.TestCase):
             git("checkout", "-q", "main")
             git("-c", "commit.gpgsign=false", "merge", "--no-ff", "-qm", "integration", "change")
             merge = git("rev-parse", "HEAD")
+            event = root / "event.json"
+            event.write_text(json.dumps({"pull_request": {"head": {"sha": pr_head}}}))
             env = {**os.environ, "GITHUB_EVENT_NAME": "pull_request",
                    "GITHUB_REF": "refs/pull/1/merge", "GITHUB_SHA": merge,
-                   "MIGRATIONS_PR_HEAD_SHA": pr_head, "GITHUB_OUTPUT": str(root / "output")}
-            selector = next(step_field(step, "run") for step in self.steps
-                            if step_field(step, "id") == "migrations-base")
+                   "GITHUB_EVENT_PATH": str(event), "GITHUB_OUTPUT": str(root / "output")}
+            selector = next(step_field(step, "run") for step in split_steps(self.jobs["ci-commits"])
+                            if step_field(step, "id") == "commits")
             result = run("bash", "-eo", "pipefail", "-c", selector, env=env)
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn(f"checkout={merge} base={base}", result.stderr)
-            key, value = (root / "output").read_text().strip().split("=", 1)
-            self.assertEqual("base_ref", key)
+            outputs = (root / "output").read_text()
+            value = dict(line.split("=", 1) for line in outputs.splitlines())["base_sha"]
             self.assertEqual(base, value)
             gate = next(step_field(step, "run") for step in self.steps
                         if "migrations_gate.py" in (step_field(step, "run") or ""))
@@ -105,7 +110,7 @@ class TestMigrationWorkflow(unittest.TestCase):
                          env={**env, "GITHUB_SHA": base})
             self.assertEqual(2, result.returncode, result.stderr)
             # A failed selector must never append a fallback output.
-            self.assertEqual(f"base_ref={base}\n", (root / "output").read_text())
+            self.assertEqual(outputs, (root / "output").read_text())
 
 
 if __name__ == "__main__":

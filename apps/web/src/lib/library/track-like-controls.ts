@@ -92,7 +92,7 @@ export function createTrackLikeControls(
 		return {
 			liked,
 			pending: inFlight.has(id),
-			toggle: () => write(() => setTrackLike(owner.client, id, !liked, binding),
+			toggle: () => write(() => setTrackLike(owner.client, id, !liked),
 				(confirmedId) => owner.confirm(id, confirmedId, !liked)),
 			taste: taste && saved !== undefined ? {
 				saved: visible?.signal,

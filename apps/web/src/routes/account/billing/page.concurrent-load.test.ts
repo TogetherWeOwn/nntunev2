@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
 import { load } from './+page';
+import { useSessionFixture } from './page.fixture.js';
+
+useSessionFixture();
 
 /**
  * Protected acceptance spec: the billing loader dispatches the subscription

@@ -442,7 +442,7 @@
 {:else}
 	<div class="nt-topbar nt-wrap" data-testid="shell-topbar">
 		<a class="nt-brand" href="/home">NNTune</a>
-		<form class="nt-topbar-search" role="search" onsubmit={onSearchSubmit}>
+		<form class="nt-topbar-search" role="search" aria-label="Top bar" onsubmit={onSearchSubmit}>
 			<input
 				type="search"
 				name="q"

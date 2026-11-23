@@ -145,7 +145,9 @@ test('clears former-session data and ignores a write response even if its transp
 	await schedule(page).click();
 	await expect(page.locator('html')).toHaveAttribute('data-window-fixture', 'held');
 	await page.evaluate(() => {
-		window.dispatchEvent(new StorageEvent('storage', { key: 'nntune.auth.generation.v1', storageArea: localStorage }));
+		const key = 'nntune.auth.generation.v1';
+		localStorage.setItem(key, 'replacement-session');
+		window.dispatchEvent(new StorageEvent('storage', { key, storageArea: localStorage }));
 		window.dispatchEvent(new Event('release-window-fixture'));
 	});
 	await expect(schedule(page)).toHaveCount(0);
