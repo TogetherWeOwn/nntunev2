@@ -158,10 +158,13 @@ jobs:
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
           # Check inheritance from outside production without passing secret values to this runner.
           UNPROTECTED_CF_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' }}
+          UNPROTECTED_ROLLBACK_CONFIG: ${{ inputs.mode == 'promote' && (secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '') }}
         run: |
           set -euo pipefail
           [ "${UNPROTECTED_CF_CONFIG:-}" = false ] ||
             { echo '::error::Cloudflare credentials must exist only in the production Environment'; exit 1; }
+          [ "${UNPROTECTED_ROLLBACK_CONFIG:-}" = false ] ||
+            { echo '::error::Rollback custody and intent key must exist only in the production Environment'; exit 1; }
           python3 - <<'PY'
           import json, os, sys, urllib.request
 
@@ -310,65 +313,16 @@ jobs:
         # out the dispatch tip, while this job checked out the validated
         # promotion SHA above.
         run: node ci/check-production-secrets-shape.mjs
-      - name: Require production-only Cloudflare credentials
-        env:
+      - name: Require verified private maintenance before upload
+        env: &rollback-env
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
-            echo "::error::Production-only Cloudflare credentials must be configured in the production Environment"
-            exit 1
-          fi
-          echo "production credentials present (names only)"
-      # One-time production seed precondition (see docs/ops.md). The shared
-      # gradual-promote action records its rollback target from the latest
-      # production deployment and refuses unless that deployment is a single
-      # version at 100%. Check that here, before uploading, so the first
-      # promotion fails with seed instructions instead of orphaning an
-      # uploaded version inside the action.
-      - name: Require one-time production seed deployment
-        working-directory: apps/web
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
-          WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
-        run: |
-          set -euo pipefail
-          npx wrangler deployments list --env production --name "$WORKER_NAME" --json \
-            | node -e '
-              let raw = "";
-              process.stdin.on("data", (c) => { raw += c; });
-              process.stdin.on("end", () => {
-                const seed = "Require one production version at 100%. If unseeded, keep promotion off. " +
-                  "See docs/ops.md production seed precondition.";
-                let parsed;
-                try {
-                  parsed = JSON.parse(raw);
-                } catch (e) {
-                  console.error("::error::could not parse deployments list output: " + e.message);
-                  process.exit(1);
-                }
-                const deployments = Array.isArray(parsed) ? parsed : (parsed.result ?? parsed.deployments);
-                if (!Array.isArray(deployments) || deployments.length === 0) {
-                  console.error("::error::No production deployments found. " + seed);
-                  process.exit(1);
-                }
-                let newest = deployments[0];
-                for (const entry of deployments.slice(1)) {
-                  if (String(entry?.created_on ?? "") > String(newest?.created_on ?? "")) newest = entry;
-                }
-                const versions = newest?.versions;
-                const id = Array.isArray(versions) && versions.length === 1 && versions[0]?.percentage === 100
-                  ? versions[0]?.version_id
-                  : undefined;
-                if (typeof id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
-                  console.error("::error::Latest production deployment is not a single-version 100% deployment. " + seed);
-                  process.exit(1);
-                }
-                console.log("production seed ok: rollback target " + id);
-              });
-            '
+          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          ROLLBACK_CUSTODY: ${{ secrets.PRODUCTION_ROLLBACK_CUSTODY }}
+          INTENT_KEY: ${{ secrets.PRODUCTION_ROLLBACK_INTENT_KEY }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          DOMAIN: ${{ needs.preflight.outputs.domain }}
+        run: node ci/production-maintenance/final-smoke-rollback.mjs check-seed
       # Uploading a version does not mutate routes, custom domains or cron
       # triggers. Never use a full deploy or a trigger-syncing subcommand
       # here: those re-provision the production hostname and fail or drift.
@@ -383,6 +337,16 @@ jobs:
           set -euo pipefail
           npx wrangler versions upload --env production \
             --tag "${DEPLOY_SHA:?}-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
+      - name: Record protected rollback intent before shifting traffic
+        env: *rollback-env
+        run: node ci/production-maintenance/final-smoke-rollback.mjs record
+      - name: Preserve sealed rollback intent before shifting traffic
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-rollback-intent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-rollback-intent.sealed
+          if-no-files-found: error
+          retention-days: 30
       # Gradual promotion lives in the shared central composite action
       # (pinned below): 5% -> 50% -> 100% with per-stage health gates pinned
       # to the new version, and automatic rollback to the recorded
@@ -398,20 +362,26 @@ jobs:
           domain: ${{ needs.preflight.outputs.domain }}
           api-token: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           account-id: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+      - name: Pin the final deployment before final smoke
+        id: final-allocation
+        # Keep this guard and the restore in this job's production lock.
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          ROLLBACK_CUSTODY: ${{ secrets.PRODUCTION_ROLLBACK_CUSTODY }}
+          INTENT_KEY: ${{ secrets.PRODUCTION_ROLLBACK_INTENT_KEY }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          DOMAIN: ${{ needs.preflight.outputs.domain }}
+          PROMOTED_VERSION: ${{ steps.gradual.outputs.promoted-version-id }}
+          PREV_VERSION: ${{ steps.gradual.outputs.rollback-version-id }}
+        run: node ci/production-maintenance/final-smoke-rollback.mjs pin-final
       - name: Verify production serves the promoted build
+        id: final-smoke
         if: inputs.mode == 'promote'
-        # Post-promotion verification: after the gradual promotion reaches
-        # 100%, probe the public-route set against the production origin and
-        # prove the serving build is the promoted SHA (GET /api/build). Same
-        # retry contract as the stage gates (6 attempts, 10s sleeps, fail
-        # closed). No automatic restore here: a failed verification leaves
-        # the promoted candidate live at 100% and prints the recorded
-        # restoration target; the operator restores it with a wrangler
-        # rollback to that version id.
         env:
           DOMAIN: ${{ needs.preflight.outputs.domain }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
-          PREV_VERSION: ${{ steps.gradual.outputs.rollback-version-id }}
         run: |
           set -euo pipefail
           for i in 1 2 3 4 5 6; do
@@ -424,8 +394,12 @@ jobs:
               sleep 10
             fi
           done
-          echo "::error::post-promotion smoke failed; promoted candidate remains live at 100%; recorded restoration target ${PREV_VERSION:-unknown} - restore it with a wrangler rollback to that version id"
+          echo '::error::Post-promotion smoke failed'
           exit 1
+      - name: Restore recorded maintenance after failed final smoke
+        if: failure() && !cancelled() && steps.final-allocation.outcome == 'success' && steps.final-smoke.outcome == 'failure'
+        env: *rollback-env
+        run: node ci/production-maintenance/final-smoke-rollback.mjs restore
       - name: Record successful production promotion
         if: inputs.mode == 'promote'
         # Success-only and after the identity-aware smoke above. Write inline
