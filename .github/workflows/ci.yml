@@ -806,7 +806,11 @@ jobs:
         run: bash workers/api/tests/test_migration_runner.sh
       - name: Exercise first-launch catalog preflight on disposable PostgreSQL
         run: python3 .github/scripts/test_database_bootstrap_preflight_postgres.py
-      - run: bash workers/api/tests/run_migration_tests.sh
+      - name: Run migration tests and verify the scoped reservation fixture
+        run: |
+          set -euo pipefail
+          bash workers/api/tests/run_migration_tests.sh | tee "$RUNNER_TEMP/migration-tests.log"
+          grep -Fxq 'test (hosted): ingest_session_reserve passed' "$RUNNER_TEMP/migration-tests.log"
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - name: Exercise hosted reservation race fixture
