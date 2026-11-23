@@ -1,10 +1,13 @@
-//! Exact-target folds committed through the dormant Worker store on disposable PostgreSQL.
-use super::{billing_budget, MirrorBinding, PgStore, ReconcileProbe, StoreError, CONNECTION};
+//! Exact-target folds through the owned Worker store on disposable PostgreSQL.
+use super::{
+    billing_budget, MirrorBinding, PgStore, ReconcileProbe, Store, StoreError, CONNECTION,
+};
 use crate::billing_reconcile::{
     reconcile_exact_target, reconcile_live_select_statement, reconcile_target_select_statement,
-    FailClosedReason, LiveRow, PriceBinding, ReconcileInput, ReconcileOutcome, RemoteSubscription,
+    FailClosedReason, LiveRow, PaidInvoiceRow, PriceBinding, ReconcileInput, ReconcileOutcome,
+    RemoteSubscription,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 const USER: &str = "worker_fault_user";
 const HOLDER: &str = "sub_worker_fault";
@@ -90,11 +93,11 @@ fn remote(id: &str, item: &str, status: &str, invoices: &[(&str, &str)]) -> Remo
             "id": id, "customer": customer, "status": status, "current_period_end": END,
             "items": { "data": [{ "id": item, "price": PRICE }] }
         })).expect("fixed subscription fixture"),
-        invoices: invoices.iter().enumerate().map(|(order, (invoice, currency))| {
+        invoices: invoices.iter().map(|(invoice, currency)| {
             serde_json::from_value(json!({
                 "id": invoice, "customer": customer, "subscription": id, "status": "paid",
-                "currency": currency, "amount_paid": 800, "status_transitions": { "paid_at": NOW + order as i64 },
-                "lines": { "has_more": false, "data": [{ "id": "il_exact_target", "amount": 800, "price": PRICE,
+                "currency": currency, "amount_paid": 800, "status_transitions": { "paid_at": NOW - 1 },
+                "lines": { "has_more": false, "data": [{ "id": "il_exact_target", "amount": 800, "price": PRICE, "currency": currency,
                     "period": { "start": NOW - 1, "end": END } }] }
             })).expect("fixed invoice fixture")
         }).collect(),
@@ -404,7 +407,8 @@ pub(super) async fn check() -> Result<(), &'static str> {
         return Err("fresh exact-target retry did not recover state and history");
     }
     check_existing_target_suppression(&store).await?;
-    check_terminal_provenance(&store).await
+    check_terminal_provenance(&store).await?;
+    check_archive_evidence(&store).await
 }
 
 async fn check_terminal_provenance(store: &PgStore) -> Result<(), &'static str> {
@@ -455,6 +459,11 @@ async fn check_terminal_provenance(store: &PgStore) -> Result<(), &'static str> 
                 "active",
                 &[(OLD_ANCHOR, "usd"), (NEW_ANCHOR, "usd")],
             );
+            listing.invoices[1]
+                .status_transitions
+                .as_mut()
+                .unwrap()
+                .paid_at = Some(NOW);
         } else {
             // Same shared anchor and paid end, with a qualifying line for the new price.
             let item = &mut listing.subscription.items.as_mut().unwrap().data[0];
@@ -539,6 +548,188 @@ async fn check_terminal_provenance(store: &PgStore) -> Result<(), &'static str> 
         || entitled_at(END - 1).await?
     {
         return Err("fresh terminal refold failed to release entitlement or changed paid history");
+    }
+    Ok(())
+}
+
+async fn archive_fixture_sql(sql: &'static str) -> Result<(), &'static str> {
+    billing_budget::with_owned_connection(
+        "127.0.0.1",
+        5432,
+        CONNECTION,
+        |_| Box::pin(async { Ok(()) }),
+        move |client| {
+            Box::pin(async move { client.batch_execute(sql).await.map_err(|_| StoreError) })
+        },
+        |_| {},
+    )
+    .await
+    .map_err(|_| "archive fixture setup failed")
+}
+
+async fn check_archive_evidence(store: &PgStore) -> Result<(), &'static str> {
+    let archive = state(HOLDER, Some("trialing")).await?;
+    let replacement = state(TARGET, Some("active")).await?;
+    let mut listing = remote(
+        HOLDER,
+        "si_worker_fault",
+        "active",
+        &[
+            ("in_worker_first", "usd"),
+            ("in_worker_second", "eur"),
+            ("in_worker_absent", "usd"),
+        ],
+    );
+    let replay = fold(HOLDER, archive.row.clone(), &listing)?;
+    store
+        .store_reconcile_outcome(USER, &replay)
+        .await
+        .map_err(|_| "exact invoice replay failed")?;
+    if state(HOLDER, None).await? != archive || state(TARGET, None).await? != replacement {
+        return Err("exact invoice replay changed archive or replacement");
+    }
+
+    archive_fixture_sql(
+        "UPDATE public.paid_invoice_history SET covered_periods = NULL
+                         WHERE stripe_invoice_id = 'in_worker_first'",
+    )
+    .await?;
+    let legacy = state(HOLDER, None).await?;
+    let mut unknown = replay.clone();
+    unknown.history[0].covered_periods.clear();
+    store
+        .store_reconcile_outcome(USER, &unknown)
+        .await
+        .map_err(|_| "null coverage replay failed")?;
+    if legacy == archive
+        || state(HOLDER, None).await? != legacy
+        || state(TARGET, None).await? != replacement
+    {
+        return Err("null coverage replay changed archive or replacement");
+    }
+    let mut changed = replay.clone();
+    changed.history[0].amount_cents += 1;
+    if store.store_reconcile_outcome(USER, &changed).await.is_ok()
+        || state(HOLDER, None).await? != legacy
+        || state(TARGET, None).await? != replacement
+    {
+        return Err("conflicting evidence hydrated legacy coverage");
+    }
+    let mut hydrated = replay;
+    // Adjacent components are the same multirange as the original interval.
+    hydrated.history[0].covered_periods = vec![(NOW - 1, NOW + 1), (NOW + 1, END)];
+    for _ in 0..2 {
+        store
+            .store_reconcile_outcome(USER, &hydrated)
+            .await
+            .map_err(|_| "exact legacy hydration or replay failed")?;
+        if state(HOLDER, None).await? != archive || state(TARGET, None).await? != replacement {
+            return Err(
+                "exact hydration changed fields beyond coverage or touched the replacement",
+            );
+        }
+    }
+
+    // Release the slot so the next fold reaches the subscription write as
+    // well as the history write. Keep the entire replacement as a witness.
+    let released = state(TARGET, Some("canceled")).await?;
+    let mut advancing = remote(
+        HOLDER,
+        "si_worker_fault",
+        "active",
+        &[("in_worker_archive_fresh", "usd")],
+    );
+    advancing.invoices[0].lines.as_mut().unwrap().data[0]
+        .period
+        .as_mut()
+        .unwrap()
+        .end = Some(END + 10);
+    listing.invoices.insert(0, advancing.invoices.remove(0));
+    let fresh = fold(HOLDER, archive.row.clone(), &listing)?;
+    // The fresh invoice precedes the conflict, so both its insert and the
+    // subscription recovery must disappear on refusal.
+    if fresh.explicit_stale
+        || fresh.fail_closed.is_some()
+        || fresh.row.paid_through_unix != Some(END + 10)
+        || fresh
+            .history
+            .get(1)
+            .map(|row| row.stripe_invoice_id.as_str())
+            != Some("in_worker_first")
+    {
+        return Err("archive conflict fixture did not produce advancing paid evidence");
+    }
+    let conflicts: [fn(&mut PaidInvoiceRow); 8] = [
+        |row| row.amount_cents += 1,
+        |row| row.currency = "eur".into(),
+        |row| row.plan_id = "max".into(),
+        |row| row.period_start_unix -= 1,
+        |row| row.period_end_unix += 1,
+        |row| row.paid_at_unix += 1,
+        |row| row.covered_periods = vec![(NOW - 1, NOW + 1), (NOW + 2, END)],
+        |row| row.stripe_invoice_id = "in_worker_exact".into(),
+    ];
+    for conflict in conflicts {
+        let mut changed = fresh.clone();
+        conflict(&mut changed.history[1]);
+        if store.store_reconcile_outcome(USER, &changed).await.is_ok()
+            || state(HOLDER, None).await? != archive
+            || state(TARGET, None).await? != released
+        {
+            return Err("changed paid evidence did not refuse and roll back the archive recovery");
+        }
+    }
+
+    archive_fixture_sql(
+        "INSERT INTO public.users (id, email, created_at)
+                         VALUES ('worker_archive_other', 'archive-other@example.test', 1786032000);
+                         UPDATE public.paid_invoice_history SET user_id = 'worker_archive_other'
+                         WHERE stripe_invoice_id = 'in_worker_first'",
+    )
+    .await?;
+    let foreign = state(HOLDER, None).await?;
+    if foreign == archive
+        || store.store_reconcile_outcome(USER, &fresh).await.is_ok()
+        || state(HOLDER, None).await? != foreign
+        || state(TARGET, None).await? != released
+    {
+        return Err("foreign history attribution did not refuse and roll back");
+    }
+    archive_fixture_sql(
+        "UPDATE public.paid_invoice_history SET user_id = 'worker_fault_user'
+                         WHERE stripe_invoice_id = 'in_worker_first'",
+    )
+    .await?;
+    let retry = fold(HOLDER, state(HOLDER, None).await?.row, &listing)?;
+    store
+        .store_reconcile_outcome(USER, &retry)
+        .await
+        .map_err(|_| "fresh archive refold failed")?;
+    let committed = state(HOLDER, None).await?;
+    let invoices = |snapshot: &TargetState| {
+        serde_json::from_str::<Vec<Value>>(&snapshot.history).map_err(|_| "invalid archive history")
+    };
+    let mut history = invoices(&committed)?;
+    history.retain(|row| row["stripe_invoice_id"] != "in_worker_archive_fresh");
+    if committed.history_count != archive.history_count + 1
+        || history != invoices(&archive)?
+        || committed
+            .row
+            .as_ref()
+            .and_then(|row| row.paid_invoice_id.as_deref())
+            != Some("in_worker_archive_fresh")
+        || live_subscription_id().await? != HOLDER
+        || state(TARGET, None).await? != released
+    {
+        return Err("fresh paid evidence did not recover the archive while preserving prior state");
+    }
+    let retry = fold(HOLDER, committed.row.clone(), &listing)?;
+    store
+        .store_reconcile_outcome(USER, &retry)
+        .await
+        .map_err(|_| "fresh evidence replay failed")?;
+    if state(HOLDER, None).await? != committed || state(TARGET, None).await? != released {
+        return Err("fresh evidence replay changed committed snapshots");
     }
     Ok(())
 }

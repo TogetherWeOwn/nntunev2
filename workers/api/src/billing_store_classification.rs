@@ -1,10 +1,9 @@
-//! Classification primitives for the future coupled reconciliation transaction.
+//! Classification primitives for the owned reconciliation transaction.
 //!
 //! These functions do not acquire locks, decode database rows, or perform writes.
 //! Callers must supply a fresh global-key observation made after acquiring the
 //! subscription table exclusion on the same transaction backend. The stale
 //! predicate must be evaluated by PostgreSQL using the production input casts.
-//! Used by the dormant owned Worker store; not a live reconciliation boundary.
 
 use crate::billing_reconcile::ReconcileOutcome;
 

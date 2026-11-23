@@ -7211,7 +7211,7 @@ where
 /// remote subscription plus its paid invoices (every invoice read FULLY —
 /// line pagination is followed until exhausted, a first page is never
 /// the full invoice) and fold them into the store through the pure
-/// `billing_reconcile::reconcile_subscription`. `Err(())` is a Stripe or
+/// `billing_reconcile::reconcile_exact_target`. `Err(())` is a Stripe or
 /// store failure (the caller 500s so the delivery retries); fail-closed
 /// passes still persist their observed row and return `Ok` with the
 /// marker set, so the caller can alert and disable.
