@@ -218,6 +218,52 @@ timeouts. Server processing, wire bytes, provider metering and hard-kill
 session closure require separate evidence. A failure from the point of
 attempted creation is uncertain. The caller stops without retry or deletion.
 
+### Setup role custody and lifecycle
+
+The dormant [role SQL](../.github/scripts/database_bootstrap_role.py)
+uses the same plan's bare setup and owner roles. The separate custodian
+supplies an approved absolute expiry within two hours and a freshly
+generated password. Issuance commits the setup role and its single
+SET-only, non-inherited, non-admin owner membership together. It grants
+LOGIN and CREATEDB, limits connections to one and reads back the exact
+attributes, expiry and membership. CREATEDB is cluster-wide during the
+window. The protected setup caller pins the target database name. The
+aggregate reader keeps its own credential and grants.
+
+Keep the private issuance OID and require exclusive custody of the role
+through retirement. A duplicate issuance refuses. After ambiguous issuance,
+reconcile catalog identity under that custody before supplying a receipt.
+The first cleanup transaction removes login, password and CREATEDB. Commit
+it before terminating sessions. The second transaction confirms the fence,
+terminates sessions for the issued OID and drops the role with its
+memberships. Require the fixed `retired` verdict and a successful commit.
+A matching absence can be retried. A replacement role with the same name
+is refused. If the role still owns a database, the drop fails while the
+login fence stays committed. Reconcile the database separately before
+retrying cleanup. Keep role SQL, credentials, OIDs and raw diagnostics
+in private custody and out of published evidence.
+
+`VALID UNTIL` limits fresh password authentication. An already-open
+session can continue after expiry or a login fence until terminated. The
+hosted disposable proof uses verified TLS, SCRAM, a scoped non-superuser
+issuer and the test-only routing adapter. It exercises expiration, an open
+session with the owner selected, and cleanup after successful and
+interrupted setup.
+
+PlanetScale's managed role interfaces expose a fixed set of inherited
+roles and a provider TTL. They lack `CREATEDB` and SET-only membership
+controls, and the TTL documentation gives no guarantee for `rolvaliduntil`.
+The SQL route requires PostgreSQL 16+ membership options, a custodian with
+effective `CREATEROLE` and `CREATEDB`, authority to grant the owner role
+and terminate the setup role's sessions, and the routed primary username
+on the approved direct endpoint with hostname verification. The provider
+documents SQL-created roles under its default administrator. Protected live
+proof must establish that this custodian can issue and retire this exact
+role, and that the routed endpoint enforces native password expiry, exposes
+both bare SQL identities and lets the custodian terminate and read back its
+sessions. [PlanetScale roles](https://planetscale.com/docs/postgres/connecting/roles)
+· [PostgreSQL CREATE ROLE](https://www.postgresql.org/docs/current/sql-createrole.html)
+
 ### Snapshot and metering
 
 Standard hosted public-repo minutes are free. A private Enterprise repo can
