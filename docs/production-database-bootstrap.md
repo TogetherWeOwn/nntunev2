@@ -161,16 +161,50 @@ and T0 code reviews are separate from this deployment approval.
 
 ### Setup plan and enforced limits
 
-Version 1 is one UTF-8 JSON object with exactly `version`, `host`, `port`,
-`ca_pem`, `maintenance`, `launch`, `setup_role`, `owner_role`,
-`migrator_role` and `reader_role`. The caller checks the entire plan
-before connecting. It requires a single DNS name or IPv4 address, port
-5432, one PEM trust certificate, distinct roles and verified TLS. The
-password is separate. The catalog check requires a non-admin `CREATEDB`
-login expiring within the authorization, a loginless owner and a reader
-outside the writer roles. After fenced creation, one transaction revokes
-PUBLIC, admits the migrator and transfers ownership. Reader and serving
-grants and migrations use separate protected paths.
+Version 2 is one UTF-8 JSON object with exactly `version`, `host`, `port`,
+`ca_pem`, `maintenance`, `launch`, `branch_id`, `setup_login`, `setup_role`,
+`owner_role`, `migrator_role` and `reader_role`. The version and port are
+JSON integers. All other values are strings. Duplicate fields, missing or
+extra fields, and every other version, including version 1, are refused.
+A new approval must bind the SHA-256 of the exact version 2 bytes.
+
+- `branch_id` is the approved PlanetScale branch ID. This caller accepts
+  exactly 10 lowercase ASCII letters or digits for the ID.
+- `setup_role` is the bare SQL setup role and may contain 1–63 ASCII
+  letters, digits, underscores or hyphens. Use this name for catalog
+  checks, SQL role attributes, grants, ownership and teardown. The SQL
+  session must match it exactly as both `session_user` and `current_user`.
+- `setup_login` is the direct primary connection username. It must equal
+  `setup_role + "." + branch_id` exactly. The caller passes it as `PGUSER`.
+  Bare logins, mismatched suffixes or prefixes, and replica or pool
+  selectors are refused before invoking `psql`. The password is separate.
+
+PlanetScale documents this routing format for SQL-created roles and
+distinguishes `username` and `base_username` in the managed Roles API.
+Independently verify the branch ID and direct endpoint against the approved
+provider target before approving the digest. Tuple validation checks their
+consistency with the approved plan. The authorization is the source of the
+branch and endpoint pins. The caller requires a single DNS name or IPv4
+address, port 5432, one PEM trust certificate, distinct SQL roles and
+verified TLS. [Provider roles](https://planetscale.com/docs/postgres/connecting/roles#creating-roles-via-create-role)
+· [Direct connections](https://planetscale.com/docs/postgres/connecting#authentication)
+· [Roles API schema](https://planetscale.com/docs/openapi.yaml)
+
+The catalog check requires a non-admin `CREATEDB` login expiring within
+the authorization, a loginless owner and a reader outside the writer
+roles. After fenced creation, one transaction revokes PUBLIC, admits the
+migrator and transfers ownership. Reader and serving grants and migrations
+use separate protected paths.
+
+The hosted disposable fixture models routing with a test-only adapter at
+the `psql` boundary. It checks the exact routed `PGUSER` on each invocation,
+then supplies the bare name to real libpq and TLS PostgreSQL. It also maps
+the approved login to a different eligible SQL role and verifies refusal
+before writes. Before live writes, authorized provider readback must verify
+that the approved branch ID belongs to the pinned direct endpoint and that
+the routed primary login under verified TLS reaches the maintenance database
+with both SQL identities equal to the expected bare role. Read back the
+actual role attributes, memberships and expiry through the protected path.
 
 Admission limits the event to 256 KiB, the decoded plan to 4 KiB and
 the remaining authorization to two hours. The caller accepts up to 1 KiB
