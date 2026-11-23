@@ -192,7 +192,7 @@ mod tests {
         let expected = media.locator();
         let plan = DigestGeometry::new(media.plaintext_len())
             .unwrap()
-            .range(65_536, 65_537)
+            .range(65_535, 65_537)
             .unwrap();
         let response = S3RangeResponse {
             status: 206,
