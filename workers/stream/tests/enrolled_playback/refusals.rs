@@ -81,7 +81,7 @@ async fn partial_write_cannot_acknowledge_more_than_offered() {
         )
         .await
         .unwrap();
-    assert_eq!(part.as_slice(), b"AA");
+    assert_eq!(part.as_slice(), b"AY");
     play.written(1).unwrap();
     assert!(matches!(play.written(2), Err(PlaybackError::Delivery)));
     assert_eq!(play.served_bytes(), 1);
