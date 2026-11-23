@@ -11,14 +11,12 @@ from database_bootstrap_preflight import (
 )
 
 
-def probe(launch_database="unused_launch_fixture", maintenance_database="postgres",
-          creator_role="postgres", session_setup="", session_cleanup=""):
+def run_sql(sql):
     # Supply the entire connection environment. This fixture uses the
     # job's throwaway loopback service even if the caller exports a URL.
     result = subprocess.run(
         ["psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"],
-        input=(session_setup + catalog_probe_sql(maintenance_database, launch_database, creator_role)
-               + session_cleanup),
+        input=sql,
         env={
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "PGHOSTADDR": "127.0.0.1",
@@ -32,6 +30,13 @@ def probe(launch_database="unused_launch_fixture", maintenance_database="postgre
         capture_output=True, text=True, timeout=20,
     )
     return result.returncode, result.stdout
+
+
+def probe(launch_database="unused_launch_fixture", maintenance_database="postgres",
+          creator_role="postgres", session_setup="", session_cleanup=""):
+    return run_sql(session_setup
+                   + catalog_probe_sql(maintenance_database, launch_database, creator_role)
+                   + session_cleanup)
 
 
 class BootstrapCatalogTests(unittest.TestCase):
@@ -60,15 +65,32 @@ class BootstrapCatalogTests(unittest.TestCase):
             ):
                 require_absent_catalog_result(*probe(**pins))
 
-    def test_creator_without_createdb_refuses(self):
-        with self.assertRaisesRegex(BootstrapPreflightError, "lacks LOGIN or CREATEDB"):
-            require_absent_catalog_result(*probe(
-                creator_role="bootstrap_unprivileged_fixture",
-                session_setup=("CREATE ROLE bootstrap_unprivileged_fixture LOGIN NOCREATEDB;\n"
-                               "SET SESSION AUTHORIZATION bootstrap_unprivileged_fixture;\n"),
-                session_cleanup=("RESET SESSION AUTHORIZATION;"
-                                 " DROP ROLE bootstrap_unprivileged_fixture;\n"),
-            ))
+    def test_creator_without_login_or_createdb_refuses(self):
+        for attributes in ("LOGIN NOCREATEDB", "NOLOGIN CREATEDB"):
+            with self.subTest(attributes=attributes), self.assertRaisesRegex(
+                BootstrapPreflightError, "lacks LOGIN or CREATEDB"
+            ):
+                require_absent_catalog_result(*probe(
+                    creator_role="bootstrap_ineligible_fixture",
+                    session_setup=(f"CREATE ROLE bootstrap_ineligible_fixture {attributes};\n"
+                                   "SET SESSION AUTHORIZATION bootstrap_ineligible_fixture;\n"),
+                    session_cleanup=("RESET SESSION AUTHORIZATION;"
+                                     " DROP ROLE bootstrap_ineligible_fixture;\n"),
+                ))
+
+    def test_template0_with_unexpected_flags_refuses(self):
+        for flag, invalid, original in (
+            ("ALLOW_CONNECTIONS", "true", "false"),
+            ("IS_TEMPLATE", "false", "true"),
+        ):
+            with self.subTest(flag=flag):
+                try:
+                    with self.assertRaisesRegex(BootstrapPreflightError, "template0 catalog entry"):
+                        require_absent_catalog_result(*probe(
+                            session_setup=f"ALTER DATABASE template0 {flag} {invalid};\n",
+                        ))
+                finally:
+                    self.assertEqual(run_sql(f"ALTER DATABASE template0 {flag} {original};\n"), (0, ""))
 
     def test_unsafe_pins_and_ambiguous_output_refuse(self):
         for name in ("postgres", "template0", "template1", "a" * 64, "last\n", "name'with_quote"):
@@ -85,8 +107,6 @@ class BootstrapCatalogTests(unittest.TestCase):
                 require_absent_catalog_result(0, out)
         with self.assertRaisesRegex(BootstrapPreflightError, "^catalog probe failed;"):
             require_absent_catalog_result(3, "name-absent\n")
-        with self.assertRaisesRegex(BootstrapPreflightError, "template0 catalog entry is unavailable"):
-            require_absent_catalog_result(0, "template-unavailable\n")
 
 
 if __name__ == "__main__":
