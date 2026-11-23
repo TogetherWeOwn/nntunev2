@@ -16,6 +16,7 @@ from database_bootstrap_preflight import (
 
 IMAGE = "postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336"
 PORT = 5432
+DRILL_SIGNAL = signal.SIGUSR1
 CREATOR, OWNER = "fixture_creator", "fixture_owner"
 MIGRATOR, RUNTIME, READER = "fixture_migrator", "fixture_runtime", "fixture_reader"
 STAGING = "fixture_staging"
@@ -36,9 +37,10 @@ def remember_signal(signum, _frame):
     received_signals.add(signum)
 
 
-def check_interruption():
-    if received_signals - {signal.SIGUSR1}:
-        raise Interrupted()
+def check_interruption(include_drill=False):
+    pending = received_signals if include_drill else received_signals - {DRILL_SIGNAL}
+    if pending:
+        raise Interrupted(frozenset(pending))
 
 
 def require(condition, verdict):
@@ -59,17 +61,15 @@ def command(*args, input_text=None, timeout=20, cleanup=False, interrupt=False):
                 require(readable and process.stdout.readline() == "ready\n" and process.poll() is None,
                         "start an in-flight Docker interruption drill")
                 check_interruption()
-                signal.raise_signal(signal.SIGUSR1)
+                received_signals.discard(DRILL_SIGNAL)
+                signal.raise_signal(DRILL_SIGNAL)
             stdout, stderr = process.communicate(input_text, timeout=timeout)
         finally:
             if process.poll() is None:
                 process.kill()
+    require(not interrupt or process.returncode == 0, "finish the in-flight Docker command")
     if not cleanup:
-        check_interruption()
-    if interrupt:
-        require(process.returncode == 0 and signal.SIGUSR1 in received_signals,
-                "record the drill signal and finish the active command")
-        raise Interrupted(signal.SIGUSR1)
+        check_interruption(include_drill=interrupt)
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
@@ -354,14 +354,14 @@ def exercise(*, interrupt):
             finally:
                 cluster.teardown()
     except Interrupted as error:
-        if error.args != (signal.SIGUSR1,):
+        if error.args != (frozenset({DRILL_SIGNAL}),):
             raise
     require(not Path(temp).exists(), "verify generated files were removed")
 
 
 def main():
     require(len(sys.argv) == 1, "fixture accepts no arguments")
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1):
+    for signum in (signal.SIGINT, signal.SIGTERM, DRILL_SIGNAL):
         signal.signal(signum, remember_signal)
     if docker("image", "inspect", IMAGE).returncode != 0:
         checked(docker("pull", IMAGE, timeout=180), "pull pinned PostgreSQL image")
