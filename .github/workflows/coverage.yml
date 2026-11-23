@@ -36,26 +36,30 @@ jobs:
           # Cargo's current build layout puts test executables under debug/build.
           tool: cargo-llvm-cov@0.9.1
 
-      - name: Coverage for root workspace
-        run: cargo llvm-cov --workspace --lcov --output-path coverage-root.lcov
-
-      - name: Coverage for standalone crates
+      - name: Collect Rust line coverage
         shell: bash
         run: |
           set -euo pipefail
+          # Keep the previous instrumentation of local path dependencies and
+          # count unit-test modules under src while excluding test target dirs.
+          toolchain_sources='/rustc/([0-9a-f]+|[0-9]+\.[0-9]+\.[0-9]+)/|/\.cargo/(registry|git)/|/\.rustup/toolchains/'
+          collect_coverage() {
+            local workspace="$1"
+            shift
+            local excluded_paths="${toolchain_sources}|^${workspace}(/.*)?/(tests|examples|benches)/|^${workspace}/target/llvm-cov-target(/|$)"
+            cargo llvm-cov --no-rustc-wrapper --no-default-ignore-filename-regex \
+              --ignore-filename-regex "$excluded_paths" --lcov "$@"
+          }
+
+          collect_coverage "$GITHUB_WORKSPACE" --workspace --output-path coverage-root.lcov
           # `--locked` for api, ingest, mb, repair and transcode: each
           # committed workers/<crate>/Cargo.lock is the audited
           # dependency set, enforced the same way as in the required
           # CI lanes.
-          cargo llvm-cov --locked --manifest-path workers/api/Cargo.toml \
-            --lcov --output-path coverage-api.lcov
-          cargo llvm-cov --locked --manifest-path workers/repair/Cargo.toml \
-            --lcov --output-path coverage-repair.lcov
-          cargo llvm-cov --locked --manifest-path workers/transcode/Cargo.toml \
-            --lcov --output-path coverage-transcode.lcov
-          for crate in ingest mb; do
-            cargo llvm-cov --locked --manifest-path "workers/${crate}/Cargo.toml" \
-              --lcov --output-path "coverage-${crate}.lcov"
+          for crate in api repair transcode ingest mb; do
+            collect_coverage "$GITHUB_WORKSPACE/workers/${crate}" \
+              --locked --manifest-path "workers/${crate}/Cargo.toml" \
+              --output-path "coverage-${crate}.lcov"
           done
 
       - name: Write line coverage summary
