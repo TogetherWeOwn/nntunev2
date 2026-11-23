@@ -174,7 +174,7 @@ pub(super) async fn exercise(
     }
 
     let mut tx = writer.transaction().await.unwrap();
-    tx.execute("UPDATE public.storage_validated_digest_winners SET quarantined = TRUE WHERE object_id = $1::text::uuid",
+    tx.execute("UPDATE public.storage_validated_digest_winners SET retain_until = '-infinity' WHERE object_id = $1::text::uuid",
         &[&object]).await.unwrap();
     refuse(&mut tx, &next_match, &new).await;
     tx.rollback().await.unwrap();

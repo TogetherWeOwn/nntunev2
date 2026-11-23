@@ -35,7 +35,7 @@ BEGIN
         prior.provider_configuration_version_id, prior.plaintext_bytes, prior.envelope_bytes, prior.header_tag);
     INSERT INTO public.storage_object_envelope_intents VALUES (
         new_object, envelope.root_version_id,
-        overlay(envelope.wrapped_record placing uuid_send(new_object) || uuid_send(generation) from 58 for 32));
+        overlay(envelope.wrapped_record placing uuid_send(new_object) || uuid_send(generation) from 59 for 32));
     INSERT INTO public.storage_plaintext_digest_claim_intents VALUES (
         new_object, prior.environment_id, prior.library_id, prior.plaintext_bytes, digest);
     INSERT INTO public.storage_digest_map_intents (map_id, object_id, environment_id, library_id, plaintext_bytes)
