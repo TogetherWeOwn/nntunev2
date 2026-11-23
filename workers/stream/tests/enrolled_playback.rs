@@ -55,7 +55,9 @@ impl Fixture {
             header: seal.header().to_bytes(),
         };
         let envelope = wrap_scheme2(&ROOT, &context, seal.key().expose_secret()).unwrap();
-        let first = seal.seal_chunk(&[b'A'; 65_536]).unwrap().bytes;
+        let mut first_plaintext = [b'A'; 65_536];
+        first_plaintext[65_535] = b'Y';
+        let first = seal.seal_chunk(&first_plaintext).unwrap().bytes;
         let last = seal.seal_chunk(b"Z").unwrap();
         let locator = S3Locator::new(
             "fixture-media".into(),
@@ -148,7 +150,7 @@ async fn suffix_opens_two_complete_chunks_and_counts_only_writer_bytes() {
         )
         .await
         .unwrap();
-    assert_eq!(part.as_slice(), b"A");
+    assert_eq!(part.as_slice(), b"Y");
     drop(part);
     assert_eq!(play.served_bytes(), 0);
     assert!(matches!(
