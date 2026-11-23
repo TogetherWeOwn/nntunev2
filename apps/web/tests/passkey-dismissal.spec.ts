@@ -257,6 +257,47 @@ test('login: retry after dismissal signs in', async ({ page }) => {
 	expect(traffic.finishPosts).toBe(1);
 });
 
+test('private listening invite opens Library and refusal clears it', async ({ page }) => {
+	await installCreateDouble(page, {});
+	const code = 'synthetic_invite_codeA';
+	const email = 'friend@example.test';
+	const binding = 'A'.repeat(43);
+	let revoked = false;
+	await page.route('**/v1/auth/passkey/register/start', (route) => {
+		const input = route.request().postDataJSON();
+		return input.email === email && input.invite_code === code
+			? route.fulfill({ json: { challenge: 'Y2hhbGxlbmdl', user_id: 'dXNlcg', rp_id: 'localhost' } })
+			: route.fulfill({ status: 401, json: { error: 'check your email and try again' } });
+	});
+	await page.route('**/v1/auth/passkey/register/finish', (route) => {
+		expect(route.request().postDataJSON()).toMatchObject({ invite_code: code, magic_token: 'fixture-code' });
+		return route.fulfill({ json: { ok: true, private_listening: true } });
+	});
+	await page.route('**/v1/me/likes/session', (route) => route.fulfill({ json: { session_binding: binding } }));
+	await page.route('**/api/library', (route) => revoked
+		? route.fulfill({ status: 403, json: { code: 'forbidden' } })
+		: route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: [{ id: 'fixture-track', title: 'Synthetic track' }] }));
+	await page.goto('/signup');
+	await page.getByTestId('signup-email').fill(email);
+	await page.getByTestId('signup-submit').click();
+	await expect(page.getByTestId('signup-error')).toBeVisible();
+	await expect(page.getByLabel('Email code')).toHaveCount(0);
+	await page.goto(`/signup#invite=${code}`);
+	await expect(page.getByLabel(/invite code/i)).toHaveValue(code);
+	await expect(page).toHaveURL(/\/signup$/);
+	await page.getByTestId('signup-email').fill(email);
+	await page.getByTestId('signup-submit').click();
+	await page.getByLabel('Email code').fill('fixture-code');
+	await page.getByRole('button', { name: 'Finish creating account' }).click();
+	await expect(page).toHaveURL(/\/library$/);
+	const track = page.getByTestId('library-item').filter({ hasText: 'Synthetic track' });
+	await expect(track).toBeVisible();
+	revoked = true;
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByText('You do not have access to this library.')).toBeVisible();
+	await expect(track).toHaveCount(0);
+});
+
 test('signup: a genuine finish failure keeps the exact current code message', async ({
 	page
 }) => {

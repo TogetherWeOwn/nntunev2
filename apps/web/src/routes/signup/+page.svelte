@@ -22,6 +22,7 @@
 	let email = $state('');
 	let magicCode = $state('');
 	let inviteCode = $state('');
+	let privateListening = $state(false);
 	let pending: RegisterStartResponse | null = $state(null);
 	let status = $state<
 		| 'idle'
@@ -53,7 +54,7 @@
 		} catch {
 			return;
 		}
-		// The invite is used only at registration finish, not when sending the email code.
+		// Sending an email code may validate the invite. Only enrollment spends it.
 		if (!attempt.signal.aborted && window.location.href === url.href &&
 			!finishLocked && codes.length === 1 && isMemberInviteCode(codes[0])) {
 			inviteCode = codes[0];
@@ -79,7 +80,7 @@
 			// The API answers the same shape for every email (never an
 			// existence oracle) and mails an inbox-proof code when the
 			// address can still enroll.
-			const options = await client.registerStart(email.trim(), attempt.signal);
+			const options = await client.registerStart(email.trim(), attempt.signal, inviteCode.trim() || undefined);
 			if (attempt.signal.aborted) return;
 			pending = options;
 			status = 'code-sent';
@@ -160,7 +161,7 @@
 			}
 			// Exact finish shape (the API rejects unknown fields): the
 			// emailed code proves inbox control before the key enrolls.
-			await client.registerFinish(
+			const result = await client.registerFinish(
 				{
 					challenge: pending.challenge,
 					credentialId,
@@ -172,11 +173,15 @@
 				attempt.signal
 			);
 			if (attempt.signal.aborted) return;
+			privateListening = result.private_listening === true;
 			const purge = invalidateLibraryCache();
 			status = 'created';
 			stashSignedInEmail(email.trim());
 			await purge;
-			if (!attempt.signal.aborted) window.location.href = '/account/billing';
+			if (!attempt.signal.aborted) {
+				if (privateListening) window.location.href = '/library';
+				else window.location.href = '/account/billing';
+			}
 		} catch (error) {
 			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {
@@ -203,13 +208,13 @@
 
 <svelte:head>
 	<title>NNTune — get started</title>
-	<meta name="description" content="Create your NNTune account, then choose an account plan." />
+	<meta name="description" content="Create your NNTune account with a passkey." />
 </svelte:head>
 
 <main class="nt-wrap">
 	<h1>Get started</h1>
 	<p>
-		Create your account with a passkey — no password to phish or leak. Choose your plan next.
+		Create your account with a passkey. If you received an invite, enter its code before requesting an email code.
 	</p>
 	{#if status === 'code-sent' || status === 'finishing' || status === 'code-error' || status === 'dismissed' || status === 'created'}
 		<form onsubmit={finishAccount}>
@@ -284,6 +289,11 @@
 					disabled={status === 'working'}
 				/>
 			</label>
+			<label>
+				Invite code (if you have one)
+				<input type="text" name="invite_code" autocomplete="off" bind:value={inviteCode}
+					disabled={status === 'working'} />
+			</label>
 			<button
 				data-testid="signup-submit"
 				class="nt-button"
@@ -306,7 +316,7 @@
 	{:else if status === 'error'}
 		<p id="signup-email-error" data-testid="signup-error" role="alert">Something went wrong. Try again.</p>
 	{:else if status === 'created'}
-		<p role="status">Account created — taking you to choose your plan…</p>
+		<p role="status">{privateListening ? 'Account created. Opening Library…' : 'Account created — taking you to choose your plan…'}</p>
 	{/if}
 	<p>Already have an account? <a href="/login">Sign in</a>.</p>
 </main>
