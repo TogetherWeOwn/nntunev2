@@ -248,9 +248,13 @@ it('only a matching owner, track and continuation can publish an uncredentialed 
 		expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), () => true, publish)).toBe(false);
 	}
 	expect(await scope.open({ ...candidate, playId: 'play-7' }, signal(), () => true, publish)).toBe(true);
+	expect(prepare).toHaveBeenLastCalledWith(expect.objectContaining({ ...candidate, playId: 'play-7' }), expect.any(AbortSignal));
 	expect(publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
 		streamUrl: `/v1/plays/media/next/${scope.playbackSessionId}/play-7`
 	}), 120_000);
+	expect(publish.mock.calls[0][0].isCurrent()).toBe(true);
+	scope.dispose();
+	expect(publish.mock.calls[0][0].isCurrent()).toBe(false);
 });
 
 it.each(['accepted', 'disabled', 'denied', 'superseded', 'cancelled', 'account switch', 'reset'] as const)('%s respects the live player and queue receipts', async (reason) => {
@@ -262,7 +266,7 @@ it.each(['accepted', 'disabled', 'denied', 'superseded', 'cancelled', 'account s
 	const audio = Object.assign(new EventTarget(), { paused: false, ended: false, error: null,
 		getAttribute: () => '/current', pause: vi.fn() });
 	player.media.attach(audio as unknown as HTMLAudioElement);
-	const publish = (source: QueuedPlaySource) => { void player.media.playSelected(initial, 1, source); };
+	const publish = vi.fn((source: QueuedPlaySource) => { void player.media.playSelected(initial, 1, source); });
 	const started = Promise.withResolvers<AbortSignal>();
 	const finish = Promise.withResolvers<void>();
 	const prepare = vi.fn(async (req: { sessionBinding: string; playbackSessionId: string; trackId: string }, transportSignal: AbortSignal) => {
@@ -291,6 +295,7 @@ it.each(['accepted', 'disabled', 'denied', 'superseded', 'cancelled', 'account s
 		finish.resolve();
 		const accepted = reason === 'accepted';
 		expect(await opening).toBe(accepted);
+		expect(publish).toHaveBeenCalledTimes(Number(accepted));
 		expect(flush).toHaveBeenCalledTimes(Number(accepted));
 		if (accepted) return;
 		if (reason === 'account switch') {

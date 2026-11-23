@@ -19116,13 +19116,8 @@ mod tests {
             duration_ms: 60_000.try_into().unwrap(),
             grant: &token,
         };
-        let set_lease = |row| {
-            h.store
-                .playback_leases
-                .borrow_mut()
-                .insert(user_id.into(), row)
-        };
-        set_lease(lease.clone());
+        let leases = &h.store.playback_leases;
+        leases.borrow_mut().insert(user_id.into(), lease.clone());
         let meta = TrackMeterMeta {
             track_duration_ms: Some(60_000),
             bitrate_kbps: Some(1_000),
@@ -19184,10 +19179,10 @@ mod tests {
             epoch: lease.epoch + 1,
             ..lease.clone()
         };
-        set_lease(newer.clone());
+        leases.borrow_mut().insert(user_id.into(), newer.clone());
         refused_grant(&receipt);
-        assert_eq!(h.store.playback_leases.borrow()[user_id], newer);
-        set_lease(lease.clone());
+        assert_eq!(leases.borrow()[user_id], newer);
+        leases.borrow_mut().insert(user_id.into(), lease.clone());
         let missing_duration = TrackMeterMeta {
             track_duration_ms: None,
             ..meta
