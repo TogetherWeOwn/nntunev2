@@ -169,7 +169,7 @@ extra fields, and every other version, including version 1, are refused.
 A new approval must bind the SHA-256 of the exact version 2 bytes.
 
 - `branch_id` is the approved PlanetScale branch ID. This caller accepts
-  exactly 10 lowercase ASCII letters or digits for the ID.
+  10- or 12-character IDs made up of lowercase ASCII letters or digits.
 - `setup_role` is the bare SQL setup role and may contain 1–63 ASCII
   letters, digits, underscores or hyphens. Use this name for catalog
   checks, SQL role attributes, grants, ownership and teardown. The SQL

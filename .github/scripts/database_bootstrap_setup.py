@@ -65,7 +65,7 @@ def setup_plan(raw):
     ):
         raise ValueError
     setup_role, branch_id = data["setup_role"], data["branch_id"]
-    if ("." in setup_role or not re.fullmatch(r"[a-z0-9]{10}", branch_id)
+    if ("." in setup_role or not re.fullmatch(r"(?:[a-z0-9]{10}|[a-z0-9]{12})", branch_id)
             or data["setup_login"] != f"{setup_role}.{branch_id}"):
         raise ValueError
     ca = data["ca_pem"]

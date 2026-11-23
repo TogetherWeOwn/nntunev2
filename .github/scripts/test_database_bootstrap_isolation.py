@@ -93,12 +93,12 @@ def checked(result, verdict, expected=None):
 
 
 class Cluster:
-    def __init__(self, directory):
+    def __init__(self, directory, branch_id):
         token = secrets.token_hex(8)
         self.network = "bootstrap-" + token
         self.server = self.network + ".test"
         self.client = self.network + "-client"
-        self.branch_id = secrets.token_hex(5)
+        self.branch_id = branch_id
         roles = ("postgres", CREATOR, DECOY, MIGRATOR, RUNTIME, READER, STAGING)
         self.passwords = {role: secrets.token_hex(24) for role in roles}
         self.expiry = int(time.time()) + 300
@@ -324,12 +324,15 @@ def prove_setup_caller(cluster, *, interrupt):
             {"setup_login": f"{CREATOR}.{other_branch}"}, {"setup_login": f"{DECOY}.{branch}"},
             {"setup_login": CREATOR}, {"setup_login": f"{login}|replica"},
             {"setup_login": login + "\n"}, {"setup_login": None},
-            {"branch_id": "a" * 9, "setup_login": f"{CREATOR}.{'a' * 9}"},
-            {"branch_id": "A" * 10, "setup_login": f"{CREATOR}.{'A' * 10}"},
             {"setup_role": login, "setup_login": f"{login}.{branch}"},
             {"port": PORT + 1}, {"reader_role": CREATOR},
         ):
             run(caller_env(cluster, roles, **changes) | route, "refused", 0)
+        for malformed in ("a" * 9, "a" * 11, "a" * 13, "A" * 12, "á" * 12):
+            run(caller_env(cluster, roles, branch_id=malformed, setup_login=f"{CREATOR}.{malformed}") | route,
+                "refused", 0)
+        changed_branch = caller_env(cluster, roles, branch_id=other_branch, setup_login=f"{CREATOR}.{other_branch}")
+        run(env | {"BOOTSTRAP_PLAN_B64": changed_branch["BOOTSTRAP_PLAN_B64"]}, "refused", 0)
         raw = base64.b64decode(env["BOOTSTRAP_PLAN_B64"])
         run(env | plan_binding(b'{"setup_login":"ambiguous",' + raw[1:]), "refused", 0)
         plan = json.loads(raw)
@@ -479,7 +482,7 @@ def verify_launch_grants(cluster):
 def exercise(*, interrupt):
     try:
         with tempfile.TemporaryDirectory(prefix="database-bootstrap-") as temp:
-            cluster = Cluster(Path(temp))
+            cluster = Cluster(Path(temp), branch_id=secrets.token_hex(5 if interrupt else 6))
             try:
                 cluster.start()
                 provision_roles(cluster)
