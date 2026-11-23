@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { activeAttributions, plannedAttributions } from '../attributions/index.js';
-import { createLyricsResolver, cueAt, parseTimedLrc, type ExactLyricsProvider } from './lyrics.js';
+import {
+	bindVerifiedLocalLyrics, createLyricsResolver, cueAt, parseTimedLrc, type ExactLyricsProvider
+} from './lyrics.js';
 
 const track = {
 	trackName: 'Synthetic Track', artistName: 'Fixture Artist', albumName: 'Unit Test',
@@ -10,6 +12,60 @@ const lrc = '[00:01]Fixture cue';
 const match = { kind: 'match', track, instrumental: false, syncedLyrics: lrc } as const;
 const sidecar = { path: 'album/demo.lrc', lrc: '[00:02]Sidecar cue' };
 const mediaPath = 'album/demo.flac';
+
+describe('verified local lyrics binding', () => {
+	const selection = Object.freeze({
+		libraryScope: Symbol('fixture library'), trackId: 'fixture-recording',
+		occurrenceKey: 'fixture-release:1', sourceRevision: 'fixture-bundle-v1'
+	});
+	// The producer reads the identity from the verified source independently of the selection.
+	const identity = { ...selection };
+
+	it('projects matching nonempty timed tags first, then a verified sidecar', () => {
+		const verified = { identity, mediaPath, sidecar };
+		expect(bindVerifiedLocalLyrics(selection, selection, { ...verified, embedded: lrc })).toEqual({
+			trackId: selection.trackId,
+			result: { source: 'embedded', cues: [{ atMs: 1000, text: 'Fixture cue' }] }
+		});
+		expect(bindVerifiedLocalLyrics(selection, selection, { ...verified, embedded: '[00:61]Invalid' })).toEqual({
+			trackId: selection.trackId,
+			result: { source: 'sidecar', cues: [{ atMs: 2000, text: 'Sidecar cue' }] }
+		});
+	});
+
+	it('refuses missing, empty or unusable local evidence', () => {
+		for (const evidence of [null, { identity, embedded: ' ' }, { identity, embedded: '[00:02]' },
+			{ identity, embedded: '[00:61]Invalid' }, { identity, embedded: '[00:01][00:61]' },
+			{ identity, mediaPath, sidecar: { ...sidecar, path: 'another-album/demo.lrc' } },
+			{ identity, embedded: lrc, instrumental: true }]) {
+			expect(bindVerifiedLocalLyrics(selection, selection, evidence)).toBeNull();
+		}
+	});
+
+	it('requires the verified library, track, occurrence and source revision to match', () => {
+		for (const mismatch of [{ libraryScope: Symbol('other library') }, { trackId: 'other-recording' },
+			{ occurrenceKey: 'other-release:1' }, { sourceRevision: 'fixture-bundle-v0' }]) {
+			expect(bindVerifiedLocalLyrics(selection, selection, {
+				identity: { ...identity, ...mismatch }, mediaPath, sidecar
+			})).toBeNull();
+		}
+		for (const invalid of [{ trackId: '' }, { occurrenceKey: ' ' }, { sourceRevision: 'x'.repeat(257) }]) {
+			const badSelection = Object.freeze({ ...selection, ...invalid });
+			expect(bindVerifiedLocalLyrics(badSelection, badSelection, { identity: badSelection, embedded: lrc })).toBeNull();
+		}
+	});
+
+	it('discards a delayed result after clearing, advancing or reselecting the same track', () => {
+		const delayed = { identity, embedded: lrc };
+		const next = Object.freeze({ ...selection, trackId: 'next-recording', occurrenceKey: 'fixture-release:2' });
+		const reselected = Object.freeze({ ...selection });
+		expect(bindVerifiedLocalLyrics(selection, null, delayed)).toBeNull();
+		expect(bindVerifiedLocalLyrics(selection, next, delayed)).toBeNull();
+		expect(bindVerifiedLocalLyrics(selection, reselected, delayed)).toBeNull();
+		expect(bindVerifiedLocalLyrics(reselected, reselected, { identity, embedded: lrc })?.trackId)
+			.toBe(reselected.trackId);
+	});
+});
 
 describe('timed LRC', () => {
 	it('sorts stamps, handles fractions, offsets and clears, and finds the current cue', () => {

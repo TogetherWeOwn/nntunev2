@@ -1,7 +1,8 @@
 //! Client-reported listening history, separate from billing and playback leases.
 
+use crate::postgres::{PgConnect, PgQuery, PgTransaction};
 use serde::{Deserialize, Serialize};
-use tokio_postgres::{types::Type, Client, IsolationLevel, Transaction};
+use tokio_postgres::types::Type;
 
 use crate::handlers::StoreError;
 
@@ -100,7 +101,10 @@ impl ExportCursor {
 
 // Lock acquisition and history access must be separate statements at READ
 // COMMITTED, so the history snapshot starts after the owner lock is granted.
-async fn owner_is_deleting(tx: &Transaction<'_>, owner: &str) -> Result<Option<bool>, StoreError> {
+async fn owner_is_deleting(
+    tx: &PgTransaction<'_>,
+    owner: &str,
+) -> Result<Option<bool>, StoreError> {
     tx.query_typed(
         "SELECT deleting_at IS NOT NULL FROM public.users WHERE id = $1 FOR NO KEY UPDATE",
         &[(&owner, Type::TEXT)],
@@ -113,24 +117,16 @@ async fn owner_is_deleting(tx: &Transaction<'_>, owner: &str) -> Result<Option<b
     .transpose()
 }
 
-async fn begin_write(client: &mut Client) -> Result<Transaction<'_>, StoreError> {
-    let tx = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
+async fn begin_write(client: &mut impl PgConnect) -> Result<PgTransaction<'_>, StoreError> {
+    let tx = client.read_committed().await.map_err(|_| StoreError)?;
+    tx.set_local_statement_timeout(crate::vault::TOTAL_TIMEOUT_MS)
         .await
         .map_err(|_| StoreError)?;
-    tx.batch_execute(&format!(
-        "SET LOCAL statement_timeout = {}",
-        crate::vault::TOTAL_TIMEOUT_MS
-    ))
-    .await
-    .map_err(|_| StoreError)?;
     Ok(tx)
 }
 
 pub async fn record(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     owner: &str,
     body: &ListenEventBody,
     now: i64,
@@ -163,7 +159,7 @@ pub async fn record(
     })
 }
 
-async fn clear_in_transaction(tx: &Transaction<'_>, owner: &str) -> Result<(), StoreError> {
+async fn clear_in_transaction(tx: &PgTransaction<'_>, owner: &str) -> Result<(), StoreError> {
     if owner_is_deleting(tx, owner).await?.is_some() {
         tx.query_typed(
             "DELETE FROM public.listen_events WHERE user_id = $1",
@@ -175,7 +171,7 @@ async fn clear_in_transaction(tx: &Transaction<'_>, owner: &str) -> Result<(), S
     Ok(())
 }
 
-pub async fn clear(client: &mut Client, owner: &str) -> Result<(), StoreError> {
+pub async fn clear(client: &mut impl PgConnect, owner: &str) -> Result<(), StoreError> {
     let tx = begin_write(client).await?;
     clear_in_transaction(&tx, owner).await?;
     tx.commit().await.map_err(|_| StoreError)
@@ -186,7 +182,7 @@ pub async fn clear(client: &mut Client, owner: &str) -> Result<(), StoreError> {
 pub(crate) mod postgres_tests;
 
 pub async fn export(
-    client: &Client,
+    client: &impl PgQuery,
     owner: &str,
     before: Option<&ExportCursor>,
 ) -> Result<Vec<ListenRow>, StoreError> {

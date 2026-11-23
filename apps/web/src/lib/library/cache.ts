@@ -15,6 +15,7 @@
  */
 
 import { clearUsageWarnings } from '../billing/usageWarnings.js';
+import type { AccountSession } from '../auth-fence.js';
 
 export interface LibraryItem {
 	id: string;
@@ -48,6 +49,30 @@ export const LIBRARY_FAVORITES_KEY = 'nntune.library.favorites.v1';
  * and legacy-base-key handling as favorites (see `recent-finds.ts`).
  */
 export const LIBRARY_RECENT_FINDS_KEY = 'nntune.library.recent-finds.v1';
+
+function libraryContext(session: SnapshotStorage | null): string | null {
+	try { return session?.getItem(LIBRARY_AUTH_CONTEXT_KEY) || null; } catch { return null; }
+}
+
+export function libraryContextKey(session: SnapshotStorage | null, base: string): string | null {
+	const context = libraryContext(session);
+	return context ? `${base}.${context}` : null;
+}
+
+/** Pin the existing tab context to the account that verified the listing. */
+export function scopeLibraryStorage(session: SnapshotStorage | null, owner?: AccountSession): SnapshotStorage | null {
+	const context = libraryContext(session);
+	if (!session || !context) return null;
+	const current = () => (!owner || owner.isCurrent()) && libraryContext(session) === context;
+	const requireCurrent = () => {
+		if (!current()) throw new DOMException('Library storage scope ended', 'AbortError');
+	};
+	return {
+		getItem: (key) => current() ? session.getItem(key) : null,
+		setItem: (key, value) => { requireCurrent(); session.setItem(key, value); },
+		removeItem: (key) => { requireCurrent(); session.removeItem(key); }
+	};
+}
 
 function provenance(session: SnapshotStorage | null): [string, string] | null {
 	try {
