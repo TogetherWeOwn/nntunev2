@@ -34,6 +34,9 @@ async fn connect() -> Client {
     client
 }
 
+#[path = "catalogue.rs"]
+mod catalogue;
+
 #[tokio::test]
 #[ignore = "requires a migrated disposable PostgreSQL database"]
 async fn postgres_stages_completed_candidate_atomically() {
@@ -273,4 +276,5 @@ async fn postgres_stages_completed_candidate_atomically() {
         &[&environment, &library, &digest, &(length as i64), &object, &generation, &root],
     ).await.unwrap().get(0);
     assert!(!admitted);
+    catalogue::exercise(&observer, &mut writer, &mut contender, &fixture, &intent).await;
 }
