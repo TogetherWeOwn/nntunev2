@@ -1243,6 +1243,31 @@ shape check — no credentials, no network — that reads key names only and
 never reads or prints values
 (`ci/check-production-secrets-shape.mjs:6-7`).
 
+### First-release recovery after failed final smoke
+
+App promotion stays disabled. Before first release, verify empty production
+state with a read-only check, take a snapshot before the first schema change,
+and record the switch-off plan. Keep provider restore proof separate.
+
+Keep `PRODUCTION_ROLLBACK_CUSTODY` and `PRODUCTION_ROLLBACK_INTENT_KEY`
+(a separate random 256-bit key in lowercase hex) in the protected `production`
+Environment. The custody JSON pins the accepted `sha`, `account`, immutable
+`worker`, private `domain`, fresh `checked_at` (ISO UTC with milliseconds),
+private `evidence_sha256`, exact Worker `references` and verified `maintenance`
+`version`, `deployment`, seed `sha` and `module_sha256`. Set `exclusive_writers`
+and `private_routes_frozen` only after verifying and freezing all Worker,
+route, DNS and Access writers through readback. The job verifies the Worker
+and preview settings and seals the intent before traffic shifts. Custody
+evidence must be at most 30 minutes old when sealing. Keep the freeze in
+place through recovery readback even if final smoke runs past that window.
+The maintenance module digest must also match the reviewed candidate checkout.
+
+Failed final smoke keeps the release red. The same lock covers recovery, which
+requires the exact final deployment and submits maintenance at 100% once.
+On ambiguity reconcile Worker, allocation, routes and provider audit before
+any further action. Verify maintenance behavior and private Access denials on
+the isolated candidate. Post-watch and cancellation need separate admission.
+
 ### Production promotion publishes a CalVer release
 
 After a successful production promotion and its post-promotion smoke, the
