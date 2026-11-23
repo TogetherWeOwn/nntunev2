@@ -50,6 +50,7 @@ pub mod body;
 pub mod cache;
 pub mod choose;
 pub mod delivered;
+pub mod enrolled_playback;
 pub mod grant;
 pub mod loader;
 pub mod meter;
