@@ -42,23 +42,24 @@ jobs:
           set -euo pipefail
           # Keep the previous instrumentation of local path dependencies and
           # count unit-test modules under src while excluding test target dirs.
+          coverage_options=(--no-rustc-wrapper --no-default-ignore-filename-regex --lcov)
           toolchain_sources='/rustc/([0-9a-f]+|[0-9]+\.[0-9]+\.[0-9]+)/|/\.cargo/(registry|git)/|/\.rustup/toolchains/'
-          collect_coverage() {
+          coverage_exclusions() {
             local workspace="$1"
-            shift
-            local excluded_paths="${toolchain_sources}|^${workspace}(/.*)?/(tests|examples|benches)/|^${workspace}/target/llvm-cov-target(/|$)"
-            cargo llvm-cov --no-rustc-wrapper --no-default-ignore-filename-regex \
-              --ignore-filename-regex "$excluded_paths" --lcov "$@"
+            printf '%s' "${toolchain_sources}|^${workspace}(/.*)?/(tests|examples|benches)/|^${workspace}/target/llvm-cov-target(/|$)"
           }
 
-          collect_coverage "$GITHUB_WORKSPACE" --workspace --output-path coverage-root.lcov
+          cargo llvm-cov --workspace "${coverage_options[@]}" \
+            --ignore-filename-regex "$(coverage_exclusions "$GITHUB_WORKSPACE")" \
+            --output-path coverage-root.lcov
           # `--locked` for api, ingest, mb, repair and transcode: each
           # committed workers/<crate>/Cargo.lock is the audited
           # dependency set, enforced the same way as in the required
           # CI lanes.
           for crate in api repair transcode ingest mb; do
-            collect_coverage "$GITHUB_WORKSPACE/workers/${crate}" \
-              --locked --manifest-path "workers/${crate}/Cargo.toml" \
+            cargo llvm-cov --locked --manifest-path "workers/${crate}/Cargo.toml" \
+              "${coverage_options[@]}" \
+              --ignore-filename-regex "$(coverage_exclusions "$GITHUB_WORKSPACE/workers/${crate}")" \
               --output-path "coverage-${crate}.lcov"
           done
 
