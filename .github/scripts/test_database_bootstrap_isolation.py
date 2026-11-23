@@ -17,6 +17,7 @@ from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
 import database_bootstrap_setup as setup
+from database_bootstrap_role import SetupRoleLifecycle
 from fixtures.database_bootstrap.authorization import caller_env, plan_binding
 from database_bootstrap_preflight import (
     BootstrapPreflightError, catalog_probe_sql, require_absent_catalog_result,
@@ -28,6 +29,7 @@ DRILL_SIGNAL = signal.SIGUSR1
 CREATOR, OWNER, DECOY = "fixture_creator", "fixture_owner", "fixture_decoy"
 MIGRATOR, RUNTIME, READER = "fixture_migrator", "fixture_runtime", "fixture_reader"
 STAGING = "fixture_staging"
+ISSUER = "fixture_issuer"
 MAINTENANCE, LAUNCH, SIBLING = "postgres", "launch_fixture", "staging_fixture"
 received_signals = set()
 
@@ -99,7 +101,7 @@ class Cluster:
         self.server = self.network + ".test"
         self.client = self.network + "-client"
         self.branch_id = branch_id
-        roles = ("postgres", CREATOR, DECOY, MIGRATOR, RUNTIME, READER, STAGING)
+        roles = ("postgres", CREATOR, DECOY, MIGRATOR, RUNTIME, READER, STAGING, ISSUER)
         self.passwords = {role: secrets.token_hex(24) for role in roles}
         self.expiry = int(time.time()) + 300
         self.directory = directory
@@ -223,19 +225,123 @@ class Cluster:
 def provision_roles(cluster):
     valid_until = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(cluster.expiry))
     cluster.ok("create distinct fixture roles", f"""
-        CREATE ROLE {CREATOR} LOGIN CREATEDB PASSWORD '{cluster.passwords[CREATOR]}' VALID UNTIL '{valid_until}';
         CREATE ROLE {DECOY} LOGIN CREATEDB PASSWORD '{cluster.passwords[DECOY]}' VALID UNTIL '{valid_until}';
         CREATE ROLE {OWNER} NOLOGIN;
-        GRANT {OWNER} TO {CREATOR}, {DECOY} WITH INHERIT FALSE, SET TRUE;
+        GRANT {OWNER} TO {DECOY} WITH INHERIT FALSE, SET TRUE;
+        CREATE ROLE {ISSUER} LOGIN CREATEDB CREATEROLE PASSWORD '{cluster.passwords[ISSUER]}';
+        GRANT pg_signal_backend TO {ISSUER};
+        ALTER ROLE {ISSUER} SET createrole_self_grant = 'set, inherit';
         """ + "\n".join(
             f"CREATE ROLE {role} LOGIN PASSWORD '{cluster.passwords[role]}';"
             for role in (MIGRATOR, RUNTIME, READER, STAGING)
         ))
-    cluster.ok("verify limited creator and loginless owner", f"""
-        SELECT (SELECT rolcanlogin AND rolcreatedb AND NOT rolsuper AND NOT rolcreaterole
-                FROM pg_roles WHERE rolname = current_user)
-           AND (SELECT NOT rolcanlogin AND NOT rolsuper FROM pg_roles WHERE rolname = '{OWNER}');
+
+
+def issue_role(cluster, lifecycle, expiry):
+    result = cluster.sql(lifecycle.issue(expiry, cluster.passwords[CREATOR]), role=ISSUER)
+    checked(result, "issue the restricted setup role")
+    receipt, separator, rest = result.stdout.partition("\n")
+    require(separator and not rest and receipt.isascii() and receipt.isdigit(),
+            "read back one private issuance receipt")
+    return int(receipt)
+
+
+def prove_issuance(cluster, lifecycle):
+    issue = lifecycle.issue(cluster.expiry, secrets.token_hex(24))
+    cluster.denied("roll back role creation when the issuer cannot grant the owner", issue,
+                   "ERROR:  42501:", role=ISSUER)
+    cluster.ok("verify failed issuance left no role", f"""
+        SELECT NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{CREATOR}');
+        """, "t\n")
+    cluster.ok("authorize the non-superuser issuer to grant only the owner membership", f"""
+        GRANT {OWNER} TO {ISSUER} WITH ADMIN TRUE, SET FALSE, INHERIT FALSE;
+        """)
+    for connection in ({"role": ISSUER, "database": "template1"}, {"switch": ISSUER}):
+        cluster.denied("refuse an eligible issuer in the wrong custodian session", issue,
+                       "ERROR:  P0001: wrong custodian session", **connection)
+    for expiry in (int(time.time()) - 1, int(time.time()) + 7300):
+        cluster.denied("refuse issuance outside the native expiry window",
+                       lifecycle.issue(expiry, cluster.passwords[CREATOR]),
+                       "ERROR:  P0001:", role=ISSUER)
+    oid = issue_role(cluster, lifecycle, cluster.expiry)
+    cluster.denied("refuse repeated issuance without rotating the credential", issue,
+                   "ERROR:  P0001:", role=ISSUER)
+    cluster.ok("read back both setup SQL identities, attributes, membership and expiry", f"""
+        SELECT session_user = '{CREATOR}' AND current_user = '{CREATOR}'
+           AND (SELECT rolcanlogin AND rolcreatedb AND rolconnlimit = 1 AND NOT
+                    (rolinherit OR rolsuper OR rolcreaterole OR rolreplication OR rolbypassrls)
+                    AND rolvaliduntil = to_timestamp({cluster.expiry}) FROM pg_roles WHERE oid = {oid})
+           AND (SELECT count(*) = 1 AND bool_and(roleid = '{OWNER}'::regrole AND set_option
+                    AND NOT (admin_option OR inherit_option)) FROM pg_auth_members WHERE member = {oid})
+           AND (SELECT count(*) = 1 AND bool_and(member = '{ISSUER}'::regrole AND admin_option
+                    AND NOT (set_option OR inherit_option)) FROM pg_auth_members WHERE roleid = {oid});
         """, "t\n", role=CREATOR)
+    cluster.ok("allow switching to the loginless owner without inheriting its rights", f"""
+        SELECT session_user = '{CREATOR}' AND current_user = '{OWNER}';
+        """, "t\n", role=CREATOR, switch=OWNER)
+    for role, sql in (
+        (CREATOR, "CREATE ROLE fixture_denied"),
+        (CREATOR, f"GRANT {OWNER} TO {READER}"),
+        (CREATOR, f"SET ROLE {READER}"),
+        (READER, f"SET ROLE {CREATOR}"),
+        (READER, "CREATE DATABASE fixture_denied"),
+    ):
+        cluster.denied("deny authority outside the setup and reader roles", sql, "ERROR:  42501:", role=role)
+    cluster.denied("refuse retirement before the login fence", lifecycle.retire(oid),
+                   "ERROR:  P0001:", role=ISSUER)
+    return oid
+
+
+def prove_expiry_and_drain(cluster, lifecycle, old_oid):
+    # Reuse the name only in the fixture to prove that an old receipt is harmless.
+    cluster.passwords[CREATOR] = secrets.token_hex(24)
+    expiry = int(time.time()) + 10
+    oid = issue_role(cluster, lifecycle, expiry)
+    cluster.denied("refuse to fence a replacement role with a stale receipt", lifecycle.fence(old_oid),
+                   "ERROR:  P0001:", role=ISSUER)
+    env = {"PATH": os.defpath, "LC_ALL": "C", "PGHOST": cluster.address, "PGPORT": str(PORT),
+           "PGDATABASE": MAINTENANCE,
+           "PGSSLMODE": "verify-full", "PGGSSENCMODE": "disable", "PGCONNECT_TIMEOUT": "2",
+           "PGSSLROOTCERT": str(cluster.directory / "client" / "trusted.crt")}
+
+    def start_session(role):
+        return subprocess.Popen(["/usr/bin/psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"],
+                                env=env | {"PGUSER": role, "PGPASSWORD": cluster.passwords[role]},
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def readback(session, sql, expected, timeout=3):
+        session.stdin.write((sql + "\n").encode())
+        session.stdin.flush()
+        ready, _, _ = select.select([session.stdout], [], [], timeout)
+        require(ready and session.stdout.readline() == expected, "read back a held TLS session")
+
+    with start_session(CREATOR) as holder, start_session(READER) as reader:
+        try:
+            readback(holder, f"SELECT session_user = '{CREATOR}' AND current_user = '{CREATOR}';", b"t\n")
+            reader_identity = f"SELECT session_user = '{READER}' AND current_user = '{READER}';"
+            readback(reader, reader_identity, b"t\n")
+            cluster.denied("cap concurrent setup sessions", "SELECT 1;",
+                           "too many connections for role", role=CREATOR)
+            # PostgreSQL checks password validity only at authentication.
+            readback(holder, f"SELECT pg_sleep(GREATEST(0, extract(epoch FROM to_timestamp({expiry})"
+                     " - clock_timestamp()) + 0.1));", b"\n", timeout=12)
+            cluster.denied("deny fresh password authentication after native expiry", "SELECT 1;",
+                           "password authentication failed", role=CREATOR)
+            readback(holder, f"SET ROLE {OWNER}; SELECT current_user = '{OWNER}';", b"t\n")
+            for _ in range(2):
+                cluster.ok("commit the login fence independently of session cleanup", lifecycle.fence(oid),
+                           role=ISSUER)
+            readback(holder, "SELECT 1;", b"1\n")
+            for _ in range(2):
+                cluster.ok("terminate existing sessions and verify role removal", lifecycle.retire(oid),
+                           "retired\n", role=ISSUER)
+            stdout, _ = holder.communicate(b"SELECT 1;\n", timeout=3)
+            require(holder.returncode != 0 and not stdout, "observe the terminated TLS client")
+            readback(reader, reader_identity, b"t\n")
+        finally:
+            for session in (holder, reader):
+                if session.poll() is None:
+                    session.kill()
 
 
 def refuse_before_create(cluster):
@@ -427,7 +533,7 @@ def verify_launch_grants(cluster):
         REVOKE CREATE ON DATABASE {LAUNCH} FROM {MIGRATOR};
         GRANT CONNECT ON DATABASE {LAUNCH} TO {RUNTIME}, {READER};
         """, role=CREATOR, switch=OWNER)
-    cluster.ok("retire creator membership", f"REVOKE {OWNER} FROM {CREATOR};")
+    cluster.ok("retire creator membership", f"REVOKE {OWNER} FROM {CREATOR};", role=ISSUER)
     cluster.ok("verify creator cannot reassume ownership", f"""
         SELECT NOT pg_has_role(current_user, '{OWNER}', 'SET')
            AND NOT has_database_privilege(current_user, '{LAUNCH}', 'CONNECT');
@@ -489,16 +595,40 @@ def exercise(*, interrupt):
             try:
                 cluster.start()
                 provision_roles(cluster)
+                env = caller_env(cluster, (CREATOR, OWNER, MIGRATOR, READER))
+                lifecycle = SetupRoleLifecycle(base64.b64decode(env["BOOTSTRAP_PLAN_B64"]))
+                oid = prove_issuance(cluster, lifecycle)
                 if not interrupt:
                     refuse_before_create(cluster)
                     verify_quiet_failure(cluster)
                 prove_setup_caller(cluster, interrupt=interrupt)
+                if not interrupt:
+                    verify_launch_grants(cluster)
+                cluster.ok("revoke setup login and password", lifecycle.fence(oid), role=ISSUER)
+                cluster.ok("read back the login fence and cleared password", f"""
+                    SELECT NOT rolcanlogin AND NOT rolcreatedb AND rolpassword IS NULL
+                       AND rolvaliduntil = 'epoch'::timestamptz FROM pg_authid WHERE oid = {oid};
+                    """, "t\n")
+                cluster.denied("refuse setup authentication after revocation", "SELECT 1;",
+                               "password authentication failed", role=CREATOR)
+                if interrupt:
+                    cluster.denied("preserve the interrupted database on failed retirement",
+                                   lifecycle.retire(oid), "ERROR:  2BP01:", role=ISSUER)
+                    cluster.denied("retain revocation after failed retirement", "SELECT 1;",
+                                   "password authentication failed", role=CREATOR)
+                    cluster.ok("reconcile only the known fenced fixture database", f"""
+                        ALTER DATABASE {LAUNCH} OWNER TO {OWNER};
+                        SELECT NOT datallowconn AND datdba = '{OWNER}'::regrole
+                        FROM pg_database WHERE datname = '{LAUNCH}';
+                        """, "t\n")
+                cluster.ok("read back setup role removal and zero sessions", lifecycle.retire(oid),
+                           "retired\n", role=ISSUER)
                 if interrupt:
                     docker("exec", "-i", cluster.client, "sh", "-exc",
                            'echo ready; read -r line; printf "%s" "$line"',
                            input_text=secrets.token_hex(24) + "\n", timeout=3, interrupt=True)
                     raise FixtureFailure("interruption did not stop the fixture")
-                verify_launch_grants(cluster)
+                prove_expiry_and_drain(cluster, lifecycle, oid)
             finally:
                 cluster.teardown()
     except Interrupted as error:
@@ -532,4 +662,4 @@ if __name__ == "__main__":
         sys.exit(f"database-bootstrap-fixture: failed to {error}")
     except Exception:
         sys.exit("database-bootstrap-fixture: failed")
-    print("database-bootstrap-fixture: routed login, SQL identity, TLS, fencing, grants and teardown passed")
+    print("database-bootstrap-fixture: routed TLS, setup role lifecycle, isolation and teardown passed")
