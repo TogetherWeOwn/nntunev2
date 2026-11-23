@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from database_bootstrap_preflight import (
@@ -86,7 +87,6 @@ class Cluster:
         token = secrets.token_hex(8)
         self.network = "bootstrap-" + token
         self.server = self.network + ".test"
-        self.bad_host = "wrong-" + self.server
         self.client = self.network + "-client"
         roles = ("postgres", CREATOR, MIGRATOR, RUNTIME, READER, STAGING)
         self.passwords = {role: secrets.token_hex(24) for role in roles}
@@ -111,20 +111,18 @@ class Cluster:
                         "-CA", client / "trusted.crt", "-CAkey", self.directory / "trusted.key",
                         "-copy_extensions", "copy", "-out", server / "server.crt"),
                 "sign fixture server certificate")
-        password_file = server / "password"
-        password_file.touch(mode=0o600)
-        password_file.write_text(self.passwords["postgres"] + "\n")
+        (server / "password").write_text(self.passwords["postgres"] + "\n")
         (server / "pg_hba.conf").write_text("local all all trust\nhostssl all all all scram-sha-256\n")
         checked(docker("network", "create", "--internal", self.network), "create internal network")
         common = ["run", "--detach", "--pull=never", "--log-driver=none",
                   "--network", self.network, "--tmpfs", "/var/lib/postgresql"]
-        checked(docker(*common, "--name", self.server, "--network-alias", self.bad_host,
+        checked(docker(*common, "--name", self.server, "--network-alias", f"wrong-{self.server}",
                        "--mount", f"type=bind,src={server},dst=/fixture,readonly",
                        "-e", "POSTGRES_PASSWORD_FILE=/fixture/password", "--entrypoint", "sh", IMAGE,
                        "-ec", """
-                       install -o postgres -g postgres -m 0600 /fixture/server.key /tmp/server.key
+                       install -o postgres -g postgres -m 0600 /fixture/server.key /fixture/server.crt /fixture/pg_hba.conf /tmp/
                        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_key_file=/tmp/server.key \
-                           -c ssl_cert_file=/fixture/server.crt -c hba_file=/fixture/pg_hba.conf
+                           -c ssl_cert_file=/tmp/server.crt -c hba_file=/tmp/pg_hba.conf
                        """), "start disposable server")
         checked(docker(*common, "--name", self.client, "--entrypoint", "sleep",
                        "--mount", f"type=bind,src={client},dst=/fixture,readonly", IMAGE, "infinity"),
@@ -192,11 +190,11 @@ class Cluster:
                     role=MIGRATOR, database=target)
 
     def teardown(self):
-        # Use successful listings as absence evidence. A failed inspect could
-        # also mean the daemon was unreachable.
-        for name in (self.client, self.server):
-            docker("container", "rm", "--force", "--volumes", name, cleanup=True)
-        docker("network", "rm", self.network, cleanup=True)
+        # Attempt every removal. Only successful empty listings prove absence.
+        for kind, name in (("container", self.client), ("container", self.server), ("network", self.network)):
+            flags = ("--force", "--volumes") if kind == "container" else ()
+            with suppress(OSError, subprocess.TimeoutExpired):
+                docker(kind, "rm", *flags, name, cleanup=True)
         for name in (self.client, self.server):
             checked(docker("container", "ls", "-aq", "--filter", f"name=^/{name}$", cleanup=True),
                     "verify container teardown", "")
@@ -224,7 +222,7 @@ def refuse_before_create(cluster):
     cluster.ok("create and restrict the synthetic staging sibling",
                f"CREATE DATABASE {SIBLING} OWNER {STAGING} TEMPLATE template0;\n"
                f"REVOKE ALL ON DATABASE {SIBLING} FROM PUBLIC;")
-    cluster.create_fenced(host=cluster.bad_host, expected_refusal="does not match host name")
+    cluster.create_fenced(host=f"wrong-{cluster.server}", expected_refusal="does not match host name")
     cluster.create_fenced(ca="other", expected_refusal="certificate verify failed")
     try:
         cluster.create_fenced(port=PORT + 1)
@@ -361,6 +359,7 @@ def exercise(*, interrupt):
 
 def main():
     require(len(sys.argv) == 1, "fixture accepts no arguments")
+    os.umask(0o077)
     for signum in (signal.SIGINT, signal.SIGTERM, DRILL_SIGNAL):
         signal.signal(signum, remember_signal)
     if docker("image", "inspect", IMAGE).returncode != 0:
@@ -370,6 +369,7 @@ def main():
     check_interruption()
     if output := os.environ.get("GITHUB_OUTPUT"):
         Path(output).write_text("verdict=passed\n", encoding="utf-8")
+        check_interruption()
 
 
 if __name__ == "__main__":
