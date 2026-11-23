@@ -3,13 +3,14 @@
 use super::subsonic_pg_page::{admit_page, fetch_page, Param};
 use super::{with_deadline, StoreError};
 use crate::catalogue::{self, ArtistDbRow, ReleaseDbRow, TrackDbRow};
+use crate::postgres::{PgClient, PgConnect, PgQuery, PgTransaction};
 use nntune_subsonic::{
     construction_budget::ConstructionBudget, staging_rejection::StagingRejection,
 };
 use std::future::Future;
 use tokio_postgres::{
     types::{ToSql, Type},
-    Client, Row, Transaction,
+    Row,
 };
 
 type CatalogueRows = (Vec<ArtistDbRow>, Vec<ReleaseDbRow>, Vec<TrackDbRow>);
@@ -51,7 +52,7 @@ macro_rules! probe_sql {
 }
 
 async fn preflight(
-    tx: &Transaction<'_>,
+    tx: &PgTransaction<'_>,
     probe: &str,
     params: &[Param<'_>],
     limit: i64,
@@ -84,7 +85,7 @@ fn optional_text(
 }
 
 async fn read_mirror(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     budget: &mut ConstructionBudget,
     member: MirrorSelection<'_>,
     cap: i64,
@@ -94,14 +95,8 @@ async fn read_mirror(
         .filter(|_| (0..=MIRROR_ROWS).contains(&cap))
         .ok_or(StoreError)?;
     let mut remaining = member.remaining_text_bytes;
-    let tx = client
-        .build_transaction()
-        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
-        .read_only(true)
-        .start()
-        .await
-        .map_err(|_| StoreError)?;
-    tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '1s'")
+    let tx = client.read_only_snapshot().await.map_err(|_| StoreError)?;
+    tx.set_local_subsonic_timeouts()
         .await
         .map_err(|_| StoreError)?;
     // octet_length measures server bytes, while binary text uses the client encoding.
@@ -232,7 +227,7 @@ pub(crate) async fn load_staging_mirror<F>(
     connect_isolated: impl FnOnce() -> F,
 ) -> Result<CatalogueRows, StagingRejection>
 where
-    F: Future<Output = Result<Client, StagingRejection>>,
+    F: Future<Output = Result<PgClient, StagingRejection>>,
 {
     if member.releases.is_empty() && member.pairs.is_empty() {
         return Ok(CatalogueRows::default());

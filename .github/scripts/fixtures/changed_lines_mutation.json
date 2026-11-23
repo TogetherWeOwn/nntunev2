@@ -1,0 +1,85 @@
+{
+  "base": "def old(value):\n    return value < 2\n\ndef unchanged(value):\n    return value > 3\n",
+  "head": "def old(value):\n    return value < 2  # clarified\n\ndef unchanged(value):\n    return value > 3\n\ndef new(value):\n    return value < 8\n",
+  "test_template": "import unittest\nfrom account_export import new\n\nclass BoundaryTest(unittest.TestCase):\n    def test_new(self):\n        {assertion}\n",
+  "cases": [
+    {
+      "name": "new survivor blocks enforcement while pre-existing and out-of-scope mutants are skipped",
+      "assertion": "self.assertTrue(new(7))",
+      "enforcing": true,
+      "verdict": 1,
+      "evidence": [
+        "Changed paths outside scope: 2",
+        "selected 1, existing or ambiguous 1",
+        "Survived: scripts/account_export.py:8",
+        "0 killed, 1 survived"
+      ]
+    },
+    {
+      "name": "boundary assertion kills the new mutant",
+      "assertion": "self.assertFalse(new(8))",
+      "enforcing": true,
+      "verdict": 0,
+      "evidence": [
+        "1 killed, 0 survived"
+      ]
+    },
+    {
+      "name": "warning phase reports a survivor and passes",
+      "assertion": "self.assertTrue(new(7))",
+      "enforcing": false,
+      "verdict": 0,
+      "evidence": [
+        "0 killed, 1 survived",
+        "1 new changed-line mutants survived (warning phase)"
+      ]
+    },
+    {
+      "name": "failing baseline blocks in warning phase",
+      "assertion": "self.assertTrue(new(8))",
+      "enforcing": false,
+      "error": "baseline tests failed"
+    },
+    {
+      "name": "unexpected mutant test error blocks without a mutation verdict",
+      "assertion": "self.assertFalse(new(8) and missing_helper())",
+      "enforcing": false,
+      "error": "test runner failed"
+    },
+    {
+      "name": "an exception originating in mutated source kills the mutant",
+      "assertion": "self.assertFalse(new(8))",
+      "enforcing": false,
+      "implementation": "if value < 8: raise RuntimeError()\n    return False",
+      "verdict": 0,
+      "evidence": [
+        "1 killed, 0 survived"
+      ]
+    },
+    {
+      "name": "a mutated source exception inside a subtest kills the mutant",
+      "assertion": "with self.subTest():\n            self.assertFalse(new(8))",
+      "enforcing": false,
+      "implementation": "if value < 8: raise RuntimeError()\n    return False",
+      "verdict": 0,
+      "evidence": [
+        "1 killed, 0 survived"
+      ]
+    },
+    {
+      "name": "a source call that raises in a Python library kills the mutant",
+      "assertion": "self.assertFalse(new(8))",
+      "enforcing": false,
+      "implementation": "from fractions import Fraction\n    return Fraction(1, 0) if value < 8 else False",
+      "verdict": 0,
+      "evidence": ["1 killed, 0 survived"]
+    },
+    {
+      "name": "an error raised by a test callback stays a harness failure",
+      "assertion": "new.__globals__['callback'] = lambda: missing_helper()\n        self.assertFalse(new(8))",
+      "enforcing": false,
+      "implementation": "return callback() if value < 8 else False",
+      "error": "test runner failed"
+    }
+  ]
+}

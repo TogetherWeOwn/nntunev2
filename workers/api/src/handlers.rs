@@ -225,6 +225,7 @@ pub struct Config {
     pub prior_keks: Vec<(u32, [u8; 32])>,
     pub session_ttl_secs: u64,
     pub invites_required: bool,
+    pub(crate) private_listening: Option<crate::private_listening::PrivateListening>,
     /// Verify-only previous session HMAC secret: `Some` only inside a
     /// recorded rotation window, `None` in steady state. Never mints;
     /// length-checked like the primary (a short previous fails closed).
@@ -337,6 +338,7 @@ impl Config {
             prior_keks: Vec::new(),
             session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
             invites_required,
+            private_listening: None,
             session_previous_secret,
             native_rest_pepper: None,
             native_rest_pepper_version: 0,
@@ -505,6 +507,15 @@ impl Config {
 /// Opaque storage failure: detail stays server-side.
 #[derive(Debug, Clone, Copy)]
 pub struct StoreError;
+
+pub(crate) const ADMIN_INVITE_BATCH_MAX: usize = 50;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdminInviteBatchOutcome {
+    Issued,
+    ActorNotAdmin,
+    AccountDeleting,
+}
 
 /// Outcome of one admin write transaction (migration 0028). The
 /// transaction serializes every admin write and re-reads the actor's
@@ -811,6 +822,14 @@ pub trait Store {
         &self,
         email: &str,
     ) -> impl Future<Output = Result<Option<UserRecord>, StoreError>>;
+    fn private_listening_access(
+        &self,
+        _user_id: &str,
+        _owner_user_id: &str,
+        _invite_ids: &[i64],
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     fn insert_user(&self, user: &UserRecord) -> impl Future<Output = Result<(), StoreError>>;
     fn insert_challenge(
         &self,
@@ -1588,6 +1607,17 @@ pub trait Store {
     ) -> impl Future<Output = Result<AdminInviteIssueOutcome, StoreError>> {
         async { Err(StoreError) }
     }
+    /// Atomically issue unbound admin invites and write one audit per row.
+    fn admin_issue_invite_batch(
+        &self,
+        _actor: &str,
+        _hashes: &[String],
+        _source_ip: &str,
+        _now: u64,
+        _expires_at: u64,
+    ) -> impl Future<Output = Result<AdminInviteBatchOutcome, StoreError>> {
+        async { Err(StoreError) }
+    }
     /// Read the issuer's summary; `None` means the issuer is absent or deleting.
     fn member_invite_summary(
         &self,
@@ -2073,7 +2103,11 @@ where
 }
 
 // Adapted from PR #982. Serialize with privacy-aware new-play acquisition.
-async fn me_private_session<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn me_private_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    claims: SessionClaims,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -2091,10 +2125,6 @@ where
         enabled: bool,
     }
 
-    let (claims, _) = match preference_authenticate(ctx, req, true).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
     let invalid = || validation_failed("invalid private session request");
     // Serde structs also accept positional arrays without this object check.
     if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
@@ -2149,6 +2179,29 @@ fn session_binding(claims: &SessionClaims) -> String {
     b64url_encode(&hash.finalize())
 }
 
+fn require_session_binding(
+    claims: &SessionClaims,
+    expected: Option<&str>,
+) -> Result<String, Response> {
+    let binding = session_binding(claims);
+    if expected != Some(binding.as_str()) {
+        return Err(json_response(
+            412,
+            serde_json::json!({"error": "session binding mismatch"}),
+        ));
+    }
+    Ok(binding)
+}
+
+pub(crate) const BOUND_TASTE_PATH: &str = "/v1/me/taste/session";
+
+fn taste_response(mut body: serde_json::Value, binding: Option<String>) -> Response {
+    if let Some(binding) = binding {
+        body["session_binding"] = serde_json::Value::String(binding);
+    }
+    json_response(200, body)
+}
+
 async fn me_likes_session<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -2198,25 +2251,17 @@ where
     }
 }
 
-async fn me_taste_list<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn me_taste_list<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    claims: SessionClaims,
+    binding: Option<String>,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
     D: Dialer,
     N: AsyncDns,
 {
-    let (claims, _) = match preference_authenticate(ctx, req, false).await {
-        Ok(pair) => pair,
-        // Keep the preference contract's envelope without changing legacy session routes.
-        Err(resp) if resp.status == 401 => {
-            let error = crate::api_error::ApiError::unauthorized("authentication required");
-            return Response {
-                body: error.body_json(),
-                ..resp
-            };
-        }
-        Err(resp) => return resp,
-    };
     match ctx.store.taste_list(&claims.user_id, ctx.now).await {
         Ok(rows) => {
             let items: Vec<_> = rows
@@ -2231,7 +2276,7 @@ where
                     })
                 })
                 .collect();
-            json_response(200, serde_json::json!({"items": items}))
+            taste_response(serde_json::json!({"items": items}), binding)
         }
         Err(_) => unavailable(),
     }
@@ -2282,32 +2327,10 @@ where
     }
 }
 
-async fn track_like_authenticate<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
-    expected_session_binding: Option<&str>,
-) -> Result<SessionClaims, Response>
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let (claims, _) = preference_authenticate(ctx, req, true).await?;
-    if expected_session_binding != Some(session_binding(&claims).as_str()) {
-        return Err(json_response(
-            412,
-            serde_json::json!({"error": "session binding mismatch"}),
-        ));
-    }
-    Ok(claims)
-}
-
 async fn me_like_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
     target: &str,
-    expected_session_binding: Option<&str>,
+    claims: SessionClaims,
 ) -> Response
 where
     S: Store + SingleUseStore,
@@ -2318,10 +2341,6 @@ where
     use crate::target_identity::{valid_target_id, TargetKind};
     use crate::taste_signal::TasteSignal;
 
-    let claims = match track_like_authenticate(ctx, req, expected_session_binding).await {
-        Ok(claims) => claims,
-        Err(resp) => return resp,
-    };
     if !valid_target_id(target) {
         return not_found();
     }
@@ -2356,9 +2375,8 @@ where
 
 async fn me_unlike_track<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
     target: &str,
-    expected_session_binding: Option<&str>,
+    claims: SessionClaims,
 ) -> Response
 where
     S: Store + SingleUseStore,
@@ -2368,10 +2386,6 @@ where
 {
     use crate::target_identity::{valid_target_id, TargetKind};
 
-    let claims = match track_like_authenticate(ctx, req, expected_session_binding).await {
-        Ok(claims) => claims,
-        Err(resp) => return resp,
-    };
     if !valid_target_id(target) {
         return not_found();
     }
@@ -2397,15 +2411,17 @@ where
     }
 }
 
-// Adapted from PR #982.
-async fn me_likes_import<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    use crate::target_identity::{canonical_target_id, valid_target_id, TargetKind};
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LikesImportItem {
+    kind: String,
+    target_id: String,
+}
+
+fn admit_likes_import(
+    req: &Request,
+    claims: &SessionClaims,
+) -> Result<Vec<LikesImportItem>, Response> {
     use serde::de::{value::MapAccessDeserializer, MapAccess, Visitor};
     use std::{fmt, marker::PhantomData};
 
@@ -2432,43 +2448,42 @@ where
     #[serde(deny_unknown_fields)]
     struct Body {
         session_binding: String,
-        items: Vec<Object<Item>>,
+        items: Vec<Object<LikesImportItem>>,
     }
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Item {
-        kind: String,
-        target_id: String,
-    }
-
-    let (claims, _) = match preference_authenticate(ctx, req, true).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
     let Some(Object(Body {
         session_binding: provided_binding,
         items,
     })) = parse_body(req)
     else {
-        return validation_failed("invalid likes import body");
+        return Err(validation_failed("invalid likes import body"));
     };
     if provided_binding.is_empty() {
-        return validation_failed("invalid likes import body");
+        return Err(validation_failed("invalid likes import body"));
     }
-    if provided_binding != session_binding(&claims) {
-        return json_response(
-            412,
-            serde_json::json!({"error": "session binding mismatch"}),
-        );
-    }
+    require_session_binding(claims, Some(&provided_binding))?;
     if items.len() > 500 {
-        return validation_failed("too many likes import items");
+        return Err(validation_failed("too many likes import items"));
     }
+    Ok(items.into_iter().map(|Object(item)| item).collect())
+}
+
+async fn me_likes_import<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    claims: SessionClaims,
+    items: Vec<LikesImportItem>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::target_identity::{canonical_target_id, valid_target_id, TargetKind};
 
     let owner = &claims.user_id;
     let (mut added, mut already) = (0, 0);
     let mut rejected = Vec::new();
-    for Object(Item { kind, target_id }) in items {
+    for LikesImportItem { kind, target_id } in items {
         let mut reject = |reason| {
             rejected.push(serde_json::json!({
                 "target_id": target_id.chars().take(64).collect::<String>(), "reason": reason,
@@ -2514,7 +2529,12 @@ where
     )
 }
 
-async fn me_taste_put<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn me_taste_put<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    claims: SessionClaims,
+    binding: Option<String>,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -2538,10 +2558,6 @@ where
         u64::deserialize(d).map(Some)
     }
 
-    let (claims, _) = match preference_authenticate(ctx, req, true).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
     let invalid = || validation_failed("invalid taste signal request");
     // Serde structs can also deserialize from arrays; require an object here.
     if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
@@ -2581,8 +2597,8 @@ where
         _ => return not_found(),
     };
     let target = match target {
-        Ok(Some(target)) => target,
-        Ok(None) => return not_found(),
+        Ok(Some(target)) if binding.is_none() || target == body.target_id => target,
+        Ok(_) => return not_found(),
         Err(_) => return unavailable(),
     };
     match ctx
@@ -2590,17 +2606,22 @@ where
         .taste_upsert(owner, kind, &target, signal, until, ctx.now)
         .await
     {
-        Ok(row) => json_response(
-            200,
+        Ok(row) => taste_response(
             serde_json::json!({
                 "kind": row.kind, "target_id": row.target_id, "signal": row.signal, "until": row.snooze_until,
             }),
+            binding,
         ),
         Err(_) => unavailable(),
     }
 }
 
-async fn me_taste_clear<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn me_taste_clear<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    claims: SessionClaims,
+    binding: Option<String>,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -2616,10 +2637,6 @@ where
         target_id: String,
     }
 
-    let (claims, _) = match preference_authenticate(ctx, req, true).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
     // Serde structs can also deserialize positional arrays; require an object.
     if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
         return validation_failed("invalid taste clear body");
@@ -2646,12 +2663,19 @@ where
         TargetKind::Release => return not_found(),
     };
     let target = match member {
-        Ok(Some(target)) => target,
-        Ok(None) => return not_found(),
+        Ok(Some(target)) if binding.is_none() || target == target_id => target,
+        Ok(_) => return not_found(),
         Err(_) => return unavailable(),
     };
     match ctx.store.taste_delete(owner, kind, &target).await {
-        Ok(cleared) => json_response(200, serde_json::json!({"cleared": cleared})),
+        Ok(cleared) => {
+            let mut body = serde_json::json!({"cleared": cleared});
+            if binding.is_some() {
+                body["kind"] = serde_json::json!(kind.as_str());
+                body["target_id"] = serde_json::json!(target);
+            }
+            taste_response(body, binding)
+        }
         Err(_) => unavailable(),
     }
 }
@@ -3005,6 +3029,23 @@ where
         Ok(resp)
     }
 
+    async fn private_listening_deadline(&self, user_id: &str) -> Result<Option<u64>, Response> {
+        let Some(policy) = &self.cfg.private_listening else {
+            return Ok(None);
+        };
+        if self.now < policy.expires_at
+            && self
+                .store
+                .private_listening_access(user_id, &policy.owner_user_id, &policy.invite_ids)
+                .await
+                .map_err(|_| internal())?
+        {
+            return Ok(Some(policy.expires_at));
+        }
+        let error = crate::api_error::ApiError::forbidden("private listening access required");
+        Err(json_response(error.status, serde_json::json!(error)))
+    }
+
     /// Full request authentication: signed token + current server row via
     /// `verify_stored_session`, plus the CSRF origin pin for mutations.
     async fn authenticate(
@@ -3351,6 +3392,9 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
+    if ctx.cfg.private_listening.is_some() && body.invite_code.is_none() {
+        return generic_auth();
+    }
     // Invite pre-check (spec §6.3): when the signup page presents a
     // code, validate it — never consume it — before any signup row is
     // minted, so a bad code fails at the code step with the one
@@ -3394,6 +3438,14 @@ where
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
+        if ctx
+            .cfg
+            .private_listening
+            .as_ref()
+            .is_some_and(|policy| !policy.accepts_invite(&invite, ctx.now))
+        {
+            return generic_auth();
+        }
         // No user row exists yet: validate against a sentinel id that
         // can never equal an issuer, so the hash/spend/revoked/expiry/
         // email-bind/self-invite (by email) predicates all run; the
@@ -3700,7 +3752,10 @@ where
     // token intact for a corrected retry (the signup page stays on the
     // code step). Single-use is enforced by the conditional store claim,
     // not this snapshot. All claims and enrollment commit together.
-    let invite_redemption = if ctx.cfg.invites_required || body.invite_code.is_some() {
+    let invite_redemption = if ctx.cfg.invites_required
+        || ctx.cfg.private_listening.is_some()
+        || body.invite_code.is_some()
+    {
         // Atomic redemption budgets BEFORE the lookup, claimed as one
         // all-or-none pair: the per-client key (10/300s, keyed by client
         // prefix and account, per `auth::invite_attempt_allowed`) and
@@ -3745,6 +3800,14 @@ where
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
+        if ctx
+            .cfg
+            .private_listening
+            .as_ref()
+            .is_some_and(|policy| !policy.accepts_invite(&invite, ctx.now))
+        {
+            return generic_auth();
+        }
         // The snapshot prepare validates every refusal class with the
         // one generic error (unknown/expired/revoked/email-mismatch/
         // self-invite are indistinguishable) and stamps the spend the
@@ -3756,10 +3819,11 @@ where
             issuer_email: issuer_email.as_deref(),
             now: ctx.now,
         };
-        let prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
+        let mut prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
             Ok(prepared) => prepared,
             Err(_) => return generic_auth(),
         };
+        prepared.require_active_admin_issuer = ctx.cfg.private_listening.is_some();
         // The `invite.redeemed` audit rides the enrollment transaction
         // inside `complete_registration`, so it can never be separated
         // from the claim it records. It references the invite by row
@@ -3825,6 +3889,10 @@ where
     }
     ctx.audit(&user_id, "auth.register", true).await;
     match ctx.start_session(&user_id).await {
+        Ok(mut resp) if ctx.cfg.private_listening.is_some() => {
+            resp.body = serde_json::json!({"ok": true, "private_listening": true}).to_string();
+            resp
+        }
         Ok(resp) => resp,
         Err(resp) => resp,
     }
@@ -4328,7 +4396,7 @@ where
     // established state, and gating on credentials alone would lock
     // those members out the moment invites flip on, with
     // register/finish demanding an invite they never needed.
-    if ctx.cfg.invites_required {
+    if ctx.cfg.invites_required || ctx.cfg.private_listening.is_some() {
         match ctx.store.account_admitted(&record.user_id).await {
             Ok(false) => return generic_auth(),
             Ok(true) => {}
@@ -4659,15 +4727,12 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if let Some(user) = bearer {
-        if !user.is_empty() {
-            return Ok(user.to_string());
-        }
-    }
-    match ctx.authenticate(req, false).await {
-        Ok((claims, _token)) => Ok(claims.user_id),
-        Err(resp) => Err(resp),
-    }
+    let user_id = match bearer.filter(|user| !user.is_empty()) {
+        Some(user) => user.to_string(),
+        None => ctx.authenticate(req, false).await?.0.user_id,
+    };
+    ctx.private_listening_deadline(&user_id).await?;
+    Ok(user_id)
 }
 
 /// Serialize a catalogue page, failing closed on the (in practice
@@ -4727,6 +4792,9 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    if let Err(resp) = ctx.private_listening_deadline(&claims.user_id).await {
+        return resp;
+    }
     let mut response = catalogue_library_entries(ctx, &claims.user_id).await;
     if is_cookie && response.status == 200 {
         response
@@ -4978,6 +5046,10 @@ mod listen_history_controls;
 #[allow(dead_code)] // Prepared, with no production route or caller.
 #[path = "listen_history_receiver.rs"]
 mod listen_history_receiver;
+
+#[allow(dead_code)] // Callable only after a browser media route is admitted.
+#[path = "browser_playback_relay.rs"]
+mod browser_playback_relay;
 
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
@@ -6117,6 +6189,13 @@ struct AdminInviteIssueBody {
     expires_in_days: Option<u32>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminInviteBatchBody {
+    count: usize,
+    expires_in_days: Option<u32>,
+}
+
 /// One invite as the admin API reports it: lifecycle fields only —
 /// the code and its hash are never in any response.
 fn invite_admin_json(record: &InviteRecord, now: u64) -> serde_json::Value {
@@ -6160,26 +6239,9 @@ where
         },
         None => None,
     };
-    let expiry_key = crate::admin::SettingKey::InviteDefaultExpiryDays;
-    let expires_in_days = match body.expires_in_days {
-        Some(days) => match expiry_key.validate(days) {
-            Some(days) => days,
-            None => return validation_failed("invite expiry out of range"),
-        },
-        None => {
-            let rows = match ctx.store.app_settings().await {
-                Ok(rows) => rows,
-                Err(_) => return internal(),
-            };
-            let stored = rows
-                .iter()
-                .find(|(name, _)| name == expiry_key.as_str())
-                .map(|(_, value)| value.as_str());
-            match expiry_key.resolve(stored) {
-                Some(days) => days,
-                None => return internal(),
-            }
-        }
+    let expires_at = match admin_invite_expiry(ctx.store, body.expires_in_days, ctx.now).await {
+        Ok(expires_at) => expires_at,
+        Err(response) => return response,
     };
     let code = match auth::generate_invite_code() {
         Ok(code) => code,
@@ -6192,8 +6254,7 @@ where
         auth::INVITE_KIND_ADMIN,
         email,
         ctx.now,
-        ctx.now
-            .saturating_add(u64::from(expires_in_days).saturating_mul(86_400)),
+        expires_at,
     );
     let invite_id = match ctx
         .store
@@ -6217,6 +6278,87 @@ where
             "code": code,
         }),
     )
+}
+
+async fn admin_invite_expiry(
+    store: &impl Store,
+    override_days: Option<u32>,
+    now: u64,
+) -> Result<u64, Response> {
+    let key = crate::admin::SettingKey::InviteDefaultExpiryDays;
+    let days = match override_days {
+        Some(days) => key
+            .validate(days)
+            .ok_or_else(|| validation_failed("invite expiry out of range"))?,
+        None => {
+            let rows = store.app_settings().await.map_err(|_| internal())?;
+            let stored = rows
+                .iter()
+                .find(|(name, _)| name == key.as_str())
+                .map(|(_, value)| value.as_str());
+            key.resolve(stored).ok_or_else(internal)?
+        }
+    };
+    Ok(now.saturating_add(u64::from(days).saturating_mul(86_400)))
+}
+
+async fn admin_invite_batch_issue(
+    ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
+    req: &Request,
+) -> Response {
+    let claims = match ctx.authenticate_admin(req, true).await {
+        Ok(claims) => claims,
+        Err(response) => return response,
+    };
+    // Serde also accepts positional arrays for structs; this contract is object-only.
+    if req.body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return validation_failed("invalid request");
+    }
+    let Some(body) = parse_body::<AdminInviteBatchBody>(req) else {
+        return validation_failed("invalid request");
+    };
+    if !(1..=ADMIN_INVITE_BATCH_MAX).contains(&body.count) {
+        return validation_failed("invite count out of range");
+    }
+    let expires_at = match admin_invite_expiry(ctx.store, body.expires_in_days, ctx.now).await {
+        Ok(expires_at) => expires_at,
+        Err(response) => return response,
+    };
+    let mut codes = Vec::with_capacity(body.count);
+    let mut hashes = Vec::with_capacity(body.count);
+    for _ in 0..body.count {
+        let code = match auth::generate_invite_code() {
+            Ok(code) => code,
+            Err(auth::AuthError::RandomnessUnavailable) => return unavailable(),
+            Err(_) => return internal(),
+        };
+        hashes.push(auth::hash_invite_code(&code));
+        codes.push(code);
+    }
+    match ctx
+        .store
+        .admin_issue_invite_batch(
+            &claims.user_id,
+            &hashes,
+            &ctx.source_ip,
+            ctx.now,
+            expires_at,
+        )
+        .await
+    {
+        Ok(AdminInviteBatchOutcome::Issued) => {}
+        Ok(AdminInviteBatchOutcome::ActorNotAdmin) => return not_found(),
+        Ok(AdminInviteBatchOutcome::AccountDeleting) => return account_deleting_response(),
+        Err(_) => return internal(),
+    }
+    let mut response = json_response(
+        201,
+        serde_json::json!({"expires_at": expires_at, "codes": codes}),
+    );
+    response
+        .extra_headers
+        .push(("cache-control".into(), "private, no-store".into()));
+    response
 }
 
 /// Browser-session read only; do not use invite lookups that observe expiry.
@@ -6532,6 +6674,14 @@ where
 // cookie) but cannot mint until native bearer dispatch lands; the
 // heartbeat path is `Deny` in the scope map and never enters the gate.
 
+// Distinguishes private leases from paid leases when the cohort is disabled.
+const PRIVATE_PLAY_PREFIX: &str = "private_";
+
+fn is_private_play_id(play_id: &str) -> bool {
+    // Standard play ids encode 16 bytes in 22 unpadded base64url characters.
+    play_id.len() == PRIVATE_PLAY_PREFIX.len() + 22 && play_id.starts_with(PRIVATE_PLAY_PREFIX)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlayIssueBody {
@@ -6644,18 +6794,25 @@ fn mint_play(
     }
 }
 
-async fn play_issue<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn play_issue<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    claims: SessionClaims,
+    binding_verified: bool,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
     D: Dialer,
     N: AsyncDns,
 {
-    let (claims, _token) = match ctx.authenticate(req, true).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
+    let body = parse_body::<PlayIssueBody>(req);
+    let issued = if binding_verified {
+        issue_play(ctx, &claims.user_id, body, true).await
+    } else {
+        issue_play_for_user(ctx, &claims.user_id, body).await
     };
-    match issue_play_for_user(ctx, &claims.user_id, parse_body::<PlayIssueBody>(req)).await {
+    match issued {
         Ok(issued) => issued.into_response(),
         Err(response) => response,
     }
@@ -6678,12 +6835,28 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    issue_play(ctx, user_id, body, false).await
+}
+
+async fn issue_play<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    body: Option<PlayIssueBody>,
+    strict_continuation: bool,
+) -> Result<IssuedPlay, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
     // The lease writers are fenced on `deleting_at` (ADR 0002 rule 3);
     // answer the typed 409 up front rather than a lease 429/500 after
     // the fence refuses the write.
     if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) {
         return Err(account_deleting_response());
     }
+    let private_deadline = ctx.private_listening_deadline(user_id).await?;
     // An unprovisioned (or too-short) secret fails closed before any
     // lease write: an unmintable grant must never burn a lease epoch or
     // displace the current holder.
@@ -6709,6 +6882,19 @@ where
     if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, "play").is_err() {
         return Err(validation_failed("invalid track_id"));
     }
+    if private_deadline.is_some()
+        && !ctx
+            .store
+            .catalogue_member_target(
+                user_id,
+                crate::target_identity::TargetKind::Track,
+                &body.track_id,
+            )
+            .await
+            .map_err(|_| internal())?
+    {
+        return Err(not_found());
+    }
     let lease = match ctx.store.playback_lease(user_id).await {
         Ok(row) => row,
         Err(_) => return Err(internal()),
@@ -6719,16 +6905,21 @@ where
     // crosses the cap, or whose subscription lapses mid-play,
     // finishes; only the next NEW start is refused. The conditional
     // touch either re-extends the same epoch or reports the caller
-    // lost the lease between the read and now, in which case this is
-    // simply a new start through the gates below.
+    // lost the lease between the read and now. Only legacy callers
+    // fall through to new-start gates after a lost continuation.
     if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
         if row.is_continuation(&body.session_id, play_id, &body.track_id, ctx.now) {
+            if is_private_play_id(play_id) && private_deadline.is_none() {
+                return Err(not_found());
+            }
             if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, play_id).is_err()
             {
                 return Err(validation_failed("invalid play_id"));
             }
-            let lease_expires_at =
-                crate::playback::lease_expiry(ctx.now, row.continuation_deadline);
+            let deadline = row
+                .continuation_deadline
+                .min(private_deadline.unwrap_or(u64::MAX));
+            let lease_expires_at = crate::playback::lease_expiry(ctx.now, deadline);
             match ctx
                 .store
                 .touch_playback_lease(
@@ -6749,13 +6940,28 @@ where
                         play_id,
                         row.epoch,
                         ctx.now,
-                        row.continuation_deadline,
+                        deadline,
                     );
                 }
                 Ok(false) => {}
                 Err(_) => return Err(internal()),
             }
         }
+    }
+    if strict_continuation && body.play_id.is_some() {
+        if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) {
+            return Err(account_deleting_response());
+        }
+        let error =
+            crate::api_error::ApiError::by_code("conflict", "playback lease no longer active");
+        return Err(json_response(error.status, serde_json::json!(error)));
+    }
+    if private_deadline.is_some() {
+        let caps = crate::plan_limits::PlanCaps {
+            stream_seconds_month: 0,
+            max_concurrent_streams: 1,
+        };
+        return acquire_new_play(ctx, user_id, body, secret, caps, private_deadline).await;
     }
     // New start, gate 1: subscription. `now` saturates into i64 rather
     // than wrapping — an absurd clock reads as far-future (closed),
@@ -6813,20 +7019,39 @@ where
             ),
         ));
     }
-    // Gate 3: the lease. The play id is minted here, never taken from
-    // the client (a client-chosen fresh id could replay an old play
-    // and under-meter). The atomic acquire bumps the epoch in the
-    // store; `Held` is the other-session 429 with the live TTL.
-    let play_id = match random_id::<16>() {
+    acquire_new_play(ctx, user_id, body, secret, caps, None).await
+}
+
+async fn acquire_new_play<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    body: PlayIssueBody,
+    secret: &[u8],
+    caps: crate::plan_limits::PlanCaps,
+    private_deadline: Option<u64>,
+) -> Result<IssuedPlay, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // The per-account lease enforces one stream on either path. Only the
+    // server generates play ids for new starts.
+    let mut play_id = match random_id::<16>() {
         Ok(id) => id,
         Err(_) => return Err(unavailable()),
     };
+    if private_deadline.is_some() {
+        play_id.insert_str(0, PRIVATE_PLAY_PREFIX);
+    }
     let meta = ctx
         .store
         .track_meta(user_id, &body.track_id, true)
         .await
         .map_err(|_| internal())?;
-    let continuation_deadline = crate::playback::continuation_deadline(ctx.now, meta);
+    let continuation_deadline = crate::playback::continuation_deadline(ctx.now, meta)
+        .min(private_deadline.unwrap_or(u64::MAX));
     match ctx
         .store
         .acquire_playback_lease(
@@ -6867,22 +7092,26 @@ where
 /// displacement, and `expired` means the matching lease ended or no
 /// row exists). No subscription or cap gates: a current play finishes
 /// even when a new start would be refused.
-async fn play_heartbeat<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn play_heartbeat<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    claims: SessionClaims,
+) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
     D: Dialer,
     N: AsyncDns,
 {
-    let (claims, _token) = match ctx.authenticate(req, true).await {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
     // Same fence as issuance (ADR 0002 rule 3): a deleting account's
     // heartbeat is the typed 409, never an `active` extension.
     if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
         return account_deleting_response();
     }
+    let private_deadline = match ctx.private_listening_deadline(&claims.user_id).await {
+        Ok(deadline) => deadline,
+        Err(response) => return response,
+    };
     // Same fail-closed secret gate as issuance: a misconfigured
     // deployment must not let heartbeats keep a lease alive that no
     // new grant could be minted against.
@@ -6914,10 +7143,14 @@ where
         ctx.now,
     );
     let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
+        if is_private_play_id(&body.play_id) && private_deadline.is_none() {
+            return not_found();
+        }
         let deadline = lease
             .as_ref()
             .expect("active lease has a row")
-            .continuation_deadline;
+            .continuation_deadline
+            .min(private_deadline.unwrap_or(u64::MAX));
         let expires = crate::playback::lease_expiry(ctx.now, deadline);
         match ctx
             .store
@@ -7101,6 +7334,15 @@ where
 /// store failure (the caller 500s so the delivery retries); fail-closed
 /// passes still persist their observed row and return `Ok` with the
 /// marker set, so the caller can alert and disable.
+///
+/// Future invite review belongs after `store_reconcile_outcome` succeeds:
+/// select the relevant confirmed paid invoice from `outcome.history` and use
+/// the persisted unique customer binding (not the remote subscription's
+/// customer alone). Under that flow's read budget, verify the authenticated
+/// invoice with its Charge expanded via `stripe::payment_evidence`. Compare
+/// only confirmed issuer/invitee observations. Keep only the comparison and
+/// internal references in the private, idempotent audit; never gate access or
+/// add this work to signup. No evidence lookup runs here today.
 async fn reconcile_remote_subscription<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     user_id: &str,
@@ -8071,6 +8313,7 @@ pub fn is_known_path(path: &str) -> bool {
             | "/v1/me/likes/session"
             | "/v1/me/likes/import"
             | "/v1/me/taste"
+            | BOUND_TASTE_PATH
             | "/v1/me/history"
             | crate::native_rest::MEMBER_INVITE_HISTORY_PATH
             | "/v1/me/private-session"
@@ -8237,6 +8480,69 @@ where
     Box::pin(dispatch_request(ctx, req, expected_session_binding)).await
 }
 
+async fn dispatch_browser_session<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    route: crate::native_rest::BrowserSessionRoute<'_>,
+    expected: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::native_rest::BrowserSessionRoute::*;
+
+    let playback = matches!(route, PlayIssue | PlayHeartbeat);
+    let authenticated = if playback {
+        ctx.authenticate(req, true).await
+    } else {
+        preference_authenticate(ctx, req, !matches!(route, TasteList { .. })).await
+    };
+    let (claims, _) = match authenticated {
+        Ok(pair) => pair,
+        Err(mut resp) if resp.status == 401 && matches!(route, TasteList { .. }) => {
+            resp.body =
+                crate::api_error::ApiError::unauthorized("authentication required").body_json();
+            return resp;
+        }
+        Err(resp) => return resp,
+    };
+    let required = matches!(
+        route,
+        LikeTrack(_)
+            | UnlikeTrack(_)
+            | TasteList { bound: true }
+            | TastePut { bound: true }
+            | TasteClear { bound: true }
+    );
+    let optional = playback || matches!(route, PrivateSession);
+    let binding = if required || (optional && expected.is_some()) {
+        match require_session_binding(&claims, expected) {
+            Ok(binding) => Some(binding),
+            Err(resp) => return resp,
+        }
+    } else {
+        None
+    };
+
+    match route {
+        LikesImport => match admit_likes_import(req, &claims) {
+            Ok(items) => me_likes_import(ctx, claims, items).await,
+            Err(resp) => resp,
+        },
+        LikeTrack(target) => me_like_track(ctx, target, claims).await,
+        UnlikeTrack(target) => me_unlike_track(ctx, target, claims).await,
+        TasteList { .. } => me_taste_list(ctx, claims, binding).await,
+        TastePut { .. } => me_taste_put(ctx, req, claims, binding).await,
+        TasteClear { .. } => me_taste_clear(ctx, req, claims, binding).await,
+        PrivateSession => me_private_session(ctx, req, claims).await,
+        PlayIssue => play_issue(ctx, req, claims, binding.is_some()).await,
+        PlayHeartbeat => play_heartbeat(ctx, req, claims).await,
+    }
+}
+
 async fn dispatch_request<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -8279,7 +8585,13 @@ where
             }
         }
     }
-    use crate::native_rest::{admin_invite_window_close_id, ADMIN_INVITE_WINDOWS_PATH};
+    use crate::native_rest::{
+        admin_invite_window_close_id, browser_route, ADMIN_INVITE_BATCH_PATH,
+        ADMIN_INVITE_WINDOWS_PATH,
+    };
+    if let Some(route) = browser_route(&req.method, &req.path) {
+        return dispatch_browser_session(ctx, req, route, expected_session_binding).await;
+    }
     use listen_history_controls as listens;
     if let ("GET", Some(user_id)) = (
         req.method.as_str(),
@@ -8317,12 +8629,7 @@ where
         ("POST", crate::native_rest::MEMBER_INVITES_PATH) => member_invite_issue(ctx, req).await,
         ("GET", "/v1/me/likes") => me_likes_list(ctx, req).await,
         ("GET", "/v1/me/likes/session") => me_likes_session(ctx, req).await,
-        ("POST", "/v1/me/likes/import") => me_likes_import(ctx, req).await,
-        ("GET", "/v1/me/taste") => me_taste_list(ctx, req).await,
-        ("PUT", "/v1/me/taste") => me_taste_put(ctx, req).await,
-        ("DELETE", "/v1/me/taste") => me_taste_clear(ctx, req).await,
         ("GET", "/v1/me/history") => me_history_list(ctx, req).await,
-        ("PUT", "/v1/me/private-session") => me_private_session(ctx, req).await,
         ("POST", QA_TEST_CODES_PATH) => qa_test_codes(ctx, req).await,
         ("POST", QA_TEST_ACCOUNTS_PATH) => qa_test_accounts(ctx, req).await,
         // NZB intake cap guard: refuses capped callers with the plan-limit
@@ -8330,13 +8637,6 @@ where
         // map denies this path to bearer credentials, so the gate above
         // skips it and the guard owns session authentication.
         ("POST", "/api/ingest") => ingest_cap_guard(ctx, req).await,
-        // Play grant issuance + lease heartbeat: cookie-session handlers
-        // (see the section above). A presented native-rest bearer on
-        // `/v1/plays` is gate-checked above (invalid keys plain-404)
-        // but does not authenticate here; the heartbeat path is `Deny`
-        // in the scope map, so it never enters the gate.
-        ("POST", "/v1/plays") => play_issue(ctx, req).await,
-        ("POST", "/v1/plays/heartbeat") => play_heartbeat(ctx, req).await,
         ("POST", listens::EXPORT_PATH) => listens::export(ctx, req).await,
         ("DELETE", listens::CLEAR_PATH) => listens::clear(ctx, req).await,
         // Internal meter sink: HMAC-authenticated inside the handler
@@ -8411,6 +8711,7 @@ where
         // `/status/{s}` and `/issuer/{id}` segment filters), revoke.
         // Same non-enumerable posture as the rest of the namespace.
         ("POST", "/v1/admin/invites") => admin_invite_issue(ctx, req).await,
+        ("POST", ADMIN_INVITE_BATCH_PATH) => admin_invite_batch_issue(ctx, req).await,
         ("GET", "/v1/admin/invites") => admin_invite_list(ctx, req).await,
         ("GET", path) if path.starts_with("/v1/admin/invites/") => {
             admin_invite_list(ctx, req).await
@@ -8422,21 +8723,14 @@ where
         // paths, the single-segment revoke id, and the scope-map-served
         // native paths); unserved shapes stay 404 on preflight too.
         ("OPTIONS", path) if options_preflight_served(path) => preflight_response(),
-        ("PUT", path) => match crate::native_rest::like_track_target(path) {
-            Some(target) => me_like_track(ctx, req, target, expected_session_binding).await,
-            None => not_found(),
-        },
-        ("DELETE", path) => match crate::native_rest::like_track_target(path) {
-            Some(target) => me_unlike_track(ctx, req, target, expected_session_binding).await,
-            None => not_found(),
-        },
         _ => not_found(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{dispatch_browser_session as browser, *};
+    use crate::native_rest::BrowserSessionRoute::{LikeTrack, TasteList, UnlikeTrack};
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
@@ -8608,6 +8902,7 @@ mod tests {
         native_credential_lookups: RefCell<usize>,
         fail_session_insert: RefCell<bool>,
         fail_magic_audit: RefCell<bool>,
+        expire_invite_before_claim: std::cell::Cell<bool>,
         /// Role-read outage pin: `user_role` fails like a production
         /// query error, which the admin guard must collapse to the
         /// plain 404 (never a distinguishing 500).
@@ -8698,6 +8993,8 @@ mod tests {
         plan_caps_rows: RefCell<HashMap<String, crate::plan_limits::PlanCaps>>,
         /// One `playback_leases` row per user.
         playback_leases: RefCell<HashMap<String, crate::playback::LeaseRow>>,
+        /// Install a replacement after the handler reads the old holder.
+        takeover_before_next_lease_touch: RefCell<Option<crate::playback::LeaseRow>>,
         /// Deletion-marker race pin: when set, the next lease write
         /// (`acquire_playback_lease` / `touch_playback_lease`) first
         /// lands the named user in `deleting_users`, mirroring a marker
@@ -9450,6 +9747,26 @@ mod tests {
         ) -> Result<bool, StoreError> {
             self.delete_preference(user_id, kind, target, false)
         }
+        async fn private_listening_access(
+            &self,
+            user_id: &str,
+            owner_user_id: &str,
+            invite_ids: &[i64],
+        ) -> Result<bool, StoreError> {
+            let users = self.users.borrow();
+            let Some(user) = users.get(user_id) else {
+                return Ok(false);
+            };
+            Ok(user_id == owner_user_id
+                || self.invites.borrow().values().any(|invite| {
+                    invite_ids.contains(&invite.id)
+                        && invite.issued_by.as_deref() == Some(owner_user_id)
+                        && invite.redeemed_by.as_deref() == Some(user_id)
+                        && invite.email.as_deref() == Some(user.email.as_str())
+                        && invite.revoked_at.is_none()
+                }))
+        }
+
         async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
             Ok(self
                 .users
@@ -9529,6 +9846,13 @@ mod tests {
             credential: &PasskeyCredential,
             now: u64,
         ) -> Result<(), StoreError> {
+            if let Some(record) = invite.filter(|_| self.expire_invite_before_claim.replace(false))
+            {
+                // Simulate expiry after a successful lookup, before the transaction.
+                if let Some(stored) = self.invites.borrow_mut().get_mut(&record.code_hash) {
+                    stored.expires_at = now;
+                }
+            }
             // Mirror the production transaction, including rollback when a
             // later conditional claim loses or credential insertion fails.
             let challenges_before = self.challenges.borrow().clone();
@@ -9860,6 +10184,9 @@ mod tests {
                 return Ok(false);
             }
             let mut leases = self.playback_leases.borrow_mut();
+            if let Some(holder) = self.takeover_before_next_lease_touch.take() {
+                leases.insert(user_id.into(), holder);
+            }
             match leases.get_mut(user_id) {
                 Some(row)
                     if row.is_live(now)
@@ -11486,6 +11813,34 @@ mod tests {
                 }),
             ));
             Ok(AdminInviteIssueOutcome::Issued(id))
+        }
+        async fn admin_issue_invite_batch(
+            &self,
+            actor: &str,
+            hashes: &[String],
+            source_ip: &str,
+            now: u64,
+            expires_at: u64,
+        ) -> Result<AdminInviteBatchOutcome, StoreError> {
+            if !crate::admin::is_admin_role(self.user_role(actor).await?.as_deref()) {
+                return Ok(AdminInviteBatchOutcome::ActorNotAdmin);
+            }
+            if self.deleting_users.borrow().contains(actor) {
+                return Ok(AdminInviteBatchOutcome::AccountDeleting);
+            }
+            for hash in hashes {
+                let record = InviteRecord::new_issued(
+                    hash.clone(),
+                    Some(actor.into()),
+                    auth::INVITE_KIND_ADMIN,
+                    None,
+                    now,
+                    expires_at,
+                );
+                self.admin_issue_invite(actor, &record, source_ip, now)
+                    .await?;
+            }
+            Ok(AdminInviteBatchOutcome::Issued)
         }
         async fn admin_list_invites(
             &self,
@@ -16577,7 +16932,7 @@ mod tests {
             if dispatch {
                 block_on(handle(ctx, req))
             } else {
-                block_on(me_taste_list(ctx, req))
+                block_on(browser(ctx, req, TasteList { bound: false }, None))
             }
         };
         let call = |req: &Request| call_at(&h.ctx(), req);
@@ -16738,7 +17093,7 @@ mod tests {
             } else {
                 &alice_binding
             };
-            block_on(me_like_track(&h.ctx(), req, target, Some(binding)))
+            block_on(browser(&h.ctx(), req, LikeTrack(target), Some(binding)))
         };
         let first = call(&req, "Job_A");
         assert_eq!(first.status, 200);
@@ -16754,7 +17109,13 @@ mod tests {
         let mut later = h.ctx();
         later.now += 100;
         assert_eq!(
-            block_on(me_like_track(&later, &req, "Job_A", Some(&alice_binding))).body,
+            block_on(browser(
+                &later,
+                &req,
+                LikeTrack("Job_A"),
+                Some(&alice_binding)
+            ))
+            .body,
             first.body
         );
         for (signal, until) in [(Hide, None), (Snooze, Some(NOW - 1))] {
@@ -16763,7 +17124,12 @@ mod tests {
                     .taste_upsert("alice", Track, "Job_A", signal, until, NOW - 2),
             )
             .unwrap();
-            let result = block_on(me_like_track(&later, &req, "Job_A", Some(&alice_binding)));
+            let result = block_on(browser(
+                &later,
+                &req,
+                LikeTrack("Job_A"),
+                Some(&alice_binding),
+            ));
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&result.body).unwrap()["liked_at"],
                 NOW + 100
@@ -16841,7 +17207,13 @@ mod tests {
         let mut expired = h.ctx();
         expired.now += 365 * 24 * 60 * 60;
         assert_eq!(
-            block_on(me_like_track(&expired, &req, "Job_A", Some(&alice_binding))).status,
+            block_on(browser(
+                &expired,
+                &req,
+                LikeTrack("Job_A"),
+                Some(&alice_binding)
+            ))
+            .status,
             401
         );
         *h.store.fail_catalogue_reads.borrow_mut() = true;
@@ -16912,7 +17284,7 @@ mod tests {
             } else {
                 &alice_binding
             };
-            block_on(me_unlike_track(&h.ctx(), req, target, Some(binding)))
+            block_on(browser(&h.ctx(), req, UnlikeTrack(target), Some(binding)))
         };
         for (user, kind) in [("alice", Track), ("alice", Release), ("bob", Track)] {
             block_on(h.store.taste_upsert(user, kind, "Job_A", Love, None, NOW)).unwrap();
@@ -17004,10 +17376,10 @@ mod tests {
         let mut expired = h.ctx();
         expired.now += 365 * 24 * 60 * 60;
         assert_eq!(
-            block_on(me_unlike_track(
+            block_on(browser(
                 &expired,
                 &req,
-                "Job_A",
+                UnlikeTrack("Job_A"),
                 Some(&alice_binding)
             ))
             .status,
@@ -17086,7 +17458,7 @@ mod tests {
                 body["snooze_seconds"] = json!(seconds);
             }
             req.body = body.to_string().into_bytes();
-            let res = block_on(me_taste_put(&ctx, &req));
+            let res = block_on(handle(&ctx, &req));
             let until = seconds.map(|s| ctx.now + s);
             let expected =
                 json!({"kind":"track", "target_id":"Job_A", "signal":signal, "until":until});
@@ -17102,7 +17474,7 @@ mod tests {
         }
         let alice_row = stored("alice");
         let bob = taste_put_request(&h, "bob");
-        assert_eq!(block_on(me_taste_put(&h.ctx(), &bob)).status, 200);
+        assert_eq!(block_on(handle(&h.ctx(), &bob)).status, 200);
         assert_eq!(stored("bob").signal, "love");
         assert_eq!(stored("alice"), alice_row);
     }
@@ -17128,7 +17500,7 @@ mod tests {
             req.body = json!({"kind":kind, "target_id":target, "signal":"hide"})
                 .to_string()
                 .into_bytes();
-            block_on(me_taste_put(&h.ctx(), &req))
+            block_on(handle(&h.ctx(), &req))
         };
         for (kind, input, resolved) in [
             ("track", "Job_A", "Job_A"),
@@ -17183,7 +17555,7 @@ mod tests {
             .catalogue_library
             .borrow_mut()
             .insert("alice".into(), vec![unmatched_library_row("Job_A")]);
-        let call = |req: &Request| block_on(me_taste_put(&h.ctx(), req));
+        let call = |req: &Request| block_on(handle(&h.ctx(), req));
         let valid = req.body.clone();
         for body in [
             "{",
@@ -17272,7 +17644,7 @@ mod tests {
         let call = |req: &Request, body: &[u8]| {
             let mut req = req.clone();
             req.body = body.to_vec();
-            let resp = block_on(me_taste_clear(&h.ctx(), &req));
+            let resp = block_on(handle(&h.ctx(), &req));
             assert_eq!((resp.set_cookie, resp.retry_after), (None, None));
             assert!(resp.extra_headers.is_empty());
             (resp.status, resp.body)
@@ -17469,7 +17841,11 @@ mod tests {
         seed_user(&h, "alice", "alice@example.com");
         let ctx = h.ctx();
         let mut req = private_session_request(&ctx, "alice");
-        assert_eq!(block_on(handle(&ctx, &req)).status, 200);
+        let binding = current_likes_binding(&h, req.cookie.as_deref().unwrap());
+        let bound = |binding| block_on(handle_with_session_binding(&ctx, &req, binding));
+        assert_eq!(bound(Some("stale")).status, 412);
+        assert_eq!(h.store.private_session_write_attempts.get(), 0);
+        assert_eq!(bound(Some(&binding)).status, 200);
         let saved = h.store.private_sessions.borrow().clone();
         assert_eq!(saved[&("alice".into(), "s".into())], NOW + 21_600);
         let check = |req: &Request, status, attempts| {
@@ -18275,6 +18651,162 @@ mod tests {
     }
 
     #[test]
+    fn library_taste_refuses_missing_and_replaced_session_bindings() {
+        use crate::native_rest::{scope_for_operation, RouteDecision};
+
+        let h = harness();
+        let mut req = taste_put_request(&h, "alice");
+        let original = current_likes_binding(&h, req.cookie.as_deref().unwrap());
+        // Pin the public browser URL independently of the routing constant.
+        req.path = "/v1/me/taste/session".into();
+        seed_user(&h, "bob", "bob@example.com");
+        // A valid request reaches these faults; a refused binding must not.
+        h.store.fail_taste_read.replace(true);
+        h.store
+            .preference_failure
+            .set(Some((PreferenceFailure::Member, "Job_A")));
+        let call = |req: &Request, expected: Option<&str>| {
+            let headers = expected
+                .map(|value| HashMap::from([(SESSION_BINDING_HEADER.into(), value.into())]))
+                .unwrap_or_default();
+            block_on(crate::worker_entry::handle_with_transport_headers(
+                &h.ctx(),
+                req.clone(),
+                &headers,
+            ))
+        };
+        for email in ["alice@example.com", "bob@example.com"] {
+            let cookie = magic_login(&h, email);
+            let current = current_likes_binding(&h, &cookie);
+            let duplicated = format!("{current}, {current}");
+            req.cookie = Some(cookie);
+            for (method, body) in [
+                ("GET", ""),
+                (
+                    "PUT",
+                    r#"{"kind":"track","target_id":"Job_A","signal":"hide"}"#,
+                ),
+                ("DELETE", r#"{"kind":"track","target_id":"Job_A"}"#),
+            ] {
+                req.method = method.into();
+                req.body = body.as_bytes().to_vec();
+                assert_eq!(
+                    scope_for_operation(method, &req.path),
+                    RouteDecision::SessionOnly
+                );
+                for expected in [
+                    None,
+                    Some(""),
+                    Some(original.as_str()),
+                    Some(duplicated.as_str()),
+                ] {
+                    let response = call(&req, expected);
+                    assert_eq!(
+                        (response.status, response.body.as_str()),
+                        (412, r#"{"error":"session binding mismatch"}"#)
+                    );
+                }
+                assert_eq!(call(&req, Some(&current)).status, 503);
+                req.authorization = Some("Bearer fixture".into());
+                assert_eq!(call(&req, Some(&current)).status, 404);
+                req.authorization = None;
+                if method != "GET" {
+                    req.origin = None;
+                    assert_eq!(call(&req, Some(&current)).status, 401);
+                    req.origin = Some(ORIGIN.into());
+                }
+            }
+        }
+        assert_eq!(h.store.taste_write_attempts.get(), 0);
+    }
+
+    #[test]
+    fn library_taste_receipts_bind_exact_identity_replacement_expiry_and_clear() {
+        use serde_json::{json, Value};
+
+        let h = harness();
+        let req = taste_put_request(&h, "alice");
+        let binding = current_likes_binding(&h, req.cookie.as_deref().unwrap());
+        let job = "ABCDEFAB-5678-1234-1234-ABcDEFABCDEF";
+        let recording = job.to_ascii_lowercase();
+        let mut matched = matched_library_row("Job_A", CAT_REC_A, 1);
+        matched.recording_mbids.push(recording.clone());
+        h.store
+            .catalogue_library
+            .borrow_mut()
+            .insert("alice".into(), vec![matched, unmatched_library_row(job)]);
+        let call = |method: &str, path: &str, body: Value, offset: u64| {
+            let mut ctx = h.ctx();
+            ctx.now += offset;
+            block_on(handle_with_session_binding(
+                &ctx,
+                &Request {
+                    method: method.into(),
+                    path: path.into(),
+                    body: if body.is_null() {
+                        Vec::new()
+                    } else {
+                        body.to_string().into_bytes()
+                    },
+                    ..req.clone()
+                },
+                Some(&binding),
+            ))
+        };
+        let ok = |response: Response| -> Value {
+            assert_eq!(response.status, 200, "{}", response.body);
+            serde_json::from_str(&response.body).unwrap()
+        };
+        let list = |offset| ok(call("GET", BOUND_TASTE_PATH, Value::Null, offset));
+        let put = |target: &str| {
+            call(
+                "PUT",
+                BOUND_TASTE_PATH,
+                json!({"kind":"track","target_id":target,"signal":"snooze","snooze_seconds":60}),
+                0,
+            )
+        };
+        let clear = |target: &str| {
+            call(
+                "DELETE",
+                BOUND_TASTE_PATH,
+                json!({"kind":"track","target_id":target}),
+                61,
+            )
+        };
+        let like = format!("/v1/me/likes/track/{recording}");
+        assert_eq!(
+            ok(call("PUT", &like, Value::Null, 0))["target_id"],
+            recording
+        );
+        assert_eq!(list(0)["items"][0]["signal"], "love");
+        assert_eq!(put(&job.to_ascii_uppercase()).status, 404);
+        assert_eq!(clear(&job.to_ascii_uppercase()).status, 404);
+        assert_eq!(list(0)["items"][0]["signal"], "love");
+
+        for target in [job, recording.as_str()] {
+            let mut receipt = json!({"kind":"track","target_id":target,"signal":"snooze","until":NOW+60,
+                "session_binding":binding});
+            assert_eq!(ok(put(target)), receipt);
+            receipt.as_object_mut().unwrap().remove("session_binding");
+            receipt["updated_at"] = json!(NOW);
+            assert!(list(59)["items"].as_array().unwrap().contains(&receipt));
+        }
+        assert_eq!(
+            ok(call("GET", "/v1/me/likes", Value::Null, 0))["items"],
+            json!([])
+        );
+        assert_eq!(list(60), json!({"items":[],"session_binding":binding}));
+        for cleared in [true, false] {
+            assert_eq!(
+                ok(clear(job)),
+                json!({"kind":"track","target_id":job,"cleared":cleared,
+                "session_binding":binding})
+            );
+        }
+    }
+
+    #[test]
     fn dispatched_track_like_mutations_require_the_current_session_binding() {
         let h = harness();
         seed_user(&h, "alice", "alice@example.com");
@@ -18648,6 +19180,314 @@ mod tests {
             Some(cookie.to_string()),
             Some(ORIGIN),
         )
+    }
+
+    fn bound_play_request(
+        h: &Harness,
+        cookie: &str,
+        binding: &str,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        let req = Request {
+            method: method.into(),
+            path: path.into(),
+            cookie: Some(cookie.into()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: body.to_string().into_bytes(),
+        };
+        let headers = HashMap::from([(SESSION_BINDING_HEADER.into(), binding.into())]);
+        block_on(crate::worker_entry::handle_with_transport_headers(
+            &h.ctx(),
+            req,
+            &headers,
+        ))
+    }
+
+    #[test]
+    fn browser_relay_requires_the_exact_cookie_lease_token_and_duration() {
+        use super::browser_playback_relay::{relay, BrowserGrant, StreamGet};
+        use crate::{meter_sink::TrackMeterMeta, play_grant::IssuedGrant, playback::LeaseRow};
+        let mut h = harness();
+        h.config = cfg().with_play_grant_secret(b"test only, not a deployed secret".to_vec());
+        let mut ctx = h.ctx();
+        ctx.now = 199;
+        let (user_id, track_id, play_id) =
+            ("user-1", "22222222-2222-2222-2222-222222222222", "play-7");
+        seed_user(&h, user_id, "play@example.com");
+        let start_session = |id| block_on(ctx.start_session(id)).unwrap().set_cookie.unwrap();
+        let cookie = start_session(user_id);
+        let token = IssuedGrant {
+            token: include_str!("../../../fixtures/play-grant/browser-rendition.token").into(),
+            exp_unix: 200,
+        };
+        let lease = LeaseRow {
+            session_id: "tab-1".into(),
+            track_id: track_id.into(),
+            play_id: play_id.into(),
+            epoch: 42,
+            expires_at: ctx.now + 45,
+            continuation_deadline: ctx.now + 120,
+        };
+        let req = Request {
+            method: "GET".into(),
+            path: format!("/v1/plays/media/{track_id}/tab-1/{play_id}"),
+            cookie: Some(cookie),
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: vec![],
+        };
+        let (claims, _) = block_on(ctx.authenticate(&req, false)).unwrap();
+        let binding = session_binding(&claims);
+        let receipt = BrowserGrant {
+            user_id,
+            session_binding: &binding,
+            lease: &lease,
+            artifact_sha256: "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734",
+            duration_ms: 60_000.try_into().unwrap(),
+            grant: &token,
+        };
+        let leases = &h.store.playback_leases;
+        leases.borrow_mut().insert(user_id.into(), lease.clone());
+        let meta = TrackMeterMeta {
+            track_duration_ms: Some(60_000),
+            bitrate_kbps: Some(1_000),
+            ..Default::default()
+        };
+        let key = (user_id.to_owned(), track_id.to_owned());
+        h.store.meter_meta.borrow_mut().insert(key.clone(), meta);
+        assert_eq!(block_on(handle(&ctx, &req)).status, 404);
+        let range = Some("bytes=2-7");
+        block_on(relay(
+            &ctx,
+            &req,
+            Some(&receipt),
+            Some("same-origin"),
+            range,
+            async |upstream: StreamGet<'_>| {
+                assert_eq!(upstream.path, format!("/play/{track_id}"));
+                assert!(upstream.authorization == crate::play_grant::bearer(&token.token));
+                assert_eq!(upstream.range, range);
+            },
+        ))
+        .unwrap();
+
+        let refused = |req: &Request, receipt: Option<&BrowserGrant<'_>>, site: Option<&str>| {
+            let result: Result<(), Response> =
+                block_on(relay(&ctx, req, receipt, site, range, async |_| {
+                    panic!("refusal contacted the receiver")
+                }));
+            assert_eq!(result.unwrap_err().status, 404);
+        };
+        refused(&req, None, Some("same-origin"));
+        refused(&req, Some(&receipt), Some("same-site"));
+
+        seed_user(&h, "other-user", "other@example.com");
+        for id in [user_id, "other-user"] {
+            let mut stale = req.clone();
+            stale.cookie = Some(start_session(id));
+            refused(&stale, Some(&receipt), Some("same-origin"));
+        }
+        for component in [track_id, "tab-1", play_id] {
+            let mut different = req.clone();
+            different.path = req.path.replace(component, "other");
+            refused(&different, Some(&receipt), Some("same-origin"));
+        }
+        let refused_grant =
+            |grant: &BrowserGrant<'_>| refused(&req, Some(grant), Some("same-origin"));
+        refused_grant(&BrowserGrant {
+            artifact_sha256: &"a".repeat(64),
+            ..receipt
+        });
+        refused_grant(&BrowserGrant {
+            grant: &IssuedGrant {
+                exp_unix: ctx.now,
+                ..token.clone()
+            },
+            ..receipt
+        });
+        let newer = LeaseRow {
+            epoch: lease.epoch + 1,
+            ..lease.clone()
+        };
+        leases.borrow_mut().insert(user_id.into(), newer.clone());
+        refused_grant(&receipt);
+        assert_eq!(leases.borrow()[user_id], newer);
+        leases.borrow_mut().insert(user_id.into(), lease.clone());
+        let missing_duration = TrackMeterMeta {
+            track_duration_ms: None,
+            ..meta
+        };
+        h.store
+            .meter_meta
+            .borrow_mut()
+            .insert(key, missing_duration);
+        refused_grant(&receipt);
+    }
+
+    #[test]
+    fn playback_binding_rejects_replaced_cookie_before_writes() {
+        use serde_json::json;
+        let h = play_harness();
+        let cookie = play_user(&h);
+        let binding = current_likes_binding(&h, &cookie);
+        let replacement = magic_login(&h, "plays@example.com");
+        seed_user(&h, "other-user", "other@example.com");
+        let other_account = magic_login(&h, "other@example.com");
+        for user in ["user-plays-1", "other-user"] {
+            seed_entitled(&h, user, "plus", 100);
+        }
+        for (method, path, body) in [
+            (
+                "PUT",
+                "/v1/me/private-session",
+                json!({"session_id":"tab", "enabled":true}),
+            ),
+            (
+                "POST",
+                "/v1/plays",
+                json!({"session_id":"tab", "track_id":"track"}),
+            ),
+            (
+                "POST",
+                "/v1/plays/heartbeat",
+                json!({"session_id":"tab", "play_id":"play", "lease_epoch":1}),
+            ),
+        ] {
+            for cookie in [&replacement, &other_account] {
+                let resp = bound_play_request(&h, cookie, &binding, method, path, body.clone());
+                assert_eq!(resp.status, 412, "{method} {path}");
+                assert_eq!(resp.body, r#"{"error":"session binding mismatch"}"#);
+            }
+        }
+        assert_eq!(h.store.private_session_write_attempts.get(), 0);
+        assert!(h.store.playback_leases.borrow().is_empty());
+        assert!(h.store.private_play_marks.borrow().is_empty());
+    }
+
+    #[test]
+    fn bound_playback_toggles_only_new_plays_and_never_restarts_a_continuation() {
+        use serde_json::{json, Value};
+        let h = play_harness();
+        let user = "user-plays-1";
+        let cookie = play_user(&h);
+        seed_entitled(&h, user, "plus", 100);
+        let binding = current_likes_binding(&h, &cookie);
+        let call =
+            |method, path, body| bound_play_request(&h, &cookie, &binding, method, path, body);
+        let ok = |resp: Response| {
+            assert_eq!(resp.status, 200);
+            serde_json::from_str::<Value>(&resp.body).unwrap()
+        };
+        let toggle = |enabled| {
+            ok(call(
+                "PUT",
+                "/v1/me/private-session",
+                json!({"session_id":"tab", "enabled":enabled}),
+            ))
+        };
+        let play = |id: &Value| {
+            call(
+                "POST",
+                "/v1/plays",
+                json!({"session_id":"tab", "track_id":"track", "play_id":id}),
+            )
+        };
+        let marked = |play: &Value| {
+            let key = crate::ledger::derive_play_idempotency_key(
+                user,
+                "track",
+                play["play_id"].as_str().unwrap(),
+            )
+            .unwrap();
+            h.store
+                .private_play_marks
+                .borrow()
+                .contains(&(user.into(), key))
+        };
+
+        let public = ok(play(&Value::Null));
+        assert_eq!(
+            toggle(true),
+            json!({"session_id":"tab", "private_until":NOW + 21_600})
+        );
+        let continued = ok(play(&public["play_id"]));
+        assert_eq!(continued["play_id"], public["play_id"]);
+        assert_eq!(continued["lease_epoch"], public["lease_epoch"]);
+        assert!(!marked(&continued));
+
+        let private = ok(play(&Value::Null));
+        assert_ne!(private["play_id"], public["play_id"]);
+        assert!(marked(&private));
+        let heartbeat = ok(call(
+            "POST",
+            "/v1/plays/heartbeat",
+            json!({"session_id":"tab", "play_id":private["play_id"], "lease_epoch":private["lease_epoch"]}),
+        ));
+        assert_eq!(heartbeat["lease"], "active");
+        assert_eq!(
+            toggle(false),
+            json!({"session_id":"tab", "private_until":null})
+        );
+        let continued = ok(play(&private["play_id"]));
+        assert_eq!(continued["play_id"], private["play_id"]);
+        assert_eq!(continued["lease_epoch"], private["lease_epoch"]);
+        assert!(marked(&continued));
+
+        let next = ok(play(&Value::Null));
+        assert!(!marked(&next));
+        let incumbent = h.store.playback_leases.borrow()[user].clone();
+        assert_eq!(play(&private["play_id"]).status, 409);
+        assert_eq!(h.store.playback_leases.borrow()[user], incumbent);
+
+        h.store
+            .playback_leases
+            .borrow_mut()
+            .get_mut(user)
+            .unwrap()
+            .expires_at = NOW;
+        let expired = h.store.playback_leases.borrow()[user].clone();
+        let refused = play(&next["play_id"]);
+        assert_eq!(refused.status, 409);
+        assert!(serde_json::from_str::<Value>(&refused.body)
+            .unwrap()
+            .get("grant")
+            .is_none());
+        assert_eq!(h.store.playback_leases.borrow()[user], expired);
+        assert_eq!(h.store.private_play_marks.borrow().len(), 1);
+    }
+
+    #[test]
+    fn bound_grant_renewal_does_not_overwrite_a_racing_takeover() {
+        use serde_json::{json, Value};
+        let h = play_harness();
+        let user = "user-plays-1";
+        let cookie = play_user(&h);
+        seed_entitled(&h, user, "plus", 100);
+        let binding = current_likes_binding(&h, &cookie);
+        let play = |body| bound_play_request(&h, &cookie, &binding, "POST", "/v1/plays", body);
+        let initial = play(json!({"session_id":"old-tab", "track_id":"track"}));
+        assert_eq!(initial.status, 200);
+        let initial: Value = serde_json::from_str(&initial.body).unwrap();
+        let mut replacement = h.store.playback_leases.borrow()[user].clone();
+        replacement.session_id = "new-tab".into();
+        replacement.play_id = "replacement-play".into();
+        replacement.epoch += 1;
+        *h.store.takeover_before_next_lease_touch.borrow_mut() = Some(replacement.clone());
+
+        let refused = play(json!({"session_id":"old-tab", "track_id":"track",
+            "play_id":initial["play_id"], "takeover":true}));
+        assert_eq!(refused.status, 409);
+        assert!(serde_json::from_str::<Value>(&refused.body)
+            .unwrap()
+            .get("grant")
+            .is_none());
+        assert!(h.store.takeover_before_next_lease_touch.borrow().is_none());
+        assert_eq!(h.store.playback_leases.borrow()[user], replacement);
     }
 
     // Adapted from PR #982: no compensation over a newer concurrent holder.
@@ -23539,9 +24379,8 @@ mod tests {
         assert_eq!(h.store.audits.borrow().len(), audits_before);
     }
 
-    /// One full passkey signup (start + finish) presenting `invite_code`
-    /// at finish only, mirroring the signup page's code step. Returns
-    /// the finish response and the user id minted at start.
+    /// One full passkey signup. Private listening requires invite pre-check
+    /// at start. Returns the finish response and the user id minted at start.
     fn signup_with_invite(
         h: &Harness,
         email: &str,
@@ -23549,11 +24388,12 @@ mod tests {
         cose_seed: u8,
         invite_code: Option<&str>,
     ) -> (Response, String) {
-        let start = h.call(
-            "POST",
-            "/v1/auth/passkey/register/start",
-            serde_json::json!({"email": email}),
-        );
+        let start_body = if h.config.private_listening.is_some() {
+            serde_json::json!({"email": email, "invite_code": invite_code})
+        } else {
+            serde_json::json!({"email": email})
+        };
+        let start = h.call("POST", "/v1/auth/passkey/register/start", start_body);
         assert_eq!(start.status, 200, "{}", start.body);
         let start: serde_json::Value = serde_json::from_str(&start.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
@@ -23575,6 +24415,106 @@ mod tests {
             }),
         );
         (resp, user_id)
+    }
+
+    #[test]
+    fn private_listening_redeems_owner_invite_and_fences_library_and_playback() {
+        use serde_json::{json, Value};
+        let mut h = play_harness();
+        let owner = seed_admin(&h, "owner", "owner@example.test");
+        seed_user(&h, "outsider", "outsider@example.test");
+        let outsider = magic_login(&h, "outsider@example.test");
+        let invited_email = "friend@example.test";
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(json!({"email": invited_email}).to_string()),
+            Some(owner.clone()),
+            Some(ORIGIN),
+        );
+        let selected: Value = serde_json::from_str(&issued.body).unwrap();
+        let code = selected["code"].as_str().unwrap();
+        let expires_at = NOW + 30;
+        h.config.private_listening = crate::private_listening::PrivateListening::parse(&json!({
+            "owner_user_id": "owner", "invite_ids": [selected["invite"]["id"]], "expires_at": expires_at
+        }).to_string());
+        assert!(h.config.private_listening.is_some());
+        let start = |body: Value| h.call("POST", "/v1/auth/passkey/register/start", body);
+        let mail_before = h.mailer.sent.borrow().len();
+        for body in [
+            json!({"email": "public@example.test"}),
+            json!({"email": "wrong@example.test", "invite_code": code}),
+        ] {
+            assert_eq!(start(body).status, 401);
+        }
+        assert_eq!(h.mailer.sent.borrow().len(), mail_before);
+        assert_eq!(h.store.users.borrow().len(), 2);
+
+        let (finish, friend_id) =
+            signup_with_invite(&h, invited_email, b"fixture-private-cred", 21, Some(code));
+        assert_eq!(finish.body, r#"{"ok":true,"private_listening":true}"#);
+        let friend = cookie_of(&finish);
+        assert_eq!(
+            start(json!({"email": invited_email, "invite_code": code})).status,
+            401
+        );
+        seed_library(&h, &friend_id);
+        let library =
+            |path: &str, cookie: Option<String>| h.call_full("GET", path, None, cookie, None);
+        for path in ["/api/library", "/v1/library"] {
+            assert_eq!(library(path, None).status, 401);
+            assert_eq!(library(path, Some(outsider.clone())).status, 403);
+            assert_eq!(library(path, Some(owner.clone())).status, 200);
+            assert_eq!(library(path, Some(friend.clone())).status, 200);
+        }
+        assert!(h.config.stripe_secret_key.is_none() && h.config.stripe_webhook_secret.is_none());
+        assert!(
+            h.store.playback_subscriptions.borrow().is_empty()
+                && h.store.invoice_history.borrow().is_empty()
+        );
+        let play = json!({"track_id": CAT_REC_A, "session_id": "tab"});
+        assert_eq!(play_call(&h, &outsider, play.clone()).status, 403);
+        assert_eq!(play_call(&h, &owner, play.clone()).status, 404);
+        let issued = play_call(&h, &friend, play.clone());
+        assert_eq!(issued.status, 200);
+        let conflict = play_call(
+            &h,
+            &friend,
+            json!({"track_id": CAT_REC_A, "session_id": "other-tab"}),
+        );
+        assert_eq!(conflict.status, 429);
+        assert!(conflict
+            .extra_headers
+            .contains(&("x-plan-limit".into(), "concurrent_streams=1".into())));
+        let state: Value = serde_json::from_str(&issued.body).unwrap();
+        assert_eq!(state["expires_at"], expires_at);
+        let renewal =
+            json!({"track_id": CAT_REC_A, "session_id": "tab", "play_id": state["play_id"]});
+        let heartbeat = |h: &Harness| {
+            h.call_full(
+            "POST", "/v1/plays/heartbeat",
+            Some(json!({"session_id": "tab", "play_id": state["play_id"], "lease_epoch": state["lease_epoch"]}).to_string()),
+            Some(friend.clone()), Some(ORIGIN),
+        )
+        };
+        assert_eq!(heartbeat(&h).status, 200);
+        h.config
+            .private_listening
+            .as_mut()
+            .unwrap()
+            .invite_ids
+            .clear();
+        assert_eq!(
+            h.call_full("GET", "/api/library", None, Some(friend.clone()), None)
+                .status,
+            403
+        );
+        assert_eq!(play_call(&h, &friend, renewal.clone()).status, 403);
+        assert_eq!(heartbeat(&h).status, 403);
+        h.config.private_listening = None;
+        assert_eq!(play_call(&h, &friend, renewal).status, 404);
+        assert_eq!(heartbeat(&h).status, 404);
+        assert_eq!(play_call(&h, &friend, play).status, 402);
     }
 
     fn audits_with_action(h: &Harness, action: &str) -> Vec<vault::AuditEvent> {
@@ -24038,6 +24978,77 @@ mod tests {
                 serde_json::json!(["admin", "198.51.100.9", NOW, 3]),
             ]
         );
+    }
+
+    #[test]
+    fn admin_invite_batch_is_bounded_private_and_browser_only() {
+        use crate::native_rest::ADMIN_INVITE_BATCH_PATH as PATH;
+        let h = harness();
+        let admin = seed_admin(&h, "issuer", "admin@example.com");
+        seed_user(&h, "member", "member@example.com");
+        let member = magic_login(&h, "member@example.com");
+        let valid = r#"{"count":1}"#;
+        let call = |body: &str, cookie, origin| {
+            h.call_full("POST", PATH, Some(body.into()), cookie, origin)
+        };
+        let audit_count = h.store.audits.borrow().len();
+        for (cookie, origin) in [
+            (None, Some(ORIGIN)),
+            (Some(member), Some(ORIGIN)),
+            (Some(admin.clone()), None),
+            (Some(admin.clone()), Some("https://other.example")),
+        ] {
+            assert_eq!(call(valid, cookie, origin).status, 404);
+        }
+        assert_eq!(
+            h.call_bearer("POST", PATH, Some("Bearer ntk_synthetic".into()))
+                .status,
+            404
+        );
+        let post = |body: &str| call(body, Some(admin.clone()), Some(ORIGIN));
+        for body in [
+            "{",
+            "[1,null]",
+            r#"{"count":0}"#,
+            r#"{"count":51}"#,
+            r#"{"count":1.5}"#,
+            r#"{"count":1,"count":2}"#,
+            r#"{"count":1,"email":"a@example.com"}"#,
+            r#"{"count":1,"expires_in_days":31}"#,
+        ] {
+            assert_eq!(post(body).status, 422, "{body}");
+        }
+        assert_eq!(post(&" ".repeat(MAX_BODY_BYTES + 1)).status, 400);
+        h.store.deleting_users.borrow_mut().insert("issuer".into());
+        assert_eq!(post(valid).body, account_deleting_response().body);
+        assert!(h.store.invites.borrow().is_empty());
+        assert_eq!(h.store.audits.borrow().len(), audit_count);
+        h.store.deleting_users.borrow_mut().clear();
+        h.store
+            .app_settings_rows
+            .borrow_mut()
+            .insert("invite_default_expiry_days".into(), "9".into());
+        for (body, count, days) in [
+            (valid, 1, 9),
+            (r#"{"count":50,"expires_in_days":2}"#, 50, 2),
+        ] {
+            let response = post(body);
+            assert_eq!(response.status, 201);
+            assert!(response
+                .extra_headers
+                .contains(&("cache-control".into(), "private, no-store".into())));
+            let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+            let expires_at = NOW + days * 86_400;
+            assert_eq!(json["expires_at"], expires_at);
+            let codes = json["codes"].as_array().unwrap();
+            assert_eq!(codes.len(), count);
+            for code in codes {
+                let hash = auth::hash_invite_code(code.as_str().unwrap());
+                assert!(!response.body.contains(&hash));
+                assert_eq!(h.store.invites.borrow()[&hash].expires_at, expires_at);
+            }
+        }
+        assert_eq!(h.store.invites.borrow().len(), 51);
     }
 
     #[test]
@@ -25933,7 +26944,7 @@ mod tests {
     }
 
     #[test]
-    fn register_finish_wrong_invite_does_not_burn_challenge_or_token() {
+    fn register_finish_wrong_or_expired_invite_does_not_burn_proofs() {
         // A mistyped invite is pre-validated before either single-use
         // claim (like a mistyped emailed code), so correcting it against
         // the SAME challenge and token still enrolls — the signup page's
@@ -25951,6 +26962,12 @@ mod tests {
                 NOW + 604_800,
             ),
         );
+        let mut racing = h.store.invites.borrow()[&good_hash].clone();
+        racing.code_hash = auth::hash_invite_code("racing-invite");
+        h.store
+            .invites
+            .borrow_mut()
+            .insert(racing.code_hash.clone(), racing);
         let resp = h.call(
             "POST",
             "/v1/auth/passkey/register/start",
@@ -25981,6 +26998,22 @@ mod tests {
         );
         assert_eq!(resp.status, 401, "{}", resp.body);
         assert!(resp.set_cookie.is_none());
+        h.store.expire_invite_before_claim.set(true);
+        for _ in 0..2 {
+            // First refusal is at claim time; the same code fails preflight next.
+            let expired = h.call(
+                "POST",
+                "/v1/auth/passkey/register/finish",
+                finish("racing-invite"),
+            );
+            assert_eq!(expired.status, 401);
+            assert_eq!(expired.body, resp.body);
+            assert!(expired.set_cookie.is_none());
+            assert!(!h.store.challenges.borrow()[&challenge].challenge.consumed);
+            assert!(!h.store.magic.borrow()[&auth::hash_magic_token(&emailed)].used);
+            assert!(h.store.credentials.borrow().is_empty());
+        }
+        assert!(!h.store.expire_invite_before_claim.get());
         assert!(
             !h.store.invites.borrow().get(&good_hash).unwrap().used,
             "rejected attempt must not consume the invite"
@@ -27923,6 +28956,7 @@ mod tests {
             recording_mbids: vec![CAT_REC_A.to_string(), CAT_REC_B.to_string()],
             recording_mbid: Some(rec.to_string()),
             recording_ord: ord,
+            recording_job_match: false,
             recording_title: Some(format!("Track {ord}")),
             duration_ms: Some(200_000),
             medium_no: Some(1),
@@ -27940,6 +28974,7 @@ mod tests {
             recording_mbids: Vec::new(),
             recording_mbid: None,
             recording_ord: 0,
+            recording_job_match: false,
             recording_title: None,
             duration_ms: None,
             medium_no: None,
@@ -28329,6 +29364,7 @@ mod tests {
                 recording_mbids: vec![CAT_REC_A.into(), CAT_REC_A.into()],
                 recording_mbid: Some(CAT_REC_A.into()),
                 recording_ord: ord,
+                recording_job_match: false,
             })
             .collect();
         h.store.catalogue_library.borrow_mut().insert(

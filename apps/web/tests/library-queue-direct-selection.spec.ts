@@ -1,8 +1,8 @@
 import { expect, test as base, type Page } from '@playwright/test';
-import { createServer } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { createQueue, type QueueState, type Track } from '../src/lib/player/queue.js';
 import type {} from './fixtures/queue-direct-selection/mount.js';
+import { withIsolatedViteFixture } from './vite-fixture.helpers.js';
 
 /**
  * PICK — protected test-only handoff. No live API, provider, audio or deployment.
@@ -26,19 +26,13 @@ import type {} from './fixtures/queue-direct-selection/mount.js';
  */
 const test = base.extend<{ componentPage: Page }, { componentOrigin: string }>({
 	componentOrigin: [async ({}, use) => {
-		const server = await createServer({
+		await withIsolatedViteFixture({
 			configFile: false,
 			root: decodeURIComponent(new URL('./fixtures/queue-direct-selection/', import.meta.url).pathname),
 			publicDir: false,
 			plugins: [svelte({ configFile: false, compilerOptions: { runes: true } })],
 			server: { host: '127.0.0.1', port: 0, fs: { allow: [decodeURIComponent(new URL('../', import.meta.url).pathname)] } }
-		});
-		try {
-			await server.listen();
-			const address = server.httpServer?.address();
-			if (!address || typeof address === 'string') throw new Error('missing component TCP address');
-			await use(`http://127.0.0.1:${address.port}`);
-		} finally { await server.close(); }
+		}, use);
 	}, { scope: 'worker' }],
 	componentPage: async ({ page, componentOrigin }, use) => {
 		await localOnly(page, componentOrigin);

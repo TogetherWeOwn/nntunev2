@@ -5,6 +5,7 @@ import { defineConfig, loadEnv } from 'vite';
 import { minify } from 'terser';
 
 import { cspSources } from './src/lib/security/headers.js';
+import { YOUTUBE_API_ORIGIN, YOUTUBE_EMBED_ORIGIN } from './src/lib/player/musicVideo.js';
 
 // Build-time commit SHA for the deployed-build identity surface
 // (`src/lib/build.ts` -> `GET /api/build`). GitHub Actions always sets
@@ -21,6 +22,8 @@ const buildSha =
 	'unknown';
 
 export default defineConfig(({ command, mode }) => {
+	// Only browser fixtures bundle the video view and allow its stubbed origins.
+	const videoFixtures = mode === 'browser-fixtures';
 	// SvelteKit's `csp` option is baked in at build time, so the API origin
 	// must come from the build environment (process env or an `.env` file),
 	// not a platform runtime var. `cspSources` returns header-ready quoted
@@ -46,6 +49,9 @@ export default defineConfig(({ command, mode }) => {
 	);
 
 	return {
+		resolve: videoFixtures ? { alias: {
+			'#lib/player/AudioPlaybackView.svelte': `${envDir}src/lib/player/MusicVideoPlaybackView.svelte`
+		} } : undefined,
 		define: {
 			__BUILD_SHA__: JSON.stringify(buildSha)
 		},
@@ -105,7 +111,8 @@ export default defineConfig(({ command, mode }) => {
 					mode: 'nonce',
 					directives: {
 						'default-src': ['self'],
-						'script-src': ['self'],
+						'script-src': videoFixtures ? ['self', YOUTUBE_API_ORIGIN] : ['self'],
+						...(videoFixtures ? { 'frame-src': [YOUTUBE_EMBED_ORIGIN] } : {}),
 						'script-src-attr': [
 							'unsafe-hashes',
 							'sha256-7dQwUgLau1NFCCGjfn9FsYptB6ZtWxJin6VohGIu20I='
