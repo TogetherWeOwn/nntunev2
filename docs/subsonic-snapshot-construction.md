@@ -1,8 +1,26 @@
 # Inert Subsonic snapshot construction accounting
 
-The inert builder rejects all borrowed rows before allocation: database transfer
-bounds do not prove allocation capacities or precharge retained rows, and even
-an empty slice may have a retained backing allocation. No mount is enabled.
+The borrowed-row entry point rejects every input before allocation, including
+empty slices with retained backing allocations. The unmounted production adapter
+uses the owned-copy builder after the [database transfer
+guards](subsonic-snapshot-transfer.md). Before allocating that copy it checks
+8,192 text bytes per raw or output row and 1,048,576 text bytes across raw and
+output rows together. It counts repeated artist sort names per album occurrence,
+both release-ID strings in each song, and fixed output strings. The 8,388,608-byte
+cumulative ledger charges the copied raw and mapped output allocations,
+including vector backing and alignment allowances. The original database
+projections, retained tracks and driver storage sit outside that ledger.
+
+The production adapter acquires the same non-waiting construction slot as
+the staging adapter after authentication and before catalogue and account
+reads. It holds the slot through mapping, dispatch and Worker response
+preparation. This limits authenticated construction to one at a time per
+isolate. Input and authentication happen before admission, and the runtime
+can retain response buffers after the permit drops.
+Dropping a pending Rust future releases its permit. Candidate liveness still
+depends on the Worker runtime's handling of disconnects, cancellation and
+traps, including whether an affected isolate can continue serving with the
+slot occupied.
 
 The Worker manifest pins Rust 1.98.1 and its wasm32 standard library. The
 construction ledger computes a provisional charge for each nonempty allocation
@@ -169,7 +187,12 @@ has no coupled compiler, allocator, configuration and artifact evidence. Until
 that boundary is established and the allocator argument is complete, nonempty
 admission remains closed; no candidate artifact identity is claimed here.
 
-Dispatch clones, response Value trees, rendering, database collection, and
-platform buffers require their own accounting. This inventory alone does not
-establish the complete 8 MiB graph or a concurrency guarantee. The AGENTS.md
-Clean-room, YouTube and MetaBrainz guardrails remain applicable.
+The production dispatch path still needs a ceiling covering database collection,
+original row capacities, dispatch clones, response Value trees, rendering and
+platform conversion. The [separate staging ledger](subsonic-staging-charge.md)
+covers more of that graph and supplies a bounded measurement path. Candidate
+allocator identity, isolate baseline and shared-route load, allocator retention,
+driver and platform buffering, database and Hyperdrive pressure, and headroom
+across isolates remain open. Activation requires accepted bounded staging
+measurement as well as a production construction and response ceiling. The
+AGENTS.md Clean-room, YouTube and MetaBrainz guardrails remain applicable.

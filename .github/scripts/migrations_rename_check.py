@@ -60,6 +60,7 @@ def main(argv=None):
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--base-sha", required=True)
     parser.add_argument("--head-sha", required=True)
+    parser.add_argument("--integration-base", action="store_true")
     parser.add_argument("--files-file", required=True, help="gh api --paginate --slurp files JSON")
     parser.add_argument("--metadata-file", required=True, help="pinned PR metadata JSON")
     parser.add_argument("--event-file", help="require bracketed evidence against the original Actions event")
@@ -76,15 +77,17 @@ def main(argv=None):
         if args.event_file:
             budget = resumed_budget(metadata_text)
             budget.consume(len(files_text.encode()) + len(metadata_text.encode()))
-            expected = event_metadata(args.event_file, args.base_sha, args.head_sha)
+            expected = event_metadata(args.event_file, args.base_sha, args.head_sha,
+                                      root=args.root if args.integration_base else None, budget=budget)
+            event_base = expected["base"]["sha"]
             effective, coverage = snapshot_coverage(args.root, args.base_sha, args.head_sha,
                                                     files_text, metadata_text, expected, budget)
-            for name, base in (("event", args.base_sha), ("effective", effective)):
+            for name, base in (("event", event_base), ("effective", effective)):
                 outcomes[name].update(base=base, head=args.head_sha)
             policy = unapplied_policy(expected)
             # Never let B1 absorb an event-range edge or the original baseline.
             active_pass = "event"
-            edges = verify(args.root, args.base_sha, args.head_sha, manifest_text,
+            edges = verify(args.root, event_base, args.head_sha, manifest_text,
                            budget=budget, audit=outcomes["event"], **policy)
             active_pass = "effective"
             verify(args.root, effective, args.head_sha, manifest_text, coverage,
