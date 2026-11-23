@@ -127,8 +127,6 @@
 		}
 		menu.style.left = `${point.left + offsetX}px`;
 		menu.style.top = `${point.top + offsetY}px`;
-		// Growing the viewport can clamp the menu's scroll position.
-		menuScrollTop = menu.scrollTop;
 	}
 
 	function reveal(item: HTMLButtonElement) {
@@ -216,8 +214,10 @@
 		// also lets the row consume a long-press's synthesized click first.
 		const resize = () => {
 			place();
-			const item = document.activeElement;
+			// Keep the flyout's parent visible for both anchoring and focus return.
+			const item = child?.invoker ?? document.activeElement;
 			if (item instanceof HTMLButtonElement && item.parentElement === menu) reveal(item);
+			else menuScrollTop = menu.scrollTop;
 		};
 		const listeners = [listen(window, 'resize', resize)];
 		const openingClick = setTimeout(() => {

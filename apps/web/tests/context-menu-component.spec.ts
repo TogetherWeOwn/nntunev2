@@ -188,6 +188,23 @@ for (const scale of [1, 2]) {
 		await expect.poll(() => viewportGeometry(page)).toMatchObject({ scale, width: 342 / scale, height: 300 / scale });
 		await expectInVisualViewport(root);
 		await expectInVisualViewport(child);
+		await page.keyboard.press('ArrowLeft');
+		await expect(child).toHaveCount(0);
+		await expect(parent).toBeFocused();
+		await expect(parent).toBeInViewport({ ratio: 1 });
+		await page.keyboard.press('ArrowRight');
+		if (scale === 2) {
+			await expectInVisualViewport(child);
+			await root.evaluate((node) => {
+				node.scrollTop = 0;
+				// Deliver a viewport update ahead of the queued menu scroll event.
+				window.visualViewport!.dispatchEvent(new Event('scroll'));
+			});
+			await expect(child).toHaveCount(0);
+			await expect(parent).toBeFocused();
+			await page.keyboard.press('End');
+			await page.keyboard.press('ArrowRight');
+		}
 		await page.keyboard.press('End');
 		const action = child.getByRole('menuitem', { name: 'Second destination' });
 		await expect(action).toBeFocused();
@@ -228,10 +245,17 @@ for (const scale of [1, 2]) {
 			await expect(root).toHaveCount(0);
 			await expect(more).toBeFocused();
 
+			await play.evaluate((button) => {
+				document.addEventListener('click', (event) => {
+					if (event.detail && event.composedPath().includes(button)) button.setAttribute('data-release-click', '');
+				}, true);
+			});
 			const box = (await play.boundingBox())!;
 			await touch(session, 'touchStart', box.x + box.width / 2, box.y + box.height / 2);
 			await expect(root).toBeVisible();
 			await touch(session, 'touchEnd');
+			// Chromium can omit the compatibility click after a long press.
+			if (await play.getAttribute('data-release-click') === null) await play.dispatchEvent('click', { detail: 1 });
 			await expect(page.getByRole('status')).toBeEmpty();
 			await expectInVisualViewport(root, true);
 			const parent = root.getByRole('menuitem', { name: 'Destinations', exact: true });
@@ -246,6 +270,11 @@ for (const scale of [1, 2]) {
 			await page.setViewportSize({ width: 342, height: 300 });
 			await expect.poll(() => viewportGeometry(page)).toMatchObject({ scale, width: 342 / scale, height: 300 / scale });
 			await expectInVisualViewport(child, true);
+			if (scale === 1) {
+				await page.setViewportSize({ width: 780, height: 300 });
+				expect(await page.evaluate(() => matchMedia('(max-width: 767px)').matches)).toBe(false);
+				await expectInVisualViewport(child, true);
+			}
 			await child.getByRole('menuitem', { name: 'Back', exact: true }).tap();
 			await expect(parent).toBeFocused();
 			await expectInVisualViewport(root, true);
