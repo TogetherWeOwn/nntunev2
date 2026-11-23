@@ -285,10 +285,12 @@ async fn postgres_stages_completed_candidate_atomically() {
         .await
         .unwrap()
         .get::<_, bool>(0));
+    let digest = hex::encode(fixture.origin.plaintext_sha256());
+    let length = i64::try_from(intent.plaintext_len).unwrap();
     let admitted: bool = observer.query_one(
         "SELECT public.admit_storage_digest_delete($1::text::uuid, $2::text::uuid, decode($3, 'hex'),
             $4, $5::text::uuid, $6::text::uuid, $7::text::uuid)",
-        &[&environment, &library, &digest, &(length as i64), &object, &generation, &root],
+        &[&environment, &library, &digest, &length, &object, &generation, &root],
     ).await.unwrap().get(0);
     assert!(!admitted);
 }
