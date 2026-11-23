@@ -46,13 +46,13 @@ impl FrameContinuity {
         if block == 0 || block > self.info.max_block {
             return Err(());
         }
-        let next = match (next, header.position) {
+        let next = match (next, &header.position) {
             (Next::First, Position::Frame(0)) => self.after_fixed(0, block)?,
-            (Next::Fixed(expected), Position::Frame(n)) if n == expected => {
-                self.after_fixed(n, block)?
+            (Next::Fixed(expected), Position::Frame(n)) if *n == expected => {
+                self.after_fixed(*n, block)?
             }
             (Next::First | Next::Variable, Position::Sample(n))
-                if n == self.samples && self.info.min_block != self.info.max_block =>
+                if *n == self.samples && self.info.min_block != self.info.max_block =>
             {
                 if block < self.info.min_block {
                     Next::EndOnly
