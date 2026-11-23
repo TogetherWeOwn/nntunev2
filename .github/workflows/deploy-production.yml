@@ -133,13 +133,6 @@ jobs:
             { echo '::error::Worker ID and route proof must exist only in the production Environment'; exit 1; }
           echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
           echo "domain=$domain" >> "$GITHUB_OUTPUT"
-      - name: Refuse inherited rollback custody and intent key
-        if: inputs.mode == 'promote'
-        env:
-          UNPROTECTED_ROLLBACK_CONFIG: ${{ secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '' }}
-        run: |
-          [ "${UNPROTECTED_ROLLBACK_CONFIG:-}" = false ] ||
-            { echo '::error::Rollback custody and intent key must exist only in the production Environment'; exit 1; }
 
   staging-evidence:
     name: staging-evidence
@@ -165,10 +158,13 @@ jobs:
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
           # Check inheritance from outside production without passing secret values to this runner.
           UNPROTECTED_CF_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' }}
+          UNPROTECTED_ROLLBACK_CONFIG: ${{ inputs.mode == 'promote' && (secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '') }}
         run: |
           set -euo pipefail
           [ "${UNPROTECTED_CF_CONFIG:-}" = false ] ||
             { echo '::error::Cloudflare credentials must exist only in the production Environment'; exit 1; }
+          [ "${UNPROTECTED_ROLLBACK_CONFIG:-}" = false ] ||
+            { echo '::error::Rollback custody and intent key must exist only in the production Environment'; exit 1; }
           python3 - <<'PY'
           import json, os, sys, urllib.request
 

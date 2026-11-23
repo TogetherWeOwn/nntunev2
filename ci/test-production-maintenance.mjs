@@ -42,12 +42,12 @@ test('only exact-main bootstrap uses the protected production job after staging 
   assert.doesNotMatch(preflight[1], /secrets\./);
   const staging = workflow.split('\n  staging-evidence:\n')[1].split('\n  deploy-production:\n')[0];
   assert.match(staging, /needs: \[preflight\][\s\S]*?environment:\n      name: staging\n      deployment: false/);
-  const guard = staging.match(/UNPROTECTED_CF_CONFIG: \$\{\{ secrets\.PRODUCTION_CLOUDFLARE_API_TOKEN != '' \|\| secrets\.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' \}\}\n        run: \|\n([\s\S]*?)          python3 -/);
+  const guard = staging.match(/UNPROTECTED_CF_CONFIG: \$\{\{ secrets\.PRODUCTION_CLOUDFLARE_API_TOKEN != '' \|\| secrets\.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' \}\}\n          UNPROTECTED_ROLLBACK_CONFIG: \$\{\{ inputs\.mode == 'promote' && \(secrets\.PRODUCTION_ROLLBACK_CUSTODY != '' \|\| secrets\.PRODUCTION_ROLLBACK_INTENT_KEY != ''\) \}\}\n        run: \|\n([\s\S]*?)          python3 -/);
   assert.ok(guard);
-  for (const value of ['false', 'true', '']) {
+  for (const [credentials, rollback] of [['false', 'false'], ['true', 'false'], ['', 'false'], ['false', 'true'], ['false', '']]) {
     assert.equal(spawnSync('/bin/bash', ['-c', guard[1]], {
-      env: { UNPROTECTED_CF_CONFIG: value }, timeout: 5_000,
-    }).status, value === 'false' ? 0 : 1);
+      env: { UNPROTECTED_CF_CONFIG: credentials, UNPROTECTED_ROLLBACK_CONFIG: rollback }, timeout: 5_000,
+    }).status, credentials === 'false' && rollback === 'false' ? 0 : 1);
   }
   const job = workflow.split('\n  bootstrap-maintenance:\n')[1].split('\n  release:\n')[0];
   assert.match(job, /if: inputs.mode == 'bootstrap-maintenance'\n    needs: \[preflight, staging-evidence\]/);
@@ -193,6 +193,16 @@ test('wrong allocation, version or page count fails readback without retry or de
 });
 
 test('automatic rollback passes the selected maintenance UUID to the locked binary without npm fallback', () => {
+  const seed = workflow.match(/- name: Require one-time production seed deployment\n[\s\S]+?        run: \|\n((?:          [^\n]*\n)+)/)?.[1];
+  assert.ok(seed);
+  for (const percentage of [100, 50]) {
+    const fixture = JSON.stringify([{ versions: [{ percentage, version_id: version }] }]);
+    const baseline = spawnSync('/bin/bash', ['-c', `npx() { printf '%s' '${fixture}'; }\n${seed.replace(/^ {10}/gm, '')}`], {
+      encoding: 'utf8', timeout: 5_000, env: { PATH: process.env.PATH, WORKER_NAME: 'nntune-web' },
+    });
+    assert.equal(baseline.status, percentage === 100 ? 0 : 1, baseline.stderr);
+    if (percentage === 100) assert.ok(baseline.stdout.endsWith('production seed ok\n'));
+  }
   const workspace = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'locked-wrangler-'));
   try {
     const bin = join(workspace, 'apps/web/node_modules/.bin');
@@ -215,7 +225,7 @@ test('automatic rollback passes the selected maintenance UUID to the locked bina
 const rollbackFixture = { checkedAt, now, sha, version, workerId };
 
 test('production rollout requires the verified seed and a unique attempt version before shifting traffic', async (t) => {
-  const { calls, custody, versions, seed, run } = finalSmokeFixture(t, rollbackFixture);
+  const { calls, custody, versions, seed, temp, run } = finalSmokeFixture(t, rollbackFixture);
   await assert.rejects(run('check-seed', { ROLLBACK_CUSTODY: JSON.stringify({ ...custody, checked_at: checkedAt.replace('12:', '11:') }) }), /custody/);
   assert.deepEqual(calls, []);
   seed.bindings.push({ type: 'secret_text' });
@@ -224,6 +234,10 @@ test('production rollout requires the verified seed and a unique attempt version
   await run('check-seed');
   versions.push(versions[1]);
   await assert.rejects(run('record'), /did not resolve uniquely/);
+  versions.pop();
+  const times = [now(), now() + 31 * 60 * 1000];
+  await assert.rejects(run('record', {}, () => times.shift()), /Stale production rollback custody/);
+  assert.equal(existsSync(join(temp, 'production-rollback-intent.sealed')), false);
   assert.ok(calls.every((method) => method === 'GET'));
 });
 
@@ -271,12 +285,6 @@ test('final smoke refuses stale or tampered intent, changed targets and newer al
 test('only a failed executed final smoke can restore under the production lock', () => {
   const job = workflow.split('\n  deploy-production:\n')[1].split('\n  bootstrap-maintenance:\n')[0];
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false[\s\S]*?name: production/);
-  const inheritance = workflow.match(/- name: Refuse inherited rollback custody and intent key\n[\s\S]*?        run: \|\n((?: {10}[^\n]+\n)+)/);
-  assert.ok(inheritance && inheritance.index < workflow.indexOf('\n  staging-evidence:'));
-  for (const value of ['false', 'true', '']) {
-    const env = { UNPROTECTED_ROLLBACK_CONFIG: value };
-    assert.equal(spawnSync('/bin/bash', ['-c', inheritance[1]], { env, timeout: 5_000 }).status, value === 'false' ? 0 : 1);
-  }
   const steps = ['check-seed', 'Require one-time production seed deployment', 'Upload reviewed production version', 'rollback.mjs record',
     'Preserve sealed rollback intent', 'id: gradual', 'rollback.mjs pin-final', 'id: final-smoke',
     'rollback.mjs restore', 'Record successful production promotion'];
