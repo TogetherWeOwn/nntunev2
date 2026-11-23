@@ -22,7 +22,7 @@ use nntune_ingest::{
     },
 };
 use sha2::{Digest, Sha256};
-use std::io;
+use std::{io, ops::Range};
 
 #[path = "multipart_readback_inventory/publisher.rs"]
 mod publisher;
@@ -261,10 +261,78 @@ async fn completed_readback_binds_the_exact_inventory_after_flac_and_eof() {
             let verified = result.unwrap();
             assert!(std::ptr::eq(verified.inventory(), &inventory));
             assert!(std::ptr::eq(verified.origin(), &fixture.origin));
+            assert_eq!(
+                verified.flac_plaintext_range(
+                    fixture.media.metadata(),
+                    fixture.origin.plaintext_sha256(),
+                    0..1
+                ),
+                None
+            );
         } else {
             let invalid_flac = BodyReadbackError::Content(ReadbackError::MediaValidation);
             assert_eq!(result.err(), Some(Body(invalid_flac)));
         }
+    }
+}
+
+#[tokio::test]
+async fn hands_off_seek_ranges_only_for_the_verified_flac_object() {
+    use nntune_core::s3_locator::{S3Binding, S3Locator, S3MediaMetadata};
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic-flac/admin-upload");
+    for index in 1..=10 {
+        let plaintext = std::fs::read(directory.join(format!("fixture-{index}.flac"))).unwrap();
+        let fixture = ReadbackFixture::new(&plaintext);
+        let receipts = [fixture.sidecar()];
+        let inventory = fixture.inventory(&receipts);
+        let verified = inventory
+            .verify_with_flac_seek(SCOPE, fixture.envelope(), async |_, pin| {
+                Ok(fixture.response(pin))
+            })
+            .await
+            .unwrap();
+        let metadata = fixture.media.metadata();
+        let digest = fixture.origin.plaintext_sha256();
+        let seek = |millis| verified.flac_plaintext_range(metadata, digest, millis);
+        assert_eq!(seek(0..1), Some(42..plaintext.len() as u64));
+        assert_eq!(seek(92..u64::MAX), Some(42..plaintext.len() as u64));
+        for millis in [93..100, 1..1, Range { start: 10, end: 2 }] {
+            assert_eq!(seek(millis), None);
+        }
+
+        for (bucket, version) in [(BUCKET, FINAL_VERSION), ("other-bucket", SHARED_VERSION)] {
+            let locator = S3Locator::new(
+                bucket.into(),
+                KEY.into(),
+                S3Binding::VersionId(version.into()),
+            )
+            .unwrap();
+            let metadata =
+                S3MediaMetadata::from_trusted_context(locator, &fixture.context).unwrap();
+            assert_eq!(verified.flac_plaintext_range(&metadata, digest, 0..1), None);
+        }
+        let mut identities = fixture.context.identities;
+        identities[5] = id(9);
+        let foreign_configuration = EnvelopeContext {
+            identities,
+            ..fixture.context
+        };
+        let foreign_metadata = S3MediaMetadata::from_trusted_context(
+            metadata.locator().clone(),
+            &foreign_configuration,
+        )
+        .unwrap();
+        assert_eq!(
+            verified.flac_plaintext_range(&foreign_metadata, digest, 0..1),
+            None
+        );
+        let mut wrong_digest = *digest;
+        wrong_digest[0] ^= 1;
+        assert_eq!(
+            verified.flac_plaintext_range(metadata, &wrong_digest, 0..1),
+            None
+        );
     }
 }
 
@@ -741,7 +809,7 @@ async fn completed_readback_rejects_foreign_scope_and_response_pins() {
 
     for version in [Some(FINAL_VERSION), Some(SHARED_VERSION), None] {
         let result = inventory
-            .verify(SCOPE, fixture.envelope(), async |_, pin| {
+            .verify_with_flac_seek(SCOPE, fixture.envelope(), async |_, pin| {
                 let mut response = fixture.response(pin);
                 if pin.object_key == PAGE_KEY {
                     let version = version.ok_or(io::ErrorKind::TimedOut)?;
