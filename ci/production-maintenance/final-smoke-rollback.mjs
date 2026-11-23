@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { cloudflare, requireCompletePage } from './seed.mjs';
 
@@ -8,8 +8,8 @@ const workflow = '.github/workflows/deploy-production.yml';
 const name = 'nntune-web';
 const deployments = `/scripts/${name}/deployments`;
 const page = '?page=1&per_page=100';
-const hex = (s, length) => typeof s === 'string' && s.length === length && /^[0-9a-f]+$/.test(s);
-const uuid = (s) => typeof s === 'string' && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(s);
+const hex = (s, length) => typeof s === 'string' && s.length === length && !/[^0-9a-f]/.test(s);
+const uuid = (s) => typeof s === 'string' && s.length === 36 && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(s);
 const allocation = (version_id, percentage = 100) => ({ version_id, percentage });
 const matches = (entry, expected) => Array.isArray(entry?.versions) && entry.versions.length === expected.length &&
   expected.every((v) => entry.versions.some((actual) =>
@@ -31,34 +31,36 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   }
   const proof = custody?.length <= 4096 ? JSON.parse(custody) : null;
   const { maintenance, references, checked_at: checkedAt } = proof ?? {};
-  const checkCustody = () => {
-    const stamp = Date.parse(checkedAt);
-    if (proof?.account !== account || proof.worker !== worker || proof.sha !== sha || proof.domain !== domain ||
-        proof.private_routes_frozen !== true || proof.exclusive_writers !== true || !hex(proof.evidence_sha256, 64) ||
-        !Number.isFinite(stamp) || checkedAt !== new Date(stamp).toISOString() || stamp > now() || now() - stamp > 1_800_000 ||
-        !uuid(maintenance?.version) || !uuid(maintenance.deployment) || !hex(maintenance.sha, 40) ||
-        maintenance.module_sha256 !== seedDigest || !Array.isArray(references?.domains) || references.domains.length > 1 ||
-        !references.domains.every((entry) => entry?.hostname === domain) ||
-        !Object.entries(references).every(([kind, entries]) => kind === 'domains' ||
-          (Array.isArray(entries) && entries.length === 0))) {
-      throw new Error('Missing, stale or mismatched production rollback custody');
-    }
-  };
-  checkCustody();
-  const aad = Buffer.from(JSON.stringify({ ...context, custody: createHash('sha256').update(custody).digest('hex') }));
+  const stamp = Date.parse(checkedAt);
+  if (proof?.account !== account || proof.worker !== worker || proof.sha !== sha || proof.domain !== domain ||
+      proof.private_routes_frozen !== true || proof.exclusive_writers !== true || !hex(proof.evidence_sha256, 64) ||
+      !Number.isFinite(stamp) || checkedAt !== new Date(stamp).toISOString() ||
+      !uuid(maintenance?.version) || !uuid(maintenance.deployment) || !hex(maintenance.sha, 40) ||
+      maintenance.module_sha256 !== seedDigest || !Array.isArray(references?.domains) || references.domains.length > 1 ||
+      !references.domains.every((entry) => entry?.hostname === domain) ||
+      !Object.entries(references).every(([kind, entries]) => kind === 'domains' ||
+        (Array.isArray(entries) && entries.length === 0))) {
+    throw new Error('Missing or mismatched production rollback custody');
+  }
+  function requireFreshCustody() {
+    const elapsed = now() - stamp;
+    if (elapsed < 0 || elapsed > 1_800_000) throw new Error('Stale production rollback custody');
+  }
+  const custodyDigest = createHash('sha256').update(custody).digest('hex');
+  const aad = (path) => Buffer.from(JSON.stringify({ ...context, custody: custodyDigest, file: basename(path) }));
   const secret = Buffer.from(key, 'hex');
   const intentPath = join(temp, 'production-rollback-intent.sealed');
   const finalPath = join(temp, 'production-final-allocation.sealed');
   function seal(path, value) {
     const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', secret, iv).setAAD(aad);
+    const cipher = createCipheriv('aes-256-gcm', secret, iv).setAAD(aad(path));
     const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]);
     writeFileSync(path, Buffer.concat([iv, cipher.getAuthTag(), ciphertext]), { mode: 0o600, flag: 'wx' });
   }
   function unseal(path) {
     try {
       const bytes = readFileSync(path);
-      const decipher = createDecipheriv('aes-256-gcm', secret, bytes.subarray(0, 12)).setAAD(aad);
+      const decipher = createDecipheriv('aes-256-gcm', secret, bytes.subarray(0, 12)).setAAD(aad(path));
       decipher.setAuthTag(bytes.subarray(12, 28));
       return JSON.parse(Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]));
     } catch {
@@ -81,7 +83,6 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
     if (list.length > 100 || !list.every((row, i) => uuid(row?.id) && Number.isFinite(Date.parse(row.created_on)) &&
         (i === 0 || Date.parse(list[i - 1].created_on) > Date.parse(row.created_on))) ||
         new Set(list.map((row) => row.id)).size !== list.length) throw new Error('Ambiguous deployment history');
-    checkCustody();
     return list;
   }
 
@@ -89,6 +90,7 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   const seedOnly = [allocation(maintenance.version)];
   const isSeed = (row) => row?.id === maintenance.deployment && matches(row, seedOnly);
   if (command === 'check-seed' || command === 'record') {
+    requireFreshCustody();
     if (!isSeed((await live())[0])) throw new Error('Recorded maintenance deployment is no longer active');
     if (command === 'check-seed') return;
     const inventory = await api(`${pinned}/versions${page}`, 'Candidate version inventory');
@@ -99,11 +101,13 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
     if (list.length > 100 || candidates.length !== 1 || !uuid(candidate) || candidate === maintenance.version) {
       throw new Error('Candidate tag did not resolve uniquely on the pinned Worker');
     }
-    checkCustody();
+    requireFreshCustody();
     seal(intentPath, { ...context, maintenance, tag, candidate, nonce: randomBytes(16).toString('hex') });
     return;
   }
 
+  // Freshness is checked before the rollout. The sealed intent and continuous
+  // custody carry that proof through final smoke and the same-job restore.
   const intent = unseal(intentPath);
   const { candidate, nonce } = intent;
   const candidateOnly = [allocation(candidate)];

@@ -42,12 +42,12 @@ test('only exact-main bootstrap uses the protected production job after staging 
   assert.doesNotMatch(preflight[1], /secrets\./);
   const staging = workflow.split('\n  staging-evidence:\n')[1].split('\n  deploy-production:\n')[0];
   assert.match(staging, /needs: \[preflight\][\s\S]*?environment:\n      name: staging\n      deployment: false/);
-  const guard = staging.match(/UNPROTECTED_CF_CONFIG: \$\{\{ secrets\.PRODUCTION_CLOUDFLARE_API_TOKEN != '' \|\| secrets\.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' \}\}\n          UNPROTECTED_ROLLBACK_CONFIG: [^\n]+\n        run: \|\n([\s\S]*?)          python3 -/);
+  const guard = staging.match(/UNPROTECTED_CF_CONFIG: \$\{\{ secrets\.PRODUCTION_CLOUDFLARE_API_TOKEN != '' \|\| secrets\.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' \}\}\n        run: \|\n([\s\S]*?)          python3 -/);
   assert.ok(guard);
-  for (const [credentials, rollback] of [['false', 'false'], ['true', 'false'], ['', 'false'], ['false', 'true'], ['false', '']]) {
+  for (const value of ['false', 'true', '']) {
     assert.equal(spawnSync('/bin/bash', ['-c', guard[1]], {
-      env: { UNPROTECTED_CF_CONFIG: credentials, UNPROTECTED_ROLLBACK_CONFIG: rollback }, timeout: 5_000,
-    }).status, credentials === 'false' && rollback === 'false' ? 0 : 1);
+      env: { UNPROTECTED_CF_CONFIG: value }, timeout: 5_000,
+    }).status, value === 'false' ? 0 : 1);
   }
   const job = workflow.split('\n  bootstrap-maintenance:\n')[1].split('\n  release:\n')[0];
   assert.match(job, /if: inputs.mode == 'bootstrap-maintenance'\n    needs: \[preflight, staging-evidence\]/);
@@ -228,16 +228,17 @@ test('production rollout requires the verified seed and a unique attempt version
 });
 
 test('final smoke restores only recorded maintenance and reconciles ambiguity without a second write', async (t) => {
+  const afterLongRollout = () => now() + 31 * 60 * 1000;
   for (const outcome of ['ack', 'lost', 'unresolved']) {
     const { calls, prepare, run } = finalSmokeFixture(t, rollbackFixture, outcome);
-    await prepare();
+    await prepare(afterLongRollout);
     assert.ok(calls.every((method) => method === 'GET'));
     if (outcome === 'unresolved') {
-      await assert.rejects(run('restore'), /reconcile allocation/);
-      await assert.rejects(run('restore'), /EEXIST/);
+      await assert.rejects(run('restore', {}, afterLongRollout), /reconcile allocation/);
+      await assert.rejects(run('restore', {}, afterLongRollout), /EEXIST/);
     } else {
-      assert.match(await run('restore'), outcome === 'ack' ? /allocation verified/ : /reconciled by readback/);
-      assert.match(await run('restore'), /already verified/);
+      assert.match(await run('restore', {}, afterLongRollout), outcome === 'ack' ? /allocation verified/ : /reconciled by readback/);
+      assert.match(await run('restore', {}, afterLongRollout), /already verified/);
     }
     assert.deepEqual(calls.slice(calls.indexOf('POST') + 1), Array(6).fill('GET'));
     assert.equal(calls.filter((method) => method === 'POST').length, 1);
@@ -270,7 +271,13 @@ test('final smoke refuses stale or tampered intent, changed targets and newer al
 test('only a failed executed final smoke can restore under the production lock', () => {
   const job = workflow.split('\n  deploy-production:\n')[1].split('\n  bootstrap-maintenance:\n')[0];
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false[\s\S]*?name: production/);
-  const steps = ['check-seed', 'Upload reviewed production version', 'rollback.mjs record',
+  const inheritance = workflow.match(/- name: Refuse inherited rollback custody and intent key\n[\s\S]*?        run: \|\n((?: {10}[^\n]+\n)+)/);
+  assert.ok(inheritance && inheritance.index < workflow.indexOf('\n  staging-evidence:'));
+  for (const value of ['false', 'true', '']) {
+    const env = { UNPROTECTED_ROLLBACK_CONFIG: value };
+    assert.equal(spawnSync('/bin/bash', ['-c', inheritance[1]], { env, timeout: 5_000 }).status, value === 'false' ? 0 : 1);
+  }
+  const steps = ['check-seed', 'Require one-time production seed deployment', 'Upload reviewed production version', 'rollback.mjs record',
     'Preserve sealed rollback intent', 'id: gradual', 'rollback.mjs pin-final', 'id: final-smoke',
     'rollback.mjs restore', 'Record successful production promotion'];
   let last = -1;

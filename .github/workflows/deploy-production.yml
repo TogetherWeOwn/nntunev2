@@ -133,6 +133,13 @@ jobs:
             { echo '::error::Worker ID and route proof must exist only in the production Environment'; exit 1; }
           echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
           echo "domain=$domain" >> "$GITHUB_OUTPUT"
+      - name: Refuse inherited rollback custody and intent key
+        if: inputs.mode == 'promote'
+        env:
+          UNPROTECTED_ROLLBACK_CONFIG: ${{ secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '' }}
+        run: |
+          [ "${UNPROTECTED_ROLLBACK_CONFIG:-}" = false ] ||
+            { echo '::error::Rollback custody and intent key must exist only in the production Environment'; exit 1; }
 
   staging-evidence:
     name: staging-evidence
@@ -158,13 +165,10 @@ jobs:
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
           # Check inheritance from outside production without passing secret values to this runner.
           UNPROTECTED_CF_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' }}
-          UNPROTECTED_ROLLBACK_CONFIG: ${{ inputs.mode == 'promote' && (secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '') }}
         run: |
           set -euo pipefail
           [ "${UNPROTECTED_CF_CONFIG:-}" = false ] ||
             { echo '::error::Cloudflare credentials must exist only in the production Environment'; exit 1; }
-          [ "${UNPROTECTED_ROLLBACK_CONFIG:-}" = false ] ||
-            { echo '::error::Rollback custody and intent key must exist only in the production Environment'; exit 1; }
           python3 - <<'PY'
           import json, os, sys, urllib.request
 
@@ -323,6 +327,50 @@ jobs:
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
           DOMAIN: ${{ needs.preflight.outputs.domain }}
         run: node ci/production-maintenance/final-smoke-rollback.mjs check-seed
+      # Check the same name-based Wrangler read used by the shared action,
+      # after the authenticated immutable Worker and maintenance checks.
+      - name: Require one-time production seed deployment
+        working-directory: apps/web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
+        run: |
+          set -euo pipefail
+          npx wrangler deployments list --env production --name "$WORKER_NAME" --json \
+            | node -e '
+              let raw = "";
+              process.stdin.on("data", (c) => { raw += c; });
+              process.stdin.on("end", () => {
+                const seed = "Require one production version at 100%. If unseeded, keep promotion off. " +
+                  "See docs/ops.md production seed precondition.";
+                let parsed;
+                try {
+                  parsed = JSON.parse(raw);
+                } catch (e) {
+                  console.error("::error::could not parse deployments list output: " + e.message);
+                  process.exit(1);
+                }
+                const deployments = Array.isArray(parsed) ? parsed : (parsed.result ?? parsed.deployments);
+                if (!Array.isArray(deployments) || deployments.length === 0) {
+                  console.error("::error::No production deployments found. " + seed);
+                  process.exit(1);
+                }
+                let newest = deployments[0];
+                for (const entry of deployments.slice(1)) {
+                  if (String(entry?.created_on ?? "") > String(newest?.created_on ?? "")) newest = entry;
+                }
+                const versions = newest?.versions;
+                const id = Array.isArray(versions) && versions.length === 1 && versions[0]?.percentage === 100
+                  ? versions[0]?.version_id
+                  : undefined;
+                if (typeof id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) {
+                  console.error("::error::Latest production deployment is not a single-version 100% deployment. " + seed);
+                  process.exit(1);
+                }
+                console.log("production seed ok");
+              });
+            '
       # Uploading a version does not mutate routes, custom domains or cron
       # triggers. Never use a full deploy or a trigger-syncing subcommand
       # here: those re-provision the production hostname and fail or drift.

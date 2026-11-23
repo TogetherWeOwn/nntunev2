@@ -1220,7 +1220,10 @@ private `evidence_sha256`, exact Worker `references` and verified `maintenance`
 `version`, `deployment`, seed `sha` and `module_sha256`. Set `exclusive_writers`
 and `private_routes_frozen` only after verifying and freezing all Worker,
 route, DNS and Access writers through readback. The job verifies the Worker
-and preview settings and saves an encrypted intent before traffic shifts.
+and preview settings and seals the intent before traffic shifts. Custody
+evidence must be at most 30 minutes old when sealing. Keep the freeze in
+place through recovery readback even if final smoke runs past that window.
+The maintenance module digest must also match the reviewed candidate checkout.
 
 Failed final smoke keeps the release red. The same lock covers recovery, which
 requires the exact final deployment and submits maintenance at 100% once.

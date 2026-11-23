@@ -59,11 +59,16 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId },
       default: assert.fail('Unexpected offline request');
     }
   };
-  const run = (command, overrides) => finalSmokeRollback(command,
-    { ...env, ROLLBACK_CUSTODY: JSON.stringify(custody), ...overrides }, request, now);
+  const run = (command, overrides, clock = now) => finalSmokeRollback(command,
+    { ...env, ROLLBACK_CUSTODY: JSON.stringify(custody), ...overrides }, request, clock);
   const shift = () => rows.unshift(deployment(4, [allocation(candidate)]),
     deployment(3, [allocation(candidate, 50), allocation(version, 50)]),
     deployment(2, [allocation(candidate, 5), allocation(version, 95)]));
-  const prepare = async () => { await run('check-seed'); await run('record'); shift(); await run('pin-final'); };
+  const prepare = async (clock = now) => {
+    await run('check-seed');
+    await run('record');
+    shift();
+    await run('pin-final', {}, clock);
+  };
   return { calls, custody, rows, versions, seed, state, id, temp, run, prepare };
 }
