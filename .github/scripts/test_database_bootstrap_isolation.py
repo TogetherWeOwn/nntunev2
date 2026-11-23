@@ -1,5 +1,6 @@
 """Disposable PostgreSQL qualification. No connection or credential inputs."""
 
+import io
 import os
 import secrets
 import select
@@ -8,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import suppress
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
 from database_bootstrap_preflight import (
@@ -68,7 +69,10 @@ def command(*args, input_text=None, timeout=20, cleanup=False, interrupt=False):
         finally:
             if process.poll() is None:
                 process.kill()
-    require(not interrupt or process.returncode == 0, "finish the in-flight Docker command")
+    if interrupt:
+        canary = input_text.rstrip("\n")
+        require(process.returncode == 0 and stdout == canary and canary in stderr,
+                "capture the in-flight command output and trace during interruption")
     if not cleanup:
         check_interruption(include_drill=interrupt)
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
@@ -143,7 +147,8 @@ class Cluster:
             time.sleep(0.25)
         raise FixtureFailure("verify TLS readiness")
 
-    def sql(self, sql, *, role="postgres", database=MAINTENANCE, host=None, ca="trusted", switch=""):
+    def sql(self, sql, *, role="postgres", database=MAINTENANCE, host=None, ca="trusted", switch="",
+            trace=False):
         sql = (f"SET ROLE {switch};\n" if switch else "") + sql
         return docker("exec", "-i", self.client, "env", "-i",
                       "PATH=/usr/local/bin:/usr/bin:/bin", "LC_ALL=C",
@@ -151,9 +156,9 @@ class Cluster:
                       f"PGUSER={role}", "PGSSLMODE=verify-full", "PGGSSENCMODE=disable",
                       f"PGSSLROOTCERT=/fixture/{ca}.crt", "PGCONNECT_TIMEOUT=2",
                       "PGOPTIONS=-c statement_timeout=5000 -c lock_timeout=2000",
-                      "sh", "-ec", """
+                      "sh", "-exc" if trace else "-ec", """
                       IFS= read -r PGPASSWORD
-                      export PGPASSWORD
+                      export PGPASSWORD="$PGPASSWORD"
                       exec psql -XqAtw -v ON_ERROR_STOP=1 -v VERBOSITY=verbose
                       """, input_text=self.passwords[role] + "\n" + sql)
 
@@ -238,6 +243,14 @@ def refuse_before_create(cluster):
            AND EXISTS (SELECT FROM pg_database WHERE datname = '{SIBLING}'
                        AND datdba = '{STAGING}'::regrole AND datallowconn);
         """, "t\n", role=CREATOR)
+
+
+def verify_quiet_failure(cluster):
+    token = secrets.token_hex(20)
+    result = cluster.sql(f"SELECT '{token}';\nSELECT missing_{token};", role=CREATOR, trace=True)
+    require(result.returncode != 0 and token in result.stdout and token in result.stderr
+            and cluster.passwords[CREATOR] in result.stderr,
+            "capture result, error and credential trace without publishing them")
 
 
 def verify_launch_grants(cluster):
@@ -343,10 +356,12 @@ def exercise(*, interrupt):
                 provision_roles(cluster)
                 if not interrupt:
                     refuse_before_create(cluster)
+                    verify_quiet_failure(cluster)
                 cluster.create_fenced()
                 if interrupt:
-                    docker("exec", "-i", cluster.client, "sh", "-ec", "echo ready; read -r line",
-                           input_text="continue\n", timeout=3, interrupt=True)
+                    docker("exec", "-i", cluster.client, "sh", "-exc",
+                           'echo ready; read -r line; printf "%s" "$line"',
+                           input_text=secrets.token_hex(24) + "\n", timeout=3, interrupt=True)
                     raise FixtureFailure("interruption did not stop the fixture")
                 verify_launch_grants(cluster)
             finally:
@@ -374,7 +389,10 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output):
+            main()
+        require(output.tell() == 0, "keep child diagnostics out of the fixture output")
     except FixtureFailure as error:
         sys.exit(f"database-bootstrap-fixture: failed to {error}")
     except Exception:
