@@ -6,11 +6,21 @@
 
 use nntune_core::digest_enrollment::OriginManifest;
 
+mod inventory;
+pub use inventory::{
+    append_inventory, stage_completed_candidate, stage_validated_winner, InventoryAppendError,
+};
+
 // Not wired until authority and custody can be established by the caller.
 #[allow(dead_code)]
 mod reconciliation;
 #[cfg(test)]
 mod reconciliation_tests;
+
+// Lock the whole digest key before looking at holder, generation, or expiry.
+const LOCK_SQL: &str = "SELECT 1 FROM public.storage_digest_reservations
+ WHERE environment_id = $1::text::uuid AND library_id = $2::text::uuid
+   AND plaintext_sha256 = $3 AND plaintext_bytes = $4 FOR UPDATE";
 
 const STORE_SQL: &str = "WITH locked_reservation AS MATERIALIZED (
     SELECT r.object_id FROM public.storage_digest_reservations AS r

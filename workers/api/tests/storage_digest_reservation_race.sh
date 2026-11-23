@@ -221,32 +221,48 @@ advance="PREPARE advance_checkpoint(uuid, uuid, text, uuid, bytea, uuid, bigint,
 scope="'01000000-0000-4000-8000-000000000001', '11000000-0000-4000-8000-000000000001', 'digest-test-owner'"
 fp="decode(repeat('de', 32), 'hex')"
 gen="'41000000-0000-4000-8000-000000000001'"
-initial_idle="absolute_deadline - interval '23 hours 55 minutes'"
-
 # Exercise both lock orders and both possible holder dispositions. '-' denotes
 # a successful statement returning zero rows, not a database/transport error.
 for scenario in 'abort terminal COMMIT aborted - 0 0 aborted' 'abort terminal ROLLBACK aborted 1 1 100 active' \
                 'abort checkpoint COMMIT 1 aborted 1 100 aborted' 'abort checkpoint ROLLBACK 1 aborted 0 0 aborted' \
-                'checkpoint_lost terminal COMMIT aborted - 0 0 aborted' 'checkpoint_lost terminal ROLLBACK aborted 1 1 100 active' \
+                'expire checkpoint ROLLBACK 1 expired 0 0 expired' 'grant lease COMMIT - - 0 0 active' \
+                'checkpoint_lost terminal COMMIT aborted - 0 0 aborted' \
+                'checkpoint_lost terminal ROLLBACK aborted 1 1 100 active' \
                 'checkpoint_lost checkpoint COMMIT 1 - 1 100 active' \
                 'checkpoint_lost checkpoint ROLLBACK 1 aborted 0 0 aborted'; do
   read -r action first finish holder_expected contender_expected rev offset terminal <<<"$scenario"
+  initial_idle="absolute_deadline - interval '23 hours 55 minutes'"
+  if [[ "$action" == expire ]]; then
+    initial_idle="absolute_deadline - interval '23 hours 59 minutes 52 seconds'"
+  fi
   sid="$(psql_run -Atc 'SELECT gen_random_uuid()')"
   [[ "$sid" =~ ^[0-9a-f-]{36}$ ]]
   [[ "$(psql_run -Atc "$reserve" -c "EXECUTE reserve_session($scope, 'race-$action-$first-$finish', $fp, '$sid')")" == "$sid" ]]
   psql_run -c "UPDATE public.ingest_session_reservations SET idle_deadline=$initial_idle WHERE id='$sid'"
   lease_id="$(psql_run -Atc 'SELECT gen_random_uuid()')"
   [[ "$lease_id" =~ ^[0-9a-f-]{36}$ ]]
-  [[ "$(psql_run -Atc "$lease" -c "EXECUTE acquire_write_lease($scope, '$sid', $fp, $gen, 0, 0, '$lease_id')")" == "$lease_id" ]]
-  terminal_snapshot='NULL, NULL, NULL, NULL, NULL'
-  if [[ "$action" == checkpoint_lost ]]; then terminal_snapshot="$fp, $gen, 0, 0, '$lease_id'"; fi
-  terminal_query="EXECUTE terminate_session($scope, '$sid', '$action', $terminal_snapshot);"
-  advance_query="EXECUTE advance_checkpoint($scope, '$sid', $fp, $gen, 0, 0, 100, '$lease_id');"
-  holder_prepare="$terminate"; holder_query="$terminal_query"
-  contender_prepare="$advance"; contender_query="$advance_query"
-  if [[ "$first" == checkpoint ]]; then
-    holder_prepare="$advance"; holder_query="$advance_query"
-    contender_prepare="$terminate"; contender_query="$terminal_query"
+  lease_before="write_lease_id='$lease_id' AND write_lease_generation=$gen::uuid"
+  lease_after='write_lease_id IS NULL'
+  if [[ "$action" == grant ]]; then
+    holder_prepare="$lease"; holder_expected="$lease_id"
+    holder_query="EXECUTE acquire_write_lease($scope, '$sid', $fp, $gen, 0, 0, '$lease_id');"
+    contender_prepare="$lease"
+    contender_query="EXECUTE acquire_write_lease($scope, '$sid', $fp, $gen, 0, 0, gen_random_uuid());"
+    lease_after="$lease_before"
+    lease_before='write_lease_id IS NULL'
+  else
+    [[ "$(psql_run -Atc "$lease" -c "EXECUTE acquire_write_lease($scope, '$sid', $fp, $gen, 0, 0, '$lease_id')")" == "$lease_id" ]]
+    terminal_snapshot='NULL, NULL, NULL, NULL, NULL'
+    if [[ "$action" == checkpoint_lost ]]; then terminal_snapshot="$fp, $gen, 0, 0, '$lease_id'"; fi
+    terminal_query="EXECUTE terminate_session($scope, '$sid', '$action', $terminal_snapshot);"
+    advance_query="EXECUTE advance_checkpoint($scope, '$sid', $fp, $gen, 0, 0, 100, '$lease_id');"
+    if [[ "$first" == checkpoint ]]; then
+      holder_prepare="$advance"; holder_query="$advance_query"
+      contender_prepare="$terminate"; contender_query="$terminal_query"
+    else
+      holder_prepare="$terminate"; holder_query="$terminal_query"
+      contender_prepare="$advance"; contender_query="$advance_query"
+    fi
   fi
 
   race="$dir/session-$action-$first-$finish"
@@ -266,14 +282,37 @@ for scenario in 'abort terminal COMMIT aborted - 0 0 aborted' 'abort terminal RO
     sleep 0.1
   done
   [[ "$blocked" == 1 ]] || { printf 'ingest session contender did not wait on holder: %s\n' "$scenario" >&2; exit 1; }
+  if [[ "$action" == expire ]]; then
+    # The observer sees the original deadline until the checkpoint rolls back.
+    expired_sql="SELECT clock_timestamp() >= idle_deadline FROM public.ingest_session_reservations WHERE id='$sid'"
+    [[ "$(psql_run -Atc "$expired_sql")" == f ]] || { printf 'expiry contender arrived after the idle cutoff\n' >&2; exit 1; }
+    expired=0
+    for _ in {1..100}; do
+      if [[ "$(psql_run -Atc "$expired_sql")" == t ]]; then expired=1; break; fi
+      sleep 0.1
+    done
+    [[ "$expired" == 1 ]] || { printf 'idle cutoff did not pass while the contender waited\n' >&2; exit 1; }
+  fi
+  # A separate connection must see only the committed reservation and expiry intent.
+  [[ "$(psql_run -Atc "SELECT checkpoint_revision=0 AND checkpoint_offset=0
+       AND checkpoint_generation IS NULL AND terminal_reason IS NULL AND terminal_at IS NULL
+       AND ($lease_before)
+       AND idle_deadline=$initial_idle
+       AND EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+         WHERE session_id=session.id AND kind='absolute_expiry' AND due_at=session.absolute_deadline)
+       AND NOT EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+         WHERE session_id=session.id AND kind='terminal_reconcile')
+     FROM public.ingest_session_reservations AS session WHERE session.id='$sid'")" == t ]] || {
+    printf 'observer saw an unexpected checkpoint, lease or cleanup state: %s\n' "$scenario" >&2; exit 1;
+  }
   printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
   wait "$holder"; wait "$contender"
   result="$(<"$race/contender")"
   [[ "$(<"$race/holder")" == "$holder_expected" && "${result:--}" == "$contender_expected" ]] || {
-    printf 'unexpected checkpoint/terminal statement result: %s\n' "$scenario" >&2; exit 1;
+    printf 'unexpected session statement result: %s\n' "$scenario" >&2; exit 1;
   }
   [[ "$(psql_run -Atc "SELECT COALESCE(terminal_reason, 'active'), checkpoint_revision, checkpoint_offset,
-       (terminal_at IS NULL) = ('$terminal' = 'active'), write_lease_id IS NULL,
+       (terminal_at IS NULL) = ('$terminal' = 'active'), ($lease_after),
        checkpoint_generation IS NOT DISTINCT FROM CASE WHEN $rev = 0 THEN NULL ELSE $gen::uuid END,
        CASE WHEN $rev = 0 THEN idle_deadline = $initial_idle ELSE idle_deadline > $initial_idle END,
        EXISTS (SELECT FROM public.ingest_session_cleanup_intents
@@ -281,9 +320,9 @@ for scenario in 'abort terminal COMMIT aborted - 0 0 aborted' 'abort terminal RO
        (SELECT due_at FROM public.ingest_session_cleanup_intents
          WHERE session_id=session.id AND kind='terminal_reconcile') IS NOT DISTINCT FROM session.terminal_at
      FROM public.ingest_session_reservations AS session WHERE session.id='$sid'")" == "$terminal|$rev|$offset|t|t|t|t|t|t" ]] || {
-    printf 'unexpected committed checkpoint/terminal state or cleanup intent: %s\n' "$scenario" >&2; exit 1;
+    printf 'unexpected committed session or cleanup state: %s\n' "$scenario" >&2; exit 1;
   }
-  printf 'ingest session row fence and cleanup intents passed: %s vs checkpoint, %s first, %s; checkpoint revision=%s, state=%s\n' \
+  printf 'ingest session row fence and cleanup intents passed: %s, %s first, %s; checkpoint revision=%s, state=%s\n' \
     "$action" "$first" "$finish" "$rev" "$terminal"
 done
 psql_run -c 'DROP TABLE public.ingest_session_cleanup_intents, public.ingest_session_reservations'

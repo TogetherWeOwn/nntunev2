@@ -1,5 +1,25 @@
 export const AUTH_GENERATION_KEY = 'nntune.auth.generation.v1';
 export const AUTH_LOCK = 'nntune.auth.cookie-transition.v1';
+export const SESSION_BINDING_HEADER = 'x-nntune-session-binding';
+// SHA-256 base64url has two zero pad bits in its last sextet.
+export const validSessionBinding = (value: unknown): value is string =>
+	typeof value === 'string' && /^[\w-]{42}[AEIMQUYcgkosw048]$/.test(value);
+
+export interface AccountSession {
+	readonly generation: string;
+	readonly signal: AbortSignal;
+	isCurrent(): boolean;
+	run<T>(work: () => T): Promise<T | undefined>;
+}
+
+let account: { scope: AccountSession; controller: AbortController } | undefined;
+
+function retireAccountSession() {
+	const previous = account;
+	account = undefined;
+	previous?.controller.abort();
+}
+
 // An abandoned write can leave its marker; don't guess when its cookie settled.
 const PENDING_PREFIX = 'nntune.auth.pending.v1.';
 let localEpoch = 0, pending = 0;
@@ -72,9 +92,56 @@ export function captureAuthFence({ readOnly = false } = {}) {
 		const id = generation();
 		const isCurrent = () => !pending && epoch === localEpoch && !receiptsBlocked() && generation() === id;
 		if (!id || (await cacheReceiptsBlocked()) || !isCurrent()) return;
-		return { generation: id, isCurrent, run: <T>(work: () => T) => readLock(() => isCurrent() ? work() : undefined) };
+		if (account?.scope.isCurrent()) return account.scope;
+		retireAccountSession();
+		// Abort listeners are synchronous and may start an auth transition.
+		if (!isCurrent()) return;
+		const controller = new AbortController();
+		const scope: AccountSession = {
+			generation: id,
+			signal: controller.signal,
+			isCurrent: () => !controller.signal.aborted && isCurrent(),
+			run: (work) => readLock(() => scope.isCurrent() ? work() : undefined)
+		};
+		account = { scope, controller };
+		window.addEventListener?.('storage', ({ key }) => {
+			if (account?.scope === scope &&
+				(key === null || key === AUTH_GENERATION_KEY || pendingMarker(key)) && !scope.isCurrent()) {
+				retireAccountSession();
+			}
+		}, { signal: scope.signal });
+		return scope;
 	});
 }
+
+/** Own the account data a mounted view publishes, including data kept after a request settles. */
+export function observeAccountSession(clear: () => void) {
+	const lifetime = new AbortController();
+	let observed: AccountSession | undefined;
+	const retire = () => {
+		observed?.signal.removeEventListener('abort', retire);
+		observed = undefined;
+		clear();
+	};
+	return {
+		/** Clear stale data before creating a new attempt, even if an event was missed. */
+		prepare() {
+			if (observed && !observed.isCurrent()) retire();
+		},
+		async capture(options?: Parameters<typeof captureAuthFence>[0]) {
+			if (lifetime.signal.aborted) return;
+			const scope = await captureAuthFence(options);
+			if (lifetime.signal.aborted || !scope?.isCurrent()) return;
+			if (scope !== observed) {
+				observed = scope;
+				scope.signal.addEventListener('abort', retire, { signal: lifetime.signal, once: true });
+			}
+			return scope;
+		},
+		dispose: () => lifetime.abort()
+	};
+}
+
 type AuthIntent = { stale: Error; revocation?: { generation: string | undefined } };
 /** Mark before dispatch and hold until fetch settles (including response cookies). */
 export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Promise<T>, intent?: AuthIntent): Promise<T> {
@@ -103,6 +170,7 @@ export async function runAuthMutation<T>(signal: AbortSignal, dispatch: () => Pr
 		}
 	};
 	try {
+		retireAccountSession();
 		invalidation.dispatchEvent(new Event('invalidate'));
 		const locks = globalThis.navigator?.locks;
 		if (revocation) {

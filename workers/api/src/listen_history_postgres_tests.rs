@@ -1,6 +1,6 @@
 use super::*;
 use std::time::Duration;
-use tokio_postgres::{config::Host, Config, NoTls};
+use tokio_postgres::{config::Host, Client, Config, NoTls};
 
 pub(crate) async fn connect() -> Client {
     let config: Config = std::env::var("NNTUNE_TEST_DATABASE_URL")
@@ -198,7 +198,7 @@ async fn clear_and_terminal_write_share_owner_fence() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let blockers: Vec<i32> = tx
-                .query_one("SELECT pg_blocking_pids($1)", &[&writer_pid])
+                .query_typed_one("SELECT pg_blocking_pids($1)", &[(&writer_pid, Type::INT4)])
                 .await
                 .unwrap()
                 .get(0);

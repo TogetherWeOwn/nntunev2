@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { load } from './+page';
+import { useSessionFixture } from './page.fixture.js';
 import type { PageData } from './$types';
+
+useSessionFixture();
 
 function mockFetch401(): typeof fetch {
 	return (async () =>

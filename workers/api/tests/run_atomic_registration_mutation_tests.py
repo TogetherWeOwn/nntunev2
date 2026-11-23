@@ -78,9 +78,7 @@ MUTATIONS = (
         "    reaper_selection_pause().await;",
         "        .collect::<Result<Vec<_>, _>>()?;\n"
         "    transaction.commit().await.map_err(|_| StoreError)?;\n"
-        "    let transaction = client.build_transaction()"
-        ".isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)"
-        ".start().await.map_err(|_| StoreError)?;\n"
+        "    let transaction = client.read_committed().await.map_err(|_| StoreError)?;\n"
         '    #[cfg(all(test, not(target_arch = "wasm32")))]\n'
         "    reaper_selection_pause().await;",
         PREFIX + "postgres_reap_holds_selected_parent_lock_through_delete",
