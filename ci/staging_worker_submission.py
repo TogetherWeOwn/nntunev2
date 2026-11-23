@@ -32,10 +32,12 @@ def require_reviewed_submission(
     """Compare the fixed target, source revision, operation and final body offline.
 
     The credential holder must authenticate workflow/job and load the independent
-    approval itself. It must derive the source SHA from trusted build provenance,
-    extract the target and operation from the actual request, and submit the same
-    immutable bytes without overrides. This comparison cannot establish approval
-    provenance, HTTP request semantics, provider state or rollback eligibility.
+    approval itself. The source SHA comes from the candidate build provenance or
+    the recorded build provenance of the version being restored. The holder must
+    derive the target and operation from the final request and, for rollback,
+    extract the explicit version from its body. It must send those same immutable
+    bytes without overrides. This comparison cannot establish approval provenance,
+    HTTP request semantics, provider state or rollback eligibility.
     """
     target = _TARGETS.get((workflow, job))
     if target is None or worker != target:

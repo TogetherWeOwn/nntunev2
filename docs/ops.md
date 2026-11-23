@@ -1326,8 +1326,10 @@ stay in the old `e2e-staging` group and cannot replace a pending run in
 
 ### Staging Worker custody
 
-Custody and rollback require a separately verified activation. The protected
-staging workflows have these fixed source targets.
+Custody and rollback require a separately verified activation. The current
+staging workflows have no protected operation to restore a named version.
+Keep custody cutover and staging promotion on hold until that operation and
+its readback are verified. The workflows have these fixed source targets.
 
 | Workflow | Job | Worker |
 | --- | --- | --- |
@@ -1354,14 +1356,17 @@ staging workflows have these fixed source targets.
 3. Independently approve the exact submission before the writer uses its
    credential. Tie approval to the trusted workflow revision, protected main
    ref, approved event, job, run/attempt, exact source SHA, account, Worker and
-   operation. The deploy lanes use the main push event.
+   operation. The deploy lanes use the main push event. For rollback, the
+   source SHA identifies the version being restored. The workflow revision
+   identifies the code executing the restore.
    Cover each outgoing provider mutation with its HTTP method, path, query,
    request format and digest of the final body, including generated settings,
    code, routes and triggers. The writer verifies provider-retained settings,
-   loads the independent approval itself, derives the submission from trusted
-   provenance and sends the same checked bytes without overrides. Record hashes
-   and IDs in the authorized evidence record. Keep raw requests and credentials
-   out of evidence. The [offline comparison](../ci/staging_worker_submission.py)
+   loads the independent approval itself, and checks the final request before
+   sending its bytes unchanged. For rollback, derive the version from the final
+   request body and compare it with the approved version. Record hashes and IDs
+   in the authorized evidence record. Keep raw requests and credentials out of
+   evidence. The [offline comparison](../ci/staging_worker_submission.py)
    compares the supplied pins. Caller authentication, single-use enforcement,
    request handling and provider confirmation are separate admission requirements.
 4. Before a staging apply, prove that the same custody and review boundary can
@@ -1371,8 +1376,10 @@ staging workflows have these fixed source targets.
    staging workflow, retain its executed restore result and read back the restored
    serving version, SHA and health. Record partial-failure state before any retry.
    Hold the apply while the protected restore path or its readback is unavailable.
-   Retain existing health, schema and exact-head checks and bound the staging
-   window, including cleanup or expiry on failure and cancellation.
+   Retain existing health, schema and exact-head checks. Keep pipeline-owned
+   readiness and a bounded use window for Containers, Durable Object alarms,
+   scheduled Workers, Stream inputs and database compute, with cleanup or expiry
+   on failure and cancellation.
 
 ## Future Worker deploy lanes: required rollback evidence
 

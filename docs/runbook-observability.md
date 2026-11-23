@@ -69,16 +69,17 @@ attachment state in the private deployment record. Never record secret values.
    remain untouched. If a separately approved Tail attachment is active, its
    authorized executor restores/removes only that attachment under its own
    recorded rollback contract; this lane does not manage producer settings.
-2. Admit the exact recorded version on `nntune-alerts-staging` through the
-   protected staging workflow after the
-   [staging Worker custody](ops.md#staging-worker-custody) checks pass.
+2. The alerts workflow has no protected version restore operation. Keep
+   activation on hold until an exact version restore can be verified through
+   [staging Worker custody](ops.md#staging-worker-custody).
    [Cloudflare rollback limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
    prohibit crossing a DO lifecycle migration. No new migration, Worker deletion,
    namespace deletion or durable-history deletion is an undo step here.
-3. On the first deployment there is no pre-creation version to restore. Keep the
-   consumer unattached, pause the lane and preserve the Worker/namespace. Fix
-   forward through an exact-head reviewed PR; do not invent a rollback ID.
-4. Recheck Cloudflare's active deployment against the selected version and run
+3. If there is no known-good version or the protected restore is unavailable,
+   preserve the Worker and namespace and keep the lane paused. Prepare any
+   fix-forward through an exact-head reviewed PR.
+4. After a verified restore operation is available and has run, recheck
+   Cloudflare's active deployment against the selected version and run
    `python3 .github/scripts/alerts_staging.py verify` using existing scoped
    credentials. Confirm observability remains off and attachment state matches the
    approved record. Record version/namespace IDs and staging API health; require
