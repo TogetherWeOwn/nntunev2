@@ -26,7 +26,7 @@ fn auth(bearer: &str) -> Authorization<'_> {
     }
 }
 
-fn object(version: &str) -> ObjectRef {
+fn object(version: &str, digest: u8) -> ObjectRef {
     let mut id = [0; 16];
     id[6] = 0x40;
     id[8] = 0x80;
@@ -44,7 +44,7 @@ fn object(version: &str) -> ObjectRef {
     };
     ObjectRef {
         media: S3MediaMetadata::from_trusted_context(locator, &context).unwrap(),
-        plaintext_sha256: [1; 32],
+        plaintext_sha256: [digest; 32],
     }
 }
 
@@ -52,7 +52,7 @@ fn object(version: &str) -> ObjectRef {
 struct Fixture {
     committed: Cell<bool>,
     reads: Cell<u32>,
-    mismatch: Cell<bool>,
+    stored: Cell<Option<(&'static str, u8)>>,
 }
 
 impl Fixture {
@@ -71,7 +71,7 @@ impl Fixture {
                 reason: (!committed).then_some(NeedsReview::PositionMismatch),
             },
             owner_id: "owner".into(),
-            object: Some(object("v1")),
+            object: Some(object("v1", 1)),
             retried_revision: committed.then_some(1),
         }
     }
@@ -117,7 +117,8 @@ async fn retry_fences_side_effects_and_recovers_a_lost_response() {
     let verify = async |owner: &str, _: &ObjectRef| {
         assert_eq!(owner, "owner");
         fixture.reads.set(fixture.reads.get() + 1);
-        Ok(object(if fixture.mismatch.get() { "v2" } else { "v1" }))
+        let (version, digest) = fixture.stored.get().unwrap_or(("v1", 1));
+        Ok(object(version, digest))
     };
     let publish = async |expected: &ReviewJob| {
         assert_eq!(expected.view.revision, 1);
@@ -140,15 +141,17 @@ async fn retry_fences_side_effects_and_recovers_a_lost_response() {
     }
     assert_eq!(fixture.reads.get(), 0);
     let authorized = async || run("owner", RETRY_SCOPE, RETRY).await;
-    fixture.mismatch.set(true);
-    assert_eq!(authorized().await.unwrap_err().status, 409);
-    assert!(!fixture.committed.get());
-    fixture.mismatch.set(false);
+    for mismatch in [("v2", 1), ("v1", 2)] {
+        fixture.stored.set(Some(mismatch));
+        assert_eq!(authorized().await.unwrap_err().status, 409);
+        assert!(!fixture.committed.get());
+    }
+    fixture.stored.set(None);
     assert_eq!(authorized().await.unwrap_err().status, 503);
     let view = authorized().await.unwrap();
     assert_eq!(
         to_value(view).unwrap(),
         json!({"job_id":"upload","revision":2,"status":"published"})
     );
-    assert_eq!(fixture.reads.get(), 2);
+    assert_eq!(fixture.reads.get(), 3);
 }
