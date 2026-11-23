@@ -114,6 +114,72 @@ pub async fn stage_validated_winner(
     .await
 }
 
+/// Stage the exact receipt pins and their winner as one unit. The caller must
+/// already hold the authorized upload session fence, acquired before the
+/// digest reservation, and supply trusted custody and retention. Use a bounded
+/// READ COMMITTED transaction and roll it back on cancellation or uncertainty.
+/// Success is staged only. The caller must record the scoped session outcome
+/// and recheck its fences before committing the outer transaction.
+pub async fn stage_completed_candidate(
+    tx: &mut Transaction<'_>,
+    intent: &CandidateIntent,
+    scope: ReadbackScope<'_>,
+    verified: &VerifiedCompletedReadback<'_, '_>,
+    retain_until_unix_seconds: i64,
+) -> Result<(), InventoryAppendError> {
+    let mut staged = tx
+        .transaction()
+        .await
+        .map_err(|_| InventoryAppendError::Indeterminate)?;
+    let result = async {
+        check_retention(&staged, retain_until_unix_seconds).await?;
+        match append_inventory(&mut staged, intent, scope, verified).await {
+            // The winner guard below compares every pin, including when the
+            // append reports a pre-existing inventory row.
+            Ok(()) | Err(InventoryAppendError::Conflict) => {}
+            Err(error) => return Err(error),
+        }
+        stage_validated_winner(
+            &mut staged,
+            intent,
+            scope,
+            verified,
+            retain_until_unix_seconds,
+        )
+        .await?;
+        check_retention(&staged, retain_until_unix_seconds).await
+    }
+    .await;
+    match result {
+        Ok(()) => staged
+            .commit()
+            .await
+            .map_err(|_| InventoryAppendError::Indeterminate),
+        Err(error) => {
+            staged
+                .rollback()
+                .await
+                .map_err(|_| InventoryAppendError::Indeterminate)?;
+            Err(error)
+        }
+    }
+}
+
+async fn check_retention(
+    tx: &Transaction<'_>,
+    retain_until_unix_seconds: i64,
+) -> Result<(), InventoryAppendError> {
+    tx.query_opt(
+        "SELECT 1 WHERE pg_catalog.to_timestamp($1::bigint::double precision)
+            > pg_catalog.clock_timestamp()",
+        &[&retain_until_unix_seconds],
+    )
+    .await
+    .map_err(|_| InventoryAppendError::Indeterminate)?
+    .ok_or(InventoryAppendError::MissingOrFenced)?;
+    Ok(())
+}
+
 async fn write_verified(
     tx: &mut Transaction<'_>,
     intent: &CandidateIntent,

@@ -59,6 +59,7 @@ pub mod play_grant;
 pub mod playback;
 pub mod postgres;
 pub mod preference_rows;
+mod private_listening;
 pub mod random;
 pub mod rate_limit;
 pub mod realtime_presence;

@@ -7,6 +7,10 @@ use crate::session::{
     verify_stored_session, SessionClaims, SessionKeys, SessionRecord, MAX_SESSION_SECS,
 };
 
+#[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
+#[path = "realtime_presence_postgres_tests.rs"]
+mod postgres_tests;
+
 const ONLINE_SECS: u64 = 45;
 const MAX_DEVICES: usize = 32;
 
@@ -44,6 +48,7 @@ pub enum PresenceError {
     Capacity,
 }
 
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 struct Entry {
     order: u64,
     sequence: u64,
@@ -53,6 +58,7 @@ struct Entry {
 
 /// Replay protection is instance-local. A future adapter must preserve the
 /// sequence markers across replacement or invalidate those login sessions.
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct Presence {
     owner: String,
     last_order: u64,

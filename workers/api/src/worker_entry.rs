@@ -72,8 +72,8 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
 }
 
 /// Presence-preserving env lookup: `Some("")` for a present-but-empty
-/// var, `None` only when neither secret nor var exists. Used solely by
-/// the vault-KEK provisioning decision, where a blanked var (what a
+/// var, `None` only when neither secret nor var exists. Used for
+/// provisioning decisions where a blanked var (what a
 /// dashboard "clear this var" action leaves behind) must fail closed
 /// rather than read as absent.
 fn env_string_raw(env: &Env, name: &str) -> Option<String> {
@@ -257,6 +257,9 @@ pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
     )
     .ok()?
     .with_prior_keks(kek_set.priors);
+    if let Some(raw) = env_string_raw(env, "PRIVATE_LISTENING_COHORT") {
+        config.private_listening = Some(crate::private_listening::PrivateListening::parse(&raw)?);
+    }
     // Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
     // armed ONLY by the explicit staging flag, and usable only with the
     // staged QA bearer. Both default off/absent, so production serves the
@@ -1841,6 +1844,7 @@ fn invite_from_row(row: &tokio_postgres::Row) -> Result<InviteRecord, StoreError
         revoked_by: row.try_get("revoked_by").map_err(|_| StoreError)?,
         window_id: row.try_get("window_id").map_err(|_| StoreError)?,
         issuer_email: row.try_get("issuer_email").ok().flatten(),
+        require_active_admin_issuer: false,
     })
 }
 
@@ -2238,6 +2242,16 @@ async fn complete_registration_on(
     // `query_opt`'s rule: exactly one parent row, else the claim fails.
     if parent.len() != 1 {
         return Err(StoreError);
+    }
+    if let Some(record) = invite.filter(|record| record.require_active_admin_issuer) {
+        let issuer = record.issued_by.as_deref().ok_or(StoreError)?;
+        let owner = transaction.query_typed(
+            "SELECT id FROM users WHERE id = $1 AND role = 'admin' AND deleting_at IS NULL FOR SHARE",
+            &[(&issuer, Type::TEXT)],
+        ).await.map_err(|_| StoreError)?;
+        if owner.len() != 1 {
+            return Err(StoreError);
+        }
     }
     let mut claims = vec![
         SingleUseClaim::Challenge {
@@ -4039,6 +4053,38 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 rows[0].try_get("target_id").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_listening_access(
+        &self,
+        user_id: &str,
+        owner_user_id: &str,
+        invite_ids: &[i64],
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::private_listening::ACCESS_SQL,
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&owner_user_id, Type::TEXT),
+                            (&invite_ids, Type::INT8_ARRAY),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.private_listening")
+                    })?;
+                let [row] = rows.as_slice() else {
+                    return Err(StoreError);
+                };
+                row.try_get(0).map_err(|_| StoreError)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -7901,6 +7947,16 @@ fn subsonic_catalogue_error(query: &str) -> nntune_subsonic::HttpResponse {
     )
 }
 
+pub(crate) async fn with_production_snapshot<T>(
+    query: &str,
+    prepare_response: impl Future<Output = T>,
+) -> Result<T, nntune_subsonic::HttpResponse> {
+    let _permit = nntune_subsonic::construction_permit::CONSTRUCTION_SLOT
+        .try_acquire()
+        .ok_or_else(|| subsonic_catalogue_error(query))?;
+    Ok(prepare_response.await)
+}
+
 fn construct_production_subsonic_snapshot(
     artists: &[crate::catalogue::ArtistDbRow],
     releases: &[crate::catalogue::ReleaseDbRow],
@@ -7997,66 +8053,60 @@ pub async fn subsonic_mount(
         .await
         .map_err(|err| core::auth_error_response(&merged, err))
     };
-    let (principal, (artist_rows, release_rows, track_rows)) = match after_auth(auth, |principal| {
+    let response = after_auth(auth, |principal| {
         let store = &store;
         let merged = &merged;
-        async move {
-            let rows = catalogue_for_route(path, || async {
-                store
-                    .subsonic_member_catalogue(principal.user_id())
-                    .await
-                    .map_err(|_| subsonic_catalogue_error(merged))
+        with_production_snapshot(merged, async move {
+            let catalogue = catalogue_for_route(path, || {
+                store.subsonic_member_catalogue(principal.user_id())
             })
-            .await?;
-            Ok((principal, rows))
-        }
+            .await;
+            let (artist_rows, release_rows, track_rows) = match catalogue {
+                Ok(rows) => rows,
+                Err(_) => return respond_document(&subsonic_catalogue_error(merged)),
+            };
+            let (email, role) = match store.subsonic_account(principal.user_id()).await {
+                Ok(Some(pair)) => pair,
+                _ => return respond_document(&subsonic_catalogue_error(merged)),
+            };
+            let is_admin = role == "admin";
+            let identity = Identity {
+                username: principal.username().to_string(),
+                email: email.clone(),
+                is_admin,
+            };
+            let account = UserAccount {
+                email,
+                is_admin,
+                is_manager: role == "manager",
+            };
+            let (artists, albums, songs) = match construct_production_subsonic_snapshot(
+                &artist_rows,
+                &release_rows,
+                &track_rows,
+                merged,
+                PRODUCTION_SNAPSHOT_LIMITS,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(response) => return respond_document(&response),
+            };
+            let app = SubsonicApp::production(core::ProductionStore::new(
+                identity,
+                account,
+                artists,
+                albums,
+                songs,
+                track_rows,
+                now_millis as i64,
+            ));
+            respond_document(&app.handle(method, path, query, body))
+        })
     })
-    .await
-    {
-        Ok(result) => result,
-        Err(response) => return respond_document(&response),
-    };
-    let (email, role) = match store.subsonic_account(principal.user_id()).await {
-        Ok(Some(pair)) => pair,
-        _ => {
-            return respond_document(&core::render_error(
-                &merged,
-                code::GENERIC,
-                "Internal server error.",
-            ))
-        }
-    };
-    let is_admin = role == "admin";
-    let identity = Identity {
-        username: principal.username().to_string(),
-        email: email.clone(),
-        is_admin,
-    };
-    let account = UserAccount {
-        email,
-        is_admin,
-        is_manager: role == "manager",
-    };
-    let (artists, albums, songs) = match construct_production_subsonic_snapshot(
-        &artist_rows,
-        &release_rows,
-        &track_rows,
-        &merged,
-        PRODUCTION_SNAPSHOT_LIMITS,
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(response) => return respond_document(&response),
-    };
-    let app = SubsonicApp::production(core::ProductionStore::new(
-        identity,
-        account,
-        artists,
-        albums,
-        songs,
-        track_rows,
-        now_millis as i64,
-    ));
-    respond_document(&app.handle(method, path, query, body))
+    .await;
+    match response {
+        Ok(response) => response,
+        Err(response) => respond_document(&response),
+    }
 }
 
 // The runtime path has no query; restore it only for list routes that use it.
@@ -8305,7 +8355,21 @@ mod tests {
             .1
             .split_once("\n}\n")
             .expect("production mount must have a closing brace");
-        let (before_store, before_dispatch) = mount
+        let (before_admission, admitted) = mount
+            .split_once("with_production_snapshot(merged, async move {")
+            .expect("mount delegates preparation to the construction guard");
+        assert!(before_admission.contains("after_auth(auth, |principal| {"));
+        assert!(!before_admission.contains("catalogue_for_route("));
+        assert!(!before_admission.contains("subsonic_account("));
+        let (admitted, finish) = admitted
+            .split_once("\n        })\n    })")
+            .expect("construction guard ends inside the authentication callback");
+        assert!(admitted.contains("catalogue_for_route("));
+        assert!(admitted.contains("subsonic_account("));
+        assert!(admitted.ends_with("respond_document(&app.handle(method, path, query, body))"));
+        assert!(!finish.contains("app.handle("));
+
+        let (before_store, before_dispatch) = admitted
             .split_once("ProductionStore::new(")
             .expect("dispatch store");
         assert!(!before_store.contains("app.handle("));
@@ -8314,7 +8378,7 @@ mod tests {
 
         // Compare the entire account-to-store span, not a substring that could be commented out.
         let construction: String = before_store
-            .split_once("\n    let account = UserAccount {")
+            .split_once("let account = UserAccount {")
             .expect("account setup")
             .1
             .split_ascii_whitespace()
@@ -8323,7 +8387,7 @@ mod tests {
             email, is_admin, is_manager: role == "manager",
             };
             let (artists, albums, songs) = match construct_production_subsonic_snapshot(
-                &artist_rows, &release_rows, &track_rows, &merged, PRODUCTION_SNAPSHOT_LIMITS,
+                &artist_rows, &release_rows, &track_rows, merged, PRODUCTION_SNAPSHOT_LIMITS,
             ) {
                 Ok(snapshot) => snapshot,
                 Err(response) => return respond_document(&response),
