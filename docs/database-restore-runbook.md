@@ -64,7 +64,7 @@ Three distinct operations. They are not interchangeable:
 
 | Operation | What it does | Governing rule |
 |---|---|---|
-| **Redeploy rollback** | Re-serves a prior known-good build (web rerun; Worker redeploy/activation). Touches code only. | `docs/ops.md:649-650`: staging rollback is a redeploy, **never a data restore**. `docs/ops.md:702-707`: a Worker rollback restores Worker code only; **rollback is never a data restore**. |
+| **Redeploy rollback** | Restores a recorded prior Worker version. Database contents stay current. | [Staging Worker custody](ops.md#staging-worker-custody) requires a protected exact-version restore and readback. |
 | **Forward fix** | Repairs schema or data with a NEW migration / NEW write on top of current state. History is append-only. | `migrations/README.md:9`: migrations are forward-only — correct a deployed schema with a new migration, never by editing history. Enforced by `migrations_gate.py` `check_drift` (`applied-edited`, `applied-removed`). |
 | **Data restore** | Replaces or re-seeds database contents from a backup, point-in-time (PITR) snapshot, or branch **[UNVERIFIED — confirm in console: exact PlanetScale Postgres restore primitive names and whether restore is in-place, branch-clone, or dump-reload]**. | This runbook only. A restore never rewrites migration history (§4). |
 

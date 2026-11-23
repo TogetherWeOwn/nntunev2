@@ -140,6 +140,6 @@ Do not mark an item live without dated evidence for the exact deployed environme
 - A controlled staging error produces a release-linked event and a Discord alert with a useful log link. Confirm the event's SHA points to the responsible commit/PR. Production verification remains passive.
 - Staging 5xx/error-rate, uncaught-exception, and health/readiness alerts are exercised; confirm health/readiness fires only after the configured two-minute sustained-red condition.
 - The main user-flow synthetic runs every five minutes in staging and alerts on failure. A separately verified production synthetic, if configured, is read-only and passive; none exists in the current repository baseline.
-- The shared promotion action's gradual rollout and error-rate rollback are exercised on staging. Record the pre-release and rollback SHAs and verify recovery; do not infer Worker rollback support from the existing web-only procedure.
+- The shared promotion action's gradual rollout and error-rate rollback are exercised on staging. Record the pre-release and rollback SHAs and verify recovery through [staging Worker custody](ops.md#staging-worker-custody).
 
 The current repository baseline does not satisfy this checklist. Use staging evidence for active tests and production configuration/read-only evidence separately.

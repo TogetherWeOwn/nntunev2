@@ -148,13 +148,14 @@ evidence IDs. Rows marked † are must-pass for a `GO`.
 | 4† | Admin publication | An admin publishes a matched curated FLAC release and entitled accounts see it in the shared catalogue | | |
 | 5† | Play / seek | The shared track plays in the web player and continues after a player seek | | |
 | 6 | Metering and limits | Optional evidence for the separate metering milestone, including accrual, cap and lapse behavior | | |
-| 7† | Rollback | Record the last-good push deploy before promotion, then verify the rerun, restored SHA, health and separate Worker outcomes | | |
+| 7† | Rollback | Record each affected Worker's known-good version, SHA and deployment run, then verify the protected exact-version restore, serving identity and health | | |
 
 Row 6 tracks separate milestone evidence. Record the serving web and API
 SHAs at the start and end of the post-deploy journey. Match both identities
-to the promotion SHA and cite the passing run. For row 7, cite both the
-last-good push deploy and the successful rollback rerun. Follow the
-[staging promotion checklist](ops.md#staging-promotion-checklist).
+to the promotion SHA and cite the passing run. For row 7, cite each affected
+Worker's known-good deployment and executed restore with readback. Mark row 7
+inconclusive while the protected restore or its readback is unavailable. Follow
+[staging Worker custody](ops.md#staging-worker-custody).
 
 ### 2. User-visible failures
 
@@ -273,7 +274,7 @@ VERDICT: <GO | NO-GO | KILL> — <one sentence naming the deciding evidence IDs>
 | 4† | Ingest | Synthetic fixture ingests to a playable library item | PASS | E1, E9 |
 | 5† | Play / seek | The ingested item plays and seeks in the web player | FAIL | E1, E10 |
 | 6 | Metering | Playback/ingest usage is metered against the synthetic account | INCONCLUSIVE | E1, E11 |
-| 7† | Rollback pointer | Last-good staging SHA and its push-triggered `deploy.yml` run with `staging-web` conclusion `success` (not `skipped`) are recorded before promotion; Workers rollback evidence is recorded separately or listed as not verified | PASS | E12, E13 |
+| 7† | Rollback | Known-good deployment, exact-version restore and serving identity and health on each affected Worker are recorded | PASS | E12, E13 |
 
 ### 2. User-visible failures
 
@@ -339,8 +340,8 @@ all prospective costs.
 | E9 | Synthetic fixture ingests to a playable library item | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/9> | 2026-01-15 | PASS | QA, 2026-01-15 |
 | E10 | Player spins indefinitely after seeking past the buffered range | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/10> | 2026-01-15 | FAIL | QA, 2026-01-15 |
 | E11 | Metering assertion was skipped, so no metering result was produced | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/11> | 2026-01-15 | SKIPPED | QA, 2026-01-15 |
-| E12 | Last-good SHA `89abcdef0123` is recorded pre-promotion with a push-triggered `deploy.yml` run whose `staging-web` conclusion is `success` (not `skipped`) | `89abcdef0123` · staging | <https://example.invalid/runs/deploy/12> | 2026-01-13 | PASS | QA, 2026-01-15 |
-| E13 | Workers deployed versions and their rollback targets are recorded separately pre-promotion | `89abcdef0123` · staging | <https://example.invalid/records/workers-rollback/13> | 2026-01-13 | PASS | QA, 2026-01-15 |
+| E12 | Known-good Worker versions, source SHA and successful deployment recorded before promotion | `89abcdef0123` · staging | <https://example.invalid/runs/deploy/12> | 2026-01-13 | PASS | QA, 2026-01-15 |
+| E13 | Protected restore of the recorded versions succeeded and readback matched each serving version and SHA. Health checks passed | `89abcdef0123` · staging | <https://example.invalid/records/workers-rollback/13> | 2026-01-15 | PASS | QA, 2026-01-15 |
 | E14 | Confirmation screen on one locale displays a raw message key instead of localized text | `0123456789ab` · staging | <https://example.invalid/runs/e2e-staging/14> | 2026-01-14 | FAIL | QA, 2026-01-15 |
 | E15 | Storage metrics query reports 40 GB stored in the staging R2 bucket | `0123456789ab` · staging | <https://example.invalid/metrics/r2-storage/15> | 2026-01-15 | PASS | QA, 2026-01-15 |
 | E16 | Previous promoted build has no must-pass `FAIL`, so this is the first consecutive failing promoted build | `89abcdef0123` · staging | <https://example.invalid/records/prior-readout/16> | 2026-01-13 | PASS | QA, 2026-01-15 |

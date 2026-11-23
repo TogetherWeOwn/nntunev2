@@ -1348,11 +1348,13 @@ its readback are verified. The workflows have these fixed source targets.
    Cloudflare [Worker roles](https://developers.cloudflare.com/workers/authorization/workers/)
    can limit Worker names while allowing bindings to same-account resources.
 2. Confirm a single authorized writer before applying anything. Inventory
-   deploy, observation and other credential consumers. A cutover has to remove
-   superseded write access and prove that those paths are unusable. Refuse
+   deploy, observation and other credential consumers. Retire superseded write
+   access, including any repository-scoped deploy credential available outside
+   the authorized writer, and prove those paths are unusable. Refuse
    alternate workflows and jobs, stale refs, reruns and off-CI writers. Keep
    provider observation, staging Access, CI fixtures and production credentials
-   separate. The GitHub environment's branch rule covers refs only.
+   separate. The environment's branch rule restricts refs. Repository-scoped
+   credentials keep their repository scope.
 3. Independently approve the exact submission before the writer uses its
    credential. Tie approval to the trusted workflow revision, protected main
    ref, approved event, job, run/attempt, exact source SHA, account, Worker and
@@ -1436,7 +1438,7 @@ be called accepted:
 | 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (the web checklist above verifies this via `GET /api/build`; a Worker with no such surface cannot claim it). |
 | 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate`, `Verify actual staging migration schema (read-only)` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the MB Worker, retain the successful executed `Deploy mb to staging` step outcome plus `staging-mb` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the ingest Worker, retain successful executed `Hyperdrive cache-disabled gate` and `Deploy ingest to staging` step outcomes plus `staging-ingest` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. A config-skipped `success` does not qualify. Record gate results by name and outcome only. |
 | 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
-| 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |
+| 5 | Rollback action and run | The protected rollback job restored item 4's exact version on that Worker. Record the run/attempt URL, version and source SHA, and the executed rollback job's `success` conclusion. |
 | 6 | Post-rollback health result | The lane's health/readiness check for that Worker, run after item 5, with its result and run URL recorded. Where a deployed-build identity exists, it must match the rollback target; a green rollback run or a bare `ok` response without that identity does not by itself prove the prior version is serving. |
 
 A Worker rollback restores Worker code only. If the deploy being rolled
