@@ -9,15 +9,16 @@ use nntune_ingest::{
     multipart::readback_inventory::ReadbackScope,
 };
 use std::time::Duration;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, GenericClient, NoTls};
 
-const RETAIN_UNTIL: i64 = 2_000_000_000;
-const INVENTORY: &str = "SELECT media_version, page_versions
+pub(super) const RETAIN_UNTIL: i64 = 2_000_000_000;
+pub(super) const INVENTORY: &str = "SELECT media_version, page_versions
     FROM public.storage_digest_inventory_intents WHERE map_id = $1::text::uuid";
-const WINNERS: &str = "SELECT object_id::text FROM public.storage_validated_digest_winners
+pub(super) const WINNERS: &str =
+    "SELECT object_id::text FROM public.storage_validated_digest_winners
     WHERE environment_id = $1::text::uuid AND library_id = $2::text::uuid";
 
-async fn connect() -> Client {
+pub(super) async fn connect() -> Client {
     const SCRATCH: &str = "postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci";
     assert!(
         std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
@@ -34,6 +35,50 @@ async fn connect() -> Client {
     client
 }
 
+pub(super) async fn seed_candidate(
+    observer: &impl GenericClient,
+    fixture: &ReadbackFixture,
+) -> CandidateIntent {
+    let identities = fixture.context.identities;
+    let [_, environment, library, object, generation, provider] = identities.map(hex::encode);
+    let map_id = fixture.map_id;
+    let map = hex::encode(map_id);
+    let intent = CandidateIntent {
+        identities: identities[1..].try_into().unwrap(),
+        plaintext_len: fixture.context.plaintext_len,
+        map_id,
+        header: fixture.context.header,
+        reservation_generation: 1,
+    };
+    let length = intent.plaintext_len;
+    let sealed = nntune_core::media::ciphertext_size(length).unwrap();
+    let header = hex::encode(intent.header);
+    let digest = hex::encode(fixture.origin.plaintext_sha256());
+    let hashes: Vec<_> = fixture
+        .origin
+        .candidate_page_hashes(&intent.identities, length, &map_id, &intent.header)
+        .unwrap()
+        .iter()
+        .map(|hash| hash.to_vec())
+        .collect();
+    observer.batch_execute(&format!(
+        "INSERT INTO public.storage_object_intents VALUES ('{object}', '{generation}', '{environment}',
+             '{library}', '{provider}', {length}, {sealed}, decode('{header}', 'hex'));
+         INSERT INTO public.storage_plaintext_digest_claim_intents VALUES ('{object}', '{environment}',
+             '{library}', {length}, decode('{digest}', 'hex'));
+         SELECT public.reserve_storage_digest('{object}', 3600);"
+    )).await.unwrap();
+    observer
+        .query_one(
+            "SELECT public.store_storage_digest_candidate($1::text::uuid, $2::text::uuid,
+            $3::text::uuid, $4::text::uuid, 1, $5)",
+            &[&environment, &library, &object, &map, &hashes],
+        )
+        .await
+        .unwrap();
+    intent
+}
+
 #[tokio::test]
 #[ignore = "requires a migrated disposable PostgreSQL database"]
 async fn postgres_stages_completed_candidate_atomically() {
@@ -41,7 +86,7 @@ async fn postgres_stages_completed_candidate_atomically() {
     let mut writer = connect().await;
     let mut contender = connect().await;
     let identities = [0x70, 0x71, 0x72, 0x73, 0x74, 5].map(id);
-    let [root, environment, library, object, generation, provider] = identities.map(hex::encode);
+    let [root, environment, library, object, generation, _] = identities.map(hex::encode);
     let map_id = id(0x75);
     let map = hex::encode(map_id);
     let key = format!("media/{object}/{generation}");
@@ -56,41 +101,14 @@ async fn postgres_stages_completed_candidate_atomically() {
         })
         .await
         .unwrap();
-    let intent = CandidateIntent {
-        identities: identities[1..].try_into().unwrap(),
-        plaintext_len: fixture.context.plaintext_len,
-        map_id,
-        header: fixture.context.header,
-        reservation_generation: 1,
-    };
-    let length = intent.plaintext_len;
-    let sealed = inventory.geometry().sealed_len();
-    let header = hex::encode(intent.header);
-    let digest = hex::encode(fixture.origin.plaintext_sha256());
-    let hashes: Vec<_> = fixture
-        .origin
-        .candidate_page_hashes(&intent.identities, length, &map_id, &intent.header)
-        .unwrap()
-        .iter()
-        .map(|hash| hash.to_vec())
-        .collect();
-    observer.batch_execute(&format!(
-        "INSERT INTO public.storage_environments VALUES ('{environment}');
-         INSERT INTO public.storage_library_namespaces VALUES ('{library}', '{environment}', NULL);
-         INSERT INTO public.storage_object_intents VALUES ('{object}', '{generation}', '{environment}',
-             '{library}', '{provider}', {length}, {sealed}, decode('{header}', 'hex'));
-         INSERT INTO public.storage_plaintext_digest_claim_intents VALUES ('{object}', '{environment}',
-             '{library}', {length}, decode('{digest}', 'hex'));
-         SELECT public.reserve_storage_digest('{object}', 3600);"
-    )).await.unwrap();
     observer
-        .query_one(
-            "SELECT public.store_storage_digest_candidate($1::text::uuid, $2::text::uuid,
-            $3::text::uuid, $4::text::uuid, 1, $5)",
-            &[&environment, &library, &object, &map, &hashes],
-        )
+        .batch_execute(&format!(
+        "INSERT INTO public.storage_environments VALUES ('{environment}');
+         INSERT INTO public.storage_library_namespaces VALUES ('{library}', '{environment}', NULL);"
+    ))
         .await
         .unwrap();
+    let intent = seed_candidate(&observer, &fixture).await;
 
     let stage = async |tx: &mut tokio_postgres::Transaction<'_>| {
         stage_completed_candidate(tx, &intent, SCOPE, &verified, RETAIN_UNTIL).await
