@@ -33,7 +33,8 @@ jobs:
           rustup default stable
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cargo-llvm-cov@0.6.21
+          # Cargo's current build layout puts test executables under debug/build.
+          tool: cargo-llvm-cov@0.9.1
 
       - name: Coverage for root workspace
         run: cargo llvm-cov --workspace --lcov --output-path coverage-root.lcov
