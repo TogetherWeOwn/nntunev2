@@ -1,9 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { captureAuthFence } from '#lib/auth-fence.js';
 import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
 import { load } from './+page';
+import { useSessionFixture } from './page.fixture.js';
 import type { PageData } from './$types';
 
+useSessionFixture();
+
 afterEach(() => vi.unstubAllGlobals());
+
+it('withholds billing data when no account scope can be captured', async () => {
+	vi.mocked(captureAuthFence).mockResolvedValueOnce(undefined);
+	const fetch = vi.fn<typeof globalThis.fetch>();
+	await expect(load({ fetch } as never)).resolves.toMatchObject({
+		subscription: null, usage: null, hadFetchError: true
+	});
+	expect(fetch).not.toHaveBeenCalled();
+});
 
 function mockFetch(
 	routes: Record<string, { status: number; body: unknown; headers?: HeadersInit }>

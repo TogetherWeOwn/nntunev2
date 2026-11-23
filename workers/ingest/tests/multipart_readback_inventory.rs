@@ -24,6 +24,9 @@ use nntune_ingest::{
 use sha2::{Digest, Sha256};
 use std::io;
 
+#[path = "multipart_readback_inventory/publisher.rs"]
+mod publisher;
+
 const BUCKET: &str = "test-bucket";
 const KEY: &str = "media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd";
 const SHARED_VERSION: &str = "Opaque+%2F/=";
@@ -66,6 +69,7 @@ impl ReadbackBody for MemoryBody<'_> {
 }
 
 struct ReadbackFixture {
+    map_id: [u8; 16],
     origin: OriginManifest,
     context: EnvelopeContext,
     record: [u8; 230],
@@ -76,10 +80,13 @@ struct ReadbackFixture {
 
 impl ReadbackFixture {
     fn new(plaintext: &[u8]) -> Self {
-        let identities = [0, 1, 2, 0xab, 0xcd, 5].map(id);
+        Self::in_scope(plaintext, [0, 1, 2, 0xab, 0xcd, 5].map(id), MAP_ID, KEY)
+    }
+
+    fn in_scope(plaintext: &[u8], identities: [[u8; 16]; 6], map_id: [u8; 16], key: &str) -> Self {
         let plaintext_len = plaintext.len() as u64;
         let mut enrollment =
-            DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), MAP_ID)
+            DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), map_id)
                 .unwrap();
         let context = EnvelopeContext {
             identities,
@@ -90,7 +97,7 @@ impl ReadbackFixture {
         let plan = Plan::new(
             UploadTarget {
                 bucket: BUCKET,
-                key: KEY,
+                key,
                 upload_id: "synthetic",
             },
             enrollment.header(),
@@ -129,7 +136,7 @@ impl ReadbackFixture {
             .collect();
         let composite = STANDARD.encode(composite.finalize());
         let body = format!(
-            "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key>\
+            "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{key}</Key>\
              <ChecksumSHA256>{composite}-{}</ChecksumSHA256></CompleteMultipartUploadResult>",
             parts.len()
         );
@@ -142,6 +149,7 @@ impl ReadbackFixture {
         let completion = plan.complete(uploads).unwrap();
         let media = completion.verify_versioned_reply(&context, reply).unwrap();
         Self {
+            map_id,
             origin: enrollment.finish().unwrap(),
             context,
             record,
@@ -165,8 +173,15 @@ impl ReadbackFixture {
             version_headers: &[version],
         };
         let page = &self.page_bytes[index as usize];
-        let put =
-            SidecarPut::new(BUCKET, &self.context, &self.origin, MAP_ID, index, page).unwrap();
+        let put = SidecarPut::new(
+            BUCKET,
+            &self.context,
+            &self.origin,
+            self.map_id,
+            index,
+            page,
+        )
+        .unwrap();
         put.verify_reply(reply).unwrap()
     }
 
@@ -178,7 +193,7 @@ impl ReadbackFixture {
             BUCKET,
             CONFIGURATION,
             &self.context,
-            MAP_ID,
+            self.map_id,
             &self.origin,
             &self.media,
             sidecars,
@@ -196,10 +211,19 @@ impl ReadbackFixture {
     }
 
     fn response(&self, pin: ReadbackPin<'_>) -> BucketReadbackResponse<MemoryBody<'_>> {
-        let (key, version, bytes) = match pin.object_key {
-            KEY => (KEY, SHARED_VERSION, &self.media_bytes),
-            PAGE_KEY => (PAGE_KEY, FINAL_VERSION, &self.page_bytes[0]),
-            PAGE_ONE_KEY => (PAGE_ONE_KEY, PAGE_ONE_VERSION, &self.page_bytes[1]),
+        self.response_with_keys(pin, KEY, PAGE_KEY)
+    }
+
+    fn response_with_keys(
+        &self,
+        pin: ReadbackPin<'_>,
+        media_key: &str,
+        first_page_key: &str,
+    ) -> BucketReadbackResponse<MemoryBody<'_>> {
+        let (version, bytes) = match pin.object_key {
+            key if key == media_key => (SHARED_VERSION, &self.media_bytes),
+            key if key == first_page_key => (FINAL_VERSION, &self.page_bytes[0]),
+            PAGE_ONE_KEY => (PAGE_ONE_VERSION, &self.page_bytes[1]),
             _ => panic!("unexpected readback key"),
         };
         assert_eq!(pin.configuration, CONFIGURATION);
@@ -208,7 +232,7 @@ impl ReadbackFixture {
             bucket: BUCKET.into(),
             response: ReadbackResponse {
                 configuration: CONFIGURATION,
-                object_key: key.into(),
+                object_key: pin.object_key.into(),
                 version: Some(version.into()),
                 status: 200,
                 content_length: Some(bytes.len() as u64),
@@ -620,6 +644,57 @@ async fn postgres_append_stages_only_exact_live_candidate_inventory() {
         .await
         .unwrap();
     assert_eq!(stage(&mut tx).await, Err(MissingOrFenced));
+    tx.rollback().await.unwrap();
+
+    let mut tx = writer.transaction().await.unwrap();
+    // Count candidate rows before insertion. Sequence increments survive
+    // savepoint rollback, so an empty winner table alone cannot mask an attempt.
+    tx.batch_execute(
+        "CREATE TEMP SEQUENCE winner_row_insert_attempts;
+         CREATE FUNCTION pg_temp.test_count_winner_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+            PERFORM nextval('pg_temp.winner_row_insert_attempts');
+            RETURN NEW;
+         END $$;
+         CREATE TRIGGER count_winner_insert BEFORE INSERT ON public.storage_validated_digest_winners
+         FOR EACH ROW EXECUTE FUNCTION pg_temp.test_count_winner_insert();",
+    )
+    .await
+    .unwrap();
+    let attempts = async |tx: &Transaction<'_>| {
+        tx.query_one(
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END
+             FROM pg_temp.winner_row_insert_attempts",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0)
+    };
+
+    let mut expired = tx.transaction().await.unwrap();
+    assert_eq!(
+        expired
+            .execute(
+                "UPDATE public.storage_digest_reservations SET expires_at = '-infinity'
+                 WHERE object_id = $1::text::uuid AND generation = $2",
+                &[&ids[2], &intent.reservation_generation],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(stage(&mut expired).await, Err(MissingOrFenced));
+    assert_eq!(attempts(&expired).await, 0, "already-expired reservation");
+    assert!(expired.query_opt(winner, key).await.unwrap().is_none());
+    expired.rollback().await.unwrap();
+
+    // Restoring the same reservation makes the otherwise identical input valid.
+    let mut live = tx.transaction().await.unwrap();
+    stage(&mut live).await.unwrap();
+    live.rollback().await.unwrap();
+    assert_eq!(attempts(&tx).await, 1, "rolled-back live insert");
+    assert!(tx.query_opt(winner, key).await.unwrap().is_none());
     tx.rollback().await.unwrap();
 
     let mut tx = writer.transaction().await.unwrap();

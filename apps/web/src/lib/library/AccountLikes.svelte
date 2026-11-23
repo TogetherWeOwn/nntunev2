@@ -3,14 +3,15 @@
 	import { onMount } from 'svelte';
 	import { ApiClient, ApiError } from '../api/client.js';
 	import { captureAuthFence, type AccountSession } from '../auth-fence.js';
-	import { browserStorage, verifiedFavoritesKey } from './cache.js';
+	import { verifiedFavoritesKey, type SnapshotStorage } from './cache.js';
 	import { importDeviceLikes, loadLikes, type LibraryLike } from './likes.js';
 	import { verifyLibrarySession } from './session-verification.js';
 
-	let { titles, libraryBinding, deviceScope, deviceCount, readDeviceIds, retireDeviceIds, onSessionChanged, onVerificationSuspended }: {
+	let { titles, libraryBinding, deviceScope, storageScope, deviceCount, readDeviceIds, retireDeviceIds, onSessionChanged, onVerificationSuspended }: {
 		titles: ReadonlyMap<string, string>;
 		libraryBinding?: string;
 		deviceScope?: string;
+		storageScope: SnapshotStorage | null;
 		deviceCount: number;
 		readDeviceIds: () => string[];
 		retireDeviceIds: (key: string, ids: readonly string[], verify: () => Promise<boolean>, run: AccountSession['run']) => Promise<boolean>;
@@ -82,7 +83,7 @@
 		const binding = shelfBinding, owner = shelfSession, key = deviceScope;
 		if (phase !== 'ready' || importing || !canImport || !binding || !owner || !key) return;
 		const signal = begin();
-		const session = browserStorage('session');
+		const session = storageScope;
 		const isCurrent = () => !signal.aborted && owner.isCurrent() && libraryBinding === binding &&
 			deviceScope === key && verifiedFavoritesKey(session, binding) === key;
 		const run: AccountSession['run'] = (work) => owner.run(() => isCurrent() ? work() : undefined);
