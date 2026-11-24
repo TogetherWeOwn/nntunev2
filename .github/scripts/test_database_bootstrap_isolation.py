@@ -457,16 +457,36 @@ def prove_setup_caller(cluster, *, interrupt, reader):
             {"ca_pem": (cluster.directory / "client" / "other.crt").read_text()},
         ):
             run(caller_env(cluster, roles, **changes) | route, "refused", 1)
+        reader_identifier = f'"{reader}"'
         cluster.ok("grant the pending reader an unrelated SET-only membership",
-                   f"GRANT {STAGING} TO {reader} WITH SET TRUE, INHERIT FALSE;")
+                   f"GRANT {STAGING} TO {reader_identifier} WITH SET TRUE, INHERIT FALSE;")
         run(env, "refused", 1)
-        cluster.ok("restore the reader to its pending state", f"REVOKE {STAGING} FROM {reader};")
-        cluster.ok("raise the pending reader's connection limit", f"ALTER ROLE {reader} CONNECTION LIMIT 2;")
+        cluster.ok("restore the reader to its pending state", f"REVOKE {STAGING} FROM {reader_identifier};")
+        cluster.ok("raise the pending reader's connection limit",
+                   f"ALTER ROLE {reader_identifier} CONNECTION LIMIT 2;")
         run(env, "refused", 1)
-        cluster.ok("restore the one-connection reader limit", f"ALTER ROLE {reader} CONNECTION LIMIT 1;")
-        cluster.ok("remove the pending reader's expiry", f"ALTER ROLE {reader} VALID UNTIL 'infinity';")
+        cluster.ok("restore the one-connection reader limit", f"ALTER ROLE {reader_identifier} CONNECTION LIMIT 1;")
+        password = secrets.token_hex(24)
+        cluster.ok("enable a synthetic reader session",
+                   f"ALTER ROLE {reader_identifier} PASSWORD '{password}' VALID UNTIL 'infinity';")
         run(env, "refused", 1)
-        cluster.ok("restore the expired reader", f"ALTER ROLE {reader} VALID UNTIL 'epoch';")
+        tls = setup.tls_environment(cluster.directory, setup.setup_plan(raw), MAINTENANCE, reader, password)
+        del tls["PGOPTIONS"]
+        with subprocess.Popen(["/usr/bin/psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"], env=tls,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as holder:
+            try:
+                holder.stdin.write(f"SELECT session_user = '{reader}';\n".encode())
+                holder.stdin.flush()
+                ready, _, _ = select.select([holder.stdout], [], [], 3)
+                require(ready and holder.stdout.readline() == b"t\n", "hold an authenticated reader session")
+                cluster.ok("restore the expired, passwordless reader while its session is open",
+                           f"ALTER ROLE {reader_identifier} PASSWORD NULL VALID UNTIL 'epoch';")
+                run(env, "refused", 1)
+                holder.communicate(timeout=3)
+                require(holder.returncode == 0, "close the held reader session")
+            finally:
+                if holder.poll() is None:
+                    holder.kill()
         cluster.ok("remove the canonical role's database creation privilege", f"ALTER ROLE {CREATOR} NOCREATEDB;")
         run(env, "refused", 1)
         cluster.ok("restore the canonical role's database creation privilege", f"ALTER ROLE {CREATOR} CREATEDB;")
