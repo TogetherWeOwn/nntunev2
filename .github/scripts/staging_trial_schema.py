@@ -65,8 +65,10 @@ BEGIN
        OR pg_catalog.has_schema_privilege('{reader}', 'public', 'CREATE')
        OR NOT pg_catalog.has_schema_privilege('{writer}', 'public', 'USAGE')
        OR NOT pg_catalog.has_schema_privilege('{reader}', 'public', 'USAGE')
-       OR pg_catalog.pg_has_role('{reader}', '{writer}', 'MEMBER') THEN
-        RAISE EXCEPTION 'private trial roles must be separate and have schema usage without create';
+       OR pg_catalog.pg_has_role('{reader}', '{writer}', 'MEMBER')
+       OR pg_catalog.pg_has_role('{writer}', current_user, 'MEMBER')
+       OR pg_catalog.pg_has_role('{reader}', current_user, 'MEMBER') THEN
+        RAISE EXCEPTION 'private trial roles must have schema usage and no writer or owner escalation';
     END IF;
     IF {exists} = 4 AND pg_catalog.obj_description(pg_catalog.to_regclass('{admission}'), 'pg_class') = '{receipt}' THEN
         RAISE EXCEPTION '{migrator.ALREADY_SAME}';

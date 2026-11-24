@@ -25,7 +25,7 @@ NO_SCHEMA = "SELECT " + " AND ".join(
 
 
 class TrialSchemaTests(unittest.TestCase):
-    def dispatch(self, db, summary, mode="single", data_root=ROOT, writer=WRITER):
+    def dispatch(self, db, summary, mode="single", data_root=ROOT, writer=WRITER, *, connects=True):
         env = {
             staging_apply.SECRET_ENV: f"postgresql://fixture:synthetic@127.0.0.1/{DATABASE}",
             "TRIAL_WRITER_ROLE": writer, "TRIAL_READER_ROLE": READER,
@@ -40,7 +40,7 @@ class TrialSchemaTests(unittest.TestCase):
                 "apply", "--file", "private-trial", "--mode", mode, "--expect-database", DATABASE,
                 "--trusted-root", str(ROOT), "--data-root", str(data_root), "--applied-by", "fixture",
             ])
-        if mode == "single" and data_root == ROOT:
+        if connects:
             connect.assert_called_once_with(env[staging_apply.SECRET_ENV] + "?sslmode=verify-full")
         else:
             connect.assert_not_called()
@@ -55,9 +55,29 @@ class TrialSchemaTests(unittest.TestCase):
                 candidate.write_bytes((ROOT / name).read_bytes())
             with (data_root / trial.SCHEMAS[-1]).open("ab") as candidate:
                 candidate.write(b"\n-- changed source\n")
-            code, error = self.dispatch({}, data_root / "summary.md", data_root=data_root)
+            code, error = self.dispatch({}, data_root / "summary.md", data_root=data_root, connects=False)
             self.assertEqual(code, 1)
             self.assertIn("differs from protected main", error)
+
+    def assert_refused_roles(self, db, summary):
+        for writer in (READER, "public", 'invalid"writer'):
+            with self.subTest(writer=writer):
+                code, error = self.dispatch(db, summary, writer=writer, connects=False)
+                self.assertEqual(code, 1)
+                self.assertIn("configure distinct private trial", error)
+        for grant, revoke in (
+            (f'GRANT "{WRITER}" TO "{READER}" WITH INHERIT FALSE;', f'REVOKE "{WRITER}" FROM "{READER}";'),
+            (f'GRANT postgres TO "{WRITER}" WITH INHERIT FALSE;', f'REVOKE postgres FROM "{WRITER}";'),
+            (f'GRANT CREATE ON SCHEMA public TO "{WRITER}";', f'REVOKE CREATE ON SCHEMA public FROM "{WRITER}";'),
+            ('REVOKE USAGE ON SCHEMA public FROM PUBLIC;', 'GRANT USAGE ON SCHEMA public TO PUBLIC;'),
+        ):
+            with self.subTest(grant=grant):
+                run_psql(db, grant)
+                code, error = self.dispatch(db, summary)
+                self.assertEqual(code, 1)
+                self.assertIn("psql failed", error)
+                self.assertEqual(run_psql(db, NO_SCHEMA), "t")
+                run_psql(db, revoke)
 
     def assert_access(self, db):
         for table in trial.TABLES.split(", "):
@@ -91,7 +111,7 @@ class TrialSchemaTests(unittest.TestCase):
                     continue
                 filename = entry["file"]
                 if filename == trial.BASELINE:
-                    code, error = self.dispatch(db, summary, mode="all-pending")
+                    code, error = self.dispatch(db, summary, mode="all-pending", connects=False)
                     self.assertEqual(code, 1)
                     self.assertIn("single protected staging apply", error)
                     code, error = self.dispatch(db, summary)
@@ -108,6 +128,7 @@ class TrialSchemaTests(unittest.TestCase):
             history = "SELECT jsonb_agg(to_jsonb(m) ORDER BY file) FROM public.schema_migrations m;"
             before = run_psql(db, history)
             self.assertEqual(run_psql(db, NO_SCHEMA), "t")
+            self.assert_refused_roles(db, summary)
 
             run_psql(db, f"""
                 ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO "{OTHER}", PUBLIC;
@@ -161,9 +182,12 @@ class TrialSchemaTests(unittest.TestCase):
             self.assertIn("Private trial schema already installed", summary.read_text())
             self.assertEqual(run_psql(db, version), original_oid)
             self.assertEqual(run_psql(db, history), before)
+            receipt = "SELECT obj_description('public.private_library_admissions'::regclass, 'pg_class');"
+            original_receipt = run_psql(db, receipt)
             code, error = self.dispatch(db, summary, writer=OTHER)
             self.assertEqual(code, 1)
             self.assertIn("psql failed", error)
+            self.assertEqual(run_psql(db, receipt), original_receipt)
             self.assert_access(db)
 
 
