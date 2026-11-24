@@ -14,7 +14,7 @@ use crate::queue::validate_mbid;
 const MAX_RELEASE_CANDIDATES: usize = 25;
 const MAX_LABEL_BYTES: usize = 4096;
 // The mirror truncates listings at this length.
-const RECORDINGS_LIMIT: usize = 1000;
+pub(crate) const RECORDINGS_LIMIT: usize = 1000;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Fixed reasons suitable for a future needs_review outcome.

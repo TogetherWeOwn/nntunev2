@@ -13,6 +13,8 @@ use crate::{
     track_writers::track_row_for,
 };
 
+pub mod completed_upload;
+
 pub struct ExpectedFile<'a> {
     pub numbering: FileNumbering<'a>,
     pub object: &'a ObjectRef,
@@ -29,6 +31,7 @@ pub struct AuthorizedRelease<'a> {
 
 /// Injected by the encrypted completion caller after authoritative commit or
 /// fenced reconciliation. Readback proves the exact bytes are valid FLAC.
+#[derive(Clone, Copy)]
 pub struct CommittedFlac<'a> {
     pub verified: &'a VerifiedCompletedReadback<'a, 'a>,
     pub receipt: PublishedObject<'a>,
