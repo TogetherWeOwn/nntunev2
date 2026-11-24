@@ -24,3 +24,11 @@ pub struct CommittedOutcome {
     pub media_version: String,
     pub page_versions: Vec<String>,
 }
+
+pub(crate) fn uuid_text(id: [u8; 16]) -> String {
+    let mut id = hex::encode(id);
+    for boundary in [20, 16, 12, 8] {
+        id.insert(boundary, '-');
+    }
+    id
+}
