@@ -113,13 +113,14 @@ pub(crate) async fn deliver(
         [0; 32],
         1,
         60,
-        false,
+        true,
         false,
         None,
     ) else {
         return Response::error("webhook control config failed", 500);
     };
-    let cfg = cfg.with_stripe(Some("synthetic".into()), Some("webhook-ack-fixture".into()));
+    let mut cfg = cfg.with_stripe(Some("synthetic".into()), Some("webhook-ack-fixture".into()));
+    cfg.paid_invite_billing = true;
     let expired = std::rc::Rc::new(Cell::new(false));
     let trace = if lose_ack {
         "worker-webhook-ack-test"

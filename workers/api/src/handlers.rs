@@ -257,6 +257,7 @@ pub struct Config {
     /// fails closed per-request (generic 500) before signature verification
     /// — an unverifiable webhook is never parsed, never acked.
     pub stripe_webhook_secret: Option<String>,
+    pub(crate) paid_invite_billing: bool,
     /// Play-grant HMAC secret shared with the stream Worker
     /// (`PLAY_GRANT_SECRET`, [`crate::play_grant`]): the RAW string
     /// bytes, never base64-decoded — the stream side keys its verifier
@@ -345,6 +346,7 @@ impl Config {
             subsonic_index: None,
             stripe_secret_key: None,
             stripe_webhook_secret: None,
+            paid_invite_billing: false,
             play_grant_secret: None,
             meter_sink_secret: None,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
@@ -421,6 +423,10 @@ impl Config {
         self.stripe_secret_key = secret_key;
         self.stripe_webhook_secret = webhook_secret;
         self
+    }
+
+    pub(crate) fn paid_billing_enabled(&self) -> bool {
+        self.paid_invite_billing && self.invites_required && self.private_listening.is_none()
     }
 
     /// Provision the play-grant HMAC secret (raw bytes of the
@@ -1503,6 +1509,14 @@ pub trait Store {
         _outcome: &crate::billing_reconcile::ReconcileOutcome,
     ) -> impl Future<Output = Result<(), StoreError>> {
         async move { Err(StoreError) }
+    }
+    /// Opt-in writer for the exact-target fold.
+    fn store_paid_reconcile_outcome(
+        &self,
+        _user_id: &str,
+        _outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> impl Future<Output = Result<(), StoreError>> {
+        async { Err(StoreError) }
     }
     /// The user's unresolved single-flight checkout operation, if any (at
     /// most one: `uq_billing_operations_single_flight`). Default `Ok(None)`
@@ -7356,7 +7370,7 @@ where
 /// only confirmed issuer/invitee observations. Keep only the comparison and
 /// internal references in the private, idempotent audit; never gate access or
 /// add this work to signup. No evidence lookup runs here today.
-async fn reconcile_remote_subscription<S, M, D, N>(
+pub(crate) async fn reconcile_remote_subscription<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     user_id: &str,
     subscription_id: &str,
@@ -7372,10 +7386,9 @@ where
         .retrieve_subscription(subscription_id.to_string())
         .await
         .map_err(|_| ())?;
+    let exact = ctx.cfg.paid_billing_enabled();
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-    let exact = ctx.store.webhook_ack_control();
-    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
-    let exact = false;
+    let exact = exact || ctx.store.webhook_ack_control();
     if subscription.id != subscription_id {
         return Err(());
     }
@@ -7384,6 +7397,13 @@ where
         .load_reconcile_input(user_id, exact.then_some(subscription_id))
         .await
         .map_err(|_| ())?;
+    if ctx.cfg.paid_billing_enabled()
+        && (subscription.livemode
+            || input.stripe_customer_id.is_none()
+            || input.stripe_customer_id != subscription.customer)
+    {
+        return Err(());
+    }
     let listed = ctx
         .stripe
         .list_invoices(crate::stripe::ListInvoices {
@@ -7399,6 +7419,7 @@ where
         .map_err(|_| ())?;
     let mut invoices = Vec::with_capacity(listed.len());
     for mut invoice in listed {
+        let mut pages = 0;
         loop {
             let has_more = invoice
                 .lines
@@ -7413,11 +7434,23 @@ where
                 .as_ref()
                 .and_then(|lines| lines.data.last())
                 .map(|line| line.id.clone());
+            pages += 1;
+            if pages > 10 {
+                return Err(());
+            }
             let page = ctx
                 .stripe
-                .list_invoice_lines(invoice.id.clone(), cursor, 100)
+                .list_invoice_lines(invoice.id.clone(), cursor.clone(), 100)
                 .await
                 .map_err(|_| ())?;
+            if page.has_more
+                && page
+                    .data
+                    .last()
+                    .is_none_or(|line| Some(line.id.as_str()) == cursor.as_deref())
+            {
+                return Err(());
+            }
             match invoice.lines.as_mut() {
                 Some(lines) => {
                     lines.data.extend(page.data);
@@ -7444,10 +7477,14 @@ where
     } else {
         crate::billing_reconcile::reconcile_subscription(&input, &remote, now)
     };
-    ctx.store
-        .store_reconcile_outcome(user_id, &outcome)
-        .await
-        .map_err(|_| ())?;
+    if ctx.cfg.paid_billing_enabled() {
+        ctx.store
+            .store_paid_reconcile_outcome(user_id, &outcome)
+            .await
+    } else {
+        ctx.store.store_reconcile_outcome(user_id, &outcome).await
+    }
+    .map_err(|_| ())?;
     Ok(outcome)
 }
 
@@ -7472,13 +7509,17 @@ where
         .retrieve_checkout_session(session_id.to_string())
         .await
         .map_err(|_| ())?;
+    let paid_dispatch = ctx.cfg.paid_billing_enabled();
+    if paid_dispatch && (session.livemode || session.id != session_id) {
+        return Err(());
+    }
     if session.status.as_deref() != Some("complete")
         || session.payment_status.as_deref() != Some("paid")
     {
         return Ok(());
     }
     let Some(subscription_id) = session.subscription.clone() else {
-        return Ok(());
+        return if paid_dispatch { Err(()) } else { Ok(()) };
     };
     let mut user_id: Option<String> = None;
     let mut op: Option<crate::billing_reconcile::StoredCheckoutOp> = None;
@@ -7490,6 +7531,24 @@ where
             }
             Ok(None) => {}
             Err(_) => return Err(()),
+        }
+    }
+    if paid_dispatch {
+        let bound_op = op.as_ref().ok_or(())?;
+        let customer = session.customer.as_deref().ok_or(())?;
+        if bound_op
+            .session_id
+            .as_deref()
+            .is_some_and(|id| id != session_id)
+            || ctx
+                .store
+                .user_for_stripe_customer(customer)
+                .await
+                .map_err(|_| ())?
+                .as_deref()
+                != Some(bound_op.user_id.as_str())
+        {
+            return Err(());
         }
     }
     if user_id.is_none() {
@@ -7564,6 +7623,11 @@ where
         Ok(event) => event,
         Err(_) => return invalid_request(),
     };
+    if ctx.cfg.paid_billing_enabled()
+        && (event.livemode || event.event_type != "checkout.session.completed")
+    {
+        return json_response(200, serde_json::json!({"ok": true}));
+    }
     // First claim wins. Duplicates of a verified non-checkout event (or a
     // live-mode event) still ack 200 with no state change — those paths
     // never write state, so nothing can be lost. A duplicate
@@ -8396,28 +8460,8 @@ fn options_preflight_served(path: &str) -> bool {
         })
 }
 
-// --- Stripe billing: webhook + single-flight checkout -------------------------------
-//
-// Checkout shape only, test mode only (ADR 0005). The webhook route is a
-// signature carve-out: `Stripe-Signature` HMAC-SHA256 over the raw body
-// is the authentication, so no session cookie, bearer, or Access gate
-// applies here — and the scope map keeps the path `Deny` so bearer
-// credentials can never enter it. Staging Cloudflare Access bypass is
-// the wiring card's job, not this slice's. There is deliberately no
-// user-facing checkout/portal route here either: `ensure_checkout_session`
-// is the serialized purchase attempt those routes will call.
-//
-// Both the webhook and the inline/API paths reconcile through ONE
-// function (`reconcile_remote_subscription` below, pure core in
-// `billing_reconcile::reconcile_subscription`), so the same remote state
-// always lands the same stored state whichever path runs first
-// (webhook-before-response and lost-response races included).
-
-/// Stripe webhook route. Unauthenticated by design (the signature is the
-/// auth); stays out of `is_known_path` so browser preflight stays 404 and
-/// the served log line keeps the `unknown` template like other unlisted
-/// paths. Stripe retries non-2xx, so every failure here is either a 400
-/// (sender's fault: fix and resend) or a 500 (ours: retried).
+/// Only mounted when the paid invite gate is open. The raw-body Stripe
+/// signature authenticates this path; it is excluded from browser CORS.
 pub const BILLING_WEBHOOK_PATH: &str = "/v1/billing/webhook";
 
 /// Audit action for a fail-closed reconcile pass: observed state stored,
@@ -8670,7 +8714,9 @@ where
         // bypasses the bearer gate above like the cookie/session paths do
         // — and the scope map keeps the path `Deny` so bearer credentials
         // can never enter it. Deliberately outside `is_known_path`.
-        ("POST", BILLING_WEBHOOK_PATH) => billing_webhook(ctx, req).await,
+        ("POST", BILLING_WEBHOOK_PATH) if ctx.cfg.paid_billing_enabled() => {
+            Box::pin(billing_webhook(ctx, req)).await
+        }
         // Catalogue slice 1: session-or-bearer reads over the
         // ingest ledger plus the MusicBrainz mirror.
         ("GET", "/v1/library") => catalogue_library(ctx, req, bearer_user.as_deref()).await,
@@ -8951,6 +8997,7 @@ mod tests {
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
         remove_billing_row_after_read: std::cell::Cell<bool>,
         reconcile_outcome_attempts: std::cell::Cell<usize>,
+        paid_reconcile_attempts: std::cell::Cell<usize>,
         // Displaced rows are retained without changing the per-user projection.
         billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
@@ -11445,6 +11492,16 @@ mod tests {
                 .find(|(_, customer)| customer.as_str() == customer_id)
                 .map(|(user, _)| user.clone()))
         }
+        async fn store_paid_reconcile_outcome(
+            &self,
+            user_id: &str,
+            outcome: &crate::billing_reconcile::ReconcileOutcome,
+        ) -> Result<(), StoreError> {
+            self.paid_reconcile_attempts
+                .set(self.paid_reconcile_attempts.get() + 1);
+            self.store_reconcile_outcome(user_id, outcome).await
+        }
+
         async fn store_reconcile_outcome(
             &self,
             user_id: &str,
@@ -12057,6 +12114,7 @@ mod tests {
         /// the next page from here, so tests pin the full-read follow-up
         /// instead of trusting the first page.
         line_pages: RefCell<HashMap<String, Vec<crate::stripe::InvoiceLine>>>,
+        scripted_line_pages: RefCell<std::collections::VecDeque<crate::stripe::InvoiceLines>>,
         /// Customer-create log `(user_id, test_clock)` for the seam assert.
         customers_created: RefCell<Vec<(Option<String>, Option<String>)>>,
         /// Checkout sessions minted through `create_checkout_session`.
@@ -12281,6 +12339,9 @@ mod tests {
                 if self.fail("list_invoice_lines") {
                     return self.err();
                 }
+                if let Some(page) = self.scripted_line_pages.borrow_mut().pop_front() {
+                    return Ok(page);
+                }
                 let data = self
                     .line_pages
                     .borrow_mut()
@@ -12486,7 +12547,11 @@ mod tests {
                 stripe_signature: signature,
                 body: raw_body.to_vec(),
             };
-            block_on(handle(&self.ctx(), &req))
+            if self.config.paid_billing_enabled() {
+                block_on(handle(&self.ctx(), &req))
+            } else {
+                block_on(billing_webhook(&self.ctx(), &req))
+            }
         }
     }
 
@@ -12698,6 +12763,157 @@ mod tests {
         let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
         webhook_ok(&resp);
         body
+    }
+
+    #[test]
+    fn paid_invite_webhook_replays_only_the_verified_bound_target() {
+        let mut h = stripe_harness();
+        let body = checkout_completed_body("evt_closed", "cs_test_1", false);
+        let closed_request = Request {
+            method: "POST".into(),
+            path: BILLING_WEBHOOK_PATH.into(),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            stripe_signature: Some(sign(&body, BILLING_NOW)),
+            body,
+        };
+        assert_eq!(block_on(handle(&h.ctx(), &closed_request)).status, 404);
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        h.config.private_listening = crate::private_listening::PrivateListening::parse(
+            r#"{"owner_user_id":"u1","invite_ids":[1],"expires_at":1800000000}"#,
+        );
+        assert!(h.config.private_listening.is_some());
+        assert_eq!(block_on(handle(&h.ctx(), &closed_request)).status, 404);
+        assert!(h.store.webhook_events.borrow().is_empty());
+        h.config.private_listening = None;
+        seed_billing_user(&h, "u1");
+        let forged = checkout_completed_body("evt_forged", "cs_test_1", false);
+        assert_eq!(h.call_webhook(&forged, None).status, 400);
+        assert!(h.store.webhook_events.borrow().is_empty());
+        let body = deliver_first_period(&h, "evt_paid");
+        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        assert_eq!(h.store.paid_reconcile_attempts.get(), 2);
+        let paid = live_for(&h, "u1").unwrap();
+        assert_eq!(paid.stripe_subscription_id, "sub_test_1");
+        assert_eq!(paid.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
+        let attempts = h.store.reconcile_outcome_attempts.get();
+        let refused = || {
+            assert_eq!(
+                h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+                500
+            );
+            assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts);
+            assert_eq!(live_for(&h, "u1").as_ref(), Some(&paid));
+            assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        };
+        let original = h.stripe.sessions.borrow()["cs_test_1"].clone();
+        let set_session = |session| {
+            h.stripe
+                .sessions
+                .borrow_mut()
+                .insert("cs_test_1".into(), session);
+        };
+        for invalid in [
+            crate::stripe::CheckoutSession {
+                customer: Some("cus_other".into()),
+                ..original.clone()
+            },
+            crate::stripe::CheckoutSession {
+                id: "cs_other".into(),
+                ..original.clone()
+            },
+            crate::stripe::CheckoutSession {
+                livemode: true,
+                ..original.clone()
+            },
+            crate::stripe::CheckoutSession {
+                subscription: None,
+                ..original.clone()
+            },
+        ] {
+            set_session(invalid);
+            refused();
+        }
+        set_session(original);
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut("op_test_1")
+            .unwrap()
+            .session_id = Some("cs_other".into());
+        refused();
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut("op_test_1")
+            .unwrap()
+            .session_id = Some("cs_test_1".into());
+        let original = h.stripe.subscriptions.borrow()["sub_test_1"].clone();
+        for invalid in [
+            crate::stripe::Subscription {
+                customer: Some("cus_other".into()),
+                ..original.clone()
+            },
+            crate::stripe::Subscription {
+                livemode: true,
+                ..original
+            },
+        ] {
+            h.stripe
+                .subscriptions
+                .borrow_mut()
+                .insert("sub_test_1".into(), invalid);
+            refused();
+        }
+    }
+
+    #[test]
+    fn paid_invite_webhook_refuses_nonadvancing_and_excess_invoice_pages() {
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        let body = deliver_first_period(&h, "evt_page");
+        let line = {
+            let mut invoices = h.stripe.invoices.borrow_mut();
+            let lines = invoices
+                .get_mut("in_test_1")
+                .unwrap()
+                .lines
+                .as_mut()
+                .unwrap();
+            lines.has_more = true;
+            lines.data[0].clone()
+        };
+        let attempts = h.store.reconcile_outcome_attempts.get();
+        for repeated in [true, false] {
+            h.stripe.scripted_line_pages.replace(
+                (0..11)
+                    .map(|index| {
+                        let mut line = line.clone();
+                        if !repeated {
+                            line.id = format!("il_next_{index}");
+                        }
+                        crate::stripe::InvoiceLines {
+                            data: vec![line],
+                            has_more: true,
+                        }
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+                500
+            );
+            assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts);
+            assert_eq!(
+                h.stripe.scripted_line_pages.borrow().len(),
+                if repeated { 10 } else { 1 }
+            );
+        }
     }
 
     #[test]
