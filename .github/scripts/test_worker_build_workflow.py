@@ -156,6 +156,19 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         self.assertIn("check_worker_upload.py --wrangler", section)
         self.assertLess(section.index(BUILD), section.index("check_worker_upload.py --wrangler"))
 
+    def test_stream_profile_selects_tools_after_ordinary_builds_and_smoke(self):
+        ci = job((ROOT / ".github/workflows/ci.yml").read_text(), "worker-release-builds")
+        items = steps(ci)
+        prepare = next(i for i, s in enumerate(items) if "worker_tools.py install stream" in s)
+        smoke = next(i for i, s in enumerate(items) if "Exercise concurrent Rust span identity in real workerd" in s)
+        build = items[prepare + 1]
+        self.assertLess(smoke, prepare)
+        self.assertIn("working-directory: workers/stream", build)
+        self.assertIn(BUILD, build)
+        self.assertIn('check-build "$RUNNER_TEMP/worker-stream.log" stream', build)
+        self.assertIn("git diff --exit-code -- ../../Cargo.lock", build)
+        self.assertIn("check_worker_upload.py --wrangler", items[prepare + 2])
+
 
 if __name__ == "__main__":
     unittest.main()

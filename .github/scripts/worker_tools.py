@@ -2,12 +2,12 @@
 """Prepare and audit pinned worker build tools (GitHub Actions on Linux x86_64 only).
 
 Usage:
-  worker_tools.py install [repair]
-  worker_tools.py check-build <worker-build-log> [repair]
+  worker_tools.py install [repair|stream]
+  worker_tools.py check-build <worker-build-log> [repair|stream]
 
 Pins live in .github/worker-toolchain.json, the single manifest. The install and
 log-check logic is adapted from the earlier qualification tooling, reduced to what
-ordinary api, mb and ingest release builds need; repair is opt-in.
+ordinary api, mb and ingest release builds need. Repair and Stream select separate profiles.
 
 worker-build resolves each tool from a <NAME>_BIN override first, then its
 cache, then a download. `check-build` proves every build used the overrides.
@@ -87,17 +87,27 @@ def require_actions(env=os.environ, system: str | None = None, machine: str | No
 def select_profile(pins: dict, profile: str) -> tuple[dict, tuple[str, ...]]:
     if profile == "ordinary":
         return pins, LOCKED_WORKERS
-    if profile == "repair":
-        return {**pins, **pins["repair-profile"]}, ("repair",)
+    if profile in ("repair", "stream"):
+        return {**pins, **pins[f"{profile}-profile"]}, (profile,)
     raise ValueError(f"unknown worker tool profile: {profile}")
 
 
 def check_locks(pins: dict, root: Path = ROOT, workers: tuple[str, ...] = LOCKED_WORKERS) -> None:
     for worker in workers:
-        packages = tomllib.loads((root / f"workers/{worker}/Cargo.lock").read_text())["package"]
+        lock = "Cargo.lock" if worker == "stream" else f"workers/{worker}/Cargo.lock"
+        packages = tomllib.loads((root / lock).read_text())["package"]
+        stream_deps = None
+        if worker == "stream":
+            stream = next((p for p in packages if p["name"] == "nntune-stream"), {})
+            stream_deps = stream.get("dependencies", ())
         for name, version in (("worker", pins["worker-build"]["version"]),
                               ("wasm-bindgen", pins["wasm-bindgen-cli"]["version"])):
-            if {p["version"] for p in packages if p["name"] == name} != {version}:
+            locked = [p["version"] for p in packages if p["name"] == name]
+            if stream_deps is not None:
+                # In a shared lockfile Cargo qualifies ambiguous dependency names.
+                locked = [v for v in locked if f"{name} {v}" in stream_deps
+                          or (len(locked) == 1 and name in stream_deps)]
+            if set(locked) != {version}:
                 raise ValueError(f"{worker} locked library disagrees with {name} tool")
 
 
@@ -211,7 +221,7 @@ def install(env=os.environ, dl=download, run=subprocess.run, profile: str = "ord
     require_actions(env)
     pins, workers = select_profile(load_pins(), profile)
     check_locks(pins, workers=workers)
-    root = Path(env["RUNNER_TEMP"]) / "worker-tools"
+    root = Path(env["RUNNER_TEMP"]) / ("worker-tools-stream" if profile == "stream" else "worker-tools")
     root.mkdir()  # A reused or nonempty root is not admissible.
     tool_root = root / "installed"
     for name in ("worker-build", "wasm-bindgen-cli"):
@@ -275,18 +285,23 @@ def check_build(log_path: str, env=os.environ) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if argv[1:] == ["install"] or (argv[1:2] == ["check-build"] and len(argv) == 3):
+    install_args = argv[1:] in (["install"], ["install", "stream"], ["install", "repair"])
+    check_args = argv[1:2] == ["check-build"] and (
+        len(argv) == 3 or (len(argv) == 4 and argv[3] in ("repair", "stream"))
+    )
+    repair_profile = argv[1:] == ["install", "repair"] or (check_args and len(argv) == 4 and argv[3] == "repair")
+    if (install_args or check_args) and not repair_profile:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from worker_rust_provenance import check_lock_identity, verify_rust_toolchain
         pins = load_pins()
         check_lock_identity(pins)
         verify_rust_toolchain(pins)
-    if argv[1:] == ["install"]:
-        install()
-    elif argv[1:] == ["install", "repair"]:
-        install(profile="repair")
-    elif (argv[1:2] == ["check-build"] and
-          (len(argv) == 3 or (len(argv) == 4 and argv[3] == "repair"))):
+    if install_args:
+        if len(argv) == 2:
+            install()
+        else:
+            install(profile=argv[2])
+    elif check_args:
         check_build(argv[2])
     else:
         print(__doc__, file=sys.stderr)
