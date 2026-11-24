@@ -1,5 +1,7 @@
--- Draft storage contract, not in the migration manifest or mounted in the API.
+-- Pending app migration. Register through the staging migration procedure.
 -- A reservation alone does not authorize sealing, provider writes or publication.
+SET search_path = public, pg_catalog;
+
 CREATE TABLE public.ingest_session_reservations (
     id UUID PRIMARY KEY,
     library_id UUID NOT NULL REFERENCES public.storage_library_namespaces (id),
@@ -55,3 +57,23 @@ CREATE TABLE public.ingest_session_cleanup_intents (
     CHECK (enqueued_at IS NULL OR delivery_claim_id IS NULL),
     PRIMARY KEY (session_id, kind)
 );
+
+-- Keep both relations private until a dedicated writer is provisioned. New
+-- relations can inherit grants from the migrator's default table privileges.
+REVOKE ALL ON public.ingest_session_reservations, public.ingest_session_cleanup_intents FROM PUBLIC;
+DO $acl$
+DECLARE
+    grantee_name NAME;
+BEGIN
+    FOR grantee_name IN
+        SELECT DISTINCT pg_catalog.pg_get_userbyid(a.grantee)
+        FROM pg_catalog.pg_class c CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) a
+        WHERE c.oid IN ('public.ingest_session_reservations'::regclass,
+                        'public.ingest_session_cleanup_intents'::regclass)
+          AND a.grantee <> c.relowner AND a.grantee <> 0
+    LOOP
+        EXECUTE pg_catalog.format(
+            'REVOKE ALL ON public.ingest_session_reservations, public.ingest_session_cleanup_intents FROM %I',
+            grantee_name);
+    END LOOP;
+END $acl$;

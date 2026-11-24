@@ -86,6 +86,41 @@ that exact object key, including late arrivals. Staging activation needs a
 verified incomplete-upload lifecycle policy on its configured bucket as a
 backstop. A new attempt uses fresh object and sealing identities.
 
+## Staging database handoff
+
+The pending [app migration SQL](../workers/api/src/ingest_session_schema.sql)
+creates reservations and durable cleanup intents. It depends on the app
+namespace, object-intent and digest-inventory migrations (0042, 0043 and 0055)
+and the existing users table. The new tables start with owner-only ACLs even
+when the migrator has default grants for the ordinary app roles. Hosted CI
+registers the exact bytes in a temporary manifest and rehearses both a fresh
+app install and a populated upgrade. The deployed manifest excludes these bytes.
+
+To activate the schema, take a separate staging migration PR. Copy the exact
+SQL bytes into `migrations/` as the next available numbered
+`*_ingest_sessions.sql` and append its `app` entry and SHA-256 to the manifest.
+Make the disposable rehearsal use that entry directly. Remove direct schema
+loads and table drops from the reservation SQL and race fixtures and the
+cleanup handoff, multipart handoff, reconciliation and publisher-outcome
+PostgreSQL tests. Seed and clear only their fixture rows once migration
+replay takes ownership of the tables. Use the
+[protected staging apply procedure](ops.md#staging-migrations)
+with independent approval for the exact DDL and a successful staging ledger
+receipt before merge. For a failed or uncertain apply, reconcile both the
+receipt and table state before retrying. On a confirmed apply, leave the
+additive schema and receipt in place when rolling back a caller.
+
+Provision the isolated staging writer separately, without inherited app
+roles, using the [scoped grant fixture](../workers/api/tests/fixtures/ingest_session_migration.sql)
+as the access matrix for the upload and cleanup queries. The trusted caller
+must enforce environment, library and principal scope in every operation.
+The upload role has no session deletion or publication write grant. Before
+staging writes, agree how principal erasure and namespace retirement handle
+retained reservations. Their foreign keys forbid dropping referenced rows.
+Keep routes and cleanup scheduling off until isolated caller wiring, the
+provider and bucket checks above, and review of the cleanup behavior are
+complete. Publication authority has its own rollout.
+
 Proposed lifecycle bounds are at most 24 hours absolute and 60 minutes idle
 since accepted progress; status and retries do not extend absolute expiry.
 Consumers must agree limits, tombstones, lease fencing, cleanup, and race and
