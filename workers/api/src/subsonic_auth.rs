@@ -295,7 +295,9 @@ impl<S: CredentialStore> AuthSession for &S {
     }
 }
 
-impl AuthSession for tokio_postgres::Client {
+struct PgAuthSession<'a, C>(&'a mut C);
+
+impl<C: crate::postgres::PgConnect> AuthSession for PgAuthSession<'_, C> {
     async fn lookup(
         &mut self,
         version: Option<u32>,
@@ -303,7 +305,7 @@ impl AuthSession for tokio_postgres::Client {
         budget: Option<&mut ConstructionBudget>,
     ) -> Result<Option<CredentialRecord>, AuthError> {
         crate::worker_entry::load_staging_credential(
-            self,
+            self.0,
             budget.ok_or(AuthError::Unavailable)?,
             version,
             value,
@@ -312,7 +314,7 @@ impl AuthSession for tokio_postgres::Client {
     }
 
     async fn admit(&mut self, selected: &CredentialRecord, now: u64) -> Result<bool, AuthError> {
-        crate::worker_entry::mutate_staging_credential(self, selected, None, now).await
+        crate::worker_entry::mutate_staging_credential(self.0, selected, None, now).await
     }
 
     async fn finish(
@@ -321,7 +323,7 @@ impl AuthSession for tokio_postgres::Client {
         reindex: Option<&Reindex>,
         now: u64,
     ) -> Result<bool, AuthError> {
-        crate::worker_entry::mutate_staging_credential(self, selected, Some(reindex), now).await
+        crate::worker_entry::mutate_staging_credential(self.0, selected, Some(reindex), now).await
     }
 }
 
@@ -341,14 +343,22 @@ pub async fn authenticate(
 /// Authenticate a staging request on its already admitted app client and
 /// construction ledger. This helper neither connects nor mounts a route.
 pub async fn authenticate_staging(
-    client: &mut tokio_postgres::Client,
+    client: &mut impl crate::postgres::PgConnect,
     credentials: &Credentials,
     peppers: &IndexKeyring<'_>,
     keks: &impl KekSource,
     now: u64,
     budget: &mut ConstructionBudget,
 ) -> Result<Principal, AuthError> {
-    authenticate_in(client, credentials, peppers, keks, now, Some(budget)).await
+    authenticate_in(
+        &mut PgAuthSession(client),
+        credentials,
+        peppers,
+        keks,
+        now,
+        Some(budget),
+    )
+    .await
 }
 
 async fn authenticate_in(

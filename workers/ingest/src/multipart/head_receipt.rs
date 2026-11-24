@@ -9,7 +9,8 @@ use nntune_core::{
 
 use super::{CompletedVersionedMedia, Completion, MultipartError};
 
-/// Synthetic HEAD observations, not values copied from the expected object.
+/// Metadata observed for the exact HEAD request. Supply the configuration
+/// used and the returned locator and length independently of the expected pin.
 pub struct HeadReceipt<'a> {
     pub configuration: Option<[u8; 16]>,
     pub locator: Option<&'a S3Locator>,

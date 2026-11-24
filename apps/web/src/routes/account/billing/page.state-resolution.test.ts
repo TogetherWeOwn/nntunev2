@@ -26,7 +26,10 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { load } from './+page';
+import { useSessionFixture } from './page.fixture.js';
 import type { PageData } from './$types';
+
+useSessionFixture();
 
 afterEach(() => vi.unstubAllGlobals());
 

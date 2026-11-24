@@ -220,10 +220,8 @@ pub fn derive_track_rows<'a>(
     })
 }
 
-/// Derive one row for a backed (file, recording) pair. Private: callers go
-/// through [`derive_track_rows`] so pairing, unmatched handling and skip
-/// accounting stay in one place.
-fn track_row_for<'a>(
+/// Derive one row for an already paired file and recording.
+pub(crate) fn track_row_for<'a>(
     release_mbid: &'a str,
     recording: &'a MbRecording,
     file_ordinal: usize,

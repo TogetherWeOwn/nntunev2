@@ -88,6 +88,10 @@ test('app shortcut help lists only supported bindings, restores focus and respec
 	await page.keyboard.press('Shift+Slash');
 	const dialog = page.getByRole('dialog', { name: 'Keyboard shortcuts' });
 	const close = dialog.getByRole('button', { name: 'Close' });
+	const headingId = await dialog.getByRole('heading', { name: 'Keyboard shortcuts', exact: true }).getAttribute('id');
+	expect(headingId).toBeTruthy();
+	await expect(dialog).toHaveAttribute('aria-labelledby', headingId!);
+	await expect(dialog.and(page.locator('dialog:modal'))).toBeVisible();
 	await expect(dialog.locator('kbd')).toHaveText(['k', 'j', 'l', '0', '?', 'Escape']);
 	await expect(close).toBeFocused();
 	for (const key of ['Tab', 'Shift+Tab', 'j', 'k', '0']) {

@@ -65,12 +65,10 @@ fn stalled_admission_query_expires_to_detail_free_transport_error() {
     let error = finish(with_db_deadline(
         pending::<Result<u64, MeterWriteError>>(),
         FiresAfter(3),
-        || MeterWriteError::Transport("admission ledger unavailable".to_string()),
+        || MeterWriteError::AdmissionLedgerUnavailable,
     ))
     .unwrap_err();
-    assert!(
-        matches!(error, MeterWriteError::Transport(ref detail) if detail == "admission ledger unavailable")
-    );
+    assert!(error == MeterWriteError::AdmissionLedgerUnavailable);
     assert_eq!(error.http_status(), 503);
     assert!(error.is_retryable());
 }
