@@ -7,7 +7,8 @@ const { s3_completion_test: complete } = require('./ingest_wasm.cjs');
 
 const version = 'fixture-version+/=?';
 const versionQuery = 'versionId=fixture-version%2B%2F%3D%3F';
-const ciphertextLength = 48 + 1 + 16;
+const wireHeaderLength = 48;
+const ciphertextLength = wireHeaderLength + 1 + 16;
 const headHeaders = { 'x-amz-version-id': version, 'content-length': String(ciphertextLength) };
 const bucket = 'fixture-bucket';
 const mediaKey = 'media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd';
@@ -168,6 +169,198 @@ test('uses the initialized upload ID, signed part receipt and completed version 
   assert.deepEqual(requests, [
     'POST uploads=', `PUT partNumber=1&${initiatedQuery}`, `POST ${initiatedQuery}`, `HEAD ${versionQuery}`,
   ]);
+});
+
+const readbackPageVersion = 'page+%2F/=';
+const readbackPageQuery = 'versionId=page%2B%252F%2F%3D';
+const readbackHeaders = (bytes, id) => ({
+  'content-length': String(bytes.length), 'x-amz-version-id': id,
+});
+
+function mockReadback(t, { mediaReply, pageReply, waitForPage = false } = {}) {
+  let media;
+  let page;
+  let releaseCiphertext;
+  const gets = [];
+  t.mock.method(globalThis, 'fetch', async (request) => {
+    const url = new URL(request.url);
+    if (url.search === '?uploads=') {
+      await verifySignedRequest(request, 'POST', 'uploads=', initiationHeaders);
+      return new Response(initiationReceipt());
+    }
+    if (request.method === 'PUT' && url.search) {
+      media = await verifySignedRequest(request, 'PUT', `partNumber=1&${initiatedQuery}`);
+      return new Response(null, { headers: { etag: '"fixture-part"', 'x-amz-checksum-sha256': checksum(media) } });
+    }
+    if (request.method === 'POST') {
+      const manifest = (await verifySignedRequest(request, 'POST', initiatedQuery)).toString();
+      return new Response(completionReceipt(manifest, 'fixture-part'), { headers: { 'x-amz-version-id': version } });
+    }
+    if (request.method === 'HEAD') {
+      await verifySignedRequest(request, 'HEAD', versionQuery, {});
+      return new Response(null, { headers: readbackHeaders(media, version) });
+    }
+    if (request.method === 'PUT') {
+      page = await verifySignedRequest(request, 'PUT', '', undefined, sidecarKey);
+      return new Response(null, { headers: { 'x-amz-version-id': readbackPageVersion } });
+    }
+    assert.equal(request.body, null);
+    assert.equal(request.headers.has('range'), false);
+    if (url.pathname === `/${bucket}/${mediaKey}`) {
+      await verifySignedRequest(request, 'GET', versionQuery, {});
+      gets.push(mediaKey);
+      const headers = readbackHeaders(media, version);
+      if (mediaReply) return mediaReply(media, headers, request);
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array());
+          controller.enqueue(media.subarray(0, 7));
+          controller.enqueue(media.subarray(7, wireHeaderLength));
+          const finish = () => {
+            controller.enqueue(media.subarray(wireHeaderLength));
+            controller.close();
+          };
+          if (waitForPage) releaseCiphertext = finish;
+          else finish();
+        },
+      });
+      return new Response(body, { headers });
+    }
+    await verifySignedRequest(request, 'GET', readbackPageQuery, {}, sidecarKey);
+    gets.push(sidecarKey);
+    releaseCiphertext?.();
+    const headers = readbackHeaders(page, readbackPageVersion);
+    return pageReply ? pageReply(page, headers) : new Response(page, { headers });
+  });
+  return gets;
+}
+
+test('streams the completed media and sidecar versions into authenticated readback', async (t) => {
+  // Only the wire header is available until the verifier opens the sidecar.
+  const gets = mockReadback(t, { waitForPage: true });
+  assert.equal(await complete('readback'), version);
+  assert.deepEqual(gets, [mediaKey, sidecarKey]);
+});
+
+for (const [name, mediaReply, failure] of [
+  ['HTTP 206', (bytes, headers) => new Response(bytes, { status: 206, headers }), 'Response'],
+  ['wrong version', (bytes, headers) => new Response(bytes, {
+    headers: { ...headers, 'x-amz-version-id': 'other' },
+  }), 'Response'],
+  ['missing version', (bytes, headers) => new Response(bytes, {
+    headers: { 'content-length': headers['content-length'] },
+  }), 'Response'],
+  ['joined versions', (bytes, headers) => new Response(bytes, {
+    headers: { ...headers, 'x-amz-version-id': `${version}, other` },
+  }), 'Transport'],
+  ['wrong length', (bytes, headers) => new Response(bytes, {
+    headers: { ...headers, 'content-length': String(bytes.length + 1) },
+  }), 'Response'],
+  ['joined lengths', (bytes, headers) => new Response(bytes, {
+    headers: { ...headers, 'content-length': `${bytes.length}, ${bytes.length}` },
+  }), 'Transport'],
+  ['content range', (bytes, headers) => new Response(bytes, {
+    headers: { ...headers, 'content-range': `bytes 0-${bytes.length - 1}/${bytes.length}` },
+  }), 'Response'],
+  ['content encoding', (bytes, headers) => new Response(bytes, {
+    headers: { ...headers, 'content-encoding': 'gzip' },
+  }), 'Transport'],
+  ['redirect', (_bytes, headers) => new Response(null, {
+    status: 307, headers: { ...headers, location: 'https://other.test/' },
+  }), 'Transport'],
+]) {
+  test(`refuses ${name} on the first readback GET`, async (t) => {
+    const gets = mockReadback(t, { mediaReply });
+    await assert.rejects(complete('readback'), rejectedWith(`Body(${failure})`));
+    assert.deepEqual(gets, [mediaKey]);
+  });
+}
+
+test('rejects a truncated sidecar and trailing media even with exact declared lengths', async (t) => {
+  await t.test('truncated sidecar', async (t) => {
+    const gets = mockReadback(t, {
+      pageReply: (bytes, headers) => new Response(bytes.subarray(0, -1), { headers }),
+    });
+    await assert.rejects(complete('readback'), rejectedWith('Body(Truncated)'));
+    assert.deepEqual(gets, [mediaKey, sidecarKey]);
+  });
+  await t.test('trailing media', async (t) => {
+    const gets = mockReadback(t, {
+      mediaReply: (bytes, headers) => new Response(Buffer.concat([bytes, Buffer.of(0)]), { headers }),
+    });
+    await assert.rejects(complete('readback'), rejectedWith('Body(Trailing)'));
+    assert.deepEqual(gets, [mediaKey, sidecarKey]);
+  });
+});
+
+test('rejects changed sidecar or ciphertext bytes with valid version and length headers', async (t) => {
+  const changed = (bytes, headers) => {
+    const body = Buffer.from(bytes);
+    body[body.length - 1] ^= 1;
+    return new Response(body, { headers });
+  };
+  await t.test('changed sidecar', async (t) => {
+    const gets = mockReadback(t, { pageReply: changed });
+    await assert.rejects(complete('readback'), rejectedWith('Body(Content(Frame(Page(HashMismatch))))'));
+    assert.deepEqual(gets, [mediaKey, sidecarKey]);
+  });
+  await t.test('changed ciphertext', async (t) => {
+    const gets = mockReadback(t, { mediaReply: changed });
+    await assert.rejects(complete('readback'), rejectedWith('Body(Content(Frame(DigestMismatch)))'));
+    assert.deepEqual(gets, [mediaKey, sidecarKey]);
+  });
+});
+
+test('aborts readback when the media never reaches EOF', async (t) => {
+  let signal;
+  const gets = mockReadback(t, {
+    mediaReply(bytes, headers, request) {
+      signal = request.signal;
+      const body = new ReadableStream({ start(controller) { controller.enqueue(bytes); } });
+      return new Response(body, { headers });
+    },
+  });
+  await assert.rejects(complete('readback-deadline'), rejectedWith('Body(Transport)'));
+  assert.deepEqual(gets, [mediaKey, sidecarKey]);
+  assert.equal(signal.aborted, true);
+});
+
+test('does not renew the deadline between GETs or chunk reads', async (t) => {
+  // Each operation advances the clock by less than the 2 s fixture budget.
+  // Date is mocked so the cumulative-deadline assertion is independent of host speed.
+  await t.test('across GETs', async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const delayed = (bytes, headers) => {
+      t.mock.timers.tick(1100);
+      return new Response(bytes, { headers });
+    };
+    const gets = mockReadback(t, { mediaReply: delayed, pageReply: delayed });
+    await assert.rejects(complete('readback'), rejectedWith('Body(Transport)'));
+    assert.deepEqual(gets, [mediaKey, sidecarKey]);
+  });
+  await t.test('across chunk reads', async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    let pulls = 0;
+    const gets = mockReadback(t, {
+      mediaReply(bytes, headers) {
+        const body = new ReadableStream({
+          pull(controller) {
+            t.mock.timers.tick(1100);
+            if (++pulls === 1) {
+              controller.enqueue(bytes.subarray(0, 7));
+            } else {
+              controller.enqueue(bytes.subarray(7));
+              controller.close();
+            }
+          },
+        }, { highWaterMark: 0 });
+        return new Response(body, { headers });
+      },
+    });
+    await assert.rejects(complete('readback'), rejectedWith('Body(Transport)'));
+    assert.equal(pulls, 2);
+    assert.deepEqual(gets, [mediaKey]);
+  });
 });
 
 test('refuses a foreign completion context before sending HEAD', async (t) => {
