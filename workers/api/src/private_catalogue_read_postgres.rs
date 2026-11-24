@@ -84,11 +84,8 @@ async fn resolves_only_the_committed_scoped_publication() {
         bucket: "test-bucket",
         version: "new-media-pin",
     };
-    let exp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 120;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let exp = now.as_secs() + 120;
     let deadline = UNIX_EPOCH + Duration::from_secs(exp);
     let signed = receipt(track, digest, exp);
     writer
@@ -117,13 +114,7 @@ async fn resolves_only_the_committed_scoped_publication() {
     let publication = writer.transaction().await.unwrap();
     assert!(publication
         .query_one(
-            "SELECT public.attach_storage_digest_reference(w.environment_id, w.library_id,
-           w.plaintext_sha256, w.plaintext_bytes, w.object_id, i.generation_id, w.root_version_id,
-           s.track_id, $2)
-         FROM public.catalogue_s3_sources s
-         JOIN public.storage_validated_digest_winners w USING (object_id)
-         JOIN public.storage_object_intents i ON i.object_id = w.object_id
-         WHERE s.track_id = $1::text::uuid",
+            include_str!("../tests/fixtures/private_catalogue_attach.sql"),
             &[&track, &deadline],
         )
         .await
@@ -187,10 +178,7 @@ async fn resolves_only_the_committed_scoped_publication() {
         )
         .await
         .unwrap();
-    assert!(
-        query(&mut reader, &signed, &pins).await.is_none(),
-        "lease no longer holds this track"
-    );
+    assert!(query(&mut reader, &signed, &pins).await.is_none());
     assert!(
         query(&mut reader, &receipt(same_media_track, digest, exp), &pins)
             .await
