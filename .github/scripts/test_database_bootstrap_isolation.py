@@ -399,7 +399,7 @@ def routed_client(cluster, mode, role=CREATOR):
     return f"{cluster.directory}:/usr/bin:/bin"
 
 
-def prove_setup_caller(cluster, *, interrupt, reader=READER):
+def prove_setup_caller(cluster, *, interrupt, reader):
     calls = cluster.directory / "invocations"
     calls.touch()
 
@@ -434,7 +434,7 @@ def prove_setup_caller(cluster, *, interrupt, reader=READER):
             {"setup_login": CREATOR}, {"setup_login": f"{login}|replica"},
             {"setup_login": login + "\n"}, {"setup_login": None},
             {"setup_role": login, "setup_login": f"{login}.{branch}"},
-            {"port": PORT + 1}, {"reader_role": CREATOR},
+            {"port": PORT + 1}, {"reader_role": CREATOR}, {"launch": MAINTENANCE},
         ):
             run(caller_env(cluster, roles, **changes) | route, "refused", 0)
         for malformed in ("a" * 9, "a" * 11, "a" * 13, "A" * 12, "á" * 12):
@@ -453,9 +453,20 @@ def prove_setup_caller(cluster, *, interrupt, reader=READER):
 
         for changes in (
             {"reader_role": "missing_reader"},
+            {"reader_role": READER},
             {"ca_pem": (cluster.directory / "client" / "other.crt").read_text()},
         ):
             run(caller_env(cluster, roles, **changes) | route, "refused", 1)
+        cluster.ok("grant the pending reader an unrelated SET-only membership",
+                   f"GRANT {STAGING} TO {reader} WITH SET TRUE, INHERIT FALSE;")
+        run(env, "refused", 1)
+        cluster.ok("restore the reader to its pending state", f"REVOKE {STAGING} FROM {reader};")
+        cluster.ok("raise the pending reader's connection limit", f"ALTER ROLE {reader} CONNECTION LIMIT 2;")
+        run(env, "refused", 1)
+        cluster.ok("restore the one-connection reader limit", f"ALTER ROLE {reader} CONNECTION LIMIT 1;")
+        cluster.ok("remove the pending reader's expiry", f"ALTER ROLE {reader} VALID UNTIL 'infinity';")
+        run(env, "refused", 1)
+        cluster.ok("restore the expired reader", f"ALTER ROLE {reader} VALID UNTIL 'epoch';")
         cluster.ok("remove the canonical role's database creation privilege", f"ALTER ROLE {CREATOR} NOCREATEDB;")
         run(env, "refused", 1)
         cluster.ok("restore the canonical role's database creation privilege", f"ALTER ROLE {CREATOR} CREATEDB;")
@@ -463,6 +474,9 @@ def prove_setup_caller(cluster, *, interrupt, reader=READER):
                    "BOOTSTRAP_SETUP_PASSWORD": cluster.passwords[DECOY]}, "refused", 1)
         require((cluster.directory / "probe-result").read_bytes() == b"wrong-session\nroles-ready\n",
                 "observe a different eligible SQL identity on the approved route")
+        run(env | {"PATH": routed_client(cluster, "standby")}, "refused", 1)
+        require((cluster.directory / "standby-result").read_bytes() == b"",
+                "refuse the recovery-state probe without a SQL error")
         run(env | {"PATH": routed_client(cluster, "error")}, "refused", 1)
         diagnostics = (cluster.directory / "diagnostics").read_bytes()
         require(all(value.encode() in diagnostics for value in
@@ -474,8 +488,23 @@ def prove_setup_caller(cluster, *, interrupt, reader=READER):
         run(env | {"BOOTSTRAP_EXPIRY": str(cluster.expiry - 60)}, "refused", 1)
         cluster.ok("verify all caller refusals leave the target absent",
                    f"SELECT NOT EXISTS (SELECT FROM pg_database WHERE datname = '{LAUNCH}');", "t\n")
+        sibling_sql = (f"SELECT to_jsonb(d) FROM pg_database d WHERE datname IN ('{MAINTENANCE}', '{SIBLING}') "
+                       "ORDER BY datname;")
+        siblings = cluster.sql(sibling_sql)
+        checked(siblings, "record the staging and reserved database identities and ACLs")
+        require(len(siblings.stdout.splitlines()) == 2, "observe both sibling databases before setup")
+        sibling_env = caller_env(cluster, roles, host=cluster.server, launch=SIBLING)
+        run(sibling_env | {"PATH": env["PATH"]}, "refused", 1)
         run(env, "complete", 3)
+        identity_sql = f"""SELECT oid FROM pg_database WHERE datname = '{LAUNCH}' AND datallowconn
+            AND NOT datistemplate AND datdba = '{OWNER}'::regrole
+            AND NOT has_database_privilege('{reader}', oid, 'CONNECT');"""
+        identity = cluster.sql(identity_sql)
+        checked(identity, "read back the new database identity with the reader still fenced")
+        require(identity.stdout.strip().isdigit(), "observe a single launch database OID")
         run(env, "refused", 1)  # The name collision stops any second write.
+        cluster.ok("preserve the new database OID after collision refusal", identity_sql, identity.stdout)
+        cluster.ok("preserve both sibling database identities and ACLs", sibling_sql, siblings.stdout)
         return
 
     def wait_for(verdict, sql):

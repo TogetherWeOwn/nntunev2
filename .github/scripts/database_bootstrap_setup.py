@@ -83,7 +83,8 @@ def statements(plan, expiry):
     probe = catalog_probe_sql(plan.maintenance, plan.launch, plan.setup_role)
     probe += f"""
 SELECT 'roles-ready'
-WHERE EXISTS (
+WHERE NOT pg_is_in_recovery()
+AND EXISTS (
     SELECT FROM pg_roles WHERE rolname = current_user
       AND NOT (rolsuper OR rolcreaterole OR rolreplication OR rolbypassrls)
       AND rolvaliduntil > clock_timestamp() AND rolvaliduntil <= to_timestamp({expiry})
@@ -93,13 +94,17 @@ AND EXISTS (
       AND NOT (rolcanlogin OR rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)
       AND pg_has_role(current_user, oid, 'SET') AND NOT pg_has_role(current_user, oid, 'USAGE')
 )
-AND (
-    SELECT count(*) FROM pg_roles WHERE rolname IN ('{plan.migrator_role}', '{plan.reader_role}')
+AND EXISTS (
+    SELECT FROM pg_roles WHERE rolname = '{plan.migrator_role}'
       AND rolcanlogin AND NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)
-) = 2
-AND NOT pg_has_role('{plan.reader_role}', '{plan.migrator_role}', 'MEMBER')
-AND NOT pg_has_role('{plan.reader_role}', '{plan.owner_role}', 'MEMBER')
-AND NOT pg_has_role('{plan.reader_role}', '{plan.setup_role}', 'MEMBER');
+)
+AND EXISTS (
+    SELECT FROM pg_roles r WHERE rolname = '{plan.reader_role}'
+      AND rolcanlogin AND rolconnlimit = 1 AND rolvaliduntil = 'epoch'::timestamptz
+      AND NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls)
+      AND NOT EXISTS (SELECT FROM pg_auth_members WHERE member = r.oid)
+      AND NOT EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = r.oid)
+);
 """
     database = f'"{plan.launch}"'
     create = f"CREATE DATABASE {database} TEMPLATE template0 ALLOW_CONNECTIONS false;"

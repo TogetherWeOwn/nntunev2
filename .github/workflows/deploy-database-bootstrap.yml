@@ -7,14 +7,32 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    name: Check setup authorization custody
+    # Set the repository variable only after the protected Environment and
+    # exact release candidate have been independently approved.
+    if: >-
+      ${{ github.repository == 'TogetherWeOwn/nntunev2' &&
+          github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+          github.run_attempt == '1' && vars.DATABASE_BOOTSTRAP_CANDIDATE_SHA == github.sha }}
+    permissions: {}
+    environment:
+      name: staging
+      deployment: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Reject setup authorization outside its protected Environment
+        env:
+          UNPROTECTED_BOOTSTRAP: >-
+            ${{ secrets.BOOTSTRAP_SETUP_PASSWORD != '' || secrets.BOOTSTRAP_SHA != '' ||
+                secrets.BOOTSTRAP_RUN_ID != '' || secrets.BOOTSTRAP_EXPIRY != '' ||
+                secrets.BOOTSTRAP_PLAN_B64 != '' || secrets.BOOTSTRAP_PLAN_DIGEST != '' }}
+        run: test "$UNPROTECTED_BOOTSTRAP" = false
+
   admit:
     name: Run authorized first-launch database setup
-    # Deliberately disabled. Enabling this job requires a separate reviewed
-    # change and a readback of the Environment before dispatch.
-    if: >-
-      ${{ false && github.repository == 'TogetherWeOwn/nntunev2' &&
-          github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
-          github.run_attempt == '1' }}
+    needs: preflight
     environment: production-db-bootstrap
     concurrency:
       group: production-db-bootstrap
