@@ -7804,13 +7804,13 @@ fn build_sha_from_env(env: &Env) -> String {
 
 /// Wall-clock milliseconds for record timestamps.
 #[cfg(target_arch = "wasm32")]
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     worker::Date::now().as_millis()
 }
 
 /// Wall-clock milliseconds for record timestamps (native test builds).
 #[cfg(not(target_arch = "wasm32"))]
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis().try_into().unwrap_or(u64::MAX))

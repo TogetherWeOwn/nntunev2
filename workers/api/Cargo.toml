@@ -37,6 +37,7 @@ nntune-ssrf-guard = { version = "0.1.0", path = "../../crates/nntune-ssrf-guard"
 # no TLS transport in this worker's graph; same shape as
 # workers/ingest).
 nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-features = false }
+nntune-ingest = { version = "0.1.0", path = "../ingest", default-features = false, features = ["upload-caller"], optional = true }
 zeroize = { version = "1", features = ["derive"] }
 url = "2"
 subtle = "2"
@@ -64,6 +65,7 @@ tokio = { version = "1", features = ["io-util"] }
 worker = "0.9"
 
 [features]
+encrypted-upload-caller = ["dep:nntune-ingest"]
 postgres-tests = []
 # Exposes the inert adapter only to the synthetic WASM runtime test.
 staging-body-wasm-test = []
@@ -104,7 +106,7 @@ required-features = ["postgres-tests"]
 
 [dev-dependencies]
 # Cross-seam persisted source conformance uses the real pure producer.
-nntune-ingest = { version = "0.1.0", path = "../ingest" }
+nntune-ingest = { version = "0.1.0", path = "../ingest", default-features = false }
 rusqlite = { version = "0.42", features = ["bundled"] }
 serde_json = "1"
 # Test-only RNG for the KEK rotation acceptance fixtures (native tests only;

@@ -28,7 +28,7 @@ impl<'a> InitiatedUpload<'a> {
         }
     }
 
-    pub(super) fn verify(
+    pub fn verify(
         configuration: [u8; 16],
         bucket: &'a str,
         key: &'a str,

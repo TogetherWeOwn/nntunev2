@@ -19,6 +19,13 @@ pub struct Request<'a> {
 #[derive(PartialEq, Eq)]
 pub struct Fingerprint([u8; 32]);
 
+#[cfg(feature = "encrypted-upload-caller")]
+impl Fingerprint {
+    pub(crate) fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum RequestError {
     InvalidKey,

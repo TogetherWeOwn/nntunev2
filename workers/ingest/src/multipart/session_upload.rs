@@ -40,7 +40,7 @@ pub struct DurableUpload<'a> {
     id: String,
     usable_until: SystemTime,
     context: &'a EnvelopeContext,
-    session: &'a str,
+    session: String,
 }
 
 impl<'a> DurableUpload<'a> {
@@ -56,7 +56,7 @@ impl<'a> DurableUpload<'a> {
             key: target.key,
             id: target.upload_id.to_owned(),
             context,
-            session,
+            session: session.to_owned(),
             usable_until,
         }
     }
@@ -82,9 +82,11 @@ impl<'a> DurableUpload<'a> {
     }
 }
 
-pub(crate) async fn handoff<'a>(
+/// Commit the scoped object claim and provider ID before returning a target.
+/// The initiator must use the exact trusted configuration, bucket and key.
+pub async fn handoff<'a>(
     db: &mut Client,
-    scope: &CompletionScope<'a>,
+    scope: &CompletionScope<'_>,
     lease: &str,
     context: &'a EnvelopeContext,
     target: (&'a str, &'a str),
@@ -146,7 +148,7 @@ pub(crate) async fn handoff<'a>(
             id,
             usable_until,
             context,
-            session: scope.session,
+            session: scope.session.to_owned(),
         })
     };
 
@@ -189,7 +191,7 @@ pub(crate) async fn handoff<'a>(
     upload(target.upload_id.to_owned(), deadline)
 }
 
-async fn begin(db: &mut Client) -> Result<Transaction<'_>, HandoffError> {
+pub async fn begin(db: &mut Client) -> Result<Transaction<'_>, HandoffError> {
     let tx = db
         .build_transaction()
         .isolation_level(IsolationLevel::ReadCommitted)

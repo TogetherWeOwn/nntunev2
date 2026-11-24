@@ -9,11 +9,11 @@ WITH locked AS MATERIALIZED (
     SELECT session.id, session.idle_deadline, session.absolute_deadline
     FROM public.ingest_session_reservations AS session
     JOIN public.storage_library_namespaces AS library ON library.id = session.library_id
-    WHERE library.environment_id = $1 AND session.library_id = $2
-      AND session.principal_id = $3 AND session.id = $4 AND session.fingerprint = $5
+    WHERE library.environment_id = $1::text::uuid AND session.library_id = $2::text::uuid
+      AND session.principal_id = $3 AND session.id = $4::text::uuid AND session.fingerprint = $5
       AND session.terminal_reason IS NULL
       AND (session.multipart_object_id IS NULL OR session.multipart_upload_id IS NOT NULL)
-      AND session.write_lease_id = $10 AND session.write_lease_generation = $6
+      AND session.write_lease_id = $10::text::uuid AND session.write_lease_generation = $6::text::uuid
       AND session.checkpoint_revision = $7 AND session.checkpoint_offset = $8
       AND $9 > $8 AND $9 <= 8589934592
     FOR UPDATE OF session
@@ -21,7 +21,7 @@ WITH locked AS MATERIALIZED (
     SELECT locked.*, clock_timestamp() AS ts FROM locked
 )
 UPDATE public.ingest_session_reservations AS session
-SET checkpoint_generation = $6,
+SET checkpoint_generation = $6::text::uuid,
     checkpoint_revision = session.checkpoint_revision + 1,
     checkpoint_offset = $9,
     write_lease_id = NULL,

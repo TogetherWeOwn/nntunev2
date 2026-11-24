@@ -6,6 +6,7 @@ use crate::native_rest::{self, CredentialError, NativeRestRecord, Pepper, Scope}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Create,
+    Upload,
     Status,
     Abort,
     Reuse,
@@ -68,7 +69,7 @@ pub fn authorize(
     }
     match (action, job) {
         (Action::Create, None) => Ok(()),
-        (Action::Status | Action::Abort | Action::Reuse, Some((id, job)))
+        (Action::Upload | Action::Status | Action::Abort | Action::Reuse, Some((id, job)))
             if !id.is_empty()
                 && id == job.id
                 && job.owner_id == record.user_id

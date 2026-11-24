@@ -98,7 +98,7 @@ impl S3CompletionSender {
     pub async fn open_upload<'a>(
         &'a self,
         db: &mut tokio_postgres::Client,
-        scope: &CompletionScope<'a>,
+        scope: &CompletionScope<'_>,
         lease: &str,
         context: &'a EnvelopeContext,
         key: &'a str,

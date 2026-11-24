@@ -2127,7 +2127,7 @@ async fn process_raw_message(env: &Env, raw: worker::RawMessage) {
     }
 }
 
-#[worker::event(queue)]
+#[cfg_attr(feature = "worker-entry", worker::event(queue))]
 pub async fn ingest_queue(
     batch: worker::MessageBatch<serde_json::Value>,
     env: Env,

@@ -1641,7 +1641,7 @@ mod tests {
         // route and adapter source while testing the HTTP contract natively.
         let source = include_str!("lib.rs");
         let router = source
-            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .split_once("\npub async fn main(")
             .expect("worker entrypoint must exist")
             .1;
         let route = router
@@ -1968,7 +1968,7 @@ mod tests {
             assert!(auth < refused && refused < effect, "{signature}");
         }
         let router = include_str!("lib.rs")
-            .split_once("\n#[worker::event(fetch)]\npub async fn main")
+            .split_once("\npub async fn main(")
             .unwrap()
             .1;
         assert!(router.contains("job_status(&req, &ctx, &trace_id)"));
@@ -3191,7 +3191,7 @@ mod tests {
     }
 }
 
-#[worker::event(fetch)]
+#[cfg_attr(feature = "worker-entry", worker::event(fetch))]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     Router::new()
         .get_async("/healthz", |_, _| async { healthz() })
