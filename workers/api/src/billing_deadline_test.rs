@@ -1004,7 +1004,6 @@ pub(crate) async fn test_reconcile_lock_cycle(row_update: bool) -> Result<(), &'
                 let mut reconcile = Box::pin(store.store_reconcile_owned(
                     user.into(),
                     outcome,
-                    false,
                     ReconcileProbe::None,
                 ));
                 let worker = match select(
@@ -1280,6 +1279,7 @@ async fn transaction_refuses_misattributed_history(
                     client,
                     "worker_fault_user".into(),
                     outcome,
+                    false,
                     ReconcileProbe::None,
                 )
                 .await
