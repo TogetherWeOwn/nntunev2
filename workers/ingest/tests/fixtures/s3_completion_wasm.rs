@@ -2,10 +2,12 @@ use super::{now, Duration, S3CompletionSender};
 use crate::multipart::{
     resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
     session_completion::SessionCompletion,
+    sidecar::SidecarPut,
     Plan, UploadTarget,
 };
 use nntune_core::{
-    media_envelope::EnvelopeContext, origin_sealer::OriginSealer, s3_locator::S3Binding,
+    digest_enrollment::DigestEnrollment, media_envelope::EnvelopeContext,
+    origin_sealer::OriginSealer, s3_locator::S3Binding,
 };
 use sha2::{Digest, Sha256};
 use worker::wasm_bindgen::{self, prelude::*};
@@ -27,12 +29,15 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         _ => "https://fixture.test:8443",
     };
     let sender = S3CompletionSender::new(
-        if matches!(mode.as_str(), "foreign" | "part-foreign" | "init-foreign") {
+        if matches!(
+            mode.as_str(),
+            "foreign" | "part-foreign" | "init-foreign" | "sidecar-foreign"
+        ) {
             id(8)
         } else {
             configuration
         },
-        if mode == "bucket" {
+        if matches!(mode.as_str(), "bucket" | "sidecar-bucket") {
             "other-bucket"
         } else {
             bucket
@@ -44,9 +49,29 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         "fixture-secret".into(),
     )
     .map_err(|_| JsValue::from_str("invalid configuration"))?;
+    let identities = [0, 1, 2, 0xab, 0xcd, 7].map(id);
+    if mode.starts_with("sidecar") {
+        let map_id = id(0xef);
+        let mut enrollment =
+            DigestEnrollment::new(1, identities[1..].try_into().unwrap(), map_id).unwrap();
+        let context = EnvelopeContext {
+            identities,
+            plaintext_len: 1,
+            header: enrollment.header().to_bytes(),
+        };
+        let page = enrollment.seal_chunk(&[42]).unwrap().page.unwrap();
+        let manifest = enrollment.finish().unwrap();
+        let put = SidecarPut::new(bucket, &context, &manifest, map_id, 0, &page).unwrap();
+        let budget = if mode == "sidecar-expired" { 0 } else { 2000 };
+        let completed = sender
+            .put_sidecar(put, now() + Duration::from_millis(budget))
+            .await
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+        return Ok(completed.pin().1.into());
+    }
     let mut sealer = OriginSealer::new(1).unwrap();
     let mut context = EnvelopeContext {
-        identities: [0, 1, 2, 0xab, 0xcd, 7].map(id),
+        identities,
         plaintext_len: 1,
         header: sealer.header().to_bytes(),
     };
