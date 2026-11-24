@@ -264,6 +264,8 @@ class ProtectedProbeTests(unittest.TestCase):
              2, 0, "request-failed", ["sample", "post", "sample"]),
             ("armed rejection", OFF_REPLY.replace(b"200 OK", b"404 Not Found"),
              2, 0, "request-failed", ["sample", "post", "sample"]),
+            ("wrong protocol error", OFF_REPLY.replace(b'"code":40', b'"code":44'),
+             2, 0, "request-failed", ["sample", "post", "sample"]),
             ("cancel", OFF_REPLY, 2, 0, "cancelled", ["sample", "post", "sample"]),
             ("postflight busy", OFF_REPLY, 2, 1, "postflight-unverified", ["sample", "post", "sample"]),
             ("postflight drift", OFF_REPLY, 2, 0, "postflight-unverified", ["sample", "post"]),
