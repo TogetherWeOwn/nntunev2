@@ -759,7 +759,7 @@ jobs:
           persist-credentials: false
       - name: Prove synthetic run authorization and fixed diagnostics
         run: exec python3 -B .github/scripts/test_database_bootstrap_admission.py
-      - name: Prove synthetic TLS, role isolation and teardown
+      - name: Prove synthetic TLS, role isolation, launch baseline and teardown
         id: bootstrap
         run: exec python3 -B .github/scripts/test_database_bootstrap_isolation.py
       - name: Require the post-teardown execution marker
@@ -774,6 +774,7 @@ jobs:
   api-migrations:
     name: api-migrations
     runs-on: ubuntu-latest
+    # Allow cold Rust builds to finish before the PostgreSQL test deadline.
     timeout-minutes: 25
     services:
       postgres:
