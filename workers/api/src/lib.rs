@@ -39,6 +39,9 @@ pub mod billing_store_classification;
 pub mod billing_sweep;
 pub mod billing_transaction_sql;
 pub mod catalogue;
+#[cfg(all(target_arch = "wasm32", feature = "catalogue-playback-wasm-test"))]
+#[path = "../tests/fixtures/catalogue_playback_wasm.rs"]
+mod catalogue_playback_wasm;
 pub mod credential_session_store;
 mod field_envelope;
 pub mod handlers;

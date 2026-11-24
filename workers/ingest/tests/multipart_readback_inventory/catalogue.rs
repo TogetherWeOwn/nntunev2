@@ -25,6 +25,7 @@ pub(super) async fn exercise(
 ) {
     let schema = concat!(
         include_str!("../../../api/tests/fixtures/storage_s3_locator_schema.sql"),
+        include_str!("../fixtures/catalogue_source_schema.sql"),
         include_str!("../fixtures/catalogue_publication.sql")
     );
     db.batch_execute(schema).await.unwrap();

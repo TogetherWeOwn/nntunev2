@@ -18,6 +18,9 @@ use nntune_core::{
 use sha2::{Digest, Sha256};
 use worker::wasm_bindgen::{self, prelude::*};
 
+#[path = "catalogue_upload_wasm.rs"]
+mod catalogue;
+
 // Mono, 8-bit, 19 constant samples at 44.1 kHz.
 const FLAC: &[u8] = b"fLaC\x80\0\0\x22\0\x10\0\x10\0\0\0\0\0\0\x0a\xc4\x40\x70\0\0\0\x13\
     \x46\xd2\xbe\x27\x5e\xd2\xdd\x86\xab\x2b\x53\x88\xf7\x34\x6d\x15\
@@ -41,8 +44,13 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
 }
 
 #[wasm_bindgen]
-pub async fn upload_for_playback(endpoint: String) -> Result<String, JsValue> {
-    run("readback-playback", &endpoint).await
+pub async fn upload_for_playback(endpoint: String, publish: bool) -> Result<String, JsValue> {
+    let mode = if publish {
+        "readback-publish"
+    } else {
+        "readback-playback"
+    };
+    run(mode, &endpoint).await
 }
 
 async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
@@ -96,7 +104,7 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
     }
     let readback = mode.starts_with("readback");
     let padded;
-    let plaintext: &[u8] = if mode == "readback-playback" {
+    let plaintext: &[u8] = if matches!(mode, "readback-publish" | "readback-playback") {
         // Add one FLAC PADDING block so the suffix crosses into a second
         // encrypted chunk while preserving the existing valid audio frames.
         let padding = PLAIN_CHUNK_SIZE as usize + 1 - FLAC.len() - 4;
@@ -135,7 +143,7 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
         [1, 2, 0xab, 0xcd].map(|value| hex::encode(id(value)));
     let key = format!("media/{object}/{generation}");
     let budget = match mode {
-        "readback-playback" => 5000,
+        "readback-publish" | "readback-playback" => 5000,
         "deadline" => 200,
         "expired" | "reconcile-expired" => 0,
         _ => 2000,
@@ -316,19 +324,20 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
             .verify_readback(&inventory, envelope, readback_until)
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
-        if mode == "readback-playback" {
-            let inventory = verified.inventory();
-            let media = inventory.media();
-            // Stand in for the catalogue's committed locator projection.
-            return Ok(serde_json::json!({
-                "configuration": media.configuration,
-                "s3_bucket": inventory.bucket(),
-                "s3_key": media.object_key,
-                "s3_version_id": media.version.unwrap(),
-                "ciphertext_len": inventory.geometry().sealed_len(),
-                "plaintext_len": plaintext_len,
-            })
-            .to_string());
+        if mode == "readback-publish" {
+            let object = crate::admin_review::ObjectRef {
+                media: completed.metadata().clone(),
+                plaintext_sha256: *verified.origin().plaintext_sha256(),
+            };
+            return Ok(catalogue::publish(
+                &verified,
+                &context,
+                &record,
+                map_id,
+                object,
+                target.upload_id,
+            )
+            .await);
         }
     }
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {

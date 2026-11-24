@@ -38,6 +38,14 @@ tests=("$root"/workers/api/tests/sql/*.sql)
 [ "${#migrations[@]}" -gt 0 ] || { echo "no migrations found" >&2; exit 1; }
 [ "${#tests[@]}" -gt 0 ] || { echo "no sql tests found" >&2; exit 1; }
 
+if [[ ${1:-} == --migrate-only ]]; then
+  [[ $# == 1 && ${#session_fixture[@]} == 2 ]] || exit 1
+  for f in "${migrations[@]}"; do
+    psql_run -f "$f"
+  done
+  exit 0
+fi
+
 sql_dir="$root/workers/api/tests/sql"
 pre_purge_tests=(legacy_vault_established.sql reconcile_legacy_vault_cohort.sql
   refresh_legacy_vault_cohort.sql library_artifacts.sql)
