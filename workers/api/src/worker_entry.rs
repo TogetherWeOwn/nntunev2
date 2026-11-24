@@ -4121,12 +4121,6 @@ impl Store for PgStore {
         .await
     }
 
-    fn browser_playback_enabled(&self) -> bool {
-        self.env
-            .as_ref()
-            .is_some_and(private_browser_worker::enabled)
-    }
-
     async fn open_browser_playback(
         &self,
         claims: &crate::session::SessionClaims,
