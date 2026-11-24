@@ -16,8 +16,7 @@ fn invalid() -> crate::Error {
     crate::Error::Malformed("invalid digest enrollment state".into())
 }
 
-/// Complete sealer-origin evidence. Hydration requires committed custody from
-/// the trusted enrollment store. Provider bytes do not establish custody.
+/// Complete sealer-origin evidence, produced only by the enrollment sealer.
 ///
 /// Provider rows cannot be substituted into an existing manifest:
 /// ```compile_fail
@@ -33,7 +32,6 @@ fn invalid() -> crate::Error {
 ///     builder.rows.push(provider_hash);
 /// }
 /// ```
-#[allow(dead_code)] // Consumed by the independent verifier in the next slice.
 pub struct OriginManifest {
     geometry: DigestGeometry,
     map_id: [u8; 16],
@@ -43,7 +41,11 @@ pub struct OriginManifest {
     rows: Vec<[u8; 32]>,
 }
 
-impl OriginManifest {
+/// Read-only restoration of immutable enrollment rows. This type cannot
+/// supply sealer-origin evidence to ingest.
+pub struct StoredManifest(OriginManifest);
+
+impl StoredManifest {
     /// Restore the original ordered hashes from a validated winner's immutable
     /// enrollment rows. The caller establishes their provenance and exact map
     /// association within the protected storage lookup.
@@ -63,16 +65,68 @@ impl OriginManifest {
             pins.generation_id,
             pins.provider_configuration,
         ];
-        Some(Self {
+        Some(Self(OriginManifest {
             geometry,
             map_id: pins.map_id,
             context: context_hash(&identities, geometry, &header)?,
             header,
             plaintext_sha256: pins.plaintext_sha256,
             rows,
-        })
+        }))
     }
 
+    pub fn authenticate(
+        &self,
+        root: &[u8; 32],
+        context: &crate::media_envelope::EnvelopeContext,
+        record: &[u8; 230],
+    ) -> bool {
+        crate::media_envelope::verify_enrolled_scheme2(root, context, record, record, &self.0)
+            .is_ok()
+    }
+}
+
+/// Read-only manifest input to the playback range receiver.
+#[derive(Clone, Copy)]
+pub enum PlaybackManifest<'a> {
+    Sealed(&'a OriginManifest),
+    Stored(&'a StoredManifest),
+}
+
+impl<'a> From<&'a OriginManifest> for PlaybackManifest<'a> {
+    fn from(origin: &'a OriginManifest) -> Self {
+        Self::Sealed(origin)
+    }
+}
+
+impl<'a> PlaybackManifest<'a> {
+    pub(crate) fn origin(self) -> &'a OriginManifest {
+        match self {
+            Self::Sealed(origin) => origin,
+            Self::Stored(stored) => &stored.0,
+        }
+    }
+
+    pub fn matches(
+        &self,
+        pins: &DigestReadSnapshot<'_>,
+        context: &crate::media_envelope::EnvelopeContext,
+    ) -> bool {
+        let origin = self.origin();
+        let [_, identities @ ..] = context.identities;
+        &pins.plaintext_sha256 == origin.plaintext_sha256()
+            && origin
+                .candidate_page_hashes(
+                    &identities,
+                    pins.plaintext_len,
+                    &pins.map_id,
+                    &context.header,
+                )
+                .is_some()
+    }
+}
+
+impl OriginManifest {
     /// Digest of the plaintext chunks consumed by this sealer, in order.
     /// This alone does not authorize a claim, publication, or reuse. Do not
     /// include this digest in logs or errors.

@@ -187,28 +187,17 @@ async fn resolves_only_the_committed_scoped_publication() {
     let renewed = receipt(track, digest, 2, exp);
     assert!(query(&mut reader, &renewed, &pins).await.is_some());
 
-    // The original publisher fixture has a genuinely sealed header and
-    // authenticated envelope, unlike the replacement's metadata-only pins.
-    let seq: i64 = writer
+    // Exercise custody with the original authenticated publisher fixture.
+    let original_row = writer
         .query_one(
             include_str!("../tests/fixtures/private_catalogue_custody.sql"),
             &[&track],
         )
         .await
-        .unwrap()
-        .get(0);
-    let row = writer
-        .query_one(
-            "SELECT encode(w.plaintext_sha256, 'hex') FROM public.catalogue_s3_sources s
-         JOIN public.storage_validated_digest_winners w USING (object_id)
-         WHERE s.track_id = $1::text::uuid",
-            &[&track],
-        )
-        .await
         .unwrap();
-    let original = receipt(track, row.get(0), 2, exp);
+    let original = receipt(track, original_row.get(1), 2, exp);
     let original_pins = PublicationPins {
-        accepted_seq: seq,
+        accepted_seq: original_row.get(0),
         version: "Opaque+%2F/=",
         ..pins
     };
@@ -262,8 +251,9 @@ async fn resolves_only_the_committed_scoped_publication() {
         .await
         .unwrap();
     assert_eq!(resolved.read.pins().media_version, original_pins.version);
-    assert_eq!(
-        resolved.manifest.plaintext_sha256(),
-        &resolved.read.target().plaintext_sha256
-    );
+    let manifest = nntune_core::digest_enrollment::PlaybackManifest::Stored(&resolved.manifest);
+    assert!(manifest.matches(
+        &resolved.read.playback_snapshot().unwrap(),
+        &resolved.context
+    ));
 }

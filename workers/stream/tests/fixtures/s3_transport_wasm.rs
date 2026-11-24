@@ -127,7 +127,7 @@ impl PlaybackFixture {
         };
         let enrolled = EnrolledMedia {
             media: &media,
-            manifest: &self.manifest,
+            manifest: nntune_core::digest_enrollment::PlaybackManifest::Sealed(&self.manifest),
             context: &self.context,
             root: &ROOT,
             expected_record: &self.envelope,
