@@ -976,14 +976,14 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
       stagingWebResult: string,
       eventName: string,
       stagingApiResult = 'success',
+      privateJourneyArmed = false,
     ): boolean => {
       const inner = condition!
         .replace(/^\$\{\{\s*/, '')
         .replace(/\s*\}\}$/, '');
-      const expr = inner.replace(
-        /github\.event_name\s*==\s*'push'/g,
-        String(eventName === 'push'),
-      );
+      const expr = inner
+        .replace(/github\.event_name\s*==\s*'push'/g, String(eventName === 'push'))
+        .replace(/vars\.PRIVATE_MUSIC_STAGING_JOURNEY\s*!=\s*'true'/g, String(!privateJourneyArmed));
       expect(expr, `unmodelled post-deploy syntax in: ${condition}`).toMatch(
         /^[\s()!&|truefals]+$/,
       );
@@ -992,6 +992,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
       return stagingWebResult === 'success' && stagingApiResult === 'success' && conditionHolds;
     };
     expect(evaluate('success', 'push')).toBe(true);
+    expect(evaluate('success', 'push', 'success', true)).toBe(false);
     for (const result of ['skipped', 'failure', 'cancelled']) {
       expect(
         evaluate(result, 'push'),
@@ -1010,7 +1011,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   test('main staging deploy and post-deploy E2E share a queued workflow lock', () => {
     const group = "  group: ${{ github.event_name == 'push' && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}\n";
     const lock = `\nconcurrency:\n${group}  cancel-in-progress: false\n  queue: max\n`;
-    const lanes = ['staging-web', 'staging-api', 'staging-mb', 'staging-ingest', 'post-deploy-e2e'];
+    const lanes = ['staging-web', 'staging-api', 'staging-mb', 'staging-ingest', 'post-deploy-e2e', 'post-deploy-private-music'];
     const assertDeployLock = (body: string) => {
       const header = body.split('\njobs:\n')[0]!;
       expect(header).toMatch(/^on:\n  push:\n    branches: \[main\]\n  workflow_dispatch:\n\n/m);
@@ -1794,6 +1795,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(names).toEqual([
       'gate',
       'post-deploy-e2e',
+      'post-deploy-private-music',
       'staging-api',
       'staging-ingest',
       'staging-mb',
@@ -1848,7 +1850,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     // Working directories: apps/web everywhere except the backend lanes,
     // which deploy from their own workers/<lane> checkout (see
     // LANE_WORKING_DIRS for the ingest lane's shared gate script).
-    for (const line of bodyWithoutLanes(body, BACKEND_LANES).split('\n')) {
+    for (const line of bodyWithoutLanes(body, [...BACKEND_LANES, 'post-deploy-private-music']).split('\n')) {
       if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
         expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
           'apps/web',
@@ -2117,6 +2119,16 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
 
   test('job set is exactly the evidenced lanes (web + api/mb/ingest staging)', () => {
     assertJobSet(jobsBody);
+  });
+
+  test('private music journey requires an armed, same-build staging deploy', () => {
+    const lane = 'post-deploy-private-music';
+    const section = jobSection(deployWorkflow, lane);
+    expect(jobIf(deployWorkflow, lane)).toBe("${{ github.event_name == 'push' && vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' }}");
+    expect(section).toContain('needs: [staging-web, staging-api]');
+    expect(section).toContain('environment:\n      name: staging\n    steps:');
+    expect(section).toContain('test "$API_DEPLOYED" = true && test "$API_SOURCE_SHA" = "$GITHUB_SHA"');
+    expect(section.match(/working-directory: .*$/gm)).toEqual(['working-directory: e2e', 'working-directory: e2e']);
   });
 
   test('only the evidenced staging steps run a wrangler deploy', () => {

@@ -1,0 +1,9 @@
+{
+  "license": "CC0-1.0",
+  "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "source": "Original 14-second mono sine tones at 44100 Hz generated with the FFmpeg sine filter, encoded as FLAC with -map_metadata -1 -fflags +bitexact -flags:a +bitexact. Tone A is 330 Hz. Tone B is 440 Hz.",
+  "tracks": [
+    { "file": "tone-a.flac", "bytes": 177175, "sha256": "c935d3368a1f2f22ca87b8ccfa6b9facae070e6e07be1e16abff513835a5f259" },
+    { "file": "tone-b.flac", "bytes": 176198, "sha256": "282e10c51971566914e576c6f562ab02226186bad3a591174ec1d4f35f732f37" }
+  ]
+}

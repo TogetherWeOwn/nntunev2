@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { expect, test } from '@playwright/test';
+import { parsePrivateStagingFixture, privateStagingAudio } from '../../helpers/private-staging-fixture.js';
 import {
   assertCuratedLibrary,
   assertPrivateInvite,
@@ -9,6 +10,31 @@ import {
 } from '../../helpers/private-music-journey.js';
 
 const clips = new URL('../../../fixtures/synthetic-flac/admin-upload/', import.meta.url);
+
+test('staging preflight rejects stale, non-synthetic and ambiguous evidence', () => {
+  const now = 1_800_000_000;
+  const fixture = {
+    email: 'listener@example.test', inviteCode: 'A'.repeat(22), expiresAt: now + 180,
+    publications: privateStagingAudio().map(({ sha256, body }, index) => {
+      expect(body.length).toBeGreaterThan(69631);
+      return { trackId: `fixture-${index}`, sha256 };
+    }),
+  };
+  const digests = fixture.publications.map(({ sha256 }) => sha256);
+  expect(parsePrivateStagingFixture(JSON.stringify(fixture), now, digests)).toEqual(fixture);
+  for (const invalid of [
+    { ...fixture, email: 'listener@example.com' },
+    { ...fixture, expiresAt: now },
+    { ...fixture, expiresAt: now + 481 },
+    { ...fixture, inviteCode: 'query&other=value' },
+    { ...fixture, publications: [fixture.publications[0], fixture.publications[0]] },
+    { ...fixture, publications: [fixture.publications[0], { ...fixture.publications[1], sha256: '0'.repeat(64) }] },
+  ]) {
+    expect(() => parsePrivateStagingFixture(JSON.stringify(invalid), now, digests)).toThrow(
+      'Private staging requires a fresh synthetic invite and two verified publication records',
+    );
+  }
+});
 
 test('synthetic invite redemption requires a usable Library session', () => {
   const redeemed = {
