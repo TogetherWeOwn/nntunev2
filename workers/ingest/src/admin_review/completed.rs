@@ -22,7 +22,7 @@ pub struct ReviewTarget<'a> {
 
 /// Resolved by the server for the locked job and revision. The upload carries
 /// the sealed authenticated readback, scoped final checkpoint and exact pins.
-/// Matching inputs come from the pinned job and the authorized CC0 mirror.
+/// Use the pinned job and authorized CC0 mirror. Return Unavailable for outages.
 pub struct ResolvedCompletion<'a> {
     pub job_id: &'a str,
     pub revision: u32,
@@ -41,18 +41,15 @@ pub async fn retry_completed<'a>(
     auth: &Authorization<'_>,
     client: &mut Client,
     target: ReviewTarget<'_>,
-    lock: impl AsyncFn(
-        &Transaction<'_>,
-        &str,
-        &ReviewTarget<'_>,
-    ) -> Result<Option<ReviewJob>, BoundaryError>,
+    lock: impl AsyncFn(&Transaction<'_>, &str, &str) -> Result<Option<ReviewJob>, BoundaryError>,
     record: impl AsyncFnOnce(&Transaction<'_>, &ReviewJob, &JobView) -> Result<(), BoundaryError>,
     resolve: impl AsyncFnOnce(&ReviewJob) -> Result<ResolvedCompletion<'a>, BoundaryError>,
     read_committed: impl AsyncFnMut(
         &CompletionScope<'_>,
     ) -> Result<Option<CommittedOutcome>, PublicationError>,
 ) -> Result<JobView, ApiError> {
-    let (caller, revision) = retry_input(auth, target.body)?;
+    let (caller, request) = retry_input(auth, target.body)?;
+    let revision = request.revision;
     let mut tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::ReadCommitted)
@@ -60,7 +57,7 @@ pub async fn retry_completed<'a>(
         .await
         .map_err(|_| BoundaryError::Unavailable)?;
     let job = load(
-        async |actor, _| lock(&tx, actor, &target).await,
+        async |actor, id| lock(&tx, actor, id).await,
         &caller,
         target.job_id,
     )

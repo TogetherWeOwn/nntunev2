@@ -145,13 +145,13 @@ pub async fn retry(
     job_id: &str,
     body: &[u8],
 ) -> Result<JobView, ApiError> {
-    let (caller, revision) = retry_input(auth, body)?;
+    let (caller, request) = retry_input(auth, body)?;
     let job = load(get, &caller, job_id).await?;
     let object = versioned_object(&job)?;
-    if is_retry_result(&job, revision) {
+    if is_retry_result(&job, request.revision) {
         return Ok(job.view);
     }
-    next_revision(&job, revision)?;
+    next_revision(&job, request.revision)?;
     if verify(&caller.user_id, object).await? != *object {
         return Err(BoundaryError::Conflict.into());
     }
@@ -159,13 +159,13 @@ pub async fn retry(
     if !owns_job(&caller, &committed.owner_id) || committed.view.job_id != job_id {
         return Err(not_found());
     }
-    if !is_retry_result(&committed, revision) || committed.object.as_ref() != Some(object) {
+    if !is_retry_result(&committed, request.revision) || committed.object.as_ref() != Some(object) {
         return Err(BoundaryError::Unavailable.into());
     }
     Ok(committed.view)
 }
 
-fn retry_input(auth: &Authorization<'_>, body: &[u8]) -> Result<(Caller, u32), ApiError> {
+fn retry_input(auth: &Authorization<'_>, body: &[u8]) -> Result<(Caller, RetryRequest), ApiError> {
     let caller = auth.caller(RETRY_SCOPE)?;
     if body.len() > RETRY_BODY_LIMIT {
         return Err(ApiError::by_code("payload_too_large", "body too large"));
@@ -175,7 +175,7 @@ fn retry_input(auth: &Authorization<'_>, body: &[u8]) -> Result<(Caller, u32), A
     }
     let request: RetryRequest = serde_json::from_slice(body)
         .map_err(|_| ApiError::invalid_request("invalid retry request"))?;
-    Ok((caller, request.revision))
+    Ok((caller, request))
 }
 
 fn versioned_object(job: &ReviewJob) -> Result<&ObjectRef, BoundaryError> {

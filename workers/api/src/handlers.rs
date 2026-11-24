@@ -23092,15 +23092,23 @@ mod tests {
             stripe_signature: None,
             body: br#" { "revision": 4 } "#.to_vec(),
         };
-        let ctx = h.ctx();
-        for cookie in [None, Some(member)] {
-            req.cookie = cookie;
-            let denied = block_on(admin_flac_proxy::retry(&ctx, &req, Some(key), async |_| {
-                panic!("refusals must not reach ingest")
-            }));
-            assert_eq!(denied.unwrap_err().status, 404);
-        }
+        let mut ctx = h.ctx();
+        let denied = |ctx: &_, req: &Request| {
+            let send = async |_| panic!("unexpected ingest call");
+            block_on(admin_flac_proxy::retry(ctx, req, Some(key), send))
+                .unwrap_err()
+                .status
+        };
+        assert_eq!(denied(&ctx, &req), 404);
+        req.cookie = Some(member);
+        assert_eq!(denied(&ctx, &req), 404);
         req.cookie = Some(admin);
+        let origin = req.origin.take();
+        assert_eq!(denied(&ctx, &req), 404);
+        req.origin = origin;
+        ctx.now += session::PRIVILEGE_REAUTH_WINDOW_SECS + 1;
+        assert_eq!(denied(&ctx, &req), 401);
+        ctx.now = NOW;
         assert_eq!(block_on(handle(&ctx, &req)).status, 404);
         let post = block_on(admin_flac_proxy::retry(
             &ctx,
@@ -23114,12 +23122,7 @@ mod tests {
         let expected = issue("admin1", RETRY_SCOPE, NOW + 60, key.as_bytes());
         assert_eq!(post.authorization, crate::ingest_grant::bearer(&expected));
         req.body = br#"{"revision":4,"receipt":"caller-supplied"}"#.to_vec();
-        assert_eq!(
-            block_on(admin_flac_proxy::retry(&ctx, &req, Some(key), async |_| ()))
-                .unwrap_err()
-                .status,
-            400,
-        );
+        assert_eq!(denied(&ctx, &req), 400);
     }
 
     #[test]

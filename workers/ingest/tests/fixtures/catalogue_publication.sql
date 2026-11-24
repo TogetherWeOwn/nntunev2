@@ -97,3 +97,6 @@ BEGIN
         PERFORM pg_sleep(0.01);
     END LOOP;
 END $$;
+
+CREATE TABLE public.test_flac_review (revision integer NOT NULL);
+INSERT INTO public.test_flac_review VALUES (1);
