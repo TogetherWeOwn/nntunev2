@@ -310,3 +310,8 @@ sha256 = "3740b481e83ae13387f8e8169c2ad0f0c5b37e0c34f8a5182f3faa5d21897f00"
 file = "0061_invite_issuer_restriction.sql"
 target = "app"
 sha256 = "5b37d57a74e1f9c3b0e134aac28059a73e0f879d0aa5e97597ae79bc1db813b0"
+
+[[migration]]
+file = "0062_ingest_sessions.sql"
+target = "app"
+sha256 = "00ef502288181c1a18b77a0974d8b3a900fdfa49efce8907ce38d70353121ff3"

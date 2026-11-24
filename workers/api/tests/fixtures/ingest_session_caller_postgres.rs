@@ -61,10 +61,6 @@ async fn connect(url: &str) -> Client {
 async fn scoped_writer_commits_and_replays_exact_upload() {
     let observer = connect(DB).await;
     observer
-        .batch_execute(include_str!("../../src/ingest_session_schema.sql"))
-        .await
-        .unwrap();
-    observer
         .batch_execute(include_str!("ingest_session_writer_grants.sql"))
         .await
         .unwrap();

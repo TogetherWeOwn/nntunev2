@@ -32,10 +32,6 @@ pub(super) async fn prove(
     let owner = "synthetic-outcome-owner";
     let other_object = hex::encode(id(0xa0));
     let other_generation = hex::encode(id(0xa1));
-    observer
-        .batch_execute(include_str!("../../../api/src/ingest_session_schema.sql"))
-        .await
-        .unwrap();
     for (signature, returns, sql) in [
         (
             "reserve(uuid, uuid, text, text, bytea, uuid)",
@@ -237,9 +233,12 @@ pub(super) async fn prove(
         assert!(matches!(result, Err(Refused)));
     }
     observer
-        .batch_execute(
-            "DROP TABLE public.ingest_session_cleanup_intents, public.ingest_session_reservations",
-        )
+        .batch_execute(&format!(
+            "BEGIN;
+             DELETE FROM public.ingest_session_cleanup_intents WHERE session_id = '{sid}';
+             DELETE FROM public.ingest_session_reservations WHERE id = '{sid}';
+             COMMIT;"
+        ))
         .await
         .unwrap();
 }

@@ -68,9 +68,12 @@ BEGIN
     END IF;
 END $$;
 
+-- PostgreSQL checks inbound foreign keys before invoking the truncate trigger.
+SELECT pg_temp.expect_error('TRUNCATE public.storage_digest_inventory_intents', '0A000');
 SELECT pg_temp.expect_error(s, '23514') FROM (VALUES
     ('UPDATE public.storage_digest_inventory_intents SET media_version = NULL'),
     ('DELETE FROM public.storage_digest_inventory_intents'),
-    ('TRUNCATE public.storage_digest_inventory_intents')
+    ('TRUNCATE public.storage_digest_inventory_intents, public.ingest_session_reservations,
+        public.ingest_session_cleanup_intents')
 ) AS cases(s);
 ROLLBACK;

@@ -88,22 +88,14 @@ backstop. A new attempt uses fresh object and sealing identities.
 
 ## Staging database handoff
 
-The pending [app migration SQL](../workers/api/src/ingest_session_schema.sql)
+The [app migration](../migrations/0062_ingest_sessions.sql)
 creates reservations and durable cleanup intents. It depends on the app
 namespace, object-intent and digest-inventory migrations (0042, 0043 and 0055)
 and the existing users table. The new tables start with owner-only ACLs even
 when the migrator has default grants for the ordinary app roles. Hosted CI
-registers the exact bytes in a temporary manifest and rehearses both a fresh
-app install and a populated upgrade. The deployed manifest excludes these bytes.
+rehearses the registered bytes on a fresh app install and a populated upgrade.
 
-To activate the schema, take a separate staging migration PR. Copy the exact
-SQL bytes into `migrations/` as the next available numbered
-`*_ingest_sessions.sql` and append its `app` entry and SHA-256 to the manifest.
-Make the disposable rehearsal use that entry directly. Remove direct schema
-loads and table drops from the reservation SQL and race fixtures and the
-cleanup handoff, multipart handoff, reconciliation and publisher-outcome
-PostgreSQL tests. Seed and clear only their fixture rows once migration
-replay takes ownership of the tables. Use the
+Use the
 [protected staging apply procedure](ops.md#staging-migrations)
 with independent approval for the exact DDL and a successful staging ledger
 receipt before merge. For a failed or uncertain apply, reconcile both the

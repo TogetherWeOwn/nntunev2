@@ -220,8 +220,7 @@ DROP FUNCTION public.digest_ref_fixture(int, bool, text, uuid, timestamptz);
 SQL
 
 # Reuse the disposable lookup fixture's namespace and owner, not its digest
-# winners. Load the inert schema only here, then run the actual SQL statements.
-psql_run -f "$tests_dir/../src/ingest_session_schema.sql"
+# winners. The app migration supplies the upload-session tables.
 reserve="PREPARE reserve_session(uuid, uuid, text, text, bytea, uuid) AS $(<"$tests_dir/../src/ingest_session_reserve.sql")"
 terminate="PREPARE terminate_session(uuid, uuid, text, uuid, text, bytea, uuid, bigint, bigint, uuid) AS $(<"$tests_dir/../src/ingest_session_terminate.sql")"
 lease="PREPARE acquire_write_lease(uuid, uuid, text, uuid, bytea, uuid, bigint, bigint, uuid) AS $(<"$tests_dir/../src/ingest_session_acquire_write_lease.sql")"
@@ -413,4 +412,13 @@ wait "$holder"; wait "$contender"
   printf 'acknowledgement consumed or changed a claim that expired during the lock wait\n' >&2; exit 1;
 }
 printf 'cleanup acknowledgement refused the claim that expired during the lock wait\n'
-psql_run -c 'DROP TABLE public.ingest_session_cleanup_intents, public.ingest_session_reservations'
+psql_run <<'SQL'
+BEGIN;
+DELETE FROM public.ingest_session_cleanup_intents AS c
+USING public.ingest_session_reservations AS s
+WHERE c.session_id = s.id AND s.principal_id = 'digest-test-owner'
+  AND s.library_id = '11000000-0000-4000-8000-000000000001';
+DELETE FROM public.ingest_session_reservations
+WHERE principal_id = 'digest-test-owner' AND library_id = '11000000-0000-4000-8000-000000000001';
+COMMIT;
+SQL
