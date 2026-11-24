@@ -4,7 +4,10 @@ use crate::{
     ledger::{derive_play_idempotency_key, is_valid_key_field},
     private_catalogue_read::{lookup_scoped, PublicationScope},
     storage_digest_read::DigestReadTarget,
-    worker_entry::{classify_play_privacy, lock_playback_account, playback_privacy_mark},
+    worker_entry::{
+        acquire_playback_lease_with_expiry, classify_play_privacy, lock_playback_account,
+        playback_privacy_mark, query_playback_lease_row,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +57,7 @@ async fn current(
     db: &impl PgQuery,
     user: &str,
 ) -> Result<Option<(LeaseRow, ReceiptPins)>, StoreError> {
-    let Some(lease) = crate::worker_entry::query_playback_lease_row(db, user).await? else {
+    let Some(lease) = query_playback_lease_row(db, user).await? else {
         return Ok(None);
     };
     if !is_browser_play(&lease.play_id) {
@@ -346,13 +349,18 @@ impl PrivatePlayback<'_> {
                 },
             )
             .min(policy.expires_at)
-            .min(claims.expires_at);
-            let LeaseAcquire::Acquired { epoch } =
-                acquire_playback_lease_on(&tx, user, tab, track, &play, start, end, false).await?
+            .min(claims.expires_at)
+            .min(start.saturating_add(crate::play_grant::MAX_GRANT_TTL));
+            // Native <audio> has no heartbeat. Bound this immutable grant
+            // and lease to one track's window and the existing v4 TTL cap.
+            let LeaseAcquire::Acquired { epoch } = acquire_playback_lease_with_expiry(
+                &tx, user, tab, track, &play, start, end, end, false,
+            )
+            .await?
             else {
                 return Ok(None);
             };
-            let expires_at = playback::lease_expiry(start, end);
+            let expires_at = end;
             let pins = ReceiptPins {
                 account_session: claims.session_id.clone(),
                 play: play.clone(),

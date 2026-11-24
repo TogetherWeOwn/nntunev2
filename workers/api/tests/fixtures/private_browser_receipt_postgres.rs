@@ -70,6 +70,45 @@ pub(super) async fn receipt_retries(
     let browser = open(reader, claims, &input, scope).await.unwrap();
     let original = browser.relay();
     assert_eq!(mark_count().await, before + 1);
+    let grant = original.grant.token.as_str();
+    let receipt = service
+        .load_for_stream(reader, grant, scope, SystemTime::now)
+        .await
+        .unwrap()
+        .unwrap();
+    let cutoff = original.lease.expires_at;
+    assert!(cutoff > claims.created_at + crate::playback::LEASE_TTL_SECS);
+    let after_native_ttl =
+        UNIX_EPOCH + Duration::from_secs(claims.created_at + crate::playback::LEASE_TTL_SECS);
+    let retained = service
+        .load_for_stream(reader, grant, scope, || after_native_ttl)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.relay().lease, original.lease);
+    let root = crate::storage_digest_read::custody::PlaybackRoot {
+        version: root_version,
+        secret: &[17; 32],
+    };
+    let resolved = service
+        .resolve(reader, &receipt, grant, &root, SystemTime::now)
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot =
+        crate::worker_entry::private_browser_custody::project(&receipt, resolved, grant).unwrap();
+    let pins = snapshot.pins().unwrap();
+    assert_eq!(snapshot.catalogue_reference, pins.reference_id);
+    assert_eq!(snapshot.media_version, publication.version);
+    assert_eq!(snapshot.page_hashes.len(), snapshot.page_versions.len());
+    assert!(!snapshot.page_hashes.is_empty());
+    assert!(snapshot.usable_until_unix <= cutoff);
+    let wrong_grant = format!("{grant}x");
+    assert!(service
+        .load_for_stream(reader, &wrong_grant, scope, SystemTime::now)
+        .await
+        .unwrap()
+        .is_none());
     let replay = open(reader, claims, &input, scope).await.unwrap();
     assert_eq!(replay.relay().lease, original.lease);
     assert!(replay.relay().grant.token == original.grant.token);
@@ -162,6 +201,14 @@ pub(super) async fn receipt_retries(
             .unwrap();
         assert!(
             open(reader, claims, &input, scope).await.is_none(),
+            "{state}"
+        );
+        assert!(
+            service
+                .load_for_stream(reader, grant, scope, SystemTime::now)
+                .await
+                .unwrap()
+                .is_none(),
             "{state}"
         );
     }

@@ -69,6 +69,13 @@ pub fn max_body_bytes(method: &str, path: &str) -> usize {
     } else if method == "POST" && path == "/v1/me/likes/import" {
         // A compact batch of 500 maximum-length track IDs exceeds 32 KiB.
         320 * 1024
+    } else if method == "POST"
+        && matches!(
+            path,
+            nntune_core::playback_custody::RESOLVE_PATH | nntune_core::playback_custody::LEASE_PATH
+        )
+    {
+        1800
     } else {
         MAX_BODY_BYTES
     }

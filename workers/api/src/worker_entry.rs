@@ -571,6 +571,32 @@ pub async fn acquire_playback_lease_on(
     continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
+    acquire_playback_lease_with_expiry(
+        client,
+        user_id,
+        session_id,
+        track_id,
+        play_id,
+        now,
+        continuation_deadline,
+        crate::playback::lease_expiry(now, continuation_deadline),
+        takeover,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acquire_playback_lease_with_expiry(
+    client: &impl PgQuery,
+    user_id: &str,
+    session_id: &str,
+    track_id: &str,
+    play_id: &str,
+    now: u64,
+    continuation_deadline: u64,
+    expires_at: u64,
+    takeover: bool,
+) -> Result<crate::playback::LeaseAcquire, StoreError> {
     let rows = client
         .query_typed(
             crate::playback::playback_lease_acquire_statement(),
@@ -579,10 +605,7 @@ pub async fn acquire_playback_lease_on(
                 (&session_id, Type::TEXT),
                 (&track_id, Type::TEXT),
                 (&play_id, Type::TEXT),
-                (
-                    &i64_of(crate::playback::lease_expiry(now, continuation_deadline))?,
-                    Type::INT8,
-                ),
+                (&i64_of(expires_at)?, Type::INT8),
                 (&i64_of(now)?, Type::INT8),
                 (&takeover, Type::BOOL),
                 (&i64_of(continuation_deadline)?, Type::INT8),
@@ -867,7 +890,7 @@ pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
 pub use subsonic_pg::load_staging_account;
 
 #[path = "private_browser_custody.rs"]
-mod private_browser_custody;
+pub(crate) mod private_browser_custody;
 #[path = "private_browser_worker.rs"]
 mod private_browser_worker;
 
@@ -4150,6 +4173,12 @@ impl Store for PgStore {
             TOTAL_TIMEOUT_MS,
         )
         .await
+    }
+
+    fn browser_playback_enabled(&self) -> bool {
+        self.env
+            .as_ref()
+            .is_some_and(private_browser_custody::can_open)
     }
 
     async fn open_browser_playback(

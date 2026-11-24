@@ -12,8 +12,33 @@ use super::{
     CollectedBody, Config, Env, PgStore, StoreError, WorkerResult,
 };
 use crate::{
-    handlers, private_playback::PrivatePlayback, storage_digest_read::custody::PlaybackRoot,
+    handlers,
+    private_playback::{PrivatePlayback, PrivateReceipt},
+    storage_digest_read::custody::{PlaybackRoot, ResolvedPlayback},
 };
+
+fn root_secret(env: &Env) -> Option<Zeroizing<[u8; 32]>> {
+    env.secret("PRIVATE_PLAYBACK_ROOT_KEY")
+        .ok()
+        .and_then(|value| hex(&Zeroizing::new(value.to_string())))
+        .map(Zeroizing::new)
+}
+
+fn custody_secret(env: &Env) -> Option<Zeroizing<String>> {
+    let secret = Zeroizing::new(
+        env.secret(playback_custody::SECRET_BINDING)
+            .ok()?
+            .to_string(),
+    );
+    (secret.len() >= 32).then_some(secret)
+}
+
+pub(super) fn can_open(env: &Env) -> bool {
+    super::private_browser_worker::enabled(env)
+        && env.service("STREAM").is_ok()
+        && custody_secret(env).is_some()
+        && root_secret(env).is_some()
+}
 
 fn authentic(secret: &[u8], path: &str, bearer: &str, header: Option<&str>) -> bool {
     let signature = header
@@ -62,10 +87,7 @@ async fn serve(
     let Some(bearer) = std::str::from_utf8(body).ok().filter(|s| s.len() <= 1800) else {
         return fixed_response(404);
     };
-    let secret = env
-        .secret(playback_custody::SECRET_BINDING)
-        .ok()
-        .map(|value| Zeroizing::new(value.to_string()));
+    let secret = custody_secret(env);
     if req.method != "POST"
         || req.cookie.is_some()
         || !secret.is_some_and(|secret| {
@@ -89,12 +111,7 @@ async fn serve(
             if req.path == LEASE_PATH {
                 return Ok(Some(None));
             }
-            let Some(root) = env
-                .secret("PRIVATE_PLAYBACK_ROOT_KEY")
-                .ok()
-                .and_then(|value| hex(&Zeroizing::new(value.to_string())))
-                .map(Zeroizing::new)
-            else {
+            let Some(root) = root_secret(env) else {
                 return Ok(None);
             };
             let root = PlaybackRoot {
@@ -107,29 +124,7 @@ async fn serve(
             else {
                 return Ok(None);
             };
-            let pins = resolved.read.playback_snapshot()?;
-            let locator = resolved.media.locator();
-            Ok(Some(Some(CustodySnapshot {
-                bearer_sha256: Sha256::digest(bearer.as_bytes()).into(),
-                catalogue_reference: PrivatePlayback::catalogue_reference(&receipt),
-                reference_id: pins.reference_id,
-                identities: resolved.context.identities,
-                map_id: pins.map_id,
-                plaintext_len: pins.plaintext_len,
-                plaintext_sha256: pins.plaintext_sha256,
-                bucket: locator.bucket().into(),
-                key: locator.key().into(),
-                media_version: pins.media_version.into(),
-                page_versions: pins.page_versions.to_vec(),
-                usable_until_unix: pins
-                    .usable_until
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|_| StoreError)?
-                    .as_secs(),
-                header: resolved.context.header.to_vec(),
-                envelope_record: resolved.record.to_vec(),
-                page_hashes: resolved.ordered_page_hashes,
-            })))
+            Ok(Some(Some(project(&receipt, resolved, bearer)?)))
         },
         4_500,
         StoreError,
@@ -147,6 +142,36 @@ async fn serve(
         }
         Err(_) => fixed_response(503),
     }
+}
+
+pub(crate) fn project(
+    receipt: &PrivateReceipt,
+    resolved: ResolvedPlayback,
+    bearer: &str,
+) -> Result<CustodySnapshot, StoreError> {
+    let pins = resolved.read.playback_snapshot()?;
+    let locator = resolved.media.locator();
+    Ok(CustodySnapshot {
+        bearer_sha256: Sha256::digest(bearer.as_bytes()).into(),
+        catalogue_reference: PrivatePlayback::catalogue_reference(receipt),
+        reference_id: pins.reference_id,
+        identities: resolved.context.identities,
+        map_id: pins.map_id,
+        plaintext_len: pins.plaintext_len,
+        plaintext_sha256: pins.plaintext_sha256,
+        bucket: locator.bucket().into(),
+        key: locator.key().into(),
+        media_version: pins.media_version.into(),
+        page_versions: pins.page_versions.to_vec(),
+        usable_until_unix: pins
+            .usable_until
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| StoreError)?
+            .as_secs(),
+        header: resolved.context.header.to_vec(),
+        envelope_record: resolved.record.to_vec(),
+        page_hashes: resolved.ordered_page_hashes,
+    })
 }
 
 #[cfg(test)]
