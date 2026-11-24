@@ -68,6 +68,7 @@ class TrialSchemaTests(unittest.TestCase):
         for grant, revoke in (
             (f'GRANT "{WRITER}" TO "{READER}" WITH INHERIT FALSE;', f'REVOKE "{WRITER}" FROM "{READER}";'),
             (f'GRANT postgres TO "{WRITER}" WITH INHERIT FALSE;', f'REVOKE postgres FROM "{WRITER}";'),
+            (f'GRANT postgres TO "{READER}" WITH INHERIT FALSE;', f'REVOKE postgres FROM "{READER}";'),
             (f'GRANT CREATE ON SCHEMA public TO "{WRITER}";', f'REVOKE CREATE ON SCHEMA public FROM "{WRITER}";'),
             ('REVOKE USAGE ON SCHEMA public FROM PUBLIC;', 'GRANT USAGE ON SCHEMA public TO PUBLIC;'),
         ):
