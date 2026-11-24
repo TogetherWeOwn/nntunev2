@@ -1,9 +1,11 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use tokio_postgres::{types::ToSql, Client, IsolationLevel, Transaction};
 use worker::{Delay, Env};
 
-use super::{enqueue_claim, CleanupClaim, CleanupKind, HandoffError};
+use super::{
+    handoff, send_cleanup_message, CleanupClaim, CleanupKind, CleanupMessage, HandoffError,
+};
 use crate::library::{with_db_deadline, LIBRARY_DB_DEADLINE_MS};
 
 const CLAIM: &str = include_str!("../../../api/src/ingest_session_claim_cleanup.sql");
@@ -32,13 +34,33 @@ pub async fn dispatch_scope(
     mut db: Client,
     scope: CleanupScope<'_>,
 ) -> Result<(), DispatchError> {
-    let claims = with_db_deadline(scope.claim(&mut db), db_deadline(), || ())
+    dispatch_claims(
+        &mut db,
+        scope,
+        |message, delay| send_cleanup_message(env, message, delay),
+        db_deadline,
+    )
+    .await
+}
+
+async fn dispatch_claims<S, D>(
+    db: &mut Client,
+    scope: CleanupScope<'_>,
+    mut send: impl FnMut(CleanupMessage, u32) -> S,
+    deadline: impl Fn() -> D,
+) -> Result<(), DispatchError>
+where
+    S: Future<Output = Result<(), ()>>,
+    D: Future<Output = ()>,
+{
+    let claims = with_db_deadline(scope.claim(db), deadline(), || ())
         .await
         .map_err(|()| DispatchError::ClaimNotConfirmed)?;
     for claim in claims {
-        let db = &mut db;
-        enqueue_claim(env, claim, |_, kind, id| async move {
-            with_db_deadline(scope.ack(db, kind, &id), db_deadline(), || ()).await
+        let db = &mut *db;
+        let deadline = &deadline;
+        handoff(claim, &mut send, |_, kind, id| async move {
+            with_db_deadline(scope.ack(db, kind, &id), deadline(), || ()).await
         })
         .await
         .map_err(DispatchError::Handoff)?;
@@ -120,6 +142,7 @@ impl CleanupScope<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{sync::oneshot, time};
 
     #[tokio::test]
     #[ignore = "requires the disposable hosted migration database"]
@@ -159,25 +182,64 @@ mod tests {
             principal_id: "not-the-owner",
             ..scope
         };
-        assert!(outside.claim(&mut db).await.unwrap().is_empty());
-        let mut claims = scope.claim(&mut db).await.unwrap();
-        assert_eq!(claims.len(), 1);
-        let claim = claims.pop().unwrap();
-        assert_eq!(claim.kind, CleanupKind::AbsoluteExpiry);
-        assert!((1..=86400).contains(&claim.delay_seconds));
-        let visible: Option<String> = observer.query_one("SELECT delivery_claim_id::text FROM public.ingest_session_cleanup_intents WHERE session_id=$1::text::uuid",
-            &[&scope.session_id]).await.unwrap().get(0);
-        assert_eq!(visible.as_deref(), Some(claim.claim_id.as_str()));
-        assert!(!outside
-            .ack(&mut db, claim.kind, &claim.claim_id)
-            .await
-            .unwrap());
-        assert!(scope
-            .ack(&mut db, claim.kind, &claim.claim_id)
-            .await
-            .unwrap());
+        let deadline = || time::sleep(Duration::from_millis(LIBRARY_DB_DEADLINE_MS));
+        dispatch_claims(
+            &mut db,
+            outside,
+            |_, _| async { panic!("out-of-scope dispatch attempted a queue send") },
+            deadline,
+        )
+        .await
+        .unwrap();
+
+        let (sent, observed_send) = oneshot::channel();
+        let (accept, accepted) = oneshot::channel();
+        let mut queue = Some((sent, accepted));
+        let dispatch = dispatch_claims(
+            &mut db,
+            scope,
+            move |message, delay| {
+                let (sent, accepted) = queue.take().expect("unexpected second queue send");
+                async move {
+                    assert!(sent.send((message, delay)).is_ok());
+                    accepted.await.map_err(|_| ())
+                }
+            },
+            deadline,
+        );
+        let observe = async {
+            let (message, delay) = observed_send
+                .await
+                .expect("dispatch skipped the queue send");
+            let CleanupMessage::UploadSessionCleanup { session_id, kind } = message;
+            assert_eq!(session_id, scope.session_id);
+            assert_eq!(kind, CleanupKind::AbsoluteExpiry);
+            assert!((1..=86400).contains(&delay));
+            let intent = observer.query_one(
+                "SELECT delivery_claim_id::text, enqueued_at IS NULL, claimed_until > clock_timestamp()
+                 FROM public.ingest_session_cleanup_intents WHERE session_id=$1::text::uuid AND kind='absolute_expiry'",
+                &[&scope.session_id],
+            ).await.unwrap();
+            let claim_id: String = intent
+                .get::<_, Option<String>>(0)
+                .expect("claim must be committed and visible before send");
+            assert!(
+                intent.get::<_, bool>(1),
+                "acknowledged before queue acceptance"
+            );
+            assert!(intent.get::<_, bool>(2), "claim must be live at send time");
+            assert!(!outside.ack(&mut observer, kind, &claim_id).await.unwrap());
+            assert!(accept.send(()).is_ok());
+            claim_id
+        };
+        let (outcome, claim_id) = time::timeout(Duration::from_secs(30), async {
+            tokio::join!(dispatch, observe)
+        })
+        .await
+        .expect("dispatch or queue observation timed out");
+        outcome.unwrap();
         assert!(!scope
-            .ack(&mut observer, claim.kind, &claim.claim_id)
+            .ack(&mut observer, CleanupKind::AbsoluteExpiry, &claim_id)
             .await
             .unwrap());
         let acknowledged: bool = observer.query_one("SELECT enqueued_at IS NOT NULL AND delivery_claim_id IS NULL AND claimed_until IS NULL

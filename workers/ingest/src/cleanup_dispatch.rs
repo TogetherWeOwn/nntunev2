@@ -75,16 +75,18 @@ pub async fn enqueue_claim<A: Future<Output = Result<bool, ()>>>(
 ) -> Result<(), HandoffError> {
     handoff(
         claim,
-        |message, delay| async move {
-            env.queue(crate::dispatch::INGEST_QUEUE_BINDING)
-                .map_err(|_| ())?
-                .send(MessageBuilder::new(message).delay_seconds(delay).build())
-                .await
-                .map_err(|_| ())
-        },
+        |message, delay| send_cleanup_message(env, message, delay),
         ack,
     )
     .await
+}
+
+async fn send_cleanup_message(env: &Env, message: CleanupMessage, delay: u32) -> Result<(), ()> {
+    env.queue(crate::dispatch::INGEST_QUEUE_BINDING)
+        .map_err(|_| ())?
+        .send(MessageBuilder::new(message).delay_seconds(delay).build())
+        .await
+        .map_err(|_| ())
 }
 
 async fn handoff<S: Future<Output = Result<(), ()>>, A: Future<Output = Result<bool, ()>>>(
