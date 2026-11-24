@@ -14,8 +14,8 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    test portal with period-end cancellation and subscription changes disabled.
    Verify `plan_prices` against the provider account, currency, amount, interval
    and usage type. Admit only `POST /v1/billing/webhook` via the Access exception.
-   Verify invalid signatures refuse and a verified replay leaves the
-   subscription and paid-invoice history unchanged.
+   Deliver `checkout.session.completed` and `customer.subscription.updated`.
+   Prove signature failure and replay of a verified delivery at that ingress.
 3. Complete test checkout. Verify confirmed coverage and the caller's portal
    through `/v1/me/subscription` and the billing page. Reuse the
    [play, seek and meter assertions](../e2e/tests/ingest-play-meter.spec.ts)
