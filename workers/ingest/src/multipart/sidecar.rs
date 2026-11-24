@@ -1,5 +1,6 @@
 //! Pin one versioned sidecar PUT; stored bytes still need full readback.
 
+use nntune_core::digest_page::object_key;
 use nntune_core::{
     digest_enrollment::OriginManifest, digest_page::page_hash, media_envelope::EnvelopeContext,
 };
@@ -77,10 +78,7 @@ impl<'a> SidecarPut<'a> {
         if page_hash(body).as_ref() != Some(expected) {
             return Err(SidecarError::Origin);
         }
-        let object = hex::encode(identities[2]);
-        let generation = hex::encode(identities[3]);
-        let map = hex::encode(map_id);
-        let key = format!("media-digests/{object}/{generation}/{map}/{index:08x}");
+        let key = object_key(identities[2], identities[3], map_id, index);
         let target = SidecarTarget {
             bucket,
             key,

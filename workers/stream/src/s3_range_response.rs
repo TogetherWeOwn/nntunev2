@@ -53,11 +53,30 @@ pub async fn read_s3_range_chunk(
         return Err(ObjectIdentity);
     }
     let chunk = plan.sealed_chunk(index).ok_or(NoCiphertext)?;
-    let len =
-        validate_s3_range_metadata(plan, chunk.ciphertext, expected_locator.binding(), response)?;
-    let mut bytes = vec![0; len as usize];
+    let len = validate_s3_range_metadata(
+        plan.sealed_len(),
+        chunk.ciphertext,
+        expected_locator.binding(),
+        response,
+    )?;
+    let bytes = read_exact(&mut body, len as usize, &mut is_live).await?;
+    require_eof(&mut body, &mut is_live).await?;
+    Ok(bytes)
+}
+
+pub(super) async fn read_exact(
+    body: &mut impl ReadbackBody,
+    len: usize,
+    is_live: &mut impl FnMut() -> bool,
+) -> Result<Vec<u8>, S3RangeResponseError> {
+    use S3RangeResponseError::*;
+
+    let mut bytes = vec![0; len];
     let mut remaining = bytes.as_mut_slice();
     while !remaining.is_empty() {
+        if !is_live() {
+            return Err(Expired);
+        }
         let result = body.read(remaining).await;
         if !is_live() {
             return Err(Expired);
@@ -68,12 +87,24 @@ pub async fn read_s3_range_chunk(
         }
         remaining = remaining.get_mut(count..).ok_or(Body)?;
     }
+    Ok(bytes)
+}
+
+pub(super) async fn require_eof(
+    body: &mut impl ReadbackBody,
+    is_live: &mut impl FnMut() -> bool,
+) -> Result<(), S3RangeResponseError> {
+    use S3RangeResponseError::*;
+
+    if !is_live() {
+        return Err(Expired);
+    }
     let eof = body.read(&mut [0]).await;
     if !is_live() {
         return Err(Expired);
     }
     match eof {
-        Ok(0) => Ok(bytes),
+        Ok(0) => Ok(()),
         Ok(1) => Err(Length),
         _ => Err(Body),
     }
@@ -93,7 +124,7 @@ pub fn validate_s3_range_response(
     let span = plan
         .ciphertext_span()
         .ok_or(S3RangeResponseError::NoCiphertext)?;
-    let len = validate_s3_range_metadata(plan, span, expected_binding, response)?;
+    let len = validate_s3_range_metadata(plan.sealed_len(), span, expected_binding, response)?;
     if body_bytes != len {
         return Err(S3RangeResponseError::Length);
     }
@@ -101,8 +132,8 @@ pub fn validate_s3_range_response(
 }
 
 /// Check headers before reading any of the body; return the exact read bound.
-fn validate_s3_range_metadata(
-    plan: RangeGeometry,
+pub(super) fn validate_s3_range_metadata(
+    sealed_len: u64,
     span: std::ops::Range<u64>,
     expected_binding: &S3Binding,
     response: S3RangeResponse<'_>,
@@ -116,7 +147,7 @@ fn validate_s3_range_metadata(
         start: span.start,
         end: span.end - 1,
     };
-    let expected_range = content_range_value(range, plan.sealed_len());
+    let expected_range = content_range_value(range, sealed_len);
     if response.content_range != Some(expected_range.as_str()) {
         return Err(ContentRange);
     }

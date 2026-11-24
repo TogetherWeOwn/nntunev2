@@ -18,6 +18,9 @@ use crate::{
     s3_range_response::{read_s3_range_chunk, S3RangeResponse, S3RangeResponseError},
 };
 
+mod s3;
+pub use s3::{S3EnrolledPlayback, S3Get, S3GetReply, S3PlaybackTransport};
+
 /// Independently resolved custody for that same committed root and lifecycle.
 pub struct EnrolledMedia<'a> {
     pub media: &'a S3MediaMetadata,
@@ -40,6 +43,7 @@ pub enum PlaybackError {
 
 pub struct EnrolledPlayback<'a> {
     reader: Option<DigestRange<'a>>,
+    geometry: DigestGeometry,
     plan: RangeGeometry,
     locator: &'a S3Locator,
     pins: DigestReadSnapshot<'a>,
@@ -104,6 +108,7 @@ impl<'a> EnrolledPlayback<'a> {
             outcome,
             Some(Self {
                 reader: Some(reader),
+                geometry,
                 plan: plan.ok_or(PlaybackError::Binding)?,
                 locator,
                 pins,
@@ -145,7 +150,7 @@ impl<'a> EnrolledPlayback<'a> {
     ) -> Result<OpenPart, PlaybackError> {
         let chunk = self.next_chunk(now())?.ok_or(PlaybackError::Stopped)?;
         // Take before any await: cancellation or failure fences the in-flight cursor.
-        let mut reader = self.reader.take().ok_or(PlaybackError::Stopped)?;
+        let reader = self.reader.take().ok_or(PlaybackError::Stopped)?;
         let index = chunk.selection.index;
         let version = self.pins.page_versions.get(chunk.selection.page as usize);
         if locator != self.locator
@@ -166,8 +171,20 @@ impl<'a> EnrolledPlayback<'a> {
         )
         .await
         .map_err(PlaybackError::Response)?;
+        self.open_part(reader, index, page.1, sealed, wire_header, now)
+    }
+
+    fn open_part(
+        &mut self,
+        mut reader: DigestRange<'a>,
+        index: u32,
+        page: &[u8],
+        sealed: Vec<u8>,
+        wire_header: Option<&[u8]>,
+        now: impl FnOnce() -> SystemTime,
+    ) -> Result<OpenPart, PlaybackError> {
         let part = reader
-            .open_next(index, page.1, sealed, wire_header)
+            .open_next(index, page, sealed, wire_header)
             .map_err(PlaybackError::Frame)?;
         if now() >= self.pins.usable_until {
             return Err(PlaybackError::Expired);
