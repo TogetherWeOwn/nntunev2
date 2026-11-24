@@ -49,6 +49,13 @@ def valid_host(host):
         return len(host) <= 253 and re.fullmatch(rf"{label}(?:\.{label})*\.[a-z]{{2,63}}", host)
 
 
+def validate_ca(ca):
+    if not re.fullmatch(r"-----BEGIN CERTIFICATE-----\n(?:[A-Za-z0-9+/=]+\n)+"
+                        r"-----END CERTIFICATE-----\n", ca):
+        raise ValueError
+    ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=ca)
+
+
 def setup_plan(raw):
     data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
     if (not isinstance(data, dict) or data.keys() != FIELDS
@@ -68,11 +75,7 @@ def setup_plan(raw):
     if ("." in setup_role or not re.fullmatch(r"(?:[a-z0-9]{10}|[a-z0-9]{12})", branch_id)
             or data["setup_login"] != f"{setup_role}.{branch_id}"):
         raise ValueError
-    ca = data["ca_pem"]
-    if not re.fullmatch(r"-----BEGIN CERTIFICATE-----\n(?:[A-Za-z0-9+/=]+\n)+"
-                        r"-----END CERTIFICATE-----\n", ca):
-        raise ValueError
-    ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=ca)
+    validate_ca(data["ca_pem"])
     return SimpleNamespace(**data)
 
 
@@ -152,6 +155,20 @@ def run_sql(sql, env, deadline):
             process.stdout.close()
 
 
+def tls_environment(private, plan, database, login, password):
+    ca = Path(private) / "root.crt"
+    ca.write_text(plan.ca_pem, encoding="ascii")
+    return {
+        "PATH": os.environ["PATH"], "LC_ALL": "C", "HOME": private,
+        "PGHOST": plan.host, "PGPORT": str(plan.port), "PGDATABASE": database,
+        "PGUSER": login, "PGPASSWORD": password, "PGCONNECT_TIMEOUT": "3",
+        "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(ca), "PGGSSENCMODE": "disable",
+        "PGOPTIONS": "-c search_path=pg_catalog -c statement_timeout=10000 -c lock_timeout=2000 "
+                     "-c transaction_timeout=15000 -c idle_session_timeout=5000 "
+                     "-c client_connection_check_interval=500",
+    }
+
+
 def setup():
     write_attempted = False
     try:
@@ -171,17 +188,7 @@ def setup():
             raise ValueError
 
         with tempfile.TemporaryDirectory(prefix="database-bootstrap-ca-") as private:
-            ca = Path(private) / "root.crt"
-            ca.write_text(plan.ca_pem, encoding="ascii")
-            env = {
-                "PATH": os.environ["PATH"], "LC_ALL": "C", "HOME": private,
-                "PGHOST": plan.host, "PGPORT": str(plan.port), "PGDATABASE": plan.maintenance,
-                "PGUSER": plan.setup_login, "PGPASSWORD": password, "PGCONNECT_TIMEOUT": "3",
-                "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(ca), "PGGSSENCMODE": "disable",
-                "PGOPTIONS": "-c search_path=pg_catalog -c statement_timeout=10000 -c lock_timeout=2000 "
-                             "-c transaction_timeout=15000 -c idle_session_timeout=5000 "
-                             "-c client_connection_check_interval=500",
-            }
+            env = tls_environment(private, plan, plan.maintenance, plan.setup_login, password)
             result = run_sql(probe, env, deadline)
             first, newline, rest = result.partition(b"\n")
             require_absent_catalog_result(0, (first + newline).decode("ascii"))

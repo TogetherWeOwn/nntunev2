@@ -1268,6 +1268,22 @@ On ambiguity reconcile Worker, allocation, routes and provider audit before
 any further action. Verify maintenance behavior and private Access denials on
 the isolated candidate. Post-watch and cancellation need separate admission.
 
+### First private release handoff
+
+Record the exact SHA, checks, reviews, staging build IDs, and admitted health
+and listening attempt. Pin the maintenance module SHA-256 and its isolated
+`503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex`.
+
+Record the [database baseline](production-database-bootstrap.md#protected-baseline)
+attempt, target and manifest digest. On `empty`, keep launch writes quiesced
+through snapshot verification and the first schema apply. If writes could have
+resumed, repeat the baseline before snapshotting. On `rows-present`, rehearse
+the exact undo on a temporary restore from a fresh backup. Resolve any refusal.
+
+To switch off, close admission and restore the pinned maintenance allocation
+and API/media denials via protected rollback. Preserve the database and snapshot.
+Record the recovery entry point, operator, triggers and 30-minute watch before promotion.
+
 ### Production promotion publishes a CalVer release
 
 After a successful production promotion and its post-promotion smoke, the

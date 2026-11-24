@@ -201,9 +201,6 @@ mod tests {
             .await
             .unwrap();
         tokio::spawn(async move { connection.await.unwrap() });
-        db.batch_execute(include_str!("../../../api/src/ingest_session_schema.sql"))
-            .await
-            .unwrap();
         let scope = CleanupScope {
             environment_id: "01000000-0000-4000-8000-000000000001",
             library_id: "11000000-0000-4000-8000-000000000001",
@@ -287,10 +284,19 @@ mod tests {
         let acknowledged: bool = observer.query_one("SELECT enqueued_at IS NOT NULL AND delivery_claim_id IS NULL AND claimed_until IS NULL
             FROM public.ingest_session_cleanup_intents WHERE session_id=$1::text::uuid", &[&scope.session_id]).await.unwrap().get(0);
         assert!(acknowledged);
-        db.batch_execute(
-            "DROP TABLE public.ingest_session_cleanup_intents, public.ingest_session_reservations",
+        let tx = db.transaction().await.unwrap();
+        tx.execute(
+            "DELETE FROM public.ingest_session_cleanup_intents WHERE session_id = $1::text::uuid",
+            &[&scope.session_id],
         )
         .await
         .unwrap();
+        tx.execute(
+            "DELETE FROM public.ingest_session_reservations WHERE id = $1::text::uuid",
+            &[&scope.session_id],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
     }
 }

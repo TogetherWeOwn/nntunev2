@@ -1,6 +1,5 @@
 -- Included inside the digest lookup fixture's rolled-back transaction. Reuse
 -- only its namespace identities; seeded map rows confer no ingest authority.
-\ir ../../src/ingest_session_schema.sql
 CREATE FUNCTION pg_temp.reserve_session(UUID, UUID, TEXT, TEXT, BYTEA, UUID)
 RETURNS SETOF UUID LANGUAGE sql VOLATILE AS :'ingest_session_reserve_sql';
 

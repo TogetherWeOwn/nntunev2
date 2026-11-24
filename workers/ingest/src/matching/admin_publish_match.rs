@@ -18,7 +18,7 @@ pub(crate) const RECORDINGS_LIMIT: usize = 1000;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Fixed reasons suitable for a future needs_review outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NeedsReview {
     InvalidQuery,

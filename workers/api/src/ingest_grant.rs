@@ -52,6 +52,17 @@ pub fn issue_at(
     ttl_secs: u64,
     secret: Option<&str>,
 ) -> Result<String, MintError> {
+    issue_scoped_at(user_id, INGEST_WRITE_SCOPE, now_unix, ttl_secs, secret)
+}
+
+/// The caller must select a fixed, server-owned scope.
+pub(crate) fn issue_scoped_at(
+    user_id: &str,
+    scope: &str,
+    now_unix: u64,
+    ttl_secs: u64,
+    secret: Option<&str>,
+) -> Result<String, MintError> {
     let secret = match secret {
         Some(s) if s.len() >= MIN_SECRET_BYTES => s.as_bytes(),
         _ => return Err(MintError::NotConfigured),
@@ -60,7 +71,7 @@ pub fn issue_at(
         return Err(MintError::InvalidUser);
     }
     let exp_unix = now_unix.saturating_add(ttl_secs.min(MAX_GRANT_TTL));
-    let payload_hex = hex_encode(format!("{user_id}|{INGEST_WRITE_SCOPE}|{exp_unix}").as_bytes());
+    let payload_hex = hex_encode(format!("{user_id}|{scope}|{exp_unix}").as_bytes());
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| MintError::NotConfigured)?;
     mac.update(payload_hex.as_bytes());
     let sig = mac.finalize().into_bytes();

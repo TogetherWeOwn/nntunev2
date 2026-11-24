@@ -30,6 +30,9 @@ const LEASE: &str = include_str!("ingest_session_acquire_write_lease.sql");
 const ADVANCE: &str = include_str!("ingest_session_advance_checkpoint.sql");
 const AUTHORITY_TIMEOUT_MS: u64 = 3_000;
 
+mod flac;
+pub use flac::CommittedFlacUpload;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum UploadError {
     Refused,

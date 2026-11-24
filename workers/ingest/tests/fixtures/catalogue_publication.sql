@@ -97,3 +97,7 @@ BEGIN
         PERFORM pg_sleep(0.01);
     END LOOP;
 END $$;
+
+CREATE TABLE public.test_flac_review (view jsonb NOT NULL, retried_revision bigint);
+INSERT INTO public.test_flac_review VALUES
+    ('{"job_id":"catalogue-old","revision":1,"status":"needs_review"}', NULL);

@@ -172,6 +172,16 @@ class ManifestAndLocks(unittest.TestCase):
     def test_repository_locks_agree(self):
         wt.check_locks(wt.load_pins())
 
+    def test_stream_tools_match_the_shared_workspace_lock(self):
+        manifest = wt.load_pins()
+        pins, workers = wt.select_profile(manifest, "stream")
+        self.assertEqual(workers, ("stream",))
+        self.assertEqual(pins["worker-build"]["version"], "0.8.7")
+        self.assertEqual(pins["wasm-bindgen-cli"]["version"], "0.2.129")
+        wt.check_locks(pins, workers=workers)
+        with self.assertRaisesRegex(ValueError, "stream locked library disagrees with worker tool"):
+            wt.check_locks(manifest, workers=workers)
+
     def test_lock_mismatch_refused(self):
         pins = wt.load_pins()
         with tempfile.TemporaryDirectory() as tmp:

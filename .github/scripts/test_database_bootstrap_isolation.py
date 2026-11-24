@@ -17,6 +17,7 @@ from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 
 import database_bootstrap_setup as setup
+import database_bootstrap_baseline as baseline
 from database_bootstrap_role import SetupRoleLifecycle
 from fixtures.database_bootstrap.authorization import caller_env, plan_binding
 from database_bootstrap_preflight import (
@@ -374,8 +375,8 @@ def verify_quiet_failure(cluster):
             "capture result, error and credential trace without publishing them")
 
 
-def start_caller(env):
-    return subprocess.Popen([sys.executable, "-EsB", setup.__file__], env=env,
+def start_caller(env, script=setup.__file__):
+    return subprocess.Popen([sys.executable, "-EsB", script], env=env,
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -386,12 +387,12 @@ def caller_verdict(process, expected, timeout=45):
     require((process.returncode, stdout, stderr) == result, f"emit only the caller's {expected} verdict")
 
 
-def routed_client(cluster, mode):
+def routed_client(cluster, mode, role=CREATOR):
     shim = cluster.directory / "psql"
     shutil.copyfile(Path(__file__).parent / "fixtures/database_bootstrap/psql", shim)
     shim.chmod(0o700)
     (cluster.directory / "route").write_text(
-        f"{mode} {cluster.canary} {cluster.address} {CREATOR}.{cluster.branch_id} {CREATOR} {DECOY}"
+        f"{mode} {cluster.canary} {cluster.address} {role}.{cluster.branch_id} {role} {DECOY}"
     )
     return f"{cluster.directory}:/usr/bin:/bin"
 
@@ -502,6 +503,75 @@ def prove_setup_caller(cluster, *, interrupt):
     require(not list(cluster.directory.glob("database-bootstrap-ca-*")), "remove the caller's temporary CA")
 
 
+def prove_baseline(cluster):
+    reader = "Fixture-Reader"
+    result = cluster.sql(f"SELECT oid FROM pg_database WHERE datname = '{LAUNCH}';")
+    checked(result, "identify the dedicated fixture database")
+    raw_env = caller_env(cluster, (CREATOR, OWNER, MIGRATOR, READER))
+    setup_plan = json.loads(base64.b64decode(raw_env["BOOTSTRAP_PLAN_B64"]))
+    plan = {key: setup_plan[key] for key in ("host", "port", "ca_pem", "branch_id", "launch", "reader_role")}
+    plan.update(version=1, database_oid=int(result.stdout), reader_role=reader)
+    env = raw_env | {
+        "BASELINE_ENABLED": "true",
+        "BASELINE_READER_PASSWORD": cluster.passwords[READER],
+        "PATH": routed_client(cluster, "route", reader),
+        "GITHUB_WORKFLOW_REF": f'{raw_env["GITHUB_REPOSITORY"]}/{baseline.WORKFLOW}@refs/heads/main',
+    }
+    del env["BOOTSTRAP_SETUP_PASSWORD"]
+
+    def run(expected, *, overrides=None, **plan_changes):
+        binding = plan_binding(json.dumps(plan | plan_changes).encode())
+        with start_caller(env | binding | (overrides or {}), baseline.__file__) as process:
+            stdout, stderr = process.communicate(timeout=20)
+            line = f"database-bootstrap-baseline: {expected}\n".encode()
+            result = (1, b"", line) if expected == "refused" else (0, line, b"")
+            require((process.returncode, stdout, stderr) == result, f"baseline emits only {expected}")
+
+    cluster.ok("grant baseline reader only CONNECT to the dedicated database",
+               f'GRANT CONNECT ON DATABASE {LAUNCH} TO {READER};', role=CREATOR, switch=OWNER)
+    cluster.ok("use the exact mixed-case SQL reader name", f'ALTER ROLE {READER} RENAME TO "{reader}";')
+    calls = cluster.directory / "invocations"
+    before = calls.stat().st_size
+    run("refused", overrides={"BASELINE_ENABLED": ""})
+    run("refused", overrides={"GITHUB_WORKFLOW_REF": raw_env["GITHUB_WORKFLOW_REF"]})
+    run("refused", launch=MAINTENANCE)
+    require(calls.stat().st_size == before, "refuse disabled, cross-workflow and reserved DB plans before SQL")
+    run("refused", database_oid=plan["database_oid"] + 1)
+    run("empty")
+    run("refused", overrides={"PATH": routed_client(cluster, "standby", reader)})
+    require(b"baseline scope refused" in (cluster.directory / "standby-result").read_bytes(),
+            "refuse the simulated PostgreSQL recovery verdict for an otherwise eligible reader")
+    routed_client(cluster, "route", reader)
+    cluster.ok("prepare a partition with hidden child grants", f"""
+        CREATE SCHEMA baseline_fixture;
+        CREATE TABLE baseline_fixture.parent (id integer) PARTITION BY RANGE (id);
+        CREATE TABLE baseline_fixture.child PARTITION OF baseline_fixture.parent FOR VALUES FROM (0) TO (10);
+        INSERT INTO baseline_fixture.parent VALUES (5);
+        GRANT USAGE ON SCHEMA baseline_fixture TO "{reader}";
+        GRANT SELECT ON baseline_fixture.parent TO "{reader}";
+        """, role=MIGRATOR, database=LAUNCH)
+    run("refused")
+    cluster.ok("grant direct leaf coverage", f'GRANT SELECT ON baseline_fixture.child TO "{reader}";', database=LAUNCH)
+    run("rows-present")
+    cluster.ok("hide leaf rows with RLS", "ALTER TABLE baseline_fixture.child ENABLE ROW LEVEL SECURITY;", database=LAUNCH)
+    run("refused")
+    cluster.ok("restore visibility and grant a column write", f"""
+        ALTER TABLE baseline_fixture.child DISABLE ROW LEVEL SECURITY;
+        GRANT UPDATE (id) ON baseline_fixture.child TO "{reader}";
+        """, database=LAUNCH)
+    run("refused")
+    cluster.ok("replace the fixture tables with one large object",
+               "DROP SCHEMA baseline_fixture CASCADE; SELECT lo_create(900001);", "900001\n", database=LAUNCH)
+    run("rows-present")
+    cluster.ok("grant large-object write access", f'GRANT UPDATE ON LARGE OBJECT 900001 TO "{reader}";', database=LAUNCH)
+    run("refused")
+    cluster.ok("retire the baseline fixture's grants and object", f"""
+        SELECT lo_unlink(900001);
+        ALTER ROLE "{reader}" RENAME TO {READER};
+        REVOKE CONNECT ON DATABASE {LAUNCH} FROM {READER};
+        """, "1\n", database=LAUNCH)
+
+
 def verify_launch_grants(cluster):
     cluster.ok("verify revoked PUBLIC access and transferred ownership on admission", f"""
         SELECT datallowconn AND datdba = '{OWNER}'::regrole
@@ -603,6 +673,7 @@ def exercise(*, interrupt):
                     verify_quiet_failure(cluster)
                 prove_setup_caller(cluster, interrupt=interrupt)
                 if not interrupt:
+                    prove_baseline(cluster)
                     verify_launch_grants(cluster)
                 cluster.ok("revoke setup login and password", lifecycle.fence(oid), role=ISSUER)
                 cluster.ok("read back the login fence and cleared password", f"""
@@ -662,4 +733,4 @@ if __name__ == "__main__":
         sys.exit(f"database-bootstrap-fixture: failed to {error}")
     except Exception:
         sys.exit("database-bootstrap-fixture: failed")
-    print("database-bootstrap-fixture: routed TLS, setup role lifecycle, isolation and teardown passed")
+    print("database-bootstrap-fixture: routed TLS, setup role lifecycle, baseline, isolation and teardown passed")
