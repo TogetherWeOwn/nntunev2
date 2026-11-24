@@ -1,4 +1,5 @@
 import { expect, type APIResponse } from '@playwright/test';
+import { ARTWORK_PLACEHOLDER_SRC } from '../src/lib/player/artwork.js';
 import { ARTWORK_PATH, AUDIO_PATH } from './fixtures/player-seek/paths.js';
 import { test } from './fixtures/player-seek/test.js';
 
@@ -65,14 +66,16 @@ test('a failed artwork fallback renders alt content instead of a broken image', 
 });
 
 test('valid artwork renders after a failed placeholder and track change', async ({ page, openPlayer }) => {
-	await page.route('**/placeholder-artwork.svg', (route) => route.fulfill({ status: 404 }));
+	await page.route((url) => url.pathname === ARTWORK_PLACEHOLDER_SRC, (route) => route.fulfill({ status: 404 }));
 	await openPlayer();
 
 	const artwork = page.getByTestId('current-artwork');
 	await expect(artwork.getByTestId('track-artwork-fallback')).toBeVisible();
 	await page.getByTestId('player-next').click();
-	await expect(artwork.getByTestId('track-artwork')).toBeVisible();
-	await expect(artwork.getByTestId('track-artwork')).toHaveAttribute('src', ARTWORK_PATH);
+	const image = artwork.getByTestId('track-artwork');
+	await expect(image).toBeVisible();
+	await expect(image).toHaveAttribute('src', ARTWORK_PATH);
+	await expect.poll(() => image.evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
 });
 
 test('10x rapid seeks never wedge the player', async ({ page, openPlayer }) => {

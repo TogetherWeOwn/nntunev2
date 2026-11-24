@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { expect, test as base } from '@playwright/test';
@@ -15,13 +16,20 @@ declare global {
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const webRoot = fileURLToPath(new URL('../../../', import.meta.url));
+const mediaRoot = new URL('../../../../../fixtures/synthetic-audio/player-seek/', import.meta.url);
 
 export const test = base.extend<{ openPlayer: () => Promise<void> }, { playerOrigin: string }>({
 	playerOrigin: [async ({}, use) => {
+		const manifest: { tracks: Array<{ file: string; bytes: number; sha256: string }> } =
+			JSON.parse(await readFile(new URL('manifest.json', mediaRoot), 'utf8'));
+		const [track] = manifest.tracks;
 		const [wav, artwork] = await Promise.all([
-			readFile(new URL('.' + AUDIO_PATH, import.meta.url)),
+			readFile(new URL(track.file, mediaRoot)),
 			readFile(new URL(`../../../static${ARTWORK_PLACEHOLDER_SRC}`, import.meta.url))
 		]);
+		if (wav.length !== track.bytes || createHash('sha256').update(wav).digest('hex') !== track.sha256) {
+			throw new Error('Player seek WAV does not match its fixture manifest');
+		}
 
 		await withIsolatedViteFixture({
 			configFile: false,
@@ -73,7 +81,7 @@ export const test = base.extend<{ openPlayer: () => Promise<void> }, { playerOri
 		const unexpected: string[] = [];
 		await page.route('**/*', (route) => {
 			const url = new URL(route.request().url());
-			if (url.origin === playerOrigin && !/^\/(api|demo)(\/|$)/.test(url.pathname)) return route.continue();
+			if (url.origin === playerOrigin && !/^\/(api|demo)(\/|$)/.test(url.pathname)) return route.fallback();
 			unexpected.push(url.href);
 			return route.abort();
 		});
