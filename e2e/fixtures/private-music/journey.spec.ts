@@ -20,16 +20,17 @@ test('staging preflight rejects stale, non-synthetic and ambiguous evidence', ()
       return { trackId: `fixture-${index}`, sha256 };
     }),
   };
-  expect(parsePrivateStagingFixture(JSON.stringify(fixture), now)).toEqual(fixture);
+  const digests = fixture.publications.map(({ sha256 }) => sha256);
+  expect(parsePrivateStagingFixture(JSON.stringify(fixture), now, digests)).toEqual(fixture);
   for (const invalid of [
     { ...fixture, email: 'listener@example.com' },
     { ...fixture, expiresAt: now },
     { ...fixture, expiresAt: now + 481 },
     { ...fixture, inviteCode: 'query&other=value' },
     { ...fixture, publications: [fixture.publications[0], fixture.publications[0]] },
-    { ...fixture, publications: [fixture.publications[0], { ...fixture.publications[1], sha256: 'invalid' }] },
+    { ...fixture, publications: [fixture.publications[0], { ...fixture.publications[1], sha256: '0'.repeat(64) }] },
   ]) {
-    expect(() => parsePrivateStagingFixture(JSON.stringify(invalid), now)).toThrow(
+    expect(() => parsePrivateStagingFixture(JSON.stringify(invalid), now, digests)).toThrow(
       'Private staging requires a fresh synthetic invite and two verified publication records',
     );
   }

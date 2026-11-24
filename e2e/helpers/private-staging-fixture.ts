@@ -29,7 +29,7 @@ export interface PrivateStagingFixture {
   }[];
 }
 
-export function parsePrivateStagingFixture(raw: string, now: number): PrivateStagingFixture {
+export function parsePrivateStagingFixture(raw: string, now: number, expectedDigests: readonly string[]): PrivateStagingFixture {
   const invalid = () => new Error('Private staging requires a fresh synthetic invite and two verified publication records');
   if (!raw || raw.length > 4096) throw invalid();
   let fixture: Partial<PrivateStagingFixture> | null;
@@ -46,7 +46,7 @@ export function parsePrivateStagingFixture(raw: string, now: number): PrivateSta
     !Array.isArray(fixture.publications) || fixture.publications.length !== 2 ||
     fixture.publications.some((entry) =>
       !entry || typeof entry.trackId !== 'string' || !TRACK.test(entry.trackId) ||
-      typeof entry.sha256 !== 'string' || !DIGEST.test(entry.sha256)
+      typeof entry.sha256 !== 'string' || !DIGEST.test(entry.sha256) || !expectedDigests.includes(entry.sha256)
     ) || new Set(fixture.publications.map((entry) => entry.trackId)).size !== 2 ||
     new Set(fixture.publications.map((entry) => entry.sha256)).size !== 2
   ) throw invalid();

@@ -65,8 +65,9 @@ test('private staging invite serves curated audio and refuses access at cutoff',
   if (process.env.STAGING_BASE_URL !== ORIGIN || apiDeployOutcome() !== 'deployed' || !process.env.QA_AUTH_TOKEN) {
     throw new Error('Private journey requires the exact staging origin, a same-run API deploy and the QA code seam');
   }
-  const fixture = parsePrivateStagingFixture(process.env.PRIVATE_MUSIC_STAGE_FIXTURE ?? '', Math.floor(Date.now() / 1000));
   const inputs = privateStagingAudio();
+  const digests = inputs.map((item) => item.sha256);
+  const fixture = parsePrivateStagingFixture(process.env.PRIVATE_MUSIC_STAGE_FIXTURE ?? '', Math.floor(Date.now() / 1000), digests);
   const access = accessHeaders();
   const getLibrary = async (context = page.request) => {
     const url = `${ORIGIN}${PRIVATE_MUSIC.library.api}`;
@@ -135,7 +136,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     for (const item of fixture.publications) {
       await expect(rows.and(page.locator(`[data-id="${item.trackId}"]`))).toBeVisible();
     }
-    const order = assertCuratedLibrary(inputs.map((item) => item.sha256), fixture.publications,
+    const order = assertCuratedLibrary(digests, fixture.publications,
       await idsOf(rows, PRIVATE_MUSIC.library.id));
     for (const id of order) await rows.and(page.locator(`[data-id="${id}"]`)).click();
     const current = page.locator(PRIVATE_MUSIC.player.currentQueueItem);

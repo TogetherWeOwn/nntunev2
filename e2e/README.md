@@ -243,8 +243,8 @@ the arm, cohort setting and single-use fixture secret after the run.
 
 The runner checks both serving build identities before and after the journey,
 matches an authorized nonzero byte range against the checked-in FLAC, and
-tests the same session through the cohort deadline. That deadline proves
-expiry, with invite-removal revocation requiring a separate policy change.
+checks that access transitions from allowed to refused by the post-deadline
+probe. Invite-removal revocation requires a separate policy change.
 Keep the job URL, admin publication receipts, versioned storage readback
 and Stream deployment identity together when qualifying the encrypted path.
 The in-browser runner pins the web and API builds.
