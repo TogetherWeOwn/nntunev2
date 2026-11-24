@@ -315,6 +315,7 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
         check(ready.returncode == 0, "armed web refused successful same-build Workers")
         other_sha = ("1" if sha[0] == "0" else "0") + sha[1:]
         for key, value in (("API_RESULT", "failure"), ("STREAM_RESULT", "skipped"),
+                           ("API_SOURCE_SHA", ""), ("STREAM_SOURCE_SHA", ""),
                            ("API_SOURCE_SHA", other_sha), ("STREAM_SOURCE_SHA", other_sha)):
             bad = run(ready_args, cwd=tree, env={**ready_env, key: value}, label=f"armed web refuses wrong {key}")
             check(bad.returncode != 0, f"armed web accepted wrong {key}")
