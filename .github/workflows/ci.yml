@@ -1365,6 +1365,11 @@ jobs:
           -e ALLOW_TEST_TRUNCATE=1
           -v "$GITHUB_WORKSPACE/containers/mb-import/test-import.sh:/job/test-import.sh:ro"
           mb-import:ci bash /job/test-import.sh
+      - name: Prove mirror readiness on a disposable synthetic import
+        run: >-
+          docker run --rm --network none
+          -v "$GITHUB_WORKSPACE:/src:ro"
+          mb-import:ci bash /src/containers/mb-import/tests/test_readiness.sh
 
   # Cache policy: archive reservation guard (docs/cache-policy.md). Fails
   # any Worker R2 binding that targets a reserved archive bucket.

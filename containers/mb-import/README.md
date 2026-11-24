@@ -268,6 +268,49 @@ non-UTF-8 bytes); `import.sh:526-618`
 (FK orphan split); `migrations/0014_mb_import_resume_dlq.sql`;
 `migrations/0001_mb_mirror.sql:57-65`.)
 
+### Initial mirror readiness
+
+After the initial load described in the [ADR 0007 amendment](../../docs/adr/0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement),
+run this evidence check from the trusted checkout with Python 3.10+ and `psql`.
+Set libpq connection settings for the intended mirror and a least-privilege
+observer with `SELECT` on the ten mirror tables, `mb_import_cursor` and
+`mb_import_dlq`. Use verified TLS (`PGSSLMODE=verify-full` and the operator's
+trusted root configuration) and supply credentials through the secret store.
+
+```sh
+python3 -I containers/mb-import/check-readiness.py /path/to/import-evidence.json
+```
+
+Build the JSON from the approved curated snapshot and import handoff before
+querying the freshly loaded mirror. Counts cover the whole table. The JSON
+has two keys:
+
+- `tables` maps each of `artist`, `release_group`, `release`, `recording`,
+  `track`, `url`, `artist_url`, `recording_url`, `recording_music_video` and
+  `recording_isrc` to an object with `sha256` (lowercase hex of the exact
+  curated TSV bytes), `lines` (total input lines) and `rows` (expected loaded
+  rows from the import evidence). The difference must equal the number of
+  dead-letter rows for that table and hash. Keep any dead-letter disposition
+  in the import handoff.
+- `probes` is an array of one to five representative releases; include a
+  multi-medium release. Each object has `query` (a trimmed search term
+  without control characters),
+  `release_mbid` and `artist_mbid` (lowercase UUID strings), and `tracks`
+  (ordered `[medium_no, track_no, recording_mbid]` triples, up to the Worker
+  limit of 1,000). Choose the expected hits and track lists from the approved
+  source evidence. Search lowercases the term and collapses whitespace, then
+  checks for the release and its joined artist in the first 25 results. The
+  recording list must match in order, including shared recordings and their
+  distinct positions.
+
+The check reads one repeatable, read-only PostgreSQL snapshot. Exact counts
+scan the tables and each statement has a five-minute timeout. Output lists
+counts and probe outcomes. Exit `0` means the initial load matches the
+supplied evidence, `1` means a mismatch, and `2` means invalid input or an
+execution error. Attach the output and input to the existing
+[Operator handoff](../../docs/ops.md#operator-runbook-enabling-staging-mb--staging-ingest),
+where target identity, validator provenance and activation are evaluated.
+
 ## Build and test
 
 The image build context is the repository root (the validator stage needs the
