@@ -1015,7 +1015,7 @@ impl DriverErrorCode for tokio_postgres::Error {
 
 impl PgStore {
     /// Prepare an exact-target fold and commit it through the owned transaction.
-    /// The invoice loader must exhaust the paid invoice list and each line list.
+    /// The callback must exhaust the paid invoice list and each line list.
     #[allow(dead_code)] // Off-route until the release caller is enabled.
     async fn reconcile_owned_subscription(
         &self,
