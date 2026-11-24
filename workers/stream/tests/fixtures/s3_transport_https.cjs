@@ -77,7 +77,7 @@ test('versioned encrypted playback over a disposable HTTPS origin', { timeout: 2
 
   assert.deepEqual(Buffer.from(await play()), Buffer.from('Z'));
   assert.equal(hits, 1);
-  for (const fault of ['provider', 'bucket', 'comma', 'stale', 'range']) {
+  for (const fault of ['provider', 'bucket', 'comma', 'etag', 'stale', 'range']) {
     await refuses(play(fault));
     assert.equal(hits, 1, fault);
   }
@@ -97,6 +97,7 @@ test('versioned encrypted playback over a disposable HTTPS origin', { timeout: 2
     { headers: { 'content-length': [17, 17] } },
     { headers: { 'content-length': 16 } },
     { headers: { 'content-length': null, 'transfer-encoding': 'chunked' } },
+    { headers: { 'content-encoding': 'identity' } },
     { headers: { 'content-encoding': 'gzip' } },
     { headers: { connection: 'close' }, body: ciphertext.subarray(0, 16) },
     { body: Buffer.from(ciphertext.map(byte => byte ^ 1)) },
@@ -108,7 +109,9 @@ test('versioned encrypted playback over a disposable HTTPS origin', { timeout: 2
   }
 
   // The origin sees cancellation while the GET or body read is pending.
-  for (const [stall, fault] of [['headers', ''], ['body', ''], ['body', 'drop-body']]) {
+  for (const [stall, fault] of [
+    ['headers', ''], ['body', ''], ['body', 'drop-body'], ['body', 'drop-read'],
+  ]) {
     const before = hits;
     const closed = new Promise(resolve => { response = { stall, closed: resolve }; });
     if (fault) {

@@ -1,12 +1,18 @@
 //! Synthetic artifact only. The ordinary Worker build has no fixture exports.
 
+use std::pin::pin;
+
+use futures_util::future::{select, Either};
 use nntune_core::{
     digest_enrollment::{DigestEnrollment, OriginManifest},
     digest_read_snapshot::DigestReadSnapshot,
     media_envelope::{wrap_scheme2, EnvelopeContext},
     s3_locator::{S3Locator, S3MediaMetadata},
 };
-use worker::wasm_bindgen::{self, prelude::*};
+use worker::{
+    wasm_bindgen::{self, prelude::*},
+    Delay,
+};
 
 use super::*;
 use crate::enrolled_playback::{EnrolledMedia, EnrolledPlayback};
@@ -89,14 +95,17 @@ impl PlaybackFixture {
             "FixtureAccess".into(),
             Zeroizing::new("fixture-reader-signing-material".into()),
         )?;
-        let version = match fault {
-            "comma" => "version,duplicate",
-            _ => VERSION,
+        let alternate = match fault {
+            "comma" => Some(S3Binding::VersionId("version,duplicate".into())),
+            "etag" => Some(S3Binding::Etag("\"version\"".into())),
+            _ => None,
         };
+        let alternate =
+            alternate.map(|binding| S3Locator::new(BUCKET.into(), KEY.into(), binding).unwrap());
         let locator = S3Locator::new(
             BUCKET.into(),
             KEY.into(),
-            S3Binding::VersionId(version.into()),
+            S3Binding::VersionId(VERSION.into()),
         )
         .unwrap();
         let media = S3MediaMetadata::from_trusted_context(locator, &self.context).unwrap();
@@ -112,7 +121,7 @@ impl PlaybackFixture {
             plaintext_len: LEN,
             plaintext_sha256: *self.manifest.plaintext_sha256(),
             map_id: id(6),
-            media_version: version,
+            media_version: VERSION,
             page_versions: &versions,
             usable_until: now() + Duration::from_millis(milliseconds.into()),
         };
@@ -129,6 +138,9 @@ impl PlaybackFixture {
         let mut play = play
             .ok_or_else(refused)?
             .open_s3(now, async |mut get| {
+                if let Some(locator) = alternate.as_ref() {
+                    get.locator = locator;
+                }
                 match fault {
                     "stale" => get.usable_until = UNIX_EPOCH,
                     "range" => get.range.end = get.sealed_len + 1,
@@ -140,6 +152,17 @@ impl PlaybackFixture {
             .map_err(|_| refused())?;
         if fault == "drop-body" {
             return Ok(Vec::new());
+        }
+        if fault == "drop-read" {
+            let timed = select(
+                pin!(Delay::from(Duration::from_millis(100))),
+                pin!(play.next((&versions[0], &self.page), now)),
+            )
+            .await;
+            return match timed {
+                Either::Left(((), _)) => Ok(Vec::new()),
+                Either::Right(_) => Err(refused()),
+            };
         }
         let part = play
             .next((&versions[0], &self.page), now)
