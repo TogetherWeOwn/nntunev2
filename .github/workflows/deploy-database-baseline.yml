@@ -1,0 +1,62 @@
+name: First-launch database baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Check baseline authorization custody
+    if: >-
+      ${{ github.repository == 'TogetherWeOwn/nntunev2' &&
+          github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+          github.run_attempt == '1' }}
+    environment:
+      name: staging
+      deployment: false
+    concurrency:
+      group: production-db-baseline-preflight
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Reject baseline authorization outside its protected Environment
+        env:
+          UNPROTECTED_BASELINE: >-
+            ${{ secrets.BASELINE_ENABLED != '' || secrets.BASELINE_READER_PASSWORD != '' ||
+                secrets.BASELINE_SHA != '' || secrets.BASELINE_RUN_ID != '' ||
+                secrets.BASELINE_EXPIRY != '' || secrets.BASELINE_PLAN_B64 != '' ||
+                secrets.BASELINE_PLAN_DIGEST != '' }}
+        run: test "$UNPROTECTED_BASELINE" = false
+
+  baseline:
+    name: Read the first-launch baseline
+    needs: preflight
+    environment: production-db-baseline
+    concurrency:
+      group: production-db-bootstrap
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Read the dedicated launch database baseline
+        timeout-minutes: 2
+        env:
+          PATH: /usr/bin:/bin
+          BASELINE_ENABLED: ${{ secrets.BASELINE_ENABLED }}
+          BASELINE_READER_PASSWORD: ${{ secrets.BASELINE_READER_PASSWORD }}
+          BOOTSTRAP_SHA: ${{ secrets.BASELINE_SHA }}
+          BOOTSTRAP_RUN_ID: ${{ secrets.BASELINE_RUN_ID }}
+          BOOTSTRAP_EXPIRY: ${{ secrets.BASELINE_EXPIRY }}
+          BOOTSTRAP_PLAN_B64: ${{ secrets.BASELINE_PLAN_B64 }}
+          BOOTSTRAP_PLAN_DIGEST: ${{ secrets.BASELINE_PLAN_DIGEST }}
+          BOOTSTRAP_RUNNER_DEBUG: ${{ secrets.ACTIONS_RUNNER_DEBUG || vars.ACTIONS_RUNNER_DEBUG }}
+          BOOTSTRAP_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG || vars.ACTIONS_STEP_DEBUG }}
+        run: exec python3 -EsB .github/scripts/database_bootstrap_baseline.py

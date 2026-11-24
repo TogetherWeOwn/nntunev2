@@ -23,6 +23,11 @@ if mode in ("route", "resolve"):
     os.execv(args[0], args)
 
 sql = sys.stdin.buffer.read()
+if mode == "standby":
+    result = subprocess.run(args, input=sql.replace(b"pg_is_in_recovery()", b"true"),
+                            stderr=subprocess.PIPE, timeout=5)
+    (directory / "standby-result").write_bytes(result.stderr)
+    sys.exit(result.returncode)
 if mode == "wrong-role":
     result = subprocess.run(args, input=sql, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
     (directory / "probe-result").write_bytes(result.stdout)
