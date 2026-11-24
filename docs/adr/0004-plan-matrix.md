@@ -23,6 +23,20 @@ recovery, not a claim of revenue or permission to activate live billing.
 
 ## Decision
 
+### 2026-11-23 amendment for the personal-use release
+
+The music-only personal-use release may admit the owner and a bounded group
+of explicitly invited friends and family through a time-limited private
+entitlement. It uses the owner and selected email-bound admin invite records
+as the authority. The cohort can start playback without an invoice or Stripe
+credentials. It uses the same one-stream lease and source restrictions. Paid
+plan hour caps apply to paid access. No selectable free plan or public
+registration is added, and the music-video interface stays off. The private
+entitlement is disabled by default and subject to the existing release gates.
+See [private listening qualification](../ops.md#private-listening-qualification).
+
+### Paid plans
+
 | Plan | USD/mo | Stream hrs/mo | Concurrent streams |
 |---|---|---|---|
 | Free (reserved, non-selectable) | $0 | 0 | 1 |

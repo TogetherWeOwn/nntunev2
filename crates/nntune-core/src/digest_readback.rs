@@ -6,6 +6,7 @@
 
 use crate::digest_enrollment::OriginManifest;
 use crate::digest_range::{DigestRange, RangeError};
+pub use crate::flac_prepare::FlacSeekIndex;
 use crate::flac_stream::FlacStream;
 use crate::media::FileKey;
 use crate::media_envelope::{enrolled_scheme2_key, EnvelopeContext};
@@ -24,11 +25,15 @@ pub enum ReadbackError {
 // Private to this module: a decoder may inspect authenticated frames, but
 // must not expose plaintext or commit any result while verification is pending.
 trait MediaValidation {
+    type Output;
+
     fn push(&mut self, plaintext: &[u8]) -> Result<(), ()>;
-    fn finish(self) -> Result<(), ()>;
+    fn finish(self) -> Result<Self::Output, ()>;
 }
 
 impl MediaValidation for () {
+    type Output = ();
+
     fn push(&mut self, _: &[u8]) -> Result<(), ()> {
         Ok(())
     }
@@ -39,12 +44,14 @@ impl MediaValidation for () {
 }
 
 impl MediaValidation for FlacStream {
+    type Output = Option<FlacSeekIndex>;
+
     fn push(&mut self, plaintext: &[u8]) -> Result<(), ()> {
         FlacStream::push(self, plaintext)
     }
 
-    fn finish(self) -> Result<(), ()> {
-        self.finish_at_eof()
+    fn finish(self) -> Result<Self::Output, ()> {
+        self.finish_with_index()
     }
 }
 
@@ -281,6 +288,24 @@ pub async fn verify_enrolled_readback<'a, B: ReadbackBody>(
     pages: &[(u32, ReadbackPin<'a>)],
     open: impl AsyncFnMut(ReadbackPin<'a>) -> Result<ReadbackResponse<B>, BodyReadbackError>,
 ) -> Result<(), EnrolledReadbackError> {
+    verify_enrolled_readback_with_seek(manifest, envelope, completed, media, pages, open, false)
+        .await
+        .map(|_| ())
+}
+
+/// As for `verify_enrolled_readback`, optionally derive a bounded seek index
+/// from the authenticated frames in their stored layout. The index is returned
+/// only after exact EOF, digest and FLAC validation. Carry it with the pins
+/// used for verification so it can only be applied to that plaintext.
+pub async fn verify_enrolled_readback_with_seek<'a, B: ReadbackBody>(
+    manifest: &OriginManifest,
+    envelope: EnrolledEnvelope<'_>,
+    completed: &CompletedInventory<'_>,
+    media: ReadbackPin<'a>,
+    pages: &[(u32, ReadbackPin<'a>)],
+    open: impl AsyncFnMut(ReadbackPin<'a>) -> Result<ReadbackResponse<B>, BodyReadbackError>,
+    collect_seek: bool,
+) -> Result<Option<FlacSeekIndex>, EnrolledReadbackError> {
     let key = enrolled_scheme2_key(
         envelope.authorized_root,
         envelope.context,
@@ -320,21 +345,21 @@ pub async fn verify_enrolled_readback<'a, B: ReadbackBody>(
         media,
         pages,
         open,
-        FlacStream::default(),
+        FlacStream::new(collect_seek),
     )
     .await
     .map_err(EnrolledReadbackError::Body)
 }
 
-async fn verify_readback<'a, B: ReadbackBody>(
+async fn verify_readback<'a, B: ReadbackBody, V: MediaValidation>(
     manifest: &OriginManifest,
     key: &FileKey,
     identities: &[[u8; 16]; 5],
     media: ReadbackPin<'a>,
     pages: &[(u32, ReadbackPin<'a>)],
     mut open: impl AsyncFnMut(ReadbackPin<'a>) -> Result<ReadbackResponse<B>, BodyReadbackError>,
-    mut validation: impl MediaValidation,
-) -> Result<(), BodyReadbackError> {
+    mut validation: V,
+) -> Result<V::Output, BodyReadbackError> {
     let geometry = manifest.geometry();
     let indices = pages.iter().map(|&(index, _)| index);
     let origin = manifest.candidate_page_hashes(
@@ -427,7 +452,7 @@ mod tests {
         f: &Fixture,
         media: Body<'_>,
         page: Body<'_>,
-        validation: impl MediaValidation,
+        validation: impl MediaValidation<Output = ()>,
     ) -> Result<(), BodyReadbackError> {
         verify_readback(
             &f.manifest,
@@ -773,6 +798,8 @@ mod tests {
         let valid = split_flac();
         let mut wrong_checksum = valid.clone();
         wrong_checksum[26] ^= 1;
+        let mut bad_crc = valid.clone();
+        *bad_crc.last_mut().unwrap() ^= 1;
         let invalid = || {
             Err(EnrolledReadbackError::Body(BodyReadbackError::Content(
                 ReadbackError::MediaValidation,
@@ -782,6 +809,7 @@ mod tests {
         for (plaintext, extra, expected) in [
             (valid.as_slice(), false, Ok(())),
             (&valid[..valid.len() - 1], false, invalid()),
+            (bad_crc.as_slice(), false, invalid()),
             (wrong_checksum.as_slice(), false, invalid()),
             (wrong_checksum.as_slice(), true, trailing),
         ] {
@@ -789,7 +817,7 @@ mod tests {
             if extra {
                 media.push(0);
             }
-            let result = verify_enrolled_readback(
+            let result = verify_enrolled_readback_with_seek(
                 &f.manifest,
                 EnrolledEnvelope {
                     authorized_root: &ROOT,
@@ -808,9 +836,13 @@ mod tests {
                         f.manifest.geometry().sealed_len(),
                     ))
                 },
+                true,
             )
             .await;
-            assert_eq!(result, expected);
+            assert_eq!(
+                result.map(|index| index.unwrap().plaintext_range(0..1)),
+                expected.map(|()| Some(65_531..valid.len() as u64)),
+            );
         }
     }
 
@@ -825,6 +857,8 @@ mod tests {
         }
 
         impl MediaValidation for &mut Probe<'_> {
+            type Output = ();
+
             fn push(&mut self, plaintext: &[u8]) -> Result<(), ()> {
                 let (expected, rest) = self.remaining.split_at(plaintext.len());
                 assert_eq!(plaintext, expected);
