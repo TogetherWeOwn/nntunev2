@@ -191,7 +191,9 @@ test('unsatisfiable Range refusal surfaces an honest error with no spinner hang'
 	// that never resolves. Select a track whose bytes are not buffered yet so
 	// the refusal is actually exercised (the initial track already decoded).
 	let refusedRequests = 0;
-	await page.route((url) => url.pathname === AUDIO_PATH && url.searchParams.get('track') === 'second', (route) => {
+	const secondTrack = (url: URL) =>
+		url.pathname === AUDIO_PATH && url.searchParams.get('track') === 'second';
+	await page.route(secondTrack, (route) => {
 		refusedRequests += 1;
 		return route.fulfill({
 			status: 416,
@@ -201,7 +203,11 @@ test('unsatisfiable Range refusal surfaces an honest error with no spinner hang'
 		});
 	});
 
-	await page.getByTestId('queue-select-second').click();
+	const [refusal] = await Promise.all([
+		page.waitForResponse((response) => secondTrack(new URL(response.url()))),
+		page.getByTestId('queue-select-second').click()
+	]);
+	expect(refusal.status()).toBe(416);
 	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
 	const status = page.getByTestId('player-status');
 	await expect(status, 'a refused load must leave the loading state promptly').not.toContainText(
@@ -210,6 +216,7 @@ test('unsatisfiable Range refusal surfaces an honest error with no spinner hang'
 	);
 	await expect(status).toContainText('error');
 	expect(refusedRequests, 'the error state must come from refused audio loads').toBeGreaterThan(0);
+	await expect.poll(async () => (await audioSnapshot(audio)).errorCode).not.toBeNull();
 
 	const error = page.getByTestId('player-error');
 	await expect(error).toBeVisible();
