@@ -24,9 +24,10 @@
 	 * stays behind its own liveness guard.
 	 */
 	function crossAuthBoundary() {
-		invalidateLibraryCache();
+		const purge = invalidateLibraryCache();
 		clearSignedInEmail();
 		notifyLocalAuthTransition();
+		return purge;
 	}
 
 	function redirectToLogin() {
@@ -49,7 +50,7 @@
 			if (error instanceof ApiError && error.status === 401) {
 				// Qualifying 401: this session is confirmed gone. Cross the
 				// boundary even when abandoned; navigation stays live-only.
-				crossAuthBoundary();
+				await crossAuthBoundary();
 				redirectToLogin();
 				return;
 			}
@@ -61,17 +62,21 @@
 			if (!alive) busy = null;
 		}
 		// Fulfilled success is qualifying live or abandoned.
-		crossAuthBoundary();
+		await crossAuthBoundary();
 		redirectToLogin();
 	}
 
 	async function signOutEverywhere() {
-		if (!alive || busy !== null || !window.confirm('Sign out on every device?')) return;
+		if (!alive || busy !== null) return;
 		busy = 'everywhere';
-		actionError = null;
-		revokeIncomplete = false;
 		try {
-			await client.revokeAllSessions();
+			const revoked = await client.revokeAllSessions(() => {
+				if (!alive || !window.confirm('Sign out on every device?')) return false;
+				actionError = null;
+				revokeIncomplete = false;
+				return true;
+			});
+			if (!revoked) { busy = null; return; }
 		} catch (error) {
 			if (error instanceof ApiError && error.status === 401) {
 				// A 401 means this request was rejected before any session
@@ -97,7 +102,7 @@
 			if (!alive) busy = null;
 		}
 		// Fulfilled success is qualifying live or abandoned.
-		crossAuthBoundary();
+		await crossAuthBoundary();
 		redirectToLogin();
 	}
 </script>

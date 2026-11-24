@@ -69,7 +69,8 @@
 //!   latest-ending line's plan — so earlier-plan invoices row after a plan
 //!   change instead of being skipped — and spanning only that plan's own
 //!   lines, so a mid-cycle upgrade invoice never attributes the earlier
-//!   plan's service period to the later plan. Anchored on
+//!   plan's service period to the later plan. Exact paid coverage is
+//!   collected independently from validated lines across all plans. Anchored on
 //!   `status_transitions.paid_at`; invoices without it are skipped: no
 //!   anchor, no coverage, no history row.
 //!
@@ -184,6 +185,16 @@ pub struct PaidInvoiceRow {
     pub amount_cents: i64,
     pub currency: String,
     pub paid_at_unix: i64,
+    /// Validated half-open service periods across all plans; PostgreSQL unions
+    /// them. No bounds means no exact coverage is asserted (SQL NULL).
+    pub covered_periods: Vec<(i64, i64)>,
+}
+
+impl PaidInvoiceRow {
+    /// Parallel arrays for the shared history statement's final two binds.
+    pub fn coverage_bounds(&self) -> (Vec<i64>, Vec<i64>) {
+        self.covered_periods.iter().copied().unzip()
+    }
 }
 
 /// The outcome of one pass: the row to persist, the history rows to
@@ -281,6 +292,23 @@ fn qualify_line(
     let end = period.end?;
     let start = period.start.unwrap_or(end);
     Some(QualifiedLine { plan, start, end })
+}
+
+/// Fold a reconciliation snapshot without borrowing state from another subscription.
+#[allow(dead_code)] // The release caller stays on the legacy fold until activation.
+pub(crate) fn reconcile_exact_target(
+    requested_id: &str,
+    mut local: ReconcileInput,
+    remote: &RemoteSubscription,
+    now_unix: i64,
+) -> Option<ReconcileOutcome> {
+    if remote.subscription.id != requested_id {
+        return None;
+    }
+    local.live = local
+        .live
+        .filter(|row| row.stripe_subscription_id == requested_id);
+    Some(reconcile_subscription(&local, remote, now_unix))
 }
 
 /// Shared by the webhook and API/inline paths: fold one retrieved remote
@@ -462,16 +490,20 @@ pub fn reconcile_subscription(
         let Some(currency) = invoice.currency.clone() else {
             continue;
         };
-        let lines = invoice
-            .lines
-            .as_ref()
-            .map(|lines| lines.data.as_slice())
-            .unwrap_or(&[]);
+        let Some(lines) = invoice.lines.as_ref() else {
+            continue;
+        };
+        let exact_coverage = invoice.amount_paid > 0
+            && !invoice.id.trim().is_empty()
+            && !lines.has_more
+            && currency.len() == 3
+            && currency.bytes().all(|b| b.is_ascii_lowercase());
+        let mut covered_periods = Vec::new();
         let mut spans = std::collections::BTreeMap::<String, (i64, i64)>::new();
         let mut span_end: Option<i64> = None;
         let mut span_plan: Option<String> = None;
         let mut item_end: Option<i64> = None;
-        for line in lines {
+        for line in &lines.data {
             let Some(qualified) = qualify_line(
                 &local.bindings,
                 line.price.as_deref(),
@@ -480,6 +512,12 @@ pub fn reconcile_subscription(
             ) else {
                 continue;
             };
+            if exact_coverage
+                && line.currency.as_deref() == Some(currency.as_str())
+                && qualified.start < qualified.end
+            {
+                covered_periods.push((qualified.start, qualified.end));
+            }
             // Accumulate each plan independently so an intervening plan
             // cannot discard the eventual winner's earlier service days.
             // Strictly greater preserves ties: the first latest-ending
@@ -501,6 +539,7 @@ pub fn reconcile_subscription(
             continue;
         };
         let (start, end) = spans[&plan];
+        covered_periods.sort_unstable();
         history.push(PaidInvoiceRow {
             stripe_invoice_id: invoice.id.clone(),
             stripe_subscription_id: sub.id.clone(),
@@ -510,6 +549,7 @@ pub fn reconcile_subscription(
             amount_cents: invoice.amount_paid,
             currency,
             paid_at_unix: paid_at,
+            covered_periods,
         });
         if let Some(end) = item_end {
             if new_end.is_none_or(|current| {
@@ -1052,12 +1092,45 @@ pub fn store_reconciled_subscription_statement() -> &'static str {
     "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id, stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end, cancel_at_period_end, paid_through_at, paid_invoice_id, grace_until) SELECT $1, $2, $3, $4, $5, $6, $7, to_timestamp($8::bigint), $9, to_timestamp($10::bigint), $11, to_timestamp($12::bigint) WHERE NOT $15::boolean ON CONFLICT (stripe_subscription_id) DO UPDATE SET stripe_customer_id = EXCLUDED.stripe_customer_id, stripe_subscription_item_id = EXCLUDED.stripe_subscription_item_id, stripe_price_id = EXCLUDED.stripe_price_id, plan_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN EXCLUDED.plan_id ELSE subscriptions.plan_id END, status = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.status ELSE EXCLUDED.status END, current_period_end = EXCLUDED.current_period_end, cancel_at_period_end = EXCLUDED.cancel_at_period_end, paid_through_at = CASE WHEN EXCLUDED.paid_through_at IS NULL THEN subscriptions.paid_through_at WHEN subscriptions.paid_through_at IS NULL THEN EXCLUDED.paid_through_at WHEN EXCLUDED.paid_through_at > subscriptions.paid_through_at THEN EXCLUDED.paid_through_at ELSE subscriptions.paid_through_at END, paid_invoice_id = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND (subscriptions.paid_through_at IS NULL OR EXCLUDED.paid_through_at > subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NOT NULL AND subscriptions.plan_id = $14 AND subscriptions.paid_invoice_id IS NOT DISTINCT FROM $13)) THEN COALESCE(EXCLUDED.paid_invoice_id, subscriptions.paid_invoice_id) ELSE subscriptions.paid_invoice_id END, grace_until = CASE WHEN EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL)) THEN subscriptions.grace_until ELSE EXCLUDED.grace_until END WHERE (EXCLUDED.paid_through_at IS NOT NULL AND subscriptions.paid_through_at IS NOT NULL AND (EXCLUDED.paid_through_at < subscriptions.paid_through_at OR (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND EXCLUDED.paid_invoice_id IS NULL AND subscriptions.paid_invoice_id IS NOT NULL))) IS NOT TRUE"
 }
 
+macro_rules! paid_invoice_coverage {
+    () => {
+        "(SELECT range_agg(tstzrange(to_timestamp(lo), to_timestamp(hi), '[)'))
+                      FROM unnest($10::bigint[], $11::bigint[]) AS bounds(lo, hi))"
+    };
+}
+pub(crate) use paid_invoice_coverage;
+
+macro_rules! insert_paid_invoice_history {
+    ($relation:literal, $conflict:literal) => {
+        concat!(
+            "INSERT INTO ",
+            $relation,
+            " AS history (user_id, stripe_invoice_id,
+             stripe_subscription_id, plan_id, period_start, period_end, amount_cents,
+             currency, paid_at, covered_periods)
+             VALUES ($1, $2, $3, $4, to_timestamp($5::bigint), to_timestamp($6::bigint),
+                     $7, $8, to_timestamp($9::bigint),
+                     ",
+            $crate::billing_reconcile::paid_invoice_coverage!(),
+            ")\n             ",
+            $conflict
+        )
+    };
+}
+pub(crate) use insert_paid_invoice_history;
+
 /// Parameters: user_id · invoice_id · subscription_id · plan_id ·
 /// period_start epoch · period_end epoch · amount_cents · currency ·
-/// paid_at epoch. Exactly one row per invoice: replays converge on the
-/// primary key and insert nothing.
+/// paid_at epoch · covered start epochs[] · covered end epochs[].
 pub fn insert_paid_invoice_history_statement() -> &'static str {
-    "INSERT INTO paid_invoice_history (user_id, stripe_invoice_id, stripe_subscription_id, plan_id, period_start, period_end, amount_cents, currency, paid_at) VALUES ($1, $2, $3, $4, to_timestamp($5::bigint), to_timestamp($6::bigint), $7, $8, to_timestamp($9::bigint)) ON CONFLICT DO NOTHING"
+    insert_paid_invoice_history!(
+        "paid_invoice_history",
+        "ON CONFLICT (stripe_invoice_id) DO UPDATE SET covered_periods = EXCLUDED.covered_periods
+             WHERE history.covered_periods IS NULL AND EXCLUDED.covered_periods IS NOT NULL
+               AND history.user_id = EXCLUDED.user_id
+               AND history.stripe_subscription_id = EXCLUDED.stripe_subscription_id
+               AND history.amount_cents > 0 AND history.currency = EXCLUDED.currency"
+    )
 }
 
 #[cfg(test)]
@@ -1685,6 +1758,14 @@ mod tests {
                 (NOW - 15 * 86_400, NOW),
                 "span covers the pro line only"
             );
+            assert_eq!(
+                row.covered_periods,
+                vec![
+                    (NOW - 30 * 86_400, NOW - 15 * 86_400),
+                    (NOW - 15 * 86_400, NOW)
+                ],
+                "exact coverage includes both plans"
+            );
         }
     }
 
@@ -1774,6 +1855,54 @@ mod tests {
             ),
             (NOW - 20 * 86_400, NOW),
         );
+    }
+
+    #[test]
+    fn exact_coverage_requires_positive_bound_and_complete_evidence() {
+        for case in [
+            "total",
+            "credit",
+            "currency",
+            "line currency",
+            "empty id",
+            "partial",
+            "missing start",
+            "reverse",
+            "customer",
+            "subscription",
+        ] {
+            let mut invoice = paid_invoice("in_bounds", PRICE_PLUS, NOW - 10, NOW, NOW);
+            let lines = invoice.lines.as_mut().unwrap();
+            let line = &mut lines.data[0];
+            match case {
+                "total" => invoice.amount_paid = 0,
+                "credit" => line.amount = -100,
+                "currency" => invoice.currency = Some("".into()),
+                "line currency" => line.currency = Some("eur".into()),
+                "empty id" => invoice.id.clear(),
+                "partial" => lines.has_more = true,
+                "missing start" => line.period.as_mut().unwrap().start = None,
+                "reverse" => line.period.as_mut().unwrap().start = Some(NOW + 1),
+                "customer" => invoice.customer = Some("cus_elsewhere".into()),
+                "subscription" => invoice.subscription = Some("sub_elsewhere".into()),
+                _ => unreachable!(),
+            }
+            let remote = RemoteSubscription {
+                subscription: subscription("active", PRICE_PLUS),
+                invoices: vec![invoice],
+            };
+            let outcome = reconcile_subscription(&fresh(), &remote, NOW);
+            assert!(
+                outcome
+                    .history
+                    .iter()
+                    .all(|row| row.covered_periods.is_empty()),
+                "{case}"
+            );
+            if matches!(case, "customer" | "subscription") {
+                assert!(outcome.history.is_empty(), "{case}");
+            }
+        }
     }
 
     #[test]
@@ -2065,6 +2194,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retained_fields_never_use_replacement_subscription_proof() {
+        let mut foreign = anchored("plus", NOW + 100, "in_replacement");
+        let row = foreign.live.as_mut().expect("row");
+        row.stripe_subscription_id = "sub_replacement".to_string();
+        row.grace_until_unix = Some(NOW + 200);
+        let mut absent = foreign.clone();
+        absent.live = None;
+        for status in [
+            "canceled",
+            "incomplete_expired",
+            "unpaid",
+            "paused",
+            "active",
+            "past_due",
+            "trialing",
+        ] {
+            for price in [PRICE_PLUS, "price_unknown"] {
+                let remote = RemoteSubscription {
+                    subscription: subscription(status, price),
+                    invoices: vec![paid_invoice("in_target", PRICE_PLUS, NOW, NOW + 50, NOW)],
+                };
+                assert_eq!(
+                    reconcile_exact_target("sub_123", foreign.clone(), &remote, NOW)
+                        .expect("requested target"),
+                    reconcile_exact_target("sub_123", absent.clone(), &remote, NOW)
+                        .expect("requested target"),
+                    "foreign row affected {status} / {price}"
+                );
+            }
+        }
+    }
+
     // --- Renewal grace: set once, kept verbatim, cleared on recovery -----------------
 
     #[test]
@@ -2264,7 +2426,8 @@ mod tests {
             "insert converges on the single-flight index",
         );
         assert!(
-            insert_paid_invoice_history_statement().contains("ON CONFLICT DO NOTHING"),
+            insert_paid_invoice_history_statement()
+                .contains("ON CONFLICT (stripe_invoice_id) DO UPDATE SET covered_periods"),
             "history replays converge on the invoice id",
         );
         assert!(

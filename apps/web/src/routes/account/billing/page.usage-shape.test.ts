@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { load } from './+page';
+import { useSessionFixture } from './page.fixture.js';
 import type { PageData } from './$types';
+
+useSessionFixture();
 
 /**
  * Protected acceptance surface: a valid subscription plus a malformed

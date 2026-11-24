@@ -1,8 +1,8 @@
 /**
  * Mobile mini-player hint (roadmap W10).
  *
- * The library page writes the current selection here through
- * `replaceQueue`; the app shell reads it to render the mobile mini-player
+ * The Library player controller writes the current selection here on queue
+ * commits; the app shell reads it to render the mobile mini-player
  * (a title plus a link back to Your Library — the full player bar arrives
  * with W11). Metadata only: track id plus display title/artist, never
  * audio URLs or playback state. Same listener idiom as `onPaywall` and the

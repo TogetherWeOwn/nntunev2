@@ -11,7 +11,7 @@ name: migrations-staging
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened, ready_for_review]
+    types: [opened, edited, synchronize, reopened]
   # Required checks must report on merge_group; the queue run has no PR
   # file list, so it passes vacuously (renames were checked on the PR).
   merge_group:
@@ -38,76 +38,89 @@ jobs:
     name: migrations-staging
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # The data checkout has action-created Git config. Keep hooks and
+    # filesystem monitors disabled when inspecting or switching its commits.
+    env:
+      GIT_CONFIG_NOSYSTEM: '1'
+      GIT_CONFIG_COUNT: '2'
+      GIT_CONFIG_KEY_0: core.hooksPath
+      GIT_CONFIG_VALUE_0: /dev/null
+      GIT_CONFIG_KEY_1: core.fsmonitor
+      GIT_CONFIG_VALUE_1: 'false'
     steps:
       - name: Merge queue vacuous pass
         if: github.event_name == 'merge_group'
         run: |
           echo "migrations-staging: merge_group vacuous pass (renames checked on PR)"
+      - name: Check out pinned integration evidence
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: pr-data
+          fetch-depth: 0
+      - name: Resolve commits with trusted first-parent code
+        if: github.event_name == 'pull_request'
+        id: commits
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          # Bootstrap from the runner-pinned merge's first parent. The
+          # resolver validates the checkout and both parents before output.
+          git --no-replace-objects -C "$GITHUB_WORKSPACE/pr-data" cat-file blob \
+            "$GITHUB_SHA^1:.github/scripts/migrations_base.py" |
+            python3 -I - --root "$GITHUB_WORKSPACE/pr-data" >> "$GITHUB_OUTPUT"
       - name: Check out trusted checker
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
           persist-credentials: false
-          # The immutable trusted base supplies executable code and imports.
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ steps.commits.outputs.base_sha }}
           path: trusted-checker
-      - name: Check out pinned PR evidence
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Select the pinned source head for evidence
         if: github.event_name == 'pull_request'
-        with:
-          persist-credentials: false
-          # Data only: never run scripts, setup or builds from this checkout.
-          # Full ancestry supplies every per-parent edge and the pinned base.
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: pr-data
-          fetch-depth: 0
+        working-directory: ${{ runner.temp }}
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          HEAD_SHA: ${{ steps.commits.outputs.head_sha }}
+        # Data only. Keep the merge's full ancestry and leave the source
+        # head's manifest in place for the history checker.
+        run: git --no-replace-objects -C "$GITHUB_WORKSPACE/pr-data" checkout --detach "$HEAD_SHA"
       - name: Collect pinned PR API evidence
         if: github.event_name == 'pull_request'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GIT_CONFIG_NOSYSTEM: '1'
           GIT_CONFIG_GLOBAL: /dev/null
-          GIT_CONFIG_COUNT: '2'
-          GIT_CONFIG_KEY_0: core.hooksPath
-          GIT_CONFIG_VALUE_0: /dev/null
-          GIT_CONFIG_KEY_1: core.fsmonitor
-          GIT_CONFIG_VALUE_1: 'false'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ steps.commits.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.commits.outputs.head_sha }}
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          # B0 remains the only executable source. Bracket every complete
-          # attempt; B1 must retain event identities and descend from B0.
-          # Raw reads, projections, attempts and both Git passes share bounds.
+          # Each API bracket must retain the event identities and descend
+          # from the tested first parent. Both history passes share bounds.
           python3 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from migration_snapshot import main; sys.exit(main())' \
             "$GITHUB_WORKSPACE/trusted-checker/.github/scripts" \
             --root "$GITHUB_WORKSPACE/pr-data" \
-            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --integration-base --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             --event-file "$GITHUB_EVENT_PATH" --output-dir "$RUNNER_TEMP"
       - name: Check migration rename history
         if: github.event_name == 'pull_request'
         working-directory: ${{ runner.temp }}
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Git config here is action-created, never supplied by the PR tree.
-          # Ignore ambient global/system config and disable executable hooks.
-          GIT_CONFIG_NOSYSTEM: '1'
           GIT_CONFIG_GLOBAL: /dev/null
-          GIT_CONFIG_COUNT: '2'
-          GIT_CONFIG_KEY_0: core.hooksPath
-          GIT_CONFIG_VALUE_0: /dev/null
-          GIT_CONFIG_KEY_1: core.fsmonitor
-          GIT_CONFIG_VALUE_1: 'false'
+          BASE_SHA: ${{ steps.commits.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.commits.outputs.head_sha }}
         run: |
           set -euo pipefail
           # -I drops cwd, PYTHONPATH and user-site imports. Add only the
-          # trusted base's module directory (checker + stdlib-only history).
+          # first parent's module directory (checker + stdlib-only history).
           # Missing trusted code or evidence fails; never fall back to PR code.
           python3 -I - "$GITHUB_WORKSPACE/trusted-checker/.github/scripts" \
             --root "$GITHUB_WORKSPACE/pr-data" \
-            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --integration-base --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             --files-file "$RUNNER_TEMP/pr-files.json" \
             --event-file "$GITHUB_EVENT_PATH" \
             --validation-output "$RUNNER_TEMP/pr-validation.json" \

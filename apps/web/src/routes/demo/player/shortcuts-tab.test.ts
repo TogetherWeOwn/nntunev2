@@ -1,13 +1,13 @@
 import { expect, test, vi } from 'vitest';
 import { parse } from 'svelte/compiler';
 import ts from 'typescript';
-import source from './+page.svelte?raw';
+import source from '#lib/player/ShortcutHelp.svelte?raw';
 
 // Builder-owned supplement to the protected native-editing acceptance bank.
 // Execute the real trap with two focusable controls so guard deletion exposes
 // both extra cancellation and a focus move. Browser coverage pins DOM wiring.
 const { instance } = parse(source);
-if (!instance) throw new Error('Player page script missing');
+if (!instance) throw new Error('Shortcut help script missing');
 const script = ts.createSourceFile(
 	'player.ts', source.slice(instance.content.start, instance.content.end), ts.ScriptTarget.Latest, true
 );

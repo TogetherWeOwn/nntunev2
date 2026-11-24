@@ -4,7 +4,10 @@
 //! authorize serving. Empty input is supported for codec/restore fixtures only;
 //! admission of new media remains the responsibility of the origin sealer.
 
-const CHUNK: u64 = 65_536;
+use crate::media::{chunk_offset, PLAIN_CHUNK_SIZE as CHUNK};
+use std::ops::{Range, RangeInclusive};
+
+const R2_PART_BYTES: u64 = 5_244_160;
 const MAX_PLAINTEXT: u64 = 1 << 33;
 const PAGE_ENTRIES: u32 = 256;
 const PAGE_HEADER: u32 = 92;
@@ -46,7 +49,48 @@ pub struct RangeChunk {
     pub end: usize,
 }
 
+/// The complete input to a chunk authentication and the slice to use on success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedRangeChunk {
+    /// Half-open object offsets including the tag, excluding the media header.
+    pub ciphertext: Range<u64>,
+    pub final_chunk: bool,
+    pub selection: RangeChunk,
+}
+
 impl RangeGeometry {
+    /// Total ciphertext object size, including the separate media header.
+    pub fn sealed_len(self) -> u64 {
+        self.geometry.sealed_len()
+    }
+
+    /// Complete sealed chunks covering the selection, excluding the header.
+    /// This describes coverage, not a recommendation to fetch it all at once.
+    pub fn ciphertext_span(self) -> Option<Range<u64>> {
+        let (first, last) = self.chunks?;
+        Some(self.sealed_chunk(first)?.ciphertext.start..self.sealed_chunk(last)?.ciphertext.end)
+    }
+
+    /// Inclusive one-based R2 upload parts intersecting the ciphertext span.
+    /// Parts partition the whole object (starting with the header) and may
+    /// split a chunk or tag. They are not authentication or GET boundaries.
+    pub fn r2_parts(self) -> Option<RangeInclusive<u64>> {
+        let span = self.ciphertext_span()?;
+        Some((1 + span.start / R2_PART_BYTES)..=(1 + span.end.checked_sub(1)? / R2_PART_BYTES))
+    }
+
+    /// Plan one complete chunk; authenticate before using `selection` to trim it.
+    pub fn sealed_chunk(self, index: u32) -> Option<SealedRangeChunk> {
+        let selection = self.chunk(index)?;
+        let (len, final_chunk) = self.geometry.chunk(index)?;
+        let start = chunk_offset(u64::from(index))?;
+        Some(SealedRangeChunk {
+            ciphertext: start..start.checked_add(u64::from(len))?,
+            final_chunk,
+            selection,
+        })
+    }
+
     /// Inclusive first and last chunk indices; `None` for empty nonempty-object ranges.
     pub fn chunks(self) -> Option<(u32, u32)> {
         self.chunks
@@ -235,6 +279,57 @@ mod tests {
         let plan = g.range((1 << 33) - 1, 1 << 33).unwrap();
         assert_eq!(plan.chunks(), Some((131_071, 131_071)));
         assert_eq!(plan.chunk(131_071).unwrap().page, 511);
+    }
+
+    #[test]
+    fn sealed_coverage_for_every_final_chunk_size() {
+        // The wire chunk size is fixed; exhaust every possible final length.
+        for tail in 1..=65_536_u64 {
+            let last = [1, 79, 256, 131_071][(tail % 4) as usize];
+            let offset = u64::from(last) * 65_536;
+            let end = offset + tail;
+            let plan = DigestGeometry::new(end)
+                .unwrap()
+                .range(offset - 1, end)
+                .unwrap();
+            let left = plan.sealed_chunk(last - 1).unwrap();
+            let right = plan.sealed_chunk(last).unwrap();
+            let split = 48 + offset + 16 * u64::from(last);
+            assert_eq!(left.ciphertext, split - 65_552..split);
+            assert_eq!(right.ciphertext, split..split + tail + 16);
+            assert_eq!(plan.sealed_len(), right.ciphertext.end);
+            assert_eq!(
+                plan.ciphertext_span(),
+                Some(left.ciphertext.start..right.ciphertext.end)
+            );
+            assert!(!left.final_chunk && right.final_chunk);
+            assert_eq!((left.selection.start, left.selection.end), (65_535, 65_536));
+            assert_eq!(
+                (right.selection.start, right.selection.end),
+                (0, tail as usize)
+            );
+            assert_eq!(right.selection.page, last / 256);
+            assert_eq!(plan.sealed_chunk(last + 1), None);
+        }
+    }
+
+    #[test]
+    fn r2_parts_include_both_sides_of_a_split_chunk_but_not_an_empty_part() {
+        let len = 80 * 65_536;
+        let first_of_final = 79 * 65_536;
+        let plan = DigestGeometry::new(len)
+            .unwrap()
+            .range(first_of_final, first_of_final + 1)
+            .unwrap();
+        assert_eq!(plan.ciphertext_span(), Some(5_178_656..5_244_208));
+        assert_eq!(plan.r2_parts(), Some(1..=2));
+        let len = len - 48;
+        let exact = DigestGeometry::new(len)
+            .unwrap()
+            .range(len - 1, len)
+            .unwrap();
+        assert_eq!(exact.sealed_len(), 5_244_160);
+        assert_eq!(exact.r2_parts(), Some(1..=1));
     }
 
     #[test]

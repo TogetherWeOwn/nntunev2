@@ -9,6 +9,9 @@ use std::pin::Pin;
 use std::task::Poll;
 
 use crate::handlers::StoreError;
+use crate::postgres::PgBilling;
+#[cfg(target_arch = "wasm32")]
+use crate::postgres::PgClient;
 use crate::worker_entry::with_deadline;
 
 const TOTAL_MS: u64 = 15_000;
@@ -163,26 +166,15 @@ async fn phase_deadline<T, F: Future<Output = Result<T, StoreError>>>(
 /// Start the future billing transaction with conservative work-phase limits.
 /// A failed batch may have begun a transaction, so attempt rollback; failure
 /// or cancellation of that attempt does not establish connection cleanup.
-pub(super) async fn bootstrap_transaction(
-    client: &mut tokio_postgres::Client,
-) -> Result<(), StoreError> {
-    let remaining_ms = WORK_MS;
-    let lock_ms = remaining_ms.min(4_000);
-    let statement_ms = remaining_ms.min(5_000);
-    let idle_ms = remaining_ms.min(5_000);
-    if client.batch_execute(&format!(
-        "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL transaction_timeout = {remaining_ms}; SET LOCAL lock_timeout = {lock_ms}; SET LOCAL statement_timeout = {statement_ms}; SET LOCAL idle_in_transaction_session_timeout = {idle_ms}"
-    )).await.is_err() {
-        let _ = client.batch_execute("ROLLBACK").await;
+pub(super) async fn bootstrap_transaction(client: &mut impl PgBilling) -> Result<(), StoreError> {
+    if client.begin_billing(WORK_MS).await.is_err() {
+        let _ = client.rollback_billing().await;
         return Err(StoreError);
     }
     Ok(())
 }
 
-/// Inactive owned transport preparation. Callbacks must not spawn work or let
-/// database handles escape; transaction setup and outcome handling remain the
-/// responsibility of the future billing operation.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 pub(super) async fn with_owned_connection<T: 'static>(
     host: &str,
     port: u16,
@@ -193,6 +185,50 @@ pub(super) async fn with_owned_connection<T: 'static>(
     work: impl for<'a> FnOnce(
         &'a mut tokio_postgres::Client,
     ) -> Pin<Box<dyn Future<Output = Result<T, StoreError>> + 'a>>,
+    work_finished: impl FnOnce(bool),
+) -> Result<T, StoreError> {
+    drive_owned_connection(
+        || Ok((host.to_owned(), port, connection_string.to_owned())),
+        std::convert::identity,
+        bootstrap,
+        work,
+        work_finished,
+    )
+    .await
+}
+
+/// Resolve the binding inside the connect phase. Callbacks must not spawn work
+/// or let database handles escape.
+#[cfg(target_arch = "wasm32")]
+pub(super) async fn with_owned_connection_from<T: 'static>(
+    target: impl FnOnce() -> Result<(String, u16, String), StoreError>,
+    bootstrap: impl for<'a> FnOnce(
+        &'a mut PgClient,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + 'a>>,
+    work: impl for<'a> FnOnce(
+        &'a mut PgClient,
+    ) -> Pin<Box<dyn Future<Output = Result<T, StoreError>> + 'a>>,
+    #[cfg(feature = "billing-owned-wasm-test")] work_finished: impl FnOnce(bool),
+) -> Result<T, StoreError> {
+    drive_owned_connection(
+        target,
+        PgClient::new,
+        bootstrap,
+        work,
+        #[cfg(feature = "billing-owned-wasm-test")]
+        work_finished,
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn drive_owned_connection<T: 'static, C>(
+    target: impl FnOnce() -> Result<(String, u16, String), StoreError>,
+    wrap: impl FnOnce(tokio_postgres::Client) -> C,
+    bootstrap: impl for<'a> FnOnce(
+        &'a mut C,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + 'a>>,
+    work: impl for<'a> FnOnce(&'a mut C) -> Pin<Box<dyn Future<Output = Result<T, StoreError>> + 'a>>,
     #[cfg(feature = "billing-owned-wasm-test")] work_finished: impl FnOnce(bool),
 ) -> Result<T, StoreError> {
     use crate::billing_owned_socket::SocketGuard;
@@ -201,13 +237,15 @@ pub(super) async fn with_owned_connection<T: 'static>(
         let guard = SocketGuard::default();
         let (mut client, connection) = budget
             .connect(|| async {
-                let socket = guard.open(host, port).map_err(|_| StoreError)?;
+                let (host, port, connection_string) = target()?;
+                let socket = guard.open(&host, port).map_err(|_| StoreError)?;
                 socket.opened().await.map_err(|_| StoreError)?;
                 let config: tokio_postgres::Config =
                     connection_string.parse().map_err(|_| StoreError)?;
                 config
                     .connect_raw(socket, guard.tls())
                     .await
+                    .map(|(client, connection)| (wrap(client), connection))
                     .map_err(|_| StoreError)
             })
             .await?;
@@ -239,6 +277,20 @@ pub(crate) async fn test_real_connection() -> Result<(i32, i32), &'static str> {
     use std::rc::Rc;
 
     const CONNECTION: &str = "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_ci sslmode=disable application_name=owned_transport_test";
+    let attempted = Cell::new(false);
+    let failure = with_owned_connection_from::<()>(
+        || {
+            attempted.set(true);
+            Err(StoreError)
+        },
+        |_| panic!("bootstrap ran without a connection target"),
+        |_| panic!("work ran without a connection target"),
+        |_| panic!("work observer ran without a connection target"),
+    );
+    if attempted.get() || failure.await.is_ok() || !attempted.get() {
+        return Err("connection target failure did not stop before bootstrap");
+    }
+
     let success_pid = with_owned_connection(
         "127.0.0.1",
         5432,

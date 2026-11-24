@@ -353,13 +353,14 @@ this documentation update, nor evidence of separate compute/failure domains.
 
 ### Staging migrations
 
-The scheduled/CI deploy path never applies `migrations/*.sql`. Staging
-migrations are applied **before** merge, after board approval for the
-DDL, by the authoring agent itself: once board approval is recorded on
-the card, the agent dispatches the `migrations-staging-apply` workflow
-(`.github/workflows/migrations-staging-apply.yml`) with the exact
-40-hex commit `ref`, the migration `file`, an `applied_by` identity and
-the Paperclip board-approval interaction id. The workflow checks out
+The scheduled/CI deploy path never applies `migrations/*.sql`. The task owner
+applies staging migrations **before** merge. Obtain explicit approval of
+the exact DDL for the staging apply from the independent reviewers required
+by the PR's risk tier. Record the approval and commit before dispatching the
+[`migrations-staging-apply` workflow](../.github/workflows/migrations-staging-apply.yml) with the exact
+40-hex commit `ref`, the migration `file`, and an `applied_by` identity.
+In the dispatch form's `board_approval` field, enter the recorded public-safe
+approval reference on a single line of at most 200 characters. The workflow checks out
 that exact ref as data only (migration bytes and manifest) and runs
 the trusted `.github/scripts/apply_migration.py` from the workflow's
 own ref — never code from the dispatch-supplied ref — with
@@ -371,15 +372,16 @@ migrator credential
 (`PLANETSCALE_MIGRATOR_URL_STAGING`, the `staging` environment secret)
 is read only inside the job and never reaches the agent. Any
 manifest/sha mismatch refuses exactly as the migrator does. Mode
-`all-pending` applies every unrecorded manifest entry up to `file` in
-manifest order, refusing on the first failure. The recorded
-`schema_migrations` row lands in the job summary; post it on the card
-before merging. Only a row from a successful apply counts as merge
-evidence — on a failed run, rows are diagnostic, and the receipt and
-effects must be reconciled before retrying (an older row for the same
-filename is not proof that the failed apply landed). The `board_approval` input is an audit record of the
-card's own gate, not a workflow-side call — the workflow cannot call
-Paperclip. Prerequisites before the first dispatch: (a)
+`all-pending` selects app migrations through `file` from the pinned manifest
+in manifest order. Include the pending app migrations in that range in the
+approval. The migrator skips matching records and refuses on the first
+failure. The recorded `schema_migrations` row lands in the job
+summary. Link that receipt in the PR before merging. Only a row from a
+successful apply counts as merge evidence. On a failed run, rows are
+diagnostic, and the receipt and effects must be reconciled before retrying
+(an older row for the same filename is not proof that the failed apply landed). The workflow logs the
+required `board_approval` input in the job summary for audit. Prerequisites
+before the first dispatch: (a)
 `PLANETSCALE_MIGRATOR_URL_STAGING` must be scoped to the `staging`
 environment, and (b) the `staging` environment's deployment-branch
 policy must restrict deployments to the protected branch (`main`) so
@@ -438,6 +440,19 @@ proof of an exclusive writer window. The default `readback` mode remains a
 single-row observation. Neither mode establishes admission expiry, writer drain,
 unknown-outcome reconciliation or crash-safe zero-idle restoration; these
 remain prerequisites for an authorized staging window, not claims of this route.
+
+`purge-census` stays disabled until reviewed code pins the independently approved SELECT-only
+staging app endpoint and role (no ledger/runtime fallback) and the purge owner's exact guard
+head/digest. No guard ref is checked out. The receipt reports `user_cache_grants` (all rows)
+and `provider_owners_without_account_evidence` (distinct provider owners without a vault marker,
+passkey or session, even a revoked one). Role, deletion fence, age, challenges and magic links do
+not affect the count. Before relying on it, confirm both predicates against the exact final reviewed
+`0051_purge_legacy_provider_credentials.sql`. This is not proof of vault markers, locked-guard success
+or caller drain.
+
+After separate dispatch approval, retrieve `staging-purge-census-<run>-<attempt>` (seven days)
+from a successful protected `main` job. Match `purge-census-receipt.json` to its run/job/attempt,
+trusted revision and reviewed guard. Unknown, stale or nonzero is NO-GO. A merge produces no receipt.
 
 Every actual runner database child session overrides caller `PGOPTIONS`
 with `search_path=public,pg_catalog`, `standard_conforming_strings=on`,
@@ -516,11 +531,19 @@ are not PR deletions; no merge from the target is required to hide them.
 Neither field permits editing/removing a base migration, changing its target,
 renumbering it, bypassing numbering/search-path rules, or relaxing hashes.
 
-The secretless PR gate loads its checker and its stdlib-only
-`migration_history.py` import from a separate checkout of the event's full
-trusted **base SHA**. The PR **head SHA** is checked out with full Git
-history under a different root, used only as evidence through `--root`;
-no PR setup, scripts or builds run in this job. Python isolated mode (`-I`)
+A confirmed-unapplied byte-identical renumber needs a source-only record
+in the trusted checker, pinned to the repository, PR, reviewed Git parent,
+paths, digest and target. Both passes require exact Git lineage and an
+unchanged accepted prefix; neither accepts a new applied alias for the
+recorded identity, even in a different PR. Trigger a fresh PR event after
+the checker lands; rerunning a prior event tests its original integration commit. If the slot
+changes, reconcile the new path with the checker owner before retrying.
+
+The secretless PR gate pins the tested integration commit and runs the
+resolver blob from its first parent. It loads the checker and its imports
+from a separate checkout of that **tested base SHA**. The validated second
+parent supplies the source head and manifest. That checkout retains full
+Git history and serves only as evidence through `--root`. Python isolated mode (`-I`)
 excludes the working directory, `PYTHONPATH` and user-site imports, then
 adds only the trusted checker directory. The checker runs outside both
 checkouts with no API token in its environment; Git ignores global/system
@@ -548,14 +571,15 @@ The API collector retains projected metadata before and after a complete
 file-list attempt, including every page and non-migration record. Both
 samples must agree on PR number, repository IDs/names, refs, commits and
 file count. An observed head change or retarget fails; it never adopts a
-live head. A recorded effective base B1 may equal the event base B0 or be
-its Git-verified descendant in the same repository/ref. Every observed base
-must also equal or descend from the preceding observation across brackets
-and attempts; an observed rewind or divergent transition is a hard failure.
+live head. Git must prove the original event base B0 is the tested first
+parent or its ancestor. A recorded effective base B1 must equal or descend
+from the tested first parent in the same repository/ref. Every observed base
+must equal or descend from the preceding observation across brackets and
+attempts. An observed rewind or divergent transition fails the check.
 B1 need not be an ancestor of H. Its immutable object must be available in the full data
 checkout; missing objects or ambiguous ancestry fail, with no mutable-ref
-fetch or trust-pin substitution. Missing/incompatible trusted B0 code also
-still fails; advancing the evidence base cannot recover absent executables.
+fetch or trust-pin substitution. Missing or incompatible first-parent code
+fails the check.
 
 Validation independently runs the existing verifier on **both B0/H and
 B1/H**, each with its own unique merge-base manifest baseline. Only the
@@ -613,9 +637,10 @@ operator-verified staging state). The three pre-merge applies from
 equivalently via `apply_migration.py --record-only`), so the gate is
 green immediately after the app backfill. A future shared mirror would couple
 staging and production reads; the replacement is not activated and these
-historical backfill files do not prove its migration state. Its backfill — and
-creating the table on production at all — requires a Release Manager decision;
-production applies use the same `apply_migration.py` path once their gate opens.
+historical backfill files do not prove its migration state. A production
+backfill or table creation requires a separate approved
+[production release task](../CONTRIBUTING.md#production-releases). Production
+applies use the same `apply_migration.py` path once their gate opens.
 
 ### Admin bootstrap (owner promotion)
 
@@ -683,6 +708,22 @@ or the issuer's own email — gets the same generic signup error.
 Flipping `INVITES_REQUIRED` on stays the last operator step, after
 the bootstrap above and after a first invite has been issued and
 redeemed end-to-end in that environment.
+
+`POST /v1/admin/invites/batch` accepts a JSON object with `count` (1–50)
+and optional `expires_in_days` (the same bounds and default as single issue).
+Batch invites are not email-bound and don't consume member-window quota.
+The entire batch and its per-invite audits commit together. The one-time
+`201` response is `private, no-store` and contains `expires_at` (epoch
+seconds) and `codes` (an array of plaintext codes). If the response is lost,
+issuance may have committed: check the invite list, and don't retry automatically.
+
+`GET /v1/admin/users/{id}/invite-tree` is a private/no-store browser-admin
+read. It returns `user_id`, nullable `inviter_id`, up to 50 direct
+`invitee_ids` (bytewise ascending), and nullable `next_cursor`. Continue
+with `?cursor=<next_cursor>` on the same user; a stale or unrelated
+cursor returns 422. A missing node returns 404; a deleting admin or
+selected user is refused with 409. Hard deletion clears the recorded
+edge. The read never consults the invite ledger or writes audit events.
 
 ### Hyperdrive bindings
 
@@ -870,7 +911,7 @@ worker and the exact config source for each row.
 | `METER` | Analytics Engine | `stream` | dataset `nntune_meter` | dataset `nntune_meter` | `workers/stream/wrangler.toml:38-40` (top-level), `:50-52` (staging), `:62-64` (production); code `workers/stream/src/observability.rs:23` |
 | `INGEST_METER` | Analytics Engine | `ingest` | dataset `nntune_ingest_meter` | dataset `nntune_ingest_meter` | `workers/ingest/wrangler.toml:136-139` (top-level), `:212-214` (staging), `:272-274` (production); code `workers/ingest/src/metering.rs:16-18` |
 | `REPAIR_CONTAINER` | service | `ingest` → `repair` | service `nntune-repair-staging` | service `nntune-repair` | staging omits it (`workers/ingest/wrangler.toml:195-202`: target does not exist); top-level `:141-145`, production `:276-278`; target names `workers/repair/wrangler.toml:15` (prod default), `:50` (staging), `:69` (prod); contract note `:3-6`; code `workers/ingest/src/repair.rs:24` |
-| `TRANSCODE_CONTAINER` | service | `ingest` → `transcode` | service `nntune-transcode-staging` | service `nntune-transcode` | staging omits it (`workers/ingest/wrangler.toml:195-202`: target does not exist); top-level `:147-152`, production `:280-282`; target names `workers/transcode/wrangler.toml:15` (prod default), `:51` (staging), `:71` (prod); contract note `:3-9`; code `workers/ingest/src/transcode.rs:95` |
+| `TRANSCODE_CONTAINER` | service | `ingest` → `transcode` | service `nntune-transcode-staging` | service `nntune-transcode` | staging omits it (`workers/ingest/wrangler.toml:195-202`: target does not exist); top-level `:147-152`, production `:280-282`; target names `workers/transcode/wrangler.toml:15` (prod default), `:51` (staging), `:71` (prod); contract note `:3-9`; code `workers/ingest/src/transcode.rs:85` |
 | `MB_API` | service | `ingest` → `mb` | service `nntune-mb-staging` | service `nntune-mb-production` | `workers/ingest/wrangler.toml:154-158` (top-level), `:216-221` (staging), `:284-286` (production); per-env names committed in `workers/mb/wrangler.toml:24` (top-level), `:61` (staging), `:80` (production); code `workers/ingest/src/matching.rs:30` |
 | `REPAIR_JOBS` | Durable Object | `repair` | class `RepairContainer` | class `RepairContainer` | `workers/repair/wrangler.toml:33-35` (top-level), `:61-63` (staging), `:80-82` (production); migration tag `v1` `:37-39`; Container class/image/sizing `:23-31`, `:52-60`, `:71-79`; code `workers/repair/src/runtime.rs:33` |
 | `TRANSCODE_JOBS` | Durable Object | `transcode` | class `TranscodeContainer` | class `TranscodeContainer` | `workers/transcode/wrangler.toml:34-36` (top-level), `:63-65` (staging), `:83-85` (production); migration tag `v1` `:38-40`; Container class/image/sizing `:23-32`, `:53-62`, `:73-82`; code `workers/transcode/src/runtime.rs:34` |
@@ -956,6 +997,70 @@ three-day resolution age policy; existing lock entries are not a
 retrospective publication audit. No lifecycle-script exemption is granted.
 Retain the exact-head Actions job link and build-log artifact with review
 evidence; a skipped staging lane is not deployment evidence.
+
+For the staging API, keep `redact_query_string = true` under
+`[env.staging.observability]` in the deploy workflow's generated TOML. The
+upload check also reads the pinned Wrangler CLI's `--outfile` multipart body
+and requires `observability.redact_query_string` to be the boolean `true`
+in the `metadata` part for both mirror states. It never prints or publishes
+that body. This catches a CLI that accepts the TOML but drops the setting on
+upload. It does not prove Cloudflare applied the setting. Before any real
+Subsonic credentials are provisioned, the authorized operator must read back
+query-string redaction in the deployed staging API Worker's observability
+settings and verify it in that Worker's invocation log:
+
+1. Through the existing staging Access policy, send a read-only
+   `GET /v1/plans?redaction_probe=synthetic-only`. Include no application
+   session, authorization header or Subsonic credentials. An application
+   `401` is expected without a session; an Access denial is not a probe.
+2. Match the request by time, method and path in the **staging API Worker**
+   invocation logs. Do not use a web Worker event or treat a missing event
+   as a pass. The matching event must contain no query string. The API's
+   `/v1/*` route still matches with a query; its exact `/healthz` route does
+   not.
+
+Repeat both checks after relevant uploads or mount/configuration changes,
+which can change the effective setting. Record the deployed SHA and outcome,
+not the raw URL or log event. Keep raw request URLs and query strings out
+of application log fields independently, per the
+[logging standard](logging-standard.md).
+
+## Private listening qualification
+
+`PRIVATE_LISTENING_COHORT` is an optional API Worker setting. Leave it unset
+on default builds. An explicitly configured cohort uses `owner_user_id`, up
+to eight `invite_ids`, and a shared `expires_at` in Unix seconds. Use the
+existing administrator account and email-bound single invites it issued in
+the same environment. Carry only ledger IDs in configuration. Keep invite
+links and actual cohort configuration in private custody. Keep
+`INVITES_REQUIRED` enabled for invite-only environments independently.
+The cohort setting restricts Library, catalogue and play grants to the named
+cohort while set. Regular account and billing routes retain their own access
+rules. Unset the cohort setting to use the regular paid playback gate.
+When the deadline expires, the cohort setting continues to refuse Library
+and playback until a qualified configuration change restores access.
+
+Open `/admin/invites/issue`, choose **Single invite**, enter the recipient's
+email, and use **Create invite** and **Signup link**. Find the resulting row
+ID in `/admin/invites`. In `/signup`, use **Email**, **Invite code (if you
+have one)** or the prefilled link, **Create account with passkey**, **Email
+code**, then **Finish creating account**. The owner uses `/login`. Verify the
+Library with `library-item`, its **Refresh** action and the explicit access
+refusal message after revocation. Observe `GET /api/library` and
+`POST /v1/plays` with a synthetic Library track.
+
+Test anonymous and unlisted sessions, absent and refused invites, the cohort
+deadline, and revocation by removing a ledger ID while retaining the cohort
+setting. Before redemption the invite ledger's existing **Revoke** action
+also refuses enrollment. Already signed play grants can remain valid until
+their expiry, up to 15 minutes. Confirm an empty payment history and no
+Stripe credentials for the synthetic cohort. Keep the music-video interface
+off. Exclude payment checkout, paid renewal/grace, member-issued invitations,
+real media delivery, range/seek behavior and consumption metering from this
+access-only evidence. Run the existing paid signup-arrival case with the
+cohort setting absent, since it expects the Billing destination. Preserve the
+same serving build identity when qualifying the two configurations.
+Apply the existing staging promotion checklist to any release candidate.
 
 ## Staging promotion checklist
 
@@ -1092,34 +1197,34 @@ writes automatically, and an observer success alone is not verified recovery.
 
 The first rollback target is a binding-free maintenance Worker, not a direct
 application deploy. Do not bypass the production lane to seed the app.
+Promotion stays disabled; bootstrap changes no DNS, routes or triggers.
+Cloudflare documents [empty Worker creation](https://developers.cloudflare.com/workers/platform/infrastructure-as-code/),
+but [version upload with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/)
+and [deployment creation](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
+do not document a deploy-only-if-undeployed condition. Actions serialization
+cannot stop a concurrent provider write between the empty read and deployment.
 
-1. **Release Manager:** Accept the exact launch SHA after M1, staging
-   admission, Security → QA, exact-head CI and migration ledger review.
-   Explicitly accept the maintenance seed, hostname attachment and rollback.
-2. **DevOps / GitHub custodian:** Verify the production Environment protection
-   and credential scopes. After independent Release Manager acceptance, set
-   `PRODUCTION_ACCEPTED_SHA` **only** in that Environment, never as a repo or org
-   variable. Both modes require this exact SHA, in addition to staging admission.
-   Dispatch `deploy-production.yml` on `main` with that SHA and
-   `mode=bootstrap-maintenance`. Cloudflare creates an unbound Worker under a
-   unique name, deploys maintenance only to that new immutable ID, then renames
-   it to `nntune-web`. Cloudflare returns a conflict if the destination exists;
-   the workflow never writes through that name, attaches a host or tags.
-   On conflict or ambiguous failure, stop. The Cloudflare custodian reconciles
-   the logged scratch name/ID against the canonical Worker before any retry or
-   cleanup; never delete by name or assume a failed rename did not take effect.
-3. **Cloudflare custodian / DevOps:** Record the seed's 100% version ID.
-   Verify ownership of `PRODUCTION_DOMAIN` and absence of DNS, domain and
-   route conflicts; attach the host to `nntune-web` without displacing routing.
-   Record the non-cacheable, non-indexable maintenance 503 probe.
-4. **DevOps:** Verify that version is still at 100%; dispatch `mode=promote`
-   for the same accepted SHA. The gradual action uses the lockfile-installed
-   Wrangler for promotion and automatic stage rollback. On final smoke
-   failure, use the same CLI and production credentials:
-   `pnpm --dir apps/web exec wrangler rollback "$MAINTENANCE_VERSION" --name nntune-web --yes`.
-   Verify 100% on that version, maintenance 503 on `/` and `/api/build`, and
-   no tag. Retry only with current release admission. The GitHub custodian
-   clears `PRODUCTION_ACCEPTED_SHA` after the authorized window closes.
+1. **Release task owner and independent release reviewer.** Apply the
+   [production release process](../CONTRIBUTING.md#production-releases).
+   The reviewer explicitly accepts the seed and exact launch SHA after M1,
+   staging admission, security and QA evidence, exact-head CI and migration
+   ledger review. The application staging run supplies admission evidence.
+   Record same-build staging evidence for the pinned maintenance artifact
+   separately. For this first deployment, rehearse the close/undo procedure
+   below where supported. Stop before dispatch if staging has no supported
+   lane for the maintenance artifact or the required evidence is incomplete.
+   The release task owner verifies `production` Environment protection with
+   the GitHub custodian and coordinates configuration of the hostname and
+   `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
+   Keep `PRODUCTION_ACCEPTED_SHA`, `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID), Worker-scoped bearer and matching account in `production` only; a presence-only check during staging admission rejects inherited Cloudflare secrets.
+2. **Route custodian:** Immediately before dispatch, inventory every applicable zone and page, including wildcards, with existing read-only access. Refuse gaps; record zones, Worker ID, SHA, read time and zero matches.
+   The GitHub custodian sets `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in `production`: JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`) and numeric `route_count: 0`.
+   Freeze routes and keep this lane the sole Worker writer through readback. The Worker token cannot list zone routes.
+3. **Release task owner.** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`. Actions reruns are refused.
+   Under the mutation lock, require proof ≤30 minutes old, empty deployment/version/binding inventories and no custom domain, workers.dev or previews.
+   One [upload by immutable ID with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/) installs `worker.mjs` at 100%. Record verified readback.
+4. **Close/undo:** Disable `PRODUCTION_DEPLOY_ENABLED` and clear the accepted SHA and route proof. To abort an in-flight run, cancel it too and reconcile Worker, deployment and route state before any retry.
+   Verify the seed remains unrouted and unexposed. Leave it and the Worker intact; re-entry refuses. Reverse only separately accepted cutover routes/DNS.
 
 ### Production Worker secret-shape gate
 
@@ -1138,6 +1243,31 @@ shape check — no credentials, no network — that reads key names only and
 never reads or prints values
 (`ci/check-production-secrets-shape.mjs:6-7`).
 
+### First-release recovery after failed final smoke
+
+App promotion stays disabled. Before first release, verify empty production
+state with a read-only check, take a snapshot before the first schema change,
+and record the switch-off plan. Keep provider restore proof separate.
+
+Keep `PRODUCTION_ROLLBACK_CUSTODY` and `PRODUCTION_ROLLBACK_INTENT_KEY`
+(a separate random 256-bit key in lowercase hex) in the protected `production`
+Environment. The custody JSON pins the accepted `sha`, `account`, immutable
+`worker`, private `domain`, fresh `checked_at` (ISO UTC with milliseconds),
+private `evidence_sha256`, exact Worker `references` and verified `maintenance`
+`version`, `deployment`, seed `sha` and `module_sha256`. Set `exclusive_writers`
+and `private_routes_frozen` only after verifying and freezing all Worker,
+route, DNS and Access writers through readback. The job verifies the Worker
+and preview settings and seals the intent before traffic shifts. Custody
+evidence must be at most 30 minutes old when sealing. Keep the freeze in
+place through recovery readback even if final smoke runs past that window.
+The maintenance module digest must also match the reviewed candidate checkout.
+
+Failed final smoke keeps the release red. The same lock covers recovery, which
+requires the exact final deployment and submits maintenance at 100% once.
+On ambiguity reconcile Worker, allocation, routes and provider audit before
+any further action. Verify maintenance behavior and private Access denials on
+the isolated candidate. Post-watch and cancellation need separate admission.
+
 ### Production promotion publishes a CalVer release
 
 After a successful production promotion and its post-promotion smoke, the
@@ -1153,15 +1283,14 @@ and publishes a calendar version (`vYYYY.MDD.P`, e.g. `v2026.1102.1`)
 through the shared `TogetherWeOwn/.github` CalVer releaser (policy
 `production-promotion`; notes grouped by `release-please-config.json`
 changelog-sections). A re-promote of an already-tagged commit skips green
-without a tag. Production therefore only ever deploys on the release path
-(`environment: production`, human-gated); push to `main` deploys staging
-only (`environment: staging` on both deploy jobs). No other GitHub
-environment exists on this repo.
+without a tag. The production deploy uses the `production` Environment and
+requires independent release approval. A push to `main` deploys to the
+`staging` Environment only.
 
 - [ ] Exact-head CI: record the promotion SHA and GitHub Actions run/job
   URLs showing `ci-ok`, `gitleaks` and `pr-lint` green on that SHA.
   CI is `.github/workflows/ci.yml`; full suites and CI gates run in Actions,
-  never in a local CI mirror. Reviewers and the Release Manager accept
+  never in a local CI mirror. The release task owner and reviewers accept
   these exact-head links as CI evidence, not local full-suite transcripts
   ([verification contract](../CONTRIBUTING.md#evidence-for-review-and-release)).
   `migrations-staging` and `Devin Review` report on pull requests, not on
@@ -1207,8 +1336,12 @@ environment exists on this repo.
   a green `staging-api` job may be an unconfigured skip, passed on as
   `api_deploy_outcome`), so a skipped/failed
   deploy cannot produce a full-journey PASS and no separate dispatch is
-  needed or accepted as evidence. Scheduled/manual `e2e-staging` runs are
-  synthetic monitoring only (the full-journey job is skipped there).
+  needed or accepted as evidence. `deploy-staging-main` queues later main
+  pushes until the entire deploy and verification finish. The
+  `e2e-staging-queued` group queues pending runs rather than replacing the
+  post-deploy call.
+  Scheduled/manual `e2e-staging` runs are synthetic monitoring only (the
+  full-journey job is skipped there).
   Record the deploy run and the `post-deploy-e2e` result, and call it
   same-build evidence only when staging `GET /api/build` returns the
   deploy SHA itself (a source SHA alone is not build identity; see the
@@ -1229,8 +1362,10 @@ environment exists on this repo.
   `success` (not `skipped`), before promoting. To accept rollback evidence,
   also require the rollback rerun's `staging-web` job conclusion to be `success`
   (not `skipped`); overall workflow success and staging health alone are
-  insufficient. To roll back `apps/web`, open that Actions run and choose
-  **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
+  insufficient. Follow the [staging deploy lock cutover and rollback
+  procedure](#staging-deploy-lock-cutover-and-rollback) before re-running
+  any known-good push. To roll back `apps/web`, open that Actions run and
+  choose **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
   `staging-web` is push-only and will be skipped. Verify the rerun's
   `staging-web` success and staging health. The rerun also redeploys the api,
   mb and ingest Workers through `staging-api`, `staging-mb` and
@@ -1239,6 +1374,54 @@ environment exists on this repo.
   Staging rollback is
   a redeploy, never a data restore; retain the UNDO blocks and consolidation
   receipt for infrastructure-specific rollback.
+
+### Staging deploy lock cutover and rollback
+
+Actions reruns use the workflow and reusable workflow from the original
+run. A deploy from before `deploy-staging-main` was added cannot acquire
+that lock, even if it is rerun after cutover. Pre-cutover smoke reruns
+stay in the old `e2e-staging` group and cannot replace a pending run in
+`e2e-staging-queued`.
+
+- **Cutover:** Coordinate a pause on other `main` merges/pushes and staging
+  deploy reruns. In Actions, wait for all active and queued `main`
+  `deploy.yml` runs to finish, including their post-deploy E2E. Then land
+  the lock change and let its deploy and post-deploy E2E finish before
+  resuming normal merges and reruns. Do not rerun a pre-lock deploy during
+  cutover.
+- **Rollback:** Pause new `main` merges/pushes and other staging deploy
+  reruns, and let all active and queued `main` deploy runs finish through
+  post-deploy E2E. Only then **Re-run all jobs** on the chosen push run.
+  Keep the pause in place through the rerun's deploy and post-deploy E2E
+  and verify that staging is serving the rollback SHA before resuming.
+  Draining first also keeps an already queued push from immediately
+  undoing the rollback. If the queue cannot be drained and kept clear, do
+  not start a pre-lock rerun.
+
+### Offline staging Worker submission checks
+
+The [submission comparator](../ci/staging_worker_submission.py) runs only in
+CI with synthetic inputs. It checks the fixed web, API, MB and ingest jobs in
+[`deploy.yml`](../.github/workflows/deploy.yml) and the alerts job in
+[`deploy-alerts-staging.yml`](../.github/workflows/deploy-alerts-staging.yml).
+It compares the Worker, account, full source SHA, operation and final body
+digest with approval pins. Rollback also requires the approved version ID.
+The current staging writer is Wrangler. The web rollback procedure above
+redeploys a prior source revision and can also redeploy other configured
+Workers. The staging workflows have yet to implement a protected restore
+of a named Worker version.
+
+Before wiring this comparison into a live writer, resolve competing write
+paths and verify the target account and reachable bindings. The writer must
+derive the target, operation and rollback version from the request it will
+send, enforce single use of approval tied to the protected workflow revision
+and run attempt, and check each mutation's method, path, query and exact body
+before sending those bytes. For a named-version restore, record prior-version
+provenance, verify binding, schema and Durable Object compatibility, and
+confirm the serving version, build SHA and health after recovery. An enablement
+with no verified prior version needs a separately reviewed recovery plan.
+The [MB and ingest activation prerequisites](#operator-runbook-enabling-staging-mb--staging-ingest)
+apply to those lanes.
 
 ## Future Worker deploy lanes: required rollback evidence
 
@@ -1415,8 +1598,10 @@ deploys either Worker — until every step below clears, in order:
    `.github/scripts/binding_manifest.toml`, and re-run binding-parity
    before the next staging deploy.
 8. **Rollback is a redeploy, never a data restore.** To roll back a Worker,
-   re-run the known-good push's `deploy.yml` run (**Re-run all jobs**;
-   never `workflow_dispatch` on an old SHA — the lanes are push-only and
-   would skip) and retain the per-Worker evidence in the table above. A
+   follow the [staging deploy lock cutover and rollback
+   procedure](#staging-deploy-lock-cutover-and-rollback), then re-run the
+   known-good push's `deploy.yml` run (**Re-run all jobs**; never
+   `workflow_dispatch` on an old SHA — the lanes are push-only and would
+   skip). Retain the per-Worker evidence in the table above. A
    rerun redeploys every configured lane; that is not verified per-Worker
    rollback unless each Worker's own outcome evidence is recorded.

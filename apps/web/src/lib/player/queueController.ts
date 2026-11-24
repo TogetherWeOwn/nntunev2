@@ -1,9 +1,9 @@
 import { writable } from 'svelte/store';
 import { resolveStreamUrl } from '../library/stream-url.js';
-import { currentTrack, type QueueState } from './queue.js';
+import { createQueue, currentTrack, type QueueState } from './queue.js';
 import { createQueueRevision } from './queueRevision.js';
 
-type LibrarySources = ReadonlyMap<string, ReadonlySet<string>>;
+export type LibrarySources = ReadonlyMap<string, ReadonlySet<string>>;
 export interface QueuedPlaySource {
 	streamUrl: string;
 	isCurrent: () => boolean;
@@ -16,19 +16,24 @@ export function createQueueController(initial: QueueState) {
 	let snapshot = initial;
 	let librarySources: LibrarySources = new Map();
 	let operation = 0;
+	let selectionGeneration = 0;
 	let alive = true;
+	let purging = false;
 	const revision = createQueueRevision();
 	const store = writable(initial);
 
 	function isCurrentOperation(receipt: number): boolean {
-		return alive && operation === receipt;
+		return alive && !purging && operation === receipt;
 	}
 
 	return {
 		get snapshot() { return snapshot; },
+		get selectionGeneration() { return selectionGeneration; },
+		get purging() { return purging; },
 		get revision() { return revision.revision; },
 		subscribe: store.subscribe,
 		begin(next: QueueState, kind: QueueCommitKind, withLibrary = false): number {
+			if (!alive || purging) return -1;
 			const queueChanged = kind !== 'replace' || next !== snapshot;
 			if (!queueChanged && !withLibrary) return operation;
 			const receipt = ++operation;
@@ -73,8 +78,29 @@ export function createQueueController(initial: QueueState) {
 			// Evidence is visible with the new queue, including to reentrant subscribers.
 			if (sources) librarySources = sources;
 			if (snapshot === next) return;
+			if (currentTrack(snapshot)?.id !== currentTrack(next)?.id) selectionGeneration++;
 			snapshot = next;
 			store.set(next);
+		},
+		purgeAtAuthBoundary(retirePlayer: () => void): void {
+			if (!alive || purging) return;
+			purging = true;
+			operation += 1;
+			revision.revoke();
+			librarySources = new Map();
+			const previous = snapshot;
+			selectionGeneration++;
+			if (previous.tracks.length || previous.currentIndex !== -1) snapshot = createQueue([]);
+			// Native cleanup sees the empty snapshot; subscribers only see it after cleanup.
+			try {
+				retirePlayer();
+			} finally {
+				try {
+					if (previous !== snapshot) store.set(snapshot);
+				} finally {
+					purging = false;
+				}
+			}
 		},
 		isCurrentOperation,
 		revoke: revision.revoke,

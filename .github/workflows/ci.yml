@@ -6,7 +6,7 @@ name: ci
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened]
   # Merge queue validation: every required check must report on
   # the queue's temporary merge commit, or the queue stalls on "Expected —
   # waiting". merge_group runs are never cancelled (see concurrency below).
@@ -31,6 +31,35 @@ env:
   PNPM_VERSION: 10.34.7
 
 jobs:
+  ci-commits:
+    name: ci-commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      merge_sha: ${{ steps.commits.outputs.merge_sha }}
+      base_sha: ${{ steps.commits.outputs.base_sha }}
+      head_sha: ${{ steps.commits.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve tested commit and comparison range
+        id: commits
+        run: python3 -I .github/scripts/migrations_base.py >> "$GITHUB_OUTPUT"
+      - name: Install the pinned workflow YAML scanner
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/ci-python"
+          "$RUNNER_TEMP/ci-python/bin/pip" --isolated install --no-deps --only-binary=:all: --require-hashes \
+            -r /dev/stdin <<<'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc'
+          echo "$RUNNER_TEMP/ci-python/bin" >> "$GITHUB_PATH"
+      - name: Reject added direct PR SHA reads
+        env:
+          BASE_SHA: ${{ steps.commits.outputs.base_sha }}
+          MERGE_SHA: ${{ steps.commits.outputs.merge_sha }}
+        run: python3 .github/scripts/check_workflow_pr_shas.py --base "$BASE_SHA" --tested "$MERGE_SHA"
+      - name: Test the workflow SHA ratchet
+        run: python3 -m unittest discover -s .github/scripts -p test_workflow_pr_shas.py
   # PR-only public security caller; never scan push/queue/dispatch events.
   # Keep this in the ci-ok dependency graph rather than waiting across workflows.
   public-pr-security:
@@ -321,10 +350,39 @@ jobs:
         run: python3 .github/scripts/test_ci_fixture_secrets.py
       - name: Test workflow and offline account-export boundaries
         run: python3 .github/scripts/test_workflow_policy_hardening.py && python3 .github/scripts/test_staging_apply.py && python3 scripts/test_account_export.py
+      - name: Test the read-only Subsonic staging observer offline
+        run: python3 -I .github/scripts/test_subsonic_staging_observer.py
+      - name: Test Subsonic staging off-and-drained verifier and adapter offline
+        run: python3 -I .github/scripts/test_subsonic_staging_cleanup.py && python3 -I .github/scripts/test_subsonic_staging_off_drain.py
+      - name: Test Subsonic staging telemetry, health and API identity offline
+        run: python3 -I .github/scripts/test_subsonic_staging_telemetry.py && python3 -I .github/scripts/test_subsonic_staging_health.py && python3 -I .github/scripts/test_staging_api_identity.py
       - name: Test offline playable-artist root coverage (synthetic only)
         run: python3 scripts/test_genre_root_coverage.py
       - name: Test bounded process-group cleanup
         run: python3 workers/api/tests/test_process_group.py
+      # No staging environment or network. exec lets Actions signal the
+      # actual fixture process, not a shell waiting for its child.
+      - name: Fail an armed synthetic Subsonic step
+        id: subsonic_failure
+        continue-on-error: true
+        run: exec python3 -I scripts/test-subsonic-actions-cleanup.py arm failure "$RUNNER_TEMP/subsonic-failure.json"
+      - name: Verify Subsonic finalization after step failure
+        if: ${{ always() }}
+        env:
+          STEP_OUTCOME: ${{ steps.subsonic_failure.outcome }}
+        run: python3 -I scripts/test-subsonic-actions-cleanup.py finalize failure "$RUNNER_TEMP/subsonic-failure.json" --outcome "$STEP_OUTCOME"
+      - name: Time out an armed synthetic Subsonic step
+        id: subsonic_timeout
+        continue-on-error: true
+        timeout-minutes: 1
+        run: exec python3 -I scripts/test-subsonic-actions-cleanup.py arm timeout "$RUNNER_TEMP/subsonic-timeout.json"
+      - name: Verify Subsonic finalization after native step timeout
+        if: ${{ always() }}
+        env:
+          STEP_OUTCOME: ${{ steps.subsonic_timeout.outcome }}
+        run: python3 -I scripts/test-subsonic-actions-cleanup.py finalize timeout "$RUNNER_TEMP/subsonic-timeout.json" --outcome "$STEP_OUTCOME"
+      - name: Rehearse synthetic Subsonic recovery after process loss
+        run: python3 -I scripts/test-subsonic-actions-cleanup.py rehearse-process-loss
 
   # Bounded local Cargo pool: the offline wrapper suite plus a shape
   # check of the shipped pool policy through the wrapper's own
@@ -423,9 +481,7 @@ jobs:
     name: migrations-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      MIGRATIONS_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      MIGRATIONS_PUSH_BEFORE: ${{ github.event.before }}
+    needs: ci-commits
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -436,12 +492,9 @@ jobs:
       # Keep the default PR integration checkout. Its first parent pairs
       # with that exact tree; the payload's base.sha can be stale. Pushes
       # still compare event.before, including pushes of merge commits.
-      - name: Select migration comparison base
-        id: migrations-base
-        run: python3 .github/scripts/migrations_base.py --root . >> "$GITHUB_OUTPUT"
       - name: Check migration manifest and drift
         env:
-          MIGRATIONS_BASE_REF: ${{ steps.migrations-base.outputs.base_ref }}
+          MIGRATIONS_BASE_REF: ${{ needs.ci-commits.outputs.base_sha }}
         run: python3 .github/scripts/migrations_gate.py --root . --base-ref "$MIGRATIONS_BASE_REF"
       - name: Test migration comparison selection and workflow wiring
         run: python3 .github/scripts/test_migrations_base.py
@@ -616,6 +669,12 @@ jobs:
       # The Worker deploys to wasm32: the crate must check on that target
       # (native-only CI once missed a getrandom/RNG breakage there).
       - run: cargo check --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+      - name: Enforce unnamed Postgres statements in the API Worker
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/workers/api/clippy
+        run: python3 workers/api/tests/check_hyperdrive_clippy.py
+      - name: Check typed Postgres interface
+        run: cargo test --locked --manifest-path workers/api/Cargo.toml --doc 'postgres::'
       # The Hyperdrive cache gate fails closed without credentials; pin its
       # exit codes with the built-in shim self-test (no network, no secrets).
       - run: bash workers/api/check_hyperdrive_cache.sh --self-test
@@ -674,8 +733,24 @@ jobs:
         run: python3 workers/mb/spike/test_recall.py
       - name: Run R2 snapshot spike gate 2 verdict tests
         run: python3 workers/mb/spike/test_bench.py
-      - name: Run R2 snapshot spike expiry-rule check tests
-        run: python3 workers/mb/spike/test_lifecycle.py
+
+  database-bootstrap-fixture:
+    name: database-bootstrap-fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prove synthetic run authorization and fixed diagnostics
+        run: exec python3 -B .github/scripts/test_database_bootstrap_admission.py
+      - name: Prove synthetic TLS, role isolation and teardown
+        id: bootstrap
+        run: exec python3 -B .github/scripts/test_database_bootstrap_isolation.py
+      - name: Require the post-teardown execution marker
+        env:
+          BOOTSTRAP_VERDICT: ${{ steps.bootstrap.outputs.verdict }}
+        run: test "$BOOTSTRAP_VERDICT" = passed
 
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
@@ -729,7 +804,13 @@ jobs:
         run: bash workers/api/tests/test_storage_digest_target.sh
       - name: Check scratch migration runner offline
         run: bash workers/api/tests/test_migration_runner.sh
-      - run: bash workers/api/tests/run_migration_tests.sh
+      - name: Exercise first-launch catalog preflight on disposable PostgreSQL
+        run: python3 .github/scripts/test_database_bootstrap_preflight_postgres.py
+      - name: Run migration tests and verify the scoped reservation fixture
+        run: |
+          set -euo pipefail
+          bash workers/api/tests/run_migration_tests.sh | tee "$RUNNER_TEMP/migration-tests.log"
+          grep -Fxq 'test (hosted): ingest_session_reserve passed' "$RUNNER_TEMP/migration-tests.log"
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - name: Exercise hosted reservation race fixture
@@ -755,6 +836,15 @@ jobs:
           workspaces: workers/api
           key: api-postgres-acceptance
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Exercise protected playback lookup on disposable PostgreSQL
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci
+        run: |
+          test_name='storage_digest_read::postgres_tests::pins_require_authorization_and_live_committed_protection'
+          args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name")
+          inventory="$(cargo test "${args[@]}" -- --list --exact)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          cargo test "${args[@]}" -- --exact
       - name: Exercise ingest candidate adapter on disposable PostgreSQL
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
@@ -763,6 +853,37 @@ jobs:
           inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name" -- --list)"
           test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
           cargo test --locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name" -- --exact --ignored
+          test_name='postgres_append_stages_only_exact_live_candidate_inventory'
+          inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --list)"
+          test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
+          cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --exact --ignored
+          test_name='publisher::postgres_stages_completed_candidate_atomically'
+          inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --list)"
+          test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
+          psql "$NNTUNE_TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -c 'CREATE DATABASE nntune_catalogue_ci TEMPLATE nntune_ci'
+          export NNTUNE_TEST_DATABASE_URL=postgresql://postgres:ci-throwaway@localhost:5432/nntune_catalogue_ci
+          cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --exact --ignored
+      - name: Exercise listen history on disposable PostgreSQL
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+        run: |
+          for test_name in \
+            listen_history::postgres_tests::clear_and_terminal_write_share_owner_fence \
+            listen_history::postgres_tests::history_uses_the_grant_privacy_decision \
+            handlers::tests::unmounted_history_receiver_writes_through_pg_store; do
+            inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --list)"
+            test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
+            cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --exact
+          done
+      - name: Exercise the off-route presence boundary on disposable PostgreSQL
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+        run: |
+          test_name='realtime_presence::postgres_tests::postgres_presence_keeps_authority_and_replay_state_together'
+          args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name")
+          inventory="$(cargo test "${args[@]}" -- --list --exact)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          cargo test "${args[@]}" -- --exact
       # Meter-metadata boundary runs below against independently migrated
       # app/mirror stores (their own env vars); it must not run here on the
       # single shared database, where the split-store env vars are absent.
@@ -780,7 +901,8 @@ jobs:
           done
           inventory_billing="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres -- --list)"
           printf '%s\n' "$inventory_billing"
-          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 23
+          test "$(printf '%s\n' "$inventory_billing" | grep -c '^[^ ]*: test$')" -eq 26
+          printf '%s\n' "$inventory_billing" | grep -Fx 'exact_paid_periods_preserve_gaps_and_only_hydrate_owned_history: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'parent_delete_waits_for_subscription_exclusion: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'coupled_fixture_waits_for_raw_insert_commit_or_rollback: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'coupled_sql_relation_is_transformed_only_for_the_trusted_schema: test'
@@ -804,10 +926,17 @@ jobs:
           printf '%s\n' "$inventory_billing" | grep -Fx 'insertion_conflicts_only_while_another_subscription_holds_the_slot: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'retained_subscription_rows_follow_existing_upsert_guards: test'
           printf '%s\n' "$inventory_billing" | grep -Fx 'target_selector_reads_archived_rows_without_changing_live_selection: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'target_fold_before_slot_release_does_not_borrow_live_proof: test'
+          printf '%s\n' "$inventory_billing" | grep -Fx 'trialing_row_recovers_to_active_and_past_due_on_the_same_paid_evidence: test'
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test billing_reconcile_postgres
           inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests -- --list)"
           printf '%s\n' "$inventory"
-          test "$(printf '%s\n' "$inventory" | grep -c '^worker_entry::subsonic_pg::postgres_tests::.*: test$')" -eq 10
+          test "$(printf '%s\n' "$inventory" | grep -c '^worker_entry::subsonic_pg::postgres_tests::.*: test$')" -eq 15
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_credential_mutations_keep_the_cap_and_fences: test'
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_credential_projection_charges_bounded_fields: test'
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_account_projects_only_bounded_email_and_live_role_flags: test'
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_membership_admits_only_complete_owner_scoped_pages: test'
+          printf '%s\n' "$inventory" | grep -Fx 'worker_entry::subsonic_pg::postgres_tests::staging_session_enforces_admission_before_reindexing: test'
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib worker_entry::subsonic_pg::postgres_tests
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test credential_session_postgres
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test subsonic_deadlock_postgres
@@ -815,8 +944,27 @@ jobs:
           cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --test ingest_classifications_postgres
           python3 .github/scripts/test_check_refresh_retry_mutants.py
           python3 .github/scripts/check_refresh_retry_mutants.py
+          psql "$NNTUNE_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE nntune_ci_latin1 TEMPLATE template0 ENCODING 'LATIN1' LOCALE_PROVIDER libc LOCALE 'C'"
+          test_name='worker_entry::subsonic_mirror::postgres_tests::staging_mirror_counts_combined_text_and_keeps_exact_occurrences'
+          inventory="$(cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --list --exact)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          cargo test --locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name" -- --exact
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
+      - name: Exercise native PgStore billing reconciliation
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          test_name=worker_entry::billing_store_postgres_test::billing_store_refuses_unowned_history_and_replays_when_owned
+          test_args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name")
+          inventory="$(cargo test "${test_args[@]}" -- --exact --ignored --list)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          maintenance=postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci
+          createdb --maintenance-db="$maintenance" --template=template0 nntune_billing_native
+          trap 'dropdb --maintenance-db="$maintenance" nntune_billing_native' EXIT
+          log="$RUNNER_TEMP/native-billing-reconciliation.log"
+          cargo test "${test_args[@]}" -- --exact --ignored | tee "$log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
       # The preparation entry point creates its own isolated PostgreSQL
       # container, migrates each store, runs the schema test and removes it.
       - name: Reject externally supplied store targets
@@ -1065,7 +1213,7 @@ jobs:
         with:
           workspaces: workers/transcode
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --manifest-path workers/transcode/Cargo.toml --all-targets
+      - run: cargo test --locked --manifest-path workers/transcode/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path workers/transcode/Cargo.toml --all-targets -- -D warnings
       - run: cargo fmt --manifest-path workers/transcode/Cargo.toml -- --check
       # The Worker deploys to wasm32: the crate (including the Container
@@ -1250,6 +1398,8 @@ jobs:
         run: node --test ci/test-production-maintenance.mjs
       - name: Unit-test candidate staging admission (offline synthetic evidence only)
         run: python3 ci/test_staging_admission.py
+      - name: Unit-test staging Worker target and submission comparison (offline)
+        run: python3 ci/test_staging_worker_submission.py
       - name: Unit-test the receipt archive bounds
         run: python3 ci/test_read_promotion_receipt.py
       - name: Unit-test gate incident reporting (offline API fixtures)
@@ -1276,9 +1426,9 @@ jobs:
     name: docs-links
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Compare pushes with their previous tip; comparing main to itself would miss drift.
+    needs: ci-commits
     env:
-      DOCS_LINKS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || 'main' }}
+      DOCS_LINKS_BASE_REF: ${{ needs.ci-commits.outputs.base_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1572,11 +1722,11 @@ jobs:
           printf 'Locked Wrangler: %s\n' "$wrangler_version"
           test "$wrangler_version" = "$(node -p 'require("./apps/web/package.json").devDependencies.wrangler')"
           timeout 120 npx wrangler rollback 12345678-1234-1234-1234-123456789abc --name nntune-web --yes --help
-      - name: Exclude history instrumentation from ordinary output
+      - name: Exclude browser fixtures and YouTube sources from ordinary output
         run: |
           test -d .svelte-kit/output/client && test -d .svelte-kit/output/server
-          if grep -R -l -E '__nntuneHistoryFixture|acceptance-history-live-store' .svelte-kit/output/client .svelte-kit/output/server; then
-            echo 'Test-only history instrumentation found in ordinary output'
+          if grep -R -l -E '__nntuneHistoryFixture|acceptance-history-live-store|music-video-fixture|fixture0001|www\.youtube(-nocookie)?\.com' .svelte-kit/output/client .svelte-kit/output/server; then
+            echo 'Test-only browser fixtures or YouTube sources found in ordinary output'
             exit 1
           else
             result=$?
@@ -1595,7 +1745,11 @@ jobs:
         run: python3 "$GITHUB_WORKSPACE/.github/scripts/test_check_web_bundle_budget.py"
 
   web-e2e:
-    name: web-e2e
+    name: web-e2e (${{ matrix.shard }}/2)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     environment:
       name: ci-fixtures
       deployment: false
@@ -1685,9 +1839,37 @@ jobs:
           fetched="$("$fetcher" fixtures/cc0/fetch_fixture.py --position 1)"
           echo "CC0 fixture fetched and sha256-verified against the manifest:"
           sha256sum "$fetched"
+      - name: Verify web Playwright shard coverage
+        if: matrix.shard == 1
+        # Discovery only: compare the same config without running browsers or a build.
+        run: |
+          set -eu
+          pnpm --silent test:e2e --list --reporter=json > "$RUNNER_TEMP/web-e2e-all.json"
+          for shard in 1 2; do
+            pnpm --silent test:e2e --list --reporter=json --shard="$shard/2" > "$RUNNER_TEMP/web-e2e-$shard.json"
+          done
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          function collect({ specs = [], suites = [] }) {
+            return [...specs, ...suites.flatMap(collect)];
+          }
+          const [all, first, second] = ['all', 1, 2].map((shard) =>
+            collect(JSON.parse(readFileSync(join(process.env.RUNNER_TEMP, `web-e2e-${shard}.json`), 'utf8')))
+          );
+          assert.ok(first.length && second.length, 'Both web-e2e shards must discover specs');
+          const firstFiles = new Set(first.map(({ file }) => file));
+          assert.ok(second.every(({ file }) => !firstFiles.has(file)), 'A spec file is split across shards');
+          const ids = (entries) => entries.map(({ id }) => id).sort();
+          assert.deepEqual(ids([...first, ...second]), ids(all), 'Shards must discover every spec exactly once');
+          console.log(`Verified ${all.length} specs exactly once across shard 1/2 (${first.length}) and 2/2 (${second.length})`);
+          JS
       - name: Run apps/web Playwright suite
-        run: pnpm test:e2e
+        run: pnpm test:e2e --shard="$PLAYWRIGHT_SHARD"
         env:
+          PLAYWRIGHT_SHARD: ${{ matrix.shard }}/2
           NNTUNE_E2E_HTML_REPORT: 'true'
           PLAYWRIGHT_HTML_OPEN: never
           NNTUNE_FIXTURE_R2_ACCESS_KEY_ID: ${{ env.FIXTURE_SECRETS_ALLOWED == 'true' && secrets.NNTUNE_FIXTURE_R2_ACCESS_KEY_ID || '' }}
@@ -1697,7 +1879,7 @@ jobs:
         if: always() && !cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: web-e2e-html-report
+          name: web-e2e-html-report-shard-${{ matrix.shard }}
           path: apps/web/playwright-report/
           if-no-files-found: ignore
           retention-days: 7
@@ -1705,7 +1887,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: web-e2e-report
+          name: web-e2e-report-shard-${{ matrix.shard }}
           path: apps/web/test-results/
           retention-days: 7
 
@@ -1937,7 +2119,9 @@ jobs:
           set -euo pipefail
           cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test --target-dir "$RUNNER_TEMP/staging-body-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/staging-body-js" "$RUNNER_TEMP/staging-body-target/wasm32-unknown-unknown/debug/nntune_api.wasm"
-          STAGING_BODY_WASM_JS="$RUNNER_TEMP/staging-body-js/nntune_api.js" node --test workers/api/tests/staging_body_wasm.cjs
+          STAGING_BODY_WASM_JS="$RUNNER_TEMP/staging-body-js/nntune_api.js" node --test workers/api/tests/staging_body_wasm.cjs workers/api/tests/staging_request_wasm.cjs
+      - name: Exercise unmounted staging admission through Worker responses
+        run: STAGING_BODY_WASM_JS="$RUNNER_TEMP/ledger-js/nntune_api.js" node --test workers/api/tests/staging_dispatch_wasm.cjs
       # Reuse the existing locked Wrangler dependency. No root prepare or
       # dependency install scripts are needed for upload-only dry-runs.
       - name: Install locked upload CLI without lifecycle scripts
@@ -1949,6 +2133,17 @@ jobs:
           mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
           test "${#wranglers[@]}" -eq 1
           python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
+      - name: Exclude Subsonic deadline test markers from release WASM
+        run: |
+          if grep -aEq 'subsonic-connect-deadline-(proof|ok)' workers/api/build/index_bg.wasm; then
+            printf '%s\n' 'Subsonic deadline test marker found in release WASM' >&2
+            exit 1
+          else
+            # Only a clean no-match passes; a missing or unreadable bundle fails.
+            test "$?" -eq 1
+          fi
+      - name: Rehearse the offline Subsonic staging schedule
+        run: python3 -I scripts/test-subsonic-staging-runner.py
       - name: Exercise Worker routing with disposable PostgreSQL
         run: |
           python3 -I workers/api/tests/test_worker_routing_postgres_smoke.py
@@ -1962,7 +2157,7 @@ jobs:
       - name: Exercise owned transport in a separate test Worker
         run: |
           set -euo pipefail
-          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok|billing-ack-ok:' workers/api/build/index_bg.wasm; then
+          if grep -aEq 'owned-drive-ok:|owned-empty-guard-ok|billing-ack-ok:|/billing-webhook-(ack|retry)-proof|billing-restricted-history-|/billing-raw-update-proof|/billing-(raw-(insert|replace)|worker-first-insert)-(commit|rollback)-proof|billing-worker-first-insert-ok|/billing-(parent|row-update)-cycle-proof|/billing-parent-(first-)?delete-(commit|rollback)-proof' workers/api/build/index_bg.wasm; then
             printf '%s\n' 'test entry marker found in release WASM' >&2
             exit 1
           fi
@@ -1988,11 +2183,36 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
+  changed-lines-mutation:
+    name: changed-lines-mutation
+    needs: ci-commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove the mutation verdict on synthetic PR diffs
+        if: github.event_name == 'pull_request'
+        run: python3 -B .github/scripts/test_check_changed_lines_mutants.py
+      - name: Report the rollout phase and evaluate the tested PR diff
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: python3 -B .github/scripts/check_changed_lines_mutants.py
+        env:
+          MUTATION_BASE_SHA: ${{ needs.ci-commits.outputs.base_sha }}
+          MUTATION_MERGE_SHA: ${{ needs.ci-commits.outputs.merge_sha }}
+      - name: Record the non-PR skip
+        if: github.event_name != 'pull_request' && !(github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: echo 'Mutation skipped because this run has no pull request diff.' | tee -a "$GITHUB_STEP_SUMMARY"
+
   # Aggregate required check: every dependency must succeed, including
-  # when a required job fails, is cancelled, or is skipped.
+  # when a required job fails, is cancelled, or is skipped. GitHub's needs
+  # names job IDs, not matrix legs: the web-e2e entry covers both shards.
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds]
+    needs: [ci-commits, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, database-bootstrap-fixture, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds, changed-lines-mutation]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -102,8 +102,16 @@ for (const path of ['/library', '/home', '/search?q=Echo', '/library/liked']) {
 		await page.route('**/api/library', (route) => route.fulfill({ json: rows }));
 		await page.goto(path);
 		if (path === '/library') {
+			const tracks = page.getByTestId('library-list');
 			await expect(page.getByTestId('library-item')).toHaveCount(3);
 			await expect(page.getByTestId('favorite-item')).toHaveCount(1);
+			await expect(page.getByTestId('usage-meter')).toHaveCount(1);
+
+			await page.getByRole('button', { name: 'Group by artist' }).click();
+			await expect(tracks.getByRole('list')).toHaveCount(3);
+			await expect(tracks.getByTestId('library-item')).toHaveCount(3);
+			await expect(tracks.getByRole('checkbox', { name: 'Select Echo Two' })).toBeVisible();
+			await expect(page.getByTestId('usage-meter')).toHaveCount(1);
 		} else {
 			const items = page.locator('main ul').first().locator(':scope > li');
 			await expect(items).toHaveCount(3);

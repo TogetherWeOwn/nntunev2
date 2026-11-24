@@ -1,43 +1,91 @@
 //! Hyperdrive persistence for the production credential core. Not an HTTP mount.
 use super::{PgStore, StoreError, TOTAL_TIMEOUT_MS};
 use crate::field_envelope::FieldEnvelope;
+use crate::postgres::{PgConnect, PgQuery, PgTransaction};
 use crate::subsonic_auth::{
-    AuthError, AuthMode, CredentialRecord, CredentialStore, Reindex, TokenEnvelope,
+    AuthError, AuthMode, CredentialRecord, CredentialStore, Principal, Reindex, TokenEnvelope,
 };
-use tokio_postgres::{types::Type, Client, GenericClient, Row, Transaction};
+use nntune_subsonic::{
+    construction_budget::ConstructionBudget, staging_rejection::StagingRejection, Identity,
+    UserAccount,
+};
+use tokio_postgres::{types::Type, Row};
 
-const COLUMNS: &str = "c.id::text AS id, c.user_id, c.subsonic_username, c.scope, c.auth_mode, \
-    c.api_key_hmac, c.pepper_version, c.token_secret_encrypted, c.token_envelope_version, \
-    c.token_payload_format, c.token_kek_version, c.token_dek_wrapped_nonce, \
-    c.token_dek_wrapped, c.token_payload_nonce";
+macro_rules! lookup_sql {
+    (bounded, $predicate:literal) => {
+        lookup_sql!("CASE WHEN octet_length(c.user_id) BETWEEN 1 AND 128 THEN c.user_id END", $predicate)
+    };
+    ($user_id:literal, $predicate:literal) => {
+        concat!(
+            "SELECT c.id::text AS id, ", $user_id,
+            " AS user_id, c.subsonic_username, c.scope, c.auth_mode, c.api_key_hmac, \
+             c.pepper_version, c.token_secret_encrypted, c.token_envelope_version, \
+             c.token_payload_format, c.token_kek_version, c.token_dek_wrapped_nonce, \
+             c.token_dek_wrapped, c.token_payload_nonce \
+             FROM subsonic_credentials c JOIN users u ON u.id = c.user_id \
+             WHERE c.scope = 'subsonic' AND c.revoked_at IS NULL AND u.deleting_at IS NULL AND ",
+            $predicate, " LIMIT 2"
+        )
+    };
+}
+
 // Compare all security-relevant selected material, not just id or last_used_at.
-const SNAPSHOT: &str = "id = $1::text::uuid AND user_id = $2 AND subsonic_username = $3 \
-    AND scope = 'subsonic' AND revoked_at IS NULL AND auth_mode = $4 \
-    AND api_key_hmac IS NOT DISTINCT FROM $5 AND pepper_version IS NOT DISTINCT FROM $6 \
-    AND token_secret_encrypted IS NOT DISTINCT FROM $7 \
-    AND token_envelope_version IS NOT DISTINCT FROM $8 \
-    AND token_payload_format IS NOT DISTINCT FROM $9 \
-    AND token_kek_version IS NOT DISTINCT FROM $10 \
-    AND token_dek_wrapped_nonce IS NOT DISTINCT FROM $11 \
-    AND token_dek_wrapped IS NOT DISTINCT FROM $12 \
-    AND token_payload_nonce IS NOT DISTINCT FROM $13";
+macro_rules! update_sql {
+    ($update:literal, $suffix:literal) => {
+        concat!(
+            $update,
+            " WHERE id = $1::text::uuid AND user_id = $2 AND subsonic_username = $3 \
+             AND scope = 'subsonic' AND revoked_at IS NULL AND auth_mode = $4 \
+             AND api_key_hmac IS NOT DISTINCT FROM $5 AND pepper_version IS NOT DISTINCT FROM $6 \
+             AND token_secret_encrypted IS NOT DISTINCT FROM $7 \
+             AND token_envelope_version IS NOT DISTINCT FROM $8 \
+             AND token_payload_format IS NOT DISTINCT FROM $9 \
+             AND token_kek_version IS NOT DISTINCT FROM $10 \
+             AND token_dek_wrapped_nonce IS NOT DISTINCT FROM $11 \
+             AND token_dek_wrapped IS NOT DISTINCT FROM $12 \
+             AND token_payload_nonce IS NOT DISTINCT FROM $13",
+            $suffix, " RETURNING id"
+        )
+    };
+}
 
-fn record(row: &Row) -> Result<CredentialRecord, StoreError> {
-    let mode: String = row.try_get("auth_mode").map_err(|_| StoreError)?;
-    let auth_mode = match mode.as_str() {
+fn copy_credential_bytes(
+    budget: &mut Option<&mut ConstructionBudget>,
+    source: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    let Some(budget) = budget else {
+        return Ok(source.to_vec());
+    };
+    let mut bytes = budget
+        .allocate_exact(source.len())
+        .map_err(|_| StoreError)?;
+    bytes.extend_from_slice(source);
+    Ok(bytes)
+}
+
+fn record(
+    row: &Row,
+    mut budget: Option<&mut ConstructionBudget>,
+) -> Result<CredentialRecord, StoreError> {
+    // Borrow directly from the bounded driver row. In staging, a NULL owner
+    // sentinel must fail before any credential bytes are copied.
+    let user_id: &str = row.try_get("user_id").map_err(|_| StoreError)?;
+    let mode: &str = row.try_get("auth_mode").map_err(|_| StoreError)?;
+    let auth_mode = match mode {
         "apikey" => AuthMode::ApiKey,
         "token" => AuthMode::Token,
         "both" => AuthMode::Both,
         _ => return Err(StoreError),
     };
-    let ciphertext: Option<Vec<u8>> = row
+    let ciphertext: Option<&[u8]> = row
         .try_get("token_secret_encrypted")
         .map_err(|_| StoreError)?;
     let token = if let Some(ciphertext) = ciphertext {
-        let wrap_nonce: Vec<u8> = row
+        let wrap_nonce: &[u8] = row
             .try_get("token_dek_wrapped_nonce")
             .map_err(|_| StoreError)?;
-        let nonce: Vec<u8> = row.try_get("token_payload_nonce").map_err(|_| StoreError)?;
+        let nonce: &[u8] = row.try_get("token_payload_nonce").map_err(|_| StoreError)?;
+        let wrapped: &[u8] = row.try_get("token_dek_wrapped").map_err(|_| StoreError)?;
         Some(TokenEnvelope {
             envelope_version: u16::try_from(
                 row.try_get::<_, i16>("token_envelope_version")
@@ -56,23 +104,31 @@ fn record(row: &Row) -> Result<CredentialRecord, StoreError> {
             .map_err(|_| StoreError)?,
             envelope: FieldEnvelope {
                 dek_wrapped_nonce: wrap_nonce.try_into().map_err(|_| StoreError)?,
-                dek_wrapped: row.try_get("token_dek_wrapped").map_err(|_| StoreError)?,
+                dek_wrapped: copy_credential_bytes(&mut budget, wrapped)?,
                 payload_nonce: nonce.try_into().map_err(|_| StoreError)?,
-                ciphertext,
+                ciphertext: copy_credential_bytes(&mut budget, ciphertext)?,
             },
         })
     } else {
         None
     };
+    let mut copy_text = |text: &str| {
+        if budget.is_none() {
+            return Ok(text.to_owned());
+        }
+        String::from_utf8(copy_credential_bytes(&mut budget, text.as_bytes())?)
+            .map_err(|_| StoreError)
+    };
+    let api_key_hmac: Option<&str> = row.try_get("api_key_hmac").map_err(|_| StoreError)?;
     Ok(CredentialRecord {
-        id: row.try_get("id").map_err(|_| StoreError)?,
-        user_id: row.try_get("user_id").map_err(|_| StoreError)?,
-        username: row.try_get("subsonic_username").map_err(|_| StoreError)?,
-        scope: row.try_get("scope").map_err(|_| StoreError)?,
+        id: copy_text(row.try_get("id").map_err(|_| StoreError)?)?,
+        user_id: copy_text(user_id)?,
+        username: copy_text(row.try_get("subsonic_username").map_err(|_| StoreError)?)?,
+        scope: copy_text(row.try_get("scope").map_err(|_| StoreError)?)?,
         auth_mode,
         revoked: false,
         owner_active: true,
-        api_key_hmac: row.try_get("api_key_hmac").map_err(|_| StoreError)?,
+        api_key_hmac: api_key_hmac.map(copy_text).transpose()?,
         pepper_version: row
             .try_get::<_, Option<i32>>("pepper_version")
             .map_err(|_| StoreError)?
@@ -86,7 +142,7 @@ fn record(row: &Row) -> Result<CredentialRecord, StoreError> {
 /// Migration 0037 may still be pending in production. Until it lands there
 /// are no compat credentials, so lifecycle reads/revokes are empty no-ops
 /// instead of missing-relation errors. A probe failure stays loud.
-async fn compat_table_present(client: &mut Client) -> Result<bool, StoreError> {
+async fn compat_table_present(client: &mut impl PgConnect) -> Result<bool, StoreError> {
     // Unqualified like the queries below: the probe must resolve the same
     // table the compat queries reach through the active search_path.
     let rows = client
@@ -102,33 +158,71 @@ async fn compat_table_present(client: &mut Client) -> Result<bool, StoreError> {
         .unwrap_or(false))
 }
 
-async fn transaction(client: &mut Client) -> Result<Transaction<'_>, StoreError> {
+async fn transaction(client: &mut impl PgConnect) -> Result<PgTransaction<'_>, StoreError> {
     let tx = client.transaction().await.map_err(|_| StoreError)?;
     // Hyperdrive transaction pooling requires the timeout on this transaction.
-    tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+    tx.set_local_statement_timeout(TOTAL_TIMEOUT_MS)
+        .await
+        .map_err(|_| StoreError)?;
+    Ok(tx)
+}
+
+async fn staging_transaction(client: &mut impl PgConnect) -> Result<PgTransaction<'_>, StoreError> {
+    let tx = client.transaction().await.map_err(|_| StoreError)?;
+    tx.set_local_subsonic_timeouts()
         .await
         .map_err(|_| StoreError)?;
     Ok(tx)
 }
 
 async fn lookup(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     version: Option<u32>,
     value: &str,
 ) -> Result<Option<CredentialRecord>, StoreError> {
     let tx = transaction(client).await?;
-    let sql = format!(
-        "SELECT {COLUMNS} FROM subsonic_credentials c JOIN users u ON u.id = c.user_id \
-        WHERE c.scope = 'subsonic' AND c.revoked_at IS NULL AND u.deleting_at IS NULL AND {}",
-        if version.is_some() {
-            "c.pepper_version = $1 AND c.api_key_hmac = $2"
-        } else {
-            "c.subsonic_username = $1"
-        }
-    );
-    let rows = if let Some(version) = version {
-        tx.query_typed(
-            &sql,
+    let selected = lookup_record(&tx, version, value, None).await?;
+    tx.commit().await.map_err(|_| StoreError)?;
+    Ok(selected)
+}
+
+/// Unmounted lookup on the existing app client. Expiry does not prove driver cancellation.
+pub async fn load_staging_credential(
+    client: &mut impl PgConnect,
+    budget: &mut ConstructionBudget,
+    version: Option<u32>,
+    value: &str,
+) -> Result<Option<CredentialRecord>, AuthError> {
+    super::with_deadline(
+        async {
+            let tx = staging_transaction(client).await?;
+            let selected = lookup_record(&tx, version, value, Some(budget)).await?;
+            tx.commit().await.map_err(|_| StoreError)?;
+            Ok(selected)
+        },
+        1_000,
+        StoreError,
+    )
+    .await
+    .map_err(|_| AuthError::Unavailable)
+}
+
+async fn lookup_record(
+    tx: &PgTransaction<'_>,
+    version: Option<u32>,
+    value: &str,
+    budget: Option<&mut ConstructionBudget>,
+) -> Result<Option<CredentialRecord>, StoreError> {
+    // The UUID cast and the credential table's checks bound all other fields.
+    // The owner is unconstrained in that schema: project a same-row sentinel
+    // rather than transferring an oversized identifier or treating it as absent.
+    let staged = budget.is_some();
+    let row = if let Some(version) = version {
+        const KEY: &str = lookup_sql!("c.user_id", "c.pepper_version = $1 AND c.api_key_hmac = $2");
+        const STAGED_KEY: &str =
+            lookup_sql!(bounded, "c.pepper_version = $1 AND c.api_key_hmac = $2");
+        tx.query_typed_opt(
+            if staged { STAGED_KEY } else { KEY },
             &[
                 (&i32::try_from(version).map_err(|_| StoreError)?, Type::INT4),
                 (&value, Type::TEXT),
@@ -136,21 +230,148 @@ async fn lookup(
         )
         .await
     } else {
-        tx.query_typed(&sql, &[(&value, Type::TEXT)]).await
+        const USERNAME: &str = lookup_sql!("c.user_id", "c.subsonic_username = $1");
+        const STAGED_USERNAME: &str = lookup_sql!(bounded, "c.subsonic_username = $1");
+        tx.query_typed_opt(
+            if staged { STAGED_USERNAME } else { USERNAME },
+            &[(&value, Type::TEXT)],
+        )
+        .await
     }
     .map_err(|_| StoreError)?;
-    if rows.len() > 1 {
-        return Err(StoreError);
-    }
-    let selected = rows.first().map(record).transpose()?;
-    tx.commit().await.map_err(|_| StoreError)?;
-    Ok(selected)
+    row.as_ref().map(|row| record(row, budget)).transpose()
 }
 
-async fn owner_fence(
-    tx: &impl GenericClient,
-    selected: &CredentialRecord,
-) -> Result<bool, StoreError> {
+const ACCOUNT_FIELD_BYTES: i32 = 1_024;
+
+fn account_fields(
+    budget: &mut ConstructionBudget,
+    username: &str,
+    email: &str,
+    is_admin: bool,
+    is_manager: bool,
+) -> Result<(Identity, UserAccount), StagingRejection> {
+    let capacity = StagingRejection::BusyOrCapacity;
+    if [username, email]
+        .iter()
+        .any(|text| text.len() > ACCOUNT_FIELD_BYTES as usize)
+    {
+        return Err(capacity);
+    }
+    let mut copy = |text: &str| {
+        let mut bytes = budget.allocate_exact(text.len()).map_err(|_| capacity)?;
+        bytes.extend_from_slice(text.as_bytes());
+        String::from_utf8(bytes).map_err(|_| capacity)
+    };
+    Ok((
+        Identity {
+            username: copy(username)?,
+            email: copy(email)?,
+            is_admin,
+        },
+        UserAccount {
+            email: copy(email)?,
+            is_admin,
+            is_manager,
+        },
+    ))
+}
+
+/// Read account state after authentication and before member catalogue work.
+/// The caller supplies the already connected staging app client. The deadline
+/// bounds this lookup, not the driver's cancellation or teardown.
+pub async fn load_staging_account(
+    budget: &mut ConstructionBudget,
+    client: &mut impl PgConnect,
+    principal: &Principal,
+) -> Result<(Identity, UserAccount), StagingRejection> {
+    use StagingRejection::BusyOrCapacity;
+    super::with_deadline(
+        async {
+            let tx = client.transaction().await.map_err(|_| BusyOrCapacity)?;
+            tx.set_local_subsonic_timeouts()
+                .await
+                .map_err(|_| BusyOrCapacity)?;
+            let row = staging_account_row(&tx, principal.user_id())
+                .await
+                .map_err(|_| BusyOrCapacity)?
+                .ok_or(BusyOrCapacity)?;
+            let (email, admin, manager) = (
+                row.try_get::<_, Option<&str>>(0)
+                    .map_err(|_| BusyOrCapacity)?,
+                row.try_get(1).map_err(|_| BusyOrCapacity)?,
+                row.try_get(2).map_err(|_| BusyOrCapacity)?,
+            );
+            let account = account_fields(
+                budget,
+                principal.username(),
+                email.ok_or(BusyOrCapacity)?,
+                admin,
+                manager,
+            )?;
+            tx.commit().await.map_err(|_| BusyOrCapacity)?;
+            Ok(account)
+        },
+        1_000,
+        BusyOrCapacity,
+    )
+    .await
+}
+
+async fn staging_account_row(
+    client: &impl PgQuery,
+    user_id: &str,
+) -> Result<Option<Row>, StoreError> {
+    // Same-statement projection: return a NULL sentinel, never the oversized
+    // email. The role is reduced to flags before transfer, not cloned in Rust.
+    client
+        .query_typed_opt(
+            "SELECT CASE WHEN octet_length(email) <= $2 THEN email END, \
+             role = 'admin', role = 'manager' FROM users \
+             WHERE id = $1 AND deleting_at IS NULL LIMIT 2",
+            &[(&user_id, Type::TEXT), (&ACCOUNT_FIELD_BYTES, Type::INT4)],
+        )
+        .await
+        .map_err(|_| StoreError)
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "ledger-wasm-test")))]
+#[cfg_attr(test, test)]
+pub(crate) fn account_fields_use_the_carried_charge() {
+    let email = "é".repeat(ACCOUNT_FIELD_BYTES as usize / 2);
+    let mut expected = ConstructionBudget::new(usize::MAX);
+    for size in [1, "client".len(), email.len(), email.len()] {
+        expected.charge(size, 1, 1).unwrap();
+    }
+    let total = expected.charged();
+    for limit in [total - 1, total] {
+        let mut budget = ConstructionBudget::new(limit);
+        budget.charge(1, 1, 1).unwrap(); // A charge carried from an earlier phase.
+        let result = account_fields(&mut budget, "client", &email, false, true);
+        if limit < total {
+            assert_eq!(result, Err(StagingRejection::BusyOrCapacity));
+        } else {
+            let (identity, account) = result.unwrap();
+            assert_eq!(identity.username, "client");
+            assert_eq!(identity.username.capacity(), "client".len());
+            assert_eq!(identity.email, email);
+            assert_eq!(account.email, email);
+            assert_eq!(identity.email.capacity(), email.len());
+            assert_eq!(account.email.capacity(), email.len());
+            assert!(!identity.is_admin && !account.is_admin && account.is_manager);
+            assert_eq!(budget.charged(), total);
+        }
+    }
+    let mut budget = ConstructionBudget::new(usize::MAX);
+    let over = email + "x";
+    assert_eq!(
+        account_fields(&mut budget, "client", &over, false, false),
+        Err(StagingRejection::BusyOrCapacity)
+    );
+    assert_eq!(budget.charged(), 0);
+}
+
+async fn owner_fence(tx: &impl PgQuery, selected: &CredentialRecord) -> Result<bool, StoreError> {
     if selected.scope != "subsonic" || selected.revoked || !selected.owner_active {
         return Ok(false);
     }
@@ -167,13 +388,46 @@ async fn owner_fence(
 }
 
 async fn mutate(
-    client: &mut Client,
+    client: &mut impl PgConnect,
+    s: &CredentialRecord,
+    completion: Option<Option<&Reindex>>,
+    now: u64,
+) -> Result<bool, StoreError> {
+    mutate_transaction(transaction(client).await?, s, completion, now).await
+}
+
+/// The same fenced admission/completion updates, on the staging app client.
+/// Keep admission and completion in separate committed transactions.
+pub async fn mutate_staging_credential(
+    client: &mut impl PgConnect,
+    selected: &CredentialRecord,
+    completion: Option<Option<&Reindex>>,
+    now: u64,
+) -> Result<bool, AuthError> {
+    super::with_deadline(
+        async {
+            mutate_transaction(
+                staging_transaction(client).await?,
+                selected,
+                completion,
+                now,
+            )
+            .await
+        },
+        1_000,
+        StoreError,
+    )
+    .await
+    .map_err(|_| AuthError::Unavailable)
+}
+
+async fn mutate_transaction(
+    tx: PgTransaction<'_>,
     s: &CredentialRecord,
     completion: Option<Option<&Reindex>>,
     now: u64,
 ) -> Result<bool, StoreError> {
     let now = i64::try_from(now).map_err(|_| StoreError)?;
-    let tx = transaction(client).await?;
     if !owner_fence(&tx, s).await? {
         return Ok(false);
     }
@@ -215,7 +469,13 @@ async fn mutate(
         .token
         .as_ref()
         .map(|t| t.envelope.payload_nonce.as_slice());
-    let mut params: Vec<(&(dyn tokio_postgres::types::ToSql + Sync), Type)> = vec![
+    let new_version = completion
+        .flatten()
+        .map(|r| i32::try_from(r.pepper_version))
+        .transpose()
+        .map_err(|_| StoreError)?;
+    let new_digest = completion.flatten().map(|r| r.api_key_hmac.as_str());
+    let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 16] = [
         (&s.id, Type::TEXT),
         (&s.user_id, Type::TEXT),
         (&s.username, Type::TEXT),
@@ -230,39 +490,32 @@ async fn mutate(
         (&wrapped, Type::BYTEA),
         (&nonce, Type::BYTEA),
         (&now, Type::INT8),
+        (&new_version, Type::INT4),
+        (&new_digest, Type::TEXT),
     ];
-    let new_version = completion
-        .flatten()
-        .map(|r| i32::try_from(r.pepper_version))
-        .transpose()
-        .map_err(|_| StoreError)?;
-    let new_digest = completion.flatten().map(|r| r.api_key_hmac.as_str());
-    let sql = if completion.is_some() {
-        params.extend([
-            (
-                &new_version as &(dyn tokio_postgres::types::ToSql + Sync),
-                Type::INT4,
-            ),
-            (&new_digest, Type::TEXT),
-        ]);
-        format!("UPDATE subsonic_credentials SET last_used_at = GREATEST(last_used_at, to_timestamp($14::bigint::double precision)), \
-            pepper_version = COALESCE($15, pepper_version), api_key_hmac = COALESCE($16, api_key_hmac) \
-            WHERE {SNAPSHOT} RETURNING id")
+    const COMPLETE: &str = update_sql!(
+        "UPDATE subsonic_credentials SET last_used_at = GREATEST(last_used_at, to_timestamp($14::bigint::double precision)), \
+         pepper_version = COALESCE($15, pepper_version), api_key_hmac = COALESCE($16, api_key_hmac)",
+        ""
+    );
+    // Fixed per-credential 60/minute allowance, persisted across isolates.
+    // A regressed clock never reopens an earlier allowance.
+    const ADMIT: &str = update_sql!(
+        "UPDATE subsonic_credentials SET \
+         attempt_count = CASE WHEN attempt_window < $14 / 60 THEN 1 ELSE attempt_count + 1 END, \
+         attempt_window = GREATEST(attempt_window, $14 / 60)",
+        " AND (attempt_window < $14 / 60 OR attempt_count < 60)"
+    );
+    let (sql, params) = if completion.is_some() {
+        (COMPLETE, &params[..])
     } else {
-        // Fixed per-credential 60/minute allowance, persisted across isolates.
-        // A regressed clock never reopens an earlier allowance.
-        format!(
-            "UPDATE subsonic_credentials SET \
-            attempt_count = CASE WHEN attempt_window < $14 / 60 THEN 1 ELSE attempt_count + 1 END, \
-            attempt_window = GREATEST(attempt_window, $14 / 60) \
-            WHERE {SNAPSHOT} AND (attempt_window < $14 / 60 OR attempt_count < 60) RETURNING id"
-        )
+        (ADMIT, &params[..14])
     };
-    let rows = tx
-        .query_typed(&sql, &params)
+    let row = tx
+        .query_typed_opt(sql, params)
         .await
         .map_err(|_| StoreError)?;
-    if rows.len() != 1 {
+    if row.is_none() {
         return Ok(false);
     }
     tx.commit().await.map_err(|_| StoreError)?;
@@ -320,7 +573,7 @@ impl CredentialStore for PgStore {
 const MAX_ACTIVE_CREDENTIALS: i64 = 32;
 
 pub(super) async fn insert(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     prepared: &crate::subsonic_lifecycle::PreparedCredential,
     session: &crate::session::SessionClaims,
 ) -> Result<bool, StoreError> {
@@ -435,7 +688,7 @@ pub(super) async fn insert(
 }
 
 pub(super) async fn list(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     user_id: &str,
 ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
     if !compat_table_present(client).await? {
@@ -482,7 +735,7 @@ pub(super) async fn list(
 }
 
 pub(super) async fn revoke(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     id: Option<&str>,
     user_id: &str,
     now: u64,

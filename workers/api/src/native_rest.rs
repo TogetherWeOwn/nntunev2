@@ -143,8 +143,10 @@ fn base62_encode(bytes: &[u8]) -> String {
 
 fn lowercase_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in bytes {
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 0x0f)]));
     }
     out
 }
@@ -446,6 +448,69 @@ pub enum RouteDecision {
     Deny,
 }
 
+/// Match the route shape; the handler validates the target's identity.
+pub(crate) fn like_track_target(path: &str) -> Option<&str> {
+    path.strip_prefix("/v1/me/likes/track/")
+        .filter(|target| !target.is_empty() && !target.contains('/'))
+}
+
+/// Exact browser session contracts for preferences and optional playback binding.
+/// The remaining cookie-only operations use their existing authentication policies.
+#[derive(Clone, Copy)]
+pub(crate) enum BrowserSessionRoute<'a> {
+    LikesImport,
+    LikeTrack(&'a str),
+    UnlikeTrack(&'a str),
+    TasteList { bound: bool },
+    TastePut { bound: bool },
+    TasteClear { bound: bool },
+    PrivateSession,
+    PlayIssue,
+    PlayHeartbeat,
+}
+
+pub(crate) fn browser_route<'a>(method: &str, path: &'a str) -> Option<BrowserSessionRoute<'a>> {
+    use crate::handlers::BOUND_TASTE_PATH;
+    use BrowserSessionRoute::*;
+
+    let bound = path == BOUND_TASTE_PATH;
+    match (method, path) {
+        ("POST", "/v1/me/likes/import") => Some(LikesImport),
+        ("GET", "/v1/me/taste" | BOUND_TASTE_PATH) => Some(TasteList { bound }),
+        ("PUT", "/v1/me/taste" | BOUND_TASTE_PATH) => Some(TastePut { bound }),
+        ("DELETE", "/v1/me/taste" | BOUND_TASTE_PATH) => Some(TasteClear { bound }),
+        ("PUT", "/v1/me/private-session") => Some(PrivateSession),
+        ("POST", "/v1/plays") => Some(PlayIssue),
+        ("POST", "/v1/plays/heartbeat") => Some(PlayHeartbeat),
+        ("PUT", path) => like_track_target(path).map(LikeTrack),
+        ("DELETE", path) => like_track_target(path).map(UnlikeTrack),
+        _ => None,
+    }
+}
+
+pub(crate) const MEMBER_INVITES_PATH: &str = "/v1/me/invites";
+pub(crate) const MEMBER_INVITE_HISTORY_PATH: &str = "/v1/me/invites/history";
+pub(crate) const ADMIN_INVITE_BATCH_PATH: &str = "/v1/admin/invites/batch";
+pub(crate) const ADMIN_INVITE_WINDOWS_PATH: &str = "/v1/admin/invite-windows";
+
+pub(crate) fn admin_invite_tree_user(path: &str) -> Option<&str> {
+    let id = path
+        .strip_prefix("/v1/admin/users/")?
+        .strip_suffix("/invite-tree")?;
+    crate::ledger::is_valid_key_field(id, crate::ledger::MAX_USER_ID_LEN).then_some(id)
+}
+
+pub(crate) fn admin_invite_window_close_id(path: &str) -> Option<i64> {
+    let id = path
+        .strip_prefix(ADMIN_INVITE_WINDOWS_PATH)?
+        .strip_prefix('/')?
+        .strip_suffix("/close")?;
+    if id.is_empty() || id.starts_with('0') || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    id.parse().ok()
+}
+
 /// The exhaustive default-deny map (ADR 0010). Methods match exact
 /// uppercase (`"get"` fails closed); paths match the listed collection
 /// roots plus subpaths. The HTTP layer passes the path without the query
@@ -457,6 +522,13 @@ pub enum RouteDecision {
 /// resource name or a similar operation.
 pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
     use RouteDecision::{Bearer, Deny, SessionOnly};
+    if let Some(route) = browser_route(method, path) {
+        return match route {
+            BrowserSessionRoute::PlayIssue => Bearer(Scope::PlaysWrite),
+            BrowserSessionRoute::PlayHeartbeat => Deny,
+            _ => SessionOnly,
+        };
+    }
     /// `/prefix/{single-segment}` (no deeper nesting). Callers pass a
     /// slash-terminated prefix, so the remainder never starts with `/`.
     fn one_segment_after(prefix: &str, path: &str) -> bool {
@@ -487,7 +559,16 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 return Bearer(Scope::StreamRead);
             }
             // Session-only reads (never reachable by bearer).
-            if path == "/v1/me" || path == "/v1/indexers" {
+            if matches!(
+                path,
+                "/v1/me"
+                    | "/v1/indexers"
+                    | "/v1/me/likes"
+                    | "/v1/me/likes/session"
+                    | "/v1/me/history"
+                    | MEMBER_INVITES_PATH
+                    | MEMBER_INVITE_HISTORY_PATH
+            ) {
                 return SessionOnly;
             }
             // Billing/usage display reads: session-only like checkout —
@@ -503,7 +584,9 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             }
             // Admin surface (migration 0028): session + fresh DB role,
             // never bearer.
-            if path == "/v1/admin/settings" {
+            if matches!(path, "/v1/admin/settings" | ADMIN_INVITE_WINDOWS_PATH)
+                || admin_invite_tree_user(path).is_some()
+            {
                 return SessionOnly;
             }
             // Admin ingest reads (migration 0034): the exact list path
@@ -558,9 +641,6 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/playlists" {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/plays" {
-                return Bearer(Scope::PlaysWrite);
-            }
             if path == "/v1/ingest" || path.starts_with("/v1/ingest/") {
                 return Bearer(Scope::IngestSubmit);
             }
@@ -573,6 +653,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
                 || path == "/v1/admin/ingest"
+                || path == MEMBER_INVITES_PATH
             {
                 return SessionOnly;
             }
@@ -583,10 +664,11 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                     }
                 }
             }
-            // Admin invite writes (migration 0033): issue at the bare
-            // path, revoke at `{id}/revoke`. Session-only, like the
-            // rest of the admin surface.
-            if path == "/v1/admin/invites" {
+            if path == ADMIN_INVITE_WINDOWS_PATH || admin_invite_window_close_id(path).is_some() {
+                return SessionOnly;
+            }
+            // Single and batch issue, plus `{id}/revoke`, are session-only.
+            if matches!(path, "/v1/admin/invites" | ADMIN_INVITE_BATCH_PATH) {
                 return SessionOnly;
             }
             if let Some(rest) = path.strip_prefix("/v1/admin/invites/") {

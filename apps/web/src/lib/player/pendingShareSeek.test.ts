@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { createPendingShareSeek } from './pendingShareSeek.js';
+import { createPendingShareSeek, type ShareSeekTarget } from './pendingShareSeek.js';
 
 const target = { trackId: 'a', streamUrl: '/a', seconds: 90 };
 
@@ -15,15 +15,17 @@ function fixture() {
 			onWrite();
 		}
 	} as HTMLAudioElement;
-	const seek = createPendingShareSeek(
-		(candidate) => {
-			const captured = incarnation;
-			return { isCurrent: () => live && candidate === element && captured === incarnation, cancelResume: () => onCancel() };
-		},
-		() => false
-	);
+	const seek = createPendingShareSeek();
 	return {
-		seek, element,
+		seek: {
+			...seek,
+			get current() { return seek.current; },
+			set: (target: ShareSeekTarget) => seek.set(target, (candidate) => {
+				const captured = incarnation;
+				return { isCurrent: () => live && candidate === element && captured === incarnation, cancelResume: () => onCancel() };
+			})
+		},
+		element,
 		duration: (value: number) => { duration = value; },
 		refuse: (value: boolean) => { refuse = value; },
 		live: (value: boolean) => { live = value; },

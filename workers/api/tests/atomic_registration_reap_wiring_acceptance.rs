@@ -116,8 +116,13 @@ fn candidate_filter_keeps_subquery_clauses_but_not_top_level_batching() {
 fn reaper_sequences_lock_then_fresh_recheck_delete_in_read_committed() {
     let source = include_str!("../src/worker_entry.rs");
     let body = function_body(source, "async fn reap_unverified_users_on(");
+    let wrapper = function_body(
+        include_str!("../src/postgres.rs"),
+        "async fn read_committed(",
+    );
     assert!(
-        body.contains("IsolationLevel::ReadCommitted"),
+        body.contains(".read_committed()")
+            && wrapper.contains(".isolation_level(IsolationLevel::ReadCommitted)"),
         "each reaper statement needs its own snapshot so the delete sees \
          credentials committed after candidate selection began"
     );

@@ -13,20 +13,16 @@
  */
 
 import {
-	LIBRARY_AUTH_CONTEXT_KEY,
 	LIBRARY_FAVORITES_KEY,
+	libraryContextKey,
+	purgeFavorites,
+	withFavoritesLock,
 	type SnapshotStorage
 } from './cache.js';
 
 /** Scoped favorites key for the current auth context, or null without one. */
 export function favoritesKey(session: SnapshotStorage | null): string | null {
-	if (!session) return null;
-	try {
-		const context = session.getItem(LIBRARY_AUTH_CONTEXT_KEY);
-		return context ? `${LIBRARY_FAVORITES_KEY}.${context}` : null;
-	} catch {
-		return null;
-	}
+	return libraryContextKey(session, LIBRARY_FAVORITES_KEY);
 }
 
 function isStoredId(value: unknown): value is string {
@@ -59,6 +55,38 @@ export function loadFavorites(
 	} catch {
 		return [];
 	}
+}
+
+/**
+ * Apply an intent to the latest scoped list under its exclusive Web Lock.
+ * Unlike the display reader, reject malformed storage rather than repairing it.
+ * Verification runs inside the lock, before reading, and may not reacquire it.
+ */
+export async function updateStoredFavorites(
+	session: SnapshotStorage | null,
+	local: SnapshotStorage | null,
+	key: string | null,
+	update: (latest: string[]) => readonly string[],
+	verify?: () => Promise<boolean>,
+	runIfCurrent?: <T>(commit: () => T) => Promise<T | undefined>
+): Promise<string[] | null> {
+	if (!local || !key || favoritesKey(session) !== key) return null;
+	const commit = () => {
+		if (favoritesKey(session) !== key) return null;
+		const raw = local.getItem(key);
+		const parsed: unknown = raw === null ? [] : JSON.parse(raw);
+		if (!Array.isArray(parsed) || !parsed.every(isStoredId)) return null;
+		const latest = [...new Set<string>(parsed)];
+		const committed = [...new Set(update(latest.slice()))];
+		if (!committed.every(isStoredId) || favoritesKey(session) !== key) return null;
+		const encoded = JSON.stringify(committed);
+		if (encoded !== JSON.stringify(latest)) local.setItem(key, encoded);
+		return committed;
+	};
+	return withFavoritesLock(key, async () => {
+		if (favoritesKey(session) !== key || (verify && !(await verify()))) return null;
+		return runIfCurrent ? (await runIfCurrent(commit)) ?? null : commit();
+	});
 }
 
 /** Persist favorites, returning whether storage accepted the current set. */
@@ -99,22 +127,16 @@ export function selectFavoriteItems<T extends { id: string }>(
  * transition handler revokes the session auth context — afterwards the
  * scoped key is unknowable. Never throws.
  */
-export function clearFavoritesAtAuthBoundary(
+export async function clearFavoritesAtAuthBoundary(
 	session: SnapshotStorage | null,
 	local: SnapshotStorage | null
-): void {
+): Promise<void> {
 	if (!local) return;
-	let key: string | null = null;
+	const key = favoritesKey(session);
 	try {
-		const context = session?.getItem(LIBRARY_AUTH_CONTEXT_KEY) ?? null;
-		key = context ? `${LIBRARY_FAVORITES_KEY}.${context}` : null;
-	} catch {
-		key = null;
-	}
-	try {
-		if (key) local.removeItem(key);
 		local.removeItem(LIBRARY_FAVORITES_KEY);
 	} catch {
 		// Best effort; a key without its auth context is never read.
 	}
+	if (key) await purgeFavorites(session, local, key);
 }

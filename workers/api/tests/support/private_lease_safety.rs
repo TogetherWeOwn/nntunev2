@@ -1,10 +1,13 @@
-//! Disposable-PostgreSQL controls for the unwired private acquisition.
-use super::disposable_accounts;
+//! Disposable-PostgreSQL controls for private acquisition through Store.
+use super::playback_dispatch::{playback_store, with_playback_account, TRACK};
+use super::{dispatch, disposable_accounts};
 use nntune_api::handlers::{Store, StoreError};
+use nntune_api::ledger::{derive_play_idempotency_key, period_month_for_timestamp};
 use nntune_api::playback::LeaseAcquire::Acquired;
 use nntune_api::worker_entry::{
     catalogue_store_for_postgres_test, private_aware_lease_for_postgres_test as acquire,
 };
+use serde_json::{json, Value};
 use std::{cell::Cell, rc::Rc, time::Duration};
 use tokio_postgres::Client;
 
@@ -21,6 +24,166 @@ async fn store() -> Result<impl Store, String> {
         Err(StoreError),
         Rc::new(Cell::new(0)),
     ))
+}
+
+#[tokio::test]
+async fn dispatched_private_delivery_keeps_history_and_billing_distinct() {
+    with_playback_account(async |fx| {
+        let store = playback_store();
+        let call = async |method, path, body| {
+            let request = fx.request(method, path, body);
+            let response = dispatch(&store, &fx.cfg, fx.now, &request).await;
+            assert_eq!(response.status, 200, "{method} {path}");
+            serde_json::from_str::<Value>(&response.body).unwrap()
+        };
+        let play = async |id: &Value| {
+            let issued = call("POST", "/v1/plays", json!({"track_id": TRACK, "session_id": "player", "play_id": id})).await;
+            assert!(issued["grant"].as_str().is_some_and(|grant| !grant.is_empty()));
+            issued
+        };
+        let toggle = async |enabled| call("PUT", "/v1/me/private-session", json!({"session_id": "player", "enabled": enabled})).await;
+        let key = |issued: &Value| derive_play_idempotency_key(fx.user, TRACK, issued["play_id"].as_str().unwrap()).unwrap();
+        let marked = async |key: &str| store.private_play_marked(fx.user, TRACK, key).await.unwrap();
+        let deliver = async |issued: &Value| {
+            let batch = fx.delivered_batch(issued);
+            let ack = dispatch(&store, &fx.cfg, fx.now, &batch).await;
+            assert_eq!(ack.status, 200);
+            assert_eq!(serde_json::from_str::<Value>(&ack.body).unwrap(), json!({"accepted": [issued["play_id"]], "fenced": [], "rejected": []}));
+        };
+        let same_lease = |start: &Value, resumed: Value| {
+            assert_eq!(resumed["play_id"], start["play_id"]);
+            assert_eq!(resumed["lease_epoch"], start["lease_epoch"]);
+        };
+
+        let public = play(&Value::Null).await;
+        toggle(true).await;
+        same_lease(&public, play(&public["play_id"]).await);
+        assert!(!marked(&key(&public)).await);
+        deliver(&public).await;
+        let history = async || call("GET", "/v1/me/history", Value::Null).await;
+        let public_history = json!({"items": [{
+            "play_id": public["play_id"], "track_id": TRACK, "played_at": fx.now, "stream_seconds": 2,
+        }]});
+        assert_eq!(history().await, public_history, "public play remains visible in private mode");
+
+        let private = play(&Value::Null).await;
+        let private_key = key(&private);
+        assert!(marked(&private_key).await, "mark must commit before delivery");
+        fx.observer.execute("UPDATE public.private_sessions SET expires_at=$2 WHERE user_id=$1 AND session_id='player'", &[&fx.user, &(fx.now as i64 - 1)]).await.unwrap();
+        same_lease(&private, play(&private["play_id"]).await);
+        toggle(true).await;
+        toggle(false).await;
+        same_lease(&private, play(&private["play_id"]).await);
+        assert!(marked(&private_key).await, "expiry and disable must retain the mark");
+        deliver(&private).await;
+
+        let grant_only = play(&Value::Null).await;
+        assert_ne!(grant_only["play_id"], public["play_id"]);
+        assert!(!marked(&key(&grant_only)).await);
+        let rows = fx.observer.query("SELECT idempotency_key, bytes_served, stream_seconds FROM public.stream_play_ledger WHERE user_id=$1", &[&fx.user]).await.unwrap();
+        assert_eq!(rows.len(), 2, "grant-only play must not create a ledger row");
+        let private_row = rows.iter().find(|row| row.get::<_, &str>(0) == private_key).unwrap();
+        assert_eq!((private_row.get::<_, i64>(1), private_row.get::<_, i32>(2)), (80_000, 2));
+        assert_eq!(store.monthly_stream_seconds(fx.user, &period_month_for_timestamp(fx.now)).await.unwrap(), 4);
+        let usage = call("GET", "/v1/me/usage", Value::Null).await;
+        assert_eq!(usage["streamSecondsMonth"], json!(4));
+        assert_eq!(history().await, public_history, "private delivery and grant-only plays stay hidden");
+    }).await;
+}
+
+#[tokio::test]
+async fn dispatched_acquisition_faults_withhold_grant_and_distinguish_commit_outcomes() {
+    use super::commit_ack_fault::{CommitAckFault, CommitOutcome};
+    use super::playback_dispatch::playback_client;
+    use futures_util::FutureExt;
+    use nntune_api::worker_entry::playback_store_for_postgres_test;
+    use std::panic::{resume_unwind, AssertUnwindSafe};
+    use tokio::time::timeout;
+
+    with_playback_account(async |fx| {
+        let store = playback_store();
+        let incumbent = fx.request("POST", "/v1/plays", json!({"track_id": TRACK, "session_id": "incumbent"}));
+        let issued = dispatch(&store, &fx.cfg, fx.now, &incumbent).await;
+        assert_eq!(issued.status, 200);
+        let issued: Value = serde_json::from_str(&issued.body).unwrap();
+        let toggle = fx.request("PUT", "/v1/me/private-session", json!({"session_id": "replacement", "enabled": true}));
+        assert_eq!(dispatch(&store, &fx.cfg, fx.now, &toggle).await.status, 200);
+
+        let replacement = |track, takeover| fx.request("POST", "/v1/plays", json!({"track_id": track, "session_id": "replacement", "takeover": takeover}));
+        let no_marks = async || assert!(fx.observer.query("SELECT 1 FROM public.private_plays WHERE user_id=$1", &[&fx.user]).await.unwrap().is_empty());
+        assert_eq!(dispatch(&store, &fx.cfg, fx.now, &replacement(TRACK, false)).await.status, 429);
+        no_marks().await;
+
+        let takeover = async |track, client, now| {
+            let client = Rc::new(Cell::new(Some(client)));
+            let injected_client = Rc::clone(&client);
+            let checkouts = Cell::new(0);
+            let faulted = playback_store_for_postgres_test(move || {
+                let nth = checkouts.get() + 1;
+                checkouts.set(nth);
+                // Session, deletion, holder, subscription, caps and usage precede acquisition.
+                let injected = (nth == 7).then(|| injected_client.take().unwrap());
+                async { match injected { Some(client) => Ok(client), None => playback_client().await } }
+            });
+            let response = dispatch(&faulted, &fx.cfg, now, &replacement(track, true)).await;
+            assert!(client.take().is_none(), "acquisition never checked out the faulted connection");
+            assert_eq!(response.status, 503, "{track}");
+            assert!(serde_json::from_str::<Value>(&response.body).unwrap().get("grant").is_none());
+        };
+
+        // Fault only this fixture's prospective marks; server-minted play IDs need not be known.
+        let tag = format!("df_{}", fx.user.replace('-', ""));
+        let rejected = timeout(Duration::from_secs(30), AssertUnwindSafe(async {
+            fx.observer.batch_execute(&format!("
+                CREATE ROLE {tag} NOLOGIN; GRANT USAGE ON SCHEMA public TO {tag}; GRANT SELECT, UPDATE ON public.users TO {tag};
+                CREATE FUNCTION public.{tag}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic privacy fault'; END $$;
+                CREATE TRIGGER {tag} BEFORE INSERT ON public.private_plays FOR EACH ROW
+                WHEN (NEW.user_id = '{}' AND split_part(NEW.play_key, ':', 3) = 'mark-fault') EXECUTE FUNCTION public.{tag}();
+                CREATE CONSTRAINT TRIGGER {tag}_commit AFTER INSERT ON public.private_plays DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+                WHEN (NEW.user_id = '{}' AND split_part(NEW.play_key, ':', 3) = 'commit-fault') EXECUTE FUNCTION public.{tag}();",
+                fx.user, fx.user)).await.unwrap();
+            let beat = fx.request("POST", "/v1/plays/heartbeat", json!({"session_id": "incumbent", "play_id": issued["play_id"], "lease_epoch": issued["lease_epoch"]}));
+            for (offset, track, expected) in [(1, "lookup-fault", CommitOutcome::Unproven), (3, "mark-fault", CommitOutcome::Unproven), (5, "commit-fault", CommitOutcome::Rejected)] {
+                let now = fx.now + offset;
+                let (client, fault) = CommitAckFault::start().await.unwrap();
+                if track == "lookup-fault" {
+                    client.batch_execute(&format!("SET ROLE {tag}")).await.unwrap();
+                    let probe = client.query(nntune_api::preference_rows::private_session_active_statement(), &[&fx.user, &"replacement"]).await.unwrap_err();
+                    assert_eq!(probe.code(), Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE));
+                }
+                takeover(track, client, now).await;
+                assert_eq!(fault.finish().await.unwrap(), expected, "{track}");
+                no_marks().await;
+                let response = dispatch(&store, &fx.cfg, now + 1, &beat).await;
+                assert_eq!(response.status, 200);
+                assert_eq!(serde_json::from_str::<Value>(&response.body).unwrap(), json!({"lease": "active", "lease_epoch": issued["lease_epoch"], "lease_expires_at": now + 1 + nntune_api::playback::LEASE_TTL_SECS}));
+            }
+        }).catch_unwind()).await;
+        timeout(Duration::from_secs(5), fx.observer.batch_execute(&format!(
+            "DROP TRIGGER IF EXISTS {tag} ON public.private_plays; DROP TRIGGER IF EXISTS {tag}_commit ON public.private_plays; DROP FUNCTION IF EXISTS public.{tag}(); \
+             DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{tag}') THEN DROP OWNED BY {tag}; DROP ROLE {tag}; END IF; END $$"
+        ))).await.unwrap().unwrap();
+        if let Err(panic) = rejected.expect("rollback cases timed out") {
+            resume_unwind(panic);
+        }
+
+        let (client, fault) = CommitAckFault::start().await.unwrap();
+        let now = fx.now + 7;
+        takeover(TRACK, client, now).await;
+        assert_eq!(fault.finish().await.unwrap(), CommitOutcome::Withheld);
+
+        let row = fx.observer.query_one(
+            "SELECT session_id, track_id, play_id, epoch, expires_at, play_key, marked_at FROM public.playback_leases JOIN public.private_plays USING (user_id) WHERE user_id=$1",
+            &[&fx.user],
+        ).await.unwrap();
+        let play: &str = row.get(2);
+        assert_ne!(Some(play), issued["play_id"].as_str());
+        assert_eq!((row.get::<_, &str>(0), row.get::<_, &str>(1)), ("replacement", TRACK));
+        assert_eq!(row.get::<_, i64>(3), issued["lease_epoch"].as_i64().unwrap() + 1);
+        assert_eq!(row.get::<_, i64>(4), (now + nntune_api::playback::LEASE_TTL_SECS) as i64);
+        assert_eq!(row.get::<_, &str>(5), derive_play_idempotency_key(fx.user, TRACK, play).unwrap());
+        assert_eq!(row.get::<_, i64>(6), now as i64);
+    }).await;
 }
 
 #[tokio::test]
@@ -74,8 +237,12 @@ async fn private_delivery_is_hidden_from_history_not_metering() {
             )
             .await
             .map_err(|_| "acquisition failed")?;
-            if !matches!(outcome.0, Acquired { .. }) || outcome.1 != private {
-                return Err(format!("incorrect classification: {outcome:?}"));
+            if !matches!(outcome, Acquired { .. }) {
+                return Err(format!("incorrect acquisition: {outcome:?}"));
+            }
+            let key = format!("play:{user}:track:{play}");
+            if store().await?.private_play_marked(user, "track", &key).await.map_err(|_| "mark probe failed")? != private {
+                return Err(format!("incorrect classification for {play}"));
             }
         }
         let key = format!("play:{a}:track:secret");

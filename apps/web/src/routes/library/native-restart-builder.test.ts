@@ -1,15 +1,13 @@
 import { expect, test, vi } from 'vitest';
 import ts from 'typescript';
-import { addTrack, clearQueue, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, moveTrack, naturalEndPolicy, removeTrack, selectTrack } from '#lib/player/queue.js';
+import { get } from 'svelte/store';
+import { addTrack, clearUpcoming, createQueue, currentTrack, keepCurrentAndUpcoming, selectTrack } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { displayArtist, displayTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
-import { resolveShareTarget } from '#lib/player/shareTimestamp.js';
-import { createPendingShareSeek } from '#lib/player/pendingShareSeek.js';
-import { createQueueController } from '#lib/player/queueController.js';
-import { createMediaController } from '#lib/player/mediaController.js';
-import { describeJump, jumpMedia } from '#lib/player/relativeJump.js';
-import { restartIsAvailable } from './restartAvailability.js';
+import { displayArtist, displayTitle, shortTitle } from '#lib/library/order.js';
+import { onMiniPlayerHint, readMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { buildShareQuery, resolveShareTarget } from '#lib/player/shareTimestamp.js';
+import { createQueueShare } from '#lib/player/queueShare.js';
+import { createPlayerController } from '#lib/player/controller.svelte.js';
 
 const sources = import.meta.glob('./+page.svelte', {
 	query: '?raw', import: 'default', eager: true
@@ -22,28 +20,28 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const script = source.slice(source.indexOf('>') + 1, source.indexOf('</script'));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const names = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clearShareFeedback', 'replaceQueue', 'commitQueue', 'resetRestartOnSourceChange', 'syncMiniPlayerHint',
-		'applyShareLink', 'applyPendingShareSeek', 'handleSeeking', 'selectQueuedTrack', 'removeQueuedTrack',
-		'moveQueuedTrack', 'clearQueuedTracks', 'trimPreviousTracks', 'trimUpcomingTracks',
-		'refreshRestartAvailability', 'restartCurrentTrack', 'setRestartStatus', 'jumpRelative',
-		'attachNativeAudio', 'handleEnded', 'shortTitle', 'playQueuedTrack', 'playSelected'
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'clipboardWriter', 'copyTrackLink',
+		'applyShareLink', 'selectQueuedTrack', 'trimPreviousTracks', 'trimUpcomingTracks',
+		'resetShareAtAuthBoundary', 'onRepeatChange', 'playQueuedTrack'
 	]);
 	const declarations = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) =>
 		node.name && names.has(node.name.text)
 	);
 	expect(new Set(declarations.map((node) => node.name?.text))).toEqual(names);
-	const seekState = parsed.statements.find((node) => ts.isVariableStatement(node) &&
-		node.declarationList.declarations.some((item) => item.name.getText(parsed) === 'pendingShareSeek'));
-	if (!seekState) throw new Error('Missing pending share transaction');
-	const mount = parsed.statements.find((node) => ts.isExpressionStatement(node) &&
-		ts.isCallExpression(node.expression) && node.expression.expression.getText(parsed) === 'onMount');
-	if (!mount) throw new Error('Missing route mount');
-	const handlers = [seekState, ...declarations, mount].map((node) => node.getText(parsed)).join('\n');
+	const lifecycle = parsed.statements.filter((node) => ts.isExpressionStatement(node) &&
+		ts.isCallExpression(node.expression) && (node.expression.expression.getText(parsed) === 'onMount' ||
+			node.expression.getText(parsed).startsWith('$effect.pre(() => () =>')));
+	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'queueShareOutcome', 'queueShare', 'disposeRoute']);
+	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
+		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));
+	if (lifecycle.length !== 2 || controllers.length !== bindingsInRoute.size) throw new Error('Missing route lifecycle or player authority');
+	const handlers = [...declarations, ...controllers, ...lifecycle].map((node) => node.getText(parsed)).join('\n');
 	const compiled = ts.transpileModule(handlers, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const track = { id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/coral' };
-	const location = { search: '' };
+	const location = { search: '', origin: 'https://example.test' };
+	const clipboard = { writeText: vi.fn(async (_url: string) => {}) };
 	const writes: number[] = [];
 	const media = { position: 30, duration: 120, rangeStart: 0, refuse: false };
 	class NativeAudio extends EventTarget {
@@ -62,9 +60,13 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		get seekable() {
 			return { length: 1, start: () => media.rangeStart, end: () => media.duration };
 		}
-		getAttribute = (name: string) => name === 'src' ? track.streamUrl : null;
-		isConnected = true; ended = false; paused = true; error: Pick<MediaError, 'code' | 'message'> | null = null;
-		volume = 0.6; muted = false; playbackRate = 1.25;
+		sourceAttribute: string | null = track.streamUrl;
+		getAttribute = (name: string) => name === 'src' ? this.sourceAttribute : null;
+		connected = true;
+		get isConnected() { return this.connected; }
+		set isConnected(value: boolean) { this.connected = value; }
+		ended = false; paused = true; error: Pick<MediaError, 'code' | 'message'> | null = null;
+		volume = 1; muted = false; playbackRate = 1.25;
 		play = () => Promise.resolve();
 		pause() { this.paused = true; }
 	}
@@ -76,71 +78,99 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		return (currentTarget: unknown = target) => listener({ type, currentTarget } as Event);
 	};
 	let onClear = () => {};
-	const trackedPendingShareSeek: typeof createPendingShareSeek = (...args) => {
-		const transaction = createPendingShareSeek(...args);
-		const clear = transaction.clear;
-		transaction.clear = () => { onClear(); clear(); };
-		return transaction;
-	};
+	let onInvalidateBrowseCopy = () => {};
+	const routeCleanup: string[] = [];
 	const bindings = {
-		addTrack, clearQueue, clearUpcoming, createQueue, keepCurrentAndUpcoming, moveTrack,
-		queueCurrentTrack: currentTrack, selectQueueIndex: selectTrack, removeTrack,
-		resolveStreamUrl, displayArtist, displayTitle, resolveShareTarget, describeJump, jumpMedia,
-		clearMiniPlayerHint, setMiniPlayerHint, naturalEndPolicy, restartIsAvailable, createPendingShareSeek: trackedPendingShareSeek,
-		createQueueController, createMediaController, streamUrl: track.streamUrl,
+		addTrack, clearUpcoming, createQueue, keepCurrentAndUpcoming,
+		selectQueueIndex: selectTrack,
+		resolveStreamUrl, displayArtist, displayTitle, shortTitle, resolveShareTarget, get,
+		buildShareQuery, queueCurrentTrack: currentTrack, navigator: { clipboard },
+		$state: { raw: <T>(value: T) => value },
+		routeCleanup,
+		accountTrackLikes: { clear: () => routeCleanup.push('likes') },
+		createQueueShare: (...args: Parameters<typeof createQueueShare>) => {
+			const share = createQueueShare(...args);
+			return { ...share, dispose: () => { routeCleanup.push('share'); share.dispose(); } };
+		},
+		getAppPlayer: () => {
+			const player = createPlayerController(createQueue([{ ...track, artist: '' }]), { flush: tick },
+				(audio, source) => audio instanceof NativeAudio && audio.connected && audio.sourceAttribute === source);
+			const invalidate = player.browseCopy.invalidate;
+			player.browseCopy.invalidate = () => { onInvalidateBrowseCopy(); return invalidate(); };
+			const clear = player.media.clearShareSeek;
+			player.media.clearShareSeek = () => { onClear(); clear(); };
+			return Object.assign(player, { currentFavorite: { bind: () => () => {} } });
+		},
 		tick, window: { location }, element, track, capture
 	};
 	const page = new Function(...Object.keys(bindings), `
-		let items = [track], queue = createQueue(items), mediaRevision = 0;
-		const media = createMediaController();
+		let items = [track], queue = createQueue(items);
 		let loading = false, loadError = null, libraryUnavailable = false;
 		let shareAlive = true, handledShareSearch = null;
-		let shareInvalid = false, shareGeneration = 0, shareStatus = '', shareFallbackUrl = null;
+		let shareInvalid = false;
 		let queueConfirmGeneration = 0;
-		let queueAnnouncement = '', restartCanSeek = false, restartStatus = '', restartStatusVersion = 0;
-		let jumpStatus = '', jumpStatusVersion = 0, lastJumpSeek = null;
-		const restartSupersededSources = new Set();
-		const queueController = createQueueController(queue);
-		const library = queueController.prepareLibrary(items);
-		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
-		queueController.subscribe((value) => { queue = value; });
-		const queueRevision = queueController;
-		let endGeneration = 0, queueAnnouncementVersion = 0;
-		let repeat = 'off';
 		let density, priorDocumentTitle = null, tabTitle = '';
 		let cleanup;
-		const onMount = (callback) => { cleanup = callback(); };
-		const readStoredDensity = () => 'comfortable', readStoredRepeat = () => 'off';
-		const handleAuthTransition = () => {}, recordFindQuery = () => {};
-		const subscribeLocalAuthTransition = () => () => {}, handleLocalAuthTransition = () => {};
+		const $effect = { pre: (callback) => { cleanup = callback(); } };
+		const onMount = (callback) => { callback(); };
+		const readStoredDensity = () => 'comfortable';
+		const handleAuthTransition = () => {}, recordFindQuery = () => routeCleanup.push('query');
+		const subscribeLocalAuthTransition = () => () => routeCleanup.push('local-auth'), handleLocalAuthTransition = () => {};
+		const subscribeAuthFenceInvalidation = (_invalidate, signal) =>
+			signal.addEventListener('abort', () => routeCleanup.push('auth-fence'), { once: true });
 		const clearSnapshot = () => {}, browserStorage = () => null, refresh = () => {};
-		const endTrackDrag = () => {}, document = { title: '' };
-		const queueShare = { dispose() {} }, favoritesExport = { destroy() {} }, refresher = { dispose() {} };
-		window.addEventListener = () => {}; window.removeEventListener = () => {};
+		const endTrackDrag = () => routeCleanup.push('drag'), document = { title: '' };
+		let queueExportAuthGeneration = 0;
+		const favoritesExport = { destroy: () => routeCleanup.push('export') };
+		const refresher = { dispose: () => routeCleanup.push('refresh') };
+		window.addEventListener = () => {};
+		window.removeEventListener = (type) => routeCleanup.push(type);
 		${compiled}
+		player.reconcileLibrary(items, () => true);
+		queueController.subscribe((value) => { queue = value; });
+		const queueRevision = queueController;
 		return {
-			detach: attachNativeAudio(element),
-			restart: restartCurrentTrack, applyShareLink, applyPendingShareSeek, jump: jumpRelative,
-			select: selectQueuedTrack, remove: removeQueuedTrack, playQueued: playQueuedTrack,
-			move: moveQueuedTrack, clear: clearQueuedTracks, cleanup,
+			detach: media.attach(element),
+			restart: media.restart, applyShareLink, retryShare: (type = 'loadedmetadata') => capture(type)(), jump: media.jump,
+			resetAuth: () => { resetShareAtAuthBoundary(); player.purgeAtAuthBoundary(); },
+			destroyPlayer: player.destroy,
+			repopulateLibrary: () => player.reconcileLibrary(items, () => true) && selectTrack(track.id),
+			copyTrackLink, copyQueueLink: queueShare.copy,
+			refreshLibrary: () => player.reconcileLibrary(items, () => true, (queueChanged) => {
+				if (queueChanged) throw new Error('Expected a same-object refresh');
+			}),
+			readCopy: () => ({ browse: player.browseCopy.feedback, queue: queueShareOutcome }),
+			select: selectQueuedTrack, remove: player.removeQueuedTrack, playQueued: playQueuedTrack,
+			move: player.moveQueuedTrack, clear: player.clearQueuedTracks, cleanup,
 			trimPrevious: trimPreviousTracks, trimUpcoming: trimUpcomingTracks,
 			seeking: (target = element) => capture('seeking')(target), replaceQueue,
-			subscribe: queueController.subscribe, attach: attachNativeAudio, currentAudio: () => media.audio,
-			nativeIntent: () => ({ playing: media.attachment?.playing, endGeneration }),
-			end: (mode) => { repeat = mode; return capture('ended')(); },
+			subscribe: queueController.subscribe, attach: media.attach, currentAudio: () => media.audio,
+			nativeIntent: () => ({ playing: media.attachment?.playing }),
+			end: (mode) => { onRepeatChange({ currentTarget: { value: mode } }); return capture('ended')(); },
 			refresh: () => capture('timeupdate')(),
-			read: () => ({ restartCanSeek, restartStatus, restartStatusVersion, pendingShareSeek: pendingShareSeek.current, queue, jumpStatus, playEpoch: queueRevision.revision, mediaRevision, queueAnnouncement, queueAnnouncementVersion })
+			read: () => ({ ...get(media.seekFeedback), pendingShareSeek: media.pendingShareSeek, queue, playEpoch: queueRevision.revision, mediaRevision: player.mediaRevision, attachmentVersion: media.attachmentVersion,
+				queueAnnouncement: player.queueAnnouncement.text, queueAnnouncementVersion: player.queueAnnouncement.version })
 		};
 	`)(...Object.values(bindings)) as {
 		restart: () => void;
+		resetAuth: () => void;
+		repopulateLibrary: () => boolean;
+		copyTrackLink: (id: string) => Promise<void>;
+		copyQueueLink: (id: string) => Promise<void>;
+		refreshLibrary: () => void;
+		readCopy: () => {
+			browse: { status: string; fallbackUrl: string | null };
+			queue: { status: string; fallbackUrl: string | null; forQueue: ReturnType<typeof createQueue> | null };
+		};
 		applyShareLink: () => void;
-		applyPendingShareSeek: () => void;
+		retryShare: (type?: 'loadedmetadata' | 'durationchange') => void;
 		jump: (direction: 'back' | 'forward') => void;
 		select: (index: number) => void;
 		remove: (index: number) => void;
 		move: (from: number, to: number) => void;
 		clear: () => void;
 		cleanup: () => void;
+		destroyPlayer: () => void;
 		trimPrevious: () => void;
 		trimUpcoming: () => void;
 		playQueued: (id: string) => Promise<void>;
@@ -149,9 +179,9 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 		attach: (audio: NativeAudio) => () => void;
 		detach: () => void;
 		currentAudio: () => unknown;
-		nativeIntent: () => { playing: boolean | undefined; endGeneration: number };
+		nativeIntent: () => { playing: boolean | undefined };
 		subscribe: (callback: (queue: ReturnType<typeof createQueue>) => void) => () => void;
-		end: (mode: 'one' | 'queue') => Promise<void>;
+		end: (mode: 'off' | 'one' | 'queue') => Promise<void>;
 		refresh: () => void;
 		read: () => {
 			restartCanSeek: boolean;
@@ -162,14 +192,24 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 			jumpStatus: string;
 			playEpoch: number;
 			mediaRevision: number;
+			attachmentVersion: number;
 			queueAnnouncement: string;
 			queueAnnouncementVersion: number;
 		};
 	};
 	page.refresh();
 	expect(page.read().restartCanSeek).toBe(true);
-	const remount = () => { const next = new NativeAudio(); page.attach(next); return element = next; };
-	return { page, media, writes, location, track, element, capture, remount, observeClear: (callback: () => void) => { onClear = callback; } };
+	const remount = (source = track.streamUrl) => {
+		const next = new NativeAudio();
+		next.sourceAttribute = source;
+		page.attach(next);
+		return element = next;
+	};
+	return {
+		page, media, writes, location, track, element, capture, remount, clipboard, routeCleanup,
+		observeClear: (callback: () => void) => { onClear = callback; },
+		observeInvalidateBrowseCopy: (callback: () => void) => { onInvalidateBrowseCopy = callback; }
+	};
 }
 
 test('restart reads mutable availability once per gesture', () => {
@@ -195,6 +235,211 @@ test('a throwing availability getter still supersedes a pending share', () => {
 	expect(page.read().restartStatus).toBe('Could not restart Coral Night.');
 	expect(writes).toEqual([]);
 });
+
+test('a throwing native source check cannot preserve a pending share', async () => {
+	const { page, location, element, writes } = restartFixture();
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	element.getAttribute = () => { throw new Error('unreadable source'); };
+	page.restart();
+	await Promise.resolve();
+	expect(page.read().pendingShareSeek).toBeNull();
+	expect(page.read().restartStatusVersion).toBe(0);
+	expect(writes).toEqual([]);
+});
+
+test.each(['duration', 'range start'] as const)('restart stops availability reads after retirement during %s', (phase) => {
+	const { page, element, remount, writes } = restartFixture();
+	const readPosition = vi.fn(() => 30);
+	const readEnd = vi.fn(() => 120);
+	Object.defineProperties(element, {
+		duration: { get() { if (phase === 'duration') remount(); return 120; } },
+		currentTime: { get: readPosition },
+		seekable: { get: () => ({ length: 1, start: () => { remount(); return 0; }, end: readEnd }) }
+	});
+	page.restart();
+	expect(page.currentAudio()).not.toBe(element);
+	expect(readPosition).toHaveBeenCalledTimes(phase === 'duration' ? 0 : 1);
+	expect(readEnd).not.toHaveBeenCalled();
+	expect(writes).toEqual([]);
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('a position getter cannot write through a reentrant source change', () => {
+	const { page, element, writes } = restartFixture();
+	page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));
+	let reads = 0;
+	Object.defineProperty(element, 'currentTime', { get() {
+		if (++reads === 2) page.select(1);
+		return 30;
+	}, set: (value: number) => writes.push(value) });
+	page.restart();
+	expect(currentTrack(page.read().queue)?.id).toBe('pine');
+	expect(writes).toEqual([]);
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test.each([false, true])('restart with a queue edit during assignment (newer jump: %s)', (newerJump) => {
+	const { page, element, media } = restartFixture();
+	page.jump('forward');
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	const read = vi.fn(() => media.position);
+	Object.defineProperty(element, 'currentTime', { get: read, set(value: number) {
+		if (value === 0) page.replaceQueue(addTrack(page.read().queue, { id: 'pine', title: 'Pine', artist: '', streamUrl: '/test-audio/pine' }));
+		media.position = value;
+		if (value === 0 && newerJump) page.jump('forward');
+		if (value === 0) read.mockClear();
+	} });
+	page.restart();
+	expect(page.currentAudio()).toBe(element);
+	expect(page.read().queue.tracks.map((track) => track.id)).toEqual(['coral', 'pine']);
+	expect(media.position).toBe(newerJump ? 10 : 0);
+	expect(page.read().jumpStatus).toBe(newerJump ? 'Forward 10 seconds, now at 0:10.' : '');
+	// If queued, only the newer jump reads its starting position and readback.
+	expect(read).toHaveBeenCalledTimes(newerJump ? 2 : 0);
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('a setter that crosses the account boundary cannot retire new jump feedback or read back', () => {
+	const { page, element, remount, writes } = restartFixture();
+	let reads = 0;
+	Object.defineProperty(element, 'currentTime', { get: () => { reads += 1; return 30; }, set(value: number) {
+		writes.push(value);
+		page.resetAuth();
+		expect(page.read().queue.tracks).toEqual([]);
+		expect(page.repopulateLibrary()).toBe(true);
+		remount();
+		page.jump('forward');
+	} });
+	page.restart();
+	expect(reads).toBe(2);
+	expect(writes).toEqual([0, 40]);
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	expect(page.read().restartCanSeek).toBe(false);
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('restart retires jump feedback before readback can start a newer same-source share', async () => {
+	const { page, element, location, media, writes } = restartFixture();
+	page.jump('forward');
+	let jumpAtReadback: string | undefined;
+	let reads = 0;
+	Object.defineProperty(element, 'currentTime', { get() {
+		if (++reads === 3) {
+			jumpAtReadback = page.read().jumpStatus;
+			location.search = '?track=coral&t=42';
+			page.applyShareLink();
+		}
+		return media.position;
+	}, set(value: number) { writes.push(value); media.position = value; } });
+	page.restart();
+	await Promise.resolve();
+	expect(jumpAtReadback).toBe('');
+	expect(writes).toEqual([40, 0, 42]);
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('a synchronous seeking event preserves the share retry; duration clamps it once', async () => {
+	const { page, location, element, media, writes } = restartFixture();
+	media.duration = NaN;
+	Object.defineProperty(element, 'currentTime', {
+		get: () => media.position,
+		set: (value: number) => { writes.push(value); page.seeking(); media.position = value; }
+	});
+	location.search = '?track=coral&t=90';
+	page.applyShareLink();
+	await Promise.resolve();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	media.duration = 60;
+	page.retryShare('durationchange');
+	page.retryShare();
+	expect(writes).toEqual([90, 60]);
+	expect(page.read().pendingShareSeek).toBeNull();
+});
+
+test.each(['clamp', 'extend', 'restart', 'unknown'] as const)(
+	'a duration event during the share setter is bounded and respects %s', async (outcome) => {
+		const { page, location, element, media, writes } = restartFixture();
+		media.duration = outcome === 'extend' ? 60 : NaN;
+		Object.defineProperty(element, 'currentTime', {
+			get: () => media.position,
+			set(value: number) {
+				writes.push(value);
+				if (writes.length === 1 || outcome === 'unknown') {
+					if (outcome !== 'unknown') media.duration = outcome === 'extend' ? 120 : 60;
+					page.retryShare('durationchange');
+					if (outcome === 'restart') page.restart();
+				}
+				media.position = value;
+			}
+		});
+		location.search = '?track=coral&t=90';
+		page.applyShareLink();
+		await Promise.resolve();
+		const expected = outcome === 'clamp' ? 60 : outcome === 'restart' ? 0 : 90;
+		expect(writes).toEqual([outcome === 'extend' ? 60 : 90, expected]);
+		expect(media.position).toBe(expected);
+		if (outcome === 'unknown') expect(page.read().pendingShareSeek).not.toBeNull();
+		else expect(page.read().pendingShareSeek).toBeNull();
+	}
+);
+
+test.each(['reattach', 'auth', 'route', 'query', 'source'] as const)(
+	'a metadata duration read cannot write after the share receipt loses %s', async (boundary) => {
+		const { page, location, element, writes, remount } = restartFixture();
+		location.search = '?track=coral&t=90';
+		page.applyShareLink();
+		Object.defineProperty(element, 'duration', { get: () => {
+			switch (boundary) {
+				case 'reattach': remount(); break;
+				case 'auth': page.resetAuth(); break;
+				case 'route': page.cleanup(); break;
+				case 'query': location.search = '?track=coral&t=17'; break;
+				case 'source': element.sourceAttribute = '/test-audio/other'; break;
+			}
+			return 60;
+		} });
+		page.retryShare();
+		await Promise.resolve();
+		expect(writes).toEqual([]);
+		if (boundary === 'query') expect(page.currentAudio()).toBe(element);
+	}
+);
+
+test('a share tick cannot seek a same-source replacement mounted before the tick', async () => {
+	const { page, location, remount, writes } = restartFixture();
+	location.search = '?track=coral&t=90';
+	page.applyShareLink();
+	remount();
+	await Promise.resolve();
+	page.retryShare();
+	expect(writes).toEqual([]);
+	expect(page.read().pendingShareSeek).toBeNull();
+});
+
+test.each(['tick', 'loadedmetadata', 'durationchange'] as const)(
+	'%s cannot seek a same-source remount using a share retained after detach', async (retry) => {
+		let resume!: () => void;
+		const { page, element, location, remount, writes } = restartFixture(() => new Promise<void>((resolve) => { resume = resolve; }));
+		expect(page.currentAudio()).toBe(element);
+		location.search = '?track=coral&t=90';
+		page.applyShareLink();
+		const pending = page.read().pendingShareSeek;
+		expect(pending).toMatchObject({ trackId: 'coral', streamUrl: element.sourceAttribute, seconds: 90 });
+		page.detach();
+		expect(page.currentAudio()).toBeUndefined();
+		expect(page.read().pendingShareSeek).toBe(pending);
+		const replacement = remount();
+		expect(page.currentAudio()).toBe(replacement);
+		expect(replacement.sourceAttribute).toBe(element.sourceAttribute);
+		expect(page.read().pendingShareSeek).toBe(pending);
+		if (retry === 'tick') resume();
+		else replacement.dispatchEvent(new Event(retry));
+		await Promise.resolve();
+		expect(writes).toEqual([]);
+	}
+);
 
 test('a new same-source share navigation supersedes an earlier restart marker', async () => {
 	const { page, media, location } = restartFixture();
@@ -228,7 +473,7 @@ test('direct queue selection retires a pending share adjustment across a round t
 	remount();
 	media.position = 12;
 	media.duration = 20;
-	page.applyPendingShareSeek();
+	page.retryShare();
 	expect(media.position).toBe(12);
 	expect(writes).toEqual([45]);
 });
@@ -269,18 +514,110 @@ test('a new URL for the same ID retires the attachment before queue publication'
 	const original = page.read().queue;
 	const next = createQueue(original.tracks.map((track) => ({ ...track, streamUrl: '/test-audio/new' })));
 	const observed: unknown[] = [];
-	const unsubscribe = page.subscribe(() => observed.push(page.currentAudio()));
+	const unsubscribe = page.subscribe(() => observed.push([page.read().mediaRevision, page.currentAudio()]));
 	page.replaceQueue(next);
 	page.replaceQueue(original);
-	expect(observed).toEqual([element, undefined, undefined]);
+	expect(observed).toEqual([[0, element], [1, undefined], [2, undefined]]);
 	expect(page.read().mediaRevision).toBe(2);
 	const replacement = remount();
+	const mounted = page.read();
+	expect(mounted.mediaRevision).toBe(2);
 	page.detach();
 	expect(page.currentAudio()).toBe(replacement);
+	expect(page.read()).toEqual(mounted);
 	unsubscribe();
 });
 
-test('queued and captured events from a retired node cannot change its same-source replacement', () => {
+test('selecting another track with the same resolved source retires the native host', () => {
+	const { page, element, track } = restartFixture();
+	page.replaceQueue(addTrack(page.read().queue, {
+		...track, id: 'alternate', artist: '', streamUrl: ` ${track.streamUrl} `
+	}));
+	const before = page.read();
+	element.paused = false;
+	page.select(1);
+	expect(currentTrack(page.read().queue)?.id).toBe('alternate');
+	expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
+	expect(page.currentAudio()).toBeUndefined();
+	expect(element.paused).toBe(true);
+});
+
+test('auth retirement increments the render revision and cancels pending share work', async () => {
+	const { page, media, location, writes, remount, capture, element } = restartFixture();
+	media.duration = Number.NaN;
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	const metadata = capture('loadedmetadata');
+	const before = page.read();
+	expect(before.pendingShareSeek).not.toBeNull();
+	const observed = vi.fn();
+	const pause = element.pause.bind(element);
+	element.pause = () => { observed(page.read().pendingShareSeek, page.currentAudio()); pause(); };
+	element.paused = false;
+	page.resetAuth();
+	expect(observed.mock.calls).toEqual([[null, undefined]]);
+	expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
+	expect(page.read().attachmentVersion).toBe(before.attachmentVersion + 1);
+	expect(page.read().pendingShareSeek).toBeNull();
+	expect(page.currentAudio()).toBeUndefined();
+	expect(page.repopulateLibrary()).toBe(true);
+	const replacement = remount();
+	media.duration = 120;
+	metadata();
+	replacement.dispatchEvent(new Event('loadedmetadata'));
+	await Promise.resolve();
+	expect(writes).toEqual([]);
+});
+
+test.each(['wrong target', 'disconnected', 'absent source', 'wrong source', 'source swapped during read', 'unreadable source'] as const)(
+	'native events ignore a %s even while the attachment receipt is active', (boundary) => {
+		const { page, element, media, track, capture } = restartFixture();
+		const readSource = element.getAttribute;
+		const target = boundary === 'wrong target' ? new EventTarget() : element;
+		if (boundary === 'disconnected') element.connected = false;
+		if (boundary === 'absent source') element.sourceAttribute = null;
+		if (boundary === 'wrong source') element.sourceAttribute = '/test-audio/other';
+		if (boundary === 'source swapped during read') {
+			element.getAttribute = () => {
+				element.sourceAttribute = '/test-audio/other';
+				return track.streamUrl;
+			};
+		}
+		if (boundary === 'unreadable source') element.getAttribute = () => { throw new Error('unreadable source'); };
+		element.paused = false;
+		media.duration = NaN;
+		capture('playing')(target);
+		capture('timeupdate')(target);
+		expect(page.nativeIntent().playing).toBe(false);
+		expect(page.read().restartCanSeek).toBe(true);
+
+		element.connected = true;
+		element.sourceAttribute = track.streamUrl;
+		element.getAttribute = readSource;
+		element.dispatchEvent(new Event('playing'));
+		element.dispatchEvent(new Event('timeupdate'));
+		expect(page.nativeIntent().playing).toBe(true);
+		expect(page.read().restartCanSeek).toBe(false);
+	}
+);
+
+test('metadata cannot refresh availability after a share retry changes the native source', async () => {
+	const { page, element, location, capture, writes } = restartFixture();
+	location.search = '?track=coral&t=45';
+	page.applyShareLink();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	Object.defineProperty(element, 'duration', { get() {
+		element.sourceAttribute = '/test-audio/other';
+		return NaN;
+	} });
+	capture('loadedmetadata')();
+	await Promise.resolve();
+	expect(element.sourceAttribute).toBe('/test-audio/other');
+	expect(writes).toEqual([]);
+	expect(page.read().restartCanSeek).toBe(true);
+});
+
+test('queued and captured events from a retired node cannot change its same-source replacement', async () => {
 	const { page, element, media, capture, remount } = restartFixture();
 	const [play, pause, error, ended, seeking, progress] =
 		['play', 'pause', 'error', 'ended', 'seeking', 'progress'].map(capture);
@@ -318,7 +655,11 @@ test('queued and captured events from a retired node cannot change its same-sour
 	replacement.dispatchEvent(new Event('timeupdate'));
 	expect(page.read().restartCanSeek).toBe(false);
 	replacement.dispatchEvent(new Event('pause'));
-	expect(page.nativeIntent()).toEqual({ playing: false, endGeneration: before.endGeneration + 1 });
+	expect(page.nativeIntent()).toEqual({ playing: false });
+	replacement.ended = true;
+	await page.end('one');
+	expect(media.position).toBe(80);
+	expect(page.read().queueAnnouncement).toBe('');
 });
 
 test('a reentrant subscription cannot publish an older operation hint', () => {
@@ -328,10 +669,18 @@ test('a reentrant subscription cannot publish an older operation hint', () => {
 	const unsubscribe = page.subscribe((value) => {
 		if (value === pine) page.replaceQueue(oak);
 	});
-	page.replaceQueue(pine);
-	expect(page.read().queue).toBe(oak);
-	expect(readMiniPlayerHint()?.trackId).toBe('oak');
-	unsubscribe();
+	const hints = vi.fn();
+	const stopHints = onMiniPlayerHint(hints);
+	hints.mockClear();
+	try {
+		page.replaceQueue(pine);
+		expect(page.read().queue).toBe(oak);
+		expect(readMiniPlayerHint()?.trackId).toBe('oak');
+		expect(hints).toHaveBeenCalledExactlyOnceWith({ trackId: 'oak', title: 'Oak', artist: null });
+	} finally {
+		stopHints();
+		unsubscribe();
+	}
 });
 
 test('reentrant replacement during share append prevents the older navigation', async () => {
@@ -494,6 +843,22 @@ test('a queue edit before tick prevents native play and stale feedback', async (
 	expect(page.read().queueAnnouncementVersion).toBe(edited.queueAnnouncementVersion);
 });
 
+test('auth retirement before the first attachment cannot hand deferred Play to the next node', async () => {
+	let resume!: () => void;
+	const { page, remount } = restartFixture(() => new Promise<void>((resolve) => { resume = resolve; }));
+	page.detach();
+	const attempt = page.playQueued('coral');
+	expect(resume).toBeTypeOf('function');
+	page.resetAuth();
+	const replacement = remount();
+	replacement.play = vi.fn(async () => {});
+	const before = page.read();
+	resume();
+	await attempt;
+	expect(replacement.play).not.toHaveBeenCalled();
+	expect(page.read()).toEqual(before);
+});
+
 test('native play access cannot start an attempt retired by a queue edit', async () => {
 	const { page, element } = restartFixture();
 	let plays = 0;
@@ -537,6 +902,30 @@ test('a late rejection cannot report against a replacement attachment at the sam
 	expect(page.currentAudio()).toBe(replacement);
 	expect(page.nativeIntent().playing).toBe(true);
 	expect(page.read()).toEqual(before);
+});
+
+test('Library cleanup fences both copy receipts without pausing the shared decoder', async () => {
+	const { page, element, track, clipboard, routeCleanup } = restartFixture();
+	page.replaceQueue(createQueue([{ ...track, artist: '' }]));
+	expect(readMiniPlayerHint()?.trackId).toBe(track.id);
+	let finish!: () => void;
+	const pending = new Promise<void>((resolve) => { finish = resolve; });
+	clipboard.writeText.mockReturnValue(pending);
+	const copies = [page.copyTrackLink(track.id), page.copyQueueLink(track.id)];
+	expect(clipboard.writeText).toHaveBeenCalledTimes(2);
+	element.paused = false;
+	const pause = vi.spyOn(element, 'pause');
+
+	page.cleanup();
+	page.cleanup();
+	const afterCleanup = page.readCopy();
+	finish();
+	await Promise.all(copies);
+	expect(pause).not.toHaveBeenCalled();
+	expect(page.currentAudio()).toBe(element);
+	expect(page.readCopy()).toEqual(afterCleanup);
+	expect(readMiniPlayerHint()?.trackId).toBe(track.id);
+	expect(routeCleanup).toEqual(['auth-fence', 'drag', 'share', 'export', 'refresh', 'likes', 'query', 'local-auth', 'storage', 'pagehide']);
 });
 
 test('route cleanup fences an explicit play waiting for tick', async () => {
@@ -666,13 +1055,25 @@ test('removing the current queue row clears its jump readout', () => {
 });
 
 test('native seeking clears a previous jump readout but not the jump seek itself', () => {
-	const { page, media } = restartFixture();
+	const { page, element, media } = restartFixture();
 	page.jump('forward');
 	page.seeking();
 	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
 	media.position = 90;
 	page.seeking();
 	expect(page.read().jumpStatus).toBe('');
+	page.jump('back');
+	vi.spyOn(element, 'currentTime', 'get').mockImplementationOnce(() => { page.jump('back'); return 90; });
+	page.seeking();
+	expect(page.read().jumpStatus).toBe('Back 10 seconds, now at 1:10.');
+});
+
+test('native availability reads cannot overwrite the replacement attachment', () => {
+	const { page, element, remount } = restartFixture();
+	vi.spyOn(element, 'duration', 'get').mockImplementationOnce(() => { remount(); page.refresh(); return NaN; });
+	page.refresh();
+	expect(page.currentAudio()).not.toBe(element);
+	expect(page.read().restartCanSeek).toBe(true);
 });
 
 test('repeated seeks at the jump target retain an accurate readout', () => {
@@ -719,20 +1120,181 @@ test('a native seek retires earlier boundary feedback', () => {
 	expect(page.read().jumpStatus).toBe('');
 });
 
-test('a refused jump still supersedes a pending share seek for the source', () => {
-	const { page, media, location } = restartFixture();
-	media.duration = Number.NaN;
+test.each([false, true])('a refused jump supersedes a pending share (during seeking: %s)', async (seeking) => {
+	const { page, media, location, element } = restartFixture();
+	media.duration = NaN;
 	location.search = '?track=coral&t=45';
 	page.applyShareLink();
+	if (seeking) await Promise.resolve();
 	expect(page.read().pendingShareSeek).not.toBeNull();
 	media.duration = 120;
 	media.refuse = true;
-	page.jump('forward');
+	if (seeking) {
+		expect(media.position).toBe(45);
+		vi.spyOn(element, 'currentTime', 'get').mockImplementationOnce(() => {
+			page.jump('forward');
+			return media.position;
+		});
+		page.seeking();
+	} else page.jump('forward');
 	expect(page.read().jumpStatus).toBe('The player did not accept that jump.');
 	expect(page.read().pendingShareSeek).toBeNull();
 	media.refuse = false;
-	page.applyPendingShareSeek();
+	page.retryShare();
+	expect(media.position).toBe(seeking ? 45 : 30);
+});
+
+test('a deferred Back cancels an older share before a metadata retry', async () => {
+	const { page, element, media, location, writes } = restartFixture();
+	let firstRead = true;
+	Object.defineProperty(element, 'duration', { get() {
+		if (firstRead) {
+			firstRead = false;
+			location.search = '?track=coral&t=45';
+			page.applyShareLink();
+			page.jump('back');
+			element.dispatchEvent(new Event('loadedmetadata'));
+		}
+		return media.duration;
+	} });
+	page.jump('forward');
+	await Promise.resolve();
+	expect(writes).toEqual([20]);
+	expect(media.position).toBe(20);
+	expect(page.read().jumpStatus).toBe('Back 10 seconds, now at 0:20.');
+});
+
+test.each(['account', 'queue', 'attachment'] as const)(
+	'jump cannot write after a native getter revokes its %s receipt', (boundary) => {
+		const { page, element, writes, remount } = restartFixture();
+		Object.defineProperty(element, 'seekable', { get() {
+			if (boundary === 'account') page.resetAuth();
+			if (boundary === 'queue') page.replaceQueue({ ...page.read().queue });
+			if (boundary === 'attachment') remount();
+			return { length: 1, start: () => 0, end: () => 120 };
+		} });
+		page.jump('forward');
+		expect(writes).toEqual([]);
+		expect(page.read().jumpStatus).toBe('');
+	}
+);
+
+test('a newer share received by a jump source getter survives the old gesture', async () => {
+	const { page, element, location, writes, track } = restartFixture();
+	element.getAttribute = () => {
+		element.getAttribute = () => track.streamUrl;
+		location.search = '?track=coral&t=45';
+		page.applyShareLink();
+		return track.streamUrl;
+	};
+	page.jump('forward');
+	expect(writes).toEqual([]);
+	await Promise.resolve();
+	expect(writes).toEqual([45]);
+});
+
+test.each([
+	['jump', 1], ['jump', 2], ['restart', 2]
+] as const)('%s cannot write if pre-write connectivity read %s changes the source', (gesture, order) => {
+	const { page, element, media, writes } = restartFixture();
+	let targetChecked = false;
+	let connectivityReads = 0;
+	let positionReads = 0;
+	Object.defineProperties(element, {
+		seekable: { get() {
+			if (gesture === 'jump') targetChecked = true;
+			return { length: 1, start: () => 0, end: () => 120 };
+		} },
+		currentTime: { get() {
+			// Restart reads the position once for availability, then once for the write.
+			if (gesture === 'restart' && ++positionReads === 2) targetChecked = true;
+			return media.position;
+		}, set(value: number) { writes.push(value); media.position = value; } },
+		isConnected: { get() {
+			if (targetChecked && ++connectivityReads === order) element.sourceAttribute = '/test-audio/replacement';
+			return true;
+		} }
+	});
+	if (gesture === 'restart') page.restart(); else page.jump('forward');
+	expect(element.sourceAttribute).toBe('/test-audio/replacement');
+	expect(writes).toEqual([]);
 	expect(media.position).toBe(30);
+	expect(page.read().jumpStatus).toBe('');
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('a source read that disconnects the element cannot authorize a jump', () => {
+	const { page, element, track, writes } = restartFixture();
+	let targetChecked = false;
+	Object.defineProperty(element, 'seekable', { get() {
+		targetChecked = true;
+		return { length: 1, start: () => 0, end: () => 120 };
+	} });
+	element.getAttribute = () => {
+		if (targetChecked) element.isConnected = false;
+		return track.streamUrl;
+	};
+	page.jump('forward');
+	expect(element.isConnected).toBe(false);
+	expect(writes).toEqual([]);
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test.each(['before', 'after'])('unreadable source %s assignment retires feedback only if the jump wrote', (order) => {
+	const { page, element, media, track, writes } = restartFixture();
+	page.jump('forward');
+	const priorStatus = 'Forward 10 seconds, now at 0:40.';
+	expect(page.read().jumpStatus).toBe(priorStatus);
+	let targetChecked = false;
+	Object.defineProperty(element, 'seekable', { get() {
+		targetChecked = true;
+		return { length: 1, start: () => 0, end: () => 120 };
+	} });
+	element.getAttribute = () => {
+		if (order === 'before' ? targetChecked : media.position === 50) throw new Error('unreadable source');
+		return track.streamUrl;
+	};
+	page.jump('forward');
+	expect(writes).toEqual(order === 'before' ? [40] : [40, 50]);
+	expect(page.read().jumpStatus).toBe(order === 'before' ? priorStatus : '');
+});
+
+test.each(['before', 'after'])('a restart called %s the jump setter stores its value wins', (order) => {
+	const { page, element, media, writes } = restartFixture();
+	Object.defineProperty(element, 'currentTime', {
+		get: () => media.position,
+		set: (seconds: number) => {
+			writes.push(seconds);
+			if (seconds !== 0 && order === 'before') page.restart();
+			media.position = seconds;
+			page.seeking();
+			if (seconds !== 0 && order === 'after') page.restart();
+		}
+	});
+	page.jump('forward');
+	expect(writes).toEqual([40, 0]);
+	expect(media.position).toBe(0);
+	expect(page.read().restartStatus).toBe('Restarted Coral Night.');
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test('a new share supersedes a restart deferred by the jump setter', async () => {
+	const { page, element, media, location, writes } = restartFixture();
+	Object.defineProperty(element, 'currentTime', { get: () => media.position, set(seconds: number) {
+		writes.push(seconds);
+		if (seconds === 40) {
+			page.restart();
+			location.search = '?track=coral&t=45';
+			page.applyShareLink();
+		}
+		media.position = seconds;
+	} });
+	page.jump('forward');
+	await Promise.resolve();
+	expect(writes).toEqual([40, 45]);
+	expect(media.position).toBe(45);
+	expect(page.read().restartStatusVersion).toBe(0);
+	expect(page.read().jumpStatus).toBe('');
 });
 
 test('restart clears an earlier jump position readout', () => {
@@ -741,6 +1303,33 @@ test('restart clears an earlier jump position readout', () => {
 	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
 	page.restart();
 	expect(media.position).toBe(0);
+	expect(page.read().jumpStatus).toBe('');
+});
+
+test('a native source check that throws after assignment cannot preserve the prior jump readout', () => {
+	const { page, media, element, writes, track } = restartFixture();
+	page.jump('forward');
+	expect(page.read().jumpStatus).toBe('Forward 10 seconds, now at 0:40.');
+	element.getAttribute = () => {
+		if (media.position === 0) throw new Error('unreadable source after assignment');
+		return track.streamUrl;
+	};
+	page.restart();
+	expect(writes).toEqual([40, 0]);
+	expect(page.read().jumpStatus).toBe('');
+	expect(page.read().restartStatusVersion).toBe(0);
+});
+
+test('unreadable restart readback reports failure without restoring the retired jump readout', () => {
+	const { page, media, element, writes } = restartFixture();
+	page.jump('forward');
+	Object.defineProperty(element, 'currentTime', { get() {
+		if (media.position === 0) throw new Error('unreadable position');
+		return media.position;
+	}, set(value: number) { writes.push(value); media.position = value; } });
+	page.restart();
+	expect(writes).toEqual([40, 0]);
+	expect(page.read().restartStatus).toBe('Could not restart Coral Night.');
 	expect(page.read().jumpStatus).toBe('');
 });
 
@@ -764,6 +1353,7 @@ for (const mode of ['one', 'queue'] as const) {
 		media.position = media.duration;
 		element.ended = element.paused = true;
 		capture('pause')();
+		element.play = async () => { element.ended = element.paused = false; };
 		await page.end(mode);
 		expect(media.position).toBe(0);
 		expect(page.read().jumpStatus).toBe('');
@@ -777,21 +1367,269 @@ test.each(['tick', 'play', 'play rejection'] as const)('same-source repeat canno
 		resume = phase === 'play rejection' ? () => reject(new Error('native play refused')) : resolve;
 	});
 	const { page, element, media, capture, remount } = restartFixture(() => phase === 'tick' ? pending : Promise.resolve());
-	element.play = () => pending;
+	element.play = vi.fn(() => pending);
 	element.paused = false;
 	capture('play')();
 	media.position = media.duration;
 	element.ended = element.paused = true;
 	const repeat = page.end('one');
 	await Promise.resolve();
+	expect(element.play).toHaveBeenCalledTimes(phase === 'tick' ? 0 : 1);
 	const replacement = remount();
 	replacement.paused = false;
 	capture('play')();
+	// A successful stale play must be fenced by its receipt, not by native pause.
+	if (phase === 'play') element.ended = element.paused = false;
 	resume();
 	await repeat;
 	expect(media.position).toBe(phase === 'tick' ? media.duration : 0);
 	expect(page.read().queueAnnouncement).toBe('');
 	expect(page.nativeIntent().playing).toBe(true);
+});
+
+const pine = { id: 'pine', title: 'Pine Morning', artist: '', streamUrl: '/test-audio/pine' };
+
+test.each(['none', 'callback reset', 'invalidation source change', 'publication reset'] as const)('native ended uses the queue transaction with boundary %s', async (boundary) => {
+	const flush = vi.fn(async () => {});
+	const { page, element, remount, observeClear, observeInvalidateBrowseCopy, writes } = restartFixture(flush);
+	element.play = vi.fn(async () => {});
+	page.replaceQueue(addTrack(page.read().queue, pine));
+	const before = page.read();
+	let publications = 0;
+	const stop = page.subscribe((next) => {
+		if (currentTrack(next) !== pine) return;
+		publications += 1;
+		expect(page.read().mediaRevision).toBe(before.mediaRevision + 1);
+		expect(page.currentAudio()).toBeUndefined();
+		expect(readMiniPlayerHint()?.trackId).toBe('coral');
+		if (boundary === 'publication reset') page.resetAuth();
+	});
+	if (boundary === 'callback reset') {
+		observeClear(() => { observeClear(() => {}); page.resetAuth(); });
+	} else if (boundary === 'invalidation source change') {
+		observeInvalidateBrowseCopy(() => { element.sourceAttribute = '/test-audio/other'; });
+	}
+
+	element.paused = false;
+	element.dispatchEvent(new Event('play'));
+	element.ended = element.paused = true;
+	element.dispatchEvent(new Event('pause'));
+	element.dispatchEvent(new Event('ended'));
+	stop();
+	if (boundary === 'invalidation source change') {
+		expect(element.getAttribute('src')).toBe('/test-audio/other');
+		expect(element.isConnected).toBe(true);
+		expect(page.currentAudio()).toBe(element);
+		expect(page.read().attachmentVersion).toBe(before.attachmentVersion);
+		expect(page.read().playEpoch).toBe(before.playEpoch);
+	}
+	const target = remount(pine.streamUrl);
+	target.play = vi.fn(async () => { target.paused = false; });
+	await Promise.resolve(); // Native flush.
+	await Promise.resolve(); // Native play result.
+
+	const advanced = boundary === 'none' || boundary === 'publication reset';
+	const played = boundary === 'none';
+	expect(publications).toBe(Number(advanced));
+	if (boundary === 'callback reset' || boundary === 'publication reset') {
+		expect(page.read().queue.tracks).toEqual([]);
+		expect(readMiniPlayerHint()).toBeNull();
+	} else {
+		expect(currentTrack(page.read().queue)?.id).toBe(played ? 'pine' : 'coral');
+		expect(readMiniPlayerHint()?.trackId).toBe(played ? 'pine' : 'coral');
+	}
+	expect(flush).toHaveBeenCalledTimes(Number(played));
+	expect(element.play).not.toHaveBeenCalled();
+	expect(target.play).toHaveBeenCalledTimes(Number(played));
+	expect(writes).toEqual(played ? [0] : []);
+	expect(page.read().queueAnnouncement).toBe(played ? 'Playing Pine Morning.' : '');
+});
+
+test.each(['publication', 'hint'] as const)('a reset during queued Play %s retires the Play attempt', async (boundary) => {
+	const flush = vi.fn(async () => {});
+	const { page, remount } = restartFixture(flush);
+	page.replaceQueue(selectTrack(addTrack(page.read().queue, pine), 1));
+	remount(pine.streamUrl);
+	const revision = page.read().mediaRevision;
+	const stop = boundary === 'publication'
+		? page.subscribe((next) => { if (currentTrack(next)?.id === 'coral') page.resetAuth(); })
+		: onMiniPlayerHint((hint) => { if (hint?.trackId === 'coral') page.resetAuth(); });
+	const attempt = page.playQueued('coral');
+	stop();
+	const target = remount();
+	target.play = vi.fn(async () => {});
+	await attempt;
+	expect(page.read().mediaRevision).toBe(revision + 2);
+	expect(page.read().queue.tracks).toEqual([]);
+	expect(readMiniPlayerHint()).toBeNull();
+	expect(flush).not.toHaveBeenCalled();
+	expect(target.play).not.toHaveBeenCalled();
+	expect(page.read().queueAnnouncement).toBe('');
+});
+
+function signalNaturalEnd({ element, capture, media }: ReturnType<typeof restartFixture>): void {
+	element.paused = false;
+	capture('play')();
+	media.position = media.duration;
+	element.ended = element.paused = true;
+	capture('pause')(); // The browser's completion pause is not a manual pause.
+}
+
+for (const refuses of [false, true]) {
+	test.each(['replace', 'repeat', 'stop', 'ignore', 'append', 'refresh'] as const)(
+		`browse copy ${refuses ? 'refusal' : 'success'} after %s only settles on a live receipt`, async (action) => {
+			let releaseFlush!: () => void;
+			const flush = new Promise<void>((resolve) => { releaseFlush = resolve; });
+			const fixture = restartFixture(() => flush);
+			const { page, element, track, clipboard, writes } = fixture;
+			const before = page.read().queue;
+			await page.copyQueueLink(track.id);
+			const queueFeedback = page.readCopy().queue;
+			expect(queueFeedback).toEqual({ status: 'Copied link for Coral Night.', fallbackUrl: null, forQueue: before });
+
+			let finish!: () => void;
+			clipboard.writeText.mockImplementationOnce(() => new Promise<void>((resolve, reject) => {
+				finish = refuses ? () => reject(new Error('clipboard refused')) : resolve;
+			}));
+			const copy = page.copyTrackLink(track.id);
+			const url = 'https://example.test/library?track=coral&t=30';
+			expect(clipboard.writeText).toHaveBeenLastCalledWith(url);
+			if (action === 'replace') page.replaceQueue(createQueue([pine]));
+			if (action === 'append') page.replaceQueue(addTrack(before, pine));
+			if (action === 'refresh') page.refreshLibrary();
+			if (action === 'repeat' || action === 'stop') signalNaturalEnd(fixture);
+			element.play = async () => { element.ended = element.paused = false; };
+			const end = action === 'repeat' || action === 'ignore' ? page.end('one') :
+				action === 'stop' ? page.end('off') : undefined;
+			// Settle against the accepted boundary without waiting for the native flush.
+			finish();
+			await copy;
+			const retired = action === 'replace' || action === 'repeat';
+			expect(page.readCopy().browse).toEqual({
+				status: retired || refuses ? '' : 'Copied link for Coral Night.',
+				fallbackUrl: !retired && refuses ? url : null
+			});
+			releaseFlush();
+			await end;
+			if (action === 'repeat') {
+				expect(page.read().queue).toBe(before);
+				expect(page.readCopy().queue).toBe(queueFeedback);
+				expect(writes).toEqual([0]);
+				expect(page.read().queueAnnouncement).toBe('Playing Coral Night.');
+			}
+		}
+	);
+}
+
+test('route selection drives native repeat, and owner teardown retires only its own player', async () => {
+	let flush!: () => void;
+	const pending = new Promise<void>((resolve) => { flush = resolve; });
+	const selectedFlush = vi.fn(() => pending);
+	const leavingFlush = vi.fn(() => pending);
+	const selected = restartFixture(selectedFlush);
+	const leaving = restartFixture(leavingFlush);
+	selected.page.replaceQueue(addTrack(selected.page.read().queue, pine));
+	selected.page.select(1);
+	const target = selected.remount(pine.streamUrl);
+	target.play = vi.fn(async () => { target.ended = target.paused = false; });
+	leaving.element.play = vi.fn(async () => { leaving.element.ended = leaving.element.paused = false; });
+
+	signalNaturalEnd({ ...selected, element: target });
+	signalNaturalEnd(leaving);
+	const repeatSelection = selected.page.end('one');
+	const retiredRepeat = leaving.page.end('one');
+	expect(selectedFlush).toHaveBeenCalledOnce();
+	expect(leavingFlush).toHaveBeenCalledOnce();
+	leaving.page.cleanup();
+	expect(leaving.page.currentAudio()).toBe(leaving.element);
+	leaving.page.destroyPlayer();
+	flush();
+	await Promise.all([repeatSelection, retiredRepeat]);
+
+	expect(currentTrack(selected.page.read().queue)).toBe(pine);
+	expect(selected.page.currentAudio()).toBe(target);
+	expect(target.play).toHaveBeenCalledOnce();
+	expect(selected.writes).toEqual([0]);
+	expect(selected.page.read().queueAnnouncement).toBe('Playing Pine Morning.');
+	expect(selected.page.read().queueAnnouncementVersion).toBe(1);
+	expect(currentTrack(leaving.page.read().queue)?.id).toBe(leaving.track.id);
+	expect(leaving.page.currentAudio()).toBeUndefined();
+	expect(leaving.element.play).not.toHaveBeenCalled();
+	expect(leaving.writes).toEqual([]);
+	expect(leaving.page.read().queueAnnouncement).toBe('');
+	expect(leaving.page.read().queueAnnouncementVersion).toBe(0);
+});
+
+test.each(['pause', 'auth', 'edit'] as const)('queue wrap is fenced by %s during the native flush', async (boundary) => {
+	let flush!: () => void;
+	const fixture = restartFixture(() => new Promise<void>((resolve) => { flush = resolve; }));
+	const { page, track, remount, writes } = fixture;
+	page.replaceQueue(selectTrack(createQueue([pine, { ...track, artist: '' }]), 1));
+	signalNaturalEnd(fixture);
+	const continuation = page.end('queue');
+	expect(currentTrack(page.read().queue)?.id).toBe(pine.id);
+	if (boundary === 'auth') page.resetAuth(); // While no attachment exists yet.
+	const target = remount(pine.streamUrl);
+	target.play = vi.fn(async () => {});
+	if (boundary === 'pause') target.dispatchEvent(new Event('pause'));
+	if (boundary === 'edit') page.replaceQueue(addTrack(page.read().queue, { ...track, id: 'oak', artist: '' }));
+	flush();
+	await continuation;
+	expect(target.play).not.toHaveBeenCalled();
+	expect(writes).toEqual([]);
+	expect(page.read().queueAnnouncement).toBe('');
+});
+
+test.each(['plays', 'refuses', 'pauses before pause dispatch'] as const)('queue wrap transfers native settings and %s without a premature announcement', async (outcome) => {
+	let settle!: () => void;
+	const fixture = restartFixture();
+	const { page, element, track, remount, writes } = fixture;
+	page.replaceQueue(selectTrack(createQueue([pine, { ...track, artist: '' }]), 1));
+	// Native properties change immediately, before the queued volumechange event.
+	element.volume = 0.6;
+	element.muted = true;
+	signalNaturalEnd(fixture);
+	const continuation = page.end('queue');
+	const target = remount(pine.streamUrl);
+	// Volume and mute are already restored by attachment, before native play.
+	expect(target).toMatchObject({ volume: 0.6, muted: true });
+	target.playbackRate = 1;
+	target.play = vi.fn(() => new Promise<void>((resolve, reject) => {
+		if (outcome !== 'refuses') target.paused = false;
+		settle = outcome === 'refuses' ? () => reject(new Error('native play refused')) : resolve;
+	}));
+	await Promise.resolve();
+	expect(target.play).toHaveBeenCalledTimes(1);
+	expect(target).toMatchObject({ volume: 0.6, muted: true, playbackRate: 1.25 });
+	expect(writes).toEqual([0]);
+	expect(page.read().queueAnnouncement).toBe('');
+	// Native pause changes the property immediately, but queues the pause event.
+	if (outcome === 'pauses before pause dispatch') target.pause();
+	settle();
+	await continuation;
+	expect(page.read().queueAnnouncement).toBe(outcome === 'plays' ? 'Playing Pine Morning.' : '');
+	expect(page.nativeIntent().playing).toBe(outcome === 'plays');
+});
+
+test('end supersedes a deferred share adjustment but yields to a newer share during flush', async () => {
+	const fixture = restartFixture();
+	const { page, location, media, writes } = fixture;
+	media.duration = NaN;
+	location.search = '?track=coral&t=90';
+	page.applyShareLink();
+	await Promise.resolve();
+	expect(page.read().pendingShareSeek).not.toBeNull();
+	media.duration = 120;
+	signalNaturalEnd(fixture);
+	const continuation = page.end('one');
+	expect(page.read().pendingShareSeek).toBeNull();
+	page.retryShare();
+	expect(writes).toEqual([90]); // No metadata retry of the original seek.
+	location.search = '?track=coral&t=17';
+	page.applyShareLink();
+	await continuation;
+	expect(writes).toEqual([90, 17]);
+	expect(page.read().queueAnnouncement).toBe('');
 });
 
 test('source-preserving queue edits retain the current jump readout', () => {

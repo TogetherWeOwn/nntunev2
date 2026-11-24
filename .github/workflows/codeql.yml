@@ -10,7 +10,7 @@ name: codeql
 # is scanned so the rule always has a result to compare.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened]
   # Merge queue validation: report on merge_group so the code_scanning rule
   # never stalls the queue.
   merge_group:

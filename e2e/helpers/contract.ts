@@ -41,6 +41,7 @@ export const TESTIDS = {
   // player) move to the persistent player bar. See helpers/player-ui.ts
   // and e2e/README.md ("Player contract migration").
   audioPlayer: 'audio-player',
+  playerSeek: 'player-seek',
   usageMeter: 'usage-meter',
   nowPlaying: 'now-playing',
   playerNext: 'player-next',
@@ -64,7 +65,6 @@ export const TESTIDS = {
 export const PENDING_TESTIDS = {
   playerBar: 'player-bar',
   playerPlayPause: 'player-play-pause',
-  playerSeek: 'player-seek',
   playerVolume: 'player-volume',
 } as const;
 
@@ -472,6 +472,31 @@ const MBID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0
 /** True for a canonical 8-4-4-4-12 hex MBID string. */
 export function isMbid(value: unknown): value is string {
   return typeof value === 'string' && MBID_RE.test(value);
+}
+
+type CatalogueLibraryRow = Record<string, unknown> & { id: string };
+
+function isCatalogueLibraryRow(value: unknown): value is CatalogueLibraryRow {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const id = (value as Record<string, unknown>).id;
+  return typeof id === 'string' && id.trim().length > 0;
+}
+
+/** The catalogue routes serve a bare array. Keep staging evidence strict and redact row values. */
+export function catalogueLibraryRows(body: unknown, sharedPublished: boolean): CatalogueLibraryRow[] {
+  if (!Array.isArray(body) || !body.every(isCatalogueLibraryRow)) {
+    throw new Error('Library must return a bare array of rows with string IDs (body withheld).');
+  }
+  if (!sharedPublished && body.length !== 0) {
+    throw new Error('Fresh Library must be empty before shared publication (rows withheld).');
+  }
+  if (sharedPublished && !body.some((row) => ['release_mbid', 'title', 'release', 'artist'].every((key) => {
+    const text = row[key];
+    return typeof text === 'string' && text.trim().length > 0;
+  }))) {
+    throw new Error('Published Library must contain a mirror-enriched row (rows withheld).');
+  }
+  return body;
 }
 
 /**

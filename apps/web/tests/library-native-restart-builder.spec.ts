@@ -112,6 +112,71 @@ test('removing the current queue row clears the restart outcome and availability
 	await expect(restartButton(page)).toBeDisabled();
 });
 
+test('the restart button cannot seek a source retired during the position read', async ({ page }) => {
+	await openLibrary(page);
+	await restartCoral(page);
+	const selectPine = queueRow(page, 'rb-pine').getByRole('button', { name: 'Select Pine Morning' });
+	await selectPine.evaluate((button) => { button.id = 'restart-test-select-pine'; });
+	await audio(page).evaluate((el) => {
+		let armed = false, reads = 0;
+		document.querySelector('[data-testid="library-restart"]')!.addEventListener('click', () => { armed = true; }, { capture: true, once: true });
+		document.body.dataset.restartWrites = '0';
+		Object.defineProperty(el, 'currentTime', {
+			get() {
+				if (armed && ++reads === 2) document.getElementById('restart-test-select-pine')?.click();
+				return 30;
+			},
+			set: () => { document.body.dataset.restartWrites = '1'; },
+			configurable: true
+		});
+	});
+	await signalMedia(page);
+	await expect(page.getByTestId('now-playing')).toContainText('Coral Night');
+	await restartButton(page).click();
+	await expect(page.getByTestId('now-playing')).toContainText('Pine Morning');
+	await expect(page.locator('body')).toHaveAttribute('data-restart-writes', '0');
+	await expect(restartStatus(page)).toHaveText('');
+});
+
+for (const gesture of ['jump', 'restart'] as const) {
+	for (const change of ['source replacement', 'detachment'] as const) {
+		test(`${gesture} refuses ${change} hidden by the audio instance accessors`, async ({ page }) => {
+			await openLibrary(page);
+			await selectRow(page, 'rb-coral', 'Coral Night');
+			await mockMedia(page, 30);
+			await signalMedia(page);
+			const button = gesture === 'restart' ? restartButton(page) : page.getByRole('button', { name: 'Forward 10 seconds' });
+			await expect(button).toBeEnabled();
+			const result = await button.evaluate((control: HTMLButtonElement, { change, gesture }) => {
+				const el = document.querySelector<HTMLAudioElement>('[data-testid="audio-player"]')!;
+				const source = el.getAttribute('src');
+				const writes: number[] = [];
+				let reads = 0, changed = false;
+				// Restart reads position for availability first; both gestures then read it to seek.
+				const seekRead = gesture === 'restart' ? 2 : 1;
+				Object.defineProperties(el, {
+					currentTime: { get: () => { reads += 1; return 30; }, set: (value: number) => writes.push(value) },
+					isConnected: { get: () => true },
+					getAttribute: { value: (name: string) => {
+						if (name !== 'src') return Element.prototype.getAttribute.call(el, name);
+						if (!changed && reads >= seekRead) {
+							changed = true;
+							if (change === 'detachment') el.remove();
+							else el.setAttribute('src', '/test-audio/replacement');
+						}
+						return source;
+					} }
+				});
+				control.click();
+				return { changed, writes };
+			}, { change, gesture });
+			expect(result).toEqual({ changed: true, writes: [] });
+			await expect(restartStatus(page)).toHaveText('');
+			await expect(page.getByTestId('player-seek-feedback')).toHaveText('');
+		});
+	}
+}
+
 test('a new same-source share navigation applies after restarting', async ({ page }) => {
 	await openLibrary(page);
 	await restartCoral(page);
@@ -180,7 +245,7 @@ for (const outcome of ['Restarted', 'Already at the start of', 'Could not restar
 			Array.from(el.childNodes).find((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) !== previous,
 			previousText
 		)).toBe(true);
-		await expect(page.locator('main [data-testid="library-restart-status"][aria-live="polite"]')).toHaveCount(1);
+		await expect(page.locator('section[aria-label="Player"] [data-testid="library-restart-status"][aria-live="polite"]')).toHaveCount(1);
 		await previousText.dispose();
 	});
 }

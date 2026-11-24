@@ -11,7 +11,9 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::media::ciphertext_size;
+use crate::digest_context::context_hash;
+use crate::digest_enrollment::OriginManifest;
+use crate::media::{ciphertext_size, FileKey, Header, KeyMode, Profile, VerifiedHeader};
 
 /// Public context from trusted state, not from the envelope being checked.
 pub struct EnvelopeContext {
@@ -144,6 +146,58 @@ pub fn unwrap_scheme2(
     );
     let mut key = Zeroizing::new([0; 32]);
     key.copy_from_slice(&plaintext);
+    Ok(key)
+}
+
+/// Internal failures at the inactive enrollment boundary; not a public oracle.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnrolledEnvelopeError {
+    /// Record or sealer context disagreed before any decrypt attempt.
+    Mismatch,
+    Envelope(EnvelopeError),
+    Header,
+}
+
+/// Verify an exact retained envelope against sealer-origin evidence without
+/// returning the unwrapped key. The expected bytes, root purpose/version and
+/// context must come from independently authenticated, current custody, not
+/// from the record being checked. This verifies neither that custody nor any
+/// locator, upload receipt, reservation or publication eligibility.
+pub fn verify_enrolled_scheme2(
+    root: &[u8; 32],
+    expected: &EnvelopeContext,
+    trusted_record: &[u8; 230],
+    record: &[u8],
+    manifest: &OriginManifest,
+) -> Result<(), EnrolledEnvelopeError> {
+    enrolled_scheme2_key(root, expected, trusted_record, record, manifest).map(drop)
+}
+
+/// Internal readback handoff. Use the checked key for this manifest only.
+pub(crate) fn enrolled_scheme2_key(
+    root: &[u8; 32],
+    expected: &EnvelopeContext,
+    trusted_record: &[u8; 230],
+    record: &[u8],
+    manifest: &OriginManifest,
+) -> Result<FileKey, EnrolledEnvelopeError> {
+    let [_, environment, library, object, generation, provider] = expected.identities;
+    let identities = [environment, library, object, generation, provider];
+    let geometry = manifest.geometry();
+    if record != trusted_record.as_slice()
+        || expected.plaintext_len != geometry.plaintext_len()
+        || &expected.header != manifest.header_bytes()
+        || context_hash(&identities, geometry, &expected.header).as_ref()
+            != Some(manifest.context())
+    {
+        return Err(EnrolledEnvelopeError::Mismatch);
+    }
+    let unwrapped =
+        unwrap_scheme2(root, expected, record).map_err(EnrolledEnvelopeError::Envelope)?;
+    let key = FileKey::from_bytes(*unwrapped);
+    let header = Header::from_bytes(manifest.header_bytes());
+    VerifiedHeader::verify(&Profile::nntune(), KeyMode::Random, &key, &header)
+        .map_err(|_| EnrolledEnvelopeError::Header)?;
     Ok(key)
 }
 

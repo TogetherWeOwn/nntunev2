@@ -2,7 +2,7 @@ name: deploy-production
 
 # Production promotion for the web frontend (apps/web only).
 #
-# Cutover only. Never runs on push, PR, release, or another workflow.
+# Manual only; never runs on push, PR, release, or another workflow.
 # Disabled by default: the preflight job refuses unless the repo variable
 # PRODUCTION_DEPLOY_ENABLED is exactly "true". The production hostname is
 # decided at launch; until then the workflow builds against the placeholder
@@ -57,7 +57,7 @@ on:
         type: string
         default: ""
       mode:
-        description: "Promote the app, or initialize its unbound maintenance rollback target once"
+        description: "Seed unexposed maintenance (app promotion is disabled)"
         type: choice
         options: [promote, bootstrap-maintenance]
         default: promote
@@ -97,9 +97,12 @@ jobs:
         id: target
         env:
           INPUT_SHA: ${{ inputs.sha }}
+          DEPLOY_MODE: ${{ inputs.mode }}
           PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
           PRODUCTION_DOMAIN: ${{ vars.PRODUCTION_DOMAIN }}
           UNPROTECTED_ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+          UNPROTECTED_WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          UNPROTECTED_ROUTE_PROOF: ${{ vars.PRODUCTION_BOOTSTRAP_ROUTE_PROOF }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF" != refs/heads/main ] || [ -n "$UNPROTECTED_ACCEPTED_SHA" ]; then
@@ -120,11 +123,16 @@ jobs:
             exit 1
           fi
           case "$domain" in
-            *\ *|*/*|*:*) echo "::error::PRODUCTION_DOMAIN must be a bare hostname (no scheme, path, port or spaces)"; exit 1;;
+            *[!a-zA-Z0-9.-]*) echo '::error::PRODUCTION_DOMAIN must be a bare hostname'; exit 1;;
           esac
+          [ "$DEPLOY_MODE" = bootstrap-maintenance ] ||
+            { echo '::error::Application promotion is disabled; only bootstrap-maintenance is supported'; exit 1; }
+          [ "$INPUT_SHA" = "${GITHUB_SHA:-}" ] ||
+            { echo '::error::Bootstrap SHA must match the dispatched main commit'; exit 1; }
+          [ -z "${UNPROTECTED_WORKER_ID:-}${UNPROTECTED_ROUTE_PROOF:-}" ] ||
+            { echo '::error::Worker ID and route proof must exist only in the production Environment'; exit 1; }
           echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
           echo "domain=$domain" >> "$GITHUB_OUTPUT"
-          echo "Promotion target: $INPUT_SHA -> $domain (lane enabled)"
 
   staging-evidence:
     name: staging-evidence
@@ -148,8 +156,15 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          # Check inheritance from outside production without passing secret values to this runner.
+          UNPROTECTED_CF_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' }}
+          UNPROTECTED_ROLLBACK_CONFIG: ${{ inputs.mode == 'promote' && (secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '') }}
         run: |
           set -euo pipefail
+          [ "${UNPROTECTED_CF_CONFIG:-}" = false ] ||
+            { echo '::error::Cloudflare credentials must exist only in the production Environment'; exit 1; }
+          [ "${UNPROTECTED_ROLLBACK_CONFIG:-}" = false ] ||
+            { echo '::error::Rollback custody and intent key must exist only in the production Environment'; exit 1; }
           python3 - <<'PY'
           import json, os, sys, urllib.request
 
@@ -230,6 +245,7 @@ jobs:
 
   deploy-production:
     name: deploy-production
+    if: inputs.mode == 'promote'
     needs: [preflight, staging-evidence]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -297,39 +313,24 @@ jobs:
         # out the dispatch tip, while this job checked out the validated
         # promotion SHA above.
         run: node ci/check-production-secrets-shape.mjs
-      - name: Require production-only Cloudflare credentials
-        env:
+      - name: Require verified private maintenance before upload
+        env: &rollback-env
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
-            echo "::error::Production-only Cloudflare credentials must be configured in the production Environment"
-            exit 1
-          fi
-          echo "production credentials present (names only)"
-      - name: Initialize the first-release maintenance rollback target
-        if: inputs.mode == 'bootstrap-maintenance'
-        id: bootstrap
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
-          WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
-        run: node ci/production-maintenance/seed.mjs
-      # One-time production seed precondition (see docs/ops.md). The shared
-      # gradual-promote action records its rollback target from the latest
-      # production deployment and refuses unless that deployment is a single
-      # version at 100%. Check that here, before uploading, so the first
-      # promotion fails with seed instructions instead of orphaning an
-      # uploaded version inside the action.
+          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          ROLLBACK_CUSTODY: ${{ secrets.PRODUCTION_ROLLBACK_CUSTODY }}
+          INTENT_KEY: ${{ secrets.PRODUCTION_ROLLBACK_INTENT_KEY }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          DOMAIN: ${{ needs.preflight.outputs.domain }}
+        run: node ci/production-maintenance/final-smoke-rollback.mjs check-seed
+      # Check the same name-based Wrangler read used by the shared action,
+      # after the authenticated immutable Worker and maintenance checks.
       - name: Require one-time production seed deployment
         working-directory: apps/web
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
           WORKER_NAME: ${{ env.PRODUCTION_WORKER_NAME }}
-          SEED_VERSION: ${{ steps.bootstrap.outputs.version }}
-          DEPLOY_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           npx wrangler deployments list --env production --name "$WORKER_NAME" --json \
@@ -337,8 +338,8 @@ jobs:
               let raw = "";
               process.stdin.on("data", (c) => { raw += c; });
               process.stdin.on("end", () => {
-                const seed = "Require one production version at 100%. For an unprovisioned Worker, " +
-                  "use the guarded bootstrap-maintenance mode. See docs/ops.md production seed precondition.";
+                const seed = "Require one production version at 100%. If unseeded, keep promotion off. " +
+                  "See docs/ops.md production seed precondition.";
                 let parsed;
                 try {
                   parsed = JSON.parse(raw);
@@ -363,11 +364,7 @@ jobs:
                   console.error("::error::Latest production deployment is not a single-version 100% deployment. " + seed);
                   process.exit(1);
                 }
-                if (process.env.DEPLOY_MODE === "bootstrap-maintenance" && id !== process.env.SEED_VERSION) {
-                  console.error("::error::Production is not serving the version just seeded; reconcile before promoting");
-                  process.exit(1);
-                }
-                console.log("production seed ok: rollback target " + id);
+                console.log("production seed ok");
               });
             '
       # Uploading a version does not mutate routes, custom domains or cron
@@ -384,6 +381,16 @@ jobs:
           set -euo pipefail
           npx wrangler versions upload --env production \
             --tag "${DEPLOY_SHA:?}-${GITHUB_RUN_ID:?}-${GITHUB_RUN_ATTEMPT:?}"
+      - name: Record protected rollback intent before shifting traffic
+        env: *rollback-env
+        run: node ci/production-maintenance/final-smoke-rollback.mjs record
+      - name: Preserve sealed rollback intent before shifting traffic
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-rollback-intent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-rollback-intent.sealed
+          if-no-files-found: error
+          retention-days: 30
       # Gradual promotion lives in the shared central composite action
       # (pinned below): 5% -> 50% -> 100% with per-stage health gates pinned
       # to the new version, and automatic rollback to the recorded
@@ -399,20 +406,26 @@ jobs:
           domain: ${{ needs.preflight.outputs.domain }}
           api-token: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           account-id: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+      - name: Pin the final deployment before final smoke
+        id: final-allocation
+        # Keep this guard and the restore in this job's production lock.
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          ROLLBACK_CUSTODY: ${{ secrets.PRODUCTION_ROLLBACK_CUSTODY }}
+          INTENT_KEY: ${{ secrets.PRODUCTION_ROLLBACK_INTENT_KEY }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          DOMAIN: ${{ needs.preflight.outputs.domain }}
+          PROMOTED_VERSION: ${{ steps.gradual.outputs.promoted-version-id }}
+          PREV_VERSION: ${{ steps.gradual.outputs.rollback-version-id }}
+        run: node ci/production-maintenance/final-smoke-rollback.mjs pin-final
       - name: Verify production serves the promoted build
+        id: final-smoke
         if: inputs.mode == 'promote'
-        # Post-promotion verification: after the gradual promotion reaches
-        # 100%, probe the public-route set against the production origin and
-        # prove the serving build is the promoted SHA (GET /api/build). Same
-        # retry contract as the stage gates (6 attempts, 10s sleeps, fail
-        # closed). No automatic restore here: a failed verification leaves
-        # the promoted candidate live at 100% and prints the recorded
-        # restoration target; the operator restores it with a wrangler
-        # rollback to that version id.
         env:
           DOMAIN: ${{ needs.preflight.outputs.domain }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
-          PREV_VERSION: ${{ steps.gradual.outputs.rollback-version-id }}
         run: |
           set -euo pipefail
           for i in 1 2 3 4 5 6; do
@@ -425,8 +438,12 @@ jobs:
               sleep 10
             fi
           done
-          echo "::error::post-promotion smoke failed; promoted candidate remains live at 100%; recorded restoration target ${PREV_VERSION:-unknown} - restore it with a wrangler rollback to that version id"
+          echo '::error::Post-promotion smoke failed'
           exit 1
+      - name: Restore recorded maintenance after failed final smoke
+        if: failure() && !cancelled() && steps.final-allocation.outcome == 'success' && steps.final-smoke.outcome == 'failure'
+        env: *rollback-env
+        run: node ci/production-maintenance/final-smoke-rollback.mjs restore
       - name: Record successful production promotion
         if: inputs.mode == 'promote'
         # Success-only and after the identity-aware smoke above. Write inline
@@ -465,6 +482,45 @@ jobs:
           path: ${{ runner.temp }}/promotion.json
           if-no-files-found: error
           retention-days: 30
+
+  bootstrap-maintenance:
+    name: bootstrap-maintenance
+    if: inputs.mode == 'bootstrap-maintenance'
+    needs: [preflight, staging-evidence]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    concurrency:
+      group: production-worker-mutation
+      cancel-in-progress: false
+    environment: production
+    steps:
+      - name: Require the exact Release Manager-accepted SHA
+        env:
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+        run: |
+          set -euo pipefail
+          # A partial rerun can reuse successful preflight and staging admission.
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 && -n "$ACCEPTED_SHA" && "$DEPLOY_SHA" == "$ACCEPTED_SHA" ]] ||
+            { echo '::error::Use a fresh dispatch whose SHA matches PRODUCTION_ACCEPTED_SHA in the production Environment'; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Seed only the pinned, empty maintenance Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          ROUTE_PROOF: ${{ vars.PRODUCTION_BOOTSTRAP_ROUTE_PROOF }}
+          DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+        run: node ci/production-maintenance/seed.mjs
 
   release:
     name: release

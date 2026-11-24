@@ -64,9 +64,32 @@ while IFS=$'\t' read -r target name; do
   psql_run -d "nntune_${target}_ci" < "$root/migrations/$name"
 done < "$tmp/migrations"
 
+fixtures="$root/workers/api/tests/fixtures"
+# Commit multi-session fixtures only in a throwaway clone; the meter test uses the original.
+psql_run -d nntune_ci -c 'CREATE DATABASE nntune_playlist_ci TEMPLATE nntune_app_ci'
+psql_run -d nntune_playlist_ci \
+  -v corpus="$(<"$fixtures/legacy-playlists-v1.json")" \
+  -v playlist_schema="$(<"$fixtures/private_playlist_schema.sql")" \
+  -v playlist_crud="$(<"$fixtures/private_playlist_crud.sql")" \
+  < "$fixtures/private_playlist_rehearsal.sql"
+
+# Both rehearsals roll back the unregistered locator schema and fixture rows.
+locator_schema="$(<"$fixtures/storage_s3_locator_schema.sql")"
+locator_fixture="$fixtures/storage_s3_locator_upgrade.sql"
+echo 'test (populated upgrade): storage_s3_locator_upgrade.sql'
+psql_run -d nntune_app_ci -v locator_schema="$locator_schema" -v replay=false < "$locator_fixture"
+echo 'test (after replay): storage_s3_locator_upgrade.sql'
+psql_run -d nntune_app_ci -v locator_schema="$locator_schema" -v replay=true < "$locator_fixture"
+
 port="$(docker_clean port "$id" 5432/tcp)"
 [[ "$port" =~ ^127\.0\.0\.1:([0-9]+)$ ]]
 port="${BASH_REMATCH[1]}"
+playlist_test=(--locked --manifest-path "$root/workers/api/Cargo.toml" --features postgres-tests --lib
+  handlers::tests::private_playlist_postgres::postgres_store_rehearsal)
+NNTUNE_TEST_PRIVATE_PLAYLIST_PORT="$port" \
+NNTUNE_TEST_PRIVATE_PLAYLIST_MARKER="$(psql_run -d nntune_playlist_ci -Atc 'SELECT token FROM private_playlist_rehearsal.marker')" \
+  cargo test "${playlist_test[@]}" -- --exact --ignored | tee "$tmp/playlist-test.log"
+grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$tmp/playlist-test.log"
 NNTUNE_TEST_APP_DATABASE_URL="postgresql://postgres:ci-throwaway@127.0.0.1:$port/nntune_app_ci" \
 NNTUNE_TEST_MIRROR_DATABASE_URL="postgresql://postgres:ci-throwaway@127.0.0.1:$port/nntune_mirror_ci" \
   cargo test --locked --manifest-path "$root/workers/api/Cargo.toml" --features postgres-tests --test meter_meta_store_postgres

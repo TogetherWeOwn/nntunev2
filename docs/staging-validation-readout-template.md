@@ -44,8 +44,10 @@ synthetic sample data only and must never be cited as a real run.
 - **Production facts presented as staging facts** (or the reverse):
   extrapolated production cost or load must be labelled an estimate with
   its formula, never "measured".
-- **Real content identifiers:** real NZB names, release names, or library
-  contents. The synthetic flow uses checked-in synthetic fixtures only.
+- **Private content identifiers and NZB data:** production library contents,
+  private release names and filenames, and NZB names, bytes, message IDs,
+  subjects and segment lists. Staging uses [approved audio fixtures](fixture-audio-licences.md)
+  with a tracked manifest and licensed audio bytes stored outside Git.
 
 If any of the above is found in a draft readout, the readout is withdrawn,
 redacted, and re-reviewed before any verdict is recorded.
@@ -114,11 +116,8 @@ VERDICT: GO | NO-GO | KILL — <one sentence naming the deciding evidence IDs> (
   the threshold, and `INCONCLUSIVE` otherwise.
 - `GO` requires every must-pass row `PASS`, every kill rule
   `NOT TRIGGERED`, and QA sign-off on the evidence index.
-- In real-NZB mode the RAR set can feed no completable ingest until RAR
-  read lands, so rows 4–6 land `INCONCLUSIVE` on named skips (evidence =
-  the journey gate's allow-listed skip receipt) rather than `PASS` — the
-  readout is `NO-GO` on those rows by design, not a product failure; the
-  parked legs un-park under TWO-1174.
+- Record named must-pass skips as `INCONCLUSIVE`. A skip permitted by
+  the journey gate still leaves [M1 coverage](m1-exit-traceability.md) open.
 - `GO` in a staging readout means "eligible for the launch decision". It is
   not production activation and authorizes no production action by itself.
 
@@ -137,25 +136,25 @@ VERDICT: GO | NO-GO | KILL — <one sentence naming the deciding evidence IDs> (
 
 ### 1. Synthetic staging flow
 
-Synthetic accounts and checked-in synthetic fixtures only. Mark each row
+Use synthetic accounts and approved staging audio fixtures. Mark each row
 `PASS`, `FAIL`, or `INCONCLUSIVE` (includes `SKIPPED` evidence) with its
 evidence IDs. Rows marked † are must-pass for a `GO`.
 
 | # | Step (user-observable) | Expected outcome | Result | Evidence |
 |---|---|---|---|---|
-| 1† | Access gate | Unauthenticated request to staging is challenged; no bypass used during the run | | |
-| 2† | Signup | Synthetic user can create an account and sign in | | |
-| 3† | BYOP configuration | Synthetic provider credentials are accepted, stored encrypted, and never appear in logs or UI after entry | | |
-| 4† | Ingest | Staged secret-held real NZB (no checked-in fixtures since TWO-1169): no completable ingest exists until RAR read lands (RAR-only subset fails permanent at transcode), so ingest-completion, reload and decoded-audio legs skip by name (TWO-1174); live ingest verdict is the intake-level refusal leg (402/429 on a capped account) | | |
-| 5† | Play / seek | The ingested item plays and seeks in the web player | | |
-| 6 | Metering | Playback/ingest usage is metered against the synthetic account | | |
-| 7† | Rollback pointer | Last-good staging SHA and its push-triggered `deploy.yml` run with `staging-web` conclusion `success` (not `skipped`) are recorded before promotion; Workers rollback evidence is recorded separately or listed as not verified | | |
+| 1† | Access gate | Access denies anonymous requests to each of `/api/health`, `/api/ready` and the app shell `/`. Record evidence for all three paths with Access enforced throughout the run | | |
+| 2† | Invited signup | A synthetic listener redeems an owner-issued invite and reaches the plan picker | | |
+| 3† | Test-mode subscription | The synthetic listener subscribes in test mode and has active playback entitlement | | |
+| 4† | Admin publication | An admin publishes a matched curated FLAC release and entitled accounts see it in the shared catalogue | | |
+| 5† | Play / seek | The shared track plays in the web player and continues after a player seek | | |
+| 6 | Metering and limits | Optional evidence for the separate metering milestone, including accrual, cap and lapse behavior | | |
+| 7† | Rollback | Record the last-good push deploy before promotion, then verify the rerun, restored SHA, health and separate Worker outcomes | | |
 
-Row 7 records the rollback *pointer* before promotion; it does not prove a
-rollback was executed. A readout that claims a rollback was executed or
-tested must cite separate evidence for that claim: the rollback rerun's
-`staging-web` conclusion `success` (not `skipped`) plus staging health, per
-the staging promotion checklist in `docs/ops.md`.
+Row 6 tracks separate milestone evidence. Record the serving web and API
+SHAs at the start and end of the post-deploy journey. Match both identities
+to the promotion SHA and cite the passing run. For row 7, cite both the
+last-good push deploy and the successful rollback rerun. Follow the
+[staging promotion checklist](ops.md#staging-promotion-checklist).
 
 ### 2. User-visible failures
 
@@ -215,7 +214,7 @@ Copy the standing non-goals and add run-specific ones. A readout that omits
 this section is incomplete.
 
 - No production activation, production migration, or production data.
-- No real users, real provider accounts, or real content.
+- Use synthetic accounts and [approved staged audio](fixture-audio-licences.md).
 - No demand, pricing, or willingness-to-pay conclusion (see "must never
   contain").
 - No load, soak, or multi-region claim beyond the single synthetic journey
@@ -251,8 +250,8 @@ VERDICT: <GO | NO-GO | KILL> — <one sentence naming the deciding evidence IDs>
 ## Filled synthetic example (trial fill — not a real run)
 
 > **SYNTHETIC EXAMPLE.** Every SHA, link, date, price, and result below is
-> invented sample data showing the format only. It is not evidence that any
-> staging run happened, and it must never be cited as one. Links use
+> invented sample data showing the historical format, including retired BYOP rows.
+> It must never be cited as evidence of a staging run. Links use
 > `example.invalid` placeholders so they cannot be mistaken for real runs.
 
 # Staging validation readout — 2026-01-15 (synthetic example)

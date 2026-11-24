@@ -3,6 +3,7 @@ import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const workflow = readFileSync(new URL('../../.github/workflows/deploy.yml', import.meta.url), 'utf8');
 // Scoped to the staging-api job only: the staging-mb and staging-ingest lanes
@@ -102,7 +103,15 @@ function assertWiring(source: string) {
   expect(source.indexOf('- name: Verify actual staging migration schema (read-only)'))
     .toBeLessThan(source.indexOf('- name: Deploy api to staging'));
   expect(step('Generate staging wrangler.toml', source)).toContain("        if: steps.config.outputs.configured == 'true'\n");
-  expect(source).not.toContain('continue-on-error:');
+  // Only the two post-deploy evidence steps may fail without failing the job.
+  const softFailures = source.split(/^      - /m).flatMap((section) =>
+    Array.from(section.matchAll(/^[ \t]*continue-on-error[ \t]*:[^\n]*$/gm),
+      ([setting]) => [section.split('\n', 1)[0], setting]),
+  );
+  expect(softFailures).toEqual([
+    ['name: Read staging off and drained state after API deploy', '        continue-on-error: true'],
+    ['name: Record Subsonic staging readback outcome', '        continue-on-error: true'],
+  ]);
   expect(step('Hyperdrive cache-disabled gate', source)).toContain('working-directory: workers/api');
   expect(step('Generate staging wrangler.toml', source)).toContain('working-directory: workers/api');
   expect(step('Hyperdrive cache-disabled gate', source)).not.toContain('--allow-skip');
@@ -119,6 +128,7 @@ test.describe('API deployment outcome (offline workflow contract)', () => {
       ['steps.schema.outcome', 'steps.schema.conclusion'],
       [" && steps.schema.outcome == 'success'", ''],
       ['id: schema\n', 'id: renamed\n'],
+      ['id: schema\n', 'id: schema\n        continue-on-error: true\n'],
       ['steps.deployment.outputs.deployed', 'steps.config.outputs.configured'],
       ['id: deploy\n', 'id: renamed\n'],
     ]) {
@@ -283,4 +293,27 @@ prod = "dummy-mb-mirror"
     expect(result.toml).toBeUndefined();
     expect(result.summary).not.toContain('mirror:');
   });
+});
+
+test('only an unconfigured API omits the empty-history smoke from discovery', () => {
+  const e2eDir = fileURLToPath(new URL('../', import.meta.url));
+  const cli = join(e2eDir, 'node_modules', '@playwright', 'test', 'cli.js');
+  const smoke = 'empty-history privacy-route smoke: export, reject, clear, export again';
+  for (const outcome of ['unconfigured', 'deployed', undefined]) {
+    // Discovery only: clean environment, no browser, credentials or staging calls.
+    const result = spawnSync(process.execPath, [
+      cli, 'test', '--list', '--config=playwright.config.ts',
+      'tests/listen-history-privacy.spec.ts', 'tests/zz-build-identity-final.spec.ts',
+    ], {
+      cwd: e2eDir,
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: outcome === undefined ? {} : { API_DEPLOY_OUTCOME: outcome },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(result.stdout).toContain('deployed build still matches the promotion SHA at journey end');
+    expect(result.stdout.includes(smoke), `registration with API outcome ${outcome ?? '(unset)'}`)
+      .toBe(outcome !== 'unconfigured');
+  }
 });
