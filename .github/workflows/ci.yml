@@ -2204,6 +2204,19 @@ jobs:
           cargo build --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown --features cleanup-dispatch-wasm-test,s3-completion-wasm-test --target-dir "$RUNNER_TEMP/ingest-wasm-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/ingest-wasm-js" "$RUNNER_TEMP/ingest-wasm-target/wasm32-unknown-unknown/debug/nntune_ingest.wasm"
           INGEST_WASM_JS="$RUNNER_TEMP/ingest-wasm-js/nntune_ingest.js" node --test workers/ingest/tests/cleanup_dispatch_wasm.cjs workers/ingest/tests/fixtures/s3_completion_wasm.cjs
+      - name: Exercise encrypted upload and version-pinned playback against disposable HTTPS
+        run: |
+          set -euo pipefail
+          # The stream and ingest lockfiles pin different wasm-bindgen versions.
+          bindgen=wasm-bindgen-0.2.129-x86_64-unknown-linux-musl
+          curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.129/$bindgen.tar.gz" -o "$RUNNER_TEMP/$bindgen.tar.gz"
+          echo "82d12bb940e2d4e72e0d5605387fc1b8ca179044e012b620f0ce4e7440e8320e  $RUNNER_TEMP/$bindgen.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$bindgen.tar.gz" -C "$RUNNER_TEMP"
+          cargo build --locked -p nntune-stream --target wasm32-unknown-unknown --features s3-transport-fixture --target-dir "$RUNNER_TEMP/stream-wasm-target"
+          "$RUNNER_TEMP/$bindgen/wasm-bindgen" --target nodejs --out-dir "$RUNNER_TEMP/s3-fixture" "$RUNNER_TEMP/stream-wasm-target/wasm32-unknown-unknown/debug/nntune_stream.wasm"
+          export NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/s3-fixture/loopback.crt" S3_FIXTURE_KEY="$RUNNER_TEMP/s3-fixture/loopback.key"
+          openssl req -x509 -newkey rsa:2048 -noenc -days 1 -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1 -keyout "$S3_FIXTURE_KEY" -out "$NODE_EXTRA_CA_CERTS"
+          INGEST_WASM_JS="$RUNNER_TEMP/ingest-wasm-js/nntune_ingest.js" S3_FIXTURE_WASM="$RUNNER_TEMP/s3-fixture/nntune_stream.js" node --test workers/ingest/tests/fixtures/s3_upload_playback_https.cjs
       # Reuse the existing locked Wrangler dependency. No root prepare or
       # dependency install scripts are needed for upload-only dry-runs.
       - name: Install locked upload CLI without lifecycle scripts

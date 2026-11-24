@@ -1,48 +1,20 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { createHash, createHmac } = require('node:crypto');
 const { test } = require('node:test');
 const { s3_completion_test: complete } = require('./ingest_wasm.cjs');
+const {
+  authorization, bucket, checksum, completionReceipt, initiatedId, initiatedQuery,
+  initiationHeaders, initiationReceipt, mapId, mediaKey, sha256, sidecarKey, uploadQuery,
+} = require('./s3_fixture_protocol.cjs');
 
 const version = 'fixture-version+/=?';
 const versionQuery = 'versionId=fixture-version%2B%2F%3D%3F';
 const wireHeaderLength = 48;
 const ciphertextLength = wireHeaderLength + 1 + 16;
 const headHeaders = { 'x-amz-version-id': version, 'content-length': String(ciphertextLength) };
-const bucket = 'fixture-bucket';
-const mediaKey = 'media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd';
-const mapId = 'efefefefefef40ef80efefefefefefef';
-const sidecarKey = `media-digests/${mediaKey.slice('media/'.length)}/${mapId}/00000000`;
 const transportFailure = 'Unconfirmed(None)';
 const rejectedWith = (expected) => (error) => error === expected;
-const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
-const checksum = (bytes) => createHash('sha256').update(bytes).digest('base64');
-const mac = (key, text) => createHmac('sha256', key).update(text).digest();
-const uploadQuery = 'uploadId=fixture%2B%2F%3D%3F';
-const initiatedId = 'new+/=?';
-const initiatedQuery = 'uploadId=new%2B%2F%3D%3F';
-const initiationHeaders = { 'x-amz-checksum-algorithm': 'SHA256', 'x-amz-checksum-type': 'COMPOSITE' };
-
-function initiationReceipt(observedBucket = bucket, observedKey = mediaKey, uploadId = initiatedId) {
-  return '<?xml version="1.0" encoding="UTF-8"?>'
-    + '<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
-    + `<Bucket>${observedBucket}</Bucket><Key>${observedKey}</Key><UploadId>${uploadId}</UploadId>`
-    + '</InitiateMultipartUploadResult>';
-}
-
-function completionReceipt(manifest, etag = 'fixture-etag') {
-  const prefix = '<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
-    + `<Part><PartNumber>1</PartNumber><ETag>&quot;${etag}&quot;</ETag><ChecksumSHA256>`;
-  const suffix = '</ChecksumSHA256></Part></CompleteMultipartUpload>';
-  assert.ok(manifest.startsWith(prefix));
-  assert.ok(manifest.endsWith(suffix));
-  const part = manifest.slice(prefix.length, -suffix.length);
-  assert.match(part, /^[A-Za-z0-9+/]{43}=$/);
-  const composite = checksum(Buffer.from(part, 'base64'));
-  return `<CompleteMultipartUploadResult><Bucket>${bucket}</Bucket><Key>${mediaKey}</Key>`
-    + `<ChecksumSHA256>${composite}-1</ChecksumSHA256></CompleteMultipartUploadResult>`;
-}
 
 async function verifySignedRequest(request, method, query, operationHeaders, objectKey = mediaKey) {
   const path = `/${bucket}/${objectKey}`;
@@ -66,14 +38,8 @@ async function verifySignedRequest(request, method, query, operationHeaders, obj
   for (const name of names.filter((value) => value !== 'host')) {
     assert.equal(request.headers.get(name), fields[name]);
   }
-  const signedHeaders = names.join(';');
-  const canonical = [method, path, query, ...names.map((name) => `${name}:${fields[name]}`), '', signedHeaders, payload].join('\n');
-  const day = date.slice(0, 8);
-  const scope = `${day}/fixture-region/s3/aws4_request`;
-  const key = [day, 'fixture-region', 's3', 'aws4_request'].reduce(mac, 'AWS4fixture-secret');
-  const signature = mac(key, `AWS4-HMAC-SHA256\n${date}\n${scope}\n${sha256(canonical)}`).toString('hex');
   assert.equal(request.headers.get('authorization'),
-    `AWS4-HMAC-SHA256 Credential=FIXTUREACCESS/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`);
+    authorization(method, path, query, fields, 'FIXTUREACCESS', 'fixture-secret', 'fixture-region'));
   return body;
 }
 
