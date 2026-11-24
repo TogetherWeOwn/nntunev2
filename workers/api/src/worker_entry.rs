@@ -10511,14 +10511,14 @@ mod tests {
             assert_eq!(config.paid_billing_enabled(), flag == Some("1"));
             assert_eq!(config.billing_purchase_configured(), expected);
         }
-        let loader = include_str!("worker_entry.rs")
+        let config_body = include_str!("worker_entry.rs")
             .split_once("fn config_from_env(")
             .unwrap()
             .1
             .split_once("fn apply_paid_billing_config(")
             .unwrap()
             .0;
-        assert!(loader.contains("apply_paid_billing_config("));
+        assert!(config_body.contains("apply_paid_billing_config("));
     }
 
     #[test]

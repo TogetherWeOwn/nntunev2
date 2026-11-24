@@ -7788,9 +7788,10 @@ where
         Err(_) => return invalid_request(),
     };
     let checkout = event.event_type == "checkout.session.completed";
-    let subscription_update =
-        ctx.cfg.paid_billing_enabled() && event.event_type == "customer.subscription.updated";
-    if ctx.cfg.paid_billing_enabled() && (event.livemode || !(checkout || subscription_update)) {
+    let renewal = event.event_type == "invoice.paid";
+    let bound_update = ctx.cfg.paid_billing_enabled()
+        && (renewal || event.event_type == "customer.subscription.updated");
+    if ctx.cfg.paid_billing_enabled() && (event.livemode || !(checkout || bound_update)) {
         return json_response(200, serde_json::json!({"ok": true}));
     }
     // A claimant can die before reconciliation. Reprocess approved
@@ -7800,7 +7801,7 @@ where
         Ok(first) => first,
         Err(_) => return internal(),
     };
-    if !(checkout || subscription_update) {
+    if !(checkout || bound_update) {
         // Other verified events never reach Stripe or the billing writer.
         return json_response(200, serde_json::json!({"ok": true}));
     }
@@ -7818,7 +7819,20 @@ where
     let Some(target) = event.object.get("id").and_then(serde_json::Value::as_str) else {
         return invalid_request();
     };
-    let result = if subscription_update {
+    let result = if bound_update {
+        let subscription = if renewal {
+            // Acacia invoices carry the subscription ID at the top level.
+            let Some(subscription) = event
+                .object
+                .get("subscription")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return json_response(200, serde_json::json!({"ok": true}));
+            };
+            subscription
+        } else {
+            target
+        };
         let Some(customer) = event
             .object
             .get("customer")
@@ -7826,7 +7840,7 @@ where
         else {
             return invalid_request();
         };
-        reconcile_bound_subscription_update(ctx, customer, target).await
+        reconcile_bound_subscription_update(ctx, customer, subscription).await
     } else {
         reconcile_checkout_session(ctx, target).await
     };
@@ -9207,6 +9221,7 @@ mod tests {
         remove_billing_row_after_read: std::cell::Cell<bool>,
         reconcile_outcome_attempts: std::cell::Cell<usize>,
         paid_reconcile_attempts: std::cell::Cell<usize>,
+        skip_checkout_mark: std::cell::Cell<bool>,
         // Displaced rows are retained without changing the per-user projection.
         billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
@@ -11934,6 +11949,9 @@ mod tests {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
+            if self.skip_checkout_mark.get() {
+                return Ok(false);
+            }
             // Mirrors the production conditional mark: only an unresolved
             // row takes the mark. A missing or already-retired row (lost
             // mark, or superseded while its Stripe create was still in
@@ -13051,9 +13069,24 @@ mod tests {
         );
         assert_eq!(buy(&h).status, 404);
         h.config.private_listening = None;
+        h.store.plans.borrow_mut().push(PlanRow {
+            id: PLAN_PLUS.into(),
+            price_cents: 800,
+            stream_hours_month: 100,
+            max_concurrent_streams: 1,
+        });
+        let plus_selectable = |h: &Harness| {
+            let reply = billing_get(h, "/v1/plans", Some(cookie.clone()));
+            serde_json::from_str::<serde_json::Value>(&reply.body).unwrap()["plans"][0]
+                ["selectable"]
+                .as_bool()
+                .unwrap()
+        };
         h.config.stripe_portal_configuration = None;
         assert_eq!(buy(&h).status, 503);
+        assert!(!plus_selectable(&h));
         h.config.stripe_portal_configuration = Some("bpc_fixture".into());
+        assert!(plus_selectable(&h));
         assert_eq!(checkout(&h, "plus", None, Some(ORIGIN)).status, 401);
         assert_eq!(
             checkout(
@@ -13109,6 +13142,75 @@ mod tests {
         drop(ops);
         assert_eq!(buy(&h).status, 409);
         assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+    }
+
+    #[test]
+    fn verified_paid_invoice_refreshes_renewal_without_the_hourly_sweep() {
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_checkout");
+        let start = BILLING_NOW + BILLING_PERIOD;
+        let end = start + BILLING_PERIOD;
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .get_mut("sub_test_1")
+            .unwrap()
+            .current_period_end = Some(end);
+        h.stripe.invoices.borrow_mut().insert(
+            "in_renewal".into(),
+            test_invoice(
+                "in_renewal",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                start,
+                end,
+                start + 60,
+            ),
+        );
+        let body = |subscription| {
+            serde_json::json!({
+            "id":"evt_renewal", "type":"invoice.paid", "livemode":false,
+            "data":{"object":{"id":"in_renewal","customer":"cus_test_1","subscription":subscription}}
+        }).to_string().into_bytes()
+        };
+        let standalone = body(None::<&str>);
+        webhook_ok(&h.call_webhook(&standalone, Some(sign(&standalone, BILLING_NOW))));
+        assert_eq!(live_for(&h, "u1").unwrap().paid_through_unix, Some(start));
+        let event = body(Some("sub_test_1"));
+        for _ in 0..2 {
+            webhook_ok(&h.call_webhook(&event, Some(sign(&event, BILLING_NOW))));
+        }
+        assert_eq!(live_for(&h, "u1").unwrap().paid_through_unix, Some(end));
+        assert_eq!(h.store.invoice_history.borrow().len(), 2);
+    }
+
+    #[test]
+    fn hourly_paid_checkout_requires_a_persisted_success_mark() {
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_checkout");
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut("op_test_1")
+            .unwrap()
+            .state = "needs_reconcile".into();
+        let run = || block_on(reconcile_paid_targets(&h.ctx(), vec![("u1", None)]));
+        h.store.skip_checkout_mark.set(true);
+        assert!(run().is_err());
+        h.store.skip_checkout_mark.set(false);
+        run().unwrap();
+        assert_eq!(
+            h.store.checkout_ops.borrow()["op_test_1"].state,
+            "succeeded"
+        );
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
     }
 
     #[test]

@@ -17,7 +17,8 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    Prove signature refusal at that ingress and check that missing portal
    configuration prevents a new checkout.
 3. Complete test checkout and deliver `checkout.session.completed`. Verify
-   confirmed coverage and the caller's portal
+   a signed replay preserves the subscription and invoice history. Confirm
+   paid coverage and the caller's portal
    through `/v1/me/subscription` and the billing page. Reuse the
    [play, seek and meter assertions](../e2e/tests/ingest-play-meter.spec.ts)
    with the rank 74 encrypted fixture and callable browser relay. Assert 206
@@ -26,8 +27,9 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    verify the usage total stays flat.
 4. Cross the cap and verify a new play returns `plan_limit_exceeded`. Check
    continuation before and refusal after its lease deadline. Below cap, observe
-   an hourly renewal, schedule cancellation in the portal, then deliver and
-   replay the bound `customer.subscription.updated` event. Confirm its flag
+   renewal through the bound `invoice.paid` event while hourly reconcile is
+   idle. Schedule portal cancellation, then deliver and replay the bound
+   `customer.subscription.updated` event. Confirm its flag
    reaches the API before the paid cutoff and invoice history is stable. Verify `reason: lapsed` at the cutoff. Run applicable
    [same-build privacy cases](m1-exit-traceability.md).
 5. Repeat the private listening refusal control in the personal configuration
@@ -37,5 +39,6 @@ and [M1 traceability matrix](m1-exit-traceability.md).
 
 Before testing checkout, confirm hourly trigger `0 * * * *` fires on the same
 build. It rotates through up to 16 due targets. Keep test timing within one
-batch. Resolve ambiguous old payments before reusing their flight. Remove
+batch. Inspect the Worker error log for unresolved targets even if Cloudflare
+shows the invocation completed. Resolve ambiguous old payments before reusing their flight. Remove
 `PAID_INVITE_BILLING` to close paid dispatch.
