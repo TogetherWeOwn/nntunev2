@@ -330,23 +330,30 @@ export function serializeQueue(state: QueueState): string {
  * duplicate would break both.
  */
 export function restoreQueue(raw: string | null, catalogue: readonly Track[]): QueueState {
-	const fallback = createQueue(catalogue);
-	if (raw === null) return fallback;
+	return (raw === null ? null : decodeQueue(raw, catalogue, { allowInvalidCurrentId: true })) ?? createQueue(catalogue);
+}
+
+/** Decode an arrangement without defaulting to the caller's whole catalogue. */
+export function decodeQueue(
+	raw: string, catalogue: readonly Track[], { allowInvalidCurrentId = false } = {}
+): QueueState | null {
 	try {
 		const parsed = JSON.parse(raw) as { orderIds?: unknown; currentId?: unknown };
-		if (!Array.isArray(parsed.orderIds) || !parsed.orderIds.every((id) => typeof id === 'string')) {
-			return fallback;
+		if (!Array.isArray(parsed.orderIds) || parsed.orderIds.length > catalogue.length ||
+			!parsed.orderIds.every((id) => typeof id === 'string') ||
+			(!allowInvalidCurrentId && parsed.currentId != null && typeof parsed.currentId !== 'string')) {
+			return null;
 		}
 		if (parsed.orderIds.length === 0) return { tracks: [], currentIndex: -1 };
-		if (new Set(parsed.orderIds).size !== parsed.orderIds.length) return fallback;
+		if (new Set(parsed.orderIds).size !== parsed.orderIds.length) return null;
 		const byId = new Map(catalogue.map((t) => [t.id, t]));
 		const tracks = parsed.orderIds.map((id) => byId.get(id as string));
-		if (tracks.some((t) => t === undefined)) return fallback;
+		if (tracks.some((t) => t === undefined)) return null;
 		const list = tracks as Track[];
 		const currentIndex =
 			typeof parsed.currentId === 'string' ? list.findIndex((t) => t.id === parsed.currentId) : -1;
 		return { tracks: list, currentIndex: currentIndex >= 0 ? currentIndex : 0 };
 	} catch {
-		return fallback;
+		return null;
 	}
 }

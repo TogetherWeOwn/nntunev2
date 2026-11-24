@@ -32,6 +32,8 @@ export interface LibrarySnapshot {
 
 /** Base key for snapshots; the tab's authentication context scopes each value. */
 export const LIBRARY_SNAPSHOT_KEY = 'nntune.library.snapshot.v1';
+/** The queue stores only arranged IDs and the current ID under the verified tab context. */
+export const LIBRARY_QUEUE_KEY = 'nntune.library.queue.v1';
 export const LIBRARY_AUTH_CONTEXT_KEY = 'nntune.library.auth-context.v1';
 /** Session-only provenance: JSON [auth-context, verified session binding]. */
 export const LIBRARY_SESSION_BINDING_KEY = 'nntune.library.session-binding.v1';
@@ -278,8 +280,14 @@ export function saveSnapshot(
 	return snapshot;
 }
 
+export function clearLibraryQueue(storage: SnapshotStorage | null): void {
+	const key = libraryContextKey(storage, LIBRARY_QUEUE_KEY);
+	try { if (key) storage?.removeItem(key); } catch { /* Storage may be unavailable. */ }
+}
+
 export function clearSnapshot(storage: SnapshotStorage | null): void {
 	if (!storage) return;
+	clearLibraryQueue(storage);
 	try {
 		const key = snapshotKey(storage);
 		// Revoke access to the snapshot before attempting to remove its bytes.

@@ -1,6 +1,7 @@
 <script module lang="ts">
 	import { createContext, onMount, tick, untrack, type Snippet } from 'svelte';
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
+	import { subscribeAuthFenceInvalidation } from '../auth-fence.js';
 	import { browserStorage, LIBRARY_AUTH_TRANSITION_KEY } from '../library/cache.js';
 	import { LIBRARY_ACCESS_REFUSED_EVENT } from '../library/refresh.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
@@ -50,6 +51,7 @@
 		const offAuth = subscribeLocalAuthTransition(player.purgeAtAuthBoundary);
 		const listeners = new AbortController();
 		const options = { signal: listeners.signal };
+		subscribeAuthFenceInvalidation(queue.clearSavedLibraryQueue, listeners.signal);
 		window.addEventListener('storage', ({ key }) => key === LIBRARY_AUTH_TRANSITION_KEY && player.purgeAtAuthBoundary(), options);
 		window.addEventListener(LIBRARY_ACCESS_REFUSED_EVENT, player.purgeAtAuthBoundary, options);
 		return () => { offAuth(); listeners.abort(); };

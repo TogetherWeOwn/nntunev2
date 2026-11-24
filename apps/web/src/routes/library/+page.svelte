@@ -408,9 +408,17 @@
 			}
 			if (!isCurrent()) return;
 			if (authoritative && !authBoundary && !state.libraryUnavailable) {
-				player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
+				if (sessionBinding && queueController.setLibraryBinding(sessionBinding)) {
+					player.purgeAtAuthBoundary();
+					queueController.setLibraryBinding(sessionBinding);
+				}
+				const reconciled = player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
 					if (queueChanged) queueConfirmGeneration += 1;
 				});
+				if (reconciled && isCurrent() && receipt.deviceScope && receipt.storageScope) {
+					const restored = queueController.restoreLibraryQueue(receipt.storageScope, () => state.items.map(queuedTrackFor));
+					if (restored && isCurrent()) replaceQueue(restored);
+				}
 			}
 			// Queue publication can reenter the route and revoke this receipt.
 			if (!isCurrent()) return;
@@ -757,7 +765,7 @@
 	/**
 	 * Metadata-only direct selection: apply the validated selectTrack
 	 * transition on the ORIGINAL queue coordinate, preserving every track id
-	 * and arrangement. Never transport, audio, storage, provider or stream
+	 * and arrangement. Never transport, audio, provider or stream
 	 * language. Reselecting the current row is an observable no-op that keeps
 	 * the existing feedback; stale or invalid coordinates select nothing.
 	 */
