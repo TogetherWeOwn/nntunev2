@@ -256,4 +256,115 @@ async fn resolves_only_the_committed_scoped_publication() {
         &resolved.read.playback_snapshot().unwrap(),
         &resolved.context
     ));
+    use crate::{
+        private_listening::PrivateListening, private_playback::PrivatePlayback, session::*,
+    };
+
+    let keys = SessionKeys::single(&[24; 32]);
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cookie = issue_session(keys.primary, MEMBER, issued_at, 120).unwrap();
+    let claims = verify_session_dual(&keys, &cookie, issued_at).unwrap();
+    let invite: i64 = writer
+        .query_one(
+            include_str!("../tests/fixtures/private_playback_session.sql"),
+            &[
+                &claims.session_id,
+                &MEMBER,
+                &(claims.created_at as i64),
+                &(claims.expires_at as i64),
+            ],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    writer
+        .batch_execute(include_str!(
+            "../tests/fixtures/private_playback_transitions.sql"
+        ))
+        .await
+        .unwrap();
+    let policy = PrivateListening::parse(&serde_json::json!({
+        "owner_user_id": "catalogue-owner", "invite_ids": [invite], "expires_at": claims.expires_at
+    }).to_string()).unwrap();
+    let service = |policy| PrivatePlayback {
+        policy,
+        grant_secret: SECRET,
+    };
+    let issue = async |db: &mut Client, admission, cookie, pins: &PublicationPins<'_>| {
+        service(admission)
+            .issue(
+                db,
+                &keys,
+                cookie,
+                track,
+                &signed.lease.session_id,
+                pins,
+                SystemTime::now,
+            )
+            .await
+            .unwrap()
+    };
+    let configured = Some(&policy);
+    let session = Some(cookie.as_str());
+    for (admission, cookie, requested) in [
+        (configured, None, &original_pins),
+        (configured, session, &pins),
+        (configured, session, &original_pins),
+    ] {
+        assert!(issue(&mut reader, admission, cookie, requested)
+            .await
+            .is_none());
+    }
+    let duration = include_str!("../tests/fixtures/private_playback_duration.sql");
+    writer.query_one(duration, &[&track]).await.unwrap();
+    assert!(issue(&mut reader, None, session, &original_pins)
+        .await
+        .is_none());
+    let issued = issue(&mut reader, configured, session, &original_pins)
+        .await
+        .unwrap();
+    let token = &issued.relay().grant.token;
+    let resolve = async |db: &mut Client, admission, token: &str, time| {
+        service(admission)
+            .resolve(db, &issued, token, &root, || time)
+            .await
+            .unwrap()
+    };
+    let current = SystemTime::now();
+    let expiry = UNIX_EPOCH + Duration::from_secs(issued.relay().grant.exp_unix);
+    let failed_transaction = reader.batch_execute("BEGIN; SELECT 1 / 0");
+    assert!(failed_transaction.await.is_err());
+    for (admission, bearer, time) in [
+        (configured, "invalid-bearer", current),
+        (None, token.as_str(), current),
+        (configured, token.as_str(), expiry),
+    ] {
+        assert!(resolve(&mut reader, admission, bearer, time)
+            .await
+            .is_none());
+    }
+    reader.batch_execute("ROLLBACK").await.unwrap();
+    let resolved = resolve(&mut reader, configured, token, current)
+        .await
+        .unwrap();
+    assert_eq!(resolved.read.pins().media_version, original_pins.version);
+    for state in ["invite", "session", "rotation", "revision", "race", "lease"] {
+        writer
+            .query_one(
+                "SELECT pg_temp.private_playback_state($1, $2, $3)",
+                &[&state, &track, &original_pins.accepted_seq],
+            )
+            .await
+            .unwrap();
+        if matches!(state, "invite" | "session" | "rotation" | "race") {
+            assert!(issue(&mut reader, configured, session, &original_pins)
+                .await
+                .is_none());
+        }
+        let playback = resolve(&mut reader, configured, token, current).await;
+        assert_eq!(playback.is_some(), state == "race", "{state}");
+    }
 }

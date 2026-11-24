@@ -2194,7 +2194,7 @@ pub(crate) const SESSION_BINDING_HEADER: &str = "x-nntune-session-binding";
 
 // A precondition, not a credential. Cookie refresh preserves the verified
 // session ID; a replacement session gets a new random ID, even for the same user.
-fn session_binding(claims: &SessionClaims) -> String {
+pub(crate) fn session_binding(claims: &SessionClaims) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hash = Sha256::new();
@@ -2855,7 +2855,7 @@ where
 /// (HTTP 503 `service_unavailable`) so the caller fails the request closed.
 /// The success path is byte-identical: the same `N` entropy bytes through
 /// the same `b64url_encode`.
-fn random_id<const N: usize>() -> Result<String, crate::random::CryptoError> {
+pub(crate) fn random_id<const N: usize>() -> Result<String, crate::random::CryptoError> {
     let bytes = crate::random::secure_random_bytes::<N>()?;
     Ok(b64url_encode(&bytes))
 }
@@ -6706,7 +6706,7 @@ where
 // heartbeat path is `Deny` in the scope map and never enters the gate.
 
 // Distinguishes private leases from paid leases when the cohort is disabled.
-const PRIVATE_PLAY_PREFIX: &str = "private_";
+pub(crate) const PRIVATE_PLAY_PREFIX: &str = "private_";
 
 fn is_private_play_id(play_id: &str) -> bool {
     // Standard play ids encode 16 bytes in 22 unpadded base64url characters.

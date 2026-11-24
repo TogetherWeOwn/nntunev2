@@ -11,7 +11,7 @@ pub struct PrivateListening {
 }
 
 impl PrivateListening {
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
+    pub fn parse(raw: &str) -> Option<Self> {
         if raw.len() > 1024 {
             return None;
         }
