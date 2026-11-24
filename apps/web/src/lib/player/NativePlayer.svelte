@@ -120,7 +120,7 @@
 			}}>
 			{playbackStatus === 'error' || playbackStatus === 'retrying' ? 'Retry playback' : canPause ? 'Pause' : 'Play'}
 		</button>
-		<NativeAudio {mediaRevision} {streamUrl} {attachNativeAudio} />
+		{#if streamUrl}<NativeAudio {mediaRevision} {streamUrl} {attachNativeAudio} />{/if}
 		<button
 			class="nt-button nt-library-restart"
 			type="button"

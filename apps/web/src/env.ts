@@ -19,6 +19,11 @@ import { defineEnvVars } from '@sveltejs/kit/env';
  * vars ship to the browser.
  */
 export const variables = defineEnvVars({
+	PUBLIC_BROWSER_PLAYBACK: {
+		public: true,
+		description: 'Use the same-origin browser playback relay when set to 1.',
+		schema: (value) => value === '1'
+	},
 	PUBLIC_API_BASE_URL: {
 		public: true,
 		description: 'Base URL of the workers/api worker. Empty means same-origin.',

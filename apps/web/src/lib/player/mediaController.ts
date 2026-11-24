@@ -3,7 +3,7 @@ import { emptySeek, readAbsoluteSeek, SEEK_READBACK_TOLERANCE, writeAbsoluteSeek
 import { displayTitle, shortTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { createPlayerSleepTimer } from './playerSleepTimer.js';
-import { currentTrack, naturalEndPolicy, nextTrack, previousTrack, selectTrack, type QueueState, type RepeatMode } from './queue.js';
+import { currentTrack, naturalEndPolicy, nextTrack, previousTrack, selectTrack, type QueueState, type RepeatMode, type Track } from './queue.js';
 import type { createQueueController, QueuedPlaySource } from './queueController.js';
 import { describeJump, jumpMedia, RELATIVE_JUMP_SECONDS, type JumpDirection } from './relativeJump.js';
 import { createNativeSound } from './nativeSound.js';
@@ -22,7 +22,9 @@ type QueueAuthority = Pick<ReturnType<typeof createQueueController>,
 	'snapshot' | 'subscribe' | 'revision' | 'revoke' | 'isCurrent' | 'purging' | 'sourceForQueuedPlay'>;
 
 export type MediaSelection = {
-	commit: (queue: QueueState) => boolean;
+	commit: (queue: QueueState, grant?: QueuedPlaySource) => boolean;
+	streamFor?: (track: Track | null) => string;
+	prepare?: (trackId: string, isCurrent: () => boolean, publish: (source: QueuedPlaySource) => void) => Promise<boolean>;
 	flush: () => Promise<void>;
 	browseCopy: { invalidate: () => void };
 	announce: (message: string, replay?: boolean) => void;
@@ -75,6 +77,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let destroyed = false;
 	let positionIntent = 0;
 	const pendingShare = createPendingShareSeek();
+	let deferredShare: { intent: number; target: ShareTarget; current: () => boolean } | undefined;
 	let applyingShare: { revision: number; retry: boolean } | undefined;
 	let positioning = false;
 	let nextPosition: (() => void) | undefined;
@@ -83,7 +86,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (audio && !audio.paused) audio.pause();
 	}
 
-	const selectedSource = () => resolveStreamUrl(currentTrack(queue.snapshot));
+	const streamFor = selection?.streamFor ?? resolveStreamUrl;
+	const selectedSource = () => streamFor(currentTrack(queue.snapshot));
+	const clearShareSeek = () => { deferredShare = undefined; pendingShare.clear(); };
 	const sleepTimer = createPlayerSleepTimer(pauseCurrent, () => !destroyed && !queue.purging && !!selectedSource());
 
 	function settlePlay(outcome?: PlayOutcome): void {
@@ -174,6 +179,12 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function playCurrent(): Promise<void> {
+		if (selection?.prepare && !selectedSource()) {
+			const base = queue.snapshot;
+			const id = currentTrack(base)?.id;
+			const evidence = id && queue.sourceForQueuedPlay(id);
+			if (evidence) return playSelected(base, base.currentIndex, evidence);
+		}
 		return startCurrent(false);
 	}
 
@@ -203,6 +214,10 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!target) return;
 		// Bulk-added slots carry metadata only. Keep the decoder unless Library can resolve the destination.
 		const source = queue.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || undefined);
+		if (selection.prepare && source) {
+			void preparePlay(target, source, (grant) => { selection.commit(next, grant); });
+			return;
+		}
 		if (!source?.streamUrl || !source.isCurrent()) return;
 		// Match Library Next's paused handoff, hydrating only the destination slot.
 		if (target.streamUrl === source.streamUrl) selection.commit(next);
@@ -256,7 +271,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	function purgeAtAuthBoundary(clearHint: () => void): void {
 		sleepTimer.cancel();
-		pendingShare.clear();
+		clearShareSeek();
 		positionIntent += 1;
 		nextPosition = undefined;
 		const audio = retire();
@@ -268,16 +283,39 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		}
 	}
 
-	async function playSelected(
-		base: QueueState, index: number, source: QueuedPlaySource, suffix = ''
+	async function preparePlay(target: Track, evidence: QueuedPlaySource, publish: (source: QueuedPlaySource) => void) {
+		if (!selection?.prepare || destroyed || queue.purging || !evidence.isCurrent()) return;
+		const revision = queue.revision, intent = playIntent, position = positionIntent, version = attachmentVersion;
+		const current = () => !destroyed && queue.isCurrent(revision) && evidence.isCurrent() &&
+			intent === playIntent && position === positionIntent && version === attachmentVersion;
+		if (!(await selection.prepare(target.id, current, publish)) && current()) {
+			selection.announce('Could not start playback.', true);
+		}
+	}
+
+	async function playSelected(base: QueueState, index: number, source: QueuedPlaySource, suffix = ''): Promise<void> {
+		const target = base.tracks[index];
+		if (!selection?.prepare || !target) return playPrepared(base, index, source, suffix);
+		let playback: Promise<void> | undefined;
+		await preparePlay(target, source, (grant) => { playback = playPrepared(base, index, grant, suffix, true); });
+		await playback;
+	}
+
+	async function playPrepared(
+		base: QueueState, index: number, source: QueuedPlaySource, suffix: string, granted = false
 	): Promise<void> {
 		if (!selection || queue.purging) return;
 		const target = base.tracks[index];
 		if (!target || destroyed || !source.isCurrent()) return;
 		const { streamUrl } = source;
 		const tracks = [...base.tracks];
-		tracks[index] = { ...target, streamUrl };
-		if (!selection.commit(selectTrack({ ...base, tracks }, index)) || !source.isCurrent() || destroyed) return;
+		if (!granted) tracks[index] = { ...target, streamUrl };
+		if (!selection.commit(selectTrack({ ...base, tracks }, index), granted ? source : undefined) || !source.isCurrent() || destroyed) return;
+		const share = deferredShare;
+		if (share && share.target.trackId === target.id) {
+			deferredShare = undefined;
+			captureShareSeek(share.intent, share.target, share.current);
+		}
 
 		const receipt = queue.revoke();
 		let attachment = current;
@@ -380,8 +418,11 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!routeIsCurrent() || destroyed || intent !== positionIntent) return;
 		const track = currentTrack(queue.snapshot);
 		if (track?.id !== trackId) return;
-		const streamUrl = resolveStreamUrl(track);
-		if (!streamUrl) return;
+		const streamUrl = streamFor(track);
+		if (!streamUrl) {
+			if (selection?.prepare) deferredShare = { intent, target: { trackId, seconds }, current: routeIsCurrent };
+			return;
+		}
 		// Before the keyed node mounts, only the first upcoming attachment can inherit this seek.
 		const version = current ? attachmentVersion : attachmentVersion + 1;
 		const revision = pendingShare.set({ trackId, streamUrl, seconds }, (audio) => ({
@@ -390,7 +431,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 					attachmentVersion !== version || positionIntent !== intent) return false;
 				// Other queue edits need not revoke a seek for this track and source.
 				const selected = currentTrack(queue.snapshot);
-				return selected?.id === trackId && resolveStreamUrl(selected) === streamUrl;
+				return selected?.id === trackId && streamFor(selected) === streamUrl;
 			})
 		}));
 		clearJumpFeedback();
@@ -406,7 +447,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	function jump(direction: JumpDirection, seconds = RELATIVE_JUMP_SECONDS, system?: SystemSeekGuard): void {
 		if (destroyed || queue.purging || system?.active() === false) return;
 		const track = currentTrack(queue.snapshot);
-		const source = resolveStreamUrl(track);
+		const source = streamFor(track);
 		const attachment = current;
 		const audio = attachment?.audio;
 		const version = attachmentVersion;
@@ -460,7 +501,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const sameSelection = () => currentTrack(queue.snapshot)?.id === track?.id;
 		if (!track || !matches(() => positionIntent === before && sameSelection() && system?.active() !== false)) return;
 		const intent = ++positionIntent;
-		pendingShare.supersede(track.id, resolveStreamUrl(track));
+		pendingShare.supersede(track.id, streamFor(track));
 		const isCurrent = (guard = system?.active) => matches(() => positionIntent === intent && sameSelection() && guard?.() !== false);
 		runPosition(() => {
 			if (!isCurrent()) return;
@@ -472,7 +513,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	function restart(): void {
 		const track = currentTrack(queue.snapshot);
-		const source = resolveStreamUrl(track);
+		const source = streamFor(track);
 		if (destroyed || !track || !source) return;
 		const title = track.title?.trim() ? track.title : track.id;
 		const attachment = current;
@@ -558,7 +599,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		});
 		if (result.action !== 'play' || !ownsOrigin()) return;
 		const track = currentTrack(result.queue);
-		const streamUrl = resolveStreamUrl(track);
+		if (selection.prepare && track) {
+			const evidence = queue.sourceForQueuedPlay(track.id);
+			if (evidence) await playSelected(result.queue, result.queue.currentIndex, {
+				...evidence, isCurrent: () => evidence.isCurrent() && ownsOrigin()
+			});
+			return;
+		}
+		const streamUrl = streamFor(track);
 		const replacing = currentTrack(base)?.id !== track?.id || source !== streamUrl;
 		const playbackRate = speed.observe({ audio, matches: ownsOrigin });
 		if (!ownsOrigin()) return;
@@ -608,6 +656,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		absoluteSeek: { subscribe: absoluteSeek.subscribe }, seek,
 		playbackStatus: { subscribe: playbackStatus.subscribe },
 		playCurrent, pauseCurrent, retryCurrent: () => startCurrent(true),
+		next: () => navigateQueue(nextTrack),
 		speed,
 		clearSeekFeedback,
 		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
@@ -624,9 +673,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		playSelected,
 		restart,
 		jump,
-		beginShareInput() { pendingShare.clear(); return ++positionIntent; },
+		beginShareInput() { clearShareSeek(); return ++positionIntent; },
 		captureShareSeek,
-		clearShareSeek: pendingShare.clear,
+		clearShareSeek,
 		get pendingShareSeek() { return pendingShare.current; },
 		get attachmentVersion() { return attachmentVersion; },
 		get audio() { return current?.audio; },
@@ -772,7 +821,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		destroy() {
 			destroyed = true;
 			sleepTimer.cancel();
-			pendingShare.clear();
+			clearShareSeek();
 			reset();
 		}
 	};

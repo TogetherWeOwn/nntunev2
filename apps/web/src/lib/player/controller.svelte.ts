@@ -1,9 +1,11 @@
 import { displayArtist, displayTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '../shell/mini-player.js';
+import { validSessionBinding, type AccountSession } from '../auth-fence.js';
+import { createBrowserPlaybackSession, type PrivateListeningState } from './browserPlaybackSession.js';
 import { createMediaController, type MediaSelection } from './mediaController.js';
-import { clearQueue, currentTrack, moveTrack, removeTrack, type QueueState } from './queue.js';
-import { createQueueController, type LibrarySources, type QueueCommitKind } from './queueController.js';
+import { clearQueue, currentTrack, moveTrack, removeTrack, type QueueState, type Track } from './queue.js';
+import { createQueueController, type LibrarySources, type QueueCommitKind, type QueuedPlaySource } from './queueController.js';
 
 type PlayerEffects = Pick<MediaSelection, 'flush'>;
 
@@ -13,9 +15,33 @@ type LibraryCommit = {
 };
 
 export function createPlayerController(
-	initial: QueueState, effects: PlayerEffects, matchesNative?: (audio: HTMLAudioElement, source: string) => boolean
+	initial: QueueState, effects: PlayerEffects, matchesNative?: (audio: HTMLAudioElement, source: string) => boolean,
+	browserPlayback?: { fetchFn?: typeof fetch }
 ) {
 	const queue = createQueueController(initial);
+	let browserSession: ReturnType<typeof createBrowserPlaybackSession> | undefined;
+	let privateListening = $state.raw<PrivateListeningState>();
+	let activeGrant = $state.raw<{ trackId: string; source: QueuedPlaySource }>();
+	function streamFor(track: Track | null): string {
+		if (!browserPlayback) return resolveStreamUrl(track);
+		return activeGrant && activeGrant.trackId === track?.id && activeGrant.source.isCurrent() ? activeGrant.source.streamUrl : '';
+	}
+	function retireBrowserPlayback() {
+		const previous = browserSession;
+		browserSession = undefined;
+		previous?.owner.signal.removeEventListener('abort', purgeAtAuthBoundary);
+		previous?.dispose();
+		activeGrant = privateListening = undefined;
+	}
+	function bindBrowserPlayback(owner: AccountSession, binding: string) {
+		if (!browserPlayback || destroyed || !owner.isCurrent() || !validSessionBinding(binding) ||
+			(browserSession?.owner === owner && browserSession.binding === binding)) return;
+		if (browserSession) purgeAtAuthBoundary();
+		if (!owner.isCurrent()) return;
+		browserSession = createBrowserPlaybackSession(owner, binding, (state) => { privateListening = state; }, browserPlayback.fetchFn);
+		privateListening = { enabled: false, pending: false, feedback: '' };
+		owner.signal.addEventListener('abort', purgeAtAuthBoundary, { once: true });
+	}
 	let queueAnnouncement = $state.raw<Readonly<{ text: string; version: number }>>({ text: '', version: 0 });
 	let destroyed = false;
 	let accountGeneration = 0;
@@ -34,7 +60,11 @@ export function createPlayerController(
 			if (!destroyed && !queue.purging && generation === browseCopyGeneration) browseCopyFeedback = { status, fallbackUrl };
 		}
 	};
-	const media = createMediaController(queue, { ...effects, browseCopy, commit: replaceQueue, announce: announceQueue }, matchesNative);
+	const media = createMediaController(queue, {
+		...effects, browseCopy, streamFor, announce: announceQueue,
+		commit: (next, source) => commitQueue(next, 'replace', undefined, source),
+		prepare: browserPlayback ? (id, current, publish) => browserSession?.open(id, current, publish) ?? Promise.resolve(false) : undefined
+	}, matchesNative);
 
 	// Keyed messages can announce identical text again without replacing the live region.
 	function announceQueue(text: string, replay = false): void {
@@ -54,6 +84,7 @@ export function createPlayerController(
 	function purgeAtAuthBoundary(): void {
 		if (destroyed || queue.purging) return;
 		accountGeneration += 1;
+		retireBrowserPlayback();
 		// Svelte can deliver nested queue notifications after the purge returns.
 		// Don't accept new queue entries until fresh Library evidence arrives.
 		awaitingLibrary = true;
@@ -68,19 +99,20 @@ export function createPlayerController(
 	function destroy(): void {
 		if (destroyed) return;
 		destroyed = true;
+		retireBrowserPlayback();
 		// Retire queue and copy receipts before media destruction can call native pause.
 		queue.destroy();
 		browseCopy.invalidate();
 		media.destroy();
 	}
 
-	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit): boolean {
-		if ((library && !library.isCurrent()) || destroyed || queue.purging ||
+	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit, grant?: QueuedPlaySource): boolean {
+		if ((library && !library.isCurrent()) || grant?.isCurrent() === false || destroyed || queue.purging ||
 			(!library && awaitingLibrary && next.tracks.length > 0)) return false;
 		const receipt = queue.begin(next, kind, !!library);
 		let version = media.attachmentVersion;
 		// A callback can reset media without publishing a queue write (e.g. auth reset).
-		const isCurrent = () => (!library || library.isCurrent()) &&
+		const isCurrent = () => (!library || library.isCurrent()) && grant?.isCurrent() !== false &&
 			queue.isCurrentOperation(receipt) && media.attachmentVersion === version;
 		if (library && next === queue.snapshot) {
 			queue.publish(next, receipt, library.sources);
@@ -100,8 +132,8 @@ export function createPlayerController(
 			media.clearSeekFeedback();
 			if (!isCurrent()) return false;
 		}
-		const nextSource = resolveStreamUrl(after);
-		if (trackChanged || resolveStreamUrl(before) !== nextSource) {
+		const nextSource = grant?.streamUrl ?? streamFor(after);
+		if (trackChanged || streamFor(before) !== nextSource) {
 			// Sample the live element before retiring its queued volumechange events.
 			media.observeSound();
 			if (!isCurrent()) return false;
@@ -116,6 +148,8 @@ export function createPlayerController(
 		}
 		if (kind === 'replace') announceQueue('');
 		if (!isCurrent()) return false;
+		if (grant && after) activeGrant = { trackId: after.id, source: grant };
+		else if (trackChanged) activeGrant = undefined;
 		queue.publish(next, receipt, library?.sources);
 		if (!isCurrent()) return false;
 		const selected = currentTrack(queue.snapshot);
@@ -182,6 +216,8 @@ export function createPlayerController(
 
 	return {
 		moveQueuedTrack, removeQueuedTrack, clearQueuedTracks,
+		streamFor, bindBrowserPlayback, get privateListening() { return privateListening; },
+		setPrivateListening: (enabled: boolean) => browserSession?.setPrivate(enabled),
 		queue, media, browseCopy, get mediaRevision() { return mediaRevision; },
 		get queueAnnouncement() { return queueAnnouncement; }, announceQueue,
 		commitQueue: (next: QueueState, kind: QueueCommitKind) => commitQueue(next, kind),

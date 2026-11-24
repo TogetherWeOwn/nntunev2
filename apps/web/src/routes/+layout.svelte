@@ -3,7 +3,7 @@
 	import type { Snippet } from 'svelte';
 	import { afterNavigate, goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
-	import { PUBLIC_API_BASE_URL } from '$app/env/public';
+	import { PUBLIC_API_BASE_URL, PUBLIC_BROWSER_PLAYBACK } from '$app/env/public';
 	import favicon from '#lib/assets/favicon.svg';
 	import PaywallModal from '#lib/billing/PaywallModal.svelte';
 	import { onPaywall, type PaywallModel } from '#lib/billing/planLimit.js';
@@ -531,7 +531,7 @@
 	{#if page.route.id === null}
 		{@render appBody()}
 	{:else}
-		<AppPlayer {claimShareEntry} children={appBody} allowDesktopRow={page.route.id !== '/now-playing'}
+		<AppPlayer {claimShareEntry} children={appBody} browserPlayback={PUBLIC_BROWSER_PLAYBACK} allowDesktopRow={page.route.id !== '/now-playing'}
 			signedOut={page.route.id === '/account/billing' && page.data.signedOut === true} />
 	{/if}
 	{#if miniHint && page.route.id !== '/now-playing'}
