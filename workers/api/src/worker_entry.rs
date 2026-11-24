@@ -8253,6 +8253,54 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     let served_method = request.method.clone();
     let served_path = served_display_path(&request.path);
+    use handlers::browser_playback_relay::{private_media, MEDIA_PREFIX};
+    if request.method == "GET" && request.path.starts_with(MEDIA_PREFIX) {
+        if collected != CollectedBody::Complete(Vec::new()) {
+            return render(&handlers::invalid_request(), &[], &trace_id);
+        }
+        let result = private_media(
+            &ctx,
+            &request,
+            headers_map.get("sec-fetch-site").map(String::as_str),
+            headers_map.get("range").map(String::as_str),
+            async |get| {
+                let headers = Headers::new();
+                headers.set("authorization", &get.authorization)?;
+                if let Some(range) = get.range {
+                    headers.set("range", range)?;
+                }
+                let mut init = RequestInit::new();
+                init.with_headers(headers)
+                    .with_redirect(worker::RequestRedirect::Error);
+                let init = worker::web_sys::RequestInit::from(&init);
+                init.set_signal(Some(&req.signal()));
+                let upstream = worker::web_sys::Request::new_with_str_and_init(
+                    &format!("https://nntune-stream{}", get.path),
+                    &init,
+                )
+                .map_err(worker::Error::from)?;
+                let upstream = env
+                    .service("STREAM")?
+                    .fetch_request(Request::from(upstream))
+                    .await?;
+                let mut response = Response::try_from(upstream)?;
+                response
+                    .headers_mut()
+                    .set("cache-control", "private, no-store")?;
+                response
+                    .headers_mut()
+                    .set("x-content-type-options", "nosniff")?;
+                response.headers_mut().delete("set-cookie")?;
+                Ok::<_, worker::Error>(response)
+            },
+        )
+        .await;
+        return match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => render(&handlers::unavailable(), &[], &trace_id),
+            Err(response) => render(&response, &[], &trace_id),
+        };
+    }
     let response = dispatch_collected(collected, request, |collected_request| {
         handle_with_transport_headers(&ctx, collected_request, &headers_map)
     })

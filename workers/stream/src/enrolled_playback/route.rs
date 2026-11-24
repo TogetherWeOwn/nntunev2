@@ -25,6 +25,9 @@ use crate::{
     range::{self, RangeOutcome},
 };
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod worker;
+
 pub struct CatalogueMedia<'a> {
     /// The reference from the member's catalogue, independent of the snapshot.
     pub reference: [u8; 16],

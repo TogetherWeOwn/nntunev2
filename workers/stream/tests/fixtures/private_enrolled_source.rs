@@ -136,7 +136,10 @@ impl PrivateSource for Source {
 
     async fn resolve(&self, grant: &Grant) -> Option<CatalogueMedia<'_>> {
         assert_eq!(grant.user_id, "member");
-        assert_eq!(grant.play_id.as_deref(), Some("private_fixture"));
+        assert_eq!(
+            grant.play_id.as_deref(),
+            Some("private_1234567890abcdefghijkl")
+        );
         assert_eq!(grant.lease_epoch, Some(42));
         assert_eq!(grant.track_id, "track");
         (self.fault != Fault::Denied).then(|| {
