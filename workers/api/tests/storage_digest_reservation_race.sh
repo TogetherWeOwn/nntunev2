@@ -338,4 +338,79 @@ for scenario in 'abort terminal COMMIT aborted - 0 0 aborted' 'abort terminal RO
   printf 'ingest session row fence and cleanup intents passed: %s, %s first, %s; checkpoint revision=%s, state=%s\n' \
     "$action" "$first" "$finish" "$rev" "$terminal"
 done
+
+# Use a single pending intent so a second claim has no unlocked work to take.
+claim_cleanup="PREPARE claim_cleanup(uuid, uuid, text, uuid) AS $(<"$tests_dir/../src/ingest_session_claim_cleanup.sql")"
+ack_cleanup="PREPARE ack_cleanup(uuid, uuid, text, uuid, text, uuid) AS $(<"$tests_dir/../src/ingest_session_ack_cleanup_enqueue.sql")"
+sid="$(psql_run -Atc 'SELECT gen_random_uuid()')"
+[[ "$sid" =~ ^[0-9a-f-]{36}$ ]]
+[[ "$(psql_run -Atc "$reserve" -c "EXECUTE reserve_session($scope, 'race-cleanup-delivery', $fp, '$sid')")" == "$sid" ]]
+claim_query="EXECUTE claim_cleanup($scope, '$sid');"
+intent_predicate="session_id='$sid' AND kind='absolute_expiry'"
+lock_intent="SELECT 1 FROM public.ingest_session_cleanup_intents WHERE $intent_predicate FOR UPDATE;"
+
+wait_for_cleanup_marker() {
+  for _ in {1..100}; do
+    if [[ -e "$1" ]]; then return 0; fi
+    sleep 0.1
+  done
+  printf 'cleanup race did not reach %s\n' "${1##*/}" >&2
+  return 1
+}
+
+race="$dir/cleanup-delivery"
+mkdir -- "$race"
+mkfifo "$race/holder-input" "$race/ack-input"
+exec 3<>"$race/holder-input"
+PGAPPNAME=cleanup_intent_holder psql_run -At <"$race/holder-input" 3>&- >"$race/holder" & holder=$!
+printf "BEGIN; SET LOCAL idle_in_transaction_session_timeout = '30s';\n%s\n\\! touch '%s/claim-locked'\n" "$lock_intent" "$race" >&3
+wait_for_cleanup_marker "$race/claim-locked"
+# A lock error must fail this test instead of counting as an empty result.
+result="$(psql_run -Atc "$claim_cleanup" -c "SET lock_timeout = '2s'" -c "$claim_query")"
+[[ -z "$result" ]] || { printf 'competing claim did not skip the locked intent\n' >&2; exit 1; }
+printf "ROLLBACK;\n\\! touch '%s/claim-unlocked'\n" "$race" >&3
+wait_for_cleanup_marker "$race/claim-unlocked"
+result="$(psql_run -Atc "$claim_cleanup" -c "$claim_query")"
+IFS='|' read -r claimed_session kind claim_id delay <<<"$result"
+[[ "$result" != *$'\n'* && "$claimed_session" == "$sid" && "$kind" == absolute_expiry &&
+   "$claim_id" =~ ^[0-9a-f-]{36}$ && "$delay" =~ ^[0-9]+$ ]] || {
+  printf 'released cleanup intent was not claimable\n' >&2; exit 1;
+}
+printf 'cleanup claim skipped the locked intent and succeeded after release\n'
+
+# Connect both sessions before shortening the committed claim's lifetime.
+exec 4<>"$race/ack-input"
+PGAPPNAME=cleanup_intent_ack psql_run -At <"$race/ack-input" 3>&- 4>&- >"$race/ack" & contender=$!
+printf "%s\n\\! touch '%s/ack-prepared'\n" "$ack_cleanup" "$race" >&4
+wait_for_cleanup_marker "$race/ack-prepared"
+intent_snapshot="$(psql_run -Atc "UPDATE public.ingest_session_cleanup_intents AS intent
+  SET claimed_until=clock_timestamp() + interval '8 seconds'
+  WHERE $intent_predicate AND delivery_claim_id='$claim_id' RETURNING to_jsonb(intent)")"
+[[ -n "$intent_snapshot" ]]
+printf "BEGIN; SET LOCAL idle_in_transaction_session_timeout = '30s';\n%s\n\\! touch '%s/ack-locked'\n" "$lock_intent" "$race" >&3
+wait_for_cleanup_marker "$race/ack-locked"
+printf "BEGIN ISOLATION LEVEL READ COMMITTED;\nEXECUTE ack_cleanup(%s, '%s', 'absolute_expiry', '%s');\nCOMMIT;\n\\q\n" \
+  "$scope" "$sid" "$claim_id" >&4
+exec 4>&-
+blocked=0
+for _ in {1..100}; do
+  if [[ "$(psql_run -Atc "SELECT count(*) FROM pg_stat_activity c JOIN pg_stat_activity h ON h.pid=ANY(pg_blocking_pids(c.pid))
+    WHERE c.application_name='cleanup_intent_ack' AND h.application_name='cleanup_intent_holder' AND c.wait_event='transactionid'")" == 1 ]]; then
+    blocked=1
+    break
+  fi
+  sleep 0.1
+done
+[[ "$blocked" == 1 ]] || { printf 'cleanup acknowledgement did not wait on the intent lock\n' >&2; exit 1; }
+intent_live="SELECT clock_timestamp() < claimed_until FROM public.ingest_session_cleanup_intents WHERE $intent_predicate"
+[[ "$(psql_run -Atc "$intent_live")" == t ]] || { printf 'cleanup claim expired before the acknowledgement waited\n' >&2; exit 1; }
+psql_run -c "SELECT pg_sleep_until(claimed_until) FROM public.ingest_session_cleanup_intents WHERE $intent_predicate" >/dev/null
+[[ "$(psql_run -Atc "$intent_live")" == f ]]
+printf 'ROLLBACK;\n\\q\n' >&3; exec 3>&-
+wait "$holder"; wait "$contender"
+[[ "$(<"$race/holder")" == $'1\n1' && ! -s "$race/ack" &&
+   "$(psql_run -Atc "SELECT to_jsonb(intent) FROM public.ingest_session_cleanup_intents AS intent WHERE $intent_predicate")" == "$intent_snapshot" ]] || {
+  printf 'acknowledgement consumed or changed a claim that expired during the lock wait\n' >&2; exit 1;
+}
+printf 'cleanup acknowledgement refused the claim that expired during the lock wait\n'
 psql_run -c 'DROP TABLE public.ingest_session_cleanup_intents, public.ingest_session_reservations'
