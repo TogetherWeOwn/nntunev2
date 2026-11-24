@@ -8608,7 +8608,25 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     if let Some(response) =
         private_browser_custody::dispatch(&env, ctx.store, &config, &request, &collected).await
     {
-        return response;
+        let response = response?;
+        let status = response.status_code();
+        let level = if status >= 500 {
+            crate::logging::Level::Error
+        } else {
+            crate::logging::Level::Info
+        };
+        // Custody dispatch only matches its two static paths.
+        let _ = emit_record(
+            level,
+            "api.request.served",
+            &trace_id,
+            serde_json::json!({
+                "route": format!("POST {}", request.path), "status_code": status,
+                "error_class": response_error_code(status, ""),
+                "duration_ms": now_millis().saturating_sub(start_ms), "build_sha": build_sha, "release": build_sha,
+            }),
+        );
+        return Ok(response);
     }
     if let Some(result) = relay_media(&ctx, &request, &collected, &headers_map, async |get| {
         let headers = Headers::new();
