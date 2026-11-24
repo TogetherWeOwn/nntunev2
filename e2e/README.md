@@ -173,7 +173,8 @@ test discovery. They verify the verdicts for invite redemption, publication
 and Library identity, playback and seek, queue order and Next, and explicit
 access refusal. A [web browser test](../apps/web/tests/private-music-publication.spec.ts)
 uses intercepted HTTP and the checked-in FLAC to exercise fresh publication,
-selection, playback, seek and revocation in the rendered Library. The short upload inputs are original
+selection, playback, seek and revocation in the rendered Library. The short
+upload inputs are original
 [CC0 FLAC clips](../fixtures/synthetic-flac/admin-upload/manifest.json).
 The self-test hashes two clips and checks their sizes against the manifest.
 The [ingest readback test](../workers/ingest/tests/multipart_readback_inventory.rs)
@@ -230,9 +231,11 @@ The `post-deploy-private-music` job is an explicit staging opt-in in the
 same workflow and concurrency group as the staging deploy. Keep
 the repository variable `PRIVATE_MUSIC_STAGING_JOURNEY` unset until the
 protected upload schema, dedicated versioned S3 path, MusicBrainz mirror
-and serving bindings are qualified. Prepare the `tone-b.flac` companion from
-the original [14-second FLAC fixtures](../fixtures/synthetic-flac/private-staging/manifest.json)
-with a scoped Library admission and retain the version pins separately.
+and serving bindings are qualified. Prepublish the `tone-b.flac` companion
+from the original [14-second FLAC fixtures](../fixtures/synthetic-flac/private-staging/manifest.json)
+and retain the version pins separately. Protected fixture setup admits that
+companion to the exact recipient after invite redemption. The browser waits
+up to 60 seconds for that admission before sending tone A.
 Set the staging Environment secret `PRIVATE_MUSIC_STAGE_FIXTURE` with the
 unredeemed `example.test` recipient `email`, its `inviteCode`, the cohort's
 `expiresAt` in Unix seconds, the `companion` receipt `{ sha256, trackId }`

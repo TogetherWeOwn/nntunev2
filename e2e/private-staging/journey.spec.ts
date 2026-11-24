@@ -120,7 +120,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     }
   });
 
-  const priorIds = await check('invite redemption and Library arrival', async () => {
+  await check('invite redemption and Library arrival', async () => {
     await applyAccountToPage(page, null, ORIGIN);
     await page.goto(`${ORIGIN}${PRIVATE_MUSIC.signup.path}`);
     await waitForHydration(page, 'private-signup');
@@ -146,21 +146,27 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       destination: new URL(page.url()).pathname, inviteFragmentCleared: !new URL(page.url()).hash,
       libraryStatus: library.status,
     });
-    expect(library.ids).toContain(fixture.companion.trackId);
-    return library.ids;
   });
 
   const rows = page.getByTestId(PRIVATE_MUSIC.library.item);
   const rowFor = (id: string) => rows.and(page.locator(`[data-id="${id}"]`));
+  const refresh = page.getByRole('button', { name: PRIVATE_MUSIC.library.refresh, exact: true });
   const fresh = await check('owner upload and fresh publication in invited Library', async () => {
+    // Protected setup can admit the prepublished companion only after redemption.
+    let priorIds: string[] = [];
+    await expect.poll(async () => {
+      const library = await getLibrary();
+      priorIds = library.ids;
+      return library.status === 200 && priorIds.includes(fixture.companion.trackId);
+    }, { timeout: 60_000, intervals: [1_000] }).toBe(true);
+    await refresh.click();
     await expect(rowFor(fixture.companion.trackId)).toBeVisible();
     const receipt = await post(request, PRIVATE_TRIAL_UPLOAD, upload.body, {
       ...access, 'Content-Type': 'audio/flac', Cookie: `${SESSION_COOKIE}=${fixture.ownerSession}`,
     });
     expect(receipt.status).toBe(200);
     const publication = freshTrialPublication(receipt.text, upload.sha256, priorIds);
-    await expect(rowFor(publication.trackId)).toHaveCount(0);
-    await page.getByRole('button', { name: PRIVATE_MUSIC.library.refresh, exact: true }).click();
+    await refresh.click();
     await expect(rowFor(publication.trackId)).toBeVisible();
     return publication;
   });
