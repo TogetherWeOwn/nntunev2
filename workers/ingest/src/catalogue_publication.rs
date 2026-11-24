@@ -10,6 +10,8 @@ use crate::{
     track_writers::{validate_track_row, TrackRow},
 };
 
+pub(crate) const MAX_TRACK_TITLE_BYTES: usize = 4096;
+
 /// Trusted handoff binding an already authorized, verified job to the
 /// matched occurrence and the exact object that backed the match.
 pub struct VerifiedOccurrence<'a> {
@@ -57,7 +59,7 @@ pub async fn stage(
         || !validate_job_id(matched.job_id)
         || !(1..=128).contains(&matched.owner_id.len())
         || matched.owner_id.contains('\0')
-        || track.title.len() > 4096
+        || track.title.len() > MAX_TRACK_TITLE_BYTES
         || validate_track_row(track).is_err()
         || !(1..=512).contains(&result.page_versions.len())
         || result

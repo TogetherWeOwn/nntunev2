@@ -1587,6 +1587,7 @@ fn owned_checkpoint<E>(
     }
 }
 
+pub mod admin_auto_publish;
 pub mod admin_review;
 pub mod catalogue_publication;
 pub mod multipart;
