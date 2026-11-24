@@ -7433,18 +7433,22 @@ where
                 .lines
                 .as_ref()
                 .and_then(|lines| lines.data.last())
-                .map(|line| line.id.clone())
-                .ok_or(())?;
+                .map(|line| line.id.clone());
             pages += 1;
             if pages > 10 {
                 return Err(());
             }
             let page = ctx
                 .stripe
-                .list_invoice_lines(invoice.id.clone(), Some(cursor.clone()), 100)
+                .list_invoice_lines(invoice.id.clone(), cursor.clone(), 100)
                 .await
                 .map_err(|_| ())?;
-            if page.has_more && page.data.last().is_none_or(|line| line.id == cursor) {
+            if page.has_more
+                && page
+                    .data
+                    .last()
+                    .is_none_or(|line| Some(line.id.as_str()) == cursor.as_deref())
+            {
                 return Err(());
             }
             match invoice.lines.as_mut() {
@@ -12107,6 +12111,7 @@ mod tests {
         /// the next page from here, so tests pin the full-read follow-up
         /// instead of trusting the first page.
         line_pages: RefCell<HashMap<String, Vec<crate::stripe::InvoiceLine>>>,
+        scripted_line_pages: RefCell<std::collections::VecDeque<crate::stripe::InvoiceLines>>,
         /// Customer-create log `(user_id, test_clock)` for the seam assert.
         customers_created: RefCell<Vec<(Option<String>, Option<String>)>>,
         /// Checkout sessions minted through `create_checkout_session`.
@@ -12330,6 +12335,9 @@ mod tests {
             Box::pin(async move {
                 if self.fail("list_invoice_lines") {
                     return self.err();
+                }
+                if let Some(page) = self.scripted_line_pages.borrow_mut().pop_front() {
+                    return Ok(page);
                 }
                 let data = self
                     .line_pages
@@ -12769,18 +12777,121 @@ mod tests {
         let paid = live_for(&h, "u1").unwrap();
         assert_eq!(paid.stripe_subscription_id, "sub_test_1");
         assert_eq!(paid.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
-        h.stripe
-            .sessions
+        let attempts = h.store.reconcile_outcome_attempts.get();
+        let refused = || {
+            assert_eq!(
+                h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+                500
+            );
+            assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts);
+            assert_eq!(live_for(&h, "u1").as_ref(), Some(&paid));
+            assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        };
+        let original = h.stripe.sessions.borrow()["cs_test_1"].clone();
+        let set_session = |session| {
+            h.stripe
+                .sessions
+                .borrow_mut()
+                .insert("cs_test_1".into(), session);
+        };
+        for invalid in [
+            crate::stripe::CheckoutSession {
+                customer: Some("cus_other".into()),
+                ..original.clone()
+            },
+            crate::stripe::CheckoutSession {
+                id: "cs_other".into(),
+                ..original.clone()
+            },
+            crate::stripe::CheckoutSession {
+                livemode: true,
+                ..original.clone()
+            },
+            crate::stripe::CheckoutSession {
+                subscription: None,
+                ..original.clone()
+            },
+        ] {
+            set_session(invalid);
+            refused();
+        }
+        set_session(original);
+        h.store
+            .checkout_ops
             .borrow_mut()
-            .get_mut("cs_test_1")
+            .get_mut("op_test_1")
             .unwrap()
-            .customer = Some("cus_other".into());
-        assert_eq!(
-            h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
-            500
-        );
-        assert_eq!(live_for(&h, "u1"), Some(paid));
-        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+            .session_id = Some("cs_other".into());
+        refused();
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut("op_test_1")
+            .unwrap()
+            .session_id = Some("cs_test_1".into());
+        let original = h.stripe.subscriptions.borrow()["sub_test_1"].clone();
+        for invalid in [
+            crate::stripe::Subscription {
+                customer: Some("cus_other".into()),
+                ..original.clone()
+            },
+            crate::stripe::Subscription {
+                livemode: true,
+                ..original
+            },
+        ] {
+            h.stripe
+                .subscriptions
+                .borrow_mut()
+                .insert("sub_test_1".into(), invalid);
+            refused();
+        }
+    }
+
+    #[test]
+    fn paid_invite_webhook_refuses_nonadvancing_and_excess_invoice_pages() {
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        let body = deliver_first_period(&h, "evt_page");
+        let line = {
+            let mut invoices = h.stripe.invoices.borrow_mut();
+            let lines = invoices
+                .get_mut("in_test_1")
+                .unwrap()
+                .lines
+                .as_mut()
+                .unwrap();
+            lines.has_more = true;
+            lines.data[0].clone()
+        };
+        let attempts = h.store.reconcile_outcome_attempts.get();
+        for repeated in [true, false] {
+            h.stripe.scripted_line_pages.replace(
+                (0..11)
+                    .map(|index| {
+                        let mut line = line.clone();
+                        if !repeated {
+                            line.id = format!("il_next_{index}");
+                        }
+                        crate::stripe::InvoiceLines {
+                            data: vec![line],
+                            has_more: true,
+                        }
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                h.call_webhook(&body, Some(sign(&body, BILLING_NOW))).status,
+                500
+            );
+            assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts);
+            assert_eq!(
+                h.stripe.scripted_line_pages.borrow().len(),
+                if repeated { 10 } else { 1 }
+            );
+        }
     }
 
     #[test]

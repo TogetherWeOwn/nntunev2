@@ -313,8 +313,7 @@ pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
         }
     }
     let stripe_webhook = env_string(env, "STRIPE_WEBHOOK_SECRET");
-    let mut config = config.with_stripe(stripe_secret, stripe_webhook);
-    config.paid_invite_billing = env_string(env, "PAID_INVITE_BILLING").as_deref() == Some("1");
+    let config = config.with_stripe(stripe_secret, stripe_webhook);
     // Play-grant signing secret, shared with the stream Worker: raw
     // string bytes, never base64-decoded (see the helper). Absent (or
     // the minter's minimum length not met at issue time) fails the
