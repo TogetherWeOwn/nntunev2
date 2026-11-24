@@ -431,6 +431,12 @@ impl Config {
         self.paid_invite_billing && self.invites_required && self.private_listening.is_none()
     }
 
+    pub(crate) fn billing_purchase_configured(&self) -> bool {
+        self.stripe_secret_key.is_some()
+            && self.stripe_webhook_secret.is_some()
+            && self.stripe_portal_configuration.is_some()
+    }
+
     /// Provision the play-grant HMAC secret (raw bytes of the
     /// `PLAY_GRANT_SECRET` Worker secret). The 32-byte minimum is
     /// enforced by the minter per request (fail closed), so this
@@ -4717,11 +4723,7 @@ where
     };
     let purchase_bindings = if ctx.cfg.paid_billing_enabled() {
         match ctx.store.load_reconcile_input(&claims.user_id, None).await {
-            Ok(input)
-                if input.live.is_none()
-                    && ctx.cfg.stripe_secret_key.is_some()
-                    && ctx.cfg.stripe_webhook_secret.is_some() =>
-            {
+            Ok(input) if input.live.is_none() && ctx.cfg.billing_purchase_configured() => {
                 Some(input.bindings)
             }
             Ok(_) | Err(_) => Some(Vec::new()),
@@ -7698,7 +7700,63 @@ where
     Ok(())
 }
 
-async fn billing_webhook<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
+async fn reconcile_bound_subscription_update<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    customer: &str,
+    subscription: &str,
+) -> Result<(), ()>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(user) = ctx
+        .store
+        .user_for_stripe_customer(customer)
+        .await
+        .map_err(|_| ())?
+    else {
+        return Ok(());
+    };
+    // Checkout completion establishes the local target. A lifecycle event
+    // may refresh an existing target, but cannot establish one.
+    let input = ctx
+        .store
+        .load_reconcile_input(&user, Some(subscription))
+        .await
+        .map_err(|_| ())?;
+    if input.stripe_customer_id.as_deref() != Some(customer)
+        || !input.live.is_some_and(|row| {
+            row.stripe_subscription_id == subscription && row.stripe_customer_id == customer
+        })
+    {
+        return Ok(());
+    }
+    let outcome = reconcile_remote_subscription(ctx, &user, subscription).await?;
+    if outcome.disable_new_purchases() {
+        billing_alert(ctx, &user, BILLING_FAIL_CLOSED_ACTION).await;
+        return Err(());
+    }
+    Ok(())
+}
+
+// Build the webhook future outside the shared dispatcher, as for checkout.
+#[inline(never)]
+fn billing_webhook<'a, S, M, D, N>(
+    ctx: &'a Ctx<'_, S, M, D, N>,
+    req: &'a Request,
+) -> Pin<Box<dyn Future<Output = Response> + 'a>>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    Box::pin(dispatch_billing_webhook(ctx, req))
+}
+
+async fn dispatch_billing_webhook<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
     M: Mailer,
@@ -7729,30 +7787,22 @@ where
         Ok(event) => event,
         Err(_) => return invalid_request(),
     };
-    if ctx.cfg.paid_billing_enabled()
-        && (event.livemode || event.event_type != "checkout.session.completed")
-    {
+    let checkout = event.event_type == "checkout.session.completed";
+    let renewal = event.event_type == "invoice.paid";
+    let bound_update = ctx.cfg.paid_billing_enabled()
+        && (renewal || event.event_type == "customer.subscription.updated");
+    if ctx.cfg.paid_billing_enabled() && (event.livemode || !(checkout || bound_update)) {
         return json_response(200, serde_json::json!({"ok": true}));
     }
-    // First claim wins. Duplicates of a verified non-checkout event (or a
-    // live-mode event) still ack 200 with no state change — those paths
-    // never write state, so nothing can be lost. A duplicate
-    // `checkout.session.completed`, however, is REPROCESSED idempotently
-    // instead of acked: the release below is a same-DB DELETE, so a store
-    // outage that fails the release — or a worker death after the claim —
-    // would otherwise leave the paid event consumed and unprocessed.
-    // Reconciliation converges (monotonic upsert under the per-user lock,
-    // history idempotent on the invoice id, operation mark idempotent), so
-    // reprocessing a duplicate lands the same stored state, and a still-
-    // failing pass 500s so Stripe retries anyway. A store failure on the
-    // claim itself 500s so Stripe retries the delivery.
+    // A claimant can die before reconciliation. Reprocess approved
+    // duplicates through the same idempotent writer and let Stripe retry
+    // errors, even if dropping the receipt fails.
     let _first_claim = match ctx.store.claim_webhook_event(&event.id).await {
         Ok(first) => first,
         Err(_) => return internal(),
     };
-    if event.event_type != "checkout.session.completed" {
-        // Verified but not ours: ack, no state change. Live-mode events
-        // land here too — never Stripe-called, never stored.
+    if !(checkout || bound_update) {
+        // Other verified events never reach Stripe or the billing writer.
         return json_response(200, serde_json::json!({"ok": true}));
     }
     if event.livemode {
@@ -7766,13 +7816,35 @@ where
         .await;
         return json_response(200, serde_json::json!({"ok": true}));
     }
-    // The session object is verified JSON now; a missing id is a sender
-    // bug (400), not a retryable failure.
-    let session_id = match event.object.get("id").and_then(|id| id.as_str()) {
-        Some(id) => id.to_string(),
-        None => return invalid_request(),
+    let Some(target) = event.object.get("id").and_then(serde_json::Value::as_str) else {
+        return invalid_request();
     };
-    match reconcile_checkout_session(ctx, &session_id).await {
+    let result = if bound_update {
+        let subscription = if renewal {
+            // Acacia invoices carry the subscription ID at the top level.
+            let Some(subscription) = event
+                .object
+                .get("subscription")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return json_response(200, serde_json::json!({"ok": true}));
+            };
+            subscription
+        } else {
+            target
+        };
+        let Some(customer) = event
+            .object
+            .get("customer")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return invalid_request();
+        };
+        reconcile_bound_subscription_update(ctx, customer, subscription).await
+    } else {
+        reconcile_checkout_session(ctx, target).await
+    };
+    match result {
         Ok(()) => json_response(200, serde_json::json!({"ok": true})),
         Err(()) => {
             // The claim is released so the retried delivery reprocesses
@@ -8861,7 +8933,7 @@ where
         // — and the scope map keeps the path `Deny` so bearer credentials
         // can never enter it. Deliberately outside `is_known_path`.
         ("POST", BILLING_WEBHOOK_PATH) if ctx.cfg.paid_billing_enabled() => {
-            Box::pin(billing_webhook(ctx, req)).await
+            billing_webhook(ctx, req).await
         }
         ("POST", paid_invite_billing::CHECKOUT | paid_invite_billing::PORTAL)
             if ctx.cfg.paid_billing_enabled() =>
@@ -9149,6 +9221,7 @@ mod tests {
         remove_billing_row_after_read: std::cell::Cell<bool>,
         reconcile_outcome_attempts: std::cell::Cell<usize>,
         paid_reconcile_attempts: std::cell::Cell<usize>,
+        skip_checkout_mark: std::cell::Cell<bool>,
         // Displaced rows are retained without changing the per-user projection.
         billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
@@ -10230,9 +10303,23 @@ mod tests {
             if *self.fail_billing_reads.borrow() {
                 return Err(StoreError);
             }
+            let seeded = self.subscriptions.borrow().get(user_id).cloned();
+            let folded = self.billing_rows.borrow();
+            let row = folded.get(user_id);
+            let ever = self.ever_subscribed.borrow().contains(user_id)
+                || row.is_some_and(|row| row.paid_through_unix.is_some());
             Ok((
-                self.subscriptions.borrow().get(user_id).cloned(),
-                self.ever_subscribed.borrow().contains(user_id),
+                seeded.or_else(|| {
+                    row.map(|row| SubscriptionRow {
+                        plan_id: row.plan_id.clone(),
+                        status: row.status.clone(),
+                        paid_through_at_unix: row.paid_through_unix,
+                        grace_until_unix: row.grace_until_unix,
+                        current_period_end_unix: row.current_period_end_unix,
+                        cancel_at_period_end: row.cancel_at_period_end,
+                    })
+                }),
+                ever,
             ))
         }
         async fn stream_seconds_month(
@@ -11862,6 +11949,9 @@ mod tests {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
+            if self.skip_checkout_mark.get() {
+                return Ok(false);
+            }
             // Mirrors the production conditional mark: only an unresolved
             // row takes the mark. A missing or already-retired row (lost
             // mark, or superseded while its Stripe create was still in
@@ -12636,6 +12726,7 @@ mod tests {
             Some("sk_test_synthetic".to_string()),
             Some("whsec_synthetic".to_string()),
         );
+        h.config.stripe_portal_configuration = Some("bpc_fixture".into());
         h
     }
 
@@ -12978,6 +13069,24 @@ mod tests {
         );
         assert_eq!(buy(&h).status, 404);
         h.config.private_listening = None;
+        h.store.plans.borrow_mut().push(PlanRow {
+            id: PLAN_PLUS.into(),
+            price_cents: 800,
+            stream_hours_month: 100,
+            max_concurrent_streams: 1,
+        });
+        let plus_selectable = |h: &Harness| {
+            let reply = billing_get(h, "/v1/plans", Some(cookie.clone()));
+            serde_json::from_str::<serde_json::Value>(&reply.body).unwrap()["plans"][0]
+                ["selectable"]
+                .as_bool()
+                .unwrap()
+        };
+        h.config.stripe_portal_configuration = None;
+        assert_eq!(buy(&h).status, 503);
+        assert!(!plus_selectable(&h));
+        h.config.stripe_portal_configuration = Some("bpc_fixture".into());
+        assert!(plus_selectable(&h));
         assert_eq!(checkout(&h, "plus", None, Some(ORIGIN)).status, 401);
         assert_eq!(
             checkout(
@@ -13033,6 +13142,146 @@ mod tests {
         drop(ops);
         assert_eq!(buy(&h).status, 409);
         assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+    }
+
+    #[test]
+    fn verified_paid_invoice_refreshes_renewal_without_the_hourly_sweep() {
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_checkout");
+        let start = BILLING_NOW + BILLING_PERIOD;
+        let end = start + BILLING_PERIOD;
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .get_mut("sub_test_1")
+            .unwrap()
+            .current_period_end = Some(end);
+        h.stripe.invoices.borrow_mut().insert(
+            "in_renewal".into(),
+            test_invoice(
+                "in_renewal",
+                "cus_test_1",
+                "sub_test_1",
+                PRICE_PLUS,
+                start,
+                end,
+                start + 60,
+            ),
+        );
+        let body = |id, subscription| {
+            serde_json::json!({
+            "id":id, "type":"invoice.paid", "livemode":false,
+            "data":{"object":{"id":"in_renewal","customer":"cus_test_1","subscription":subscription}}
+        }).to_string().into_bytes()
+        };
+        let standalone = body("evt_standalone", None::<&str>);
+        webhook_ok(&h.call_webhook(&standalone, Some(sign(&standalone, BILLING_NOW))));
+        assert_eq!(live_for(&h, "u1").unwrap().paid_through_unix, Some(start));
+        let event = body("evt_renewal", Some("sub_test_1"));
+        let deliver = || webhook_ok(&h.call_webhook(&event, Some(sign(&event, BILLING_NOW))));
+        deliver();
+        let renewed = live_for(&h, "u1").unwrap();
+        assert_eq!(renewed.paid_through_unix, Some(end));
+        let history = h.store.invoice_history.borrow().clone();
+        assert_eq!(history.len(), 2);
+        deliver();
+        assert_eq!(live_for(&h, "u1"), Some(renewed));
+        assert_eq!(*h.store.invoice_history.borrow(), history);
+    }
+
+    #[test]
+    fn hourly_paid_checkout_requires_a_persisted_success_mark() {
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_checkout");
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut("op_test_1")
+            .unwrap()
+            .state = "needs_reconcile".into();
+        let run = || block_on(reconcile_paid_targets(&h.ctx(), vec![("u1", None)]));
+        h.store.skip_checkout_mark.set(true);
+        assert!(run().is_err());
+        h.store.skip_checkout_mark.set(false);
+        run().unwrap();
+        assert_eq!(
+            h.store.checkout_ops.borrow()["op_test_1"].state,
+            "succeeded"
+        );
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+    }
+
+    #[test]
+    fn verified_bound_subscription_update_enforces_portal_cutoff() {
+        let mut h = stripe_harness();
+        h.config = h.config.with_play_grant_secret(PLAY_SECRET.to_vec());
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        deliver_first_period(&h, "evt_first_period");
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .get_mut("sub_test_1")
+            .unwrap()
+            .cancel_at_period_end = true;
+        let event = |customer, subscription| {
+            serde_json::json!({
+            "id": "evt_portal_update",
+            "type": "customer.subscription.updated",
+            "livemode": false,
+            "data": {"object": {"id": subscription, "customer": customer, "cancel_at_period_end": false}}
+        }).to_string().into_bytes()
+        };
+        let before = h.store.paid_reconcile_attempts.get();
+        for (customer, subscription) in [("cus_other", "sub_test_1"), ("cus_test_1", "sub_other")] {
+            let body = event(customer, subscription);
+            webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        }
+        let body = event("cus_test_1", "sub_test_1");
+        assert_eq!(
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW - 600)))
+                .status,
+            400
+        );
+        assert_eq!(h.store.paid_reconcile_attempts.get(), before);
+        assert!(!h.store.billing_rows.borrow()["u1"].cancel_at_period_end);
+        for _ in 0..2 {
+            webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
+        }
+        assert_eq!(h.store.paid_reconcile_attempts.get(), before + 2);
+        assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        let cookie = cookie_of(&block_on(h.ctx().start_session("u1")).unwrap());
+        let response = billing_get(&h, "/v1/me/subscription", Some(cookie));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["cancelAtPeriodEnd"],
+            true
+        );
+
+        let mut cutoff = h.ctx();
+        cutoff.now = (BILLING_NOW + BILLING_PERIOD) as u64;
+        let cookie = cookie_of(&block_on(cutoff.start_session("u1")).unwrap());
+        let response = block_on(handle(
+            &cutoff,
+            &Request {
+                method: "POST".into(),
+                path: "/v1/plays".into(),
+                cookie: Some(cookie),
+                origin: Some(ORIGIN.into()),
+                authorization: None,
+                stripe_signature: None,
+                body: br#"{"track_id":"track-9","session_id":"tab-a"}"#.to_vec(),
+            },
+        ));
+        assert_eq!(response.status, 402);
+        let refusal: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(refusal["reason"], "lapsed");
     }
 
     #[test]
