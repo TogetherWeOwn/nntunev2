@@ -568,6 +568,18 @@ jobs:
           INTENT_KEY: ${{ secrets.PRODUCTION_ROLLBACK_INTENT_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: node ci/production-maintenance/final-smoke-rollback.mjs admit-recovery
+      - name: Verify the allocation before reserving a recovery submission
+        if: steps.source.outputs.allow-submit == 'true'
+        env: &recovery-env
+          ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          ROLLBACK_CUSTODY: ${{ secrets.PRODUCTION_ROLLBACK_CUSTODY }}
+          INTENT_KEY: ${{ secrets.PRODUCTION_ROLLBACK_INTENT_KEY }}
+          DOMAIN: ${{ needs.preflight.outputs.domain }}
+          CLAIM_VERIFIED: ${{ steps.claim.outcome == 'success' }}
+        run: node ci/production-maintenance/final-smoke-rollback.mjs prepare-recovery
       - name: Reserve one recovery submission across runners
         id: claim
         if: steps.source.outputs.allow-submit == 'true'
@@ -578,15 +590,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Restore or verify the recorded allocation
-        env:
-          ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
-          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
-          ROLLBACK_CUSTODY: ${{ secrets.PRODUCTION_ROLLBACK_CUSTODY }}
-          INTENT_KEY: ${{ secrets.PRODUCTION_ROLLBACK_INTENT_KEY }}
-          DOMAIN: ${{ needs.preflight.outputs.domain }}
-          CLAIM_VERIFIED: ${{ steps.claim.outcome == 'success' }}
+        env: *recovery-env
         run: node ci/production-maintenance/final-smoke-rollback.mjs recover
 
   release:

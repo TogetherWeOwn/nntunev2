@@ -1230,15 +1230,15 @@ cannot stop a concurrent provider write between the empty read and deployment.
 
 The production lane refuses any production vars beyond `name` in
 `[env.production]` before uploading a version. The gate step
-(`.github/workflows/deploy-production.yml:321-329`) runs
+(`.github/workflows/deploy-production.yml:233-241`) runs
 `node ci/check-production-secrets-shape.mjs`, which enforces the offline
 policy in `ci/check-production-secrets-shape.mjs:1-7`: the web Worker ships
 no bindings and needs no secrets, so its production env table must carry
 only `name` (current state: `apps/web/wrangler.toml:31-32`). It runs in the
 `deploy-production` job after that job checks out the validated promotion
-SHA (`.github/workflows/deploy-production.yml:291-295`), not in preflight
+SHA (`.github/workflows/deploy-production.yml:210-214`), not in preflight
 (preflight checks out the dispatch tip,
-`.github/workflows/deploy-production.yml:97-99`). It is an offline
+`.github/workflows/deploy-production.yml:84-86`). It is an offline
 shape check — no credentials, no network — that reads key names only and
 never reads or prints values
 (`ci/check-production-secrets-shape.mjs:6-7`).
@@ -1272,10 +1272,9 @@ promoted `sha` and original `recovery_run_id` (attempt 1). Keep the original
 custody, key and accepted SHA in `production` through the watch. The approval
 and shared mutation lock apply even with new deployments disabled.
 
-Recovery verifies the sealed intent and the source run's contiguous 5%, 50%,
-and 100% rollout. Re-entry checks the active allocation without repeating a
-possible submission. On ambiguity, reconcile the Worker, routes, and provider
-audit. Verify restored build identity and health or the private maintenance behavior.
+Recovery verifies the sealed intent and exact rollout before reserving a write.
+Re-entry checks readback. Reconcile any ambiguous write against provider audit.
+Verify restored build health and identity or the private maintenance behavior.
 
 ### First private release handoff
 
@@ -1328,7 +1327,7 @@ requires independent release approval. A push to `main` deploys to the
   a card link, never dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
   secret shape before upload` step passed on the promotion SHA
-  (`.github/workflows/deploy-production.yml:321-329` runs
+  (`.github/workflows/deploy-production.yml:233-241` runs
   `ci/check-production-secrets-shape.mjs`, which refuses any
   `[env.production]` table beyond `name`). Same-checker CI coverage
   (`.github/workflows/ci.yml:824-842`) is not promotion evidence on its

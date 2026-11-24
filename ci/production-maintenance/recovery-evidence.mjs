@@ -42,8 +42,6 @@ export function admitRecovery(env, evidence = proof.productionEvidence) {
   }
   const sealed = command('python3', [fileURLToPath(new URL('../read-promotion-receipt.py', import.meta.url)),
     '--sealed-rollback-intent'], 4096, archive);
-  // The mutation lock spans claim discovery, the durable upload and restore.
-  // Any prior submission may have committed, even without an acknowledgement.
   if (!/^[0-9a-f]{64}$/.test(env.INTENT_KEY ?? '')) throw new Error('Missing recovery intent key');
   // An unrelated workflow must not be able to predict and reserve this name.
   const claim = createHmac('sha256', Buffer.from(env.INTENT_KEY, 'hex')).update(`claim:${env.RECOVERY_RUN_ID}`).digest('hex');

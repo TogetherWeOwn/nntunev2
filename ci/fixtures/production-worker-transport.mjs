@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { createHash, createHmac } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { admitRecovery, intentFile } from '../production-maintenance/recovery-evidence.mjs';
 import { finalSmokeRollback } from '../production-maintenance/final-smoke-rollback.mjs';
+
+export const mainSha = () => execFileSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8' }).trim();
 
 export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId }, outcome = 'ack', kind = 'maintenance') {
   const temp = mkdtempSync(join(tmpdir(), 'final-smoke-'));
@@ -37,6 +39,7 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId },
   const state = { id: workerId, name: 'nntune-web', deployed_on: checkedAt, references: structuredClone(references),
     subdomain: { enabled: false, previews_enabled: false } };
   const calls = [];
+  const fail = { nextRead: false };
   const request = async (url, options) => {
     const root = `https://api.cloudflare.com/client/v4/accounts/${account}/workers`;
     assert.ok(url.startsWith(root + '/'));
@@ -44,6 +47,10 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId },
     assert.equal(options.headers.Authorization, 'Bearer fixture-only');
     const path = url.slice(root.length);
     calls.push(options.method);
+    if (options.method === 'GET' && fail.nextRead) {
+      fail.nextRead = false;
+      throw new Error('synthetic provider read failed');
+    }
     const response = (result, count) => Response.json({ success: true, errors: [], result,
       result_info: { page: 1, total_count: count, count } });
     if (options.method === 'POST') {
@@ -77,7 +84,7 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId },
     shift();
     await run('pin-final', {}, clock);
   };
-  return { calls, custody, rows, versions, seed, state, id, temp, env, run, prepare, shift };
+  return { calls, custody, rows, versions, seed, state, id, temp, env, run, prepare, shift, fail };
 }
 
 export function recoveryFixture(t, transport, conclusion) {
@@ -127,12 +134,46 @@ sys.stdout.buffer.write(buf.getvalue())`, intentFile], { input: readFileSync(joi
       GITHUB_JOB: 'recover-worker', GITHUB_SHA: 'c'.repeat(40), GITHUB_WORKFLOW_SHA: 'c'.repeat(40),
       RUNNER_TEMP: temp, GITHUB_OUTPUT: join(temp, 'output') };
   }
-  function enter(env) {
-    admitRecovery(env, evidence);
+  function admitWithFakeGitHub(env) {
+    const repository = { id: 114, full_name: env.GITHUB_REPOSITORY };
+    const route = '.github/workflows/deploy-production.yml';
+    const responses = {
+      'workflows/deploy-production.yml': { id: 77, path: route, state: 'active' },
+      'runs/12/attempts/1': { ...run, id: 12, run_attempt: 1, workflow_id: 77, path: route, repository,
+        head_repository: repository, head_branch: 'main', event: 'workflow_dispatch' },
+      'runs/12/attempts/1/jobs?per_page=100&page=1': { total_count: 1,
+        jobs: [{ id: 65, name: 'deploy-production', run_id: 12, run_attempt: 1, status: 'completed', conclusion, steps }] },
+      'runs/12/artifacts?per_page=100&page=1': { total_count: 1, artifacts: [{ ...artifact, id: 97,
+        name: 'production-rollback-intent-12-1', expired: false, size_in_bytes: zipped.stdout.length,
+        workflow_run: { id: 12, repository_id: 114, head_repository_id: 114, head_branch: 'main', head_sha: run.head_sha } }] },
+      [`artifacts?name=${claimName}&per_page=100&page=1`]: { total_count: claims.length, artifacts: claims },
+    };
+    writeFileSync(join(env.RUNNER_TEMP, 'gh'), `#!/usr/bin/env node
+if (process.env.INTENT_KEY !== undefined) process.exit(1);
+const route = process.argv[5].replace(/^repos\\/example\\/fixture\\/actions\\//, '');
+if (route === 'artifacts/97/zip') process.stdout.write(Buffer.from('${zipped.stdout.toString('base64')}', 'base64'));
+else {
+  const response = ${JSON.stringify(responses)}[route];
+  if (response === undefined) process.exit(1);
+  process.stdout.write(JSON.stringify(response));
+}
+`, { mode: 0o700 });
+    const result = spawnSync(process.execPath, ['ci/production-maintenance/final-smoke-rollback.mjs', 'admit-recovery'], {
+      env: { ...env, PATH: `${env.RUNNER_TEMP}:${process.env.PATH}`, GITHUB_REPOSITORY_ID: '114' },
+      encoding: 'utf8', timeout: 15_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+  }
+  async function enter(env) {
+    if (conclusion === 'cancelled') admitWithFakeGitHub(env);
+    else admitRecovery(env, evidence);
     const output = readFileSync(env.GITHUB_OUTPUT, 'utf8');
     const canSubmit = /^allow-submit=true$/m.test(output);
     assert.ok(output.includes(`claim-name=${claimName}\n`));
-    if (canSubmit) claims.push({ name: claimName });
+    if (canSubmit) {
+      await transport.run('prepare-recovery', env);
+      claims.push({ name: claimName });
+    }
     env.CLAIM_VERIFIED = String(canSubmit);
     return transport.run('recover', env);
   }

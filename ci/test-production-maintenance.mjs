@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { finalSmokeFixture, recoveryFixture } from './fixtures/production-worker-transport.mjs';
+import { finalSmokeFixture, mainSha, recoveryFixture } from './fixtures/production-worker-transport.mjs';
 import { admitRecovery } from './production-maintenance/recovery-evidence.mjs';
 import { seedMaintenance } from './production-maintenance/seed.mjs';
 import worker from './production-maintenance/worker.mjs';
@@ -303,8 +303,7 @@ test('a regression during the release watch restores the verified previous Worke
   const transport = finalSmokeFixture(t, rollbackFixture, 'ack', 'previous');
   await assert.rejects(transport.run('record', {}, now, async () => 1), /Previous build health/);
   await transport.run('record', {}, now, async (url, { expectedSha }) => {
-    assert.equal(url, 'https://test.example.com');
-    assert.equal(expectedSha, transport.custody.previous.sha);
+    assert.deepEqual([url, expectedSha], ['https://test.example.com', transport.custody.previous.sha]);
     return 0;
   });
   transport.shift();
@@ -315,15 +314,15 @@ test('a regression during the release watch restores the verified previous Worke
 });
 
 test('an interrupted 100% promotion can recover maintenance from a fresh runner', async (t) => {
-  const transport = finalSmokeFixture(t, rollbackFixture, 'lost');
+  const transport = finalSmokeFixture(t, { ...rollbackFixture, sha: mainSha() }, 'lost');
   await transport.run('record');
   transport.shift();
   const { fresh, enter } = recoveryFixture(t, transport, 'cancelled');
   assert.equal(existsSync(join(transport.temp, 'production-final-allocation.sealed')), false);
-  assert.match(await enter(fresh('13')), /reconciled by readback/);
-  const reentry = fresh('14');
-  assert.match(await enter(reentry), /already verified/);
-  assert.equal(reentry.CLAIM_VERIFIED, 'false');
+  transport.fail.nextRead = true;
+  await assert.rejects(enter(fresh('13')), /Cloudflare request/);
+  assert.match(await enter(fresh('14')), /reconciled by readback/);
+  assert.match(await enter(fresh('15')), /already verified/);
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
 });
 
@@ -336,6 +335,8 @@ test('recovery refuses superseding deployments and any second unresolved submiss
   await assert.rejects(enter(fresh('14')), /readback only/);
   transport.rows.unshift({ ...transport.rows[0], id: transport.id(8), created_on: new Date(now() + 8000).toISOString() });
   await assert.rejects(enter(fresh('15')), /newer or foreign/);
+  transport.rows[0].versions = [{ version_id: version, percentage: 100 }];
+  await assert.rejects(enter(fresh('16')), /newer or foreign/);
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
 });
 
@@ -357,10 +358,9 @@ test('protected recovery wiring keeps the production lock and contains source an
   const job = workflow.split('\n  recover-worker:\n')[1].split('\n  release:\n')[0];
   assert.match(job, /if: inputs.mode == 'recover-worker'\n    needs: \[preflight, staging-evidence\]/);
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false\n    environment: production/);
-  const [proof, restore] = job.split('      - name: Restore or verify the recorded allocation');
+  const [proof, restore] = job.split('      - name: Verify the allocation before reserving a recovery submission');
   assert.doesNotMatch(proof, /secrets\.(?:PRODUCTION_CLOUDFLARE|PRODUCTION_ROLLBACK_CUSTODY)/);
-  assert.match(proof, /admit-recovery[\s\S]*?upload-artifact@[0-9a-f]{40}/);
-  assert.match(restore, /CLAIM_VERIFIED: \$\{\{ steps\.claim\.outcome == 'success' \}\}[\s\S]*?rollback\.mjs recover/);
+  assert.match(restore, /CLAIM_VERIFIED: \$\{\{ steps\.claim\.outcome == 'success' \}\}[\s\S]*?prepare-recovery[\s\S]*?upload-artifact@[0-9a-f]{40}[\s\S]*?env: \*recovery-env[\s\S]*?rollback\.mjs recover/);
   for (const command of ['admit-recovery', 'recover']) {
     const result = spawnSync(process.execPath, ['ci/production-maintenance/final-smoke-rollback.mjs', command], {
       env: { ROLLBACK_CUSTODY: 'fixture-private-input', INTENT_KEY: 'fixture-private-key' }, encoding: 'utf8', timeout: 5000,

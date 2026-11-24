@@ -18,7 +18,8 @@ const matches = (entry, expected) => Array.isArray(entry?.versions) && entry.ver
 const seedDigest = createHash('sha256').update(readFileSync(new URL('./worker.mjs', import.meta.url))).digest('hex');
 
 export async function finalSmokeRollback(command, env, request = fetch, now = Date.now, probe = smoke) {
-  const recovery = command === 'recover';
+  const prepare = command === 'prepare-recovery';
+  const recovery = prepare || command === 'recover';
   if (recovery) recoveryContext(env);
   const { CLOUDFLARE_ACCOUNT_ID: account, CLOUDFLARE_API_TOKEN: token, WORKER_ID: worker,
     DEPLOY_SHA: sha, DOMAIN: domain, GITHUB_REPOSITORY: repository,
@@ -143,22 +144,29 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   }
   if (command !== 'restore' && !recovery) throw new Error('Invalid rollback operation');
 
-  // The unique candidate and complete contiguous rollout allow re-entry even
-  // if promotion stopped before pin-final could record the deployment ID.
-  const final = recovery ? null : unseal(finalPath);
+  const reserved = recovery && !prepare && env.CLAIM_VERIFIED === 'true';
+  const final = recovery && !reserved ? null : unseal(finalPath);
   if (final && final.nonce !== nonce) throw new Error('Final allocation belongs to another rollback intent');
   const isFinal = (rows) => (!final || rows[0]?.id === final.deployment) && rollout(rows);
   const restored = (rows) => matches(rows[0], targetOnly) && rows[0].annotations?.['workers/message'] === message &&
     isFinal(rows.slice(1));
-  const allowSubmit = !recovery || env.CLAIM_VERIFIED === 'true';
-  if (recovery) {
-    const { result: version } = await api(`${pinned}/versions/${candidate}`, 'Recorded candidate version');
-    if (version.id !== candidate || version.annotations?.['workers/tag'] !== tag) throw new Error('Candidate version drifted');
+  const alreadyVerified = `Recorded ${targetLabel} allocation already verified`;
+  if (reserved) {
+    const age = now() - final.checkedAt;
+    if (!Number.isFinite(age) || age < 0 || age > 120_000) throw new Error('Recovery allocation proof expired');
+    if (final.deployment === null) return alreadyVerified;
+  } else {
+    if (recovery) {
+      const { result: version } = await api(`${pinned}/versions/${candidate}`, 'Recorded candidate version');
+      if (version.id !== candidate || version.annotations?.['workers/tag'] !== tag) throw new Error('Candidate version drifted');
+    }
+    const before = await live();
+    const complete = restored(before);
+    if (!complete && !isFinal(before)) throw new Error('Stale intent or newer or foreign active deployment');
+    if (prepare) return seal(finalPath, { nonce, deployment: complete ? null : before[0].id, checkedAt: now() });
+    if (complete) return alreadyVerified;
+    if (recovery) throw new Error('Recovery is readback only; reconcile any previous submission');
   }
-  const before = await live();
-  if (restored(before)) return `Recorded ${targetLabel} allocation already verified`;
-  if (!isFinal(before)) throw new Error('Stale intent or newer or foreign active deployment');
-  if (!allowSubmit) throw new Error('Recovery is readback only; reconcile any previous submission');
   // The Actions lock serializes participating jobs. Custody must exclude every
   // other writer because the provider has no deployment compare-and-set.
   writeFileSync(join(temp, 'production-rollback-submitted'), '', { mode: 0o600, flag: 'wx' });
