@@ -97,11 +97,14 @@ identity, migration and rollback evidence, and review and merge gates. Follow
 for release evidence. Explicitly state what was not run.
 
 Post newly available CI results and independent reviews in the PR conversation.
-Put the verified run and job links, conclusions, skips and reviewer decisions
-in Markdown and run `python3 scripts/post_pr_evidence.py <pr-number> <full-head-sha> < evidence.md`.
-The helper checks the current PR head and posts a new comment labeled with the
-supplied SHA. Before merging, verify the evidence against the current head and
-base and confirm the required checks in GitHub.
+Run `python3 scripts/post_pr_evidence.py PR_NUMBER HEAD_SHA --job success JOB_URL`
+with the verified conclusion and full GitHub Actions job URL. Repeat `--job`
+for each result, and pass `--general-review-cleared` or
+`--security-review-cleared` after those independent reviews clear the head.
+The helper accepts job URLs from this repository and fixed conclusions and
+review labels. It checks the current PR head and posts a SHA-labeled comment.
+Before merging, open the linked runs, verify the current head and base, and
+confirm the required checks and the reviewers' decisions at their sources.
 GitHub reports body edits and base retargets as the same `edited` activity.
 Posting evidence as a comment avoids starting another `migrations-staging` run.
 Edit the PR body when its description or Attestation needs a substantive correction.
