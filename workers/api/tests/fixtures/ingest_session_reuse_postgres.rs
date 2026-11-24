@@ -74,13 +74,8 @@ pub(super) async fn protect_completed(
         assert!(matches!(attempt.await, Err(Refused)));
         set_reuse_grant(observer, &auth.record.id, true).await;
     }
-    let first = reuse(writer, auth, &scope, job, reload).await.unwrap();
-    assert_pins(first.outcome(), expected);
-    assert!(first.usable_until() > SystemTime::now());
-    assert!(first.usable_until() <= SystemTime::now() + Duration::from_secs(30));
-
-    // Shrink one independent bound at a time. Retries still return exact pins
-    // but must never shorten the first caller's durable deletion protection.
+    // The credential initially limits the protection. Once restored, a retry
+    // can extend the durable fence to its own deadline.
     let cutoff: SystemTime = observer
         .query_one(
             "SELECT date_trunc('second', clock_timestamp()) + interval '20 seconds'",
@@ -89,7 +84,6 @@ pub(super) async fn protect_completed(
         .await
         .unwrap()
         .get(0);
-    assert!(cutoff < first.usable_until());
     let expiry = |time: SystemTime| {
         i64::try_from(time.duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap()
     };
@@ -99,9 +93,9 @@ pub(super) async fn protect_completed(
         .execute(credential_deadline, &[&auth.record.id, &expiry(cutoff)])
         .await
         .unwrap();
-    let retry = reuse(writer, auth, &scope, job, reload).await.unwrap();
-    assert_eq!(retry.usable_until(), cutoff);
-    assert_pins(retry.outcome(), expected);
+    let first = reuse(writer, auth, &scope, job, reload).await.unwrap();
+    assert_eq!(first.usable_until(), cutoff);
+    assert_pins(first.outcome(), expected);
     observer
         .execute(
             credential_deadline,
@@ -109,16 +103,22 @@ pub(super) async fn protect_completed(
         )
         .await
         .unwrap();
+    let extended = reuse(writer, auth, &scope, job, reload).await.unwrap();
+    assert_pins(extended.outcome(), expected);
+    assert!(extended.usable_until() > cutoff);
+    assert!(extended.usable_until() <= SystemTime::now() + Duration::from_secs(30));
 
-    let session_deadline: SystemTime = observer.query_one(
-        "SELECT absolute_deadline FROM public.ingest_session_reservations WHERE id = $1::text::uuid",
+    // Tighten the session and retention independently. Neither shorter retry
+    // may take protection away from the caller with the extended deadline.
+    let session = observer.query_one(
+        "SELECT absolute_deadline, idle_deadline FROM public.ingest_session_reservations WHERE id = $1::text::uuid",
         &[&scope.session],
-    ).await.unwrap().get(0);
+    ).await.unwrap();
     let move_session = "UPDATE public.ingest_session_reservations
-        SET absolute_deadline = $2, idle_deadline = LEAST(idle_deadline, $2)
+        SET absolute_deadline = $2, idle_deadline = $3
         WHERE id = $1::text::uuid";
     observer
-        .execute(move_session, &[&scope.session, &cutoff])
+        .execute(move_session, &[&scope.session, &cutoff, &UNIX_EPOCH])
         .await
         .unwrap();
     assert_eq!(
@@ -129,7 +129,14 @@ pub(super) async fn protect_completed(
         cutoff
     );
     observer
-        .execute(move_session, &[&scope.session, &session_deadline])
+        .execute(
+            move_session,
+            &[
+                &scope.session,
+                &session.get::<_, SystemTime>(0),
+                &session.get::<_, SystemTime>(1),
+            ],
+        )
         .await
         .unwrap();
 
@@ -153,7 +160,7 @@ pub(super) async fn protect_completed(
         .await
         .unwrap()
         .get::<_, SystemTime>(0);
-    assert_eq!(protected, first.usable_until());
+    assert_eq!(protected, extended.usable_until());
     // With only the reuse fence active, the real delete guard refuses admission.
     assert!(!observer
         .query_one(DELETE, &[obj])
