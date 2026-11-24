@@ -54,7 +54,7 @@ pub struct RetryRequest {
     pub revision: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct JobView {
     pub job_id: String,
     pub revision: u32,

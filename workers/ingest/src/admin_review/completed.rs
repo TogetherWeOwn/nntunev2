@@ -41,7 +41,11 @@ pub async fn retry_completed<'a>(
     auth: &Authorization<'_>,
     client: &mut Client,
     target: ReviewTarget<'_>,
-    lock: impl AsyncFn(&Transaction<'_>, &str, &str) -> Result<Option<ReviewJob>, BoundaryError>,
+    lock: impl AsyncFn(
+        &Transaction<'_>,
+        &str,
+        &ReviewTarget<'_>,
+    ) -> Result<Option<ReviewJob>, BoundaryError>,
     record: impl AsyncFnOnce(&Transaction<'_>, &ReviewJob, &JobView) -> Result<(), BoundaryError>,
     resolve: impl AsyncFnOnce(&ReviewJob) -> Result<ResolvedCompletion<'a>, BoundaryError>,
     read_committed: impl AsyncFnMut(
@@ -56,12 +60,8 @@ pub async fn retry_completed<'a>(
         .start()
         .await
         .map_err(|_| BoundaryError::Unavailable)?;
-    let job = load(
-        async |actor, id| lock(&tx, actor, id).await,
-        &caller,
-        target.job_id,
-    )
-    .await?;
+    let get = async |actor: &str, _: &str| lock(&tx, actor, &target).await;
+    let job = load(get, &caller, target.job_id).await?;
     let object = versioned_object(&job)?;
     if is_retry_result(&job, revision) {
         return Ok(job.view);

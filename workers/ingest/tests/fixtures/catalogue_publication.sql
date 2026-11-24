@@ -98,5 +98,6 @@ BEGIN
     END LOOP;
 END $$;
 
-CREATE TABLE public.test_flac_review (revision integer NOT NULL);
-INSERT INTO public.test_flac_review VALUES (1);
+CREATE TABLE public.test_flac_review (view jsonb NOT NULL, retried_revision bigint);
+INSERT INTO public.test_flac_review VALUES
+    ('{"job_id":"catalogue-old","revision":1,"status":"needs_review"}', NULL);

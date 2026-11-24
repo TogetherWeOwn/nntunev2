@@ -6,8 +6,7 @@ use nntune_ingest::{
     },
     admin_review::{
         completed::{retry_completed, ResolvedCompletion, ReviewTarget},
-        Authorization, BoundaryError, JobView, ObjectRef, ReviewJob, ReviewStatus, READ_SCOPE,
-        RETRY_SCOPE,
+        Authorization, BoundaryError, ObjectRef, ReviewJob, ReviewStatus, READ_SCOPE, RETRY_SCOPE,
     },
     catalogue_publication::{PublicationError, PublishedObject},
     matching::{
@@ -333,26 +332,23 @@ pub(super) async fn exercise(
                 environment,
                 library,
             },
-            async |tx, _, _| {
-                let revision: i32 = tx.query_one("SELECT revision FROM public.test_flac_review FOR UPDATE", &[]).await.unwrap().get(0);
-                let status = if revision == 3 { ReviewStatus::Published } else { ReviewStatus::NeedsReview };
-                let view = JobView {
-                    job_id: job.job_id.into(),
-                    revision: revision as u32,
-                    status,
-                    reason: (revision == 2).then_some(NeedsReview::SearchEvidence),
-                };
+            async |tx, actor, target| {
+                assert_eq!(actor, job.owner_id);
+                assert_eq!((target.environment, target.library), (environment, library));
+                let row = tx.query_one("SELECT view::text, retried_revision FROM public.test_flac_review FOR UPDATE", &[]).await.unwrap();
                 Ok(Some(ReviewJob {
-                    view,
+                    view: serde_json::from_str(row.get(0)).unwrap(),
                     owner_id: job.owner_id.into(),
                     object: Some(objects[0].clone()),
-                    retried_revision: (revision > 1).then_some(revision as u32 - 1),
+                    retried_revision: row.get::<_, Option<i64>>(1).map(|prior| prior as u32),
                 }))
             },
-            async |tx, _, result| {
-                let changed = tx.execute("UPDATE public.test_flac_review SET revision = revision + 1 WHERE revision + 1 = $1",
-                    &[&(result.revision as i32)]).await.unwrap();
-                assert_eq!(changed, 1, "replay must not record again");
+            async |tx, expected, result| {
+                let view = serde_json::to_string(result).unwrap();
+                let prior = i64::from(expected.view.revision);
+                let changed = tx.execute("UPDATE public.test_flac_review SET view = $1::text::jsonb,
+                    retried_revision = $2 WHERE (view->>'revision')::bigint = $2", &[&view, &prior]).await.unwrap();
+                assert_eq!(changed, 1);
                 if fail_record { Err(BoundaryError::Unavailable) } else { Ok(()) }
             },
             async |_| {
@@ -405,12 +401,12 @@ pub(super) async fn exercise(
     assert_eq!(review.revision, 2);
     assert_eq!(review.reason, Some(NeedsReview::SearchEvidence));
     let replay = run(RETRY_SCOPE, 1, 0, true, true, true).await.unwrap();
-    assert_eq!(replay.reason, review.reason);
+    assert_eq!(replay, review);
     assert_eq!(rows().await, 0);
     let result = run(RETRY_SCOPE, 2, 2, false, true, false).await.unwrap();
     let replay = run(RETRY_SCOPE, 2, 0, true, false, true).await.unwrap();
     let published = (ReviewStatus::Published, 3);
     assert_eq!((result.status, result.revision), published);
-    assert_eq!((replay.status, replay.revision), published);
+    assert_eq!(replay, result);
     assert_eq!(rows().await, 1);
 }
