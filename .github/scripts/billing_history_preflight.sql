@@ -47,7 +47,7 @@ WITH checked AS MATERIALIZED (
            (p.evidence_complete AND p.user_id = s.user_id
             AND p.stripe_subscription_id = s.stripe_subscription_id
             AND s.stripe_invoice_id <> '' AND s.user_id <> '' AND s.stripe_subscription_id <> ''
-            AND p.plan_id <> '' AND p.start_s < p.end_s
+            AND p.plan_id <> '' AND p.start_s <= p.end_s
             AND p.start_s >= 0 AND p.end_s <= 253402300799
             AND p.paid_s BETWEEN 0 AND 253402300799
             AND p.amount_cents >= 0 AND p.currency ~ '^[a-z]{3}$'

@@ -1,9 +1,13 @@
 """Hosted-only fixture on the api-migrations loopback PostgreSQL service."""
 
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+import json
 import os
 import subprocess
-import sys
+from unittest.mock import patch
 
+import billing_history_preflight as preflight
 from billing_history_preflight import DATABASE, SCRIPTS, run
 
 
@@ -46,9 +50,6 @@ def refused(role, connection):
 
 
 def exercise():
-    # Generated test-mode monthly periods and paid-at starts use the same
-    # projection shape as the paid invite journey.
-    check(0, exact=1, eligible_hydration=1, fresh=1)
     assert run(ROLE, 2, OBSERVER) == (2, None)
 
     # The old item-plan report retains a different plan. The old takeover
@@ -65,12 +66,19 @@ def exercise():
     check(1, collision=1, eligible_hydration=1, fresh=1)
     sql("""UPDATE public.paid_invoice_history SET paid_at = paid_at - interval '0.5 seconds'
            WHERE stripe_invoice_id = 'in_fixture_1'""")
+    sql("""UPDATE billing_preflight.projection SET start_s = end_s, starts = '{}', ends = '{}'
+           WHERE stripe_invoice_id = 'in_fixture_2';
+           UPDATE public.paid_invoice_history SET period_start = period_end
+           WHERE stripe_invoice_id = 'in_fixture_2';""")
+    check(0, exact=2, fresh=1)
 
     sql("""UPDATE billing_preflight.projection SET evidence_complete = false
            WHERE stripe_invoice_id = 'in_fixture_1';
            DELETE FROM billing_preflight.projection WHERE stripe_invoice_id = 'in_fixture_2';""")
     check(2, incomplete=2, fresh=1)
-    sql("""UPDATE billing_preflight.projection SET stripe_subscription_id = 'sub_fixture_other'
+    sql("""UPDATE billing_preflight.scope SET stripe_subscription_id = 'sub_fixture_absent'
+           WHERE stripe_invoice_id = 'in_fixture_3';
+           UPDATE billing_preflight.projection SET stripe_subscription_id = 'sub_fixture_absent'
            WHERE stripe_invoice_id = 'in_fixture_3';""")
     check(2, incomplete=3)
 
@@ -84,19 +92,47 @@ def exercise():
     refused(ROLE, OBSERVER)
 
 
+def invoke(environment):
+    with (patch.dict(os.environ, environment, clear=True),
+          redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()) as err):
+        status = preflight.main()
+    return status, out.getvalue(), err.getvalue()
+
+
+def exercise_entrypoint():
+    env = {
+        "NNTUNE_INVOICE_PREFLIGHT": "1", "BILLING_PREFLIGHT_HOST": "staging.example.test",
+        "BILLING_PREFLIGHT_ROLE": ROLE, "BILLING_PREFLIGHT_PASSWORD": ADMIN["PGPASSWORD"],
+        "BILLING_PREFLIGHT_SCOPE_COUNT": "3", "PGHOSTADDR": "ignored", "PGSERVICE": "ignored",
+    }
+    real_run = subprocess.run
+
+    def loopback(argv, *, env, **options):
+        assert env["PGHOST"] == "staging.example.test" and env["PGSSLMODE"] == "verify-full"
+        assert env["PGUSER"] == ROLE and env["PGDATABASE"] == DATABASE
+        assert "PGHOSTADDR" not in env and "PGSERVICE" not in env
+        assert env["PGPASSWORD"] == ADMIN["PGPASSWORD"] and env["PGPASSWORD"] not in argv
+        return real_run(argv, env=OBSERVER, **options)
+
+    with patch.object(subprocess, "run", side_effect=loopback) as psql:
+        for host in ("/var/run/postgresql", "staging.example.test,other.example.test"):
+            assert invoke({**env, "BILLING_PREFLIGHT_HOST": host}) == (3, "", "refused\n")
+        psql.assert_not_called()
+        status, out, err = invoke(env)
+        assert (status, err) == (0, "")
+        assert json.loads(out) == dict(total=3, exact=1, eligible_hydration=1,
+                                       collision=0, incomplete=0, fresh=1)
+
+
 def main():
-    result = subprocess.run(
-        [sys.executable, str(SCRIPTS / "billing_history_preflight.py")],
-        env={}, capture_output=True, text=True, timeout=5,
-    )
-    assert (result.returncode, result.stdout, result.stderr) == (3, "", "disabled\n")
+    assert invoke({}) == (3, "", "disabled\n")
     sql(f"CREATE DATABASE {DATABASE} TEMPLATE template0;", "postgres")
     try:
         migration_dir = SCRIPTS.parents[1] / "migrations"
         sql("\n".join((migration_dir / name).read_text() for name in MIGRATIONS))
-        sql((SCRIPTS / "billing_history_preflight_fixture.sql").read_text())
+        sql((SCRIPTS.parent / "fixtures/billing_history_preflight.sql").read_text())
         before = archive_counts()
-        check(0, exact=1, eligible_hydration=1, fresh=1)
+        exercise_entrypoint()
         assert archive_counts() == before == "2|1\n"
         exercise()
     finally:

@@ -60,15 +60,16 @@ independently verified staging PostgreSQL origin on port 5432 and
 `BILLING_PREFLIGHT_ROLE` to its approved restricted login. Supply
 `BILLING_PREFLIGHT_PASSWORD` through the runner's secret environment.
 The client verifies TLS and checks the session's database and role before
-reading evidence. The observer needs global invoice-key visibility and
-reads limited to the required columns and prepared evidence.
+reading evidence. Provision the observer with global invoice-key visibility
+and reads limited to the required columns and prepared evidence.
 
 Pin the candidate, staging origin, schema, Stripe test account, scope and
 evidence cutoff. In the approved perimeter, prepare a fixed batch in
 `billing_preflight.scope` and `billing_preflight.projection`. Both use text
 `stripe_invoice_id` (unique globally), `user_id` and `stripe_subscription_id`.
-Scope is the independently inventoried union of relevant retained and currently
-eligible keys, including retained targets that can return to an advancing state.
+Scope covers existing subscription targets only. Inventory the union of relevant
+retained and currently eligible keys, including retained targets that can return
+to an advancing state. First-time Checkout is covered by the paid invite journey.
 Set the boolean `retained` per scope key and pass the independent denominator
 as `BILLING_PREFLIGHT_SCOPE_COUNT` (1–10,000). Use stable relations for one
 batch and keep the scope and archive aligned to the same observation.
@@ -79,7 +80,8 @@ bindings and exhausting both invoice and line pages. The projection carries
 text `plan_id` and `currency`, bigint `amount_cents`, `start_s`, `end_s`
 and `paid_s` (whole Unix seconds), and paired bigint arrays `starts` and
 `ends` for up to 1,000 half-open periods. Two empty arrays represent
-unknown exact coverage. A missing projection counts as incomplete.
+unknown exact coverage. Reporting start and end may coincide. A missing
+projection or missing subscription target counts as incomplete.
 
 The command emits one JSON object of counts (`total`, `exact`,
 `eligible_hydration`, `fresh`, `collision`, `incomplete`) for an admitted
