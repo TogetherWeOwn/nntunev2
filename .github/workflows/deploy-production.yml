@@ -16,17 +16,11 @@ name: deploy-production
 # - workflow_dispatch with an explicit full 40-hex main SHA.
 # - preflight resolves and validates the SHA, the enabled flag, and the
 #   production hostname variable.
-# - staging-evidence requires a real post-deploy staging run on the exact
-#   SHA: the push-triggered deploy run (event=push; manual dispatches never
-#   count and can never shadow evidence) must have staging-web success (never
-#   skipped) and its post-deploy full-journey job success. The called
-#   workflow reports its jobs under the "post-deploy-e2e / ..." prefix, so
-#   every matching job must conclude success. These are prerequisites only:
-#   ci/staging_admission.py additionally authenticates an attempt-bound receipt
-#   with actual same-source API deployment, both live identities, candidate
-#   migration manifest and complete independently approved product mapping.
-#   The reviewed approval list is initially empty: real admission refuses.
-#   Scheduled/manual monitoring never counts (docs/ops.md staging checklist).
+# - staging-evidence requires an attempt-bound receipt from the exact main
+#   push and the independently approved product mapping. Application promotion
+#   requires the private-music journey and Web, API and Stream deployments
+#   from that attempt. Maintenance bootstrap retains its ordinary full-journey
+#   prerequisites. The approval list is empty, so real admission refuses.
 # - deploy-production uploads one Worker version without mutating routes,
 #   custom domains or triggers, then calls the shared central
 #   gradual-promote action (pinned below): 5% -> 50% -> 100% with per-stage
@@ -162,7 +156,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Require real post-deploy staging evidence on the exact SHA
+      - name: Check secret isolation and maintenance staging prerequisites
         env:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -177,7 +171,11 @@ jobs:
             { echo '::error::Cloudflare credentials must exist only in the production Environment'; exit 1; }
           [ "${UNPROTECTED_ROLLBACK_CONFIG:-}" = false ] ||
             { echo '::error::Rollback custody and intent key must exist only in the production Environment'; exit 1; }
-          if [ "${DEPLOY_MODE:-}" = recover-worker ]; then exit 0; fi
+          case "${DEPLOY_MODE:-}" in
+            promote|recover-worker) exit 0 ;;
+            bootstrap-maintenance) ;;
+            *) echo '::error::Unsupported production admission mode'; exit 1 ;;
+          esac
           python3 - <<'PY'
           import json, os, sys, urllib.request
 
@@ -252,6 +250,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          DEPLOY_MODE: ${{ inputs.mode }}
           STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}

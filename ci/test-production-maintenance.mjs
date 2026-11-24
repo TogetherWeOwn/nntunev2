@@ -50,6 +50,15 @@ test('only exact-main bootstrap uses the protected production job after staging 
       env: { DEPLOY_MODE: 'recover-worker', UNPROTECTED_CF_CONFIG: credentials, UNPROTECTED_ROLLBACK_CONFIG: rollback }, timeout: 5_000,
     }).status, credentials === 'false' && rollback === 'false' ? 0 : 1);
   }
+  for (const [mode, credentials, expected] of [
+    ['bootstrap-maintenance', 'false', 42], ['promote', 'false', 0],
+    ['promote', 'true', 1], ['unknown', 'false', 1],
+  ]) {
+    assert.equal(spawnSync('/bin/bash', ['-c', guard[1] + 'exit 42\n'], {
+      env: { DEPLOY_MODE: mode, UNPROTECTED_CF_CONFIG: credentials, UNPROTECTED_ROLLBACK_CONFIG: 'false' },
+      timeout: 5_000,
+    }).status, expected);
+  }
   const job = workflow.split('\n  bootstrap-maintenance:\n')[1].split('\n  release:\n')[0];
   assert.match(job, /if: inputs.mode == 'bootstrap-maintenance'\n    needs: \[preflight, staging-evidence\]/);
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false\n    environment: production/);

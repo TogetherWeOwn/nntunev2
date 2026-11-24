@@ -916,10 +916,6 @@ class SourceBindingTests(Base):
             "id": "signup", "applicable": True, "evidence": [{
                 "classname": "signup.spec.ts", "name": "signup", "outcome": "passed"}]}])).encode()
         self.policy = make_policy(self.contract)
-        for name, data in ((sa.POLICY, json.dumps(self.policy).encode()), (sa.CONTRACT, self.contract)):
-            path = self.root / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
         self.files = {name: ("100644", b"reviewed source") for name in sa.TRUSTED_FILES}
         self.files.update({f"{name}/fixture": ("100644", b"reviewed tree") for name in sa.TRUSTED_TREES})
         self.files.update({
@@ -934,9 +930,22 @@ class SourceBindingTests(Base):
             "bin/smoke.mjs": ("100644", b"external executable"),
             "fixtures/cc0/fetch_fixture.py": ("100644", b"external helper"),
             "migrations/manifest.toml": ("100644", MANIFEST),
-            sa.POLICY: ("100644", json.dumps(self.policy).encode()),
-            sa.CONTRACT: ("100644", self.contract),
         })
+        self.install_contract(self.contract, self.policy)
+
+    def install_contract(self, contract, policy):
+        self.contract, self.policy = contract, policy
+        for name, data in ((sa.POLICY, json.dumps(policy).encode()), (sa.CONTRACT, contract)):
+            self.files[name] = ("100644", data)
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+
+    def install_private_contract(self):
+        self.install_contract(PRIVATE_CONTRACT_BYTES, make_policy(PRIVATE_CONTRACT_BYTES))
+        fixture = "fixtures/synthetic-flac/private-staging/fixture"
+        self.files[fixture] = ("100644", b"synthetic input")
+        return fixture
 
     def git(self, *args, data=None):
         env = dict(os.environ, GIT_AUTHOR_NAME="Fixture", GIT_COMMITTER_NAME="Fixture",
@@ -974,7 +983,8 @@ class SourceBindingTests(Base):
             args.extend(["-p", parent])
         return self.git(*args).decode().strip()
 
-    def run_main(self, candidate_files=None, trusted_files=None, current_files=None, private=False):
+    def run_main(self, candidate_files=None, trusted_files=None, current_files=None, private=False,
+                 mode="bootstrap-maintenance", world_factory=None):
         candidate = self.commit(candidate_files or self.files)
         trusted = self.commit(trusted_files or self.files, candidate)
         current = self.commit(current_files or trusted_files or self.files, trusted)
@@ -986,7 +996,9 @@ class SourceBindingTests(Base):
         self.git("update-ref", "refs/heads/main", current)
         self.git("config", "remote.origin.url", str(self.root))
         with patch.dict(globals(), SHA=candidate):
-            if private:
+            if world_factory is not None:
+                world = world_factory()
+            elif private:
                 world = PrivateWorld()
             else:
                 world = World(policy=self.policy, contract_bytes=self.contract,
@@ -994,7 +1006,7 @@ class SourceBindingTests(Base):
                                   b'classname="journey"', b'classname="signup.spec.ts"'))
             actions = FakeActions(world.routes())
         env = make_env(GITHUB_SHA=trusted, DEPLOY_SHA=candidate, GITHUB_EVENT_NAME="workflow_dispatch",
-                       GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token")
+                       GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token", DEPLOY_MODE=mode)
         with patch.object(sa, "ROOT", self.root), patch.dict(sa.os.environ, env, clear=True), \
                 patch.object(sa.sys, "argv", ["staging_admission.py", "verify"]), \
                 patch.object(sa, "Actions", return_value=actions), \
@@ -1016,15 +1028,74 @@ class SourceBindingTests(Base):
         self.run_main(current_files=current)
 
     def test_private_main_binds_synthetic_audio_tree(self):
-        self.files[sa.CONTRACT] = ("100644", PRIVATE_CONTRACT_BYTES)
-        self.files[sa.POLICY] = ("100644", json.dumps(make_policy(PRIVATE_CONTRACT_BYTES)).encode())
-        for name in (sa.CONTRACT, sa.POLICY):
-            (self.root / name).write_bytes(self.files[name][1])
-        fixture = "fixtures/synthetic-flac/private-staging/fixture"
-        self.files[fixture] = ("100644", b"synthetic input")
-        self.run_main(private=True)
+        fixture = self.install_private_contract()
+        self.run_main(private=True, mode="promote")
         corrected = dict(self.files, **{fixture: ("100644", b"different synthetic input")})
-        self.refused("producer.*drift", self.run_main, current_files=corrected, private=True)
+        self.refused("producer.*drift", self.run_main, current_files=corrected, private=True, mode="promote")
+
+    def test_promotion_refuses_missing_approval(self):
+        self.install_private_contract()
+        self.install_contract(self.contract, dict(self.policy, approvals=[]))
+        self.refused("approved product contract unavailable", self.run_main, private=True, mode="promote")
+
+    def test_promotion_refuses_ordinary_and_billing_admission(self):
+        # Each substitute independently verifies on its approved ordinary route.
+        self.run_main()
+        self.refused("requires the approved private-music journey", self.run_main, mode="promote")
+
+        billing = json.dumps(dict(CONTRACT, criteria=[{
+            "id": "billing", "applicable": True, "evidence": [{
+                "classname": "billing.spec.ts", "name": "checkout", "outcome": "passed"}]}])).encode()
+        self.install_contract(billing, make_policy(billing))
+
+        def billing_world():
+            xml = make_junit().replace(b'classname="journey" name="signup"',
+                                       b'classname="billing.spec.ts" name="checkout"')
+            return World(policy=self.policy, contract_bytes=self.contract, xml=xml)
+
+        self.run_main(world_factory=billing_world)
+        self.refused("requires the approved private-music journey", self.run_main,
+                     mode="promote", world_factory=billing_world)
+
+    def test_promotion_refuses_absent_or_skipped_private_evidence(self):
+        self.install_private_contract()
+
+        def without_journey():
+            world = PrivateWorld()
+            world.jobs.pop()
+            return world
+
+        def skipped_journey():
+            world = PrivateWorld()
+            world.jobs[-1]["conclusion"] = "skipped"
+            return world
+
+        def without_private_artifact():
+            world = PrivateWorld()
+            world.artifact["name"] = sa.artifact_name(SHA, RUN_ID, 1)
+            return world
+
+        for factory, reason in ((without_journey, "missing or ambiguous required staging job"),
+                                (skipped_journey, "required job did not pass in selected attempt"),
+                                (without_private_artifact, "missing or ambiguous attempt-bound receipt")):
+            with self.subTest(fixture=factory.__name__):
+                self.refused(reason, self.run_main, private=True, mode="promote", world_factory=factory)
+
+    def test_promotion_refuses_receipt_for_other_build_attempt_or_journey(self):
+        self.install_private_contract()
+        for field, value, reason in (("sha", OTHER_SHA, "receipt source, producer or attempt mismatch"),
+                                     ("run_attempt", "2", "receipt source, producer or attempt mismatch"),
+                                     ("journey", "billing", "receipt journey mismatch")):
+            with self.subTest(field=field):
+                def wrong_receipt():
+                    world = PrivateWorld()
+                    name = world.artifact["name"]
+                    world.receipt[field] = value
+                    world.set_archive()
+                    world.artifact["name"] = name
+                    return world
+
+                self.refused(reason, self.run_main, private=True, mode="promote", world_factory=wrong_receipt)
 
     def test_main_source_binding_is_independent_of_initial_branch(self):
         for initial_branch in ("main", "master"):
@@ -1223,7 +1294,11 @@ class WiringTests(Base):
         evidence = workflow.split("  staging-evidence:\n", 1)[1].split("\n  deploy-production:", 1)[0]
         self.assertIn("persist-credentials: false", evidence)
         self.assertIn("fetch-depth: 0", evidence)
-        self.assertIn("run: python3 -I ci/staging_admission.py verify", evidence)
+        verification = evidence.split("      - name: Verify candidate deployment and accepted journey receipt\n")[1]
+        self.assertIn("if: inputs.mode != 'recover-worker'", verification)
+        self.assertIn("DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}", verification)
+        self.assertIn("DEPLOY_MODE: ${{ inputs.mode }}", verification)
+        self.assertIn("run: python3 -I ci/staging_admission.py verify", verification)
         self.assertNotIn("continue-on-error", evidence)
         self.assertIn("needs: [preflight, staging-evidence]", workflow)
         self.assertIn("PRODUCTION_DEPLOY_ENABLED", workflow)
