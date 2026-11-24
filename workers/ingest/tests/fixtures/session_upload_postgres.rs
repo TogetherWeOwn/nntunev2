@@ -9,11 +9,13 @@ const OWNER: &str = "synthetic-handoff-owner";
 const LEASE: &str = "61000000-0000-4000-8000-000000000001";
 const NEXT_LEASE: &str = "61000000-0000-4000-8000-000000000002";
 
-fn id(value: u8) -> [u8; 16] {
-    let mut id = [value; 16];
-    id[6] = 0x40;
-    id[8] = 0x80;
-    id
+async fn fresh_id(db: &Client) -> [u8; 16] {
+    let bytes: Vec<u8> = db
+        .query_one("SELECT uuid_send(gen_random_uuid())", &[])
+        .await
+        .unwrap()
+        .get(0);
+    bytes.try_into().unwrap()
 }
 
 async fn connect() -> Client {
@@ -117,8 +119,12 @@ async fn postgres_fences_the_provider_id_handoff() {
             .await
             .unwrap();
     }
+    let mut identities = [[0; 16]; 6];
+    for identity in &mut identities {
+        *identity = fresh_id(&observer).await;
+    }
     let mut context = EnvelopeContext {
-        identities: [0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5].map(id),
+        identities,
         plaintext_len: 1,
         header: [17; 48],
     };
@@ -249,7 +255,12 @@ async fn postgres_fences_the_provider_id_handoff() {
     .await
     .unwrap();
     assert_eq!(replay.target().upload_id, provider_id);
-    for invalid_id in [format!("{provider_id}x"), "id\n".into(), String::new()] {
+    for invalid_id in [
+        format!("{provider_id}x"),
+        "id\n".into(),
+        "é".into(),
+        String::new(),
+    ] {
         let invalid = observer
             .execute(
                 "UPDATE public.ingest_session_reservations SET multipart_upload_id = $2
@@ -338,8 +349,8 @@ async fn postgres_fences_the_provider_id_handoff() {
     .unwrap();
     assert_eq!(replay.target().upload_id, provider_id);
 
-    context.identities[3] = id(0xb6);
-    context.identities[4] = id(0xb7);
+    context.identities[3] = fresh_id(&observer).await;
+    context.identities[4] = fresh_id(&observer).await;
     let object = uuid(&context.identities[3]);
     let generation = uuid(&context.identities[4]);
     let key = format!("media/{object}/{generation}");
