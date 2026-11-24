@@ -5,7 +5,9 @@ const { once } = require('node:events');
 const { readFileSync } = require('node:fs');
 const { createServer } = require('node:https');
 const { test } = require('node:test');
-const { upload_for_playback } = require('./ingest_wasm.cjs');
+const loadWorker = require('./worker_fixture_wasm.cjs');
+const { upload_for_playback } = loadWorker(process.env.INGEST_WASM_JS, true);
+const { resolve_uploaded_playback } = loadWorker(process.env.CATALOGUE_PLAYBACK_WASM_JS, true);
 const { read_uploaded_suffix } = require('../../../stream/tests/fixtures/s3_stream_wasm.cjs');
 const {
   authorization, bucket, checksum, completionReceipt, initiationHeaders,
@@ -20,7 +22,7 @@ const length = 65_617;
 const range = 'bytes=65600-65616';
 const queryFor = version => `versionId=${encodeURIComponent(version)}`;
 
-test('reads the original uploaded ciphertext range after the current version changes', { timeout: 20_000 }, async (t) => {
+test('reads the committed catalogue version after the current storage version changes', { timeout: 30_000 }, async (t) => {
   const neighbor = Buffer.from('unrelated synthetic object');
   const media = new Map();
   const pages = new Map();
@@ -155,24 +157,22 @@ test('reads the original uploaded ciphertext range after the current version cha
   host = `127.0.0.1:${server.address().port}`;
   const endpoint = `https://${host}`;
 
-  // Freeze the confirmed receipt before publishing another version to this key.
-  const pointer = await upload_for_playback(endpoint);
-  const original = JSON.parse(pointer);
-  const replacement = JSON.parse(await upload_for_playback(endpoint));
-  assert.equal(original.s3_version_id, 'media+/%?=&1');
-  assert.equal(replacement.s3_version_id, 'media+/%?=&2');
-  assert.equal(replacement.s3_bucket, original.s3_bucket);
-  assert.equal(replacement.s3_key, original.s3_key);
-  const expected = media.get(original.s3_version_id).subarray(start);
+  const track = await upload_for_playback(endpoint, true);
+  const replacement = await upload_for_playback(endpoint, false);
+  const original = 'media+/%?=&1';
+  assert.equal(replacement, 'media+/%?=&2');
+  const expected = media.get(original).subarray(start);
   const current = [...media.entries()].at(-1);
-  assert.equal(current[0], replacement.s3_version_id);
+  assert.equal(current[0], replacement);
   assert.notDeepEqual(current[1].subarray(start), expected);
 
-  const unsigned = await fetch(`${endpoint}${mediaPath}?${queryFor(original.s3_version_id)}`, {
+  const unsigned = await fetch(`${endpoint}${mediaPath}?${queryFor(original)}`, {
     headers: { range }, signal: AbortSignal.timeout(5000),
   });
   assert.equal(unsigned.status, 403);
   assert.equal(rejectedUnsigned, 1);
+  const pointer = await resolve_uploaded_playback(track);
+  assert.equal(JSON.parse(pointer).s3_version_id, original);
   assert.deepEqual(Buffer.from(await read_uploaded_suffix(endpoint, pointer)), expected);
   const upload = ['POST media', 'PUT media', 'POST media', 'HEAD media', 'PUT page', 'GET media', 'GET page'];
   assert.deepEqual(operations, [...upload, ...upload, 'GET range']);

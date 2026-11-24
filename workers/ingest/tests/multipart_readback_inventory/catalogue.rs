@@ -25,6 +25,7 @@ pub(super) async fn exercise(
 ) {
     let schema = concat!(
         include_str!("../../../api/tests/fixtures/storage_s3_locator_schema.sql"),
+        include_str!("../fixtures/catalogue_source_schema.sql"),
         include_str!("../fixtures/catalogue_publication.sql")
     );
     db.batch_execute(schema).await.unwrap();
@@ -136,6 +137,31 @@ pub(super) async fn exercise(
     let mut tx = writer.transaction().await.unwrap();
     let track_id = stage(&mut tx, &first_match, &old).await.unwrap();
     tx.commit().await.unwrap();
+
+    const POINTER: &str = "SELECT s.source_job_id, l.s3_version_id
+        FROM public.catalogue_s3_sources s JOIN public.storage_s3_locator_intents l USING (object_id)
+        WHERE s.track_id = $1::text::uuid";
+    let S3Binding::VersionId(old_version) = old.locator.binding() else {
+        panic!("original fixture must be versioned");
+    };
+    let S3Binding::VersionId(new_version) = new.locator.binding() else {
+        panic!("replacement fixture must be versioned");
+    };
+    assert_ne!(old_version, new_version);
+    let prior = async || {
+        let row = db.query_one(POINTER, &[&track_id]).await.unwrap();
+        assert_eq!(row.get::<_, &str>(0), "catalogue-old");
+        assert_eq!(row.get::<_, &str>(1), old_version);
+    };
+    let mut tx = writer.transaction().await.unwrap();
+    assert_eq!(stage(&mut tx, &next_match, &new).await.unwrap(), track_id);
+    let staged = tx.query_one(POINTER, &[&track_id]).await.unwrap();
+    assert_eq!(staged.get::<_, &str>(0), "catalogue-new");
+    assert_eq!(staged.get::<_, &str>(1), new_version);
+    prior().await;
+    tx.rollback().await.unwrap();
+    prior().await;
+
     let mut tx = writer.transaction().await.unwrap();
     assert_eq!(stage(&mut tx, &first_match, &old).await.unwrap(), track_id);
     let conflicting = occurrence("catalogue-old", object, 1);
