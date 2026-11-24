@@ -27,7 +27,7 @@ on:
         type: string
         required: true
       file:
-        description: "Migration file basename (e.g. 0054_example.sql); in all-pending mode the last file to apply"
+        description: "Migration basename, private-trial for the opt-in staging overlay, or last file in all-pending mode"
         type: string
         required: true
       applied_by:
@@ -88,7 +88,9 @@ jobs:
             printf '%s\n' "ref must be a full 40-hex commit SHA" >&2
             exit 1
           fi
-          if [[ ! "$MIGRATION_FILE" =~ ^[0-9]{4}_[A-Za-z0-9_]+\.sql$ ]]; then
+          if [[ "$MIGRATION_FILE" == private-trial && "$APPLY_MODE" == single ]]; then
+            : # The overlay is separate from the ordinary app ledger.
+          elif [[ ! "$MIGRATION_FILE" =~ ^[0-9]{4}_[A-Za-z0-9_]+\.sql$ ]]; then
             printf '%s\n' "file must be a migration basename like 0054_example.sql" >&2
             exit 1
           fi
@@ -157,12 +159,14 @@ jobs:
           APPLIED_BY: ${{ inputs.applied_by }}
           APPLY_MODE: ${{ inputs.mode }}
           EXPECT_DATABASE: nntunev2_staging
+          TRIAL_WRITER_ROLE: ${{ vars.PRIVATE_TRIAL_SCHEMA_WRITER_ROLE }}
+          TRIAL_READER_ROLE: ${{ vars.PRIVATE_TRIAL_SCHEMA_READER_ROLE }}
         run: |
           set -euo pipefail
           python3 -E -s trusted/.github/scripts/staging_apply.py apply --trusted-root trusted --data-root data --file "$MIGRATION_FILE" --applied-by "$APPLIED_BY" --mode "$APPLY_MODE" --expect-database "$EXPECT_DATABASE"
 
       - name: Record evidence in job summary
-        if: always() && steps.apply.conclusion != 'skipped'
+        if: always() && steps.apply.conclusion != 'skipped' && inputs.file != 'private-trial'
         env:
           PLANETSCALE_MIGRATOR_URL_STAGING: ${{ secrets.PLANETSCALE_MIGRATOR_URL_STAGING }}
           MIGRATION_FILE: ${{ inputs.file }}

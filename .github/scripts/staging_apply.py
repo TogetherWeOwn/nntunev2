@@ -16,6 +16,8 @@ Modes: ``single`` applies one manifest-checked ``app`` entry; refusal of
 a non-``app`` target happens before connecting. ``all-pending`` walks
 the app entries up to the input file in manifest order and stops at the
 first failure, reporting the applied prefix as evidence.
+Selecting ``private-trial`` explicitly installs the staging-only overlay
+outside the ordinary app manifest and ledger.
 """
 import argparse
 import datetime
@@ -125,6 +127,27 @@ def plan_files(entries, migration_file, mode):
 
 def trusted_script_path(trusted_root, name="apply_migration.py"):
     return Path(trusted_root) / TRUSTED_DIRNAME / name
+
+
+def apply_private_trial(args):
+    from apply_migration import ApplyError, connection_env
+    from staging_trial_schema import compose, install
+
+    if args.mode != "single" or args.expect_database != "nntunev2_staging":
+        raise StagingApplyError("private trial schema requires a single protected staging apply")
+    try:
+        sql, digest = compose(args.trusted_root, args.data_root,
+                              os.environ.get("TRIAL_WRITER_ROLE", ""),
+                              os.environ.get("TRIAL_READER_ROLE", ""), database=args.expect_database)
+        url = normalize_url(os.environ.get(SECRET_ENV, ""), args.expect_database)
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+            outcome = install(connection_env(url), sql)
+            print(f"Private trial schema {outcome} on `{args.expect_database}`. "
+                  f"Bundle SHA-256 `{digest}`.", file=summary)
+    except ApplyError as exc:
+        raise StagingApplyError(str(exc)) from None
+    except (KeyError, OSError, ValueError):
+        raise StagingApplyError("private trial schema apply failed; details redacted") from None
 
 
 def apply_files(trusted_root, data_root, migration_file, applied_by, mode,
@@ -518,7 +541,9 @@ def main(argv=None):
     parser.add_argument("--expect-database", required=True)
     args = parser.parse_args(argv)
     try:
-        if args.phase == "apply":
+        if args.phase == "apply" and args.file == "private-trial":
+            apply_private_trial(args)
+        elif args.phase == "apply":
             apply_files(args.trusted_root, args.data_root, args.file,
                         args.applied_by, args.mode, args.expect_database)
         elif args.phase == "evidence":
