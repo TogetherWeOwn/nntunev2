@@ -72,8 +72,8 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
 }
 
 /// Presence-preserving env lookup: `Some("")` for a present-but-empty
-/// var, `None` only when neither secret nor var exists. Used solely by
-/// the vault-KEK provisioning decision, where a blanked var (what a
+/// var, `None` only when neither secret nor var exists. Used for
+/// provisioning decisions where a blanked var (what a
 /// dashboard "clear this var" action leaves behind) must fail closed
 /// rather than read as absent.
 fn env_string_raw(env: &Env, name: &str) -> Option<String> {
@@ -257,6 +257,9 @@ pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
     )
     .ok()?
     .with_prior_keks(kek_set.priors);
+    if let Some(raw) = env_string_raw(env, "PRIVATE_LISTENING_COHORT") {
+        config.private_listening = Some(crate::private_listening::PrivateListening::parse(&raw)?);
+    }
     // Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
     // armed ONLY by the explicit staging flag, and usable only with the
     // staged QA bearer. Both default off/absent, so production serves the
@@ -1841,6 +1844,7 @@ fn invite_from_row(row: &tokio_postgres::Row) -> Result<InviteRecord, StoreError
         revoked_by: row.try_get("revoked_by").map_err(|_| StoreError)?,
         window_id: row.try_get("window_id").map_err(|_| StoreError)?,
         issuer_email: row.try_get("issuer_email").ok().flatten(),
+        require_active_admin_issuer: false,
     })
 }
 
@@ -2238,6 +2242,16 @@ async fn complete_registration_on(
     // `query_opt`'s rule: exactly one parent row, else the claim fails.
     if parent.len() != 1 {
         return Err(StoreError);
+    }
+    if let Some(record) = invite.filter(|record| record.require_active_admin_issuer) {
+        let issuer = record.issued_by.as_deref().ok_or(StoreError)?;
+        let owner = transaction.query_typed(
+            "SELECT id FROM users WHERE id = $1 AND role = 'admin' AND deleting_at IS NULL FOR SHARE",
+            &[(&issuer, Type::TEXT)],
+        ).await.map_err(|_| StoreError)?;
+        if owner.len() != 1 {
+            return Err(StoreError);
+        }
     }
     let mut claims = vec![
         SingleUseClaim::Challenge {
@@ -4039,6 +4053,38 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 rows[0].try_get("target_id").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_listening_access(
+        &self,
+        user_id: &str,
+        owner_user_id: &str,
+        invite_ids: &[i64],
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::private_listening::ACCESS_SQL,
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&owner_user_id, Type::TEXT),
+                            (&invite_ids, Type::INT8_ARRAY),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.private_listening")
+                    })?;
+                let [row] = rows.as_slice() else {
+                    return Err(StoreError);
+                };
+                row.try_get(0).map_err(|_| StoreError)
             },
             TOTAL_TIMEOUT_MS,
         )
