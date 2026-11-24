@@ -8,7 +8,8 @@ const { s3_completion_test: complete } = require('./ingest_wasm.cjs');
 const version = 'fixture-version';
 const bucket = 'fixture-bucket';
 const mediaKey = 'media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd';
-const unconfirmed = (error) => error === 'completion send unconfirmed';
+const transportFailure = 'Unconfirmed(None)';
+const rejectedWith = (expected) => (error) => error === expected;
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const mac = (key, text) => createHmac('sha256', key).update(text).digest();
 
@@ -61,7 +62,7 @@ test('signs the exact multipart POST once and collects its version and body', as
 test('requires a canonical HTTPS origin before fetch', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('unexpected fetch'); });
   for (const mode of ['http', 'path']) {
-    await assert.rejects(complete(mode), (error) => error === 'invalid configuration');
+    await assert.rejects(complete(mode), rejectedWith('invalid configuration'));
   }
   assert.equal(fetch.mock.callCount(), 0);
 });
@@ -69,21 +70,23 @@ test('requires a canonical HTTPS origin before fetch', async (t) => {
 test('refuses a foreign configuration or bucket or an expired deadline before fetch', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('unexpected fetch'); });
   for (const mode of ['foreign', 'bucket', 'expired']) {
-    await assert.rejects(complete(mode), unconfirmed);
+    await assert.rejects(complete(mode), rejectedWith(transportFailure));
   }
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-for (const [name, response] of [
+for (const [name, response, failure = transportFailure] of [
   ['redirect', () => new Response(null, { status: 307, headers: { location: 'https://other.test/' } })],
   ['encoded response', () => new Response('fixture receipt', { headers: { 'content-encoding': 'gzip' } })],
   ['oversized response', () => new Response(new Uint8Array(16 * 1024 + 1))],
-  ['receipt without a version', async (request) => new Response(completionReceipt(await request.text()))],
-  ['embedded error', () => new Response('<Error/>', { headers: { 'x-amz-version-id': version } })],
+  ['receipt without a version', async (request) => new Response(completionReceipt(await request.text())),
+    'Unconfirmed(Some(CompletionVersion))'],
+  ['embedded error', () => new Response('<Error/>', { headers: { 'x-amz-version-id': version } }),
+    'Unconfirmed(Some(EmbeddedError))'],
 ]) {
   test(`refuses ${name} after one fetch`, async (t) => {
     const fetch = t.mock.method(globalThis, 'fetch', async (request) => response(request));
-    await assert.rejects(complete('success'), unconfirmed);
+    await assert.rejects(complete('success'), rejectedWith(failure));
     assert.equal(fetch.mock.callCount(), 1);
   });
 }
@@ -94,7 +97,7 @@ test('the single deadline covers body reads and aborts the fetch', async (t) => 
     signal = request.signal;
     return new Response(new ReadableStream());
   });
-  await assert.rejects(complete('deadline'), unconfirmed);
+  await assert.rejects(complete('deadline'), rejectedWith(transportFailure));
   assert.equal(fetch.mock.callCount(), 1);
   assert.equal(signal.aborted, true);
 });

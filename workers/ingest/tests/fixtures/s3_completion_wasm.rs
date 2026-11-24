@@ -98,7 +98,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
     let completed = sender
         .complete(completion, now() + Duration::from_millis(budget))
         .await
-        .map_err(|_| JsValue::from_str("completion send unconfirmed"))?;
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {
         return Err(JsValue::from_str("missing fixture version"));
     };
