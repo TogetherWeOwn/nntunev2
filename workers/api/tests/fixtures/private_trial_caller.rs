@@ -492,6 +492,40 @@ async fn verify_cleanup(
         ..fixture
     };
     assert!(!cleanup(publication, &wrong, unexpected).await.unwrap());
+    let before_cutoff = Fixture {
+        cutoff: now as i64 + 300,
+        ..fixture
+    };
+    assert!(!cleanup(publication, &before_cutoff, unexpected)
+        .await
+        .unwrap());
+
+    let other_track: String = observer
+        .query_one(
+            "INSERT INTO public.tracks (release_id, title, medium_no, track_no)
+         VALUES ($1::text::uuid, 'Unrelated cleanup control', 1, 2) RETURNING id::text",
+            &[&RELEASE],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    observer.execute(
+        "INSERT INTO public.catalogue_s3_sources (track_id, source_job_id, accepted_seq, object_id)
+         SELECT $1::text::uuid, source_job_id, accepted_seq, object_id
+         FROM public.catalogue_s3_sources WHERE track_id = $2::text::uuid",
+        &[&other_track, &track],
+    ).await.unwrap();
+    assert!(!cleanup(publication, &fixture, unexpected).await.unwrap());
+    assert_eq!(
+        observer
+            .execute(
+                "DELETE FROM public.catalogue_s3_sources WHERE track_id = $1::text::uuid",
+                &[&other_track],
+            )
+            .await
+            .unwrap(),
+        1
+    );
 
     let reference_count = async || {
         observer.query_one(
@@ -524,6 +558,10 @@ async fn verify_cleanup(
     )
     .await;
     assert_eq!(interrupted, Err(TrialError::Unconfirmed));
+    observer
+        .execute("DELETE FROM public.invite_codes WHERE id = 931", &[])
+        .await
+        .unwrap();
     assert!(cleanup(
         publication,
         &fixture,
