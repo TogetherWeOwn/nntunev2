@@ -108,6 +108,33 @@ async fn handoff<S: Future<Output = Result<(), ()>>, A: Future<Output = Result<b
     }
 }
 
+#[cfg(all(target_arch = "wasm32", feature = "cleanup-dispatch-wasm-test"))]
+mod wasm_test {
+    use super::{enqueue_claim, CleanupClaim, CleanupKind, Env};
+    use std::future::ready;
+    use worker::wasm_bindgen::{self, prelude::*};
+
+    #[wasm_bindgen]
+    pub async fn cleanup_dispatch_test(
+        env: Env,
+        session_id: String,
+        claim_id: String,
+        terminal: bool,
+        delay_seconds: i32,
+    ) -> Result<(), JsValue> {
+        let kind = if terminal {
+            CleanupKind::TerminalReconcile
+        } else {
+            CleanupKind::AbsoluteExpiry
+        };
+        let claim = CleanupClaim::from_committed_row(session_id, kind, claim_id, delay_seconds)
+            .ok_or_else(|| JsValue::from_str("invalid fixture claim"))?;
+        enqueue_claim(&env, claim, |_, _, _| ready(Ok(true)))
+            .await
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
