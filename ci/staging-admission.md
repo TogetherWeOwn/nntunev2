@@ -19,6 +19,11 @@ reviews their executable evidence mapping. The repository's normal protected
 review process must authenticate those decisions before a policy entry is added.
 This interface does not select or reduce the applicable product requirements.
 
+The offline `release-proof` CI job checks the installed policy with the same
+approval check as the verifier. When the contract file is absent, CI requires
+an empty approval list and expects the check to refuse. When the file is present,
+the check must accept its exact bytes using the installed policy.
+
 ## Reviewed input encoding
 
 The contract is the exact UTF-8 bytes of `ci/product-journey-contract.json` (not
