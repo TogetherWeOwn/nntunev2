@@ -1417,7 +1417,7 @@ requires independent release approval. A push to `main` deploys to the
   it routes the hostname to the edge and is not replaced.
 - [ ] Staging E2E: `deploy.yml` sequences it — its `post-deploy-e2e` job
   calls `e2e-staging.yml` (reusable workflow) only after the same run's
-  `staging-web` and `staging-api` jobs succeed (`needs`, no `always()`;
+  `staging-web` and `staging-api` jobs succeed (explicit result checks;
   a green `staging-api` job may be an unconfigured skip, passed on as
   `api_deploy_outcome`), so a skipped/failed
   deploy cannot produce a full-journey PASS and no separate dispatch is
