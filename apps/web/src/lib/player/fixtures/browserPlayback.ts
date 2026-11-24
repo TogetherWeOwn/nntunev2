@@ -22,7 +22,7 @@ export function setup(privateTtlSeconds = 60) {
 		isCurrent: () => !lifetime.signal.aborted, run: async (work) => !lifetime.signal.aborted ? work() : undefined };
 	let marked = false;
 	const starts: boolean[] = [];
-	const fetchFn = vi.fn<typeof fetch>(async (path, init) => {
+	const respond: typeof fetch = async (path, init) => {
 		const { session_id, enabled, track_id, play_id } = JSON.parse(String(init?.body));
 		expect(new Headers(init?.headers).get(SESSION_BINDING_HEADER)).toBe(binding);
 		expect(init).toMatchObject({ credentials: 'include', cache: 'no-store', redirect: 'error' });
@@ -36,9 +36,10 @@ export function setup(privateTtlSeconds = 60) {
 		if (play_id) return Response.json(receipt(session_id, track_id, play_id));
 		starts.push(marked);
 		return Response.json(receipt(session_id, track_id, `play-${starts.length}`));
-	});
-	let flush = () => {};
-	const player = createPlayerController(initial, { flush: async () => flush() }, (node, source) => node.getAttribute('src') === source, { fetchFn });
+	};
+	const fetchFn = vi.fn(respond);
+	const player = createPlayerController(initial, { flush: async () => { if (src() && !media.audio) attach(); } },
+		(node, source) => node.getAttribute('src') === source, { fetchFn });
 	onTestFinished(() => player.destroy());
 	const { media, queue } = player;
 	const refresh = () => {
@@ -67,13 +68,15 @@ export function setup(privateTtlSeconds = 60) {
 		media.attach(audio as unknown as HTMLAudioElement);
 		return audio;
 	}
-	const mountOnFlush = () => { flush = () => { if (src() && !media.audio) attach(); }; };
 	function delayGrant() {
-		const started = Promise.withResolvers<void>(), reply = Promise.withResolvers<Response>();
-		fetchFn.mockImplementationOnce(() => { started.resolve(); return reply.promise; });
+		const started = Promise.withResolvers<void>(), reply = Promise.withResolvers<Response | undefined>();
+		fetchFn.mockImplementationOnce(async (...args) => {
+			started.resolve();
+			return (await reply.promise) ?? respond(...args);
+		});
 		return { started: started.promise, reply: reply.resolve };
 	}
-	return { player, media, queue, fetchFn, starts, lifetime, refresh, src, play, attach, mountOnFlush, delayGrant };
+	return { player, media, queue, fetchFn, starts, lifetime, refresh, src, play, attach, delayGrant };
 }
 
 export const refusedContinuations = (tab: string) => [

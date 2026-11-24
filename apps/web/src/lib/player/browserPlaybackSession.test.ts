@@ -2,16 +2,17 @@ import { expect, onTestFinished, test, vi } from 'vitest';
 import { expireInsideRequestWindow, grantReply, initial, refusedContinuations, setup } from './fixtures/browserPlayback.js';
 
 test('new plays use the acknowledged mode in the same tab and continuations keep the established source', async () => {
-	const { player, media, queue, fetchFn, starts, refresh, src, attach, mountOnFlush } = setup();
-	expect(player.privateListening?.enabled).toBe(false);
+	const { player, media, queue, fetchFn, starts, refresh, src, attach, delayGrant } = setup();
 	media.captureShareSeek(media.beginShareInput(), { trackId: 'first', seconds: 18 }, () => true);
-	mountOnFlush();
-	expect([src(), fetchFn.mock.calls.length]).toEqual(['', 0]);
-	await media.playCurrent();
+	expect([player.privateListening?.enabled, src(), fetchFn.mock.calls.length]).toEqual([false, '', 0]);
+	const delayed = delayGrant(), starting = media.playCurrent();
+	await delayed.started;
+	const enabling = player.setPrivateListening(true);
+	delayed.reply(undefined);
+	await Promise.all([starting, enabling]);
 	const first = src(), tab = first.split('/')[5];
 	expect([first, media.audio?.currentTime]).toEqual([`/v1/plays/media/first/${tab}/play-1`, 18]);
 	const audio = attach();
-	await player.setPrivateListening(true);
 	expect(player.privateListening?.enabled).toBe(true);
 	refresh();
 	await media.playCurrent();
@@ -26,7 +27,9 @@ test('new plays use the acknowledged mode in the same tab and continuations keep
 	expect([src(), audio.currentTime, audio.load.mock.calls.length]).toEqual([first, 36, 1]);
 	expect(fetchFn.mock.calls.slice(2).map(([, init]) => JSON.parse(String(init?.body)).play_id)).toEqual(Array(3).fill('play-1'));
 	media.next();
-	await vi.waitFor(() => expect(src()).toBe(`/v1/plays/media/second/${tab}/play-2`));
+	expect([src(), fetchFn.mock.calls.length]).toEqual(['', 5]);
+	await media.playCurrent();
+	expect(src()).toBe(`/v1/plays/media/second/${tab}/play-2`);
 	expect(queue.snapshot.tracks).toEqual(initial.tracks);
 	await player.setPrivateListening(false);
 	media.setRepeat('queue', null);

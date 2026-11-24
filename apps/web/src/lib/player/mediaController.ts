@@ -224,10 +224,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (!target) return;
 		// Bulk-added slots carry metadata only. Keep the decoder unless Library can resolve the destination.
 		const source = queue.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || undefined);
-		if (selection.prepare && source) {
-			void preparePlay(target, source, (grant) => { selection.commit(next, grant); });
-			return;
-		}
+		if (selection.prepare && source?.isCurrent()) return void selection.commit(next);
 		if (!source?.streamUrl || !source.isCurrent()) return;
 		// Match Library Next's paused handoff, hydrating only the destination slot.
 		if (target.streamUrl === source.streamUrl) selection.commit(next);
