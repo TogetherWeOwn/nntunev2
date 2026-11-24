@@ -56,7 +56,7 @@ pub fn make_s3_fixture() -> PlaybackFixture {
     }
 }
 
-#[wasm_bindgen]
+#[wasm_bindgen(wasm_bindgen_futures = worker::wasm_bindgen_futures)]
 impl PlaybackFixture {
     pub fn ciphertext(&self) -> Vec<u8> {
         self.cipher.clone()
@@ -154,12 +154,9 @@ impl PlaybackFixture {
             return Ok(Vec::new());
         }
         if fault == "drop-read" {
-            let timed = select(
-                pin!(Delay::from(Duration::from_millis(100))),
-                pin!(play.next((&versions[0], &self.page), now)),
-            )
-            .await;
-            return match timed {
+            let delay = pin!(Delay::from(Duration::from_millis(100)));
+            let read = pin!(play.next((&versions[0], &self.page), now));
+            return match select(delay, read).await {
                 Either::Left(((), _)) => Ok(Vec::new()),
                 Either::Right(_) => Err(refused()),
             };
