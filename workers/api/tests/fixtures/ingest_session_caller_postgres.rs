@@ -89,6 +89,7 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         Some(Fault::Digest),
         Some(Fault::Revoked),
         Some(Fault::Retention),
+        Some(Fault::Quarantined),
     ]
     .into_iter()
     .enumerate()
@@ -102,6 +103,7 @@ enum Fault {
     Digest,
     Revoked,
     Retention,
+    Quarantined,
 }
 
 async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fault: Option<Fault>) {
@@ -472,6 +474,48 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
         })
         .await
         .unwrap();
+    if matches!(fault, Some(Fault::Quarantined)) {
+        // Make the winner unreadable only at the outer commit. The observer
+        // owns this fixture trigger; the writer's grants stay unchanged.
+        observer
+            .batch_execute(&format!(
+                "CREATE FUNCTION public.fixture_quarantine_at_commit() RETURNS trigger
+             LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+             BEGIN
+                 UPDATE public.storage_validated_digest_winners SET quarantined = true
+                 WHERE object_id = '{obj}'::uuid;
+                 RETURN NEW;
+             END $$;
+             REVOKE ALL ON FUNCTION public.fixture_quarantine_at_commit() FROM PUBLIC;
+             CREATE CONSTRAINT TRIGGER fixture_quarantine_at_commit
+             AFTER UPDATE ON public.ingest_session_reservations DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW WHEN (NEW.id = '{sid}'::uuid AND NEW.terminal_reason = 'completed')
+             EXECUTE FUNCTION public.fixture_quarantine_at_commit();"
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            opened
+                .commit(&mut writer, auth, &verified, now as i64 + 600)
+                .await,
+            Err(UploadError::Unconfirmed)
+        ));
+        let committed: bool = observer.query_one(
+            "SELECT s.terminal_reason = 'completed' AND s.write_lease_id IS NULL
+                    AND w.quarantined AND p.media_version = $4::text
+             FROM public.ingest_session_reservations s
+             JOIN public.storage_digest_inventory_intents p ON p.map_id = s.completed_map_id
+             JOIN public.storage_validated_digest_winners w ON w.object_id = s.multipart_object_id
+             WHERE s.id = $1::text::uuid AND p.map_id = $2::text::uuid AND w.object_id = $3::text::uuid",
+            &[&sid, &map_text, &obj, &MEDIA],
+        ).await.unwrap().get(0);
+        assert!(committed);
+        assert!(matches!(
+            read(&mut writer, auth, prepared).await,
+            Err(UploadError::Refused)
+        ));
+        return;
+    }
     if let Some(fault) = fault {
         let (auth, retain, expected) = match fault {
             Fault::Digest => (auth, now as i64 + 600, UploadError::Refused),
@@ -484,6 +528,7 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
                 UploadError::Refused,
             ),
             Fault::Retention => (auth, now as i64 - 1, UploadError::Unconfirmed),
+            Fault::Quarantined => unreachable!("checked above"),
         };
         assert!(
             matches!(opened.commit(&mut writer, auth, &verified, retain).await,
