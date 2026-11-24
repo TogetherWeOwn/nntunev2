@@ -1259,8 +1259,7 @@ and `private_routes_frozen` only after verifying and freezing all Worker,
 route, DNS and Access writers through readback. The job verifies the Worker
 and preview settings and seals the intent before traffic shifts. Custody
 evidence must be at most 30 minutes old when sealing. Keep the freeze in
-place through the health watch and any recovery readback, even after the
-freshness window for sealing has elapsed.
+place through the health watch and any recovery readback.
 The maintenance module digest must also match the reviewed candidate checkout.
 For a later release, supply `previous` in place of `maintenance` with the
 verified prior `version`, `deployment`, `sha`, and full upload `tag`.
@@ -1269,17 +1268,14 @@ Sealing requires the immutable prior version at 100% and passing build smoke.
 Failed final smoke keeps the release red and invokes the existing same-job
 restore. During the required 30-minute watch, dispatch `recover-worker` on
 `main` on regression or if promotion was interrupted at 100%. Supply the
-original promoted `sha` and `recovery_run_id` (attempt 1). Keep the original
-custody, intent key and accepted SHA in `production` through the watch.
-Recovery requires Environment approval and the shared mutation lock, including
-when new deployments are disabled.
+promoted `sha` and original `recovery_run_id` (attempt 1). Keep the original
+custody, key and accepted SHA in `production` through the watch. The approval
+and shared mutation lock apply even with new deployments disabled.
 
-Recovery authenticates the terminal source attempt and its sealed intent and
-requires its 5%, 50%, and 100% sequence at the head of the live history. It
-restores the recorded target at 100% and verifies readback. Re-entry checks the
-result without repeating a possible submission. If readback is inconclusive,
-reconcile the Worker, allocation, routes, and provider audit. Verify restored
-build health and identity, or maintenance behavior and private Access denials.
+Recovery verifies the sealed intent and the source run's contiguous 5%, 50%,
+and 100% rollout. Re-entry checks the active allocation without repeating a
+possible submission. On ambiguity, reconcile the Worker, routes, and provider
+audit. Verify restored build identity and health or the private maintenance behavior.
 
 ### First private release handoff
 
