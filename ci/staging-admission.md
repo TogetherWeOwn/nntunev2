@@ -40,46 +40,6 @@ passed product criterion even when Playwright calls the overall test green.
 No skip is automatically an applicability exclusion. Unsupported proof types
 require reviewed evaluator changes, not boolean inputs.
 
-### Private music producer interface
-
-The reviewed contract can select `journey: "private-music"`. Contracts without
-that field select the ordinary journey. The private contract must map each of
-`upload-to-library`, `play`, `seek`, `queue`, `anonymous-refused`,
-`unlisted-refused`, `revoked-or-expired-refused` and `video-off` to its own case
-with `classname="private-music"` and `name` equal to the criterion ID. Paid
-acceptance is separate. Upload evidence requires actual upload and publication
-through Library arrival. Playing a prepublished fixture cannot satisfy it.
-
-The protected main-push job `post-deploy private music journey` must complete
-`Qualify private listening`, `Record candidate admission receipt` and
-`Upload candidate admission receipt` in order, after the web, API and Stream
-deployment steps succeed in the same attempt. Its producer calls
-`python3 -I ci/staging_admission.py produce-private` with the existing API job
-outputs, the bounded report at `e2e/private-staging-results/admission.xml`, and
-`PRIVATE_STAGING_DEPLOYMENTS` containing the three deployment pins. Keys are
-`staging-web`, `staging-api` and `staging-stream`. Each pin has `worker`,
-`build_sha`, `version_id` and `deployment_id` for the deployed staging Worker,
-plus decimal string `run_id` and `run_attempt` captured by that deployment job.
-Version and deployment IDs are lowercase UUIDs. The producer verifies the
-armed Stream mode before recording its pin.
-
-The reporter derives cases from actual protected Playwright results and emits
-the observed `retry="0"` on first-attempt cases, including the identity cases.
-Missing, duplicate, skipped, expected-failed, retried or failed cases refuse.
-The `build-identity` and `build-identity-final` cases use the same class and
-carry the existing `candidate-identity` properties, plus a `deployments` map
-with the four provider identity fields per lane. Read these independently
-from provider state at both boundaries. The verifier compares them with the
-deploy job pins. It also binds `fixtures/synthetic-flac/private-staging/` and
-checks for intervening mutations in all three lanes, including other root runs
-of the same commit. The artifact name adds `-private-music` to the existing
-name. Its single `staging-admission.json` member carries the private `journey`
-and pins. Raw XML, failure details and credentials stay off the artifact.
-
-Protected producer wiring, live evidence and reviewed approval are separate
-release work. The current production workflow's preliminary job check still
-expects the ordinary journey.
-
 The trusted policy has `schema: 1`, the evaluator and exactly one current approval
 when available. An entry pins `sha256` of the exact contract bytes, the same
 `spec_revision`, and immutable repository-safe `product_approval` and `qa_approval`
@@ -198,6 +158,46 @@ not a new age TTL, soak, passive-production baseline or continuous staging
 reservation. Per-lane locks do not prove uninterrupted staging ownership. These
 observations do not replace independent runtime QA, incident/drill clearance,
 release acceptance, ledger/N-1 compatibility or separate operator execution.
+
+## Private music producer interface
+
+The reviewed contract can select `journey: "private-music"`. Contracts without
+that field select the ordinary journey. The private contract must map each of
+`upload-to-library`, `play`, `seek`, `queue`, `anonymous-refused`,
+`unlisted-refused`, `revoked-or-expired-refused` and `video-off` to its own case
+with `classname="private-music"` and `name` equal to the criterion ID. Paid
+acceptance is separate. Upload evidence requires actual upload and publication
+through Library arrival. Playing a prepublished fixture cannot satisfy it.
+
+The protected main-push job `post-deploy private music journey` must complete
+`Qualify private listening`, `Record candidate admission receipt` and
+`Upload candidate admission receipt` in order, after the web, API and Stream
+deployment steps succeed in the same attempt. Its producer calls
+`python3 -I ci/staging_admission.py produce-private` with the existing API job
+outputs, the bounded report at `e2e/private-staging-results/admission.xml`, and
+`PRIVATE_STAGING_DEPLOYMENTS` containing the three deployment pins. Keys are
+`staging-web`, `staging-api` and `staging-stream`. Each pin has `worker`,
+`build_sha`, `version_id` and `deployment_id` for the deployed staging Worker,
+plus decimal string `run_id` and `run_attempt` captured by that deployment job.
+Version and deployment IDs are lowercase UUIDs. The producer verifies the
+armed Stream mode before recording its pin.
+
+The reporter derives cases from actual protected Playwright results and emits
+the observed `retry="0"` on first-attempt cases, including the identity cases.
+Missing, duplicate, skipped, expected-failed, retried or failed cases refuse.
+The `build-identity` and `build-identity-final` cases use the same class and
+carry the existing `candidate-identity` properties, plus a `deployments` map
+with the four provider identity fields per lane. Read these independently
+from provider state at both boundaries. The verifier compares them with the
+deploy job pins. It also binds `fixtures/synthetic-flac/private-staging/` and
+checks for intervening mutations in all three lanes, including other root runs
+of the same commit. The artifact name adds `-private-music` to the existing
+name. Its single `staging-admission.json` member carries the private `journey`
+and pins. Raw XML, failure details and credentials stay off the artifact.
+
+Protected producer wiring, live evidence and reviewed approval are separate
+release work. The current production workflow's preliminary job check still
+expects the ordinary journey.
 
 ## Offline verification
 

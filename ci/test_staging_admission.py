@@ -45,6 +45,14 @@ CONTRACT = {
     ],
 }
 CONTRACT_BYTES = json.dumps(CONTRACT).encode()
+PRIVATE_CASES = ("upload-to-library", "play", "seek", "queue", "anonymous-refused",
+                 "unlisted-refused", "revoked-or-expired-refused", "video-off")
+PRIVATE_CONTRACT = dict(CONTRACT, journey="private-music", criteria=[
+    {"id": name, "applicable": True,
+     "evidence": [{"classname": "private-music", "name": name, "outcome": "passed"}]}
+    for name in PRIVATE_CASES
+])
+PRIVATE_CONTRACT_BYTES = json.dumps(PRIVATE_CONTRACT).encode()
 
 
 def make_policy(contract_bytes=CONTRACT_BYTES):
@@ -67,6 +75,29 @@ def make_junit(skip=False, fail=False, omit=False, final_sha=SHA):
         value = {"phase": phase, "web": web, "api": SHA, "expected": SHA, "observed_at": iso(minutes)}
         ET.SubElement(props, "property", name="candidate-identity", value=json.dumps(value))
     return ET.tostring(suite)
+
+
+def private_pins():
+    return {f"staging-{name}": {"worker": f"nntune-{name}-staging", "build_sha": SHA,
+            "version_id": f"00000000-0000-4000-8000-{index:012d}",
+            "deployment_id": f"10000000-0000-4000-8000-{index:012d}",
+            "run_id": str(RUN_ID), "run_attempt": "1"}
+            for index, name in enumerate(("web", "api", "stream"), 1)}
+
+
+def private_report(pins):
+    suite = ET.Element("testsuite")
+    for name in PRIVATE_CASES:
+        ET.SubElement(suite, "testcase", classname="private-music", name=name, retry="0")
+    observations = {lane: {k: v for k, v in pin.items() if k not in ("run_id", "run_attempt")}
+                    for lane, pin in pins.items()}
+    for phase, minutes in (("build-identity", -3), ("build-identity-final", -2)):
+        case = ET.SubElement(suite, "testcase", classname="private-music", name=phase, retry="0")
+        props = ET.SubElement(case, "properties")
+        value = {"phase": phase, "web": SHA, "api": SHA, "expected": SHA,
+                 "observed_at": iso(minutes), "deployments": observations}
+        ET.SubElement(props, "property", name="candidate-identity", value=json.dumps(value))
+    return suite
 
 
 def make_env(**over):
@@ -115,12 +146,13 @@ def page(key, rows, total=None):
 class World:
     """Coherent synthetic run: one main-push attempt, three green jobs, one receipt."""
 
-    def __init__(self, env=None, xml=None, policy=None, contract_bytes=CONTRACT_BYTES, manifest=MANIFEST):
+    def __init__(self, env=None, xml=None, policy=None, contract_bytes=CONTRACT_BYTES, manifest=MANIFEST,
+                 private_deployments=None):
         self.policy = policy or make_policy(contract_bytes)
         self.contract_bytes = contract_bytes
         self.manifest = manifest
         self.receipt = sa.produce(make_env(**(env or {})), xml or make_junit(), self.policy,
-                                  contract_bytes, manifest)
+                                  contract_bytes, manifest, private_pins=private_deployments)
         self.workflow = {"id": WORKFLOW_ID, "path": sa.WORKFLOW, "state": "active"}
         repo = {"full_name": REPO, "id": REPO_ID}
         self.run = {"id": RUN_ID, "run_attempt": 1, "workflow_id": WORKFLOW_ID, "path": sa.WORKFLOW,
@@ -152,7 +184,8 @@ class World:
         self.archive = archive if archive is not None else make_zip(
             [("staging-admission.json", json.dumps(self.receipt))])
         self.artifact = {
-            "id": ARTIFACT_ID, "name": sa.artifact_name(SHA, RUN_ID, 1), "expired": False,
+            "id": ARTIFACT_ID, "name": sa.artifact_name(SHA, RUN_ID, 1, self.receipt.get("journey")),
+            "expired": False,
             "size_in_bytes": len(self.archive), "digest": "sha256:" + sa.digest(self.archive),
             "expires_at": iso(60 * 24),
             "workflow_run": {"id": RUN_ID, "repository_id": REPO_ID, "head_repository_id": REPO_ID,
@@ -224,6 +257,127 @@ class Base(unittest.TestCase):
 
     def assertWorldRefused(self, world, reason, **kw):
         self.refused(reason, world.verify, **kw)
+
+
+class PrivateWorld(World):
+    def __init__(self):
+        pins = private_pins()
+        super().__init__(env={"JOURNEY_GATE": ""}, xml=ET.tostring(private_report(pins)),
+                         contract_bytes=PRIVATE_CONTRACT_BYTES, private_deployments=pins)
+        self.jobs = [self.job(lane, -10, steps=[self.step(step, 1)]) for lane, step in (
+            ("staging-web", "Deploy to staging"), ("staging-api", "Deploy api to staging"),
+            ("staging-stream", "Deploy stream to staging"))]
+        self.jobs.append(self.job("post-deploy private music journey", 5, started=-9, steps=[
+            self.step("Qualify private listening", 1), self.step(sa.RECORD, 2), self.step(sa.UPLOAD, 3)]))
+
+
+class PrivateAdmissionTests(Base):
+    def test_exact_private_receipt(self):
+        world = PrivateWorld()
+        receipt = world.verify()
+        self.assertEqual(receipt["coverage"], [{"id": name, "outcome": "passed"} for name in PRIVATE_CASES])
+        self.assertEqual(receipt["deployments"], private_pins())
+        self.assertTrue(world.artifact["name"].endswith("-private-music"))
+
+    def test_private_receipt_requires_reviewed_policy_and_private_job(self):
+        world = PrivateWorld()
+        world.receipt["approved"] = True
+        world.set_archive()
+        empty_policy = dict(world.policy, approvals=[])
+        self.assertWorldRefused(world, "unavailable or ambiguous", policy=empty_policy)
+        world.jobs[-1] = World().jobs[-1]
+        self.assertWorldRefused(world, "missing or ambiguous required staging job")
+
+    def test_ordinary_report_and_producer_cannot_supply_private_cases(self):
+        pins = private_pins()
+        policy = make_policy(PRIVATE_CONTRACT_BYTES)
+        for xml, args in ((make_junit(), {"private_pins": pins}), (ET.tostring(private_report(pins)), {})):
+            receipt = sa.produce(make_env(), xml, policy, PRIVATE_CONTRACT_BYTES, MANIFEST, **args)
+            self.assertEqual(receipt["result"], "incomplete")
+
+    def test_contract_cannot_exclude_or_substitute_upload_case(self):
+        for evidence in (None, [{"classname": "fixture", "name": "uploaded", "outcome": "passed"}]):
+            contract = copy.deepcopy(PRIVATE_CONTRACT)
+            upload = contract["criteria"][0]
+            if evidence is None:
+                upload.update(applicable=False, rationale="fixture already published")
+            else:
+                upload["evidence"] = evidence
+            data = json.dumps(contract).encode()
+            self.refused("private.*(criteria|criterion)", sa.approved_contract, make_policy(data), data)
+
+    def test_upload_case_must_pass_once_on_first_attempt(self):
+        pins = private_pins()
+        for outcome in ("absent", "skipped", "failure", "flakyFailure", "duplicate", "retried", "unknown-retry"):
+            with self.subTest(outcome=outcome):
+                suite = private_report(pins)
+                case = suite.find("testcase[@name='upload-to-library']")
+                if outcome == "absent":
+                    suite.remove(case)
+                elif outcome == "duplicate":
+                    suite.append(copy.deepcopy(case))
+                elif outcome == "retried":
+                    case.set("retry", "1")
+                elif outcome == "unknown-retry":
+                    del case.attrib["retry"]
+                else:
+                    ET.SubElement(case, outcome).text = "synthetic diagnostic"
+                receipt = sa.produce(make_env(), ET.tostring(suite), make_policy(PRIVATE_CONTRACT_BYTES),
+                                     PRIVATE_CONTRACT_BYTES, MANIFEST, private_pins=pins)
+                self.assertEqual(receipt["result"], "incomplete")
+                self.assertEqual(receipt["coverage"][0]["outcome"], "incomplete")
+                self.assertNotIn("synthetic diagnostic", json.dumps(receipt))
+
+    def test_private_jobs_and_deploy_steps_must_belong_to_the_attempt(self):
+        world = PrivateWorld()
+        stream = world.jobs[2]
+        stream["run_attempt"] = 2
+        self.assertWorldRefused(world, "did not pass in selected attempt")
+        stream["run_attempt"] = 1
+        stream["steps"][0]["conclusion"] = "skipped"
+        self.assertWorldRefused(world, "private deploy step did not pass")
+        stream["steps"][0]["conclusion"] = "success"
+        world.jobs[-1]["steps"].pop(1)
+        self.assertWorldRefused(world, "must succeed in order")
+
+    def test_private_receipt_rejects_other_root_attempt_or_deployment(self):
+        for field, value, reason in (("run_id", "99", "run or attempt mismatch"),
+                                     ("run_attempt", "2", "run or attempt mismatch"),
+                                     ("build_sha", OTHER_SHA, "invalid private deployment identity"),
+                                     ("version_id", "30000000-0000-4000-8000-000000000001", "different deployment"),
+                                     ("deployment_id", "40000000-0000-4000-8000-000000000001", "different deployment")):
+            with self.subTest(field=field):
+                world = PrivateWorld()
+                world.receipt["deployments"]["staging-stream"][field] = value
+                world.set_archive()
+                self.assertWorldRefused(world, reason)
+        world = PrivateWorld()
+        world.artifact["name"] = sa.artifact_name(SHA, RUN_ID, 1)
+        self.assertWorldRefused(world, "missing or ambiguous attempt-bound receipt")
+
+    def test_private_producer_refuses_a_different_closing_identity(self):
+        pins = private_pins()
+        suite = private_report(pins)
+        prop = suite.find("testcase[@name='build-identity-final']/properties/property")
+        closing = json.loads(prop.get("value"))
+        closing["deployments"]["staging-web"]["deployment_id"] = pins["staging-api"]["deployment_id"]
+        prop.set("value", json.dumps(closing))
+        receipt = sa.produce(make_env(), ET.tostring(suite), make_policy(PRIVATE_CONTRACT_BYTES),
+                             PRIVATE_CONTRACT_BYTES, MANIFEST, private_pins=pins)
+        self.assertEqual(receipt["result"], "incomplete")
+        self.assertEqual(receipt["reasons"], ["private journey observed different deployment identities"])
+
+    def test_intervening_stream_mutation_from_another_same_sha_run_refuses(self):
+        world = PrivateWorld()
+        world.add_other("skipped")
+        other_id = RUN_ID - 1
+        world.runs[-1].update(id=other_id, head_sha=SHA)
+        jobs = world.others[other_id] = world.others.pop(101)
+        stream = dict(jobs[0], name="staging-stream")
+        jobs.append(stream)
+        self.assertEqual(world.verify()["result"], "satisfied")
+        stream["conclusion"] = "success"
+        self.assertWorldRefused(world, "intervening staging deployment")
 
 
 class PolicyTests(Base):
@@ -820,7 +974,7 @@ class SourceBindingTests(Base):
             args.extend(["-p", parent])
         return self.git(*args).decode().strip()
 
-    def run_main(self, candidate_files=None, trusted_files=None, current_files=None):
+    def run_main(self, candidate_files=None, trusted_files=None, current_files=None, private=False):
         candidate = self.commit(candidate_files or self.files)
         trusted = self.commit(trusted_files or self.files, candidate)
         current = self.commit(current_files or trusted_files or self.files, trusted)
@@ -832,9 +986,12 @@ class SourceBindingTests(Base):
         self.git("update-ref", "refs/heads/main", current)
         self.git("config", "remote.origin.url", str(self.root))
         with patch.dict(globals(), SHA=candidate):
-            world = World(policy=self.policy, contract_bytes=self.contract,
-                          xml=make_junit(final_sha=candidate).replace(
-                              b'classname="journey"', b'classname="signup.spec.ts"'))
+            if private:
+                world = PrivateWorld()
+            else:
+                world = World(policy=self.policy, contract_bytes=self.contract,
+                              xml=make_junit(final_sha=candidate).replace(
+                                  b'classname="journey"', b'classname="signup.spec.ts"'))
             actions = FakeActions(world.routes())
         env = make_env(GITHUB_SHA=trusted, DEPLOY_SHA=candidate, GITHUB_EVENT_NAME="workflow_dispatch",
                        GITHUB_REPOSITORY_ID=str(REPO_ID), GITHUB_TOKEN="synthetic-token")
@@ -846,7 +1003,8 @@ class SourceBindingTests(Base):
                 sa.main()
             live.assert_called_once_with(sa.os.environ, candidate)
             source_git.assert_any_call("merge-base", "--is-ancestor", candidate, current)
-            source_git.assert_any_call("ls-tree", "-z", current, "--", *sa.TRUSTED_TREES, *sa.TRUSTED_FILES)
+            trees = (*sa.TRUSTED_TREES, "fixtures/synthetic-flac/private-staging") if private else sa.TRUSTED_TREES
+            source_git.assert_any_call("ls-tree", "-z", current, "--", *trees, *sa.TRUSTED_FILES)
             source_git.assert_any_call("show", f"{current}:migrations/manifest.toml")
         self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), trusted)
         self.assertEqual(self.git("rev-parse", "origin/main").decode().strip(), trusted)
@@ -856,6 +1014,17 @@ class SourceBindingTests(Base):
     def test_main_accepts_matching_closure_despite_unrelated_main_movement(self):
         current = dict(self.files, **{"docs/unrelated.md": ("100644", b"unrelated main change")})
         self.run_main(current_files=current)
+
+    def test_private_main_binds_synthetic_audio_tree(self):
+        self.files[sa.CONTRACT] = ("100644", PRIVATE_CONTRACT_BYTES)
+        self.files[sa.POLICY] = ("100644", json.dumps(make_policy(PRIVATE_CONTRACT_BYTES)).encode())
+        for name in (sa.CONTRACT, sa.POLICY):
+            (self.root / name).write_bytes(self.files[name][1])
+        fixture = "fixtures/synthetic-flac/private-staging/fixture"
+        self.files[fixture] = ("100644", b"synthetic input")
+        self.run_main(private=True)
+        corrected = dict(self.files, **{fixture: ("100644", b"different synthetic input")})
+        self.refused("producer.*drift", self.run_main, current_files=corrected, private=True)
 
     def test_main_source_binding_is_independent_of_initial_branch(self):
         for initial_branch in ("main", "master"):
