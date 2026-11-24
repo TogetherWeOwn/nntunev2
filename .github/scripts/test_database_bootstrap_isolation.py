@@ -620,7 +620,7 @@ def prove_reader_lifecycle(cluster, pending):
         "wrong custodian session", **launch)
     cluster.denied("refuse inherited PUBLIC access to unrelated databases", activate, "reader scope refused", **launch)
     cluster.ok("reconcile the disposable cluster's PUBLIC database grants explicitly", f"""
-        GRANT CONNECT ON DATABASE postgres TO {CREATOR}, {ISSUER}, {READER}, {READER_ISSUER};
+        GRANT CONNECT ON DATABASE postgres TO {READER_ISSUER};
         REVOKE CONNECT ON DATABASE postgres, template1 FROM PUBLIC;
     """)
     cluster.ok("model a wider PUBLIC column grant", "GRANT UPDATE (id) ON reader_scope.leaf TO PUBLIC;", database=LAUNCH)
@@ -672,6 +672,7 @@ def prove_reader_lifecycle(cluster, pending):
             require(holder.returncode != 0 and not stdout, "observe the reader server session terminate")
         cluster.ok("restore the disposable maintenance grants and remove fixture relations", f"""
             GRANT CONNECT ON DATABASE postgres, template1 TO PUBLIC;
+            REVOKE CONNECT ON DATABASE postgres FROM {READER_ISSUER};
             DROP SCHEMA reader_scope CASCADE;
         """, database=LAUNCH)
 
