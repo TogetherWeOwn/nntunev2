@@ -12832,7 +12832,7 @@ mod tests {
                 origin,
             )
         };
-        let buy = |h| checkout(h, "plus", Some(cookie.clone()), Some(ORIGIN));
+        let buy = |h: &Harness| checkout(h, "plus", Some(cookie.clone()), Some(ORIGIN));
         assert_eq!(buy(&h).status, 404);
         h.config.paid_invite_billing = true;
         assert_eq!(buy(&h).status, 404);
