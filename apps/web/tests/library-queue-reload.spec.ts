@@ -131,7 +131,7 @@ test('share verification preserves a pending route navigation and consumes the L
 		await page.evaluate(() => {
 			const link = document.createElement('a');
 			link.href = '/account/security';
-			link.dataset.sveltekitPreloadData = 'off';
+			link.dataset.sveltekitPreloadData = 'false';
 			link.textContent = 'Open account security';
 			document.body.append(link);
 		});
