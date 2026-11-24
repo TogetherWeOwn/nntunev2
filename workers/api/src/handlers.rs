@@ -5054,6 +5054,10 @@ mod browser_playback_relay;
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
 
+#[allow(dead_code)] // Draft only; not registered in dispatch or preflight.
+#[path = "private_playlists.rs"]
+mod private_playlists;
+
 // --- Native REST credentials (ADR 0010) ------------------------------------------------------
 //
 // Session-authenticated issuance surface only: `POST /v1/credentials`
@@ -8735,6 +8739,11 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::task::{Context as TaskContext, Poll, Waker};
+
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    mod private_playlist_postgres {
+        include!("private_playlists_postgres_tests.rs");
+    }
 
     fn block_on<F: Future>(future: F) -> F::Output {
         let waker = Waker::noop();

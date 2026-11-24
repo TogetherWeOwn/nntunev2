@@ -15,7 +15,7 @@ CREATE TEMP TABLE legacy_before AS SELECT to_jsonb(p) AS row FROM public.playlis
 CREATE TEMP TABLE fixture_tracks AS
 SELECT handle, gen_random_uuid() AS id FROM (
     SELECT e->>'track_public_id' AS handle FROM fixture_cases c, jsonb_array_elements(c.entries) e
-    WHERE e->>'status' = 'resolved' UNION SELECT 'new-track'
+    WHERE e->>'status' = 'resolved' UNION SELECT 'new-track' UNION SELECT 'inactive-track'
 ) handles;
 INSERT INTO public.tracks (id, release_id, title, medium_no, track_no)
 SELECT id, gen_random_uuid(), handle, 1, 1 FROM fixture_tracks;
@@ -26,7 +26,7 @@ FROM fixture_cases c CROSS JOIN LATERAL jsonb_array_elements(c.entries) e
 JOIN fixture_tracks t ON t.handle = e->>'track_public_id' WHERE e->>'status' = 'resolved'
 -- A stale mapping for the wrong ref must not fill an unresolved slot.
 UNION ALL SELECT 9002, 1, 'not-the-original-ref', id FROM fixture_tracks WHERE handle = 'new-track';
-CREATE TEMP TABLE synthetic_memberships AS
+CREATE TEMP TABLE fixture_memberships AS
 SELECT 'fixture-user-owner'::text AS owner_id, id AS track_id FROM fixture_tracks
 WHERE handle IN ('new-track', 'trkRpRepeat00000000000', 'trkFrAlpha000000000000')
 UNION ALL SELECT 'fixture-user-other', id FROM fixture_tracks WHERE handle IN ('new-track', 'trkRpMiddle00000000000');
@@ -187,6 +187,7 @@ ROLLBACK TO applied_legacy;
 DO $$
 BEGIN
     IF to_regclass('public.playlist_tracks') IS NOT NULL
+        OR to_regclass('public.libraries') IS NOT NULL OR to_regclass('public.library_tracks') IS NOT NULL
         OR to_regnamespace('private_playlist_rehearsal') IS NOT NULL
         OR EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'public.playlists'::regclass
             AND attname = 'deleting_at' AND NOT attisdropped)
@@ -217,7 +218,6 @@ DO $$
 DECLARE
     c record;
     writer_pid integer := (SELECT pid FROM public.dblink('writer', 'SELECT pg_backend_pid()') AS w(pid integer));
-    deadline timestamptz;
 BEGIN
     IF (SELECT count(DISTINCT account_scope) FROM pg_temp.race_cases) <> 2 THEN
         RAISE EXCEPTION 'both deletion scopes must be tested';
@@ -247,12 +247,7 @@ BEGIN
         IF public.dblink_send_query('writer', format('SELECT add_track(%L,%L,%L)', c.owner_id, c.handle, c.late)) <> 1 THEN
             RAISE EXCEPTION 'could not send late append';
         END IF;
-        -- Prove the writer is queued behind this transaction, rather than timing by sleeps alone.
-        deadline := clock_timestamp() + interval '3 seconds';
-        WHILE NOT pg_backend_pid() = ANY(pg_blocking_pids(writer_pid)) LOOP
-            IF clock_timestamp() >= deadline THEN RAISE EXCEPTION 'late append did not wait (account=%)', c.account_scope; END IF;
-            PERFORM pg_sleep(0.01);
-        END LOOP;
+        PERFORM await_blocked(writer_pid);
         COMMIT;
         IF NOT EXISTS (SELECT FROM public.dblink_get_result('writer') AS r(id uuid) WHERE id IS NULL) THEN
             RAISE EXCEPTION 'queued append crossed the committed deletion fence (account=%)', c.account_scope;
@@ -266,4 +261,6 @@ BEGIN
 END;
 $$;
 SELECT public.dblink_disconnect('writer');
+-- Restore the synthetic second owner for the Rust store's cross-owner checks.
+UPDATE public.users SET deleting_at = NULL WHERE id = 'fixture-user-other';
 \echo Private playlist rehearsal: upgrade, owner CRUD, concurrent fences and rollback passed
