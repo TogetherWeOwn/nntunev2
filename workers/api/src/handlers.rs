@@ -1958,6 +1958,13 @@ pub trait Store {
     ) -> impl Future<Output = Result<Vec<crate::catalogue::LibraryDbRow>, StoreError>> {
         async { Ok(Vec::new()) }
     }
+    fn private_library(
+        &self,
+        _user_id: &str,
+        _policy: &crate::private_listening::PrivateListening,
+    ) -> impl Future<Output = Result<Vec<crate::catalogue::LibraryEntry>, StoreError>> {
+        async { Ok(Vec::new()) }
+    }
     /// Caller-member artist collection page (only artists of the caller's
     /// member releases).
     fn catalogue_artists(
@@ -4880,10 +4887,31 @@ where
     D: Dialer,
     N: AsyncDns,
 {
+    let mut entries = Vec::new();
+    // Reserve the first page for recent private admissions, then fill any
+    // remaining slots in the existing legacy order.
+    if let Some(policy) = ctx
+        .cfg
+        .private_listening
+        .as_ref()
+        .filter(|policy| policy.library_scope.is_some())
+    {
+        entries = match ctx.store.private_library(user_id, policy).await {
+            Ok(entries) => entries,
+            Err(_) => return internal(),
+        };
+        if entries.len() == crate::catalogue::CATALOGUE_MAX_PAGE_SIZE {
+            return catalogue_response(&entries);
+        }
+    }
     match ctx.store.catalogue_library(user_id).await {
         Ok(rows) => {
-            let entries: Vec<crate::catalogue::LibraryEntry> =
-                rows.iter().map(crate::catalogue::library_entry).collect();
+            let remaining = crate::catalogue::CATALOGUE_MAX_PAGE_SIZE.saturating_sub(entries.len());
+            entries.extend(
+                rows.iter()
+                    .take(remaining)
+                    .map(crate::catalogue::library_entry),
+            );
             catalogue_response(&entries)
         }
         Err(_) => internal(),
@@ -9131,6 +9159,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(
+        feature = "postgres-tests",
+        feature = "encrypted-upload-caller",
+        not(target_arch = "wasm32")
+    ))]
+    mod private_library_postgres {
+        include!("../tests/fixtures/private_library_postgres.rs");
+    }
+
     use super::{dispatch_browser_session as browser, *};
     use crate::native_rest::BrowserSessionRoute::{LikeTrack, TasteList, UnlikeTrack};
     use std::cell::RefCell;

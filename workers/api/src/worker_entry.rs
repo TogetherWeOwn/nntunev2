@@ -5801,6 +5801,22 @@ impl Store for PgStore {
         .await
     }
 
+    async fn private_library(
+        &self,
+        user_id: &str,
+        policy: &crate::private_listening::PrivateListening,
+    ) -> Result<Vec<crate::catalogue::LibraryEntry>, StoreError> {
+        Self::bounded(
+            async {
+                crate::private_library::page(&self.connect().await?, user_id, policy)
+                    .await
+                    .map_err(|_| self.statement_failed("api.db.statement_failed.catalogue_library"))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
     /// Member-scoped artist collection: the caller's distinct member
     /// releases from the app ledger (the whole ledger, uncapped — capping
     /// the input at the page size drops artists whose releases sort past

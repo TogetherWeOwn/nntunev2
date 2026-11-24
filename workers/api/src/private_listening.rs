@@ -8,6 +8,7 @@ pub struct PrivateListening {
     pub(crate) owner_user_id: String,
     pub(crate) invite_ids: Vec<i64>,
     pub(crate) expires_at: u64,
+    pub(crate) library_scope: Option<crate::private_library::Scope>,
 }
 
 impl PrivateListening {
@@ -20,6 +21,10 @@ impl PrivateListening {
             || policy.expires_at == 0
             || policy.invite_ids.len() > 8
             || policy.invite_ids.iter().any(|id| *id <= 0)
+            || policy
+                .library_scope
+                .as_ref()
+                .is_some_and(|scope| !scope.valid())
         {
             return None;
         }

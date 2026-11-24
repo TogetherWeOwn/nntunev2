@@ -65,6 +65,7 @@ pub mod playback;
 pub mod postgres;
 pub mod preference_rows;
 pub mod private_catalogue_read;
+pub mod private_library;
 pub mod private_listening;
 pub mod private_playback;
 pub mod random;
