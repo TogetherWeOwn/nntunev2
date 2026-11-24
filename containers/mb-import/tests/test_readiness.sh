@@ -29,6 +29,7 @@ PGOPTIONS='-c search_path=public,pg_catalog' db \
 db <<'SQL'
 CREATE ROLE fixture_observer LOGIN;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO fixture_observer;
+ALTER ROLE fixture_observer SET log_statement = 'all';
 SQL
 
 # Reuse the ETL's synthetic golden projections, swapping out art and URL
@@ -111,6 +112,11 @@ echo '=== Completed import ==='
 MB_VALIDATE_BIN=mb-validate bash /job/import.sh "$scratch/curated"
 expect_readiness 0 evidence 'track: ok cursor=4 rows=4 dlq=0' \
   'probe 1: search=ok recordings=ok' 'probe 2: search=ok recordings=ok' 'readiness: PASS'
+# Trigram search can return the same hit for the original term. Verify that
+# PostgreSQL received the normalized "a release" in the fixture's private log.
+grep -Fq "EXECUTE release_search(convert_from(decode('612072656c65617365', 'hex'), 'UTF8'));" \
+  "$scratch/postgres.log"
+echo 'ok: PostgreSQL received the normalized release search term'
 
 echo '=== Wrong evidence against completed import ==='
 expect_readiness 1 mismatch 'url: mismatch cursor=None rows=3 dlq=0' \
