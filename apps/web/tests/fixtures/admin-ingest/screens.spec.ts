@@ -193,3 +193,100 @@ test('an opaque review denial clears previous queue data and actions', async ({ 
 	await expect(page.getByRole('button', { name: 'Retry match' })).toHaveCount(0);
 	await expect(page.getByText('fixture-private-diagnostic')).toHaveCount(0);
 });
+
+const pendingReview = { job_id: 'pending-review', status: 'needs_review', revision: 4 };
+
+test('invalid queue responses cannot render a review page', async ({ page, ingestOrigin }) => {
+	const replies = [
+		queuePage([pendingReview]),
+		queuePage([pendingReview, pendingReview]),
+		queuePage([{ ...pendingReview, status: 'accepted' }]),
+		queuePage([pendingReview], 50),
+		{ status: 200, body: { jobs: [pendingReview], limit: 49, offset: 0 } },
+		queuePage(Array.from({ length: 51 }, (_, i) => ({ ...pendingReview, job_id: `job-${i}` }))),
+		queuePage([pendingReview])
+	];
+	await page.exposeFunction('queueFixture', () => replies.shift());
+	await openScreens(page, ingestOrigin, 'owner', true);
+	const queue = page.getByRole('list', { name: 'Review queue' });
+	await expect(queue).toBeVisible();
+	await page.getByLabel('Status', { exact: true }).selectOption('needs_review');
+	for (let remaining = 5; remaining >= 1; remaining--) {
+		await page.getByRole('button', { name: 'Refresh queue' }).click();
+		await expect(page.getByRole('alert')).toHaveText('Review could not be loaded. Try again.');
+		await expect(queue).toHaveCount(0);
+		expect(replies).toHaveLength(remaining);
+	}
+	await page.getByRole('button', { name: 'Refresh queue' }).click();
+	await expect(queue).toBeVisible();
+	expect(replies).toHaveLength(0);
+});
+
+test('detail and retry responses must match the requested job and revision', async ({ page, ingestOrigin }) => {
+	const foreign = 'wrong-review-job';
+	const published = { ...pendingReview, status: 'published', revision: 5 };
+	const replies = [
+		{ ...published, job_id: foreign },
+		{ ...published, revision: 6 },
+		{ ...published, status: 'failed' },
+		published
+	];
+	let detailId = foreign;
+	await page.exposeFunction('queueFixture', () => queuePage([pendingReview]));
+	await page.exposeFunction('detailFixture', () => ({ status: 200, body: { ...pendingReview, job_id: detailId } }));
+	const revisions: number[] = [];
+	await page.exposeFunction('retryFixture', (_id: string, { revision }: { revision: number }) => {
+		revisions.push(revision);
+		return { status: 200, body: replies.shift() };
+	});
+	await openScreens(page, ingestOrigin, 'owner', true);
+	const open = page.getByRole('button', { name: 'Open job pending-review' });
+	const retry = page.getByRole('button', { name: 'Retry match' });
+	await open.click();
+	await expect(page.getByRole('alert')).toHaveText('Review could not be loaded. Try again.');
+	await expect(page.getByText(foreign, { exact: false })).toHaveCount(0);
+	await expect(retry).toHaveCount(0);
+
+	detailId = pendingReview.job_id;
+	await open.click();
+	for (let attempt = 1; attempt <= 3; attempt++) {
+		await retry.click();
+		await expect(page.getByRole('alert')).toContainText('Retry could not be confirmed.');
+		await expect(page.getByText('Job published.')).toHaveCount(0);
+		await expect(page.getByText(foreign, { exact: false })).toHaveCount(0);
+		expect(revisions).toEqual(Array(attempt).fill(4));
+	}
+	await retry.click();
+	await expect(page.getByText('Job published.')).toBeVisible();
+	expect(revisions).toEqual([4, 4, 4, 4]);
+});
+
+test('a page hidden during detail aborts the old request and cached restore reloads', async ({ page, ingestOrigin }) => {
+	const started = Promise.withResolvers<void>();
+	const detail = Promise.withResolvers<{ status: number; body: typeof pendingReview }>();
+	let queueReads = 0;
+	await page.exposeFunction('queueFixture', () => {
+		queueReads++;
+		return queuePage(queueReads === 1 ? [pendingReview] : []);
+	});
+	await page.exposeFunction('detailFixture', () => {
+		started.resolve();
+		return detail.promise;
+	});
+	await openScreens(page, ingestOrigin, 'owner', true);
+	await page.getByRole('button', { name: 'Open job pending-review' }).click();
+	await started.promise;
+	await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })));
+	await expect(page.getByRole('heading', { name: 'Page not found' })).toBeVisible();
+	detail.resolve({ status: 200, body: pendingReview });
+	await expect.poll(() => page.evaluate(() => window.detailAbortedAtReply)).toBe(true);
+	await expect(page.getByText('pending-review', { exact: false })).toHaveCount(0);
+
+	await page.evaluate(() => {
+		window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+	});
+	await expect(page.getByRole('heading', { name: 'Catalogue ingest' })).toBeVisible();
+	await expect(page.getByText('0 jobs on this page.')).toBeVisible();
+	await expect(page.getByText('pending-review', { exact: false })).toHaveCount(0);
+	expect(queueReads).toBe(2);
+});

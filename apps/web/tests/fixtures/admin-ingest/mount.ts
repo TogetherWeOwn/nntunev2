@@ -11,6 +11,7 @@ declare global {
 		queueFixture(query: Parameters<IngestRequests['queue']>[0]): ReturnType<IngestRequests['queue']>;
 		detailFixture(jobId: string): ReturnType<IngestRequests['detail']>;
 		retryFixture(jobId: string, body: { revision: number }): ReturnType<IngestRequests['retry']>;
+		detailAbortedAtReply?: boolean;
 	}
 }
 
@@ -24,7 +25,11 @@ mount(PrivateIngest, {
 				return window.uploadFixture(Array.from(new Uint8Array(await file.arrayBuffer())));
 			},
 			queue: (query) => window.queueFixture(query),
-			detail: (id) => window.detailFixture(id),
+			async detail(id, signal) {
+				const reply = await window.detailFixture(id);
+				window.detailAbortedAtReply = signal.aborted;
+				return reply;
+			},
 			retry: (id, body) => window.retryFixture(id, body)
 		}
 	}

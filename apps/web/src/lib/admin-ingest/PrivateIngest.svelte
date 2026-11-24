@@ -7,14 +7,20 @@
 		role?: 'owner' | 'member' | 'anonymous';
 		requests?: IngestRequests;
 	} = $props();
+	let authorizedRequests = $derived(enabled === true && role === 'owner' ? requests : undefined);
 	let suspended = $state(false);
+
+	function onPageShow(event: PageTransitionEvent) {
+		// Enter through a fresh authorization check after a cached restore.
+		if (event.persisted && suspended) window.location.reload();
+	}
 </script>
 
-<svelte:window onpagehide={() => { suspended = true; }} />
+<svelte:window onpagehide={() => { suspended = !!authorizedRequests; }} onpageshow={onPageShow} />
 
-{#if enabled === true && role === 'owner' && requests && !suspended}
-	{#key requests}
-		<IngestScreens {requests} />
+{#if authorizedRequests && !suspended}
+	{#key authorizedRequests}
+		<IngestScreens requests={authorizedRequests} />
 	{/key}
 {:else}
 	<main class="nt-wrap">
