@@ -13,9 +13,10 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    `INVITES_REQUIRED`, `PAID_INVITE_BILLING=1`, Stripe test credentials and a
    test portal with period-end cancellation and subscription changes disabled.
    Verify `plan_prices` against the provider account, currency, amount, interval
-   and usage type. Admit only `POST /v1/billing/webhook` via the Access exception.
-   Prove signature refusal at that ingress and check that missing portal
-   configuration prevents a new checkout.
+   and usage type. Use a Stripe test destination on `2024-12-18.acacia` with
+   `checkout.session.completed`, `invoice.paid` and `customer.subscription.updated`.
+   Admit only `POST /v1/billing/webhook` via Access. Check invalid signatures
+   and checkout refusal when portal configuration is absent.
 3. Complete test checkout and deliver `checkout.session.completed`. Verify
    a signed replay preserves the subscription and invoice history. Confirm
    paid coverage and the caller's portal
@@ -27,10 +28,11 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    verify the usage total stays flat.
 4. Cross the cap and verify a new play returns `plan_limit_exceeded`. Check
    continuation before and refusal after its lease deadline. Below cap, observe
-   renewal through the bound `invoice.paid` event while hourly reconcile is
-   idle. Schedule portal cancellation, then deliver and replay the bound
-   `customer.subscription.updated` event. Confirm its flag
-   reaches the API before the paid cutoff and invoice history is stable. Verify `reason: lapsed` at the cutoff. Run applicable
+   renewal through `invoice.paid` while hourly reconcile is idle. For a second
+   renewal, withhold both renewal webhook signals and verify only the hourly
+   job advances paid coverage and invoice history. Then schedule cancellation,
+   deliver and replay `customer.subscription.updated`, and verify the flag and
+   stable history before `reason: lapsed` at the cutoff. Run applicable
    [same-build privacy cases](m1-exit-traceability.md).
 5. Repeat the private listening refusal control in the personal configuration
    on that build. Keep credentials, invite links, and hosted session URLs out

@@ -13171,21 +13171,25 @@ mod tests {
                 start + 60,
             ),
         );
-        let body = |subscription| {
+        let body = |id, subscription| {
             serde_json::json!({
-            "id":"evt_renewal", "type":"invoice.paid", "livemode":false,
+            "id":id, "type":"invoice.paid", "livemode":false,
             "data":{"object":{"id":"in_renewal","customer":"cus_test_1","subscription":subscription}}
         }).to_string().into_bytes()
         };
-        let standalone = body(None::<&str>);
+        let standalone = body("evt_standalone", None::<&str>);
         webhook_ok(&h.call_webhook(&standalone, Some(sign(&standalone, BILLING_NOW))));
         assert_eq!(live_for(&h, "u1").unwrap().paid_through_unix, Some(start));
-        let event = body(Some("sub_test_1"));
-        for _ in 0..2 {
-            webhook_ok(&h.call_webhook(&event, Some(sign(&event, BILLING_NOW))));
-        }
-        assert_eq!(live_for(&h, "u1").unwrap().paid_through_unix, Some(end));
-        assert_eq!(h.store.invoice_history.borrow().len(), 2);
+        let event = body("evt_renewal", Some("sub_test_1"));
+        let deliver = || webhook_ok(&h.call_webhook(&event, Some(sign(&event, BILLING_NOW))));
+        deliver();
+        let renewed = live_for(&h, "u1").unwrap();
+        assert_eq!(renewed.paid_through_unix, Some(end));
+        let history = h.store.invoice_history.borrow().clone();
+        assert_eq!(history.len(), 2);
+        deliver();
+        assert_eq!(live_for(&h, "u1"), Some(renewed));
+        assert_eq!(*h.store.invoice_history.borrow(), history);
     }
 
     #[test]
