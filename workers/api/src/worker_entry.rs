@@ -7724,17 +7724,16 @@ where
     if *collected != CollectedBody::Complete(Vec::new()) {
         return Some(Err(handlers::invalid_request()));
     }
-    Some(
-        relay(
-            ctx,
-            request,
-            None,
-            headers.get("sec-fetch-site").map(String::as_str),
-            headers.get("range").map(String::as_str),
-            stream_get,
-        )
-        .await,
+    let result = relay(
+        ctx,
+        request,
+        None,
+        headers.get("sec-fetch-site").map(String::as_str),
+        headers.get("range").map(String::as_str),
+        stream_get,
     )
+    .await;
+    Some(result)
 }
 
 /// Registry code for an error response: the envelope `code` when the body
@@ -8316,10 +8315,12 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     })
     .await
     {
-        let response = match result {
-            Ok(result) => result.or_else(|_| render(&handlers::unavailable(), &[], &trace_id)),
-            Err(response) => render(&response, &[], &trace_id),
-        }?;
+        let result = result.and_then(|response| response.map_err(|_| handlers::unavailable()));
+        let mut error_class = None;
+        let response = result.or_else(|refusal| {
+            error_class = response_error_code(refusal.status, &refusal.body);
+            render(&refusal, &[], &trace_id)
+        })?;
         let status = response.status_code();
         let level = if status >= 500 {
             crate::logging::Level::Error
@@ -8333,6 +8334,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             serde_json::json!({
                 "route": "GET /v1/plays/media/{track}/{tab}/{play}",
                 "status_code": status,
+                "error_class": error_class.or_else(|| response_error_code(status, "")),
                 "duration_ms": now_millis().saturating_sub(start_ms),
                 "build_sha": build_sha,
                 "release": build_sha,

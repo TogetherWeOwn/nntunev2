@@ -71,10 +71,8 @@ pub(crate) async fn serve<S: PrivateSource + 'static>(
                 now,
                 |range| {
                     let (response, writer) = if range.status == 416 {
-                        let extra = range
-                            .content_range
-                            .as_deref()
-                            .map(|value| ("content-range", value));
+                        let value = range.content_range.as_deref();
+                        let extra = value.map(|value| ("content-range", value));
                         api_error_response(&ApiError::range_not_satisfiable(), extra)
                             .map(|response| (response, None))
                     } else {
