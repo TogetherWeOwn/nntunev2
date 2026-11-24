@@ -9,6 +9,12 @@ import { finalSmokeRollback } from '../production-maintenance/final-smoke-rollba
 
 export const mainSha = () => execFileSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8' }).trim();
 
+export function recoveryError(command) {
+  return spawnSync(process.execPath, ['ci/production-maintenance/final-smoke-rollback.mjs', command], {
+    env: { ROLLBACK_CUSTODY: 'fixture-private-input', INTENT_KEY: 'fixture-private-key' }, encoding: 'utf8', timeout: 5000,
+  });
+}
+
 export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId }, outcome = 'ack', kind = 'maintenance') {
   const temp = mkdtempSync(join(tmpdir(), 'final-smoke-'));
   t.after(() => rmSync(temp, { recursive: true, force: true }));
@@ -177,5 +183,10 @@ else {
     env.CLAIM_VERIFIED = String(canSubmit);
     return transport.run('recover', env);
   }
-  return { fresh, enter, steps, evidence, artifact };
+  async function claimedRecovery(env, clock, prepare = true) {
+    admitRecovery(env, evidence);
+    if (prepare) await transport.run('prepare-recovery', env);
+    return transport.run('recover', { ...env, CLAIM_VERIFIED: 'true' }, clock);
+  }
+  return { fresh, enter, steps, evidence, artifact, claimedRecovery };
 }

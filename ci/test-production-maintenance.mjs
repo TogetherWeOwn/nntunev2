@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { finalSmokeFixture, mainSha, recoveryFixture } from './fixtures/production-worker-transport.mjs';
+import { finalSmokeFixture, mainSha, recoveryError, recoveryFixture } from './fixtures/production-worker-transport.mjs';
 import { admitRecovery } from './production-maintenance/recovery-evidence.mjs';
 import { seedMaintenance } from './production-maintenance/seed.mjs';
 import worker from './production-maintenance/worker.mjs';
@@ -317,12 +317,18 @@ test('an interrupted 100% promotion can recover maintenance from a fresh runner'
   const transport = finalSmokeFixture(t, { ...rollbackFixture, sha: mainSha() }, 'lost');
   await transport.run('record');
   transport.shift();
-  const { fresh, enter } = recoveryFixture(t, transport, 'cancelled');
+  const { fresh, enter, claimedRecovery } = recoveryFixture(t, transport, 'cancelled');
   assert.equal(existsSync(join(transport.temp, 'production-final-allocation.sealed')), false);
+  await assert.rejects(claimedRecovery(fresh('13'), now, false), /invalid or stale/);
+  for (const age of [-1, 120_001, NaN]) {
+    await assert.rejects(claimedRecovery(fresh('13'), () => now() + age), /proof expired/);
+  }
+  assert.ok(transport.calls.every((method) => method === 'GET'));
   transport.fail.nextRead = true;
   await assert.rejects(enter(fresh('13')), /Cloudflare request/);
   assert.match(await enter(fresh('14')), /reconciled by readback/);
   assert.match(await enter(fresh('15')), /already verified/);
+  assert.match(await claimedRecovery(fresh('16'), now), /already verified/);
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
 });
 
@@ -362,9 +368,7 @@ test('protected recovery wiring keeps the production lock and contains source an
   assert.doesNotMatch(proof, /secrets\.(?:PRODUCTION_CLOUDFLARE|PRODUCTION_ROLLBACK_CUSTODY)/);
   assert.match(restore, /CLAIM_VERIFIED: \$\{\{ steps\.claim\.outcome == 'success' \}\}[\s\S]*?prepare-recovery[\s\S]*?upload-artifact@[0-9a-f]{40}[\s\S]*?env: \*recovery-env[\s\S]*?rollback\.mjs recover/);
   for (const command of ['admit-recovery', 'recover']) {
-    const result = spawnSync(process.execPath, ['ci/production-maintenance/final-smoke-rollback.mjs', command], {
-      env: { ROLLBACK_CUSTODY: 'fixture-private-input', INTENT_KEY: 'fixture-private-key' }, encoding: 'utf8', timeout: 5000,
-    });
+    const result = recoveryError(command);
     assert.equal(result.status, 1);
     assert.match(result.stderr, /Protected rollback check failed/);
     assert.doesNotMatch(result.stdout + result.stderr, /fixture-private|Invalid protected/);
