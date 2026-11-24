@@ -194,14 +194,16 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
     let aged = aged.unwrap().unwrap();
     assert!(!aged.replayable);
     sql("UPDATE public.users SET deleting_at = now() WHERE id = 'native_billing_other';").await;
-    let marked = with_fixture_store(async |store| {
-        store
-            .update_checkout_operation(&aged.id, "succeeded", PRICE, Some("cs_fixture"))
-            .await
-    })
-    .await
-    .unwrap();
-    assert!(!marked);
+    for state in ["succeeded", crate::billing_reconcile::SUPERSEDED_OP_STATE] {
+        let marked = with_fixture_store(async |store| {
+            store
+                .update_checkout_operation(&aged.id, state, PRICE, Some("cs_fixture"))
+                .await
+        })
+        .await
+        .unwrap();
+        assert!(!marked);
+    }
     sql("UPDATE public.users SET deleting_at = NULL WHERE id = 'native_billing_other';").await;
     sql("DELETE FROM billing_operations; DELETE FROM billing_accounts; DELETE FROM plan_prices; DELETE FROM plans WHERE id = 'checkout-fixture';").await;
 }
@@ -252,6 +254,57 @@ async fn hourly_billing_query_rotates_due_targets(observer: &Client) {
         )
         .await
         .unwrap();
+}
+
+async fn create_while_deletion_waits(observer: &Client, outcome: &ReconcileOutcome) {
+    observer
+        .batch_execute("BEGIN; LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let probe = async {
+        let waiting = "SELECT EXISTS (SELECT 1 FROM pg_locks
+            WHERE relation = 'public.subscriptions'::regclass AND NOT granted
+              AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))";
+        let reached = tokio::time::timeout(Duration::from_secs(2), async {
+            while !observer
+                .query_one(waiting, &[])
+                .await
+                .unwrap()
+                .get::<_, bool>(0)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let blocked = if reached {
+            let (deleter, connection) = tokio_postgres::connect(CONNECTION, NoTls).await.unwrap();
+            let driver = tokio::spawn(connection);
+            deleter
+                .batch_execute("SET lock_timeout = '200ms'")
+                .await
+                .unwrap();
+            let result = deleter
+                .execute(
+                    "UPDATE public.users SET deleting_at = now() WHERE id = $1",
+                    &[&USER],
+                )
+                .await;
+            drop(deleter);
+            driver.await.unwrap().unwrap();
+            matches!(result, Err(err) if err.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE))
+        } else {
+            false
+        };
+        observer.batch_execute("COMMIT").await.unwrap();
+        blocked
+    };
+    let (created, blocked) = tokio::join!(dispatch(USER, outcome), probe);
+    assert!(
+        blocked,
+        "owner deletion must wait while the paid transaction is open"
+    );
+    created.expect("create owned target after releasing the fixture table lock");
 }
 
 async fn snapshot(observer: &Client) -> (Value, Value) {
@@ -350,7 +403,7 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     assert!(dispatch(USER, &stale).await.is_err());
     assert_eq!(snapshot(&observer).await, (json!([]), json!([])));
 
-    dispatch(USER, &seed).await.expect("create owned target");
+    create_while_deletion_waits(&observer, &seed).await;
     checkout_reservation_and_price_mapping(&observer).await;
     hourly_billing_query_rotates_due_targets(&observer).await;
     let (owned, history) = snapshot(&observer).await;
@@ -371,6 +424,7 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
         .await
         .unwrap();
     let mut live_update = seed.clone();
+    live_update.read_plan = Some(seed.row.plan_id.clone());
     live_update.row.cancel_at_period_end = true;
     assert!(dispatch(USER, &live_update).await.is_err());
     assert!(dispatch(USER, &stale).await.is_err());

@@ -8551,18 +8551,30 @@ where
             .await
             .map_err(|_| EnsureCheckoutError::Failed)?;
     }
-    // A supersede is idempotent retirement: the conditional mark may
-    // report `false` when the row already retired, which is success here.
-    ctx.store
+    let marked = ctx
+        .store
         .update_checkout_operation(
             &op.id,
             crate::billing_reconcile::SUPERSEDED_OP_STATE,
-            &op.price_id.clone().unwrap_or_default(),
+            op.price_id.as_deref().unwrap_or_default(),
             op.session_id.as_deref(),
         )
         .await
-        .map(|_| ())
-        .map_err(|_| EnsureCheckoutError::Failed)
+        .map_err(|_| EnsureCheckoutError::Failed)?;
+    // A missed mark is idempotent only after the flight actually retired.
+    // The owner fence can also leave the original flight open.
+    if !marked
+        && ctx.cfg.paid_billing_enabled()
+        && ctx
+            .store
+            .checkout_operation_by_id(&op.id)
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?
+            .is_some_and(|current| crate::billing_reconcile::is_single_flight_state(&current.state))
+    {
+        return Err(EnsureCheckoutError::Unavailable);
+    }
+    Ok(())
 }
 
 /// Every exact path the router serves. The Worker answers `OPTIONS` on
@@ -13519,6 +13531,36 @@ mod tests {
                 if repeated { 10 } else { 1 }
             );
         }
+    }
+
+    #[test]
+    fn checkout_replacement_refuses_a_mark_miss_on_an_open_flight() {
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        let attempt =
+            block_on(
+                h.store
+                    .create_checkout_operation("op_fixture", "u1", PRICE_PLUS, None),
+            )
+            .unwrap();
+        let op = attempt.op();
+        h.store.skip_checkout_mark.set(true);
+        assert_eq!(
+            block_on(replace_checkout_operation(&h.ctx(), op, None)),
+            Err(EnsureCheckoutError::Unavailable)
+        );
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut(&op.id)
+            .unwrap()
+            .state = crate::billing_reconcile::SUPERSEDED_OP_STATE.into();
+        assert_eq!(
+            block_on(replace_checkout_operation(&h.ctx(), op, None)),
+            Ok(())
+        );
     }
 
     #[test]
