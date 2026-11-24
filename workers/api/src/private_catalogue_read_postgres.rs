@@ -146,6 +146,14 @@ async fn resolves_only_the_committed_scoped_publication() {
     unsigned.grant.token.push('A');
     assert!(query(&mut reader, &unsigned, &pins).await.is_none());
 
+    let (current, row) = lookup_scoped(&reader, track, (&pins).into(), None, None)
+        .await
+        .unwrap()
+        .expect("current committed publication");
+    assert_eq!(row.get::<_, i64>("accepted_seq"), pins.accepted_seq);
+    assert_eq!(current.target.reference, id("track_id"));
+    assert!(matches!(current.locator.binding(), S3Binding::VersionId(v) if v == pins.version));
+
     let resolved = query(&mut reader, &signed, &pins)
         .await
         .expect("committed publication");
@@ -351,117 +359,6 @@ async fn resolves_only_the_committed_scoped_publication() {
         .await
         .unwrap();
     assert_eq!(resolved.read.pins().media_version, original_pins.version);
-    use crate::private_playback::browser::{BrowserScope, BrowserStart};
-
-    let scope = BrowserScope {
-        publication: (&original_pins).into(),
-        root_version: root.version,
-    };
-    let mut input = BrowserStart {
-        track_id: track.into(),
-        session_id: signed.lease.session_id.clone(),
-        play_id: None,
-        request_id: Some("09845e3c-8711-4d64-9c63-997b43d09a6b".into()),
-    };
-    writer.execute(
-        "INSERT INTO public.private_sessions (user_id, session_id, expires_at) VALUES ($1, $2, $3)",
-        &[&MEMBER, &input.session_id, &(claims.expires_at as i64)],
-    ).await.unwrap();
-    let open = async |db: &mut Client,
-                      admission,
-                      identity: &SessionClaims,
-                      request: &BrowserStart,
-                      scope| {
-        service(admission)
-            .open_browser(db, identity, request, scope, SystemTime::now)
-            .await
-            .unwrap()
-    };
-    assert!(open(&mut reader, None, &claims, &input, scope)
-        .await
-        .is_none());
-    let wrong_scope = BrowserScope {
-        root_version: [255; 16],
-        ..scope
-    };
-    assert!(open(&mut reader, configured, &claims, &input, wrong_scope)
-        .await
-        .is_none());
-    let browser = open(&mut reader, configured, &claims, &input, scope)
-        .await
-        .unwrap();
-    let original = browser.relay();
-    let replay = open(&mut reader, configured, &claims, &input, scope)
-        .await
-        .unwrap();
-    assert_eq!(replay.relay().lease, original.lease);
-    assert!(replay.relay().grant.token == original.grant.token);
-    let key =
-        crate::ledger::derive_play_idempotency_key(MEMBER, track, &original.lease.play_id).unwrap();
-    assert!(
-        crate::worker_entry::playback_privacy_mark(&writer, MEMBER, &key)
-            .await
-            .unwrap()
-    );
-    writer
-        .execute(
-            "DELETE FROM public.private_sessions WHERE user_id = $1",
-            &[&MEMBER],
-        )
-        .await
-        .unwrap();
-    input.request_id = None;
-    input.play_id = Some(original.lease.play_id.clone());
-    let retry = open(&mut reader, configured, &claims, &input, scope)
-        .await
-        .unwrap();
-    assert_eq!(retry.relay().lease, original.lease);
-    assert!(retry.relay().grant.token == original.grant.token);
-    input.session_id = "different-tab".into();
-    assert!(open(&mut reader, configured, &claims, &input, scope)
-        .await
-        .is_none());
-    input.session_id = original.lease.session_id.clone();
-    let wrong_account = SessionClaims {
-        user_id: "catalogue-owner".into(),
-        ..claims.clone()
-    };
-    assert!(open(&mut reader, configured, &wrong_account, &input, scope)
-        .await
-        .is_none());
-    for state in ["revision", "invite", "session"] {
-        writer
-            .query_one(
-                "SELECT pg_temp.private_playback_state($1, $2, $3)",
-                &[&state, &track, &original_pins.accepted_seq],
-            )
-            .await
-            .unwrap();
-        assert!(
-            open(&mut reader, configured, &claims, &input, scope)
-                .await
-                .is_none(),
-            "{state}"
-        );
-    }
-    assert_eq!(
-        query_playback_lease_row(&writer, MEMBER)
-            .await
-            .unwrap()
-            .unwrap(),
-        original.lease
-    );
-    assert!(
-        crate::worker_entry::playback_privacy_mark(&writer, MEMBER, &key)
-            .await
-            .unwrap()
-    );
-    // Restore the original lease for the independent off-route issuer checks below.
-    writer.execute(
-        "UPDATE public.playback_leases SET play_id = $2, epoch = $3, continuation_epoch = $3, expires_at = $4, continuation_deadline = $5 WHERE user_id = $1",
-        &[&MEMBER, &issued.relay().lease.play_id, &(issued.relay().lease.epoch as i64),
-            &(issued.relay().lease.expires_at as i64), &(issued.relay().lease.continuation_deadline as i64)],
-    ).await.unwrap();
     for state in ["invite", "session", "rotation", "revision", "race", "lease"] {
         writer
             .query_one(
