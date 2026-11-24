@@ -423,6 +423,17 @@ export class ApiClient {
 		});
 	}
 
+	async writeBrowserPlayback(body: { session_id: string } & ({ track_id: string; play_id?: string } | { enabled: boolean }), signal: AbortSignal) {
+		const binding = this.session?.binding;
+		if (this.baseUrl || !binding) throw new Error('Browser playback requires a verified same-origin session');
+		const toggle = 'enabled' in body;
+		return this.requestWithStatus<unknown>(toggle ? '/v1/me/private-session' : '/v1/plays', {
+			method: toggle ? 'PUT' : 'POST', signal, body: JSON.stringify(body),
+			headers: { 'content-type': 'application/json', [SESSION_BINDING_HEADER]: binding,
+				...(!toggle && { 'x-nntune-browser-playback': '1' }) }
+		});
+	}
+
 	async delete<T>(path: string, headers?: Record<string, string>, body?: unknown): Promise<T> {
 		return this.request<T>(path, body === undefined ? { method: 'DELETE', headers } : {
 			method: 'DELETE', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(body)

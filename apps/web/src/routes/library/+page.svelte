@@ -282,7 +282,7 @@
 		$state.raw({ status: '', fallbackUrl: null, forQueue: null });
 	const queueShare = createQueueShare({
 		getQueue: () => queueController.snapshot,
-		getPosition: () => media.audio?.currentTime,
+		getPosition: media.sharePosition,
 		getOrigin: () => window.location.origin,
 		getClipboard: clipboardWriter,
 		shortTitle,
@@ -349,6 +349,7 @@
 		onStateChange: (state, receipt) => {
 			const { isCurrent, authoritative, authBoundary, runIfCurrent, sessionBinding } = receipt;
 			if (!isCurrent()) return;
+			if (receipt.accountSession && sessionBinding) player.bindBrowserPlayback(receipt.accountSession, sessionBinding);
 			if (receipt.storageScope !== undefined) {
 				libraryStorage = receipt.storageScope;
 				librarySession = receipt.accountSession;
@@ -684,7 +685,7 @@
 		if (!item || loading) return;
 		const current = queueCurrentTrack(queueController.snapshot);
 		const seconds =
-			current?.id === id && resolveStreamUrl(current) ? media.audio?.currentTime : 0;
+			current?.id === id ? media.sharePosition() : 0;
 		if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return;
 		let url: string;
 		try {
@@ -1606,6 +1607,12 @@
 
 <main class="nt-wrap" data-density={density}>
 	<h1>Library</h1>
+	{#if player.privateListening}
+		<button class="nt-button nt-button--ghost" type="button" aria-pressed={player.privateListening.enabled}
+			aria-disabled={player.privateListening.pending}
+			onclick={() => { if (!player.privateListening?.pending) void player.setPrivateListening(!player.privateListening?.enabled); }}>Private listening</button>
+		<p aria-live="polite">{player.privateListening.feedback}</p>
+	{/if}
 	{#if accountTrackLikes?.feedback}<p role="status">{accountTrackLikes.feedback}</p>{/if}
 
 	<div class="nt-library-density">

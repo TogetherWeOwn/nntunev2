@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createQueue, type Track } from './queue.js';
 import { createQueueShare } from './queueShare.js';
 
-const track = (id: string, title = id): Track => ({ id, title, artist: '', streamUrl: '/audio' });
+const track = (id: string, title = id): Track => ({ id, title, artist: '', streamUrl: '' });
 
 function setup() {
 	let queue = createQueue([track('a', 'First'), track('b')]);

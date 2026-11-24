@@ -3,7 +3,6 @@
 	import { subscribeLocalAuthTransition } from '../auth-transition.js';
 	import { browserStorage, LIBRARY_AUTH_TRANSITION_KEY } from '../library/cache.js';
 	import { LIBRARY_ACCESS_REFUSED_EVENT } from '../library/refresh.js';
-	import { resolveStreamUrl } from '../library/stream-url.js';
 	import { clearMiniPlayerHint } from '../shell/mini-player.js';
 	import NativePlayer from './NativePlayer.svelte';
 	import PlaybackSpeedControl from './PlaybackSpeedControl.svelte';
@@ -19,6 +18,7 @@
 		{ claimShareEntry?: () => boolean; currentFavorite: ReturnType<typeof createCurrentTrackFavorite> }>();
 </script>
 <script lang="ts">
+	import { PUBLIC_BROWSER_PLAYBACK } from '$app/env/public';
 	let { children, claimShareEntry, signedOut, allowDesktopRow }: {
 		children: Snippet;
 		claimShareEntry?: (owner: string) => boolean;
@@ -26,7 +26,7 @@
 		allowDesktopRow?: boolean;
 	} = $props();
 	let shareOwner: string | undefined;
-	const controller = createPlayerController(createQueue([]), { flush: tick });
+	const controller = createPlayerController(createQueue([]), { flush: tick }, undefined, PUBLIC_BROWSER_PLAYBACK ? {} : undefined);
 	const player = setAppPlayer(Object.assign(controller, { currentFavorite: createCurrentTrackFavorite(controller.queue),
 		claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
 	const { queue, media, media: { seekFeedback, playbackStatus, absoluteSeek } } = player;
@@ -34,7 +34,7 @@
 	const attachNativeAudio = media.attach;
 	const sound = media.sound.state;
 	const currentTrack = $derived(queueCurrentTrack($queue));
-	const streamUrl = $derived(resolveStreamUrl(currentTrack));
+	const streamUrl = $derived(player.streamFor(currentTrack));
 	const sleepTimer = media.sleepTimer;
 	let shortcutHelp = $state.raw<ReturnType<typeof ShortcutHelp>>();
 	let shortcutScope = $state<HTMLDivElement>();
@@ -69,10 +69,10 @@
 <svelte:document onvisibilitychange={() => { if (document.visibilityState === 'visible') sleepTimer.tick(); }} />
 {@render children()}
 {#snippet favoriteAction(statusOnly: boolean)}<CurrentTrackFavorite currentFavorite={player.currentFavorite} snapshot={$queue} {statusOnly} />{/snippet}
-{#if streamUrl}
+{#if streamUrl || (currentTrack && player.privateListening)}
 	<div class="nt-wrap" bind:this={shortcutScope}>
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio} volumeControls={soundControls}
-			playbackStatus={$playbackStatus} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
+			playbackStatus={streamUrl ? $playbackStatus : 'paused'} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}
 			retryCurrent={media.retryCurrent} {allowDesktopRow}
 			seekState={$absoluteSeek} seek={media.seek}
 			{...$seekFeedback} restartCurrentTrack={media.restart} jumpRelative={media.jump} {favoriteAction} />
@@ -87,4 +87,7 @@
 	<section class="nt-wrap" aria-label="Sleep timer">
 		<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
 	</section>
+{:else if $sleepTimer.armed}
+	<button class="nt-button nt-button--ghost" type="button" data-testid="sleep-timer-cancel" onclick={sleepTimer.cancel}>Cancel sleep timer</button>
+	<p data-testid="sleep-timer-status" aria-live="polite">{$sleepTimer.announcement}</p>
 {/if}
