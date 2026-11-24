@@ -142,12 +142,3 @@ pub(crate) async fn page(
     })
     .collect()
 }
-
-#[cfg(all(
-    test,
-    feature = "postgres-tests",
-    feature = "encrypted-upload-caller",
-    not(target_arch = "wasm32")
-))]
-#[path = "private_library_postgres.rs"]
-mod postgres_tests;

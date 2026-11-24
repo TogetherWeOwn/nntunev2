@@ -9054,6 +9054,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(
+        feature = "postgres-tests",
+        feature = "encrypted-upload-caller",
+        not(target_arch = "wasm32")
+    ))]
+    mod private_library_postgres {
+        include!("../tests/fixtures/private_library_postgres.rs");
+    }
+
     use super::{dispatch_browser_session as browser, *};
     use crate::native_rest::BrowserSessionRoute::{LikeTrack, TasteList, UnlikeTrack};
     use std::cell::RefCell;
