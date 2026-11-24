@@ -61,17 +61,14 @@ pub enum StageOutcome {
 }
 
 /// Stage every occurrence in pairing order in a bounded READ COMMITTED
-/// transaction. The input query and responses come from the landed matcher
-/// and trusted exact-title CC0 mirror lookup. Exact replays must use the same
-/// job, mapping and committed receipts.
+/// transaction using trusted exact-title CC0 mirror evidence. Replay with the
+/// same job, mapping and committed receipts.
 ///
 /// The future encrypted caller must supply the authoritative committed result.
 /// The future app proxy must establish current admin authority and bind the
-/// manifest to the authorized job and revision. The complete manifest must
-/// come from the job, independently of the supplied completion results.
-/// The caller owns lifecycle
-/// fences, retention references, deadlines and commit, including any review
-/// state and audit. Roll back the outer transaction on cancellation or uncertainty.
+/// manifest to the authorized job and revision independently of those results.
+/// The caller owns lifecycle fences, retention, deadlines, review state, audit
+/// and commit. Roll back the outer transaction on cancellation or uncertainty.
 pub async fn stage(
     tx: &mut Transaction<'_>,
     job: &AuthorizedRelease<'_>,
@@ -92,13 +89,8 @@ pub async fn stage(
 
     let matched = select_release(query, candidates).and_then(|release| {
         let numbers: Vec<_> = job.files.iter().map(|file| file.numbering).collect();
-        decide_publish_match(
-            release,
-            committed.len(),
-            &numbers,
-            recordings.0,
-            recordings.1,
-        )
+        let (status, body) = recordings;
+        decide_publish_match(release, committed.len(), &numbers, status, body)
     });
     let matched = match matched {
         Ok(matched) => matched,

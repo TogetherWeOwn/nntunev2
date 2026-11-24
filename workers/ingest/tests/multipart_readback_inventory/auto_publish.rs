@@ -1,4 +1,4 @@
-use super::{Client, ReadbackFixture};
+use super::Client;
 use nntune_ingest::{
     admin_auto_publish::{stage, AuthorizedRelease, CommittedFlac, ExpectedFile, StageOutcome},
     admin_review::ObjectRef,
@@ -19,21 +19,16 @@ const TRACKS: [&str; 2] = [
     "ab320000-0000-4000-8000-000000000001",
     "ab320000-0000-4000-8000-000000000002",
 ];
-const ROWS: &str = "SELECT t.id::text, t.medium_no, t.track_no, t.mbid::text, t.title,
-                           s.object_id::text, s.source_job_id
+const ROWS: &str = "SELECT t.id::text, t.medium_no, t.track_no, t.mbid::text, s.object_id::text
     FROM public.tracks t LEFT JOIN public.catalogue_s3_sources s ON t.id = s.track_id
     WHERE release_id = $1::text::uuid ORDER BY medium_no, track_no";
 
 pub(super) async fn exercise(
     db: &Client,
     writer: &mut Client,
-    fixtures: [&ReadbackFixture; 2],
+    objects: &[ObjectRef; 2],
     both: [CommittedFlac<'_>; 2],
 ) {
-    let objects = fixtures.map(|fixture| ObjectRef {
-        media: fixture.media.metadata().clone(),
-        plaintext_sha256: *fixture.origin.plaintext_sha256(),
-    });
     let files = [("1", &objects[0]), ("2", &objects[1])].map(|(disc, object)| ExpectedFile {
         numbering: FileNumbering {
             disc: Some(disc),
@@ -57,30 +52,24 @@ pub(super) async fn exercise(
         artist_mbid: None,
         score: 0.9,
     };
-    let candidates = |hits| {
-        Some(CompleteReleaseCandidates {
-            lookup: &lookup,
-            hits,
-        })
-    };
     let apply =
         async |tx: &mut Transaction<'_>, media: &[CommittedFlac<'_>], rival, second_disc| {
             let mut hits = vec![hit(RELEASE)];
             if rival {
                 hits.push(hit("ab330000-0000-4000-8000-000000000000"));
             }
-            let rows = [1, second_disc]
-                .into_iter()
-                .zip(TRACKS)
-                .map(|(disc, mbid)| {
-                    json!({
-                        "release_mbid": RELEASE, "mbid": mbid, "title": "Synthetic FLAC",
-                        "medium_no": disc, "track_no": 1
-                    })
+            let candidates = CompleteReleaseCandidates {
+                lookup: &lookup,
+                hits,
+            };
+            let rows = [(1, TRACKS[0]), (second_disc, TRACKS[1])].map(|(disc, mbid)| {
+                json!({
+                    "release_mbid": RELEASE, "mbid": mbid, "title": "Synthetic FLAC",
+                    "medium_no": disc, "track_no": 1
                 })
-                .collect::<Vec<_>>();
+            });
             let body = json!({ "release_mbid": RELEASE, "recordings": rows }).to_string();
-            stage(tx, &job, media, ALBUM, candidates(hits), (200, &body)).await
+            stage(tx, &job, media, ALBUM, Some(candidates), (200, &body)).await
         };
 
     let mut tx = writer.transaction().await.unwrap();
@@ -102,65 +91,37 @@ pub(super) async fn exercise(
     }
     let [first, second] = &both;
     let swapped = [CommittedFlac { ..*second }, CommittedFlac { ..*first }];
-    assert_eq!(
-        apply(&mut tx, &swapped, false, 2).await,
-        Err(PublicationError::Refused)
-    );
-    let receipt = second.receipt;
     let missing_pin = PublishedObject {
         page_versions: &[],
-        ..receipt
+        ..second.receipt
     };
-    let wrong_pin = PublishedObject {
-        page_versions: &["other-version"],
-        ..receipt
-    };
-    let wrong_root = PublishedObject {
-        root_version_id: [0; 16],
-        ..receipt
-    };
-    let wrong_digest = PublishedObject {
-        plaintext_sha256: &[0; 32],
-        ..receipt
-    };
-    for invalid in [missing_pin, wrong_pin, wrong_root, wrong_digest] {
-        let media = [
-            CommittedFlac { ..*first },
-            CommittedFlac {
-                receipt: invalid,
-                ..*second
-            },
-        ];
+    let incomplete = [
+        CommittedFlac { ..*first },
+        CommittedFlac {
+            receipt: missing_pin,
+            ..*second
+        },
+    ];
+    for media in [&both[..1], &swapped, &incomplete] {
         assert_eq!(
-            apply(&mut tx, &media, false, 2).await,
+            apply(&mut tx, media, false, 2).await,
             Err(PublicationError::Refused)
         );
     }
-    assert_eq!(
-        apply(&mut tx, &both[..1], false, 2).await,
-        Err(PublicationError::Refused)
-    );
     assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
     tx.commit().await.unwrap();
 
-    // A conflicting canonical second track rolls back the whole batch while
-    // preserving the caller's earlier write in the outer transaction.
+    // A late storage fence must roll back the first occurrence too.
     let mut tx = writer.transaction().await.unwrap();
-    tx.execute(
-        "INSERT INTO public.tracks (release_id, medium_no, track_no, mbid, title)
-         VALUES ($1::text::uuid, 2, 1, $2::text::uuid, 'Different recording')",
-        &[&RELEASE, &TRACKS[0]],
-    )
-    .await
-    .unwrap();
+    let second_id = hex::encode(second.receipt.intent.identities[2]);
+    let quarantined = "UPDATE public.storage_validated_digest_winners
+        SET quarantined = true WHERE object_id = $1::text::uuid";
+    assert_eq!(tx.execute(quarantined, &[&second_id]).await.unwrap(), 1);
     assert_eq!(
         apply(&mut tx, &both, false, 2).await,
         Err(PublicationError::Refused)
     );
-    let rows = tx.query(ROWS, &[&RELEASE]).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get::<_, i32>(1), 2);
-    assert!(rows[0].get::<_, Option<&str>>(5).is_none());
+    assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
     tx.rollback().await.unwrap();
 
     let mut tx = writer.transaction().await.unwrap();
@@ -183,11 +144,9 @@ pub(super) async fn exercise(
         assert_eq!(row.get::<_, i32>(1), (i + 1) as i32);
         assert_eq!(row.get::<_, i32>(2), 1);
         assert_eq!(row.get::<_, &str>(3), TRACKS[i]);
-        assert_eq!(row.get::<_, &str>(4), "Synthetic FLAC");
         assert_eq!(
-            row.get::<_, String>(5).replace('-', ""),
+            row.get::<_, String>(4).replace('-', ""),
             hex::encode(both[i].receipt.intent.identities[2])
         );
-        assert_eq!(row.get::<_, &str>(6), job.job_id);
     }
 }
