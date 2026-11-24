@@ -10,6 +10,7 @@ use crate::multipart::{
 use nntune_core::{
     digest_enrollment::DigestEnrollment,
     digest_readback::EnrolledEnvelope,
+    media::PLAIN_CHUNK_SIZE,
     media_envelope::{wrap_scheme2, EnvelopeContext},
     origin_sealer::SealedChunk,
     s3_locator::S3Binding,
@@ -31,23 +32,32 @@ fn id(value: u8) -> [u8; 16] {
 
 #[wasm_bindgen]
 pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
-    let configuration = id(7);
-    let bucket = "fixture-bucket";
     let endpoint = match mode.as_str() {
         "http" => "http://fixture.test:8443",
         "path" => "https://fixture.test:8443/api",
         _ => "https://fixture.test:8443",
     };
+    run(&mode, endpoint).await
+}
+
+#[wasm_bindgen]
+pub async fn upload_for_playback(endpoint: String) -> Result<String, JsValue> {
+    run("readback-playback", &endpoint).await
+}
+
+async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
+    let configuration = id(7);
+    let bucket = "fixture-bucket";
     let sender = S3CompletionSender::new(
         if matches!(
-            mode.as_str(),
+            mode,
             "foreign" | "part-foreign" | "init-foreign" | "sidecar-foreign"
         ) {
             id(8)
         } else {
             configuration
         },
-        if matches!(mode.as_str(), "bucket" | "sidecar-bucket") {
+        if matches!(mode, "bucket" | "sidecar-bucket") {
             "other-bucket"
         } else {
             bucket
@@ -85,7 +95,24 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         .to_string());
     }
     let readback = mode.starts_with("readback");
-    let plaintext = if readback { FLAC } else { &[42] };
+    let padded;
+    let plaintext: &[u8] = if mode == "readback-playback" {
+        // Add one FLAC PADDING block so the suffix crosses into a second
+        // encrypted chunk while preserving the existing valid audio frames.
+        let padding = PLAIN_CHUNK_SIZE as usize + 1 - FLAC.len() - 4;
+        let mut bytes = FLAC[..42].to_vec();
+        bytes[4] = 0;
+        bytes.push(0x81);
+        bytes.extend_from_slice(&(padding as u32).to_be_bytes()[1..]);
+        bytes.resize(bytes.len() + padding, 0);
+        bytes.extend_from_slice(&FLAC[42..]);
+        padded = bytes;
+        &padded
+    } else if readback {
+        FLAC
+    } else {
+        &[42]
+    };
     let plaintext_len = plaintext.len() as u64;
     let map_id = id(0xef);
     let mut enrollment =
@@ -99,12 +126,16 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
     let root = [17; 32];
     let record =
         readback.then(|| wrap_scheme2(&root, &context, enrollment.key().expose_secret()).unwrap());
-    let sealed = enrollment.seal_chunk(plaintext).unwrap();
+    let chunks: Vec<_> = plaintext
+        .chunks(PLAIN_CHUNK_SIZE as usize)
+        .map(|chunk| enrollment.seal_chunk(chunk).unwrap())
+        .collect();
     let manifest = enrollment.finish().unwrap();
     let [environment, library, object, generation] =
         [1, 2, 0xab, 0xcd].map(|value| hex::encode(id(value)));
     let key = format!("media/{object}/{generation}");
-    let budget = match mode.as_str() {
+    let budget = match mode {
+        "readback-playback" => 5000,
         "deadline" => 200,
         "expired" | "reconcile-expired" => 0,
         _ => 2000,
@@ -156,14 +187,22 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         .map_or(configuration, |upload| upload.configuration());
     let plan = Plan::new(target, header, plaintext_len).unwrap();
     let mut partition = plan.partition();
-    assert!(partition
-        .push(&SealedChunk {
-            digest: Sha256::digest(&sealed.bytes).into(),
-            bytes: sealed.bytes,
-            final_chunk: true,
-        })
-        .unwrap()
-        .is_none());
+    let mut page = None;
+    let chunk_count = chunks.len();
+    for (index, sealed) in chunks.into_iter().enumerate() {
+        assert!(partition
+            .push(&SealedChunk {
+                digest: Sha256::digest(&sealed.bytes).into(),
+                bytes: sealed.bytes,
+                final_chunk: index + 1 == chunk_count,
+            })
+            .unwrap()
+            .is_none());
+        if sealed.page.is_some() {
+            assert!(page.is_none());
+            page = sealed.page;
+        }
+    }
     let part = partition.finish().unwrap().unwrap();
     let (_, number, bytes, checksum) = part.request();
     let binding = ResumeBinding {
@@ -246,7 +285,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     }
     if let Some(record) = record {
-        let page = sealed.page.unwrap();
+        let page = page.unwrap();
         let put = SidecarPut::new(bucket, &context, &manifest, map_id, 0, &page).unwrap();
         let sidecars = [sender
             .put_sidecar(put, until)
@@ -273,10 +312,24 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         } else {
             until
         };
-        sender
+        let verified = sender
             .verify_readback(&inventory, envelope, readback_until)
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+        if mode == "readback-playback" {
+            let inventory = verified.inventory();
+            let media = inventory.media();
+            // Stand in for the catalogue's committed locator projection.
+            return Ok(serde_json::json!({
+                "configuration": media.configuration,
+                "s3_bucket": inventory.bucket(),
+                "s3_key": media.object_key,
+                "s3_version_id": media.version.unwrap(),
+                "ciphertext_len": inventory.geometry().sealed_len(),
+                "plaintext_len": plaintext_len,
+            })
+            .to_string());
+        }
     }
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {
         return Err(JsValue::from_str("missing fixture version"));

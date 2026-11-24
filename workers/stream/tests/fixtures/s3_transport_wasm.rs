@@ -5,19 +5,25 @@ use std::pin::pin;
 use futures_util::future::{select, Either};
 use nntune_core::{
     digest_enrollment::{DigestEnrollment, OriginManifest},
+    digest_geometry::DigestGeometry,
     digest_page::page_hash,
     digest_read_snapshot::DigestReadSnapshot,
     media_envelope::{wrap_scheme2, EnvelopeContext},
     playback_custody::CustodySnapshot,
     s3_locator::{S3Locator, S3MediaMetadata},
 };
+use serde::Deserialize;
 use worker::{
     wasm_bindgen::{self, prelude::*},
     Delay,
 };
 
 use super::*;
-use crate::enrolled_playback::{EnrolledMedia, EnrolledPlayback};
+use crate::{
+    enrolled_playback::{EnrolledMedia, EnrolledPlayback},
+    range::plan_encrypted_range,
+    s3_range_response::{read_exact, require_eof},
+};
 
 const BUCKET: &str = "fixture-media";
 const KEY: &str = "media/00000000000040008000000000000003/00000000000040008000000000000004";
@@ -25,6 +31,68 @@ const VERSION: &str = "version+/%?=&";
 const PAGE_VERSION: &str = "page+/%?=&";
 const LEN: u64 = 65_537;
 const ROOT: [u8; 32] = [7; 32];
+
+#[derive(Deserialize)]
+struct CataloguePointer {
+    configuration: [u8; 16],
+    s3_bucket: String,
+    s3_key: String,
+    s3_version_id: String,
+    ciphertext_len: u64,
+    plaintext_len: u64,
+}
+
+#[wasm_bindgen]
+pub async fn read_uploaded_suffix(endpoint: String, pointer: String) -> Result<Vec<u8>, JsValue> {
+    read_uploaded_suffix_inner(&endpoint, &pointer)
+        .await
+        .map_err(|_| JsValue::from_str("storage read refused"))
+}
+
+async fn read_uploaded_suffix_inner(endpoint: &str, pointer: &str) -> io::Result<Vec<u8>> {
+    let pointer: CataloguePointer = serde_json::from_str(pointer).map_err(|_| refused())?;
+    let geometry = DigestGeometry::new(pointer.plaintext_len).ok_or_else(refused)?;
+    if geometry.sealed_len() != pointer.ciphertext_len {
+        return Err(refused());
+    }
+    let range = plan_encrypted_range(Some("bytes=-1"), geometry)
+        .1
+        .and_then(|plan| plan.ciphertext_span())
+        .ok_or_else(refused)?;
+    let len = usize::try_from(range.end - range.start).map_err(|_| refused())?;
+    let locator = S3Locator::new(
+        pointer.s3_bucket,
+        pointer.s3_key,
+        S3Binding::VersionId(pointer.s3_version_id),
+    )
+    .map_err(|_| refused())?;
+    let reader = S3Reader::new(
+        [7, 7, 7, 7, 7, 7, 0x40, 7, 0x80, 7, 7, 7, 7, 7, 7, 7],
+        "fixture-bucket".into(),
+        endpoint,
+        "fixture-region".into(),
+        "FixtureAccess".into(),
+        Zeroizing::new("fixture-reader-signing-material".into()),
+    )?;
+    let until = now() + Duration::from_secs(5);
+    let mut reply = reader
+        .open(S3Get {
+            configuration: pointer.configuration,
+            locator: &locator,
+            range,
+            sealed_len: pointer.ciphertext_len,
+            usable_until: until,
+        })
+        .await?;
+    let mut live = || now() < until;
+    let bytes = read_exact(&mut reply.body, len, &mut live)
+        .await
+        .map_err(|_| refused())?;
+    require_eof(&mut reply.body, &mut live)
+        .await
+        .map_err(|_| refused())?;
+    Ok(bytes)
+}
 
 fn id(n: u8) -> [u8; 16] {
     [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, n]
