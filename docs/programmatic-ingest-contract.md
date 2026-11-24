@@ -86,6 +86,13 @@ that exact object key, including late arrivals. Staging activation needs a
 verified incomplete-upload lifecycle policy on its configured bucket as a
 backstop. A new attempt uses fresh object and sealing identities.
 
+The dormant reconciliation dispatcher waits out the write deadline, then
+uses the live terminal delivery claim to list the exact key prefix and
+commit a uniquely discovered upload ID before sending an ID-specific abort.
+An empty listing with an unknown ID leaves the claim retryable. The staging
+caller must revisit expired claims, quiesce submitted writes, and qualify
+list and abort on the isolated bucket before enabling this dispatcher.
+
 Proposed lifecycle bounds are at most 24 hours absolute and 60 minutes idle
 since accepted progress; status and retries do not extend absolute expiry.
 Consumers must agree limits, tombstones, lease fencing, cleanup, and race and

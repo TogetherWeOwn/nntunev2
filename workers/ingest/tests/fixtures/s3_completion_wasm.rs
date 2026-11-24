@@ -106,10 +106,25 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
     let key = format!("media/{object}/{generation}");
     let budget = match mode.as_str() {
         "deadline" => 200,
-        "expired" => 0,
+        "expired" | "reconcile-expired" => 0,
         _ => 2000,
     };
     let until = now() + Duration::from_millis(budget);
+    if mode.starts_with("reconcile") {
+        let id = if mode == "reconcile-replay" {
+            "new+/=?".into()
+        } else {
+            sender
+                .find_incomplete(&key, until)
+                .await
+                .map_err(|()| JsValue::from_str("unconfirmed listing"))?
+        };
+        sender
+            .abort_incomplete(&key, &id, until)
+            .await
+            .map_err(|()| JsValue::from_str("unconfirmed abort"))?;
+        return Ok(id);
+    }
     let initiated = if mode.starts_with("init") || readback {
         let requested_key = if mode == "init-other" {
             "media/efefefefefef40ef80efefefefefefef/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd"

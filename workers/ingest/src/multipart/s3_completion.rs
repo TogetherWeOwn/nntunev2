@@ -41,6 +41,9 @@ use super::initiation::InitiatedUpload;
 #[path = "s3_readback.rs"]
 mod readback;
 
+#[path = "s3_reconcile.rs"]
+mod reconcile;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum HeadConfirmationError {
     InvalidRequest,

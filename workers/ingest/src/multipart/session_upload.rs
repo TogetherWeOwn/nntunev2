@@ -82,7 +82,7 @@ impl<'a> DurableUpload<'a> {
     }
 }
 
-pub(super) async fn handoff<'a>(
+pub(crate) async fn handoff<'a>(
     db: &mut Client,
     scope: &CompletionScope<'a>,
     lease: &str,
