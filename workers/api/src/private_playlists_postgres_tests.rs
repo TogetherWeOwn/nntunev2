@@ -47,7 +47,7 @@ async fn postgres_store_rehearsal() {
     let track: String = scalar(&db, track_id, &[&"new-track"]).await;
     let foreign = scalar(&db, track_id, &[&"trkRpMiddle00000000000"]).await;
     let inactive = scalar(&db, track_id, &[&"inactive-track"]).await;
-    let another = scalar(&db, track_id, &[&"trkFrAlpha000000000000"]).await;
+    let another: String = scalar(&db, track_id, &[&"trkFrAlpha000000000000"]).await;
     let repeat: String = scalar(&db, track_id, &[&"trkRpRepeat00000000000"]).await;
     for cmd in [
         Read(id),
