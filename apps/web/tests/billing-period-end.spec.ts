@@ -119,7 +119,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 							return route.fulfill({ json: { plans: [
 								{ id: 'free', priceCents: 0, streamHoursMonth: 0, maxConcurrentStreams: 1, selectable: false },
 								{ id: 'plus', priceCents: 800, streamHoursMonth: 100, maxConcurrentStreams: 1, selectable: true },
-								{ id: 'pro', priceCents: 1500, streamHoursMonth: 300, maxConcurrentStreams: 1, selectable: true },
+								{ id: 'pro', priceCents: 1500, streamHoursMonth: paidPilot ? 301 : 300, maxConcurrentStreams: 1, selectable: true },
 								{ id: 'max', priceCents: 2500, streamHoursMonth: 750, maxConcurrentStreams: 1, selectable: true }
 							] } });
 						}
@@ -160,6 +160,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					// The page hydrates caps from /v1/plans after the loader's
 					// two reads; wait for that third call before the exact list.
 					await expect.poll(() => calls.length).toBe(3);
+					if (paidPilot) await expect(page.getByText(/50\.0 \/ 301 hrs/)).toBeVisible();
 					await expect(page.getByRole('button', { name: 'Upgrade to max' })).toHaveCount(confirmed && !paidPilot ? 1 : 0);
 					expect(calls).toEqual([
 						{ path: '/v1/me/subscription', method: 'GET' },
