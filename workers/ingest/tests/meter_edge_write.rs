@@ -319,12 +319,9 @@ fn meter_missing_binding_surfaces_retryable_failure() {
         503,
         "a missing binding maps to 503 + Retry-After, never 202"
     );
-    assert!(
-        matches!(
-            err,
-            MeterWriteError::Transport(MeterTransportReason::BindingMissing)
-        ),
-        "a missing binding has its own transport reason: {err:?}"
+    assert_eq!(
+        err,
+        MeterWriteError::Transport(MeterTransportReason::BindingMissing)
     );
 }
 
@@ -337,10 +334,7 @@ fn meter_unknown_stage_rejected_before_any_write() {
     let err = emit_meter(&mut sink, &msg, "teleport", MeterOutcome::Ok)
         .expect_err("an unknown stage must be rejected");
 
-    assert!(
-        matches!(err, MeterWriteError::UnknownStage),
-        "unknown stage keeps its stage error, got: {err:?}"
-    );
+    assert_eq!(err, MeterWriteError::UnknownStage);
     assert!(
         !err.is_retryable(),
         "an unknown stage is a caller bug, not a retry: {err:?}"

@@ -700,6 +700,13 @@ fn size_refused_terminal_keeps_its_positive_refusal_guard() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn meter_binding_lookup_is_inside_the_validated_send_path() {
+    let lib = production("src/lib.rs");
+    assert_eq!(lib.matches(".analytics_engine(").count(), 1);
+    assert!(fn_body(&lib, "send").contains(".analytics_engine(METER_DATASET_BINDING)"));
+}
+
+#[test]
 fn migrated_files_never_serialize_an_error_value_into_a_string() {
     for rel in ["src/lib.rs", "src/queue_consumer.rs"] {
         let source = production(rel);
