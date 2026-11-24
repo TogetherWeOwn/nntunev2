@@ -9,6 +9,9 @@ license = "MIT"
 # cdylib for the worker; rlib so tests/ integration targets can link the crate.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+cleanup-dispatch-wasm-test = []
+
 [dependencies]
 worker = { version = "0.9", features = ["http", "queue", "tokio-postgres"] }
 http = "1"

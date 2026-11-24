@@ -74,3 +74,4 @@ BEGIN
         RAISE EXCEPTION 'a different principal or library did not get an independent reservation';
     END IF;
 END $$;
+\echo 'test (hosted): ingest_session_reserve passed'

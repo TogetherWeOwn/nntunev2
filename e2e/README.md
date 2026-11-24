@@ -164,6 +164,66 @@ B8 feeds the signed-URL vectors to staging and compares the wire verdicts
 against the matrix expectations. Vector ids (`botgrant-NNN`, `boturl-NNN`,
 `botmx-NNN`) are stable and citable; fixtures name secrets only.
 
+## Private music journey preparation
+
+The private music journey is off by default. The `e2e-lint` self-tests
+run [synthetic observations](fixtures/private-music/journey.spec.ts) with a
+separate [Playwright config](playwright.private-music.config.ts) outside staging
+test discovery. They verify the verdicts for invite redemption, publication
+and Library identity, playback and seek, queue order and Next, and explicit
+access refusal. The upload inputs are original
+[CC0 FLAC clips](../fixtures/synthetic-flac/admin-upload/manifest.json).
+The self-test hashes two clips and checks their sizes against the manifest.
+The [ingest readback test](../workers/ingest/tests/multipart_readback_inventory.rs)
+already verifies the clips' whole-frame range handoff against pinned media
+metadata and digest. Each clip is about 93 ms and has one frame. Publication,
+Library, transport and refusal observations here are synthetic. The
+[signup browser test](../apps/web/tests/passkey-dismissal.spec.ts) exercises
+the rendered signup and Library surfaces with intercepted HTTP and passkeys.
+
+When the real routes are available, call the
+[private music assertions and selectors](helpers/private-music-journey.ts)
+from the post-deploy staging journey:
+
+1. Use the [staging promotion checklist](../docs/ops.md#staging-promotion-checklist).
+   Require that this run deployed the staging API. Open and close the journey
+   with the existing [build identity probes](helpers/build-identity-live.ts).
+   Require both `/api/build` and `/healthz` to match the promotion SHA from
+   the deploy. Refuse skipped or unconfigured API deployment or either
+   identity changing. Use the scoped Access helpers and real cookie sessions.
+2. Follow [private listening qualification](../docs/ops.md#private-listening-qualification):
+   issue an email-bound owner invite for a fresh synthetic mailbox, redeem it,
+   and check the private signup response, cleared fragment and session-backed
+   Library navigation. Check missing-invite signup and anonymous Library in
+   fresh contexts. Use a separate authenticated unlisted account for the
+   uninvited Library and play assertions.
+3. Use the real owner upload, verification and publication routes. Record the
+   input digests and obtain the resulting digest-to-track IDs from verified
+   publication evidence. Confirm the invitee sees those IDs in Library. Use
+   at least two distinct original FLAC tracks for queue order, with a longer
+   multi-frame synthetic track first for the browser seek. The short clips
+   remain useful for upload and readback checks.
+4. Select the curated rows in rendered order, capture browser playback
+   advancement before seeking, and drive a paused seek using
+   [the player UI driver](helpers/player-ui.ts). Observe `seeked` and start
+   a fresh playback sampler before resuming. Record the minimum position
+   across time updates and polling to catch a restart. Verify media delivery
+   and the authorized Range response against the served representation.
+   Compare rendered queue IDs and use Next to verify the active track ID
+   changes to the second selection.
+5. Revoke the redeemed invitee's cohort access while keeping private mode
+   configured. Check Library, play issuance and heartbeat refusal using the
+   same previously working session. Refresh Library and check that the
+   curated rows disappear. Follow the runbook's signed-grant expiry boundary.
+
+Use only synthetic identities and media. Keep video and synced lyrics disabled,
+and qualify paid signup, checkout and renewal separately. Keep invite codes,
+tokens and cohort values out of evidence. Any later enrollment must map real
+exact-build evidence through the
+[candidate admission contract](../ci/staging-admission.md). Include a reviewed
+source-binding change if the enrolled journey reads fixture files outside the
+existing bound roots.
+
 ## Run in GitHub Actions
 
 Push the PR branch and open a draft PR while work is incomplete. The

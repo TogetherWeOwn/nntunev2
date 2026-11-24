@@ -1,25 +1,21 @@
 //! PostgreSQL credential/session writes, shared by Hyperdrive and native tests.
 
 use crate::handlers::{NativeCredentialRow, StoreError};
-use tokio_postgres::{types::Type, Client, IsolationLevel};
+use crate::postgres::{PgConnect, PgQuery};
+use tokio_postgres::types::Type;
 
 /// Retain the account-deletion fence before locking the issuing session. Both
 /// locks live through commit. A session check without a conflicting row lock
 /// would only validate a snapshot, not serialize the write with revocation.
 pub async fn insert_native_credential(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     row: &NativeCredentialRow,
     session_id: &str,
 ) -> Result<(), StoreError> {
     if row.record.user_id.is_empty() || session_id.is_empty() {
         return Err(StoreError);
     }
-    let transaction = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await
-        .map_err(|_| StoreError)?;
+    let transaction = client.read_committed().await.map_err(|_| StoreError)?;
     let owner = transaction
         .query_typed(
             "SELECT id FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE",
@@ -88,7 +84,7 @@ pub async fn insert_native_credential(
 /// Revocation never acquires a user lock after the session lock, preserving the
 /// user -> session -> credential lock order of issuance and account deletion.
 pub async fn revoke_sessions_and_native_credentials(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     user_id: &str,
     now: u64,
 ) -> Result<u64, StoreError> {
@@ -113,12 +109,7 @@ pub async fn revoke_sessions_and_native_credentials(
         .first()
         .map(|row| row.get::<_, bool>(0))
         .unwrap_or(false);
-    let transaction = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await
-        .map_err(|_| StoreError)?;
+    let transaction = client.read_committed().await.map_err(|_| StoreError)?;
     transaction
         .query_typed(
             "UPDATE sessions SET revoked = TRUE WHERE user_id = $1",

@@ -276,7 +276,18 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .0;
     let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
     let prototype = format!("{prototype_gate}asyncfnstore_reconcile_outcome(");
-    let store = store.replacen(function_body(store, &prototype), "{}", 1);
+    let owned_body = function_body(store, &prototype);
+    assert!(owned_body.contains("self.store_reconcile_owned("));
+    let release_gate =
+        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
+    let legacy_body = function_body(
+        store,
+        &format!("{release_gate}asyncfnstore_reconcile_outcome("),
+    );
+    assert!(legacy_body.contains("store_reconciled_subscription_statement()"));
+    assert!(legacy_body.contains("insert_paid_invoice_history_statement()"));
+    assert!(!legacy_body.contains("store_reconcile_owned("));
+    let store = store.replacen(owned_body, "{}", 1);
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
@@ -293,8 +304,6 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             "Store impl slice must contain {anchor}"
         );
     }
-    let release_gate =
-        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
     assert_eq!(
         names
             .iter()
@@ -619,10 +628,9 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         }
     }
     // The production redemption transaction lives outside worker_entry:
-    // slice its `tokio_postgres::Transaction` impl (comments stripped,
+    // slice its `PgTransaction` impl (comments stripped,
     // whitespace normalized, like `production()` above) and pin the
-    // same rule. `SET LOCAL` stays on `batch_execute` (simple-query
-    // protocol, never a named prepared statement).
+    // same rule. The wrapper owns the fixed `SET LOCAL` command.
     let redemption: String = include_str!("../src/magic_redemption.rs")
         .split_once("#[cfg(all(test,")
         .expect("magic_redemption test-module boundary")
@@ -634,7 +642,7 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         .filter(|ch| !ch.is_whitespace())
         .collect();
     let pg_impl = redemption
-        .split_once("implRedemptionTransactionfortokio_postgres::Transaction<'_>{")
+        .split_once("implRedemptionTransactionforPgTransaction<'_>{")
         .expect("production redemption transaction impl")
         .1
         .split_once("pub(crate)asyncfnredeem(")

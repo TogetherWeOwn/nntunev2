@@ -23,6 +23,16 @@ BEGIN
         RAISE EXCEPTION 'out-of-scope delivery claim';
     END IF;
     BEGIN
+        UPDATE public.ingest_session_cleanup_intents SET due_at=clock_timestamp() + interval '25 hours'
+        WHERE session_id=sid AND kind='absolute_expiry';
+        IF (SELECT array_agg(kind) FROM pg_temp.claim_cleanup(f.environment_id, f.library_id, owner, sid))
+            IS DISTINCT FROM ARRAY['terminal_reconcile'] THEN
+            RAISE EXCEPTION 'claim did not honor the 24-hour scheduling cutoff';
+        END IF;
+        RAISE SQLSTATE 'Z0001';
+    EXCEPTION WHEN SQLSTATE 'Z0001' THEN NULL;
+    END;
+    BEGIN
         IF (SELECT count(*) FROM pg_temp.claim_cleanup(f.environment_id, f.library_id, owner, sid)) <> 2 THEN
             RAISE EXCEPTION 'expected both scoped intents';
         END IF;
@@ -38,6 +48,8 @@ BEGIN
 
     IF EXISTS (SELECT FROM pg_temp.claim_cleanup(f.environment_id, f.library_id, owner, sid)) OR
        EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(gen_random_uuid(), f.library_id, owner, sid, 'absolute_expiry', expiry_id)) OR
+       EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(f.environment_id, gen_random_uuid(), owner, sid, 'absolute_expiry', expiry_id)) OR
+       EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(f.environment_id, f.library_id, 'session-other', sid, 'absolute_expiry', expiry_id)) OR
        EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(f.environment_id, f.library_id, owner, sid, 'absolute_expiry', terminal_id)) THEN
         RAISE EXCEPTION 'live claim duplicated or acknowledgement accepted the wrong scope/intent';
     END IF;

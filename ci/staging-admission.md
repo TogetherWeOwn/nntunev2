@@ -5,19 +5,24 @@ acceptance or permission to deploy. The manual production lane remains disabled
 by default. No runner, migration, mirror, production binding, secret or promoter
 is enabled by this change.
 
-## Current state: no approved product scope
+## Product approval and candidate evidence
 
-`staging-admission-policy.json` deliberately has **no approvals**. A green legacy
-journey, its permitted parked skips and a successful but unconfigured API job
-cannot qualify a candidate. The producer can publish an `incomplete` diagnostic
-receipt. Real production admission refuses until an independently approved
-product contract and complete candidate execution evidence exist. Do not enroll
-one of the synthetic test contracts as a production approval.
+An empty `staging-admission-policy.json` approval list refuses admission. A green
+legacy journey, its permitted parked skips and a successful but unconfigured API
+job cannot qualify a candidate. The producer can publish an `incomplete`
+diagnostic receipt. Production admission requires both an independently approved
+product contract and complete candidate execution evidence. Do not enroll a
+synthetic test contract as a production approval.
 
 Product requirements/applicability belong to the product authority; QA separately
 reviews their executable evidence mapping. The repository's normal protected
 review process must authenticate those decisions before a policy entry is added.
 This interface does not select or reduce the applicable product requirements.
+
+The offline `release-proof` CI job checks the installed policy with the same
+approval check as the verifier. When the contract file is absent, CI requires
+an empty approval list and expects the check to refuse. When the file is present,
+the check must accept its exact bytes using the installed policy.
 
 ## Reviewed input encoding
 

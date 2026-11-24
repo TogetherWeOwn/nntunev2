@@ -347,7 +347,39 @@ fn postgres_registration_commit_without_invite_is_single_use() {
 fn postgres_registration_commit_consumes_optional_invite() {
     run_test(async {
         let mut client = connect().await;
-        let fixture = Fixture::seed(&client).await;
+        let mut fixture = Fixture::seed(&client).await;
+        let issuer = Fixture::seed(&client).await.credential.user_id;
+        client
+            .execute(
+                "UPDATE invite_codes SET issued_by = $1, email = $2 WHERE code_hash = $3",
+                &[&issuer, &fixture.magic.email, &fixture.invite.code_hash],
+            )
+            .await
+            .expect("bind the invite to a distinct issuer and inbox");
+        fixture.invite.issued_by = Some(issuer.clone());
+        fixture.invite.email = Some(fixture.magic.email.clone());
+        fixture.invite.require_active_admin_issuer = true;
+        let denied = complete_registration_on(
+            &mut client,
+            &fixture.challenge,
+            &fixture.magic,
+            Some(&fixture.invite),
+            Some(&fixture.invite_audit),
+            &fixture.credential,
+            NOW,
+        )
+        .await;
+        assert!(
+            denied.is_err(),
+            "private invite from a non-admin issuer was accepted"
+        );
+        fixture
+            .assert_state(&client, (false, false, false, 0))
+            .await;
+        client
+            .execute("UPDATE users SET role = 'admin' WHERE id = $1", &[&issuer])
+            .await
+            .expect("restore the synthetic issuer's admin role");
         complete_registration_on(
             &mut client,
             &fixture.challenge,
@@ -358,7 +390,7 @@ fn postgres_registration_commit_consumes_optional_invite() {
             NOW,
         )
         .await
-        .expect("registration with invite commits");
+        .expect("the unchanged invite and proofs commit once the issuer is an admin");
         // In particular, removing the production invite claim fails here.
         fixture.assert_state(&client, (true, true, true, 1)).await;
         fixture.assert_credential(&client).await;
@@ -3158,12 +3190,19 @@ fn assert_member_invite_issuance() {
             let spend = summary(&issuer).await.open_window.unwrap();
             assert_eq!((spend.used, spend.remaining), (1, 0), "{stamp}");
         }
+        // Leave one slot unused so the next window can distinguish a reset
+        // from carrying the unused slot forward.
+        assert_eq!(db.execute(settings, &[&"2", &"2", &"1"]).await.unwrap(), 3);
+        let before_close = summary(&issuer).await.open_window.unwrap();
+        assert_eq!((before_close.used, before_close.remaining), (1, 1));
         let closed_at: i64 = db.query_one("UPDATE invite_windows SET
             ends_at = floor(extract(epoch FROM clock_timestamp()))::bigint WHERE id = $1 RETURNING ends_at",
             &[&window]).await.unwrap().get(0);
         let closed = summary(&issuer).await;
+        assert!(closed.eligible);
         assert!(closed.open_window.is_none());
         assert_eq!(closed.next_window.unwrap().starts_at, future_start);
+        assert_eq!(issue(&mut db, &issuer, 2).await, WindowClosed);
         let replacement = db
             .query_one(
                 "INSERT INTO invite_windows (starts_at, ends_at)
@@ -3176,9 +3215,16 @@ fn assert_member_invite_issuance() {
         let fresh = summary(&issuer).await.open_window.unwrap();
         assert_eq!(fresh.bounds.starts_at, closed_at);
         assert_eq!(fresh.bounds.ends_at, end);
-        assert_eq!((fresh.used, fresh.remaining), (0, 1));
+        assert_eq!((fresh.used, fresh.remaining), (0, 2));
         let outcome = issue(&mut db, &issuer, 2).await;
         assert!(matches!(outcome, Issued { expires_at, .. } if expires_at == end));
+        assert!(matches!(
+            issue(&mut db, &issuer, 3).await,
+            Issued { expires_at, .. } if expires_at == end
+        ));
+        assert_eq!(issue(&mut db, &issuer, 4).await, QuotaExhausted);
+        let spent = summary(&issuer).await.open_window.unwrap();
+        assert_eq!((spent.used, spent.remaining), (2, 0));
         let relax_lock = "SET lock_timeout = '5s'";
         let wait_until = "SELECT pg_sleep_until(to_timestamp($1))";
         other.batch_execute(relax_lock).await.unwrap();

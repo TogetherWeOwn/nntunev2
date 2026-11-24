@@ -128,7 +128,7 @@ mod tests {
         assert!(
             std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
                 && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
-                && url == "postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci"
+                && url == "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci"
         );
         let (mut db, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
             .await

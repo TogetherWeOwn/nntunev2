@@ -454,6 +454,40 @@ pub(crate) fn like_track_target(path: &str) -> Option<&str> {
         .filter(|target| !target.is_empty() && !target.contains('/'))
 }
 
+/// Exact browser session contracts for preferences and optional playback binding.
+/// The remaining cookie-only operations use their existing authentication policies.
+#[derive(Clone, Copy)]
+pub(crate) enum BrowserSessionRoute<'a> {
+    LikesImport,
+    LikeTrack(&'a str),
+    UnlikeTrack(&'a str),
+    TasteList { bound: bool },
+    TastePut { bound: bool },
+    TasteClear { bound: bool },
+    PrivateSession,
+    PlayIssue,
+    PlayHeartbeat,
+}
+
+pub(crate) fn browser_route<'a>(method: &str, path: &'a str) -> Option<BrowserSessionRoute<'a>> {
+    use crate::handlers::BOUND_TASTE_PATH;
+    use BrowserSessionRoute::*;
+
+    let bound = path == BOUND_TASTE_PATH;
+    match (method, path) {
+        ("POST", "/v1/me/likes/import") => Some(LikesImport),
+        ("GET", "/v1/me/taste" | BOUND_TASTE_PATH) => Some(TasteList { bound }),
+        ("PUT", "/v1/me/taste" | BOUND_TASTE_PATH) => Some(TastePut { bound }),
+        ("DELETE", "/v1/me/taste" | BOUND_TASTE_PATH) => Some(TasteClear { bound }),
+        ("PUT", "/v1/me/private-session") => Some(PrivateSession),
+        ("POST", "/v1/plays") => Some(PlayIssue),
+        ("POST", "/v1/plays/heartbeat") => Some(PlayHeartbeat),
+        ("PUT", path) => like_track_target(path).map(LikeTrack),
+        ("DELETE", path) => like_track_target(path).map(UnlikeTrack),
+        _ => None,
+    }
+}
+
 pub(crate) const MEMBER_INVITES_PATH: &str = "/v1/me/invites";
 pub(crate) const MEMBER_INVITE_HISTORY_PATH: &str = "/v1/me/invites/history";
 pub(crate) const ADMIN_INVITE_BATCH_PATH: &str = "/v1/admin/invites/batch";
@@ -488,6 +522,13 @@ pub(crate) fn admin_invite_window_close_id(path: &str) -> Option<i64> {
 /// resource name or a similar operation.
 pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
     use RouteDecision::{Bearer, Deny, SessionOnly};
+    if let Some(route) = browser_route(method, path) {
+        return match route {
+            BrowserSessionRoute::PlayIssue => Bearer(Scope::PlaysWrite),
+            BrowserSessionRoute::PlayHeartbeat => Deny,
+            _ => SessionOnly,
+        };
+    }
     /// `/prefix/{single-segment}` (no deeper nesting). Callers pass a
     /// slash-terminated prefix, so the remainder never starts with `/`.
     fn one_segment_after(prefix: &str, path: &str) -> bool {
@@ -524,8 +565,6 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                     | "/v1/indexers"
                     | "/v1/me/likes"
                     | "/v1/me/likes/session"
-                    | "/v1/me/taste"
-                    | crate::handlers::BOUND_TASTE_PATH
                     | "/v1/me/history"
                     | MEMBER_INVITES_PATH
                     | MEMBER_INVITE_HISTORY_PATH
@@ -602,9 +641,6 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if path == "/v1/playlists" {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if path == "/v1/plays" {
-                return Bearer(Scope::PlaysWrite);
-            }
             if path == "/v1/ingest" || path.starts_with("/v1/ingest/") {
                 return Bearer(Scope::IngestSubmit);
             }
@@ -617,7 +653,6 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
                 || path == "/v1/session/revoke-all"
                 || path == "/v1/billing/checkout"
                 || path == "/v1/admin/ingest"
-                || path == "/v1/me/likes/import"
                 || path == MEMBER_INVITES_PATH
             {
                 return SessionOnly;
@@ -652,14 +687,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/playlists/", path) {
                 return Bearer(Scope::PlaylistsWrite);
             }
-            if matches!(
-                path,
-                "/v1/me"
-                    | "/v1/me/private-session"
-                    | "/v1/me/taste"
-                    | crate::handlers::BOUND_TASTE_PATH
-            ) || like_track_target(path).is_some()
-            {
+            if path == "/v1/me" {
                 return SessionOnly;
             }
             // Admin writes (migration 0028): one setting key, or one
@@ -691,11 +719,7 @@ pub fn scope_for_operation(method: &str, path: &str) -> RouteDecision {
             if one_segment_after("/v1/libraries/", path) {
                 return SessionOnly;
             }
-            if matches!(
-                path,
-                "/v1/account" | "/v1/me/taste" | crate::handlers::BOUND_TASTE_PATH
-            ) || like_track_target(path).is_some()
-            {
+            if path == "/v1/account" {
                 return SessionOnly;
             }
             if one_segment_after("/v1/subsonic-credentials/", path) {

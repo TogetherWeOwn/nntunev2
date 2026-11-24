@@ -105,6 +105,40 @@ fn seeks_in_prepared_plaintext_and_maps_complete_sealed_chunks() {
     assert!(last.final_chunk);
 }
 
+#[test]
+fn streamed_seek_ignores_source_offsets_at_every_input_split() {
+    let mut input = STREAMINFO.to_vec();
+    block_header(&mut input, 0x83, 36);
+    // Well-formed entries. The second offset points to frame 1, but sample
+    // 5000 starts at frame 2, byte 28 relative to the audio.
+    for (sample, offset) in [(0_u64, 0_u64), (5000, 14)] {
+        input.extend_from_slice(&sample.to_be_bytes());
+        input.extend_from_slice(&offset.to_be_bytes());
+        input.extend_from_slice(&2500_u16.to_be_bytes());
+    }
+    input.extend_from_slice(AUDIO);
+    let audio_start = (input.len() - AUDIO.len()) as u64;
+    for split in 0..=input.len() {
+        let mut stream = crate::flac_stream::FlacStream::new(true);
+        stream.push(&input[..split]).unwrap();
+        stream.push(&input[split..]).unwrap();
+        let seek = stream.finish_with_index().unwrap().unwrap();
+        assert_eq!(
+            seek.plaintext_range(4999..5001),
+            Some(audio_start..audio_start + 56)
+        );
+        assert_eq!(
+            seek.plaintext_range(5000..10_000),
+            Some(audio_start + 28..audio_start + 56)
+        );
+        assert_eq!(
+            seek.plaintext_range(11_999..u64::MAX),
+            Some(audio_start + 56..input.len() as u64)
+        );
+        assert_eq!(seek.plaintext_range(12_000..12_001), None);
+    }
+}
+
 fn assert_bad_geometry(input: &[u8], frames: impl IntoIterator<Item = FrameSpan>) {
     let error = prepare(input, &[], frames).err();
     assert_eq!(error, Some(PrepareError::FrameGeometry));

@@ -17,9 +17,10 @@ _USER (postgres), _ADMIN_DB (nntune_ci). Needs node and a host psql client.
 
     python3 -I workers/api/tests/worker_routing_postgres_smoke.py [--wrangler PATH]
 """
-import argparse, base64, hashlib, importlib.util, json, os, re, secrets, shutil, socket, subprocess
+import argparse, base64, hashlib, importlib.util, json, os, re, runpy, secrets, shutil, socket, subprocess
 import sys, tempfile, time, tomllib, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
+from threading import Event
 
 spec = importlib.util.spec_from_file_location("process_group", Path(__file__).resolve().with_name("process_group.py"))
 process_group = importlib.util.module_from_spec(spec)
@@ -274,6 +275,27 @@ def legacy_vault_cutover(base, q):
     print("ok: PostgreSQL marker-only admission and reaping, stale cleanup after provider purge", flush=True)
 
 
+def default_off_probe(base):
+    """Run the real probe transport against the already-running, lease-free Worker."""
+    check(re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", base), "probe fixture must use loopback")
+    runner = runpy.run_path(str(ROOT / "scripts/subsonic-staging-runner.py"))
+
+    def disposable_curl(argv, **options):
+        path = "/rest/getArtists"
+        check(argv[-2:] == ("--url", "https://staging.nntune.com" + path),
+              "unexpected staging probe destination")
+        argv = list(argv)
+        argv[argv.index("=https")] = "=http"
+        argv[-1] = base + path
+        return subprocess.Popen(argv, **options)
+
+    runner["StagingPostTransport"](spawn=disposable_curl).probe_off(
+        deadline=time.monotonic() + 10, cancel=Event(),
+        access_client_id="fixture-edge-id", access_client_secret="fixture-edge-secret",
+    )
+    print("ok: default-off release Worker passed the bounded Subsonic probe oracle", flush=True)
+
+
 def smoke(base, s, db, fx=None, mirror=False):
     q = lambda sql, **v: psql(s, db, stdin=sql, tuples=True, **v)
     status, _, body = http("GET", base + "/healthz")
@@ -303,6 +325,7 @@ def smoke(base, s, db, fx=None, mirror=False):
         check(classify(st, ct, b) == want, f"/rest control {path}: want {want}: {st} {ct} {b[:100]!r}")
         if path.startswith("/rest/ping.view?"):
             check_ping(st, ct, b)
+    default_off_probe(base)
     after = q("SELECT (SELECT count(*) FROM auth_challenges) || '/' || (SELECT count(*) FROM auth_rate_limit_slots)")
     check(after == snap, "current main /rest changed observed table counts")
     print("ok: /rest claimed by the Subsonic adapter; observed table counts unchanged", flush=True)
@@ -315,8 +338,10 @@ def smoke(base, s, db, fx=None, mirror=False):
         fixture_inert(base, q, fx, mirror)
 
 
-def measurement_fetch(tmp, wrangler, env, s, db, sha, fx, redact):
+def measurement_fetch(tmp, wrangler, env, s, db, sha, fx, redact, runner, shared):
     now = int(time.time())
+    (tmp / ".dev.vars").write_text(dev_vars(fx) + f"QA_AUTH_TOKEN={shared}\n"
+                                   f"SUBSONIC_MEASUREMENT_RUNNER=v1:{now}:{now + 600}:{runner}\n")
     for enabled in (1, 0):
         extra = f'''QA_CODE_SEAM = "1"
 SUBSONIC_MEASUREMENT_STAGE = "staging"
@@ -330,8 +355,12 @@ SUBSONIC_MEASUREMENT_LEASE = "v1:{sha}:{now}:{now + 600}:ci-fixture-active;small
                             cwd=tmp, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
-        output, _ = proc.communicate(json.dumps([fx.keys[k] for k in ("active", "grace")]), timeout=150)
+        matching, other = (fx.keys[k] for k in ("active", "grace"))
+        output, _ = proc.communicate(json.dumps([matching, other, runner, shared]), timeout=150)
         check(proc.returncode == 0, "measurement Fetch failed:\n" + redact(output)[-4000:])
+    except subprocess.TimeoutExpired as err:
+        partial = (err.output or b"").decode(errors="replace")
+        raise Failure("measurement Fetch timed out:\n" + redact(partial)[-4000:]) from None
     finally:
         process_group.shutdown_process_group(proc)
     used = psql(s, db, "SELECT user_id FROM subsonic_credentials WHERE last_used_at IS NOT NULL ORDER BY user_id",
@@ -408,12 +437,14 @@ def main(argv=None):
             break
         smoke(base, s, db, fx, args.mirror_fixture)
         if fx:
-            runner = b64(secrets.token_bytes(32))
-            secrets_out.append(runner)
+            # Stop ordinary routing before reusing the test Worker name.
+            process_group.shutdown_process_group(proc)
+            proc = None
+            runner, shared = (b64(secrets.token_bytes(32)) for _ in range(2))
+            secrets_out.extend((runner, shared))
             measurement = tmp / "measurement"
             measurement.mkdir()
-            (measurement / ".dev.vars").write_text(dev_vars(fx) + f"QA_AUTH_TOKEN={runner}\n")
-            measurement_fetch(measurement, wrangler, {**env, "QA_AUTH_TOKEN": runner}, s, db, sha, fx, redact)
+            measurement_fetch(measurement, wrangler, env, s, db, sha, fx, redact, runner, shared)
     except (Failure, subprocess.TimeoutExpired) as err:
         print(f"FAIL: {redact(str(err))}", file=sys.stderr)
         failed = True

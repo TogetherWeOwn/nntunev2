@@ -10,6 +10,7 @@ DECLARE
     idle_at timestamptz;
     absolute_at timestamptz;
     observed record;
+    terminal_before jsonb;
 BEGIN
     SELECT * INTO STRICT f FROM digest_lookup_fixture WHERE n=1;
     PERFORM pg_temp.reserve_session(f.environment_id, f.library_id, owner, 'status',
@@ -38,15 +39,36 @@ BEGIN
         RAISE EXCEPTION 'status renewed a deadline or required/wrote an expiry tombstone';
     END IF;
 
+    BEGIN
+        IF (SELECT pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'expire'))
+            IS DISTINCT FROM 'expired' THEN
+            RAISE EXCEPTION 'fixture failed to record expiry';
+        END IF;
+        SELECT to_jsonb(session) INTO STRICT terminal_before
+        FROM public.ingest_session_reservations AS session WHERE id=sid;
+        SELECT * INTO STRICT observed FROM pg_temp.session_status(f.environment_id, f.library_id, owner, sid);
+        IF observed.state IS DISTINCT FROM 'expired' OR observed.expires_at IS DISTINCT FROM past OR
+           (SELECT to_jsonb(session) FROM public.ingest_session_reservations AS session WHERE id=sid)
+           IS DISTINCT FROM terminal_before THEN
+            RAISE EXCEPTION 'status returned the wrong recorded expiry or changed the reservation';
+        END IF;
+        RAISE SQLSTATE 'Z0001';
+    EXCEPTION WHEN SQLSTATE 'Z0001' THEN NULL;
+    END;
+
     UPDATE public.ingest_session_reservations SET idle_deadline=idle_at WHERE id=sid;
     IF (SELECT pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'abort'))
         IS DISTINCT FROM 'aborted' THEN
         RAISE EXCEPTION 'fixture failed to abort an active session';
     END IF;
     UPDATE public.ingest_session_reservations SET idle_deadline=past WHERE id=sid;
-    IF (SELECT state FROM pg_temp.session_status(f.environment_id, f.library_id, owner, sid))
-        IS DISTINCT FROM 'aborted' THEN
-        RAISE EXCEPTION 'status replaced the earlier terminal verdict with expiry';
+    SELECT to_jsonb(session) INTO STRICT terminal_before
+    FROM public.ingest_session_reservations AS session WHERE id=sid;
+    SELECT * INTO STRICT observed FROM pg_temp.session_status(f.environment_id, f.library_id, owner, sid);
+    IF observed.state IS DISTINCT FROM 'aborted' OR observed.expires_at IS DISTINCT FROM past OR
+       (SELECT to_jsonb(session) FROM public.ingest_session_reservations AS session WHERE id=sid)
+       IS DISTINCT FROM terminal_before THEN
+        RAISE EXCEPTION 'status returned the wrong recorded abort or changed the reservation';
     END IF;
 END $$;
 \echo ingest session status fixture passed

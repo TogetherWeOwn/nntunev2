@@ -4,6 +4,7 @@
 use crate::flac_continuity::FrameContinuity;
 use crate::flac_frame::FrameReader;
 use crate::flac_preamble::FlacPreamble;
+use crate::flac_prepare::FlacSeekIndex;
 
 #[derive(Default)]
 pub(crate) struct FlacStream {
@@ -14,10 +15,20 @@ pub(crate) struct FlacStream {
     frame: Option<FrameReader>,
     pcm_md5: Option<md5::Context>,
     pcm_scratch: Option<Vec<i32>>,
+    collect_seek: bool,
+    bytes_seen: u64,
+    seek: Option<FlacSeekIndex>,
     failed: bool,
 }
 
 impl FlacStream {
+    pub(crate) fn new(collect_seek: bool) -> Self {
+        Self {
+            collect_seek,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn push(&mut self, input: &[u8]) -> Result<(), ()> {
         if self.failed {
             return Err(());
@@ -26,11 +37,18 @@ impl FlacStream {
     }
 
     fn consume(&mut self, mut input: &[u8]) -> Result<(), ()> {
+        if self.collect_seek {
+            self.bytes_seen = self.bytes_seen.checked_add(input.len() as u64).ok_or(())?;
+        }
         if self.continuity.is_none() {
             let Some((info, audio)) = self.preamble.push(input)? else {
                 return Ok(());
             };
             input = audio;
+            if self.collect_seek {
+                let audio_start = self.bytes_seen - audio.len() as u64;
+                self.seek = Some(FlacSeekIndex::new(info.sample_rate, audio_start));
+            }
             self.continuity = Some(FrameContinuity::new(&info));
             // RFC 9639: an all-zero checksum means it is not provided.
             if info.pcm_md5 != [0; 16] {
@@ -44,11 +62,15 @@ impl FlacStream {
                 if !frame.read(&mut input)? {
                     return Ok(());
                 }
-                let (depth, pcm) = continuity.accept_with_pcm(self.frame.take().ok_or(())?)?;
+                let (header, pcm) = continuity.accept_with_pcm(self.frame.take().ok_or(())?)?;
                 if let Some(md5) = &mut self.pcm_md5 {
                     let pcm = pcm.ok_or(())?;
-                    hash_pcm(md5, depth, &pcm);
+                    hash_pcm(md5, header.bits_per_sample, &pcm);
                     self.pcm_scratch = Some(pcm);
+                }
+                if let Some(seek) = &mut self.seek {
+                    let frame_end = self.bytes_seen - input.len() as u64;
+                    seek.record_frame(header.block_size, frame_end)?;
                 }
             } else {
                 // Feed only header bytes into scratch. The body always starts
@@ -75,9 +97,14 @@ impl FlacStream {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn finish_at_eof(self) -> Result<(), ()> {
+        self.finish_with_index().map(|_| ())
+    }
+
     /// Call only once the outer reader has confirmed EOF. Partial metadata,
     /// headers, subframes and footers cannot count as a finished stream.
-    pub(crate) fn finish_at_eof(self) -> Result<(), ()> {
+    pub(crate) fn finish_with_index(self) -> Result<Option<FlacSeekIndex>, ()> {
         if self.failed || self.filled != 0 || self.frame.is_some() {
             return Err(());
         }
@@ -87,7 +114,7 @@ impl FlacStream {
         if self.pcm_md5.map_or([0; 16], |md5| md5.finalize().0) != expected {
             return Err(());
         }
-        Ok(())
+        Ok(self.seek)
     }
 }
 
@@ -108,6 +135,8 @@ fn hash_pcm(md5: &mut md5::Context, depth: u8, pcm: &[i32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::{collections::HashSet, fs, path::Path};
 
     // Synthetic 16-sample mono constant frame followed by a three-sample tail.
     const FIRST: &[u8] = &[255, 248, 105, 2, 0, 15, 183, 0, 42, 122, 221];
@@ -136,6 +165,68 @@ mod tests {
             stream.push(byte).unwrap();
         }
         assert_eq!(stream.finish_at_eof(), Ok(()));
+    }
+
+    fn admin_upload_clips() -> Vec<Vec<u8>> {
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            tracks: Vec<Track>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Track {
+            file: String,
+            bytes: usize,
+            sha256: String,
+        }
+
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/synthetic-flac/admin-upload");
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest.tracks.len(), 10);
+        let mut digests = HashSet::new();
+        manifest
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(index, track)| {
+                assert_eq!(track.file, format!("fixture-{}.flac", index + 1));
+                let clip = fs::read(directory.join(&track.file)).unwrap();
+                assert_eq!(clip.len(), track.bytes, "{}", track.file);
+                let digest: String = Sha256::digest(&clip)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                assert_eq!(digest, track.sha256, "{}", track.file);
+                assert!(digests.insert(digest), "duplicate fixture {}", track.file);
+                clip
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accepts_each_admin_upload_clip_as_a_complete_flac_stream() {
+        for (index, clip) in admin_upload_clips().iter().enumerate() {
+            let mut stream = FlacStream::default();
+            assert_eq!(
+                stream.push(clip).and_then(|()| stream.finish_at_eof()),
+                Ok(()),
+                "fixture-{}.flac",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_two_admin_upload_clips_concatenated_as_one_flac_stream() {
+        let clips = admin_upload_clips();
+        let mut stream = FlacStream::default();
+        stream.push(&clips[0]).unwrap();
+        assert_eq!(
+            stream.push(&clips[1]).and_then(|()| stream.finish_at_eof()),
+            Err(())
+        );
     }
 
     #[test]

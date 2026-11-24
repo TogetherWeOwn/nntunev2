@@ -37,19 +37,7 @@ impl S3Locator {
     /// Validate shape only. The trusted producer must assure version provenance,
     /// configuration ownership and durable key non-reuse.
     pub fn new(bucket: String, key: String, binding: S3Binding) -> Result<Self, S3LocatorError> {
-        let mut labels = bucket.split('.');
-        if !(3..=63).contains(&bucket.len())
-            || !labels.clone().all(|label| {
-                !label.is_empty()
-                    && !label.starts_with('-')
-                    && !label.ends_with('-')
-                    && label
-                        .bytes()
-                        .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
-            })
-            || (labels.clone().count() == 4
-                && labels.all(|label| label.bytes().all(|b| b.is_ascii_digit())))
-        {
+        if !valid_bucket(&bucket) {
             return Err(S3LocatorError::Bucket);
         }
         if !key
@@ -106,6 +94,21 @@ impl S3Locator {
     }
 }
 
+fn valid_bucket(bucket: &str) -> bool {
+    let mut labels = bucket.split('.');
+    (3..=63).contains(&bucket.len())
+        && labels.clone().all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        })
+        && !(labels.clone().count() == 4
+            && labels.all(|label| label.bytes().all(|b| b.is_ascii_digit())))
+}
+
 fn opaque_token(token: &str) -> bool {
     (1..=MAX_BINDING_BYTES).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic())
 }
@@ -115,6 +118,23 @@ fn valid_key_id(id: &str) -> bool {
         && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         && id.as_bytes()[12] == b'4'
         && matches!(id.as_bytes()[16], b'8'..=b'9' | b'a'..=b'b')
+}
+
+fn context_media_key(identities: &[[u8; 16]; 5]) -> Option<String> {
+    if identities
+        .iter()
+        .any(|id| id[6] >> 4 != 4 || id[8] >> 6 != 2)
+    {
+        return None;
+    }
+    let mut key = String::from("media");
+    for id in &identities[2..4] {
+        key.push('/');
+        for byte in id {
+            write!(&mut key, "{byte:02x}").ok()?;
+        }
+    }
+    Some(key)
 }
 
 /// Trusted media expectations stored alongside, not inside, the locator.
@@ -136,24 +156,19 @@ impl fmt::Debug for S3MediaMetadata {
 }
 
 impl S3MediaMetadata {
+    /// Validate the target bucket shape and the exact key for the trusted
+    /// context before a provider returns a version. The caller establishes
+    /// bucket ownership and authorization independently.
+    pub fn matches_target(bucket: &str, key: &str, context: &EnvelopeContext) -> bool {
+        let [_, identities @ ..] = &context.identities;
+        valid_bucket(bucket) && context_media_key(identities).as_deref() == Some(key)
+    }
+
     /// Build from independently trusted context, not a returned tag, length,
     /// or envelope. Full envelope authentication and readback remain separate.
     pub fn from_trusted_context(locator: S3Locator, context: &EnvelopeContext) -> Option<Self> {
         let [_, identities @ ..] = context.identities;
-        if identities
-            .iter()
-            .any(|id| id[6] >> 4 != 4 || id[8] >> 6 != 2)
-        {
-            return None;
-        }
-        let mut key = String::from("media");
-        for id in &identities[2..4] {
-            key.push('/');
-            for byte in id {
-                write!(&mut key, "{byte:02x}").ok()?;
-            }
-        }
-        if locator.key() != key {
+        if context_media_key(&identities).as_deref() != Some(locator.key()) {
             return None;
         }
         Some(Self {

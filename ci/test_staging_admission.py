@@ -227,10 +227,36 @@ class Base(unittest.TestCase):
 
 
 class PolicyTests(Base):
-    def test_default_policy_has_no_approvals_and_refuses(self):
-        policy = json.loads((HERE / "staging-admission-policy.json").read_text())
-        self.assertEqual(policy["approvals"], [])
-        self.refused("unavailable or ambiguous", sa.approved_contract, policy, CONTRACT_BYTES)
+    def assert_installed_policy(self, root):
+        policy = sa.parse_json((root / sa.POLICY).read_bytes())
+        try:
+            contract_bytes = (root / sa.CONTRACT).read_bytes()
+        except FileNotFoundError:
+            self.assertEqual(policy["approvals"], [])
+            self.refused("unavailable or ambiguous", sa.approved_contract, policy, b"")
+        else:
+            sa.approved_contract(policy, contract_bytes)
+
+    def test_checked_in_policy_matches_contract(self):
+        self.assert_installed_policy(HERE.parent)
+
+    def test_installed_policy_with_fixture_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy_path = root / sa.POLICY
+            contract_path = root / sa.CONTRACT
+            policy_path.parent.mkdir()
+            policy_path.write_text(json.dumps(dict(make_policy(), approvals=[])), encoding="utf-8")
+            self.assert_installed_policy(root)
+
+            contract_bytes = CONTRACT_BYTES + b"\r\n"
+            policy_path.write_text(json.dumps(make_policy(contract_bytes)), encoding="utf-8")
+            contract_path.write_bytes(contract_bytes)
+            self.assert_installed_policy(root)
+
+            # The JSON is equivalent, but the approved bytes have changed.
+            contract_path.write_bytes(CONTRACT_BYTES + b"\n")
+            self.refused("unapproved product contract hash", self.assert_installed_policy, root)
 
     def test_missing_or_ambiguous_approval(self):
         policy = make_policy()

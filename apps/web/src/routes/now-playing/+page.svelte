@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { displayArtist, displayTitle } from '#lib/library/order.js';
 	import Artwork from '#lib/player/Artwork.svelte';
+	import PlaybackView from '#lib/player/AudioPlaybackView.svelte';
 	import { getAppPlayer } from '#lib/player/AppPlayer.svelte';
 	import LyricsPanel, { type TrackLyrics } from '#lib/player/LyricsPanel.svelte';
 	import { currentTrack } from '#lib/player/queue.js';
@@ -114,12 +115,14 @@
 	{/if}
 
 	{#if track}
-		<div class="artwork">
-			<Artwork />
-		</div>
-		<h2>{displayTitle(track)}</h2>
-		{#if artist}<p class="artist">{artist}</p>{/if}
-		<LyricsPanel trackId={track.id} {lyrics} />
+		<PlaybackView {track}>
+			<div class="artwork">
+				<Artwork />
+			</div>
+			<h2>{displayTitle(track)}</h2>
+			{#if artist}<p class="artist">{artist}</p>{/if}
+			<LyricsPanel trackId={track.id} {lyrics} />
+		</PlaybackView>
 	{:else}
 		<p>Nothing playing. Choose a track in Your Library.</p>
 	{/if}

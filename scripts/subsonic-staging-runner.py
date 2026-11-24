@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rehearse the reviewed Subsonic schedule against an in-memory staging model."""
+"""Bound Subsonic staging POSTs and rehearse the schedule in memory."""
 
 import argparse
 import hashlib
@@ -19,6 +19,9 @@ MATRIX = Path(__file__).resolve().parents[1] / "fixtures/subsonic/staging/matrix
 MATRIX_DIGEST = "18a076d2fc86f2a7dadf5efd2e1a1200c741b821379afeb158c4dac06ce80abb"
 MATRIX_LIMIT = 32 * 1024
 STAGING_ORIGIN = "https://staging.nntune.com"
+STAGING_TARGETS = frozenset(STAGING_ORIGIN + path for path in (
+    "/rest/getArtists", "/rest/getArtist", "/rest/getAlbum",
+))
 FORM_LIMIT = 8 * 1024
 ENCODED_API_KEY_LIMIT = 1024  # MAX_CREDENTIAL_VALUE_BYTES in subsonic_http.rs
 REJECTION_LIMIT = 1024
@@ -237,18 +240,64 @@ class StagingPostTransport:
         """Return a PostResponse or a sanitized fixed-rejection/client-ended sample.
 
         deadline is the executor's absolute monotonic cutoff; cancel is a threading.Event.
-        The caller must inject a separately authorized Access pair for staging /rest,
-        not a health-only token. There is no credential discovery or fallback.
+        The caller must inject the dedicated staging measurement Access pair and bearer.
+        Do not use shared QA, health or deploy credentials. There is no credential discovery or fallback.
         """
-        slots, limits = self._matrix["slots"], self._matrix["limits"]
+        slots = self._matrix["slots"]
         require(type(number) is int and 1 <= number <= len(slots), "unreviewed-slot")
-        require(type(deadline) is float and math.isfinite(deadline), "invalid-deadline")
         _validate_access(access_client_id, access_client_secret)
         bearer, api_key = _validate_credentials(bearer, api_key)
         slot = slots[number - 1]
         post = _prepare_post(slot, bearer, api_key)
-        require(post.method == "POST" and post.url == f"{STAGING_ORIGIN}/rest/{slot['endpoint']}",
-                "destination-refused")
+        fixed = slot["expected"]["oracle"] in REJECTION_ORACLES
+        cap = REJECTION_LIMIT if fixed else self._matrix["limits"]["body_bytes"]
+        response = self._send(slot, post, access_client_id, access_client_secret,
+                              deadline, cancel, cap)
+        if response is None:
+            return {"oracle": "client-ended"}  # Local client only; never evidence of server drain.
+        if fixed:
+            return classify_fixed_rejection(slot, response.status, response.body,
+                                            response.content_type, response.cache_control,
+                                            response.retry_after)
+        # Do not return credential reflections in a proxy or application response.
+        fields = (response.content_type, response.cache_control, response.retry_after)
+        exposed = (response.body, *(value.encode("ascii") for value in fields if value is not None))
+        for value in (access_client_id, access_client_secret, bearer, api_key, quote_plus(api_key)):
+            credential = value.encode("ascii")
+            require(not any(credential in part for part in exposed), "credential-reflected")
+        return response
+
+    def probe_off(self, *, deadline, cancel, access_client_id, access_client_secret):
+        """Require the ordinary auth refusal from an off Worker."""
+        _validate_access(access_client_id, access_client_secret)
+        slot = self._matrix["slots"][4]
+        post = _prepare_post(slot, "", "")
+        require(
+            slot.get("auth") == "omit_both"
+            and post.url == STAGING_ORIGIN + "/rest/getArtists",
+            "off-probe-refused",
+        )
+        response = self._send(slot, post, access_client_id, access_client_secret,
+                              deadline, cancel, REJECTION_LIMIT)
+        # With no lease, the ordinary adapter owns the route. Its version
+        # field follows the Subsonic crate version, independently of this runner.
+        require(
+            response is not None and response.status == 200
+            and response.content_type == "application/json"
+            and response.cache_control == "private, no-store"
+            and response.retry_after is None
+            and re.fullmatch(
+                rb'\{"subsonic-response":\{"status":"failed","version":"1\.16\.1",'
+                rb'"type":"nntune","serverVersion":"[0-9A-Za-z.+-]{1,64}","openSubsonic":true,'
+                rb'"error":\{"code":40,"message":"Wrong username or password\."\}\}\}',
+                response.body,
+            ),
+            "response-mismatch",
+        )
+
+    def _send(self, slot, post, access_client_id, access_client_secret, deadline, cancel, cap):
+        limits = self._matrix["limits"]
+        require(type(deadline) is float and math.isfinite(deadline), "invalid-deadline")
         reader = slot.get("reader", "normal")
         timeout_ms = limits["request_timeout_ms"]
         if reader != "normal":
@@ -257,8 +306,8 @@ class StagingPostTransport:
         end = min(deadline, start + timeout_ms / 1000)
         # Withhold even pipe reads for paired legs; curl, TLS and kernel buffering still exist.
         read_after = start + {"normal": 0, "held": 1.5, "disconnect": 1.1}[reader]
-        oracle = slot["expected"]["oracle"]
-        cap = REJECTION_LIMIT if oracle in REJECTION_ORACLES else limits["body_bytes"]
+        require(post.method == "POST" and post.url in STAGING_TARGETS
+                and post.url == f"{STAGING_ORIGIN}/rest/{slot['endpoint']}", "destination-refused")
         argv = (
             "/usr/bin/curl", "--disable", "--globoff", "--proto", "=https", "--noproxy", "*",
             "--no-location", "--retry", "0", "--http1.1", "--silent", "--no-buffer", "--include",
@@ -292,17 +341,6 @@ class StagingPostTransport:
         self._remaining(end, cancel)
         if response is None:
             require(process.returncode == -signal.SIGKILL, "disconnect-unconfirmed")
-            return {"oracle": "client-ended"}  # Local client only; never evidence of server drain.
-        if oracle in REJECTION_ORACLES:
-            return classify_fixed_rejection(slot, response.status, response.body,
-                                            response.content_type, response.cache_control,
-                                            response.retry_after)
-        # Do not return credential reflections in a proxy or application response.
-        fields = (response.content_type, response.cache_control, response.retry_after)
-        exposed = (response.body, *(value.encode("ascii") for value in fields if value is not None))
-        for value in (access_client_id, access_client_secret, bearer, api_key, quote_plus(api_key)):
-            credential = value.encode("ascii")
-            require(not any(credential in part for part in exposed), "credential-reflected")
         return response
 
     def _exchange(self, process, config, cap, end, cancel, read_after, disconnect):
