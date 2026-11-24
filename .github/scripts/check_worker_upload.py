@@ -291,9 +291,16 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
         args = ["bash", "-e", "-c", run_script(preflight)]
         good = run(args, cwd=tree, env={**env, **trial}, label="private staging preflight")
         check(good.returncode == 0, "complete settings did not pass trial preflight")
-        bad = run(args, cwd=tree, env={**env, **trial, "PRIVATE_PLAYBACK_STAGING_S3_REGION": ""},
-                  label="private staging preflight without region")
-        check(bad.returncode != 0, "trial preflight accepted missing Stream region")
+        for key, value in (
+            ("PRIVATE_PLAYBACK_STAGING_S3_REGION", ""),
+            ("STREAM_SERVICE_STAGING", "nntune-stream"),
+            ("STREAM_STAGING_DEPLOY_ENABLED", ""),
+            ("PRIVATE_PLAYBACK_STAGING_ENVIRONMENT", "11111111-1111-5111-8111-111111111111"),
+            ("PRIVATE_PLAYBACK_STAGING_LIBRARY", "invalid"),
+            ("PRIVATE_MUSIC_STAGING_JOURNEY", "false"),
+        ):
+            bad = run(args, cwd=tree, env={**env, **trial, key: value}, label=f"private staging preflight refuses {key}")
+            check(bad.returncode != 0, f"trial preflight accepted invalid {key}")
     config = generate(worker, gen_script, wdir, env, summary_env, label)
     assert_no_build(config, label)
     if worker in ("api", "stream"):
