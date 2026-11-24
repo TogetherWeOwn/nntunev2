@@ -157,6 +157,11 @@ test('versioned digest pages require exact complete response framing', { timeout
       'x-amz-version-id': 'page+/%?=&',
       ...fault.headers,
     });
+    if (fault.closed) {
+      res.once('close', fault.closed);
+      res.write(page.subarray(1));
+      return;
+    }
     res.end(fault.body ?? page);
   });
   t.after(() => {
@@ -176,5 +181,10 @@ test('versioned digest pages require exact complete response framing', { timeout
     { headers: { 'x-amz-version-id': 'wrong-version' } },
     { headers: { 'content-encoding': 'identity' } },
     { headers: { 'content-length': page.length - 1 }, body: page.subarray(1) },
+    { headers: { connection: 'close' }, body: page.subarray(1) },
   ]) await assert.rejects(read(), error => error === 'storage read refused');
+
+  const closed = new Promise(resolve => { fault = { closed: resolve }; });
+  await assert.rejects(read(), error => error === 'storage read refused');
+  await closed;
 });
