@@ -324,12 +324,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const tracks = [...base.tracks];
 		if (!grant) tracks[index] = { ...target, streamUrl };
 		if (!selection.commit(selectTrack({ ...base, tracks }, index), grant) || !source.isCurrent() || destroyed) return;
-		const share = deferredShare;
-		let restoreShare: (() => void) | undefined;
-		if (share && share.target.trackId === target.id) {
-			deferredShare = undefined;
-			restoreShare = captureShareSeek(share.intent, share.target, share.current);
-		}
+		const share = deferredShare?.target.trackId === target.id ? deferredShare : undefined;
+		if (share) deferredShare = undefined;
+		const restoreShare = share && captureShareSeek(share.intent, share.target, share.current);
 
 		const receipt = queue.revoke();
 		let attachment = current;
