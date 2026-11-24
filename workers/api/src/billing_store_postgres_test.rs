@@ -87,15 +87,17 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
         })
         .await
     };
-    observer
-        .batch_execute(
-            "INSERT INTO billing_accounts VALUES ('native_billing_user', 'cus_already_owned');
+    let sql = async |statement: &str| observer.batch_execute(statement).await.unwrap();
+    sql(
+        "INSERT INTO billing_accounts VALUES ('native_billing_user', 'cus_already_owned');
+         INSERT INTO plans VALUES ('checkout-fixture', 800, 100, 1);
          INSERT INTO plan_prices VALUES
            ('price_checkout_fixture', 'plus', 'usd', 800, 'month', false, true),
-           ('price_wrong_scope', 'pro', 'eur', 1, 'year', false, true);",
-        )
-        .await
-        .unwrap();
+           ('price_currency', 'pro', 'eur', 1500, 'month', false, true),
+           ('price_interval', 'max', 'usd', 2500, 'year', false, true),
+           ('price_amount', 'checkout-fixture', 'usd', 799, 'month', false, true);",
+    )
+    .await;
     // The existing subscription owns USER's live slot.
     assert!(reserve(OP, USER, "cus_already_owned").await.is_err());
     // The unique customer bind fails after reserving a flight. It must roll back.
@@ -106,21 +108,29 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
         .unwrap()
         .get(0);
     assert_eq!(count, 0);
-    observer
-        .execute(
-            "UPDATE users SET deleting_at = now() WHERE id = $1",
-            &[&OTHER_USER],
-        )
-        .await
-        .unwrap();
+    sql("UPDATE users SET deleting_at = now() WHERE id = 'native_billing_other';").await;
     assert!(reserve(OP, OTHER_USER, "cus_checkout").await.is_err());
-    observer
-        .execute(
-            "UPDATE users SET deleting_at = NULL WHERE id = $1",
-            &[&OTHER_USER],
-        )
-        .await
-        .unwrap();
+    sql(
+        "UPDATE users SET deleting_at = NULL WHERE id = 'native_billing_other';
+         SELECT pg_advisory_lock(hashtext('native_billing_other'));",
+    )
+    .await;
+    let mut pending = Box::pin(reserve(OP, OTHER_USER, "cus_checkout"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut pending)
+            .await
+            .is_err()
+    );
+    sql(
+        "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id,
+             stripe_subscription_item_id, stripe_price_id, plan_id, status)
+         VALUES ('native_billing_other', 'sub_reservation_race', 'cus_checkout',
+             'si_reservation_race', 'price_checkout_fixture', 'plus', 'active');
+         SELECT pg_advisory_unlock(hashtext('native_billing_other'));",
+    )
+    .await;
+    assert!(pending.await.is_err());
+    sql("DELETE FROM subscriptions WHERE stripe_subscription_id = 'sub_reservation_race'").await;
 
     let (left, right) = tokio::join!(
         reserve(OP, OTHER_USER, "cus_checkout"),
@@ -138,22 +148,15 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
     })
     .await;
     assert_eq!(snapshot.stripe_customer_id.as_deref(), Some("cus_checkout"));
-    assert!(snapshot
+    let selectable: Vec<_> = snapshot
         .bindings
         .iter()
-        .any(|binding| binding.price_id == PRICE && binding.selectable));
-    assert!(snapshot
-        .bindings
-        .iter()
-        .any(|binding| binding.price_id == "price_wrong_scope" && !binding.selectable));
+        .filter(|row| row.selectable)
+        .map(|row| row.price_id.as_str())
+        .collect();
+    assert_eq!(selectable, [PRICE]);
 
-    observer
-        .execute(
-            "UPDATE billing_operations SET created_at = now() - interval '24 hours'",
-            &[],
-        )
-        .await
-        .unwrap();
+    sql("UPDATE billing_operations SET created_at = now() - interval '23 hours 30 minutes'").await;
     assert!(
         !with_fixture_store(async |store| store
             .open_checkout_operation(OTHER_USER)
@@ -163,7 +166,7 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
         .await
         .replayable
     );
-    observer.batch_execute("DELETE FROM billing_operations; DELETE FROM billing_accounts; DELETE FROM plan_prices;").await.unwrap();
+    sql("DELETE FROM billing_operations; DELETE FROM billing_accounts; DELETE FROM plan_prices; DELETE FROM plans WHERE id = 'checkout-fixture';").await;
 }
 
 async fn snapshot(observer: &Client) -> (Value, Value) {
