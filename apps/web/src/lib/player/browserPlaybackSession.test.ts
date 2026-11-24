@@ -1,6 +1,5 @@
 import { expect, onTestFinished, test, vi } from 'vitest';
 import { expireInsideRequestWindow, grantReply, initial, refusedContinuations, setup } from './fixtures/browserPlayback.js';
-
 test('new plays use the acknowledged mode in the same tab and continuations keep the established source', async () => {
 	const { player, media, queue, fetchFn, starts, refresh, src, attach, delayGrant } = setup();
 	media.captureShareSeek(media.beginShareInput(), { trackId: 'first', seconds: 18 }, () => true);
@@ -61,27 +60,23 @@ test.each(['refused', 'superseded', 'account retirement', 'legacy reply', 'extra
 		expect(selected).not.toContain(1);
 		expect(src()).toMatch(/\/first\/[^/]+\/play-2$/);
 	} else if (caseName === 'account retirement') {
-		expect(player.privateListening).toBeUndefined();
-		expect(queue.snapshot.tracks).toHaveLength(0);
-		expect(audio.pause).toHaveBeenCalledOnce();
+		expect([player.privateListening, queue.snapshot.tracks.length, audio.pause.mock.calls.length]).toEqual([undefined, 0, 1]);
 	} else {
 		expect(queue.snapshot).toBe(snapshot);
-		expect(src()).toBe(incumbent);
-		expect([media.audio === audio, audio.pause.mock.calls.length]).toEqual([true, 0]);
+		expect([src(), media.audio === audio, audio.pause.mock.calls.length]).toEqual([incumbent, true, 0]);
 	}
 });
 
-test.each(['wrong tab', 'server error', 'expired'] as const)('%s requires a fresh privacy acknowledgement before another start', async (reason) => {
-	const { player, queue, fetchFn, src, play } = setup(reason === 'expired' ? 7 * 60 * 60 : 60);
+test.each(['wrong tab', 'server error', 'short expiry', 'TTL expiry'] as const)('%s requires a fresh privacy acknowledgement before another start', async (reason) => {
+	const { player, queue, fetchFn, src, play } = setup(reason === 'TTL expiry' ? 7 * 60 * 60 : 60);
 	await play(0);
 	const incumbent = src(), snapshot = queue.snapshot;
 	if (reason === 'wrong tab') fetchFn.mockResolvedValueOnce(Response.json({ session_id: 'another-tab', private_until: Math.floor(Date.now() / 1000) + 60 }));
 	if (reason === 'server error') fetchFn.mockResolvedValueOnce(new Response(null, { status: 503 }));
 	await player.setPrivateListening(true);
-	expect(player.privateListening?.enabled).toBe(reason === 'expired');
-	if (reason === 'expired') expireInsideRequestWindow();
+	expect(player.privateListening?.enabled).toBe(reason.endsWith('expiry'));
+	if (reason.endsWith('expiry')) expireInsideRequestWindow(reason === 'TTL expiry' ? 21_600_000 : 60_000);
 	await play(1);
-	expect(fetchFn).toHaveBeenCalledTimes(2);
 	expect(queue.snapshot).toBe(snapshot);
-	expect(src()).toBe(incumbent);
+	expect([fetchFn.mock.calls.length, src()]).toEqual([2, incumbent]);
 });

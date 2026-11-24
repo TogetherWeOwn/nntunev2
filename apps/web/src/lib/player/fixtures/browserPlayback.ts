@@ -83,10 +83,9 @@ export const refusedContinuations = (tab: string) => [
 	new Response(null, { status: 409 }), Response.json(receipt(tab, 'first', 'other-play'))
 ];
 
-export function expireInsideRequestWindow() {
-	// Wall clock moves backwards and the advertised expiry is an hour beyond the server's TTL.
-	// The monotonic clock is past the request margin but still inside the six-hour window.
+export function expireInsideRequestWindow(durationMs: number) {
+	// Wall clock moves backwards while the monotonic clock enters the final request window.
 	const wall = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - 3_600_000);
-	const monotonic = vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 21_600_000 - 15_000);
+	const monotonic = vi.spyOn(performance, 'now').mockReturnValue(performance.now() + durationMs - 15_000);
 	onTestFinished(() => { wall.mockRestore(); monotonic.mockRestore(); });
 }

@@ -684,7 +684,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		playSelected,
 		restart,
 		jump,
-		beginShareInput() { clearShareSeek(); return ++positionIntent; },
+		beginShareInput() { pendingShare.clear(); return ++positionIntent; },
 		captureShareSeek,
 		clearShareSeek,
 		get pendingShareSeek() { return pendingShare.current; },

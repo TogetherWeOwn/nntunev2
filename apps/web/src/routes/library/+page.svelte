@@ -282,7 +282,7 @@
 		$state.raw({ status: '', fallbackUrl: null, forQueue: null });
 	const queueShare = createQueueShare({
 		getQueue: () => queueController.snapshot,
-		getPosition: () => media.audio?.currentTime,
+		getPosition: () => player.streamFor(queueCurrentTrack(queueController.snapshot)) ? media.audio?.currentTime : 0,
 		getOrigin: () => window.location.origin,
 		getClipboard: clipboardWriter,
 		shortTitle,
