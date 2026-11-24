@@ -27,9 +27,9 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    positive delivered usage from `/v1/me/usage`. Replay one meter window and
    verify the usage total stays flat.
 4. Cross the cap and verify a new play returns `plan_limit_exceeded`. Check
-   continuation before and refusal after its lease deadline. Below cap, observe
-   renewal through `invoice.paid` while hourly reconcile is idle. For a second
-   renewal, withhold both renewal webhook signals and verify only the hourly
+   continuation before and refusal after its lease deadline. Below cap, deliver
+   only `invoice.paid` for the first renewal while hourly reconcile is idle.
+   For a second renewal, withhold both webhook signals and verify only the hourly
    job advances paid coverage and invoice history. Then schedule cancellation,
    deliver and replay `customer.subscription.updated`, and verify the flag and
    stable history before `reason: lapsed` at the cutoff. Run applicable
