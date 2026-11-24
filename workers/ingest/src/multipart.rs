@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 
 pub mod head_receipt;
+#[cfg(target_arch = "wasm32")]
+mod initiation;
 pub mod readback_inventory;
 pub mod resume_checkpoint;
 #[cfg(target_arch = "wasm32")]
@@ -24,6 +26,7 @@ const S3_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MultipartError {
     Geometry,
+    InitiationReceipt,
     PartReceipt,
     CompletionStatus,
     CompletionBody,
@@ -284,58 +287,10 @@ impl<'a> Completion<'a> {
         if status != 200 {
             return Err(MultipartError::CompletionStatus);
         }
-        use quick_xml::events::Event::{Decl, DocType, Empty, Eof, Start};
-        use quick_xml::name::PrefixDeclaration::{Default, Named};
         use MultipartError::{Checksum, CompletionBody, EmbeddedError};
         const SUCCESS: &str = "CompleteMultipartUploadResult";
         const SHA256: &str = "ChecksumSHA256";
-        if body.len() > MAX_COMPLETION_BODY || std::str::from_utf8(body).is_err() {
-            return Err(CompletionBody);
-        }
-        let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
-        // Allow only the element's own S3 namespace declaration, before resolution.
-        let mut tokens = quick_xml::Reader::from_reader(body);
-        loop {
-            let at_start = tokens.buffer_position() == 0;
-            let tag = match tokens.read_event().map_err(|_| CompletionBody)? {
-                Start(tag) | Empty(tag) => tag,
-                Decl(declaration) => {
-                    let encoding = declaration
-                        .encoding()
-                        .transpose()
-                        .map_err(|_| CompletionBody)?;
-                    if !at_start
-                        || !matches!(
-                            declaration.xml_version(),
-                            Ok(quick_xml::XmlVersion::Explicit1_0)
-                        )
-                        || encoding.is_some_and(|value| !value.eq_ignore_ascii_case("UTF-8"))
-                    {
-                        return Err(CompletionBody);
-                    }
-                    continue;
-                }
-                DocType(_) => return Err(CompletionBody),
-                Eof => break,
-                _ => continue,
-            };
-            let prefix = tag.name().prefix();
-            let binding = prefix.map_or(Default, |p| Named(p.into_inner()));
-            if matches!(binding, Named("" | "xml" | "xmlns"))
-                || tag.attributes().any(|attr| match attr {
-                    Ok(a) => {
-                        a.value != S3_XML_NAMESPACE || a.key.as_namespace_binding() != Some(binding)
-                    }
-                    Err(_) => true,
-                })
-            {
-                return Err(CompletionBody);
-            }
-        }
-        let mut reader = ParserConfig::new()
-            .override_encoding(Some(Encoding::Utf8))
-            .allow_multiple_root_elements(false)
-            .create_reader(body);
+        let mut reader = s3_receipt_reader(body)?;
         let mut next = || reader.next().map_err(|_| CompletionBody);
         let (mut depth, mut root_ns, mut matched, mut typed) = (0, None, false, false);
         let (mut saw_bucket, mut saw_key) = (false, false);
@@ -376,4 +331,58 @@ impl<'a> Completion<'a> {
             }
         }
     }
+}
+
+fn s3_receipt_reader(body: &[u8]) -> Result<xml::EventReader<&[u8]>> {
+    use quick_xml::events::Event::{Decl, DocType, Empty, Eof, Start};
+    use quick_xml::name::PrefixDeclaration::{Default, Named};
+    use MultipartError::CompletionBody;
+
+    if body.len() > MAX_COMPLETION_BODY || std::str::from_utf8(body).is_err() {
+        return Err(CompletionBody);
+    }
+    let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
+    // Allow only the element's own S3 namespace declaration, before resolution.
+    let mut tokens = quick_xml::Reader::from_reader(body);
+    loop {
+        let at_start = tokens.buffer_position() == 0;
+        let tag = match tokens.read_event().map_err(|_| CompletionBody)? {
+            Start(tag) | Empty(tag) => tag,
+            Decl(declaration) => {
+                let encoding = declaration
+                    .encoding()
+                    .transpose()
+                    .map_err(|_| CompletionBody)?;
+                if !at_start
+                    || !matches!(
+                        declaration.xml_version(),
+                        Ok(quick_xml::XmlVersion::Explicit1_0)
+                    )
+                    || encoding.is_some_and(|value| !value.eq_ignore_ascii_case("UTF-8"))
+                {
+                    return Err(CompletionBody);
+                }
+                continue;
+            }
+            DocType(_) => return Err(CompletionBody),
+            Eof => break,
+            _ => continue,
+        };
+        let prefix = tag.name().prefix();
+        let binding = prefix.map_or(Default, |p| Named(p.into_inner()));
+        if matches!(binding, Named("" | "xml" | "xmlns"))
+            || tag.attributes().any(|attr| match attr {
+                Ok(a) => {
+                    a.value != S3_XML_NAMESPACE || a.key.as_namespace_binding() != Some(binding)
+                }
+                Err(_) => true,
+            })
+        {
+            return Err(CompletionBody);
+        }
+    }
+    Ok(ParserConfig::new()
+        .override_encoding(Some(Encoding::Utf8))
+        .allow_multiple_root_elements(false)
+        .create_reader(body))
 }

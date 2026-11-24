@@ -14,6 +14,16 @@ const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const checksum = (bytes) => createHash('sha256').update(bytes).digest('base64');
 const mac = (key, text) => createHmac('sha256', key).update(text).digest();
 const uploadQuery = 'uploadId=fixture%2B%2F%3D%3F';
+const initiatedId = 'new+/=?';
+const initiatedQuery = 'uploadId=new%2B%2F%3D%3F';
+const initiationHeaders = { 'x-amz-checksum-algorithm': 'SHA256', 'x-amz-checksum-type': 'COMPOSITE' };
+
+function initiationReceipt(observedBucket = bucket, observedKey = mediaKey, uploadId = initiatedId) {
+  return '<?xml version="1.0" encoding="UTF-8"?>'
+    + '<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    + `<Bucket>${observedBucket}</Bucket><Key>${observedKey}</Key><UploadId>${uploadId}</UploadId>`
+    + '</InitiateMultipartUploadResult>';
+}
 
 function completionReceipt(manifest, etag = 'fixture-etag') {
   const prefix = '<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
@@ -28,7 +38,7 @@ function completionReceipt(manifest, etag = 'fixture-etag') {
     + `<ChecksumSHA256>${composite}-1</ChecksumSHA256></CompleteMultipartUploadResult>`;
 }
 
-async function verifySignedRequest(request, method, query) {
+async function verifySignedRequest(request, method, query, operationHeaders) {
   const path = `/${bucket}/${mediaKey}`;
   assert.equal(request.url, `https://fixture.test:8443${path}?${query}`);
   assert.equal(request.method, method);
@@ -43,7 +53,8 @@ async function verifySignedRequest(request, method, query) {
     host: 'fixture.test:8443',
     'x-amz-content-sha256': payload,
     'x-amz-date': date,
-    ...(method === 'PUT' ? { 'x-amz-checksum-sha256': checksum(body) } : { 'content-type': 'application/xml' }),
+    ...(operationHeaders ?? (method === 'PUT'
+      ? { 'x-amz-checksum-sha256': checksum(body) } : { 'content-type': 'application/xml' })),
   };
   const names = Object.keys(fields).sort();
   for (const name of names.filter((value) => value !== 'host')) {
@@ -79,23 +90,53 @@ test('signs the ciphertext part and accepts only its matching checksum and ETag'
   assert.equal(fetch.mock.callCount(), 1);
 });
 
-test('carries the signed part receipt through the checkpoint into completion', async (t) => {
-  const methods = [];
+test('uses the initialized upload ID and signed part receipt in completion', async (t) => {
+  const requests = [];
   let uploadedChecksum;
   t.mock.method(globalThis, 'fetch', async (request) => {
-    methods.push(request.method);
+    const query = new URL(request.url).search.slice(1);
+    requests.push(`${request.method} ${query}`);
+    if (query === 'uploads=') {
+      const body = await verifySignedRequest(request, 'POST', 'uploads=', initiationHeaders);
+      assert.equal(body.length, 0);
+      return new Response(initiationReceipt());
+    }
     if (request.method === 'PUT') {
-      const body = await verifySignedRequest(request, 'PUT', `partNumber=1&${uploadQuery}`);
+      const body = await verifySignedRequest(request, 'PUT', `partNumber=1&${initiatedQuery}`);
       uploadedChecksum = checksum(body);
       return new Response(null, { headers: { etag: '"fixture-part"', 'x-amz-checksum-sha256': uploadedChecksum } });
     }
-    const manifest = (await verifySignedRequest(request, 'POST', uploadQuery)).toString();
+    const manifest = (await verifySignedRequest(request, 'POST', initiatedQuery)).toString();
     assert.ok(manifest.includes(`<ChecksumSHA256>${uploadedChecksum}</ChecksumSHA256>`));
     return new Response(completionReceipt(manifest, 'fixture-part'), { headers: { 'x-amz-version-id': version } });
   });
-  assert.equal(await complete('upload-completion'), version);
-  assert.deepEqual(methods, ['PUT', 'POST']);
+  assert.equal(await complete('init-upload-completion'), version);
+  assert.deepEqual(requests, ['POST uploads=', `PUT partNumber=1&${initiatedQuery}`, `POST ${initiatedQuery}`]);
 });
+
+test('refuses initiation with an unrelated provider or key before fetch', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('unexpected fetch'); });
+  await assert.rejects(complete('init-foreign'), rejectedWith(transportFailure));
+  await assert.rejects(complete('init-other'), rejectedWith('InvalidRequest'));
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+for (const [name, body, status = 200] of [
+  ['HTTP 500', initiationReceipt(), 500],
+  ['wrong bucket', initiationReceipt('other-bucket')],
+  ['wrong key', initiationReceipt(bucket, 'media/other')],
+  ['empty upload ID', initiationReceipt(bucket, mediaKey, '')],
+  ['control character', initiationReceipt(bucket, mediaKey, 'upload&#10;id')],
+  ['duplicate upload ID', initiationReceipt(bucket, mediaKey, 'one</UploadId><UploadId>two')],
+  ['DOCTYPE', initiationReceipt().replace('?>', '?><!DOCTYPE InitiateMultipartUploadResult>')],
+  ['embedded error', '<Error/>'],
+]) {
+  test(`refuses ${name} in an initiation reply without restarting the upload`, async (t) => {
+    const fetch = t.mock.method(globalThis, 'fetch', async () => new Response(body, { status }));
+    await assert.rejects(complete('init'), rejectedWith('Unconfirmed(Some(InitiationReceipt))'));
+    assert.equal(fetch.mock.callCount(), 1);
+  });
+}
 
 test('refuses an unrelated checkpoint or provider before uploading the part', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('unexpected fetch'); });
