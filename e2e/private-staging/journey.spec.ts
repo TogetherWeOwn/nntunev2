@@ -41,6 +41,15 @@ async function startSampling(audio: Locator) {
   });
 }
 
+async function currentMedia(audio: Locator, trackId: string | null) {
+  const source = new URL(await audio.evaluate((element) => (element as HTMLAudioElement).currentSrc));
+  const media = MEDIA.exec(source.pathname);
+  if (!media || media[1] !== trackId || source.origin !== ORIGIN || source.search || source.hash) {
+    throw new Error('Expected the authenticated media relay for the selected track');
+  }
+  return { source, media };
+}
+
 async function samplePlaying(audio: Locator, baseline: number) {
   const sample = () => audio.evaluate((element) => {
     const player = element as HTMLAudioElement;
@@ -146,22 +155,9 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const baselineTime = await audio.evaluate((element) => (element as HTMLAudioElement).currentTime);
     await transport.getByRole('button', { name: 'Play', exact: true }).click();
     const playback = (await samplePlaying(audio, baselineTime)).playback;
+    await currentMedia(audio, firstTrackId);
     await transport.getByRole('button', { name: 'Pause', exact: true }).click();
     await waitForPaused(audio, true, 5_000, 'Player did not pause');
-    const source = new URL(await audio.evaluate((element) => (element as HTMLAudioElement).currentSrc));
-    const media = MEDIA.exec(source.pathname);
-    if (!media || media[1] !== firstTrackId || source.origin !== ORIGIN || source.search || source.hash) {
-      throw new Error('Expected the authenticated media relay for the selected track');
-    }
-    const digest = fixture.publications.find((item) => item.trackId === firstTrackId)?.sha256;
-    const original = inputs.find((item) => item.sha256 === digest)!.body;
-    const range = await apiGet(page.request, source.href, rangeHeaders, 'private-range');
-    expect(range.status()).toBe(206);
-    const headers = range.headers();
-    expect(headers['content-type']).toBe('audio/flac');
-    expect(headers['content-range']).toBe(`bytes 65536-69631/${original.length}`);
-    expect(headers['content-length']).toBe('4096');
-    expect((await range.body()).equals(original.subarray(65536, 69632))).toBe(true);
 
     await audio.evaluate((element) => {
       delete (element as HTMLElement).dataset.seeked;
@@ -174,14 +170,8 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     await transport.getByRole('button', { name: 'Play', exact: true }).click();
     const resume = await samplePlaying(audio, paused.currentTime);
     expect(resume.minimumTime).toBeGreaterThanOrEqual(resumeFloorAfterSeek(paused.currentTime, paused.duration));
-
-    const play = { track_id: media[1], session_id: media[2], play_id: media[3] };
-    const renewed = await post(page.request, PRIVATE_MUSIC.player.plays, play);
-    const lease = JSON.parse(renewed.text);
-    expect(renewed.status === 200 && lease.play_id === play.play_id && Number.isSafeInteger(lease.lease_epoch)).toBe(true);
-    const heartbeat = { session_id: play.session_id, play_id: play.play_id, lease_epoch: lease.lease_epoch };
-    const active = await post(page.request, PRIVATE_MUSIC.player.heartbeat, heartbeat);
-    expect(active.status === 200 && JSON.parse(active.text).lease === 'active').toBe(true);
+    await transport.getByRole('button', { name: 'Pause', exact: true }).click();
+    await waitForPaused(audio, true, 5_000, 'Player did not pause before Next');
 
     const queueOrder = await idsOf(page.getByTestId(PRIVATE_MUSIC.player.queueItem), PRIVATE_MUSIC.player.queueId);
     await page.getByTestId(PRIVATE_MUSIC.player.next).click();
@@ -190,10 +180,32 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       firstTrackId, baselineTime, playback, seek: { ...paused, fraction, sawSeekedEvent: true },
       resume, queueOrder, nextTrackId: await current.getAttribute(PRIVATE_MUSIC.player.queueId),
     });
+    // Issue the second track's lease near cutoff, within this 14-second clip.
+    await delay(Math.max(0, fixture.expiresAt * 1000 - Date.now() - 10_000));
+    await transport.getByRole('button', { name: 'Play', exact: true }).click();
+    await samplePlaying(audio, 0);
+    const { source, media } = await currentMedia(audio, order[1]!);
     await page.locator('a[href="/now-playing"]').filter({ visible: true }).first().click();
     await expect(page).toHaveURL(`${ORIGIN}/now-playing`);
     await expect(page.getByRole('tab', { name: 'Music Video' })).toHaveCount(0);
     await expect(page.locator('iframe, video')).toHaveCount(0);
+    const digest = fixture.publications.find((item) => item.trackId === media[1])?.sha256;
+    const original = inputs.find((item) => item.sha256 === digest)!.body;
+    const range = await apiGet(page.request, source.href, rangeHeaders, 'private-range');
+    expect(range.status()).toBe(206);
+    const headers = range.headers();
+    expect(headers['content-type']).toBe('audio/flac');
+    expect(headers['content-range']).toBe(`bytes 65536-69631/${original.length}`);
+    expect(headers['content-length']).toBe('4096');
+    expect((await range.body()).equals(original.subarray(65536, 69632))).toBe(true);
+    const play = { track_id: media[1], session_id: media[2], play_id: media[3] };
+    const renewed = await post(page.request, PRIVATE_MUSIC.player.plays, play);
+    const lease = JSON.parse(renewed.text);
+    expect(renewed.status === 200 && lease.play_id === play.play_id && Number.isSafeInteger(lease.lease_epoch)).toBe(true);
+    expect(lease.expires_at).toBe(fixture.expiresAt);
+    const heartbeat = { session_id: play.session_id, play_id: play.play_id, lease_epoch: lease.lease_epoch };
+    const active = await post(page.request, PRIVATE_MUSIC.player.heartbeat, heartbeat);
+    expect(active.status === 200 && JSON.parse(active.text).lease === 'active').toBe(true);
     return { play, heartbeat, mediaUrl: source.href };
   });
 
