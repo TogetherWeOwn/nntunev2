@@ -19356,37 +19356,27 @@ mod tests {
         refused_grant(&receipt);
     }
 
-    mod private_media_fixture {
-        include!("../tests/fixtures/private_media_relay.rs");
-    }
+    include!("../tests/fixtures/private_media_relay.rs");
 
     #[test]
     fn private_media_entry_requires_a_lease_capped_grant_and_defaults_off() {
         use crate::worker_entry::{relay_media, CollectedBody};
-        use private_media_fixture::{
-            context, expected_headers, receipt, relay_headers, shorten_lease,
+        let (h, req, headers) = media_relay_fixture();
+        let ctx = media_relay_context(&h);
+        let inspect = async |get: browser_playback_relay::StreamGet<'_>| {
+            assert_eq!(get.path, "/play/track");
+            assert!(get.headers().eq(expected_media_relay_headers()));
+            200
         };
-        let (h, req) = receipt();
-        let headers = relay_headers();
         let media = |body| {
-            block_on(relay_media(
-                &context(&h),
-                &req,
-                &body,
-                &headers,
-                async |get| {
-                    assert_eq!(get.path, "/play/track");
-                    assert!(get.headers().eq(expected_headers()));
-                    200
-                },
-            ))
-            .unwrap()
-            .unwrap_or_else(|error| error.status)
+            block_on(relay_media(&ctx, &req, &body, &headers, inspect))
+                .unwrap()
+                .unwrap_or_else(|error| error.status)
         };
         let get = || media(CollectedBody::Complete(Vec::new()));
         assert_eq!(get(), 200);
         assert_eq!(media(CollectedBody::Complete(vec![1])), 400);
-        shorten_lease(&h);
+        shorten_media_relay_lease(&h);
         assert_eq!(get(), 404);
         h.store.browser_receipt.take();
         assert_eq!(get(), 404);

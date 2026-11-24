@@ -1,11 +1,10 @@
-use super::*;
 use crate::{meter_sink::TrackMeterMeta, play_grant::IssuedGrant, playback::LeaseRow};
 
-pub(super) const PLAY: &str = "private_1234567890abcdefghijkl";
-const RANGE: &str = "bytes=2-7";
-const TOKEN: &str = include_str!("../../../../fixtures/play-grant/private-enrolled.token");
+const MEDIA_PLAY: &str = "private_1234567890abcdefghijkl";
+const MEDIA_RANGE: &str = "bytes=2-7";
+const MEDIA_TOKEN: &str = include_str!("../../../../fixtures/play-grant/private-enrolled.token");
 
-pub(super) fn receipt() -> (Harness, Request) {
+fn media_relay_fixture() -> (Harness, Request, HashMap<String, String>) {
     let mut h = harness();
     const USER: &str = "member";
     const TRACK: &str = "track";
@@ -14,10 +13,10 @@ pub(super) fn receipt() -> (Harness, Request) {
         r#"{"owner_user_id":"member","invite_ids":[],"expires_at":220}"#,
     );
     seed_user(&h, USER, "test@example.com");
-    let ctx = context(&h);
+    let ctx = media_relay_context(&h);
     let req = Request {
         method: "GET".into(),
-        path: format!("/v1/plays/media/{TRACK}/tab-1/{PLAY}"),
+        path: format!("/v1/plays/media/{TRACK}/tab-1/{MEDIA_PLAY}"),
         cookie: block_on(ctx.start_session(USER)).unwrap().set_cookie,
         origin: None,
         authorization: None,
@@ -28,7 +27,7 @@ pub(super) fn receipt() -> (Harness, Request) {
     let lease = LeaseRow {
         session_id: "tab-1".into(),
         track_id: TRACK.into(),
-        play_id: PLAY.into(),
+        play_id: MEDIA_PLAY.into(),
         epoch: 42,
         expires_at: 12,
         continuation_deadline: 222,
@@ -54,18 +53,18 @@ pub(super) fn receipt() -> (Harness, Request) {
                 .into(),
             duration_ms: 60_000.try_into().unwrap(),
             grant: IssuedGrant {
-                token: TOKEN.into(),
+                token: MEDIA_TOKEN.into(),
                 exp_unix: 12,
             },
         }));
-    (h, req)
+    (h, req, relay_headers())
 }
 
-pub(super) fn context(h: &Harness) -> Ctx<'_, FakeStore, FakeMailer, FakeDialer, FakeDns> {
+fn media_relay_context(h: &Harness) -> Ctx<'_, FakeStore, FakeMailer, FakeDialer, FakeDns> {
     Ctx { now: 10, ..h.ctx() }
 }
 
-pub(super) fn shorten_lease(h: &Harness) {
+fn shorten_media_relay_lease(h: &Harness) {
     h.store
         .playback_leases
         .borrow_mut()
@@ -74,17 +73,17 @@ pub(super) fn shorten_lease(h: &Harness) {
         .expires_at = 11;
 }
 
-pub(super) fn relay_headers() -> HashMap<String, String> {
+fn relay_headers() -> HashMap<String, String> {
     HashMap::from([
         ("sec-fetch-site".into(), "same-origin".into()),
-        ("range".into(), RANGE.into()),
+        ("range".into(), MEDIA_RANGE.into()),
     ])
 }
 
-pub(super) fn expected_headers() -> [(&'static str, &'static str); 2] {
+fn expected_media_relay_headers() -> [(&'static str, &'static str); 2] {
     const AUTHORIZATION: &str = concat!(
         "Bearer ",
         include_str!("../../../../fixtures/play-grant/private-enrolled.token")
     );
-    [("authorization", AUTHORIZATION), ("range", RANGE)]
+    [("authorization", AUTHORIZATION), ("range", MEDIA_RANGE)]
 }
