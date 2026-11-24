@@ -50,6 +50,7 @@ pub(crate) async fn verify_publication(
         &CompletionScope<'_>,
     ) -> Result<Option<CurrentAuthorization>, StoreError>,
 ) {
+    private_trial::sealed_fixture::verify_sealed_fixture(input);
     observer.batch_execute(concat!(
         include_str!("storage_s3_locator_schema.sql"),
         include_str!("../../../ingest/tests/fixtures/catalogue_source_schema.sql"),
