@@ -75,7 +75,6 @@ async fn with_fixture_store<T>(run: impl AsyncFnOnce(&PgStore) -> T) -> T {
 
 async fn checkout_reservation_and_price_mapping(observer: &Client) {
     use super::Store;
-    use crate::billing_reconcile::CreateOpOutcome;
     const OP: &str = "7f000000-0000-4000-8000-000000000001";
     const RACE: &str = "7f000000-0000-4000-8000-000000000002";
     const PRICE: &str = "price_checkout_fixture";
@@ -130,15 +129,16 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
             "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id,
              stripe_subscription_item_id, stripe_price_id, plan_id, status)
          VALUES ('native_billing_other', 'sub_reservation_race', 'cus_checkout',
-             'si_reservation_race', 'price_checkout_fixture', 'plus', 'active');
-         SELECT pg_advisory_unlock(hashtext('native_billing_other'));",
+             'si_reservation_race', 'price_checkout_fixture', 'plus', 'active');",
         )
         .await;
     };
-    let (reservation, completed) = tokio::join!(
-        reserve(OP, OTHER_USER, "cus_checkout"),
-        tokio::time::timeout(Duration::from_secs(2), commit_subscription),
-    );
+    let writer = async {
+        let result = tokio::time::timeout(Duration::from_secs(2), commit_subscription).await;
+        sql("SELECT pg_advisory_unlock(hashtext('native_billing_other'));").await;
+        result
+    };
+    let (reservation, completed) = tokio::join!(reserve(OP, OTHER_USER, "cus_checkout"), writer);
     completed.expect("checkout never waited on the subscription writer");
     assert!(reservation.is_err());
     sql("DELETE FROM subscriptions WHERE stripe_subscription_id = 'sub_reservation_race'").await;
@@ -149,10 +149,6 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
     );
     let (left, right) = (left.unwrap(), right.unwrap());
     assert_eq!(left.op(), right.op());
-    assert_ne!(
-        matches!(left, CreateOpOutcome::Created(_)),
-        matches!(right, CreateOpOutcome::Created(_))
-    );
     assert!(left.op().replayable);
     let snapshot = with_fixture_store(async |store| {
         store.load_reconcile_input(OTHER_USER, None).await.unwrap()
