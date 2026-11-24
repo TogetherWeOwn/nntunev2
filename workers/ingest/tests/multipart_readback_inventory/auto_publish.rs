@@ -9,7 +9,6 @@ use nntune_ingest::{
         },
         MbSearchHit,
     },
-    multipart::readback_inventory::VerifiedCompletedReadback,
 };
 use serde_json::json;
 use tokio_postgres::Transaction;
@@ -28,24 +27,21 @@ const ROWS: &str = "SELECT t.id::text, t.medium_no, t.track_no, t.mbid::text, t.
 pub(super) async fn exercise(
     db: &Client,
     writer: &mut Client,
-    fixture: &ReadbackFixture,
-    verified: &VerifiedCompletedReadback<'_, '_>,
-    receipt: PublishedObject<'_>,
-    other: PublishedObject<'_>,
+    fixtures: [&ReadbackFixture; 2],
+    both: [CommittedFlac<'_>; 2],
 ) {
-    let object = ObjectRef {
+    let objects = fixtures.map(|fixture| ObjectRef {
         media: fixture.media.metadata().clone(),
         plaintext_sha256: *fixture.origin.plaintext_sha256(),
-    };
-    let files = ["1", "2"].map(|disc| ExpectedFile {
+    });
+    let files = [("1", &objects[0]), ("2", &objects[1])].map(|(disc, object)| ExpectedFile {
         numbering: FileNumbering {
             disc: Some(disc),
             track: Some("01"),
         },
-        object: &object,
+        object,
     });
-    // Two occurrences can legitimately have identical bytes via scoped dedupe.
-    let [environment, library, ..] = receipt.intent.identities;
+    let [environment, library, ..] = both[0].receipt.intent.identities;
     let job = AuthorizedRelease {
         job_id: "catalogue-old",
         owner_id: "catalogue-owner",
@@ -53,7 +49,6 @@ pub(super) async fn exercise(
         library,
         files: &files,
     };
-    let committed = || CommittedFlac { verified, receipt };
     let lookup = release_lookup(ALBUM).unwrap();
     let hit = |mbid: &str| MbSearchHit {
         mbid: mbid.into(),
@@ -88,7 +83,6 @@ pub(super) async fn exercise(
             stage(tx, &job, media, ALBUM, candidates(hits), (200, &body)).await
         };
 
-    let both = [committed(), committed()];
     let mut tx = writer.transaction().await.unwrap();
     for (rival, second_disc, reason, code) in [
         (
@@ -106,6 +100,13 @@ pub(super) async fn exercise(
         assert_eq!(serde_json::to_value(reason).unwrap(), code);
         assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
     }
+    let [first, second] = &both;
+    let swapped = [CommittedFlac { ..*second }, CommittedFlac { ..*first }];
+    assert_eq!(
+        apply(&mut tx, &swapped, false, 2).await,
+        Err(PublicationError::Refused)
+    );
+    let receipt = second.receipt;
     let missing_pin = PublishedObject {
         page_versions: &[],
         ..receipt
@@ -122,12 +123,12 @@ pub(super) async fn exercise(
         plaintext_sha256: &[0; 32],
         ..receipt
     };
-    for invalid in [other, missing_pin, wrong_pin, wrong_root, wrong_digest] {
+    for invalid in [missing_pin, wrong_pin, wrong_root, wrong_digest] {
         let media = [
-            committed(),
+            CommittedFlac { ..*first },
             CommittedFlac {
-                verified,
                 receipt: invalid,
+                ..*second
             },
         ];
         assert_eq!(
@@ -185,7 +186,7 @@ pub(super) async fn exercise(
         assert_eq!(row.get::<_, &str>(4), "Synthetic FLAC");
         assert_eq!(
             row.get::<_, String>(5).replace('-', ""),
-            hex::encode(receipt.intent.identities[2])
+            hex::encode(both[i].receipt.intent.identities[2])
         );
         assert_eq!(row.get::<_, &str>(6), job.job_id);
     }

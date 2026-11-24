@@ -2,11 +2,13 @@ use super::{
     id, ReadbackFixture, BUCKET, CONFIGURATION, FINAL_VERSION, FLAC, SCOPE, SHARED_VERSION,
 };
 use nntune_ingest::{
+    admin_auto_publish::CommittedFlac,
+    catalogue_publication::PublishedObject,
     digest_candidate_store::{
         stage_completed_candidate, CandidateIntent,
         InventoryAppendError::{Identity, MissingOrFenced},
     },
-    multipart::readback_inventory::ReadbackScope,
+    multipart::readback_inventory::{ReadbackScope, VerifiedCompletedReadback},
 };
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
@@ -34,40 +36,25 @@ async fn connect() -> Client {
     client
 }
 
+#[path = "auto_publish.rs"]
+mod auto_publish;
 #[path = "catalogue.rs"]
 mod catalogue;
 
-#[tokio::test]
-#[ignore = "requires a migrated disposable PostgreSQL database"]
-async fn postgres_stages_completed_candidate_atomically() {
-    let observer = connect().await;
-    let mut writer = connect().await;
-    let mut contender = connect().await;
-    let identities = [0x70, 0x71, 0x72, 0x73, 0x74, 5].map(id);
-    let [root, environment, library, object, generation, provider] = identities.map(hex::encode);
-    let map_id = id(0x75);
+async fn prepare_candidate(observer: &Client, fixture: &ReadbackFixture) -> CandidateIntent {
+    let [_, environment, library, object, generation, provider] =
+        fixture.context.identities.map(hex::encode);
+    let map_id = fixture.map_id;
     let map = hex::encode(map_id);
-    let key = format!("media/{object}/{generation}");
-    let page_key = format!("media-digests/{object}/{generation}/{map}/00000000");
-    let fixture = ReadbackFixture::in_scope(FLAC, identities, map_id, &key);
-    let receipts = [fixture.sidecar_at(0, &page_key, FINAL_VERSION)];
-    let inventory = fixture.inventory(&receipts);
-    let verified = inventory
-        .verify(SCOPE, fixture.envelope(), async |bucket, pin| {
-            assert_eq!(bucket, BUCKET);
-            Ok(fixture.response_with_keys(pin, &key, &page_key))
-        })
-        .await
-        .unwrap();
     let intent = CandidateIntent {
-        identities: identities[1..].try_into().unwrap(),
+        identities: fixture.context.identities[1..].try_into().unwrap(),
         plaintext_len: fixture.context.plaintext_len,
         map_id,
         header: fixture.context.header,
         reservation_generation: 1,
     };
     let length = intent.plaintext_len;
-    let sealed = inventory.geometry().sealed_len();
+    let sealed = fixture.media.metadata().ciphertext_len();
     let header = hex::encode(intent.header);
     let digest = hex::encode(fixture.origin.plaintext_sha256());
     let hashes: Vec<_> = fixture
@@ -78,8 +65,8 @@ async fn postgres_stages_completed_candidate_atomically() {
         .map(|hash| hash.to_vec())
         .collect();
     observer.batch_execute(&format!(
-        "INSERT INTO public.storage_environments VALUES ('{environment}');
-         INSERT INTO public.storage_library_namespaces VALUES ('{library}', '{environment}', NULL);
+        "INSERT INTO public.storage_environments VALUES ('{environment}') ON CONFLICT DO NOTHING;
+         INSERT INTO public.storage_library_namespaces VALUES ('{library}', '{environment}', NULL) ON CONFLICT DO NOTHING;
          INSERT INTO public.storage_object_intents VALUES ('{object}', '{generation}', '{environment}',
              '{library}', '{provider}', {length}, {sealed}, decode('{header}', 'hex'));
          INSERT INTO public.storage_plaintext_digest_claim_intents VALUES ('{object}', '{environment}',
@@ -94,6 +81,34 @@ async fn postgres_stages_completed_candidate_atomically() {
         )
         .await
         .unwrap();
+    intent
+}
+
+#[tokio::test]
+#[ignore = "requires a migrated disposable PostgreSQL database"]
+async fn postgres_stages_completed_candidate_atomically() {
+    let observer = connect().await;
+    let mut writer = connect().await;
+    let mut contender = connect().await;
+    let identities = [0x70, 0x71, 0x72, 0x73, 0x74, 5].map(id);
+    let [root, environment, library, object, generation, _] = identities.map(hex::encode);
+    let map_id = id(0x75);
+    let map = hex::encode(map_id);
+    let key = format!("media/{object}/{generation}");
+    let page_key = format!("media-digests/{object}/{generation}/{map}/00000000");
+    let fixture = ReadbackFixture::in_scope(FLAC, identities, map_id, &key);
+    let receipts = [fixture.sidecar_at(0, &page_key, FINAL_VERSION)];
+    let inventory = fixture.inventory(&receipts);
+    let verified = inventory
+        .verify(SCOPE, fixture.envelope(), async |bucket, pin| {
+            assert_eq!(bucket, BUCKET);
+            Ok(fixture.response_with_keys(pin, &key, &page_key))
+        })
+        .await
+        .unwrap();
+    let intent = prepare_candidate(&observer, &fixture).await;
+    let length = intent.plaintext_len;
+    let digest = hex::encode(fixture.origin.plaintext_sha256());
 
     let stage = async |tx: &mut tokio_postgres::Transaction<'_>| {
         stage_completed_candidate(tx, &intent, SCOPE, &verified, RETAIN_UNTIL).await
@@ -276,13 +291,76 @@ async fn postgres_stages_completed_candidate_atomically() {
         &[&environment, &library, &digest, &(length as i64), &object, &generation, &root],
     ).await.unwrap().get(0);
     assert!(!admitted);
-    catalogue::exercise(
+    catalogue::exercise(&observer, &mut writer, &mut contender, &fixture, &intent).await;
+
+    // Add one FLAC padding byte to generate a different valid plaintext digest.
+    let mut padded = FLAC[..42].to_vec();
+    padded[4] = 0;
+    padded.extend_from_slice(&[0x81, 0, 0, 1, 0]);
+    padded.extend_from_slice(&FLAC[42..]);
+    let identities = [0x70, 0x71, 0x72, 0x82, 0x83, 5].map(id);
+    let [root, _, _, object, generation, _] = identities.map(hex::encode);
+    let map_id = id(0x84);
+    let key = format!("media/{object}/{generation}");
+    let page_key = format!(
+        "media-digests/{object}/{generation}/{}/00000000",
+        hex::encode(map_id)
+    );
+    let second = ReadbackFixture::in_scope(&padded, identities, map_id, &key);
+    let second_intent = prepare_candidate(&observer, &second).await;
+    let receipts = [second.sidecar_at(0, &page_key, FINAL_VERSION)];
+    let inventory = second.inventory(&receipts);
+    let second_verified = inventory
+        .verify(SCOPE, second.envelope(), async |_, pin| {
+            Ok(second.response_with_keys(pin, &key, &page_key))
+        })
+        .await
+        .unwrap();
+    let mut tx = writer.transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO public.storage_object_envelope_intents VALUES ($1::text::uuid, $2::text::uuid, $3)",
+        &[&object, &root, &second.record.as_slice()],
+    ).await.unwrap();
+    stage_completed_candidate(
+        &mut tx,
+        &second_intent,
+        SCOPE,
+        &second_verified,
+        RETAIN_UNTIL,
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO public.storage_s3_locator_intents VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, NULL)",
+        &[&object, &root, &BUCKET, &key, &SHARED_VERSION],
+    ).await.unwrap();
+    tx.commit().await.unwrap();
+    let files = [&fixture, &second];
+    auto_publish::exercise(
         &observer,
         &mut writer,
-        &mut contender,
-        &fixture,
-        &intent,
-        &verified,
+        files,
+        [
+            committed(&fixture, &intent, &verified),
+            committed(&second, &second_intent, &second_verified),
+        ],
     )
     .await;
+}
+
+fn committed<'a>(
+    fixture: &'a ReadbackFixture,
+    intent: &'a CandidateIntent,
+    verified: &'a VerifiedCompletedReadback<'a, 'a>,
+) -> CommittedFlac<'a> {
+    CommittedFlac {
+        verified,
+        receipt: PublishedObject {
+            intent,
+            locator: fixture.media.metadata().locator(),
+            plaintext_sha256: fixture.origin.plaintext_sha256(),
+            root_version_id: fixture.context.identities[0],
+            page_versions: &[FINAL_VERSION],
+        },
+    }
 }
