@@ -30,6 +30,18 @@ async fn dispatch_with(
     outcome: &ReconcileOutcome,
     writer: Writer,
 ) -> Result<(), StoreError> {
+    with_fixture_store(async |store| match writer {
+        Writer::Owned => {
+            store
+                .store_reconcile_owned(user.to_owned(), outcome.clone())
+                .await
+        }
+        Writer::Release => super::Store::store_reconcile_outcome(store, user, outcome).await,
+    })
+    .await
+}
+
+async fn with_fixture_store<T>(run: impl AsyncFnOnce(&PgStore) -> T) -> T {
     let driver = Rc::new(RefCell::new(None));
     let driver_slot = Rc::clone(&driver);
     let store = PgStore {
@@ -50,14 +62,7 @@ async fn dispatch_with(
         })),
         test_mirror: None,
     };
-    let result = match writer {
-        Writer::Owned => {
-            store
-                .store_reconcile_owned(user.to_owned(), outcome.clone())
-                .await
-        }
-        Writer::Release => super::Store::store_reconcile_outcome(&store, user, outcome).await,
-    };
+    let result = run(&store).await;
     // Join before discarding the store: the call must have released its client.
     let driver = driver.take().expect("store must acquire one connection");
     tokio::time::timeout(Duration::from_secs(5), driver)
@@ -66,6 +71,99 @@ async fn dispatch_with(
         .unwrap()
         .unwrap();
     result
+}
+
+async fn checkout_reservation_and_price_mapping(observer: &Client) {
+    use super::Store;
+    use crate::billing_reconcile::CreateOpOutcome;
+    const OP: &str = "7f000000-0000-4000-8000-000000000001";
+    const RACE: &str = "7f000000-0000-4000-8000-000000000002";
+    const PRICE: &str = "price_checkout_fixture";
+    let reserve = async |operation, user, customer| {
+        with_fixture_store(async |store| {
+            store
+                .create_checkout_operation(operation, user, PRICE, Some(customer))
+                .await
+        })
+        .await
+    };
+    observer
+        .batch_execute(
+            "INSERT INTO billing_accounts VALUES ('native_billing_user', 'cus_already_owned');
+         INSERT INTO plan_prices VALUES
+           ('price_checkout_fixture', 'plus', 'usd', 800, 'month', false, true),
+           ('price_wrong_scope', 'pro', 'eur', 1, 'year', false, true);",
+        )
+        .await
+        .unwrap();
+    // The existing subscription owns USER's live slot.
+    assert!(reserve(OP, USER, "cus_already_owned").await.is_err());
+    // The unique customer bind fails after reserving a flight. It must roll back.
+    assert!(reserve(OP, OTHER_USER, "cus_already_owned").await.is_err());
+    let count: i64 = observer
+        .query_one("SELECT count(*) FROM billing_operations", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    observer
+        .execute(
+            "UPDATE users SET deleting_at = now() WHERE id = $1",
+            &[&OTHER_USER],
+        )
+        .await
+        .unwrap();
+    assert!(reserve(OP, OTHER_USER, "cus_checkout").await.is_err());
+    observer
+        .execute(
+            "UPDATE users SET deleting_at = NULL WHERE id = $1",
+            &[&OTHER_USER],
+        )
+        .await
+        .unwrap();
+
+    let (left, right) = tokio::join!(
+        reserve(OP, OTHER_USER, "cus_checkout"),
+        reserve(RACE, OTHER_USER, "cus_checkout")
+    );
+    let (left, right) = (left.unwrap(), right.unwrap());
+    assert_eq!(left.op(), right.op());
+    assert_ne!(
+        matches!(left, CreateOpOutcome::Created(_)),
+        matches!(right, CreateOpOutcome::Created(_))
+    );
+    assert!(left.op().replayable);
+    let snapshot = with_fixture_store(async |store| {
+        store.load_reconcile_input(OTHER_USER, None).await.unwrap()
+    })
+    .await;
+    assert_eq!(snapshot.stripe_customer_id.as_deref(), Some("cus_checkout"));
+    assert!(snapshot
+        .bindings
+        .iter()
+        .any(|binding| binding.price_id == PRICE && binding.selectable));
+    assert!(snapshot
+        .bindings
+        .iter()
+        .any(|binding| binding.price_id == "price_wrong_scope" && !binding.selectable));
+
+    observer
+        .execute(
+            "UPDATE billing_operations SET created_at = now() - interval '24 hours'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !with_fixture_store(async |store| store
+            .open_checkout_operation(OTHER_USER)
+            .await
+            .unwrap()
+            .unwrap())
+        .await
+        .replayable
+    );
+    observer.batch_execute("DELETE FROM billing_operations; DELETE FROM billing_accounts; DELETE FROM plan_prices;").await.unwrap();
 }
 
 async fn snapshot(observer: &Client) -> (Value, Value) {
@@ -103,6 +201,7 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     );
     for migration in [
         include_str!("../../../migrations/0002_auth_vault.sql"),
+        include_str!("../../../migrations/0006_account_deletion.sql"),
         include_str!("../../../migrations/0021_billing_schema.sql"),
         include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
         include_str!("../../../migrations/0029_paid_invoice_history.sql"),
@@ -164,6 +263,7 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     assert_eq!(snapshot(&observer).await, (json!([]), json!([])));
 
     dispatch(USER, &seed).await.expect("create owned target");
+    checkout_reservation_and_price_mapping(&observer).await;
     let (owned, history) = snapshot(&observer).await;
     assert_eq!(owned.as_array().unwrap().len(), 1);
     assert_eq!(owned[0]["stripe_subscription_id"], SUBSCRIPTION);
