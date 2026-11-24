@@ -96,6 +96,16 @@ identity, migration and rollback evidence, and review and merge gates. Follow
 [the staging promotion checklist](docs/ops.md#staging-promotion-checklist)
 for release evidence. Explicitly state what was not run.
 
+Post newly available CI results and independent reviews in the PR conversation.
+Put the verified run and job links, conclusions, skips and reviewer decisions
+in Markdown and run `python3 scripts/post_pr_evidence.py <pr-number> <full-head-sha> < evidence.md`.
+The helper checks the current PR head and posts a new comment labeled with the
+supplied SHA. Before merging, verify the evidence against the current head and
+base and confirm the required checks in GitHub.
+GitHub reports body edits and base retargets as the same `edited` activity.
+Posting evidence as a comment avoids starting another `migrations-staging` run.
+Edit the PR body when its description or Attestation needs a substantive correction.
+
 ### Changed-lines mutation gate
 
 `changed-lines-mutation` checks new single-line boundaries in `scripts/account_export.py`
