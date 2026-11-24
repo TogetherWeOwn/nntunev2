@@ -1,4 +1,4 @@
-//! Signed multipart writes against the trusted ingest provider and bucket.
+//! Signed multipart requests against the trusted ingest provider and bucket.
 
 use std::{
     fmt::Write as _,
@@ -8,7 +8,7 @@ use std::{
 use nntune_core::{
     media_envelope::EnvelopeContext,
     origin_sealer::MAX_NEW_PLAINTEXT,
-    s3_locator::S3MediaMetadata,
+    s3_locator::{S3Binding, S3Locator, S3MediaMetadata},
     s3_signing::{encode_query_value, S3SigningKey},
 };
 use sha2::{Digest, Sha256};
@@ -24,6 +24,7 @@ use worker::{
 };
 
 use super::{
+    head_receipt::{HeadReceipt, HeadReceiptError},
     resume_checkpoint::ResumeBinding,
     session_completion::{
         valid_upload_id, CompletionRequest, CompletionResponse, DispatchError, SessionCompletion,
@@ -34,6 +35,14 @@ use crate::pool_deadline::race_against_deadline;
 
 pub use super::initiation::InitiatedUpload;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeadConfirmationError {
+    InvalidRequest,
+    Transport,
+    InvalidResponse,
+    Receipt(HeadReceiptError),
+}
+
 pub struct S3CompletionSender {
     configuration: [u8; 16],
     bucket: String,
@@ -42,7 +51,7 @@ pub struct S3CompletionSender {
 }
 
 impl S3CompletionSender {
-    /// Load a canonical HTTPS origin and write credentials from trusted configuration.
+    /// Load a canonical HTTPS origin and credentials from trusted configuration.
     pub fn new(
         configuration: [u8; 16],
         bucket: String,
@@ -82,8 +91,8 @@ impl S3CompletionSender {
             return Err(DispatchError::InvalidRequest);
         }
         let reply = self
-            .write_request(
-                WriteRequest {
+            .signed_request(
+                SignedRequest {
                     configuration: context.identities[5],
                     bucket,
                     key,
@@ -115,6 +124,88 @@ impl S3CompletionSender {
             .await
     }
 
+    /// Confirm metadata for the immutable completed version. Publication still
+    /// requires authenticated ciphertext readback.
+    pub async fn confirm_head(
+        &self,
+        completed: &CompletedVersionedMedia,
+        context: &EnvelopeContext,
+        usable_until: SystemTime,
+    ) -> Result<(), HeadConfirmationError> {
+        use HeadConfirmationError::{InvalidRequest, InvalidResponse, Receipt, Transport};
+
+        let metadata = completed.metadata();
+        let locator = metadata.locator();
+        if !metadata.matches_context(context) {
+            return Err(InvalidRequest);
+        }
+        let S3Binding::VersionId(version) = locator.binding() else {
+            return Err(InvalidRequest);
+        };
+        let reply = self
+            .signed_request(
+                SignedRequest {
+                    configuration: context.identities[5],
+                    bucket: locator.bucket(),
+                    key: locator.key(),
+                    method: "HEAD",
+                    query: format!("versionId={}", encode_query_value(version)),
+                    body: &[],
+                    payload_hash: hex::encode(Sha256::digest([])),
+                    operation_headers: &[],
+                },
+                usable_until,
+            )
+            .await
+            .map_err(|()| Transport)?;
+        if reply.status != 200
+            || !reply.body.is_empty()
+            || reply
+                .headers
+                .has("content-range")
+                .map_err(|_| InvalidResponse)?
+        {
+            return Err(InvalidResponse);
+        }
+        let observed_locator = reply
+            .headers
+            .get("x-amz-version-id")
+            .map_err(|_| InvalidResponse)?
+            .map(|observed| {
+                if observed.contains(',') {
+                    return Err(InvalidResponse);
+                }
+                S3Locator::new(
+                    self.bucket.clone(),
+                    locator.key().into(),
+                    S3Binding::VersionId(observed),
+                )
+                .map_err(|_| InvalidResponse)
+            })
+            .transpose()?;
+        let content_length = reply
+            .headers
+            .get("content-length")
+            .map_err(|_| InvalidResponse)?
+            .map(|length| {
+                if !length.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(InvalidResponse);
+                }
+                length.parse::<u64>().map_err(|_| InvalidResponse)
+            })
+            .transpose()?;
+        completed
+            .verify_head(
+                context,
+                Some(HeadReceipt {
+                    configuration: Some(self.configuration),
+                    locator: observed_locator.as_ref(),
+                    content_length,
+                }),
+            )
+            .map_err(Receipt)
+    }
+
     /// Upload only the locally sealed part from the authorized session. Retain
     /// those immutable bytes and reconcile the session after an unconfirmed send.
     pub async fn put_part<'a>(
@@ -132,8 +223,8 @@ impl S3CompletionSender {
             return Err(DispatchError::InvalidRequest);
         }
         let reply = self
-            .write_request(
-                WriteRequest {
+            .signed_request(
+                SignedRequest {
                     configuration: binding.configuration,
                     bucket: target.bucket,
                     key: target.key,
@@ -184,8 +275,8 @@ impl S3CompletionSender {
         until: SystemTime,
     ) -> Result<CompletionResponse, ()> {
         let reply = self
-            .write_request(
-                WriteRequest {
+            .signed_request(
+                SignedRequest {
                     configuration: request.configuration,
                     bucket: request.target.bucket,
                     key: request.target.key,
@@ -206,11 +297,11 @@ impl S3CompletionSender {
         })
     }
 
-    async fn write_request(
+    async fn signed_request(
         &self,
-        request: WriteRequest<'_>,
+        request: SignedRequest<'_>,
         until: SystemTime,
-    ) -> Result<WriteReply, ()> {
+    ) -> Result<SignedReply, ()> {
         if self.configuration != request.configuration
             || self.bucket != request.bucket
             || now() >= until
@@ -261,7 +352,9 @@ impl S3CompletionSender {
         let init = RequestInit::new();
         init.set_method(request.method);
         init.set_headers(headers.as_ref());
-        init.set_body_opt_u8_array(Some(&Uint8Array::from(request.body)));
+        if !request.body.is_empty() {
+            init.set_body_opt_u8_array(Some(&Uint8Array::from(request.body)));
+        }
         init.set_redirect(RequestRedirect::Manual);
         init.set_cache(RequestCache::NoStore);
         init.set_signal(Some(&abort.0.signal()));
@@ -292,7 +385,7 @@ impl S3CompletionSender {
     }
 }
 
-struct WriteRequest<'a> {
+struct SignedRequest<'a> {
     configuration: [u8; 16],
     bucket: &'a str,
     key: &'a str,
@@ -303,7 +396,7 @@ struct WriteRequest<'a> {
     operation_headers: &'a [(&'static str, &'a str)],
 }
 
-struct WriteReply {
+struct SignedReply {
     status: u16,
     headers: Headers,
     body: Vec<u8>,
@@ -321,7 +414,7 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn fetch_reply(request: &Request) -> Result<WriteReply, ()> {
+async fn fetch_reply(request: &Request) -> Result<SignedReply, ()> {
     let scope: WorkerGlobalScope = js_sys::global().unchecked_into();
     let response: Response = JsFuture::from(scope.fetch_with_request(request))
         .await
@@ -361,7 +454,7 @@ async fn fetch_reply(request: &Request) -> Result<WriteReply, ()> {
             bytes.copy_to(&mut body[start..]);
         }
     }
-    Ok(WriteReply {
+    Ok(SignedReply {
         status,
         headers,
         body,

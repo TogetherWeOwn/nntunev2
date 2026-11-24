@@ -45,7 +45,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
     )
     .map_err(|_| JsValue::from_str("invalid configuration"))?;
     let mut sealer = OriginSealer::new(1).unwrap();
-    let context = EnvelopeContext {
+    let mut context = EnvelopeContext {
         identities: [0, 1, 2, 0xab, 0xcd, 7].map(id),
         plaintext_len: 1,
         header: sealer.header().to_bytes(),
@@ -70,7 +70,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
         assert_eq!(upload.configuration(), configuration);
-        if mode != "init-upload-completion" {
+        if mode != "init-upload-completion-head" {
             return Ok(upload.target().upload_id.into());
         }
         Some(upload)
@@ -122,7 +122,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         generation: &generation,
         envelope_scheme: 2,
     };
-    let receipt = if mode.starts_with("part") || mode == "init-upload-completion" {
+    let receipt = if mode.starts_with("part") || initiated.is_some() {
         let uploaded = sender
             .put_part(binding, &context, &part, until)
             .await
@@ -152,6 +152,15 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         .complete(completion, until)
         .await
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    if mode == "head-context" {
+        context.identities[1] = id(8);
+    }
+    if mode.starts_with("head") || initiated.is_some() {
+        sender
+            .confirm_head(&completed, &context, until)
+            .await
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    }
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {
         return Err(JsValue::from_str("missing fixture version"));
     };

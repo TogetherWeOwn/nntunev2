@@ -5,7 +5,10 @@ const { createHash, createHmac } = require('node:crypto');
 const { test } = require('node:test');
 const { s3_completion_test: complete } = require('./ingest_wasm.cjs');
 
-const version = 'fixture-version';
+const version = 'fixture-version+/=?';
+const versionQuery = 'versionId=fixture-version%2B%2F%3D%3F';
+const ciphertextLength = 48 + 1 + 16;
+const headHeaders = { 'x-amz-version-id': version, 'content-length': String(ciphertextLength) };
 const bucket = 'fixture-bucket';
 const mediaKey = 'media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd';
 const transportFailure = 'Unconfirmed(None)';
@@ -83,14 +86,14 @@ test('signs the exact multipart POST once and collects its version and body', as
 test('signs the ciphertext part and accepts only its matching checksum and ETag', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
     const body = await verifySignedRequest(request, 'PUT', `partNumber=1&${uploadQuery}`);
-    assert.equal(body.length, 48 + 1 + 16);
+    assert.equal(body.length, ciphertextLength);
     return new Response(null, { headers: { etag: '"fixture-part"', 'x-amz-checksum-sha256': checksum(body) } });
   });
   assert.equal(await complete('part'), '"fixture-part"');
   assert.equal(fetch.mock.callCount(), 1);
 });
 
-test('uses the initialized upload ID and signed part receipt in completion', async (t) => {
+test('uses the initialized upload ID, signed part receipt and completed version through HEAD', async (t) => {
   const requests = [];
   let uploadedChecksum;
   t.mock.method(globalThis, 'fetch', async (request) => {
@@ -103,16 +106,67 @@ test('uses the initialized upload ID and signed part receipt in completion', asy
     }
     if (request.method === 'PUT') {
       const body = await verifySignedRequest(request, 'PUT', `partNumber=1&${initiatedQuery}`);
+      assert.equal(body.length, ciphertextLength);
       uploadedChecksum = checksum(body);
       return new Response(null, { headers: { etag: '"fixture-part"', 'x-amz-checksum-sha256': uploadedChecksum } });
+    }
+    if (request.method === 'HEAD') {
+      assert.equal(request.body, null);
+      const body = await verifySignedRequest(request, 'HEAD', versionQuery, {});
+      assert.equal(body.length, 0);
+      return new Response(null, { headers: headHeaders });
     }
     const manifest = (await verifySignedRequest(request, 'POST', initiatedQuery)).toString();
     assert.ok(manifest.includes(`<ChecksumSHA256>${uploadedChecksum}</ChecksumSHA256>`));
     return new Response(completionReceipt(manifest, 'fixture-part'), { headers: { 'x-amz-version-id': version } });
   });
-  assert.equal(await complete('init-upload-completion'), version);
-  assert.deepEqual(requests, ['POST uploads=', `PUT partNumber=1&${initiatedQuery}`, `POST ${initiatedQuery}`]);
+  assert.equal(await complete('init-upload-completion-head'), version);
+  assert.deepEqual(requests, [
+    'POST uploads=', `PUT partNumber=1&${initiatedQuery}`, `POST ${initiatedQuery}`, `HEAD ${versionQuery}`,
+  ]);
 });
+
+test('refuses a foreign completion context before sending HEAD', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+    const body = await verifySignedRequest(request, 'POST', uploadQuery);
+    return new Response(completionReceipt(body.toString()), { headers: { 'x-amz-version-id': version } });
+  });
+  await assert.rejects(complete('head-context'), rejectedWith('InvalidRequest'));
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+for (const [name, response, failure = 'InvalidResponse'] of [
+  ['HTTP 500', () => new Response(null, { status: 500, headers: headHeaders })],
+  ['non-empty body', () => new Response('unexpected', { headers: headHeaders })],
+  ['content range', () => new Response(null, { headers: { ...headHeaders, 'content-range': 'bytes 0-64/65' } })],
+  ['encoded response', () => new Response(null, { headers: { ...headHeaders, 'content-encoding': 'gzip' } }), 'Transport'],
+  ['missing version', () => new Response(null, { headers: { 'content-length': headHeaders['content-length'] } }),
+    'Receipt(MissingMetadata)'],
+  ['wrong version', () => new Response(null, { headers: { ...headHeaders, 'x-amz-version-id': 'other' } }),
+    'Receipt(WrongObject)'],
+  ['null version', () => new Response(null, { headers: { ...headHeaders, 'x-amz-version-id': 'null' } })],
+  ['joined versions', () => new Response(null, { headers: { ...headHeaders, 'x-amz-version-id': `${version}, other` } })],
+  ['missing length', () => new Response(null, { headers: { 'x-amz-version-id': version } }), 'Receipt(MissingMetadata)'],
+  ['wrong length', () => new Response(null, { headers: { ...headHeaders, 'content-length': String(ciphertextLength + 1) } }),
+    'Receipt(SizeMismatch)'],
+  ['signed length', () => new Response(null, { headers: { ...headHeaders, 'content-length': `+${ciphertextLength}` } })],
+  ['joined lengths', () => new Response(null, {
+    headers: { ...headHeaders, 'content-length': `${ciphertextLength}, ${ciphertextLength}` },
+  })],
+]) {
+  test(`refuses ${name} in a HEAD reply without resending`, async (t) => {
+    const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+      if (request.method === 'HEAD') {
+        await verifySignedRequest(request, 'HEAD', versionQuery, {});
+        return response();
+      }
+      const body = await verifySignedRequest(request, 'POST', uploadQuery);
+      return new Response(completionReceipt(body.toString()), { headers: { 'x-amz-version-id': version } });
+    });
+    await assert.rejects(complete('head'), rejectedWith(failure));
+    assert.equal(fetch.mock.callCount(), 2);
+  });
+}
 
 test('refuses initiation with an unrelated provider or key before fetch', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('unexpected fetch'); });
