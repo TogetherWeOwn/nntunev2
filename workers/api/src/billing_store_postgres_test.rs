@@ -115,21 +115,32 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
          SELECT pg_advisory_lock(hashtext('native_billing_other'));",
     )
     .await;
-    let mut pending = Box::pin(reserve(OP, OTHER_USER, "cus_checkout"));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut pending)
+    let commit_subscription = async {
+        let waiting = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory'
+            AND NOT granted AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))";
+        while !observer
+            .query_one(waiting, &[])
             .await
-            .is_err()
-    );
-    sql(
-        "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id,
+            .unwrap()
+            .get::<_, bool>(0)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sql(
+            "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id,
              stripe_subscription_item_id, stripe_price_id, plan_id, status)
          VALUES ('native_billing_other', 'sub_reservation_race', 'cus_checkout',
              'si_reservation_race', 'price_checkout_fixture', 'plus', 'active');
          SELECT pg_advisory_unlock(hashtext('native_billing_other'));",
-    )
-    .await;
-    assert!(pending.await.is_err());
+        )
+        .await;
+    };
+    let (reservation, completed) = tokio::join!(
+        reserve(OP, OTHER_USER, "cus_checkout"),
+        tokio::time::timeout(Duration::from_secs(2), commit_subscription),
+    );
+    completed.expect("checkout never waited on the subscription writer");
+    assert!(reservation.is_err());
     sql("DELETE FROM subscriptions WHERE stripe_subscription_id = 'sub_reservation_race'").await;
 
     let (left, right) = tokio::join!(
@@ -155,17 +166,12 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
         .map(|row| row.price_id.as_str())
         .collect();
     assert_eq!(selectable, [PRICE]);
+    assert_eq!(snapshot.bindings.len(), 4);
 
     sql("UPDATE billing_operations SET created_at = now() - interval '23 hours 30 minutes'").await;
-    assert!(
-        !with_fixture_store(async |store| store
-            .open_checkout_operation(OTHER_USER)
-            .await
-            .unwrap()
-            .unwrap())
-        .await
-        .replayable
-    );
+    let aged =
+        with_fixture_store(async |store| store.open_checkout_operation(OTHER_USER).await).await;
+    assert!(!aged.unwrap().unwrap().replayable);
     sql("DELETE FROM billing_operations; DELETE FROM billing_accounts; DELETE FROM plan_prices; DELETE FROM plans WHERE id = 'checkout-fixture';").await;
 }
 
