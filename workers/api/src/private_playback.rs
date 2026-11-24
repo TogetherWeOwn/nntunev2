@@ -13,7 +13,8 @@ use tokio_postgres::types::Type;
 
 use crate::{
     handlers::{
-        browser_playback_relay::BrowserReceipt, session_binding, StoreError, PRIVATE_PLAY_PREFIX,
+        browser_playback_relay::BrowserReceipt, random_id, session_binding, StoreError,
+        PRIVATE_PLAY_PREFIX,
     },
     play_grant::{IssuedGrant, MIN_SECRET_BYTES},
     playback::{self, LeaseAcquire, LeaseRow},
@@ -52,10 +53,8 @@ pub struct PrivatePlayback<'a> {
 const LOOKUP_TIMEOUT_MS: u64 = 4_000;
 
 fn seconds(now: SystemTime) -> Result<u64, StoreError> {
-    Ok(now
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| StoreError)?
-        .as_secs())
+    let elapsed = now.duration_since(UNIX_EPOCH).map_err(|_| StoreError)?;
+    Ok(elapsed.as_secs())
 }
 
 async fn authorized(
@@ -157,12 +156,8 @@ impl PrivatePlayback<'_> {
                 grant_deadline: deadline,
                 ..music
             };
-            let play_id = format!(
-                "{PRIVATE_PLAY_PREFIX}{}",
-                crate::b64::encode(
-                    &crate::random::secure_random_bytes::<16>().map_err(|_| StoreError)?
-                )
-            );
+            let mut play_id = random_id::<16>().map_err(|_| StoreError)?;
+            play_id.insert_str(0, PRIVATE_PLAY_PREFIX);
             let LeaseAcquire::Acquired { epoch } =
                 acquire_playback_lease_on(&tx, user, tab, track, &play_id, start, end, false)
                     .await?
@@ -182,10 +177,8 @@ impl PrivatePlayback<'_> {
             let mut mac =
                 Hmac::<sha2::Sha256>::new_from_slice(self.grant_secret).map_err(|_| StoreError)?;
             mac.update(signed.as_bytes());
-            let token = format!(
-                "{signed}.{}",
-                crate::b64::encode(&mac.finalize().into_bytes())
-            );
+            let signature = crate::b64::encode(&mac.finalize().into_bytes());
+            let token = format!("{signed}.{signature}");
             let receipt = PrivateReceipt {
                 relay: BrowserReceipt {
                     user_id: user.clone(),
@@ -215,8 +208,7 @@ impl PrivatePlayback<'_> {
         with_deadline(operation, LOOKUP_TIMEOUT_MS, StoreError).await
     }
 
-    /// Recheck the original account session, invitation, exact lease and
-    /// publication before using the committed protected read.
+    /// Resolve only the live receipt's exact publication and protected custody.
     pub async fn resolve<C: PgConnect>(
         &self,
         db: &mut C,
@@ -234,7 +226,6 @@ impl PrivatePlayback<'_> {
             let stored = &receipt.music;
             if root.version != stored.target.root_version
                 || !bool::from(bearer.as_bytes().ct_eq(expected.grant.token.as_bytes()))
-                || !expected.valid_private_grant(self.grant_secret, seconds(now())?)
                 || expires > policy.expires_at
             {
                 return Ok(None);
@@ -254,13 +245,12 @@ impl PrivatePlayback<'_> {
                 let found =
                     private_catalogue_read::resolve(db, expected, &pins, self.grant_secret, &now)
                         .await?;
-                Ok::<_, StoreError>(if authorized(db, policy, &receipt.session).await? {
+                let active = authorized(db, policy, &receipt.session).await?;
+                Ok::<_, StoreError>(
                     found
-                        .filter(|found| found == stored && now() < stored.grant_deadline)
-                        .map(|found| found.target)
-                } else {
-                    None
-                })
+                        .filter(|found| active && found == stored && now() < stored.grant_deadline)
+                        .map(|found| found.target),
+                )
             };
             let Some(target) = current(db).await? else {
                 return Ok(None);

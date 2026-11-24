@@ -289,26 +289,23 @@ async fn resolves_only_the_committed_scoped_publication() {
     let policy = PrivateListening::parse(&serde_json::json!({
         "owner_user_id": "catalogue-owner", "invite_ids": [invite], "expires_at": claims.expires_at
     }).to_string()).unwrap();
-    let api = PrivatePlayback {
-        policy: Some(&policy),
+    let service = |policy| PrivatePlayback {
+        policy,
         grant_secret: SECRET,
     };
     let issue = async |db: &mut Client, admission, cookie, pins: &PublicationPins<'_>| {
-        PrivatePlayback {
-            policy: admission,
-            ..api
-        }
-        .issue(
-            db,
-            &keys,
-            cookie,
-            track,
-            &signed.lease.session_id,
-            pins,
-            SystemTime::now,
-        )
-        .await
-        .unwrap()
+        service(admission)
+            .issue(
+                db,
+                &keys,
+                cookie,
+                track,
+                &signed.lease.session_id,
+                pins,
+                SystemTime::now,
+            )
+            .await
+            .unwrap()
     };
     let configured = Some(&policy);
     let session = Some(cookie.as_str());
@@ -330,21 +327,27 @@ async fn resolves_only_the_committed_scoped_publication() {
         .await
         .unwrap();
     let token = &issued.relay().grant.token;
-    let resolve = async |db: &mut Client, token: &str| {
-        api.resolve(db, &issued, token, &root, SystemTime::now)
+    let resolve = async |db: &mut Client, admission, token: &str, time| {
+        service(admission)
+            .resolve(db, &issued, token, &root, || time)
             .await
             .unwrap()
     };
-    assert!(resolve(&mut reader, "invalid-bearer").await.is_none());
-    assert_eq!(
-        resolve(&mut reader, token)
+    let current = SystemTime::now();
+    let expiry = UNIX_EPOCH + Duration::from_secs(issued.relay().grant.exp_unix);
+    for (admission, bearer, time) in [
+        (configured, "invalid-bearer", current),
+        (None, token.as_str(), current),
+        (configured, token.as_str(), expiry),
+    ] {
+        assert!(resolve(&mut reader, admission, bearer, time)
             .await
-            .unwrap()
-            .read
-            .pins()
-            .media_version,
-        original_pins.version
-    );
+            .is_none());
+    }
+    let resolved = resolve(&mut reader, configured, token, current)
+        .await
+        .unwrap();
+    assert_eq!(resolved.read.pins().media_version, original_pins.version);
     for state in ["invite", "session", "rotation", "revision", "lease"] {
         writer
             .query_one(
@@ -353,7 +356,12 @@ async fn resolves_only_the_committed_scoped_publication() {
             )
             .await
             .unwrap();
-        assert!(resolve(&mut reader, token).await.is_none(), "{state}");
+        assert!(
+            resolve(&mut reader, configured, token, current)
+                .await
+                .is_none(),
+            "{state}"
+        );
         if matches!(state, "invite" | "session" | "rotation") {
             assert!(issue(&mut reader, configured, session, &original_pins)
                 .await

@@ -2841,7 +2841,7 @@ where
 /// (HTTP 503 `service_unavailable`) so the caller fails the request closed.
 /// The success path is byte-identical: the same `N` entropy bytes through
 /// the same `b64url_encode`.
-fn random_id<const N: usize>() -> Result<String, crate::random::CryptoError> {
+pub(crate) fn random_id<const N: usize>() -> Result<String, crate::random::CryptoError> {
     let bytes = crate::random::secure_random_bytes::<N>()?;
     Ok(b64url_encode(&bytes))
 }
