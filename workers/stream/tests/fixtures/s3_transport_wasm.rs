@@ -42,7 +42,7 @@ struct CataloguePointer {
     plaintext_len: u64,
 }
 
-#[wasm_bindgen]
+#[wasm_bindgen(wasm_bindgen_futures = worker::wasm_bindgen_futures)]
 pub async fn read_uploaded_suffix(endpoint: String, pointer: String) -> Result<Vec<u8>, JsValue> {
     read_uploaded_suffix_inner(&endpoint, &pointer)
         .await
