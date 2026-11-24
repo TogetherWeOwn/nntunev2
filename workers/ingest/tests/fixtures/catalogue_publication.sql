@@ -8,6 +8,13 @@ CREATE TABLE public.catalogue_s3_sources (
         REFERENCES public.storage_validated_digest_winners (object_id)
 );
 
+-- Disposable substitute for the session outcome writer. The read side resolves
+-- the result through the real committed publisher rows.
+CREATE TABLE public.test_committed_uploads (
+    scope TEXT[] PRIMARY KEY,
+    map_id UUID NOT NULL REFERENCES public.storage_digest_inventory_intents (map_id)
+);
+
 INSERT INTO public.users (id, email, created_at) VALUES
     ('catalogue-owner', 'catalogue@example.invalid', 1),
     ('catalogue-other', 'other@example.invalid', 1);
