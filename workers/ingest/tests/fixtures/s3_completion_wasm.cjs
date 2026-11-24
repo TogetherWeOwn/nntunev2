@@ -15,9 +15,9 @@ const checksum = (bytes) => createHash('sha256').update(bytes).digest('base64');
 const mac = (key, text) => createHmac('sha256', key).update(text).digest();
 const uploadQuery = 'uploadId=fixture%2B%2F%3D%3F';
 
-function completionReceipt(manifest) {
+function completionReceipt(manifest, etag = 'fixture-etag') {
   const prefix = '<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
-    + '<Part><PartNumber>1</PartNumber><ETag>&quot;fixture-etag&quot;</ETag><ChecksumSHA256>';
+    + `<Part><PartNumber>1</PartNumber><ETag>&quot;${etag}&quot;</ETag><ChecksumSHA256>`;
   const suffix = '</ChecksumSHA256></Part></CompleteMultipartUpload>';
   assert.ok(manifest.startsWith(prefix));
   assert.ok(manifest.endsWith(suffix));
@@ -79,6 +79,24 @@ test('signs the ciphertext part and accepts only its matching checksum and ETag'
   assert.equal(fetch.mock.callCount(), 1);
 });
 
+test('carries the signed part receipt through the checkpoint into completion', async (t) => {
+  const methods = [];
+  let uploadedChecksum;
+  t.mock.method(globalThis, 'fetch', async (request) => {
+    methods.push(request.method);
+    if (request.method === 'PUT') {
+      const body = await verifySignedRequest(request, 'PUT', `partNumber=1&${uploadQuery}`);
+      uploadedChecksum = checksum(body);
+      return new Response(null, { headers: { etag: '"fixture-part"', 'x-amz-checksum-sha256': uploadedChecksum } });
+    }
+    const manifest = (await verifySignedRequest(request, 'POST', uploadQuery)).toString();
+    assert.ok(manifest.includes(`<ChecksumSHA256>${uploadedChecksum}</ChecksumSHA256>`));
+    return new Response(completionReceipt(manifest, 'fixture-part'), { headers: { 'x-amz-version-id': version } });
+  });
+  assert.equal(await complete('upload-completion'), version);
+  assert.deepEqual(methods, ['PUT', 'POST']);
+});
+
 test('refuses an unrelated checkpoint or provider before uploading the part', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('unexpected fetch'); });
   for (const mode of ['part-other', 'part-context']) {
@@ -88,13 +106,19 @@ test('refuses an unrelated checkpoint or provider before uploading the part', as
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-for (const [name, headers, error] of [
-  ['missing checksum', { etag: '"fixture-part"' }, 'PartReceipt'],
-  ['wrong checksum', { etag: '"fixture-part"', 'x-amz-checksum-sha256': 'wrong' }, 'Checksum'],
-  ['joined ETags', { etag: '"first", "second"', 'x-amz-checksum-sha256': 'unused' }, 'PartReceipt'],
+for (const [name, response, error = 'PartReceipt'] of [
+  ['HTTP 500', (headers) => new Response(null, { status: 500, headers })],
+  ['non-empty success body', (headers) => new Response('unexpected', { headers })],
+  ['missing checksum', () => new Response(null, { headers: { etag: '"fixture-part"' } })],
+  ['wrong checksum', (headers) => new Response(null, { headers: { ...headers, 'x-amz-checksum-sha256': 'wrong' } }), 'Checksum'],
+  ['missing ETag', ({ etag: _, ...headers }) => new Response(null, { headers })],
+  ['joined ETags', (headers) => new Response(null, { headers: { ...headers, etag: '"first", "second"' } })],
 ]) {
   test(`rejects ${name} from UploadPart without resending`, async (t) => {
-    const fetch = t.mock.method(globalThis, 'fetch', async () => new Response(null, { headers }));
+    const fetch = t.mock.method(globalThis, 'fetch', async (request) => response({
+      etag: '"fixture-part"',
+      'x-amz-checksum-sha256': checksum(Buffer.from(await request.arrayBuffer())),
+    }));
     await assert.rejects(complete('part'), rejectedWith(`Unconfirmed(Some(${error}))`));
     assert.equal(fetch.mock.callCount(), 1);
   });

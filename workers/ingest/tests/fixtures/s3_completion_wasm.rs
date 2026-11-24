@@ -66,14 +66,6 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         .is_none());
     let part = partition.finish().unwrap().unwrap();
     let (_, number, bytes, checksum) = part.request();
-    let etag = "\"fixture-etag\"";
-    let receipt = part.verify_reply(etag.into(), checksum).unwrap();
-    let parts = [CheckpointPart {
-        number,
-        len: bytes.len(),
-        etag,
-        digest: Sha256::digest(bytes).into(),
-    }];
     let binding = ResumeBinding {
         plan: if mode == "part-other" {
             Plan::new(
@@ -106,13 +98,26 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         _ => 2000,
     };
     let until = now() + Duration::from_millis(budget);
-    if mode.starts_with("part") {
+    let receipt = if mode.starts_with("part") || mode == "upload-completion" {
         let uploaded = sender
             .put_part(binding, &context, &part, until)
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
-        return Ok(uploaded.etag);
-    }
+        if mode.starts_with("part") {
+            return Ok(uploaded.etag);
+        }
+        uploaded
+    } else {
+        part.verify_reply("\"fixture-etag\"".into(), checksum)
+            .unwrap()
+    };
+    let etag = receipt.etag.clone();
+    let parts = [CheckpointPart {
+        number,
+        len: bytes.len(),
+        etag: &etag,
+        digest: Sha256::digest(bytes).into(),
+    }];
     let checkpoint = ResumeCheckpoint {
         binding,
         parts: &parts,
