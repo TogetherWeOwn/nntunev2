@@ -2204,12 +2204,6 @@ jobs:
       - name: Install locked upload CLI without lifecycle scripts
         working-directory: apps/web
         run: pnpm install --frozen-lockfile --ignore-scripts --config.minimumReleaseAge=4320
-      - name: Dry-run generated staging upload configs without rebuilding
-        run: |
-          set -euo pipefail
-          mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
-          test "${#wranglers[@]}" -eq 1
-          python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
       - name: Exclude Subsonic deadline test markers from release WASM
         run: |
           if grep -aEq 'subsonic-connect-deadline-(proof|ok)' workers/api/build/index_bg.wasm; then
@@ -2251,6 +2245,23 @@ jobs:
         run: python3 -I .github/scripts/worker_span_runtime.py --self-test
       - name: Exercise concurrent Rust span identity in real workerd
         run: python3 -I .github/scripts/worker_span_runtime.py
+      # Select Stream tools after all ordinary Worker compilation and smoke tests.
+      - name: Prepare pinned Stream tools
+        run: python3 -I .github/scripts/worker_tools.py install stream
+      - name: Build the Stream release bundle
+        working-directory: workers/stream
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-stream.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-stream.log" stream
+          git diff --exit-code -- ../../Cargo.lock
+      - name: Dry-run generated staging upload configs without rebuilding
+        run: |
+          set -euo pipefail
+          mapfile -t wranglers < <(find apps/web/node_modules/.pnpm -path '*/node_modules/wrangler/bin/wrangler.js' -type f)
+          test "${#wranglers[@]}" -eq 1
+          python3 -I .github/scripts/check_worker_upload.py --wrangler "${wranglers[0]}"
       - name: Upload Worker build logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

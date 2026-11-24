@@ -9,6 +9,16 @@
     "version": "0.2.130",
     "sha256": "c37f6904387d19a319525c74af274c73912f3871c35555aa49f3ea64ebb2fc7a"
   },
+  "stream-profile": {
+    "worker-build": {
+      "version": "0.8.7",
+      "sha256": "1051c05ef088889a30ad3bad40c22a716ba8ca8d02a3fb01cef8c143ba952222"
+    },
+    "wasm-bindgen-cli": {
+      "version": "0.2.129",
+      "sha256": "5fd044ed178958a277eeaf21f3d384287b0f4428d38c019141df01da9c03168c"
+    }
+  },
   "repair-profile": {
     "worker-build": {
       "version": "0.9.0",
