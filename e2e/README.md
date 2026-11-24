@@ -261,24 +261,30 @@ Its [hosted offline fixture](fixtures/private-music/staging-playback-probe.spec.
 checks the request and response contract without making staging requests.
 
 1. Qualify the replacement under the existing opt-in private staging job.
-   In [the private browser journey](private-staging/journey.spec.ts), after
-   the first curated track starts and its `currentMedia` is validated, call
-   `assertStagingPlaybackProbe` with `request: page.request`,
-   `sourceUrl: first.source.href`, the selected `trackId`, and `fixtureSha256`
-   from the matching publication. Run it before the cohort cutoff with the
-   active play and the invitee's existing cookie context. Keep the journey's
-   native seek, resume and queue checks, and qualify metering as required by
-   the disposition. The new check independently requires the full FLAC body
-   and an exact nonzero `206` slice from that relay.
-2. Record the successful run and job alongside the exact serving Web, API and
+   Keep the native seek, resume and queue checks in
+   [the private browser journey](private-staging/journey.spec.ts). Collect
+   seek metering against the first track's play ID before sending any manual
+   range GET for that play. Stream merges delivered intervals per play, so the
+   full-body probe needs its own play ID.
+2. Use the second curated track's active play for the transport probe.
+   After its `currentMedia` check, verify that `media[3]` differs from the
+   first play ID. Before the cohort cutoff, call `assertStagingPlaybackProbe`
+   with `request: page.request`, `sourceUrl: source.href`, the second selected
+   `trackId`, and `fixtureSha256` from its matching publication. Keep the
+   cutoff checks. The helper independently requires the full FLAC body and
+   an exact nonzero `206` slice from the invitee's authenticated relay.
+3. Record the successful run and job alongside the exact serving Web, API and
    Stream deployment identities. Keep the ordinary staging journey as the
    default and keep `/demo/player`, `/api/demo/audio`, `/api/demo/artwork`,
    and their current probes in service through this qualification. Record the
    last-good build and successful deploy run with the old routes and probes
    together as the [rollback target](../docs/ops.md#staging-deploy-lock-cutover-and-rollback).
-3. Before retiring the routes, verify that each remaining local browser case
-   still has its accepted product coverage or a recorded deferral. In the
-   retirement change, move the two anonymous `/library` and `/api/library`
+4. Before retiring the routes, verify that each remaining local browser case
+   still has its accepted product coverage or a recorded deferral. Keep the
+   demo's Axe cases until removal and preserve the loaded product scans, the
+   bundle cap, and the decoder and Media Session teardown coverage in
+   `security-auth-transition.spec.ts` and `library-system-transport.spec.ts`.
+   In the retirement change, move the two anonymous `/library` and `/api/library`
    tests from [demo-media-sessionless.spec.ts](tests/demo-media-sessionless.spec.ts)
    into a dedicated Library spec with their request setup and assertion bodies
    intact. Keep them in the ordinary staging run. Replace the demo audio and
@@ -288,7 +294,7 @@ checks the request and response contract without making staging requests.
    Remove the vendored WAV formula and its tests with its route, and update the
    E2E unit list, [credential-scope pins](tests/workflows.spec.ts), route contract
    and [M1 traceability](../docs/m1-exit-traceability.md) in the same change.
-4. Verify the route-absence and Library denial checks on the exact staging
+5. Verify the route-absence and Library denial checks on the exact staging
    retirement build. If they regress, restore the last-good build and its
    matching probes together.
 
