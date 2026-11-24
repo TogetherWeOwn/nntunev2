@@ -182,4 +182,6 @@ ROLLBACK;
 \quit
 \endif
 \ir ../fixtures/ingest_session_reserve.sql
+\ir ../fixtures/ingest_session_terminate.sql
+\ir ../fixtures/ingest_session_advance_checkpoint.sql
 ROLLBACK;
