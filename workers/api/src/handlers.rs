@@ -7607,7 +7607,43 @@ where
         ))
     )
 ))]
-pub(crate) async fn reconcile_pending_checkout<S, M, D, N>(
+pub(crate) async fn reconcile_paid_targets<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    targets: Vec<(&str, Option<&str>)>,
+) -> Result<(), StoreError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if !ctx.cfg.paid_billing_enabled() {
+        return Ok(());
+    }
+    let mut failed = false;
+    for (user, subscription) in targets {
+        failed |= match subscription {
+            Some(subscription) => reconcile_remote_subscription(ctx, user, subscription)
+                .await
+                .map_or(true, |outcome| outcome.disable_new_purchases()),
+            None => reconcile_pending_checkout(ctx, user).await.is_err(),
+        };
+    }
+    (!failed).then_some(()).ok_or(StoreError)
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_arch = "wasm32",
+        not(any(
+            feature = "staging-body-wasm-test",
+            feature = "billing-owned-wasm-test",
+            feature = "span-runtime-test"
+        ))
+    )
+))]
+async fn reconcile_pending_checkout<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     user_id: &str,
 ) -> Result<(), EnsureCheckoutError>
@@ -7629,9 +7665,17 @@ where
         // A scheduled run cannot infer whether Stripe created a session.
         return Err(EnsureCheckoutError::Unavailable);
     };
-    handle_flight_session(ctx, &op, session, price)
-        .await
-        .map(|_| ())
+    if handle_flight_session(ctx, &op, session, price).await? == FlightSessionDecision::Completed {
+        let updated = ctx
+            .store
+            .checkout_operation_by_id(&op.id)
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+        if !updated.is_some_and(|row| row.state == "succeeded") {
+            return Err(EnsureCheckoutError::Failed);
+        }
+    }
+    Ok(())
 }
 
 async fn billing_webhook<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
@@ -10188,10 +10232,27 @@ mod tests {
             &self,
             user_id: &str,
         ) -> Result<Option<crate::playback::SubscriptionRow>, StoreError> {
-            Ok(self.playback_subscriptions.borrow().get(user_id).cloned())
+            let seeded = self.playback_subscriptions.borrow().get(user_id).cloned();
+            Ok(seeded.or_else(|| {
+                self.billing_rows.borrow().get(user_id).map(|row| {
+                    crate::playback::SubscriptionRow {
+                        plan_id: row.plan_id.clone(),
+                        status: row.status.clone(),
+                        paid_through_at_unix: row.paid_through_unix,
+                        grace_until_unix: row.grace_until_unix,
+                        current_period_end_unix: row.current_period_end_unix,
+                        cancel_at_period_end: row.cancel_at_period_end,
+                    }
+                })
+            }))
         }
         async fn ever_subscribed(&self, user_id: &str) -> Result<bool, StoreError> {
-            Ok(self.ever_paid_users.borrow().contains(user_id))
+            Ok(self.ever_paid_users.borrow().contains(user_id)
+                || self
+                    .billing_rows
+                    .borrow()
+                    .get(user_id)
+                    .is_some_and(|row| row.paid_through_unix.is_some()))
         }
         async fn plan_caps(
             &self,
@@ -13099,8 +13160,21 @@ mod tests {
         );
         assert_eq!(reply.status, 200);
         let op = || block_on(h.store.open_checkout_operation("u1")).unwrap();
-        let session = op().unwrap().session_id.unwrap();
-        block_on(reconcile_pending_checkout(&h.ctx(), "u1")).unwrap();
+        let mut active = op().unwrap();
+        let session = active.session_id.take().unwrap();
+        let run = || block_on(reconcile_paid_targets(&h.ctx(), vec![("u1", None)]));
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .insert(active.id.clone(), active.clone());
+        assert!(run().is_err());
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut(&active.id)
+            .unwrap()
+            .session_id = Some(session.clone());
+        run().unwrap();
         assert!(op().is_some());
         h.stripe
             .sessions
@@ -13108,7 +13182,7 @@ mod tests {
             .get_mut(&session)
             .unwrap()
             .status = Some("expired".into());
-        block_on(reconcile_pending_checkout(&h.ctx(), "u1")).unwrap();
+        run().unwrap();
         assert!(op().is_none());
         assert!(live_for(&h, "u1").is_none());
         assert_eq!(*h.stripe.sessions_created.borrow(), 1);
@@ -13125,21 +13199,8 @@ mod tests {
         let play = serde_json::json!({"track_id":"track-9", "session_id":"tab-a"});
         assert_eq!(play_call(&h, &cookie, play.clone()).status, 402);
         deliver_first_period(&h, "evt_play");
-        let row = live_for(&h, "u1").expect("confirmed paid coverage");
-        h.store.playback_subscriptions.borrow_mut().insert(
-            "u1".into(),
-            crate::playback::SubscriptionRow {
-                plan_id: row.plan_id.clone(),
-                status: row.status,
-                paid_through_at_unix: row.paid_through_unix,
-                grace_until_unix: row.grace_until_unix,
-                current_period_end_unix: row.current_period_end_unix,
-                cancel_at_period_end: row.cancel_at_period_end,
-            },
-        );
-        h.store.ever_paid_users.borrow_mut().insert("u1".into());
         h.store.plan_caps_rows.borrow_mut().insert(
-            row.plan_id,
+            PLAN_PLUS.into(),
             crate::plan_limits::PlanCaps {
                 stream_seconds_month: 2,
                 max_concurrent_streams: 1,

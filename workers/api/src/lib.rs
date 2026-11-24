@@ -249,11 +249,13 @@ pub async fn billing_schedule(
     env: worker::Env,
     _ctx: worker::ScheduleContext,
 ) {
-    if event.cron() == "0 * * * *" {
-        assert!(
-            worker_entry::reconcile_paid_invites(env).await.is_ok(),
-            "paid invite reconcile did not complete"
-        );
+    if let Some(hour) = billing_sweep::scheduled_hour(&event.cron(), event.schedule()) {
+        if worker_entry::reconcile_paid_invites(env, hour)
+            .await
+            .is_err()
+        {
+            worker::console_error!("paid invite reconcile did not complete");
+        }
     }
 }
 
