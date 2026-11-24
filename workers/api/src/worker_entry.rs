@@ -1872,7 +1872,7 @@ const NATIVE_REST_COLUMNS: &str = "id, user_id, label, key_prefix, key_hmac, pep
 /// that no longer parse are a data-corruption signal: the row fails
 /// closed (`StoreError`, never an authenticated caller) rather than
 /// authorizing a narrowed or widened set.
-fn native_credential_from_row(
+pub(crate) fn native_credential_from_row(
     row: &tokio_postgres::Row,
 ) -> Result<NativeCredentialRow, StoreError> {
     let scopes: Vec<String> = row.try_get("scopes").map_err(|_| StoreError)?;

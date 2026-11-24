@@ -14,11 +14,12 @@ pub enum Action {
 
 /// A server-side grant bound to one credential and one library in one environment.
 /// It does not replace bearer validation and must never be populated from the request.
-pub struct Grant<'a> {
-    pub credential_id: &'a str,
-    pub environment: &'a str,
-    pub library_id: &'a str,
-    pub actions: &'a [Action],
+#[derive(Clone)]
+pub struct Grant {
+    pub credential_id: String,
+    pub environment: String,
+    pub library_id: String,
+    pub actions: Vec<Action>,
 }
 
 /// Ownership loaded from trusted job state, not from caller-supplied fields.
@@ -34,7 +35,7 @@ pub fn authorize(
     bearer: (Option<&NativeRestRecord>, Option<&str>),
     peppers: &[Pepper<'_>],
     now: u64,
-    grant: Option<&Grant<'_>>,
+    grant: Option<&Grant>,
     scope: (&str, &str),
     action: Action,
     job: Option<(&str, &Job<'_>)>,
@@ -111,10 +112,10 @@ mod tests {
             bytes: PEPPER,
         }];
         let grant = Grant {
-            credential_id: "credential",
-            environment: "test",
-            library_id: "library",
-            actions: &[Action::Create],
+            credential_id: "credential".into(),
+            environment: "test".into(),
+            library_id: "library".into(),
+            actions: vec![Action::Create],
         };
         let check = |record: Option<&NativeRestRecord>, secret, now, grant| {
             authorize(
@@ -137,8 +138,8 @@ mod tests {
         assert_eq!(check(Some(&record), Some(SECRET), 11, Some(&grant)), unauth);
         assert_eq!(check(Some(&record), Some(SECRET), 1, None), forbidden);
         let other = Grant {
-            credential_id: "other",
-            ..grant
+            credential_id: "other".into(),
+            ..grant.clone()
         };
         let wrong_grant = check(Some(&record), Some(SECRET), 1, Some(&other));
         record.scopes.clear();
@@ -156,10 +157,10 @@ mod tests {
             bytes: PEPPER,
         }];
         let grant = Grant {
-            credential_id: "credential",
-            environment: "test",
-            library_id: "library",
-            actions: &[Action::Status],
+            credential_id: "credential".into(),
+            environment: "test".into(),
+            library_id: "library".into(),
+            actions: vec![Action::Status],
         };
         let job = Job {
             id: "job",
