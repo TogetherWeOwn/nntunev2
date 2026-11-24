@@ -1,6 +1,6 @@
 use super::*;
 use nntune_stream::{enrolled_playback::route::serve, play_route::PlayRouteRequest};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 #[path = "../fixtures/private_enrolled_source.rs"]
 mod fixture;
@@ -26,6 +26,7 @@ async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
             trace_id: None,
         };
         let output = RefCell::new(Vec::new());
+        let aborted = Cell::new(false);
         let mut status = 0;
         let mut report = None;
         let outcome = serve(
@@ -42,7 +43,7 @@ async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
                     _ => FLAC.len(),
                 };
                 assert_eq!(head.len, len as u64);
-                Ok((status != 416).then_some(Writer(&output, case.fault)))
+                Ok((status != 416).then_some(Writer(&output, case.fault, &aborted)))
             },
             |interval| report = Some(interval),
         )
@@ -54,6 +55,10 @@ async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
             case.fault
         );
         assert_eq!(status, case.response_status());
+        assert_eq!(
+            aborted.get(),
+            matches!(case.fault, Fault::Writer | Fault::ExpiredAtWrite)
+        );
         let slice = case.delivered;
         assert_eq!(output.into_inner(), FLAC[slice.clone()]);
         assert_eq!(

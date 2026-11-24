@@ -233,7 +233,11 @@ fn reply(version: &str, bytes: Vec<u8>) -> S3GetReply<BodyBytes> {
     }
 }
 
-pub(super) struct Writer<'a>(pub(super) &'a RefCell<Vec<u8>>, pub(super) Fault);
+pub(super) struct Writer<'a>(
+    pub(super) &'a RefCell<Vec<u8>>,
+    pub(super) Fault,
+    pub(super) &'a Cell<bool>,
+);
 impl OriginalWriter for Writer<'_> {
     fn poll_cancel(&mut self, _: &mut Context<'_>) -> Poll<SourceError> {
         Poll::Pending
@@ -252,5 +256,7 @@ impl OriginalWriter for Writer<'_> {
     fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
         Poll::Ready(Ok(()))
     }
-    fn abort(&mut self) {}
+    fn abort(&mut self) {
+        self.2.set(true);
+    }
 }
