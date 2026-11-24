@@ -65,6 +65,14 @@ for (const [role, enabled] of [
 		await page.exposeFunction('queueFixture', () => { requests++; return queuePage([]); });
 		await openScreens(page, ingestOrigin, role, enabled);
 		await expect(page.getByRole('heading', { name: 'Page not found' })).toBeVisible();
+		await page.evaluate(async () => {
+			document.documentElement.dataset.fixtureDocument = 'original';
+			window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
+			window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+			await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+		});
+		await expect(page.locator('html')).toHaveAttribute('data-fixture-document', 'original');
+		await expect(page.getByRole('heading', { name: 'Page not found' })).toBeVisible();
 		await expect(page.getByRole('navigation', { name: 'Catalogue ingest' })).toHaveCount(0);
 		await expect(page.getByLabel('FLAC files')).toHaveCount(0);
 		expect(requests).toBe(0);
@@ -283,9 +291,11 @@ test('a page hidden during detail aborts the old request and cached restore relo
 	await expect(page.getByText('pending-review', { exact: false })).toHaveCount(0);
 
 	await page.evaluate(() => {
+		document.documentElement.dataset.fixtureDocument = 'original';
 		window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
 	});
 	await expect(page.getByRole('heading', { name: 'Catalogue ingest' })).toBeVisible();
+	await expect(page.locator('html')).not.toHaveAttribute('data-fixture-document', 'original');
 	await expect(page.getByText('0 jobs on this page.')).toBeVisible();
 	await expect(page.getByText('pending-review', { exact: false })).toHaveCount(0);
 	expect(queueReads).toBe(2);
