@@ -1003,7 +1003,7 @@ jobs:
   post-deploy-e2e:
     name: post-deploy-e2e
     needs: [staging-web, staging-api]
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'push' && vars.PRIVATE_MUSIC_STAGING_JOURNEY != 'true' }}
     permissions:
       contents: read
     uses: $/.github/workflows/e2e-staging.yml
@@ -1029,16 +1029,16 @@ jobs:
       # No NZB fixture secrets are passed: the staging real-NZB leg is
       # retired under the CC0-only fixture rule (see e2e-staging.yml).
 
-  # Separate from paid-journey and production admission evidence. The main
-  # staging concurrency lock holds for the entire private qualification.
+  # The main staging concurrency lock holds for the private qualification.
+  # This job produces its own verdict and an armed failure fails the deploy run.
   post-deploy-private-music:
+    name: post-deploy private music journey
     needs: [staging-web, staging-api]
     if: ${{ github.event_name == 'push' && vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment:
       name: staging
-      deployment: false
     steps:
       - name: Require this run's API deployment
         env:

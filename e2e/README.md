@@ -226,23 +226,28 @@ existing bound roots.
 
 The `post-deploy-private-music` job is an explicit staging opt-in in the
 same workflow and concurrency group as the staging deploy. Keep
-`PRIVATE_MUSIC_STAGING_JOURNEY` unset until the protected upload schema,
-dedicated versioned S3 path, MusicBrainz mirror and serving bindings are
-qualified. Before arming, publish the two original [14-second FLAC
+the repository variable `PRIVATE_MUSIC_STAGING_JOURNEY` unset until the
+protected upload schema, dedicated versioned S3 path, MusicBrainz mirror
+and serving bindings are qualified. Before arming, publish the two original [14-second FLAC
 fixtures](../fixtures/synthetic-flac/private-staging/manifest.json) through
 the admin upload and publish path and retain the version pins separately.
 Set the staging Environment secret `PRIVATE_MUSIC_STAGE_FIXTURE` with the
 unredeemed `example.test` recipient `email`, its `inviteCode`, the cohort's
 `expiresAt` in Unix seconds, and the two `{ sha256, trackId }` `publications`
-from that path. Arrange for the job to start within eight minutes of the
-cutoff. Remove the arm and the single-use fixture secret after the run.
+from that path. Configure `PRIVATE_LISTENING_COHORT` for this recipient
+using the [private listening runbook](../docs/ops.md#private-listening-qualification).
+Arrange for the job to start within eight minutes of the cutoff. The armed
+push runs the private journey instead of the ordinary journey, so it cannot
+provide the ordinary journey gate required for production admission. Remove
+the arm, cohort setting and single-use fixture secret after the run.
 
 The runner checks both serving build identities before and after the journey,
 matches an authorized nonzero byte range against the checked-in FLAC, and
 tests the same session through the cohort deadline. That deadline proves
 expiry, with invite-removal revocation requiring a separate policy change.
-Retain the job URL with the admin publication receipts and storage readback
-when qualifying the encrypted path.
+Keep the job URL, admin publication receipts, versioned storage readback
+and Stream deployment identity together when qualifying the encrypted path.
+The in-browser runner pins the web and API builds.
 
 ## Run in GitHub Actions
 

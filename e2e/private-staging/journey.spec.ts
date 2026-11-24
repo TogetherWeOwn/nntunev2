@@ -130,7 +130,8 @@ test('private staging invite serves curated audio and refuses access at cutoff',
   const rows = page.getByTestId(PRIVATE_MUSIC.library.item);
   const idsOf = (items: Locator, attr: string) => items.evaluateAll((elements, name) =>
     elements.flatMap((element) => element.getAttribute(name) ?? []), attr);
-  const { play, heartbeat } = await check('curated playback, byte range, seek, queue and video posture', async () => {
+  const rangeHeaders = { ...access, Range: 'bytes=65536-69631', 'Sec-Fetch-Site': 'same-origin' };
+  const { play, heartbeat, mediaUrl } = await check('curated playback, byte range, seek, queue and video posture', async () => {
     for (const item of fixture.publications) {
       await expect(rows.and(page.locator(`[data-id="${item.trackId}"]`))).toBeVisible();
     }
@@ -153,7 +154,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     }
     const digest = fixture.publications.find((item) => item.trackId === firstTrackId)?.sha256;
     const original = inputs.find((item) => item.sha256 === digest)!.body;
-    const range = await apiGet(page.request, source.href, { ...access, Range: 'bytes=65536-69631', 'Sec-Fetch-Site': 'same-origin' }, 'private-range');
+    const range = await apiGet(page.request, source.href, rangeHeaders, 'private-range');
     expect(range.status()).toBe(206);
     const headers = range.headers();
     expect(headers['content-type']).toBe('audio/flac');
@@ -192,7 +193,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     await expect(page).toHaveURL(`${ORIGIN}/now-playing`);
     await expect(page.getByRole('tab', { name: 'Music Video' })).toHaveCount(0);
     await expect(page.locator('iframe, video')).toHaveCount(0);
-    return { play, heartbeat };
+    return { play, heartbeat, mediaUrl: source.href };
   });
 
   await check('same-session refusal at the configured cohort cutoff', async () => {
@@ -202,6 +203,9 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const revokedLibrary = await getLibrary();
     const revokedPlay = (await post(page.request, PRIVATE_MUSIC.player.plays, play)).status;
     const revokedHeartbeat = (await post(page.request, PRIVATE_MUSIC.player.heartbeat, heartbeat)).status;
+    const range = await apiGet(page.request, mediaUrl, rangeHeaders, 'private-range-cutoff');
+    expect([401, 403, 404]).toContain(range.status());
+    await readApiBody(range, mediaUrl, 'private-range-cutoff');
     await page.goto(`${ORIGIN}${PRIVATE_MUSIC.library.path}`);
     await expect(page.getByText(PRIVATE_MUSIC.library.forbidden, { exact: true })).toBeVisible();
     const remainingCuratedRows = (await idsOf(rows, PRIVATE_MUSIC.library.id))
