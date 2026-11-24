@@ -53,9 +53,9 @@ DECLARE
     found_row boolean;
     probes text[] := ARRAY[]::text[];
     probe text;
-    role_id oid := current_user::regrole;
+    role_id oid := (SELECT oid FROM pg_roles WHERE rolname = current_user);
 BEGIN
-    IF current_database() <> '{plan.launch}'
+    IF pg_is_in_recovery() OR current_database() <> '{plan.launch}'
         OR session_user <> '{plan.reader_role}' OR current_user <> '{plan.reader_role}'
         OR NOT EXISTS (
             SELECT FROM pg_database WHERE datname = current_database()
@@ -68,6 +68,12 @@ BEGIN
         OR EXISTS (SELECT FROM pg_auth_members WHERE member = role_id)
         OR has_database_privilege(current_database(), 'CREATE,TEMP,CONNECT WITH GRANT OPTION')
         OR NOT has_table_privilege('pg_largeobject_metadata', 'SELECT')
+        OR EXISTS (
+            SELECT FROM pg_largeobject_metadata l
+            LEFT JOIN LATERAL aclexplode(l.lomacl) a ON true
+            WHERE l.lomowner = role_id
+              OR (a.grantee IN (0, role_id) AND (a.privilege_type = 'UPDATE' OR a.is_grantable))
+        )
         OR EXISTS (
             SELECT FROM pg_namespace
             WHERE nspowner = role_id OR has_schema_privilege(oid, 'CREATE,USAGE WITH GRANT OPTION')

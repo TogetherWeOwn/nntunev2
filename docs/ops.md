@@ -1270,33 +1270,24 @@ the isolated candidate. Post-watch and cancellation need separate admission.
 
 ### First private release handoff
 
-Record one exact candidate SHA with its required checks, PR reviews,
-admitted staging run and attempt, web and API build identities, and
-same-run health and private listening journey. Pin the maintenance module
-SHA-256 from that checkout separately. Record its isolated staging response
-`503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex`, and keep its
-production Worker, seed version and deployment IDs with the rollback
-custody record. Before actual seed, resolve preview exposure and ambiguous
-settings or inventory responses. Keep one production Worker writer through
-the protected readback and close the seed window after verification.
+Record the exact SHA, checks, reviews, admitted staging attempt, both build
+identities, health and private listening journey. Pin the maintenance module
+SHA-256 and its isolated `503` with `Cache-Control: no-store` and
+`X-Robots-Tag: noindex`. Resolve preview exposure and ambiguous inventory
+before seeding. Keep one writer through readback, record the Worker, seed
+version and deployment IDs, and close the seed window.
 
-Carry the [dedicated database baseline](production-database-bootstrap.md#protected-baseline)
-run and attempt, target identity and migration manifest digest into the same
-handoff. On `empty`, take and verify the provider snapshot before the first
-schema change. On `rows-present`, require the fresh provider backup,
-temporary restore and exact undo rehearsal for the proposed data or schema
-change. On refusal, resolve the target or visibility gap before proceeding.
+Record the [database baseline](production-database-bootstrap.md#protected-baseline)
+attempt, target and migration manifest digest. On `empty`, verify the provider
+snapshot before the first schema change. On `rows-present`, rehearse the exact
+undo on a temporary restore from a fresh provider backup. Resolve any refusal.
 
-To switch off the initial release, close admission and restore the pinned
-maintenance allocation through the protected rollback path. Keep the
-allow-list and deny rules in effect. Verify the maintenance response on the
-private web hostname, and verify denial on the API and media routes without
-an active invite. If the change enabled new API or media entry points, shut
-them off through their separately admitted protected controls. Preserve
-the database and snapshot. The final-smoke workflow covers the immediate
-web failure case. Before promotion, record the exact authorized recovery
-entry point for watch regressions and cancellation, plus the operator,
-rollback triggers and 30-minute health and error watch.
+To switch off, close admission, restore the pinned maintenance allocation
+through protected rollback and keep Access denies in force. Close newly
+enabled API and media routes through their protected controls. Verify the
+maintenance response and private denial. Preserve the database and snapshot.
+Before promotion, record the protected recovery entry point for cancellation
+and watch regressions, the operator, rollback triggers and 30-minute watch.
 
 ### Production promotion publishes a CalVer release
 

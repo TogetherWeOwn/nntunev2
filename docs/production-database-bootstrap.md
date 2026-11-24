@@ -221,35 +221,27 @@ attempted creation is uncertain. The caller stops without retry or deletion.
 ### Protected baseline
 
 The [baseline workflow](../.github/workflows/deploy-database-baseline.yml)
-shares setup's concurrency group and uses a separate `production-db-baseline`
-Environment. Apply the same main-only, prevent-self-review, no-bypass and
-readback rules. Fail the window if any baseline secret is inherited. Dispatch
-once from the approved main SHA with zero inputs. Set `BASELINE_ENABLED` to
-`true` privately for the pending attempt, with its `BASELINE_SHA`,
+shares setup's lock and uses its own `production-db-baseline` Environment.
+Apply the same protection and readback rules. Dispatch from the approved main
+SHA with zero inputs. The pending attempt requires `BASELINE_ENABLED=true`,
+`BASELINE_SHA`,
 `BASELINE_RUN_ID`, `BASELINE_EXPIRY`, `BASELINE_PLAN_B64`,
-`BASELINE_PLAN_DIGEST` and `BASELINE_READER_PASSWORD`. Remove the pins and
-credential after the run and verify reader retirement and session closure.
+`BASELINE_PLAN_DIGEST` and `BASELINE_READER_PASSWORD` in that Environment.
+Remove them after use and verify reader retirement and session closure.
 
 The version 1 plan contains exactly `version`, `host`, `port`, `ca_pem`,
-`branch_id`, `launch`, `database_oid` and `reader_role`. Record the exact
-database name and OID from fenced provisioning or an independently
-authenticated readiness record. Bind them to the approved provider branch,
-direct endpoint and certificate before approving the plan digest. Use a
-dedicated login with no role memberships and grant launch CONNECT, schema
-USAGE and direct SELECT on all physical tables, partitions and materialized
-views. Prove that the reader has no write, ownership or role-switch path.
-Require a separately scoped SQL custodian to create or grant that login.
-Keep schema, grant and writer changes quiesced through the baseline.
+`branch_id`, `launch`, `database_oid` and `reader_role`. Bind the independently
+verified database name and OID to the provider branch, primary endpoint and CA.
+A scoped SQL custodian supplies a reader with launch CONNECT, schema USAGE,
+direct SELECT on all physical relations and no write, ownership or role-switch
+path. Keep schema, grant and writer changes quiesced through the read.
 
-The caller uses the routed username over verified TLS. In one read-only
-repeatable-read transaction it checks name, OID, SQL identity and
-permissions. It examines at most 256 user relations and reads only row
-existence. It scans permanent and unlogged user relations plus large-object
-metadata, leaves views unexpanded and makes no sequence calls. A foreign
-table, active table RLS, unsupported storage or incomplete physical-relation
-visibility refuses the verdict. Migration ledger and reference rows count
-as existing data. The only outputs are `empty`, `rows-present` and `refused`.
-Keep the job URL and attempt with the private target record.
+One TLS-verified, read-only repeatable-read transaction checks primary status,
+name, OID, identity and permissions. It checks row existence across at most
+256 user relations plus large-object metadata, without expanding views or
+calling sequences. Foreign tables, RLS on physical tables, unsupported storage
+and incomplete visibility refuse. Ledger and reference rows count as data.
+Record the job URL and attempt with its `empty`, `rows-present` or `refused` verdict.
 
 ### Setup role custody and lifecycle
 
