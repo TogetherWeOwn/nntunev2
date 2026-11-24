@@ -240,15 +240,32 @@ async fn session_completion_requires_checkpoint_full_manifest_and_head() {
         plaintext_len: 2,
         ..context
     };
-    let mut invalid_configuration = EnvelopeContext { ..context };
-    invalid_configuration.identities[5][6] = 0;
-    let invalid_metadata = [wrong_header, wrong_length, invalid_configuration];
-    for wrong_context in wrong_scopes.into_iter().chain(invalid_metadata) {
+    let rejects_context = |wrong_context: &EnvelopeContext, binding| {
         assert!(matches!(
-            SessionCompletion::prepare(binding, &wrong_context, receipts(), &checkpoint),
+            SessionCompletion::prepare(
+                binding,
+                wrong_context,
+                receipts(),
+                &ResumeCheckpoint {
+                    binding,
+                    ..checkpoint
+                },
+            ),
             Err(PrepareError::EnvelopeContextMismatch)
         ));
+    };
+    for wrong_context in wrong_scopes.into_iter().chain([wrong_header, wrong_length]) {
+        rejects_context(&wrong_context, binding);
     }
+    let mut invalid_configuration = EnvelopeContext { ..context };
+    invalid_configuration.identities[5][6] = 0;
+    rejects_context(
+        &invalid_configuration,
+        ResumeBinding {
+            configuration: invalid_configuration.identities[5],
+            ..binding
+        },
+    );
     for wrong_target in [
         UploadTarget {
             key: "media/efefefefefef40ef80efefefefefefef/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd",
