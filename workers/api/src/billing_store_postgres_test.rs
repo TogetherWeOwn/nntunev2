@@ -1,5 +1,8 @@
 use super::{MirrorBinding, PgStore, StoreError};
-use crate::billing_reconcile::{PaidInvoiceRow, ReconcileOutcome, ReconciledRow};
+use crate::billing_reconcile::{
+    reconcile_exact_target, LiveRow, PaidInvoiceRow, PriceBinding, ReconcileInput,
+    ReconcileOutcome, ReconciledRow, RemoteSubscription,
+};
 use serde_json::{json, Value};
 use std::{cell::RefCell, rc::Rc, time::Duration};
 use tokio_postgres::{Client, NoTls};
@@ -14,6 +17,19 @@ const INVOICE: &str = "in_native_billing";
 const NOW: i64 = 1_786_032_000;
 
 async fn dispatch(user: &str, outcome: &ReconcileOutcome) -> Result<(), StoreError> {
+    dispatch_with(user, outcome, Writer::Owned).await
+}
+
+enum Writer {
+    Owned,
+    Release,
+}
+
+async fn dispatch_with(
+    user: &str,
+    outcome: &ReconcileOutcome,
+    writer: Writer,
+) -> Result<(), StoreError> {
     let driver = Rc::new(RefCell::new(None));
     let driver_slot = Rc::clone(&driver);
     let store = PgStore {
@@ -34,9 +50,14 @@ async fn dispatch(user: &str, outcome: &ReconcileOutcome) -> Result<(), StoreErr
         })),
         test_mirror: None,
     };
-    let result = store
-        .store_reconcile_owned(user.to_owned(), outcome.clone())
-        .await;
+    let result = match writer {
+        Writer::Owned => {
+            store
+                .store_reconcile_owned(user.to_owned(), outcome.clone())
+                .await
+        }
+        Writer::Release => super::Store::store_reconcile_outcome(&store, user, outcome).await,
+    };
     // Join before discarding the store: the call must have released its client.
     let driver = driver.take().expect("store must acquire one connection");
     tokio::time::timeout(Duration::from_secs(5), driver)
@@ -179,6 +200,235 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
         .await
         .expect("replay against owned target");
     assert_eq!(snapshot(&observer).await, committed);
+
+    check_legacy_mixed_plan_history(&observer, seed).await;
     drop(observer);
     driver.await.unwrap().unwrap();
+}
+
+async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileOutcome) {
+    const TARGET: &str = "sub_native_mixed_plan";
+    const CUSTOMER: &str = "cus_native_mixed_plan";
+    const ITEM: &str = "si_native_mixed_plan";
+    const LEGACY: &str = "in_native_mixed_plan";
+    const FRESH: &str = "in_native_mixed_plan_fresh";
+    const PLUS: &str = "price_native_mixed_plus";
+    const PRO: &str = "price_native_mixed_pro";
+    seed.row.stripe_subscription_id = TARGET.into();
+    seed.row.stripe_customer_id = CUSTOMER.into();
+    seed.row.stripe_item_id = ITEM.into();
+    seed.row.stripe_price_id = PLUS.into();
+    seed.row.current_period_end_unix = Some(NOW + 15);
+    seed.row.paid_through_unix = Some(NOW + 15);
+    seed.row.paid_invoice_id = Some(LEGACY.into());
+    dispatch(OTHER_USER, &seed)
+        .await
+        .expect("create mixed-plan target");
+
+    let line = |id, price, start: i64, end: i64| {
+        json!({
+            "id": id, "amount": 400, "price": price, "currency": "usd",
+            "period": {"start": NOW + start, "end": NOW + end}
+        })
+    };
+    let invoice = |id, amount_paid, lines| {
+        serde_json::from_value(json!({
+            "id": id, "customer": CUSTOMER, "subscription": TARGET, "status": "paid",
+            "amount_paid": amount_paid, "currency": "usd", "status_transitions": {"paid_at": NOW},
+            "lines": {"data": lines, "has_more": false}
+        }))
+        .unwrap()
+    };
+    let remote = RemoteSubscription {
+        subscription: serde_json::from_value(json!({
+            "id": TARGET, "customer": CUSTOMER, "status": "active", "current_period_end": NOW + 60,
+            "items": {"data": [{"id": ITEM, "price": PLUS}]}
+        }))
+        .unwrap(),
+        invoices: vec![
+            invoice(FRESH, 400, vec![line("fresh_plus", PLUS, 15, 60)]),
+            invoice(
+                LEGACY,
+                1200,
+                vec![
+                    line("early_pro", PRO, 1, 10),
+                    line("interleaved_plus", PLUS, 0, 15),
+                    line("late_pro", PRO, 10, 30),
+                ],
+            ),
+        ],
+    };
+    let local = LiveRow {
+        stripe_subscription_id: TARGET.into(),
+        stripe_customer_id: CUSTOMER.into(),
+        stripe_item_id: ITEM.into(),
+        stripe_price_id: PLUS.into(),
+        plan_id: "plus".into(),
+        status: "active".into(),
+        paid_through_unix: seed.row.paid_through_unix,
+        paid_invoice_id: seed.row.paid_invoice_id.clone(),
+        grace_until_unix: None,
+    };
+    let fold = |live| {
+        reconcile_exact_target(
+            TARGET,
+            ReconcileInput {
+                stripe_customer_id: Some(CUSTOMER.into()),
+                live: Some(live),
+                bindings: [(PLUS, "plus"), (PRO, "pro")]
+                    .map(|(price, plan)| PriceBinding {
+                        price_id: price.into(),
+                        plan_id: plan.into(),
+                        selectable: true,
+                        livemode: false,
+                    })
+                    .into(),
+            },
+            &remote,
+            NOW,
+        )
+        .unwrap()
+    };
+    let fresh = fold(local.clone());
+    assert!(!fresh.explicit_stale && fresh.fail_closed.is_none());
+    assert_eq!(fresh.row.paid_invoice_id.as_deref(), Some(FRESH));
+    assert_eq!(fresh.row.paid_through_unix, Some(NOW + 60));
+    assert_eq!(fresh.history[0].stripe_invoice_id, FRESH);
+    let current = &fresh.history[1];
+    assert_eq!(current.stripe_invoice_id, LEGACY);
+    assert_eq!(current.plan_id, "pro");
+    assert_eq!(
+        (current.period_start_unix, current.period_end_unix),
+        (NOW + 1, NOW + 30)
+    );
+    assert_eq!(
+        current.covered_periods,
+        [(NOW, NOW + 15), (NOW + 1, NOW + 10), (NOW + 10, NOW + 30)]
+    );
+
+    observer
+        .execute(
+            "INSERT INTO public.paid_invoice_history (
+            stripe_invoice_id, user_id, stripe_subscription_id, plan_id, period_start, period_end,
+            amount_cents, currency, paid_at
+         ) VALUES ($1, $2, $3, 'plus', to_timestamp($4::bigint), to_timestamp($5::bigint),
+                   $6, $7, to_timestamp($8::bigint))",
+            &[
+                &LEGACY,
+                &OTHER_USER,
+                &TARGET,
+                &NOW,
+                &(NOW + 15),
+                &current.amount_cents,
+                &current.currency,
+                &current.paid_at_unix,
+            ],
+        )
+        .await
+        .unwrap();
+    // #902 only counted the item plan. #926 lost the first Pro start
+    // when Plus temporarily held the latest end.
+    for (plan, start, end) in [("plus", NOW, NOW + 15), ("pro", NOW + 10, NOW + 30)] {
+        assert_eq!(
+            observer
+                .execute(
+                    "UPDATE public.paid_invoice_history SET plan_id = $2,
+             period_start = to_timestamp($3::bigint), period_end = to_timestamp($4::bigint)
+             WHERE stripe_invoice_id = $1",
+                    &[&LEGACY, &plan, &start, &end],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let before = snapshot(observer).await;
+        assert!(
+            dispatch(OTHER_USER, &fresh).await.is_err(),
+            "{plan} {start} {end}"
+        );
+        assert_eq!(
+            snapshot(observer).await,
+            before,
+            "history conflict must roll back the whole fold"
+        );
+    }
+
+    let coverage_matches = "SELECT covered_periods = tstzmultirange(tstzrange(
+             to_timestamp($2::bigint), to_timestamp($3::bigint), '[)'))
+         FROM public.paid_invoice_history WHERE stripe_invoice_id = $1";
+    let mut legacy_replay = fold(local.clone());
+    legacy_replay.explicit_stale = true;
+    legacy_replay
+        .history
+        .retain(|row| row.stripe_invoice_id == LEGACY);
+    assert_eq!(legacy_replay.history.len(), 1);
+    dispatch_with(OTHER_USER, &legacy_replay, Writer::Release)
+        .await
+        .expect("release writer hydrates a nonempty legacy invoice batch");
+    assert_eq!(
+        observer
+            .query_one(coverage_matches, &[&LEGACY, &NOW, &(NOW + 30)])
+            .await
+            .unwrap()
+            .get::<_, Option<bool>>(0),
+        Some(true)
+    );
+    let hydrated = snapshot(observer).await;
+    assert!(dispatch(OTHER_USER, &fresh).await.is_err());
+    assert_eq!(snapshot(observer).await, hydrated);
+
+    assert_eq!(observer.execute(
+        "UPDATE public.paid_invoice_history SET plan_id = $2, period_start = to_timestamp($3::bigint),
+         period_end = to_timestamp($4::bigint), covered_periods = NULL WHERE stripe_invoice_id = $1",
+        &[&LEGACY, &current.plan_id, &current.period_start_unix, &current.period_end_unix],
+    ).await.unwrap(), 1);
+    dispatch(OTHER_USER, &fresh)
+        .await
+        .expect("matching mixed-plan history hydrates");
+    let committed = snapshot(observer).await;
+    let target = committed
+        .0
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["stripe_subscription_id"] == TARGET)
+        .unwrap();
+    assert_eq!(target["paid_invoice_id"], FRESH);
+    let paid_through_unix: Option<i64> = observer
+        .query_one(
+            "SELECT extract(epoch FROM paid_through_at)::bigint FROM public.subscriptions
+         WHERE user_id = $1 AND stripe_subscription_id = $2",
+            &[&OTHER_USER, &TARGET],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(paid_through_unix, Some(NOW + 60));
+    assert!(committed
+        .1
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["stripe_invoice_id"] == FRESH));
+    assert_eq!(
+        observer
+            .query_one(coverage_matches, &[&LEGACY, &NOW, &(NOW + 30)],)
+            .await
+            .unwrap()
+            .get::<_, Option<bool>>(0),
+        Some(true)
+    );
+    let replay = fold(LiveRow {
+        paid_through_unix,
+        paid_invoice_id: target["paid_invoice_id"].as_str().map(str::to_owned),
+        ..local
+    });
+    assert!(replay
+        .history
+        .iter()
+        .any(|row| row.stripe_invoice_id == LEGACY));
+    dispatch(OTHER_USER, &replay)
+        .await
+        .expect("matching mixed-plan replay");
+    assert_eq!(snapshot(observer).await, committed);
 }
