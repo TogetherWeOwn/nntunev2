@@ -866,6 +866,8 @@ pub(crate) mod subsonic_pg_page;
 pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
 pub use subsonic_pg::load_staging_account;
 
+#[path = "private_browser_custody.rs"]
+mod private_browser_custody;
 #[path = "private_browser_worker.rs"]
 mod private_browser_worker;
 
@@ -8574,6 +8576,11 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     let served_method = request.method.clone();
     let served_path = served_display_path(&request.path);
+    if let Some(response) =
+        private_browser_custody::dispatch(&env, ctx.store, &config, &request, &collected).await
+    {
+        return response;
+    }
     if let Some(result) = relay_media(&ctx, &request, &collected, &headers_map, async |get| {
         let headers = Headers::new();
         for (name, value) in get.headers() {

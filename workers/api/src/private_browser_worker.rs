@@ -12,7 +12,7 @@ pub(super) fn enabled(env: &Env) -> bool {
         .is_some_and(|value| value.to_string() == "true")
 }
 
-fn hex<const N: usize>(raw: &str) -> Option<[u8; N]> {
+pub(super) fn hex<const N: usize>(raw: &str) -> Option<[u8; N]> {
     if raw.len() != 2 * N || !raw.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
@@ -28,7 +28,7 @@ pub(super) struct Settings {
     library: [u8; 16],
     provider: [u8; 16],
     bucket: String,
-    root_version: [u8; 16],
+    pub(super) root_version: [u8; 16],
 }
 
 impl Settings {

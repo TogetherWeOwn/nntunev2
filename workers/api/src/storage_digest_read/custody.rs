@@ -26,6 +26,7 @@ pub struct ResolvedPlayback {
     pub manifest: StoredManifest,
     pub context: EnvelopeContext,
     pub record: [u8; 230],
+    pub ordered_page_hashes: Vec<[u8; 32]>,
 }
 
 const CUSTODY_TIMEOUT_MS: u64 = 4_000;
@@ -90,7 +91,8 @@ pub async fn resolve_custody(
             .into_iter()
             .map(|hash| hash.try_into().map_err(|_| StoreError))
             .collect::<Result<Vec<_>, _>>()?;
-        let Some(manifest) = StoredManifest::from_committed_storage(&pins, context.header, hashes)
+        let Some(manifest) =
+            StoredManifest::from_committed_storage(&pins, context.header, hashes.clone())
         else {
             return Ok(None);
         };
@@ -108,6 +110,7 @@ pub async fn resolve_custody(
             manifest,
             context,
             record,
+            ordered_page_hashes: hashes,
         }))
     };
     with_deadline(operation, CUSTODY_TIMEOUT_MS, StoreError).await
