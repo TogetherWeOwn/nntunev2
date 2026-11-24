@@ -322,6 +322,11 @@ async fn prove_attempt(
     };
     let sid = fresh_id().unwrap();
     let fingerprint = request.fingerprint().unwrap();
+    let idempotency_key = if fault.is_none() {
+        crate::handlers::tests::private_trial_fixture::JOB
+    } else {
+        "fixture-key"
+    };
     let reserve = include_str!("../../src/ingest_session_reserve.sql");
     writer
         .batch_execute(&format!(
@@ -332,7 +337,7 @@ async fn prove_attempt(
         .unwrap();
     let inserted: String = writer.query_one(
         "SELECT pg_temp.reserve($1::text::uuid, $2::text::uuid, $3, $4, $5, $6::text::uuid)::text",
-        &[&env, &lib, &OWNER, &"fixture-key", &fingerprint.bytes().as_slice(), &sid],
+        &[&env, &lib, &OWNER, &idempotency_key, &fingerprint.bytes().as_slice(), &sid],
     ).await.unwrap().get(0);
     assert_eq!(inserted.replace('-', ""), sid);
     let job = Job {

@@ -21,7 +21,7 @@ const RECIPIENT: &str = "synthetic-trial-listener";
 const OUTSIDER: &str = "synthetic-trial-outsider";
 const RELEASE: &str = "ab340000-0000-4000-8000-000000000000";
 const QUERY: &str = "Trial synthetic FLAC";
-const JOB: &str = "synthetic-trial-publication";
+pub(crate) const JOB: &str = "synthetic-trial-publication";
 const ORIGIN: &str = "https://staging.nntune.com";
 const DB: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
 
@@ -443,4 +443,114 @@ pub(crate) async fn verify_publication(
         .unwrap();
     assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
     assert_eq!(handle(&ctx, &library).await.status, 403);
+
+    verify_cleanup(observer, &mut publication, prepared, track, now).await;
+}
+
+async fn verify_cleanup(
+    observer: &Client,
+    publication: &mut Client,
+    prepared: PreparedUpload<'_>,
+    track: &str,
+    now: u64,
+) {
+    use private_trial::{
+        cleanup::{cleanup, Fixture},
+        TrialError,
+    };
+    let scope = prepared.scope;
+    let object = prepared.intent.identities[2];
+    let object_id = uuid_text(object);
+    let fixture = Fixture {
+        environment: scope.environment,
+        library: scope.library,
+        object,
+        track,
+        session: scope.session,
+        job: JOB,
+        issuer: scope.principal,
+        invite: 931,
+        bucket: "fixture-bucket",
+        cutoff: now as i64 - 1,
+    };
+    let retained = async |future: bool| {
+        observer.execute(
+            "UPDATE public.storage_validated_digest_winners
+             SET retain_until = clock_timestamp() - interval '1 second',
+                 read_until = CASE WHEN $2 THEN clock_timestamp() + interval '5 minutes' ELSE '-infinity' END
+             WHERE object_id = $1::text::uuid",
+            &[&object_id, &future],
+        ).await.unwrap()
+    };
+    assert_eq!(retained(true).await, 1);
+    let unexpected =
+        async |_: &str, _: &str, _: &str| panic!("ineligible cleanup reached the provider");
+    assert!(!cleanup(publication, &fixture, unexpected).await.unwrap());
+    assert_eq!(retained(false).await, 1);
+    let wrong = Fixture {
+        invite: 932,
+        ..fixture
+    };
+    assert!(!cleanup(publication, &wrong, unexpected).await.unwrap());
+
+    let reference_count = async || {
+        observer.query_one(
+        "SELECT count(*) FROM public.storage_validated_digest_references WHERE object_id <> $1::text::uuid",
+        &[&object_id],
+    ).await.unwrap().get::<_, i64>(0)
+    };
+    let other_references = reference_count().await;
+    let generation = uuid_text(scope.seal);
+    let map = uuid_text(prepared.intent.map_id);
+    let media = format!("media/{object_id}/{generation}");
+    let page = format!("media-digests/{object_id}/{generation}/{map}/00000000");
+    let mut versions = std::collections::BTreeSet::from([
+        (media.clone(), "media-fixture-version".to_owned()),
+        (media.clone(), "unrelated-fixture-version".to_owned()),
+        (page.clone(), "page-fixture-version".to_owned()),
+    ]);
+    let interrupted = cleanup(
+        publication,
+        &fixture,
+        async |bucket: &str, key: &str, version: &str| {
+            assert_eq!(bucket, fixture.bucket);
+            if key == page && version == "page-fixture-version" {
+                return Err(TrialError::Unconfirmed);
+            }
+            assert_eq!((key, version), (media.as_str(), "media-fixture-version"));
+            assert!(versions.remove(&(key.to_owned(), version.to_owned())));
+            Ok(())
+        },
+    )
+    .await;
+    assert_eq!(interrupted, Err(TrialError::Unconfirmed));
+    assert!(cleanup(
+        publication,
+        &fixture,
+        async |bucket: &str, key: &str, version: &str| {
+            assert_eq!(bucket, fixture.bucket);
+            assert!(
+                (key, version) == (media.as_str(), "media-fixture-version")
+                    || (key, version) == (page.as_str(), "page-fixture-version")
+            );
+            versions.remove(&(key.to_owned(), version.to_owned()));
+            Ok(())
+        }
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        versions,
+        std::collections::BTreeSet::from([(media, "unrelated-fixture-version".to_owned())])
+    );
+    assert_eq!(reference_count().await, other_references);
+    assert!(observer.query_one(
+        "SELECT deleting_at IS NOT NULL
+            AND NOT EXISTS (SELECT FROM public.private_library_admissions a WHERE a.object_id = w.object_id)
+            AND NOT EXISTS (SELECT FROM public.catalogue_s3_sources s WHERE s.object_id = w.object_id)
+            AND NOT EXISTS (SELECT FROM public.storage_validated_digest_references r WHERE r.object_id = w.object_id)
+         FROM public.storage_validated_digest_winners w WHERE w.object_id = $1::text::uuid",
+        &[&object_id],
+    ).await.unwrap().get::<_, bool>(0));
+    assert!(!cleanup(publication, &fixture, unexpected).await.unwrap());
 }
