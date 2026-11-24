@@ -67,7 +67,12 @@ pub(super) async fn receipt_retries(
     assert!(open(reader, claims, &input, wrong_scope).await.is_none());
     let before = mark_count().await;
     set_private(&input.session_id).await;
-    let browser = open(reader, claims, &input, scope).await.unwrap();
+    let started = SystemTime::now();
+    let browser = service
+        .open_browser(reader, claims, &input, scope, || started)
+        .await
+        .unwrap()
+        .unwrap();
     let original = browser.relay();
     assert_eq!(mark_count().await, before + 1);
     let grant = original.grant.token.as_str();
@@ -77,9 +82,9 @@ pub(super) async fn receipt_retries(
         .unwrap()
         .unwrap();
     let cutoff = original.lease.expires_at;
-    assert!(cutoff > claims.created_at + crate::playback::LEASE_TTL_SECS);
-    let after_native_ttl =
-        UNIX_EPOCH + Duration::from_secs(claims.created_at + crate::playback::LEASE_TTL_SECS);
+    assert_eq!(cutoff, original.lease.continuation_deadline);
+    let after_native_ttl = started + Duration::from_secs(crate::playback::LEASE_TTL_SECS + 1);
+    assert!(UNIX_EPOCH + Duration::from_secs(cutoff) > after_native_ttl);
     let retained = service
         .load_for_stream(reader, grant, scope, || after_native_ttl)
         .await
