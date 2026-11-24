@@ -53,6 +53,7 @@ async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
             "{:?}",
             case.fault
         );
+        assert_eq!(status, case.response_status());
         let slice = case.delivered;
         assert_eq!(output.into_inner(), FLAC[slice.clone()]);
         assert_eq!(

@@ -43,6 +43,16 @@ pub(super) struct Case {
     pub content_range: Option<&'static str>,
 }
 
+impl Case {
+    pub(super) fn response_status(&self) -> u16 {
+        match self.fault {
+            Fault::Writer | Fault::ExpiredAtWrite => 200,
+            Fault::None => self.status,
+            _ => 0,
+        }
+    }
+}
+
 pub(super) fn cases() -> impl Iterator<Item = Case> {
     use Fault::*;
     let len = FLAC.len();

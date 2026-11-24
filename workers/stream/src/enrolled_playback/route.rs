@@ -61,10 +61,10 @@ pub struct ResponseRange {
     pub content_range: Option<String>,
 }
 
-/// Render errors before `start` at the HTTP boundary. After `start`, the
-/// For a 416, the start callback renders the refusal and returns no writer.
-/// caller cancels this future on expiry/disconnect and its writer aborts on
-/// drop. Only the sink-acknowledged prefix is reported, including on drop.
+/// Render errors before `start` at the HTTP boundary. For a 416, the start
+/// callback renders the refusal and returns no writer. The caller cancels
+/// this future on expiry or disconnect and its writer aborts on drop.
+/// Only the sink-acknowledged prefix is reported, including on drop.
 pub async fn serve<S: PrivateSource, W: OriginalWriter>(
     request: &PlayRouteRequest,
     secret: &[u8],
@@ -147,12 +147,14 @@ pub async fn serve<S: PrivateSource, W: OriginalWriter>(
         .key()
         .strip_prefix("media/")
         .ok_or_else(unavailable)?;
-    let mut writer = start(ResponseRange {
-        status,
-        len: size,
-        content_range,
-    })?
-    .ok_or_else(ApiError::internal_error)?;
+    let mut start = Some(|| {
+        start(ResponseRange {
+            status,
+            len: size,
+            content_range,
+        })
+    });
+    let mut writer = None;
     let mut delivery = Delivery::new(size, |served| {
         report(DeliveredInterval {
             user_id: grant.user_id.clone(),
@@ -204,6 +206,10 @@ pub async fn serve<S: PrivateSource, W: OriginalWriter>(
             if !source.lease_live(&grant).await {
                 return Err(ApiError::not_found());
             }
+            if let Some(start) = start.take() {
+                writer = start()?;
+            }
+            let writer = writer.as_mut().ok_or_else(ApiError::internal_error)?;
             let mut remaining = part.as_slice();
             while !remaining.is_empty() {
                 let accepted = poll_fn(|cx| {
@@ -223,12 +229,13 @@ pub async fn serve<S: PrivateSource, W: OriginalWriter>(
             }
         }
         play.finish().map_err(|_| unavailable())?;
+        let writer = writer.as_mut().ok_or_else(ApiError::internal_error)?;
         poll_fn(|cx| writer.poll_close(cx))
             .await
             .map_err(|_| unavailable())
     }
     .await;
-    if result.is_err() {
+    if let Some(writer) = writer.as_mut().filter(|_| result.is_err()) {
         writer.abort();
     }
     result
