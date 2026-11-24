@@ -2,6 +2,7 @@
 
 use super::*;
 use std::time::Duration;
+use tokio_postgres::Client;
 use tokio_postgres::NoTls;
 
 const OBJECT: &str = "21000000-0000-4000-8000-000000000012";

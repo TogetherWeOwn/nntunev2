@@ -2,13 +2,16 @@
 
 use nntune_core::digest_read_snapshot::DigestReadSnapshot;
 use std::time::SystemTime;
-use tokio_postgres::{
-    types::{FromSql, Type},
-    Client, IsolationLevel,
+use tokio_postgres::types::{FromSql, Type};
+
+use crate::{
+    handlers::StoreError,
+    postgres::{PgConnect, PgQuery},
 };
 
-use crate::handlers::StoreError;
+pub mod custody;
 
+#[derive(PartialEq, Eq)]
 pub struct DigestReadTarget {
     pub environment: [u8; 16],
     pub library: [u8; 16],
@@ -68,7 +71,7 @@ impl CommittedDigestRead {
 /// target's authorization cutoff, or `None`. Use a fresh clock on each call;
 /// returned pins cease to be usable at `usable_until`.
 pub async fn protect_digest_read(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     target: DigestReadTarget,
     requested_until: SystemTime,
     authorize: impl AsyncFnOnce(&DigestReadTarget) -> Option<SystemTime>,
@@ -81,12 +84,7 @@ pub async fn protect_digest_read(
         return Ok(None);
     }
 
-    let tx = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await
-        .map_err(|_| StoreError)?;
+    let tx = client.read_committed().await.map_err(|_| StoreError)?;
     let rows = tx
         .query_typed(
             include_str!("storage_digest_read_lookup.sql"),

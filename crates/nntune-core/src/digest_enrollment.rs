@@ -7,6 +7,7 @@
 use crate::digest_context::context_hash;
 use crate::digest_geometry::DigestGeometry;
 use crate::digest_page::{encode_page, page_hash};
+use crate::digest_read_snapshot::DigestReadSnapshot;
 use crate::media::{FileKey, Header};
 use crate::origin_sealer::OriginSealer;
 use sha2::{Digest, Sha256};
@@ -15,8 +16,8 @@ fn invalid() -> crate::Error {
     crate::Error::Malformed("invalid digest enrollment state".into())
 }
 
-/// Complete sealer-origin evidence. Its private fields cannot be hydrated from
-/// provider bytes or caller-supplied hashes, and do not authorize serving.
+/// Complete sealer-origin evidence. Hydration requires committed custody from
+/// the trusted enrollment store. Provider bytes do not establish custody.
 ///
 /// Provider rows cannot be substituted into an existing manifest:
 /// ```compile_fail
@@ -43,6 +44,35 @@ pub struct OriginManifest {
 }
 
 impl OriginManifest {
+    /// Restore the original ordered hashes from a validated winner's immutable
+    /// enrollment rows. The caller establishes their provenance and exact map
+    /// association within the protected storage lookup.
+    pub fn from_committed_storage(
+        pins: &DigestReadSnapshot<'_>,
+        header: [u8; 48],
+        rows: Vec<[u8; 32]>,
+    ) -> Option<Self> {
+        let geometry = DigestGeometry::new(pins.plaintext_len)?;
+        if geometry.plaintext_len() == 0 || rows.len() != geometry.pages() as usize {
+            return None;
+        }
+        let identities = [
+            pins.environment_id,
+            pins.library_id,
+            pins.object_id,
+            pins.generation_id,
+            pins.provider_configuration,
+        ];
+        Some(Self {
+            geometry,
+            map_id: pins.map_id,
+            context: context_hash(&identities, geometry, &header)?,
+            header,
+            plaintext_sha256: pins.plaintext_sha256,
+            rows,
+        })
+    }
+
     /// Digest of the plaintext chunks consumed by this sealer, in order.
     /// This alone does not authorize a claim, publication, or reuse. Do not
     /// include this digest in logs or errors.

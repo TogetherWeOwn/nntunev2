@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     play_grant::IssuedGrant,
     playback::{LeaseAcquire, LeaseRow},
-    storage_digest_read::protect_digest_read,
+    storage_digest_read::{custody, protect_digest_read},
     worker_entry::acquire_playback_lease_on,
 };
 use hmac::{Hmac, KeyInit, Mac};
@@ -186,4 +186,84 @@ async fn resolves_only_the_committed_scoped_publication() {
     assert!(query(&mut reader, &signed, &pins).await.is_none());
     let renewed = receipt(track, digest, 2, exp);
     assert!(query(&mut reader, &renewed, &pins).await.is_some());
+
+    // The original publisher fixture has a genuinely sealed header and
+    // authenticated envelope, unlike the replacement's metadata-only pins.
+    let seq: i64 = writer
+        .query_one(
+            include_str!("../tests/fixtures/private_catalogue_custody.sql"),
+            &[&track],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let row = writer
+        .query_one(
+            "SELECT encode(w.plaintext_sha256, 'hex') FROM public.catalogue_s3_sources s
+         JOIN public.storage_validated_digest_winners w USING (object_id)
+         WHERE s.track_id = $1::text::uuid",
+            &[&track],
+        )
+        .await
+        .unwrap();
+    let original = receipt(track, row.get(0), 2, exp);
+    let original_pins = PublicationPins {
+        accepted_seq: seq,
+        version: "Opaque+%2F/=",
+        ..pins
+    };
+    assert!(writer
+        .query_one(
+            include_str!("../tests/fixtures/private_catalogue_attach.sql"),
+            &[&track, &deadline]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    let root = custody::PlaybackRoot {
+        version: id("root_version_id"),
+        secret: &[17; 32],
+    };
+    let load = async |db: &mut Client, bucket: &str, secret: &[u8; 32]| {
+        let resolved = query(db, &original, &original_pins).await.unwrap();
+        let locator = S3Locator::new(
+            bucket.into(),
+            resolved.locator.key().into(),
+            S3Binding::VersionId(original_pins.version.into()),
+        )
+        .unwrap();
+        let read = protect_digest_read(
+            db,
+            resolved.target,
+            deadline,
+            async |_| Some(deadline),
+            SystemTime::now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        custody::resolve_custody(
+            db,
+            read,
+            &locator,
+            &custody::PlaybackRoot { secret, ..root },
+            SystemTime::now,
+        )
+        .await
+        .unwrap()
+    };
+    assert!(load(&mut reader, "other-bucket", root.secret)
+        .await
+        .is_none());
+    assert!(load(&mut reader, original_pins.bucket, &[18; 32])
+        .await
+        .is_none());
+    let resolved = load(&mut reader, original_pins.bucket, root.secret)
+        .await
+        .unwrap();
+    assert_eq!(resolved.read.pins().media_version, original_pins.version);
+    assert_eq!(
+        resolved.manifest.plaintext_sha256(),
+        &resolved.read.target().plaintext_sha256
+    );
 }
