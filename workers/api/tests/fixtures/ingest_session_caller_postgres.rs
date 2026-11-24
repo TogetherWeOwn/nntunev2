@@ -84,8 +84,13 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         &[],
     ).await.unwrap().get::<_, bool>(0));
 
-    let [root_id, environment, library, object, seal, configuration, map] =
-        [1, 2, 3, 4, 5, 6, 7].map(|value| [value; 16]);
+    let [root_id, environment, library, object, seal, configuration, map] = [1, 2, 3, 4, 5, 6, 7]
+        .map(|value| {
+            let mut id = [value; 16];
+            id[6] = 0x40;
+            id[8] = 0x80;
+            id
+        });
     let identities = [environment, library, object, seal, configuration];
     let [env, lib, obj, generation, provider] = identities.map(uuid_text);
     let map_text = uuid_text(map);
