@@ -91,21 +91,21 @@ async fn resolves_only_the_committed_scoped_publication() {
     let exp = now.as_secs() + crate::playback::LEASE_TTL_SECS;
     let deadline = UNIX_EPOCH + Duration::from_secs(exp);
     let signed = receipt(track, digest, exp);
-    assert_eq!(
+    let acquire = async |db: &Client| {
         acquire_playback_lease_on(
-            &writer,
+            db,
             MEMBER,
             &signed.lease.session_id,
             track,
             PLAY,
             now.as_secs(),
             exp,
-            false
+            false,
         )
         .await
-        .unwrap(),
-        LeaseAcquire::Acquired { epoch: 1 }
-    );
+        .unwrap()
+    };
+    assert_eq!(acquire(&writer).await, LeaseAcquire::Acquired { epoch: 1 });
 
     let query = async |db: &mut Client, receipt: &BrowserReceipt, pins: &PublicationPins<'_>| {
         resolve(db, receipt, pins, SECRET, SystemTime::now)
@@ -125,28 +125,17 @@ async fn resolves_only_the_committed_scoped_publication() {
     assert!(query(&mut reader, &signed, &pins).await.is_none());
     publication.commit().await.unwrap();
 
-    for refused in [
-        PublicationPins {
-            environment: [0xff; 16],
-            ..pins
-        },
-        PublicationPins {
-            library: [0xff; 16],
-            ..pins
-        },
-        PublicationPins {
-            accepted_seq: pins.accepted_seq - 1,
-            ..pins
-        },
-        PublicationPins {
-            provider_configuration: [0xff; 16],
-            ..pins
-        },
-        PublicationPins {
-            version: "other-version",
-            ..pins
-        },
-    ] {
+    let mismatches: [fn(&mut PublicationPins<'_>); 6] = [
+        |pins| pins.environment = [0xff; 16],
+        |pins| pins.library = [0xff; 16],
+        |pins| pins.accepted_seq -= 1,
+        |pins| pins.provider_configuration = [0xff; 16],
+        |pins| pins.bucket = "other-bucket",
+        |pins| pins.version = "other-version",
+    ];
+    for change in mismatches {
+        let mut refused = PublicationPins { ..pins };
+        change(&mut refused);
         assert!(query(&mut reader, &signed, &refused).await.is_none());
     }
     let wrong_digest = receipt(track, &"00".repeat(32), exp);
@@ -187,4 +176,6 @@ async fn resolves_only_the_committed_scoped_publication() {
             .is_none(),
         "shared bytes cannot supply another track's reference"
     );
+    assert_eq!(acquire(&writer).await, LeaseAcquire::Acquired { epoch: 2 });
+    assert!(query(&mut reader, &signed, &pins).await.is_none());
 }
