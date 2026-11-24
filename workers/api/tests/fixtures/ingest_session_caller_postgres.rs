@@ -128,7 +128,9 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
             AND NOT (SELECT rolinherit OR rolsuper FROM pg_roles WHERE rolname = current_user)
             AND NOT has_table_privilege(current_user, 'public.ingest_session_reservations', 'DELETE,TRUNCATE')
             AND NOT has_any_column_privilege(current_user, 'public.native_rest_credentials', 'SELECT,INSERT,UPDATE')
+            AND NOT has_table_privilege(current_user, 'public.native_rest_credentials', 'DELETE,TRUNCATE')
             AND NOT has_any_column_privilege(current_user, 'public.fixture_upload_grants', 'SELECT,INSERT,UPDATE')
+            AND NOT has_table_privilege(current_user, 'public.fixture_upload_grants', 'DELETE,TRUNCATE')
             AND NOT has_any_column_privilege(current_user, 'public.track_sources', 'INSERT,UPDATE')
             AND NOT has_any_column_privilege(current_user, 'public.storage_validated_digest_references', 'INSERT,UPDATE')
             AND NOT has_table_privilege(current_user, 'public.track_sources', 'DELETE,TRUNCATE')",
@@ -690,6 +692,21 @@ async fn prove_attempt(
         read(writer, auth, prepared, async |_, _| Err(StoreError)).await,
         Err(UploadError::Unconfirmed)
     ));
+    let stalled = tokio::time::timeout(
+        Duration::from_secs(6),
+        read(writer, auth, prepared, async |_, _| {
+            std::future::pending().await
+        }),
+    )
+    .await
+    .expect("the authority deadline must end a stalled replay");
+    assert!(matches!(stalled, Err(UploadError::Unconfirmed)));
+    // Drain the rollback queued by the dropped transaction before checking its lock.
+    writer.simple_query("SELECT 1").await.unwrap();
+    observer.query_one(
+        "SELECT 1 FROM public.ingest_session_reservations WHERE id = $1::text::uuid FOR UPDATE NOWAIT",
+        &[&sid],
+    ).await.unwrap();
     let mismatched = async |id: &str, scope: &CompletionScope<'_>| {
         let mut state = reload(id, scope).await?.unwrap();
         state.grant.library_id = "foreign".into();

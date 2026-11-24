@@ -126,9 +126,9 @@ pre-enrolled intent, commits after authenticated readback, and replays durable
 pins. The [completion grants fixture](../workers/api/tests/fixtures/ingest_session_caller_grants.sql)
 covers inventory and outcome writes. Replay and the immediate post-commit read
 lock the scoped session before loading current credential and upload grant state
-through the trusted authorization reader. Give that reader separate access and
-keep credential and grant stores outside the upload writer's grants. Hosted
-fixtures cover waiting replay, revocation during the lock wait and rollback
+through the trusted authorization reader. Use current, non-locking reads with
+separate access and keep credential and grant stores outside the upload writer's
+grants. Hosted fixtures cover waiting replay, revocation during the lock wait and rollback
 when the session expires after winner staging. Connect the sealed data producer
 and provision the live authorization reader and scoped staging grants separately.
 Wire scoped cleanup after bucket qualification.
