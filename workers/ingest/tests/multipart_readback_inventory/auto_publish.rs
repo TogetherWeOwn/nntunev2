@@ -253,6 +253,8 @@ pub(super) async fn exercise(
     let mut wrong_offset = uploads;
     wrong_offset[0].scope.offset = 0;
     for evidence in [
+        Scoped(&[]),
+        Scoped(&uploads[..1]),
         Scoped(&mismatched),
         Scoped(&foreign),
         Scoped(&wrong_request),
