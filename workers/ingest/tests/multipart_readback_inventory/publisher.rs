@@ -276,5 +276,13 @@ async fn postgres_stages_completed_candidate_atomically() {
         &[&environment, &library, &digest, &(length as i64), &object, &generation, &root],
     ).await.unwrap().get(0);
     assert!(!admitted);
-    catalogue::exercise(&observer, &mut writer, &mut contender, &fixture, &intent).await;
+    catalogue::exercise(
+        &observer,
+        &mut writer,
+        &mut contender,
+        &fixture,
+        &intent,
+        &verified,
+    )
+    .await;
 }

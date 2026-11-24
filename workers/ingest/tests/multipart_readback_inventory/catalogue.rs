@@ -7,9 +7,13 @@ use nntune_ingest::{
         PublishedObject, VerifiedOccurrence,
     },
     digest_candidate_store::CandidateIntent,
+    multipart::readback_inventory::VerifiedCompletedReadback,
     track_writers::TrackRow,
 };
 use tokio_postgres::Transaction;
+
+#[path = "auto_publish.rs"]
+mod auto_publish;
 
 const RELEASE: &str = "ab310000-0000-4000-8000-000000000000";
 const ROWS: &str = "SELECT t.track_no, s.source_job_id, s.object_id::text
@@ -22,6 +26,7 @@ pub(super) async fn exercise(
     contender: &mut Client,
     first: &ReadbackFixture,
     old_intent: &CandidateIntent,
+    verified: &VerifiedCompletedReadback<'_, '_>,
 ) {
     let schema = concat!(
         include_str!("../../../api/tests/fixtures/storage_s3_locator_schema.sql"),
@@ -67,6 +72,8 @@ pub(super) async fn exercise(
             page_versions: &["new-page-pin"],
             ..old
         });
+
+    auto_publish::exercise(db, writer, first, verified, old, new).await;
 
     let occurrence = |job_id, object_id, track_no| VerifiedOccurrence {
         job_id,

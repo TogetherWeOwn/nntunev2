@@ -65,6 +65,14 @@ impl<'inventory, 'receipts> VerifiedCompletedReadback<'inventory, 'receipts> {
         self.inventory.origin
     }
 
+    pub(crate) fn matches_media(
+        &self,
+        media: &S3MediaMetadata,
+        plaintext_sha256: &[u8; 32],
+    ) -> bool {
+        media == self.inventory.metadata && plaintext_sha256 == self.origin().plaintext_sha256()
+    }
+
     /// Get whole-frame plaintext offsets for the consumer's independently
     /// trusted media metadata and digest. Authorization and authenticated
     /// range reads remain the consumer's responsibility.
@@ -74,8 +82,7 @@ impl<'inventory, 'receipts> VerifiedCompletedReadback<'inventory, 'receipts> {
         plaintext_sha256: &[u8; 32],
         millis: Range<u64>,
     ) -> Option<Range<u64>> {
-        if media != self.inventory.metadata || plaintext_sha256 != self.origin().plaintext_sha256()
-        {
+        if !self.matches_media(media, plaintext_sha256) {
             return None;
         }
         self.flac_seek.as_ref()?.plaintext_range(millis)
