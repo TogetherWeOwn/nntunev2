@@ -82,6 +82,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
+      browser_playback: ${{ steps.trial.outputs.browser_playback || '0' }}
     steps:
       - id: check
         env:
@@ -103,8 +104,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Validate private staging trial settings
+        id: trial
         if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}
         env:
+          HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
+          API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
+          API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
           STREAM_SERVICE_STAGING: ${{ vars.STREAM_SERVICE_STAGING }}
           STREAM_STAGING_DEPLOY_ENABLED: ${{ vars.STREAM_STAGING_DEPLOY_ENABLED }}
           PRIVATE_MUSIC_STAGING_JOURNEY: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY }}
@@ -118,7 +123,7 @@ jobs:
           PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION }}
           PRIVATE_PLAYBACK_STAGING_ROOT_VERSION: ${{ vars.PRIVATE_PLAYBACK_STAGING_ROOT_VERSION }}
         run: |
-          python3 -I .github/scripts/staging_stream_config.py --trial-preflight
+          python3 -I .github/scripts/staging_stream_config.py --trial-preflight >> "$GITHUB_OUTPUT"
 
   staging-web:
     name: staging-web
@@ -148,7 +153,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build staging web
         env:
-          PUBLIC_BROWSER_PLAYBACK: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' && vars.PRIVATE_PLAYBACK_STAGING_ENABLED == 'true' && vars.STREAM_STAGING_DEPLOY_ENABLED == 'true' && '1' || '0' }}
+          PUBLIC_BROWSER_PLAYBACK: ${{ needs.gate.outputs.browser_playback }}
         run: pnpm build
       - name: Deploy to staging
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3

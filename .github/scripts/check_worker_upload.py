@@ -280,21 +280,36 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
     tree, wdir = fixture(base, worker, f"tree-{tag}")
     if api_private:
         shutil.copy(ROOT / PRIVATE_CONFIG, tree / PRIVATE_CONFIG)
-        trial = {key: value for key, value in summary_env.items() if key.startswith("PRIVATE_") or key.startswith("STREAM_")}
+        trial = {key: value for key, value in summary_env.items() if key != "GITHUB_STEP_SUMMARY"}
+        trial.pop("HYPERDRIVE_ID_MB", None)
         generator = step_text(job_text(wf_text, "staging-api"), "Generate staging wrangler.toml")
         check_variable_mappings(generator, trial)
         trial.update(PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT="https://objects.example.test",
                      PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region",
                      PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION=OBSERVATION)
-        preflight = step_text(job_text(wf_text, "gate"), "Validate private staging trial settings")
+        gate = job_text(wf_text, "gate")
+        preflight = step_text(gate, "Validate private staging trial settings")
+        condition = "        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}"
+        check(condition in preflight.splitlines() and gate.splitlines().count(condition) == 2,
+              "trial preflight and its checkout must run when either arm is configured")
+        check("browser_playback: ${{ steps.trial.outputs.browser_playback || '0' }}" in gate,
+              "the protected gate must supply a default-off browser mode")
+        web_build = step_text(job_text(wf_text, "staging-web"), "Build staging web")
+        check("PUBLIC_BROWSER_PLAYBACK: ${{ needs.gate.outputs.browser_playback }}" in web_build,
+              "the browser build must use the validated trial gate result")
         check_variable_mappings(preflight, trial)
         stream_dir = tree / "workers/stream"
         stream_dir.mkdir()
         shutil.copy(ROOT / "workers/stream/wrangler.toml", stream_dir / "wrangler.toml")
         args = ["bash", "-e", "-c", run_script(preflight)]
-        good = run(args, cwd=tree, env={**env, **trial}, label="private staging preflight")
-        check(good.returncode == 0, "complete settings did not pass trial preflight")
+        output = tree / "trial-output"
+        trial_env = {**env, **trial, "GITHUB_OUTPUT": str(output)}
+        good = run(args, cwd=tree, env=trial_env, label="private staging preflight")
+        check(good.returncode == 0 and output.read_text() == "browser_playback=1\n",
+              "complete settings did not arm the browser build")
         for key, value in (
+            ("API_RP_ORIGIN_STAGING", ""),
+            ("HYPERDRIVE_ID_STAGING", "invalid"),
             ("PRIVATE_PLAYBACK_STAGING_S3_REGION", ""),
             ("PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION", "invalid"),
             ("STREAM_SERVICE_STAGING", "nntune-stream"),
@@ -303,8 +318,9 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
             ("PRIVATE_PLAYBACK_STAGING_LIBRARY", "invalid"),
             ("PRIVATE_MUSIC_STAGING_JOURNEY", "false"),
         ):
-            bad = run(args, cwd=tree, env={**env, **trial, key: value}, label=f"private staging preflight refuses {key}")
-            check(bad.returncode != 0, f"trial preflight accepted invalid {key}")
+            output.write_text("")
+            bad = run(args, cwd=tree, env={**trial_env, key: value}, label=f"private staging preflight refuses {key}")
+            check(bad.returncode != 0 and not output.read_text(), f"trial preflight accepted invalid {key}")
     config = generate(worker, gen_script, wdir, env, summary_env, label)
     assert_no_build(config, label)
     if worker in ("api", "stream"):

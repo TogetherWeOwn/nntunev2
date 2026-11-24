@@ -48,6 +48,23 @@ def api_vars(env):
     return lines
 
 
+def trial_preflight(env):
+    armed = bool(api_vars(env))
+    source = tomllib.loads(Path("workers/stream/wrangler.toml").read_text())
+    render(source, env)
+    if armed:
+        if (env.get("API_RP_ID_STAGING"), env.get("API_RP_ORIGIN_STAGING")) != (
+            "staging.nntune.com", "https://staging.nntune.com",
+        ):
+            raise ValueError("Private trial requires the staging API RP ID and origin")
+        manifest = tomllib.loads(Path(".github/scripts/binding_manifest.toml").read_text())
+        api = next(worker for worker in manifest["worker"] if worker["name"] == "api")
+        database = next(binding for binding in api["binding"] if binding["binding"] == "HYPERDRIVE")
+        if env.get("HYPERDRIVE_ID_STAGING") != database["staging"]:
+            raise ValueError("Private trial requires the pinned staging API database binding")
+    return armed
+
+
 def render(source, env):
     stage = source["env"]["staging"]
     bindings = {
@@ -104,8 +121,6 @@ if __name__ == "__main__":
         case ["--api-vars"]:
             print("\n".join(api_vars(os.environ)))
         case ["--trial-preflight"]:
-            api_vars(os.environ)
-            source = tomllib.loads(Path("workers/stream/wrangler.toml").read_text())
-            render(source, os.environ)
+            print(f"browser_playback={int(trial_preflight(os.environ))}")
         case _:
             raise SystemExit(2)
