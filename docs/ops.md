@@ -1501,7 +1501,12 @@ gate disabled. See the [dated lifecycle inventory](#planetscale-postgres) and
 [ADR 0007 amendment](adr/0007-mb-mirror.md#2026-11-07-amendment-retirement-and-conditional-bounded-replacement).
 
 Before this sequence becomes executable, require validated import/readiness
-and separately accepted activation. A reviewed, coordinated replacement-ID
+and separately accepted activation. After the initial load, the Operator can
+use the [read-only mirror readiness check](../containers/mb-import/README.md#initial-mirror-readiness)
+to attach cursor, row-count and release lookup evidence to the existing import
+handoff. Keep that evidence with the approved source and target, elapsed time
+and validator provenance described in the [replacement inventory](#planetscale-postgres).
+A reviewed, coordinated replacement-ID
 change must align `workers/mb/wrangler.toml`, API MB metadata in
 `workers/api/wrangler.toml.example`, `.github/scripts/binding_manifest.toml`,
 relevant binding/deploy contracts and the Hyperdrive inventory **before any

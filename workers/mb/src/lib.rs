@@ -222,12 +222,7 @@ const RELEASE_EXISTS_SQL: &str = "SELECT 1 FROM mb_release WHERE mbid = $1::text
 /// a multi-medium release. `mb_track` holds every track appearance
 /// with its medium position, so ordering by (medium_no, track_no) is
 /// true album order. Both positions are NOT NULL in `mb_track`.
-const RELEASE_RECORDINGS_SQL: &str =
-    "SELECT r.mbid::text AS mbid, t.release_mbid::text AS release_mbid, r.title, \
-     t.track_no AS track_no, r.duration_ms, t.medium_no AS medium_no \
-     FROM mb_track t JOIN mb_recording r ON r.mbid = t.recording_mbid \
-     WHERE t.release_mbid = $1::text::uuid \
-     ORDER BY t.medium_no ASC, t.track_no ASC, r.mbid ASC LIMIT 1000";
+const RELEASE_RECORDINGS_SQL: &str = include_str!("release_recordings.sql");
 
 /// Existence probe for a release-group MBID. The discography listing must
 /// tell "no such group" (404) apart from "group with no releases yet"
@@ -320,13 +315,7 @@ fn search_sql(kind: Kind, limit: u32, offset: u32) -> String {
              FROM mb_artist WHERE name % $1 \
              ORDER BY score DESC, label ASC, mbid ASC"
         }
-        Kind::Release => {
-            "SELECT r.mbid::text AS mbid, r.title AS label, similarity(r.title, $1) AS score, \
-             r.artist_mbid::text AS artist_mbid, a.name AS artist_name \
-             FROM mb_release r LEFT JOIN mb_artist a ON a.mbid = r.artist_mbid \
-             WHERE r.title % $1 \
-             ORDER BY score DESC, label ASC, r.mbid ASC"
-        }
+        Kind::Release => include_str!("release_search.sql").trim_end(),
         Kind::Recording => {
             "SELECT mbid::text AS mbid, title AS label, similarity(title, $1) AS score, \
              NULL::text AS artist_mbid, NULL::text AS artist_name \
