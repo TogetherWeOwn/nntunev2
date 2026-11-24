@@ -90,3 +90,46 @@ pub fn encode_query_value(value: &str) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_s3_signing_credentials() {
+        let key = |region: &str, access: &str, secret: &str| {
+            S3SigningKey::new(region.into(), access.into(), secret.into())
+        };
+        assert!(key("fixture-region", "FIXTUREACCESS", "fixture-secret").is_some());
+        for region in ["", "Uppercase", "fixture/region", &"r".repeat(65)] {
+            assert!(key(region, "FIXTUREACCESS", "fixture-secret").is_none());
+        }
+        for access in ["", "fixture/access", &"a".repeat(129)] {
+            assert!(key("fixture-region", access, "fixture-secret").is_none());
+        }
+        for secret in ["", "fixture\nsecret", &"s".repeat(257)] {
+            assert!(key("fixture-region", "FIXTUREACCESS", secret).is_none());
+        }
+    }
+
+    #[test]
+    fn requires_a_utc_signing_timestamp() {
+        let key = S3SigningKey::new(
+            "fixture-region".into(),
+            "FIXTUREACCESS".into(),
+            "fixture-secret".into(),
+        )
+        .unwrap();
+        let authorize = |date| key.authorization(date, "fixture canonical request", "host");
+        assert!(authorize("20261124T074000Z").is_some());
+        for invalid in [
+            "",
+            "20261124074000Z",
+            "20261124t074000Z",
+            "20261124T074000z",
+            "202611xxT074000Z",
+        ] {
+            assert!(authorize(invalid).is_none());
+        }
+    }
+}
