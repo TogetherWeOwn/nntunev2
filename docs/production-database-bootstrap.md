@@ -222,11 +222,11 @@ attempted creation is uncertain. The caller stops without retry or deletion.
 
 The [baseline workflow](../.github/workflows/deploy-database-baseline.yml)
 shares setup's lock and uses its own `production-db-baseline` Environment.
-Apply the same protection and readback rules. Dispatch from the approved main
-SHA with zero inputs. The pending attempt requires `BASELINE_ENABLED=true`,
-`BASELINE_SHA`,
-`BASELINE_RUN_ID`, `BASELINE_EXPIRY`, `BASELINE_PLAN_B64`,
-`BASELINE_PLAN_DIGEST` and `BASELINE_READER_PASSWORD` in that Environment.
+Apply the same protection and readback rules. Dispatch the approved main SHA
+with zero inputs. Preflight checks secret placement without a staging deploy.
+The pending attempt requires `BASELINE_ENABLED=true`, `BASELINE_SHA`,
+`BASELINE_RUN_ID`, `BASELINE_EXPIRY`, `BASELINE_PLAN_B64`, `BASELINE_PLAN_DIGEST`
+and `BASELINE_READER_PASSWORD` in that Environment.
 Remove them after use and verify reader retirement and session closure.
 
 The version 1 plan contains exactly `version`, `host`, `port`, `ca_pem`,
@@ -237,11 +237,10 @@ direct SELECT on all physical relations and no write, ownership or role-switch
 path. Keep schema, grant and writer changes quiesced through the read.
 
 One TLS-verified, read-only repeatable-read transaction checks primary status,
-name, OID, identity and permissions. It checks row existence across at most
-256 user relations plus large-object metadata, without expanding views or
-calling sequences. Foreign tables, RLS on physical tables, unsupported storage
-and incomplete visibility refuse. Ledger and reference rows count as data.
-Record the job URL and attempt with its `empty`, `rows-present` or `refused` verdict.
+name, OID, identity, permissions and row existence across at most 256 user
+relations and large-object metadata. Refusals include foreign tables,
+RLS, unpopulated materialized views, unsupported storage and incomplete access.
+Ledger and reference rows count as data. Record the job URL, attempt and verdict.
 
 ### Setup role custody and lifecycle
 

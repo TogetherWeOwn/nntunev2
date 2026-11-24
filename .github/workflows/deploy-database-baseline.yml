@@ -8,10 +8,17 @@ permissions:
 
 jobs:
   preflight:
+    name: Check baseline authorization custody
     if: >-
       ${{ github.repository == 'TogetherWeOwn/nntunev2' &&
           github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
           github.run_attempt == '1' }}
+    environment:
+      name: staging
+      deployment: false
+    concurrency:
+      group: production-db-baseline-preflight
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -25,6 +32,7 @@ jobs:
         run: test "$UNPROTECTED_BASELINE" = false
 
   baseline:
+    name: Read the first-launch baseline
     needs: preflight
     environment: production-db-baseline
     concurrency:

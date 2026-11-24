@@ -1270,24 +1270,21 @@ the isolated candidate. Post-watch and cancellation need separate admission.
 
 ### First private release handoff
 
-Record the exact SHA, checks, reviews, admitted staging attempt, both build
-identities, health and private listening journey. Pin the maintenance module
-SHA-256 and its isolated `503` with `Cache-Control: no-store` and
-`X-Robots-Tag: noindex`. Resolve preview exposure and ambiguous inventory
-before seeding. Keep one writer through readback, record the Worker, seed
-version and deployment IDs, and close the seed window.
+Record the exact SHA, checks, reviews, admitted staging attempt, build IDs,
+health and private listening journey. Pin the maintenance module SHA-256 and
+its isolated `503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex`.
+Resolve preview exposure and inventory gaps before seeding. Keep one writer
+through readback, record the Worker, seed version and deployment, and close the window.
 
 Record the [database baseline](production-database-bootstrap.md#protected-baseline)
 attempt, target and migration manifest digest. On `empty`, verify the provider
 snapshot before the first schema change. On `rows-present`, rehearse the exact
 undo on a temporary restore from a fresh provider backup. Resolve any refusal.
 
-To switch off, close admission, restore the pinned maintenance allocation
-through protected rollback and keep Access denies in force. Close newly
-enabled API and media routes through their protected controls. Verify the
-maintenance response and private denial. Preserve the database and snapshot.
-Before promotion, record the protected recovery entry point for cancellation
-and watch regressions, the operator, rollback triggers and 30-minute watch.
+To switch off, close admission and use protected rollback to restore the pinned
+maintenance allocation and close newly enabled API and media routes. Verify
+maintenance and private denials. Preserve the database and snapshot. Record
+the operator, recovery entry point, triggers and 30-minute watch before promotion.
 
 ### Production promotion publishes a CalVer release
 
