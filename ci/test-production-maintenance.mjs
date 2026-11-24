@@ -43,11 +43,11 @@ test('only exact-main bootstrap uses the protected production job after staging 
   assert.doesNotMatch(preflight[1], /secrets\./);
   const staging = workflow.split('\n  staging-evidence:\n')[1].split('\n  deploy-production:\n')[0];
   assert.match(staging, /needs: \[preflight\][\s\S]*?environment:\n      name: staging\n      deployment: false/);
-  const guard = staging.match(/UNPROTECTED_CF_CONFIG: \$\{\{ secrets\.PRODUCTION_CLOUDFLARE_API_TOKEN != '' \|\| secrets\.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' \}\}\n          UNPROTECTED_ROLLBACK_CONFIG: \$\{\{ inputs\.mode == 'promote' && \(secrets\.PRODUCTION_ROLLBACK_CUSTODY != '' \|\| secrets\.PRODUCTION_ROLLBACK_INTENT_KEY != ''\) \}\}\n        run: \|\n([\s\S]*?)          python3 -/);
+  const guard = staging.match(/UNPROTECTED_CF_CONFIG: \$\{\{ secrets\.PRODUCTION_CLOUDFLARE_API_TOKEN != '' \|\| secrets\.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' \}\}\n          UNPROTECTED_ROLLBACK_CONFIG: \$\{\{ inputs\.mode != 'bootstrap-maintenance' && \(secrets\.PRODUCTION_ROLLBACK_CUSTODY != '' \|\| secrets\.PRODUCTION_ROLLBACK_INTENT_KEY != ''\) \}\}\n        run: \|\n([\s\S]*?)          python3 -/);
   assert.ok(guard);
   for (const [credentials, rollback] of [['false', 'false'], ['true', 'false'], ['', 'false'], ['false', 'true'], ['false', '']]) {
     assert.equal(spawnSync('/bin/bash', ['-c', guard[1]], {
-      env: { UNPROTECTED_CF_CONFIG: credentials, UNPROTECTED_ROLLBACK_CONFIG: rollback }, timeout: 5_000,
+      env: { DEPLOY_MODE: 'recover-worker', UNPROTECTED_CF_CONFIG: credentials, UNPROTECTED_ROLLBACK_CONFIG: rollback }, timeout: 5_000,
     }).status, credentials === 'false' && rollback === 'false' ? 0 : 1);
   }
   const job = workflow.split('\n  bootstrap-maintenance:\n')[1].split('\n  release:\n')[0];
@@ -355,7 +355,7 @@ test('recovery refuses unapproved or altered evidence and reconciles a prior fin
 
 test('protected recovery wiring keeps the production lock and contains source and provider errors', () => {
   const job = workflow.split('\n  recover-worker:\n')[1].split('\n  release:\n')[0];
-  assert.match(job, /if: inputs.mode == 'recover-worker'\n    needs: preflight/);
+  assert.match(job, /if: inputs.mode == 'recover-worker'\n    needs: \[preflight, staging-evidence\]/);
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false\n    environment: production/);
   const [proof, restore] = job.split('      - name: Restore or verify the recorded allocation');
   assert.doesNotMatch(proof, /secrets\.(?:PRODUCTION_CLOUDFLARE|PRODUCTION_ROLLBACK_CUSTODY)/);

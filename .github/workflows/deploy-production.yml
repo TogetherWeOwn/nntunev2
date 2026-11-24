@@ -3,8 +3,8 @@ name: deploy-production
 # Production promotion for the web frontend (apps/web only).
 #
 # Manual only; never runs on push, PR, release, or another workflow.
-# New deployments require the repo variable PRODUCTION_DEPLOY_ENABLED to
-# be exactly "true". The production hostname is
+# New deployments are disabled by default unless the repo variable
+# PRODUCTION_DEPLOY_ENABLED is exactly "true". The production hostname is
 # decided at launch; until then the workflow builds against the placeholder
 # domain below and refuses to promote to it. Backend Workers (api, ingest,
 # mb, stream, repair) each add their own lane as follow-ups; the reserved
@@ -143,17 +143,9 @@ jobs:
           fi
           echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
           echo "domain=$domain" >> "$GITHUB_OUTPUT"
-      - name: Require production-only recovery configuration
-        if: inputs.mode == 'recover-worker'
-        env:
-          UNPROTECTED_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' || secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '' }}
-        run: |
-          test "$UNPROTECTED_CONFIG" = false ||
-            { echo '::error::Recovery configuration must exist only in the production Environment'; exit 1; }
 
   staging-evidence:
     name: staging-evidence
-    if: inputs.mode != 'recover-worker'
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -166,6 +158,7 @@ jobs:
       # Verifier and approval policy come from the dispatch's reviewed main
       # source, never from an artifact or an arbitrary selected candidate.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.mode != 'recover-worker'
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -174,15 +167,17 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+          DEPLOY_MODE: ${{ inputs.mode }}
           # Check inheritance from outside production without passing secret values to this runner.
           UNPROTECTED_CF_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' }}
-          UNPROTECTED_ROLLBACK_CONFIG: ${{ inputs.mode == 'promote' && (secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '') }}
+          UNPROTECTED_ROLLBACK_CONFIG: ${{ inputs.mode != 'bootstrap-maintenance' && (secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '') }}
         run: |
           set -euo pipefail
           [ "${UNPROTECTED_CF_CONFIG:-}" = false ] ||
             { echo '::error::Cloudflare credentials must exist only in the production Environment'; exit 1; }
           [ "${UNPROTECTED_ROLLBACK_CONFIG:-}" = false ] ||
             { echo '::error::Rollback custody and intent key must exist only in the production Environment'; exit 1; }
+          if [ "${DEPLOY_MODE:-}" = recover-worker ]; then exit 0; fi
           python3 - <<'PY'
           import json, os, sys, urllib.request
 
@@ -253,6 +248,7 @@ jobs:
           print(f"staging evidence job prerequisites ok: deploy run {latest['id']} on {sha}; receipt verification still required")
           PY
       - name: Verify candidate deployment and accepted journey receipt
+        if: inputs.mode != 'recover-worker'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
@@ -268,7 +264,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # One static non-cancelling group serializes production Worker
-    # mutations (promotion, bootstrap and recovery share it).
+    # mutations (promotion and any future rollback lane share it).
     concurrency:
       group: production-worker-mutation
       cancel-in-progress: false
@@ -543,12 +539,12 @@ jobs:
   recover-worker:
     name: recover-worker
     if: inputs.mode == 'recover-worker'
-    needs: preflight
+    needs: [preflight, staging-evidence]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
-      actions: read
+      actions: read # Authenticate the original rollout and sealed intent using the Actions API.
     concurrency:
       group: production-worker-mutation
       cancel-in-progress: false

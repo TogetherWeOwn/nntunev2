@@ -31,7 +31,8 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId },
   const deployment = (n, versions, annotations) => ({ id: id(n), versions, annotations,
     created_on: new Date(now() + n * 1000).toISOString() });
   const rows = [deployment(1, [allocation(version)])];
-  const seed = { id: version, bindings: [], annotations: { 'workers/tag': custody.previous?.tag ?? target.sha } };
+  const seed = { id: version, bindings: kind === 'previous' ? [{ name: 'ASSETS', type: 'assets' }] : [],
+    annotations: { 'workers/tag': custody.previous?.tag ?? target.sha } };
   const versions = [seed, { id: candidate, annotations: { 'workers/tag': `${sha}-12-1` } }];
   const state = { id: workerId, name: 'nntune-web', deployed_on: checkedAt, references: structuredClone(references),
     subdomain: { enabled: false, previews_enabled: false } };

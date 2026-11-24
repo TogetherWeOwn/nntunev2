@@ -43,7 +43,8 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
       (maintenance != null && previous != null) || !uuid(target?.version) || !uuid(target.deployment) ||
       !hex(target.sha, 40) || (maintenance ?
         !hex(maintenance.module_sha256, 64) || (!recovery && maintenance.module_sha256 !== seedDigest) :
-        typeof previous.tag !== 'string' || !new RegExp(`^${target.sha}-[1-9][0-9]{0,15}-1$`).test(previous.tag)) ||
+        typeof previous?.tag !== 'string' || !previous.tag.startsWith(`${target.sha}-`) ||
+        !/^[1-9][0-9]{0,15}-1$/.test(previous.tag.slice(41))) ||
       !Array.isArray(references?.domains) || references.domains.length > 1 ||
       !references.domains.every((entry) => entry?.hostname === domain) ||
       !Object.entries(references).every(([kind, entries]) => kind === 'domains' ||
@@ -83,8 +84,9 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
         !isDeepStrictEqual(result.references, references) || result.subdomain?.enabled !== false ||
         result.subdomain.previews_enabled !== false) throw new Error('Worker identity, routes or previews drifted');
     const { result: version } = await api(`${pinned}/versions/${target.version}`, 'Rollback target version');
+    const bindings = maintenance ? [] : [{ name: 'ASSETS', type: 'assets' }];
     if (version.id !== target.version || version.annotations?.['workers/tag'] !== (maintenance?.sha ?? previous.tag) ||
-        !Array.isArray(version.bindings) || version.bindings.length !== 0) {
+        !isDeepStrictEqual(version.bindings, bindings)) {
       throw new Error(maintenance ? 'Maintenance version drifted' : 'Previous version drifted');
     }
     const history = await api(deployments + page, 'Deployment history');
