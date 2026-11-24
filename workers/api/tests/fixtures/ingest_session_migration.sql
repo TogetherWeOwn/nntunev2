@@ -28,7 +28,7 @@ GRANT INSERT (session_id, kind, due_at),
     ON public.ingest_session_cleanup_intents TO upload_fixture_writer;
 
 SET ROLE upload_fixture_writer;
-CREATE TEMP TABLE upload_claims (kind text PRIMARY KEY, claim_id text);
+CREATE TEMP TABLE upload_claims (session_id text, kind text, claim_id text, PRIMARY KEY (session_id, kind));
 -- worker statements
 
 BEGIN ISOLATION LEVEL READ COMMITTED;
@@ -80,6 +80,9 @@ BEGIN
     IF EXISTS (SELECT FROM pg_temp.acquire_write_lease(env, lib, principal, sid, fp, generation, 1, 64, lease)) THEN
         RAISE EXCEPTION 'tombstone accepted a write lease';
     END IF;
+    INSERT INTO upload_claims
+    SELECT session_id, kind, delivery_claim_id FROM pg_temp.claim_cleanup(env::text, lib::text, principal, sid::text)
+    WHERE kind = 'terminal_reconcile';
 
     IF (SELECT pg_temp.reserve(env, lib, principal, 'lost-upload-key', fp, lost)) IS DISTINCT FROM lost THEN
         RAISE EXCEPTION 'lost-initiation fixture reservation failed';
@@ -103,8 +106,8 @@ BEGIN
         RAISE EXCEPTION 'lost-initiation fixture expiry failed';
     END IF;
     INSERT INTO upload_claims
-    SELECT kind, delivery_claim_id FROM pg_temp.claim_cleanup(env::text, lib::text, principal, lost::text);
-    IF (SELECT count(*) FROM upload_claims) <> 2 THEN
+    SELECT session_id, kind, delivery_claim_id FROM pg_temp.claim_cleanup(env::text, lib::text, principal, lost::text);
+    IF (SELECT count(*) FROM upload_claims WHERE session_id = lost::text) <> 2 THEN
         RAISE EXCEPTION 'expected one expiry claim and one terminal reconcile claim';
     END IF;
 END $$;
@@ -116,10 +119,16 @@ DECLARE
     env CONSTANT text := '10000000-0000-4000-8000-000000000001';
     lib CONSTANT text := '20000000-0000-4000-8000-000000000001';
     sid CONSTANT text := '30000000-0000-4000-8000-000000000002';
+    unclaimed CONSTANT text := '30000000-0000-4000-8000-000000000001';
     provider CONSTANT text := '60000000-0000-4000-8000-000000000001';
     claim text;
 BEGIN
-    SELECT claim_id INTO STRICT claim FROM upload_claims WHERE kind = 'terminal_reconcile';
+    SELECT claim_id INTO STRICT claim FROM upload_claims WHERE session_id = unclaimed AND kind = 'terminal_reconcile';
+    IF NOT EXISTS (SELECT FROM pg_temp.reconcile(env, lib, 'upload-owner', unclaimed, claim,
+                   'fixture-bucket', provider, NULL) WHERE media_key IS NULL AND upload_id IS NULL) THEN
+        RAISE EXCEPTION 'unclaimed session could not be reconciled';
+    END IF;
+    SELECT claim_id INTO STRICT claim FROM upload_claims WHERE session_id = sid AND kind = 'terminal_reconcile';
     IF NOT EXISTS (SELECT FROM pg_temp.reconcile(env, lib, 'upload-owner', sid, claim,
                    'fixture-bucket', provider, 'recovered-fixture-id')
                    WHERE upload_id = 'recovered-fixture-id' AND media_key =
@@ -137,7 +146,7 @@ DECLARE
     sid CONSTANT text := '30000000-0000-4000-8000-000000000002';
     claim text;
 BEGIN
-    SELECT claim_id INTO STRICT claim FROM upload_claims WHERE kind = 'terminal_reconcile';
+    SELECT claim_id INTO STRICT claim FROM upload_claims WHERE session_id = sid AND kind = 'terminal_reconcile';
     IF (SELECT multipart_upload_id FROM public.ingest_session_reservations WHERE id = sid::uuid)
             IS DISTINCT FROM 'recovered-fixture-id' THEN
         RAISE EXCEPTION 'recovered upload ID did not survive commit';
