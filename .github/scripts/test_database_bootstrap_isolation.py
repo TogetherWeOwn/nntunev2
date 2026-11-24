@@ -18,6 +18,7 @@ from pathlib import Path
 
 import database_bootstrap_setup as setup
 import database_bootstrap_baseline as baseline
+from database_bootstrap_reader_role import MAX_READER_SECONDS, ReaderRoleLifecycle
 from database_bootstrap_role import SetupRoleLifecycle
 from fixtures.database_bootstrap.authorization import caller_env, plan_binding
 from database_bootstrap_preflight import (
@@ -31,6 +32,7 @@ CREATOR, OWNER, DECOY = "fixture_creator", "fixture_owner", "fixture_decoy"
 MIGRATOR, RUNTIME, READER = "fixture_migrator", "fixture_runtime", "fixture_reader"
 STAGING = "fixture_staging"
 ISSUER = "fixture_issuer"
+BASELINE_READER, READER_ISSUER = "Fixture-Protected-Reader", "fixture_reader_issuer"
 MAINTENANCE, LAUNCH, SIBLING = "postgres", "launch_fixture", "staging_fixture"
 received_signals = set()
 
@@ -397,7 +399,7 @@ def routed_client(cluster, mode, role=CREATOR):
     return f"{cluster.directory}:/usr/bin:/bin"
 
 
-def prove_setup_caller(cluster, *, interrupt):
+def prove_setup_caller(cluster, *, interrupt, reader=READER):
     calls = cluster.directory / "invocations"
     calls.touch()
 
@@ -412,7 +414,7 @@ def prove_setup_caller(cluster, *, interrupt):
         require(calls.stat().st_size - before == invocations, "verify the expected routed client calls")
 
     cluster.canary = secrets.token_hex(20)
-    roles = CREATOR, OWNER, MIGRATOR, READER
+    roles = CREATOR, OWNER, MIGRATOR, reader
     env = caller_env(cluster, roles)
     if not interrupt:
         route = {"PATH": routed_client(cluster, "route")}
@@ -572,6 +574,106 @@ def prove_baseline(cluster):
         """, "1\n", database=LAUNCH)
 
 
+def prepare_baseline_reader(cluster):
+    cluster.passwords[READER_ISSUER] = secrets.token_hex(24)
+    cluster.ok("scope reader issuance and signalling separately from setup", f"""
+        CREATE ROLE {READER_ISSUER} LOGIN CREATEROLE PASSWORD '{cluster.passwords[READER_ISSUER]}';
+        GRANT pg_signal_backend TO {READER_ISSUER};
+    """)
+    env = caller_env(cluster, (CREATOR, OWNER, MIGRATOR, BASELINE_READER))
+    raw = base64.b64decode(env.pop("BOOTSTRAP_PLAN_B64"))
+    lifecycle = ReaderRoleLifecycle(raw, READER_ISSUER)
+    result = cluster.sql(lifecycle.prepare(), role=READER_ISSUER)
+    checked(result, "prepare an unusable reader for the setup caller")
+    oid = int(result.stdout)
+    cluster.ok("read back pending reader attributes and a NULL password", f"""
+        SELECT rolcanlogin AND rolconnlimit = 1 AND rolpassword IS NULL AND NOT
+            (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls)
+            AND rolvaliduntil = 'epoch'::timestamptz FROM pg_authid WHERE oid = {oid};
+    """, "t\n")
+    return lifecycle, oid, env
+
+
+def prove_reader_lifecycle(cluster, pending):
+    lifecycle, oid, env = pending
+    launch = {"database": LAUNCH, "role": READER_ISSUER}
+    reader = f'"{BASELINE_READER}"'
+    plan = {key: getattr(lifecycle.plan, key) for key in ("host", "port", "ca_pem", "branch_id", "launch", "reader_role")}
+    result = cluster.sql(f"SELECT oid FROM pg_database WHERE datname = '{LAUNCH}';")
+    checked(result, "pin the setup database identity")
+    plan.update(version=1, database_oid=int(result.stdout))
+    raw = json.dumps(plan).encode()
+    cluster.ok("delegate only launch CONNECT and schema/table grant options", f"""
+        GRANT CONNECT ON DATABASE {LAUNCH} TO {READER_ISSUER} WITH GRANT OPTION;
+        REVOKE USAGE ON SCHEMA public FROM PUBLIC;
+        CREATE SCHEMA reader_scope;
+        CREATE TABLE reader_scope.root (id integer) PARTITION BY RANGE (id);
+        CREATE TABLE reader_scope.leaf PARTITION OF reader_scope.root FOR VALUES FROM (0) TO (10);
+        INSERT INTO reader_scope.root VALUES (5);
+        GRANT USAGE ON SCHEMA reader_scope TO {READER_ISSUER} WITH GRANT OPTION;
+    """, database=LAUNCH)
+    password = secrets.token_hex(24)
+    expiry = int(time.time()) + MAX_READER_SECONDS
+    activate = lifecycle.activate(raw, oid, expiry, password)
+    cluster.denied("refuse the wrong catalog OID", lifecycle.activate(
+        json.dumps(plan | {"database_oid": plan["database_oid"] + 1}).encode(), oid, expiry, password),
+        "wrong custodian session", **launch)
+    cluster.denied("refuse inherited PUBLIC access to unrelated databases", activate, "reader scope refused", **launch)
+    cluster.ok("reconcile the disposable cluster's PUBLIC database grants explicitly", f"""
+        GRANT CONNECT ON DATABASE postgres TO {CREATOR}, {ISSUER}, {READER}, {READER_ISSUER};
+        REVOKE CONNECT ON DATABASE postgres, template1 FROM PUBLIC;
+    """)
+    cluster.ok("model a wider PUBLIC column grant", "GRANT UPDATE (id) ON reader_scope.leaf TO PUBLIC;", database=LAUNCH)
+    cluster.denied("refuse the wider PUBLIC column grant", activate, "reader scope refused", **launch)
+    cluster.ok("remove the synthetic wider grant", "REVOKE UPDATE (id) ON reader_scope.leaf FROM PUBLIC;", database=LAUNCH)
+    cluster.denied("roll back partial grants if a required grant option is missing", activate,
+                   "reader coverage missing", **launch)
+    cluster.ok("verify refusal preserved both credential and CONNECT fences", f"""
+        SELECT rolpassword IS NULL AND NOT has_database_privilege(oid, '{LAUNCH}', 'CONNECT')
+        FROM pg_authid WHERE oid = {oid};
+        GRANT SELECT ON reader_scope.leaf TO {READER_ISSUER} WITH GRANT OPTION;
+    """, "t\n", database=LAUNCH)
+    holder = None
+    try:
+        expiry = int(time.time()) + 15
+        cluster.ok("activate with direct physical leaf coverage", lifecycle.activate(raw, oid, expiry, password), **launch)
+        env.pop("BOOTSTRAP_SETUP_PASSWORD")
+        env.update(plan_binding(raw), BASELINE_ENABLED="true", BASELINE_READER_PASSWORD=password,
+                   BOOTSTRAP_EXPIRY=str(expiry), PATH=routed_client(cluster, "route", BASELINE_READER),
+                   GITHUB_WORKFLOW_REF=f'{env["GITHUB_REPOSITORY"]}/{baseline.WORKFLOW}@refs/heads/main')
+        with start_caller(env, baseline.__file__) as process:
+            stdout, stderr = process.communicate(timeout=18)
+            require((process.returncode, stdout, stderr) == (0, b"database-bootstrap-baseline: rows-present\n", b""),
+                    "publish only the aggregate verdict from the admitted TLS reader")
+        cluster.denied("refuse to rotate an active reader", activate, "reader is no longer pending", **launch)
+        cluster.denied("refuse to retire before fencing", lifecycle.retire(raw, oid), "reader retirement refused", **launch)
+        tls = setup.tls_environment(cluster.directory, lifecycle.plan, LAUNCH, BASELINE_READER, password)
+        holder = subprocess.Popen(
+            ["/usr/bin/psql", "-XqAtw"], env=tls, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        holder.stdin.write(b"SELECT 1;\n")
+        holder.stdin.flush()
+        require(select.select([holder.stdout], [], [], 3)[0] and holder.stdout.readline() == b"1\n",
+                "observe a surviving reader session before retirement")
+    finally:
+        env.pop("BASELINE_READER_PASSWORD", None)
+        cluster.ok("deny logins and clear the credential in a separate commit", lifecycle.fence(raw, oid), **launch)
+        cluster.ok("read back the cleared credential", f"""
+            SELECT NOT rolcanlogin AND rolpassword IS NULL AND rolvaliduntil = 'epoch'::timestamptz
+            FROM pg_authid WHERE oid = {oid};
+        """, "t\n")
+        cluster.ok("revoke the scoped grants and read back role and session absence", lifecycle.retire(raw, oid),
+                   "retired\n", **launch)
+        if holder is not None:
+            holder.communicate(timeout=3)
+            require(holder.returncode != 0, "observe the reader server session terminate")
+        cluster.ok("restore the disposable maintenance grants and remove fixture relations", f"""
+            GRANT CONNECT ON DATABASE postgres, template1 TO PUBLIC;
+            DROP SCHEMA reader_scope CASCADE;
+        """, database=LAUNCH)
+
+
 def verify_launch_grants(cluster):
     cluster.ok("verify revoked PUBLIC access and transferred ownership on admission", f"""
         SELECT datallowconn AND datdba = '{OWNER}'::regrole
@@ -671,9 +773,11 @@ def exercise(*, interrupt):
                 if not interrupt:
                     refuse_before_create(cluster)
                     verify_quiet_failure(cluster)
-                prove_setup_caller(cluster, interrupt=interrupt)
+                pending = None if interrupt else prepare_baseline_reader(cluster)
+                prove_setup_caller(cluster, interrupt=interrupt, reader=READER if interrupt else BASELINE_READER)
                 if not interrupt:
                     prove_baseline(cluster)
+                    prove_reader_lifecycle(cluster, pending)
                     verify_launch_grants(cluster)
                 cluster.ok("revoke setup login and password", lifecycle.fence(oid), role=ISSUER)
                 cluster.ok("read back the login fence and cleared password", f"""

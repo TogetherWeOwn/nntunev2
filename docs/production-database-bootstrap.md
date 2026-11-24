@@ -235,6 +235,23 @@ One TLS-verified read-only snapshot checks primary status, identity and rights.
 It scans up to 256 user relations and large objects, and refuses incomplete coverage.
 Ledger and reference rows count as data. Record the job URL, attempt and verdict.
 
+### Reader role custody and lifecycle
+
+The dormant [reader SQL](../.github/scripts/database_bootstrap_reader_role.py) prepares a
+passwordless setup-visible login through a separate pinned custodian. After setup, match
+the baseline plan to the setup route and the new database OID. Activate once, with a
+fresh SCRAM credential expiring within 120 seconds and no later than the authorized attempt.
+Reconcile shared ACLs separately if activation refuses. The fixture uses direct SELECT on
+physical relations. Only the protected read-only caller may use the credential, since its
+SQL role grants permit reading the underlying rows.
+
+Keep exclusive custody over schema, grants and the role. On completion or failure, commit
+the login and password fence before draining sessions and revoking the exact scoped grants.
+Require the retired result and SQL success. Discard a still-pending login from maintenance
+if setup did not finish. For live use, wire the SQL to protected custody, bind the runner to
+the issued role OID and remove and read back the Environment pins and 0600 connection
+reference on every exit. Reconcile uncertain commits before another attempt.
+
 ### Setup role custody and lifecycle
 
 The dormant [role SQL](../.github/scripts/database_bootstrap_role.py)
