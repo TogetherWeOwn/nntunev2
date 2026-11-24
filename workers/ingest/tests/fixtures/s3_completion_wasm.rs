@@ -60,6 +60,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
             header: enrollment.header().to_bytes(),
         };
         let page = enrollment.seal_chunk(&[42]).unwrap().page.unwrap();
+        let expected_page = hex::encode(&page);
         let manifest = enrollment.finish().unwrap();
         let put = SidecarPut::new(bucket, &context, &manifest, map_id, 0, &page).unwrap();
         let budget = if mode == "sidecar-expired" { 0 } else { 2000 };
@@ -67,7 +68,11 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
             .put_sidecar(put, now() + Duration::from_millis(budget))
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
-        return Ok(completed.pin().1.into());
+        return Ok(serde_json::json!({
+            "version": completed.pin().1,
+            "expectedPage": expected_page,
+        })
+        .to_string());
     }
     let mut sealer = OriginSealer::new(1).unwrap();
     let mut context = EnvelopeContext {

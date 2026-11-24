@@ -96,16 +96,19 @@ test('signs the ciphertext part and accepts only its matching checksum and ETag'
 });
 
 test('signs the sealer-derived sidecar page and captures its returned version', async (t) => {
+  let sentPage;
   const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
-    const body = await verifySignedRequest(request, 'PUT', '', undefined, sidecarKey);
-    assert.equal(body.length, 124);
-    assert.equal(body.subarray(0, 8).toString(), 'NNTDGP01');
-    assert.equal(body.subarray(12, 28).toString('hex'), mapId);
-    assert.equal(body.readUInt32BE(80), 0);
+    sentPage = await verifySignedRequest(request, 'PUT', '', undefined, sidecarKey);
     return new Response(null, { headers: { 'x-amz-version-id': version } });
   });
-  assert.equal(await complete('sidecar'), version);
+  const receipt = JSON.parse(await complete('sidecar'));
   assert.equal(fetch.mock.callCount(), 1);
+  assert.deepEqual(sentPage, Buffer.from(receipt.expectedPage, 'hex'));
+  assert.equal(sentPage.length, 124);
+  assert.equal(sentPage.subarray(0, 8).toString(), 'NNTDGP01');
+  assert.equal(sentPage.subarray(12, 28).toString('hex'), mapId);
+  assert.equal(sentPage.readUInt32BE(80), 0);
+  assert.equal(receipt.version, version);
 });
 
 test('refuses sidecar PUT for a different provider or bucket or an expired deadline', async (t) => {
