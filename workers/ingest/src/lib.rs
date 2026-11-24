@@ -2783,31 +2783,69 @@ mod tests {
     }
 
     #[test]
-    fn admission_meter_failure_leaves_pending_for_retry() {
-        // Queue accepted but the meter write failed: 503 with the ledger
-        // still pending (the orphan queue message is deduplicated by the
-        // consumer via idempotency_key); the retry meters exactly once.
-        let msg = admission_msg();
-        let mut ledger = MemLedger::new();
-        let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
-        let decision = drive_once(
-            &mut ledger,
-            &msg,
-            "parse",
-            true,
-            true,
-            &mut queue_calls,
-            &mut meter_calls,
-        );
-        match &decision {
-            AdmissionDecision::MeterUnavailable(e) => assert_eq!(e.http_status(), 503),
-            other => panic!("meter failure must stay retryable, got {other:?}"),
+    fn admission_meters_pending_retry_but_not_queued_replay() {
+        let search = crate::dispatch::build_search_dispatch(
+            "user_01",
+            "synthetic query",
+            "vault_idx_01-ab",
+            &[],
+            10,
+            0,
+        )
+        .unwrap();
+        for (msg, expected_stage) in [(admission_msg(), "parse"), (search, "search")] {
+            let stage = meter_entry_stage(msg.source);
+            assert_eq!(stage, expected_stage);
+            let mut ledger = MemLedger::new();
+            let (mut queue_calls, mut meter_calls) = (0usize, 0usize);
+
+            // A failed meter write leaves the admission pending even after
+            // the queue accepted the message. Retrying sends the same job
+            // again. Once queued, admission replays skip both side effects.
+            let failure = drive_once(
+                &mut ledger,
+                &msg,
+                stage,
+                true,
+                true,
+                &mut queue_calls,
+                &mut meter_calls,
+            );
+            let AdmissionDecision::MeterUnavailable(err) = failure else {
+                panic!("{stage} meter failure must stay retryable, got {failure:?}");
+            };
+            assert_eq!(err, MeterWriteError::Rejected { status: 500 });
+            assert_eq!(meter_failure_http(&err).status(), 503);
+            assert_eq!((queue_calls, meter_calls), (1, 1));
+            assert_eq!(
+                ledger.mark_of(&msg.job_id, stage),
+                Some(AdmissionMark::Pending)
+            );
+
+            for expected in [
+                AdmissionDecision::Admitted,
+                AdmissionDecision::AlreadyQueued,
+            ] {
+                assert_eq!(
+                    drive_once(
+                        &mut ledger,
+                        &msg,
+                        stage,
+                        true,
+                        false,
+                        &mut queue_calls,
+                        &mut meter_calls,
+                    ),
+                    expected,
+                    "{stage} admission must converge after the meter recovers",
+                );
+                assert_eq!((queue_calls, meter_calls), (2, 2));
+                assert_eq!(
+                    ledger.mark_of(&msg.job_id, stage),
+                    Some(AdmissionMark::Queued)
+                );
+            }
         }
-        assert_eq!((queue_calls, meter_calls), (1, 1));
-        assert_eq!(
-            ledger.mark_of(&msg.job_id, "parse"),
-            Some(AdmissionMark::Pending)
-        );
     }
 
     #[test]
