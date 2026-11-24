@@ -11,10 +11,10 @@ WITH binding AS MATERIALIZED (
     JOIN public.storage_digest_inventory_intents inv USING (map_id)
     CROSS JOIN LATERAL public.lock_storage_digest_winner(
         i.environment_id, i.library_id, $3, i.plaintext_bytes,
-        i.object_id, i.generation_id, $7) w
-    WHERE i.environment_id = $1 AND i.library_id = $2 AND i.plaintext_bytes = $4
-      AND i.object_id = $5 AND i.generation_id = $6
-      AND i.provider_configuration_version_id = $10 AND inv.media_version IS NOT NULL
+        i.object_id, i.generation_id, $7::text::uuid) w
+    WHERE i.environment_id = $1::text::uuid AND i.library_id = $2::text::uuid AND i.plaintext_bytes = $4
+      AND i.object_id = $5::text::uuid AND i.generation_id = $6::text::uuid
+      AND i.provider_configuration_version_id = $10::text::uuid AND inv.media_version IS NOT NULL
       AND w.object_id IS NOT NULL
 ), referenced AS MATERIALIZED (
     -- Lock the reference after the winner; a snapshot alone could see a
@@ -22,7 +22,7 @@ WITH binding AS MATERIALIZED (
     SELECT b.* FROM binding b
     JOIN public.storage_validated_digest_references r
       ON (r.environment_id, r.library_id, r.reference_id, r.object_id) =
-         (b.environment_id, b.library_id, $8, b.object_id)
+         (b.environment_id, b.library_id, $8::text::uuid, b.object_id)
     FOR UPDATE OF r
 )
 UPDATE public.storage_validated_digest_winners w

@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { AUTH_GENERATION_KEY, AUTH_LOCK } from '../auth-fence.js';
-import { LIBRARY_AUTH_CONTEXT_KEY, loadSnapshot } from './cache.js';
+import { LIBRARY_AUTH_CONTEXT_KEY, loadSnapshot, verifiedFavoritesKey } from './cache.js';
 import { createLibraryRefresher, type LibraryRefreshUpdate } from './refresh.js';
 
 const label = 'A'.repeat(43);
@@ -38,6 +38,17 @@ function setup(delayRead?: { number: number; wait: Promise<void>; requested: () 
 	return { local, session, verify, refresh, refresher, update: () => update, onAccessRefused };
 }
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+
+it('publishes storage tied to the verified listing and refuses it after account replacement', async () => {
+	const { refresh, local, session, update } = setup();
+	await refresh();
+	const { storageScope, deviceScope } = update();
+	expect(deviceScope).toEqual(expect.any(String));
+	expect(verifiedFavoritesKey(storageScope ?? null, label)).toBe(deviceScope);
+	local.setItem(AUTH_GENERATION_KEY, 'replacement');
+	expect(verifiedFavoritesKey(storageScope ?? null, label)).toBeNull();
+	expect(verifiedFavoritesKey(session, label)).toBe(deviceScope);
+});
 
 it.each([2, 3])('suspends when verification lock admission %i exceeds the deadline', async (delayedRead) => {
 	vi.useFakeTimers();

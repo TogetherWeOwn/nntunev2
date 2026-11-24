@@ -11,6 +11,7 @@ use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 pub mod head_receipt;
 pub mod readback_inventory;
 pub mod resume_checkpoint;
+pub mod session_completion;
 pub mod sidecar;
 
 pub const PART_BYTES: usize = 5_244_160;

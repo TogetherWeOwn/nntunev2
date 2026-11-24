@@ -8,7 +8,9 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
-import { captureAuthFence, runAuthMutation } from '../auth-fence.js';
+import {
+	captureAuthFence, runAuthMutation, SESSION_BINDING_HEADER, validSessionBinding, type AccountSession
+} from '../auth-fence.js';
 import { paywallFromResponse, type PaywallModel } from '../billing/planLimit.js';
 import { isJsonBodyTooLarge, readCappedJson } from './cappedJson.js';
 import { parseErrorBody } from './errors.js';
@@ -20,6 +22,8 @@ export interface ApiClientOptions {
 	fetchFn?: FetchFn;
 	/** Optional lifetime for requests owned by a mounted component. */
 	signal?: AbortSignal;
+	/** Cookie-only account work. Supply a binding only for contracts that require it. */
+	session?: { owner: AccountSession; binding?: string };
 }
 
 export class ApiError extends Error {
@@ -75,6 +79,10 @@ export interface MagicLinkResult {
 	 * landing page (login-CSRF defense in depth).
 	 */
 	email?: string;
+}
+
+interface RegisterFinishResponse extends MagicLinkResult {
+	private_listening?: true;
 }
 
 /** `POST /v1/auth/passkey/register/start` response (fixed shape, never an oracle). */
@@ -359,15 +367,26 @@ const COOKIE_MUTATIONS = new Set([
 	'/v1/session/reauthenticate/finish', '/v1/session/refresh', LOGOUT, REVOKE_ALL
 ]);
 
+function requiresSessionBinding(path: string, method?: string): boolean {
+	const route = path.split('?', 1)[0];
+	return (route === '/v1/me/taste/session' && ['GET', 'PUT', 'DELETE'].includes(method ?? '')) ||
+		((method === 'PUT' || method === 'DELETE') && /^\/v1\/me\/likes\/track\/[^/]+$/.test(route));
+}
+
 export class ApiClient {
 	private readonly baseUrl: string;
 	private readonly fetchFn: FetchFn;
 	private readonly signal?: AbortSignal;
+	private readonly session?: ApiClientOptions['session'];
 	private token: string | null = null;
 
-	constructor({ baseUrl, fetchFn, signal }: ApiClientOptions) {
+	constructor({ baseUrl, fetchFn, signal, session }: ApiClientOptions) {
 		this.baseUrl = baseUrl.replace(/\/+$/, '');
 		this.signal = signal;
+		if (session?.binding !== undefined && !validSessionBinding(session.binding)) {
+			throw new Error('Missing or invalid verified session binding');
+		}
+		this.session = session && { ...session };
 		// Default to a wrapper (not a bare `fetch` reference): calling a stored
 		// `fetch` as `this.fetchFn(...)` sets `this` to the client instance and
 		// browsers/workerd reject it with "Illegal invocation".
@@ -375,6 +394,7 @@ export class ApiClient {
 	}
 
 	setToken(token: string | null): void {
+		if (this.session && token !== null) throw new Error('Account requests use the browser session');
 		this.token = token;
 	}
 
@@ -630,13 +650,13 @@ export class ApiClient {
 	 * success body is shape-checked before it returns so a malformed
 	 * `challenge` surfaces as a typed `ApiError`, never a mid-ceremony throw.
 	 */
-	async registerStart(email: string, signal?: AbortSignal): Promise<RegisterStartResponse> {
+	async registerStart(email: string, signal?: AbortSignal, inviteCode?: string): Promise<RegisterStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/auth/passkey/register/start',
 			{
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ email }),
+				body: JSON.stringify({ email, invite_code: inviteCode }),
 				signal
 			}
 		);
@@ -644,8 +664,8 @@ export class ApiClient {
 	}
 
 	/** Finish passkey enrollment with the attestation + emailed code. */
-	async registerFinish(input: RegisterFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
-		return this.postWithSignal<MagicLinkResult>(
+	async registerFinish(input: RegisterFinishInput, signal?: AbortSignal): Promise<RegisterFinishResponse> {
+		return this.postWithSignal<RegisterFinishResponse>(
 			'/v1/auth/passkey/register/finish',
 			toRegisterFinishBody(input),
 			signal
@@ -719,27 +739,46 @@ export class ApiClient {
 			accept: 'application/json'
 		};
 		if (this.token !== null) headers['authorization'] = `Bearer ${this.token}`;
+		const session = this.session;
+		if (session && Object.keys(headers).some((name) => name.toLowerCase() === 'authorization')) {
+			throw new Error('Account requests use the browser session');
+		}
+		const bound = requiresSessionBinding(path, init.method);
+		if (bound) {
+			if (!session?.binding) throw new Error('Missing verified session binding');
+			headers[SESSION_BINDING_HEADER] = session.binding;
+		}
 
 		// Per-request deadline: abort hung fetches AND stalled body reads so
 		// auth spinners always settle. The timer is cleared on settle so
 		// fast requests never wait for it and later requests are unaffected.
 		const controller = new AbortController();
 		const callerSignal = init.signal ?? this.signal;
-		callerSignal?.throwIfAborted();
-		const onCallerAbort = (): void => controller.abort(callerSignal?.reason);
-		if (callerSignal?.aborted) controller.abort(callerSignal.reason);
-		else callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
+		// A same-binding refresh must wait for an already-dispatched preference
+		// write, including after a failed logout. Retirement still refuses its result.
+		const retirement = session && (!bound || init.method === 'GET') ? session.owner.signal : undefined;
+		const assertCurrent = () => {
+			callerSignal?.throwIfAborted();
+			session?.owner.signal.throwIfAborted();
+			if (session && !session.owner.isCurrent()) throw new DOMException('Account session ended', 'AbortError');
+		};
+		assertCurrent();
+		const onCallerAbort = () => controller.abort(callerSignal?.reason);
+		const onRetire = () => controller.abort(retirement?.reason);
+		callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
+		retirement?.addEventListener('abort', onRetire, { once: true });
 		let timedOut = false;
 		const timer = setTimeout(() => {
 			timedOut = true;
 			controller.abort(new DOMException(`request timed out after ${API_REQUEST_TIMEOUT_MS}ms`, 'TimeoutError'));
 		}, API_REQUEST_TIMEOUT_MS);
 		try {
-			callerSignal?.throwIfAborted();
+			assertCurrent();
 			const url = `${this.baseUrl}${path}`;
 			const route = init.method === 'POST' && new URL(url, globalThis.document?.baseURI ?? 'http://localhost').pathname;
 			const dispatch = () => this.fetchFn(url, {
 				...init,
+				...(session && { cache: 'no-store', redirect: 'error' } as const),
 				signal: controller.signal,
 				headers,
 				credentials: 'include'
@@ -748,8 +787,8 @@ export class ApiClient {
 				: route === LOGOUT ? { stale: staleSession() } : undefined;
 			const response = await (route && COOKIE_MUTATIONS.has(route)
 				? runAuthMutation(controller.signal, dispatch, intent) : dispatch());
-			// A transport may ignore abort; never publish an abandoned response.
-			callerSignal?.throwIfAborted();
+			// A transport may ignore abort; refuse its response before touching the body.
+			assertCurrent();
 			if (!response.ok) {
 				// A known denial must clear private rows without waiting for its body.
 				if (statusOnly?.(response.status)) {
@@ -763,6 +802,7 @@ export class ApiClient {
 				try {
 					body = await readCappedJson(response);
 				} catch (error) {
+					if (session) assertCurrent();
 					// Invite reads must not lose a known denial and retain private rows.
 					if (timedOut && !(init.method === 'GET' &&
 						[MEMBER_INVITES, `${MEMBER_INVITES}/history`].includes(path.split('?', 1)[0]) &&
@@ -777,16 +817,17 @@ export class ApiClient {
 					}
 					/* non-JSON error body: use status-based defaults */
 				}
-				callerSignal?.throwIfAborted();
+				assertCurrent();
 				const parsed = parseErrorBody(body, response.status);
 				const paywall = paywallFromResponse({ status: response.status, headers: response.headers, body });
 				throw new ApiError(response.status, parsed.code, parsed.message, paywall, parsed.retryable);
 			}
 			try {
 				const data = (await readCappedJson(response)) as T;
-				callerSignal?.throwIfAborted();
+				assertCurrent();
 				return { data, status: response.status, headers: response.headers };
 			} catch (error) {
+				if (session) assertCurrent();
 				if (timedOut) throw this.timeoutError();
 				// An over-cap 2xx never parses: surface the typed error, never
 				// a bare SyntaxError, never retryable, never a paywall, and
@@ -815,6 +856,7 @@ export class ApiClient {
 		} finally {
 			clearTimeout(timer);
 			callerSignal?.removeEventListener('abort', onCallerAbort);
+			retirement?.removeEventListener('abort', onRetire);
 		}
 	}
 

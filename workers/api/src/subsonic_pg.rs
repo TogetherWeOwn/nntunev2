@@ -1,6 +1,7 @@
 //! Hyperdrive persistence for the production credential core. Not an HTTP mount.
 use super::{PgStore, StoreError, TOTAL_TIMEOUT_MS};
 use crate::field_envelope::FieldEnvelope;
+use crate::postgres::{PgConnect, PgQuery, PgTransaction};
 use crate::subsonic_auth::{
     AuthError, AuthMode, CredentialRecord, CredentialStore, Principal, Reindex, TokenEnvelope,
 };
@@ -8,7 +9,7 @@ use nntune_subsonic::{
     construction_budget::ConstructionBudget, staging_rejection::StagingRejection, Identity,
     UserAccount,
 };
-use tokio_postgres::{types::Type, Client, GenericClient, Row, Transaction};
+use tokio_postgres::{types::Type, Row};
 
 macro_rules! lookup_sql {
     (bounded, $predicate:literal) => {
@@ -141,7 +142,7 @@ fn record(
 /// Migration 0037 may still be pending in production. Until it lands there
 /// are no compat credentials, so lifecycle reads/revokes are empty no-ops
 /// instead of missing-relation errors. A probe failure stays loud.
-async fn compat_table_present(client: &mut Client) -> Result<bool, StoreError> {
+async fn compat_table_present(client: &mut impl PgConnect) -> Result<bool, StoreError> {
     // Unqualified like the queries below: the probe must resolve the same
     // table the compat queries reach through the active search_path.
     let rows = client
@@ -157,25 +158,25 @@ async fn compat_table_present(client: &mut Client) -> Result<bool, StoreError> {
         .unwrap_or(false))
 }
 
-async fn transaction(client: &mut Client) -> Result<Transaction<'_>, StoreError> {
+async fn transaction(client: &mut impl PgConnect) -> Result<PgTransaction<'_>, StoreError> {
     let tx = client.transaction().await.map_err(|_| StoreError)?;
     // Hyperdrive transaction pooling requires the timeout on this transaction.
-    tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOTAL_TIMEOUT_MS}"))
+    tx.set_local_statement_timeout(TOTAL_TIMEOUT_MS)
         .await
         .map_err(|_| StoreError)?;
     Ok(tx)
 }
 
-async fn staging_transaction(client: &mut Client) -> Result<Transaction<'_>, StoreError> {
+async fn staging_transaction(client: &mut impl PgConnect) -> Result<PgTransaction<'_>, StoreError> {
     let tx = client.transaction().await.map_err(|_| StoreError)?;
-    tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '1s'")
+    tx.set_local_subsonic_timeouts()
         .await
         .map_err(|_| StoreError)?;
     Ok(tx)
 }
 
 async fn lookup(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     version: Option<u32>,
     value: &str,
 ) -> Result<Option<CredentialRecord>, StoreError> {
@@ -187,7 +188,7 @@ async fn lookup(
 
 /// Unmounted lookup on the existing app client. Expiry does not prove driver cancellation.
 pub async fn load_staging_credential(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     budget: &mut ConstructionBudget,
     version: Option<u32>,
     value: &str,
@@ -207,7 +208,7 @@ pub async fn load_staging_credential(
 }
 
 async fn lookup_record(
-    tx: &Transaction<'_>,
+    tx: &PgTransaction<'_>,
     version: Option<u32>,
     value: &str,
     budget: Option<&mut ConstructionBudget>,
@@ -281,14 +282,14 @@ fn account_fields(
 /// bounds this lookup, not the driver's cancellation or teardown.
 pub async fn load_staging_account(
     budget: &mut ConstructionBudget,
-    client: &mut Client,
+    client: &mut impl PgConnect,
     principal: &Principal,
 ) -> Result<(Identity, UserAccount), StagingRejection> {
     use StagingRejection::BusyOrCapacity;
     super::with_deadline(
         async {
             let tx = client.transaction().await.map_err(|_| BusyOrCapacity)?;
-            tx.batch_execute("SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '1s'")
+            tx.set_local_subsonic_timeouts()
                 .await
                 .map_err(|_| BusyOrCapacity)?;
             let row = staging_account_row(&tx, principal.user_id())
@@ -318,7 +319,7 @@ pub async fn load_staging_account(
 }
 
 async fn staging_account_row(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     user_id: &str,
 ) -> Result<Option<Row>, StoreError> {
     // Same-statement projection: return a NULL sentinel, never the oversized
@@ -370,10 +371,7 @@ pub(crate) fn account_fields_use_the_carried_charge() {
     assert_eq!(budget.charged(), 0);
 }
 
-async fn owner_fence(
-    tx: &impl GenericClient,
-    selected: &CredentialRecord,
-) -> Result<bool, StoreError> {
+async fn owner_fence(tx: &impl PgQuery, selected: &CredentialRecord) -> Result<bool, StoreError> {
     if selected.scope != "subsonic" || selected.revoked || !selected.owner_active {
         return Ok(false);
     }
@@ -390,7 +388,7 @@ async fn owner_fence(
 }
 
 async fn mutate(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     s: &CredentialRecord,
     completion: Option<Option<&Reindex>>,
     now: u64,
@@ -401,7 +399,7 @@ async fn mutate(
 /// The same fenced admission/completion updates, on the staging app client.
 /// Keep admission and completion in separate committed transactions.
 pub async fn mutate_staging_credential(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     selected: &CredentialRecord,
     completion: Option<Option<&Reindex>>,
     now: u64,
@@ -424,7 +422,7 @@ pub async fn mutate_staging_credential(
 }
 
 async fn mutate_transaction(
-    tx: Transaction<'_>,
+    tx: PgTransaction<'_>,
     s: &CredentialRecord,
     completion: Option<Option<&Reindex>>,
     now: u64,
@@ -575,7 +573,7 @@ impl CredentialStore for PgStore {
 const MAX_ACTIVE_CREDENTIALS: i64 = 32;
 
 pub(super) async fn insert(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     prepared: &crate::subsonic_lifecycle::PreparedCredential,
     session: &crate::session::SessionClaims,
 ) -> Result<bool, StoreError> {
@@ -690,7 +688,7 @@ pub(super) async fn insert(
 }
 
 pub(super) async fn list(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     user_id: &str,
 ) -> Result<Vec<crate::subsonic_lifecycle::ListedCredential>, StoreError> {
     if !compat_table_present(client).await? {
@@ -737,7 +735,7 @@ pub(super) async fn list(
 }
 
 pub(super) async fn revoke(
-    client: &mut Client,
+    client: &mut impl PgConnect,
     id: Option<&str>,
     user_id: &str,
     now: u64,

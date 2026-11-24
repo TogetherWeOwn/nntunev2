@@ -1,5 +1,78 @@
 # NNTune v2 agent notes
 
+## Documentation map
+
+- Start with the [roadmap](ROADMAP.md) for agreed product boundaries and conditional work.
+- Read the [handoff](docs/handoff.md) for the dated source state, remaining work and published evidence.
+- Use the [M1 traceability matrix](docs/m1-exit-traceability.md) and the
+  [staging promotion checklist](docs/ops.md#staging-promotion-checklist) for acceptance and rollback.
+- Consult the [architecture decision records](docs/adr/README.md) for design decisions and amendments.
+
+## Working in T3 Code
+
+The lead prioritizes and dispatches work, with up to four active task threads
+per project. One task thread owns each PR-sized change in its own worktree,
+from implementation through review, CI, merge and settlement. Continue an
+existing PR on its branch. Use the PR watch for GitHub updates and settle the
+thread when the work is complete.
+[CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) defines review
+tiers, exact-commit evidence and merge authority.
+
+Delegated implementation stays within the assigned worktree and file scope.
+The task owner handles commits, pushes, PRs and integration. Implementation
+helpers report changed files, dependencies, integration risks and verification,
+including any checks they skipped. Search and triage helpers use read-only
+inspection and report findings with file and line references, including where
+they looked when evidence is missing.
+
+The task owner makes ordinary technical and staging decisions and takes a
+conservative approach to UI decisions. Describe any user-visible changes in
+the PR. Escalate to the repository owner only for spending beyond approved
+budgets, permanent deletion of member data, shutting down a member-facing
+service, or genuine legal, terms-of-service or privacy questions.
+
+Handle production changes as separate [release tasks](CONTRIBUTING.md#production-releases).
+Follow the exact-commit admission, approval and access gates in the
+[operations runbook](docs/ops.md#staging-promotion-checklist).
+
+Keep staging and production storage separate, and keep scratch data out of
+archive buckets. Existing access, retention and deletion controls apply to
+all environments. See the [storage boundary ADR](docs/adr/0015-standard-s3-storage-boundary.md)
+and [bucket inventory](docs/ops.md#cloudflare).
+
+### Model selection and effort
+
+T3 Code selects the provider, model and effort for each thread through the
+project default, a thread's launch selection or an independent reviewer's
+target. The repository owner chooses the harness. Use the project default
+when launching task threads and apply any task-specific model choice at
+dispatch. Follow the independent cross-family review requirements in
+[CONTRIBUTING.md](CONTRIBUTING.md#merge-policy) based on the model that ran
+each review. Include [REVIEW.md](REVIEW.md) in each independent review brief.
+
+- Use `claude-opus-5-5` whenever selecting Opus. Name that exact model ID
+  in task, review and child briefs that request Opus, and set the effort
+  explicitly. Use `medium` effort by default for tasks and reviews. Use
+  `high` or `xhigh` only when the brief documents why the task needs it.
+- Use `high` effort by default for Sol. Use `xhigh` only when the brief
+  justifies it.
+- Never use `max`, `ultra` or `ultrathink` on any model.
+
+Keep model and effort policy here. Leave model selection to T3 Code and
+keep repository harness configuration free of model pins, model-selection
+environment variables and model-forcing hooks. The root `CLAUDE.md` imports
+these shared instructions.
+
+## Shell cleanup
+
+Never use forced `rm`, including `rm -f`, `rm -rf` or `rm --force`. This
+applies inside trap cleanups, `bash -lc` strings and all other wrappers.
+Use `rm -r -- "$dir"` for a directory and `rm -- "$file"` for a file. If
+cleanup is optional and the path might be absent, check for it first.
+
+Report shell approval prompts to the task lead with the exact command
+shape. Preserve the flags and wrapper and redact sensitive literals.
+
 ## CI and verification location
 
 Full test suites and CI gates run on GitHub Actions, never as local
@@ -8,7 +81,7 @@ and open a draft PR while incomplete; the actual workflow is
 `.github/workflows/ci.yml` with the aggregate `ci-ok` gate.
 [CONTRIBUTING.md](CONTRIBUTING.md#verification-github-actions-first)
 defines focused reproduction, guarded Boat use and exact-head Actions
-run/job evidence for reviewers and the Release Manager. Local transcripts
+run/job evidence for reviewers and the owner. Local transcripts
 are not CI evidence; required checks and review/release gates stay intact.
 
 Local test execution is allowed only for focused reproduction of one
@@ -50,7 +123,7 @@ Pool facts:
 - Two slots, each with a sampled byte budget (see
   `scripts/cargo_pool_policy.json`, provisioned on the host under
   `/paperclip/.cache/nntunev2-bounded`). The hard aggregate bound is a
-  host-enforced filesystem quota, attested by the Operator receipt in
+  host-enforced filesystem quota, attested by the operator receipt in
   the pool policy — not by the script.
 - The wrapper adds `--offline --locked`, redirects `CARGO_TARGET_DIR`
   and `TMPDIR` into per-worktree subdirs (`ws-<hash>`) under the leased
@@ -61,7 +134,7 @@ Pool facts:
   material refuses the slot, leaving it unchanged); legacy
   shared-target slots migrate automatically after the same check.
 - Exit 75 means refused: both slots busy, a slot over budget, a stale
-  lease needing Operator inspection, a missing/bad pool, or low
+  lease needing host operator inspection, a missing/bad pool, or low
   filesystem headroom. Retry later. Never fall back to a per-worktree
   `target/`, never set `CARGO_TARGET_DIR` manually, and never run a
   direct compiling `cargo` command to dodge the pool.
@@ -71,7 +144,7 @@ Pool facts:
   do not compile and run directly.
 - One interrupted run keeps its `lease.json` sentinel; a stale
   under-budget lease with a dead Cargo process group is recovered on
-  the next acquire, anything else stays for Operator inspection.
+  the next acquire, anything else stays for host operator inspection.
 
 ## Clean-room, YouTube and MetaBrainz guardrails
 
@@ -165,6 +238,30 @@ Do not extend the spike, and do not copy its approach into new code.
   1 request/second per IP and a descriptive `User-Agent` of the form
   `nntune/<version> ( <contact> )`. Serve product reads from the
   mirror, not the live API.
+
+## Modern web platform guidance
+
+Before writing or changing browser-facing code in the SvelteKit app under `apps/web/` (`.svelte` components, CSS, HTML, client-side TypeScript), consult Modern Web Guidance. It covers current HTML, CSS and DOM APIs, accessibility, forms and performance. Skip it for server-only code, Rust crates and workers. The clean-room, YouTube and MetaBrainz guardrails above still win over any guide.
+
+1. Run every Modern Web Guidance invocation with `DISABLE_TELEMETRY=1`
+   and an environment limited to the runner settings shown below. Use the
+   installed `modern-web-guidance` skill only if you can apply those controls
+   and the same CLI version to its commands. Otherwise use the CLI directly
+   (Node 22+):
+
+   ```sh
+   env -i PATH="$PATH" HOME="$HOME" DISABLE_TELEMETRY=1 \
+     npx -y modern-web-guidance@1.0.1 search "<2-5 word capability>"
+   env -i PATH="$PATH" HOME="$HOME" DISABLE_TELEMETRY=1 \
+     npx -y modern-web-guidance@1.0.1 retrieve "<id>"
+   ```
+
+   Search one capability at a time (for example `"light dismiss dialog"`),
+   without framework or app names.
+2. Apply only the retrieved guidance that fits the task. Keep existing behavior, copy, design tokens and
+   the stack the route already uses; record any guide you followed in the PR body.
+3. The guidance never overrides this file, an ADR, or a project decision. If they
+   conflict, follow the project and note the conflict in the PR.
 
 ## Contributing
 

@@ -225,7 +225,8 @@ fn total_budget_encloses_dial_handshake_and_statement_setup_without_reset() {
         "socket.opened()",
         "DIAL_TIMEOUT_MS",
         ".connect_raw(socket,worker::postgres_tls::PassthroughTls)",
-        "client.batch_execute(",
+        ".map(|(client,connection)|(PgClient::new(client),connection))",
+        "client.set_statement_timeout(",
         "Ok(client)",
     ] {
         assert!(
@@ -234,12 +235,9 @@ fn total_budget_encloses_dial_handshake_and_statement_setup_without_reset() {
         );
     }
     assert!(operation.find("socket.opened()").unwrap() < operation.find(".connect_raw(").unwrap());
-    assert!(
-        operation.find(".connect_raw(").unwrap() < operation.find("client.batch_execute(").unwrap()
-    );
-    assert!(
-        operation.find("client.batch_execute(").unwrap() < operation.find("Ok(client)").unwrap()
-    );
+    let timeout_at = operation.find("client.set_statement_timeout(").unwrap();
+    assert!(operation.find(".connect_raw(").unwrap() < timeout_at);
+    assert!(timeout_at < operation.find("Ok(client)").unwrap());
 }
 
 #[test]
@@ -260,19 +258,19 @@ fn returned_client_finishes_setting_statement_timeout_to_the_overall_budget() {
         1,
         "one SET per connection"
     );
-    let sets = calls(operation, "client.batch_execute");
+    let sets = calls(operation, "client.set_statement_timeout");
     assert_eq!(sets.len(), 1);
-    assert!(sets[0].args[0].contains("SETstatement_timeout="));
-    assert!(
-        sets[0].args[0].contains("TOTAL_TIMEOUT_MS"),
-        "SET uses the shared total, not a fresh literal"
-    );
+    assert_eq!(sets[0].args, ["TOTAL_TIMEOUT_MS"]);
+    let wrapper = include_str!("../src/postgres.rs");
+    let setter = function_body(wrapper, "async fn set_statement_timeout(");
+    assert!(setter.contains(".batch_execute(&format!(\"SET statement_timeout = {ms}\"))"));
     assert!(
         sets[0].after.starts_with(".await.map_err(|_|StoreError)?"),
         "SET must finish or fail before returning the client"
     );
     assert!(
-        operation.find("spawn_local(").unwrap() < operation.find("client.batch_execute(").unwrap(),
+        operation.find("spawn_local(").unwrap()
+            < operation.find("client.set_statement_timeout(").unwrap(),
         "the connection driver must be running before awaiting SET"
     );
 }
