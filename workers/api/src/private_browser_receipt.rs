@@ -22,7 +22,7 @@ pub(crate) struct BrowserScope<'a> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BrowserStart {
+pub struct BrowserStart {
     pub track_id: String,
     pub session_id: String,
     pub play_id: Option<String>,
@@ -160,6 +160,26 @@ impl PrivatePlayback<'_> {
             accepted_seq: pins.accepted_seq,
             music,
         }))
+    }
+
+    pub(crate) async fn load_browser(
+        &self,
+        db: &impl PgQuery,
+        claims: &SessionClaims,
+        path: &str,
+        scope: BrowserScope<'_>,
+        now: impl Fn() -> SystemTime,
+    ) -> Result<Option<PrivateReceipt>, StoreError> {
+        let Some((lease, pins)) = current(db, &claims.user_id).await? else {
+            return Ok(None);
+        };
+        if path != format!("{}/{}/{}", lease.track_id, lease.session_id, lease.play_id) {
+            return Ok(None);
+        }
+        let receipt = self
+            .browser_receipt_for(db, claims, lease, &pins, scope, seconds(now())?)
+            .await?;
+        Ok(receipt.filter(|receipt| now() < receipt.music.grant_deadline))
     }
 
     /// Issue under the privacy/deletion fence, or replay the exact current

@@ -777,11 +777,26 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    fn browser_playback_enabled(&self) -> bool {
+        false
+    }
+
+    fn open_browser_playback(
+        &self,
+        _claims: &SessionClaims,
+        _start: &crate::private_playback::browser::BrowserStart,
+        _config: &Config,
+    ) -> impl Future<Output = Result<Option<browser_playback_relay::BrowserReceipt>, StoreError>>
+    {
+        async { Ok(None) }
+    }
+
     /// Find the committed catalogue receipt for this member and exact media path.
     fn browser_playback_receipt(
         &self,
-        _user_id: &str,
+        _claims: &SessionClaims,
         _media_path: &str,
+        _config: &Config,
     ) -> impl Future<Output = Result<Option<browser_playback_relay::BrowserReceipt>, StoreError>>
     {
         async { Ok(None) }
@@ -5160,7 +5175,7 @@ fn scope_forbidden() -> Response {
     }
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     let error = crate::api_error::ApiError::not_found("not found");
     Response {
         status: error.status,
@@ -6732,7 +6747,8 @@ pub(crate) const PRIVATE_PLAY_PREFIX: &str = "private_";
 
 fn is_private_play_id(play_id: &str) -> bool {
     // Standard play ids encode 16 bytes in 22 unpadded base64url characters.
-    play_id.len() == PRIVATE_PLAY_PREFIX.len() + 22 && play_id.starts_with(PRIVATE_PLAY_PREFIX)
+    (play_id.len() == PRIVATE_PLAY_PREFIX.len() + 22 && play_id.starts_with(PRIVATE_PLAY_PREFIX))
+        || crate::private_playback::browser::is_browser_play(play_id)
 }
 
 #[derive(Deserialize)]
@@ -6847,6 +6863,78 @@ fn mint_play(
     }
 }
 
+pub(crate) async fn browser_play_issue<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    req: &Request,
+    expected: Option<&str>,
+) -> Response
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use crate::private_playback::browser::BrowserStart;
+
+    if !ctx.store.browser_playback_enabled()
+        || ctx.cfg.private_listening.is_none()
+        || req.body.len() > 1024
+    {
+        return not_found();
+    }
+    let (claims, _) = match preference_authenticate(ctx, req, true).await {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    let binding = match require_session_binding(&claims, expected) {
+        Ok(binding) => binding,
+        Err(response) => return response,
+    };
+    if let Err(response) = ctx.private_listening_deadline(&claims.user_id).await {
+        return response;
+    }
+    if req.body.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+        return invalid_request();
+    }
+    let Some(input) = parse_body::<BrowserStart>(req) else {
+        return invalid_request();
+    };
+    let receipt = match ctx
+        .store
+        .open_browser_playback(&claims, &input, ctx.cfg)
+        .await
+    {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => return not_found(),
+        Err(_) => return unavailable(),
+    };
+    if receipt.user_id != claims.user_id
+        || receipt.session_binding != binding
+        || receipt.lease.session_id != input.session_id
+        || receipt.lease.track_id != input.track_id
+        || input
+            .play_id
+            .as_ref()
+            .is_some_and(|id| *id != receipt.lease.play_id)
+    {
+        return not_found();
+    }
+    let mut response = json_response(
+        200,
+        serde_json::json!({
+            "sessionBinding": binding,
+            "playbackSessionId": receipt.lease.session_id,
+            "trackId": receipt.lease.track_id,
+            "playId": receipt.lease.play_id,
+            "durationMs": receipt.duration_ms,
+        }),
+    );
+    response
+        .extra_headers
+        .push(("cache-control".into(), "private, no-store".into()));
+    response
+}
+
 async fn play_issue<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
@@ -6924,6 +7012,13 @@ where
     let Some(body) = body else {
         return Err(validation_failed("invalid request"));
     };
+    if body
+        .play_id
+        .as_deref()
+        .is_some_and(crate::private_playback::browser::is_browser_play)
+    {
+        return Err(not_found());
+    }
     if !valid_client_session_id(&body.session_id) {
         return Err(validation_failed("invalid session_id"));
     }
@@ -7180,6 +7275,9 @@ where
     let Some(body) = parse_body::<PlayHeartbeatBody>(req) else {
         return validation_failed("invalid request");
     };
+    if crate::private_playback::browser::is_browser_play(&body.play_id) {
+        return not_found();
+    }
     if !valid_client_session_id(&body.session_id) {
         return validation_failed("invalid session_id");
     }
@@ -9296,6 +9394,8 @@ mod tests {
         duration_lookups: std::cell::Cell<usize>,
         meter_meta: RefCell<HashMap<(String, String), crate::meter_sink::TrackMeterMeta>>,
         browser_receipt: RefCell<Option<browser_playback_relay::BrowserReceipt>>,
+        browser_playback_armed: std::cell::Cell<bool>,
+        browser_playback_opens: std::cell::Cell<usize>,
         /// Stored play windows by idempotency key, mirroring the
         /// monotonic upsert (see `record_play_window`).
         play_windows: RefCell<HashMap<String, crate::ledger::PlayWindow>>,
@@ -9818,10 +9918,26 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        fn browser_playback_enabled(&self) -> bool {
+            self.browser_playback_armed.get()
+        }
+
+        async fn open_browser_playback(
+            &self,
+            _: &SessionClaims,
+            _: &crate::private_playback::browser::BrowserStart,
+            _: &Config,
+        ) -> Result<Option<browser_playback_relay::BrowserReceipt>, StoreError> {
+            self.browser_playback_opens
+                .set(self.browser_playback_opens.get() + 1);
+            Ok(self.browser_receipt.borrow().clone())
+        }
+
         async fn browser_playback_receipt(
             &self,
+            _: &SessionClaims,
             _: &str,
-            _: &str,
+            _: &Config,
         ) -> Result<Option<browser_playback_relay::BrowserReceipt>, StoreError> {
             Ok(self.browser_receipt.borrow().clone())
         }

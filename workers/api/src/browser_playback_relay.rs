@@ -107,7 +107,7 @@ where
                 .ok_or_else(not_found)?;
             receipt = ctx
                 .store
-                .browser_playback_receipt(&claims.user_id, path)
+                .browser_playback_receipt(&claims, path, ctx.cfg)
                 .await
                 .map_err(|_| unavailable())?
                 .ok_or_else(not_found)?;
@@ -133,13 +133,16 @@ where
         return Err(not_found());
     }
 
-    let meta = ctx
-        .store
-        .track_meta(grant.user_id, track_id, true)
-        .await
-        .map_err(|_| unavailable())?;
-    if meta.track_duration_ms != Some(grant.duration_ms.get()) {
-        return Err(not_found());
+    // The browser receipt store already checks canonical publication duration.
+    if !crate::private_playback::browser::is_browser_play(play_id) {
+        let meta = ctx
+            .store
+            .track_meta(grant.user_id, track_id, true)
+            .await
+            .map_err(|_| unavailable())?;
+        if meta.track_duration_ms != Some(grant.duration_ms.get()) {
+            return Err(not_found());
+        }
     }
     let lease = ctx
         .store

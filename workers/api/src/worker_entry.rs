@@ -848,6 +848,9 @@ pub(crate) mod subsonic_pg_page;
 pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
 pub use subsonic_pg::load_staging_account;
 
+#[path = "private_browser_worker.rs"]
+mod private_browser_worker;
+
 struct PgStore {
     env: Option<Env>,
     trace_id: String,
@@ -4116,6 +4119,30 @@ impl Store for PgStore {
             TOTAL_TIMEOUT_MS,
         )
         .await
+    }
+
+    fn browser_playback_enabled(&self) -> bool {
+        self.env
+            .as_ref()
+            .is_some_and(private_browser_worker::enabled)
+    }
+
+    async fn open_browser_playback(
+        &self,
+        claims: &crate::session::SessionClaims,
+        input: &crate::private_playback::browser::BrowserStart,
+        cfg: &Config,
+    ) -> Result<Option<handlers::browser_playback_relay::BrowserReceipt>, StoreError> {
+        private_browser_worker::open(self, claims, input, cfg).await
+    }
+
+    async fn browser_playback_receipt(
+        &self,
+        claims: &crate::session::SessionClaims,
+        path: &str,
+        cfg: &Config,
+    ) -> Result<Option<handlers::browser_playback_relay::BrowserReceipt>, StoreError> {
+        private_browser_worker::media(self, claims, path, cfg).await
     }
 
     async fn private_listening_access(
@@ -7813,6 +7840,15 @@ where
     let expected_session_binding = headers
         .get(handlers::SESSION_BINDING_HEADER)
         .map(String::as_str);
+    if request.method == "POST" && request.path == "/v1/plays" {
+        if let Some(selector) = headers.get("x-nntune-browser-playback") {
+            return if selector == "1" {
+                handlers::browser_play_issue(ctx, &request, expected_session_binding).await
+            } else {
+                handlers::not_found()
+            };
+        }
+    }
     handlers::handle_with_session_binding(ctx, &request, expected_session_binding).await
 }
 
