@@ -115,6 +115,16 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
     }
     let authorization = req.headers().get("authorization").ok().flatten();
     let token = play_route::bearer_token(authorization.as_deref()).unwrap_or("");
+    if token.starts_with("v4.") {
+        let request = play_route::PlayRouteRequest {
+            track_id: track_id.into(),
+            token: Some(token.into()),
+            range: req.headers().get("range")?,
+            trace_id: None,
+        };
+        use crate::enrolled_playback::route::worker::{serve, Unregistered};
+        return serve(req, env, ctx, request, secret, None::<Unregistered>).await;
+    }
     let now_unix = Date::now().as_millis() / 1000;
     let play = match r2_play::authorize(token, track_id, secret.as_bytes(), now_unix) {
         Ok(play) => play,
@@ -312,7 +322,10 @@ async fn post_delivered(env: &Env, user_id: &str, body: &str) -> core::result::R
 /// Render a shared-envelope error (`docs/api-errors.md`) as the play
 /// route's refusal; `extra` carries at most one route header (the `416`
 /// `Content-Range`).
-fn api_error_response(error: &ApiError, extra: Option<(&str, &str)>) -> Result<Response> {
+pub(crate) fn api_error_response(
+    error: &ApiError,
+    extra: Option<(&str, &str)>,
+) -> Result<Response> {
     let headers = Headers::new();
     headers.set("content-type", "application/json")?;
     headers.set("cache-control", "private, no-store")?;

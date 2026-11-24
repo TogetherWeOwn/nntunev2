@@ -659,6 +659,7 @@ version = "0.1.0"
 name = "nntune-stream"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
  "futures-util",
  "nntune-core",
  "nntune-logging",

@@ -93,7 +93,10 @@ pub struct WorkerOriginalControl {
 
 impl WorkerOriginalControl {
     pub fn new(authority: &OriginalAuthorization, request: &Request) -> worker::Result<Self> {
-        let expiry_unix = authority.grant.exp_unix;
+        Self::until(authority.grant.exp_unix, request)
+    }
+
+    pub(crate) fn until(expiry_unix: u64, request: &Request) -> worker::Result<Self> {
         let timer: Pin<Box<dyn Future<Output = ()>>> = Box::pin(async move {
             loop {
                 // Compute on poll, not construction: a delayed first poll must
@@ -168,7 +171,7 @@ pub fn response_channel(
     channel(play.status, &play.headers, play.body_len)
 }
 
-fn channel(
+pub(crate) fn channel(
     status: u16,
     values: &[(String, String)],
     body_len: u64,
