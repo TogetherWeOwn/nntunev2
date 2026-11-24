@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::library::{check_name, clamp_page_size, new_public_id, page_cursor, parse_page_cursor};
+use crate::postgres::{PgConnect, PgQuery};
 use serde_json::{json, Value};
-use tokio_postgres::{types::ToSql, Client, GenericClient, IsolationLevel};
+use tokio_postgres::types::{ToSql, Type};
 
 const LIST: &str = "
 SELECT p.public_id, p.name FROM playlists p JOIN users u ON u.id = p.owner_user_id
@@ -28,6 +29,12 @@ const LOCK_ACCOUNT: &str = "SELECT 1 FROM users WHERE id = $1 AND deleting_at IS
 const LOCK_PLAYLIST: &str = "
 SELECT id FROM playlists WHERE owner_user_id = $1 AND public_id = $2 AND NOT is_public
   AND ($3::boolean OR deleting_at IS NULL) FOR UPDATE";
+
+const CREATE: &str = "INSERT INTO playlists (owner_user_id, public_id, name, created_at)
+VALUES ($1, $2, $3, extract(epoch FROM now())::bigint)
+RETURNING jsonb_build_object('id', public_id, 'name', name)::text";
+const RENAME: &str = "UPDATE playlists SET name = $2 WHERE id = $1
+RETURNING jsonb_build_object('id', public_id, 'name', name)::text";
 
 const APPEND: &str = "
 WITH next AS (
@@ -137,7 +144,7 @@ fn command(req: &Request) -> Result<(u16, Command<'_>), Response> {
 pub(super) async fn route(
     ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
     req: &Request,
-    db: &mut Client,
+    db: &mut impl PgConnect,
 ) -> Response {
     if req.authorization.is_some() {
         return not_found();
@@ -161,11 +168,15 @@ pub(super) async fn route(
 }
 
 async fn value(
-    db: &impl GenericClient,
+    db: &impl PgQuery,
     sql: &str,
-    args: &[&(dyn ToSql + Sync)],
+    args: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<Option<Value>, StoreError> {
-    let Some(row) = db.query_opt(sql, args).await.map_err(|_| StoreError)? else {
+    let row = db
+        .query_typed_opt(sql, args)
+        .await
+        .map_err(|_| StoreError)?;
+    let Some(row) = row else {
         return Ok(None);
     };
     let text = row.try_get(0).map_err(|_| StoreError)?;
@@ -173,15 +184,17 @@ async fn value(
 }
 
 async fn execute(
-    db: &mut Client,
+    db: &mut impl PgConnect,
     owner: &str,
     cmd: Command<'_>,
 ) -> Result<Option<Value>, StoreError> {
+    let owner = || (&owner as &(dyn ToSql + Sync), Type::TEXT);
     let handle = match cmd {
         Command::List(after, limit) => {
             let limit = clamp_page_size(limit);
+            let fetch = limit as i64 + 1;
             let rows = db
-                .query(LIST, &[&owner, &after, &(limit as i64 + 1)])
+                .query_typed(LIST, &[owner(), (&after, Type::TEXT), (&fetch, Type::INT8)])
                 .await
                 .map_err(|_| StoreError)?;
             let mut items = Vec::new();
@@ -196,66 +209,47 @@ async fn execute(
             }
             return Ok(Some(json!({"items": items, "next_cursor": next})));
         }
-        Command::Read(id) => return value(db, READ, &[&owner, &id]).await,
+        Command::Read(id) => return value(db, READ, &[owner(), (&id, Type::TEXT)]).await,
         Command::Create(_) => None,
         Command::Rename(id, _) | Command::Append(id, _) | Command::Delete(id) => Some(id),
     };
     // Wait for both locks before taking a fresh snapshot for duplicate checks.
-    let tx = db
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await
-        .map_err(|_| StoreError)?;
-    if tx
-        .query_opt(LOCK_ACCOUNT, &[&owner])
-        .await
-        .map_err(|_| StoreError)?
-        .is_none()
-    {
+    let tx = db.read_committed().await.map_err(|_| StoreError)?;
+    let account = tx.query_typed_opt(LOCK_ACCOUNT, &[owner()]).await;
+    if account.map_err(|_| StoreError)?.is_none() {
         return Ok(None);
     }
     let deleting = matches!(cmd, Command::Delete(_));
     let target: Option<i64> = if let Some(id) = handle {
-        tx.query_opt(LOCK_PLAYLIST, &[&owner, &id, &deleting])
-            .await
-            .map_err(|_| StoreError)?
-            .map(|row| row.try_get(0))
-            .transpose()
-            .map_err(|_| StoreError)?
+        tx.query_typed_opt(
+            LOCK_PLAYLIST,
+            &[owner(), (&id, Type::TEXT), (&deleting, Type::BOOL)],
+        )
+        .await
+        .map_err(|_| StoreError)?
+        .map(|row| row.try_get(0))
+        .transpose()
+        .map_err(|_| StoreError)?
     } else {
         None
     };
+    let target = (&target as &(dyn ToSql + Sync), Type::INT8);
     let result = match cmd {
         Command::Create(name) => {
             let id = new_public_id().map_err(|_| StoreError)?;
-            value(
-                &tx,
-                "INSERT INTO playlists (owner_user_id, public_id, name, created_at)
-                VALUES ($1, $2, $3, extract(epoch FROM now())::bigint)
-                RETURNING jsonb_build_object('id', public_id, 'name', name)::text",
-                &[&owner, &id, &name],
-            )
-            .await?
+            let params = [owner(), (&id, Type::TEXT), (&name, Type::TEXT)];
+            value(&tx, CREATE, &params).await?
         }
-        Command::Rename(_, name) => {
-            value(
-                &tx,
-                "UPDATE playlists SET name = $2 WHERE id = $1
-            RETURNING jsonb_build_object('id', public_id, 'name', name)::text",
-                &[&target, &name],
-            )
-            .await?
-        }
+        Command::Rename(_, name) => value(&tx, RENAME, &[target, (&name, Type::TEXT)]).await?,
         Command::Append(_, track) => {
-            value(
-                &tx,
-                APPEND,
-                &[&owner, &target, &track, &(crate::library::MAX_ITEMS as i32)],
-            )
-            .await?
+            let max_items = crate::library::MAX_ITEMS as i32;
+            let cap = (&max_items as &(dyn ToSql + Sync), Type::INT4);
+            let params = [owner(), target, (&track, Type::TEXT), cap];
+            value(&tx, APPEND, &params).await?
         }
-        Command::Delete(id) => value(&tx, DELETE_REQUEST, &[&owner, &id, &target]).await?,
+        Command::Delete(id) => {
+            value(&tx, DELETE_REQUEST, &[owner(), (&id, Type::TEXT), target]).await?
+        }
         Command::Read(_) | Command::List(_, _) => unreachable!(),
     };
     tx.commit().await.map_err(|_| StoreError)?;

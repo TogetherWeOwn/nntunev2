@@ -1,4 +1,5 @@
 use super::*;
+use tokio_postgres::Client;
 use Command::*;
 
 async fn connect() -> Client {
@@ -91,6 +92,10 @@ async fn postgres_store_rehearsal() {
     );
     assert!(first.is_some() && second.is_some());
     let detail = run(&mut db, owner, Read(unresolved)).await.unwrap();
+    assert_eq!(
+        detail["legacy_items"],
+        json!(["legacy-ref-au-unknown-1", "legacy-ref-au-unknown-2"])
+    );
     let positions: Vec<_> = detail["entries"]
         .as_array()
         .unwrap()
