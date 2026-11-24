@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nntune_core::s3_locator::{S3Binding, S3Locator};
-use tokio_postgres::types::Type;
+use tokio_postgres::{types::Type, Row};
 
 use crate::{
     handlers::{browser_playback_relay::BrowserReceipt, StoreError},
@@ -25,6 +25,7 @@ pub struct PublicationPins<'a> {
     pub version: &'a str,
 }
 
+#[derive(PartialEq, Eq)]
 pub struct ResolvedMusic {
     pub target: DigestReadTarget,
     pub locator: S3Locator,
@@ -46,17 +47,7 @@ pub async fn resolve(
     let track = &expected_lease.track_id;
     let exp = receipt.grant.exp_unix;
     let now_secs = || now().duration_since(UNIX_EPOCH).map(|time| time.as_secs());
-    let version = pins.version.as_bytes();
-    if !now_secs().is_ok_and(|time| receipt.valid_private_grant(grant_secret, time))
-        || !is_uuid_shaped(track)
-        || track.bytes().any(|b| b.is_ascii_uppercase())
-        || pins.bucket.len() > 63
-        || version.len() > 1024
-        || version.contains(&b',')
-        || version.contains(&0)
-        || pins.bucket.contains('\0')
-        || pins.accepted_seq <= 0
-    {
+    if !now_secs().is_ok_and(|time| receipt.valid_private_grant(grant_secret, time)) {
         return Ok(None);
     }
 
@@ -80,18 +71,47 @@ pub async fn resolve(
     if !lease_authorizes() {
         return Ok(None);
     }
-    let row = tx
+    let Some((mut resolved, _)) = lookup(&tx, track, pins, Some(&receipt.artifact_sha256)).await?
+    else {
+        return Ok(None);
+    };
+    resolved.grant_deadline = UNIX_EPOCH
+        .checked_add(Duration::from_secs(exp))
+        .ok_or(StoreError)?;
+    tx.commit().await.map_err(|_| StoreError)?;
+    Ok(lease_authorizes().then_some(resolved))
+}
+
+pub(crate) async fn lookup(
+    db: &impl PgQuery,
+    track: &str,
+    pins: &PublicationPins<'_>,
+    digest: Option<&str>,
+) -> Result<Option<(ResolvedMusic, Row)>, StoreError> {
+    let version = pins.version.as_bytes();
+    if !is_uuid_shaped(track)
+        || track.bytes().any(|b| b.is_ascii_uppercase())
+        || pins.bucket.len() > 63
+        || version.len() > 1024
+        || version.contains(&b',')
+        || version.contains(&0)
+        || pins.bucket.contains('\0')
+        || pins.accepted_seq <= 0
+    {
+        return Ok(None);
+    }
+    let row = db
         .query_typed_opt(
             include_str!("private_catalogue_read.sql"),
             &[
-                (track, Type::TEXT),
+                (&track, Type::TEXT),
                 (&uuid_text(pins.environment), Type::TEXT),
                 (&uuid_text(pins.library), Type::TEXT),
                 (&pins.accepted_seq, Type::INT8),
                 (&uuid_text(pins.provider_configuration), Type::TEXT),
                 (&pins.bucket, Type::TEXT),
                 (&pins.version, Type::TEXT),
-                (&receipt.artifact_sha256, Type::TEXT),
+                (&digest, Type::TEXT),
             ],
         )
         .await
@@ -122,15 +142,14 @@ pub async fn resolve(
         plaintext_sha256: digest.try_into().map_err(|_| StoreError)?,
         plaintext_bytes: row.try_get("plaintext_bytes").map_err(|_| StoreError)?,
     };
-    let grant_deadline = UNIX_EPOCH
-        .checked_add(Duration::from_secs(exp))
-        .ok_or(StoreError)?;
-    tx.commit().await.map_err(|_| StoreError)?;
-    Ok(lease_authorizes().then_some(ResolvedMusic {
-        target,
-        locator,
-        grant_deadline,
-    }))
+    Ok(Some((
+        ResolvedMusic {
+            target,
+            locator,
+            grant_deadline: UNIX_EPOCH,
+        },
+        row,
+    )))
 }
 
 #[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]

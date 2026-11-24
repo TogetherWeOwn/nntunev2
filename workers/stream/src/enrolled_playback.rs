@@ -3,7 +3,7 @@
 use std::time::SystemTime;
 
 use nntune_core::{
-    digest_enrollment::OriginManifest,
+    digest_enrollment::PlaybackManifest,
     digest_geometry::{DigestGeometry, RangeGeometry, SealedRangeChunk},
     digest_range::{DigestRange, OpenPart, RangeError},
     digest_read_snapshot::DigestReadSnapshot,
@@ -27,7 +27,7 @@ pub mod s3_transport;
 /// Independently resolved custody for that same committed root and lifecycle.
 pub struct EnrolledMedia<'a> {
     pub media: &'a S3MediaMetadata,
-    pub manifest: &'a OriginManifest,
+    pub manifest: PlaybackManifest<'a>,
     pub context: &'a EnvelopeContext,
     pub root: &'a [u8; 32],
     pub expected_record: &'a [u8; 230],
@@ -66,7 +66,6 @@ impl<'a> EnrolledPlayback<'a> {
         }
         let len = input.media.plaintext_len();
         let geometry = DigestGeometry::new(len).ok_or(PlaybackError::Binding)?;
-        let [_, identities @ ..] = input.context.identities;
         let locator = input.media.locator();
         if input.context.identities
             != [
@@ -78,15 +77,11 @@ impl<'a> EnrolledPlayback<'a> {
                 pins.provider_configuration,
             ]
             || pins.plaintext_len != len
-            || &pins.plaintext_sha256 != input.manifest.plaintext_sha256()
             || !input.media.matches_context(input.context)
             || input.media.ciphertext_len() != geometry.sealed_len()
             || !matches!(locator.binding(), S3Binding::VersionId(v) if v == pins.media_version)
             || pins.page_versions.len() != geometry.pages() as usize
-            || input
-                .manifest
-                .candidate_page_hashes(&identities, len, &pins.map_id, &input.context.header)
-                .is_none()
+            || !input.manifest.matches(&pins, input.context)
         {
             return Err(PlaybackError::Binding);
         }

@@ -125,9 +125,23 @@ impl PlaybackFixture {
             page_versions: &versions,
             usable_until: now() + Duration::from_millis(milliseconds.into()),
         };
+        use nntune_core::digest_enrollment::{PlaybackManifest, StoredManifest};
+        let [_, identities @ ..] = self.context.identities;
+        let rows = self
+            .manifest
+            .candidate_page_hashes(
+                &identities,
+                pins.plaintext_len,
+                &pins.map_id,
+                &self.context.header,
+            )
+            .ok_or_else(refused)?;
+        let manifest =
+            StoredManifest::from_committed_storage(&pins, self.context.header, rows.to_vec())
+                .ok_or_else(refused)?;
         let enrolled = EnrolledMedia {
             media: &media,
-            manifest: &self.manifest,
+            manifest: PlaybackManifest::Stored(&manifest),
             context: &self.context,
             root: &ROOT,
             expected_record: &self.envelope,

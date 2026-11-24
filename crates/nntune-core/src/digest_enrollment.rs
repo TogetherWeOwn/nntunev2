@@ -7,6 +7,7 @@
 use crate::digest_context::context_hash;
 use crate::digest_geometry::DigestGeometry;
 use crate::digest_page::{encode_page, page_hash};
+use crate::digest_read_snapshot::DigestReadSnapshot;
 use crate::media::{FileKey, Header};
 use crate::origin_sealer::OriginSealer;
 use sha2::{Digest, Sha256};
@@ -15,8 +16,7 @@ fn invalid() -> crate::Error {
     crate::Error::Malformed("invalid digest enrollment state".into())
 }
 
-/// Complete sealer-origin evidence. Its private fields cannot be hydrated from
-/// provider bytes or caller-supplied hashes, and do not authorize serving.
+/// Complete sealer-origin evidence, produced only by the enrollment sealer.
 ///
 /// Provider rows cannot be substituted into an existing manifest:
 /// ```compile_fail
@@ -32,7 +32,6 @@ fn invalid() -> crate::Error {
 ///     builder.rows.push(provider_hash);
 /// }
 /// ```
-#[allow(dead_code)] // Consumed by the independent verifier in the next slice.
 pub struct OriginManifest {
     geometry: DigestGeometry,
     map_id: [u8; 16],
@@ -40,6 +39,91 @@ pub struct OriginManifest {
     header: [u8; 48],
     plaintext_sha256: [u8; 32],
     rows: Vec<[u8; 32]>,
+}
+
+/// Read-only restoration of immutable enrollment rows. This type cannot
+/// supply sealer-origin evidence to ingest.
+pub struct StoredManifest(OriginManifest);
+
+impl StoredManifest {
+    /// Restore the original ordered hashes from a validated winner's immutable
+    /// enrollment rows. The caller establishes their provenance and exact map
+    /// association within the protected storage lookup.
+    pub fn from_committed_storage(
+        pins: &DigestReadSnapshot<'_>,
+        header: [u8; 48],
+        rows: Vec<[u8; 32]>,
+    ) -> Option<Self> {
+        let geometry = DigestGeometry::new(pins.plaintext_len)?;
+        if geometry.plaintext_len() == 0 || rows.len() != geometry.pages() as usize {
+            return None;
+        }
+        let identities = [
+            pins.environment_id,
+            pins.library_id,
+            pins.object_id,
+            pins.generation_id,
+            pins.provider_configuration,
+        ];
+        Some(Self(OriginManifest {
+            geometry,
+            map_id: pins.map_id,
+            context: context_hash(&identities, geometry, &header)?,
+            header,
+            plaintext_sha256: pins.plaintext_sha256,
+            rows,
+        }))
+    }
+
+    pub fn authenticate(
+        &self,
+        root: &[u8; 32],
+        context: &crate::media_envelope::EnvelopeContext,
+        record: &[u8; 230],
+    ) -> bool {
+        crate::media_envelope::verify_enrolled_scheme2(root, context, record, record, &self.0)
+            .is_ok()
+    }
+}
+
+/// Read-only manifest input to the playback range receiver.
+#[derive(Clone, Copy)]
+pub enum PlaybackManifest<'a> {
+    Sealed(&'a OriginManifest),
+    Stored(&'a StoredManifest),
+}
+
+impl<'a> From<&'a OriginManifest> for PlaybackManifest<'a> {
+    fn from(origin: &'a OriginManifest) -> Self {
+        Self::Sealed(origin)
+    }
+}
+
+impl<'a> PlaybackManifest<'a> {
+    pub(crate) fn origin(self) -> &'a OriginManifest {
+        match self {
+            Self::Sealed(origin) => origin,
+            Self::Stored(stored) => &stored.0,
+        }
+    }
+
+    pub fn matches(
+        &self,
+        pins: &DigestReadSnapshot<'_>,
+        context: &crate::media_envelope::EnvelopeContext,
+    ) -> bool {
+        let origin = self.origin();
+        let [_, identities @ ..] = context.identities;
+        &pins.plaintext_sha256 == origin.plaintext_sha256()
+            && origin
+                .candidate_page_hashes(
+                    &identities,
+                    pins.plaintext_len,
+                    &pins.map_id,
+                    &context.header,
+                )
+                .is_some()
+    }
 }
 
 impl OriginManifest {

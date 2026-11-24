@@ -6,7 +6,7 @@
 pub use crate::digest_chunk::OpenPart;
 use crate::digest_chunk::{open_chunk_part, ChunkError};
 use crate::digest_cursor::{CursorError, RangeCursor};
-use crate::digest_enrollment::OriginManifest;
+use crate::digest_enrollment::{OriginManifest, PlaybackManifest};
 use crate::digest_geometry::RangeGeometry;
 use crate::digest_verifier::PageError;
 use crate::media::{FileKey, Header, KeyMode, Profile, VerifiedHeader};
@@ -68,13 +68,14 @@ impl<'a> DigestRange<'a> {
     /// also requires a confirmed lookup commit for the authorized reference
     /// and exact manifest, with reads limited by its returned deadline.
     pub fn from_enrolled(
-        manifest: &'a OriginManifest,
+        manifest: impl Into<PlaybackManifest<'a>>,
         authorized_root: &[u8; 32],
         context: &EnvelopeContext,
         trusted_record: &[u8; 230],
         retained_record: &[u8],
         range: std::ops::Range<u64>,
     ) -> Result<Self, RangeError> {
+        let manifest = manifest.into().origin();
         let plan = manifest
             .geometry()
             .range(range.start, range.end)

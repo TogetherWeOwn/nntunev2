@@ -114,7 +114,7 @@ impl Fixture {
     fn media_input(&self) -> EnrolledMedia<'_> {
         EnrolledMedia {
             media: &self.media,
-            manifest: &self.manifest,
+            manifest: nntune_core::digest_enrollment::PlaybackManifest::Sealed(&self.manifest),
             context: &self.context,
             root: &ROOT,
             expected_record: &self.envelope,
