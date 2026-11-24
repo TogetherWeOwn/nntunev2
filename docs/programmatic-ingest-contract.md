@@ -70,6 +70,22 @@ replay conflicts. If exact ciphertext replay or a trustworthy checkpoint is
 unavailable, fence, abort and reconcile before a fresh lifecycle; never reseal
 changed plaintext under an old lifecycle.
 
+The unmounted multipart handoff commits an object claim under the initial
+write lease before sending CreateMultipartUpload, then records the exact
+provider upload ID under the same fence. Parts require the committed target.
+Recover it with the current scoped checkpoint and lease before resuming, and
+verify the trusted sealer state and exact ciphertext independently.
+
+A claim without an ID may still be in flight. A racing caller can re-read it
+but cannot send another initiation or treat the pending state as checkpoint
+loss. After a confirmed interruption with a lost ID, fence the matching
+snapshot through the existing checkpoint-loss transition or let it expire.
+Reconcile the original object under the resulting cleanup intent. If S3
+may have created an upload whose ID was never recorded, cleanup must cover
+that exact object key, including late arrivals. Staging activation needs a
+verified incomplete-upload lifecycle policy on its configured bucket as a
+backstop. A new attempt uses fresh object and sealing identities.
+
 Proposed lifecycle bounds are at most 24 hours absolute and 60 minutes idle
 since accepted progress; status and retries do not extend absolute expiry.
 Consumers must agree limits, tombstones, lease fencing, cleanup, and race and

@@ -1,5 +1,6 @@
 use super::{
-    id, publisher_fixture, FINAL_VERSION, INVENTORY, RETAIN_UNTIL, SCOPE, SHARED_VERSION, WINNERS,
+    id, publisher_fixture, BUCKET, FINAL_VERSION, INVENTORY, RETAIN_UNTIL, SCOPE, SHARED_VERSION,
+    WINNERS,
 };
 use nntune_ingest::{
     digest_candidate_store::{
@@ -133,6 +134,25 @@ pub(super) async fn prove(
         assert_eq!(stage(&mut tx, &scope, lease).await, Err(Refused));
         tx.rollback().await.unwrap();
     }
+    let mut tx = writer.transaction().await.unwrap();
+    tx.execute(
+        "UPDATE public.ingest_session_reservations SET multipart_object_id = $2::text::uuid,
+         multipart_bucket = $3 WHERE id = $1::text::uuid",
+        &[&sid, &object, &BUCKET],
+    )
+    .await
+    .unwrap();
+    assert_eq!(stage(&mut tx, &scope, lease).await, Err(Refused));
+    absent().await;
+    tx.execute(
+        "UPDATE public.ingest_session_reservations SET multipart_upload_id = 'fixture-upload'
+         WHERE id = $1::text::uuid",
+        &[&sid],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
     let mut tx = writer.transaction().await.unwrap();
     stage(&mut tx, &scope, lease).await.unwrap();
     absent().await;

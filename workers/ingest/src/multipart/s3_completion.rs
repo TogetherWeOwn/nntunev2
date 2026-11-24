@@ -28,15 +28,15 @@ use worker::{
 use super::{
     head_receipt::{HeadReceipt, HeadReceiptError},
     resume_checkpoint::ResumeBinding,
-    session_completion::{
-        valid_upload_id, CompletionRequest, CompletionResponse, DispatchError, SessionCompletion,
-    },
+    session_completion::{CompletionRequest, CompletionResponse, DispatchError, SessionCompletion},
+    session_outcome::CompletionScope,
+    session_upload::{self, DurableUpload, HandoffError},
     sidecar::{CompletedSidecar, SidecarError, SidecarPut, SidecarPutReply},
     CompletedVersionedMedia, MultipartError, UploadPart, UploadedPart, MAX_COMPLETION_BODY,
 };
 use crate::pool_deadline::race_against_deadline;
 
-pub use super::initiation::InitiatedUpload;
+use super::initiation::InitiatedUpload;
 
 #[path = "s3_readback.rs"]
 mod readback;
@@ -89,9 +89,42 @@ impl S3CompletionSender {
         })
     }
 
-    /// Start one upload for the authorized session. Persist the scope-bound
-    /// receipt before sending parts, and reconcile an unconfirmed initiation.
-    pub async fn initiate<'a>(
+    /// Open or recover the durable target before constructing a part plan.
+    /// Supply the authorized scope, trusted sealer intent, current lease and
+    /// its caller deadline on a dedicated writer connection.
+    pub async fn open_upload<'a>(
+        &'a self,
+        db: &mut tokio_postgres::Client,
+        scope: &CompletionScope<'a>,
+        lease: &str,
+        context: &'a EnvelopeContext,
+        key: &'a str,
+        usable_until: SystemTime,
+    ) -> Result<DurableUpload<'a>, HandoffError> {
+        if self.configuration != context.identities[5] || now() >= usable_until {
+            return Err(HandoffError::Refused);
+        }
+        let upload = session_upload::handoff(
+            db,
+            scope,
+            lease,
+            context,
+            (&self.bucket, key),
+            usable_until,
+            async |deadline| {
+                self.initiate(context, &self.bucket, key, deadline)
+                    .await
+                    .map_err(|_| ())
+            },
+        )
+        .await?;
+        if now() >= upload.usable_until() {
+            return Err(HandoffError::Refused);
+        }
+        Ok(upload)
+    }
+
+    async fn initiate<'a>(
         &self,
         context: &EnvelopeContext,
         bucket: &'a str,
@@ -251,19 +284,20 @@ impl S3CompletionSender {
         .map_err(SidecarDispatchError::Receipt)
     }
 
-    /// Upload only the locally sealed part from the authorized session. Retain
-    /// those immutable bytes and reconcile the session after an unconfirmed send.
+    /// Upload a locally sealed part to the committed target. The caller must
+    /// still own the checkpoint lease and retain exact ciphertext for recovery.
     pub async fn put_part<'a>(
         &self,
         binding: ResumeBinding<'a>,
         context: &EnvelopeContext,
         part: &UploadPart<'a>,
+        upload: &DurableUpload<'_>,
         usable_until: SystemTime,
     ) -> Result<UploadedPart<'a>, DispatchError> {
         let (target, number, body, checksum) = part.request();
         if part.plan != binding.plan
             || !binding.matches_context(context)
-            || !valid_upload_id(target.upload_id)
+            || !upload.matches(binding, context)
         {
             return Err(DispatchError::InvalidRequest);
         }
@@ -282,7 +316,7 @@ impl S3CompletionSender {
                     payload_hash: hex::encode(part.digest),
                     operation_headers: &[("x-amz-checksum-sha256", checksum)],
                 },
-                usable_until,
+                usable_until.min(upload.usable_until()),
             )
             .await
             .map_err(|()| DispatchError::Unconfirmed(None))?;

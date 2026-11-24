@@ -55,7 +55,7 @@ pub async fn stage_completion(
     verified: &VerifiedCompletedReadback<'_, '_>,
     retain_until: i64,
 ) -> Result<(), OutcomeError> {
-    let [environment, library, _, seal, _] = intent.identities;
+    let [environment, library, object, seal, _] = intent.identities;
     if (environment, library, seal) != (scope.environment, scope.library, scope.seal)
         || u64::try_from(scope.offset).ok() != Some(intent.plaintext_len)
     {
@@ -73,7 +73,14 @@ pub async fn stage_completion(
         staged
             .query_opt(
                 RECORD,
-                &[&scope.session, &uuid(&intent.map_id), &lease, &retain_until],
+                &[
+                    &scope.session,
+                    &uuid(&intent.map_id),
+                    &lease,
+                    &retain_until,
+                    &uuid(&object),
+                    &custody.bucket,
+                ],
             )
             .await
             .map_err(|_| Indeterminate)?
