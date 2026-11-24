@@ -23,3 +23,12 @@ CREATE TABLE public.ingest_session_reservations (
     -- The library identity is globally unique and its environment is immutable.
     UNIQUE (library_id, principal_id, idempotency_key)
 );
+
+-- Intent only, for the existing ingest queue. Not a delivery or deletion receipt.
+-- Keep intent identities across replay; later dispatch state must not replace them.
+CREATE TABLE public.ingest_session_cleanup_intents (
+    session_id UUID NOT NULL REFERENCES public.ingest_session_reservations (id),
+    kind TEXT NOT NULL CHECK (kind IN ('absolute_expiry', 'terminal_reconcile')),
+    due_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (session_id, kind)
+);

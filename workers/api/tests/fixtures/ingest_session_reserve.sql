@@ -34,6 +34,9 @@ BEGIN
     EXCEPTION WHEN SQLSTATE 'Z0001' THEN
         NULL; -- Roll back the reservation before another transaction can observe it.
     END;
+    IF EXISTS (SELECT FROM public.ingest_session_cleanup_intents) THEN
+        RAISE EXCEPTION 'refused or rolled-back reservation left cleanup work';
+    END IF;
     IF (SELECT pg_temp.reserve_session(f.environment_id, f.library_id,
         'session-owner', key, request_fingerprint, first_id)) IS DISTINCT FROM first_id THEN
         RAISE EXCEPTION 'create did not reserve its session identity';
@@ -42,6 +45,10 @@ BEGIN
     IF reserved.absolute_deadline - reserved.idle_deadline <> interval '23 hours' OR
        reserved.idle_deadline <= clock_timestamp() THEN
         RAISE EXCEPTION 'wrong reservation deadline';
+    END IF;
+    IF NOT EXISTS (SELECT FROM public.ingest_session_cleanup_intents WHERE session_id=first_id
+        AND kind='absolute_expiry' AND due_at=reserved.absolute_deadline) THEN
+        RAISE EXCEPTION 'reservation did not record its original absolute expiry intent';
     END IF;
     -- Simulate an expired reservation. Replay is still the same identity, not renewal.
     UPDATE public.ingest_session_reservations SET idle_deadline=expired WHERE id=first_id;
@@ -53,8 +60,11 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT FROM public.ingest_session_reservations WHERE id=first_id AND
         idle_deadline=expired AND absolute_deadline=reserved.absolute_deadline AND fingerprint=request_fingerprint) OR
-       (SELECT count(*) FROM public.ingest_session_reservations) <> 1 THEN
-        RAISE EXCEPTION 'replay or refusal changed durable reservation data';
+       (SELECT count(*) FROM public.ingest_session_reservations) <> 1 OR
+       (SELECT count(*) FROM public.ingest_session_cleanup_intents) <> 1 OR
+       NOT EXISTS (SELECT FROM public.ingest_session_cleanup_intents WHERE session_id=first_id
+           AND kind='absolute_expiry' AND due_at=reserved.absolute_deadline) THEN
+        RAISE EXCEPTION 'replay or refusal changed the reservation or expiry intent';
     END IF;
     INSERT INTO public.storage_library_namespaces VALUES (private_library, f.environment_id, 'session-owner');
     IF (SELECT pg_temp.reserve_session(f.environment_id, f.library_id,

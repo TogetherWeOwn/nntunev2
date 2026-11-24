@@ -290,6 +290,17 @@ for scenario in 'abort COMMIT aborted - 0 0' 'abort ROLLBACK aborted 1 1 100' \
     done
     [[ "$expired" == 1 ]] || { printf 'idle cutoff did not pass while the contender waited\n' >&2; exit 1; }
   fi
+  # A separate connection must see only the committed reservation and expiry intent.
+  [[ "$(psql_run -Atc "SELECT checkpoint_revision=0 AND checkpoint_offset=0
+       AND checkpoint_generation IS NULL AND terminal_reason IS NULL AND terminal_at IS NULL
+       AND idle_deadline=$initial_idle
+       AND EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+         WHERE session_id=session.id AND kind='absolute_expiry' AND due_at=session.absolute_deadline)
+       AND NOT EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+         WHERE session_id=session.id AND kind='terminal_reconcile')
+     FROM public.ingest_session_reservations AS session WHERE session.id='$sid'")" == t ]] || {
+    printf 'observer saw uncommitted session progress or cleanup work: %s\n' "$scenario" >&2; exit 1;
+  }
   printf '%s;\n\\q\n' "$finish" >&3; exec 3>&-
   wait "$holder"; wait "$contender"
   result="$(<"$race/contender")"
@@ -299,10 +310,14 @@ for scenario in 'abort COMMIT aborted - 0 0' 'abort ROLLBACK aborted 1 1 100' \
   [[ "$(psql_run -Atc "SELECT COALESCE(terminal_reason, 'active'), checkpoint_revision, checkpoint_offset,
        (terminal_at IS NULL) = ('$terminal' = 'active'),
        checkpoint_generation IS NOT DISTINCT FROM CASE WHEN $rev = 0 THEN NULL ELSE $gen::uuid END,
-       CASE WHEN $rev = 0 THEN idle_deadline = $initial_idle ELSE idle_deadline > $initial_idle END
-     FROM public.ingest_session_reservations WHERE id='$sid'")" == "$terminal|$rev|$offset|t|t|t" ]] || {
-    printf 'unexpected committed checkpoint/abort state: %s\n' "$scenario" >&2; exit 1;
+       CASE WHEN $rev = 0 THEN idle_deadline = $initial_idle ELSE idle_deadline > $initial_idle END,
+       EXISTS (SELECT FROM public.ingest_session_cleanup_intents
+         WHERE session_id=session.id AND kind='absolute_expiry' AND due_at=session.absolute_deadline),
+       (SELECT due_at FROM public.ingest_session_cleanup_intents
+         WHERE session_id=session.id AND kind='terminal_reconcile') IS NOT DISTINCT FROM session.terminal_at
+     FROM public.ingest_session_reservations AS session WHERE session.id='$sid'")" == "$terminal|$rev|$offset|t|t|t|t|t" ]] || {
+    printf 'unexpected committed checkpoint/abort state or cleanup intent: %s\n' "$scenario" >&2; exit 1;
   }
-  printf 'ingest session row fence passed: %s first, %s; checkpoint revision=%s, state=%s\n' "$first" "$finish" "$rev" "$terminal"
+  printf 'ingest session row fence and cleanup intents passed: %s first, %s; checkpoint revision=%s, state=%s\n' "$first" "$finish" "$rev" "$terminal"
 done
-psql_run -c 'DROP TABLE public.ingest_session_reservations'
+psql_run -c 'DROP TABLE public.ingest_session_cleanup_intents, public.ingest_session_reservations'

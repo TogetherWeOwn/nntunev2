@@ -14,14 +14,19 @@ WITH locked AS MATERIALIZED (
 ), observed AS MATERIALIZED (
     -- Evaluate expiry after acquiring the row lock, not before a lock wait.
     SELECT locked.*, clock_timestamp() AS ts FROM locked
+), terminated AS (
+    UPDATE public.ingest_session_reservations AS session
+    SET terminal_reason = CASE
+            WHEN observed.ts >= LEAST(observed.idle_deadline, observed.absolute_deadline) THEN 'expired'
+            ELSE 'aborted'
+        END,
+        terminal_at = observed.ts
+    FROM observed
+    WHERE session.id = observed.id AND session.terminal_reason IS NULL
+      AND ($5 = 'abort' OR observed.ts >= LEAST(observed.idle_deadline, observed.absolute_deadline))
+    RETURNING session.id, session.terminal_reason, session.terminal_at
+), cleanup_intent AS (
+    INSERT INTO public.ingest_session_cleanup_intents (session_id, kind, due_at)
+    SELECT id, 'terminal_reconcile', terminal_at FROM terminated
 )
-UPDATE public.ingest_session_reservations AS session
-SET terminal_reason = CASE
-        WHEN observed.ts >= LEAST(observed.idle_deadline, observed.absolute_deadline) THEN 'expired'
-        ELSE 'aborted'
-    END,
-    terminal_at = observed.ts
-FROM observed
-WHERE session.id = observed.id AND session.terminal_reason IS NULL
-  AND ($5 = 'abort' OR observed.ts >= LEAST(observed.idle_deadline, observed.absolute_deadline))
-RETURNING session.terminal_reason;
+SELECT terminal_reason FROM terminated;
