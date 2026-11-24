@@ -1,7 +1,7 @@
 //! Unmounted FLAC frame order and sample-count checks (RFC 9639 §§8.2, 9.1).
 
 use crate::flac_frame::FrameReader;
-use crate::flac_frame_header::Position;
+use crate::flac_frame_header::{FrameHeader, Position};
 use crate::flac_preamble::StreamInfo;
 
 enum Next {
@@ -39,20 +39,20 @@ impl FrameContinuity {
     pub(crate) fn accept_with_pcm(
         &mut self,
         frame: FrameReader,
-    ) -> Result<(u8, Option<Vec<i32>>), ()> {
+    ) -> Result<(FrameHeader, Option<Vec<i32>>), ()> {
         let next = self.next.take().ok_or(())?;
         let (header, pcm) = frame.finish_with_pcm()?;
         let block = header.block_size;
         if block == 0 || block > self.info.max_block {
             return Err(());
         }
-        let next = match (next, header.position) {
+        let next = match (next, &header.position) {
             (Next::First, Position::Frame(0)) => self.after_fixed(0, block)?,
-            (Next::Fixed(expected), Position::Frame(n)) if n == expected => {
-                self.after_fixed(n, block)?
+            (Next::Fixed(expected), Position::Frame(n)) if *n == expected => {
+                self.after_fixed(*n, block)?
             }
             (Next::First | Next::Variable, Position::Sample(n))
-                if n == self.samples && self.info.min_block != self.info.max_block =>
+                if *n == self.samples && self.info.min_block != self.info.max_block =>
             {
                 if block < self.info.min_block {
                     Next::EndOnly
@@ -68,7 +68,7 @@ impl FrameContinuity {
         }
         self.next = Some(next);
         self.samples = samples;
-        Ok((header.bits_per_sample, pcm))
+        Ok((header, pcm))
     }
 
     fn after_fixed(&self, number: u32, block: u16) -> Result<Next, ()> {

@@ -136,7 +136,15 @@ for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false C
     holder_query="SELECT 1 FROM public.storage_validated_digest_winners WHERE object_id='$object' FOR UPDATE"
     query="SELECT * FROM public.digest_read_lookup_fixture($id, clock_timestamp() + interval '5 minutes')"
     holder_expected=$'1\n1'; contender_expected=''
-    if [[ "$expected" == t ]]; then contender_expected="$pins"; fi
+    if [[ "$expected" == t ]]; then
+      # The existing reference can return provisional pins, but a rollback must
+      # leave no lease before the separate, committed read is attempted below.
+      provisional="$(psql_run -Atc "BEGIN ISOLATION LEVEL READ COMMITTED; $query; ROLLBACK")"
+      [[ "$provisional" == "$pins" && "$(psql_run -Atc "SELECT read_until = '-infinity' FROM public.storage_validated_digest_winners WHERE object_id='$object'")" == t ]] ||
+        { printf 'rolled-back playback lookup left protection or returned wrong pins\n' >&2; exit 1; }
+      printf 'read lookup rollback returned provisional pins without a committed lease\n'
+      contender_expected="$pins"
+    fi
   elif [[ "$deleting" == true ]]; then
     holder_query="$delete"; query="$lookup"; contender_expected=''
     if [[ "$expected" == t ]]; then contender_expected="$pins"; fi
@@ -225,14 +233,15 @@ gen="'41000000-0000-4000-8000-000000000001'"
 # a successful statement returning zero rows, not a database/transport error.
 for scenario in 'abort terminal COMMIT aborted - 0 0 aborted' 'abort terminal ROLLBACK aborted 1 1 100 active' \
                 'abort checkpoint COMMIT 1 aborted 1 100 aborted' 'abort checkpoint ROLLBACK 1 aborted 0 0 aborted' \
-                'expire checkpoint ROLLBACK 1 expired 0 0 expired' 'grant lease COMMIT - - 0 0 active' \
+                'expire checkpoint ROLLBACK 1 expired 0 0 expired' 'advance checkpoint ROLLBACK 1 - 0 0 active' \
+                'grant lease COMMIT - - 0 0 active' \
                 'checkpoint_lost terminal COMMIT aborted - 0 0 aborted' \
                 'checkpoint_lost terminal ROLLBACK aborted 1 1 100 active' \
                 'checkpoint_lost checkpoint COMMIT 1 - 1 100 active' \
                 'checkpoint_lost checkpoint ROLLBACK 1 aborted 0 0 aborted'; do
   read -r action first finish holder_expected contender_expected rev offset terminal <<<"$scenario"
   initial_idle="absolute_deadline - interval '23 hours 55 minutes'"
-  if [[ "$action" == expire ]]; then
+  if [[ "$action" == expire || "$action" == advance ]]; then
     initial_idle="absolute_deadline - interval '23 hours 59 minutes 52 seconds'"
   fi
   sid="$(psql_run -Atc 'SELECT gen_random_uuid()')"
@@ -256,7 +265,11 @@ for scenario in 'abort terminal COMMIT aborted - 0 0 aborted' 'abort terminal RO
     if [[ "$action" == checkpoint_lost ]]; then terminal_snapshot="$fp, $gen, 0, 0, '$lease_id'"; fi
     terminal_query="EXECUTE terminate_session($scope, '$sid', '$action', $terminal_snapshot);"
     advance_query="EXECUTE advance_checkpoint($scope, '$sid', $fp, $gen, 0, 0, 100, '$lease_id');"
-    if [[ "$first" == checkpoint ]]; then
+    if [[ "$action" == advance ]]; then
+      holder_prepare="$advance"; holder_query="$advance_query"
+      contender_prepare="$advance"; contender_query="$advance_query"
+      lease_after="$lease_before"
+    elif [[ "$first" == checkpoint ]]; then
       holder_prepare="$advance"; holder_query="$advance_query"
       contender_prepare="$terminate"; contender_query="$terminal_query"
     else
@@ -282,10 +295,10 @@ for scenario in 'abort terminal COMMIT aborted - 0 0 aborted' 'abort terminal RO
     sleep 0.1
   done
   [[ "$blocked" == 1 ]] || { printf 'ingest session contender did not wait on holder: %s\n' "$scenario" >&2; exit 1; }
-  if [[ "$action" == expire ]]; then
-    # The observer sees the original deadline until the checkpoint rolls back.
+  if [[ "$action" == expire || "$action" == advance ]]; then
+    # The observer sees the original deadline while the holder's renewal is uncommitted.
     expired_sql="SELECT clock_timestamp() >= idle_deadline FROM public.ingest_session_reservations WHERE id='$sid'"
-    [[ "$(psql_run -Atc "$expired_sql")" == f ]] || { printf 'expiry contender arrived after the idle cutoff\n' >&2; exit 1; }
+    [[ "$(psql_run -Atc "$expired_sql")" == f ]] || { printf 'contender arrived after the idle cutoff: %s\n' "$scenario" >&2; exit 1; }
     expired=0
     for _ in {1..100}; do
       if [[ "$(psql_run -Atc "$expired_sql")" == t ]]; then expired=1; break; fi

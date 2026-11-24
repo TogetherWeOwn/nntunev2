@@ -235,6 +235,31 @@ or record that readback did not verify. This is point-in-time evidence only:
 it neither fences concurrent writers nor restores a deployment, cancels
 clients, proves recovery after runner loss, or authorizes measurement.
 
+### Protected off-state POST probe
+
+The manual off-and-drained workflow also accepts `run_off_probe`, which
+defaults to false. On protected `main`, the opt-in job shares the automatic
+staging deployment queue and uses the same three receipt pins. It checks
+that the pinned Worker is off and drained and that two database slots are
+free, then sends the request from matrix slot 5 once. The POST goes only to
+`https://staging.nntune.com/rest/getArtists` with neither the runner bearer
+nor a fixture key. With the mount off, the ordinary adapter returns HTTP
+200 with a Subsonic authentication error (code 40). Require that exact
+response shape and a fresh, independent off-and-drained readback of the
+same pin. The postflight read runs after the client exits or is stopped,
+even if the POST fails. After forced runner termination without a verdict,
+drain is unverified. Use the separate readback to establish current state.
+
+The POST uses the dedicated Access pair in the protected `staging`
+environment (`SUBSONIC_PROBE_ACCESS_CLIENT_ID` and
+`SUBSONIC_PROBE_ACCESS_CLIENT_SECRET`). Leave those entries empty until the
+dedicated edge scope above has been verified. The probe never arms the
+mount. Its receipt covers one off-state request and cannot establish bearer
+placement, active fixture authentication, a fence across other deployment
+writers, or readiness to run the bounded measurement. The hosted test
+exercises this response contract against a disposable release Worker
+without staging credentials or traffic.
+
 ### Actions step finalization (synthetic only)
 
 The `public-text` CI job arms a synthetic deployment and starts a simulated

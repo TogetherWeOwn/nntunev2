@@ -1025,6 +1025,43 @@ not the raw URL or log event. Keep raw request URLs and query strings out
 of application log fields independently, per the
 [logging standard](logging-standard.md).
 
+## Private listening qualification
+
+`PRIVATE_LISTENING_COHORT` is an optional API Worker setting. Leave it unset
+on default builds. An explicitly configured cohort uses `owner_user_id`, up
+to eight `invite_ids`, and a shared `expires_at` in Unix seconds. Use the
+existing administrator account and email-bound single invites it issued in
+the same environment. Carry only ledger IDs in configuration. Keep invite
+links and actual cohort configuration in private custody. Keep
+`INVITES_REQUIRED` enabled for invite-only environments independently.
+The cohort setting restricts Library, catalogue and play grants to the named
+cohort while set. Regular account and billing routes retain their own access
+rules. Unset the cohort setting to use the regular paid playback gate.
+When the deadline expires, the cohort setting continues to refuse Library
+and playback until a qualified configuration change restores access.
+
+Open `/admin/invites/issue`, choose **Single invite**, enter the recipient's
+email, and use **Create invite** and **Signup link**. Find the resulting row
+ID in `/admin/invites`. In `/signup`, use **Email**, **Invite code (if you
+have one)** or the prefilled link, **Create account with passkey**, **Email
+code**, then **Finish creating account**. The owner uses `/login`. Verify the
+Library with `library-item`, its **Refresh** action and the explicit access
+refusal message after revocation. Observe `GET /api/library` and
+`POST /v1/plays` with a synthetic Library track.
+
+Test anonymous and unlisted sessions, absent and refused invites, the cohort
+deadline, and revocation by removing a ledger ID while retaining the cohort
+setting. Before redemption the invite ledger's existing **Revoke** action
+also refuses enrollment. Already signed play grants can remain valid until
+their expiry, up to 15 minutes. Confirm an empty payment history and no
+Stripe credentials for the synthetic cohort. Keep the music-video interface
+off. Exclude payment checkout, paid renewal/grace, member-issued invitations,
+real media delivery, range/seek behavior and consumption metering from this
+access-only evidence. Run the existing paid signup-arrival case with the
+cohort setting absent, since it expects the Billing destination. Preserve the
+same serving build identity when qualifying the two configurations.
+Apply the existing staging promotion checklist to any release candidate.
+
 ## Staging promotion checklist
 
 Promotion is `main` HEAD → staging; production promotion is a later gated
@@ -1206,6 +1243,31 @@ shape check — no credentials, no network — that reads key names only and
 never reads or prints values
 (`ci/check-production-secrets-shape.mjs:6-7`).
 
+### First-release recovery after failed final smoke
+
+App promotion stays disabled. Before first release, verify empty production
+state with a read-only check, take a snapshot before the first schema change,
+and record the switch-off plan. Keep provider restore proof separate.
+
+Keep `PRODUCTION_ROLLBACK_CUSTODY` and `PRODUCTION_ROLLBACK_INTENT_KEY`
+(a separate random 256-bit key in lowercase hex) in the protected `production`
+Environment. The custody JSON pins the accepted `sha`, `account`, immutable
+`worker`, private `domain`, fresh `checked_at` (ISO UTC with milliseconds),
+private `evidence_sha256`, exact Worker `references` and verified `maintenance`
+`version`, `deployment`, seed `sha` and `module_sha256`. Set `exclusive_writers`
+and `private_routes_frozen` only after verifying and freezing all Worker,
+route, DNS and Access writers through readback. The job verifies the Worker
+and preview settings and seals the intent before traffic shifts. Custody
+evidence must be at most 30 minutes old when sealing. Keep the freeze in
+place through recovery readback even if final smoke runs past that window.
+The maintenance module digest must also match the reviewed candidate checkout.
+
+Failed final smoke keeps the release red. The same lock covers recovery, which
+requires the exact final deployment and submits maintenance at 100% once.
+On ambiguity reconcile Worker, allocation, routes and provider audit before
+any further action. Verify maintenance behavior and private Access denials on
+the isolated candidate. Post-watch and cancellation need separate admission.
+
 ### Production promotion publishes a CalVer release
 
 After a successful production promotion and its post-promotion smoke, the
@@ -1335,6 +1397,31 @@ stay in the old `e2e-staging` group and cannot replace a pending run in
   Draining first also keeps an already queued push from immediately
   undoing the rollback. If the queue cannot be drained and kept clear, do
   not start a pre-lock rerun.
+
+### Offline staging Worker submission checks
+
+The [submission comparator](../ci/staging_worker_submission.py) runs only in
+CI with synthetic inputs. It checks the fixed web, API, MB and ingest jobs in
+[`deploy.yml`](../.github/workflows/deploy.yml) and the alerts job in
+[`deploy-alerts-staging.yml`](../.github/workflows/deploy-alerts-staging.yml).
+It compares the Worker, account, full source SHA, operation and final body
+digest with approval pins. Rollback also requires the approved version ID.
+The current staging writer is Wrangler. The web rollback procedure above
+redeploys a prior source revision and can also redeploy other configured
+Workers. The staging workflows have yet to implement a protected restore
+of a named Worker version.
+
+Before wiring this comparison into a live writer, resolve competing write
+paths and verify the target account and reachable bindings. The writer must
+derive the target, operation and rollback version from the request it will
+send, enforce single use of approval tied to the protected workflow revision
+and run attempt, and check each mutation's method, path, query and exact body
+before sending those bytes. For a named-version restore, record prior-version
+provenance, verify binding, schema and Durable Object compatibility, and
+confirm the serving version, build SHA and health after recovery. An enablement
+with no verified prior version needs a separately reviewed recovery plan.
+The [MB and ingest activation prerequisites](#operator-runbook-enabling-staging-mb--staging-ingest)
+apply to those lanes.
 
 ## Future Worker deploy lanes: required rollback evidence
 

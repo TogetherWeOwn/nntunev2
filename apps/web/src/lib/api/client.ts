@@ -81,6 +81,10 @@ export interface MagicLinkResult {
 	email?: string;
 }
 
+interface RegisterFinishResponse extends MagicLinkResult {
+	private_listening?: true;
+}
+
 /** `POST /v1/auth/passkey/register/start` response (fixed shape, never an oracle). */
 export interface RegisterStartResponse {
 	challenge: string;
@@ -646,13 +650,13 @@ export class ApiClient {
 	 * success body is shape-checked before it returns so a malformed
 	 * `challenge` surfaces as a typed `ApiError`, never a mid-ceremony throw.
 	 */
-	async registerStart(email: string, signal?: AbortSignal): Promise<RegisterStartResponse> {
+	async registerStart(email: string, signal?: AbortSignal, inviteCode?: string): Promise<RegisterStartResponse> {
 		const { data, status } = await this.requestWithStatus<unknown>(
 			'/v1/auth/passkey/register/start',
 			{
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ email }),
+				body: JSON.stringify({ email, invite_code: inviteCode }),
 				signal
 			}
 		);
@@ -660,8 +664,8 @@ export class ApiClient {
 	}
 
 	/** Finish passkey enrollment with the attestation + emailed code. */
-	async registerFinish(input: RegisterFinishInput, signal?: AbortSignal): Promise<MagicLinkResult> {
-		return this.postWithSignal<MagicLinkResult>(
+	async registerFinish(input: RegisterFinishInput, signal?: AbortSignal): Promise<RegisterFinishResponse> {
+		return this.postWithSignal<RegisterFinishResponse>(
 			'/v1/auth/passkey/register/finish',
 			toRegisterFinishBody(input),
 			signal

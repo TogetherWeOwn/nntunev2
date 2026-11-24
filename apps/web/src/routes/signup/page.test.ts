@@ -85,7 +85,7 @@ describe('signup code-error and start-over rendering', () => {
 		// outer condition turns the spec red instead of matching the inner
 		// alert condition.
 		expect(source).toMatch(
-			/\{#if status === 'code-sent'[^}]*\|\| status === 'code-error'[^}]*\}[\s\S]*?<form onsubmit=\{finishAccount\}[\s\S]*?name="magic_code"/
+			/\{#if status === 'code-sent'[^}]*\|\| status === 'code-error'[^}]*\}[\s\S]*?<form\b(?=[^>]*\bmethod="post")[^>]*\bonsubmit=\{finishAccount\}[\s\S]*?name="magic_code"/
 		);
 	});
 

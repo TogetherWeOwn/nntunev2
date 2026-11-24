@@ -37,6 +37,11 @@ availability and live billing require separate decisions and release validation.
 M1 uses owner-issued invites. The later scope allows eligible paid members to
 invite during owner-scheduled windows.
 
+The first personal-use release is music-only for the owner and a small group
+of explicitly invited friends and family. It can use time-limited
+[private listening access](docs/ops.md#private-listening-qualification) while
+payment integration is being qualified. The music-video interface stays off.
+
 ## Storage direction
 
 The approved target is for NNTune to be a plain standard S3 client: an

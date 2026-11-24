@@ -8,21 +8,25 @@ use nntune_core::{
     media::PLAIN_CHUNK_SIZE,
     media_envelope::{wrap_scheme2, EnvelopeContext},
     origin_sealer::SealedChunk,
+    s3_locator::{S3Binding, S3Locator},
 };
 use nntune_ingest::{
     digest_candidate_store::{
         append_inventory, stage_validated_winner, CandidateIntent, InventoryAppendError,
     },
     multipart::{
+        head_receipt::HeadReceipt,
         readback_inventory::{
             BucketReadbackResponse, CompletedReadbackInventory, InventoryError, ReadbackScope,
         },
+        resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
+        session_completion::SessionCompletion,
         sidecar::{CompletedSidecar, SidecarPut, SidecarPutReply},
-        CompletedVersionedMedia, Plan, UploadTarget, VersionedCompletionReply,
+        CompletedVersionedMedia, MultipartError, Plan, UploadTarget, VersionedCompletionReply,
     },
 };
 use sha2::{Digest, Sha256};
-use std::io;
+use std::{io, ops::Range};
 
 #[path = "multipart_readback_inventory/publisher.rs"]
 mod publisher;
@@ -84,6 +88,16 @@ impl ReadbackFixture {
     }
 
     fn in_scope(plaintext: &[u8], identities: [[u8; 16]; 6], map_id: [u8; 16], key: &str) -> Self {
+        Self::complete(plaintext, identities, map_id, key, true).unwrap()
+    }
+
+    fn complete(
+        plaintext: &[u8],
+        identities: [[u8; 16]; 6],
+        map_id: [u8; 16],
+        key: &str,
+        checksum_matches: bool,
+    ) -> Result<Self, MultipartError> {
         let plaintext_len = plaintext.len() as u64;
         let mut enrollment =
             DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), map_id)
@@ -125,16 +139,28 @@ impl ReadbackFixture {
         parts.extend(partition.finish().unwrap());
         let mut media_bytes = Vec::new();
         let mut composite = Sha256::new();
+        let mut checkpoint_parts = Vec::new();
         let uploads = parts
             .iter()
             .map(|part| {
-                let (_, _, bytes, checksum) = part.request();
+                let (_, number, bytes, checksum) = part.request();
                 media_bytes.extend_from_slice(bytes);
-                composite.update(STANDARD.decode(checksum).unwrap());
+                let digest = Sha256::digest(bytes).into();
+                composite.update(digest);
+                checkpoint_parts.push(CheckpointPart {
+                    number,
+                    len: bytes.len(),
+                    etag: "synthetic",
+                    digest,
+                });
                 part.verify_reply("synthetic".into(), checksum).unwrap()
             })
             .collect();
-        let composite = STANDARD.encode(composite.finalize());
+        let mut composite = composite.finalize();
+        if !checksum_matches {
+            composite[0] ^= 1;
+        }
+        let composite = STANDARD.encode(composite);
         let body = format!(
             "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{key}</Key>\
              <ChecksumSHA256>{composite}-{}</ChecksumSHA256></CompleteMultipartUploadResult>",
@@ -146,9 +172,40 @@ impl ReadbackFixture {
             body: body.as_bytes(),
             version_headers: &[SHARED_VERSION],
         };
-        let completion = plan.complete(uploads).unwrap();
-        let media = completion.verify_versioned_reply(&context, reply).unwrap();
-        Self {
+        let [_, environment, library, object, generation, _] = identities.map(hex::encode);
+        let binding = ResumeBinding {
+            plan,
+            environment: &environment,
+            library: &library,
+            session: &object,
+            object: &object,
+            generation: &generation,
+            envelope_scheme: 2,
+        };
+        let checkpoint = ResumeCheckpoint {
+            binding,
+            parts: &checkpoint_parts,
+        };
+        let completion =
+            SessionCompletion::prepare(binding, &context, uploads, &checkpoint).unwrap();
+        let media = completion.verify_completion(reply)?;
+        let observed = S3Locator::new(
+            BUCKET.into(),
+            key.into(),
+            S3Binding::VersionId(SHARED_VERSION.into()),
+        )
+        .unwrap();
+        media
+            .verify_head(
+                &context,
+                Some(HeadReceipt {
+                    configuration: Some(CONFIGURATION),
+                    locator: Some(&observed),
+                    content_length: Some(media_bytes.len() as u64),
+                }),
+            )
+            .unwrap();
+        Ok(Self {
             map_id,
             origin: enrollment.finish().unwrap(),
             context,
@@ -156,7 +213,7 @@ impl ReadbackFixture {
             media,
             media_bytes,
             page_bytes,
-        }
+        })
     }
 
     fn sidecar(&self) -> CompletedSidecar<'_> {
@@ -261,10 +318,78 @@ async fn completed_readback_binds_the_exact_inventory_after_flac_and_eof() {
             let verified = result.unwrap();
             assert!(std::ptr::eq(verified.inventory(), &inventory));
             assert!(std::ptr::eq(verified.origin(), &fixture.origin));
+            assert_eq!(
+                verified.flac_plaintext_range(
+                    fixture.media.metadata(),
+                    fixture.origin.plaintext_sha256(),
+                    0..1
+                ),
+                None
+            );
         } else {
             let invalid_flac = BodyReadbackError::Content(ReadbackError::MediaValidation);
             assert_eq!(result.err(), Some(Body(invalid_flac)));
         }
+    }
+}
+
+#[tokio::test]
+async fn hands_off_seek_ranges_only_for_the_verified_flac_object() {
+    use nntune_core::s3_locator::{S3Binding, S3Locator, S3MediaMetadata};
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/synthetic-flac/admin-upload");
+    for index in 1..=10 {
+        let plaintext = std::fs::read(directory.join(format!("fixture-{index}.flac"))).unwrap();
+        let fixture = ReadbackFixture::new(&plaintext);
+        let receipts = [fixture.sidecar()];
+        let inventory = fixture.inventory(&receipts);
+        let verified = inventory
+            .verify_with_flac_seek(SCOPE, fixture.envelope(), async |_, pin| {
+                Ok(fixture.response(pin))
+            })
+            .await
+            .unwrap();
+        let metadata = fixture.media.metadata();
+        let digest = fixture.origin.plaintext_sha256();
+        let seek = |millis| verified.flac_plaintext_range(metadata, digest, millis);
+        assert_eq!(seek(0..1), Some(42..plaintext.len() as u64));
+        assert_eq!(seek(92..u64::MAX), Some(42..plaintext.len() as u64));
+        for millis in [93..100, 1..1, Range { start: 10, end: 2 }] {
+            assert_eq!(seek(millis), None);
+        }
+
+        for (bucket, version) in [(BUCKET, FINAL_VERSION), ("other-bucket", SHARED_VERSION)] {
+            let locator = S3Locator::new(
+                bucket.into(),
+                KEY.into(),
+                S3Binding::VersionId(version.into()),
+            )
+            .unwrap();
+            let metadata =
+                S3MediaMetadata::from_trusted_context(locator, &fixture.context).unwrap();
+            assert_eq!(verified.flac_plaintext_range(&metadata, digest, 0..1), None);
+        }
+        let mut identities = fixture.context.identities;
+        identities[5] = id(9);
+        let foreign_configuration = EnvelopeContext {
+            identities,
+            ..fixture.context
+        };
+        let foreign_metadata = S3MediaMetadata::from_trusted_context(
+            metadata.locator().clone(),
+            &foreign_configuration,
+        )
+        .unwrap();
+        assert_eq!(
+            verified.flac_plaintext_range(&foreign_metadata, digest, 0..1),
+            None
+        );
+        let mut wrong_digest = *digest;
+        wrong_digest[0] ^= 1;
+        assert_eq!(
+            verified.flac_plaintext_range(metadata, &wrong_digest, 0..1),
+            None
+        );
     }
 }
 
@@ -741,7 +866,7 @@ async fn completed_readback_rejects_foreign_scope_and_response_pins() {
 
     for version in [Some(FINAL_VERSION), Some(SHARED_VERSION), None] {
         let result = inventory
-            .verify(SCOPE, fixture.envelope(), async |_, pin| {
+            .verify_with_flac_seek(SCOPE, fixture.envelope(), async |_, pin| {
                 let mut response = fixture.response(pin);
                 if pin.object_key == PAGE_KEY {
                     let version = version.ok_or(io::ErrorKind::TimedOut)?;
