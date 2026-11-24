@@ -8605,30 +8605,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     let served_method = request.method.clone();
     let served_path = served_display_path(&request.path);
-    if let Some(response) =
-        private_browser_custody::dispatch(&env, ctx.store, &config, &request, &collected).await
-    {
-        let response = response?;
-        let status = response.status_code();
-        let level = if status >= 500 {
-            crate::logging::Level::Error
-        } else {
-            crate::logging::Level::Info
-        };
-        // Custody dispatch only matches its two static paths.
-        let _ = emit_record(
-            level,
-            "api.request.served",
-            &trace_id,
-            serde_json::json!({
-                "route": format!("POST {}", request.path), "status_code": status,
-                "error_class": response_error_code(status, ""),
-                "duration_ms": now_millis().saturating_sub(start_ms), "build_sha": build_sha, "release": build_sha,
-            }),
-        );
-        return Ok(response);
-    }
-    if let Some(result) = relay_media(&ctx, &request, &collected, &headers_map, async |get| {
+    let stream_get = async |get: handlers::browser_playback_relay::StreamGet<'_>| {
         let headers = Headers::new();
         for (name, value) in get.headers() {
             headers.set(name, value)?;
@@ -8655,9 +8632,18 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         headers.delete("set-cookie")?;
         headers.set(crate::logging::TRACE_HEADER, &trace_id)?;
         Ok::<_, worker::Error>(response)
-    })
-    .await
-    {
+    };
+    let playback_response =
+        match private_browser_custody::dispatch(&env, ctx.store, &config, &request, &collected)
+            .await
+        {
+            // Custody dispatch only matches two static paths.
+            Some(response) => Some((format!("POST {}", request.path), Ok(response))),
+            None => relay_media(&ctx, &request, &collected, &headers_map, stream_get)
+                .await
+                .map(|response| ("GET /v1/plays/media/{track}/{tab}/{play}".into(), response)),
+        };
+    if let Some((route, result)) = playback_response {
         let result = result.and_then(|response| response.map_err(|_| handlers::unavailable()));
         let mut error_class = None;
         let response = result.or_else(|refusal| {
@@ -8675,7 +8661,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             "api.request.served",
             &trace_id,
             serde_json::json!({
-                "route": "GET /v1/plays/media/{track}/{tab}/{play}",
+                "route": route,
                 "status_code": status,
                 "error_class": error_class.or_else(|| response_error_code(status, "")),
                 "duration_ms": now_millis().saturating_sub(start_ms),
