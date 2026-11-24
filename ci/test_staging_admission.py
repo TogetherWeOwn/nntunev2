@@ -61,7 +61,9 @@ def make_policy(contract_bytes=CONTRACT_BYTES):
         "product_approval": "synthetic-product", "qa_approval": "synthetic-qa"}]}
 
 
-def make_junit(skip=False, fail=False, omit=False, final_sha=SHA):
+def make_junit(skip=False, fail=False, omit=False, final_sha=None):
+    if final_sha is None:
+        final_sha = SHA
     suite = ET.Element("testsuite")
     if not omit:
         case = ET.SubElement(suite, "testcase", classname="journey", name="signup")
