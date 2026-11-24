@@ -820,10 +820,10 @@ async fn prove_attempt(
         return;
     }
     let committed = committed.unwrap();
-    let range = committed
-        .flac_plaintext_range(completed.metadata(), origin.plaintext_sha256(), 0..1)
-        .unwrap();
-    assert!(range.start < range.end && range.end < length);
+    assert_eq!(
+        committed.flac_plaintext_range(completed.metadata(), origin.plaintext_sha256(), 0..1),
+        Some(8256..9520)
+    );
     assert_eq!(
         committed.flac_plaintext_range(completed.metadata(), &[0; 32], 0..1),
         None

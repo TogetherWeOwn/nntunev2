@@ -291,11 +291,9 @@ impl Permit<'_> {
         {
             return Err(Refused);
         }
+        let cohort_until = i64::try_from(self.policy.expires_at).map_err(|_| Refused)?;
         if !tx
-            .query_one(
-                include_str!("reference.sql"),
-                &[&track, &(self.policy.expires_at as i64)],
-            )
+            .query_one(include_str!("reference.sql"), &[&track, &cohort_until])
             .await
             .map_err(|_| Unconfirmed)?
             .try_get::<_, bool>(0)

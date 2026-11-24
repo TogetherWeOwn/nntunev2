@@ -227,6 +227,16 @@ pub(crate) async fn verify_publication(
     let entries: Vec<serde_json::Value> = serde_json::from_str(&listing.body).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["id"], track);
+    let exact_reference = async || {
+        observer.query_one(
+            "SELECT count(*) = 1 AND bool_and((environment_id, library_id, reference_id, object_id)
+                   = ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid))
+             FROM public.storage_validated_digest_references",
+            &[&uuid_text(prepared.scope.environment), &uuid_text(prepared.scope.library),
+              &track, &uuid_text(prepared.intent.identities[2])],
+        ).await.unwrap().get::<_, bool>(0)
+    };
+    assert!(exact_reference().await);
     assert_eq!(
         handle(
             &ctx,
@@ -241,6 +251,7 @@ pub(crate) async fn verify_publication(
     );
     let replay = publish(&mut publication, upload_writer).await;
     assert_eq!((replay.status, replay.body), (200, first.body));
+    assert!(exact_reference().await);
 
     observer
         .execute(
