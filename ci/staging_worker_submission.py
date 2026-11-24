@@ -8,6 +8,7 @@ _TARGETS = {
     (".github/workflows/deploy.yml", "staging-api"): "nntune-api-staging",
     (".github/workflows/deploy.yml", "staging-mb"): "nntune-mb-staging",
     (".github/workflows/deploy.yml", "staging-ingest"): "nntune-ingest-staging",
+    (".github/workflows/deploy.yml", "staging-stream"): "nntune-stream-staging",
     (".github/workflows/deploy-alerts-staging.yml", "deploy"): "nntune-alerts-staging",
 }
 _VERSION_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")

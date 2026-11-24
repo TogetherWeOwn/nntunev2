@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Credential-free dry-run of the staging Worker upload path.
 
-Run AFTER the real api/mb/ingest release builds exist
+Run AFTER the real api/mb/ingest/stream release builds exist
 (workers/<name>/build). For each Worker it:
 
 1. extracts the exact "Generate staging wrangler.toml" run script and the
@@ -40,7 +40,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/deploy.yml"
 MANIFEST = ".github/scripts/binding_manifest.toml"
-WORKERS = ("api", "mb", "ingest")
 BUILD_CMD = "worker-build --release -- --locked"
 TIMEOUT = 600
 
@@ -168,6 +167,10 @@ def fixture(base, worker, label):
     shutil.copytree(src, wdir / "build")
     (tree / ".github/scripts").mkdir(parents=True)
     shutil.copy(ROOT / MANIFEST, tree / MANIFEST)
+    if worker == "stream":
+        shutil.copy(ROOT / "workers/stream/wrangler.toml", wdir / "wrangler.toml")
+        script = ".github/scripts/staging_stream_config.py"
+        shutil.copy(ROOT / script, tree / script)
     return tree, wdir
 
 
@@ -221,6 +224,8 @@ def assert_upload_redaction(upload_body, label):
 
 def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
     label = f"{worker}" + ("" if worker != "api" else (" mirror-present" if mirror else " mirror-absent"))
+    if worker == "stream":
+        label += " private-enabled" if mirror else " private-disabled"
     tag = label.replace(" ", "_")
     gen_script, argv = workflow_commands(wf_text, worker, sha)
     workers = {w["name"]: {b["binding"]: b for b in w["binding"]} for w in manifest["worker"]}
@@ -234,8 +239,17 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
             summary_env["HYPERDRIVE_ID_MB"] = workers["api"]["MB_DB"]["staging"]
     elif worker == "mb":
         summary_env["HYPERDRIVE_ID_MB"] = workers["mb"]["MB_DB"]["staging"]
-    else:
+    elif worker == "ingest":
         summary_env["HYPERDRIVE_ID_STAGING"] = workers["ingest"]["LIBRARY_DB"]["staging"]
+    elif mirror:
+        summary_env.update(
+            PRIVATE_MUSIC_STAGING_JOURNEY="true", PRIVATE_PLAYBACK_STAGING_ENABLED="true",
+            PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION="11111111-1111-4111-8111-111111111111",
+            PRIVATE_PLAYBACK_STAGING_S3_BUCKET="nntunev2-private-fixtures-staging",
+            PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT="https://objects.example.test",
+            PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region",
+            PRIVATE_PLAYBACK_STAGING_ROOT_VERSION="22222222-2222-4222-8222-222222222222",
+        )
 
     home = base / f"home-{tag}"
     home.mkdir()
@@ -244,6 +258,14 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
     tree, wdir = fixture(base, worker, f"tree-{tag}")
     config = generate(worker, gen_script, wdir, env, summary_env, label)
     assert_no_build(config, label)
+    if worker == "stream":
+        stage = config["env"].get("staging", {})
+        check(set(config["env"]) == {"staging"} and config["name"] == stage.get("name") == "nntune-stream-staging",
+              f"{label}: upload must target only the staging Stream Worker")
+        check(all(scope.get("workers_dev") is False and scope.get("preview_urls") is False and "routes" not in scope
+                  for scope in (config, stage)), f"{label}: Stream must be internal")
+        check(stage["vars"].get("PRIVATE_PLAYBACK_ENABLED") == ("true" if mirror else "false"),
+              f"{label}: private playback does not match the requested mode")
     if worker == "api":
         summary = Path(summary_env["GITHUB_STEP_SUMMARY"]).read_text()
         staging = config["env"]["staging"]
@@ -310,9 +332,10 @@ def main():
         home.mkdir()
         wrangler = args.wrangler.resolve()
         check_wrangler(wrangler, m.group(1), base_env(home, path, base / "marker-version"))
-        for worker, mirror in (("api", True), ("api", False), ("mb", False), ("ingest", False)):
+        for worker, mirror in (("api", True), ("api", False), ("mb", False), ("ingest", False),
+                               ("stream", False), ("stream", True)):
             scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror)
-    print("check_worker_upload: ok (api with/without mirror, mb, ingest)")
+    print("check_worker_upload: ok (api with/without mirror, mb, ingest, stream with/without private playback)")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,7 @@ archive buckets as scratch storage.
 | `nntunev2-archive-prod` | prod | reserved archive capacity; no Worker consumer configured |
 | `nntunev2-ingest-scratch-staging` | staging | ingest repair scratch; live `ingest-scratch/` object expiry verified 2026-10-17 at 604800 seconds |
 | `nntunev2-ingest-scratch-prod` | prod | ingest repair scratch; live `ingest-scratch/` object expiry verified 2026-10-17 at 604800 seconds |
+| `nntunev2-private-fixtures-staging` (planned, versioned S3) | staging | private synthetic uploads and encrypted Stream qualification |
 
 The archive buckets were requested at provisioning time. They are not evidence
 of an implemented archival pipeline and must not be bound to a Worker by default.
@@ -1067,6 +1068,38 @@ Apply the existing staging promotion checklist to any release candidate.
 Promotion is `main` HEAD → staging; production promotion is a later gated
 lane. Complete every box on the exact head being promoted.
 
+### Private Stream staging
+
+`staging-stream` uses the same serialized `deploy.yml` push as the staging
+API. Leave `STREAM_STAGING_DEPLOY_ENABLED`, `PRIVATE_PLAYBACK_STAGING_ENABLED`
+and `PRIVATE_MUSIC_STAGING_JOURNEY` unset until the upstream runtime and
+staging prerequisites pass. The first internal-only Stream deploy can use
+`STREAM_STAGING_DEPLOY_ENABLED=true` alone. After its version is verified,
+set `STREAM_SERVICE_STAGING=nntune-stream-staging` on the next staging API
+deploy to complete the service binding in both directions.
+
+Use a dedicated versioned S3 bucket named `nntunev2-private-fixtures-staging`.
+Set the staging repository variables prefixed `PRIVATE_PLAYBACK_STAGING_`
+for `S3_CONFIGURATION`, `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION` and
+`ROOT_VERSION`. The configuration and root-version IDs are lowercase
+UUIDv4. Provision the read-only S3 credentials and the 64-character
+lowercase hex root key on `nntune-stream-staging` in Worker secret custody. Share
+`PRIVATE_PLAYBACK_CUSTODY_SECRET` with the staging API only, independently
+of `PLAY_GRANT_SECRET`. Keep the upload writer's credentials separate.
+Arm `PRIVATE_PLAYBACK_STAGING_ENABLED=true` and the private journey together.
+Retain the version ID, deployment ID, `BUILD_SHA` and playback mode from
+the Stream job summary alongside the browser run. To restore the default,
+keep `STREAM_STAGING_DEPLOY_ENABLED=true` for the next protected deploy.
+Remove `PRIVATE_PLAYBACK_STAGING_ENABLED` and follow the [private journey
+cleanup](../e2e/README.md#private-music-journey-preparation). After the
+Stream receipt confirms `private_playback_enabled=false`, unset
+`STREAM_STAGING_DEPLOY_ENABLED`.
+
+If Wrangler uploads Stream but the version readback fails, treat the
+previous mode as unknown. Clear both private arms and use the same protected
+disable deploy before retrying qualification with a fresh invite. A failed
+readback gives no serving evidence.
+
 ### Gate incident reporting
 
 `gate-incidents.yml` scans completed main-branch `deploy`, `e2e-staging`
@@ -1335,9 +1368,9 @@ requires independent release approval. A push to `main` deploys to the
   `deploy.yml` run for the promotion SHA, and require its `staging-web` job
   conclusion to be `success` (not `skipped`); verify staging health. This
   workflow deploys `apps/web` (`staging-web`) plus the api, mb and ingest
-  Worker staging lanes (`staging-api`, `staging-mb`, `staging-ingest`;
-  staging only, mb before ingest); it does not deploy stream, repair or
-  transcode Workers. `/api/health` returns exactly `{ok, version}` — the public
+  Worker staging lanes (`staging-api`, `staging-mb`, `staging-ingest` and
+  the opt-in `staging-stream`; staging only, mb before ingest). Repair and
+  transcode Workers have separate rollout. `/api/health` returns exactly `{ok, version}` — the public
   package version, never a build identifier
   (`apps/web/src/routes/api/health/+server.ts`, pinned by
   `apps/web/tests/smoke.spec.ts`) — so a health response alone never proves

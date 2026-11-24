@@ -47,7 +47,7 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                         command += f" --target {target}"
                     self.assertIn(command + "\n          rustup default stable\n", section)
         deploy = (WORKFLOWS / "deploy.yml").read_text()
-        for name in ("staging-api", "staging-mb", "staging-ingest"):
+        for name in ("staging-api", "staging-mb", "staging-ingest", "staging-stream"):
             with self.subTest(path="deploy.yml", job=name):
                 section = job(deploy, name)
                 self.assertIn("python3 -I .github/scripts/worker_rust_provenance.py rust", section)

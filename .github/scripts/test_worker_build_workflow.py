@@ -11,6 +11,11 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location("check_worker_upload", Path(__file__).with_name("check_worker_upload.py"))
 UPLOAD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(UPLOAD)
+CONFIG_SPEC = importlib.util.spec_from_file_location(
+    "staging_stream_config", Path(__file__).with_name("staging_stream_config.py"),
+)
+STREAM_CONFIG = importlib.util.module_from_spec(CONFIG_SPEC)
+CONFIG_SPEC.loader.exec_module(STREAM_CONFIG)
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = "worker-build --release -- --locked"
@@ -28,6 +33,36 @@ def steps(section):
 
 
 class WorkerBuildWorkflowTests(unittest.TestCase):
+    def test_stream_config_is_internal_and_uses_the_dedicated_fixture_bucket(self):
+        source = tomllib.loads((ROOT / "workers/stream/wrangler.toml").read_text())
+        off = tomllib.loads(STREAM_CONFIG.render(source, {}))
+        self.assertEqual(off["env"]["staging"]["vars"], {"PRIVATE_PLAYBACK_ENABLED": "false"})
+        env = {
+            "PRIVATE_PLAYBACK_STAGING_ENABLED": "true", "PRIVATE_MUSIC_STAGING_JOURNEY": "true",
+            "PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION": "11111111-1111-4111-8111-111111111111",
+            "PRIVATE_PLAYBACK_STAGING_S3_BUCKET": STREAM_CONFIG.FIXTURE_BUCKET,
+            "PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT": "https://objects.example.test",
+            "PRIVATE_PLAYBACK_STAGING_S3_REGION": "test-region",
+            "PRIVATE_PLAYBACK_STAGING_ROOT_VERSION": "22222222-2222-4222-8222-222222222222",
+        }
+        on = tomllib.loads(STREAM_CONFIG.render(source, env))
+        self.assertEqual(set(on["env"]), {"staging"})
+        stage = on["env"]["staging"]
+        self.assertEqual(stage["services"], [{"binding": "API", "service": "nntune-api-staging"}])
+        self.assertFalse(stage["workers_dev"] or stage["preview_urls"])
+        self.assertNotIn("routes", stage)
+        self.assertEqual(stage["vars"]["PRIVATE_PLAYBACK_S3_BUCKET"], STREAM_CONFIG.FIXTURE_BUCKET)
+        for key, value in (
+            ("PRIVATE_MUSIC_STAGING_JOURNEY", ""),
+            ("PRIVATE_PLAYBACK_STAGING_S3_BUCKET", "nntunev2-audio-prod"),
+            ("PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT", "https://name@objects.example.test"),
+            ("PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION", "11111111-1111-5111-8111-111111111111"),
+            ("PRIVATE_PLAYBACK_STAGING_ROOT_VERSION", "22222222-2222-4222-7222-222222222222"),
+            ("PRIVATE_PLAYBACK_STAGING_ROOT_VERSION", ""),
+        ):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                STREAM_CONFIG.render(source, env | {key: value})
+
     def test_upload_redaction_requires_boolean_true_in_metadata(self):
         boundary = b"------formdata-undici-test"
 

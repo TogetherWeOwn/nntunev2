@@ -1011,7 +1011,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
   test('main staging deploy and post-deploy E2E share a queued workflow lock', () => {
     const group = "  group: ${{ github.event_name == 'push' && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}\n";
     const lock = `\nconcurrency:\n${group}  cancel-in-progress: false\n  queue: max\n`;
-    const lanes = ['staging-web', 'staging-api', 'staging-mb', 'staging-ingest', 'post-deploy-e2e', 'post-deploy-private-music'];
+    const lanes = ['staging-web', 'staging-api', 'staging-mb', 'staging-ingest', 'staging-stream', 'post-deploy-e2e', 'post-deploy-private-music'];
     const assertDeployLock = (body: string) => {
       const header = body.split('\njobs:\n')[0]!;
       expect(header).toMatch(/^on:\n  push:\n    branches: \[main\]\n  workflow_dispatch:\n\n/m);
@@ -1778,7 +1778,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     const section = jobSection(body, job);
     return body.split(section).join('');
   };
-  const BACKEND_LANES = ['staging-api', 'staging-mb', 'staging-ingest'];
+  const BACKEND_LANES = ['staging-api', 'staging-mb', 'staging-ingest', 'staging-stream'];
   const bodyWithoutLanes = (body: string, lanes: string[]): string =>
     lanes.reduce((rest, lane) => bodyWithoutJob(rest, lane), body);
   const codeLines = (text: string): string =>
@@ -1799,6 +1799,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       'staging-api',
       'staging-ingest',
       'staging-mb',
+      'staging-stream',
       'staging-web',
     ]);
     for (const name of names) {
@@ -1816,11 +1817,12 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     'staging-api': ['workers/api'],
     'staging-mb': ['workers/mb'],
     'staging-ingest': ['workers/ingest', 'workers/api'],
+    'staging-stream': ['workers/stream'],
   };
 
   const assertDeployBody = (body: string) => {
-    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(4);
-    expect(body.match(/deploy --env/g) ?? []).toHaveLength(4);
+    expect(body.match(/wrangler-action/g) ?? []).toHaveLength(5);
+    expect(body.match(/deploy --env/g) ?? []).toHaveLength(5);
     // Exact command pin: staging-web deploys to staging and staging-api
     // deploys the api Worker to staging with the public BUILD_SHA var —
     // no `preview` lane exists. A bare `command: deploy` (no --env)
@@ -1835,6 +1837,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       `wrangler commands stay exactly the evidenced lanes (got ${JSON.stringify(commands)})`,
     ).toEqual([
       'deploy --env staging',
+      'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
       'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
       'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
       'deploy --env staging --var BUILD_SHA:${{ github.sha }}',
@@ -1867,13 +1870,11 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
         }
       }
     }
-    // Staging environment record: all four deploy lanes bind the staging
+    // Staging environment record: all deploy lanes bind the staging
     // GitHub Environment (assertStagingEnv pins the exact block), so
     // push-to-main deployment records land only in `staging`.
     assertStagingEnv(body, 'staging-web');
-    assertStagingEnv(body, 'staging-api');
-    assertStagingEnv(body, 'staging-mb');
-    assertStagingEnv(body, 'staging-ingest');
+    for (const lane of BACKEND_LANES) assertStagingEnv(body, lane);
   };
 
   const assertNoBackendPath = (body: string) => {
@@ -1895,7 +1896,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     const rest = bodyWithoutLanes(body, BACKEND_LANES);
     expect(rest).not.toContain('workers/');
     expect(codeLines(rest).toLowerCase()).not.toContain('production');
-    for (const lane of ['staging-api', 'staging-ingest']) {
+    for (const lane of ['staging-api', 'staging-ingest', 'staging-stream']) {
       expect(
         codeLines(jobSection(body, lane)).toLowerCase(),
         `${lane} stays staging-only`,
@@ -1909,7 +1910,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(jobSection(body, 'staging-mb')).toContain('name = "nntune-mb-production"');
   };
 
-  // All four push-to-main deploy lanes bind the `staging` GitHub Environment
+  // The push-to-main deploy lanes bind the `staging` GitHub Environment
   // (mapping form, name + url), so deployment records land only in
   // `staging` — never an unscoped record and never `production`
   // (assertNoBackendPath still bans that word in code). The anchored
@@ -2125,10 +2126,20 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     const lane = 'post-deploy-private-music';
     const section = jobSection(deployWorkflow, lane);
     expect(jobIf(deployWorkflow, lane)).toBe("${{ github.event_name == 'push' && vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' }}");
-    expect(section).toContain('needs: [staging-web, staging-api]');
+    expect(section).toContain('needs: [staging-web, staging-api, staging-stream]');
     expect(section).toContain('environment:\n      name: staging\n    steps:');
-    expect(section).toContain('test "$API_DEPLOYED" = true && test "$API_SOURCE_SHA" = "$GITHUB_SHA"');
+    expect(section).toContain('test "$API_DEPLOYED" = true');
+    expect(section).toContain('test "$API_SOURCE_SHA" = "$GITHUB_SHA"');
+    expect(section).toContain('test "$STREAM_SOURCE_SHA" = "$GITHUB_SHA"');
     expect(section.match(/working-directory: .*$/gm)).toEqual(['working-directory: e2e', 'working-directory: e2e']);
+    const stream = jobSection(deployWorkflow, 'staging-stream');
+    expect(stream).toContain('needs: [gate, staging-api]');
+    expect(stream).toContain('test "$STREAM_DEPLOY_ENABLED" = true');
+    expect(stream).toContain('test "$API_SOURCE_SHA" = "$GITHUB_SHA"');
+    expect(stream).toContain('worker_tools.py install stream');
+    expect(stream).toContain('staging_api_identity.py --stream-staging');
+    expect(stream).toContain('test -s "$RUNNER_TEMP/staging-stream-identity.json"');
+    expect(jobSection(deployWorkflow, 'gate')).toContain('Armed Stream staging requires the deploy credential.');
   });
 
   test('only the evidenced staging steps run a wrangler deploy', () => {
@@ -2273,18 +2284,18 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     );
     // Dropped staging environment mapping on exactly one lane: that lane's
     // deployment record would land unscoped instead of in `staging`. The
-    // block appears exactly four times (staging-web, staging-api,
-    // staging-mb, staging-ingest); split it so each mutant drops one
+    // block appears exactly five times; split it so each mutant drops one
     // lane's copy.
     const envParts = jobsBody.split(stagingEnvBlock);
-    expect(envParts, 'staging env block must appear exactly four times').toHaveLength(5);
+    expect(envParts, 'staging env block must appear exactly five times').toHaveLength(6);
     const noWebStagingEnvMutant = envParts[0] + envParts.slice(1).join(stagingEnvBlock);
     const noApiStagingEnvMutant =
       envParts.slice(0, 2).join(stagingEnvBlock) + envParts.slice(2).join(stagingEnvBlock);
     const noMbStagingEnvMutant =
       envParts.slice(0, 3).join(stagingEnvBlock) + envParts.slice(3).join(stagingEnvBlock);
     const noIngestStagingEnvMutant =
-      envParts.slice(0, 4).join(stagingEnvBlock) + envParts[4];
+      envParts.slice(0, 4).join(stagingEnvBlock) + envParts.slice(4).join(stagingEnvBlock);
+    const noStreamStagingEnvMutant = envParts.slice(0, 5).join(stagingEnvBlock) + envParts[5];
     // Quoted production environment value.
     const quotedEnvMutant = `${jobsBody}\n    environment: "production"\n`;
     // CI-only gate bypass in the api lane: the Hyperdrive cache-disabled
@@ -2516,6 +2527,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       noApiStagingEnvMutant,
       noMbStagingEnvMutant,
       noIngestStagingEnvMutant,
+      noStreamStagingEnvMutant,
       allowSkipMutant,
       noBuildShaMutant,
       noParityMutant,

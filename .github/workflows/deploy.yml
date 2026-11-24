@@ -86,10 +86,15 @@ jobs:
       - id: check
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          STREAM_ARM: ${{ vars.STREAM_STAGING_DEPLOY_ENABLED }}
+          PRIVATE_JOURNEY_ARM: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY }}
         run: |
           set -euo pipefail
           if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" == push && ( "${STREAM_ARM,,}" == true || "${PRIVATE_JOURNEY_ARM,,}" == true ) ]]; then
+            echo '::error::Armed Stream staging requires the deploy credential.'
+            exit 1
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
@@ -988,6 +993,80 @@ jobs:
             echo "Deployment marker only; not health, rollback or full staging acceptance evidence."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Internal Stream bootstrap and private qualification share the staging lock.
+  staging-stream:
+    name: staging-stream
+    needs: [gate, staging-api]
+    if: ${{ github.event_name == 'push' && (vars.STREAM_STAGING_DEPLOY_ENABLED == 'true' || vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: staging
+      url: https://staging.nntune.com
+    outputs:
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+    steps:
+      - name: Require staging Stream and API deployment gates
+        env:
+          STREAM_DEPLOY_ENABLED: ${{ vars.STREAM_STAGING_DEPLOY_ENABLED }}
+          DEPLOY_TOKEN_PRESENT: ${{ needs.gate.outputs.enabled }}
+          API_DEPLOYED: ${{ needs.staging-api.outputs.deployed }}
+          API_SOURCE_SHA: ${{ needs.staging-api.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$STREAM_DEPLOY_ENABLED" = true
+          test "$DEPLOY_TOKEN_PRESENT" = true
+          test "$API_DEPLOYED" = true
+          test "$API_SOURCE_SHA" = "$GITHUB_SHA"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Worker Rust
+        run: python3 -I .github/scripts/worker_rust_provenance.py rust
+      - name: Prepare pinned Stream tools
+        run: python3 -I .github/scripts/worker_tools.py install stream
+      - name: Build stream with canonical tools
+        working-directory: workers/stream
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-stream.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-stream.log" stream
+          git diff --exit-code -- ../../Cargo.lock
+      - name: Generate staging wrangler.toml
+        working-directory: workers/stream
+        env:
+          PRIVATE_MUSIC_STAGING_JOURNEY: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY }}
+          PRIVATE_PLAYBACK_STAGING_ENABLED: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENABLED }}
+          PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION }}
+          PRIVATE_PLAYBACK_STAGING_S3_BUCKET: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_BUCKET }}
+          PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT }}
+          PRIVATE_PLAYBACK_STAGING_S3_REGION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_REGION }}
+          PRIVATE_PLAYBACK_STAGING_ROOT_VERSION: ${{ vars.PRIVATE_PLAYBACK_STAGING_ROOT_VERSION }}
+        run: |
+          python3 -I ../../.github/scripts/staging_stream_config.py
+      - name: Deploy stream to staging
+        id: deploy
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        env:
+          PRIVATE_PLAYBACK_STAGING_ENABLED: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENABLED }}
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: ${{ env.WRANGLER_VERSION }}
+          workingDirectory: workers/stream
+          command: deploy --env staging --var BUILD_SHA:${{ github.sha }}
+          postCommands: >-
+            receipt=$(timeout -k 2s 30s python3 -I ../../.github/scripts/staging_api_identity.py --stream-staging 2>/dev/null) &&
+            printf '%s\n' "$receipt" > "$RUNNER_TEMP/staging-stream-identity.json"
+      - name: Record served Stream deployment identity
+        id: identity
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/staging-stream-identity.json"
+          cat "$RUNNER_TEMP/staging-stream-identity.json" >> "$GITHUB_STEP_SUMMARY"
+          echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
   # Post-deploy staging E2E (same run, same revision as the deploys above).
   # No always()/!cancelled(): with the implicit success() gate, this job is
   # skipped whenever `staging-web` or `staging-api` is skipped (gate
@@ -1033,18 +1112,23 @@ jobs:
   # This job produces its own verdict and an armed failure fails the deploy run.
   post-deploy-private-music:
     name: post-deploy private music journey
-    needs: [staging-web, staging-api]
+    needs: [staging-web, staging-api, staging-stream]
     if: ${{ github.event_name == 'push' && vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment:
       name: staging
     steps:
-      - name: Require this run's API deployment
+      - name: Require this run's API and Stream deployment
         env:
           API_SOURCE_SHA: ${{ needs.staging-api.outputs.source_sha }}
           API_DEPLOYED: ${{ needs.staging-api.outputs.deployed }}
-        run: test "$API_DEPLOYED" = true && test "$API_SOURCE_SHA" = "$GITHUB_SHA"
+          STREAM_SOURCE_SHA: ${{ needs.staging-stream.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$API_DEPLOYED" = true
+          test "$API_SOURCE_SHA" = "$GITHUB_SHA"
+          test "$STREAM_SOURCE_SHA" = "$GITHUB_SHA"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

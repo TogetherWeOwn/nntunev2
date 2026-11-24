@@ -42,6 +42,25 @@ def version(*bindings, sha=SHA):
 
 
 class IdentityTests(unittest.TestCase):
+    def test_stream_receipt_requires_its_own_deployed_version_and_build(self):
+        output_stream = output(worker_name=identity.STREAM)
+        mode = {"name": "PRIVATE_PLAYBACK_ENABLED", "type": "plain_text", "text": "false"}
+        read = MagicMock(side_effect=[current(), version(mode), current()])
+        self.assertEqual(identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "false"), {
+            "identity": "matched", "worker": "nntune-stream-staging", "build_sha": SHA,
+            "deployment_id": DEPLOYMENT, "version_id": VERSION, "private_playback_enabled": False,
+        })
+        self.assertTrue(all("/workers/scripts/nntune-stream-staging/" in call.args[0]
+                            for call in read.call_args_list))
+        with self.assertRaisesRegex(identity.Unavailable, "deploy-output-unavailable"):
+            identity.receipt(output(), SHA, ACCOUNT, MagicMock(), identity.STREAM, "false")
+        read = MagicMock(side_effect=[current(), version(mode, sha="e" * 40)])
+        with self.assertRaisesRegex(identity.Unavailable, "version-build-mismatch"):
+            identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "false")
+        read = MagicMock(side_effect=[current(), version(mode)])
+        with self.assertRaisesRegex(identity.Unavailable, "stream-mode-mismatch"):
+            identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "true")
+
     def test_cli_reports_matched_or_unavailable(self):
         deployment = identity.decode(json.dumps(current()).replace("100}", "100.0}").encode(), "bad fixture")
         deployment["deployments"] += current(OTHER, OTHER)["deployments"]

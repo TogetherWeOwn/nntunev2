@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 SCRIPT = "nntune-api-staging"
+STREAM = "nntune-stream-staging"
 HOST = "api.cloudflare.com"
 MAX_BODY = 1024 * 1024
 MAX_DEPLOY_OUTPUT = 64 * 1024
@@ -53,7 +54,7 @@ def valid(pattern, value):
     return isinstance(value, str) and pattern.fullmatch(value) is not None
 
 
-def deployed_version(body):
+def deployed_version(body, script=SCRIPT):
     # The action has no version-ID output; use Wrangler 4.162.0's session and deploy v1 JSONL.
     reason = "deploy-output-unavailable"
     require(len(body) <= MAX_DEPLOY_OUTPUT and body.endswith(b"\n"), reason)
@@ -64,7 +65,7 @@ def deployed_version(body):
     deploy = deploys[0]
     version_id = deploy.get("version_id")
     require(type(deploy.get("version")) is int and deploy["version"] == 1, reason)
-    require(deploy.get("worker_name") == SCRIPT and deploy.get("wrangler_environment") == "staging", reason)
+    require(deploy.get("worker_name") == script and deploy.get("wrangler_environment") == "staging", reason)
     require(valid(UUID, version_id), reason)
     return version_id
 
@@ -154,7 +155,7 @@ def current_deployment(result, version_id):
     return ids[0]
 
 
-def verify_version(result, version_id, expected_sha):
+def verify_build(result, version_id, expected_sha):
     require(field(result, "id") == version_id, "provider-version-mismatch")
     bindings = field(field(result, "resources"), "bindings")
     require(isinstance(bindings, list), "version-bindings-unavailable")
@@ -167,20 +168,38 @@ def verify_version(result, version_id, expected_sha):
     build = by_name.get("BUILD_SHA")
     require(field(build, "type") == "plain_text" and valid(SHA, field(build, "text")), "version-build-unavailable")
     require(build["text"] == expected_sha, "version-build-mismatch")
+    return by_name
+
+
+def verify_version(result, version_id, expected_sha):
+    by_name = verify_build(result, version_id, expected_sha)
     enable = by_name.get(PREFIX + "ENABLE")
     off = enable is None or (enable["type"] == "plain_text" and enable.get("text") == "0")
     require(off and PREFIX + "LEASE" not in by_name and PREFIX + "DB" not in by_name, "default-off-not-verified")
 
 
-def receipt(body, expected_sha, account, read):
+def receipt(body, expected_sha, account, read, script=SCRIPT, stream_enabled=None):
     require(valid(SHA, expected_sha), "expected-build-shape")
     require(valid(re.compile(r"[0-9a-f]{32}"), account), "account-config")
-    version_id = deployed_version(body)
-    path = f"/client/v4/accounts/{account}/workers/scripts/{SCRIPT}"
+    require(script in (SCRIPT, STREAM), "deploy-output-unavailable")
+    if script == STREAM:
+        require(stream_enabled in ("true", "false"), "stream-mode-config")
+    version_id = deployed_version(body, script)
+    path = f"/client/v4/accounts/{account}/workers/scripts/{script}"
     deployments = path + "/deployments"
     deployment_id = current_deployment(read(deployments), version_id)
-    verify_version(read(path + "/versions/" + version_id), version_id, expected_sha)
+    version = read(path + "/versions/" + version_id)
+    if script == STREAM:
+        bindings = verify_build(version, version_id, expected_sha)
+        mode = bindings.get("PRIVATE_PLAYBACK_ENABLED")
+        require(field(mode, "type") == "plain_text" and field(mode, "text") == stream_enabled,
+                "stream-mode-mismatch")
+    else:
+        verify_version(version, version_id, expected_sha)
     require(current_deployment(read(deployments), version_id) == deployment_id, "deployment-changed-during-readback")
+    if script == STREAM:
+        return {"identity": "matched", "worker": script, "deployment_id": deployment_id,
+                "version_id": version_id, "build_sha": expected_sha, "private_playback_enabled": stream_enabled == "true"}
     return matched_receipt(deployment_id, version_id, expected_sha)
 
 
@@ -226,7 +245,7 @@ def report_receipt(path, expected_sha):
     return 0
 
 
-def main():
+def main(script=SCRIPT):
     try:
         token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
         require(valid(re.compile(r"[\x21-\x7e]{1,512}"), token), "credential-config")
@@ -236,8 +255,9 @@ def main():
                 body = source.read(MAX_DEPLOY_OUTPUT + 1)
         except (OSError, KeyError, ValueError):
             raise Unavailable("deploy-output-unavailable") from None
+        stream_enabled = (os.getenv("PRIVATE_PLAYBACK_STAGING_ENABLED") or "false") if script == STREAM else None
         result = receipt(body, os.getenv("GITHUB_SHA"), os.getenv("CLOUDFLARE_ACCOUNT_ID"),
-                         lambda path: provider_result(path, token))
+                         lambda path: provider_result(path, token), script, stream_enabled)
     except Unavailable as exc:
         print(json.dumps({"identity": "unavailable", "reason": str(exc)}))
         return 1
@@ -248,6 +268,8 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) == 1:
         raise SystemExit(main())
+    if sys.argv[1:] == ["--stream-staging"]:
+        raise SystemExit(main(STREAM))
     if len(sys.argv) == 4 and sys.argv[1] == "--validate-receipt":
         raise SystemExit(report_receipt(sys.argv[2], sys.argv[3]))
     raise SystemExit(2)
