@@ -364,6 +364,8 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
              GRANT CONNECT ON DATABASE nntune_billing_native TO billing_native_caller_fixture;
              GRANT USAGE ON SCHEMA public TO billing_native_caller_fixture;
              GRANT SELECT ON public.subscriptions, public.billing_accounts
+                TO billing_native_caller_fixture;
+             GRANT SELECT (id, price_cents) ON public.plans
                 TO billing_native_caller_fixture;",
         )
         .await
