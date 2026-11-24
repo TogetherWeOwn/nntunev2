@@ -332,9 +332,21 @@ pub(crate) async fn verify_publication(
 
     let lookup = release_lookup(QUERY).unwrap();
     let mut publication = connection().await;
-    let mut publish = async |publication: &mut Client, upload_writer: &mut Client| {
+    let mut publish = async |publication: &mut Client, upload_writer: &mut Client, replay: bool| {
         Box::pin(upload(&ctx, &request, target, async |permit, _| {
             permit.preflight(publication).await?;
+            if replay {
+                return permit
+                    .replay(
+                        publication,
+                        upload_writer,
+                        "fixture-bucket",
+                        auth,
+                        prepared,
+                        &mut read_authority,
+                    )
+                    .await;
+            }
             let evidence = MatchEvidence {
                 query: QUERY,
                 candidates: Some(CompleteReleaseCandidates {
@@ -377,7 +389,10 @@ pub(crate) async fn verify_publication(
         ).await.unwrap()
     };
     assert_eq!(set_job("other-trial-job").await, 1);
-    assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
+    assert_eq!(
+        publish(&mut publication, upload_writer, false).await.status,
+        404
+    );
     assert_eq!(set_job(JOB).await, 1);
     observer.batch_execute(
         "CREATE FUNCTION public.fixture_refuse_trial_admission() RETURNS trigger LANGUAGE plpgsql
@@ -385,7 +400,14 @@ pub(crate) async fn verify_publication(
          CREATE TRIGGER fixture_refusal BEFORE INSERT ON public.private_library_admissions
          FOR EACH ROW EXECUTE FUNCTION public.fixture_refuse_trial_admission();",
     ).await.unwrap();
-    assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
+    assert_eq!(
+        publish(&mut publication, upload_writer, true).await.status,
+        503
+    );
+    assert_eq!(
+        publish(&mut publication, upload_writer, false).await.status,
+        404
+    );
     publication.simple_query("SELECT 1").await.unwrap();
     assert!(observer
         .query_one(
@@ -401,7 +423,7 @@ pub(crate) async fn verify_publication(
         .batch_execute("DROP TRIGGER fixture_refusal ON public.private_library_admissions")
         .await
         .unwrap();
-    let first = publish(&mut publication, upload_writer).await;
+    let first = publish(&mut publication, upload_writer, false).await;
     assert_eq!(first.status, 200);
     let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
     let track = body["trackId"].as_str().unwrap();
@@ -439,7 +461,7 @@ pub(crate) async fn verify_publication(
         .status,
         403
     );
-    let replay = publish(&mut publication, upload_writer).await;
+    let replay = publish(&mut publication, upload_writer, true).await;
     assert_eq!((replay.status, replay.body), (200, first.body));
     assert!(exact_reference().await);
 
@@ -450,7 +472,10 @@ pub(crate) async fn verify_publication(
         )
         .await
         .unwrap();
-    assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
+    assert_eq!(
+        publish(&mut publication, upload_writer, true).await.status,
+        404
+    );
     assert_eq!(handle(&ctx, &library).await.status, 403);
 
     track.to_owned()

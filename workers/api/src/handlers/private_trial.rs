@@ -5,6 +5,7 @@ pub const FIXTURE_BYTES: usize = 177_175;
 
 mod caller;
 pub mod cleanup;
+pub use caller::replay::read_registered_header;
 #[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]
 pub mod registration;
 #[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]

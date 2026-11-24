@@ -25,6 +25,9 @@ use nntune_ingest::{
 use sha2::{Digest, Sha256};
 use tokio_postgres::{types::Type, Client, Transaction};
 
+#[path = "replay.rs"]
+pub(super) mod replay;
+
 const STAGING_ORIGIN: &str = "https://staging.nntune.com";
 // SHA-256 of the original CC0 tone-a.flac in the private staging manifest.
 pub(super) const FIXTURE_DIGEST: [u8; 32] = [
