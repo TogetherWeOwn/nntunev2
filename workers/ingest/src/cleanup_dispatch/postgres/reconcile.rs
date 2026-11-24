@@ -17,7 +17,7 @@ pub(super) async fn dispatch_multipart_claims<
 >(
     db: &mut Client,
     scope: CleanupScope<'_>,
-    environment: &str,
+    environment: [u8; 16],
     (configuration, bucket): ([u8; 16], &str),
     (mut find, mut abort): (
         impl AsyncFnMut(&str, SystemTime) -> Result<String, ()>,
@@ -26,7 +26,7 @@ pub(super) async fn dispatch_multipart_claims<
     send: impl FnMut(CleanupMessage, u32) -> S,
     deadline: impl Fn() -> D,
 ) -> Result<(), DispatchError> {
-    if !scope.environment_id.eq_ignore_ascii_case(environment) {
+    if scope.environment_id.replace('-', "").to_ascii_lowercase() != uuid(&environment) {
         return Err(DispatchError::MultipartNotConfirmed);
     }
     dispatch_claims(

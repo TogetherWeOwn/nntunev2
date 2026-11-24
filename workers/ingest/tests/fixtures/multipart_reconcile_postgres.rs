@@ -89,6 +89,13 @@ async fn postgres_reconciles_a_lost_initiation() {
     };
     let [_, environment, library, object, generation, configuration] =
         identities.map(|id| uuid(&id));
+    let scope_ids = observer
+        .query_one(
+            "SELECT $1::text::uuid::text, $2::text::uuid::text",
+            &[&environment, &library],
+        )
+        .await
+        .unwrap();
     let session: String = observer
         .query_one("SELECT gen_random_uuid()::text", &[])
         .await
@@ -113,8 +120,8 @@ async fn postgres_reconciles_a_lost_initiation() {
                  '{lease}', '{generation}');"
     )).await.unwrap();
     let scope = CleanupScope {
-        environment_id: &environment,
-        library_id: &library,
+        environment_id: scope_ids.get(0),
+        library_id: scope_ids.get(1),
         principal_id: OWNER,
         session_id: &session,
     };
@@ -171,7 +178,7 @@ async fn postgres_reconciles_a_lost_initiation() {
         dispatch_multipart_claims(
             &mut writer,
             scope,
-            &library,
+            identities[2],
             provider_scope,
             (unexpected_list, unexpected_abort),
             unexpected_send,
@@ -185,7 +192,7 @@ async fn postgres_reconciles_a_lost_initiation() {
         dispatch_multipart_claims(
             &mut writer,
             scope,
-            &environment,
+            identities[1],
             provider_scope,
             (unexpected_list, unexpected_abort),
             |message, delay| {
@@ -296,12 +303,24 @@ async fn postgres_reconciles_a_lost_initiation() {
     )
     .unwrap();
     let mut contender = connect().await;
-    let (started, started_rx) = tokio::sync::oneshot::channel();
-    let started = Cell::new(Some(started));
+    let (elapsed, timer) = tokio::sync::oneshot::channel();
+    let elapsed = Cell::new(Some(elapsed));
+    let timer = Cell::new(Some(timer));
+    let claim_phase = Cell::new(true);
+    let attempt_deadline = || {
+        let terminal_timer = (!claim_phase.replace(false)).then(|| timer.take().unwrap());
+        async move {
+            if let Some(timer) = terminal_timer {
+                timer.await.unwrap();
+            } else {
+                deadline().await;
+            }
+        }
+    };
     let interrupted = dispatch_multipart_claims(
         &mut writer,
         scope,
-        &environment,
+        identities[1],
         provider_scope,
         (
             async |observed: &str, _| {
@@ -326,27 +345,29 @@ async fn postgres_reconciles_a_lost_initiation() {
                 assert_eq!((observed, upload), (key.as_str(), UPLOAD));
                 assert!(SystemTime::now() < until);
                 assert_eq!(saved_id(&observer, &session).await.as_deref(), Some(UPLOAD));
-                // Abort reached S3, but its response is lost when the task is dropped.
+                // Abort reached S3, but its response is lost at the attempt deadline.
                 assert!(created.replace(false));
-                started.take().unwrap().send(()).unwrap();
+                elapsed.take().unwrap().send(()).unwrap();
                 pending().await
             },
         ),
         unexpected_send,
-        deadline,
+        attempt_deadline,
     );
-    tokio::select! {
-        result = interrupted => panic!("abort should have been interrupted: {result:?}"),
-        ready = started_rx => ready.unwrap(),
-        _ = deadline() => panic!("abort never started"),
-    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), interrupted)
+            .await
+            .unwrap(),
+        Err(DispatchError::MultipartNotConfirmed)
+    );
+    assert!(!created.get());
     expire_claim(&observer, &session).await;
 
     let sent = Cell::new(false);
     dispatch_multipart_claims(
         &mut writer,
         scope,
-        &environment,
+        identities[1],
         provider_scope,
         (unexpected_list, async |observed: &str, upload: &str, _| {
             assert_eq!((observed, upload), (key.as_str(), UPLOAD));

@@ -60,7 +60,7 @@ pub async fn dispatch_multipart_scope(
     env: &Env,
     mut db: Client,
     scope: CleanupScope<'_>,
-    environment: &str,
+    environment: [u8; 16],
     provider: &crate::multipart::s3_completion::S3CompletionSender,
 ) -> Result<(), DispatchError> {
     reconcile::dispatch_multipart_claims(
