@@ -5,11 +5,14 @@ use crate::billing_reconcile::{
 };
 use serde_json::{json, Value};
 use std::{cell::RefCell, rc::Rc, time::Duration};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
 // This database is created from template0 by the exact-test Actions step.
 const CONNECTION: &str =
     "host=127.0.0.1 user=postgres password=ci-throwaway dbname=nntune_billing_native sslmode=disable";
+const CALLER_CONNECTION: &str =
+    "host=127.0.0.1 user=billing_native_caller_fixture password=ci-throwaway dbname=nntune_billing_native sslmode=disable";
 const USER: &str = "native_billing_user";
 const OTHER_USER: &str = "native_billing_other";
 const SUBSCRIPTION: &str = "sub_native_billing";
@@ -17,59 +20,79 @@ const INVOICE: &str = "in_native_billing";
 const NOW: i64 = 1_786_032_000;
 
 async fn dispatch(user: &str, outcome: &ReconcileOutcome) -> Result<(), StoreError> {
-    dispatch_with(user, outcome, Writer::Owned).await
+    with_fixture_store(async |store| {
+        store
+            .store_reconcile_owned(user.to_owned(), outcome.clone())
+            .await
+    })
+    .await
 }
 
-enum Writer {
-    Owned,
-    Release,
-}
-
-async fn dispatch_with(
+async fn dispatch_caller(
     user: &str,
-    outcome: &ReconcileOutcome,
-    writer: Writer,
-) -> Result<(), StoreError> {
-    with_fixture_store(async |store| match writer {
-        Writer::Owned => {
-            store
-                .store_reconcile_owned(user.to_owned(), outcome.clone())
-                .await
-        }
-        Writer::Release => super::Store::store_reconcile_outcome(store, user, outcome).await,
+    target: &str,
+    remote: &RemoteSubscription,
+) -> Result<ReconcileOutcome, StoreError> {
+    let expected_connections = if target == remote.subscription.id {
+        2
+    } else {
+        0
+    };
+    with_store(CALLER_CONNECTION, expected_connections, async |store| {
+        store
+            .reconcile_owned_subscription(
+                user,
+                target,
+                remote.subscription.clone(),
+                async |subscription| {
+                    assert_eq!(subscription.id, target);
+                    Ok(remote.invoices.clone())
+                },
+                NOW,
+            )
+            .await
     })
     .await
 }
 
 async fn with_fixture_store<T>(run: impl AsyncFnOnce(&PgStore) -> T) -> T {
-    let driver = Rc::new(RefCell::new(None));
-    let driver_slot = Rc::clone(&driver);
+    with_store(CONNECTION, 1, run).await
+}
+
+async fn with_store<T>(
+    connection: &'static str,
+    expected_connections: usize,
+    run: impl AsyncFnOnce(&PgStore) -> T,
+) -> T {
+    let drivers = Rc::new(RefCell::new(Vec::new()));
+    let driver_slots = Rc::clone(&drivers);
     let store = PgStore {
         env: None,
         trace_id: "native-billing-store-test".into(),
         mirror_binding: MirrorBinding::Unconfigured,
         test_client: RefCell::new(None),
         test_connect: Some(Box::new(move || {
-            let driver_slot = Rc::clone(&driver_slot);
+            let driver_slots = Rc::clone(&driver_slots);
             Box::pin(async move {
                 let (client, connection) =
-                    tokio_postgres::connect(CONNECTION, NoTls).await.unwrap();
-                assert!(driver_slot
-                    .replace(Some(tokio::spawn(connection)))
-                    .is_none());
+                    tokio_postgres::connect(connection, NoTls).await.unwrap();
+                driver_slots.borrow_mut().push(tokio::spawn(connection));
                 Ok(client)
             })
         })),
         test_mirror: None,
     };
     let result = run(&store).await;
-    // Join before discarding the store: the call must have released its client.
-    let driver = driver.take().expect("store must acquire one connection");
-    tokio::time::timeout(Duration::from_secs(5), driver)
-        .await
-        .expect("billing connection did not close")
-        .unwrap()
-        .unwrap();
+    let drivers = drivers.take();
+    assert_eq!(drivers.len(), expected_connections);
+    // Join before discarding the Store to verify the caller released every client.
+    for driver in drivers {
+        tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("billing connection did not close")
+            .unwrap()
+            .unwrap();
+    }
     result
 }
 
@@ -369,12 +392,44 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
     seed.row.stripe_customer_id = CUSTOMER.into();
     seed.row.stripe_item_id = ITEM.into();
     seed.row.stripe_price_id = PLUS.into();
+    seed.row.status = "trialing".into();
     seed.row.current_period_end_unix = Some(NOW + 15);
     seed.row.paid_through_unix = Some(NOW + 15);
     seed.row.paid_invoice_id = Some(LEGACY.into());
     dispatch(OTHER_USER, &seed)
         .await
         .expect("create mixed-plan target");
+    observer
+        .batch_execute(
+            "CREATE ROLE billing_native_caller_fixture LOGIN NOSUPERUSER NOINHERIT
+                NOCREATEDB NOCREATEROLE NOBYPASSRLS PASSWORD 'ci-throwaway';
+             REVOKE CONNECT ON DATABASE nntune_billing_native FROM PUBLIC;
+             GRANT CONNECT ON DATABASE nntune_billing_native TO billing_native_caller_fixture;
+             GRANT USAGE ON SCHEMA public TO billing_native_caller_fixture;
+             GRANT SELECT ON public.subscriptions, public.billing_accounts
+                TO billing_native_caller_fixture;
+             GRANT SELECT (id, price_cents) ON public.plans
+                TO billing_native_caller_fixture;",
+        )
+        .await
+        .unwrap();
+    observer
+        .execute(
+            "INSERT INTO public.billing_accounts (user_id, stripe_customer_id) VALUES ($1, $2)",
+            &[&OTHER_USER, &CUSTOMER],
+        )
+        .await
+        .unwrap();
+    observer
+        .execute(
+            "INSERT INTO public.plan_prices
+             (stripe_price_id, plan_id, currency, price_cents, billing_interval, livemode, selectable)
+             VALUES ($1, 'plus', 'usd', 800, 'month', false, true),
+                    ($2, 'pro', 'usd', 1500, 'month', false, true)",
+            &[&PLUS, &PRO],
+        )
+        .await
+        .unwrap();
 
     let line = |id, price, start: i64, end: i64| {
         json!({
@@ -415,7 +470,7 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         stripe_item_id: ITEM.into(),
         stripe_price_id: PLUS.into(),
         plan_id: "plus".into(),
-        status: "active".into(),
+        status: seed.row.status.clone(),
         paid_through_unix: seed.row.paid_through_unix,
         paid_invoice_id: seed.row.paid_invoice_id.clone(),
         grace_until_unix: None,
@@ -477,6 +532,59 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         )
         .await
         .unwrap();
+    let before = snapshot(observer).await;
+    let denied_read = with_store(CALLER_CONNECTION, 1, async |store| {
+        store
+            .reconcile_owned_subscription(
+                OTHER_USER,
+                TARGET,
+                remote.subscription.clone(),
+                async |_| panic!("must read price bindings before loading invoices"),
+                NOW,
+            )
+            .await
+    })
+    .await;
+    assert!(denied_read.is_err());
+    assert_eq!(snapshot(observer).await, before);
+    observer
+        .batch_execute("GRANT SELECT ON public.plan_prices TO billing_native_caller_fixture")
+        .await
+        .unwrap();
+
+    // An anchored terminal observation without its anchor is explicitly stale.
+    // The owned transaction checks the lock and target without writing either table.
+    let mut stale = remote.clone();
+    stale.subscription.status = "canceled".into();
+    stale.invoices.clear();
+    check_caller_lock_privilege().await;
+    assert!(dispatch_caller(OTHER_USER, TARGET, &stale).await.is_err());
+    assert_eq!(snapshot(observer).await, before);
+    observer
+        .batch_execute(
+            "GRANT INSERT, UPDATE ON public.subscriptions TO billing_native_caller_fixture",
+        )
+        .await
+        .unwrap();
+    let locked = dispatch_caller(OTHER_USER, TARGET, &stale)
+        .await
+        .expect("stale no-op only needs the subscription lock and reads");
+    assert!(locked.explicit_stale && locked.history.is_empty());
+    assert_eq!(snapshot(observer).await, before);
+    observer
+        .batch_execute(
+            "GRANT INSERT, UPDATE (covered_periods),
+                SELECT (stripe_invoice_id, user_id, stripe_subscription_id, plan_id,
+                    period_start, period_end, amount_cents, currency, paid_at, covered_periods)
+                ON public.paid_invoice_history TO billing_native_caller_fixture;",
+        )
+        .await
+        .unwrap();
+    assert!(dispatch_caller(OTHER_USER, SUBSCRIPTION, &remote)
+        .await
+        .is_err());
+    assert!(dispatch_caller(USER, TARGET, &remote).await.is_err());
+    assert_eq!(snapshot(observer).await, before);
     // #902 only counted the item plan. #926 lost the first Pro start
     // when Plus temporarily held the latest end.
     for (plan, start, end) in [("plus", NOW, NOW + 15), ("pro", NOW + 10, NOW + 30)] {
@@ -494,7 +602,7 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         );
         let before = snapshot(observer).await;
         assert!(
-            dispatch(OTHER_USER, &fresh).await.is_err(),
+            dispatch_caller(OTHER_USER, TARGET, &remote).await.is_err(),
             "{plan} {start} {end}"
         );
         assert_eq!(
@@ -513,9 +621,11 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         .history
         .retain(|row| row.stripe_invoice_id == LEGACY);
     assert_eq!(legacy_replay.history.len(), 1);
-    dispatch_with(OTHER_USER, &legacy_replay, Writer::Release)
-        .await
-        .expect("release writer hydrates a nonempty legacy invoice batch");
+    with_fixture_store(async |store| {
+        super::Store::store_reconcile_outcome(store, OTHER_USER, &legacy_replay).await
+    })
+    .await
+    .expect("release writer hydrates a nonempty legacy invoice batch");
     assert_eq!(
         observer
             .query_one(coverage_matches, &[&LEGACY, &NOW, &(NOW + 30)])
@@ -525,7 +635,7 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         Some(true)
     );
     let hydrated = snapshot(observer).await;
-    assert!(dispatch(OTHER_USER, &fresh).await.is_err());
+    assert!(dispatch_caller(OTHER_USER, TARGET, &remote).await.is_err());
     assert_eq!(snapshot(observer).await, hydrated);
 
     assert_eq!(observer.execute(
@@ -533,9 +643,30 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
          period_end = to_timestamp($4::bigint), covered_periods = NULL WHERE stripe_invoice_id = $1",
         &[&LEGACY, &current.plan_id, &current.period_start_unix, &current.period_end_unix],
     ).await.unwrap(), 1);
-    dispatch(OTHER_USER, &fresh)
+    let before = snapshot(observer).await;
+    let mut altered = remote.clone();
+    altered.invoices[1].amount_paid += 1;
+    assert!(dispatch_caller(OTHER_USER, TARGET, &altered).await.is_err());
+    assert_eq!(snapshot(observer).await, before);
+
+    observer
+        .batch_execute(
+            "REVOKE INSERT ON public.paid_invoice_history FROM billing_native_caller_fixture",
+        )
+        .await
+        .unwrap();
+    assert!(dispatch_caller(OTHER_USER, TARGET, &remote).await.is_err());
+    assert_eq!(snapshot(observer).await, before);
+    observer
+        .batch_execute(
+            "GRANT INSERT ON public.paid_invoice_history TO billing_native_caller_fixture",
+        )
+        .await
+        .unwrap();
+    let applied = dispatch_caller(OTHER_USER, TARGET, &remote)
         .await
         .expect("matching mixed-plan history hydrates");
+    assert_eq!(applied, fresh, "caller must read the exact archived target");
     let committed = snapshot(observer).await;
     let target = committed
         .0
@@ -569,17 +700,28 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
             .get::<_, Option<bool>>(0),
         Some(true)
     );
-    let replay = fold(LiveRow {
-        paid_through_unix,
-        paid_invoice_id: target["paid_invoice_id"].as_str().map(str::to_owned),
-        ..local
-    });
+    let replay = dispatch_caller(OTHER_USER, TARGET, &remote)
+        .await
+        .expect("matching mixed-plan replay");
     assert!(replay
         .history
         .iter()
         .any(|row| row.stripe_invoice_id == LEGACY));
-    dispatch(OTHER_USER, &replay)
-        .await
-        .expect("matching mixed-plan replay");
     assert_eq!(snapshot(observer).await, committed);
+}
+
+async fn check_caller_lock_privilege() {
+    let (mut client, connection) = tokio_postgres::connect(CALLER_CONNECTION, NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(connection);
+    let tx = client.transaction().await.unwrap();
+    let err = tx
+        .batch_execute(crate::billing_transaction_sql::LOCK_SUBSCRIPTIONS)
+        .await
+        .expect_err("SELECT alone must not permit the subscription lock");
+    assert_eq!(err.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+    tx.rollback().await.unwrap();
+    drop(client);
+    driver.await.unwrap().unwrap();
 }

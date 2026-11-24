@@ -267,6 +267,8 @@ fn assert_bounded(piece: &str, name: &str) {
 #[test]
 fn every_store_method_races_its_statements_through_the_shared_seam() {
     let source = production();
+    assert_eq!(source.matches("reconcile_owned_subscription").count(), 1);
+    assert!(source.contains("asyncfnreconcile_owned_subscription("));
     let store = source
         .split_once("implStoreforPgStore{")
         .expect("Store impl")

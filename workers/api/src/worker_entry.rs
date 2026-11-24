@@ -1014,6 +1014,44 @@ impl DriverErrorCode for tokio_postgres::Error {
 }
 
 impl PgStore {
+    /// Prepare an exact-target fold and commit it through the owned transaction.
+    /// The callback must exhaust the paid invoice list and each line list.
+    #[allow(dead_code)] // Off-route until the release caller is enabled.
+    async fn reconcile_owned_subscription(
+        &self,
+        user_id: &str,
+        subscription_id: &str,
+        subscription: crate::stripe::Subscription,
+        load_paid_invoices: impl AsyncFnOnce(
+            &crate::stripe::Subscription,
+        ) -> Result<Vec<crate::stripe::Invoice>, StoreError>,
+        now: i64,
+    ) -> Result<crate::billing_reconcile::ReconcileOutcome, StoreError> {
+        use crate::billing_reconcile::{reconcile_exact_target, RemoteSubscription};
+
+        if subscription.id != subscription_id {
+            return Err(StoreError);
+        }
+        let input = self
+            .load_reconcile_input(user_id, Some(subscription_id))
+            .await?;
+        let invoices = load_paid_invoices(&subscription).await?;
+        let remote = RemoteSubscription {
+            subscription,
+            invoices,
+        };
+        let outcome =
+            reconcile_exact_target(subscription_id, input, &remote, now).ok_or(StoreError)?;
+        self.store_reconcile_owned(
+            user_id.to_owned(),
+            outcome.clone(),
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            crate::billing_transaction_sql::ReconcileProbe::None,
+        )
+        .await?;
+        Ok(outcome)
+    }
+
     #[cfg(target_arch = "wasm32")]
     async fn store_reconcile_owned(
         &self,
