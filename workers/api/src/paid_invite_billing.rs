@@ -8,7 +8,23 @@ struct Checkout {
     plan_id: String,
 }
 
-pub(super) async fn browser_purchase<S, M, D, N>(
+// Keep checkout's large future off the shared dispatcher's stack frame.
+#[inline(never)]
+pub(super) fn browser_purchase<'a, S, M, D, N>(
+    ctx: &'a Ctx<'_, S, M, D, N>,
+    req: &'a Request,
+    expected_session_binding: Option<&'a str>,
+) -> Pin<Box<dyn Future<Output = Response> + 'a>>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    Box::pin(dispatch_purchase(ctx, req, expected_session_binding))
+}
+
+async fn dispatch_purchase<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
     expected_session_binding: Option<&str>,

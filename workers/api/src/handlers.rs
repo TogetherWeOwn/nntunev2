@@ -8762,12 +8762,7 @@ where
             Box::pin(billing_webhook(ctx, req)).await
         }
         ("POST", paid_invite_billing::CHECKOUT) if ctx.cfg.paid_billing_enabled() => {
-            Box::pin(paid_invite_billing::browser_purchase(
-                ctx,
-                req,
-                expected_session_binding,
-            ))
-            .await
+            paid_invite_billing::browser_purchase(ctx, req, expected_session_binding).await
         }
         // Catalogue slice 1: session-or-bearer reads over the
         // ingest ledger plus the MusicBrainz mirror.
