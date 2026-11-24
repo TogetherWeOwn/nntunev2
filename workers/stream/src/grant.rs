@@ -165,12 +165,36 @@ pub(crate) fn verify_for_r2(
     secret: &[u8],
     now_unix: u64,
 ) -> Result<(Grant, Option<String>), (GrantError, Option<String>)> {
+    if token.starts_with("v4.") {
+        return Err((GrantError::Malformed, None));
+    }
+    verify_signed(token, secret, now_unix)
+}
+
+pub(crate) fn verify_private(
+    token: &str,
+    secret: &[u8],
+    now_unix: u64,
+) -> Result<(Grant, String), GrantError> {
+    if !token.starts_with("v4.") || token.len() > 1800 || secret.len() < 32 {
+        return Err(GrantError::Malformed);
+    }
+    let (grant, digest) = verify_signed(token, secret, now_unix).map_err(|(e, _)| e)?;
+    Ok((grant, digest.ok_or(GrantError::Malformed)?))
+}
+
+fn verify_signed(
+    token: &str,
+    secret: &[u8],
+    now_unix: u64,
+) -> Result<(Grant, Option<String>), (GrantError, Option<String>)> {
     // The version prefix selects an exact payload grammar.
     let (version, rest) = match token
         .strip_prefix("v1.")
         .map(|r| (1u8, r))
         .or_else(|| token.strip_prefix("v2.").map(|r| (2u8, r)))
         .or_else(|| token.strip_prefix("v3.").map(|r| (3u8, r)))
+        .or_else(|| token.strip_prefix("v4.").map(|r| (4u8, r)))
     {
         Some(pair) => pair,
         None => return Err((GrantError::Malformed, None)),
@@ -180,7 +204,7 @@ pub(crate) fn verify_for_r2(
         return Err((GrantError::Malformed, None));
     }
     let sig = base64url_decode(sig_b64).ok_or((GrantError::Malformed, None))?;
-    let mac_input = if version == 3 {
+    let mac_input = if version >= 3 {
         &token[..3 + payload_b64.len()]
     } else {
         payload_b64
@@ -191,7 +215,7 @@ pub(crate) fn verify_for_r2(
     }
     let payload = base64url_decode(payload_b64).ok_or((GrantError::Malformed, None))?;
     let payload = String::from_utf8(payload).map_err(|_| (GrantError::Malformed, None))?;
-    let (identity, artifact_sha256) = if version == 3 {
+    let (identity, artifact_sha256) = if version >= 3 {
         let (identity, hash) = payload
             .rsplit_once('|')
             .ok_or((GrantError::Malformed, None))?;

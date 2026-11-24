@@ -18,6 +18,7 @@ use crate::{
     s3_range_response::{read_s3_range_chunk, S3RangeResponse, S3RangeResponseError},
 };
 
+pub mod route;
 mod s3;
 pub use s3::{S3EnrolledPlayback, S3Get, S3GetReply};
 
