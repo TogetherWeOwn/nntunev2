@@ -29,8 +29,8 @@ async fn connect() -> Client {
     client
 }
 
-fn receipt(track_id: &str, digest: &str, exp: u64) -> BrowserReceipt {
-    let payload = format!("{MEMBER}|{track_id}|{PLAY}|1|{exp}|{digest}");
+fn receipt(track_id: &str, digest: &str, epoch: u64, exp: u64) -> BrowserReceipt {
+    let payload = format!("{MEMBER}|{track_id}|{PLAY}|{epoch}|{exp}|{digest}");
     let signed = format!("v4.{}", crate::b64::encode(payload.as_bytes()));
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(SECRET).unwrap();
     mac.update(signed.as_bytes());
@@ -45,7 +45,7 @@ fn receipt(track_id: &str, digest: &str, exp: u64) -> BrowserReceipt {
             session_id: "catalogue-tab".into(),
             track_id: track_id.into(),
             play_id: PLAY.into(),
-            epoch: 1,
+            epoch,
             expires_at: exp,
             continuation_deadline: exp,
         },
@@ -90,7 +90,7 @@ async fn resolves_only_the_committed_scoped_publication() {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let exp = now.as_secs() + crate::playback::LEASE_TTL_SECS;
     let deadline = UNIX_EPOCH + Duration::from_secs(exp);
-    let signed = receipt(track, digest, exp);
+    let signed = receipt(track, digest, 1, exp);
     let acquire = async |db: &Client| {
         acquire_playback_lease_on(
             db,
@@ -107,8 +107,9 @@ async fn resolves_only_the_committed_scoped_publication() {
     };
     assert_eq!(acquire(&writer).await, LeaseAcquire::Acquired { epoch: 1 });
 
+    // Keep grant time fixed so expiry cannot mask an authority check.
     let query = async |db: &mut Client, receipt: &BrowserReceipt, pins: &PublicationPins<'_>| {
-        resolve(db, receipt, pins, SECRET, SystemTime::now)
+        resolve(db, receipt, pins, SECRET, || UNIX_EPOCH + now)
             .await
             .unwrap()
     };
@@ -125,6 +126,7 @@ async fn resolves_only_the_committed_scoped_publication() {
     assert!(query(&mut reader, &signed, &pins).await.is_none());
     publication.commit().await.unwrap();
 
+    assert!(pins.accepted_seq > 1, "need a positive stale revision");
     let mismatches: [fn(&mut PublicationPins<'_>); 6] = [
         |pins| pins.environment = [0xff; 16],
         |pins| pins.library = [0xff; 16],
@@ -138,7 +140,7 @@ async fn resolves_only_the_committed_scoped_publication() {
         change(&mut refused);
         assert!(query(&mut reader, &signed, &refused).await.is_none());
     }
-    let wrong_digest = receipt(track, &"00".repeat(32), exp);
+    let wrong_digest = receipt(track, &"00".repeat(32), 1, exp);
     assert!(query(&mut reader, &wrong_digest, &pins).await.is_none());
     let mut unsigned = signed.clone();
     unsigned.grant.token.push('A');
@@ -171,11 +173,17 @@ async fn resolves_only_the_committed_scoped_publication() {
         .unwrap();
     assert!(query(&mut reader, &signed, &pins).await.is_none());
     assert!(
-        query(&mut reader, &receipt(same_media_track, digest, exp), &pins)
-            .await
-            .is_none(),
+        query(
+            &mut reader,
+            &receipt(same_media_track, digest, 1, exp),
+            &pins
+        )
+        .await
+        .is_none(),
         "shared bytes cannot supply another track's reference"
     );
     assert_eq!(acquire(&writer).await, LeaseAcquire::Acquired { epoch: 2 });
     assert!(query(&mut reader, &signed, &pins).await.is_none());
+    let renewed = receipt(track, digest, 2, exp);
+    assert!(query(&mut reader, &renewed, &pins).await.is_some());
 }
