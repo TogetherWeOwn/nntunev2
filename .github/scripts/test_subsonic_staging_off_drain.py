@@ -19,7 +19,7 @@ import subsonic_staging_off_drain as adapter
 import subsonic_staging_probe as probe
 from subsonic_staging_cleanup import CleanupResult
 from subsonic_staging_observer import PressureObservation
-from test_subsonic_staging_cleanup import PIN, deployment, version
+from test_subsonic_staging_cleanup import OTHER, PIN, deployment, version
 
 READ_TOKEN = "SUBSONIC_STAGING_WORKERS_READ_TOKEN"
 OBSERVER = "PLANETSCALE_OBSERVER_URL_STAGING"
@@ -34,9 +34,9 @@ ENV = {
 }
 PROBE_ENV = ENV | {probe.ACCESS_ID: "fixture-edge-id", probe.ACCESS_SECRET: "fixture-edge-secret"}
 OFF_REPLY = (
-    b"HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n"
-    b'Cache-Control: private, no-store\r\n\r\n<subsonic-response status="failed" version="1.16.1">'
-    b'<error code="70" message="Endpoint not supported in staging."/></subsonic-response>'
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: private, no-store\r\n\r\n"
+    b'{"subsonic-response":{"status":"failed","version":"1.16.1","type":"nntune","serverVersion":"0.1.0",'
+    b'"openSubsonic":true,"error":{"code":40,"message":"Wrong username or password."}}}'
 )
 
 
@@ -260,10 +260,13 @@ class ProtectedProbeTests(unittest.TestCase):
             ("success", OFF_REPLY, 2, 0, "verified", ["sample", "post", "sample"]),
             ("redirect", b"HTTP/1.1 302 Found\r\nLocation: https://example.invalid\r\n\r\n",
              2, 0, "request-failed", ["sample", "post", "sample"]),
-            ("oversize", b"HTTP/1.1 404 Not Found\r\nContent-Length: 1025\r\n\r\n",
+            ("oversize", b"HTTP/1.1 200 OK\r\nContent-Length: 1025\r\n\r\n",
+             2, 0, "request-failed", ["sample", "post", "sample"]),
+            ("armed rejection", OFF_REPLY.replace(b"200 OK", b"404 Not Found"),
              2, 0, "request-failed", ["sample", "post", "sample"]),
             ("cancel", OFF_REPLY, 2, 0, "cancelled", ["sample", "post", "sample"]),
             ("postflight busy", OFF_REPLY, 2, 1, "postflight-unverified", ["sample", "post", "sample"]),
+            ("postflight drift", OFF_REPLY, 2, 0, "postflight-unverified", ["sample", "post"]),
             ("preflight pressure", OFF_REPLY, 1, 0, "preflight-unverified", ["sample"]),
             ("missing access", OFF_REPLY, 2, 0, "access-config-unavailable", []),
         )
@@ -302,11 +305,16 @@ class ProtectedProbeTests(unittest.TestCase):
                         self.assertTrue(child.stdin.closed and child.stdout.closed)
                     return PressureObservation(time.monotonic() * 1000, backends if children else 0, free)
 
+                def read_provider(path, _):
+                    if "/versions/" in path:
+                        return version()
+                    if children and case == "postflight drift":
+                        return deployment(deployment_id=OTHER)
+                    return deployment()
+
                 env = PROBE_ENV | ({probe.ACCESS_ID: ""} if case == "missing access" else {})
                 with (
-                    patch.object(adapter, "provider_result", side_effect=lambda path, _: (
-                        version() if "/versions/" in path else deployment()
-                    )),
+                    patch.object(adapter, "provider_result", side_effect=read_provider),
                     patch.object(adapter, "sample_pressure", side_effect=pressure),
                 ):
                     self.assertEqual(probe.probe(env, transport_type(spawn=spawn), cancel), verdict)
