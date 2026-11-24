@@ -2,10 +2,11 @@ import { displayArtist, displayTitle } from '../library/order.js';
 import { resolveStreamUrl } from '../library/stream-url.js';
 import { clearMiniPlayerHint, setMiniPlayerHint } from '../shell/mini-player.js';
 import { validSessionBinding, type AccountSession } from '../auth-fence.js';
+import type { BrowserPlaybackSource } from './browserPlaybackGrant.js';
 import { createBrowserPlaybackSession, type PrivateListeningState } from './browserPlaybackSession.js';
 import { createMediaController, type MediaSelection } from './mediaController.js';
 import { clearQueue, currentTrack, moveTrack, removeTrack, type QueueState, type Track } from './queue.js';
-import { createQueueController, type LibrarySources, type QueueCommitKind, type QueuedPlaySource } from './queueController.js';
+import { createQueueController, type LibrarySources, type QueueCommitKind } from './queueController.js';
 
 type PlayerEffects = Pick<MediaSelection, 'flush'>;
 
@@ -21,10 +22,10 @@ export function createPlayerController(
 	const queue = createQueueController(initial);
 	let browserSession: ReturnType<typeof createBrowserPlaybackSession> | undefined;
 	let privateListening = $state.raw<PrivateListeningState>();
-	let activeGrant = $state.raw<{ trackId: string; source: QueuedPlaySource }>();
+	let activeGrant = $state.raw<BrowserPlaybackSource>();
 	function streamFor(track: Track | null): string {
 		if (!browserPlayback) return resolveStreamUrl(track);
-		return activeGrant && activeGrant.trackId === track?.id && activeGrant.source.isCurrent() ? activeGrant.source.streamUrl : '';
+		return activeGrant && activeGrant.trackId === track?.id && activeGrant.isCurrent() ? activeGrant.streamUrl : '';
 	}
 	function retireBrowserPlayback() {
 		const previous = browserSession;
@@ -34,10 +35,10 @@ export function createPlayerController(
 		activeGrant = privateListening = undefined;
 	}
 	function bindBrowserPlayback(owner: AccountSession, binding: string) {
-		if (!browserPlayback || destroyed || !owner.isCurrent() || !validSessionBinding(binding) ||
+		if (!browserPlayback || destroyed || queue.purging || !owner.isCurrent() || !validSessionBinding(binding) ||
 			(browserSession?.owner === owner && browserSession.binding === binding)) return;
 		if (browserSession) purgeAtAuthBoundary();
-		if (!owner.isCurrent()) return;
+		if (destroyed || !owner.isCurrent()) return;
 		browserSession = createBrowserPlaybackSession(owner, binding, (state) => { privateListening = state; }, browserPlayback.fetchFn);
 		privateListening = { enabled: false, pending: false, feedback: '' };
 		owner.signal.addEventListener('abort', purgeAtAuthBoundary, { once: true });
@@ -63,7 +64,11 @@ export function createPlayerController(
 	const media = createMediaController(queue, {
 		...effects, browseCopy, streamFor, announce: announceQueue,
 		commit: (next, source) => commitQueue(next, 'replace', undefined, source),
-		prepare: browserPlayback ? (id, current, publish) => browserSession?.open(id, current, publish) ?? Promise.resolve(false) : undefined
+		prepare: browserPlayback ? (id, current, publish, retry) => {
+			const playId = retry && activeGrant?.trackId === id ? activeGrant.playId : undefined;
+			if (retry && !playId) return Promise.resolve(false);
+			return browserSession?.open(id, current, publish, playId) ?? Promise.resolve(false);
+		} : undefined
 	}, matchesNative);
 
 	// Keyed messages can announce identical text again without replacing the live region.
@@ -106,7 +111,7 @@ export function createPlayerController(
 		media.destroy();
 	}
 
-	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit, grant?: QueuedPlaySource): boolean {
+	function commitQueue(next: QueueState, kind: QueueCommitKind, library?: LibraryCommit, grant?: BrowserPlaybackSource): boolean {
 		if ((library && !library.isCurrent()) || grant?.isCurrent() === false || destroyed || queue.purging ||
 			(!library && awaitingLibrary && next.tracks.length > 0)) return false;
 		const receipt = queue.begin(next, kind, !!library);
@@ -148,8 +153,7 @@ export function createPlayerController(
 		}
 		if (kind === 'replace') announceQueue('');
 		if (!isCurrent()) return false;
-		if (grant && after) activeGrant = { trackId: after.id, source: grant };
-		else if (trackChanged) activeGrant = undefined;
+		if (grant || trackChanged) activeGrant = grant;
 		queue.publish(next, receipt, library?.sources);
 		if (!isCurrent()) return false;
 		const selected = currentTrack(queue.snapshot);

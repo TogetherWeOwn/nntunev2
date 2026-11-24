@@ -18,15 +18,15 @@
 		{ claimShareEntry?: () => boolean; currentFavorite: ReturnType<typeof createCurrentTrackFavorite> }>();
 </script>
 <script lang="ts">
-	let { children, claimShareEntry, signedOut, allowDesktopRow, browserPlayback = false }: {
+	import { PUBLIC_BROWSER_PLAYBACK } from '$app/env/public';
+	let { children, claimShareEntry, signedOut, allowDesktopRow }: {
 		children: Snippet;
 		claimShareEntry?: (owner: string) => boolean;
 		signedOut?: boolean;
 		allowDesktopRow?: boolean;
-		browserPlayback?: boolean;
 	} = $props();
 	let shareOwner: string | undefined;
-	const controller = createPlayerController(createQueue([]), { flush: tick }, undefined, untrack(() => browserPlayback ? {} : undefined));
+	const controller = createPlayerController(createQueue([]), { flush: tick }, undefined, PUBLIC_BROWSER_PLAYBACK ? {} : undefined);
 	const player = setAppPlayer(Object.assign(controller, { currentFavorite: createCurrentTrackFavorite(controller.queue),
 		claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
 	const { queue, media, media: { seekFeedback, playbackStatus, absoluteSeek } } = player;
@@ -35,7 +35,6 @@
 	const sound = media.sound.state;
 	const currentTrack = $derived(queueCurrentTrack($queue));
 	const streamUrl = $derived(player.streamFor(currentTrack));
-	const canPrepare = $derived(!!(currentTrack && player.privateListening));
 	const sleepTimer = media.sleepTimer;
 	let shortcutHelp = $state.raw<ReturnType<typeof ShortcutHelp>>();
 	let shortcutScope = $state<HTMLDivElement>();
@@ -70,7 +69,7 @@
 <svelte:document onvisibilitychange={() => { if (document.visibilityState === 'visible') sleepTimer.tick(); }} />
 {@render children()}
 {#snippet favoriteAction(statusOnly: boolean)}<CurrentTrackFavorite currentFavorite={player.currentFavorite} snapshot={$queue} {statusOnly} />{/snippet}
-{#if streamUrl || canPrepare}
+{#if streamUrl || (currentTrack && player.privateListening)}
 	<div class="nt-wrap" bind:this={shortcutScope}>
 		<NativePlayer {currentTrack} mediaRevision={player.mediaRevision} {streamUrl} {attachNativeAudio} volumeControls={soundControls}
 			playbackStatus={streamUrl ? $playbackStatus : 'paused'} playCurrent={media.playCurrent} pauseCurrent={media.pauseCurrent}

@@ -12,6 +12,7 @@ import { createLivePlaybackSpeed } from './livePlaybackSpeed.js';
 import { restartIsAvailable } from './restartAvailability.js';
 import type { SystemSeekGuard } from './systemSeek.js';
 import { bindSystemTransport } from './systemTransport.js';
+import type { BrowserPlaybackSource } from './browserPlaybackGrant.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
 export type MediaAttachment = { readonly audio: HTMLAudioElement; playing: boolean; soughtToEnd: boolean | { end: number; seekDuration: number; played: TimeRanges; settled?: number; progressed?: boolean; tailProgress?: boolean } };
@@ -22,9 +23,9 @@ type QueueAuthority = Pick<ReturnType<typeof createQueueController>,
 	'snapshot' | 'subscribe' | 'revision' | 'revoke' | 'isCurrent' | 'purging' | 'sourceForQueuedPlay'>;
 
 export type MediaSelection = {
-	commit: (queue: QueueState, grant?: QueuedPlaySource) => boolean;
+	commit: (queue: QueueState, grant?: BrowserPlaybackSource) => boolean;
 	streamFor?: (track: Track | null) => string;
-	prepare?: (trackId: string, isCurrent: () => boolean, publish: (source: QueuedPlaySource) => void) => Promise<boolean>;
+	prepare?: (trackId: string, isCurrent: () => boolean, publish: (source: BrowserPlaybackSource) => void, retry?: boolean) => Promise<boolean>;
 	flush: () => Promise<void>;
 	browseCopy: { invalidate: () => void };
 	announce: (message: string, replay?: boolean) => void;
@@ -65,6 +66,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	let attachmentVersion = 0;
 	let endGeneration = 0;
 	let playIntent = 0;
+	let grantIntent = 0, pendingGrant: number | undefined;
 	let pendingPlay: { result: Promise<PlayOutcome>; finish: (outcome: PlayOutcome) => void } | undefined;
 	const playbackStatus = writable<PlaybackStatus>('unavailable');
 	const sound = createNativeSound();
@@ -122,16 +124,20 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	const speed = createLivePlaybackSpeed(transportTarget);
 
-	async function startCurrent(retry: boolean): Promise<void> {
+	async function startCurrent(retry: boolean, recoverPosition = false): Promise<void> {
 		const target = transportTarget();
 		if (!target || pendingPlay) return;
 		const { audio, matches } = target;
-		const trackId = retry ? currentTrack(queue.snapshot)?.id : undefined;
+		const track = retry ? currentTrack(queue.snapshot) : null;
+		const trackId = track?.id;
 		const sameTrack = () => !retry || currentTrack(queue.snapshot)?.id === trackId;
 		const previousIntent = playIntent;
 		if (!matches() || (retry ? get(playbackStatus) !== 'error' || !audio.error
 			: audio.error || (!audio.paused && !audio.ended)) ||
 			!matches(() => playIntent === previousIntent && sameTrack())) return;
+		if (track && selection?.prepare && !recoverPosition) {
+			return preparePlay(track, { streamUrl: selectedSource(), isCurrent: matches }, () => startCurrent(true, true), true);
+		}
 		++playIntent;
 		if (retry) ++endGeneration;
 		let finish!: (outcome: PlayOutcome) => void;
@@ -151,8 +157,12 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				}
 				const rateTarget = { audio, matches: matchesAttempt };
 				const liveRate = speed.read(rateTarget);
+				const seconds = recoverPosition ? audio.currentTime : 0;
+				const restore = trackId && Number.isFinite(seconds) && seconds > 0 ?
+					captureShareSeek(++positionIntent, { trackId, seconds }, matches) : undefined;
 				if (!matchesAttempt()) return;
 				load.call(audio);
+				restore?.();
 				speed.reapply(rateTarget, liveRate); // load() resets playbackRate.
 				if (!matchesAttempt()) return;
 			}
@@ -283,38 +293,42 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		}
 	}
 
-	async function preparePlay(target: Track, evidence: QueuedPlaySource, publish: (source: QueuedPlaySource) => void) {
+	async function preparePlay(target: Track, evidence: QueuedPlaySource, publish: (source: BrowserPlaybackSource) => void | Promise<void>, retry?: boolean) {
 		if (!selection?.prepare || destroyed || queue.purging || !evidence.isCurrent()) return;
+		const request = pendingGrant = ++grantIntent;
 		const revision = queue.revision, intent = playIntent, position = positionIntent, version = attachmentVersion;
-		const current = () => !destroyed && queue.isCurrent(revision) && evidence.isCurrent() &&
+		const current = () => !destroyed && pendingGrant === request && queue.isCurrent(revision) && evidence.isCurrent() &&
 			intent === playIntent && position === positionIntent && version === attachmentVersion;
-		if (!(await selection.prepare(target.id, current, publish)) && current()) {
-			selection.announce('Could not start playback.', true);
-		}
+		let playback: void | Promise<void> = undefined;
+		try {
+			if (!(await selection.prepare(target.id, current, (grant) => { playback = publish(grant); }, retry)) && current()) {
+				selection.announce('Could not start playback.', true);
+			}
+			await playback;
+		} finally { if (pendingGrant === request) pendingGrant = undefined; }
 	}
 
 	async function playSelected(base: QueueState, index: number, source: QueuedPlaySource, suffix = ''): Promise<void> {
 		const target = base.tracks[index];
 		if (!selection?.prepare || !target) return playPrepared(base, index, source, suffix);
-		let playback: Promise<void> | undefined;
-		await preparePlay(target, source, (grant) => { playback = playPrepared(base, index, grant, suffix, true); });
-		await playback;
+		return preparePlay(target, source, (grant) => playPrepared(base, index, grant, suffix, grant));
 	}
 
 	async function playPrepared(
-		base: QueueState, index: number, source: QueuedPlaySource, suffix: string, granted = false
+		base: QueueState, index: number, source: QueuedPlaySource, suffix: string, grant?: BrowserPlaybackSource
 	): Promise<void> {
 		if (!selection || queue.purging) return;
 		const target = base.tracks[index];
 		if (!target || destroyed || !source.isCurrent()) return;
 		const { streamUrl } = source;
 		const tracks = [...base.tracks];
-		if (!granted) tracks[index] = { ...target, streamUrl };
-		if (!selection.commit(selectTrack({ ...base, tracks }, index), granted ? source : undefined) || !source.isCurrent() || destroyed) return;
+		if (!grant) tracks[index] = { ...target, streamUrl };
+		if (!selection.commit(selectTrack({ ...base, tracks }, index), grant) || !source.isCurrent() || destroyed) return;
 		const share = deferredShare;
+		let restoreShare: (() => void) | undefined;
 		if (share && share.target.trackId === target.id) {
 			deferredShare = undefined;
-			captureShareSeek(share.intent, share.target, share.current);
+			restoreShare = captureShareSeek(share.intent, share.target, share.current);
 		}
 
 		const receipt = queue.revoke();
@@ -335,6 +349,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			if (!ownsQueue() || attachmentVersion !== version + Number(!attachment && !!current)) return;
 			attachment = current;
 			version = attachmentVersion;
+			restoreShare?.();
 			const audio = attachment?.audio;
 			lead = `Selected ${title}, paused: playback was blocked.`;
 			if (sharedPlay && audio) {
@@ -561,7 +576,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 
 	async function handleEnded(attachment: MediaAttachment, source: string, matchesOrigin: () => boolean): Promise<void> {
 		if (attachment.audio.ended && matchesOrigin()) {
-			invalidatePlay();
+			if (pendingGrant === undefined) invalidatePlay();
+			else settlePlay();
 			readPlayback(attachment.audio, matchesOrigin, 'playing');
 		}
 		if (!selection) return;
@@ -600,6 +616,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		if (result.action !== 'play' || !ownsOrigin()) return;
 		const track = currentTrack(result.queue);
 		if (selection.prepare && track) {
+			if (pendingGrant) return;
 			const evidence = queue.sourceForQueuedPlay(track.id);
 			if (evidence) await playSelected(result.queue, result.queue.currentIndex, {
 				...evidence, isCurrent: () => evidence.isCurrent() && ownsOrigin()

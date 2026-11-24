@@ -423,7 +423,7 @@ export class ApiClient {
 		});
 	}
 
-	async writeBrowserPlayback(body: { session_id: string } & ({ track_id: string } | { enabled: boolean }), signal: AbortSignal) {
+	async writeBrowserPlayback(body: { session_id: string } & ({ track_id: string; play_id?: string } | { enabled: boolean }), signal: AbortSignal) {
 		const binding = this.session?.binding;
 		if (this.baseUrl || !binding) throw new Error('Browser playback requires a verified same-origin session');
 		const toggle = 'enabled' in body;
