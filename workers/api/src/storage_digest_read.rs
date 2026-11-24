@@ -146,11 +146,11 @@ fn deadline_allowed(until: SystemTime, cutoff: SystemTime, now: SystemTime) -> b
     now < until && until <= cutoff
 }
 
-fn uuid_text(id: [u8; 16]) -> String {
+pub(crate) fn uuid_text(id: [u8; 16]) -> String {
     format!("{:032x}", u128::from_be_bytes(id))
 }
 
-struct ReadUuid([u8; 16]);
+pub(crate) struct ReadUuid(pub(crate) [u8; 16]);
 
 impl<'a> FromSql<'a> for ReadUuid {
     fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {

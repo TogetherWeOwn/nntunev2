@@ -27,6 +27,24 @@ pub struct BrowserReceipt {
     pub grant: IssuedGrant,
 }
 
+impl BrowserReceipt {
+    fn as_grant(&self) -> BrowserGrant<'_> {
+        BrowserGrant {
+            user_id: &self.user_id,
+            session_binding: &self.session_binding,
+            lease: &self.lease,
+            artifact_sha256: &self.artifact_sha256,
+            duration_ms: self.duration_ms,
+            grant: &self.grant,
+        }
+    }
+
+    pub(crate) fn valid_private_grant(&self, secret: &[u8], now: u64) -> bool {
+        super::is_private_play_id(&self.lease.play_id)
+            && valid_grant(Some(secret), &self.as_grant(), now, "v4")
+    }
+}
+
 pub(crate) const MEDIA_PREFIX: &str = "/v1/plays/media/";
 
 /// Use the configured Stream service with redirects disabled. Stream the
@@ -96,18 +114,7 @@ where
             if !super::is_private_play_id(&receipt.lease.play_id) {
                 return Err(not_found());
             }
-            (
-                BrowserGrant {
-                    user_id: &receipt.user_id,
-                    session_binding: &receipt.session_binding,
-                    lease: &receipt.lease,
-                    artifact_sha256: &receipt.artifact_sha256,
-                    duration_ms: receipt.duration_ms,
-                    grant: &receipt.grant,
-                },
-                "v4",
-                Some(deadline),
-            )
+            (receipt.as_grant(), "v4", Some(deadline))
         }
     };
     let LeaseRow {
