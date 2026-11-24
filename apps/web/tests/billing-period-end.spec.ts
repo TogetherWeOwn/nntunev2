@@ -119,7 +119,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 							return route.fulfill({ json: { plans: [
 								{ id: 'free', priceCents: 0, streamHoursMonth: 0, maxConcurrentStreams: 1, selectable: false },
 								{ id: 'plus', priceCents: 800, streamHoursMonth: 100, maxConcurrentStreams: 1, selectable: true },
-								{ id: 'pro', priceCents: 1500, streamHoursMonth: paidPilot ? 301 : 300, maxConcurrentStreams: 1, selectable: true },
+								{ id: 'pro', priceCents: 1500, streamHoursMonth: paidPilot ? 301 : 300, maxConcurrentStreams: 1, selectable: !paidPilot },
 								{ id: 'max', priceCents: 2500, streamHoursMonth: 750, maxConcurrentStreams: 1, selectable: true }
 							] } });
 						}
