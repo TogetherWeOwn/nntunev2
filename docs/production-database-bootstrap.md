@@ -218,6 +218,39 @@ timeouts. Server processing, wire bytes, provider metering and hard-kill
 session closure require separate evidence. A failure from the point of
 attempted creation is uncertain. The caller stops without retry or deletion.
 
+### Protected baseline
+
+The [baseline workflow](../.github/workflows/deploy-database-baseline.yml)
+shares setup's concurrency group and uses a separate `production-db-baseline`
+Environment. Apply the same main-only, prevent-self-review, no-bypass and
+readback rules. Fail the window if any baseline secret is inherited. Dispatch
+once from the approved main SHA with zero inputs. Set `BASELINE_ENABLED` to
+`true` privately for the pending attempt, with its `BASELINE_SHA`,
+`BASELINE_RUN_ID`, `BASELINE_EXPIRY`, `BASELINE_PLAN_B64`,
+`BASELINE_PLAN_DIGEST` and `BASELINE_READER_PASSWORD`. Remove the pins and
+credential after the run and verify reader retirement and session closure.
+
+The version 1 plan contains exactly `version`, `host`, `port`, `ca_pem`,
+`branch_id`, `launch`, `database_oid` and `reader_role`. Record the exact
+database name and OID from fenced provisioning or an independently
+authenticated readiness record. Bind them to the approved provider branch,
+direct endpoint and certificate before approving the plan digest. Use a
+dedicated login with no role memberships and grant launch CONNECT, schema
+USAGE and direct SELECT on all physical tables, partitions and materialized
+views. Prove that the reader has no write, ownership or role-switch path.
+Require a separately scoped SQL custodian to create or grant that login.
+Keep schema, grant and writer changes quiesced through the baseline.
+
+The caller uses the routed username over verified TLS. In one read-only
+repeatable-read transaction it checks name, OID, SQL identity and
+permissions. It examines at most 256 user relations and reads only row
+existence. It scans permanent and unlogged user relations plus large-object
+metadata, leaves views unexpanded and makes no sequence calls. A foreign
+table, active table RLS, unsupported storage or incomplete physical-relation
+visibility refuses the verdict. Migration ledger and reference rows count
+as existing data. The only outputs are `empty`, `rows-present` and `refused`.
+Keep the job URL and attempt with the private target record.
+
 ### Setup role custody and lifecycle
 
 The dormant [role SQL](../.github/scripts/database_bootstrap_role.py)

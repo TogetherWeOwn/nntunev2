@@ -1268,6 +1268,36 @@ On ambiguity reconcile Worker, allocation, routes and provider audit before
 any further action. Verify maintenance behavior and private Access denials on
 the isolated candidate. Post-watch and cancellation need separate admission.
 
+### First private release handoff
+
+Record one exact candidate SHA with its required checks, PR reviews,
+admitted staging run and attempt, web and API build identities, and
+same-run health and private listening journey. Pin the maintenance module
+SHA-256 from that checkout separately. Record its isolated staging response
+`503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex`, and keep its
+production Worker, seed version and deployment IDs with the rollback
+custody record. Before actual seed, resolve preview exposure and ambiguous
+settings or inventory responses. Keep one production Worker writer through
+the protected readback and close the seed window after verification.
+
+Carry the [dedicated database baseline](production-database-bootstrap.md#protected-baseline)
+run and attempt, target identity and migration manifest digest into the same
+handoff. On `empty`, take and verify the provider snapshot before the first
+schema change. On `rows-present`, require the fresh provider backup,
+temporary restore and exact undo rehearsal for the proposed data or schema
+change. On refusal, resolve the target or visibility gap before proceeding.
+
+To switch off the initial release, close admission and restore the pinned
+maintenance allocation through the protected rollback path. Keep the
+allow-list and deny rules in effect. Verify the maintenance response on the
+private web hostname, and verify denial on the API and media routes without
+an active invite. If the change enabled new API or media entry points, shut
+them off through their separately admitted protected controls. Preserve
+the database and snapshot. The final-smoke workflow covers the immediate
+web failure case. Before promotion, record the exact authorized recovery
+entry point for watch regressions and cancellation, plus the operator,
+rollback triggers and 30-minute health and error watch.
+
 ### Production promotion publishes a CalVer release
 
 After a successful production promotion and its post-promotion smoke, the

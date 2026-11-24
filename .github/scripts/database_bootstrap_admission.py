@@ -16,13 +16,13 @@ MAX_PLAN_BYTES = 4096
 MAX_WINDOW_SECONDS = 7200
 
 
-def authorized_plan(env, event, now):
+def authorized_plan(env, event, now, *, workflow=WORKFLOW):
     sha = env.get("BOOTSTRAP_SHA", "")
     run_id = env.get("BOOTSTRAP_RUN_ID", "")
     expiry = env.get("BOOTSTRAP_EXPIRY", "")
     digest = env.get("BOOTSTRAP_PLAN_DIGEST", "")
     encoded = env.get("BOOTSTRAP_PLAN_B64", "")
-    repo, separator, workflow_ref = env.get("GITHUB_WORKFLOW_REF", "").partition(f"/{WORKFLOW}@")
+    repo, separator, workflow_ref = env.get("GITHUB_WORKFLOW_REF", "").partition(f"/{workflow}@")
     if not (
         env.get("GITHUB_REPOSITORY", "").lower() == REPOSITORY
         and repo.lower() == REPOSITORY and separator and workflow_ref == MAIN
@@ -57,13 +57,13 @@ def authorized_plan(env, event, now):
     return None
 
 
-def read_authorized_plan(env):
+def read_authorized_plan(env, *, workflow=WORKFLOW):
     if len(sys.argv) != 1:
         return None
     with open(env["GITHUB_EVENT_PATH"], "rb") as source:
         raw = source.read(MAX_EVENT_BYTES + 1)
     if len(raw) <= MAX_EVENT_BYTES:
-        return authorized_plan(env, json.loads(raw), time.time())
+        return authorized_plan(env, json.loads(raw), time.time(), workflow=workflow)
     return None
 
 
