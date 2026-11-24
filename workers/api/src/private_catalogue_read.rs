@@ -104,7 +104,7 @@ pub(crate) async fn lookup(
         .query_typed_opt(
             include_str!("private_catalogue_read.sql"),
             &[
-                (track, Type::TEXT),
+                (&track, Type::TEXT),
                 (&uuid_text(pins.environment), Type::TEXT),
                 (&uuid_text(pins.library), Type::TEXT),
                 (&pins.accepted_seq, Type::INT8),
