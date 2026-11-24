@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { expect, test, type Locator } from '@playwright/test';
+import { expect, test, type Locator, type Response } from '@playwright/test';
 import { accessHeaders, qaAuthHeader, readApiBody } from '../helpers/access.js';
 import {
   apiGet, apiPost, applyAccountToPage, enableVirtualAuthenticator, retrieveStagedSignupCode,
@@ -18,6 +18,8 @@ import { parsePrivateStagingFixture, privateStagingAudio } from '../helpers/priv
 const ORIGIN = 'https://staging.nntune.com';
 const REGISTER = '/v1/auth/passkey/register';
 const MEDIA = /^\/v1\/plays\/media\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)$/;
+const BROWSER_SELECTOR = 'x-nntune-browser-playback';
+const BROWSER_BINDING = 'x-nntune-session-binding';
 
 // Suppress underlying browser and API diagnostics, which can include a URL,
 // request headers or the value typed into a form. The step name is fixed.
@@ -150,7 +152,26 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       .toEqual([206, 'audio/flac', '4096', `bytes 65536-69631/${original.length}`]);
     expect((await range.body()).equals(original.subarray(65536, 69632))).toBe(true);
   };
-  const { play, heartbeat, mediaUrl } = await check('curated playback, byte range, seek, queue and video posture', async () => {
+  const startBrowserPlay = (button: Locator) => Promise.all([
+    page.waitForResponse((response) => response.url() === `${ORIGIN}${PRIVATE_MUSIC.player.plays}` &&
+      response.request().method() === 'POST' && response.request().headers()[BROWSER_SELECTOR] === '1'),
+    button.click(),
+  ]);
+  const retryBrowserPlay = async (start: Response, media: RegExpExecArray) => {
+    const binding = start.request().headers()[BROWSER_BINDING];
+    const ack = await start.json();
+    expect(start.status() === 200 && !!binding && ack.sessionBinding === binding &&
+      ack.trackId === media[1] && ack.playbackSessionId === media[2] && ack.playId === media[3] &&
+      Number.isSafeInteger(ack.durationMs) && ack.durationMs > 0 && Object.keys(ack).length === 5).toBe(true);
+    const retry = () => post(page.request, PRIVATE_MUSIC.player.plays, {
+      track_id: media[1], session_id: media[2], play_id: media[3],
+    }, { ...access, [BROWSER_SELECTOR]: '1', [BROWSER_BINDING]: binding! });
+    const positive = await retry();
+    expect(positive.status).toBe(200);
+    expect(JSON.parse(positive.text)).toEqual(ack);
+    return retry;
+  };
+  const { retryAtCutoff, mediaUrl } = await check('curated playback, byte range, seek, queue and video posture', async () => {
     for (const item of fixture.publications) {
       await expect(rows.and(page.locator(`[data-id="${item.trackId}"]`))).toBeVisible();
     }
@@ -162,11 +183,13 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const audio = page.getByTestId(PRIVATE_MUSIC.player.audio);
     const transport = page.getByRole('region', { name: 'Player', exact: true });
     const baselineTime = await audio.evaluate((element) => (element as HTMLAudioElement).currentTime);
-    await transport.getByRole('button', { name: 'Play', exact: true }).click();
+    const [start] = await startBrowserPlay(transport.getByRole('button', { name: 'Play', exact: true }));
     const playback = (await samplePlaying(audio, baselineTime)).playback;
     await transport.getByRole('button', { name: 'Pause', exact: true }).click();
     await waitForPaused(audio, true, 5_000, 'Player did not pause');
-    await verifyRange(order[0]!, (await currentMedia(audio, firstTrackId)).source);
+    const first = await currentMedia(audio, firstTrackId);
+    await retryBrowserPlay(start, first.media);
+    await verifyRange(order[0]!, first.source);
 
     await audio.evaluate((element) => {
       delete (element as HTMLElement).dataset.seeked;
@@ -189,9 +212,10 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       resume, queueOrder, nextTrackId: await current.getAttribute(PRIVATE_MUSIC.player.queueId),
     });
     await delay(Math.max(0, fixture.expiresAt * 1000 - Date.now() - 25_000));
-    await transport.getByRole('button', { name: 'Play', exact: true }).click();
+    const [secondStart] = await startBrowserPlay(transport.getByRole('button', { name: 'Play', exact: true }));
     await samplePlaying(audio, 0);
     const { source, media } = await currentMedia(audio, order[1]!);
+    expect(media[2]).toBe(first.media[2]);
     await transport.getByRole('button', { name: 'Pause', exact: true }).click();
     await waitForPaused(audio, true, 5_000, 'Second track did not pause');
     await page.locator('a[href="/now-playing"]').filter({ visible: true }).first().click();
@@ -199,15 +223,8 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     await expect(page.getByRole('tab', { name: 'Music Video' })).toHaveCount(0);
     await expect(page.locator('iframe, video')).toHaveCount(0);
     await verifyRange(order[1]!, source);
-    const play = { track_id: media[1], session_id: media[2], play_id: media[3] };
-    const renewed = await post(page.request, PRIVATE_MUSIC.player.plays, play);
-    const nativeGrant = JSON.parse(renewed.text);
-    expect(renewed.status === 200 && nativeGrant.play_id === play.play_id && Number.isSafeInteger(nativeGrant.lease_epoch)).toBe(true);
-    expect(nativeGrant.expires_at).toBe(fixture.expiresAt);
-    const heartbeat = { session_id: play.session_id, play_id: play.play_id, lease_epoch: nativeGrant.lease_epoch };
-    const active = await post(page.request, PRIVATE_MUSIC.player.heartbeat, heartbeat);
-    expect(active.status === 200 && JSON.parse(active.text).lease === 'active').toBe(true);
-    return { play, heartbeat, mediaUrl: source.href };
+    const retryAtCutoff = await retryBrowserPlay(secondStart, media);
+    return { retryAtCutoff, mediaUrl: source.href };
   });
 
   await check('same-session refusal at the configured cohort cutoff', async () => {
@@ -215,8 +232,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     if (remaining <= 0) throw new Error('Cohort cutoff preceded completion of the active journey');
     await delay(remaining + 2_000);
     const revokedLibrary = await getLibrary();
-    const revokedPlay = (await post(page.request, PRIVATE_MUSIC.player.plays, play)).status;
-    const revokedHeartbeat = (await post(page.request, PRIVATE_MUSIC.player.heartbeat, heartbeat)).status;
+    const revokedPlay = (await retryAtCutoff()).status;
     const range = await apiGet(page.request, mediaUrl, rangeHeaders, 'private-range-cutoff');
     expect([401, 403, 404]).toContain(range.status());
     await readApiBody(range, mediaUrl, 'private-range-cutoff');
@@ -225,7 +241,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const remainingCuratedRows = (await idsOf(rows, PRIVATE_MUSIC.library.id))
       .filter((id) => fixture.publications.some((item) => item.trackId === id)).length;
     assertPrivateRefusals({
-      missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay, revokedLibrary, revokedPlay, revokedHeartbeat,
+      missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay, revokedLibrary, revokedPlay,
     }, remainingCuratedRows);
   });
   await check('closing deployed build identity', () => assertServingBuildMatchesPromotion(request, ORIGIN, 'private-closing'));

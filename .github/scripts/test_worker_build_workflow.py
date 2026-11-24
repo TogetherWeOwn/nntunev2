@@ -36,7 +36,7 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
     def test_stream_config_is_internal_and_uses_the_dedicated_fixture_bucket(self):
         source = tomllib.loads((ROOT / "workers/stream/wrangler.toml").read_text())
         off = tomllib.loads(STREAM_CONFIG.render(source, {}))
-        self.assertEqual(off["env"]["staging"]["vars"], {"PRIVATE_PLAYBACK_ENABLED": "false"})
+        self.assertEqual(off["env"]["staging"]["vars"], {"ENVIRONMENT": "staging", "PRIVATE_PLAYBACK_ENABLED": "false"})
         env = {
             "PRIVATE_PLAYBACK_STAGING_ENABLED": "true", "PRIVATE_MUSIC_STAGING_JOURNEY": "true",
             "PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION": "11111111-1111-4111-8111-111111111111",

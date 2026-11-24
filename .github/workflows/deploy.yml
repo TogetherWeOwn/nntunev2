@@ -5,7 +5,7 @@ name: deploy
 # - Push to `main` deploys apps/web to its `staging` env, then the
 #   `post-deploy-e2e` job calls e2e-staging.yml in the same run/revision.
 #   That call is the only path to the full-journey staging E2E: it
-#   `needs` `staging-web` and `staging-api` with no always()/!cancelled(),
+#   explicitly requires `staging-web` and `staging-api` success,
 #   so a skipped or failed deploy cannot produce a full-journey PASS, and
 #   the journey never runs against the previous api while the new one is
 #   still deploying.
@@ -82,6 +82,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
+      browser_playback: ${{ steps.trial.outputs.browser_playback || '0' }}
     steps:
       - id: check
         env:
@@ -98,11 +99,36 @@ jobs:
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}
+        with:
+          persist-credentials: false
+      - name: Validate private staging trial settings
+        id: trial
+        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}
+        env:
+          HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
+          API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
+          API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
+          STREAM_SERVICE_STAGING: ${{ vars.STREAM_SERVICE_STAGING }}
+          STREAM_STAGING_DEPLOY_ENABLED: ${{ vars.STREAM_STAGING_DEPLOY_ENABLED }}
+          PRIVATE_MUSIC_STAGING_JOURNEY: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY }}
+          PRIVATE_PLAYBACK_STAGING_ENABLED: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENABLED }}
+          PRIVATE_PLAYBACK_STAGING_ENVIRONMENT: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENVIRONMENT }}
+          PRIVATE_PLAYBACK_STAGING_LIBRARY: ${{ vars.PRIVATE_PLAYBACK_STAGING_LIBRARY }}
+          PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION }}
+          PRIVATE_PLAYBACK_STAGING_S3_BUCKET: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_BUCKET }}
+          PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT }}
+          PRIVATE_PLAYBACK_STAGING_S3_REGION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_REGION }}
+          PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION }}
+          PRIVATE_PLAYBACK_STAGING_ROOT_VERSION: ${{ vars.PRIVATE_PLAYBACK_STAGING_ROOT_VERSION }}
+        run: |
+          python3 -I .github/scripts/staging_stream_config.py --trial-preflight >> "$GITHUB_OUTPUT"
 
   staging-web:
     name: staging-web
-    needs: [gate]
-    if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
+    needs: [gate, staging-api, staging-stream]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.gate.result == 'success' && needs.gate.outputs.enabled == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Protected staging environment; deployment uses repository credentials.
@@ -116,6 +142,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify armed playback deployments
+        if: ${{ needs.gate.outputs.browser_playback == '1' }}
+        env:
+          API_RESULT: ${{ needs.staging-api.result }}
+          API_SOURCE_SHA: ${{ needs.staging-api.outputs.source_sha }}
+          STREAM_RESULT: ${{ needs.staging-stream.result }}
+          STREAM_SOURCE_SHA: ${{ needs.staging-stream.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$API_RESULT" = success
+          test "$STREAM_RESULT" = success
+          test "$API_SOURCE_SHA" = "$GITHUB_SHA"
+          test "$STREAM_SOURCE_SHA" = "$GITHUB_SHA"
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
@@ -125,7 +164,10 @@ jobs:
           # Deployment builds do not consume the CI package cache.
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
+      - name: Build staging web
+        env:
+          PUBLIC_BROWSER_PLAYBACK: ${{ needs.gate.outputs.browser_playback }}
+        run: pnpm build
       - name: Deploy to staging
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
         with:
@@ -223,6 +265,14 @@ jobs:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
           HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
           STREAM_SERVICE_STAGING: ${{ vars.STREAM_SERVICE_STAGING }}
+          STREAM_STAGING_DEPLOY_ENABLED: ${{ vars.STREAM_STAGING_DEPLOY_ENABLED }}
+          PRIVATE_MUSIC_STAGING_JOURNEY: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY }}
+          PRIVATE_PLAYBACK_STAGING_ENABLED: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENABLED }}
+          PRIVATE_PLAYBACK_STAGING_ENVIRONMENT: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENVIRONMENT }}
+          PRIVATE_PLAYBACK_STAGING_LIBRARY: ${{ vars.PRIVATE_PLAYBACK_STAGING_LIBRARY }}
+          PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION }}
+          PRIVATE_PLAYBACK_STAGING_S3_BUCKET: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_BUCKET }}
+          PRIVATE_PLAYBACK_STAGING_ROOT_VERSION: ${{ vars.PRIVATE_PLAYBACK_STAGING_ROOT_VERSION }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
           API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
         run: |
@@ -282,6 +332,10 @@ jobs:
               assert stream_service == "nntune-stream-staging", \
                   "STREAM_SERVICE_STAGING must equal the staging stream Worker name"
           PY
+          private_playback=""
+          if [ "${PRIVATE_PLAYBACK_STAGING_ENABLED:-}" = true ]; then
+            private_playback=$(python3 -I ../../.github/scripts/staging_stream_config.py --api-vars)
+          fi
           # Generated, never committed: bindings + public vars only, no
           # secrets. HYPERDRIVE_CACHING_DISABLED=1 is set here only because
           # the gate step above passed for this env's Hyperdrive config
@@ -352,6 +406,7 @@ jobs:
           QA_CODE_SEAM = "1"
           # Identifies this deployment; no measurement enable, lease, or DB binding.
           SUBSONIC_MEASUREMENT_STAGE = "staging"
+          ${private_playback}
 
           # Workers Logs persistence for the structured api records (the
           # build_sha evidence is read there). Without this block the
@@ -1043,6 +1098,7 @@ jobs:
           PRIVATE_PLAYBACK_STAGING_S3_BUCKET: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_BUCKET }}
           PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT }}
           PRIVATE_PLAYBACK_STAGING_S3_REGION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_REGION }}
+          PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION }}
           PRIVATE_PLAYBACK_STAGING_ROOT_VERSION: ${{ vars.PRIVATE_PLAYBACK_STAGING_ROOT_VERSION }}
         run: |
           python3 -I ../../.github/scripts/staging_stream_config.py
@@ -1069,13 +1125,9 @@ jobs:
           echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
   # Post-deploy staging E2E (same run, same revision as the deploys above).
-  # No always()/!cancelled(): with the implicit success() gate, this job is
-  # skipped whenever `staging-web` or `staging-api` is skipped (gate
-  # disabled / non-push), fails or is cancelled, so it can never report a
-  # full-journey PASS without both deploys finishing first. A failed api
-  # deploy already turns the run red; running the journey against the
-  # previous api would only add misleading evidence. An unconfigured api
-  # lane still succeeds (outcome=unconfigured), so the journey runs.
+  # Check the two direct deploy results explicitly. An ordinary push may
+  # skip Stream upstream of staging-web while both required deploys succeed.
+  # An unconfigured API job still reports its explicit outcome to the journey.
   # Secrets are passed explicitly (never `inherit`) and match
   # exactly the names e2e-staging.yml reads. The promotion SHA (github.sha)
   # is passed as expected_sha so the build-identity spec can prove the
@@ -1083,7 +1135,7 @@ jobs:
   post-deploy-e2e:
     name: post-deploy-e2e
     needs: [staging-web, staging-api]
-    if: ${{ github.event_name == 'push' && vars.PRIVATE_MUSIC_STAGING_JOURNEY != 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.staging-web.result == 'success' && needs.staging-api.result == 'success' && vars.PRIVATE_MUSIC_STAGING_JOURNEY != 'true' }}
     permissions:
       contents: read
     uses: $/.github/workflows/e2e-staging.yml

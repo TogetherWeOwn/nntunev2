@@ -958,40 +958,39 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // Both lanes: needing only staging-web let the journey run against the
     // previous api while the new one was still deploying.
     expect(section).toContain('needs: [staging-web, staging-api]');
-    expect(jobIf(deployWorkflow, 'staging-api')).toBe(jobIf(deployWorkflow, 'staging-web'));
+    expect(jobIf(deployWorkflow, 'staging-api')).toContain("github.event_name == 'push' && needs.gate.outputs.enabled == 'true'");
     expect(section).toContain('uses: $/.github/workflows/e2e-staging.yml');
     expect(section).toMatch(/post_deploy: true/);
 
     const condition = jobIf(deployWorkflow, 'post-deploy-e2e');
     expect(condition, 'post-deploy-e2e must carry a job-level if').toBeDefined();
-    // No status-check function in the condition: GitHub then applies the
-    // implicit success() over `needs`, which is the whole contract — a
-    // skipped/failed/cancelled staging-web or staging-api can never run
-    // this job.
-    for (const statusFn of ['always()', '!cancelled()', 'success()', 'failure()', 'cancelled()']) {
-      expect(condition, `post-deploy-e2e if must not use ${statusFn}`).not.toContain(statusFn);
-    }
+    // A skipped Stream is upstream through staging-web on ordinary pushes.
+    // Override the implicit success() and require both direct deploy results.
+    expect(condition).toContain('!cancelled()');
 
     const evaluate = (
       stagingWebResult: string,
       eventName: string,
       stagingApiResult = 'success',
       privateJourneyArmed = false,
+      runCancelled = false,
     ): boolean => {
       const inner = condition!
         .replace(/^\$\{\{\s*/, '')
         .replace(/\s*\}\}$/, '');
       const expr = inner
+        .replace(/cancelled\(\)/g, String(runCancelled))
         .replace(/github\.event_name\s*==\s*'push'/g, String(eventName === 'push'))
+        .replace(/needs\.staging-web\.result\s*==\s*'success'/g, String(stagingWebResult === 'success'))
+        .replace(/needs\.staging-api\.result\s*==\s*'success'/g, String(stagingApiResult === 'success'))
         .replace(/vars\.PRIVATE_MUSIC_STAGING_JOURNEY\s*!=\s*'true'/g, String(!privateJourneyArmed));
       expect(expr, `unmodelled post-deploy syntax in: ${condition}`).toMatch(
         /^[\s()!&|truefals]+$/,
       );
-      const conditionHolds = Function(`"use strict"; return (${expr});`)() as boolean;
-      // Implicit success() over needs.
-      return stagingWebResult === 'success' && stagingApiResult === 'success' && conditionHolds;
+      return Function(`"use strict"; return (${expr});`)() as boolean;
     };
     expect(evaluate('success', 'push')).toBe(true);
+    expect(evaluate('success', 'push', 'success', false, true)).toBe(false);
     expect(evaluate('success', 'push', 'success', true)).toBe(false);
     for (const result of ['skipped', 'failure', 'cancelled']) {
       expect(

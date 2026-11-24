@@ -134,7 +134,6 @@ test('synthetic uninvited and revoked requests require explicit refusal', () => 
     uninvitedPlay: 403,
     revokedLibrary: 403,
     revokedPlay: 403,
-    revokedHeartbeat: 403,
   };
   expect(() => assertPrivateRefusals(statuses, 0)).not.toThrow();
   for (const key of Object.keys(statuses)) {

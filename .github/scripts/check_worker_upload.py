@@ -40,6 +40,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/deploy.yml"
 MANIFEST = ".github/scripts/binding_manifest.toml"
+PRIVATE_CONFIG = ".github/scripts/staging_stream_config.py"
+OBSERVATION = "1" * 32 + ":" + "2" * 64
 BUILD_CMD = "worker-build --release -- --locked"
 TIMEOUT = 600
 
@@ -93,6 +95,12 @@ def workflow_commands(text, worker, sha):
     check(argv[:3] == ["deploy", "--env", "staging"], f"{worker}: unexpected upload argv {argv}")
     check(f"BUILD_SHA:{sha}" in argv, f"{worker}: upload argv lacks BUILD_SHA for the commit")
     return gen, argv
+
+
+def check_variable_mappings(step, keys):
+    for key in keys:
+        expected = f"          {key}: " + "${{ vars." + key + " }}"
+        check(step.splitlines().count(expected) == 1, f"missing or duplicate staging variable mapping {key}")
 
 
 # --- process helpers -----------------------------------------------------
@@ -169,8 +177,7 @@ def fixture(base, worker, label):
     shutil.copy(ROOT / MANIFEST, tree / MANIFEST)
     if worker == "stream":
         shutil.copy(ROOT / "workers/stream/wrangler.toml", wdir / "wrangler.toml")
-        script = ".github/scripts/staging_stream_config.py"
-        shutil.copy(ROOT / script, tree / script)
+        shutil.copy(ROOT / PRIVATE_CONFIG, tree / PRIVATE_CONFIG)
     return tree, wdir
 
 
@@ -222,10 +229,12 @@ def assert_upload_redaction(upload_body, label):
           f"{label}: Wrangler upload metadata must set observability.redact_query_string to true")
 
 
-def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
+def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_private=False):
     label = f"{worker}" + ("" if worker != "api" else (" mirror-present" if mirror else " mirror-absent"))
     if worker == "stream":
         label += " private-enabled" if mirror else " private-disabled"
+    if api_private:
+        label += " private-enabled"
     tag = label.replace(" ", "_")
     gen_script, argv = workflow_commands(wf_text, worker, sha)
     workers = {w["name"]: {b["binding"]: b for b in w["binding"]} for w in manifest["worker"]}
@@ -248,6 +257,19 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
             PRIVATE_PLAYBACK_STAGING_S3_BUCKET="nntunev2-private-fixtures-staging",
             PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT="https://objects.example.test",
             PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region",
+            PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION=OBSERVATION,
+            PRIVATE_PLAYBACK_STAGING_ROOT_VERSION="22222222-2222-4222-8222-222222222222",
+        )
+        generator = step_text(job_text(wf_text, "staging-stream"), "Generate staging wrangler.toml")
+        check_variable_mappings(generator, (key for key in summary_env if key.startswith("PRIVATE_")))
+    if api_private:
+        summary_env.update(
+            STREAM_SERVICE_STAGING="nntune-stream-staging", STREAM_STAGING_DEPLOY_ENABLED="true",
+            PRIVATE_MUSIC_STAGING_JOURNEY="true", PRIVATE_PLAYBACK_STAGING_ENABLED="true",
+            PRIVATE_PLAYBACK_STAGING_ENVIRONMENT="33333333-3333-4333-8333-333333333333",
+            PRIVATE_PLAYBACK_STAGING_LIBRARY="44444444-4444-4444-8444-444444444444",
+            PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION="11111111-1111-4111-8111-111111111111",
+            PRIVATE_PLAYBACK_STAGING_S3_BUCKET="nntunev2-private-fixtures-staging",
             PRIVATE_PLAYBACK_STAGING_ROOT_VERSION="22222222-2222-4222-8222-222222222222",
         )
 
@@ -256,6 +278,76 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
     marker = base / f"marker-{tag}"
     env = base_env(home, path, marker)
     tree, wdir = fixture(base, worker, f"tree-{tag}")
+    if api_private:
+        shutil.copy(ROOT / PRIVATE_CONFIG, tree / PRIVATE_CONFIG)
+        trial = {key: value for key, value in summary_env.items() if key != "GITHUB_STEP_SUMMARY"}
+        trial.pop("HYPERDRIVE_ID_MB", None)
+        generator = step_text(job_text(wf_text, "staging-api"), "Generate staging wrangler.toml")
+        check_variable_mappings(generator, trial)
+        trial.update(PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT="https://objects.example.test",
+                     PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region",
+                     PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION=OBSERVATION)
+        gate = job_text(wf_text, "gate")
+        preflight = step_text(gate, "Validate private staging trial settings")
+        condition = "        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}"
+        check(condition in preflight.splitlines() and gate.splitlines().count(condition) == 2,
+              "trial preflight and its checkout must run when either arm is configured")
+        check("        id: trial" in preflight.splitlines(), "missing trial preflight output ID")
+        check("browser_playback: ${{ steps.trial.outputs.browser_playback || '0' }}" in gate,
+              "the protected gate must supply a default-off browser mode")
+        web = job_text(wf_text, "staging-web")
+        check("    needs: [gate, staging-api, staging-stream]" in web.splitlines(),
+              "the web deploy must wait for the API and Stream jobs")
+        web_build = step_text(web, "Build staging web")
+        check("PUBLIC_BROWSER_PLAYBACK: ${{ needs.gate.outputs.browser_playback }}" in web_build,
+              "the browser build must use the validated trial gate result")
+        readiness = step_text(web, "Verify armed playback deployments")
+        check("        if: ${{ needs.gate.outputs.browser_playback == '1' }}" in readiness,
+              "same-run deployment verification must run for armed playback only")
+        for prefix, lane in (("API", "staging-api"), ("STREAM", "staging-stream")):
+            for key, source in (("RESULT", "result"), ("SOURCE_SHA", "outputs.source_sha")):
+                mapping = f"          {prefix}_{key}: $" + "{{ needs." + lane + "." + source + " }}"
+                check(mapping in readiness.splitlines(), f"armed web missing {prefix}_{key} mapping")
+        ready_env = {**env, "API_RESULT": "success", "STREAM_RESULT": "success",
+                     "GITHUB_SHA": sha, "API_SOURCE_SHA": sha, "STREAM_SOURCE_SHA": sha}
+        ready_args = ["bash", "-e", "-c", run_script(readiness)]
+        ready = run(ready_args, cwd=tree, env=ready_env, label="armed browser can deploy")
+        check(ready.returncode == 0, "armed web refused successful same-build Workers")
+        other_sha = ("1" if sha[0] == "0" else "0") + sha[1:]
+        for key, value in (("API_RESULT", "failure"), ("STREAM_RESULT", "skipped"),
+                           ("API_SOURCE_SHA", ""), ("STREAM_SOURCE_SHA", ""),
+                           ("API_SOURCE_SHA", other_sha), ("STREAM_SOURCE_SHA", other_sha)):
+            bad = run(ready_args, cwd=tree, env={**ready_env, key: value}, label=f"armed web refuses wrong {key}")
+            check(bad.returncode != 0, f"armed web accepted wrong {key}")
+        check_variable_mappings(preflight, trial)
+        stream_dir = tree / "workers/stream"
+        stream_dir.mkdir()
+        shutil.copy(ROOT / "workers/stream/wrangler.toml", stream_dir / "wrangler.toml")
+        args = ["bash", "-e", "-c", run_script(preflight)]
+        output = tree / "trial-output"
+        trial_env = {**env, **trial, "GITHUB_OUTPUT": str(output)}
+        good = run(args, cwd=tree, env=trial_env, label="private staging preflight")
+        check(good.returncode == 0 and output.read_text() == "browser_playback=1\n",
+              "complete settings did not arm the browser build")
+        output.write_text("")
+        off = run(args, cwd=tree, env={**trial_env, "PRIVATE_PLAYBACK_STAGING_ENABLED": "false",
+                                      "PRIVATE_MUSIC_STAGING_JOURNEY": "false"}, label="private staging preflight disarmed")
+        check(off.returncode == 0 and output.read_text() == "browser_playback=0\n",
+              "disarmed settings enabled the browser build")
+        for key, value in (
+            ("API_RP_ORIGIN_STAGING", ""),
+            ("HYPERDRIVE_ID_STAGING", "invalid"),
+            ("PRIVATE_PLAYBACK_STAGING_S3_REGION", ""),
+            ("PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION", "invalid"),
+            ("STREAM_SERVICE_STAGING", "nntune-stream"),
+            ("STREAM_STAGING_DEPLOY_ENABLED", ""),
+            ("PRIVATE_PLAYBACK_STAGING_ENVIRONMENT", "11111111-1111-5111-8111-111111111111"),
+            ("PRIVATE_PLAYBACK_STAGING_LIBRARY", "invalid"),
+            ("PRIVATE_MUSIC_STAGING_JOURNEY", "false"),
+        ):
+            output.write_text("")
+            bad = run(args, cwd=tree, env={**trial_env, key: value}, label=f"private staging preflight refuses {key}")
+            check(bad.returncode != 0 and not output.read_text(), f"trial preflight accepted invalid {key}")
     config = generate(worker, gen_script, wdir, env, summary_env, label)
     assert_no_build(config, label)
     if worker in ("api", "stream"):
@@ -269,9 +361,19 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
         check(stage["vars"].get("PRIVATE_PLAYBACK_ENABLED") == ("true" if mirror else "false"),
               f"{label}: private playback does not match the requested mode")
         check(stage.get("limits") == ({"subrequests": 132000} if mirror else None), f"{label}: Stream subrequest budget mismatch")
+        check(stage["vars"].get("ENVIRONMENT") == "staging", f"{label}: Stream environment mismatch")
+        check(stage["vars"].get("PRIVATE_PLAYBACK_READ_OBSERVATION") == (OBSERVATION if mirror else None),
+              f"{label}: Stream observation selector mismatch")
     if worker == "api":
         summary = Path(summary_env["GITHUB_STEP_SUMMARY"]).read_text()
         staging = config["env"]["staging"]
+        private_vars = {key: value for key, value in staging["vars"].items() if key.startswith("PRIVATE_PLAYBACK_")}
+        expected = {key.replace("PRIVATE_PLAYBACK_STAGING_", "PRIVATE_PLAYBACK_"): value
+                    for key, value in summary_env.items() if key.startswith("PRIVATE_PLAYBACK_STAGING_")}
+        check(private_vars == expected, f"{label}: API private playback settings drifted")
+        if api_private:
+            check(staging["services"] == [{"binding": "STREAM", "service": "nntune-stream-staging"}],
+                  f"{label}: private API lacks its staging Stream binding")
         check(staging.get("observability", {}).get("redact_query_string") is True,
               f"{label}: staging API invocation query strings must be redacted")
         bound = [h["binding"] for h in staging["hyperdrive"]]
@@ -296,7 +398,7 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
         assert_upload_redaction(upload_body, label)
         print(f"{label}: Wrangler upload metadata redacts query strings", flush=True)
 
-    if worker == "api" and mirror:
+    if worker == "api" and mirror and not api_private:
         negative_control(wrangler, argv, wdir, env, marker, label)
 
 
@@ -338,7 +440,8 @@ def main():
         for worker, mirror in (("api", True), ("api", False), ("mb", False), ("ingest", False),
                                ("stream", False), ("stream", True)):
             scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror)
-    print("check_worker_upload: ok (api with/without mirror, mb, ingest, stream with/without private playback)")
+        scenario(wrangler, wf_text, sha, manifest, base, path, "api", True, api_private=True)
+    print("check_worker_upload: ok (api with/without mirror, mb, ingest, API and Stream with/without private playback)")
 
 
 if __name__ == "__main__":

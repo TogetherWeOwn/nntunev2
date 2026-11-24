@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import sys
 import tomllib
 from pathlib import Path
 
@@ -16,6 +17,52 @@ PRIVATE_SETTINGS = {
     "S3_REGION": r"[a-z0-9][a-z0-9-]{0,62}",
     "ROOT_VERSION": UUID_V4,
 }
+API_SETTINGS = {"ENVIRONMENT": UUID_V4, "LIBRARY": UUID_V4, **{
+    name: PRIVATE_SETTINGS[name] for name in ("S3_CONFIGURATION", "S3_BUCKET", "ROOT_VERSION")
+}}
+
+
+def private_vars(env, settings):
+    enabled = env.get("PRIVATE_PLAYBACK_STAGING_ENABLED", "")
+    if enabled not in ("", "false", "true"):
+        raise ValueError("PRIVATE_PLAYBACK_STAGING_ENABLED has an invalid value")
+    if (enabled == "true") != (env.get("PRIVATE_MUSIC_STAGING_JOURNEY", "").lower() == "true"):
+        raise ValueError("Arm private playback and the private journey together")
+    if enabled != "true":
+        return []
+    lines = ['PRIVATE_PLAYBACK_ENABLED = "true"']
+    for name, pattern in settings.items():
+        key = f"PRIVATE_PLAYBACK_STAGING_{name}"
+        value = env.get(key, "")
+        if len(value) > 253 or not re.fullmatch(pattern, value):
+            raise ValueError(f"{key} must name the dedicated staging setting")
+        lines.append(f"PRIVATE_PLAYBACK_{name} = {json.dumps(value)}")
+    return lines
+
+
+def api_vars(env):
+    lines = private_vars(env, API_SETTINGS)
+    if lines and (env.get("STREAM_SERVICE_STAGING") != "nntune-stream-staging"
+                  or env.get("STREAM_STAGING_DEPLOY_ENABLED") != "true"):
+        raise ValueError("Private API playback requires the staging Stream service and deploy lane")
+    return lines
+
+
+def trial_preflight(env):
+    armed = bool(api_vars(env))
+    source = tomllib.loads(Path("workers/stream/wrangler.toml").read_text())
+    render(source, env)
+    if armed:
+        if (env.get("API_RP_ID_STAGING"), env.get("API_RP_ORIGIN_STAGING")) != (
+            "staging.nntune.com", "https://staging.nntune.com",
+        ):
+            raise ValueError("Private trial requires the staging API RP ID and origin")
+        manifest = tomllib.loads(Path(".github/scripts/binding_manifest.toml").read_text())
+        api = next(worker for worker in manifest["worker"] if worker["name"] == "api")
+        database = next(binding for binding in api["binding"] if binding["binding"] == "HYPERDRIVE")
+        if env.get("HYPERDRIVE_ID_STAGING") != database["staging"]:
+            raise ValueError("Private trial requires the pinned staging API database binding")
+    return armed
 
 
 def render(source, env):
@@ -33,11 +80,7 @@ def render(source, env):
         "tag": "v1", "new_sqlite_classes": ["NntpPool"],
     }]:
         raise ValueError("Stream entrypoint or Durable Object migration changed")
-    enabled = env.get("PRIVATE_PLAYBACK_STAGING_ENABLED", "")
-    if enabled not in ("", "false", "true"):
-        raise ValueError("PRIVATE_PLAYBACK_STAGING_ENABLED has an invalid value")
-    if (enabled == "true") != (env.get("PRIVATE_MUSIC_STAGING_JOURNEY", "").lower() == "true"):
-        raise ValueError("Arm encrypted Stream and the private journey together")
+    playback = private_vars(env, PRIVATE_SETTINGS)
     lines = [
         'name = "nntune-stream-staging"',
         f'main = {json.dumps(source["main"])}',
@@ -48,15 +91,15 @@ def render(source, env):
         "workers_dev = false", "preview_urls = false", "",
         'compatibility_flags = ["enable_request_signal"]',
         '[env.staging.vars]',
-        f'PRIVATE_PLAYBACK_ENABLED = {json.dumps("true" if enabled == "true" else "false")}',
+        'ENVIRONMENT = "staging"',
+        *(playback or ['PRIVATE_PLAYBACK_ENABLED = "false"']),
     ]
-    if enabled == "true":
-        for name, pattern in PRIVATE_SETTINGS.items():
-            key = f"PRIVATE_PLAYBACK_STAGING_{name}"
-            value = env.get(key, "")
-            if len(value) > 253 or not re.fullmatch(pattern, value):
-                raise ValueError(f"{key} must name the dedicated staging setting")
-            lines.append(f"PRIVATE_PLAYBACK_{name} = {json.dumps(value)}")
+    if playback:
+        observation = env.get("PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION", "")
+        if observation:
+            if not re.fullmatch(r"[0-9a-f]{32}:[0-9a-f]{64}", observation):
+                raise ValueError("Invalid staged private read observation selector")
+            lines.append(f"PRIVATE_PLAYBACK_READ_OBSERVATION = {json.dumps(observation)}")
         lines.extend(("", "[env.staging.limits]", "subrequests = 132000"))
     for group, entries in bindings.items():
         if group == "name":
@@ -71,5 +114,13 @@ def render(source, env):
 
 
 if __name__ == "__main__":
-    config = Path("wrangler.toml")
-    config.write_text(render(tomllib.loads(config.read_text()), os.environ))
+    match sys.argv[1:]:
+        case []:
+            config = Path("wrangler.toml")
+            config.write_text(render(tomllib.loads(config.read_text()), os.environ))
+        case ["--api-vars"]:
+            print("\n".join(api_vars(os.environ)))
+        case ["--trial-preflight"]:
+            print(f"browser_playback={int(trial_preflight(os.environ))}")
+        case _:
+            raise SystemExit(2)

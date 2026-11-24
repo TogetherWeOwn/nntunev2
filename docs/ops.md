@@ -1087,8 +1087,36 @@ lowercase hex root key on `nntune-stream-staging` in Worker secret custody. Shar
 `PRIVATE_PLAYBACK_CUSTODY_SECRET` with the staging API only, independently
 of `PLAY_GRANT_SECRET`. Keep the upload writer's credentials separate.
 Arm `PRIVATE_PLAYBACK_STAGING_ENABLED=true` and the private journey together.
+The same arm prepares the staging API and browser build settings. Supply
+`PRIVATE_PLAYBACK_STAGING_ENVIRONMENT` and `PRIVATE_PLAYBACK_STAGING_LIBRARY`
+as lowercase UUIDv4 identifiers for the dedicated synthetic namespace. Staging
+API and Stream use the same S3 configuration, bucket, and root-version IDs.
+Keep the cohort setting, root key, custody secret and play-grant key in
+staging Worker secret custody. The shared gate validates all API and Stream
+settings before either deploy starts. The armed web build waits for both
+Workers to report successful deployments from the same run and commit.
+Arm only once the browser API adapter
+and its receipt store, Stream runtime, and Library client are on the candidate.
 Before accepting the trial, verify a browser disconnect through the relay
 closes the upstream read and settles only the acknowledged byte prefix.
+For that drill only, set `PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION` to a
+fresh 16-byte random trace in lowercase hex, a colon, and the lowercase
+SHA-256 hex of the UTF-8 synthetic track ID. Use a fresh committed play and
+send the trace as `x-trace-id` on the dedicated unbuffered relay request.
+Read the first plaintext chunk and cancel while the paced synthetic origin
+still has ciphertext outstanding. The ordinary Playwright Access wrapper
+can buffer the response. Establish timing at the paced origin because tail
+events may arrive together after the request ends.
+
+Use read-only Stream tail access. Keep the provider payload in memory and
+retain only the event name and matching trace. Require `private_storage_read_started`
+then `private_storage_read_aborted` with no completion. In a separate
+unbuffered control, drain to EOF and require `private_storage_read_started`
+then `private_storage_read_completed` with no abort. Wait for the terminal
+event before reusing a trace, or configure a fresh one. Missing or ambiguous
+events are inconclusive. Verify the canceled play's committed settlement
+against the writer-acknowledged prefix independently. Clear the observation
+variable before the disable deploy.
 Retain the version ID, deployment ID, `BUILD_SHA` and playback mode from
 the Stream job summary alongside the browser run. To restore the default,
 keep `STREAM_STAGING_DEPLOY_ENABLED=true` for the next protected deploy.
@@ -1389,7 +1417,7 @@ requires independent release approval. A push to `main` deploys to the
   it routes the hostname to the edge and is not replaced.
 - [ ] Staging E2E: `deploy.yml` sequences it — its `post-deploy-e2e` job
   calls `e2e-staging.yml` (reusable workflow) only after the same run's
-  `staging-web` and `staging-api` jobs succeed (`needs`, no `always()`;
+  `staging-web` and `staging-api` jobs succeed (explicit result checks;
   a green `staging-api` job may be an unconfigured skip, passed on as
   `api_deploy_outcome`), so a skipped/failed
   deploy cannot produce a full-journey PASS and no separate dispatch is

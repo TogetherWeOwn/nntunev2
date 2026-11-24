@@ -38,7 +38,6 @@ export const PRIVATE_MUSIC = {
     queueId: 'data-track-id',
     currentQueueItem: '[data-testid="queue-item"][aria-current="true"]',
     plays: '/v1/plays',
-    heartbeat: '/v1/plays/heartbeat',
   },
 } as const;
 
@@ -144,7 +143,6 @@ const REFUSALS = {
   uninvitedPlay: 403,
   revokedLibrary: 403,
   revokedPlay: 403,
-  revokedHeartbeat: 403,
 } as const;
 
 export function assertPrivateRefusals(
