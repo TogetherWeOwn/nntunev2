@@ -1,6 +1,9 @@
 use super::*;
 use crate::{
-    play_grant::IssuedGrant, playback::LeaseRow, storage_digest_read::protect_digest_read,
+    play_grant::IssuedGrant,
+    playback::{LeaseAcquire, LeaseRow},
+    storage_digest_read::protect_digest_read,
+    worker_entry::acquire_playback_lease_on,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use tokio_postgres::{Client, NoTls};
@@ -85,25 +88,24 @@ async fn resolves_only_the_committed_scoped_publication() {
         version: "new-media-pin",
     };
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let exp = now.as_secs() + 120;
+    let exp = now.as_secs() + crate::playback::LEASE_TTL_SECS;
     let deadline = UNIX_EPOCH + Duration::from_secs(exp);
     let signed = receipt(track, digest, exp);
-    writer
-        .query_one(
-            crate::playback::playback_lease_acquire_statement(),
-            &[
-                &MEMBER,
-                &signed.lease.session_id,
-                &track,
-                &PLAY,
-                &(exp as i64),
-                &((exp - 120) as i64),
-                &false,
-                &(exp as i64),
-            ],
+    assert_eq!(
+        acquire_playback_lease_on(
+            &writer,
+            MEMBER,
+            &signed.lease.session_id,
+            track,
+            PLAY,
+            now.as_secs(),
+            exp,
+            false
         )
         .await
-        .unwrap();
+        .unwrap(),
+        LeaseAcquire::Acquired { epoch: 1 }
+    );
 
     let query = async |db: &mut Client, receipt: &BrowserReceipt, pins: &PublicationPins<'_>| {
         resolve(db, receipt, pins, SECRET, SystemTime::now)
