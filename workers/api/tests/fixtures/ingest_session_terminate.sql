@@ -1,5 +1,6 @@
 -- Run the exact statement in the reservation fixture's rollback boundary.
-CREATE FUNCTION pg_temp.terminate_session(UUID, UUID, TEXT, UUID, TEXT)
+CREATE FUNCTION pg_temp.terminate_session(UUID, UUID, TEXT, UUID, TEXT,
+    BYTEA DEFAULT NULL, UUID DEFAULT NULL, BIGINT DEFAULT NULL, BIGINT DEFAULT NULL, UUID DEFAULT NULL)
 RETURNS SETOF TEXT LANGUAGE sql VOLATILE AS :'ingest_session_terminate_sql';
 
 DO $$

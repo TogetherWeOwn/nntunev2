@@ -120,6 +120,22 @@ BEGIN
         RAISE EXCEPTION 'checkpoint advance did not cap renewal at absolute expiry';
     END IF;
 
+    -- A committed checkpoint can be unsafe even with no outstanding lease.
+    BEGIN
+        IF (SELECT pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost', fp, gen, 2, 200, NULL))
+            IS DISTINCT FROM 'aborted' THEN
+            RAISE EXCEPTION 'loss of a committed checkpoint did not fence the session';
+        END IF;
+        IF NOT EXISTS (SELECT FROM public.ingest_session_cleanup_intents WHERE session_id=sid AND kind='terminal_reconcile') THEN
+            RAISE EXCEPTION 'checkpoint-loss transaction did not record a reconciliation intent';
+        END IF;
+        RAISE SQLSTATE 'Z0001';
+    EXCEPTION WHEN SQLSTATE 'Z0001' THEN NULL;
+    END;
+    IF EXISTS (SELECT FROM public.ingest_session_cleanup_intents WHERE session_id=sid AND kind='terminal_reconcile') THEN
+        RAISE EXCEPTION 'rolled-back checkpoint loss left cleanup work';
+    END IF;
+
     lease_id := gen_random_uuid();
     IF (SELECT pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 2, 200, lease_id))
         IS DISTINCT FROM lease_id THEN
@@ -130,12 +146,24 @@ BEGIN
         RAISE EXCEPTION 'idle-expired session progressed before tombstoning';
     END IF;
     UPDATE public.ingest_session_reservations SET idle_deadline=original_idle WHERE id=sid;
-    IF (SELECT pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'abort')) IS DISTINCT FROM 'aborted' THEN
-        RAISE EXCEPTION 'fixture failed to abort an active session';
+    IF EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost')) OR
+       EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, 'session-other', sid, 'checkpoint_lost', fp, gen, 2, 200, lease_id)) OR
+       EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost', ''::bytea, gen, 2, 200, lease_id)) OR
+       EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost', fp, gen_random_uuid(), 2, 200, lease_id)) OR
+       EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost', fp, gen, 1, 200, lease_id)) OR
+       EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost', fp, gen, 2, 100, lease_id)) OR
+       EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost', fp, gen, 2, 200, next_lease)) OR
+       EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost', fp, gen, 2, 200, NULL)) THEN
+        RAISE EXCEPTION 'stale, incomplete or foreign checkpoint-loss report terminated a session';
     END IF;
-    IF EXISTS (SELECT FROM pg_temp.advance_checkpoint(f.environment_id, f.library_id, owner, sid, fp, gen, 2, 200, 300, lease_id)) OR
+    IF (SELECT pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost', fp, gen, 2, 200, lease_id))
+        IS DISTINCT FROM 'aborted' THEN
+        RAISE EXCEPTION 'current lease loss did not abort the session';
+    END IF;
+    IF EXISTS (SELECT FROM pg_temp.terminate_session(f.environment_id, f.library_id, owner, sid, 'checkpoint_lost', fp, gen, 2, 200, lease_id)) OR
+       EXISTS (SELECT FROM pg_temp.advance_checkpoint(f.environment_id, f.library_id, owner, sid, fp, gen, 2, 200, 300, lease_id)) OR
        EXISTS (SELECT FROM pg_temp.acquire_write_lease(f.environment_id, f.library_id, owner, sid, fp, gen, 2, 200, gen_random_uuid())) THEN
-        RAISE EXCEPTION 'terminal session acquired a lease or advanced';
+        RAISE EXCEPTION 'terminal session accepted a replay, acquired a lease or advanced';
     END IF;
     IF NOT EXISTS (SELECT FROM public.ingest_session_reservations WHERE id=sid AND terminal_reason='aborted'
                    AND checkpoint_revision=2 AND checkpoint_offset=200 AND idle_deadline=original_idle
