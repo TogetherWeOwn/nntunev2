@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { expect, test, type Locator, type Response } from '@playwright/test';
+import { expect, request as playwrightRequest, test, type Locator, type Response } from '@playwright/test';
 import { accessHeaders, qaAuthHeader, readApiBody } from '../helpers/access.js';
 import {
   apiGet, apiPost, applyAccountToPage, enableVirtualAuthenticator, retrieveStagedSignupCode,
@@ -161,9 +161,10 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     }, { timeout: 60_000, intervals: [1_000] }).toBe(true);
     await refresh.click();
     await expect(rowFor(fixture.companion.trackId)).toBeVisible();
-    const receipt = await post(request, PRIVATE_TRIAL_UPLOAD, upload.body, {
+    const owner = await playwrightRequest.newContext();
+    const receipt = await post(owner, PRIVATE_TRIAL_UPLOAD, upload.body, {
       ...access, 'Content-Type': 'audio/flac', Cookie: `${SESSION_COOKIE}=${fixture.ownerSession}`,
-    });
+    }).finally(() => owner.dispose());
     expect(receipt.status).toBe(200);
     const publication = freshTrialPublication(receipt.text, upload.sha256, priorIds);
     await refresh.click();
