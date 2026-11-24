@@ -9,7 +9,7 @@ use nntune_stream::{
     original_play::OriginalWriter,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io,
     task::{Context, Poll},
 };
@@ -17,6 +17,14 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Fault {
     None,
+    Off,
+    WrongTrack,
+    WrongReference,
+    WrongDigest,
+    Expired,
+    Displaced,
+    ExpiredAtWrite,
+    Writer,
     Denied,
     LeaseLost,
     MediaVersion,
@@ -24,10 +32,86 @@ pub(super) enum Fault {
     Ciphertext,
 }
 
+pub(super) const FLAC: &[u8] =
+    include_bytes!("../../../../fixtures/synthetic-flac/admin-upload/fixture-1.flac");
+
+pub(super) struct Case {
+    pub fault: Fault,
+    pub range: Option<&'static str>,
+    pub status: u16,
+    pub delivered: std::ops::Range<usize>,
+    pub content_range: Option<&'static str>,
+}
+
+pub(super) fn cases() -> impl Iterator<Item = Case> {
+    use Fault::*;
+    let len = FLAC.len();
+    [
+        (None, Option::None, 200, 0..len, Option::None),
+        (
+            None,
+            Some("bytes=-2"),
+            206,
+            len - 2..len,
+            Some("bytes 51-52/53"),
+        ),
+        (None, Some("bytes=-0"), 416, 0..0, Some("bytes */53")),
+        (Off, Option::None, 404, 0..0, Option::None),
+        (WrongTrack, Option::None, 403, 0..0, Option::None),
+        (WrongReference, Option::None, 404, 0..0, Option::None),
+        (WrongDigest, Option::None, 404, 0..0, Option::None),
+        (Denied, Option::None, 404, 0..0, Option::None),
+        (LeaseLost, Option::None, 404, 0..0, Option::None),
+        (Displaced, Option::None, 404, 0..0, Option::None),
+        (Expired, Option::None, 401, 0..0, Option::None),
+        (ExpiredAtWrite, Option::None, 502, 0..0, Option::None),
+        (MediaVersion, Option::None, 502, 0..0, Option::None),
+        (PageVersion, Option::None, 502, 0..0, Option::None),
+        (Ciphertext, Option::None, 502, 0..0, Option::None),
+        (Writer, Option::None, 502, 0..1, Option::None),
+    ]
+    .into_iter()
+    .map(|(fault, range, status, delivered, content_range)| Case {
+        fault,
+        range,
+        status,
+        delivered,
+        content_range,
+    })
+}
+
 pub(super) struct Source {
-    pub(super) fixture: Fixture,
-    pub(super) sealed: Vec<u8>,
-    pub(super) fault: Fault,
+    fixture: Fixture,
+    sealed: Vec<u8>,
+    fault: Fault,
+    checked_lease: Cell<bool>,
+    clock: Cell<SystemTime>,
+}
+
+impl Source {
+    pub(super) fn new(fault: Fault) -> Self {
+        let fixture = Fixture::from_plaintext(FLAC);
+        let mut sealed = [&fixture.context.header[..], &fixture.first].concat();
+        if fault == Fault::Ciphertext {
+            sealed[48] ^= 1;
+        }
+        let start = if fault == Fault::Expired {
+            now() + Duration::from_secs(2)
+        } else {
+            now()
+        };
+        Self {
+            fixture,
+            sealed,
+            fault,
+            checked_lease: Cell::new(false),
+            clock: Cell::new(start),
+        }
+    }
+
+    pub(super) fn time(&self) -> SystemTime {
+        self.clock.get()
+    }
 }
 
 pub(super) struct BodyBytes(std::io::Cursor<Vec<u8>>);
@@ -44,15 +128,31 @@ impl PrivateSource for Source {
         assert_eq!(grant.user_id, "member");
         assert_eq!(grant.play_id.as_deref(), Some("private_fixture"));
         assert_eq!(grant.lease_epoch, Some(42));
-        (self.fault != Fault::Denied).then(|| CatalogueMedia {
-            reference: id(9),
-            pins: self.fixture.pins(),
-            media: self.fixture.media_input(),
+        assert_eq!(grant.track_id, "track");
+        (self.fault != Fault::Denied).then(|| {
+            let reference = if self.fault == Fault::WrongReference {
+                id(8)
+            } else {
+                id(9)
+            };
+            let mut pins = self.fixture.pins();
+            if self.fault == Fault::WrongDigest {
+                pins.plaintext_sha256[0] ^= 1;
+            }
+            CatalogueMedia {
+                reference,
+                pins,
+                media: self.fixture.media_input(),
+            }
         })
     }
 
     async fn lease_live(&self, _: &Grant) -> bool {
-        self.fault != Fault::LeaseLost
+        let checked = self.checked_lease.replace(true);
+        if checked && self.fault == Fault::ExpiredAtWrite {
+            self.clock.set(self.fixture.pins().usable_until);
+        }
+        self.fault != Fault::LeaseLost && !(checked && self.fault == Fault::Displaced)
     }
 
     async fn media(&self, get: S3Get<'_>) -> io::Result<S3GetReply<Self::Body>> {
@@ -123,7 +223,7 @@ fn reply(version: &str, bytes: Vec<u8>) -> S3GetReply<BodyBytes> {
     }
 }
 
-pub(super) struct Writer<'a>(pub(super) &'a RefCell<Vec<u8>>);
+pub(super) struct Writer<'a>(pub(super) &'a RefCell<Vec<u8>>, pub(super) Fault);
 impl OriginalWriter for Writer<'_> {
     fn poll_cancel(&mut self, _: &mut Context<'_>) -> Poll<SourceError> {
         Poll::Pending
@@ -133,6 +233,9 @@ impl OriginalWriter for Writer<'_> {
         _: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<Result<usize, SourceError>> {
+        if self.1 == Fault::Writer && !self.0.borrow().is_empty() {
+            return Poll::Ready(Err(SourceError::Transport));
+        }
         self.0.borrow_mut().push(bytes[0]);
         Poll::Ready(Ok(1))
     }

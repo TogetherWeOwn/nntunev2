@@ -62,6 +62,7 @@ pub struct ResponseRange {
 }
 
 /// Render errors before `start` at the HTTP boundary. After `start`, the
+/// For a 416, the start callback renders the refusal and returns no writer.
 /// caller cancels this future on expiry/disconnect and its writer aborts on
 /// drop. Only the sink-acknowledged prefix is reported, including on drop.
 pub async fn serve<S: PrivateSource, W: OriginalWriter>(
