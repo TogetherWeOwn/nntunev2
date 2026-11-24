@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["playwright.config.ts", "helpers/**/*.ts", "tests/**/*.ts"]
+  "include": ["playwright*.config.ts", "helpers/**/*.ts", "tests/**/*.ts", "fixtures/private-music/**/*.ts"]
 }
