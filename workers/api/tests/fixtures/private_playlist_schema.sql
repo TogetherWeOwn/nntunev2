@@ -29,6 +29,12 @@ INSERT INTO public.libraries (user_id, name)
 SELECT DISTINCT owner_id, 'Rehearsal Library' FROM pg_temp.fixture_memberships;
 INSERT INTO public.library_tracks (library_id, track_id)
 SELECT l.id, m.track_id FROM public.libraries l JOIN pg_temp.fixture_memberships m ON m.owner_id = l.user_id;
+WITH inactive AS (
+    INSERT INTO public.libraries (user_id, name, deleting_at)
+    VALUES ('fixture-user-owner', 'Fenced Library', now()) RETURNING id
+)
+INSERT INTO public.library_tracks (library_id, track_id)
+SELECT inactive.id, t.id FROM inactive, pg_temp.fixture_tracks t WHERE t.handle = 'inactive-track';
 
 -- Require an explicit trusted mapping even when the legacy ref resembles a canonical ID.
 INSERT INTO public.playlist_tracks (playlist_id, track_id, position, is_legacy)

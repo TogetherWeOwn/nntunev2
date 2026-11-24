@@ -15,7 +15,7 @@ CREATE TEMP TABLE legacy_before AS SELECT to_jsonb(p) AS row FROM public.playlis
 CREATE TEMP TABLE fixture_tracks AS
 SELECT handle, gen_random_uuid() AS id FROM (
     SELECT e->>'track_public_id' AS handle FROM fixture_cases c, jsonb_array_elements(c.entries) e
-    WHERE e->>'status' = 'resolved' UNION SELECT 'new-track'
+    WHERE e->>'status' = 'resolved' UNION SELECT 'new-track' UNION SELECT 'inactive-track'
 ) handles;
 INSERT INTO public.tracks (id, release_id, title, medium_no, track_no)
 SELECT id, gen_random_uuid(), handle, 1, 1 FROM fixture_tracks;

@@ -46,6 +46,7 @@ async fn postgres_store_rehearsal() {
     let track_id = "SELECT id::text FROM tracks WHERE title = $1";
     let track: String = scalar(&db, track_id, &[&"new-track"]).await;
     let foreign = scalar(&db, track_id, &[&"trkRpMiddle00000000000"]).await;
+    let inactive = scalar(&db, track_id, &[&"inactive-track"]).await;
     let another = scalar(&db, track_id, &[&"trkFrAlpha000000000000"]).await;
     let repeat: String = scalar(&db, track_id, &[&"trkRpRepeat00000000000"]).await;
     for cmd in [
@@ -56,15 +57,9 @@ async fn postgres_store_rehearsal() {
     ] {
         assert!(run(&mut db, other, cmd).await.is_none());
     }
-    for denied in [foreign, "00000000-0000-0000-0000-000000000000".into()] {
+    for denied in [foreign, inactive, "00000000-0000-0000-0000-000000000000".into()] {
         assert!(run(&mut db, owner, Append(id, denied)).await.is_none());
     }
-    let set_fence =
-        "UPDATE libraries SET deleting_at = CASE WHEN $2 THEN now() END WHERE user_id = $1";
-    assert_eq!(db.execute(set_fence, &[&owner, &true]).await.unwrap(), 1);
-    let inactive = Append(id, track.clone());
-    assert!(run(&mut db, owner, inactive).await.is_none());
-    assert_eq!(db.execute(set_fence, &[&owner, &false]).await.unwrap(), 1);
     let page = run(&mut db, owner, List(None, 1)).await.unwrap();
     let after = parse_page_cursor(page["next_cursor"].as_str().unwrap()).unwrap();
     let next = run(&mut db, owner, List(Some(after), 50)).await.unwrap();
@@ -92,6 +87,11 @@ async fn postgres_store_rehearsal() {
         run(&mut peer, owner, Append(id, track.clone()))
     );
     assert_ne!(first.is_some(), second.is_some());
+    let seed = "UPDATE playlist_tracks e SET position = 498 FROM playlists p WHERE p.public_id = $1 AND e.playlist_id = p.id";
+    assert_eq!(db.execute(seed, &[&id]).await.unwrap(), 1);
+    let last = run(&mut db, owner, Append(id, another.clone())).await.unwrap();
+    assert_eq!(last["position"], 499);
+    assert!(run(&mut db, owner, Append(id, repeat)).await.is_none());
     let (first, second) = tokio::join!(
         run(&mut db, owner, Append(unresolved, track.clone())),
         run(&mut peer, owner, Append(unresolved, another))
