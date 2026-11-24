@@ -5918,6 +5918,10 @@ where
 
 // --- Admin ingest (migration 0034) ---------------------------------------------------------
 
+#[allow(dead_code)] // Prepared, with no route or service binding.
+#[path = "admin_flac_proxy.rs"]
+mod admin_flac_proxy;
+
 /// 413 for an admin NZB upload whose body breached the collection cap:
 /// the in-handler pre-gate answers oversized admin uploads this way,
 /// with the null-job failure shape — no row, no audit, no parse. This
@@ -23329,6 +23333,56 @@ mod tests {
         assert_eq!(body["settings"]["invite_default_expiry_days"], 7);
         assert_eq!(body["settings"]["invite_member_min_paid_months"], 3);
         assert_eq!(body["settings"]["invite_member_per_window"], 2);
+    }
+
+    #[test]
+    fn admin_flac_proxy_authenticates_and_sends_only_review_retry() {
+        use nntune_ingest::{admin_review::RETRY_SCOPE, caller_auth::issue};
+        let h = harness();
+        seed_user(&h, "member1", "member@example.com");
+        let member = magic_login(&h, "member@example.com");
+        let admin = seed_admin(&h, "admin1", "admin@example.com");
+        let key = "synthetic-review-proxy-fixture-key";
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/v1/admin/ingest/review/flac_1/retry".into(),
+            cookie: None,
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: br#" { "revision": 4 } "#.to_vec(),
+        };
+        let mut ctx = h.ctx();
+        let denied = |ctx: &_, req: &Request| {
+            let send = async |_| panic!("unexpected ingest call");
+            block_on(admin_flac_proxy::retry(ctx, req, Some(key), send))
+                .unwrap_err()
+                .status
+        };
+        assert_eq!(denied(&ctx, &req), 404);
+        req.cookie = Some(member);
+        assert_eq!(denied(&ctx, &req), 404);
+        req.cookie = Some(admin);
+        let origin = req.origin.take();
+        assert_eq!(denied(&ctx, &req), 404);
+        req.origin = origin;
+        ctx.now += session::PRIVILEGE_REAUTH_WINDOW_SECS + 1;
+        assert_eq!(denied(&ctx, &req), 401);
+        ctx.now = NOW;
+        assert_eq!(block_on(handle(&ctx, &req)).status, 404);
+        let post = block_on(admin_flac_proxy::retry(
+            &ctx,
+            &req,
+            Some(key),
+            async |post| post,
+        ))
+        .unwrap();
+        assert_eq!(post.path, "/v1/ingest/review/flac_1/retry");
+        assert_eq!(post.body, r#"{"revision":4}"#);
+        let expected = issue("admin1", RETRY_SCOPE, NOW + 60, key.as_bytes());
+        assert_eq!(post.authorization, crate::ingest_grant::bearer(&expected));
+        req.body = br#"{"revision":4,"receipt":"caller-supplied"}"#.to_vec();
+        assert_eq!(denied(&ctx, &req), 400);
     }
 
     #[test]

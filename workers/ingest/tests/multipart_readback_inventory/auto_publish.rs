@@ -4,7 +4,10 @@ use nntune_ingest::{
         completed_upload::{stage_completed_release, VerifiedUpload},
         stage, AuthorizedRelease, CommittedFlac, ExpectedFile, StageOutcome,
     },
-    admin_review::ObjectRef,
+    admin_review::{
+        completed::{retry_completed, ResolvedCompletion, ReviewTarget},
+        Authorization, BoundaryError, ObjectRef, ReviewJob, ReviewStatus, READ_SCOPE, RETRY_SCOPE,
+    },
     catalogue_publication::{PublicationError, PublishedObject},
     matching::{
         admin_publish_match::{
@@ -309,4 +312,101 @@ pub(super) async fn exercise(
             hex::encode(both[i].receipt.intent.identities[2])
         );
     }
+    let release = "ab340000-0000-4000-8000-000000000000";
+    let mut run = async |scope, revision, resolved, bad_receipt, match_found: bool, fail_record| {
+        use nntune_ingest::caller_auth::issue;
+        const KEY: &str = "synthetic-review-receiver-fixture-key";
+        let bearer = format!("Bearer {}", issue(job.owner_id, scope, 10, KEY.as_bytes()));
+        let body = format!(r#"{{"revision":{revision}}}"#);
+        let recordings = include_str!("../fixtures/review_retry_recordings.json");
+        retry_completed(
+            &Authorization {
+                bearer: Some(&bearer),
+                secret: Some(KEY),
+                now: 1,
+            },
+            writer,
+            ReviewTarget {
+                job_id: job.job_id,
+                body: body.as_bytes(),
+                environment,
+                library,
+            },
+            async |tx, actor, target| {
+                assert_eq!(actor, job.owner_id);
+                assert_eq!((target.environment, target.library), (environment, library));
+                let row = tx.query_one("SELECT view::text, retried_revision FROM public.test_flac_review FOR UPDATE", &[]).await.unwrap();
+                Ok(Some(ReviewJob {
+                    view: serde_json::from_str(row.get(0)).unwrap(),
+                    owner_id: job.owner_id.into(),
+                    object: Some(objects[0].clone()),
+                    retried_revision: row.get::<_, Option<i64>>(1).map(|prior| prior as u32),
+                }))
+            },
+            async |tx, expected, result| {
+                let view = serde_json::to_string(result).unwrap();
+                let prior = i64::from(expected.view.revision);
+                let changed = tx.execute("UPDATE public.test_flac_review SET view = $1::text::jsonb,
+                    retried_revision = $2 WHERE (view->>'revision')::bigint = $2", &[&view, &prior]).await.unwrap();
+                assert_eq!(changed, 1);
+                if fail_record { Err(BoundaryError::Unavailable) } else { Ok(()) }
+            },
+            async |_| {
+                Ok(ResolvedCompletion {
+                    job_id: job.job_id,
+                    revision: resolved,
+                    upload: uploads[usize::from(bad_receipt)],
+                    numbering: files[0].numbering,
+                    query: ALBUM,
+                    recordings: (200, recordings),
+                    candidates: match_found.then(|| CompleteReleaseCandidates {
+                        lookup: &lookup,
+                        hits: vec![hit(release)],
+                    }),
+                })
+            },
+            async |scope| {
+                Ok(db
+                    .query_opt(READ, &[&&scope_key(scope)[..]])
+                    .await?
+                    .map(|row| CommittedOutcome {
+                        map: row.get(0),
+                        object: row.get(1),
+                        generation: row.get(2),
+                        configuration: row.get(3),
+                        root_version: row.get(4),
+                        media_version: row.get(5),
+                        page_versions: row.get(6),
+                    }))
+            },
+        )
+        .await
+    };
+    let rows = async || db.query(ROWS, &[&release]).await.unwrap().len();
+    for (scope, revision, resolved, bad_receipt, fail_record, status) in [
+        (READ_SCOPE, 1, 1, false, false, 404),
+        (RETRY_SCOPE, 0, 1, false, false, 409),
+        (RETRY_SCOPE, 1, 2, false, false, 409),
+        (RETRY_SCOPE, 1, 1, true, false, 409),
+        (RETRY_SCOPE, 1, 1, false, true, 503),
+    ] {
+        let error = run(scope, revision, resolved, bad_receipt, true, fail_record)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, status);
+        assert_eq!(rows().await, 0);
+    }
+    let review = run(RETRY_SCOPE, 1, 1, false, false, false).await.unwrap();
+    assert_eq!(review.status, ReviewStatus::NeedsReview);
+    assert_eq!(review.revision, 2);
+    assert_eq!(review.reason, Some(NeedsReview::SearchEvidence));
+    let replay = run(RETRY_SCOPE, 1, 0, true, true, true).await.unwrap();
+    assert_eq!(replay, review);
+    assert_eq!(rows().await, 0);
+    let result = run(RETRY_SCOPE, 2, 2, false, true, false).await.unwrap();
+    let replay = run(RETRY_SCOPE, 2, 0, true, false, true).await.unwrap();
+    let published = (ReviewStatus::Published, 3);
+    assert_eq!((result.status, result.revision), published);
+    assert_eq!(replay, result);
+    assert_eq!(rows().await, 1);
 }

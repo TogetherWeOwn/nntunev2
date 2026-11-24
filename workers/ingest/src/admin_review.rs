@@ -14,6 +14,8 @@ pub const READ_SCOPE: &str = "ingest:review:read";
 pub const RETRY_SCOPE: &str = "ingest:review:retry";
 pub const RETRY_BODY_LIMIT: usize = 128;
 
+pub mod completed;
+
 /// Synthetic grants use the existing caller-grant format. A future app proxy
 /// must check current admin status and retry step-up before issuing grants.
 pub struct Authorization<'a> {
@@ -52,7 +54,7 @@ pub struct RetryRequest {
     pub revision: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct JobView {
     pub job_id: String,
     pub revision: u32,
@@ -143,31 +145,14 @@ pub async fn retry(
     job_id: &str,
     body: &[u8],
 ) -> Result<JobView, ApiError> {
-    let caller = auth.caller(RETRY_SCOPE)?;
-    if body.len() > RETRY_BODY_LIMIT {
-        return Err(ApiError::by_code("payload_too_large", "body too large"));
-    }
-    if body.trim_ascii_start().first() != Some(&b'{') {
-        return Err(ApiError::invalid_request("invalid retry request"));
-    }
-    let request: RetryRequest = serde_json::from_slice(body)
-        .map_err(|_| ApiError::invalid_request("invalid retry request"))?;
+    let (caller, request) = retry_input(auth, body)?;
     let job = load(get, &caller, job_id).await?;
-    let Some(object) = job
-        .object
-        .as_ref()
-        .filter(|object| matches!(object.media.locator().binding(), S3Binding::VersionId(_)))
-    else {
-        return Err(BoundaryError::Conflict.into());
-    };
+    let object = versioned_object(&job)?;
     if is_retry_result(&job, request.revision) {
         return Ok(job.view);
     }
-    if job.view.revision != request.revision
-        || job.view.revision == u32::MAX
-        || job.view.status != ReviewStatus::NeedsReview
-        || verify(&caller.user_id, object).await? != *object
-    {
+    next_revision(&job, request.revision)?;
+    if verify(&caller.user_id, object).await? != *object {
         return Err(BoundaryError::Conflict.into());
     }
     let committed = publish(&job).await?;
@@ -178,6 +163,33 @@ pub async fn retry(
         return Err(BoundaryError::Unavailable.into());
     }
     Ok(committed.view)
+}
+
+fn retry_input(auth: &Authorization<'_>, body: &[u8]) -> Result<(Caller, RetryRequest), ApiError> {
+    let caller = auth.caller(RETRY_SCOPE)?;
+    if body.len() > RETRY_BODY_LIMIT {
+        return Err(ApiError::by_code("payload_too_large", "body too large"));
+    }
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return Err(ApiError::invalid_request("invalid retry request"));
+    }
+    let request: RetryRequest = serde_json::from_slice(body)
+        .map_err(|_| ApiError::invalid_request("invalid retry request"))?;
+    Ok((caller, request))
+}
+
+fn versioned_object(job: &ReviewJob) -> Result<&ObjectRef, BoundaryError> {
+    job.object
+        .as_ref()
+        .filter(|object| matches!(object.media.locator().binding(), S3Binding::VersionId(_)))
+        .ok_or(BoundaryError::Conflict)
+}
+
+fn next_revision(job: &ReviewJob, revision: u32) -> Result<u32, BoundaryError> {
+    revision
+        .checked_add(1)
+        .filter(|_| job.view.revision == revision && job.view.status == ReviewStatus::NeedsReview)
+        .ok_or(BoundaryError::Conflict)
 }
 
 fn is_retry_result(job: &ReviewJob, revision: u32) -> bool {
