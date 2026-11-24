@@ -1027,7 +1027,7 @@ pub fn bind_account_customer_statement() -> &'static str {
 /// missed mark means the flight moved on, and the caller retries into the
 /// replacement instead of acting on the dead row.
 pub fn update_checkout_operation_statement() -> &'static str {
-    "UPDATE billing_operations SET state = $2, request_payload = $3::jsonb, stripe_subscription_id = $4, updated_at = now() WHERE id = $1::uuid AND state IN ('pending', 'submitted', 'needs_reconcile') RETURNING id::text"
+    "UPDATE billing_operations SET state = $2, request_payload = $3::jsonb, stripe_subscription_id = $4, updated_at = now() WHERE id = $1::uuid AND state IN ('pending', 'submitted', 'needs_reconcile') AND EXISTS (SELECT 1 FROM public.users WHERE id = billing_operations.user_id AND deleting_at IS NULL FOR SHARE) RETURNING id::text"
 }
 
 /// Parameters: user_id. The per-user lock the reconcile write holds for
@@ -2417,7 +2417,7 @@ mod tests {
         // retired row into the single flight.
         assert!(
             update_checkout_operation_statement().contains(
-                "WHERE id = $1::uuid AND state IN ('pending', 'submitted', 'needs_reconcile') RETURNING id::text"
+                "WHERE id = $1::uuid AND state IN ('pending', 'submitted', 'needs_reconcile') AND EXISTS (SELECT 1 FROM public.users WHERE id = billing_operations.user_id AND deleting_at IS NULL FOR SHARE) RETURNING id::text"
             ),
             "late session marks must miss retired rows",
         );

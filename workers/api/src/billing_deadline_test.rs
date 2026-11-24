@@ -19,6 +19,7 @@ async fn fixture(setup: bool) -> Result<(), StoreError> {
                 if !safe { return Err(StoreError); }
                 for migration in [
                     include_str!("../../../migrations/0002_auth_vault.sql"),
+                    include_str!("../../../migrations/0006_account_deletion.sql"),
                     include_str!("../../../migrations/0021_billing_schema.sql"),
                     include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
                     include_str!("../../../migrations/0029_paid_invoice_history.sql"),
@@ -1003,6 +1004,7 @@ pub(crate) async fn test_reconcile_lock_cycle(row_update: bool) -> Result<(), &'
                 let mut reconcile = Box::pin(store.store_reconcile_owned(
                     user.into(),
                     outcome,
+                    false,
                     ReconcileProbe::None,
                 ));
                 let worker = match select(

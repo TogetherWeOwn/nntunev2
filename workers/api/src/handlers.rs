@@ -7683,11 +7683,11 @@ where
     else {
         return Ok(());
     };
-    let (Some(session), Some(price)) = (&op.session_id, &op.price_id) else {
+    let (Some(session), Some(_)) = (&op.session_id, &op.price_id) else {
         // A scheduled run cannot infer whether Stripe created a session.
         return Err(EnsureCheckoutError::Unavailable);
     };
-    if handle_flight_session(ctx, &op, session, price).await? == FlightSessionDecision::Completed {
+    if handle_flight_session(ctx, &op, session, None).await? == FlightSessionDecision::Completed {
         let updated = ctx
             .store
             .checkout_operation_by_id(&op.id)
@@ -8096,7 +8096,7 @@ async fn handle_flight_session<S, M, D, N>(
     ctx: &Ctx<'_, S, M, D, N>,
     op: &crate::billing_reconcile::StoredCheckoutOp,
     session_id: &str,
-    price_id: &str,
+    redirect_price_id: Option<&str>,
 ) -> Result<FlightSessionDecision, EnsureCheckoutError>
 where
     S: Store + SingleUseStore,
@@ -8130,6 +8130,9 @@ where
         }
     }
     if session.status.as_deref() == Some("open") {
+        let Some(price_id) = redirect_price_id else {
+            return Ok(FlightSessionDecision::Retained);
+        };
         if crate::billing_reconcile::checkout_price_matches(op, price_id) {
             if let Some(url) = session.url {
                 return Ok(FlightSessionDecision::Reuse(url));
@@ -8333,7 +8336,7 @@ where
             // replay a dead session inside Stripe's retention window. Lost
             // responses and same-price concurrent attempts still converge
             // here: no second session is minted for them.
-            return match handle_flight_session(ctx, &op, &session_id, price_id).await? {
+            return match handle_flight_session(ctx, &op, &session_id, Some(price_id)).await? {
                 FlightSessionDecision::Reuse(url) => Ok(url),
                 FlightSessionDecision::Replace => {
                     create_fresh_checkout_session(
@@ -8465,7 +8468,7 @@ where
             let Some(session_id) = resolved.session_id.clone() else {
                 return Err(EnsureCheckoutError::Failed);
             };
-            match handle_flight_session(ctx, &resolved, &session_id, price_id).await? {
+            match handle_flight_session(ctx, &resolved, &session_id, Some(price_id)).await? {
                 // Unreachable: the price mismatches by construction, so the
                 // winner's session is never reusable here. Fail safe — the
                 // retry heals it, and nothing mints beside unknown state.
@@ -13548,8 +13551,15 @@ mod tests {
             .get_mut(&active.id)
             .unwrap()
             .session_id = Some(session.clone());
+        h.stripe
+            .sessions
+            .borrow_mut()
+            .get_mut(&session)
+            .unwrap()
+            .url = None;
         run().unwrap();
         assert!(op().is_some());
+        assert!(h.stripe.expired.borrow().is_empty());
         h.stripe
             .sessions
             .borrow_mut()

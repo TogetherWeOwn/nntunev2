@@ -21,9 +21,7 @@ const NOW: i64 = 1_786_032_000;
 
 async fn dispatch(user: &str, outcome: &ReconcileOutcome) -> Result<(), StoreError> {
     with_fixture_store(async |store| {
-        store
-            .store_reconcile_owned(user.to_owned(), outcome.clone())
-            .await
+        super::Store::store_paid_reconcile_outcome(store, user, outcome)
     })
     .await
 }
@@ -193,7 +191,18 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
     sql("UPDATE billing_operations SET created_at = now() - interval '23 hours 30 minutes'").await;
     let aged =
         with_fixture_store(async |store| store.open_checkout_operation(OTHER_USER).await).await;
-    assert!(!aged.unwrap().unwrap().replayable);
+    let aged = aged.unwrap().unwrap();
+    assert!(!aged.replayable);
+    sql("UPDATE public.users SET deleting_at = now() WHERE id = 'native_billing_other';").await;
+    let marked = with_fixture_store(async |store| {
+        store
+            .update_checkout_operation(&aged.id, "succeeded", PRICE, Some("cs_fixture"))
+            .await
+    })
+    .await
+    .unwrap();
+    assert!(!marked);
+    sql("UPDATE public.users SET deleting_at = NULL WHERE id = 'native_billing_other';").await;
     sql("DELETE FROM billing_operations; DELETE FROM billing_accounts; DELETE FROM plan_prices; DELETE FROM plans WHERE id = 'checkout-fixture';").await;
 }
 
@@ -206,7 +215,11 @@ async fn hourly_billing_query_rotates_due_targets(observer: &Client) {
                 CASE WHEN n = 21 THEN now() ELSE NULL END
          FROM generate_series(1, 21) n;
          INSERT INTO billing_operations (user_id, kind, state, request_key, request_payload)
-         SELECT id, 'checkout', 'pending', id, '{}' FROM users WHERE id LIKE 'sweep-%';",
+         SELECT id, 'checkout', 'pending', id, '{}' FROM users WHERE id LIKE 'sweep-%';
+         INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id,
+             stripe_subscription_item_id, stripe_price_id, plan_id, status, paid_through_at)
+         VALUES ('native_billing_other', 'sub_future', 'cus_future',
+             'si_future', 'price_future', 'plus', 'active', now() + interval '1 day');",
         )
         .await
         .unwrap();
@@ -221,6 +234,7 @@ async fn hourly_billing_query_rotates_due_targets(observer: &Client) {
             let user: String = row.get(0);
             let subscription: Option<String> = row.get(1);
             assert_ne!(user, "sweep-21");
+            assert_ne!(user, OTHER_USER, "future paid coverage is not due");
             assert_eq!(
                 subscription.as_deref(),
                 (user == USER).then_some(SUBSCRIPTION)
@@ -232,7 +246,8 @@ async fn hourly_billing_query_rotates_due_targets(observer: &Client) {
     assert!(seen.contains(USER));
     observer
         .batch_execute(
-            "DELETE FROM billing_operations WHERE user_id LIKE 'sweep-%';
+            "DELETE FROM subscriptions WHERE stripe_subscription_id = 'sub_future';
+         DELETE FROM billing_operations WHERE user_id LIKE 'sweep-%';
          DELETE FROM users WHERE id LIKE 'sweep-%';",
         )
         .await
@@ -347,6 +362,26 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
         assert!(dispatch(OTHER_USER, foreign).await.is_err());
         assert_eq!(snapshot(&observer).await, (owned.clone(), history.clone()));
     }
+
+    observer
+        .execute(
+            "UPDATE public.users SET deleting_at = now() WHERE id = $1",
+            &[&USER],
+        )
+        .await
+        .unwrap();
+    let mut live_update = seed.clone();
+    live_update.row.cancel_at_period_end = true;
+    assert!(dispatch(USER, &live_update).await.is_err());
+    assert!(dispatch(USER, &stale).await.is_err());
+    assert_eq!(snapshot(&observer).await, (owned.clone(), history.clone()));
+    observer
+        .execute(
+            "UPDATE public.users SET deleting_at = NULL WHERE id = $1",
+            &[&USER],
+        )
+        .await
+        .unwrap();
 
     dispatch(USER, &stale)
         .await
@@ -548,7 +583,11 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
     assert!(denied_read.is_err());
     assert_eq!(snapshot(observer).await, before);
     observer
-        .batch_execute("GRANT SELECT ON public.plan_prices TO billing_native_caller_fixture")
+        .batch_execute(
+            "GRANT SELECT ON public.plan_prices TO billing_native_caller_fixture;
+             GRANT SELECT (id, deleting_at), UPDATE (id)
+                ON public.users TO billing_native_caller_fixture;",
+        )
         .await
         .unwrap();
 
