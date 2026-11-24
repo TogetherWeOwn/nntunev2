@@ -17,6 +17,19 @@ const INVOICE: &str = "in_native_billing";
 const NOW: i64 = 1_786_032_000;
 
 async fn dispatch(user: &str, outcome: &ReconcileOutcome) -> Result<(), StoreError> {
+    dispatch_with(user, outcome, Writer::Owned).await
+}
+
+enum Writer {
+    Owned,
+    Release,
+}
+
+async fn dispatch_with(
+    user: &str,
+    outcome: &ReconcileOutcome,
+    writer: Writer,
+) -> Result<(), StoreError> {
     let driver = Rc::new(RefCell::new(None));
     let driver_slot = Rc::clone(&driver);
     let store = PgStore {
@@ -37,9 +50,14 @@ async fn dispatch(user: &str, outcome: &ReconcileOutcome) -> Result<(), StoreErr
         })),
         test_mirror: None,
     };
-    let result = store
-        .store_reconcile_owned(user.to_owned(), outcome.clone())
-        .await;
+    let result = match writer {
+        Writer::Owned => {
+            store
+                .store_reconcile_owned(user.to_owned(), outcome.clone())
+                .await
+        }
+        Writer::Release => super::Store::store_reconcile_outcome(&store, user, outcome).await,
+    };
     // Join before discarding the store: the call must have released its client.
     let driver = driver.take().expect("store must acquire one connection");
     tokio::time::timeout(Duration::from_secs(5), driver)
@@ -309,22 +327,15 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         .await
         .unwrap();
     // #902 only counted the item plan. #926 lost the first Pro start
-    // when Plus temporarily held the latest end. Later coverage hydration
-    // could populate the full union without changing those reporting fields.
-    for (plan, start, end, hydrated) in [
-        ("plus", NOW, NOW + 15, false),
-        ("pro", NOW + 10, NOW + 30, false),
-        ("pro", NOW + 10, NOW + 30, true),
-    ] {
+    // when Plus temporarily held the latest end.
+    for (plan, start, end) in [("plus", NOW, NOW + 15), ("pro", NOW + 10, NOW + 30)] {
         assert_eq!(
             observer
                 .execute(
                     "UPDATE public.paid_invoice_history SET plan_id = $2,
-             period_start = to_timestamp($3::bigint), period_end = to_timestamp($4::bigint),
-             covered_periods = CASE WHEN $5 THEN
-                 tstzmultirange(tstzrange(to_timestamp($6::bigint), to_timestamp($7::bigint), '[)'))
-             END WHERE stripe_invoice_id = $1",
-                    &[&LEGACY, &plan, &start, &end, &hydrated, &NOW, &(NOW + 30)],
+             period_start = to_timestamp($3::bigint), period_end = to_timestamp($4::bigint)
+             WHERE stripe_invoice_id = $1",
+                    &[&LEGACY, &plan, &start, &end],
                 )
                 .await
                 .unwrap(),
@@ -333,7 +344,7 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         let before = snapshot(observer).await;
         assert!(
             dispatch(OTHER_USER, &fresh).await.is_err(),
-            "{plan} {start} {end} hydrated={hydrated}"
+            "{plan} {start} {end}"
         );
         assert_eq!(
             snapshot(observer).await,
@@ -341,6 +352,30 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
             "history conflict must roll back the whole fold"
         );
     }
+
+    let coverage_matches = "SELECT covered_periods = tstzmultirange(tstzrange(
+             to_timestamp($2::bigint), to_timestamp($3::bigint), '[)'))
+         FROM public.paid_invoice_history WHERE stripe_invoice_id = $1";
+    let mut legacy_replay = fold(local.clone());
+    legacy_replay.explicit_stale = true;
+    legacy_replay
+        .history
+        .retain(|row| row.stripe_invoice_id == LEGACY);
+    assert_eq!(legacy_replay.history.len(), 1);
+    dispatch_with(OTHER_USER, &legacy_replay, Writer::Release)
+        .await
+        .expect("release writer hydrates a nonempty legacy invoice batch");
+    assert_eq!(
+        observer
+            .query_one(coverage_matches, &[&LEGACY, &NOW, &(NOW + 30)])
+            .await
+            .unwrap()
+            .get::<_, Option<bool>>(0),
+        Some(true)
+    );
+    let hydrated = snapshot(observer).await;
+    assert!(dispatch(OTHER_USER, &fresh).await.is_err());
+    assert_eq!(snapshot(observer).await, hydrated);
 
     assert_eq!(observer.execute(
         "UPDATE public.paid_invoice_history SET plan_id = $2, period_start = to_timestamp($3::bigint),
@@ -359,6 +394,16 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         .find(|row| row["stripe_subscription_id"] == TARGET)
         .unwrap();
     assert_eq!(target["paid_invoice_id"], FRESH);
+    let paid_through_unix: Option<i64> = observer
+        .query_one(
+            "SELECT extract(epoch FROM paid_through_at)::bigint FROM public.subscriptions
+         WHERE user_id = $1 AND stripe_subscription_id = $2",
+            &[&OTHER_USER, &TARGET],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(paid_through_unix, Some(NOW + 60));
     assert!(committed
         .1
         .as_array()
@@ -367,22 +412,21 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         .any(|row| row["stripe_invoice_id"] == FRESH));
     assert_eq!(
         observer
-            .query_one(
-                "SELECT covered_periods = tstzmultirange(tstzrange(
-             to_timestamp($2::bigint), to_timestamp($3::bigint), '[)'))
-         FROM public.paid_invoice_history WHERE stripe_invoice_id = $1",
-                &[&LEGACY, &NOW, &(NOW + 30)],
-            )
+            .query_one(coverage_matches, &[&LEGACY, &NOW, &(NOW + 30)],)
             .await
             .unwrap()
             .get::<_, Option<bool>>(0),
         Some(true)
     );
     let replay = fold(LiveRow {
-        paid_through_unix: fresh.row.paid_through_unix,
-        paid_invoice_id: fresh.row.paid_invoice_id,
+        paid_through_unix,
+        paid_invoice_id: target["paid_invoice_id"].as_str().map(str::to_owned),
         ..local
     });
+    assert!(replay
+        .history
+        .iter()
+        .any(|row| row.stripe_invoice_id == LEGACY));
     dispatch(OTHER_USER, &replay)
         .await
         .expect("matching mixed-plan replay");
