@@ -1,11 +1,15 @@
-//! Source selection and byte accounting shared by the R2 fetch and its fixtures.
+//! R2 source selection and shared byte-prefix settlement.
 
+#[cfg(any(test, target_arch = "wasm32"))]
 use std::future::Future;
 
+#[cfg(any(test, target_arch = "wasm32"))]
 use nntune_core::transcode::artifact_r2_key;
 
+#[cfg(any(test, target_arch = "wasm32"))]
 use crate::{api_error::ApiError, grant, play_route};
 
+#[cfg(any(test, target_arch = "wasm32"))]
 pub(crate) struct Play {
     pub(crate) user_id: String,
     pub(crate) play_id: String,
@@ -13,6 +17,7 @@ pub(crate) struct Play {
     artifact_key: Option<String>,
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 pub(crate) fn authorize(
     token: &str,
     track_id: &str,
@@ -37,6 +42,7 @@ pub(crate) fn authorize(
     })
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 impl Play {
     pub(crate) fn content_type(&self) -> &'static str {
         self.artifact_key
@@ -61,11 +67,13 @@ impl Play {
 }
 
 /// Keep the selected key private so HEAD and the body read cannot diverge.
+#[cfg(any(test, target_arch = "wasm32"))]
 pub(crate) struct Blob {
     key: String,
     pub(crate) size: u64,
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 impl Blob {
     pub(crate) async fn read<T>(
         self,

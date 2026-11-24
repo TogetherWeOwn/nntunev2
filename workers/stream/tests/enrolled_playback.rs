@@ -15,6 +15,8 @@ use nntune_stream::{
 
 #[path = "enrolled_playback/refusals.rs"]
 mod refusals;
+#[path = "enrolled_playback/route.rs"]
+mod route;
 #[path = "enrolled_playback/s3.rs"]
 mod s3;
 
@@ -49,18 +51,30 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        let mut plaintext = vec![b'A'; LEN as usize];
+        plaintext[65_535..].copy_from_slice(b"YZ");
+        Self::from_plaintext(&plaintext)
+    }
+
+    fn from_plaintext(plaintext: &[u8]) -> Self {
+        let len = plaintext.len() as u64;
         let mut seal =
-            DigestEnrollment::new(LEN, [id(1), id(2), id(3), id(4), id(5)], id(6)).unwrap();
+            DigestEnrollment::new(len, [id(1), id(2), id(3), id(4), id(5)], id(6)).unwrap();
         let context = EnvelopeContext {
             identities: [id(7), id(1), id(2), id(3), id(4), id(5)],
-            plaintext_len: LEN,
+            plaintext_len: len,
             header: seal.header().to_bytes(),
         };
         let envelope = wrap_scheme2(&ROOT, &context, seal.key().expose_secret()).unwrap();
-        let mut first_plaintext = [b'A'; 65_536];
-        first_plaintext[65_535] = b'Y';
-        let first = seal.seal_chunk(&first_plaintext).unwrap().bytes;
-        let last = seal.seal_chunk(b"Z").unwrap();
+        let first = seal
+            .seal_chunk(&plaintext[..plaintext.len().min(65_536)])
+            .unwrap();
+        let (last, page) = if let Some(page) = first.page {
+            (Vec::new(), page)
+        } else {
+            let last = seal.seal_chunk(&plaintext[65_536..]).unwrap();
+            (last.bytes, last.page.unwrap())
+        };
         let locator = S3Locator::new(
             "fixture-media".into(),
             "media/00000000000040008000000000000003/00000000000040008000000000000004".into(),
@@ -71,9 +85,9 @@ impl Fixture {
             media: S3MediaMetadata::from_trusted_context(locator, &context).unwrap(),
             context,
             envelope,
-            first,
-            last: last.bytes,
-            page: last.page.unwrap(),
+            first: first.bytes,
+            last,
+            page,
             manifest: seal.finish().unwrap(),
             versions: ["page-v1".into()],
         }
@@ -88,7 +102,7 @@ impl Fixture {
             generation_id: id(4),
             provider_configuration: id(5),
             root_version_id: id(7),
-            plaintext_len: LEN,
+            plaintext_len: self.context.plaintext_len,
             plaintext_sha256: *self.manifest.plaintext_sha256(),
             map_id: id(6),
             media_version: "media-v1",
