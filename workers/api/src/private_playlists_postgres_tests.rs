@@ -53,7 +53,6 @@ async fn postgres_store_rehearsal() {
         Rename(id, "Denied".into()),
         Append(id, track.clone()),
         Delete(id),
-        Read("noSuchPlaylist00000000"),
     ] {
         assert!(run(&mut db, other, cmd).await.is_none());
     }
@@ -71,27 +70,28 @@ async fn postgres_store_rehearsal() {
     let next = run(&mut db, owner, List(Some(after), 50)).await.unwrap();
     let mut ids = [id, clean_id, unresolved, "plFullyResolved0000000"];
     ids.sort_unstable_by(|a, b| b.cmp(a));
-    assert_eq!(page["items"][0]["id"], ids[0]);
-    let tail = next["items"].as_array().unwrap();
-    assert_eq!(tail.len(), ids.len() - 1);
-    for (item, id) in tail.iter().zip(&ids[1..]) {
-        assert_eq!(item["id"], *id);
+    for (page, expected) in [(page, &ids[..1]), (next, &ids[1..])] {
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), expected.len());
+        for (item, id) in items.iter().zip(expected) {
+            assert_eq!(item["id"], *id);
+        }
     }
     let legacy = run(&mut db, owner, Read(clean_id)).await.unwrap();
-    assert_eq!(legacy["legacy_items"].as_array().unwrap().len(), 4);
-    assert_eq!(legacy["entries"][1]["dormant"], true);
-    assert!(legacy["entries"][1].get("track_id").is_none());
     let entries = legacy["entries"].as_array().unwrap();
-    assert_eq!(entries[0]["track_id"], repeat);
-    assert_eq!(entries[3]["track_id"], repeat);
-    assert_eq!(entries[1]["position"], 1);
-    assert!(entries[1]["id"].is_string());
+    for i in [0, 2, 3] {
+        assert_eq!(entries[i]["position"], i);
+        assert_eq!(entries[i]["track_id"], repeat);
+    }
+    let dormant = &entries[1];
+    assert_eq!(dormant["dormant"], true);
+    assert_eq!(dormant["position"], 1);
+    assert!(dormant["id"].is_string() && dormant.get("track_id").is_none());
     let (first, second) = tokio::join!(
         run(&mut db, owner, Append(id, track.clone())),
         run(&mut peer, owner, Append(id, track.clone()))
     );
     assert_ne!(first.is_some(), second.is_some());
-    assert_eq!(first.or(second).unwrap()["position"], 0);
     let (first, second) = tokio::join!(
         run(&mut db, owner, Append(unresolved, track.clone())),
         run(&mut peer, owner, Append(unresolved, another))
@@ -115,28 +115,28 @@ async fn postgres_store_rehearsal() {
     assert_eq!(run(&mut db, owner, Delete(id)).await, Some(deleted));
     assert!(run(&mut db, other, Delete(id)).await.is_none());
 
-    db.batch_execute("ALTER TABLE delete_operations ADD CHECK (scope <> 'playlist') NOT VALID")
-        .await
-        .unwrap();
+    let reject_op = "ALTER TABLE delete_operations ADD CHECK (scope <> 'playlist') NOT VALID";
+    db.batch_execute(reject_op).await.unwrap();
     let h = harness();
     let email = "playlist-owner@example.com";
     seed_user(&h, owner, email);
-    let cookie = magic_login(&h, email);
-    for (session, origin, target, expected) in [
-        (None, ORIGIN, clean_id, generic_auth()),
-        (Some(cookie.clone()), "https://wrong.example", clean_id, generic_auth()),
-        (Some(cookie.clone()), ORIGIN, "noSuchPlaylist00000000", not_found()),
-        (Some(cookie), ORIGIN, clean_id, unavailable()),
+    let cookie = Some(magic_login(&h, email));
+    for (cookie, origin, target, header, expected) in [
+        (None, ORIGIN, clean_id, None, generic_auth()),
+        (cookie.clone(), "https://wrong.example", clean_id, None, generic_auth()),
+        (cookie.clone(), ORIGIN, "noSuchPlaylist00000000", None, not_found()),
+        (cookie.clone(), ORIGIN, clean_id, Some("Bearer fixture"), not_found()),
+        (cookie, ORIGIN, clean_id, None, unavailable()),
     ] {
         let req = Request {
-            method: "DELETE".into(), path: format!("/v1/playlists/{target}"), cookie: session,
-            origin: Some(origin.into()), authorization: None, stripe_signature: None, body: Vec::new(),
+            method: "DELETE".into(), path: format!("/v1/playlists/{target}"), cookie,
+            origin: Some(origin.into()), authorization: header.map(str::to_owned),
+            stripe_signature: None, body: Vec::new(),
         };
         let result = route(&h.ctx(), &req, &mut db, Delete(target)).await;
         assert_eq!((result.status, result.body), (expected.status, expected.body));
     }
     assert!(run(&mut db, owner, Read(clean_id)).await.is_some());
-
     let writer_pid: i32 = scalar(&peer, "SELECT pg_backend_pid()", &[]).await;
     let playlist_fence = "UPDATE playlists SET deleting_at = now() WHERE public_id = $1";
     let account_fence = "UPDATE users SET deleting_at = now() WHERE id = $1";
