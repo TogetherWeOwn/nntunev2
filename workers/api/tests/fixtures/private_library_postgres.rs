@@ -159,7 +159,8 @@ async fn publishes_and_admits_only_the_fresh_canonical_track() {
     assert_eq!(merged[1..], legacy_ids[..49]);
 
     let mut tx = writer.transaction().await.unwrap();
-    for position in 100..149 {
+    let mut admitted = vec![track.clone()];
+    for position in 100..150 {
         let mut next = fixture.occurrence(JOB, ISSUER, MBID);
         next.track.track_no = position;
         let id = stage(&mut tx, &next, &source).await.unwrap();
@@ -173,15 +174,16 @@ async fn publishes_and_admits_only_the_fresh_canonical_track() {
         )
         .await
         .unwrap());
+        admitted.push(id);
     }
     tx.commit().await.unwrap();
+    admitted.sort_unstable();
     writer
         .batch_execute("ALTER TABLE public.library RENAME TO legacy_fixture")
         .await
         .unwrap();
     let full = ids(handle(&ctx, &request).await);
-    assert_eq!(full.len(), 50);
-    assert!(full.contains(&track));
+    assert_eq!(full, admitted[..50]);
     writer
         .batch_execute("ALTER TABLE public.legacy_fixture RENAME TO library")
         .await
@@ -194,6 +196,7 @@ async fn publishes_and_admits_only_the_fresh_canonical_track() {
         .await
         .unwrap();
     assert_eq!(handle(&ctx, &request).await.status, 403);
+    assert!(page(&writer, RECIPIENT, policy).await.unwrap().is_empty());
     writer
         .execute(
             "UPDATE public.invite_codes SET revoked_at = NULL WHERE id = 901",
