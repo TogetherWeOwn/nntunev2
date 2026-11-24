@@ -18,10 +18,11 @@ class StagingWorkerSubmissionTests(unittest.TestCase):
         for workflow, job, worker in lanes:
             with self.subTest(workflow=workflow, job=job):
                 self.check(workflow=workflow, job=job, worker=worker, approved_worker=worker)
+                wrong_worker = worker.removesuffix("-staging")
                 with self.assertRaisesRegex(ValueError, "Worker target"):
                     self.check(
-                        workflow=workflow, job=job, worker=worker.removesuffix("-staging"),
-                        approved_worker=worker,
+                        workflow=workflow, job=job, worker=wrong_worker,
+                        approved_worker=wrong_worker,
                     )
         for overrides in (
             {"worker": "nntune-api-staging"},
@@ -56,6 +57,7 @@ class StagingWorkerSubmissionTests(unittest.TestCase):
             ({"operation": "rollback"}, "deployment operation"),
             ({"approved_operation": "delete", "operation": "delete"}, "deployment operation"),
             ({"version": "01234567-abcd-4321-9876-0123456789ab"}, "unexpected version"),
+            ({"approved_version": "01234567-abcd-4321-9876-0123456789ab"}, "unexpected version"),
         ):
             with self.subTest(**overrides), self.assertRaisesRegex(ValueError, message):
                 self.check(**overrides)
