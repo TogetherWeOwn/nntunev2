@@ -1028,3 +1028,41 @@ jobs:
       SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
       # No NZB fixture secrets are passed: the staging real-NZB leg is
       # retired under the CC0-only fixture rule (see e2e-staging.yml).
+
+  # Separate from paid-journey and production admission evidence. The main
+  # staging concurrency lock holds for the entire private qualification.
+  post-deploy-private-music:
+    needs: [staging-web, staging-api]
+    if: ${{ github.event_name == 'push' && vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+      deployment: false
+    steps:
+      - name: Require this run's API deployment
+        env:
+          API_SOURCE_SHA: ${{ needs.staging-api.outputs.source_sha }}
+          API_DEPLOYED: ${{ needs.staging-api.outputs.deployed }}
+        run: test "$API_DEPLOYED" = true && test "$API_SOURCE_SHA" = "$GITHUB_SHA"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Install the private journey runner
+        working-directory: e2e
+        run: npm ci && npx playwright install --with-deps chromium
+      - name: Qualify private listening
+        working-directory: e2e
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          PRIVATE_MUSIC_STAGE_FIXTURE: ${{ secrets.PRIVATE_MUSIC_STAGE_FIXTURE }}
+          EXPECTED_BUILD_SHA: ${{ github.sha }}
+          API_DEPLOY_OUTCOME: ${{ needs.staging-api.outputs.outcome }}
+        run: npx playwright test --config=playwright.private-staging.config.ts
