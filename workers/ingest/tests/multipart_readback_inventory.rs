@@ -21,6 +21,7 @@ use nntune_ingest::{
         },
         resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
         session_completion::SessionCompletion,
+        session_outcome::CommittedOutcome,
         sidecar::{CompletedSidecar, SidecarPut, SidecarPutReply},
         CompletedVersionedMedia, MultipartError, Plan, UploadTarget, VersionedCompletionReply,
     },
@@ -391,6 +392,70 @@ async fn hands_off_seek_ranges_only_for_the_verified_flac_object() {
             verified.flac_plaintext_range(metadata, &wrong_digest, 0..1),
             None
         );
+    }
+}
+
+#[tokio::test]
+async fn indexed_readback_requires_all_durable_completion_pins() {
+    let fixture = ReadbackFixture::new(FLAC);
+    let receipts = [fixture.sidecar()];
+    let inventory = fixture.inventory(&receipts);
+    let verified = inventory
+        .verify_with_flac_seek(SCOPE, fixture.envelope(), async |_, pin| {
+            Ok(fixture.response(pin))
+        })
+        .await
+        .unwrap();
+    let expected = || CommittedOutcome {
+        map: "06060606-0606-4006-8006-060606060606".into(),
+        object: "abababab-abab-40ab-80ab-abababababab".into(),
+        generation: "cdcdcdcd-cdcd-40cd-80cd-cdcdcdcdcdcd".into(),
+        configuration: "05050505-0505-4005-8005-050505050505".into(),
+        root_version: "00000000-0000-4000-8000-000000000000".into(),
+        media_version: SHARED_VERSION.into(),
+        page_versions: vec![FINAL_VERSION.into()],
+    };
+    assert!(verified.matches_committed_outcome(&expected()));
+    let wrong = "0f0f0f0f-0f0f-400f-800f-0f0f0f0f0f0f";
+    for different in [
+        CommittedOutcome {
+            map: wrong.into(),
+            ..expected()
+        },
+        CommittedOutcome {
+            object: wrong.into(),
+            ..expected()
+        },
+        CommittedOutcome {
+            generation: wrong.into(),
+            ..expected()
+        },
+        CommittedOutcome {
+            configuration: wrong.into(),
+            ..expected()
+        },
+        CommittedOutcome {
+            root_version: wrong.into(),
+            ..expected()
+        },
+        CommittedOutcome {
+            media_version: FINAL_VERSION.into(),
+            ..expected()
+        },
+        CommittedOutcome {
+            page_versions: vec![SHARED_VERSION.into()],
+            ..expected()
+        },
+        CommittedOutcome {
+            page_versions: vec![FINAL_VERSION.into(), PAGE_ONE_VERSION.into()],
+            ..expected()
+        },
+        CommittedOutcome {
+            page_versions: vec![],
+            ..expected()
+        },
+    ] {
+        assert!(!verified.matches_committed_outcome(&different));
     }
 }
 

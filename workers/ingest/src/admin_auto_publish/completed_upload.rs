@@ -7,7 +7,7 @@ use super::{stage, AuthorizedRelease, CommittedFlac, StageOutcome};
 use crate::{
     catalogue_publication::PublicationError,
     matching::admin_publish_match::{CompleteReleaseCandidates, RECORDINGS_LIMIT},
-    multipart::session_outcome::{CommittedOutcome, CompletionScope},
+    multipart::session_outcome::{uuid_text, CommittedOutcome, CompletionScope},
 };
 
 /// Trusted final checkpoint and authenticated readback in job file order.
@@ -79,12 +79,4 @@ pub async fn stage_completed_release(
     }
 
     stage(tx, job, &committed, query, candidates, recordings).await
-}
-
-fn uuid_text(id: [u8; 16]) -> String {
-    let mut id = hex::encode(id);
-    for boundary in [20, 16, 12, 8] {
-        id.insert(boundary, '-');
-    }
-    id
 }
