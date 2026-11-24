@@ -1,5 +1,6 @@
 use super::{
-    id, publisher_fixture, FINAL_VERSION, INVENTORY, RETAIN_UNTIL, SCOPE, SHARED_VERSION, WINNERS,
+    id, publisher_fixture, BUCKET, FINAL_VERSION, INVENTORY, RETAIN_UNTIL, SCOPE, SHARED_VERSION,
+    WINNERS,
 };
 use nntune_ingest::{
     digest_candidate_store::{
@@ -29,6 +30,8 @@ pub(super) async fn prove(
     let lease = "99000000-0000-4000-8000-000000000002";
     let first = "99000000-0000-4000-8000-000000000003";
     let owner = "synthetic-outcome-owner";
+    let other_object = hex::encode(id(0xa0));
+    let other_generation = hex::encode(id(0xa1));
     observer
         .batch_execute(include_str!("../../../api/src/ingest_session_schema.sql"))
         .await
@@ -65,6 +68,10 @@ pub(super) async fn prove(
     }
     observer.batch_execute(&format!(
         "INSERT INTO public.users (id, email, created_at) VALUES ('{owner}', '{owner}@example.invalid', 1);
+         INSERT INTO public.storage_object_intents
+         SELECT '{other_object}', '{other_generation}', environment_id, library_id,
+                provider_configuration_version_id, plaintext_bytes, envelope_bytes, header_tag
+         FROM public.storage_object_intents WHERE object_id = '{object}';
          SELECT pg_temp.reserve('{environment}', '{library}', '{owner}', 'synthetic', decode(repeat('fa',32),'hex'), '{sid}');
          SELECT pg_temp.lease('{environment}', '{library}', '{owner}', '{sid}', decode(repeat('fa',32),'hex'), '{seal}', 0, 0, '{first}');
          SELECT pg_temp.advance('{environment}', '{library}', '{owner}', '{sid}', decode(repeat('fa',32),'hex'), '{seal}', 0, 0, {checkpoint}, '{first}');
@@ -133,6 +140,46 @@ pub(super) async fn prove(
         assert_eq!(stage(&mut tx, &scope, lease).await, Err(Refused));
         tx.rollback().await.unwrap();
     }
+    let mut tx = writer.transaction().await.unwrap();
+    tx.execute(
+        "UPDATE public.ingest_session_reservations SET multipart_object_id = $2::text::uuid,
+         multipart_bucket = $3 WHERE id = $1::text::uuid",
+        &[&sid, &object, &BUCKET],
+    )
+    .await
+    .unwrap();
+    assert_eq!(stage(&mut tx, &scope, lease).await, Err(Refused));
+    absent().await;
+    tx.commit().await.unwrap();
+    for (claimed_object, claimed_bucket) in [(&object, "different-bucket"), (&other_object, BUCKET)]
+    {
+        let mut tx = writer.transaction().await.unwrap();
+        tx.execute(
+            "UPDATE public.ingest_session_reservations SET multipart_object_id = $2::text::uuid,
+             multipart_bucket = $3, multipart_upload_id = 'fixture-upload'
+             WHERE id = $1::text::uuid",
+            &[&sid, &claimed_object, &claimed_bucket],
+        )
+        .await
+        .unwrap();
+        assert_eq!(stage(&mut tx, &scope, lease).await, Err(Refused));
+        assert!(tx.query_opt(INVENTORY, &[&map]).await.unwrap().is_none());
+        assert!(tx
+            .query_opt(WINNERS, &[&environment, &library])
+            .await
+            .unwrap()
+            .is_none());
+        tx.rollback().await.unwrap();
+    }
+    observer
+        .execute(
+            "UPDATE public.ingest_session_reservations SET multipart_upload_id = 'fixture-upload'
+         WHERE id = $1::text::uuid",
+            &[&sid],
+        )
+        .await
+        .unwrap();
+
     let mut tx = writer.transaction().await.unwrap();
     stage(&mut tx, &scope, lease).await.unwrap();
     absent().await;

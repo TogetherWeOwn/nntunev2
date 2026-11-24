@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 
 pub mod head_receipt;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 mod initiation;
 pub mod readback_inventory;
 pub mod resume_checkpoint;
@@ -17,6 +17,8 @@ pub mod resume_checkpoint;
 pub mod s3_completion;
 pub mod session_completion;
 pub mod session_outcome;
+#[cfg(any(target_arch = "wasm32", test))]
+pub mod session_upload;
 pub mod sidecar;
 
 pub const PART_BYTES: usize = 5_244_160;

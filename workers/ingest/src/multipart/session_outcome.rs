@@ -1,6 +1,6 @@
 //! Internal contract for reading the durable result of a scoped completion.
 
-/// Exact scope of the authorized session and its final checkpoint.
+/// Exact scope of the authorized session and its checkpoint (final for completion).
 #[derive(Clone, Copy)]
 pub struct CompletionScope<'a> {
     pub environment: [u8; 16],

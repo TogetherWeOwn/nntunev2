@@ -45,7 +45,7 @@ WHERE i.environment_id = $1::text::uuid AND i.library_id = $2::text::uuid
 use crate::digest_candidate_identity::candidate_hashes;
 pub use crate::digest_candidate_identity::{CandidateError, CandidateIntent};
 
-fn uuid(id: &[u8; 16]) -> String {
+pub(crate) fn uuid(id: &[u8; 16]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

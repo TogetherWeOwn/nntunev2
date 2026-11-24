@@ -12,6 +12,7 @@ WITH locked AS MATERIALIZED (
     WHERE library.environment_id = $1 AND session.library_id = $2
       AND session.principal_id = $3 AND session.id = $4 AND session.fingerprint = $5
       AND session.terminal_reason IS NULL
+      AND (session.multipart_object_id IS NULL OR session.multipart_upload_id IS NOT NULL)
       AND session.write_lease_id = $10 AND session.write_lease_generation = $6
       AND session.checkpoint_revision = $7 AND session.checkpoint_offset = $8
       AND $9 > $8 AND $9 <= 8589934592

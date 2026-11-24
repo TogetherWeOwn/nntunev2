@@ -29,6 +29,15 @@ CREATE TABLE public.ingest_session_reservations (
     CHECK (terminal_reason IS NULL OR write_lease_id IS NULL),
     CHECK (checkpoint_generation IS NULL OR write_lease_generation IS NULL
            OR write_lease_generation = checkpoint_generation),
+    -- A committed object claim precedes CreateMultipartUpload. A null ID on
+    -- a claimed object means initiation may have run. Retain both on tombstones
+    -- for reconciliation. Each immutable object belongs to one session.
+    multipart_object_id UUID UNIQUE REFERENCES public.storage_object_intents (object_id),
+    multipart_bucket TEXT COLLATE "C" CHECK (multipart_bucket ~ '^[a-z0-9.-]{3,63}$'),
+    multipart_upload_id TEXT COLLATE "C" CHECK (octet_length(multipart_upload_id) BETWEEN 1 AND 4096
+                                             AND multipart_upload_id !~ '[^!-~]'),
+    CHECK ((multipart_object_id IS NULL) = (multipart_bucket IS NULL)),
+    CHECK (multipart_upload_id IS NULL OR multipart_object_id IS NOT NULL),
     -- The library identity is globally unique and its environment is immutable.
     UNIQUE (library_id, principal_id, idempotency_key)
 );

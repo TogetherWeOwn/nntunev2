@@ -3,6 +3,7 @@ use crate::multipart::{
     readback_inventory::CompletedReadbackInventory,
     resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
     session_completion::SessionCompletion,
+    session_upload::DurableUpload,
     sidecar::SidecarPut,
     Plan, UploadTarget,
 };
@@ -177,8 +178,22 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         envelope_scheme: 2,
     };
     let receipt = if mode.starts_with("part") || initiated.is_some() {
+        let durable_target = if mode == "part-durable-id" {
+            UploadTarget {
+                upload_id: "different-durable-id",
+                ..target
+            }
+        } else {
+            target
+        };
+        let durable_session = if mode == "part-durable-session" {
+            "different-session"
+        } else {
+            "fixture-session"
+        };
+        let durable = DurableUpload::new(durable_target, &context, durable_session, until);
         let uploaded = sender
-            .put_part(binding, &context, &part, until)
+            .put_part(binding, &context, &part, &durable, until)
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
         if mode.starts_with("part") {
