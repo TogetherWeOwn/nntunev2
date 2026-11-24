@@ -72,8 +72,8 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
 }
 
 /// Presence-preserving env lookup: `Some("")` for a present-but-empty
-/// var, `None` only when neither secret nor var exists. Used solely by
-/// the vault-KEK provisioning decision, where a blanked var (what a
+/// var, `None` only when neither secret nor var exists. Used for
+/// provisioning decisions where a blanked var (what a
 /// dashboard "clear this var" action leaves behind) must fail closed
 /// rather than read as absent.
 fn env_string_raw(env: &Env, name: &str) -> Option<String> {
@@ -257,6 +257,9 @@ pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
     )
     .ok()?
     .with_prior_keks(kek_set.priors);
+    if let Some(raw) = env_string_raw(env, "PRIVATE_LISTENING_COHORT") {
+        config.private_listening = Some(crate::private_listening::PrivateListening::parse(&raw)?);
+    }
     // Staging-only emailed-code retrieval seam (`POST /api/test-codes`):
     // armed ONLY by the explicit staging flag, and usable only with the
     // staged QA bearer. Both default off/absent, so production serves the
@@ -1012,6 +1015,7 @@ impl DriverErrorCode for tokio_postgres::Error {
 
 impl PgStore {
     #[cfg(target_arch = "wasm32")]
+    #[allow(dead_code)] // Not called by release reconciliation until activation.
     async fn store_reconcile_owned(
         &self,
         user_id: String,
@@ -1078,7 +1082,10 @@ impl PgStore {
         .map_err(|_| failed())
     }
 
+    // Native acceptance injects connection acquisition only. This entry is not
+    // wired to Store; its client stays inside the budgeted operation.
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
     async fn store_reconcile_owned(
         &self,
         user_id: String,
@@ -1837,6 +1844,7 @@ fn invite_from_row(row: &tokio_postgres::Row) -> Result<InviteRecord, StoreError
         revoked_by: row.try_get("revoked_by").map_err(|_| StoreError)?,
         window_id: row.try_get("window_id").map_err(|_| StoreError)?,
         issuer_email: row.try_get("issuer_email").ok().flatten(),
+        require_active_admin_issuer: false,
     })
 }
 
@@ -2234,6 +2242,16 @@ async fn complete_registration_on(
     // `query_opt`'s rule: exactly one parent row, else the claim fails.
     if parent.len() != 1 {
         return Err(StoreError);
+    }
+    if let Some(record) = invite.filter(|record| record.require_active_admin_issuer) {
+        let issuer = record.issued_by.as_deref().ok_or(StoreError)?;
+        let owner = transaction.query_typed(
+            "SELECT id FROM users WHERE id = $1 AND role = 'admin' AND deleting_at IS NULL FOR SHARE",
+            &[(&issuer, Type::TEXT)],
+        ).await.map_err(|_| StoreError)?;
+        if owner.len() != 1 {
+            return Err(StoreError);
+        }
     }
     let mut claims = vec![
         SingleUseClaim::Challenge {
@@ -4035,6 +4053,38 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 rows[0].try_get("target_id").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn private_listening_access(
+        &self,
+        user_id: &str,
+        owner_user_id: &str,
+        invite_ids: &[i64],
+    ) -> Result<bool, StoreError> {
+        Self::bounded(
+            async {
+                let client = self.connect().await?;
+                let rows = client
+                    .query_typed(
+                        crate::private_listening::ACCESS_SQL,
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&owner_user_id, Type::TEXT),
+                            (&invite_ids, Type::INT8_ARRAY),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.statement_failed("api.db.statement_failed.private_listening")
+                    })?;
+                let [row] = rows.as_slice() else {
+                    return Err(StoreError);
+                };
+                row.try_get(0).map_err(|_| StoreError)
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -6072,15 +6122,94 @@ impl Store for PgStore {
         .await
     }
 
+    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
     async fn store_reconcile_outcome(
         &self,
         user_id: &str,
         outcome: &crate::billing_reconcile::ReconcileOutcome,
     ) -> Result<(), StoreError> {
+        Self::bounded(
+            async {
+                let failed =
+                    || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
+                let mut client = self.connect().await?;
+                let transaction = client.transaction().await.map_err(|_| failed())?;
+                // One transaction under the per-user advisory lock: coverage
+                // advances monotonically while history inserts converge on
+                // the invoice id — duplicates and out-of-order replays land
+                // the same stored state.
+                transaction
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_lock_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                let row = &outcome.row;
+                transaction
+                    .query_typed(
+                        crate::billing_reconcile::store_reconciled_subscription_statement(),
+                        &[
+                            (&user_id, Type::TEXT),
+                            (&row.stripe_subscription_id, Type::TEXT),
+                            (&row.stripe_customer_id, Type::TEXT),
+                            (&row.stripe_item_id, Type::TEXT),
+                            (&row.stripe_price_id, Type::TEXT),
+                            (&row.plan_id, Type::TEXT),
+                            (&row.status, Type::TEXT),
+                            (&row.current_period_end_unix, Type::INT8),
+                            (&row.cancel_at_period_end, Type::BOOL),
+                            (&row.paid_through_unix, Type::INT8),
+                            (&row.paid_invoice_id, Type::TEXT),
+                            (&row.grace_until_unix, Type::INT8),
+                            (&outcome.read_anchor, Type::TEXT),
+                            (&outcome.read_plan, Type::TEXT),
+                            (&outcome.explicit_stale, Type::BOOL),
+                        ],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
+                for history in &outcome.history {
+                    let (starts, ends) = history.coverage_bounds();
+                    transaction
+                        .query_typed(
+                            crate::billing_reconcile::insert_paid_invoice_history_statement(),
+                            &[
+                                (&user_id, Type::TEXT),
+                                (&history.stripe_invoice_id, Type::TEXT),
+                                (&history.stripe_subscription_id, Type::TEXT),
+                                (&history.plan_id, Type::TEXT),
+                                (&history.period_start_unix, Type::INT8),
+                                (&history.period_end_unix, Type::INT8),
+                                (&history.amount_cents, Type::INT8),
+                                (&history.currency, Type::TEXT),
+                                (&history.paid_at_unix, Type::INT8),
+                                (&starts, Type::INT8_ARRAY),
+                                (&ends, Type::INT8_ARRAY),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| failed())?;
+                }
+                transaction.commit().await.map_err(|_| failed())?;
+                Ok(())
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    async fn store_reconcile_outcome(
+        &self,
+        user_id: &str,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        let user_id = user_id.to_owned();
+        let outcome = outcome.clone();
         self.store_reconcile_owned(
-            user_id.to_owned(),
-            outcome.clone(),
-            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            user_id,
+            outcome,
             crate::billing_transaction_sql::ReconcileProbe::None,
         )
         .await
@@ -8752,16 +8881,6 @@ mod tests {
             };
             assert_eq!(kind, "statement_failed", "unexpected db failure kind");
             let site = format!("self.statement_failed(\"{event}\")");
-            if operation == "store_reconcile_outcome" {
-                assert!(method.contains("self.store_reconcile_owned("));
-                let mut helpers = production.split("async fn store_reconcile_owned(").skip(1);
-                for target in ["WASM", "native"] {
-                    let (body, _) = helpers.next().unwrap().split_once("\n    }\n").unwrap();
-                    assert!(body.contains(&site), "{target} must emit {event}");
-                }
-                assert!(helpers.next().is_none());
-                continue;
-            }
             assert!(method.contains(&site), "{operation} must emit {event}");
         }
     }

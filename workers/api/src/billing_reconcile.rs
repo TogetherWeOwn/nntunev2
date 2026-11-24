@@ -295,6 +295,7 @@ fn qualify_line(
 }
 
 /// Fold a reconciliation snapshot without borrowing state from another subscription.
+#[allow(dead_code)] // The release caller stays on the legacy fold until activation.
 pub(crate) fn reconcile_exact_target(
     requested_id: &str,
     mut local: ReconcileInput,
@@ -1094,7 +1095,7 @@ pub fn store_reconciled_subscription_statement() -> &'static str {
 macro_rules! paid_invoice_coverage {
     () => {
         "(SELECT range_agg(tstzrange(to_timestamp(lo), to_timestamp(hi), '[)'))
-          FROM unnest($10::bigint[], $11::bigint[]) AS bounds(lo, hi))"
+                      FROM unnest($10::bigint[], $11::bigint[]) AS bounds(lo, hi))"
     };
 }
 pub(crate) use paid_invoice_coverage;
@@ -1108,9 +1109,10 @@ macro_rules! insert_paid_invoice_history {
              stripe_subscription_id, plan_id, period_start, period_end, amount_cents,
              currency, paid_at, covered_periods)
              VALUES ($1, $2, $3, $4, to_timestamp($5::bigint), to_timestamp($6::bigint),
-                     $7, $8, to_timestamp($9::bigint), ",
+                     $7, $8, to_timestamp($9::bigint),
+                     ",
             $crate::billing_reconcile::paid_invoice_coverage!(),
-            ")\n",
+            ")\n             ",
             $conflict
         )
     };
@@ -1124,10 +1126,10 @@ pub fn insert_paid_invoice_history_statement() -> &'static str {
     insert_paid_invoice_history!(
         "paid_invoice_history",
         "ON CONFLICT (stripe_invoice_id) DO UPDATE SET covered_periods = EXCLUDED.covered_periods
-         WHERE history.covered_periods IS NULL AND EXCLUDED.covered_periods IS NOT NULL
-           AND history.user_id = EXCLUDED.user_id
-           AND history.stripe_subscription_id = EXCLUDED.stripe_subscription_id
-           AND history.amount_cents > 0 AND history.currency = EXCLUDED.currency"
+             WHERE history.covered_periods IS NULL AND EXCLUDED.covered_periods IS NOT NULL
+               AND history.user_id = EXCLUDED.user_id
+               AND history.stripe_subscription_id = EXCLUDED.stripe_subscription_id
+               AND history.amount_cents > 0 AND history.currency = EXCLUDED.currency"
     )
 }
 

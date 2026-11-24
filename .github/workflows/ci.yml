@@ -734,6 +734,24 @@ jobs:
       - name: Run R2 snapshot spike gate 2 verdict tests
         run: python3 workers/mb/spike/test_bench.py
 
+  database-bootstrap-fixture:
+    name: database-bootstrap-fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prove synthetic run authorization and fixed diagnostics
+        run: exec python3 -B .github/scripts/test_database_bootstrap_admission.py
+      - name: Prove synthetic TLS, role isolation and teardown
+        id: bootstrap
+        run: exec python3 -B .github/scripts/test_database_bootstrap_isolation.py
+      - name: Require the post-teardown execution marker
+        env:
+          BOOTSTRAP_VERDICT: ${{ steps.bootstrap.outputs.verdict }}
+        run: test "$BOOTSTRAP_VERDICT" = passed
+
   # Real-Postgres migration tests: applies every migrations/*.sql, in order,
   # to an empty throwaway database (twice, to prove idempotency) and runs
   # workers/api/tests/sql/*.sql against it. The database is an ephemeral
@@ -786,7 +804,13 @@ jobs:
         run: bash workers/api/tests/test_storage_digest_target.sh
       - name: Check scratch migration runner offline
         run: bash workers/api/tests/test_migration_runner.sh
-      - run: bash workers/api/tests/run_migration_tests.sh
+      - name: Exercise first-launch catalog preflight on disposable PostgreSQL
+        run: python3 .github/scripts/test_database_bootstrap_preflight_postgres.py
+      - name: Run migration tests and verify the scoped reservation fixture
+        run: |
+          set -euo pipefail
+          bash workers/api/tests/run_migration_tests.sh | tee "$RUNNER_TEMP/migration-tests.log"
+          grep -Fxq 'test (hosted): ingest_session_reserve passed' "$RUNNER_TEMP/migration-tests.log"
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
       - name: Exercise hosted reservation race fixture
@@ -812,6 +836,15 @@ jobs:
           workspaces: workers/api
           key: api-postgres-acceptance
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Exercise protected playback lookup on disposable PostgreSQL
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci
+        run: |
+          test_name='storage_digest_read::postgres_tests::pins_require_authorization_and_live_committed_protection'
+          args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name")
+          inventory="$(cargo test "${args[@]}" -- --list --exact)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          cargo test "${args[@]}" -- --exact
       - name: Exercise ingest candidate adapter on disposable PostgreSQL
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
@@ -827,6 +860,8 @@ jobs:
           test_name='publisher::postgres_stages_completed_candidate_atomically'
           inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --list)"
           test "$(printf '%s\n' "$inventory" | grep -Fxc "$test_name: test")" -eq 1
+          psql "$NNTUNE_TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -c 'CREATE DATABASE nntune_catalogue_ci TEMPLATE nntune_ci'
+          export NNTUNE_TEST_DATABASE_URL=postgresql://postgres:ci-throwaway@localhost:5432/nntune_catalogue_ci
           cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --exact --ignored
       - name: Exercise listen history on disposable PostgreSQL
         env:
@@ -1685,11 +1720,11 @@ jobs:
           printf 'Locked Wrangler: %s\n' "$wrangler_version"
           test "$wrangler_version" = "$(node -p 'require("./apps/web/package.json").devDependencies.wrangler')"
           timeout 120 npx wrangler rollback 12345678-1234-1234-1234-123456789abc --name nntune-web --yes --help
-      - name: Exclude history instrumentation from ordinary output
+      - name: Exclude browser fixtures and YouTube sources from ordinary output
         run: |
           test -d .svelte-kit/output/client && test -d .svelte-kit/output/server
-          if grep -R -l -E '__nntuneHistoryFixture|acceptance-history-live-store' .svelte-kit/output/client .svelte-kit/output/server; then
-            echo 'Test-only history instrumentation found in ordinary output'
+          if grep -R -l -E '__nntuneHistoryFixture|acceptance-history-live-store|music-video-fixture|fixture0001|www\.youtube(-nocookie)?\.com' .svelte-kit/output/client .svelte-kit/output/server; then
+            echo 'Test-only browser fixtures or YouTube sources found in ordinary output'
             exit 1
           else
             result=$?
@@ -2175,7 +2210,7 @@ jobs:
   # names job IDs, not matrix legs: the web-e2e entry covers both shards.
   ci-ok:
     name: ci-ok
-    needs: [ci-commits, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds, changed-lines-mutation]
+    needs: [ci-commits, rust-test, rust-wasm, cargo-deny, worker-wasm-budget, test-nntp, billing-pool-fixture, api, fixture-check, nzb-guard, api-migrations, database-bootstrap-fixture, mb-import-etl, rust-mb, rust-ingest, rust-repair, repair-container, rust-transcode, transcode-container, mb-import, config-parity, dependabot-coverage, e2e-lint, svelte-check, vitest, web-build, web-e2e, web-a11y, history-fixture, public-text, binding-parity, migrations-gate, cache-policy, docs-links, production-secrets-shape, release-proof, cargo-pool, tail-projection, public-pr-security, worker-release-builds, changed-lines-mutation]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

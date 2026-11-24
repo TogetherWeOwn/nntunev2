@@ -14,8 +14,7 @@
 //! Signup lookup then resolves explicit expiry through a separately bounded
 //! best-effort audit, so audit failure cannot overwrite a completed denial.
 //! Hyperdrive RESETs pooled backends, so these races bound statements where
-//! they run. Billing reconciliation delegates to the owned, budgeted
-//! transaction.
+//! they run.
 //!
 //! Breaks caught: a new Store method that connects without the seam, a
 //! method that bounds an empty block while its statements run outside it,
@@ -275,6 +274,20 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .split_once("implSingleUseStoreforPgStore{")
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
+    let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
+    let prototype = format!("{prototype_gate}asyncfnstore_reconcile_outcome(");
+    let owned_body = function_body(store, &prototype);
+    assert!(owned_body.contains("self.store_reconcile_owned("));
+    let release_gate =
+        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
+    let legacy_body = function_body(
+        store,
+        &format!("{release_gate}asyncfnstore_reconcile_outcome("),
+    );
+    assert!(legacy_body.contains("store_reconciled_subscription_statement()"));
+    assert!(legacy_body.contains("insert_paid_invoice_history_statement()"));
+    assert!(!legacy_body.contains("store_reconcile_owned("));
+    let store = store.replacen(owned_body, "{}", 1);
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
@@ -296,19 +309,19 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             .iter()
             .filter(|&&n| n == "store_reconcile_outcome")
             .count(),
-        1
+        2
     );
-    for piece in pieces {
+    for gate in [prototype_gate, release_gate] {
+        assert_eq!(
+            store
+                .matches(&format!("{gate}asyncfnstore_reconcile_outcome("))
+                .count(),
+            1
+        );
+    }
+    for (index, piece) in pieces.iter().enumerate() {
         let name = method_name(piece);
-        if name == "store_reconcile_outcome" {
-            assert_eq!(
-                function_body(piece, name),
-                concat!(
-                    "{self.store_reconcile_owned(user_id.to_owned(),outcome.clone(),",
-                    "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]",
-                    "crate::billing_transaction_sql::ReconcileProbe::None,).await}"
-                )
-            );
+        if name == "store_reconcile_outcome" && pieces[index - 1].ends_with(prototype_gate) {
             continue;
         }
         if matches!(name, "like_delete" | "taste_delete") {

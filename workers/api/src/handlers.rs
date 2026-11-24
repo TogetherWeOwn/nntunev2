@@ -225,6 +225,7 @@ pub struct Config {
     pub prior_keks: Vec<(u32, [u8; 32])>,
     pub session_ttl_secs: u64,
     pub invites_required: bool,
+    pub(crate) private_listening: Option<crate::private_listening::PrivateListening>,
     /// Verify-only previous session HMAC secret: `Some` only inside a
     /// recorded rotation window, `None` in steady state. Never mints;
     /// length-checked like the primary (a short previous fails closed).
@@ -337,6 +338,7 @@ impl Config {
             prior_keks: Vec::new(),
             session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
             invites_required,
+            private_listening: None,
             session_previous_secret,
             native_rest_pepper: None,
             native_rest_pepper_version: 0,
@@ -820,6 +822,14 @@ pub trait Store {
         &self,
         email: &str,
     ) -> impl Future<Output = Result<Option<UserRecord>, StoreError>>;
+    fn private_listening_access(
+        &self,
+        _user_id: &str,
+        _owner_user_id: &str,
+        _invite_ids: &[i64],
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     fn insert_user(&self, user: &UserRecord) -> impl Future<Output = Result<(), StoreError>>;
     fn insert_challenge(
         &self,
@@ -3019,6 +3029,23 @@ where
         Ok(resp)
     }
 
+    async fn private_listening_deadline(&self, user_id: &str) -> Result<Option<u64>, Response> {
+        let Some(policy) = &self.cfg.private_listening else {
+            return Ok(None);
+        };
+        if self.now < policy.expires_at
+            && self
+                .store
+                .private_listening_access(user_id, &policy.owner_user_id, &policy.invite_ids)
+                .await
+                .map_err(|_| internal())?
+        {
+            return Ok(Some(policy.expires_at));
+        }
+        let error = crate::api_error::ApiError::forbidden("private listening access required");
+        Err(json_response(error.status, serde_json::json!(error)))
+    }
+
     /// Full request authentication: signed token + current server row via
     /// `verify_stored_session`, plus the CSRF origin pin for mutations.
     async fn authenticate(
@@ -3365,6 +3392,9 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
+    if ctx.cfg.private_listening.is_some() && body.invite_code.is_none() {
+        return generic_auth();
+    }
     // Invite pre-check (spec §6.3): when the signup page presents a
     // code, validate it — never consume it — before any signup row is
     // minted, so a bad code fails at the code step with the one
@@ -3408,6 +3438,14 @@ where
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
+        if ctx
+            .cfg
+            .private_listening
+            .as_ref()
+            .is_some_and(|policy| !policy.accepts_invite(&invite, ctx.now))
+        {
+            return generic_auth();
+        }
         // No user row exists yet: validate against a sentinel id that
         // can never equal an issuer, so the hash/spend/revoked/expiry/
         // email-bind/self-invite (by email) predicates all run; the
@@ -3714,7 +3752,10 @@ where
     // token intact for a corrected retry (the signup page stays on the
     // code step). Single-use is enforced by the conditional store claim,
     // not this snapshot. All claims and enrollment commit together.
-    let invite_redemption = if ctx.cfg.invites_required || body.invite_code.is_some() {
+    let invite_redemption = if ctx.cfg.invites_required
+        || ctx.cfg.private_listening.is_some()
+        || body.invite_code.is_some()
+    {
         // Atomic redemption budgets BEFORE the lookup, claimed as one
         // all-or-none pair: the per-client key (10/300s, keyed by client
         // prefix and account, per `auth::invite_attempt_allowed`) and
@@ -3759,6 +3800,14 @@ where
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
+        if ctx
+            .cfg
+            .private_listening
+            .as_ref()
+            .is_some_and(|policy| !policy.accepts_invite(&invite, ctx.now))
+        {
+            return generic_auth();
+        }
         // The snapshot prepare validates every refusal class with the
         // one generic error (unknown/expired/revoked/email-mismatch/
         // self-invite are indistinguishable) and stamps the spend the
@@ -3770,10 +3819,11 @@ where
             issuer_email: issuer_email.as_deref(),
             now: ctx.now,
         };
-        let prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
+        let mut prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
             Ok(prepared) => prepared,
             Err(_) => return generic_auth(),
         };
+        prepared.require_active_admin_issuer = ctx.cfg.private_listening.is_some();
         // The `invite.redeemed` audit rides the enrollment transaction
         // inside `complete_registration`, so it can never be separated
         // from the claim it records. It references the invite by row
@@ -3839,6 +3889,10 @@ where
     }
     ctx.audit(&user_id, "auth.register", true).await;
     match ctx.start_session(&user_id).await {
+        Ok(mut resp) if ctx.cfg.private_listening.is_some() => {
+            resp.body = serde_json::json!({"ok": true, "private_listening": true}).to_string();
+            resp
+        }
         Ok(resp) => resp,
         Err(resp) => resp,
     }
@@ -4342,7 +4396,7 @@ where
     // established state, and gating on credentials alone would lock
     // those members out the moment invites flip on, with
     // register/finish demanding an invite they never needed.
-    if ctx.cfg.invites_required {
+    if ctx.cfg.invites_required || ctx.cfg.private_listening.is_some() {
         match ctx.store.account_admitted(&record.user_id).await {
             Ok(false) => return generic_auth(),
             Ok(true) => {}
@@ -4673,15 +4727,12 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if let Some(user) = bearer {
-        if !user.is_empty() {
-            return Ok(user.to_string());
-        }
-    }
-    match ctx.authenticate(req, false).await {
-        Ok((claims, _token)) => Ok(claims.user_id),
-        Err(resp) => Err(resp),
-    }
+    let user_id = match bearer.filter(|user| !user.is_empty()) {
+        Some(user) => user.to_string(),
+        None => ctx.authenticate(req, false).await?.0.user_id,
+    };
+    ctx.private_listening_deadline(&user_id).await?;
+    Ok(user_id)
 }
 
 /// Serialize a catalogue page, failing closed on the (in practice
@@ -4741,6 +4792,9 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    if let Err(resp) = ctx.private_listening_deadline(&claims.user_id).await {
+        return resp;
+    }
     let mut response = catalogue_library_entries(ctx, &claims.user_id).await;
     if is_cookie && response.status == 200 {
         response
@@ -4992,6 +5046,10 @@ mod listen_history_controls;
 #[allow(dead_code)] // Prepared, with no production route or caller.
 #[path = "listen_history_receiver.rs"]
 mod listen_history_receiver;
+
+#[allow(dead_code)] // Callable only after a browser media route is admitted.
+#[path = "browser_playback_relay.rs"]
+mod browser_playback_relay;
 
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
@@ -6616,6 +6674,14 @@ where
 // cookie) but cannot mint until native bearer dispatch lands; the
 // heartbeat path is `Deny` in the scope map and never enters the gate.
 
+// Distinguishes private leases from paid leases when the cohort is disabled.
+const PRIVATE_PLAY_PREFIX: &str = "private_";
+
+fn is_private_play_id(play_id: &str) -> bool {
+    // Standard play ids encode 16 bytes in 22 unpadded base64url characters.
+    play_id.len() == PRIVATE_PLAY_PREFIX.len() + 22 && play_id.starts_with(PRIVATE_PLAY_PREFIX)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlayIssueBody {
@@ -6790,6 +6856,7 @@ where
     if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) {
         return Err(account_deleting_response());
     }
+    let private_deadline = ctx.private_listening_deadline(user_id).await?;
     // An unprovisioned (or too-short) secret fails closed before any
     // lease write: an unmintable grant must never burn a lease epoch or
     // displace the current holder.
@@ -6815,6 +6882,19 @@ where
     if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, "play").is_err() {
         return Err(validation_failed("invalid track_id"));
     }
+    if private_deadline.is_some()
+        && !ctx
+            .store
+            .catalogue_member_target(
+                user_id,
+                crate::target_identity::TargetKind::Track,
+                &body.track_id,
+            )
+            .await
+            .map_err(|_| internal())?
+    {
+        return Err(not_found());
+    }
     let lease = match ctx.store.playback_lease(user_id).await {
         Ok(row) => row,
         Err(_) => return Err(internal()),
@@ -6829,12 +6909,17 @@ where
     // fall through to new-start gates after a lost continuation.
     if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
         if row.is_continuation(&body.session_id, play_id, &body.track_id, ctx.now) {
+            if is_private_play_id(play_id) && private_deadline.is_none() {
+                return Err(not_found());
+            }
             if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, play_id).is_err()
             {
                 return Err(validation_failed("invalid play_id"));
             }
-            let lease_expires_at =
-                crate::playback::lease_expiry(ctx.now, row.continuation_deadline);
+            let deadline = row
+                .continuation_deadline
+                .min(private_deadline.unwrap_or(u64::MAX));
+            let lease_expires_at = crate::playback::lease_expiry(ctx.now, deadline);
             match ctx
                 .store
                 .touch_playback_lease(
@@ -6855,7 +6940,7 @@ where
                         play_id,
                         row.epoch,
                         ctx.now,
-                        row.continuation_deadline,
+                        deadline,
                     );
                 }
                 Ok(false) => {}
@@ -6870,6 +6955,13 @@ where
         let error =
             crate::api_error::ApiError::by_code("conflict", "playback lease no longer active");
         return Err(json_response(error.status, serde_json::json!(error)));
+    }
+    if private_deadline.is_some() {
+        let caps = crate::plan_limits::PlanCaps {
+            stream_seconds_month: 0,
+            max_concurrent_streams: 1,
+        };
+        return acquire_new_play(ctx, user_id, body, secret, caps, private_deadline).await;
     }
     // New start, gate 1: subscription. `now` saturates into i64 rather
     // than wrapping — an absurd clock reads as far-future (closed),
@@ -6927,20 +7019,39 @@ where
             ),
         ));
     }
-    // Gate 3: the lease. The play id is minted here, never taken from
-    // the client (a client-chosen fresh id could replay an old play
-    // and under-meter). The atomic acquire bumps the epoch in the
-    // store; `Held` is the other-session 429 with the live TTL.
-    let play_id = match random_id::<16>() {
+    acquire_new_play(ctx, user_id, body, secret, caps, None).await
+}
+
+async fn acquire_new_play<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    body: PlayIssueBody,
+    secret: &[u8],
+    caps: crate::plan_limits::PlanCaps,
+    private_deadline: Option<u64>,
+) -> Result<IssuedPlay, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // The per-account lease enforces one stream on either path. Only the
+    // server generates play ids for new starts.
+    let mut play_id = match random_id::<16>() {
         Ok(id) => id,
         Err(_) => return Err(unavailable()),
     };
+    if private_deadline.is_some() {
+        play_id.insert_str(0, PRIVATE_PLAY_PREFIX);
+    }
     let meta = ctx
         .store
         .track_meta(user_id, &body.track_id, true)
         .await
         .map_err(|_| internal())?;
-    let continuation_deadline = crate::playback::continuation_deadline(ctx.now, meta);
+    let continuation_deadline = crate::playback::continuation_deadline(ctx.now, meta)
+        .min(private_deadline.unwrap_or(u64::MAX));
     match ctx
         .store
         .acquire_playback_lease(
@@ -6997,6 +7108,10 @@ where
     if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
         return account_deleting_response();
     }
+    let private_deadline = match ctx.private_listening_deadline(&claims.user_id).await {
+        Ok(deadline) => deadline,
+        Err(response) => return response,
+    };
     // Same fail-closed secret gate as issuance: a misconfigured
     // deployment must not let heartbeats keep a lease alive that no
     // new grant could be minted against.
@@ -7028,10 +7143,14 @@ where
         ctx.now,
     );
     let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
+        if is_private_play_id(&body.play_id) && private_deadline.is_none() {
+            return not_found();
+        }
         let deadline = lease
             .as_ref()
             .expect("active lease has a row")
-            .continuation_deadline;
+            .continuation_deadline
+            .min(private_deadline.unwrap_or(u64::MAX));
         let expires = crate::playback::lease_expiry(ctx.now, deadline);
         match ctx
             .store
@@ -7211,7 +7330,7 @@ where
 /// remote subscription plus its paid invoices (every invoice read FULLY —
 /// line pagination is followed until exhausted, a first page is never
 /// the full invoice) and fold them into the store through the pure
-/// `billing_reconcile::reconcile_exact_target`. `Err(())` is a Stripe or
+/// `billing_reconcile::reconcile_subscription`. `Err(())` is a Stripe or
 /// store failure (the caller 500s so the delivery retries); fail-closed
 /// passes still persist their observed row and return `Ok` with the
 /// marker set, so the caller can alert and disable.
@@ -7240,12 +7359,16 @@ where
         .retrieve_subscription(subscription_id.to_string())
         .await
         .map_err(|_| ())?;
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+    let exact = ctx.store.webhook_ack_control();
+    #[cfg(not(all(target_arch = "wasm32", feature = "billing-owned-wasm-test")))]
+    let exact = false;
     if subscription.id != subscription_id {
         return Err(());
     }
     let input = ctx
         .store
-        .load_reconcile_input(user_id, Some(subscription_id))
+        .load_reconcile_input(user_id, exact.then_some(subscription_id))
         .await
         .map_err(|_| ())?;
     let listed = ctx
@@ -7302,9 +7425,12 @@ where
         invoices,
     };
     let now = billing_now_i64(ctx.now);
-    let outcome =
+    let outcome = if exact {
         crate::billing_reconcile::reconcile_exact_target(subscription_id, input, &remote, now)
-            .ok_or(())?;
+            .ok_or(())?
+    } else {
+        crate::billing_reconcile::reconcile_subscription(&input, &remote, now)
+    };
     ctx.store
         .store_reconcile_outcome(user_id, &outcome)
         .await
@@ -8806,8 +8932,6 @@ mod tests {
         billing_customers: RefCell<HashMap<String, String>>,
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
         remove_billing_row_after_read: std::cell::Cell<bool>,
-        release_live_slot_before_store: std::cell::Cell<bool>,
-        relabel_before_store: std::cell::Cell<bool>,
         reconcile_outcome_attempts: std::cell::Cell<usize>,
         // Displaced rows are retained without changing the per-user projection.
         billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
@@ -9623,6 +9747,26 @@ mod tests {
         ) -> Result<bool, StoreError> {
             self.delete_preference(user_id, kind, target, false)
         }
+        async fn private_listening_access(
+            &self,
+            user_id: &str,
+            owner_user_id: &str,
+            invite_ids: &[i64],
+        ) -> Result<bool, StoreError> {
+            let users = self.users.borrow();
+            let Some(user) = users.get(user_id) else {
+                return Ok(false);
+            };
+            Ok(user_id == owner_user_id
+                || self.invites.borrow().values().any(|invite| {
+                    invite_ids.contains(&invite.id)
+                        && invite.issued_by.as_deref() == Some(owner_user_id)
+                        && invite.redeemed_by.as_deref() == Some(user_id)
+                        && invite.email.as_deref() == Some(user.email.as_str())
+                        && invite.revoked_at.is_none()
+                }))
+        }
+
         async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
             Ok(self
                 .users
@@ -11299,8 +11443,7 @@ mod tests {
                 return Err(StoreError);
             }
             use crate::billing_store_classification::{
-                classify_explicit_stale, has_slot_suppression_proof, validate_history_target,
-                validate_read_provenance, validate_terminal_provenance, Target,
+                classify_explicit_stale, validate_history_target, Target,
             };
             validate_history_target(outcome).map_err(|_| StoreError)?;
             if outcome.explicit_stale {
@@ -11329,65 +11472,43 @@ mod tests {
             if !outcome.explicit_stale {
                 let mut rows = self.billing_rows.borrow_mut();
                 let mut shadow = self.billing_shadow.borrow_mut();
-                if self.release_live_slot_before_store.replace(false) {
-                    let holder = rows.get_mut(user_id).expect("live holder before release");
-                    assert_ne!(&holder.stripe_subscription_id, sub);
-                    assert_eq!(holder.status, "active");
-                    holder.status = "canceled".into();
-                }
-                if self.relabel_before_store.replace(false) {
-                    let row = rows.get_mut(user_id).unwrap();
-                    assert_eq!(outcome.read_plan.as_deref(), Some(PLAN_PLUS));
-                    assert_eq!(outcome.row.paid_through_unix, row.paid_through_unix);
-                    assert_eq!(outcome.row.status, "canceled");
-                    row.plan_id = PLAN_PRO.into();
-                }
-                let key = (user_id.to_string(), sub.clone());
+                let key = (
+                    user_id.to_string(),
+                    outcome.row.stripe_subscription_id.clone(),
+                );
                 let current = rows.get(user_id);
                 let stored = current
-                    .filter(|row| &row.stripe_subscription_id == sub)
+                    .filter(|row| row.stripe_subscription_id == outcome.row.stripe_subscription_id)
                     .or_else(|| shadow.get(&key));
-                validate_read_provenance(outcome, stored.is_some()).map_err(|_| StoreError)?;
+                let merged = merge_billing_row(stored, outcome);
+                // Mirrors `uq_subscriptions_live_slot`: a different live
+                // subscription holding the slot aborts the write before any
+                // row or history mutation.
                 let live = |status: &str| {
                     matches!(
                         status,
                         "incomplete" | "active" | "past_due" | "unpaid" | "paused"
                     )
                 };
-                let occupied = current
-                    .is_some_and(|row| &row.stripe_subscription_id != sub && live(&row.status));
-                if let Some(row) = stored {
-                    let target = Target::Owned {
-                        predicate_stale: false,
-                        other_live_holder: occupied,
-                        equal_end_provenance_changed: row.paid_through_unix.is_some()
-                            && row.paid_through_unix == outcome.row.paid_through_unix
-                            && (Some(row.plan_id.as_str()) != outcome.read_plan.as_deref()
-                                || row.paid_invoice_id != outcome.read_anchor),
-                    };
-                    validate_terminal_provenance(outcome, &target).map_err(|_| StoreError)?;
+                if current.is_some_and(|row| {
+                    row.stripe_subscription_id != merged.stripe_subscription_id
+                        && live(&row.status)
+                        && live(&merged.status)
+                }) {
+                    return Err(StoreError);
                 }
-                if occupied && live(&outcome.row.status) {
-                    if stored.is_none() || !has_slot_suppression_proof(outcome) {
-                        return Err(StoreError);
-                    }
-                } else if occupied {
-                    let merged = merge_billing_row(stored, outcome);
-                    shadow.insert(key, merged);
-                } else {
-                    let merged = merge_billing_row(stored, outcome);
-                    if let Some(existing) = current.filter(|row| &row.stripe_subscription_id != sub)
-                    {
+                if let Some(existing) = current {
+                    if existing.stripe_subscription_id != merged.stripe_subscription_id {
                         shadow.insert(
                             (user_id.to_string(), existing.stripe_subscription_id.clone()),
                             existing.clone(),
                         );
                     }
-                    if let Some(retained) = shadow.get_mut(&key) {
-                        *retained = merged.clone();
-                    }
-                    rows.insert(user_id.to_string(), merged);
                 }
+                if let Some(retained) = shadow.get_mut(&key) {
+                    *retained = merged.clone();
+                }
+                rows.insert(user_id.to_string(), merged);
             }
             let mut history = self.invoice_history.borrow_mut();
             for row in &outcome.history {
@@ -12706,53 +12827,6 @@ mod tests {
     }
 
     #[test]
-    fn billing_duplicate_checkout_refolds_equal_end_state() {
-        for status in ["active", "past_due", "canceled"] {
-            let mut h = stripe_harness();
-            seed_billing_user(&h, "u1");
-            let body = deliver_first_period(&h, "evt_test_1");
-            let rows = h.store.billing_rows.get_mut();
-            let ops = h.store.checkout_ops.get_mut();
-            let subscriptions = h.stripe.subscriptions.get_mut();
-            let terminal = status == "canceled";
-            if !terminal {
-                rows.get_mut("u1").unwrap().status = "trialing".into();
-            }
-            ops.get_mut("op_test_1").unwrap().state = "needs_reconcile".into();
-            subscriptions.get_mut("sub_test_1").unwrap().status = status.into();
-
-            let state = || h.store.checkout_ops.borrow()["op_test_1"].state.clone();
-            let deliver = || h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
-            let history = h.store.invoice_history.borrow().clone();
-            let mut expected = h.store.billing_rows.borrow()["u1"].clone();
-            if terminal {
-                let attempts = h.store.reconcile_outcome_attempts.get();
-                let ops = h.store.checkout_ops.borrow().clone();
-                h.store.relabel_before_store.set(true);
-                assert_eq!(deliver().status, 500);
-                assert_eq!(h.store.reconcile_outcome_attempts.get(), attempts + 1);
-                assert!(h.store.webhook_events.borrow().is_empty());
-                assert_eq!(*h.store.checkout_ops.borrow(), ops);
-                expected.plan_id = PLAN_PRO.into();
-                assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
-                assert!(h.store.billing_shadow.borrow().is_empty());
-                assert_eq!(*h.store.invoice_history.borrow(), history);
-            }
-            webhook_ok(&deliver());
-            let mut stored = h.store.billing_rows.borrow()["u1"].clone();
-            assert_eq!(
-                stored.grace_until_unix.take().is_some(),
-                status == "past_due"
-            );
-            expected.status = status.into();
-            assert_eq!(stored, expected);
-            assert_eq!(*h.store.invoice_history.borrow(), history);
-            assert_eq!(state(), "succeeded");
-            assert!(h.store.webhook_events.borrow().contains("evt_test_1"));
-        }
-    }
-
-    #[test]
     fn billing_webhook_out_of_order_invoices_never_regress() {
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
@@ -13740,12 +13814,6 @@ mod tests {
             read_anchor: None,
         };
         block_on(h.store.store_reconcile_outcome("u1", &fresh)).expect("fresh stores");
-        let mut terminal = stored_seed("free", "canceled", None, None, None);
-        terminal.history.push(history_row("in_unseen", BILLING_NOW));
-        assert!(block_on(h.store.store_reconcile_outcome("u1", &terminal)).is_err());
-        assert_eq!(h.store.billing_rows.borrow()["u1"], fresh.row);
-        assert!(h.store.billing_shadow.borrow().is_empty());
-        assert!(!h.store.invoice_history.borrow().contains_key("in_unseen"));
         let mut stale = crate::billing_reconcile::ReconcileOutcome {
             row: row(Some(BILLING_NOW), Some("in_test_1"), "active", None),
             history: vec![history_row("in_test_1", BILLING_NOW)],
@@ -13923,16 +13991,12 @@ mod tests {
                     let rows = h.store.billing_rows.borrow().clone();
                     let shadow = h.store.billing_shadow.borrow().clone();
                     let history = h.store.invoice_history.borrow().clone();
-                    let ops = h.store.checkout_ops.borrow().clone();
-                    let attempts = h.store.reconcile_outcome_attempts.get();
                     let case = format!("{a_status}/{b_status}/webhook={webhook}");
                     if webhook {
                         let body = checkout_completed_body("evt_b", "cs_b", false);
-                        for _ in 0..2 {
-                            let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
-                            assert_eq!(resp.status, 500, "{case}");
-                            assert!(h.store.webhook_events.borrow().is_empty(), "{case}");
-                        }
+                        let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
+                        assert_eq!(resp.status, 500, "{case}");
+                        assert!(h.store.webhook_events.borrow().is_empty(), "{case}");
                     } else {
                         // `ensure_checkout_session` refuses a live A before
                         // reaching its completed-session branch, so drive
@@ -13940,85 +14004,58 @@ mod tests {
                         let result = block_on(reconcile_checkout_session(&h.ctx(), "cs_b"));
                         assert_eq!(result, Err(()), "{case}");
                     }
-                    assert_eq!(
-                        h.store.reconcile_outcome_attempts.get() - attempts,
-                        if webhook { 2 } else { 1 },
-                        "{case}: refusal must come from persistence"
-                    );
                     let op = block_on(h.store.checkout_operation_by_id("op_b"))
                         .expect("op lookup")
                         .expect("op stored");
                     assert_eq!(op.state, "submitted", "{case}: not succeeded");
-                    assert_eq!(*h.store.checkout_ops.borrow(), ops, "{case}");
                     assert_eq!(*h.store.billing_rows.borrow(), rows, "{case}");
                     assert_eq!(*h.store.billing_shadow.borrow(), shadow, "{case}");
                     assert_eq!(*h.store.invoice_history.borrow(), history, "{case}");
                     assert_eq!(*h.stripe.sessions_created.borrow(), 0, "{case}");
-                    if (a_status, b_status, webhook) == ("active", "active", false) {
-                        assert_billing_retry_after_fold(&h, end + BILLING_PERIOD);
-                    }
                 }
             }
         }
     }
 
-    fn assert_billing_retry_after_fold(h: &Harness, end: i64) {
-        let mut canceled = h.store.billing_rows.borrow()["u1"].clone();
-        canceled.status = "canceled".into();
-        h.store.release_live_slot_before_store.set(true);
-        let outcome = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_b"))
-            .expect("slot released after fresh fold accepts exact target");
-        assert_eq!(
-            h.store.billing_shadow.borrow()[&("u1".into(), "sub_test_1".into())],
-            canceled
-        );
-        assert!(!outcome.disable_new_purchases());
-        assert_eq!((outcome.read_anchor, outcome.read_plan), (None, None));
-        let mut expected = stored_seed(PLAN_PLUS, "active", Some(end), Some("in_b"), None).row;
-        expected.stripe_subscription_id = "sub_b".into();
-        assert_eq!(outcome.row, expected);
-        assert_eq!(h.store.billing_rows.borrow()["u1"], expected);
-        let history = h.store.invoice_history.borrow();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history["in_b"].stripe_subscription_id, "sub_b");
-    }
-
     #[test]
     fn billing_shadow_preserves_per_user_projection() {
         let h = stripe_harness();
-        seed_billing_user(&h, "u1");
-        let mut first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
-        first.row.stripe_subscription_id = "sub_holder".into();
+        let first = stored_seed(PLAN_PLUS, "active", Some(BILLING_NOW), Some("in_1"), None);
         block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
         let mut second = first.clone();
         second.row.stripe_subscription_id = "sub_second".into();
         block_on(h.store.store_reconcile_outcome("u2", &second)).unwrap();
-        let rows = h.store.billing_rows.borrow().clone();
-        h.stripe.subscriptions.borrow_mut().insert(
-            "sub_test_1".into(),
-            test_subscription("sub_test_1", "cus_test_1", "canceled", PRICE_PLUS),
-        );
-        let terminal = block_on(reconcile_remote_subscription(&h.ctx(), "u1", "sub_test_1"))
-            .expect("new terminal target beside live holder");
-        assert_eq!((terminal.read_plan, terminal.read_anchor), (None, None));
-        assert_eq!(
-            terminal.row,
-            stored_seed("free", "canceled", None, None, None).row
-        );
-        assert_eq!(*h.store.billing_rows.borrow(), rows);
-        let shadow = h.store.billing_shadow.borrow().clone();
-        assert_eq!(shadow.len(), 1);
-        assert_eq!(shadow[&("u1".into(), "sub_test_1".into())], terminal.row);
-        assert!(h.store.invoice_history.borrow().is_empty());
 
-        // A proven live fold beside the holder records only its own history.
-        let body = deliver_first_period(&h, "evt_other");
-        webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
-        assert_eq!(*h.store.billing_rows.borrow(), rows);
-        assert_eq!(*h.store.billing_shadow.borrow(), shadow);
-        let history = h.store.invoice_history.borrow();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history["in_test_1"].stripe_subscription_id, "sub_test_1");
+        let mut replacement = stored_seed(PLAN_PLUS, "canceled", None, None, None);
+        replacement.row.stripe_subscription_id = "sub_other".to_string();
+        block_on(h.store.store_reconcile_outcome("u1", &replacement)).unwrap();
+        assert!(
+            live_for(&h, "u1").is_none(),
+            "terminal projection remains hidden"
+        );
+        assert_eq!(
+            live_for(&h, "u2").unwrap().stripe_subscription_id,
+            "sub_second"
+        );
+        let shadow = h.store.billing_shadow.borrow();
+        let displaced = &shadow[&(String::from("u1"), String::from("sub_test_1"))];
+        assert_eq!(displaced.status, "active");
+        assert_eq!(displaced.paid_through_unix, Some(BILLING_NOW));
+        assert_eq!(displaced.paid_invoice_id.as_deref(), Some("in_1"));
+        assert_eq!(shadow.len(), 1);
+        drop(shadow);
+
+        block_on(h.store.store_reconcile_outcome("u1", &first)).unwrap();
+        assert_eq!(
+            live_for(&h, "u1").unwrap().stripe_subscription_id,
+            "sub_test_1"
+        );
+        let shadow = h.store.billing_shadow.borrow();
+        assert_eq!(
+            shadow[&(String::from("u1"), String::from("sub_other"))].status,
+            "canceled"
+        );
+        assert_eq!(shadow.len(), 2);
     }
 
     #[test]
@@ -14232,33 +14269,20 @@ mod tests {
         };
         let submitted = op();
         assert_eq!(submitted.state, "submitted");
-        let return_id = |id: &str| {
-            let mut responses = h.stripe.subscriptions.borrow_mut();
-            responses.get_mut("sub_test_1").unwrap().id = id.into();
-        };
-        for wrong_id in [false, false, true] {
+        for _ in 0..2 {
             block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
-            h.store.remove_billing_row_after_read.set(!wrong_id);
-            if wrong_id {
-                return_id("sub_wrong");
-            }
-            let attempts = h.store.reconcile_outcome_attempts.get();
+            h.store.remove_billing_row_after_read.set(true);
             assert_eq!(deliver("evt_row6").status, 500);
-            assert_eq!(
-                h.store.reconcile_outcome_attempts.get() - attempts,
-                if wrong_id { 0 } else { 1 }
-            );
             assert!(!h.store.remove_billing_row_after_read.get());
             assert!(!h.store.webhook_events.borrow().contains("evt_row6"));
             assert_eq!(op(), submitted);
             assert_eq!(h.store.checkout_ops.borrow().len(), 1);
-            let rows = wrong_id.then(|| ("u1".to_string(), seed.row.clone()));
-            assert_eq!(*h.store.billing_rows.borrow(), HashMap::from_iter(rows));
+            assert!(h.store.billing_rows.borrow().is_empty());
             assert!(h.store.billing_shadow.borrow().is_empty());
             assert!(h.store.invoice_history.borrow().is_empty());
         }
-        // The own target is restored; correcting the returned ID permits retry.
-        return_id("sub_test_1");
+        // An independently restored own target makes that stale fold safe to retry.
+        block_on(h.store.store_reconcile_outcome("u1", &seed)).unwrap();
         for _ in 0..2 {
             let attempts = h.store.reconcile_outcome_attempts.get();
             webhook_ok(&deliver("evt_row6"));
@@ -14281,13 +14305,8 @@ mod tests {
         let mut b = stored_seed(PLAN_PLUS, "active", Some(200), Some("in_200"), None);
         b.row.stripe_subscription_id = "sub_other".into();
         let mut stale = a.clone();
-        stale.read_plan = Some(a.row.plan_id.clone());
-        stale.read_anchor = a.row.paid_invoice_id.clone();
         stale.row.paid_through_unix = Some(50);
-        let mut replay = b.clone();
-        replay.read_plan = Some(b.row.plan_id.clone());
-        replay.read_anchor = b.row.paid_invoice_id.clone();
-        for row in [&a, &b, &stale, &replay] {
+        for row in [&a, &b, &stale, &b] {
             block_on(h.store.store_reconcile_outcome("u1", row)).unwrap();
         }
         let select = |user, target| {
@@ -14338,7 +14357,7 @@ mod tests {
     #[test]
     fn billing_shadow_retains_rows_across_repeated_displacement() {
         let h = stripe_harness();
-        let mut a = stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_100"), Some(10));
+        let a = stored_seed(PLAN_PLUS, "canceled", Some(100), Some("in_100"), Some(10));
         let mut b = stored_seed(PLAN_PLUS, "canceled", None, None, None);
         b.row.stripe_subscription_id = "sub_other".to_string();
         let mut other = a.clone();
@@ -14351,9 +14370,6 @@ mod tests {
         put("u1", &a);
         put("u2", &other);
         put("u1", &b);
-        a.read_plan = Some(a.row.plan_id.clone());
-        a.read_anchor = a.row.paid_invoice_id.clone();
-        b.read_plan = Some(b.row.plan_id.clone());
         assert!(live_for(&h, "u1").is_none());
         let before_rows = h.store.billing_rows.borrow().clone();
         let before_shadow = h.store.billing_shadow.borrow().clone();
@@ -14419,8 +14435,6 @@ mod tests {
             let h = stripe_harness();
             let stored = stored_seed(PLAN_PLUS, stored_status, Some(100), Some("in_100"), None);
             let mut incoming = stored.clone();
-            incoming.read_plan = Some(stored.row.plan_id.clone());
-            incoming.read_anchor = stored.row.paid_invoice_id.clone();
             incoming.row.status = incoming_status.into();
             incoming.row.paid_through_unix = Some(50);
             for outcome in [&stored, &b, &incoming] {
@@ -14459,9 +14473,6 @@ mod tests {
                 Some("in_new"),
                 Some(20),
             );
-            if matches!(case, "read-plan" | "read-anchor") {
-                incoming.row.status = "active".into();
-            }
             incoming.row.stripe_customer_id = "cus_new".into();
             incoming.row.stripe_item_id = "si_new".into();
             incoming.row.stripe_price_id = "price_new".into();
@@ -19194,6 +19205,128 @@ mod tests {
             req,
             &headers,
         ))
+    }
+
+    #[test]
+    fn browser_relay_requires_the_exact_cookie_lease_token_and_duration() {
+        use super::browser_playback_relay::{relay, BrowserGrant, StreamGet};
+        use crate::{meter_sink::TrackMeterMeta, play_grant::IssuedGrant, playback::LeaseRow};
+        let mut h = harness();
+        h.config = cfg().with_play_grant_secret(b"test only, not a deployed secret".to_vec());
+        let mut ctx = h.ctx();
+        ctx.now = 199;
+        let (user_id, track_id, play_id) =
+            ("user-1", "22222222-2222-2222-2222-222222222222", "play-7");
+        seed_user(&h, user_id, "play@example.com");
+        let start_session = |id| block_on(ctx.start_session(id)).unwrap().set_cookie.unwrap();
+        let cookie = start_session(user_id);
+        let token = IssuedGrant {
+            token: include_str!("../../../fixtures/play-grant/browser-rendition.token").into(),
+            exp_unix: 200,
+        };
+        let lease = LeaseRow {
+            session_id: "tab-1".into(),
+            track_id: track_id.into(),
+            play_id: play_id.into(),
+            epoch: 42,
+            expires_at: ctx.now + 45,
+            continuation_deadline: ctx.now + 120,
+        };
+        let req = Request {
+            method: "GET".into(),
+            path: format!("/v1/plays/media/{track_id}/tab-1/{play_id}"),
+            cookie: Some(cookie),
+            origin: None,
+            authorization: None,
+            stripe_signature: None,
+            body: vec![],
+        };
+        let (claims, _) = block_on(ctx.authenticate(&req, false)).unwrap();
+        let binding = session_binding(&claims);
+        let receipt = BrowserGrant {
+            user_id,
+            session_binding: &binding,
+            lease: &lease,
+            artifact_sha256: "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734",
+            duration_ms: 60_000.try_into().unwrap(),
+            grant: &token,
+        };
+        let leases = &h.store.playback_leases;
+        leases.borrow_mut().insert(user_id.into(), lease.clone());
+        let meta = TrackMeterMeta {
+            track_duration_ms: Some(60_000),
+            bitrate_kbps: Some(1_000),
+            ..Default::default()
+        };
+        let key = (user_id.to_owned(), track_id.to_owned());
+        h.store.meter_meta.borrow_mut().insert(key.clone(), meta);
+        assert_eq!(block_on(handle(&ctx, &req)).status, 404);
+        let range = Some("bytes=2-7");
+        block_on(relay(
+            &ctx,
+            &req,
+            Some(&receipt),
+            Some("same-origin"),
+            range,
+            async |upstream: StreamGet<'_>| {
+                assert_eq!(upstream.path, format!("/play/{track_id}"));
+                assert!(upstream.authorization == crate::play_grant::bearer(&token.token));
+                assert_eq!(upstream.range, range);
+            },
+        ))
+        .unwrap();
+
+        let refused = |req: &Request, receipt: Option<&BrowserGrant<'_>>, site: Option<&str>| {
+            let result: Result<(), Response> =
+                block_on(relay(&ctx, req, receipt, site, range, async |_| {
+                    panic!("refusal contacted the receiver")
+                }));
+            assert_eq!(result.unwrap_err().status, 404);
+        };
+        refused(&req, None, Some("same-origin"));
+        refused(&req, Some(&receipt), Some("same-site"));
+
+        seed_user(&h, "other-user", "other@example.com");
+        for id in [user_id, "other-user"] {
+            let mut stale = req.clone();
+            stale.cookie = Some(start_session(id));
+            refused(&stale, Some(&receipt), Some("same-origin"));
+        }
+        for component in [track_id, "tab-1", play_id] {
+            let mut different = req.clone();
+            different.path = req.path.replace(component, "other");
+            refused(&different, Some(&receipt), Some("same-origin"));
+        }
+        let refused_grant =
+            |grant: &BrowserGrant<'_>| refused(&req, Some(grant), Some("same-origin"));
+        refused_grant(&BrowserGrant {
+            artifact_sha256: &"a".repeat(64),
+            ..receipt
+        });
+        refused_grant(&BrowserGrant {
+            grant: &IssuedGrant {
+                exp_unix: ctx.now,
+                ..token.clone()
+            },
+            ..receipt
+        });
+        let newer = LeaseRow {
+            epoch: lease.epoch + 1,
+            ..lease.clone()
+        };
+        leases.borrow_mut().insert(user_id.into(), newer.clone());
+        refused_grant(&receipt);
+        assert_eq!(leases.borrow()[user_id], newer);
+        leases.borrow_mut().insert(user_id.into(), lease.clone());
+        let missing_duration = TrackMeterMeta {
+            track_duration_ms: None,
+            ..meta
+        };
+        h.store
+            .meter_meta
+            .borrow_mut()
+            .insert(key, missing_duration);
+        refused_grant(&receipt);
     }
 
     #[test]
@@ -24246,9 +24379,8 @@ mod tests {
         assert_eq!(h.store.audits.borrow().len(), audits_before);
     }
 
-    /// One full passkey signup (start + finish) presenting `invite_code`
-    /// at finish only, mirroring the signup page's code step. Returns
-    /// the finish response and the user id minted at start.
+    /// One full passkey signup. Private listening requires invite pre-check
+    /// at start. Returns the finish response and the user id minted at start.
     fn signup_with_invite(
         h: &Harness,
         email: &str,
@@ -24256,11 +24388,12 @@ mod tests {
         cose_seed: u8,
         invite_code: Option<&str>,
     ) -> (Response, String) {
-        let start = h.call(
-            "POST",
-            "/v1/auth/passkey/register/start",
-            serde_json::json!({"email": email}),
-        );
+        let start_body = if h.config.private_listening.is_some() {
+            serde_json::json!({"email": email, "invite_code": invite_code})
+        } else {
+            serde_json::json!({"email": email})
+        };
+        let start = h.call("POST", "/v1/auth/passkey/register/start", start_body);
         assert_eq!(start.status, 200, "{}", start.body);
         let start: serde_json::Value = serde_json::from_str(&start.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
@@ -24282,6 +24415,106 @@ mod tests {
             }),
         );
         (resp, user_id)
+    }
+
+    #[test]
+    fn private_listening_redeems_owner_invite_and_fences_library_and_playback() {
+        use serde_json::{json, Value};
+        let mut h = play_harness();
+        let owner = seed_admin(&h, "owner", "owner@example.test");
+        seed_user(&h, "outsider", "outsider@example.test");
+        let outsider = magic_login(&h, "outsider@example.test");
+        let invited_email = "friend@example.test";
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(json!({"email": invited_email}).to_string()),
+            Some(owner.clone()),
+            Some(ORIGIN),
+        );
+        let selected: Value = serde_json::from_str(&issued.body).unwrap();
+        let code = selected["code"].as_str().unwrap();
+        let expires_at = NOW + 30;
+        h.config.private_listening = crate::private_listening::PrivateListening::parse(&json!({
+            "owner_user_id": "owner", "invite_ids": [selected["invite"]["id"]], "expires_at": expires_at
+        }).to_string());
+        assert!(h.config.private_listening.is_some());
+        let start = |body: Value| h.call("POST", "/v1/auth/passkey/register/start", body);
+        let mail_before = h.mailer.sent.borrow().len();
+        for body in [
+            json!({"email": "public@example.test"}),
+            json!({"email": "wrong@example.test", "invite_code": code}),
+        ] {
+            assert_eq!(start(body).status, 401);
+        }
+        assert_eq!(h.mailer.sent.borrow().len(), mail_before);
+        assert_eq!(h.store.users.borrow().len(), 2);
+
+        let (finish, friend_id) =
+            signup_with_invite(&h, invited_email, b"fixture-private-cred", 21, Some(code));
+        assert_eq!(finish.body, r#"{"ok":true,"private_listening":true}"#);
+        let friend = cookie_of(&finish);
+        assert_eq!(
+            start(json!({"email": invited_email, "invite_code": code})).status,
+            401
+        );
+        seed_library(&h, &friend_id);
+        let library =
+            |path: &str, cookie: Option<String>| h.call_full("GET", path, None, cookie, None);
+        for path in ["/api/library", "/v1/library"] {
+            assert_eq!(library(path, None).status, 401);
+            assert_eq!(library(path, Some(outsider.clone())).status, 403);
+            assert_eq!(library(path, Some(owner.clone())).status, 200);
+            assert_eq!(library(path, Some(friend.clone())).status, 200);
+        }
+        assert!(h.config.stripe_secret_key.is_none() && h.config.stripe_webhook_secret.is_none());
+        assert!(
+            h.store.playback_subscriptions.borrow().is_empty()
+                && h.store.invoice_history.borrow().is_empty()
+        );
+        let play = json!({"track_id": CAT_REC_A, "session_id": "tab"});
+        assert_eq!(play_call(&h, &outsider, play.clone()).status, 403);
+        assert_eq!(play_call(&h, &owner, play.clone()).status, 404);
+        let issued = play_call(&h, &friend, play.clone());
+        assert_eq!(issued.status, 200);
+        let conflict = play_call(
+            &h,
+            &friend,
+            json!({"track_id": CAT_REC_A, "session_id": "other-tab"}),
+        );
+        assert_eq!(conflict.status, 429);
+        assert!(conflict
+            .extra_headers
+            .contains(&("x-plan-limit".into(), "concurrent_streams=1".into())));
+        let state: Value = serde_json::from_str(&issued.body).unwrap();
+        assert_eq!(state["expires_at"], expires_at);
+        let renewal =
+            json!({"track_id": CAT_REC_A, "session_id": "tab", "play_id": state["play_id"]});
+        let heartbeat = |h: &Harness| {
+            h.call_full(
+            "POST", "/v1/plays/heartbeat",
+            Some(json!({"session_id": "tab", "play_id": state["play_id"], "lease_epoch": state["lease_epoch"]}).to_string()),
+            Some(friend.clone()), Some(ORIGIN),
+        )
+        };
+        assert_eq!(heartbeat(&h).status, 200);
+        h.config
+            .private_listening
+            .as_mut()
+            .unwrap()
+            .invite_ids
+            .clear();
+        assert_eq!(
+            h.call_full("GET", "/api/library", None, Some(friend.clone()), None)
+                .status,
+            403
+        );
+        assert_eq!(play_call(&h, &friend, renewal.clone()).status, 403);
+        assert_eq!(heartbeat(&h).status, 403);
+        h.config.private_listening = None;
+        assert_eq!(play_call(&h, &friend, renewal).status, 404);
+        assert_eq!(heartbeat(&h).status, 404);
+        assert_eq!(play_call(&h, &friend, play).status, 402);
     }
 
     fn audits_with_action(h: &Harness, action: &str) -> Vec<vault::AuditEvent> {

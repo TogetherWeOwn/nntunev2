@@ -248,6 +248,9 @@ describe("verifyPromotion", () => {
     "        ]",
     "        if scenario == \"bad-step-order\":",
     "            steps[1][1], steps[2][1] = steps[2][1], steps[1][1]",
+    '        smoke_conclusion = "success"',
+    '        if scenario.startswith("final-smoke-"):',
+    '            smoke_conclusion = scenario.removeprefix("final-smoke-")',
     "        jobs = []",
     "        if scenario != \"missing-job\":",
     "            jobs = [{",
@@ -255,7 +258,8 @@ describe("verifyPromotion", () => {
     "                \"run_id\": int(run_id), \"run_attempt\": int(attempt),",
     '                \"status\": \"completed\", \"conclusion\": \"success\",',
     "                \"steps\": [{\"name\": name, \"status\": \"completed\",",
-    '                    \"conclusion\": \"success\", \"number\": number}',
+    '                    \"conclusion\": smoke_conclusion if name == \"Verify production serves the promoted build\" else \"success\",',
+    '                    \"number\": number}',
     "                    for name, number in steps],",
     "            }]",
     "        return respond({\"total_count\": len(jobs), \"jobs\": jobs})",
@@ -351,6 +355,15 @@ describe("verifyPromotion", () => {
       /must succeed in order/,
     );
   });
+
+  for (const conclusion of ["failure", "skipped", "cancelled"]) {
+    it(`refuses ${conclusion} final smoke despite a green deploy job and valid receipt`, () => {
+      assert.throws(
+        () => withFakeGithub(`final-smoke-${conclusion}`, () => verifyPromotion({ repo: REPO, sha: SHA })),
+        /actual promotion, identity-aware smoke and receipt steps must succeed in order/,
+      );
+    });
+  }
 
   it("refuses a run that was not a manual dispatch", () => {
     assert.throws(
