@@ -20,7 +20,9 @@ WITH locked AS MATERIALIZED (
             WHEN observed.ts >= LEAST(observed.idle_deadline, observed.absolute_deadline) THEN 'expired'
             ELSE 'aborted'
         END,
-        terminal_at = observed.ts
+        terminal_at = observed.ts,
+        write_lease_id = NULL,
+        write_lease_generation = NULL
     FROM observed
     WHERE session.id = observed.id AND session.terminal_reason IS NULL
       AND ($5 = 'abort' OR observed.ts >= LEAST(observed.idle_deadline, observed.absolute_deadline))

@@ -20,6 +20,13 @@ CREATE TABLE public.ingest_session_reservations (
     CHECK (checkpoint_revision BETWEEN 0 AND checkpoint_offset),
     CHECK ((checkpoint_revision = 0) = (checkpoint_offset = 0)),
     CHECK ((checkpoint_revision = 0) = (checkpoint_generation IS NULL)),
+    -- A single writer at the current checkpoint revision and session deadlines.
+    write_lease_id UUID,
+    write_lease_generation UUID,
+    CHECK ((write_lease_id IS NULL) = (write_lease_generation IS NULL)),
+    CHECK (terminal_reason IS NULL OR write_lease_id IS NULL),
+    CHECK (checkpoint_generation IS NULL OR write_lease_generation IS NULL
+           OR write_lease_generation = checkpoint_generation),
     -- The library identity is globally unique and its environment is immutable.
     UNIQUE (library_id, principal_id, idempotency_key)
 );
