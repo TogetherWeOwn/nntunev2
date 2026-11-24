@@ -297,6 +297,7 @@ jobs:
 
           [env.staging]
           name = "nntune-api-staging"
+          compatibility_flags = ["enable_request_signal"]
 
           # Same-host split: this Worker serves /v1/*, /healthz, the
           # GET /api/library legacy alias (same entries as /v1/library),

@@ -1087,6 +1087,8 @@ lowercase hex root key on `nntune-stream-staging` in Worker secret custody. Shar
 `PRIVATE_PLAYBACK_CUSTODY_SECRET` with the staging API only, independently
 of `PLAY_GRANT_SECRET`. Keep the upload writer's credentials separate.
 Arm `PRIVATE_PLAYBACK_STAGING_ENABLED=true` and the private journey together.
+Before accepting the trial, verify a browser disconnect through the relay
+closes the upstream read and settles only the acknowledged byte prefix.
 Retain the version ID, deployment ID, `BUILD_SHA` and playback mode from
 the Stream job summary alongside the browser run. To restore the default,
 keep `STREAM_STAGING_DEPLOY_ENABLED=true` for the next protected deploy.

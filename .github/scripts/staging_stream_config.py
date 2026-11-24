@@ -46,6 +46,7 @@ def render(source, env):
         '[[migrations]]', 'tag = "v1"', 'new_sqlite_classes = ["NntpPool"]', "",
         '[env.staging]', 'name = "nntune-stream-staging"',
         "workers_dev = false", "preview_urls = false", "",
+        'compatibility_flags = ["enable_request_signal"]',
         '[env.staging.vars]',
         f'PRIVATE_PLAYBACK_ENABLED = {json.dumps("true" if enabled == "true" else "false")}',
     ]
@@ -56,6 +57,7 @@ def render(source, env):
             if len(value) > 253 or not re.fullmatch(pattern, value):
                 raise ValueError(f"{key} must name the dedicated staging setting")
             lines.append(f"PRIVATE_PLAYBACK_{name} = {json.dumps(value)}")
+        lines.extend(("", "[env.staging.limits]", "subrequests = 132000"))
     for group, entries in bindings.items():
         if group == "name":
             continue

@@ -258,6 +258,8 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
     tree, wdir = fixture(base, worker, f"tree-{tag}")
     config = generate(worker, gen_script, wdir, env, summary_env, label)
     assert_no_build(config, label)
+    if worker in ("api", "stream"):
+        check("enable_request_signal" in config["env"]["staging"]["compatibility_flags"], f"{label}: request cancellation missing")
     if worker == "stream":
         stage = config["env"].get("staging", {})
         check(set(config["env"]) == {"staging"} and config["name"] == stage.get("name") == "nntune-stream-staging",
@@ -266,6 +268,7 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
                   for scope in (config, stage)), f"{label}: Stream must be internal")
         check(stage["vars"].get("PRIVATE_PLAYBACK_ENABLED") == ("true" if mirror else "false"),
               f"{label}: private playback does not match the requested mode")
+        check(stage.get("limits") == ({"subrequests": 132000} if mirror else None), f"{label}: Stream subrequest budget mismatch")
     if worker == "api":
         summary = Path(summary_env["GITHUB_STEP_SUMMARY"]).read_text()
         staging = config["env"]["staging"]
