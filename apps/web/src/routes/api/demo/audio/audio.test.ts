@@ -15,6 +15,9 @@ describe('demo audio route', () => {
 		const response = await getAudio();
 
 		expect(response.status).toBe(200);
+		expect(response.headers.get('content-type')).toBe('audio/wav');
+		expect(response.headers.get('cache-control')).toMatch(/^private/);
+		expect(response.headers.get('cache-control')).not.toContain('immutable');
 		expect(response.headers.get('content-range')).toBeNull();
 		expect(response.headers.get('content-length')).toBe(String(MEDIA_BYTES));
 		expect((await response.arrayBuffer()).byteLength).toBe(MEDIA_BYTES);
@@ -25,7 +28,11 @@ describe('demo audio route', () => {
 
 		expect(response.status).toBe(206);
 		expect(response.headers.get('content-range')).toBe(`bytes 0-99/${MEDIA_BYTES}`);
-		expect((await response.arrayBuffer()).byteLength).toBe(100);
+		const body = await response.arrayBuffer();
+		expect(body.byteLength).toBe(100);
+		const decoder = new TextDecoder();
+		expect(decoder.decode(body.slice(0, 4))).toBe('RIFF');
+		expect(decoder.decode(body.slice(8, 12))).toBe('WAVE');
 	});
 
 	it('returns a partial response for a middle range', async () => {
@@ -34,7 +41,10 @@ describe('demo audio route', () => {
 		expect(response.status).toBe(206);
 		expect(response.headers.get('content-range')).toBe(`bytes 1000-1099/${MEDIA_BYTES}`);
 		expect(response.headers.get('content-length')).toBe('100');
-		expect((await response.arrayBuffer()).byteLength).toBe(100);
+		const body = await response.arrayBuffer();
+		expect(body.byteLength).toBe(100);
+		// Offset 1000 starts at PCM sample 478 after the 44-byte header.
+		expect(new DataView(body).getInt16(0, true)).toBe(16_975);
 	});
 
 	it('returns a partial response for an open-ended range', async () => {
@@ -79,6 +89,7 @@ describe('demo audio route', () => {
 		expect(response.status).toBe(416);
 		expect(response.headers.get('content-range')).toBe(`bytes */${MEDIA_BYTES}`);
 		expect(response.headers.get('content-length')).toBe('0');
+		expect((await response.arrayBuffer()).byteLength).toBe(0);
 	});
 
 	it('returns 416 when the range starts past the body length', async () => {
@@ -95,6 +106,7 @@ describe('demo audio route', () => {
 		expect(response.status).toBe(416);
 		expect(response.headers.get('content-range')).toBe(`bytes */${MEDIA_BYTES}`);
 		expect(response.headers.get('content-length')).toBe('0');
+		expect((await response.arrayBuffer()).byteLength).toBe(0);
 	});
 
 	it('returns 416 for a zero-length suffix range', async () => {
