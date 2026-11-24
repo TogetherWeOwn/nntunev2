@@ -50,6 +50,27 @@ fn authentic(secret: &[u8], path: &str, bearer: &str, header: Option<&str>) -> b
         .is_some_and(|(expected, observed)| bool::from(expected.ct_eq(&observed)))
 }
 
+fn admitted_bearer<'a>(
+    request: &handlers::Request,
+    body: &'a CollectedBody,
+    secret: &[u8],
+) -> Option<&'a str> {
+    if request.method != "POST" || request.cookie.is_some() {
+        return None;
+    }
+    let CollectedBody::Complete(body) = body else {
+        return None;
+    };
+    let bearer = std::str::from_utf8(body).ok()?;
+    authentic(
+        secret,
+        &request.path,
+        bearer,
+        request.authorization.as_deref(),
+    )
+    .then_some(bearer)
+}
+
 pub(super) async fn dispatch(
     env: &Env,
     store: &PgStore,
@@ -79,28 +100,14 @@ async fn serve(
     req: &handlers::Request,
     body: &CollectedBody,
 ) -> WorkerResult<Response> {
-    let (Some(settings), Some(playback), CollectedBody::Complete(body)) =
-        (Settings::load(env), service(cfg), body)
+    let (Some(settings), Some(playback), Some(secret)) =
+        (Settings::load(env), service(cfg), custody_secret(env))
     else {
         return fixed_response(404);
     };
-    let Some(bearer) = std::str::from_utf8(body).ok().filter(|s| s.len() <= 1800) else {
+    let Some(bearer) = admitted_bearer(req, body, secret.as_bytes()) else {
         return fixed_response(404);
     };
-    let secret = custody_secret(env);
-    if req.method != "POST"
-        || req.cookie.is_some()
-        || !secret.is_some_and(|secret| {
-            authentic(
-                secret.as_bytes(),
-                &req.path,
-                bearer,
-                req.authorization.as_deref(),
-            )
-        })
-    {
-        return fixed_response(404);
-    }
     let scope = settings.scope();
     let reply = super::with_deadline(
         async {
@@ -189,6 +196,23 @@ mod tests {
             hex
         });
         let header = format!("{} {hex}", playback_custody::AUTH_SCHEME);
+        let mut req = handlers::Request {
+            method: "POST".into(),
+            path: RESOLVE_PATH.into(),
+            cookie: None,
+            origin: None,
+            authorization: Some(header.clone()),
+            stripe_signature: None,
+            body: Vec::new(),
+        };
+        let body = CollectedBody::Complete(bearer.as_bytes().to_vec());
+        assert_eq!(admitted_bearer(&req, &body, &secret), Some(bearer));
+        assert!(admitted_bearer(&req, &CollectedBody::Oversized, &secret).is_none());
+        req.cookie = Some("synthetic-cookie".into());
+        assert!(admitted_bearer(&req, &body, &secret).is_none());
+        req.cookie = None;
+        req.method = "GET".into();
+        assert!(admitted_bearer(&req, &body, &secret).is_none());
         assert!(authentic(&secret, RESOLVE_PATH, bearer, Some(&header)));
         assert!(!authentic(&secret, LEASE_PATH, bearer, Some(&header)));
         assert!(!authentic(
