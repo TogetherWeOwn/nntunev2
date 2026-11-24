@@ -38,7 +38,10 @@ DECLARE
     lib CONSTANT uuid := '20000000-0000-4000-8000-000000000001';
     principal CONSTANT text := 'upload-owner';
     sid CONSTANT uuid := '30000000-0000-4000-8000-000000000001';
-    generation CONSTANT uuid := gen_random_uuid();
+    lost CONSTANT uuid := '30000000-0000-4000-8000-000000000002';
+    object_id CONSTANT text := '40000000-0000-4000-8000-000000000001';
+    generation CONSTANT uuid := '50000000-0000-4000-8000-000000000001';
+    provider CONSTANT text := '60000000-0000-4000-8000-000000000001';
     lease CONSTANT uuid := gen_random_uuid();
     fp CONSTANT bytea := decode(repeat('ab', 32), 'hex');
 BEGIN
@@ -77,8 +80,30 @@ BEGIN
     IF EXISTS (SELECT FROM pg_temp.acquire_write_lease(env, lib, principal, sid, fp, generation, 1, 64, lease)) THEN
         RAISE EXCEPTION 'tombstone accepted a write lease';
     END IF;
+
+    IF (SELECT pg_temp.reserve(env, lib, principal, 'lost-upload-key', fp, lost)) IS DISTINCT FROM lost THEN
+        RAISE EXCEPTION 'lost-initiation fixture reservation failed';
+    END IF;
+    IF (SELECT pg_temp.acquire_write_lease(env, lib, principal, lost, fp, generation, 0, 0, lease))
+            IS DISTINCT FROM lease THEN
+        RAISE EXCEPTION 'lost-initiation fixture lease failed';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_temp.lock_upload(env::text, lib::text, principal, lost::text, fp,
+            generation::text, 0, 0, lease::text, object_id, provider, 'fixture-bucket',
+            64, decode(repeat('ab', 48), 'hex')) WHERE NOT claimed AND upload_id IS NULL) THEN
+        RAISE EXCEPTION 'scoped multipart handoff could not lock the object';
+    END IF;
+    -- Model a claimed object with an unrecorded provider ID and elapsed idle deadline.
+    UPDATE public.ingest_session_reservations
+    SET multipart_object_id = object_id::uuid, multipart_bucket = 'fixture-bucket',
+        idle_deadline = clock_timestamp() - interval '1 second'
+    WHERE id = lost;
+    IF (SELECT pg_temp.terminate(env, lib, principal, lost, 'expire', NULL, NULL, NULL, NULL, NULL))
+            IS DISTINCT FROM 'expired' THEN
+        RAISE EXCEPTION 'lost-initiation fixture expiry failed';
+    END IF;
     INSERT INTO upload_claims
-    SELECT kind, delivery_claim_id FROM pg_temp.claim_cleanup(env::text, lib::text, principal, sid::text);
+    SELECT kind, delivery_claim_id FROM pg_temp.claim_cleanup(env::text, lib::text, principal, lost::text);
     IF (SELECT count(*) FROM upload_claims) <> 2 THEN
         RAISE EXCEPTION 'expected one expiry claim and one terminal reconcile claim';
     END IF;
@@ -90,13 +115,32 @@ DO $$
 DECLARE
     env CONSTANT text := '10000000-0000-4000-8000-000000000001';
     lib CONSTANT text := '20000000-0000-4000-8000-000000000001';
-    sid CONSTANT text := '30000000-0000-4000-8000-000000000001';
+    sid CONSTANT text := '30000000-0000-4000-8000-000000000002';
+    provider CONSTANT text := '60000000-0000-4000-8000-000000000001';
     claim text;
 BEGIN
     SELECT claim_id INTO STRICT claim FROM upload_claims WHERE kind = 'terminal_reconcile';
     IF NOT EXISTS (SELECT FROM pg_temp.reconcile(env, lib, 'upload-owner', sid, claim,
-                   'fixture-bucket', gen_random_uuid()::text, NULL) WHERE media_key IS NULL) THEN
-        RAISE EXCEPTION 'committed cleanup claim could not be reconciled';
+                   'fixture-bucket', provider, 'recovered-fixture-id')
+                   WHERE upload_id = 'recovered-fixture-id' AND media_key =
+                         'media/40000000000040008000000000000001/50000000000040008000000000000001') THEN
+        RAISE EXCEPTION 'committed cleanup claim could not pin the recovered upload ID';
+    END IF;
+END $$;
+COMMIT;
+
+BEGIN ISOLATION LEVEL READ COMMITTED;
+DO $$
+DECLARE
+    env CONSTANT text := '10000000-0000-4000-8000-000000000001';
+    lib CONSTANT text := '20000000-0000-4000-8000-000000000001';
+    sid CONSTANT text := '30000000-0000-4000-8000-000000000002';
+    claim text;
+BEGIN
+    SELECT claim_id INTO STRICT claim FROM upload_claims WHERE kind = 'terminal_reconcile';
+    IF (SELECT multipart_upload_id FROM public.ingest_session_reservations WHERE id = sid::uuid)
+            IS DISTINCT FROM 'recovered-fixture-id' THEN
+        RAISE EXCEPTION 'recovered upload ID did not survive commit';
     END IF;
     IF EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(env, lib, 'wrong-owner', sid, 'terminal_reconcile', claim)) THEN
         RAISE EXCEPTION 'wrong owner acknowledged the claim';

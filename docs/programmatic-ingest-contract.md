@@ -98,9 +98,13 @@ app install and a populated upgrade. The deployed manifest excludes these bytes.
 
 To activate the schema, take a separate staging migration PR. Copy the exact
 SQL bytes into `migrations/` as the next available numbered
-`*_ingest_sessions.sql`, append its `app` entry and SHA-256 to the manifest,
-and point the disposable rehearsal and fixture inclusions at the registered
-file. Use the [protected staging apply procedure](ops.md#staging-migrations)
+`*_ingest_sessions.sql` and append its `app` entry and SHA-256 to the manifest.
+Make the disposable rehearsal use that entry directly. Remove direct schema
+loads and table drops from the reservation SQL and race fixtures and the
+cleanup handoff, multipart handoff, reconciliation and publisher-outcome
+PostgreSQL tests. Seed and clear only their fixture rows once migration
+replay takes ownership of the tables. Use the
+[protected staging apply procedure](ops.md#staging-migrations)
 with independent approval for the exact DDL and a successful staging ledger
 receipt before merge. For a failed or uncertain apply, reconcile both the
 receipt and table state before retrying. On a confirmed apply, leave the

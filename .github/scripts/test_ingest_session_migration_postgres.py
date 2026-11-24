@@ -29,6 +29,10 @@ SEED = """
     INSERT INTO public.storage_library_namespaces VALUES (
         '20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000001',
         'upload-owner');
+    INSERT INTO public.storage_object_intents VALUES (
+        '40000000-0000-4000-8000-000000000001', '50000000-0000-4000-8000-000000000001',
+        '10000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000001',
+        '60000000-0000-4000-8000-000000000001', 64, 128, decode(repeat('ab', 48), 'hex'));
 """
 OLD_ROWS = """
     SELECT to_jsonb(u), to_jsonb(l)
@@ -88,6 +92,13 @@ class UploadMigrationTests(unittest.TestCase):
             "CREATE FUNCTION pg_temp.reconcile(text, text, text, text, text, text, text, text) "
             "RETURNS TABLE (media_key text, upload_id text, deadline bigint) "
             f"LANGUAGE sql AS $query${reconcile}$query$;"
+        )
+        lock = (INGEST_SQL / "multipart/session_upload_lock.sql").read_text()
+        wrappers.append(
+            "CREATE FUNCTION pg_temp.lock_upload(text, text, text, text, bytea, text, bigint, bigint, "
+            "text, text, text, text, bigint, bytea) "
+            "RETURNS TABLE (claimed boolean, upload_id text, deadline bigint) "
+            f"LANGUAGE sql AS $query${lock}$query$;"
         )
         run_psql(env, FIXTURE.read_text().replace("-- worker statements", "\n".join(wrappers)))
 
