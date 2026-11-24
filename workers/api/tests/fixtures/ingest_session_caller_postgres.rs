@@ -20,9 +20,15 @@ use sha2::{Digest, Sha256};
 use std::{io, net::Ipv4Addr};
 use tokio_postgres::{Config, NoTls};
 
+#[path = "../support/blocker_observer.rs"]
+mod blocker_observer;
+use blocker_observer::observe_blocked;
+
 const DB: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
 const WRITER: &str =
     "postgresql://upload_fixture_writer:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
+const AUTHORITY: &str =
+    "postgresql://upload_fixture_authority:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
 const OWNER: &str = "synthetic-upload-caller";
 const BUCKET: &str = "fixture-bucket";
 const UPLOAD: &str = "fixture+/=?";
@@ -56,6 +62,30 @@ async fn connect(url: &str) -> Client {
     client
 }
 
+async fn load_authority(
+    authority: &Client,
+    credential_id: &str,
+    scope: &CompletionScope<'_>,
+) -> Result<Option<CurrentAuthorization>, StoreError> {
+    let row = authority.query_opt(
+        "SELECT c.*, g.environment, g.library_id
+         FROM public.native_rest_credentials c JOIN public.fixture_upload_grants g ON g.credential_id = c.id
+         WHERE c.id = $1 AND c.user_id = $2 AND g.environment = $3 AND g.library_id = $4",
+        &[&credential_id, &scope.principal, &uuid_text(scope.environment), &uuid_text(scope.library)],
+    ).await.map_err(|_| StoreError)?;
+    row.map(|row| {
+        let record = crate::worker_entry::native_credential_from_row(&row)?.record;
+        let grant = Grant {
+            credential_id: record.id.clone(),
+            environment: row.try_get("environment").map_err(|_| StoreError)?,
+            library_id: row.try_get("library_id").map_err(|_| StoreError)?,
+            actions: vec![Action::Upload],
+        };
+        Ok(CurrentAuthorization { record, grant })
+    })
+    .transpose()
+}
+
 #[tokio::test]
 #[ignore = "requires the disposable hosted upload caller database"]
 async fn scoped_writer_commits_and_replays_exact_upload() {
@@ -72,12 +102,33 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         .batch_execute(include_str!("ingest_session_caller_grants.sql"))
         .await
         .unwrap();
+    observer.batch_execute(
+        "CREATE ROLE upload_fixture_authority LOGIN NOINHERIT PASSWORD 'ci-throwaway';
+         CREATE TABLE public.fixture_upload_grants (
+             credential_id text PRIMARY KEY REFERENCES public.native_rest_credentials (id),
+             environment text NOT NULL, library_id text NOT NULL
+         );
+         GRANT SELECT ON public.native_rest_credentials, public.fixture_upload_grants TO upload_fixture_authority;
+         CREATE FUNCTION public.fixture_hold_completion() RETURNS trigger
+         LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock(1751);
+             RETURN NEW;
+         END $$;
+         CREATE CONSTRAINT TRIGGER fixture_hold_completion
+         AFTER UPDATE ON public.ingest_session_reservations DEFERRABLE INITIALLY DEFERRED
+         FOR EACH ROW WHEN (NEW.terminal_reason = 'completed')
+         EXECUTE FUNCTION public.fixture_hold_completion();",
+    ).await.unwrap();
+    let authority = connect(AUTHORITY).await;
     let mut writer = connect(WRITER).await;
     assert!(writer.query_one(
         "SELECT session_user = current_user AND current_user = 'upload_fixture_writer'
             AND NOT EXISTS (SELECT FROM pg_auth_members WHERE member = current_user::regrole)
             AND NOT (SELECT rolinherit OR rolsuper FROM pg_roles WHERE rolname = current_user)
             AND NOT has_table_privilege(current_user, 'public.ingest_session_reservations', 'DELETE,TRUNCATE')
+            AND NOT has_any_column_privilege(current_user, 'public.native_rest_credentials', 'SELECT,INSERT,UPDATE')
+            AND NOT has_any_column_privilege(current_user, 'public.fixture_upload_grants', 'SELECT,INSERT,UPDATE')
             AND NOT has_any_column_privilege(current_user, 'public.track_sources', 'INSERT,UPDATE')
             AND NOT has_any_column_privilege(current_user, 'public.storage_validated_digest_references', 'INSERT,UPDATE')
             AND NOT has_table_privilege(current_user, 'public.track_sources', 'DELETE,TRUNCATE')",
@@ -86,6 +137,7 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
 
     for (index, fault) in [
         None,
+        Some(Fault::GrantRevokedWhileWaiting),
         Some(Fault::Digest),
         Some(Fault::Revoked),
         Some(Fault::Retention),
@@ -94,19 +146,26 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
     .into_iter()
     .enumerate()
     {
-        prove_attempt(&observer, &mut writer, index as u8 * 16, fault).await;
+        prove_attempt(&observer, &authority, &mut writer, index as u8 * 16, fault).await;
     }
 }
 
 #[derive(Clone, Copy)]
 enum Fault {
+    GrantRevokedWhileWaiting,
     Digest,
     Revoked,
     Retention,
     Quarantined,
 }
 
-async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fault: Option<Fault>) {
+async fn prove_attempt(
+    observer: &Client,
+    authority: &Client,
+    mut writer: &mut Client,
+    seed: u8,
+    fault: Option<Fault>,
+) {
     let [root_id, environment, library, object, seal, configuration, map] = [1, 2, 3, 4, 5, 6, 7]
         .map(|value| {
             let mut id = [value + seed; 16];
@@ -172,13 +231,30 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
     let now = now_millis() / 1000;
     let credential = issue_credential(OWNER, &[Scope::IngestSubmit], 300, now, &pepper).unwrap();
     let grant = Grant {
-        credential_id: &credential.record.id,
-        environment: &env,
-        library_id: &lib,
-        actions: &[Action::Create, Action::Upload],
+        credential_id: credential.record.id.clone(),
+        environment: env.clone(),
+        library_id: lib.clone(),
+        actions: vec![Action::Create, Action::Upload],
     };
+    let credential_record = &credential.record;
+    observer.execute(
+        "INSERT INTO public.native_rest_credentials
+            (id, user_id, key_prefix, key_hmac, pepper_version, scopes, created_at, expires_at, created_from_ip)
+         VALUES ($1, $2, $3, $4, 1, ARRAY['ingest:submit'], $5, $6, '127.0.0.1')",
+        &[&credential_record.id, &credential_record.user_id, &credential_record.key_prefix, &credential_record.key_hmac,
+          &(credential_record.created_at as i64), &(credential_record.expires_at as i64)],
+    ).await.unwrap();
+    observer
+        .execute(
+            "INSERT INTO public.fixture_upload_grants VALUES ($1, $2, $3)",
+            &[&credential_record.id, &env, &lib],
+        )
+        .await
+        .unwrap();
+    let reload =
+        async |id: &str, scope: &CompletionScope<'_>| load_authority(authority, id, scope).await;
     let auth = Authorization {
-        record: &credential.record,
+        record: credential_record,
         bearer: &credential.display_once,
         peppers: &[pepper],
         grant: &grant,
@@ -241,12 +317,12 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
     let mut revoked = credential.record.clone();
     revoked.revoked_at = Some(now);
     let wrong_environment = Grant {
-        environment: "foreign",
-        ..grant
+        environment: "foreign".into(),
+        ..grant.clone()
     };
     let wrong_library = Grant {
-        library_id: "foreign",
-        ..grant
+        library_id: "foreign".into(),
+        ..grant.clone()
     };
     for wrong in [
         foreign,
@@ -275,7 +351,7 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
             Err(UploadError::Refused)
         ));
         assert!(matches!(
-            read(&mut writer, wrong, prepared).await,
+            read(writer, wrong, prepared, reload).await,
             Err(UploadError::Refused)
         ));
     }
@@ -496,7 +572,7 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
             .unwrap();
         assert!(matches!(
             opened
-                .commit(&mut writer, auth, &verified, now as i64 + 600)
+                .commit(writer, auth, &verified, now as i64 + 600, reload)
                 .await,
             Err(UploadError::Unconfirmed)
         ));
@@ -511,12 +587,12 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
         ).await.unwrap().get(0);
         assert!(committed);
         assert!(matches!(
-            read(&mut writer, auth, prepared).await,
+            read(writer, auth, prepared, reload).await,
             Err(UploadError::Refused)
         ));
         return;
     }
-    if let Some(fault) = fault {
+    if let Some(fault @ (Fault::Digest | Fault::Revoked | Fault::Retention)) = fault {
         let (auth, retain, expected) = match fault {
             Fault::Digest => (auth, now as i64 + 600, UploadError::Refused),
             Fault::Revoked => (
@@ -528,10 +604,10 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
                 UploadError::Refused,
             ),
             Fault::Retention => (auth, now as i64 - 1, UploadError::Unconfirmed),
-            Fault::Quarantined => unreachable!("checked above"),
+            Fault::Quarantined | Fault::GrantRevokedWhileWaiting => unreachable!(),
         };
         assert!(
-            matches!(opened.commit(&mut writer, auth, &verified, retain).await,
+            matches!(opened.commit(writer, auth, &verified, retain, reload).await,
             Err(error) if error == expected)
         );
         let untouched: bool = observer.query_one(
@@ -548,27 +624,83 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
         ).await.unwrap().get::<_, bool>(0));
         return;
     }
-    let retain = now as i64 + 600;
-    let committed = opened
-        .commit(&mut writer, auth, &verified, retain)
-        .await
-        .unwrap();
-    assert_eq!(
-        (&committed.media_version[..], &committed.page_versions[..]),
-        (MEDIA, &[PAGE.to_string()][..])
-    );
-    assert_eq!(committed.map.replace('-', ""), map_text);
-    let replayed = read(&mut writer, auth, prepared).await.unwrap().unwrap();
-    assert_eq!(
-        (replayed.map, replayed.media_version, replayed.page_versions),
-        (
-            committed.map,
-            committed.media_version,
-            committed.page_versions
-        )
-    );
+    let revoke = matches!(fault, Some(Fault::GrantRevokedWhileWaiting));
+    let (committed, replayed) = {
+        // Pause the real commit while it holds the session row and has staged the outcome.
+        let mut gate = connect(DB).await;
+        let mut replay_writer = connect(WRITER).await;
+        let writer_pid = backend_pid(writer).await;
+        let replay_pid = backend_pid(&replay_writer).await;
+        let gate_pid = backend_pid(&gate).await;
+        let gate = gate.transaction().await.unwrap();
+        gate.query_one("SELECT pg_advisory_xact_lock(1751)", &[])
+            .await
+            .unwrap();
+        let mut committed =
+            std::pin::pin!(opened.commit(writer, auth, &verified, now as i64 + 600, reload));
+        observe_blocked(observer, gate_pid, writer_pid, committed.as_mut())
+            .await
+            .unwrap();
+        let mut replayed = std::pin::pin!(read(&mut replay_writer, auth, prepared, reload));
+        observe_blocked(observer, writer_pid, replay_pid, replayed.as_mut())
+            .await
+            .unwrap();
+        if revoke {
+            assert_eq!(
+                observer
+                    .execute(
+                        "DELETE FROM public.fixture_upload_grants WHERE credential_id = $1",
+                        &[&auth.record.id]
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        gate.commit().await.unwrap();
+        tokio::join!(committed, replayed)
+    };
+    if revoke {
+        assert!(matches!(committed, Err(UploadError::Unconfirmed)));
+        assert!(matches!(replayed, Err(UploadError::Refused)));
+        assert!(observer
+            .query_one(
+                "SELECT s.terminal_reason = 'completed' AND s.write_lease_id IS NULL
+                    AND p.media_version = $3 AND p.page_versions = $4
+             FROM public.ingest_session_reservations s
+             JOIN public.storage_digest_inventory_intents p ON p.map_id = s.completed_map_id
+             WHERE s.id = $1::text::uuid AND p.map_id = $2::text::uuid",
+                &[&sid, &map_text, &MEDIA, &&[PAGE][..]],
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0));
+        return;
+    }
+    for outcome in [committed.unwrap(), replayed.unwrap().unwrap()] {
+        assert_eq!(outcome.map.replace('-', ""), map_text);
+        assert_eq!(outcome.object.replace('-', ""), obj);
+        assert_eq!(outcome.generation.replace('-', ""), generation);
+        assert_eq!(outcome.configuration.replace('-', ""), provider);
+        assert_eq!(outcome.root_version.replace('-', ""), root_text);
+        assert_eq!(outcome.media_version, MEDIA);
+        assert_eq!(outcome.page_versions, [PAGE]);
+    }
     assert!(matches!(
-        read(&mut writer, foreign, other).await,
+        read(writer, auth, prepared, async |_, _| Err(StoreError)).await,
+        Err(UploadError::Unconfirmed)
+    ));
+    let mismatched = async |id: &str, scope: &CompletionScope<'_>| {
+        let mut state = reload(id, scope).await?.unwrap();
+        state.grant.library_id = "foreign".into();
+        Ok(Some(state))
+    };
+    assert!(matches!(
+        read(writer, auth, prepared, mismatched).await,
+        Err(UploadError::Refused)
+    ));
+    assert!(matches!(
+        read(writer, foreign, other, reload).await,
         Err(UploadError::Refused)
     ));
     assert!(matches!(
@@ -582,6 +714,25 @@ async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fau
         .await,
         Err(UploadError::Refused)
     ));
+    observer
+        .execute(
+            "UPDATE public.native_rest_credentials SET revoked_at = $2 WHERE id = $1",
+            &[&auth.record.id, &(now as i64)],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        read(writer, auth, prepared, reload).await,
+        Err(UploadError::Refused)
+    ));
+}
+
+async fn backend_pid(client: &Client) -> i32 {
+    client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0)
 }
 
 fn hex(bytes: &[u8]) -> String {

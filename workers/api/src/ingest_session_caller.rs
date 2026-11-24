@@ -17,16 +17,18 @@ use nntune_ingest::{
 use tokio_postgres::{Client, Transaction};
 
 use crate::{
+    handlers::StoreError,
     ingest_session_auth::{authorize, Action, Grant, Job},
     ingest_session_request::Request,
     native_rest::{NativeRestRecord, Pepper},
     random::secure_random_bytes,
     storage_digest_read::uuid_text,
-    worker_entry::now_millis,
+    worker_entry::{now_millis, with_deadline},
 };
 
 const LEASE: &str = include_str!("ingest_session_acquire_write_lease.sql");
 const ADVANCE: &str = include_str!("ingest_session_advance_checkpoint.sql");
+const AUTHORITY_TIMEOUT_MS: u64 = 3_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UploadError {
@@ -45,7 +47,13 @@ pub struct Authorization<'a> {
     pub record: &'a NativeRestRecord,
     pub bearer: &'a str,
     pub peppers: &'a [Pepper<'a>],
-    pub grant: &'a Grant<'a>,
+    pub grant: &'a Grant,
+}
+
+/// Current state loaded by the trusted reader from the authorization stores.
+pub struct CurrentAuthorization {
+    pub record: NativeRestRecord,
+    pub grant: Grant,
 }
 
 /// Trusted sealer and candidate identity for an existing reservation. The job
@@ -110,12 +118,17 @@ impl<'a> OpenedUpload<'a> {
 
     /// Commit verified readback and the exact final checkpoint together. Pass
     /// freshly loaded authorization and the retention limit from trusted policy.
+    /// The post-commit result uses the same trusted reader as replay.
     pub async fn commit(
         self,
         writer: &mut Client,
         auth: Authorization<'_>,
         verified: &VerifiedCompletedReadback<'_, '_>,
         retain_until: i64,
+        reader: impl AsyncFnOnce(
+            &str,
+            &CompletionScope<'_>,
+        ) -> Result<Option<CurrentAuthorization>, StoreError>,
     ) -> Result<CommittedOutcome, UploadError> {
         let auth_until = self.prepared.authorize(auth)?;
         let target = self.target.target();
@@ -170,8 +183,10 @@ impl<'a> OpenedUpload<'a> {
         .map_err(|_| Unconfirmed)?
         .ok_or(Refused)?;
         tx.commit().await.map_err(|_| Unconfirmed)?;
-        let outcome = read(writer, auth, self.prepared).await.unwrap_or_default();
-        outcome.ok_or(Unconfirmed)
+        read(writer, auth, self.prepared, reader)
+            .await
+            .map_err(|_| Unconfirmed)?
+            .ok_or(Unconfirmed)
     }
 }
 
@@ -237,15 +252,39 @@ pub async fn open<'a>(
     })
 }
 
-/// Re-read the exact committed pins without provider requests or publication.
+/// Re-read the exact committed pins. After acquiring the scoped session lock,
+/// invoke the trusted reader for the credential ID and locked upload scope.
+/// It must load current credential and upload grant state from their authorities
+/// through separate access, without a cached snapshot or the upload writer's role.
 pub async fn read(
     writer: &mut Client,
     auth: Authorization<'_>,
     prepared: PreparedUpload<'_>,
+    reader: impl AsyncFnOnce(
+        &str,
+        &CompletionScope<'_>,
+    ) -> Result<Option<CurrentAuthorization>, StoreError>,
 ) -> Result<Option<CommittedOutcome>, UploadError> {
     prepared.authorize(auth)?;
-    read_completion(writer, &prepared.completed_scope(), async |_, _| {
-        prepared.authorize(auth).map_err(|_| OutcomeError::Refused)
+    read_completion(writer, &prepared.completed_scope(), async |_, locked| {
+        let current = with_deadline(
+            reader(&auth.record.id, locked),
+            AUTHORITY_TIMEOUT_MS,
+            StoreError,
+        )
+        .await
+        .map_err(|_| OutcomeError::Indeterminate)?
+        .ok_or(OutcomeError::Refused)?;
+        if current.record.id != auth.record.id {
+            return Err(OutcomeError::Refused);
+        }
+        prepared
+            .authorize(Authorization {
+                record: &current.record,
+                grant: &current.grant,
+                ..auth
+            })
+            .map_err(|_| OutcomeError::Refused)
     })
     .await
     .map_err(outcome_error)
