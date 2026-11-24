@@ -897,6 +897,17 @@ jobs:
           inventory="$(cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --exact --ignored --list)"
           printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
           cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --exact --ignored
+      - name: Exercise private Library admission on disposable PostgreSQL
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_private_library_ci
+        run: |
+          set -euo pipefail
+          psql postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci -X -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE nntune_private_library_ci TEMPLATE nntune_catalogue_ci'
+          test_name='private_library::postgres_tests::publishes_and_admits_only_the_fresh_canonical_track'
+          args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests,encrypted-upload-caller --lib "$test_name")
+          cargo test "${args[@]}" -- --exact | tee "$RUNNER_TEMP/private-library-test.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/private-library-test.log"
       - name: Resolve private music against the committed catalogue fixture
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_catalogue_ci
