@@ -2,8 +2,7 @@ use super::*;
 use crate::library::parse_page_cursor;
 use private_playlists::{execute, route, Command};
 use serde_json::{json, Value};
-use tokio_postgres::types::ToSql;
-use tokio_postgres::{types::FromSqlOwned, Client};
+use tokio_postgres::Client;
 use Command::*;
 
 async fn connect() -> Client {
@@ -19,10 +18,6 @@ async fn connect() -> Client {
         .unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
     db
-}
-
-async fn scalar<T: FromSqlOwned>(db: &Client, sql: &str, args: &[&(dyn ToSql + Sync)]) -> T {
-    db.query_one(sql, args).await.unwrap().get(0)
 }
 
 async fn run(db: &mut Client, owner: &str, cmd: Command<'_>) -> Option<Value> {
@@ -43,12 +38,11 @@ async fn postgres_store_rehearsal() {
     let id = created["id"].as_str().unwrap();
     let renamed = run(&mut db, owner, Rename(id, "Renamed".into())).await;
     assert_eq!(renamed, Some(json!({"id": id, "name": "Renamed"})));
-    let track_id = "SELECT id::text FROM tracks WHERE title = $1";
-    let track: String = scalar(&db, track_id, &[&"new-track"]).await;
-    let foreign = scalar(&db, track_id, &[&"trkRpMiddle00000000000"]).await;
-    let inactive = scalar(&db, track_id, &[&"inactive-track"]).await;
-    let another: String = scalar(&db, track_id, &[&"trkFrAlpha000000000000"]).await;
-    let repeat: String = scalar(&db, track_id, &[&"trkRpRepeat00000000000"]).await;
+    let titles = ["new-track", "trkRpMiddle00000000000", "inactive-track",
+        "trkFrAlpha000000000000", "trkRpRepeat00000000000"];
+    let sql = "SELECT array_agg(id::text ORDER BY array_position($1, title)) FROM tracks WHERE title = ANY($1)";
+    let ids: Vec<String> = db.query_one_scalar(sql, &[&titles.as_slice()]).await.unwrap();
+    let [track, foreign, inactive, another, repeat]: [String; 5] = ids.try_into().unwrap();
     for cmd in [
         Read(id),
         Rename(id, "Denied".into()),
@@ -121,23 +115,29 @@ async fn postgres_store_rehearsal() {
     let email = "playlist-owner@example.com";
     seed_user(&h, owner, email);
     let cookie = Some(magic_login(&h, email));
-    for (cookie, origin, target, header, expected) in [
-        (None, ORIGIN, clean_id, None, generic_auth()),
-        (cookie.clone(), "https://wrong.example", clean_id, None, generic_auth()),
-        (cookie.clone(), ORIGIN, "noSuchPlaylist00000000", None, not_found()),
-        (cookie.clone(), ORIGIN, clean_id, Some("Bearer fixture"), not_found()),
-        (cookie, ORIGIN, clean_id, None, unavailable()),
+    for (cookie, origin, cmd, header, size, expected) in [
+        (None, ORIGIN, Delete(clean_id), None, 0, generic_auth()),
+        (cookie.clone(), "https://wrong.example", Delete(clean_id), None, 0, generic_auth()),
+        (cookie.clone(), ORIGIN, Delete("noSuchPlaylist00000000"), None, 0, not_found()),
+        (cookie.clone(), ORIGIN, Delete(clean_id), Some("Bearer fixture"), 0, not_found()),
+        (cookie.clone(), ORIGIN, Delete(clean_id), None, MAX_BODY_BYTES + 1, invalid_request()),
+        (cookie.clone(), ORIGIN, Rename(clean_id, " ".into()), None, 0, invalid_request()),
+        (cookie.clone(), ORIGIN, Rename(clean_id, "bad\0name".into()), None, 0, invalid_request()),
+        (cookie.clone(), ORIGIN, List(Some("bad".into()), 1), None, 0, invalid_request()),
+        (cookie.clone(), ORIGIN, Append(clean_id, "bad".into()), None, 0, invalid_request()),
+        (cookie, ORIGIN, Delete(clean_id), None, 0, unavailable()),
     ] {
         let req = Request {
-            method: "DELETE".into(), path: format!("/v1/playlists/{target}"), cookie,
+            method: String::new(), path: String::new(), cookie,
             origin: Some(origin.into()), authorization: header.map(str::to_owned),
-            stripe_signature: None, body: Vec::new(),
+            stripe_signature: None, body: vec![0; size],
         };
-        let result = route(&h.ctx(), &req, &mut db, Delete(target)).await;
+        let result = route(&h.ctx(), &req, &mut db, cmd).await;
         assert_eq!((result.status, result.body), (expected.status, expected.body));
     }
     assert!(run(&mut db, owner, Read(clean_id)).await.is_some());
-    let writer_pid: i32 = scalar(&peer, "SELECT pg_backend_pid()", &[]).await;
+    let backend_pid = "SELECT pg_backend_pid()";
+    let writer_pid: i32 = peer.query_one_scalar(backend_pid, &[]).await.unwrap();
     let playlist_fence = "UPDATE playlists SET deleting_at = now() WHERE public_id = $1";
     let account_fence = "UPDATE users SET deleting_at = now() WHERE id = $1";
     for (sql, key, target) in [(playlist_fence, clean_id, clean_id),

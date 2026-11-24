@@ -34,7 +34,8 @@ WITH inactive AS (
     VALUES ('fixture-user-owner', 'Fenced Library', now()) RETURNING id
 )
 INSERT INTO public.library_tracks (library_id, track_id)
-SELECT inactive.id, t.id FROM inactive, pg_temp.fixture_tracks t WHERE t.handle = 'inactive-track';
+SELECT inactive.id, t.id FROM inactive, pg_temp.fixture_tracks t
+WHERE t.handle IN ('inactive-track', 'trkRpMiddle00000000000');
 
 -- Require an explicit trusted mapping even when the legacy ref resembles a canonical ID.
 INSERT INTO public.playlist_tracks (playlist_id, track_id, position, is_legacy)
