@@ -78,6 +78,7 @@ async fn pinned_media_play_seek_and_refusals_preserve_written_prefix() {
                     assert_eq!(req.usable_until, now() + Duration::from_secs(1));
                     let start = offset;
                     assert_eq!(req.range, start as u64..65_617);
+                    assert_eq!(req.sealed_len, 65_617);
                     if fault == Fault::Expired {
                         clock.set(req.usable_until);
                     }

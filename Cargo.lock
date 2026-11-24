@@ -659,6 +659,7 @@ version = "0.1.0"
 name = "nntune-stream"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures-channel",
  "futures-util",
  "nntune-core",
@@ -669,8 +670,10 @@ dependencies = [
  "serde_json",
  "syn 3.0.10",
  "tokio",
+ "url",
  "wasm-bindgen",
  "worker",
+ "zeroize",
 ]
 
 [[package]]

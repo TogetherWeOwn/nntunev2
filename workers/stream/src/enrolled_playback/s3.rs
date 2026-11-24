@@ -16,6 +16,8 @@ pub struct S3Get<'a> {
     pub locator: &'a S3Locator,
     /// Half-open ciphertext offsets into the pinned media object.
     pub range: Range<u64>,
+    /// Trusted ciphertext object size from the committed playback geometry.
+    pub sealed_len: u64,
     pub usable_until: SystemTime,
 }
 
@@ -71,6 +73,7 @@ impl<'a> EnrolledPlayback<'a> {
             configuration: self.pins.provider_configuration,
             locator,
             range: range.clone(),
+            sealed_len: self.plan.sealed_len(),
             usable_until: self.pins.usable_until,
         })
         .await;

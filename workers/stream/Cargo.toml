@@ -5,6 +5,9 @@ edition = "2021"
 description = "NNTune v2 stream worker: per-user NNTP pool + Range streaming play path (portable Rust core of the Cloudflare Worker / Durable Object)"
 license = "MIT"
 
+[features]
+s3-transport-fixture = []
+
 [lib]
 name = "nntune_stream"
 path = "src/lib.rs"
@@ -27,6 +30,9 @@ worker = "0.8"
 wasm-bindgen = "0.2.129"
 futures-channel = "0.3"
 futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+url = "2"
+zeroize = "1"
 
 [dev-dependencies]
 futures-util = "0.3"
