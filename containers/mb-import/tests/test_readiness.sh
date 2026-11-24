@@ -60,13 +60,17 @@ for table in ("artist", "release_group", "release", "recording", "track", "url",
 artist = "11111111-1111-4111-8111-111111111111"
 recording = "88888888-8888-4888-8888-888888888888"
 probes = [
-    {"query": "A release", "release_mbid": "55555555-5555-4555-8555-555555555555",
+    {"query": "A  RELEASE", "release_mbid": "55555555-5555-4555-8555-555555555555",
      "artist_mbid": artist, "tracks": [[1, 1, recording], [1, 2, recording], [2, 1, recording]]},
     {"query": "Second 'release'", "release_mbid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
      "artist_mbid": artist, "tracks": [[1, 1, recording]]},
 ]
 evidence = {"tables": tables, "probes": probes}
 (scratch / "evidence.json").write_text(json.dumps(evidence))
+for name, control in (("tab", "\t"), ("next-line", "\u0085")):
+    probes[0]["query"] = f"A{control}release"
+    (scratch / f"{name}.json").write_text(json.dumps(evidence))
+probes[0]["query"] = "A  RELEASE"
 tables["url"]["sha256"] = "0" * 64
 tables["recording"]["rows"] = 1
 probes[0]["tracks"].reverse()
@@ -78,7 +82,7 @@ expect_readiness() {
   local expected="$1" evidence="$2" status=0 output
   shift 2
   output="$(PGUSER=fixture_observer python3 -I "$repo/containers/mb-import/check-readiness.py" \
-    "$scratch/$evidence.json")" || status=$?
+    "$scratch/$evidence.json" 2>&1)" || status=$?
   printf '%s\n' "$output"
   [[ "$status" == "$expected" ]]
   for line in "$@"; do grep -Fxq -- "$line" <<<"$output"; done
@@ -112,3 +116,17 @@ echo '=== Wrong evidence against completed import ==='
 expect_readiness 1 mismatch 'url: mismatch cursor=None rows=3 dlq=0' \
   'recording: mismatch cursor=2 rows=2 dlq=0' \
   'probe 1: search=ok recordings=mismatch' 'probe 2: search=mismatch recordings=ok' 'readiness: FAIL'
+
+echo '=== Search terms rejected before probing ==='
+for evidence in tab next-line; do
+  expect_readiness 2 "$evidence" 'readiness: could not read valid import evidence'
+done
+
+echo '=== Unexpected dead letter against completed import ==='
+db <<'SQL'
+INSERT INTO mb_import_dlq (table_name, dump_id, line_no, reason, raw_line)
+SELECT table_name, dump_id, 1, 'fixture_only', 'synthetic row'
+FROM mb_import_cursor WHERE table_name = 'track';
+SQL
+expect_readiness 1 evidence 'track: mismatch cursor=4 rows=4 dlq=1' \
+  'probe 1: search=ok recordings=ok' 'probe 2: search=ok recordings=ok' 'readiness: FAIL'

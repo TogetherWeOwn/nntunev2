@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import unicodedata
 
 
 TABLES = (
@@ -41,7 +42,8 @@ def load_evidence(path):
     for probe in probes:
         query, tracks = probe["query"], probe["tracks"]
         if (not isinstance(query, str) or query != query.strip()
-                or not 2 <= len(query) <= 100 or "\0" in query
+                or not 2 <= len(query) <= 100
+                or any(unicodedata.category(char) == "Cc" for char in query)
                 or not matches(MBID, probe["release_mbid"])
                 or not matches(MBID, probe["artist_mbid"])
                 or not isinstance(tracks, list) or not 1 <= len(tracks) <= 1000):
@@ -79,7 +81,8 @@ def read_snapshot(tables, probes):
             (SELECT count(*) FROM public.mb_import_dlq
              WHERE table_name = '{table}' AND dump_id = '{digest}'));""")
     for probe in probes:
-        query_hex = probe["query"].encode("utf-8").hex()
+        normalized = " ".join(probe["query"].split()).lower()
+        query_hex = normalized.encode("utf-8").hex()
         statements.append(f"EXECUTE release_search(convert_from(decode('{query_hex}', 'hex'), 'UTF8'));")
         statements.append(f"EXECUTE release_recordings('{probe['release_mbid']}');")
     statements.append("ROLLBACK;")

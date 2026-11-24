@@ -282,7 +282,8 @@ python3 -I containers/mb-import/check-readiness.py /path/to/import-evidence.json
 ```
 
 Build the JSON from the approved curated snapshot and import handoff before
-querying the mirror. It has two keys:
+querying the freshly loaded mirror. Counts cover the whole table. The JSON
+has two keys:
 
 - `tables` maps each of `artist`, `release_group`, `release`, `recording`,
   `track`, `url`, `artist_url`, `recording_url`, `recording_music_video` and
@@ -292,13 +293,15 @@ querying the mirror. It has two keys:
   dead-letter rows for that table and hash. Keep any dead-letter disposition
   in the import handoff.
 - `probes` is an array of one to five representative releases; include a
-  multi-medium release. Each object has `query` (the trimmed search term),
+  multi-medium release. Each object has `query` (a trimmed search term
+  without control characters),
   `release_mbid` and `artist_mbid` (lowercase UUID strings), and `tracks`
   (ordered `[medium_no, track_no, recording_mbid]` triples, up to the Worker
   limit of 1,000). Choose the expected hits and track lists from the approved
-  source evidence. Search checks for the release and its joined artist in the
-  first 25 results. The recording list must match in order, including shared
-  recordings and their distinct positions.
+  source evidence. Search lowercases the term and collapses whitespace, then
+  checks for the release and its joined artist in the first 25 results. The
+  recording list must match in order, including shared recordings and their
+  distinct positions.
 
 The check reads one repeatable, read-only PostgreSQL snapshot. Exact counts
 scan the tables and each statement has a five-minute timeout. Output lists
