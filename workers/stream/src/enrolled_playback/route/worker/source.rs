@@ -35,7 +35,11 @@ struct Resolved {
 }
 
 impl<'a> WorkerSource<'a> {
-    pub(super) fn from_env(env: &Env, bearer: &'a str) -> Option<Self> {
+    pub(super) fn from_env(
+        env: &Env,
+        bearer: &'a str,
+        observation: Option<Rc<ReadObservation>>,
+    ) -> Option<Self> {
         let var = |name| env.var(name).ok().map(|value| value.to_string());
         let secret = |name| {
             env.secret(name)
@@ -51,19 +55,21 @@ impl<'a> WorkerSource<'a> {
         if custody_secret.len() < 32 {
             return None;
         }
+        let mut reader = S3Reader::new(
+            uuid(&var("PRIVATE_PLAYBACK_S3_CONFIGURATION")?)?,
+            var("PRIVATE_PLAYBACK_S3_BUCKET")?,
+            &var("PRIVATE_PLAYBACK_S3_ENDPOINT")?,
+            var("PRIVATE_PLAYBACK_S3_REGION")?,
+            secret("PRIVATE_PLAYBACK_S3_ACCESS_KEY_ID")?.to_string(),
+            secret("PRIVATE_PLAYBACK_S3_SECRET_ACCESS_KEY")?,
+        )
+        .ok()?;
+        reader.observation = observation;
         Some(Self {
             api,
             bearer,
             custody_secret,
-            reader: S3Reader::new(
-                uuid(&var("PRIVATE_PLAYBACK_S3_CONFIGURATION")?)?,
-                var("PRIVATE_PLAYBACK_S3_BUCKET")?,
-                &var("PRIVATE_PLAYBACK_S3_ENDPOINT")?,
-                var("PRIVATE_PLAYBACK_S3_REGION")?,
-                secret("PRIVATE_PLAYBACK_S3_ACCESS_KEY_ID")?.to_string(),
-                secret("PRIVATE_PLAYBACK_S3_SECRET_ACCESS_KEY")?,
-            )
-            .ok()?,
+            reader,
             root_version: uuid(&var("PRIVATE_PLAYBACK_ROOT_VERSION")?)?,
             root: Zeroizing::new(decode_hex(&secret("PRIVATE_PLAYBACK_ROOT_KEY")?)?),
             resolved: OnceCell::new(),

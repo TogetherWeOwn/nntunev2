@@ -116,10 +116,10 @@ pub fn make_s3_fixture() -> PlaybackFixture {
         header: seal.header().to_bytes(),
     };
     let envelope = wrap_scheme2(&ROOT, &context, seal.key().expose_secret()).unwrap();
-    seal.seal_chunk(&vec![b'A'; 65_536]).unwrap();
+    let first = seal.seal_chunk(&vec![b'A'; 65_536]).unwrap();
     let last = seal.seal_chunk(b"Z").unwrap();
     PlaybackFixture {
-        cipher: last.bytes,
+        cipher: [context.header.as_slice(), &first.bytes, &last.bytes].concat(),
         page: last.page.unwrap(),
         manifest: seal.finish().unwrap(),
         context,
@@ -130,6 +130,10 @@ pub fn make_s3_fixture() -> PlaybackFixture {
 #[wasm_bindgen(wasm_bindgen_futures = worker::wasm_bindgen_futures)]
 impl PlaybackFixture {
     pub fn ciphertext(&self) -> Vec<u8> {
+        self.cipher[self.cipher.len() - 17..].to_vec()
+    }
+
+    pub fn full_ciphertext(&self) -> Vec<u8> {
         self.cipher.clone()
     }
 

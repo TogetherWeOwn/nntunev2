@@ -1,12 +1,13 @@
-use std::{future::poll_fn, pin::pin};
+use std::{future::poll_fn, pin::pin, rc::Rc};
 
 use ::worker::{Context, Date, Env, Request, Response, Result};
 use futures_channel::oneshot;
-use futures_util::future::{select, Either};
+use futures_util::future::{join, select, Either};
 use nntune_core::original_source::reader::AsyncReadControl;
 
 use super::*;
 use crate::{
+    enrolled_playback::read_observation::ReadObservation,
     original_play::worker::{channel, WorkerOriginalControl},
     play_route::PLAY_CONTENT_TYPE,
     runtime::{api_error_response, report_delivered},
@@ -30,9 +31,14 @@ pub(crate) async fn serve(
         return api_error_response(&ApiError::unauthorized(), None);
     };
     let mut control = WorkerOriginalControl::until(grant.exp_unix, &req)?;
+    let observation = ReadObservation::from_env(&env, &req, &grant.track_id).map(Rc::new);
     let (ready, response) = oneshot::channel();
     ctx.wait_until(async move {
-        let source = source::WorkerSource::from_env(&env, request.token.as_deref().unwrap_or(""));
+        let source = source::WorkerSource::from_env(
+            &env,
+            request.token.as_deref().unwrap_or(""),
+            observation.clone(),
+        );
         let mut ready = Some(ready);
         let mut delivered = None;
         let result = {
@@ -78,9 +84,19 @@ pub(crate) async fn serve(
             let error = result.err().unwrap_or_else(ApiError::internal_error);
             let _ = ready.send(api_error_response(&error, None));
         }
-        if let Some(interval) = delivered {
-            report_delivered(env, interval).await;
-        }
+        join(
+            async {
+                if let Some(interval) = delivered {
+                    report_delivered(env, interval).await;
+                }
+            },
+            async {
+                if let Some(observation) = observation {
+                    observation.confirm_abort().await;
+                }
+            },
+        )
+        .await;
     });
     response
         .await

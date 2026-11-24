@@ -1,8 +1,9 @@
 //! Private playback for the stream route, with an injected committed source.
 
 use std::{
-    future::poll_fn,
+    future::{poll_fn, Future},
     io,
+    pin::pin,
     task::Poll,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -157,7 +158,7 @@ pub async fn serve<S: PrivateSource, W: OriginalWriter>(
             content_range,
         })
     });
-    let mut writer = None;
+    let mut writer: Option<W> = None;
     let mut delivery = Delivery::new(size, |served| {
         report(DeliveredInterval {
             user_id: grant.user_id.clone(),
@@ -171,44 +172,62 @@ pub async fn serve<S: PrivateSource, W: OriginalWriter>(
     let result = async {
         let mut cached = None;
         while let Some(index) = play.next_page(now()).map_err(|_| unavailable())? {
-            if cached
-                .as_ref()
-                .is_none_or(|(loaded, _, _)| *loaded != index)
-            {
-                let version = &page_versions[index as usize];
-                if matches!(version.as_str(), "" | "null")
-                    || version.len() > 1024
-                    || !version
-                        .bytes()
-                        .all(|byte| byte.is_ascii_graphic() && byte != b',')
+            let next = async {
+                if cached
+                    .as_ref()
+                    .is_none_or(|(loaded, _, _)| *loaded != index)
                 {
-                    return Err(unavailable());
+                    let version = &page_versions[index as usize];
+                    if matches!(version.as_str(), "" | "null")
+                        || version.len() > 1024
+                        || !version
+                            .bytes()
+                            .all(|byte| byte.is_ascii_graphic() && byte != b',')
+                    {
+                        return Err(unavailable());
+                    }
+                    let key = format!("media-digests/{object}/{map:032x}/{index:08x}");
+                    let size = geometry.page(index).ok_or_else(unavailable)?.encoded_len;
+                    let pin = ReadbackPin {
+                        configuration,
+                        object_key: &key,
+                        version: Some(version),
+                    };
+                    let (observed, bytes) = source
+                        .page(locator.bucket(), pin, size, until)
+                        .await
+                        .map_err(|_| unavailable())?;
+                    if &observed != version || bytes.len() != size as usize {
+                        return Err(unavailable());
+                    }
+                    cached = Some((index, observed, bytes));
                 }
-                let key = format!("media-digests/{object}/{map:032x}/{index:08x}");
-                let size = geometry.page(index).ok_or_else(unavailable)?.encoded_len;
-                let pin = ReadbackPin {
-                    configuration,
-                    object_key: &key,
-                    version: Some(version),
-                };
-                let (observed, bytes) = source
-                    .page(locator.bucket(), pin, size, until)
+                let (_, version, page) = cached.as_ref().expect("selected page");
+                let part = play
+                    .next((version, page), &now)
                     .await
-                    .map_err(|_| unavailable())?;
-                if &observed != version || bytes.len() != size as usize {
-                    return Err(unavailable());
+                    .map_err(|_| unavailable())?
+                    .ok_or_else(unavailable)?;
+                if !source.lease_live(&grant).await {
+                    return Err(ApiError::not_found());
                 }
-                cached = Some((index, observed, bytes));
-            }
-            let (_, version, page) = cached.as_ref().expect("selected page");
-            let part = play
-                .next((version, page), &now)
-                .await
-                .map_err(|_| unavailable())?
-                .ok_or_else(unavailable)?;
-            if !source.lease_live(&grant).await {
-                return Err(ApiError::not_found());
-            }
+                Ok(part)
+            };
+            let part = {
+                let mut next = pin!(next);
+                poll_fn(|cx| {
+                    // A cancelled response must wake the pump even while a
+                    // read is its only outstanding operation.
+                    if writer
+                        .as_mut()
+                        .is_some_and(|w| w.poll_cancel(cx).is_ready())
+                    {
+                        return Poll::Ready(Err(unavailable()));
+                    }
+                    next.as_mut().poll(cx)
+                })
+                .await?
+            };
             if let Some(start) = start.take() {
                 writer = start()?;
             }
