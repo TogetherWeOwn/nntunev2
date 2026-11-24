@@ -239,7 +239,8 @@ using the [private listening runbook](../docs/ops.md#private-listening-qualifica
 Arrange for the job to start within eight minutes of the cutoff. The armed
 push runs the private journey instead of the ordinary journey, so it cannot
 provide the ordinary journey gate required for production admission. Remove
-the arm, cohort setting and single-use fixture secret after the run.
+the arm, cohort setting and single-use fixture secret, then verify the
+[Stream disable deploy](../docs/ops.md#private-stream-staging).
 
 The runner checks both serving build identities before and after the journey,
 matches an authorized nonzero byte range against the checked-in FLAC, and
@@ -247,7 +248,9 @@ checks that access transitions from allowed to refused by the post-deadline
 probe. Invite-removal revocation requires a separate policy change.
 Keep the job URL, admin publication receipts, versioned storage readback
 and Stream deployment identity together when qualifying the encrypted path.
-The in-browser runner pins the web and API builds.
+The in-browser runner pins the web and API builds. The staging deploy must
+also verify the serving Stream version against the same commit before the
+runner can start.
 
 ## Run in GitHub Actions
 

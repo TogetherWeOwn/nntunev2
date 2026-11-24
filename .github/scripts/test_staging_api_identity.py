@@ -42,6 +42,29 @@ def version(*bindings, sha=SHA):
 
 
 class IdentityTests(unittest.TestCase):
+    def test_stream_receipt_requires_its_own_deployed_version_and_build(self):
+        output_stream = output(worker_name=identity.STREAM)
+        mode = {"name": "PRIVATE_PLAYBACK_ENABLED", "type": "plain_text"}
+        with TemporaryDirectory() as temp:
+            Path(temp, "wrangler-output-test.json").write_bytes(output_stream)
+            env = {"WRANGLER_OUTPUT_FILE_DIRECTORY": temp, "GITHUB_SHA": SHA, "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                   "CLOUDFLARE_API_TOKEN": "synthetic-token"}
+            for settings, enabled in (({}, "false"), ({"PRIVATE_PLAYBACK_STAGING_ENABLED": "true"}, "true")):
+                read = MagicMock(side_effect=[current(), version(dict(mode, text=enabled)), current()])
+                with patch.dict(identity.os.environ, env | settings, clear=True), patch.object(identity, "provider_result", read), redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(identity.main(identity.STREAM), 0)
+                self.assertEqual(json.loads(stdout.getvalue()), {"identity": "matched", "worker": identity.STREAM,
+                    "build_sha": SHA, "deployment_id": DEPLOYMENT, "version_id": VERSION, "private_playback_enabled": enabled == "true"})
+                self.assertTrue(all(f"/workers/scripts/{identity.STREAM}/" in call.args[0] for call in read.call_args_list))
+        with self.assertRaisesRegex(identity.Unavailable, "deploy-output-unavailable"):
+            identity.receipt(output(), SHA, ACCOUNT, MagicMock(), identity.STREAM, "false")
+        read = MagicMock(side_effect=[current(), version(mode, sha="e" * 40)])
+        with self.assertRaisesRegex(identity.Unavailable, "version-build-mismatch"):
+            identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "false")
+        read = MagicMock(side_effect=[current(), version(dict(mode, text="true"))])
+        with self.assertRaisesRegex(identity.Unavailable, "stream-mode-mismatch"):
+            identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "false")
+
     def test_cli_reports_matched_or_unavailable(self):
         deployment = identity.decode(json.dumps(current()).replace("100}", "100.0}").encode(), "bad fixture")
         deployment["deployments"] += current(OTHER, OTHER)["deployments"]

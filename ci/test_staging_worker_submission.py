@@ -13,6 +13,7 @@ class StagingWorkerSubmissionTests(unittest.TestCase):
             (deploy, "staging-api", "nntune-api-staging"),
             (deploy, "staging-mb", "nntune-mb-staging"),
             (deploy, "staging-ingest", "nntune-ingest-staging"),
+            (deploy, "staging-stream", "nntune-stream-staging"),
             (alerts, "deploy", "nntune-alerts-staging"),
         ]
         for workflow, job, worker in lanes:
