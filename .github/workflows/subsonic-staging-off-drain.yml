@@ -15,6 +15,10 @@ on:
         description: Build SHA from the same receipt (not the workflow SHA)
         type: string
         required: true
+      run_off_probe:
+        description: Send one off-state Subsonic POST without application credentials
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -23,7 +27,7 @@ jobs:
   readback:
     name: Verify Subsonic staging is off and drained
     if: >-
-      ${{ github.repository == 'TogetherWeOwn/nntunev2' &&
+      ${{ !inputs.run_off_probe && github.repository == 'TogetherWeOwn/nntunev2' &&
           github.ref == 'refs/heads/main' && github.ref_protected &&
           github.workflow_sha == github.sha && github.run_attempt == 1 }}
     runs-on: ubuntu-latest
@@ -48,3 +52,36 @@ jobs:
           SUBSONIC_STAGING_WORKERS_READ_TOKEN: ${{ secrets.SUBSONIC_STAGING_WORKERS_READ_TOKEN }}
           PLANETSCALE_OBSERVER_URL_STAGING: ${{ secrets.PLANETSCALE_OBSERVER_URL_STAGING }}
         run: exec timeout -k 2s 32s python3 -I .github/scripts/subsonic_staging_off_drain.py 2>/dev/null
+
+  off-probe:
+    name: Probe the protected Subsonic staging off state
+    if: >-
+      ${{ inputs.run_off_probe && github.event_name == 'workflow_dispatch' &&
+          github.repository == 'TogetherWeOwn/nntunev2' &&
+          github.ref == 'refs/heads/main' && github.ref_protected &&
+          github.workflow_sha == github.sha && github.run_attempt == 1 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    concurrency:
+      group: deploy-staging-main
+      cancel-in-progress: false
+      queue: max
+    environment:
+      name: staging
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Probe one staging Subsonic route and verify drain
+        env:
+          EXPECTED_STAGING_DEPLOYMENT_ID: ${{ inputs.expected_deployment_id }}
+          EXPECTED_STAGING_VERSION_ID: ${{ inputs.expected_version_id }}
+          EXPECTED_STAGING_BUILD_SHA: ${{ inputs.expected_build_sha }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SUBSONIC_STAGING_WORKERS_READ_TOKEN: ${{ secrets.SUBSONIC_STAGING_WORKERS_READ_TOKEN }}
+          PLANETSCALE_OBSERVER_URL_STAGING: ${{ secrets.PLANETSCALE_OBSERVER_URL_STAGING }}
+          SUBSONIC_PROBE_ACCESS_CLIENT_ID: ${{ secrets.SUBSONIC_PROBE_ACCESS_CLIENT_ID }}
+          SUBSONIC_PROBE_ACCESS_CLIENT_SECRET: ${{ secrets.SUBSONIC_PROBE_ACCESS_CLIENT_SECRET }}
+        run: exec timeout -k 2s 75s python3 -I .github/scripts/subsonic_staging_probe.py 2>/dev/null

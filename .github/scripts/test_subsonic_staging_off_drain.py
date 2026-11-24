@@ -2,20 +2,24 @@
 
 import io
 import os
+import runpy
 import signal
+import subprocess
 import sys
 import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import subsonic_staging_off_drain as adapter
+import subsonic_staging_probe as probe
 from subsonic_staging_cleanup import CleanupResult
 from subsonic_staging_observer import PressureObservation
-from test_subsonic_staging_cleanup import PIN, deployment, version
+from test_subsonic_staging_cleanup import OTHER, PIN, deployment, version
 
 READ_TOKEN = "SUBSONIC_STAGING_WORKERS_READ_TOKEN"
 OBSERVER = "PLANETSCALE_OBSERVER_URL_STAGING"
@@ -28,6 +32,12 @@ ENV = {
     "EXPECTED_STAGING_VERSION_ID": PIN.version_id,
     "EXPECTED_STAGING_BUILD_SHA": PIN.build_sha,
 }
+PROBE_ENV = ENV | {probe.ACCESS_ID: "fixture-edge-id", probe.ACCESS_SECRET: "fixture-edge-secret"}
+OFF_REPLY = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: private, no-store\r\n\r\n"
+    b'{"subsonic-response":{"status":"failed","version":"1.16.1","type":"nntune","serverVersion":"0.1.0",'
+    b'"openSubsonic":true,"error":{"code":40,"message":"Wrong username or password."}}}'
+)
 
 
 class ReadbackTests(unittest.TestCase):
@@ -136,7 +146,8 @@ class ReadbackTests(unittest.TestCase):
             "ref: ${{ github.sha }}\n          persist-credentials: false",
         ):
             self.assertIn(guard, text)
-        prefix, step = text.split(
+        readback, _ = text.split("\n  off-probe:\n")
+        prefix, step = readback.split(
             "      - name: Read staging off and drained state (no restore)\n"
         )
         self.assertNotIn("secrets.", prefix)
@@ -207,6 +218,109 @@ class ReadbackTests(unittest.TestCase):
         self.assertIn(
             "READBACK_OUTCOME: ${{ steps.subsonic_readback.outcome }}", suffix
         )
+
+
+class ProtectedProbeTests(unittest.TestCase):
+    def test_probe_is_opt_in_and_secrets_are_bound_only_to_its_protected_step(self):
+        path = Path(__file__).parents[1] / "workflows/subsonic-staging-off-drain.yml"
+        default, opted_in = path.read_text().split("\n  off-probe:\n")
+        self.assertIn("type: boolean\n        default: false", default)
+        self.assertIn("!inputs.run_off_probe &&", default)
+        guard, command = opted_in.split("      - name: Probe one staging Subsonic route and verify drain\n")
+        for required in (
+            "inputs.run_off_probe && github.event_name == 'workflow_dispatch' &&",
+            "github.repository == 'TogetherWeOwn/nntunev2' &&",
+            "github.ref == 'refs/heads/main' && github.ref_protected &&",
+            "github.workflow_sha == github.sha && github.run_attempt == 1",
+            "group: deploy-staging-main\n      cancel-in-progress: false\n      queue: max",
+            "environment:\n      name: staging\n      deployment: false",
+            "ref: ${{ github.sha }}\n          persist-credentials: false",
+        ):
+            self.assertIn(required, guard)
+        self.assertNotIn("secrets.", guard)
+        for name in (probe.ACCESS_ID, probe.ACCESS_SECRET):
+            self.assertNotIn(name, default)
+            self.assertIn(f"{name}: ${{{{ secrets.{name} }}}}", command)
+            for other in path.parent.glob("*.yml"):
+                if other != path:
+                    self.assertNotIn(name, other.read_text(), other.name)
+        self.assertRegex(command, r"exec timeout -k 2s 75s python3 -I .*subsonic_staging_probe.py")
+
+    def test_disposable_transport_is_reaped_before_independent_postflight(self):
+        transport_type = runpy.run_path(str(probe.RUNNER))["StagingPostTransport"]
+        config = (
+            'header = "Content-Type: application/x-www-form-urlencoded"\n'
+            'header = "Accept-Encoding: identity"\n'
+            'header = "X-Subsonic-Measurement-Case: small"\n'
+            'header = "CF-Access-Client-Id: fixture-edge-id"\n'
+            'header = "CF-Access-Client-Secret: fixture-edge-secret"\n'
+            'data-binary = "f=json"\n'
+        ).encode()
+        cases = (
+            ("success", OFF_REPLY, 2, 0, "verified", ["sample", "post", "sample"]),
+            ("redirect", b"HTTP/1.1 302 Found\r\nLocation: https://example.invalid\r\n\r\n",
+             2, 0, "request-failed", ["sample", "post", "sample"]),
+            ("oversize", b"HTTP/1.1 200 OK\r\nContent-Length: 1025\r\n\r\n",
+             2, 0, "request-failed", ["sample", "post", "sample"]),
+            ("armed rejection", OFF_REPLY.replace(b"200 OK", b"404 Not Found"),
+             2, 0, "request-failed", ["sample", "post", "sample"]),
+            ("wrong protocol error", OFF_REPLY.replace(b'"code":40', b'"code":44'),
+             2, 0, "request-failed", ["sample", "post", "sample"]),
+            ("cancel", OFF_REPLY, 2, 0, "cancelled", ["sample", "post", "sample"]),
+            ("postflight busy", OFF_REPLY, 2, 1, "postflight-unverified", ["sample", "post", "sample"]),
+            ("postflight drift", OFF_REPLY, 2, 0, "postflight-unverified", ["sample", "post"]),
+            ("preflight pressure", OFF_REPLY, 1, 0, "preflight-unverified", ["sample"]),
+            ("missing access", OFF_REPLY, 2, 0, "access-config-unavailable", []),
+        )
+        for case, response, free, backends, verdict, expected_events in cases:
+            with self.subTest(case=case):
+                events, children, cancel = [], [], Event()
+
+                def spawn(argv, **options):
+                    self.assertEqual(argv[-3:], ("-", "--url", "https://staging.nntune.com/rest/getArtists"))
+                    for flag, value in (("--request", "POST"), ("--retry", "0"),
+                                        ("--connect-timeout", "2.0"), ("--max-time", "10.0")):
+                        self.assertEqual(argv[argv.index(flag) + 1], value)
+                    self.assertIn("--no-location", argv)
+                    self.assertEqual(options["env"], {})
+                    self.assertFalse(any(PROBE_ENV[k] in arg for k in (probe.ACCESS_ID, probe.ACCESS_SECRET) for arg in argv))
+                    events.append("post")
+                    script = (
+                        "import sys, time\n"
+                        f"assert sys.stdin.buffer.read() == {config!r}\n"
+                        f"sys.stdout.buffer.write({response!r})\nsys.stdout.flush()\n"
+                        f"time.sleep({60 if case in ('redirect', 'oversize', 'cancel') else 0})\n"
+                    )
+                    child = subprocess.Popen([sys.executable, "-I", "-c", script], **options)
+                    children.append(child)
+                    self.addCleanup(child.wait, timeout=2)
+                    self.addCleanup(child.kill)
+                    if case == "cancel":
+                        cancel.set()
+                    return child
+
+                def pressure(env, *, deadline_ms):
+                    events.append("sample")
+                    if children:
+                        child, = children
+                        self.assertIsNotNone(child.returncode)
+                        self.assertTrue(child.stdin.closed and child.stdout.closed)
+                    return PressureObservation(time.monotonic() * 1000, backends if children else 0, free)
+
+                def read_provider(path, _):
+                    if "/versions/" in path:
+                        return version()
+                    if children and case == "postflight drift":
+                        return deployment(deployment_id=OTHER)
+                    return deployment()
+
+                env = PROBE_ENV | ({probe.ACCESS_ID: ""} if case == "missing access" else {})
+                with (
+                    patch.object(adapter, "provider_result", side_effect=read_provider),
+                    patch.object(adapter, "sample_pressure", side_effect=pressure),
+                ):
+                    self.assertEqual(probe.probe(env, transport_type(spawn=spawn), cancel), verdict)
+                self.assertEqual(events, expected_events)
 
 
 if __name__ == "__main__":
