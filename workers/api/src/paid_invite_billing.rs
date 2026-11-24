@@ -112,6 +112,9 @@ pub(super) fn selectable_test_price<'a>(
     bindings: &'a [crate::billing_reconcile::PriceBinding],
     plan: &str,
 ) -> Option<&'a str> {
+    if crate::plan_limits::PlanId::parse_id(plan)? == crate::plan_limits::PlanId::Free {
+        return None;
+    }
     let mut eligible = bindings
         .iter()
         .filter(|row| row.plan_id == plan && row.selectable && !row.livemode);
