@@ -520,7 +520,10 @@ test('reconciles a sole exact upload and safely retries an interrupted abort', a
   const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
     if (request.method === 'GET') {
       assert.equal((await verifySignedRequest(request, 'GET', listQuery, {}, '')).length, 0);
-      return new Response(listing([...open].map(([key, id]) => listedUpload(key, id)).join('')));
+      const completePage = listing([...open].map(([key, id]) => listedUpload(key, id)).join(''))
+        .replace('<MaxUploads>', `<NextKeyMarker>${suffix}</NextKeyMarker>`
+          + '<NextUploadIdMarker>unrelated</NextUploadIdMarker><MaxUploads>');
+      return new Response(completePage);
     }
     assert.equal((await verifySignedRequest(request, 'DELETE', initiatedQuery, {})).length, 0);
     if (open.delete(mediaKey)) {
@@ -586,6 +589,7 @@ test('an ambiguous or mismatched abort response stays unconfirmed', async (t) =>
     '<Error><Code>NoSuchBucket</Code></Error>',
     '<Error><Code>NoSuchUpload</Code><Key>media/other</Key></Error>',
     '<Error><Code>NoSuchUpload</Code><UploadId>other</UploadId></Error>',
+    '<Error><Code>NoSuchUpload</Code><Resource>/other-bucket/other-key</Resource></Error>',
     '<Error><Code>NoSuchUpload</Code><Code>NoSuchBucket</Code></Error>',
   ]) {
     reply = body;

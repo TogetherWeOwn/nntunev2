@@ -60,35 +60,18 @@ pub async fn dispatch_multipart_scope(
     env: &Env,
     mut db: Client,
     scope: CleanupScope<'_>,
-    environment: [u8; 16],
+    environment: &str,
     provider: &crate::multipart::s3_completion::S3CompletionSender,
 ) -> Result<(), DispatchError> {
-    if !scope
-        .environment_id
-        .replace('-', "")
-        .eq_ignore_ascii_case(&crate::digest_candidate_store::uuid(&environment))
-    {
-        return Err(DispatchError::MultipartNotConfirmed);
-    }
-    dispatch_claims(
+    reconcile::dispatch_multipart_claims(
         &mut db,
         scope,
-        async |db, claim| {
-            with_db_deadline(
-                reconcile::reconcile(
-                    db,
-                    scope,
-                    claim,
-                    provider.bucket(),
-                    &provider.configuration(),
-                    async |key, until| provider.find_incomplete(key, until).await,
-                    async |key, id, until| provider.abort_incomplete(key, id, until).await,
-                ),
-                Delay::from(Duration::from_secs(60)),
-                || (),
-            )
-            .await
-        },
+        environment,
+        provider.multipart_scope(),
+        (
+            async |key, until| provider.find_incomplete(key, until).await,
+            async |key, id, until| provider.abort_incomplete(key, id, until).await,
+        ),
         |message, delay| send_cleanup_message(env, message, delay),
         db_deadline,
     )
@@ -106,11 +89,12 @@ where
     S: Future<Output = Result<(), ()>>,
     D: Future<Output = ()>,
 {
-    let claims = with_db_deadline(scope.claim(db), deadline(), || ())
+    let mut claims = with_db_deadline(scope.claim(db), deadline(), || ())
         .await
         .map_err(|()| DispatchError::ClaimNotConfirmed)?;
+    claims.sort_by_key(|claim| claim.kind == CleanupKind::TerminalReconcile);
     for claim in claims {
-        prepare(db, &claim)
+        with_db_deadline(prepare(db, &claim), deadline(), || ())
             .await
             .map_err(|()| DispatchError::MultipartNotConfirmed)?;
         let db = &mut *db;

@@ -4,12 +4,8 @@ use super::{encode_query_value, Digest, S3CompletionSender, Sha256, SignedReques
 use crate::multipart::{s3_receipt_reader, session_completion::valid_upload_id, S3_XML_NAMESPACE};
 
 impl S3CompletionSender {
-    pub(crate) fn bucket(&self) -> &str {
-        &self.bucket
-    }
-
-    pub(crate) fn configuration(&self) -> [u8; 16] {
-        self.configuration
+    pub(crate) fn multipart_scope(&self) -> ([u8; 16], &str) {
+        (self.configuration, &self.bucket)
     }
 
     pub(crate) async fn find_incomplete(&self, key: &str, until: SystemTime) -> Result<String, ()> {
@@ -32,40 +28,33 @@ impl S3CompletionSender {
             return Err(());
         }
         let result = Element::document(&reply.body, "ListMultipartUploadsResult")?;
-        if result.field("Bucket")? != Some(self.bucket())
+        let markers = ["KeyMarker", "UploadIdMarker", "Delimiter"];
+        let next_markers = ["NextKeyMarker", "NextUploadIdMarker"];
+        if result.field("Bucket")? != Some(self.bucket.as_str())
             || result.field("Prefix")? != Some(key)
             || result.field("IsTruncated")? != Some("false")
             || result
                 .field("MaxUploads")?
                 .is_some_and(|value| value != "2")
             || result.children.iter().any(|child| {
+                let name = child.name.as_str();
                 !matches!(
-                    child.name.as_str(),
-                    "Bucket"
-                        | "Prefix"
-                        | "IsTruncated"
-                        | "MaxUploads"
-                        | "Upload"
-                        | "KeyMarker"
-                        | "UploadIdMarker"
-                        | "NextKeyMarker"
-                        | "NextUploadIdMarker"
-                        | "Delimiter"
-                )
+                    name,
+                    "Bucket" | "Prefix" | "IsTruncated" | "MaxUploads" | "Upload"
+                ) && !markers.contains(&name)
+                    && !next_markers.contains(&name)
             })
         {
             return Err(());
         }
-        for field in [
-            "KeyMarker",
-            "UploadIdMarker",
-            "NextKeyMarker",
-            "NextUploadIdMarker",
-            "Delimiter",
-        ] {
+        for field in markers {
             if result.field(field)?.is_some_and(|value| !value.is_empty()) {
                 return Err(());
             }
+        }
+        // Complete pages can still echo next markers. Never follow them.
+        for field in next_markers {
+            result.field(field)?;
         }
         let mut candidate = None;
         for (index, upload) in result
@@ -118,16 +107,12 @@ impl S3CompletionSender {
                     return Err(());
                 }
                 for (field, expected) in [
-                    ("BucketName", self.bucket()),
+                    ("BucketName", self.bucket.as_str()),
                     ("Key", key),
                     ("UploadId", id),
+                    ("Resource", &format!("/{}/{key}", self.bucket)),
                 ] {
                     if error.field(field)?.is_some_and(|value| value != expected) {
-                        return Err(());
-                    }
-                }
-                if let Some(resource) = error.field("Resource")? {
-                    if resource != format!("/{}/{key}", self.bucket()) {
                         return Err(());
                     }
                 }

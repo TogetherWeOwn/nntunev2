@@ -25,10 +25,10 @@ WITH locked AS MATERIALIZED (
     UPDATE public.ingest_session_reservations AS s
     SET multipart_upload_id = $8::text
     FROM live
-    WHERE s.id = live.id AND live.media_key IS NOT NULL AND $8 IS NOT NULL
+    WHERE s.id = live.id AND live.media_key IS NOT NULL AND $8::text IS NOT NULL
       AND s.multipart_upload_id IS NULL AND clock_timestamp() < live.claimed_until
     RETURNING s.id
 )
 SELECT media_key, COALESCE($8, multipart_upload_id),
        floor(extract(epoch FROM claimed_until) * 1000)::bigint
-FROM live WHERE $8 IS NULL OR EXISTS (SELECT FROM pinned WHERE pinned.id = live.id);
+FROM live WHERE $8::text IS NULL OR EXISTS (SELECT FROM pinned WHERE pinned.id = live.id);

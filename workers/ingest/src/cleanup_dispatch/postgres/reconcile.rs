@@ -1,9 +1,54 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    future::Future,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use super::{begin, CleanupClaim, CleanupKind, CleanupScope, Client};
+use super::{
+    begin, dispatch_claims, CleanupClaim, CleanupKind, CleanupMessage, CleanupScope, Client,
+    DispatchError,
+};
 use crate::{digest_candidate_store::uuid, multipart::session_completion::valid_upload_id};
 
 const TARGET: &str = include_str!("reconcile.sql");
+
+pub(super) async fn dispatch_multipart_claims<
+    S: Future<Output = Result<(), ()>>,
+    D: Future<Output = ()>,
+>(
+    db: &mut Client,
+    scope: CleanupScope<'_>,
+    environment: &str,
+    (configuration, bucket): ([u8; 16], &str),
+    (mut find, mut abort): (
+        impl AsyncFnMut(&str, SystemTime) -> Result<String, ()>,
+        impl AsyncFnMut(&str, &str, SystemTime) -> Result<(), ()>,
+    ),
+    send: impl FnMut(CleanupMessage, u32) -> S,
+    deadline: impl Fn() -> D,
+) -> Result<(), DispatchError> {
+    if !scope.environment_id.eq_ignore_ascii_case(environment) {
+        return Err(DispatchError::MultipartNotConfirmed);
+    }
+    dispatch_claims(
+        db,
+        scope,
+        async |db, claim| {
+            reconcile(
+                db,
+                scope,
+                claim,
+                bucket,
+                &configuration,
+                &mut find,
+                &mut abort,
+            )
+            .await
+        },
+        send,
+        &deadline,
+    )
+    .await
+}
 
 /// Reuse the delivery lease to bound the provider attempt. A discovered ID is
 /// committed before abort, so replay never has to infer success from an empty
@@ -61,9 +106,6 @@ pub(super) async fn reconcile(
         (id, until)
     } else {
         let found = find(&key, until).await?;
-        if !valid_upload_id(&found) {
-            return Err(());
-        }
         let (pinned_key, pinned_id, until) = target(db, Some(&found)).await?;
         if pinned_key.as_deref() != Some(&key) || pinned_id.as_deref() != Some(&found) {
             return Err(());

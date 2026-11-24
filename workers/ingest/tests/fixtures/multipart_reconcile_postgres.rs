@@ -4,6 +4,7 @@ use crate::{
     multipart::{session_outcome::CompletionScope, session_upload},
 };
 use nntune_core::media_envelope::EnvelopeContext;
+use reconcile::dispatch_multipart_claims;
 use std::{cell::Cell, future::pending, time::SystemTime};
 
 const DB: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci";
@@ -156,29 +157,53 @@ async fn postgres_reconciles_a_lost_initiation() {
     ), &[]).await.unwrap().get(0);
     assert_eq!(reason, "aborted");
 
-    let prepare_without_s3 = async |db: &mut Client, claim: &CleanupClaim| {
-        reconcile::reconcile(
-            db,
-            scope,
-            claim,
-            BUCKET,
-            &identities[5],
-            unexpected_list,
-            unexpected_abort,
+    observer
+        .execute(
+            "INSERT INTO public.ingest_session_cleanup_intents (session_id, kind, due_at)
+         VALUES ($1::text::uuid, 'absolute_expiry', clock_timestamp() + interval '10 minutes')",
+            &[&session],
         )
         .await
-    };
+        .unwrap();
+
+    let provider_scope = (identities[5], BUCKET);
     assert_eq!(
-        dispatch_claims(
+        dispatch_multipart_claims(
             &mut writer,
             scope,
-            prepare_without_s3,
+            &library,
+            provider_scope,
+            (unexpected_list, unexpected_abort),
             unexpected_send,
-            deadline
+            deadline,
         )
         .await,
         Err(DispatchError::MultipartNotConfirmed)
     );
+    let sent_expiry = Cell::new(false);
+    assert_eq!(
+        dispatch_multipart_claims(
+            &mut writer,
+            scope,
+            &environment,
+            provider_scope,
+            (unexpected_list, unexpected_abort),
+            |message, delay| {
+                let CleanupMessage::UploadSessionCleanup { session_id, kind } = message;
+                assert_eq!(
+                    (session_id.as_str(), kind),
+                    (session.as_str(), CleanupKind::AbsoluteExpiry)
+                );
+                assert!((1..=600).contains(&delay));
+                assert!(!sent_expiry.replace(true));
+                std::future::ready(Ok(()))
+            },
+            deadline,
+        )
+        .await,
+        Err(DispatchError::MultipartNotConfirmed)
+    );
+    assert!(sent_expiry.get());
     expire_claim(&observer, &session).await;
     observer.execute(
         "UPDATE public.ingest_session_reservations SET idle_deadline = clock_timestamp() WHERE id=$1::text::uuid",
@@ -270,48 +295,43 @@ async fn postgres_reconciles_a_lost_initiation() {
         0,
     )
     .unwrap();
+    let mut contender = connect().await;
     let (started, started_rx) = tokio::sync::oneshot::channel();
     let started = Cell::new(Some(started));
-    let interrupted = dispatch_claims(
+    let interrupted = dispatch_multipart_claims(
         &mut writer,
         scope,
-        async |db, claim| {
-            assert_eq!(
-                reconcile::reconcile(
-                    db,
-                    scope,
-                    &stale,
-                    BUCKET,
-                    &identities[5],
-                    unexpected_list,
-                    unexpected_abort
-                )
-                .await,
-                Err(())
-            );
-            reconcile::reconcile(
-                db,
-                scope,
-                claim,
-                BUCKET,
-                &identities[5],
-                async |observed, _| {
-                    assert_eq!(observed, key);
-                    assert!(created.get());
-                    Ok(UPLOAD.into())
-                },
-                async |observed, upload, until| {
-                    assert_eq!((observed, upload), (key.as_str(), UPLOAD));
-                    assert!(SystemTime::now() < until);
-                    assert_eq!(saved_id(&observer, &session).await.as_deref(), Some(UPLOAD));
-                    // Abort reached S3, but its response is lost when the task is dropped.
-                    assert!(created.replace(false));
-                    started.take().unwrap().send(()).unwrap();
-                    pending().await
-                },
-            )
-            .await
-        },
+        &environment,
+        provider_scope,
+        (
+            async |observed: &str, _| {
+                assert_eq!(observed, key);
+                assert!(created.get());
+                assert_eq!(
+                    reconcile::reconcile(
+                        &mut contender,
+                        scope,
+                        &stale,
+                        BUCKET,
+                        &identities[5],
+                        unexpected_list,
+                        unexpected_abort,
+                    )
+                    .await,
+                    Err(())
+                );
+                Ok(UPLOAD.into())
+            },
+            async |observed: &str, upload: &str, until| {
+                assert_eq!((observed, upload), (key.as_str(), UPLOAD));
+                assert!(SystemTime::now() < until);
+                assert_eq!(saved_id(&observer, &session).await.as_deref(), Some(UPLOAD));
+                // Abort reached S3, but its response is lost when the task is dropped.
+                assert!(created.replace(false));
+                started.take().unwrap().send(()).unwrap();
+                pending().await
+            },
+        ),
         unexpected_send,
         deadline,
     );
@@ -323,25 +343,16 @@ async fn postgres_reconciles_a_lost_initiation() {
     expire_claim(&observer, &session).await;
 
     let sent = Cell::new(false);
-    dispatch_claims(
+    dispatch_multipart_claims(
         &mut writer,
         scope,
-        async |db, claim| {
-            reconcile::reconcile(
-                db,
-                scope,
-                claim,
-                BUCKET,
-                &identities[5],
-                unexpected_list,
-                async |observed, upload, _| {
-                    assert_eq!((observed, upload), (key.as_str(), UPLOAD));
-                    assert!(!created.get()); // Synthetic NoSuchUpload on same ID.
-                    Ok(())
-                },
-            )
-            .await
-        },
+        &environment,
+        provider_scope,
+        (unexpected_list, async |observed: &str, upload: &str, _| {
+            assert_eq!((observed, upload), (key.as_str(), UPLOAD));
+            assert!(!created.get()); // Synthetic NoSuchUpload on same ID.
+            Ok(())
+        }),
         |message, delay| {
             let CleanupMessage::UploadSessionCleanup { session_id, kind } = message;
             assert_eq!(
@@ -372,7 +383,7 @@ async fn postgres_reconciles_a_lost_initiation() {
                 c.enqueued_at IS NOT NULL, c.delivery_claim_id IS NULL
          FROM public.ingest_session_reservations AS s
          JOIN public.ingest_session_cleanup_intents AS c ON c.session_id = s.id
-         WHERE s.id = $1::text::uuid",
+         WHERE s.id = $1::text::uuid AND c.kind = 'terminal_reconcile'",
             &[&session],
         )
         .await
