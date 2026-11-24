@@ -503,6 +503,8 @@ fn site_slice<'a>(production: &'a str, func: &str) -> &'a str {
 #[test]
 fn migrated_events_fire_from_their_own_call_site_with_its_trace() {
     let lib = production("src/lib.rs");
+    assert_eq!(lib.matches(".analytics_engine(").count(), 1);
+    assert!(fn_body(&lib, "send").contains(".analytics_engine(METER_DATASET_BINDING)"));
     let consumer = production("src/queue_consumer.rs");
     assert_eq!(
         SITE_PINS.len(),
@@ -698,13 +700,6 @@ fn size_refused_terminal_keeps_its_positive_refusal_guard() {
 // Finding 4: returned error strings are fixed categories, never built from
 // an error value (`e.to_string()` bypasses a `format!`-only scan).
 // ---------------------------------------------------------------------------
-
-#[test]
-fn meter_binding_lookup_is_inside_the_validated_send_path() {
-    let lib = production("src/lib.rs");
-    assert_eq!(lib.matches(".analytics_engine(").count(), 1);
-    assert!(fn_body(&lib, "send").contains(".analytics_engine(METER_DATASET_BINDING)"));
-}
 
 #[test]
 fn migrated_files_never_serialize_an_error_value_into_a_string() {

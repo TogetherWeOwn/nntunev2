@@ -72,7 +72,6 @@ pub enum MeterTransportReason {
 }
 
 impl MeterTransportReason {
-    /// Classify an upstream failure without inspecting or formatting it.
     pub(crate) fn redact<T, E>(self, result: Result<T, E>) -> Result<T, Self> {
         result.map_err(|_| self)
     }
@@ -90,14 +89,13 @@ pub enum MeterWriteError {
     /// (missing `INGEST_METER` binding, connection refused, timeout).
     Transport(MeterTransportReason),
     /// The dataset endpoint answered with a non-2xx HTTP-equivalent status.
-    Rejected {
-        status: u16,
-    },
+    Rejected { status: u16 },
+    /// Ledger failures use the generic retry response and admission diagnostics.
     AdmissionLedgerUnavailable,
 }
 
 impl MeterWriteError {
-    /// Fixed diagnostic code; neither upstream errors nor stage input appear here.
+    /// Fixed code for display and meter diagnostics.
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::UnknownStage => "meter_unknown_stage",

@@ -683,25 +683,27 @@ pub(crate) fn try_meter(
     }
 }
 
-/// Keep the public error generic while the log retains the fixed reason code.
-fn meter_failure_projection(err: &MeterWriteError) -> (ApiError, Option<&'static str>) {
-    if err.is_retryable() {
-        (
-            ApiError::service_unavailable("service unavailable"),
-            Some("5"),
-        )
+fn meter_failure_http(err: &MeterWriteError) -> http::Response<Vec<u8>> {
+    let mut response = http::Response::builder().status(err.http_status()).header(
+        http::header::CONTENT_TYPE,
+        "application/json; charset=utf-8",
+    );
+    let api_error = if err.is_retryable() {
+        response = response.header(http::header::RETRY_AFTER, "5");
+        ApiError::service_unavailable("service unavailable")
     } else {
-        (ApiError::invalid_request("unknown meter stage"), None)
-    }
+        ApiError::invalid_request("unknown meter stage")
+    };
+    response
+        .body(api_error.body_json().into_bytes())
+        .expect("fixed meter response is valid")
 }
 
 fn meter_failure_response(err: &MeterWriteError) -> Result<Response> {
-    let (api_error, retry_after) = meter_failure_projection(err);
-    let mut response = json_error(api_error)?;
-    if let Some(seconds) = retry_after {
-        response.headers_mut().append("retry-after", seconds)?;
-    }
-    Ok(response)
+    let (parts, body) = meter_failure_http(err).into_parts();
+    Ok(Response::from_body(worker::ResponseBody::Body(body))?
+        .with_status(parts.status.as_u16())
+        .with_headers(parts.headers.into()))
 }
 
 /// Durable metered admission: the (`job_id`, `stage`) ledger owns the
@@ -2564,21 +2566,20 @@ mod tests {
                     serde_json::json!({"reason": reason, "build_sha": "unknown"})
                 );
             }
-            let (api_error, header) = meter_failure_projection(&err);
-            assert_eq!(api_error.status, status);
-            assert_eq!(err.http_status(), status);
-            assert_eq!(header, (status == 503).then_some("5"));
-            let body = api_error.body_json();
+            let response = meter_failure_http(&err);
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(http::header::RETRY_AFTER),
+                (status == 503).then_some(&http::HeaderValue::from_static("5"))
+            );
+            let body = std::str::from_utf8(response.body()).unwrap();
             assert!(!body.contains(CANARY));
             let expected = if status == 503 {
-                serde_json::json!({"code": "service_unavailable", "message": "service unavailable", "retryable": true})
+                r#"{"code":"service_unavailable","message":"service unavailable","retryable":true}"#
             } else {
-                serde_json::json!({"code": "invalid_request", "message": "unknown meter stage", "retryable": false})
+                r#"{"code":"invalid_request","message":"unknown meter stage","retryable":false}"#
             };
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-                expected
-            );
+            assert_eq!(body, expected);
         }
     }
 
