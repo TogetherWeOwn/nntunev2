@@ -26,15 +26,7 @@ const TRACKS: [&str; 2] = [
 const ROWS: &str = "SELECT t.id::text, t.medium_no, t.track_no, t.mbid::text, s.object_id::text
     FROM public.tracks t LEFT JOIN public.catalogue_s3_sources s ON t.id = s.track_id
     WHERE release_id = $1::text::uuid ORDER BY medium_no, track_no";
-const READ: &str = "SELECT p.map_id::text, m.object_id::text, i.generation_id::text,
-        i.provider_configuration_version_id::text, w.root_version_id::text,
-        p.media_version, p.page_versions
-    FROM public.test_committed_uploads s
-    JOIN public.storage_digest_inventory_intents p USING (map_id)
-    JOIN public.storage_digest_map_intents m USING (map_id)
-    JOIN public.storage_object_intents i USING (object_id)
-    JOIN public.storage_validated_digest_winners w USING (object_id)
-    WHERE s.scope = $1";
+const READ: &str = include_str!("../fixtures/catalogue_completed_upload_read.sql");
 
 fn scope_key(scope: &CompletionScope<'_>) -> [String; 8] {
     [
@@ -255,10 +247,17 @@ pub(super) async fn exercise(
     wrong_request[1].scope.fingerprint = &[0; 32];
     let mut mismatched = uploads;
     mismatched[1].flac.verified = uploads[0].flac.verified;
+    // A non-final scope must refuse before the indeterminate reader runs.
+    let mut wrong_seal = uploads;
+    wrong_seal[0].scope.seal = [0; 16];
+    let mut wrong_offset = uploads;
+    wrong_offset[0].scope.offset = 0;
     for evidence in [
         Scoped(&mismatched),
         Scoped(&foreign),
         Scoped(&wrong_request),
+        Indeterminate(&wrong_seal),
+        Indeterminate(&wrong_offset),
     ]
     .into_iter()
     .chain((0..7).map(|pin| Conflicting(&uploads, pin)))
