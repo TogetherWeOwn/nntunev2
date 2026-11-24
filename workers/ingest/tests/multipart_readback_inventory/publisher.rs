@@ -15,6 +15,9 @@ use nntune_ingest::{
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
 
+#[path = "publisher_outcome.rs"]
+mod outcome;
+
 const RETAIN_UNTIL: i64 = 2_000_000_000;
 const INVENTORY: &str = "SELECT media_version, page_versions
     FROM public.storage_digest_inventory_intents WHERE map_id = $1::text::uuid";
@@ -29,7 +32,9 @@ async fn connect() -> Client {
             && std::env::var("NNTUNE_TEST_DATABASE_URL").as_deref() == Ok(SCRATCH),
         "disposable GitHub-hosted migration database required"
     );
-    let (client, connection) = tokio_postgres::connect(SCRATCH, NoTls).await.unwrap();
+    let mut config: tokio_postgres::Config = SCRATCH.parse().unwrap();
+    config.hostaddr(std::net::Ipv4Addr::LOCALHOST.into());
+    let (client, connection) = config.connect(NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
     client
         .batch_execute("SET statement_timeout = '10s'; SET lock_timeout = '5s'")
@@ -46,12 +51,17 @@ mod catalogue;
 #[tokio::test]
 #[ignore = "requires a migrated disposable PostgreSQL database"]
 async fn postgres_stages_completed_candidate_atomically() {
+    publisher_fixture(false).await;
+}
+
+async fn publisher_fixture(with_outcome: bool) {
     let observer = connect().await;
     let mut writer = connect().await;
     let mut contender = connect().await;
-    let identities = [0x70, 0x71, 0x72, 0x73, 0x74, 5].map(id);
+    let first = if with_outcome { 0x90 } else { 0x70 };
+    let identities = [first, first + 1, first + 2, first + 3, first + 4, 5].map(id);
     let [root, environment, library, object, generation, provider] = identities.map(hex::encode);
-    let map_id = id(0x75);
+    let map_id = id(first + 5);
     let map = hex::encode(map_id);
     let key = format!("media/{object}/{generation}");
     let page_key = format!("media-digests/{object}/{generation}/{map}/00000000");
@@ -114,6 +124,10 @@ async fn postgres_stages_completed_candidate_atomically() {
         "INSERT INTO public.storage_object_envelope_intents VALUES ($1::text::uuid, $2::text::uuid, $3)",
         &[&object, &root, &fixture.record.as_slice()],
     ).await.unwrap();
+    if with_outcome {
+        outcome::prove(&observer, &mut writer, &intent, &verified).await;
+        return;
+    }
     let scope = ReadbackScope {
         bucket: "foreign-bucket",
         configuration: CONFIGURATION,

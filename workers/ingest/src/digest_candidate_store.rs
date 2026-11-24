@@ -7,6 +7,7 @@
 use nntune_core::digest_enrollment::OriginManifest;
 
 mod inventory;
+pub mod outcome;
 pub use inventory::{
     append_inventory, stage_completed_candidate, stage_validated_winner, InventoryAppendError,
 };
