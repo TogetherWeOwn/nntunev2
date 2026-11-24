@@ -140,17 +140,28 @@ fn assert_history_rejections(h: &Harness, mut req: Request) {
 }
 
 #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+fn assert_history_conflict(response: Response) {
+    assert_eq!((response.status, response.retry_after), (409, None));
+    let envelope: Value = from_str(&response.body).unwrap();
+    assert_eq!(envelope["code"], "conflict");
+    assert_eq!(envelope["retryable"], false);
+}
+
+#[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
 #[tokio::test]
 async fn unmounted_history_receiver_writes_through_pg_store() {
     use crate::listen_history::postgres_tests::{connect, seed_lease, seed_owner};
-    use crate::listen_history::{export, ListenEvent};
+    use crate::listen_history::{export, ListenEvent, ListenRow};
     use crate::worker_entry::playback_store_for_postgres_test;
     let observer = connect().await;
-    let owner = format!("listen-receiver-{:x}", rand::random::<u64>());
+    let suffix = rand::random::<u64>();
+    let owner = format!("listen-receiver-{suffix:x}");
+    let other = format!("listen-receiver-{suffix:x}-other");
     seed_owner(&observer, &owner).await;
+    seed_owner(&observer, &other).await;
     let store = playback_store_for_postgres_test(|| async { Ok(connect().await) });
     let h = harness();
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         cfg: &h.config,
         store: &store,
         mailer: &h.mailer,
@@ -160,21 +171,73 @@ async fn unmounted_history_receiver_writes_through_pg_store() {
         now: 1000,
         source_ip: h.ctx().source_ip,
     };
-    let mut req = receive_request(Some(cookie_of(&ctx.start_session(&owner).await.unwrap())));
-    req.body = bind_start(receiver::context(&ctx, &req).await);
-    req.path = CLEAR_PATH.into();
-    let refused = receiver::write(&ctx, &req).await;
-    assert_eq!((refused.status, refused.retry_after), (409, None));
-    let envelope: Value = from_str(&refused.body).unwrap();
-    assert_eq!(envelope["code"], "conflict");
-    assert_eq!(envelope["retryable"], false);
+    let mut start = receive_request(Some(cookie_of(&ctx.start_session(&owner).await.unwrap())));
+    start.body.clear();
+    assert_eq!(handle(&ctx, &start).await.status, 404);
+    start.body = bind_start(receiver::context(&ctx, &start).await);
+    start.path = CLEAR_PATH.into();
+    assert_history_conflict(receiver::write(&ctx, &start).await);
     assert!(export(&observer, &owner, None).await.unwrap().is_empty());
+
+    let mut other_start =
+        receive_request(Some(cookie_of(&ctx.start_session(&other).await.unwrap())));
+    other_start.body = bind_start(receiver::context(&ctx, &other_start).await);
+    other_start.path = CLEAR_PATH.into();
+    seed_lease(&observer, &other, 1).await;
+    assert_eq!(receiver::write(&ctx, &other_start).await.status, 200);
+    let other_rows = export(&observer, &other, None).await.unwrap();
+    assert_eq!(other_rows.len(), 1);
+
+    let start_event: Value = serde_json::from_slice(&start.body).unwrap();
+    let with_field = |key: &str, value: &str| {
+        let mut body = start_event.clone();
+        body[key] = json!(value);
+        Request {
+            body: serde_json::to_vec(&body).unwrap(),
+            ..start.clone()
+        }
+    };
+    let complete = with_field("event", "complete");
+    let skip = with_field("event", "skip");
+
+    // Neither the other owner's grant nor their admitted start can authorize this owner.
+    assert_history_conflict(receiver::write(&ctx, &start).await);
+    assert_history_conflict(receiver::write(&ctx, &complete).await);
     seed_lease(&observer, &owner, 1).await;
-    assert_eq!(receiver::write(&ctx, &req).await.status, 200);
-    assert_eq!(receiver::write(&ctx, &req).await.status, 200);
-    let rows = export(&observer, &owner, None).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].event, ListenEvent::Start);
-    let delete = "DELETE FROM public.users WHERE id = $1";
-    observer.execute(delete, &[&owner]).await.unwrap();
+    assert_history_conflict(receiver::write(&ctx, &complete).await);
+    let wrong_track = with_field("track_id", "catalogue-43");
+    assert_history_conflict(receiver::write(&ctx, &wrong_track).await);
+    assert!(export(&observer, &owner, None).await.unwrap().is_empty());
+
+    ctx.now = 1044;
+    assert_eq!(handle(&ctx, &start).await.status, 404);
+    assert!(export(&observer, &owner, None).await.unwrap().is_empty());
+    assert_eq!(receiver::write(&ctx, &start).await.status, 200);
+    ctx.now = 1045;
+    let expired_start = with_field("playback_id", "40c325c0-2cee-489d-a8b6-fbe937155602");
+    seed_lease(&observer, &owner, 2).await;
+    assert_history_conflict(receiver::write(&ctx, &expired_start).await);
+    assert_eq!(receiver::write(&ctx, &start).await.status, 200);
+    ctx.now = 1046;
+    assert_eq!(receiver::write(&ctx, &complete).await.status, 200);
+    ctx.now = 1047;
+    assert_eq!(receiver::write(&ctx, &complete).await.status, 200);
+    assert_history_conflict(receiver::write(&ctx, &skip).await);
+
+    let expected = |event, recorded_at| ListenRow {
+        playback_id: start_event["playback_id"].as_str().unwrap().into(),
+        track_id: start_event["track_id"].as_str().unwrap().into(),
+        event,
+        recorded_at,
+    };
+    assert_eq!(
+        export(&observer, &owner, None).await.unwrap(),
+        [
+            expected(ListenEvent::Complete, 1046),
+            expected(ListenEvent::Start, 1044)
+        ]
+    );
+    assert_eq!(export(&observer, &other, None).await.unwrap(), other_rows);
+    let delete = "DELETE FROM public.users WHERE id IN ($1, $2)";
+    observer.execute(delete, &[&owner, &other]).await.unwrap();
 }
