@@ -11,6 +11,8 @@ use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 pub mod head_receipt;
 pub mod readback_inventory;
 pub mod resume_checkpoint;
+#[cfg(target_arch = "wasm32")]
+pub mod s3_completion;
 pub mod session_completion;
 pub mod session_outcome;
 pub mod sidecar;

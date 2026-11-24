@@ -1,0 +1,106 @@
+use super::{now, Duration, S3CompletionSender};
+use crate::multipart::{
+    resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
+    session_completion::SessionCompletion,
+    Plan, UploadTarget,
+};
+use nntune_core::{
+    media_envelope::EnvelopeContext, origin_sealer::OriginSealer, s3_locator::S3Binding,
+};
+use sha2::{Digest, Sha256};
+use worker::wasm_bindgen::{self, prelude::*};
+
+fn id(value: u8) -> [u8; 16] {
+    let mut bytes = [value; 16];
+    bytes[6] = 0x40;
+    bytes[8] = 0x80;
+    bytes
+}
+
+#[wasm_bindgen]
+pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
+    let configuration = id(7);
+    let bucket = "fixture-bucket";
+    let endpoint = match mode.as_str() {
+        "http" => "http://fixture.test:8443",
+        "path" => "https://fixture.test:8443/api",
+        _ => "https://fixture.test:8443",
+    };
+    let sender = S3CompletionSender::new(
+        if mode == "foreign" {
+            id(8)
+        } else {
+            configuration
+        },
+        if mode == "bucket" {
+            "other-bucket"
+        } else {
+            bucket
+        }
+        .into(),
+        endpoint,
+        "fixture-region".into(),
+        "FIXTUREACCESS".into(),
+        "fixture-secret".into(),
+    )
+    .map_err(|_| JsValue::from_str("invalid configuration"))?;
+    let mut sealer = OriginSealer::new(1).unwrap();
+    let context = EnvelopeContext {
+        identities: [0, 1, 2, 0xab, 0xcd, 7].map(id),
+        plaintext_len: 1,
+        header: sealer.header().to_bytes(),
+    };
+    let [environment, library, object, generation] =
+        [1, 2, 0xab, 0xcd].map(|value| hex::encode(id(value)));
+    let key = format!("media/{object}/{generation}");
+    let target = UploadTarget {
+        bucket,
+        key: &key,
+        upload_id: "fixture+/=?",
+    };
+    let plan = Plan::new(target, sealer.header(), 1).unwrap();
+    let mut partition = plan.partition();
+    assert!(partition
+        .push(&sealer.seal_chunk(&[42]).unwrap())
+        .unwrap()
+        .is_none());
+    let part = partition.finish().unwrap().unwrap();
+    let (_, number, bytes, checksum) = part.request();
+    let etag = "\"fixture-etag\"";
+    let receipt = part.verify_reply(etag.into(), checksum).unwrap();
+    let parts = [CheckpointPart {
+        number,
+        len: bytes.len(),
+        etag,
+        digest: Sha256::digest(bytes).into(),
+    }];
+    let binding = ResumeBinding {
+        plan,
+        configuration,
+        environment: &environment,
+        library: &library,
+        session: "fixture-session",
+        object: &object,
+        generation: &generation,
+        envelope_scheme: 2,
+    };
+    let checkpoint = ResumeCheckpoint {
+        binding,
+        parts: &parts,
+    };
+    let completion =
+        SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap();
+    let budget = match mode.as_str() {
+        "deadline" => 200,
+        "expired" => 0,
+        _ => 2000,
+    };
+    let completed = sender
+        .complete(completion, now() + Duration::from_millis(budget))
+        .await
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {
+        return Err(JsValue::from_str("missing fixture version"));
+    };
+    Ok(version.clone())
+}

@@ -2143,12 +2143,12 @@ jobs:
           STAGING_BODY_WASM_JS="$RUNNER_TEMP/staging-body-js/nntune_api.js" node --test workers/api/tests/staging_body_wasm.cjs workers/api/tests/staging_request_wasm.cjs
       - name: Exercise unmounted staging admission through Worker responses
         run: STAGING_BODY_WASM_JS="$RUNNER_TEMP/ledger-js/nntune_api.js" node --test workers/api/tests/staging_dispatch_wasm.cjs
-      - name: Exercise ingest cleanup queue binding and delay in a synthetic WASM runtime
+      - name: Exercise ingest queue and signed S3 completion in a synthetic WASM runtime
         run: |
           set -euo pipefail
-          cargo build --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown --features cleanup-dispatch-wasm-test --target-dir "$RUNNER_TEMP/ingest-cleanup-target"
-          wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/ingest-cleanup-js" "$RUNNER_TEMP/ingest-cleanup-target/wasm32-unknown-unknown/debug/nntune_ingest.wasm"
-          INGEST_CLEANUP_WASM_JS="$RUNNER_TEMP/ingest-cleanup-js/nntune_ingest.js" node --test workers/ingest/tests/cleanup_dispatch_wasm.cjs
+          cargo build --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown --features cleanup-dispatch-wasm-test,s3-completion-wasm-test --target-dir "$RUNNER_TEMP/ingest-wasm-target"
+          wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/ingest-wasm-js" "$RUNNER_TEMP/ingest-wasm-target/wasm32-unknown-unknown/debug/nntune_ingest.wasm"
+          INGEST_WASM_JS="$RUNNER_TEMP/ingest-wasm-js/nntune_ingest.js" node --test workers/ingest/tests/cleanup_dispatch_wasm.cjs workers/ingest/tests/fixtures/s3_completion_wasm.cjs
       # Reuse the existing locked Wrangler dependency. No root prepare or
       # dependency install scripts are needed for upload-only dry-runs.
       - name: Install locked upload CLI without lifecycle scripts
