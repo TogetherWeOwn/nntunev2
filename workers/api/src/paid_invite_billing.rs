@@ -1,6 +1,11 @@
 use super::*;
 
 pub(super) const CHECKOUT: &str = "/v1/billing/checkout";
+pub(super) const PORTAL: &str = "/v1/billing/portal";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Portal {}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,6 +52,16 @@ where
     if ctx.cfg.stripe_secret_key.is_none() || ctx.cfg.stripe_webhook_secret.is_none() {
         return unavailable();
     }
+    let return_url = format!("{}/account/billing", ctx.cfg.origin);
+    if req.path == PORTAL {
+        if serde_json::from_slice::<Portal>(&req.body).is_err() {
+            return invalid_request();
+        }
+        let Some(configuration) = ctx.cfg.stripe_portal_configuration.as_deref() else {
+            return unavailable();
+        };
+        return portal_for(ctx, &claims.user_id, configuration, &return_url).await;
+    }
     let Ok(Checkout { plan_id }) = serde_json::from_slice(&req.body) else {
         return invalid_request();
     };
@@ -54,39 +69,65 @@ where
         Ok(input) => input,
         Err(_) => return unavailable(),
     };
-    let mut matches = input
-        .bindings
-        .iter()
-        .filter(|binding| binding.plan_id == plan_id && binding.selectable && !binding.livemode);
-    let Some(price) = matches.next() else {
+    let Some(price) = selectable_test_price(&input.bindings, &plan_id) else {
         return invalid_request();
     };
-    if matches.next().is_some() {
-        return unavailable();
-    }
-    let return_url = format!("{}/account/billing", ctx.cfg.origin);
-    let result = ensure_checkout_session(
-        ctx,
-        &claims.user_id,
-        &price.price_id,
-        &return_url,
-        &return_url,
-        None,
-    )
-    .await;
+    let result =
+        ensure_checkout_session(ctx, &claims.user_id, price, &return_url, &return_url, None).await;
     match result {
-        Ok(url) if approved_redirect(&url, "checkout.stripe.com") => {
-            let mut response = json_response(200, serde_json::json!({"url": url}));
-            response
-                .extra_headers
-                .push(("cache-control".into(), "private, no-store".into()));
-            response
-        }
+        Ok(url) => redirect_response(url, "checkout.stripe.com"),
         Err(EnsureCheckoutError::Unavailable) => {
             json_response(409, serde_json::json!({"error": "billing unavailable"}))
         }
         _ => unavailable(),
     }
+}
+
+async fn portal_for<S: Store + SingleUseStore, M: Mailer, D: Dialer, N: AsyncDns>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    configuration: &str,
+    return_url: &str,
+) -> Response {
+    let input = match ctx.store.load_reconcile_input(user_id, None).await {
+        Ok(input) => input,
+        Err(_) => return unavailable(),
+    };
+    let Some(customer) = input.stripe_customer_id else {
+        return json_response(409, serde_json::json!({"error": "billing unavailable"}));
+    };
+    match ctx
+        .stripe
+        .create_portal_session(&customer, configuration, return_url)
+        .await
+    {
+        Ok(session) if !session.livemode && session.customer == customer => {
+            redirect_response(session.url, "billing.stripe.com")
+        }
+        _ => unavailable(),
+    }
+}
+
+pub(super) fn selectable_test_price<'a>(
+    bindings: &'a [crate::billing_reconcile::PriceBinding],
+    plan: &str,
+) -> Option<&'a str> {
+    let mut eligible = bindings
+        .iter()
+        .filter(|row| row.plan_id == plan && row.selectable && !row.livemode);
+    let price = eligible.next()?.price_id.as_str();
+    eligible.next().is_none().then_some(price)
+}
+
+fn redirect_response(url: String, host: &str) -> Response {
+    if !approved_redirect(&url, host) {
+        return unavailable();
+    }
+    let mut response = json_response(200, serde_json::json!({"url": url}));
+    response
+        .extra_headers
+        .push(("cache-control".into(), "private, no-store".into()));
+    response
 }
 
 fn approved_redirect(value: &str, host: &str) -> bool {

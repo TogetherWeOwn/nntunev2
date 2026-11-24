@@ -313,7 +313,16 @@ pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
         }
     }
     let stripe_webhook = env_string(env, "STRIPE_WEBHOOK_SECRET");
-    let config = config.with_stripe(stripe_secret, stripe_webhook);
+    let mut config = config.with_stripe(stripe_secret, stripe_webhook);
+    config.paid_invite_billing = env_string(env, "PAID_INVITE_BILLING").as_deref() == Some("1");
+    if config.paid_billing_enabled() {
+        config.stripe_portal_configuration =
+            env_string(env, "STRIPE_PORTAL_CONFIGURATION").filter(|id| {
+                id.strip_prefix("bpc_").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+            });
+    }
     // Play-grant signing secret, shared with the stream Worker: raw
     // string bytes, never base64-decoded (see the helper). Absent (or
     // the minter's minimum length not met at issue time) fails the
@@ -7311,6 +7320,24 @@ impl WorkerStripeTransport {
 }
 
 impl crate::stripe::StripeTransport for WorkerStripeTransport {
+    fn create_portal_session(
+        &self,
+        customer: &str,
+        configuration: &str,
+        return_url: &str,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::PortalSession>> + '_>,
+    > {
+        let request = crate::stripe::create_billing_portal_session_request(
+            customer,
+            configuration,
+            return_url,
+        );
+        Box::pin(async move {
+            self.send(&request.ok_or_else(crate::stripe::StripeError::transport)?)
+                .await
+        })
+    }
     fn create_customer(
         &self,
         req: crate::stripe::CreateCustomer,

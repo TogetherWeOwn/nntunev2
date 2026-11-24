@@ -121,7 +121,8 @@ export const load: PageLoad = async ({ fetch }) => {
 	// while the page renders Manage billing as the sole action. A lapsed
 	// subscriber must never start a new checkout — that would double-subscribe
 	// them next to the invoice they already owe.
-	if (manageBillingOnly && usageStatus) usageStatus = { ...usageStatus, upgradeTo: null };
+	const canUpgrade = !manageBillingOnly && subscription?.canChangePlan !== false;
+	if (!canUpgrade && usageStatus) usageStatus = { ...usageStatus, upgradeTo: null };
 
 	const notices: string[] = [];
 	if (signedOut) {
@@ -165,6 +166,7 @@ export const load: PageLoad = async ({ fetch }) => {
 		signedOut,
 		hadFetchError: !signedOut && (subFailed || usageFailed || retryableLimit),
 		manageBillingOnly,
+		canUpgrade,
 		subscription,
 		usage,
 		usageStatus,

@@ -93,7 +93,7 @@
 	const status = $derived.by(() => {
 		if (livePlan === null || !data.usage || !data.usageStatus) return data.usageStatus;
 		const scored = evaluateUsage(livePlan, data.usage);
-		return data.manageBillingOnly ? { ...scored, upgradeTo: null } : scored;
+		return data.canUpgrade ? scored : { ...scored, upgradeTo: null };
 	});
 
 	// 80% / 95% warnings fire once per threshold per month (spec §3.2):
@@ -119,7 +119,7 @@
 		// portal-only subscriptions): never start a checkout from here when
 		// the subscriber already holds a plan that needs the portal instead.
 		const owner = data.owner, upgrade = status?.upgradeTo;
-		if (!alive || busy || !owner?.isCurrent() || (action === 'checkout' && (!upgrade || data.manageBillingOnly))) return;
+		if (!alive || busy || !owner?.isCurrent() || (action === 'checkout' && (!upgrade || !data.canUpgrade))) return;
 		const current = () => alive && owner === data.owner && owner.isCurrent();
 		actionError = null;
 		busy = action;
@@ -237,7 +237,7 @@
 
 	{#if data.owner && !data.signedOut}
 		<div>
-			{#if status?.upgradeTo && !data.manageBillingOnly}
+			{#if status?.upgradeTo && data.canUpgrade}
 				<button disabled={busy !== null} onclick={() => billingAction('checkout')}>
 					{busy === 'checkout' ? 'Starting…' : `Upgrade to ${status.upgradeTo}`}
 				</button>

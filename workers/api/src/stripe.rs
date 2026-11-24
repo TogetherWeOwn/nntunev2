@@ -396,6 +396,13 @@ pub struct Customer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PortalSession {
+    pub customer: String,
+    pub livemode: bool,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CheckoutSession {
     pub id: String,
     #[serde(default)]
@@ -676,6 +683,14 @@ pub struct ListInvoices {
 /// object-safe so handlers hold `&dyn StripeTransport` without a fifth
 /// `Ctx` generic.
 pub trait StripeTransport {
+    fn create_portal_session(
+        &self,
+        _customer: &str,
+        _configuration: &str,
+        _return_url: &str,
+    ) -> Pin<Box<dyn Future<Output = StripeResult<PortalSession>> + '_>> {
+        Box::pin(async { Err(StripeError::transport()) })
+    }
     fn create_customer(
         &self,
         req: CreateCustomer,
