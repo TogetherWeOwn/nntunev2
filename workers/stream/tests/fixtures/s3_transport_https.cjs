@@ -4,9 +4,21 @@ const { createHash, createHmac } = require('node:crypto');
 const { once } = require('node:events');
 const { readFileSync } = require('node:fs');
 const { createServer } = require('node:https');
+const { registerHooks } = require('node:module');
 const { test } = require('node:test');
+const { pathToFileURL } = require('node:url');
 
+// The production bundle also imports the existing NNTP socket adapter.
+// Make that import fail on use while keeping real Fetch and loopback TLS.
+const sockets = pathToFileURL(require.resolve('./s3_fixture_sockets.cjs')).href;
+const hook = registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === 'cloudflare:sockets') return { url: sockets, shortCircuit: true };
+    return nextResolve(specifier, context);
+  },
+});
 const { make_s3_fixture } = require(process.env.S3_FIXTURE_WASM);
+hook.deregister();
 const path = '/fixture-media/media/00000000000040008000000000000003/00000000000040008000000000000004';
 const query = 'versionId=version%2B%2F%25%3F%3D%26';
 const span = 'bytes 65600-65616/65617';
@@ -18,7 +30,8 @@ function verifyGet(req, host) {
   assert.equal(req.url, `${path}?${query}`);
   assert.equal(req.headers.host, host);
   assert.equal(req.headers.range, 'bytes=65600-65616');
-  assert.equal(req.headers['accept-encoding'], 'identity');
+  // Undici also appends identity automatically for a ranged request.
+  assert.match(req.headers['accept-encoding'], /^identity(?:, identity)?$/);
   assert.equal(req.headers['x-amz-content-sha256'], hash(''));
   const date = req.headers['x-amz-date'];
   assert.match(date, /^\d{8}T\d{6}Z$/);
