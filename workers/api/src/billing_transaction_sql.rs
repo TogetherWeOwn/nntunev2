@@ -102,6 +102,7 @@ pub(crate) async fn apply_reconcile_transaction(
     transaction: &mut impl crate::postgres::PgBilling,
     user_id: String,
     outcome: crate::billing_reconcile::ReconcileOutcome,
+    require_open_owner: bool,
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))] probe: ReconcileProbe,
 ) -> Result<(), crate::handlers::StoreError> {
     use crate::billing_store_classification::{
@@ -116,6 +117,20 @@ pub(crate) async fn apply_reconcile_transaction(
             .query_typed(reconcile_lock_statement(), &[(&user_id, Type::TEXT)])
             .await
             .map_err(|_| StoreError)?;
+        // Hold the owner row until commit, before taking the subscriptions
+        // table lock. Erasure scheduling either wins first or waits for us.
+        if require_open_owner
+            && transaction
+                .query_typed_opt(
+                    "SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE",
+                    &[(&user_id, Type::TEXT)],
+                )
+                .await
+                .map_err(|_| StoreError)?
+                .is_none()
+        {
+            return Err(StoreError);
+        }
         transaction
             .query_typed(crate::billing_transaction_sql::LOCK_SUBSCRIPTIONS, &[])
             .await

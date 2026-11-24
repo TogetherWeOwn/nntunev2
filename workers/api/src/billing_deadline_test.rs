@@ -19,6 +19,7 @@ async fn fixture(setup: bool) -> Result<(), StoreError> {
                 if !safe { return Err(StoreError); }
                 for migration in [
                     include_str!("../../../migrations/0002_auth_vault.sql"),
+                    include_str!("../../../migrations/0006_account_deletion.sql"),
                     include_str!("../../../migrations/0021_billing_schema.sql"),
                     include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
                     include_str!("../../../migrations/0029_paid_invoice_history.sql"),
@@ -1278,6 +1279,7 @@ async fn transaction_refuses_misattributed_history(
                     client,
                     "worker_fault_user".into(),
                     outcome,
+                    false,
                     ReconcileProbe::None,
                 )
                 .await

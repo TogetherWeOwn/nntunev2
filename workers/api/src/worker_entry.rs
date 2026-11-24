@@ -313,7 +313,10 @@ pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
         }
     }
     let stripe_webhook = env_string(env, "STRIPE_WEBHOOK_SECRET");
-    let config = config.with_stripe(stripe_secret, stripe_webhook);
+    let config =
+        apply_paid_billing_config(config.with_stripe(stripe_secret, stripe_webhook), |name| {
+            env_string(env, name)
+        });
     // Play-grant signing secret, shared with the stream Worker: raw
     // string bytes, never base64-decoded (see the helper). Absent (or
     // the minter's minimum length not met at issue time) fails the
@@ -334,6 +337,21 @@ pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
     Some(apply_rate_limit_overlay(config, |name| {
         env_string(env, name)
     }))
+}
+
+fn apply_paid_billing_config(
+    mut config: Config,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Config {
+    config.paid_invite_billing = lookup("PAID_INVITE_BILLING").as_deref() == Some("1");
+    if config.paid_billing_enabled() {
+        config.stripe_portal_configuration = lookup("STRIPE_PORTAL_CONFIGURATION").filter(|id| {
+            id.strip_prefix("bpc_").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        });
+    }
+    config
 }
 
 /// The [vars] names `RateLimitConfig::from_vars` reads. One const
@@ -1106,21 +1124,29 @@ impl PgStore {
         };
         let outcome =
             reconcile_exact_target(subscription_id, input, &remote, now).ok_or(StoreError)?;
-        self.store_reconcile_owned(
-            user_id.to_owned(),
-            outcome.clone(),
-            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
-            crate::billing_transaction_sql::ReconcileProbe::None,
-        )
-        .await?;
+        self.store_paid_reconcile_outcome(user_id, &outcome).await?;
         Ok(outcome)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    // The dormant workerd controls exercise the original transaction and
+    // its lock-order probes. Paid dispatch uses the account fence below.
+    #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
     async fn store_reconcile_owned(
         &self,
         user_id: String,
         outcome: crate::billing_reconcile::ReconcileOutcome,
+        probe: crate::billing_transaction_sql::ReconcileProbe,
+    ) -> Result<(), StoreError> {
+        self.store_reconcile_owned_inner(user_id, outcome, false, probe)
+            .await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn store_reconcile_owned_inner(
+        &self,
+        user_id: String,
+        outcome: crate::billing_reconcile::ReconcileOutcome,
+        require_open_owner: bool,
         #[cfg(feature = "billing-owned-wasm-test")]
         probe: crate::billing_transaction_sql::ReconcileProbe,
     ) -> Result<(), StoreError> {
@@ -1168,6 +1194,7 @@ impl PgStore {
                     client,
                     user_id,
                     outcome,
+                    require_open_owner,
                     #[cfg(feature = "billing-owned-wasm-test")]
                     probe,
                 ))
@@ -1186,10 +1213,11 @@ impl PgStore {
     // Native acceptance injects connection acquisition only. The client
     // stays inside the budgeted operation.
     #[cfg(not(target_arch = "wasm32"))]
-    async fn store_reconcile_owned(
+    async fn store_reconcile_owned_inner(
         &self,
         user_id: String,
         outcome: crate::billing_reconcile::ReconcileOutcome,
+        require_open_owner: bool,
     ) -> Result<(), StoreError> {
         let failed = || self.statement_failed("api.db.statement_failed.store_reconcile_outcome");
         crate::billing_store_classification::validate_history_target(&outcome)
@@ -1205,6 +1233,7 @@ impl PgStore {
                         &mut client,
                         user_id,
                         outcome,
+                        require_open_owner,
                     )
                 })
                 .await
@@ -6279,9 +6308,10 @@ impl Store for PgStore {
         user_id: &str,
         outcome: &crate::billing_reconcile::ReconcileOutcome,
     ) -> Result<(), StoreError> {
-        self.store_reconcile_owned(
+        self.store_reconcile_owned_inner(
             user_id.to_owned(),
             outcome.clone(),
+            true,
             #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
             crate::billing_transaction_sql::ReconcileProbe::None,
         )
@@ -10479,6 +10509,47 @@ mod tests {
             body.contains("trim().is_empty()"),
             "config_from_env must reject whitespace-only QA bearer values"
         );
+    }
+
+    #[test]
+    fn worker_checkout_requires_the_opt_in_and_a_valid_portal() {
+        for (flag, portal, expected) in [
+            (None, Some("bpc_fixture"), false),
+            (Some("true"), Some("bpc_fixture"), false),
+            (Some("1"), None, false),
+            (Some("1"), Some("bpc_"), false),
+            (Some("1"), Some("bpc_wrong/host"), false),
+            (Some("1"), Some("bpc_fixture"), true),
+        ] {
+            let config = Config::new(
+                "example.com",
+                "https://example.com",
+                vec![0; 32],
+                [0; 32],
+                1,
+                60,
+                true,
+                false,
+                None,
+            )
+            .unwrap()
+            .with_stripe(Some("sk_test_fixture".into()), Some("whsec_fixture".into()));
+            let config = apply_paid_billing_config(config, |name| match name {
+                "PAID_INVITE_BILLING" => flag.map(str::to_owned),
+                "STRIPE_PORTAL_CONFIGURATION" => portal.map(str::to_owned),
+                _ => None,
+            });
+            assert_eq!(config.paid_billing_enabled(), flag == Some("1"));
+            assert_eq!(config.billing_purchase_configured(), expected);
+        }
+        let config_body = include_str!("worker_entry.rs")
+            .split_once("fn config_from_env(")
+            .unwrap()
+            .1
+            .split_once("fn apply_paid_billing_config(")
+            .unwrap()
+            .0;
+        assert!(config_body.contains("apply_paid_billing_config("));
     }
 
     #[test]

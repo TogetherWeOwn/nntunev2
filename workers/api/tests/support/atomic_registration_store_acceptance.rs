@@ -3103,7 +3103,7 @@ fn assert_member_invite_issuance() {
         };
         let outcome = reconcile_subscription(&local, &snapshot, NOW as i64);
         bootstrap_transaction(&mut db).await.unwrap();
-        let write = apply_reconcile_transaction(&mut db, peer.clone(), outcome);
+        let write = apply_reconcile_transaction(&mut db, peer.clone(), outcome, false);
         write.await.unwrap();
         let status = "UPDATE subscriptions SET status = $2 WHERE stripe_subscription_id = $1";
         db.execute(status, &[&old, &"canceled"]).await.unwrap();

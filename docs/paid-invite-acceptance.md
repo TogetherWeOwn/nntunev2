@@ -11,7 +11,8 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    and passkey handling. Confirm a second redemption refuses.
 2. Keep `PRIVATE_LISTENING_COHORT` absent for the paid run. Confirm
    `INVITES_REQUIRED`, `PAID_INVITE_BILLING=1`, Stripe test credentials and a
-   test portal with period-end cancellation and subscription changes disabled.
+   test portal. Verify that the configured portal exists in the same Stripe
+   test account with period-end cancellation and subscription changes disabled.
    Verify `plan_prices` against the provider account, currency, amount, interval
    and usage type. Admit only `POST /v1/billing/webhook` via the Access exception.
    Use a `2024-12-18.acacia` test destination for the three events below.
