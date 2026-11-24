@@ -2,7 +2,34 @@
 -- `owner` must come from the authenticated principal, never the request body.
 CREATE SCHEMA private_playlist_rehearsal;
 SET LOCAL search_path = private_playlist_rehearsal, pg_catalog, pg_temp;
-CREATE TABLE member_tracks AS TABLE pg_temp.synthetic_memberships;
+CREATE TABLE marker AS SELECT gen_random_uuid()::text AS token;
+CREATE VIEW member_tracks AS
+SELECT l.user_id AS owner_id, lt.track_id FROM public.libraries l
+JOIN public.library_tracks lt ON lt.library_id = l.id WHERE l.deleting_at IS NULL;
+
+-- Observe a real lock wait before committing the fixture transaction.
+CREATE FUNCTION await_blocked(writer_pid integer) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE deadline timestamptz := clock_timestamp() + interval '3 seconds';
+BEGIN
+    WHILE NOT pg_backend_pid() = ANY(pg_blocking_pids(writer_pid)) LOOP
+        IF clock_timestamp() >= deadline THEN RAISE EXCEPTION 'late writer did not wait'; END IF;
+        PERFORM pg_sleep(0.01);
+    END LOOP;
+END;
+$$;
+
+-- Simulate the executor's persisted completion state in the disposable clone.
+CREATE FUNCTION complete_playlist_delete(owner text, handle text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM public.playlist_tracks e USING public.playlists p
+    WHERE e.playlist_id = p.id AND p.owner_user_id = owner AND p.public_id = handle;
+    DELETE FROM public.playlists WHERE owner_user_id = owner AND public_id = handle;
+    IF NOT FOUND THEN RAISE EXCEPTION 'playlist was not physically removed'; END IF;
+    UPDATE public.delete_operations SET state = 'done'
+    WHERE user_id = owner AND scope = 'playlist' AND container_id = handle;
+    IF NOT FOUND THEN RAISE EXCEPTION 'durable operation was missing'; END IF;
+END;
+$$;
 
 -- Match library::check_name's Rust Unicode White_Space trim, regardless of locale.
 CREATE FUNCTION trim_name(title text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
@@ -67,8 +94,7 @@ CREATE FUNCTION add_track(owner text, handle text, track uuid) RETURNS uuid
 LANGUAGE plpgsql AS $$
 DECLARE target bigint := lock_playlist(owner, handle); entry uuid;
 BEGIN
-    -- Deduplicate under the playlist lock. Synthetic membership is rehearsal-only;
-    -- live code must check actual Library membership, not mere track existence.
+    -- Deduplicate under the playlist lock and require Library membership.
     INSERT INTO public.playlist_tracks (playlist_id, track_id, position)
     SELECT p.id, track, next.position
     FROM public.playlists p

@@ -210,6 +210,25 @@ async function releaseReject(page: Page) {
 	});
 }
 
+for (const action of ACTIONS.filter(({ path }) => path === '/account/billing')) {
+	test(`${action.name}: a retired account cannot follow a held payment redirect`, async ({ page }) => {
+		const observed = await fixtures(page, action);
+		await begin(page, action);
+		await page.evaluate(() => {
+			const key = 'nntune.auth.generation.v1';
+			localStorage.setItem(key, 'replacement-generation');
+			window.dispatchEvent(new StorageEvent('storage', { key }));
+		});
+		await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+		await release(page, action, 200);
+		// Observe navigation attempts after the deliberately deferred response settles.
+		await page.waitForTimeout(350);
+		expect(observed.external).toEqual([]);
+		expect(observed.pageErrors).toEqual([]);
+		await expect(page).toHaveURL((url) => url.pathname === action.path);
+	});
+}
+
 for (const action of ACTIONS) {
 	// Qualifying security results (200/401) purge even when abandoned, so only
 	// the non-qualifying 500 keeps the preservation contract there. Pricing

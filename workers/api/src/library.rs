@@ -151,7 +151,7 @@ fn require_caller(caller: Option<&str>) -> Result<&str, LibraryError> {
     }
 }
 
-fn check_name(name: &str) -> Result<String, LibraryError> {
+pub(crate) fn check_name(name: &str) -> Result<String, LibraryError> {
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_NAME_LEN {
         return Err(LibraryError::Invalid);

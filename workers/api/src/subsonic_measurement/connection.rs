@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 
 use futures_util::future::{select, Either};
-use tokio_postgres::{Client, Connection};
+use tokio_postgres::Connection;
 
 use super::*;
 use crate::billing_owned_socket::{SocketGuard, TrackedSocket};
+use crate::postgres::PgClient;
 use crate::subsonic_staging::{respond_staging, CatalogueSource, StagingApp, StagingDispatch};
 use crate::worker_entry::config_from_env;
 
@@ -16,13 +17,13 @@ use crate::worker_entry::config_from_env;
 static DB_BUSY: AtomicBool = AtomicBool::new(false);
 
 type Driver = Connection<TrackedSocket, worker::Socket>;
-type NoMirror = fn() -> Ready<Result<Client, StagingRejection>>;
+type NoMirror = fn() -> Ready<Result<PgClient, StagingRejection>>;
 
 async fn connect_auth(
     socket: &SocketGuard,
     pg_config: &tokio_postgres::Config,
     open: impl FnOnce() -> std::io::Result<TrackedSocket>,
-) -> Result<(Client, Driver), StagingRejection> {
+) -> Result<(PgClient, Driver), StagingRejection> {
     // One budget from the first socket operation through authenticated startup.
     with_deadline(
         async {
@@ -31,6 +32,7 @@ async fn connect_auth(
             pg_config
                 .connect_raw(tracked, socket.tls())
                 .await
+                .map(|(client, driver)| (PgClient::new(client), driver))
                 .map_err(|_| Unavailable)
         },
         2_000,

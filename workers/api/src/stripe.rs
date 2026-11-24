@@ -52,6 +52,12 @@ use serde::Deserialize;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "invite review integration is deferred")
+)]
+pub(crate) mod payment_evidence;
+
 /// Stripe API host. The transport builds `https://` URLs from this; the
 /// value is pinned here (not per-call) so a test asserts the host.
 pub const STRIPE_API_BASE: &str = "https://api.stripe.com";

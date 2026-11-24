@@ -378,11 +378,7 @@ impl Store for OtherStore {
         _, old, new, _, _, signature = _control_by_name("reaper-releases-selected-parent-lock")
         changed = runner.mutated_source(REAPER_RELEASE_FIXTURE, old, new, signature).decode("utf-8")
         commit = "transaction.commit().await.map_err(|_| StoreError)?;"
-        fresh = (
-            "let transaction = client.build_transaction()"
-            ".isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)"
-            ".start().await.map_err(|_| StoreError)?;"
-        )
+        fresh = "let transaction = client.read_committed().await.map_err(|_| StoreError)?;"
         pause_cfg = '#[cfg(all(test, not(target_arch = "wasm32")))]'
         pause_call = "reaper_selection_pause().await;"
         commit_index = changed.index(commit)

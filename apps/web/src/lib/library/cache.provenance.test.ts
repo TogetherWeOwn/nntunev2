@@ -8,8 +8,10 @@ import {
 	LIBRARY_SESSION_BINDING_KEY,
 	loadSnapshot,
 	saveSnapshot,
+	scopeLibraryStorage,
 	verifiedFavoritesKey
 } from './cache.js';
+import { favoritesKey, loadFavorites } from './favorites.js';
 
 const context = '9cd1c49f-eda8-44e8-8a35-edabed800ce0';
 const key = `nntune.library.favorites.v1.${context}`;
@@ -72,6 +74,26 @@ it('never binds an existing unbound scope or changes its exact favorites bytes',
 	expect(session.getItem(LIBRARY_SESSION_BINDING_KEY)).toBeNull();
 	expect(libraryScopeBinding(session)).toBeNull();
 	expect(verifiedFavoritesKey(session, binding)).toBeNull();
+	expect(local.getItem(key)).toBe(bytes);
+});
+
+it.each(['account retirement', 'context replacement'])('does not rederive a storage key after %s', (boundary) => {
+	const { local, session } = fixture();
+	expect(establishVerifiedLibraryScope(session, binding)).toBe(key);
+	local.setItem(key, bytes);
+	const controller = new AbortController();
+	const { signal } = controller;
+	const owner = { generation: 'fixture', signal, isCurrent: () => !signal.aborted, run: async <T>(work: () => T) => work() };
+	const scoped = scopeLibraryStorage(session, owner)!;
+	expect(favoritesKey(scoped)).toBe(key);
+	expect(loadFavorites(scoped, local)).toEqual(['track']);
+
+	if (boundary === 'account retirement') controller.abort();
+	else session.setItem(LIBRARY_AUTH_CONTEXT_KEY, 'replacement');
+	expect(favoritesKey(scoped)).toBeNull();
+	expect(verifiedFavoritesKey(scoped, binding)).toBeNull();
+	expect(loadFavorites(scoped, local)).toEqual([]);
+	expect(() => scoped.setItem(LIBRARY_AUTH_CONTEXT_KEY, context)).toThrow('Library storage scope ended');
 	expect(local.getItem(key)).toBe(bytes);
 });
 

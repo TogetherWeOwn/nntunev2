@@ -220,8 +220,7 @@ fn sibling_precedent_still_logs_sqlstate_only() {
 fn commit_failure_is_still_detail_free_transport_error() {
     let handler = commit_handler();
     assert!(
-        handler
-            .contains("MeterWriteError::Transport(\"admission ledger unavailable\".to_string())"),
+        handler.contains("MeterWriteError::AdmissionLedgerUnavailable"),
         "execute failure must keep mapping to the detail-free transport error"
     );
     assert!(mark_queued_body().contains("admission_mark_queued_sql()"));
@@ -336,7 +335,7 @@ fn execute_failure_anchor_excludes_unrelated_events() {
             serde_json::json!({"build_sha": build_sha_from_env(&self.env),
                 "sqlstate": admission_commit_sqlstate(&e)}));
         client.execute(admission_mark_queued_sql(), &[]).await.map_err(|e| {
-            MeterWriteError::Transport("admission ledger unavailable".to_string())
+            MeterWriteError::AdmissionLedgerUnavailable
         })?;
         emit(Level::Error, &self.trace_id, "ingest.admission.commit_failed",
             serde_json::json!({"build_sha": build_sha_from_env(&self.env),

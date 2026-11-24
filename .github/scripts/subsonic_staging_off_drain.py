@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from staging_api_identity import SCRIPT, provider_result, valid
 from subsonic_staging_cleanup import CleanupResult, DeploymentPin, verify_cleanup
-from subsonic_staging_observer import sample_pressure
+from subsonic_staging_observer import require_preflight, sample_pressure
 
 BUDGET_SECONDS = 30
 
@@ -25,7 +25,7 @@ def expire(_signal, _frame):
     raise ReadDeadline
 
 
-def readback(env):
+def readback(env, *, require_headroom=False):
     account = env.get("CLOUDFLARE_ACCOUNT_ID")
     token = env.get("SUBSONIC_STAGING_WORKERS_READ_TOKEN")
     if not (
@@ -49,6 +49,12 @@ def readback(env):
             raise ReadDeadline
         return provider_result(path + suffix, token)
 
+    def pressure(*, deadline_ms):
+        row = sample_pressure(env, deadline_ms=deadline_ms)
+        if require_headroom:
+            require_preflight(row)
+        return row
+
     previous = signal.signal(signal.SIGALRM, expire)
     try:
         remaining = deadline_ms / 1000 - time.monotonic()
@@ -62,9 +68,7 @@ def readback(env):
             read_version=lambda version, *, deadline_ms: read(
                 f"/versions/{version}", deadline_ms
             ),
-            sample_pressure=lambda *, deadline_ms: sample_pressure(
-                env, deadline_ms=deadline_ms
-            ),
+            sample_pressure=pressure,
         )
     except ReadDeadline:
         return CleanupResult.DEADLINE

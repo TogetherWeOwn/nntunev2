@@ -1,9 +1,10 @@
 //! One node and one keyset page of the recorded invite tree.
 
 use serde::Serialize;
-use tokio_postgres::{types::Type, GenericClient};
+use tokio_postgres::types::Type;
 
 use crate::handlers::StoreError;
+use crate::postgres::PgQuery;
 
 const PAGE_SIZE: usize = 50;
 
@@ -25,7 +26,7 @@ pub enum InviteTreeRead {
 }
 
 pub(crate) async fn read_on(
-    client: &impl GenericClient,
+    client: &impl PgQuery,
     actor_id: &str,
     user_id: &str,
     cursor: Option<&str>,

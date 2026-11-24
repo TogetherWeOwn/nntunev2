@@ -62,8 +62,8 @@ test('creates one invite on demand and hands the copied link to signup', async (
 		return mockInvite(route);
 	});
 	await page.route('**/v1/auth/passkey/register/start', async (route) => {
-		// Only the email goes to registration start; opening a link spends nothing.
-		expect(route.request().postDataJSON()).toEqual({ email: 'friend@example.test' });
+		// Registration start validates the linked invite without spending it.
+		expect(route.request().postDataJSON()).toEqual({ email: 'friend@example.test', invite_code: code });
 		await route.fulfill({ json: { challenge: 'Zmlyc3Q=', user_id: 'dXNlcg', rp_id: 'localhost' } });
 	});
 	await page.goto('/account/invites');
@@ -109,6 +109,7 @@ test('creates one invite on demand and hands the copied link to signup', async (
 	expect(await page.evaluate(() => JSON.stringify(history.state))).not.toContain(code);
 	await page.getByRole('textbox', { name: 'Email', exact: true }).fill('friend@example.test');
 	await page.getByRole('button', { name: 'Create account with passkey' }).click();
+	await expect(page.getByRole('textbox', { name: 'Email code', exact: true })).toBeVisible();
 	await expect(page.getByRole('textbox', { name: 'Invite code', exact: false })).toHaveValue(code);
 	await page.reload();
 	await expect(page.getByText('Invite link added.', { exact: false })).toHaveCount(0);

@@ -27,14 +27,22 @@ pub(crate) struct FrameSpan {
 
 struct SeekPoint {
     sample: u64,
-    offset: usize,
+    offset: u64,
     samples: u16,
 }
 
 pub(crate) struct PreparedFlac<'a> {
     preamble: Vec<u8>,
     audio: &'a [u8],
+    seek: FlacSeekIndex,
+}
+
+/// Sparse, whole-frame seek geometry for one exact FLAC plaintext layout.
+/// This does not authenticate bytes or authorize a storage read.
+pub struct FlacSeekIndex {
     points: Vec<SeekPoint>,
+    audio_start: u64,
+    audio_len: u64,
     sample_rate: u32,
     total_samples: u64,
 }
@@ -45,10 +53,49 @@ impl PreparedFlac<'_> {
         (&self.preamble, self.audio)
     }
 
-    /// Whole-frame, half-open range in the *prepared plaintext*. Seek back
-    /// to the anchor at or before the start, and stop before the first anchor
-    /// at or after the exclusive end (or at EOF). No ciphertext math here.
     pub(crate) fn plaintext_range(&self, millis: Range<u64>) -> Option<Range<u64>> {
+        self.seek.plaintext_range(millis)
+    }
+}
+
+impl FlacSeekIndex {
+    pub(crate) fn new(sample_rate: u32, audio_start: u64) -> Self {
+        Self {
+            points: Vec::new(),
+            audio_start,
+            audio_len: 0,
+            sample_rate,
+            total_samples: 0,
+        }
+    }
+
+    /// Record the next contiguous validated frame. The end is an absolute
+    /// plaintext offset, while embedded FLAC seek points are audio-relative.
+    pub(crate) fn record_frame(&mut self, samples: u16, frame_end: u64) -> Result<(), ()> {
+        let interval = 5 * u64::from(self.sample_rate);
+        if self
+            .points
+            .last()
+            .is_none_or(|p| self.total_samples - p.sample >= interval)
+        {
+            if self.points.len() == MAX_SEEK_POINTS {
+                return Err(());
+            }
+            self.points.push(SeekPoint {
+                sample: self.total_samples,
+                offset: self.audio_len,
+                samples,
+            });
+        }
+        self.audio_len = frame_end - self.audio_start;
+        self.total_samples += u64::from(samples);
+        Ok(())
+    }
+
+    /// Whole-frame, half-open range in the indexed plaintext. Seek back to
+    /// the anchor at or before the start, and stop before the first anchor
+    /// at or after the exclusive end (or at EOF).
+    pub fn plaintext_range(&self, millis: Range<u64>) -> Option<Range<u64>> {
         if millis.start >= millis.end {
             return None;
         }
@@ -65,9 +112,8 @@ impl PreparedFlac<'_> {
         let end = self
             .points
             .partition_point(|p| u128::from(p.sample) < limit);
-        let base = self.preamble.len() as u64;
-        let end_offset = self.points.get(end).map_or(self.audio.len(), |p| p.offset);
-        Some(base + self.points[start].offset as u64..base + end_offset as u64)
+        let end_offset = self.points.get(end).map_or(self.audio_len, |p| p.offset);
+        Some(self.audio_start + self.points[start].offset..self.audio_start + end_offset)
     }
 }
 
@@ -80,14 +126,12 @@ pub(crate) fn prepare<'a>(
         .push(input)
         .map_err(|()| PrepareError::Preamble)?
         .ok_or(PrepareError::Preamble)?;
-    let mut points: Vec<SeekPoint> = Vec::new();
-    let (mut bytes, mut samples) = (0, 0_u64);
-    let interval = 5 * u64::from(info.sample_rate);
+    let mut seek = FlacSeekIndex::new(info.sample_rate, 0);
     for frame in validated_frames {
-        if frame.bytes.start != bytes
-            || frame.bytes.end <= bytes
+        if frame.bytes.start as u64 != seek.audio_len
+            || frame.bytes.end <= frame.bytes.start
             || frame.bytes.end > audio.len()
-            || frame.first_sample != samples
+            || frame.first_sample != seek.total_samples
             || frame.samples == 0
             || frame.samples > info.max_block
             // RFC 9639 §8.2 exempts the final frame from the minimum.
@@ -95,25 +139,15 @@ pub(crate) fn prepare<'a>(
         {
             return Err(PrepareError::FrameGeometry);
         }
-        if points.last().is_none_or(|p| samples - p.sample >= interval) {
-            if points.len() == MAX_SEEK_POINTS {
-                return Err(PrepareError::SeekLimit);
-            }
-            points.push(SeekPoint {
-                sample: samples,
-                offset: bytes,
-                samples: frame.samples,
-            });
-        }
-        bytes = frame.bytes.end;
-        samples += u64::from(frame.samples);
-        if samples >= 1 << 36 {
+        seek.record_frame(frame.samples, frame.bytes.end as u64)
+            .map_err(|()| PrepareError::SeekLimit)?;
+        if seek.total_samples >= 1 << 36 {
             return Err(PrepareError::FrameGeometry);
         }
     }
-    if points.is_empty()
-        || bytes != audio.len()
-        || (info.total_samples != 0 && info.total_samples != samples)
+    if seek.points.is_empty()
+        || seek.audio_len != audio.len() as u64
+        || (info.total_samples != 0 && info.total_samples != seek.total_samples)
     {
         return Err(PrepareError::FrameGeometry);
     }
@@ -127,18 +161,17 @@ pub(crate) fn prepare<'a>(
     preamble[4] = 0;
     block_header(&mut preamble, 4, comments.len());
     preamble.extend_from_slice(&comments);
-    block_header(&mut preamble, 0x80 | 3, points.len() * 18);
-    for point in &points {
+    block_header(&mut preamble, 0x80 | 3, seek.points.len() * 18);
+    for point in &seek.points {
         preamble.extend_from_slice(&point.sample.to_be_bytes());
-        preamble.extend_from_slice(&(point.offset as u64).to_be_bytes());
+        preamble.extend_from_slice(&point.offset.to_be_bytes());
         preamble.extend_from_slice(&point.samples.to_be_bytes());
     }
+    seek.audio_start = preamble.len() as u64;
     Ok(PreparedFlac {
         preamble,
         audio,
-        points,
-        sample_rate: info.sample_rate,
-        total_samples: samples,
+        seek,
     })
 }
 

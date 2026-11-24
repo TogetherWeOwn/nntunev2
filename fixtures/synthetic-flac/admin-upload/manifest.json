@@ -1,0 +1,57 @@
+{
+  "license": "CC0-1.0",
+  "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "source": "Original generated audio. Each clip contains 4096 constant 16-bit mono PCM samples at 44.1 kHz. The sample value is the number in the filename.",
+  "tracks": [
+    {
+      "file": "fixture-1.flac",
+      "bytes": 53,
+      "sha256": "e96d0ce34def34abaa429581f626f574ac45129a52459a35dc2d78acacf26bd3"
+    },
+    {
+      "file": "fixture-2.flac",
+      "bytes": 53,
+      "sha256": "6c438fea54b72379bce8675578fd4b4b16b033c08462ab6d275c98993708adfe"
+    },
+    {
+      "file": "fixture-3.flac",
+      "bytes": 53,
+      "sha256": "7d0c05274c4414fbe00903528a4d5d4c9acfd017f50a8867eac2bc9445fbdb6c"
+    },
+    {
+      "file": "fixture-4.flac",
+      "bytes": 53,
+      "sha256": "f39d5e0c67ae3371fb9fc2ce72b8705551828e2468cdc320674be5ad7986777d"
+    },
+    {
+      "file": "fixture-5.flac",
+      "bytes": 53,
+      "sha256": "6a378a75891876287fb788980148bc3920b78ffaeb0a055d5aec0b1323a67880"
+    },
+    {
+      "file": "fixture-6.flac",
+      "bytes": 53,
+      "sha256": "2d1fcea810bf8b2bad7449384bf57b70fcaabff9224c8351b943e0245e4987a0"
+    },
+    {
+      "file": "fixture-7.flac",
+      "bytes": 53,
+      "sha256": "c713a1f1d9297d276704114d1db01143d8f967711bb969fc7e441661b230df53"
+    },
+    {
+      "file": "fixture-8.flac",
+      "bytes": 53,
+      "sha256": "af7c6fa57648804ae245ed158c0b841325acff54d3a285f37a77090ae4e05c00"
+    },
+    {
+      "file": "fixture-9.flac",
+      "bytes": 53,
+      "sha256": "34e5aec60383379f2dcb1399d57d250fdaa816cbb7274e9dd1122d357d8ee3b2"
+    },
+    {
+      "file": "fixture-10.flac",
+      "bytes": 53,
+      "sha256": "76a730ff1035203aedd55db1df6c8e1b722ea8b20545cdff90213f11016db8db"
+    }
+  ]
+}

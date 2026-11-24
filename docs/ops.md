@@ -353,13 +353,14 @@ this documentation update, nor evidence of separate compute/failure domains.
 
 ### Staging migrations
 
-The scheduled/CI deploy path never applies `migrations/*.sql`. Staging
-migrations are applied **before** merge, after board approval for the
-DDL, by the authoring agent itself: once board approval is recorded on
-the card, the agent dispatches the `migrations-staging-apply` workflow
-(`.github/workflows/migrations-staging-apply.yml`) with the exact
-40-hex commit `ref`, the migration `file`, an `applied_by` identity and
-the Paperclip board-approval interaction id. The workflow checks out
+The scheduled/CI deploy path never applies `migrations/*.sql`. The task owner
+applies staging migrations **before** merge. Obtain explicit approval of
+the exact DDL for the staging apply from the independent reviewers required
+by the PR's risk tier. Record the approval and commit before dispatching the
+[`migrations-staging-apply` workflow](../.github/workflows/migrations-staging-apply.yml) with the exact
+40-hex commit `ref`, the migration `file`, and an `applied_by` identity.
+In the dispatch form's `board_approval` field, enter the recorded public-safe
+approval reference on a single line of at most 200 characters. The workflow checks out
 that exact ref as data only (migration bytes and manifest) and runs
 the trusted `.github/scripts/apply_migration.py` from the workflow's
 own ref — never code from the dispatch-supplied ref — with
@@ -371,15 +372,16 @@ migrator credential
 (`PLANETSCALE_MIGRATOR_URL_STAGING`, the `staging` environment secret)
 is read only inside the job and never reaches the agent. Any
 manifest/sha mismatch refuses exactly as the migrator does. Mode
-`all-pending` applies every unrecorded manifest entry up to `file` in
-manifest order, refusing on the first failure. The recorded
-`schema_migrations` row lands in the job summary; post it on the card
-before merging. Only a row from a successful apply counts as merge
-evidence — on a failed run, rows are diagnostic, and the receipt and
-effects must be reconciled before retrying (an older row for the same
-filename is not proof that the failed apply landed). The `board_approval` input is an audit record of the
-card's own gate, not a workflow-side call — the workflow cannot call
-Paperclip. Prerequisites before the first dispatch: (a)
+`all-pending` selects app migrations through `file` from the pinned manifest
+in manifest order. Include the pending app migrations in that range in the
+approval. The migrator skips matching records and refuses on the first
+failure. The recorded `schema_migrations` row lands in the job
+summary. Link that receipt in the PR before merging. Only a row from a
+successful apply counts as merge evidence. On a failed run, rows are
+diagnostic, and the receipt and effects must be reconciled before retrying
+(an older row for the same filename is not proof that the failed apply landed). The workflow logs the
+required `board_approval` input in the job summary for audit. Prerequisites
+before the first dispatch: (a)
 `PLANETSCALE_MIGRATOR_URL_STAGING` must be scoped to the `staging`
 environment, and (b) the `staging` environment's deployment-branch
 policy must restrict deployments to the protected branch (`main`) so
@@ -534,14 +536,14 @@ in the trusted checker, pinned to the repository, PR, reviewed Git parent,
 paths, digest and target. Both passes require exact Git lineage and an
 unchanged accepted prefix; neither accepts a new applied alias for the
 recorded identity, even in a different PR. Trigger a fresh PR event after
-the checker lands; rerunning a prior event uses its old base. If the slot
+the checker lands; rerunning a prior event tests its original integration commit. If the slot
 changes, reconcile the new path with the checker owner before retrying.
 
-The secretless PR gate loads its checker and its stdlib-only
-`migration_history.py` import from a separate checkout of the event's full
-trusted **base SHA**. The PR **head SHA** is checked out with full Git
-history under a different root, used only as evidence through `--root`;
-no PR setup, scripts or builds run in this job. Python isolated mode (`-I`)
+The secretless PR gate pins the tested integration commit and runs the
+resolver blob from its first parent. It loads the checker and its imports
+from a separate checkout of that **tested base SHA**. The validated second
+parent supplies the source head and manifest. That checkout retains full
+Git history and serves only as evidence through `--root`. Python isolated mode (`-I`)
 excludes the working directory, `PYTHONPATH` and user-site imports, then
 adds only the trusted checker directory. The checker runs outside both
 checkouts with no API token in its environment; Git ignores global/system
@@ -569,14 +571,15 @@ The API collector retains projected metadata before and after a complete
 file-list attempt, including every page and non-migration record. Both
 samples must agree on PR number, repository IDs/names, refs, commits and
 file count. An observed head change or retarget fails; it never adopts a
-live head. A recorded effective base B1 may equal the event base B0 or be
-its Git-verified descendant in the same repository/ref. Every observed base
-must also equal or descend from the preceding observation across brackets
-and attempts; an observed rewind or divergent transition is a hard failure.
+live head. Git must prove the original event base B0 is the tested first
+parent or its ancestor. A recorded effective base B1 must equal or descend
+from the tested first parent in the same repository/ref. Every observed base
+must equal or descend from the preceding observation across brackets and
+attempts. An observed rewind or divergent transition fails the check.
 B1 need not be an ancestor of H. Its immutable object must be available in the full data
 checkout; missing objects or ambiguous ancestry fail, with no mutable-ref
-fetch or trust-pin substitution. Missing/incompatible trusted B0 code also
-still fails; advancing the evidence base cannot recover absent executables.
+fetch or trust-pin substitution. Missing or incompatible first-parent code
+fails the check.
 
 Validation independently runs the existing verifier on **both B0/H and
 B1/H**, each with its own unique merge-base manifest baseline. Only the
@@ -634,9 +637,10 @@ operator-verified staging state). The three pre-merge applies from
 equivalently via `apply_migration.py --record-only`), so the gate is
 green immediately after the app backfill. A future shared mirror would couple
 staging and production reads; the replacement is not activated and these
-historical backfill files do not prove its migration state. Its backfill — and
-creating the table on production at all — requires a Release Manager decision;
-production applies use the same `apply_migration.py` path once their gate opens.
+historical backfill files do not prove its migration state. A production
+backfill or table creation requires a separate approved
+[production release task](../CONTRIBUTING.md#production-releases). Production
+applies use the same `apply_migration.py` path once their gate opens.
 
 ### Admin bootstrap (owner promotion)
 
@@ -1021,6 +1025,43 @@ not the raw URL or log event. Keep raw request URLs and query strings out
 of application log fields independently, per the
 [logging standard](logging-standard.md).
 
+## Private listening qualification
+
+`PRIVATE_LISTENING_COHORT` is an optional API Worker setting. Leave it unset
+on default builds. An explicitly configured cohort uses `owner_user_id`, up
+to eight `invite_ids`, and a shared `expires_at` in Unix seconds. Use the
+existing administrator account and email-bound single invites it issued in
+the same environment. Carry only ledger IDs in configuration. Keep invite
+links and actual cohort configuration in private custody. Keep
+`INVITES_REQUIRED` enabled for invite-only environments independently.
+The cohort setting restricts Library, catalogue and play grants to the named
+cohort while set. Regular account and billing routes retain their own access
+rules. Unset the cohort setting to use the regular paid playback gate.
+When the deadline expires, the cohort setting continues to refuse Library
+and playback until a qualified configuration change restores access.
+
+Open `/admin/invites/issue`, choose **Single invite**, enter the recipient's
+email, and use **Create invite** and **Signup link**. Find the resulting row
+ID in `/admin/invites`. In `/signup`, use **Email**, **Invite code (if you
+have one)** or the prefilled link, **Create account with passkey**, **Email
+code**, then **Finish creating account**. The owner uses `/login`. Verify the
+Library with `library-item`, its **Refresh** action and the explicit access
+refusal message after revocation. Observe `GET /api/library` and
+`POST /v1/plays` with a synthetic Library track.
+
+Test anonymous and unlisted sessions, absent and refused invites, the cohort
+deadline, and revocation by removing a ledger ID while retaining the cohort
+setting. Before redemption the invite ledger's existing **Revoke** action
+also refuses enrollment. Already signed play grants can remain valid until
+their expiry, up to 15 minutes. Confirm an empty payment history and no
+Stripe credentials for the synthetic cohort. Keep the music-video interface
+off. Exclude payment checkout, paid renewal/grace, member-issued invitations,
+real media delivery, range/seek behavior and consumption metering from this
+access-only evidence. Run the existing paid signup-arrival case with the
+cohort setting absent, since it expects the Billing destination. Preserve the
+same serving build identity when qualifying the two configurations.
+Apply the existing staging promotion checklist to any release candidate.
+
 ## Staging promotion checklist
 
 Promotion is `main` HEAD → staging; production promotion is a later gated
@@ -1163,14 +1204,23 @@ and [deployment creation](https://developers.cloudflare.com/api/resources/worker
 do not document a deploy-only-if-undeployed condition. Actions serialization
 cannot stop a concurrent provider write between the empty read and deployment.
 
-1. **Release Manager:** Accept the exact launch SHA after M1, staging
-   admission, Security → QA, exact-head CI and migration ledger review.
-   Accept the seed explicitly. Verify `production` Environment protection with the GitHub custodian; configure the hostname and `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
+1. **Release task owner and independent release reviewer.** Apply the
+   [production release process](../CONTRIBUTING.md#production-releases).
+   The reviewer explicitly accepts the seed and exact launch SHA after M1,
+   staging admission, security and QA evidence, exact-head CI and migration
+   ledger review. The application staging run supplies admission evidence.
+   Record same-build staging evidence for the pinned maintenance artifact
+   separately. For this first deployment, rehearse the close/undo procedure
+   below where supported. Stop before dispatch if staging has no supported
+   lane for the maintenance artifact or the required evidence is incomplete.
+   The release task owner verifies `production` Environment protection with
+   the GitHub custodian and coordinates configuration of the hostname and
+   `PRODUCTION_DEPLOY_ENABLED` for the accepted window only.
    Keep `PRODUCTION_ACCEPTED_SHA`, `PRODUCTION_WORKER_ID` (immutable `nntune-web` ID), Worker-scoped bearer and matching account in `production` only; a presence-only check during staging admission rejects inherited Cloudflare secrets.
 2. **Route custodian:** Immediately before dispatch, inventory every applicable zone and page, including wildcards, with existing read-only access. Refuse gaps; record zones, Worker ID, SHA, read time and zero matches.
    The GitHub custodian sets `PRODUCTION_BOOTSTRAP_ROUTE_PROOF` only in `production`: JSON with `worker_id`, `sha`, `checked_at` (`YYYY-MM-DDTHH:MM:SSZ`) and numeric `route_count: 0`.
    Freeze routes and keep this lane the sole Worker writer through readback. The Worker token cannot list zone routes.
-3. **Release Manager:** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`; Actions reruns are refused.
+3. **Release task owner.** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`. Actions reruns are refused.
    Under the mutation lock, require proof ≤30 minutes old, empty deployment/version/binding inventories and no custom domain, workers.dev or previews.
    One [upload by immutable ID with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/) installs `worker.mjs` at 100%. Record verified readback.
 4. **Close/undo:** Disable `PRODUCTION_DEPLOY_ENABLED` and clear the accepted SHA and route proof. To abort an in-flight run, cancel it too and reconcile Worker, deployment and route state before any retry.
@@ -1193,6 +1243,31 @@ shape check — no credentials, no network — that reads key names only and
 never reads or prints values
 (`ci/check-production-secrets-shape.mjs:6-7`).
 
+### First-release recovery after failed final smoke
+
+App promotion stays disabled. Before first release, verify empty production
+state with a read-only check, take a snapshot before the first schema change,
+and record the switch-off plan. Keep provider restore proof separate.
+
+Keep `PRODUCTION_ROLLBACK_CUSTODY` and `PRODUCTION_ROLLBACK_INTENT_KEY`
+(a separate random 256-bit key in lowercase hex) in the protected `production`
+Environment. The custody JSON pins the accepted `sha`, `account`, immutable
+`worker`, private `domain`, fresh `checked_at` (ISO UTC with milliseconds),
+private `evidence_sha256`, exact Worker `references` and verified `maintenance`
+`version`, `deployment`, seed `sha` and `module_sha256`. Set `exclusive_writers`
+and `private_routes_frozen` only after verifying and freezing all Worker,
+route, DNS and Access writers through readback. The job verifies the Worker
+and preview settings and seals the intent before traffic shifts. Custody
+evidence must be at most 30 minutes old when sealing. Keep the freeze in
+place through recovery readback even if final smoke runs past that window.
+The maintenance module digest must also match the reviewed candidate checkout.
+
+Failed final smoke keeps the release red. The same lock covers recovery, which
+requires the exact final deployment and submits maintenance at 100% once.
+On ambiguity reconcile Worker, allocation, routes and provider audit before
+any further action. Verify maintenance behavior and private Access denials on
+the isolated candidate. Post-watch and cancellation need separate admission.
+
 ### Production promotion publishes a CalVer release
 
 After a successful production promotion and its post-promotion smoke, the
@@ -1208,15 +1283,14 @@ and publishes a calendar version (`vYYYY.MDD.P`, e.g. `v2026.1102.1`)
 through the shared `TogetherWeOwn/.github` CalVer releaser (policy
 `production-promotion`; notes grouped by `release-please-config.json`
 changelog-sections). A re-promote of an already-tagged commit skips green
-without a tag. Production therefore only ever deploys on the release path
-(`environment: production`, human-gated); push to `main` deploys staging
-only (`environment: staging` on both deploy jobs). No other GitHub
-environment exists on this repo.
+without a tag. The production deploy uses the `production` Environment and
+requires independent release approval. A push to `main` deploys to the
+`staging` Environment only.
 
 - [ ] Exact-head CI: record the promotion SHA and GitHub Actions run/job
   URLs showing `ci-ok`, `gitleaks` and `pr-lint` green on that SHA.
   CI is `.github/workflows/ci.yml`; full suites and CI gates run in Actions,
-  never in a local CI mirror. Reviewers and the Release Manager accept
+  never in a local CI mirror. The release task owner and reviewers accept
   these exact-head links as CI evidence, not local full-suite transcripts
   ([verification contract](../CONTRIBUTING.md#evidence-for-review-and-release)).
   `migrations-staging` and `Devin Review` report on pull requests, not on
@@ -1323,6 +1397,31 @@ stay in the old `e2e-staging` group and cannot replace a pending run in
   Draining first also keeps an already queued push from immediately
   undoing the rollback. If the queue cannot be drained and kept clear, do
   not start a pre-lock rerun.
+
+### Offline staging Worker submission checks
+
+The [submission comparator](../ci/staging_worker_submission.py) runs only in
+CI with synthetic inputs. It checks the fixed web, API, MB and ingest jobs in
+[`deploy.yml`](../.github/workflows/deploy.yml) and the alerts job in
+[`deploy-alerts-staging.yml`](../.github/workflows/deploy-alerts-staging.yml).
+It compares the Worker, account, full source SHA, operation and final body
+digest with approval pins. Rollback also requires the approved version ID.
+The current staging writer is Wrangler. The web rollback procedure above
+redeploys a prior source revision and can also redeploy other configured
+Workers. The staging workflows have yet to implement a protected restore
+of a named Worker version.
+
+Before wiring this comparison into a live writer, resolve competing write
+paths and verify the target account and reachable bindings. The writer must
+derive the target, operation and rollback version from the request it will
+send, enforce single use of approval tied to the protected workflow revision
+and run attempt, and check each mutation's method, path, query and exact body
+before sending those bytes. For a named-version restore, record prior-version
+provenance, verify binding, schema and Durable Object compatibility, and
+confirm the serving version, build SHA and health after recovery. An enablement
+with no verified prior version needs a separately reviewed recovery plan.
+The [MB and ingest activation prerequisites](#operator-runbook-enabling-staging-mb--staging-ingest)
+apply to those lanes.
 
 ## Future Worker deploy lanes: required rollback evidence
 
