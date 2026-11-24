@@ -293,8 +293,12 @@ async fn resolves_only_the_committed_scoped_publication() {
         policy: Some(&policy),
         grant_secret: SECRET,
     };
-    let issue = async |db: &mut Client, cookie: Option<&str>, pins: &PublicationPins<'_>| {
-        api.issue(
+    let issue = async |db: &mut Client, admission, cookie, pins: &PublicationPins<'_>| {
+        PrivatePlayback {
+            policy: admission,
+            ..api
+        }
+        .issue(
             db,
             &keys,
             cookie,
@@ -306,14 +310,23 @@ async fn resolves_only_the_committed_scoped_publication() {
         .await
         .unwrap()
     };
-    assert!(issue(&mut reader, None, &original_pins).await.is_none());
-    assert!(issue(&mut reader, Some(&cookie), &pins).await.is_none());
-    assert!(issue(&mut reader, Some(&cookie), &original_pins)
-        .await
-        .is_none());
+    let configured = Some(&policy);
+    let session = Some(cookie.as_str());
+    for (admission, cookie, requested) in [
+        (configured, None, &original_pins),
+        (configured, session, &pins),
+        (configured, session, &original_pins),
+    ] {
+        assert!(issue(&mut reader, admission, cookie, requested)
+            .await
+            .is_none());
+    }
     let duration = include_str!("../tests/fixtures/private_playback_duration.sql");
     writer.query_one(duration, &[&track]).await.unwrap();
-    let issued = issue(&mut reader, Some(&cookie), &original_pins)
+    assert!(issue(&mut reader, None, session, &original_pins)
+        .await
+        .is_none());
+    let issued = issue(&mut reader, configured, session, &original_pins)
         .await
         .unwrap();
     let token = &issued.relay().grant.token;
@@ -332,21 +345,6 @@ async fn resolves_only_the_committed_scoped_publication() {
             .media_version,
         original_pins.version
     );
-    let expired = || UNIX_EPOCH + Duration::from_secs(issued.relay().grant.exp_unix);
-    let disabled = PrivatePlayback {
-        policy: None,
-        ..api
-    };
-    assert!(disabled
-        .resolve(&mut reader, &issued, token, &root, SystemTime::now)
-        .await
-        .unwrap()
-        .is_none());
-    assert!(api
-        .resolve(&mut reader, &issued, token, &root, expired)
-        .await
-        .unwrap()
-        .is_none());
     for state in ["invite", "session", "rotation", "revision", "lease"] {
         writer
             .query_one(
@@ -356,5 +354,10 @@ async fn resolves_only_the_committed_scoped_publication() {
             .await
             .unwrap();
         assert!(resolve(&mut reader, token).await.is_none(), "{state}");
+        if matches!(state, "invite" | "session" | "rotation") {
+            assert!(issue(&mut reader, configured, session, &original_pins)
+                .await
+                .is_none());
+        }
     }
 }
