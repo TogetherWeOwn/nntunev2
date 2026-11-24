@@ -1398,6 +1398,31 @@ stay in the old `e2e-staging` group and cannot replace a pending run in
   undoing the rollback. If the queue cannot be drained and kept clear, do
   not start a pre-lock rerun.
 
+### Offline staging Worker submission checks
+
+The [submission comparator](../ci/staging_worker_submission.py) runs only in
+CI with synthetic inputs. It checks the fixed web, API, MB and ingest jobs in
+[`deploy.yml`](../.github/workflows/deploy.yml) and the alerts job in
+[`deploy-alerts-staging.yml`](../.github/workflows/deploy-alerts-staging.yml).
+It compares the Worker, account, full source SHA, operation and final body
+digest with approval pins. Rollback also requires the approved version ID.
+The current staging writer is Wrangler. The web rollback procedure above
+redeploys a prior source revision and can also redeploy other configured
+Workers. The staging workflows have yet to implement a protected restore
+of a named Worker version.
+
+Before wiring this comparison into a live writer, resolve competing write
+paths and verify the target account and reachable bindings. The writer must
+derive the target, operation and rollback version from the request it will
+send, enforce single use of approval tied to the protected workflow revision
+and run attempt, and check each mutation's method, path, query and exact body
+before sending those bytes. For a named-version restore, record prior-version
+provenance, verify binding, schema and Durable Object compatibility, and
+confirm the serving version, build SHA and health after recovery. An enablement
+with no verified prior version needs a separately reviewed recovery plan.
+The [MB and ingest activation prerequisites](#operator-runbook-enabling-staging-mb--staging-ingest)
+apply to those lanes.
+
 ## Future Worker deploy lanes: required rollback evidence
 
 This section defines evidence only. It does not create a lane.
