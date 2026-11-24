@@ -390,13 +390,5 @@ async fn postgres_stages_completed_candidate_atomically() {
             page_versions: &[FINAL_VERSION],
         },
     });
-    auto_publish::exercise(
-        &observer,
-        &mut writer,
-        &mut contender,
-        &objects,
-        committed,
-        corrupt.ok().as_ref(),
-    )
-    .await;
+    auto_publish::exercise(&observer, &mut writer, &mut contender, &objects, committed).await;
 }

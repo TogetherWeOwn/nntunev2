@@ -12,10 +12,7 @@ use nntune_ingest::{
         },
         MbSearchHit,
     },
-    multipart::{
-        readback_inventory::VerifiedCompletedReadback,
-        session_outcome::{CommittedOutcome, CompletionScope},
-    },
+    multipart::session_outcome::{CommittedOutcome, CompletionScope},
 };
 use serde_json::json;
 use tokio_postgres::Transaction;
@@ -57,7 +54,7 @@ enum ReleaseFixtureEvidence<'a> {
     Receipt(&'a [CommittedFlac<'a>]),
     Scoped(&'a [VerifiedUpload<'a>]),
     Indeterminate(&'a [VerifiedUpload<'a>]),
-    Conflicting(&'a [VerifiedUpload<'a>]),
+    Conflicting(&'a [VerifiedUpload<'a>], usize),
 }
 
 pub(super) async fn exercise(
@@ -66,7 +63,6 @@ pub(super) async fn exercise(
     outcome_writer: &mut Client,
     objects: &[ObjectRef; 2],
     both: [CommittedFlac<'_>; 2],
-    corrupt: Option<&VerifiedCompletedReadback<'_, '_>>,
 ) {
     use ReleaseFixtureEvidence::{Conflicting, Indeterminate, Receipt, Scoped};
     let files = [("1", &objects[0]), ("2", &objects[1])].map(|(disc, object)| ExpectedFile {
@@ -113,7 +109,7 @@ pub(super) async fn exercise(
                 Receipt(receipts) => {
                     return stage(tx, &job, receipts, ALBUM, Some(candidates), (200, &body)).await;
                 }
-                Scoped(uploads) | Indeterminate(uploads) | Conflicting(uploads) => uploads,
+                Scoped(uploads) | Indeterminate(uploads) | Conflicting(uploads, _) => uploads,
             };
             stage_completed_release(
                 tx,
@@ -127,18 +123,29 @@ pub(super) async fn exercise(
                     if matches!(media, Indeterminate(_)) {
                         return Err(PublicationError::Indeterminate);
                     }
-                    Ok(row.map(|row| CommittedOutcome {
-                        map: row.get(0),
-                        object: row.get(1),
-                        generation: row.get(2),
-                        configuration: row.get(3),
-                        root_version: row.get(4),
-                        media_version: row.get(5),
-                        page_versions: if matches!(media, Conflicting(_)) {
-                            vec!["wrong-pin".into()]
-                        } else {
-                            row.get(6)
-                        },
+                    Ok(row.map(|row| {
+                        let mut outcome = CommittedOutcome {
+                            map: row.get(0),
+                            object: row.get(1),
+                            generation: row.get(2),
+                            configuration: row.get(3),
+                            root_version: row.get(4),
+                            media_version: row.get(5),
+                            page_versions: row.get(6),
+                        };
+                        if let Conflicting(_, pin) = media {
+                            [
+                                &mut outcome.map,
+                                &mut outcome.object,
+                                &mut outcome.generation,
+                                &mut outcome.configuration,
+                                &mut outcome.root_version,
+                                &mut outcome.media_version,
+                                &mut outcome.page_versions[0],
+                            ][pin]
+                                .push('!');
+                        }
+                        outcome
                     }))
                 },
             )
@@ -214,15 +221,6 @@ pub(super) async fn exercise(
         flac: both[i],
     });
     let mut tx = writer.transaction().await.unwrap();
-    let corrupt_batch: Vec<_> = std::iter::once(uploads[0])
-        .chain(corrupt.map(|verified| VerifiedUpload {
-            flac: CommittedFlac {
-                verified,
-                ..uploads[1].flac
-            },
-            ..uploads[1]
-        }))
-        .collect();
     for commit in [false, true] {
         let result = outcome_writer.transaction().await.unwrap();
         for upload in &uploads {
@@ -255,16 +253,27 @@ pub(super) async fn exercise(
     foreign[1].scope.principal = "catalogue-other";
     let mut wrong_request = uploads;
     wrong_request[1].scope.fingerprint = &[0; 32];
-    for (evidence, error) in [
-        (Scoped(&corrupt_batch), PublicationError::Refused),
-        (Scoped(&foreign), PublicationError::Refused),
-        (Scoped(&wrong_request), PublicationError::Refused),
-        (Conflicting(&uploads), PublicationError::Refused),
-        (Indeterminate(&uploads), PublicationError::Indeterminate),
-    ] {
-        assert_eq!(apply(&mut tx, evidence, false, 2).await, Err(error));
+    let mut mismatched = uploads;
+    mismatched[1].flac.verified = uploads[0].flac.verified;
+    for evidence in [
+        Scoped(&mismatched),
+        Scoped(&foreign),
+        Scoped(&wrong_request),
+    ]
+    .into_iter()
+    .chain((0..7).map(|pin| Conflicting(&uploads, pin)))
+    {
+        assert_eq!(
+            apply(&mut tx, evidence, false, 2).await,
+            Err(PublicationError::Refused)
+        );
         assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
     }
+    assert_eq!(
+        apply(&mut tx, Indeterminate(&uploads), false, 2).await,
+        Err(PublicationError::Indeterminate)
+    );
+    assert!(tx.query(ROWS, &[&RELEASE]).await.unwrap().is_empty());
 
     // Simulate a lost acknowledgement on either side of COMMIT. One retry
     // stages after rollback, and one replays the already committed rows.

@@ -17,10 +17,10 @@ pub struct VerifiedUpload<'a> {
     pub flac: CommittedFlac<'a>,
 }
 
-/// Stage an authorized release from its committed upload outcomes. The reader
-/// must use authoritative committed state, recheck live authorization for the
-/// entire scope, and reconcile under the session fence after an ambiguous
-/// commit. A missing result or reader error stops the batch before any write.
+/// Stage a release from immutable `completed` session outcomes. The reader
+/// must recheck live authorization and resolve each outcome under the session
+/// fence after the atomic winner and terminal-session commit. Abort, expiry and
+/// their cleanup must preserve completed inventory. Missing results and errors stop writes.
 ///
 /// Use the same path on retry. It reads outcomes and stages catalogue rows
 /// without dispatching storage operations or restaging the guarded winner.
