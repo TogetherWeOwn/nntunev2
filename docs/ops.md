@@ -1087,6 +1087,13 @@ lowercase hex root key on `nntune-stream-staging` in Worker secret custody. Shar
 `PRIVATE_PLAYBACK_CUSTODY_SECRET` with the staging API only, independently
 of `PLAY_GRANT_SECRET`. Keep the upload writer's credentials separate.
 Arm `PRIVATE_PLAYBACK_STAGING_ENABLED=true` and the private journey together.
+The same arm enables the staging API and browser builds. Supply
+`PRIVATE_PLAYBACK_STAGING_ENVIRONMENT` and `PRIVATE_PLAYBACK_STAGING_LIBRARY`
+as lowercase UUIDv4 identifiers for the dedicated synthetic namespace. Staging
+API and Stream use the same S3 configuration, bucket, and root-version IDs.
+Keep the cohort setting, root key, custody secret and play-grant key in
+staging Worker secret custody. Arm only after the browser API adapter and its
+receipt store, Stream runtime, and Library client are on the candidate.
 Before accepting the trial, verify a browser disconnect through the relay
 closes the upstream read and settles only the acknowledged byte prefix.
 Retain the version ID, deployment ID, `BUILD_SHA` and playback mode from

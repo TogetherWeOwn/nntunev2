@@ -222,10 +222,12 @@ def assert_upload_redaction(upload_body, label):
           f"{label}: Wrangler upload metadata must set observability.redact_query_string to true")
 
 
-def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
+def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_private=False):
     label = f"{worker}" + ("" if worker != "api" else (" mirror-present" if mirror else " mirror-absent"))
     if worker == "stream":
         label += " private-enabled" if mirror else " private-disabled"
+    if api_private:
+        label += " private-enabled"
     tag = label.replace(" ", "_")
     gen_script, argv = workflow_commands(wf_text, worker, sha)
     workers = {w["name"]: {b["binding"]: b for b in w["binding"]} for w in manifest["worker"]}
@@ -250,6 +252,16 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
             PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region",
             PRIVATE_PLAYBACK_STAGING_ROOT_VERSION="22222222-2222-4222-8222-222222222222",
         )
+    if api_private:
+        summary_env.update(
+            STREAM_SERVICE_STAGING="nntune-stream-staging", STREAM_STAGING_DEPLOY_ENABLED="true",
+            PRIVATE_MUSIC_STAGING_JOURNEY="true", PRIVATE_PLAYBACK_STAGING_ENABLED="true",
+            PRIVATE_PLAYBACK_STAGING_ENVIRONMENT="33333333-3333-4333-8333-333333333333",
+            PRIVATE_PLAYBACK_STAGING_LIBRARY="44444444-4444-4444-8444-444444444444",
+            PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION="11111111-1111-4111-8111-111111111111",
+            PRIVATE_PLAYBACK_STAGING_S3_BUCKET="nntunev2-private-fixtures-staging",
+            PRIVATE_PLAYBACK_STAGING_ROOT_VERSION="22222222-2222-4222-8222-222222222222",
+        )
 
     home = base / f"home-{tag}"
     home.mkdir()
@@ -272,6 +284,13 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
     if worker == "api":
         summary = Path(summary_env["GITHUB_STEP_SUMMARY"]).read_text()
         staging = config["env"]["staging"]
+        private_vars = {key: value for key, value in staging["vars"].items() if key.startswith("PRIVATE_PLAYBACK_")}
+        expected = {key.replace("PRIVATE_PLAYBACK_STAGING_", "PRIVATE_PLAYBACK_"): value
+                    for key, value in summary_env.items() if key.startswith("PRIVATE_PLAYBACK_STAGING_")}
+        check(private_vars == expected, f"{label}: API private playback settings drifted")
+        if api_private:
+            check(staging["services"] == [{"binding": "STREAM", "service": "nntune-stream-staging"}],
+                  f"{label}: private API lacks its staging Stream binding")
         check(staging.get("observability", {}).get("redact_query_string") is True,
               f"{label}: staging API invocation query strings must be redacted")
         bound = [h["binding"] for h in staging["hyperdrive"]]
@@ -296,7 +315,7 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
         assert_upload_redaction(upload_body, label)
         print(f"{label}: Wrangler upload metadata redacts query strings", flush=True)
 
-    if worker == "api" and mirror:
+    if worker == "api" and mirror and not api_private:
         negative_control(wrangler, argv, wdir, env, marker, label)
 
 
@@ -338,7 +357,8 @@ def main():
         for worker, mirror in (("api", True), ("api", False), ("mb", False), ("ingest", False),
                                ("stream", False), ("stream", True)):
             scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror)
-    print("check_worker_upload: ok (api with/without mirror, mb, ingest, stream with/without private playback)")
+        scenario(wrangler, wf_text, sha, manifest, base, path, "api", True, api_private=True)
+    print("check_worker_upload: ok (api with/without mirror, mb, ingest, API and Stream with/without private playback)")
 
 
 if __name__ == "__main__":

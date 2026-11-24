@@ -125,7 +125,10 @@ jobs:
           # Deployment builds do not consume the CI package cache.
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
+      - name: Build staging web
+        env:
+          PUBLIC_BROWSER_PLAYBACK: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' && vars.PRIVATE_PLAYBACK_STAGING_ENABLED == 'true' && vars.STREAM_STAGING_DEPLOY_ENABLED == 'true' && '1' || '0' }}
+        run: pnpm build
       - name: Deploy to staging
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
         with:
@@ -223,6 +226,14 @@ jobs:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
           HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
           STREAM_SERVICE_STAGING: ${{ vars.STREAM_SERVICE_STAGING }}
+          STREAM_STAGING_DEPLOY_ENABLED: ${{ vars.STREAM_STAGING_DEPLOY_ENABLED }}
+          PRIVATE_MUSIC_STAGING_JOURNEY: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY }}
+          PRIVATE_PLAYBACK_STAGING_ENABLED: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENABLED }}
+          PRIVATE_PLAYBACK_STAGING_ENVIRONMENT: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENVIRONMENT }}
+          PRIVATE_PLAYBACK_STAGING_LIBRARY: ${{ vars.PRIVATE_PLAYBACK_STAGING_LIBRARY }}
+          PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION }}
+          PRIVATE_PLAYBACK_STAGING_S3_BUCKET: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_BUCKET }}
+          PRIVATE_PLAYBACK_STAGING_ROOT_VERSION: ${{ vars.PRIVATE_PLAYBACK_STAGING_ROOT_VERSION }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
           API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
         run: |
@@ -281,7 +292,28 @@ jobs:
           if stream_service:
               assert stream_service == "nntune-stream-staging", \
                   "STREAM_SERVICE_STAGING must equal the staging stream Worker name"
+          enabled = os.environ.get("PRIVATE_PLAYBACK_STAGING_ENABLED", "")
+          assert enabled in ("", "false", "true"), "invalid private playback arm"
+          assert (enabled == "true") == (os.environ.get("PRIVATE_MUSIC_STAGING_JOURNEY", "").lower() == "true"), \
+              "arm API playback and the private journey together"
+          if enabled == "true":
+              assert stream_service and os.environ.get("STREAM_STAGING_DEPLOY_ENABLED") == "true", \
+                  "private playback requires the staging Stream binding and deploy lane"
+              uuid_v4 = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+              for name in ("ENVIRONMENT", "LIBRARY", "S3_CONFIGURATION", "ROOT_VERSION"):
+                  key = f"PRIVATE_PLAYBACK_STAGING_{name}"
+                  assert re.fullmatch(uuid_v4, os.environ.get(key, "")), f"{key} must be a lowercase UUIDv4"
+              assert os.environ.get("PRIVATE_PLAYBACK_STAGING_S3_BUCKET") == "nntunev2-private-fixtures-staging", \
+                  "private playback requires the dedicated fixture bucket"
           PY
+          private_playback=""
+          if [ "${PRIVATE_PLAYBACK_STAGING_ENABLED:-}" = true ]; then
+            private_playback=$(printf '%s\n' 'PRIVATE_PLAYBACK_ENABLED = "true"'
+              for field in ENVIRONMENT LIBRARY S3_CONFIGURATION S3_BUCKET ROOT_VERSION; do
+                input="PRIVATE_PLAYBACK_STAGING_$field"
+                printf 'PRIVATE_PLAYBACK_%s = "%s"\n' "$field" "${!input}"
+              done)
+          fi
           # Generated, never committed: bindings + public vars only, no
           # secrets. HYPERDRIVE_CACHING_DISABLED=1 is set here only because
           # the gate step above passed for this env's Hyperdrive config
@@ -352,6 +384,7 @@ jobs:
           QA_CODE_SEAM = "1"
           # Identifies this deployment; no measurement enable, lease, or DB binding.
           SUBSONIC_MEASUREMENT_STAGE = "staging"
+          ${private_playback}
 
           # Workers Logs persistence for the structured api records (the
           # build_sha evidence is read there). Without this block the
