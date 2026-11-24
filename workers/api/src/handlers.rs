@@ -225,6 +225,7 @@ pub struct Config {
     pub prior_keks: Vec<(u32, [u8; 32])>,
     pub session_ttl_secs: u64,
     pub invites_required: bool,
+    pub(crate) private_listening: Option<crate::private_listening::PrivateListening>,
     /// Verify-only previous session HMAC secret: `Some` only inside a
     /// recorded rotation window, `None` in steady state. Never mints;
     /// length-checked like the primary (a short previous fails closed).
@@ -337,6 +338,7 @@ impl Config {
             prior_keks: Vec::new(),
             session_ttl_secs: session_ttl_secs.min(session::MAX_SESSION_SECS),
             invites_required,
+            private_listening: None,
             session_previous_secret,
             native_rest_pepper: None,
             native_rest_pepper_version: 0,
@@ -820,6 +822,14 @@ pub trait Store {
         &self,
         email: &str,
     ) -> impl Future<Output = Result<Option<UserRecord>, StoreError>>;
+    fn private_listening_access(
+        &self,
+        _user_id: &str,
+        _owner_user_id: &str,
+        _invite_ids: &[i64],
+    ) -> impl Future<Output = Result<bool, StoreError>> {
+        async { Err(StoreError) }
+    }
     fn insert_user(&self, user: &UserRecord) -> impl Future<Output = Result<(), StoreError>>;
     fn insert_challenge(
         &self,
@@ -3019,6 +3029,23 @@ where
         Ok(resp)
     }
 
+    async fn private_listening_deadline(&self, user_id: &str) -> Result<Option<u64>, Response> {
+        let Some(policy) = &self.cfg.private_listening else {
+            return Ok(None);
+        };
+        if self.now < policy.expires_at
+            && self
+                .store
+                .private_listening_access(user_id, &policy.owner_user_id, &policy.invite_ids)
+                .await
+                .map_err(|_| internal())?
+        {
+            return Ok(Some(policy.expires_at));
+        }
+        let error = crate::api_error::ApiError::forbidden("private listening access required");
+        Err(json_response(error.status, serde_json::json!(error)))
+    }
+
     /// Full request authentication: signed token + current server row via
     /// `verify_stored_session`, plus the CSRF origin pin for mutations.
     async fn authenticate(
@@ -3365,6 +3392,9 @@ where
     let Some(email) = normalize_email(&body.email) else {
         return generic_auth();
     };
+    if ctx.cfg.private_listening.is_some() && body.invite_code.is_none() {
+        return generic_auth();
+    }
     // Invite pre-check (spec §6.3): when the signup page presents a
     // code, validate it — never consume it — before any signup row is
     // minted, so a bad code fails at the code step with the one
@@ -3408,6 +3438,14 @@ where
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
+        if ctx
+            .cfg
+            .private_listening
+            .as_ref()
+            .is_some_and(|policy| !policy.accepts_invite(&invite, ctx.now))
+        {
+            return generic_auth();
+        }
         // No user row exists yet: validate against a sentinel id that
         // can never equal an issuer, so the hash/spend/revoked/expiry/
         // email-bind/self-invite (by email) predicates all run; the
@@ -3714,7 +3752,10 @@ where
     // token intact for a corrected retry (the signup page stays on the
     // code step). Single-use is enforced by the conditional store claim,
     // not this snapshot. All claims and enrollment commit together.
-    let invite_redemption = if ctx.cfg.invites_required || body.invite_code.is_some() {
+    let invite_redemption = if ctx.cfg.invites_required
+        || ctx.cfg.private_listening.is_some()
+        || body.invite_code.is_some()
+    {
         // Atomic redemption budgets BEFORE the lookup, claimed as one
         // all-or-none pair: the per-client key (10/300s, keyed by client
         // prefix and account, per `auth::invite_attempt_allowed`) and
@@ -3759,6 +3800,14 @@ where
             Ok(None) => return generic_auth(),
             Err(_) => return internal(),
         };
+        if ctx
+            .cfg
+            .private_listening
+            .as_ref()
+            .is_some_and(|policy| !policy.accepts_invite(&invite, ctx.now))
+        {
+            return generic_auth();
+        }
         // The snapshot prepare validates every refusal class with the
         // one generic error (unknown/expired/revoked/email-mismatch/
         // self-invite are indistinguishable) and stamps the spend the
@@ -3770,10 +3819,11 @@ where
             issuer_email: issuer_email.as_deref(),
             now: ctx.now,
         };
-        let prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
+        let mut prepared = match auth::prepare_invite_redemption(invite, &code, &redemption) {
             Ok(prepared) => prepared,
             Err(_) => return generic_auth(),
         };
+        prepared.require_active_admin_issuer = ctx.cfg.private_listening.is_some();
         // The `invite.redeemed` audit rides the enrollment transaction
         // inside `complete_registration`, so it can never be separated
         // from the claim it records. It references the invite by row
@@ -3839,6 +3889,10 @@ where
     }
     ctx.audit(&user_id, "auth.register", true).await;
     match ctx.start_session(&user_id).await {
+        Ok(mut resp) if ctx.cfg.private_listening.is_some() => {
+            resp.body = serde_json::json!({"ok": true, "private_listening": true}).to_string();
+            resp
+        }
         Ok(resp) => resp,
         Err(resp) => resp,
     }
@@ -4342,7 +4396,7 @@ where
     // established state, and gating on credentials alone would lock
     // those members out the moment invites flip on, with
     // register/finish demanding an invite they never needed.
-    if ctx.cfg.invites_required {
+    if ctx.cfg.invites_required || ctx.cfg.private_listening.is_some() {
         match ctx.store.account_admitted(&record.user_id).await {
             Ok(false) => return generic_auth(),
             Ok(true) => {}
@@ -4673,15 +4727,12 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if let Some(user) = bearer {
-        if !user.is_empty() {
-            return Ok(user.to_string());
-        }
-    }
-    match ctx.authenticate(req, false).await {
-        Ok((claims, _token)) => Ok(claims.user_id),
-        Err(resp) => Err(resp),
-    }
+    let user_id = match bearer.filter(|user| !user.is_empty()) {
+        Some(user) => user.to_string(),
+        None => ctx.authenticate(req, false).await?.0.user_id,
+    };
+    ctx.private_listening_deadline(&user_id).await?;
+    Ok(user_id)
 }
 
 /// Serialize a catalogue page, failing closed on the (in practice
@@ -4741,6 +4792,9 @@ where
         Ok(pair) => pair,
         Err(resp) => return resp,
     };
+    if let Err(resp) = ctx.private_listening_deadline(&claims.user_id).await {
+        return resp;
+    }
     let mut response = catalogue_library_entries(ctx, &claims.user_id).await;
     if is_cookie && response.status == 200 {
         response
@@ -6620,6 +6674,14 @@ where
 // cookie) but cannot mint until native bearer dispatch lands; the
 // heartbeat path is `Deny` in the scope map and never enters the gate.
 
+// Distinguishes private leases from paid leases when the cohort is disabled.
+const PRIVATE_PLAY_PREFIX: &str = "private_";
+
+fn is_private_play_id(play_id: &str) -> bool {
+    // Standard play ids encode 16 bytes in 22 unpadded base64url characters.
+    play_id.len() == PRIVATE_PLAY_PREFIX.len() + 22 && play_id.starts_with(PRIVATE_PLAY_PREFIX)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlayIssueBody {
@@ -6794,6 +6856,7 @@ where
     if matches!(ctx.store.account_deleting(user_id).await, Ok(true)) {
         return Err(account_deleting_response());
     }
+    let private_deadline = ctx.private_listening_deadline(user_id).await?;
     // An unprovisioned (or too-short) secret fails closed before any
     // lease write: an unmintable grant must never burn a lease epoch or
     // displace the current holder.
@@ -6819,6 +6882,19 @@ where
     if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, "play").is_err() {
         return Err(validation_failed("invalid track_id"));
     }
+    if private_deadline.is_some()
+        && !ctx
+            .store
+            .catalogue_member_target(
+                user_id,
+                crate::target_identity::TargetKind::Track,
+                &body.track_id,
+            )
+            .await
+            .map_err(|_| internal())?
+    {
+        return Err(not_found());
+    }
     let lease = match ctx.store.playback_lease(user_id).await {
         Ok(row) => row,
         Err(_) => return Err(internal()),
@@ -6833,12 +6909,17 @@ where
     // fall through to new-start gates after a lost continuation.
     if let (Some(play_id), Some(row)) = (body.play_id.as_deref(), lease.as_ref()) {
         if row.is_continuation(&body.session_id, play_id, &body.track_id, ctx.now) {
+            if is_private_play_id(play_id) && private_deadline.is_none() {
+                return Err(not_found());
+            }
             if crate::ledger::derive_play_idempotency_key(user_id, &body.track_id, play_id).is_err()
             {
                 return Err(validation_failed("invalid play_id"));
             }
-            let lease_expires_at =
-                crate::playback::lease_expiry(ctx.now, row.continuation_deadline);
+            let deadline = row
+                .continuation_deadline
+                .min(private_deadline.unwrap_or(u64::MAX));
+            let lease_expires_at = crate::playback::lease_expiry(ctx.now, deadline);
             match ctx
                 .store
                 .touch_playback_lease(
@@ -6859,7 +6940,7 @@ where
                         play_id,
                         row.epoch,
                         ctx.now,
-                        row.continuation_deadline,
+                        deadline,
                     );
                 }
                 Ok(false) => {}
@@ -6874,6 +6955,13 @@ where
         let error =
             crate::api_error::ApiError::by_code("conflict", "playback lease no longer active");
         return Err(json_response(error.status, serde_json::json!(error)));
+    }
+    if private_deadline.is_some() {
+        let caps = crate::plan_limits::PlanCaps {
+            stream_seconds_month: 0,
+            max_concurrent_streams: 1,
+        };
+        return acquire_new_play(ctx, user_id, body, secret, caps, private_deadline).await;
     }
     // New start, gate 1: subscription. `now` saturates into i64 rather
     // than wrapping — an absurd clock reads as far-future (closed),
@@ -6931,20 +7019,39 @@ where
             ),
         ));
     }
-    // Gate 3: the lease. The play id is minted here, never taken from
-    // the client (a client-chosen fresh id could replay an old play
-    // and under-meter). The atomic acquire bumps the epoch in the
-    // store; `Held` is the other-session 429 with the live TTL.
-    let play_id = match random_id::<16>() {
+    acquire_new_play(ctx, user_id, body, secret, caps, None).await
+}
+
+async fn acquire_new_play<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+    body: PlayIssueBody,
+    secret: &[u8],
+    caps: crate::plan_limits::PlanCaps,
+    private_deadline: Option<u64>,
+) -> Result<IssuedPlay, Response>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    // The per-account lease enforces one stream on either path. Only the
+    // server generates play ids for new starts.
+    let mut play_id = match random_id::<16>() {
         Ok(id) => id,
         Err(_) => return Err(unavailable()),
     };
+    if private_deadline.is_some() {
+        play_id.insert_str(0, PRIVATE_PLAY_PREFIX);
+    }
     let meta = ctx
         .store
         .track_meta(user_id, &body.track_id, true)
         .await
         .map_err(|_| internal())?;
-    let continuation_deadline = crate::playback::continuation_deadline(ctx.now, meta);
+    let continuation_deadline = crate::playback::continuation_deadline(ctx.now, meta)
+        .min(private_deadline.unwrap_or(u64::MAX));
     match ctx
         .store
         .acquire_playback_lease(
@@ -7001,6 +7108,10 @@ where
     if matches!(ctx.store.account_deleting(&claims.user_id).await, Ok(true)) {
         return account_deleting_response();
     }
+    let private_deadline = match ctx.private_listening_deadline(&claims.user_id).await {
+        Ok(deadline) => deadline,
+        Err(response) => return response,
+    };
     // Same fail-closed secret gate as issuance: a misconfigured
     // deployment must not let heartbeats keep a lease alive that no
     // new grant could be minted against.
@@ -7032,10 +7143,14 @@ where
         ctx.now,
     );
     let (state, lease_expires_at) = if state == crate::playback::LeaseHeartbeat::Active {
+        if is_private_play_id(&body.play_id) && private_deadline.is_none() {
+            return not_found();
+        }
         let deadline = lease
             .as_ref()
             .expect("active lease has a row")
-            .continuation_deadline;
+            .continuation_deadline
+            .min(private_deadline.unwrap_or(u64::MAX));
         let expires = crate::playback::lease_expiry(ctx.now, deadline);
         match ctx
             .store
@@ -9632,6 +9747,26 @@ mod tests {
         ) -> Result<bool, StoreError> {
             self.delete_preference(user_id, kind, target, false)
         }
+        async fn private_listening_access(
+            &self,
+            user_id: &str,
+            owner_user_id: &str,
+            invite_ids: &[i64],
+        ) -> Result<bool, StoreError> {
+            let users = self.users.borrow();
+            let Some(user) = users.get(user_id) else {
+                return Ok(false);
+            };
+            Ok(user_id == owner_user_id
+                || self.invites.borrow().values().any(|invite| {
+                    invite_ids.contains(&invite.id)
+                        && invite.issued_by.as_deref() == Some(owner_user_id)
+                        && invite.redeemed_by.as_deref() == Some(user_id)
+                        && invite.email.as_deref() == Some(user.email.as_str())
+                        && invite.revoked_at.is_none()
+                }))
+        }
+
         async fn user_by_email(&self, email: &str) -> Result<Option<UserRecord>, StoreError> {
             Ok(self
                 .users
@@ -24244,9 +24379,8 @@ mod tests {
         assert_eq!(h.store.audits.borrow().len(), audits_before);
     }
 
-    /// One full passkey signup (start + finish) presenting `invite_code`
-    /// at finish only, mirroring the signup page's code step. Returns
-    /// the finish response and the user id minted at start.
+    /// One full passkey signup. Private listening requires invite pre-check
+    /// at start. Returns the finish response and the user id minted at start.
     fn signup_with_invite(
         h: &Harness,
         email: &str,
@@ -24254,11 +24388,12 @@ mod tests {
         cose_seed: u8,
         invite_code: Option<&str>,
     ) -> (Response, String) {
-        let start = h.call(
-            "POST",
-            "/v1/auth/passkey/register/start",
-            serde_json::json!({"email": email}),
-        );
+        let start_body = if h.config.private_listening.is_some() {
+            serde_json::json!({"email": email, "invite_code": invite_code})
+        } else {
+            serde_json::json!({"email": email})
+        };
+        let start = h.call("POST", "/v1/auth/passkey/register/start", start_body);
         assert_eq!(start.status, 200, "{}", start.body);
         let start: serde_json::Value = serde_json::from_str(&start.body).unwrap();
         let challenge = start["challenge"].as_str().unwrap().to_string();
@@ -24280,6 +24415,106 @@ mod tests {
             }),
         );
         (resp, user_id)
+    }
+
+    #[test]
+    fn private_listening_redeems_owner_invite_and_fences_library_and_playback() {
+        use serde_json::{json, Value};
+        let mut h = play_harness();
+        let owner = seed_admin(&h, "owner", "owner@example.test");
+        seed_user(&h, "outsider", "outsider@example.test");
+        let outsider = magic_login(&h, "outsider@example.test");
+        let invited_email = "friend@example.test";
+        let issued = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(json!({"email": invited_email}).to_string()),
+            Some(owner.clone()),
+            Some(ORIGIN),
+        );
+        let selected: Value = serde_json::from_str(&issued.body).unwrap();
+        let code = selected["code"].as_str().unwrap();
+        let expires_at = NOW + 30;
+        h.config.private_listening = crate::private_listening::PrivateListening::parse(&json!({
+            "owner_user_id": "owner", "invite_ids": [selected["invite"]["id"]], "expires_at": expires_at
+        }).to_string());
+        assert!(h.config.private_listening.is_some());
+        let start = |body: Value| h.call("POST", "/v1/auth/passkey/register/start", body);
+        let mail_before = h.mailer.sent.borrow().len();
+        for body in [
+            json!({"email": "public@example.test"}),
+            json!({"email": "wrong@example.test", "invite_code": code}),
+        ] {
+            assert_eq!(start(body).status, 401);
+        }
+        assert_eq!(h.mailer.sent.borrow().len(), mail_before);
+        assert_eq!(h.store.users.borrow().len(), 2);
+
+        let (finish, friend_id) =
+            signup_with_invite(&h, invited_email, b"fixture-private-cred", 21, Some(code));
+        assert_eq!(finish.body, r#"{"ok":true,"private_listening":true}"#);
+        let friend = cookie_of(&finish);
+        assert_eq!(
+            start(json!({"email": invited_email, "invite_code": code})).status,
+            401
+        );
+        seed_library(&h, &friend_id);
+        let library =
+            |path: &str, cookie: Option<String>| h.call_full("GET", path, None, cookie, None);
+        for path in ["/api/library", "/v1/library"] {
+            assert_eq!(library(path, None).status, 401);
+            assert_eq!(library(path, Some(outsider.clone())).status, 403);
+            assert_eq!(library(path, Some(owner.clone())).status, 200);
+            assert_eq!(library(path, Some(friend.clone())).status, 200);
+        }
+        assert!(h.config.stripe_secret_key.is_none() && h.config.stripe_webhook_secret.is_none());
+        assert!(
+            h.store.playback_subscriptions.borrow().is_empty()
+                && h.store.invoice_history.borrow().is_empty()
+        );
+        let play = json!({"track_id": CAT_REC_A, "session_id": "tab"});
+        assert_eq!(play_call(&h, &outsider, play.clone()).status, 403);
+        assert_eq!(play_call(&h, &owner, play.clone()).status, 404);
+        let issued = play_call(&h, &friend, play.clone());
+        assert_eq!(issued.status, 200);
+        let conflict = play_call(
+            &h,
+            &friend,
+            json!({"track_id": CAT_REC_A, "session_id": "other-tab"}),
+        );
+        assert_eq!(conflict.status, 429);
+        assert!(conflict
+            .extra_headers
+            .contains(&("x-plan-limit".into(), "concurrent_streams=1".into())));
+        let state: Value = serde_json::from_str(&issued.body).unwrap();
+        assert_eq!(state["expires_at"], expires_at);
+        let renewal =
+            json!({"track_id": CAT_REC_A, "session_id": "tab", "play_id": state["play_id"]});
+        let heartbeat = |h: &Harness| {
+            h.call_full(
+            "POST", "/v1/plays/heartbeat",
+            Some(json!({"session_id": "tab", "play_id": state["play_id"], "lease_epoch": state["lease_epoch"]}).to_string()),
+            Some(friend.clone()), Some(ORIGIN),
+        )
+        };
+        assert_eq!(heartbeat(&h).status, 200);
+        h.config
+            .private_listening
+            .as_mut()
+            .unwrap()
+            .invite_ids
+            .clear();
+        assert_eq!(
+            h.call_full("GET", "/api/library", None, Some(friend.clone()), None)
+                .status,
+            403
+        );
+        assert_eq!(play_call(&h, &friend, renewal.clone()).status, 403);
+        assert_eq!(heartbeat(&h).status, 403);
+        h.config.private_listening = None;
+        assert_eq!(play_call(&h, &friend, renewal).status, 404);
+        assert_eq!(heartbeat(&h).status, 404);
+        assert_eq!(play_call(&h, &friend, play).status, 402);
     }
 
     fn audits_with_action(h: &Harness, action: &str) -> Vec<vault::AuditEvent> {

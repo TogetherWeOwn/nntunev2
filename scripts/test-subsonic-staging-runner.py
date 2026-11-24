@@ -299,6 +299,23 @@ class TransportTests(unittest.TestCase):
             self.send()
         self.assertEqual(len(self.children), 3)
 
+    def test_off_probe_refuses_route_changes_and_bad_edge_auth_before_spawn(self):
+        access = {"access_client_id": self.access_client_id,
+                  "access_client_secret": self.access_client_secret}
+        timing = {"deadline": time.monotonic() + 4, "cancel": self.cancel}
+        with self.assertRaisesRegex(runner["Stop"], "^access-credential-shape$"):
+            self.transport.probe_off(**timing, **(access | {"access_client_secret": ""}))
+        for endpoint in ("getAlbum", "getArtists/child", "getArtists?x=1", "ping"):
+            with (patch.dict(self.transport._matrix["slots"][4], endpoint=endpoint),
+                  self.assertRaisesRegex(runner["Stop"], "^off-probe-refused$")):
+                self.transport.probe_off(**timing, **access)
+        original = runner["_prepare_post"](self.transport._matrix["slots"][4], "", "")
+        off_host = replace(original, url=original.url.replace("staging.nntune.com", "nntune.com"))
+        with (patch.dict(runner["_prepare_post"].__globals__, _prepare_post=lambda *_: off_host),
+              self.assertRaisesRegex(runner["Stop"], "^off-probe-refused$")):
+            self.transport.probe_off(**timing, **access)
+        self.assertEqual(self.children, [])
+
     def test_access_denial_and_redirect_are_terminal(self):
         for status, reason in ((302, "redirect-refused"), (307, "redirect-refused"),
                                (401, "access-refused"), (403, "access-refused")):

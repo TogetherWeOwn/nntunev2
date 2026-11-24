@@ -1,12 +1,16 @@
 use super::{
-    id, ReadbackFixture, BUCKET, CONFIGURATION, FINAL_VERSION, FLAC, SCOPE, SHARED_VERSION,
+    id, MemoryBody, ReadbackFixture, BUCKET, CONFIGURATION, FINAL_VERSION, FLAC, SCOPE,
+    SHARED_VERSION,
 };
 use nntune_ingest::{
+    admin_auto_publish::CommittedFlac,
+    admin_review::ObjectRef,
+    catalogue_publication::PublishedObject,
     digest_candidate_store::{
         stage_completed_candidate, CandidateIntent,
         InventoryAppendError::{Identity, MissingOrFenced},
     },
-    multipart::readback_inventory::ReadbackScope,
+    multipart::{readback_inventory::ReadbackScope, MultipartError},
 };
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
@@ -18,7 +22,7 @@ const WINNERS: &str = "SELECT object_id::text FROM public.storage_validated_dige
     WHERE environment_id = $1::text::uuid AND library_id = $2::text::uuid";
 
 async fn connect() -> Client {
-    const SCRATCH: &str = "postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci";
+    const SCRATCH: &str = "postgresql://postgres:ci-throwaway@localhost:5432/nntune_catalogue_ci";
     assert!(
         std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
             && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
@@ -33,6 +37,11 @@ async fn connect() -> Client {
         .unwrap();
     client
 }
+
+#[path = "auto_publish.rs"]
+mod auto_publish;
+#[path = "catalogue.rs"]
+mod catalogue;
 
 #[tokio::test]
 #[ignore = "requires a migrated disposable PostgreSQL database"]
@@ -273,4 +282,113 @@ async fn postgres_stages_completed_candidate_atomically() {
         &[&environment, &library, &digest, &(length as i64), &object, &generation, &root],
     ).await.unwrap().get(0);
     assert!(!admitted);
+    catalogue::exercise(&observer, &mut writer, &mut contender, &fixture, &intent).await;
+
+    // A padding block provides a second valid FLAC with a distinct digest.
+    let mut padded = FLAC[..42].to_vec();
+    padded[4] = 0;
+    padded.extend_from_slice(&[0x81, 0, 0, 1, 0]);
+    padded.extend_from_slice(&FLAC[42..]);
+    let identities = [0x70, 0x71, 0x72, 0x82, 0x83, 5].map(id);
+    let ids = identities.map(hex::encode);
+    let [root, _, _, object, generation, _] = &ids;
+    let map_id = id(0x84);
+    let map = hex::encode(map_id);
+    let key = format!("media/{object}/{generation}");
+    let page_key = format!("media-digests/{object}/{generation}/{map}/00000000");
+    assert!(matches!(
+        ReadbackFixture::complete(&padded, identities, map_id, &key, false),
+        Err(MultipartError::Checksum)
+    ));
+    let second = ReadbackFixture::in_scope(&padded, identities, map_id, &key);
+    let receipts = [second.sidecar_at(0, &page_key, FINAL_VERSION)];
+    let inventory = second.inventory(&receipts);
+    let corrupt = inventory
+        .verify_with_flac_seek(SCOPE, second.envelope(), async |_, pin| {
+            let mut response = second.response_with_keys(pin, &key, &page_key);
+            if pin.object_key == key {
+                response.response.body = MemoryBody(Some(&[]));
+            }
+            Ok(response)
+        })
+        .await;
+    assert!(corrupt.is_err());
+    assert!(observer
+        .query_opt(INVENTORY, &[&map])
+        .await
+        .unwrap()
+        .is_none());
+    let second_verified = inventory
+        .verify_with_flac_seek(SCOPE, second.envelope(), async |_, pin| {
+            Ok(second.response_with_keys(pin, &key, &page_key))
+        })
+        .await
+        .unwrap();
+    let second_intent = CandidateIntent {
+        identities: identities[1..].try_into().unwrap(),
+        plaintext_len: second.context.plaintext_len,
+        map_id,
+        header: second.context.header,
+        reservation_generation: 1,
+    };
+    let mut tx = writer.transaction().await.unwrap();
+    tx.batch_execute(include_str!("../fixtures/auto_publish_candidate.sql"))
+        .await
+        .unwrap();
+    let length = second_intent.plaintext_len;
+    let hashes = second
+        .origin
+        .candidate_page_hashes(
+            &second_intent.identities,
+            length,
+            &map_id,
+            &second_intent.header,
+        )
+        .unwrap();
+    let sealed = inventory.geometry().sealed_len() as i64;
+    tx.query_one(
+        "SELECT pg_temp.prepare_catalogue_candidate($1, $2, $3, $4, $5, $6, $7, $8)",
+        &[
+            &ids.as_slice(),
+            &map,
+            &(length as i64),
+            &sealed,
+            &second_intent.header.as_slice(),
+            &second.origin.plaintext_sha256().as_slice(),
+            &hashes[0].as_slice(),
+            &second.record.as_slice(),
+        ],
+    )
+    .await
+    .unwrap();
+    let staged = stage_completed_candidate(
+        &mut tx,
+        &second_intent,
+        SCOPE,
+        &second_verified,
+        RETAIN_UNTIL,
+    );
+    staged.await.unwrap();
+    tx.execute(
+        "INSERT INTO public.storage_s3_locator_intents VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, NULL)",
+        &[object, root, &BUCKET, &key, &SHARED_VERSION],
+    ).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let objects = [&fixture, &second].map(|file| ObjectRef {
+        media: file.media.metadata().clone(),
+        plaintext_sha256: *file.origin.plaintext_sha256(),
+    });
+    let both = [(&verified, &intent), (&second_verified, &second_intent)];
+    let committed = std::array::from_fn(|i| CommittedFlac {
+        verified: both[i].0,
+        receipt: PublishedObject {
+            intent: both[i].1,
+            locator: objects[i].media.locator(),
+            plaintext_sha256: &objects[i].plaintext_sha256,
+            root_version_id: identities[0],
+            page_versions: &[FINAL_VERSION],
+        },
+    });
+    auto_publish::exercise(&observer, &mut writer, &mut contender, &objects, committed).await;
 }
