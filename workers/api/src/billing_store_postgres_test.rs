@@ -21,7 +21,7 @@ const NOW: i64 = 1_786_032_000;
 
 async fn dispatch(user: &str, outcome: &ReconcileOutcome) -> Result<(), StoreError> {
     with_fixture_store(async |store| {
-        super::Store::store_paid_reconcile_outcome(store, user, outcome)
+        super::Store::store_paid_reconcile_outcome(store, user, outcome).await
     })
     .await
 }
