@@ -12,9 +12,6 @@ JOIN public.ingest_session_reservations u
   ON (u.multipart_object_id, u.completed_map_id, u.library_id) = (w.object_id, m.map_id, w.library_id)
 JOIN public.ingest_jobs j ON j.id = $6 AND j.user_id = u.principal_id
 LEFT JOIN public.invite_codes v ON v.id = $8 AND v.issued_by = u.principal_id
-JOIN public.catalogue_s3_sources s
-  ON s.track_id = $4::text::uuid AND s.source_job_id = j.id AND s.accepted_seq = j.accepted_seq
- AND s.object_id = w.object_id
 WHERE w.environment_id = $1::text::uuid AND w.library_id = $2::text::uuid AND w.object_id = $3::text::uuid
   AND u.id = $5::text::uuid AND u.principal_id = $7 AND u.terminal_reason = 'completed'
   AND u.idempotency_key = j.id AND n.owner_id IS NULL
@@ -28,9 +25,11 @@ WHERE w.environment_id = $1::text::uuid AND w.library_id = $2::text::uuid AND w.
       AND v.kind = 'admin' AND v.email LIKE '%@example.test' AND v.used
       AND greatest(w.retain_until, w.read_until, w.upload_until, w.delete_until) <= clock_timestamp()
       AND EXISTS (
-          SELECT FROM public.private_library_admissions a
-          WHERE (a.track_id, a.accepted_seq, a.object_id) = (s.track_id, s.accepted_seq, s.object_id)
+          SELECT FROM public.catalogue_s3_sources s
+          JOIN public.private_library_admissions a USING (track_id, accepted_seq, object_id)
+          WHERE s.track_id = $4::text::uuid AND s.source_job_id = j.id AND s.accepted_seq = j.accepted_seq
+            AND s.object_id = w.object_id
             AND a.invite_id = v.id AND a.recipient_id = v.redeemed_by
       )
   ))
-FOR UPDATE OF w, s
+FOR UPDATE OF w

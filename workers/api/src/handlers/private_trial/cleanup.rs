@@ -44,7 +44,7 @@ pub async fn cleanup(
     delete_and_confirm(pins.media.bucket(), pins.media.key(), media_version).await?;
     delete_and_confirm(pins.media.bucket(), &pins.page_key, &pins.page_version).await?;
     let tx = begin(db).await.map_err(|_| TrialError::Unconfirmed)?;
-    let removed = tx.execute_typed(
+    tx.execute_typed(
         "DELETE FROM public.catalogue_s3_sources s USING public.storage_validated_digest_winners w
          WHERE (s.track_id, s.object_id, s.source_job_id) = ($1::text::uuid, $2::text::uuid, $3)
          AND (w.object_id, w.environment_id, w.library_id) = (s.object_id, $4::text::uuid, $5::text::uuid)
@@ -53,7 +53,7 @@ pub async fn cleanup(
           (&uuid_text(fixture.environment), Type::TEXT), (&uuid_text(fixture.library), Type::TEXT)],
     ).await.map_err(|_| TrialError::Unconfirmed)?;
     tx.commit().await.map_err(|_| TrialError::Unconfirmed)?;
-    Ok(removed == 1)
+    Ok(true)
 }
 
 async fn retire(
@@ -110,6 +110,24 @@ async fn retire(
     let retired = row
         .try_get::<_, bool>("retired")
         .map_err(|_| TrialError::Unconfirmed)?;
+    if !retired
+        && tx
+            .query_typed_opt(
+                "SELECT 1 FROM public.catalogue_s3_sources
+         WHERE track_id = $1::text::uuid AND object_id = $2::text::uuid AND source_job_id = $3
+         FOR UPDATE",
+                &[
+                    (&fixture.track, Type::TEXT),
+                    (&obj, Type::TEXT),
+                    (&fixture.job, Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| TrialError::Unconfirmed)?
+            .is_none()
+    {
+        return Ok(None);
+    }
     // Take a fresh snapshot after the source lock. The admission writer can
     // finish while this cleanup waits for it, including at the cutoff.
     let no_other_links = tx.query_typed_one(
@@ -117,7 +135,7 @@ async fn retire(
              SELECT FROM public.catalogue_s3_sources s WHERE s.object_id = $2::text::uuid AND s.track_id <> $1::text::uuid
          ) AND NOT EXISTS (
              SELECT FROM public.private_library_admissions a
-             WHERE (a.track_id = $1::text::uuid OR a.object_id = $2::text::uuid)
+             WHERE ((NOT $4 AND a.track_id = $1::text::uuid) OR a.object_id = $2::text::uuid)
                AND ($4 OR (a.track_id, a.object_id, a.invite_id) <> ($1::text::uuid, $2::text::uuid, $3))
          )",
         &[(&fixture.track, Type::TEXT), (&obj, Type::TEXT), (&fixture.invite, Type::INT8), (&retired, Type::BOOL)],

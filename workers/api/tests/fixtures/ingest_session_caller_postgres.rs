@@ -322,7 +322,7 @@ async fn prove_attempt(
     };
     let sid = fresh_id().unwrap();
     let fingerprint = request.fingerprint().unwrap();
-    let idempotency_key = if fault.is_none() {
+    let idempotency_key = if publish_fixture {
         crate::handlers::tests::private_trial_fixture::JOB
     } else {
         "fixture-key"
@@ -903,8 +903,8 @@ async fn prove_attempt(
         .await,
         Err(UploadError::Refused)
     ));
-    if publish_fixture {
-        crate::handlers::tests::private_trial_fixture::verify_publication(
+    let track = if publish_fixture {
+        let track = crate::handlers::tests::private_trial_fixture::verify_publication(
             observer, writer, now, input, auth, prepared, &committed, reload,
         )
         .await;
@@ -912,7 +912,10 @@ async fn prove_attempt(
             observer, authority, input, auth,
         )
         .await;
-    }
+        Some(track)
+    } else {
+        None
+    };
     observer
         .execute(
             "UPDATE public.native_rest_credentials SET revoked_at = $2 WHERE id = $1",
@@ -924,7 +927,11 @@ async fn prove_attempt(
         read(writer, auth, prepared, reload).await,
         Err(UploadError::Refused)
     ));
-    if publish_fixture {
+    if let Some(track) = track {
+        crate::handlers::tests::private_trial_fixture::verify_cleanup(
+            observer, prepared, &track, now,
+        )
+        .await;
         return;
     }
     // Restore the disposable credential for the independent reuse cases.

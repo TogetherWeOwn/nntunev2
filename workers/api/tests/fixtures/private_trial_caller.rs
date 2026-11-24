@@ -226,7 +226,7 @@ pub(crate) async fn verify_publication(
         &str,
         &CompletionScope<'_>,
     ) -> Result<Option<CurrentAuthorization>, StoreError>,
-) {
+) -> String {
     private_trial::sealed_fixture::verify_sealed_fixture(input);
     observer.batch_execute(concat!(
         include_str!("storage_s3_locator_schema.sql"),
@@ -370,6 +370,15 @@ pub(crate) async fn verify_publication(
         })
         .await
     };
+    let set_job = async |job: &str| {
+        observer.execute(
+            "UPDATE public.ingest_session_reservations SET idempotency_key = $1 WHERE id = $2::text::uuid",
+            &[&job, &prepared.scope.session],
+        ).await.unwrap()
+    };
+    assert_eq!(set_job("other-trial-job").await, 1);
+    assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
+    assert_eq!(set_job(JOB).await, 1);
     observer.batch_execute(
         "CREATE FUNCTION public.fixture_refuse_trial_admission() RETURNS trigger LANGUAGE plpgsql
          AS $$ BEGIN RETURN NULL; END $$;
@@ -444,12 +453,11 @@ pub(crate) async fn verify_publication(
     assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
     assert_eq!(handle(&ctx, &library).await.status, 403);
 
-    verify_cleanup(observer, &mut publication, prepared, track, now).await;
+    track.to_owned()
 }
 
-async fn verify_cleanup(
+pub(crate) async fn verify_cleanup(
     observer: &Client,
-    publication: &mut Client,
     prepared: PreparedUpload<'_>,
     track: &str,
     now: u64,
@@ -458,6 +466,8 @@ async fn verify_cleanup(
         cleanup::{cleanup, Fixture},
         TrialError,
     };
+    let mut publication = connection().await;
+    let publication = &mut publication;
     let scope = prepared.scope;
     let object = prepared.intent.identities[2];
     let object_id = uuid_text(object);
@@ -526,6 +536,25 @@ async fn verify_cleanup(
             .unwrap(),
         1
     );
+    observer
+        .batch_execute(
+        "INSERT INTO public.invite_codes (id, code_hash, used, created_at, expires_at, issued_by)
+         SELECT 932, 'auxiliary-trial-invite', true, created_at, expires_at, issued_by
+         FROM public.invite_codes WHERE id = 931;
+         INSERT INTO public.private_library_admissions
+         SELECT 932, recipient_id, track_id, accepted_seq, object_id
+         FROM public.private_library_admissions WHERE invite_id = 931;",
+        )
+        .await
+        .unwrap();
+    assert!(!cleanup(publication, &fixture, unexpected).await.unwrap());
+    assert_eq!(
+        observer
+            .execute("DELETE FROM public.invite_codes WHERE id = 932", &[])
+            .await
+            .unwrap(),
+        1
+    );
 
     let reference_count = async || {
         observer.query_one(
@@ -562,6 +591,16 @@ async fn verify_cleanup(
         .execute("DELETE FROM public.invite_codes WHERE id = 931", &[])
         .await
         .unwrap();
+    assert_eq!(
+        observer
+            .execute(
+                "DELETE FROM public.catalogue_s3_sources WHERE track_id = $1::text::uuid",
+                &[&track],
+            )
+            .await
+            .unwrap(),
+        1
+    );
     assert!(cleanup(
         publication,
         &fixture,
@@ -590,5 +629,4 @@ async fn verify_cleanup(
          FROM public.storage_validated_digest_winners w WHERE w.object_id = $1::text::uuid",
         &[&object_id],
     ).await.unwrap().get::<_, bool>(0));
-    assert!(!cleanup(publication, &fixture, unexpected).await.unwrap());
 }
