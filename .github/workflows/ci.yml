@@ -1026,7 +1026,11 @@ jobs:
           printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
           maintenance=postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci
           createdb --maintenance-db="$maintenance" --template=template0 nntune_billing_native
-          trap 'dropdb --maintenance-db="$maintenance" nntune_billing_native' EXIT
+          cleanup_billing_fixture() {
+            dropdb --maintenance-db="$maintenance" nntune_billing_native
+            psql "$maintenance" -X -v ON_ERROR_STOP=1 -c 'DROP ROLE IF EXISTS billing_native_caller_fixture'
+          }
+          trap cleanup_billing_fixture EXIT
           log="$RUNNER_TEMP/native-billing-reconciliation.log"
           cargo test "${test_args[@]}" -- --exact --ignored | tee "$log"
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
