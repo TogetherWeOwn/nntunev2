@@ -1,8 +1,35 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { registerHooks } = require('node:module');
 const { test } = require('node:test');
-const { cleanup_dispatch_test: enqueue } = require(process.env.INGEST_CLEANUP_WASM_JS);
+
+// The linked Worker imports sockets, but this fixture must never connect.
+const socketsStub = 'test:cloudflare:sockets';
+const hooks = registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === 'cloudflare:sockets') {
+      return { url: socketsStub, format: 'commonjs', shortCircuit: true };
+    }
+    return nextResolve(specifier, context);
+  },
+  load(url, context, nextLoad) {
+    if (url === socketsStub) {
+      return {
+        format: 'commonjs',
+        source: 'exports.connect = () => { throw new Error("unexpected Worker socket connection"); };',
+        shortCircuit: true,
+      };
+    }
+    return nextLoad(url, context);
+  },
+});
+let enqueue;
+try {
+  ({ cleanup_dispatch_test: enqueue } = require(process.env.INGEST_CLEANUP_WASM_JS));
+} finally {
+  hooks.deregister();
+}
 
 const sessionId = '00000000-0000-0000-0000-000000000001';
 const claimId = '00000000-0000-0000-0000-000000000002';
