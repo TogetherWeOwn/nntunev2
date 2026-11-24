@@ -189,7 +189,7 @@ test('versioned digest pages require exact complete response framing', { timeout
   await closed;
 });
 
-test('Stream fetch serves a pinned encrypted seek and settles only written bytes', { timeout: 10_000 }, async (t) => {
+test('Stream fetch serves a pinned encrypted seek and settles only written bytes', { timeout: 20_000 }, async (t) => {
   const fixture = make_s3_fixture();
   const plaintext = Buffer.concat([Buffer.alloc(65_536, 'A'), Buffer.from('Z')]);
   const expires = Math.floor(Date.now() / 1000) + 90;
@@ -201,6 +201,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   const bearer = `${signed}.${mac(grantKey, signed).toString('base64url')}`;
   const original = JSON.parse(fixture.custody(bearer, expires));
   let snapshot = original;
+  let resolveFault;
   let leaseNo = 0;
   let revokeAt = Infinity;
   let host;
@@ -240,7 +241,17 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
       assert.equal(req.headers.get('authorization'),
         `PlaybackCustody ${mac(custodyKey, `${pathname}\n${bearer}`).toString('hex')}`);
       custody.push(pathname);
-      if (pathname.endsWith('/resolve')) return Response.json(snapshot);
+      if (pathname.endsWith('/resolve')) {
+        if (resolveFault === 'oversize') {
+          return new Response(JSON.stringify(snapshot) + ' '.repeat(2 * 1024 * 1024));
+        }
+        if (resolveFault === 'stall') {
+          return new Promise((_, reject) => {
+            req.signal.addEventListener('abort', () => reject(req.signal.reason), { once: true });
+          });
+        }
+        return Response.json(snapshot);
+      }
       return new Response(null, { status: ++leaseNo >= revokeAt ? 404 : 204 });
     }
   }
@@ -317,6 +328,8 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     { bearer_sha256: Array(32).fill(0) },
     { catalogue_reference: Array(16).fill(0) },
     { bucket: 'other-media' },
+    { media_version: 'version,duplicate' },
+    { page_versions: ['null'] },
     { envelope_record: original.envelope_record.map((x, i) => i === 229 ? x ^ 1 : x) },
   ]) {
     snapshot = { ...original, ...mismatch };
@@ -324,7 +337,10 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   }
   snapshot = original;
   assert.equal(await status({ PRIVATE_PLAYBACK_ROOT_KEY: '08'.repeat(32) }), 404);
+  assert.equal(await status({ PRIVATE_PLAYBACK_ROOT_VERSION: '00000000-0000-4000-8000-000000000008' }), 404);
   assert.equal(await status({ PRIVATE_PLAYBACK_S3_CONFIGURATION: '00000000-0000-4000-8000-000000000008' }), 404);
+  for (resolveFault of ['oversize', 'stall']) assert.equal(await status(), 404, resolveFault);
+  resolveFault = undefined;
   revokeAt = leaseNo + 1;
   assert.equal(await status(), 404);
   assert.equal(fetches.length, 2);
