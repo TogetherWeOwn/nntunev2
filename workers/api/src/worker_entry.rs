@@ -313,7 +313,8 @@ pub(crate) fn config_from_env(env: &Env) -> Option<Config> {
         }
     }
     let stripe_webhook = env_string(env, "STRIPE_WEBHOOK_SECRET");
-    let config = config.with_stripe(stripe_secret, stripe_webhook);
+    let mut config = config.with_stripe(stripe_secret, stripe_webhook);
+    config.paid_invite_billing = env_string(env, "PAID_INVITE_BILLING").as_deref() == Some("1");
     // Play-grant signing secret, shared with the stream Worker: raw
     // string bytes, never base64-decoded (see the helper). Absent (or
     // the minter's minimum length not met at issue time) fails the
@@ -1015,7 +1016,6 @@ impl DriverErrorCode for tokio_postgres::Error {
 
 impl PgStore {
     #[cfg(target_arch = "wasm32")]
-    #[allow(dead_code)] // Not called by release reconciliation until activation.
     async fn store_reconcile_owned(
         &self,
         user_id: String,
@@ -1082,10 +1082,9 @@ impl PgStore {
         .map_err(|_| failed())
     }
 
-    // Native acceptance injects connection acquisition only. This entry is not
-    // wired to Store; its client stays inside the budgeted operation.
+    // Native acceptance injects connection acquisition only. The client
+    // stays inside the budgeted operation.
     #[cfg(not(target_arch = "wasm32"))]
-    #[allow(dead_code)]
     async fn store_reconcile_owned(
         &self,
         user_id: String,
@@ -6215,6 +6214,20 @@ impl Store for PgStore {
         .await
     }
 
+    async fn store_paid_reconcile_outcome(
+        &self,
+        user_id: &str,
+        outcome: &crate::billing_reconcile::ReconcileOutcome,
+    ) -> Result<(), StoreError> {
+        self.store_reconcile_owned(
+            user_id.to_owned(),
+            outcome.clone(),
+            #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
+            crate::billing_transaction_sql::ReconcileProbe::None,
+        )
+        .await
+    }
+
     async fn open_checkout_operation(
         &self,
         user_id: &str,
@@ -7249,7 +7262,9 @@ impl WorkerStripeTransport {
         }
         let url = format!("{STRIPE_API_BASE}{}", req.path);
         let mut init = RequestInit::new();
-        init.with_method(method).with_headers(headers);
+        init.with_method(method)
+            .with_headers(headers)
+            .with_redirect(worker::RequestRedirect::Error);
         if req.method == "POST" {
             init.with_body(Some(req.body.clone().into()));
         }
@@ -7384,7 +7399,7 @@ impl crate::stripe::StripeTransport for WorkerStripeTransport {
             // `has_more` with `starting_after` until exhausted.
             let mut invoices = Vec::new();
             let mut cursor: Option<String> = req.starting_after.clone();
-            loop {
+            for _ in 0..10 {
                 let request = crate::stripe::list_invoices_request(
                     req.customer_id.as_deref(),
                     req.subscription_id.as_deref(),
@@ -7397,16 +7412,14 @@ impl crate::stripe::StripeTransport for WorkerStripeTransport {
                 let last = page.data.last().map(|invoice| invoice.id.clone());
                 invoices.extend(page.data);
                 if !page.has_more {
-                    break;
+                    return Ok(invoices);
                 }
-                // A `has_more` page with no cursor to continue from cannot
-                // advance: fail closed rather than loop on the same page.
-                cursor = last;
-                if cursor.is_none() {
+                if last.is_none() || last == cursor {
                     return Err(crate::stripe::StripeError::transport());
                 }
+                cursor = last;
             }
-            Ok(invoices)
+            Err(crate::stripe::StripeError::transport())
         })
     }
     fn cancel_subscription(

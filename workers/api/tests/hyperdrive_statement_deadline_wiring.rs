@@ -324,7 +324,9 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         if name == "store_reconcile_outcome" && pieces[index - 1].ends_with(prototype_gate) {
             continue;
         }
-        if matches!(name, "like_delete" | "taste_delete") {
+        if name == "store_paid_reconcile_outcome" {
+            assert!(function_body(piece, name).starts_with("{self.store_reconcile_owned("));
+        } else if matches!(name, "like_delete" | "taste_delete") {
             let love_only = name == "like_delete";
             let body = function_body(piece, name);
             assert_eq!(

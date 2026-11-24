@@ -295,7 +295,6 @@ fn qualify_line(
 }
 
 /// Fold a reconciliation snapshot without borrowing state from another subscription.
-#[allow(dead_code)] // The release caller stays on the legacy fold until activation.
 pub(crate) fn reconcile_exact_target(
     requested_id: &str,
     mut local: ReconcileInput,
