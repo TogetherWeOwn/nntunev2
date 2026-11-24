@@ -28,6 +28,11 @@ POLICY = "ci/staging-admission-policy.json"
 CONTRACT = "ci/product-journey-contract.json"
 WORKFLOW = ".github/workflows/deploy.yml"
 JOURNEY = "post-deploy-e2e / full journey (signup → library → meter → limits)"
+PRIVATE = "private-music"
+PRIVATE_JOURNEY = "post-deploy private music journey"
+PRIVATE_CRITERIA = frozenset({"upload-to-library", "play", "seek", "queue", "anonymous-refused",
+                              "unlisted-refused", "revoked-or-expired-refused", "video-off"})
+IDENTITY_PHASES = ("build-identity", "build-identity-final")
 RECORD = "Record candidate admission receipt"
 UPLOAD = "Upload candidate admission receipt"
 # Bind conservative dependency roots, not a hand-picked set of test helpers.
@@ -45,6 +50,7 @@ TRUSTED_FILES = (
 )
 SHA = re.compile(r"[0-9a-f]{40}")
 HASH = re.compile(r"[0-9a-f]{64}")
+UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 LABEL = re.compile(r"[A-Za-z0-9_.:/@ -]{1,200}")
 MAX_JSON = 256 * 1024
 MAX_ARCHIVE = 512 * 1024
@@ -54,6 +60,7 @@ PENDING_RUN_STATES = ("queued", "in_progress", "waiting", "pending", "requested"
 TERMINAL_CONCLUSIONS = ("success", "failure", "cancelled", "skipped", "timed_out",
                         "action_required", "neutral", "stale", "startup_failure")
 DEPLOY_STEPS = {"staging-web": "Deploy to staging", "staging-api": "Deploy api to staging"}
+PRIVATE_DEPLOY_STEPS = {**DEPLOY_STEPS, "staging-stream": "Deploy stream to staging"}
 
 
 class Refused(Exception):
@@ -115,11 +122,12 @@ def approved_contract(policy, contract_bytes):
     contract = parse_json(contract_bytes)
     require(contract.get("schema") == 1 and contract.get("evaluator") == policy["evaluator"]
             and contract.get("spec_revision") == approval["spec_revision"], "contract policy mismatch")
+    require("journey" not in contract or contract["journey"] == PRIVATE, "unsupported contract journey")
     criteria = contract.get("criteria")
     require(isinstance(criteria, list) and 0 < len(criteria) <= 200, "empty or invalid applicability")
     seen = set()
     selectors = set()
-    applicable = 0
+    applicable = set()
     for criterion in criteria:
         key = criterion.get("id")
         require(isinstance(key, str) and LABEL.fullmatch(key) and key not in seen,
@@ -130,7 +138,7 @@ def approved_contract(policy, contract_bytes):
             require(isinstance(criterion.get("rationale"), str) and criterion["rationale"].strip(),
                     "exclusion lacks approved rationale")
             continue
-        applicable += 1
+        applicable.add(key)
         evidence = criterion.get("evidence")
         require(isinstance(evidence, list) and 0 < len(evidence) <= 100,
                 "applicable criterion has no executable evidence")
@@ -141,8 +149,30 @@ def approved_contract(policy, contract_bytes):
             selector = (item["classname"], item["name"])
             require(selector not in selectors, "ambiguous evidence mapping")
             selectors.add(selector)
-    require(applicable > 0, "no applicable product criteria")
+        if contract.get("journey") == PRIVATE and key in PRIVATE_CRITERIA:
+            require(any((e["classname"], e["name"]) == (PRIVATE, key) for e in evidence),
+                    "private criterion lacks its required case mapping")
+    require(applicable, "no applicable product criteria")
+    if contract.get("journey") == PRIVATE:
+        require(PRIVATE_CRITERIA <= applicable, "private release criteria missing or excluded")
     return contract
+
+
+def private_deployments(pins, sha, provenance=None):
+    """Validate fixed deployment pins and return the provider identity portion."""
+    require(isinstance(pins, dict) and pins.keys() == PRIVATE_DEPLOY_STEPS.keys(),
+            "missing or unexpected private deployment lane")
+    fields = {"worker", "build_sha", "version_id", "deployment_id"}
+    provenance = provenance or {}
+    for lane, pin in pins.items():
+        worker = f"nntune-{lane.removeprefix('staging-')}-staging"
+        require(isinstance(pin, dict) and pin.keys() == fields | provenance.keys()
+                and pin["worker"] == worker and pin["build_sha"] == sha
+                and all(isinstance(pin[key], str) and UUID.fullmatch(pin[key])
+                        for key in ("version_id", "deployment_id")), "invalid private deployment identity")
+        require(all(pin[key] == value for key, value in provenance.items()),
+                "private deployment run or attempt mismatch")
+    return {lane: {key: pin[key] for key in fields} for lane, pin in pins.items()}
 
 
 def junit_evidence(xml, contract):
@@ -156,26 +186,33 @@ def junit_evidence(xml, contract):
     require(0 < len(cases) <= 10000, "empty or oversized journey")
     rows = {}
     identities = {}
+    private = contract.get("journey") == PRIVATE
     for case in cases:
         selector = (case.get("classname"), case.get("name"))
         expected_failure = any(p.get("name") == "fail" for p in case.findall("properties/property"))
         failure = any(c.tag in ("failure", "error", "flakyFailure", "flakyError", "rerunFailure", "rerunError")
                       for c in case)
         outcome = "skipped" if case.find("skipped") is not None else (
-            "failed" if failure or expected_failure else "passed")
+            "failed" if failure or expected_failure or (private and case.get("retry") != "0") else "passed")
         rows.setdefault(selector, []).append(outcome)
         for prop in case.findall("properties/property"):
             if prop.get("name") == "candidate-identity":
                 require(outcome == "passed", "identity test did not pass")
                 value = parse_json(prop.get("value", "").encode())
                 phase = value.get("phase")
-                require(phase in ("build-identity", "build-identity-final") and phase not in identities,
+                require(phase in IDENTITY_PHASES and phase not in identities,
                         "missing or ambiguous live identities")
                 require(all(isinstance(value.get(k), str) and SHA.fullmatch(value[k])
                             for k in ("web", "api", "expected")), "malformed live identities")
                 timestamp(value.get("observed_at"))
                 identities[phase] = {k: value[k] for k in
                                      ("phase", "web", "api", "expected", "observed_at")}
+                if private:
+                    require(selector == (PRIVATE, phase), "unexpected private identity case")
+                    identities[phase]["deployments"] = private_deployments(value.get("deployments"), value["expected"])
+    if private:
+        require(all(rows.get((PRIVATE, phase)) == ["passed"] for phase in IDENTITY_PHASES),
+                "private identity cases did not pass exactly once")
     coverage = []
     for criterion in contract["criteria"]:
         if not criterion["applicable"]:
@@ -200,10 +237,15 @@ def validate_receipt(receipt, *, repo, sha, run_id, attempt, workflow_sha,
     require(receipt.get("contract_sha256") == digest(contract_bytes)
             and receipt.get("policy_sha256") == digest(json.dumps(policy, sort_keys=True).encode())
             and receipt.get("evaluator") == policy["evaluator"], "receipt approval/evaluator mismatch")
+    require(receipt.get("journey") == contract.get("journey"), "receipt journey mismatch")
     require(receipt.get("api") == {"job": "staging-api", "deployed": True,
                                   "outcome": "deployed", "source_sha": sha},
             "candidate API not actually deployed from the same source")
-    require(receipt.get("legacy_gate") == "success", "legacy journey gate did not pass")
+    private = contract.get("journey") == PRIVATE
+    if private:
+        pins = private_deployments(receipt.get("deployments"), sha, {"run_id": run_id, "run_attempt": attempt})
+    else:
+        require(receipt.get("legacy_gate") == "success", "legacy journey gate did not pass")
     expected = [{"id": c["id"], "outcome": "passed"} for c in contract["criteria"] if c["applicable"]]
     require(receipt.get("coverage") == expected, "applicable product evidence incomplete, skipped or failed")
     require(receipt.get("result") == "satisfied" and receipt.get("reasons") == [],
@@ -212,10 +254,12 @@ def validate_receipt(receipt, *, repo, sha, run_id, attempt, workflow_sha,
             "missing evidence content digest")
     identities = receipt.get("identities", {})
     times = []
-    for phase in ("build-identity", "build-identity-final"):
+    for phase in IDENTITY_PHASES:
         item = identities.get(phase, {})
         require(item.get("phase") == phase and item.get("web") == sha and item.get("api") == sha
                 and item.get("expected") == sha, "opening/closing live identities disagree")
+        if private:
+            require(item.get("deployments") == pins, "private journey observed different deployment identities")
         times.append(timestamp(item.get("observed_at")))
     require(times[0] < times[1] <= timestamp(receipt.get("recorded_at")), "incoherent evidence ordering")
     return receipt
@@ -250,7 +294,7 @@ def current_main(trusted):
     return tip
 
 
-def produce(env, xml, policy, contract_bytes, manifest_bytes):
+def produce(env, xml, policy, contract_bytes, manifest_bytes, *, private_pins=None):
     sha = env["GITHUB_SHA"]
     require(SHA.fullmatch(sha) and SHA.fullmatch(env["GITHUB_WORKFLOW_SHA"])
             and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", env["GITHUB_REPOSITORY"]),
@@ -277,6 +321,13 @@ def produce(env, xml, policy, contract_bytes, manifest_bytes):
     }
     try:
         contract = approved_contract(policy, contract_bytes)
+        private = private_pins is not None
+        require(private == (contract.get("journey") == PRIVATE), "producer journey mismatch")
+        if private:
+            receipt["journey"] = PRIVATE
+            provenance = {key: receipt[key] for key in ("run_id", "run_attempt")}
+            pins = private_deployments(private_pins, sha, provenance)
+            receipt["deployments"] = {lane: {**pin, **provenance} for lane, pin in pins.items()}
         receipt["coverage"], receipt["identities"] = junit_evidence(xml, contract)
         receipt["result"] = "satisfied"
         validate_receipt(receipt, repo=receipt["repository"], sha=sha, run_id=receipt["run_id"],
@@ -288,8 +339,9 @@ def produce(env, xml, policy, contract_bytes, manifest_bytes):
     return receipt
 
 
-def artifact_name(sha, run_id, attempt):
-    return f"staging-admission-{sha}-{run_id}-{attempt}"
+def artifact_name(sha, run_id, attempt, journey=None):
+    suffix = f"-{PRIVATE}" if journey == PRIVATE else ""
+    return f"staging-admission-{sha}-{run_id}-{attempt}{suffix}"
 
 
 def read_archive(archive):
@@ -446,7 +498,7 @@ class Actions:
         return list(found.values())
 
 
-def unchanged_by_job(job, opening, source, producer_source_ok):
+def unchanged_by_job(job, opening, source, producer_source_ok, deploy_step):
     reason = "known intervening staging deployment; fresh journey required"
     require(job.get("status") == "completed" and job.get("conclusion") in TERMINAL_CONCLUSIONS, reason)
     if job["conclusion"] == "skipped":
@@ -456,7 +508,7 @@ def unchanged_by_job(job, opening, source, producer_source_ok):
     # A failed install/build/schema prerequisite is not a mutation, but only
     # the reviewed producer plus an explicit skipped deploy step proves that.
     steps = job.get("steps", [])
-    deploy = [step for step in steps if step.get("name") == DEPLOY_STEPS[job["name"]]]
+    deploy = [step for step in steps if step.get("name") == deploy_step]
     require(job["conclusion"] == "failure" and len(deploy) == 1
             and deploy[0].get("status") == "completed" and deploy[0].get("conclusion") == "skipped"
             and type(deploy[0].get("number")) is int, reason)
@@ -466,10 +518,23 @@ def unchanged_by_job(job, opening, source, producer_source_ok):
     producer_source_ok(source)
 
 
+def require_steps(job, names, reason):
+    previous = 0
+    for name in names:
+        steps = [s for s in job.get("steps", []) if s.get("name") == name]
+        require(len(steps) == 1 and steps[0].get("status") == "completed"
+                and steps[0].get("conclusion") == "success" and type(steps[0].get("number")) is int
+                and steps[0]["number"] > previous, reason)
+        previous = steps[0]["number"]
+
+
 def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifest_hash,
            producer_source_ok):
     # Approval absence is a refusal even when every legacy job is green.
-    approved_contract(policy, contract_bytes)
+    contract_journey = approved_contract(policy, contract_bytes).get("journey")
+    private = contract_journey == PRIVATE
+    deploy_steps = PRIVATE_DEPLOY_STEPS if private else DEPLOY_STEPS
+    journey_job = PRIVATE_JOURNEY if private else JOURNEY
     workflow = actions.api("workflows/deploy.yml")
     require(workflow.get("path") == WORKFLOW and workflow.get("state") == "active",
             "wrong staging workflow")
@@ -495,7 +560,7 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     producer_source_ok(run["head_sha"])
     jobs = actions.listing(f"runs/{run_id}/attempts/{attempt}/jobs", "jobs")
     selected_jobs = {}
-    for name in ("staging-web", "staging-api", JOURNEY):
+    for name in (*deploy_steps, journey_job):
         matches = [j for j in jobs if j.get("name") == name]
         require(len(matches) == 1, "missing or ambiguous required staging job")
         job = matches[0]
@@ -503,16 +568,16 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
                 and job.get("head_sha") == sha and job.get("status") == "completed"
                 and job.get("conclusion") == "success", "required job did not pass in selected attempt")
         selected_jobs[name] = job
-    journey = selected_jobs[JOURNEY]
-    previous = 0
-    for name in ("Run full journey", "Enforce journey evidence gate (all-skipped must fail)", RECORD, UPLOAD):
-        steps = [s for s in journey.get("steps", []) if s.get("name") == name]
-        require(len(steps) == 1 and steps[0].get("status") == "completed"
-                and steps[0].get("conclusion") == "success" and type(steps[0].get("number")) is int
-                and steps[0]["number"] > previous, "journey, evaluator and receipt steps must succeed in order")
-        previous = steps[0]["number"]
+    journey = selected_jobs[journey_job]
+    if private:
+        for lane, step in deploy_steps.items():
+            require_steps(selected_jobs[lane], (step,), "required private deploy step did not pass")
+        journey_steps = ("Qualify private listening", RECORD, UPLOAD)
+    else:
+        journey_steps = ("Run full journey", "Enforce journey evidence gate (all-skipped must fail)", RECORD, UPLOAD)
+    require_steps(journey, journey_steps, "journey, evaluator and receipt steps must succeed in order")
     artifacts = actions.listing(f"runs/{run_id}/artifacts", "artifacts")
-    name = artifact_name(sha, run_id, attempt)
+    name = artifact_name(sha, run_id, attempt, contract_journey)
     matches = [a for a in artifacts if a.get("name") == name]
     require(len(matches) == 1, "missing or ambiguous attempt-bound receipt")
     artifact = matches[0]
@@ -536,13 +601,13 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     require(timestamp(journey.get("started_at")) <= opening < closing
             <= timestamp(receipt["recorded_at"]) <= timestamp(journey.get("completed_at")),
             "journey timing mismatch")
-    for name in ("staging-web", "staging-api"):
+    for name in deploy_steps:
         require(timestamp(selected_jobs[name].get("completed_at")) <= opening,
                 "journey preceded candidate deployment")
     # Per-lane locks are not a reservation. Discover recent/rerunnable runs
     # and every unresolved run, not the workflow's entire lifetime history.
     for other in actions.conflicts(workflow_id, opening):
-        if other.get("head_sha") == sha:
+        if (decimal(other.get("id")) == run_id if private else other.get("head_sha") == sha):
             continue
         require(other.get("status") in (*PENDING_RUN_STATES, "completed"),
                 "unclassified conflicting staging run")
@@ -557,16 +622,16 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
         # Include ALL attempts: a failed latest rerun must not hide a mutation
         # from an earlier attempt after the candidate journey started.
         other_jobs = actions.listing(f"runs/{other_id}/jobs?filter=all", "jobs")
-        require(all(any(job.get("name") == lane for job in other_jobs) for lane in DEPLOY_STEPS),
+        require(all(any(job.get("name") == lane for job in other_jobs) for lane in deploy_steps),
                 "missing conflicting staging jobs; fresh journey required")
         if other["status"] != "completed":
             other_attempt = int(decimal(other.get("run_attempt")))
             require(all(any(job.get("name") == lane and job.get("run_attempt") == other_attempt
-                            for job in other_jobs) for lane in DEPLOY_STEPS),
+                            for job in other_jobs) for lane in deploy_steps),
                     "missing current-attempt conflicting staging jobs; fresh journey required")
         for job in other_jobs:
-            if job.get("name") in DEPLOY_STEPS:
-                unchanged_by_job(job, opening, other.get("head_sha"), producer_source_ok)
+            if job.get("name") in deploy_steps:
+                unchanged_by_job(job, opening, other.get("head_sha"), producer_source_ok, deploy_steps[job["name"]])
     # Re-resolve after download and drift discovery: a rerun cannot mix attempts.
     run_identity(actions.api(f"runs/{run_id}"))
     return receipt
@@ -574,16 +639,20 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("produce", "verify"))
+    parser.add_argument("mode", choices=("produce", "produce-private", "verify"))
     args = parser.parse_args()
     env = os.environ
     policy = parse_json((ROOT / POLICY).read_bytes())
     contract_bytes = (ROOT / CONTRACT).read_bytes() if (ROOT / CONTRACT).is_file() else b""
-    if args.mode == "produce":
-        xml_path = ROOT / "e2e/test-results/junit.xml"
-        xml = xml_path.read_bytes() if xml_path.is_file() else b""
+    if args.mode != "verify":
+        private = args.mode == "produce-private"
+        xml_path = ROOT / ("e2e/private-staging-results/admission.xml" if private else "e2e/test-results/junit.xml")
+        with xml_path.open("rb") if xml_path.is_file() else io.BytesIO() as report:
+            xml = report.read(MAX_XML + 1)
         require(len(xml) <= MAX_XML, "oversized JUnit")
-        receipt = produce(env, xml, policy, contract_bytes, (ROOT / "migrations/manifest.toml").read_bytes())
+        pins = parse_json(env.get("PRIVATE_STAGING_DEPLOYMENTS", "").encode()) if private else None
+        receipt = produce(env, xml, policy, contract_bytes, (ROOT / "migrations/manifest.toml").read_bytes(),
+                          private_pins=pins)
         (ROOT / "staging-admission.json").write_text(json.dumps(receipt, indent=2) + "\n")
         print("candidate admission receipt: " + receipt["result"])
         return
@@ -596,11 +665,13 @@ def main():
             "verifier checkout is not workflow source")
     main_tip = current_main(trusted)
     git("merge-base", "--is-ancestor", sha, main_tip)
+    contract = approved_contract(policy, contract_bytes)
+    trees = TRUSTED_TREES + (("fixtures/synthetic-flac/private-staging",) if contract.get("journey") == PRIVATE else ())
     def source_binding(source):
-        records = git("ls-tree", "-z", source, "--", *TRUSTED_TREES, *TRUSTED_FILES)
+        records = git("ls-tree", "-z", source, "--", *trees, *TRUSTED_FILES)
         entries = dict(row.split(b"\t", 1)[::-1] for row in records.split(b"\0") if row)
-        require(set(entries) == {path.encode() for path in (*TRUSTED_TREES, *TRUSTED_FILES)}
-                and all(entries[path.encode()].startswith(b"040000 tree ") for path in TRUSTED_TREES)
+        require(set(entries) == {path.encode() for path in (*trees, *TRUSTED_FILES)}
+                and all(entries[path.encode()].startswith(b"040000 tree ") for path in trees)
                 and all(entries[path.encode()].startswith(b"100644 blob ")
                         or entries[path.encode()].startswith(b"100755 blob ") for path in TRUSTED_FILES),
                 "missing or unsupported producer dependency source")
