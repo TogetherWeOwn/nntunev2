@@ -19,6 +19,9 @@ jobs:
     environment:
       name: staging
       deployment: false
+    concurrency:
+      group: production-db-bootstrap-preflight
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
