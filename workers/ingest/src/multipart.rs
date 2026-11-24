@@ -17,6 +17,7 @@ pub mod sidecar;
 
 pub const PART_BYTES: usize = 5_244_160;
 pub const MAX_COMPLETION_BODY: usize = 16 * 1024;
+const S3_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MultipartError {
@@ -285,7 +286,6 @@ impl<'a> Completion<'a> {
         use quick_xml::name::PrefixDeclaration::{Default, Named};
         use MultipartError::{Checksum, CompletionBody, EmbeddedError};
         const SUCCESS: &str = "CompleteMultipartUploadResult";
-        const S3_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
         const SHA256: &str = "ChecksumSHA256";
         if body.len() > MAX_COMPLETION_BODY || std::str::from_utf8(body).is_err() {
             return Err(CompletionBody);
@@ -303,7 +303,9 @@ impl<'a> Completion<'a> {
             let binding = prefix.map_or(Default, |p| Named(p.into_inner()));
             if matches!(binding, Named("" | "xml" | "xmlns"))
                 || tag.attributes().any(|attr| match attr {
-                    Ok(a) => a.value != S3_NS || a.key.as_namespace_binding() != Some(binding),
+                    Ok(a) => {
+                        a.value != S3_XML_NAMESPACE || a.key.as_namespace_binding() != Some(binding)
+                    }
                     Err(_) => true,
                 })
             {
@@ -322,7 +324,7 @@ impl<'a> Completion<'a> {
                 StartElement { name, .. } => {
                     match (depth, name.local_name.as_str(), name.namespace.as_deref()) {
                         (_, "Error", _) => return Err(EmbeddedError),
-                        (0, SUCCESS, None | Some(S3_NS)) => root_ns = name.namespace,
+                        (0, SUCCESS, None | Some(S3_XML_NAMESPACE)) => root_ns = name.namespace,
                         (1, field @ (SHA256 | "ChecksumType" | "Bucket" | "Key"), n)
                             if n == root_ns.as_deref() =>
                         {
