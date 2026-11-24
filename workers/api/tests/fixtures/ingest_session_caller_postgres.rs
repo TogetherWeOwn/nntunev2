@@ -84,9 +84,30 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         &[],
     ).await.unwrap().get::<_, bool>(0));
 
+    for (index, fault) in [
+        None,
+        Some(Fault::Digest),
+        Some(Fault::Revoked),
+        Some(Fault::Retention),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        prove_attempt(&observer, &mut writer, index as u8 * 16, fault).await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Fault {
+    Digest,
+    Revoked,
+    Retention,
+}
+
+async fn prove_attempt(observer: &Client, mut writer: &mut Client, seed: u8, fault: Option<Fault>) {
     let [root_id, environment, library, object, seal, configuration, map] = [1, 2, 3, 4, 5, 6, 7]
         .map(|value| {
-            let mut id = [value; 16];
+            let mut id = [value + seed; 16];
             id[6] = 0x40;
             id[8] = 0x80;
             id
@@ -123,7 +144,7 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         .map(|hash| hash.as_slice())
         .collect::<Vec<_>>();
     observer.batch_execute(&format!(
-        "INSERT INTO public.users (id, email, created_at) VALUES ('{OWNER}', '{OWNER}@example.invalid', 1);
+        "INSERT INTO public.users (id, email, created_at) VALUES ('{OWNER}', '{OWNER}@example.invalid', 1) ON CONFLICT (id) DO NOTHING;
          INSERT INTO public.storage_environments VALUES ('{env}');
          INSERT INTO public.storage_library_namespaces VALUES ('{lib}', '{env}', '{OWNER}');
          INSERT INTO public.storage_object_intents VALUES ('{obj}', '{generation}', '{env}',
@@ -162,7 +183,10 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
     };
     let request = Request {
         file_bytes: length,
-        content_sha256: *origin.plaintext_sha256(),
+        content_sha256: match fault {
+            Some(Fault::Digest) => [0xaa; 32],
+            _ => *origin.plaintext_sha256(),
+        },
         title: "synthetic",
         artist: "fixture",
         album: None,
@@ -172,7 +196,7 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
     let reserve = include_str!("../../src/ingest_session_reserve.sql");
     writer
         .batch_execute(&format!(
-        "CREATE FUNCTION pg_temp.reserve(uuid, uuid, text, text, bytea, uuid) RETURNS SETOF uuid
+        "CREATE OR REPLACE FUNCTION pg_temp.reserve(uuid, uuid, text, text, bytea, uuid) RETURNS SETOF uuid
          LANGUAGE sql AS $sql${reserve}$sql$;"
     ))
         .await
@@ -448,6 +472,37 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         })
         .await
         .unwrap();
+    if let Some(fault) = fault {
+        let (auth, retain, expected) = match fault {
+            Fault::Digest => (auth, now as i64 + 600, UploadError::Refused),
+            Fault::Revoked => (
+                Authorization {
+                    record: &revoked,
+                    ..auth
+                },
+                now as i64 + 600,
+                UploadError::Refused,
+            ),
+            Fault::Retention => (auth, now as i64 - 1, UploadError::Unconfirmed),
+        };
+        assert!(
+            matches!(opened.commit(&mut writer, auth, &verified, retain).await,
+            Err(error) if error == expected)
+        );
+        let untouched: bool = observer.query_one(
+            "SELECT terminal_reason IS NULL AND completed_map_id IS NULL AND write_lease_id IS NOT NULL
+                AND checkpoint_revision = 0 AND checkpoint_offset = 0
+             FROM public.ingest_session_reservations WHERE id = $1::text::uuid",
+            &[&sid],
+        ).await.unwrap().get(0);
+        assert!(untouched);
+        assert!(!observer.query_one(
+            "SELECT EXISTS (SELECT FROM public.storage_digest_inventory_intents WHERE map_id = $1::text::uuid)
+                 OR EXISTS (SELECT FROM public.storage_validated_digest_winners WHERE object_id = $2::text::uuid)",
+            &[&map_text, &obj],
+        ).await.unwrap().get::<_, bool>(0));
+        return;
+    }
     let retain = now as i64 + 600;
     let committed = opened
         .commit(&mut writer, auth, &verified, retain)

@@ -79,7 +79,7 @@ fn consumer_preserves_a_valid_inbound_trace_and_mints_otherwise() {
         .split_once("async fn process_raw_message")
         .expect("process_raw_message must exist")
         .1
-        .split_once("#[worker::event(queue)]")
+        .split_once("\npub async fn ingest_queue(")
         .expect("queue entrypoint must bound process_raw_message")
         .0;
     assert!(

@@ -104,7 +104,6 @@ pub struct OpenedUpload<'a> {
 }
 
 impl<'a> OpenedUpload<'a> {
-    /// Only available after confirmed commit of the exact provider upload ID.
     pub fn durable_target(&self) -> &DurableUpload<'a> {
         &self.target
     }
@@ -171,7 +170,8 @@ impl<'a> OpenedUpload<'a> {
         .map_err(|_| Unconfirmed)?
         .ok_or(Refused)?;
         tx.commit().await.map_err(|_| Unconfirmed)?;
-        read(writer, auth, self.prepared).await?.ok_or(Unconfirmed)
+        let outcome = read(writer, auth, self.prepared).await.unwrap_or_default();
+        outcome.ok_or(Unconfirmed)
     }
 }
 
