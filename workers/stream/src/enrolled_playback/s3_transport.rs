@@ -3,6 +3,7 @@
 use std::{
     fmt::Write as _,
     io,
+    rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +15,7 @@ use nntune_core::{
 };
 use url::Url;
 use worker::{
-    js_sys::{self, Reflect, Uint8Array},
+    js_sys::{self, Promise, Reflect, Uint8Array},
     wasm_bindgen::{closure::Closure, JsCast, JsValue},
     wasm_bindgen_futures::JsFuture,
     web_sys::{
@@ -25,7 +26,7 @@ use worker::{
 };
 use zeroize::Zeroizing;
 
-use super::{S3Get, S3GetReply};
+use super::{read_observation::ReadObservation, S3Get, S3GetReply};
 use crate::{
     grant::{hmac_sha256, sha256},
     s3_range_response::{read_exact, require_eof, validate_s3_range_metadata, S3RangeResponse},
@@ -42,6 +43,7 @@ pub struct S3Reader {
     region: String,
     access_key: String,
     secret_key: Zeroizing<String>,
+    pub(super) observation: Option<Rc<ReadObservation>>,
 }
 
 impl S3Reader {
@@ -76,6 +78,7 @@ impl S3Reader {
             region,
             access_key,
             secret_key,
+            observation: None,
         })
     }
 
@@ -127,7 +130,7 @@ impl S3Reader {
             content_range,
             content_length,
             has_content_encoding: false,
-            body: body(response, abort, remaining)?,
+            body: body(response, abort, remaining, self.observation.clone())?,
         })
     }
 
@@ -169,7 +172,7 @@ impl S3Reader {
         {
             return Err(refused());
         }
-        let mut body = body(response, abort, u64::from(size))?;
+        let mut body = body(response, abort, u64::from(size), None)?;
         let mut live = || now() < until;
         let bytes = read_exact(&mut body, size as usize, &mut live)
             .await
@@ -312,7 +315,12 @@ fn length(headers: &Headers) -> io::Result<Option<u64>> {
         .and_then(|value| value.parse().ok()))
 }
 
-fn body(response: Response, abort: Deadline, remaining: u64) -> io::Result<S3Body> {
+fn body(
+    response: Response,
+    abort: Deadline,
+    remaining: u64,
+    observation: Option<Rc<ReadObservation>>,
+) -> io::Result<S3Body> {
     let stream = response.body().ok_or_else(refused)?;
     let reader = ReadableStreamDefaultReader::new(&stream).map_err(|_| refused())?;
     Ok(S3Body(Some(Body {
@@ -320,6 +328,9 @@ fn body(response: Response, abort: Deadline, remaining: u64) -> io::Result<S3Bod
         reader,
         chunk: None,
         remaining,
+        observation,
+        pending: None,
+        started: false,
     })))
 }
 
@@ -408,6 +419,9 @@ struct Body {
     reader: ReadableStreamDefaultReader,
     chunk: Option<Uint8Array>,
     remaining: u64,
+    observation: Option<Rc<ReadObservation>>,
+    pending: Option<Promise>,
+    started: bool,
 }
 
 impl ReadbackBody for S3Body {
@@ -427,14 +441,25 @@ impl Body {
             return Ok(0);
         }
         if self.chunk.is_none() {
-            let item = JsFuture::from(self.reader.read())
-                .await
-                .map_err(|_| refused())?;
+            let read = self.reader.read();
+            if let Some(observation) = &self.observation {
+                if !self.started {
+                    self.started = true;
+                    observation.started();
+                }
+                self.pending = Some(read.clone());
+            }
+            let item = JsFuture::from(read).await;
+            self.pending = None;
+            let item = item.map_err(|_| refused())?;
             self.abort.check()?;
             let field =
                 |name: &str| Reflect::get(&item, &JsValue::from_str(name)).map_err(|_| refused());
             if field("done")?.as_bool().ok_or_else(refused)? {
                 return if self.remaining == 0 {
+                    if let Some(observation) = &self.observation {
+                        observation.completed();
+                    }
                     Ok(0)
                 } else {
                     Err(refused())
@@ -454,6 +479,17 @@ impl Body {
             self.chunk = Some(chunk.subarray(count, chunk.length()));
         }
         Ok(count as usize)
+    }
+}
+
+impl Drop for Body {
+    fn drop(&mut self) {
+        if let (Some(read), Some(observation)) = (self.pending.take(), &self.observation) {
+            if self.abort.check().is_ok() {
+                observation.dropping_pending_read(read, self.abort.signal());
+            }
+        }
+        // Deadline drops next, aborting the original Fetch signal.
     }
 }
 

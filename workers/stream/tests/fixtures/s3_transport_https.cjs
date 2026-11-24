@@ -5,6 +5,7 @@ const { once } = require('node:events');
 const { readFileSync } = require('node:fs');
 const { createServer } = require('node:https');
 const { test } = require('node:test');
+const { setImmediate } = require('node:timers/promises');
 const { make_s3_fixture, fetch: streamFetch } = require('./s3_stream_wasm.cjs');
 
 const path = '/fixture-media/media/00000000000040008000000000000003/00000000000040008000000000000004';
@@ -15,14 +16,14 @@ const pageQuery = 'versionId=page%2B%2F%25%3F%3D%26';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const mac = (key, value) => createHmac('sha256', key).update(value).digest();
 
-function verifyGet(req, host, page = false) {
+function verifyGet(req, host, page = false, range = 'bytes=65600-65616') {
   const objectPath = page ? pagePath : path;
   const versionQuery = page ? pageQuery : query;
   assert.equal(req.method, 'GET');
   assert.equal(req.url, `${objectPath}?${versionQuery}`);
   assert.equal(req.headers.host, host);
   if (page) assert.equal(req.headers.range, undefined);
-  else assert.equal(req.headers.range, 'bytes=65600-65616');
+  else assert.equal(req.headers.range, range);
   // Undici also appends identity automatically for a ranged request.
   assert.match(req.headers['accept-encoding'], /^identity(?:, identity)?$/);
   assert.equal(req.headers['x-amz-content-sha256'], hash(''));
@@ -194,6 +195,8 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   let revokeAt = Infinity;
   let host;
   let observedPageVersion = 'page+/%?=&';
+  let fullRange = false;
+  let stallTail;
   const fetches = [];
   const reports = [];
   const server = createServer({
@@ -201,12 +204,18 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     cert: readFileSync(process.env.NODE_EXTRA_CA_CERTS),
   }, (req, res) => {
     const page = req.url.startsWith(pagePath);
-    verifyGet(req, host, page);
+    verifyGet(req, host, page, fullRange ? 'bytes=0-65616' : undefined);
     fetches.push(page ? 'page' : 'media');
-    const bytes = Buffer.from(page ? fixture.digest_page() : fixture.ciphertext());
+    const bytes = Buffer.from(page ? fixture.digest_page()
+      : fullRange ? fixture.full_ciphertext() : fixture.ciphertext());
     const headers = { 'content-length': bytes.length, 'x-amz-version-id': page ? observedPageVersion : 'version+/%?=&' };
-    if (!page) headers['content-range'] = span;
+    if (!page) headers['content-range'] = fullRange ? 'bytes 0-65616/65617' : span;
     res.writeHead(page ? 200 : 206, headers);
+    if (!page && stallTail) {
+      res.once('close', () => stallTail(res.writableFinished));
+      res.write(bytes.subarray(0, -17));
+      return;
+    }
     res.end(bytes);
   });
   t.after(() => {
@@ -283,14 +292,18 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
     PRIVATE_PLAYBACK_S3_ACCESS_KEY_ID: 'FixtureAccess',
     PRIVATE_PLAYBACK_S3_SECRET_ACCESS_KEY: 'fixture-reader-signing-material',
   };
-  async function request(overrides = {}, suffix = '/play/track', token = bearer) {
+  async function open(overrides, suffix, token, headers) {
     const pending = [];
     const req = new Request(`https://stream.test${suffix}`, {
-      headers: { authorization: `Bearer ${token}`, range: 'bytes=65536-65536' },
+      headers: { authorization: `Bearer ${token}`, ...headers },
     });
     const response = await streamFetch(req, { ...env, ...overrides }, { waitUntil: p => pending.push(p) });
+    return { req, response, settled: Promise.all(pending) };
+  }
+  async function request(overrides = {}, suffix = '/play/track', token = bearer, headers = { range: 'bytes=65536-65536' }) {
+    const { response, settled } = await open(overrides, suffix, token, headers);
     const bytes = Buffer.from(await response.arrayBuffer());
-    await Promise.all(pending);
+    await settled;
     return { response, bytes };
   }
 
@@ -340,4 +353,54 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   assert.equal(await status(), 502);
   assert.equal(fetches.length, 6);
   assert.equal(reports.length, 1);
+
+  await t.test('canceling a v4 response stops a pending read at the HTTPS origin', { timeout: 5_000 }, async (t) => {
+    const logs = t.mock.method(console, 'log', () => {});
+    const trace = '0123456789abcdef0123456789abcdef';
+    const setting = `${trace}:${hash('track')}`;
+    const stage = { ENVIRONMENT: 'staging', PRIVATE_PLAYBACK_READ_OBSERVATION: setting };
+    const headers = { range: 'bytes=0-65536', 'x-trace-id': trace };
+    observedPageVersion = 'page+/%?=&';
+    fullRange = true;
+    for (const [overrides, inbound] of [
+      [{ ENVIRONMENT: 'staging' }, headers],
+      [{ ...stage, ENVIRONMENT: 'production' }, headers],
+      [{ ...stage, PRIVATE_PLAYBACK_READ_OBSERVATION: `${trace}:${hash('other-track')}` }, headers],
+      [stage, { range: headers.range }],
+    ]) assert.deepEqual((await request(overrides, '/play/track', bearer, inbound)).bytes, plaintext);
+    assert.equal(logs.mock.callCount(), 0);
+
+    const events = () => logs.mock.calls.map(({ arguments: args }) => {
+      assert.equal(args.length, 1);
+      const { ts, event, ...fields } = JSON.parse(args[0]);
+      assert.ok(Number.isFinite(Date.parse(ts)));
+      assert.deepEqual(fields, { worker: 'stream', level: 'info', trace_id: trace, fields: {} });
+      return event;
+    });
+    const started = 'private_storage_read_started';
+    const completed = 'private_storage_read_completed';
+    const aborted = 'private_storage_read_aborted';
+    assert.deepEqual((await request(stage, '/play/track', bearer, headers)).bytes, plaintext);
+    assert.deepEqual(events(), [started, completed]);
+
+    const closed = new Promise(resolve => { stallTail = resolve; });
+    const { req, response, settled } = await open(stage, '/play/track', bearer, headers);
+    assert.equal(response.status, 206);
+    const client = response.body.getReader();
+    const first = await client.read();
+    assert.equal(first.done, false);
+    assert.deepEqual(Buffer.from(first.value), plaintext.subarray(0, 65_536));
+    await setImmediate();
+    assert.deepEqual(events(), [started, completed, started]);
+    await client.cancel();
+    // Reader cancellation leaves the inbound Request signal untouched. The
+    // origin must close before sending the final frame and before expiry.
+    assert.equal(req.signal.aborted, false);
+    assert.equal(await closed, false);
+    await settled;
+    assert.deepEqual(events(), [started, completed, started, aborted]);
+    assert.deepEqual(reports.at(-1), {
+      user_id: 'member', play_id: play, track_id: 'track', start: 0, end: 65_536, file_bytes: 65_537,
+    });
+  });
 });
