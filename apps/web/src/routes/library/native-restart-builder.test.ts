@@ -31,7 +31,10 @@ function restartFixture(tick: () => Promise<void> = () => Promise.resolve()) {
 	const lifecycle = parsed.statements.filter((node) => ts.isExpressionStatement(node) &&
 		ts.isCallExpression(node.expression) && (node.expression.expression.getText(parsed) === 'onMount' ||
 			node.expression.getText(parsed).startsWith('$effect.pre(() => () =>')));
-	const bindingsInRoute = new Set(['player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'queueShareOutcome', 'queueShare', 'disposeRoute']);
+	const bindingsInRoute = new Set([
+		'player', 'commitQueue', 'replaceQueue', 'queueController', 'media', 'queueShareOutcome', 'queueShare',
+		'disposeRoute', 'shareEntryUrl'
+	]);
 	const controllers = parsed.statements.filter((node) => ts.isVariableStatement(node) &&
 		node.declarationList.declarations.some((declaration) => bindingsInRoute.has(declaration.name.getText(parsed))));
 	if (lifecycle.length !== 2 || controllers.length !== bindingsInRoute.size) throw new Error('Missing route lifecycle or player authority');
