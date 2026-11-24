@@ -4,20 +4,24 @@ const assert = require('node:assert/strict');
 const { registerHooks } = require('node:module');
 const { test } = require('node:test');
 
-// The linked Worker imports sockets, but this fixture must never connect.
-const socketsStub = 'test:cloudflare:sockets';
+// The linked Worker imports runtime modules outside the queue adapter.
+const workerStubs = new Map([
+  ['cloudflare:sockets', 'export const connect = refuse;'],
+  ['cloudflare:workers', 'export const tracing = new Proxy({}, { get: refuse });'],
+]);
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (specifier === 'cloudflare:sockets') {
-      return { url: socketsStub, format: 'commonjs', shortCircuit: true };
+    if (workerStubs.has(specifier)) {
+      return { url: specifier, format: 'module', shortCircuit: true };
     }
     return nextResolve(specifier, context);
   },
   load(url, context, nextLoad) {
-    if (url === socketsStub) {
+    const stub = workerStubs.get(url);
+    if (stub !== undefined) {
       return {
-        format: 'commonjs',
-        source: 'exports.connect = () => { throw new Error("unexpected Worker socket connection"); };',
+        format: 'module',
+        source: `const refuse = () => { throw new Error('unexpected ${url} access'); };\n${stub}`,
         shortCircuit: true,
       };
     }
