@@ -10,9 +10,11 @@ CREATE TABLE public.ingest_session_reservations (
     idle_deadline TIMESTAMPTZ NOT NULL CHECK (idle_deadline <= absolute_deadline),
     -- A permanent fence: checkpoint and publication writers must lock this row
     -- and require a null terminal marker before advancing.
-    terminal_reason TEXT CHECK (terminal_reason IN ('aborted', 'expired')),
+    terminal_reason TEXT CHECK (terminal_reason IN ('aborted', 'expired', 'completed')),
     terminal_at TIMESTAMPTZ,
     CHECK ((terminal_reason IS NULL) = (terminal_at IS NULL)),
+    completed_map_id UUID REFERENCES public.storage_digest_inventory_intents (map_id),
+    CHECK ((terminal_reason IS NOT DISTINCT FROM 'completed') = (completed_map_id IS NOT NULL)),
     -- Only the checkpoint coordinates; no validator or sealer state lives here.
     checkpoint_generation UUID,
     checkpoint_revision BIGINT NOT NULL DEFAULT 0,
