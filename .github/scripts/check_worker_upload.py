@@ -307,6 +307,11 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
         good = run(args, cwd=tree, env=trial_env, label="private staging preflight")
         check(good.returncode == 0 and output.read_text() == "browser_playback=1\n",
               "complete settings did not arm the browser build")
+        output.write_text("")
+        off = run(args, cwd=tree, env={**trial_env, "PRIVATE_PLAYBACK_STAGING_ENABLED": "false",
+                                      "PRIVATE_MUSIC_STAGING_JOURNEY": "false"}, label="private staging preflight disarmed")
+        check(off.returncode == 0 and output.read_text() == "browser_playback=0\n",
+              "disarmed settings enabled the browser build")
         for key, value in (
             ("API_RP_ORIGIN_STAGING", ""),
             ("HYPERDRIVE_ID_STAGING", "invalid"),
