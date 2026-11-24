@@ -7,6 +7,8 @@ use serde::Serialize;
 use worker::{Env, MessageBuilder};
 
 mod postgres;
+#[cfg(target_arch = "wasm32")]
+pub use postgres::dispatch_multipart_scope;
 pub use postgres::{dispatch_scope, CleanupScope, DispatchError};
 
 const MAX_DELAY_SECONDS: u32 = 24 * 60 * 60;

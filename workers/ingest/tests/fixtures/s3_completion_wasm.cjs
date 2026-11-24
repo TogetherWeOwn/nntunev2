@@ -500,3 +500,101 @@ test('the single deadline covers body reads and aborts the fetch', async (t) => 
   assert.equal(fetch.mock.callCount(), 1);
   assert.equal(signal.aborted, true);
 });
+
+const listQuery = `max-uploads=2&prefix=${encodeURIComponent(mediaKey)}&uploads=`;
+const namespace = 'http://s3.amazonaws.com/doc/2006-03-01/';
+const listedUpload = (key, id) => `<Upload><Key>${key}</Key><UploadId>${id}</UploadId>`
+  + '<Initiator><ID>synthetic</ID></Initiator><Owner><ID>synthetic</ID></Owner>'
+  + '<StorageClass>STANDARD</StorageClass><Initiated>2026-11-24T00:00:00Z</Initiated></Upload>';
+const listing = (uploads, overrides = {}) => {
+  const { name = bucket, prefix = mediaKey, truncated = 'false', ns = namespace } = overrides;
+  return `<ListMultipartUploadsResult xmlns="${ns}"><Bucket>${name}</Bucket><Prefix>${prefix}</Prefix>`
+    + `<KeyMarker/><UploadIdMarker/><MaxUploads>2</MaxUploads><IsTruncated>${truncated}</IsTruncated>`
+    + `${uploads}</ListMultipartUploadsResult>`;
+};
+
+test('reconciles a sole exact upload and safely retries an interrupted abort', async (t) => {
+  const suffix = `${mediaKey}-other`;
+  const open = new Map([[mediaKey, initiatedId], [suffix, 'unrelated']]);
+  const versions = new Map([[mediaKey, version]]);
+  const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+    if (request.method === 'GET') {
+      assert.equal((await verifySignedRequest(request, 'GET', listQuery, {}, '')).length, 0);
+      const completePage = listing([...open].map(([key, id]) => listedUpload(key, id)).join(''))
+        .replace('<MaxUploads>', `<NextKeyMarker>${suffix}</NextKeyMarker>`
+          + '<NextUploadIdMarker>unrelated</NextUploadIdMarker><MaxUploads>');
+      return new Response(completePage);
+    }
+    assert.equal((await verifySignedRequest(request, 'DELETE', initiatedQuery, {})).length, 0);
+    if (open.delete(mediaKey)) {
+      throw new Error('synthetic loss of abort response');
+    }
+    return new Response('<Error><Code>NoSuchUpload</Code><Message>Already absent</Message></Error>',
+      { status: 404 });
+  });
+  await assert.rejects(complete('reconcile'), rejectedWith('unconfirmed abort'));
+  assert.equal(await complete('reconcile-replay'), initiatedId);
+  assert.equal(fetch.mock.callCount(), 3);
+  assert.deepEqual([...open], [[suffix, 'unrelated']]);
+  assert.equal(versions.get(mediaKey), version);
+});
+
+test('accepts the empty 204 response to an exact signed abort', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+    await verifySignedRequest(request, 'DELETE', initiatedQuery, {});
+    return new Response(null, { status: 204 });
+  });
+  assert.equal(await complete('reconcile-replay'), initiatedId);
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test('ambiguous or wrong-scope listings cannot reach abort', async (t) => {
+  const exact = listedUpload(mediaKey, initiatedId);
+  let reply;
+  const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+    await verifySignedRequest(request, 'GET', listQuery, {}, '');
+    return new Response(reply);
+  });
+  for (const body of [
+    listing(''),
+    listing(listedUpload(`${mediaKey}-other`, 'unrelated')),
+    listing(exact + exact),
+    listing(exact + listedUpload('media/other', 'unrelated')),
+    listing(exact, { truncated: 'true' }),
+    listing(exact, { name: 'other-bucket' }),
+    listing(exact, { prefix: 'media/other' }),
+    listing(exact, { ns: 'https://other.test/' }),
+    listing(exact + '<Error><Code>InternalError</Code></Error>'),
+    listing(exact.replace('</Upload>', '<Error><Code>InternalError</Code></Error></Upload>')),
+    listing(exact.replace('<UploadId>', '<UploadId>split</UploadId><UploadId>')),
+    listing(exact.replace('<UploadId>', '<UploadId><Nested/>')),
+    listing(exact.replace(initiatedId, 'x'.repeat(16 * 1024))),
+    listing(exact) + '<Error><Code>NoSuchUpload</Code></Error>',
+  ]) {
+    reply = body;
+    await assert.rejects(complete('reconcile'), rejectedWith('unconfirmed listing'));
+  }
+  assert.equal(fetch.mock.callCount(), 14);
+  await assert.rejects(complete('reconcile-expired'), rejectedWith('unconfirmed listing'));
+  assert.equal(fetch.mock.callCount(), 14);
+});
+
+test('an ambiguous or mismatched abort response stays unconfirmed', async (t) => {
+  let reply;
+  t.mock.method(globalThis, 'fetch', async (request) => {
+    await verifySignedRequest(request, 'DELETE', initiatedQuery, {});
+    return new Response(reply, { status: 404 });
+  });
+  for (const body of [
+    '',
+    '<Error><Code>NoSuchBucket</Code></Error>',
+    '<Error><Code>NoSuchUpload</Code><Key>media/other</Key></Error>',
+    '<Error><Code>NoSuchUpload</Code><UploadId>other</UploadId></Error>',
+    '<Error><Code>NoSuchUpload</Code><Resource>/other-bucket/other-key</Resource></Error>',
+    '<Error><Code>NoSuchUpload</Code><Code>NoSuchBucket</Code></Error>',
+    '<Error><Code>NoSuchUpload</Code><Error><Code>InternalError</Code></Error></Error>',
+  ]) {
+    reply = body;
+    await assert.rejects(complete('reconcile-replay'), rejectedWith('unconfirmed abort'));
+  }
+});

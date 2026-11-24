@@ -893,6 +893,11 @@ jobs:
           inventory="$(cargo test "${args[@]}" -- --exact --ignored --list)"
           printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
           cargo test "${args[@]}" -- --exact --ignored
+          test_name='cleanup_dispatch::postgres::reconcile_tests::postgres_reconciles_a_lost_initiation'
+          args=(--locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name")
+          inventory="$(cargo test "${args[@]}" -- --exact --ignored --list)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          cargo test "${args[@]}" -- --exact --ignored
       - name: Exercise listen history on disposable PostgreSQL
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci

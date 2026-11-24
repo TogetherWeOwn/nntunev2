@@ -13,7 +13,7 @@ use super::{
 
 const MAX_UPLOAD_ID_BYTES: usize = 4096;
 
-pub(super) fn valid_upload_id(upload_id: &str) -> bool {
+pub(crate) fn valid_upload_id(upload_id: &str) -> bool {
     (1..=MAX_UPLOAD_ID_BYTES).contains(&upload_id.len())
         && upload_id.bytes().all(|byte| byte.is_ascii_graphic())
 }

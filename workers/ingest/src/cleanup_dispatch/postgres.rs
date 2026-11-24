@@ -11,6 +11,13 @@ use crate::library::{with_db_deadline, LIBRARY_DB_DEADLINE_MS};
 const CLAIM: &str = include_str!("../../../api/src/ingest_session_claim_cleanup.sql");
 const ACK: &str = include_str!("../../../api/src/ingest_session_ack_cleanup_enqueue.sql");
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod reconcile;
+
+#[cfg(test)]
+#[path = "../../tests/fixtures/multipart_reconcile_postgres.rs"]
+mod reconcile_tests;
+
 /// Internal scope from an authorized session; UUIDs use the hyphenated form.
 #[derive(Clone, Copy)]
 pub struct CleanupScope<'a> {
@@ -23,6 +30,7 @@ pub struct CleanupScope<'a> {
 #[derive(Debug, Eq, PartialEq)]
 pub enum DispatchError {
     ClaimNotConfirmed,
+    MultipartNotConfirmed,
     Handoff(HandoffError),
 }
 
@@ -37,6 +45,33 @@ pub async fn dispatch_scope(
     dispatch_claims(
         &mut db,
         scope,
+        async |_, _| Ok(()),
+        |message, delay| send_cleanup_message(env, message, delay),
+        db_deadline,
+    )
+    .await
+}
+
+/// Dormant staging entry point. Bind the provider and environment from the
+/// isolated upload configuration. A failed reconciliation leaves the outbox
+/// claim retryable after expiry, with no queue acknowledgement.
+#[cfg(target_arch = "wasm32")]
+pub async fn dispatch_multipart_scope(
+    env: &Env,
+    mut db: Client,
+    scope: CleanupScope<'_>,
+    environment: [u8; 16],
+    provider: &crate::multipart::s3_completion::S3CompletionSender,
+) -> Result<(), DispatchError> {
+    reconcile::dispatch_multipart_claims(
+        &mut db,
+        scope,
+        environment,
+        provider.multipart_scope(),
+        (
+            async |key, until| provider.find_incomplete(key, until).await,
+            async |key, id, until| provider.abort_incomplete(key, id, until).await,
+        ),
         |message, delay| send_cleanup_message(env, message, delay),
         db_deadline,
     )
@@ -46,6 +81,7 @@ pub async fn dispatch_scope(
 async fn dispatch_claims<S, D>(
     db: &mut Client,
     scope: CleanupScope<'_>,
+    mut prepare: impl AsyncFnMut(&mut Client, &CleanupClaim) -> Result<(), ()>,
     mut send: impl FnMut(CleanupMessage, u32) -> S,
     deadline: impl Fn() -> D,
 ) -> Result<(), DispatchError>
@@ -53,10 +89,14 @@ where
     S: Future<Output = Result<(), ()>>,
     D: Future<Output = ()>,
 {
-    let claims = with_db_deadline(scope.claim(db), deadline(), || ())
+    let mut claims = with_db_deadline(scope.claim(db), deadline(), || ())
         .await
         .map_err(|()| DispatchError::ClaimNotConfirmed)?;
+    claims.sort_by_key(|claim| claim.kind == CleanupKind::TerminalReconcile);
     for claim in claims {
+        with_db_deadline(prepare(db, &claim), deadline(), || ())
+            .await
+            .map_err(|()| DispatchError::MultipartNotConfirmed)?;
         let db = &mut *db;
         let deadline = &deadline;
         handoff(claim, &mut send, |_, kind, id| async move {
@@ -186,6 +226,7 @@ mod tests {
         dispatch_claims(
             &mut db,
             outside,
+            async |_, _| Ok(()),
             |_, _| async { panic!("out-of-scope dispatch attempted a queue send") },
             deadline,
         )
@@ -198,6 +239,7 @@ mod tests {
         let dispatch = dispatch_claims(
             &mut db,
             scope,
+            async |_, _| Ok(()),
             move |message, delay| {
                 let (sent, accepted) = queue.take().expect("unexpected second queue send");
                 async move {
