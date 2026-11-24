@@ -7217,8 +7217,13 @@ impl Mailer for WebhookMailer {
 // the same generic 500 as any store outage, never to an entitlement
 // change. Secret material rides the `Authorization` header only; nothing
 // here logs header values or response bodies.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+type StripeTestReply = Box<dyn Fn(&crate::stripe::StripeRequest) -> serde_json::Value>;
+
 struct WorkerStripeTransport {
     secret_key: Option<String>,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    test_reply: Option<StripeTestReply>,
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
     webhook_script: Option<billing_webhook_ack_test::StripeScript>,
 }
@@ -7232,6 +7237,10 @@ impl WorkerStripeTransport {
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         if let Some(script) = &self.webhook_script {
             return script.send(req);
+        }
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        if let Some(reply) = &self.test_reply {
+            return serde_json::from_value(reply(req)).map_err(|_| StripeError::transport());
         }
         let key = self
             .secret_key
@@ -8264,6 +8273,8 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // same config before any Stripe call).
     let stripe = WorkerStripeTransport {
         secret_key: config.stripe_secret_key.clone(),
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        test_reply: None,
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         webhook_script: None,
     };
@@ -8404,6 +8415,47 @@ mod billing_store_postgres_test;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn stripe_invoice_list_rejects_nonadvancing_or_excess_pages() {
+        use crate::stripe::{ListInvoices, StripeTransport};
+        use std::{cell::Cell, rc::Rc};
+
+        for (repeat, expected_calls) in [(true, 2), (false, 10)] {
+            let calls = Rc::new(Cell::new(0_usize));
+            let seen = Rc::clone(&calls);
+            let stripe = WorkerStripeTransport {
+                secret_key: None,
+                test_reply: Some(Box::new(move |request| {
+                    let n = seen.get();
+                    let prior = if repeat { 0 } else { n.saturating_sub(1) };
+                    assert_eq!(
+                        request
+                            .path
+                            .contains(&format!("starting_after=in_fixture_{prior}")),
+                        n > 0
+                    );
+                    seen.set(n + 1);
+                    serde_json::json!({
+                        "has_more": n < 10,
+                        "data": [{"id": format!("in_fixture_{}", if repeat { 0 } else { n }), "status": "paid"}]
+                    })
+                })),
+            };
+            let result = stripe
+                .list_invoices(ListInvoices {
+                    customer_id: Some("cus_fixture".into()),
+                    subscription_id: Some("sub_fixture".into()),
+                    paid_only: true,
+                    limit: 100,
+                    starting_after: None,
+                })
+                .await;
+            assert!(result.is_err());
+            assert_eq!(calls.get(), expected_calls);
+        }
+    }
 
     #[test]
     fn over_cap_snapshot_page_fails_closed() {

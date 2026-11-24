@@ -8997,6 +8997,7 @@ mod tests {
         billing_rows: RefCell<HashMap<String, crate::billing_reconcile::ReconciledRow>>,
         remove_billing_row_after_read: std::cell::Cell<bool>,
         reconcile_outcome_attempts: std::cell::Cell<usize>,
+        paid_reconcile_attempts: std::cell::Cell<usize>,
         // Displaced rows are retained without changing the per-user projection.
         billing_shadow: RefCell<HashMap<(String, String), crate::billing_reconcile::ReconciledRow>>,
         billing_bindings: RefCell<Vec<crate::billing_reconcile::PriceBinding>>,
@@ -11496,6 +11497,8 @@ mod tests {
             user_id: &str,
             outcome: &crate::billing_reconcile::ReconcileOutcome,
         ) -> Result<(), StoreError> {
+            self.paid_reconcile_attempts
+                .set(self.paid_reconcile_attempts.get() + 1);
             self.store_reconcile_outcome(user_id, outcome).await
         }
 
@@ -12765,8 +12768,26 @@ mod tests {
     #[test]
     fn paid_invite_webhook_replays_only_the_verified_bound_target() {
         let mut h = stripe_harness();
+        let body = checkout_completed_body("evt_closed", "cs_test_1", false);
+        let closed_request = Request {
+            method: "POST".into(),
+            path: BILLING_WEBHOOK_PATH.into(),
+            cookie: None,
+            origin: None,
+            authorization: None,
+            stripe_signature: Some(sign(&body, BILLING_NOW)),
+            body,
+        };
+        assert_eq!(block_on(handle(&h.ctx(), &closed_request)).status, 404);
         h.config.invites_required = true;
         h.config.paid_invite_billing = true;
+        h.config.private_listening = crate::private_listening::PrivateListening::parse(
+            r#"{"owner_user_id":"u1","invite_ids":[1],"expires_at":1800000000}"#,
+        );
+        assert!(h.config.private_listening.is_some());
+        assert_eq!(block_on(handle(&h.ctx(), &closed_request)).status, 404);
+        assert!(h.store.webhook_events.borrow().is_empty());
+        h.config.private_listening = None;
         seed_billing_user(&h, "u1");
         let forged = checkout_completed_body("evt_forged", "cs_test_1", false);
         assert_eq!(h.call_webhook(&forged, None).status, 400);
@@ -12774,6 +12795,7 @@ mod tests {
         let body = deliver_first_period(&h, "evt_paid");
         webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
         assert_eq!(h.store.invoice_history.borrow().len(), 1);
+        assert_eq!(h.store.paid_reconcile_attempts.get(), 2);
         let paid = live_for(&h, "u1").unwrap();
         assert_eq!(paid.stripe_subscription_id, "sub_test_1");
         assert_eq!(paid.paid_through_unix, Some(BILLING_NOW + BILLING_PERIOD));
