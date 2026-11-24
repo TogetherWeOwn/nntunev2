@@ -27,6 +27,9 @@ use tokio_postgres::{types::Type, Client, Transaction};
 
 #[path = "replay.rs"]
 pub(super) mod replay;
+#[cfg(target_arch = "wasm32")]
+#[path = "worker.rs"]
+pub(crate) mod worker;
 
 const STAGING_ORIGIN: &str = "https://staging.nntune.com";
 // SHA-256 of the original CC0 tone-a.flac in the private staging manifest.

@@ -8550,12 +8550,23 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     // Per-route collection bound: the in-handler gate re-checks the
     // same bound as defense in depth, so the two cannot drift apart.
-    let collected = collect_body_with_cap(
-        declared_len,
-        source,
-        handlers::max_body_bytes(req.method().as_ref(), &req.path()),
-    )
-    .await;
+    let request_path = req.path();
+    let body_cap = handlers::max_body_bytes(req.method().as_ref(), &request_path);
+    #[cfg(target_arch = "wasm32")]
+    #[cfg(feature = "encrypted-upload-caller")]
+    let trial = if req.method() == Method::Post && request_path == handlers::private_trial::PATH {
+        handlers::private_trial::worker::selected(&env)
+    } else {
+        None
+    };
+    #[cfg(target_arch = "wasm32")]
+    #[cfg(feature = "encrypted-upload-caller")]
+    let body_cap = if trial.is_some() {
+        handlers::private_trial::FIXTURE_BYTES
+    } else {
+        body_cap
+    };
+    let collected = collect_body_with_cap(declared_len, source, body_cap).await;
     let headers_map: HashMap<String, String> = req
         .headers()
         .entries()
@@ -8687,8 +8698,18 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         );
         return Ok(response);
     }
-    let response = dispatch_collected(collected, request, |collected_request| {
-        handle_with_transport_headers(&ctx, collected_request, &headers_map)
+    let response = dispatch_collected(collected, request, async |collected_request| {
+        #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
+        if let Some(selection) = trial.as_ref() {
+            return handlers::private_trial::upload(
+                &ctx,
+                &collected_request,
+                Some(selection.target()),
+                async |permit, body| selection.run(&env, permit, body).await,
+            )
+            .await;
+        }
+        handle_with_transport_headers(&ctx, collected_request, &headers_map).await
     })
     .await;
     // One structured line per served request: route, status, latency, and

@@ -4,6 +4,8 @@ pub const PATH: &str = "/v1/admin/private-trial/upload";
 pub const FIXTURE_BYTES: usize = 177_175;
 
 mod caller;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use caller::worker;
 pub mod cleanup;
 #[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]
 pub mod registered;
