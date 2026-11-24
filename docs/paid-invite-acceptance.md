@@ -49,3 +49,45 @@ build. It rotates through up to 16 due targets. Keep test timing within one
 batch. Resolve ambiguous old payments before reusing their flight. Remove
 `PAID_INVITE_BILLING` to close paid dispatch.
 Check Worker error logs for unresolved scheduled targets.
+
+## Invoice history preflight
+
+Run the [read-only preflight](../.github/scripts/billing_history_preflight.py)
+from the exact candidate checkout inside an approved private runner that
+holds the prepared evidence and the staging observer credential. It runs
+only with `NNTUNE_INVOICE_PREFLIGHT=1`. Set `BILLING_PREFLIGHT_HOST` to the
+independently verified staging PostgreSQL origin on port 5432 and
+`BILLING_PREFLIGHT_ROLE` to its approved restricted login. Supply
+`BILLING_PREFLIGHT_PASSWORD` through the runner's secret environment.
+The client verifies TLS and checks the session's database and role before
+reading evidence. The observer needs global invoice-key visibility and
+reads limited to the required columns and prepared evidence.
+
+Pin the candidate, staging origin, schema, Stripe test account, scope and
+evidence cutoff. In the approved perimeter, prepare a fixed batch in
+`billing_preflight.scope` and `billing_preflight.projection`. Both use text
+`stripe_invoice_id` (unique globally), `user_id` and `stripe_subscription_id`.
+Scope is the independently inventoried union of relevant retained and currently
+eligible keys, including retained targets that can return to an advancing state.
+Set the boolean `retained` per scope key and pass the independent denominator
+as `BILLING_PREFLIGHT_SCOPE_COUNT` (1–10,000). Use stable relations for one
+batch and keep the scope and archive aligned to the same observation.
+
+Use the candidate's fold at the pinned time for each projection. Set the
+boolean `evidence_complete` only after checking exact ownership and provider
+bindings and exhausting both invoice and line pages. The projection carries
+text `plan_id` and `currency`, bigint `amount_cents`, `start_s`, `end_s`
+and `paid_s` (whole Unix seconds), and paired bigint arrays `starts` and
+`ends` for up to 1,000 half-open periods. Two empty arrays represent
+unknown exact coverage. A missing projection counts as incomplete.
+
+The command emits one JSON object of counts (`total`, `exact`,
+`eligible_hydration`, `fresh`, `collision`, `incomplete`) for an admitted
+comparison. Exit 0 requires a complete batch without collisions. Exit 1
+reports a collision, including when other items are incomplete. Exit 2
+reports incomplete evidence or the fixed diagnostic `scope_incomplete`
+when the inventory does not reconcile. Exit 3 gives a fixed `disabled` or
+`refused` diagnostic. Keep identities, projections, credentials and database
+diagnostics inside the approved perimeter. Recheck if scope, inputs or candidate
+drift. Effective writer privileges and any legacy provenance decision are
+separate activation prerequisites.
