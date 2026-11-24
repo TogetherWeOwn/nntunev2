@@ -591,7 +591,10 @@ pub async fn acquire_playback_lease_on(
 }
 
 /// Share the same exclusive account fence with privacy toggles and deletion.
-pub(crate) async fn lock_playback_account(db: &impl PgQuery, user: &str) -> Result<bool, StoreError> {
+pub(crate) async fn lock_playback_account(
+    db: &impl PgQuery,
+    user: &str,
+) -> Result<bool, StoreError> {
     db.query_typed_opt(
         crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
         &[(&user, Type::TEXT)],
