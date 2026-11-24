@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
 	import type { Snippet } from 'svelte';
-	import { afterNavigate, goto } from '$app/navigation';
+	import { afterNavigate, goto, snapshot } from '$app/navigation';
 	import { page } from '$app/state';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import favicon from '#lib/assets/favicon.svg';
@@ -33,13 +33,22 @@
 
 	let { children }: LayoutProps = $props();
 
-	// Keep the opaque claim on this history entry across reloads.
-	function claimShareEntry(libraryShareOwner: string, restoredQueue: boolean): boolean {
-		const previous = page.state.libraryShareOwner;
-		if (previous === libraryShareOwner) return false;
-		void goto(window.location.href, {
-			shallow: true, replace: true, persistState: true, state: { ...page.state, libraryShareOwner }
+	// SvelteKit captures this with the outgoing history entry, including on reload.
+	let shareEntryOwner: string | undefined;
+	if (typeof window !== 'undefined') {
+		snapshot({
+			id: 'library-share-owner',
+			capture: () => shareEntryOwner,
+			restore: (owner) => { shareEntryOwner = owner; },
+			reset: () => { shareEntryOwner = undefined; }
 		});
+	}
+
+	function claimShareEntry(libraryShareOwner: string, restoredQueue: boolean): boolean {
+		// Existing history entries may still carry the marker in page.state.
+		const previous = shareEntryOwner ?? page.state.libraryShareOwner;
+		if (previous === libraryShareOwner) return false;
+		shareEntryOwner = libraryShareOwner;
 		return !previous || !restoredQueue;
 	}
 

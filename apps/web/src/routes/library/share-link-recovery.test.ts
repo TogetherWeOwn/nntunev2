@@ -26,7 +26,9 @@ const ITEMS = [{ id: 'coral', title: 'Coral Night', streamUrl: '/test-audio/cora
  */
 function pageScript(search: string, tick = () => Promise.resolve()) {
 	vi.stubGlobal('navigator', {}); // Do not use Node's Web Locks with this partial window fixture.
-	vi.stubGlobal('window', { location: { search } });
+	const location = new URL(`/library${search}`, 'https://example.test');
+	vi.stubGlobal('window', { location });
+	let afterNavigation = () => {};
 	const source = sources['./+page.svelte'];
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const script = source.slice(start, source.indexOf('</script', start));
@@ -69,7 +71,8 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		invalidateLibraryCache: () => {},
 		onMount: () => {},
 		$effect: { pre: () => {} },
-		afterNavigate: () => {},
+		afterNavigate: (callback: typeof afterNavigation) => { afterNavigation = callback; },
+		finishNavigation: () => afterNavigation(),
 		shortTitle,
 		tick,
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
@@ -80,6 +83,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		function endSession() { player.purgeAtAuthBoundary(); handleLocalAuthTransition(); }
 		return {
 			refresh, applyShareLink, handleLocalAuthTransition: endSession, selectTrack,
+			finishNavigation,
 			requiresSignIn: () => refresher.state.requiresSignIn,
 			attachNativeAudio: media.attach, playQueuedTrack, subscribe: queueController.subscribe,
 			addDisplayed: () => { renderedItems = items; addDisplayedTracksToQueue(); },
@@ -97,6 +101,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 	`)(...Object.values(bindings)) as {
 		refresh: () => Promise<void>;
 		applyShareLink: () => void;
+		finishNavigation: () => void;
 		handleLocalAuthTransition: () => void;
 		requiresSignIn: () => boolean;
 		selectTrack: (id: string) => void;
@@ -175,6 +180,27 @@ test('a valid same-route navigation while the empty load is failed survives Retr
 	expect(queueFunctions.currentTrack(page.read().queue)?.id).toBe('coral');
 	expect(page.read().pendingShareSeek?.seconds).toBe(9);
 	expect(page.read().shareInvalid).toBe(false);
+});
+
+test('a pending Back traversal leaves the destination share unclaimed until commit', async () => {
+	const catalogue = Promise.withResolvers<Response>();
+	vi.stubGlobal('fetch', () => catalogue.promise);
+	const page = pageScript('?track=coral&t=90');
+	page.finishNavigation();
+
+	const refresh = page.refresh();
+	// Traversal changes the browser URL before the router commits the destination.
+	window.location.search = '?track=coral&t=9';
+	catalogue.resolve(Response.json(ITEMS));
+	await refresh;
+	expect(page.read().handledShareSearch).toBeNull();
+	expect(page.read().queue.tracks).toEqual([]);
+	expect(page.read().pendingShareSeek).toBeNull();
+
+	page.finishNavigation();
+	await Promise.resolve();
+	expect(queueFunctions.currentTrack(page.read().queue)?.id).toBe('coral');
+	expect(page.read().pendingShareSeek?.seconds).toBe(9);
 });
 
 for (const search of ['?track=missing&t=9', '?track=coral&t=bad']) {

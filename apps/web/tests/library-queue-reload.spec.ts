@@ -108,6 +108,53 @@ test('a consumed share link respects a restored selection and clear', async ({ p
 	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'first');
 });
 
+test('share verification preserves a pending route navigation and consumes the Library entry', async ({ page }) => {
+	await mockLibrary(page);
+	const verifying = deferred(), releaseVerification = deferred();
+	const loadingDestination = deferred(), releaseDestination = deferred();
+	await page.route('**/v1/me/likes/session', async (route) => {
+		verifying.resolve();
+		await releaseVerification.promise;
+		await route.fulfill({ json: { session_binding: sessionA } });
+	}, { times: 1 });
+	await page.route('**/v1/me/subscription', async (route) => {
+		loadingDestination.resolve();
+		await releaseDestination.promise;
+		await route.fulfill({ json: {} });
+	});
+
+	const link = '/library?track=first&t=0';
+	try {
+		await page.goto(link);
+		await verifying.promise;
+		await expect(queueRows(page)).toHaveCount(0);
+		await page.evaluate(() => {
+			const link = document.createElement('a');
+			link.href = '/account/security';
+			link.dataset.sveltekitPreloadData = 'false';
+			link.textContent = 'Open account security';
+			document.body.append(link);
+		});
+		await page.getByRole('link', { name: 'Open account security', exact: true }).click();
+		await loadingDestination.promise;
+		releaseVerification.resolve();
+		await expect(currentRow(page)).toHaveAttribute('data-track-id', 'first');
+		await expect(page).toHaveURL(link);
+		await libraryRow(page, 'third').click();
+		await page.getByRole('button', { name: 'Select Third Song', exact: true }).click();
+		await expect(currentRow(page)).toHaveAttribute('data-track-id', 'third');
+	} finally {
+		releaseVerification.resolve();
+		releaseDestination.resolve();
+	}
+	await expect(page).toHaveURL('/account/security');
+	await expect(page.getByRole('heading', { name: 'Account security' })).toBeVisible();
+	await page.goBack();
+	await expect(page).toHaveURL(link);
+	await page.reload();
+	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'third');
+});
+
 test('a failed catalogue load leaves the saved queue unread until Retry', async ({ page }) => {
 	await mockLibrary(page);
 	await addTracks(page);
