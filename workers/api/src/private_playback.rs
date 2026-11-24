@@ -86,7 +86,7 @@ async fn authorized(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn mint_grant(
+pub(crate) fn mint_grant(
     secret: &[u8],
     user: &str,
     track: &str,

@@ -157,6 +157,11 @@ fn browser_issue_selects_only_armed_verified_sessions_and_projects_five_fields()
     );
     assert_eq!(h.store.browser_playback_opens.get(), 0);
 
+    assert_eq!(
+        browser(json!({"track_id": "track", "session_id": "tab-1", "play_id": null})).status,
+        400
+    );
+    assert_eq!(h.store.browser_playback_opens.get(), 0);
     let response = browser(start.clone());
     assert_eq!(response.status, 200);
     assert_eq!(
@@ -194,4 +199,92 @@ fn browser_issue_selects_only_armed_verified_sessions_and_projects_five_fields()
     assert_eq!(native.status, 200);
     assert!(serde_json::from_str::<Value>(&native.body).unwrap()["grant"].is_string());
     assert_eq!(h.store.browser_playback_opens.get(), 3);
+}
+
+#[test]
+fn production_media_relay_and_legacy_routes_fence_the_browser_lease() {
+    use crate::worker_entry::{relay_media, CollectedBody};
+    use serde_json::json;
+
+    let (h, mut request, headers) = media_relay_fixture();
+    let play = format!(
+        "{}{}",
+        crate::private_playback::browser::PREFIX,
+        "A".repeat(22)
+    );
+    let mut receipt = h.store.browser_receipt.take().unwrap();
+    receipt.lease.play_id.clone_from(&play);
+    receipt.grant = crate::private_playback::mint_grant(
+        h.config.play_grant_secret.as_deref().unwrap(),
+        &receipt.user_id,
+        &receipt.lease.track_id,
+        &play,
+        receipt.lease.epoch,
+        receipt.grant.exp_unix,
+        &receipt.artifact_sha256,
+    )
+    .unwrap();
+    let lease = receipt.lease.clone();
+    h.store
+        .playback_leases
+        .borrow_mut()
+        .insert("member".into(), lease.clone());
+    h.store.meter_meta.borrow_mut().clear();
+    let expected = crate::play_grant::bearer(&receipt.grant.token);
+    h.store.browser_receipt.replace(Some(receipt));
+    request.path = format!("/v1/plays/media/track/tab-1/{play}");
+
+    let ctx = media_relay_context(&h);
+    let serve = |req: &Request| {
+        block_on(relay_media(
+            &ctx,
+            req,
+            &CollectedBody::Complete(Vec::new()),
+            &headers,
+            async |get| {
+                assert_eq!(get.path, "/play/track");
+                assert!(get
+                    .headers()
+                    .eq([("authorization", expected.as_str()), ("range", MEDIA_RANGE)]));
+                206
+            },
+        ))
+        .unwrap()
+        .unwrap_or_else(|response| response.status)
+    };
+    assert_eq!(serve(&request), 206);
+    request.path = format!("/v1/plays/media/track/other-tab/{play}");
+    assert_eq!(serve(&request), 404);
+    request.path = format!("/v1/plays/media/track/tab-1/{play}");
+    let signed_cookie = request.cookie.clone().unwrap();
+    request.cookie = block_on(ctx.start_session("member")).unwrap().set_cookie;
+    assert_eq!(serve(&request), 404);
+    request.cookie = Some(signed_cookie.clone());
+
+    let body = json!({"track_id": "track", "session_id": "tab-1", "play_id": play});
+    h.store
+        .catalogue_library
+        .borrow_mut()
+        .insert("member".into(), vec![unmatched_library_row("track")]);
+    for (path, body) in [
+        ("/v1/plays", body),
+        (
+            "/v1/plays/heartbeat",
+            json!({"session_id": "tab-1", "play_id": play, "lease_epoch": 42}),
+        ),
+    ] {
+        let req = Request {
+            method: "POST".into(),
+            path: path.into(),
+            cookie: Some(signed_cookie.clone()),
+            origin: Some(ORIGIN.into()),
+            authorization: None,
+            stripe_signature: None,
+            body: body.to_string().into_bytes(),
+        };
+        assert_eq!(block_on(handle(&ctx, &req)).status, 404);
+        assert_eq!(h.store.playback_leases.borrow()["member"], lease);
+    }
+    shorten_media_relay_lease(&h);
+    assert_eq!(serve(&request), 404);
 }

@@ -25,8 +25,13 @@ pub(crate) struct BrowserScope<'a> {
 pub struct BrowserStart {
     pub track_id: String,
     pub session_id: String,
+    #[serde(default, deserialize_with = "present_id")]
     pub play_id: Option<String>,
     pub request_id: Option<String>,
+}
+
+fn present_id<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(decoder).map(Some)
 }
 
 #[derive(Serialize, Deserialize)]
