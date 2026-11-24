@@ -92,6 +92,46 @@ pub(super) async fn receipt_retries(
     let retry = open(reader, claims, &input, scope).await.unwrap();
     assert_eq!(retry.relay().lease, original.lease);
     assert!(retry.relay().grant.token == original.grant.token);
+    let second_cookie =
+        crate::session::issue_session(&[91; 32], MEMBER, claims.created_at, 120).unwrap();
+    let second =
+        crate::session::verify_session(&[91; 32], &second_cookie, claims.created_at).unwrap();
+    writer.execute(
+        "INSERT INTO public.sessions (id, user_id, created_at, expires_at, rotation_counter, revoked) VALUES ($1, $2, $3, $4, 0, false)",
+        &[&second.session_id, &MEMBER, &(second.created_at as i64), &(second.expires_at as i64)],
+    ).await.unwrap();
+    let path = format!(
+        "{}/{}/{}",
+        input.track_id, input.session_id, original.lease.play_id
+    );
+    let loaded = service
+        .load_browser(reader, claims, &path, scope, SystemTime::now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.relay().lease, original.lease);
+    assert!(service
+        .load_browser(reader, &second, &path, scope, SystemTime::now)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(service
+        .load_browser(reader, claims, "mismatched-path", scope, SystemTime::now)
+        .await
+        .unwrap()
+        .is_none());
+    let expiry = UNIX_EPOCH + Duration::from_secs(original.lease.expires_at);
+    assert!(service
+        .load_browser(reader, claims, &path, scope, || expiry)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(service
+        .open_browser(reader, claims, &input, scope, || expiry)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(open(reader, &second, &input, scope).await.is_none());
     input.session_id = "different-tab".into();
     assert!(open(reader, claims, &input, scope).await.is_none());
     input.play_id = None;

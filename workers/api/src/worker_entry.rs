@@ -866,6 +866,9 @@ pub(crate) mod subsonic_pg_page;
 pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
 pub use subsonic_pg::load_staging_account;
 
+#[path = "private_browser_worker.rs"]
+mod private_browser_worker;
+
 struct PgStore {
     env: Option<Env>,
     trace_id: String,
@@ -4141,6 +4144,70 @@ impl Store for PgStore {
                     return Err(StoreError);
                 }
                 rows[0].try_get("target_id").map_err(|_| StoreError)
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn open_browser_playback(
+        &self,
+        claims: &crate::session::SessionClaims,
+        input: &crate::private_playback::browser::BrowserStart,
+        cfg: &Config,
+    ) -> Result<Option<handlers::browser_playback_relay::BrowserReceipt>, StoreError> {
+        use private_browser_worker::{service, Settings};
+        Self::bounded(
+            async {
+                let Some(settings) = self.env.as_ref().and_then(Settings::load) else {
+                    return Ok(None);
+                };
+                let Some(service) = service(cfg) else {
+                    return Ok(None);
+                };
+                let mut db = self.connect().await?;
+                Ok(service
+                    .open_browser(
+                        &mut db,
+                        claims,
+                        input,
+                        settings.scope(),
+                        private_browser_worker::now,
+                    )
+                    .await?
+                    .map(|receipt| receipt.relay().clone()))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
+    }
+
+    async fn browser_playback_receipt(
+        &self,
+        claims: &crate::session::SessionClaims,
+        path: &str,
+        cfg: &Config,
+    ) -> Result<Option<handlers::browser_playback_relay::BrowserReceipt>, StoreError> {
+        use private_browser_worker::{service, Settings};
+        Self::bounded(
+            async {
+                let Some(settings) = self.env.as_ref().and_then(Settings::load) else {
+                    return Ok(None);
+                };
+                let Some(service) = service(cfg) else {
+                    return Ok(None);
+                };
+                let db = self.connect().await?;
+                Ok(service
+                    .load_browser(
+                        &db,
+                        claims,
+                        path,
+                        settings.scope(),
+                        private_browser_worker::now,
+                    )
+                    .await?
+                    .map(|receipt| receipt.relay().clone()))
             },
             TOTAL_TIMEOUT_MS,
         )
@@ -7843,6 +7910,15 @@ where
     let expected_session_binding = headers
         .get(handlers::SESSION_BINDING_HEADER)
         .map(String::as_str);
+    if request.method == "POST" && request.path == "/v1/plays" {
+        if let Some(selector) = headers.get("x-nntune-browser-playback") {
+            return if selector == "1" {
+                handlers::browser_play_issue(ctx, &request, expected_session_binding).await
+            } else {
+                handlers::not_found()
+            };
+        }
+    }
     handlers::handle_with_session_binding(ctx, &request, expected_session_binding).await
 }
 

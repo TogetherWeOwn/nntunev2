@@ -86,7 +86,7 @@ async fn authorized(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn mint_grant(
+pub(crate) fn mint_grant(
     secret: &[u8],
     user: &str,
     track: &str,
@@ -106,9 +106,8 @@ fn mint_grant(
     })
 }
 
-#[allow(dead_code)] // Mounted by the browser playback adapter.
 #[path = "private_browser_receipt.rs"]
-pub(crate) mod browser;
+pub mod browser;
 
 impl PrivatePlayback<'_> {
     /// Start one new private play with a live signed cookie and current
