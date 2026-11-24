@@ -13139,7 +13139,7 @@ mod tests {
             400
         );
         assert_eq!(h.store.paid_reconcile_attempts.get(), before);
-        assert!(!live_for(&h, "u1").unwrap().cancel_at_period_end);
+        assert!(!h.store.billing_rows.borrow()["u1"].cancel_at_period_end);
         for _ in 0..2 {
             webhook_ok(&h.call_webhook(&body, Some(sign(&body, BILLING_NOW))));
         }
