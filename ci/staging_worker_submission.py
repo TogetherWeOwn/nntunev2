@@ -18,6 +18,7 @@ def require_reviewed_submission(
     workflow: str,
     job: str,
     approved_account: str,
+    approved_worker: str,
     approved_source_sha: str,
     approved_operation: str,
     approved_body_sha256: str,
@@ -40,7 +41,7 @@ def require_reviewed_submission(
     HTTP request semantics, provider state or rollback eligibility.
     """
     target = _TARGETS.get((workflow, job))
-    if target is None or worker != target:
+    if target is None or worker != target or worker != approved_worker:
         raise ValueError("unapproved staging Worker target")
     if not re.fullmatch(r"[0-9a-f]{32}", approved_account) or account != approved_account:
         raise ValueError("unapproved Cloudflare account")

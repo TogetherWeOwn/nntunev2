@@ -1295,13 +1295,23 @@ requires independent release approval. A push to `main` deploys to the
   creation, and no resize, split, role change, or credential rotation as part
   of promotion. Staging serves `nntunev2_staging` through its runtime roles;
   the prod binding stays reserved.
-- [ ] Rollback pointer recorded: for each affected staging Worker, retain the
-  last reviewed known-good version, source SHA, successful deployment run/attempt,
-  and effective binding inventory before promoting. Require an executed rollback
-  job and verify each affected Worker's restored version, serving SHA and health.
-  Follow the [deploy lock procedure](#staging-deploy-lock-cutover-and-rollback)
-  and the [Worker custody checks](#staging-worker-custody). Retain the UNDO blocks
-  and consolidation receipt for separate infrastructure rollback.
+- [ ] Rollback pointer recorded: record the last good staging SHA and its
+  successful push-triggered `deploy.yml` run, with `staging-web` conclusion
+  `success` (not `skipped`), before promoting. To accept rollback evidence,
+  also require the rollback rerun's `staging-web` job conclusion to be `success`
+  (not `skipped`); overall workflow success and staging health alone are
+  insufficient. Follow the [staging deploy lock cutover and rollback
+  procedure](#staging-deploy-lock-cutover-and-rollback) before re-running
+  any known-good push. To roll back `apps/web`, open that Actions run and
+  choose **Re-run all jobs**; do not use `workflow_dispatch` on the old SHA because
+  `staging-web` is push-only and will be skipped. Verify the rerun's
+  `staging-web` success and staging health. The rerun also redeploys the api,
+  mb and ingest Workers through `staging-api`, `staging-mb` and
+  `staging-ingest` when those lanes are configured; that is not verified
+  Worker rollback, and each Worker needs its own rollback evidence.
+  Staging rollback is
+  a redeploy, never a data restore; retain the UNDO blocks and consolidation
+  receipt for infrastructure-specific rollback.
 
 ### Staging deploy lock cutover and rollback
 
@@ -1317,71 +1327,39 @@ stay in the old `e2e-staging` group and cannot replace a pending run in
   the lock change and let its deploy and post-deploy E2E finish before
   resuming normal merges and reruns. Do not rerun a pre-lock deploy during
   cutover.
-- **Rollback:** Pause new `main` merges/pushes and staging deploy reruns.
-  Drain active and queued deploys through post-deploy E2E, including the
-  separate alerts lane when affected. Keep the pause through the reviewed
-  restore and its readback so a queued push cannot immediately overwrite it.
-  A historical rerun can redeploy multiple Workers and may bypass the lock.
-  Hold if the queue cannot be drained or the restore path is unverified.
+- **Rollback:** Pause new `main` merges/pushes and other staging deploy
+  reruns, and let all active and queued `main` deploy runs finish through
+  post-deploy E2E. Only then **Re-run all jobs** on the chosen push run.
+  Keep the pause in place through the rerun's deploy and post-deploy E2E
+  and verify that staging is serving the rollback SHA before resuming.
+  Draining first also keeps an already queued push from immediately
+  undoing the rollback. If the queue cannot be drained and kept clear, do
+  not start a pre-lock rerun.
 
-### Staging Worker custody
+### Offline staging Worker submission checks
 
-Custody and rollback require a separately verified activation. The current
-staging workflows have no protected operation to restore a named version.
-Keep custody cutover and staging promotion on hold until that operation and
-its readback are verified. The workflows have these fixed source targets.
+The [submission comparator](../ci/staging_worker_submission.py) runs only in
+CI with synthetic inputs. It checks the fixed web, API, MB and ingest jobs in
+[`deploy.yml`](../.github/workflows/deploy.yml) and the alerts job in
+[`deploy-alerts-staging.yml`](../.github/workflows/deploy-alerts-staging.yml).
+It compares the Worker, account, full source SHA, operation and final body
+digest with approval pins. Rollback also requires the approved version ID.
+The current staging writer is Wrangler. The web rollback procedure above
+redeploys a prior source revision and can also redeploy other configured
+Workers. The staging workflows have yet to implement a protected restore
+of a named Worker version.
 
-| Workflow | Job | Worker |
-| --- | --- | --- |
-| [`deploy.yml`](../.github/workflows/deploy.yml) | `staging-web` | `nntune-web-staging` |
-| `deploy.yml` | `staging-api` | `nntune-api-staging` |
-| `deploy.yml` | `staging-mb` | `nntune-mb-staging` |
-| `deploy.yml` | `staging-ingest` | `nntune-ingest-staging` |
-| [`deploy-alerts-staging.yml`](../.github/workflows/deploy-alerts-staging.yml) | `deploy` | `nntune-alerts-staging` |
-
-1. Use read-only provider inventory to confirm the account, Worker identity,
-   active deployment, and effective bindings of each deploy and rollback
-   target. Follow service bindings, Tail, queues, routes and other invocation
-   paths to their destinations. Resolve unexpected reach and verify isolation
-   from production writes. Preserve the documented shared MusicBrainz read
-   boundary and [MB/ingest activation holds](#operator-runbook-enabling-staging-mb--staging-ingest).
-   Cloudflare [Worker roles](https://developers.cloudflare.com/workers/authorization/workers/)
-   can limit Worker names while allowing bindings to same-account resources.
-2. Confirm a single authorized writer before applying anything. Inventory
-   deploy, observation and other credential consumers. Retire superseded write
-   access, including any repository-scoped deploy credential available outside
-   the authorized writer, and prove those paths are unusable. Refuse
-   alternate workflows and jobs, stale refs, reruns and off-CI writers. Keep
-   provider observation, staging Access, CI fixtures and production credentials
-   separate. The environment's branch rule restricts refs. Repository-scoped
-   credentials keep their repository scope.
-3. Independently approve the exact submission before the writer uses its
-   credential. Tie approval to the trusted workflow revision, protected main
-   ref, approved event, job, run/attempt, exact source SHA, account, Worker and
-   operation. The deploy lanes use the main push event. For rollback, the
-   source SHA identifies the version being restored. The workflow revision
-   identifies the code executing the restore.
-   Cover each outgoing provider mutation with its HTTP method, path, query,
-   request format and digest of the final body, including generated settings,
-   code, routes and triggers. The writer verifies provider-retained settings,
-   loads the independent approval itself, and checks the final request before
-   sending its bytes unchanged. For rollback, derive the version from the final
-   request body and compare it with the approved version. Record hashes and IDs
-   in the authorized evidence record. Keep raw requests and credentials out of
-   evidence. The [offline comparison](../ci/staging_worker_submission.py)
-   compares the supplied pins. Caller authentication, single-use enforcement,
-   request handling and provider confirmation are separate admission requirements.
-4. Before a staging apply, prove that the same custody and review boundary can
-   restore the exact known-good Worker version, with safe reachable bindings
-   and compatible schema and Durable Object lineage. Rehearse the restore and
-   refusals with synthetic fixtures. For live evidence use the existing protected
-   staging workflow, retain its executed restore result and read back the restored
-   serving version, SHA and health. Record partial-failure state before any retry.
-   Hold the apply while the protected restore path or its readback is unavailable.
-   Retain existing health, schema and exact-head checks. Keep pipeline-owned
-   readiness and a bounded use window for Containers, Durable Object alarms,
-   scheduled Workers, Stream inputs and database compute, with cleanup or expiry
-   on failure and cancellation.
+Before wiring this comparison into a live writer, resolve competing write
+paths and verify the target account and reachable bindings. The writer must
+derive the target, operation and rollback version from the request it will
+send, enforce single use of approval tied to the protected workflow revision
+and run attempt, and check each mutation's method, path, query and exact body
+before sending those bytes. For a named-version restore, record prior-version
+provenance, verify binding, schema and Durable Object compatibility, and
+confirm the serving version, build SHA and health after recovery. An enablement
+with no verified prior version needs a separately reviewed recovery plan.
+The [MB and ingest activation prerequisites](#operator-runbook-enabling-staging-mb--staging-ingest)
+apply to those lanes.
 
 ## Future Worker deploy lanes: required rollback evidence
 
@@ -1438,7 +1416,7 @@ be called accepted:
 | 2 | Source revision | The exact commit SHA that version was built from. Where the Worker exposes a deployed-build identity, record it and require it to match this SHA; without one, do not claim same-build evidence (the web checklist above verifies this via `GET /api/build`; a Worker with no such surface cannot claim it). |
 | 3 | Deploy run | URL of the workflow run (or equivalent executed deploy record) that produced item 1, with the Worker deploy job's conclusion `success`. A `skipped` job, a skipped gate, or overall workflow success without that job succeeding is not deploy evidence. For the API Worker, retain successful executed `Hyperdrive cache-disabled gate`, `Verify actual staging migration schema (read-only)` and `Deploy api to staging` step outcomes plus `staging-api` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the MB Worker, retain the successful executed `Deploy mb to staging` step outcome plus `staging-mb` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. For the ingest Worker, retain successful executed `Hyperdrive cache-disabled gate` and `Deploy ingest to staging` step outcomes plus `staging-ingest` outputs `deployed=true`, `outcome=deployed`, and `source_sha` matching item 2. A config-skipped `success` does not qualify. Record gate results by name and outcome only. |
 | 4 | Prior known-good version | Recorded **before** the new deploy: the previously serving Worker's name, version and source SHA, its own successful deploy run (item 3 bar), and its last passing health result. A first deploy has no prior known-good version, so rollback acceptance cannot be claimed for it; removing or disabling a first deployment is a separate gated action, not defined here. |
-| 5 | Rollback action and run | The protected rollback job restored item 4's exact version on that Worker. Record the run/attempt URL, version and source SHA, and the executed rollback job's `success` conclusion. |
+| 5 | Rollback action and run | Which mechanism was used (redeploy of the prior known-good source revision, or activation of the prior version, whichever the lane implements), the target it restored (item 4's version and SHA), and the URL of the rollback run with the rollback/deploy job's conclusion `success` (not `skipped`). |
 | 6 | Post-rollback health result | The lane's health/readiness check for that Worker, run after item 5, with its result and run URL recorded. Where a deployed-build identity exists, it must match the rollback target; a green rollback run or a bare `ok` response without that identity does not by itself prove the prior version is serving. |
 
 A Worker rollback restores Worker code only. If the deploy being rolled
@@ -1557,7 +1535,11 @@ deploys either Worker — until every step below clears, in order:
    corresponding `absent_in` entries from
    `.github/scripts/binding_manifest.toml`, and re-run binding-parity
    before the next staging deploy.
-8. **Rollback restores Worker code.** Preserve the last reviewed known-good
-   version and the per-Worker evidence above. Follow the
-   [deploy lock procedure](#staging-deploy-lock-cutover-and-rollback) and
-   [staging Worker custody](#staging-worker-custody) before restoring it.
+8. **Rollback is a redeploy, never a data restore.** To roll back a Worker,
+   follow the [staging deploy lock cutover and rollback
+   procedure](#staging-deploy-lock-cutover-and-rollback), then re-run the
+   known-good push's `deploy.yml` run (**Re-run all jobs**; never
+   `workflow_dispatch` on an old SHA — the lanes are push-only and would
+   skip). Retain the per-Worker evidence in the table above. A
+   rerun redeploys every configured lane; that is not verified per-Worker
+   rollback unless each Worker's own outcome evidence is recorded.

@@ -17,9 +17,12 @@ class StagingWorkerSubmissionTests(unittest.TestCase):
         ]
         for workflow, job, worker in lanes:
             with self.subTest(workflow=workflow, job=job):
-                self.check(workflow=workflow, job=job, worker=worker)
+                self.check(workflow=workflow, job=job, worker=worker, approved_worker=worker)
                 with self.assertRaisesRegex(ValueError, "Worker target"):
-                    self.check(workflow=workflow, job=job, worker=worker.removesuffix("-staging"))
+                    self.check(
+                        workflow=workflow, job=job, worker=worker.removesuffix("-staging"),
+                        approved_worker=worker,
+                    )
         for overrides in (
             {"worker": "nntune-api-staging"},
             {"workflow": alerts},
@@ -28,6 +31,10 @@ class StagingWorkerSubmissionTests(unittest.TestCase):
         ):
             with self.subTest(**overrides), self.assertRaisesRegex(ValueError, "Worker target"):
                 self.check(**overrides)
+
+    def test_rejects_substitution_of_another_valid_lane(self):
+        with self.assertRaisesRegex(ValueError, "Worker target"):
+            self.check(job="staging-api", worker="nntune-api-staging")
 
     def test_rejects_account_or_body_drift(self):
         for overrides, message in (
@@ -77,7 +84,8 @@ class StagingWorkerSubmissionTests(unittest.TestCase):
         body = b"reviewed payload"
         fields = dict(
             workflow=".github/workflows/deploy.yml", job="staging-web",
-            approved_account="a" * 32, account="a" * 32, worker="nntune-web-staging",
+            approved_account="a" * 32, account="a" * 32,
+            approved_worker="nntune-web-staging", worker="nntune-web-staging",
             approved_source_sha="c" * 40, source_sha="c" * 40,
             approved_operation="deploy", operation="deploy",
             approved_version=None, version=None,

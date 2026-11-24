@@ -482,9 +482,12 @@ security finding requiring a CISO disposition before merge):
 ## 13. Future Worker deploy-lane rollback: trust assumptions (docs-only)
 
 **Status: staging-only backend Worker lanes exist; production deploys `apps/web` only.**
-The [staging Worker custody table](../ops.md#staging-worker-custody) lists
-the five staging deploy lanes and their targets. The trust assumptions below
-apply alongside the standing review gate (§8).
+`.github/workflows/deploy.yml` deploys `apps/web` and, through `staging-api`,
+the api Worker to staging; `.github/workflows/deploy-alerts-staging.yml`
+deploys the `workers/observability` alerts consumer to staging. No tracked
+workflow deploys the other Workers under `workers/`. This section records trust assumptions only. It grants
+no deployment authorization, creates no lane, and changes neither the
+decided stack (§1) nor the standing review gate (§8).
 
 It is the trust companion to the procedure in `docs/ops.md` ("Future
 Worker deploy lanes: required rollback evidence", items 1–6). Procedure
@@ -497,21 +500,38 @@ migration declarations depends on the mechanism (items 2–3); the
 this boundary. Where they overlap, the evidence rule governs
 what must be retained and this section governs what must be trusted.
 
-**Rollback actor.** The authorized writer restores the recorded version
-through the workflow and independent approval defined in
-[staging Worker custody](../ops.md#staging-worker-custody). This operation is
-currently unavailable. Historical reruns carry the original workflow and its
-credential paths. Keep those reruns outside the restore procedure.
+**Rollback actor(s).** The only actor this note contemplates is the
+identity permitted to Re-run the future Worker deploy workflow's
+deploy/rollback job, acting through the repo's Cloudflare CI credentials
+(secret names only, never values; scope recorded in `docs/ops.md`, "CI API
+token + GitHub secrets"). Re-running is a privileged deploy action, not a
+read-only operation: whoever can re-run that job can ship Worker code to
+the target environment once the lane exists. Its reach is bounded by that
+identity's GitHub permissions plus the CI token's Cloudflare scope, and by
+the lane's own required gates on the exact head being (re)deployed. No
+other actor — reader, commenter, or holder of an unrelated token — gains
+any deploy capability from this note.
 
-At restore time, verify the recorded artifact and its compatibility with
-current secret and binding state.
+**What re-running an old-SHA deploy implicitly trusts.** Whichever
+mechanism the future lane implements (redeploy of the prior known-good
+source revision, or activation of the prior version), the rollback trusts
+all three of the following at re-run time, not at the original deploy time:
 
 1. **Artifact integrity.** That the old source revision is the same code
    that passed exact-head CI and review when it was the known-good
    version (prior version, SHA, deploy run, and health result recorded
-   *before* the new deploy per `docs/ops.md` item 4). Verify the serving
-   version, build identity and health after the restore.
-2. **Secret versions.** Activation of a prior version can restore its
+   *before* the new deploy per `docs/ops.md` item 4); that a rebuild from
+   that SHA is faithful to what was reviewed (toolchain/pinning drift can
+   break this — hence the deployed-build identity check in `docs/ops.md`
+   items 2 and 6); and that source control and the build path have not been
+   tampered with since. A green rollback run alone does not prove the prior
+   version is serving — the post-rollback health result plus the
+   deployed-build identity do.
+2. **Secret versions (mechanism-dependent).** A redeploy of the prior
+   known-good source revision keeps the *current* Worker secret values
+   and trusts the current secrets, KEK versions, Hyperdrive credentials,
+   and Access policies — not the values in force at the old deploy.
+   Activation of a prior version instead restores that version's
    snapshotted secret values, vars, and binding config as a unit (a Worker
    version snapshots code plus bindings — secrets are a binding type —
    plus vars and compatibility settings), so it can bring back a
@@ -522,10 +542,13 @@ current secret and binding state.
    signal the decrypt path trusts). A forward-incompatible secret change
    (new KEK generation retired, credential format change) can make a code
    rollback fail or misbehave even when the rollback run is green.
-3. **Binding state.** A prior version can restore its binding targets,
-   vars and compatibility settings. Connected resources (Hyperdrive config,
-   KV/R2 contents, Durable Object storage, Access policies) stay current as
-   inventoried in `docs/ops.md`. If the deploy being rolled back also changed any of
+3. **Binding state (mechanism-dependent).** Activation of a prior version
+   restores that version's binding targets, vars, and compatibility
+   settings; a redeploy of an old SHA reapplies that SHA's Wrangler
+   binding, route, and migration declarations. Neither mechanism restores
+   resource state (Hyperdrive config, KV/R2 contents, Durable Object
+   storage, Access policies), which stays current as inventoried in
+   `docs/ops.md`. If the deploy being rolled back also changed any of
    these (or schema/stored data), the rollback evidence is incomplete until
    it states, per change, that the restored version is compatible with the
    current state or records that change's own rollback. Evidence records
@@ -536,8 +559,14 @@ current secret and binding state.
 
 - Old code against current secrets/bindings/schema may be incompatible;
   fail-closed behavior is preferred but not guaranteed for every Worker.
-- A recorded version may predate a security fix. The restore approval must
-  account for that version's effective code, secret versions and access.
+- A rebuilt artifact may differ byte-for-byte from the originally
+  deployed version if the toolchain is unpinned; without a
+  deployed-build identity matched to the rollback target, serving state
+  is unproven.
+- The re-run capability itself is a deploy capability: anyone holding it
+  can restore any recorded known-good SHA, including one predating a
+  security fix. The mitigation is the lane's exact-head gates and the
+  prior-known-good recording rule — not this note.
 - Data written by the newer version persists after a code rollback;
   forward-only migrations in particular have no code-rollback path.
 - Activating a pre-rotation version after a secret or KEK compromise

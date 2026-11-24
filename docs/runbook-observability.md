@@ -69,17 +69,17 @@ attachment state in the private deployment record. Never record secret values.
    remain untouched. If a separately approved Tail attachment is active, its
    authorized executor restores/removes only that attachment under its own
    recorded rollback contract; this lane does not manage producer settings.
-2. The alerts workflow has no protected version restore operation. Keep
-   activation on hold until an exact version restore can be verified through
-   [staging Worker custody](ops.md#staging-worker-custody).
+2. For an existing known-good version with the same DO migration lineage, use
+   pinned Wrangler 4.159.0:
+   `wrangler rollback "$LAST_KNOWN_GOOD_VERSION" --name nntune-alerts-staging`.
+   Select the recorded version explicitly; never rely on implicit "previous".
    [Cloudflare rollback limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
    prohibit crossing a DO lifecycle migration. No new migration, Worker deletion,
    namespace deletion or durable-history deletion is an undo step here.
-3. If there is no known-good version or the protected restore is unavailable,
-   preserve the Worker and namespace and keep the lane paused. Prepare any
-   fix-forward through an exact-head reviewed PR.
-4. After a verified restore operation is available and has run, recheck
-   Cloudflare's active deployment against the selected version and run
+3. On the first deployment there is no pre-creation version to restore. Keep the
+   consumer unattached, pause the lane and preserve the Worker/namespace. Fix
+   forward through an exact-head reviewed PR; do not invent a rollback ID.
+4. Recheck Cloudflare's active deployment against the selected version and run
    `python3 .github/scripts/alerts_staging.py verify` using existing scoped
    credentials. Confirm observability remains off and attachment state matches the
    approved record. Record version/namespace IDs and staging API health; require
@@ -128,7 +128,7 @@ Until the deployed service exposes and verifies its build identity, neither a wo
 
 ## Rollback and verification boundaries
 
-Staging is the first verification target. Follow [staging Worker custody](ops.md#staging-worker-custody) and verify each affected Worker's serving identity and health. A historical rerun can redeploy web, API, MB and ingest together. Rehearse the restore for each Worker and use the exact version recorded for that Worker.
+Staging is the first verification target. The current web rollback procedure is to rerun all jobs for the last known-good successful staging deployment as documented in [`docs/ops.md`](ops.md#staging-promotion-checklist); confirm `staging-web` succeeds and verify staging health. The rerun also redeploys the api Worker when `staging-api` is configured, but that is not verified api rollback; it does not deploy or roll back the ingest, stream, MB, repair or transcode Workers, and does not prove the serving SHA. Establish and test each Worker rollback separately before relying on it.
 
 Production monitoring is passive. No production deploy, synthetic write, data migration, secret change, or alert-suppression change is authorized by this runbook. Do not manufacture production incidents to test alert delivery.
 
@@ -140,6 +140,6 @@ Do not mark an item live without dated evidence for the exact deployed environme
 - A controlled staging error produces a release-linked event and a Discord alert with a useful log link. Confirm the event's SHA points to the responsible commit/PR. Production verification remains passive.
 - Staging 5xx/error-rate, uncaught-exception, and health/readiness alerts are exercised; confirm health/readiness fires only after the configured two-minute sustained-red condition.
 - The main user-flow synthetic runs every five minutes in staging and alerts on failure. A separately verified production synthetic, if configured, is read-only and passive; none exists in the current repository baseline.
-- The shared promotion action's gradual rollout and error-rate rollback are exercised on staging. Record the pre-release and rollback SHAs and verify recovery through [staging Worker custody](ops.md#staging-worker-custody).
+- The shared promotion action's gradual rollout and error-rate rollback are exercised on staging. Record the pre-release and rollback SHAs and verify recovery; do not infer Worker rollback support from the existing web-only procedure.
 
 The current repository baseline does not satisfy this checklist. Use staging evidence for active tests and production configuration/read-only evidence separately.
