@@ -89,7 +89,7 @@ impl<'a> PreparedUpload<'a> {
         authorize_scope(auth, &scope, self.job, Action::Upload)
     }
 
-    fn completed_scope(self) -> CompletionScope<'a> {
+    pub(crate) fn completed_scope(self) -> CompletionScope<'a> {
         CompletionScope {
             offset: self.request.file_bytes as i64,
             revision: 1,

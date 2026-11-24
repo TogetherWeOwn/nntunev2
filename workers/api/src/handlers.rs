@@ -5993,6 +5993,8 @@ where
 #[allow(dead_code)] // Prepared, with no route or service binding.
 #[path = "admin_flac_proxy.rs"]
 mod admin_flac_proxy;
+#[cfg(feature = "encrypted-upload-caller")]
+pub mod private_trial;
 
 /// 413 for an admin NZB upload whose body breached the collection cap:
 /// the in-handler pre-gate answers oversized admin uploads this way,
@@ -9158,7 +9160,15 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[cfg(all(
+        feature = "postgres-tests",
+        feature = "encrypted-upload-caller",
+        not(target_arch = "wasm32")
+    ))]
+    pub(crate) mod private_trial_fixture {
+        include!("../tests/fixtures/private_trial_caller.rs");
+    }
     #[cfg(all(
         feature = "postgres-tests",
         feature = "encrypted-upload-caller",
