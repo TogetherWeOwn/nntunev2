@@ -44,11 +44,17 @@ def version(*bindings, sha=SHA):
 class IdentityTests(unittest.TestCase):
     def test_stream_receipt_requires_its_own_deployed_version_and_build(self):
         output_stream = output(worker_name=identity.STREAM)
-        mode = {"name": "PRIVATE_PLAYBACK_ENABLED", "type": "plain_text", "text": "false"}
+        mode = {"name": "PRIVATE_PLAYBACK_ENABLED", "type": "plain_text", "text": "true"}
         read = MagicMock(side_effect=[current(), version(mode), current()])
-        self.assertEqual(identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "false"), {
+        with TemporaryDirectory() as temp, patch.object(identity, "provider_result", read), redirect_stdout(io.StringIO()) as stdout:
+            Path(temp, "wrangler-output-test.json").write_bytes(output_stream)
+            env = {"WRANGLER_OUTPUT_FILE_DIRECTORY": temp, "GITHUB_SHA": SHA, "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                   "CLOUDFLARE_API_TOKEN": "synthetic-token", "PRIVATE_PLAYBACK_STAGING_ENABLED": "true"}
+            with patch.dict(identity.os.environ, env, clear=True):
+                self.assertEqual(identity.main(identity.STREAM), 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {
             "identity": "matched", "worker": "nntune-stream-staging", "build_sha": SHA,
-            "deployment_id": DEPLOYMENT, "version_id": VERSION, "private_playback_enabled": False,
+            "deployment_id": DEPLOYMENT, "version_id": VERSION, "private_playback_enabled": True,
         })
         self.assertTrue(all("/workers/scripts/nntune-stream-staging/" in call.args[0]
                             for call in read.call_args_list))
@@ -59,7 +65,7 @@ class IdentityTests(unittest.TestCase):
             identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "false")
         read = MagicMock(side_effect=[current(), version(mode)])
         with self.assertRaisesRegex(identity.Unavailable, "stream-mode-mismatch"):
-            identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "true")
+            identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "false")
 
     def test_cli_reports_matched_or_unavailable(self):
         deployment = identity.decode(json.dumps(current()).replace("100}", "100.0}").encode(), "bad fixture")
