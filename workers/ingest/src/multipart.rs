@@ -9,15 +9,15 @@ use sha2::{Digest, Sha256};
 use xml::{reader::XmlEvent::*, Encoding, ParserConfig};
 
 pub mod head_receipt;
-#[cfg(any(target_arch = "wasm32", test))]
-mod initiation;
+#[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
+pub mod initiation;
 pub mod readback_inventory;
 pub mod resume_checkpoint;
 #[cfg(target_arch = "wasm32")]
 pub mod s3_completion;
 pub mod session_completion;
 pub mod session_outcome;
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_arch = "wasm32", feature = "upload-caller", test))]
 pub mod session_upload;
 pub mod sidecar;
 

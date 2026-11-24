@@ -45,6 +45,8 @@ pub mod handlers;
 pub mod history_key;
 pub mod ingest_grant;
 pub mod ingest_session_auth;
+#[cfg(feature = "encrypted-upload-caller")]
+pub mod ingest_session_caller;
 pub mod ingest_session_request;
 pub mod ledger;
 pub mod legacy_playlist_fixtures;

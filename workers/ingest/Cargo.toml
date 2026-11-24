@@ -10,6 +10,9 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+default = ["worker-entry"]
+worker-entry = []
+upload-caller = []
 cleanup-dispatch-wasm-test = []
 s3-completion-wasm-test = []
 

@@ -100,7 +100,9 @@ class UploadMigrationTests(unittest.TestCase):
             "RETURNS TABLE (claimed boolean, upload_id text, deadline bigint) "
             f"LANGUAGE sql AS $query${lock}$query$;"
         )
-        run_psql(env, FIXTURE.read_text().replace("-- worker statements", "\n".join(wrappers)))
+        grants = FIXTURE.with_name("ingest_session_writer_grants.sql").read_text()
+        run_psql(env, FIXTURE.read_text().replace("-- upload writer grants", grants)
+                 .replace("-- worker statements", "\n".join(wrappers)))
 
     def test_fresh_app_and_populated_upgrade(self):
         with TemporaryDirectory() as tmp:

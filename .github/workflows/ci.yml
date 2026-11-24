@@ -838,6 +838,18 @@ jobs:
           workspaces: workers/api
           key: api-postgres-acceptance
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Exercise the isolated encrypted upload caller on disposable PostgreSQL
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci
+        run: |
+          admin=postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci
+          psql "$admin" -X -v ON_ERROR_STOP=1 -c 'CREATE DATABASE nntune_upload_caller_ci TEMPLATE nntune_ci'
+          psql "$admin" -X -v ON_ERROR_STOP=1 -c "CREATE ROLE upload_fixture_writer LOGIN NOINHERIT PASSWORD 'ci-throwaway'"
+          test_name='ingest_session_caller::postgres_tests::scoped_writer_commits_and_replays_exact_upload'
+          args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests,encrypted-upload-caller --lib "$test_name")
+          inventory="$(cargo test "${args[@]}" -- --exact --ignored --list)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          cargo test "${args[@]}" -- --exact --ignored
       - name: Exercise protected playback lookup on disposable PostgreSQL
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci
@@ -2159,6 +2171,8 @@ jobs:
           STAGING_BODY_WASM_JS="$RUNNER_TEMP/staging-body-js/nntune_api.js" node --test workers/api/tests/staging_body_wasm.cjs workers/api/tests/staging_request_wasm.cjs
       - name: Exercise unmounted staging admission through Worker responses
         run: STAGING_BODY_WASM_JS="$RUNNER_TEMP/ledger-js/nntune_api.js" node --test workers/api/tests/staging_dispatch_wasm.cjs
+      - name: Build the off-route API upload caller for the Worker runtime
+        run: cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features encrypted-upload-caller --target-dir "$RUNNER_TEMP/upload-caller-target"
       - name: Exercise ingest queue and signed S3 completion in a synthetic WASM runtime
         run: |
           set -euo pipefail

@@ -42,7 +42,9 @@ impl CompletionScope<'_> {
     }
 }
 
-/// Stage as the first operation of a dedicated READ COMMITTED transaction.
+/// Use a dedicated READ COMMITTED transaction. Prior writes may advance the
+/// same scoped checkpoint and obtain its final lease. Lock the session before
+/// touching the digest reservation.
 /// Supply authorized scope, a live lease, custody and retention. Report success after outer commit.
 /// Roll back the outer transaction on error or cancellation. Reconcile an ambiguous commit
 /// through the scoped reader.

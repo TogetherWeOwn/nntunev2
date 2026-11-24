@@ -111,7 +111,7 @@ receipt and table state before retrying. On a confirmed apply, leave the
 additive schema and receipt in place when rolling back a caller.
 
 Provision the isolated staging writer separately, without inherited app
-roles, using the [scoped grant fixture](../workers/api/tests/fixtures/ingest_session_migration.sql)
+roles, using the [scoped grant fixture](../workers/api/tests/fixtures/ingest_session_writer_grants.sql)
 as the access matrix for the upload and cleanup queries. The trusted caller
 must enforce environment, library and principal scope in every operation.
 The upload role has no session deletion or publication write grant. Before
@@ -120,6 +120,14 @@ retained reservations. Their foreign keys forbid dropping referenced rows.
 Keep routes and cleanup scheduling off until isolated caller wiring, the
 provider and bucket checks above, and review of the cleanup behavior are
 complete. Publication authority has its own rollout.
+
+The opt-in API caller opens a signed upload for a scoped reservation and
+pre-enrolled sealer intent. Commit after signed transfer and authenticated
+readback, then read the durable pins on retry. Reconcile interrupted attempts
+under their original fence. Use the [completion grants fixture](../workers/api/tests/fixtures/ingest_session_caller_grants.sql)
+for storage inventory and outcome writes. Next, compose the sealed-part and
+sidecar producer and live authorization loader in an isolated staging entry,
+and connect terminal cleanup to scoped reconciliation after bucket qualification.
 
 Proposed lifecycle bounds are at most 24 hours absolute and 60 minutes idle
 since accepted progress; status and retries do not extend absolute expiry.
