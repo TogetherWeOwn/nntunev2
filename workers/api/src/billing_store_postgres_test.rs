@@ -30,6 +30,18 @@ async fn dispatch_with(
     outcome: &ReconcileOutcome,
     writer: Writer,
 ) -> Result<(), StoreError> {
+    with_fixture_store(async |store| match writer {
+        Writer::Owned => {
+            store
+                .store_reconcile_owned(user.to_owned(), outcome.clone())
+                .await
+        }
+        Writer::Release => super::Store::store_reconcile_outcome(store, user, outcome).await,
+    })
+    .await
+}
+
+async fn with_fixture_store<T>(run: impl AsyncFnOnce(&PgStore) -> T) -> T {
     let driver = Rc::new(RefCell::new(None));
     let driver_slot = Rc::clone(&driver);
     let store = PgStore {
@@ -50,14 +62,7 @@ async fn dispatch_with(
         })),
         test_mirror: None,
     };
-    let result = match writer {
-        Writer::Owned => {
-            store
-                .store_reconcile_owned(user.to_owned(), outcome.clone())
-                .await
-        }
-        Writer::Release => super::Store::store_reconcile_outcome(&store, user, outcome).await,
-    };
+    let result = run(&store).await;
     // Join before discarding the store: the call must have released its client.
     let driver = driver.take().expect("store must acquire one connection");
     tokio::time::timeout(Duration::from_secs(5), driver)
@@ -66,6 +71,107 @@ async fn dispatch_with(
         .unwrap()
         .unwrap();
     result
+}
+
+async fn checkout_reservation_and_price_mapping(observer: &Client) {
+    use super::Store;
+    use crate::billing_reconcile::CreateOpOutcome;
+    const OP: &str = "7f000000-0000-4000-8000-000000000001";
+    const RACE: &str = "7f000000-0000-4000-8000-000000000002";
+    const PRICE: &str = "price_checkout_fixture";
+    let reserve = async |operation, user, customer| {
+        with_fixture_store(async |store| {
+            store
+                .create_checkout_operation(operation, user, PRICE, Some(customer))
+                .await
+        })
+        .await
+    };
+    let sql = async |statement: &str| observer.batch_execute(statement).await.unwrap();
+    sql(
+        "INSERT INTO billing_accounts VALUES ('native_billing_user', 'cus_already_owned');
+         INSERT INTO plans VALUES ('checkout-fixture', 800, 100, 1);
+         INSERT INTO plan_prices VALUES
+           ('price_checkout_fixture', 'plus', 'usd', 800, 'month', false, true),
+           ('price_currency', 'pro', 'eur', 1500, 'month', false, true),
+           ('price_interval', 'max', 'usd', 2500, 'year', false, true),
+           ('price_amount', 'checkout-fixture', 'usd', 799, 'month', false, true);",
+    )
+    .await;
+    // The existing subscription owns USER's live slot.
+    assert!(reserve(OP, USER, "cus_already_owned").await.is_err());
+    // The unique customer bind fails after reserving a flight. It must roll back.
+    assert!(reserve(OP, OTHER_USER, "cus_already_owned").await.is_err());
+    let count: i64 = observer
+        .query_one("SELECT count(*) FROM billing_operations", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    sql("UPDATE users SET deleting_at = now() WHERE id = 'native_billing_other';").await;
+    assert!(reserve(OP, OTHER_USER, "cus_checkout").await.is_err());
+    sql(
+        "UPDATE users SET deleting_at = NULL WHERE id = 'native_billing_other';
+         SELECT pg_advisory_lock(hashtext('native_billing_other'));",
+    )
+    .await;
+    let commit_subscription = async {
+        let waiting = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory'
+            AND NOT granted AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))";
+        while !observer
+            .query_one(waiting, &[])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sql(
+            "INSERT INTO subscriptions (user_id, stripe_subscription_id, stripe_customer_id,
+             stripe_subscription_item_id, stripe_price_id, plan_id, status)
+         VALUES ('native_billing_other', 'sub_reservation_race', 'cus_checkout',
+             'si_reservation_race', 'price_checkout_fixture', 'plus', 'active');",
+        )
+        .await;
+    };
+    let writer = async {
+        let result = tokio::time::timeout(Duration::from_secs(2), commit_subscription).await;
+        sql("SELECT pg_advisory_unlock(hashtext('native_billing_other'));").await;
+        result
+    };
+    let (reservation, completed) = tokio::join!(reserve(OP, OTHER_USER, "cus_checkout"), writer);
+    completed.expect("checkout never waited on the subscription writer");
+    assert!(reservation.is_err());
+    sql("DELETE FROM subscriptions WHERE stripe_subscription_id = 'sub_reservation_race'").await;
+
+    let (left, right) = tokio::join!(
+        reserve(OP, OTHER_USER, "cus_checkout"),
+        reserve(RACE, OTHER_USER, "cus_checkout")
+    );
+    let (left, right) = (left.unwrap(), right.unwrap());
+    assert_eq!(left.op(), right.op());
+    let created = |outcome: &CreateOpOutcome| matches!(outcome, CreateOpOutcome::Created(_));
+    assert_ne!(created(&left), created(&right));
+    assert!(left.op().replayable);
+    let snapshot = with_fixture_store(async |store| {
+        store.load_reconcile_input(OTHER_USER, None).await.unwrap()
+    })
+    .await;
+    assert_eq!(snapshot.stripe_customer_id.as_deref(), Some("cus_checkout"));
+    let selectable: Vec<_> = snapshot
+        .bindings
+        .iter()
+        .filter(|row| row.selectable)
+        .map(|row| row.price_id.as_str())
+        .collect();
+    assert_eq!(selectable, [PRICE]);
+    assert_eq!(snapshot.bindings.len(), 4);
+
+    sql("UPDATE billing_operations SET created_at = now() - interval '23 hours 30 minutes'").await;
+    let aged =
+        with_fixture_store(async |store| store.open_checkout_operation(OTHER_USER).await).await;
+    assert!(!aged.unwrap().unwrap().replayable);
+    sql("DELETE FROM billing_operations; DELETE FROM billing_accounts; DELETE FROM plan_prices; DELETE FROM plans WHERE id = 'checkout-fixture';").await;
 }
 
 async fn snapshot(observer: &Client) -> (Value, Value) {
@@ -103,6 +209,7 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     );
     for migration in [
         include_str!("../../../migrations/0002_auth_vault.sql"),
+        include_str!("../../../migrations/0006_account_deletion.sql"),
         include_str!("../../../migrations/0021_billing_schema.sql"),
         include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
         include_str!("../../../migrations/0029_paid_invoice_history.sql"),
@@ -164,6 +271,7 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     assert_eq!(snapshot(&observer).await, (json!([]), json!([])));
 
     dispatch(USER, &seed).await.expect("create owned target");
+    checkout_reservation_and_price_mapping(&observer).await;
     let (owned, history) = snapshot(&observer).await;
     assert_eq!(owned.as_array().unwrap().len(), 1);
     assert_eq!(owned[0]["stripe_subscription_id"], SUBSCRIPTION);

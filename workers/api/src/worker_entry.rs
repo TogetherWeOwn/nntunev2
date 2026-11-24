@@ -1721,6 +1721,9 @@ impl PgStore {
     fn checkout_op_from_row(
         row: &tokio_postgres::Row,
     ) -> Result<crate::billing_reconcile::StoredCheckoutOp, StoreError> {
+        if row.try_get::<_, &str>("kind").map_err(|_| StoreError)? != "checkout" {
+            return Err(StoreError);
+        }
         let payload: String = row.try_get("request_payload").map_err(|_| StoreError)?;
         let (price_id, session_id) =
             crate::billing_reconcile::parse_checkout_operation_payload(&payload);
@@ -1734,6 +1737,7 @@ impl PgStore {
             price_id,
             session_id,
             subscription_id: subscription,
+            replayable: row.try_get("replayable").map_err(|_| StoreError)?,
         })
     }
 
@@ -6266,12 +6270,20 @@ impl Store for PgStore {
             async {
                 let failed =
                     || self.statement_failed("api.db.statement_failed.create_checkout_operation");
-                let client = self.connect().await?;
+                let mut client = self.connect().await?;
+                let transaction = client.read_committed().await.map_err(|_| failed())?;
+                transaction
+                    .query_typed(
+                        crate::billing_reconcile::reconcile_lock_statement(),
+                        &[(&user_id, Type::TEXT)],
+                    )
+                    .await
+                    .map_err(|_| failed())?;
                 // The operation id is its own request key (fresh UUID per
                 // attempt, never reused across attempts); the partial
                 // unique — not this key — arbitrates the race.
                 let payload = crate::billing_reconcile::checkout_operation_payload(price_id, None);
-                let rows = client
+                let rows = transaction
                     .query_typed(
                         crate::billing_reconcile::create_checkout_operation_statement(),
                         &[
@@ -6288,7 +6300,7 @@ impl Store for PgStore {
                     // only when unbound — an existing binding is never
                     // overwritten by a racing second customer create.
                     if let Some(customer) = customer_id {
-                        client
+                        transaction
                             .query_typed(
                                 crate::billing_reconcile::bind_account_customer_statement(),
                                 &[(&user_id, Type::TEXT), (&customer, Type::TEXT)],
@@ -6296,6 +6308,7 @@ impl Store for PgStore {
                             .await
                             .map_err(|_| failed())?;
                     }
+                    transaction.commit().await.map_err(|_| failed())?;
                     return Ok(crate::billing_reconcile::CreateOpOutcome::Created(
                         crate::billing_reconcile::StoredCheckoutOp {
                             id: op_id.to_string(),
@@ -6304,13 +6317,14 @@ impl Store for PgStore {
                             price_id: Some(price_id.to_string()),
                             session_id: None,
                             subscription_id: None,
+                            replayable: true,
                         },
                     ));
                 }
                 // Loser: converge on the winner's row (same operation id,
                 // hence the same Stripe idempotency key) instead of
                 // minting a second subscription.
-                let winner = client
+                let winner = transaction
                     .query_typed(
                         crate::billing_reconcile::open_checkout_operation_select_statement(),
                         &[(&user_id, Type::TEXT)],
@@ -6320,12 +6334,14 @@ impl Store for PgStore {
                 if winner.len() > 1 {
                     return Err(StoreError);
                 }
-                winner
+                let winner = winner
                     .first()
                     .map(Self::checkout_op_from_row)
                     .transpose()?
                     .map(crate::billing_reconcile::CreateOpOutcome::Existing)
-                    .ok_or(StoreError)
+                    .ok_or(StoreError)?;
+                transaction.commit().await.map_err(|_| failed())?;
+                Ok(winner)
             },
             TOTAL_TIMEOUT_MS,
         )
