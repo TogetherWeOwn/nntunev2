@@ -218,7 +218,6 @@ DO $$
 DECLARE
     c record;
     writer_pid integer := (SELECT pid FROM public.dblink('writer', 'SELECT pg_backend_pid()') AS w(pid integer));
-    deadline timestamptz;
 BEGIN
     IF (SELECT count(DISTINCT account_scope) FROM pg_temp.race_cases) <> 2 THEN
         RAISE EXCEPTION 'both deletion scopes must be tested';
@@ -248,12 +247,7 @@ BEGIN
         IF public.dblink_send_query('writer', format('SELECT add_track(%L,%L,%L)', c.owner_id, c.handle, c.late)) <> 1 THEN
             RAISE EXCEPTION 'could not send late append';
         END IF;
-        -- Prove the writer is queued behind this transaction, rather than timing by sleeps alone.
-        deadline := clock_timestamp() + interval '3 seconds';
-        WHILE NOT pg_backend_pid() = ANY(pg_blocking_pids(writer_pid)) LOOP
-            IF clock_timestamp() >= deadline THEN RAISE EXCEPTION 'late append did not wait (account=%)', c.account_scope; END IF;
-            PERFORM pg_sleep(0.01);
-        END LOOP;
+        PERFORM await_blocked(writer_pid);
         COMMIT;
         IF NOT EXISTS (SELECT FROM public.dblink_get_result('writer') AS r(id uuid) WHERE id IS NULL) THEN
             RAISE EXCEPTION 'queued append crossed the committed deletion fence (account=%)', c.account_scope;

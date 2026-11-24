@@ -2,7 +2,7 @@
 //! Register only as part of the Library and playlist cutovers.
 
 use super::*;
-use crate::library::{check_name, clamp_page_size, new_public_id, page_cursor, parse_page_cursor};
+use crate::library::{check_name, clamp_page_size, new_public_id, page_cursor};
 use crate::postgres::{PgConnect, PgQuery};
 use serde_json::{json, Value};
 use tokio_postgres::types::{ToSql, Type};
@@ -62,7 +62,7 @@ WITH existing AS (
 SELECT jsonb_build_object('operation_id', id)::text
 FROM (SELECT id FROM existing UNION ALL SELECT id FROM requested) operation";
 
-enum Command<'a> {
+pub(super) enum Command<'a> {
     List(Option<String>, usize),
     Read(&'a str),
     Create(String),
@@ -71,92 +71,66 @@ enum Command<'a> {
     Delete(&'a str),
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Title {
-    name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Track {
-    track_id: String,
-}
-
-fn handle_shape(id: &str) -> bool {
-    id.len() == 22
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-}
-
-fn command(req: &Request) -> Result<(u16, Command<'_>), Response> {
-    let (path, query) = req.path.split_once('?').unwrap_or((&req.path, ""));
-    let title = || {
-        let body = parse_body::<Title>(req).ok_or_else(invalid_request)?;
-        if body.name.contains('\0') {
-            return Err(invalid_request());
-        }
-        check_name(&body.name).map_err(|_| invalid_request())
-    };
-    match (req.method.as_str(), path) {
-        ("GET", "/v1/playlists") => {
-            let mut after = None;
-            let mut limit = crate::library::MAX_PAGE_SIZE;
-            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-                match key.as_ref() {
-                    "limit" => limit = value.parse().map_err(|_| invalid_request())?,
-                    "after" => {
-                        after = parse_page_cursor(&value).ok().filter(|id| handle_shape(id));
-                        if after.is_none() {
-                            return Err(invalid_request());
-                        }
-                    }
-                    _ => return Err(invalid_request()),
-                }
+impl<'a> Command<'a> {
+    fn handle(&self) -> Option<&'a str> {
+        match self {
+            Self::Read(id) | Self::Rename(id, _) | Self::Append(id, _) | Self::Delete(id) => {
+                Some(id)
             }
-            Ok((200, Command::List(after, limit)))
-        }
-        ("POST", "/v1/playlists") => Ok((201, Command::Create(title()?))),
-        (method, path) => {
-            let rest = path.strip_prefix("/v1/playlists/").ok_or_else(not_found)?;
-            let id = rest.strip_suffix("/entries").unwrap_or(rest);
-            if !handle_shape(id) {
-                return Err(not_found());
-            }
-            match (method, id != rest) {
-                ("POST", true) => {
-                    let body = parse_body::<Track>(req).ok_or_else(invalid_request)?;
-                    if !crate::meter_sink::is_uuid_shaped(&body.track_id) {
-                        return Err(invalid_request());
-                    }
-                    Ok((201, Command::Append(id, body.track_id)))
-                }
-                ("GET", false) => Ok((200, Command::Read(id))),
-                ("PATCH", false) => Ok((200, Command::Rename(id, title()?))),
-                ("DELETE", false) => Ok((202, Command::Delete(id))),
-                _ => Err(not_found()),
-            }
+            Self::Create(_) | Self::List(_, _) => None,
         }
     }
 }
 
+fn handle_shape(id: &str) -> bool {
+    let valid_byte = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-');
+    id.len() == 22 && id.bytes().all(valid_byte)
+}
+
+fn validate(cmd: Command<'_>) -> Result<(u16, Command<'_>), Response> {
+    if cmd.handle().is_some_and(|id| !handle_shape(id)) {
+        return Err(not_found());
+    }
+    let title = |name: String| {
+        check_name(&name)
+            .ok()
+            .filter(|name| !name.contains('\0'))
+            .ok_or_else(invalid_request)
+    };
+    match cmd {
+        Command::List(ref after, _) if after.as_deref().is_some_and(|id| !handle_shape(id)) => {
+            Err(invalid_request())
+        }
+        Command::Append(_, ref track) if !crate::meter_sink::is_uuid_shaped(track) => {
+            Err(invalid_request())
+        }
+        Command::Create(name) => Ok((201, Command::Create(title(name)?))),
+        Command::Rename(id, name) => Ok((200, Command::Rename(id, title(name)?))),
+        Command::Append(..) => Ok((201, cmd)),
+        Command::Delete(_) => Ok((202, cmd)),
+        Command::List(..) | Command::Read(_) => Ok((200, cmd)),
+    }
+}
+
+/// Accepts the operation selected by a future HTTP dispatcher.
 pub(super) async fn route(
     ctx: &Ctx<'_, impl Store + SingleUseStore, impl Mailer, impl Dialer, impl AsyncDns>,
     req: &Request,
     db: &mut impl PgConnect,
+    cmd: Command<'_>,
 ) -> Response {
     if req.authorization.is_some() {
         return not_found();
     }
-    let (claims, _) = match ctx.authenticate(req, req.method != "GET").await {
+    let mutation = !matches!(cmd, Command::Read(_) | Command::List(..));
+    let (claims, _) = match ctx.authenticate(req, mutation).await {
         Ok(session) => session,
         Err(response) => return response,
     };
     if req.body.len() > MAX_BODY_BYTES {
         return invalid_request();
     }
-    let (status, cmd) = match command(req) {
+    let (status, cmd) = match validate(cmd) {
         Ok(command) => command,
         Err(response) => return response,
     };
@@ -172,24 +146,22 @@ async fn value(
     sql: &str,
     args: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<Option<Value>, StoreError> {
-    let row = db
-        .query_typed_opt(sql, args)
-        .await
-        .map_err(|_| StoreError)?;
-    let Some(row) = row else {
+    let found = db.query_typed_opt(sql, args).await;
+    let Some(row) = found.map_err(|_| StoreError)? else {
         return Ok(None);
     };
     let text = row.try_get(0).map_err(|_| StoreError)?;
     serde_json::from_str(text).map(Some).map_err(|_| StoreError)
 }
 
-async fn execute(
+pub(super) async fn execute(
     db: &mut impl PgConnect,
     owner: &str,
     cmd: Command<'_>,
 ) -> Result<Option<Value>, StoreError> {
     let owner = || (&owner as &(dyn ToSql + Sync), Type::TEXT);
-    let handle = match cmd {
+    let handle = cmd.handle();
+    match cmd {
         Command::List(after, limit) => {
             let limit = clamp_page_size(limit);
             let fetch = limit as i64 + 1;
@@ -210,9 +182,8 @@ async fn execute(
             return Ok(Some(json!({"items": items, "next_cursor": next})));
         }
         Command::Read(id) => return value(db, READ, &[owner(), (&id, Type::TEXT)]).await,
-        Command::Create(_) => None,
-        Command::Rename(id, _) | Command::Append(id, _) | Command::Delete(id) => Some(id),
-    };
+        _ => {}
+    }
     // Wait for both locks before taking a fresh snapshot for duplicate checks.
     let tx = db.read_committed().await.map_err(|_| StoreError)?;
     let account = tx.query_typed_opt(LOCK_ACCOUNT, &[owner()]).await;
@@ -255,7 +226,3 @@ async fn execute(
     tx.commit().await.map_err(|_| StoreError)?;
     Ok(result)
 }
-
-#[cfg(all(test, feature = "postgres-tests", not(target_arch = "wasm32")))]
-#[path = "private_playlists_postgres_tests.rs"]
-mod postgres_tests;

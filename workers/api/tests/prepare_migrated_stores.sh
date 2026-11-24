@@ -85,7 +85,7 @@ port="$(docker_clean port "$id" 5432/tcp)"
 [[ "$port" =~ ^127\.0\.0\.1:([0-9]+)$ ]]
 port="${BASH_REMATCH[1]}"
 playlist_test=(--locked --manifest-path "$root/workers/api/Cargo.toml" --features postgres-tests --lib
-  handlers::private_playlists::postgres_tests::postgres_store_rehearsal)
+  handlers::tests::private_playlist_postgres::postgres_store_rehearsal)
 NNTUNE_TEST_PRIVATE_PLAYLIST_PORT="$port" \
   cargo test "${playlist_test[@]}" -- --exact --ignored | tee "$tmp/playlist-test.log"
 grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$tmp/playlist-test.log"

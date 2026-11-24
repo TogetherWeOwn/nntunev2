@@ -8740,6 +8740,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context as TaskContext, Poll, Waker};
 
+    #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
+    mod private_playlist_postgres {
+        include!("private_playlists_postgres_tests.rs");
+    }
+
     fn block_on<F: Future>(future: F) -> F::Output {
         let waker = Waker::noop();
         let mut cx = TaskContext::from_waker(waker);

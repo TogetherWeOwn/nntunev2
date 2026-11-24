@@ -6,6 +6,30 @@ CREATE VIEW member_tracks AS
 SELECT l.user_id AS owner_id, lt.track_id FROM public.libraries l
 JOIN public.library_tracks lt ON lt.library_id = l.id WHERE l.deleting_at IS NULL;
 
+-- Observe a real lock wait before committing the fixture transaction.
+CREATE FUNCTION await_blocked(writer_pid integer) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE deadline timestamptz := clock_timestamp() + interval '3 seconds';
+BEGIN
+    WHILE NOT pg_backend_pid() = ANY(pg_blocking_pids(writer_pid)) LOOP
+        IF clock_timestamp() >= deadline THEN RAISE EXCEPTION 'late writer did not wait'; END IF;
+        PERFORM pg_sleep(0.01);
+    END LOOP;
+END;
+$$;
+
+-- Simulate the executor's persisted completion state in the disposable clone.
+CREATE FUNCTION complete_playlist_delete(owner text, handle text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM public.playlist_tracks e USING public.playlists p
+    WHERE e.playlist_id = p.id AND p.owner_user_id = owner AND p.public_id = handle;
+    DELETE FROM public.playlists WHERE owner_user_id = owner AND public_id = handle;
+    IF NOT FOUND THEN RAISE EXCEPTION 'playlist was not physically removed'; END IF;
+    UPDATE public.delete_operations SET state = 'done'
+    WHERE user_id = owner AND scope = 'playlist' AND container_id = handle;
+    IF NOT FOUND THEN RAISE EXCEPTION 'durable operation was missing'; END IF;
+END;
+$$;
+
 -- Match library::check_name's Rust Unicode White_Space trim, regardless of locale.
 CREATE FUNCTION trim_name(title text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
     SELECT btrim(title, U&'\0009\000A\000B\000C\000D\0020\0085\00A0\1680\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200A\2028\2029\202F\205F\3000');
