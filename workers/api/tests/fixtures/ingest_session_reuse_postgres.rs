@@ -55,40 +55,95 @@ pub(super) async fn protect_completed(
             Err(Refused)
         ));
     }
-    observer
-        .execute(
-            "UPDATE public.fixture_upload_grants SET can_reuse = false WHERE credential_id = $1",
-            &[&auth.record.id],
+    let obj = &expected.object;
+    let mut cleaner = connect(DB).await;
+    let cleaner_pid = backend_pid(&cleaner).await;
+    let writer_pid = backend_pid(writer).await;
+    {
+        let held = cleaner.transaction().await.unwrap();
+        held.query_one(
+            "SELECT 1 FROM public.storage_validated_digest_winners WHERE object_id = $1::text::uuid FOR UPDATE",
+            &[obj],
+        ).await.unwrap();
+        let mut attempt = std::pin::pin!(reuse(writer, auth, &scope, job, reload));
+        observe_blocked(observer, cleaner_pid, writer_pid, attempt.as_mut())
+            .await
+            .unwrap();
+        set_reuse_grant(observer, &auth.record.id, false).await;
+        held.commit().await.unwrap();
+        assert!(matches!(attempt.await, Err(Refused)));
+        set_reuse_grant(observer, &auth.record.id, true).await;
+    }
+    let first = reuse(writer, auth, &scope, job, reload).await.unwrap();
+    assert_pins(first.outcome(), expected);
+    assert!(first.usable_until() > SystemTime::now());
+    assert!(first.usable_until() <= SystemTime::now() + Duration::from_secs(30));
+
+    // Shrink one independent bound at a time. Retries still return exact pins
+    // but must never shorten the first caller's durable deletion protection.
+    let cutoff: SystemTime = observer
+        .query_one(
+            "SELECT date_trunc('second', clock_timestamp()) + interval '20 seconds'",
+            &[],
         )
         .await
+        .unwrap()
+        .get(0);
+    assert!(cutoff < first.usable_until());
+    let expiry = |time: SystemTime| {
+        i64::try_from(time.duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap()
+    };
+    let credential_deadline =
+        "UPDATE public.native_rest_credentials SET expires_at = $2 WHERE id = $1";
+    observer
+        .execute(credential_deadline, &[&auth.record.id, &expiry(cutoff)])
+        .await
         .unwrap();
-    assert!(matches!(
-        reuse(writer, auth, &scope, job, reload).await,
-        Err(Refused)
-    ));
+    let retry = reuse(writer, auth, &scope, job, reload).await.unwrap();
+    assert_eq!(retry.usable_until(), cutoff);
+    assert_pins(retry.outcome(), expected);
     observer
         .execute(
-            "UPDATE public.fixture_upload_grants SET can_reuse = true WHERE credential_id = $1",
-            &[&auth.record.id],
+            credential_deadline,
+            &[&auth.record.id, &(auth.record.expires_at as i64)],
         )
         .await
         .unwrap();
 
-    let first = reuse(writer, auth, &scope, job, reload).await.unwrap();
-    let retry = reuse(writer, auth, &scope, job, reload).await.unwrap();
-    for reuse in [&first, &retry] {
-        let got = reuse.outcome();
-        assert_eq!(got.map, expected.map);
-        assert_eq!(got.object, expected.object);
-        assert_eq!(got.generation, expected.generation);
-        assert_eq!(got.configuration, expected.configuration);
-        assert_eq!(got.root_version, expected.root_version);
-        assert_eq!(got.media_version, expected.media_version);
-        assert_eq!(got.page_versions, expected.page_versions);
-        assert!(reuse.usable_until() > SystemTime::now());
-        assert!(reuse.usable_until() <= SystemTime::now() + Duration::from_secs(30));
-    }
-    let obj = &expected.object;
+    let session_deadline: SystemTime = observer.query_one(
+        "SELECT absolute_deadline FROM public.ingest_session_reservations WHERE id = $1::text::uuid",
+        &[&scope.session],
+    ).await.unwrap().get(0);
+    let move_session = "UPDATE public.ingest_session_reservations
+        SET absolute_deadline = $2, idle_deadline = LEAST(idle_deadline, $2)
+        WHERE id = $1::text::uuid";
+    observer
+        .execute(move_session, &[&scope.session, &cutoff])
+        .await
+        .unwrap();
+    assert_eq!(
+        reuse(writer, auth, &scope, job, reload)
+            .await
+            .unwrap()
+            .usable_until(),
+        cutoff
+    );
+    observer
+        .execute(move_session, &[&scope.session, &session_deadline])
+        .await
+        .unwrap();
+
+    observer.execute(
+        "UPDATE public.storage_validated_digest_winners SET retain_until = $2 WHERE object_id = $1::text::uuid",
+        &[obj, &cutoff],
+    ).await.unwrap();
+    assert_eq!(
+        reuse(writer, auth, &scope, job, reload)
+            .await
+            .unwrap()
+            .usable_until(),
+        cutoff
+    );
     let protected = observer
         .query_one(
             "UPDATE public.storage_validated_digest_winners SET retain_until = '-infinity'
@@ -98,8 +153,7 @@ pub(super) async fn protect_completed(
         .await
         .unwrap()
         .get::<_, SystemTime>(0);
-    assert_eq!(protected, retry.usable_until());
-    assert!(protected >= first.usable_until());
+    assert_eq!(protected, first.usable_until());
     // With only the reuse fence active, the real delete guard refuses admission.
     assert!(!observer
         .query_one(DELETE, &[obj])
@@ -107,9 +161,6 @@ pub(super) async fn protect_completed(
         .unwrap()
         .get::<_, bool>(0));
 
-    let mut cleaner = connect(DB).await;
-    let cleaner_pid = backend_pid(&cleaner).await;
-    let writer_pid = backend_pid(writer).await;
     let cleanup = cleaner.transaction().await.unwrap();
     // Move the fence to the past inside the transaction to model elapsed time
     // without waiting. The reuse query sees a committed candidate, then blocks.
@@ -141,9 +192,31 @@ pub(super) async fn protect_completed(
         .get::<_, bool>(0));
 }
 
+async fn set_reuse_grant(observer: &Client, credential_id: &str, allowed: bool) {
+    assert_eq!(
+        observer
+            .execute(
+                "UPDATE public.fixture_upload_grants SET can_reuse = $2 WHERE credential_id = $1",
+                &[&credential_id, &allowed],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+fn assert_pins(got: &CommittedOutcome, expected: &CommittedOutcome) {
+    assert_eq!(got.map, expected.map);
+    assert_eq!(got.object, expected.object);
+    assert_eq!(got.generation, expected.generation);
+    assert_eq!(got.configuration, expected.configuration);
+    assert_eq!(got.root_version, expected.root_version);
+    assert_eq!(got.media_version, expected.media_version);
+    assert_eq!(got.page_versions, expected.page_versions);
+}
+
 pub(super) async fn refuse_unverified(
     observer: &Client,
-    authority: &Client,
     writer: &mut Client,
     auth: Authorization<'_>,
     prepared: PreparedUpload<'_>,
@@ -168,8 +241,8 @@ pub(super) async fn refuse_unverified(
         &[&scope.session, &map, &uuid_text(scope.seal), &scope.revision, &scope.offset],
     ).await.unwrap(), 1);
     assert!(matches!(
-        reuse(writer, auth, &scope, prepared.job, async |id, locked| {
-            load_authority(authority, id, locked).await
+        reuse(writer, auth, &scope, prepared.job, async |_, _| {
+            panic!("unverified inventory must not reach the authority reader")
         })
         .await,
         Err(Refused)

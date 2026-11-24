@@ -741,8 +741,7 @@ async fn prove_attempt(
             &[&map_text, &obj],
         ).await.unwrap().get::<_, bool>(0));
         if matches!(fault, Fault::BadFlac) {
-            reuse_cases::refuse_unverified(observer, authority, writer, auth, prepared, &map_text)
-                .await;
+            reuse_cases::refuse_unverified(observer, writer, auth, prepared, &map_text).await;
         }
         return;
     }
