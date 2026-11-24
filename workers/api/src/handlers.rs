@@ -763,13 +763,11 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
-    /// The private relay stays dormant until the trusted receipt store is registered.
+    /// Find the committed catalogue receipt for this member and exact media path.
     fn browser_playback_receipt(
         &self,
         _user_id: &str,
-        _track: &str,
-        _tab: &str,
-        _play: &str,
+        _media_path: &str,
     ) -> impl Future<Output = Result<Option<browser_playback_relay::BrowserReceipt>, StoreError>>
     {
         async { Ok(None) }
@@ -9551,8 +9549,6 @@ mod tests {
     impl Store for FakeStore {
         async fn browser_playback_receipt(
             &self,
-            _: &str,
-            _: &str,
             _: &str,
             _: &str,
         ) -> Result<Option<browser_playback_relay::BrowserReceipt>, StoreError> {
@@ -19366,29 +19362,34 @@ mod tests {
 
     #[test]
     fn private_media_entry_requires_a_lease_capped_grant_and_defaults_off() {
-        use super::browser_playback_relay::private_media;
-        use private_media_fixture::{context, receipt, shorten_lease, EXPECTED, RANGE};
+        use crate::worker_entry::{relay_media, CollectedBody};
+        use private_media_fixture::{
+            context, expected_headers, receipt, relay_headers, shorten_lease,
+        };
         let (h, req) = receipt();
-        let relay = || {
-            block_on(private_media(
+        let headers = relay_headers();
+        let media = |body| {
+            block_on(relay_media(
                 &context(&h),
                 &req,
-                Some("same-origin"),
-                RANGE,
+                &body,
+                &headers,
                 async |get| {
                     assert_eq!(get.path, "/play/track");
-                    assert_eq!(get.authorization, crate::play_grant::bearer(EXPECTED));
-                    assert_eq!(get.range, RANGE);
+                    assert!(get.headers().eq(expected_headers()));
                     200
                 },
             ))
+            .unwrap()
             .unwrap_or_else(|error| error.status)
         };
-        assert_eq!(relay(), 200);
+        let get = || media(CollectedBody::Complete(Vec::new()));
+        assert_eq!(get(), 200);
+        assert_eq!(media(CollectedBody::Complete(vec![1])), 400);
         shorten_lease(&h);
-        assert_eq!(relay(), 404);
+        assert_eq!(get(), 404);
         h.store.browser_receipt.take();
-        assert_eq!(relay(), 404);
+        assert_eq!(get(), 404);
     }
 
     #[test]

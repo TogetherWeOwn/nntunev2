@@ -1,9 +1,9 @@
 use std::{future::poll_fn, pin::pin};
 
+use ::worker::{Context, Date, Env, Request, Response, Result};
 use futures_channel::oneshot;
 use futures_util::future::{select, Either};
 use nntune_core::original_source::reader::AsyncReadControl;
-use worker::{Context, Date, Env, Request, Response, Result};
 
 use super::*;
 use crate::{
@@ -75,11 +75,8 @@ pub(crate) async fn serve<S: PrivateSource + 'static>(
                             .content_range
                             .as_deref()
                             .map(|value| ("content-range", value));
-                        (
-                            api_error_response(&ApiError::range_not_satisfiable(), extra)
-                                .map_err(|_| ApiError::internal_error())?,
-                            None,
-                        )
+                        api_error_response(&ApiError::range_not_satisfiable(), extra)
+                            .map(|response| (response, None))
                     } else {
                         let mut headers = vec![
                             ("content-type".into(), PLAY_CONTENT_TYPE.into()),
@@ -89,10 +86,10 @@ pub(crate) async fn serve<S: PrivateSource + 'static>(
                         if let Some(value) = range.content_range {
                             headers.push(("content-range".into(), value));
                         }
-                        let (response, writer) = channel(range.status, &headers, range.len)
-                            .map_err(|_| ApiError::internal_error())?;
-                        (response, Some(writer))
-                    };
+                        channel(range.status, &headers, range.len)
+                            .map(|(response, writer)| (response, Some(writer)))
+                    }
+                    .map_err(|_| ApiError::internal_error())?;
                     ready
                         .take()
                         .expect("response starts once")

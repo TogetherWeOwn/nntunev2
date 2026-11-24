@@ -7704,6 +7704,39 @@ where
     handlers::handle_with_session_binding(ctx, &request, expected_session_binding).await
 }
 
+pub(crate) async fn relay_media<S, M, D, N, T>(
+    ctx: &handlers::Ctx<'_, S, M, D, N>,
+    request: &handlers::Request,
+    collected: &CollectedBody,
+    headers: &HashMap<String, String>,
+    stream_get: impl AsyncFnOnce(handlers::browser_playback_relay::StreamGet<'_>) -> T,
+) -> Option<Result<T, handlers::Response>>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    use handlers::browser_playback_relay::{relay, MEDIA_PREFIX};
+    if request.method != "GET" || !request.path.starts_with(MEDIA_PREFIX) {
+        return None;
+    }
+    if *collected != CollectedBody::Complete(Vec::new()) {
+        return Some(Err(handlers::invalid_request()));
+    }
+    Some(
+        relay(
+            ctx,
+            request,
+            None,
+            headers.get("sec-fetch-site").map(String::as_str),
+            headers.get("range").map(String::as_str),
+            stream_get,
+        )
+        .await,
+    )
+}
+
 /// Registry code for an error response: the envelope `code` when the body
 /// carries one, else the status-implied code for statuses this worker owns
 /// unambiguously (429 is only ever `rate_limited`, 404 only `not_found`,
@@ -8253,53 +8286,59 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     let served_method = request.method.clone();
     let served_path = served_display_path(&request.path);
-    use handlers::browser_playback_relay::{private_media, MEDIA_PREFIX};
-    if request.method == "GET" && request.path.starts_with(MEDIA_PREFIX) {
-        if collected != CollectedBody::Complete(Vec::new()) {
-            return render(&handlers::invalid_request(), &[], &trace_id);
+    if let Some(result) = relay_media(&ctx, &request, &collected, &headers_map, async |get| {
+        let headers = Headers::new();
+        for (name, value) in get.headers() {
+            headers.set(name, value)?;
         }
-        let result = private_media(
-            &ctx,
-            &request,
-            headers_map.get("sec-fetch-site").map(String::as_str),
-            headers_map.get("range").map(String::as_str),
-            async |get| {
-                let headers = Headers::new();
-                headers.set("authorization", &get.authorization)?;
-                if let Some(range) = get.range {
-                    headers.set("range", range)?;
-                }
-                let mut init = RequestInit::new();
-                init.with_headers(headers)
-                    .with_redirect(worker::RequestRedirect::Error);
-                let init = worker::web_sys::RequestInit::from(&init);
-                init.set_signal(Some(&req.signal()));
-                let upstream = worker::web_sys::Request::new_with_str_and_init(
-                    &format!("https://nntune-stream{}", get.path),
-                    &init,
-                )
-                .map_err(worker::Error::from)?;
-                let upstream = env
-                    .service("STREAM")?
-                    .fetch_request(Request::from(upstream))
-                    .await?;
-                let mut response = Response::try_from(upstream)?;
-                response
-                    .headers_mut()
-                    .set("cache-control", "private, no-store")?;
-                response
-                    .headers_mut()
-                    .set("x-content-type-options", "nosniff")?;
-                response.headers_mut().delete("set-cookie")?;
-                Ok::<_, worker::Error>(response)
-            },
+        headers.set(crate::logging::TRACE_HEADER, &trace_id)?;
+        let mut init = RequestInit::new();
+        init.with_headers(headers)
+            .with_redirect(worker::RequestRedirect::Error);
+        let init = worker::web_sys::RequestInit::from(&init);
+        init.set_signal(Some(&req.signal()));
+        let upstream = worker::web_sys::Request::new_with_str_and_init(
+            &format!("https://nntune-stream{}", get.path),
+            &init,
         )
-        .await;
-        return match result {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => render(&handlers::unavailable(), &[], &trace_id),
+        .map_err(worker::Error::from)?;
+        let upstream = env
+            .service("STREAM")?
+            .fetch_request(Request::from(upstream))
+            .await?;
+        let mut response = Response::try_from(upstream)?;
+        let headers = response.headers_mut();
+        headers.set("cache-control", "private, no-store")?;
+        headers.set("x-content-type-options", "nosniff")?;
+        headers.delete("set-cookie")?;
+        headers.set(crate::logging::TRACE_HEADER, &trace_id)?;
+        Ok::<_, worker::Error>(response)
+    })
+    .await
+    {
+        let response = match result {
+            Ok(result) => result.or_else(|_| render(&handlers::unavailable(), &[], &trace_id)),
             Err(response) => render(&response, &[], &trace_id),
+        }?;
+        let status = response.status_code();
+        let level = if status >= 500 {
+            crate::logging::Level::Error
+        } else {
+            crate::logging::Level::Info
         };
+        let _ = emit_record(
+            level,
+            "api.request.served",
+            &trace_id,
+            serde_json::json!({
+                "route": "GET /v1/plays/media/{track}/{tab}/{play}",
+                "status_code": status,
+                "duration_ms": now_millis().saturating_sub(start_ms),
+                "build_sha": build_sha,
+                "release": build_sha,
+            }),
+        );
+        return Ok(response);
     }
     let response = dispatch_collected(collected, request, |collected_request| {
         handle_with_transport_headers(&ctx, collected_request, &headers_map)
@@ -9339,12 +9378,11 @@ mod tests {
         }
         // Match the key literal inside the `json!` fields, not the bare
         // substring: `let build_sha = …` alone must never satisfy this.
-        // `dispatch` holds two emit sites (served + misconfigured), so a
-        // dropped key at either site drops the count below two.
+        // `dispatch` emits ordinary, media and misconfiguration records.
         assert_eq!(
             dispatch_body.matches("\"build_sha\": build_sha").count(),
-            2,
-            "served and misconfigured must each carry the build_sha key"
+            3,
+            "each dispatch log must carry the build_sha key"
         );
         let store_body = production
             .split_once("impl PgStore")

@@ -2,15 +2,12 @@
 
 use super::{not_found, preference_authenticate, session_binding, unavailable};
 use super::{AsyncDns, Ctx, Dialer, Mailer, Request, Response, SingleUseStore, Store};
+use crate::play_grant::{self, IssuedGrant};
 use crate::playback::LeaseRow;
-use crate::{
-    play_grant::{self, IssuedGrant},
-    session::SessionClaims,
-};
 use hmac::{Hmac, KeyInit, Mac};
 use std::num::NonZeroU64;
 
-pub(super) struct BrowserGrant<'a> {
+pub(crate) struct BrowserGrant<'a> {
     pub(super) user_id: &'a str,
     pub(super) session_binding: &'a str,
     pub(super) lease: &'a LeaseRow,
@@ -40,9 +37,21 @@ pub(crate) struct StreamGet<'a> {
     pub(crate) range: Option<&'a str>,
 }
 
-pub(crate) async fn private_media<S, M, D, N, T>(
+impl StreamGet<'_> {
+    pub(crate) fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        [
+            Some(("authorization", self.authorization.as_str())),
+            self.range.map(|value| ("range", value)),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+pub(crate) async fn relay<S, M, D, N, T>(
     ctx: &Ctx<'_, S, M, D, N>,
     req: &Request,
+    committed: Option<&BrowserGrant<'_>>,
     fetch_site: Option<&str>,
     range: Option<&str>,
     stream_get: impl AsyncFnOnce(StreamGet<'_>) -> T,
@@ -53,74 +62,54 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    if ctx.cfg.private_listening.is_none() || !admitted(req, fetch_site, range) {
-        return Err(not_found());
-    }
-    let path = req.path.strip_prefix(MEDIA_PREFIX).ok_or_else(not_found)?;
-    let mut parts = path.split('/');
-    let (Some(track), Some(tab), Some(play), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err(not_found());
+    let valid_range = |value: &str| {
+        value.len() <= 128 && value.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
     };
-    if !crate::ledger::is_valid_key_field(track, 512)
-        || !crate::ledger::is_valid_key_field(tab, 128)
-        || !super::is_private_play_id(play)
+    if req.method != "GET"
+        || fetch_site != Some("same-origin")
+        || !range.is_none_or(valid_range)
+        || (committed.is_none() && ctx.cfg.private_listening.is_none())
     {
         return Err(not_found());
     }
     let (claims, _) = preference_authenticate(ctx, req, false).await?;
-    let deadline = ctx
-        .private_listening_deadline(&claims.user_id)
-        .await?
-        .ok_or_else(not_found)?;
-    let receipt = ctx
-        .store
-        .browser_playback_receipt(&claims.user_id, track, tab, play)
-        .await
-        .map_err(|_| unavailable())?
-        .ok_or_else(not_found)?;
-    let grant = BrowserGrant {
-        user_id: &receipt.user_id,
-        session_binding: &receipt.session_binding,
-        lease: &receipt.lease,
-        artifact_sha256: &receipt.artifact_sha256,
-        duration_ms: receipt.duration_ms,
-        grant: &receipt.grant,
+    let receipt;
+    let (grant, version, policy_end) = match committed {
+        #[cfg(test)]
+        Some(grant) => (BrowserGrant { ..*grant }, "v3", None),
+        _ => {
+            let path = req
+                .path
+                .strip_prefix(MEDIA_PREFIX)
+                .filter(|path| path.len() <= 512 + 128 + 30 + 2)
+                .ok_or_else(not_found)?;
+            let deadline = ctx
+                .private_listening_deadline(&claims.user_id)
+                .await?
+                .ok_or_else(not_found)?;
+            receipt = ctx
+                .store
+                .browser_playback_receipt(&claims.user_id, path)
+                .await
+                .map_err(|_| unavailable())?
+                .ok_or_else(not_found)?;
+            if !super::is_private_play_id(&receipt.lease.play_id) {
+                return Err(not_found());
+            }
+            (
+                BrowserGrant {
+                    user_id: &receipt.user_id,
+                    session_binding: &receipt.session_binding,
+                    lease: &receipt.lease,
+                    artifact_sha256: &receipt.artifact_sha256,
+                    duration_ms: receipt.duration_ms,
+                    grant: &receipt.grant,
+                },
+                "v4",
+                Some(deadline),
+            )
+        }
     };
-    let lease = authorize(ctx, req, &claims, &grant, "v4").await?;
-    if receipt.grant.exp_unix > lease.expires_at.min(deadline).min(claims.expires_at) {
-        return Err(not_found());
-    }
-    Ok(stream_get(StreamGet {
-        path: format!("/play/{track}"),
-        authorization: play_grant::bearer(&receipt.grant.token),
-        range,
-    })
-    .await)
-}
-
-fn admitted(req: &Request, fetch_site: Option<&str>, range: Option<&str>) -> bool {
-    req.method == "GET"
-        && fetch_site == Some("same-origin")
-        && range.is_none_or(|value| {
-            value.len() <= 128 && value.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
-        })
-}
-
-async fn authorize<S, M, D, N>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
-    claims: &SessionClaims,
-    grant: &BrowserGrant<'_>,
-    version: &str,
-) -> Result<LeaseRow, Response>
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
     let LeaseRow {
         session_id,
         track_id,
@@ -130,9 +119,9 @@ where
     } = grant.lease;
     let secret = ctx.cfg.play_grant_secret.as_deref();
     if claims.user_id != grant.user_id
-        || session_binding(claims) != grant.session_binding
-        || !valid_grant(secret, grant, ctx.now, version)
-        || req.path != format!("/v1/plays/media/{track_id}/{session_id}/{play_id}")
+        || session_binding(&claims) != grant.session_binding
+        || !valid_grant(secret, &grant, ctx.now, version)
+        || req.path != format!("{MEDIA_PREFIX}{track_id}/{session_id}/{play_id}")
     {
         return Err(not_found());
     }
@@ -150,38 +139,21 @@ where
         .playback_lease(grant.user_id)
         .await
         .map_err(|_| unavailable())?;
-    lease
-        .filter(|lease| {
-            lease.is_continuation(session_id, play_id, track_id, ctx.now)
-                && lease.epoch == *epoch
-                && grant.grant.exp_unix <= lease.continuation_deadline
-        })
-        .ok_or_else(not_found)
-}
-
-#[cfg(test)]
-pub(super) async fn relay<S, M, D, N, T>(
-    ctx: &Ctx<'_, S, M, D, N>,
-    req: &Request,
-    committed: Option<&BrowserGrant<'_>>,
-    fetch_site: Option<&str>,
-    range: Option<&str>,
-    stream_get: impl AsyncFnOnce(StreamGet<'_>) -> T,
-) -> Result<T, Response>
-where
-    S: Store + SingleUseStore,
-    M: Mailer,
-    D: Dialer,
-    N: AsyncDns,
-{
-    let grant = committed.ok_or_else(not_found)?;
-    if !admitted(req, fetch_site, range) {
+    if !lease.is_some_and(|lease| {
+        let cutoff = lease
+            .continuation_deadline
+            .min(policy_end.map_or(u64::MAX, |end| {
+                lease.expires_at.min(end).min(claims.expires_at)
+            }));
+        lease.is_continuation(session_id, play_id, track_id, ctx.now)
+            && lease.epoch == *epoch
+            && grant.grant.exp_unix <= cutoff
+    }) {
         return Err(not_found());
     }
-    let (claims, _) = preference_authenticate(ctx, req, false).await?;
-    authorize(ctx, req, &claims, grant, "v3").await?;
+
     Ok(stream_get(StreamGet {
-        path: format!("/play/{}", grant.lease.track_id),
+        path: format!("/play/{track_id}"),
         authorization: play_grant::bearer(&grant.grant.token),
         range,
     })

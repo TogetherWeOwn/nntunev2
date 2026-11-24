@@ -2,9 +2,8 @@ use super::*;
 use crate::{meter_sink::TrackMeterMeta, play_grant::IssuedGrant, playback::LeaseRow};
 
 pub(super) const PLAY: &str = "private_1234567890abcdefghijkl";
-pub(super) const RANGE: Option<&str> = Some("bytes=2-7");
-pub(super) const EXPECTED: &str =
-    include_str!("../../../../fixtures/play-grant/private-enrolled.token");
+const RANGE: &str = "bytes=2-7";
+const TOKEN: &str = include_str!("../../../../fixtures/play-grant/private-enrolled.token");
 
 pub(super) fn receipt() -> (Harness, Request) {
     let mut h = harness();
@@ -55,7 +54,7 @@ pub(super) fn receipt() -> (Harness, Request) {
                 .into(),
             duration_ms: 60_000.try_into().unwrap(),
             grant: IssuedGrant {
-                token: EXPECTED.into(),
+                token: TOKEN.into(),
                 exp_unix: 12,
             },
         }));
@@ -73,4 +72,19 @@ pub(super) fn shorten_lease(h: &Harness) {
         .get_mut("member")
         .unwrap()
         .expires_at = 11;
+}
+
+pub(super) fn relay_headers() -> HashMap<String, String> {
+    HashMap::from([
+        ("sec-fetch-site".into(), "same-origin".into()),
+        ("range".into(), RANGE.into()),
+    ])
+}
+
+pub(super) fn expected_headers() -> [(&'static str, &'static str); 2] {
+    const AUTHORIZATION: &str = concat!(
+        "Bearer ",
+        include_str!("../../../../fixtures/play-grant/private-enrolled.token")
+    );
+    [("authorization", AUTHORIZATION), ("range", RANGE)]
 }
