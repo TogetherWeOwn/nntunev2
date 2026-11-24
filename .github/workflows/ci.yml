@@ -863,6 +863,15 @@ jobs:
           psql "$NNTUNE_TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -c 'CREATE DATABASE nntune_catalogue_ci TEMPLATE nntune_ci'
           export NNTUNE_TEST_DATABASE_URL=postgresql://postgres:ci-throwaway@localhost:5432/nntune_catalogue_ci
           cargo test --locked --manifest-path workers/ingest/Cargo.toml --test multipart_readback_inventory "$test_name" -- --exact --ignored
+      - name: Resolve private music against the committed catalogue fixture
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_catalogue_ci
+        run: |
+          test_name='private_catalogue_read::postgres_tests::resolves_only_the_committed_scoped_publication'
+          args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests --lib "$test_name")
+          inventory="$(cargo test "${args[@]}" -- --list --exact)"
+          printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
+          cargo test "${args[@]}" -- --exact
       - name: Exercise listen history on disposable PostgreSQL
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci

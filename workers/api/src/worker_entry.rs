@@ -511,7 +511,7 @@ fn u32_of(v: i64) -> Result<u32, StoreError> {
 /// and the acquire-refusal path (which reads the surviving holder for
 /// the 429's `Retry-After`). More than one row is impossible (user PK)
 /// and errors rather than picking one.
-async fn query_playback_lease_row(
+pub(crate) async fn query_playback_lease_row(
     client: &impl PgQuery,
     user_id: &str,
 ) -> Result<Option<crate::playback::LeaseRow>, StoreError> {
