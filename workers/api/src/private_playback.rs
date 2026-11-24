@@ -242,14 +242,15 @@ impl PrivatePlayback<'_> {
                 version,
             };
             let current = async |db: &mut C| {
-                let found =
+                let Some(found) =
                     private_catalogue_read::resolve(db, expected, &pins, self.grant_secret, &now)
-                        .await?;
-                let active = authorized(db, policy, &receipt.session).await?;
+                        .await?
+                else {
+                    return Ok(None);
+                };
+                let active = found == *stored && authorized(db, policy, &receipt.session).await?;
                 Ok::<_, StoreError>(
-                    found
-                        .filter(|found| active && found == stored && now() < stored.grant_deadline)
-                        .map(|found| found.target),
+                    (active && now() < stored.grant_deadline).then_some(found.target),
                 )
             };
             let Some(target) = current(db).await? else {

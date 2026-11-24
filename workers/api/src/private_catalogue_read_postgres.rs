@@ -335,6 +335,8 @@ async fn resolves_only_the_committed_scoped_publication() {
     };
     let current = SystemTime::now();
     let expiry = UNIX_EPOCH + Duration::from_secs(issued.relay().grant.exp_unix);
+    let failed_transaction = reader.batch_execute("BEGIN; SELECT 1 / 0");
+    assert!(failed_transaction.await.is_err());
     for (admission, bearer, time) in [
         (configured, "invalid-bearer", current),
         (None, token.as_str(), current),
@@ -344,11 +346,12 @@ async fn resolves_only_the_committed_scoped_publication() {
             .await
             .is_none());
     }
+    reader.batch_execute("ROLLBACK").await.unwrap();
     let resolved = resolve(&mut reader, configured, token, current)
         .await
         .unwrap();
     assert_eq!(resolved.read.pins().media_version, original_pins.version);
-    for state in ["invite", "session", "rotation", "revision", "lease"] {
+    for state in ["invite", "session", "rotation", "revision", "race", "lease"] {
         writer
             .query_one(
                 "SELECT pg_temp.private_playback_state($1, $2, $3)",
@@ -356,16 +359,12 @@ async fn resolves_only_the_committed_scoped_publication() {
             )
             .await
             .unwrap();
-        assert!(
-            resolve(&mut reader, configured, token, current)
-                .await
-                .is_none(),
-            "{state}"
-        );
-        if matches!(state, "invite" | "session" | "rotation") {
+        if matches!(state, "invite" | "session" | "rotation" | "race") {
             assert!(issue(&mut reader, configured, session, &original_pins)
                 .await
                 .is_none());
         }
+        let playback = resolve(&mut reader, configured, token, current).await;
+        assert_eq!(playback.is_some(), state == "race", "{state}");
     }
 }
