@@ -222,8 +222,7 @@ attempted creation is uncertain. The caller stops without retry or deletion.
 
 The [baseline workflow](../.github/workflows/deploy-database-baseline.yml)
 shares setup's lock and uses its own `production-db-baseline` Environment.
-Apply the same protection and readback rules. Dispatch the approved main SHA
-with zero inputs. Preflight checks secret placement without a staging deploy.
+Apply setup's protection rules and dispatch the approved main SHA with zero inputs.
 The pending attempt requires `BASELINE_ENABLED=true`, `BASELINE_SHA`,
 `BASELINE_RUN_ID`, `BASELINE_EXPIRY`, `BASELINE_PLAN_B64`, `BASELINE_PLAN_DIGEST`
 and `BASELINE_READER_PASSWORD` in that Environment.
@@ -232,9 +231,9 @@ Remove them after use and verify reader retirement and session closure.
 The version 1 plan contains exactly `version`, `host`, `port`, `ca_pem`,
 `branch_id`, `launch`, `database_oid` and `reader_role`. Bind the independently
 verified database name and OID to the provider branch, primary endpoint and CA.
-A scoped SQL custodian supplies a reader with launch CONNECT, schema USAGE,
-direct SELECT on all physical relations and no write, ownership or role-switch
-path. Keep schema, grant and writer changes quiesced through the read.
+A scoped SQL custodian supplies launch CONNECT, schema USAGE and direct SELECT
+on all physical relations to a reader without application write grants,
+ownership or role-switch access. Quiesce schema, grants and writes through the read.
 
 One TLS-verified, read-only repeatable-read transaction checks primary status,
 name, OID, identity, permissions and row existence across at most 256 user

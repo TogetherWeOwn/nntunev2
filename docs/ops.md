@@ -1277,9 +1277,10 @@ Resolve preview exposure and inventory gaps before seeding. Keep one writer
 through readback, record the Worker, seed version and deployment, and close the window.
 
 Record the [database baseline](production-database-bootstrap.md#protected-baseline)
-attempt, target and migration manifest digest. On `empty`, verify the provider
-snapshot before the first schema change. On `rows-present`, rehearse the exact
-undo on a temporary restore from a fresh provider backup. Resolve any refusal.
+attempt, target and manifest digest. On `empty`, keep launch writes quiesced
+through snapshot verification and the first schema apply. If writes could have
+resumed, repeat the baseline before snapshotting. On `rows-present`, rehearse
+the exact undo on a temporary restore from a fresh backup. Resolve any refusal.
 
 To switch off, close admission and use protected rollback to restore the pinned
 maintenance allocation and close newly enabled API and media routes. Verify
