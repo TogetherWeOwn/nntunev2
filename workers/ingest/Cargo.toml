@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 cleanup-dispatch-wasm-test = []
+s3-completion-wasm-test = []
 
 [dependencies]
 worker = { version = "0.9", features = ["http", "queue", "tokio-postgres"] }
