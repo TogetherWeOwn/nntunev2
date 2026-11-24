@@ -590,6 +590,67 @@ pub async fn acquire_playback_lease_on(
     }
 }
 
+/// Share the same exclusive account fence with privacy toggles and deletion.
+pub(crate) async fn lock_playback_account(db: &impl PgQuery, user: &str) -> Result<bool, StoreError> {
+    db.query_typed_opt(
+        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
+        &[(&user, Type::TEXT)],
+    )
+    .await
+    .map(|row| row.is_some())
+    .map_err(|_| StoreError)
+}
+
+pub(crate) async fn playback_privacy_mark(
+    db: &impl PgQuery,
+    user: &str,
+    key: &str,
+) -> Result<bool, StoreError> {
+    db.query_typed_one(
+        crate::preference_rows::private_play_probe_statement(),
+        &[(&user, Type::TEXT), (&key, Type::TEXT)],
+    )
+    .await
+    .map_err(|_| StoreError)?
+    .try_get(0)
+    .map_err(|_| StoreError)
+}
+
+/// Call under the account lock and commit only together with the new lease.
+pub(crate) async fn classify_play_privacy(
+    db: &impl PgQuery,
+    user: &str,
+    tab: &str,
+    key: &str,
+    now: u64,
+) -> Result<bool, StoreError> {
+    let private: bool = db
+        .query_typed_one(
+            crate::preference_rows::private_session_active_statement(),
+            &[(&user, Type::TEXT), (&tab, Type::TEXT)],
+        )
+        .await
+        .map_err(|_| StoreError)?
+        .try_get(0)
+        .map_err(|_| StoreError)?;
+    if private {
+        db.query_typed_one(
+            crate::preference_rows::private_play_mark_statement(),
+            &[
+                (&user, Type::TEXT),
+                (&key, Type::TEXT),
+                (&i64_of(now)?, Type::INT8),
+            ],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+        if !playback_privacy_mark(db, user, key).await? {
+            return Err(StoreError);
+        }
+    }
+    Ok(private)
+}
+
 /// Durable-slot budgets are bounded: a zero limit/window admits
 /// nothing, and the slot scan is capped at
 /// [`crate::rate_limit::MAX_BUDGET_SLOTS`] (the largest in-tree
@@ -1137,55 +1198,10 @@ impl PgStore {
                 tx.set_local_statement_timeout(TOTAL_TIMEOUT_MS)
                     .await
                     .map_err(|_| StoreError)?;
-                if tx
-                    .query_typed(
-                        crate::account_deletion::PRIVATE_SESSION_ACCOUNT_FENCE_SQL,
-                        &[(&user_id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?
-                    .len()
-                    != 1
-                {
+                if !lock_playback_account(&tx, user_id).await? {
                     return Err(StoreError);
                 }
-                let rows = tx
-                    .query_typed(
-                        crate::preference_rows::private_session_active_statement(),
-                        &[(&user_id, Type::TEXT), (&session_id, Type::TEXT)],
-                    )
-                    .await
-                    .map_err(|_| StoreError)?;
-                if rows.len() != 1 {
-                    return Err(StoreError);
-                }
-                let private: bool = rows[0].try_get(0).map_err(|_| StoreError)?;
-                if private {
-                    let rows = tx
-                        .query_typed(
-                            crate::preference_rows::private_play_mark_statement(),
-                            &[
-                                (&user_id, Type::TEXT),
-                                (&key, Type::TEXT),
-                                (&i64_of(now)?, Type::INT8),
-                            ],
-                        )
-                        .await
-                        .map_err(|_| StoreError)?;
-                    if rows.len() != 1 {
-                        return Err(StoreError);
-                    }
-                    let rows = tx
-                        .query_typed(
-                            crate::preference_rows::private_play_probe_statement(),
-                            &[(&user_id, Type::TEXT), (&key, Type::TEXT)],
-                        )
-                        .await
-                        .map_err(|_| StoreError)?;
-                    if rows.len() != 1 || !rows[0].try_get::<_, bool>(0).map_err(|_| StoreError)? {
-                        return Err(StoreError);
-                    }
-                }
+                classify_play_privacy(&tx, user_id, session_id, &key, now).await?;
                 let result = acquire_playback_lease_on(
                     &tx,
                     user_id,
