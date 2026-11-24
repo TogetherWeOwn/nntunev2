@@ -43,3 +43,7 @@ SELECT p.id, r.track_id, r.position, true
 FROM public.playlists p
 JOIN pg_temp.legacy_resolution r ON r.playlist_id = p.id
 WHERE p.items ->> r.position = r.legacy_ref;
+
+-- Pin the existing dormant row's handle so Rust can assert the stored identity.
+UPDATE public.playlist_tracks SET id = '00000000-0000-0000-0000-000000000001'
+WHERE playlist_id = 9006 AND position = 1;

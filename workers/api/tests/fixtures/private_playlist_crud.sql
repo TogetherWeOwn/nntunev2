@@ -2,6 +2,7 @@
 -- `owner` must come from the authenticated principal, never the request body.
 CREATE SCHEMA private_playlist_rehearsal;
 SET LOCAL search_path = private_playlist_rehearsal, pg_catalog, pg_temp;
+CREATE TABLE marker AS SELECT gen_random_uuid()::text AS token;
 CREATE VIEW member_tracks AS
 SELECT l.user_id AS owner_id, lt.track_id FROM public.libraries l
 JOIN public.library_tracks lt ON lt.library_id = l.id WHERE l.deleting_at IS NULL;

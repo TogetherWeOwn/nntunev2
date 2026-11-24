@@ -17,6 +17,9 @@ async fn connect() -> Client {
         .await
         .unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
+    let marker = std::env::var("NNTUNE_TEST_PRIVATE_PLAYLIST_MARKER").expect("fixture marker");
+    let sql = "SELECT token FROM private_playlist_rehearsal.marker";
+    assert_eq!(db.query_one_scalar::<String, _>(sql, &[]).await.unwrap(), marker);
     db
 }
 
@@ -33,11 +36,8 @@ async fn postgres_store_rehearsal() {
     let other = "fixture-user-other";
     let clean_id = "plRepeatedRefs00000000";
     let unresolved = "plAllUnresolved0000000";
-    let create = Create("Draft playlist".into());
-    let created = run(&mut db, owner, create).await.unwrap();
+    let created = run(&mut db, owner, Create("Draft".into())).await.unwrap();
     let id = created["id"].as_str().unwrap();
-    let renamed = run(&mut db, owner, Rename(id, "Renamed".into())).await;
-    assert_eq!(renamed, Some(json!({"id": id, "name": "Renamed"})));
     let titles = ["new-track", "trkRpMiddle00000000000", "inactive-track",
         "trkFrAlpha000000000000", "trkRpRepeat00000000000"];
     let sql = "SELECT array_agg(id::text ORDER BY array_position($1, title)) FROM tracks WHERE title = ANY($1)";
@@ -72,10 +72,8 @@ async fn postgres_store_rehearsal() {
         assert_eq!(entries[i]["position"], i);
         assert_eq!(entries[i]["track_id"], repeat);
     }
-    let dormant = &entries[1];
-    assert_eq!(dormant["dormant"], true);
-    assert_eq!(dormant["position"], 1);
-    assert!(dormant["id"].is_string() && dormant.get("track_id").is_none());
+    let dormant_id = "00000000-0000-0000-0000-000000000001";
+    assert_eq!(entries[1], json!({"id": dormant_id, "position": 1, "dormant": true}));
     let (first, second) = tokio::join!(
         run(&mut db, owner, Append(id, track.clone())),
         run(&mut peer, owner, Append(id, track.clone()))
@@ -108,13 +106,13 @@ async fn postgres_store_rehearsal() {
     db.query_one(complete, &[&owner, &id]).await.unwrap();
     assert_eq!(run(&mut db, owner, Delete(id)).await, Some(deleted));
     assert!(run(&mut db, other, Delete(id)).await.is_none());
-
     let reject_op = "ALTER TABLE delete_operations ADD CHECK (scope <> 'playlist') NOT VALID";
     db.batch_execute(reject_op).await.unwrap();
     let h = harness();
     let email = "playlist-owner@example.com";
     seed_user(&h, owner, email);
     let cookie = Some(magic_login(&h, email));
+    let renamed = json_response(200, json!({"id": clean_id, "name": "Renamed"}));
     for (cookie, origin, cmd, header, size, expected) in [
         (None, ORIGIN, Delete(clean_id), None, 0, generic_auth()),
         (cookie.clone(), "https://wrong.example", Delete(clean_id), None, 0, generic_auth()),
@@ -125,6 +123,7 @@ async fn postgres_store_rehearsal() {
         (cookie.clone(), ORIGIN, Rename(clean_id, "bad\0name".into()), None, 0, invalid_request()),
         (cookie.clone(), ORIGIN, List(Some("bad".into()), 1), None, 0, invalid_request()),
         (cookie.clone(), ORIGIN, Append(clean_id, "bad".into()), None, 0, invalid_request()),
+        (cookie.clone(), ORIGIN, Rename(clean_id, " Renamed ".into()), None, 0, renamed),
         (cookie, ORIGIN, Delete(clean_id), None, 0, unavailable()),
     ] {
         let req = Request {
