@@ -1,6 +1,8 @@
 import { writable } from 'svelte/store';
 import { resolveStreamUrl } from '../library/stream-url.js';
-import { createQueue, currentTrack, type QueueState } from './queue.js';
+import type { SnapshotStorage } from '../library/cache.js';
+import { createLibraryQueuePersistence } from './libraryQueuePersistence.js';
+import { createQueue, currentTrack, type QueueState, type Track } from './queue.js';
 import { createQueueRevision } from './queueRevision.js';
 
 export type LibrarySources = ReadonlyMap<string, ReadonlySet<string>>;
@@ -21,6 +23,8 @@ export function createQueueController(initial: QueueState) {
 	let purging = false;
 	const revision = createQueueRevision();
 	const store = writable(initial);
+	const persistence = createLibraryQueuePersistence();
+	let libraryBinding: string | undefined;
 
 	function isCurrentOperation(receipt: number): boolean {
 		return alive && !purging && operation === receipt;
@@ -32,6 +36,15 @@ export function createQueueController(initial: QueueState) {
 		get purging() { return purging; },
 		get revision() { return revision.revision; },
 		subscribe: store.subscribe,
+		// The layout can outlive the route and its refresh receipts.
+		setLibraryBinding(binding: string): boolean {
+			const replaced = libraryBinding !== undefined && libraryBinding !== binding;
+			libraryBinding = binding;
+			return replaced;
+		},
+		restoreLibraryQueue: (storage: SnapshotStorage, catalogue: () => Track[]) =>
+			alive && !purging ? persistence.restore(storage, snapshot, catalogue) : null,
+		clearSavedLibraryQueue: persistence.clear,
 		begin(next: QueueState, kind: QueueCommitKind, withLibrary = false): number {
 			if (!alive || purging) return -1;
 			const queueChanged = kind !== 'replace' || next !== snapshot;
@@ -81,10 +94,13 @@ export function createQueueController(initial: QueueState) {
 			if (currentTrack(snapshot)?.id !== currentTrack(next)?.id) selectionGeneration++;
 			snapshot = next;
 			store.set(next);
+			if (isCurrentOperation(receipt)) persistence.save(next);
 		},
 		purgeAtAuthBoundary(retirePlayer: () => void): void {
 			if (!alive || purging) return;
 			purging = true;
+			libraryBinding = undefined;
+			persistence.clear();
 			operation += 1;
 			revision.revoke();
 			librarySources = new Map();

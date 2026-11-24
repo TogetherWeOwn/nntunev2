@@ -407,10 +407,19 @@
 				media.clearShareSeek();
 			}
 			if (!isCurrent()) return;
+			let restoredQueue = false;
 			if (authoritative && !authBoundary && !state.libraryUnavailable) {
-				player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
+				if (sessionBinding && queueController.setLibraryBinding(sessionBinding)) {
+					player.purgeAtAuthBoundary();
+					queueController.setLibraryBinding(sessionBinding);
+				}
+				const reconciled = player.reconcileLibrary(state.items, isCurrent, (queueChanged) => {
 					if (queueChanged) queueConfirmGeneration += 1;
 				});
+				if (reconciled && isCurrent() && receipt.deviceScope && receipt.storageScope) {
+					const restored = queueController.restoreLibraryQueue(receipt.storageScope, () => state.items.map(queuedTrackFor));
+					if (restored && isCurrent()) restoredQueue = replaceQueue(restored);
+				}
 			}
 			// Queue publication can reenter the route and revoke this receipt.
 			if (!isCurrent()) return;
@@ -446,7 +455,7 @@
 					recentFinds = loadRecentFinds(libraryStorage, browserStorage('local'));
 					recentFindsInitialized = true;
 				}
-				applyShareLink();
+				applyShareLink(restoredQueue);
 			} else if (!state.loading) currentFavoriteEdit++; // Retire feedback without invalidating pending writes.
 			if (!isCurrent()) return;
 			// Same-account refresh completion: the panel may have remounted
@@ -708,7 +717,7 @@
 		player.browseCopy.settle(generation, status, copied ? null : url);
 	}
 
-	function applyShareLink(): void {
+	function applyShareLink(restoredQueue = false): void {
 		// A failed/unavailable load cannot resolve a link against the library.
 		// Leave it unconsumed for Retry; auth resets still fence account changes.
 		if (typeof window === 'undefined' || !shareAlive || loading || loadError || libraryUnavailable) return;
@@ -736,7 +745,7 @@
 			shareInvalid = true;
 			return;
 		}
-		if (player.claimShareEntry?.() === false) return;
+		if (player.claimShareEntry?.(restoredQueue) === false) return;
 		// A newly consumed navigation must not inherit consent for the old arrangement.
 		queueConfirmGeneration += 1;
 		if (!selectTrack(target.trackId) || !inputIsCurrent()) return;
@@ -757,7 +766,7 @@
 	/**
 	 * Metadata-only direct selection: apply the validated selectTrack
 	 * transition on the ORIGINAL queue coordinate, preserving every track id
-	 * and arrangement. Never transport, audio, storage, provider or stream
+	 * and arrangement. Never transport, audio, provider or stream
 	 * language. Reselecting the current row is an observable no-op that keeps
 	 * the existing feedback; stale or invalid coordinates select nothing.
 	 */
