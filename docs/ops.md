@@ -1098,13 +1098,23 @@ and its receipt store, Stream runtime, and Library client are on the candidate.
 Before accepting the trial, verify a browser disconnect through the relay
 closes the upstream read and settles only the acknowledged byte prefix.
 For that drill only, set `PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION` to a
-fresh lowercase 32-hex trace, a colon, and the lowercase SHA-256 hex of the
-synthetic track ID. Send that trace as `x-trace-id` on the dedicated unbuffered
-relay request. Keep the protected tail in memory and retain only verdicts
-for that trace from `private_storage_read_started`,
-`private_storage_read_aborted`, and a separate `private_storage_read_completed`
-control. Compare the canceled play's committed settlement separately. Clear
-the observation variable before the disable deploy.
+fresh 16-byte random trace in lowercase hex, a colon, and the lowercase
+SHA-256 hex of the UTF-8 synthetic track ID. Use a fresh committed play and
+send the trace as `x-trace-id` on the dedicated unbuffered relay request.
+Read the first plaintext chunk and cancel while the paced synthetic origin
+still has ciphertext outstanding. The ordinary Playwright Access wrapper
+can buffer the response. Establish timing at the paced origin because tail
+events may arrive together after the request ends.
+
+Use read-only Stream tail access. Keep the provider payload in memory and
+retain only the event name and matching trace. Require `private_storage_read_started`
+then `private_storage_read_aborted` with no completion. In a separate
+unbuffered control, drain to EOF and require `private_storage_read_started`
+then `private_storage_read_completed` with no abort. Wait for the terminal
+event before reusing a trace, or configure a fresh one. Missing or ambiguous
+events are inconclusive. Verify the canceled play's committed settlement
+against the writer-acknowledged prefix independently. Clear the observation
+variable before the disable deploy.
 Retain the version ID, deployment ID, `BUILD_SHA` and playback mode from
 the Stream job summary alongside the browser run. To restore the default,
 keep `STREAM_STAGING_DEPLOY_ENABLED=true` for the next protected deploy.
