@@ -431,9 +431,9 @@ for (const [name, body, status = 200] of [
   });
 }
 
-test('refuses an unrelated checkpoint or provider before uploading the part', async (t) => {
+test('refuses an unrelated checkpoint, durable target, or provider before uploading the part', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('unexpected fetch'); });
-  for (const mode of ['part-other', 'part-context']) {
+  for (const mode of ['part-other', 'part-context', 'part-durable-id', 'part-durable-session']) {
     await assert.rejects(complete(mode), rejectedWith('InvalidRequest'));
   }
   await assert.rejects(complete('part-foreign'), rejectedWith(transportFailure));

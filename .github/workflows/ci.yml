@@ -889,10 +889,10 @@ jobs:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci
         run: |
           test_name='multipart::session_upload::tests::postgres_fences_the_provider_id_handoff'
-          args=(--locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name" -- --exact --ignored)
-          inventory="$(cargo test "${args[@]}" --list)"
+          args=(--locked --manifest-path workers/ingest/Cargo.toml --lib "$test_name")
+          inventory="$(cargo test "${args[@]}" -- --exact --ignored --list)"
           printf '%s\n' "$inventory" | grep -Fx "$test_name: test"
-          cargo test "${args[@]}"
+          cargo test "${args[@]}" -- --exact --ignored
       - name: Exercise listen history on disposable PostgreSQL
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
