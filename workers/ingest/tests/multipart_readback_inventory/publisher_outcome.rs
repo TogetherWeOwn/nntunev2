@@ -109,6 +109,7 @@ pub(super) async fn prove(
             .unwrap();
         let active: bool = observer.query_one(
             "SELECT terminal_reason IS NULL AND completed_map_id IS NULL AND write_lease_id = $2::text::uuid
+                    AND clock_timestamp() < idle_deadline
              FROM public.ingest_session_reservations WHERE id = $1::text::uuid",
             &[&sid, &lease],
         ).await.unwrap().get(0);
@@ -179,6 +180,28 @@ pub(super) async fn prove(
         )
         .await
         .unwrap();
+
+    // The winner INSERT follows inventory staging and the initial session check.
+    // Expire the session inside the savepoint just before the outcome write.
+    let mut tx = writer.transaction().await.unwrap();
+    tx.batch_execute(&format!(
+        "CREATE FUNCTION pg_temp.expire_upload_after_winner() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             UPDATE public.ingest_session_reservations SET idle_deadline = '-infinity' WHERE id = '{sid}';
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER expire_upload_after_winner AFTER INSERT ON public.storage_validated_digest_winners
+         FOR EACH ROW EXECUTE FUNCTION pg_temp.expire_upload_after_winner();"
+    )).await.unwrap();
+    assert_eq!(stage(&mut tx, &scope, lease).await, Err(Refused));
+    tx.batch_execute(
+        "DROP TRIGGER expire_upload_after_winner ON public.storage_validated_digest_winners;
+         DROP FUNCTION pg_temp.expire_upload_after_winner();",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    absent().await;
 
     let mut tx = writer.transaction().await.unwrap();
     stage(&mut tx, &scope, lease).await.unwrap();
