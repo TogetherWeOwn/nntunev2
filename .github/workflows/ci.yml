@@ -185,6 +185,21 @@ jobs:
       # verifies the native-only stampede guard remains cfg'd out.
       - run: cargo check -p nntune-stream --target wasm32-unknown-unknown
       - run: cargo clippy -p nntune-stream --target wasm32-unknown-unknown -- -D warnings
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Exercise version-pinned playback against disposable HTTPS
+        run: |
+          set -euo pipefail
+          bindgen=wasm-bindgen-0.2.129-x86_64-unknown-linux-musl
+          curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.129/$bindgen.tar.gz" -o "$RUNNER_TEMP/$bindgen.tar.gz"
+          echo "82d12bb940e2d4e72e0d5605387fc1b8ca179044e012b620f0ce4e7440e8320e  $RUNNER_TEMP/$bindgen.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$bindgen.tar.gz" -C "$RUNNER_TEMP"
+          cargo build --locked -p nntune-stream --target wasm32-unknown-unknown --features s3-transport-fixture
+          "$RUNNER_TEMP/$bindgen/wasm-bindgen" --target nodejs --out-dir "$RUNNER_TEMP/s3-fixture" target/wasm32-unknown-unknown/debug/nntune_stream.wasm
+          export NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/s3-fixture/loopback.crt" S3_FIXTURE_KEY="$RUNNER_TEMP/s3-fixture/loopback.key"
+          openssl req -x509 -newkey rsa:2048 -noenc -days 1 -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1 -keyout "$S3_FIXTURE_KEY" -out "$NODE_EXTRA_CA_CERTS"
+          S3_FIXTURE_WASM="$RUNNER_TEMP/s3-fixture/nntune_stream.js" node --test workers/stream/tests/fixtures/s3_transport_https.cjs
       # The YouTube measurement Worker entry (YtExtract Durable Object) only
       # compiles on wasm32: check and lint it on the target it deploys to.
       - run: cargo check -p nntune-youtube --target wasm32-unknown-unknown

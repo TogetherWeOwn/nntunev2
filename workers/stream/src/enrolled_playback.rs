@@ -21,6 +21,8 @@ use crate::{
 pub mod route;
 mod s3;
 pub use s3::{S3EnrolledPlayback, S3Get, S3GetReply};
+#[cfg(target_arch = "wasm32")]
+pub mod s3_transport;
 
 /// Independently resolved custody for that same committed root and lifecycle.
 pub struct EnrolledMedia<'a> {
