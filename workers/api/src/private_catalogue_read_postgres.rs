@@ -308,6 +308,11 @@ async fn resolves_only_the_committed_scoped_publication() {
     };
     assert!(issue(&mut reader, None, &original_pins).await.is_none());
     assert!(issue(&mut reader, Some(&cookie), &pins).await.is_none());
+    assert!(issue(&mut reader, Some(&cookie), &original_pins)
+        .await
+        .is_none());
+    let duration = include_str!("../tests/fixtures/private_playback_duration.sql");
+    writer.query_one(duration, &[&track]).await.unwrap();
     let issued = issue(&mut reader, Some(&cookie), &original_pins)
         .await
         .unwrap();
