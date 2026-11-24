@@ -227,11 +227,14 @@ pub(crate) async fn verify_publication(
     let entries: Vec<serde_json::Value> = serde_json::from_str(&listing.body).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["id"], track);
+    // The database clone already contains references from the reservation race fixture.
     let exact_reference = async || {
         observer.query_one(
             "SELECT count(*) = 1 AND bool_and((environment_id, library_id, reference_id, object_id)
                    = ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid))
-             FROM public.storage_validated_digest_references",
+             FROM public.storage_validated_digest_references
+             WHERE (environment_id, library_id) = ($1::text::uuid, $2::text::uuid)
+                OR reference_id = $3::text::uuid OR object_id = $4::text::uuid",
             &[&uuid_text(prepared.scope.environment), &uuid_text(prepared.scope.library),
               &track, &uuid_text(prepared.intent.identities[2])],
         ).await.unwrap().get::<_, bool>(0)
