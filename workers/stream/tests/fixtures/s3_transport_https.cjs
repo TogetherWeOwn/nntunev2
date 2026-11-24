@@ -17,7 +17,7 @@ const hook = registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const { make_s3_fixture } = require(process.env.S3_FIXTURE_WASM);
+const { make_s3_fixture, fetch: streamFetch } = require(process.env.S3_FIXTURE_WASM);
 hook.deregister();
 const path = '/fixture-media/media/00000000000040008000000000000003/00000000000040008000000000000004';
 const query = 'versionId=version%2B%2F%25%3F%3D%26';
@@ -187,4 +187,153 @@ test('versioned digest pages require exact complete response framing', { timeout
   const closed = new Promise(resolve => { fault = { closed: resolve }; });
   await assert.rejects(read(), error => error === 'storage read refused');
   await closed;
+});
+
+test('Stream fetch serves a pinned encrypted seek and settles only written bytes', { timeout: 10_000 }, async (t) => {
+  const fixture = make_s3_fixture();
+  const plaintext = Buffer.concat([Buffer.alloc(65_536, 'A'), Buffer.from('Z')]);
+  const expires = Math.floor(Date.now() / 1000) + 90;
+  const grantKey = 'fixture-only-play-grant-key-material';
+  const custodyKey = 'fixture-only-transport-authentication-key';
+  const play = 'private_1234567890abcdefghijkl';
+  const payload = Buffer.from(`member|track|${play}|42|${expires}|${hash(plaintext)}`).toString('base64url');
+  const signed = `v4.${payload}`;
+  const bearer = `${signed}.${mac(grantKey, signed).toString('base64url')}`;
+  const original = JSON.parse(fixture.custody(bearer, expires));
+  let snapshot = original;
+  let leaseNo = 0;
+  let revokeAt = Infinity;
+  let host;
+  let observedPageVersion = 'page+/%?=&';
+  const fetches = [];
+  const reports = [];
+  const server = createServer({
+    key: readFileSync(process.env.S3_FIXTURE_KEY),
+    cert: readFileSync(process.env.NODE_EXTRA_CA_CERTS),
+  }, (req, res) => {
+    const page = req.url.startsWith(pagePath);
+    verifyGet(req, host, page);
+    fetches.push(page ? 'page' : 'media');
+    const bytes = Buffer.from(page ? fixture.digest_page() : fixture.ciphertext());
+    const headers = { 'content-length': bytes.length, 'x-amz-version-id': page ? observedPageVersion : 'version+/%?=&' };
+    if (!page) headers['content-range'] = span;
+    res.writeHead(page ? 200 : 206, headers);
+    res.end(bytes);
+  });
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+    fixture.free();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  host = `127.0.0.1:${server.address().port}`;
+
+  const custody = [];
+  class Fetcher {
+    async fetch(req) {
+      const { origin, pathname } = new URL(req.url);
+      assert.equal(origin, 'https://nntune-api');
+      assert.equal(req.method, 'POST');
+      assert.equal(req.redirect, 'error');
+      assert.equal(await req.text(), bearer);
+      assert.equal(req.headers.get('authorization'),
+        `PlaybackCustody ${mac(custodyKey, `${pathname}\n${bearer}`).toString('hex')}`);
+      custody.push(pathname);
+      if (pathname.endsWith('/resolve')) return Response.json(snapshot);
+      return new Response(null, { status: ++leaseNo >= revokeAt ? 404 : 204 });
+    }
+  }
+  class DurableObjectNamespace {
+    idFromName(user) { assert.equal(user, 'member'); return {}; }
+    get() {
+      return { fetch: async req => {
+        assert.equal(req.url, 'https://nntp-pool/delivered');
+        reports.push(await req.json());
+        return new Response(null, { status: 202 });
+      } };
+    }
+  }
+  // Preserve backpressure and reject writes that violate the declared length.
+  globalThis.FixedLengthStream = class FixedLengthStream extends TransformStream {
+    constructor(len) {
+      let count = 0;
+      super({
+        transform(chunk, controller) {
+          count += chunk.length;
+          assert.ok(count <= len);
+          controller.enqueue(chunk);
+        },
+        flush() { assert.equal(count, len); },
+      });
+    }
+  };
+  t.after(() => { delete globalThis.FixedLengthStream; });
+  const env = {
+    API: new Fetcher(),
+    NNTP_POOL: new DurableObjectNamespace(),
+    PLAY_GRANT_SECRET: grantKey,
+    PRIVATE_PLAYBACK_ENABLED: 'true',
+    PRIVATE_PLAYBACK_S3_CONFIGURATION: '00000000-0000-4000-8000-000000000005',
+    PRIVATE_PLAYBACK_S3_BUCKET: 'fixture-media',
+    PRIVATE_PLAYBACK_S3_ENDPOINT: `https://${host}`,
+    PRIVATE_PLAYBACK_S3_REGION: 'fixture-1',
+    PRIVATE_PLAYBACK_ROOT_VERSION: '00000000-0000-4000-8000-000000000007',
+    PRIVATE_PLAYBACK_ROOT_KEY: '07'.repeat(32),
+    PRIVATE_PLAYBACK_CUSTODY_SECRET: custodyKey,
+    PRIVATE_PLAYBACK_S3_ACCESS_KEY_ID: 'FixtureAccess',
+    PRIVATE_PLAYBACK_S3_SECRET_ACCESS_KEY: 'fixture-reader-signing-material',
+  };
+  async function request(overrides = {}, suffix = '/play/track', token = bearer) {
+    const pending = [];
+    const req = new Request(`https://stream.test${suffix}`, {
+      headers: { authorization: `Bearer ${token}`, range: 'bytes=65536-65536' },
+    });
+    const response = await streamFetch(req, { ...env, ...overrides }, { waitUntil: p => pending.push(p) });
+    const bytes = Buffer.from(await response.arrayBuffer());
+    await Promise.all(pending);
+    return { response, bytes };
+  }
+
+  const { response, bytes } = await request();
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get('content-range'), 'bytes 65536-65536/65537');
+  assert.equal(response.headers.get('cache-control'), 'private, no-store');
+  assert.deepEqual(bytes, plaintext.subarray(65_536));
+  assert.deepEqual(fetches, ['media', 'page']);
+  assert.deepEqual(custody, ['resolve', 'lease', 'lease'].map(x => `/internal/v1/private-playback/${x}`));
+  assert.deepEqual(reports, [{ user_id: 'member', play_id: play, track_id: 'track', start: 65_536, end: 65_537, file_bytes: 65_537 }]);
+
+  const status = async (overrides, suffix, token) => (await request(overrides, suffix, token)).response.status;
+  assert.equal(await status({}, '/health'), 404);
+  assert.equal(await status({}, '/play/other'), 403);
+  assert.equal(await status({}, '/play/track', 'v4.invalid'), 401);
+  for (const binding of Object.keys(env).filter(x => x.startsWith('PRIVATE_PLAYBACK_')).concat('API', 'NNTP_POOL')) {
+    assert.equal(await status({ [binding]: undefined }), 404, binding);
+  }
+  assert.equal(await status({ PRIVATE_PLAYBACK_ENABLED: 'false' }), 404);
+  assert.equal(custody.length, 3);
+  for (const mismatch of [
+    { bearer_sha256: Array(32).fill(0) },
+    { catalogue_reference: Array(16).fill(0) },
+    { bucket: 'other-media' },
+    { envelope_record: original.envelope_record.map((x, i) => i === 229 ? x ^ 1 : x) },
+  ]) {
+    snapshot = { ...original, ...mismatch };
+    assert.equal(await status(), 404);
+  }
+  snapshot = original;
+  assert.equal(await status({ PRIVATE_PLAYBACK_ROOT_KEY: '08'.repeat(32) }), 404);
+  assert.equal(await status({ PRIVATE_PLAYBACK_S3_CONFIGURATION: '00000000-0000-4000-8000-000000000008' }), 404);
+  revokeAt = leaseNo + 1;
+  assert.equal(await status(), 404);
+  assert.equal(fetches.length, 2);
+  revokeAt = leaseNo + 2;
+  assert.equal(await status(), 404);
+  assert.equal(fetches.length, 4);
+  revokeAt = Infinity;
+  observedPageVersion = 'wrong-version';
+  assert.equal(await status(), 502);
+  assert.equal(fetches.length, 6);
+  assert.equal(reports.length, 1);
 });
