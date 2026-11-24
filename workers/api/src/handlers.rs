@@ -13047,6 +13047,27 @@ mod tests {
         };
         let portal = |cookie| request("/v1/billing/portal", "POST", cookie);
         let authenticated_portal = || portal(Some(cookie.clone()));
+        for (plan_id, price_id) in [("free", "price_free"), ("pro-5x", "price_retired")] {
+            h.store
+                .billing_bindings
+                .borrow_mut()
+                .push(crate::billing_reconcile::PriceBinding {
+                    plan_id: plan_id.into(),
+                    price_id: price_id.into(),
+                    selectable: true,
+                    livemode: false,
+                });
+            let response = h.call_full(
+                "POST",
+                "/v1/billing/checkout",
+                Some(serde_json::json!({"planId": plan_id}).to_string()),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(response.status, 400);
+        }
+        assert!(h.stripe.customers_created.borrow().is_empty());
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
         assert_eq!(portal(None).status, 401);
         assert_eq!(authenticated_portal().status, 409);
         deliver_first_period(&h, "evt_portal");
