@@ -1,11 +1,9 @@
-"""Rehearse registration and application of the pending app migration."""
+"""Rehearse the registered upload migration on fresh and populated databases."""
 
 from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
-import shutil
-from tempfile import TemporaryDirectory
 import unittest
 
 import apply_migration as migrator
@@ -105,59 +103,55 @@ class UploadMigrationTests(unittest.TestCase):
                  .replace("-- worker statements", "\n".join(wrappers)))
 
     def test_fresh_app_and_populated_upgrade(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            shutil.copytree(ROOT / "migrations", root / "migrations")
-            manifest = root / "migrations/manifest.toml"
-            entries = migrator.load_manifest(manifest)
-            app_files = [entry["file"] for entry in entries if entry["target"] == "app"]
-            number = int(entries[-1]["file"].split("_", 1)[0]) + 1
-            filename = f"{number:04d}_ingest_sessions.sql"
-            contents = (API_SQL / "ingest_session_schema.sql").read_bytes()
-            checksum = hashlib.sha256(contents).hexdigest()
-            (manifest.parent / filename).write_bytes(contents)
-            with manifest.open("a", encoding="utf-8") as f:
-                f.write(f'\n[[migration]]\nfile = "{filename}"\ntarget = "app"\n'
-                        f'sha256 = "{checksum}"\n')
-            self.assertEqual(migrations_gate.check_manifest(root), 0)
-            receipt = f"FROM public.schema_migrations WHERE file = '{filename}'"
+        manifest = ROOT / "migrations/manifest.toml"
+        entries = migrator.load_manifest(manifest)
+        app_files = [entry["file"] for entry in entries if entry["target"] == "app"]
+        filename = "0062_ingest_sessions.sql"
+        earlier = app_files[:app_files.index(filename)]
+        contents = (manifest.parent / filename).read_bytes()
+        # This registration adds a new migration. Keep the former fixture
+        # source byte-identical until its removal can land separately.
+        self.assertEqual(contents, (API_SQL / "ingest_session_schema.sql").read_bytes())
+        checksum = hashlib.sha256(contents).hexdigest()
+        self.assertEqual(migrations_gate.check_manifest(ROOT), 0)
+        receipt = f"FROM public.schema_migrations WHERE file = '{filename}'"
 
-            for mode in ("fresh", "upgrade"):
-                with self.subTest(mode=mode), scratch_database(ENV, f"nntune_upload_{mode}") as db:
-                    migrator.psql(db, migrator.ddl_sql(db["PGDATABASE"]), single_transaction=True)
-                    for prior in app_files[:-1]:
-                        self.apply(db, prior, manifest)
-                    with self.assertRaisesRegex(migrator.ApplyError, "earlier same-target migration"):
+        for mode in ("fresh", "upgrade"):
+            with self.subTest(mode=mode), scratch_database(ENV, f"nntune_upload_{mode}") as db:
+                migrator.psql(db, migrator.ddl_sql(db["PGDATABASE"]), single_transaction=True)
+                for prior in earlier[:-1]:
+                    self.apply(db, prior, manifest)
+                with self.assertRaisesRegex(migrator.ApplyError, "earlier same-target migration"):
+                    self.apply(db, filename, manifest)
+                self.assertEqual(run_psql(db, NO_TABLES), "t")
+                self.apply(db, earlier[-1], manifest)
+                run_psql(db, DEFAULT_ACL)
+                if mode == "upgrade":
+                    run_psql(db, SEED)
+                    before = run_psql(db, OLD_ROWS)
+                    self.assertTrue(before)
+                    # Fail the receipt INSERT after the candidate DDL ran.
+                    run_psql(db, "ALTER TABLE public.schema_migrations ADD CONSTRAINT "
+                             f"fixture_refuse_receipt CHECK (file <> '{filename}');")
+                    with self.assertRaisesRegex(migrator.ApplyError, "psql failed"):
                         self.apply(db, filename, manifest)
                     self.assertEqual(run_psql(db, NO_TABLES), "t")
-                    self.apply(db, app_files[-1], manifest)
-                    run_psql(db, DEFAULT_ACL)
-                    if mode == "upgrade":
-                        run_psql(db, SEED)
-                        before = run_psql(db, OLD_ROWS)
-                        self.assertTrue(before)
-                        # Fail the receipt INSERT after the candidate DDL ran.
-                        run_psql(db, "ALTER TABLE public.schema_migrations ADD CONSTRAINT "
-                                 f"fixture_refuse_receipt CHECK (file <> '{filename}');")
-                        with self.assertRaisesRegex(migrator.ApplyError, "psql failed"):
-                            self.apply(db, filename, manifest)
-                        self.assertEqual(run_psql(db, NO_TABLES), "t")
-                        self.assertEqual(run_psql(db, f"SELECT count(*) {receipt};"), "0")
-                        self.assertEqual(run_psql(db, OLD_ROWS), before)
-                        run_psql(db, "ALTER TABLE public.schema_migrations "
-                                 "DROP CONSTRAINT fixture_refuse_receipt;")
+                    self.assertEqual(run_psql(db, f"SELECT count(*) {receipt};"), "0")
+                    self.assertEqual(run_psql(db, OLD_ROWS), before)
+                    run_psql(db, "ALTER TABLE public.schema_migrations "
+                             "DROP CONSTRAINT fixture_refuse_receipt;")
+                self.apply(db, filename, manifest)
+                self.assertEqual(run_psql(db, f"SELECT sha256 {receipt};"), checksum)
+                if mode == "upgrade":
+                    self.assertEqual(run_psql(db, OLD_ROWS), before)
+                else:
+                    run_psql(db, SEED)
+                self.check_scoped_calls(db)
+                with self.assertRaises(migrator._AlreadyRecorded) as replay:
                     self.apply(db, filename, manifest)
-                    self.assertEqual(run_psql(db, f"SELECT sha256 {receipt};"), checksum)
-                    if mode == "upgrade":
-                        self.assertEqual(run_psql(db, OLD_ROWS), before)
-                    else:
-                        run_psql(db, SEED)
-                    self.check_scoped_calls(db)
-                    with self.assertRaises(migrator._AlreadyRecorded) as replay:
-                        self.apply(db, filename, manifest)
-                    self.assertTrue(replay.exception.same)
-                    self.assertEqual(run_psql(db, f"SELECT sha256 {receipt};"), checksum)
-                    print(f"upload session migration: {mode} passed", flush=True)
+                self.assertTrue(replay.exception.same)
+                self.assertEqual(run_psql(db, f"SELECT sha256 {receipt};"), checksum)
+                print(f"upload session migration: {mode} passed", flush=True)
 
 
 if __name__ == "__main__":

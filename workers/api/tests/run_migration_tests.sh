@@ -49,8 +49,10 @@ replay_migrations() {
   for f in "$@"; do
     # 0006 has an unconditional ADD COLUMN. The 0021 seed names
     # columns and a table that 0026 drops. Do not edit applied files.
+    # 0062 refuses pre-existing tables. Its hosted rehearsal tests replay
+    # through the migration ledger.
     case "${f##*/}" in
-      0006_account_deletion.sql|0021_billing_schema.sql) continue ;;
+      0006_account_deletion.sql|0021_billing_schema.sql|0062_ingest_sessions.sql) continue ;;
     esac
     psql_run -f "$f"
   done

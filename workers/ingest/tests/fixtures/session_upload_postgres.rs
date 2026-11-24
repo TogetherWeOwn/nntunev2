@@ -85,10 +85,6 @@ async fn postgres_fences_the_provider_id_handoff() {
     let observer = connect().await;
     let mut writer = connect().await;
     let mut contender = connect().await;
-    observer
-        .batch_execute(include_str!("../../../api/src/ingest_session_schema.sql"))
-        .await
-        .unwrap();
     for (signature, returns, sql) in [
         (
             "reserve(uuid, uuid, text, text, bytea, uuid)",
@@ -427,10 +423,16 @@ async fn postgres_fences_the_provider_id_handoff() {
         Err(Refused)
     ));
     observer
-        .batch_execute(
-            "DROP TABLE public.ingest_session_cleanup_intents, public.ingest_session_reservations;
-         DROP FUNCTION public.fixture_stop_id_commit();",
-        )
+        .batch_execute(&format!(
+            "BEGIN;
+             DROP TRIGGER fixture_stop_id_commit ON public.ingest_session_reservations;
+             DROP FUNCTION public.fixture_stop_id_commit();
+             DELETE FROM public.ingest_session_cleanup_intents
+             WHERE session_id IN ('{session}', '{other_session}', '{interrupted}');
+             DELETE FROM public.ingest_session_reservations
+             WHERE id IN ('{session}', '{other_session}', '{interrupted}');
+             COMMIT;"
+        ))
         .await
         .unwrap();
 }

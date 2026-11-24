@@ -68,10 +68,6 @@ async fn postgres_reconciles_a_lost_initiation() {
     );
     let mut writer = connect().await;
     let observer = connect().await;
-    observer
-        .batch_execute(include_str!("../../../api/src/ingest_session_schema.sql"))
-        .await
-        .unwrap();
     let mut identities = [[0; 16]; 6];
     for identity in &mut identities {
         *identity = observer
@@ -412,9 +408,12 @@ async fn postgres_reconciles_a_lost_initiation() {
     assert_eq!((state.get::<_, i64>(0), state.get::<_, i64>(1)), (0, 0));
     assert!((2..5).all(|index| state.get::<_, bool>(index)));
     observer
-        .batch_execute(
-            "DROP TABLE public.ingest_session_cleanup_intents, public.ingest_session_reservations",
-        )
+        .batch_execute(&format!(
+            "BEGIN;
+             DELETE FROM public.ingest_session_cleanup_intents WHERE session_id = '{session}';
+             DELETE FROM public.ingest_session_reservations WHERE id = '{session}';
+             COMMIT;"
+        ))
         .await
         .unwrap();
 }
