@@ -359,6 +359,16 @@ async fn resolves_only_the_committed_scoped_publication() {
         .await
         .unwrap();
     assert_eq!(resolved.read.pins().media_version, original_pins.version);
+    browser_cases::receipt_retries(
+        &mut reader,
+        &writer,
+        &service(configured),
+        &claims,
+        &issued,
+        &original_pins,
+        root.version,
+    )
+    .await;
     for state in ["invite", "session", "rotation", "revision", "race", "lease"] {
         writer
             .query_one(
@@ -376,3 +386,6 @@ async fn resolves_only_the_committed_scoped_publication() {
         assert_eq!(playback.is_some(), state == "race", "{state}");
     }
 }
+
+#[path = "../tests/fixtures/private_browser_receipt_postgres.rs"]
+mod browser_cases;
