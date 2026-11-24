@@ -27,7 +27,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         _ => "https://fixture.test:8443",
     };
     let sender = S3CompletionSender::new(
-        if mode == "foreign" {
+        if mode == "foreign" || mode == "part-foreign" {
             id(8)
         } else {
             configuration
@@ -75,8 +75,24 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         digest: Sha256::digest(bytes).into(),
     }];
     let binding = ResumeBinding {
-        plan,
-        configuration,
+        plan: if mode == "part-other" {
+            Plan::new(
+                UploadTarget {
+                    upload_id: "other",
+                    ..target
+                },
+                sealer.header(),
+                1,
+            )
+            .unwrap()
+        } else {
+            plan
+        },
+        configuration: if mode == "part-context" {
+            id(8)
+        } else {
+            configuration
+        },
         environment: &environment,
         library: &library,
         session: "fixture-session",
@@ -84,19 +100,27 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         generation: &generation,
         envelope_scheme: 2,
     };
+    let budget = match mode.as_str() {
+        "deadline" => 200,
+        "expired" => 0,
+        _ => 2000,
+    };
+    let until = now() + Duration::from_millis(budget);
+    if mode.starts_with("part") {
+        let uploaded = sender
+            .put_part(binding, &context, &part, until)
+            .await
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+        return Ok(uploaded.etag);
+    }
     let checkpoint = ResumeCheckpoint {
         binding,
         parts: &parts,
     };
     let completion =
         SessionCompletion::prepare(binding, &context, vec![receipt], &checkpoint).unwrap();
-    let budget = match mode.as_str() {
-        "deadline" => 200,
-        "expired" => 0,
-        _ => 2000,
-    };
     let completed = sender
-        .complete(completion, now() + Duration::from_millis(budget))
+        .complete(completion, until)
         .await
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     let S3Binding::VersionId(version) = completed.metadata().locator().binding() else {
