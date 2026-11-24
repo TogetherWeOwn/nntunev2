@@ -90,9 +90,9 @@ on `main`.
    An accepted rollback pointer and successful restore run are still outstanding
    in this readout.
 
-M1 exit remains open. The [current production preflight](../.github/workflows/deploy-production.yml#L128)
-accepts only `bootstrap-maintenance` and refuses application promotion even
-when the lane is enabled. The staging-evidence gate applies to both
+M1 exit remains open. The [production workflow](../.github/workflows/deploy-production.yml)
+allows `bootstrap-maintenance` and [protected Worker recovery](ops.md#protected-production-worker-recovery).
+Application promotion remains disabled even when the lane is enabled. The staging-evidence gate applies to both
 maintenance bootstrap and application promotion. It requires the full
 passing journey and an [attempt-bound candidate admission receipt](../ci/staging-admission.md).
 The [admission policy](../ci/staging-admission-policy.json) has no approvals.

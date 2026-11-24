@@ -1230,20 +1230,20 @@ cannot stop a concurrent provider write between the empty read and deployment.
 
 The production lane refuses any production vars beyond `name` in
 `[env.production]` before uploading a version. The gate step
-(`.github/workflows/deploy-production.yml:233-241`) runs
+(`.github/workflows/deploy-production.yml:325-333`) runs
 `node ci/check-production-secrets-shape.mjs`, which enforces the offline
 policy in `ci/check-production-secrets-shape.mjs:1-7`: the web Worker ships
 no bindings and needs no secrets, so its production env table must carry
 only `name` (current state: `apps/web/wrangler.toml:31-32`). It runs in the
 `deploy-production` job after that job checks out the validated promotion
-SHA (`.github/workflows/deploy-production.yml:210-214`), not in preflight
+SHA (`.github/workflows/deploy-production.yml:295-299`), not in preflight
 (preflight checks out the dispatch tip,
-`.github/workflows/deploy-production.yml:84-86`). It is an offline
+`.github/workflows/deploy-production.yml:97-99`). It is an offline
 shape check — no credentials, no network — that reads key names only and
 never reads or prints values
 (`ci/check-production-secrets-shape.mjs:6-7`).
 
-### First-release recovery after failed final smoke
+### Protected production Worker recovery
 
 App promotion stays disabled. Before first release, verify empty production
 state with a read-only check, take a snapshot before the first schema change,
@@ -1259,14 +1259,27 @@ and `private_routes_frozen` only after verifying and freezing all Worker,
 route, DNS and Access writers through readback. The job verifies the Worker
 and preview settings and seals the intent before traffic shifts. Custody
 evidence must be at most 30 minutes old when sealing. Keep the freeze in
-place through recovery readback even if final smoke runs past that window.
+place through the health watch and any recovery readback, even after the
+freshness window for sealing has elapsed.
 The maintenance module digest must also match the reviewed candidate checkout.
+For a later release, supply `previous` in place of `maintenance` with the
+verified prior `version`, `deployment`, `sha`, and full upload `tag`.
+Sealing requires the immutable prior version at 100% and passing build smoke.
 
-Failed final smoke keeps the release red. The same lock covers recovery, which
-requires the exact final deployment and submits maintenance at 100% once.
-On ambiguity reconcile Worker, allocation, routes and provider audit before
-any further action. Verify maintenance behavior and private Access denials on
-the isolated candidate. Post-watch and cancellation need separate admission.
+Failed final smoke keeps the release red and invokes the existing same-job
+restore. During the required 30-minute watch, dispatch `recover-worker` on
+`main` on regression or if promotion was interrupted at 100%. Supply the
+original promoted `sha` and `recovery_run_id` (attempt 1). Keep the original
+custody, intent key and accepted SHA in `production` through the watch.
+Recovery requires Environment approval and the shared mutation lock, including
+when new deployments are disabled.
+
+Recovery authenticates the terminal source attempt and its sealed intent and
+requires its 5%, 50%, and 100% sequence at the head of the live history. It
+restores the recorded target at 100% and verifies readback. Re-entry checks the
+result without repeating a possible submission. If readback is inconclusive,
+reconcile the Worker, allocation, routes, and provider audit. Verify restored
+build health and identity, or maintenance behavior and private Access denials.
 
 ### First private release handoff
 
@@ -1319,7 +1332,7 @@ requires independent release approval. A push to `main` deploys to the
   a card link, never dismissed.
 - [ ] Secret-shape gate: the promotion run's `Require production Worker
   secret shape before upload` step passed on the promotion SHA
-  (`.github/workflows/deploy-production.yml:233-241` runs
+  (`.github/workflows/deploy-production.yml:325-333` runs
   `ci/check-production-secrets-shape.mjs`, which refuses any
   `[env.production]` table beyond `name`). Same-checker CI coverage
   (`.github/workflows/ci.yml:824-842`) is not promotion evidence on its

@@ -10,7 +10,7 @@ MAX_ARCHIVE = 64 * 1024
 MAX_RECEIPT = 4096
 
 
-def read_receipt(data):
+def read_receipt(data, *, sealed=False):
     if not data or len(data) > MAX_ARCHIVE:
         raise ValueError("archive size outside bounds")
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -19,9 +19,10 @@ def read_receipt(data):
             raise ValueError("expected exactly one receipt")
         entry = entries[0]
         mode = entry.external_attr >> 16
+        name = "production-rollback-intent.sealed" if sealed else "promotion.json"
         if (
-            entry.filename != "promotion.json"
-            or entry.orig_filename != "promotion.json"
+            entry.filename != name
+            or entry.orig_filename != name
             or entry.is_dir()
             or (stat.S_IFMT(mode) not in (0, stat.S_IFREG))
             or entry.flag_bits & 1
@@ -35,13 +36,16 @@ def read_receipt(data):
             data = member.read(MAX_RECEIPT + 1)
         if len(data) != entry.file_size or len(data) > MAX_RECEIPT:
             raise ValueError("receipt length mismatch")
-        data.decode("utf-8", errors="strict")
+        if not sealed:
+            data.decode("utf-8", errors="strict")
         return data
 
 
 if __name__ == "__main__":
     try:
-        sys.stdout.buffer.write(read_receipt(sys.stdin.buffer.read(MAX_ARCHIVE + 1)))
+        if sys.argv[1:] not in ([], ["--sealed-rollback-intent"]):
+            raise ValueError("unknown archive format")
+        sys.stdout.buffer.write(read_receipt(sys.stdin.buffer.read(MAX_ARCHIVE + 1), sealed=bool(sys.argv[1:])))
     except (ValueError, OSError, RuntimeError, EOFError, zipfile.BadZipFile, NotImplementedError):
         sys.stderr.write("invalid promotion receipt archive\n")
         sys.exit(1)

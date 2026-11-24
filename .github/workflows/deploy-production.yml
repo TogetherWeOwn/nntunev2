@@ -3,9 +3,9 @@ name: deploy-production
 # Production promotion for the web frontend (apps/web only).
 #
 # Manual only; never runs on push, PR, release, or another workflow.
-# Disabled by default: the preflight job refuses unless the repo variable
-# PRODUCTION_DEPLOY_ENABLED is exactly "true". The production hostname is
-# decided at launch; until then the workflow builds against the placeholder
+# New deployments require PRODUCTION_DEPLOY_ENABLED to be exactly "true".
+# Recovery requires production approval and the mutation lock. The production
+# hostname is decided at launch; until then builds use the placeholder
 # domain below and refuses to promote to it. Backend Workers (api, ingest,
 # mb, stream, repair) each add their own lane as follow-ups; the reserved
 # production data-plane bindings stay untouched by this lane (see docs/ops.md
@@ -52,15 +52,19 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: "Full 40-hex main commit to deploy (explicit; empty refuses)"
+        description: "Full 40-hex main commit to deploy or recover from"
         required: false
         type: string
         default: ""
       mode:
-        description: "Seed unexposed maintenance (app promotion is disabled)"
+        description: "Seed unexposed maintenance or recover a recorded rollout (app promotion is disabled)"
         type: choice
-        options: [promote, bootstrap-maintenance]
+        options: [promote, bootstrap-maintenance, recover-worker]
         default: promote
+      recovery_run_id:
+        description: "Original promotion run ID for recover-worker (attempt 1)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -98,6 +102,7 @@ jobs:
         env:
           INPUT_SHA: ${{ inputs.sha }}
           DEPLOY_MODE: ${{ inputs.mode }}
+          RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
           PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
           PRODUCTION_DOMAIN: ${{ vars.PRODUCTION_DOMAIN }}
           UNPROTECTED_ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
@@ -109,7 +114,7 @@ jobs:
             echo '::error::Dispatch on main; PRODUCTION_ACCEPTED_SHA must exist only in the production Environment'
             exit 1
           fi
-          if [ "${PRODUCTION_DEPLOY_ENABLED:-}" != "true" ]; then
+          if [ "$DEPLOY_MODE" != recover-worker ] && [ "${PRODUCTION_DEPLOY_ENABLED:-}" != "true" ]; then
             echo "::error::Production lane disabled: repo variable PRODUCTION_DEPLOY_ENABLED must be exactly true"
             exit 1
           fi
@@ -125,17 +130,30 @@ jobs:
           case "$domain" in
             *[!a-zA-Z0-9.-]*) echo '::error::PRODUCTION_DOMAIN must be a bare hostname'; exit 1;;
           esac
-          [ "$DEPLOY_MODE" = bootstrap-maintenance ] ||
-            { echo '::error::Application promotion is disabled; only bootstrap-maintenance is supported'; exit 1; }
-          [ "$INPUT_SHA" = "${GITHUB_SHA:-}" ] ||
-            { echo '::error::Bootstrap SHA must match the dispatched main commit'; exit 1; }
           [ -z "${UNPROTECTED_WORKER_ID:-}${UNPROTECTED_ROUTE_PROOF:-}" ] ||
             { echo '::error::Worker ID and route proof must exist only in the production Environment'; exit 1; }
+          if [ "$DEPLOY_MODE" = recover-worker ]; then
+            [[ "${RECOVERY_RUN_ID:-}" =~ ^[1-9][0-9]{0,15}$ && "$GITHUB_RUN_ATTEMPT" == 1 ]] ||
+              { echo '::error::Recovery requires an original run ID and a fresh dispatch'; exit 1; }
+          else
+            [ "$DEPLOY_MODE" = bootstrap-maintenance ] ||
+              { echo '::error::Application promotion is disabled'; exit 1; }
+            [ "$INPUT_SHA" = "${GITHUB_SHA:-}" ] ||
+              { echo '::error::Bootstrap SHA must match the dispatched main commit'; exit 1; }
+          fi
           echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
           echo "domain=$domain" >> "$GITHUB_OUTPUT"
+      - name: Require production-only recovery configuration
+        if: inputs.mode == 'recover-worker'
+        env:
+          UNPROTECTED_CONFIG: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN != '' || secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' || secrets.PRODUCTION_ROLLBACK_CUSTODY != '' || secrets.PRODUCTION_ROLLBACK_INTENT_KEY != '' }}
+        run: |
+          test "$UNPROTECTED_CONFIG" = false ||
+            { echo '::error::Recovery configuration must exist only in the production Environment'; exit 1; }
 
   staging-evidence:
     name: staging-evidence
+    if: inputs.mode != 'recover-worker'
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -250,7 +268,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # One static non-cancelling group serializes production Worker
-    # mutations (promotion and any future rollback lane share it).
+    # mutations (promotion, bootstrap and recovery share it).
     concurrency:
       group: production-worker-mutation
       cancel-in-progress: false
@@ -313,7 +331,7 @@ jobs:
         # out the dispatch tip, while this job checked out the validated
         # promotion SHA above.
         run: node ci/check-production-secrets-shape.mjs
-      - name: Require verified private maintenance before upload
+      - name: Require verified private rollback target before upload
         env: &rollback-env
           CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
@@ -521,6 +539,58 @@ jobs:
           ROUTE_PROOF: ${{ vars.PRODUCTION_BOOTSTRAP_ROUTE_PROOF }}
           DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
         run: node ci/production-maintenance/seed.mjs
+
+  recover-worker:
+    name: recover-worker
+    if: inputs.mode == 'recover-worker'
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: production-worker-mutation
+      cancel-in-progress: false
+    environment: production
+    env:
+      DEPLOY_SHA: ${{ needs.preflight.outputs.sha }}
+      RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Verify the original protected rollout and load its sealed intent
+        id: source
+        env:
+          ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+          GH_TOKEN: ${{ github.token }}
+        run: node ci/production-maintenance/final-smoke-rollback.mjs admit-recovery
+      - name: Reserve one recovery submission across runners
+        id: claim
+        if: steps.source.outputs.allow-submit == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.source.outputs.claim-name }}
+          path: ${{ runner.temp }}/production-rollback-intent.sealed
+          if-no-files-found: error
+          retention-days: 30
+      - name: Restore or verify the recorded allocation
+        env:
+          ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.PRODUCTION_CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_ID: ${{ vars.PRODUCTION_WORKER_ID }}
+          ROLLBACK_CUSTODY: ${{ secrets.PRODUCTION_ROLLBACK_CUSTODY }}
+          INTENT_KEY: ${{ secrets.PRODUCTION_ROLLBACK_INTENT_KEY }}
+          DOMAIN: ${{ needs.preflight.outputs.domain }}
+          CLAIM_VERIFIED: ${{ steps.claim.outcome == 'success' }}
+        run: node ci/production-maintenance/final-smoke-rollback.mjs recover
 
   release:
     name: release
