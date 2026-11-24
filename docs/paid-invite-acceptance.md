@@ -14,9 +14,10 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    test portal with period-end cancellation and subscription changes disabled.
    Verify `plan_prices` against the provider account, currency, amount, interval
    and usage type. Admit only `POST /v1/billing/webhook` via the Access exception.
-   Deliver `checkout.session.completed` and `customer.subscription.updated`.
-   Prove signature failure and replay of a verified delivery at that ingress.
-3. Complete test checkout. Verify confirmed coverage and the caller's portal
+   Prove signature refusal at that ingress and check that missing portal
+   configuration prevents a new checkout.
+3. Complete test checkout and deliver `checkout.session.completed`. Verify
+   confirmed coverage and the caller's portal
    through `/v1/me/subscription` and the billing page. Reuse the
    [play, seek and meter assertions](../e2e/tests/ingest-play-meter.spec.ts)
    with the rank 74 encrypted fixture and callable browser relay. Assert 206
@@ -25,8 +26,9 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    verify the usage total stays flat.
 4. Cross the cap and verify a new play returns `plan_limit_exceeded`. Check
    continuation before and refusal after its lease deadline. Below cap, observe
-   an hourly renewal, schedule cancellation and confirm its flag reaches the API
-   before the paid cutoff. Verify `reason: lapsed` at the cutoff. Run applicable
+   an hourly renewal, schedule cancellation in the portal, then deliver and
+   replay the bound `customer.subscription.updated` event. Confirm its flag
+   reaches the API before the paid cutoff and invoice history is stable. Verify `reason: lapsed` at the cutoff. Run applicable
    [same-build privacy cases](m1-exit-traceability.md).
 5. Repeat the private listening refusal control in the personal configuration
    on that build. Keep credentials, invite links, and hosted session URLs out

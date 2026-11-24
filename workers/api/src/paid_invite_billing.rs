@@ -49,7 +49,7 @@ where
             return response;
         }
     }
-    if ctx.cfg.stripe_secret_key.is_none() || ctx.cfg.stripe_webhook_secret.is_none() {
+    if !ctx.cfg.billing_purchase_configured() {
         return unavailable();
     }
     let return_url = format!("{}/account/billing", ctx.cfg.origin);

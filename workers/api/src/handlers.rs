@@ -431,6 +431,12 @@ impl Config {
         self.paid_invite_billing && self.invites_required && self.private_listening.is_none()
     }
 
+    pub(crate) fn billing_purchase_configured(&self) -> bool {
+        self.stripe_secret_key.is_some()
+            && self.stripe_webhook_secret.is_some()
+            && self.stripe_portal_configuration.is_some()
+    }
+
     /// Provision the play-grant HMAC secret (raw bytes of the
     /// `PLAY_GRANT_SECRET` Worker secret). The 32-byte minimum is
     /// enforced by the minter per request (fail closed), so this
@@ -4717,11 +4723,7 @@ where
     };
     let purchase_bindings = if ctx.cfg.paid_billing_enabled() {
         match ctx.store.load_reconcile_input(&claims.user_id, None).await {
-            Ok(input)
-                if input.live.is_none()
-                    && ctx.cfg.stripe_secret_key.is_some()
-                    && ctx.cfg.stripe_webhook_secret.is_some() =>
-            {
+            Ok(input) if input.live.is_none() && ctx.cfg.billing_purchase_configured() => {
                 Some(input.bindings)
             }
             Ok(_) | Err(_) => Some(Vec::new()),
@@ -12706,6 +12708,7 @@ mod tests {
             Some("sk_test_synthetic".to_string()),
             Some("whsec_synthetic".to_string()),
         );
+        h.config.stripe_portal_configuration = Some("bpc_fixture".into());
         h
     }
 
@@ -13048,6 +13051,9 @@ mod tests {
         );
         assert_eq!(buy(&h).status, 404);
         h.config.private_listening = None;
+        h.config.stripe_portal_configuration = None;
+        assert_eq!(buy(&h).status, 503);
+        h.config.stripe_portal_configuration = Some("bpc_fixture".into());
         assert_eq!(checkout(&h, "plus", None, Some(ORIGIN)).status, 401);
         assert_eq!(
             checkout(
