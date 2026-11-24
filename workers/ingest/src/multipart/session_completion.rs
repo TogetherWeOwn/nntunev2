@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use nntune_core::{media_envelope::EnvelopeContext, s3_locator::S3MediaMetadata};
+use nntune_core::media_envelope::EnvelopeContext;
 use quick_xml::escape::escape;
 
 use super::{
@@ -12,6 +12,11 @@ use super::{
 };
 
 const MAX_UPLOAD_ID_BYTES: usize = 4096;
+
+pub(super) fn valid_upload_id(upload_id: &str) -> bool {
+    (1..=MAX_UPLOAD_ID_BYTES).contains(&upload_id.len())
+        && upload_id.bytes().all(|byte| byte.is_ascii_graphic())
+}
 
 pub struct SessionCompletion<'a> {
     completion: Completion<'a>,
@@ -63,17 +68,7 @@ impl<'a> SessionCompletion<'a> {
         if !matches_checkpoint(expected, &receipts, checkpoint) {
             return Err(PrepareError::CheckpointMismatch);
         }
-        let [_, environment, library, object, generation, configuration] = context.identities;
-        let target = expected.plan.target;
-        if expected.environment != hex::encode(environment)
-            || expected.library != hex::encode(library)
-            || expected.object != hex::encode(object)
-            || expected.generation != hex::encode(generation)
-            || expected.configuration != configuration
-            || expected.plan.header != context.header
-            || expected.plan.plaintext_len != context.plaintext_len
-            || !S3MediaMetadata::matches_target(target.bucket, target.key, context)
-        {
+        if !expected.matches_context(context) {
             return Err(PrepareError::EnvelopeContextMismatch);
         }
         let completion = expected
@@ -98,9 +93,7 @@ impl<'a> SessionCompletion<'a> {
         send: impl AsyncFnOnce(CompletionRequest<'a>) -> Result<CompletionResponse, ()>,
     ) -> Result<CompletedVersionedMedia, DispatchError> {
         let (target, _) = self.completion.object();
-        if !(1..=MAX_UPLOAD_ID_BYTES).contains(&target.upload_id.len())
-            || !target.upload_id.bytes().all(|byte| byte.is_ascii_graphic())
-        {
+        if !valid_upload_id(target.upload_id) {
             return Err(DispatchError::InvalidRequest);
         }
         let mut body = format!("<CompleteMultipartUpload xmlns=\"{S3_XML_NAMESPACE}\">");

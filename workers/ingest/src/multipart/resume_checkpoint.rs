@@ -1,5 +1,7 @@
 //! In-memory comparison for the diagnostics-disabled trusted-map profile.
 
+use nntune_core::{media_envelope::EnvelopeContext, s3_locator::S3MediaMetadata};
+
 use super::{Plan, UploadedPart};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -13,6 +15,22 @@ pub struct ResumeBinding<'a> {
     pub object: &'a str,
     pub generation: &'a str,
     pub envelope_scheme: u16,
+}
+
+impl ResumeBinding<'_> {
+    pub(super) fn matches_context(&self, context: &EnvelopeContext) -> bool {
+        let [_, environment, library, object, generation, configuration] = context.identities;
+        let target = self.plan.target;
+        self.envelope_scheme == 2
+            && self.environment == hex::encode(environment)
+            && self.library == hex::encode(library)
+            && self.object == hex::encode(object)
+            && self.generation == hex::encode(generation)
+            && self.configuration == configuration
+            && self.plan.header == context.header
+            && self.plan.plaintext_len == context.plaintext_len
+            && S3MediaMetadata::matches_target(target.bucket, target.key, context)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
