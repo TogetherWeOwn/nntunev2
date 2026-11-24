@@ -11,7 +11,7 @@ use crate::{
 
 pub mod custody;
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DigestReadTarget {
     pub environment: [u8; 16],
     pub library: [u8; 16],

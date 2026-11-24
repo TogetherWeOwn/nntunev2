@@ -106,6 +106,10 @@ fn mint_grant(
     })
 }
 
+#[allow(dead_code)] // Mounted by the browser playback adapter.
+#[path = "private_browser_receipt.rs"]
+pub(crate) mod browser;
+
 impl PrivatePlayback<'_> {
     /// Start one new private play with a live signed cookie and current
     /// invitation. Only the server supplies publication pins. The caller
