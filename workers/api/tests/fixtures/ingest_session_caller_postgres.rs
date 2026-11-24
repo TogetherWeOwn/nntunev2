@@ -820,9 +820,10 @@ async fn prove_attempt(
         return;
     }
     let committed = committed.unwrap();
+    // The sparse index ends this read at the next seek anchor, 5.015s.
     assert_eq!(
         committed.flac_plaintext_range(completed.metadata(), origin.plaintext_sha256(), 0..1),
-        Some(8256..9520)
+        Some(8256..68861)
     );
     assert_eq!(
         committed.flac_plaintext_range(completed.metadata(), &[0; 32], 0..1),
