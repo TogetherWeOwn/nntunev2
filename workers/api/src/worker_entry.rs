@@ -4127,7 +4127,30 @@ impl Store for PgStore {
         input: &crate::private_playback::browser::BrowserStart,
         cfg: &Config,
     ) -> Result<Option<handlers::browser_playback_relay::BrowserReceipt>, StoreError> {
-        private_browser_worker::open(self, claims, input, cfg).await
+        use private_browser_worker::{service, Settings};
+        Self::bounded(
+            async {
+                let Some(settings) = self.env.as_ref().and_then(Settings::load) else {
+                    return Ok(None);
+                };
+                let Some(service) = service(cfg) else {
+                    return Ok(None);
+                };
+                let mut db = self.connect().await?;
+                Ok(service
+                    .open_browser(
+                        &mut db,
+                        claims,
+                        input,
+                        settings.scope(),
+                        private_browser_worker::now,
+                    )
+                    .await?
+                    .map(|receipt| receipt.relay().clone()))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn browser_playback_receipt(
@@ -4136,7 +4159,30 @@ impl Store for PgStore {
         path: &str,
         cfg: &Config,
     ) -> Result<Option<handlers::browser_playback_relay::BrowserReceipt>, StoreError> {
-        private_browser_worker::media(self, claims, path, cfg).await
+        use private_browser_worker::{service, Settings};
+        Self::bounded(
+            async {
+                let Some(settings) = self.env.as_ref().and_then(Settings::load) else {
+                    return Ok(None);
+                };
+                let Some(service) = service(cfg) else {
+                    return Ok(None);
+                };
+                let db = self.connect().await?;
+                Ok(service
+                    .load_browser(
+                        &db,
+                        claims,
+                        path,
+                        settings.scope(),
+                        private_browser_worker::now,
+                    )
+                    .await?
+                    .map(|receipt| receipt.relay().clone()))
+            },
+            TOTAL_TIMEOUT_MS,
+        )
+        .await
     }
 
     async fn private_listening_access(

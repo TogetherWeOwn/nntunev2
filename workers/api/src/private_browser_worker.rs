@@ -1,15 +1,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{Config, Env, PgStore, StoreError};
+use super::{Config, Env};
 use crate::{
-    handlers::browser_playback_relay::BrowserReceipt,
     private_catalogue_read::PublicationScope,
-    private_playback::{
-        browser::{BrowserScope, BrowserStart},
-        PrivatePlayback,
-    },
-    session::SessionClaims,
-    worker_entry::with_deadline,
+    private_playback::{browser::BrowserScope, PrivatePlayback},
 };
 
 pub(super) fn enabled(env: &Env) -> bool {
@@ -81,56 +75,4 @@ pub(super) fn service(cfg: &Config) -> Option<PrivatePlayback<'_>> {
 
 pub(super) fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(super::now_millis())
-}
-
-pub(super) async fn open(
-    store: &PgStore,
-    claims: &SessionClaims,
-    input: &BrowserStart,
-    cfg: &Config,
-) -> Result<Option<BrowserReceipt>, StoreError> {
-    let Some(settings) = store.env.as_ref().and_then(Settings::load) else {
-        return Ok(None);
-    };
-    let Some(service) = service(cfg) else {
-        return Ok(None);
-    };
-    with_deadline(
-        async {
-            let mut db = store.connect().await?;
-            Ok(service
-                .open_browser(&mut db, claims, input, settings.scope(), now)
-                .await?
-                .map(|receipt| receipt.relay().clone()))
-        },
-        5_000,
-        StoreError,
-    )
-    .await
-}
-
-pub(super) async fn media(
-    store: &PgStore,
-    claims: &SessionClaims,
-    path: &str,
-    cfg: &Config,
-) -> Result<Option<BrowserReceipt>, StoreError> {
-    let Some(settings) = store.env.as_ref().and_then(Settings::load) else {
-        return Ok(None);
-    };
-    let Some(service) = service(cfg) else {
-        return Ok(None);
-    };
-    with_deadline(
-        async {
-            let db = store.connect().await?;
-            Ok(service
-                .load_browser(&db, claims, path, settings.scope(), now)
-                .await?
-                .map(|receipt| receipt.relay().clone()))
-        },
-        5_000,
-        StoreError,
-    )
-    .await
 }
