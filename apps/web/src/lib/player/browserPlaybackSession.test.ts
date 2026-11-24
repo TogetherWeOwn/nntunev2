@@ -5,8 +5,6 @@ import { createQueue, currentTrack } from './queue.js';
 
 const binding = 'A'.repeat(43);
 const initial = createQueue(['first', 'second'].map((id) => ({ id, title: id, artist: '', streamUrl: `/fixture/${id}` })));
-const matches = (node: HTMLAudioElement, source: string) => node.getAttribute('src') === source;
-
 function setup() {
 	const lifetime = new AbortController();
 	const account: AccountSession = { generation: 'first', signal: lifetime.signal,
@@ -22,20 +20,19 @@ function setup() {
 			marked = enabled;
 			return Response.json({ session_id, private_until: marked ? Math.floor(Date.now() / 1000) + 60 : null });
 		}
-		expect(path).toBe('/v1/plays');
-		expect(init?.method).toBe('POST');
+		expect([path, init?.method]).toEqual(['/v1/plays', 'POST']);
 		expect(new Headers(init?.headers).get('x-nntune-browser-playback')).toBe('1');
 		expect(play_id).toBeUndefined();
 		starts.push(marked);
 		return Response.json({ sessionBinding: binding, playbackSessionId: session_id, trackId: track_id,
 			playId: `play-${starts.length}`, durationMs: 120_000 });
 	});
-	const player = createPlayerController(initial, { flush: async () => {} }, matches, { fetchFn });
+	const player = createPlayerController(initial, { flush: async () => {} }, (node, source) => node.getAttribute('src') === source, { fetchFn });
 	const { media, queue } = player;
-	const refresh = () => player.reconcileLibrary(initial.tracks, () => {
+	const refresh = () => {
 		player.bindBrowserPlayback(account, binding);
-		return true;
-	});
+		return player.reconcileLibrary(initial.tracks, () => true);
+	};
 	refresh();
 	const src = () => player.streamFor(currentTrack(queue.snapshot));
 	const play = (index: number) => media.playSelected(queue.snapshot, index, queue.sourceForQueuedPlay(initial.tracks[index].id)!);
@@ -49,8 +46,7 @@ test('new plays use the acknowledged mode in the same tab and continuations keep
 		expect(src()).toBe('');
 		expect(fetchFn).not.toHaveBeenCalled();
 		await media.playCurrent();
-		const first = src();
-		const tab = first.split('/')[5];
+		const first = src(), tab = first.split('/')[5];
 		expect(first).toBe(`/v1/plays/media/first/${tab}/play-1`);
 		const audio = Object.assign(new EventTarget(), { paused: true, ended: false, error: null, isConnected: true,
 			getAttribute: () => first, play: vi.fn(async () => { audio.paused = false; }), pause: vi.fn() });
@@ -73,7 +69,7 @@ test('new plays use the acknowledged mode in the same tab and continuations keep
 	} finally { player.destroy(); }
 });
 
-test.each(['refused', 'superseded', 'account retirement'] as const)('%s fences grant publication', async (caseName) => {
+test.each(['refused', 'superseded', 'account retirement', 'legacy reply', 'extra field'] as const)('%s fences grant publication', async (caseName) => {
 	const { player, media, queue, fetchFn, lifetime, src, play, refresh } = setup();
 	try {
 		await play(0);
@@ -90,9 +86,10 @@ test.each(['refused', 'superseded', 'account retirement'] as const)('%s fences g
 		if (caseName === 'superseded') refresh();
 		if (caseName === 'account retirement') lifetime.abort();
 		const sessionId = incumbent.split('/')[5];
-		reply.resolve(caseName === 'refused' ? new Response(null, { status: 409 }) : Response.json({
-			sessionBinding: binding, playbackSessionId: sessionId, trackId: 'second', playId: 'late', durationMs: 120_000
-		}));
+		const receipt = { sessionBinding: binding, playbackSessionId: sessionId, trackId: 'second', playId: 'late', durationMs: 120_000 };
+		if (caseName === 'refused') reply.resolve(new Response(null, { status: 409 }));
+		else if (caseName === 'legacy reply') reply.resolve(Response.json({ play_id: 'late', grant: 'synthetic' }));
+		else reply.resolve(Response.json(caseName === 'extra field' ? { ...receipt, grant: 'synthetic' } : receipt));
 		await playing;
 		if (caseName === 'account retirement') {
 			expect(player.privateListening).toBeUndefined();
@@ -105,4 +102,21 @@ test.each(['refused', 'superseded', 'account retirement'] as const)('%s fences g
 			expect(audio.pause).not.toHaveBeenCalled();
 		}
 	} finally { player.destroy(); }
+});
+
+test.each(['wrong tab', 'server error', 'expired'] as const)('%s requires a fresh privacy acknowledgement before another start', async (reason) => {
+	const { player, queue, fetchFn, src, play } = setup();
+	const clock = vi.spyOn(Date, 'now');
+	try {
+		await play(0);
+		const incumbent = src(), snapshot = queue.snapshot;
+		if (reason === 'wrong tab') fetchFn.mockResolvedValueOnce(Response.json({ session_id: 'another-tab', private_until: Math.floor(Date.now() / 1000) + 60 }));
+		if (reason === 'server error') fetchFn.mockResolvedValueOnce(new Response(null, { status: 503 }));
+		await player.setPrivateListening(true);
+		if (reason === 'expired') clock.mockReturnValue(Date.now() + 60_000);
+		await play(1);
+		expect(fetchFn).toHaveBeenCalledTimes(2);
+		expect(queue.snapshot).toBe(snapshot);
+		expect(src()).toBe(incumbent);
+	} finally { clock.mockRestore(); player.destroy(); }
 });

@@ -6,13 +6,6 @@ type Owner = { readonly sessionBinding: string; readonly playbackSessionId: stri
 type Reply = Owner & { trackId: string; playId: string; durationMs: number };
 type Prepare = (request: Owner & Target, signal: AbortSignal) => Promise<unknown>;
 
-function isReply(value: unknown): value is Reply {
-	if (typeof value !== 'object' || value === null || Object.keys(value).length !== 5) return false;
-	const reply = value as Partial<Reply>;
-	return validSessionBinding(reply.sessionBinding) && validId(reply.playbackSessionId) && validId(reply.trackId) &&
-		validId(reply.playId) && typeof reply.durationMs === 'number' && Number.isSafeInteger(reply.durationMs) && reply.durationMs > 0;
-}
-
 function validId(value: unknown): value is string {
 	return typeof value === 'string' && /^[A-Za-z0-9_-]{1,512}$/.test(value);
 }
@@ -42,9 +35,10 @@ export function createBrowserPlaybackGrant(owner: AccountSession, sessionBinding
 					pending: prepare({ sessionBinding, playbackSessionId, trackId, playId }, signal).catch(() => undefined)
 				});
 				if (!dispatched) return false;
-				const reply = await dispatched.pending;
-				if (!isReply(reply) || reply.sessionBinding !== sessionBinding || reply.playbackSessionId !== playbackSessionId ||
-					reply.trackId !== trackId || (playId !== undefined && reply.playId !== playId)) return false;
+				const reply = await dispatched.pending as Reply | undefined;
+				if (!reply || Object.keys(reply).length !== 5 || reply.sessionBinding !== sessionBinding ||
+					reply.playbackSessionId !== playbackSessionId || reply.trackId !== trackId || !validId(reply.playId) ||
+					(playId !== undefined && reply.playId !== playId) || !Number.isSafeInteger(reply.durationMs) || reply.durationMs <= 0) return false;
 				const { playId: issuedPlayId, durationMs } = reply;
 				return (await owner.run(() => {
 					if (!current()) return false;

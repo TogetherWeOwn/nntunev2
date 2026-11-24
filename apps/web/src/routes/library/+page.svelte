@@ -1610,9 +1610,7 @@
 	{#if player.privateListening}
 		<button class="nt-button nt-button--ghost" type="button" aria-pressed={player.privateListening.enabled}
 			aria-disabled={player.privateListening.pending}
-			onclick={() => { if (!player.privateListening?.pending) void player.setPrivateListening(!player.privateListening?.enabled); }}>
-			Private listening
-		</button>
+			onclick={() => { if (!player.privateListening?.pending) void player.setPrivateListening(!player.privateListening?.enabled); }}>Private listening</button>
 		<p aria-live="polite">{player.privateListening.feedback}</p>
 	{/if}
 	{#if accountTrackLikes?.feedback}<p role="status">{accountTrackLikes.feedback}</p>{/if}
