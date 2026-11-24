@@ -8,12 +8,6 @@
 use crate::digest_geometry::DigestGeometry;
 use sha2::{Digest, Sha256};
 
-/// Canonical bucket-relative key for a page of a committed digest map.
-pub fn object_key(object: [u8; 16], generation: [u8; 16], map: [u8; 16], index: u32) -> String {
-    let [object, generation, map] = [object, generation, map].map(u128::from_be_bytes);
-    format!("media-digests/{object:032x}/{generation:032x}/{map:032x}/{index:08x}")
-}
-
 /// Encode the unique page partition for trusted geometry. Inputs to this
 /// utility are not authenticated, and its output is not an enrolled manifest.
 pub fn encode_page(

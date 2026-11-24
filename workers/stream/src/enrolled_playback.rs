@@ -19,7 +19,7 @@ use crate::{
 };
 
 mod s3;
-pub use s3::{S3EnrolledPlayback, S3Get, S3GetReply, S3PlaybackTransport};
+pub use s3::{S3EnrolledPlayback, S3Get, S3GetReply};
 
 /// Independently resolved custody for that same committed root and lifecycle.
 pub struct EnrolledMedia<'a> {
@@ -43,7 +43,6 @@ pub enum PlaybackError {
 
 pub struct EnrolledPlayback<'a> {
     reader: Option<DigestRange<'a>>,
-    geometry: DigestGeometry,
     plan: RangeGeometry,
     locator: &'a S3Locator,
     pins: DigestReadSnapshot<'a>,
@@ -108,7 +107,6 @@ impl<'a> EnrolledPlayback<'a> {
             outcome,
             Some(Self {
                 reader: Some(reader),
-                geometry,
                 plan: plan.ok_or(PlaybackError::Binding)?,
                 locator,
                 pins,
@@ -152,10 +150,8 @@ impl<'a> EnrolledPlayback<'a> {
         // Take before any await: cancellation or failure fences the in-flight cursor.
         let reader = self.reader.take().ok_or(PlaybackError::Stopped)?;
         let index = chunk.selection.index;
-        let version = self.pins.page_versions.get(chunk.selection.page as usize);
         if locator != self.locator
-            || version.is_none_or(|v| v.as_str() != page.0)
-            || matches!(page.0, "" | "null")
+            || !self.matches_page(chunk.selection.page, page.0)
             || (index == 0) != wire_header.is_some()
         {
             return Err(PlaybackError::Binding);
@@ -172,6 +168,15 @@ impl<'a> EnrolledPlayback<'a> {
         .await
         .map_err(PlaybackError::Response)?;
         self.open_part(reader, index, page.1, sealed, wire_header, now)
+    }
+
+    fn matches_page(&self, index: u32, version: &str) -> bool {
+        !matches!(version, "" | "null")
+            && self
+                .pins
+                .page_versions
+                .get(index as usize)
+                .is_some_and(|v| v == version)
     }
 
     fn open_part(
