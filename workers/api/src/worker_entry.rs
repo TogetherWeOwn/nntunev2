@@ -8197,6 +8197,75 @@ pub(crate) fn route_path(
     }
 }
 
+#[cfg(all(
+    target_arch = "wasm32",
+    not(any(
+        feature = "staging-body-wasm-test",
+        feature = "billing-owned-wasm-test",
+        feature = "span-runtime-test"
+    ))
+))]
+pub(crate) async fn reconcile_paid_invites(env: Env, hour: i64) -> Result<(), StoreError> {
+    if env_string(&env, "PAID_INVITE_BILLING").as_deref() != Some("1") {
+        return Ok(());
+    }
+    let config = config_from_env(&env).ok_or(StoreError)?;
+    if !config.paid_billing_enabled() {
+        return Ok(());
+    }
+    if config.stripe_secret_key.is_none() || config.stripe_webhook_secret.is_none() {
+        return Err(StoreError);
+    }
+    let trace_id = crate::logging::resolve_trace_id(None);
+    let ctx = handlers::Ctx {
+        cfg: &config,
+        store: &PgStore {
+            env: Some(env.clone()),
+            trace_id: trace_id.clone(),
+            mirror_binding: MirrorBinding::Unconfigured,
+        },
+        mailer: &WebhookMailer {
+            env,
+            origin: config.origin.clone(),
+            trace_id,
+        },
+        dialer: &SocketDialer,
+        dns: &DohDns,
+        stripe: &WorkerStripeTransport {
+            secret_key: config.stripe_secret_key.clone(),
+        },
+        now: worker::Date::now().as_millis() / 1000,
+        source_ip: String::new(),
+    };
+    let rows = PgStore::bounded(
+        async {
+            let client = ctx.store.connect().await?;
+            client
+                .query_typed(
+                    crate::billing_sweep::DUE_TARGETS,
+                    &[
+                        (&hour, Type::INT8),
+                        (&crate::billing_sweep::BATCH_SIZE, Type::INT8),
+                    ],
+                )
+                .await
+                .map_err(|_| StoreError)
+        },
+        TOTAL_TIMEOUT_MS,
+    )
+    .await?;
+    let targets = rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<_, &str>(0).map_err(|_| StoreError)?,
+                row.try_get::<_, Option<&str>>(1).map_err(|_| StoreError)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    handlers::reconcile_paid_targets(&ctx, targets).await
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.

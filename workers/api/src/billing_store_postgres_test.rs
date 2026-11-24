@@ -174,6 +174,48 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
     sql("DELETE FROM billing_operations; DELETE FROM billing_accounts; DELETE FROM plan_prices; DELETE FROM plans WHERE id = 'checkout-fixture';").await;
 }
 
+async fn hourly_billing_query_rotates_due_targets(observer: &Client) {
+    use crate::billing_sweep::{BATCH_SIZE, DUE_TARGETS};
+    observer
+        .batch_execute(
+            "INSERT INTO users (id, email, created_at, deleting_at)
+         SELECT 'sweep-' || n, 'sweep-' || n || '@example.test', 1,
+                CASE WHEN n = 21 THEN now() ELSE NULL END
+         FROM generate_series(1, 21) n;
+         INSERT INTO billing_operations (user_id, kind, state, request_key, request_payload)
+         SELECT id, 'checkout', 'pending', id, '{}' FROM users WHERE id LIKE 'sweep-%';",
+        )
+        .await
+        .unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for hour in [0_i64, 1] {
+        let rows = observer
+            .query(DUE_TARGETS, &[&hour, &BATCH_SIZE])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), BATCH_SIZE as usize);
+        for row in rows {
+            let user: String = row.get(0);
+            let subscription: Option<String> = row.get(1);
+            assert_ne!(user, "sweep-21");
+            assert_eq!(
+                subscription.as_deref(),
+                (user == USER).then_some(SUBSCRIPTION)
+            );
+            seen.insert(user);
+        }
+    }
+    assert_eq!(seen.len(), 21);
+    assert!(seen.contains(USER));
+    observer
+        .batch_execute(
+            "DELETE FROM billing_operations WHERE user_id LIKE 'sweep-%';
+         DELETE FROM users WHERE id LIKE 'sweep-%';",
+        )
+        .await
+        .unwrap();
+}
+
 async fn snapshot(observer: &Client) -> (Value, Value) {
     let row = observer
         .query_one(
@@ -272,6 +314,7 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
 
     dispatch(USER, &seed).await.expect("create owned target");
     checkout_reservation_and_price_mapping(&observer).await;
+    hourly_billing_query_rotates_due_targets(&observer).await;
     let (owned, history) = snapshot(&observer).await;
     assert_eq!(owned.as_array().unwrap().len(), 1);
     assert_eq!(owned[0]["stripe_subscription_id"], SUBSCRIPTION);

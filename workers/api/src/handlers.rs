@@ -7596,6 +7596,88 @@ where
     Ok(())
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_arch = "wasm32",
+        not(any(
+            feature = "staging-body-wasm-test",
+            feature = "billing-owned-wasm-test",
+            feature = "span-runtime-test"
+        ))
+    )
+))]
+pub(crate) async fn reconcile_paid_targets<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    targets: Vec<(&str, Option<&str>)>,
+) -> Result<(), StoreError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    if !ctx.cfg.paid_billing_enabled() {
+        return Ok(());
+    }
+    let mut failed = false;
+    for (user, subscription) in targets {
+        failed |= match subscription {
+            Some(subscription) => reconcile_remote_subscription(ctx, user, subscription)
+                .await
+                .map_or(true, |outcome| outcome.disable_new_purchases()),
+            None => reconcile_pending_checkout(ctx, user).await.is_err(),
+        };
+    }
+    (!failed).then_some(()).ok_or(StoreError)
+}
+
+#[cfg(any(
+    test,
+    all(
+        target_arch = "wasm32",
+        not(any(
+            feature = "staging-body-wasm-test",
+            feature = "billing-owned-wasm-test",
+            feature = "span-runtime-test"
+        ))
+    )
+))]
+async fn reconcile_pending_checkout<S, M, D, N>(
+    ctx: &Ctx<'_, S, M, D, N>,
+    user_id: &str,
+) -> Result<(), EnsureCheckoutError>
+where
+    S: Store + SingleUseStore,
+    M: Mailer,
+    D: Dialer,
+    N: AsyncDns,
+{
+    let Some(op) = ctx
+        .store
+        .open_checkout_operation(user_id)
+        .await
+        .map_err(|_| EnsureCheckoutError::Failed)?
+    else {
+        return Ok(());
+    };
+    let (Some(session), Some(price)) = (&op.session_id, &op.price_id) else {
+        // A scheduled run cannot infer whether Stripe created a session.
+        return Err(EnsureCheckoutError::Unavailable);
+    };
+    if handle_flight_session(ctx, &op, session, price).await? == FlightSessionDecision::Completed {
+        let updated = ctx
+            .store
+            .checkout_operation_by_id(&op.id)
+            .await
+            .map_err(|_| EnsureCheckoutError::Failed)?;
+        if !updated.is_some_and(|row| row.state == "succeeded") {
+            return Err(EnsureCheckoutError::Failed);
+        }
+    }
+    Ok(())
+}
+
 async fn billing_webhook<S, M, D, N>(ctx: &Ctx<'_, S, M, D, N>, req: &Request) -> Response
 where
     S: Store + SingleUseStore,
@@ -10150,10 +10232,27 @@ mod tests {
             &self,
             user_id: &str,
         ) -> Result<Option<crate::playback::SubscriptionRow>, StoreError> {
-            Ok(self.playback_subscriptions.borrow().get(user_id).cloned())
+            let seeded = self.playback_subscriptions.borrow().get(user_id).cloned();
+            Ok(seeded.or_else(|| {
+                self.billing_rows.borrow().get(user_id).map(|row| {
+                    crate::playback::SubscriptionRow {
+                        plan_id: row.plan_id.clone(),
+                        status: row.status.clone(),
+                        paid_through_at_unix: row.paid_through_unix,
+                        grace_until_unix: row.grace_until_unix,
+                        current_period_end_unix: row.current_period_end_unix,
+                        cancel_at_period_end: row.cancel_at_period_end,
+                    }
+                })
+            }))
         }
         async fn ever_subscribed(&self, user_id: &str) -> Result<bool, StoreError> {
-            Ok(self.ever_paid_users.borrow().contains(user_id))
+            Ok(self.ever_paid_users.borrow().contains(user_id)
+                || self
+                    .billing_rows
+                    .borrow()
+                    .get(user_id)
+                    .is_some_and(|row| row.paid_through_unix.is_some()))
         }
         async fn plan_caps(
             &self,
@@ -13043,6 +13142,125 @@ mod tests {
                 if repeated { 10 } else { 1 }
             );
         }
+    }
+
+    #[test]
+    fn paid_invite_hourly_reconcile_retires_only_confirmed_expiry() {
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        let cookie = cookie_of(&block_on(h.ctx().start_session("u1")).unwrap());
+        let reply = h.call_full(
+            "POST",
+            "/v1/billing/checkout",
+            Some(r#"{"planId":"plus"}"#.into()),
+            Some(cookie),
+            Some(ORIGIN),
+        );
+        assert_eq!(reply.status, 200);
+        let op = || block_on(h.store.open_checkout_operation("u1")).unwrap();
+        let mut active = op().unwrap();
+        let session = active.session_id.take().unwrap();
+        let run = || block_on(reconcile_paid_targets(&h.ctx(), vec![("u1", None)]));
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .insert(active.id.clone(), active.clone());
+        assert!(run().is_err());
+        h.store
+            .checkout_ops
+            .borrow_mut()
+            .get_mut(&active.id)
+            .unwrap()
+            .session_id = Some(session.clone());
+        run().unwrap();
+        assert!(op().is_some());
+        h.stripe
+            .sessions
+            .borrow_mut()
+            .get_mut(&session)
+            .unwrap()
+            .status = Some("expired".into());
+        run().unwrap();
+        assert!(op().is_none());
+        assert!(live_for(&h, "u1").is_none());
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+    }
+
+    #[test]
+    fn paid_invite_coverage_drives_play_meter_cap_and_lapse() {
+        let mut h = stripe_harness();
+        h.config = h.config.with_play_grant_secret(PLAY_SECRET.to_vec());
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        seed_billing_user(&h, "u1");
+        let cookie = cookie_of(&block_on(h.ctx().start_session("u1")).unwrap());
+        let play = serde_json::json!({"track_id":"track-9", "session_id":"tab-a"});
+        assert_eq!(play_call(&h, &cookie, play.clone()).status, 402);
+        deliver_first_period(&h, "evt_play");
+        h.store.plan_caps_rows.borrow_mut().insert(
+            PLAN_PLUS.into(),
+            crate::plan_limits::PlanCaps {
+                stream_seconds_month: 2,
+                max_concurrent_streams: 1,
+            },
+        );
+
+        let response = play_call(&h, &cookie, play.clone());
+        assert_eq!(response.status, 200, "{}", response.body);
+        let issued: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let play_id = issued["play_id"].as_str().unwrap();
+        let record = |bytes| {
+            let window = crate::ledger::prepare_play_window(
+                "u1",
+                "track-9",
+                play_id,
+                bytes,
+                Some(2000),
+                Some(2000),
+                NOW,
+            )
+            .unwrap();
+            block_on(h.store.record_play_window(&window)).unwrap()
+        };
+        assert_eq!(record(1000), crate::meter_sink::PlayWindowOutcome::Written);
+        assert_eq!(record(2000), crate::meter_sink::PlayWindowOutcome::Written);
+        assert_eq!(record(2000), crate::meter_sink::PlayWindowOutcome::Covered);
+        let usage = billing_get(&h, "/v1/me/usage", Some(cookie.clone()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&usage.body).unwrap()["streamSecondsMonth"],
+            2
+        );
+        let cap = play_call(&h, &cookie, play.clone());
+        assert_eq!(cap.status, 402);
+        assert!(cap.body.contains("plan_limit_exceeded"));
+        let continuation =
+            serde_json::json!({"track_id":"track-9", "session_id":"tab-a", "play_id":play_id});
+        assert_eq!(play_call(&h, &cookie, continuation).status, 200);
+
+        // Move the server clock past the settlement allowance in a fresh
+        // usage period. The retained row may still read active at Stripe.
+        let mut lapse = h.ctx();
+        lapse.now = NOW + BILLING_PERIOD as u64 + 10_801;
+        let cookie = cookie_of(&block_on(lapse.start_session("u1")).unwrap());
+        let refusal = block_on(handle(
+            &lapse,
+            &Request {
+                method: "POST".into(),
+                path: "/v1/plays".into(),
+                origin: Some(ORIGIN.into()),
+                cookie: Some(cookie),
+                authorization: None,
+                stripe_signature: None,
+                body: play.to_string().into_bytes(),
+            },
+        ));
+        assert_eq!(refusal.status, 402);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&refusal.body).unwrap()["reason"],
+            "lapsed"
+        );
     }
 
     #[test]
