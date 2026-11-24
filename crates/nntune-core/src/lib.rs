@@ -53,12 +53,39 @@ pub mod digest_enrollment;
 pub mod digest_geometry;
 pub mod digest_page;
 pub mod digest_range;
+pub mod digest_read_snapshot;
+pub mod digest_readback;
 #[cfg(test)]
 mod digest_test_fixture;
 pub mod digest_verifier;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_continuity;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_frame;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_frame_footer;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_frame_header;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_preamble;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_predictor;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_prepare;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_residual;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_samples;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_stereo;
+#[allow(dead_code)] // Not mounted at the authenticated readback boundary yet.
+mod flac_stream;
+#[allow(dead_code)] // Not mounted until full frame validation is available.
+mod flac_subframe;
 pub mod media_envelope;
 pub mod media_layout;
 pub mod origin_sealer;
 
 pub mod original_source;
+pub mod s3_locator;
 pub mod transcode;

@@ -28,6 +28,7 @@ use crate::{
     grant::{self, Grant},
     play_route::{PlayRouteRefusal, PlayRouteRequest, PLAY_CONTENT_TYPE},
     range::{self, ByteRange, RangeOutcome},
+    response_delivery::OrderedDelivery,
 };
 
 /// A verified v2 authority, obtained before any private source lookup. The
@@ -255,8 +256,7 @@ impl OriginalPlan {
             sink,
             start: self.selected.start,
             file_bytes: self.file_bytes,
-            written: 0,
-            offered: 0,
+            delivery: OrderedDelivery::new(self.selected.len()),
             stopped: false,
         })
     }
@@ -386,8 +386,7 @@ pub struct OriginalPlay<'a> {
     sink: &'a mut dyn DeliveredSink,
     start: u64,
     file_bytes: u64,
-    written: u64,
-    offered: usize,
+    delivery: OrderedDelivery,
     stopped: bool,
 }
 
@@ -492,7 +491,7 @@ impl<'a> OriginalPlay<'a> {
         transport: &mut T,
         control: &mut C,
     ) -> Result<Option<Vec<u8>>, SourceError> {
-        if self.stopped || self.offered != 0 {
+        if self.stopped || self.delivery.pending() {
             self.stopped = true;
             return Err(SourceError::Cancelled);
         }
@@ -502,7 +501,7 @@ impl<'a> OriginalPlay<'a> {
             control,
         };
         let bytes = self.reader.next(transport, &mut authorized).await?;
-        self.offered = bytes.as_ref().map_or(0, Vec::len);
+        self.delivery.offer(bytes.as_ref().map_or(0, Vec::len))?;
         self.stopped = false;
         Ok(bytes)
     }
@@ -511,23 +510,21 @@ impl<'a> OriginalPlay<'a> {
     /// writer. On writer failure, acknowledge its accepted prefix, then drop.
     /// This API cannot infer delivery from an account receipt or a pull.
     pub fn written(&mut self, bytes: usize) -> Result<(), SourceError> {
-        if self.stopped || bytes > self.offered {
+        if self.stopped || self.delivery.acknowledge(bytes).is_err() {
             self.stopped = true;
             return Err(SourceError::Bounds);
         }
-        self.written += bytes as u64; // Bounded by the offered range slices.
-        self.offered -= bytes;
         Ok(())
     }
 
     pub fn served_bytes(&self) -> u64 {
-        self.written
+        self.delivery.accepted()
     }
 
     /// No drain, cache publication or account release. Drop reports exactly
     /// the acknowledged bytes even when completion is refused.
     pub fn finish(self) -> Result<(), SourceError> {
-        if self.stopped || self.offered != 0 || self.written != self.body_len {
+        if self.stopped || !self.delivery.complete() {
             return Err(SourceError::Transport);
         }
         Ok(())
@@ -538,7 +535,8 @@ impl<'a> OriginalPlay<'a> {
 
 impl Drop for OriginalPlay<'_> {
     fn drop(&mut self) {
-        if self.written == 0 {
+        let accepted = self.delivery.accepted();
+        if accepted == 0 {
             return;
         }
         self.sink.delivered(DeliveredInterval {
@@ -551,7 +549,7 @@ impl Drop for OriginalPlay<'_> {
                 .expect("verified v2 grant"),
             track_id: self.authority.grant.track_id.clone(),
             start: self.start,
-            end: self.start + self.written,
+            end: self.start + accepted,
             file_bytes: Some(self.file_bytes),
         });
     }

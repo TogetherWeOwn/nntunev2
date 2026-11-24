@@ -832,24 +832,22 @@ fn claim_statements_are_conditional_parameterized_updates() {
     // binding, self-invite refusal), so revocation and competing
     // redemptions win or lose atomically against it.
     let sql = auth::SingleUseClaim::Invite { record: &inv }.statement();
-    assert!(
-        sql.starts_with("UPDATE invite_codes SET used = TRUE"),
-        "{sql}"
-    );
     for fragment in [
+        "UPDATE invite_codes SET used = TRUE",
         "redeemed_by = $2",
-        "redeemed_at = $3",
+        "redeemed_at = CASE WHEN checked.kind = 'member' THEN live_now ELSE $3 END",
         "code_hash = $1",
         "used = FALSE",
         "redeemed_at IS NULL",
         "revoked_at IS NULL",
-        "expires_at > $3",
+        "checked.expires_at > GREATEST(live_now, $3)",
         "email IS NULL OR EXISTS",
-        "lower(email) = lower(invite_codes.email)",
+        "lower(email) = lower(i.email)",
         "NOT EXISTS",
-        "issuer.id = invite_codes.issued_by",
+        "issuer.id = i.issued_by",
         "redeemer.id = $2",
-        "RETURNING code_hash",
+        "RETURNING invite_codes.id",
+        "SELECT NULL::bigint AS expired_id FROM claimed",
     ] {
         assert!(sql.contains(fragment), "missing {fragment:?} in {sql}");
     }

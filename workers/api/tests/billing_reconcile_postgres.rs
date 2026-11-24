@@ -15,8 +15,6 @@ use tokio_postgres::{Client, Config, NoTls};
 
 #[path = "support/billing_contention.rs"]
 mod billing_contention;
-#[path = "support/billing_legacy_write.rs"]
-mod billing_legacy_write;
 #[path = "support/billing_transaction_fixture.rs"]
 mod billing_transaction_fixture;
 
@@ -25,6 +23,13 @@ const T: i64 = 1_786_032_000;
 const P: i64 = 30 * 24 * 60 * 60;
 const CUS: &str = "cus_a";
 const PRICE: &str = "price_plus_test";
+
+fn paid_coverage_fixture_migration() -> &'static str {
+    // Keep DDL in the fixture's isolated schema rather than public.
+    include_str!("../../../migrations/0059_paid_invoice_covered_periods.sql")
+        .strip_prefix("SET search_path = public, pg_catalog;")
+        .expect("migration must pin its production search path")
+}
 
 fn disposable_config(url: &str) -> Result<Config, &'static str> {
     let config: Config = url.parse().map_err(|_| "invalid test database URL")?;
@@ -103,6 +108,7 @@ impl Fx {
             include_str!("../../../migrations/0021_billing_schema.sql"),
             include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
             include_str!("../../../migrations/0029_paid_invoice_history.sql"),
+            paid_coverage_fixture_migration(),
         ] {
             db.batch_execute(migration).await.unwrap();
         }
@@ -208,12 +214,23 @@ impl Fx {
         reconcile_subscription(&input, remote, T + P + 1)
     }
 
+    async fn fold_target(&self, user: &str, remote: &RemoteSubscription) -> ReconcileOutcome {
+        let input = ReconcileInput {
+            stripe_customer_id: Some(CUS.into()),
+            live: self.select(user, Some(&remote.subscription.id)).await,
+            bindings: bindings(),
+        };
+        reconcile_subscription(&input, remote, T + P + 1)
+    }
+
     async fn try_put(
         &mut self,
         user: &str,
         outcome: &ReconcileOutcome,
-    ) -> Result<(), tokio_postgres::Error> {
-        billing_legacy_write::try_put(&mut self.db, user, outcome).await
+    ) -> Result<(), billing_transaction_fixture::FixtureError> {
+        billing_transaction_fixture::run(&mut self.db, &self.schema, user, outcome)
+            .await
+            .map(|_| ())
     }
 
     async fn put(&mut self, user: &str, outcome: &ReconcileOutcome) {
@@ -366,6 +383,116 @@ async fn first_insert_and_replay_preserve_subscription_and_history() {
     assert_eq!(fx.snap("sub_a").await, Some(seeded));
     assert_eq!(fx.rows("u1").await, 1);
     assert_eq!(fx.history_rows("sub_a").await, 2);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn exact_paid_periods_preserve_gaps_and_only_hydrate_owned_history() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    fx.add_user("u2").await;
+    let mut paid = invoice("sub_a", 1);
+    let template = paid.lines.as_ref().unwrap().data[0].clone();
+    paid.lines.as_mut().unwrap().data = [(3, 5), (10, 12), (0, 4), (4, 7)]
+        .into_iter()
+        .map(|(lo, hi)| InvoiceLine {
+            id: format!("il_{lo}"),
+            price: if lo == 0 {
+                Some("price_pro".into())
+            } else {
+                template.price.clone()
+            },
+            period: Some(InvoiceLinePeriod {
+                start: Some(T + lo),
+                end: Some(T + hi),
+            }),
+            ..template.clone()
+        })
+        .collect();
+    let mut prices = bindings();
+    prices.push(PriceBinding {
+        price_id: "price_pro".into(),
+        plan_id: "pro".into(),
+        selectable: true,
+        livemode: false,
+    });
+    let snapshot = remote("sub_a", &[paid]);
+    let fold = |live| {
+        reconcile_subscription(
+            &ReconcileInput {
+                stripe_customer_id: Some(CUS.into()),
+                live,
+                bindings: prices.clone(),
+            },
+            &snapshot,
+            T,
+        )
+    };
+    let o = fold(None);
+    let reported = &o.history[0];
+    assert_eq!(reported.plan_id, "plus");
+    assert_eq!(
+        (reported.period_start_unix, reported.period_end_unix),
+        (T + 3, T + 12)
+    );
+    assert_eq!(o.row.paid_through_unix, Some(T + 12));
+    let read = "SELECT (to_jsonb(h) - 'covered_periods')::text, covered_periods =
+        tstzmultirange(tstzrange(to_timestamp($1), to_timestamp($1 + 7), '[)'),
+                       tstzrange(to_timestamp($1 + 10), to_timestamp($1 + 12), '[)'))
+        FROM paid_invoice_history h WHERE stripe_invoice_id = 'inv_sub_a_1'";
+    fx.put("u1", &o).await;
+    assert_eq!(
+        fx.db
+            .query_one(read, &[&(T as f64)])
+            .await
+            .unwrap()
+            .get::<_, Option<bool>>(1),
+        Some(true)
+    );
+
+    // Simulate a pre-migration row with different stored reporting metadata.
+    fx.db
+        .execute(
+            "UPDATE paid_invoice_history SET covered_periods = NULL,
+        user_id = 'u2', stripe_subscription_id = 'sub_other', plan_id = 'pro',
+        period_start = period_start - interval '1 day', period_end = period_end + interval '1 day',
+        paid_at = paid_at - interval '1 hour', amount_cents = 700",
+            &[],
+        )
+        .await
+        .unwrap();
+    for (bind, exact) in [
+        ("", None),
+        ("UPDATE paid_invoice_history SET user_id = 'u1'", None),
+        (
+            "UPDATE paid_invoice_history SET stripe_subscription_id = 'sub_a', currency = 'eur'",
+            None,
+        ),
+        (
+            "UPDATE paid_invoice_history SET currency = 'usd'",
+            Some(true),
+        ),
+    ] {
+        if !bind.is_empty() {
+            fx.db.batch_execute(bind).await.unwrap();
+        }
+        let before = fx.db.query_one(read, &[&(T as f64)]).await.unwrap();
+        assert_eq!(before.get::<_, Option<bool>>(1), None);
+        let replay = fold(fx.select("u1", Some("sub_a")).await);
+        fx.put("u1", &replay).await;
+        let after = fx.db.query_one(read, &[&(T as f64)]).await.unwrap();
+        assert_eq!(before.get::<_, String>(0), after.get::<_, String>(0));
+        assert_eq!(after.get::<_, Option<bool>>(1), exact);
+    }
+    let mut changed_replay = fold(fx.select("u1", Some("sub_a")).await);
+    changed_replay.history[0].covered_periods = vec![(T + 20, T + 22)];
+    fx.put("u1", &changed_replay).await;
+    assert!(fx
+        .db
+        .query_one(read, &[&(T as f64)])
+        .await
+        .unwrap()
+        .get::<_, bool>(1));
     fx.cleanup().await;
 }
 
@@ -613,7 +740,11 @@ async fn insertion_conflicts_only_while_another_subscription_holds_the_slot() {
             reconcile_subscription(&input, &remote(&newcomer, &[invoice(&newcomer, 1)]), T);
         let result = fx.try_put(&user, &outcome).await;
         if live.contains(status) {
-            let error = result.expect_err(status);
+            let billing_transaction_fixture::FixtureError::Postgres(error) =
+                result.expect_err(status)
+            else {
+                panic!("expected PostgreSQL unique violation for {status}");
+            };
             assert_eq!(
                 error.code(),
                 Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
@@ -652,7 +783,11 @@ async fn foreign_remote_without_live_anchor_rolls_back_on_unique_violation() {
     assert!(b.invoices.iter().all(|i| Some(&i.id) != a.anchor.as_ref()));
     let outcome = fx.fold("u1", &b).await;
     assert_eq!(outcome.row.stripe_subscription_id, "sub_b");
-    let error = fx.try_put("u1", &outcome).await.expect_err("foreign B");
+    let billing_transaction_fixture::FixtureError::Postgres(error) =
+        fx.try_put("u1", &outcome).await.expect_err("foreign B")
+    else {
+        panic!("expected PostgreSQL unique violation for foreign B");
+    };
     assert_eq!(
         error.code(),
         Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
@@ -761,6 +896,122 @@ async fn target_selector_reads_archived_rows_without_changing_live_selection() {
 }
 
 #[tokio::test]
+async fn target_fold_before_slot_release_does_not_borrow_live_proof() {
+    let mut fx = Fx::new().await;
+    fx.add_user("u1").await;
+    let holder = fx.seed_active("u1", "sub_a").await;
+    let mut target = remote("sub_b", &[invoice("sub_b", 1)]);
+    target.subscription.items.as_mut().unwrap().data[0].id = "si_b".into();
+    let outcome = fx.fold_target("u1", &target).await;
+    assert_eq!(outcome.row.stripe_item_id, "si_b");
+    assert_eq!(outcome.row.stripe_price_id, PRICE);
+    assert_eq!(outcome.row.status, "active");
+    assert_eq!(outcome.row.grace_until_unix, None);
+    assert_eq!(outcome.row.plan_id, "plus");
+    assert_eq!(outcome.row.paid_through_unix, Some(T + P));
+    assert_eq!(outcome.row.paid_invoice_id.as_deref(), Some("inv_sub_b_1"));
+    assert_eq!(outcome.read_anchor, None);
+    assert_eq!(outcome.read_plan, None);
+    assert_eq!(fx.live("u1").await.unwrap().stripe_subscription_id, "sub_a");
+    assert_eq!(fx.snap("sub_a").await, Some(holder));
+    fx.db
+        .execute(
+            "UPDATE subscriptions SET status = 'canceled' WHERE stripe_subscription_id = 'sub_a'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let canceled = fx.snap("sub_a").await.unwrap();
+    fx.put("u1", &outcome).await;
+    assert_eq!(fx.snap("sub_a").await, Some(canceled));
+    let stored = fx.snap("sub_b").await.unwrap();
+    assert_eq!(
+        (
+            stored.item.as_str(),
+            stored.price.as_str(),
+            stored.plan.as_str(),
+            stored.status.as_str()
+        ),
+        ("si_b", PRICE, "plus", "active")
+    );
+    assert_eq!(
+        (stored.paid_through, stored.anchor.as_deref(), stored.grace),
+        (Some(T + P), Some("inv_sub_b_1"), None)
+    );
+    assert_eq!(fx.history_rows("sub_b").await, 1);
+    let history = fx.db.query_one(
+        "SELECT user_id, stripe_invoice_id, plan_id, EXTRACT(EPOCH FROM period_start)::bigint, EXTRACT(EPOCH FROM period_end)::bigint, amount_cents, currency, EXTRACT(EPOCH FROM paid_at)::bigint FROM paid_invoice_history WHERE stripe_subscription_id = $1",
+        &[&"sub_b"],
+    ).await.unwrap();
+    assert_eq!(
+        (
+            history.get::<_, String>(0),
+            history.get::<_, String>(1),
+            history.get::<_, String>(2)
+        ),
+        ("u1".into(), "inv_sub_b_1".into(), "plus".into())
+    );
+    assert_eq!(
+        (
+            history.get::<_, i64>(3),
+            history.get::<_, i64>(4),
+            history.get::<_, i64>(5),
+            history.get::<_, String>(6),
+            history.get::<_, i64>(7)
+        ),
+        (T, T + P, 800, "usd".into(), T)
+    );
+    assert_eq!(fx.live("u1").await.unwrap().stripe_subscription_id, "sub_b");
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn trialing_row_recovers_to_active_and_past_due_on_the_same_paid_evidence() {
+    let mut fx = Fx::new().await;
+    for status in ["active", "past_due"] {
+        let user = format!("u_{status}");
+        let sub = format!("sub_{status}");
+        fx.add_user(&user).await;
+        fx.seed_active(&user, &sub).await;
+        fx.db
+            .execute(
+                "UPDATE subscriptions SET status = 'trialing' WHERE stripe_subscription_id = $1",
+                &[&sub],
+            )
+            .await
+            .unwrap();
+        let archived = fx.snap(&sub).await.unwrap();
+        let mut missing = remote(&sub, &[]);
+        missing.subscription.status = status.into();
+        let stale = fx.fold_target(&user, &missing).await;
+        assert!(stale.explicit_stale);
+        assert_eq!(stale.read_anchor, archived.anchor);
+        fx.put(&user, &stale).await;
+        assert_eq!(fx.snap(&sub).await, Some(archived.clone()));
+        assert_eq!(fx.history_rows(&sub).await, 2);
+        assert!(fx.live(&user).await.is_none());
+
+        let mut fresh = remote(&sub, &[invoice(&sub, 1), invoice(&sub, 2)]);
+        fresh.subscription.status = status.into();
+        let outcome = fx.fold_target(&user, &fresh).await;
+        assert_eq!(outcome.read_anchor, archived.anchor);
+        fx.put(&user, &outcome).await;
+        let recovered = fx.snap(&sub).await.unwrap();
+        assert_eq!(recovered.status, status);
+        assert_eq!(
+            (recovered.plan.as_str(), recovered.paid_through),
+            ("plus", Some(T + 2 * P))
+        );
+        assert_eq!(recovered.anchor, archived.anchor);
+        assert_eq!(recovered.grace, outcome.row.grace_until_unix);
+        assert_eq!(recovered.grace.is_some(), status == "past_due");
+        assert_eq!(fx.history_rows(&sub).await, 2);
+        assert_eq!(fx.live(&user).await.unwrap().stripe_subscription_id, sub);
+    }
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn retained_subscription_rows_follow_existing_upsert_guards() {
     let mut fx = Fx::new().await;
     fx.add_user("u1").await;
@@ -814,6 +1065,8 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
     assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
     let mut stale = a.clone();
+    stale.read_plan = Some(expected.plan.clone());
+    stale.read_anchor = expected.anchor.clone();
     stale.row.paid_through_unix = Some(50);
     stale.row.status = "incomplete_expired".into();
     stale.row.stripe_customer_id = "cus_stale".into();
@@ -821,6 +1074,7 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     stale.row.stripe_price_id = "price_stale".into();
     stale.row.current_period_end_unix = Some(50);
     stale.row.cancel_at_period_end = true;
+    b.read_plan = Some(expected_b.plan.clone());
     for _ in 0..2 {
         fx.put("u1", &stale).await;
         assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
@@ -831,6 +1085,8 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
     let mut advanced = a.clone();
     advanced.row.plan_id = "pro".into();
     for end in [150, 200] {
+        advanced.read_plan = Some(expected.plan.clone());
+        advanced.read_anchor = expected.anchor.clone();
         advanced.row.paid_through_unix = Some(end);
         advanced.row.paid_invoice_id = Some(format!("in_{end}"));
         fx.put("u1", &advanced).await;
@@ -840,13 +1096,15 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
         assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
     }
     fx.put("u1", &b).await;
-    fx.put("u1", &a).await;
+    stale.row = a.row.clone();
+    fx.put("u1", &stale).await;
     assert_eq!(fx.snap("sub_test_1").await.as_ref(), Some(&expected));
     assert_eq!(fx.snap("sub_other").await.as_ref(), Some(&expected_b));
     assert_eq!(fx.history_rows("sub_test_1").await, 0);
     assert_eq!(fx.rows("u1").await, 2);
 
-    // The same named write-boundary cases are exercised by the handler test.
+    // The handler test exercises the same cases against the legacy upsert.
+    // The owned transaction refuses changed terminal proof before that write.
     for case in [
         "valid",
         "shared",
@@ -894,7 +1152,16 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
             incoming.row.paid_through_unix = Some(150);
         }
         let stored_before = fx.snap(&sub).await.unwrap();
-        fx.put("u1", &incoming).await;
+        let changed_proof = matches!(case, "read-plan" | "read-anchor");
+        if changed_proof {
+            let result = fx.try_put("u1", &incoming).await;
+            assert!(
+                matches!(&result, Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "changed terminal read provenance"),
+                "{case}: {result:?}"
+            );
+        } else {
+            fx.put("u1", &incoming).await;
+        }
         let mut expected = Snap {
             user_id: "u1".into(),
             customer: "cus_new".into(),
@@ -908,14 +1175,13 @@ async fn retained_subscription_rows_follow_existing_upsert_guards() {
             anchor: Some("in_new".into()),
             grace: Some(20),
         };
-        if matches!(case, "read-plan" | "read-anchor" | "no-anchor" | "null-end") {
+        if changed_proof || case == "no-anchor" {
+            expected = stored_before;
+        } else if case == "null-end" {
             expected.plan = "plus".into();
             expected.anchor = Some("in_old".into());
         } else if case == "shared" || case == "advance-null-anchor" {
             expected.anchor = Some("in_old".into());
-        }
-        if case == "no-anchor" {
-            expected = stored_before;
         }
         if case == "advance-null-anchor" {
             expected.paid_through = Some(150);
@@ -961,6 +1227,7 @@ async fn table_exclusion_blocks_raw_writer_but_not_plain_reader() {
             include_str!("../../../migrations/0021_billing_schema.sql"),
             include_str!("../../../migrations/0026_plan_reseed_no_trial.sql"),
             include_str!("../../../migrations/0029_paid_invoice_history.sql"),
+            paid_coverage_fixture_migration(),
         ] {
             db.batch_execute(migration).await?;
         }
@@ -1491,21 +1758,34 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     fx.add_user("u2").await;
     let schema = fx.schema.clone();
     // Non-explicit guarded upsert: exact RETURNING, then an equal-end replay.
-    let first = fx
-        .fold(
-            "u1",
-            &remote("sub_a", &[invoice("sub_a", 1), invoice("sub_a", 2)]),
-        )
-        .await;
+    let snapshot = remote("sub_a", &[invoice("sub_a", 1), invoice("sub_a", 2)]);
+    let first = fx.fold_target("u1", &snapshot).await;
+    let mut terminal = snapshot.clone();
+    terminal.subscription.status = "canceled".into();
+    let mut without_read = fx.fold_target("u1", &terminal).await;
+    assert!(!without_read.explicit_stale && without_read.read_plan.is_none());
+    // The terminal fold itself emits no history. Supply a fresh, attributed
+    // item so a mistaken history-only success is also observable.
+    let mut late_history = first.history[0].clone();
+    late_history.stripe_invoice_id = "inv_late_terminal".into();
+    without_read.history.push(late_history);
     assert!(!first.explicit_stale);
     assert!(matches!(
         run(&mut fx.db, &schema, "u1", &first).await,
         Ok(Class::Wrote)
     ));
     let stored = fx.snap("sub_a").await.unwrap();
-    assert_eq!(fx.history_rows("sub_a").await, 2);
+    for _ in 0..2 {
+        assert!(
+            matches!(run(&mut fx.db, &schema, "u1", &without_read).await,
+            Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "missing exact-target read provenance")
+        );
+        assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
+        assert_eq!(fx.history_rows("sub_a").await, 2);
+    }
+    let replay = fx.fold_target("u1", &snapshot).await;
     assert!(matches!(
-        run(&mut fx.db, &schema, "u1", &first).await,
+        run(&mut fx.db, &schema, "u1", &replay).await,
         Ok(Class::Wrote)
     ));
     assert_eq!(fx.snap("sub_a").await, Some(stored.clone()));
@@ -1553,6 +1833,8 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     assert!(matches!(run(&mut fx.db, &schema, "u1", &absent).await,
         Err(billing_transaction_fixture::FixtureError::Refusal(message)) if message == "absent row with history rejected"));
     assert_eq!(fx.history_rows("sub_a").await, 3);
+    assert_eq!(fx.history_rows("sub_missing").await, 0);
+    assert!(fx.snap("sub_missing").await.is_none());
     absent.history.clear();
     assert!(matches!(
         run(&mut fx.db, &schema, "u1", &absent).await,
@@ -1587,5 +1869,16 @@ async fn coupled_transaction_matrix_and_rollback_on_disposable_schema() {
     assert!(fx.snap("sub_r").await.is_none());
     assert_eq!(fx.history_rows("sub_r").await, 0);
     assert_eq!(fx.snap("sub_a").await, Some(stored));
+
+    let mut retry = fx.fold_target("u1", &terminal).await;
+    assert!(retry.read_plan.is_some());
+    retry.history = without_read.history;
+    fx.put("u1", &retry).await;
+    assert_eq!(fx.history_rows("sub_a").await, 4);
+    let canceled = fx.snap("sub_a").await.unwrap();
+    assert_eq!(canceled.status, "canceled");
+    fx.put("u1", &retry).await;
+    assert_eq!(fx.snap("sub_a").await, Some(canceled));
+    assert_eq!(fx.history_rows("sub_a").await, 4);
     fx.cleanup().await;
 }

@@ -3,6 +3,40 @@ use crate::digest_geometry::DigestGeometry;
 use crate::digest_test_fixture::{fixture, synthetic_single_chunk, Fixture};
 
 #[test]
+fn partial_range_releases_no_bytes_from_a_failed_later_chunk() {
+    let mut plaintext = vec![0; 65_539];
+    plaintext[65_535..].copy_from_slice(&[11, 22, 33, 44]);
+    let sample = fixture(&plaintext);
+    let plan = sample.manifest.geometry().range(65_535, 65_537).unwrap();
+    let wire: Vec<_> = sample
+        .header
+        .iter()
+        .chain(sample.chunks.iter().flatten())
+        .copied()
+        .collect();
+    let mut cursor = DigestRange::new(&sample.manifest, &sample.key, 65_535, 65_537).unwrap();
+    let sealed = |index| {
+        let span = plan.sealed_chunk(index).unwrap().ciphertext;
+        wire[span.start as usize..span.end as usize].to_vec()
+    };
+    let first = cursor
+        .open_next(0, &sample.pages[0], sealed(0), Some(&sample.header))
+        .unwrap();
+    assert_eq!(first.as_slice(), &[11]);
+    let mut second = sealed(1);
+    *second.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        cursor.open_next(1, &sample.pages[0], second, None),
+        Err(RangeError::DigestMismatch)
+    ));
+    assert_eq!(cursor.next_indices(), None);
+    assert!(matches!(
+        cursor.open_next(1, &sample.pages[0], sealed(1), None),
+        Err(RangeError::InvalidChunk)
+    ));
+}
+
+#[test]
 fn empty_final_and_wrong_finality() {
     for (length, final_chunk) in [(0_u64, true), (65_536, false)] {
         let Fixture {
@@ -12,7 +46,7 @@ fn empty_final_and_wrong_finality() {
             chunks,
             pages,
         } = synthetic_single_chunk(length, final_chunk);
-        let mut cursor = DigestRange::new(&manifest, &key, 0, length).unwrap();
+        let mut cursor = DigestRange::new(&manifest, &key, 0, length.min(1)).unwrap();
         let result = cursor.open_next(0, &pages[0], chunks[0].clone(), Some(&header));
         if final_chunk {
             assert!(result.unwrap().as_slice().is_empty());

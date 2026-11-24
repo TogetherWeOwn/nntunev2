@@ -73,6 +73,15 @@ pub fn authenticate(
     secret: Option<&str>,
     now_unix: u64,
 ) -> Result<Caller, AuthError> {
+    authenticate_scoped(authorization, secret, now_unix, INGEST_WRITE_SCOPE)
+}
+
+pub(crate) fn authenticate_scoped(
+    authorization: Option<&str>,
+    secret: Option<&str>,
+    now_unix: u64,
+    scope: &str,
+) -> Result<Caller, AuthError> {
     let secret = match secret {
         Some(s) if s.len() >= MIN_SECRET_BYTES => s.as_bytes(),
         _ => return Err(AuthError::NotConfigured),
@@ -80,11 +89,20 @@ pub fn authenticate(
     let token = authorization
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or(AuthError::Missing)?;
-    verify(token, secret, now_unix)
+    verify_scoped(token, secret, now_unix, scope)
 }
 
 /// Verify one grant token.
 pub fn verify(token: &str, secret: &[u8], now_unix: u64) -> Result<Caller, AuthError> {
+    verify_scoped(token, secret, now_unix, INGEST_WRITE_SCOPE)
+}
+
+fn verify_scoped(
+    token: &str,
+    secret: &[u8],
+    now_unix: u64,
+    required_scope: &str,
+) -> Result<Caller, AuthError> {
     let rest = token.strip_prefix("v1.").ok_or(AuthError::Malformed)?;
     let (payload_hex, sig_hex) = rest.split_once('.').ok_or(AuthError::Malformed)?;
     if payload_hex.is_empty() {
@@ -105,7 +123,7 @@ pub fn verify(token: &str, secret: &[u8], now_unix: u64) -> Result<Caller, AuthE
     if !validate_user_id(user_id) {
         return Err(AuthError::Malformed);
     }
-    if scope != INGEST_WRITE_SCOPE {
+    if scope != required_scope {
         return Err(AuthError::WrongScope);
     }
     let exp_unix: u64 = exp.parse().map_err(|_| AuthError::Malformed)?;

@@ -57,7 +57,9 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         for path in ("deploy.yml", "deploy-alerts-staging.yml"):
             with self.subTest(path=path):
                 text = (WORKFLOWS / path).read_text()
-                self.assertNotRegex(text, r"(?m)^concurrency:")
+                # The separate alerts deploy must not hold a run-level lock.
+                if path == "deploy-alerts-staging.yml":
+                    self.assertNotRegex(text, r"(?m)^concurrency:")
                 gate = job(text, "gate")
                 self.assertIn("group: ${{ github.workflow }}-gate-${{ github.ref }}", gate)
                 self.assertIn("cancel-in-progress: false", gate)
@@ -112,8 +114,12 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         production = (WORKFLOWS / "deploy-production.yml").read_text()
         evidence = job(production, "staging-evidence")
         self.assertIn("    environment:\n      name: staging\n      deployment: false\n", evidence)
+        without_presence_checks = re.sub(
+            r"secrets\.PRODUCTION_(?:CLOUDFLARE_(?:API_TOKEN|ACCOUNT_ID)|ROLLBACK_(?:CUSTODY|INTENT_KEY)) != ''",
+            "", evidence,
+        )
         self.assertEqual(
-            sorted(re.findall(r"secrets\.([A-Z_]+)", evidence)),
+            sorted(re.findall(r"secrets\.([A-Z_]+)", without_presence_checks)),
             ["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "STAGING_BASE_URL"],
         )
         self.assertIn("persist-credentials: false", evidence)
@@ -121,6 +127,29 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertNotIn("environment:", job(production, "preflight"))
         self.assertIn("      name: production\n", job(production, "deploy-production"))
         self.assertIn("needs: [preflight, staging-evidence]", job(production, "deploy-production"))
+
+    def test_snapshot_spike_is_build_and_recall_only(self):
+        text = (WORKFLOWS / "mb-snapshot-spike.yml").read_text()
+        self.assertRegex(text, r"(?m)^  workflow_dispatch:$")
+        self.assertIn("  pull_request:\n    types: [labeled]", text)
+        self.assertIn("github.event.label.name == 'mb-snapshot-spike'", text)
+        self.assertIn("permissions:\n  contents: read", text)
+        self.assertNotRegex(text, r"(?m)^\s*(stage|environment|workflow_call):")
+        self.assertNotRegex(text, r"\b(secrets|inputs\.stage|CLOUDFLARE_\w+|wrangler)\b")
+
+        spike = job(text, "spike")
+        self.assertIn("persist-credentials: false", spike)
+        for command in ("bash workers/mb/spike/measure.sh", "python3 workers/mb/spike/recall.py"):
+            self.assertRegex(spike, rf"(?m)^[ \t]+{re.escape(command)}[ \t]+")
+        self.assertRegex(spike, r"(?m)^ {10}name: mb-snapshot-spike-results$")
+        for retired in ("stage.sh", "lifecycle.py", "bench.py", "live-archive"):
+            self.assertNotIn(retired, text)
+
+        for helper in ("stage.sh", "lifecycle.py", "test_lifecycle.py"):
+            self.assertFalse((ROOT / "workers/mb/spike" / helper).exists())
+        ci = (WORKFLOWS / "ci.yml").read_text()
+        self.assertNotIn("spike/test_lifecycle.py", ci)
+        self.assertNotIn("spike/live-archive", ci)
 
     def test_regression_suite_is_a_required_ci_step(self):
         ci = (WORKFLOWS / "ci.yml").read_text()

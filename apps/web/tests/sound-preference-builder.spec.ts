@@ -17,6 +17,7 @@ for (const mode of ['throw', 'ignore']) {
 		await frames(page);
 		await expectSound(page, 1, false);
 		await expect(volumeControl(page)).toHaveValue('100');
+		await expect(volumeControl(page)).toHaveAccessibleName('Volume 100%');
 		await expect(volumeControl(page)).toBeDisabled();
 		await expect(page.getByRole('status').filter({ hasText: "Use system volume controls." })).toBeVisible();
 		expect(await playCount(page)).toBe(0);
@@ -32,6 +33,42 @@ for (const mode of ['throw', 'ignore']) {
 		expect(errors).toEqual([]);
 	});
 }
+
+test('keyboard volume and mute reflect native readback without moving paused position', async ({ page }) => {
+	const errors = await openPlayer(page);
+	const audio = page.getByTestId('demo-audio');
+	const volume = volumeControl(page);
+	const mute = muteControl(page);
+	await audio.evaluate((el: HTMLAudioElement) => { el.currentTime = 5; });
+	await expect.poll(() => audio.evaluate(
+		(el: HTMLAudioElement) => el.seeking ? null : el.currentTime
+	)).toBe(5);
+
+	await expect(volume).toHaveAccessibleName('Volume 100%');
+	await volume.press('Home');
+	await expectSound(page, 0, false);
+	await volume.press('ArrowRight');
+	await expectSound(page, 0.01, false);
+	await expect(volume).toHaveValue('1');
+	await expect(volume).toHaveAccessibleName('Volume 1%');
+	await expect(mute).toHaveAccessibleName('Mute');
+	await mute.press('Space');
+	await expectSound(page, 0.01, true);
+	await expect(mute).toHaveAttribute('aria-pressed', 'true');
+	expect(await media(page)).toMatchObject({ time: 5, paused: true });
+
+	await audio.evaluate((el: HTMLAudioElement) => {
+		el.volume = 0.42;
+		el.muted = false;
+	});
+	await expect(volume).toHaveValue('42');
+	await expect(volume).toHaveAccessibleName('Volume 42%');
+	await expect(mute).toHaveAttribute('aria-pressed', 'false');
+	await expect.poll(() => preference(page)).toEqual({ version: 1, volume: 0.42, muted: false });
+	expect(await media(page)).toMatchObject({ time: 5, paused: true });
+	expect(await playCount(page)).toBe(0);
+	expect(errors).toEqual([]);
+});
 
 test('same-track error retry reapplies sound before the replacement play', async ({ page }) => {
 	const errors = await openPlayer(page);

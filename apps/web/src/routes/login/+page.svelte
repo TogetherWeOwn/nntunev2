@@ -107,8 +107,8 @@
 			);
 			if (attempt.signal.aborted) return;
 			stashSignedInEmail(attemptedEmail);
-			invalidateLibraryCache();
-			window.location.href = '/library';
+			await invalidateLibraryCache();
+			if (!attempt.signal.aborted) window.location.href = '/library';
 		} catch (error) {
 			if (attempt.signal.aborted) return;
 			if (error instanceof ApiError && error.paywall) {
@@ -137,10 +137,11 @@
 
 	<section aria-labelledby="passkey-heading">
 		<h2 id="passkey-heading">Passkey</h2>
-		<p>Enter your email below, then use your passkey.</p>
+		<p id="passkey-instructions">Enter your email below, then use your passkey.</p>
 		<button
 			class="nt-button"
 			type="button"
+			aria-describedby="passkey-instructions"
 			onclick={signInWithPasskey}
 			disabled={passkeyStatus === 'working'}
 		>
@@ -165,13 +166,14 @@
 	<section aria-labelledby="magic-link-heading">
 		<h2 id="magic-link-heading">Email link</h2>
 		<form onsubmit={sendMagicLink}>
-			<label>
+			<label for="login-email">
 				Email
 				<input
+					id="login-email"
 					type="email"
 					name="email"
 					required
-					autocomplete="email"
+					autocomplete="username"
 					bind:this={emailInput}
 					bind:value={email}
 					disabled={status === 'sending' || passkeyStatus === 'working'}

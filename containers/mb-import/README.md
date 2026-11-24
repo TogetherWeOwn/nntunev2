@@ -24,17 +24,119 @@ Container image for the two batch jobs behind `nntunev2-mb`
 
 Run `DUMP_TS=<ISO-8601 timestamp> ./etl.sh <mbdump-dir>` before
 `import.sh <mbdump-dir>/curated`. The input directory must contain the official,
-uncompressed, headerless MusicBrainz COPY files: the entity files (`artist`
-with `artist_type`/`area`/`iso_3166_1` lookups, `release` with
-`artist_credit_name`/`release_group`/`release_group_primary_type`/`release_country`/`release_unknown_country`,
-`recording` with `medium`/`track`) plus the relationship files (`url`,
-`link_type`, `link`, `link_attribute_type`, `link_attribute`,
-`l_artist_url`, `l_recording_url`, `l_recording_recording`, `isrc`) listed in
-`etl.py`. The ETL writes the ten curated `mbdump-<table>.tsv` files into an
-immutable snapshot and atomically swaps `<mbdump-dir>/curated` to point to it;
-previous snapshots are retained. It uses the image's Python 3 and a temporary,
-disk-backed SQLite projection (no external database). Run the fixture checks
-with `bash containers/mb-import/tests/test_etl.sh` and
+headerless MusicBrainz COPY files from the CC0 core dump: the entity files
+(`artist` with `artist_alias` and `artist_type`/`area`/`iso_3166_1` lookups,
+`release` with `release_alias` and `artist_credit_name`/`release_country`/`release_unknown_country`,
+`release_group` with `release_group_alias` and `release_group_primary_type`,
+`recording` with `recording_alias`/`medium`/`track`, `work` with
+`work_alias`/`work_type`, `label` with `label_alias`/`label_type`) plus the relationship files
+(`url`, `link_type`, `link`, `link_attribute_type`, `link_attribute`,
+`l_artist_url`, `l_recording_url`, `l_recording_recording`, `l_recording_work`,
+`l_artist_recording`, `l_artist_release`, `l_artist_work`, `release_label`, `isrc`) listed in
+`etl.py`. The ETL writes the ten curated import files and the sidecars below
+into an immutable snapshot and atomically swaps
+`<mbdump-dir>/curated` to point to it; previous snapshots
+are retained. It uses the image's Python 3 and a temporary, disk-backed SQLite
+projection (no external database). `stream_extract.py` admits the same required
+tables as `.gz` inputs for the disk-bounded path.
+
+The sidecar `mbdump-release_credit.tsv` contains the release MBID, zero-based
+credit position, artist MBID, credited name, join phrase, and dump timestamp.
+It keeps every credit position and the upstream COPY text, not just the first
+artist in the release row.
+
+The sidecar `mbdump-artist_alias.tsv` contains the artist MBID, alias name,
+locale (empty for NULL), sort name, primary-for-locale (`t` or `f`), and dump
+timestamp. Keys use the COPY-decoded name and locale. Each key keeps one
+source row's COPY text: primary wins, then the greatest raw sort name, then
+the lowest alias ID. Missing artists and malformed primary flags refuse ETL.
+
+`mbdump-recording_alias.tsv` uses the same columns and tie-break, with a
+lowercase recording MBID instead of an artist MBID. It is sorted by MBID,
+decoded alias name, and decoded locale. It includes aliases for recordings
+with no track, and refuses malformed projected fields or missing recordings.
+An empty `recording_alias` input produces an empty sidecar; disk-bounded
+mode writes the same TSV content under `.tsv.gz`.
+
+`mbdump-release_alias.tsv` uses the same columns and tie-break, keyed by
+the exact release MBID in `mbdump-release.tsv`. The 16-column CC0
+`release_alias` input uses the same COPY positions as `recording_alias`.
+Rows sort by release MBID, decoded alias name, and decoded locale. Malformed
+projected fields or missing releases refuse publication; an empty input
+produces an empty sidecar. Disk-bounded mode emits the same rows as `.tsv.gz`.
+
+`mbdump-release_group_alias.tsv` uses the same columns and tie-break, but
+keys aliases by the exact group MBID from `mbdump-release_group.tsv`, not a
+release MBID. The required CC0 `release_group_alias` input has 16 COPY fields:
+ID, parent, name, locale, sort name, and primary flag are at positions 1, 2,
+3, 4, 8, and 15, respectively. Rows sort by group MBID, decoded name, and
+decoded locale. Groups without aliases produce no sidecar rows; an empty
+input produces an empty sidecar. Dangling group references or malformed
+projected fields refuse publication. Disk-bounded mode emits the same TSV
+content under `.tsv.gz`.
+
+The sidecar `mbdump-work.tsv` contains the work MBID, title, work-type name
+(`\N` for an untyped work), and dump timestamp, ordered by upstream work ID.
+It preserves the COPY text of the title and type name. A non-NULL type ID
+with no lookup row refuses publication; an empty `work` file produces an
+empty sidecar. Disk-bounded mode emits the same TSV content under `.tsv.gz`.
+
+`mbdump-work_alias.tsv` uses the alias columns and whole-row tie-break above,
+keyed by the work MBID in `mbdump-work.tsv`, not a recording MBID. The required
+CC0 `work_alias` input has 16 COPY fields and uses the same field positions as
+`release_group_alias`. Rows sort by work MBID, decoded alias name, and decoded
+locale. Works without aliases produce no rows; an empty input produces an
+empty sidecar. Malformed projected fields or missing works refuse publication.
+Disk-bounded mode emits the same TSV content under `.tsv.gz`.
+
+The `mbdump-artist_recording.tsv`, `mbdump-artist_release.tsv`, and
+`mbdump-artist_work.tsv` sidecars contain the artist MBID, the corresponding
+recording, release (not release-group), or work MBID, link-type name (raw COPY
+text), and dump timestamp. `mbdump-recording_work.tsv` has the same shape.
+Nine-field COPY rows supply link, source, and target IDs at positions 2–4.
+The ETL resolves `link → link_type` and verifies the declared direction.
+
+Rows sort and deduplicate by source MBID, target MBID, and decoded type name,
+keeping the smallest raw COPY spelling for ties. Empty sources emit empty
+sidecars; malformed fields, missing endpoints, links or types, and wrong
+direction refuse publication. Disk-bounded mode writes `.tsv.gz`. URL/video
+allowlists and the SQL importer's ten inputs are unchanged.
+See upstream [core table membership](https://github.com/metabrainz/musicbrainz-server/blob/master/lib/MusicBrainz/Server/Constants.pm)
+and the [core export definition](https://github.com/metabrainz/musicbrainz-server/blob/master/admin/ExportAllTables).
+
+`mbdump-recording_recording.tsv` contains `entity0` recording MBID, `entity1`
+recording MBID, link-type name (raw COPY text), and dump timestamp. It keeps
+both directions if present and deduplicates by directed MBID pair and decoded
+type name, retaining the smallest raw COPY spelling. It excludes the pinned
+music-video type, not the pair: a separate song relation on the same endpoints
+still appears. The existing undirected video projection is unchanged. Empty or
+video-only input yields an empty sidecar; malformed or dangling references
+refuse publication. Disk-bounded mode writes the same content as `.tsv.gz`.
+
+`mbdump-label.tsv` contains label MBID, name, label code, label-type name,
+and dump timestamp, ordered by upstream label ID. An absent code or type is
+`\N`. `mbdump-release_label.tsv` contains release MBID, label MBID, catalogue
+number, and dump timestamp. Rows without a label do not produce edges. For
+real labels, a missing catalogue number becomes empty text. Edges are sorted
+and deduplicated by release MBID, label MBID, and COPY-decoded number, then
+re-escaped without changing case or whitespace. Both sidecars use `.tsv.gz`
+in disk-bounded mode. Malformed fields and dangling references used by these
+projections refuse publication, even if other edges are valid.
+
+`mbdump-label_alias.tsv` uses the alias columns and whole-row tie-break above,
+keyed by the exact label MBID in `mbdump-label.tsv`. The CC0 archive member
+`mbdump/label_alias` has 16 COPY fields: alias ID, label ID, name, locale, sort
+name, and primary flag are at positions 1, 2, 3, 4, 8, and 15. Rows sort by
+label MBID, COPY-decoded name, and COPY-decoded locale. An empty input emits
+an empty sidecar; malformed projected fields or dangling label IDs refuse
+publication. Disk-bounded mode emits the same TSV content under `.tsv.gz`.
+
+`import.sh` still loads only its existing ten files; no database table or read
+route consumes the sidecars yet. To regenerate an older snapshot with the
+sidecars, use a fresh dump directory and keep the original dump timestamp. An
+existing snapshot is never modified in place.
+
+Run the fixture checks with `bash containers/mb-import/tests/test_etl.sh` and
 `bash containers/mb-import/tests/test_etl_reference_graphs.sh` (from the
 repository root — the latter pins four broken-reference refusal diagnostics:
 missing artist_type, release credit-name rows, track recording, medium
@@ -44,7 +146,7 @@ shipping fixtures in the runtime image. (Sources: `etl.sh:1-14`;
 `etl.py` `validate_timestamp` (`DUMP_TS` validation), `main` (temp SQLite projection; immutable
 snapshot + atomic `curated` symlink swap, previous snapshots retained);
 `tests/test_etl.sh`; `Dockerfile:9-17,40-41`;
-`.github/workflows/ci.yml:298-313`.)
+`.github/workflows/ci.yml:629-640`.)
 
 ### Import admission
 
@@ -106,7 +208,7 @@ field order; use an extract from the matching schema revision. Derivations:
   (canonical recording, membership rows); `migrations/0016_mb_track.sql`;
   `import.sh:538-545` (FK specs);
   `crates/mb-import-validate/src/lib.rs` (`Position` check).)
-- Relationship slices keep only allowlisted link types, resolved from their
+- Legacy URL and music-video slices keep only allowlisted link types, resolved from their
   pinned GIDs (artist `youtube` / `youtube music` / `free streaming` /
   `streaming`, recording `free streaming`, recording-recording
   `music video`); a dump missing any pinned GID fails closed, as does a
@@ -207,7 +309,7 @@ resume — suites 1-12 cover all ten tables, including the relationship/ISRC
 generators and the newer/older-changed-dump and split-fixture suites) against
 a scratch database: (Sources: `test-import.sh:10-15` (contract/refusal
 guard), `:111-665` (suites 1-12);
-`.github/workflows/ci.yml:746-790`.)
+`.github/workflows/ci.yml:1157-1205`.)
 
 The shipped CI image carries `mb-validate`.
 The Docker build and import test suite run in the GitHub Actions

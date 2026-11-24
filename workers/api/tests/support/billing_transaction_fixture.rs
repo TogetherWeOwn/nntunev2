@@ -2,7 +2,14 @@
 //! Only the generated Fx schema is substituted for the fixed `public` relation.
 
 use nntune_api::billing_reconcile::{insert_paid_invoice_history_statement, ReconcileOutcome};
-use nntune_api::billing_transaction_sql::{LOCK_SUBSCRIPTIONS, LOOKUP_TARGET, WRITE_SUBSCRIPTION};
+use nntune_api::billing_store_classification::{
+    classify_explicit_stale, classify_target, classify_write, has_slot_suppression_proof,
+    validate_history_target, validate_read_provenance, validate_terminal_provenance, Accepted,
+    Identity, ObservedTarget, Target,
+};
+use nntune_api::billing_transaction_sql::{
+    LookupBinds, LOCK_SUBSCRIPTIONS, LOOKUP_TARGET, WRITE_SUBSCRIPTION,
+};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::Client;
 
@@ -10,6 +17,7 @@ use tokio_postgres::Client;
 pub enum Class {
     Wrote,
     OwnStale,
+    LiveSlotSuppressed,
     AbsentEmpty,
 }
 
@@ -33,8 +41,13 @@ pub fn fixed_sql(schema: &str) -> [String; 3] {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_')
     );
-    [LOCK_SUBSCRIPTIONS, LOOKUP_TARGET, WRITE_SUBSCRIPTION].map(|sql| {
-        assert_eq!(sql.matches("public.subscriptions").count(), 1);
+    [
+        (LOCK_SUBSCRIPTIONS, 1),
+        (LOOKUP_TARGET, 2),
+        (WRITE_SUBSCRIPTION, 2),
+    ]
+    .map(|(sql, count)| {
+        assert_eq!(sql.matches("public.subscriptions").count(), count);
         let out = sql.replace("public.subscriptions", &format!("{schema}.subscriptions"));
         assert!(!out.contains("public."));
         out
@@ -56,6 +69,14 @@ pub async fn run(
         .await
         .map_err(e)?;
     let result = async {
+    // Model the reserved work-phase ceiling; the fixture does not model the
+    // Worker connection or its outer deadline.
+    tx.batch_execute("SET LOCAL transaction_timeout = 9000; SET LOCAL lock_timeout = 4000; SET LOCAL statement_timeout = 5000; SET LOCAL idle_in_transaction_session_timeout = 5000")
+        .await.map_err(e)?;
+    tx.query(
+        &tx.prepare_typed(nntune_api::billing_reconcile::reconcile_lock_statement(), &[Type::TEXT]).await.map_err(e)?,
+        &[&user],
+    ).await.map_err(e)?;
     tx.batch_execute(&lock).await.map_err(e)?;
     let held = tx
         .query_one("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() AND relation = $1::text::regclass AND mode = 'ShareRowExclusiveLock' AND granted)", &[&format!("{schema}.subscriptions")])
@@ -64,43 +85,47 @@ pub async fn run(
         return Err("relation lock not held before lookup".into());
     }
     let r = &o.row;
+    let binds = LookupBinds {
+        subscription_id: &r.stripe_subscription_id,
+        paid_through_seconds: r.paid_through_unix,
+        paid_invoice_id: r.paid_invoice_id.as_deref(),
+        read_anchor: o.read_anchor.as_deref(),
+        read_plan: o.read_plan.as_deref(),
+    };
+    let (subscription_id, paid_through, paid_invoice, read_anchor, read_plan) = binds.ordered();
     // Fresh global lookup, a separate statement after the lock; no owner filter.
     let found = tx
-        .query_opt(
-            &tx.prepare_typed(&lookup, &[Type::TEXT, Type::INT8, Type::TEXT])
+        .query(
+            &tx.prepare_typed(&lookup, &[Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT])
                 .await
                 .map_err(e)?,
-            &[
-                &r.stripe_subscription_id,
-                &r.paid_through_unix,
-                &r.paid_invoice_id,
-            ],
+            &[&subscription_id, &paid_through, &paid_invoice, &read_anchor, &read_plan],
         )
         .await
         .map_err(e)?;
-    let (own, stale) = match found {
-        Some(f) => {
-            let owner: String = f.try_get(0).map_err(e)?;
-            let key: String = f.try_get(1).map_err(e)?;
-            let stale: bool = f.try_get(2).map_err(e)?;
-            if key != r.stripe_subscription_id || owner != user {
-                return Err("foreign or mismatched target".into());
-            }
-            (Some(true), stale)
-        }
-        None => (None, false),
-    };
-    if o.history.iter().any(|h| h.stripe_subscription_id != r.stripe_subscription_id) {
-        return Err("history target mismatch".into());
-    }
-    let class = if o.explicit_stale {
-        match own {
-            Some(true) => Class::OwnStale,
-            Some(false) => return Err("foreign row rejected".into()),
-            None if o.history.is_empty() => Class::AbsentEmpty,
-            None => return Err("absent row with history rejected".into()),
-        }
+    let observed = found
+        .iter()
+        .map(|row| {
+            Ok(ObservedTarget {
+                identity: Identity { user_id: row.try_get(0)?, subscription_id: row.try_get(1)? },
+                predicate_stale: row.try_get(2)?,
+                other_live_holder: row.try_get("other_live_holder")?,
+                equal_end_provenance_changed: row.try_get("equal_end_provenance_changed")?,
+            })
+        })
+        .collect::<Result<Vec<_>, tokio_postgres::Error>>()
+        .map_err(e)?;
+    let requested = Identity { user_id: user, subscription_id: &r.stripe_subscription_id };
+    let target = classify_target(&requested, &observed).map_err(|_| "foreign or mismatched target")?;
+    validate_history_target(o).map_err(|_| "history target mismatch")?;
+    let accepted = if o.explicit_stale {
+        classify_explicit_stale(&target, o.history.is_empty())
+            .map_err(|_| "absent row with history rejected")?
     } else {
+        validate_read_provenance(o, matches!(&target, Target::Owned { .. }))
+            .map_err(|_| "missing exact-target read provenance")?;
+        validate_terminal_provenance(o, &target)
+            .map_err(|_| "changed terminal read provenance")?;
         let types = [Type::TEXT; 7]
             .into_iter()
             .chain([
@@ -135,18 +160,16 @@ pub async fn run(
             .query(&tx.prepare_typed(&write, &types).await.map_err(e)?, &params)
             .await
             .map_err(e)?;
-        match rows.as_slice() {
-            [row] => {
-                let owner: String = row.try_get(0).map_err(e)?;
-                let key: String = row.try_get(1).map_err(e)?;
-                if owner != user || key != r.stripe_subscription_id {
-                    return Err("write identity mismatch".into());
-                }
-                Class::Wrote
-            }
-            [] if own == Some(true) && stale => Class::OwnStale,
-            _ => return Err(FixtureError::Refusal(format!("unrecognized write result: {} rows", rows.len()))),
-        }
+        let returned = rows.iter().map(|row| {
+            Ok(Identity { user_id: row.try_get(0)?, subscription_id: row.try_get(1)? })
+        }).collect::<Result<Vec<_>, tokio_postgres::Error>>().map_err(e)?;
+        classify_write(&requested, &target, &returned, has_slot_suppression_proof(o)).map_err(|_| "unrecognized write result")?
+    };
+    let class = match accepted {
+        Accepted::AppliedOwned => Class::Wrote,
+        Accepted::StaleOwned | Accepted::PredicateStaleOwned => Class::OwnStale,
+        Accepted::StaleAbsentEmpty => Class::AbsentEmpty,
+        Accepted::LiveSlotSuppressedOwned => Class::LiveSlotSuppressed,
     };
     let history = tx
         .prepare_typed(
@@ -161,11 +184,14 @@ pub async fn run(
                 Type::INT8,
                 Type::TEXT,
                 Type::INT8,
+                Type::INT8_ARRAY,
+                Type::INT8_ARRAY,
             ],
         )
         .await
         .map_err(e)?;
     for h in &o.history {
+        let (starts, ends) = h.coverage_bounds();
         tx.execute(
             &history,
             &[
@@ -178,6 +204,8 @@ pub async fn run(
                 &h.amount_cents,
                 &h.currency,
                 &h.paid_at_unix,
+                &starts,
+                &ends,
             ],
         )
         .await

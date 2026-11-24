@@ -1,42 +1,119 @@
+import { MAX_OPAQUE_ID_CHARS } from './localStateBounds.js';
 import { createResumeStore, type ResumeStoreDeps } from './resume.js';
 
-type StorageReader = () => ResumeStoreDeps['storage'] | null;
+type PositionObservation = 'sample' | 'flush' | 'seeked' | 'ended';
 
-/** Library position persistence. This owner never restores a position. */
+type PositionAttachment = {
+	trackId: string;
+	audio: HTMLAudioElement;
+	/** The attachment's exact src attribute, as selected by the playback owner. */
+	source: string;
+	/** Checks the host's current attachment receipt, track and selected source. */
+	ownsAttachment: () => boolean;
+	storage: () => ResumeStoreDeps['storage'] | null;
+};
+
+/**
+ * Opt-in Library position writer. The playback host remains responsible for native
+ * events and attachment lifetime. Scope comes from accepted authenticated Library
+ * data. The host must clear it before auth teardown or when response headers no
+ * longer attest its current account, even if the replacement body is refused.
+ */
 export function createResumeController() {
-	let account: { scope: string } | undefined;
+	let scope: string | null = null;
+	let current: object | undefined;
 
 	return {
-		setScope(scope: string | null): void {
-			if (scope !== account?.scope) account = scope ? { scope } : undefined;
+		setScope(value: string | null): void {
+			const next = value?.length === 64 && /^[a-f0-9]+$/.test(value) ? value : null;
+			if (next !== scope) current = undefined;
+			scope = next;
 		},
-		capture(trackId: string, getStorage: StorageReader, ownsSource: () => boolean) {
-			const receipt = account;
-			if (!receipt) return;
-			const storageKey = `nntune:library-position:v1:${receipt.scope}`;
-			function write(seconds: number | null, matches: () => boolean): void {
-				const isCurrent = () => account === receipt && ownsSource() && matches() &&
-					account === receipt && ownsSource();
-				if (!isCurrent()) return;
-				const storage = getStorage();
-				if (!storage || !isCurrent()) return;
-				// The store reads before writing. Fence both calls so a reentrant
-				// storage read cannot publish after the account or source retires.
-				const store = createResumeStore({ storageKey, storage: {
-					getItem(key) {
-						const get = storage.getItem;
-						return isCurrent() ? get.call(storage, key) : null;
-					},
-					setItem(key, value) {
-						const set = storage.setItem;
-						if (isCurrent()) set.call(storage, key, value);
-					},
-					removeItem(key) { if (isCurrent()) storage.removeItem(key); }
-				} });
-				if (seconds === null) store.clear(trackId);
-				else store.save(trackId, seconds);
+		attach({ trackId, audio, source, ownsAttachment, storage: getStorage }: PositionAttachment) {
+			current = undefined;
+			if (!scope || !source || !trackId || trackId.length > MAX_OPAQUE_ID_CHARS) return;
+			const receipt = {};
+			current = receipt;
+			const storageKey = `nntune:library-position:v1:${scope}`;
+
+			function matches(): boolean {
+				const owns = () => current === receipt && ownsAttachment() && current === receipt;
+				if (!owns() || !audio.isConnected || audio.getAttribute('src') !== source) return false;
+				// Match the selected resource as well as the attribute. A decoder can
+				// still report the previous resource during a src transition.
+				const selected = audio.currentSrc;
+				return selected !== '' && selected === audio.src && owns();
 			}
-			return write;
+
+			let observing = false;
+			let lastPosition: number | undefined;
+			let completed = false;
+			function observe(kind: PositionObservation): void {
+				if (observing) return;
+				observing = true;
+				try {
+					if (!matches() || audio.error !== null || audio.seeking) return;
+					const ended = kind === 'ended';
+					if (audio.ended !== ended || (completed && (kind === 'ended' || kind === 'flush'))) return;
+					const seconds = ended ? null : audio.currentTime;
+					if (seconds !== null) {
+						if (!Number.isFinite(seconds) || seconds < 0 || seconds === lastPosition) return;
+						if (seconds === 0 && lastPosition === undefined && (kind !== 'seeked' || completed)) return;
+						if (kind === 'sample' && Math.abs(seconds - (lastPosition ?? 0)) < 5) return;
+					}
+					if (!matches()) return;
+					if (ended) {
+						lastPosition = undefined;
+						completed = true;
+					}
+					const storage = getStorage();
+					if (!storage || !matches()) return;
+					// A failed or revoked read must not turn into an empty-map write.
+					let read = false;
+					let saved = false;
+					const store = createResumeStore({ storageKey, storage: {
+						getItem(key) {
+							const get = storage.getItem;
+							if (!matches()) return null;
+							const raw = get.call(storage, key);
+							read = matches();
+							return read ? raw : null;
+						},
+						setItem(key, value) {
+							const set = storage.setItem;
+							if (!read || !matches()) return;
+							set.call(storage, key, value);
+							saved = true;
+						},
+						removeItem(key) {
+							const remove = storage.removeItem;
+							if (read && matches()) remove.call(storage, key);
+						}
+					} });
+					if (seconds === null) {
+						store.clear(trackId);
+					} else {
+						store.save(trackId, seconds);
+						if (saved) {
+							lastPosition = seconds;
+							completed = false;
+						}
+					}
+				} catch {
+					// Optional storage and native reads must stay outside transport settlement.
+				} finally {
+					observing = false;
+				}
+			}
+
+			return {
+				observe,
+				/** Observe a final flush while still current, then retire the receipt. */
+				detach() {
+					observe('flush');
+					if (current === receipt) current = undefined;
+				}
+			};
 		}
 	};
 }

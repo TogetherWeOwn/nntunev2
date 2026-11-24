@@ -117,6 +117,7 @@ async function openLibrary(
 				media.play += 1;
 				media.lastTime = this.currentTime;
 				media.lastSrc = this.getAttribute('src') ?? '';
+				this.dataset.rateAtPlay = String(this.playbackRate);
 				Object.defineProperty(this, 'paused', { value: false, configurable: true });
 				Object.defineProperty(this, 'ended', { value: false, configurable: true });
 				return Promise.resolve();
@@ -394,6 +395,8 @@ test('[LIBREP-02] Off advances mid-queue from zero with one announcement and no 
 	await setAudioTime(page, 23);
 	const guards = await snapshotGuards(page);
 	const before = await mediaCalls(page);
+	// Native readback may be outside preference bounds; don't deliver ratechange.
+	await page.getByTestId('audio-player').evaluate((el) => void Object.defineProperty(el, 'playbackRate', { value: 0.25 }));
 	await fireEnded(page);
 	await expect(
 		page.getByTestId('now-playing'),
@@ -420,6 +423,8 @@ test('[LIBREP-02] Off advances mid-queue from zero with one announcement and no 
 		.toBe(before.play + 1);
 	const last = await mediaCalls(page);
 	expect(last.lastTime, 'LIBREP-02: the next track must start from zero').toBe(0);
+	await expect(page.getByTestId('audio-player')).toHaveAttribute('data-rate-at-play', '0.25');
+	expect(await page.evaluate(() => localStorage.getItem('nntune:playback-speed:v1'))).toBe('0.5');
 	expect(last.lastSrc, 'LIBREP-02: the next track src must be the pine stream').toContain('lib-pine');
 	expect(await audioTime(page), 'LIBREP-02: the new audio must start at zero').toBe(0);
 	expect(await queueOrder(page)).toEqual(['lib-coral', 'lib-pine', 'lib-ember']);

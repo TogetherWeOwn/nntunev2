@@ -16,6 +16,7 @@
 	import Artwork from '#lib/player/Artwork.svelte';
 	import LevelingToggle from '#lib/player/LevelingToggle.svelte';
 	import ShuffleUpcoming from '#lib/player/ShuffleUpcoming.svelte';
+	import VolumeControls from '#lib/player/VolumeControls.svelte';
 	import {
 		applyGainToNode,
 		loadLevelingEnabled,
@@ -46,13 +47,8 @@
 	} from '#lib/player/recentlyPlayed.js';
 	import { buildShareQuery, parseTimestampParam } from '#lib/player/shareTimestamp.js';
 	import { createSleepTimer, type SleepTimerMode } from '#lib/player/sleepTimer.js';
-	import {
-		actionForKey,
-		isModalOpen,
-		isTypingTarget,
-		SEEK_SECONDS,
-		SHORTCUT_ROWS
-	} from '#lib/player/shortcuts.js';
+	import ShortcutHelp from '#lib/player/ShortcutHelp.svelte';
+	import { actionForShortcutEvent, SEEK_SECONDS } from '#lib/player/shortcuts.js';
 	import {
 		addTrack,
 		clearQueue,
@@ -113,9 +109,7 @@
 	let restored = $state(false);
 	let audioEl: HTMLAudioElement | undefined = $state();
 	let sound = $state.raw<SoundPreference & { restricted?: boolean }>({ volume: 1, muted: false });
-	let shortcutsOpen = $state(false);
-	let shortcutsDialogEl: HTMLDialogElement | undefined = $state();
-	let shortcutsOpener: HTMLElement | null = null;
+	let shortcutHelp: ReturnType<typeof ShortcutHelp> | undefined;
 
 	/**
 	 * Auto-continue radio: a seeded pass over the loaded catalogue that
@@ -573,27 +567,16 @@
 		}
 	}
 
-	/**
-	 * Reconcile a native-control rate change to state, display and
-	 * best-effort persistence. Reads only: never writes back into the
-	 * element (no feedback loop) and never implies play or seek. Detached,
-	 * stale, throwing or non-finite readings are ignored so they cannot
-	 * poison the last verified preference.
-	 */
 	function handleNativeRateChange(event: Event): void {
 		const element = event.currentTarget as HTMLAudioElement | null;
-		if (!element || element !== audioEl || !element.isConnected) return;
-		if (!speed) return;
-		let nativeRate: number;
-		try {
-			nativeRate = element.playbackRate;
-		} catch {
-			return;
-		}
-		if (!Number.isFinite(nativeRate)) return;
-		const effective = speed.adoptNativeRate(nativeRate);
-		speedValue = String(effective);
-		if (speedFeedbackRate !== null && effective !== speedFeedbackRate) {
+		if (!element?.isConnected) return;
+		const rate = speed?.observeNativeRate(element);
+		if (rate !== undefined) showVerifiedSpeed(rate);
+	}
+
+	function showVerifiedSpeed(rate: number): void {
+		speedValue = String(rate);
+		if (speedFeedbackRate !== null && rate !== speedFeedbackRate) {
 			speedFeedback = '';
 			speedFeedbackRate = null;
 		}
@@ -988,56 +971,6 @@
 		void playback.unload();
 	}
 
-	async function openShortcuts(): Promise<void> {
-		if (shortcutsOpen) return;
-		shortcutsOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-		shortcutsOpen = true;
-		await tick();
-		// Native modality moves focus to Close and makes the background inert.
-		if (shortcutsOpen) shortcutsDialogEl?.showModal();
-	}
-
-	function closeShortcuts(): void {
-		shortcutsDialogEl?.close();
-		shortcutsOpen = false;
-		shortcutsOpener?.focus();
-	}
-
-	// Explicit Tab wrap for the shortcuts dialog. Native showModal keeps the
-	// background inert, but Chromium does not cycle Tab past the dialog's
-	// last/first control: focus falls back to body instead of wrapping,
-	// which KEYSAFE-B11 pins as a failure (same workaround as PaywallModal
-	// wrapTab, which documents the stutter). Cycling the rendered controls
-	// here restores the documented trap in every browser. Scoped to this
-	// dialog only: page tab order and modified chords pass through, and an
-	// already-handled Tab keeps its prior ownership.
-	function trapShortcutsTab(event: KeyboardEvent): void {
-		if (event.key !== 'Tab') return;
-		if (event.defaultPrevented) return;
-		if (event.metaKey || event.ctrlKey || event.altKey) return;
-		const root = shortcutsDialogEl;
-		if (!root) return;
-		const controls = [...root.querySelectorAll<HTMLElement>(
-			'a[href], button:not([disabled]), input, select, textarea, [tabindex]:not([tabindex="-1"])'
-		)].filter((control) => control.getClientRects().length > 0);
-		if (controls.length === 0) {
-			event.preventDefault();
-			return;
-		}
-		const first = controls[0];
-		const last = controls[controls.length - 1];
-		const active = document.activeElement;
-		if (event.shiftKey) {
-			if (active === first || !root.contains(active)) {
-				event.preventDefault();
-				last.focus();
-			}
-		} else if (active === last || !root.contains(active)) {
-			event.preventDefault();
-			first.focus();
-		}
-	}
-
 	function togglePlayShortcut(): void {
 		if (status === 'playing' || status === 'loading') pauseCurrent();
 		else {
@@ -1207,11 +1140,9 @@
 		if (restored && eventForCurrent(event)) updateSound(event.currentTarget);
 	}
 
-	function handleVolumeInput(event: Event & { currentTarget: HTMLInputElement }): void {
-		if (!audioEl || !restored) return;
-		updateSound({ volume: Number(event.currentTarget.value) / 100, muted: audioEl.muted });
-		// A rejected setter leaves state unchanged: undo the range's own edit.
-		event.currentTarget.value = String(sound.volume * 100);
+	function handleVolumeInput(volume: number): number {
+		if (audioEl && restored) updateSound({ volume, muted: audioEl.muted });
+		return sound.volume;
 	}
 
 	function toggleMuteShortcut(): void {
@@ -1228,33 +1159,14 @@
 		repeat = repeat === 'off' ? 'one' : repeat === 'one' ? 'queue' : 'off';
 	}
 
-	// Global transport keymap. Escape closes our dialog first so a modal
-	// guard can never wedge it; every other binding yields to typing
-	// surfaces, open modals and modified chords. Cancelled or composing keys
-	// keep native ownership: no preventDefault and no player mutation.
-	// Handled bindings suppress their keydown default: the digit binding
-	// would otherwise also drive native select type-ahead (the 0.5x/0.75x
-	// speed options start with 0), so one keystroke would restart the track
-	// AND halve the speed.
 	function handleGlobalKeydown(event: KeyboardEvent): void {
-		if (event.metaKey || event.ctrlKey || event.altKey) return;
-		// Prior ownership wins: a cancelled event was already handled, and an
-		// isComposing or legacy 229 key belongs to the IME, not the player.
-		if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
-		const action = actionForKey(event.key);
+		const action = actionForShortcutEvent(event, document);
 		if (!action) return;
 		if (action === 'close-shortcuts') {
-			if (shortcutsOpen) closeShortcuts();
+			shortcutHelp?.close();
 			return;
 		}
-		if (shortcutsOpen || isTypingTarget(event.target) || isModalOpen(document)) return;
-		// The new queue bindings yield to IME and native select editing without
-		// changing existing transport defaults (notably 0 on the speed select).
-		if (
-			(action === 'shuffle-upcoming' || action === 'cycle-repeat') &&
-			(event.isComposing || event.keyCode === 229 ||
-				(event.target instanceof Element && event.target.closest('select')))
-		) return;
+		if (shortcutHelp?.isOpen()) return;
 		event.preventDefault();
 		switch (action) {
 			case 'toggle-play':
@@ -1288,7 +1200,7 @@
 				cycleRepeat();
 				break;
 			case 'open-shortcuts':
-				openShortcuts();
+				void shortcutHelp?.open();
 				break;
 		}
 	}
@@ -1503,13 +1415,11 @@
 		};
 	}
 
-	// A swapped-in element starts at 1x: re-apply the persisted speed.
-	// `apply` verifies against the element, so reconcile the display to
-	// the actual rate it reports (a rejecting/clamping element must not
-	// leave a false selection on screen).
+	// A swapped-in decoder starts at 1x. Restore this tab's cached speed
+	// and show what the new decoder actually applied.
 	$effect(() => {
 		audioEl;
-		if (speed) speedValue = String(speed.apply());
+		if (speed) showVerifiedSpeed(speed.apply());
 	});
 
 	// Smoke-test hook for `page.evaluate`, registered on client mount.
@@ -1548,7 +1458,7 @@
 			store = memoryStorage();
 		}
 		speed = createPlaybackSpeed({ storage: store, audio: () => audioEl });
-		speedValue = String(speed.apply());
+		showVerifiedSpeed(speed.apply());
 		resumeStore = createResumeStore({ storage: store });
 		try {
 			recentStore = createRecentlyPlayedStore({ storage: sessionStorage });
@@ -1730,23 +1640,14 @@
 		></audio>
 	{/key}
 
-	<div class="nt-sound">
-		<label>
-			Volume {Math.round(sound.volume * 100)}%
-			<input
-				type="range"
-				min="0"
-				max="100"
-				value={sound.volume * 100}
-				disabled={!restored || sound.restricted}
-				oninput={handleVolumeInput}
-			/>
-		</label>
-		<button type="button" aria-pressed={sound.muted} onclick={toggleMuteShortcut}>
-			Mute
-		</button>
-	</div>
-	<p role="status" hidden={!sound.restricted}>Use system volume controls.</p>
+	<VolumeControls
+		volume={sound.volume}
+		muted={sound.muted}
+		restricted={sound.restricted}
+		ready={restored}
+		onvolumeinput={handleVolumeInput}
+		ontogglemute={toggleMuteShortcut}
+	/>
 
 	<div>
 		<label for="track-time-mode">Time display</label>
@@ -1808,9 +1709,7 @@
 			</button>
 		</div>
 		<LevelingToggle enabled={levelingEnabled} onchange={setLevelingEnabled} />
-		<button type="button" data-testid="shortcuts-button" onclick={openShortcuts}>
-			Keyboard shortcuts
-		</button>
+		<ShortcutHelp bind:this={shortcutHelp} />
 	</div>
 
 	<!-- Explicit seek for the synthetic demo track: a native form so Enter
@@ -1873,29 +1772,6 @@
 			</div>
 		{/if}
 	</div>
-
-	{#if shortcutsOpen}
-		<dialog
-			bind:this={shortcutsDialogEl}
-			data-testid="shortcuts-dialog"
-			aria-label="Keyboard shortcuts"
-			onkeydown={trapShortcutsTab}
-			oncancel={(event) => {
-				event.preventDefault();
-				closeShortcuts();
-			}}
-		>
-			<h2>Keyboard shortcuts</h2>
-			<ul>
-				{#each SHORTCUT_ROWS as row (row.key)}
-					<li><kbd>{row.key}</kbd> {row.label}</li>
-				{/each}
-			</ul>
-			<button type="button" data-testid="shortcuts-close" onclick={closeShortcuts}>
-				Close
-			</button>
-		</dialog>
-	{/if}
 
 	<section data-testid="queue-panel" aria-label="Playback queue">
 		<h2>Queue</h2>

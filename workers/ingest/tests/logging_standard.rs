@@ -1179,7 +1179,9 @@ fn every_emit_call_carries_build_sha_and_trace_without_freeform_detail() {
             };
             emit_calls += 1;
             assert!(
-                window.contains("\"build_sha\""),
+                window.contains("\"build_sha\"")
+                    || (rel == LIB_RS
+                        && window.contains("meter_failure_fields(&err, build_sha_from_env(env))")),
                 "{rel}: every emit() call must carry the build SHA; window: {window}"
             );
             assert!(

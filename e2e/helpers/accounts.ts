@@ -219,7 +219,7 @@ function throwOnRedirect(status: number, headers: Record<string, string>, contex
  * this only protects propagated errors, not Playwright's internal API steps.
  */
 async function credentialedTransport(
-  method: 'GET' | 'POST' | 'OPTIONS',
+  method: 'GET' | 'POST' | 'DELETE' | 'OPTIONS',
   send: () => Promise<APIResponse>,
 ): Promise<APIResponse> {
   try {
@@ -407,15 +407,12 @@ export async function anonymousGet(
  * navigation: the route applies to subsequent loads, never past ones, and
  * the session cookie must be planted before the first request carries it.
  *
- * Two credentials are installed for a session account. First, the minted
- * session is planted as the `__Host-` session cookie (see
- * browserSessionCookie): session routes (`POST /v1/vault/*` for the BYOP
- * wizard's test/save, `/v1/session/*`, …) authenticate by cookie only and
- * ignore the bearer, so without this plant every wizard test-connection
- * fails closed as unauthenticated. When no plant applies (a null account,
- * or a non-https offline double) any previously planted session cookie is
- * cleared instead, so a re-applied page is anonymous and cookieless rather
- * than leaking the earlier identity. Second, headers are attached ONLY to
+ * The minted session is planted as the `__Host-` session cookie (see
+ * browserSessionCookie). Use the same transport as the real app: the Library
+ * alias emits its session binding only for cookie auth and the verifier
+ * rejects presented bearers. A non-HTTPS offline double keeps the bearer
+ * fallback because it cannot plant the cookie. A null account or an offline
+ * double clears any previously planted cookie. Headers are attached ONLY to
  * the staging origin via a context route: `extraHTTPHeaders`/
  * `setExtraHTTPHeaders` would also send the Access service token and
  * session bearer to cross-origin subresources (fonts, analytics,
@@ -425,8 +422,7 @@ export async function anonymousGet(
  * WITHOUT the credential headers — the follow-up request is evaluated fresh
  * by this handler. The browser attaches the planted cookie to same-origin
  * navigations and fetches itself, and the route handler forwards it with
- * the merged request headers. Re-entrant: replaces any previous scope
- * routing. Null accounts plant nothing and stay cookieless.
+ * the merged request headers. This replaces any previous scope routing.
  */
 export async function applyAccountToPage(
   page: Page,
@@ -453,8 +449,8 @@ export async function applyAccountToPage(
   const cookie = browserSessionCookie(session, baseURL);
   if (cookie) await page.context().addCookies([cookie]);
   else await page.context().clearCookies();
-  const stagingHeaders: Record<string, string> = { ...accessHeaders() };
-  if (session) stagingHeaders.Authorization = `Bearer ${session}`;
+  const stagingHeaders = accessHeaders();
+  if (session && !cookie) stagingHeaders.Authorization = `Bearer ${session}`;
   // Anonymous pages put the QA bearer on auth-start POSTs only, so the
   // public forms are admitted past the per-IP start budget every journey
   // spec shares from one runner IP (TWO-434). It grants no identity: the
@@ -883,4 +879,23 @@ export async function submitPublicUiSignupToBilling(
     'authenticated billing action not visible after public UI signup',
   ).toBeVisible({ timeout: 15_000 });
   return { email, viaApi: false };
+}
+
+/** Credentialed, bodyless DELETE with the same no-follow contract as apiGet. */
+export async function apiDelete(
+  request: APIRequestContext,
+  url: string,
+  headers: Record<string, string>,
+  context: string,
+  opts?: { timeout?: number },
+): Promise<APIResponse> {
+  const res = await credentialedTransport('DELETE', () =>
+    request.delete(url, {
+      headers,
+      timeout: opts?.timeout ?? 30_000,
+      maxRedirects: 0,
+    }),
+  );
+  throwOnRedirect(res.status(), res.headers(), context);
+  return res;
 }

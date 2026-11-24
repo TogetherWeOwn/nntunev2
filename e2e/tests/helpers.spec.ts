@@ -25,7 +25,7 @@ import {
   stagingBaseUrl,
   syntheticNntpEndpoint,
 } from '../helpers/access.js';
-import { assertPlanLimitHeaders, assertPlanLimitRefusal, extractLibraryItems, extractLimitCode, extractPlanMeta, extractRecordingMbids, extractUpgradeCta, extractUsageBytes, isMbid, secretLeak } from '../helpers/contract.js';
+import { assertPlanLimitHeaders, assertPlanLimitRefusal, catalogueLibraryRows, extractLibraryItems, extractLimitCode, extractPlanMeta, extractRecordingMbids, extractUpgradeCta, extractUsageBytes, isMbid, secretLeak } from '../helpers/contract.js';
 import {
   anonymousApiGet,
   anonymousApiOptions,
@@ -47,6 +47,18 @@ import {
 // These run on every PR via e2e-lint AND inside the staging suite, pinning
 // the fail-closed behavior — half-set Access secrets, non-https targets and
 // Access-wall responses must never pass silent.
+test('catalogue Library requires the wire shape for each publication mode', () => {
+  const published = [{ id: 'synthetic-track', release_mbid: '11111111-1111-4111-8111-111111111111',
+    title: 'Fixture track', release: 'Fixture release', artist: 'Fixture artist' }];
+  expect(catalogueLibraryRows([], false)).toEqual([]);
+  expect(catalogueLibraryRows(published, true)).toEqual(published);
+  expect(() => catalogueLibraryRows(published, false)).toThrow(/must be empty/);
+  expect(() => catalogueLibraryRows([], true)).toThrow(/mirror-enriched row/);
+  expect(() => catalogueLibraryRows([{ id: 'unenriched-track' }], true)).toThrow(/mirror-enriched row/);
+  expect(() => catalogueLibraryRows({ items: [] }, false)).toThrow(/bare array/);
+  expect(() => catalogueLibraryRows([...published, { title: 'Missing ID' }], true)).toThrow(/string IDs/);
+});
+
 function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
   const saved: Record<string, string | undefined> = {};
   for (const key of Object.keys(vars)) {

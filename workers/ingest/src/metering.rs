@@ -42,9 +42,9 @@ pub fn meter_event(
     msg: &QueueMsg,
     stage: &str,
     outcome: MeterOutcome,
-) -> Result<MeterEvent, &'static str> {
+) -> Result<MeterEvent, MeterWriteError> {
     if !WORKFLOW_STEPS.contains(&stage) {
-        return Err("stage must be a pipeline workflow step");
+        return Err(MeterWriteError::UnknownStage);
     }
     Ok(MeterEvent {
         job_id: msg.job_id.clone(),
@@ -64,52 +64,64 @@ pub fn meter_write_body(event: &MeterEvent) -> serde_json::Value {
     serde_json::to_value(event).expect("MeterEvent serializes")
 }
 
-/// How a meter edge-write failed. A dropped event must never look accepted:
+/// Failures before a dataset status exists. Sinks cannot return upstream text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeterTransportReason {
+    BindingMissing,
+    WriteFailed,
+}
+
+impl MeterTransportReason {
+    pub(crate) fn redact<T, E>(self, result: Result<T, E>) -> Result<T, Self> {
+        result.map_err(|_| self)
+    }
+}
+
+/// How a meter write or admission ledger failed. A dropped event must never look accepted:
 /// retryable failures map to HTTP 503 + `Retry-After` at the route, while an
 /// unknown stage is a caller bug and maps to 400.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeterWriteError {
     /// `stage` was not in [`WORKFLOW_STEPS`]. Returned before any write is
     /// attempted, so the sink is never touched.
-    UnknownStage(&'static str),
+    UnknownStage,
     /// The binding/transport failed before any dataset status existed
     /// (missing `INGEST_METER` binding, connection refused, timeout).
-    Transport(String),
+    Transport(MeterTransportReason),
     /// The dataset endpoint answered with a non-2xx HTTP-equivalent status.
     Rejected { status: u16 },
+    /// Ledger failures use the generic retry response and admission diagnostics.
+    AdmissionLedgerUnavailable,
 }
 
 impl MeterWriteError {
-    /// Transport and rejection failures are retryable (never a silent drop);
-    /// an unknown stage is a caller bug, not a retry.
-    pub fn is_retryable(&self) -> bool {
+    /// Fixed code for display and meter diagnostics.
+    pub fn reason_code(&self) -> &'static str {
         match self {
-            MeterWriteError::UnknownStage(_) => false,
-            MeterWriteError::Transport(_) | MeterWriteError::Rejected { .. } => true,
+            Self::UnknownStage => "meter_unknown_stage",
+            Self::Transport(MeterTransportReason::BindingMissing) => "meter_binding_missing",
+            Self::Transport(MeterTransportReason::WriteFailed) => "meter_write_failed",
+            Self::Rejected { .. } => "meter_write_rejected",
+            Self::AdmissionLedgerUnavailable => "admission_ledger_unavailable",
         }
     }
 
-    /// HTTP status the route answers with: retryable failures surface 503 +
-    /// `Retry-After` (never 202-and-dropped); unknown stages surface 400.
+    pub fn is_retryable(&self) -> bool {
+        !matches!(self, Self::UnknownStage)
+    }
+
     pub fn http_status(&self) -> u16 {
-        match self {
-            MeterWriteError::UnknownStage(_) => 400,
-            MeterWriteError::Transport(_) | MeterWriteError::Rejected { .. } => 503,
+        if self.is_retryable() {
+            503
+        } else {
+            400
         }
     }
 }
 
 impl core::fmt::Display for MeterWriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            MeterWriteError::UnknownStage(stage) => write!(f, "unknown meter stage: {stage}"),
-            MeterWriteError::Transport(detail) => {
-                write!(f, "meter write transport failed: {detail}")
-            }
-            MeterWriteError::Rejected { status } => {
-                write!(f, "meter write rejected with status {status}")
-            }
-        }
+        f.write_str(self.reason_code())
     }
 }
 
@@ -122,7 +134,8 @@ impl std::error::Error for MeterWriteError {}
 /// this is the `INGEST_METER` binding call; a native binding success maps to
 /// 2xx.
 pub trait MeterSink {
-    fn send(&mut self, dataset: &str, body: serde_json::Value) -> Result<u16, String>;
+    fn send(&mut self, dataset: &str, body: serde_json::Value)
+        -> Result<u16, MeterTransportReason>;
 }
 
 /// Emit one stage-transition meter event through the sink.
@@ -139,15 +152,12 @@ pub fn emit_meter<S: MeterSink>(
     stage: &str,
     outcome: MeterOutcome,
 ) -> Result<(), MeterWriteError> {
-    let event = match meter_event(msg, stage, outcome) {
-        Ok(event) => event,
-        Err(message) => return Err(MeterWriteError::UnknownStage(message)),
-    };
+    let event = meter_event(msg, stage, outcome)?;
     let body = meter_write_body(&event);
     match sink.send(METER_DATASET, body) {
         Ok(status) if (200..300).contains(&status) => Ok(()),
         Ok(status) => Err(MeterWriteError::Rejected { status }),
-        Err(detail) => Err(MeterWriteError::Transport(detail)),
+        Err(reason) => Err(MeterWriteError::Transport(reason)),
     }
 }
 
@@ -174,6 +184,90 @@ mod tests {
         // Every workflow step is a legal stage, including the repair branch.
         for step in crate::queue::WORKFLOW_STEPS {
             assert!(meter_event(&msg, step, MeterOutcome::Retry).is_ok());
+        }
+    }
+
+    struct RecordingSink {
+        status: u16,
+        writes: Vec<(String, serde_json::Value)>,
+    }
+
+    impl MeterSink for RecordingSink {
+        fn send(
+            &mut self,
+            dataset: &str,
+            body: serde_json::Value,
+        ) -> Result<u16, MeterTransportReason> {
+            self.writes.push((dataset.to_owned(), body));
+            Ok(self.status)
+        }
+    }
+
+    #[test]
+    fn existing_stages_emit_one_exact_event_for_each_supported_outcome() {
+        let upload = build_upload_dispatch("user_01", SMALL_NZB).unwrap();
+        let search = crate::dispatch::build_search_dispatch(
+            "user_01",
+            "synthetic query",
+            "vault_idx_01-ab",
+            &[3000],
+            10,
+            0,
+        )
+        .unwrap();
+        // These are the wire values accepted by the meter. Individual callers
+        // choose which stages and outcomes to emit.
+        for mut msg in [upload, search] {
+            msg.attempt = 3;
+            for stage in WORKFLOW_STEPS {
+                for (outcome, wire_outcome) in [
+                    (MeterOutcome::Ok, "ok"),
+                    (MeterOutcome::Retry, "retry"),
+                    (MeterOutcome::Failed, "failed"),
+                ] {
+                    let mut sink = RecordingSink {
+                        status: 204,
+                        writes: Vec::new(),
+                    };
+                    assert_eq!(emit_meter(&mut sink, &msg, stage, outcome), Ok(()));
+                    assert_eq!(
+                        sink.writes,
+                        [(
+                            METER_DATASET.to_owned(),
+                            serde_json::json!({
+                                "job_id": msg.job_id,
+                                "user_id": msg.user_id,
+                                "stage": stage,
+                                "outcome": wire_outcome,
+                                "attempt": 3,
+                            })
+                        )],
+                        "{:?} {stage}/{wire_outcome} must emit exactly one five-field event",
+                        msg.source,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn meter_accepts_only_2xx_at_status_boundaries() {
+        let msg = build_upload_dispatch("user_01", SMALL_NZB).unwrap();
+        for (status, expected) in [
+            (199, Err(MeterWriteError::Rejected { status: 199 })),
+            (200, Ok(())),
+            (299, Ok(())),
+            (300, Err(MeterWriteError::Rejected { status: 300 })),
+        ] {
+            let mut sink = RecordingSink {
+                status,
+                writes: Vec::new(),
+            };
+            assert_eq!(
+                emit_meter(&mut sink, &msg, "probe", MeterOutcome::Ok),
+                expected
+            );
+            assert_eq!(sink.writes.len(), 1, "no inline retry for {status}");
         }
     }
 

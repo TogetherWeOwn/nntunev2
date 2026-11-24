@@ -1,0 +1,128 @@
+import { expect, test, type Page } from '@playwright/test';
+
+const track = { id: 'keys-coral', title: 'Keys Coral', streamUrl: '/api/demo/audio?track=coral' };
+const audio = (page: Page) => page.getByTestId('audio-player');
+const help = (page: Page) => page.getByTestId('shortcuts-button');
+const status = (page: Page) => page.getByRole('region', { name: 'Player', exact: true }).getByRole('status');
+const time = (page: Page) => audio(page).evaluate((node: HTMLAudioElement) => node.currentTime);
+const keyPasses = (page: Page, key: string) => page.evaluate((key) => document.activeElement!.dispatchEvent(
+	new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+), key);
+async function openLibrary(page: Page) {
+	await page.route('**/api/library', (route) => route.fulfill({ json: [track] }));
+	await page.goto(`/library?track=${track.id}&t=12`);
+	await expect(page.locator('#library-density')).toBeAttached();
+	await expect(status(page)).toHaveText('Paused');
+	await expect(page.getByTestId('library-restart')).toBeEnabled();
+	await expect.poll(() => time(page)).toBeCloseTo(12);
+}
+
+test('app shortcuts act once on the live native audio across routes and stop at teardown', async ({ page }) => {
+	await openLibrary(page);
+	const native = (await audio(page).elementHandle())!;
+	await help(page).press('j');
+	await expect.poll(() => time(page)).toBeCloseTo(2);
+	await page.keyboard.press('k');
+	await expect(status(page)).toHaveText('Playing');
+	await page.keyboard.press('k');
+	await expect(status(page)).toHaveText('Paused');
+	const pausedAt = await time(page);
+	const home = page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true });
+	await home.click();
+	await expect(page).toHaveURL(/\/home$/);
+	await expect(page.locator('#library-density')).toHaveCount(0);
+	await home.focus();
+	await expect(home).toBeFocused();
+	for (const key of ['0', '?', 'k', 'j', 'l']) expect(await keyPasses(page, key)).toBe(true);
+	await home.evaluate((link) => link.addEventListener('keydown', () => {
+		document.querySelector<HTMLButtonElement>('[data-testid="shortcuts-button"]')!.focus();
+	}, { once: true }));
+	expect(await keyPasses(page, '0')).toBe(true);
+	await expect(help(page)).toBeFocused();
+	const restartStatus = page.getByTestId('library-restart-status');
+	expect(await time(page)).toBeCloseTo(pausedAt);
+	await expect(restartStatus).toBeEmpty();
+	const restart = page.getByTestId('library-restart');
+	await restart.press('l');
+	await expect.poll(() => time(page)).toBeCloseTo(pausedAt + 10);
+	await page.keyboard.press('0');
+	await expect.poll(() => time(page)).toBeCloseTo(0);
+	await expect(restartStatus).toHaveText('Restarted Keys Coral.');
+	expect(await native.evaluate((node: HTMLAudioElement) =>
+		node === document.querySelector('audio') && node.controls && node.paused)).toBe(true);
+
+	await restart.press('Shift+Slash');
+	await expect(page.getByTestId('shortcuts-close')).toBeFocused();
+	await audio(page).evaluate((node: HTMLAudioElement) => {
+		node.currentTime = 7;
+		Object.defineProperty(node, 'seekable', { value: { length: 0 } });
+		node.dispatchEvent(new Event('progress'));
+	});
+	await expect(restart).toBeDisabled();
+	await page.keyboard.press('Escape');
+	await expect(help(page)).toBeFocused();
+	expect(await keyPasses(page, '0')).toBe(true);
+	expect(await time(page)).toBeCloseTo(7);
+	await expect(restartStatus).toHaveText('Restarted Keys Coral.');
+	// A delegated link leaves the app shell without replacing the JS realm.
+	await page.evaluate(() => {
+		const exit = document.createElement('a');
+		exit.href = '/pricing';
+		exit.textContent = 'Leave shortcut fixture';
+		document.body.append(exit);
+	});
+	await page.getByRole('link', { name: 'Leave shortcut fixture' }).click();
+	await expect(page).toHaveURL(/\/pricing$/);
+	await expect(page.getByRole('link', { name: 'Leave shortcut fixture' })).toBeAttached();
+	await expect(audio(page)).toHaveCount(0);
+	await expect(help(page)).toHaveCount(0);
+	expect(await page.evaluate(() => ['k', 'l', '0', '?'].every((key) => document.body.dispatchEvent(
+		new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+	)))).toBe(true);
+});
+
+test('app shortcut help lists only supported bindings, restores focus and respects key ownership', async ({ page }) => {
+	await openLibrary(page);
+	const play = page.getByRole('button', { name: 'Play', exact: true });
+	await play.focus();
+	await page.keyboard.press('Shift+Slash');
+	const dialog = page.getByRole('dialog', { name: 'Keyboard shortcuts' });
+	const close = dialog.getByRole('button', { name: 'Close' });
+	const headingId = await dialog.getByRole('heading', { name: 'Keyboard shortcuts', exact: true }).getAttribute('id');
+	expect(headingId).toBeTruthy();
+	await expect(dialog).toHaveAttribute('aria-labelledby', headingId!);
+	await expect(dialog.and(page.locator('dialog:modal'))).toBeVisible();
+	await expect(dialog.locator('kbd')).toHaveText(['k', 'j', 'l', '0', '?', 'Escape']);
+	await expect(close).toBeFocused();
+	for (const key of ['Tab', 'Shift+Tab', 'j', 'k', '0']) {
+		await page.keyboard.press(key);
+		await expect(close).toBeFocused();
+	}
+	await page.evaluate(() => document.body.appendChild(document.createElement('dialog')).showModal());
+	await page.keyboard.press('Escape');
+	await expect(page.locator('dialog[open]')).toHaveCount(1);
+	await expect(dialog.getByText('Focus a player button to use the character shortcuts. The audio controls keep their own keys.')).toBeVisible();
+	await page.keyboard.press('Escape');
+	await expect(dialog).toHaveCount(0);
+	await expect(play).toBeFocused();
+	await help(page).click();
+	await close.click();
+	await expect(help(page)).toBeFocused();
+	expect(await page.evaluate(() => {
+		const send = (target: EventTarget, key: string, flags?: KeyboardEventInit) => target.dispatchEvent(
+			new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...flags })
+		);
+		return ['n', 'p', 'm', 's', 'r'].every((key) => send(document.activeElement!, key)) &&
+			['J', 'K', 'L', '0'].every((key) => send(document.activeElement!, key, { shiftKey: true })) &&
+			[{ ctrlKey: true }, { metaKey: true }, { altKey: true }, { isComposing: true }, { repeat: true }]
+				.every((flags) => send(document.activeElement!, '0', flags));
+	})).toBe(true);
+	await audio(page).focus();
+	await expect(audio(page)).toBeFocused();
+	for (const key of ['0', 'k', 'j', 'l', '?', ' ', 'ArrowLeft', 'ArrowRight', 'Enter']) expect(await keyPasses(page, key)).toBe(true);
+	expect(await time(page)).toBeCloseTo(12);
+	await play.press('Space');
+	await expect(status(page)).toHaveText('Playing');
+	await page.getByRole('button', { name: 'Pause', exact: true }).press('Enter');
+	await expect(status(page)).toHaveText('Paused');
+});

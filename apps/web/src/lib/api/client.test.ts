@@ -300,7 +300,7 @@ describe('ApiClient', () => {
 		}) as unknown as typeof fetch;
 		const client = new ApiClient({ baseUrl: 'https://api.example.com/', fetchFn });
 
-		await expect(client.revokeAllSessions()).resolves.toEqual({ ok: true });
+		await expect(client.revokeAllSessions(() => true)).resolves.toEqual({ ok: true });
 		expect(seen).toEqual([
 			{
 				url: 'https://api.example.com/v1/session/revoke-all',
@@ -318,7 +318,7 @@ describe('ApiClient', () => {
 		const fetchFn = vi.fn(async () => jsonResponse({ error: 'revoke failed' }, status));
 		const client = new ApiClient({ baseUrl: 'https://api.example.com', fetchFn });
 
-		const failure = await client.revokeAllSessions().catch((error: unknown) => error);
+		const failure = await client.revokeAllSessions(() => true).catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(ApiError);
 		expect((failure as ApiError).status).toBe(status);
 		expect((failure as ApiError).code).toBe(status === 401 ? 'unauthorized' : 'request_failed');

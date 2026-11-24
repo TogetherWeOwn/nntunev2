@@ -48,7 +48,7 @@ vi.mock('#lib/library/refresh.js', async (importOriginal) => {
 	};
 });
 
-import Library from './+page.svelte';
+import Library from '../../../tests/fixtures/LibraryPlayerHarness.svelte';
 
 async function renderLoaded(items: LibraryItem[]): Promise<string> {
 	const real = await vi.importActual<typeof import('#lib/library/refresh.js')>('#lib/library/refresh.js');

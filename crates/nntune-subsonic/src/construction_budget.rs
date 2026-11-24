@@ -21,6 +21,12 @@ impl ConstructionBudget {
         self.charged
     }
 
+    /// Narrow the remaining allowance without refunding any prior charge or
+    /// raising the original ceiling.
+    pub fn restrict_remaining(&mut self, bytes: usize) {
+        self.limit = self.charged + bytes.min(self.limit - self.charged);
+    }
+
     /// Charge and reserve a fresh vector. Callers may fill it up to the
     /// requested capacity; any later growth needs its own pre-allocation charge.
     pub fn allocate_exact<T>(&mut self, capacity: usize) -> Result<Vec<T>, BudgetExceeded> {
@@ -96,8 +102,16 @@ pub mod tests {
         assert_eq!(budget.charge(12, 1, 4), Ok(()));
         assert_eq!(budget.charge(13, 1, 8), Ok(()));
         assert_eq!(budget.charged(), 80);
+        budget.restrict_remaining(usize::MAX);
         assert_eq!(budget.charge(1, 1, 1), Err(BudgetExceeded));
         assert_eq!(budget.charged(), 80);
+
+        let mut restricted = ConstructionBudget::new(8 * 1024 * 1024);
+        restricted.charge(1, 1, 1).unwrap();
+        restricted.restrict_remaining(23);
+        restricted.restrict_remaining(24);
+        assert_eq!(restricted.charge(1, 1, 1), Err(BudgetExceeded));
+        assert_eq!(restricted.charged(), 24);
     }
 
     #[cfg_attr(test, test)]

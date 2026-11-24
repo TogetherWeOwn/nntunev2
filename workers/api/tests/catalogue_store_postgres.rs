@@ -684,7 +684,8 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
     use nntune_api::catalogue::*;
     let app = client(true).await;
     app.execute(
-        "INSERT INTO library VALUES (NULL, 'shared', $1, ARRAY[$2])",
+        "INSERT INTO library VALUES (NULL, 'shared', $1, ARRAY[upper($2)]),
+         ('u1', upper($2), NULL, ARRAY[]::text[])",
         &[&OTHER_RELEASE, &RECORDING],
     )
     .await
@@ -727,8 +728,13 @@ async fn shared_memberships_use_production_queries_without_private_leaks() {
             .query(library_page_statement(), &[&caller, &50_i64])
             .await
             .unwrap();
-        assert_eq!(page.len(), if caller == "u1" { 5 } else { 1 });
+        assert_eq!(page.len(), if caller == "u1" { 6 } else { 1 });
         assert!(page.iter().all(|r| r.get::<_, String>(0) != "private"));
+        let shared = page
+            .iter()
+            .find(|row| row.get::<_, &str>("job_id") == "shared")
+            .unwrap();
+        assert_eq!(shared.get::<_, bool>("recording_job_match"), caller == "u1");
     }
 }
 
@@ -1280,6 +1286,35 @@ async fn taste_upsert_isolates_owners_and_rolls_back_invalid_replacement() {
 }
 
 #[tokio::test]
+async fn import_like_counts_only_one_transition_and_fences_replay() {
+    use nntune_api::target_identity::TargetKind::Track;
+    let accounts = disposable_accounts::Accounts::new(1).await;
+    let owner = accounts.id(0);
+    let db = &accounts.observer;
+    let result = async {
+        let ((a, _), (b, _)) = (store(false, false).await, store(false, false).await);
+        let counts = tokio::join!(a.import_like(owner, Track, "job", 10), b.import_like(owner, Track, "job", 20));
+        db.execute("UPDATE public.users SET deleting_at = now() WHERE id = $1", &[&owner]).await?;
+        let (c, _) = store(false, false).await;
+        let fenced = c.import_like(owner, Track, "job", 30).await;
+        let row = db.query_one("SELECT signal, snooze_until, created_at, updated_at FROM public.account_taste WHERE user_id = $1", &[&owner]).await?;
+        Ok::<_, tokio_postgres::Error>((counts, fenced, row))
+    }.await;
+    accounts.cleanup().await;
+    let (counts, fenced, row) = result.unwrap();
+    let added_at: i64 = match counts {
+        (Ok(true), Ok(false)) => 10,
+        (Ok(false), Ok(true)) => 20,
+        other => panic!("expected one addition: {other:?}"),
+    };
+    assert!(fenced.is_err());
+    assert_eq!(row.get::<_, &str>(0), "love");
+    assert_eq!(row.get::<_, Option<i64>>(1), None);
+    assert_eq!(row.get::<_, i64>(2), added_at);
+    assert_eq!(row.get::<_, i64>(3), added_at);
+}
+
+#[tokio::test]
 async fn taste_upsert_waits_for_deletion_fence() {
     use nntune_api::target_identity::TargetKind::Track;
     use nntune_api::taste_signal::TasteSignal::Ban;
@@ -1427,6 +1462,7 @@ async fn absent_mirror_library_preserves_app_rows_and_occurrences() {
         },
         recording_mbid: recording.map(str::to_owned),
         recording_ord: if recording.is_some() { i as i64 + 1 } else { 0 },
+        recording_job_match: false,
     })
     .collect();
     assert_eq!(rows, assemble_library_rows(&page, &[], &[], &[]));

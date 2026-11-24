@@ -11,8 +11,10 @@
 //! self.connect_mirror() the catalogue reads use, or (catalogue_library)
 //! both — plus all of its statements (connects and statements share one
 //! bound: finishing one statement must not unbind a later stalled one).
-//! Hyperdrive RESETs pooled backends, so this per-method race is what
-//! bounds statements where they run.
+//! Signup lookup then resolves explicit expiry through a separately bounded
+//! best-effort audit, so audit failure cannot overwrite a completed denial.
+//! Hyperdrive RESETs pooled backends, so these races bound statements where
+//! they run.
 //!
 //! Breaks caught: a new Store method that connects without the seam, a
 //! method that bounds an empty block while its statements run outside it,
@@ -169,11 +171,20 @@ fn method_name(piece: &str) -> &str {
 }
 
 fn assert_bounded(piece: &str, name: &str) {
-    let bounded = calls(piece, "Self::bounded");
+    let (seam, budget, connection) = if name == "try_observe_invite_expiry" {
+        (
+            "PgStore::bounded",
+            "AUDIT_BUDGET_MS",
+            "client.transaction()",
+        )
+    } else {
+        ("Self::bounded", "TOTAL_TIMEOUT_MS", "self.connect()")
+    };
+    let bounded = calls(piece, seam);
     assert_eq!(
         bounded.len(),
         1,
-        "{name} must race exactly one operation through Self::bounded"
+        "{name} must race exactly one operation through {seam}"
     );
     let call = &bounded[0];
     assert_eq!(
@@ -189,13 +200,11 @@ fn assert_bounded(piece: &str, name: &str) {
     // the method runs must sit inside the bound operation, sharing the one
     // TOTAL_TIMEOUT_MS race with the statements.
     assert!(
-        call.args[0].contains("self.connect()") || call.args[0].contains("self.connect_mirror()"),
-        "{name} must run its connect inside the bound operation"
+        call.args[0].contains(connection)
+            || (connection == "self.connect()" && call.args[0].contains("self.connect_mirror()")),
+        "{name} must connect or open the audit transaction inside the bound operation"
     );
-    assert_eq!(
-        call.args[1], "TOTAL_TIMEOUT_MS",
-        "{name} must use the shared vault total, not a fresh literal"
-    );
+    assert_eq!(call.args[1], budget, "{name} must use its named budget");
     assert!(
         call.after.starts_with(".await"),
         "{name} must await the bound operation"
@@ -266,12 +275,19 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .expect("SingleUseStore impl bounds the Store impl")
         .0;
     let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
-    let prototype = store.split_once(prototype_gate).expect("prototype gate").1;
-    let store = store.replacen(
-        function_body(prototype, "asyncfnstore_reconcile_outcome("),
-        "{}",
-        1,
+    let prototype = format!("{prototype_gate}asyncfnstore_reconcile_outcome(");
+    let owned_body = function_body(store, &prototype);
+    assert!(owned_body.contains("self.store_reconcile_owned("));
+    let release_gate =
+        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
+    let legacy_body = function_body(
+        store,
+        &format!("{release_gate}asyncfnstore_reconcile_outcome("),
     );
+    assert!(legacy_body.contains("store_reconciled_subscription_statement()"));
+    assert!(legacy_body.contains("insert_paid_invoice_history_statement()"));
+    assert!(!legacy_body.contains("store_reconcile_owned("));
+    let store = store.replacen(owned_body, "{}", 1);
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
@@ -288,8 +304,6 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             "Store impl slice must contain {anchor}"
         );
     }
-    let release_gate =
-        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
     assert_eq!(
         names
             .iter()
@@ -317,6 +331,34 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
                 body,
                 format!("{{self.delete_preference(user_id,kind,target,{love_only}).await}}"),
                 "{name} must delegate its entire operation to the bounded helper"
+            );
+        } else if name == "acquire_playback_lease" {
+            assert_eq!(
+                function_body(piece, name),
+                "{self.acquire_private_aware_lease(user_id,session_id,track_id,play_id,now,continuation_deadline,takeover,).await}",
+                "lease acquisition must delegate its entire operation to the bounded helper"
+            );
+            assert_bounded(
+                function_body(&source, "asyncfnacquire_private_aware_lease("),
+                "acquire_private_aware_lease",
+            );
+        } else if name == "invite_by_hash" {
+            let lookup = function_body(piece, name)
+                .strip_suffix("lookup.resolve(&mutclient).await}")
+                .expect("lookup must end by handing off to the bounded expiry resolver");
+            assert_bounded(lookup, name);
+            assert_eq!(
+                function_body(&source, "implInviteLookup{asyncfnresolve("),
+                concat!(
+                    "{matchself{Self::Active(row)=>invite_from_row(&row).map(Some),",
+                    "Self::Expired(id)=>{try_observe_invite_expiry(client,id).await;Ok(None)}",
+                    "Self::Refused=>Ok(None),}}",
+                ),
+                "the expiry resolver must await only the best-effort audit"
+            );
+            assert_bounded(
+                function_body(&source, "asyncfntry_observe_invite_expiry("),
+                "try_observe_invite_expiry",
             );
         } else {
             assert_bounded(piece, name);
@@ -401,6 +443,21 @@ fn rate_limit_pair_commits_both_claims_in_one_cancellation_safe_transaction() {
 }
 
 #[test]
+fn account_deleting_probe_runs_unnamed_with_a_text_owner() {
+    let source = production();
+    let probe = function_body(&source, "asyncfnaccount_deleting(");
+    let queries = calls(probe, ".query_typed_opt");
+    assert_eq!(queries.len(), 1, "the pooled probe must run unnamed");
+    assert_eq!(
+        queries[0].args.as_slice(),
+        [
+            "crate::account_deletion::ACCOUNT_DELETING_PROBE_SQL",
+            "&[(&user_id,Type::TEXT)]",
+        ]
+    );
+}
+
+#[test]
 fn mint_path_statements_run_unnamed_through_query_typed() {
     // TWO-222: tokio-postgres names prepared statements `sN` per isolate, and
     // a named statement can collide on, or go missing from, a
@@ -479,6 +536,8 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     ]
     .map(|name| (name, function_body(store, &format!("asyncfn{name}("))));
     let helpers = [
+        "invite_by_hash_on",
+        "try_observe_invite_expiry",
         "reap_unverified_users_on",
         "prune_expired_challenges_on",
         "delete_expired_rate_limit_slots",
@@ -490,7 +549,10 @@ fn signup_path_statements_run_unnamed_through_query_typed() {
     .map(|name| (name, function_body(&source, &format!("asyncfn{name}("))));
     for (name, body) in methods.iter().chain(helpers.iter()) {
         assert!(
-            body.contains(".query_typed("),
+            body.contains(match *name {
+                "invite_by_hash" => "invite_by_hash_on(&client,code_hash).await",
+                _ => ".query_typed(",
+            }),
             "{name} must run its statements unnamed via query_typed"
         );
         for named in [
@@ -566,10 +628,9 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         }
     }
     // The production redemption transaction lives outside worker_entry:
-    // slice its `tokio_postgres::Transaction` impl (comments stripped,
+    // slice its `PgTransaction` impl (comments stripped,
     // whitespace normalized, like `production()` above) and pin the
-    // same rule. `SET LOCAL` stays on `batch_execute` (simple-query
-    // protocol, never a named prepared statement).
+    // same rule. The wrapper owns the fixed `SET LOCAL` command.
     let redemption: String = include_str!("../src/magic_redemption.rs")
         .split_once("#[cfg(all(test,")
         .expect("magic_redemption test-module boundary")
@@ -581,7 +642,7 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
         .filter(|ch| !ch.is_whitespace())
         .collect();
     let pg_impl = redemption
-        .split_once("implRedemptionTransactionfortokio_postgres::Transaction<'_>{")
+        .split_once("implRedemptionTransactionforPgTransaction<'_>{")
         .expect("production redemption transaction impl")
         .1
         .split_once("pub(crate)asyncfnredeem(")
@@ -597,6 +658,57 @@ fn magic_finish_path_statements_run_unnamed_through_query_typed() {
             !pg_impl.contains(named),
             "redemption transaction must not run a named prepared statement ({named})"
         );
+    }
+}
+
+#[test]
+fn history_controls_wire_to_postgres_storage() {
+    let source = production();
+    let dispatch = function_body(&source, "pubasyncfndispatch(");
+    assert!(dispatch.contains("store:&PgStore{"));
+    assert!(dispatch.contains("handle_with_transport_headers(&ctx,collected_request,&headers_map)"));
+    let store = source.split_once("implStoreforPgStore{").unwrap().1;
+    for (method, operation) in [
+        ("export_listen_events", "export(&client,owner,before)"),
+        ("clear_listen_events", "clear(&mutclient,owner)"),
+    ] {
+        let body = function_body(store, &format!("asyncfn{method}("));
+        assert!(body.contains("self.connect().await?"), "{method}");
+        assert!(
+            body.contains(&format!("crate::listen_history::{operation}.await")),
+            "{method}"
+        );
+    }
+}
+
+#[test]
+fn listen_history_statements_run_unnamed_through_query_typed() {
+    let source: String = include_str!("../src/listen_history.rs")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    for name in [
+        "owner_is_deleting",
+        "record",
+        "clear_in_transaction",
+        "export",
+    ] {
+        let body = function_body(&source, &format!("asyncfn{name}("));
+        assert!(
+            body.contains(".query_typed("),
+            "{name} must use unnamed statements"
+        );
+        for named in [
+            ".query(",
+            ".query_one(",
+            ".query_opt(",
+            ".query_raw(",
+            ".execute(",
+            ".execute_raw(",
+            ".prepare",
+        ] {
+            assert!(!body.contains(named), "{name} must not use {named}");
+        }
     }
 }
 

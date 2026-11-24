@@ -260,3 +260,53 @@ sha256 = "b4c11522e567f8db575936ebe61e1e02e5133b8ea6bf8c23f4c2190b7ba3d7ee"
 file = "0051_storage_object_envelope_intents.sql"
 target = "app"
 sha256 = "ff16b0766d071b944191190e1f237c40ce276bb421c0e0dcd29384c643deadeb"
+
+[[migration]]
+file = "0052_storage_digest_reference_admission.sql"
+target = "app"
+sha256 = "16a26d5f322ee3b651d44519b0d07adfff7f1e4adc47d14c8f83757fa9eb8676"
+
+[[migration]]
+file = "0053_purge_legacy_provider_credentials.sql"
+target = "app"
+sha256 = "ccd14876ce8ed7379c0a03ad1fb4404f12b32f0d31cb470b6b9f1817c8b0e0ca"
+
+[[migration]]
+file = "0054_listen_history.sql"
+target = "app"
+sha256 = "27d43e70497bb7ab5b65218b2c56a50580ce3ecb7517a1d0d8afd2e582755f6e"
+
+[[migration]]
+file = "0055_storage_digest_inventory_intents.sql"
+target = "app"
+sha256 = "b6bf4b124a926002dbf59e4a77a9df48594cc7b99074c4f2167d80743153713c"
+
+[[migration]]
+file = "0056_subsonic_measurement_auth.sql"
+target = "app"
+sha256 = "1658162dd6ff7f15b8f4f6c3708f26fbc5a42b6fa4b19a687cdce0133be84424"
+
+[[migration]]
+file = "0057_invite_windows.sql"
+target = "app"
+sha256 = "a2a640bb557386b65f237083f9921503af999b987f34e0b488a13205cd5b9dff"
+
+[[migration]]
+file = "0058_playback_continuation_deadline.sql"
+target = "app"
+sha256 = "567a3838e2efdd1af0e45ffb17d52f41a47d03a0f7928f80d5c34db872d9d119"
+
+[[migration]]
+file = "0059_paid_invoice_covered_periods.sql"
+target = "app"
+sha256 = "cb8b5ff85c2d2ef3cf732f74e8a9baf3e9da143d76aa0c87045972695f8a1923"
+
+[[migration]]
+file = "0060_invite_expiry_observation.sql"
+target = "app"
+sha256 = "3740b481e83ae13387f8e8169c2ad0f0c5b37e0c34f8a5182f3faa5d21897f00"
+
+[[migration]]
+file = "0061_invite_issuer_restriction.sql"
+target = "app"
+sha256 = "5b37d57a74e1f9c3b0e134aac28059a73e0f879d0aa5e97597ae79bc1db813b0"

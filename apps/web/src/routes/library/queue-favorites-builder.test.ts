@@ -1,11 +1,10 @@
 import { expect, test } from 'vitest';
 import ts from 'typescript';
-import { addTrack, clearQueue, createQueue, currentTrack as queueCurrentTrack, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
+import { addTrack, clearQueue, createQueue, selectTrack as selectQueueIndex, type QueueState } from '#lib/player/queue.js';
 import { displayArtist, displayTitle } from '#lib/library/order.js';
-import { clearMiniPlayerHint, readMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { readMiniPlayerHint } from '#lib/shell/mini-player.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { createQueueController } from '#lib/player/queueController.js';
-import { createMediaController } from '#lib/player/mediaController.js';
+import { createPlayerController } from '#lib/player/controller.svelte.js';
 import type { LibraryItem } from '#lib/library/cache.js';
 
 const sources = import.meta.glob('./+page.svelte', {
@@ -28,14 +27,10 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 	const script = source.slice(start, source.indexOf('</script', start));
 	const parsed = ts.createSourceFile('library.ts', script, ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'replaceQueue', 'commitQueue', 'queueFavorites', 'clearShareFeedback',
-		'resetRestartOnSourceChange', 'syncMiniPlayerHint'
+		'queuedTrackFor', 'playableTrackFor', 'selectTrack', 'queueFavorites'
 	]);
-	// Row selection now clears transient link feedback. Execute that real
-	// dependency with its real initial state, not a no-op handler substitute.
 	const state = new Set([
-		'favoriteTracks', 'favoritesAction', 'shareGeneration', 'shareStatus', 'shareFallbackUrl', 'pendingShareSeek',
-		'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision'
+		'favoriteTracks', 'favoritesAction', 'player', 'commitQueue', 'replaceQueue', 'queueController', 'media'
 	]);
 	const body = parsed.statements.filter((statement) =>
 		ts.isFunctionDeclaration(statement)
@@ -48,21 +43,20 @@ function pageActions(favorites: string[], queue = createQueue([]), announcement 
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
 	const bindings = {
-		items: ITEMS, favorites, queue, queueAnnouncement: announcement,
-		addTrack, queueCurrentTrack, resolveStreamUrl, displayArtist, displayTitle,
-		queueController: createQueueController(queue), createMediaController,
-		clearMiniPlayerHint, setMiniPlayerHint,
+		items: ITEMS, favorites, queue, announcement,
+		addTrack, resolveStreamUrl, displayArtist, displayTitle,
+		createQueue: () => queue, getAppPlayer: () => createPlayerController(queue, { flush: () => Promise.resolve() }),
 		$state: <T>(value: T) => value, $derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `
-		const library = queueController.prepareLibrary([...items, ...queue.tracks]);
-		queueController.publish(library.next, queueController.begin(library.next, 'replace', true), library.sources);
-		queueController.subscribe((value) => { queue = value; });
 		${compiled}
+		player.reconcileLibrary([...items, ...queue.tracks], () => true);
+		player.announceQueue(announcement);
+		queueController.subscribe((value) => { queue = value; });
 		return {
 			queueAll: typeof queueFavorites === 'function' ? queueFavorites : () => {},
 			replaceQueue, commitQueue, subscribe: queueController.subscribe,
-			read: () => ({ queue, announcement: queueAnnouncement })
+			read: () => ({ queue, announcement: player.queueAnnouncement.text })
 		};
 	`)(...Object.values(bindings)) as {
 		queueAll: () => void;

@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type APIRequestContext } from '@playwright/test';
 import { stagingBaseUrl } from '../helpers/access.js';
 import { assertServingBuildMatchesPromotion } from '../helpers/build-identity-live.js';
 import {
@@ -17,16 +17,16 @@ import {
 // `expected_sha` from `github.sha`) — never a local source checkout.
 //
 // This file holds the OPENING read plus the offline verdict pins. A single
-// point-in-time read cannot bind a ~30 min journey: a later main push may
-// deploy staging mid-journey after this read passes. The CLOSING read
+// point-in-time read cannot bind a ~30 min journey: a deploy outside the
+// main workflow lock could overwrite staging after this read. The CLOSING read
 // (`e2e/tests/zz-build-identity-final.spec.ts`, `zz-` prefix sorts it last
 // under the serial `workers: 1` config) re-reads `/api/build` after every
 // other spec through the same shared helper below and fails with a
 // "superseded by a newer deploy" message when the serving build changed —
 // so a green run proves the whole journey ran against the promoted SHA.
-// Deploy concurrency is intentionally unchanged (job-level groups release
-// when the deploy finishes); the closing read turns the race into a red
-// run instead of a false pass.
+// The main deploy lock now covers the whole journey. The closing read
+// still detects an overwrite from outside that lock, such as a pre-lock
+// rollback rerun (see the cutover and rollback procedure in `docs/ops.md`).
 //
 // NO file-level skip by design: the offline describe below pins the verdict
 // contract on every PR (via `npm run test:unit`) with no staging, while the
@@ -261,4 +261,43 @@ test('deployed build matches the promotion SHA (exact-head staging evidence)', a
   // API, logged as web=… api=… head=…) before the journey. The closing spec re-reads at the end through the same helper —
   // a mid-journey deploy reds the run instead of passing green.
   await assertServingBuildMatchesPromotion(request, baseURL, 'build-identity');
+});
+
+test('only the opening and closing build reads emit candidate-identity', async ({}, testInfo) => {
+  const head = 'a'.repeat(40);
+  const env = { EXPECTED_BUILD_SHA: head, API_DEPLOY_OUTCOME: 'deployed' };
+  const saved = Object.keys(env).map((key) => [key, process.env[key]] as const);
+  Object.assign(process.env, env);
+  const origin = 'https://staging.example.test';
+  const initialAnnotationCount = testInfo.annotations.length;
+  let apiSha = head;
+  const request = {
+    get: async (url: string) => ({
+      status: () => 200,
+      headers: () => ({}),
+      text: async () =>
+        JSON.stringify(url === `${origin}/api/build` ? { sha: head } : { ok: true, build_sha: apiSha }),
+    }),
+  } as unknown as APIRequestContext;
+  // This offline double also runs in the staging journey; don't log mock SHAs.
+  const readIdentity = (phase: string) =>
+    assertServingBuildMatchesPromotion(request, origin, phase, () => {});
+  try {
+    for (const phase of ['build-identity', 'listen-history-privacy', 'build-identity-final']) {
+      await expect(readIdentity(phase)).resolves.toBe(head);
+    }
+    apiSha = 'b'.repeat(40);
+    await expect(readIdentity('listen-history-privacy')).rejects.toThrow(/API build identity mismatch/);
+    const phases = testInfo.annotations.slice(initialAnnotationCount)
+      .filter(({ type }) => type === 'candidate-identity')
+      .map(({ description }) => JSON.parse(description ?? '{}').phase);
+    expect(phases).toEqual(['build-identity', 'build-identity-final']);
+  } finally {
+    // This offline double also runs in the full journey; never report its fake SHAs.
+    testInfo.annotations.splice(initialAnnotationCount);
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });

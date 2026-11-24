@@ -12,7 +12,9 @@ Run AFTER the real api/mb/ingest release builds exist
 4. runs the pinned real Wrangler CLI with the workflow's upload argv plus
    --dry-run --outdir, with poisoned cargo/worker-build on PATH, and asserts
    nothing tried to rebuild,
-5. runs a negative control: a config WITH the custom build command must
+5. checks query-string redaction in the staging API's serialized upload
+   metadata in both mirror scenarios,
+6. runs a negative control: a config WITH the custom build command must
    invoke the poisoned worker-build and be rejected.
 
 No secrets, no Cloudflare API calls. Usage:
@@ -31,6 +33,8 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -182,10 +186,37 @@ def assert_no_build(config, label):
           f"{label}: generated env.staging still has [build]")
 
 
-def dry_run(wrangler, argv, wdir, env, label):
+def dry_run(wrangler, argv, wdir, env, label, *, upload_body=None):
     out = wdir.parent.parent / f"out-{wdir.name}-{label}".replace(" ", "_")
-    return out, run(["node", str(wrangler), *argv, "--dry-run", "--outdir", str(out)],
-                    cwd=wdir, env=env, label=f"{label}: wrangler {' '.join(argv)} --dry-run")
+    args = ["node", str(wrangler), *argv, "--dry-run", "--outdir", str(out)]
+    if upload_body is not None:
+        args.extend(["--outfile", str(upload_body)])
+    return out, run(args, cwd=wdir, env=env, label=f"{label}: wrangler {' '.join(argv)} --dry-run")
+
+
+def assert_upload_redaction(upload_body, label):
+    # Wrangler --outfile writes the multipart body without its Content-Type
+    # header. Recover the boundary from the first line; don't search the bundle
+    # for JSON text, which could also appear inside a JS or Wasm module.
+    check(upload_body.is_file(), f"{label}: Wrangler did not write the upload body")
+    body = upload_body.read_bytes()
+    boundary = re.match(rb"--([A-Za-z0-9_-]{1,70})\r\n", body)
+    check(boundary, f"{label}: missing or invalid multipart boundary in Wrangler upload body")
+    message = BytesParser(policy=policy.default).parsebytes(
+        b'Content-Type: multipart/form-data; boundary="' + boundary[1] + b'"\r\n\r\n' + body
+    )
+    check(message.is_multipart() and not message.defects, f"{label}: malformed Wrangler upload body")
+    parts = [part for part in message.iter_parts()
+             if part.get_content_disposition() == "form-data"
+             and part.get_param("name", header="Content-Disposition") == "metadata"]
+    check(len(parts) == 1, f"{label}: expected exactly one Wrangler upload metadata part")
+    try:
+        metadata = json.loads(parts[0].get_payload(decode=True))
+    except (ValueError, TypeError):
+        raise Failure(f"{label}: invalid Wrangler upload metadata JSON") from None
+    observability = metadata.get("observability") if isinstance(metadata, dict) else None
+    check(isinstance(observability, dict) and observability.get("redact_query_string") is True,
+          f"{label}: Wrangler upload metadata must set observability.redact_query_string to true")
 
 
 def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
@@ -215,7 +246,10 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
     assert_no_build(config, label)
     if worker == "api":
         summary = Path(summary_env["GITHUB_STEP_SUMMARY"]).read_text()
-        bound = [h["binding"] for h in config["env"]["staging"]["hyperdrive"]]
+        staging = config["env"]["staging"]
+        check(staging.get("observability", {}).get("redact_query_string") is True,
+              f"{label}: staging API invocation query strings must be redacted")
+        bound = [h["binding"] for h in staging["hyperdrive"]]
         if mirror:
             check(bound == ["HYPERDRIVE", "MB_DB"] and "mirror: configured" in summary,
                   f"{label}: expected MB_DB bound, got {bound}")
@@ -223,13 +257,19 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror):
             check(bound == ["HYPERDRIVE"] and "mirror: absent" in summary,
                   f"{label}: expected no MB_DB, got {bound}")
 
-    # Upload: no second build, and the dry-run must succeed.
-    out, proc = dry_run(wrangler, argv, wdir, env, label)
+    # Keep the serialized body separate from the bundle output, and only in
+    # the temporary credential-free API fixture.
+    upload_body = tree / "upload.multipart" if worker == "api" else None
+    out, proc = dry_run(wrangler, argv, wdir, env, label, upload_body=upload_body)
     check(proc.returncode == 0, f"{label}: wrangler dry-run failed (exit {proc.returncode})")
     if marker.exists():
         raise Failure(f"{label}: poisoned build tool was invoked:\n{marker.read_text()}")
     check("Running custom build" not in proc.stdout + proc.stderr, f"{label}: wrangler ran a custom build")
     check(out.is_dir() and any(out.iterdir()), f"{label}: dry-run wrote nothing to {out}")
+
+    if upload_body is not None:
+        assert_upload_redaction(upload_body, label)
+        print(f"{label}: Wrangler upload metadata redacts query strings", flush=True)
 
     if worker == "api" and mirror:
         negative_control(wrangler, argv, wdir, env, marker, label)

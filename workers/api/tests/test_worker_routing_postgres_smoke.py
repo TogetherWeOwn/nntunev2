@@ -77,7 +77,7 @@ class Helpers(unittest.TestCase):
                  patch.object(smoke.sys, "stderr"):
                 sock.return_value.__enter__.return_value.getsockname.return_value = ("localhost", 1234)
                 popen.return_value.poll.return_value = None
-                self.assertEqual(smoke.main([]), 1)
+                self.assertEqual(smoke.main(["--no-fixture"]), 1)
                 run_smoke.assert_called_once()
                 remove.assert_called_once_with(Path("/tmp/fake"))
 

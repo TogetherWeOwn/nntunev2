@@ -4,11 +4,9 @@ import { displayArtist, displayTitle, orderLibraryItems, type LibraryOrder } fro
 import { selectFavoriteItems } from '#lib/library/favorites.js';
 import { filterLibraryItems } from '#lib/library/filter.js';
 import { groupLibraryItems } from '#lib/library/group.js';
-import { createQueue, currentTrack as queueCurrentTrack, type QueueState } from '#lib/player/queue.js';
+import { createQueue, type QueueState } from '#lib/player/queue.js';
 import { resolveStreamUrl } from '#lib/library/stream-url.js';
-import { createQueueController } from '#lib/player/queueController.js';
-import { createMediaController } from '#lib/player/mediaController.js';
-import { clearMiniPlayerHint, setMiniPlayerHint } from '#lib/shell/mini-player.js';
+import { createPlayerController } from '#lib/player/controller.svelte.js';
 
 // Builder-owned integration regression: the merged favorites/query projections
 // must bound both the bulk action and its disabled/already-queued states.
@@ -26,14 +24,12 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const parsed = ts.createSourceFile('library.ts', source.slice(start, source.indexOf('</script', start)), ts.ScriptTarget.Latest, true);
 	const handlers = new Set([
-		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks', 'replaceQueue', 'commitQueue',
-		'addDisplayedTracksToQueue', 'clearShareFeedback', 'resetRestartOnSourceChange', 'syncMiniPlayerHint'
+		'missingDisplayedTracks', 'queuedTrackFor', 'appendMissingTracks',
+		'addDisplayedTracksToQueue'
 	]);
 	const functions = parsed.statements.filter(ts.isFunctionDeclaration).filter((node) => handlers.has(node.name?.text ?? ''));
 	expect(new Set(functions.map((node) => node.name?.text))).toEqual(handlers);
-	// Queue replacement clears real share state when the current source changes.
-	// Include those dependencies without substituting or weakening the handler.
-	const stateNames = new Set(['shareGeneration', 'shareStatus', 'shareFallbackUrl', 'restartCanSeek', 'restartStatus', 'jumpStatus', 'queueRevision', 'media', 'mediaRevision']);
+	const stateNames = new Set(['player', 'replaceQueue', 'queueController']);
 	const state = parsed.statements.filter((statement) => ts.isVariableStatement(statement) && statement.declarationList.declarations.some(
 		(declaration) => stateNames.has(declaration.name.getText(parsed))
 	));
@@ -48,27 +44,25 @@ function actions(view: 'all' | 'favorites', favorites: string[], queue: QueueSta
 	const compiled = ts.transpileModule(body, {
 		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
 	}).outputText;
-	const queueController = createQueueController(queue);
-	const { next, sources: evidence } = queueController.prepareLibrary([...ITEMS, ...queue.tracks]);
-	queueController.publish(next, queueController.begin(next, 'replace', true), evidence);
 	const bindings = {
 		view, favorites, queue, findQuery, findScope: 'both', order, groupByArtist, items: ITEMS,
 		queuedIds: new Set(queue.tracks.map((track) => track.id)),
-		libraryUnavailable: false, queueAnnouncement: 'Previous outcome',
+		libraryUnavailable: false,
 		displayArtist, displayTitle, selectFavoriteItems, orderLibraryItems, filterLibraryItems,
-		groupLibraryItems, queueCurrentTrack, resolveStreamUrl,
-		queueController, createMediaController,
-		clearMiniPlayerHint, setMiniPlayerHint,
+		groupLibraryItems, resolveStreamUrl,
+		createQueue: () => queue, getAppPlayer: () => createPlayerController(queue, { flush: () => Promise.resolve() }),
 		$state: <T>(value: T) => value,
 		$derived: <T>(value: T) => value
 	};
 	return new Function(...Object.keys(bindings), `
-		queueController.subscribe((value) => { queue = value; });
 		${compiled}
+		player.reconcileLibrary([...items, ...queue.tracks], () => true);
+		player.announceQueue('Previous outcome');
+		queueController.subscribe((value) => { queue = value; });
 		return {
 			disabled: bulkDisabled, allQueued: bulkAllQueued,
 			add: addDisplayedTracksToQueue,
-			read: () => ({ queue, announcement: queueAnnouncement })
+			read: () => ({ queue, announcement: player.queueAnnouncement.text })
 		};
 	`)(...Object.values(bindings)) as {
 		disabled: boolean; allQueued: boolean; add: () => void;
