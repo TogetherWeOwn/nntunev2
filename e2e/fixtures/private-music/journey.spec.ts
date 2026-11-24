@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { expect, test } from '@playwright/test';
-import { parsePrivateStagingFixture, privateStagingAudio } from '../../helpers/private-staging-fixture.js';
+import { freshTrialPublication, parsePrivateStagingFixture, privateStagingAudio } from '../../helpers/private-staging-fixture.js';
 import {
   assertCuratedLibrary,
   assertPrivateInvite,
@@ -13,27 +13,39 @@ const clips = new URL('../../../fixtures/synthetic-flac/admin-upload/', import.m
 
 test('staging preflight rejects stale, non-synthetic and ambiguous evidence', () => {
   const now = 1_800_000_000;
+  const companionAudio = privateStagingAudio().find(({ file }) => file === 'tone-b.flac')!;
   const fixture = {
     email: 'listener@example.test', inviteCode: 'A'.repeat(22), expiresAt: now + 180,
-    publications: privateStagingAudio().map(({ sha256, body }, index) => {
-      expect(body.length).toBeGreaterThan(69631);
-      return { trackId: `fixture-${index}`, sha256 };
-    }),
+    ownerSession: `synthetic.${'A'.repeat(43)}`,
+    companion: { trackId: '00000000-0000-4000-8000-000000000002', sha256: companionAudio.sha256 },
   };
-  const digests = fixture.publications.map(({ sha256 }) => sha256);
-  expect(parsePrivateStagingFixture(JSON.stringify(fixture), now, digests)).toEqual(fixture);
+  expect(parsePrivateStagingFixture(JSON.stringify(fixture), now, companionAudio.sha256)).toEqual(fixture);
   for (const invalid of [
     { ...fixture, email: 'listener@example.com' },
     { ...fixture, expiresAt: now },
     { ...fixture, expiresAt: now + 481 },
     { ...fixture, inviteCode: 'query&other=value' },
-    { ...fixture, publications: [fixture.publications[0], fixture.publications[0]] },
-    { ...fixture, publications: [fixture.publications[0], { ...fixture.publications[1], sha256: '0'.repeat(64) }] },
+    { ...fixture, ownerSession: '' },
+    { ...fixture, ownerSession: `${fixture.ownerSession}\r\nOther: injected` },
+    { ...fixture, companion: { ...fixture.companion, trackId: 'non-canonical' } },
+    { ...fixture, companion: { ...fixture.companion, sha256: '0'.repeat(64) } },
   ]) {
-    expect(() => parsePrivateStagingFixture(JSON.stringify(invalid), now, digests)).toThrow(
-      'Private staging requires a fresh synthetic invite and two verified publication records',
+    expect(() => parsePrivateStagingFixture(JSON.stringify(invalid), now, companionAudio.sha256)).toThrow(
+      'Private staging requires a fresh synthetic invite, owner session and verified companion publication',
     );
   }
+});
+
+test('publication receipt requires the uploaded digest and an unseen canonical ID', () => {
+  const { sha256 } = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
+  const receipt = { trackId: '00000000-0000-4000-8000-000000000001', sha256 };
+  const parse = (raw: string, before: string[] = []) => freshTrialPublication(raw, sha256, before);
+  expect(parse(JSON.stringify(receipt))).toEqual(receipt);
+  for (const raw of [
+    '<html>', 'null', JSON.stringify({ ...receipt, sha256: '0'.repeat(64) }),
+    JSON.stringify({ ...receipt, trackId: 'synthetic' }), JSON.stringify({ ...receipt, extra: true }),
+  ]) expect(() => parse(raw)).toThrow('Expected a fresh canonical publication');
+  expect(() => parse(JSON.stringify(receipt), [receipt.trackId])).toThrow('Expected a fresh canonical publication');
 });
 
 test('synthetic invite redemption requires a usable Library session', () => {

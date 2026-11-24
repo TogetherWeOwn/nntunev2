@@ -171,7 +171,9 @@ run [synthetic observations](fixtures/private-music/journey.spec.ts) with a
 separate [Playwright config](playwright.private-music.config.ts) outside staging
 test discovery. They verify the verdicts for invite redemption, publication
 and Library identity, playback and seek, queue order and Next, and explicit
-access refusal. The upload inputs are original
+access refusal. A [web browser test](../apps/web/tests/private-music-publication.spec.ts)
+uses intercepted HTTP and the checked-in FLAC to exercise fresh publication,
+selection, playback, seek and revocation in the rendered Library. The short upload inputs are original
 [CC0 FLAC clips](../fixtures/synthetic-flac/admin-upload/manifest.json).
 The self-test hashes two clips and checks their sizes against the manifest.
 The [ingest readback test](../workers/ingest/tests/multipart_readback_inventory.rs)
@@ -197,12 +199,12 @@ from the post-deploy staging journey:
    Library navigation. Check missing-invite signup and anonymous Library in
    fresh contexts. Use a separate authenticated unlisted account for the
    uninvited Library and play assertions.
-3. Use the real owner upload, verification and publication routes. Record the
-   input digests and obtain the resulting digest-to-track IDs from verified
-   publication evidence. Confirm the invitee sees those IDs in Library. Use
-   at least two distinct original FLAC tracks for queue order, with a longer
-   multi-frame synthetic track first for the browser seek. The short clips
-   remain useful for upload and readback checks.
+3. After redemption, check the companion is visible in the invitee Library.
+   Send the exact `tone-a.flac` bytes to `POST /v1/admin/private-trial/upload`
+   with the stepped-up owner's cookie in a separate request. Verify that the
+   returned canonical ID was absent before upload and becomes visible on
+   Refresh. Use the returned ID first for playback and seek, then the
+   prepublished `tone-b.flac` companion for Next.
 4. Select the curated rows in rendered order, capture browser playback
    advancement before seeking, and drive a paused seek using
    [the player UI driver](helpers/player-ui.ts). Observe `seeked` and start
@@ -228,13 +230,14 @@ The `post-deploy-private-music` job is an explicit staging opt-in in the
 same workflow and concurrency group as the staging deploy. Keep
 the repository variable `PRIVATE_MUSIC_STAGING_JOURNEY` unset until the
 protected upload schema, dedicated versioned S3 path, MusicBrainz mirror
-and serving bindings are qualified. Before arming, publish the two original [14-second FLAC
-fixtures](../fixtures/synthetic-flac/private-staging/manifest.json) through
-the admin upload and publish path and retain the version pins separately.
+and serving bindings are qualified. Prepare the `tone-b.flac` companion from
+the original [14-second FLAC fixtures](../fixtures/synthetic-flac/private-staging/manifest.json)
+with a scoped Library admission and retain the version pins separately.
 Set the staging Environment secret `PRIVATE_MUSIC_STAGE_FIXTURE` with the
 unredeemed `example.test` recipient `email`, its `inviteCode`, the cohort's
-`expiresAt` in Unix seconds, and the two `{ sha256, trackId }` `publications`
-from that path. Configure `PRIVATE_LISTENING_COHORT` for this recipient
+`expiresAt` in Unix seconds, the `companion` receipt `{ sha256, trackId }`
+for tone B, and the fresh stepped-up owner's cookie value as `ownerSession`.
+Configure `PRIVATE_LISTENING_COHORT` for this recipient
 using the [private listening runbook](../docs/ops.md#private-listening-qualification).
 Arrange for the job to start within eight minutes of the cutoff. The armed
 push runs the private journey instead of the ordinary journey, so it cannot

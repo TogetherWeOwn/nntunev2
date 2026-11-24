@@ -3,8 +3,7 @@ import { playbackFailure, type PlaybackEvidence } from './playback.js';
 import { resumeFloorAfterSeek, seekProofFailure, type TimedPlayer } from './player-ui.js';
 import { queueOrderFailure } from './queue-order.js';
 
-// Existing hooks only. The owner upload and publish routes will supply their
-// own selectors when mounted.
+// Existing hooks for the invited browser session.
 export const PRIVATE_MUSIC = {
   issueInvite: {
     path: '/admin/invites/issue',
@@ -26,6 +25,7 @@ export const PRIVATE_MUSIC = {
     path: '/library',
     api: API.library,
     item: TESTIDS.libraryItem,
+    select: 'button.nt-library-row',
     id: 'data-id',
     refresh: 'Refresh',
     forbidden: 'You do not have access to this library.',
