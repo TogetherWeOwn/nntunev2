@@ -12,6 +12,7 @@ import { createLivePlaybackSpeed } from './livePlaybackSpeed.js';
 import { restartIsAvailable } from './restartAvailability.js';
 import type { SystemSeekGuard } from './systemSeek.js';
 import { bindSystemTransport } from './systemTransport.js';
+import { applyMediaSession, clearMediaSession } from './mediaSession.js';
 import type { BrowserPlaybackSource } from './browserPlaybackGrant.js';
 import type { ShareTarget } from './shareTimestamp.js';
 
@@ -63,6 +64,7 @@ function matchesNativeSource(audio: HTMLAudioElement, source: string): boolean {
 
 export function createMediaController(queue: QueueAuthority, selection?: MediaSelection, matchesNative = matchesNativeSource) {
 	let current: (MediaAttachment & { listeners: AbortController }) | undefined;
+	let pausedTransport: AbortController | undefined;
 	let attachmentVersion = 0;
 	let endGeneration = 0;
 	let playIntent = 0;
@@ -128,15 +130,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const target = transportTarget();
 		if (!target || pendingPlay) return;
 		const { audio, matches } = target;
-		const track = retry ? currentTrack(queue.snapshot) : null;
-		const trackId = track?.id;
+		const trackId = retry ? currentTrack(queue.snapshot)?.id : undefined;
 		const sameTrack = () => !retry || currentTrack(queue.snapshot)?.id === trackId;
 		const previousIntent = playIntent;
 		if (!matches() || (retry ? get(playbackStatus) !== 'error' || !audio.error
 			: audio.error || (!audio.paused && !audio.ended)) ||
 			!matches(() => playIntent === previousIntent && sameTrack())) return;
-		if (track && selection?.prepare && !recoverPosition) {
-			return preparePlay(track, { streamUrl: selectedSource(), isCurrent: matches }, () => startCurrent(true, true), true);
+		if (trackId && selection?.prepare && !recoverPosition) {
+			return preparePlay(trackId, matches, () => startCurrent(true, true), true);
 		}
 		++playIntent;
 		if (retry) ++endGeneration;
@@ -234,6 +235,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			selection.commit({ ...next, tracks });
 		}
 	}
+	const queueTransport = { playCurrent, pauseCurrent, onNext: () => navigateQueue(nextTrack), onPrevious: () => navigateQueue(previousTrack) };
 
 	function clearJumpFeedback(): void {
 		const feedback = get(seekFeedback);
@@ -260,6 +262,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function retire(): HTMLAudioElement | undefined {
+		pausedTransport?.abort();
 		const previous = current;
 		current = undefined;
 		// Retire the native receipt without imposing replacement's share-clear policy on remove/clear.
@@ -290,33 +293,27 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		}
 	}
 
-	async function preparePlay(target: Track, evidence: QueuedPlaySource, publish: (source: BrowserPlaybackSource) => void | Promise<void>, retry?: boolean) {
-		if (!selection?.prepare || destroyed || queue.purging || !evidence.isCurrent()) return;
+	async function preparePlay(trackId: string, isEligible: () => boolean, publish: (source: BrowserPlaybackSource) => Promise<void>, retry?: boolean) {
+		if (!selection?.prepare || destroyed || queue.purging || !isEligible()) return;
 		const request = pendingGrant = ++grantIntent;
 		const revision = queue.revision, intent = playIntent, position = positionIntent, version = attachmentVersion;
-		const current = () => !destroyed && pendingGrant === request && queue.isCurrent(revision) && evidence.isCurrent() &&
+		const current = () => !destroyed && pendingGrant === request && queue.isCurrent(revision) && isEligible() &&
 			intent === playIntent && position === positionIntent && version === attachmentVersion;
-		let playback: void | Promise<void> = undefined;
+		let playback: Promise<void> | undefined;
 		try {
-			if (!(await selection.prepare(target.id, current, (grant) => { playback = publish(grant); }, retry)) && current()) {
-				selection.announce('Could not start playback.', true);
-			}
+			const accepted = await selection.prepare(trackId, current, (grant) => { playback = publish(grant); }, retry);
+			if (!accepted && current()) selection.announce('Could not start playback.', true);
 			await playback;
 		} finally { if (pendingGrant === request) pendingGrant = undefined; }
 	}
 
-	async function playSelected(base: QueueState, index: number, source: QueuedPlaySource, suffix = ''): Promise<void> {
-		const target = base.tracks[index];
-		if (!selection?.prepare || !target) return playPrepared(base, index, source, suffix);
-		return preparePlay(target, source, (grant) => playPrepared(base, index, grant, suffix, grant));
-	}
-
-	async function playPrepared(
-		base: QueueState, index: number, source: QueuedPlaySource, suffix: string, grant?: BrowserPlaybackSource
+	async function playSelected(
+		base: QueueState, index: number, source: QueuedPlaySource, suffix = '', grant?: BrowserPlaybackSource
 	): Promise<void> {
 		if (!selection || queue.purging) return;
 		const target = base.tracks[index];
 		if (!target || destroyed || !source.isCurrent()) return;
+		if (selection.prepare && !grant) return preparePlay(target.id, source.isCurrent, (issued) => playSelected(base, index, issued, suffix, issued));
 		const { streamUrl } = source;
 		const tracks = [...base.tracks];
 		if (!grant) tracks[index] = { ...target, streamUrl };
@@ -667,7 +664,14 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		absoluteSeek: { subscribe: absoluteSeek.subscribe }, seek,
 		playbackStatus: { subscribe: playbackStatus.subscribe },
 		playCurrent, pauseCurrent, retryCurrent: () => startCurrent(true),
-		next: () => navigateQueue(nextTrack),
+		bindPausedTransport(track: Track) {
+			const lifetime = pausedTransport = new AbortController();
+			const guard = (run: () => void) => () => { if (!lifetime.signal.aborted && !queue.purging) run(); };
+			if (applyMediaSession({ ...track, artworkUrl: null }, { onPlay: guard(playCurrent),
+				onNext: guard(queueTransport.onNext), onPrevious: guard(queueTransport.onPrevious) })) {
+				lifetime.signal.addEventListener('abort', () => clearMediaSession(), { once: true });
+			}
+		},
 		speed,
 		clearSeekFeedback,
 		restoreRepeat(storage: Pick<Storage, 'getItem'> | null): void {
@@ -693,6 +697,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement): () => void {
 			if (destroyed || queue.purging) return () => {};
+			pausedTransport?.abort();
 			if (mountedAudio.has(audio)) throw new Error('Native observations require a fresh audio element');
 			mountedAudio.add(audio);
 			const previous = current;
@@ -811,11 +816,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 				readPlayback(audio, target.matches, 'starting');
 				const attachment = attachmentVersion;
 				bindSystemTransport(queue, audio, () => target.matches() ? currentTrack(queue.snapshot) : null,
-					{
-						playCurrent, pauseCurrent,
-						onNext: selection && (() => navigateQueue(nextTrack)),
-						onPrevious: selection && (() => navigateQueue(previousTrack))
-					}, receipt.listeners.signal, {
+					selection ? queueTransport : { playCurrent, pauseCurrent }, receipt.listeners.signal, {
 						audio, attachment, availability: absoluteSeek, positionIntent: () => positionIntent,
 						matches: () => target.matches(() => currentTrack(queue.snapshot)?.id === trackId),
 						dispatch: (action, seconds, guard) => action === 'seekto' ? seek(attachment, seconds, true, guard)

@@ -138,6 +138,7 @@ export function createPlayerController(
 			if (!isCurrent()) return false;
 		}
 		const nextSource = grant?.streamUrl ?? streamFor(after);
+		const canPrepare = browserSession && after && queue.hasLibraryTrack(after.id);
 		if (trackChanged || streamFor(before) !== nextSource) {
 			// Sample the live element before retiring its queued volumechange events.
 			media.observeSound();
@@ -147,7 +148,7 @@ export function createPlayerController(
 			version += 1;
 			retireNativeHost();
 			if (!isCurrent()) return false;
-			if (!nextSource) media.sleepTimer.cancel();
+			if (!nextSource && !canPrepare) media.sleepTimer.cancel();
 			else media.speed.handoff(() => queue.isCurrentOperation(receipt) && queue.snapshot === next &&
 				media.attachmentVersion === version + 1 ? rate : null);
 		}
@@ -155,6 +156,8 @@ export function createPlayerController(
 		if (!isCurrent()) return false;
 		if (grant || trackChanged) activeGrant = grant;
 		queue.publish(next, receipt, library?.sources);
+		if (!isCurrent()) return false;
+		if (trackChanged && after && canPrepare && !nextSource) media.bindPausedTransport(after);
 		if (!isCurrent()) return false;
 		const selected = currentTrack(queue.snapshot);
 		if (selected) {

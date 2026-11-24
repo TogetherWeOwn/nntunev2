@@ -1,14 +1,12 @@
 import { expect, onTestFinished, test, vi } from 'vitest';
-import { expireInsideRequestWindow, grantReply, initial, refusedContinuations, setup } from './fixtures/browserPlayback.js';
+import { captureSystemActions, expireInsideRequestWindow, grantReply, initial, invalidToggleReply, refusedContinuations, setup } from './fixtures/browserPlayback.js';
+import { get } from 'svelte/store';
 test('new plays use the acknowledged mode in the same tab and continuations keep the established source', async () => {
-	const { player, media, queue, fetchFn, starts, refresh, src, attach, delayGrant } = setup();
+	const system = captureSystemActions();
+	const { player, media, queue, fetchFn, starts, refresh, src, attach, toggleDuringFirstPlay, requests } = setup();
 	media.captureShareSeek(media.beginShareInput(), { trackId: 'first', seconds: 18 }, () => true);
 	expect([player.privateListening?.enabled, src(), fetchFn.mock.calls.length]).toEqual([false, '', 0]);
-	const delayed = delayGrant(), starting = media.playCurrent();
-	await delayed.started;
-	const enabling = player.setPrivateListening(true);
-	delayed.reply(undefined);
-	await Promise.all([starting, enabling]);
+	await toggleDuringFirstPlay();
 	const first = src(), tab = first.split('/')[5];
 	expect([first, media.audio?.currentTime]).toEqual([`/v1/plays/media/first/${tab}/play-1`, 18]);
 	const audio = attach();
@@ -24,18 +22,19 @@ test('new plays use the acknowledged mode in the same tab and continuations keep
 	}
 	await media.retryCurrent();
 	expect([src(), audio.currentTime, audio.load.mock.calls.length]).toEqual([first, 36, 1]);
-	expect(fetchFn.mock.calls.slice(2).map(([, init]) => JSON.parse(String(init?.body)).play_id)).toEqual(Array(3).fill('play-1'));
-	media.next();
+	expect(requests().slice(2).map((body) => body.play_id)).toEqual(Array(3).fill('play-1'));
+	media.sleepTimer.start({ kind: 'duration', ms: 60_000 }, 'Armed');
+	system.get('nexttrack')!();
 	expect([src(), fetchFn.mock.calls.length]).toEqual(['', 5]);
-	await media.playCurrent();
-	expect(src()).toBe(`/v1/plays/media/second/${tab}/play-2`);
+	system.get('play')!();
+	await vi.waitFor(() => expect([src(), media.audio?.paused, get(media.sleepTimer).armed]).toEqual([`/v1/plays/media/second/${tab}/play-2`, false, true]));
 	expect(queue.snapshot.tracks).toEqual(initial.tracks);
 	await player.setPrivateListening(false);
 	media.setRepeat('queue', null);
 	attach(false).finish();
 	await vi.waitFor(() => expect(src()).toBe(`/v1/plays/media/first/${tab}/play-3`));
 	expect(starts).toEqual([false, true, false]);
-	expect(fetchFn.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).session_id)).toEqual(Array(8).fill(tab));
+	expect(requests().map((body) => body.session_id)).toEqual(Array(8).fill(tab));
 });
 
 test.each(['refused', 'superseded', 'account retirement', 'legacy reply', 'extra field', 'newer play'] as const)('%s fences grant publication', async (caseName) => {
@@ -63,7 +62,7 @@ test.each(['refused', 'superseded', 'account retirement', 'legacy reply', 'extra
 		expect([player.privateListening, queue.snapshot.tracks.length, audio.pause.mock.calls.length]).toEqual([undefined, 0, 1]);
 	} else {
 		expect(queue.snapshot).toBe(snapshot);
-		expect([src(), media.audio === audio, audio.pause.mock.calls.length]).toEqual([incumbent, true, 0]);
+		expect([src(), media.audio, audio.pause.mock.calls.length]).toEqual([incumbent, audio, 0]);
 	}
 });
 
@@ -71,8 +70,8 @@ test.each(['wrong tab', 'server error', 'short expiry', 'TTL expiry'] as const)(
 	const { player, queue, fetchFn, src, play } = setup(reason === 'TTL expiry' ? 7 * 60 * 60 : 60);
 	await play(0);
 	const incumbent = src(), snapshot = queue.snapshot;
-	if (reason === 'wrong tab') fetchFn.mockResolvedValueOnce(Response.json({ session_id: 'another-tab', private_until: Math.floor(Date.now() / 1000) + 60 }));
-	if (reason === 'server error') fetchFn.mockResolvedValueOnce(new Response(null, { status: 503 }));
+	const reply = invalidToggleReply(reason);
+	if (reply) fetchFn.mockResolvedValueOnce(reply);
 	await player.setPrivateListening(true);
 	expect(player.privateListening?.enabled).toBe(reason.endsWith('expiry'));
 	if (reason.endsWith('expiry')) expireInsideRequestWindow(reason === 'TTL expiry' ? 21_600_000 : 60_000);

@@ -22,8 +22,7 @@ export function createBrowserPlaybackSession(
 		tail = result.then(() => {}, () => {});
 		return result;
 	}
-	let expiry: ReturnType<typeof setTimeout> | undefined;
-	let expired: (() => boolean) | undefined;
+	let expiry: ReturnType<typeof setTimeout> | undefined, expired: (() => boolean) | undefined;
 	function expire() {
 		if (!enabled || !isCurrent()) return;
 		enabled = false;
@@ -48,10 +47,7 @@ export function createBrowserPlaybackSession(
 					if (!dispatched) return;
 					const result = await dispatched.pending;
 					if (!isCurrent()) return;
-					if ('error' in result) {
-						uncertain ||= !(result.error instanceof ApiError && result.error.status >= 400 && result.error.status < 500);
-						return;
-					}
+					if ('error' in result) throw result.error;
 					const { status, data } = result.reply;
 					const ack = data as { session_id?: unknown; private_until?: unknown } | null;
 					const advertised = Number.isSafeInteger(ack?.private_until) ? Number(ack?.private_until) * 1000 - wall : 0;
@@ -69,6 +65,8 @@ export function createBrowserPlaybackSession(
 						expired = next ? () => remaining() <= 0 : undefined;
 						if (next) expiry = setTimeout(expire, remaining());
 					});
+				} catch (error) {
+					uncertain ||= !(error instanceof ApiError && error.status >= 400 && error.status < 500);
 				} finally {
 					pending = false;
 					if (isCurrent()) show({ enabled, pending, feedback });

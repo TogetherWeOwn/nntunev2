@@ -2081,7 +2081,7 @@
 				liveRegions={!loading}
 				confirmDestructive
 				confirmGeneration={queueConfirmGeneration}
-				onnext={() => player.privateListening ? media.next() : replaceQueue(nextTrack(queueController.snapshot))}
+				onnext={() => replaceQueue(nextTrack(queueController.snapshot))}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queueController.snapshot))}
 				onmove={player.moveQueuedTrack}
 				oninsert={insertQueuedIds}

@@ -76,12 +76,40 @@ export function setup(privateTtlSeconds = 60) {
 		});
 		return { started: started.promise, reply: reply.resolve };
 	}
-	return { player, media, queue, fetchFn, starts, lifetime, refresh, src, play, attach, delayGrant };
+	async function toggleDuringFirstPlay() {
+		const delayed = delayGrant();
+		const playing = media.playCurrent();
+		await delayed.started;
+		const enabling = player.setPrivateListening(true);
+		delayed.reply(undefined);
+		await Promise.all([playing, enabling]);
+	}
+	const requests = () => fetchFn.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+	return { player, media, queue, fetchFn, starts, lifetime, refresh, src, play, attach, delayGrant, toggleDuringFirstPlay, requests };
+}
+
+export function captureSystemActions() {
+	const handlers = new Map<string, (() => void) | null>();
+	const navigator = globalThis.navigator;
+	const original = Object.getOwnPropertyDescriptor(navigator, 'mediaSession');
+	Object.defineProperty(navigator, 'mediaSession', { configurable: true, value: {
+		metadata: null, setActionHandler: (name: string, action: (() => void) | null) => handlers.set(name, action)
+	} });
+	onTestFinished(() => {
+		if (original) Object.defineProperty(navigator, 'mediaSession', original);
+		else Reflect.deleteProperty(navigator, 'mediaSession');
+	});
+	return handlers;
 }
 
 export const refusedContinuations = (tab: string) => [
 	new Response(null, { status: 409 }), Response.json(receipt(tab, 'first', 'other-play'))
 ];
+
+export function invalidToggleReply(reason: string) {
+	if (reason === 'server error') return new Response(null, { status: 503 });
+	if (reason === 'wrong tab') return Response.json({ session_id: 'another-tab', private_until: Math.floor(Date.now() / 1000) + 60 });
+}
 
 export function expireInsideRequestWindow(durationMs: number) {
 	// Wall clock moves backwards while the monotonic clock enters the final request window.
