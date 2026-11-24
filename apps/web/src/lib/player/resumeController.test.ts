@@ -169,6 +169,24 @@ test('observes a real seek to zero, refuses failed completion, and clears only t
 	expect(storage.positions.get(key)).toBe('{"kelp":15}');
 });
 
+test.each(['ended', 'flush'] as const)('completion can retry from %s after a storage failure', (retry) => {
+	const { native, storage, mount } = setup();
+	const receipt = mount()!;
+	const key = accountKey(accountA);
+	storage.positions.set(key, '{"coral":32,"kelp":15}');
+	const failingOperation = retry === 'ended' ? storage.getItem : storage.setItem;
+	failingOperation.mockImplementationOnce(() => { throw new Error('Storage unavailable'); });
+	native.currentTime = native.duration;
+	native.ended = true;
+	receipt.observe('ended');
+	expect(storage.positions.get(key)).toBe('{"coral":32,"kelp":15}');
+	receipt.observe(retry);
+	expect(storage.positions.get(key)).toBe('{"kelp":15}');
+	storage.getItem.mockClear();
+	receipt.detach();
+	expect(storage.getItem).not.toHaveBeenCalled();
+});
+
 test('the existing Library host plays and resumes the same attachment with position persistence off', async () => {
 	const native = new SyntheticAudio();
 	const seeded = { [RESUME_STORAGE_KEY]: '{"coral":45}', [accountKey(accountA)]: '{"coral":51}' };

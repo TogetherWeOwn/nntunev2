@@ -47,29 +47,35 @@ export function createResumeController() {
 
 			let observing = false;
 			let lastPosition: number | undefined;
-			let completed = false;
+			let completion: 'pending' | 'cleared' | undefined;
 			function observe(kind: PositionObservation): void {
 				if (observing) return;
 				observing = true;
 				try {
 					if (!matches() || audio.error !== null || audio.seeking) return;
-					const ended = kind === 'ended';
-					if (audio.ended !== ended || (completed && (kind === 'ended' || kind === 'flush'))) return;
-					const seconds = ended ? null : audio.currentTime;
+					const ended = audio.ended;
+					const clearing = ended && (kind === 'ended' || (kind === 'flush' && completion === 'pending'));
+					if (clearing) {
+						if (completion === 'cleared') return;
+					} else if (ended || kind === 'ended' || (kind === 'flush' && completion)) {
+						return;
+					}
+					const seconds = clearing ? null : audio.currentTime;
 					if (seconds !== null) {
 						if (!Number.isFinite(seconds) || seconds < 0 || seconds === lastPosition) return;
-						if (seconds === 0 && lastPosition === undefined && (kind !== 'seeked' || completed)) return;
+						if (seconds === 0 && lastPosition === undefined && (kind !== 'seeked' || completion)) return;
 						if (kind === 'sample' && Math.abs(seconds - (lastPosition ?? 0)) < 5) return;
 					}
 					if (!matches()) return;
-					if (ended) {
+					if (clearing) {
 						lastPosition = undefined;
-						completed = true;
+						completion = 'pending';
 					}
 					const storage = getStorage();
 					if (!storage || !matches()) return;
 					// A failed or revoked read must not turn into an empty-map write.
 					let read = false;
+					let writeRequested = false;
 					let saved = false;
 					const store = createResumeStore({ storageKey, storage: {
 						getItem(key) {
@@ -80,6 +86,7 @@ export function createResumeController() {
 							return read ? raw : null;
 						},
 						setItem(key, value) {
+							writeRequested = true;
 							const set = storage.setItem;
 							if (!read || !matches()) return;
 							set.call(storage, key, value);
@@ -92,11 +99,13 @@ export function createResumeController() {
 					} });
 					if (seconds === null) {
 						store.clear(trackId);
+						// An accepted read with no rewrite is an idempotent clear.
+						if (read && (!writeRequested || saved)) completion = 'cleared';
 					} else {
 						store.save(trackId, seconds);
 						if (saved) {
 							lastPosition = seconds;
-							completed = false;
+							completion = undefined;
 						}
 					}
 				} catch {
