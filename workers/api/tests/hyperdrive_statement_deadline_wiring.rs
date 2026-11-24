@@ -276,7 +276,18 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
         .0;
     let prototype_gate = "#[cfg(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\"))]";
     let prototype = format!("{prototype_gate}asyncfnstore_reconcile_outcome(");
-    let store = store.replacen(function_body(store, &prototype), "{}", 1);
+    let owned_body = function_body(store, &prototype);
+    assert!(owned_body.contains("self.store_reconcile_owned("));
+    let release_gate =
+        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
+    let legacy_body = function_body(
+        store,
+        &format!("{release_gate}asyncfnstore_reconcile_outcome("),
+    );
+    assert!(legacy_body.contains("store_reconciled_subscription_statement()"));
+    assert!(legacy_body.contains("insert_paid_invoice_history_statement()"));
+    assert!(!legacy_body.contains("store_reconcile_owned("));
+    let store = store.replacen(owned_body, "{}", 1);
     let mut pieces = store.split("asyncfn");
     pieces.next().expect("preamble before the first method");
     let pieces: Vec<&str> = pieces.collect();
@@ -293,8 +304,6 @@ fn every_store_method_races_its_statements_through_the_shared_seam() {
             "Store impl slice must contain {anchor}"
         );
     }
-    let release_gate =
-        "#[cfg(not(all(target_arch=\"wasm32\",feature=\"billing-owned-wasm-test\")))]";
     assert_eq!(
         names
             .iter()

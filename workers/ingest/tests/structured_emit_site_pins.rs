@@ -503,6 +503,8 @@ fn site_slice<'a>(production: &'a str, func: &str) -> &'a str {
 #[test]
 fn migrated_events_fire_from_their_own_call_site_with_its_trace() {
     let lib = production("src/lib.rs");
+    assert_eq!(lib.matches(".analytics_engine(").count(), 1);
+    assert!(fn_body(&lib, "send").contains(".analytics_engine(METER_DATASET_BINDING)"));
     let consumer = production("src/queue_consumer.rs");
     assert_eq!(
         SITE_PINS.len(),
@@ -534,7 +536,10 @@ fn migrated_events_fire_from_their_own_call_site_with_its_trace() {
              (dropping the trace to None must fail): {call}"
         );
         assert!(
-            call.contains("\"build_sha\":"),
+            call.contains("\"build_sha\":")
+                || (*func == "try_meter"
+                    && call.contains("meter_failure_fields(")
+                    && call.contains("build_sha_from_env(env)")),
             "{rel}::{func} must carry the build SHA for {event}: {call}"
         );
     }
@@ -713,15 +718,15 @@ fn migrated_files_never_serialize_an_error_value_into_a_string() {
             );
         }
     }
-    // Both meter failure strings stay pinned literals.
-    let lib = production("src/lib.rs");
+    // Both transport reason codes stay pinned at the typed boundary.
+    let metering = production("src/metering.rs");
     assert_eq!(
-        lib.matches("\"meter_write_failed\"").count(),
+        metering.matches("\"meter_write_failed\"").count(),
         1,
         "the meter write failure must stay the fixed category string"
     );
     assert_eq!(
-        lib.matches("\"meter_binding_missing\"").count(),
+        metering.matches("\"meter_binding_missing\"").count(),
         1,
         "the meter binding failure must stay the fixed category string"
     );

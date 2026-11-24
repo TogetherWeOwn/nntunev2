@@ -5,13 +5,14 @@ use nntune_core::{
     digest_enrollment::OriginManifest,
     digest_geometry::DigestGeometry,
     digest_readback::{
-        verify_enrolled_readback, BodyReadbackError, CompletedInventory, EnrolledEnvelope,
-        EnrolledReadbackError, ReadbackBody, ReadbackPin, ReadbackResponse,
+        verify_enrolled_readback_with_seek, BodyReadbackError, CompletedInventory,
+        EnrolledEnvelope, EnrolledReadbackError, FlacSeekIndex, ReadbackBody, ReadbackPin,
+        ReadbackResponse,
     },
     media_envelope::EnvelopeContext,
-    s3_locator::S3Binding,
+    s3_locator::{S3Binding, S3MediaMetadata},
 };
-use std::ops::AsyncFnMut;
+use std::ops::{AsyncFnMut, Range};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InventoryError {
@@ -28,6 +29,7 @@ pub struct CompletedReadbackInventory<'a> {
     map_id: [u8; 16],
     origin: &'a OriginManifest,
     geometry: DigestGeometry,
+    metadata: &'a S3MediaMetadata,
     media: ReadbackPin<'a>,
     pages: Vec<(u32, ReadbackPin<'a>)>,
 }
@@ -51,6 +53,7 @@ pub struct VerifiedCompletedReadback<'inventory, 'receipts> {
     inventory: &'inventory CompletedReadbackInventory<'receipts>,
     root_version: [u8; 16],
     wrapped_record: [u8; 230],
+    flac_seek: Option<FlacSeekIndex>,
 }
 
 impl<'inventory, 'receipts> VerifiedCompletedReadback<'inventory, 'receipts> {
@@ -60,6 +63,29 @@ impl<'inventory, 'receipts> VerifiedCompletedReadback<'inventory, 'receipts> {
 
     pub fn origin(&self) -> &'receipts OriginManifest {
         self.inventory.origin
+    }
+
+    pub(crate) fn matches_media(
+        &self,
+        media: &S3MediaMetadata,
+        plaintext_sha256: &[u8; 32],
+    ) -> bool {
+        media == self.inventory.metadata && plaintext_sha256 == self.origin().plaintext_sha256()
+    }
+
+    /// Get whole-frame plaintext offsets for the consumer's independently
+    /// trusted media metadata and digest. Authorization and authenticated
+    /// range reads remain the consumer's responsibility.
+    pub fn flac_plaintext_range(
+        &self,
+        media: &S3MediaMetadata,
+        plaintext_sha256: &[u8; 32],
+        millis: Range<u64>,
+    ) -> Option<Range<u64>> {
+        if !self.matches_media(media, plaintext_sha256) {
+            return None;
+        }
+        self.flac_seek.as_ref()?.plaintext_range(millis)
     }
 
     pub(crate) fn authenticated_envelope(&self) -> (&[u8; 16], &[u8; 230]) {
@@ -149,6 +175,7 @@ impl<'a> CompletedReadbackInventory<'a> {
             map_id,
             origin: manifest,
             geometry,
+            metadata,
             media,
             pages,
         })
@@ -162,10 +189,31 @@ impl<'a> CompletedReadbackInventory<'a> {
         &'inventory self,
         scope: ReadbackScope<'_>,
         envelope: EnrolledEnvelope<'_>,
+        open: impl AsyncFnMut(&'a str, ReadbackPin<'a>) -> std::io::Result<BucketReadbackResponse<B>>,
+    ) -> Result<VerifiedCompletedReadback<'inventory, 'a>, EnrolledReadbackError> {
+        self.verify_inner(scope, envelope, open, false).await
+    }
+
+    /// Opt in to recording seek anchors during the same verified readback.
+    /// The opener follows the same contract as `verify`.
+    pub async fn verify_with_flac_seek<'inventory, B: ReadbackBody>(
+        &'inventory self,
+        scope: ReadbackScope<'_>,
+        envelope: EnrolledEnvelope<'_>,
+        open: impl AsyncFnMut(&'a str, ReadbackPin<'a>) -> std::io::Result<BucketReadbackResponse<B>>,
+    ) -> Result<VerifiedCompletedReadback<'inventory, 'a>, EnrolledReadbackError> {
+        self.verify_inner(scope, envelope, open, true).await
+    }
+
+    async fn verify_inner<'inventory, B: ReadbackBody>(
+        &'inventory self,
+        scope: ReadbackScope<'_>,
+        envelope: EnrolledEnvelope<'_>,
         mut open: impl AsyncFnMut(
             &'a str,
             ReadbackPin<'a>,
         ) -> std::io::Result<BucketReadbackResponse<B>>,
+        collect_seek: bool,
     ) -> Result<VerifiedCompletedReadback<'inventory, 'a>, EnrolledReadbackError> {
         let inventory_error = || EnrolledReadbackError::Body(BodyReadbackError::Inventory);
         if scope.bucket != self.bucket || scope.configuration != self.media.configuration {
@@ -187,7 +235,7 @@ impl<'a> CompletedReadbackInventory<'a> {
         };
         let root_version = envelope.context.identities[0];
         let wrapped_record = *envelope.trusted_record;
-        verify_enrolled_readback(
+        let flac_seek = verify_enrolled_readback_with_seek(
             self.origin,
             envelope,
             &completed,
@@ -202,12 +250,14 @@ impl<'a> CompletedReadbackInventory<'a> {
                 }
                 Ok(opened.response)
             },
+            collect_seek,
         )
         .await?;
         Ok(VerifiedCompletedReadback {
             inventory: self,
             root_version,
             wrapped_record,
+            flac_seek,
         })
     }
 

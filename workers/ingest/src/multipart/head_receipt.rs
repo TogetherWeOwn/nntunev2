@@ -7,9 +7,10 @@ use nntune_core::{
     s3_locator::{S3Locator, S3MediaMetadata},
 };
 
-use super::{Completion, MultipartError};
+use super::{CompletedVersionedMedia, Completion, MultipartError};
 
-/// Synthetic HEAD observations, not values copied from the expected object.
+/// Metadata observed for the exact HEAD request. Supply the configuration
+/// used and the returned locator and length independently of the expected pin.
 pub struct HeadReceipt<'a> {
     pub configuration: Option<[u8; 16]>,
     pub locator: Option<&'a S3Locator>,
@@ -52,18 +53,46 @@ pub fn compare_head_receipt(
     {
         return Err(ExpectedObject);
     }
+    compare_observation(&expected, context.identities[5], head)
+}
+
+impl CompletedVersionedMedia {
+    /// Compare HEAD against the version captured by completion and its trusted
+    /// context. This comparison only verifies transport metadata.
+    pub fn verify_head(
+        &self,
+        context: &EnvelopeContext,
+        head: Option<HeadReceipt<'_>>,
+    ) -> Result<(), HeadReceiptError> {
+        let expected = self.metadata();
+        if !expected.matches_context(context) {
+            return Err(HeadReceiptError::ExpectedObject);
+        }
+        compare_observation(expected, context.identities[5], head)
+    }
+}
+
+fn compare_observation(
+    expected: &S3MediaMetadata,
+    configuration: [u8; 16],
+    head: Option<HeadReceipt<'_>>,
+) -> Result<(), HeadReceiptError> {
+    use HeadReceiptError::*;
+
     let head = head.ok_or(MissingHead)?;
-    let (Some(configuration), Some(observed), Some(size)) =
+    let (Some(observed_configuration), Some(observed), Some(size)) =
         (head.configuration, head.locator, head.content_length)
     else {
         return Err(MissingMetadata);
     };
-    if configuration != context.identities[5] || observed != locator {
+    if observed_configuration != configuration || observed != expected.locator() {
         return Err(WrongObject);
     }
     let max = ciphertext_size(MAX_NEW_PLAINTEXT).ok_or(InvalidSize)?;
     if size <= HEADER_SIZE + TAG_SIZE || size > max {
         return Err(InvalidSize);
     }
-    (size == length).then_some(()).ok_or(SizeMismatch)
+    (size == expected.ciphertext_len())
+        .then_some(())
+        .ok_or(SizeMismatch)
 }
