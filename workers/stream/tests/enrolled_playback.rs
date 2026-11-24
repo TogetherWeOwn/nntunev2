@@ -15,6 +15,8 @@ use nntune_stream::{
 
 #[path = "enrolled_playback/refusals.rs"]
 mod refusals;
+#[path = "enrolled_playback/s3.rs"]
+mod s3;
 
 struct Body<'a>(&'a [u8]);
 impl ReadbackBody for Body<'_> {
