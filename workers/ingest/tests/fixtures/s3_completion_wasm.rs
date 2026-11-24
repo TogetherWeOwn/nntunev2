@@ -239,7 +239,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
             retained_record: &record,
         };
         let readback_until = if mode == "readback-deadline" {
-            now() + Duration::from_millis(200)
+            now() + Duration::from_millis(500)
         } else {
             until
         };

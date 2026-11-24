@@ -7,7 +7,8 @@ const { s3_completion_test: complete } = require('./ingest_wasm.cjs');
 
 const version = 'fixture-version+/=?';
 const versionQuery = 'versionId=fixture-version%2B%2F%3D%3F';
-const ciphertextLength = 48 + 1 + 16;
+const wireHeaderLength = 48;
+const ciphertextLength = wireHeaderLength + 1 + 16;
 const headHeaders = { 'x-amz-version-id': version, 'content-length': String(ciphertextLength) };
 const bucket = 'fixture-bucket';
 const mediaKey = 'media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd';
@@ -179,7 +180,7 @@ const readbackHeaders = (bytes, id) => ({
 function mockReadback(t, { mediaReply, pageReply, waitForPage = false } = {}) {
   let media;
   let page;
-  let endMedia;
+  let releaseCiphertext;
   const gets = [];
   t.mock.method(globalThis, 'fetch', async (request) => {
     const url = new URL(request.url);
@@ -214,16 +215,20 @@ function mockReadback(t, { mediaReply, pageReply, waitForPage = false } = {}) {
         start(controller) {
           controller.enqueue(new Uint8Array());
           controller.enqueue(media.subarray(0, 7));
-          controller.enqueue(media.subarray(7));
-          if (waitForPage) endMedia = () => controller.close();
-          else controller.close();
+          controller.enqueue(media.subarray(7, wireHeaderLength));
+          const finish = () => {
+            controller.enqueue(media.subarray(wireHeaderLength));
+            controller.close();
+          };
+          if (waitForPage) releaseCiphertext = finish;
+          else finish();
         },
       });
       return new Response(body, { headers });
     }
     await verifySignedRequest(request, 'GET', readbackPageQuery, {}, sidecarKey);
     gets.push(sidecarKey);
-    endMedia?.();
+    releaseCiphertext?.();
     const headers = readbackHeaders(page, readbackPageVersion);
     return pageReply ? pageReply(page, headers) : new Response(page, { headers });
   });
@@ -231,7 +236,7 @@ function mockReadback(t, { mediaReply, pageReply, waitForPage = false } = {}) {
 }
 
 test('streams the completed media and sidecar versions into authenticated readback', async (t) => {
-  // The media stream cannot finish until the verifier opens the sidecar.
+  // Only the wire header is available until the verifier opens the sidecar.
   const gets = mockReadback(t, { waitForPage: true });
   assert.equal(await complete('readback'), version);
   assert.deepEqual(gets, [mediaKey, sidecarKey]);
@@ -318,6 +323,44 @@ test('aborts readback when the media never reaches EOF', async (t) => {
   await assert.rejects(complete('readback-deadline'), rejectedWith('Body(Transport)'));
   assert.deepEqual(gets, [mediaKey, sidecarKey]);
   assert.equal(signal.aborted, true);
+});
+
+test('does not renew the deadline between GETs or chunk reads', async (t) => {
+  // Each operation advances the clock by less than the 2 s fixture budget.
+  // Date is mocked so the cumulative-deadline assertion is independent of host speed.
+  await t.test('across GETs', async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const delayed = (bytes, headers) => {
+      t.mock.timers.tick(1100);
+      return new Response(bytes, { headers });
+    };
+    const gets = mockReadback(t, { mediaReply: delayed, pageReply: delayed });
+    await assert.rejects(complete('readback'), rejectedWith('Body(Transport)'));
+    assert.deepEqual(gets, [mediaKey, sidecarKey]);
+  });
+  await t.test('across chunk reads', async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    let pulls = 0;
+    const gets = mockReadback(t, {
+      mediaReply(bytes, headers) {
+        const body = new ReadableStream({
+          pull(controller) {
+            t.mock.timers.tick(1100);
+            if (++pulls === 1) {
+              controller.enqueue(bytes.subarray(0, 7));
+            } else {
+              controller.enqueue(bytes.subarray(7));
+              controller.close();
+            }
+          },
+        }, { highWaterMark: 0 });
+        return new Response(body, { headers });
+      },
+    });
+    await assert.rejects(complete('readback'), rejectedWith('Body(Transport)'));
+    assert.equal(pulls, 2);
+    assert.deepEqual(gets, [mediaKey]);
+  });
 });
 
 test('refuses a foreign completion context before sending HEAD', async (t) => {
