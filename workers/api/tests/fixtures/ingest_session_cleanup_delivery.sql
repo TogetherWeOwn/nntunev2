@@ -48,6 +48,8 @@ BEGIN
 
     IF EXISTS (SELECT FROM pg_temp.claim_cleanup(f.environment_id, f.library_id, owner, sid)) OR
        EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(gen_random_uuid(), f.library_id, owner, sid, 'absolute_expiry', expiry_id)) OR
+       EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(f.environment_id, gen_random_uuid(), owner, sid, 'absolute_expiry', expiry_id)) OR
+       EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(f.environment_id, f.library_id, 'session-other', sid, 'absolute_expiry', expiry_id)) OR
        EXISTS (SELECT FROM pg_temp.ack_cleanup_enqueue(f.environment_id, f.library_id, owner, sid, 'absolute_expiry', terminal_id)) THEN
         RAISE EXCEPTION 'live claim duplicated or acknowledgement accepted the wrong scope/intent';
     END IF;
