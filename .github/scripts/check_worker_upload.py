@@ -40,6 +40,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/deploy.yml"
 MANIFEST = ".github/scripts/binding_manifest.toml"
+PRIVATE_CONFIG = ".github/scripts/staging_stream_config.py"
 BUILD_CMD = "worker-build --release -- --locked"
 TIMEOUT = 600
 
@@ -93,6 +94,12 @@ def workflow_commands(text, worker, sha):
     check(argv[:3] == ["deploy", "--env", "staging"], f"{worker}: unexpected upload argv {argv}")
     check(f"BUILD_SHA:{sha}" in argv, f"{worker}: upload argv lacks BUILD_SHA for the commit")
     return gen, argv
+
+
+def check_variable_mappings(step, keys):
+    for key in keys:
+        expected = f"          {key}: " + "${{ vars." + key + " }}"
+        check(step.splitlines().count(expected) == 1, f"missing or duplicate staging variable mapping {key}")
 
 
 # --- process helpers -----------------------------------------------------
@@ -169,8 +176,7 @@ def fixture(base, worker, label):
     shutil.copy(ROOT / MANIFEST, tree / MANIFEST)
     if worker == "stream":
         shutil.copy(ROOT / "workers/stream/wrangler.toml", wdir / "wrangler.toml")
-        script = ".github/scripts/staging_stream_config.py"
-        shutil.copy(ROOT / script, tree / script)
+        shutil.copy(ROOT / PRIVATE_CONFIG, tree / PRIVATE_CONFIG)
     return tree, wdir
 
 
@@ -252,6 +258,8 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
             PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region",
             PRIVATE_PLAYBACK_STAGING_ROOT_VERSION="22222222-2222-4222-8222-222222222222",
         )
+        generator = step_text(job_text(wf_text, "staging-stream"), "Generate staging wrangler.toml")
+        check_variable_mappings(generator, (key for key in summary_env if key.startswith("PRIVATE_")))
     if api_private:
         summary_env.update(
             STREAM_SERVICE_STAGING="nntune-stream-staging", STREAM_STAGING_DEPLOY_ENABLED="true",
@@ -268,6 +276,24 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
     marker = base / f"marker-{tag}"
     env = base_env(home, path, marker)
     tree, wdir = fixture(base, worker, f"tree-{tag}")
+    if api_private:
+        shutil.copy(ROOT / PRIVATE_CONFIG, tree / PRIVATE_CONFIG)
+        trial = {key: value for key, value in summary_env.items() if key.startswith("PRIVATE_") or key.startswith("STREAM_")}
+        generator = step_text(job_text(wf_text, "staging-api"), "Generate staging wrangler.toml")
+        check_variable_mappings(generator, trial)
+        trial.update(PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT="https://objects.example.test",
+                     PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region")
+        preflight = step_text(job_text(wf_text, "gate"), "Validate private staging trial settings")
+        check_variable_mappings(preflight, trial)
+        stream_dir = tree / "workers/stream"
+        stream_dir.mkdir()
+        shutil.copy(ROOT / "workers/stream/wrangler.toml", stream_dir / "wrangler.toml")
+        args = ["bash", "-e", "-c", run_script(preflight)]
+        good = run(args, cwd=tree, env={**env, **trial}, label="private staging preflight")
+        check(good.returncode == 0, "complete settings did not pass trial preflight")
+        bad = run(args, cwd=tree, env={**env, **trial, "PRIVATE_PLAYBACK_STAGING_S3_REGION": ""},
+                  label="private staging preflight without region")
+        check(bad.returncode != 0, "trial preflight accepted missing Stream region")
     config = generate(worker, gen_script, wdir, env, summary_env, label)
     assert_no_build(config, label)
     if worker in ("api", "stream"):
