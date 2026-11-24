@@ -85,6 +85,27 @@ async fn authorized(
     .map_err(|_| StoreError)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn mint_grant(
+    secret: &[u8],
+    user: &str,
+    track: &str,
+    play: &str,
+    epoch: u64,
+    exp: u64,
+    digest: &str,
+) -> Result<IssuedGrant, StoreError> {
+    let payload = format!("{user}|{track}|{play}|{epoch}|{exp}|{digest}");
+    let signed = format!("v4.{}", crate::b64::encode(payload.as_bytes()));
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).map_err(|_| StoreError)?;
+    mac.update(signed.as_bytes());
+    let signature = crate::b64::encode(&mac.finalize().into_bytes());
+    Ok(IssuedGrant {
+        token: format!("{signed}.{signature}"),
+        exp_unix: exp,
+    })
+}
+
 impl PrivatePlayback<'_> {
     /// Start one new private play with a live signed cookie and current
     /// invitation. Only the server supplies publication pins. The caller
@@ -172,13 +193,15 @@ impl PrivatePlayback<'_> {
             {
                 return Ok(None);
             }
-            let payload = format!("{user}|{track}|{play_id}|{epoch}|{exp}|{digest}");
-            let signed = format!("v4.{}", crate::b64::encode(payload.as_bytes()));
-            let mut mac =
-                Hmac::<sha2::Sha256>::new_from_slice(self.grant_secret).map_err(|_| StoreError)?;
-            mac.update(signed.as_bytes());
-            let signature = crate::b64::encode(&mac.finalize().into_bytes());
-            let token = format!("{signed}.{signature}");
+            let grant = mint_grant(
+                self.grant_secret,
+                user,
+                track,
+                &play_id,
+                epoch,
+                exp,
+                &digest,
+            )?;
             let receipt = PrivateReceipt {
                 relay: BrowserReceipt {
                     user_id: user.clone(),
@@ -193,10 +216,7 @@ impl PrivatePlayback<'_> {
                     },
                     artifact_sha256: digest,
                     duration_ms,
-                    grant: IssuedGrant {
-                        token,
-                        exp_unix: exp,
-                    },
+                    grant,
                 },
                 session: claims,
                 accepted_seq: pins.accepted_seq,

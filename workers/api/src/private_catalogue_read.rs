@@ -82,35 +82,76 @@ pub async fn resolve(
     Ok(lease_authorizes().then_some(resolved))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PublicationScope<'a> {
+    pub environment: [u8; 16],
+    pub library: [u8; 16],
+    pub provider_configuration: [u8; 16],
+    pub bucket: &'a str,
+}
+
+impl<'a> From<&PublicationPins<'a>> for PublicationScope<'a> {
+    fn from(pins: &PublicationPins<'a>) -> Self {
+        Self {
+            environment: pins.environment,
+            library: pins.library,
+            provider_configuration: pins.provider_configuration,
+            bucket: pins.bucket,
+        }
+    }
+}
+
 pub(crate) async fn lookup(
     db: &impl PgQuery,
     track: &str,
     pins: &PublicationPins<'_>,
     digest: Option<&str>,
 ) -> Result<Option<(ResolvedMusic, Row)>, StoreError> {
-    let version = pins.version.as_bytes();
+    if pins.accepted_seq <= 0 || !valid_version(pins.version) {
+        return Ok(None);
+    }
+    lookup_scoped(
+        db,
+        track,
+        pins.into(),
+        Some((pins.accepted_seq, pins.version)),
+        digest,
+    )
+    .await
+}
+
+fn valid_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 1024
+        && version.bytes().all(|b| b.is_ascii_graphic() && b != b',')
+}
+
+pub(crate) async fn lookup_scoped(
+    db: &impl PgQuery,
+    track: &str,
+    scope: PublicationScope<'_>,
+    pin: Option<(i64, &str)>,
+    digest: Option<&str>,
+) -> Result<Option<(ResolvedMusic, Row)>, StoreError> {
     if !is_uuid_shaped(track)
         || track.bytes().any(|b| b.is_ascii_uppercase())
-        || pins.bucket.len() > 63
-        || version.len() > 1024
-        || version.contains(&b',')
-        || version.contains(&0)
-        || pins.bucket.contains('\0')
-        || pins.accepted_seq <= 0
+        || scope.bucket.len() > 63
+        || scope.bucket.contains('\0')
     {
         return Ok(None);
     }
+    let (seq, version) = pin.unzip();
     let row = db
         .query_typed_opt(
             include_str!("private_catalogue_read.sql"),
             &[
                 (&track, Type::TEXT),
-                (&uuid_text(pins.environment), Type::TEXT),
-                (&uuid_text(pins.library), Type::TEXT),
-                (&pins.accepted_seq, Type::INT8),
-                (&uuid_text(pins.provider_configuration), Type::TEXT),
-                (&pins.bucket, Type::TEXT),
-                (&pins.version, Type::TEXT),
+                (&uuid_text(scope.environment), Type::TEXT),
+                (&uuid_text(scope.library), Type::TEXT),
+                (&seq, Type::INT8),
+                (&uuid_text(scope.provider_configuration), Type::TEXT),
+                (&scope.bucket, Type::TEXT),
+                (&version, Type::TEXT),
                 (&digest, Type::TEXT),
             ],
         )
@@ -124,20 +165,24 @@ pub(crate) async fn lookup(
             .map(|uuid| uuid.0)
             .map_err(|_| StoreError)
     };
+    let version: &str = row.try_get("s3_version_id").map_err(|_| StoreError)?;
+    if !valid_version(version) {
+        return Ok(None);
+    }
     let locator = S3Locator::new(
-        pins.bucket.into(),
+        scope.bucket.into(),
         row.try_get("s3_key").map_err(|_| StoreError)?,
-        S3Binding::VersionId(pins.version.into()),
+        S3Binding::VersionId(version.into()),
     )
     .map_err(|_| StoreError)?;
     let digest: &[u8] = row.try_get("plaintext_sha256").map_err(|_| StoreError)?;
     let target = DigestReadTarget {
-        environment: pins.environment,
-        library: pins.library,
+        environment: scope.environment,
+        library: scope.library,
         reference: id("track_id")?,
         object: id("object_id")?,
         generation: id("generation_id")?,
-        provider_configuration: pins.provider_configuration,
+        provider_configuration: scope.provider_configuration,
         root_version: id("root_version_id")?,
         plaintext_sha256: digest.try_into().map_err(|_| StoreError)?,
         plaintext_bytes: row.try_get("plaintext_bytes").map_err(|_| StoreError)?,

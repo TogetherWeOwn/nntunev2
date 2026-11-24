@@ -315,3 +315,8 @@ sha256 = "5b37d57a74e1f9c3b0e134aac28059a73e0f879d0aa5e97597ae79bc1db813b0"
 file = "0062_ingest_sessions.sql"
 target = "app"
 sha256 = "00ef502288181c1a18b77a0974d8b3a900fdfa49efce8907ce38d70353121ff3"
+
+[[migration]]
+file = "0063_browser_playback_receipt.sql"
+target = "app"
+sha256 = "cbf0c5796654ac439698a32e6b399f1fde1faffb4f032c535a688a0138d0c73b"

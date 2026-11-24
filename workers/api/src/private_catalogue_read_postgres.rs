@@ -146,6 +146,14 @@ async fn resolves_only_the_committed_scoped_publication() {
     unsigned.grant.token.push('A');
     assert!(query(&mut reader, &unsigned, &pins).await.is_none());
 
+    let (current, row) = lookup_scoped(&reader, track, (&pins).into(), None, None)
+        .await
+        .unwrap()
+        .expect("current committed publication");
+    assert_eq!(row.get::<_, i64>("accepted_seq"), pins.accepted_seq);
+    assert_eq!(current.target.reference, id("track_id"));
+    assert!(matches!(current.locator.binding(), S3Binding::VersionId(v) if v == pins.version));
+
     let resolved = query(&mut reader, &signed, &pins)
         .await
         .expect("committed publication");
