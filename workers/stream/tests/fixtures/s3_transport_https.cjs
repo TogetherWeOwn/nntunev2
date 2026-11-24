@@ -22,22 +22,27 @@ hook.deregister();
 const path = '/fixture-media/media/00000000000040008000000000000003/00000000000040008000000000000004';
 const query = 'versionId=version%2B%2F%25%3F%3D%26';
 const span = 'bytes 65600-65616/65617';
+const pagePath = path.replace('/media/', '/media-digests/') + '/00000000000040008000000000000006/00000000';
+const pageQuery = 'versionId=page%2B%2F%25%3F%3D%26';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const mac = (key, value) => createHmac('sha256', key).update(value).digest();
 
-function verifyGet(req, host) {
+function verifyGet(req, host, page = false) {
+  const objectPath = page ? pagePath : path;
+  const versionQuery = page ? pageQuery : query;
   assert.equal(req.method, 'GET');
-  assert.equal(req.url, `${path}?${query}`);
+  assert.equal(req.url, `${objectPath}?${versionQuery}`);
   assert.equal(req.headers.host, host);
-  assert.equal(req.headers.range, 'bytes=65600-65616');
+  if (page) assert.equal(req.headers.range, undefined);
+  else assert.equal(req.headers.range, 'bytes=65600-65616');
   // Undici also appends identity automatically for a ranged request.
   assert.match(req.headers['accept-encoding'], /^identity(?:, identity)?$/);
   assert.equal(req.headers['x-amz-content-sha256'], hash(''));
   const date = req.headers['x-amz-date'];
   assert.match(date, /^\d{8}T\d{6}Z$/);
-  const signed = 'host;range;x-amz-content-sha256;x-amz-date';
+  const signed = page ? 'host;x-amz-content-sha256;x-amz-date' : 'host;range;x-amz-content-sha256;x-amz-date';
   const headers = signed.split(';').map(key => `${key}:${req.headers[key]}\n`).join('');
-  const canonical = ['GET', path, query, headers, signed, hash('')].join('\n');
+  const canonical = ['GET', objectPath, versionQuery, headers, signed, hash('')].join('\n');
   const scope = `${date.slice(0, 8)}/fixture-1/s3/aws4_request`;
   const key = scope.split('/').reduce(mac, Buffer.from('AWS4fixture-reader-signing-material'));
   const signature = mac(key, ['AWS4-HMAC-SHA256', date, scope, hash(canonical)].join('\n'));
@@ -135,4 +140,51 @@ test('versioned encrypted playback over a disposable HTTPS origin', { timeout: 2
     await closed;
     assert.equal(hits, before + 1);
   }
+});
+
+test('versioned digest pages require exact complete response framing', { timeout: 10_000 }, async (t) => {
+  const fixture = make_s3_fixture();
+  const page = Buffer.from(fixture.digest_page());
+  let host;
+  let fault = {};
+  const server = createServer({
+    key: readFileSync(process.env.S3_FIXTURE_KEY),
+    cert: readFileSync(process.env.NODE_EXTRA_CA_CERTS),
+  }, (req, res) => {
+    verifyGet(req, host, true);
+    res.writeHead(fault.status ?? 200, {
+      'content-length': page.length,
+      'x-amz-version-id': 'page+/%?=&',
+      ...fault.headers,
+    });
+    if (fault.closed) {
+      res.once('close', fault.closed);
+      res.write(page.subarray(1));
+      return;
+    }
+    res.end(fault.body ?? page);
+  });
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+    fixture.free();
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  host = `127.0.0.1:${server.address().port}`;
+  const read = () => fixture.read_digest_page(`https://${host}`);
+  assert.deepEqual(Buffer.from(await read()), page);
+  for (fault of [
+    { status: 206 },
+    { headers: { 'content-range': 'bytes 0-155/156' } },
+    { headers: { 'x-amz-version-id': ['page+/%?=&', 'page+/%?=&'] } },
+    { headers: { 'x-amz-version-id': 'wrong-version' } },
+    { headers: { 'content-encoding': 'identity' } },
+    { headers: { 'content-length': page.length - 1 }, body: page.subarray(1) },
+    { headers: { connection: 'close' }, body: page.subarray(1) },
+  ]) await assert.rejects(read(), error => error === 'storage read refused');
+
+  const closed = new Promise(resolve => { fault = { closed: resolve }; });
+  await assert.rejects(read(), error => error === 'storage read refused');
+  await closed;
 });

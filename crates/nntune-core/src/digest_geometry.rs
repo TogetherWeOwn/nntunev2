@@ -11,6 +11,7 @@ const R2_PART_BYTES: u64 = 5_244_160;
 const MAX_PLAINTEXT: u64 = 1 << 33;
 const PAGE_ENTRIES: u32 = 256;
 const PAGE_HEADER: u32 = 92;
+pub const MAX_PAGE_ENCODED_LEN: u32 = PAGE_HEADER + PAGE_ENTRIES * 32;
 
 /// Bounded geometry computed from a trusted application plaintext length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
