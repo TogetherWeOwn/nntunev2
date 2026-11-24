@@ -175,6 +175,7 @@ impl ReadbackFixture {
         let [_, environment, library, object, generation, _] = identities.map(hex::encode);
         let binding = ResumeBinding {
             plan,
+            configuration: CONFIGURATION,
             environment: &environment,
             library: &library,
             session: &object,

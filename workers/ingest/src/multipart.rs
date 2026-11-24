@@ -290,12 +290,30 @@ impl<'a> Completion<'a> {
         if body.len() > MAX_COMPLETION_BODY || std::str::from_utf8(body).is_err() {
             return Err(CompletionBody);
         }
+        let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
         // Allow only the element's own S3 namespace declaration, before resolution.
         let mut tokens = quick_xml::Reader::from_reader(body);
         loop {
+            let at_start = tokens.buffer_position() == 0;
             let tag = match tokens.read_event().map_err(|_| CompletionBody)? {
                 Start(tag) | Empty(tag) => tag,
-                Decl(_) | DocType(_) => return Err(CompletionBody),
+                Decl(declaration) => {
+                    let encoding = declaration
+                        .encoding()
+                        .transpose()
+                        .map_err(|_| CompletionBody)?;
+                    if !at_start
+                        || !matches!(
+                            declaration.xml_version(),
+                            Ok(quick_xml::XmlVersion::Explicit1_0)
+                        )
+                        || encoding.is_some_and(|value| !value.eq_ignore_ascii_case("UTF-8"))
+                    {
+                        return Err(CompletionBody);
+                    }
+                    continue;
+                }
+                DocType(_) => return Err(CompletionBody),
                 Eof => break,
                 _ => continue,
             };
@@ -315,7 +333,7 @@ impl<'a> Completion<'a> {
         let mut reader = ParserConfig::new()
             .override_encoding(Some(Encoding::Utf8))
             .allow_multiple_root_elements(false)
-            .create_reader(body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body));
+            .create_reader(body);
         let mut next = || reader.next().map_err(|_| CompletionBody);
         let (mut depth, mut root_ns, mut matched, mut typed) = (0, None, false, false);
         let (mut saw_bucket, mut saw_key) = (false, false);

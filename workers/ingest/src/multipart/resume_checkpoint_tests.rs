@@ -17,6 +17,7 @@ fn fixture() -> (
     let plan = Plan::new(target, sealer.header(), PART_BYTES as u64).unwrap();
     let binding = ResumeBinding {
         plan,
+        configuration: [5; 16],
         environment: "test",
         library: "library",
         session: "session",
@@ -64,6 +65,10 @@ fn requires_exact_upload_session_and_object_binding() {
     }));
     assert!(!matches(ResumeBinding {
         generation: "other",
+        ..binding
+    }));
+    assert!(!matches(ResumeBinding {
+        configuration: [6; 16],
         ..binding
     }));
     let legacy = ResumeBinding {

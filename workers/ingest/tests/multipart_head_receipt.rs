@@ -174,6 +174,7 @@ async fn session_completion_requires_checkpoint_full_manifest_and_head() {
         [1, 2, 0xab, 0xcd].map(|byte| hex::encode(id(byte)));
     let binding = ResumeBinding {
         plan,
+        configuration: id(5),
         environment: &environment,
         library: &library,
         session: "03030303-0303-4003-8003-030303030303",
@@ -228,7 +229,7 @@ async fn session_completion_requires_checkpoint_full_manifest_and_head() {
         ),
         Err(PrepareError::Parts(MultipartError::Geometry))
     ));
-    let wrong_scopes = [1, 2, 3, 4].map(|index| {
+    let wrong_scopes = [1, 2, 3, 4, 5].map(|index| {
         let mut wrong_scope = EnvelopeContext { ..context };
         wrong_scope.identities[index] = id(9);
         wrong_scope
@@ -355,7 +356,8 @@ async fn session_completion_requires_checkpoint_full_manifest_and_head() {
     let sent = prepare()
         .dispatch(async |request| {
             expect_request(request);
-            Ok(reply(body.as_bytes(), "pinned-version"))
+            let declared = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{body}");
+            Ok(reply(declared.as_bytes(), "pinned-version"))
         })
         .await
         .unwrap();

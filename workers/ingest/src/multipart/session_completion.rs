@@ -63,12 +63,13 @@ impl<'a> SessionCompletion<'a> {
         if !matches_checkpoint(expected, &receipts, checkpoint) {
             return Err(PrepareError::CheckpointMismatch);
         }
-        let [_, environment, library, object, generation, _] = context.identities;
+        let [_, environment, library, object, generation, configuration] = context.identities;
         let target = expected.plan.target;
         if expected.environment != hex::encode(environment)
             || expected.library != hex::encode(library)
             || expected.object != hex::encode(object)
             || expected.generation != hex::encode(generation)
+            || expected.configuration != configuration
             || expected.plan.header != context.header
             || expected.plan.plaintext_len != context.plaintext_len
             || !S3MediaMetadata::matches_target(target.bucket, target.key, context)
