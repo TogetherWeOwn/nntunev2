@@ -156,8 +156,7 @@ export function createPlayerController(
 		if (!isCurrent()) return false;
 		if (grant || trackChanged) activeGrant = grant;
 		queue.publish(next, receipt, library?.sources);
-		if (!isCurrent()) return false;
-		if (trackChanged && after && canPrepare && !nextSource) media.bindPausedTransport(after);
+		if (isCurrent() && trackChanged && after && canPrepare && !nextSource) media.bindPausedTransport(after);
 		if (!isCurrent()) return false;
 		const selected = currentTrack(queue.snapshot);
 		if (selected) {

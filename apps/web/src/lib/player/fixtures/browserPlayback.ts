@@ -106,9 +106,17 @@ export const refusedContinuations = (tab: string) => [
 	new Response(null, { status: 409 }), Response.json(receipt(tab, 'first', 'other-play'))
 ];
 
-export function invalidToggleReply(reason: string) {
+function invalidToggleReply(reason: string) {
 	if (reason === 'server error') return new Response(null, { status: 503 });
 	if (reason === 'wrong tab') return Response.json({ session_id: 'another-tab', private_until: Math.floor(Date.now() / 1000) + 60 });
+}
+
+export async function setupToggleCase(reason: string) {
+	const fixture = setup(reason === 'TTL expiry' ? 7 * 60 * 60 : 60);
+	await fixture.play(0);
+	const reply = invalidToggleReply(reason);
+	if (reply) fixture.fetchFn.mockResolvedValueOnce(reply);
+	return fixture;
 }
 
 export function expireInsideRequestWindow(durationMs: number) {

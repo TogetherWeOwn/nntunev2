@@ -87,4 +87,7 @@
 	<section class="nt-wrap" aria-label="Sleep timer">
 		<SleepTimerControls {...$sleepTimer} start={sleepTimer.start} cancel={sleepTimer.cancel} />
 	</section>
+{:else if $sleepTimer.armed}
+	<button class="nt-button nt-button--ghost" type="button" data-testid="sleep-timer-cancel" onclick={sleepTimer.cancel}>Cancel sleep timer</button>
+	<p data-testid="sleep-timer-status" aria-live="polite">{$sleepTimer.announcement}</p>
 {/if}

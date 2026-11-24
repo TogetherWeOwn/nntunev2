@@ -1,5 +1,5 @@
 import { expect, onTestFinished, test, vi } from 'vitest';
-import { captureSystemActions, expireInsideRequestWindow, grantReply, initial, invalidToggleReply, refusedContinuations, setup } from './fixtures/browserPlayback.js';
+import { captureSystemActions, expireInsideRequestWindow, grantReply, initial, refusedContinuations, setup, setupToggleCase } from './fixtures/browserPlayback.js';
 import { get } from 'svelte/store';
 test('new plays use the acknowledged mode in the same tab and continuations keep the established source', async () => {
 	const system = captureSystemActions();
@@ -67,11 +67,8 @@ test.each(['refused', 'superseded', 'account retirement', 'legacy reply', 'extra
 });
 
 test.each(['wrong tab', 'server error', 'short expiry', 'TTL expiry'] as const)('%s requires a fresh privacy acknowledgement before another start', async (reason) => {
-	const { player, queue, fetchFn, src, play } = setup(reason === 'TTL expiry' ? 7 * 60 * 60 : 60);
-	await play(0);
+	const { player, queue, fetchFn, src, play } = await setupToggleCase(reason);
 	const incumbent = src(), snapshot = queue.snapshot;
-	const reply = invalidToggleReply(reason);
-	if (reply) fetchFn.mockResolvedValueOnce(reply);
 	await player.setPrivateListening(true);
 	expect(player.privateListening?.enabled).toBe(reason.endsWith('expiry'));
 	if (reason.endsWith('expiry')) expireInsideRequestWindow(reason === 'TTL expiry' ? 21_600_000 : 60_000);
