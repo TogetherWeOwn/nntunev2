@@ -84,7 +84,6 @@ pub async fn resolve_uploaded_playback(track: String) -> String {
         .await
         .unwrap()
         .expect("committed catalogue source");
-    // A later source was staged and rolled back by the writer.
     assert_eq!(row.get::<_, i64>("accepted_seq"), accepted_seq);
     let S3Binding::VersionId(version) = published.locator.binding() else {
         panic!("catalogue lookup must return a version");

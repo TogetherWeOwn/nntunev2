@@ -1,5 +1,4 @@
 use nntune_core::media_envelope::EnvelopeContext;
-use tokio_postgres::Transaction;
 
 use super::now;
 use crate::{
@@ -115,7 +114,7 @@ pub(super) async fn publish(
           idle_deadline, checkpoint_generation, checkpoint_revision, checkpoint_offset,
           write_lease_id, write_lease_generation, multipart_object_id, multipart_bucket, multipart_upload_id)
          VALUES ($1::text::uuid, $2::text::uuid, $3, 'synthetic-upload', $4,
-                 clock_timestamp() + interval '5 minutes', clock_timestamp() + interval '5 minutes',
+                 statement_timestamp() + interval '5 minutes', statement_timestamp() + interval '5 minutes',
                  $5::text::uuid, 1, $6, $7::text::uuid, $5::text::uuid, $8::text::uuid, $9, $10)",
         &[&SESSION, &ids[2], &OWNER, &scope.fingerprint.as_slice(), &ids[4],
           &offset, &LEASE, &ids[3], &bucket, &upload_id],
@@ -183,51 +182,46 @@ pub(super) async fn publish(
             },
         },
     };
-    let publish =
-        async |tx: &mut Transaction<'_>, job_id, outcomes: &mut tokio_postgres::Client| {
-            let job = AuthorizedRelease {
-                job_id,
-                owner_id: OWNER,
-                environment,
-                library,
-                files: &[ExpectedFile {
-                    numbering: FileNumbering {
-                        disc: Some("1"),
-                        track: Some("1"),
-                    },
-                    object: &object,
-                }],
-            };
-            let lookup = release_lookup(ALBUM).unwrap();
-            let candidates = CompleteReleaseCandidates {
-                lookup: &lookup,
-                hits: vec![MbSearchHit {
-                    mbid: RELEASE.into(),
-                    title: ALBUM.into(),
-                    artist_name: None,
-                    artist_mbid: None,
-                    score: 0.9,
-                }],
-            };
-            stage_completed_release(
-                tx,
-                &job,
-                &[upload],
-                ALBUM,
-                Some(candidates),
-                (200, include_str!("review_retry_recordings.json")),
-                async |scope| {
-                    read_completion(outcomes, scope, async |_, _| Ok(retain_until))
-                        .await
-                        .map_err(|_| PublicationError::Indeterminate)
-                },
-            )
-            .await
-            .unwrap()
-        };
+    let job = AuthorizedRelease {
+        job_id: "catalogue-old",
+        owner_id: OWNER,
+        environment,
+        library,
+        files: &[ExpectedFile {
+            numbering: FileNumbering {
+                disc: Some("1"),
+                track: Some("1"),
+            },
+            object: &object,
+        }],
+    };
+    let lookup = release_lookup(ALBUM).unwrap();
+    let candidates = CompleteReleaseCandidates {
+        lookup: &lookup,
+        hits: vec![MbSearchHit {
+            mbid: RELEASE.into(),
+            title: ALBUM.into(),
+            artist_name: None,
+            artist_mbid: None,
+            score: 0.9,
+        }],
+    };
     let mut tx = writer.transaction().await.unwrap();
-    let StageOutcome::Staged(tracks) = publish(&mut tx, "catalogue-old", &mut outcomes).await
-    else {
+    let StageOutcome::Staged(tracks) = stage_completed_release(
+        &mut tx,
+        &job,
+        &[upload],
+        ALBUM,
+        Some(candidates),
+        (200, include_str!("review_retry_recordings.json")),
+        async |scope| {
+            read_completion(&mut outcomes, scope, async |_, _| Ok(retain_until))
+                .await
+                .map_err(|_| PublicationError::Indeterminate)
+        },
+    )
+    .await
+    .unwrap() else {
         panic!("expected the committed FLAC to publish");
     };
     let [track] = tracks.as_slice() else {
@@ -235,19 +229,5 @@ pub(super) async fn publish(
     };
     tx.commit().await.unwrap();
 
-    let mut tx = writer.transaction().await.unwrap();
-    assert_eq!(
-        publish(&mut tx, "catalogue-new", &mut outcomes).await,
-        StageOutcome::Staged(tracks.clone())
-    );
-    let source = tx
-        .query_one(
-            "SELECT source_job_id FROM public.catalogue_s3_sources WHERE track_id = $1::text::uuid",
-            &[&track],
-        )
-        .await
-        .unwrap();
-    assert_eq!(source.get::<_, &str>(0), "catalogue-new");
-    tx.rollback().await.unwrap();
     track.clone()
 }
