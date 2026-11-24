@@ -240,12 +240,15 @@ Set the staging Environment secret `PRIVATE_MUSIC_STAGE_FIXTURE` with the
 unredeemed `example.test` recipient `email`, its `inviteCode`, the cohort's
 `expiresAt` in Unix seconds, the `companion` receipt `{ sha256, trackId }`
 for tone B, and the fresh stepped-up owner's cookie value as `ownerSession`.
+Use a dedicated owner session for the run. The upload must reach the Worker
+within ten minutes of step-up.
 Configure `PRIVATE_LISTENING_COHORT` for this recipient
 using the [private listening runbook](../docs/ops.md#private-listening-qualification).
 Arrange for the job to start within eight minutes of the cutoff. The armed
 push runs the private journey instead of the ordinary journey, so it cannot
-provide the ordinary journey gate required for production admission. Remove
-the arm, cohort setting and single-use fixture secret, then verify the
+provide the ordinary journey gate required for production admission. Revoke
+the dedicated owner session, remove the arm, cohort setting and single-use
+fixture secret, then verify the
 [Stream disable deploy](../docs/ops.md#private-stream-staging).
 
 The runner checks both serving build identities before and after the journey,
