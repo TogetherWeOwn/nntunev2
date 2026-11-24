@@ -1097,6 +1097,14 @@ settings before either deploy starts. Arm only once the browser API adapter
 and its receipt store, Stream runtime, and Library client are on the candidate.
 Before accepting the trial, verify a browser disconnect through the relay
 closes the upstream read and settles only the acknowledged byte prefix.
+For that drill only, set `PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION` to a
+fresh lowercase 32-hex trace, a colon, and the lowercase SHA-256 hex of the
+synthetic track ID. Send that trace as `x-trace-id` on the dedicated unbuffered
+relay request. Keep the protected tail in memory and retain only verdicts
+for that trace from `private_storage_read_started`,
+`private_storage_read_aborted`, and a separate `private_storage_read_completed`
+control. Compare the canceled play's committed settlement separately. Clear
+the observation variable before the disable deploy.
 Retain the version ID, deployment ID, `BUILD_SHA` and playback mode from
 the Stream job summary alongside the browser run. To restore the default,
 keep `STREAM_STAGING_DEPLOY_ENABLED=true` for the next protected deploy.

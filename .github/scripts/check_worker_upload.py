@@ -41,6 +41,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/deploy.yml"
 MANIFEST = ".github/scripts/binding_manifest.toml"
 PRIVATE_CONFIG = ".github/scripts/staging_stream_config.py"
+OBSERVATION = "1" * 32 + ":" + "2" * 64
 BUILD_CMD = "worker-build --release -- --locked"
 TIMEOUT = 600
 
@@ -256,6 +257,7 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
             PRIVATE_PLAYBACK_STAGING_S3_BUCKET="nntunev2-private-fixtures-staging",
             PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT="https://objects.example.test",
             PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region",
+            PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION=OBSERVATION,
             PRIVATE_PLAYBACK_STAGING_ROOT_VERSION="22222222-2222-4222-8222-222222222222",
         )
         generator = step_text(job_text(wf_text, "staging-stream"), "Generate staging wrangler.toml")
@@ -282,7 +284,8 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
         generator = step_text(job_text(wf_text, "staging-api"), "Generate staging wrangler.toml")
         check_variable_mappings(generator, trial)
         trial.update(PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT="https://objects.example.test",
-                     PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region")
+                     PRIVATE_PLAYBACK_STAGING_S3_REGION="test-region",
+                     PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION=OBSERVATION)
         preflight = step_text(job_text(wf_text, "gate"), "Validate private staging trial settings")
         check_variable_mappings(preflight, trial)
         stream_dir = tree / "workers/stream"
@@ -293,6 +296,7 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
         check(good.returncode == 0, "complete settings did not pass trial preflight")
         for key, value in (
             ("PRIVATE_PLAYBACK_STAGING_S3_REGION", ""),
+            ("PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION", "invalid"),
             ("STREAM_SERVICE_STAGING", "nntune-stream"),
             ("STREAM_STAGING_DEPLOY_ENABLED", ""),
             ("PRIVATE_PLAYBACK_STAGING_ENVIRONMENT", "11111111-1111-5111-8111-111111111111"),
@@ -314,6 +318,9 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
         check(stage["vars"].get("PRIVATE_PLAYBACK_ENABLED") == ("true" if mirror else "false"),
               f"{label}: private playback does not match the requested mode")
         check(stage.get("limits") == ({"subrequests": 132000} if mirror else None), f"{label}: Stream subrequest budget mismatch")
+        check(stage["vars"].get("ENVIRONMENT") == "staging", f"{label}: Stream environment mismatch")
+        check(stage["vars"].get("PRIVATE_PLAYBACK_READ_OBSERVATION") == (OBSERVATION if mirror else None),
+              f"{label}: Stream observation selector mismatch")
     if worker == "api":
         summary = Path(summary_env["GITHUB_STEP_SUMMARY"]).read_text()
         staging = config["env"]["staging"]

@@ -74,9 +74,15 @@ def render(source, env):
         "workers_dev = false", "preview_urls = false", "",
         'compatibility_flags = ["enable_request_signal"]',
         '[env.staging.vars]',
+        'ENVIRONMENT = "staging"',
         *(playback or ['PRIVATE_PLAYBACK_ENABLED = "false"']),
     ]
     if playback:
+        observation = env.get("PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION", "")
+        if observation:
+            if not re.fullmatch(r"[0-9a-f]{32}:[0-9a-f]{64}", observation):
+                raise ValueError("Invalid staged private read observation selector")
+            lines.append(f"PRIVATE_PLAYBACK_READ_OBSERVATION = {json.dumps(observation)}")
         lines.extend(("", "[env.staging.limits]", "subrequests = 132000"))
     for group, entries in bindings.items():
         if group == "name":
