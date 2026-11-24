@@ -3,9 +3,9 @@ name: deploy-production
 # Production promotion for the web frontend (apps/web only).
 #
 # Manual only; never runs on push, PR, release, or another workflow.
-# New deployments require PRODUCTION_DEPLOY_ENABLED to be exactly "true".
-# Recovery requires production approval and the mutation lock. The production
-# hostname is decided at launch; until then builds use the placeholder
+# New deployments require the repo variable PRODUCTION_DEPLOY_ENABLED to
+# be exactly "true". The production hostname is
+# decided at launch; until then the workflow builds against the placeholder
 # domain below and refuses to promote to it. Backend Workers (api, ingest,
 # mb, stream, repair) each add their own lane as follow-ups; the reserved
 # production data-plane bindings stay untouched by this lane (see docs/ops.md
@@ -569,6 +569,7 @@ jobs:
         id: source
         env:
           ACCEPTED_SHA: ${{ vars.PRODUCTION_ACCEPTED_SHA }}
+          INTENT_KEY: ${{ secrets.PRODUCTION_ROLLBACK_INTENT_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: node ci/production-maintenance/final-smoke-rollback.mjs admit-recovery
       - name: Reserve one recovery submission across runners

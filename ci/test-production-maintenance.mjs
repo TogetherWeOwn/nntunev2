@@ -358,7 +358,7 @@ test('protected recovery wiring keeps the production lock and contains source an
   assert.match(job, /if: inputs.mode == 'recover-worker'\n    needs: preflight/);
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false\n    environment: production/);
   const [proof, restore] = job.split('      - name: Restore or verify the recorded allocation');
-  assert.doesNotMatch(proof, /secrets\./);
+  assert.doesNotMatch(proof, /secrets\.(?:PRODUCTION_CLOUDFLARE|PRODUCTION_ROLLBACK_CUSTODY)/);
   assert.match(proof, /admit-recovery[\s\S]*?upload-artifact@[0-9a-f]{40}/);
   assert.match(restore, /CLAIM_VERIFIED: \$\{\{ steps\.claim\.outcome == 'success' \}\}[\s\S]*?rollback\.mjs recover/);
   for (const command of ['admit-recovery', 'recover']) {

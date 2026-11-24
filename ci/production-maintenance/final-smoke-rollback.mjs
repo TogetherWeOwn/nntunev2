@@ -179,7 +179,9 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
 if (import.meta.main) {
   try {
     const command = process.argv[2];
-    const verdict = command === 'admit-recovery' ? admitRecovery(process.env) : await finalSmokeRollback(command, process.env);
+    const env = { ...process.env };
+    if (command === 'admit-recovery') delete process.env.INTENT_KEY; // Withhold from subprocesses.
+    const verdict = command === 'admit-recovery' ? admitRecovery(env) : await finalSmokeRollback(command, env);
     if (verdict) console.log(verdict);
   } catch {
     // Errors may contain protected input or provider data. Keep details in private custody.

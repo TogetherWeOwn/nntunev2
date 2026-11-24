@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -86,6 +86,8 @@ export function recoveryFixture(t, transport, conclusion) {
     { name: 'Gradual promotion 5-50-100 with automatic rollback', status: 'completed', conclusion, number: 20 },
   ];
   const claims = [];
+  const claimName = `production-worker-recovery-claim-${createHmac('sha256', Buffer.from(transport.env.INTENT_KEY, 'hex'))
+    .update('claim:12').digest('hex')}`;
   const zipped = spawnSync('python3', ['-c', `import io,sys,zipfile
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, 'w') as z:
@@ -111,7 +113,7 @@ sys.stdout.buffer.write(buf.getvalue())`, intentFile], { input: readFileSync(joi
         return read.stdout;
       },
       list: (route, key) => {
-        assert.equal(route, 'artifacts?name=production-worker-recovery-claim-12');
+        assert.equal(route, `artifacts?name=${claimName}`);
         assert.equal(key, 'artifacts');
         return claims;
       },
@@ -128,7 +130,8 @@ sys.stdout.buffer.write(buf.getvalue())`, intentFile], { input: readFileSync(joi
     admitRecovery(env, evidence);
     const output = readFileSync(env.GITHUB_OUTPUT, 'utf8');
     const canSubmit = /^allow-submit=true$/m.test(output);
-    if (canSubmit) claims.push({ name: 'production-worker-recovery-claim-12' });
+    assert.ok(output.includes(`claim-name=${claimName}\n`));
+    if (canSubmit) claims.push({ name: claimName });
     env.CLAIM_VERIFIED = String(canSubmit);
     return transport.run('recover', env);
   }

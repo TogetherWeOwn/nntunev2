@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,7 +44,10 @@ export function admitRecovery(env, evidence = proof.productionEvidence) {
     '--sealed-rollback-intent'], 4096, archive);
   // The mutation lock spans claim discovery, the durable upload and restore.
   // Any prior submission may have committed, even without an acknowledgement.
-  const name = `production-worker-recovery-claim-${env.RECOVERY_RUN_ID}`;
+  if (!/^[0-9a-f]{64}$/.test(env.INTENT_KEY ?? '')) throw new Error('Missing recovery intent key');
+  // An unrelated workflow must not be able to predict and reserve this name.
+  const claim = createHmac('sha256', Buffer.from(env.INTENT_KEY, 'hex')).update(`claim:${env.RECOVERY_RUN_ID}`).digest('hex');
+  const name = `production-worker-recovery-claim-${claim}`;
   const sourceDidNotRestore = !restores.length || restores[0].conclusion === 'skipped';
   const allowSubmit = sourceDidNotRestore && list(`artifacts?name=${name}`, 'artifacts').length === 0;
   writeFileSync(join(env.RUNNER_TEMP, intentFile), sealed, { mode: 0o600, flag: 'wx' });
