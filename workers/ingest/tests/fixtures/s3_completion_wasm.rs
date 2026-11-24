@@ -27,7 +27,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         _ => "https://fixture.test:8443",
     };
     let sender = S3CompletionSender::new(
-        if mode == "foreign" || mode == "part-foreign" {
+        if matches!(mode.as_str(), "foreign" | "part-foreign" | "init-foreign") {
             id(8)
         } else {
             configuration
@@ -53,11 +53,41 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
     let [environment, library, object, generation] =
         [1, 2, 0xab, 0xcd].map(|value| hex::encode(id(value)));
     let key = format!("media/{object}/{generation}");
-    let target = UploadTarget {
-        bucket,
-        key: &key,
-        upload_id: "fixture+/=?",
+    let budget = match mode.as_str() {
+        "deadline" => 200,
+        "expired" => 0,
+        _ => 2000,
     };
+    let until = now() + Duration::from_millis(budget);
+    let initiated = if mode.starts_with("init") {
+        let requested_key = if mode == "init-other" {
+            "media/efefefefefef40ef80efefefefefefef/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd"
+        } else {
+            &key
+        };
+        let upload = sender
+            .initiate(&context, bucket, requested_key, until)
+            .await
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+        assert_eq!(upload.configuration(), configuration);
+        if mode != "init-upload-completion" {
+            return Ok(upload.target().upload_id.into());
+        }
+        Some(upload)
+    } else {
+        None
+    };
+    let target = initiated.as_ref().map_or(
+        UploadTarget {
+            bucket,
+            key: &key,
+            upload_id: "fixture+/=?",
+        },
+        |upload| upload.target(),
+    );
+    let configuration = initiated
+        .as_ref()
+        .map_or(configuration, |upload| upload.configuration());
     let plan = Plan::new(target, sealer.header(), 1).unwrap();
     let mut partition = plan.partition();
     assert!(partition
@@ -92,13 +122,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         generation: &generation,
         envelope_scheme: 2,
     };
-    let budget = match mode.as_str() {
-        "deadline" => 200,
-        "expired" => 0,
-        _ => 2000,
-    };
-    let until = now() + Duration::from_millis(budget);
-    let receipt = if mode.starts_with("part") || mode == "upload-completion" {
+    let receipt = if mode.starts_with("part") || mode == "init-upload-completion" {
         let uploaded = sender
             .put_part(binding, &context, &part, until)
             .await

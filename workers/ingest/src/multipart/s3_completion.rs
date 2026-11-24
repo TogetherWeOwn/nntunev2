@@ -7,6 +7,8 @@ use std::{
 
 use nntune_core::{
     media_envelope::EnvelopeContext,
+    origin_sealer::MAX_NEW_PLAINTEXT,
+    s3_locator::S3MediaMetadata,
     s3_signing::{encode_query_value, S3SigningKey},
 };
 use sha2::{Digest, Sha256};
@@ -26,10 +28,11 @@ use super::{
     session_completion::{
         valid_upload_id, CompletionRequest, CompletionResponse, DispatchError, SessionCompletion,
     },
-    CompletedVersionedMedia, MultipartError, UploadPart, UploadTarget, UploadedPart,
-    MAX_COMPLETION_BODY,
+    CompletedVersionedMedia, MultipartError, UploadPart, UploadedPart, MAX_COMPLETION_BODY,
 };
 use crate::pool_deadline::race_against_deadline;
+
+pub use super::initiation::InitiatedUpload;
 
 pub struct S3CompletionSender {
     configuration: [u8; 16],
@@ -64,6 +67,43 @@ impl S3CompletionSender {
         })
     }
 
+    /// Start one upload for the authorized session. Persist the scope-bound
+    /// receipt before sending parts, and reconcile an unconfirmed initiation.
+    pub async fn initiate<'a>(
+        &self,
+        context: &EnvelopeContext,
+        bucket: &'a str,
+        key: &'a str,
+        usable_until: SystemTime,
+    ) -> Result<InitiatedUpload<'a>, DispatchError> {
+        if !(1..=MAX_NEW_PLAINTEXT).contains(&context.plaintext_len)
+            || !S3MediaMetadata::matches_target(bucket, key, context)
+        {
+            return Err(DispatchError::InvalidRequest);
+        }
+        let reply = self
+            .write_request(
+                WriteRequest {
+                    configuration: context.identities[5],
+                    bucket,
+                    key,
+                    method: "POST",
+                    query: "uploads=".into(),
+                    body: &[],
+                    payload_hash: hex::encode(Sha256::digest([])),
+                    operation_headers: &[
+                        ("x-amz-checksum-algorithm", "SHA256"),
+                        ("x-amz-checksum-type", "COMPOSITE"),
+                    ],
+                },
+                usable_until,
+            )
+            .await
+            .map_err(|()| DispatchError::Unconfirmed(None))?;
+        InitiatedUpload::verify(self.configuration, bucket, key, reply.status, &reply.body)
+            .map_err(|error| DispatchError::Unconfirmed(Some(error)))
+    }
+
     /// The caller authorizes the live session and supplies its dispatch deadline.
     pub async fn complete(
         &self,
@@ -95,7 +135,8 @@ impl S3CompletionSender {
             .write_request(
                 WriteRequest {
                     configuration: binding.configuration,
-                    target,
+                    bucket: target.bucket,
+                    key: target.key,
                     method: "PUT",
                     query: format!(
                         "partNumber={number}&uploadId={}",
@@ -103,7 +144,7 @@ impl S3CompletionSender {
                     ),
                     body,
                     payload_hash: hex::encode(part.digest),
-                    operation_header: ("x-amz-checksum-sha256", checksum),
+                    operation_headers: &[("x-amz-checksum-sha256", checksum)],
                 },
                 usable_until,
             )
@@ -146,12 +187,13 @@ impl S3CompletionSender {
             .write_request(
                 WriteRequest {
                     configuration: request.configuration,
-                    target: request.target,
+                    bucket: request.target.bucket,
+                    key: request.target.key,
                     method: "POST",
                     query: format!("uploadId={}", encode_query_value(request.target.upload_id)),
                     body: &request.body,
                     payload_hash: hex::encode(Sha256::digest(&request.body)),
-                    operation_header: ("content-type", "application/xml"),
+                    operation_headers: &[("content-type", "application/xml")],
                 },
                 until,
             )
@@ -170,12 +212,12 @@ impl S3CompletionSender {
         until: SystemTime,
     ) -> Result<WriteReply, ()> {
         if self.configuration != request.configuration
-            || self.bucket != request.target.bucket
+            || self.bucket != request.bucket
             || now() >= until
         {
             return Err(());
         }
-        let path = format!("/{}/{}", self.bucket, request.target.key);
+        let path = format!("/{}/{}", self.bucket, request.key);
         let host =
             &self.endpoint[worker::url::Position::BeforeHost..worker::url::Position::AfterPort];
         let iso = js_sys::Date::new_0()
@@ -184,16 +226,20 @@ impl S3CompletionSender {
             .ok_or(())?;
         let date = format!("{}Z", iso.get(..19).ok_or(())?.replace(['-', ':'], ""));
         let payload = &request.payload_hash;
-        let mut signed = [
+        let mut signed = vec![
             ("host", host),
             ("x-amz-content-sha256", payload.as_str()),
             ("x-amz-date", date.as_str()),
-            request.operation_header,
         ];
+        signed.extend_from_slice(request.operation_headers);
         signed.sort_unstable_by_key(|(name, _)| *name);
-        let names = signed.map(|(name, _)| name).join(";");
+        let names = signed
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(";");
         let mut canonical = format!("{}\n{path}\n{}\n", request.method, request.query);
-        for (name, value) in signed {
+        for (name, value) in &signed {
             writeln!(canonical, "{name}:{value}").map_err(|_| ())?;
         }
         write!(canonical, "\n{names}\n{payload}").map_err(|_| ())?;
@@ -248,12 +294,13 @@ impl S3CompletionSender {
 
 struct WriteRequest<'a> {
     configuration: [u8; 16],
-    target: UploadTarget<'a>,
+    bucket: &'a str,
+    key: &'a str,
     method: &'static str,
     query: String,
     body: &'a [u8],
     payload_hash: String,
-    operation_header: (&'static str, &'a str),
+    operation_headers: &'a [(&'static str, &'a str)],
 }
 
 struct WriteReply {
