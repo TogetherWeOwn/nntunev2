@@ -266,4 +266,82 @@ async fn resolves_only_the_committed_scoped_publication() {
         resolved.manifest.plaintext_sha256(),
         &resolved.read.target().plaintext_sha256
     );
+
+    use crate::{
+        private_listening::PrivateListening, private_playback::PrivatePlayback, session::*,
+    };
+
+    let keys = SessionKeys::single(&[24; 32]);
+    let cookie = issue_session(keys.primary, MEMBER, now.as_secs(), 120).unwrap();
+    let claims = verify_session_dual(&keys, &cookie, now.as_secs()).unwrap();
+    let invite: i64 = writer
+        .query_one(
+            include_str!("../tests/fixtures/private_playback_session.sql"),
+            &[
+                &claims.session_id,
+                &MEMBER,
+                &(claims.created_at as i64),
+                &(claims.expires_at as i64),
+            ],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    writer
+        .batch_execute(include_str!(
+            "../tests/fixtures/private_playback_transitions.sql"
+        ))
+        .await
+        .unwrap();
+    let policy = PrivateListening::parse(&serde_json::json!({
+        "owner_user_id": "catalogue-owner", "invite_ids": [invite], "expires_at": claims.expires_at
+    }).to_string()).unwrap();
+    let api = PrivatePlayback {
+        policy: Some(&policy),
+        grant_secret: SECRET,
+    };
+    let issue = async |db: &mut Client, cookie: Option<&str>, pins: &PublicationPins<'_>| {
+        api.issue(
+            db,
+            &keys,
+            cookie,
+            track,
+            &signed.lease.session_id,
+            pins,
+            SystemTime::now,
+        )
+        .await
+        .unwrap()
+    };
+    assert!(issue(&mut reader, None, &original_pins).await.is_none());
+    assert!(issue(&mut reader, Some(&cookie), &pins).await.is_none());
+    let issued = issue(&mut reader, Some(&cookie), &original_pins)
+        .await
+        .unwrap();
+    let token = &issued.relay().grant.token;
+    let resolve = async |db: &mut Client, token: &str| {
+        api.resolve(db, &issued, token, &root, SystemTime::now)
+            .await
+            .unwrap()
+    };
+    assert!(resolve(&mut reader, "invalid-bearer").await.is_none());
+    assert_eq!(
+        resolve(&mut reader, token)
+            .await
+            .unwrap()
+            .read
+            .pins()
+            .media_version,
+        original_pins.version
+    );
+    for state in ["invite", "session", "rotation", "revision"] {
+        writer
+            .query_one(
+                "SELECT pg_temp.private_playback_state($1, $2)",
+                &[&state, &track],
+            )
+            .await
+            .unwrap();
+        assert!(resolve(&mut reader, token).await.is_none(), "{state}");
+    }
 }
