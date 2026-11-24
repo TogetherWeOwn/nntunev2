@@ -136,7 +136,15 @@ for scenario in '11 false ROLLBACK f - 12' '11 false ROLLBACK t - 12' '9 false C
     holder_query="SELECT 1 FROM public.storage_validated_digest_winners WHERE object_id='$object' FOR UPDATE"
     query="SELECT * FROM public.digest_read_lookup_fixture($id, clock_timestamp() + interval '5 minutes')"
     holder_expected=$'1\n1'; contender_expected=''
-    if [[ "$expected" == t ]]; then contender_expected="$pins"; fi
+    if [[ "$expected" == t ]]; then
+      # The existing reference can return provisional pins, but a rollback must
+      # leave no lease before the separate, committed read is attempted below.
+      provisional="$(psql_run -Atc "BEGIN ISOLATION LEVEL READ COMMITTED; $query; ROLLBACK")"
+      [[ "$provisional" == "$pins" && "$(psql_run -Atc "SELECT read_until = '-infinity' FROM public.storage_validated_digest_winners WHERE object_id='$object'")" == t ]] ||
+        { printf 'rolled-back playback lookup left protection or returned wrong pins\n' >&2; exit 1; }
+      printf 'read lookup rollback returned provisional pins without a committed lease\n'
+      contender_expected="$pins"
+    fi
   elif [[ "$deleting" == true ]]; then
     holder_query="$delete"; query="$lookup"; contender_expected=''
     if [[ "$expected" == t ]]; then contender_expected="$pins"; fi

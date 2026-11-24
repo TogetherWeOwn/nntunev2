@@ -18,7 +18,7 @@ const WINNERS: &str = "SELECT object_id::text FROM public.storage_validated_dige
     WHERE environment_id = $1::text::uuid AND library_id = $2::text::uuid";
 
 async fn connect() -> Client {
-    const SCRATCH: &str = "postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci";
+    const SCRATCH: &str = "postgresql://postgres:ci-throwaway@localhost:5432/nntune_catalogue_ci";
     assert!(
         std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
             && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
@@ -33,6 +33,9 @@ async fn connect() -> Client {
         .unwrap();
     client
 }
+
+#[path = "catalogue.rs"]
+mod catalogue;
 
 #[tokio::test]
 #[ignore = "requires a migrated disposable PostgreSQL database"]
@@ -273,4 +276,5 @@ async fn postgres_stages_completed_candidate_atomically() {
         &[&environment, &library, &digest, &(length as i64), &object, &generation, &root],
     ).await.unwrap().get(0);
     assert!(!admitted);
+    catalogue::exercise(&observer, &mut writer, &mut contender, &fixture, &intent).await;
 }
