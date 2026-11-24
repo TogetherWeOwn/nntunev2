@@ -7,9 +7,10 @@ database privileges before paid activation. Follow the [staging promotion checkl
 and [M1 traceability matrix](m1-exit-traceability.md).
 
 The API CI case `paid_invite_signup_to_subscription_cap_and_lapse` rehearses
-the signup, signed Stripe deliveries, renewal recovery and play refusals
-with the existing in-memory store and Stripe transport. The recording
-below supplies the browser, provider, database and deployed-build evidence.
+the signup, signed Stripe deliveries, recovery of a selected renewal and
+play refusals with the in-memory store and Stripe transport. The recording
+below verifies hourly dispatch and the browser, provider and database on the
+deployed build.
 
 1. Open an owner-issued single-use staging invite to prefill the code.
    Follow [signup arrival](../e2e/tests/signup-arrival.spec.ts) for email-code

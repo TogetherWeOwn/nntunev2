@@ -13781,13 +13781,10 @@ mod tests {
         let mut h = stripe_harness();
         h.config = h.config.with_play_grant_secret(PLAY_SECRET.to_vec());
         h.config.invites_required = true;
-        h.store
-            .billing_bindings
-            .borrow_mut()
-            .extend(test_bindings());
+        h.store.billing_bindings.replace(test_bindings());
         h.store.plans.borrow_mut().push(PlanRow {
             id: PLAN_PLUS.into(),
-            price_cents: 800,
+            price_cents: 1_000,
             stream_hours_month: 100,
             max_concurrent_streams: 1,
         });
@@ -13819,7 +13816,8 @@ mod tests {
         );
         assert_eq!(signup.status, 200);
         let cookie = cookie_of(&signup);
-        let (replay, _) = signup_with_invite(
+        let session_count = h.store.sessions.borrow().len();
+        let (replay, second_user) = signup_with_invite(
             &h,
             "second@example.test",
             b"second-invite-cred",
@@ -13828,6 +13826,16 @@ mod tests {
         );
         assert_eq!(replay.status, 401);
         assert!(replay.set_cookie.is_none());
+        assert_eq!(
+            h.store.invites.borrow()[&auth::hash_invite_code(code)]
+                .redeemed_by
+                .as_deref(),
+            Some(user.as_str())
+        );
+        assert!(block_on(h.store.credentials_for_user(&second_user))
+            .unwrap()
+            .is_empty());
+        assert_eq!(h.store.sessions.borrow().len(), session_count);
 
         let checkout = |h: &Harness| {
             h.call_full(
@@ -14093,6 +14101,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(subscription(sweep.now, &cookie)["state"], "active");
+        decode(play_at(sweep.now, &cookie, &play), 200);
         assert_period(cutoff, 3);
         assert_eq!(
             h.store.invoice_history.borrow()["in_test_3"].period_end_unix,
@@ -14115,11 +14124,12 @@ mod tests {
             }),
         );
         let history = h.store.invoice_history.borrow().clone();
-        webhook_ok(&signed(sweep.now as i64 + 1, &update));
-        assert!(assert_period(cutoff, 3).cancel_at_period_end);
-        webhook_ok(&signed(sweep.now as i64 + 2, &update));
-        assert!(assert_period(cutoff, 3).cancel_at_period_end);
-        assert_eq!(*h.store.invoice_history.borrow(), history);
+        for now in [sweep.now + 1, sweep.now + 2] {
+            webhook_ok(&signed(now as i64, &update));
+            assert_eq!(subscription(now, &cookie)["cancelAtPeriodEnd"], true);
+            assert_period(cutoff, 3);
+            assert_eq!(*h.store.invoice_history.borrow(), history);
+        }
 
         // Keep the same member after advancing beyond the signup cookie lifetime.
         let mut before_cutoff = h.ctx();
