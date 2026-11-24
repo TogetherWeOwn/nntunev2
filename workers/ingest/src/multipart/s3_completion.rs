@@ -5,6 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use nntune_core::{
     media_envelope::EnvelopeContext,
     origin_sealer::MAX_NEW_PLAINTEXT,
@@ -29,6 +30,7 @@ use super::{
     session_completion::{
         valid_upload_id, CompletionRequest, CompletionResponse, DispatchError, SessionCompletion,
     },
+    sidecar::{CompletedSidecar, SidecarError, SidecarPut, SidecarPutReply},
     CompletedVersionedMedia, MultipartError, UploadPart, UploadedPart, MAX_COMPLETION_BODY,
 };
 use crate::pool_deadline::race_against_deadline;
@@ -41,6 +43,13 @@ pub enum HeadConfirmationError {
     Transport,
     InvalidResponse,
     Receipt(HeadReceiptError),
+}
+
+/// The caller must reconcile the sidecar write before sending it again.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SidecarDispatchError {
+    Transport,
+    Receipt(SidecarError),
 }
 
 pub struct S3CompletionSender {
@@ -206,6 +215,48 @@ impl S3CompletionSender {
             .map_err(Receipt)
     }
 
+    /// Write one sealer-derived digest page and capture the returned version
+    /// for authenticated readback. The caller authorizes the live session.
+    pub async fn put_sidecar<'a>(
+        &self,
+        put: SidecarPut<'a>,
+        usable_until: SystemTime,
+    ) -> Result<CompletedSidecar<'a>, SidecarDispatchError> {
+        let (target, body) = put.request();
+        let key = target.key.clone();
+        let digest: [u8; 32] = Sha256::digest(body).into();
+        let checksum = STANDARD.encode(digest);
+        let reply = self
+            .signed_request(
+                SignedRequest {
+                    configuration: target.context.identities[5],
+                    bucket: target.bucket,
+                    key: &key,
+                    method: "PUT",
+                    query: String::new(),
+                    body,
+                    payload_hash: hex::encode(digest),
+                    operation_headers: &[("x-amz-checksum-sha256", &checksum)],
+                },
+                usable_until,
+            )
+            .await
+            .map_err(|()| SidecarDispatchError::Transport)?;
+        let version = reply
+            .headers
+            .get("x-amz-version-id")
+            .map_err(|_| SidecarDispatchError::Receipt(SidecarError::Version))?;
+        put.verify_reply(SidecarPutReply {
+            configuration: self.configuration,
+            bucket: &self.bucket,
+            key: &key,
+            status: reply.status,
+            body: &reply.body,
+            version_headers: version.as_deref().as_slice(),
+        })
+        .map_err(SidecarDispatchError::Receipt)
+    }
+
     /// Upload only the locally sealed part from the authorized session. Retain
     /// those immutable bytes and reconcile the session after an unconfirmed send.
     pub async fn put_part<'a>(
@@ -367,11 +418,11 @@ impl S3CompletionSender {
         {
             return Err(());
         }
-        let url = format!(
-            "{}{path}?{}",
-            self.endpoint.origin().ascii_serialization(),
-            request.query,
-        );
+        let mut url = format!("{}{path}", self.endpoint.origin().ascii_serialization());
+        if !request.query.is_empty() {
+            url.push('?');
+            url.push_str(&request.query);
+        }
         let request = Request::new_with_str_and_init(&url, &init).map_err(|_| ())?;
         let wait = until.duration_since(now()).map_err(|_| ())?;
         if !(1..=i32::MAX as u128).contains(&wait.as_millis()) {

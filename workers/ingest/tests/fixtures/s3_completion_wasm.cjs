@@ -11,6 +11,8 @@ const ciphertextLength = 48 + 1 + 16;
 const headHeaders = { 'x-amz-version-id': version, 'content-length': String(ciphertextLength) };
 const bucket = 'fixture-bucket';
 const mediaKey = 'media/abababababab40ab80ababababababab/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd';
+const mapId = 'efefefefefef40ef80efefefefefefef';
+const sidecarKey = `media-digests/${mediaKey.slice('media/'.length)}/${mapId}/00000000`;
 const transportFailure = 'Unconfirmed(None)';
 const rejectedWith = (expected) => (error) => error === expected;
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -41,9 +43,9 @@ function completionReceipt(manifest, etag = 'fixture-etag') {
     + `<ChecksumSHA256>${composite}-1</ChecksumSHA256></CompleteMultipartUploadResult>`;
 }
 
-async function verifySignedRequest(request, method, query, operationHeaders) {
-  const path = `/${bucket}/${mediaKey}`;
-  assert.equal(request.url, `https://fixture.test:8443${path}?${query}`);
+async function verifySignedRequest(request, method, query, operationHeaders, objectKey = mediaKey) {
+  const path = `/${bucket}/${objectKey}`;
+  assert.equal(request.url, `https://fixture.test:8443${path}${query ? `?${query}` : ''}`);
   assert.equal(request.method, method);
   assert.equal(request.redirect, 'manual');
   assert.equal(request.cache, 'no-store');
@@ -92,6 +94,48 @@ test('signs the ciphertext part and accepts only its matching checksum and ETag'
   assert.equal(await complete('part'), '"fixture-part"');
   assert.equal(fetch.mock.callCount(), 1);
 });
+
+test('signs the sealer-derived sidecar page and captures its returned version', async (t) => {
+  let sentPage;
+  const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+    sentPage = await verifySignedRequest(request, 'PUT', '', undefined, sidecarKey);
+    return new Response(null, { headers: { 'x-amz-version-id': version } });
+  });
+  const receipt = JSON.parse(await complete('sidecar'));
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.deepEqual(sentPage, Buffer.from(receipt.expectedPage, 'hex'));
+  assert.equal(sentPage.length, 124);
+  assert.equal(sentPage.subarray(0, 8).toString(), 'NNTDGP01');
+  assert.equal(sentPage.subarray(12, 28).toString('hex'), mapId);
+  assert.equal(sentPage.readUInt32BE(80), 0);
+  assert.equal(receipt.version, version);
+});
+
+test('refuses sidecar PUT for a different provider or bucket or an expired deadline', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('unexpected fetch'); });
+  for (const mode of ['sidecar-foreign', 'sidecar-bucket', 'sidecar-expired']) {
+    await assert.rejects(complete(mode), rejectedWith('Transport'));
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+for (const [name, response, failure] of [
+  ['HTTP 500', () => new Response(null, { status: 500, headers: { 'x-amz-version-id': version } }), 'Receipt(Response)'],
+  ['non-empty body', () => new Response('unexpected', { headers: { 'x-amz-version-id': version } }), 'Receipt(Response)'],
+  ['missing version', () => new Response(null), 'Receipt(Version)'],
+  ['null version', () => new Response(null, { headers: { 'x-amz-version-id': 'null' } }), 'Receipt(Version)'],
+  ['joined versions', () => new Response(null, { headers: { 'x-amz-version-id': `${version}, other` } }), 'Receipt(Version)'],
+  ['redirect', () => new Response(null, { status: 307, headers: { location: 'https://other.test/' } }), 'Transport'],
+]) {
+  test(`refuses ${name} in a sidecar PUT reply without resending`, async (t) => {
+    const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+      await verifySignedRequest(request, 'PUT', '', undefined, sidecarKey);
+      return response();
+    });
+    await assert.rejects(complete('sidecar'), rejectedWith(failure));
+    assert.equal(fetch.mock.callCount(), 1);
+  });
+}
 
 test('uses the initialized upload ID, signed part receipt and completed version through HEAD', async (t) => {
   const requests = [];
