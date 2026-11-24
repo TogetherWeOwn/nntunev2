@@ -125,6 +125,8 @@ for (const [name, body, status = 200] of [
   ['HTTP 500', initiationReceipt(), 500],
   ['wrong bucket', initiationReceipt('other-bucket')],
   ['wrong key', initiationReceipt(bucket, 'media/other')],
+  ['missing bucket', initiationReceipt().replace(`<Bucket>${bucket}</Bucket>`, '')],
+  ['missing key', initiationReceipt().replace(`<Key>${mediaKey}</Key>`, '')],
   ['empty upload ID', initiationReceipt(bucket, mediaKey, '')],
   ['control character', initiationReceipt(bucket, mediaKey, 'upload&#10;id')],
   ['duplicate upload ID', initiationReceipt(bucket, mediaKey, 'one</UploadId><UploadId>two')],
