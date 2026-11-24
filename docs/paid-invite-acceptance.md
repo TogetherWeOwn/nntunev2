@@ -13,13 +13,11 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    `INVITES_REQUIRED`, `PAID_INVITE_BILLING=1`, Stripe test credentials and a
    test portal with period-end cancellation and subscription changes disabled.
    Verify `plan_prices` against the provider account, currency, amount, interval
-   and usage type. Use a Stripe test destination on `2024-12-18.acacia` with
-   `checkout.session.completed`, `invoice.paid` and `customer.subscription.updated`.
-   Admit only `POST /v1/billing/webhook` via Access. Check invalid signatures
-   and checkout refusal when portal configuration is absent.
-3. Complete test checkout and deliver `checkout.session.completed`. Verify
-   a signed replay preserves the subscription and invoice history. Confirm
-   paid coverage and the caller's portal
+   and usage type. Admit only `POST /v1/billing/webhook` via the Access exception.
+   Use a `2024-12-18.acacia` test destination for the three events below.
+   Check invalid signatures and checkout refusal without a portal.
+3. Deliver `checkout.session.completed` after checkout. Verify a replay
+   preserves the subscription and invoice history. Confirm coverage and portal
    through `/v1/me/subscription` and the billing page. Reuse the
    [play, seek and meter assertions](../e2e/tests/ingest-play-meter.spec.ts)
    with the rank 74 encrypted fixture and callable browser relay. Assert 206
@@ -27,12 +25,12 @@ and [M1 traceability matrix](m1-exit-traceability.md).
    positive delivered usage from `/v1/me/usage`. Replay one meter window and
    verify the usage total stays flat.
 4. Cross the cap and verify a new play returns `plan_limit_exceeded`. Check
-   continuation before and refusal after its lease deadline. Below cap, deliver
-   only `invoice.paid` for the first renewal while hourly reconcile is idle.
-   For a second renewal, withhold both webhook signals and verify only the hourly
-   job advances paid coverage and invoice history. Then schedule cancellation,
-   deliver and replay `customer.subscription.updated`, and verify the flag and
-   stable history before `reason: lapsed` at the cutoff. Run applicable
+   continuation before and refusal after its lease deadline. Below cap, observe
+   coverage and invoice history advance before the hourly job after delivering
+   only `invoice.paid`. On the next renewal, withhold both webhook signals and
+   verify the hourly job advances both records.
+   Schedule cancellation and replay `customer.subscription.updated`. Confirm
+   the flag and stable history before the `lapsed` refusal at cutoff. Run the
    [same-build privacy cases](m1-exit-traceability.md).
 5. Repeat the private listening refusal control in the personal configuration
    on that build. Keep credentials, invite links, and hosted session URLs out
@@ -41,6 +39,6 @@ and [M1 traceability matrix](m1-exit-traceability.md).
 
 Before testing checkout, confirm hourly trigger `0 * * * *` fires on the same
 build. It rotates through up to 16 due targets. Keep test timing within one
-batch. Inspect the Worker error log for unresolved targets even if Cloudflare
-shows the invocation completed. Resolve ambiguous old payments before reusing their flight. Remove
+batch. Resolve ambiguous old payments before reusing their flight. Remove
 `PAID_INVITE_BILLING` to close paid dispatch.
+Check Worker error logs for unresolved scheduled targets.
