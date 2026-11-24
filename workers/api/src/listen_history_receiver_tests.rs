@@ -211,6 +211,7 @@ async fn unmounted_history_receiver_writes_through_pg_store() {
 
     ctx.now = 1044;
     assert_eq!(handle(&ctx, &start).await.status, 404);
+    assert!(export(&observer, &owner, None).await.unwrap().is_empty());
     assert_eq!(receiver::write(&ctx, &start).await.status, 200);
     ctx.now = 1045;
     let expired_start = with_field("playback_id", "40c325c0-2cee-489d-a8b6-fbe937155602");
