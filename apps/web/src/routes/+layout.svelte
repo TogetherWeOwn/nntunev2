@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
 	import type { Snippet } from 'svelte';
-	import { afterNavigate, goto, replaceState } from '$app/navigation';
+	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { PUBLIC_API_BASE_URL } from '$app/env/public';
 	import favicon from '#lib/assets/favicon.svg';
@@ -33,11 +33,14 @@
 
 	let { children }: LayoutProps = $props();
 
-	// Store only the current player's opaque receipt, never the share target or position.
-	function claimShareEntry(libraryShareOwner: string): boolean {
-		if ((page.state as { libraryShareOwner?: string }).libraryShareOwner === libraryShareOwner) return false;
-		replaceState(window.location.href, { ...page.state, libraryShareOwner });
-		return true;
+	// Keep the opaque claim on this history entry across reloads.
+	function claimShareEntry(libraryShareOwner: string, restoredQueue: boolean): boolean {
+		const previous = page.state.libraryShareOwner;
+		if (previous === libraryShareOwner) return false;
+		void goto(window.location.href, {
+			shallow: true, replace: true, persistState: true, state: { ...page.state, libraryShareOwner }
+		});
+		return !previous || !restoredQueue;
 	}
 
 	type Appearance = 'system' | 'light' | 'dark';

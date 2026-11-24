@@ -16,20 +16,20 @@
 	import { createPlayerController } from './controller.svelte.js';
 	import { createQueue, currentTrack as queueCurrentTrack } from './queue.js';
 	export const [getAppPlayer, setAppPlayer] = createContext<ReturnType<typeof createPlayerController> &
-		{ claimShareEntry?: () => boolean; currentFavorite: ReturnType<typeof createCurrentTrackFavorite> }>();
+		{ claimShareEntry?: (restoredQueue?: boolean) => boolean; currentFavorite: ReturnType<typeof createCurrentTrackFavorite> }>();
 </script>
 <script lang="ts">
 	import { PUBLIC_BROWSER_PLAYBACK } from '$app/env/public';
 	let { children, claimShareEntry, signedOut, allowDesktopRow }: {
 		children: Snippet;
-		claimShareEntry?: (owner: string) => boolean;
+		claimShareEntry?: (owner: string, restoredQueue: boolean) => boolean;
 		signedOut?: boolean;
 		allowDesktopRow?: boolean;
 	} = $props();
 	let shareOwner: string | undefined;
 	const controller = createPlayerController(createQueue([]), { flush: tick }, undefined, PUBLIC_BROWSER_PLAYBACK ? {} : undefined);
 	const player = setAppPlayer(Object.assign(controller, { currentFavorite: createCurrentTrackFavorite(controller.queue),
-		claimShareEntry: () => claimShareEntry?.(shareOwner ??= crypto.randomUUID()) ?? true }));
+		claimShareEntry: (restoredQueue = false) => claimShareEntry?.(shareOwner ??= crypto.randomUUID(), restoredQueue) ?? true }));
 	const { queue, media, media: { seekFeedback, playbackStatus, absoluteSeek } } = player;
 	const { speed, speed: { state: speedState } } = media;
 	const attachNativeAudio = media.attach;

@@ -63,9 +63,9 @@ test('Library restores arranged order and selection only after authorization', a
 		await release.promise;
 		await route.fulfill({ json: { session_binding: sessionA } });
 	}, { times: 1 });
+	playback.length = 0;
 	await page.reload();
 	await verifying.promise;
-	playback.length = 0;
 	try {
 		await expect(queueRows(page)).toHaveCount(0);
 	} finally {
@@ -84,6 +84,28 @@ test('Library restores arranged order and selection only after authorization', a
 	await page.reload();
 	await expect(listings(page)).toHaveCount(3);
 	await expect(queueRows(page)).toHaveCount(0);
+});
+
+test('a consumed share link respects a restored selection and clear', async ({ page }) => {
+	await mockLibrary(page);
+	const link = '/library?track=first&t=0';
+	await page.goto(link);
+	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'first');
+	await libraryRow(page, 'third').click();
+	await page.getByRole('button', { name: 'Select Third Song', exact: true }).click();
+	await page.reload();
+	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'third');
+
+	await page.getByRole('button', { name: 'Clear queue', exact: true }).click();
+	await page.getByRole('button', { name: 'Yes, clear queue', exact: true }).click();
+	await page.reload();
+	await expect(listings(page)).toHaveCount(3);
+	await expect(queueRows(page)).toHaveCount(0);
+	expect(await storedQueue(page)).toEqual([{ orderIds: [], currentId: null }]);
+
+	await page.goto('/library');
+	await page.goto(link);
+	await expect(currentRow(page)).toHaveAttribute('data-track-id', 'first');
 });
 
 test('a failed catalogue load leaves the saved queue unread until Retry', async ({ page }) => {
