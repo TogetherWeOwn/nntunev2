@@ -837,6 +837,7 @@ pub struct StoredCheckoutOp {
     pub price_id: Option<String>,
     pub session_id: Option<String>,
     pub subscription_id: Option<String>,
+    pub replayable: bool,
 }
 
 /// Outcome of the single-flight checkout-operation insert: `Created`
@@ -952,7 +953,7 @@ pub fn reconcile_user_by_customer_select_statement() -> &'static str {
 /// Parameters: none. The whole price map (a handful of rows): unknown
 /// prices fail closed against complete data, never a partial cache.
 pub fn price_bindings_select_statement() -> &'static str {
-    "SELECT stripe_price_id, plan_id, selectable, livemode FROM plan_prices"
+    "SELECT pp.stripe_price_id, pp.plan_id, pp.selectable AND pp.currency = 'usd' AND pp.billing_interval = 'month' AND pp.price_cents = p.price_cents AND p.price_cents > 0 AS selectable, pp.livemode FROM plan_prices pp JOIN plans p ON p.id = pp.plan_id"
 }
 
 /// Parameters: user_id. The live-slot subscription row, if any (the same
@@ -991,7 +992,7 @@ pub fn release_webhook_event_statement() -> &'static str {
 /// projects `::text`: the column is JSONB and the store reads it as
 /// `String`, which rejects the JSONB binary form.
 pub fn open_checkout_operation_select_statement() -> &'static str {
-    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload FROM billing_operations WHERE user_id = $1 AND state IN ('pending', 'submitted', 'needs_reconcile') LIMIT 1"
+    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload, clock_timestamp() < created_at + interval '23 hours' AS replayable FROM billing_operations WHERE user_id = $1 AND state IN ('pending', 'submitted', 'needs_reconcile') LIMIT 1"
 }
 
 /// Parameters: op_id. Operation lookup by id (the webhook's
@@ -999,14 +1000,14 @@ pub fn open_checkout_operation_select_statement() -> &'static str {
 /// a verified Stripe event never carries a malformed id. Same `::text`
 /// payload cast as the open-flight select (JSONB column, `String` read).
 pub fn checkout_operation_by_id_select_statement() -> &'static str {
-    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload FROM billing_operations WHERE id = $1::uuid"
+    "SELECT id::text, user_id, kind, state, stripe_subscription_id, request_payload::text AS request_payload, clock_timestamp() < created_at + interval '23 hours' AS replayable FROM billing_operations WHERE id = $1::uuid"
 }
 
 /// Parameters: op_id, user_id, request_key, payload. Single-flight insert:
 /// concurrent first attempts converge (the partial unique admits exactly
 /// one; the loser reads the winner's row next). Returns the id on insert.
 pub fn create_checkout_operation_statement() -> &'static str {
-    "INSERT INTO billing_operations (id, user_id, kind, state, request_key, request_payload) VALUES ($1::uuid, $2, 'checkout', 'pending', $3, $4::jsonb) ON CONFLICT (user_id) WHERE state IN ('pending', 'submitted', 'needs_reconcile') DO NOTHING RETURNING id::text"
+    "INSERT INTO billing_operations (id, user_id, kind, state, request_key, request_payload) SELECT $1::uuid, $2, 'checkout', 'pending', $3, $4::jsonb WHERE EXISTS (SELECT 1 FROM users WHERE id = $2 AND deleting_at IS NULL FOR SHARE) AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE user_id = $2 AND status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) ON CONFLICT (user_id) WHERE state IN ('pending', 'submitted', 'needs_reconcile') DO NOTHING RETURNING id::text"
 }
 
 /// Parameters: user_id, customer_id. Bind the Stripe customer to the
@@ -2316,6 +2317,7 @@ mod tests {
             price_id: Some(PRICE_PLUS.to_string()),
             session_id: Some("cs_123".to_string()),
             subscription_id: None,
+            replayable: true,
         };
         assert_eq!(
             decide_checkout(Some(&open)),
@@ -2364,6 +2366,7 @@ mod tests {
             price_id: Some(PRICE_PLUS.to_string()),
             session_id: Some("cs_123".to_string()),
             subscription_id: None,
+            replayable: true,
         };
         assert!(checkout_price_matches(&op, PRICE_PLUS));
         assert!(!checkout_price_matches(&op, PRICE_PRO));

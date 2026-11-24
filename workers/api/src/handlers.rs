@@ -7844,6 +7844,14 @@ where
         })
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
+    if ctx.cfg.paid_billing_enabled()
+        && (session.livemode
+            || session.customer.as_deref() != Some(customer_id)
+            || session.client_reference_id.as_deref() != Some(operation_id)
+            || session.status.as_deref() != Some("open"))
+    {
+        return Err(EnsureCheckoutError::Failed);
+    }
     // Conditional mark: the session already exists under our idempotency
     // key, so a lost mark only costs a retrieve on the next attempt — but
     // a mark that lands after a deliberate supersede must not resurrect
@@ -7928,7 +7936,7 @@ where
         .await
     {
         Ok(session) => session,
-        Err(err) if err.http_status == 404 => {
+        Err(err) if err.http_status == 404 && !ctx.cfg.paid_billing_enabled() => {
             // Missing (past retention, never minted): same deliberate
             // replacement as a confirmed-expired session.
             replace_checkout_operation(ctx, op, None).await?;
@@ -7936,6 +7944,17 @@ where
         }
         Err(_) => return Err(EnsureCheckoutError::Failed),
     };
+    if ctx.cfg.paid_billing_enabled() {
+        let binding = snapshot_customer_fresh(ctx, &op.user_id).await?;
+        if session.id != session_id
+            || session.livemode
+            || binding.is_none()
+            || session.customer != binding
+            || session.client_reference_id.as_deref() != Some(op.id.as_str())
+        {
+            return Err(EnsureCheckoutError::Failed);
+        }
+    }
     if session.status.as_deref() == Some("open") {
         if crate::billing_reconcile::checkout_price_matches(op, price_id) {
             if let Some(url) = session.url {
@@ -8009,6 +8028,13 @@ where
         })
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
+    if ctx.cfg.paid_billing_enabled()
+        && (recovered.livemode
+            || recovered.customer.as_deref() != Some(customer_id)
+            || recovered.client_reference_id.as_deref() != Some(op.id.as_str()))
+    {
+        return Err(EnsureCheckoutError::Failed);
+    }
     op.session_id = Some(recovered.id.clone());
     // Conditional, like the create-path mark: the in-memory row already
     // carries the recovered id for this attempt, so a lost mark only costs
@@ -8068,7 +8094,9 @@ where
     // retry may still proceed below. Terminal rows sit outside the slot
     // (`live` is `None`) and never reach this guard.
     if let Some(live) = input.live.as_ref() {
-        if !matches!(live.status.as_str(), "incomplete" | "unpaid" | "paused") {
+        if ctx.cfg.paid_billing_enabled()
+            || !matches!(live.status.as_str(), "incomplete" | "unpaid" | "paused")
+        {
             if !matches!(live.status.as_str(), "active" | "past_due") {
                 billing_alert(ctx, user_id, BILLING_PURCHASE_UNAVAILABLE_ACTION).await;
             }
@@ -8087,6 +8115,11 @@ where
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
     if let Some(mut op) = open {
+        if ctx.cfg.paid_billing_enabled()
+            && (op.price_id.is_none() || (op.session_id.is_none() && !op.replayable))
+        {
+            return Err(EnsureCheckoutError::Unavailable);
+        }
         // A session-less operation whose recorded price no longer matches
         // is resolved under its ORIGINAL operation id and price before
         // anything retires it: a lost mark does not mean Stripe has no
@@ -8218,6 +8251,10 @@ where
             .await
             .map_err(|_| EnsureCheckoutError::Failed)?;
         let converged = outcome.op();
+        if ctx.cfg.paid_billing_enabled() && (converged.price_id.is_none() || !converged.replayable)
+        {
+            return Err(EnsureCheckoutError::Unavailable);
+        }
         // A converged loser that named a different price must not inherit the
         // winner's session (which keeps the first attempt's price). A
         // session-less winner is still creating (or lost its mark): recover
@@ -8463,6 +8500,9 @@ fn options_preflight_served(path: &str) -> bool {
                 != crate::native_rest::RouteDecision::Deny
         })
 }
+
+#[path = "paid_invite_billing.rs"]
+mod paid_invite_billing;
 
 /// Only mounted when the paid invite gate is open. The raw-body Stripe
 /// signature authenticates this path; it is excluded from browser CORS.
@@ -8720,6 +8760,14 @@ where
         // can never enter it. Deliberately outside `is_known_path`.
         ("POST", BILLING_WEBHOOK_PATH) if ctx.cfg.paid_billing_enabled() => {
             Box::pin(billing_webhook(ctx, req)).await
+        }
+        ("POST", paid_invite_billing::CHECKOUT) if ctx.cfg.paid_billing_enabled() => {
+            Box::pin(paid_invite_billing::browser_purchase(
+                ctx,
+                req,
+                expected_session_binding,
+            ))
+            .await
         }
         // Catalogue slice 1: session-or-bearer reads over the
         // ingest ledger plus the MusicBrainz mirror.
@@ -11674,6 +11722,7 @@ mod tests {
                 price_id: Some(price_id.to_string()),
                 session_id: None,
                 subscription_id: None,
+                replayable: true,
             };
             ops.insert(op_id.to_string(), op.clone());
             Ok(crate::billing_reconcile::CreateOpOutcome::Created(op))
@@ -12767,6 +12816,87 @@ mod tests {
         let resp = h.call_webhook(&body, Some(sign(&body, BILLING_NOW)));
         webhook_ok(&resp);
         body
+    }
+
+    #[test]
+    fn paid_invite_checkout_requires_activation_and_the_callers_session() {
+        let mut h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let cookie = cookie_of(&block_on(h.ctx().start_session("u1")).unwrap());
+        let checkout = |h: &Harness, plan, cookie, origin| {
+            h.call_full(
+                "POST",
+                paid_invite_billing::CHECKOUT,
+                Some(serde_json::json!({"planId": plan}).to_string()),
+                cookie,
+                origin,
+            )
+        };
+        let buy = |h| checkout(h, "plus", Some(cookie.clone()), Some(ORIGIN));
+        assert_eq!(buy(&h).status, 404);
+        h.config.paid_invite_billing = true;
+        assert_eq!(buy(&h).status, 404);
+        h.config.invites_required = true;
+        h.config.private_listening = crate::private_listening::PrivateListening::parse(
+            r#"{"owner_user_id":"u1","invite_ids":[1],"expires_at":1800000000}"#,
+        );
+        assert_eq!(buy(&h).status, 404);
+        h.config.private_listening = None;
+        assert_eq!(checkout(&h, "plus", None, Some(ORIGIN)).status, 401);
+        assert_eq!(
+            checkout(
+                &h,
+                "plus",
+                Some(cookie.clone()),
+                Some("https://other.example")
+            )
+            .status,
+            401
+        );
+        assert_eq!(
+            checkout(&h, "free", Some(cookie.clone()), Some(ORIGIN)).status,
+            400
+        );
+        assert!(h.stripe.customers_created.borrow().is_empty());
+
+        let first = buy(&h);
+        assert_eq!(first.status, 200);
+        assert_eq!(buy(&h).body, first.body);
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        assert!(live_for(&h, "u1").is_none());
+
+        let session_id = "cs_test_1";
+        let session = h.stripe.sessions.borrow()[session_id].clone();
+        let change = |session| {
+            h.stripe
+                .sessions
+                .borrow_mut()
+                .insert(session_id.into(), session)
+        };
+        change(crate::stripe::CheckoutSession {
+            customer: Some("cus_other".into()),
+            ..session.clone()
+        });
+        assert_eq!(buy(&h).status, 503);
+        change(crate::stripe::CheckoutSession {
+            url: Some("https://elsewhere.example/".into()),
+            ..session.clone()
+        });
+        assert_eq!(buy(&h).status, 503);
+        change(session);
+        h.stripe
+            .missing_sessions
+            .borrow_mut()
+            .insert(session_id.into());
+        assert_eq!(buy(&h).status, 503);
+
+        let mut ops = h.store.checkout_ops.borrow_mut();
+        let op = ops.values_mut().next().unwrap();
+        op.session_id = None;
+        op.replayable = false;
+        drop(ops);
+        assert_eq!(buy(&h).status, 409);
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
     }
 
     #[test]
@@ -15976,6 +16106,7 @@ mod tests {
                 price_id: Some(PRICE_PRO.to_string()),
                 session_id: Some("cs_race_1".to_string()),
                 subscription_id: None,
+                replayable: true,
             });
         let ctx = h.ctx();
         let url = block_on(ensure_checkout_session(
@@ -16480,6 +16611,7 @@ mod tests {
                 price_id: Some(PRICE_PRO.to_string()),
                 session_id: None,
                 subscription_id: None,
+                replayable: true,
             });
         let ctx = h.ctx();
         let url = block_on(ensure_checkout_session(
