@@ -756,6 +756,22 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         )
         .await
         .unwrap();
+    observer
+        .execute(
+            "UPDATE public.users SET deleting_at = now() WHERE id = $1",
+            &[&OTHER_USER],
+        )
+        .await
+        .unwrap();
+    assert!(dispatch_caller(OTHER_USER, TARGET, &remote).await.is_err());
+    assert_eq!(snapshot(observer).await, before);
+    observer
+        .execute(
+            "UPDATE public.users SET deleting_at = NULL WHERE id = $1",
+            &[&OTHER_USER],
+        )
+        .await
+        .unwrap();
     let applied = dispatch_caller(OTHER_USER, TARGET, &remote)
         .await
         .expect("matching mixed-plan history hydrates");
