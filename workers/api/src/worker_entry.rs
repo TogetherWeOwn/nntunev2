@@ -8197,6 +8197,85 @@ pub(crate) fn route_path(
     }
 }
 
+#[cfg(all(
+    target_arch = "wasm32",
+    not(any(
+        feature = "staging-body-wasm-test",
+        feature = "billing-owned-wasm-test",
+        feature = "span-runtime-test"
+    ))
+))]
+pub(crate) async fn reconcile_paid_invites(env: Env) -> Result<(), StoreError> {
+    if env_string(&env, "PAID_INVITE_BILLING").as_deref() != Some("1") {
+        return Ok(());
+    }
+    let config = config_from_env(&env).ok_or(StoreError)?;
+    if !config.paid_billing_enabled() {
+        return Ok(());
+    }
+    if config.stripe_secret_key.is_none() || config.stripe_webhook_secret.is_none() {
+        return Err(StoreError);
+    }
+    let trace_id = crate::logging::resolve_trace_id(None);
+    let ctx = handlers::Ctx {
+        cfg: &config,
+        store: &PgStore {
+            env: Some(env.clone()),
+            trace_id: trace_id.clone(),
+            mirror_binding: MirrorBinding::Unconfigured,
+        },
+        mailer: &WebhookMailer {
+            env,
+            origin: config.origin.clone(),
+            trace_id,
+        },
+        dialer: &SocketDialer,
+        dns: &DohDns,
+        stripe: &WorkerStripeTransport {
+            secret_key: config.stripe_secret_key.clone(),
+        },
+        now: worker::Date::now().as_millis() / 1000,
+        source_ip: String::new(),
+    };
+    // This first paid cohort has a bounded due set. Detect overflow
+    // before processing so a perpetually failing prefix cannot starve rows.
+    const LIMIT: i64 = 16;
+    let rows = PgStore::bounded(async {
+        let client = ctx.store.connect().await?;
+        client.query_typed(
+            "SELECT subject.user_id, subject.subscription_id FROM (\
+               SELECT user_id, NULL::text AS subscription_id FROM billing_operations \
+                 WHERE kind = 'checkout' AND state IN ('pending', 'submitted', 'needs_reconcile') \
+               UNION ALL SELECT user_id, stripe_subscription_id FROM subscriptions \
+                 WHERE status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused') \
+                 AND (paid_through_at IS NULL OR paid_through_at <= now()) \
+             ) subject JOIN users ON users.id = subject.user_id AND users.deleting_at IS NULL LIMIT $1",
+            &[(&(LIMIT + 1), Type::INT8)],
+        ).await.map_err(|_| StoreError)
+    }, TOTAL_TIMEOUT_MS).await?;
+    if rows.len() > LIMIT as usize {
+        return Err(StoreError);
+    }
+    let mut failed = false;
+    for row in rows {
+        let user: &str = row.try_get(0).map_err(|_| StoreError)?;
+        let subscription: Option<&str> = row.try_get(1).map_err(|_| StoreError)?;
+        failed |= match subscription {
+            Some(subscription) => handlers::reconcile_remote_subscription(&ctx, user, subscription)
+                .await
+                .map_or(true, |outcome| outcome.disable_new_purchases()),
+            None => handlers::reconcile_pending_checkout(&ctx, user)
+                .await
+                .is_err(),
+        };
+    }
+    if failed {
+        Err(StoreError)
+    } else {
+        Ok(())
+    }
+}
+
 pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // Trace ID first: every record below carries it, including the
     // fail-closed paths. An invalid inbound value is dropped, never logged.

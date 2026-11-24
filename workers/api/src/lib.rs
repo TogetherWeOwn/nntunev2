@@ -235,6 +235,28 @@ pub async fn main(
     worker_entry::dispatch(req, env).await
 }
 
+#[cfg(all(
+    target_arch = "wasm32",
+    not(any(
+        feature = "staging-body-wasm-test",
+        feature = "billing-owned-wasm-test",
+        feature = "span-runtime-test"
+    ))
+))]
+#[worker::event(scheduled)]
+pub async fn billing_schedule(
+    event: worker::ScheduledEvent,
+    env: worker::Env,
+    _ctx: worker::ScheduleContext,
+) {
+    if event.cron() == "0 * * * *" {
+        assert!(
+            worker_entry::reconcile_paid_invites(env).await.is_ok(),
+            "paid invite reconcile did not complete"
+        );
+    }
+}
+
 // This entry exists only in the separately bundled runtime-test Worker.
 #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
 #[worker::event(fetch)]
