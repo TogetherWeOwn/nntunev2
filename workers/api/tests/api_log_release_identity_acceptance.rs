@@ -183,7 +183,7 @@ fn central_release_mirror_exists(worker_entry: &str, logging: &str) -> bool {
     false
 }
 
-/// The core wiring pin: each of the three existing API emission sites
+/// The core wiring pin: every API emission site
 /// carries `release` mirroring its `build_sha`, either site-locally or
 /// through one central mirror. RED on the base tree, where no site
 /// sets `release` at all (the missing-release mutant), and still red
@@ -208,11 +208,11 @@ fn every_api_emission_site_carries_release_mirroring_build_sha() {
     for event in ["api.request.served", "api.start.misconfigured"] {
         assert!(dispatch_body.contains(event), "dispatch must emit {event}");
     }
-    // `dispatch` holds two emit sites (served + misconfigured); the
+    // `dispatch` emits ordinary, media and misconfiguration records; the
     // existing build_sha wiring is the shape `release` must mirror.
     assert_eq!(
         dispatch_body.matches("\"build_sha\": build_sha").count(),
-        2,
+        3,
         "served and misconfigured must each carry the build_sha key"
     );
 
@@ -228,12 +228,12 @@ fn every_api_emission_site_carries_release_mirroring_build_sha() {
 
     if central_release_mirror_exists(&production, &logging) {
         // One central build_sha -> release copy in the shared emitter
-        // path covers all three sites above.
+        // path covers all sites above.
         return;
     }
     assert_eq!(
         count_release_mirrors(dispatch_body, &production),
-        2,
+        3,
         "served and misconfigured must each carry release == build_sha \
          (missing or mismatched release at a dispatch site)"
     );

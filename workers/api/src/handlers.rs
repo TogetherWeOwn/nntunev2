@@ -763,6 +763,16 @@ pub enum PairAdmission {
 /// [`SingleUseStore`] with the `auth::SingleUseClaim::statement` SQL.
 #[allow(clippy::too_many_arguments)]
 pub trait Store {
+    /// Find the committed catalogue receipt for this member and exact media path.
+    fn browser_playback_receipt(
+        &self,
+        _user_id: &str,
+        _media_path: &str,
+    ) -> impl Future<Output = Result<Option<browser_playback_relay::BrowserReceipt>, StoreError>>
+    {
+        async { Ok(None) }
+    }
+
     #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
     fn webhook_ack_control(&self) -> bool {
         false
@@ -2686,7 +2696,7 @@ fn internal() -> Response {
 
 /// Fail-closed secure-randomness response: the existing 503
 /// `service_unavailable` envelope (retryable, sealed public text).
-fn unavailable() -> Response {
+pub(crate) fn unavailable() -> Response {
     let error = crate::api_error::ApiError::service_unavailable("service unavailable");
     Response {
         status: error.status,
@@ -5047,9 +5057,8 @@ mod listen_history_controls;
 #[path = "listen_history_receiver.rs"]
 mod listen_history_receiver;
 
-#[allow(dead_code)] // Callable only after a browser media route is admitted.
 #[path = "browser_playback_relay.rs"]
-mod browser_playback_relay;
+pub mod browser_playback_relay;
 
 #[path = "subsonic_handlers.rs"]
 mod subsonic_handlers;
@@ -9015,6 +9024,7 @@ mod tests {
         /// mirroring the production zero-row answer.
         duration_lookups: std::cell::Cell<usize>,
         meter_meta: RefCell<HashMap<(String, String), crate::meter_sink::TrackMeterMeta>>,
+        browser_receipt: RefCell<Option<browser_playback_relay::BrowserReceipt>>,
         /// Stored play windows by idempotency key, mirroring the
         /// monotonic upsert (see `record_play_window`).
         play_windows: RefCell<HashMap<String, crate::ledger::PlayWindow>>,
@@ -9537,6 +9547,14 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        async fn browser_playback_receipt(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<browser_playback_relay::BrowserReceipt>, StoreError> {
+            Ok(self.browser_receipt.borrow().clone())
+        }
+
         async fn admin_invite_tree(
             &self,
             actor_id: &str,
@@ -19336,6 +19354,32 @@ mod tests {
             .borrow_mut()
             .insert(key, missing_duration);
         refused_grant(&receipt);
+    }
+
+    include!("../tests/fixtures/private_media_relay.rs");
+
+    #[test]
+    fn private_media_entry_requires_a_lease_capped_grant_and_defaults_off() {
+        use crate::worker_entry::{relay_media, CollectedBody};
+        let (h, req, headers) = media_relay_fixture();
+        let ctx = media_relay_context(&h);
+        let inspect = async |get: browser_playback_relay::StreamGet<'_>| {
+            assert_eq!(get.path, "/play/track");
+            assert!(get.headers().eq(expected_media_relay_headers()));
+            200
+        };
+        let media = |body| {
+            block_on(relay_media(&ctx, &req, &body, &headers, inspect))
+                .unwrap()
+                .unwrap_or_else(|error| error.status)
+        };
+        let get = || media(CollectedBody::Complete(Vec::new()));
+        assert_eq!(get(), 200);
+        assert_eq!(media(CollectedBody::Complete(vec![1])), 400);
+        shorten_media_relay_lease(&h);
+        assert_eq!(get(), 404);
+        h.store.browser_receipt.take();
+        assert_eq!(get(), 404);
     }
 
     #[test]

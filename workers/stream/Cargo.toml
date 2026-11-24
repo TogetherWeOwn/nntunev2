@@ -25,6 +25,7 @@ nntune-core = { version = "0.1.0", path = "../../crates/nntune-core", default-fe
 worker = "0.8"
 # `#[durable_object]` expands to `#[wasm_bindgen]` items resolved by name.
 wasm-bindgen = "0.2.129"
+futures-channel = "0.3"
 futures-util = "0.3"
 
 [dev-dependencies]
