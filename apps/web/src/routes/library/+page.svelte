@@ -299,6 +299,7 @@
 	// A link is consumed once per navigation, never replayed by Refresh or
 	// across an account boundary. Deferred seeks belong to one loaded source.
 	let handledShareSearch: string | null = null;
+	let shareEntryUrl: URL | undefined;
 	/**
 	 * Favorites export feedback. Exporting is read-only: the handlers only
 	 * snapshot `favoriteTracks` and write feedback here. The feedback is
@@ -721,7 +722,10 @@
 		// A failed/unavailable load cannot resolve a link against the library.
 		// Leave it unconsumed for Retry; auth resets still fence account changes.
 		if (typeof window === 'undefined' || !shareAlive || loading || loadError || libraryUnavailable) return;
-		const search = window.location.search;
+		const { pathname, search } = window.location;
+		// Back/Forward may have moved the browser to a different entry while the
+		// previous Library view is still mounted and finishing verification.
+		if (shareEntryUrl && (shareEntryUrl.pathname !== pathname || shareEntryUrl.search !== search)) return;
 		if (search === handledShareSearch) return;
 		handledShareSearch = search;
 		const account = queueExportAuthGeneration;
@@ -760,7 +764,11 @@
 	}
 
 	if (typeof window !== 'undefined') {
-		afterNavigate(() => applyShareLink());
+		afterNavigate(({ to }) => {
+			shareEntryUrl = to?.url;
+			// The router restores the entry's snapshot after this callback.
+			void tick().then(() => applyShareLink());
+		});
 	}
 
 	/**
