@@ -1270,11 +1270,9 @@ the isolated candidate. Post-watch and cancellation need separate admission.
 
 ### First private release handoff
 
-Record the exact SHA, checks, reviews, admitted staging attempt, build IDs,
-health and private listening journey. Pin the maintenance module SHA-256 and
-its isolated `503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex`.
-Resolve preview exposure and inventory gaps before seeding. Keep one writer
-through readback, record the Worker, seed version and deployment, and close the window.
+Record the exact SHA, checks, reviews, staging build IDs, and admitted health
+and listening attempt. Pin the maintenance module SHA-256 and its isolated
+`503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex`.
 
 Record the [database baseline](production-database-bootstrap.md#protected-baseline)
 attempt, target and manifest digest. On `empty`, keep launch writes quiesced
@@ -1282,10 +1280,9 @@ through snapshot verification and the first schema apply. If writes could have
 resumed, repeat the baseline before snapshotting. On `rows-present`, rehearse
 the exact undo on a temporary restore from a fresh backup. Resolve any refusal.
 
-To switch off, close admission and use protected rollback to restore the pinned
-maintenance allocation and close newly enabled API and media routes. Verify
-maintenance and private denials. Preserve the database and snapshot. Record
-the operator, recovery entry point, triggers and 30-minute watch before promotion.
+To switch off, close admission and restore the pinned maintenance allocation
+and API/media denials via protected rollback. Preserve the database and snapshot.
+Record the recovery entry point, operator, triggers and 30-minute watch before promotion.
 
 ### Production promotion publishes a CalVer release
 

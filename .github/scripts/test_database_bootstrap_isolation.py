@@ -538,6 +538,10 @@ def prove_baseline(cluster):
     require(calls.stat().st_size == before, "refuse disabled, cross-workflow and reserved DB plans before SQL")
     run("refused", database_oid=plan["database_oid"] + 1)
     run("empty")
+    run("refused", overrides={"PATH": routed_client(cluster, "standby", reader)})
+    require(b"baseline scope refused" in (cluster.directory / "standby-result").read_bytes(),
+            "refuse the simulated PostgreSQL recovery verdict for an otherwise eligible reader")
+    routed_client(cluster, "route", reader)
     cluster.ok("prepare a partition with hidden child grants", f"""
         CREATE SCHEMA baseline_fixture;
         CREATE TABLE baseline_fixture.parent (id integer) PARTITION BY RANGE (id);
