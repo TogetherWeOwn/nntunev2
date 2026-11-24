@@ -185,4 +185,5 @@ ROLLBACK;
 \ir ../fixtures/ingest_session_terminate.sql
 \ir ../fixtures/ingest_session_advance_checkpoint.sql
 \ir ../fixtures/ingest_session_status.sql
+\ir ../fixtures/ingest_session_cleanup_delivery.sql
 ROLLBACK;
