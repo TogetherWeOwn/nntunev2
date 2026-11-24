@@ -1,6 +1,10 @@
 //! Assemble and verify exact completion pins at an unmounted readback boundary.
 
-use super::{sidecar::CompletedSidecar, CompletedVersionedMedia};
+use super::{
+    session_outcome::{uuid_text, CommittedOutcome},
+    sidecar::CompletedSidecar,
+    CompletedVersionedMedia,
+};
 use nntune_core::{
     digest_enrollment::OriginManifest,
     digest_geometry::DigestGeometry,
@@ -63,6 +67,40 @@ impl<'inventory, 'receipts> VerifiedCompletedReadback<'inventory, 'receipts> {
 
     pub fn origin(&self) -> &'receipts OriginManifest {
         self.inventory.origin
+    }
+
+    pub fn has_flac_seek(&self) -> bool {
+        self.flac_seek.is_some()
+    }
+
+    /// Compare all immutable pins from an independently obtained scoped result.
+    /// The caller establishes durability, session scope and authorization.
+    pub fn matches_committed_outcome(&self, outcome: &CommittedOutcome) -> bool {
+        let [_, _, object, generation, configuration] = self.inventory.identities;
+        let ids = [
+            self.inventory.map_id,
+            object,
+            generation,
+            configuration,
+            self.root_version,
+        ]
+        .map(uuid_text);
+        ids.iter().eq([
+            &outcome.map,
+            &outcome.object,
+            &outcome.generation,
+            &outcome.configuration,
+            &outcome.root_version,
+        ]) && self.inventory.media.version == Some(outcome.media_version.as_str())
+            && self
+                .inventory
+                .pages
+                .iter()
+                .map(|(_, pin)| pin.version)
+                .eq(outcome
+                    .page_versions
+                    .iter()
+                    .map(|version| Some(version.as_str())))
     }
 
     pub(crate) fn matches_media(

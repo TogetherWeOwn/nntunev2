@@ -3,7 +3,10 @@ use crate::native_rest::{issue_credential, Scope};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use nntune_core::{
     digest_enrollment::DigestEnrollment,
-    digest_readback::{EnrolledEnvelope, ReadbackBody, ReadbackResponse},
+    digest_readback::{
+        BodyReadbackError, EnrolledEnvelope, EnrolledReadbackError, ReadbackBody, ReadbackError,
+        ReadbackPin, ReadbackResponse,
+    },
     media_envelope::wrap_scheme2,
     origin_sealer::SealedChunk,
 };
@@ -143,6 +146,9 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         Some(Fault::Digest),
         Some(Fault::Revoked),
         Some(Fault::Retention),
+        Some(Fault::BadFlac),
+        Some(Fault::SidecarVersion),
+        Some(Fault::MissingSeek),
         Some(Fault::Quarantined),
     ]
     .into_iter()
@@ -158,6 +164,9 @@ enum Fault {
     Digest,
     Revoked,
     Retention,
+    BadFlac,
+    SidecarVersion,
+    MissingSeek,
     Quarantined,
 }
 
@@ -190,7 +199,11 @@ async fn prove_attempt(
     };
     let root = [17; 32];
     let record = wrap_scheme2(&root, &context, sealer.key().expose_secret()).unwrap();
-    let sealed = sealer.seal_chunk(FLAC).unwrap();
+    let mut plaintext = FLAC.to_vec();
+    if matches!(fault, Some(Fault::BadFlac)) {
+        *plaintext.last_mut().unwrap() ^= 1;
+    }
+    let sealed = sealer.seal_chunk(&plaintext).unwrap();
     let page = sealed.page.unwrap();
     let origin = sealer.finish().unwrap();
     let intent = CandidateIntent {
@@ -527,8 +540,8 @@ async fn prove_attempt(
         trusted_record: &record,
         retained_record: &record,
     };
-    let verified = inventory
-        .verify(custody, envelope, async |_, pin| {
+    let verify = async || {
+        let open = async |_: &str, pin: ReadbackPin<'_>| {
             let (version, data) = if pin.object_key == key {
                 (MEDIA, &ciphertext)
             } else {
@@ -536,12 +549,18 @@ async fn prove_attempt(
                 (PAGE, &page)
             };
             assert_eq!(pin.version, Some(version));
+            let returned_version =
+                if version == PAGE && matches!(fault, Some(Fault::SidecarVersion)) {
+                    "foreign-page-version"
+                } else {
+                    version
+                };
             Ok(BucketReadbackResponse {
                 bucket: BUCKET.into(),
                 response: ReadbackResponse {
                     configuration,
                     object_key: pin.object_key.into(),
-                    version: Some(version.into()),
+                    version: Some(returned_version.into()),
                     status: 200,
                     content_length: Some(data.len() as u64),
                     has_content_range: false,
@@ -549,9 +568,29 @@ async fn prove_attempt(
                     body: Body(data),
                 },
             })
-        })
-        .await
-        .unwrap();
+        };
+        let verified = if matches!(fault, Some(Fault::MissingSeek)) {
+            inventory.verify(custody, envelope, open).await
+        } else {
+            inventory
+                .verify_with_flac_seek(custody, envelope, open)
+                .await
+        };
+        match fault {
+            Some(Fault::BadFlac) => assert!(matches!(
+                verified,
+                Err(EnrolledReadbackError::Body(BodyReadbackError::Content(
+                    ReadbackError::MediaValidation
+                )))
+            )),
+            Some(Fault::SidecarVersion) => assert!(matches!(
+                verified,
+                Err(EnrolledReadbackError::Body(BodyReadbackError::Response))
+            )),
+            _ => assert!(verified.is_ok()),
+        }
+        verified
+    };
     if matches!(fault, Some(Fault::Quarantined)) {
         // Make the winner unreadable only at the outer commit. The observer
         // owns this fixture trigger; the writer's grants stay unchanged.
@@ -574,7 +613,7 @@ async fn prove_attempt(
             .unwrap();
         assert!(matches!(
             opened
-                .commit(writer, auth, &verified, now as i64 + 600, reload)
+                .commit_flac(writer, auth, now as i64 + 600, reload, verify)
                 .await,
             Err(UploadError::Unconfirmed)
         ));
@@ -594,9 +633,9 @@ async fn prove_attempt(
         ));
         return;
     }
-    if let Some(fault @ (Fault::Digest | Fault::Revoked | Fault::Retention)) = fault {
+    if let Some(fault) = fault.filter(|fault| !matches!(fault, Fault::GrantRevokedWhileWaiting)) {
         let (auth, retain, expected) = match fault {
-            Fault::Digest => (auth, now as i64 + 600, UploadError::Refused),
+            Fault::Digest | Fault::MissingSeek => (auth, now as i64 + 600, UploadError::Refused),
             Fault::Revoked => (
                 Authorization {
                     record: &revoked,
@@ -606,10 +645,13 @@ async fn prove_attempt(
                 UploadError::Refused,
             ),
             Fault::Retention => (auth, now as i64 - 1, UploadError::Unconfirmed),
+            Fault::BadFlac | Fault::SidecarVersion => {
+                (auth, now as i64 + 600, UploadError::Unconfirmed)
+            }
             Fault::Quarantined | Fault::GrantRevokedWhileWaiting => unreachable!(),
         };
         assert!(
-            matches!(opened.commit(writer, auth, &verified, retain, reload).await,
+            matches!(opened.commit_flac(writer, auth, retain, reload, verify).await,
             Err(error) if error == expected)
         );
         let untouched: bool = observer.query_one(
@@ -639,7 +681,7 @@ async fn prove_attempt(
             .await
             .unwrap();
         let mut committed =
-            std::pin::pin!(opened.commit(writer, auth, &verified, now as i64 + 600, reload));
+            std::pin::pin!(opened.commit_flac(writer, auth, now as i64 + 600, reload, verify));
         observe_blocked(observer, gate_pid, writer_pid, committed.as_mut())
             .await
             .unwrap();
@@ -679,7 +721,16 @@ async fn prove_attempt(
             .get::<_, bool>(0));
         return;
     }
-    for outcome in [committed.unwrap(), replayed.unwrap().unwrap()] {
+    let committed = committed.unwrap();
+    assert_eq!(
+        committed.flac_plaintext_range(completed.metadata(), origin.plaintext_sha256(), 0..1),
+        Some(42..length)
+    );
+    assert_eq!(
+        committed.flac_plaintext_range(completed.metadata(), &[0; 32], 0..1),
+        None
+    );
+    for outcome in [committed.outcome(), &replayed.unwrap().unwrap()] {
         assert_eq!(outcome.map.replace('-', ""), map_text);
         assert_eq!(outcome.object.replace('-', ""), obj);
         assert_eq!(outcome.generation.replace('-', ""), generation);
