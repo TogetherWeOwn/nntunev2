@@ -12,7 +12,7 @@ import apply_migration as migrator
 import staging_apply
 import staging_trial_schema as trial
 from test_apply_migration_postgres import run_psql
-from test_ingest_session_migration_postgres import scratch_database
+from test_ingest_session_migration_postgres import SEED, scratch_database
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,10 +25,10 @@ NO_SCHEMA = "SELECT " + " AND ".join(
 
 
 class TrialSchemaTests(unittest.TestCase):
-    def dispatch(self, db, summary, mode="single", data_root=ROOT):
+    def dispatch(self, db, summary, mode="single", data_root=ROOT, writer=WRITER):
         env = {
             staging_apply.SECRET_ENV: f"postgresql://fixture:synthetic@127.0.0.1/{DATABASE}",
-            "TRIAL_WRITER_ROLE": WRITER, "TRIAL_READER_ROLE": READER,
+            "TRIAL_WRITER_ROLE": writer, "TRIAL_READER_ROLE": READER,
             "GITHUB_STEP_SUMMARY": str(summary),
         }
         errors = io.StringIO()
@@ -126,6 +126,27 @@ class TrialSchemaTests(unittest.TestCase):
             self.assertEqual(self.dispatch(db, summary), (0, ""))
             self.assertIn("Private trial schema installed", summary.read_text())
             self.assert_access(db)
+            # Model the trigger's existing base-table read with a minimal
+            # fixture grant, then execute the actual locator write as caller.
+            self.assertEqual(run_psql(db, SEED + f"""
+                INSERT INTO public.storage_object_envelope_intents
+                SELECT object_id, root_id, decode('4e4e544d454430310002', 'hex') || uuid_send(root_id)
+                       || uuid_send(environment_id) || uuid_send(library_id) || uuid_send(object_id)
+                       || uuid_send(generation_id) || uuid_send(provider_configuration_version_id)
+                       || int8send(plaintext_bytes) || int8send(envelope_bytes) || header_tag
+                       || decode(repeat('00', 12) || repeat('cd', 48), 'hex')
+                FROM public.storage_object_intents,
+                     (VALUES ('f0000000-0000-4000-8000-000000000001'::UUID)) AS r(root_id);
+                GRANT SELECT (object_id, generation_id) ON public.storage_object_intents TO "{WRITER}";
+                SET ROLE "{WRITER}";
+                INSERT INTO public.storage_s3_locator_intents
+                    (object_id, root_version_id, s3_bucket, s3_key, s3_version_id)
+                VALUES ('40000000-0000-4000-8000-000000000001',
+                        'f0000000-0000-4000-8000-000000000001', 'trial-media',
+                        'media/40000000000040008000000000000001/50000000000040008000000000000001',
+                        'trial-fixture-version')
+                RETURNING s3_version_id;
+            """), "trial-fixture-version")
             run_psql(db, """
                 DO $$
                 BEGIN
@@ -140,6 +161,10 @@ class TrialSchemaTests(unittest.TestCase):
             self.assertIn("Private trial schema already installed", summary.read_text())
             self.assertEqual(run_psql(db, version), original_oid)
             self.assertEqual(run_psql(db, history), before)
+            code, error = self.dispatch(db, summary, writer=OTHER)
+            self.assertEqual(code, 1)
+            self.assertIn("psql failed", error)
+            self.assert_access(db)
 
 
 if __name__ == "__main__":
