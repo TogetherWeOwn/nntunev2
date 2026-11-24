@@ -14,6 +14,8 @@ pub const READ_SCOPE: &str = "ingest:review:read";
 pub const RETRY_SCOPE: &str = "ingest:review:retry";
 pub const RETRY_BODY_LIMIT: usize = 128;
 
+pub mod completed;
+
 /// Synthetic grants use the existing caller-grant format. A future app proxy
 /// must check current admin status and retry step-up before issuing grants.
 pub struct Authorization<'a> {
@@ -143,6 +145,27 @@ pub async fn retry(
     job_id: &str,
     body: &[u8],
 ) -> Result<JobView, ApiError> {
+    let (caller, revision) = retry_input(auth, body)?;
+    let job = load(get, &caller, job_id).await?;
+    let object = versioned_object(&job)?;
+    if is_retry_result(&job, revision) {
+        return Ok(job.view);
+    }
+    next_revision(&job, revision)?;
+    if verify(&caller.user_id, object).await? != *object {
+        return Err(BoundaryError::Conflict.into());
+    }
+    let committed = publish(&job).await?;
+    if !owns_job(&caller, &committed.owner_id) || committed.view.job_id != job_id {
+        return Err(not_found());
+    }
+    if !is_retry_result(&committed, revision) || committed.object.as_ref() != Some(object) {
+        return Err(BoundaryError::Unavailable.into());
+    }
+    Ok(committed.view)
+}
+
+fn retry_input(auth: &Authorization<'_>, body: &[u8]) -> Result<(Caller, u32), ApiError> {
     let caller = auth.caller(RETRY_SCOPE)?;
     if body.len() > RETRY_BODY_LIMIT {
         return Err(ApiError::by_code("payload_too_large", "body too large"));
@@ -152,32 +175,21 @@ pub async fn retry(
     }
     let request: RetryRequest = serde_json::from_slice(body)
         .map_err(|_| ApiError::invalid_request("invalid retry request"))?;
-    let job = load(get, &caller, job_id).await?;
-    let Some(object) = job
-        .object
+    Ok((caller, request.revision))
+}
+
+fn versioned_object(job: &ReviewJob) -> Result<&ObjectRef, BoundaryError> {
+    job.object
         .as_ref()
         .filter(|object| matches!(object.media.locator().binding(), S3Binding::VersionId(_)))
-    else {
-        return Err(BoundaryError::Conflict.into());
-    };
-    if is_retry_result(&job, request.revision) {
-        return Ok(job.view);
-    }
-    if job.view.revision != request.revision
-        || job.view.revision == u32::MAX
-        || job.view.status != ReviewStatus::NeedsReview
-        || verify(&caller.user_id, object).await? != *object
-    {
-        return Err(BoundaryError::Conflict.into());
-    }
-    let committed = publish(&job).await?;
-    if !owns_job(&caller, &committed.owner_id) || committed.view.job_id != job_id {
-        return Err(not_found());
-    }
-    if !is_retry_result(&committed, request.revision) || committed.object.as_ref() != Some(object) {
-        return Err(BoundaryError::Unavailable.into());
-    }
-    Ok(committed.view)
+        .ok_or(BoundaryError::Conflict)
+}
+
+fn next_revision(job: &ReviewJob, revision: u32) -> Result<u32, BoundaryError> {
+    revision
+        .checked_add(1)
+        .filter(|_| job.view.revision == revision && job.view.status == ReviewStatus::NeedsReview)
+        .ok_or(BoundaryError::Conflict)
 }
 
 fn is_retry_result(job: &ReviewJob, revision: u32) -> bool {

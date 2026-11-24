@@ -4,7 +4,10 @@ use nntune_ingest::{
         completed_upload::{stage_completed_release, VerifiedUpload},
         stage, AuthorizedRelease, CommittedFlac, ExpectedFile, StageOutcome,
     },
-    admin_review::ObjectRef,
+    admin_review::{
+        completed::{retry_completed, ResolvedCompletion, ReviewTarget},
+        Authorization, JobView, ObjectRef, ReviewJob, ReviewStatus, READ_SCOPE, RETRY_SCOPE,
+    },
     catalogue_publication::{PublicationError, PublishedObject},
     matching::{
         admin_publish_match::{
@@ -309,4 +312,102 @@ pub(super) async fn exercise(
             hex::encode(both[i].receipt.intent.identities[2])
         );
     }
+    let release = "ab340000-0000-4000-8000-000000000000";
+    let published = std::cell::Cell::new(false);
+    let mut run = async |scope, revision, bad_receipt| {
+        use nntune_ingest::caller_auth::issue;
+        const KEY: &str = "synthetic-review-receiver-fixture-key";
+        let bearer = format!("Bearer {}", issue(job.owner_id, scope, 10, KEY.as_bytes()));
+        let body = format!(r#"{{"revision":{revision}}}"#);
+        let recordings = include_str!("../fixtures/review_retry_recordings.json");
+        retry_completed(
+            &Authorization {
+                bearer: Some(&bearer),
+                secret: Some(KEY),
+                now: 1,
+            },
+            writer,
+            ReviewTarget {
+                job_id: job.job_id,
+                body: body.as_bytes(),
+                environment,
+                library,
+            },
+            async |_, _, _| {
+                let (revision, status, retried_revision) = if published.get() {
+                    (2, ReviewStatus::Published, Some(1))
+                } else {
+                    (1, ReviewStatus::NeedsReview, None)
+                };
+                let view = JobView {
+                    job_id: job.job_id.into(),
+                    revision,
+                    status,
+                    reason: None,
+                };
+                Ok(Some(ReviewJob {
+                    view,
+                    owner_id: job.owner_id.into(),
+                    object: Some(objects[0].clone()),
+                    retried_revision,
+                }))
+            },
+            async |_, _, result| {
+                assert_eq!(result.status, ReviewStatus::Published);
+                assert!(!published.replace(true), "replay must not record again");
+                Ok(())
+            },
+            async |_| {
+                Ok(ResolvedCompletion {
+                    job_id: job.job_id,
+                    revision,
+                    upload: uploads[usize::from(bad_receipt)],
+                    numbering: files[0].numbering,
+                    query: ALBUM,
+                    recordings: (200, recordings),
+                    candidates: Some(CompleteReleaseCandidates {
+                        lookup: &lookup,
+                        hits: vec![hit(release)],
+                    }),
+                })
+            },
+            async |scope| {
+                Ok(db
+                    .query_opt(READ, &[&&scope_key(scope)[..]])
+                    .await?
+                    .map(|row| CommittedOutcome {
+                        map: row.get(0),
+                        object: row.get(1),
+                        generation: row.get(2),
+                        configuration: row.get(3),
+                        root_version: row.get(4),
+                        media_version: row.get(5),
+                        page_versions: row.get(6),
+                    }))
+            },
+        )
+        .await
+    };
+    for (scope, revision, wrong, status) in [
+        (READ_SCOPE, 1, false, 404),
+        (RETRY_SCOPE, 0, false, 409),
+        (RETRY_SCOPE, 1, true, 409),
+    ] {
+        assert_eq!(
+            run(scope, revision, wrong).await.unwrap_err().status,
+            status
+        );
+        assert!(!published.get());
+    }
+    let result = run(RETRY_SCOPE, 1, false).await.unwrap();
+    let replay = run(RETRY_SCOPE, 1, true).await.unwrap();
+    assert_eq!(
+        (result.status, result.revision),
+        (ReviewStatus::Published, 2)
+    );
+    assert_eq!(
+        (replay.status, replay.revision),
+        (result.status, result.revision)
+    );
+    assert_eq!(db.query(ROWS, &[&release]).await.unwrap().len(), 1);
 }
