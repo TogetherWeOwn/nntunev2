@@ -1,16 +1,25 @@
 use super::{now, Duration, S3CompletionSender};
 use crate::multipart::{
+    readback_inventory::CompletedReadbackInventory,
     resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
     session_completion::SessionCompletion,
     sidecar::SidecarPut,
     Plan, UploadTarget,
 };
 use nntune_core::{
-    digest_enrollment::DigestEnrollment, media_envelope::EnvelopeContext,
-    origin_sealer::OriginSealer, s3_locator::S3Binding,
+    digest_enrollment::DigestEnrollment,
+    digest_readback::EnrolledEnvelope,
+    media_envelope::{wrap_scheme2, EnvelopeContext},
+    origin_sealer::SealedChunk,
+    s3_locator::S3Binding,
 };
 use sha2::{Digest, Sha256};
 use worker::wasm_bindgen::{self, prelude::*};
+
+// Mono, 8-bit, 19 constant samples at 44.1 kHz.
+const FLAC: &[u8] = b"fLaC\x80\0\0\x22\0\x10\0\x10\0\0\0\0\0\0\x0a\xc4\x40\x70\0\0\0\x13\
+    \x46\xd2\xbe\x27\x5e\xd2\xdd\x86\xab\x2b\x53\x88\xf7\x34\x6d\x15\
+    \xff\xf8\x69\x02\0\x0f\xb7\0\x2a\x7a\xdd\xff\xf8\x69\x02\x01\x02\x81\0\x2a\x9d\x1d";
 
 fn id(value: u8) -> [u8; 16] {
     let mut bytes = [value; 16];
@@ -74,12 +83,23 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         })
         .to_string());
     }
-    let mut sealer = OriginSealer::new(1).unwrap();
+    let readback = mode.starts_with("readback");
+    let plaintext = if readback { FLAC } else { &[42] };
+    let plaintext_len = plaintext.len() as u64;
+    let map_id = id(0xef);
+    let mut enrollment =
+        DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), map_id).unwrap();
+    let header = enrollment.header();
     let mut context = EnvelopeContext {
         identities,
-        plaintext_len: 1,
-        header: sealer.header().to_bytes(),
+        plaintext_len,
+        header: header.to_bytes(),
     };
+    let root = [17; 32];
+    let record =
+        readback.then(|| wrap_scheme2(&root, &context, enrollment.key().expose_secret()).unwrap());
+    let sealed = enrollment.seal_chunk(plaintext).unwrap();
+    let manifest = enrollment.finish().unwrap();
     let [environment, library, object, generation] =
         [1, 2, 0xab, 0xcd].map(|value| hex::encode(id(value)));
     let key = format!("media/{object}/{generation}");
@@ -89,7 +109,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         _ => 2000,
     };
     let until = now() + Duration::from_millis(budget);
-    let initiated = if mode.starts_with("init") {
+    let initiated = if mode.starts_with("init") || readback {
         let requested_key = if mode == "init-other" {
             "media/efefefefefef40ef80efefefefefefef/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd"
         } else {
@@ -100,7 +120,7 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
         assert_eq!(upload.configuration(), configuration);
-        if mode != "init-upload-completion-head" {
+        if mode != "init-upload-completion-head" && !readback {
             return Ok(upload.target().upload_id.into());
         }
         Some(upload)
@@ -118,10 +138,14 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
     let configuration = initiated
         .as_ref()
         .map_or(configuration, |upload| upload.configuration());
-    let plan = Plan::new(target, sealer.header(), 1).unwrap();
+    let plan = Plan::new(target, header, plaintext_len).unwrap();
     let mut partition = plan.partition();
     assert!(partition
-        .push(&sealer.seal_chunk(&[42]).unwrap())
+        .push(&SealedChunk {
+            digest: Sha256::digest(&sealed.bytes).into(),
+            bytes: sealed.bytes,
+            final_chunk: true,
+        })
         .unwrap()
         .is_none());
     let part = partition.finish().unwrap().unwrap();
@@ -133,8 +157,8 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
                     upload_id: "other",
                     ..target
                 },
-                sealer.header(),
-                1,
+                header,
+                plaintext_len,
             )
             .unwrap()
         } else {
@@ -188,6 +212,39 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
     if mode.starts_with("head") || initiated.is_some() {
         sender
             .confirm_head(&completed, &context, until)
+            .await
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
+    }
+    if let Some(record) = record {
+        let page = sealed.page.unwrap();
+        let put = SidecarPut::new(bucket, &context, &manifest, map_id, 0, &page).unwrap();
+        let sidecars = [sender
+            .put_sidecar(put, until)
+            .await
+            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?];
+        let inventory = CompletedReadbackInventory::assemble(
+            bucket,
+            configuration,
+            &context,
+            map_id,
+            &manifest,
+            &completed,
+            &sidecars,
+        )
+        .unwrap();
+        let envelope = EnrolledEnvelope {
+            authorized_root: &root,
+            context: &context,
+            trusted_record: &record,
+            retained_record: &record,
+        };
+        let readback_until = if mode == "readback-deadline" {
+            now() + Duration::from_millis(200)
+        } else {
+            until
+        };
+        sender
+            .verify_readback(&inventory, envelope, readback_until)
             .await
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     }

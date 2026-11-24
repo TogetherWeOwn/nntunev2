@@ -2,6 +2,7 @@
 
 use std::{
     fmt::Write as _,
+    future::Future,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -36,6 +37,9 @@ use super::{
 use crate::pool_deadline::race_against_deadline;
 
 pub use super::initiation::InitiatedUpload;
+
+#[path = "s3_readback.rs"]
+mod readback;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HeadConfirmationError {
@@ -192,17 +196,7 @@ impl S3CompletionSender {
                 .map_err(|_| InvalidResponse)
             })
             .transpose()?;
-        let content_length = reply
-            .headers
-            .get("content-length")
-            .map_err(|_| InvalidResponse)?
-            .map(|length| {
-                if !length.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(InvalidResponse);
-                }
-                length.parse::<u64>().map_err(|_| InvalidResponse)
-            })
-            .transpose()?;
+        let content_length = content_length(&reply.headers).map_err(|()| InvalidResponse)?;
         completed
             .verify_head(
                 context,
@@ -353,6 +347,15 @@ impl S3CompletionSender {
         request: SignedRequest<'_>,
         until: SystemTime,
     ) -> Result<SignedReply, ()> {
+        let (request, mut deadline) = self.prepare_request(request, until)?;
+        deadline.run(fetch_reply(&request)).await
+    }
+
+    fn prepare_request(
+        &self,
+        request: SignedRequest<'_>,
+        until: SystemTime,
+    ) -> Result<(Request, RequestDeadline), ()> {
         if self.configuration != request.configuration
             || self.bucket != request.bucket
             || now() >= until
@@ -428,11 +431,14 @@ impl S3CompletionSender {
         if !(1..=i32::MAX as u128).contains(&wait.as_millis()) {
             return Err(());
         }
-        let mut timer = Delay::from(wait);
-        let reply = race_against_deadline(Box::pin(fetch_reply(&request)), &mut timer)
-            .await
-            .ok_or(())??;
-        (now() < until).then_some(reply).ok_or(())
+        Ok((
+            request,
+            RequestDeadline {
+                until,
+                timer: Delay::from(wait),
+                _abort: abort,
+            },
+        ))
     }
 }
 
@@ -465,37 +471,80 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn fetch_reply(request: &Request) -> Result<SignedReply, ()> {
+struct RequestDeadline {
+    until: SystemTime,
+    timer: Delay,
+    _abort: AbortOnDrop,
+}
+
+impl RequestDeadline {
+    async fn run<T>(&mut self, operation: impl Future<Output = Result<T, ()>>) -> Result<T, ()> {
+        self.check()?;
+        let result = race_against_deadline(Box::pin(operation), &mut self.timer)
+            .await
+            .ok_or(())??;
+        self.check()?;
+        Ok(result)
+    }
+
+    fn check(&self) -> Result<(), ()> {
+        (now() < self.until).then_some(()).ok_or(())
+    }
+}
+
+fn content_length(headers: &Headers) -> Result<Option<u64>, ()> {
+    headers
+        .get("content-length")
+        .map_err(|_| ())?
+        .map(|length| {
+            if !length.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
+            }
+            length.parse().map_err(|_| ())
+        })
+        .transpose()
+}
+
+async fn fetch_response(request: &Request) -> Result<Response, ()> {
     let scope: WorkerGlobalScope = js_sys::global().unchecked_into();
     let response: Response = JsFuture::from(scope.fetch_with_request(request))
         .await
         .map_err(|_| ())?
         .dyn_into()
         .map_err(|_| ())?;
-    let status = response.status();
-    let headers = response.headers();
     if response.redirected()
-        || (300..400).contains(&status)
-        || headers.has("content-encoding").map_err(|_| ())?
+        || (300..400).contains(&response.status())
+        || response.headers().has("content-encoding").map_err(|_| ())?
     {
         return Err(());
     }
+    Ok(response)
+}
+
+async fn next_response_chunk(
+    reader: &ReadableStreamDefaultReader,
+) -> Result<Option<Uint8Array>, ()> {
+    let chunk = JsFuture::from(reader.read()).await.map_err(|_| ())?;
+    if Reflect::get(&chunk, &"done".into())
+        .map_err(|_| ())?
+        .as_bool()
+        .ok_or(())?
+    {
+        return Ok(None);
+    }
+    Reflect::get(&chunk, &"value".into())
+        .map_err(|_| ())?
+        .dyn_into()
+        .map(Some)
+        .map_err(|_| ())
+}
+
+async fn fetch_reply(request: &Request) -> Result<SignedReply, ()> {
+    let response = fetch_response(request).await?;
     let mut body = Vec::new();
     if let Some(stream) = response.body() {
         let reader = ReadableStreamDefaultReader::new(&stream).map_err(|_| ())?;
-        loop {
-            let chunk = JsFuture::from(reader.read()).await.map_err(|_| ())?;
-            let done = Reflect::get(&chunk, &"done".into())
-                .map_err(|_| ())?
-                .as_bool()
-                .ok_or(())?;
-            if done {
-                break;
-            }
-            let bytes: Uint8Array = Reflect::get(&chunk, &"value".into())
-                .map_err(|_| ())?
-                .dyn_into()
-                .map_err(|_| ())?;
+        while let Some(bytes) = next_response_chunk(&reader).await? {
             let start = body.len();
             let len = bytes.length() as usize;
             if len > MAX_COMPLETION_BODY - start {
@@ -506,8 +555,8 @@ async fn fetch_reply(request: &Request) -> Result<SignedReply, ()> {
         }
     }
     Ok(SignedReply {
-        status,
-        headers,
+        status: response.status(),
+        headers: response.headers(),
         body,
     })
 }
