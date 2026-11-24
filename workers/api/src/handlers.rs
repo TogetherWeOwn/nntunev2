@@ -4718,7 +4718,8 @@ where
     let purchase_bindings = if ctx.cfg.paid_billing_enabled() {
         match ctx.store.load_reconcile_input(&claims.user_id, None).await {
             Ok(input)
-                if ctx.cfg.stripe_secret_key.is_some()
+                if input.live.is_none()
+                    && ctx.cfg.stripe_secret_key.is_some()
                     && ctx.cfg.stripe_webhook_secret.is_some() =>
             {
                 Some(input.bindings)
@@ -13070,6 +13071,21 @@ mod tests {
         assert_eq!(*h.stripe.sessions_created.borrow(), 0);
         assert_eq!(portal(None).status, 401);
         assert_eq!(authenticated_portal().status, 409);
+        h.store
+            .plans
+            .borrow_mut()
+            .extend(["plus", "max"].map(|id| PlanRow {
+                id: id.into(),
+                price_cents: 800,
+                stream_hours_month: 100,
+                max_concurrent_streams: 1,
+            }));
+        let plans = || {
+            let reply = request("/v1/plans", "GET", Some(cookie.clone()));
+            serde_json::from_str::<serde_json::Value>(&reply.body).unwrap()
+        };
+        assert_eq!(plans()["plans"][0]["selectable"], true);
+        assert_eq!(plans()["plans"][1]["selectable"], false);
         deliver_first_period(&h, "evt_portal");
         let valid = crate::stripe::PortalSession {
             customer: "cus_test_1".into(),
@@ -13096,19 +13112,7 @@ mod tests {
         h.stripe.portal_reply.replace(Some(valid));
         assert_eq!(authenticated_portal().status, 200);
 
-        h.store
-            .plans
-            .borrow_mut()
-            .extend(["plus", "max"].map(|id| PlanRow {
-                id: id.into(),
-                price_cents: 800,
-                stream_hours_month: 100,
-                max_concurrent_streams: 1,
-            }));
-        let plans = request("/v1/plans", "GET", Some(cookie.clone()));
-        let plans: serde_json::Value = serde_json::from_str(&plans.body).unwrap();
-        assert_eq!(plans["plans"][0]["selectable"], true);
-        assert_eq!(plans["plans"][1]["selectable"], false);
+        assert_eq!(plans()["plans"][0]["selectable"], false);
         let subscription = request("/v1/me/subscription", "GET", Some(cookie));
         let subscription: serde_json::Value = serde_json::from_str(&subscription.body).unwrap();
         assert_eq!(subscription["canChangePlan"], false);

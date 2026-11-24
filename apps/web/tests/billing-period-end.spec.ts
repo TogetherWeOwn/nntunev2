@@ -96,6 +96,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					// Only a stored `active` folds to the server's active state;
 					// every other stored status (trialing included) is lapsed.
 					const confirmed = status === 'active';
+					const paidPilot = confirmed && cancelAtPeriodEnd;
 					await page.route('**/v1/**', (route) => {
 						const path = new URL(route.request().url()).pathname;
 						calls.push({ path, method: route.request().method() });
@@ -103,7 +104,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 							return route.fulfill({ json: {
 								state: confirmed ? 'active' : 'lapsed',
 								planId: 'pro', status, currentPeriodEnd,
-								graceUntil: null, cancelAtPeriodEnd
+								graceUntil: null, cancelAtPeriodEnd, ...(paidPilot && { canChangePlan: false })
 							} });
 						}
 						if (path === '/v1/me/usage') {
@@ -151,7 +152,6 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					// including for a legacy stored `trialing`.
 					await expect(plan).not.toContainText('trial ends');
 					await expect(page.getByRole('heading', { name: 'Usage for 2026-10' })).toHaveCount(confirmed ? 1 : 0);
-					await expect(page.getByRole('button', { name: 'Upgrade to max' })).toHaveCount(confirmed ? 1 : 0);
 					const manage = page.getByRole('button', {
 						name: confirmed ? 'Manage billing' : 'Manage billing to resolve', exact: true
 					});
@@ -160,6 +160,7 @@ for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 
 					// The page hydrates caps from /v1/plans after the loader's
 					// two reads; wait for that third call before the exact list.
 					await expect.poll(() => calls.length).toBe(3);
+					await expect(page.getByRole('button', { name: 'Upgrade to max' })).toHaveCount(confirmed && !paidPilot ? 1 : 0);
 					expect(calls).toEqual([
 						{ path: '/v1/me/subscription', method: 'GET' },
 						{ path: '/v1/me/usage', method: 'GET' },
