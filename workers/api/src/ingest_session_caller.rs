@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use nntune_core::media_envelope::EnvelopeContext;
 use nntune_ingest::{
     digest_candidate_store::{
-        outcome::{read_completion, stage_completion, OutcomeError},
+        outcome::{protect_completion_reuse, read_completion, stage_completion, OutcomeError},
         CandidateIntent,
     },
     multipart::{
@@ -32,6 +32,7 @@ const AUTHORITY_TIMEOUT_MS: u64 = 3_000;
 
 mod flac;
 pub use flac::CommittedFlacUpload;
+pub use nntune_ingest::digest_candidate_store::outcome::ProtectedReuse;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UploadError {
@@ -76,7 +77,6 @@ impl<'a> PreparedUpload<'a> {
         let [_, environment, library, _, seal, _] = self.context.identities;
         let fingerprint = self.request.fingerprint().map_err(|_| Refused)?;
         if (scope.revision, scope.offset) != (0, 0)
-            || scope.principal != auth.record.user_id
             || (scope.environment, scope.library, scope.seal) != (environment, library, seal)
             || scope.fingerprint != fingerprint.bytes()
             || self.context.identities[1..] != self.intent.identities
@@ -86,17 +86,7 @@ impl<'a> PreparedUpload<'a> {
         {
             return Err(Refused);
         }
-        authorize(
-            (Some(auth.record), Some(auth.bearer)),
-            auth.peppers,
-            now_millis() / 1000,
-            Some(auth.grant),
-            (&uuid_text(environment), &uuid_text(library)),
-            Action::Upload,
-            Some((scope.session, self.job)),
-        )
-        .map_err(|_| Refused)?;
-        i64::try_from(auth.record.expires_at).map_err(|_| Refused)
+        authorize_scope(auth, &scope, self.job, Action::Upload)
     }
 
     fn completed_scope(self) -> CompletionScope<'a> {
@@ -270,27 +260,92 @@ pub async fn read(
 ) -> Result<Option<CommittedOutcome>, UploadError> {
     prepared.authorize(auth)?;
     read_completion(writer, &prepared.completed_scope(), async |_, locked| {
-        let current = with_deadline(
-            reader(&auth.record.id, locked),
-            AUTHORITY_TIMEOUT_MS,
-            StoreError,
-        )
-        .await
-        .map_err(|_| OutcomeError::Indeterminate)?
-        .ok_or(OutcomeError::Refused)?;
-        if current.record.id != auth.record.id {
-            return Err(OutcomeError::Refused);
-        }
-        prepared
-            .authorize(Authorization {
-                record: &current.record,
-                grant: &current.grant,
-                ..auth
-            })
-            .map_err(|_| OutcomeError::Refused)
+        reauthorize(auth, locked, prepared.job, Action::Upload, reader).await
     })
     .await
     .map_err(outcome_error)
+}
+
+/// Admit bounded reuse of an already completed upload owned by this job.
+/// Load the job and final checkpoint coordinates from trusted session state.
+/// The current credential and reuse grant are loaded through separate access
+/// after the session and winner locks. This returns protected version pins
+/// for internal use. A destination needs its own authorization and binding.
+pub async fn reuse(
+    writer: &mut Client,
+    auth: Authorization<'_>,
+    scope: &CompletionScope<'_>,
+    job: &Job<'_>,
+    reader: impl AsyncFnOnce(
+        &str,
+        &CompletionScope<'_>,
+    ) -> Result<Option<CurrentAuthorization>, StoreError>,
+) -> Result<ProtectedReuse, UploadError> {
+    authorize_scope(auth, scope, job, Action::Reuse)?;
+    protect_completion_reuse(
+        writer,
+        scope,
+        async |locked| reauthorize(auth, locked, job, Action::Reuse, reader).await,
+        || UNIX_EPOCH + Duration::from_millis(now_millis()),
+    )
+    .await
+    .map_err(outcome_error)
+}
+
+fn authorize_scope(
+    auth: Authorization<'_>,
+    scope: &CompletionScope<'_>,
+    job: &Job<'_>,
+    action: Action,
+) -> Result<i64, UploadError> {
+    if scope.principal != auth.record.user_id {
+        return Err(Refused);
+    }
+    authorize(
+        (Some(auth.record), Some(auth.bearer)),
+        auth.peppers,
+        now_millis() / 1000,
+        Some(auth.grant),
+        (&uuid_text(scope.environment), &uuid_text(scope.library)),
+        action,
+        Some((scope.session, job)),
+    )
+    .map_err(|_| Refused)?;
+    i64::try_from(auth.record.expires_at).map_err(|_| Refused)
+}
+
+async fn reauthorize(
+    auth: Authorization<'_>,
+    scope: &CompletionScope<'_>,
+    job: &Job<'_>,
+    action: Action,
+    reader: impl AsyncFnOnce(
+        &str,
+        &CompletionScope<'_>,
+    ) -> Result<Option<CurrentAuthorization>, StoreError>,
+) -> Result<i64, OutcomeError> {
+    let current = with_deadline(
+        reader(&auth.record.id, scope),
+        AUTHORITY_TIMEOUT_MS,
+        StoreError,
+    )
+    .await
+    .map_err(|_| OutcomeError::Indeterminate)?
+    .ok_or(OutcomeError::Refused)?;
+    if current.record.id != auth.record.id {
+        return Err(OutcomeError::Refused);
+    }
+    authorize_scope(
+        Authorization {
+            record: &current.record,
+            grant: &current.grant,
+            ..auth
+        },
+        scope,
+        job,
+        action,
+    )
+    .map_err(|_| OutcomeError::Refused)
 }
 
 async fn acquire(

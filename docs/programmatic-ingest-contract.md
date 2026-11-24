@@ -47,6 +47,14 @@ complete authenticated upload and identity checks before publication. Reuse
 requires explicit authorization for a fully validated object in the permitted
 namespace; caller claims alone never establish ownership or eligibility.
 
+The off-route encrypted upload caller can admit short-lived reuse of the
+exact committed object from an owned session. It resolves immutable version
+pins from the final checkpoint and verified winner, then checks the current
+reuse grant under the session and winner locks. The protection lasts at most
+30 seconds, bounded by credential expiry, session expiry and winner retention.
+The returned pins carry no provider access. A future destination caller must
+authorize and bind its reference through guarded reference admission.
+
 ## Large uploads and activation requirements
 
 Follow ADR 0015's authenticated, resumable multipart design. Direct object

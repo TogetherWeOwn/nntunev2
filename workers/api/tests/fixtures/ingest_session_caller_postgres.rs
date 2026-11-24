@@ -27,6 +27,9 @@ use tokio_postgres::{Config, NoTls};
 mod blocker_observer;
 use blocker_observer::observe_blocked;
 
+#[path = "ingest_session_reuse_postgres.rs"]
+mod reuse_cases;
+
 const DB: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
 const WRITER: &str =
     "postgresql://upload_fixture_writer:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
@@ -71,18 +74,22 @@ async fn load_authority(
     scope: &CompletionScope<'_>,
 ) -> Result<Option<CurrentAuthorization>, StoreError> {
     let row = authority.query_opt(
-        "SELECT c.*, g.environment, g.library_id
+        "SELECT c.*, g.environment, g.library_id, g.can_reuse
          FROM public.native_rest_credentials c JOIN public.fixture_upload_grants g ON g.credential_id = c.id
          WHERE c.id = $1 AND c.user_id = $2 AND g.environment = $3 AND g.library_id = $4",
         &[&credential_id, &scope.principal, &uuid_text(scope.environment), &uuid_text(scope.library)],
     ).await.map_err(|_| StoreError)?;
     row.map(|row| {
         let record = crate::worker_entry::native_credential_from_row(&row)?.record;
+        let mut actions = vec![Action::Upload];
+        if row.try_get("can_reuse").map_err(|_| StoreError)? {
+            actions.push(Action::Reuse);
+        }
         let grant = Grant {
             credential_id: record.id.clone(),
             environment: row.try_get("environment").map_err(|_| StoreError)?,
             library_id: row.try_get("library_id").map_err(|_| StoreError)?,
-            actions: vec![Action::Upload],
+            actions,
         };
         Ok(CurrentAuthorization { record, grant })
     })
@@ -101,11 +108,15 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         .batch_execute(include_str!("ingest_session_caller_grants.sql"))
         .await
         .unwrap();
+    observer
+        .batch_execute(include_str!("ingest_session_reuse_grants.sql"))
+        .await
+        .unwrap();
     observer.batch_execute(
         "CREATE ROLE upload_fixture_authority LOGIN NOINHERIT PASSWORD 'ci-throwaway';
          CREATE TABLE public.fixture_upload_grants (
              credential_id text PRIMARY KEY REFERENCES public.native_rest_credentials (id),
-             environment text NOT NULL, library_id text NOT NULL
+             environment text NOT NULL, library_id text NOT NULL, can_reuse boolean NOT NULL DEFAULT true
          );
          GRANT SELECT ON public.native_rest_credentials, public.fixture_upload_grants TO upload_fixture_authority;
          CREATE FUNCTION public.fixture_hold_completion() RETURNS trigger
@@ -249,7 +260,7 @@ async fn prove_attempt(
         credential_id: credential.record.id.clone(),
         environment: env.clone(),
         library_id: lib.clone(),
-        actions: vec![Action::Create, Action::Upload],
+        actions: vec![Action::Create, Action::Upload, Action::Reuse],
     };
     let credential_record = &credential.record;
     observer.execute(
@@ -261,7 +272,7 @@ async fn prove_attempt(
     ).await.unwrap();
     observer
         .execute(
-            "INSERT INTO public.fixture_upload_grants VALUES ($1, $2, $3)",
+            "INSERT INTO public.fixture_upload_grants (credential_id, environment, library_id) VALUES ($1, $2, $3)",
             &[&credential_record.id, &env, &lib],
         )
         .await
@@ -729,6 +740,10 @@ async fn prove_attempt(
                  OR EXISTS (SELECT FROM public.storage_validated_digest_winners WHERE object_id = $2::text::uuid)",
             &[&map_text, &obj],
         ).await.unwrap().get::<_, bool>(0));
+        if matches!(fault, Fault::BadFlac) {
+            reuse_cases::refuse_unverified(observer, authority, writer, auth, prepared, &map_text)
+                .await;
+        }
         return;
     }
     let revoke = matches!(fault, Some(Fault::GrantRevokedWhileWaiting));
@@ -862,6 +877,23 @@ async fn prove_attempt(
         read(writer, auth, prepared, reload).await,
         Err(UploadError::Refused)
     ));
+    // Restore the disposable credential for the independent reuse cases.
+    observer
+        .execute(
+            "UPDATE public.native_rest_credentials SET revoked_at = NULL WHERE id = $1",
+            &[&auth.record.id],
+        )
+        .await
+        .unwrap();
+    reuse_cases::protect_completed(
+        observer,
+        authority,
+        writer,
+        auth,
+        prepared,
+        committed.outcome(),
+    )
+    .await;
 }
 
 async fn backend_pid(client: &Client) -> i32 {
