@@ -2139,7 +2139,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     expect(stream).toContain('worker_tools.py install stream');
     expect(stream).toContain('staging_api_identity.py --stream-staging');
     expect(stream).toContain('test -s "$RUNNER_TEMP/staging-stream-identity.json"');
-    expect(jobSection(deployWorkflow, 'gate')).toContain("echo '::error::Armed Stream staging requires the deploy credential.'\n          exit 1");
+    expect(jobSection(deployWorkflow, 'gate')).toMatch(/echo '::error::Armed Stream staging requires the deploy credential\.'\n +exit 1\n/);
     const deployStream = stream.split('      - name: Deploy stream to staging\n')[1]!.split('\n      - ')[0]!;
     expect(deployStream).toContain('PRIVATE_PLAYBACK_STAGING_ENABLED: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENABLED }}');
   });
