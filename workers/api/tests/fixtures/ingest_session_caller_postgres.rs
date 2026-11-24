@@ -903,6 +903,10 @@ async fn prove_attempt(
             observer, writer, now, input, auth, prepared, &committed, reload,
         )
         .await;
+        crate::handlers::tests::private_trial_fixture::verify_registration(
+            observer, authority, input, auth,
+        )
+        .await;
     }
     observer
         .execute(

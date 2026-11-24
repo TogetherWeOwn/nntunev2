@@ -37,6 +37,94 @@ async fn connection() -> Client {
     client
 }
 
+pub(crate) async fn verify_registration(
+    observer: &Client,
+    authority: &Client,
+    input: &[u8],
+    auth: Authorization<'_>,
+) {
+    use private_trial::{
+        registration::{load_authority, Enrollment},
+        TrialError,
+    };
+    let id = |byte| {
+        let mut value = [byte; 16];
+        value[6] = 0x40;
+        value[8] = 0x80;
+        value
+    };
+    let identities = [0xea, 0xeb, 0xec, 0xed, 0xee].map(id);
+    let [environment, library, object, generation, _] = identities;
+    let [env, lib, obj] = [environment, library, object].map(uuid_text);
+    observer
+        .execute(
+            "INSERT INTO public.storage_environments VALUES ($1::text::uuid)",
+            &[&env],
+        )
+        .await
+        .unwrap();
+    observer.execute("INSERT INTO public.storage_library_namespaces VALUES ($1::text::uuid,$2::text::uuid,NULL)", &[&lib,&env]).await.unwrap();
+    observer.batch_execute(
+        "GRANT SELECT (id, principal_id, library_id, fingerprint, terminal_reason) ON public.ingest_session_reservations TO upload_fixture_authority;
+         GRANT SELECT (id, environment_id, owner_id) ON public.storage_library_namespaces TO upload_fixture_authority;"
+    ).await.unwrap();
+    let mut registrar = connection().await;
+    let session = uuid_text(id(0xef));
+    let fingerprint = [0x47; 32];
+    let enrollment = Enrollment {
+        session: &session,
+        job: JOB,
+        actor: &auth.record.user_id,
+        fingerprint: &fingerprint,
+    };
+    let register = async |db: &mut Client, body: &[u8]| {
+        enrollment
+            .register(db, body, identities, id(0xf0), id(0xf1), &[0xac; 32])
+            .await
+    };
+    let mut changed = input.to_vec();
+    changed[0] ^= 1;
+    assert!(matches!(
+        register(&mut registrar, &changed).await,
+        Err(TrialError::Refused)
+    ));
+    let enrolled = register(&mut registrar, input).await.unwrap();
+    assert_eq!(enrolled.intent.reservation_generation, 1);
+    assert!(matches!(
+        register(&mut registrar, input).await,
+        Err(TrialError::Refused)
+    ));
+
+    let scope = CompletionScope {
+        environment,
+        library,
+        principal: enrollment.actor,
+        session: &session,
+        fingerprint: &fingerprint,
+        seal: generation,
+        revision: 0,
+        offset: 0,
+    };
+    let current = load_authority(authority, &auth.record.id, &scope)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.record.id, auth.record.id);
+    let wrong = CompletionScope {
+        fingerprint: &[0; 32],
+        ..scope
+    };
+    assert!(load_authority(authority, &auth.record.id, &wrong)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(observer.query_one(
+        "SELECT EXISTS (SELECT FROM public.ingest_session_cleanup_intents WHERE session_id=$1::text::uuid)
+              AND EXISTS (SELECT FROM public.storage_object_envelope_intents WHERE object_id=$2::text::uuid AND wrapped_record=$3)",
+        &[&session, &obj, &enrolled.record.as_slice()],
+    ).await.unwrap().get::<_, bool>(0));
+}
+
 pub(crate) async fn verify_publication(
     observer: &Client,
     upload_writer: &mut Client,
