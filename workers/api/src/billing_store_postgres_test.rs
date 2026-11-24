@@ -75,6 +75,7 @@ async fn with_fixture_store<T>(run: impl AsyncFnOnce(&PgStore) -> T) -> T {
 
 async fn checkout_reservation_and_price_mapping(observer: &Client) {
     use super::Store;
+    use crate::billing_reconcile::CreateOpOutcome;
     const OP: &str = "7f000000-0000-4000-8000-000000000001";
     const RACE: &str = "7f000000-0000-4000-8000-000000000002";
     const PRICE: &str = "price_checkout_fixture";
@@ -149,6 +150,8 @@ async fn checkout_reservation_and_price_mapping(observer: &Client) {
     );
     let (left, right) = (left.unwrap(), right.unwrap());
     assert_eq!(left.op(), right.op());
+    let created = |outcome: &CreateOpOutcome| matches!(outcome, CreateOpOutcome::Created(_));
+    assert_ne!(created(&left), created(&right));
     assert!(left.op().replayable);
     let snapshot = with_fixture_store(async |store| {
         store.load_reconcile_input(OTHER_USER, None).await.unwrap()
