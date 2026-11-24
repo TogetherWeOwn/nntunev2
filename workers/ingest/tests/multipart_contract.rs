@@ -94,13 +94,22 @@ fn rejects_bad_receipts_and_false_completion_success() {
     let composite = "<s3:ChecksumType>COMPOSITE</s3:ChecksumType>";
     let verify = |status, body: &str| completion.verify_reply(status, body.as_bytes());
     assert_eq!(verify(200, &typed(composite)), Ok(()));
+    let declaration = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+    assert_eq!(verify(200, &format!("{declaration}{success}")), Ok(()));
+    assert_eq!(
+        verify(200, &format!("<?xml version=\"1.0\"?>{success}")),
+        Ok(())
+    );
     assert_eq!(verify(503, &success), Err(CompletionStatus));
     assert_eq!(verify(200, " \n<Error/>"), Err(EmbeddedError));
     let error = success.replace("s3:Key", "s3:Error");
     assert_eq!(verify(200, &error), Err(EmbeddedError));
     assert_eq!(verify(200, &success.replace("-1</", "-2</")), Err(Checksum));
     for body in [
-        format!("<?xml version=\"1.0\"?>{success}"),
+        format!(" {declaration}{success}"),
+        format!("{declaration}{declaration}{success}"),
+        format!("<?xml version=\"1.1\"?>{success}"),
+        format!("<?xml version=\"1.0\" encoding=\"UTF-16\"?>{success}"),
         typed(&composite.replace("COMPOSITE", "FULL_OBJECT")),
         typed(&composite.repeat(2)),
         attr("unexpected='<'"),

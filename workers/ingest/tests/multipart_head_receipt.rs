@@ -8,7 +8,9 @@ use nntune_core::{
 use nntune_ingest::multipart::{
     head_receipt::{compare_head_receipt, HeadReceipt, HeadReceiptError::*},
     resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
-    session_completion::{PrepareError, SessionCompletion},
+    session_completion::{
+        CompletionRequest, CompletionResponse, DispatchError, PrepareError, SessionCompletion,
+    },
     MultipartError, Plan, UploadTarget, VersionedCompletionReply,
 };
 use sha2::{Digest, Sha256};
@@ -139,13 +141,13 @@ fn pins_only_the_exact_versioned_completion_response() {
     }
 }
 
-#[test]
-fn session_completion_requires_checkpoint_full_manifest_and_head() {
+#[tokio::test]
+async fn session_completion_requires_checkpoint_full_manifest_and_head() {
     let mut sealer = OriginSealer::new(1).unwrap();
     let target = UploadTarget {
         bucket: BUCKET,
         key: KEY,
-        upload_id: "synthetic",
+        upload_id: "synthetic+/=opaque",
     };
     let plan = Plan::new(target, sealer.header(), 1).unwrap();
     let chunk = sealer.seal_chunk(&[42]).unwrap();
@@ -160,7 +162,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
     let saved = CheckpointPart {
         number,
         len: bytes.len(),
-        etag: "opaque-part",
+        etag: "\"opaque&part<1>\"",
         digest,
     };
     let context = EnvelopeContext {
@@ -172,6 +174,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         [1, 2, 0xab, 0xcd].map(|byte| hex::encode(id(byte)));
     let binding = ResumeBinding {
         plan,
+        configuration: id(5),
         environment: &environment,
         library: &library,
         session: "03030303-0303-4003-8003-030303030303",
@@ -226,7 +229,7 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         ),
         Err(PrepareError::Parts(MultipartError::Geometry))
     ));
-    let wrong_scopes = [1, 2, 3, 4].map(|index| {
+    let wrong_scopes = [1, 2, 3, 4, 5].map(|index| {
         let mut wrong_scope = EnvelopeContext { ..context };
         wrong_scope.identities[index] = id(9);
         wrong_scope
@@ -237,15 +240,32 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         plaintext_len: 2,
         ..context
     };
-    let mut invalid_configuration = EnvelopeContext { ..context };
-    invalid_configuration.identities[5][6] = 0;
-    let invalid_metadata = [wrong_header, wrong_length, invalid_configuration];
-    for wrong_context in wrong_scopes.into_iter().chain(invalid_metadata) {
+    let rejects_context = |wrong_context: &EnvelopeContext, binding| {
         assert!(matches!(
-            SessionCompletion::prepare(binding, &wrong_context, receipts(), &checkpoint),
+            SessionCompletion::prepare(
+                binding,
+                wrong_context,
+                receipts(),
+                &ResumeCheckpoint {
+                    binding,
+                    ..checkpoint
+                },
+            ),
             Err(PrepareError::EnvelopeContextMismatch)
         ));
+    };
+    for wrong_context in wrong_scopes.into_iter().chain([wrong_header, wrong_length]) {
+        rejects_context(&wrong_context, binding);
     }
+    let mut invalid_configuration = EnvelopeContext { ..context };
+    invalid_configuration.identities[5][6] = 0;
+    rejects_context(
+        &invalid_configuration,
+        ResumeBinding {
+            configuration: invalid_configuration.identities[5],
+            ..binding
+        },
+    );
     for wrong_target in [
         UploadTarget {
             key: "media/efefefefefef40ef80efefefefefefef/cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd",
@@ -277,8 +297,9 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
             Err(PrepareError::EnvelopeContextMismatch)
         ));
     }
-    let completion =
-        SessionCompletion::prepare(binding, &context, receipts(), &checkpoint).unwrap();
+    let prepare =
+        || SessionCompletion::prepare(binding, &context, receipts(), &checkpoint).unwrap();
+    let completion = prepare();
     assert!(completion.manifest().eq([(1, saved.etag, checksum)]));
     let body = format!(
         "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key><ChecksumSHA256>{}-1</ChecksumSHA256></CompleteMultipartUploadResult>",
@@ -332,6 +353,81 @@ fn session_completion_requires_checkpoint_full_manifest_and_head() {
         verify(b"<Error/>", &["pinned-version"]).err(),
         Some(MultipartError::EmbeddedError)
     );
+
+    let expect_request = |request: CompletionRequest<'_>| {
+        assert_eq!(request.configuration, id(5));
+        assert!(request.target == target);
+        let expected = format!(
+            "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Part><PartNumber>1</PartNumber><ETag>&quot;opaque&amp;part&lt;1&gt;&quot;</ETag>\
+             <ChecksumSHA256>{checksum}</ChecksumSHA256></Part></CompleteMultipartUpload>"
+        );
+        assert_eq!(request.body.as_slice(), expected.as_bytes());
+    };
+    let reply = |body: &[u8], version: &str| CompletionResponse {
+        configuration: id(5),
+        status: 200,
+        body: body.into(),
+        version: Some(version.into()),
+    };
+    let sent = prepare()
+        .dispatch(async |request| {
+            expect_request(request);
+            let declared = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{body}");
+            Ok(reply(declared.as_bytes(), "pinned-version"))
+        })
+        .await
+        .unwrap();
+    assert!(sent.metadata().locator() == &observed);
+
+    for (response, expected) in [
+        (Err(()), None),
+        (
+            Ok(reply(b"<Error/>", "pinned-version")),
+            Some(MultipartError::EmbeddedError),
+        ),
+        (
+            Ok(reply(body.as_bytes(), "pinned-version, other")),
+            Some(MultipartError::CompletionVersion),
+        ),
+    ] {
+        let mut sends = 0;
+        let result = prepare()
+            .dispatch(async |request| {
+                expect_request(request);
+                sends += 1;
+                response
+            })
+            .await;
+        assert_eq!(result.err(), Some(DispatchError::Unconfirmed(expected)));
+        assert_eq!(sends, 1);
+    }
+
+    for (upload_id, etag) in [
+        ("invalid\nvalue", saved.etag),
+        (target.upload_id, "invalid\0value"),
+    ] {
+        let plan = Plan::new(
+            UploadTarget {
+                upload_id,
+                ..target
+            },
+            sealer.header(),
+            1,
+        )
+        .unwrap();
+        let binding = ResumeBinding { plan, ..binding };
+        let checkpoint = ResumeCheckpoint {
+            binding,
+            parts: &[CheckpointPart { etag, ..saved }],
+        };
+        let part = make_part(plan).verify_reply(etag.into(), checksum).unwrap();
+        let result = SessionCompletion::prepare(binding, &context, vec![part], &checkpoint)
+            .unwrap()
+            .dispatch(async |_| panic!("invalid request was dispatched"))
+            .await;
+        assert_eq!(result.err(), Some(DispatchError::InvalidRequest));
+    }
 }
 
 #[test]

@@ -6,6 +6,7 @@ use super::{Plan, UploadedPart};
 pub struct ResumeBinding<'a> {
     /// Binds the upload target, exact wire header and object lengths.
     pub plan: Plan<'a>,
+    pub configuration: [u8; 16],
     pub environment: &'a str,
     pub library: &'a str,
     pub session: &'a str,
