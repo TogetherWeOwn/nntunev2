@@ -5,8 +5,10 @@ use std::pin::pin;
 use futures_util::future::{select, Either};
 use nntune_core::{
     digest_enrollment::{DigestEnrollment, OriginManifest},
+    digest_page::page_hash,
     digest_read_snapshot::DigestReadSnapshot,
     media_envelope::{wrap_scheme2, EnvelopeContext},
+    playback_custody::CustodySnapshot,
     s3_locator::{S3Locator, S3MediaMetadata},
 };
 use worker::{
@@ -65,6 +67,27 @@ impl PlaybackFixture {
 
     pub fn digest_page(&self) -> Vec<u8> {
         self.page.clone()
+    }
+
+    pub fn custody(&self, bearer: &str, expires: u32) -> String {
+        serde_json::to_string(&CustodySnapshot {
+            bearer_sha256: sha256(bearer.as_bytes()),
+            catalogue_reference: id(9),
+            reference_id: id(9),
+            identities: self.context.identities,
+            map_id: id(6),
+            plaintext_len: LEN,
+            plaintext_sha256: *self.manifest.plaintext_sha256(),
+            bucket: BUCKET.into(),
+            key: KEY.into(),
+            media_version: VERSION.into(),
+            page_versions: vec![PAGE_VERSION.into()],
+            usable_until_unix: u64::from(expires),
+            header: self.context.header.to_vec(),
+            envelope_record: self.envelope.to_vec(),
+            page_hashes: vec![page_hash(&self.page).unwrap()],
+        })
+        .unwrap()
     }
 
     pub async fn read_digest_page(&self, endpoint: String) -> Result<Vec<u8>, JsValue> {

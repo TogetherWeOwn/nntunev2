@@ -87,6 +87,7 @@ pub mod media_layout;
 pub mod origin_sealer;
 
 pub mod original_source;
+pub mod playback_custody;
 pub mod s3_locator;
 pub mod s3_signing;
 pub mod transcode;

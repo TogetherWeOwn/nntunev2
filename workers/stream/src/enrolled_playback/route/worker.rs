@@ -12,43 +12,14 @@ use crate::{
     runtime::{api_error_response, report_delivered},
 };
 
-pub(crate) enum Unregistered {}
+mod source;
 
-impl ReadbackBody for Unregistered {
-    async fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-        match *self {}
-    }
-}
-
-impl PrivateSource for Unregistered {
-    type Body = Self;
-    async fn resolve(&self, _: &Grant) -> Option<CatalogueMedia<'_>> {
-        match *self {}
-    }
-    async fn lease_live(&self, _: &Grant) -> bool {
-        match *self {}
-    }
-    async fn media(&self, _: S3Get<'_>) -> io::Result<S3GetReply<Self>> {
-        match *self {}
-    }
-    async fn page(
-        &self,
-        _: &str,
-        _: ReadbackPin<'_>,
-        _: u32,
-        _: SystemTime,
-    ) -> io::Result<(String, Vec<u8>)> {
-        match *self {}
-    }
-}
-
-pub(crate) async fn serve<S: PrivateSource + 'static>(
+pub(crate) async fn serve(
     req: Request,
     env: Env,
     ctx: Context,
     request: PlayRouteRequest,
     secret: String,
-    source: Option<S>,
 ) -> Result<Response> {
     let now = || UNIX_EPOCH + Duration::from_millis(Date::now().as_millis());
     let Ok((grant, _)) = grant::verify_private(
@@ -61,6 +32,7 @@ pub(crate) async fn serve<S: PrivateSource + 'static>(
     let mut control = WorkerOriginalControl::until(grant.exp_unix, &req)?;
     let (ready, response) = oneshot::channel();
     ctx.wait_until(async move {
+        let source = source::WorkerSource::from_env(&env, request.token.as_deref().unwrap_or(""));
         let mut ready = Some(ready);
         let mut delivered = None;
         let result = {

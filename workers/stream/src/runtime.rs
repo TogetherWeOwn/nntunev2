@@ -3,9 +3,10 @@
 //!
 //! - The Worker's public `fetch` serves only `GET /play/{track_id}`
 //!   ([`crate::play_route`]): the signed play grant is verified before any
-//!   source is touched (no grant → no bytes), then the requested range is
-//!   served from the R2 popularity cache (`AUDIO_CACHE`) and the
-//!   client-written byte interval of the completed response is reported
+//!   source is touched. Older grants serve ranges from the R2 popularity
+//!   cache (`AUDIO_CACHE`). Private v4 grants serve encrypted ranges only
+//!   with configured custody and a versioned reader. The client-written
+//!   byte interval of the completed response is reported
 //!   to the user's pool Durable Object ([`crate::delivered`]). A cache
 //!   miss answers `502 upstream_unavailable`: the wasm NNTP play adapter
 //!   lands with the operator provider wiring in the follow-up card (the
@@ -67,11 +68,11 @@ const PLAY_GRANT_SECRET_BINDING: &str = "PLAY_GRANT_SECRET";
 /// R2 popularity-cache binding ([`crate::cache`] key layout).
 const AUDIO_CACHE_BINDING: &str = "AUDIO_CACHE";
 /// This Worker's own `NntpPool` Durable Object binding.
-const POOL_BINDING: &str = "NNTP_POOL";
+pub(crate) const POOL_BINDING: &str = "NNTP_POOL";
 /// Delivered-report URL on the pool object (path: [`routes::DELIVERED_PATH`]).
 const POOL_DELIVERED_URL: &str = "https://nntp-pool/delivered";
 /// Service binding to the api Worker (meter sink flush target).
-const API_SERVICE_BINDING: &str = "API";
+pub(crate) const API_SERVICE_BINDING: &str = "API";
 /// Flush URL on the api Worker (path: [`meter_sink::SINK_PATH`]); the
 /// host is never resolved — the service binding routes the fetch.
 const API_SINK_URL: &str = "https://nntune-api/internal/v1/play-windows";
@@ -101,10 +102,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 }
 
-/// Serve one `GET /play/{track_id}` from the R2 popularity cache:
-/// verify the metered grant before touching any source, resolve the HTTP
-/// range against the cached blob, stream exactly that slice, and report
-/// the client-written interval when the response stream settles.
+/// Authorize one `GET /play/{track_id}`, select the source for its grant,
+/// and settle the interval accepted by the response writer.
 async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Result<Response> {
     let Ok(secret) = env.secret(PLAY_GRANT_SECRET_BINDING) else {
         return api_error_response(&ApiError::internal_error(), None);
@@ -122,8 +121,8 @@ async fn play_fetch(req: Request, env: Env, ctx: Context, track_id: &str) -> Res
             range: req.headers().get("range")?,
             trace_id: None,
         };
-        use crate::enrolled_playback::route::worker::{serve, Unregistered};
-        return serve(req, env, ctx, request, secret, None::<Unregistered>).await;
+        return crate::enrolled_playback::route::worker::serve(req, env, ctx, request, secret)
+            .await;
     }
     let now_unix = Date::now().as_millis() / 1000;
     let play = match r2_play::authorize(token, track_id, secret.as_bytes(), now_unix) {
