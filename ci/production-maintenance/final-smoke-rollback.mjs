@@ -2,9 +2,10 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import { readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { smoke } from '../../bin/smoke.mjs';
 import { cloudflare, requireCompletePage } from './seed.mjs';
+import { admitRecovery, intentFile, recoveryContext, workflow } from './recovery-evidence.mjs';
 
-const workflow = '.github/workflows/deploy-production.yml';
 const name = 'nntune-web';
 const deployments = `/scripts/${name}/deployments`;
 const page = '?page=1&per_page=100';
@@ -16,27 +17,36 @@ const matches = (entry, expected) => Array.isArray(entry?.versions) && entry.ver
     actual?.version_id === v.version_id && actual.percentage === v.percentage));
 const seedDigest = createHash('sha256').update(readFileSync(new URL('./worker.mjs', import.meta.url))).digest('hex');
 
-export async function finalSmokeRollback(command, env, request = fetch, now = Date.now) {
+export async function finalSmokeRollback(command, env, request = fetch, now = Date.now, probe = smoke) {
+  const prepare = command === 'prepare-recovery';
+  const recovery = prepare || command === 'recover';
+  if (recovery) recoveryContext(env);
   const { CLOUDFLARE_ACCOUNT_ID: account, CLOUDFLARE_API_TOKEN: token, WORKER_ID: worker,
-    DEPLOY_SHA: sha, DOMAIN: domain, GITHUB_REPOSITORY: repository, GITHUB_RUN_ID: run,
+    DEPLOY_SHA: sha, DOMAIN: domain, GITHUB_REPOSITORY: repository,
     GITHUB_RUN_ATTEMPT: attempt, RUNNER_TEMP: temp, INTENT_KEY: key, ROLLBACK_CUSTODY: custody } = env;
+  const run = recovery ? env.RECOVERY_RUN_ID : env.GITHUB_RUN_ID;
   const context = { schema: 1, repository, workflow, job: 'deploy-production', account, worker, sha, domain, run, attempt };
   if (!hex(account, 32) || !hex(worker, 32) || !hex(sha, 40) || !token || !hex(key, 64) || !temp ||
       !repository || !/^[1-9][0-9]{0,19}$/.test(run ?? '') || attempt !== '1' ||
-      env.GITHUB_JOB !== context.job || env.GITHUB_EVENT_NAME !== 'workflow_dispatch' ||
-      env.GITHUB_REF !== 'refs/heads/main' || env.GITHUB_SHA !== sha || env.GITHUB_WORKFLOW_SHA !== sha ||
-      env.GITHUB_WORKFLOW_REF !== `${repository}/${workflow}@refs/heads/main` ||
+      (!recovery && (env.GITHUB_JOB !== context.job || env.GITHUB_EVENT_NAME !== 'workflow_dispatch' ||
+        env.GITHUB_REF !== 'refs/heads/main' || env.GITHUB_SHA !== sha || env.GITHUB_WORKFLOW_SHA !== sha ||
+        env.GITHUB_WORKFLOW_REF !== `${repository}/${workflow}@refs/heads/main`)) ||
       typeof domain !== 'string' || domain.length > 253 || !/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(domain)) {
     throw new Error('Invalid protected production rollback context');
   }
   const proof = custody?.length <= 4096 ? JSON.parse(custody) : null;
-  const { maintenance, references, checked_at: checkedAt } = proof ?? {};
+  const { maintenance, previous, references, checked_at: checkedAt } = proof ?? {};
+  const target = maintenance ?? previous;
   const stamp = Date.parse(checkedAt);
   if (proof?.account !== account || proof.worker !== worker || proof.sha !== sha || proof.domain !== domain ||
       proof.private_routes_frozen !== true || proof.exclusive_writers !== true || !hex(proof.evidence_sha256, 64) ||
       !Number.isFinite(stamp) || checkedAt !== new Date(stamp).toISOString() ||
-      !uuid(maintenance?.version) || !uuid(maintenance.deployment) || !hex(maintenance.sha, 40) ||
-      maintenance.module_sha256 !== seedDigest || !Array.isArray(references?.domains) || references.domains.length > 1 ||
+      (maintenance != null && previous != null) || !uuid(target?.version) || !uuid(target.deployment) ||
+      !hex(target.sha, 40) || (maintenance ?
+        !hex(maintenance.module_sha256, 64) || (!recovery && maintenance.module_sha256 !== seedDigest) :
+        typeof previous?.tag !== 'string' || !previous.tag.startsWith(`${target.sha}-`) ||
+        !/^[1-9][0-9]{0,15}-1$/.test(previous.tag.slice(41))) ||
+      !Array.isArray(references?.domains) || references.domains.length > 1 ||
       !references.domains.every((entry) => entry?.hostname === domain) ||
       !Object.entries(references).every(([kind, entries]) => kind === 'domains' ||
         (Array.isArray(entries) && entries.length === 0))) {
@@ -49,7 +59,7 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   const custodyDigest = createHash('sha256').update(custody).digest('hex');
   const aad = (path) => Buffer.from(JSON.stringify({ ...context, custody: custodyDigest, file: basename(path) }));
   const secret = Buffer.from(key, 'hex');
-  const intentPath = join(temp, 'production-rollback-intent.sealed');
+  const intentPath = join(temp, intentFile);
   const finalPath = join(temp, 'production-final-allocation.sealed');
   function seal(path, value) {
     const iv = randomBytes(12);
@@ -74,9 +84,12 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
     if (result.id !== worker || result.name !== name || !Number.isFinite(Date.parse(result.deployed_on)) ||
         !isDeepStrictEqual(result.references, references) || result.subdomain?.enabled !== false ||
         result.subdomain.previews_enabled !== false) throw new Error('Worker identity, routes or previews drifted');
-    const { result: seed } = await api(`${pinned}/versions/${maintenance.version}`, 'Maintenance version');
-    if (seed.id !== maintenance.version || seed.annotations?.['workers/tag'] !== maintenance.sha ||
-        !Array.isArray(seed.bindings) || seed.bindings.length !== 0) throw new Error('Maintenance version drifted');
+    const { result: version } = await api(`${pinned}/versions/${target.version}`, 'Rollback target version');
+    const bindings = maintenance ? [] : [{ name: 'ASSETS', type: 'assets' }];
+    if (version.id !== target.version || version.annotations?.['workers/tag'] !== (maintenance?.sha ?? previous.tag) ||
+        !isDeepStrictEqual(version.bindings, bindings)) {
+      throw new Error(maintenance ? 'Maintenance version drifted' : 'Previous version drifted');
+    }
     const history = await api(deployments + page, 'Deployment history');
     const list = history.result.deployments;
     requireCompletePage(history, list, list?.length, 'deployments');
@@ -87,22 +100,25 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   }
 
   const tag = `${sha}-${run}-${attempt}`;
-  const seedOnly = [allocation(maintenance.version)];
-  const isSeed = (row) => row?.id === maintenance.deployment && matches(row, seedOnly);
+  const targetOnly = [allocation(target.version)];
+  const isTarget = (row) => row?.id === target.deployment && matches(row, targetOnly);
   if (command === 'check-seed' || command === 'record') {
     requireFreshCustody();
-    if (!isSeed((await live())[0])) throw new Error('Recorded maintenance deployment is no longer active');
+    if (!isTarget((await live())[0])) throw new Error('Recorded rollback deployment is no longer active');
     if (command === 'check-seed') return;
     const inventory = await api(`${pinned}/versions${page}`, 'Candidate version inventory');
     const list = inventory.result;
     requireCompletePage(inventory, list, list?.length, 'versions');
     const candidates = list.filter((v) => v?.annotations?.['workers/tag'] === tag);
     const candidate = candidates[0]?.id;
-    if (list.length > 100 || candidates.length !== 1 || !uuid(candidate) || candidate === maintenance.version) {
+    if (list.length > 100 || candidates.length !== 1 || !uuid(candidate) || candidate === target.version) {
       throw new Error('Candidate tag did not resolve uniquely on the pinned Worker');
     }
+    if (previous && await probe(`https://${domain}`, { expectedSha: previous.sha, log: () => {} }) !== 0) {
+      throw new Error('Previous build health or identity was not verified');
+    }
     requireFreshCustody();
-    seal(intentPath, { ...context, maintenance, tag, candidate, nonce: randomBytes(16).toString('hex') });
+    seal(intentPath, { ...context, maintenance, previous, tag, candidate, nonce: randomBytes(16).toString('hex') });
     return;
   }
 
@@ -110,36 +126,54 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   // custody carry that proof through final smoke and the same-job restore.
   const intent = unseal(intentPath);
   const { candidate, nonce } = intent;
+  if (!uuid(candidate) || candidate === target.version || !hex(nonce, 32) || intent.tag !== tag ||
+      !isDeepStrictEqual(intent.maintenance ?? intent.previous, target)) throw new Error('Mismatched rollback intent');
   const candidateOnly = [allocation(candidate)];
-  const message = `First-release maintenance recovery ${nonce}`;
+  const targetLabel = maintenance ? 'maintenance' : 'previous Worker';
+  const message = `${maintenance ? 'First-release maintenance' : 'Previous Worker'} recovery ${nonce}`;
   const rollout = (rows) => matches(rows[0], candidateOnly) &&
-    matches(rows[1], [allocation(candidate, 50), allocation(maintenance.version, 50)]) &&
-    matches(rows[2], [allocation(candidate, 5), allocation(maintenance.version, 95)]) && isSeed(rows[3]);
+    matches(rows[1], [allocation(candidate, 50), allocation(target.version, 50)]) &&
+    matches(rows[2], [allocation(candidate, 5), allocation(target.version, 95)]) && isTarget(rows[3]);
   if (command === 'pin-final') {
     const rows = await live();
-    if (env.PROMOTED_VERSION !== candidate || env.PREV_VERSION !== maintenance.version || !rollout(rows)) {
-      throw new Error('Final deployment does not match the recorded first-release rollout');
+    if (env.PROMOTED_VERSION !== candidate || env.PREV_VERSION !== target.version || !rollout(rows)) {
+      throw new Error('Final deployment does not match the recorded rollout');
     }
     seal(finalPath, { nonce, deployment: rows[0].id });
     return;
   }
-  if (command !== 'restore') throw new Error('Invalid rollback operation');
+  if (command !== 'restore' && !recovery) throw new Error('Invalid rollback operation');
 
-  const final = unseal(finalPath);
-  if (final.nonce !== nonce) throw new Error('Final allocation belongs to another rollback intent');
-  const isFinal = (rows) => rows[0]?.id === final.deployment && rollout(rows);
-  const restored = (rows) => matches(rows[0], seedOnly) && rows[0].annotations?.['workers/message'] === message &&
+  const reserved = recovery && !prepare && env.CLAIM_VERIFIED === 'true';
+  const final = recovery && !reserved ? null : unseal(finalPath);
+  if (final && final.nonce !== nonce) throw new Error('Final allocation belongs to another rollback intent');
+  const isFinal = (rows) => (!final || rows[0]?.id === final.deployment) && rollout(rows);
+  const restored = (rows) => matches(rows[0], targetOnly) && rows[0].annotations?.['workers/message'] === message &&
     isFinal(rows.slice(1));
-  const before = await live();
-  if (restored(before)) return 'Recorded maintenance allocation already verified';
-  if (!isFinal(before)) throw new Error('Stale intent or newer or foreign active deployment');
+  const alreadyVerified = `Recorded ${targetLabel} allocation already verified`;
+  if (reserved) {
+    const age = now() - final.checkedAt;
+    if (!Number.isFinite(age) || age < 0 || age > 120_000) throw new Error('Recovery allocation proof expired');
+    if (final.deployment === null) return alreadyVerified;
+  } else {
+    if (recovery) {
+      const { result: version } = await api(`${pinned}/versions/${candidate}`, 'Recorded candidate version');
+      if (version.id !== candidate || version.annotations?.['workers/tag'] !== tag) throw new Error('Candidate version drifted');
+    }
+    const before = await live();
+    const complete = restored(before);
+    if (!complete && !isFinal(before)) throw new Error('Stale intent or newer or foreign active deployment');
+    if (prepare) return seal(finalPath, { nonce, deployment: complete ? null : before[0].id, checkedAt: now() });
+    if (complete) return alreadyVerified;
+    if (recovery) throw new Error('Recovery is readback only; reconcile any previous submission');
+  }
   // The Actions lock serializes participating jobs. Custody must exclude every
   // other writer because the provider has no deployment compare-and-set.
   writeFileSync(join(temp, 'production-rollback-submitted'), '', { mode: 0o600, flag: 'wx' });
   let acknowledged;
   try {
-    const { result } = await api(deployments, 'Restore maintenance', {
-      strategy: 'percentage', versions: seedOnly, annotations: { 'workers/message': message },
+    const { result } = await api(deployments, 'Restore recorded allocation', {
+      strategy: 'percentage', versions: targetOnly, annotations: { 'workers/message': message },
     });
     if (uuid(result.id)) acknowledged = result.id;
   } catch {
@@ -149,12 +183,15 @@ export async function finalSmokeRollback(command, env, request = fetch, now = Da
   if (!restored(after) || (acknowledged && after[0].id !== acknowledged)) {
     throw new Error('Restore result unresolved; reconcile allocation and provider audit before any retry');
   }
-  return acknowledged ? 'Recorded maintenance allocation verified' : 'Recorded maintenance allocation reconciled by readback';
+  return `Recorded ${targetLabel} allocation ${acknowledged ? 'verified' : 'reconciled by readback'}`;
 }
 
 if (import.meta.main) {
   try {
-    const verdict = await finalSmokeRollback(process.argv[2], process.env);
+    const command = process.argv[2];
+    const env = { ...process.env };
+    if (command === 'admit-recovery') delete process.env.INTENT_KEY; // Withhold from subprocesses.
+    const verdict = command === 'admit-recovery' ? admitRecovery(env) : await finalSmokeRollback(command, env);
     if (verdict) console.log(verdict);
   } catch {
     // Errors may contain protected input or provider data. Keep details in private custody.

@@ -59,7 +59,7 @@ function artifactName(sha, runId, attempt) {
   return `production-promotion-${sha}-${runId}-${attempt}`;
 }
 
-function verifyPromotion({ repo, sha }) {
+function productionEvidence(repo) {
   requireProof(
     /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) &&
       repo === process.env.GITHUB_REPOSITORY &&
@@ -141,7 +141,7 @@ function verifyPromotion({ repo, sha }) {
     command("git", ["merge-base", "--is-ancestor", run.head_sha, "origin/main"], 4096);
   }
 
-  function fromRun(runId, attempt) {
+  function source(runId, attempt) {
     const run = api(`runs/${runId}/attempts/${attempt}`);
     validateRun(run, runId, attempt);
     const jobs = list(`runs/${runId}/attempts/${attempt}/jobs`, "jobs");
@@ -153,11 +153,15 @@ function verifyPromotion({ repo, sha }) {
         id(job.run_id) === runId &&
         id(job.run_attempt) === attempt &&
         job.status === "completed" &&
-        job.conclusion === "success" &&
         Array.isArray(job.steps) &&
         job.steps.length <= MAX_ITEMS,
-      "deploy job did not succeed in the selected attempt",
+      "invalid deploy job in the selected attempt",
     );
+    return { run, job };
+  }
+
+  function requirePublishedJob(job) {
+    requireProof(job.conclusion === "success", "deploy job did not succeed in the selected attempt");
     let previous = 0;
     for (const name of STEPS) {
       const matches = job.steps.filter((step) => step.name === name);
@@ -172,7 +176,10 @@ function verifyPromotion({ repo, sha }) {
       );
       previous = step.number;
     }
-    const name = artifactName(sha, runId, attempt);
+  }
+
+  function artifactFor(run, name) {
+    const runId = id(run.id);
     const artifacts = list(`runs/${runId}/artifacts`, "artifacts").filter(
       (artifact) => artifact.name === name,
     );
@@ -200,6 +207,17 @@ function verifyPromotion({ repo, sha }) {
       ["api", "--method", "GET", `repos/${repo}/actions/artifacts/${id(artifact.id)}/zip`],
       MAX_ARCHIVE,
     );
+    return { artifact, archive };
+  }
+  return { command, list, source, artifactFor, validateRun, workflow, requirePublishedJob };
+}
+
+function verifyPromotion({ repo, sha }) {
+  const { command, list, source, artifactFor, validateRun, workflow, requirePublishedJob } = productionEvidence(repo);
+  function fromRun(runId, attempt) {
+    const { run, job } = source(runId, attempt);
+    requirePublishedJob(job);
+    const { artifact, archive } = artifactFor(run, artifactName(sha, runId, attempt));
     // Read a fixed bounded member in memory; never gh run download/unzip or
     // filesystem extraction of untrusted paths. Python's stdlib checks CRC too.
     const bytes = command(
@@ -260,4 +278,4 @@ function verifyPromotion({ repo, sha }) {
   );
 }
 
-module.exports = { verifyPromotion, validateReceipt, artifactName };
+module.exports = { verifyPromotion, validateReceipt, artifactName, productionEvidence };

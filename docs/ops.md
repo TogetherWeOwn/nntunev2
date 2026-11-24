@@ -1243,7 +1243,7 @@ shape check — no credentials, no network — that reads key names only and
 never reads or prints values
 (`ci/check-production-secrets-shape.mjs:6-7`).
 
-### First-release recovery after failed final smoke
+### Protected production Worker recovery
 
 App promotion stays disabled. Before first release, verify empty production
 state with a read-only check, take a snapshot before the first schema change,
@@ -1261,12 +1261,18 @@ and preview settings and seals the intent before traffic shifts. Custody
 evidence must be at most 30 minutes old when sealing. Keep the freeze in
 place through recovery readback even if final smoke runs past that window.
 The maintenance module digest must also match the reviewed candidate checkout.
+For later releases, replace `maintenance` with `previous` containing `version`,
+`deployment`, `sha`, and full `tag`. Sealing requires 100% allocation and build smoke.
 
-Failed final smoke keeps the release red. The same lock covers recovery, which
-requires the exact final deployment and submits maintenance at 100% once.
-On ambiguity reconcile Worker, allocation, routes and provider audit before
-any further action. Verify maintenance behavior and private Access denials on
-the isolated candidate. Post-watch and cancellation need separate admission.
+Failed final smoke invokes the same-job restore and leaves the release red.
+For regression during the 30-minute watch or interruption at 100%, dispatch
+`recover-worker` on `main` with the promoted `sha` and original `recovery_run_id`
+(attempt 1). Keep the original custody, key, accepted SHA and writer freeze.
+The approval and shared mutation lock apply even with new deployments disabled.
+
+Recovery verifies the intent and rollout before reservation. The plan expires
+after two minutes. Reconcile an expired or ambiguous reservation against audit.
+Verify restored build health and identity or the private maintenance behavior.
 
 ### First private release handoff
 

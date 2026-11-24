@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { finalSmokeFixture } from './fixtures/production-worker-transport.mjs';
+import { finalSmokeFixture, mainSha, recoveryError, recoveryFixture } from './fixtures/production-worker-transport.mjs';
+import { admitRecovery } from './production-maintenance/recovery-evidence.mjs';
 import { seedMaintenance } from './production-maintenance/seed.mjs';
 import worker from './production-maintenance/worker.mjs';
 
@@ -42,11 +43,11 @@ test('only exact-main bootstrap uses the protected production job after staging 
   assert.doesNotMatch(preflight[1], /secrets\./);
   const staging = workflow.split('\n  staging-evidence:\n')[1].split('\n  deploy-production:\n')[0];
   assert.match(staging, /needs: \[preflight\][\s\S]*?environment:\n      name: staging\n      deployment: false/);
-  const guard = staging.match(/UNPROTECTED_CF_CONFIG: \$\{\{ secrets\.PRODUCTION_CLOUDFLARE_API_TOKEN != '' \|\| secrets\.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' \}\}\n          UNPROTECTED_ROLLBACK_CONFIG: \$\{\{ inputs\.mode == 'promote' && \(secrets\.PRODUCTION_ROLLBACK_CUSTODY != '' \|\| secrets\.PRODUCTION_ROLLBACK_INTENT_KEY != ''\) \}\}\n        run: \|\n([\s\S]*?)          python3 -/);
+  const guard = staging.match(/UNPROTECTED_CF_CONFIG: \$\{\{ secrets\.PRODUCTION_CLOUDFLARE_API_TOKEN != '' \|\| secrets\.PRODUCTION_CLOUDFLARE_ACCOUNT_ID != '' \}\}\n          UNPROTECTED_ROLLBACK_CONFIG: \$\{\{ inputs\.mode != 'bootstrap-maintenance' && \(secrets\.PRODUCTION_ROLLBACK_CUSTODY != '' \|\| secrets\.PRODUCTION_ROLLBACK_INTENT_KEY != ''\) \}\}\n        run: \|\n([\s\S]*?)          python3 -/);
   assert.ok(guard);
   for (const [credentials, rollback] of [['false', 'false'], ['true', 'false'], ['', 'false'], ['false', 'true'], ['false', '']]) {
     assert.equal(spawnSync('/bin/bash', ['-c', guard[1]], {
-      env: { UNPROTECTED_CF_CONFIG: credentials, UNPROTECTED_ROLLBACK_CONFIG: rollback }, timeout: 5_000,
+      env: { DEPLOY_MODE: 'recover-worker', UNPROTECTED_CF_CONFIG: credentials, UNPROTECTED_ROLLBACK_CONFIG: rollback }, timeout: 5_000,
     }).status, credentials === 'false' && rollback === 'false' ? 0 : 1);
   }
   const job = workflow.split('\n  bootstrap-maintenance:\n')[1].split('\n  release:\n')[0];
@@ -296,4 +297,80 @@ test('only a failed executed final smoke can restore under the production lock',
   }
   assert.match(job, /if: failure\(\) && !cancelled\(\) && steps\.final-allocation\.outcome == 'success' && steps\.final-smoke\.outcome == 'failure'\n        env: \*rollback-env\n        run: node ci\/production-maintenance\/final-smoke-rollback\.mjs restore/);
   assert.match(job, /Record successful production promotion\n        if: inputs\.mode == 'promote'/);
+});
+
+test('a regression during the release watch restores the verified previous Worker', async (t) => {
+  const transport = finalSmokeFixture(t, rollbackFixture, 'ack', 'previous');
+  await assert.rejects(transport.run('record', {}, now, async () => 1), /Previous build health/);
+  await transport.run('record', {}, now, async (url, { expectedSha }) => {
+    assert.deepEqual([url, expectedSha], ['https://test.example.com', transport.custody.previous.sha]);
+    return 0;
+  });
+  transport.shift();
+  await transport.run('pin-final');
+  const { fresh, enter } = recoveryFixture(t, transport, 'success');
+  assert.match(await enter(fresh('13')), /previous Worker allocation verified/);
+  assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
+});
+
+test('an interrupted 100% promotion can recover maintenance from a fresh runner', async (t) => {
+  const transport = finalSmokeFixture(t, { ...rollbackFixture, sha: mainSha() }, 'lost');
+  await transport.run('record');
+  transport.shift();
+  const { fresh, enter, claimedRecovery } = recoveryFixture(t, transport, 'cancelled');
+  assert.equal(existsSync(join(transport.temp, 'production-final-allocation.sealed')), false);
+  await assert.rejects(claimedRecovery(fresh('13'), now, false), /invalid or stale/);
+  for (const age of [-1, 120_001, NaN]) {
+    await assert.rejects(claimedRecovery(fresh('13'), () => now() + age), /proof expired/);
+  }
+  assert.ok(transport.calls.every((method) => method === 'GET'));
+  transport.fail.nextRead = true;
+  await assert.rejects(enter(fresh('13')), /Cloudflare request/);
+  assert.match(await enter(fresh('14')), /reconciled by readback/);
+  assert.match(await enter(fresh('15')), /already verified/);
+  assert.match(await claimedRecovery(fresh('16'), now), /already verified/);
+  assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
+});
+
+test('recovery refuses superseding deployments and any second unresolved submission', async (t) => {
+  const transport = finalSmokeFixture(t, rollbackFixture, 'unresolved');
+  await transport.run('record');
+  transport.shift();
+  const { fresh, enter } = recoveryFixture(t, transport, 'timed_out');
+  await assert.rejects(enter(fresh('13')), /Restore result unresolved/);
+  await assert.rejects(enter(fresh('14')), /readback only/);
+  transport.rows.unshift({ ...transport.rows[0], id: transport.id(8), created_on: new Date(now() + 8000).toISOString() });
+  await assert.rejects(enter(fresh('15')), /newer or foreign/);
+  transport.rows[0].versions = [{ version_id: version, percentage: 100 }];
+  await assert.rejects(enter(fresh('16')), /newer or foreign/);
+  assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
+});
+
+test('recovery refuses unapproved or altered evidence and reconciles a prior final-smoke write only', async (t) => {
+  const transport = finalSmokeFixture(t, rollbackFixture, 'unresolved');
+  await transport.prepare();
+  const { fresh, enter, artifact, evidence, steps } = recoveryFixture(t, transport, 'failure');
+  assert.throws(() => admitRecovery({ ...fresh('13'), ACCEPTED_SHA: 'c'.repeat(40) }, evidence), /Invalid protected/);
+  const digest = artifact.digest;
+  artifact.digest = 'sha256:' + 'b'.repeat(64);
+  assert.throws(() => admitRecovery(fresh('13'), evidence), /digest mismatch/);
+  artifact.digest = digest;
+  steps.push({ name: 'Restore recorded maintenance after failed final smoke', status: 'completed', conclusion: 'failure', number: 30 });
+  await assert.rejects(enter(fresh('13')), /readback only/);
+  assert.ok(transport.calls.every((method) => method === 'GET'));
+});
+
+test('protected recovery wiring keeps the production lock and contains source and provider errors', () => {
+  const job = workflow.split('\n  recover-worker:\n')[1].split('\n  release:\n')[0];
+  assert.match(job, /if: inputs.mode == 'recover-worker'\n    needs: \[preflight, staging-evidence\]/);
+  assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false\n    environment: production/);
+  const [proof, restore] = job.split('      - name: Verify the allocation before reserving a recovery submission');
+  assert.doesNotMatch(proof, /secrets\.(?:PRODUCTION_CLOUDFLARE|PRODUCTION_ROLLBACK_CUSTODY)/);
+  assert.match(restore, /CLAIM_VERIFIED: \$\{\{ steps\.claim\.outcome == 'success' \}\}[\s\S]*?prepare-recovery[\s\S]*?upload-artifact@[0-9a-f]{40}[\s\S]*?env: \*recovery-env[\s\S]*?rollback\.mjs recover/);
+  for (const command of ['admit-recovery', 'recover']) {
+    const result = recoveryError(command);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Protected rollback check failed/);
+    assert.doesNotMatch(result.stdout + result.stderr, /fixture-private|Invalid protected/);
+  }
 });
