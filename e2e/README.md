@@ -211,10 +211,10 @@ from the post-deploy staging journey:
    and the authorized Range response against the served representation.
    Compare rendered queue IDs and use Next to verify the active track ID
    changes to the second selection.
-5. Revoke the redeemed invitee's cohort access while keeping private mode
-   configured. Check Library, play issuance and heartbeat refusal using the
-   same previously working session. Refresh Library and check that the
-   curated rows disappear. Follow the runbook's signed-grant expiry boundary.
+5. Keep private mode configured while the cohort expires. Check Library and
+   same-play browser Retry refusal using the previously working session, and
+   repeat the authorized media range request. Refresh Library and check that
+   the curated rows disappear. Follow the runbook's signed-grant expiry boundary.
 
 Use only synthetic identities and media. Keep video and synced lyrics disabled,
 and qualify paid signup, checkout and renewal separately. Keep invite codes,
