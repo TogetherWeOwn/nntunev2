@@ -51,7 +51,18 @@ def refused(role, connection):
 
 def exercise():
     assert run(ROLE, 2, OBSERVER) == (2, None)
-
+    sql("UPDATE billing_preflight.scope SET retained = true WHERE stripe_invoice_id = 'in_fixture_3'")
+    check(2, exact=1, eligible_hydration=1, incomplete=1)
+    sql("""UPDATE billing_preflight.scope SET retained = false, user_id = 'other_fixture'
+           WHERE stripe_invoice_id = 'in_fixture_3';
+           UPDATE billing_preflight.projection SET user_id = 'other_fixture'
+           WHERE stripe_invoice_id = 'in_fixture_3';""")
+    check(1, exact=1, eligible_hydration=1, collision=1)
+    sql("DELETE FROM billing_preflight.scope WHERE stripe_invoice_id = 'in_fixture_3'")
+    assert run(ROLE, 2, OBSERVER) == (2, None)  # Count matches, but a projection is out of scope.
+    sql("""INSERT INTO billing_preflight.scope VALUES ('in_fixture_3', 'user_fixture', 'sub_fixture', false);
+           UPDATE billing_preflight.projection SET user_id = 'user_fixture'
+           WHERE stripe_invoice_id = 'in_fixture_3';""")
     # The old item-plan report retains a different plan. The old takeover
     # report retains a shorter span even after exact coverage was hydrated.
     sql("""UPDATE public.paid_invoice_history SET plan_id = 'pro'
@@ -111,12 +122,15 @@ def exercise_entrypoint():
         assert env["PGHOST"] == "staging.example.test" and env["PGSSLMODE"] == "verify-full"
         assert env["PGUSER"] == ROLE and env["PGDATABASE"] == DATABASE
         assert "PGHOSTADDR" not in env and "PGSERVICE" not in env
+        assert env["PGPASSFILE"] == "/dev/null" and env["PGGSSENCMODE"] == "disable"
+        assert env["PGSSLROOTCERT"] == "/etc/ssl/certs/ca-certificates.crt"
         assert env["PGPASSWORD"] == ADMIN["PGPASSWORD"] and env["PGPASSWORD"] not in argv
         return real_run(argv, env=OBSERVER, **options)
 
     with patch.object(subprocess, "run", side_effect=loopback) as psql:
         for host in ("/var/run/postgresql", "staging.example.test,other.example.test"):
             assert invoke({**env, "BILLING_PREFLIGHT_HOST": host}) == (3, "", "refused\n")
+        assert invoke({**env, "BILLING_PREFLIGHT_PASSWORD": ""}) == (3, "", "refused\n")
         psql.assert_not_called()
         status, out, err = invoke(env)
         assert (status, err) == (0, "")
@@ -131,17 +145,12 @@ def main():
         migration_dir = SCRIPTS.parents[1] / "migrations"
         sql("\n".join((migration_dir / name).read_text() for name in MIGRATIONS))
         sql((SCRIPTS.parent / "fixtures/billing_history_preflight.sql").read_text())
-        before = archive_counts()
         exercise_entrypoint()
-        assert archive_counts() == before == "2|1\n"
+        assert sql("SELECT count(*), count(covered_periods) FROM public.paid_invoice_history") == "2|1\n"
         exercise()
     finally:
         sql(f"DROP DATABASE {DATABASE}; DROP ROLE IF EXISTS {ROLE};", "postgres")
     print("Invoice history preflight fixture passed")
-
-
-def archive_counts():
-    return sql("SELECT count(*), count(covered_periods) FROM public.paid_invoice_history")
 
 
 if __name__ == "__main__":

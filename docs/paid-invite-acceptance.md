@@ -52,44 +52,32 @@ Check Worker error logs for unresolved scheduled targets.
 
 ## Invoice history preflight
 
-Run the [read-only preflight](../.github/scripts/billing_history_preflight.py)
-from the exact candidate checkout inside an approved private runner that
-holds the prepared evidence and the staging observer credential. It runs
-only with `NNTUNE_INVOICE_PREFLIGHT=1`. Set `BILLING_PREFLIGHT_HOST` to the
-independently verified staging PostgreSQL origin on port 5432 and
-`BILLING_PREFLIGHT_ROLE` to its approved restricted login. Supply
-`BILLING_PREFLIGHT_PASSWORD` through the runner's secret environment.
-The client verifies TLS and checks the session's database and role before
-reading evidence. Provision the observer with global invoice-key visibility
-and reads limited to the required columns and prepared evidence.
+Run the [read-only preflight](../.github/scripts/billing_history_preflight.py) with
+Python from the exact candidate checkout in the approved private runner.
+Set `NNTUNE_INVOICE_PREFLIGHT=1`, `BILLING_PREFLIGHT_HOST` to the independently
+verified staging origin on port 5432, and `BILLING_PREFLIGHT_ROLE` to its
+approved observer login. Supply `BILLING_PREFLIGHT_PASSWORD` as a runner secret.
+The observer needs global invoice-key visibility and access limited to the
+required columns and prepared evidence. The client verifies TLS, database and role.
 
-Pin the candidate, staging origin, schema, Stripe test account, scope and
-evidence cutoff. In the approved perimeter, prepare a fixed batch in
+Pin the schema, Stripe test account and cutoff. Prepare one stable batch in
 `billing_preflight.scope` and `billing_preflight.projection`. Both use text
-`stripe_invoice_id` (unique globally), `user_id` and `stripe_subscription_id`.
-Scope covers existing subscription targets only. Inventory the union of relevant
-retained and currently eligible keys, including retained targets that can return
-to an advancing state. First-time Checkout is covered by the paid invite journey.
-Set the boolean `retained` per scope key and pass the independent denominator
-as `BILLING_PREFLIGHT_SCOPE_COUNT` (1–10,000). Use stable relations for one
-batch and keep the scope and archive aligned to the same observation.
+`stripe_invoice_id` (globally unique), `user_id` and `stripe_subscription_id`.
+Scope covers existing subscription targets, including retained targets that can
+return to advancing states. Inventory the union of relevant retained and eligible
+keys at the cutoff, set boolean `retained` per key and pass the independent
+`BILLING_PREFLIGHT_SCOPE_COUNT` (1–10,000). The paid invite journey covers first-time Checkout.
 
-Use the candidate's fold at the pinned time for each projection. Set the
-boolean `evidence_complete` only after checking exact ownership and provider
-bindings and exhausting both invoice and line pages. The projection carries
-text `plan_id` and `currency`, bigint `amount_cents`, `start_s`, `end_s`
-and `paid_s` (whole Unix seconds), and paired bigint arrays `starts` and
-`ends` for up to 1,000 half-open periods. Two empty arrays represent
-unknown exact coverage. Reporting start and end may coincide. A missing
-projection or missing subscription target counts as incomplete.
+Project the candidate's fold using current target and price bindings at the same
+observation. Set boolean `evidence_complete` after verifying ownership and
+provider bindings and exhausting invoice and line pages. Each projection carries
+text `plan_id` and `currency`, bigint `amount_cents`, `start_s`, `end_s` and `paid_s`
+(Unix seconds), and paired bigint arrays `starts` and `ends` for up to 1,000 half-open
+periods. Two empty arrays mean unknown coverage. Reporting endpoints may coincide.
 
-The command emits one JSON object of counts (`total`, `exact`,
-`eligible_hydration`, `fresh`, `collision`, `incomplete`) for an admitted
-comparison. Exit 0 requires a complete batch without collisions. Exit 1
-reports a collision, including when other items are incomplete. Exit 2
-reports incomplete evidence or the fixed diagnostic `scope_incomplete`
-when the inventory does not reconcile. Exit 3 gives a fixed `disabled` or
-`refused` diagnostic. Keep identities, projections, credentials and database
-diagnostics inside the approved perimeter. Recheck if scope, inputs or candidate
-drift. Effective writer privileges and any legacy provenance decision are
-separate activation prerequisites.
+The report is one JSON object with `total`, `exact`, `eligible_hydration`, `fresh`,
+`collision` and `incomplete` counts. Exit 0 means complete and collision-free.
+Exit 1 means collision. Exit 2 means incomplete evidence, including missing targets
+or projections. An inventory mismatch exits 2 with `scope_incomplete` instead.
+Exit 3 gives `disabled` or `refused`. Keep identities, projections, credentials and DB
+diagnostics private. Recheck on drift. Writer privileges and legacy provenance are separate prerequisites.
