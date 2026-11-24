@@ -61,7 +61,7 @@ class IdentityTests(unittest.TestCase):
         read = MagicMock(side_effect=[current(), version(mode, sha="e" * 40)])
         with self.assertRaisesRegex(identity.Unavailable, "version-build-mismatch"):
             identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "false")
-        read = MagicMock(side_effect=[current(), version(mode)])
+        read = MagicMock(side_effect=[current(), version(dict(mode, text="true"))])
         with self.assertRaisesRegex(identity.Unavailable, "stream-mode-mismatch"):
             identity.receipt(output_stream, SHA, ACCOUNT, read, identity.STREAM, "false")
 
