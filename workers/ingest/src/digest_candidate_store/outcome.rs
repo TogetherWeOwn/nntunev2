@@ -1,5 +1,3 @@
-//! Off-route database outcome. Only the recorded retry result can be replayed.
-
 use tokio_postgres::{Client, IsolationLevel, Transaction};
 
 use super::{stage_completed_candidate, uuid, CandidateIntent, InventoryAppendError};
@@ -44,11 +42,10 @@ impl CompletionScope<'_> {
     }
 }
 
-/// First operation in a dedicated READ COMMITTED transaction. The caller
-/// supplies already-authorized scope, live lease, custody and retention. It
-/// owns outer commit and acknowledges only after commit. A failed staging
-/// attempt rolls back both effects. Roll back the outer transaction on error
-/// or cancellation, and use the scoped reader after an ambiguous commit.
+/// Stage as the first operation of a dedicated READ COMMITTED transaction.
+/// Supply authorized scope, a live lease, custody and retention. Report success after outer commit.
+/// Roll back the outer transaction on error or cancellation. Reconcile an ambiguous commit
+/// through the scoped reader.
 pub async fn stage_completion(
     tx: &mut Transaction<'_>,
     scope: &CompletionScope<'_>,
@@ -93,10 +90,8 @@ pub async fn stage_completion(
     }
 }
 
-/// The dedicated writer connection waits for the earlier session transaction.
-/// The authorizer rechecks live grants and revocation using the locked scope.
-/// Replay is bounded by the authorization, session and winner retention deadlines.
-/// `Ok(None)` is a scoped observation and never permits storage completion.
+/// Use the writer connection to lock the session and recheck live authorization under that lock.
+/// Replay expires with authorization, the session or retention. A scoped absence stops completion.
 pub async fn read_completion(
     db: &mut Client,
     scope: &CompletionScope<'_>,
