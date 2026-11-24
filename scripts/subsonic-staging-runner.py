@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rehearse the reviewed Subsonic schedule against an in-memory staging model."""
+"""Bound Subsonic staging POSTs and rehearse the schedule in memory."""
 
 import argparse
 import hashlib
@@ -243,13 +243,32 @@ class StagingPostTransport:
         The caller must inject the dedicated staging measurement Access pair and bearer.
         Do not use shared QA, health or deploy credentials. There is no credential discovery or fallback.
         """
-        slots, limits = self._matrix["slots"], self._matrix["limits"]
+        slots = self._matrix["slots"]
         require(type(number) is int and 1 <= number <= len(slots), "unreviewed-slot")
-        require(type(deadline) is float and math.isfinite(deadline), "invalid-deadline")
         _validate_access(access_client_id, access_client_secret)
         bearer, api_key = _validate_credentials(bearer, api_key)
         slot = slots[number - 1]
         post = _prepare_post(slot, bearer, api_key)
+        return self._send(slot, post, access_client_id, access_client_secret,
+                          deadline, cancel, (bearer, api_key, quote_plus(api_key)))
+
+    def probe_off(self, *, deadline, cancel, access_client_id, access_client_secret):
+        """Send only the reviewed negative control, without either app credential."""
+        _validate_access(access_client_id, access_client_secret)
+        slot = self._matrix["slots"][4]
+        post = _prepare_post(slot, "", "")
+        require(
+            slot.get("auth") == "omit_both"
+            and slot["expected"]["oracle"] == "fixed_staging_off"
+            and post.url == STAGING_ORIGIN + "/rest/getArtists",
+            "off-probe-refused",
+        )
+        return self._send(slot, post, access_client_id, access_client_secret, deadline, cancel)
+
+    def _send(self, slot, post, access_client_id, access_client_secret, deadline, cancel,
+              app_credentials=()):
+        limits = self._matrix["limits"]
+        require(type(deadline) is float and math.isfinite(deadline), "invalid-deadline")
         reader = slot.get("reader", "normal")
         timeout_ms = limits["request_timeout_ms"]
         if reader != "normal":
@@ -303,7 +322,7 @@ class StagingPostTransport:
         # Do not return credential reflections in a proxy or application response.
         fields = (response.content_type, response.cache_control, response.retry_after)
         exposed = (response.body, *(value.encode("ascii") for value in fields if value is not None))
-        for value in (access_client_id, access_client_secret, bearer, api_key, quote_plus(api_key)):
+        for value in (access_client_id, access_client_secret, *app_credentials):
             credential = value.encode("ascii")
             require(not any(credential in part for part in exposed), "credential-reflected")
         return response
