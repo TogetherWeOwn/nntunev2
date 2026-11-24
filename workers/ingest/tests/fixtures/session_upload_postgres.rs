@@ -55,8 +55,9 @@ async fn assert_claim(observer: &Client, session: &str, object: &str, expected: 
 fn synthetic_receipt<'a>(
     context: &EnvelopeContext,
     key: &'a str,
-    xml_upload_id: &str,
+    upload_id: &str,
 ) -> InitiatedUpload<'a> {
+    let xml_upload_id = quick_xml::escape::escape(upload_id);
     InitiatedUpload::verify(
         context.identities[5],
         BUCKET,
@@ -151,6 +152,7 @@ async fn postgres_fences_the_provider_id_handoff() {
         offset: 0,
     };
     let key = format!("media/{object}/{generation}");
+    let provider_id = format!("{PROVIDER_ID}{}", "x".repeat(4096 - PROVIDER_ID.len()));
     let until = SystemTime::now() + Duration::from_secs(60);
     let upload = handoff(
         &mut writer,
@@ -201,14 +203,14 @@ async fn postgres_fences_the_provider_id_handoff() {
                 .await
                 .unwrap();
             assert!(advanced.is_none());
-            Ok(synthetic_receipt(&context, &key, "fixture+/=?&amp;opaque"))
+            Ok(synthetic_receipt(&context, &key, &provider_id))
         },
     )
     .await
     .unwrap();
     // A separate connection sees the ID before the first part can use it.
-    assert_claim(&observer, session, &object, Some(PROVIDER_ID)).await;
-    assert_eq!(upload.target().upload_id, PROVIDER_ID);
+    assert_claim(&observer, session, &object, Some(&provider_id)).await;
+    assert_eq!(upload.target().upload_id, provider_id);
     assert_eq!(upload.usable_until(), until);
     let binding = ResumeBinding {
         plan: Plan {
@@ -246,7 +248,18 @@ async fn postgres_fences_the_provider_id_handoff() {
     )
     .await
     .unwrap();
-    assert_eq!(replay.target().upload_id, PROVIDER_ID);
+    assert_eq!(replay.target().upload_id, provider_id);
+    for invalid_id in [format!("{provider_id}x"), "id\n".into(), String::new()] {
+        let invalid = observer
+            .execute(
+                "UPDATE public.ingest_session_reservations SET multipart_upload_id = $2
+             WHERE id = $1::text::uuid",
+                &[&session, &invalid_id],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code(), Some(&SqlState::CHECK_VIOLATION));
+    }
     for (scope, bucket) in [
         (
             CompletionScope {
@@ -323,7 +336,7 @@ async fn postgres_fences_the_provider_id_handoff() {
     )
     .await
     .unwrap();
-    assert_eq!(replay.target().upload_id, PROVIDER_ID);
+    assert_eq!(replay.target().upload_id, provider_id);
 
     context.identities[3] = id(0xb6);
     context.identities[4] = id(0xb7);
