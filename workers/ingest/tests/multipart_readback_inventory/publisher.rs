@@ -1,5 +1,6 @@
 use super::{
-    id, ReadbackFixture, BUCKET, CONFIGURATION, FINAL_VERSION, FLAC, SCOPE, SHARED_VERSION,
+    id, MemoryBody, ReadbackFixture, BUCKET, CONFIGURATION, FINAL_VERSION, FLAC, SCOPE,
+    SHARED_VERSION,
 };
 use nntune_ingest::{
     admin_auto_publish::CommittedFlac,
@@ -9,7 +10,7 @@ use nntune_ingest::{
         stage_completed_candidate, CandidateIntent,
         InventoryAppendError::{Identity, MissingOrFenced},
     },
-    multipart::readback_inventory::ReadbackScope,
+    multipart::{readback_inventory::ReadbackScope, MultipartError},
 };
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
@@ -295,11 +296,30 @@ async fn postgres_stages_completed_candidate_atomically() {
     let map = hex::encode(map_id);
     let key = format!("media/{object}/{generation}");
     let page_key = format!("media-digests/{object}/{generation}/{map}/00000000");
+    assert!(matches!(
+        ReadbackFixture::complete(&padded, identities, map_id, &key, false),
+        Err(MultipartError::Checksum)
+    ));
     let second = ReadbackFixture::in_scope(&padded, identities, map_id, &key);
     let receipts = [second.sidecar_at(0, &page_key, FINAL_VERSION)];
     let inventory = second.inventory(&receipts);
+    let corrupt = inventory
+        .verify_with_flac_seek(SCOPE, second.envelope(), async |_, pin| {
+            let mut response = second.response_with_keys(pin, &key, &page_key);
+            if pin.object_key == key {
+                response.response.body = MemoryBody(Some(&[]));
+            }
+            Ok(response)
+        })
+        .await;
+    assert!(corrupt.is_err());
+    assert!(observer
+        .query_opt(INVENTORY, &[&map])
+        .await
+        .unwrap()
+        .is_none());
     let second_verified = inventory
-        .verify(SCOPE, second.envelope(), async |_, pin| {
+        .verify_with_flac_seek(SCOPE, second.envelope(), async |_, pin| {
             Ok(second.response_with_keys(pin, &key, &page_key))
         })
         .await
@@ -370,5 +390,13 @@ async fn postgres_stages_completed_candidate_atomically() {
             page_versions: &[FINAL_VERSION],
         },
     });
-    auto_publish::exercise(&observer, &mut writer, &objects, committed).await;
+    auto_publish::exercise(
+        &observer,
+        &mut writer,
+        &mut contender,
+        &objects,
+        committed,
+        corrupt.ok().as_ref(),
+    )
+    .await;
 }

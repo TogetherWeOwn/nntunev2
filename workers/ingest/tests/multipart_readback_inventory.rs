@@ -8,17 +8,21 @@ use nntune_core::{
     media::PLAIN_CHUNK_SIZE,
     media_envelope::{wrap_scheme2, EnvelopeContext},
     origin_sealer::SealedChunk,
+    s3_locator::{S3Binding, S3Locator},
 };
 use nntune_ingest::{
     digest_candidate_store::{
         append_inventory, stage_validated_winner, CandidateIntent, InventoryAppendError,
     },
     multipart::{
+        head_receipt::HeadReceipt,
         readback_inventory::{
             BucketReadbackResponse, CompletedReadbackInventory, InventoryError, ReadbackScope,
         },
+        resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
+        session_completion::SessionCompletion,
         sidecar::{CompletedSidecar, SidecarPut, SidecarPutReply},
-        CompletedVersionedMedia, Plan, UploadTarget, VersionedCompletionReply,
+        CompletedVersionedMedia, MultipartError, Plan, UploadTarget, VersionedCompletionReply,
     },
 };
 use sha2::{Digest, Sha256};
@@ -84,6 +88,16 @@ impl ReadbackFixture {
     }
 
     fn in_scope(plaintext: &[u8], identities: [[u8; 16]; 6], map_id: [u8; 16], key: &str) -> Self {
+        Self::complete(plaintext, identities, map_id, key, true).unwrap()
+    }
+
+    fn complete(
+        plaintext: &[u8],
+        identities: [[u8; 16]; 6],
+        map_id: [u8; 16],
+        key: &str,
+        checksum_matches: bool,
+    ) -> Result<Self, MultipartError> {
         let plaintext_len = plaintext.len() as u64;
         let mut enrollment =
             DigestEnrollment::new(plaintext_len, identities[1..].try_into().unwrap(), map_id)
@@ -125,16 +139,28 @@ impl ReadbackFixture {
         parts.extend(partition.finish().unwrap());
         let mut media_bytes = Vec::new();
         let mut composite = Sha256::new();
+        let mut checkpoint_parts = Vec::new();
         let uploads = parts
             .iter()
             .map(|part| {
-                let (_, _, bytes, checksum) = part.request();
+                let (_, number, bytes, checksum) = part.request();
                 media_bytes.extend_from_slice(bytes);
-                composite.update(STANDARD.decode(checksum).unwrap());
+                let digest = Sha256::digest(bytes).into();
+                composite.update(digest);
+                checkpoint_parts.push(CheckpointPart {
+                    number,
+                    len: bytes.len(),
+                    etag: "synthetic",
+                    digest,
+                });
                 part.verify_reply("synthetic".into(), checksum).unwrap()
             })
             .collect();
-        let composite = STANDARD.encode(composite.finalize());
+        let mut composite = composite.finalize();
+        if !checksum_matches {
+            composite[0] ^= 1;
+        }
+        let composite = STANDARD.encode(composite);
         let body = format!(
             "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{key}</Key>\
              <ChecksumSHA256>{composite}-{}</ChecksumSHA256></CompleteMultipartUploadResult>",
@@ -146,9 +172,40 @@ impl ReadbackFixture {
             body: body.as_bytes(),
             version_headers: &[SHARED_VERSION],
         };
-        let completion = plan.complete(uploads).unwrap();
-        let media = completion.verify_versioned_reply(&context, reply).unwrap();
-        Self {
+        let [_, environment, library, object, generation, _] = identities.map(hex::encode);
+        let binding = ResumeBinding {
+            plan,
+            environment: &environment,
+            library: &library,
+            session: &object,
+            object: &object,
+            generation: &generation,
+            envelope_scheme: 2,
+        };
+        let checkpoint = ResumeCheckpoint {
+            binding,
+            parts: &checkpoint_parts,
+        };
+        let completion =
+            SessionCompletion::prepare(binding, &context, uploads, &checkpoint).unwrap();
+        let media = completion.verify_completion(reply)?;
+        let observed = S3Locator::new(
+            BUCKET.into(),
+            key.into(),
+            S3Binding::VersionId(SHARED_VERSION.into()),
+        )
+        .unwrap();
+        media
+            .verify_head(
+                &context,
+                Some(HeadReceipt {
+                    configuration: Some(CONFIGURATION),
+                    locator: Some(&observed),
+                    content_length: Some(media_bytes.len() as u64),
+                }),
+            )
+            .unwrap();
+        Ok(Self {
             map_id,
             origin: enrollment.finish().unwrap(),
             context,
@@ -156,7 +213,7 @@ impl ReadbackFixture {
             media,
             media_bytes,
             page_bytes,
-        }
+        })
     }
 
     fn sidecar(&self) -> CompletedSidecar<'_> {
