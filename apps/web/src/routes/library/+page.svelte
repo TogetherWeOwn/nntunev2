@@ -282,7 +282,7 @@
 		$state.raw({ status: '', fallbackUrl: null, forQueue: null });
 	const queueShare = createQueueShare({
 		getQueue: () => queueController.snapshot,
-		getPosition: () => player.streamFor(queueCurrentTrack(queueController.snapshot)) ? media.audio?.currentTime : 0,
+		getPosition: media.sharePosition,
 		getOrigin: () => window.location.origin,
 		getClipboard: clipboardWriter,
 		shortTitle,
@@ -685,7 +685,7 @@
 		if (!item || loading) return;
 		const current = queueCurrentTrack(queueController.snapshot);
 		const seconds =
-			current?.id === id && player.streamFor(current) ? media.audio?.currentTime : 0;
+			current?.id === id ? media.sharePosition() : 0;
 		if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return;
 		let url: string;
 		try {

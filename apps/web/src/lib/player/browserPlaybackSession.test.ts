@@ -5,10 +5,10 @@ test('new plays use the acknowledged mode in the same tab and continuations keep
 	const system = captureSystemActions();
 	const { player, media, queue, fetchFn, starts, refresh, src, attach, toggleDuringFirstPlay, requests } = setup();
 	media.captureShareSeek(media.beginShareInput(), { trackId: 'first', seconds: 18 }, () => true);
-	expect([player.privateListening?.enabled, src(), fetchFn.mock.calls.length]).toEqual([false, '', 0]);
+	expect([player.privateListening?.enabled, src(), fetchFn.mock.calls.length, media.sharePosition()]).toEqual([false, '', 0, 0]);
 	await toggleDuringFirstPlay();
 	const first = src(), tab = first.split('/')[5];
-	expect([first, media.audio?.currentTime]).toEqual([`/v1/plays/media/first/${tab}/play-1`, 18]);
+	expect([first, media.sharePosition()]).toEqual([`/v1/plays/media/first/${tab}/play-1`, 18]);
 	const audio = attach();
 	expect(player.privateListening?.enabled).toBe(true);
 	refresh();

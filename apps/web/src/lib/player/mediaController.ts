@@ -694,6 +694,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		get pendingShareSeek() { return pendingShare.current; },
 		get attachmentVersion() { return attachmentVersion; },
 		get audio() { return current?.audio; },
+		sharePosition: () => selectedSource() ? current?.audio.currentTime : 0,
 		get attachment(): MediaAttachment | undefined { return current; },
 		attach(audio: HTMLAudioElement): () => void {
 			if (destroyed || queue.purging) return () => {};
