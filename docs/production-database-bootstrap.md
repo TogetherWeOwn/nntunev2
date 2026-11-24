@@ -245,12 +245,12 @@ Reconcile shared ACLs separately if activation refuses. The fixture uses direct 
 physical relations. Only the protected read-only caller may use the credential, since its
 SQL role grants permit reading the underlying rows.
 
-Keep exclusive custody over schema, grants and the role. On completion or failure, commit
-the login and password fence before draining sessions and revoking the exact scoped grants.
-Require the retired result and SQL success. Discard a still-pending login from maintenance
-if setup did not finish. For live use, wire the SQL to protected custody, bind the runner to
-the issued role OID and remove and read back the Environment pins and 0600 connection
-reference on every exit. Reconcile uncertain commits before another attempt.
+Serialize lifecycle calls and hold schema and grant custody until retirement. On completion
+or failure, fence the reader from maintenance, then drain sessions and revoke launch grants.
+Require the retired result and SQL success. Maintenance retirement also handles readers with
+no remaining grants, including interrupted setup. Wire live calls to protected custody and
+bind the runner to the issued role OID. Remove and read back Environment pins and the 0600
+connection reference on every exit. Reconcile uncertain commits before another attempt.
 
 ### Setup role custody and lifecycle
 

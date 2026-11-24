@@ -627,12 +627,14 @@ def prove_reader_lifecycle(cluster, pending):
     cluster.denied("refuse the wider PUBLIC column grant", activate, "reader scope refused", **launch)
     cluster.ok("remove the synthetic wider grant", "REVOKE UPDATE (id) ON reader_scope.leaf FROM PUBLIC;", database=LAUNCH)
     cluster.denied("roll back partial grants if a required grant option is missing", activate,
-                   "reader coverage missing", **launch)
+                   "ERROR:  42501:", **launch)
     cluster.ok("verify refusal preserved both credential and CONNECT fences", f"""
         SELECT rolpassword IS NULL AND NOT has_database_privilege(oid, '{LAUNCH}', 'CONNECT')
         FROM pg_authid WHERE oid = {oid};
         GRANT SELECT ON reader_scope.leaf TO {READER_ISSUER} WITH GRANT OPTION;
     """, "t\n", database=LAUNCH)
+    cluster.denied("refuse an overlong credential", lifecycle.activate(raw, oid, expiry + 300, password),
+                   "reader scope refused", **launch)
     holder = None
     try:
         expiry = int(time.time()) + 15
@@ -649,16 +651,16 @@ def prove_reader_lifecycle(cluster, pending):
         cluster.denied("refuse to retire before fencing", lifecycle.retire(raw, oid), "reader retirement refused", **launch)
         tls = setup.tls_environment(cluster.directory, lifecycle.plan, LAUNCH, BASELINE_READER, password)
         holder = subprocess.Popen(
-            ["/usr/bin/psql", "-XqAtw"], env=tls, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            ["/usr/bin/psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"], env=tls, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        holder.stdin.write(b"SELECT 1;\n")
+        holder.stdin.write(f"SELECT (rolvaliduntil = to_timestamp({expiry}))::int FROM pg_roles WHERE oid = {oid};\n".encode())
         holder.stdin.flush()
         require(select.select([holder.stdout], [], [], 3)[0] and holder.stdout.readline() == b"1\n",
                 "observe a surviving reader session before retirement")
     finally:
         env.pop("BASELINE_READER_PASSWORD", None)
-        cluster.ok("deny logins and clear the credential in a separate commit", lifecycle.fence(raw, oid), **launch)
+        cluster.ok("fence the reader from maintenance", lifecycle.fence(oid), role=READER_ISSUER)
         cluster.ok("read back the cleared credential", f"""
             SELECT NOT rolcanlogin AND rolpassword IS NULL AND rolvaliduntil = 'epoch'::timestamptz
             FROM pg_authid WHERE oid = {oid};
@@ -666,8 +668,8 @@ def prove_reader_lifecycle(cluster, pending):
         cluster.ok("revoke the scoped grants and read back role and session absence", lifecycle.retire(raw, oid),
                    "retired\n", **launch)
         if holder is not None:
-            holder.communicate(timeout=3)
-            require(holder.returncode != 0, "observe the reader server session terminate")
+            stdout, _ = holder.communicate(b"SELECT 1;\n", timeout=3)
+            require(holder.returncode != 0 and not stdout, "observe the reader server session terminate")
         cluster.ok("restore the disposable maintenance grants and remove fixture relations", f"""
             GRANT CONNECT ON DATABASE postgres, template1 TO PUBLIC;
             DROP SCHEMA reader_scope CASCADE;
@@ -773,9 +775,14 @@ def exercise(*, interrupt):
                 if not interrupt:
                     refuse_before_create(cluster)
                     verify_quiet_failure(cluster)
-                pending = None if interrupt else prepare_baseline_reader(cluster)
-                prove_setup_caller(cluster, interrupt=interrupt, reader=READER if interrupt else BASELINE_READER)
-                if not interrupt:
+                pending = prepare_baseline_reader(cluster)
+                prove_setup_caller(cluster, interrupt=interrupt, reader=BASELINE_READER)
+                if interrupt:
+                    reader_lifecycle, reader_oid, _ = pending
+                    cluster.ok("fence the pending reader", reader_lifecycle.fence(reader_oid), role=READER_ISSUER)
+                    cluster.ok("discard the pending reader", reader_lifecycle.retire(None, reader_oid),
+                               "retired\n", role=READER_ISSUER)
+                else:
                     prove_baseline(cluster)
                     prove_reader_lifecycle(cluster, pending)
                     verify_launch_grants(cluster)

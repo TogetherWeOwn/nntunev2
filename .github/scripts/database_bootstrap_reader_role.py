@@ -150,7 +150,8 @@ class ReaderRoleLifecycle(RoleLifecycle):
     ALTER ROLE {self.role} PASSWORD '{scram_verifier(password)}' VALID UNTIL '{until}';
 """, plan=self._bound_plan(raw_baseline), require_owner=True)
 
-    def fence(self, raw_baseline, oid):
+    def fence(self, oid):
+        # The role is cluster-wide. Fence it even if the launch database is unavailable.
         receipt = role_oid(oid)
         return self._run(f"""
     IF target IS NOT NULL THEN
@@ -159,10 +160,21 @@ class ReaderRoleLifecycle(RoleLifecycle):
         END IF;
         ALTER ROLE {self.role} NOLOGIN PASSWORD NULL VALID UNTIL 'epoch';
     END IF;
-""", plan=self._bound_plan(raw_baseline))
+""")
 
     def retire(self, raw_baseline, oid):
         receipt = role_oid(oid)
+        plan = None if raw_baseline is None else self._bound_plan(raw_baseline)
+        # From maintenance, DROP ROLE itself refuses any surviving grant or ownership.
+        revoke = f"""
+        FOR item IN {PHYSICAL_RELATIONS} LOOP
+            EXECUTE format('REVOKE SELECT ON TABLE %I.%I FROM %I', item.nspname, item.relname, '{self.name}');
+        END LOOP;
+        FOR item IN SELECT DISTINCT nspname FROM ({PHYSICAL_RELATIONS}) relations LOOP
+            EXECUTE format('REVOKE USAGE ON SCHEMA %I FROM %I', item.nspname, '{self.name}');
+        END LOOP;
+        EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM %I', current_database(), '{self.name}');
+""" if plan else ""
         return self._run(f"""
     IF target IS NOT NULL THEN
         IF target <> {receipt} OR NOT EXISTS (
@@ -171,23 +183,10 @@ class ReaderRoleLifecycle(RoleLifecycle):
             RAISE EXCEPTION 'reader retirement refused';
         END IF;
         {DRAIN_SESSIONS}
-        FOR item IN {PHYSICAL_RELATIONS} LOOP
-            EXECUTE format('REVOKE SELECT ON TABLE %I.%I FROM %I', item.nspname, item.relname, '{self.name}');
-        END LOOP;
-        FOR item IN SELECT DISTINCT nspname FROM ({PHYSICAL_RELATIONS}) relations LOOP
-            EXECUTE format('REVOKE USAGE ON SCHEMA %I FROM %I', item.nspname, '{self.name}');
-        END LOOP;
-        EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM %I', current_database(), '{self.name}');
+        {revoke}
         DROP ROLE {self.role};
     END IF;
-""", self._absence(receipt), plan=self._bound_plan(raw_baseline))
-
-    def discard_pending(self, oid):
-        receipt = role_oid(oid)
-        return self._run(self._pending(receipt) + f"DROP ROLE {self.role};", self._absence(receipt))
-
-    def _absence(self, receipt):
-        return f"""
+""", f"""
 SELECT 'retired' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE oid = {receipt} OR rolname = '{self.name}')
   AND NOT EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = {receipt});
-"""
+""", plan=plan)
