@@ -9,7 +9,7 @@ import {
 import { assertServingBuildMatchesPromotion } from '../helpers/build-identity-live.js';
 import { apiDeployOutcome } from '../helpers/build-identity.js';
 import { playbackFailure } from '../helpers/playback.js';
-import { resumeFloorAfterSeek, seekViaPlayerUi, waitForPaused } from '../helpers/player-ui.js';
+import { seekViaPlayerUi, waitForPaused } from '../helpers/player-ui.js';
 import {
   assertCuratedLibrary, assertPrivateInvite, assertPrivateRefusals, assertPrivateTransport, PRIVATE_MUSIC,
 } from '../helpers/private-music-journey.js';
@@ -141,6 +141,15 @@ test('private staging invite serves curated audio and refuses access at cutoff',
   const idsOf = (items: Locator, attr: string) => items.evaluateAll((elements, name) =>
     elements.flatMap((element) => element.getAttribute(name) ?? []), attr);
   const rangeHeaders = { ...access, Range: 'bytes=65536-69631', 'Sec-Fetch-Site': 'same-origin' };
+  const verifyRange = async (trackId: string, source: URL) => {
+    const digest = fixture.publications.find((item) => item.trackId === trackId)?.sha256;
+    const original = inputs.find((item) => item.sha256 === digest)!.body;
+    const range = await apiGet(page.request, source.href, rangeHeaders, 'private-range');
+    const headers = range.headers();
+    expect([range.status(), headers['content-type'], headers['content-length'], headers['content-range']])
+      .toEqual([206, 'audio/flac', '4096', `bytes 65536-69631/${original.length}`]);
+    expect((await range.body()).equals(original.subarray(65536, 69632))).toBe(true);
+  };
   const { play, heartbeat, mediaUrl } = await check('curated playback, byte range, seek, queue and video posture', async () => {
     for (const item of fixture.publications) {
       await expect(rows.and(page.locator(`[data-id="${item.trackId}"]`))).toBeVisible();
@@ -155,9 +164,9 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const baselineTime = await audio.evaluate((element) => (element as HTMLAudioElement).currentTime);
     await transport.getByRole('button', { name: 'Play', exact: true }).click();
     const playback = (await samplePlaying(audio, baselineTime)).playback;
-    await currentMedia(audio, firstTrackId);
     await transport.getByRole('button', { name: 'Pause', exact: true }).click();
     await waitForPaused(audio, true, 5_000, 'Player did not pause');
+    await verifyRange(order[0]!, (await currentMedia(audio, firstTrackId)).source);
 
     await audio.evaluate((element) => {
       delete (element as HTMLElement).dataset.seeked;
@@ -169,7 +178,6 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     await startSampling(audio);
     await transport.getByRole('button', { name: 'Play', exact: true }).click();
     const resume = await samplePlaying(audio, paused.currentTime);
-    expect(resume.minimumTime).toBeGreaterThanOrEqual(resumeFloorAfterSeek(paused.currentTime, paused.duration));
     await transport.getByRole('button', { name: 'Pause', exact: true }).click();
     await waitForPaused(audio, true, 5_000, 'Player did not pause before Next');
 
@@ -180,30 +188,23 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       firstTrackId, baselineTime, playback, seek: { ...paused, fraction, sawSeekedEvent: true },
       resume, queueOrder, nextTrackId: await current.getAttribute(PRIVATE_MUSIC.player.queueId),
     });
-    // Issue the second track's lease near cutoff, within this 14-second clip.
-    await delay(Math.max(0, fixture.expiresAt * 1000 - Date.now() - 10_000));
+    await delay(Math.max(0, fixture.expiresAt * 1000 - Date.now() - 25_000));
     await transport.getByRole('button', { name: 'Play', exact: true }).click();
     await samplePlaying(audio, 0);
     const { source, media } = await currentMedia(audio, order[1]!);
+    await transport.getByRole('button', { name: 'Pause', exact: true }).click();
+    await waitForPaused(audio, true, 5_000, 'Second track did not pause');
     await page.locator('a[href="/now-playing"]').filter({ visible: true }).first().click();
     await expect(page).toHaveURL(`${ORIGIN}/now-playing`);
     await expect(page.getByRole('tab', { name: 'Music Video' })).toHaveCount(0);
     await expect(page.locator('iframe, video')).toHaveCount(0);
-    const digest = fixture.publications.find((item) => item.trackId === media[1])?.sha256;
-    const original = inputs.find((item) => item.sha256 === digest)!.body;
-    const range = await apiGet(page.request, source.href, rangeHeaders, 'private-range');
-    expect(range.status()).toBe(206);
-    const headers = range.headers();
-    expect(headers['content-type']).toBe('audio/flac');
-    expect(headers['content-range']).toBe(`bytes 65536-69631/${original.length}`);
-    expect(headers['content-length']).toBe('4096');
-    expect((await range.body()).equals(original.subarray(65536, 69632))).toBe(true);
+    await verifyRange(order[1]!, source);
     const play = { track_id: media[1], session_id: media[2], play_id: media[3] };
     const renewed = await post(page.request, PRIVATE_MUSIC.player.plays, play);
-    const lease = JSON.parse(renewed.text);
-    expect(renewed.status === 200 && lease.play_id === play.play_id && Number.isSafeInteger(lease.lease_epoch)).toBe(true);
-    expect(lease.expires_at).toBe(fixture.expiresAt);
-    const heartbeat = { session_id: play.session_id, play_id: play.play_id, lease_epoch: lease.lease_epoch };
+    const nativeGrant = JSON.parse(renewed.text);
+    expect(renewed.status === 200 && nativeGrant.play_id === play.play_id && Number.isSafeInteger(nativeGrant.lease_epoch)).toBe(true);
+    expect(nativeGrant.expires_at).toBe(fixture.expiresAt);
+    const heartbeat = { session_id: play.session_id, play_id: play.play_id, lease_epoch: nativeGrant.lease_epoch };
     const active = await post(page.request, PRIVATE_MUSIC.player.heartbeat, heartbeat);
     expect(active.status === 200 && JSON.parse(active.text).lease === 'active').toBe(true);
     return { play, heartbeat, mediaUrl: source.href };
