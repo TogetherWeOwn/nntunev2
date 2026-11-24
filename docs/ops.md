@@ -1093,7 +1093,9 @@ as lowercase UUIDv4 identifiers for the dedicated synthetic namespace. Staging
 API and Stream use the same S3 configuration, bucket, and root-version IDs.
 Keep the cohort setting, root key, custody secret and play-grant key in
 staging Worker secret custody. The shared gate validates all API and Stream
-settings before either deploy starts. Arm only once the browser API adapter
+settings before either deploy starts. The armed web build waits for both
+Workers to report successful deployments from the same run and commit.
+Arm only once the browser API adapter
 and its receipt store, Stream runtime, and Library client are on the candidate.
 Before accepting the trial, verify a browser disconnect through the relay
 closes the upstream read and settles only the acknowledged byte prefix.

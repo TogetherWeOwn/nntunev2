@@ -958,7 +958,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     // Both lanes: needing only staging-web let the journey run against the
     // previous api while the new one was still deploying.
     expect(section).toContain('needs: [staging-web, staging-api]');
-    expect(jobIf(deployWorkflow, 'staging-api')).toBe(jobIf(deployWorkflow, 'staging-web'));
+    expect(jobIf(deployWorkflow, 'staging-api')).toContain("github.event_name == 'push' && needs.gate.outputs.enabled == 'true'");
     expect(section).toContain('uses: $/.github/workflows/e2e-staging.yml');
     expect(section).toMatch(/post_deploy: true/);
 

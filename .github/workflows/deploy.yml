@@ -127,8 +127,8 @@ jobs:
 
   staging-web:
     name: staging-web
-    needs: [gate]
-    if: ${{ github.event_name == 'push' && needs.gate.outputs.enabled == 'true' }}
+    needs: [gate, staging-api, staging-stream]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.gate.result == 'success' && needs.gate.outputs.enabled == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Protected staging environment; deployment uses repository credentials.
@@ -142,6 +142,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify armed playback deployments
+        if: ${{ needs.gate.outputs.browser_playback == '1' }}
+        env:
+          API_RESULT: ${{ needs.staging-api.result }}
+          API_SOURCE_SHA: ${{ needs.staging-api.outputs.source_sha }}
+          STREAM_RESULT: ${{ needs.staging-stream.result }}
+          STREAM_SOURCE_SHA: ${{ needs.staging-stream.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$API_RESULT" = success
+          test "$STREAM_RESULT" = success
+          test "$API_SOURCE_SHA" = "$GITHUB_SHA"
+          test "$STREAM_SOURCE_SHA" = "$GITHUB_SHA"
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}

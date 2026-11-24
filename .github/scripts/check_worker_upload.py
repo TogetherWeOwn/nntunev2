@@ -292,11 +292,30 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
         condition = "        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}"
         check(condition in preflight.splitlines() and gate.splitlines().count(condition) == 2,
               "trial preflight and its checkout must run when either arm is configured")
+        check("        id: trial" in preflight.splitlines(), "missing trial preflight output ID")
         check("browser_playback: ${{ steps.trial.outputs.browser_playback || '0' }}" in gate,
               "the protected gate must supply a default-off browser mode")
-        web_build = step_text(job_text(wf_text, "staging-web"), "Build staging web")
+        web = job_text(wf_text, "staging-web")
+        check("    needs: [gate, staging-api, staging-stream]" in web.splitlines(),
+              "the web deploy must wait for the API and Stream jobs")
+        web_build = step_text(web, "Build staging web")
         check("PUBLIC_BROWSER_PLAYBACK: ${{ needs.gate.outputs.browser_playback }}" in web_build,
               "the browser build must use the validated trial gate result")
+        readiness = step_text(web, "Verify armed playback deployments")
+        check("        if: ${{ needs.gate.outputs.browser_playback == '1' }}" in readiness,
+              "same-run deployment verification must run for armed playback only")
+        for prefix, lane in (("API", "staging-api"), ("STREAM", "staging-stream")):
+            for key, source in (("RESULT", "result"), ("SOURCE_SHA", "outputs.source_sha")):
+                mapping = f"          {prefix}_{key}: $" + "{{ needs." + lane + "." + source + " }}"
+                check(mapping in readiness.splitlines(), f"armed web missing {prefix}_{key} mapping")
+        ready_env = {**env, "API_RESULT": "success", "STREAM_RESULT": "success",
+                     "GITHUB_SHA": sha, "API_SOURCE_SHA": sha, "STREAM_SOURCE_SHA": sha}
+        ready_args = ["bash", "-e", "-c", run_script(readiness)]
+        ready = run(ready_args, cwd=tree, env=ready_env, label="armed browser can deploy")
+        check(ready.returncode == 0, "armed web refused successful same-build Workers")
+        for key in ("API_RESULT", "STREAM_RESULT", "API_SOURCE_SHA", "STREAM_SOURCE_SHA"):
+            bad = run(ready_args, cwd=tree, env={**ready_env, key: ""}, label=f"armed web refuses missing {key}")
+            check(bad.returncode != 0, f"armed web accepted missing {key}")
         check_variable_mappings(preflight, trial)
         stream_dir = tree / "workers/stream"
         stream_dir.mkdir()
