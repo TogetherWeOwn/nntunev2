@@ -313,9 +313,11 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
         ready_args = ["bash", "-e", "-c", run_script(readiness)]
         ready = run(ready_args, cwd=tree, env=ready_env, label="armed browser can deploy")
         check(ready.returncode == 0, "armed web refused successful same-build Workers")
-        for key in ("API_RESULT", "STREAM_RESULT", "API_SOURCE_SHA", "STREAM_SOURCE_SHA"):
-            bad = run(ready_args, cwd=tree, env={**ready_env, key: ""}, label=f"armed web refuses missing {key}")
-            check(bad.returncode != 0, f"armed web accepted missing {key}")
+        other_sha = ("1" if sha[0] == "0" else "0") + sha[1:]
+        for key, value in (("API_RESULT", "failure"), ("STREAM_RESULT", "skipped"),
+                           ("API_SOURCE_SHA", other_sha), ("STREAM_SOURCE_SHA", other_sha)):
+            bad = run(ready_args, cwd=tree, env={**ready_env, key: value}, label=f"armed web refuses wrong {key}")
+            check(bad.returncode != 0, f"armed web accepted wrong {key}")
         check_variable_mappings(preflight, trial)
         stream_dir = tree / "workers/stream"
         stream_dir.mkdir()
