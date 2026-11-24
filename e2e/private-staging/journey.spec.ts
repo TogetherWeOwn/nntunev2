@@ -18,6 +18,8 @@ import { parsePrivateStagingFixture, privateStagingAudio } from '../helpers/priv
 const ORIGIN = 'https://staging.nntune.com';
 const REGISTER = '/v1/auth/passkey/register';
 const MEDIA = /^\/v1\/plays\/media\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)$/;
+const BROWSER_SELECTOR = 'x-nntune-browser-playback';
+const BROWSER_BINDING = 'x-nntune-session-binding';
 
 // Suppress underlying browser and API diagnostics, which can include a URL,
 // request headers or the value typed into a form. The step name is fixed.
@@ -162,11 +164,27 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const audio = page.getByTestId(PRIVATE_MUSIC.player.audio);
     const transport = page.getByRole('region', { name: 'Player', exact: true });
     const baselineTime = await audio.evaluate((element) => (element as HTMLAudioElement).currentTime);
-    await transport.getByRole('button', { name: 'Play', exact: true }).click();
+    const [start] = await Promise.all([
+      page.waitForResponse((response) => response.url() === `${ORIGIN}${PRIVATE_MUSIC.player.plays}` &&
+        response.request().method() === 'POST' && response.request().headers()[BROWSER_SELECTOR] === '1'),
+      transport.getByRole('button', { name: 'Play', exact: true }).click(),
+    ]);
     const playback = (await samplePlaying(audio, baselineTime)).playback;
     await transport.getByRole('button', { name: 'Pause', exact: true }).click();
     await waitForPaused(audio, true, 5_000, 'Player did not pause');
-    await verifyRange(order[0]!, (await currentMedia(audio, firstTrackId)).source);
+    const first = await currentMedia(audio, firstTrackId);
+    const binding = start.request().headers()[BROWSER_BINDING];
+    const ack = await start.json();
+    expect(start.status() === 200 && !!binding && ack.sessionBinding === binding &&
+      ack.trackId === first.media[1] && ack.playbackSessionId === first.media[2] && ack.playId === first.media[3] &&
+      Number.isSafeInteger(ack.durationMs) && ack.durationMs > 0 && Object.keys(ack).length === 5).toBe(true);
+    const retryHeaders = { ...access, [BROWSER_SELECTOR]: '1', [BROWSER_BINDING]: binding! };
+    const retry = await post(page.request, PRIVATE_MUSIC.player.plays, {
+      track_id: first.media[1], session_id: first.media[2], play_id: first.media[3],
+    }, retryHeaders);
+    expect(retry.status).toBe(200);
+    expect(JSON.parse(retry.text)).toEqual(ack);
+    await verifyRange(order[0]!, first.source);
 
     await audio.evaluate((element) => {
       delete (element as HTMLElement).dataset.seeked;
