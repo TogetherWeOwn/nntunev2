@@ -20,6 +20,7 @@ use crate::enrolled_playback::{EnrolledMedia, EnrolledPlayback};
 const BUCKET: &str = "fixture-media";
 const KEY: &str = "media/00000000000040008000000000000003/00000000000040008000000000000004";
 const VERSION: &str = "version+/%?=&";
+const PAGE_VERSION: &str = "page+/%?=&";
 const LEN: u64 = 65_537;
 const ROOT: [u8; 32] = [7; 32];
 
@@ -60,6 +61,41 @@ pub fn make_s3_fixture() -> PlaybackFixture {
 impl PlaybackFixture {
     pub fn ciphertext(&self) -> Vec<u8> {
         self.cipher.clone()
+    }
+
+    pub fn digest_page(&self) -> Vec<u8> {
+        self.page.clone()
+    }
+
+    pub async fn read_digest_page(&self, endpoint: String) -> Result<Vec<u8>, JsValue> {
+        let result = async {
+            let reader = S3Reader::new(
+                id(5),
+                BUCKET.into(),
+                &endpoint,
+                "fixture-1".into(),
+                "FixtureAccess".into(),
+                Zeroizing::new("fixture-reader-signing-material".into()),
+            )?;
+            let lifecycle = KEY.strip_prefix("media/").unwrap();
+            let key = format!("media-digests/{lifecycle}/{}/00000000", hex(&id(6)));
+            let pin = ReadbackPin {
+                configuration: id(5),
+                object_key: &key,
+                version: Some(PAGE_VERSION),
+            };
+            let (_, bytes) = reader
+                .page(
+                    BUCKET,
+                    pin,
+                    self.page.len() as u32,
+                    now() + Duration::from_secs(5),
+                )
+                .await?;
+            Ok::<_, io::Error>(bytes)
+        }
+        .await;
+        result.map_err(|_| JsValue::from_str("storage read refused"))
     }
 
     pub async fn play(

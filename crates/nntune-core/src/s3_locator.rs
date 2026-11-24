@@ -94,7 +94,7 @@ impl S3Locator {
     }
 }
 
-fn valid_bucket(bucket: &str) -> bool {
+pub fn valid_bucket(bucket: &str) -> bool {
     let mut labels = bucket.split('.');
     (3..=63).contains(&bucket.len())
         && labels.clone().all(|label| {
