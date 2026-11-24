@@ -87,7 +87,7 @@ pub(super) async fn exercise(
         detail
     );
 
-    // Hold the last active membership removal open while another append starts.
+    // Hold each kind of membership loss open while another append starts.
     let pending = body(route(ctx, &owner, db, Create("Pending".into())).await, 201);
     let pending_id = pending["id"].as_str().unwrap();
     let mut peer = connect().await;
@@ -95,29 +95,35 @@ pub(super) async fn exercise(
     let pid = "SELECT pg_backend_pid()";
     let holder = remover.query_one_scalar(pid, &[]).await.unwrap();
     let waiter = peer.query_one_scalar(pid, &[]).await.unwrap();
-    let tx = remover.transaction().await.unwrap();
-    let removed = tx
-        .execute(
-            "DELETE FROM public.library_tracks WHERE library_id = $1::text::uuid",
-            &[&active],
-        )
-        .await
-        .unwrap();
-    assert_eq!(removed, 1);
-    let late = route(ctx, &owner, &mut peer, Append(pending_id, track.to_owned()));
-    tokio::pin!(late);
-    blocker::observe_blocked(db, holder, waiter, late.as_mut())
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    assert_denied(late.await);
-    let pending = body(route(ctx, &owner, db, Read(pending_id)).await, 200);
-    assert_eq!(pending["entries"], json!([]));
-    let detail = body(route(ctx, &owner, db, Read(playlist)).await, 200);
-    assert_eq!(
-        detail["entries"],
-        json!([{"id": appended["id"], "position": 0, "dormant": true}])
-    );
+    let fence = "UPDATE public.libraries SET deleting_at = now() WHERE id = $1::text::uuid";
+    let remove = "DELETE FROM public.library_tracks WHERE library_id = $1::text::uuid";
+    for change in [fence, remove] {
+        if change == remove {
+            // Restore eligibility before exercising removal of the membership row.
+            let clear = "UPDATE public.libraries SET deleting_at = NULL WHERE id = $1::text::uuid";
+            assert_eq!(db.execute(clear, &[&active]).await.unwrap(), 1);
+            assert_eq!(
+                body(route(ctx, &owner, db, Read(playlist)).await, 200),
+                detail
+            );
+        }
+        let tx = remover.transaction().await.unwrap();
+        assert_eq!(tx.execute(change, &[&active]).await.unwrap(), 1);
+        let late = route(ctx, &owner, &mut peer, Append(pending_id, track.to_owned()));
+        tokio::pin!(late);
+        blocker::observe_blocked(db, holder, waiter, late.as_mut())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_denied(late.await);
+        let pending = body(route(ctx, &owner, db, Read(pending_id)).await, 200);
+        assert_eq!(pending["entries"], json!([]));
+        let dormant = body(route(ctx, &owner, db, Read(playlist)).await, 200);
+        assert_eq!(
+            dormant["entries"],
+            json!([{"id": appended["id"], "position": 0, "dormant": true}])
+        );
+    }
 
     let deleted = body(route(ctx, &owner, db, Delete(playlist)).await, 202);
     assert!(deleted["operation_id"].is_string());
