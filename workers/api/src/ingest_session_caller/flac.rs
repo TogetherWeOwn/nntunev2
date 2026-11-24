@@ -4,23 +4,23 @@ use std::ops::Range;
 
 use nntune_core::s3_locator::S3MediaMetadata;
 
-use super::{CommittedOutcome, OpenedUpload, VerifiedCompletedReadback};
+use super::{CommittedOutcome, VerifiedCompletedReadback};
 
 #[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]
 use {
     super::{
-        Authorization, CompletionScope, CurrentAuthorization, Refused, StoreError, Unconfirmed,
-        UploadError,
+        Authorization, CompletionScope, CurrentAuthorization, OpenedUpload, Refused, StoreError,
+        Unconfirmed, UploadError,
     },
     nntune_core::digest_readback::EnrolledReadbackError,
+    nntune_ingest::multipart::readback_inventory::CompletedReadbackInventory,
+    std::time::SystemTime,
     tokio_postgres::Client,
 };
 #[cfg(target_arch = "wasm32")]
 use {
     nntune_core::digest_readback::EnrolledEnvelope,
-    nntune_ingest::multipart::{
-        readback_inventory::CompletedReadbackInventory, s3_completion::S3CompletionSender,
-    },
+    nntune_ingest::multipart::s3_completion::S3CompletionSender,
 };
 
 /// Indexed, authenticated FLAC bound to the exact scoped completion result.
@@ -46,12 +46,13 @@ impl CommittedFlacUpload<'_, '_> {
     }
 }
 
+#[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]
 impl OpenedUpload<'_> {
     /// Read the immutable ciphertext and sidecars reported by the completed
     /// upload, then use the existing writer and fenced result reader. Use the
     /// exact completion receipts and independently trusted envelope as input.
     #[cfg(target_arch = "wasm32")]
-    pub async fn commit_signed_flac<'inventory, 'receipts>(
+    pub async fn commit_signed_flac<'inventory, 'receipts: 'inventory>(
         self,
         writer: &mut Client,
         auth: Authorization<'_>,
@@ -66,7 +67,35 @@ impl OpenedUpload<'_> {
             &CompletionScope<'_>,
         ) -> Result<Option<CurrentAuthorization>, StoreError>,
     ) -> Result<CommittedFlacUpload<'inventory, 'receipts>, UploadError> {
-        let (inventory, envelope) = readback;
+        self.commit_flac(
+            writer,
+            auth,
+            readback.0,
+            retain_until,
+            reader,
+            async |until| sender.verify_readback(readback.0, readback.1, until).await,
+        )
+        .await
+    }
+
+    pub(super) async fn commit_flac<'inventory, 'receipts: 'inventory>(
+        self,
+        writer: &mut Client,
+        auth: Authorization<'_>,
+        inventory: &'inventory CompletedReadbackInventory<'receipts>,
+        retain_until: i64,
+        reader: impl AsyncFnOnce(
+            &str,
+            &CompletionScope<'_>,
+        ) -> Result<Option<CurrentAuthorization>, StoreError>,
+        verify: impl AsyncFnOnce(
+            SystemTime,
+        ) -> Result<
+            VerifiedCompletedReadback<'inventory, 'receipts>,
+            EnrolledReadbackError,
+        >,
+    ) -> Result<CommittedFlacUpload<'inventory, 'receipts>, UploadError> {
+        self.prepared.authorize(auth)?;
         let target = self.target.target();
         let media = inventory.media();
         if (inventory.bucket(), media.object_key, media.configuration)
@@ -78,30 +107,9 @@ impl OpenedUpload<'_> {
         {
             return Err(Refused);
         }
-        let until = self.target.usable_until();
-        self.commit_flac(writer, auth, retain_until, reader, async || {
-            sender.verify_readback(inventory, envelope, until).await
-        })
-        .await
-    }
-
-    #[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]
-    pub(super) async fn commit_flac<'inventory, 'receipts>(
-        self,
-        writer: &mut Client,
-        auth: Authorization<'_>,
-        retain_until: i64,
-        reader: impl AsyncFnOnce(
-            &str,
-            &CompletionScope<'_>,
-        ) -> Result<Option<CurrentAuthorization>, StoreError>,
-        verify: impl AsyncFnOnce() -> Result<
-            VerifiedCompletedReadback<'inventory, 'receipts>,
-            EnrolledReadbackError,
-        >,
-    ) -> Result<CommittedFlacUpload<'inventory, 'receipts>, UploadError> {
-        self.prepared.authorize(auth)?;
-        let verified = verify().await.map_err(|_| Unconfirmed)?;
+        let verified = verify(self.target.usable_until())
+            .await
+            .map_err(|_| Unconfirmed)?;
         if !verified.has_flac_seek() {
             return Err(Refused);
         }

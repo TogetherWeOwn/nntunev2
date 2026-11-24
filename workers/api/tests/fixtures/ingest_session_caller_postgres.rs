@@ -17,7 +17,7 @@ use nntune_ingest::multipart::{
     session_completion::{CompletionResponse, SessionCompletion},
     session_upload::handoff,
     sidecar::{SidecarPut, SidecarPutReply},
-    Plan,
+    Plan, UploadTarget,
 };
 use sha2::{Digest, Sha256};
 use std::{io, net::Ipv4Addr};
@@ -149,6 +149,8 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         Some(Fault::BadFlac),
         Some(Fault::SidecarVersion),
         Some(Fault::MissingSeek),
+        Some(Fault::ForeignTarget),
+        Some(Fault::CommittedSidecarVersion),
         Some(Fault::Quarantined),
     ]
     .into_iter()
@@ -167,6 +169,8 @@ enum Fault {
     BadFlac,
     SidecarVersion,
     MissingSeek,
+    ForeignTarget,
+    CommittedSidecarVersion,
     Quarantined,
 }
 
@@ -454,7 +458,20 @@ async fn prove_attempt(
         Err(UploadError::Refused)
     ));
 
-    let plan = Plan::new(target, header, length).unwrap();
+    let inventory_bucket = if matches!(fault, Some(Fault::ForeignTarget)) {
+        "foreign-fixture-bucket"
+    } else {
+        BUCKET
+    };
+    let plan = Plan::new(
+        UploadTarget {
+            bucket: inventory_bucket,
+            ..target
+        },
+        header,
+        length,
+    )
+    .unwrap();
     let mut partition = plan.partition();
     assert!(partition
         .push(&SealedChunk {
@@ -500,7 +517,7 @@ async fn prove_attempt(
                 status: 200,
                 version: Some(MEDIA.into()),
                 body: format!(
-                    "<CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{key}</Key>
+                    "<CompleteMultipartUploadResult><Bucket>{inventory_bucket}</Bucket><Key>{key}</Key>
                     <ChecksumSHA256>{composite}-1</ChecksumSHA256></CompleteMultipartUploadResult>"
                 )
                 .into_bytes(),
@@ -508,12 +525,12 @@ async fn prove_attempt(
         })
         .await
         .unwrap();
-    let put = SidecarPut::new(BUCKET, &context, &origin, map, 0, &page).unwrap();
+    let put = SidecarPut::new(inventory_bucket, &context, &origin, map, 0, &page).unwrap();
     let page_key = put.request().0.key.clone();
     let sidecars = [put
         .verify_reply(SidecarPutReply {
             configuration,
-            bucket: BUCKET,
+            bucket: inventory_bucket,
             key: &page_key,
             status: 200,
             body: &[],
@@ -525,7 +542,7 @@ async fn prove_attempt(
         configuration,
     };
     let inventory = CompletedReadbackInventory::assemble(
-        BUCKET,
+        inventory_bucket,
         configuration,
         &context,
         map,
@@ -540,7 +557,13 @@ async fn prove_attempt(
         trusted_record: &record,
         retained_record: &record,
     };
-    let verify = async || {
+    let expected_deadline = opened.durable_target().usable_until();
+    let verify = async |deadline| {
+        assert!(
+            !matches!(fault, Some(Fault::ForeignTarget)),
+            "foreign inventory reached readback"
+        );
+        assert_eq!(deadline, expected_deadline);
         let open = async |_: &str, pin: ReadbackPin<'_>| {
             let (version, data) = if pin.object_key == key {
                 (MEDIA, &ciphertext)
@@ -591,6 +614,46 @@ async fn prove_attempt(
         }
         verified
     };
+    if matches!(fault, Some(Fault::CommittedSidecarVersion)) {
+        // Inject a different version only after the real commit. Only the
+        // disposable database owner can bypass the append-only fixture guard.
+        const GUARD: &str = "storage_digest_inventory_intent_append_only";
+        const TABLE: &str = "public.storage_digest_inventory_intents";
+        const OTHER_PAGE: &str = "different-committed-sidecar-version";
+        observer
+            .batch_execute(&format!("ALTER TABLE {TABLE} DISABLE TRIGGER {GUARD}"))
+            .await
+            .unwrap();
+        let reload_with_mismatch = async |id: &str, scope: &CompletionScope<'_>| {
+            assert_eq!(observer.execute(
+                "UPDATE public.storage_digest_inventory_intents p SET page_versions = ARRAY[$1::text]
+                 FROM public.ingest_session_reservations s
+                 WHERE s.id = $2::text::uuid AND s.terminal_reason = 'completed'
+                   AND p.map_id = s.completed_map_id AND p.map_id = $3::text::uuid
+                   AND p.page_versions = ARRAY[$4::text]",
+                &[&OTHER_PAGE, &sid, &map_text, &PAGE],
+            ).await.unwrap(), 1);
+            load_authority(authority, id, scope).await
+        };
+        let result = opened
+            .commit_flac(
+                writer,
+                auth,
+                &inventory,
+                now as i64 + 600,
+                reload_with_mismatch,
+                verify,
+            )
+            .await;
+        observer
+            .batch_execute(&format!("ALTER TABLE {TABLE} ENABLE TRIGGER {GUARD}"))
+            .await
+            .unwrap();
+        let stored = read(writer, auth, prepared, reload).await.unwrap().unwrap();
+        assert_eq!(stored.page_versions, [OTHER_PAGE]);
+        assert!(matches!(result, Err(UploadError::Unconfirmed)));
+        return;
+    }
     if matches!(fault, Some(Fault::Quarantined)) {
         // Make the winner unreadable only at the outer commit. The observer
         // owns this fixture trigger; the writer's grants stay unchanged.
@@ -613,7 +676,7 @@ async fn prove_attempt(
             .unwrap();
         assert!(matches!(
             opened
-                .commit_flac(writer, auth, now as i64 + 600, reload, verify)
+                .commit_flac(writer, auth, &inventory, now as i64 + 600, reload, verify)
                 .await,
             Err(UploadError::Unconfirmed)
         ));
@@ -635,7 +698,9 @@ async fn prove_attempt(
     }
     if let Some(fault) = fault.filter(|fault| !matches!(fault, Fault::GrantRevokedWhileWaiting)) {
         let (auth, retain, expected) = match fault {
-            Fault::Digest | Fault::MissingSeek => (auth, now as i64 + 600, UploadError::Refused),
+            Fault::Digest | Fault::MissingSeek | Fault::ForeignTarget => {
+                (auth, now as i64 + 600, UploadError::Refused)
+            }
             Fault::Revoked => (
                 Authorization {
                     record: &revoked,
@@ -648,10 +713,12 @@ async fn prove_attempt(
             Fault::BadFlac | Fault::SidecarVersion => {
                 (auth, now as i64 + 600, UploadError::Unconfirmed)
             }
-            Fault::Quarantined | Fault::GrantRevokedWhileWaiting => unreachable!(),
+            Fault::Quarantined
+            | Fault::GrantRevokedWhileWaiting
+            | Fault::CommittedSidecarVersion => unreachable!(),
         };
         assert!(
-            matches!(opened.commit_flac(writer, auth, retain, reload, verify).await,
+            matches!(opened.commit_flac(writer, auth, &inventory, retain, reload, verify).await,
             Err(error) if error == expected)
         );
         let untouched: bool = observer.query_one(
@@ -680,8 +747,14 @@ async fn prove_attempt(
         gate.query_one("SELECT pg_advisory_xact_lock(1751)", &[])
             .await
             .unwrap();
-        let mut committed =
-            std::pin::pin!(opened.commit_flac(writer, auth, now as i64 + 600, reload, verify));
+        let mut committed = std::pin::pin!(opened.commit_flac(
+            writer,
+            auth,
+            &inventory,
+            now as i64 + 600,
+            reload,
+            verify
+        ));
         observe_blocked(observer, gate_pid, writer_pid, committed.as_mut())
             .await
             .unwrap();
