@@ -21,9 +21,10 @@
 //! grant expiry. After expiry, issuance goes through the new-play gates.
 //!
 //! Lease rules (one row per user, holder = client session id):
-//! - TTL [`LEASE_TTL_SECS`], client heartbeat every
-//!   [`HEARTBEAT_INTERVAL_SECS`]; a closed tab frees the lease within
-//!   one TTL for other sessions.
+//! - Ordinary leases use [`LEASE_TTL_SECS`] and a client heartbeat every
+//!   [`HEARTBEAT_INTERVAL_SECS`]. Private browser playback uses a fixed
+//!   track window capped by the account, invitation and grant deadlines.
+//!   Closing a browser tab leaves that lease held until its window closes.
 //! - Same-session re-acquire replaces the track (never self-refused).
 //! - Another session acquires only after expiry, or immediately with
 //!   an explicit takeover; either way `epoch` increments and rides in

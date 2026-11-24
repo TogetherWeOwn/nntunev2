@@ -4,7 +4,10 @@ use crate::{
     ledger::{derive_play_idempotency_key, is_valid_key_field},
     private_catalogue_read::{lookup_scoped, PublicationScope},
     storage_digest_read::DigestReadTarget,
-    worker_entry::{classify_play_privacy, lock_playback_account, playback_privacy_mark},
+    worker_entry::{
+        acquire_playback_lease_with_expiry, classify_play_privacy, lock_playback_account,
+        playback_privacy_mark, query_playback_lease_row,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +57,7 @@ async fn current(
     db: &impl PgQuery,
     user: &str,
 ) -> Result<Option<(LeaseRow, ReceiptPins)>, StoreError> {
-    let Some(lease) = crate::worker_entry::query_playback_lease_row(db, user).await? else {
+    let Some(lease) = query_playback_lease_row(db, user).await? else {
         return Ok(None);
     };
     if !is_browser_play(&lease.play_id) {
@@ -187,6 +190,75 @@ impl PrivatePlayback<'_> {
         Ok(receipt.filter(|receipt| now() < receipt.music.grant_deadline))
     }
 
+    /// Stream authenticates independently. Recover the session only from the
+    /// committed receipt and bind the caller to the exact reconstructed bearer.
+    pub(crate) async fn load_for_stream(
+        &self,
+        db: &impl PgQuery,
+        bearer: &str,
+        scope: BrowserScope<'_>,
+        now: impl Fn() -> SystemTime,
+    ) -> Result<Option<PrivateReceipt>, StoreError> {
+        let Some((signed, _)) = bearer.strip_prefix("v4.").and_then(|v| v.split_once('.')) else {
+            return Ok(None);
+        };
+        let Ok(payload) = crate::b64::decode(signed) else {
+            return Ok(None);
+        };
+        let Ok(payload) = std::str::from_utf8(&payload) else {
+            return Ok(None);
+        };
+        let Some((user, _)) = payload
+            .split_once('|')
+            .filter(|(user, _)| is_valid_key_field(user, 128))
+        else {
+            return Ok(None);
+        };
+        let Some((lease, pins)) = current(db, user).await? else {
+            return Ok(None);
+        };
+        let Some(row) = db.query_typed_opt(
+            "SELECT created_at, expires_at, rotation_counter FROM public.sessions WHERE id = $1 AND user_id = $2 AND NOT revoked",
+            &[(&pins.account_session, Type::TEXT), (&user, Type::TEXT)],
+        ).await.map_err(|_| StoreError)? else {
+            return Ok(None);
+        };
+        let time = |col| {
+            let seconds: i64 = row.try_get(col).map_err(|_| StoreError)?;
+            u64::try_from(seconds).map_err(|_| StoreError)
+        };
+        let created_at = time("created_at")?;
+        let claims = SessionClaims {
+            session_id: pins.account_session.clone(),
+            user_id: user.into(),
+            created_at,
+            issued_at: created_at,
+            expires_at: time("expires_at")?,
+            rotation_counter: u32::try_from(
+                row.try_get::<_, i32>("rotation_counter")
+                    .map_err(|_| StoreError)?,
+            )
+            .map_err(|_| StoreError)?,
+        };
+        let receipt = self
+            .browser_receipt_for(db, &claims, lease, &pins, scope, seconds(now())?)
+            .await?;
+        Ok(receipt.filter(|receipt| {
+            now() < receipt.music.grant_deadline
+                && bool::from(
+                    bearer
+                        .as_bytes()
+                        .ct_eq(receipt.relay.grant.token.as_bytes()),
+                )
+        }))
+    }
+
+    pub(crate) fn catalogue_reference(receipt: &PrivateReceipt) -> [u8; 16] {
+        // This is the canonical track in the pinned publication, independent
+        // of the later protected-read projection.
+        receipt.music.target.reference
+    }
+
     /// Issue under the privacy/deletion fence, or replay the exact current
     /// receipt. Only the HTTP adapter supplies already-verified claims.
     pub(crate) async fn open_browser(
@@ -277,13 +349,18 @@ impl PrivatePlayback<'_> {
                 },
             )
             .min(policy.expires_at)
-            .min(claims.expires_at);
-            let LeaseAcquire::Acquired { epoch } =
-                acquire_playback_lease_on(&tx, user, tab, track, &play, start, end, false).await?
+            .min(claims.expires_at)
+            .min(start.saturating_add(crate::play_grant::MAX_GRANT_TTL));
+            // Native <audio> has no heartbeat. Bound this immutable grant
+            // and lease to one track's window and the existing v4 TTL cap.
+            let LeaseAcquire::Acquired { epoch } = acquire_playback_lease_with_expiry(
+                &tx, user, tab, track, &play, start, end, end, false,
+            )
+            .await?
             else {
                 return Ok(None);
             };
-            let expires_at = playback::lease_expiry(start, end);
+            let expires_at = end;
             let pins = ReceiptPins {
                 account_session: claims.session_id.clone(),
                 play: play.clone(),

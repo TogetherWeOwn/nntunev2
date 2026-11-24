@@ -571,6 +571,32 @@ pub async fn acquire_playback_lease_on(
     continuation_deadline: u64,
     takeover: bool,
 ) -> Result<crate::playback::LeaseAcquire, StoreError> {
+    acquire_playback_lease_with_expiry(
+        client,
+        user_id,
+        session_id,
+        track_id,
+        play_id,
+        now,
+        continuation_deadline,
+        crate::playback::lease_expiry(now, continuation_deadline),
+        takeover,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acquire_playback_lease_with_expiry(
+    client: &impl PgQuery,
+    user_id: &str,
+    session_id: &str,
+    track_id: &str,
+    play_id: &str,
+    now: u64,
+    continuation_deadline: u64,
+    expires_at: u64,
+    takeover: bool,
+) -> Result<crate::playback::LeaseAcquire, StoreError> {
     let rows = client
         .query_typed(
             crate::playback::playback_lease_acquire_statement(),
@@ -579,10 +605,7 @@ pub async fn acquire_playback_lease_on(
                 (&session_id, Type::TEXT),
                 (&track_id, Type::TEXT),
                 (&play_id, Type::TEXT),
-                (
-                    &i64_of(crate::playback::lease_expiry(now, continuation_deadline))?,
-                    Type::INT8,
-                ),
+                (&i64_of(expires_at)?, Type::INT8),
                 (&i64_of(now)?, Type::INT8),
                 (&takeover, Type::BOOL),
                 (&i64_of(continuation_deadline)?, Type::INT8),
@@ -866,6 +889,8 @@ pub(crate) mod subsonic_pg_page;
 pub(crate) use subsonic_pg::account_fields_use_the_carried_charge;
 pub use subsonic_pg::load_staging_account;
 
+#[path = "private_browser_custody.rs"]
+pub(crate) mod private_browser_custody;
 #[path = "private_browser_worker.rs"]
 mod private_browser_worker;
 
@@ -4148,6 +4173,12 @@ impl Store for PgStore {
             TOTAL_TIMEOUT_MS,
         )
         .await
+    }
+
+    fn browser_playback_enabled(&self) -> bool {
+        self.env
+            .as_ref()
+            .is_some_and(private_browser_custody::can_open)
     }
 
     async fn open_browser_playback(
@@ -8574,7 +8605,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     let served_method = request.method.clone();
     let served_path = served_display_path(&request.path);
-    if let Some(result) = relay_media(&ctx, &request, &collected, &headers_map, async |get| {
+    let stream_get = async |get: handlers::browser_playback_relay::StreamGet<'_>| {
         let headers = Headers::new();
         for (name, value) in get.headers() {
             headers.set(name, value)?;
@@ -8601,9 +8632,18 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         headers.delete("set-cookie")?;
         headers.set(crate::logging::TRACE_HEADER, &trace_id)?;
         Ok::<_, worker::Error>(response)
-    })
-    .await
-    {
+    };
+    let playback_response =
+        match private_browser_custody::dispatch(&env, ctx.store, &config, &request, &collected)
+            .await
+        {
+            // Custody dispatch only matches two static paths.
+            Some(response) => Some((format!("POST {}", request.path), Ok(response))),
+            None => relay_media(&ctx, &request, &collected, &headers_map, stream_get)
+                .await
+                .map(|response| ("GET /v1/plays/media/{track}/{tab}/{play}".into(), response)),
+        };
+    if let Some((route, result)) = playback_response {
         let result = result.and_then(|response| response.map_err(|_| handlers::unavailable()));
         let mut error_class = None;
         let response = result.or_else(|refusal| {
@@ -8621,7 +8661,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
             "api.request.served",
             &trace_id,
             serde_json::json!({
-                "route": "GET /v1/plays/media/{track}/{tab}/{play}",
+                "route": route,
                 "status_code": status,
                 "error_class": error_class.or_else(|| response_error_code(status, "")),
                 "duration_ms": now_millis().saturating_sub(start_ms),
