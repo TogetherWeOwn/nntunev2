@@ -13775,16 +13775,22 @@ mod tests {
     }
 
     #[test]
-    fn paid_invite_coverage_drives_play_meter_cap_and_lapse() {
+    fn paid_invite_signup_to_subscription_cap_and_lapse() {
+        use serde_json::{json, Value};
+
         let mut h = stripe_harness();
         h.config = h.config.with_play_grant_secret(PLAY_SECRET.to_vec());
         h.config.invites_required = true;
-        h.config.paid_invite_billing = true;
-        seed_billing_user(&h, "u1");
-        let cookie = cookie_of(&block_on(h.ctx().start_session("u1")).unwrap());
-        let play = serde_json::json!({"track_id":"track-9", "session_id":"tab-a"});
-        assert_eq!(play_call(&h, &cookie, play.clone()).status, 402);
-        deliver_first_period(&h, "evt_play");
+        h.store
+            .billing_bindings
+            .borrow_mut()
+            .extend(test_bindings());
+        h.store.plans.borrow_mut().push(PlanRow {
+            id: PLAN_PLUS.into(),
+            price_cents: 800,
+            stream_hours_month: 100,
+            max_concurrent_streams: 1,
+        });
         h.store.plan_caps_rows.borrow_mut().insert(
             PLAN_PLUS.into(),
             crate::plan_limits::PlanCaps {
@@ -13793,60 +13799,344 @@ mod tests {
             },
         );
 
-        let response = play_call(&h, &cookie, play.clone());
-        assert_eq!(response.status, 200, "{}", response.body);
-        let issued: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        let owner = seed_admin(&h, "owner", "owner@example.test");
+        let invite = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some("{}".into()),
+            Some(owner),
+            Some(ORIGIN),
+        );
+        assert_eq!(invite.status, 201);
+        let invite: Value = serde_json::from_str(&invite.body).unwrap();
+        let code = invite["code"].as_str().unwrap();
+        let (signup, user) = signup_with_invite(
+            &h,
+            "listener@example.test",
+            b"paid-invite-cred",
+            38,
+            Some(code),
+        );
+        assert_eq!(signup.status, 200);
+        let cookie = cookie_of(&signup);
+        let (replay, _) = signup_with_invite(
+            &h,
+            "second@example.test",
+            b"second-invite-cred",
+            39,
+            Some(code),
+        );
+        assert_eq!(replay.status, 401);
+        assert!(replay.set_cookie.is_none());
+
+        let checkout = |h: &Harness| {
+            h.call_full(
+                "POST",
+                paid_invite_billing::CHECKOUT,
+                Some(json!({"planId": PLAN_PLUS}).to_string()),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            )
+        };
+        assert_eq!(checkout(&h).status, 404);
+        assert!(h.stripe.sessions.borrow().is_empty());
+        h.config.paid_invite_billing = true;
+
+        let decode = |response: Response, status| {
+            assert_eq!(response.status, status, "{}", response.body);
+            serde_json::from_str::<Value>(&response.body).unwrap()
+        };
+        let call_at = |now, method: &str, path: &str, cookie: Option<&str>, body, signature| {
+            let mut ctx = h.ctx();
+            ctx.now = now;
+            block_on(handle(
+                &ctx,
+                &Request {
+                    method: method.into(),
+                    path: path.into(),
+                    cookie: cookie.map(str::to_string),
+                    origin: cookie.map(|_| ORIGIN.to_string()),
+                    authorization: None,
+                    stripe_signature: signature,
+                    body,
+                },
+            ))
+        };
+        let plan = || decode(billing_get(&h, "/v1/plans", Some(cookie.clone())), 200);
+        let subscription = |now, cookie: &str| {
+            decode(
+                call_at(
+                    now,
+                    "GET",
+                    "/v1/me/subscription",
+                    Some(cookie),
+                    vec![],
+                    None,
+                ),
+                200,
+            )
+        };
+        let play = json!({"track_id":"track-9", "session_id":"tab-a"});
+        let play_at = |now, cookie: &str, body: &Value| {
+            call_at(
+                now,
+                "POST",
+                "/v1/plays",
+                Some(cookie),
+                body.to_string().into_bytes(),
+                None,
+            )
+        };
+        assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
+        let unpaid = decode(play_call(&h, &cookie, play.clone()), 402);
+        assert_eq!(unpaid["code"], "subscription_required");
+        assert_eq!(unpaid["reason"], "never_subscribed");
+
+        assert_eq!(plan()["plans"][0]["selectable"], true);
+        let redirect = decode(checkout(&h), 200);
+        let operation = block_on(h.store.open_checkout_operation(&user))
+            .unwrap()
+            .unwrap();
+        let session_id = operation.session_id.as_deref().unwrap();
+        let (customer, subscription_id) = ("cus_test_1", "sub_test_1");
+        assert_eq!(operation.price_id.as_deref(), Some(PRICE_PLUS));
+        let account = block_on(h.store.load_reconcile_input(&user, None)).unwrap();
+        assert_eq!(account.stripe_customer_id.as_deref(), Some(customer));
+        assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
+        assert_eq!(decode(play_call(&h, &cookie, play.clone()), 402), unpaid);
+
+        let stripe_period = |id: &str, start, end| {
+            let mut remote = test_subscription(subscription_id, customer, "active", PRICE_PLUS);
+            remote.current_period_end = Some(end);
+            h.stripe
+                .subscriptions
+                .borrow_mut()
+                .insert(subscription_id.into(), remote);
+            h.stripe.invoices.borrow_mut().insert(
+                id.into(),
+                test_invoice(id, customer, subscription_id, PRICE_PLUS, start, end, start),
+            );
+        };
+        let first_end = BILLING_NOW + BILLING_PERIOD;
+        stripe_period("in_test_1", BILLING_NOW, first_end);
+        let mut session = h.stripe.sessions.borrow()[session_id].clone();
+        assert_eq!(redirect["url"], session.url.as_deref().unwrap());
+        assert_eq!(
+            session.client_reference_id.as_deref(),
+            Some(operation.id.as_str())
+        );
+        session.status = Some("complete".into());
+        session.payment_status = Some("paid".into());
+        session.subscription = Some(subscription_id.into());
+        session.url = None;
+        h.stripe
+            .sessions
+            .borrow_mut()
+            .insert(session_id.into(), session);
+        let event_body = |id: &str, kind: &str, now, object: Value| {
+            json!({
+                "id": id, "object": "event", "api_version": "2024-12-18.acacia",
+                "created": now, "type": kind, "livemode": false, "data": {"object": object},
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let signed = |now: i64, body: &[u8]| {
+            call_at(
+                now as u64,
+                "POST",
+                BILLING_WEBHOOK_PATH,
+                None,
+                body.to_vec(),
+                Some(sign(body, now)),
+            )
+        };
+        let completed = event_body(
+            "evt_paid_signup",
+            "checkout.session.completed",
+            BILLING_NOW,
+            json!({
+                "id":session_id, "object":"checkout.session", "mode":"subscription", "livemode":false,
+                "status":"complete", "payment_status":"paid", "customer":customer,
+                "subscription":subscription_id, "client_reference_id":operation.id,
+            }),
+        );
+        let mut altered = completed.clone();
+        altered.push(b' ');
+        let bad = call_at(
+            NOW,
+            "POST",
+            BILLING_WEBHOOK_PATH,
+            None,
+            altered,
+            Some(sign(&completed, BILLING_NOW)),
+        );
+        assert_eq!(bad.status, 400);
+        assert!(h.store.webhook_events.borrow().is_empty());
+        assert!(h.store.invoice_history.borrow().is_empty());
+        assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
+
+        let assert_period = |end, invoices| {
+            let live = live_for(&h, &user).unwrap();
+            assert_eq!(live.stripe_subscription_id, subscription_id);
+            assert_eq!(live.paid_through_unix, Some(end));
+            assert_eq!(h.store.invoice_history.borrow().len(), invoices);
+            live
+        };
+        webhook_ok(&signed(BILLING_NOW, &completed));
+        let active = assert_period(first_end, 1);
+        let history = h.store.invoice_history.borrow().clone();
+        webhook_ok(&signed(BILLING_NOW + 1, &completed));
+        assert_eq!(assert_period(first_end, 1), active);
+        assert_eq!(*h.store.invoice_history.borrow(), history);
+        assert_eq!(
+            h.store.checkout_ops.borrow()[&operation.id].state,
+            "succeeded"
+        );
+
+        let subscribed = subscription(NOW + 1, &cookie);
+        assert_eq!(subscribed["state"], "active");
+        assert_eq!(subscribed["status"], "active");
+        assert_eq!(subscribed["planId"], PLAN_PLUS);
+        assert_eq!(
+            subscribed["currentPeriodEnd"],
+            crate::ledger::iso8601_utc(first_end)
+        );
+        assert_eq!(plan()["plans"][0]["selectable"], false);
+
+        h.store.meter_meta.borrow_mut().insert(
+            (user.clone(), "track-9".into()),
+            crate::meter_sink::TrackMeterMeta {
+                track_duration_ms: Some(2000),
+                ..Default::default()
+            },
+        );
+        let issued = decode(play_at(NOW + 1, &cookie, &play), 200);
         let play_id = issued["play_id"].as_str().unwrap();
         let record = |bytes| {
             let window = crate::ledger::prepare_play_window(
-                "u1",
+                &user,
                 "track-9",
                 play_id,
                 bytes,
                 Some(2000),
                 Some(2000),
-                NOW,
+                NOW + 1,
             )
             .unwrap();
             block_on(h.store.record_play_window(&window)).unwrap()
         };
         assert_eq!(record(1000), crate::meter_sink::PlayWindowOutcome::Written);
         assert_eq!(record(2000), crate::meter_sink::PlayWindowOutcome::Written);
+        let usage = || decode(billing_get(&h, "/v1/me/usage", Some(cookie.clone())), 200);
+        assert_eq!(usage()["streamSecondsMonth"], 2);
         assert_eq!(record(2000), crate::meter_sink::PlayWindowOutcome::Covered);
-        let usage = billing_get(&h, "/v1/me/usage", Some(cookie.clone()));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&usage.body).unwrap()["streamSecondsMonth"],
-            2
-        );
-        let cap = play_call(&h, &cookie, play.clone());
-        assert_eq!(cap.status, 402);
-        assert!(cap.body.contains("plan_limit_exceeded"));
-        let continuation =
-            serde_json::json!({"track_id":"track-9", "session_id":"tab-a", "play_id":play_id});
-        assert_eq!(play_call(&h, &cookie, continuation).status, 200);
+        assert_eq!(usage()["streamSecondsMonth"], 2);
 
-        // Move the server clock past the settlement allowance in a fresh
-        // usage period. The retained row may still read active at Stripe.
-        let mut lapse = h.ctx();
-        lapse.now = NOW + BILLING_PERIOD as u64 + 10_801;
-        let cookie = cookie_of(&block_on(lapse.start_session("u1")).unwrap());
-        let refusal = block_on(handle(
-            &lapse,
-            &Request {
-                method: "POST".into(),
-                path: "/v1/plays".into(),
-                origin: Some(ORIGIN.into()),
-                cookie: Some(cookie),
-                authorization: None,
-                stripe_signature: None,
-                body: play.to_string().into_bytes(),
-            },
-        ));
-        assert_eq!(refusal.status, 402);
+        let cap = decode(play_at(NOW + 2, &cookie, &play), 402);
+        assert_eq!(cap["code"], "plan_limit_exceeded");
+        let continuation = json!({"track_id":"track-9", "session_id":"tab-a", "play_id": play_id});
+        let beat =
+            json!({"session_id":"tab-a", "play_id":play_id, "lease_epoch":issued["lease_epoch"]});
+        let deadline = issued["expires_at"].as_u64().unwrap();
+        for now in ((NOW + 41)..deadline).step_by(40) {
+            let reply = call_at(
+                now,
+                "POST",
+                "/v1/plays/heartbeat",
+                Some(&cookie),
+                beat.to_string().into_bytes(),
+                None,
+            );
+            assert_eq!(decode(reply, 200)["lease"], "active");
+        }
+        let resumed = decode(play_at(deadline - 1, &cookie, &continuation), 200);
+        assert_eq!(resumed["play_id"], play_id);
+        assert_eq!(resumed["expires_at"], deadline);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&refusal.body).unwrap()["reason"],
-            "lapsed"
+            decode(play_at(deadline, &cookie, &continuation), 402)["code"],
+            "plan_limit_exceeded"
         );
+
+        let second_end = first_end + BILLING_PERIOD;
+        stripe_period("in_test_2", first_end, second_end);
+        assert_period(first_end, 1);
+        let renewal = event_body(
+            "evt_paid_renewal",
+            "invoice.paid",
+            first_end,
+            json!({
+                "id":"in_test_2", "object":"invoice", "livemode":false, "status":"paid",
+                "customer":customer, "subscription":subscription_id,
+            }),
+        );
+        webhook_ok(&signed(first_end, &renewal));
+        assert_period(second_end, 2);
+        assert_eq!(
+            h.store.invoice_history.borrow()["in_test_2"].period_end_unix,
+            second_end
+        );
+
+        let cutoff = second_end + BILLING_PERIOD;
+        stripe_period("in_test_3", second_end, cutoff);
+        assert_period(second_end, 2);
+        let mut sweep = h.ctx();
+        // Both renewal signals are missing. A delayed sweep must restore
+        // entitlement even after the ordinary settlement window closes.
+        sweep.now = second_end as u64 + 10_800;
+        let cookie = cookie_of(&block_on(sweep.start_session(&user)).unwrap());
+        let missed = decode(play_at(sweep.now, &cookie, &play), 402);
+        assert_eq!(missed["reason"], "lapsed");
+        block_on(reconcile_paid_targets(
+            &sweep,
+            vec![(&user, Some(subscription_id))],
+        ))
+        .unwrap();
+        assert_eq!(subscription(sweep.now, &cookie)["state"], "active");
+        assert_period(cutoff, 3);
+        assert_eq!(
+            h.store.invoice_history.borrow()["in_test_3"].period_end_unix,
+            cutoff
+        );
+
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .get_mut(subscription_id)
+            .unwrap()
+            .cancel_at_period_end = true;
+        let update = event_body(
+            "evt_paid_cancel",
+            "customer.subscription.updated",
+            sweep.now as i64 + 1,
+            json!({
+                "id":subscription_id, "object":"subscription", "livemode":false,
+                "customer":customer, "status":"active", "cancel_at_period_end":true,
+            }),
+        );
+        let history = h.store.invoice_history.borrow().clone();
+        webhook_ok(&signed(sweep.now as i64 + 1, &update));
+        assert!(assert_period(cutoff, 3).cancel_at_period_end);
+        webhook_ok(&signed(sweep.now as i64 + 2, &update));
+        assert!(assert_period(cutoff, 3).cancel_at_period_end);
+        assert_eq!(*h.store.invoice_history.borrow(), history);
+
+        // Keep the same member after advancing beyond the signup cookie lifetime.
+        let mut before_cutoff = h.ctx();
+        before_cutoff.now = cutoff as u64 - 1;
+        let cookie = cookie_of(&block_on(before_cutoff.start_session(&user)).unwrap());
+        let ending = subscription(before_cutoff.now, &cookie);
+        assert_eq!(ending["state"], "active");
+        assert_eq!(ending["cancelAtPeriodEnd"], true);
+        assert_eq!(
+            ending["currentPeriodEnd"],
+            crate::ledger::iso8601_utc(cutoff)
+        );
+        decode(play_at(before_cutoff.now, &cookie, &play), 200);
+        assert_eq!(subscription(cutoff as u64, &cookie)["state"], "lapsed");
+        let refusal = decode(play_at(cutoff as u64, &cookie, &play), 402);
+        assert_eq!(refusal["code"], "subscription_required");
+        assert_eq!(refusal["reason"], "lapsed");
     }
 
     #[test]
