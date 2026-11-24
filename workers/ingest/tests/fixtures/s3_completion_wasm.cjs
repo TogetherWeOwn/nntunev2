@@ -565,6 +565,7 @@ test('ambiguous or wrong-scope listings cannot reach abort', async (t) => {
     listing(exact, { prefix: 'media/other' }),
     listing(exact, { ns: 'https://other.test/' }),
     listing(exact + '<Error><Code>InternalError</Code></Error>'),
+    listing(exact.replace('</Upload>', '<Error><Code>InternalError</Code></Error></Upload>')),
     listing(exact.replace('<UploadId>', '<UploadId>split</UploadId><UploadId>')),
     listing(exact.replace('<UploadId>', '<UploadId><Nested/>')),
     listing(exact.replace(initiatedId, 'x'.repeat(16 * 1024))),
@@ -573,9 +574,9 @@ test('ambiguous or wrong-scope listings cannot reach abort', async (t) => {
     reply = body;
     await assert.rejects(complete('reconcile'), rejectedWith('unconfirmed listing'));
   }
-  assert.equal(fetch.mock.callCount(), 13);
+  assert.equal(fetch.mock.callCount(), 14);
   await assert.rejects(complete('reconcile-expired'), rejectedWith('unconfirmed listing'));
-  assert.equal(fetch.mock.callCount(), 13);
+  assert.equal(fetch.mock.callCount(), 14);
 });
 
 test('an ambiguous or mismatched abort response stays unconfirmed', async (t) => {
@@ -591,6 +592,7 @@ test('an ambiguous or mismatched abort response stays unconfirmed', async (t) =>
     '<Error><Code>NoSuchUpload</Code><UploadId>other</UploadId></Error>',
     '<Error><Code>NoSuchUpload</Code><Resource>/other-bucket/other-key</Resource></Error>',
     '<Error><Code>NoSuchUpload</Code><Code>NoSuchBucket</Code></Error>',
+    '<Error><Code>NoSuchUpload</Code><Error><Code>InternalError</Code></Error></Error>',
   ]) {
     reply = body;
     await assert.rejects(complete('reconcile-replay'), rejectedWith('unconfirmed abort'));

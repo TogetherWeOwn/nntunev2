@@ -64,11 +64,8 @@ impl S3CompletionSender {
             .enumerate()
         {
             let returned_key = upload.field("Key")?.ok_or(())?;
-            let id = upload
-                .field("UploadId")?
-                .filter(|id| valid_upload_id(id))
-                .ok_or(())?;
-            if index >= 2 || !returned_key.starts_with(key) {
+            let id = upload.field("UploadId")?.ok_or(())?;
+            if index >= 2 || !returned_key.starts_with(key) || !valid_upload_id(id) {
                 return Err(());
             }
             if returned_key == key && candidate.replace(id).is_some() {
@@ -160,7 +157,9 @@ impl Element {
         loop {
             match reader.next().map_err(|_| ())? {
                 StartElement { name: child, .. }
-                    if depth > 0 && child.namespace == name.namespace =>
+                    if depth > 0
+                        && child.namespace == name.namespace
+                        && child.local_name != "Error" =>
                 {
                     children.push(Self::read(reader, child, depth - 1)?)
                 }
