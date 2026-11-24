@@ -363,7 +363,7 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
              REVOKE CONNECT ON DATABASE nntune_billing_native FROM PUBLIC;
              GRANT CONNECT ON DATABASE nntune_billing_native TO billing_native_caller_fixture;
              GRANT USAGE ON SCHEMA public TO billing_native_caller_fixture;
-             GRANT SELECT ON public.subscriptions, public.billing_accounts, public.plan_prices
+             GRANT SELECT ON public.subscriptions, public.billing_accounts
                 TO billing_native_caller_fixture;",
         )
         .await
@@ -488,13 +488,47 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         .await
         .unwrap();
     let before = snapshot(observer).await;
+    let denied_read = with_store(CALLER_CONNECTION, 1, async |store| {
+        store
+            .reconcile_owned_subscription(
+                OTHER_USER,
+                TARGET,
+                remote.subscription.clone(),
+                async |_| panic!("must read price bindings before loading invoices"),
+                NOW,
+            )
+            .await
+    })
+    .await;
+    assert!(denied_read.is_err());
+    assert_eq!(snapshot(observer).await, before);
+    observer
+        .batch_execute("GRANT SELECT ON public.plan_prices TO billing_native_caller_fixture")
+        .await
+        .unwrap();
+
+    // An anchored terminal observation without its anchor is explicitly stale.
+    // The owned transaction checks the lock and target without writing either table.
+    let mut stale = remote.clone();
+    stale.subscription.status = "canceled".into();
+    stale.invoices.clear();
     check_caller_lock_privilege().await;
-    assert!(dispatch_caller(OTHER_USER, TARGET, &remote).await.is_err());
+    assert!(dispatch_caller(OTHER_USER, TARGET, &stale).await.is_err());
     assert_eq!(snapshot(observer).await, before);
     observer
         .batch_execute(
-            "GRANT INSERT, UPDATE ON public.subscriptions TO billing_native_caller_fixture;
-             GRANT INSERT, UPDATE (covered_periods),
+            "GRANT INSERT, UPDATE ON public.subscriptions TO billing_native_caller_fixture",
+        )
+        .await
+        .unwrap();
+    let locked = dispatch_caller(OTHER_USER, TARGET, &stale)
+        .await
+        .expect("stale no-op only needs the subscription lock and reads");
+    assert!(locked.explicit_stale && locked.history.is_empty());
+    assert_eq!(snapshot(observer).await, before);
+    observer
+        .batch_execute(
+            "GRANT INSERT, UPDATE (covered_periods),
                 SELECT (stripe_invoice_id, user_id, stripe_subscription_id, plan_id,
                     period_start, period_end, amount_cents, currency, paid_at, covered_periods)
                 ON public.paid_invoice_history TO billing_native_caller_fixture;",
