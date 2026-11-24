@@ -764,8 +764,8 @@
 	}
 
 	if (typeof window !== 'undefined') {
-		afterNavigate(({ to }) => {
-			shareEntryUrl = to?.url;
+		afterNavigate(() => {
+			shareEntryUrl = new URL(window.location.href);
 			// The router restores the entry's snapshot after this callback.
 			void tick().then(() => applyShareLink());
 		});

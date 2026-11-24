@@ -28,7 +28,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 	vi.stubGlobal('navigator', {}); // Do not use Node's Web Locks with this partial window fixture.
 	const location = new URL(`/library${search}`, 'https://example.test');
 	vi.stubGlobal('window', { location });
-	let afterNavigation: (navigation: { to: { url: URL } }) => void = () => {};
+	let afterNavigation = () => {};
 	const source = sources['./+page.svelte'];
 	const start = source.indexOf('>', source.indexOf('<script')) + 1;
 	const script = source.slice(start, source.indexOf('</script', start));
@@ -72,7 +72,7 @@ function pageScript(search: string, tick = () => Promise.resolve()) {
 		onMount: () => {},
 		$effect: { pre: () => {} },
 		afterNavigate: (callback: typeof afterNavigation) => { afterNavigation = callback; },
-		finishNavigation: () => afterNavigation({ to: { url: new URL(location) } }),
+		finishNavigation: () => afterNavigation(),
 		shortTitle,
 		tick,
 		$state: Object.assign(<T>(value: T) => value, { raw: <T>(value: T) => value }),
