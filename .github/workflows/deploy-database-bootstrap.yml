@@ -33,6 +33,7 @@ jobs:
   admit:
     name: Run authorized first-launch database setup
     needs: preflight
+    if: github.run_attempt == '1'
     environment: production-db-bootstrap
     concurrency:
       group: production-db-bootstrap
