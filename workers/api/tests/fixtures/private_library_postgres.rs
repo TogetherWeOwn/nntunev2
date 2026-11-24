@@ -10,6 +10,10 @@ mod publication_fixture {
     include!("private_library_publication.rs");
 }
 
+mod playlist_membership {
+    include!("private_library_playlist_membership.rs");
+}
+
 const DB: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_private_library_ci";
 const ISSUER: &str = "catalogue-owner";
 const RECIPIENT: &str = "library-invitee";
@@ -142,6 +146,8 @@ async fn publishes_and_admits_only_the_fresh_canonical_track() {
     assert_eq!(ids(handle(&ctx, &request).await), [track.clone()]);
     assert_ne!(track, MBID);
     assert!(ids(handle(&ctx, &unrelated).await).is_empty());
+    let playlist =
+        playlist_membership::exercise(&mut writer, &ctx, &request, &unrelated, &track).await;
     writer
         .execute(
             "INSERT INTO public.library (job_id, user_id, idempotency_key)
@@ -197,6 +203,18 @@ async fn publishes_and_admits_only_the_fresh_canonical_track() {
         .unwrap();
     assert_eq!(handle(&ctx, &request).await.status, 403);
     assert!(page(&writer, RECIPIENT, policy).await.unwrap().is_empty());
+    playlist_membership::assert_denied(
+        private_playlists::route(
+            &ctx,
+            &Request {
+                origin: Some(ORIGIN.into()),
+                ..request.clone()
+            },
+            &mut writer,
+            private_playlists::Command::Append(&playlist, track.clone()),
+        )
+        .await,
+    );
     writer
         .execute(
             "UPDATE public.invite_codes SET revoked_at = NULL WHERE id = 901",

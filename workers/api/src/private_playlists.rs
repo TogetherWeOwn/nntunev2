@@ -13,17 +13,30 @@ WHERE u.id = $1 AND u.deleting_at IS NULL AND NOT p.is_public AND p.deleting_at 
   AND ($2::text IS NULL OR p.public_id COLLATE \"C\" < $2 COLLATE \"C\")
 ORDER BY p.public_id COLLATE \"C\" DESC LIMIT $3";
 
-const READ: &str = "
+// Keep the canonical track gate shared by the read projection and append.
+// Invite-scoped browser Library admissions have their own access contract.
+macro_rules! owned_membership {
+    () => {
+        "SELECT 1 FROM public.libraries l
+        JOIN public.library_tracks lt ON lt.library_id = l.id
+        WHERE l.user_id = $1 AND l.deleting_at IS NULL"
+    };
+}
+
+const READ: &str = concat!(
+    "
 SELECT jsonb_build_object('id', p.public_id, 'name', p.name, 'legacy_items', p.items,
   'entries', COALESCE((SELECT jsonb_agg(
     jsonb_build_object('id', e.id, 'position', e.position) ||
-    CASE WHEN EXISTS (SELECT FROM libraries l JOIN library_tracks lt ON lt.library_id = l.id
-        WHERE l.user_id = u.id AND l.deleting_at IS NULL AND lt.track_id = e.track_id)
+    CASE WHEN EXISTS (",
+    owned_membership!(),
+    " AND lt.track_id = e.track_id)
       THEN jsonb_build_object('track_id', e.track_id) ELSE '{\"dormant\":true}'::jsonb END
     ORDER BY e.position) FROM playlist_tracks e WHERE e.playlist_id = p.id), '[]'::jsonb))::text
 FROM playlists p JOIN users u ON u.id = p.owner_user_id
 WHERE u.id = $1 AND u.deleting_at IS NULL AND NOT p.is_public AND p.deleting_at IS NULL
-  AND p.public_id = $2";
+  AND p.public_id = $2"
+);
 
 const LOCK_ACCOUNT: &str = "SELECT 1 FROM users WHERE id = $1 AND deleting_at IS NULL FOR SHARE";
 const LOCK_PLAYLIST: &str = "
@@ -36,7 +49,10 @@ RETURNING jsonb_build_object('id', public_id, 'name', name)::text";
 const RENAME: &str = "UPDATE playlists SET name = $2 WHERE id = $1
 RETURNING jsonb_build_object('id', public_id, 'name', name)::text";
 
-const APPEND: &str = "
+// Hold one qualifying Library and membership through commit. PostgreSQL
+// rechecks the predicate if an in-flight fence or removal won the row lock.
+const APPEND: &str = concat!(
+    "
 WITH next AS (
   SELECT greatest(jsonb_array_length(p.items), (SELECT max(e.position) + 1
     FROM playlist_tracks e WHERE e.playlist_id = p.id)) AS position
@@ -44,10 +60,12 @@ WITH next AS (
 )
 INSERT INTO playlist_tracks (playlist_id, track_id, position)
 SELECT $2, $3::text::uuid, next.position FROM next WHERE next.position < $4
-  AND EXISTS (SELECT FROM libraries l JOIN library_tracks lt ON lt.library_id = l.id
-    WHERE l.user_id = $1 AND l.deleting_at IS NULL AND lt.track_id = $3::text::uuid)
+  AND EXISTS (",
+    owned_membership!(),
+    " AND lt.track_id = $3::text::uuid LIMIT 1 FOR SHARE OF l, lt)
   AND NOT EXISTS (SELECT FROM playlist_tracks e WHERE e.playlist_id = $2 AND e.track_id = $3::text::uuid)
-RETURNING jsonb_build_object('id', id, 'position', position)::text";
+RETURNING jsonb_build_object('id', id, 'position', position)::text"
+);
 
 const DELETE_REQUEST: &str = "
 WITH existing AS (

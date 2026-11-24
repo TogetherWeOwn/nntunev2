@@ -69,7 +69,7 @@ fixtures="$root/workers/api/tests/fixtures"
 psql_run -d nntune_ci -c 'CREATE DATABASE nntune_playlist_ci TEMPLATE nntune_app_ci'
 psql_run -d nntune_playlist_ci \
   -v corpus="$(<"$fixtures/legacy-playlists-v1.json")" \
-  -v playlist_schema="$(<"$fixtures/private_playlist_schema.sql")" \
+  -v playlist_schema="$(cat "$fixtures/private_playlist_tables.sql" "$fixtures/private_playlist_schema.sql")" \
   -v playlist_crud="$(<"$fixtures/private_playlist_crud.sql")" \
   < "$fixtures/private_playlist_rehearsal.sql"
 

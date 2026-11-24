@@ -229,10 +229,17 @@ least-privilege credential.
 
 - Third-party playback + library browse require an existing caller library
   membership (or an own dormant entry restored under the gate above).
+  The invite-scoped browser `GET /api/library` also projects exact private
+  publication admissions while the invite and source are eligible. These
+  admissions authorize that projection under the private-listening policy.
+  The playlist contract independently requires an active, owned Library with
+  a matching `library_tracks` row for canonical track access and append.
+  Without that membership, append returns 404 and existing entries stay dormant.
   This alignment does not ship or specify an entitled catalogue discovery/add
   surface to create a new subscriber's first membership (ADR 0002 §6).
-  Playback/library browse for a subscriber with neither membership nor an own
-  dormant entry remain unavailable until that separately gated surface ships;
+  Third-party playback and library browse for a subscriber with neither
+  membership nor an own dormant entry remain unavailable until that separately
+  gated surface ships;
   there is no unconditional day-one availability promise. Admin ingest alone
   does not provision subscriber memberships, and raw-id adds remain 404/70.
   There is no provider management on any user surface; ingest is admin-only,
