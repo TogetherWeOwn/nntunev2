@@ -258,6 +258,7 @@ pub struct Config {
     /// — an unverifiable webhook is never parsed, never acked.
     pub stripe_webhook_secret: Option<String>,
     pub(crate) paid_invite_billing: bool,
+    pub(crate) stripe_portal_configuration: Option<String>,
     /// Play-grant HMAC secret shared with the stream Worker
     /// (`PLAY_GRANT_SECRET`, [`crate::play_grant`]): the RAW string
     /// bytes, never base64-decoded — the stream side keys its verifier
@@ -347,6 +348,7 @@ impl Config {
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             paid_invite_billing: false,
+            stripe_portal_configuration: None,
             play_grant_secret: None,
             meter_sink_secret: None,
             rate_limits: crate::rate_limit::RateLimitConfig::default(),
@@ -4709,9 +4711,23 @@ where
     D: Dialer,
     N: AsyncDns,
 {
-    let (_claims, _token) = match ctx.authenticate(req, false).await {
+    let (claims, _token) = match ctx.authenticate(req, false).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
+    };
+    let purchase_bindings = if ctx.cfg.paid_billing_enabled() {
+        match ctx.store.load_reconcile_input(&claims.user_id, None).await {
+            Ok(input)
+                if input.live.is_none()
+                    && ctx.cfg.stripe_secret_key.is_some()
+                    && ctx.cfg.stripe_webhook_secret.is_some() =>
+            {
+                Some(input.bindings)
+            }
+            Ok(_) | Err(_) => Some(Vec::new()),
+        }
+    } else {
+        None
     };
     match ctx.store.plans().await {
         Ok(rows) => {
@@ -4719,7 +4735,10 @@ where
                 .iter()
                 .map(|row| {
                     let selectable = crate::plan_limits::PlanId::parse_id(&row.id)
-                        .is_some_and(|plan| plan != crate::plan_limits::PlanId::Free);
+                        .is_some_and(|plan| plan != crate::plan_limits::PlanId::Free)
+                        && purchase_bindings.as_ref().is_none_or(|bindings| {
+                            paid_invite_billing::selectable_test_price(bindings, &row.id).is_some()
+                        });
                     serde_json::json!({
                         "id": row.id,
                         "priceCents": row.price_cents,
@@ -4943,23 +4962,24 @@ where
     });
     let now_unix = i64::try_from(ctx.now).unwrap_or(i64::MAX);
     let state = crate::billing::account_state(view, ever_subscribed, now_unix);
-    json_response(
-        200,
-        serde_json::json!({
-            "state": state.as_str(),
-            "planId": row.as_ref().map(|row| row.plan_id.as_str()),
-            "status": row.as_ref().map(|row| row.status.as_str()),
-            "currentPeriodEnd": row
-                .as_ref()
-                .and_then(|row| row.current_period_end_unix)
-                .map(crate::ledger::iso8601_utc),
-            "graceUntil": row
-                .as_ref()
-                .and_then(|row| row.grace_until_unix)
-                .map(crate::ledger::iso8601_utc),
-            "cancelAtPeriodEnd": row.as_ref().is_some_and(|row| row.cancel_at_period_end),
-        }),
-    )
+    let mut body = serde_json::json!({
+        "state": state.as_str(),
+        "planId": row.as_ref().map(|row| row.plan_id.as_str()),
+        "status": row.as_ref().map(|row| row.status.as_str()),
+        "currentPeriodEnd": row
+            .as_ref()
+            .and_then(|row| row.current_period_end_unix)
+            .map(crate::ledger::iso8601_utc),
+        "graceUntil": row
+            .as_ref()
+            .and_then(|row| row.grace_until_unix)
+            .map(crate::ledger::iso8601_utc),
+        "cancelAtPeriodEnd": row.as_ref().is_some_and(|row| row.cancel_at_period_end),
+    });
+    if ctx.cfg.paid_billing_enabled() {
+        body["canChangePlan"] = serde_json::Value::Bool(false);
+    }
+    json_response(200, body)
 }
 
 /// `GET /v1/releases`: the caller's member release collection as a bare
@@ -8843,7 +8863,9 @@ where
         ("POST", BILLING_WEBHOOK_PATH) if ctx.cfg.paid_billing_enabled() => {
             Box::pin(billing_webhook(ctx, req)).await
         }
-        ("POST", paid_invite_billing::CHECKOUT) if ctx.cfg.paid_billing_enabled() => {
+        ("POST", paid_invite_billing::CHECKOUT | paid_invite_billing::PORTAL)
+            if ctx.cfg.paid_billing_enabled() =>
+        {
             paid_invite_billing::browser_purchase(ctx, req, expected_session_binding).await
         }
         // Catalogue slice 1: session-or-bearer reads over the
@@ -12264,6 +12286,7 @@ mod tests {
         scripted_line_pages: RefCell<std::collections::VecDeque<crate::stripe::InvoiceLines>>,
         /// Customer-create log `(user_id, test_clock)` for the seam assert.
         customers_created: RefCell<Vec<(Option<String>, Option<String>)>>,
+        portal_reply: RefCell<Option<crate::stripe::PortalSession>>,
         /// Checkout sessions minted through `create_checkout_session`.
         sessions_created: RefCell<usize>,
         /// Customers the minted sessions were bound to (proves a
@@ -12309,6 +12332,25 @@ mod tests {
     }
 
     impl crate::stripe::StripeTransport for FakeStripe {
+        fn create_portal_session(
+            &self,
+            customer: &str,
+            configuration: &str,
+            return_url: &str,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = crate::stripe::StripeResult<crate::stripe::PortalSession>> + '_,
+            >,
+        > {
+            assert_eq!(customer, "cus_test_1");
+            assert_eq!(configuration, "bpc_fixture");
+            assert_eq!(return_url, format!("{ORIGIN}/account/billing"));
+            let reply = self
+                .portal_reply
+                .take()
+                .ok_or_else(crate::stripe::StripeError::transport);
+            Box::pin(async { reply })
+        }
         fn create_customer(
             &self,
             req: crate::stripe::CreateCustomer,
@@ -12991,6 +13033,89 @@ mod tests {
         drop(ops);
         assert_eq!(buy(&h).status, 409);
         assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+    }
+
+    #[test]
+    fn paid_portal_and_plan_actions_follow_account_and_mapping() {
+        let mut h = stripe_harness();
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        h.config.stripe_portal_configuration = Some("bpc_fixture".into());
+        seed_billing_user(&h, "u1");
+        let cookie = cookie_of(&block_on(h.ctx().start_session("u1")).unwrap());
+        let request = |path, method, cookie| {
+            h.call_full(method, path, Some("{}".into()), cookie, Some(ORIGIN))
+        };
+        let portal = |cookie| request("/v1/billing/portal", "POST", cookie);
+        let authenticated_portal = || portal(Some(cookie.clone()));
+        for (plan_id, price_id) in [("free", "price_free"), ("pro-5x", "price_retired")] {
+            h.store
+                .billing_bindings
+                .borrow_mut()
+                .push(crate::billing_reconcile::PriceBinding {
+                    plan_id: plan_id.into(),
+                    price_id: price_id.into(),
+                    selectable: true,
+                    livemode: false,
+                });
+            let response = h.call_full(
+                "POST",
+                "/v1/billing/checkout",
+                Some(serde_json::json!({"planId": plan_id}).to_string()),
+                Some(cookie.clone()),
+                Some(ORIGIN),
+            );
+            assert_eq!(response.status, 400);
+        }
+        assert!(h.stripe.customers_created.borrow().is_empty());
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+        assert_eq!(portal(None).status, 401);
+        assert_eq!(authenticated_portal().status, 409);
+        h.store
+            .plans
+            .borrow_mut()
+            .extend(["plus", "max"].map(|id| PlanRow {
+                id: id.into(),
+                price_cents: 800,
+                stream_hours_month: 100,
+                max_concurrent_streams: 1,
+            }));
+        let plans = || {
+            let reply = request("/v1/plans", "GET", Some(cookie.clone()));
+            serde_json::from_str::<serde_json::Value>(&reply.body).unwrap()
+        };
+        assert_eq!(plans()["plans"][0]["selectable"], true);
+        assert_eq!(plans()["plans"][1]["selectable"], false);
+        deliver_first_period(&h, "evt_portal");
+        let valid = crate::stripe::PortalSession {
+            customer: "cus_test_1".into(),
+            livemode: false,
+            url: "https://billing.stripe.com/p/session_fixture".into(),
+        };
+        for invalid in [
+            crate::stripe::PortalSession {
+                customer: "cus_other".into(),
+                ..valid.clone()
+            },
+            crate::stripe::PortalSession {
+                livemode: true,
+                ..valid.clone()
+            },
+            crate::stripe::PortalSession {
+                url: "https://elsewhere.example/".into(),
+                ..valid.clone()
+            },
+        ] {
+            h.stripe.portal_reply.replace(Some(invalid));
+            assert_eq!(authenticated_portal().status, 503);
+        }
+        h.stripe.portal_reply.replace(Some(valid));
+        assert_eq!(authenticated_portal().status, 200);
+
+        assert_eq!(plans()["plans"][0]["selectable"], false);
+        let subscription = request("/v1/me/subscription", "GET", Some(cookie));
+        let subscription: serde_json::Value = serde_json::from_str(&subscription.body).unwrap();
+        assert_eq!(subscription["canChangePlan"], false);
     }
 
     #[test]

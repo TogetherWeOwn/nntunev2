@@ -30,18 +30,17 @@
 	});
 
 	onMount(async () => {
-		mounted = true;
 		try {
 			const dtos = await fetchPlans();
 			if (!alive) return;
 			const hydrated = dtos
 				.map((dto) => planFromDTO(dto))
-				.filter((plan): plan is Plan => plan !== undefined && plan.selectable);
-			// An empty or unrecognized response never blanks the page: the
-			// static fallback mirror stays.
-			if (hydrated.length > 0) plans = hydrated;
+				.filter((plan): plan is Plan => plan !== undefined && plan.id !== 'free');
+			plans = hydrated.length ? hydrated : plans.map((plan) => ({ ...plan, selectable: false }));
 		} catch {
-			/* signed-out 401 or backend unreachable: static fallback stays */
+			/* Signed-out visitors and failed reads keep the static pricing mirror. */
+		} finally {
+			if (alive) mounted = true;
 		}
 	});
 
@@ -49,7 +48,7 @@
 		// Serialize plan selections: ignore any activation while a checkout
 		// request is already in flight (defense in depth alongside the
 		// disabled buttons below).
-		if (!alive || pendingPlan !== null) return;
+		if (!alive || !mounted || pendingPlan !== null) return;
 		checkoutError = null;
 		pendingPlan = planId;
 		try {
@@ -125,13 +124,17 @@
 						<td>{plan.streamHoursMonth}{' '}</td>
 						<td>{plan.maxConcurrentStreams}{' '}</td>
 						<td>
-							<button
-								aria-label={planButtonName(plan, pendingPlan)}
-								disabled={!mounted || pendingPlan !== null}
-								onclick={() => choose(plan.id)}
-							>
-								{pendingPlan === plan.id ? 'Starting…' : 'Choose'}
-							</button>
+							{#if plan.selectable}
+								<button
+									aria-label={planButtonName(plan, pendingPlan)}
+									disabled={!mounted || pendingPlan !== null}
+									onclick={() => choose(plan.id)}
+								>
+									{pendingPlan === plan.id ? 'Starting…' : 'Choose'}
+								</button>
+							{:else}
+								<span>Unavailable</span>
+							{/if}
 						</td>
 					</tr>
 				{/each}

@@ -436,3 +436,14 @@ test('429 selection shows the paywall, no inline alert, and restores choices', a
 	await expect(dialog).toBeHidden();
 	await expectAllChoicesRestored(page);
 });
+
+
+test('an authoritative unmapped plan stays visible without checkout', async ({ page }) => {
+	await page.route('**/v1/plans', (route) => route.fulfill({ json: { plans: [
+		{ id: 'plus', priceCents: 800, streamHoursMonth: 100, maxConcurrentStreams: 1, selectable: false }
+	] } }));
+	await page.goto('/pricing');
+	const plus = page.getByRole('row').filter({ hasText: 'Plus' });
+	await expect(plus.getByText('Unavailable', { exact: true })).toBeVisible();
+	await expect(plus.getByRole('button')).toHaveCount(0);
+});

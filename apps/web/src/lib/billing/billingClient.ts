@@ -26,7 +26,7 @@ export interface PlanDTO {
 	priceCents: number;
 	streamHoursMonth: number;
 	maxConcurrentStreams: number;
-	/** False only for the reserved `free` row: listed for parity, never offered. */
+	/** Whether this tier is available for a new checkout. */
 	selectable: boolean;
 }
 
@@ -66,6 +66,8 @@ export interface SubscriptionDTO {
 	graceUntil: string | null;
 	/** True when cancellation is scheduled at the current period end. */
 	cancelAtPeriodEnd: boolean;
+	/** False in the first-purchase pilot, where existing plans use the portal. */
+	canChangePlan?: boolean;
 }
 
 /**
@@ -213,7 +215,7 @@ function isValidSubscriptionPayload(data: unknown): data is SubscriptionDTO {
 			return false;
 	}
 	if (typeof record.cancelAtPeriodEnd !== 'boolean') return false;
-	return true;
+	return record.canChangePlan === undefined || typeof record.canChangePlan === 'boolean';
 }
 
 /**

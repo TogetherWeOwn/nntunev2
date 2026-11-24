@@ -7349,6 +7349,24 @@ impl WorkerStripeTransport {
 }
 
 impl crate::stripe::StripeTransport for WorkerStripeTransport {
+    fn create_portal_session(
+        &self,
+        customer: &str,
+        configuration: &str,
+        return_url: &str,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::PortalSession>> + '_>,
+    > {
+        let request = crate::stripe::create_billing_portal_session_request(
+            customer,
+            configuration,
+            return_url,
+        );
+        Box::pin(async move {
+            self.send(&request.ok_or_else(crate::stripe::StripeError::transport)?)
+                .await
+        })
+    }
     fn create_customer(
         &self,
         req: crate::stripe::CreateCustomer,
