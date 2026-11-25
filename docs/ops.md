@@ -1167,10 +1167,12 @@ events are inconclusive. Verify the canceled play's committed settlement
 against the writer-acknowledged prefix independently. Clear the observation
 variable before the disable deploy.
 Retain the version ID, deployment ID, `BUILD_SHA` and playback mode from
-the Stream job summary alongside the browser run. To restore the default, clear
-`PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED` in the protected staging Environment and
-keep `STREAM_STAGING_DEPLOY_ENABLED=true` for the next protected deploy.
-Remove `PRIVATE_PLAYBACK_STAGING_ENABLED` and follow the [private journey
+the Stream job summary alongside the browser run. To restore the default,
+clear `PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED` first, then clear
+`PRIVATE_PLAYBACK_STAGING_ENABLED`. Remove each value wherever it is set in
+repository variables or the protected `staging` environment. Keep
+`STREAM_STAGING_DEPLOY_ENABLED=true` for the next protected deploy and follow
+the [private journey
 cleanup](../e2e/README.md#private-music-journey-preparation). Cancel queued or
 in-progress armed deploys and use a fresh protected push to `main` so the
 staging gate reads the cleared settings. A partial rerun can reuse the armed
