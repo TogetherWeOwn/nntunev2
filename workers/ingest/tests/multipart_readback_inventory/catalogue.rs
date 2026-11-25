@@ -11,6 +11,9 @@ use nntune_ingest::{
 };
 use tokio_postgres::Transaction;
 
+#[path = "operator_source.rs"]
+mod operator_source;
+
 const RELEASE: &str = "ab310000-0000-4000-8000-000000000000";
 const ROWS: &str = "SELECT t.track_no, s.source_job_id, s.object_id::text
     FROM public.tracks t LEFT JOIN public.catalogue_s3_sources s ON s.track_id = t.id
@@ -137,6 +140,7 @@ pub(super) async fn exercise(
     let mut tx = writer.transaction().await.unwrap();
     let track_id = stage(&mut tx, &first_match, &old).await.unwrap();
     tx.commit().await.unwrap();
+    operator_source::exercise(writer, contender, first, &track_id).await;
 
     const POINTER: &str = "SELECT s.source_job_id, l.s3_version_id
         FROM public.catalogue_s3_sources s JOIN public.storage_s3_locator_intents l USING (object_id)
@@ -171,6 +175,7 @@ pub(super) async fn exercise(
     assert_eq!(stage(&mut tx, &next_match, &new).await.unwrap(), track_id);
     refuse(&mut tx, &first_match, &old).await;
     tx.commit().await.unwrap();
+    operator_source::refuse_replaced(writer, first, &track_id).await;
 
     let mut tx = writer.transaction().await.unwrap();
     let second_match = occurrence("catalogue-new", object, 2);
