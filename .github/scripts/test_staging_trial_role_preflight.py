@@ -130,6 +130,8 @@ class TrialConnectionReadbackTests(unittest.TestCase):
                 self.assertEqual(preflight.binding_connection_verdict(identity_verdicts, incomplete_tls), "pending")
                 incomplete_tls[binding] = None
                 self.assertEqual(preflight.binding_connection_verdict(identity_verdicts, incomplete_tls), "pending")
+                pending_identity = {**identity_verdicts, binding: "pending"}
+                self.assertEqual(preflight.binding_connection_verdict(pending_identity, complete_tls), "pending")
 
 
 if __name__ == "__main__":
