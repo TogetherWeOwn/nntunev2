@@ -149,20 +149,24 @@ current traffic allocation and version using the comparison in the
 | Stale | `deployment-a` serves the previous `version-a` | Pending. The comparison returns `deployed-version-mismatch`. |
 | Matching control | `deployment-b` serves `version-b` | Matched when the version reports the reviewed build SHA and the closing deployment read still returns `deployment-b`. |
 
-For the stale case, mark C2 serving evidence pending. Put the expected
-version, observed deployment and version, and both evidence references in the
-protected C2 handoff. The trial operator hands the mismatch to Engineering in
-**Setup step 4, Verify isolated serving and cleanup access**. Engineering
-reconciles the serving route and version with the reviewed deployment through
-the existing protected staging deployment procedure and returns a fresh
-serving readback for that route. Retain the original setup record and its four
-IDs. Keep the trial disarmed.
-[Protected staging deploy](../../.github/workflows/deploy.yml)
+For the stale case, mark C2 serving evidence pending. In the protected C2
+handoff, cite the deploy record for the expected version and the saved
+protected deployment history for the observed deployment and version on the
+same Worker and route. The unavailable receipt carries only the mismatch
+reason. If the history is unavailable, leave the observed IDs unconfirmed.
+
+The trial operator hands the mismatch to Engineering in **Setup step 4,
+Verify isolated serving and cleanup access**. Engineering reconciles the
+active route and version with the deploy record through the separately
+reviewed isolated serving lane and returns a fresh readback for that route.
+Retain the original setup record and its four IDs. Keep the trial disarmed
+and serving evidence pending while that lane or readback is missing.
 
 The control clears the deployment identity check. The ordinary disarmed API
-deploy omits the four trial bindings. C2 still needs the protected read-only
-results through all four bindings on the exact reviewed trial version, with
-its existing origin, TLS and cache checks.
+deploy omits the four trial bindings. After a version change, C2 needs fresh
+binding readbacks and protected read-only results through all four bindings
+on the exact reviewed trial version. The existing origin, TLS and cache checks
+still apply.
 [Binding renderer](../../.github/scripts/staging_stream_config.py)
 · [Stage C2 Hyperdrive origin connection](#stage-c2-hyperdrive-origin-connection)
 
