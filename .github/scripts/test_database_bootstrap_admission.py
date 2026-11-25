@@ -195,6 +195,26 @@ def check_handoff_snapshot_branch(baseline_branch="fixture001"):
     check_snapshot("retry with matching completed evidence", post_setup | baseline_pin, accept=True, args=args)
 
 
+def check_snapshot_label_retry():
+    record = snapshot_record()
+    prior = record["snapshot"]
+    setup_completed_at = prior["captured_at"] - 1
+    handoff = {
+        "review": record["review"] | {"phase": "pre-migration", "setup_completed_at": setup_completed_at},
+        "baseline_branch_id": prior["branch_id"],
+    }
+    args = ("--baseline-handoff",)
+    # This synthetic response illustrates what the operator sees before normalizing a readback.
+    response = {"message": "Snapshot label fixture-handoff already exists"}
+    check_snapshot("retry with only a duplicate-label response", handoff | {"snapshot": response}, args=args)
+
+    # Both readbacks carry the same label outside the checker. The older snapshot
+    # completed after setup, but its capture belongs to the pre-setup state.
+    other = prior | {"captured_at": setup_completed_at - 1}
+    check_snapshot("retry with the older same-label snapshot", handoff | {"snapshot": other}, args=args)
+    check_snapshot("retry with the verified prior snapshot", handoff | {"snapshot": prior}, accept=True, args=args)
+
+
 if __name__ == "__main__":
     try:
         check_baseline_workflow()
@@ -203,6 +223,7 @@ if __name__ == "__main__":
         if Path(temp).exists():
             raise RuntimeError
         check_snapshot_readback()
+        check_snapshot_label_retry()
     except Exception:
         sys.exit("database-bootstrap-admission-fixture: failed")
     print("database-bootstrap-admission-fixture: run binding, snapshot readback, refusals and teardown passed")
