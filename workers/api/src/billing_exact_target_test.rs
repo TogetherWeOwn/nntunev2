@@ -430,6 +430,18 @@ async fn check_terminal_provenance(store: &PgStore) -> Result<(), &'static str> 
         ("canceled", "plus", OLD_ANCHOR, "plus"),
         ("incomplete_expired", "plus", NEW_ANCHOR, "max"),
     ] {
+        let mut held = listing.clone();
+        held.subscription.status = "paused".into();
+        held.subscription.current_period_end = Some(END - 1);
+        held.subscription.cancel_at_period_end = false;
+        let delayed_held = reconcile_exact_target(TERMINAL, local.clone(), &held, NOW)
+            .ok_or("delayed held fold missing")?;
+        if delayed_held.explicit_stale
+            || delayed_held.fail_closed.is_some()
+            || delayed_held.row.paid_through_unix != Some(END)
+        {
+            return Err("held fold did not carry equal-end proof from its original read");
+        }
         let mut terminal = listing.clone();
         terminal.subscription.status = status.into();
         terminal.subscription.current_period_end = Some(END - 1);
@@ -492,6 +504,13 @@ async fn check_terminal_provenance(store: &PgStore) -> Result<(), &'static str> 
             || delayed.read_anchor.as_deref() != Some(read_anchor)
         {
             return Err("fixture did not isolate one changed proof field at equal paid end");
+        }
+        store
+            .store_reconcile_owned(USER.into(), delayed_held, ReconcileProbe::None)
+            .await
+            .map_err(|_| "changed held proof did not resolve as a stale write")?;
+        if state(TERMINAL, None).await? != committed {
+            return Err("delayed held fold changed the newer row or history");
         }
         let refused = std::rc::Rc::new(std::cell::Cell::new(false));
         if store

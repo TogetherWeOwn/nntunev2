@@ -13,11 +13,14 @@ pub const LOCK_SUBSCRIPTIONS: &str = "LOCK TABLE public.subscriptions IN SHARE R
 /// Global key lookup for stale, live-slot, and equal-end proof observations.
 /// `IS TRUE` makes SQL NULL semantics yield an unambiguous stale predicate.
 /// The owner is deliberately not part of the lookup predicate.
+/// Keep the stale predicate in sync with the upsert's UPDATE guards. Both
+/// run under the same lock, so this lookup can explain an empty RETURNING result.
 pub const LOOKUP_TARGET: &str = "SELECT user_id, stripe_subscription_id, \
     (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND \
     (to_timestamp($2::bigint) < paid_through_at OR \
-    (to_timestamp($2::bigint) = paid_through_at AND $3::text IS NULL AND \
-    paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale, \
+    (to_timestamp($2::bigint) = paid_through_at AND (($3::text IS NULL AND \
+    paid_invoice_id IS NOT NULL) OR paid_invoice_id IS DISTINCT FROM $4::text OR \
+    plan_id IS DISTINCT FROM $5::text)))) IS TRUE AS predicate_stale, \
     EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = subscriptions.user_id \
     AND live.stripe_subscription_id <> subscriptions.stripe_subscription_id \
     AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) AS other_live_holder, \
@@ -362,17 +365,17 @@ mod tests {
             LOCK_SUBSCRIPTIONS,
             "LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE"
         );
-        assert_eq!(LOOKUP_TARGET, "SELECT user_id, stripe_subscription_id, (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND (to_timestamp($2::bigint) < paid_through_at OR (to_timestamp($2::bigint) = paid_through_at AND $3::text IS NULL AND paid_invoice_id IS NOT NULL))) IS TRUE AS predicate_stale, EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = subscriptions.user_id AND live.stripe_subscription_id <> subscriptions.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) AS other_live_holder, (to_timestamp($2::bigint) = paid_through_at AND (paid_invoice_id IS DISTINCT FROM $4::text OR plan_id IS DISTINCT FROM $5::text)) IS TRUE AS equal_end_provenance_changed FROM public.subscriptions WHERE stripe_subscription_id = $1");
+        assert_eq!(LOOKUP_TARGET, "SELECT user_id, stripe_subscription_id, (to_timestamp($2::bigint) IS NOT NULL AND paid_through_at IS NOT NULL AND (to_timestamp($2::bigint) < paid_through_at OR (to_timestamp($2::bigint) = paid_through_at AND (($3::text IS NULL AND paid_invoice_id IS NOT NULL) OR paid_invoice_id IS DISTINCT FROM $4::text OR plan_id IS DISTINCT FROM $5::text)))) IS TRUE AS predicate_stale, EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = subscriptions.user_id AND live.stripe_subscription_id <> subscriptions.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused')) AS other_live_holder, (to_timestamp($2::bigint) = paid_through_at AND (paid_invoice_id IS DISTINCT FROM $4::text OR plan_id IS DISTINCT FROM $5::text)) IS TRUE AS equal_end_provenance_changed FROM public.subscriptions WHERE stripe_subscription_id = $1");
     }
 
     #[test]
-    fn write_retains_legacy_binds_with_owner_and_live_slot_guards() {
+    fn write_retains_legacy_binds_with_provenance_owner_and_live_slot_guards() {
         let existing = crate::billing_reconcile::store_reconciled_subscription_statement();
         let expected = existing.replacen(
             "INSERT INTO subscriptions ",
             "INSERT INTO public.subscriptions ",
             1,
-        ) + " AND subscriptions.user_id = EXCLUDED.user_id AND (EXCLUDED.status NOT IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused') OR NOT EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = EXCLUDED.user_id AND live.stripe_subscription_id <> EXCLUDED.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused'))) RETURNING user_id, stripe_subscription_id";
+        ) + " AND (EXCLUDED.paid_through_at = subscriptions.paid_through_at AND (subscriptions.paid_invoice_id IS DISTINCT FROM $13 OR subscriptions.plan_id IS DISTINCT FROM $14)) IS NOT TRUE AND subscriptions.user_id = EXCLUDED.user_id AND (EXCLUDED.status NOT IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused') OR NOT EXISTS (SELECT 1 FROM public.subscriptions AS live WHERE live.user_id = EXCLUDED.user_id AND live.stripe_subscription_id <> EXCLUDED.stripe_subscription_id AND live.status IN ('incomplete', 'active', 'past_due', 'unpaid', 'paused'))) RETURNING user_id, stripe_subscription_id";
         assert_eq!(WRITE_SUBSCRIPTION.trim(), expected);
 
         // Pin the insert bind order and the three additional fold inputs.
