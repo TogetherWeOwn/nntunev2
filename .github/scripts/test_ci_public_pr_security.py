@@ -13,7 +13,14 @@ import subprocess
 import textwrap
 import unittest
 
-from test_ci_pnpm_retry import check_required_step, job_level_field, split_jobs
+from test_ci_pnpm_retry import (
+    check_required_step,
+    job_level_field,
+    non_plain_key_lines,
+    split_jobs,
+    split_steps,
+    step_level_field,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
@@ -102,8 +109,29 @@ class PublicPrSecurityTests(unittest.TestCase):
         self.assertIn("public-text", self.needs)
 
     def test_every_enforcing_job_remains_in_aggregate(self):
-        self.assertEqual(set(self.needs), set(self.jobs) - {"ci-ok", "worker-wasm-sizes"})
+        self.assertEqual(set(self.needs), set(self.jobs) - {"ci-ok"})
         self.assertEqual(len(self.needs), len(set(self.needs)))
+
+    def test_worker_wasm_report_uses_the_enforcing_build(self):
+        budget = "worker-wasm-budget"
+        command = "python3 .github/scripts/check_worker_wasm_budget.py"
+        self.assertNotIn("worker-wasm-sizes", self.jobs.keys())
+        self.assertEqual(self.text.count("report_worker_wasm_sizes.py"), 0)
+        self.assertIn(budget, self.needs)
+        job = self.jobs[budget]
+        self.assertEqual(job_level_field(job, "name"), "worker wasm budget (enforcing)")
+        self.assertEqual(non_plain_key_lines(job), [])
+        builds = [
+            step
+            for step in split_steps(job)
+            if command in (step_level_field(step, "run") or "")
+        ]
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(self.text.count(command), 1)
+        self.assertEqual(step_level_field(builds[0], "run"), command)
+        for field in ("if", "continue-on-error"):
+            self.assertIsNone(job_level_field(job, field))
+            self.assertIsNone(step_level_field(builds[0], field))
 
     def test_successful_public_pr(self):
         result = self.verdict("pull_request")

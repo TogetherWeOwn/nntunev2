@@ -1,8 +1,7 @@
 name: ci
 
 # `ci-ok` is a required check on main: its NAME must stay `ci-ok`, and every
-# gating job id must be listed in its `needs` (report-only jobs such as
-# worker-wasm-sizes are excluded by design).
+# gating job id must be listed in its `needs`.
 
 on:
   pull_request:
@@ -259,6 +258,7 @@ jobs:
   # to at most 3,000,000 bytes (see BUDGET_BYTES in the script). A missing,
   # unbuildable, or over-budget module fails this job, and the job is a
   # required member of ci-ok, so the budget fails the build fail-closed.
+  # The budget step also publishes the raw/gzip size report from this build.
   # Keep this job id in ci-ok's needs.
   worker-wasm-budget:
     name: worker wasm budget (enforcing)
@@ -279,40 +279,8 @@ jobs:
         run: python3 .github/scripts/test_check_worker_wasm_budget.py
       - name: Unit-test the budget check build paths
         run: python3 .github/scripts/test_check_worker_wasm_budget_builds.py
-      - name: Build Workers and enforce the compressed-size budget
+      - name: Build Workers, report sizes and enforce the compressed-size budget
         run: python3 .github/scripts/check_worker_wasm_budget.py
-
-  # Per-Worker compressed Wasm sizes: builds each Worker's release
-  # wasm32 cdylib, measures raw + gzip bytes, and publishes a per-Worker
-  # size table to the job summary. REPORT-ONLY: this job id is
-  # deliberately NOT in ci-ok's needs, the script exits 0 even when a
-  # Worker build fails (failures become error rows), and the job itself
-  # has continue-on-error -- so a size increase (or a broken report step)
-  # can never fail the build. No thresholds, no dependency-gate changes.
-  worker-wasm-sizes:
-    name: worker wasm sizes (report-only)
-    runs-on: ubuntu-latest
-    # Six Workers x 300 s per-Worker timeout = 30 min worst case, with 5 min
-    # headroom (see report_worker_wasm_sizes.py BUILD_TIMEOUT_SECONDS).
-    timeout-minutes: 35
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install Rust stable
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Unit-test the size reporter
-        run: python3 .github/scripts/test_report_worker_wasm_sizes.py
-      - name: Unit-test the size reporter I/O errors
-        run: python3 .github/scripts/test_report_worker_wasm_io_errors.py
-      - name: Build and report per-Worker compressed Wasm sizes
-        run: python3 .github/scripts/report_worker_wasm_sizes.py
 
   # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
   # internal hostnames, instance-UI paths and agent names in tracked text.

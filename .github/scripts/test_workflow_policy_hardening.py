@@ -23,7 +23,6 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
                 "rust-wasm": ("clippy", "wasm32-unknown-unknown"),
                 "cargo-deny": (None, None),
                 "worker-wasm-budget": (None, "wasm32-unknown-unknown"),
-                "worker-wasm-sizes": (None, "wasm32-unknown-unknown"),
                 "test-nntp": ("rustfmt,clippy", None),
                 "api": ("rustfmt,clippy", "wasm32-unknown-unknown"),
                 "api-migrations": (None, None),
