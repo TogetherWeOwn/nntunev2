@@ -11,7 +11,6 @@ use nntune_ingest::{
 };
 use serde::Deserialize;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio_postgres::{types::Type, Client};
 use worker::Env;
 use zeroize::Zeroizing;
 
@@ -25,6 +24,7 @@ use crate::{
 };
 
 use super::super::{
+    registered::registered_header,
     registration::{authorize_enrollment, connect_stage_role, load_authority, Enrollment},
     FIXTURE_BYTES,
 };
@@ -119,8 +119,9 @@ impl Selection {
         let root = Zeroizing::new(hex::<32>(&root).ok_or(Unconfirmed)?);
         let bearer = secret(env, "PRIVATE_TRIAL_UPLOAD_BEARER")?;
         let pepper = secret(env, "PRIVATE_TRIAL_UPLOAD_PEPPER")?;
-        let version = var(env, "PRIVATE_TRIAL_UPLOAD_PEPPER_VERSION")
-            .and_then(|number| number.parse().ok())
+        let version = secret(env, "PRIVATE_TRIAL_UPLOAD_PEPPER_VERSION")?
+            .parse()
+            .ok()
             .ok_or(Unconfirmed)?;
         let peppers = [Pepper {
             version,
@@ -143,9 +144,15 @@ impl Selection {
         ];
         let roles = bindings
             .iter()
-            .map(|name| var(env, &format!("{name}_ROLE")).ok_or(Unconfirmed))
+            .map(|name| secret(env, &format!("{name}_ROLE")))
             .collect::<Result<Vec<_>, _>>()?;
-        if roles.iter().collect::<std::collections::HashSet<_>>().len() != roles.len() {
+        if roles
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != roles.len()
+        {
             return Err(Refused);
         }
         let mut writer = connect_stage_role(env, bindings[0], &roles[0]).await?;
@@ -194,7 +201,7 @@ impl Selection {
         )
         .await?;
         let (header, sealed) = if let Some(header) =
-            registered_header(&reader, &upload_scope, identities, map, &self.job_id).await?
+            registered_header(&writer, &upload_scope, identities, map, &self.job_id).await?
         {
             (header, None)
         } else {
@@ -321,36 +328,4 @@ struct MirrorEvidence {
     title: String,
     exact_title_candidates: Vec<MbSearchHit>,
     recordings: Vec<serde_json::Value>,
-}
-
-// Only after owner/invite preflight and the live credential read.
-async fn registered_header(
-    reader: &Client,
-    scope: &CompletionScope<'_>,
-    identities: [[u8; 16]; 5],
-    map: [u8; 16],
-    job: &str,
-) -> Result<Option<[u8; 48]>, TrialError> {
-    let [environment, library, object, generation, configuration] = identities.map(uuid_text);
-    let row = reader.query_typed_opt(
-        "SELECT i.header_tag FROM public.ingest_session_reservations s
-         JOIN public.storage_object_intents i
-           ON i.object_id = s.multipart_object_id AND i.generation_id = s.checkpoint_generation
-         JOIN public.storage_library_namespaces l ON s.library_id = l.id AND l.owner_id IS NULL
-         WHERE s.id = $1::text::uuid AND s.principal_id = $2 AND s.fingerprint = $3
-           AND l.environment_id = $4::text::uuid AND l.id = $5::text::uuid
-           AND i.object_id = $6::text::uuid AND i.generation_id = $7::text::uuid
-           AND i.provider_configuration_version_id = $8::text::uuid
-           AND s.completed_map_id = $9::text::uuid AND s.terminal_reason = 'completed' AND s.idempotency_key = $10",
-        &[(&scope.session, Type::TEXT), (&scope.principal, Type::TEXT), (&scope.fingerprint.as_slice(), Type::BYTEA),
-          (&environment, Type::TEXT), (&library, Type::TEXT), (&object, Type::TEXT), (&generation, Type::TEXT),
-          (&configuration, Type::TEXT), (&uuid_text(map), Type::TEXT), (&job, Type::TEXT)],
-    ).await.map_err(|_| Unconfirmed)?;
-    row.map(|row| {
-        row.try_get::<_, &[u8]>(0)
-            .map_err(|_| Unconfirmed)?
-            .try_into()
-            .map_err(|_| Unconfirmed)
-    })
-    .transpose()
 }
