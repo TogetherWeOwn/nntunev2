@@ -12,12 +12,13 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 1. **Issue the scoped pair (77f).** The Chief of Staff owns the secure handoff of
    the temporary staging setup login. 77f uses the authorized issuer and pins
    the staging catalog plus the canonical reader and publication-writer names
-   and OIDs. Before application grants, read back two distinct logins with
-   direct staging `CONNECT`, `public` schema `USAGE` and the intended membership
-   shape. Stop if issuance or retirement authority, the target, or either
-   identity is unverified. Issuance uses the separate authorized provider
-   route. Before issuing, confirm the grant, verification and withdrawal path
-   against the landed instructions from
+   and OIDs. The authorized staging database owner provides direct staging
+   `CONNECT` at issuance, with `public` schema `USAGE` from the authorized
+   schema executor and the intended membership shape. Read back both logins
+   at that baseline. Stop if the issuer cannot establish it before application
+   grants, or if either identity, the target or retirement authority is
+   unverified. Before issuing, confirm the grant, verification and withdrawal
+   path against the landed instructions from
    [#1828](https://github.com/TogetherWeOwn/nntunev2/pull/1828). Follow the
    Operator's secure handoff for the temporary login's retirement.
 2. **Preflight before application grants (77f).** Supply the pinned scope as
@@ -29,18 +30,19 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    Clear the Environment secret after readback and retain the original scope
    securely for retries and retirement. See
    [#1814](https://github.com/TogetherWeOwn/nntunev2/pull/1814).
-3. **Verify base rights (77f), then apply the overlay (77c).** Read back the
-   exact base grants and both routed identities before handoff. Require the
-   publication writer's five column-scoped row-lock grants and enabled update
-   guards, and confirm the reader has no update access. Stop on ACL or identity
-   drift. 77c sets `PRIVATE_TRIAL_SCHEMA_WRITER_ROLE` and
+3. **Grant and verify base rights (77f), then apply the overlay (77c).** After
+   preflight passes, use the landed lifecycle's `grant` and `verify` actions
+   for exact base rights and both routed identities. Require the publication
+   writer's five column-scoped row-lock grants and enabled update guards, and
+   confirm the reader has no update access. Stop on ACL or identity drift.
+   77c sets `PRIVATE_TRIAL_SCHEMA_WRITER_ROLE` and
    `PRIVATE_TRIAL_SCHEMA_READER_ROLE` in staging for that pair. Dispatch
    [`migrations-staging-apply`](../../.github/workflows/migrations-staging-apply.yml)
    from protected `main` with `file=private-trial`, `mode=single`, the full
    reviewed `ref`, `applied_by` and the recorded exact-DDL approval in
    `board_approval`. Require a successful job, its bundle digest and matching
-   admission-table receipt. 77f verifies the effective overlay ACLs for both
-   routed roles before 77c binds them. See the
+   admission-table receipt. 77f uses `verify-overlay` to check the effective
+   ACLs for both routed roles before 77c binds them. See the
    [schema and lock instructions](../ops.md#private-trial-schema),
    [#1800](https://github.com/TogetherWeOwn/nntunev2/pull/1800) and
    [#1817](https://github.com/TogetherWeOwn/nntunev2/pull/1817).
@@ -51,7 +53,9 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    staging MusicBrainz binding, API–Stream service bindings, dedicated fixture
    bucket and matching storage configuration and root versions. Confirm a
    protected, reviewed runner can retire the selected fixture and confirm exact
-   version absence. Stop if any binding, identity or cleanup path is missing.
+   version absence using separate, scoped cleanup access. Record a separate
+   reuse or retirement disposition for the prepublished companion and its trial
+   admission. Stop if any binding, identity or cleanup path is missing.
    See [#1816](https://github.com/TogetherWeOwn/nntunev2/pull/1816) and the
    [staging binding instructions](../ops.md#private-stream-staging).
 5. **Arm and qualify one synthetic journey (77c).** Follow the
@@ -65,14 +69,19 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    Refresh. Check playback advances, the authenticated nonzero byte range is
    exact, paused seek fires `seeked` and resumes from the selected position,
    Next selects tone B, and cutoff denies Library and playback retry. Stop on
-   any missing or mixed-build readback. Retain the selected upload, publication
-   and versioned storage pins for cleanup.
+   any missing or mixed-build readback. Before acceptance, run the
+   [relay disconnect drill](../ops.md#private-stream-staging). Require upstream
+   abort and settlement for the acknowledged byte prefix, plus a separate EOF
+   control that reports completion. Retain the selected tone A upload,
+   publication and versioned storage pins for cleanup. Keep tone B's pins
+   separately for its recorded disposition.
 
 ## Retire and recover
 
 1. **Contain and retire the selected fixture (77c).** Stop new trial activity.
-   After the cutoff checks, revoke the stepped-up owner session, clear the
-   single-use fixture and cohort settings, and follow the
+   After the cutoff checks, revoke the stepped-up owner session. Clear
+   `PRIVATE_MUSIC_STAGING_JOURNEY`, `PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION`,
+   the single-use fixture and cohort settings, then follow the
    [disable deploy](../ops.md#private-stream-staging). Cancel queued or running
    armed deploys and use a fresh protected `main` push so the gate reads the
    cleared settings. Require a deployed API and a Stream receipt showing
@@ -81,12 +90,13 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    Keep the selected pins and authorized cleanup access until cleanup finishes.
    After the cohort cutoff and all retention and lease windows, run the
    [selected-fixture retirement path](../../workers/api/src/handlers/private_trial/cleanup.rs)
-   against the exact trial scope, invite, upload session, job, track, object
-   and bucket. Require the admission and digest reference to be retired, the
-   exact media and digest page versions absent, and the selected source row
-   removed. Stop on a refusal, shared reference or ambiguous version readback.
+   for tone A against the exact trial scope, invite, upload session, job,
+   track, object and bucket. Require the admission and digest reference to be
+   retired, the exact media and digest page versions absent, and the selected
+   source row removed. Stop on a refusal, shared reference or ambiguous readback.
    For a partial delete or unconfirmed cleanup commit, resume using the same
    pins and confirm both versions, including any version already absent.
+   Handle tone B and its admission through the separate fixture disposition.
 2. **Withdraw access (77f with 77c and the schema owner).** Once trial bindings
    are removed, clear both overlay role variables. Using the original pinned
    scope, fence and drain the two logins, withdraw their overlay grants with
