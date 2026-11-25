@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from staging_apply import SECRET_ENV, StagingApplyError, evidence_child_env, load_entries
+from staging_stream_config import TRIAL_DATABASES
 from staging_trial_schema import BASELINE, ROLE_RE
 
 
@@ -108,6 +109,22 @@ COMMIT;
     checks = ("issued identities", "login attributes", "role membership", "staging access", "database isolation",
               "object ownership", "schema creation", "relation and sequence access", "privileged routines")
     return dict(zip(checks, (value == "t" for value in result.stdout.strip().split("|")), strict=True))
+
+
+def binding_connection_verdict(identity_verdicts, origin_tls_attestations):
+    """Evaluate the four-binding readback from independently verified verdicts.
+
+    A TLS verdict is True only after the existing origin TLS evidence has
+    been verified for that binding's connection. This check does not collect
+    evidence or determine whether the trial can be armed.
+    """
+    bindings = {f"PRIVATE_TRIAL_{role}_DB" for role in TRIAL_DATABASES}
+    if (type(identity_verdicts) is dict and identity_verdicts.keys() == bindings
+            and type(origin_tls_attestations) is dict and origin_tls_attestations.keys() == bindings
+            and all(identity_verdicts[binding] == "matched"
+                    and origin_tls_attestations[binding] is True for binding in bindings)):
+        return "qualified"
+    return "pending"
 
 
 def main():
