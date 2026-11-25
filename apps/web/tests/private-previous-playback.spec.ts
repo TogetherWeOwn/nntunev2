@@ -20,7 +20,7 @@ const audioBodies = new Map([
 ]);
 
 declare global {
-	interface Window { __privatePreviousAction?: MediaSessionActionHandler }
+	interface Window { __privatePreviousActions: Partial<Record<'previoustrack' | 'play', MediaSessionActionHandler>> }
 }
 
 const test = base.extend<{ origin: string }>({
@@ -101,9 +101,10 @@ for (const [scenario, title] of Object.entries(scenarios)) {
 		await page.addInitScript(() => {
 			const session = navigator.mediaSession;
 			const register = session.setActionHandler.bind(session);
+			window.__privatePreviousActions = {};
 			session.setActionHandler = (action, handler) => {
 				register(action, handler);
-				if (action === 'previoustrack') window.__privatePreviousAction = handler ?? undefined;
+				if (action === 'previoustrack' || action === 'play') window.__privatePreviousActions[action] = handler ?? undefined;
 			};
 		});
 
@@ -150,7 +151,7 @@ for (const [scenario, title] of Object.entries(scenarios)) {
 				node.addEventListener('seeked', () => resolve(), { once: true });
 				node.currentTime = 0.5;
 			});
-			const previous = window.__privatePreviousAction;
+			const previous = window.__privatePreviousActions.previoustrack;
 			if (!previous) throw new Error('Missing Media Session Previous handler');
 			const snapshot = { position: node.currentTime, source: node.currentSrc, playing: !node.paused };
 			previous({ action: 'previoustrack' });
@@ -181,7 +182,11 @@ for (const [scenario, title] of Object.entries(scenarios)) {
 			await expect(audio).toHaveCount(0);
 			expect(await native.evaluate((node: HTMLAudioElement) => !node.isConnected && node.paused)).toBe(true);
 			await expect(active).toHaveAttribute(player.queueId, selected.id);
-			await transport.getByRole('button', { name: 'Play', exact: true }).click();
+			await page.evaluate(() => {
+				const play = window.__privatePreviousActions.play;
+				if (!play) throw new Error('Missing paused Media Session Play handler');
+				play({ action: 'play' });
+			});
 			const resumedSource = `${playsUrl}/media/${selected.id}/${tab}/previous_fixture_3`;
 			await expectPlaying(resumedSource);
 			expect(grants.map((request) => request.postDataJSON())).toEqual([
