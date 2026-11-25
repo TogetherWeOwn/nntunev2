@@ -2,7 +2,10 @@
 
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const { once } = require('node:events');
+const { readFileSync } = require('node:fs');
 const { test } = require('node:test');
+const { createServer } = require('node:tls');
 const { qualify } = require('../../../../.github/scripts/private_trial_provider_preflight.cjs');
 const { authorization, mediaKey, sha256 } = require('./s3_fixture_protocol.cjs');
 
@@ -11,31 +14,36 @@ const region = 'fixture-region';
 const bucket = 'nntunev2-private-fixtures-staging';
 const generation = 'cdcdcdcdcdcd40cd80cdcdcdcdcdcdcd';
 const version = 'disposable+/=?';
+const sibling = 'other-version';
 const key = `media/00000000000040008000000000000000/${generation}`;
 const path = `/${bucket}/${key}`;
-const query = `versionId=${encodeURIComponent(version)}`;
-const url = `${endpoint}${path}?${query}`;
+const queryFor = pin => `versionId=${encodeURIComponent(pin)}`;
+const urlFor = (origin, pin) => `${origin}${path}?${queryFor(pin)}`;
 const credential = { access_key: 'FIXTUREACCESS', secret_key: 'fixture-secret' };
-const methods = ['HEAD', 'DELETE', 'HEAD', 'DELETE', 'HEAD'];
+const plan = [['HEAD', version], ['HEAD', sibling], ['DELETE', version], ['HEAD', version],
+  ['DELETE', version], ['HEAD', version], ['HEAD', sibling]];
 
-async function exercise(t, scenario = {}) {
-  const scope = { bucket, endpoint, region, generation, version, ...scenario.scope };
-  const inventory = new Map([[key, new Set([version, 'other-version'])], [mediaKey, new Set([version])]]);
+async function exercise(scenario = {}) {
+  const scope = { bucket, endpoint, region, generation, version, sibling_version: sibling, ...scenario.scope };
+  const inventory = new Map([[key, new Set([version, sibling])], [mediaKey, new Set([version])]]);
   const requests = [];
   let deleted = false;
-  t.mock.method(globalThis, 'fetch', async (request) => {
+  const send = async (request) => {
     const step = requests.push(request) - 1;
-    if (request.url !== url || request.method !== methods[step]) throw new Error('outside synthetic selection');
+    const [method, pin] = plan[step] ?? [];
+    const url = urlFor(endpoint, pin);
+    if (request.url !== url || request.method !== method) throw new Error('outside synthetic selection');
     const selected = inventory.get(key);
-    const present = selected.has(version);
+    const present = selected.has(pin);
     const reply = {
-      status: request.method === 'DELETE' ? 204 : present ? 200 : 404,
-      headers: step % 2 === 1 || present ? { 'x-amz-version-id': version } : {},
+      status: method === 'DELETE' ? 204 : present ? 200 : 404,
+      headers: method === 'DELETE' || present ? { 'x-amz-version-id': pin } : {},
       url,
       ...scenario.at?.[step],
     };
-    if (request.method === 'DELETE' && reply.status === 204) {
-      selected.delete(version);
+    if (method === 'DELETE' && reply.status === 204) {
+      if (scenario.wipeHistory) selected.clear();
+      else selected.delete(pin);
       deleted = true;
     }
     // Fetch disallows constructing a 204 with a body. Inject that malformed reply for refusal coverage.
@@ -45,13 +53,15 @@ async function exercise(t, scenario = {}) {
     });
     Object.defineProperties(response, { url: { value: reply.url }, status: { value: reply.status } });
     return response;
-  });
+  };
   const result = await qualify(process.env.INGEST_WASM_JS, endpoint, region,
-    JSON.stringify(scope), JSON.stringify(credential));
+    JSON.stringify(scope), JSON.stringify(credential), send);
   assert.equal(result, scenario.result ?? 'qualified');
-  assert.deepEqual(requests.map(request => request.method), methods.slice(0, scenario.steps ?? methods.length));
-  for (const request of requests) {
-    assert.equal(request.url, url);
+  const expected = plan.slice(0, scenario.steps ?? plan.length);
+  assert.deepEqual(requests.map(request => [request.method, request.url]),
+    expected.map(([method, pin]) => [method, urlFor(endpoint, pin)]));
+  for (const [index, request] of requests.entries()) {
+    const [, pin] = expected[index];
     assert.equal(request.redirect, 'manual');
     assert.equal(request.cache, 'no-store');
     assert.equal((await request.arrayBuffer()).byteLength, 0);
@@ -61,14 +71,15 @@ async function exercise(t, scenario = {}) {
       'x-amz-date': request.headers.get('x-amz-date'),
     };
     assert.equal(request.headers.get('authorization'),
-      authorization(request.method, path, query, fields, credential.access_key, credential.secret_key, region));
+      authorization(request.method, path, queryFor(pin), fields, credential.access_key, credential.secret_key, region));
   }
-  assert.deepEqual([...inventory.get(key)], deleted ? ['other-version'] : [version, 'other-version']);
+  assert.deepEqual([...inventory.get(key)], deleted ? (scenario.wipeHistory ? [] : [sibling]) : [version, sibling]);
   assert.deepEqual([...inventory.get(mediaKey)], [version]);
 }
 
-test('synthetic provider proof reads, deletes and reconfirms only the selected disposable version', async (t) => {
-  await exercise(t, { at: { 2: { headers: { 'x-amz-version-id': version } }, 3: { headers: {} } } });
+test('synthetic provider proof reads, deletes and reconfirms only the selected disposable version', async () => {
+  await exercise({ at: { 3: { headers: { 'x-amz-version-id': version } }, 4: { headers: {} } } });
+  await exercise({ wipeHistory: true, result: 'unconfirmed' });
 });
 
 test('synthetic provider proof stops on invalid selection or ambiguous replies', async (t) => {
@@ -79,27 +90,63 @@ test('synthetic provider proof stops on invalid selection or ambiguous replies',
     ['scope bucket differs', { scope: { bucket: 'foreign-bucket' }, steps: 0, result: 'refused' }],
     ['key injection', { scope: { generation: '../' + mediaKey }, steps: 0, result: 'refused' }],
     ['unversioned selection', { scope: { version: 'null' }, steps: 0, result: 'refused' }],
+    ['sibling aliases the selected version', { scope: { sibling_version: version }, steps: 0, result: 'refused' }],
     ['HEAD denied', 0, { status: 403 }],
     ['selected version absent at entry', 0, { status: 404 }],
     ['missing present version', 0, { headers: {} }],
     ['wrong present version', 0, { headers: wrongVersion }],
     ['duplicate present version', 0, { headers: [['x-amz-version-id', version], ['x-amz-version-id', version]] }],
-    ['wrong response origin', 0, { url: url.replace(endpoint, 'https://foreign.test') }],
+    ['wrong response origin', 0, { url: urlFor('https://foreign.test', version) }],
     ['redirect', 0, { status: 307 }],
-    ['DELETE denied', 1, { status: 403 }],
-    ['wrong DELETE version', 1, { headers: wrongVersion }],
-    ['nonempty DELETE', 1, { body: 'unexpected' }],
-    ['ambiguous 204 framing', 1, { headers: { 'content-length': '1' } }],
-    ['post-delete HEAD denied', 2, { status: 403 }],
-    ['nonempty HEAD 404', 2, { body: 'unexpected' }],
-    ['wrong absent version', 2, { headers: wrongVersion }],
-    ['repeat DELETE denied', 3, { status: 403 }],
-    ['repeat HEAD reports present', 4, { status: 200 }],
+    ['sibling missing before delete', 1, { status: 404 }],
+    ['DELETE denied', 2, { status: 403 }],
+    ['wrong DELETE version', 2, { headers: wrongVersion }],
+    ['nonempty DELETE', 2, { body: 'unexpected' }],
+    ['ambiguous 204 framing', 2, { headers: { 'content-length': '1' } }],
+    ['post-delete HEAD denied', 3, { status: 403 }],
+    ['nonempty HEAD 404', 3, { body: 'unexpected' }],
+    ['wrong absent version', 3, { headers: wrongVersion }],
+    ['repeat DELETE denied', 4, { status: 403 }],
+    ['repeat HEAD reports present', 5, { status: 200 }],
   ];
   for (const [name, step, reply] of cases) {
-    await t.test(name, (t) => exercise(t, reply
+    await t.test(name, () => exercise(reply
       ? { at: { [step]: reply }, steps: step + 1, result: 'unconfirmed' }
       : step));
+  }
+});
+
+test('synthetic TLS origin refuses trailing bytes after an otherwise valid HEAD or DELETE', async (t) => {
+  let lines = [];
+  let corruptStep = -1;
+  const server = createServer({ key: readFileSync(process.env.S3_FIXTURE_KEY),
+    cert: readFileSync(process.env.NODE_EXTRA_CA_CERTS) }, (socket) => {
+    socket.on('error', () => {});
+    let input = '';
+    socket.on('data', (chunk) => {
+      input += chunk;
+      if (!input.endsWith('\r\n\r\n')) return;
+      const step = lines.push(input.split('\r\n')[0]) - 1;
+      const [, pin] = plan[step];
+      const status = ['200 OK', '200 OK', '204 No Content', '404 Not Found',
+        '204 No Content', '404 Not Found', '200 OK'][step];
+      const length = status.startsWith('204') ? '' : 'Content-Length: 7\r\n';
+      socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\n${length}x-amz-version-id: ${pin}\r\n\r\n`);
+      socket.end(step === corruptStep ? 'payload' : undefined);
+    });
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const origin = `https://127.0.0.1:${server.address().port}`;
+  const scope = { bucket, endpoint: origin, region, generation, version, sibling_version: sibling };
+  for (const step of [-1, 2, 5]) {
+    lines = [];
+    corruptStep = step;
+    assert.equal(await qualify(process.env.INGEST_WASM_JS, origin, region,
+      JSON.stringify(scope), JSON.stringify(credential)), step < 0 ? 'qualified' : 'unconfirmed');
+    assert.deepEqual(lines, plan.slice(0, step < 0 ? plan.length : step + 1)
+      .map(([method, pin]) => `${method} ${path}?${queryFor(pin)} HTTP/1.1`));
   }
 });
 

@@ -2257,12 +2257,6 @@ jobs:
           cargo build --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown --features cleanup-dispatch-wasm-test,s3-completion-wasm-test --target-dir "$RUNNER_TEMP/ingest-wasm-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/ingest-wasm-js" "$RUNNER_TEMP/ingest-wasm-target/wasm32-unknown-unknown/debug/nntune_ingest.wasm"
           INGEST_WASM_JS="$RUNNER_TEMP/ingest-wasm-js/nntune_ingest.js" node --test workers/ingest/tests/cleanup_dispatch_wasm.cjs workers/ingest/tests/fixtures/s3_completion_wasm.cjs
-      - name: Exercise the standalone provider preflight with a synthetic version
-        run: |
-          set -euo pipefail
-          cargo build --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown --no-default-features --features fixture-provider-preflight --target-dir "$RUNNER_TEMP/ingest-wasm-target"
-          wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/preflight-js" "$RUNNER_TEMP/ingest-wasm-target/wasm32-unknown-unknown/debug/nntune_ingest.wasm"
-          INGEST_WASM_JS="$RUNNER_TEMP/preflight-js/nntune_ingest.js" node --test workers/ingest/tests/fixtures/s3_fixture_preflight.cjs
       - name: Exercise encrypted upload, catalogue publication and version-pinned playback
         env:
           DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
@@ -2285,6 +2279,13 @@ jobs:
           export NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/s3-fixture/loopback.crt" S3_FIXTURE_KEY="$RUNNER_TEMP/s3-fixture/loopback.key"
           openssl req -x509 -newkey rsa:2048 -noenc -days 1 -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1 -keyout "$S3_FIXTURE_KEY" -out "$NODE_EXTRA_CA_CERTS"
           INGEST_WASM_JS="$RUNNER_TEMP/ingest-wasm-js/nntune_ingest.js" CATALOGUE_PLAYBACK_WASM_JS="$RUNNER_TEMP/catalogue-playback-js/nntune_api.js" S3_FIXTURE_WASM="$RUNNER_TEMP/s3-fixture/nntune_stream.js" node --test workers/ingest/tests/fixtures/s3_upload_playback_https.cjs
+      - name: Exercise the standalone provider preflight with a synthetic version
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path workers/ingest/Cargo.toml --target wasm32-unknown-unknown --no-default-features --features fixture-provider-preflight --target-dir "$RUNNER_TEMP/ingest-wasm-target"
+          wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/preflight-js" "$RUNNER_TEMP/ingest-wasm-target/wasm32-unknown-unknown/debug/nntune_ingest.wasm"
+          export NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/s3-fixture/loopback.crt" S3_FIXTURE_KEY="$RUNNER_TEMP/s3-fixture/loopback.key"
+          INGEST_WASM_JS="$RUNNER_TEMP/preflight-js/nntune_ingest.js" node --test workers/ingest/tests/fixtures/s3_fixture_preflight.cjs
       # Reuse the existing locked Wrangler dependency. No root prepare or
       # dependency install scripts are needed for upload-only dry-runs.
       - name: Install locked upload CLI without lifecycle scripts

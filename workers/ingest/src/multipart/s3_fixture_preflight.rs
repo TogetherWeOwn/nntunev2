@@ -17,6 +17,7 @@ struct Scope {
     region: String,
     generation: String,
     version: String,
+    sibling_version: String,
 }
 
 #[derive(Deserialize)]
@@ -56,19 +57,27 @@ pub async fn qualify_disposable_version(
         )?;
         let key = format!("media/{DISPOSABLE_OBJECT}/{}", scope.generation);
         let version = &scope.version;
-        let until = super::super::now() + Duration::from_secs(20);
-        let present = remover.send("HEAD", BUCKET, &key, version, until).await?;
-        if present.status != 200 || !present.body.is_empty() {
-            return Err(Unconfirmed);
+        let sibling = &scope.sibling_version;
+        if version == sibling || !super::super::readback::valid_version(sibling) {
+            return Err(Refused);
         }
-        check_version(&present, version, true)?;
+        let until = super::super::now() + Duration::from_secs(20);
+        let require_present = async |pin: &str| {
+            let present = remover.send("HEAD", BUCKET, &key, pin, until).await?;
+            if present.status != 200 || !present.body.is_empty() {
+                return Err(Unconfirmed);
+            }
+            check_version(&present, pin, true)
+        };
+        require_present(version).await?;
+        require_present(sibling).await?;
         for _ in 0..2 {
             let absent = remover
                 .delete_and_read_absence(BUCKET, &key, version, until)
                 .await?;
             check_version(&absent, version, false)?;
         }
-        Ok(())
+        require_present(sibling).await
     }
     .await;
     match result {
