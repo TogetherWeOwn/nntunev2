@@ -141,6 +141,24 @@ time, recovery outcome and final allocation. A successful watch ends with all
 readbacks healthy after at least 30 minutes. Record the outcome in the release
 thread and product log. [Observability runbook](runbook-observability.md)
 
+### Rehearse the paired backend readback offline
+
+Run `python3 -I -B -m unittest discover -s .github/scripts -p test_production_backend_readback.py -v`
+to exercise the [release caller](../.github/scripts/production_backend_readback.py)
+with synthetic provider responses. It takes the reviewed candidate SHA, the
+reviewed provider account, and a `WorkerPin` for each of `nntune-api` and
+`nntune-stream`. Get both Workers' build, version and deployment IDs from
+their reviewed publication evidence, independently of the readback. The
+existing Web promotion receipt supplies only Web evidence.
+
+The caller requires a silent, uncached reader that returns the decoded
+provider result and enforces the supplied monotonic deadline through the
+entire request. A match returns exit status 0. A refusal returns 1. Both
+print only a verdict and any applicable fixed backend and reason labels.
+The rehearsal has no live reader or deploy hook. A match describes serving
+allocations at the time of the readback. Health, access and admission use
+their existing checks.
+
 ### Check the observation record offline
 
 Run `python3 ci/production_observation.py pins.json watch.json` on two private

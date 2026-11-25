@@ -1518,6 +1518,8 @@ jobs:
         run: python3 ci/test_read_promotion_receipt.py
       - name: Test private-release API and Stream identity readback offline
         run: python3 -I -B -m unittest discover -s .github/scripts -p test_production_backend_identity.py
+      - name: Rehearse the paired backend readback caller offline
+        run: python3 -I -B -m unittest discover -s .github/scripts -p test_production_backend_readback.py
       - name: Unit-test gate incident reporting (offline API fixtures)
         run: python3 -I ci/test_incident_report.py
       - name: Promotion proof scripts parse clean
