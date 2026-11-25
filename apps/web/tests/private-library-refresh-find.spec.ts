@@ -16,11 +16,11 @@ test('Refresh updates the invited Library while Find stays active', async ({ pag
 	await context.route('**/*', async (route) => {
 		const request = route.request();
 		const { origin: requestOrigin, pathname, search } = new URL(request.url());
+		if (requestOrigin === origin && pathname === library.api) listingReads += 1;
 		if (requestOrigin !== origin || request.method() !== 'GET') return route.abort();
 		if (!search && (pathname === library.api || pathname === verifierPath)) {
 			if (!hasFixtureSession(await request.headerValue('cookie'), listener)) return route.fulfill({ status: 401 });
 			if (pathname === verifierPath) return route.fulfill({ json: { session_binding: binding } });
-			listingReads += 1;
 			return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: listing });
 		}
 		if (pathname.startsWith('/api/') || pathname.startsWith('/v1/')) return route.fulfill({ status: 404 });
