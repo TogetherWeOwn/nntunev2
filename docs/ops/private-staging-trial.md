@@ -157,8 +157,10 @@ needs list access as a stop. Keep the scope and credentials in protected custody
 For a hosted run, use [staging-trial-provider-preflight](../../.github/workflows/staging-trial-provider-preflight.yml).
 Prepare the two disposable versions and read back the credential policy as
 described below. Supply the four settings below as secrets in the existing
-`staging` Environment for this run. Source the endpoint and region from trusted
-staging settings. Keep the exact scope JSON and the disposable credential in
+`staging` Environment for this run. The endpoint and region secrets must match
+the existing staging Actions variables of the same names. The workflow compares
+them before sending a request and keeps the variable values out of its logs.
+Keep the exact scope JSON and the disposable credential in
 protected custody. Use the SHA-256 of the exact UTF-8 bytes supplied as the
 scope secret. The dispatch inputs contain only the reviewed full `main` commit
 SHA and the lowercase scope digest.

@@ -65,6 +65,11 @@ jobs:
           git diff --exit-code -- workers/ingest/Cargo.lock
       - name: Run the bound disposable provider probe
         env:
+          PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: >-
+            ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT != '' &&
+                vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT == secrets.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT &&
+                vars.PRIVATE_PLAYBACK_STAGING_S3_REGION != '' &&
+                vars.PRIVATE_PLAYBACK_STAGING_S3_REGION == secrets.PRIVATE_PLAYBACK_STAGING_S3_REGION }}
           PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: ${{ inputs.scope_sha256 }}
           PRIVATE_TRIAL_PREFLIGHT_SCOPE: ${{ secrets.PRIVATE_TRIAL_PREFLIGHT_SCOPE }}
           PRIVATE_TRIAL_PREFLIGHT_S3: ${{ secrets.PRIVATE_TRIAL_PREFLIGHT_S3 }}

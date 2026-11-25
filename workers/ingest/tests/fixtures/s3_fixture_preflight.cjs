@@ -160,8 +160,10 @@ test('synthetic TLS origin checks signed headers and refuses ambiguous wire repl
             PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: origin,
             PRIVATE_PLAYBACK_STAGING_S3_REGION: region,
             PRIVATE_TRIAL_PREFLIGHT_SCOPE: scopeJson,
-            ...(scenario.mode === '--provider-dispatch'
-              ? { PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: sha256(scopeJson) } : {}),
+            ...(scenario.mode === '--provider-dispatch' ? {
+              PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: 'true',
+              PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: sha256(scopeJson),
+            } : {}),
             PRIVATE_TRIAL_PREFLIGHT_S3: JSON.stringify(credential),
           },
         });
@@ -201,16 +203,21 @@ test('the operator entry requires explicit provider invocation and prints a fixe
   assert.equal(child.stderr, '');
 });
 
-test('the hosted entry refuses missing or changed scope before loading the bundle', () => {
+test('the hosted entry refuses provider-setting drift and scope mismatches before loading the bundle', () => {
   const scope = JSON.stringify({ bucket, endpoint, region, generation, version, sibling_version: sibling });
   const digest = sha256(scope);
-  for (const [input, pin] of [
+  for (const [input, pin, match = 'true'] of [
     ['', digest], [scope, ''], [scope, 'malformed'], [scope, '0'.repeat(64)],
     [scope + '\n', digest], ['x'.repeat(4097), sha256('x'.repeat(4097))],
+    [scope, digest, 'false'], [scope, digest, ''],
   ]) {
     const child = spawnSync(process.execPath, [launcher, '--provider-dispatch', 'no-such-bundle.js'], {
       encoding: 'utf8',
-      env: { PRIVATE_TRIAL_PREFLIGHT_SCOPE: input, PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: pin },
+      env: {
+        PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: match,
+        PRIVATE_TRIAL_PREFLIGHT_SCOPE: input,
+        PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: pin,
+      },
     });
     assert.equal(child.status, 1);
     assert.equal(child.stdout, 'Private staging fixture provider preflight: refused.\n');
@@ -225,6 +232,7 @@ test('a protected scope match without a disposable credential fails closed', () 
     env: {
       PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: endpoint,
       PRIVATE_PLAYBACK_STAGING_S3_REGION: region,
+      PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: 'true',
       PRIVATE_TRIAL_PREFLIGHT_SCOPE: scope,
       PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: sha256(scope),
     },

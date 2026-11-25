@@ -296,7 +296,14 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn("cargo build --locked --manifest-path workers/ingest/Cargo.toml", setup)
         self.assertIn("--no-default-features --features fixture-provider-preflight", setup)
         self.assertIn('"$WASM_BINDGEN_BIN" --target nodejs', setup)
-        self.assertEqual(re.findall(r"secrets\.(\w+)", probe), [
+        match, settings = probe.split("          PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256:", 1)
+        self.assertEqual(" ".join(match.split()), "env: PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: >- "
+                         "${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT != '' && "
+                         "vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT == secrets.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT && "
+                         "vars.PRIVATE_PLAYBACK_STAGING_S3_REGION != '' && "
+                         "vars.PRIVATE_PLAYBACK_STAGING_S3_REGION == secrets.PRIVATE_PLAYBACK_STAGING_S3_REGION }}")
+        self.assertNotIn("vars.", settings)
+        self.assertEqual(re.findall(r"secrets\.(\w+)", settings), [
             "PRIVATE_TRIAL_PREFLIGHT_SCOPE", "PRIVATE_TRIAL_PREFLIGHT_S3",
             "PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT", "PRIVATE_PLAYBACK_STAGING_S3_REGION",
         ])

@@ -91,7 +91,8 @@ async function runProbe(args, env) {
   const scope = env.PRIVATE_TRIAL_PREFLIGHT_SCOPE ?? '';
   if (mode === '--provider-dispatch') {
     const expected = env.PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256 ?? '';
-    if (!scope || Buffer.byteLength(scope, 'utf8') > 4096 || !/^[0-9a-f]{64}$/.test(expected)
+    if (env.PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH !== 'true'
+        || !scope || Buffer.byteLength(scope, 'utf8') > 4096 || !/^[0-9a-f]{64}$/.test(expected)
         || createHash('sha256').update(scope, 'utf8').digest('hex') !== expected) {
       return 'refused';
     }
