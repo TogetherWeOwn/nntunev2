@@ -14111,7 +14111,7 @@ pub(crate) mod tests {
                 },
             ))
         };
-        let plan = || decode(billing_get(&h, "/v1/plans", Some(cookie.clone())), 200);
+        let plan = |cookie: &str| decode(billing_get(&h, "/v1/plans", Some(cookie.into())), 200);
         let subscription = |now, cookie: &str| {
             decode(
                 call_at(
@@ -14141,7 +14141,7 @@ pub(crate) mod tests {
         assert_eq!(unpaid["code"], "subscription_required");
         assert_eq!(unpaid["reason"], "never_subscribed");
 
-        assert_eq!(plan()["plans"][0]["selectable"], true);
+        assert_eq!(plan(&cookie)["plans"][0]["selectable"], true);
         let redirect = decode(checkout(&h), 200);
         let operation = block_on(h.store.open_checkout_operation(&user))
             .unwrap()
@@ -14192,8 +14192,9 @@ pub(crate) mod tests {
                 Some(sign(body, now)),
             )
         };
+        let event_id = "evt_paid_signup";
         let completed = paid_invite_event_body(
-            "evt_paid_signup",
+            event_id,
             "checkout.session.completed",
             BILLING_NOW,
             json!({
@@ -14226,16 +14227,54 @@ pub(crate) mod tests {
         };
         webhook_ok(&signed(BILLING_NOW, &completed));
         let active = assert_period(first_end, 1);
+        let stored = h.store.billing_rows.borrow()[&user].clone();
         let history = h.store.invoice_history.borrow().clone();
-        webhook_ok(&signed(BILLING_NOW + 1, &completed));
+        assert_eq!(
+            history["in_test_1"].covered_periods,
+            [(BILLING_NOW, first_end)]
+        );
+        let receipts = h.store.webhook_events.borrow().clone();
+        assert_eq!(receipts.len(), 1);
+        assert!(receipts.contains(event_id));
+        let subscribed = subscription(NOW, &cookie);
+
+        let refresh_at = NOW + 1;
+        let refreshed = call_at(
+            refresh_at,
+            "POST",
+            "/v1/session/refresh",
+            Some(&cookie),
+            vec![],
+            None,
+        );
+        assert_eq!(refreshed.status, 200, "{}", refreshed.body);
+        let refreshed_cookie = cookie_of(&refreshed);
+        assert_ne!(refreshed_cookie, cookie);
+        let stale = call_at(
+            refresh_at,
+            "GET",
+            "/v1/me/subscription",
+            Some(&cookie),
+            vec![],
+            None,
+        );
+        assert_eq!(stale.status, 401);
+        let cookie = refreshed_cookie;
+
+        let replay_at = refresh_at + 1;
+        webhook_ok(&signed(replay_at as i64, &completed));
         assert_eq!(assert_period(first_end, 1), active);
+        assert_eq!(h.store.billing_rows.borrow().len(), 1);
+        assert_eq!(h.store.billing_rows.borrow()[&user], stored);
+        assert!(h.store.billing_shadow.borrow().is_empty());
         assert_eq!(*h.store.invoice_history.borrow(), history);
+        assert_eq!(*h.store.webhook_events.borrow(), receipts);
         assert_eq!(
             h.store.checkout_ops.borrow()[&operation.id].state,
             "succeeded"
         );
 
-        let subscribed = subscription(NOW + 1, &cookie);
+        assert_eq!(subscription(replay_at, &cookie), subscribed);
         assert_eq!(subscribed["state"], "active");
         assert_eq!(subscribed["status"], "active");
         assert_eq!(subscribed["planId"], PLAN_PLUS);
@@ -14243,7 +14282,7 @@ pub(crate) mod tests {
             subscribed["currentPeriodEnd"],
             crate::ledger::iso8601_utc(first_end)
         );
-        assert_eq!(plan()["plans"][0]["selectable"], false);
+        assert_eq!(plan(&cookie)["plans"][0]["selectable"], false);
 
         h.store.meter_meta.borrow_mut().insert(
             (user.clone(), "track-9".into()),
@@ -14252,7 +14291,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         );
-        let issued = decode(play_at(NOW + 1, &cookie, &play), 200);
+        let issued = decode(play_at(replay_at, &cookie, &play), 200);
         let play_id = issued["play_id"].as_str().unwrap();
         let record = |bytes| {
             let window = crate::ledger::prepare_play_window(
@@ -14262,7 +14301,7 @@ pub(crate) mod tests {
                 bytes,
                 Some(2000),
                 Some(2000),
-                NOW + 1,
+                replay_at,
             )
             .unwrap();
             block_on(h.store.record_play_window(&window)).unwrap()
@@ -14274,13 +14313,13 @@ pub(crate) mod tests {
         assert_eq!(record(2000), crate::meter_sink::PlayWindowOutcome::Covered);
         assert_eq!(usage()["streamSecondsMonth"], 2);
 
-        let cap = decode(play_at(NOW + 2, &cookie, &play), 402);
+        let cap = decode(play_at(replay_at + 1, &cookie, &play), 402);
         assert_eq!(cap["code"], "plan_limit_exceeded");
         let continuation = json!({"track_id":"track-9", "session_id":"tab-a", "play_id": play_id});
         let beat =
             json!({"session_id":"tab-a", "play_id":play_id, "lease_epoch":issued["lease_epoch"]});
         let deadline = issued["expires_at"].as_u64().unwrap();
-        for now in ((NOW + 41)..deadline).step_by(40) {
+        for now in ((replay_at + 40)..deadline).step_by(40) {
             let reply = call_at(
                 now,
                 "POST",
