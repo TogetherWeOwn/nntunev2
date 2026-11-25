@@ -591,31 +591,40 @@ pub(crate) async fn verify_cleanup(
         .execute("DELETE FROM public.invite_codes WHERE id = 931", &[])
         .await
         .unwrap();
-    assert_eq!(
-        observer
-            .execute(
-                "DELETE FROM public.catalogue_s3_sources WHERE track_id = $1::text::uuid",
-                &[&track],
-            )
-            .await
-            .unwrap(),
-        1
+    let has_source = async || {
+        observer.query_one(
+            "SELECT EXISTS (SELECT FROM public.catalogue_s3_sources WHERE track_id = $1::text::uuid)",
+            &[&track],
+        ).await.unwrap().get::<_, bool>(0)
+    };
+    assert!(
+        has_source().await,
+        "interrupted cleanup must keep the source"
     );
-    assert!(cleanup(
-        publication,
-        &fixture,
-        async |bucket: &str, key: &str, version: &str| {
-            assert_eq!(bucket, fixture.bucket);
-            assert!(
-                (key, version) == (media.as_str(), "media-fixture-version")
-                    || (key, version) == (page.as_str(), "page-fixture-version")
-            );
-            versions.remove(&(key.to_owned(), version.to_owned()));
-            Ok(())
-        }
-    )
-    .await
-    .unwrap());
+    for _ in 0..2 {
+        let mut expected = [
+            (media.as_str(), "media-fixture-version"),
+            (page.as_str(), "page-fixture-version"),
+        ]
+        .into_iter();
+        assert!(cleanup(
+            publication,
+            &fixture,
+            async |bucket: &str, key: &str, version: &str| {
+                assert_eq!(bucket, fixture.bucket);
+                assert_eq!(Some((key, version)), expected.next());
+                versions.remove(&(key.to_owned(), version.to_owned()));
+                Ok(())
+            }
+        )
+        .await
+        .unwrap());
+        assert_eq!(expected.next(), None);
+        assert!(
+            !has_source().await,
+            "confirmed deletion must remove the source"
+        );
+    }
     assert_eq!(
         versions,
         std::collections::BTreeSet::from([(media, "unrelated-fixture-version".to_owned())])
