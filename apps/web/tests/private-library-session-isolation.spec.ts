@@ -20,19 +20,19 @@ type Track = {
 
 type Invitee = { account: string; binding: string; tracks: [Track, ...Track[]] };
 
-function makeInvitee(index: number, tones: ReturnType<typeof privateStagingAudio>, includeSwitchTrack = false): Invitee {
-	const track = (offset: number): Track => {
-		const key = 2 * index + offset + 1;
-		return {
-			item: { id: `00000000-0000-4000-8000-00000000000${key}`, title: `Private tone ${key}`, duration_ms: durationMs },
-			playId: `private_browser_000000000000000000000${key}`,
-			audio: tones[(index + offset) % tones.length].body
-		};
+function makeTrack(key: number, audio: Buffer): Track {
+	return {
+		item: { id: `00000000-0000-4000-8000-00000000000${key}`, title: `Private tone ${key}`, duration_ms: durationMs },
+		playId: `private_browser_000000000000000000000${key}`,
+		audio
 	};
+}
+
+function makeInvitee(index: number, audio: Buffer): Invitee {
 	return {
 		account: `invitee-${index + 1}`,
 		binding: Buffer.alloc(32, index + 1).toString('base64url'),
-		tracks: includeSwitchTrack ? [track(0), track(1)] : [track(0)]
+		tracks: [makeTrack(2 * index + 1, audio)]
 	};
 }
 
@@ -141,11 +141,14 @@ async function expectTrackPlaying(page: Page, origin: string, track: Track, sess
 	await expect(audio).toHaveAttribute('src', source);
 }
 
+function selectLibraryTrack(page: Page, track: Track) {
+	return page.getByTestId(library.item)
+		.and(page.locator(`[${library.id}="${track.item.id}"]`)).locator(library.select).click();
+}
+
 async function startOwnPlayback(page: Page, origin: string, invitee: Invitee) {
 	await expectOwnLibrary(page, invitee);
-	for (const { item } of invitee.tracks) {
-		await page.getByTestId(library.item).and(page.locator(`[${library.id}="${item.id}"]`)).locator(library.select).click();
-	}
+	for (const track of invitee.tracks) await selectLibraryTrack(page, track);
 	await expect(page.getByTestId(player.queueItem)).toHaveCount(invitee.tracks.length);
 	const [response] = await Promise.all([
 		page.waitForResponse(origin + player.plays),
@@ -173,8 +176,8 @@ async function openInviteePages(
 
 test('private Library and playback stay isolated when another invitee signs out', async ({ browser, context, page, origin }) => {
 	const tones = privateStagingAudio();
-	const first = makeInvitee(0, tones);
-	const second = makeInvitee(1, tones);
+	const first = makeInvitee(0, tones[0].body);
+	const second = makeInvitee(1, tones[1].body);
 	const otherContext = await browser.newContext({ serviceWorkers: 'block' });
 	try {
 		const other = await otherContext.newPage();
@@ -236,10 +239,11 @@ for (const { name, leakDenial } of [
 ]) {
 	test(name, async ({ browser, page, origin }) => {
 		const tones = privateStagingAudio();
-		const revoked = makeInvitee(0, tones, true);
-		const active = makeInvitee(1, tones, true);
-		const [revokedFirst, revokedNext] = revoked.tracks;
-		const [activeFirst, activeNext] = active.tracks;
+		const revoked = makeInvitee(0, tones[0].body);
+		const active = makeInvitee(1, tones[1].body);
+		const revokedNext = makeTrack(2, tones[1].body);
+		const activeNext = makeTrack(4, tones[0].body);
+		revoked.tracks.push(revokedNext);
 		let revokedAccount: string | undefined;
 		const otherContext = await browser.newContext({ serviceWorkers: 'block' });
 		try {
@@ -251,7 +255,12 @@ for (const { name, leakDenial } of [
 			const [revokedSession, activeSession] = await openInviteePages(page, other, origin, revoked, active,
 				(invitee) => revokedAccount !== undefined && (invitee.account === revokedAccount || leakDenial));
 			expect(activeSession).not.toBe(revokedSession);
-			const originalSource = mediaPath(revokedFirst, revokedSession);
+			// Keep natural-end handling from initiating a switch before the explicit queue action.
+			await Promise.all([toggle(page, 'Pause').click(), toggle(other, 'Pause').click()]);
+			await expect.poll(async () => (await playbackState(page)).paused).toBe(true);
+			const activeBefore = await playbackState(other);
+			expect(activeBefore.paused).toBe(true);
+			const originalSource = mediaPath(revoked.tracks[0], revokedSession);
 			const sources = await observeMediaSources(page);
 
 			// Model revocation only at new grant issuance. Existing media and sessions remain valid in the fixture.
@@ -262,11 +271,14 @@ for (const { name, leakDenial } of [
 			expect(await denial.json()).toEqual(privateListeningRefusal);
 			await expectPlaybackRefusal(page);
 			await expect(page).toHaveURL(origin + library.path);
-			await expect(page.locator(player.currentQueueItem)).toHaveAttribute(player.queueId, revokedFirst.item.id);
+			await expect(page.locator(player.currentQueueItem)).toHaveAttribute(player.queueId, revoked.tracks[0].item.id);
 			await expect(page.getByTestId(player.audio)).toHaveAttribute('src', originalSource);
 
+			// The new row must come from the active invitee's refreshed Library.
+			active.tracks.push(activeNext);
 			await refreshOwnLibrary(other, origin, active);
-			await expectTrackPlaying(other, origin, activeFirst, activeSession);
+			expect(await playbackState(other)).toEqual(activeBefore);
+			await selectLibraryTrack(other, activeNext);
 			const switched = await playQueuedTrack(other, origin, activeNext.item.title);
 			expect(switched.request().postDataJSON()).toEqual({ track_id: activeNext.item.id, session_id: activeSession });
 			const grantFailure = 'Active invitee should obtain a fresh playback grant';
