@@ -22,6 +22,7 @@ SPEC.loader.exec_module(evidence)
 admission = evidence.admission
 VERSION = "11111111-1111-4111-8111-111111111111"
 DEPLOYMENT = "22222222-2222-4222-8222-222222222222"
+REDEPLOYMENT = "33333333-3333-4333-8333-333333333333"
 PRIVATE_DETAIL = "https://private.example.invalid/listen?token=disposable-canary&account=account@example.invalid"
 PRIVATE_MARKERS = (b"private.example.invalid", b"disposable-canary", b"account@example.invalid")
 TRACK_FILE = "fixtures/synthetic-flac/private-staging/tone-a.flac"
@@ -201,14 +202,29 @@ def run_fixture(root):
     assert all(marker not in report.read_bytes() for marker in PRIVATE_MARKERS)
 
     with patch.dict(os.environ, env, clear=True), patch.object(evidence, "provider") as provider:
-        provider.return_value.return_value = provider_response(DEPLOYMENT)
+        reader = provider.return_value
+        reader.return_value = provider_response(DEPLOYMENT)
         for phase in admission.IDENTITY_PHASES:
             write(root, f"{phase}.json", json.dumps(evidence.main("observe")).encode())
-        assert provider.return_value.call_count == 6
-        provider.return_value.return_value = provider_response(VERSION)
+        assert reader.call_count == 6
+        reader.return_value = provider_response(VERSION)
         require_refusal(lambda: evidence.main("observe"), "drifted provider deployment accepted")
 
+        # Observe a redeployment of the same version under independently valid pins for this attempt.
+        api_pin = json.loads(env["API_PIN"]) | {"deployment_id": REDEPLOYMENT}
+        reader.side_effect = lambda worker: provider_response(REDEPLOYMENT if worker == api_pin["worker"] else DEPLOYMENT)
+        with patch.dict(os.environ, {"API_PIN": json.dumps(api_pin)}):
+            drifted_closing = evidence.main("observe")
+
     receipt = root / "staging-admission.json"
+    closing = root / "build-identity-final.json"
+    same_build_closing = closing.read_bytes()
+    closing.write_text(json.dumps(drifted_closing))
+    result = run(command)
+    assert result.returncode != 0, "receipt step accepted a changed serving deployment"
+    assert not receipt.exists(), "receipt step wrote a receipt after serving deployment drift"
+    closing.write_bytes(same_build_closing)
+
     mismatched = json.loads(env["API_PIN"]) | {"run_attempt": "1"}
     for bad_pins in ({"WEB_PIN": ""}, {"API_PIN": json.dumps(mismatched)}):
         assert run(command, bad_pins).returncode != 0 and not receipt.exists()
