@@ -22,6 +22,7 @@
 	let libraryUnavailable = $state(false);
 	let requiresSignIn = $state(false);
 	let accessRefused = $state(false);
+	let discoveryHeading: HTMLHeadingElement;
 
 	let session: ReturnType<typeof browserStorage> = null;
 	const local = browserStorage('local');
@@ -80,6 +81,12 @@
 
 	const preview = $derived(items.slice(0, 5));
 	const liked = $derived(selectFavoriteItems(items, favoriteIds));
+
+	function retryDiscovery(event: MouseEvent): void {
+		// Loading removes Retry, so keep its keyboard position inside the shelf.
+		if (document.activeElement === event.currentTarget) discoveryHeading.focus();
+		void refresher.refresh();
+	}
 </script>
 
 <svelte:head>
@@ -90,7 +97,9 @@
 	<h1>Home</h1>
 
 	<section aria-labelledby="home-discovery-heading">
-		<h2 id="home-discovery-heading">Discover your library</h2>
+		<h2 id="home-discovery-heading" tabindex="-1" bind:this={discoveryHeading}>
+			Discover your library
+		</h2>
 		<p>
 			This preview uses the same library catalogue as Search. It shows up to five tracks in
 			catalogue order. Your account listening history is not used to select or rank them.
@@ -106,7 +115,7 @@
 			<p role="alert">You do not have access to this library.</p>
 		{:else if loadError}
 			<div role="alert">Could not load your library: {loadError}</div>
-			<button type="button" onclick={() => refresher.refresh()}>Retry</button>
+			<button type="button" onclick={retryDiscovery}>Retry</button>
 		{:else if libraryUnavailable}
 			<p>Your library is not available yet.</p>
 		{:else if items.length === 0}
