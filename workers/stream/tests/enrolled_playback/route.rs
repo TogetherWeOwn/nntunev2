@@ -619,3 +619,87 @@ async fn successful_seek_reports_all_written_bytes_and_meters_only_new_bytes() {
         }
     }
 }
+
+#[tokio::test]
+async fn dropping_a_partial_encrypted_read_leaves_the_other_caller_live() {
+    let source = Source::browser();
+    let request = |start| PlayRouteRequest {
+        track_id: "track".into(),
+        token: Some(BROWSER_TOKEN.into()),
+        range: Some(format!("bytes={start}-65536")),
+        trace_id: None,
+    };
+    let cancelled = request(65_534);
+    let live = request(65_535);
+    let cancelled_output = RefCell::new(Vec::new());
+    let live_output = RefCell::new(Vec::new());
+    let reports = RefCell::new(Vec::new());
+    let aborted = Cell::new(false);
+    let read = |request, output, range: &'static str, len| {
+        let aborted = &aborted;
+        serve(
+            request,
+            b"test only, not a deployed secret",
+            Some(&source),
+            || source.time(),
+            move |head| {
+                assert_eq!(head.status, 206);
+                assert_eq!(head.content_range.as_deref(), Some(range));
+                assert_eq!(head.len, len);
+                Ok(Some(Writer {
+                    output,
+                    fault: Fault::None,
+                    aborted,
+                    revoke_on_write: None,
+                }))
+            },
+            |interval| reports.borrow_mut().push(interval),
+        )
+    };
+    let receipt = |start, end| DeliveredInterval {
+        user_id: "member".into(),
+        play_id: "private_browser_AAAAAAAAAAAAAAAAAAAAAA".into(),
+        track_id: "track".into(),
+        start,
+        end,
+        file_bytes: Some(LEN),
+    };
+
+    let cancelled_tail = Rc::<FrameGate>::default();
+    source.pause_last_byte.set(Some(cancelled_tail.clone()));
+    let mut cancelled = Box::pin(read(
+        &cancelled,
+        &cancelled_output,
+        "bytes 65534-65536/65537",
+        3,
+    ));
+    assert!(futures_util::poll!(&mut cancelled).is_pending());
+    assert!(cancelled_tail.waiting.get());
+    assert_eq!(*cancelled_output.borrow(), b"AY");
+
+    let live_tail = Rc::<FrameGate>::default();
+    source.pause_last_byte.set(Some(live_tail.clone()));
+    let mut live = Box::pin(read(&live, &live_output, "bytes 65535-65536/65537", 2));
+    assert!(futures_util::poll!(&mut live).is_pending());
+    assert!(live_tail.waiting.get());
+    assert_eq!(*live_output.borrow(), b"Y");
+    assert!(reports.borrow().is_empty());
+
+    drop(cancelled);
+    assert!(cancelled_tail.dropped.get());
+    assert!(!live_tail.dropped.get());
+    assert_eq!(*cancelled_output.borrow(), b"AY");
+    assert_eq!(*live_output.borrow(), b"Y");
+    assert_eq!(*reports.borrow(), [receipt(65_534, 65_536)]);
+
+    live_tail.released.set(true);
+    assert!(matches!(
+        futures_util::poll!(&mut live),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(*live_output.borrow(), b"YZ");
+    assert_eq!(
+        *reports.borrow(),
+        [receipt(65_534, 65_536), receipt(65_535, LEN)]
+    );
+}
