@@ -77,12 +77,30 @@ def check_identity(metadata, expected):
         raise HistoryError("API base repository/ref retargeted")
 
 
-def check_base(root, base, head, effective, budget):
-    # Full checkout supplies immutable objects, never executable files from B1.
-    # An inaccessible object/ancestry fails, rather than fetching a mutable ref.
+def check_base(root, base, head, effective, budget, *, integration_base=None):
+    # Use immutable objects in the full checkout for both ancestry checks.
     history = GitHistory(root, effective, head, budget=budget)
-    if history.git("merge-base", base, effective).decode().strip() != base:
+    if history.git("merge-base", "--all", base, effective).decode().splitlines() != [base]:
         raise HistoryError("effective base is not a descendant of event base/previous observation")
+    if integration_base is None or integration_base in (base, effective):
+        return
+    common = history.git("merge-base", "--all", integration_base, effective).decode().splitlines()
+    if common == [integration_base]:
+        return
+    if common != [effective]:
+        raise HistoryError("API base diverges from tested first parent")
+
+    # A lagging API base is equivalent only when H excludes the same common
+    # ancestry and the tested parent's migration prefix is identical.
+    tested_bases = history.git("merge-base", "--all", integration_base, head).decode().splitlines()
+    if len(tested_bases) != 1:
+        raise HistoryError("missing or ambiguous Git merge base for tested first parent")
+    if tested_bases[0] != history.merge_base:
+        raise HistoryError("API base lags tested first parent and migration merge base differs; rebase the PR")
+    tested_tree = history.git("rev-parse", "--verify", f"{integration_base}:migrations")
+    if (history.git("rev-parse", "--verify", f"{effective}:migrations") != tested_tree
+            or history.git("cat-file", "-t", f"{effective}:migrations").strip() != b"tree"):
+        raise HistoryError("API base lags tested first parent and migration tree differs; rebase the PR")
 
 
 def request(path, budget):
@@ -125,26 +143,27 @@ def compact(value):
     return text
 
 
-def collect(root, expected, budget, *, base=None):
+def collect(root, expected, budget, *, integration_base=None):
     shared_deadline = budget.deadline
     collection_deadline = time.monotonic() + budget.remaining(COLLECTION_TIMEOUT)
     budget.deadline = min(shared_deadline, collection_deadline)
     try:
-        pages, snapshot = collect_attempts(root, expected, budget, collection_deadline, base)
+        pages, snapshot = collect_attempts(root, expected, budget, collection_deadline, integration_base)
         snapshot["deadline"] = shared_deadline
         return pages, snapshot
     finally:
         budget.deadline = shared_deadline
 
 
-def collect_attempts(root, expected, budget, collection_deadline, base):
+def collect_attempts(root, expected, budget, collection_deadline, integration_base):
     endpoint = f"repos/{expected['base']['repo']['full_name']}/pulls/{expected['number']}"
-    observed_base = base or expected["base"]["sha"]
+    observed_base = expected["base"]["sha"]
     for attempt in range(1, MAX_ATTEMPTS + 1):
         budget.remaining(COLLECTION_TIMEOUT)
         before = project_metadata(request(endpoint, budget))
         check_identity(before, expected)
-        check_base(root, observed_base, expected["head"]["sha"], before["base"]["sha"], budget)
+        check_base(root, observed_base, expected["head"]["sha"], before["base"]["sha"], budget,
+                   integration_base=integration_base)
         observed_base = before["base"]["sha"]
         pages = []
         for page in range(1, MAX_FILES // 100 + 1):
@@ -162,7 +181,8 @@ def collect_attempts(root, expected, budget, collection_deadline, base):
             raise HistoryError("API pagination reached truncation bound")
         after = project_metadata(request(endpoint, budget))
         check_identity(after, expected)
-        check_base(root, observed_base, expected["head"]["sha"], after["base"]["sha"], budget)
+        check_base(root, observed_base, expected["head"]["sha"], after["base"]["sha"], budget,
+                   integration_base=integration_base)
         observed_base = after["base"]["sha"]
         # Structural defects are hard failures even during a moving bracket.
         # A changed count may match either bracket, but never accept that attempt.
@@ -194,7 +214,7 @@ def snapshot_coverage(root, base, head, files_text, snapshot_text, expected, bud
             raise HistoryError("invalid snapshot attempt")
         check_identity(before, expected)
         effective = before["base"]["sha"]
-        check_base(root, base, head, effective, budget)
+        check_base(root, expected["base"]["sha"], head, effective, budget, integration_base=base)
         return effective, api_coverage(files_text, compact(before), effective, head)
     except (KeyError, TypeError) as exc:
         raise HistoryError("invalid API snapshot evidence") from exc
@@ -227,7 +247,7 @@ def main(argv=None):
         budget = EvidenceBudget()
         expected = event_metadata(args.event_file, args.base_sha, args.head_sha,
                                   root=args.root if args.integration_base else None, budget=budget)
-        pages, snapshot = collect(args.root, expected, budget, base=args.base_sha)
+        pages, snapshot = collect(args.root, expected, budget, integration_base=args.base_sha)
         (args.output_dir / "pr-files.json").write_text(compact(pages), encoding="utf-8")
         (args.output_dir / "pr-metadata.json").write_text(compact(snapshot), encoding="utf-8")
     except (HistoryError, OSError, UnicodeError) as exc:

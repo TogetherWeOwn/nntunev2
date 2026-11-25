@@ -649,6 +649,27 @@ class PreparedCLI(unittest.TestCase):
         self.acquire([{"filename": "migrations/0001_final.sql", "status": "added"},
                       {"filename": "migrations/manifest.toml", "status": "modified"}], self.base)
 
+    def test_replay_rejects_lagging_api_base_with_different_migration_tree(self):
+        self.valid_evidence()
+        head = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-qb", "tested-base", self.base)
+        self.write("0002_main.sql")
+        (self.root / "migrations/manifest.toml").write_text(rename_fixture.manifest(self.entries()))
+        self.git("add", "migrations")
+        self.git("commit", "-qm", "main adds a migration")
+        tested_base = self.git("rev-parse", "HEAD")
+        self.git("checkout", "--detach", head)
+        self.args[self.args.index("--base-sha") + 1] = tested_base
+        self.args.append("--integration-base")
+
+        result, out, err = self.check()
+        self.assertEqual(result, 1, out + err)
+        self.assertIn("migration tree differs", err)
+        outcomes = json.loads((self.evidence_dir / "validation.json").read_text())
+        self.assertEqual(outcomes["event"]["outcome"], "not_run")
+        self.assertEqual(outcomes["effective"]["outcome"], "not_run")
+        self.assertFalse((self.evidence_dir / "edges.json").exists())
+
     def test_prepared_cli_recovers_advanced_base_and_records_both_histories(self):
         self.write("0001_final.sql")
         (self.root / "migrations/manifest.toml").write_text(rename_fixture.manifest(self.entries()))
@@ -683,7 +704,7 @@ class PreparedCLI(unittest.TestCase):
         result, out, err = self.check()
         self.assertEqual(result, 0, out + err)
         self.assertEqual(json.loads((self.evidence_dir / "validation.json").read_text()), outcomes)
-        with mock.patch.object(snapshot, "request", side_effect=Script(before, records, before)):
+        with mock.patch.object(snapshot, "request", side_effect=Script(live, records, before)):
             self.assertEqual(1, snapshot.main(["--root", str(self.root), "--base-sha", advanced, "--head-sha", head,
                                               "--integration-base", "--event-file", str(self.event_file),
                                               "--output-dir", str(self.evidence_dir)]))

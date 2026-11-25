@@ -20,6 +20,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import migration_history as history
+import migrations_base
 import migrations_gate
 import migrations_rename_check
 import staging_api_schema_gate as staging
@@ -888,6 +889,33 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(outcomes["event"]["merge_base"], self.base)
         self.assertEqual(outcomes["effective"]["merge_base"], self.base)
 
+    def test_workflow_accepts_lagging_api_base_with_same_migration_evidence(self):
+        pages, original = self.workflow_inputs()
+        head = original["head"]["sha"]
+        self.git("checkout", "-qb", "integration-base", self.base)
+        (self.root / "README.md").write_text("independent base advance\n")
+        tested_base = self.commit("tested first parent")
+        self.git("merge", "--no-ff", "-qm", "Actions integration checkout", head)
+        merge = self.git("rev-parse", "HEAD")
+        event = self.event(original)
+        event_path = pathlib.Path(self.tmp.name) / "event.json"
+        event_path.write_text(json.dumps(event))
+        commits = migrations_base.resolve(self.root, {
+            "GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/1/merge",
+            "GITHUB_EVENT_PATH": str(event_path), "GITHUB_SHA": merge,
+        })
+        self.assertEqual(commits, {"merge_sha": merge, "base_sha": tested_base, "head_sha": head})
+        self.git("checkout", "--detach", head)
+
+        result = self.run_workflow(pages, original, event=event, integration_base=commits["base_sha"])
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+        for outcome in outcomes.values():
+            self.assertEqual(self.base, outcome["base"])
+            self.assertEqual(self.base, outcome["merge_base"])
+            self.assertEqual(head, outcome["head"])
+            self.assertEqual("verified", outcome["outcome"])
+
     def test_workflow_requires_api_and_event_ancestry_of_tested_base(self):
         pages, original = self.workflow_inputs()
         head = original["head"]["sha"]
@@ -903,7 +931,7 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(self.base, outcomes["event"]["base"])
         self.assertEqual(tested_base, outcomes["effective"]["base"])
 
-        rewound = self.run_workflow(pages, original, integration_base=tested_base)
+        rewound = self.run_workflow(pages, live, samples=[live, original], integration_base=tested_base)
         self.assertEqual(1, rewound.returncode, rewound.stdout + rewound.stderr)
         self.assertIn("not a descendant", rewound.stderr)
         event = self.event(self.full_metadata(original))
@@ -911,6 +939,40 @@ class GitFixture(unittest.TestCase):
         divergent = self.run_workflow(pages, live, event=event, integration_base=tested_base)
         self.assertEqual(1, divergent.returncode, divergent.stdout + divergent.stderr)
         self.assertIn("not a descendant", divergent.stderr)
+
+    def test_workflow_rejects_lagging_api_base_with_different_migration_evidence(self):
+        pages, original = self.workflow_inputs()
+        head = original["head"]["sha"]
+        # Advance main without touching the PR's common ancestor. A new
+        # migration here changes the tested parent's authoritative prefix.
+        self.git("checkout", "-qb", "migration-advance", self.base)
+        self.write("0001_main.sql")
+        (self.root / "migrations/manifest.toml").write_text(manifest(self.entries()))
+        changed_tree = self.commit("main adds a migration")
+        # Independently change the common ancestor with the source head while
+        # keeping the base-side migrations tree identical.
+        side = self.git("commit-tree", f"{self.base}^{{tree}}", "-p", self.base, "-m", "shared side")
+        self.git("checkout", "-q", "--detach", head)
+        self.git("merge", "--no-ff", "-qm", "PR merges shared side", side)
+        sibling = self.git("commit-tree", f"{self.base}^{{tree}}", "-p", self.base, "-m", "sibling")
+        main_advance = self.git("commit-tree", f"{self.base}^{{tree}}", "-p", self.base, "-m", "tested advance")
+        ambiguous = self.git("commit-tree", f"{self.base}^{{tree}}", "-p", side, "-p", sibling,
+                             "-m", "tested criss-cross")
+        self.git("merge", "--no-ff", "-qm", "PR also merges sibling", sibling)
+        original["head"]["sha"] = self.git("rev-parse", "HEAD")
+
+        for tested, observed, diagnostic in (
+                (changed_tree, self.base, "migration tree differs"),
+                (side, self.base, "migration merge base differs"),
+                (ambiguous, self.base, "ambiguous Git merge base"),
+                (main_advance, sibling, "diverges from tested first parent")):
+            with self.subTest(diagnostic=diagnostic):
+                live = copy.deepcopy(original)
+                live["base"]["sha"] = observed
+                result = self.run_workflow(pages, live, integration_base=tested)
+                self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertFalse((self.workflow_api / "pr-metadata.json").exists())
 
     def test_staging_resolver_loads_only_the_first_parent_blob(self):
         workflow = pathlib.Path(__file__).resolve().parents[1] / "workflows/migrations-staging.yml"
