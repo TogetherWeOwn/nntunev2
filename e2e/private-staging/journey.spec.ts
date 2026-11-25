@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { expect, test, type Locator, type Response } from '@playwright/test';
+import { expect, request as playwrightRequest, test, type Locator, type Response } from '@playwright/test';
 import { accessHeaders, qaAuthHeader, readApiBody } from '../helpers/access.js';
 import {
   apiGet, apiPost, applyAccountToPage, enableVirtualAuthenticator, retrieveStagedSignupCode,
@@ -13,7 +13,9 @@ import { seekViaPlayerUi, waitForPaused } from '../helpers/player-ui.js';
 import {
   assertCuratedLibrary, assertPrivateInvite, assertPrivateRefusals, assertPrivateTransport, PRIVATE_MUSIC,
 } from '../helpers/private-music-journey.js';
-import { parsePrivateStagingFixture, privateStagingAudio } from '../helpers/private-staging-fixture.js';
+import {
+  freshTrialPublication, parsePrivateStagingFixture, privateStagingAudio, PRIVATE_TRIAL_UPLOAD, SESSION_COOKIE,
+} from '../helpers/private-staging-fixture.js';
 
 const ORIGIN = 'https://staging.nntune.com';
 const REGISTER = '/v1/auth/passkey/register';
@@ -77,14 +79,18 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     throw new Error('Private journey requires the exact staging origin, a same-run API deploy and the QA code seam');
   }
   const inputs = privateStagingAudio();
+  const upload = inputs.find(({ file }) => file === 'tone-a.flac');
+  const companion = inputs.find(({ file }) => file === 'tone-b.flac');
+  if (!upload || !companion) throw new Error('Private staging requires both checked-in FLACs');
   const digests = inputs.map((item) => item.sha256);
-  const fixture = parsePrivateStagingFixture(process.env.PRIVATE_MUSIC_STAGE_FIXTURE ?? '', Math.floor(Date.now() / 1000), digests);
+  const fixture = parsePrivateStagingFixture(process.env.PRIVATE_MUSIC_STAGE_FIXTURE ?? '', Math.floor(Date.now() / 1000), companion.sha256);
   const access = accessHeaders();
   const getLibrary = async (context = page.request) => {
     const url = `${ORIGIN}${PRIVATE_MUSIC.library.api}`;
     const response = await apiGet(context, url, access, 'private-library');
-    await readApiBody(response, url, 'private-library');
-    return response.status();
+    const body = await readApiBody(response, url, 'private-library');
+    const items = response.ok() ? JSON.parse(body) as { id: string }[] : [];
+    return { status: response.status(), ids: items.map(({ id }) => id) };
   };
   const post = async (context: typeof request, path: string, body: unknown, headers = access) => {
     const url = `${ORIGIN}${path}`;
@@ -94,7 +100,6 @@ test('private staging invite serves curated audio and refuses access at cutoff',
   };
   await check('opening deployed build identity', () => assertServingBuildMatchesPromotion(request, ORIGIN, 'private-opening'));
 
-  const [firstPublication] = fixture.publications;
   const { missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay } = await check('anonymous and uninvited refusal', async () => {
     const missingInvite = await post(request, `${REGISTER}/start`, { email: fixture.email }, { ...access, ...qaAuthHeader() });
     const anonymousLibrary = await getLibrary(request);
@@ -104,9 +109,12 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       if (!account || account.email === fixture.email) throw new Error('Expected a distinct synthetic session');
       await applyAccountToPage(await outsider.newPage(), account, ORIGIN);
       const uninvited = await post(outsider.request, PRIVATE_MUSIC.player.plays, {
-        track_id: firstPublication!.trackId, session_id: randomUUID(),
+        track_id: fixture.companion.trackId, session_id: randomUUID(),
       });
-      return { missingInviteSignup: missingInvite.status, anonymousLibrary, uninvitedLibrary: await getLibrary(outsider.request), uninvitedPlay: uninvited.status };
+      return {
+        missingInviteSignup: missingInvite.status, anonymousLibrary: anonymousLibrary.status,
+        uninvitedLibrary: (await getLibrary(outsider.request)).status, uninvitedPlay: uninvited.status,
+      };
     } finally {
       await outsider.close();
     }
@@ -132,19 +140,43 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     ]);
     const body = await finish.json();
     await expect(page).toHaveURL(`${ORIGIN}${PRIVATE_MUSIC.library.path}`);
+    const library = await getLibrary();
     assertPrivateInvite({
       privateListening: finish.ok() && body.private_listening === true,
       destination: new URL(page.url()).pathname, inviteFragmentCleared: !new URL(page.url()).hash,
-      libraryStatus: await getLibrary(),
+      libraryStatus: library.status,
     });
   });
 
   const rows = page.getByTestId(PRIVATE_MUSIC.library.item);
+  const rowFor = (id: string) => rows.and(page.locator(`[data-id="${id}"]`));
+  const refresh = page.getByRole('button', { name: PRIVATE_MUSIC.library.refresh, exact: true });
+  const fresh = await check('owner upload and fresh publication in invited Library', async () => {
+    // Protected setup can admit the prepublished companion only after redemption.
+    let priorIds: string[] = [];
+    await expect.poll(async () => {
+      const library = await getLibrary();
+      priorIds = library.ids;
+      return library.status === 200 && priorIds.includes(fixture.companion.trackId);
+    }, { timeout: 60_000, intervals: [1_000] }).toBe(true);
+    await refresh.click();
+    await expect(rowFor(fixture.companion.trackId)).toBeVisible();
+    const owner = await playwrightRequest.newContext();
+    const receipt = await post(owner, PRIVATE_TRIAL_UPLOAD, upload.body, {
+      ...access, 'Content-Type': 'audio/flac', Cookie: `${SESSION_COOKIE}=${fixture.ownerSession}`,
+    }).finally(() => owner.dispose());
+    expect(receipt.status).toBe(200);
+    const publication = freshTrialPublication(receipt.text, upload.sha256, priorIds);
+    await refresh.click();
+    await expect(rowFor(publication.trackId)).toBeVisible();
+    return publication;
+  });
+  const publications = [fresh, fixture.companion];
   const idsOf = (items: Locator, attr: string) => items.evaluateAll((elements, name) =>
     elements.flatMap((element) => element.getAttribute(name) ?? []), attr);
   const rangeHeaders = { ...access, Range: 'bytes=65536-69631', 'Sec-Fetch-Site': 'same-origin' };
   const verifyRange = async (trackId: string, source: URL) => {
-    const digest = fixture.publications.find((item) => item.trackId === trackId)?.sha256;
+    const digest = publications.find((item) => item.trackId === trackId)?.sha256;
     const original = inputs.find((item) => item.sha256 === digest)!.body;
     const range = await apiGet(page.request, source.href, rangeHeaders, 'private-range');
     const headers = range.headers();
@@ -172,17 +204,17 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     return retry;
   };
   const { retryAtCutoff, mediaUrl } = await check('curated playback, byte range, seek, queue and video posture', async () => {
-    for (const item of fixture.publications) {
-      await expect(rows.and(page.locator(`[data-id="${item.trackId}"]`))).toBeVisible();
-    }
-    const order = assertCuratedLibrary(digests, fixture.publications,
+    await expect(rowFor(fixture.companion.trackId)).toBeVisible();
+    const order = assertCuratedLibrary(digests, publications,
       await idsOf(rows, PRIVATE_MUSIC.library.id));
-    for (const id of order) await rows.and(page.locator(`[data-id="${id}"]`)).click();
+    expect(order[0]).toBe(fresh.trackId);
+    for (const id of order) await rowFor(id).locator(PRIVATE_MUSIC.library.select).click();
     const current = page.locator(PRIVATE_MUSIC.player.currentQueueItem);
     const firstTrackId = await current.getAttribute(PRIVATE_MUSIC.player.queueId);
     const audio = page.getByTestId(PRIVATE_MUSIC.player.audio);
     const transport = page.getByRole('region', { name: 'Player', exact: true });
-    const baselineTime = await audio.evaluate((element) => (element as HTMLAudioElement).currentTime);
+    await expect(audio).toHaveCount(0);
+    const baselineTime = 0;
     const [start] = await startBrowserPlay(transport.getByRole('button', { name: 'Play', exact: true }));
     const playback = (await samplePlaying(audio, baselineTime)).playback;
     await transport.getByRole('button', { name: 'Pause', exact: true }).click();
@@ -231,7 +263,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const remaining = fixture.expiresAt * 1000 - Date.now();
     if (remaining <= 0) throw new Error('Cohort cutoff preceded completion of the active journey');
     await delay(remaining + 2_000);
-    const revokedLibrary = await getLibrary();
+    const revokedLibrary = (await getLibrary()).status;
     const revokedPlay = (await retryAtCutoff()).status;
     const range = await apiGet(page.request, mediaUrl, rangeHeaders, 'private-range-cutoff');
     expect([401, 403, 404]).toContain(range.status());
@@ -239,7 +271,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     await page.goto(`${ORIGIN}${PRIVATE_MUSIC.library.path}`);
     await expect(page.getByText(PRIVATE_MUSIC.library.forbidden, { exact: true })).toBeVisible();
     const remainingCuratedRows = (await idsOf(rows, PRIVATE_MUSIC.library.id))
-      .filter((id) => fixture.publications.some((item) => item.trackId === id)).length;
+      .filter((id) => publications.some((item) => item.trackId === id)).length;
     assertPrivateRefusals({
       missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay, revokedLibrary, revokedPlay,
     }, remainingCuratedRows);
