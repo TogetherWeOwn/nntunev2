@@ -308,6 +308,50 @@ One TLS-verified read-only snapshot checks primary status, identity and rights.
 It scans up to 256 user relations and large objects, and refuses incomplete coverage.
 Ledger and reference rows count as data. Record the job URL, attempt and verdict.
 
+### Carry verified staging evidence into database approval
+
+Use the [pinned staging attempt and admission record](first-private-music-launch.md#qualify-the-candidate)
+for each exact database candidate. Match the candidate SHA, current staging run
+and attempt, and unique attempt-bound artifact and Actions digest. Retain the
+matching `verified_private_music_staging` pins and verifier job reference from
+[staging admission](../ci/staging-admission.md#verified-private-staging-pins).
+If verification is unavailable, the receipt is superseded or the candidate SHA
+changes, keep the affected approval pending until the exact candidate has
+eligible staging evidence. Live evidence depends on the protected same-build
+journey and reviewed Product and QA enrollment. The checked-in policy has no
+approval, and the [workflow that calls the verifier](../.github/workflows/deploy-production.yml)
+currently closes application promotion at preflight.
+
+In the private release record, cite that staging evidence from each exact-plan
+approval. For example, with a synthetic candidate `<sha>` and staging run `100`,
+attempt `1`, `#evidence-staging-100-1` points to
+`staging-admission-<sha>-100-1-private-music`, its verified digest and job
+evidence. The first-attempt database run IDs below come from the corresponding
+pending deployments.
+
+| Private approval reference | Candidate and protected authorization |
+| --- | --- |
+| `#evidence-bootstrap-200-1`, citing `#evidence-staging-100-1` | `DATABASE_BOOTSTRAP_CANDIDATE_SHA` is `<sha>`. The bootstrap Environment binds `BOOTSTRAP_SHA` to `<sha>` and `BOOTSTRAP_RUN_ID` to `200`, with the approved setup plan's exact bytes and SHA-256 in `BOOTSTRAP_PLAN_B64` and `BOOTSTRAP_PLAN_DIGEST`. |
+| `#evidence-baseline-201-1`, citing `#evidence-staging-100-1` and the verified setup readback | `DATABASE_BASELINE_CANDIDATE_SHA` is `<sha>` while that exact candidate remains eligible. The baseline Environment binds `BASELINE_SHA` to `<sha>` and `BASELINE_RUN_ID` to `201`, with its separately approved plan's exact bytes and SHA-256 in `BASELINE_PLAN_B64` and `BASELINE_PLAN_DIGEST`. The plan uses the verified launch database OID and the separately issued reader OID. |
+
+Both workflows dispatch with zero inputs. The evidence references stay in the
+private release record. The protected runners consume their own Environment's
+authorization. Bootstrap uses `BOOTSTRAP_EXPIRY` and `BOOTSTRAP_SETUP_PASSWORD`.
+Baseline uses `BASELINE_EXPIRY`, `BASELINE_READER_PASSWORD` and
+`BASELINE_ENABLED=true`. Keep the pending-deployment readback, approval and
+cleanup rules above. Setup success and verified setup-role retirement precede
+baseline approval.
+
+Rehearse the mapping from the repository root with a synthetic receipt, synthetic
+run IDs and synthetic plan bytes. The fixture uses the existing verifier with
+substitutes for Actions and serving identity reads, then checks the real database
+admission and plan parsers with certificate validation stubbed out.
+
+```sh
+python3 -B ci/test_staging_admission.py \
+  SourceBindingTests.test_private_staging_receipt_handoff_to_database_admission
+```
+
 ### Reader role custody and lifecycle
 
 The dormant [reader SQL](../.github/scripts/database_bootstrap_reader_role.py) prepares a
