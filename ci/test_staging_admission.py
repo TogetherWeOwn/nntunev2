@@ -298,6 +298,17 @@ class PrivateAdmissionTests(Base):
                          "build_sha": SHA, "track_id": PRIVATE_TRACK_ID, "sha256": PRIVATE_AUDIO_SHA})
         self.assertTrue(world.artifact["name"].endswith("-private-music"))
 
+    def test_private_receipt_rejects_a_different_staging_environment(self):
+        world = PrivateWorld()
+        receipt = world.verify()
+        self.assertEqual(receipt["environment"], "staging")
+        self.assertEqual(receipt["result"], "satisfied")
+
+        # Keep the run, attempt and build fixed, and repack with a valid digest.
+        world.receipt["environment"] = "staging-isolated"
+        world.set_archive()
+        self.assertWorldRefused(world, "^receipt source, producer or attempt mismatch$")
+
     def test_private_receipt_timing_matches_selected_attempt_job_start(self):
         world = PrivateWorld()
         world.receipt["recorded_at"] = iso(-1)
