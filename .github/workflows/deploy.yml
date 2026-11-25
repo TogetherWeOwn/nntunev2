@@ -112,6 +112,7 @@ jobs:
           python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-trial-cleanup.log"
           git diff --exit-code -- Cargo.lock
       - name: Verify the pinned staging disable deployment
+        id: containment
         env:
           CLEANUP_SCOPE_SHA256: ${{ inputs.private_trial_cleanup_scope_sha256 }}
           CLEANUP_CONTAINMENT: ${{ secrets.PRIVATE_TRIAL_CLEANUP_CONTAINMENT }}
@@ -133,6 +134,7 @@ jobs:
           umask 077
           timeout -k 2s 40s python3 -E -s .github/scripts/staging_trial_cleanup_preflight.py > "$RUNNER_TEMP/trial-cleanup-provider.json"
       - name: Retire the selected tone A versions once
+        if: ${{ success() && steps.containment.outcome == 'success' }}
         env:
           CLEANUP_STAGE: staging
           CLEANUP_SCOPE_SHA256: ${{ inputs.private_trial_cleanup_scope_sha256 }}

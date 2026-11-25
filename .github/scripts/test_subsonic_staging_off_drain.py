@@ -191,6 +191,10 @@ class ReadbackTests(unittest.TestCase):
         setup, containment = cleanup.split("      - name: Verify the pinned staging disable deployment\n", 1)
         containment, invoke = containment.split("      - name: Retire the selected tone A versions once\n", 1)
         self.assertIn("environment:\n      name: staging\n", setup)
+        self.assertTrue(containment.startswith("        id: containment\n        env:\n"))
+        self.assertTrue(invoke.startswith(
+            "        if: ${{ success() && steps.containment.outcome == 'success' }}\n        env:\n"
+        ))
         self.assertIn(".github/scripts/staging_trial_cleanup_preflight.py", containment)
         self.assertEqual(containment.count(READ_TOKEN), 1)
         self.assertIn(f"CLOUDFLARE_WORKERS_READ_TOKEN: ${{{{ secrets.{READ_TOKEN} }}}}", containment)

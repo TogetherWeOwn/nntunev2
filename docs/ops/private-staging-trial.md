@@ -142,8 +142,11 @@ separate from upload, read, publication and enrollment. Use
 independent exact-version DELETE and HEAD credential. Its policy must allow
 only the two selected fixture keys and no list or bulk operations. Record the
 SHA-256 of the exact UTF-8 credential JSON as `s3_credential_sha256` in the
-scope. Verify both identities, provider policy and access independently before
-arming the trial. Keep the scope and credentials in protected custody.
+scope. Before arming, verify both identities and qualify the provider with the
+same no-list policy on a disposable versioned fixture. Require version-specific
+HEAD to return the selected version while present and an empty HTTP 404 after
+exact-version deletion. Treat HTTP 403, ambiguity or a policy that needs list
+access as a stop. Keep the scope and credentials in protected custody.
 
 Once the cutoff, retention and lease windows have elapsed, dispatch
 [`deploy`](../../.github/workflows/deploy.yml) from protected `main` with
