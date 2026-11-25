@@ -464,6 +464,43 @@ fn account_deleting_probe_runs_unnamed_with_a_text_owner() {
 }
 
 #[test]
+fn private_trial_ingest_statements_run_unnamed() {
+    // The API Clippy check covers the caller, but does not lint its ingest dependency.
+    for (module, source) in [
+        (
+            "upload handoff",
+            include_str!("../../ingest/src/multipart/session_upload.rs"),
+        ),
+        (
+            "completion and replay",
+            include_str!("../../ingest/src/digest_candidate_store/outcome.rs"),
+        ),
+        (
+            "digest inventory",
+            include_str!("../../ingest/src/digest_candidate_store/inventory.rs"),
+        ),
+        (
+            "catalogue publication",
+            include_str!("../../ingest/src/catalogue_publication.rs"),
+        ),
+    ] {
+        let source: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+        for named in [
+            ".prepare(",
+            ".prepare_typed(",
+            ".query(",
+            ".query_one(",
+            ".query_opt(",
+            ".query_raw(",
+            ".execute(",
+            ".execute_raw(",
+        ] {
+            assert!(!source.contains(named), "{module} must not use {named}");
+        }
+    }
+}
+
+#[test]
 fn mint_path_statements_run_unnamed_through_query_typed() {
     // TWO-222: tokio-postgres names prepared statements `sN` per isolate, and
     // a named statement can collide on, or go missing from, a

@@ -1,4 +1,8 @@
-use tokio_postgres::{error::SqlState, types::ToSql, Error, Transaction};
+use tokio_postgres::{
+    error::SqlState,
+    types::{ToSql, Type},
+    Error, Transaction,
+};
 
 use super::{candidate_hashes, uuid, CandidateIntent, LOCK_SQL};
 use crate::multipart::readback_inventory::{ReadbackScope, VerifiedCompletedReadback};
@@ -169,10 +173,10 @@ async fn check_retention(
     tx: &Transaction<'_>,
     retain_until_unix_seconds: i64,
 ) -> Result<(), InventoryAppendError> {
-    tx.query_opt(
+    tx.query_typed_opt(
         "SELECT 1 WHERE pg_catalog.to_timestamp($1::bigint::double precision)
             > pg_catalog.clock_timestamp()",
-        &[&retain_until_unix_seconds],
+        &[(&retain_until_unix_seconds, Type::INT8)],
     )
     .await
     .map_err(|_| InventoryAppendError::Indeterminate)?
@@ -213,20 +217,20 @@ async fn write_verified(
 
     let map = uuid(&intent.map_id);
     let header = intent.header.as_slice();
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![
-        &environment,
-        &library,
-        &digest,
-        &length,
-        &object,
-        &intent.reservation_generation,
-        &sealing_generation,
-        &provider,
-        &header,
-        &map,
-        &hashes,
-        &media_version,
-        &page_versions,
+    let mut params: Vec<(&(dyn ToSql + Sync), Type)> = vec![
+        (&environment, Type::TEXT),
+        (&library, Type::TEXT),
+        (&digest, Type::BYTEA),
+        (&length, Type::INT8),
+        (&object, Type::TEXT),
+        (&intent.reservation_generation, Type::INT8),
+        (&sealing_generation, Type::TEXT),
+        (&provider, Type::TEXT),
+        (&header, Type::BYTEA),
+        (&map, Type::TEXT),
+        (&hashes, Type::BYTEA_ARRAY),
+        (&media_version, Type::TEXT),
+        (&page_versions, Type::TEXT_ARRAY),
     ];
     let (root_version, record) = verified.authenticated_envelope();
     let root_version = uuid(root_version);
@@ -234,11 +238,9 @@ async fn write_verified(
     let action = match &write {
         Write::AppendInventory => APPEND_SQL,
         Write::StageWinner(retain_until_unix_seconds) => {
-            params.extend([
-                &root_version as &(dyn ToSql + Sync),
-                &wrapped_record,
-                retain_until_unix_seconds,
-            ]);
+            params.push((&root_version, Type::TEXT));
+            params.push((&wrapped_record, Type::BYTEA));
+            params.push((retain_until_unix_seconds, Type::INT8));
             STAGE_WINNER_SQL
         }
     };
@@ -248,18 +250,18 @@ async fn write_verified(
         .await
         .map_err(InventoryAppendError::from_db)?;
     let result = async {
-        let held = savepoint.query_opt(LOCK_SQL, &params[..4]).await?;
+        let held = savepoint.query_typed_opt(LOCK_SQL, &params[..4]).await?;
         // READ COMMITTED refreshes the snapshot after the holder releases the lock.
         if held.is_none()
             || savepoint
-                .query_opt(&format!("{MATCH_SQL}{action}"), &params)
+                .query_typed_opt(&format!("{MATCH_SQL}{action}"), &params)
                 .await?
                 .is_none()
         {
             return Ok(false);
         }
         Ok(savepoint
-            .query_opt(STILL_LIVE_SQL, &params[..6])
+            .query_typed_opt(STILL_LIVE_SQL, &params[..6])
             .await?
             .is_some())
     }

@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nntune_core::{media_envelope::EnvelopeContext, s3_locator::S3MediaMetadata};
-use tokio_postgres::{error::SqlState, Client, IsolationLevel, Transaction};
+use tokio_postgres::{error::SqlState, types::Type, Client, IsolationLevel, Transaction};
 
 use super::{
     initiation::InitiatedUpload, resume_checkpoint::ResumeBinding,
@@ -105,23 +105,23 @@ pub async fn handoff<'a>(
     let length = i64::try_from(context.plaintext_len).map_err(|_| Refused)?;
     let lock = async |tx: &Transaction<'_>| {
         let row = tx
-            .query_opt(
+            .query_typed_opt(
                 LOCK,
                 &[
-                    &uuid(&environment),
-                    &uuid(&library),
-                    &scope.principal,
-                    &scope.session,
-                    &scope.fingerprint.as_slice(),
-                    &uuid(&generation),
-                    &scope.revision,
-                    &scope.offset,
-                    &lease,
-                    &object,
-                    &configuration_id,
-                    &bucket,
-                    &length,
-                    &context.header.as_slice(),
+                    (&uuid(&environment), Type::TEXT),
+                    (&uuid(&library), Type::TEXT),
+                    (&scope.principal, Type::TEXT),
+                    (&scope.session, Type::TEXT),
+                    (&scope.fingerprint.as_slice(), Type::BYTEA),
+                    (&uuid(&generation), Type::TEXT),
+                    (&scope.revision, Type::INT8),
+                    (&scope.offset, Type::INT8),
+                    (&lease, Type::TEXT),
+                    (&object, Type::TEXT),
+                    (&configuration_id, Type::TEXT),
+                    (&bucket, Type::TEXT),
+                    (&length, Type::INT8),
+                    (&context.header.as_slice(), Type::BYTEA),
                 ],
             )
             .await
@@ -159,7 +159,14 @@ pub async fn handoff<'a>(
         return upload(id.ok_or(Pending)?, deadline);
     }
     if tx
-        .execute(CLAIM, &[&scope.session, &object, &bucket])
+        .execute_typed(
+            CLAIM,
+            &[
+                (&scope.session, Type::TEXT),
+                (&object, Type::TEXT),
+                (&bucket, Type::TEXT),
+            ],
+        )
         .await
         .map_err(db_error)?
         != 1
@@ -180,7 +187,13 @@ pub async fn handoff<'a>(
         return Err(Refused);
     };
     if tx
-        .execute(RECORD, &[&scope.session, &target.upload_id])
+        .execute_typed(
+            RECORD,
+            &[
+                (&scope.session, Type::TEXT),
+                (&target.upload_id, Type::TEXT),
+            ],
+        )
         .await
         .map_err(db_error)?
         != 1

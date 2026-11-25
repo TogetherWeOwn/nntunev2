@@ -149,17 +149,17 @@ impl Permit<'_> {
         let expires = i64::try_from(self.actor.expires_at).map_err(|_| Refused)?;
         let rotation = i32::try_from(self.actor.rotation_counter).map_err(|_| Refused)?;
         let cohort_until = i64::try_from(self.policy.expires_at).map_err(|_| Refused)?;
-        tx.query_opt(
+        tx.query_typed_opt(
             include_str!("lock.sql"),
             &[
-                &self.actor.user_id,
-                &self.actor.session_id,
-                &self.target.invite_id,
-                &authenticated,
-                &expires,
-                &rotation,
-                &stepped_up_until,
-                &cohort_until,
+                (&self.actor.user_id, Type::TEXT),
+                (&self.actor.session_id, Type::TEXT),
+                (&self.target.invite_id, Type::INT8),
+                (&authenticated, Type::INT8),
+                (&expires, Type::INT8),
+                (&rotation, Type::INT4),
+                (&stepped_up_until, Type::INT8),
+                (&cohort_until, Type::INT8),
             ],
         )
         .await
@@ -258,10 +258,16 @@ impl Permit<'_> {
         {
             return Err(Refused);
         }
-        tx.execute(
+        tx.execute_typed(
             "INSERT INTO public.storage_s3_locator_intents (object_id, root_version_id, s3_bucket, s3_key, s3_version_id)
              VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5) ON CONFLICT (object_id) DO NOTHING",
-            &[&uuid_text(prepared.intent.identities[2]), &uuid_text(root), &inventory.bucket(), &pin.object_key, &version],
+            &[
+                (&uuid_text(prepared.intent.identities[2]), Type::TEXT),
+                (&uuid_text(root), Type::TEXT),
+                (&inventory.bucket(), Type::TEXT),
+                (&pin.object_key, Type::TEXT),
+                (&version, Type::TEXT),
+            ],
         ).await.map_err(|_| Unconfirmed)?;
         let staged = stage_completed_release(
             &mut tx,
@@ -314,7 +320,10 @@ impl Permit<'_> {
         }
         let cohort_until = i64::try_from(self.policy.expires_at).map_err(|_| Refused)?;
         if !tx
-            .query_one(include_str!("reference.sql"), &[&track, &cohort_until])
+            .query_typed_one(
+                include_str!("reference.sql"),
+                &[(&track, Type::TEXT), (&cohort_until, Type::INT8)],
+            )
             .await
             .map_err(|_| Unconfirmed)?
             .try_get::<_, bool>(0)

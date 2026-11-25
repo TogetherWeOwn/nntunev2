@@ -2,7 +2,10 @@
 //! The S3 source table and the locator schema are currently rehearsal-only.
 
 use nntune_core::s3_locator::{S3Binding, S3Locator};
-use tokio_postgres::{types::ToSql, Transaction};
+use tokio_postgres::{
+    types::{ToSql, Type},
+    Transaction,
+};
 
 use crate::{
     digest_candidate_store::CandidateIntent,
@@ -87,27 +90,27 @@ pub(crate) async fn stage_with_duration(
         return Err(Refused);
     }
 
-    let identity: [&(dyn ToSql + Sync); 5] = [
-        &track.release_id,
-        &track.medium_no,
-        &track.track_no,
-        &track.mbid,
-        &duration_ms,
+    let identity: [(&(dyn ToSql + Sync), Type); 5] = [
+        (&track.release_id, Type::TEXT),
+        (&track.medium_no, Type::INT4),
+        (&track.track_no, Type::INT4),
+        (&track.mbid, Type::TEXT),
+        (&duration_ms, Type::INT4),
     ];
-    let track_params: [&(dyn ToSql + Sync); 8] = [
-        identity[0],
-        identity[1],
-        identity[2],
-        identity[3],
-        &track.title,
-        &matched.job_id,
-        &matched.owner_id,
-        &duration_ms,
+    let track_params = [
+        identity[0].clone(),
+        identity[1].clone(),
+        identity[2].clone(),
+        identity[3].clone(),
+        (&track.title, Type::TEXT),
+        (&matched.job_id, Type::TEXT),
+        (&matched.owner_id, Type::TEXT),
+        identity[4].clone(),
     ];
     let savepoint = tx.transaction().await?;
     let staged = async {
         let job = savepoint
-            .query_opt(
+            .query_typed_opt(
                 include_str!("catalogue_publication/track.sql"),
                 &track_params,
             )
@@ -116,7 +119,7 @@ pub(crate) async fn stage_with_duration(
         let seq: i64 = job.get(0);
         // A fresh snapshot sees the canonical row after a conflicting insert.
         let row = savepoint
-            .query_opt(
+            .query_typed_opt(
                 "SELECT id::text FROM public.tracks
              WHERE release_id = $1::text::uuid AND medium_no = $2 AND track_no = $3
                AND mbid = $4::text::uuid AND ($5::integer IS NULL OR duration_ms = $5)
@@ -128,26 +131,26 @@ pub(crate) async fn stage_with_duration(
         let track_id: String = row.get(0);
         let object = hex::encode(object);
         savepoint
-            .query_opt(
+            .query_typed_opt(
                 include_str!("catalogue_publication/source.sql"),
                 &[
-                    &object,
-                    &hex::encode(environment),
-                    &hex::encode(library),
-                    &hex::encode(generation),
-                    &hex::encode(configuration),
-                    &bytes,
-                    &result.plaintext_sha256.as_slice(),
-                    &hex::encode(result.intent.map_id),
-                    &hex::encode(result.root_version_id),
-                    &result.locator.bucket(),
-                    &result.locator.key(),
-                    version,
-                    &result.page_versions,
-                    &result.intent.header.as_slice(),
-                    &track_id,
-                    &matched.job_id,
-                    &seq,
+                    (&object, Type::TEXT),
+                    (&hex::encode(environment), Type::TEXT),
+                    (&hex::encode(library), Type::TEXT),
+                    (&hex::encode(generation), Type::TEXT),
+                    (&hex::encode(configuration), Type::TEXT),
+                    (&bytes, Type::INT8),
+                    (&result.plaintext_sha256.as_slice(), Type::BYTEA),
+                    (&hex::encode(result.intent.map_id), Type::TEXT),
+                    (&hex::encode(result.root_version_id), Type::TEXT),
+                    (&result.locator.bucket(), Type::TEXT),
+                    (&result.locator.key(), Type::TEXT),
+                    (version, Type::TEXT),
+                    (&result.page_versions, Type::TEXT_ARRAY),
+                    (&result.intent.header.as_slice(), Type::BYTEA),
+                    (&track_id, Type::TEXT),
+                    (&matched.job_id, Type::TEXT),
+                    (&seq, Type::INT8),
                 ],
             )
             .await?
