@@ -763,6 +763,8 @@ jobs:
           persist-credentials: false
       - name: Prove synthetic run authorization and fixed diagnostics
         run: exec python3 -B .github/scripts/test_database_bootstrap_admission.py
+      - name: Check offline Environment protection readback fixtures
+        run: exec python3 -B .github/scripts/test_database_bootstrap_environment_readback.py
       - name: Prove synthetic TLS, role isolation, launch baseline and teardown
         id: bootstrap
         run: exec python3 -B .github/scripts/test_database_bootstrap_isolation.py
