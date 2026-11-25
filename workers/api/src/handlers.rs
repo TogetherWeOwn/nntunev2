@@ -14227,8 +14227,19 @@ pub(crate) mod tests {
 
         // Return a misbound invoice even though the caller requests the exact
         // subscription. The normal fixture filter would hide it from the fold.
-        let mut other_invoice = h.stripe.invoices.borrow()["in_test_1"].clone();
-        other_invoice.subscription = Some("sub_test_other".into());
+        let other_invoice = test_invoice(
+            "in_test_other",
+            customer,
+            "sub_test_other",
+            PRICE_PLUS,
+            BILLING_NOW,
+            first_end,
+            BILLING_NOW,
+        );
+        h.stripe
+            .invoices
+            .borrow_mut()
+            .insert(other_invoice.id.clone(), other_invoice.clone());
         h.stripe.scripted_invoice_list.replace(Some((
             crate::stripe::ListInvoices {
                 customer_id: Some(customer.into()),
