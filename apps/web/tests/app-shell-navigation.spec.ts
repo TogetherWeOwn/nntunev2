@@ -1,4 +1,8 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
+import { privateStagingAudio } from '../../../e2e/helpers/private-staging-fixture.js';
+import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.js';
+import { test as invitedLibraryTest } from './helpers/private-music-fixture.js';
 
 /**
  * App-shell navigation acceptance (roadmap item NAV): reach the primary
@@ -25,14 +29,15 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   - Changed cases (NAV-01, 02a–d, 05, 07, 10, 16, 17, 18) keep their
  *     current bodies, marked SUPERSEDED v1, and each gains a complete v2
  *     body below as `test.fixme`. The v2 bodies are the new contract.
- *   - NAV-03b (playback continuity), NAV-15 v2 (real-player shortcuts) and
- *     NAV-19 (player-bar hooks) activate later, with the player bar.
+ *   - NAV-15 v2 now exercises the scoped shortcuts on the invited Library.
+ *   - NAV-03b (playback continuity) and NAV-19 (player-bar hooks) activate
+ *     later, with the player bar.
  *
  * ACTIVATION (the one pre-authorised Builder edit, app-shell build): in the
  * PR that ships the new shell, delete every test marked SUPERSEDED v1 and
  * remove `.fixme` from its v2 counterpart. Nothing else in this file may
  * change in that PR; any other change routes back to the test author. The
- * player-bar build does the same for NAV-03b, NAV-15 v1→v2 and NAV-19.
+ * player-bar build does the same for NAV-03b and NAV-19.
  * When the last v1 test is deleted, delete the legacy helpers and the v1
  * branch of the generation-aware helpers with them.
  *
@@ -84,11 +89,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
  *   - The app shell renders on app routes in these mocked, unauthenticated
  *     contexts exactly as the current shell does; shell rendering must not
  *     be gated on a session fetch this suite does not mock.
- *   - NAV-15 sequencing: the demo player carries the shortcut contract
- *     until the player bar graduates the demo logic to the real player;
- *     then NAV-15 v2 (real player) replaces v1. The full keyboard map is
- *     owned by the player suites; NAV-15 pins transport keys + guards
- *     with the shell present.
+ *   - NAV-15 keeps the demo's global shortcuts covered while that route
+ *     exists. The invited Library scopes character shortcuts to player
+ *     buttons and uses the queue's Next button for keyboard advance.
  *   - NAV-16's signed-in `/` → `/home` redirect is NOT pinned here: this
  *     suite has no authenticated fixture, and inventing a fake session to
  *     reach it would fake the auth boundary. It belongs to the Home
@@ -842,8 +845,7 @@ test('[NAV-14] paywall upgrade navigation keeps the shell and a sane focus targe
 	await expectCurrentDestination(page, '/pricing after upgrade', null);
 });
 
-// Until player graduation (see NAV-15 v2): the demo player carries the
-// shortcut contract. Superseded by NAV-15 v2 at the player-bar activation.
+// Retain the demo's global "n" and "?" bindings while the demo is served.
 test('[NAV-15] existing player shortcuts keep working with the shell present', async ({
 	page
 }) => {
@@ -1394,52 +1396,75 @@ test('[NAV-10 v2] no demo links and no playback promises in either shell', async
 	).not.toMatch(/upload|process/i);
 });
 
-// [gate: player bar]
-test.fixme('[NAV-15 v2] player shortcuts work on the real player with the shell present', async ({
-	page
+invitedLibraryTest('[NAV-15 v2] Library keyboard controls work with the shell present', async ({
+	page,
+	origin
 }) => {
-	await mockLibrary(page, 200, PLAYABLE_ITEMS);
-	await page.goto('/library');
-	await page.getByTestId('library-item').first().click();
-	await expect(page.getByTestId('now-playing')).toContainText('Shell Song 1', {
-		timeout: PRESENCE_TIMEOUT
+	const first = { id: '00000000-0000-4000-8000-000000000001', title: 'Shell Song 1', duration_ms: 14_000 };
+	const second = { id: '00000000-0000-4000-8000-000000000002', title: 'Shell Song 2', duration_ms: 14_000 };
+	const tracks = [first, second];
+	const { library, player: playerHooks } = PRIVATE_MUSIC;
+	const fixture = await mockInvitedLibraryPlayback(page, origin, {
+		libraryItems: () => tracks,
+		playableTrackId: (id) => tracks.find((track) => track.id === id)?.id,
+		audio: privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!.body
 	});
-	// One row click queues ONE track (append-only selection: selectTrack →
-	// addTrack keeps the current index), so queue the second track
-	// explicitly — "n" must have a next track to advance to. Queueing it
-	// must not steal current: now-playing stays on Shell Song 1 until "n".
-	await page.getByTestId('library-item').nth(1).click();
-	await expect(page.getByTestId('library-queued-badge')).toHaveCount(2, {
-		timeout: PRESENCE_TIMEOUT
-	});
-	await expect(page.getByTestId('now-playing')).toContainText('Shell Song 1');
+	await fixture.signIn();
+	await page.goto(origin + library.path);
+	await expectShellPresent(page, library.path);
 
-	// A focused shell link is not a typing target: global transport keys stay live.
-	await libraryDestinationLink(page).focus();
+	const main = page.getByRole('main');
+	for (const track of tracks) {
+		await main.getByRole('button', { name: track.title, exact: true }).click();
+	}
+	const current = page.locator(playerHooks.currentQueueItem);
+	await expect(page.getByTestId(playerHooks.queueItem)).toHaveCount(2);
+	await expect(current).toHaveAttribute(playerHooks.queueId, first.id);
+
+	const player = page.getByRole('region', { name: 'Player', exact: true });
+	const audio = player.getByTestId(playerHooks.audio);
+	const pause = player.getByRole('button', { name: 'Pause', exact: true });
+	await player.getByRole('button', { name: 'Play', exact: true }).click();
+	await expect.poll(() => audio.evaluate((element: HTMLAudioElement) => element.currentTime))
+		.toBeGreaterThan(0);
+	await expect(audio).toHaveAttribute('src', fixture.mediaPath(first.id));
+
+	const libraryLink = libraryDestinationLink(page);
+	const shortcuts = page.getByRole('dialog', { name: 'Keyboard shortcuts', exact: true });
+	await libraryLink.focus();
+	await expect(libraryLink).toBeFocused();
 	await page.keyboard.press('n');
-	await expect(
-		page.getByTestId('now-playing'),
-		'expected "n" to advance the real player with a shell link focused. ' +
-			'Builder: shell links must not capture or break global player keys.'
-	).toContainText('Shell Song 2', { timeout: PRESENCE_TIMEOUT });
-
+	await page.keyboard.press('k');
 	await page.keyboard.press('?');
-	const shortcuts = page.getByTestId('shortcuts-dialog');
-	await expect(shortcuts, 'expected "?" to open the shortcuts dialog').toBeVisible();
-	await page.keyboard.press('Escape');
+	await expect(libraryLink).toBeFocused();
+	await expect(current).toHaveAttribute(playerHooks.queueId, first.id);
+	await expect(pause).toBeVisible();
 	await expect(shortcuts).toBeHidden();
 
-	// Typing guard: keys typed into the top-bar search field are text,
-	// never transport shortcuts.
-	const searchField = page.locator('[data-testid="shell-topbar"] input').first();
-	await searchField.click();
+	const search = page.getByTestId('shell-topbar').getByRole('searchbox', { name: 'Search', exact: true });
+	await search.focus();
+	await expect(search).toBeFocused();
 	await page.keyboard.press('n');
-	await expect(searchField).toHaveValue(/n/);
-	await expect(
-		page.getByTestId('now-playing'),
-		'expected typing "n" in the search field NOT to advance the track. ' +
-			'Builder: keep the shortcuts typing guard (inputs are never transport targets).'
-	).toContainText('Shell Song 2');
+	await page.keyboard.press('k');
+	await expect(search).toHaveValue('nk');
+	await expect(current).toHaveAttribute(playerHooks.queueId, first.id);
+	await expect(pause).toBeVisible();
+
+	await pause.focus();
+	await expect(pause).toBeFocused();
+	await page.keyboard.press('?');
+	await expect(shortcuts).toBeVisible();
+	await expect(shortcuts.getByRole('button', { name: 'Close', exact: true })).toBeFocused();
+	await page.keyboard.press('Escape');
+	await expect(shortcuts).toBeHidden();
+	await expect(pause).toBeFocused();
+
+	const next = page.getByTestId(playerHooks.next);
+	await next.focus();
+	await expect(next).toBeFocused();
+	await page.keyboard.press('Enter');
+	await expect(current).toHaveAttribute(playerHooks.queueId, second.id);
+	await expect(audio).toHaveAttribute('src', fixture.mediaPath(second.id));
 });
 
 // [gate: app shell]
