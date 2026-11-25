@@ -141,6 +141,9 @@ Access writers as required by [protected recovery](ops.md#protected-production-w
    Preserve the database and snapshot. Record the job, allocation and denial
    readbacks and then retire the temporary release-window controls.
 
+See the [synthetic post-recovery handoff](ops/first-release-recovery-example.md)
+for an example of recording the serving build and the pending release decision.
+
 ## Watch the first 30 minutes
 
 Start at successful final smoke on the pinned 100% allocation. Assign a named
