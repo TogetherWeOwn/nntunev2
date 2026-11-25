@@ -151,6 +151,22 @@ COMMIT;
     return dict(zip(checks, (value == "t" for value in result.stdout.strip().split("|")), strict=True))
 
 
+def binding_connection_verdict(identity_verdicts, origin_tls_attestations):
+    """Evaluate the four-binding readback from independently verified verdicts.
+
+    A TLS verdict is True only after the existing origin TLS evidence has
+    been verified for that binding's connection. This check does not collect
+    evidence or determine whether the trial can be armed.
+    """
+    bindings = {f"PRIVATE_TRIAL_{role}_DB" for role in TRIAL_DATABASES}
+    if (type(identity_verdicts) is dict and identity_verdicts.keys() == bindings
+            and type(origin_tls_attestations) is dict and origin_tls_attestations.keys() == bindings
+            and all(identity_verdicts[binding] == "matched"
+                    and origin_tls_attestations[binding] is True for binding in bindings)):
+        return "qualified"
+    return "pending"
+
+
 def main():
     try:
         scope = parse_scope(os.environ.get(SCOPE_ENV, ""))

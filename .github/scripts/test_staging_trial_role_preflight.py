@@ -190,6 +190,26 @@ class TrialRolePreflightTests(unittest.TestCase):
                     self.assertNotIn(sensitive, report)
 
 
+class TrialConnectionReadbackTests(unittest.TestCase):
+    def test_matching_identity_requires_origin_tls_for_every_binding(self):
+        bindings = ("PRIVATE_TRIAL_UPLOAD_DB", "PRIVATE_TRIAL_AUTH_DB",
+                    "PRIVATE_TRIAL_PUBLISH_DB", "PRIVATE_TRIAL_ENROLL_DB")
+        # The synthetic database, login and effective role all match on each binding.
+        identity_verdicts = dict.fromkeys(bindings, "matched")
+        complete_tls = dict.fromkeys(bindings, True)
+
+        self.assertEqual(preflight.binding_connection_verdict(identity_verdicts, complete_tls), "qualified")
+        for binding in bindings:
+            with self.subTest(binding=binding):
+                incomplete_tls = complete_tls.copy()
+                del incomplete_tls[binding]
+                self.assertEqual(preflight.binding_connection_verdict(identity_verdicts, incomplete_tls), "pending")
+                incomplete_tls[binding] = None
+                self.assertEqual(preflight.binding_connection_verdict(identity_verdicts, incomplete_tls), "pending")
+                pending_identity = {**identity_verdicts, binding: "pending"}
+                self.assertEqual(preflight.binding_connection_verdict(pending_identity, complete_tls), "pending")
+
+
 if __name__ == "__main__":
     require_disposable_runner()
     binding_logins = "\n".join(f"CREATE ROLE {role} LOGIN NOINHERIT PASSWORD 'ci-throwaway';"
