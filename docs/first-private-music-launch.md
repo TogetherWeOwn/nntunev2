@@ -5,12 +5,15 @@ and explicitly invited friends and family. Keep public signup, the music-video
 interface and live billing outside this release. Use the existing
 [private listening controls](ops.md#private-listening-qualification).
 
-**Current dispatch status: blocked.** The protected production workflow
-refuses application promotion in preflight. A separate reviewed change must
-open that lane, and real Product and QA approval must be enrolled in the staging
-policy. Production API/data-plane and Access cutover must have their own
-protected lanes, evidence and fallback. Use this procedure to prepare the
-candidate. A filled template or synthetic receipt grants no release authority.
+**Current dispatch status: blocked.** The private staging job runs Playwright
+but still needs protected wiring for the health proof, the three deployment
+pins, and the record and upload steps for the attempt-bound receipt. A reviewed
+release path must also resolve when staging can safely disable the trial and
+open the protected app lane, which currently refuses promotion in preflight.
+Enroll real Product and QA approval through the reviewed staging policy.
+Production API/data-plane and Access cutover need protected lanes, evidence and
+fallback. A synthetic receipt is for rehearsal only.
+[Staging deploy](../.github/workflows/deploy.yml) ·
 [Production preflight](../.github/workflows/deploy-production.yml) ·
 [Staging admission policy](../ci/staging-admission-policy.json)
 
@@ -21,13 +24,16 @@ candidate. A filled template or synthetic receipt grants no release authority.
    the last-good staging restore evidence. Record required CI check results and
    each included PR's review clearance on the relevant SHA. Main can keep moving.
 2. Pin the successful main-push `deploy.yml` run **and attempt** for that SHA.
-   Match successful health smoke, actual Web/API/Stream deploy steps and the
-   `post-deploy private music journey` to it. Require matching Web, API and
+   Match successful health proof, actual Web/API/Stream deploy steps and the
+   `post-deploy private music journey` to it. The ordinary post-deploy smoke
+   is skipped while the private arm is set. Require matching Web, API and
    Stream Worker version and deployment IDs at both ends of the journey. The
    [private journey](../e2e/README.md#private-music-journey-preparation) must
    show upload through Library arrival, play, seek, queue, anonymous and unlisted
    refusal, revoked or expired refusal, and video off. Record Product approval
    of applicability and separate QA approval of the executable mapping.
+   Run again from the reviewed producer and verifier source if that source or
+   the enrolled contract changes. [Admission verifier](../ci/staging-admission.md)
 3. Before release review, collect the staging pins from the protected Actions
    run, jobs and attempt-bound artifact. In the supported promotion lane,
    cross-check them against the `verified_private_music_staging` line in
@@ -35,7 +41,12 @@ candidate. A filled template or synthetic receipt grants no release authority.
    verifier refuses, the line is absent, or the SHA, attempt, digests or
    deployment pins differ. Keep the release on the reviewed evidence. If a
    rerun or drift invalidates it, obtain fresh staging evidence and review the
-   updated candidate. [Admission verifier](../ci/staging-admission.md)
+   updated candidate. The trial cleanup's disable deploy changes the serving
+   staging tuple and makes the earlier receipt unusable. Do not postpone
+   required cleanup or hold `main` to preserve a receipt. Proceed toward
+   release only with a reviewed staging window that supports admission and
+   timely cleanup. Otherwise perform cleanup and leave promotion blocked.
+   [Trial cleanup](../e2e/README.md#private-music-journey-preparation)
 4. Quiesce launch writes and schema/grant changes. Use the
    [protected read-only database baseline](production-database-bootstrap.md#protected-baseline)
    on the pinned production branch and logical database. Require `empty` and
@@ -45,12 +56,12 @@ candidate. A filled template or synthetic receipt grants no release authority.
    restore and exact undo rehearsal for a schema or data change.
 5. For a verified empty first release, take or qualify a fresh provider snapshot
    of the exact branch and scope before the first schema change, under the
-   same write fence. Read back completion, capture time, expiry and coverage of the logical
-   database and grants the change relies on. Keep pre-bootstrap and pre-schema
-   snapshots distinct when their recovery targets differ. If writes could have
-   resumed after the baseline, repeat it and re-qualify the snapshot. The
-   empty-first-release path requires no restore rehearsal. Reconcile the
-   current migration manifest and ledger before app cutover.
+   same write fence. Read back completion, capture time, expiry and coverage
+   of the logical database and grants the change relies on. Keep pre-bootstrap
+   and pre-schema snapshots distinct when their recovery targets differ. If
+   writes could have resumed after the baseline, repeat it and re-qualify the
+   snapshot. The empty-first-release path requires no restore rehearsal.
+   Reconcile the current migration manifest and ledger before app cutover.
    [Snapshot and metering](production-database-bootstrap.md#snapshot-and-metering)
 6. Verify the binding-free maintenance fallback, private Access route and
    backend/media switch-off. Commission an independent cross-family production
@@ -118,7 +129,7 @@ receipts for rehearsing the staging section only.
 | Item | Pin or evidence to record |
 | --- | --- |
 | Candidate | Full main SHA, artifact digest(s), exact-head required checks and per-PR review references |
-| Staging attempt | `deploy.yml` run URL, run ID, attempt, health and private journey job URLs and conclusions |
+| Staging attempt | `deploy.yml` run URL, run ID, attempt, health and private journey job URLs and conclusions, staging window and disable-deploy timing |
 | Staging admission | Artifact name and Actions digest, opening and closing UTC, Web/API/Stream Worker, build SHA, version and deployment IDs, contract/policy/manifest digests, Product and QA references, final verifier job URL and pin match |
 | Staging rollback | Last-good SHA, run/attempt, restore and identity readback |
 | Production baseline | Protected source SHA, run/attempt and job URL, private provider branch and logical DB/OID reference, manifest digest, read time and `empty` verdict, separate no-live-user/data confirmation, writer fence and custodian |
