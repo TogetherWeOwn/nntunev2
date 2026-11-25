@@ -5,7 +5,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import qualify
 
@@ -40,9 +40,9 @@ class TeardownPortTest(unittest.TestCase):
                     else:
                         stack.close()
 
-                expected_calls = [("docker", command) for command in commands]
-                expected_calls.append(("connect", ("127.0.0.1", prior_port)))
+                *docker_calls, probe = teardown.mock_calls
                 self.assertEqual(
-                    [(invocation[0], invocation.args[0]) for invocation in teardown.mock_calls],
-                    expected_calls,
+                    [(invocation[0], invocation.args) for invocation in docker_calls],
+                    [("docker", (command,)) for command in commands],
                 )
+                self.assertEqual(probe, call.connect(("127.0.0.1", prior_port), timeout=ANY))
