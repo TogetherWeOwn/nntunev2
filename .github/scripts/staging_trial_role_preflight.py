@@ -8,16 +8,57 @@ import subprocess
 import sys
 
 from staging_apply import SECRET_ENV, StagingApplyError, evidence_child_env, load_entries
+from staging_stream_config import TRIAL_DATABASES
 from staging_trial_schema import BASELINE, ROLE_RE
 
 
 DATABASE = "nntunev2_staging"
 SCOPE_ENV = "PRIVATE_TRIAL_ROLE_PREFLIGHT_SCOPE"
 LOGIN_RE = re.compile(r"[A-Za-z0-9_-]{1,63}(?:\.[A-Za-z0-9_-]{1,63})?")
+BINDINGS = tuple(f"PRIVATE_TRIAL_{role}_DB" for role in TRIAL_DATABASES)
+BINDING_IDENTITY_SQL = """
+SELECT d.datname::text, d.oid, session_user::text, login_role.oid, current_user::text, effective_role.oid
+FROM pg_catalog.pg_database d
+JOIN pg_catalog.pg_roles login_role ON login_role.rolname = session_user
+JOIN pg_catalog.pg_roles effective_role ON effective_role.rolname = current_user
+WHERE d.datname = pg_catalog.current_database();
+"""
 
 
 def oid(value, *, optional=False):
     return type(value) is int and (0 if optional else 1) <= value < 2**32
+
+
+def binding_identity_verdicts(database_oid, role_pins, rows):
+    """Compare one read-only result per binding against independently reviewed pins.
+
+    The database OID comes from target admission. Each binding's pin is its
+    configured _ROLE name and reviewed OID. Supply a row only when the same
+    binding returned exactly one row. All four bindings must match to satisfy
+    the role identity check. Origin, TLS, cache and serving version evidence
+    are separate.
+    """
+    verdicts = {binding: "pending" for binding in BINDINGS}
+    if (not oid(database_oid) or type(role_pins) is not dict or role_pins.keys() != verdicts.keys()
+            or type(rows) is not dict or not rows.keys() <= verdicts.keys()):
+        return verdicts
+    pins = role_pins.values()
+    if any(type(pin) is not tuple or len(pin) != 2 or type(pin[0]) is not str
+           or not ROLE_RE.fullmatch(pin[0]) or pin[0].lower() == "public" or not oid(pin[1])
+           for pin in pins):
+        return verdicts
+    if (len({name for name, _ in pins}) != len(BINDINGS)
+            or len({role_oid for _, role_oid in pins}) != len(BINDINGS)):
+        return verdicts
+
+    for binding in BINDINGS:
+        row = rows.get(binding)
+        name, role_oid = role_pins[binding]
+        if (type(row) is tuple and len(row) == 6
+                and all(type(row[i]) is str and oid(row[i + 1]) for i in (0, 2, 4))
+                and row == (DATABASE, database_oid, name, role_oid, name, role_oid)):
+            verdicts[binding] = "matched"
+    return verdicts
 
 
 def parse_scope(raw):

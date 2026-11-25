@@ -21,6 +21,72 @@ ADMIN = {
 }
 READER, WRITER, ISSUER = "preflight_fixture_reader", "preflight_fixture_writer", "preflight_fixture_issuer"
 DIGEST = "3" * 64
+BINDING_ROLES = {
+    "PRIVATE_TRIAL_UPLOAD_DB": "preflight_fixture_upload_writer",
+    "PRIVATE_TRIAL_AUTH_DB": "preflight_fixture_authority_reader",
+    "PRIVATE_TRIAL_PUBLISH_DB": "preflight_fixture_publication_writer",
+    "PRIVATE_TRIAL_ENROLL_DB": "preflight_fixture_registrar",
+}
+
+
+def require_disposable_runner():
+    if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
+        raise SystemExit("requires the disposable GitHub-hosted PostgreSQL service")
+
+
+class TrialBindingIdentityTests(unittest.TestCase):
+    def test_fixed_binding_verdicts(self):
+        database_oid = 40200
+        pins = {binding: (name, number) for number, (binding, name) in
+                enumerate(BINDING_ROLES.items(), 40201)}
+        rows = {binding: (preflight.DATABASE, database_oid, name, number, name, number)
+                for binding, (name, number) in pins.items()}
+        matched = dict.fromkeys(BINDING_ROLES, "matched")
+        self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, rows), matched)
+
+        for binding in BINDING_ROLES:
+            with self.subTest(binding=binding, case="missing"):
+                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, {
+                    key: row for key, row in rows.items() if key != binding
+                }), {**matched, binding: "pending"})
+
+        upload, auth, publish, enroll = BINDING_ROLES
+        row = rows[publish]
+        for case, observed, expected in (
+            ("swapped roles", {upload: rows[auth], auth: rows[upload]},
+             {upload: "pending", auth: "pending"}),
+            ("effective role only", {publish: (*row[:2], *pins[auth], *row[4:])}, {publish: "pending"}),
+            ("session role only", {publish: (*row[:4], *pins[auth])}, {publish: "pending"}),
+            ("reissued role", {publish: (*row[:-1], row[-1] + 10)}, {publish: "pending"}),
+            ("other database", {enroll: ("synthetic_other_db", *rows[enroll][1:])}, {enroll: "pending"}),
+            ("other database oid", {publish: (row[0], database_oid + 1, *row[2:])}, {publish: "pending"}),
+            ("malformed result", {enroll: ("postgresql://synthetic@example.invalid/fixture",)},
+             {enroll: "pending"}),
+            ("duplicate result", {publish: (row, row)}, {publish: "pending"}),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, {**rows, **observed}),
+                                 {**matched, **expected})
+        for altered in ({**pins, auth: pins[upload]},
+                        {**pins, auth: (pins[auth][0], pins[upload][1])},
+                        {key: pin for key, pin in pins.items() if key != auth}):
+            self.assertEqual(preflight.binding_identity_verdicts(database_oid, altered, rows),
+                             dict.fromkeys(BINDING_ROLES, "pending"))
+
+    def test_disposable_binding_identity_query(self):
+        require_disposable_runner()
+        with scratch_database(ADMIN, preflight.DATABASE) as db:
+            database_oid = int(run_psql(db, "SELECT oid FROM pg_database WHERE datname = current_database();"))
+            pins = {binding: (role, int(run_psql(db, f"SELECT '{role}'::regrole::oid;")))
+                    for binding, role in BINDING_ROLES.items()}
+            rows = {}
+            for binding, role in BINDING_ROLES.items():
+                result = run_psql({**db, "PGUSER": role},
+                                  "BEGIN READ ONLY;\n" + preflight.BINDING_IDENTITY_SQL + "ROLLBACK;\n")
+                name, db_oid, login, login_oid, effective, effective_oid = result.split("|")
+                rows[binding] = (name, int(db_oid), login, int(login_oid), effective, int(effective_oid))
+            self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, rows),
+                             dict.fromkeys(BINDING_ROLES, "matched"))
 
 
 class TrialRolePreflightTests(unittest.TestCase):
@@ -115,12 +181,14 @@ class TrialRolePreflightTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
-        raise SystemExit("requires the disposable GitHub-hosted PostgreSQL service")
+    require_disposable_runner()
+    binding_logins = "\n".join(f"CREATE ROLE {role} LOGIN NOINHERIT PASSWORD 'ci-throwaway';"
+                               for role in BINDING_ROLES.values())
     run_psql(ADMIN, f"""BEGIN;
         CREATE ROLE {READER} LOGIN NOINHERIT;
         CREATE ROLE {WRITER} LOGIN NOINHERIT;
         CREATE ROLE {ISSUER} CREATEROLE NOINHERIT;
+        {binding_logins}
         REVOKE CONNECT ON DATABASE postgres, nntune_ci FROM PUBLIC;
         COMMIT;""")
     try:
@@ -128,6 +196,6 @@ if __name__ == "__main__":
     finally:
         run_psql(ADMIN, f"""BEGIN;
             GRANT CONNECT ON DATABASE postgres, nntune_ci TO PUBLIC;
-            DROP ROLE {READER}, {WRITER}, {ISSUER};
+            DROP ROLE {READER}, {WRITER}, {ISSUER}, {', '.join(BINDING_ROLES.values())};
             COMMIT;""")
     raise SystemExit(not result.wasSuccessful())
