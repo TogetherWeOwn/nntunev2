@@ -18,6 +18,8 @@ const OTHER_USER: &str = "native_billing_other";
 const SUBSCRIPTION: &str = "sub_native_billing";
 const INVOICE: &str = "in_native_billing";
 const NOW: i64 = 1_786_032_000;
+const PLUS: &str = "price_native_mixed_plus";
+const PRO: &str = "price_native_mixed_pro";
 
 async fn dispatch(user: &str, outcome: &ReconcileOutcome) -> Result<(), StoreError> {
     with_fixture_store(async |store| {
@@ -30,6 +32,15 @@ async fn dispatch_caller(
     user: &str,
     target: &str,
     remote: &RemoteSubscription,
+) -> Result<ReconcileOutcome, StoreError> {
+    dispatch_caller_at(user, target, remote, NOW).await
+}
+
+async fn dispatch_caller_at(
+    user: &str,
+    target: &str,
+    remote: &RemoteSubscription,
+    now: i64,
 ) -> Result<ReconcileOutcome, StoreError> {
     let expected_connections = if target == remote.subscription.id {
         2
@@ -46,7 +57,7 @@ async fn dispatch_caller(
                     assert_eq!(subscription.id, target);
                     Ok(remote.invoices.clone())
                 },
-                NOW,
+                now,
             )
             .await
     })
@@ -465,6 +476,7 @@ async fn billing_store_refuses_unowned_history_and_replays_when_owned() {
     assert_eq!(snapshot(&observer).await, committed);
 
     check_legacy_mixed_plan_history(&observer, seed).await;
+    scheduled_reconciliation_preserves_later_plan_update(&observer).await;
     drop(observer);
     driver.await.unwrap().unwrap();
 }
@@ -475,8 +487,6 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
     const ITEM: &str = "si_native_mixed_plan";
     const LEGACY: &str = "in_native_mixed_plan";
     const FRESH: &str = "in_native_mixed_plan_fresh";
-    const PLUS: &str = "price_native_mixed_plus";
-    const PRO: &str = "price_native_mixed_pro";
     seed.row.stripe_subscription_id = TARGET.into();
     seed.row.stripe_customer_id = CUSTOMER.into();
     seed.row.stripe_item_id = ITEM.into();
@@ -833,4 +843,170 @@ async fn check_caller_lock_privilege() {
     tx.rollback().await.unwrap();
     drop(client);
     driver.await.unwrap().unwrap();
+}
+
+async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client) {
+    use crate::billing_sweep::{scheduled_hour, BATCH_SIZE, CRON, DUE_TARGETS};
+
+    fn subscription_row(rows: &Value) -> &Value {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["stripe_subscription_id"] == SUBSCRIPTION)
+            .expect("exact target exists")
+    }
+
+    const CUSTOMER: &str = "cus_native_billing";
+    const OLD_INVOICE: &str = "in_native_scheduled_observation";
+    const NEW_INVOICE: &str = "in_native_paid_plan_update";
+    const OLD_END: i64 = NOW + 100;
+    const NEW_END: i64 = NOW + 200;
+    const RENEWAL_END: i64 = NOW + 300;
+
+    observer
+        .execute(
+            "INSERT INTO public.billing_accounts (user_id, stripe_customer_id) VALUES ($1, $2)",
+            &[&USER, &CUSTOMER],
+        )
+        .await
+        .unwrap();
+    let hour = scheduled_hour(CRON, NOW as f64 * 1_000.0).unwrap();
+    let (user, target): (String, String) = observer
+        .query(DUE_TARGETS, &[&hour, &BATCH_SIZE])
+        .await
+        .unwrap()
+        .iter()
+        .find_map(|row| {
+            let user: &str = row.get(0);
+            let subscription: Option<&str> = row.get(1);
+            subscription
+                .filter(|_| user == USER)
+                .map(|id| (user.to_owned(), id.to_owned()))
+        })
+        .expect("hourly sweep selects the due account");
+    assert_eq!(target, SUBSCRIPTION);
+
+    let invoice = |id, price, amount: i64, start: i64, end: i64| {
+        serde_json::from_value::<crate::stripe::Invoice>(json!({
+            "id": id, "customer": CUSTOMER, "subscription": SUBSCRIPTION, "status": "paid",
+            "amount_paid": amount, "currency": "usd", "status_transitions": {"paid_at": start},
+            "lines": {"has_more": false, "data": [{
+                "id": format!("il_{id}"), "amount": amount, "price": price, "currency": "usd",
+                "period": {"start": start, "end": end}
+            }]}
+        }))
+        .unwrap()
+    };
+    let old = invoice(OLD_INVOICE, PLUS, 800, NOW, OLD_END);
+    let new = invoice(NEW_INVOICE, PRO, 1500, NOW + 10, NEW_END);
+    let subscription = |price, status, period_end: i64, cancel_at_period_end: bool| {
+        serde_json::from_value::<crate::stripe::Subscription>(json!({
+            "id": SUBSCRIPTION, "customer": CUSTOMER, "status": status,
+            "current_period_end": period_end, "cancel_at_period_end": cancel_at_period_end,
+            "items": {"data": [{"id": "si_native_billing", "price": price}]}
+        }))
+        .unwrap()
+    };
+    let update = RemoteSubscription {
+        subscription: subscription(PRO, "active", NEW_END, false),
+        invoices: vec![old.clone(), new],
+    };
+    let renewal = RemoteSubscription {
+        subscription: subscription(PRO, "past_due", RENEWAL_END, true),
+        invoices: update.invoices.clone(),
+    };
+    let before = snapshot(observer).await;
+    let mut latest = None;
+    let delayed = with_store(CALLER_CONNECTION, 2, async |store| {
+        store
+            .reconcile_owned_subscription(
+                &user,
+                &target,
+                subscription(PLUS, "active", OLD_END, false),
+                async |_| {
+                    // The hourly caller has read the target. These calls commit on
+                    // separate connections before its invoice load returns.
+                    let updated = dispatch_caller_at(&user, &target, &update, NOW + 10)
+                        .await
+                        .expect("ordinary paid plan update commits");
+                    assert!(!updated.explicit_stale && updated.fail_closed.is_none());
+                    assert_eq!(updated.row.plan_id, "pro");
+                    assert_eq!(updated.row.paid_through_unix, Some(NEW_END));
+                    assert_eq!(updated.row.paid_invoice_id.as_deref(), Some(NEW_INVOICE));
+                    let after_update = snapshot(observer).await;
+
+                    let observed = dispatch_caller_at(&user, &target, &renewal, NEW_END + 1)
+                        .await
+                        .expect("later renewal and cancellation observation commits");
+                    assert!(!observed.explicit_stale && observed.fail_closed.is_none());
+                    assert_eq!(observed.read_plan.as_deref(), Some("pro"));
+                    assert_eq!(observed.read_anchor.as_deref(), Some(NEW_INVOICE));
+                    assert_eq!(
+                        observed.row.grace_until_unix,
+                        Some(NEW_END + crate::billing_reconcile::RENEWAL_GRACE_SECS)
+                    );
+                    let after_renewal = snapshot(observer).await;
+                    let updated = subscription_row(&after_update.0);
+                    let observed = subscription_row(&after_renewal.0);
+                    assert_eq!(updated["plan_id"], "pro");
+                    assert_eq!(observed["plan_id"], updated["plan_id"]);
+                    assert_eq!(observed["stripe_price_id"], PRO);
+                    assert_eq!(observed["paid_invoice_id"], NEW_INVOICE);
+                    assert_eq!(observed["paid_through_at"], updated["paid_through_at"]);
+                    assert_eq!(updated["status"], "active");
+                    assert_eq!(observed["status"], "past_due");
+                    assert_eq!(updated["cancel_at_period_end"], false);
+                    assert_eq!(observed["cancel_at_period_end"], true);
+                    assert_ne!(
+                        observed["current_period_end"],
+                        updated["current_period_end"]
+                    );
+                    assert!(updated["grace_until"].is_null());
+                    assert!(observed["grace_until"].is_string());
+                    assert_eq!(after_update.1, after_renewal.1);
+                    latest = Some(after_renewal);
+                    Ok(vec![old])
+                },
+                NOW,
+            )
+            .await
+    })
+    .await
+    .expect("stale hourly observation is accepted without a subscription update");
+    assert!(!delayed.explicit_stale && delayed.fail_closed.is_none());
+    assert_eq!(delayed.read_plan.as_deref(), Some("plus"));
+    assert_eq!(delayed.read_anchor, None);
+    assert_eq!(delayed.row.paid_through_unix, Some(OLD_END));
+    assert_eq!(delayed.row.paid_invoice_id.as_deref(), Some(OLD_INVOICE));
+
+    let latest = latest.expect("later observations committed during invoice loading");
+    assert_eq!(
+        snapshot(observer).await,
+        latest,
+        "late sweep changed committed state"
+    );
+    let unrelated = |rows: Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["stripe_subscription_id"] != SUBSCRIPTION)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let unrelated_before = unrelated(before.0);
+    assert!(!unrelated_before.is_empty());
+    assert_eq!(unrelated(latest.0), unrelated_before);
+    let history = latest.1.as_array().unwrap();
+    let prior_history = before.1.as_array().unwrap();
+    assert_eq!(history.len(), prior_history.len() + 2);
+    assert!(prior_history.iter().all(|row| history.contains(row)));
+    for (invoice, plan) in [(OLD_INVOICE, "plus"), (NEW_INVOICE, "pro")] {
+        let row = history
+            .iter()
+            .find(|row| row["stripe_invoice_id"] == invoice)
+            .unwrap();
+        assert_eq!(row["user_id"], USER);
+        assert_eq!(row["stripe_subscription_id"], SUBSCRIPTION);
+        assert_eq!(row["plan_id"], plan);
+    }
 }
