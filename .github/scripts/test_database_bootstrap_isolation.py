@@ -589,6 +589,8 @@ def prove_baseline(cluster):
 
     cluster.ok("grant baseline reader only CONNECT to the dedicated database",
                f'GRANT CONNECT ON DATABASE {LAUNCH} TO {READER};', role=CREATOR, switch=OWNER)
+    fixture_plan = baseline.baseline_plan(json.dumps(plan | {"reader_role": READER}).encode())
+    prove_missing_baseline_relation(cluster, fixture_plan)
     cluster.ok("use the exact mixed-case SQL reader name", f'ALTER ROLE {READER} RENAME TO "{reader}";')
     calls = cluster.directory / "invocations"
     before = calls.stat().st_size
@@ -638,6 +640,47 @@ def prove_baseline(cluster):
         ALTER ROLE "{reader}" RENAME TO {READER};
         REVOKE CONNECT ON DATABASE {LAUNCH} FROM {READER};
         """, "1\n", database=LAUNCH)
+
+
+def prove_missing_baseline_relation(cluster, plan):
+    launch = {"database": LAUNCH, "role": MIGRATOR}
+    reader = {"database": LAUNCH, "role": READER}
+    # Rehearse the operator's reviewed inventory comparison. The protected
+    # baseline itself only scans relations that exist in the catalog.
+    begin = "\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n"
+    sql = baseline.baseline_sql(plan).decode("ascii")
+    require(sql.startswith(begin), "use the baseline's read-only snapshot for inventory reconciliation")
+    reconciled_sql = begin + """
+        DO $inventory$
+        BEGIN
+            IF ARRAY(
+                SELECT c.relname::text
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'baseline_readiness_fixture' AND c.relkind = 'r'
+                ORDER BY c.relname
+            ) <> ARRAY['required', 'retained'] THEN
+                RAISE EXCEPTION 'reviewed baseline inventory differs';
+            END IF;
+        END
+        $inventory$;
+    """ + sql.removeprefix(begin)
+
+    cluster.ok("prepare the complete reviewed fixture inventory with no rows", f"""
+        CREATE SCHEMA baseline_readiness_fixture;
+        CREATE TABLE baseline_readiness_fixture.required (id integer);
+        CREATE TABLE baseline_readiness_fixture.retained (id integer);
+        GRANT USAGE ON SCHEMA baseline_readiness_fixture TO {READER};
+        GRANT SELECT ON ALL TABLES IN SCHEMA baseline_readiness_fixture TO {READER};
+    """, **launch)
+    try:
+        cluster.ok("accept the exact reviewed empty control", reconciled_sql, "empty\n", **reader)
+        cluster.ok("remove the required empty table", "DROP TABLE baseline_readiness_fixture.required;", **launch)
+        cluster.ok("confirm the remaining inventory still has no rows", sql, "empty\n", **reader)
+        cluster.denied("refuse readiness despite the empty census", reconciled_sql,
+                       "ERROR:  P0001: reviewed baseline inventory differs", **reader)
+    finally:
+        cluster.ok("remove the reviewed inventory fixture", "DROP SCHEMA baseline_readiness_fixture CASCADE;", **launch)
 
 
 def prepare_baseline_readers(cluster, names, *, host):
