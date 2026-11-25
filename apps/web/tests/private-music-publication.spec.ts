@@ -1,6 +1,5 @@
-import { fileURLToPath } from 'node:url';
-import { expect, test as base, type Route } from '@playwright/test';
-import { preview } from 'vite';
+import { expect } from '@playwright/test';
+import { fixtureCookie, hasFixtureSession, serveFlac, test } from './helpers/private-music-fixture.js';
 import { assertCuratedLibrary, PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { freshTrialPublication, privateStagingAudio, PRIVATE_TRIAL_UPLOAD } from '../../../e2e/helpers/private-staging-fixture.js';
 import { seekProofFailure, seekViaPlayerUi, waitForPaused } from '../../../e2e/helpers/player-ui.js';
@@ -9,45 +8,7 @@ const uploadedId = '00000000-0000-4000-8000-000000000001';
 const companionId = '00000000-0000-4000-8000-000000000002';
 const binding = 'A'.repeat(43);
 const playId = '00000000-0000-4000-8000-000000000003';
-// Loopback HTTP uses a fixture-only cookie. The staged runner sends the real cookie over HTTPS.
-const fixtureCookie = 'private_music_fixture_session';
-const listener = `${fixtureCookie}=synthetic-listener`;
-const isListener = (cookie: string | null) => cookie?.split('; ').includes(listener);
-
-function serveFlac(route: Route, body: Buffer) {
-	const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers()['range'] ?? '');
-	const start = range ? Number(range[1]) : 0;
-	const end = range?.[2] ? Math.min(Number(range[2]), body.length - 1) : body.length - 1;
-	if (start > end) return route.fulfill({ status: 416, headers: { 'content-range': `bytes */${body.length}` } });
-	return route.fulfill({
-		status: range ? 206 : 200, contentType: 'audio/flac', body: body.subarray(start, end + 1),
-		headers: { 'accept-ranges': 'bytes', ...(range && { 'content-range': `bytes ${start}-${end}/${body.length}` }) }
-	});
-}
-
-const test = base.extend<{ origin: string }>({
-	origin: async ({}, use) => {
-		// Serve the existing browser-fixtures build with the runtime arm set only here.
-		const previous = process.env['PUBLIC_BROWSER_PLAYBACK'];
-		process.env['PUBLIC_BROWSER_PLAYBACK'] = '1';
-		const server = await preview({
-			root: fileURLToPath(new URL('../', import.meta.url)), mode: 'browser-fixtures',
-			preview: { host: '127.0.0.1', port: 0 }
-		}).finally(() => {
-			if (previous === undefined) delete process.env['PUBLIC_BROWSER_PLAYBACK'];
-			else process.env['PUBLIC_BROWSER_PLAYBACK'] = previous;
-		});
-		try {
-			const address = server.httpServer.address();
-			if (!address || typeof address === 'string') throw new Error('Missing private fixture TCP address');
-			await use(`http://127.0.0.1:${address.port}`);
-		} finally {
-			await server.close();
-		}
-	}
-});
-
-test.use({ serviceWorkers: 'block' });
+const isListener = (cookie: string | null) => hasFixtureSession(cookie, 'synthetic-listener');
 
 test('fresh private publication reaches the invited Library and plays under its canonical ID', async ({ page, context, browser, origin }) => {
 	const upload = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
