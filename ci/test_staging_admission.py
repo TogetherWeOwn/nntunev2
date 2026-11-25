@@ -1307,6 +1307,18 @@ class SourceBindingTests(Base):
         self.refused("current staging identity drift", self.run_main, private=True, mode="promote",
                      live_error=sa.Refused("current staging identity drift"))
 
+    def test_private_main_prints_no_pins_on_download_digest_mismatch(self):
+        self.install_private_contract()
+
+        def different_download():
+            world = PrivateWorld()
+            # Keep the published artifact metadata and repackage the same receipt.
+            world.archive = make_zip([("staging-admission.json", json.dumps(world.receipt, indent=2))])
+            return world
+
+        self.refused("^artifact content digest mismatch$", self.run_main, private=True, mode="promote",
+                     world_factory=different_download)
+
     def test_private_producer_cli_binds_candidate_audio(self):
         fixture = self.install_private_contract()
         report = self.root / "e2e/private-staging-results/admission.xml"
