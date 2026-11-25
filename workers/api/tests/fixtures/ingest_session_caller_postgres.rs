@@ -164,8 +164,19 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
     .into_iter()
     .enumerate()
     {
-        prove_attempt(&observer, &authority, &mut writer, index as u8 * 16, fault).await;
+        prove_attempt(
+            &observer,
+            &authority,
+            &mut writer,
+            index as u8 * 16,
+            fault,
+            false,
+        )
+        .await;
     }
+    // Reuse tests tombstone their winner. Publication needs its own live winner
+    // and creates a reference that must block deletion in the reuse scenario.
+    prove_attempt(&observer, &authority, &mut writer, 0xc0, None, true).await;
 }
 
 #[derive(Clone, Copy)]
@@ -188,6 +199,7 @@ async fn prove_attempt(
     mut writer: &mut Client,
     seed: u8,
     fault: Option<Fault>,
+    publish_fixture: bool,
 ) {
     let [root_id, environment, library, object, seal, configuration, map] = [1, 2, 3, 4, 5, 6, 7]
         .map(|value| {
@@ -201,7 +213,7 @@ async fn prove_attempt(
     let map_text = uuid_text(map);
     let root_text = uuid_text(root_id);
     let key = format!("media/{obj}/{generation}");
-    let input = if fault.is_none() {
+    let input = if publish_fixture {
         include_bytes!("../../../../fixtures/synthetic-flac/private-staging/tone-a.flac").as_slice()
     } else {
         FLAC
@@ -820,10 +832,15 @@ async fn prove_attempt(
         return;
     }
     let committed = committed.unwrap();
-    // The sparse index ends this read at the next seek anchor, 5.015s.
+    // The staged fixture's next sparse seek anchor is at 5.015 seconds.
+    let seek_range = if publish_fixture {
+        8256..68861
+    } else {
+        42..length
+    };
     assert_eq!(
         committed.flac_plaintext_range(completed.metadata(), origin.plaintext_sha256(), 0..1),
-        Some(8256..68861)
+        Some(seek_range)
     );
     assert_eq!(
         committed.flac_plaintext_range(completed.metadata(), &[0; 32], 0..1),
@@ -881,10 +898,12 @@ async fn prove_attempt(
         .await,
         Err(UploadError::Refused)
     ));
-    crate::handlers::tests::private_trial_fixture::verify_publication(
-        observer, writer, now, input, auth, prepared, &committed, reload,
-    )
-    .await;
+    if publish_fixture {
+        crate::handlers::tests::private_trial_fixture::verify_publication(
+            observer, writer, now, input, auth, prepared, &committed, reload,
+        )
+        .await;
+    }
     observer
         .execute(
             "UPDATE public.native_rest_credentials SET revoked_at = $2 WHERE id = $1",
@@ -896,6 +915,9 @@ async fn prove_attempt(
         read(writer, auth, prepared, reload).await,
         Err(UploadError::Refused)
     ));
+    if publish_fixture {
+        return;
+    }
     // Restore the disposable credential for the independent reuse cases.
     observer
         .execute(
