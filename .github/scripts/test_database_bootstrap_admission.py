@@ -139,6 +139,52 @@ def snapshot_record(branch="fixture001"):
     return {"review": review, "snapshot": snapshot}
 
 
+def check_inventory_run_binding():
+    script = Path(__file__).with_name("database_bootstrap_inventory.py")
+    pins = {"branch_id": "fixture001", "database_oid": 40200, "run_id": "8102", "run_attempt": "1"}
+    migration = pins | {"completed_at": 1800000000}
+    inventory = pins | {"readback_at": 1800000060}
+    record = {"migration": migration, "inventory": inventory}
+
+    def check(case, evidence, *, accept=False):
+        raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
+        result = subprocess.run(
+            [sys.executable, "-IB", str(script)], input=raw,
+            capture_output=True, timeout=3, check=False,
+        )
+        expected = ((0, b"database-bootstrap-inventory: consistent\n", b"") if accept else
+                    (1, b"", b"database-bootstrap-inventory: refused\n"))
+        if (result.returncode, result.stdout, result.stderr) != expected:
+            raise RuntimeError(f"inventory fixture: {case}")
+
+    check("fresh inventory from previous run", record | {"inventory": inventory | {"run_id": "8101"}})
+    check("fresh inventory from current run", record, accept=True)
+    for case, override in {
+        "different attempt": {"run_attempt": "2"},
+        "different database": {"database_oid": 40201},
+        "different branch": {"branch_id": "fixture002"},
+        "readback before completion": {"readback_at": migration["completed_at"] - 1},
+        "readback at completion": {"readback_at": migration["completed_at"]},
+        "non-integer readback time": {"readback_at": str(inventory["readback_at"])},
+    }.items():
+        check(case, record | {"inventory": inventory | override})
+    for case, pin in {
+        "boolean OID": {"database_oid": True},
+        "invalid run ID": {"run_id": "08102"},
+        "invalid attempt": {"run_attempt": "0"},
+        "invalid branch": {"branch_id": "fixture-01"},
+    }.items():
+        check(case, {"migration": migration | pin, "inventory": inventory | pin})
+    check("missing inventory run ID", record | {
+        "inventory": {key: value for key, value in inventory.items() if key != "run_id"},
+    })
+    check("duplicate migration key", b'{"migration": null, ' + json.dumps(record).encode()[1:])
+    check("malformed record", b"{")
+    at_limit = json.dumps(record).encode().ljust(4096)
+    check("record at size limit", at_limit, accept=True)
+    check("record one byte over size limit", at_limit + b" ")
+
+
 def check_snapshot(case, evidence, accept=False, *, args=()):
     script = Path(__file__).with_name("database_bootstrap_snapshot.py")
     raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
@@ -250,6 +296,7 @@ if __name__ == "__main__":
             exercise(Path(temp) / "event.json")
         if Path(temp).exists():
             raise RuntimeError
+        check_inventory_run_binding()
         check_snapshot_readback()
         check_snapshot_label_retry()
     except Exception:

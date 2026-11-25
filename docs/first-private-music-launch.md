@@ -86,7 +86,9 @@ until their evidence is available.
    and pre-schema snapshots distinct when their recovery targets differ. If
    writes could have resumed after the baseline, repeat it and re-qualify the
    snapshot. The empty-first-release path requires no restore rehearsal.
-   Reconcile the current migration manifest and ledger before app cutover.
+   Reconcile the current migration manifest and ledger and check the
+   [post-migration schema inventory](production-database-bootstrap.md#post-migration-schema-inventory)
+   before app cutover.
    [Snapshot and metering](production-database-bootstrap.md#snapshot-and-metering)
 6. Verify the binding-free maintenance fallback, private Access route and
    backend/media switch-off. Commission an independent cross-family production
@@ -247,6 +249,7 @@ receipt for release publication.
 | Staging rollback | Last-good SHA, run/attempt, restore and identity readback |
 | Production baseline | Protected source SHA, run/attempt and job URL, private provider branch and logical DB/OID reference, manifest digest, read time and `empty` verdict, separate no-live-user/data confirmation, writer fence and custodian |
 | Pre-schema snapshot | Private snapshot reference, capture and completion UTC, branch and restore scope, expiry, verification reference and first schema apply boundary |
+| Post-migration schema inventory | Successful protected migration run and attempt, launch branch and database OID, reconciled inventory reference, readback time and offline consistency verdict |
 | Protected switch-off | Executors and protected controls for Access/invites and API/media, private seed evidence for the verified maintenance Worker/deployment/version/seed SHA/module digest, sealed intent custody reference and original rollout artifact link when published, expected denials and grant expiry boundary |
 | Release review and dispatch | Independent reviewer, decision (initially `Pending`, then `APPROVE` or `BLOCK`), UTC and review reference for the pinned SHA and staging attempt, protected workflow and rollout run/attempt, final deployment/version and smoke result |
 | Dispatch readiness | Pending. Record ready or blocked under the [existing qualification steps](#qualify-the-candidate), with a safe reference to the supporting evidence or blocker. |
