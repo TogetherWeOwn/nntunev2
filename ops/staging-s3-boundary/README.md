@@ -97,15 +97,27 @@ reconciliation. Keep the trial disarmed.
    `<current>` by removing just the rollout's site block. The diff must leave
    the separate `other.example.invalid` route update in place. Restoring
    `<before>` here would undo that update. Recheck both targets against the
-   receipt before applying. Validate the resulting Caddy config, delete the
-   recorded DNS ID in its zone, and reload the validated config. If a step
-   fails, record what applied and read both targets again before any retry.
+   receipt before applying. Validate the resulting Caddy config. Delete the
+   recorded DNS ID in its zone and record the successful deletion and exact-ID
+   absence before reloading Caddy. If a step fails, record what applied and
+   read both targets again before any retry.
 3. Read back the DNS record ID and the Caddy source and active route to confirm
    the two additions are absent. Confirm the concurrent route update is still
    loaded and all three existing sites still return their expected responses.
    Record those results and leave hosted qualification marked pending.
    Separately staged fixtures, credentials or protected inputs belong to the
    rollout owner's existing closeout.
+
+If DNS deletion succeeded and the Caddy reload failed, resume with Caddy only
+in the rollout owner's shared-writer window. Match the deletion receipt to
+`<record-id>` and `<zone>`, then confirm that ID and the fixture hostname are
+both absent in the DNS control plane. Stop on missing proof or a replacement
+record. Read the latest Caddy source and active route. If the rollout block is
+already absent from both, continue to step 3. Otherwise require the active
+site to match the rollout receipt and the source to show either that same
+block or its recorded removal. Stop on unexplained differences between source
+and active configuration. Build the removal from the latest verified source,
+keeping the unrelated route update, then validate, reload and apply step 3.
 
 After recovery, [disposable qualification](#reproduce-the-disposable-qualification)
 can use fresh synthetic credentials and versions with `--bundle` on loopback.
