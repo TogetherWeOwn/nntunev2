@@ -11,7 +11,7 @@ import sys
 from apply_migration import ADVISORY_LOCK_KEY, ApplyError
 from staging_apply import StagingApplyError, evidence_child_env, quote_literal as literal
 from staging_trial_isolated import SHARED_OID
-from staging_trial_role_acl import audit, require
+from staging_trial_role_acl import audit, isolated_extensions, require
 from staging_trial_role_lifecycle import NAMES, baseline, psql, target
 from staging_trial_role_preflight import DATABASE, ROLE_RE, oid
 
@@ -89,7 +89,10 @@ def after_plan(original, consumers, database_oid):
                 or priv not in PRIVILEGES or type(option) is not bool):
             raise ValueError
         rows.add((dbid, grantee, grantor, priv, option))
-    public = {row for row in rows if row[1] == 0}
+    public_connect = {d for d, r, _, p, _ in rows if r == 0 and p == "CONNECT"}
+    public = {row for row in rows if row[1] == 0 and (
+        row[0] == database_oid or row[3] != "TEMPORARY" or row[0] in public_connect
+    )}
     exposed = {(d, p) for d, _, _, p, _ in public}
     added, identities = set(), set()
     direct = {(d, r, p) for d, r, _, p, _ in rows}
@@ -108,7 +111,7 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False):
     dbs, after, public, added, identities = after_plan(original, consumers, database_oid)
     owner = dbs[database_oid][1]
     affected = sorted({row[0] for row in public})
-    if any(grantor != owner or dbs[dbid][1] != owner or option
+    if any(grantor != dbs[dbid][1] or (grantor != owner and not dbs[dbid][2]) or option
            for dbid, _, grantor, _, option in public):
         raise StagingApplyError("isolated database ACL grantor authority")
 
@@ -118,12 +121,17 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False):
     def ddl(rows, grant):
         verb, direction = ("GRANT", "TO") if grant else ("REVOKE", "FROM")
         suffix = "" if grant else " RESTRICT"
-        return "".join(
-            f"SELECT format('{verb} {p} ON DATABASE %I {direction} "
-            + (f"%I{suffix}', {literal(dbs[d][0])}, pg_get_userbyid({r})" if r else
-               f"PUBLIC{suffix}', {literal(dbs[d][0])}") + ") \\gexec\n"
-            for d, r, _, p, _ in rows
-        )
+        sql = ""
+        for d, r, grantor, p, _ in rows:
+            if grantor != owner:
+                sql += f"SELECT format('SET LOCAL ROLE %I', pg_get_userbyid({grantor})) \\gexec\n"
+            statement = f"SELECT format('{verb} {p} ON DATABASE %I {direction} "
+            recipient = (f"%I{suffix}', {literal(dbs[d][0])}, pg_get_userbyid({r})" if r else
+                         f"PUBLIC{suffix}', {literal(dbs[d][0])}")
+            sql += statement + recipient + ") \\gexec\n"
+            if grantor != owner:
+                sql += "RESET ROLE;\n"
+        return sql
 
     def gate_sessions():
         return require(f"""NOT EXISTS (SELECT FROM pg_stat_activity s WHERE s.datid IN ({','.join(map(str, affected)) or 'NULL'})
@@ -140,10 +148,11 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False):
         sql += require(f"EXISTS (SELECT FROM pg_roles WHERE oid = {grantee} AND rolname = {literal(name)} AND rolcanlogin)")
     before, restricted = state(original), state(after)
     sql += require(f"({before}) OR ({restricted})")
+    for dbid, _, grantor, priv, _ in public:
+        sql += require(f"pg_has_role({grantor}::oid, 'SET') AND "
+                       f"has_database_privilege({grantor}::oid, {dbid}::oid, '{priv} WITH GRANT OPTION')")
     if action != "restore-ambient":
-        sql += audit([], exact=False, database_preparation=True)
-        for dbid, _, _, priv, _ in public:
-            sql += require(f"has_database_privilege({dbid}::oid, '{priv} WITH GRANT OPTION')")
+        sql += isolated_extensions() + audit([], exact=False, database_preparation=True)
         connect = ",".join(f"({d}::oid,{r}::oid)" for d, r, _, p, _ in after["acl"] if p == "CONNECT")
         connect = connect or "(NULL::oid,NULL::oid)"
         if affected:

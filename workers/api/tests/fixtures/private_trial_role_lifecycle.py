@@ -297,13 +297,32 @@ try:
     assert "isolated executor authority passed" in report and "staging CONNECT passed" not in report
     ungranted()
     sql(f"GRANT pg_signal_backend TO {owner} WITH INHERIT TRUE;")
+    for extension, schema in (("pg_trgm", "public"), ("dblink", "pg_catalog"), ("postgres_fdw", "pg_catalog")):
+        sql(f"CREATE EXTENSION {extension} WITH SCHEMA {schema};")
+        assert "staging CONNECT passed" not in isolated("grant", success=False)
+        ungranted()
+        sql(f"DROP EXTENSION {extension};")
+
+    sql("GRANT TEMP ON DATABASE nntune_ci, template1 TO PUBLIC;")
     assert "isolated owner authority passed" in isolated("check")
     ungranted()
+    for catalog in ("nntune_ci", "template1"):
+        sql(f"GRANT CONNECT ON DATABASE {catalog} TO PUBLIC;")
+        isolated("check", success=False)
+        sql(f"REVOKE CONNECT ON DATABASE {catalog} FROM PUBLIC;")
+    sql(f"GRANT TEMP ON DATABASE nntune_ci TO {reader};")
+    isolated("check", success=False)
+    sql(f"REVOKE TEMP ON DATABASE nntune_ci FROM {reader};")
     # A stale or wrong routed password can only be discovered after CONNECT.
     assert "application grants passed" in isolated("grant", success=False,
         PRIVATE_TRIAL_WRITER_URL=f"postgresql://{writer}:wrong@127.0.0.1:{port}/{DATABASE}")
     assert "routed writer passed" in isolated("grant")
     assert "routed reader passed" in isolated("verify-overlay")
+    for catalog in ("nntune_ci", "template1"):
+        for role in (reader, writer):
+            denied = subprocess.run(["psql", "-XqAtw", "-c", "SELECT 1"], capture_output=True, text=True,
+                                    env={**base, "PGDATABASE": catalog, "PGUSER": role}, timeout=10)
+            assert denied.returncode and "permission denied for database" in denied.stderr
     sql(f"""
     INSERT INTO public.invite_codes(code_hash,created_at,expires_at) VALUES ('isolated-fixture',0,1);
     SET ROLE {writer};
@@ -342,9 +361,12 @@ try:
     # Exercise supported ACL-only change and inverse while no trial role exists.
     sql(f"DROP ROLE {reader}, {writer}; ALTER DATABASE {DATABASE} OWNER TO postgres;")
     other = "trial_ambient_fixture"
-    sql(f"CREATE DATABASE {other} TEMPLATE template0;")
+    provider = "trial_ambient_provider_fixture"
+    sql(f"CREATE DATABASE {other} TEMPLATE template0;\nCREATE DATABASE {provider} OWNER {owner} TEMPLATE template0;")
     try:
+        sql(f"ALTER DATABASE template1 OWNER TO {owner};")
         sql(f"GRANT CONNECT,TEMP ON DATABASE {DATABASE}, template1 TO PUBLIC;")
+        sql(f"REVOKE CONNECT ON DATABASE {provider} FROM PUBLIC;")
         sql(f"GRANT CONNECT ON DATABASE template1 TO {executor} WITH GRANT OPTION;")
         initial = json.loads(sql(ambient_acl.CATALOG))
         assert sql(f"SELECT datacl IS NULL FROM pg_database WHERE datname='{other}';") == "t"
@@ -403,14 +425,14 @@ try:
 
         sql(ambient("check-ambient"))
         assert json.loads(sql(ambient_acl.CATALOG)) == initial
-        sql(f"ALTER DATABASE {other} OWNER TO {owner};")
+        sql(f"GRANT CONNECT ON DATABASE {provider} TO PUBLIC;")
         try:
             ambient("restrict-ambient", snapshot=json.loads(sql(ambient_acl.CATALOG)))
         except StagingApplyError as error:
             assert str(error) == "isolated database ACL grantor authority"
         else:
             raise AssertionError("ambient ACL operation accepted a foreign grantor")
-        sql(f"ALTER DATABASE {other} OWNER TO postgres;")
+        sql(f"REVOKE CONNECT ON DATABASE {provider} FROM PUBLIC;")
         assert json.loads(sql(ambient_acl.CATALOG)) == initial
         sql("CREATE FUNCTION public.ambient_fixture_unexpected() RETURNS int LANGUAGE sql AS 'SELECT 1';")
         refused(ambient("restrict-ambient"))
@@ -473,7 +495,10 @@ try:
         assert json.loads(sql(ambient_acl.CATALOG)) == initial
         sql(forward)
         restricted = json.loads(sql(ambient_acl.CATALOG))
-        assert all(entry[1] != 0 for entry in restricted["acl"])
+        db_names = {entry[0]: entry[1] for entry in restricted["databases"]}
+        assert {(db_names[d], p) for d, grantee, _, p, _ in restricted["acl"] if grantee == 0} == {
+            ("nntune_ci", "TEMPORARY"), (provider, "TEMPORARY"),
+        }
         assert sql(f"SELECT has_database_privilege('{executor}','template1','CONNECT WITH GRANT OPTION')"
                    f" AND has_database_privilege('{executor}','template1','TEMPORARY');") == "t"
         sql(forward)
@@ -487,11 +512,12 @@ try:
         assert json.loads(sql(ambient_acl.CATALOG)) == initial
         assert sql(f"SELECT datacl IS NULL FROM pg_database WHERE datname='{other}';") == "f"
     finally:
-        sql(f"DROP DATABASE {other};")
+        sql(f"DROP DATABASE {other};\nDROP DATABASE {provider};")
     print("Isolated ambient ACL prepare, refusal, retry and restoration passed")
 finally:
     sql(f"""
     DROP DATABASE {DATABASE} WITH (FORCE);
+    ALTER DATABASE template1 OWNER TO postgres;
     REVOKE CONNECT, TEMP ON DATABASE template1 FROM {executor};
     DROP ROLE IF EXISTS {reader}, {writer}, {executor}, {owner};
     GRANT CONNECT, TEMP ON DATABASE nntune_ci, postgres, template1 TO PUBLIC;

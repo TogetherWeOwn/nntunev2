@@ -22,8 +22,10 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    grantable column access, `REFERENCES` for the overlay's foreign keys, and
    grantable `EXECUTE` on both reviewed 0052 routines and `EXECUTE` on
    `storage_object_intent_append_only()` to install the locator trigger. Confirm
-   both logins lack access to other connectable databases. Retain the original
-   protected scope for withdrawal.
+   both routed logins independently lack CONNECT to every other connectable
+   database, including templates. Retain the original protected scope for
+   withdrawal. The isolated lifecycle admits only the reviewed catalog
+   extension set. An unexpected installed extension blocks setup.
    If the isolated branch has ambient database grants, qualify the
    [database ACL preparation](#isolated-database-acl-preparation) before issuance.
 2. **Check protected inputs.** Store the existing role-scope JSON in
@@ -141,7 +143,11 @@ With roles absent, run `check-ambient`, then `restrict-ambient` from protected
 `main`. Refuse unsupported grantors, template changes with unverified support,
 unproven dependencies, unexpected application ACLs or unexplained drift. The
 workflow transfers only reviewed PUBLIC privileges to consumers that need them
-and withdraws PUBLIC access atomically. Verify management connectivity and
+and withdraws PUBLIC access atomically. It preserves non-target PUBLIC TEMP
+on databases that already deny PUBLIC CONNECT. The target still denies
+PUBLIC CREATE, CONNECT and TEMP. If a template has a different owner, require
+SET authority for its recorded grantor in both directions and preserve that
+grantor on restoration. Verify management connectivity and
 the isolated catalog before issuing any login. After retiring both roles, use
 the same plan for `restore-ambient`. The inverse restores normalized grants,
 including grantors and grant options. Supported PostgreSQL DDL may leave an

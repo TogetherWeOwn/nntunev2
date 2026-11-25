@@ -99,6 +99,18 @@ def require(test):
     return f"DO $check$ BEGIN IF ({test}) IS NOT TRUE THEN RAISE EXCEPTION 'contract refused'; END IF; END $check$;\n"
 
 
+def isolated_extensions():
+    # The only approved installed extension is the catalog's PL/pgSQL.
+    return require("""SELECT count(*) = 1 AND bool_and(e.extname = 'plpgsql'
+             AND e.extversion = '1.0' AND n.nspname = 'pg_catalog')
+             FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace""")
+
+
+def other_database_connections(role):
+    return f"""SELECT FROM pg_database d WHERE d.datallowconn AND d.datname <> current_database()
+              AND has_database_privilege({role}, d.oid, 'CONNECT')"""
+
+
 def audit(entries, *, exact, database_preparation=False):
     """Without role inheritance or ownership, direct plus PUBLIC is effective."""
     expected = []
@@ -153,8 +165,7 @@ SELECT NOT EXISTS (SELECT * FROM direct EXCEPT SELECT * FROM expected)
                     AND (a.class_id, a.obj, a.sub) = (d.classid, d.objid, d.objsubid)))
     )
   AND NOT EXISTS (
-    SELECT FROM pg_roles r CROSS JOIN pg_database d WHERE r.oid IN ({ids}) AND d.datallowconn
-      AND d.datname <> current_database() AND has_database_privilege(r.oid, d.oid, 'CONNECT,CREATE,TEMPORARY')
+    SELECT FROM pg_roles r WHERE r.oid IN ({ids}) AND EXISTS ({other_database_connections('r.oid')})
     )
   AND NOT EXISTS (SELECT FROM pg_proc WHERE oid IN ({routines})
                   AND (prosecdef OR prokind <> 'f' OR proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog, public']))
