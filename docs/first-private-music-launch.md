@@ -249,3 +249,19 @@ Live billing is assessed separately.
 | `unlisted-refused` | Pending | — |
 | `revoked-or-expired-refused` | Pending | — |
 | `video-off` | Pending | — |
+
+### Offline handoff example with a skipped step
+
+In this synthetic rehearsal, eight journey cases have passing observations
+from one attempt. The operator deliberately skips `seek` when the time
+reserved for the manual playback check runs out.
+
+| Handoff item | Synthetic entry |
+| --- | --- |
+| Journey outcome `seek` | Pending |
+| Unresolved issues and applicability | `seek` applies and was deliberately skipped. The manual playback check ran out of time. |
+| Rehearsal verdict | Pending. Remaining step is `seek`. In the next offline rehearsal, pause playback, seek mid-track, resume playback and verify it advances from the sought position. |
+
+The offline admission fixture returns `incomplete` and names `seek` as the
+only incomplete case.
+[Synthetic fixture](../ci/test_staging_admission.py)

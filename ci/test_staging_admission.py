@@ -519,10 +519,10 @@ class DraftPrivateContractTests(Base):
              "anonymous-refused", "unlisted-refused", "revoked-or-expired-refused", "video-off")
 
     def setUp(self):
-        data = (HERE / "private-music-journey-contract.draft.json").read_bytes()
-        policy = make_policy(data)
-        policy["approvals"][0]["spec_revision"] = sa.parse_json(data)["spec_revision"]
-        self.contract = sa.approved_contract(policy, data)
+        self.contract_bytes = (HERE / "private-music-journey-contract.draft.json").read_bytes()
+        self.policy = make_policy(self.contract_bytes)
+        self.policy["approvals"][0]["spec_revision"] = sa.parse_json(self.contract_bytes)["spec_revision"]
+        self.contract = sa.approved_contract(self.policy, self.contract_bytes)
 
     def private_suite(self):
         suite = private_report(private_pins())
@@ -532,6 +532,11 @@ class DraftPrivateContractTests(Base):
     def coverage(self, report):
         rows = sa.junit_evidence(ET.tostring(report), self.contract)[0]
         return {row["id"]: row["outcome"] for row in rows}
+
+    def produce_receipt(self, report):
+        return sa.produce(make_env(JOURNEY_GATE=""), ET.tostring(report), self.policy,
+                          self.contract_bytes, MANIFEST, private_pins=private_pins(),
+                          private_track_sha256=PRIVATE_AUDIO_SHA)
 
     def raw_playwright_report(self):
         # Playwright 1.65.1 writes the spec filename and outer test title.
@@ -582,6 +587,34 @@ class DraftPrivateContractTests(Base):
                     expected = dict.fromkeys(self.CASES, "passed")
                     expected[name] = "incomplete"
                     self.assertEqual(self.coverage(suite), expected)
+
+    def test_repeated_case_cannot_replace_a_required_case_in_receipt(self):
+        suite = self.private_suite()
+        expected = dict.fromkeys(self.CASES, "passed")
+        receipt = self.produce_receipt(suite)
+        self.assertEqual(receipt["result"], "satisfied")
+        self.assertEqual(receipt["reasons"], [])
+        self.assertEqual({row["id"]: row["outcome"] for row in receipt["coverage"]}, expected)
+
+        # Neither case carries track properties, so only the selector changes.
+        suite.find("testcase[@name='queue']").set("name", "seek")
+        receipt = self.produce_receipt(suite)
+        self.assertEqual(receipt["result"], "incomplete")
+        self.assertEqual(receipt["reasons"], ["applicable product evidence incomplete, skipped or failed"])
+        expected.update(seek="incomplete", queue="incomplete")
+        self.assertEqual({row["id"]: row["outcome"] for row in receipt["coverage"]}, expected)
+
+    def test_deliberate_skip_names_the_incomplete_case_without_its_reason(self):
+        suite = self.private_suite()
+        seek = suite.find("testcase[@name='seek']")
+        reason = "The manual playback check ran out of time."
+        ET.SubElement(seek, "skipped", message=reason)
+
+        receipt = self.produce_receipt(suite)
+        self.assertEqual(receipt["result"], "incomplete")
+        coverage = {row["id"]: row["outcome"] for row in receipt["coverage"]}
+        self.assertEqual(coverage, dict.fromkeys(self.CASES, "passed") | {"seek": "incomplete"})
+        self.assertNotIn(reason, json.dumps(receipt))
 
     def test_raw_playwright_pass_cannot_supply_private_cases(self):
         root = self.raw_playwright_report()
