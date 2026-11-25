@@ -6,6 +6,7 @@ const { once } = require('node:events');
 const { readFileSync } = require('node:fs');
 const { createServer } = require('node:https');
 const { test } = require('node:test');
+const { setImmediate } = require('node:timers/promises');
 const loadWorker = require('./worker_fixture_wasm.cjs');
 const { upload_for_playback } = loadWorker(process.env.INGEST_WASM_JS, true);
 const { resolve_uploaded_playback } = loadWorker(process.env.CATALOGUE_PLAYBACK_WASM_JS, true);
@@ -47,6 +48,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   let originError;
   let expectedRange;
   let fault;
+  let onInterruptedClose;
 
   function store(versions, version, body) {
     assert.equal(versions.has(version), false);
@@ -140,6 +142,14 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
         'content-range': `bytes ${start}-${sealedLength - 1}/${sealedLength}`,
         'content-length': sealedLength - start,
       };
+      if (onInterruptedClose) {
+        assert.equal(start, 0);
+        const closed = onInterruptedClose;
+        onInterruptedClose = undefined;
+        res.once('close', () => closed(res.writableFinished));
+        res.writeHead(206, rangeHeaders).write(bytes.subarray(0, -17));
+        return;
+      }
       if (fault === 'short range') rangeHeaders.connection = 'close';
       res.writeHead(206, rangeHeaders).end(fault === 'short range' ? bytes.subarray(0, -1) : bytes);
     } else {
@@ -203,6 +213,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   assert.deepEqual(snapshot.page_versions, [originalPage]);
   const reports = [];
   const custody = [];
+  let leaseLive = true;
   class Fetcher {
     async fetch(req) {
       const { origin, pathname } = new URL(req.url);
@@ -217,7 +228,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
       custody.push(pathname.slice(prefix.length));
       return pathname === prefix + 'resolve'
         ? Response.json(snapshot)
-        : new Response(null, { status: 204 });
+        : new Response(null, { status: leaseLive ? 204 : 404 });
     }
   }
   class DurableObjectNamespace {
@@ -259,7 +270,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
     PRIVATE_PLAYBACK_S3_ACCESS_KEY_ID: access,
     PRIVATE_PLAYBACK_S3_SECRET_ACCESS_KEY: signingMaterial,
   };
-  async function request(range, enabled = true) {
+  async function open(range, enabled = true) {
     const pending = [];
     const req = new Request(`https://stream.test/play/${track}`, {
       headers: { authorization: `Bearer ${bearer}`, ...(range && { range }) },
@@ -267,8 +278,12 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
     const response = await streamFetch(req,
       enabled ? { ...env, PRIVATE_PLAYBACK_ENABLED: 'true' } : env,
       { waitUntil: promise => pending.push(promise) });
+    return { response, signal: req.signal, settled: Promise.all(pending) };
+  }
+  async function request(range, enabled = true) {
+    const { response, settled } = await open(range, enabled);
     const bytes = Buffer.from(await response.arrayBuffer());
-    await Promise.all(pending);
+    await settled;
     return { response, bytes };
   }
 
@@ -276,6 +291,52 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   assert.equal(disabled.response.status, 404);
   assert.deepEqual(custody, []);
   assert.deepEqual(operations, []);
+
+  const seek = 'bytes=65536-65536';
+  const interval = { user_id: 'catalogue-other', play_id: play, track_id: track, file_bytes: plaintextLength };
+  // Finish before the media read deadline could close the origin on its own.
+  await t.test('an interrupted encrypted range settles only its prefix and a new seek rechecks custody',
+    { timeout: 4000 }, async () => {
+      expectedRange = fullRange;
+      const { promise: closed, resolve } = Promise.withResolvers();
+      onInterruptedClose = resolve;
+      const interrupted = await open('bytes=65535-65536');
+      assert.equal(interrupted.response.status, 206);
+      assert.equal(interrupted.response.headers.get('content-range'), 'bytes 65535-65536/65537');
+      const client = interrupted.response.body.getReader();
+      const first = await client.read();
+      assert.equal(first.done, false);
+      assert.deepEqual(Buffer.from(first.value), Buffer.from([0x9d]));
+      // Let the Worker acknowledge the first byte and start awaiting the withheld frame.
+      await setImmediate();
+      await client.cancel();
+      assert.equal(interrupted.signal.aborted, false);
+      assert.equal(await closed, false);
+      await interrupted.settled;
+      assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
+      assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease']);
+      const prefix = { ...interval, start: 65_535, end: 65_536 };
+      const tail = { ...interval, start: 65_536, end: 65_537 };
+      assert.deepEqual(reports, [prefix]);
+
+      expectedRange = suffixRange;
+      const resumed = await request(seek);
+      assert.equal(resumed.response.status, 206);
+      assert.equal(resumed.response.headers.get('content-range'), 'bytes 65536-65536/65537');
+      assert.deepEqual(resumed.bytes, Buffer.from([0x1d]));
+      assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
+      assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease']);
+      assert.deepEqual(reports, [prefix, tail]);
+
+      leaseLive = false;
+      const refused = await request(seek);
+      assert.equal(refused.response.status, 404);
+      assert.deepEqual(custody.splice(0), ['resolve', 'lease']);
+      assert.deepEqual(operations, []);
+      assert.equal(rejectedUnsigned, 1, 'only the explicit unsigned control reached the origin');
+      assert.deepEqual(reports.splice(0), [prefix, tail]);
+      leaseLive = true;
+    });
 
   expectedRange = fullRange;
   const full = await request();
@@ -288,7 +349,6 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease', 'lease']);
 
   expectedRange = suffixRange;
-  const seek = 'bytes=65536-65536';
   const partial = await request(seek);
   assert.equal(partial.response.status, 206);
   assert.equal(partial.response.headers.get('content-range'), 'bytes 65536-65536/65537');
@@ -306,7 +366,6 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
   assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease', 'lease']);
 
-  const interval = { user_id: 'catalogue-other', play_id: play, track_id: track, file_bytes: plaintextLength };
   assert.deepEqual(reports.splice(0), [
     { ...interval, start: 0, end: plaintextLength },
     { ...interval, start: plaintextLength - 1, end: plaintextLength },
