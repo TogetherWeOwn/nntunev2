@@ -72,7 +72,7 @@ pub struct PreparedUpload<'a> {
 }
 
 impl<'a> PreparedUpload<'a> {
-    fn authorize(self, auth: Authorization<'_>) -> Result<i64, UploadError> {
+    fn validate(self) -> Result<(), UploadError> {
         let scope = self.scope;
         let [_, environment, library, _, seal, _] = self.context.identities;
         let fingerprint = self.request.fingerprint().map_err(|_| Refused)?;
@@ -86,7 +86,12 @@ impl<'a> PreparedUpload<'a> {
         {
             return Err(Refused);
         }
-        authorize_scope(auth, &scope, self.job, Action::Upload)
+        Ok(())
+    }
+
+    fn authorize(self, auth: Authorization<'_>) -> Result<i64, UploadError> {
+        self.validate()?;
+        authorize_scope(auth, &self.scope, self.job, Action::Upload)
     }
 
     pub(crate) fn completed_scope(self) -> CompletionScope<'a> {
@@ -243,6 +248,60 @@ pub async fn open<'a>(
         lease,
         target,
     })
+}
+
+pub enum UploadAttempt<'a> {
+    Opened(OpenedUpload<'a>),
+    Reused(ProtectedReuse),
+}
+
+/// Try reuse for this reservation's exact final checkpoint before starting an
+/// upload. Supply the existing trusted preparation and current authority
+/// reader. Reuse returns protected pins for comparison with authenticated
+/// receipts, just like completion replay. Its deadline remains attached.
+/// A refusal can proceed only through the normal lease for a fresh upload.
+pub async fn open_or_reuse<'a>(
+    writer: &mut Client,
+    auth: Authorization<'_>,
+    prepared: PreparedUpload<'a>,
+    until: SystemTime,
+    reader: impl AsyncFnOnce(
+        &str,
+        &CompletionScope<'_>,
+    ) -> Result<Option<CurrentAuthorization>, StoreError>,
+    start: impl AsyncFnOnce(
+        &mut Client,
+        &CompletionScope<'_>,
+        &str,
+        SystemTime,
+    ) -> Result<DurableUpload<'a>, HandoffError>,
+) -> Result<UploadAttempt<'a>, UploadError> {
+    prepared.validate()?;
+    match reuse(
+        writer,
+        auth,
+        &prepared.completed_scope(),
+        prepared.job,
+        reader,
+    )
+    .await
+    {
+        Ok(protected) => {
+            let outcome = protected.outcome();
+            let [_, _, object, _, configuration] = prepared.intent.identities;
+            if outcome.map.replace('-', "") != uuid_text(prepared.intent.map_id)
+                || outcome.object.replace('-', "") != uuid_text(object)
+                || outcome.configuration.replace('-', "") != uuid_text(configuration)
+            {
+                return Err(Refused);
+            }
+            Ok(UploadAttempt::Reused(protected))
+        }
+        Err(Refused) => open(writer, auth, prepared, until, start)
+            .await
+            .map(UploadAttempt::Opened),
+        Err(Unconfirmed) => Err(Unconfirmed),
+    }
 }
 
 /// Re-read the exact committed pins. After acquiring the scoped session lock,
