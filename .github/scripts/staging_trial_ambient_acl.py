@@ -10,6 +10,7 @@ import sys
 
 from apply_migration import ADVISORY_LOCK_KEY, ApplyError
 from staging_apply import StagingApplyError, evidence_child_env, quote_literal as literal
+from staging_trial_isolated import SHARED_OID
 from staging_trial_role_acl import audit, require
 from staging_trial_role_lifecycle import NAMES, baseline, psql, target
 from staging_trial_role_preflight import DATABASE, ROLE_RE, oid
@@ -80,7 +81,7 @@ def after_plan(original, consumers, database_oid):
                 or type(template) is not bool):
             raise ValueError
         dbs[dbid] = (name, owner, template)
-    if database_oid == 16500 or dbs.get(database_oid, (None,))[0] != DATABASE:
+    if database_oid == SHARED_OID or dbs.get(database_oid, (None,))[0] != DATABASE:
         raise ValueError
     rows = set()
     for dbid, grantee, grantor, priv, option in original["acl"]:
@@ -130,8 +131,7 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False):
               AND NOT coalesce(has_database_privilege(s.usesysid, s.datid, 'CONNECT'), false))""")
 
     readonly = action == "check-ambient"
-    sql = (f"BEGIN {'READ ONLY' if readonly else 'READ WRITE'};\n"
-           "SET LOCAL standard_conforming_strings = on;\nSET LOCAL stats_fetch_consistency = none;\n")
+    sql = f"BEGIN {'READ ONLY' if readonly else 'READ WRITE'};\nSET LOCAL standard_conforming_strings = on;\n"
     sql += target({"database_oid": database_oid}, login, fixture) + baseline()
     sql += f"SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
     sql += require(f"to_regrole(current_user)::oid = {owner}")
@@ -155,7 +155,7 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False):
     if action == "restrict-ambient":
         sql += f"SELECT {before} AS change_needed \\gset\n\\if :change_needed\n"
         sql += ddl(added, True) + ddl(public, False) + "\\endif\n"
-        sql += require(restricted) + gate_sessions() + audit([], exact=False)
+        sql += require(restricted) + "SELECT pg_stat_clear_snapshot();\n" + gate_sessions() + audit([], exact=False)
     if action == "restore-ambient":
         sql += f"SELECT {restricted} AS change_needed \\gset\n\\if :change_needed\n"
         sql += ddl(public, True) + ddl(added, False) + "\\endif\n" + require(before)
