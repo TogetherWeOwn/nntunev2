@@ -27,11 +27,16 @@ test('Play replays the ended final private track with repeat off', async ({ page
 	await play.click();
 	// Wait for Chromium to finish the FLAC at its normal speed.
 	await expect(audio).toHaveJSProperty('ended', true, { timeout: 20_000 });
+	const source = origin + fixture.mediaPath(track.id);
+	await expect(audio).toHaveJSProperty('currentSrc', source);
 
-	// Sample the native play event so the start position is independent of polling.
+	// Sample the native start and observe any reload of the attached decoder.
 	const replay = await audio.evaluateHandle((node: HTMLAudioElement) => {
-		const observed = { startedAt: null as number | null };
+		const observed = { node, startedAt: null as number | null, reloadEvents: [] as string[] };
 		node.addEventListener('play', () => { observed.startedAt = node.currentTime; }, { once: true });
+		for (const event of ['emptied', 'loadstart']) {
+			node.addEventListener(event, () => observed.reloadEvents.push(event));
+		}
 		return observed;
 	});
 	await play.click();
@@ -44,7 +49,9 @@ test('Play replays the ended final private track with repeat off', async ({ page
 	}).toBe(true);
 	await expect(page.locator(player.currentQueueItem)).toHaveAttribute(player.queueId, track.id);
 	await expect(transport.getByTestId('library-now-playing')).toHaveText(track.title);
-	await expect(audio).toHaveJSProperty('currentSrc', origin + fixture.mediaPath(track.id));
+	await expect(audio).toHaveJSProperty('currentSrc', source);
+	expect(await audio.evaluate((node, { node: original }) => node === original, replay)).toBe(true);
+	expect(await replay.evaluate(({ reloadEvents }) => reloadEvents), 'Replay should keep the attached decoder loaded').toEqual([]);
 	// Play on an attached source reuses its grant, including after native completion.
 	expect(grants).toEqual([track.id]);
 	await replay.dispose();
