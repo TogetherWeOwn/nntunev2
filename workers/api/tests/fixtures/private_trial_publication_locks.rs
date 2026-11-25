@@ -83,10 +83,12 @@ async fn assert_permission_denied(client: &Client, sql: &str, guard: bool) {
     );
 }
 
-async fn assert_install_waits_for_acl_change(
+async fn assert_contract_refuses_concurrent_grant(
     observer: &Client,
     executor: &Client,
     writer_oid: u32,
+    action: &str,
+    expected_error: &str,
 ) {
     let pid = async |client: &Client| {
         client
@@ -106,27 +108,15 @@ async fn assert_install_waits_for_acl_change(
     tx.batch_execute("GRANT UPDATE (duration_ms) ON public.tracks TO trial_lock_writer")
         .await
         .unwrap();
-    let mut pending = std::pin::pin!(contract(executor, "grant", writer_oid));
+    let mut pending = std::pin::pin!(contract(executor, action, writer_oid));
     blocker_observer::observe_blocked(observer, holder_pid, executor_pid, pending.as_mut())
         .await
         .unwrap();
     tx.commit().await.unwrap();
     let error = pending
         .await
-        .expect_err("concurrent UPDATE grant must refuse installation");
-    assert_eq!(
-        error.as_db_error().unwrap().message(),
-        "private trial writer already has UPDATE access"
-    );
-    assert!(observer
-        .query_one(
-            "SELECT to_regprocedure('public.reject_private_trial_publication_update()') IS NULL
-            AND NOT EXISTS (SELECT FROM pg_trigger WHERE tgname = 'private_trial_lock_only')",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get::<_, bool>(0));
+        .expect_err("concurrent UPDATE grant must refuse the contract");
+    assert_eq!(error.as_db_error().unwrap().message(), expected_error);
     grantor
         .batch_execute("REVOKE UPDATE (duration_ms) ON public.tracks FROM trial_lock_writer")
         .await
@@ -195,7 +185,23 @@ async fn scoped_writer_locks_and_publishes_without_base_updates() {
         .await
         .unwrap()
         .get::<_, bool>(0));
-    assert_install_waits_for_acl_change(&observer, &executor, writer_oid).await;
+    assert_contract_refuses_concurrent_grant(
+        &observer,
+        &executor,
+        writer_oid,
+        "grant",
+        "private trial writer already has UPDATE access",
+    )
+    .await;
+    assert!(observer
+        .query_one(
+            "SELECT to_regprocedure('public.reject_private_trial_publication_update()') IS NULL
+            AND NOT EXISTS (SELECT FROM pg_trigger WHERE tgname = 'private_trial_lock_only')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
     contract(&executor, "grant", writer_oid).await.unwrap();
     assert!(observer.query_one(
         "SELECT count(*) FILTER (WHERE attname = 'id') = 5 AND bool_and(
@@ -343,6 +349,16 @@ async fn scoped_writer_locks_and_publishes_without_base_updates() {
         1
     );
     assert!(page(&reader, RECIPIENT, &policy).await.unwrap().is_empty());
+    // An in-flight grant on the last table must leave the earlier guards in place.
+    assert_contract_refuses_concurrent_grant(
+        &observer,
+        &executor,
+        writer_oid,
+        "revoke",
+        "private trial writer still has UPDATE access",
+    )
+    .await;
+    assert_permission_denied(&writer, "UPDATE public.users SET id = id", true).await;
     observer
         .batch_execute("ALTER ROLE trial_lock_writer RENAME TO trial_lock_writer_renamed")
         .await
@@ -356,19 +372,6 @@ async fn scoped_writer_locks_and_publishes_without_base_updates() {
     assert_permission_denied(&assumed, "UPDATE public.users SET id = id", true).await;
     assert!(contract(&executor, "revoke", reader_oid).await.is_err());
     assert_permission_denied(&writer, "UPDATE public.users SET id = id", true).await;
-    // A stray grant on the last table must leave even the earlier guards in place.
-    executor
-        .batch_execute("GRANT UPDATE (duration_ms) ON public.tracks TO trial_lock_writer_renamed")
-        .await
-        .unwrap();
-    assert!(contract(&executor, "revoke", writer_oid).await.is_err());
-    assert_permission_denied(&writer, "UPDATE public.users SET id = id", true).await;
-    executor
-        .batch_execute(
-            "REVOKE UPDATE (duration_ms) ON public.tracks FROM trial_lock_writer_renamed",
-        )
-        .await
-        .unwrap();
     contract(&executor, "revoke", writer_oid).await.unwrap();
     assert!(observer
         .query_one(
