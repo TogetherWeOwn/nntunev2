@@ -49,6 +49,28 @@ def refused(role, connection):
     raise AssertionError("unadmitted comparison returned a report")
 
 
+def exercise_global_invoice_key():
+    check(0, exact=1, eligible_hydration=1, fresh=1)
+
+    # Keep the candidate target, paid fields and missing coverage valid. Only
+    # the archived key's owner changes to a subscription outside the inventory.
+    sql("""UPDATE public.paid_invoice_history
+           SET user_id = 'user_outside_trial', stripe_subscription_id = 'sub_outside_trial'
+           WHERE stripe_invoice_id = 'in_fixture_2'""")
+    check(1, exact=1, collision=1, fresh=1)
+
+    # An inventory that did not observe retention must still close. An archive
+    # join narrowed to the trial owner would incorrectly count this key as fresh.
+    sql("UPDATE billing_preflight.scope SET retained = false WHERE stripe_invoice_id = 'in_fixture_2'")
+    check(2, exact=1, incomplete=1, fresh=1)
+
+    sql("""UPDATE public.paid_invoice_history
+           SET user_id = 'user_fixture', stripe_subscription_id = 'sub_fixture'
+           WHERE stripe_invoice_id = 'in_fixture_2';
+           UPDATE billing_preflight.scope SET retained = true WHERE stripe_invoice_id = 'in_fixture_2';""")
+    check(0, exact=1, eligible_hydration=1, fresh=1)
+
+
 def exercise():
     assert run(ROLE, 2, OBSERVER) == (2, None)
     sql("UPDATE billing_preflight.scope SET retained = true WHERE stripe_invoice_id = 'in_fixture_3'")
@@ -148,6 +170,7 @@ def main():
         sql((SCRIPTS.parent / "fixtures/billing_history_preflight.sql").read_text())
         exercise_entrypoint()
         assert sql("SELECT count(*), count(covered_periods) FROM public.paid_invoice_history") == "2|1\n"
+        exercise_global_invoice_key()
         exercise()
     finally:
         sql(f"DROP DATABASE {DATABASE}; DROP ROLE IF EXISTS {ROLE};", "postgres")
