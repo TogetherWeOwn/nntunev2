@@ -24,7 +24,54 @@ def scram_verifier(password):
     return f"SCRAM-SHA-256${iterations}:{salt64}${stored64}:{server64}"
 
 
-class SetupRoleLifecycle:
+def role_oid(oid):
+    if type(oid) is not int or not 0 < oid <= 4294967295:
+        raise ValueError("invalid issuance receipt")
+    return f"{oid}::oid"
+
+
+DRAIN_SESSIONS = """
+    PERFORM pg_stat_clear_snapshot();
+    FOR session_pid IN SELECT pid FROM pg_stat_activity WHERE usesysid = target LOOP
+        IF NOT pg_terminate_backend(session_pid, 2000) THEN
+            RAISE EXCEPTION 'session termination failed';
+        END IF;
+    END LOOP;
+    PERFORM pg_stat_clear_snapshot();
+    IF EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = target) THEN
+        RAISE EXCEPTION 'session closure unconfirmed';
+    END IF;
+"""
+
+
+class RoleLifecycle:
+    def _transaction(self, body, result="", *, database=None, guard=""):
+        return f"""BEGIN;
+SET LOCAL search_path = pg_catalog;
+SET LOCAL statement_timeout = '10s';
+SET LOCAL lock_timeout = '2s';
+DO $lifecycle$
+DECLARE
+    target oid;
+    session_pid integer;
+    item record;
+BEGIN
+    IF current_database() <> '{database or self.maintenance}' OR session_user <> current_user
+       OR current_user = '{self.name}'
+       OR NOT EXISTS (SELECT FROM pg_stat_ssl WHERE pid = pg_backend_pid() AND ssl) {guard} THEN
+        RAISE EXCEPTION 'wrong custodian session';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended('{self.name}', 0));
+    SELECT oid INTO target FROM pg_roles WHERE rolname = '{self.name}';
+    {body}
+END
+$lifecycle$;
+{result}
+COMMIT;
+"""
+
+
+class SetupRoleLifecycle(RoleLifecycle):
     """Use verified direct TLS and exclusive custody for a single approved plan.
 
     Require successful SQL completion as well as the expected result. Keep the
@@ -39,30 +86,6 @@ class SetupRoleLifecycle:
         self.role = f'"{self.name}"'
         self.owner = plan.owner_role
         self.fenced = "NOT rolcanlogin AND NOT rolcreatedb AND rolvaliduntil = 'epoch'::timestamptz"
-
-    def _transaction(self, body, result=""):
-        return f"""BEGIN;
-SET LOCAL search_path = pg_catalog;
-SET LOCAL statement_timeout = '10s';
-SET LOCAL lock_timeout = '2s';
-DO $lifecycle$
-DECLARE
-    target oid;
-    session_pid integer;
-BEGIN
-    IF current_database() <> '{self.maintenance}' OR session_user <> current_user
-       OR current_user = '{self.name}'
-       OR NOT EXISTS (SELECT FROM pg_stat_ssl WHERE pid = pg_backend_pid() AND ssl) THEN
-        RAISE EXCEPTION 'wrong custodian session';
-    END IF;
-    PERFORM pg_advisory_xact_lock(hashtextextended('{self.name}', 0));
-    SELECT oid INTO target FROM pg_roles WHERE rolname = '{self.name}';
-    {body}
-END
-$lifecycle$;
-{result}
-COMMIT;
-"""
 
     def issue(self, expiry, password):
         # A generated 192-bit hex password fits the setup caller's secret contract.
@@ -104,12 +127,11 @@ COMMIT;
 """, f"SELECT oid FROM pg_roles WHERE rolname = '{self.name}';")
 
     def _cleanup(self, oid, action, *, require_fence=True, result=""):
-        if type(oid) is not int or not 0 < oid <= 4294967295:
-            raise ValueError("invalid issuance receipt")
+        receipt = role_oid(oid)
         fence_check = f"OR NOT EXISTS (SELECT FROM pg_roles WHERE oid = target AND {self.fenced})"
         return self._transaction(f"""
     IF target IS NOT NULL THEN
-        IF target <> {oid}::oid {fence_check if require_fence else ''} THEN
+        IF target <> {receipt} {fence_check if require_fence else ''} THEN
             RAISE EXCEPTION 'cleanup refused';
         END IF;
         {action}
@@ -126,16 +148,7 @@ COMMIT;
         # Signalling survives rollback. DROP ROLE refuses outstanding database
         # dependencies and removes memberships only when it succeeds.
         return self._cleanup(oid, f"""
-        PERFORM pg_stat_clear_snapshot();
-        FOR session_pid IN SELECT pid FROM pg_stat_activity WHERE usesysid = target LOOP
-            IF NOT pg_terminate_backend(session_pid, 2000) THEN
-                RAISE EXCEPTION 'session termination failed';
-            END IF;
-        END LOOP;
-        PERFORM pg_stat_clear_snapshot();
-        IF EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = target) THEN
-            RAISE EXCEPTION 'session closure unconfirmed';
-        END IF;
+        {DRAIN_SESSIONS}
         DROP ROLE {self.role};
 """, result=f"""
 SELECT 'retired' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE oid = {oid}::oid OR rolname = '{self.name}')
