@@ -130,7 +130,7 @@ consumers. Establish their approved access and a reversible window before any
 write. A live session inventory alone cannot establish those dependencies.
 
 Store the private plan as `ISOLATED_TRIAL_AMBIENT_PLAN` and retain it for undo.
-Use fields `branch_id`, `direct`, `port`, `baseline` (the catalog projection)
+Use fields `branch_id`, `direct`, `port` (5432), `baseline` (the catalog projection)
 and `consumers` (lists of database OID, role OID, role name and privilege).
 Review the exact plan digest and rollback, then pass its SHA-256 in
 `ambient_plan_sha256`. Use the isolated owner URL and `ISOLATED_TRIAL_BRANCH_READ`

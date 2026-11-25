@@ -29,9 +29,10 @@ SELECT jsonb_build_object(
                   ORDER BY dbid, grantee, grantor, privilege_type, is_grantable) FROM acl), '[]'))"""
 
 
-def branch_pin(branch, branch_id):
-    return (branch.get("id") == branch_id and branch.get("name") == "staging"
-            and branch.get("production") is False and branch.get("default") is False
+def branch_pin(database, branch, branch_id):
+    return (database.get("default_branch") == "main"
+            and branch.get("id") == branch_id and branch.get("name") == "staging"
+            and branch.get("production") is False and branch.get("default", False) is False
             and branch.get("ready") is True)
 
 
@@ -39,11 +40,20 @@ def verify_branch(branch_id, token):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_-]{1,512}", token):
         raise ValueError
     conn = http.client.HTTPSConnection("api.planetscale.com", timeout=8)
+    route = "/v1/organizations/togetherweown/databases/nntunev2"
+    headers = {"Authorization": token, "Accept": "application/json"}
     try:
-        conn.request("GET", "/v1/organizations/togetherweown/databases/nntunev2/branches/staging",
-                     headers={"Authorization": token, "Accept": "application/json"})
-        resp = conn.getresponse()
-        if resp.status != 200 or not branch_pin(json.loads(resp.read(32769)), branch_id):
+        metadata = []
+        for path in (route, f"{route}/branches/staging"):
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            if resp.status != 200:
+                raise StagingApplyError("isolated provider branch identity")
+            body = resp.read(32769)
+            if len(body) > 32768:
+                raise ValueError
+            metadata.append(json.loads(body))
+        if not branch_pin(*metadata, branch_id):
             raise StagingApplyError("isolated provider branch identity")
     finally:
         conn.close()
@@ -56,7 +66,7 @@ def plan_config(raw, digest):
     if (plan.keys() != {"branch_id", "direct", "port", "baseline", "consumers"}
             or not re.fullmatch(r"[a-z0-9]{1,63}", plan["branch_id"])
             or not re.fullmatch(r"[a-z0-9.-]+\.psdb\.cloud", plan["direct"])
-            or type(plan["port"]) is not int or not 1 <= plan["port"] <= 65535):
+            or type(plan["port"]) is not int or plan["port"] != 5432):
         raise ValueError
     return plan
 
