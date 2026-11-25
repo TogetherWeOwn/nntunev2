@@ -139,6 +139,10 @@ def check_snapshot_readback():
     check = check_snapshot
 
     check("pre-bootstrap", record, accept=True)
+    without_capture = snapshot.copy()
+    del without_capture["captured_at"]
+    check("successful readback missing capture time", record | {"snapshot": without_capture})
+
     for case, override in {
         "wrong branch": {"branch_id": "fixture002"},
         "wrong restore scope": {"restore_scope": "logical-database"},
@@ -192,6 +196,9 @@ def check_handoff_snapshot_branch(baseline_branch="fixture001"):
     check_snapshot("standalone snapshot for a different branch", wrong_branch, accept=True)
     check_snapshot("handoff snapshot for a different branch", wrong_branch | baseline_pin, args=args)
     check_snapshot("handoff without the exact baseline branch", post_setup, args=args)
+    late_readback = record["snapshot"] | {"readback_at": review["protected_write_at"] + 1}
+    check_snapshot("matching handoff first read back after the protected write",
+                   post_setup | baseline_pin | {"snapshot": late_readback}, args=args)
     check_snapshot("retry with matching completed evidence", post_setup | baseline_pin, accept=True, args=args)
 
 

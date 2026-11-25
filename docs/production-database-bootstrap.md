@@ -439,6 +439,9 @@ all times and the same precision for observations and the reviewed schedule.
   kind, restore scope and completion as `kind: ordinary-native`,
   `restore_scope: whole-branch` and `status: succeeded`.
 
+If the provider reports success but omits the capture time, leave snapshot
+evidence pending until you can verify the capture time.
+
 Capture must be at or before completion, and completion at or before
 readback. Read back success before the applicable write, which must occur
 by the reviewed window end. Expiry must be after that end. For
