@@ -267,12 +267,15 @@ records the actual Settings and REST readbacks for the live handoff.
    [Snapshot and metering](#snapshot-and-metering) ·
    [Production releases](../CONTRIBUTING.md#production-releases)
 4. When the setup attempt ends, clear its candidate variable and authorization.
-   Retire the temporary setup role under [setup role custody](#setup-role-custody-and-lifecycle),
-   require the fixed `retired` verdict, and confirm removal of its credential,
-   role and sessions. Complete this cleanup even when setup is refused,
-   canceled or needs reconciliation. Keep baseline pending until setup
-   success and the new database OID, reader fence, grants and sibling
-   isolation are verified.
+   Complete cleanup even when setup is refused, canceled or needs
+   reconciliation. Under [setup role custody](#setup-role-custody-and-lifecycle),
+   reconcile any uncertain issuance before proceeding. If the temporary
+   setup role was issued, retire it using the verified issuance OID,
+   require `retired`, and confirm removal of its credential, role and
+   sessions. If the attempt ended before issuance, verify and record that
+   the planned role is absent on the approved branch. Keep baseline pending
+   until cleanup, setup success and the new database OID, reader fence,
+   grants and sibling isolation are verified.
 5. Use the verified database OID and the separately issued reader OID for the
    baseline plan. Recheck the baseline Environment and confirm approval of
    the baseline candidate and plan. Obtain Environment approval for its exact
