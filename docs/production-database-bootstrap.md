@@ -443,3 +443,15 @@ Capture must be at or before completion, and completion at or before
 readback. Read back success before the applicable write, which must occur
 by the reviewed window end. Expiry must be after that end. For
 pre-migration evidence, capture must be strictly after setup completion.
+
+When the post-setup recovery objective calls for a pre-migration snapshot,
+cross-check it against the exact protected baseline plan. In private custody,
+add `baseline_branch_id` at the top level using `branch_id` from the version 2
+plan bound to the verified baseline run. Check that the run returned `empty`
+for the database OID from the completed setup readback. Run
+`python3 -IB .github/scripts/database_bootstrap_snapshot.py --baseline-handoff < evidence.json`.
+This mode requires the pre-migration phase, recorded setup completion and a
+snapshot on the baseline branch. If evidence is incomplete or mismatched,
+pause continuation and rerun this offline check with the matching readbacks.
+Use the Environment and baseline checks separately as part of the protected
+release process.
