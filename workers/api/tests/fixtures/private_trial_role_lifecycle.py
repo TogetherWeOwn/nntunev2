@@ -18,6 +18,7 @@ from apply_migration import transaction_body
 from staging_apply import StagingApplyError, load_entries
 import staging_trial_ambient_acl as ambient_acl
 from staging_trial_isolated import target_config
+from staging_trial_role_acl import audit
 from staging_trial_role_lifecycle import CONFIG_ENV, DATABASE, FIXTURE, NAMES, SCOPE_ENV
 from staging_trial_schema import BASELINE, compose
 
@@ -297,11 +298,15 @@ try:
     assert "isolated executor authority passed" in report and "staging CONNECT passed" not in report
     ungranted()
     sql(f"GRANT pg_signal_backend TO {owner} WITH INHERIT TRUE;")
-    for extension, schema in (("pg_trgm", "public"), ("dblink", "pg_catalog"), ("postgres_fdw", "pg_catalog")):
-        sql(f"CREATE EXTENSION {extension} WITH SCHEMA {schema};")
+    sql("CREATE SCHEMA trial_fixture_extensions;")
+    for extension in ("pg_trgm", "dblink", "postgres_fdw"):
+        sql(f"CREATE EXTENSION {extension} WITH SCHEMA trial_fixture_extensions;\n"
+            "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA trial_fixture_extensions FROM PUBLIC;")
+        sql(audit([], exact=False, database_preparation=True))
         assert "staging CONNECT passed" not in isolated("grant", success=False)
         ungranted()
         sql(f"DROP EXTENSION {extension};")
+    sql("DROP SCHEMA trial_fixture_extensions;")
 
     sql("GRANT TEMP ON DATABASE nntune_ci, template1 TO PUBLIC;")
     assert "isolated owner authority passed" in isolated("check")

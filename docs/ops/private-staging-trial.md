@@ -25,7 +25,9 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    both routed logins independently lack CONNECT to every other connectable
    database, including templates. Retain the original protected scope for
    withdrawal. The isolated lifecycle admits only the reviewed catalog
-   extension set. An unexpected installed extension blocks setup.
+   extension set. The current isolated staging catalog has provider-managed
+   HypoPG, so setup on that catalog is blocked. Keep setup off until an
+   isolated catalog passes the reviewed extension check.
    If the isolated branch has ambient database grants, qualify the
    [database ACL preparation](#isolated-database-acl-preparation) before issuance.
 2. **Check protected inputs.** Store the existing role-scope JSON in
