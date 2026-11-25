@@ -415,6 +415,33 @@ One TLS-verified read-only snapshot checks primary status, identity and rights.
 It scans up to 256 user relations and large objects, and refuses incomplete coverage.
 Ledger and reference rows count as data. Record the job URL, attempt and verdict.
 
+When reviewing the first-launch baseline, reconcile the saved catalog inventory
+and required reader privilege result with the accepted baseline plan. Use the
+[offline reader evidence check](../.github/scripts/database_bootstrap_reader_evidence.py)
+from the repository root with a private, normalized JSON record on stdin.
+
+```sh
+python3 -IB .github/scripts/database_bootstrap_reader_evidence.py < evidence.json
+```
+
+- `review` contains the approved `branch_id`, `database_oid`, `reader_role`,
+  `reader_oid` and `inventory_sha256` of the reviewed catalog inventory.
+- `inventory` contains the observed `branch_id`, `database_oid` and
+  `inventory_sha256` for the complete catalog readback.
+- `reader_privileges` contains the observed `branch_id`, `database_oid`,
+  `inventory_sha256` of the catalog covered by the privilege result, and the
+  role name and OID that the result actually checked (`reader_role` and
+  `reader_oid`). Record `result: passed` only for a completed, successful
+  privilege check. Use JSON integers for OIDs and lowercase hex for digests.
+
+Use the same inventory representation for each digest. Record observed pins
+from the underlying evidence before comparing them with the approved values.
+Keep the baseline evidence pending if the check exits nonzero with `pending`,
+including when the catalog matches but the privilege result belongs to a
+different reader. `consistent` confirms the supplied evidence agrees. The
+protected run's `empty` verdict, provenance and retirement evidence are still
+required. Keep credentials and raw SQL results out of the normalized record.
+
 ### Carry verified staging evidence into database approval
 
 Use the [pinned staging attempt and admission record](first-private-music-launch.md#qualify-the-candidate)

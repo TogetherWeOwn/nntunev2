@@ -125,6 +125,39 @@ def exercise(event_path):
     check(False, event=b" " * admission.MAX_EVENT_BYTES + b"{}")
 
 
+def check_reader_privilege_binding():
+    script = Path(__file__).with_name("database_bootstrap_reader_evidence.py")
+    inventory = {"branch_id": "fixture001", "database_oid": 17001, "inventory_sha256": "a" * 64}
+    review = inventory | {"reader_role": "Fixture-Reader", "reader_oid": 17002}
+    privileges = review | {"result": "passed"}
+    record = {"review": review, "inventory": inventory, "reader_privileges": privileges}
+
+    def check(case, evidence, accept=False):
+        raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
+        result = subprocess.run(
+            [sys.executable, "-IB", str(script)], input=raw, env={},
+            capture_output=True, timeout=3, check=False,
+        )
+        expected = ((0, b"database-bootstrap-reader-evidence: consistent\n", b"") if accept else
+                    (1, b"", b"database-bootstrap-reader-evidence: pending\n"))
+        if (result.returncode, result.stdout, result.stderr) != expected:
+            raise RuntimeError(f"reader privilege fixture: {case}")
+
+    for case, override in {
+        "another scoped reader": {"reader_role": "Fixture-Other-Reader", "reader_oid": 17003},
+        "same name reissued": {"reader_oid": 17003},
+        "same OID different role name": {"reader_role": "Fixture-Other-Reader"},
+        "OID encoded as a float": {"reader_oid": 17002.0},
+        "unsuccessful privilege result": {"result": "failed"},
+        "privileges checked against another inventory": {"inventory_sha256": "b" * 64},
+    }.items():
+        check(case, record | {"reader_privileges": privileges | override})
+    check("missing privilege evidence", {"review": review, "inventory": inventory})
+    check("duplicate privilege object", b'{"reader_privileges": null, ' + json.dumps(record).encode()[1:])
+    check("oversized record", json.dumps(record).encode().ljust(4097))
+    check("privileges match the approved reader and inventory", record, accept=True)
+
+
 def snapshot_record(branch="fixture001"):
     at = 1800000000
     review = {
@@ -292,6 +325,7 @@ if __name__ == "__main__":
     try:
         check_baseline_workflow()
         check_aborted_baseline_run_binding()
+        check_reader_privilege_binding()
         with tempfile.TemporaryDirectory(prefix="bootstrap-admission-") as temp:
             exercise(Path(temp) / "event.json")
         if Path(temp).exists():
