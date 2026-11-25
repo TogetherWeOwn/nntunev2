@@ -5,11 +5,15 @@ use wasm_bindgen::prelude::*;
 
 use crate::{
     postgres::PgClient,
-    private_catalogue_read::{lookup_scoped, PublicationPins, PublicationScope},
+    private_catalogue_read::{lookup_scoped, PublicationScope},
     private_listening::PrivateListening,
-    private_playback::PrivatePlayback,
+    private_playback::{
+        browser::{BrowserScope, BrowserStart},
+        PrivatePlayback,
+    },
     session::{issue_session, verify_session_dual, SessionKeys},
     storage_digest_read::custody::PlaybackRoot,
+    worker_entry::private_browser_custody::project,
 };
 
 #[path = "../../../ingest/tests/fixtures/catalogue_postgres_wasm.rs"]
@@ -28,13 +32,16 @@ fn now() -> SystemTime {
 }
 
 #[wasm_bindgen]
-pub async fn resolve_uploaded_playback(track: String) -> String {
+pub async fn resolve_uploaded_playback(track: String, grant_key: String) -> String {
     let db = postgres::connect().await;
-    let scope = PublicationScope {
-        environment: id(1),
-        library: id(2),
-        provider_configuration: id(7),
-        bucket: "fixture-bucket",
+    let scope = BrowserScope {
+        publication: PublicationScope {
+            environment: id(1),
+            library: id(2),
+            provider_configuration: id(7),
+            bucket: "fixture-bucket",
+        },
+        root_version: id(0),
     };
     let accepted_seq = db
         .query_one(
@@ -76,7 +83,7 @@ pub async fn resolve_uploaded_playback(track: String) -> String {
     }).to_string()).unwrap();
 
     let mut db = PgClient::new(db);
-    let (published, row) = lookup_scoped(&db, &track, scope, None, None)
+    let (published, row) = lookup_scoped(&db, &track, scope.publication, None, None)
         .await
         .unwrap()
         .expect("committed catalogue source");
@@ -84,40 +91,37 @@ pub async fn resolve_uploaded_playback(track: String) -> String {
     let S3Binding::VersionId(version) = published.locator.binding() else {
         panic!("catalogue lookup must return a version");
     };
-    let pins = PublicationPins {
-        environment: scope.environment,
-        library: scope.library,
-        provider_configuration: scope.provider_configuration,
-        bucket: scope.bucket,
-        accepted_seq,
-        version,
+    let start = BrowserStart {
+        track_id: track,
+        session_id: "catalogue-tab".into(),
+        play_id: None,
+        request_id: None,
     };
     let service = PrivatePlayback {
         policy: Some(&policy),
-        grant_secret: b"synthetic catalogue playback test key",
+        grant_secret: grant_key.as_bytes(),
     };
     let receipt = service
-        .issue(
-            &mut db,
-            &keys,
-            Some(&cookie),
-            &track,
-            "catalogue-tab",
-            &pins,
-            now,
-        )
+        .open_browser(&mut db, &claims, &start, scope, now)
         .await
         .unwrap()
         .expect("issued private playback receipt");
     // The uploaded fixture contains 19 samples at 44.1 kHz.
-    assert_eq!(receipt.relay().duration_ms.get(), 1);
+    let relay = receipt.relay();
+    assert_eq!(relay.duration_ms.get(), 1);
+    let bearer = &relay.grant.token;
+    let loaded = service
+        .load_for_stream(&db, bearer, scope, now)
+        .await
+        .unwrap()
+        .expect("committed browser receipt");
     let playback = service
         .resolve(
             &mut db,
-            &receipt,
-            &receipt.relay().grant.token,
+            &loaded,
+            bearer,
             &PlaybackRoot {
-                version: id(0),
+                version: scope.root_version,
                 secret: &[17; 32],
             },
             now,
@@ -125,19 +129,13 @@ pub async fn resolve_uploaded_playback(track: String) -> String {
         .await
         .unwrap()
         .expect("protected private playback");
-    let locator = playback.media.locator();
-    let S3Binding::VersionId(version) = locator.binding() else {
-        panic!("playback must use the version from the catalogue");
-    };
-    assert_eq!(version, &playback.read.pins().media_version);
-    // Bridge the real resolved custody into the existing Stream WASM transport.
+    assert_eq!(playback.media.locator(), &published.locator);
+    let snapshot = project(&loaded, playback, bearer).unwrap();
+    assert_eq!(&snapshot.media_version, version);
     serde_json::json!({
-        "configuration": scope.provider_configuration,
-        "s3_bucket": locator.bucket(),
-        "s3_key": locator.key(),
-        "s3_version_id": version,
-        "ciphertext_len": playback.media.ciphertext_len(),
-        "plaintext_len": playback.media.plaintext_len(),
+        "bearer": bearer,
+        "play": relay.lease.play_id,
+        "snapshot": snapshot,
     })
     .to_string()
 }
