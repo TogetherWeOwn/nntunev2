@@ -58,7 +58,6 @@ DECLARE
 BEGIN
     IF pg_is_in_recovery() OR current_database() <> '{plan.launch}'
         OR session_user <> '{plan.reader_role}' OR current_user <> '{plan.reader_role}'
-        OR role_id IS DISTINCT FROM '{plan.reader_oid}'::oid
         OR NOT EXISTS (
             SELECT FROM pg_database WHERE datname = current_database()
               AND oid = '{plan.database_oid}'::oid AND NOT datistemplate AND datdba <> role_id
@@ -89,6 +88,9 @@ BEGIN
         )
     THEN
         RAISE EXCEPTION 'baseline scope refused';
+    END IF;
+    IF role_id IS DISTINCT FROM '{plan.reader_oid}'::oid THEN
+        RAISE EXCEPTION 'baseline reader OID refused';
     END IF;
 
     FOR target IN

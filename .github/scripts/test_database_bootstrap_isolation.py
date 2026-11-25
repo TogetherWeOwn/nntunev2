@@ -709,12 +709,12 @@ def prove_reader_lifecycle(cluster, pending, *, scenario):
             reference.write(password.encode("ascii"))
             reference.seek(0)
             require(os.fstat(reference.fileno()).st_mode & 0o777 == 0o600, "keep the generated secret private")
+            mode = {"success": "resolve", "wrong-oid": "baseline-wrong-oid", "interrupt": "baseline-interrupt"}[scenario]
             env.update(
                 plan_binding(wrong_binding if scenario == "wrong-oid" else raw),
                 BASELINE_ENABLED="true", BASELINE_READER_PASSWORD=reference.read().decode("ascii"),
                 BOOTSTRAP_EXPIRY=str(expiry),
-                PATH=routed_client(cluster, "baseline-interrupt" if scenario == "interrupt" else "resolve",
-                                   lifecycle.name),
+                PATH=routed_client(cluster, mode, lifecycle.name),
                 GITHUB_WORKFLOW_REF=f'{env["GITHUB_REPOSITORY"]}/{baseline.WORKFLOW}@refs/heads/main',
             )
             calls = cluster.directory / "invocations"
@@ -734,6 +734,10 @@ def prove_reader_lifecycle(cluster, pending, *, scenario):
                     if process.poll() is None:
                         process.kill()
             require(calls.stat().st_size == before + 1, "attempt exactly one routed reader session")
+            if scenario == "wrong-oid":
+                result = cluster.directory / "baseline-result"
+                require(result.is_file() and result.read_text() == "reader-oid-refused\n",
+                        "observe a PostgreSQL rejection at the issued reader OID guard")
             wait_for(cluster, "verify the reader caller closed its SQL session", f"SELECT NOT EXISTS ({sessions});")
         if scenario == "success":
             cluster.denied("refuse to rotate an active reader", activate, "reader is no longer pending", **launch)

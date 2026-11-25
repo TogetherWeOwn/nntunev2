@@ -282,9 +282,10 @@ After success, refusal or cancellation, remove the candidate variable, all
 seven Environment secrets and the 0600 connection reference from secure
 custody. The runner holds only the reader credential, closes its own client
 and removes the temporary CA. The separate authorized SQL custodian fences
-the reader from maintenance using the private issuance OID. Use the exact
-activation plan to retire it on the pinned launch database, drain sessions
-and revoke grants. Require SQL success and the fixed retired result, and
+the reader from maintenance using the private issuance OID. Keep the custodian's
+private copy of the exact activation plan through retirement readback. Use that
+plan to retire the reader on the pinned launch database, drain sessions and
+revoke grants. Require SQL success and the fixed retired result, and
 read back credential removal and role and session absence. If activation never
 granted access, maintenance retirement also works, including after interrupted setup.
 

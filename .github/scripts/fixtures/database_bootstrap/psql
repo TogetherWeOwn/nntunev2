@@ -16,13 +16,19 @@ if os.environ["PGUSER"] != expected_login:
 # Model the provider's routing boundary before handing off to real libpq/TLS.
 os.environ["PGUSER"] = decoy_role if mode == "wrong-role" else canonical_role
 args = ["/usr/bin/psql", *sys.argv[1:]]
-if mode in ("resolve", "baseline-interrupt"):
+if mode in ("resolve", "baseline-interrupt", "baseline-wrong-oid"):
     # Route the test DNS name on the isolated network while libpq verifies PGHOST.
     os.environ["PGHOSTADDR"] = address
 if mode in ("route", "resolve"):
     os.execv(args[0], args)
 
 sql = sys.stdin.buffer.read()
+if mode == "baseline-wrong-oid":
+    result = subprocess.run(args, input=sql, stderr=subprocess.PIPE, timeout=5)
+    # Write only a fixed marker for a server-side rejection at the OID guard.
+    if result.returncode != 0 and b"ERROR:  baseline reader OID refused\n" in result.stderr:
+        (directory / "baseline-result").write_text("reader-oid-refused\n")
+    sys.exit(result.returncode)
 if mode == "standby":
     result = subprocess.run(args, input=sql.replace(b"pg_is_in_recovery()", b"true"),
                             stderr=subprocess.PIPE, timeout=5)
