@@ -291,11 +291,16 @@ pub async fn billing_owned_test_entry(
                     Err(message) => worker::Response::error(message, 500),
                 };
             }
-            "/billing-webhook-ack-proof" => {
-                return worker_entry::billing_webhook_ack_test::deliver(req, env, true).await;
-            }
-            "/billing-webhook-retry-proof" => {
-                return worker_entry::billing_webhook_ack_test::deliver(req, env, false).await;
+            path @ ("/billing-webhook-ack-proof"
+            | "/billing-webhook-retry-proof"
+            | "/billing-checkout-hourly-overlap-proof") => {
+                use worker_entry::billing_webhook_ack_test::{deliver, Delivery};
+                let delivery = match path {
+                    "/billing-webhook-ack-proof" => Delivery::LoseCommitAck,
+                    "/billing-webhook-retry-proof" => Delivery::Retry,
+                    _ => Delivery::HourlyOverlap,
+                };
+                return deliver(req, env, delivery).await;
             }
             path @ ("/billing-restricted-history-proof" | "/billing-restricted-history-replay") => {
                 let replay = path == "/billing-restricted-history-replay";

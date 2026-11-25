@@ -7453,7 +7453,7 @@ impl WorkerStripeTransport {
         use crate::stripe::{StripeError, STRIPE_API_BASE, STRIPE_API_VERSION};
         #[cfg(all(target_arch = "wasm32", feature = "billing-owned-wasm-test"))]
         if let Some(script) = &self.webhook_script {
-            return script.send(req);
+            return script.send(req).await;
         }
         #[cfg(all(test, not(target_arch = "wasm32")))]
         if let Some(reply) = &self.test_reply {
