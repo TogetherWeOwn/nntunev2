@@ -1094,7 +1094,8 @@ upload check also reads the pinned Wrangler CLI's `--outfile` multipart body
 and requires `observability.redact_query_string` to be the boolean `true`
 in the `metadata` part for both mirror states. It never prints or publishes
 that body. This catches a CLI that accepts the TOML but drops the setting on
-upload. The same CI job exercises an offline verifier with a synthetic
+upload. Confirming the effective setting requires deployed staging readback.
+The same CI job exercises an offline verifier with a synthetic
 invocation record. The normalized fixture has `kind`, `worker`, `probe_id`,
 `method` and `url` fields. The verifier requires a GET invocation from the
 staging API Worker, a per-run probe ID supplied independently of the record,

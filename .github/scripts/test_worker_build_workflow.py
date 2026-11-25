@@ -48,11 +48,11 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
             "method": "GET",
             "url": clean_url,
         }
-        command = [sys.executable, "-I", SPEC.origin, "--invocation-probe-id", probe_id]
+        command = [sys.executable, "-I", SPEC.origin, "--invocation-probe-id"]
         record = json.dumps(event).encode()
 
-        def verify(raw):
-            return subprocess.run(command, input=raw, capture_output=True, timeout=5)
+        def verify(raw, expected=probe_id):
+            return subprocess.run([*command, expected], input=raw, capture_output=True, timeout=5)
 
         passed = verify(record)
         self.assertEqual((passed.returncode, passed.stdout, passed.stderr),
@@ -81,6 +81,29 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                 refused = verify(raw)
                 self.assertEqual((refused.returncode, refused.stdout, refused.stderr),
                                  (1, b"", f"check_worker_upload: FAIL: {diagnostic}\n".encode()))
+
+        invalid_marker = verify(json.dumps(event | {"probe_id": ""}).encode(), "")
+        self.assertEqual((invalid_marker.returncode, invalid_marker.stdout, invalid_marker.stderr),
+                         (1, b"", b"check_worker_upload: FAIL: invalid synthetic invocation probe ID\n"))
+
+    def test_synthetic_invocation_rejects_wrong_rendered_worker(self):
+        workflow = (ROOT / UPLOAD.WORKFLOW).read_text()
+        manifest = {"worker": [{"name": "api", "binding": [{"binding": "HYPERDRIVE", "staging": "1" * 32}]}]}
+        config = {"env": {"staging": {
+            "name": "synthetic-web-worker",
+            "compatibility_flags": ["enable_request_signal"],
+            "observability": {"redact_query_string": True},
+        }}}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with (
+                patch.object(UPLOAD, "fixture", return_value=(base, base)),
+                patch.object(UPLOAD, "generate", return_value=config),
+                patch.object(UPLOAD, "dry_run") as upload,
+            ):
+                with self.assertRaisesRegex(UPLOAD.Failure, "unexpected staging API Worker"):
+                    UPLOAD.scenario(None, workflow, "1" * 40, manifest, base, "", "api", False)
+                upload.assert_not_called()
 
     def test_private_upload_uses_the_gate_and_checks_all_connections_before_deploy(self):
         text = (ROOT / ".github/workflows/deploy.yml").read_text()
