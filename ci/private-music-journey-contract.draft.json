@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "evaluator": "junit-map-v1",
+  "spec_revision": "private-music-rc-v1",
+  "journey": "private-music",
+  "criteria": [
+    {
+      "id": "invite-acceptance",
+      "applicable": true,
+      "evidence": [{"classname": "private-music", "name": "invite-acceptance", "outcome": "passed"}]
+    },
+    {
+      "id": "upload-to-library",
+      "applicable": true,
+      "evidence": [{"classname": "private-music", "name": "upload-to-library", "outcome": "passed"}]
+    },
+    {
+      "id": "play",
+      "applicable": true,
+      "evidence": [{"classname": "private-music", "name": "play", "outcome": "passed"}]
+    },
+    {
+      "id": "seek",
+      "applicable": true,
+      "evidence": [{"classname": "private-music", "name": "seek", "outcome": "passed"}]
+    },
+    {
+      "id": "queue",
+      "applicable": true,
+      "evidence": [{"classname": "private-music", "name": "queue", "outcome": "passed"}]
+    },
+    {
+      "id": "anonymous-refused",
+      "applicable": true,
+      "evidence": [{"classname": "private-music", "name": "anonymous-refused", "outcome": "passed"}]
+    },
+    {
+      "id": "unlisted-refused",
+      "applicable": true,
+      "evidence": [{"classname": "private-music", "name": "unlisted-refused", "outcome": "passed"}]
+    },
+    {
+      "id": "revoked-or-expired-refused",
+      "applicable": true,
+      "evidence": [{"classname": "private-music", "name": "revoked-or-expired-refused", "outcome": "passed"}]
+    },
+    {
+      "id": "video-off",
+      "applicable": true,
+      "evidence": [{"classname": "private-music", "name": "video-off", "outcome": "passed"}]
+    },
+    {
+      "id": "paid-signup",
+      "applicable": false,
+      "rationale": "The roadmapped first personal-use release uses time-limited private listening while payment integration is qualified separately."
+    }
+  ]
+}

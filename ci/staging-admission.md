@@ -199,7 +199,51 @@ Protected producer wiring, live evidence and reviewed approval are separate
 release work. The current production workflow's preliminary job check still
 expects the ordinary journey.
 
+### Draft contract for the first private music release
+
+The [draft contract](private-music-journey-contract.draft.json) maps the
+[roadmap's first personal-use release](../ROADMAP.md#product-boundaries) and
+[private listening qualification](../docs/ops.md#private-listening-qualification)
+onto the [protected staging journey](../e2e/private-staging/journey.spec.ts),
+using the private admission format from
+[#1797](https://github.com/TogetherWeOwn/nntunev2/pull/1797). Paid signup is
+outside this release scope. The music-only scope requires proof the video
+interface is off.
+
+Each applicable criterion requires the `private-music` class and the case name
+below. These are the assertions the bounded reporter must use for each case.
+
+| Case name | Required staging assertions |
+| --- | --- |
+| `invite-acceptance` | The private invite completes email and passkey signup, clears the invite fragment and opens Library with an authorized response. |
+| `upload-to-library` | The owner uploads the checked-in FLAC, the publication receipt matches its SHA-256 and yields a fresh canonical track ID, and that exact ID becomes visible in the invitee's Library. |
+| `play` | The first curated track is the fresh publication. Its audio advances through the authenticated relay, the play acknowledgement agrees with the relay identity, and the range response matches bytes of the uploaded FLAC. |
+| `seek` | The paused player completes a mid-track seek and resumes advancing from the sought position. |
+| `queue` | Queue order matches the curated Library selection. Next selects the companion track and playback advances for that track. |
+| `anonymous-refused` | Signup without an invite and anonymous Library access return 401. |
+| `unlisted-refused` | An authenticated session outside the cohort gets 403 from Library and play. |
+| `revoked-or-expired-refused` | At the configured cutoff, the same invitee session gets 403 from Library and play, its media range is refused, and the Library shows the denial with neither curated row visible. |
+| `video-off` | Now Playing exposes no Music Video tab, iframe or video element. |
+
+The protected suite currently uses the dot reporter. Playwright's built-in
+JUnit reporter records the enclosing test as one testcase and has no per-step
+case or explicit first-attempt marker. The private admission format requires the
+bounded per-case report above, including the two separately required build
+identity cases. The selector fixtures exercise that format without staging.
+Cross-stage track correlation is tracked in
+[#1823](https://github.com/TogetherWeOwn/nntunev2/pull/1823). Rendering verified
+candidate pins and the switch-off instructions are tracked in
+[#1822](https://github.com/TogetherWeOwn/nntunev2/pull/1822).
+
+The production verifier reads `ci/product-journey-contract.json`. The
+separately named draft has no approval entry. Enrollment requires the exact
+live report from protected staging and reviewed product and QA approval.
+
 ## Offline verification
+
+`python3 -I ci/test_staging_admission.py DraftPrivateContractTests` runs the
+draft selector check against synthetic private-admission and raw Playwright
+JUnit shapes without Playwright, staging access or network calls.
 
 `python3 -I ci/test_staging_admission.py` uses synthetic policy and authenticated
 API-shaped fixtures without a network, deploy or operational acceptance claim.

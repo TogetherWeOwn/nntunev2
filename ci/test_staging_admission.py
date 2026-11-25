@@ -443,6 +443,87 @@ class PolicyTests(Base):
             self.refused(reason, sa.approved_contract, make_policy(data), data)
 
 
+class DraftPrivateContractTests(Base):
+    CASES = ("invite-acceptance", "upload-to-library", "play", "seek", "queue",
+             "anonymous-refused", "unlisted-refused", "revoked-or-expired-refused", "video-off")
+
+    def setUp(self):
+        data = (HERE / "private-music-journey-contract.draft.json").read_bytes()
+        policy = make_policy(data)
+        policy["approvals"][0]["spec_revision"] = sa.parse_json(data)["spec_revision"]
+        self.contract = sa.approved_contract(policy, data)
+
+    def private_suite(self):
+        suite = private_report(private_pins())
+        ET.SubElement(suite, "testcase", classname="private-music", name="invite-acceptance", retry="0")
+        return suite
+
+    def coverage(self, report):
+        rows = sa.junit_evidence(ET.tostring(report), self.contract)[0]
+        return {row["id"]: row["outcome"] for row in rows}
+
+    def raw_playwright_report(self):
+        # Playwright 1.65.1 writes the spec filename and outer test title.
+        # Nested test.step() names do not become cases.
+        spec = HERE.parent / "e2e/private-staging/journey.spec.ts"
+        title = "private staging invite serves curated audio and refuses access at cutoff"
+        self.assertIn(f"test('{title}',", spec.read_text(encoding="utf-8"))
+        root = ET.Element("testsuites", tests="1", failures="0", skipped="0", errors="0")
+        suite = ET.SubElement(root, "testsuite", name=spec.name, tests="1")
+        ET.SubElement(suite, "testcase", name=title, classname=spec.name, time="0.001")
+        return root
+
+    def test_draft_matches_the_fixed_private_report_cases(self):
+        self.assertEqual(self.contract["journey"], "private-music")
+        self.assertEqual([row["id"] for row in self.contract["criteria"] if not row["applicable"]],
+                         ["paid-signup"])
+        root = self.raw_playwright_report()
+        suite = self.private_suite()
+        suite.set("name", "private candidate assertions")
+        root.insert(0, suite)
+        root.set("tests", str(len(root.findall(".//testcase"))))
+        self.assertEqual(self.coverage(root), dict.fromkeys(self.CASES, "passed"))
+
+    def test_each_selector_needs_one_first_attempt_pass(self):
+        faults = ("missing", "duplicate", "wrong-class", "wrong-name", "no-retry-field",
+                  "retried", "skipped", "failure", "expected-failure", "flakyFailure")
+        for name in self.CASES:
+            for fault in faults:
+                with self.subTest(case=name, fault=fault):
+                    suite = self.private_suite()
+                    case = suite.find(f"./testcase[@name='{name}']")
+                    if fault == "missing":
+                        suite.remove(case)
+                    elif fault == "duplicate":
+                        suite.append(copy.deepcopy(case))
+                    elif fault == "wrong-class":
+                        case.set("classname", "journey.spec.ts")
+                    elif fault == "wrong-name":
+                        case.set("name", f"[staging] {name}")
+                    elif fault == "no-retry-field":
+                        del case.attrib["retry"]
+                    elif fault == "retried":
+                        case.set("retry", "1")
+                    elif fault == "expected-failure":
+                        ET.SubElement(ET.SubElement(case, "properties"), "property", name="fail")
+                    else:
+                        ET.SubElement(case, fault)
+                    expected = dict.fromkeys(self.CASES, "passed")
+                    expected[name] = "incomplete"
+                    self.assertEqual(self.coverage(suite), expected)
+
+    def test_raw_playwright_pass_cannot_supply_private_cases(self):
+        root = self.raw_playwright_report()
+        self.refused("private identity cases did not pass exactly once",
+                     self.coverage, root)
+        suite = ET.SubElement(root, "testsuite", name="private build identities")
+        private = self.private_suite()
+        for phase in sa.IDENTITY_PHASES:
+            suite.append(private.find(f"./testcase[@name='{phase}']"))
+        root.set("tests", "3")
+        self.assertEqual(self.coverage(root), dict.fromkeys(self.CASES, "incomplete"))
+
+
 class ProduceTests(Base):
     def test_positive_receipt_is_satisfied(self):
         receipt = World().receipt
