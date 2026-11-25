@@ -1,4 +1,5 @@
 use super::*;
+use crate::handlers::private_trial::{registered::registered_header, TrialError};
 use crate::native_rest::{issue_credential, Scope};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use nntune_core::{
@@ -363,6 +364,12 @@ async fn prove_attempt(
         intent: &intent,
     };
     let until = SystemTime::now() + Duration::from_secs(45);
+    if publish_fixture {
+        assert_eq!(
+            registered_header(writer, &prepared.scope, identities, map, idempotency_key).await,
+            Err(TrialError::Unconfirmed)
+        );
+    }
 
     let mut stranger = credential.record.clone();
     stranger.user_id = "foreign-principal".into();
@@ -904,6 +911,24 @@ async fn prove_attempt(
         Err(UploadError::Refused)
     ));
     let track = if publish_fixture {
+        let header = async |scope: &CompletionScope<'_>, map, key: &str| {
+            registered_header(writer, scope, identities, map, key).await
+        };
+        let scope = prepared.scope;
+        assert_eq!(
+            header(&scope, map, idempotency_key).await,
+            Ok(Some(context.header))
+        );
+        assert_eq!(
+            header(&scope, [0; 16], idempotency_key).await,
+            Err(TrialError::Unconfirmed)
+        );
+        assert_eq!(header(&scope, map, "other-fixture").await, Ok(None));
+        let foreign = CompletionScope {
+            principal: "foreign-principal",
+            ..scope
+        };
+        assert_eq!(header(&foreign, map, idempotency_key).await, Ok(None));
         let track = Box::pin(
             crate::handlers::tests::private_trial_fixture::verify_publication(
                 observer, writer, now, input, auth, prepared, &committed, reload,
