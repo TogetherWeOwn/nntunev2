@@ -33,7 +33,7 @@ test('the invited Library stars only the invoked same-title track across Refresh
 			listingReads++;
 			return route.fulfill({
 				headers: { 'x-nntune-session-binding': binding },
-				json: listingReads === 1 ? [other, target] : [target, other]
+				json: listingReads === 2 ? [target, other] : [other, target]
 			});
 		}
 		if (path.startsWith('/api/') || path.startsWith('/v1/')) return route.fulfill({ status: 404 });
@@ -58,6 +58,14 @@ test('the invited Library stars only the invoked same-title track across Refresh
 		await expect(targetSelection).not.toBeChecked();
 		await expect(favorites).toHaveCount(pressed ? 1 : 0);
 		if (pressed) await expect(favorites).toHaveAttribute(library.id, target.id);
+	};
+	const refreshTo = async (ids: string[]) => {
+		const refreshed = page.waitForResponse(origin + library.api);
+		await page.getByRole('button', { name: library.refresh, exact: true }).click();
+		const response = await refreshed;
+		expect(response.status()).toBe(200);
+		expect(response.request().method()).toBe('GET');
+		await expect.poll(rowIds).toEqual(ids);
 	};
 
 	await expect.poll(rowIds).toEqual([other.id, target.id]);
@@ -88,19 +96,20 @@ test('the invited Library stars only the invoked same-title track across Refresh
 	await expect.poll(() => writes.jsonValue()).toEqual([saved]);
 	await expectFavorite(true);
 	expect(await persisted()).toBeNull();
+	expect(listingReads).toBe(1);
+	await refreshTo([target.id, other.id]);
+	await expectFavorite(true);
+	expect(await persisted()).toBeNull();
+	expect(await writes.jsonValue()).toEqual([saved]);
+
 	await star(true).click();
 	await expectFavorite(false);
 	await star(false).click();
 	await expect.poll(persisted).toBe(saved);
 	await expectFavorite(true);
-	expect(listingReads).toBe(1);
+	expect(listingReads).toBe(2);
 
-	const refreshed = page.waitForResponse(origin + library.api);
-	await page.getByRole('button', { name: library.refresh, exact: true }).click();
-	const response = await refreshed;
-	expect(response.status()).toBe(200);
-	expect(response.request().method()).toBe('GET');
-	await expect.poll(rowIds).toEqual([target.id, other.id]);
+	await refreshTo([other.id, target.id]);
 	await expectFavorite(true);
 	expect(await persisted()).toBe(saved);
 
@@ -110,6 +119,6 @@ test('the invited Library stars only the invoked same-title track across Refresh
 	expect(await writes.jsonValue()).toEqual([saved, saved, '[]']);
 	await expect(page.getByTestId(player.queueItem)).toHaveCount(0);
 	await expect(page).toHaveURL(origin + library.path);
-	expect(listingReads).toBe(2);
+	expect(listingReads).toBe(3);
 	expect(unexpectedRequests).toEqual([]);
 });
