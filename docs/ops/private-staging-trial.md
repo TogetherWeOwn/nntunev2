@@ -165,8 +165,12 @@ After containment, supply `PRIVATE_TRIAL_CLEANUP_CONTAINMENT` in the protected
 after completing and checking those steps. Leave the upload, playback,
 journey, observation and Stream deploy arms unset. Keep the original staging
 storage settings available for the runner to match against the receipt.
+In the containment receipt, record `cleanup_scope_sha256` from the approved
+fixture scope and `cleanup_s3_access_key_sha256` from the independently
+verified cleanup access-key ID. Use lowercase SHA-256 hex for both, hashing
+the exact UTF-8 bytes of the scope JSON and of the access-key ID respectively.
 If a later staging deploy changes either serving pin, obtain fresh disable
-receipts before dispatch and retain the original fixture scope and hash.
+receipts and carry forward both original cleanup pins.
 
 Store the selected tone A receipt as `PRIVATE_TRIAL_CLEANUP_SCOPE`. Supply
 `object`, `generation`, `map`, `track`, `session`, `job`, `issuer`, `invite`,
@@ -181,8 +185,10 @@ separate from upload, read, publication and enrollment. Use
 independent exact-version DELETE and HEAD credential. Its policy must allow
 only the two selected fixture keys and no list or bulk operations. Record the
 SHA-256 of the exact UTF-8 credential JSON as `s3_credential_sha256` in the
-scope. Before arming, verify both identities and qualify the provider with the
-same no-list policy on a disposable versioned fixture. Require version-specific
+scope. Derive the containment pin from the verified two-key cleanup policy
+readback. The disposable provider preflight has its own access-key ID. Before
+arming, verify both identities and qualify the provider with the same no-list
+policy on a disposable versioned fixture. Require version-specific
 HEAD to return the selected version while present. Require exact-version
 DELETE to return an empty HTTP 204 and, if it includes `x-amz-version-id`,
 require that value to match the selected version. Require the subsequent
@@ -268,13 +274,15 @@ Record actual provider qualification separately before arming the trial.
 Once the cutoff, retention and lease windows have elapsed, dispatch
 [`deploy`](../../.github/workflows/deploy.yml) from protected `main` with
 `private_trial_cleanup_scope_sha256` set to the SHA-256 of the exact UTF-8
-scope JSON. The job checks the disable deployments under the staging deploy
-lock and invokes the isolated Worker once. `confirmed` means two verified
-version absences and a committed source finalization. Stop on `refused`,
+scope JSON recorded in the containment receipt. The job checks approval and
+the disable deployments under the staging deploy lock. The isolated Worker
+checks the exact scope bytes and both credential pins before connecting to
+the cleanup database. `confirmed` means two verified version absences and a
+committed source finalization. Stop on `refused`,
 `withheld`, `unconfirmed` or missing evidence. Reconcile SQL and provider state
-before a fresh dispatch with the original scope and hash. Keep those pins
-until cleanup is confirmed, then clear the cleanup settings in custody and
-withdraw its scoped access.
+before a fresh dispatch with the original approved scope and cleanup key.
+Keep those pins until cleanup is confirmed, then clear the cleanup settings in
+custody and withdraw its scoped access.
 
 After an interruption, reconcile the last run and actual staging state before
 retrying. A grant retry requires the same reviewed overlay bytes and role OIDs.

@@ -5,14 +5,17 @@ from staging_api_identity import SCRIPT, STREAM, Unavailable
 from staging_trial_cleanup_preflight import preflight
 
 SHA = "a" * 40
+SCOPE_SHA = "b" * 64
+ACCESS_KEY_SHA = "c" * 64
 VERSION = "12345678-1234-4234-8234-123456789012"
 DISABLED_DEPLOYMENT = "22345678-1234-4234-8234-123456789012"
 PINS = {"version_id": VERSION, "deployment_id": DISABLED_DEPLOYMENT}
 ENV = {
-    "CLEANUP_SCOPE_SHA256": "b" * 64,
+    "CLEANUP_SCOPE_SHA256": SCOPE_SHA,
     "CLEANUP_CONTAINMENT": json.dumps({
         "session_revoked": True, "cohort_cleared": True, "armed_runs_drained": True,
         "build_sha": SHA, "api": PINS, "stream": PINS,
+        "cleanup_scope_sha256": SCOPE_SHA, "cleanup_s3_access_key_sha256": ACCESS_KEY_SHA,
     }),
     "PRIVATE_PLAYBACK_STAGING_ENVIRONMENT": VERSION,
     "PRIVATE_PLAYBACK_STAGING_LIBRARY": VERSION,
@@ -39,7 +42,7 @@ def read(worker, path):
 
 class CleanupContainmentTests(unittest.TestCase):
     def test_requires_off_pins_and_provider(self):
-        self.assertEqual(preflight(ENV, read)["environment"], VERSION)
+        self.assertEqual(preflight(ENV, read)["provider"]["environment"], VERSION)
         for overrides in (
             {"CLEANUP_CONTAINMENT": ""},
             {"PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true"},
@@ -48,6 +51,25 @@ class CleanupContainmentTests(unittest.TestCase):
         ):
             with self.subTest(overrides=overrides), self.assertRaises(Unavailable):
                 preflight(ENV | overrides, read)
+
+    def test_requires_approved_scope_and_cleanup_access_key_before_provider_reads(self):
+        approved = json.loads(ENV["CLEANUP_CONTAINMENT"])
+        for field, value in (
+            ("cleanup_scope_sha256", None),
+            ("cleanup_scope_sha256", "d" * 64),
+            ("cleanup_s3_access_key_sha256", None),
+            ("cleanup_s3_access_key_sha256", "not-a-digest"),
+        ):
+            with self.subTest(field=field, value=value), self.assertRaises(Unavailable):
+                receipt = {**approved, field: value}
+                if value is None:
+                    del receipt[field]
+                preflight(ENV | {"CLEANUP_CONTAINMENT": json.dumps(receipt)},
+                          lambda *_: self.fail("read before approval passed"))
+
+        approval = preflight(ENV, read)
+        self.assertEqual(approval["scope_sha256"], SCOPE_SHA)
+        self.assertEqual(approval["s3_access_key_sha256"], ACCESS_KEY_SHA)
 
     def test_refuses_armed_upload_or_moved_disable_version(self):
         def armed(worker, path):

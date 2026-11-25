@@ -8,6 +8,8 @@ import sys
 import staging_api_identity as identity
 from staging_stream_config import API_SETTINGS, PRIVATE_SETTINGS, TRIAL_DATABASES
 
+SHA256 = re.compile(r"[0-9a-f]{64}")
+
 
 def preflight(env, read):
     require = identity.require
@@ -15,14 +17,19 @@ def preflight(env, read):
                  "PRIVATE_MUSIC_STAGING_JOURNEY", "PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION",
                  "STREAM_STAGING_DEPLOY_ENABLED"):
         require(not env.get(name), "staging-arms-present")
-    require(re.fullmatch(r"[0-9a-f]{64}", env.get("CLEANUP_SCOPE_SHA256", "")), "missing-scope-pin")
+    scope_sha = env.get("CLEANUP_SCOPE_SHA256", "")
+    require(identity.valid(SHA256, scope_sha), "missing-scope-pin")
     raw = env.get("CLEANUP_CONTAINMENT", "")
     require(0 < len(raw) <= 2048, "missing-containment")
     receipt = identity.decode(raw.encode(), "invalid-containment")
     require(isinstance(receipt, dict) and set(receipt) == {
         "session_revoked", "cohort_cleared", "armed_runs_drained", "build_sha", "api", "stream",
+        "cleanup_scope_sha256", "cleanup_s3_access_key_sha256",
     } and all(receipt[k] is True for k in ("session_revoked", "cohort_cleared", "armed_runs_drained")),
         "invalid-containment")
+    require(receipt["cleanup_scope_sha256"] == scope_sha, "cleanup-scope-drift")
+    access_key_sha = receipt["cleanup_s3_access_key_sha256"]
+    require(identity.valid(SHA256, access_key_sha), "invalid-cleanup-access-key-pin")
     sha = receipt["build_sha"]
     require(identity.valid(identity.SHA, sha), "invalid-disable-build")
     for lane, worker in (("api", identity.SCRIPT), ("stream", identity.STREAM)):
@@ -52,7 +59,7 @@ def preflight(env, read):
         require(0 < len(value) <= 253 and re.fullmatch((API_SETTINGS | PRIVATE_SETTINGS)[setting], value),
                 "invalid-provider-setting")
         provider[field] = value
-    return provider
+    return {"provider": provider, "scope_sha256": scope_sha, "s3_access_key_sha256": access_key_sha}
 
 
 if __name__ == "__main__":
@@ -62,7 +69,7 @@ if __name__ == "__main__":
         identity.require(re.fullmatch(r"[0-9a-f]{32}", account) and re.fullmatch(r"[!-~]{1,512}", token),
                          "missing-read-authority")
         prefix = f"/client/v4/accounts/{account}/workers/scripts"
-        provider = preflight(os.environ, lambda worker, path: identity.provider_result(f"{prefix}/{worker}/{path}", token))
-        print(json.dumps(provider, separators=(",", ":")))
+        approval = preflight(os.environ, lambda worker, path: identity.provider_result(f"{prefix}/{worker}/{path}", token))
+        print(json.dumps(approval, separators=(",", ":")))
     except (identity.Unavailable, OSError, ValueError, KeyError, RecursionError, TypeError, AttributeError):
         sys.exit("Private staging fixture cleanup containment refused.")
