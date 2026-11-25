@@ -9,9 +9,9 @@ test('the invited Library queues the chosen same-title tracks after sorting', as
 	const verifierPath = '/v1/me/likes/session';
 	const title = 'Synthetic Echo';
 	const maple = { id: '00000000-0000-4000-8000-000000000001', title, artist: 'Maple' };
-	const noon = { id: '00000000-0000-4000-8000-000000000002', title: 'Synthetic Noon', artist: 'Birch' };
+	const noon = { id: '00000000-0000-4000-8000-000000000002', title: 'Synthetic Noon', artist: 'Acacia' };
 	const alder = { id: '00000000-0000-4000-8000-000000000003', title, artist: 'Alder' };
-	const tracks = [noon, alder, maple];
+	const tracks = [alder, noon, maple];
 	const playbackRequests: string[] = [];
 
 	await context.route('**/*', async (route) => {
@@ -46,7 +46,7 @@ test('the invited Library queues the chosen same-title tracks after sorting', as
 	const alderSelection = row(alder.id).getByRole('checkbox');
 	const selectionCount = page.getByTestId('selection-count');
 
-	await expect.poll(rowIds).toEqual([noon.id, alder.id, maple.id]);
+	await expect.poll(rowIds).toEqual([alder.id, noon.id, maple.id]);
 	await expect(mapleTitle).toBeVisible();
 	await expect(row(alder.id).getByRole('button', { name: `${title} — ${alder.artist}`, exact: true })).toBeVisible();
 	await alderSelection.check();
@@ -59,11 +59,13 @@ test('the invited Library queues the chosen same-title tracks after sorting', as
 
 	const menuName = `More actions for ${title}`;
 	const add = page.getByRole('menuitem', { name: 'Add to queue', exact: true });
+	// The second row holds a different ID in the original, title and artist orders.
+	const secondRowMenu = rows.nth(1).getByRole('button', { name: menuName, exact: true });
 	await order.selectOption({ label: 'Title A–Z' });
 	await expect.poll(rowIds).toEqual([alder.id, maple.id, noon.id]);
 	await expect(queue).toHaveCount(0);
 	// Invoke the second same-named menu so focus restoration must identify the specific button.
-	await rows.nth(1).getByRole('button', { name: menuName, exact: true }).press('Enter');
+	await secondRowMenu.press('Enter');
 	await expect(add).toBeVisible();
 	await page.keyboard.press('a');
 	await page.keyboard.press('Enter');
@@ -71,12 +73,12 @@ test('the invited Library queues the chosen same-title tracks after sorting', as
 	await expect.poll(queueIds).toEqual([maple.id]);
 
 	await order.selectOption({ label: 'Artist A–Z' });
-	await expect.poll(rowIds).toEqual([alder.id, noon.id, maple.id]);
+	await expect.poll(rowIds).toEqual([noon.id, alder.id, maple.id]);
 	await expect(mapleSelection).toBeChecked();
 	await expect(alderSelection).not.toBeChecked();
-	await rows.first().getByRole('button', { name: menuName, exact: true }).click();
+	await secondRowMenu.click();
 	await add.click();
-	// Queue order follows the add actions even though the Library shows Alder first.
+	// Queue order follows the add actions even though the Library shows Alder before Maple.
 	await expect.poll(queueIds).toEqual([maple.id, alder.id]);
 	await expect(queue.nth(0)).toBeVisible();
 	await expect(queue.nth(1)).toBeVisible();
