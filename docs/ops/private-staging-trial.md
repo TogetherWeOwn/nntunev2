@@ -154,10 +154,30 @@ needs list access as a stop. Keep the scope and credentials in protected custody
 
 #### Provider-only preflight
 
-In the protected qualification environment, build the standalone probe from
-the reviewed commit before loading provider credentials. Use Node 24+, an
-absolute disposable `probe_dir` and the `wasm-bindgen` CLI version pinned in
-`workers/ingest/Cargo.lock`.
+For a hosted run, use [staging-trial-provider-preflight](../../.github/workflows/staging-trial-provider-preflight.yml).
+Prepare the two disposable versions and read back the credential policy as
+described below. Supply the four settings below as secrets in the existing
+`staging` Environment for this run. Source the endpoint and region from trusted
+staging settings. Keep the exact scope JSON and the disposable credential in
+protected custody. Use the SHA-256 of the exact UTF-8 bytes supplied as the
+scope secret. The dispatch inputs contain only the reviewed full `main` commit
+SHA and the lowercase scope digest.
+
+```sh
+gh workflow run staging-trial-provider-preflight.yml --ref main \
+  -f ref="$reviewed_sha" -f scope_sha256="$scope_sha256"
+```
+
+GitHub must resolve the dispatch to that reviewed commit. Open the run and
+record its URL and the fixed verdict from the successful probe step. A skipped
+job or a rerun supplies no qualification evidence. Reconcile any interrupted or
+failed attempt before preparing a fresh pair and dispatch. Withdraw the
+disposable credential and clear the run's Environment secrets after use.
+
+For the controlled manual path, build the standalone probe in the protected
+qualification environment from the reviewed commit before loading provider
+credentials. Use Node 24+, an absolute disposable `probe_dir` and the
+`wasm-bindgen` CLI version pinned in `workers/ingest/Cargo.lock`.
 
 ```sh
 cargo build --locked --manifest-path workers/ingest/Cargo.toml \

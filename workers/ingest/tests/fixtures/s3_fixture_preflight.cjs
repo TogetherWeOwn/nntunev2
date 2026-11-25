@@ -1,11 +1,12 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
+const { execFile, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { readFileSync } = require('node:fs');
 const { test } = require('node:test');
 const { createServer } = require('node:tls');
+const { promisify } = require('node:util');
 const { qualify } = require('../../../../.github/scripts/private_trial_provider_preflight.cjs');
 const { authorization, mediaKey, sha256 } = require('./s3_fixture_protocol.cjs');
 
@@ -20,6 +21,7 @@ const path = `/${bucket}/${key}`;
 const queryFor = pin => `versionId=${encodeURIComponent(pin)}`;
 const urlFor = (origin, pin) => `${origin}${path}?${queryFor(pin)}`;
 const credential = { access_key: 'FIXTUREACCESS', secret_key: 'fixture-secret' };
+const launcher = require.resolve('../../../../.github/scripts/private_trial_provider_preflight.cjs');
 const plan = [['HEAD', version], ['HEAD', sibling], ['DELETE', version], ['HEAD', version],
   ['DELETE', version], ['HEAD', version], ['HEAD', sibling]];
 
@@ -142,12 +144,35 @@ test('synthetic TLS origin checks signed headers and refuses ambiguous wire repl
   const host = `[::1]:${server.address().port}`;
   const origin = `https://${host}`;
   const scope = { bucket, endpoint: origin, region, generation, version, sibling_version: sibling };
-  for (const scenario of [{ step: -1 }, { step: 2 }, { step: 5 }, { step: 6, conflictingFraming: true }]) {
+  for (const scenario of [
+    { step: -1, mode: '--provider-dispatch' }, { step: -1, mode: '--provider' },
+    { step: 2 }, { step: 5 }, { step: 6, conflictingFraming: true },
+  ]) {
     requests = [];
     fault = scenario;
     const qualified = fault.step < 0;
-    assert.equal(await qualify(process.env.INGEST_WASM_JS, origin, region,
-      JSON.stringify(scope), JSON.stringify(credential)), qualified ? 'qualified' : 'unconfirmed');
+    const scopeJson = JSON.stringify(scope);
+    if (qualified) {
+      const child = await promisify(execFile)(process.execPath,
+        [launcher, scenario.mode, process.env.INGEST_WASM_JS], {
+          env: {
+            NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS,
+            PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: origin,
+            PRIVATE_PLAYBACK_STAGING_S3_REGION: region,
+            PRIVATE_TRIAL_PREFLIGHT_SCOPE: scopeJson,
+            ...(scenario.mode === '--provider-dispatch'
+              ? { PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: sha256(scopeJson) } : {}),
+            PRIVATE_TRIAL_PREFLIGHT_S3: JSON.stringify(credential),
+          },
+        });
+      assert.equal(child.stdout, 'Private staging fixture provider preflight: qualified.'
+        + ' Matched present HEAD and preserved sibling HEAD. Twice observed empty DELETE 204 and HEAD 404'
+        + ' with optional version headers absent or matching.\n');
+      assert.equal(child.stderr, '');
+    } else {
+      assert.equal(await qualify(process.env.INGEST_WASM_JS, origin, region,
+        scopeJson, JSON.stringify(credential)), 'unconfirmed');
+    }
     assert.equal(requests.length, qualified ? plan.length : fault.step + 1);
     for (const [step, request] of requests.entries()) {
       const [method, pin] = plan[step];
@@ -170,8 +195,40 @@ test('synthetic TLS origin checks signed headers and refuses ambiguous wire repl
 });
 
 test('the operator entry requires explicit provider invocation and prints a fixed verdict', () => {
-  const launcher = require.resolve('../../../../.github/scripts/private_trial_provider_preflight.cjs');
   const child = spawnSync(process.execPath, [launcher, process.env.INGEST_WASM_JS], { encoding: 'utf8', env: {} });
+  assert.equal(child.status, 1);
+  assert.equal(child.stdout, 'Private staging fixture provider preflight: refused.\n');
+  assert.equal(child.stderr, '');
+});
+
+test('the hosted entry refuses missing or changed scope before loading the bundle', () => {
+  const scope = JSON.stringify({ bucket, endpoint, region, generation, version, sibling_version: sibling });
+  const digest = sha256(scope);
+  for (const [input, pin] of [
+    ['', digest], [scope, ''], [scope, 'malformed'], [scope, '0'.repeat(64)],
+    [scope + '\n', digest], ['x'.repeat(4097), sha256('x'.repeat(4097))],
+  ]) {
+    const child = spawnSync(process.execPath, [launcher, '--provider-dispatch', 'no-such-bundle.js'], {
+      encoding: 'utf8',
+      env: { PRIVATE_TRIAL_PREFLIGHT_SCOPE: input, PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: pin },
+    });
+    assert.equal(child.status, 1);
+    assert.equal(child.stdout, 'Private staging fixture provider preflight: refused.\n');
+    assert.equal(child.stderr, '');
+  }
+});
+
+test('a protected scope match without a disposable credential fails closed', () => {
+  const scope = JSON.stringify({ bucket, endpoint, region, generation, version, sibling_version: sibling });
+  const child = spawnSync(process.execPath, [launcher, '--provider-dispatch', process.env.INGEST_WASM_JS], {
+    encoding: 'utf8',
+    env: {
+      PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: endpoint,
+      PRIVATE_PLAYBACK_STAGING_S3_REGION: region,
+      PRIVATE_TRIAL_PREFLIGHT_SCOPE: scope,
+      PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: sha256(scope),
+    },
+  });
   assert.equal(child.status, 1);
   assert.equal(child.stdout, 'Private staging fixture provider preflight: refused.\n');
   assert.equal(child.stderr, '');

@@ -1,5 +1,6 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
 const { resolve } = require('node:path');
 const { isIP } = require('node:net');
 const { connect } = require('node:tls');
@@ -82,15 +83,25 @@ async function qualify(bundle, endpoint, region, scope, credential, send = sendB
 
 module.exports = { qualify };
 
+async function runProbe(args, env) {
+  const [mode, bundle] = args;
+  if (args.length !== 2 || (mode !== '--provider' && mode !== '--provider-dispatch')) {
+    return 'refused';
+  }
+  const scope = env.PRIVATE_TRIAL_PREFLIGHT_SCOPE ?? '';
+  if (mode === '--provider-dispatch') {
+    const expected = env.PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256 ?? '';
+    if (!scope || Buffer.byteLength(scope, 'utf8') > 4096 || !/^[0-9a-f]{64}$/.test(expected)
+        || createHash('sha256').update(scope, 'utf8').digest('hex') !== expected) {
+      return 'refused';
+    }
+  }
+  return qualify(bundle, env.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT ?? '',
+    env.PRIVATE_PLAYBACK_STAGING_S3_REGION ?? '', scope, env.PRIVATE_TRIAL_PREFLIGHT_S3 ?? '');
+}
+
 if (require.main === module) {
-  const run = process.argv.length === 4 && process.argv[2] === '--provider'
-    ? qualify(process.argv[3],
-      process.env.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT ?? '',
-      process.env.PRIVATE_PLAYBACK_STAGING_S3_REGION ?? '',
-      process.env.PRIVATE_TRIAL_PREFLIGHT_SCOPE ?? '',
-      process.env.PRIVATE_TRIAL_PREFLIGHT_S3 ?? '')
-    : Promise.resolve('refused');
-  run.then((verdict) => {
+  runProbe(process.argv.slice(2), process.env).then((verdict) => {
     const proof = verdict === 'qualified'
       ? ' Matched present HEAD and preserved sibling HEAD. Twice observed empty DELETE 204 and HEAD 404 with optional version headers absent or matching.'
       : '';
