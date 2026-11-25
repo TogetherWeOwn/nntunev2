@@ -292,7 +292,9 @@ proof of the same destination binding. The publisher's job owner, invite
 issuer role, invite redemption, browser visibility and playback entitlement
 alone convey no such authority. The producer decision must name the actor,
 the action that authorizes the write, how the destination is selected, and
-how the authorization expires or is revoked before use.
+how the authorization expires or is revoked before use. It must also define
+how to recognize a retry and prevent an already committed action from
+recreating a membership the owner later removed.
 
 For an already trusted S3 publication, resolve the local `tracks.id` from
 the committed publisher result and revalidate the current source binding
@@ -322,7 +324,8 @@ owned by the same account. Lock the active account, then the selected active
 Library, and validate the authorization and publication through commit under
 the [deletion rules](0002-data-model.md). Create exactly one
 `(library_id, track_id)` row in the selected Library. An authorized retry
-while that row exists preserves `added_at`. Check that an expired action,
+while that row exists preserves `added_at`. Replaying the committed action
+after removal must leave the row absent. Check that an expired action,
 account or Library deletion marker, superseded source, or rolled-back write
 leaves both Libraries empty when they started empty. For local releases,
 exercise both artwork cases with synthetic rows. A selection change clears
