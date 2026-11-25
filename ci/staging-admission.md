@@ -202,13 +202,15 @@ expects the ordinary journey.
 ### Draft contract for the first private music release
 
 The [draft contract](private-music-journey-contract.draft.json) maps the
-[roadmap's first personal-use release](../ROADMAP.md#product-boundaries) and
-[private listening qualification](../docs/ops.md#private-listening-qualification)
-onto the [protected staging journey](../e2e/private-staging/journey.spec.ts),
+[roadmap's first personal-use release](../ROADMAP.md#product-boundaries) to
+assertions in the [protected staging journey](../e2e/private-staging/journey.spec.ts),
 using the private admission format from
 [#1797](https://github.com/TogetherWeOwn/nntunev2/pull/1797). Paid signup is
 outside this release scope. The music-only scope requires proof the video
-interface is off.
+interface is off. The [private listening runbook](../docs/ops.md#private-listening-qualification)
+also calls for separate checks of ledger-based cohort revocation, refused and
+pre-revoked invites, and the absence of cohort payment history and Stripe
+credentials.
 
 Each applicable criterion requires the `private-music` class and the case name
 below. These are the assertions the bounded reporter must use for each case.
