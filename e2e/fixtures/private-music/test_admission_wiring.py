@@ -129,7 +129,10 @@ def protected_steps():
     opening = qualify.split("\n      - name: Observe opening private staging deployments\n", 1)[1]
     opening, listening = opening.split("\n      - name: Qualify private listening\n", 1)
     listening, _ = listening.split("\n      - name: Summarize private music contract enrollment review evidence\n", 1)
-    assert 'private_staging_evidence.py observe > "$RUNNER_TEMP/build-identity.json"' in opening
+    assert (
+        "        run: timeout -k 2s 30s python3 -I .github/scripts/private_staging_evidence.py "
+        'observe > "$RUNNER_TEMP/build-identity.json"'
+    ) in opening.splitlines()
     assert not re.search(r"^        (if|continue-on-error):", opening, re.M)
     assert not re.search(r"^        if:", listening, re.M)
     review = qualify.split("\n      - name: Summarize private music contract enrollment review evidence\n", 1)[1]
