@@ -655,6 +655,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Exercise paid invite staging runner on disposable loopback
+        run: python3 -B .github/scripts/test_paid_invite_acceptance.py -v
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
