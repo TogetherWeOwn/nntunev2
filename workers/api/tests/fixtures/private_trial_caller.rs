@@ -3,7 +3,7 @@ use crate::{
     ingest_session_caller::{
         Authorization, CommittedFlacUpload, CurrentAuthorization, PreparedUpload,
     },
-    private_catalogue_read::{lookup_scoped, PublicationScope},
+    private_catalogue_read::{lookup, lookup_scoped, PublicationPins, PublicationScope},
     private_listening::PrivateListening,
     storage_digest_read::uuid_text,
     worker_entry::playback_store_for_postgres_test,
@@ -672,6 +672,14 @@ pub(crate) async fn verify_publication(
         1
     );
 
+    Box::pin(verify_playback_version(
+        &mut publication,
+        track,
+        body["sha256"].as_str().unwrap(),
+        prepared,
+        committed,
+    ))
+    .await;
     assert_eq!(
         publish(
             &mut publication,
@@ -726,6 +734,83 @@ pub(crate) async fn verify_publication(
     assert_eq!(handle(&ctx, &library).await.status, 403);
 
     track.to_owned()
+}
+
+async fn verify_playback_version(
+    db: &mut Client,
+    track: &str,
+    digest: &str,
+    prepared: PreparedUpload<'_>,
+    committed: &CommittedFlacUpload<'_, '_>,
+) {
+    let outcome = committed.outcome();
+    let pins = PublicationPins {
+        environment: prepared.scope.environment,
+        library: prepared.scope.library,
+        provider_configuration: prepared.intent.identities[4],
+        accepted_seq: db
+            .query_one(
+                "SELECT accepted_seq FROM public.ingest_jobs WHERE id = $1",
+                &[&JOB],
+            )
+            .await
+            .unwrap()
+            .get(0),
+        bucket: committed.verified().inventory().bucket(),
+        version: &outcome.media_version,
+    };
+    let (matching, _) = lookup(db, track, &pins, Some(digest))
+        .await
+        .unwrap()
+        .expect("matching version should supply playback evidence");
+    assert!(
+        matches!(matching.locator.binding(), S3Binding::VersionId(version) if version == pins.version)
+    );
+
+    // Inject a different observed version on the same object and map. Keep
+    // the committed receipt's pins fixed and roll back both fixture changes.
+    let fault = db.transaction().await.unwrap();
+    fault.batch_execute(
+        "ALTER TABLE public.storage_s3_locator_intents DISABLE TRIGGER storage_s3_locator_intent_append_only;
+         ALTER TABLE public.storage_digest_inventory_intents DISABLE TRIGGER storage_digest_inventory_intent_append_only",
+    ).await.unwrap();
+    let other_version = "different-trial-media-version";
+    assert_eq!(
+        fault
+            .execute(
+                "UPDATE public.storage_s3_locator_intents SET s3_version_id = $1
+         WHERE object_id = $2::text::uuid AND s3_version_id = $3",
+                &[&other_version, &outcome.object, &pins.version],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fault
+            .execute(
+                "UPDATE public.storage_digest_inventory_intents SET media_version = $1
+         WHERE map_id = $2::text::uuid AND media_version = $3",
+                &[&other_version, &outcome.map, &pins.version],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let (observed, row) = lookup_scoped(&fault, track, (&pins).into(), None, Some(digest))
+        .await
+        .unwrap()
+        .expect("the same track should resolve with the substituted version alone");
+    assert!(observed.target == matching.target);
+    assert_eq!(row.get::<_, i64>("accepted_seq"), pins.accepted_seq);
+    assert!(
+        matches!(observed.locator.binding(), S3Binding::VersionId(version) if version == other_version)
+    );
+    assert!(lookup(&fault, track, &pins, Some(digest))
+        .await
+        .unwrap()
+        .is_none());
+    fault.rollback().await.unwrap();
 }
 
 pub(crate) async fn verify_cleanup(
