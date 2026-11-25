@@ -26,6 +26,11 @@ function* journeySteps(steps: TestStep[]): Generator<TestStep> {
   }
 }
 
+function exactlyOne<T>([value, ...rest]: T[]): T {
+  if (value === undefined || rest.length !== 0) throw new Error();
+  return value;
+}
+
 function properties(result: TestResult, type: string, fields: Record<string, RegExp>) {
   return result.annotations.filter((annotation) => annotation.type === type).map(({ description }) => {
     if (!description || description.length > 1024) throw new Error();
@@ -54,11 +59,10 @@ export default class PrivateStagingAdmissionReporter implements Reporter {
     this.results.push({ test, result });
   }
 
-  onEnd(run: FullResult): { status: 'failed' } | void {
+  async onEnd(run: FullResult): Promise<{ status: 'failed' } | void> {
     if (run.status !== 'passed') return;
     try {
-      if (this.results.length !== 1) throw new Error();
-      const [{ test, result }] = this.results;
+      const { test, result } = exactlyOne(this.results);
       if (test.expectedStatus !== 'passed' || result.status !== 'passed' || result.retry !== 0) throw new Error();
       const steps = [...journeySteps(result.steps)];
       const trackFields = { track_id: uuid, sha256: digest, build_sha: sha, run_id: decimal, run_attempt: decimal };
@@ -68,25 +72,22 @@ export default class PrivateStagingAdmissionReporter implements Reporter {
       if (observed.length !== identities.length) throw new Error();
 
       const cases = [...identities, ...Object.keys(proofs)].map((name) => {
-        const matches = steps.filter((step) => step.title === name);
-        if (matches.length !== 1 || matches[0].error || matches[0].duration < 0 ||
-            matches[0].annotations.some(({ type }) => type === 'skip')) throw new Error();
+        const step = exactlyOne(steps.filter((step) => step.title === name));
+        if (step.error || step.duration < 0 || step.annotations.some(({ type }) => type === 'skip')) throw new Error();
         const annotations = [];
         if (identities.includes(name)) {
-          const identity = observed.filter(({ phase }) => phase === name);
-          if (identity.length !== 1) throw new Error();
-          annotations.push(property('candidate-identity', identity[0]));
+          const identity = exactlyOne(observed.filter(({ phase }) => phase === name));
+          annotations.push(property('candidate-identity', identity));
         }
         for (const proof of proofs[name as keyof typeof proofs] ?? []) {
-          const values = properties(result, proof, trackFields);
-          if (values.length !== 1) throw new Error();
-          annotations.push(property(proof, values[0]));
+          const value = exactlyOne(properties(result, proof, trackFields));
+          annotations.push(property(proof, value));
         }
         const evidence = annotations.length ? `<properties>${annotations.join('')}</properties>` : '';
         return `<testcase classname="private-music" name="${name}" retry="${result.retry}">${evidence}</testcase>`;
       });
 
-      const directory = new URL('./private-staging-results/', import.meta.url);
+      const directory = new URL('../private-staging-results/', import.meta.url);
       mkdirSync(directory, { recursive: true });
       writeFileSync(fileURLToPath(new URL('admission.xml', directory)), `<testsuite>${cases.join('')}</testsuite>\n`, { mode: 0o600 });
     } catch {

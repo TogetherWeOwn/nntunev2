@@ -4,7 +4,7 @@ import { defineConfig, devices } from '@playwright/test';
 // staging suite and offline fixtures. The output contains fixed verdicts.
 export default defineConfig({
   testDir: './private-staging',
-  reporter: [['./private-staging-admission-reporter.ts']],
+  reporter: [['./helpers/private-staging-admission-reporter.ts']],
   outputDir: 'private-staging-results',
   workers: 1,
   retries: 0,

@@ -34,7 +34,7 @@ def write(root, name, contents):
 
 
 def setup(root, env):
-    for name in ("e2e/package.json", "e2e/playwright.private-staging.config.ts", "e2e/private-staging-admission-reporter.ts",
+    for name in ("e2e/package.json", "e2e/playwright.private-staging.config.ts", "e2e/helpers/private-staging-admission-reporter.ts",
                  "ci/staging_admission.py", ".github/scripts/private_staging_evidence.py",
                  ".github/scripts/staging_api_identity.py"):
         write(root, name, (ROOT / name).read_bytes())
