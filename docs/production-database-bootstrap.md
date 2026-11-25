@@ -466,3 +466,23 @@ approved route against the recorded database OID before retrying publication.
 Require a complete saved handoff for the same branch before continuing. The
 disposable CI fixture rehearses both publication failures with local files and
 verifies reader and session removal before checking retry evidence.
+
+#### Retry when a snapshot label is already in use
+
+If a provider response says the snapshot label already exists, keep migration
+closed while you reconcile the prior attempt. Use the provider snapshot
+identifier in the private prior readback to identify that snapshot on the
+approved branch. A label alone leaves identity unresolved. Keep the existing
+snapshot and its retention in place while reconciling. Once the prior snapshot
+is verified, normalize its complete readback and run the same
+`--baseline-handoff` check.
+
+In a synthetic retry on branch `fixture001`, the prior readback identifies
+snapshot `fixture-a` and the response names the existing label
+`fixture-handoff`.
+
+| Evidence in the retry | Expected decision |
+| --- | --- |
+| The response names only the label. | Keep migration closed pending readback. |
+| The same label points to `fixture-b` on the same branch, captured before setup and completed after setup. | Keep migration closed. The readback identifies a different snapshot, and the capture predates setup. |
+| The readback identifies `fixture-a` and confirms a successful capture after setup with the reviewed timing and restore scope. | The offline check accepts the complete evidence. The separate protected release checks still apply. |
