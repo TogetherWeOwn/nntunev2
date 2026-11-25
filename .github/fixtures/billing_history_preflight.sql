@@ -28,10 +28,13 @@ GRANT SELECT (stripe_invoice_id, user_id, stripe_subscription_id, plan_id, perio
     ON public.paid_invoice_history TO invoice_preflight_fixture;
 
 INSERT INTO public.users (id, email, created_at)
-VALUES ('user_fixture', 'invoice-preflight@example.test', 1700000000);
+VALUES ('user_fixture', 'invoice-preflight@example.test', 1700000000),
+       ('user_outside_trial', 'outside-trial@example.test', 1700000000);
 INSERT INTO public.subscriptions (user_id, stripe_subscription_id, stripe_customer_id,
     stripe_subscription_item_id, stripe_price_id, plan_id, status)
-VALUES ('user_fixture', 'sub_fixture', 'cus_fixture', 'item_fixture', 'price_fixture', 'plus', 'active');
+VALUES ('user_fixture', 'sub_fixture', 'cus_fixture', 'item_fixture', 'price_fixture', 'plus', 'active'),
+       ('user_outside_trial', 'sub_outside_trial', 'cus_outside_trial', 'item_outside_trial',
+        'price_fixture', 'plus', 'active');
 
 INSERT INTO billing_preflight.scope
 SELECT 'in_fixture_' || n, 'user_fixture', 'sub_fixture', n <= 2
