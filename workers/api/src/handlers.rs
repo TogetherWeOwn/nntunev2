@@ -9453,6 +9453,8 @@ pub(crate) mod tests {
         /// and its insert. The attempt must converge onto (and, on a price
         /// mismatch, deliberately replace) the winner.
         plant_winner_on_next_create: RefCell<Option<crate::billing_reconcile::StoredCheckoutOp>>,
+        /// Binding that lands after the checkout snapshot and before its insert.
+        plant_customer_on_next_create: std::cell::Cell<Option<&'static str>>,
         /// Paid-invoice history by Stripe invoice id (idempotent on the id,
         /// mirroring `paid_invoice_history`).
         invoice_history: RefCell<HashMap<String, crate::billing_reconcile::PaidInvoiceRow>>,
@@ -12112,6 +12114,11 @@ pub(crate) mod tests {
         ) -> Result<crate::billing_reconcile::CreateOpOutcome, StoreError> {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
+            }
+            if let Some(customer) = self.plant_customer_on_next_create.take() {
+                self.billing_customers
+                    .borrow_mut()
+                    .insert(user_id.to_string(), customer.to_string());
             }
             // Race pin: land the winner between the caller's open-flight
             // read and this insert (consumed once).

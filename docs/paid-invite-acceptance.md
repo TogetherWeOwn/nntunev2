@@ -84,9 +84,10 @@ test-mode credentials, synthetic playback and the protected Actions job.
 The selectable Stripe prices are monthly. Hosted fixtures rehearse a fresh
 customer created with the selected test clock before Checkout, with paid
 dispatch off. The rehearsal refuses an existing binding, an unrelated
-customer and a live or mismatched clock response. It follows the selected
-Checkout Session and subscription through synthetic renewal and rehearses
-closing readback before clock retirement.
+customer and a live or mismatched clock response. The API fixture follows
+the selected Checkout Session and subscription from signed Checkout through
+synthetic renewal. The loopback runner fixture rehearses closing readback
+before clock retirement.
 
 The browser Checkout path does not supply a test clock. Before arming the
 protected trial, still verify in the approved Stripe test account that a

@@ -56,6 +56,67 @@ fn clock_checkout_refuses_existing_and_unverified_customers() {
 }
 
 #[test]
+fn clock_checkout_does_not_inherit_an_unbound_flight() {
+    for wins_during_insert in [false, true] {
+        let h = stripe_harness();
+        seed_billing_user(&h, "u1");
+        let winner = crate::billing_reconcile::StoredCheckoutOp {
+            id: "op_winner".into(),
+            user_id: "u1".into(),
+            state: "submitted".into(),
+            price_id: Some(PRICE_PLUS.into()),
+            session_id: Some("cs_test_winner".into()),
+            subscription_id: None,
+            replayable: true,
+        };
+        h.stripe.sessions.borrow_mut().insert(
+            "cs_test_winner".into(),
+            test_session(
+                "cs_test_winner",
+                "open",
+                "unpaid",
+                None,
+                None,
+                Some("op_winner"),
+            ),
+        );
+        if wins_during_insert {
+            h.store
+                .plant_winner_on_next_create
+                .replace(Some(winner.clone()));
+        } else {
+            h.store
+                .checkout_ops
+                .borrow_mut()
+                .insert(winner.id.clone(), winner.clone());
+        }
+
+        assert_eq!(clock_checkout(&h), Err(EnsureCheckoutError::Unavailable));
+        assert_eq!(h.store.checkout_ops.borrow()["op_winner"], winner);
+        assert!(h.store.billing_customers.borrow().is_empty());
+        assert_eq!(
+            h.stripe.customers_created.borrow().len(),
+            usize::from(wins_during_insert)
+        );
+        assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+        assert!(h.stripe.expired.borrow().is_empty());
+    }
+}
+
+#[test]
+fn clock_checkout_does_not_use_a_binding_that_lands_before_insert() {
+    let h = stripe_harness();
+    seed_billing_user(&h, "u1");
+    h.store
+        .plant_customer_on_next_create
+        .set(Some("cus_unclocked"));
+    assert_eq!(clock_checkout(&h), Err(EnsureCheckoutError::Unavailable));
+    assert_eq!(h.store.billing_customers.borrow()["u1"], "cus_unclocked");
+    assert_eq!(h.stripe.customers_created.borrow().len(), 1);
+    assert_eq!(*h.stripe.sessions_created.borrow(), 0);
+}
+
+#[test]
 fn clock_checkout_reconciles_the_selected_monthly_subscription() {
     let h = stripe_harness();
     seed_billing_user(&h, "u1");
