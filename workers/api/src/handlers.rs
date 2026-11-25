@@ -14221,6 +14221,34 @@ pub(crate) mod tests {
         let refusal = decode(play_at(cutoff as u64, &cookie, &play), 402);
         assert_eq!(refusal["code"], "subscription_required");
         assert_eq!(refusal["reason"], "lapsed");
+
+        // Stripe reaches the scheduled end. The hourly pass reads the
+        // terminal subscription while its paid invoices are still available.
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .get_mut(subscription_id)
+            .unwrap()
+            .status = "canceled".into();
+        sweep.now = cutoff as u64;
+        block_on(reconcile_paid_targets(
+            &sweep,
+            vec![(&user, Some(subscription_id))],
+        ))
+        .unwrap();
+        assert!(live_for(&h, &user).is_none());
+        let retained = block_on(h.store.load_reconcile_input(&user, Some(subscription_id)))
+            .unwrap()
+            .live
+            .expect("canceled subscription retained");
+        assert_eq!(retained.status, "canceled");
+        assert_eq!(retained.stripe_customer_id, customer);
+        assert_eq!(retained.paid_through_unix, Some(cutoff));
+        assert_eq!(retained.paid_invoice_id.as_deref(), Some("in_test_3"));
+        assert_eq!(retained.grace_until_unix, None);
+        assert_eq!(*h.store.invoice_history.borrow(), history);
+        assert_eq!(subscription(sweep.now, &cookie)["state"], "lapsed");
+        assert!(h.stripe.canceled.borrow().is_empty());
     }
 
     #[test]
