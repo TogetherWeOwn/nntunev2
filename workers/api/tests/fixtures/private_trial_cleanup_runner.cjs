@@ -140,10 +140,22 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
         CLEANUP_APPROVAL: approved(preflightScope), CLEANUP_S3: preflightS3,
       }],
     ];
-    for (const [label, selection, overrides] of continuationControls) {
+    const expectContinuationRefused = async (label, selection, overrides) => {
       assert.equal(await run(selection, overrides), 'refused', label);
       assert.deepEqual(calls, partial, label);
       assert.equal(state(), 't|0|0|1', label);
+    };
+    for (const [label, selection, overrides] of continuationControls) {
+      await expectContinuationRefused(label, selection, overrides);
+    }
+    // Use matching approval pins to exercise the independent database check.
+    for (const [label, selection] of [
+      ['unrecorded upload session', { ...scope, session: id('a') }],
+      ['unrecorded upload job', { ...scope, job: 'other-attempt' }],
+      ['unrecorded track', wrongFixture],
+      ['unrecorded page version', wrongVersion],
+    ]) {
+      await expectContinuationRefused(label, selection, { CLEANUP_APPROVAL: approved(selection) });
     }
 
     interrupt = false;
