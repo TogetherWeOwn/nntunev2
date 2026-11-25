@@ -334,6 +334,20 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
                                       "PRIVATE_MUSIC_STAGING_JOURNEY": "false"}, label="private staging preflight disarmed")
         check(off.returncode == 0 and output.read_text() == "browser_playback=0\nprivate_trial_upload=0\n",
               "disarmed settings enabled the browser build")
+        upload_env = {
+            **trial_env, "PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true",
+            "HYPERDRIVE_ID_MB": summary_env["HYPERDRIVE_ID_MB"],
+            **{f"PRIVATE_TRIAL_{name}_DB_STAGING_ID": str(i) * 32
+               for i, name in enumerate(("UPLOAD", "AUTH", "PUBLISH", "ENROLL"), 1)},
+        }
+        output.write_text("")
+        upload = run(args, cwd=tree, env=upload_env, label="armed private trial upload preflight")
+        check(upload.returncode == 0 and output.read_text() == "browser_playback=1\nprivate_trial_upload=1\n",
+              "complete settings did not arm the upload build")
+        output.write_text("")
+        duplicate = run(args, cwd=tree, env={**upload_env, "PRIVATE_TRIAL_AUTH_DB_STAGING_ID": "1" * 32},
+                        label="private trial upload preflight refuses duplicate connection")
+        check(duplicate.returncode != 0 and not output.read_text(), "trial preflight accepted duplicate connection")
         for key, value in (
             ("API_RP_ORIGIN_STAGING", ""),
             ("HYPERDRIVE_ID_STAGING", "invalid"),

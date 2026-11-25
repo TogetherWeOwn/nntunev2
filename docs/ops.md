@@ -1167,7 +1167,8 @@ events are inconclusive. Verify the canceled play's committed settlement
 against the writer-acknowledged prefix independently. Clear the observation
 variable before the disable deploy.
 Retain the version ID, deployment ID, `BUILD_SHA` and playback mode from
-the Stream job summary alongside the browser run. To restore the default,
+the Stream job summary alongside the browser run. To restore the default, clear
+`PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED` in the protected staging Environment and
 keep `STREAM_STAGING_DEPLOY_ENABLED=true` for the next protected deploy.
 Remove `PRIVATE_PLAYBACK_STAGING_ENABLED` and follow the [private journey
 cleanup](../e2e/README.md#private-music-journey-preparation). After the
@@ -1175,8 +1176,8 @@ Stream receipt confirms `private_playback_enabled=false`, unset
 `STREAM_STAGING_DEPLOY_ENABLED`.
 
 If Wrangler uploads Stream but the version readback fails, treat the
-previous mode as unknown. Clear both private arms and use the same protected
-disable deploy before retrying qualification with a fresh invite. A failed
+previous mode as unknown. Clear the upload, playback and private journey arms
+and use the same protected disable deploy before retrying with a fresh invite. A failed
 readback gives no serving evidence.
 
 ### Gate incident reporting
