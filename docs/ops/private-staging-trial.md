@@ -9,6 +9,9 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 
 ## Setup and trial
 
+If dedicated PostgreSQL provisioning stops partway through, use the
+[Stage C recovery handoff](private-staging-trial-recovery.md) before retrying.
+
 1. **Prepare the isolated database.** Run the [catalog preflight](#isolated-database-catalog-preflight)
    before preparing ACLs or issuing either login. If the isolated branch has
    ambient database grants, qualify the [database ACL preparation](#isolated-database-acl-preparation)
