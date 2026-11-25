@@ -11,11 +11,11 @@ name: deploy
 #   still deploying.
 # - Deploy jobs bind the protected `staging` GitHub Environment, so
 #   push-to-main deployment records land only in `staging`. The deploy
-#   credentials remain repository-scoped. Store the dedicated Workers
-#   read token and database observer URL only in `staging`; this workflow
-#   passes them only to the `staging-api` Subsonic readback step, never to
-#   Wrangler or other deploy steps. Production records land only in
-#   `production` via deploy-production.yml.
+#   credentials remain repository-scoped. Store the Workers read token and
+#   database observer URL only in `staging`. Subsonic readback uses both.
+#   The private journey's two deployment observations use the read token.
+#   These credentials are scoped to the observation steps. Production
+#   records land only in `production` via deploy-production.yml.
 # - Push deploys need the repo Actions secrets CLOUDFLARE_API_TOKEN and
 #   CLOUDFLARE_ACCOUNT_ID (names only; the full account ID stays private).
 #   When the token is absent, the jobs skip via the `gate` job below

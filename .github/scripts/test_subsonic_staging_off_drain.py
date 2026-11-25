@@ -184,8 +184,33 @@ class ReadbackTests(unittest.TestCase):
         step, suffix = readback.split(
             "      - name: Record Subsonic staging readback outcome\n", 1
         )
-        for secret in (READ_TOKEN, OBSERVER):
-            self.assertNotIn(secret, prefix + deploy + suffix)
+        self.assertNotIn(OBSERVER, prefix + deploy + suffix)
+        other_jobs, private = suffix.split("\n  post-deploy-private-music:\n", 1)
+        self.assertNotIn(READ_TOKEN, prefix + deploy + other_jobs)
+        private_guard, private_steps = private.split("\n    steps:\n", 1)
+        self.assertIn("environment:\n      name: staging\n", private_guard + "\n")
+        self.assertIn("github.event_name == 'push' && vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true'", private_guard)
+        self.assertNotIn(READ_TOKEN, private_guard)
+        private_preflight, _ = private_steps.split("      - name: Observe opening private staging deployments\n", 1)
+        for check in (
+            'test "$GITHUB_REPOSITORY" = TogetherWeOwn/nntunev2',
+            'test "$GITHUB_REF" = refs/heads/main',
+            'test "$GITHUB_REF_PROTECTED" = true',
+            'test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"',
+        ):
+            self.assertIn(check, private_preflight)
+        for boundary, phase in (("opening", "build-identity"), ("closing", "build-identity-final")):
+            observation = (
+                f"      - name: Observe {boundary} private staging deployments\n"
+                "        env:\n"
+                "          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}\n"
+                f"          {READ_TOKEN}: ${{{{ secrets.{READ_TOKEN} }}}}\n"
+                "        run: timeout -k 2s 30s python3 -I .github/scripts/private_staging_evidence.py observe"
+                f' > "$RUNNER_TEMP/{phase}.json"\n'
+            )
+            self.assertEqual(private_steps.count(observation), 1)
+            private_steps = private_steps.replace(observation, "")
+        self.assertNotIn(READ_TOKEN, private_steps)
         self.assertIn("environment:\n      name: staging\n", deploy)
         self.assertIn("id: deployment\n", deploy)
         self.assertEqual(
