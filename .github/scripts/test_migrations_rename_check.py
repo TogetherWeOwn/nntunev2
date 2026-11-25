@@ -783,6 +783,52 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(set(pages[0][0]) - {"patch"}, set(projected[0][0]))
         self.assertNotIn("body", json.loads(history.read_input(self.workflow_api / "pr-metadata.json")))
 
+    def test_workflow_dependabot_opened_and_body_edited_both_verify_the_same_head(self):
+        pages, metadata = self.workflow_inputs()
+        opened = self.event(metadata)
+        opened.update(action="opened", sender={"login": "dependabot[bot]", "type": "Bot"})
+        opened["pull_request"]["body"] = "Initial update description"
+        edited = copy.deepcopy(opened)
+        edited.update(action="edited", changes={"body": {"from": opened["pull_request"]["body"]}})
+        edited["pull_request"]["body"] = "Update description with evidence"
+        expected = []
+        for event in (opened, edited):
+            with self.subTest(action=event["action"]):
+                result = self.run_workflow(pages, metadata, event=event,
+                                           samples=[opened["pull_request"], edited["pull_request"]])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                snapshot = json.loads((self.workflow_api / "pr-metadata.json").read_text())
+                self.assertEqual(snapshot["attempt"], 1)
+                self.assertEqual(snapshot["before"], snapshot["after"])
+                expected.append(snapshot["event"])
+                outcomes = json.loads((self.workflow_api / "pr-validation.json").read_text())
+                self.assertEqual(outcomes["event"]["outcome"], "verified")
+                self.assertEqual(outcomes["effective"]["outcome"], "verified")
+        self.assertEqual(expected[0], expected[1])
+
+        invalid = copy.deepcopy(pages)
+        invalid[0][1] = {"filename": "docs/substitute.md", "status": "added"}
+        result = self.run_workflow(invalid, metadata, event=edited)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("API migration coverage differs", result.stderr)
+
+    def test_workflow_retarget_checks_the_new_base_ref_even_at_the_same_commit(self):
+        pages, metadata = self.workflow_inputs()
+        original = self.full_metadata(metadata)
+        retargeted = copy.deepcopy(original)
+        retargeted["base"]["ref"] = "release"
+        event = self.event(retargeted)
+        event.update(action="edited", changes={"base": {"ref": {"from": "main"}}})
+
+        result = self.run_workflow(pages, retargeted, event=event)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        snapshot = json.loads((self.workflow_api / "pr-metadata.json").read_text())
+        self.assertEqual(snapshot["before"]["base"]["ref"], "release")
+
+        result = self.run_workflow(pages, retargeted, event=event, samples=[retargeted, original])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("API base repository/ref retargeted", result.stderr)
+
     def test_workflow_projection_keeps_fail_closed_coverage_checks(self):
         pages, metadata = self.workflow_inputs()
         for mutation, diagnostic in (("truncated", "truncated or duplicated"),

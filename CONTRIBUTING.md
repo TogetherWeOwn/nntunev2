@@ -96,6 +96,21 @@ identity, migration and rollback evidence, and review and merge gates. Follow
 [the staging promotion checklist](docs/ops.md#staging-promotion-checklist)
 for release evidence. Explicitly state what was not run.
 
+Post newly available CI results and independent reviews in the PR conversation.
+Run `python3 scripts/post_pr_evidence.py PR_NUMBER HEAD_SHA --job success 'JOB_URL' TESTED_SHA`
+with the verified conclusion, full GitHub Actions job URL and actual commit
+the run tested. Use the synthetic merge SHA when the run tested a PR merge.
+Repeat `--job` for each result. Use `--general-review-cleared` or
+`--security-review-cleared` to record a later review decision on its own.
+The helper checks the current PR head and writes both run and job links to
+a SHA-labeled comment. It accepts same-repository job URLs, including the
+numeric `?pr=` suffix copied from the PR Checks tab.
+Before merging, open the linked runs, verify the current head and base, and
+confirm the required checks and the reviewers' decisions at their sources.
+GitHub reports body edits and base retargets as the same `edited` activity.
+Posting evidence as a comment avoids starting another `migrations-staging` run.
+Edit the PR body when its description or Attestation needs a substantive correction.
+
 ### Changed-lines mutation gate
 
 `changed-lines-mutation` checks new single-line boundaries in `scripts/account_export.py`

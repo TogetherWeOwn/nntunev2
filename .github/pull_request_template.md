@@ -8,7 +8,11 @@
 
 ## How tested
 
-- [ ] `ci-ok` green
+<!-- Describe the test plan and observations available when authoring this PR.
+Post later exact-head CI results and independent reviews in the PR conversation
+using scripts/post_pr_evidence.py (see CONTRIBUTING.md). Update Attestation when
+its claims, test mappings or risk change. -->
+
 - [ ] ≤ ~400 counted lines, or a split plan / `Size justification:` line
   (see `CONTRIBUTING.md`)
 - [ ] Manual / staging notes (if applicable):
