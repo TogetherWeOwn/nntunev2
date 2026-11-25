@@ -93,8 +93,9 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 The hosted [`e2e-lint` job](../../.github/workflows/ci.yml) runs the offline
 test **private staging reporter and receipt wiring with disposable evidence**.
 For a [focused reproduction of that test's failure](../../CONTRIBUTING.md#focused-reproduction-only),
-run from the repository root with the pinned `e2e` dependencies installed
-and Bash, Git, `jq`, Node and Python 3 on `PATH`:
+run from the repository root with the pinned `e2e` dependencies installed.
+Keep Bash and Git on `PATH` and match the hosted tool versions for the
+reproduction. The job uses Node 26, Python 3.13 and `jq` 1.8.2.
 
 ```sh
 python3 -B -I e2e/fixtures/private-music/test_admission_wiring.py "$(command -v node)"
