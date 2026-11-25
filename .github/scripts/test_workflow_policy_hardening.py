@@ -217,6 +217,24 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
             self.assertNotIn("staging_trial_schema", (WORKFLOWS / name).read_text())
             self.assertNotIn("migrations-staging-apply.yml", (WORKFLOWS / name).read_text())
 
+    def test_isolated_trial_setup_uses_protected_dispatch_and_dedicated_credentials(self):
+        name = "staging-trial-isolated-setup.yml"
+        text = (WORKFLOWS / name).read_text()
+        triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)
+        self.assertEqual(re.findall(r"^  (\w+):", triggers, re.M), ["workflow_dispatch"])
+        self.assertIn("default: check", triggers)
+        self.assertIn("group: migrations-staging-apply", text)
+        setup = job(text, "setup")
+        self.assertIn("github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha", setup)
+        self.assertIn("    environment:\n      name: staging\n      deployment: false\n", setup)
+        self.assertIn('"$REVIEWED_REF" == "$GITHUB_SHA"', setup)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"', setup)
+        self.assertIn("persist-credentials: false", setup)
+        self.assertIn('staging_trial_role_lifecycle.py "$OPERATION" --isolated', setup)
+        self.assertEqual(set(re.findall(r"secrets\.(\w+)", setup)),
+                         {f"ISOLATED_TRIAL_{key}" for key in
+                          ("TARGET", "ROLE_SCOPE", "OWNER_URL", "EXECUTOR_URL", "READER_URL", "WRITER_URL")})
+
     def test_staging_readback_is_observation_only(self):
         text = (WORKFLOWS / "migrations-staging-readback.yml").read_text()
         triggers = re.search(r"^on:\n(.*?)(?=^\S)", text, re.M | re.S).group(1)

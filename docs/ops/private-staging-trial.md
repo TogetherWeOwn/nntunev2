@@ -9,45 +9,45 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 
 ## Setup and trial
 
-1. **Issue the scoped pair (77f).** The Chief of Staff owns the secure handoff of
-   the temporary staging setup login. 77f uses the authorized issuer and pins
-   the staging catalog plus the canonical reader and publication-writer names
-   and OIDs. The authorized staging database owner provides direct staging
-   `CONNECT` at issuance, with `public` schema `USAGE` from the authorized
-   schema executor and the intended membership shape. Read back both logins
-   at that baseline. Stop if the issuer cannot establish it before application
-   grants, or if either identity, the target or retirement authority is
-   unverified. Before issuing, confirm the grant, verification and withdrawal
-   path against the landed instructions from
-   [#1828](https://github.com/TogetherWeOwn/nntunev2/pull/1828). Follow the
-   Operator's secure handoff for the temporary login's retirement.
-2. **Preflight before application grants (77f).** Supply the pinned scope as
-   `PRIVATE_TRIAL_ROLE_PREFLIGHT_SCOPE` in staging and dispatch
-   [`staging-trial-role-preflight`](../../.github/workflows/staging-trial-role-preflight.yml)
-   from protected `main`. Require every summary verdict to pass against the
-   recorded 0063 baseline, including database isolation, membership and absence
-   of application privileges. Stop on a refusal, skipped job or missing verdict.
-   Clear the Environment secret after readback and retain the original scope
-   securely for retries and retirement. See
-   [#1814](https://github.com/TogetherWeOwn/nntunev2/pull/1814).
-3. **Grant and verify base rights (77f), then apply the overlay (77c).** After
-   preflight passes, use the landed lifecycle's `grant` and `verify` actions
-   for exact base rights and both routed identities. Require the publication
-   writer's five column-scoped row-lock grants and enabled update guards, and
-   confirm the reader has no update access. Stop on ACL or identity drift.
-   77c sets `PRIVATE_TRIAL_SCHEMA_WRITER_ROLE` and
-   `PRIVATE_TRIAL_SCHEMA_READER_ROLE` in staging for that pair. Dispatch
-   [`migrations-staging-apply`](../../.github/workflows/migrations-staging-apply.yml)
-   from protected `main` with `file=private-trial`, `mode=single`, the full
-   reviewed `ref`, `applied_by` and the recorded exact-DDL approval in
-   `board_approval`. Require a successful job, its bundle digest and matching
-   admission-table receipt. 77f uses `verify-overlay` to check the effective
-   ACLs for both routed roles before 77c binds them. See the
-   [schema and lock instructions](../ops.md#private-trial-schema),
-   [#1800](https://github.com/TogetherWeOwn/nntunev2/pull/1800) and
-   [#1817](https://github.com/TogetherWeOwn/nntunev2/pull/1817).
-4. **Verify staging bindings and cleanup access (77c).** Check the candidate's
-   mounted upload caller and actual staging identities for all four dedicated,
+1. **Prepare the isolated database.** The setup operator reads back the separate branch's
+   `nntunev2_staging` database OID, canonical `postgres` owner, migration 0063
+   checksum, and both direct and routed addresses. Arrange authorized owner
+   and executor connections for that branch and issue the two dedicated SQL
+   logins through its authorized issuer. Use the [role names and membership
+   rules](../ops.md#private-trial-schema) from the existing lifecycle. The owner
+   needs authority to grant CONNECT, fence, drain and retire the pair. Before
+   dispatch, confirm the executor owns the five lock tables and can install
+   the overlay and grants. The `public` schema owner must authorize `CREATE`
+   and grant `USAGE WITH GRANT OPTION` to the executor. The executor needs
+   grantable column access, `REFERENCES` for the overlay's foreign keys, and
+   grantable `EXECUTE` on both reviewed 0052 routines and `EXECUTE` on
+   `storage_object_intent_append_only()` to install the locator trigger. Confirm
+   both logins lack access to other connectable databases. Retain the original
+   protected scope for withdrawal.
+2. **Check protected inputs.** Store the existing role-scope JSON in
+   staging as `ISOLATED_TRIAL_ROLE_SCOPE`. Set `ISOLATED_TRIAL_TARGET` to a
+   reviewed JSON object with `database_oid` and `executor_oid` (numbers),
+   `direct` and `routed` (exact DNS hostnames), `direct_port` and `routed_port`
+   (numbers), and `owner`, `executor`, `reader`, `writer` (exact connection
+   usernames including any provider suffix). Set the four protected
+   `ISOLATED_TRIAL_{OWNER,EXECUTOR,READER,WRITER}_URL` secrets. Dispatch
+   [`staging-trial-isolated-setup`](../../.github/workflows/staging-trial-isolated-setup.yml)
+   with `check` from protected `main`, the full reviewed `ref` at its tip, and
+   the recorded `board_approval` reference. Require both authority verdicts
+   to pass. The workflow uses only isolated inputs and refuses the shared
+   catalog pin. Keep the shared staging URLs, roles and routing in service.
+3. **Grant and verify access.** Dispatch `grant`, then `verify-overlay`
+   with the reviewed ref and approval. Require the exact overlay ACL verdict
+   and separate reader and writer verdicts through the provider's routed
+   endpoint. After the owner grants CONNECT, the executor installs the base
+   grants, guards and overlay in one transaction. If routing fails, keep the
+   trial disarmed and correct the dedicated connection or fence and retire.
+   Hand the verified pair to the trial operator through protected custody.
+4. **Verify isolated serving and cleanup access.** Keep the trial disarmed
+   until a separately reviewed serving lane proves that the exact build's
+   account, invite, session, publication, Library, playback and cleanup
+   connections all reach the same pinned isolated database.
+   Check the mounted upload caller and actual identities for all four dedicated,
    uncached Hyperdrive bindings (`UPLOAD`, `AUTH`, `PUBLISH`, `ENROLL`). Use the
    scoped role assigned to each binding by the reviewed caller. Verify the
    staging MusicBrainz binding, API–Stream service bindings, dedicated fixture
@@ -69,7 +69,7 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    companion. Set `PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION` for the prepublished
    tone B track before the armed push so Stream reads the selector at deploy
    time. Arm upload, playback and the private journey on the same protected
-   `main` push with Stream deployment enabled. Require successful API, Stream
+   isolated build with Stream enabled. Require successful API, Stream
    and Web deploy readbacks for that run and commit, plus matching `/api/build`
    and `/healthz` before and after playback. Require tone A's upload receipt to
    match the pinned digest and a fresh canonical track visible after Library
@@ -91,9 +91,9 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    After the cutoff checks, revoke the stepped-up owner session. Clear
    `PRIVATE_MUSIC_STAGING_JOURNEY`, `PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION`,
    the single-use fixture and cohort settings, then follow the
-   [disable deploy](../ops.md#private-stream-staging). Cancel queued or running
-   armed deploys and use a fresh protected `main` push so the gate reads the
-   cleared settings. Require a deployed API and a Stream receipt showing
+   isolated lane's disable deploy procedure. Cancel queued or running armed
+   deploys and use a fresh protected build so the gate reads the cleared
+   settings. Require a deployed API and a Stream receipt showing
    `private_playback_enabled=false` before removing the Stream deployment arm
    and trial runtime bindings.
    Keep the selected pins and authorized cleanup access until cleanup finishes.
@@ -106,16 +106,16 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    For a partial delete or unconfirmed cleanup commit, resume using the same
    pins and confirm both versions, including any version already absent.
    Handle tone B and its admission through the separate fixture disposition.
-2. **Withdraw access (77f with 77c and the schema owner).** Once trial bindings
-   are removed, clear both overlay role variables. Using the original pinned
-   scope, fence and drain the two logins, withdraw their overlay grants with
-   the schema owner, then withdraw the base grants and retire the roles via
-   [#1828](https://github.com/TogetherWeOwn/nntunev2/pull/1828). Require the
-   writer's lock-only UPDATE access gone before guard removal, and both pinned
-   names, OIDs and sessions absent before closing. Remove retired credentials
-   from custody. If reversal refuses because of residual privileges, keep the
-   logins fenced and have the grant owner reconcile the exact access before
-   resuming withdrawal.
+2. **Withdraw access.** Once the trial operator removes the bindings, dispatch
+   `fence` and `retire` using the original scope and the reviewed isolated
+   workflow. Require reports that both logins are fenced and drained, their
+   overlay and base grants and lock guards are withdrawn, and their names and
+   OIDs are absent. Retirement accepts an earlier overlay bundle digest when
+   the receipt, pinned role OIDs, executor ownership and ACLs pass. The overlay
+   and its receipt remain for data reconciliation. Remove retired credentials
+   from custody and withdraw any temporary executor grants through their original
+   grantor. If withdrawal refuses, reconcile with the grant owner while both
+   logins stay fenced.
 
 ### Protected cleanup dispatch
 
@@ -164,12 +164,8 @@ until cleanup is confirmed, then clear the cleanup settings in custody and
 withdraw its scoped access.
 
 After an interruption, reconcile the last run and actual staging state before
-retrying. For a partial role setup, 77f compares the pinned identities and
-effective grants with the landed lifecycle contract and resumes only a supported
-step. The baseline preflight applies before application grants. For an
-unconfirmed overlay apply, 77c checks the receipt and ACLs, then retries with the
-same reviewed bytes and role pair if they match, or if the overlay is absent.
-The overlay treats an identical install as a no-op. A conflicting receipt or
+retrying. A grant retry requires the same reviewed overlay bytes and role OIDs.
+An identical install reuses the existing overlay. A conflicting receipt or
 replacement role goes to the schema owner before reapply. If a deploy or trial
 fails, verify the disabled state and reconcile the upload state, publication and
 storage pins before starting a fresh invite and attempt. Treat an unknown upload
