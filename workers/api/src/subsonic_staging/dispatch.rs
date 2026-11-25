@@ -35,6 +35,8 @@ pub struct StagingDispatch {
     pub now_millis: i64,
     pub order_work: OrderWork,
     pub construction_headroom: Option<usize>,
+    #[cfg(feature = "staging-body-wasm-test")]
+    pub retain_document_permit: bool,
 }
 
 impl StagingDispatch {
@@ -155,9 +157,19 @@ where
     let Some(catalogue) = authorize_catalogue(&principal) else {
         return scope.protocol_failure(code::NOT_AUTHORIZED, "Not authorized for staging.");
     };
+    #[cfg(feature = "staging-body-wasm-test")]
+    let retain_document_permit = context.retain_document_permit;
     let document = scope
         .dispatch_document(&mut app, &principal, catalogue, name, context)
         .await;
+    #[cfg(feature = "staging-body-wasm-test")]
+    if retain_document_permit {
+        return crate::subsonic_staging_response::finish_streamed_document(
+            document,
+            &mut scope.input.budget,
+            scope._permit,
+        );
+    }
     finish_document(document.map(Some))
 }
 
@@ -296,12 +308,15 @@ mod wasm_test {
         open_app: js_sys::Function,
         allowed: bool,
         fixture_id: Option<String>,
+        retain_document_permit: Option<bool>,
+        construction_headroom: Option<u32>,
     ) -> Result<web_sys::Response, JsValue> {
         type NoMirror = fn() -> std::future::Ready<Result<PgClient, StagingRejection>>;
         let context = StagingDispatch {
             now_millis: 0,
             order_work: StagingDispatch::FIXTURE_ORDER_WORK,
-            construction_headroom: None,
+            construction_headroom: construction_headroom.map(|bytes| bytes as usize),
+            retain_document_permit: retain_document_permit.unwrap_or(false),
         };
         let fixture = SyntheticCatalogue::from_trusted_id(fixture_id.as_deref().unwrap_or("empty"))
             .ok_or(JsValue::NULL)?;

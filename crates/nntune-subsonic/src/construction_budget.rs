@@ -67,10 +67,18 @@ impl ConstructionBudget {
             .and_then(|bytes| bytes.checked_add(7))
             .map(|bytes| (bytes & !7).max(16))
             .and_then(|bytes| bytes.checked_add(8))
-            .and_then(|bytes| self.charged.checked_add(bytes))
+            .ok_or(BudgetExceeded)?;
+        self.charge_payload_bytes(bytes)
+    }
+
+    /// Debit a known payload size, for example the bytes copied into a JS
+    /// typed array. The caller accounts separately for runtime overhead.
+    pub fn charge_payload_bytes(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
+        self.charged = self
+            .charged
+            .checked_add(bytes)
             .filter(|total| *total <= self.limit)
             .ok_or(BudgetExceeded)?;
-        self.charged = bytes;
         Ok(())
     }
 }
@@ -78,6 +86,19 @@ impl ConstructionBudget {
 #[cfg(any(test, feature = "ledger-wasm-test"))]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn payload_bytes_share_the_construction_limit() {
+        let mut budget = ConstructionBudget::new(29);
+        budget.allocate_exact::<u8>(1).unwrap();
+        assert_eq!(budget.charged(), 24);
+        assert_eq!(budget.charge_payload_bytes(6), Err(BudgetExceeded));
+        assert_eq!(budget.charged(), 24);
+        assert_eq!(budget.charge_payload_bytes(5), Ok(()));
+        assert_eq!(budget.charged(), 29);
+        assert_eq!(budget.charge_payload_bytes(usize::MAX), Err(BudgetExceeded));
+        assert_eq!(budget.charged(), 29);
+    }
 
     #[cfg_attr(test, test)]
     pub fn exact_vector_reservation_checks_limit_and_overflow() {

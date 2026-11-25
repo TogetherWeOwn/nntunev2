@@ -143,6 +143,45 @@ const artist = 'getArtist?id=00000000-0000-4000-8000-000000000001';
 const fixtureResponse = (id, route) => dispatch(request(route), () => true, true, id);
 const suffixes = ['below', 'exact', 'over'];
 
+test('streamed fixture keeps the construction slot through EOF and cancellation', { timeout: 10000 }, async () => {
+  const open = (id, route) => dispatch(request(route), () => true, true, id, true);
+  const busy = () => dispatch(request('getArtists?f=json'), neverOpen);
+  const route = `${album}&f=json`;
+  const expected = await (await fixtureResponse('output-json-exact', route)).text();
+  const response = await open('output-json-exact', route);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /^application\/json/);
+  assert.equal(response.headers.get('cache-control'), 'private, no-store');
+  const reader = response.body.getReader();
+  await refusal(await busy(), 503, '1');
+  const chunk = await reader.read();
+  assert.equal(chunk.done, false);
+  assert.equal(chunk.value.byteLength, 262144);
+  assert.equal(new TextDecoder().decode(chunk.value), expected);
+  await refusal(await busy(), 503, '1');
+  assert.equal((await reader.read()).done, true);
+
+  const unread = await open('small', 'getArtists?f=json');
+  assert.equal(unread.status, 200);
+  await refusal(await busy(), 503, '1');
+  await unread.body.cancel();
+  const next = await open('small', 'getArtists?f=json');
+  assert.equal(next.status, 200);
+  assert.equal(Buffer.byteLength(await next.text()), 296);
+
+  await refusal(await open('output-json-over', route), 413);
+  assert.equal((await fixtureResponse('small', 'getArtists?f=json')).status, 200);
+});
+
+test('streamed fixture charges the transferable payload on the carried ledger', async () => {
+  const render = (headroom) => dispatch(request('getArtists?f=json'), () => true, true, 'small', true, headroom);
+  // Existing 4024-byte construction charge plus one 296-byte typed-array payload.
+  await refusal(await render(4319), 503, '1');
+  const response = await render(4320);
+  assert.equal(response.status, 200);
+  assert.equal(Buffer.byteLength(await response.text()), 296);
+});
+
 test('row, field and aggregate text presets reach the application boundary', async () => {
   for (const [kind, route, lengths] of [
     ['rows', `${artist}&f=json`, [492, 492]],
