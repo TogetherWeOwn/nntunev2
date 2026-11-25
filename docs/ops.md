@@ -464,7 +464,8 @@ its effective role owns all five tables and has USAGE and CREATE on `public`.
 Use the same executor for withdrawal. In the verified session set
 `nntune.private_trial_writer_oid` to that numeric
 OID and `nntune.private_trial_lock_action` to `grant`, then run the script
-with psql `ON_ERROR_STOP`. The transaction binds the five `UPDATE (id)`
+with psql `ON_ERROR_STOP`. The transaction takes bounded exclusive table
+locks before checking the ACLs. It binds the five `UPDATE (id)`
 grants to statement triggers that reject the writer's updates, including
 when using `SET ROLE`. Read back the writer's effective update privileges
 and the enabled guards on `users`, `sessions`, `invite_codes`, `ingest_jobs`
@@ -480,6 +481,9 @@ route, fence both exact logins and drain their sessions. If the publication
 lock contract was applied, run it with the same pinned writer OID and
 `nntune.private_trial_lock_action` set to `revoke` before retiring the role.
 The transaction verifies that UPDATE access is gone before dropping the guards.
+If residual UPDATE access causes a refusal, keep both logins fenced. Identify
+and remove the separate grant supplying that access through the authorized
+route, then retry `revoke` with the guards still installed.
 Revoke the remaining scoped grants and verify role and session absence after
 retiring them. Reconcile any dependent overlay receipt with the schema owner
 before issuing a replacement pair. A fresh role alone cannot reuse a

@@ -1,6 +1,6 @@
 -- Opt-in staging contract. See docs/ops.md for the required catalog pin,
 -- isolated writer OID, session inputs and withdrawal order.
-BEGIN;
+BEGIN ISOLATION LEVEL READ COMMITTED;
 SET LOCAL search_path = pg_catalog;
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '30s';
@@ -16,6 +16,11 @@ BEGIN
         RAISE EXCEPTION 'private trial lock target or action refused';
     END IF;
     SELECT rolname INTO STRICT writer_name FROM pg_roles WHERE oid = writer_oid;
+
+    -- Column GRANT and REVOKE take ACCESS SHARE. Hold a conflicting lock
+    -- across each ACL check and the corresponding trigger and grant changes.
+    LOCK TABLE public.users, public.sessions, public.invite_codes, public.ingest_jobs,
+        public.tracks IN ACCESS EXCLUSIVE MODE;
 
     IF action = 'grant' THEN
         IF NOT EXISTS (SELECT FROM pg_roles WHERE oid = writer_oid AND rolcanlogin

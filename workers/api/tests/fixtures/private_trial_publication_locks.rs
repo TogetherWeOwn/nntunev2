@@ -1,6 +1,9 @@
 use super::*;
 use tokio_postgres::{error::SqlState, Transaction};
 
+#[path = "../support/blocker_observer.rs"]
+mod blocker_observer;
+
 const LOCK_DB: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntunev2_staging";
 const CONTRACT: &str = include_str!("../../../../scripts/private_trial_publication_locks.sql");
 const OWNER_LOCK: &str = include_str!("../../src/handlers/private_trial/lock.sql");
@@ -80,6 +83,56 @@ async fn assert_permission_denied(client: &Client, sql: &str, guard: bool) {
     );
 }
 
+async fn assert_install_waits_for_acl_change(
+    observer: &Client,
+    executor: &Client,
+    writer_oid: u32,
+) {
+    let pid = async |client: &Client| {
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0)
+    };
+    let mut grantor = connect_fixture(LOCK_DB).await;
+    grantor
+        .batch_execute("SET SESSION AUTHORIZATION trial_lock_executor")
+        .await
+        .unwrap();
+    let holder_pid = pid(&grantor).await;
+    let executor_pid = pid(executor).await;
+    let tx = grantor.transaction().await.unwrap();
+    tx.batch_execute("GRANT UPDATE (duration_ms) ON public.tracks TO trial_lock_writer")
+        .await
+        .unwrap();
+    let mut pending = std::pin::pin!(contract(executor, "grant", writer_oid));
+    blocker_observer::observe_blocked(observer, holder_pid, executor_pid, pending.as_mut())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let error = pending
+        .await
+        .expect_err("concurrent UPDATE grant must refuse installation");
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "private trial writer already has UPDATE access"
+    );
+    assert!(observer
+        .query_one(
+            "SELECT to_regprocedure('public.reject_private_trial_publication_update()') IS NULL
+            AND NOT EXISTS (SELECT FROM pg_trigger WHERE tgname = 'private_trial_lock_only')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    grantor
+        .batch_execute("REVOKE UPDATE (duration_ms) ON public.tracks FROM trial_lock_writer")
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn scoped_writer_locks_and_publishes_without_base_updates() {
     let observer = connect_fixture(LOCK_DB).await;
@@ -142,6 +195,7 @@ async fn scoped_writer_locks_and_publishes_without_base_updates() {
         .await
         .unwrap()
         .get::<_, bool>(0));
+    assert_install_waits_for_acl_change(&observer, &executor, writer_oid).await;
     contract(&executor, "grant", writer_oid).await.unwrap();
     assert!(observer.query_one(
         "SELECT count(*) FILTER (WHERE attname = 'id') = 5 AND bool_and(
