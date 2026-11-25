@@ -21,7 +21,7 @@ use private_trial::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    cell::Cell,
+    cell::{Cell, OnceCell},
     time::{Duration, SystemTime},
 };
 
@@ -32,6 +32,7 @@ const UPLOAD: &str = "replacement-upload-fixture";
 struct RefusedCompletion {
     configuration: [u8; 16],
     key: String,
+    part_checksum: OnceCell<String>,
     completions: Cell<u8>,
 }
 
@@ -69,6 +70,7 @@ impl TrialStorage for RefusedCompletion {
         let (target, number, _, checksum) = part.request();
         assert!(target == upload.target());
         assert_eq!(number, 1);
+        self.part_checksum.set(checksum.to_owned()).unwrap();
         Ok(part
             .verify_reply("\"replacement-part\"".into(), checksum)
             .unwrap())
@@ -86,6 +88,13 @@ impl TrialStorage for RefusedCompletion {
                     (sent.target.bucket, sent.target.key, sent.target.upload_id),
                     (BUCKET, self.key.as_str(), UPLOAD)
                 );
+                let checksum = self
+                    .part_checksum
+                    .get()
+                    .expect("the replacement part was uploaded");
+                assert!(std::str::from_utf8(&sent.body)
+                    .unwrap()
+                    .contains(&format!("<ChecksumSHA256>{checksum}</ChecksumSHA256>")));
                 Ok(CompletionResponse {
                     configuration: self.configuration,
                     status: 503,
@@ -206,6 +215,7 @@ pub(super) async fn attempt(
     let storage = RefusedCompletion {
         configuration,
         key: format!("media/{obj}/{seal}"),
+        part_checksum: OnceCell::new(),
         completions: Cell::new(0),
     };
     let failed = fixture
