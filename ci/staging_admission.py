@@ -32,6 +32,15 @@ PRIVATE = "private-music"
 PRIVATE_JOURNEY = "post-deploy private music journey"
 PRIVATE_CRITERIA = frozenset({"upload-to-library", "play", "seek", "queue", "anonymous-refused",
                               "unlisted-refused", "revoked-or-expired-refused", "video-off"})
+PRIVATE_TRACK_FILE = "fixtures/synthetic-flac/private-staging/tone-a.flac"
+PRIVATE_TRACK_PROOFS = {
+    "private-publication": "upload-to-library",
+    "private-library": "upload-to-library",
+    "private-play": "play",
+    "private-anonymous-refusal": "anonymous-refused",
+    "private-unlisted-refusal": "unlisted-refused",
+    "private-cutoff-refusal": "revoked-or-expired-refused",
+}
 IDENTITY_PHASES = ("build-identity", "build-identity-final")
 RECORD = "Record candidate admission receipt"
 UPLOAD = "Upload candidate admission receipt"
@@ -186,6 +195,7 @@ def junit_evidence(xml, contract):
     require(0 < len(cases) <= 10000, "empty or oversized journey")
     rows = {}
     identities = {}
+    track_proofs = []
     private = contract.get("journey") == PRIVATE
     for case in cases:
         selector = (case.get("classname"), case.get("name"))
@@ -196,7 +206,10 @@ def junit_evidence(xml, contract):
             "failed" if failure or expected_failure or (private and case.get("retry") != "0") else "passed")
         rows.setdefault(selector, []).append(outcome)
         for prop in case.findall("properties/property"):
-            if prop.get("name") == "candidate-identity":
+            name = prop.get("name")
+            if private and name in PRIVATE_TRACK_PROOFS and outcome == "passed":
+                track_proofs.append((selector, name, prop.get("value", "")))
+            if name == "candidate-identity":
                 require(outcome == "passed", "identity test did not pass")
                 value = parse_json(prop.get("value", "").encode())
                 phase = value.get("phase")
@@ -220,11 +233,24 @@ def junit_evidence(xml, contract):
         outcomes = [rows.get((e["classname"], e["name"]), []) for e in criterion["evidence"]]
         coverage.append({"id": criterion["id"], "outcome": "passed" if
                          all(value == ["passed"] for value in outcomes) else "incomplete"})
-    return coverage, identities
+    return coverage, identities, track_proofs
+
+
+def private_track_evidence(track_proofs):
+    observations = {}
+    for selector, name, value in track_proofs:
+        require(selector == (PRIVATE, PRIVATE_TRACK_PROOFS[name]) and name not in observations,
+                "misplaced or duplicate private track evidence")
+        observations[name] = parse_json(value.encode())
+    require(observations.keys() == PRIVATE_TRACK_PROOFS.keys(), "missing private track evidence")
+    publication = observations["private-publication"]
+    require(all(proof == publication for proof in observations.values()),
+            "private journey observed different tracks, builds or attempts")
+    return publication
 
 
 def validate_receipt(receipt, *, repo, sha, run_id, attempt, workflow_sha,
-                     manifest_hash, policy, contract_bytes):
+                     manifest_hash, policy, contract_bytes, private_track_sha256=None):
     contract = approved_contract(policy, contract_bytes)
     require(receipt.get("schema") == 1 and receipt.get("repository") == repo
             and receipt.get("environment") == "staging" and receipt.get("workflow") == WORKFLOW
@@ -248,6 +274,15 @@ def validate_receipt(receipt, *, repo, sha, run_id, attempt, workflow_sha,
         require(receipt.get("legacy_gate") == "success", "legacy journey gate did not pass")
     expected = [{"id": c["id"], "outcome": "passed"} for c in contract["criteria"] if c["applicable"]]
     require(receipt.get("coverage") == expected, "applicable product evidence incomplete, skipped or failed")
+    if private:
+        track = receipt.get("private_track")
+        expected_track = {"run_id": run_id, "run_attempt": attempt, "build_sha": sha,
+                          "sha256": private_track_sha256}
+        require(isinstance(track, dict) and track.keys() == expected_track.keys() | {"track_id"}
+                and isinstance(track["track_id"], str) and UUID.fullmatch(track["track_id"])
+                and isinstance(track["sha256"], str) and HASH.fullmatch(track["sha256"])
+                and all(track[k] == v for k, v in expected_track.items()),
+                "private track evidence does not match the selected run, build or synthetic audio")
     require(receipt.get("result") == "satisfied" and receipt.get("reasons") == [],
             "receipt is nonqualifying")
     require(isinstance(receipt.get("junit_sha256"), str) and HASH.fullmatch(receipt["junit_sha256"]),
@@ -294,7 +329,7 @@ def current_main(trusted):
     return tip
 
 
-def produce(env, xml, policy, contract_bytes, manifest_bytes, *, private_pins=None):
+def produce(env, xml, policy, contract_bytes, manifest_bytes, *, private_pins=None, private_track_sha256=None):
     sha = env["GITHUB_SHA"]
     require(SHA.fullmatch(sha) and SHA.fullmatch(env["GITHUB_WORKFLOW_SHA"])
             and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", env["GITHUB_REPOSITORY"]),
@@ -328,12 +363,16 @@ def produce(env, xml, policy, contract_bytes, manifest_bytes, *, private_pins=No
             provenance = {key: receipt[key] for key in ("run_id", "run_attempt")}
             pins = private_deployments(private_pins, sha, provenance)
             receipt["deployments"] = {lane: {**pin, **provenance} for lane, pin in pins.items()}
-        receipt["coverage"], receipt["identities"] = junit_evidence(xml, contract)
+        receipt["coverage"], receipt["identities"], track_proofs = junit_evidence(xml, contract)
+        if private and all(item["outcome"] == "passed" for item in receipt["coverage"]):
+            receipt["private_track"] = private_track_evidence(track_proofs)
         receipt["result"] = "satisfied"
         validate_receipt(receipt, repo=receipt["repository"], sha=sha, run_id=receipt["run_id"],
                          attempt=receipt["run_attempt"], workflow_sha=receipt["workflow_sha"],
-                         manifest_hash=digest(manifest_bytes), policy=policy, contract_bytes=contract_bytes)
+                         manifest_hash=digest(manifest_bytes), policy=policy, contract_bytes=contract_bytes,
+                         private_track_sha256=private_track_sha256)
     except Refused as error:
+        receipt.pop("private_track", None)
         receipt["result"] = "incomplete"
         receipt["reasons"] = [str(error)]
     return receipt
@@ -529,7 +568,7 @@ def require_steps(job, names, reason):
 
 
 def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifest_hash,
-           producer_source_ok):
+           producer_source_ok, private_track_sha256=None):
     # Approval absence is a refusal even when every legacy job is green.
     contract_journey = approved_contract(policy, contract_bytes).get("journey")
     private = contract_journey == PRIVATE
@@ -595,7 +634,7 @@ def verify(actions, *, repo, repository_id, sha, policy, contract_bytes, manifes
     require("sha256:" + digest(archive) == artifact["digest"], "artifact content digest mismatch")
     receipt = validate_receipt(read_archive(archive), repo=repo, sha=sha, run_id=run_id, attempt=attempt,
                                workflow_sha=sha, manifest_hash=manifest_hash,
-                               policy=policy, contract_bytes=contract_bytes)
+                               policy=policy, contract_bytes=contract_bytes, private_track_sha256=private_track_sha256)
     opening = timestamp(receipt["identities"]["build-identity"]["observed_at"])
     closing = timestamp(receipt["identities"]["build-identity-final"]["observed_at"])
     require(timestamp(journey.get("started_at")) <= opening < closing
@@ -651,8 +690,9 @@ def main():
             xml = report.read(MAX_XML + 1)
         require(len(xml) <= MAX_XML, "oversized JUnit")
         pins = parse_json(env.get("PRIVATE_STAGING_DEPLOYMENTS", "").encode()) if private else None
+        track_sha256 = digest(git_file(env["GITHUB_SHA"], PRIVATE_TRACK_FILE)) if private else None
         receipt = produce(env, xml, policy, contract_bytes, (ROOT / "migrations/manifest.toml").read_bytes(),
-                          private_pins=pins)
+                          private_pins=pins, private_track_sha256=track_sha256)
         (ROOT / "staging-admission.json").write_text(json.dumps(receipt, indent=2) + "\n")
         print("candidate admission receipt: " + receipt["result"])
         return
@@ -670,7 +710,8 @@ def main():
             "application promotion requires the approved private-music journey")
     main_tip = current_main(trusted)
     git("merge-base", "--is-ancestor", sha, main_tip)
-    trees = TRUSTED_TREES + (("fixtures/synthetic-flac/private-staging",) if contract.get("journey") == PRIVATE else ())
+    private = contract.get("journey") == PRIVATE
+    trees = TRUSTED_TREES + (("fixtures/synthetic-flac/private-staging",) if private else ())
     def source_binding(source):
         records = git("ls-tree", "-z", source, "--", *trees, *TRUSTED_FILES)
         entries = dict(row.split(b"\t", 1)[::-1] for row in records.split(b"\0") if row)
@@ -688,7 +729,8 @@ def main():
     actions = Actions(env["GITHUB_REPOSITORY"], env["GITHUB_TOKEN"])
     receipt = verify(actions, repo=env["GITHUB_REPOSITORY"],
                      repository_id=decimal(env["GITHUB_REPOSITORY_ID"]), sha=sha, policy=policy,
-                     contract_bytes=contract_bytes, manifest_hash=digest(manifest), producer_source_ok=producer_source_ok)
+                     contract_bytes=contract_bytes, manifest_hash=digest(manifest), producer_source_ok=producer_source_ok,
+                     private_track_sha256=digest(git_file(sha, PRIVATE_TRACK_FILE)) if private else None)
     current_identity(env, sha)
     if receipt.get("journey") == PRIVATE:
         # Project only validated pins. The artifact can carry fields that the

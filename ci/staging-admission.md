@@ -185,6 +185,26 @@ armed Stream mode before recording its pin.
 The reporter derives cases from actual protected Playwright results and emits
 the observed `retry="0"` on first-attempt cases, including the identity cases.
 Missing, duplicate, skipped, expected-failed, retried or failed cases refuse.
+The evaluator also requires these JUnit properties on the first-attempt cases:
+
+| Case | Required track properties |
+| --- | --- |
+| `upload-to-library` | `private-publication`, `private-library` |
+| `play` | `private-play` |
+| `anonymous-refused` | `private-anonymous-refusal` |
+| `unlisted-refused` | `private-unlisted-refusal` |
+| `revoked-or-expired-refused` | `private-cutoff-refusal` |
+
+Each property records the observed publication, Library row, player result or
+refusal target as a JSON object with `track_id`, `sha256`, `build_sha`, `run_id`
+and `run_attempt`. The last two values are decimal strings. Each case supplies
+its own observation. All properties must appear exactly once on their mapped
+cases and agree with the publication's canonical track UUID. The build, run
+and attempt must match the selected Actions evidence, and `sha256` must match
+the `tone-a.flac` bytes in that build. The receipt carries the shared identity
+as `private_track`. The verifier checks it against the selected attempt and
+candidate Git object.
+
 The `build-identity` and `build-identity-final` cases use the same class and
 carry the existing `candidate-identity` properties, plus a `deployments` map
 with the four provider identity fields per lane. Read these independently
