@@ -252,6 +252,11 @@ receipt for release publication.
 | Dispatch readiness | Pending. Record ready or blocked under the [existing qualification steps](#qualify-the-candidate), with a safe reference to the supporting evidence or blocker. |
 | Health watch and recovery | Watcher, backup, UTC start/end, health and error baseline/threshold, readback schedule and results. Actual disposition pending until the [watch](#watch-the-first-30-minutes) or [switch-off](#switch-off-and-verify) has an outcome. Record the watch result when run and whether recovery was invoked. If used, record the trigger and UTC, recovery attempt and outcome, denial and final allocation readbacks. Link the release thread and product log entries. |
 
+When a scheduled readback is still pending during the watch, name the check
+and its scheduled UTC time in the private release handoff. For example, “The
+Stream error threshold readback scheduled for 12:15 UTC is `Pending`. The
+release disposition is `Pending`.”
+
 ### Personal-use exit assessment
 
 Complete this assessment in the protected release thread. Use the **Staging
