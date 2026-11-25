@@ -298,6 +298,19 @@ class PrivateAdmissionTests(Base):
                          "build_sha": SHA, "track_id": PRIVATE_TRACK_ID, "sha256": PRIVATE_AUDIO_SHA})
         self.assertTrue(world.artifact["name"].endswith("-private-music"))
 
+    def test_private_receipt_timing_matches_selected_attempt_job_start(self):
+        world = PrivateWorld()
+        world.receipt["recorded_at"] = iso(-1)
+        world.set_archive()
+        journey = world.jobs[-1]
+
+        journey["started_at"] = world.receipt["identities"]["build-identity"]["observed_at"]
+        self.assertEqual(world.verify()["result"], "satisfied")
+
+        # Keep the same archive and attempt pins with all receipt times before job start.
+        journey["started_at"] = iso(0)
+        self.assertWorldRefused(world, "^journey timing mismatch$")
+
     def test_green_report_cannot_mix_private_track_fragments(self):
         pins = private_pins()
         for proof, field, foreign in (
