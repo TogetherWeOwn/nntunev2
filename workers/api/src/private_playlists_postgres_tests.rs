@@ -36,6 +36,7 @@ async fn postgres_store_rehearsal() {
     let other = "fixture-user-other";
     let clean_id = "plRepeatedRefs00000000";
     let unresolved = "plAllUnresolved0000000";
+    let fully_resolved = "plFullyResolved0000000";
     let created = run(&mut db, owner, Create("Draft".into())).await.unwrap();
     let id = created["id"].as_str().unwrap();
     let titles = ["new-track", "trkRpMiddle00000000000", "inactive-track",
@@ -57,7 +58,7 @@ async fn postgres_store_rehearsal() {
     let page = run(&mut db, owner, List(None, 1)).await.unwrap();
     let after = parse_page_cursor(page["next_cursor"].as_str().unwrap()).unwrap();
     let next = run(&mut db, owner, List(Some(after), 50)).await.unwrap();
-    let mut ids = [id, clean_id, unresolved, "plFullyResolved0000000"];
+    let mut ids = [id, clean_id, unresolved, fully_resolved];
     ids.sort_unstable_by(|a, b| b.cmp(a));
     for (page, expected) in [(page, &ids[..1]), (next, &ids[1..])] {
         let items = page["items"].as_array().unwrap();
@@ -74,6 +75,35 @@ async fn postgres_store_rehearsal() {
     }
     let dormant_id = "00000000-0000-0000-0000-000000000001";
     assert_eq!(entries[1], json!({"id": dormant_id, "position": 1, "dormant": true}));
+
+    // The fully resolved fixture has three distinct tracks. Only the first
+    // and last are in the owner's Library.
+    let snapshot_sql = "SELECT jsonb_agg(to_jsonb(e) ORDER BY e.position)::text
+        FROM playlist_tracks e JOIN playlists p ON p.id = e.playlist_id WHERE p.public_id = $1";
+    let before: String = db
+        .query_one_scalar(snapshot_sql, &[&fully_resolved])
+        .await
+        .unwrap();
+    let stored: [Value; 3] = serde_json::from_str(&before).unwrap();
+    assert_ne!(stored[0]["track_id"], stored[2]["track_id"]);
+    db.batch_execute("BEGIN READ ONLY").await.unwrap();
+    let detail = run(&mut db, owner, Read(fully_resolved)).await.unwrap();
+    db.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(detail["id"], fully_resolved);
+    assert_eq!(
+        detail["entries"],
+        json!([
+            {"id": stored[0]["id"], "position": 0, "track_id": stored[0]["track_id"]},
+            {"id": stored[1]["id"], "position": 1, "dormant": true},
+            {"id": stored[2]["id"], "position": 2, "track_id": stored[2]["track_id"]}
+        ])
+    );
+    let after: String = db
+        .query_one_scalar(snapshot_sql, &[&fully_resolved])
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+
     let (first, second) = tokio::join!(
         run(&mut db, owner, Append(id, track.clone())),
         run(&mut peer, owner, Append(id, track.clone()))
@@ -140,7 +170,7 @@ async fn postgres_store_rehearsal() {
     let playlist_fence = "UPDATE playlists SET deleting_at = now() WHERE public_id = $1";
     let account_fence = "UPDATE users SET deleting_at = now() WHERE id = $1";
     for (sql, key, target) in [(playlist_fence, clean_id, clean_id),
-        (account_fence, owner, "plFullyResolved0000000")] {
+        (account_fence, owner, fully_resolved)] {
         let tx = db.transaction().await.unwrap();
         tx.execute(sql, &[&key]).await.unwrap();
         let finish_fence = async {
