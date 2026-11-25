@@ -162,20 +162,29 @@ test('missing, stale, mismatched or nonempty route proof refuses before Cloudfla
   assert.deepEqual(calls, []);
 });
 
-test('wrong allocation, version or page count fails readback without retry or deletion', async () => {
-  for (const [version_id, percentage, total_pages] of [[version, 99, 1], ['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, 1], [version, 100, 2]]) {
+test('wrong deployment ID, allocation or page count fails readback without retry or deletion', async () => {
+  for (const [id, version_id, percentage, total_pages] of [
+    ['malformed', version, 100, 1],
+    [version, version, 99, 1],
+    [version, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, 1],
+    [version, version, 100, 2],
+  ]) {
     const { calls, run } = cloudflareFixture({ readback: { result_info: { page: 1, count: 1, total_count: 1, total_pages },
-      result: { deployments: [{ id: version, versions: [{ version_id, percentage }] }] } } });
+      result: { deployments: [{ id, versions: [{ version_id, percentage }] }] } } });
     await assert.rejects(run(), total_pages === 1 ? /exactly the new seed version at 100%/ : /complete first page/);
     assert.deepEqual(calls.map(([method]) => method), ['GET', 'GET', 'GET', 'GET', 'POST', 'GET']);
   }
 });
 
 test('a foreign allocation or version cannot be accepted as the seed for this submission', async () => {
+  const foreign = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
   for (const [overrides, diagnostic] of [
-    [{ acknowledged: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }, /exactly the new seed version at 100%/],
+    [{ acknowledged: foreign }, /exactly the new seed version at 100%/],
     [{ submission: 'lost', seed: { annotations: { 'workers/tag': sha } } }, /this submission/],
     [{ submission: 'lost', seed: { bindings: [{ type: 'secret_text' }] } }, /binding-free seed/],
+    [{ versionReadback: { result: [{ id: version }, { id: foreign }],
+      result_info: { page: 1, count: 2, total_count: 2 } } }, /exactly 1 versions/],
+    [{ versionReadback: { result: [{ id: foreign }] } }, /this submission/],
   ]) {
     const { calls, run } = cloudflareFixture(overrides);
     await assert.rejects(run(), diagnostic);

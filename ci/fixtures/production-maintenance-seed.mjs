@@ -41,7 +41,8 @@ export function seedTransport({ account, checkedAt, sha, version, workerId }, ov
     } else if (path === `${script}/deployments${query}`) {
       envelope = { ...list({ deployments: entries }, entries.length), ...(seed ? overrides.readback : overrides.deployments) };
     } else if (path === `${pinned}/versions${query}`) {
-      envelope = { ...list(seed ? [seed] : [], seed ? 1 : 0), ...overrides.versions };
+      envelope = { ...list(seed ? [seed] : [], seed ? 1 : 0),
+        ...(seed ? overrides.versionReadback : overrides.versions) };
     } else if (path === `${script}/settings`) {
       envelope = { result: { bindings: [], ...overrides.settings } };
     } else {
