@@ -43,7 +43,7 @@ pub async fn resolve_uploaded_playback(track: String, grant_key: String) -> Stri
         },
         root_version: id(0),
     };
-    let accepted_seq = db
+    let accepted_seq: i64 = db
         .query_one(
             "SELECT accepted_seq FROM public.ingest_jobs WHERE id = 'catalogue-old'",
             &[],
