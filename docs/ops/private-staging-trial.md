@@ -94,8 +94,12 @@ The hosted [`e2e-lint` job](../../.github/workflows/ci.yml) runs the offline
 test **private staging reporter and receipt wiring with disposable evidence**.
 For a [focused reproduction of that test's failure](../../CONTRIBUTING.md#focused-reproduction-only),
 run from the repository root with the pinned `e2e` dependencies installed.
-Keep Bash and Git on `PATH` and match the hosted tool versions for the
-reproduction. The job uses Node 26, Python 3.13 and `jq` 1.8.2.
+The hosted job uses Node 26, Python 3.13 and `jq` 1.8.2. The fixture finds
+Bash, Git, `python3` and `jq` on `PATH` in a clean environment. Check that
+`env -i PATH="$PATH" python3 --version` and
+`env -i PATH="$PATH" jq --version` work. If Python needs a private library
+path, use the launcher from the job's **Preserve Python runtime for isolated
+helper subprocesses** step.
 
 ```sh
 python3 -B -I e2e/fixtures/private-music/test_admission_wiring.py "$(command -v node)"
