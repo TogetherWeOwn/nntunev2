@@ -69,6 +69,55 @@ For focused reproduction, use `--contract` for the recording upstream or
 hosted `worker release builds` job runs `--bundle` and records the reviewed
 launcher verdict.
 
+## Check DNS convergence for the disposable ingress
+
+For an authorized attempt, import [the read-only policy](dns_convergence.py)
+in the separate protected executor. Use its REST readback, DNS transport,
+clock and receipt callbacks on the existing post-create and post-delete
+paths for the single run-owned record.
+
+1. After creation, read back the recorded ID and require exactly that one
+   record by exact name, matching the approved type, origin, proxy state, TTL,
+   tags and comment. After deletion, require `404` by recorded ID and an empty
+   exact-name provider list. Pass both results and their completion time from
+   the executor's monotonic clock as `Readback`.
+2. Use the two distinct authorities from the approved zone inputs. Pin each
+   server and its query endpoint before the write. The `read_pair` callback
+   sends one `IN A` query for the exact name directly to each pinned endpoint
+   with recursion disabled. Start the queries together every two seconds.
+   Match the response to the query and server and enforce the supplied timeout
+   on the whole round. Return an observation for each attempt, including a
+   non-authoritative failure observation when a valid response is unavailable.
+   Count A answers for the exact owner. Proxied answers are edge IPs.
+3. For create, require `NOERROR` with at least one exact-owner A answer on two
+   consecutive reads from each authority before the 90-second deadline. Only
+   then continue to existing HTTPS readiness. A missed deadline or stop
+   leaves the trial disarmed and goes to scoped disposal and full closeout.
+4. For delete, require `NXDOMAIN` with zero answers on two consecutive reads
+   from each authority before the same 90-second deadline, measured from
+   the delete readback. If that deadline is missed, continue DNS reads for
+   containment up to 300 seconds total from that readback. Keep the writer
+   held and return the receipt to Engineering even if both authorities later
+   converge. Containment does not turn the missed qualification into a pass.
+   A stopped or incomplete delete also leaves the writer held. Keep the
+   existing exact provider absence proof and perform no second create or delete.
+5. In either direction, stop when an authority regresses after two matching
+   reads, sends a non-authoritative response, reports `SERVFAIL` or `REFUSED`,
+   or otherwise cannot supply a valid observation for the scoped name. Query
+   and record both servers in every round until the verdict. Log each read's
+   UTC time, server, response code, AA flag, answer count and seconds since
+   REST readback to the protected receipt. Record the exact merged SHA and
+   SHA-256 of the executor diff used by the operator. If the check or recording
+   fails during delete, keep DNS cleanup pending and retain the writer.
+   Continue scoped closeout of other resources through the existing recovery
+   path.
+
+Exercise the policy with synthetic observations only.
+
+```sh
+python3 -B ops/staging-s3-boundary/test_dns_convergence.py -v
+```
+
 ## Recover ingress before hosted qualification starts
 
 This tabletop uses placeholder records. The protected rollout owner handles
@@ -101,10 +150,12 @@ reconciliation. Keep the trial disarmed.
    recorded DNS ID in its zone and record the successful deletion and exact-ID
    absence before reloading Caddy. If a step fails, record what applied and
    read both targets again before any retry.
-3. Read back the DNS record ID and the Caddy source and active route to confirm
-   the two additions are absent. Confirm the concurrent route update is still
-   loaded and all three existing sites still return their expected responses.
-   Record those results and leave hosted qualification marked pending.
+3. Confirm absence by exact DNS record ID and name and verify authoritative
+   absence under the [delete convergence check](#check-dns-convergence-for-the-disposable-ingress).
+   Read the Caddy source and active route to confirm the rollout block is
+   absent, the concurrent route update is still loaded and all three existing
+   sites still return their expected responses. Record those results and leave
+   hosted qualification marked pending.
    Separately staged fixtures, credentials or protected inputs belong to the
    rollout owner's existing closeout.
 
@@ -112,7 +163,8 @@ If DNS deletion succeeded and the Caddy reload failed, resume with Caddy only
 in the rollout owner's shared-writer window. Match the deletion receipt to
 `<record-id>` and `<zone>`, then confirm that ID and the fixture hostname are
 both absent in the DNS control plane. Stop on missing proof or a replacement
-record. Read the latest Caddy source and active route. If the rollout block is
+record. Step 3 still requires the authoritative absence evidence for DNS
+closeout. Read the latest Caddy source and active route. If the rollout block is
 already absent from both, continue to step 3. Otherwise require the active
 site to match the rollout receipt and the source to show either that same
 block or its recorded removal. Stop on unexplained differences between source
