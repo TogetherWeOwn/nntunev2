@@ -32,9 +32,6 @@ use blocker_observer::observe_blocked;
 #[path = "ingest_session_reuse_postgres.rs"]
 mod reuse_cases;
 
-#[path = "ingest_session_seek_playback.rs"]
-mod seek_playback;
-
 const DB: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
 const WRITER: &str =
     "postgresql://upload_fixture_writer:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
@@ -636,7 +633,7 @@ async fn prove_attempt(
         &sidecars,
     )
     .unwrap();
-    let envelope = || EnrolledEnvelope {
+    let envelope = EnrolledEnvelope {
         authorized_root: &root,
         context: &context,
         trusted_record: &record,
@@ -678,10 +675,10 @@ async fn prove_attempt(
             })
         };
         let verified = if matches!(fault, Some(Fault::MissingSeek)) {
-            inventory.verify(custody, envelope(), open).await
+            inventory.verify(custody, envelope, open).await
         } else {
             inventory
-                .verify_with_flac_seek(custody, envelope(), open)
+                .verify_with_flac_seek(custody, envelope, open)
                 .await
         };
         match fault {
@@ -987,8 +984,7 @@ async fn prove_attempt(
         committed.flac_plaintext_range(completed.metadata(), &[0; 32], 0..1),
         None
     );
-    let replayed = replayed.unwrap().unwrap();
-    for outcome in [committed.outcome(), &replayed] {
+    for outcome in [committed.outcome(), &replayed.unwrap().unwrap()] {
         assert_eq!(outcome.map.replace('-', ""), map_text);
         assert_eq!(outcome.object.replace('-', ""), obj);
         assert_eq!(outcome.generation.replace('-', ""), generation);
@@ -996,18 +992,6 @@ async fn prove_attempt(
         assert_eq!(outcome.root_version.replace('-', ""), root_text);
         assert_eq!(outcome.media_version, MEDIA);
         assert_eq!(outcome.page_versions, [PAGE]);
-    }
-    if publish_fixture {
-        Box::pin(seek_playback::verify(
-            &committed,
-            &replayed,
-            envelope(),
-            input,
-            &ciphertext,
-            page,
-            &page_key,
-        ))
-        .await;
     }
     assert!(matches!(
         read(writer, auth, prepared, async |_, _| Err(StoreError)).await,

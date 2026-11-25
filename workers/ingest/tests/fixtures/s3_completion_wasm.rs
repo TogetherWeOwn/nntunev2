@@ -25,6 +25,8 @@ mod catalogue;
 const FLAC: &[u8] = b"fLaC\x80\0\0\x22\0\x10\0\x10\0\0\0\0\0\0\x0a\xc4\x40\x70\0\0\0\x13\
     \x46\xd2\xbe\x27\x5e\xd2\xdd\x86\xab\x2b\x53\x88\xf7\x34\x6d\x15\
     \xff\xf8\x69\x02\0\x0f\xb7\0\x2a\x7a\xdd\xff\xf8\x69\x02\x01\x02\x81\0\x2a\x9d\x1d";
+const TONE: &[u8] =
+    include_bytes!("../../../../fixtures/synthetic-flac/private-staging/tone-a.flac");
 
 fn id(value: u8) -> [u8; 16] {
     let mut bytes = [value; 16];
@@ -124,22 +126,12 @@ async fn run(mode: &str, endpoint: &str) -> Result<String, JsValue> {
     }
     let readback = mode.starts_with("readback");
     let multipart_resume = matches!(mode, "multipart-resume" | "multipart-resume-full");
-    let padded;
+    let resume_bytes;
     let plaintext: &[u8] = if matches!(mode, "readback-publish" | "readback-playback") {
-        // Add one FLAC PADDING block so the suffix crosses into a second
-        // encrypted chunk while preserving the existing valid audio frames.
-        let padding = PLAIN_CHUNK_SIZE as usize + 1 - FLAC.len() - 4;
-        let mut bytes = FLAC[..42].to_vec();
-        bytes[4] = 0;
-        bytes.push(0x81);
-        bytes.extend_from_slice(&(padding as u32).to_be_bytes()[1..]);
-        bytes.resize(bytes.len() + padding, 0);
-        bytes.extend_from_slice(&FLAC[42..]);
-        padded = bytes;
-        &padded
+        TONE
     } else if multipart_resume {
-        padded = vec![42; PART_BYTES];
-        &padded
+        resume_bytes = vec![42; PART_BYTES];
+        &resume_bytes
     } else if readback {
         FLAC
     } else {
