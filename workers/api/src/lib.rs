@@ -68,6 +68,13 @@ pub mod private_catalogue_read;
 pub mod private_library;
 pub mod private_listening;
 pub mod private_playback;
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "staging-body-wasm-test",
+    feature = "encrypted-upload-caller"
+))]
+#[path = "../tests/fixtures/private_trial_dispatch_wasm.rs"]
+mod private_trial_dispatch_wasm;
 pub mod random;
 pub mod rate_limit;
 pub mod realtime_presence;

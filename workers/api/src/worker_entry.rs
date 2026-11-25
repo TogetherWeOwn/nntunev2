@@ -892,7 +892,7 @@ pub use subsonic_pg::load_staging_account;
 #[path = "private_browser_custody.rs"]
 pub(crate) mod private_browser_custody;
 #[path = "private_browser_worker.rs"]
-mod private_browser_worker;
+pub(crate) mod private_browser_worker;
 
 struct PgStore {
     env: Option<Env>,
@@ -8521,6 +8521,15 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     // `GET /healthz` reports the same normalized identity the log lines carry.
     let config = config.with_build_sha(Some(build_sha.as_str()));
+    #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
+    let trial = if req.method() == Method::Post && req.path() == handlers::private_trial::PATH {
+        let Some(selection) = handlers::private_trial::worker::selected(&env) else {
+            return render(&handlers::not_found(), &[], &trace_id);
+        };
+        Some(selection)
+    } else {
+        None
+    };
     // Classify the body source from the actual runtime request, then
     // collect through the tested seam: a legitimate bodyless request
     // (`inner().body()` is `None`; `stream()` would error for it too) is
@@ -8538,7 +8547,12 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         .ok()
         .flatten()
         .and_then(|v| v.parse::<usize>().ok());
-    let source = if req.inner().body().is_none() {
+    let body_cap = handlers::max_body_bytes(req.method().as_ref(), &req.path());
+    #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
+    let body_cap = trial
+        .as_ref()
+        .map_or(body_cap, |_| handlers::private_trial::FIXTURE_BYTES);
+    let source = if declared_len.is_some_and(|len| len > body_cap) || req.inner().body().is_none() {
         BodySource::Bodyless
     } else {
         match req.stream() {
@@ -8550,12 +8564,7 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     // Per-route collection bound: the in-handler gate re-checks the
     // same bound as defense in depth, so the two cannot drift apart.
-    let collected = collect_body_with_cap(
-        declared_len,
-        source,
-        handlers::max_body_bytes(req.method().as_ref(), &req.path()),
-    )
-    .await;
+    let collected = collect_body_with_cap(declared_len, source, body_cap).await;
     let headers_map: HashMap<String, String> = req
         .headers()
         .entries()
@@ -8687,8 +8696,18 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         );
         return Ok(response);
     }
-    let response = dispatch_collected(collected, request, |collected_request| {
-        handle_with_transport_headers(&ctx, collected_request, &headers_map)
+    let response = dispatch_collected(collected, request, async |collected_request| {
+        #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
+        if let Some(selection) = trial.as_ref() {
+            return handlers::private_trial::upload(
+                &ctx,
+                &collected_request,
+                Some(selection.target()),
+                async |permit, body| selection.run(&env, permit, body).await,
+            )
+            .await;
+        }
+        handle_with_transport_headers(&ctx, collected_request, &headers_map).await
     })
     .await;
     // One structured line per served request: route, status, latency, and

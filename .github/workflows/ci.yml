@@ -2230,8 +2230,12 @@ jobs:
           STAGING_BODY_WASM_JS="$RUNNER_TEMP/staging-body-js/nntune_api.js" node --test workers/api/tests/staging_body_wasm.cjs workers/api/tests/staging_request_wasm.cjs
       - name: Exercise unmounted staging admission through Worker responses
         run: STAGING_BODY_WASM_JS="$RUNNER_TEMP/ledger-js/nntune_api.js" node --test workers/api/tests/staging_dispatch_wasm.cjs
-      - name: Build the off-route API upload caller for the Worker runtime
-        run: cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features encrypted-upload-caller --target-dir "$RUNNER_TEMP/upload-caller-target"
+      - name: Exercise mounted private trial dispatch in the Worker runtime
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test,encrypted-upload-caller --target-dir "$RUNNER_TEMP/upload-caller-target"
+          wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/upload-caller-js" "$RUNNER_TEMP/upload-caller-target/wasm32-unknown-unknown/debug/nntune_api.wasm"
+          PRIVATE_TRIAL_DISPATCH_WASM_JS="$RUNNER_TEMP/upload-caller-js/nntune_api.js" node --test workers/api/tests/fixtures/private_trial_dispatch_wasm.cjs
       - name: Exercise ingest queue and signed S3 completion in a synthetic WASM runtime
         run: |
           set -euo pipefail
