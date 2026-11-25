@@ -1,7 +1,7 @@
 """Structural tests for the pnpm bootstrap retry in ci.yml.
 
 The pinned pnpm self-installer runs one `npm ci` with no retry, so the
-four pnpm-consuming jobs (svelte-check, vitest, web-build, web-e2e) wrap
+three pnpm-consuming jobs (web-checks, web-build, web-e2e) wrap
 it in a first attempt plus exactly one in-job retry. This suite pins that
 shape: deleting a retry, masking it with continue-on-error, weakening its
 gate, or drifting the pin between attempts must turn CI red.
@@ -28,7 +28,7 @@ import unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
 
-RETRY_JOBS = ("svelte-check", "vitest", "web-build", "web-e2e")
+RETRY_JOBS = ("web-checks", "web-build", "web-e2e")
 RETRY_STEP_NAME = "Retry pnpm bootstrap once"
 RETRY_GATE = "steps.pnpm-setup.outcome == 'failure'"
 PINNED_USES = re.compile(r"^pnpm/action-setup@[0-9a-f]{40}$")
@@ -377,12 +377,31 @@ def errors_for(text):
 
 
 class TestPnpmRetryShape(unittest.TestCase):
-    def test_real_workflow_pins_all_four_retries(self):
+    def test_real_workflow_pins_each_retry(self):
         with open(WORKFLOW_PATH, encoding="utf-8") as handle:
             jobs = split_jobs(handle.read())
         for job_id in RETRY_JOBS:
             self.assertIn(job_id, jobs, f"ci.yml no longer defines job {job_id}")
             self.assertEqual(check_job_retry(job_id, jobs[job_id]), [])
+
+    def test_web_checks_share_setup_and_report_each_result(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as handle:
+            jobs = split_jobs(handle.read())
+        self.assertFalse({"svelte-check", "vitest"} & jobs.keys())
+        job = jobs["web-checks"]
+        self.assertIsNone(job_level_field(job, "if"))
+        self.assertIsNone(job_level_field(job, "continue-on-error"))
+        run_steps = [
+            (run, step_level_field(step, "id"), step_level_field(step, "if"),
+             step_level_field(step, "continue-on-error"))
+            for step in split_steps(job)
+            if (run := step_level_field(step, "run")) is not None
+        ]
+        self.assertEqual(run_steps, [
+            ("pnpm install --frozen-lockfile", "install", None, None),
+            ("pnpm check", None, None, None),
+            ("pnpm test", None, "${{ !cancelled() && steps.install.outcome == 'success' }}", None),
+        ])
 
     def test_missing_retry_fails(self):
         errors = errors_for(workflow_with(retry_step=False))

@@ -11,7 +11,7 @@ Only the jobs whose tests actually fetch may receive them:
 
 Jobs that never fetch must not receive the secrets (least exposure):
 ``e2e-lint`` runs the cc0 helper's offline unit spec with the config
-env cleared, ``vitest`` has no fixture consumer, and the workspace
+env cleared, ``web-checks`` has no fixture consumer, and the workspace
 crate self-tests clear the config too. Fork PRs receive no secrets at
 all, so every consumer still skips through the fetcher's exit-77 path.
 
@@ -187,11 +187,11 @@ class TestFixtureSecretWiring(unittest.TestCase):
     def test_non_fetching_jobs_receive_no_fixture_secrets(self):
         """Offline-only jobs stay secret-free.
 
-        e2e-lint's cc0 spec clears the config env itself, vitest has no
+        e2e-lint's cc0 spec clears the config env itself, web-checks has no
         fixture consumer, and rust-test's crate self-tests clear the
         config for the child process — none of them needs R2 access.
         """
-        for job_id in ("e2e-lint", "vitest", "rust-test", "public-text"):
+        for job_id in ("e2e-lint", "web-checks", "rust-test", "public-text"):
             self.assertNotIn("secrets.NNTUNE_FIXTURE_R2_", self.jobs[job_id], job_id)
 
     def test_no_workflow_references_the_retired_nzb_secrets(self):
