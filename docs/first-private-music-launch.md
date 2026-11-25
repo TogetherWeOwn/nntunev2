@@ -10,23 +10,28 @@ On an armed push to protected `main`, `deploy.yml` binds the Web, API and
 Stream deployments to the same attempt and observes the serving deployments
 before and after the private Playwright journey. The journey checks the serving
 build through `/api/build` and `/healthz` at both ends. The workflow evaluates
-the first-attempt results against the reviewed contract and uploads the
-attempt-bound receipt only when the evaluator returns `satisfied`.
+the Playwright evidence against the reviewed contract, requiring cases to pass
+without retries. It uploads the attempt-bound receipt only when the evaluator
+returns `satisfied`.
 
 Scoped staging access and a live qualifying attempt remain pending. Follow the
 [protected staging trial runbook](ops/private-staging-trial.md) for setup,
 qualification and cleanup. The admission policy has no approvals, so the
 protected job cannot upload a satisfied receipt and the verifier refuses
-admission. Enroll the exact contract through a reviewed policy change after
-Product approves applicability and QA separately approves the executable
-mapping. Synthetic receipts are for rehearsal only.
+admission. The job keeps the bounded report on the runner. Keep enrollment
+pending until there is a reviewed protected path to obtain the exact live
+report for [contract enrollment](../ci/staging-admission.md#draft-contract-for-the-first-private-music-release).
+Enrolling the exact contract requires a reviewed policy change, with Product
+approval of applicability and separate QA approval of the executable mapping.
+Synthetic receipts are for rehearsal only.
 
 Production preflight currently refuses application promotion, even when the
-lane is enabled. Maintenance bootstrap keeps its ordinary staging prerequisites
-and receipt check. If a reviewed path opens the app lane, the staging-evidence
-verifier requires the approved private journey and the exact staging deployment
-evidence. That path must also support timely trial cleanup. Production
-API/data-plane and Access cutover still need protected lanes, evidence and
+lane is enabled. Maintenance bootstrap requires a passing ordinary full journey
+and a matching receipt under the approved ordinary contract. An armed private
+run skips the ordinary journey. If a reviewed path opens the app lane, the
+staging-evidence verifier requires the approved private journey and the exact
+staging deployment evidence. That path must also support timely trial cleanup.
+Production API/data-plane and Access cutover still need protected lanes, evidence and
 fallback. Keep deployment and release approvals pending in the candidate record
 until their evidence is available.
 [Staging deploy](../.github/workflows/deploy.yml) ·
@@ -48,8 +53,8 @@ until their evidence is available.
    both ends of the [private journey](../e2e/README.md#private-music-journey-preparation).
    It must show invite acceptance, upload through Library arrival, play, seek,
    queue, anonymous and unlisted refusal, revoked or expired refusal, and
-   video off. Record Product approval
-   of applicability and separate QA approval of the executable mapping.
+   video off. Record Product approval of applicability and separate QA approval
+   of the executable mapping.
    Run again from the reviewed producer and verifier source if that source or
    the enrolled contract changes. [Admission verifier](../ci/staging-admission.md)
 3. Before release review, collect the staging pins from the protected Actions
