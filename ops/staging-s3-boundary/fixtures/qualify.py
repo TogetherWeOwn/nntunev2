@@ -58,11 +58,11 @@ class Stack:
         admin_env.write_text(f"AWS_ACCESS_KEY_ID={self.admin[0]}\nAWS_SECRET_ACCESS_KEY={self.admin[1]}\n")
         self.config = scratch / "Caddyfile"
         self.config.write_text(render(self.scoped[0], [KEY, DIGEST] if recording else [KEY]))
-        data = scratch / "data"
-        data.mkdir()
+        self.config.chmod(0o644)
         self.env = {"PATH": os.environ["PATH"], "HOME": str(scratch)}
         self.compose_env = self.env | {
-            "FIXTURE_ADMIN_ENV": str(admin_env), "FIXTURE_DATA_DIR": str(data),
+            # Compose interpolates the base bind path before either override replaces it.
+            "FIXTURE_ADMIN_ENV": str(admin_env), "FIXTURE_DATA_DIR": str(scratch / "unused-data"),
             "FIXTURE_CADDYFILE": str(self.config), "FIXTURE_BOUNDARY_PORT": "0",
         }
         boundary_image = next(line.split()[1] for line in (HERE / "compose.yml").read_text().splitlines()
@@ -81,6 +81,7 @@ services:
         else:
             audit = scratch / "audit.json"
             audit.write_text(json.dumps({"fluent_host": "127.0.0.1", "fluent_port": 24224, "marshal_as_json": True}))
+            audit.chmod(0o644)
             override.write_text(f"""
 services:
   backend:
@@ -91,8 +92,11 @@ services:
         nc -l -s 127.0.0.1 -p 24224 > /tmp/nntune-audit &
         exec /entrypoint.sh "$$@" -s3.auditLogConfig=/etc/seaweedfs/audit.json
       - fixture-audit
-    volumes:
+    volumes: !override
+      - fixture-data:/data
       - "{audit}:/etc/seaweedfs/audit.json:ro"
+volumes:
+  fixture-data:
 """)
         self.cmd = [*DOCKER, "compose", "--env-file", "/dev/null", "--project-directory", str(scratch),
                     "-p", self.project, "-f", str(HERE / "compose.yml"), "-f", str(override)]

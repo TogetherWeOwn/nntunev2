@@ -20,14 +20,16 @@ for protected dispatch and custody.
 
 ## Render the credential's policy
 
-Use an absolute destination in private custody. Supply the access key ID and
-one or two exact fixture keys. The renderer accepts the same compact UUIDv4 key
-shapes as the fixture retirement checker. Qualify each credential's scope
-separately.
+Use an absolute destination inside a directory restricted to the operator.
+Set the rendered file to mode 0644 so the Caddy process can read the bind mount
+with its capabilities dropped. Supply the access key ID and one or two exact
+fixture keys. The renderer accepts the same compact UUIDv4 key shapes as the
+fixture retirement checker. Qualify each credential's scope separately.
 
 ```sh
 umask 077
 python3 -B ops/staging-s3-boundary/render.py "$fixture_access_id" "$fixture_key" > "$fixture_caddyfile"
+chmod 0644 "$fixture_caddyfile"
 sha256sum "$fixture_caddyfile"
 ```
 
@@ -37,6 +39,8 @@ absolute path to the provisioner's private env file containing
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Create the dedicated fixture
 data directory before starting the services. Record the SHA-256 of the
 mounted Caddyfile and compare it with the reviewed render.
+Use the [qualification's managed policy](fixtures/storage.py) as the
+one-key reference when checking the backend policy and its attachment.
 
 ## Reproduce the disposable qualification
 
