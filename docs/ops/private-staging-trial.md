@@ -147,9 +147,10 @@ same no-list policy on a disposable versioned fixture. Require version-specific
 HEAD to return the selected version while present. Require exact-version
 DELETE to return an empty HTTP 204 and, if it includes `x-amz-version-id`,
 require that value to match the selected version. Require the subsequent
-version-specific HEAD to return an empty HTTP 404. Treat HTTP 403, ambiguity
-or a policy that needs list access as a stop. Keep the scope and credentials
-in protected custody.
+version-specific HEAD to return an empty HTTP 404. Repeat the same DELETE and
+HEAD against the now-absent version and require the same status, body and
+optional version header checks. Treat HTTP 403, ambiguity or a policy that
+needs list access as a stop. Keep the scope and credentials in protected custody.
 
 Once the cutoff, retention and lease windows have elapsed, dispatch
 [`deploy`](../../.github/workflows/deploy.yml) from protected `main` with
