@@ -35,6 +35,22 @@ test('invited Library keeps its selection title through native pause and restore
 	await expect(page).toHaveTitle(selectedTitle);
 	await expect(audio).toHaveCount(0);
 
+	// Capture even temporary title writes while keeping the native setter active.
+	const writes = await page.evaluateHandle(() => {
+		const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
+		if (!descriptor?.set) throw new Error('Native title setter missing');
+		const { set } = descriptor;
+		const titles: string[] = [];
+		Object.defineProperty(Document.prototype, 'title', {
+			...descriptor,
+			set(this: Document, title: string) {
+				titles.push(title);
+				set.call(this, title);
+			}
+		});
+		return titles;
+	});
+
 	await play.click();
 	const native = (await audio.elementHandle())!;
 	await expect.poll(() => native.evaluate((el: HTMLAudioElement) => !el.paused && el.currentTime > 0.2)).toBe(true);
@@ -55,24 +71,11 @@ test('invited Library keeps its selection title through native pause and restore
 		el.isConnected && !el.paused && el.currentTime > from + 0.2, pausedAt)).toBe(true);
 	await expect(pause).toBeEnabled();
 	await expect(page).toHaveTitle(selectedTitle);
+	const playbackTitles = await writes.jsonValue();
+	expect(playbackTitles.filter((title) => title !== selectedTitle)).toEqual([]);
+	await native.dispose();
 
-	// Keep the native setter and capture writes in this document. Each destination
-	// has a different title from the one Library captured on entry.
-	const writes = await page.evaluateHandle(() => {
-		const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'title');
-		if (!descriptor?.set) throw new Error('Native title setter missing');
-		const { set } = descriptor;
-		const titles: string[] = [];
-		Object.defineProperty(Document.prototype, 'title', {
-			...descriptor,
-			set(this: Document, title: string) {
-				titles.push(title);
-				set.call(this, title);
-			}
-		});
-		return titles;
-	});
-
+	// Each destination has a different title from the one Library captured on entry.
 	const leaveLibrary = async (name: string, path: string, priorTitle: string, destinationTitle: string) => {
 		await writes.evaluate((titles) => { titles.length = 0; });
 		await rail.getByRole('link', { name, exact: true }).click();
@@ -90,4 +93,5 @@ test('invited Library keeps its selection title through native pause and restore
 	await expect(row).toBeVisible();
 	await expect(page).toHaveTitle(selectedTitle);
 	await leaveLibrary('Home', '/home', searchTitle, homeTitle);
+	await writes.dispose();
 });
