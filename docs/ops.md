@@ -1409,6 +1409,29 @@ cannot stop a concurrent provider write between the empty read and deployment.
 4. **Close/undo:** Disable `PRODUCTION_DEPLOY_ENABLED` and clear the accepted SHA and route proof. To abort an in-flight run, cancel it too and reconcile Worker, deployment and route state before any retry.
    Verify the seed remains unrouted and unexposed. Leave it and the Worker intact; re-entry refuses. Reverse only separately accepted cutover routes/DNS.
 
+#### Offline rehearsal for cancelled production approval
+
+In this example, `<cancelled-run>`, attempt `1`, passed `production-preflight`
+and `staging-evidence` for `mode=bootstrap-maintenance` at `<accepted-main-sha>`.
+While `bootstrap-maintenance` waits for `production` Environment approval,
+follow **Close/undo** and record the following in the private release record.
+
+- Actions shows the exact run and attempt ended `cancelled` before the
+  protected job started. **Seed only the pinned, empty maintenance Worker**
+  never ran.
+- Read-only inventories for the pinned Worker in the pinned account show
+  zero deployments and versions. Worker references remain empty, `workers.dev`
+  and previews are disabled, and the complete route inventory shows zero matches.
+
+Keep the release outcome pending. If the seed step may have run or any
+readback is missing or disagrees, reconcile Worker, deployment and route state
+before restart. When the evidence confirms the seed was never written, use
+steps 1–3 to reopen the window and make a fresh dispatch on `main` with a fresh
+route proof. If `main` moved, qualify the new commit first. Use the replacement
+run's approval check in step 3 and record verified seed readback on completion.
+The release outcome stays pending until the existing release procedure has
+complete evidence. See the [first private release handoff](#first-private-release-handoff).
+
 ### Production Worker secret-shape gate
 
 The production lane refuses any production vars beyond `name` in

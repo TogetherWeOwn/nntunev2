@@ -18,7 +18,7 @@ const { validateReceipt, artifactName, verifyPromotion } = require("./release-pr
 const { buildRequest } = require("./release-request.cjs");
 
 const REPO = "TogetherWeOwn/nntunev2";
-const SHA = "634606e7d12199e0ee8f75df5bfd81902f96e5d4";
+const SHA = "ab".repeat(20);
 const RUN_ID = "41538141542";
 const ATTEMPT = "1";
 const VERSION_ID = "123e4567-e89b-12d3-a456-426614174000";
@@ -183,6 +183,7 @@ describe("verifyPromotion", () => {
     "#!/usr/bin/env python3",
     '"""Fake `gh` for verifyPromotion tests. Serves canned API JSON or the',
     "canned artifact zip from FAKE_* env. Any unexpected route fails.\"\"\"",
+    "import hashlib",
     "import io",
     "import json",
     "import os",
@@ -206,8 +207,10 @@ describe("verifyPromotion", () => {
     '        \"run_attempt\": os.environ[\"FAKE_ATTEMPT\"],',
     "    }",
     "    buf = io.BytesIO()",
-    "    with zipfile.ZipFile(buf, \"w\", zipfile.ZIP_DEFLATED) as archive:",
-    "        archive.writestr(\"promotion.json\", json.dumps(receipt))",
+    "    with zipfile.ZipFile(buf, \"w\") as archive:",
+    "        # ZipInfo fixes the timestamp so listing and download use identical bytes.",
+    "        archive.writestr(zipfile.ZipInfo(\"promotion.json\"), json.dumps(receipt),",
+    "            compress_type=zipfile.ZIP_DEFLATED)",
     "    return buf.getvalue()",
     "def main(argv):",
     "    try:",
@@ -267,15 +270,16 @@ describe("verifyPromotion", () => {
     "        if scenario == \"no-artifact\":",
     "            return respond({\"total_count\": 0, \"artifacts\": []})",
     "        data = build_zip()",
+    '        producer_sha = sha if scenario == "wrong-artifact-producer-sha" else head_sha',
     "        return respond({\"total_count\": 1, \"artifacts\": [{",
     "            \"id\": 555001,",
     "            \"name\": \"production-promotion-\" + sha + \"-\" + run_id + \"-\" + attempt,",
     "            \"expired\": False, \"size_in_bytes\": len(data),",
     '            \"expires_at\": \"2030-01-01T00:00:00Z\",',
-    "            \"digest\": \"sha256:\" + \"cd\" * 32,",
+    '            "digest": "sha256:" + hashlib.sha256(data).hexdigest(),',
     "            \"workflow_run\": {\"id\": int(run_id), \"repository_id\": repo_id,",
     "                \"head_repository_id\": repo_id,",
-    '                \"head_branch\": \"main\", \"head_sha\": head_sha},',
+    '                \"head_branch\": \"main\", \"head_sha\": producer_sha},',
     "        }]})",
     "    if rest == \"artifacts/555001/zip\":",
     "        sys.stdout.buffer.write(build_zip())",
@@ -287,9 +291,10 @@ describe("verifyPromotion", () => {
   ].join("\n");
 
   function withFakeGithub(scenario, fn) {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-gh-"));
     const headSha = execSync("git rev-parse origin/main", { cwd: root, encoding: "utf8" }).trim();
     assert.match(headSha, /^[0-9a-f]{40}$/);
+    assert.notEqual(headSha, SHA);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-gh-"));
     const saved = {};
     for (const name of ["PATH", "GITHUB_REPOSITORY", "GITHUB_REPOSITORY_ID",
       "PROMOTION_RUN_ID", "PROMOTION_RUN_ATTEMPT",
@@ -332,14 +337,22 @@ describe("verifyPromotion", () => {
     }
   }
 
-  it("proves a genuine promotion receipt from run, job and artifact checks", () => {
+  it("proves a receipt with matching artifact producer metadata", () => {
     const proved = withFakeGithub("ok", () => verifyPromotion({ repo: REPO, sha: SHA }));
     assert.equal(proved.receipt.sha, SHA);
     assert.equal(proved.receipt.run_id, RUN_ID);
     assert.equal(proved.receipt.run_attempt, ATTEMPT);
+    assert.equal(proved.receipt.promoted_version_id, VERSION_ID);
     assert.equal(proved.artifact.name, artifactName(SHA, RUN_ID, ATTEMPT));
     assert.equal(proved.artifact.id, 555001);
     assert.match(proved.artifact.digest, /^sha256:[0-9a-f]{64}$/);
+  });
+
+  it("refuses artifact metadata that substitutes the deployed SHA for the producer head", () => {
+    assert.throws(
+      () => withFakeGithub("wrong-artifact-producer-sha", () => verifyPromotion({ repo: REPO, sha: SHA })),
+      { message: "production promotion proof refused: expired, oversized or mismatched artifact producer metadata" },
+    );
   });
 
   it("refuses when no attempt-bound artifact exists", () => {
