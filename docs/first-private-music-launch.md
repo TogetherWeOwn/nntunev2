@@ -249,7 +249,7 @@ receipt for release publication.
 | Pre-schema snapshot | Private snapshot reference, capture and completion UTC, branch and restore scope, expiry, verification reference and first schema apply boundary |
 | Protected switch-off | Executors and protected controls for Access/invites and API/media, private seed evidence for the verified maintenance Worker/deployment/version/seed SHA/module digest, sealed intent custody reference and original rollout artifact link when published, expected denials and grant expiry boundary |
 | Release review and dispatch | Independent reviewer, decision (initially `Pending`, then `APPROVE` or `BLOCK`), UTC and review reference for the pinned SHA and staging attempt, protected workflow and rollout run/attempt, final deployment/version and smoke result |
-| Dispatch readiness | Pending. Record ready or blocked under the [existing qualification steps](#qualify-the-candidate), with a safe reference to the supporting evidence or blocker. |
+| Dispatch readiness | Pending while an applicable journey case lacks a verdict or safe evidence reference from the pinned staging attempt, unless qualification identifies a blocker. Record Blocked for a blocker such as a failed applicable case or a [required staging receipt that cannot be verified](../ci/staging-admission.md#synthetic-handoff-when-actions-evidence-is-unavailable). Record Ready only after the [existing qualification steps](#qualify-the-candidate) are satisfied and every applicable case has a passing verdict and safe reference. Cite the evidence or blocker. |
 | Health watch and recovery | Watcher, backup, UTC start/end, health and error baseline/threshold, readback schedule and results. Actual disposition pending until the [watch](#watch-the-first-30-minutes) or [switch-off](#switch-off-and-verify) has an outcome. Record the watch result when run and whether recovery was invoked. If used, record the trigger and UTC, recovery attempt and outcome, denial and final allocation readbacks. Link the release thread and product log entries. |
 
 When a scheduled readback is still pending during the watch, name the check
@@ -264,9 +264,18 @@ attempt** and **Staging admission** fields above for the same-build evidence.
 Record pass or fail only when the protected attempt supplies a case-level
 verdict. Cite the case ID and a safe reference to that verdict in the accepted
 receipt or protected job evidence. An aggregate job verdict leaves each case
-pending unless its own verdict is available.
+Pending until its own verdict and safe reference are available.
 See the [journey assertions](../ci/staging-admission.md#draft-contract-for-the-first-private-music-release).
-Live billing is assessed separately.
+Record **Paid qualification** separately in the protected release thread.
+When the pinned private candidate meets the requirements above, record
+**Dispatch readiness** as Ready even if paid qualification is still Pending
+under the [paid acceptance checklist](paid-invite-acceptance.md).
+
+For an offline rehearsal, fill a separate copy of the record with synthetic
+outcomes and references. Keep the rehearsal Pending if an applicable journey
+case lacks a verdict or safe reference. Record the rehearsal as complete once
+the synthetic record satisfies the existing pre-dispatch requirements. Use
+protected evidence for dispatch readiness in the actual candidate record.
 
 - **Private invite scope:** Pending. Record the approved scope and access window
   for the owner and explicitly invited friends and family.
