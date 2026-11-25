@@ -480,7 +480,7 @@ pub(crate) async fn verify_publication(
         503
     );
     assert!(exact_reference().await);
-    let set_duration = async |duration_ms: i32| {
+    let set_duration = async |duration_ms: Option<i32>| {
         observer
             .execute(
                 "UPDATE public.tracks SET duration_ms = $2 WHERE id = $1::text::uuid",
@@ -489,18 +489,20 @@ pub(crate) async fn verify_publication(
             .await
             .unwrap()
     };
-    assert_eq!(set_duration(14_001).await, 1);
-    assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
-    let duration: i32 = observer
-        .query_one(
-            "SELECT duration_ms FROM public.tracks WHERE id = $1::text::uuid",
-            &[&track],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(duration, 14_001);
-    assert_eq!(set_duration(14_000).await, 1);
+    for stored in [None, Some(14_001)] {
+        assert_eq!(set_duration(stored).await, 1);
+        assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
+        let duration: Option<i32> = observer
+            .query_one(
+                "SELECT duration_ms FROM public.tracks WHERE id = $1::text::uuid",
+                &[&track],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(duration, stored);
+    }
+    assert_eq!(set_duration(Some(14_000)).await, 1);
 
     observer
         .execute(

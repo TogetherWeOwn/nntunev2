@@ -54,10 +54,6 @@ pub async fn resolve_uploaded_playback(track: String) -> String {
         .await
         .unwrap()
         .get::<_, bool>(0));
-    db.query_one(include_str!("private_playback_duration.sql"), &[&track])
-        .await
-        .unwrap();
-
     const MEMBER: &str = "catalogue-other";
     let keys = SessionKeys::single(&[24; 32]);
     let cookie = issue_session(keys.primary, MEMBER, time, 120).unwrap();
@@ -113,6 +109,8 @@ pub async fn resolve_uploaded_playback(track: String) -> String {
         .await
         .unwrap()
         .expect("issued private playback receipt");
+    // The uploaded fixture contains 19 samples at 44.1 kHz.
+    assert_eq!(receipt.relay().duration_ms.get(), 1);
     let playback = service
         .resolve(
             &mut db,

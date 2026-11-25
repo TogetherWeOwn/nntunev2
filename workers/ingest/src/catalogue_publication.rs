@@ -52,7 +52,8 @@ pub async fn stage(
 }
 
 /// When authenticated FLAC readback measured a duration, a fresh canonical row
-/// stores it and an existing row must agree. The publisher never overwrites it.
+/// stores it and an existing row must have the same measured value. A legacy
+/// row with no duration requires separate reconciliation of the shared track.
 pub(crate) async fn stage_with_duration(
     tx: &mut Transaction<'_>,
     matched: &VerifiedOccurrence<'_>,
