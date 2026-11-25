@@ -2281,7 +2281,8 @@ jobs:
           PRIVATE_TRIAL_CLEANUP_BUNDLE: ${{ runner.temp }}/trial-cleanup-fixture
         run: |
           set -euo pipefail
-          (cd workers/api && worker-build --release --out-dir "$PRIVATE_TRIAL_CLEANUP_BUNDLE" -- --locked --features staging-fixture-cleanup,staging-body-wasm-test) 2>&1 | tee "$RUNNER_TEMP/worker-trial-cleanup-fixture.log"
+          cargo check --locked --release --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-fixture-cleanup
+          (cd workers/api && worker-build --release --out-dir "$PRIVATE_TRIAL_CLEANUP_BUNDLE" -- --locked --features staging-fixture-cleanup-test) 2>&1 | tee "$RUNNER_TEMP/worker-trial-cleanup-fixture.log"
           python3 -I .github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-trial-cleanup-fixture.log"
           git diff --exit-code -- workers/api/Cargo.lock
           node --test workers/api/tests/fixtures/private_trial_cleanup_runner.cjs

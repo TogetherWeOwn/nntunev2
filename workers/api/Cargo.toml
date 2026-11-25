@@ -67,6 +67,8 @@ worker = "0.9"
 [features]
 encrypted-upload-caller = ["dep:nntune-ingest"]
 staging-fixture-cleanup = ["encrypted-upload-caller"]
+# Allows TCP without TLS only for the disposable loopback PostgreSQL fixture.
+staging-fixture-cleanup-test = ["staging-fixture-cleanup"]
 postgres-tests = []
 # Exposes the inert adapter only to the synthetic WASM runtime test.
 staging-body-wasm-test = []
