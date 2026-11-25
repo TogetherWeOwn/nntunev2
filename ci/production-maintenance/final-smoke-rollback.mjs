@@ -192,7 +192,8 @@ if (import.meta.main) {
     const env = { ...process.env };
     if (command === 'admit-recovery') delete process.env.INTENT_KEY; // Withhold from subprocesses.
     const verdict = command === 'admit-recovery' ? admitRecovery(env) : await finalSmokeRollback(command, env);
-    if (verdict) console.log(verdict);
+    // Report a failed summary write even when the allocation was verified.
+    if (verdict) writeFileSync(process.stdout.fd, `${verdict}\n`);
   } catch {
     // Errors may contain protected input or provider data. Keep details in private custody.
     console.error('::error::Protected rollback check failed. Reconcile Worker, deployment, routes and provider audit before any retry.');

@@ -93,7 +93,7 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId, d
     shift();
     await run('pin-final', { PROMOTED_VERSION: candidate, PREV_VERSION: version }, clock);
   };
-  return { calls, custody, rows, versions, seed, state, id, temp, env, run, prepare, shift, fail, candidate };
+  return { calls, custody, rows, versions, seed, state, id, temp, env, run, prepare, shift, fail, candidate, request };
 }
 
 export function recoveryFixture(t, transport, conclusion) {
