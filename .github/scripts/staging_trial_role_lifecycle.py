@@ -10,7 +10,10 @@ import sys
 from apply_migration import ADVISORY_LOCK_KEY, ApplyError
 from staging_apply import StagingApplyError, evidence_child_env, load_entries, quote_literal
 from staging_trial_isolated import CONFIG_ENV, ROUTES, SHARED_OID, authority, overlay, routines, target_config
-from staging_trial_role_acl import GUARD, LOCK_TABLES, WINNERS, WRITER, audit, change, grants, identities, require
+from staging_trial_role_acl import (
+    GUARD, LOCK_TABLES, WINNERS, WRITER, audit, change, grants, identities, isolated_extensions,
+    other_database_connections, require,
+)
 from staging_trial_role_preflight import BASELINE, DATABASE, LOGIN_RE, SCOPE_ENV, oid, parse_scope
 from staging_trial_schema import read_source
 
@@ -166,7 +169,7 @@ AND EXISTS (SELECT FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
     AND p.oid = 'public.storage_object_intent_append_only()'::regprocedure AND p.prosrc = {immutable}
     AND (SELECT attnum FROM pg_attribute WHERE attrelid = t.tgrelid AND attname = 'object_id') = ANY(t.tgattr))
 """)
-    identity_check = identities(scope) + winner
+    identity_check = identities(scope) + winner + (isolated_extensions() if isolated else "")
     routed = [connection(key.upper(), fixture, isolated) for key in ("reader", "writer")]
     for name, env in zip(NAMES, routed, strict=True):
         if env["PGUSER"].partition(".")[0] != name:
@@ -201,8 +204,10 @@ AND EXISTS (SELECT FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
           + audit(with_overlay, exact=True), readonly=True)
     for key, env in zip(("reader", "writer"), routed, strict=True):
         name, role_oid = scope[key]
+        confinement = require(f"NOT EXISTS ({other_database_connections('current_user')})") if isolated else ""
         psql(env, "BEGIN READ ONLY;\n" + target(scope, env["PGUSER"], fixture)
-             + require(f"session_user = '{name}' AND to_regrole(session_user)::oid = {role_oid}") + "COMMIT;\n",
+             + require(f"session_user = '{name}' AND to_regrole(session_user)::oid = {role_oid}")
+             + confinement + "COMMIT;\n",
              f"routed {key}" if isolated else f"routed {key} {env['PGUSER']} {name} {role_oid}")
 
 

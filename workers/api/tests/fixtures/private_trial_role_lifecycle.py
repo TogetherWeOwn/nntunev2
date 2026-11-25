@@ -1,19 +1,24 @@
 """End-to-end regression against a disposable PostgreSQL service with synthetic logins."""
 
 import argparse
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / ".github/scripts"))
 
 from apply_migration import transaction_body
-from staging_apply import load_entries
+from staging_apply import StagingApplyError, load_entries
+import staging_trial_ambient_acl as ambient_acl
 from staging_trial_isolated import target_config
+from staging_trial_role_acl import audit
 from staging_trial_role_lifecycle import CONFIG_ENV, DATABASE, FIXTURE, NAMES, SCOPE_ENV
 from staging_trial_schema import BASELINE, compose
 
@@ -293,13 +298,36 @@ try:
     assert "isolated executor authority passed" in report and "staging CONNECT passed" not in report
     ungranted()
     sql(f"GRANT pg_signal_backend TO {owner} WITH INHERIT TRUE;")
+    sql("CREATE SCHEMA trial_fixture_extensions;")
+    for extension in ("pg_trgm", "dblink", "postgres_fdw"):
+        sql(f"CREATE EXTENSION {extension} WITH SCHEMA trial_fixture_extensions;\n"
+            "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA trial_fixture_extensions FROM PUBLIC;")
+        sql(audit([], exact=False, database_preparation=True))
+        assert "staging CONNECT passed" not in isolated("grant", success=False)
+        ungranted()
+        sql(f"DROP EXTENSION {extension};")
+    sql("DROP SCHEMA trial_fixture_extensions;")
+
+    sql("GRANT TEMP ON DATABASE nntune_ci, template1 TO PUBLIC;")
     assert "isolated owner authority passed" in isolated("check")
     ungranted()
+    for catalog in ("nntune_ci", "template1"):
+        sql(f"GRANT CONNECT ON DATABASE {catalog} TO PUBLIC;")
+        isolated("check", success=False)
+        sql(f"REVOKE CONNECT ON DATABASE {catalog} FROM PUBLIC;")
+    sql(f"GRANT TEMP ON DATABASE nntune_ci TO {reader};")
+    isolated("check", success=False)
+    sql(f"REVOKE TEMP ON DATABASE nntune_ci FROM {reader};")
     # A stale or wrong routed password can only be discovered after CONNECT.
     assert "application grants passed" in isolated("grant", success=False,
         PRIVATE_TRIAL_WRITER_URL=f"postgresql://{writer}:wrong@127.0.0.1:{port}/{DATABASE}")
     assert "routed writer passed" in isolated("grant")
     assert "routed reader passed" in isolated("verify-overlay")
+    for catalog in ("nntune_ci", "template1"):
+        for role in (reader, writer):
+            denied = subprocess.run(["psql", "-XqAtw", "-c", "SELECT 1"], capture_output=True, text=True,
+                                    env={**base, "PGDATABASE": catalog, "PGUSER": role}, timeout=10)
+            assert denied.returncode and "permission denied for database" in denied.stderr
     sql(f"""
     INSERT INTO public.invite_codes(code_hash,created_at,expires_at) VALUES ('isolated-fixture',0,1);
     SET ROLE {writer};
@@ -334,9 +362,168 @@ try:
     scope.update(reader=[reader, role_oid(reader)], writer=[writer, role_oid(writer)])
     assert "staging CONNECT passed" not in isolated("grant", success=False)
     assert sql(f"SELECT has_database_privilege('{writer}',current_database(),'CONNECT');") == "f"
+
+    # Exercise supported ACL-only change and inverse while no trial role exists.
+    sql(f"DROP ROLE {reader}, {writer}; ALTER DATABASE {DATABASE} OWNER TO postgres;")
+    other = "trial_ambient_fixture"
+    provider = "trial_ambient_provider_fixture"
+    sql(f"CREATE DATABASE {other} TEMPLATE template0;\nCREATE DATABASE {provider} OWNER {owner} TEMPLATE template0;")
+    try:
+        sql(f"ALTER DATABASE template1 OWNER TO {owner};")
+        sql(f"GRANT CONNECT,TEMP ON DATABASE {DATABASE}, template1 TO PUBLIC;")
+        sql(f"REVOKE CONNECT ON DATABASE {provider} FROM PUBLIC;")
+        sql(f"GRANT CONNECT ON DATABASE template1 TO {executor} WITH GRANT OPTION;")
+        initial = json.loads(sql(ambient_acl.CATALOG))
+        assert sql(f"SELECT datacl IS NULL FROM pg_database WHERE datname='{other}';") == "t"
+        template_oid = next(row[0] for row in initial["databases"] if row[1] == "template1")
+        consumer = [[template_oid, role_oid(executor), executor, "CONNECT"],
+                    [template_oid, role_oid(executor), executor, "TEMPORARY"]]
+
+        plan = dict(branch_id="fixture", direct="direct.fixture.psdb.cloud", port=5432,
+                    baseline=initial, consumers=consumer)
+        db_meta = {"default_branch": "main"}
+        branch_meta = {"id": "fixture", "name": "staging", "ready": True, "production": False}
+        url = f"postgresql://postgres.fixture:{password}@{plan['direct']}:{plan['port']}/{DATABASE}"
+
+        def entrypoint(*, config=plan, owner_url=url, checksum=None, token="fixture:token",
+                       database=db_meta, branch=branch_meta, branch_status=200, accepted=False):
+            raw = json.dumps(config)
+            env = dict(AMBIENT_PLAN=raw, AMBIENT_PLAN_SHA256=checksum or hashlib.sha256(raw.encode()).hexdigest(),
+                       PRIVATE_TRIAL_OWNER_URL=owner_url)
+            if token is not None:
+                env["ISOLATED_TRIAL_BRANCH_READ"] = token
+            conn = Mock()
+            conn.getresponse.side_effect = [Mock(status=200, read=Mock(return_value=json.dumps(database).encode())),
+                                            Mock(status=branch_status, read=Mock(return_value=json.dumps(branch).encode()))]
+            with (patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", ["fixture", "check-ambient"]),
+                  patch.object(ambient_acl, "DATABASE_OID", database_oid),
+                  patch.object(ambient_acl.http.client, "HTTPSConnection", return_value=conn),
+                  patch.object(ambient_acl, "psql") as psql):
+                assert (ambient_acl.main() == 0) == accepted
+                if accepted:
+                    psql.assert_called_once()
+                    assert conn.request.call_count == 2 and token not in psql.call_args.args[0].values()
+                else:
+                    psql.assert_not_called()
+
+        entrypoint(accepted=True)
+        for invalid in (
+            dict(checksum="0" * 64), dict(config=plan | {"extra": True}),
+            dict(owner_url=url.replace(plan["direct"], "wrong.fixture.psdb.cloud")),
+            dict(owner_url=url.replace(":5432/", ":6432/")), dict(owner_url=url.replace("postgres.", "other.")),
+            dict(config=plan | {"port": 6432}, owner_url=url.replace(":5432/", ":6432/")),
+            dict(database={"default_branch": "staging"}), dict(branch=branch_meta | {"id": "other"}),
+            dict(branch=branch_meta | {"production": True}), dict(branch_status=503),
+            dict(token=None), dict(token="malformed"),
+        ):
+            entrypoint(**invalid)
+
+        def ambient(action, snapshot=initial):
+            return ambient_acl.compose(action, snapshot, consumer, database_oid, "postgres", fixture=True)
+
+        def refused(statement):
+            try:
+                sql(statement)
+            except AssertionError:
+                return
+            raise AssertionError("ambient ACL operation accepted an unsafe plan")
+
+        sql(ambient("check-ambient"))
+        assert json.loads(sql(ambient_acl.CATALOG)) == initial
+        sql(f"GRANT CONNECT ON DATABASE {provider} TO PUBLIC;")
+        try:
+            ambient("restrict-ambient", snapshot=json.loads(sql(ambient_acl.CATALOG)))
+        except StagingApplyError as error:
+            assert str(error) == "isolated database ACL grantor authority"
+        else:
+            raise AssertionError("ambient ACL operation accepted a foreign grantor")
+        sql(f"REVOKE CONNECT ON DATABASE {provider} FROM PUBLIC;")
+        assert json.loads(sql(ambient_acl.CATALOG)) == initial
+        sql("CREATE FUNCTION public.ambient_fixture_unexpected() RETURNS int LANGUAGE sql AS 'SELECT 1';")
+        refused(ambient("restrict-ambient"))
+        assert json.loads(sql(ambient_acl.CATALOG)) == initial
+        sql("DROP FUNCTION public.ambient_fixture_unexpected();")
+        forward = ambient("restrict-ambient")
+        reliant = "ambient_fixture_reliant"
+        sql(f"CREATE ROLE {reliant} LOGIN PASSWORD '{password}';")
+
+        @contextmanager
+        def public_client():
+            session = subprocess.Popen(["psql", "-XqAtw"], text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL,
+                                       env={**base, "PGDATABASE": "template1", "PGUSER": reliant, "PGCONNECT_TIMEOUT": "5"})
+            pid = None
+            try:
+                session.stdin.write("SELECT pg_backend_pid();\n")
+                session.stdin.flush()
+                pid = int(session.stdout.readline().strip())
+                yield
+            finally:
+                try:
+                    if pid is not None:
+                        pinned_backend = f"pid = {pid} AND usename = '{reliant}' AND datname = 'template1'"
+                        assert sql(f"SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE {pinned_backend};") in ("", "t")
+                        assert sql(f"SELECT NOT EXISTS (SELECT FROM pg_stat_activity WHERE {pinned_backend});") == "t"
+                finally:
+                    if session.poll() is None:
+                        session.terminate()
+                    session.wait(timeout=10)
+
+        try:
+            with public_client():
+                refused(forward)
+                assert json.loads(sql(ambient_acl.CATALOG)) == initial
+
+            # Wait for the first session scan, then connect while PUBLIC still has CONNECT.
+            prefix, boundary, rest = forward.partition("\\if :change_needed\n")
+            assert boundary
+            cutover = subprocess.Popen(["psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"], text=True,
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       env={**base, "PGDATABASE": DATABASE, "PGCONNECT_TIMEOUT": "5"})
+            try:
+                cutover.stdin.write(prefix + "SELECT 'precheck passed';\n")
+                cutover.stdin.flush()
+                assert any(line.strip() == "precheck passed" for line in cutover.stdout)
+                with public_client():
+                    _, error = cutover.communicate(boundary + rest, timeout=15)
+                    assert cutover.returncode != 0 and "contract refused" in error
+                    assert json.loads(sql(ambient_acl.CATALOG)) == initial
+            finally:
+                if cutover.poll() is None:
+                    cutover.terminate()
+                cutover.wait(timeout=10)
+        finally:
+            sql(f"DROP ROLE {reliant};")
+        changed = forward.replace("\\gexec\n", "\\gexec\nSELECT 1/0;\n", 1)
+        assert changed != forward
+        refused(changed)
+        assert json.loads(sql(ambient_acl.CATALOG)) == initial
+        sql(forward)
+        restricted = json.loads(sql(ambient_acl.CATALOG))
+        db_names = {entry[0]: entry[1] for entry in restricted["databases"]}
+        assert {(db_names[d], p) for d, grantee, _, p, _ in restricted["acl"] if grantee == 0} == {
+            ("nntune_ci", "TEMPORARY"), (provider, "TEMPORARY"),
+        }
+        assert sql(f"SELECT has_database_privilege('{executor}','template1','CONNECT WITH GRANT OPTION')"
+                   f" AND has_database_privilege('{executor}','template1','TEMPORARY');") == "t"
+        sql(forward)
+        assert json.loads(sql(ambient_acl.CATALOG)) == restricted
+        sql(f"CREATE ROLE {reader} NOLOGIN NOINHERIT;")
+        refused(ambient("restore-ambient"))
+        assert json.loads(sql(ambient_acl.CATALOG)) == restricted
+        sql(f"DROP ROLE {reader};")
+        sql(ambient("restore-ambient"))
+        sql(ambient("restore-ambient"))
+        assert json.loads(sql(ambient_acl.CATALOG)) == initial
+        assert sql(f"SELECT datacl IS NULL FROM pg_database WHERE datname='{other}';") == "f"
+    finally:
+        sql(f"DROP DATABASE {other};\nDROP DATABASE {provider};")
+    print("Isolated ambient ACL prepare, refusal, retry and restoration passed")
 finally:
     sql(f"""
     DROP DATABASE {DATABASE} WITH (FORCE);
+    ALTER DATABASE template1 OWNER TO postgres;
+    REVOKE CONNECT, TEMP ON DATABASE template1 FROM {executor};
     DROP ROLE IF EXISTS {reader}, {writer}, {executor}, {owner};
     GRANT CONNECT, TEMP ON DATABASE nntune_ci, postgres, template1 TO PUBLIC;
     """, database="nntune_ci")

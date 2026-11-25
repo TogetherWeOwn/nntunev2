@@ -99,7 +99,19 @@ def require(test):
     return f"DO $check$ BEGIN IF ({test}) IS NOT TRUE THEN RAISE EXCEPTION 'contract refused'; END IF; END $check$;\n"
 
 
-def audit(entries, *, exact):
+def isolated_extensions():
+    # The only approved installed extension is the catalog's PL/pgSQL.
+    return require("""SELECT count(*) = 1 AND bool_and(e.extname = 'plpgsql'
+             AND e.extversion = '1.0' AND n.nspname = 'pg_catalog')
+             FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace""")
+
+
+def other_database_connections(role):
+    return f"""SELECT FROM pg_database d WHERE d.datallowconn AND d.datname <> current_database()
+              AND has_database_privilege({role}, d.oid, 'CONNECT')"""
+
+
+def audit(entries, *, exact, database_preparation=False):
     """Without role inheritance or ownership, direct plus PUBLIC is effective."""
     expected = []
     for _, oid, kind, obj, privilege, columns in entries:
@@ -111,13 +123,15 @@ def audit(entries, *, exact):
             sub = (f"(SELECT attnum FROM pg_attribute WHERE attrelid = {obj_id} "
                    f"AND attname = {literal(col)} AND NOT attisdropped)") if col else "0"
             expected.append(f"({oid}::oid,'{catalog}'::regclass::oid,{obj_id},{sub},{literal(privilege)},false)")
-    values = ",\n".join(expected)
-    ids = ",".join(str(oid) for oid in sorted({entry[1] for entry in entries}))
+    values = "VALUES " + ",\n".join(expected) if expected else (
+        "SELECT NULL::oid, NULL::oid, NULL::oid, NULL::integer, NULL::text, NULL::boolean WHERE false"
+    )
+    ids = ",".join(str(oid) for oid in sorted({entry[1] for entry in entries})) or "NULL"
     routines = ", ".join(f"{literal(sig)}::regprocedure" for sig in ROUTINES)
     ambient = ",".join(f"to_regprocedure('public.{sig}')" for sig in AMBIENT)
     missing = "AND NOT EXISTS (SELECT * FROM expected EXCEPT SELECT * FROM direct)" if exact else ""
     return require(f"""
-WITH expected AS (SELECT * FROM (VALUES {values}) e(role_id, class_id, obj, sub, priv, opt)
+WITH expected AS (SELECT * FROM ({values}) e(role_id, class_id, obj, sub, priv, opt)
                   WHERE role_id IN (SELECT oid FROM pg_roles)),
 schemas AS (SELECT * FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema'),
 relations AS (SELECT c.* FROM pg_class c JOIN schemas s ON s.oid = c.relnamespace),
@@ -140,6 +154,7 @@ SELECT NOT EXISTS (SELECT * FROM direct EXCEPT SELECT * FROM expected)
   AND NOT EXISTS (
     SELECT FROM acl a WHERE role_id = 0 AND NOT (
         (class_id = 'pg_namespace'::regclass AND obj = 'public'::regnamespace AND priv = 'USAGE')
+        OR ({str(database_preparation).lower()} AND class_id = 'pg_database'::regclass)
         OR (class_id = 'pg_proc'::regclass AND priv = 'EXECUTE'
             AND obj IN (SELECT oid FROM routines WHERE NOT prosecdef AND oid IN ({ambient})))
     ))
@@ -150,8 +165,7 @@ SELECT NOT EXISTS (SELECT * FROM direct EXCEPT SELECT * FROM expected)
                     AND (a.class_id, a.obj, a.sub) = (d.classid, d.objid, d.objsubid)))
     )
   AND NOT EXISTS (
-    SELECT FROM pg_roles r CROSS JOIN pg_database d WHERE r.oid IN ({ids}) AND d.datallowconn
-      AND d.datname <> current_database() AND has_database_privilege(r.oid, d.oid, 'CONNECT,CREATE,TEMPORARY')
+    SELECT FROM pg_roles r WHERE r.oid IN ({ids}) AND EXISTS ({other_database_connections('r.oid')})
     )
   AND NOT EXISTS (SELECT FROM pg_proc WHERE oid IN ({routines})
                   AND (prosecdef OR prokind <> 'f' OR proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog, public']))

@@ -233,7 +233,12 @@ class WorkflowPolicyHardeningTests(unittest.TestCase):
         self.assertIn('staging_trial_role_lifecycle.py "$OPERATION" --isolated', setup)
         self.assertEqual(set(re.findall(r"secrets\.(\w+)", setup)),
                          {f"ISOLATED_TRIAL_{key}" for key in
-                          ("TARGET", "ROLE_SCOPE", "OWNER_URL", "EXECUTOR_URL", "READER_URL", "WRITER_URL")})
+                          ("TARGET", "ROLE_SCOPE", "OWNER_URL", "EXECUTOR_URL", "READER_URL", "WRITER_URL",
+                           "AMBIENT_PLAN", "BRANCH_READ")})
+        self.assertIn("default: ''", triggers)
+        self.assertIn("if: ${{ !endsWith(inputs.operation, '-ambient') }}", setup)
+        self.assertIn("if: ${{ endsWith(inputs.operation, '-ambient') }}", setup)
+        self.assertIn("AMBIENT_PLAN_SHA256: ${{ inputs.ambient_plan_sha256 }}", setup)
 
     def test_staging_readback_is_observation_only(self):
         text = (WORKFLOWS / "migrations-staging-readback.yml").read_text()

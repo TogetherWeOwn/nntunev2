@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Check authority, grant and install, verify routed access, fence, or retire
+        description: Isolated role lifecycle or pre-issuance database ACL operation
         type: choice
-        options: [check, grant, verify-overlay, fence, retire]
+        options: [check, grant, verify-overlay, fence, retire, check-ambient, restrict-ambient, restore-ambient]
         default: check
       ref:
         description: Full reviewed commit at protected main
@@ -16,6 +16,10 @@ on:
         description: Recorded approval reference for this staging operation
         type: string
         required: true
+      ambient_plan_sha256:
+        description: Reviewed private baseline and consumer plan SHA-256 for ambient ACL operations
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -57,6 +61,7 @@ jobs:
           fi
           test -r /etc/ssl/certs/ca-certificates.crt
       - name: Run the isolated database lifecycle
+        if: ${{ !endsWith(inputs.operation, '-ambient') }}
         env:
           OPERATION: ${{ inputs.operation }}
           ISOLATED_TRIAL_TARGET: ${{ secrets.ISOLATED_TRIAL_TARGET }}
@@ -69,3 +74,15 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 -E -s .github/scripts/staging_trial_role_lifecycle.py "$OPERATION" --isolated | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Prepare isolated database ACLs before trial role issuance
+        if: ${{ endsWith(inputs.operation, '-ambient') }}
+        env:
+          OPERATION: ${{ inputs.operation }}
+          AMBIENT_PLAN_SHA256: ${{ inputs.ambient_plan_sha256 }}
+          AMBIENT_PLAN: ${{ secrets.ISOLATED_TRIAL_AMBIENT_PLAN }}
+          ISOLATED_TRIAL_BRANCH_READ: ${{ secrets.ISOLATED_TRIAL_BRANCH_READ }}
+          PRIVATE_TRIAL_OWNER_URL: ${{ secrets.ISOLATED_TRIAL_OWNER_URL }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -E -s .github/scripts/staging_trial_ambient_acl.py "$OPERATION" | tee -a "$GITHUB_STEP_SUMMARY"
