@@ -980,8 +980,8 @@ def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=
                     REVOKE CONNECT ON DATABASE {LAUNCH} FROM {lifecycle.role};
                 """, **launch)
                 holder.stdin.write(f"""
-                    SELECT current_user::regrole::oid = {oid}
-                        AND NOT has_database_privilege(current_user, current_database(), 'CONNECT')
+                    SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = current_user AND oid = {oid})
+                        AND NOT has_database_privilege(current_database(), 'CONNECT')
                         AND EXISTS (SELECT FROM reader_scope.leaf WHERE id = 5);
                 """.encode())
                 holder.stdin.flush()
