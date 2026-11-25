@@ -266,7 +266,10 @@ async fn sequential_playback_waits_for_one_eof_at_the_short_final_frame() {
         .await
         .unwrap();
 
-    let first = play.next(f.page(), now).await.unwrap().unwrap();
+    let Poll::Ready(first) = futures_util::poll!(std::pin::pin!(play.next(f.page(), now))) else {
+        panic!("the first frame must be ready while EOF is pending");
+    };
+    let first = first.unwrap().unwrap();
     assert_eq!(first.as_slice(), &plaintext[..65_536]);
     assert_eq!(eof_reads.get(), 0);
     play.written(first.as_slice().len()).unwrap();
