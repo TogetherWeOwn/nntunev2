@@ -203,7 +203,11 @@ test('private staging invite serves curated audio and refuses access at cutoff',
       }
       const library = await getLibrary(outsider.request);
       const play = await requestFreshPlay(outsider.request, binding);
-      expect([library.status, play.status]).toEqual([403, 403]);
+      // Without the selector, the API uses its separate native play path.
+      const nativePlay = await post(outsider.request, PRIVATE_MUSIC.player.plays, {
+        track_id: play.trackId, session_id: randomUUID(),
+      });
+      expect([library.status, play.status, nativePlay.status]).toEqual([403, 403, 403]);
       observe('private-unlisted-refusal', fresh, play.trackId);
       return { uninvitedLibrary: library.status, uninvitedPlay: play.status };
     } finally {
