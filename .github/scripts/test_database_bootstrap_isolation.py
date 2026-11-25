@@ -737,15 +737,22 @@ def prove_publication_recovery(cluster, pending, *, partial, database_oid):
         # Reobserve the target over the setup endpoint using the original database OID as the pin.
         readback = f"""
             BEGIN READ ONLY;
-            SELECT oid FROM pg_database WHERE datname = current_database() AND oid = {database_oid}
+            SELECT oid FROM pg_database WHERE datname = current_database() AND oid = {{expected_oid}}
                 AND datname = '{lifecycle.plan.launch}'
                 AND datallowconn AND NOT datistemplate AND datdba = '{lifecycle.plan.owner_role}'::regrole;
             COMMIT;
         """
-        cluster.ok("refuse to reconcile a sibling at the setup endpoint", readback,
+        sibling = cluster.sql(f"SELECT oid FROM pg_database WHERE datname = '{SIBLING}';")
+        checked(sibling, "read back the sibling database OID")
+        sibling_oid = int(sibling.stdout)
+        require(sibling_oid != database_oid, "distinguish the sibling database from the pinned launch target")
+        launch = {"database": lifecycle.plan.launch, "host": lifecycle.plan.host}
+        cluster.ok("refuse a different OID on the launch route", readback.format(expected_oid=sibling_oid), **launch)
+        pinned_readback = readback.format(expected_oid=database_oid)
+        cluster.ok("refuse to reconcile a sibling at the setup endpoint", pinned_readback,
                    database=SIBLING, host=lifecycle.plan.host)
-        cluster.ok("reconcile the database from setup without reprovisioning", readback,
-                   f"{database_oid}\n", database=lifecycle.plan.launch, host=lifecycle.plan.host)
+        cluster.ok("reconcile the database from setup without reprovisioning", pinned_readback,
+                   f"{database_oid}\n", **launch)
         other_branch = branch[:-1] + ("1" if branch.endswith("0") else "0")
         other_record = record | {
             "review": record["review"] | {"branch_id": other_branch},
