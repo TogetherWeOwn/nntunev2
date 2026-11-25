@@ -57,28 +57,28 @@ test('the invited Library queues the chosen same-title tracks after sorting', as
 	await alderSelection.uncheck();
 	await expect(selectionCount).toHaveText('1 selected');
 
+	const menuName = `More actions for ${title}`;
+	const add = page.getByRole('menuitem', { name: 'Add to queue', exact: true });
 	await order.selectOption({ label: 'Title A–Z' });
 	await expect.poll(rowIds).toEqual([dawn.id, maple.id, alder.id]);
+	await expect(queue).toHaveCount(0);
+	await rows.nth(1).getByRole('button', { name: menuName, exact: true }).click();
+	await add.click();
+	await expect.poll(queueIds).toEqual([maple.id]);
+
 	await order.selectOption({ label: 'Artist A–Z' });
 	await expect.poll(rowIds).toEqual([alder.id, maple.id, dawn.id]);
 	await expect(mapleSelection).toBeChecked();
 	await expect(alderSelection).not.toBeChecked();
-	await expect(queue).toHaveCount(0);
-
-	const menuName = `More actions for ${title}`;
-	const add = page.getByRole('menuitem', { name: 'Add to queue', exact: true });
-	await rows.first().getByRole('button', { name: menuName, exact: true }).click();
-	await add.click();
-	await expect.poll(queueIds).toEqual([alder.id]);
 
 	// The two menu buttons share a name. Keyboard activation must return focus to the invoker.
-	const mapleMenu = row(maple.id).getByRole('button', { name: menuName, exact: true });
-	await mapleMenu.press('Enter');
+	await rows.first().getByRole('button', { name: menuName, exact: true }).press('Enter');
 	await expect(add).toBeVisible();
 	await page.keyboard.press('a');
 	await page.keyboard.press('Enter');
-	await expect(mapleMenu).toBeFocused();
-	await expect.poll(queueIds).toEqual([alder.id, maple.id]);
+	await expect(row(alder.id).getByRole('button', { name: menuName, exact: true })).toBeFocused();
+	// Queue order follows the add actions even though the Library shows Alder first.
+	await expect.poll(queueIds).toEqual([maple.id, alder.id]);
 	await expect(queue.nth(0)).toBeVisible();
 	await expect(queue.nth(1)).toBeVisible();
 	expect(await mediaSources.evaluate((sources) => [...sources].filter(Boolean))).toEqual([]);
