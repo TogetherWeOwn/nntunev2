@@ -108,7 +108,7 @@ In this synthetic handoff, `deploy.yml` reruns the same `<sha>` under the same
 | Artifact name | Handoff disposition |
 | --- | --- |
 | `staging-admission-<sha>-<run-id>-1-private-music` | Historical evidence from attempt 1, which the rerun superseded. |
-| `staging-admission-<sha>-<run-id>-2-private-music` | Use for verification when the run and required jobs identify attempt 2 and exactly one artifact has this name. |
+| `staging-admission-<sha>-<run-id>-<current-attempt>-private-music` | Use for verification when the run and required jobs identify the current attempt and exactly one artifact has this name. |
 
 If the handoff only identifies the run ID, the attempt records disagree, or
 the selected attempt has no unique matching artifact, record **Staging
@@ -116,6 +116,13 @@ admission** as Pending and **Dispatch readiness** as Blocked. Resolve the
 attempt and artifact from the same protected run before resuming step 3.
 The name selects the artifact for verification. The verifier still checks
 the archive digest and the receipt's own SHA, run ID and attempt.
+
+If attempt 2 reran only `staging-ingest`, the run can show green while the
+private journey and its Web, API and Stream deployments still belong to attempt
+1. Record attempt 2, the job that reran and the missing same-attempt jobs in the
+candidate record. Keep **Staging admission** Pending and **Dispatch readiness**
+Blocked. Follow the [unusable receipt handoff](#synthetic-handoff-for-an-unusable-receipt)
+to qualify a complete replacement attempt.
 
 ### Synthetic handoff for an unusable receipt
 
