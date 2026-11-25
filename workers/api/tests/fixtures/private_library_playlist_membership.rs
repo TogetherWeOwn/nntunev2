@@ -142,6 +142,24 @@ pub(super) async fn exercise(
         .await
         .unwrap();
     seed_membership(db, &alternate, track).await;
+    let account_fence = db.transaction().await.unwrap();
+    assert_eq!(
+        account_fence
+            .execute(
+                "UPDATE public.users SET deleting_at = now() WHERE id = $1",
+                &[&RECIPIENT],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        stage_removal(&account_fence, RECIPIENT, &alternate, track)
+            .await
+            .unwrap(),
+        0
+    );
+    account_fence.rollback().await.unwrap();
     assert_eq!(
         remove_membership(db, OTHER_MEMBER, &alternate, track).await,
         0
@@ -158,8 +176,8 @@ pub(super) async fn exercise(
     let mut peer = connect().await;
     let mut remover = connect().await;
     let pid = "SELECT pg_backend_pid()";
-    let holder = remover.query_one_scalar(pid, &[]).await.unwrap();
-    let waiter = peer.query_one_scalar(pid, &[]).await.unwrap();
+    let removal_pid = remover.query_one_scalar(pid, &[]).await.unwrap();
+    let append_pid = peer.query_one_scalar(pid, &[]).await.unwrap();
     let fence = "UPDATE public.libraries SET deleting_at = now() WHERE id = $1::text::uuid";
     for removing in [false, true] {
         if removing {
@@ -180,12 +198,13 @@ pub(super) async fn exercise(
         assert_eq!(changed, 1);
         let late = route(ctx, &owner, &mut peer, Append(pending_id, track.to_owned()));
         tokio::pin!(late);
-        blocker::observe_blocked(db, holder, waiter, late.as_mut())
+        blocker::observe_blocked(db, removal_pid, append_pid, late.as_mut())
             .await
             .unwrap();
         tx.commit().await.unwrap();
         assert_denied(late.await);
         assert_denied(route(ctx, &owner, db, Append(pending_id, track.to_owned())).await);
+        assert_eq!(remove_membership(db, RECIPIENT, &active, track).await, 0);
         let pending = body(route(ctx, &owner, db, Read(pending_id)).await, 200);
         assert_eq!(pending["entries"], json!([]));
         let dormant = body(route(ctx, &owner, db, Read(playlist)).await, 200);
@@ -197,7 +216,6 @@ pub(super) async fn exercise(
 
     // Seed a fresh case with one qualifying membership. The track row's
     // foreign-key lock stalls the insert after append locks that membership.
-    assert_eq!(remove_membership(db, RECIPIENT, &active, track).await, 0);
     seed_membership(db, &active, track).await;
     let first = body(
         route(ctx, &owner, db, Create("Append first".into())).await,
@@ -216,15 +234,17 @@ pub(super) async fn exercise(
         .unwrap();
     let first_append = route(ctx, &owner, &mut peer, Append(first_id, track.to_owned()));
     tokio::pin!(first_append);
-    blocker::observe_blocked(db, track_locker_pid, waiter, first_append.as_mut())
-        .await
-        .unwrap();
-
     let late_remove = remove_membership(&mut remover, RECIPIENT, &active, track);
     tokio::pin!(late_remove);
-    blocker::observe_blocked(db, waiter, holder, late_remove.as_mut())
-        .await
-        .unwrap();
+
+    // Give both observations one deadline within the database lock timeout.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        blocker::observe_blocked(db, track_locker_pid, append_pid, first_append.as_mut()).await?;
+        blocker::observe_blocked(db, append_pid, removal_pid, late_remove.as_mut()).await
+    })
+    .await
+    .expect("append and removal lock chain was not observed in time")
+    .unwrap();
     track_lock.commit().await.unwrap();
     let appended_first = body(first_append.await, 201);
     assert_eq!(appended_first["position"], 0);
