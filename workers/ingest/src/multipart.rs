@@ -199,6 +199,13 @@ pub struct UploadedPart<'a> {
     checksum: String,
 }
 
+impl UploadedPart<'_> {
+    /// The opaque provider tag from the validated part receipt.
+    pub fn etag(&self) -> &str {
+        &self.etag
+    }
+}
+
 pub struct Completion<'a> {
     plan: Plan<'a>,
     parts: Vec<UploadedPart<'a>>,
