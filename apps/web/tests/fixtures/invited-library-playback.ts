@@ -37,7 +37,8 @@ export async function mockInvitedLibraryPlayback(page: Page, origin: string, fix
 		if (!isListener(await call.headerValue('cookie')) || fixture.isRevoked?.()) return route.fulfill({ status: 403 });
 		const input = call.postDataJSON();
 		const trackId = typeof input?.track_id === 'string' ? fixture.playableTrackId(input.track_id) : undefined;
-		if (call.method() !== 'POST' || !trackId || input.track_id !== trackId ||
+		const track = fixture.libraryItems().find(({ id }) => id === trackId);
+		if (call.method() !== 'POST' || !trackId || !track || input.track_id !== trackId ||
 			await call.headerValue('x-nntune-browser-playback') !== '1' || await call.headerValue('x-nntune-session-binding') !== binding) {
 			return route.fulfill({ status: 400 });
 		}
@@ -49,7 +50,7 @@ export async function mockInvitedLibraryPlayback(page: Page, origin: string, fix
 		}
 		if (fixture.grantUnavailable?.(trackId)) return route.fulfill({ status: 503 });
 		playback = { trackId, sessionId: input.session_id };
-		return route.fulfill({ json: { trackId, playbackSessionId: playback.sessionId, sessionBinding: binding, playId, durationMs: 14_000 } });
+		return route.fulfill({ json: { trackId, playbackSessionId: playback.sessionId, sessionBinding: binding, playId, durationMs: track.duration_ms } });
 	});
 	await page.route(`${origin}/v1/plays/media/**`, async (route) => {
 		const call = route.request();

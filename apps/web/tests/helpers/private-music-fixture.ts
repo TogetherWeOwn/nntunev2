@@ -10,12 +10,16 @@ export function hasFixtureSession(cookie: string | null, account: string) {
 }
 
 export function serveFlac(route: Route, body: Buffer) {
+	return serveRangedAudio(route, body, 'audio/flac');
+}
+
+export function serveRangedAudio(route: Route, body: Buffer, contentType: 'audio/flac' | 'audio/wav') {
 	const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers()['range'] ?? '');
 	const start = range ? Number(range[1]) : 0;
 	const end = range?.[2] ? Math.min(Number(range[2]), body.length - 1) : body.length - 1;
 	if (start > end) return route.fulfill({ status: 416, headers: { 'content-range': `bytes */${body.length}` } });
 	return route.fulfill({
-		status: range ? 206 : 200, contentType: 'audio/flac', body: body.subarray(start, end + 1),
+		status: range ? 206 : 200, contentType, body: body.subarray(start, end + 1),
 		headers: { 'accept-ranges': 'bytes', ...(range && { 'content-range': `bytes ${start}-${end}/${body.length}` }) }
 	});
 }

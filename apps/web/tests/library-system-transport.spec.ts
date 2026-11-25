@@ -1,4 +1,8 @@
 import { expect, test, type Page } from '@playwright/test';
+import { expectedSyntheticBody } from '../../../e2e/helpers/demo-audio.js';
+import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
+import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.js';
+import { playQueuedTrack, test as signedInTest } from './helpers/private-music-fixture.js';
 
 type Probe = {
 	handlers: Record<string, (() => void) | null>;
@@ -14,7 +18,7 @@ const coral = {
 	streamUrl: '/api/demo/audio?track=coral'
 };
 
-async function openWithSystemControls(page: Page, items = [coral]) {
+async function recordSystemControls(page: Page) {
 	await page.addInitScript(() => {
 		const handlers: Probe['handlers'] = {};
 		window.__librarySystemTransport = { handlers, retired: {}, retiredPlays: 0 };
@@ -25,6 +29,17 @@ async function openWithSystemControls(page: Page, items = [coral]) {
 			}, configurable: true
 		});
 	});
+}
+
+async function rememberSystemControls(page: Page) {
+	await page.evaluate(() => {
+		const probe = window.__librarySystemTransport;
+		probe.retired = { ...probe.handlers };
+	});
+}
+
+async function openWithSystemControls(page: Page, items = [coral]) {
+	await recordSystemControls(page);
 	await page.route('**/api/library', (route) => route.fulfill({ json: items }));
 	await page.goto(`/library?track=${coral.id}&t=2`);
 	await expect(page.getByTestId('audio-player')).toBeVisible();
@@ -32,10 +47,7 @@ async function openWithSystemControls(page: Page, items = [coral]) {
 		const metadata = navigator.mediaSession.metadata;
 		return [metadata?.title, metadata?.artist, metadata?.album];
 	})).toEqual([coral.title, coral.artist, coral.release]);
-	await page.evaluate(() => {
-		const probe = window.__librarySystemTransport;
-		probe.retired = { ...probe.handlers };
-	});
+	await rememberSystemControls(page);
 }
 
 const systemAction = (page: Page, action: 'play' | 'pause' | 'nexttrack' | 'previoustrack') =>
@@ -159,51 +171,127 @@ test('system Next resolves a bulk-added source and keeps the live decoder for an
 	await expect.poll(title).toBe(coral.title);
 });
 
-for (const path of ['/pricing', '/demo/player']) {
-	test(`navigation to ${path} retires the app's system controls`, async ({ page }) => {
-		await openWithSystemControls(page);
-		const audio = (await page.getByTestId('audio-player').elementHandle())!;
-		await audio.evaluate((el: HTMLAudioElement) => {
-			el.play = async () => { window.__librarySystemTransport.retiredPlays += 1; };
-		});
-		await page.evaluate((href) => {
-			const link = Object.assign(document.createElement('a'), { href });
-			document.body.append(link);
-			link.click();
-		}, path);
-		await expect(page).toHaveURL(new RegExp(`${path}$`));
-		await expect(page.getByTestId('audio-player')).toHaveCount(0);
-		const snapshot = () => page.evaluate(() => ({
-			title: navigator.mediaSession.metadata?.title ?? null,
-			active: Object.keys(window.__librarySystemTransport.handlers).filter((action) =>
-				window.__librarySystemTransport.handlers[action]).sort()
-		}));
-		const retiredAction = (action: 'play' | 'pause') =>
-			page.evaluate((key) => window.__librarySystemTransport.retired[key]!(), action);
-		if (path === '/demo/player') {
-			const demo = page.getByTestId('demo-audio');
-			await expect(demo).toBeVisible();
-			await expect.poll(async () => (await snapshot()).active).toContain('seekto');
-			const current = await snapshot();
-			expect(current.title).toBeTruthy();
-			expect(current.title).not.toBe(coral.title);
-			await retiredAction('play');
-			await expect(demo).toHaveJSProperty('paused', true);
-			await systemAction(page, 'play');
-			await expect(demo).toHaveJSProperty('paused', false);
-			await retiredAction('pause');
-			expect(await demo.evaluate((el: HTMLAudioElement) => el.paused)).toBe(false);
-			await systemAction(page, 'pause');
-			await expect(demo).toHaveJSProperty('paused', true);
-			expect(await snapshot()).toEqual(current);
-		} else {
-			const cleared = { title: null, active: [] };
-			await expect.poll(snapshot).toEqual(cleared);
-			await retiredAction('play');
-			expect(await snapshot()).toEqual(cleared);
-			await retiredAction('pause');
-			expect(await snapshot()).toEqual(cleared);
-		}
-		expect(await page.evaluate(() => window.__librarySystemTransport.retiredPlays)).toBe(0);
-	});
+async function navigateInApp(page: Page, path: string) {
+	await page.evaluate((href) => {
+		const link = Object.assign(document.createElement('a'), { href });
+		document.body.append(link);
+		link.click();
+		link.remove();
+	}, path);
 }
+
+const systemSnapshot = (page: Page) => page.evaluate(() => {
+	const { metadata } = navigator.mediaSession;
+	const { handlers } = window.__librarySystemTransport;
+	return {
+		metadata: metadata && { title: metadata.title, artist: metadata.artist, album: metadata.album, artwork: metadata.artwork },
+		active: Object.keys(handlers).filter((action) => handlers[action]).sort()
+	};
+});
+const cleared = { metadata: null, active: [] };
+
+const retiredAction = (page: Page, action: 'play' | 'pause') =>
+	page.evaluate((key) => window.__librarySystemTransport.retired[key]!(), action);
+
+test("navigation to /pricing retires the app's system controls", async ({ page }) => {
+	await openWithSystemControls(page);
+	const audio = (await page.getByTestId('audio-player').elementHandle())!;
+	await audio.evaluate((el: HTMLAudioElement) => {
+		el.play = async () => { window.__librarySystemTransport.retiredPlays += 1; };
+	});
+	await navigateInApp(page, '/pricing');
+	await expect(page).toHaveURL(/\/pricing$/);
+	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	await expect.poll(() => systemSnapshot(page)).toEqual(cleared);
+	await retiredAction(page, 'play');
+	expect(await systemSnapshot(page)).toEqual(cleared);
+	await retiredAction(page, 'pause');
+	expect(await systemSnapshot(page)).toEqual(cleared);
+	expect(await page.evaluate(() => window.__librarySystemTransport.retiredPlays)).toBe(0);
+});
+
+signedInTest('a remounted Library player owns system Play and Pause', async ({ page, origin }) => {
+	const { library, player } = PRIVATE_MUSIC;
+	const first = {
+		id: '00000000-0000-4000-8000-000000000001', title: 'First Tone', artist: 'First Artist',
+		release: 'First Album', duration_ms: 16_381
+	};
+	const second = {
+		...first, id: '00000000-0000-4000-8000-000000000002', title: 'Second Tone',
+		artist: 'Second Artist', release: 'Second Album'
+	};
+	const tracks = [first, second];
+	const fixture = await mockInvitedLibraryPlayback(page, origin, {
+		libraryItems: () => tracks,
+		playableTrackId: (id) => tracks.find((track) => track.id === id)?.id,
+		audio: expectedSyntheticBody(), audioContentType: 'audio/wav'
+	});
+	await recordSystemControls(page);
+	await fixture.signIn();
+	await page.goto(origin + library.path);
+
+	const native = page.getByTestId(player.audio);
+	const time = () => native.evaluate((el: HTMLAudioElement) => el.currentTime);
+	const snapshot = () => systemSnapshot(page);
+	const expectTrack = (track: typeof first) => expect.poll(snapshot).toMatchObject({
+		metadata: { title: track.title, artist: track.artist, album: track.release },
+		active: expect.arrayContaining(['play', 'pause', 'seekto'])
+	});
+	const playTrack = async (track: typeof first) => {
+		await page.getByTestId(library.item).and(page.locator(`[${library.id}="${track.id}"]`))
+			.locator(library.select).click();
+		expect((await playQueuedTrack(page, origin, track.title)).status()).toBe(200);
+		await expect(native).toHaveAttribute('src', fixture.mediaPath(track.id));
+		await expect.poll(time).toBeGreaterThan(0.1);
+		await expectTrack(track);
+	};
+	await playTrack(first);
+	await rememberSystemControls(page);
+	const oldAudio = (await native.elementHandle())!;
+	await oldAudio.evaluate((el: HTMLAudioElement) => {
+		el.play = async () => { window.__librarySystemTransport.retiredPlays += 1; };
+	});
+
+	// The public route destroys the app player while keeping the recorded callbacks in this document.
+	await navigateInApp(page, '/');
+	await expect(page).toHaveURL(origin + '/');
+	await expect(page.getByTestId('library-list')).toHaveCount(0);
+	await expect(native).toHaveCount(0);
+	expect(await oldAudio.evaluate((el: HTMLAudioElement) => !el.isConnected && el.paused)).toBe(true);
+	await expect.poll(snapshot).toEqual(cleared);
+	await page.goBack();
+	await expect(page).toHaveURL(origin + library.path);
+	await playTrack(second);
+	const freshAudio = (await native.elementHandle())!;
+	expect(await oldAudio.evaluate((old, fresh) => old !== fresh && !old.isConnected && fresh.isConnected, freshAudio)).toBe(true);
+	expect(await page.evaluate(() => {
+		const { handlers, retired } = window.__librarySystemTransport;
+		return ['play', 'pause'].every((action) => retired[action] && handlers[action] !== retired[action]);
+	})).toBe(true);
+
+	// Count calls while preserving native behavior so a stale call cannot hide behind a later valid action.
+	const calls = await freshAudio.evaluateHandle((el: HTMLAudioElement) => {
+		const calls = { play: 0, pause: 0 };
+		const { play, pause } = el;
+		el.play = () => { calls.play += 1; return play.call(el); };
+		el.pause = () => { calls.pause += 1; pause.call(el); };
+		return calls;
+	});
+	const current = await snapshot();
+	await retiredAction(page, 'pause');
+	expect(await freshAudio.evaluate((el: HTMLAudioElement) => el.paused)).toBe(false);
+	expect(await snapshot()).toEqual(current);
+	await systemAction(page, 'pause');
+	await expect(native).toHaveJSProperty('paused', true);
+	const pausedAt = await time();
+	await retiredAction(page, 'play');
+	expect(await freshAudio.evaluate((el: HTMLAudioElement) => el.paused)).toBe(true);
+	expect(await snapshot()).toEqual(current);
+	await systemAction(page, 'play');
+	await expect(native).toHaveJSProperty('paused', false);
+	await expect.poll(time).toBeGreaterThan(pausedAt + 0.1);
+
+	expect(await calls.jsonValue()).toEqual({ play: 1, pause: 1 });
+	expect(await snapshot()).toEqual(current);
+	expect(await page.evaluate(() => window.__librarySystemTransport.retiredPlays)).toBe(0);
+});
