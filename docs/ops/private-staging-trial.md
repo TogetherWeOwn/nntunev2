@@ -25,6 +25,8 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    both routed logins independently lack CONNECT to every other connectable
    database, including templates. Retain the original protected scope for
    withdrawal.
+   For the dedicated PostgreSQL trial with Cloudflare resources, see the
+   [Stage C1 temporary API token example](stage-c1-temporary-api-token.md).
 2. **Check protected inputs.** Store the existing role-scope JSON in
    staging as `ISOLATED_TRIAL_ROLE_SCOPE`. Set `ISOLATED_TRIAL_TARGET` to a
    reviewed JSON object with `database_oid` and `executor_oid` (numbers),
