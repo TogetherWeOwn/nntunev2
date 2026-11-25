@@ -24,7 +24,19 @@ test('signup start limit shows paywall without a duplicate inline alert', async 
 	);
 });
 
-test('signup finish limit preserves the code and challenge for retry', async ({ page }) => {
+test('signup finish limit preserves the code and challenge for retry', async ({ page, baseURL }) => {
+	const origin = new URL(baseURL ?? 'about:blank');
+	if (!['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) {
+		throw new Error('Invite signup requires a loopback browser fixture');
+	}
+	const invite = 'synthetic_invite_codeA';
+	await page.addInitScript(() => {
+		const events: { url: string; detail: unknown }[] = [];
+		Reflect.set(window, '__signupPaywallEvents', events);
+		window.addEventListener('usage_limit_paywall_shown', (event) => {
+			events.push({ url: location.href, detail: (event as CustomEvent).detail });
+		});
+	});
 	await page.addInitScript(() => {
 		class FixturePublicKeyCredential {
 			id = 'fixture-credential';
@@ -76,7 +88,8 @@ test('signup finish limit preserves the code and challenge for retry', async ({ 
 		}
 	});
 
-	await page.goto('/signup');
+	await page.goto(`/signup#invite=${invite}`);
+	await expect(page.getByLabel('Invite code (if you have one)', { exact: true })).toHaveValue(invite);
 	await page.getByTestId('signup-email').fill('alice@example.com');
 	await page.getByTestId('signup-submit').click();
 	await page.getByLabel('Email code').fill('fixture-code');
@@ -84,6 +97,10 @@ test('signup finish limit preserves the code and challenge for retry', async ({ 
 
 	const dialog = page.getByRole('dialog');
 	await expect(dialog).toBeVisible();
+	expect(await page.evaluate(() => Reflect.get(window, '__signupPaywallEvents'))).toEqual([{
+		url: new URL('/signup', origin).href,
+		detail: { kind: 'retryable', status: 429, code: 'rate_limited', retryAfterSeconds: 300 }
+	}]);
 	await expect(page.getByRole('alert')).toHaveCount(0);
 	await expect(page.getByLabel('Email code')).toBeVisible();
 	await expect(page.getByLabel('Email code')).toHaveValue('fixture-code');
@@ -111,12 +128,13 @@ test('signup finish limit preserves the code and challenge for retry', async ({ 
 		}));
 	}));
 	await page.getByRole('button', { name: /finish creating account/i }).click();
-	await page.waitForURL('/account/billing');
+	await expect(page).toHaveURL(new URL('/account/billing', origin).href);
 	expect(await page.evaluate(() => [sessionStorage.getItem('test.disabled'), sessionStorage.getItem('test.passkeys')])).toEqual(['3', '2']);
 	expect(finishPosts).toBe(2);
 	expect(finishBodies[1]).toEqual(finishBodies[0]);
 	expect(finishBodies[1]).toMatchObject({
 		challenge: 'Y2hhbGxlbmdl',
-		magic_token: 'fixture-code'
+		magic_token: 'fixture-code',
+		invite_code: invite
 	});
 });

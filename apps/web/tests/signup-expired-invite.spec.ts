@@ -54,6 +54,11 @@ test('expired private invite is refused without opening Library or requesting a 
 	});
 
 	const laterNavigations: string[] = [];
+	let leakedRequestUrl = false;
+	let leakedDiagnostic = false;
+	page.on('request', (request) => { leakedRequestUrl ||= request.url().includes(invite.code); });
+	page.on('console', (message) => { leakedDiagnostic ||= message.text().includes(invite.code); });
+	page.on('pageerror', (error) => { leakedDiagnostic ||= error.message.includes(invite.code); });
 	page.on('framenavigated', (frame) => {
 		if (frame === page.mainFrame()) laterNavigations.push(frame.url());
 	});
@@ -62,7 +67,8 @@ test('expired private invite is refused without opening Library or requesting a 
 	await page.addInitScript(() => {
 		Object.defineProperty(window, '__signupInitialHistoryLength', { value: history.length });
 	});
-	await page.goto(inviteUrl.href);
+	const entry = await page.goto(inviteUrl.href);
+	expect(entry?.headers()['referrer-policy']).toBe('no-referrer');
 	const inviteCode = page.getByRole('textbox', { name: 'Invite code (if you have one)' });
 	await expect(inviteCode).toHaveValue(invite.code);
 	await expect(page).toHaveURL(signupUrl.href);
@@ -81,8 +87,12 @@ test('expired private invite is refused without opening Library or requesting a 
 	await page.goBack();
 	await expect(page).toHaveURL(signupUrl.href);
 	await expect(inviteCode).toHaveValue('');
+	await page.goForward();
+	await expect(page).toHaveURL(loginUrl);
 
 	expect(starts).toEqual([{ email, invite_code: invite.code }]);
 	expect(unexpectedRequests).toEqual([]);
-	expect(laterNavigations.slice(subsequentNavigations)).toEqual([loginUrl, signupUrl.href]);
+	expect(laterNavigations.slice(subsequentNavigations)).toEqual([loginUrl, signupUrl.href, loginUrl]);
+	expect(leakedRequestUrl, 'a browser request URL included the synthetic invite').toBe(false);
+	expect(leakedDiagnostic, 'a browser diagnostic included the synthetic invite').toBe(false);
 });
