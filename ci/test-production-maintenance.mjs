@@ -198,13 +198,18 @@ test('protected bootstrap command reconciles a committed seed after a lost respo
   const checkedAt = new Date().toISOString().slice(0, 19) + 'Z';
   for (const submission of ['lost', 'partial', 'no-commit']) {
     const preload = `
-      import assert from 'node:assert/strict';
       import { seedTransport } from ${JSON.stringify(transport)};
       const { calls, request } = seedTransport(
         ${JSON.stringify({ account, checkedAt, sha, version, workerId })}, ${JSON.stringify({ submission })}
       );
       globalThis.fetch = request;
-      process.on('exit', () => assert.equal(calls.filter(([method]) => method === 'POST').length, 1));
+      process.on('exit', () => {
+        const posts = calls.filter(([method]) => method === 'POST').length;
+        if (posts !== 1) {
+          console.error('Expected one seed POST, saw ' + posts);
+          process.exitCode = 2;
+        }
+      });
     `;
     const result = spawnSync('/bin/bash', ['-c', seedCommand], {
       env: {
