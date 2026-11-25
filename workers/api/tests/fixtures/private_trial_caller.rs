@@ -491,7 +491,10 @@ pub(crate) async fn verify_publication(
     };
     for stored in [None, Some(14_001)] {
         assert_eq!(set_duration(stored).await, 1);
-        assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
+        assert_eq!(
+            publish(&mut publication, upload_writer, None).await.status,
+            404
+        );
         let duration: Option<i32> = observer
             .query_one(
                 "SELECT duration_ms FROM public.tracks WHERE id = $1::text::uuid",
