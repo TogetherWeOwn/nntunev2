@@ -123,8 +123,11 @@ test clock.
    acceptance open.
 
 Before testing checkout, confirm hourly trigger `0 * * * *` fires on the same
-build. It rotates through up to 16 due targets. Keep test timing within one
-batch. Resolve ambiguous old payments before reusing their flight. Remove
+build. Before withholding renewal webhooks, confirm the synthetic subscription
+is due by PostgreSQL time and appears in the next hourly batch of up to 16
+targets. The [sweep](../workers/api/src/billing_sweep.rs) requires an eligible
+status and absent or elapsed `paid_through_at`. The Stripe test clock advances
+provider time. Resolve ambiguous old payments before reusing their flight. Remove
 `PAID_INVITE_BILLING` to close paid dispatch.
 Check Worker error logs for unresolved scheduled targets.
 
