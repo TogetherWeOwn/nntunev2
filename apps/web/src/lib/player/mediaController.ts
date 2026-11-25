@@ -216,6 +216,24 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		readPlayback(audio, ownsPause, get(playbackStatus));
 	}
 
+	function nextFromQueue(): void {
+		if (!selection) return;
+		const base = queue.snapshot;
+		const next = nextTrack(base);
+		if (next === base) return;
+		const transport = selection.prepare && transportTarget();
+		if (transport && !transport.audio.paused && !transport.audio.ended && !transport.audio.error &&
+			transport.matches(() => queue.snapshot === base)) {
+			// Keep the current decoder until the successor's grant is accepted.
+			if (pendingGrant !== undefined) return;
+			const target = currentTrack(next);
+			const source = target && queue.sourceForQueuedPlay(target.id);
+			if (source) void playSelected(next, next.currentIndex, source);
+			return;
+		}
+		if (queue.snapshot === base) selection.commit(next);
+	}
+
 	function navigateQueue(step: (state: QueueState) => QueueState): void {
 		if (!selection) return;
 		const base = queue.snapshot;
@@ -227,7 +245,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		const source = queue.sourceForQueuedPlay(target.id, resolveStreamUrl(target) || undefined);
 		if (selection.prepare && source?.isCurrent()) return void selection.commit(next);
 		if (!source?.streamUrl || !source.isCurrent()) return;
-		// Match Library Next's paused handoff, hydrating only the destination slot.
+		// A paused handoff hydrates only the destination slot.
 		if (target.streamUrl === source.streamUrl) selection.commit(next);
 		else {
 			const tracks = [...next.tracks];
@@ -663,7 +681,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		seekFeedback: { subscribe: seekFeedback.subscribe },
 		absoluteSeek: { subscribe: absoluteSeek.subscribe }, seek,
 		playbackStatus: { subscribe: playbackStatus.subscribe },
-		playCurrent, pauseCurrent, retryCurrent: () => startCurrent(true),
+		playCurrent, pauseCurrent, nextFromQueue, retryCurrent: () => startCurrent(true),
 		bindPausedTransport(track: Track) {
 			const lifetime = pausedTransport = new AbortController();
 			const guard = (run: () => void) => () => { if (!lifetime.signal.aborted && !queue.purging) run(); };

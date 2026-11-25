@@ -79,7 +79,6 @@
 		keepCurrentAndUpcoming,
 		insertTracks,
 		insertTracksNext,
-		nextTrack,
 		playNext,
 		removeTrack,
 		selectTrack as selectQueueIndex,
@@ -2098,7 +2097,7 @@
 				liveRegions={!loading}
 				confirmDestructive
 				confirmGeneration={queueConfirmGeneration}
-				onnext={() => replaceQueue(nextTrack(queueController.snapshot))}
+				onnext={media.nextFromQueue}
 				onshuffle={() => replaceQueue(shuffleUpcoming(queueController.snapshot))}
 				onmove={player.moveQueuedTrack}
 				oninsert={insertQueuedIds}
