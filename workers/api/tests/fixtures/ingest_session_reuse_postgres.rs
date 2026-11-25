@@ -153,6 +153,13 @@ pub(super) async fn protect_completed(
             .verified()
             .matches_committed_outcome(reused.outcome()));
     }
+    observer
+        .execute(
+            credential_deadline,
+            &[&auth.record.id, &(auth.record.expires_at as i64)],
+        )
+        .await
+        .unwrap();
     let wrong_map = CandidateIntent {
         map_id: [0xff; 16],
         ..*prepared.intent
@@ -172,13 +179,14 @@ pub(super) async fn protect_completed(
         .await,
         Err(Refused)
     ));
-    observer
-        .execute(
-            credential_deadline,
-            &[&auth.record.id, &(auth.record.expires_at as i64)],
+    assert!(observer
+        .query_one(
+            "SELECT upload_until = $2 FROM public.storage_validated_digest_winners WHERE object_id = $1::text::uuid",
+            &[obj, &cutoff],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .get::<_, bool>(0));
     let extended = reuse(writer, auth, &scope, job, reload).await.unwrap();
     assert_pins(extended.outcome(), expected);
     assert!(extended.usable_until() > cutoff);

@@ -258,13 +258,13 @@ pub enum UploadAttempt<'a> {
 /// Try reuse for this reservation's exact final checkpoint before starting an
 /// upload. Supply the existing trusted preparation and current authority
 /// reader. Reuse returns protected pins for comparison with authenticated
-/// receipts, just like completion replay. Its deadline remains attached.
+/// receipts. `upload_until` bounds a fresh upload. Reuse has its own deadline.
 /// A refusal can proceed only through the normal lease for a fresh upload.
 pub async fn open_or_reuse<'a>(
     writer: &mut Client,
     auth: Authorization<'_>,
     prepared: PreparedUpload<'a>,
-    until: SystemTime,
+    upload_until: SystemTime,
     reader: impl AsyncFnOnce(
         &str,
         &CompletionScope<'_>,
@@ -277,27 +277,24 @@ pub async fn open_or_reuse<'a>(
     ) -> Result<DurableUpload<'a>, HandoffError>,
 ) -> Result<UploadAttempt<'a>, UploadError> {
     prepared.validate()?;
-    match reuse(
+    let [_, _, object, _, configuration] = prepared.intent.identities;
+    let matches_intent = |outcome: &CommittedOutcome| {
+        outcome.map.replace('-', "") == uuid_text(prepared.intent.map_id)
+            && outcome.object.replace('-', "") == uuid_text(object)
+            && outcome.configuration.replace('-', "") == uuid_text(configuration)
+    };
+    match reuse_if(
         writer,
         auth,
         &prepared.completed_scope(),
         prepared.job,
         reader,
+        matches_intent,
     )
     .await
     {
-        Ok(protected) => {
-            let outcome = protected.outcome();
-            let [_, _, object, _, configuration] = prepared.intent.identities;
-            if outcome.map.replace('-', "") != uuid_text(prepared.intent.map_id)
-                || outcome.object.replace('-', "") != uuid_text(object)
-                || outcome.configuration.replace('-', "") != uuid_text(configuration)
-            {
-                return Err(Refused);
-            }
-            Ok(UploadAttempt::Reused(protected))
-        }
-        Err(Refused) => open(writer, auth, prepared, until, start)
+        Ok(protected) => Ok(UploadAttempt::Reused(protected)),
+        Err(Refused) => open(writer, auth, prepared, upload_until, start)
             .await
             .map(UploadAttempt::Opened),
         Err(Unconfirmed) => Err(Unconfirmed),
@@ -340,11 +337,31 @@ pub async fn reuse(
         &CompletionScope<'_>,
     ) -> Result<Option<CurrentAuthorization>, StoreError>,
 ) -> Result<ProtectedReuse, UploadError> {
+    reuse_if(writer, auth, scope, job, reader, |_| true).await
+}
+
+async fn reuse_if(
+    writer: &mut Client,
+    auth: Authorization<'_>,
+    scope: &CompletionScope<'_>,
+    job: &Job<'_>,
+    reader: impl AsyncFnOnce(
+        &str,
+        &CompletionScope<'_>,
+    ) -> Result<Option<CurrentAuthorization>, StoreError>,
+    accepts: impl FnOnce(&CommittedOutcome) -> bool,
+) -> Result<ProtectedReuse, UploadError> {
     authorize_scope(auth, scope, job, Action::Reuse)?;
     protect_completion_reuse(
         writer,
         scope,
-        async |locked| reauthorize(auth, locked, job, Action::Reuse, reader).await,
+        async |locked, outcome| {
+            let until = reauthorize(auth, locked, job, Action::Reuse, reader).await?;
+            if !accepts(outcome) {
+                return Err(OutcomeError::Refused);
+            }
+            Ok(until)
+        },
         || UNIX_EPOCH + Duration::from_millis(now_millis()),
     )
     .await
