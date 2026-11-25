@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { s3_completion_test: complete } = require('./ingest_wasm.cjs');
+const { s3_completion_test: complete, s3_fixture_retirement_test: retire } = require('./ingest_wasm.cjs');
 const {
   authorization, bucket, checksum, completionReceipt, initiatedId, initiatedQuery,
   initiationHeaders, initiationReceipt, mapId, mediaKey, sha256, sidecarKey, uploadQuery,
@@ -16,8 +16,8 @@ const headHeaders = { 'x-amz-version-id': version, 'content-length': String(ciph
 const transportFailure = 'Unconfirmed(None)';
 const rejectedWith = (expected) => (error) => error === expected;
 
-async function verifySignedRequest(request, method, query, operationHeaders, objectKey = mediaKey) {
-  const path = `/${bucket}/${objectKey}`;
+async function verifySignedRequest(request, method, query, operationHeaders, objectKey = mediaKey, targetBucket = bucket) {
+  const path = `/${targetBucket}/${objectKey}`;
   assert.equal(request.url, `https://fixture.test:8443${path}${query ? `?${query}` : ''}`);
   assert.equal(request.method, method);
   assert.equal(request.redirect, 'manual');
@@ -42,6 +42,40 @@ async function verifySignedRequest(request, method, query, operationHeaders, obj
     authorization(method, path, query, fields, 'FIXTUREACCESS', 'fixture-secret', 'fixture-region'));
   return body;
 }
+
+const retirementBucket = 'nntunev2-private-fixtures-staging';
+
+for (const key of [mediaKey, sidecarKey]) {
+  test(`retirement signs DELETE and HEAD against the same exact version of ${key.split('/')[0]}`, async (t) => {
+    const methods = [];
+    const fetch = t.mock.method(globalThis, 'fetch', async (request) => {
+      methods.push(request.method);
+      const body = await verifySignedRequest(request, request.method, versionQuery, {}, key, retirementBucket);
+      assert.equal(body.length, 0);
+      return new Response(null, { status: request.method === 'DELETE' ? 204 : 404 });
+    });
+    await retire(retirementBucket, key, version);
+    assert.deepEqual(methods, ['DELETE', 'HEAD']);
+    assert.equal(fetch.mock.callCount(), 2);
+  });
+}
+
+test('retirement refuses a foreign bucket, unexpected key or absent version before fetch', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', () => assert.fail('unexpected fetch'));
+  for (const args of [[bucket, mediaKey, version], [retirementBucket, `${mediaKey}/../other`, version],
+    [retirementBucket, sidecarKey.replace(/00000000$/, '00000001'), version], [retirementBucket, mediaKey, 'null']]) {
+    await assert.rejects(retire(...args), rejectedWith('Refused'));
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('retirement refuses to confirm when the exact version still answers HEAD', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (request) => {
+    await verifySignedRequest(request, request.method, versionQuery, {}, mediaKey, retirementBucket);
+    return new Response(null, { status: request.method === 'DELETE' ? 204 : 200 });
+  });
+  await assert.rejects(retire(retirementBucket, mediaKey, version), rejectedWith('Unconfirmed'));
+});
 
 test('signs the exact multipart POST once and collects its version and body', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', async (request) => {

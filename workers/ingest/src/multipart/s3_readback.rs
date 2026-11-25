@@ -92,7 +92,7 @@ impl S3CompletionSender {
     }
 }
 
-fn valid_version(id: &str) -> bool {
+pub(super) fn valid_version(id: &str) -> bool {
     id != "null"
         && (1..=1024).contains(&id.len())
         && id
