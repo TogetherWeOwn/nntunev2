@@ -1389,6 +1389,23 @@ cannot stop a concurrent provider write between the empty read and deployment.
 3. **Release task owner.** Start a fresh `mode=bootstrap-maintenance` dispatch on `main` at the accepted `sha`. Actions reruns are refused.
    Under the mutation lock, require proof ≤30 minutes old, empty deployment/version/binding inventories and no custom domain, workers.dev or previews.
    One [upload by immutable ID with `deploy=true`](https://developers.cloudflare.com/api/resources/workers/subresources/beta/subresources/workers/subresources/versions/methods/create/) installs `worker.mjs` at 100%. Record verified readback.
+
+   **Offline approval example.** `<original-run>`, attempt `1`, at `<same-sha>`
+   received `production` Environment approval and stopped. After **Close/undo**,
+   complete readbacks showed zero deployments and versions. The operator followed
+   steps 1–3 to reopen the window with a fresh route proof and dispatch
+   `<replacement-run>`, attempt `1`, at that SHA, still the tip of `main`.
+   Its `bootstrap-maintenance` job is waiting for `production` approval.
+
+   Match the replacement run ID and attempt in Actions job details and check
+   that run's deployment review history for `production` approval. The earlier
+   approval belongs to `<original-run>`. Record the replacement run and attempt
+   and leave Environment approval and the release outcome pending. Retain the
+   independent exact-SHA release review decision. An Actions rerun of the original
+   run keeps its ID and increments the attempt. The **Require the exact Release
+   Manager-accepted SHA** step refuses the higher attempt even with the same SHA.
+   See the [protected bootstrap job](../.github/workflows/deploy-production.yml).
+
 4. **Close/undo:** Disable `PRODUCTION_DEPLOY_ENABLED` and clear the accepted SHA and route proof. To abort an in-flight run, cancel it too and reconcile Worker, deployment and route state before any retry.
    Verify the seed remains unrouted and unexposed. Leave it and the Worker intact; re-entry refuses. Reverse only separately accepted cutover routes/DNS.
 
