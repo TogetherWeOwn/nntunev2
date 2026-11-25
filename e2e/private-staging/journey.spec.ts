@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { expect, request as playwrightRequest, test, type Locator, type Response } from '@playwright/test';
 import { accessHeaders, qaAuthHeader, readApiBody } from '../helpers/access.js';
 import {
@@ -9,19 +10,22 @@ import {
 import { assertServingBuildMatchesPromotion } from '../helpers/build-identity-live.js';
 import { apiDeployOutcome } from '../helpers/build-identity.js';
 import { playbackFailure } from '../helpers/playback.js';
-import { seekViaPlayerUi, waitForPaused } from '../helpers/player-ui.js';
+import { resumeFloorAfterSeek, seekProofFailure, seekViaPlayerUi, waitForPaused } from '../helpers/player-ui.js';
 import {
-  assertCuratedLibrary, assertPrivateInvite, assertPrivateRefusals, assertPrivateTransport, PRIVATE_MUSIC,
+  assertCuratedLibrary, assertPrivateInvite, assertPrivateRefusals, PRIVATE_MUSIC,
 } from '../helpers/private-music-journey.js';
 import {
   freshTrialPublication, parsePrivateStagingFixture, privateStagingAudio, PRIVATE_TRIAL_UPLOAD, SESSION_COOKIE,
 } from '../helpers/private-staging-fixture.js';
+import { privateRunIdentity, privateTrackObservation } from './track-evidence.js';
 
 const ORIGIN = 'https://staging.nntune.com';
 const REGISTER = '/v1/auth/passkey/register';
+const SESSION_BINDING = '/v1/me/likes/session';
 const MEDIA = /^\/v1\/plays\/media\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)$/;
 const BROWSER_SELECTOR = 'x-nntune-browser-playback';
 const BROWSER_BINDING = 'x-nntune-session-binding';
+const CUTOFF_LEAD_MS = 25_000;
 
 // Suppress underlying browser and API diagnostics, which can include a URL,
 // request headers or the value typed into a form. The step name is fixed.
@@ -45,13 +49,14 @@ async function startSampling(audio: Locator) {
   });
 }
 
-async function currentMedia(audio: Locator, trackId: string | null) {
+async function currentMedia(audio: Locator, expectedTrackId: string) {
   const source = new URL(await audio.evaluate((element) => (element as HTMLAudioElement).currentSrc));
-  const media = MEDIA.exec(source.pathname);
-  if (!media || media[1] !== trackId || source.origin !== ORIGIN || source.search || source.hash) {
+  const [, trackId, sessionId, playId] = MEDIA.exec(source.pathname) ?? [];
+  if (trackId !== expectedTrackId || !sessionId || !playId || source.origin !== ORIGIN ||
+      source.username || source.password || source.search || source.hash) {
     throw new Error('Expected the authenticated media relay for the selected track');
   }
-  return { source, media };
+  return { source, trackId, sessionId, playId };
 }
 
 async function samplePlaying(audio: Locator, baseline: number) {
@@ -98,26 +103,12 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const text = await readApiBody(response, url, 'private-api');
     return { status: response.status(), text };
   };
-  await check('opening deployed build identity', () => assertServingBuildMatchesPromotion(request, ORIGIN, 'private-opening'));
-
-  const { missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay } = await check('anonymous and uninvited refusal', async () => {
-    const missingInvite = await post(request, `${REGISTER}/start`, { email: fixture.email }, { ...access, ...qaAuthHeader() });
-    const anonymousLibrary = await getLibrary(request);
-    const outsider = await browser.newContext({ serviceWorkers: 'block' });
-    try {
-      const account = await tryMintTestAccount(request, ORIGIN);
-      if (!account || account.email === fixture.email) throw new Error('Expected a distinct synthetic session');
-      await applyAccountToPage(await outsider.newPage(), account, ORIGIN);
-      const uninvited = await post(outsider.request, PRIVATE_MUSIC.player.plays, {
-        track_id: fixture.companion.trackId, session_id: randomUUID(),
-      });
-      return {
-        missingInviteSignup: missingInvite.status, anonymousLibrary: anonymousLibrary.status,
-        uninvitedLibrary: (await getLibrary(outsider.request)).status, uninvitedPlay: uninvited.status,
-      };
-    } finally {
-      await outsider.close();
-    }
+  const build = await check('build-identity', () => assertServingBuildMatchesPromotion(request, ORIGIN, 'build-identity'));
+  const run = privateRunIdentity(build, process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT);
+  const missingInviteSignup = await check('missing invite refusal', async () => {
+    const result = await post(request, `${REGISTER}/start`, { email: fixture.email }, { ...access, ...qaAuthHeader() });
+    expect(result.status).toBe(401);
+    return result.status;
   });
 
   await check('invite redemption and Library arrival', async () => {
@@ -151,7 +142,11 @@ test('private staging invite serves curated audio and refuses access at cutoff',
   const rows = page.getByTestId(PRIVATE_MUSIC.library.item);
   const rowFor = (id: string) => rows.and(page.locator(`[data-id="${id}"]`));
   const refresh = page.getByRole('button', { name: PRIVATE_MUSIC.library.refresh, exact: true });
-  const fresh = await check('owner upload and fresh publication in invited Library', async () => {
+  const observe = (type: string, publication: { trackId: string; sha256: string }, observedTrackId: unknown) => {
+    const description = JSON.stringify(privateTrackObservation(run, publication, observedTrackId));
+    test.info().annotations.push({ type, description });
+  };
+  const fresh = await check('upload-to-library', async () => {
     // Protected setup can admit the prepublished companion only after redemption.
     let priorIds: string[] = [];
     await expect.poll(async () => {
@@ -168,61 +163,123 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     expect(receipt.status).toBe(200);
     const publication = freshTrialPublication(receipt.text, upload.sha256, priorIds);
     await refresh.click();
-    await expect(rowFor(publication.trackId)).toBeVisible();
+    const row = rowFor(publication.trackId);
+    await expect(row).toBeVisible();
+    expect((await getLibrary()).ids.filter((id) => id === publication.trackId)).toHaveLength(1);
+    observe('private-publication', publication, publication.trackId);
+    observe('private-library', publication, await row.getAttribute(PRIVATE_MUSIC.library.id));
     return publication;
+  });
+  const requestFreshPlay = async (context: typeof request, binding?: string) => {
+    const target = { track_id: fresh.trackId, session_id: randomUUID() };
+    const result = await post(context, PRIVATE_MUSIC.player.plays, target, {
+      ...access, [BROWSER_SELECTOR]: '1', ...(binding && { [BROWSER_BINDING]: binding }),
+    });
+    return { status: result.status, trackId: target.track_id };
+  };
+  const anonymousLibrary = await check('anonymous-refused', async () => {
+    const anonymous = await playwrightRequest.newContext();
+    try {
+      const library = await getLibrary(anonymous);
+      const play = await requestFreshPlay(anonymous);
+      expect([library.status, play.status]).toEqual([401, 401]);
+      observe('private-anonymous-refusal', fresh, play.trackId);
+      return library.status;
+    } finally {
+      await anonymous.dispose();
+    }
+  });
+  const { uninvitedLibrary, uninvitedPlay } = await check('unlisted-refused', async () => {
+    const outsider = await browser.newContext({ serviceWorkers: 'block' });
+    try {
+      const account = await tryMintTestAccount(request, ORIGIN);
+      if (!account || account.email === fixture.email) throw new Error('Expected a distinct synthetic session');
+      await applyAccountToPage(await outsider.newPage(), account, ORIGIN);
+      const bindingUrl = `${ORIGIN}${SESSION_BINDING}`;
+      const session = await apiGet(outsider.request, bindingUrl, access, 'private-unlisted-session');
+      const { session_binding: binding } = JSON.parse(await readApiBody(session, bindingUrl, 'private-unlisted-session'));
+      if (session.status() !== 200 || typeof binding !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(binding)) {
+        throw new Error('Expected a live unlisted session binding');
+      }
+      const library = await getLibrary(outsider.request);
+      const play = await requestFreshPlay(outsider.request, binding);
+      // Without the selector, the API uses its separate native play path.
+      const nativePlay = await post(outsider.request, PRIVATE_MUSIC.player.plays, {
+        track_id: play.trackId, session_id: randomUUID(),
+      });
+      expect([library.status, play.status, nativePlay.status]).toEqual([403, 403, 403]);
+      observe('private-unlisted-refusal', fresh, play.trackId);
+      return { uninvitedLibrary: library.status, uninvitedPlay: play.status };
+    } finally {
+      await outsider.close();
+    }
   });
   const publications = [fresh, fixture.companion];
   const idsOf = (items: Locator, attr: string) => items.evaluateAll((elements, name) =>
     elements.flatMap((element) => element.getAttribute(name) ?? []), attr);
+  const order = await check('curated selection', async () => {
+    const order = assertCuratedLibrary(digests, publications, await idsOf(rows, PRIVATE_MUSIC.library.id));
+    expect(order[0] === fresh.trackId).toBe(true);
+    for (const id of order) await rowFor(id).locator(PRIVATE_MUSIC.library.select).click();
+    return order;
+  });
   const rangeHeaders = { ...access, Range: 'bytes=65536-69631', 'Sec-Fetch-Site': 'same-origin' };
-  const verifyRange = async (trackId: string, source: URL) => {
-    const digest = publications.find((item) => item.trackId === trackId)?.sha256;
-    const original = inputs.find((item) => item.sha256 === digest)!.body;
+  const verifyRange = async (source: URL, original: Buffer) => {
     const range = await apiGet(page.request, source.href, rangeHeaders, 'private-range');
     const headers = range.headers();
     expect([range.status(), headers['content-type'], headers['content-length'], headers['content-range']])
       .toEqual([206, 'audio/flac', '4096', `bytes 65536-69631/${original.length}`]);
     expect((await range.body()).equals(original.subarray(65536, 69632))).toBe(true);
   };
-  const startBrowserPlay = (button: Locator) => Promise.all([
-    page.waitForResponse((response) => response.url() === `${ORIGIN}${PRIVATE_MUSIC.player.plays}` &&
-      response.request().method() === 'POST' && response.request().headers()[BROWSER_SELECTOR] === '1'),
-    button.click(),
-  ]);
-  const retryBrowserPlay = async (start: Response, media: RegExpExecArray) => {
-    const binding = start.request().headers()[BROWSER_BINDING];
-    const ack = await start.json();
-    expect(start.status() === 200 && !!binding && ack.sessionBinding === binding &&
-      ack.trackId === media[1] && ack.playbackSessionId === media[2] && ack.playId === media[3] &&
-      Number.isSafeInteger(ack.durationMs) && ack.durationMs > 0 && Object.keys(ack).length === 5).toBe(true);
-    const retry = () => post(page.request, PRIVATE_MUSIC.player.plays, {
-      track_id: media[1], session_id: media[2], play_id: media[3],
-    }, { ...access, [BROWSER_SELECTOR]: '1', [BROWSER_BINDING]: binding! });
-    const positive = await retry();
-    expect(positive.status).toBe(200);
-    expect(JSON.parse(positive.text)).toEqual(ack);
-    return retry;
-  };
-  const { retryAtCutoff, mediaUrl } = await check('curated playback, byte range, seek, queue and video posture', async () => {
-    await expect(rowFor(fixture.companion.trackId)).toBeVisible();
-    const order = assertCuratedLibrary(digests, publications,
-      await idsOf(rows, PRIVATE_MUSIC.library.id));
-    expect(order[0]).toBe(fresh.trackId);
-    for (const id of order) await rowFor(id).locator(PRIVATE_MUSIC.library.select).click();
-    const current = page.locator(PRIVATE_MUSIC.player.currentQueueItem);
-    const firstTrackId = await current.getAttribute(PRIVATE_MUSIC.player.queueId);
-    const audio = page.getByTestId(PRIVATE_MUSIC.player.audio);
-    const transport = page.getByRole('region', { name: 'Player', exact: true });
-    await expect(audio).toHaveCount(0);
-    const baselineTime = 0;
-    const [start] = await startBrowserPlay(transport.getByRole('button', { name: 'Play', exact: true }));
-    const playback = (await samplePlaying(audio, baselineTime)).playback;
+  const current = page.locator(PRIVATE_MUSIC.player.currentQueueItem);
+  const audio = page.getByTestId(PRIVATE_MUSIC.player.audio);
+  const transport = page.getByRole('region', { name: 'Player', exact: true });
+  const play = transport.getByRole('button', { name: 'Play', exact: true });
+  const pause = async () => {
     await transport.getByRole('button', { name: 'Pause', exact: true }).click();
     await waitForPaused(audio, true, 5_000, 'Player did not pause');
-    const first = await currentMedia(audio, firstTrackId);
-    await retryBrowserPlay(start, first.media);
-    await verifyRange(order[0]!, first.source);
-
+  };
+  const playSelected = async (trackId: string) => {
+    await expect(current).toHaveAttribute(PRIVATE_MUSIC.player.queueId, trackId);
+    const [start] = await Promise.all([
+      page.waitForResponse((response) => response.url() === `${ORIGIN}${PRIVATE_MUSIC.player.plays}` &&
+        response.request().method() === 'POST' && response.request().headers()[BROWSER_SELECTOR] === '1'),
+      play.click(),
+    ]);
+    await samplePlaying(audio, 0);
+    await pause();
+    return { start, media: await currentMedia(audio, trackId) };
+  };
+  const retryBrowserPlay = async (start: Response, media: Awaited<ReturnType<typeof currentMedia>>) => {
+    const request = start.request();
+    const binding = request.headers()[BROWSER_BINDING];
+    const issued = request.postDataJSON();
+    const ack = await start.json();
+    if (!binding) throw new Error('Missing browser playback session binding');
+    expect(start.status() === 200 && issued?.track_id === media.trackId && issued.session_id === media.sessionId &&
+      ack.sessionBinding === binding && ack.trackId === media.trackId &&
+      ack.playbackSessionId === media.sessionId && ack.playId === media.playId &&
+      Number.isSafeInteger(ack.durationMs) && ack.durationMs > 0 && Object.keys(ack).length === 5).toBe(true);
+    const target = { track_id: media.trackId, session_id: media.sessionId, play_id: media.playId };
+    const retry = async () => ({
+      ...await post(page.request, PRIVATE_MUSIC.player.plays, target,
+        { ...access, [BROWSER_SELECTOR]: '1', [BROWSER_BINDING]: binding }),
+      trackId: target.track_id,
+    });
+    const positive = await retry();
+    expect(positive.status).toBe(200);
+    expect(isDeepStrictEqual(JSON.parse(positive.text), ack)).toBe(true);
+    return { retry, trackId: ack.trackId as unknown };
+  };
+  const first = await check('play', async () => {
+    await expect(audio).toHaveCount(0);
+    const { start, media } = await playSelected(fresh.trackId);
+    const { trackId } = await retryBrowserPlay(start, media);
+    await verifyRange(media.source, upload.body);
+    observe('private-play', fresh, trackId);
+    return media;
+  });
+  await check('seek', async () => {
     await audio.evaluate((element) => {
       delete (element as HTMLElement).dataset.seeked;
       element.addEventListener('seeked', () => { (element as HTMLElement).dataset.seeked = 'yes'; }, { once: true });
@@ -230,51 +287,66 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const { fraction } = await seekViaPlayerUi(page, audio, 0.55);
     await expect(audio).toHaveAttribute('data-seeked', 'yes');
     const paused = await waitForPaused(audio, true, 5_000, 'Seek did not finish paused');
+    expect(Number.isFinite(paused.currentTime) && Number.isFinite(paused.duration) && paused.duration > 0 &&
+      fraction > 0.25 && fraction < 0.75 && !seekProofFailure(paused, fraction, true)).toBe(true);
+    expect((await currentMedia(audio, fresh.trackId)).source.href === first.source.href).toBe(true);
     await startSampling(audio);
-    await transport.getByRole('button', { name: 'Play', exact: true }).click();
+    await play.click();
     const resume = await samplePlaying(audio, paused.currentTime);
-    await transport.getByRole('button', { name: 'Pause', exact: true }).click();
-    await waitForPaused(audio, true, 5_000, 'Player did not pause before Next');
-
-    const queueOrder = await idsOf(page.getByTestId(PRIVATE_MUSIC.player.queueItem), PRIVATE_MUSIC.player.queueId);
+    expect(resume.minimumTime >= resumeFloorAfterSeek(paused.currentTime, paused.duration) &&
+      resume.minimumTime <= resume.playback.maxCurrentTime).toBe(true);
+    await pause();
+    expect((await currentMedia(audio, fresh.trackId)).source.href === first.source.href).toBe(true);
+  });
+  const queueItems = page.getByTestId(PRIVATE_MUSIC.player.queueItem);
+  await check('queue', async () => {
+    expect(await idsOf(queueItems, PRIVATE_MUSIC.player.queueId)).toEqual(order);
     await page.getByTestId(PRIVATE_MUSIC.player.next).click();
-    await expect(current).toHaveAttribute(PRIVATE_MUSIC.player.queueId, order[1]!);
-    assertPrivateTransport(order, {
-      firstTrackId, baselineTime, playback, seek: { ...paused, fraction, sawSeekedEvent: true },
-      resume, queueOrder, nextTrackId: await current.getAttribute(PRIVATE_MUSIC.player.queueId),
-    });
-    await delay(Math.max(0, fixture.expiresAt * 1000 - Date.now() - 25_000));
-    const [secondStart] = await startBrowserPlay(transport.getByRole('button', { name: 'Play', exact: true }));
-    await samplePlaying(audio, 0);
-    const { source, media } = await currentMedia(audio, order[1]!);
-    expect(media[2]).toBe(first.media[2]);
-    await transport.getByRole('button', { name: 'Pause', exact: true }).click();
-    await waitForPaused(audio, true, 5_000, 'Second track did not pause');
+    const { start, media } = await playSelected(fixture.companion.trackId);
+    expect(media.sessionId === first.sessionId).toBe(true);
+    await verifyRange(media.source, companion.body);
+    await retryBrowserPlay(start, media);
+  });
+  await check('video-off', async () => {
     await page.locator('a[href="/now-playing"]').filter({ visible: true }).first().click();
     await expect(page).toHaveURL(`${ORIGIN}/now-playing`);
     await expect(page.getByRole('tab', { name: 'Music Video' })).toHaveCount(0);
     await expect(page.locator('iframe, video')).toHaveCount(0);
-    await verifyRange(order[1]!, source);
-    const retryAtCutoff = await retryBrowserPlay(secondStart, media);
-    return { retryAtCutoff, mediaUrl: source.href };
   });
 
-  await check('same-session refusal at the configured cohort cutoff', async () => {
+  const cutoff = await check('fresh track works before cutoff', async () => {
+    await page.locator('a[href="/library"]').filter({ visible: true }).first().click();
+    await expect(page).toHaveURL(`${ORIGIN}${PRIVATE_MUSIC.library.path}`);
+    const queuedFresh = queueItems.and(page.locator(`[${PRIVATE_MUSIC.player.queueId}="${fresh.trackId}"]`));
+    await queuedFresh.getByRole('button', { name: /^Select / }).click();
+    // The companion replaced the active lease. Open a new play for the fresh
+    // track close to expiry, then keep that exact play for the cutoff probes.
+    await delay(Math.max(0, fixture.expiresAt * 1000 - Date.now() - CUTOFF_LEAD_MS));
+    const { start, media } = await playSelected(fresh.trackId);
+    expect(media.sessionId === first.sessionId && media.playId !== first.playId).toBe(true);
+    const { retry } = await retryBrowserPlay(start, media);
+    await verifyRange(media.source, upload.body);
+    const library = await getLibrary();
+    expect(library.status === 200 && library.ids.includes(fresh.trackId)).toBe(true);
+    return { retry, mediaUrl: media.source.href };
+  });
+  await check('revoked-or-expired-refused', async () => {
     const remaining = fixture.expiresAt * 1000 - Date.now();
     if (remaining <= 0) throw new Error('Cohort cutoff preceded completion of the active journey');
     await delay(remaining + 2_000);
     const revokedLibrary = (await getLibrary()).status;
-    const revokedPlay = (await retryAtCutoff()).status;
-    const range = await apiGet(page.request, mediaUrl, rangeHeaders, 'private-range-cutoff');
-    expect([401, 403, 404]).toContain(range.status());
-    await readApiBody(range, mediaUrl, 'private-range-cutoff');
+    const revoked = await cutoff.retry();
+    const range = await apiGet(page.request, cutoff.mediaUrl, rangeHeaders, 'private-range-cutoff');
+    expect(range.status()).toBe(403);
+    await readApiBody(range, cutoff.mediaUrl, 'private-range-cutoff');
     await page.goto(`${ORIGIN}${PRIVATE_MUSIC.library.path}`);
     await expect(page.getByText(PRIVATE_MUSIC.library.forbidden, { exact: true })).toBeVisible();
     const remainingCuratedRows = (await idsOf(rows, PRIVATE_MUSIC.library.id))
       .filter((id) => publications.some((item) => item.trackId === id)).length;
     assertPrivateRefusals({
-      missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay, revokedLibrary, revokedPlay,
+      missingInviteSignup, anonymousLibrary, uninvitedLibrary, uninvitedPlay, revokedLibrary, revokedPlay: revoked.status,
     }, remainingCuratedRows);
+    observe('private-cutoff-refusal', fresh, revoked.trackId);
   });
-  await check('closing deployed build identity', () => assertServingBuildMatchesPromotion(request, ORIGIN, 'private-closing'));
+  await check('build-identity-final', () => assertServingBuildMatchesPromotion(request, ORIGIN, 'build-identity-final'));
 });
