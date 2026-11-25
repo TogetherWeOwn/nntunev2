@@ -10,7 +10,7 @@ LIB = API / "src/lib.rs"
 FIXTURE = API / "tests/fixtures/hyperdrive_clippy.rs"
 CLIPPY = [
     "cargo", "clippy", "--locked", "--manifest-path", str(API / "Cargo.toml"),
-    "--target", "wasm32-unknown-unknown", "--lib",
+    "--target", "wasm32-unknown-unknown", "--lib", "--features", "encrypted-upload-caller",
 ]
 DENY = ["--", "-D", "clippy::disallowed_methods"]
 

@@ -14,7 +14,7 @@ use nntune_ingest::{
         session_upload::{begin, DurableUpload, HandoffError},
     },
 };
-use tokio_postgres::{Client, Transaction};
+use tokio_postgres::{types::Type, Client, Transaction};
 
 use crate::{
     handlers::StoreError,
@@ -134,19 +134,19 @@ impl<'a> OpenedUpload<'a> {
         }
         let scope = self.prepared.completed_scope();
         let mut tx = begin(writer).await.map_err(|_| Unconfirmed)?;
-        tx.query_opt(
+        tx.query_typed_opt(
             ADVANCE,
             &[
-                &uuid_text(scope.environment),
-                &uuid_text(scope.library),
-                &scope.principal,
-                &scope.session,
-                &scope.fingerprint.as_slice(),
-                &uuid_text(scope.seal),
-                &0_i64,
-                &0_i64,
-                &scope.offset,
-                &self.lease,
+                (&uuid_text(scope.environment), Type::TEXT),
+                (&uuid_text(scope.library), Type::TEXT),
+                (&scope.principal, Type::TEXT),
+                (&scope.session, Type::TEXT),
+                (&scope.fingerprint.as_slice(), Type::BYTEA),
+                (&uuid_text(scope.seal), Type::TEXT),
+                (&0_i64, Type::INT8),
+                (&0_i64, Type::INT8),
+                (&scope.offset, Type::INT8),
+                (&self.lease, Type::TEXT),
             ],
         )
         .await
@@ -168,9 +168,9 @@ impl<'a> OpenedUpload<'a> {
         )
         .await
         .map_err(outcome_error)?;
-        tx.query_opt(
+        tx.query_typed_opt(
             "SELECT 1 WHERE clock_timestamp() < to_timestamp($1::bigint::double precision)",
-            &[&auth_until],
+            &[(&auth_until, Type::INT8)],
         )
         .await
         .map_err(|_| Unconfirmed)?
@@ -353,18 +353,18 @@ async fn acquire(
     scope: &CompletionScope<'_>,
     lease: &str,
 ) -> Result<(), UploadError> {
-    tx.query_opt(
+    tx.query_typed_opt(
         LEASE,
         &[
-            &uuid_text(scope.environment),
-            &uuid_text(scope.library),
-            &scope.principal,
-            &scope.session,
-            &scope.fingerprint.as_slice(),
-            &uuid_text(scope.seal),
-            &scope.revision,
-            &scope.offset,
-            &lease,
+            (&uuid_text(scope.environment), Type::TEXT),
+            (&uuid_text(scope.library), Type::TEXT),
+            (&scope.principal, Type::TEXT),
+            (&scope.session, Type::TEXT),
+            (&scope.fingerprint.as_slice(), Type::BYTEA),
+            (&uuid_text(scope.seal), Type::TEXT),
+            (&scope.revision, Type::INT8),
+            (&scope.offset, Type::INT8),
+            (&lease, Type::TEXT),
         ],
     )
     .await

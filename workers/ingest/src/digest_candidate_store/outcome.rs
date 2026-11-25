@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use tokio_postgres::{Client, IsolationLevel, Row, Transaction};
+use tokio_postgres::{types::Type, Client, IsolationLevel, Row, Transaction};
 
 use super::{stage_completed_candidate, uuid, CandidateIntent, InventoryAppendError};
 use crate::multipart::{
@@ -39,18 +39,18 @@ impl ProtectedReuse {
 
 impl CompletionScope<'_> {
     async fn lock(&self, tx: &Transaction<'_>, lease: Option<&str>) -> Result<(), OutcomeError> {
-        tx.query_opt(
+        tx.query_typed_opt(
             LOCK,
             &[
-                &uuid(&self.environment),
-                &uuid(&self.library),
-                &self.principal,
-                &self.session,
-                &self.fingerprint.as_slice(),
-                &uuid(&self.seal),
-                &self.revision,
-                &self.offset,
-                &lease,
+                (&uuid(&self.environment), Type::TEXT),
+                (&uuid(&self.library), Type::TEXT),
+                (&self.principal, Type::TEXT),
+                (&self.session, Type::TEXT),
+                (&self.fingerprint.as_slice(), Type::BYTEA),
+                (&uuid(&self.seal), Type::TEXT),
+                (&self.revision, Type::INT8),
+                (&self.offset, Type::INT8),
+                (&lease, Type::TEXT),
             ],
         )
         .await
@@ -91,15 +91,15 @@ pub async fn stage_completion(
             .await
             .map_err(OutcomeError::Publication)?;
         staged
-            .query_opt(
+            .query_typed_opt(
                 RECORD,
                 &[
-                    &scope.session,
-                    &uuid(&intent.map_id),
-                    &lease,
-                    &retain_until,
-                    &uuid(&object),
-                    &custody.bucket,
+                    (&scope.session, Type::TEXT),
+                    (&uuid(&intent.map_id), Type::TEXT),
+                    (&lease, Type::TEXT),
+                    (&retain_until, Type::INT8),
+                    (&uuid(&object), Type::TEXT),
+                    (&custody.bucket, Type::TEXT),
                 ],
             )
             .await
@@ -129,7 +129,7 @@ pub async fn read_completion(
     let until = authorize(&tx, scope).await?;
     // READ COMMITTED takes a fresh snapshot after waiting on the session.
     let row = tx
-        .query_opt(READ, &[&scope.session, &until])
+        .query_typed_opt(READ, &[(&scope.session, Type::TEXT), (&until, Type::INT8)])
         .await
         .map_err(|_| Indeterminate)?
         .ok_or(Refused)?;
@@ -164,7 +164,10 @@ pub async fn protect_completion_reuse(
     let tx = begin(db).await?;
     scope.lock(&tx, None).await?;
     let row = tx
-        .query_opt(include_str!("reuse_lock.sql"), &[&scope.session])
+        .query_typed_opt(
+            include_str!("reuse_lock.sql"),
+            &[(&scope.session, Type::TEXT)],
+        )
         .await
         .map_err(|_| Indeterminate)?
         .ok_or(Refused)?;
@@ -173,9 +176,13 @@ pub async fn protect_completion_reuse(
         .ok_or(Refused)?;
     let until = authorize(scope).await?;
     let usable_until = tx
-        .query_opt(
+        .query_typed_opt(
             include_str!("reuse_protect.sql"),
-            &[&scope.session, &outcome.object, &until],
+            &[
+                (&scope.session, Type::TEXT),
+                (&outcome.object, Type::TEXT),
+                (&until, Type::INT8),
+            ],
         )
         .await
         .map_err(|_| Indeterminate)?
