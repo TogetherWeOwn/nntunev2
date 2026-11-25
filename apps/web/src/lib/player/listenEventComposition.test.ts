@@ -107,8 +107,8 @@ it('reuses the listen context on page restore and stays closed after an auth tra
 	await vi.advanceTimersByTimeAsync(0);
 	expect(requests()).toEqual(finished);
 
-	expect(await open('A'.repeat(21) + 'Q')).toBe(true);
 	transition('pageshow');
+	expect(await open('A'.repeat(21) + 'Q')).toBe(true);
 	playing();
 	await vi.advanceTimersByTimeAsync(0);
 	expect(requests()).toEqual(expected);
@@ -116,9 +116,13 @@ it('reuses the listen context on page restore and stays closed after an auth tra
 	lifecycle.dispatchEvent(Object.assign(new Event('storage'), { key: LIBRARY_AUTH_TRANSITION_KEY }));
 	transition('pagehide');
 	transition('pageshow');
-	// A usable synthetic grant isolates the observer's response to the auth event.
 	expect(await open('A'.repeat(21) + 'g')).toBe(true);
 	playing();
+	await vi.advanceTimersByTimeAsync(0);
+	expect(requests()).toEqual(expected);
+
+	// Exercise the sender directly because the closed observer cannot forward a start.
+	sender.send({ playback_id: '00000000-0000-0000-0000-000000000002', track_id: trackId, event: 'start' });
 	await vi.advanceTimersByTimeAsync(0);
 	expect(requests()).toEqual(expected);
 });
