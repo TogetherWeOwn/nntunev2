@@ -422,6 +422,21 @@ is applied and recorded.
 
 #### Private trial schema
 
+Use `python3 .github/scripts/staging_trial_role_lifecycle.py grant --target
+planetscale:nntunev2/main/nntunev2_staging@16500` with separately issued
+`nntune_trial_reader` and `nntune_trial_writer` logins. Supply the preflight
+scope below, independently verified `PRIVATE_TRIAL_DIRECT_HOST` and
+`PRIVATE_TRIAL_ROUTED_HOST`, and protected `PRIVATE_TRIAL_{OWNER,EXECUTOR,READER,WRITER}_URL`
+values. The database owner supplies CONNECT, role fencing and staging drain.
+Use a schema and table owner with routine grant authority as executor for
+the transaction that grants the application ACL and installs the lock guards.
+Use the same executor for withdrawal. The command compares direct and PUBLIC
+ACLs, role OIDs and memberships, cross-database access and guard definitions.
+Pass `verify` before binding and `verify-overlay` after applying the overlay.
+After disarming and unbinding, use `fence`, withdraw the overlay grants with
+its owner, then use `retire`. A failed phase can be rerun with the same pins.
+
+
 For an authorized private trial, dispatch `migrations-staging-apply` from
 protected `main` with `file=private-trial`, `mode=single`, the reviewed full
 commit and the usual approval and operator inputs. The review covers the
