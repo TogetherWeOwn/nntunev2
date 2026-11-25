@@ -133,7 +133,7 @@ test('private Library and playback stay isolated when another invitee signs out'
 		const origin = `http://127.0.0.1:${address.port}`;
 		const [first, second] = privateStagingAudio().map(({ body }, index): Invitee => ({
 			item: { id: `00000000-0000-4000-8000-00000000000${index + 1}`, title: `Private tone ${index + 1}`, duration_ms: durationMs },
-			binding: (index === 0 ? 'A' : 'B').repeat(43),
+			binding: Buffer.alloc(32, index + 1).toString('base64url'),
 			playId: `00000000-0000-4000-8000-00000000001${index + 1}`,
 			audio: body
 		}));
