@@ -378,3 +378,27 @@ reads when enforced before use. Shared provider egress and billable usage
 require a dispatch-time billing readback. Keep any monetary exposure in
 the release evidence. [PlanetScale backups](https://planetscale.com/docs/postgres/backups)
 · [Pricing](https://planetscale.com/docs/postgres/pricing)
+
+Use the [offline snapshot check](../.github/scripts/database_bootstrap_snapshot.py)
+with an operator-normalized JSON record in private custody. Run
+`python3 -IB .github/scripts/database_bootstrap_snapshot.py < evidence.json`
+from the repository root. The check reads at most 4 KiB of UTF-8 JSON and
+emits a fixed verdict. It checks the consistency of values supplied by the
+operator. Provider readback and release decisions remain separate.
+
+Supply exactly two objects in the record. Use integer UTC Unix seconds for
+all times and the same precision for observations and the reviewed schedule.
+
+- `review` contains the approved `branch_id`, `phase`, the applicable
+  `protected_write_at` and `window_end_at`. Use `pre-bootstrap` for the
+  first protected write. For optional `pre-migration` evidence, use the
+  migration write time and also supply the verified `setup_completed_at`.
+- `snapshot` contains the observed `branch_id`, `captured_at`,
+  `completed_at`, `readback_at` and `expires_at`. Normalize the confirmed
+  kind, restore scope and completion as `kind: ordinary-native`,
+  `restore_scope: whole-branch` and `status: succeeded`.
+
+Capture must be at or before completion, and completion at or before
+readback. Read back success before the applicable write, which must occur
+by the reviewed window end. Expiry must be after that end. For
+pre-migration evidence, capture must be strictly after setup completion.

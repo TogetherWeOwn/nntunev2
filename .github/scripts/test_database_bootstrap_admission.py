@@ -105,6 +105,66 @@ def exercise(event_path):
     check(False, event=b" " * admission.MAX_EVENT_BYTES + b"{}")
 
 
+def check_snapshot_readback():
+    script = Path(__file__).with_name("database_bootstrap_snapshot.py")
+    branch = "fixture001"
+    at = 1800000000
+    review = {
+        "phase": "pre-bootstrap", "branch_id": branch,
+        "protected_write_at": at + 120, "window_end_at": at + 600,
+    }
+    snapshot = {
+        "kind": "ordinary-native", "branch_id": branch, "restore_scope": "whole-branch",
+        "status": "succeeded", "captured_at": at, "completed_at": at + 30,
+        "readback_at": at + 60, "expires_at": at + 3600,
+    }
+    record = {"review": review, "snapshot": snapshot}
+
+    def check(case, evidence, accept=False):
+        raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
+        result = subprocess.run(
+            [sys.executable, "-IB", str(script)], input=raw,
+            capture_output=True, timeout=3, check=False,
+        )
+        expected = ((0, b"database-bootstrap-snapshot: consistent\n", b"") if accept else
+                    (1, b"", b"database-bootstrap-snapshot: refused\n"))
+        if (result.returncode, result.stdout, result.stderr) != expected:
+            raise RuntimeError(f"snapshot fixture: {case}")
+
+    check("pre-bootstrap", record, accept=True)
+    for case, override in {
+        "wrong branch": {"branch_id": "fixture002"},
+        "wrong restore scope": {"restore_scope": "logical-database"},
+        "different snapshot kind": {"kind": "manual"},
+        "incomplete": {"status": "running"},
+        "capture at write": {"captured_at": review["protected_write_at"],
+                             "completed_at": review["protected_write_at"],
+                             "readback_at": review["protected_write_at"]},
+        "completion before capture": {"completed_at": at - 1},
+        "readback before completion": {"readback_at": snapshot["completed_at"] - 1},
+        "readback at write": {"readback_at": review["protected_write_at"]},
+        "expired at write": {"expires_at": review["protected_write_at"]},
+        "expires during window": {"expires_at": review["window_end_at"] - 1},
+        "expires at window end": {"expires_at": review["window_end_at"]},
+        "non-integer timestamp": {"captured_at": str(at)},
+    }.items():
+        check(case, record | {"snapshot": snapshot | override})
+    check("missing readback", {"review": review})
+    check("missing completion", record | {
+        "snapshot": {key: value for key, value in snapshot.items() if key != "completed_at"},
+    })
+    check("window ends before write", record | {"review": review | {"window_end_at": at}})
+    check("pre-bootstrap with setup completion", record | {"review": review | {"setup_completed_at": at - 1}})
+    migration = review | {"phase": "pre-migration", "setup_completed_at": at - 1}
+    check("post-setup pre-migration", record | {"review": migration}, accept=True)
+    check("pre-migration without setup completion", record | {"review": review | {"phase": "pre-migration"}})
+    check("pre-migration capture before setup", record | {"review": migration | {"setup_completed_at": at + 1}})
+    check("pre-migration capture at setup", record | {"review": migration | {"setup_completed_at": at}})
+    check("duplicate record key", b'{"snapshot": null, ' + json.dumps(record).encode()[1:])
+    check("oversized record", b" " * 4096 + json.dumps(record).encode())
+    check("malformed record", b"{")
+
+
 if __name__ == "__main__":
     try:
         check_baseline_workflow()
@@ -112,6 +172,7 @@ if __name__ == "__main__":
             exercise(Path(temp) / "event.json")
         if Path(temp).exists():
             raise RuntimeError
+        check_snapshot_readback()
     except Exception:
         sys.exit("database-bootstrap-admission-fixture: failed")
-    print("database-bootstrap-admission-fixture: run binding, refusals and teardown passed")
+    print("database-bootstrap-admission-fixture: run binding, snapshot readback, refusals and teardown passed")
