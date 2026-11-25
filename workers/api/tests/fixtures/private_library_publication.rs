@@ -20,16 +20,9 @@ pub(super) struct PublicationFixture {
 }
 
 impl PublicationFixture {
-    pub(super) async fn load(writer: &Client, job: &str) -> Self {
-        writer
-            .batch_execute(concat!(
-                include_str!("../../src/private_library_schema.sql"),
-                include_str!("private_library_users.sql")
-            ))
-            .await
-            .unwrap();
+    pub(super) async fn load(writer: &Client, object: &str, page_pin: &'static str) -> Self {
         let row = writer
-            .query_one(include_str!("private_library_object.sql"), &[&job])
+            .query_one(include_str!("private_library_object.sql"), &[&object])
             .await
             .unwrap();
         let id = |column| row.get::<_, ReadUuid>(column).0;
@@ -53,7 +46,7 @@ impl PublicationFixture {
             S3Binding::VersionId(row.get("s3_version_id")),
         )
         .unwrap();
-        let pages = ["new-page-pin"];
+        let pages = [page_pin];
         assert_eq!(row.get::<_, Vec<String>>("page_versions"), pages);
         Self {
             intent,
