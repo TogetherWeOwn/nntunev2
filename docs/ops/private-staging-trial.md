@@ -61,18 +61,22 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 5. **Arm and qualify one synthetic journey (77c).** Follow the
    [private music journey](../../e2e/README.md#private-music-journey-preparation)
    for the fresh owner step-up, recipient invite and prepublished tone B
-   companion. Arm upload, playback and the private journey on the same protected
+   companion. Set `PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION` for the prepublished
+   tone B track before the armed push so Stream reads the selector at deploy
+   time. Arm upload, playback and the private journey on the same protected
    `main` push with Stream deployment enabled. Require successful API, Stream
    and Web deploy readbacks for that run and commit, plus matching `/api/build`
    and `/healthz` before and after playback. Require tone A's upload receipt to
    match the pinned digest and a fresh canonical track visible after Library
    Refresh. Check playback advances, the authenticated nonzero byte range is
-   exact, paused seek fires `seeked` and resumes from the selected position,
-   Next selects tone B, and cutoff denies Library and playback retry. Stop on
-   any missing or mixed-build readback. Before acceptance, run the
+   exact, paused seek fires `seeked` and resumes from the selected position, and
+   Next selects tone B. After companion admission and before the cohort cutoff,
+   use fresh tone B plays for the
    [relay disconnect drill](../ops.md#private-stream-staging). Require upstream
    abort and settlement for the acknowledged byte prefix, plus a separate EOF
-   control that reports completion. Retain the selected tone A upload,
+   control that reports completion. Clear the observation setting after the
+   drill. At cutoff, require Library and playback retry to refuse. Stop on any
+   missing or mixed-build readback. Retain the selected tone A upload,
    publication and versioned storage pins for cleanup. Keep tone B's pins
    separately for its recorded disposition.
 
