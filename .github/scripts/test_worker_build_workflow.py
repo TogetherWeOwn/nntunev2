@@ -43,7 +43,7 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
             for name in ("Build api with canonical tools", "Generate staging wrangler.toml",
                          "Require uncached private trial connections", "id: deploy\n")
         )
-        self.assertIn("if [[ '${{ needs.gate.outputs.private_trial_upload }}' == 1 ]]; then", items[build])
+        self.assertIn('if [[ "$PRIVATE_TRIAL_BUILD" == 1 ]]; then', items[build])
         self.assertIn(BUILD + " --features encrypted-upload-caller 2>&1 | tee", items[build])
         self.assertIn("else\n            " + BUILD + " 2>&1 | tee", items[build])
         self.assertIn("          private_playback=$(python3 -I ../../.github/scripts/staging_stream_config.py --api-vars)", items[generate])
@@ -171,10 +171,13 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
             manifest = source / UPLOAD.MANIFEST
             manifest.parent.mkdir(parents=True)
             manifest.write_text("worker = []\n")
+            renderer = source / UPLOAD.PRIVATE_CONFIG
+            renderer.write_bytes((ROOT / UPLOAD.PRIVATE_CONFIG).read_bytes())
             with patch.object(UPLOAD, "ROOT", source):
                 tree, wdir = UPLOAD.fixture(base, "api", "fixture")
             self.assertEqual(wdir, tree / "workers/api")
             self.assertEqual((tree / UPLOAD.MANIFEST).read_bytes(), manifest.read_bytes())
+            self.assertEqual((tree / UPLOAD.PRIVATE_CONFIG).read_bytes(), renderer.read_bytes())
             for name, content in files.items():
                 self.assertEqual((wdir / "build" / name).read_bytes(), content)
 
@@ -196,7 +199,11 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                 self.assertLess(build, upload)
                 for step in (items[install], items[build]):
                     self.assertNotIn("secrets.", step)
-                    self.assertNotIn("env:", step)
+                    if worker == "api" and step == items[build]:
+                        self.assertEqual(step.split("        env:\n")[1].split("        run:")[0],
+                                         "          PRIVATE_TRIAL_BUILD: ${{ needs.gate.outputs.private_trial_upload }}\n")
+                    else:
+                        self.assertNotIn("env:", step)
                     self.assertIn("if: steps.config.outputs.configured == 'true'", step)
                     if worker == "ingest":
                         self.assertIn("steps.config.outputs.enabled == 'true'", step)

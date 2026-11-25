@@ -248,10 +248,12 @@ jobs:
       - name: Build api with canonical tools
         if: steps.config.outputs.configured == 'true'
         working-directory: workers/api
+        env:
+          PRIVATE_TRIAL_BUILD: ${{ needs.gate.outputs.private_trial_upload }}
         run: |
           set -euo pipefail
           cargo metadata --locked --format-version 1 > /dev/null
-          if [[ '${{ needs.gate.outputs.private_trial_upload }}' == 1 ]]; then
+          if [[ "$PRIVATE_TRIAL_BUILD" == 1 ]]; then
             worker-build --release -- --locked --features encrypted-upload-caller 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
           else
             worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-api.log"

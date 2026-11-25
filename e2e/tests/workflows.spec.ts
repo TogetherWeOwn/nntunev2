@@ -1581,6 +1581,8 @@ prod = "dummy-mb-mirror"
       // Dummy inventory exercises the real parity preflight without reading
       // credentials or using a live resource id. The public RP host is just
       // an inert string here: the generator's exact-host gate requires it.
+      const renderer = '.github/scripts/staging_stream_config.py';
+      writeFileSync(join(probe, renderer), readFileSync(new URL(`../../${renderer}`, import.meta.url)));
       writeFileSync(join(probe, '.github/scripts/binding_manifest.toml'), `
 [[worker]]
 name = "api"
