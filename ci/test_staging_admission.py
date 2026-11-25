@@ -351,6 +351,20 @@ class PrivateAdmissionTests(Base):
                 self.assertEqual(receipt["result"], "incomplete")
                 self.assertIn("private track evidence", receipt["reasons"][0])
 
+    def test_green_report_requires_private_play_observation(self):
+        report = private_report(private_pins())
+        complete = PrivateWorld(report).receipt
+        self.assertEqual(complete["result"], "satisfied")
+
+        play = report.find("testcase[@name='play']/properties")
+        play.remove(play.find("property[@name='private-play']"))
+
+        incomplete = PrivateWorld(report).receipt
+        self.assertEqual(incomplete["coverage"], complete["coverage"])
+        self.assertEqual(incomplete["result"], "incomplete")
+        self.assertEqual(incomplete["reasons"], ["missing private track evidence"])
+        self.assertNotIn("private_track", incomplete)
+
     def test_private_track_must_match_selected_run_build_and_fixture(self):
         for field, foreign in (("run_id", str(RUN_ID - 1)), ("run_attempt", "2"),
                                ("build_sha", OTHER_SHA), ("sha256", "0" * 64)):
