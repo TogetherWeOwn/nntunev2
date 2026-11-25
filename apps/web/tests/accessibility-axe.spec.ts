@@ -6,7 +6,7 @@ import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.
 import { test as invitedLibraryTest } from './helpers/private-music-fixture.js';
 
 /**
- * Axe accessibility gate: every existing route must report zero serious or
+ * Axe accessibility gate: each scanned route must report zero serious or
  * critical axe violations. The full default axe ruleset runs; lower-severity
  * (minor/moderate) findings are attached to the test report as warnings but
  * do not fail the gate. Known moderate best-practice findings at introduction:
@@ -26,6 +26,7 @@ const ROUTES = [
 	'/auth/magic',
 	'/account/security',
 	'/account/billing',
+	'/demo/player',
 	'/home',
 	'/search',
 	'/settings',
@@ -34,7 +35,7 @@ const ROUTES = [
 	'/library/recent'
 ] as const;
 
-const MOBILE_ROUTES = new Set<string>(['/library']);
+const MOBILE_ROUTES = new Set<string>(['/demo/player', '/library']);
 
 async function mockApi(page: Page, route: string) {
 	await page.route('**/v1/**', (r) =>
@@ -99,6 +100,9 @@ async function visit(page: Page, route: string) {
 	}
 	await page.goto(url, { waitUntil: 'load' });
 	await expect(page.locator('main')).toBeVisible();
+	if (route === '/demo/player') {
+		await expect(page.getByTestId('leveling-toggle')).toBeVisible();
+	}
 	if (route === '/library') {
 		await expect(page.getByTestId('library-item').first()).toBeVisible();
 	}
