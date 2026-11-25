@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -97,11 +98,75 @@ test(detail, async ({{}}, info) => {{
 
 
 def receipt_step():
-    workflow = (ROOT / admission.WORKFLOW).read_text().split("\n  post-deploy-private-music:\n", 1)[1]
-    record, upload = workflow.split("\n      - name: Upload candidate admission receipt\n")
+    workflow = (ROOT / admission.WORKFLOW).read_text()
+
+    def job(name):
+        section = workflow.split(f"\n  {name}:\n", 1)[1]
+        return re.split(r"\n  [\w-]+:\n", section, maxsplit=1)[0]
+
+    qualify = job("post-deploy-private-music")
+    qualify_settings, _ = qualify.split("\n    steps:\n", 1)
+    assert "needs: [staging-web, staging-api, staging-stream]" in qualify_settings
+    for lane in evidence.LANES:
+        settings, steps = job(f"staging-{lane}").split("\n    steps:\n", 1)
+        assert "      private_pin: ${{ steps.private-pin.outputs.pin }}\n" in settings + "\n"
+        assert f"      {lane.upper()}_PIN: ${{{{ needs.staging-{lane}.outputs.private_pin }}}}" in qualify_settings
+        bind = steps.split("        id: private-pin\n", 1)[1].split("\n      - ", 1)[0]
+        assert "if: vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true'" in bind
+        assert "printf 'pin=%s\\n' \"$pin\" >> \"$GITHUB_OUTPUT\"" in bind
+        if lane == "web":
+            assert 'private_staging_evidence.py web > "$RUNNER_TEMP/staging-web-pin.json"' in steps
+            assert 'pin=$(cat "$RUNNER_TEMP/staging-web-pin.json")' in bind
+        else:
+            assert f"private_staging_evidence.py {lane})" in bind
+    record, upload = qualify.split("\n      - name: Upload candidate admission receipt\n")
     assert upload.count("          path:") == 1 and "          path: staging-admission.json\n" in upload
     assert "retention-days: 7" in upload and "${{ github.run_attempt }}-private-music" in upload
     return textwrap.dedent(record.rsplit("\n        run: |\n", 1)[1])
+
+
+def provider_response(deployment, version=VERSION):
+    return {"deployments": [{"id": deployment, "strategy": "percentage",
+                             "versions": [{"version_id": version, "percentage": 100}]}]}
+
+
+def require_refusal(action, reason):
+    try:
+        action()
+    except (admission.Refused, evidence.identity.Unavailable):
+        return
+    raise AssertionError(reason)
+
+
+def capture_pins(root, env):
+    readback = {"build_sha": env["GITHUB_SHA"], "version_id": VERSION, "deployment_id": DEPLOYMENT}
+    api = {"identity": "matched", **readback}
+    stream = {**api, "worker": "nntune-stream-staging", "private_playback_enabled": True}
+    stream_file = "staging-stream-identity.json"
+    write(root, stream_file, json.dumps(stream).encode())
+    wrangler = {"type": "deploy", "version": 1, "worker_name": "nntune-web-staging",
+                "wrangler_environment": "staging", "version_id": VERSION}
+    write(root, "wrangler/wrangler-output-fixture.json", (json.dumps(wrangler) + "\n").encode())
+    capture_env = env | {"WRANGLER_OUTPUT_FILE_DIRECTORY": str(root / "wrangler"), "API_IDENTITY": json.dumps(api)}
+
+    with patch.dict(os.environ, capture_env, clear=True), patch.object(evidence, "provider") as provider:
+        reader = provider.return_value
+        reader.return_value = provider_response(DEPLOYMENT)
+        pins = {lane: evidence.main(lane) for lane in evidence.LANES}
+        reader.assert_called_once_with("nntune-web-staging")
+        assert pins == {lane: {**readback, "worker": f"nntune-{lane}-staging",
+                               "run_id": env["GITHUB_RUN_ID"], "run_attempt": env["GITHUB_RUN_ATTEMPT"]}
+                        for lane in evidence.LANES}
+
+        reader.return_value = provider_response(DEPLOYMENT, version=DEPLOYMENT)
+        require_refusal(lambda: evidence.main("web"), "Web captured a different serving version")
+        for invalid_api in ({"identity": "unavailable"}, {"build_sha": "b" * 40}):
+            os.environ["API_IDENTITY"] = json.dumps(api | invalid_api)
+            require_refusal(lambda: evidence.main("api"), "API captured an unavailable or wrong-build identity")
+        for invalid_stream in ({"private_playback_enabled": False}, {"worker": "nntune-api-staging"}):
+            write(root, stream_file, json.dumps(stream | invalid_stream).encode())
+            require_refusal(lambda: evidence.main("stream"), "Stream captured an unarmed or wrong-Worker identity")
+    return {f"{lane.upper()}_PIN": json.dumps(pin) for lane, pin in pins.items()}
 
 
 def run_fixture(root):
@@ -110,9 +175,8 @@ def run_fixture(root):
            "GITHUB_REPOSITORY": "TogetherWeOwn/nntunev2", "GITHUB_EVENT_NAME": "push",
            "GITHUB_REF": "refs/heads/main", "API_DEPLOYED": "true", "API_DEPLOY_OUTCOME": "deployed"}
     setup(root, env)
-    for lane in evidence.LANES:
-        env[f"{lane.upper()}_PIN"] = json.dumps({"worker": f"nntune-{lane}-staging", "build_sha": env["GITHUB_SHA"],
-            "version_id": VERSION, "deployment_id": DEPLOYMENT, "run_id": "42", "run_attempt": "2"})
+    command = ["bash", "-c", receipt_step()]
+    env.update(capture_pins(root, env))
 
     def run(args, env_overrides=None):
         process = subprocess.run(args, cwd=root, env=env | (env_overrides or {}), capture_output=True, timeout=15)
@@ -125,10 +189,6 @@ def run_fixture(root):
             args.append("--retries=1")
         return run(args, {"FIXTURE_OUTCOME": kind})
 
-    def provider_response(deployment):
-        return {"deployments": [{"id": deployment, "strategy": "percentage",
-                                 "versions": [{"version_id": VERSION, "percentage": 100}]}]}
-
     report = root / "e2e/private-staging-results/admission.xml"
     for refusal in ("failure", "skip", "expected", "retry"):
         assert playwright(refusal).returncode != 0 and not report.exists()
@@ -138,19 +198,13 @@ def run_fixture(root):
     assert all(marker not in report.read_bytes() for marker in PRIVATE_MARKERS)
 
     with patch.dict(os.environ, env, clear=True), patch.object(evidence, "provider") as provider:
-        provider.return_value.side_effect = lambda _: provider_response(DEPLOYMENT)
+        provider.return_value.return_value = provider_response(DEPLOYMENT)
         for phase in admission.IDENTITY_PHASES:
             write(root, f"{phase}.json", json.dumps(evidence.main("observe")).encode())
         assert provider.return_value.call_count == 6
-        provider.return_value.side_effect = lambda _: provider_response(VERSION)
-        try:
-            evidence.main("observe")
-        except admission.Refused:
-            pass
-        else:
-            raise AssertionError("drifted provider deployment accepted")
+        provider.return_value.return_value = provider_response(VERSION)
+        require_refusal(lambda: evidence.main("observe"), "drifted provider deployment accepted")
 
-    command = ["bash", "-c", receipt_step()]
     receipt = root / "staging-admission.json"
     mismatched = json.loads(env["API_PIN"]) | {"run_attempt": "1"}
     for bad_pins in ({"WEB_PIN": ""}, {"API_PIN": json.dumps(mismatched)}):
