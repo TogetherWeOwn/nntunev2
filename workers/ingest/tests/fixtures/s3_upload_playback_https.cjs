@@ -294,7 +294,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
 
   const seek = 'bytes=65536-65536';
   const interval = { user_id: 'catalogue-other', play_id: play, track_id: track, file_bytes: plaintextLength };
-  // Finish before the transport's five-second deadline could close the origin.
+  // Finish before the media read deadline could close the origin on its own.
   await t.test('an interrupted encrypted range settles only its prefix and a new seek rechecks custody',
     { timeout: 4000 }, async () => {
       expectedRange = fullRange;
