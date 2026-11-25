@@ -37,7 +37,7 @@ async function open(page: Page, origin: string, onEvent: (route: Route) => Promi
 	});
 	await signIn('first');
 	await page.goto('/demo/player?fixture=listen-events');
-	await expect.poll(() => page.evaluate(() => Boolean(window.__nntuneListenEventFixture))).toBe(true);
+	await expect.poll(() => page.evaluate(async () => Boolean(await window.__nntuneListenEventFixture))).toBe(true);
 	return { contextReads: () => contextReads, signIn };
 }
 
@@ -51,22 +51,27 @@ test('the browser ignores a private grant and posts a matching completion for an
 	});
 	try {
 		const privateOpened = await page.evaluate(async (id) => {
-			const fixture = window.__nntuneListenEventFixture!;
+			const fixture = (await window.__nntuneListenEventFixture)!;
 			const opened = await fixture.open('private_browser_' + id);
 			fixture.playing();
 			fixture.ended();
 			return opened;
 		}, grantId);
 		expect(privateOpened).toBe(true);
-		expect(await page.evaluate((id) => window.__nntuneListenEventFixture!.open(id), grantId)).toBe(true);
-		await page.evaluate(() => window.__nntuneListenEventFixture!.playing());
+		expect(await page.evaluate(async (id) => (await window.__nntuneListenEventFixture)!.open(id), grantId)).toBe(true);
+		await page.evaluate(async () => (await window.__nntuneListenEventFixture)!.playing());
 		await expect.poll(() => bodies).toEqual([start]);
-		await page.evaluate(() => window.__nntuneListenEventFixture!.ended());
+		const writesBeforeAck = await page.evaluate(async () => {
+			const fixture = (await window.__nntuneListenEventFixture)!;
+			fixture.ended();
+			return fixture.writesAfterPendingDispatch();
+		});
+		expect(writesBeforeAck).toBe(1);
 	} finally {
 		acknowledge.resolve();
 	}
 	await expect.poll(() => bodies).toEqual([start, { ...start, event: 'complete' }]);
-	await page.evaluate(() => window.__nntuneListenEventFixture!.close());
+	await page.evaluate(async () => (await window.__nntuneListenEventFixture)!.close());
 	expect(contextReads()).toBe(1);
 });
 
@@ -88,17 +93,17 @@ test('a retry with a changed browser cookie keeps the original listen context', 
 	});
 	let refused: ReturnType<Page['waitForResponse']>;
 	try {
-		expect(await page.evaluate((id) => window.__nntuneListenEventFixture!.open(id), grantId)).toBe(true);
-		await page.evaluate(() => window.__nntuneListenEventFixture!.playing());
+		expect(await page.evaluate(async (id) => (await window.__nntuneListenEventFixture)!.open(id), grantId)).toBe(true);
+		await page.evaluate(async () => (await window.__nntuneListenEventFixture)!.playing());
 		await expect.poll(() => calls).toEqual([{ cookie: cookieFor('first'), body: start }]);
-		await page.evaluate(() => window.__nntuneListenEventFixture!.ended());
+		await page.evaluate(async () => (await window.__nntuneListenEventFixture)!.ended());
 		await signIn('second');
 		refused = page.waitForResponse((response) => response.url() === baseURL + events && response.status() === 401);
 	} finally {
 		flip.resolve();
 	}
 	await refused;
-	await page.evaluate(() => window.__nntuneListenEventFixture!.close());
+	await page.evaluate(async () => (await window.__nntuneListenEventFixture)!.close());
 	expect(calls).toEqual([
 		{ cookie: cookieFor('first'), body: start },
 		{ cookie: cookieFor('second'), body: start }

@@ -6,10 +6,11 @@ const target = normalizePath(fileURLToPath(new URL('../src/routes/demo/player/+p
 const anchor = '\t\trefreshRecent();\n\t\ttry {\n\t\t\tqueue = restoreQueue';
 const injection = `
 		const listenFixture = new AbortController();
-		if (new URLSearchParams(location.search).get('fixture') === 'listen-events') {
-			void import('../../../../tests/fixtures/listen-event-browser.js').then(({ mountListenEventFixture }) =>
-				mountListenEventFixture(listenFixture.signal));
-		}
+		const listenFixtureReady = new URLSearchParams(location.search).get('fixture') === 'listen-events'
+			? import('../../../../tests/fixtures/listen-event-browser.js').then(({ mountListenEventFixture }) =>
+				mountListenEventFixture(listenFixture.signal))
+			: undefined;
+		if (listenFixtureReady) window.__nntuneListenEventFixture = listenFixtureReady;
 		const fixtureStore = recentStore;
 		if (!fixtureStore) throw new Error('history fixture store not initialized');
 		let fixtureActive = true;
@@ -32,6 +33,8 @@ const injection = `
 `;
 const teardown = `			fixtureActive = false;
 			listenFixture.abort();
+			if (listenFixtureReady && window.__nntuneListenEventFixture === listenFixtureReady)
+				delete window.__nntuneListenEventFixture;
 			if (window.__nntuneHistoryFixture === fixture) delete window.__nntuneHistoryFixture;
 `;
 
