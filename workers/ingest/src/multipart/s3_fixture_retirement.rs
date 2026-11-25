@@ -34,6 +34,11 @@ impl FixtureVersionRemover {
         .map_err(|_| FixtureRetirementError::Refused)
     }
 
+    /// Check the runner's selected bucket before it commits the SQL fence.
+    pub fn matches_bucket(&self, bucket: &str) -> bool {
+        bucket == BUCKET
+    }
+
     /// Delete and confirm absence of the same version. Repeating an exact
     /// delete is safe after an interruption.
     pub async fn delete_and_confirm(
@@ -44,7 +49,10 @@ impl FixtureVersionRemover {
         until: SystemTime,
     ) -> Result<(), FixtureRetirementError> {
         use FixtureRetirementError::{Refused, Unconfirmed};
-        if bucket != BUCKET || !fixture_key(key) || !super::readback::valid_version(version) {
+        if !self.matches_bucket(bucket)
+            || !fixture_key(key)
+            || !super::readback::valid_version(version)
+        {
             return Err(Refused);
         }
         let query = format!("versionId={}", encode_query_value(version));
