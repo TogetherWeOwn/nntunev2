@@ -663,9 +663,13 @@ def main():
     trusted = env.get("GITHUB_SHA", "")
     require(SHA.fullmatch(trusted) and git("rev-parse", "HEAD").decode().strip() == trusted,
             "verifier checkout is not workflow source")
+    mode = env.get("DEPLOY_MODE")
+    require(mode in ("promote", "bootstrap-maintenance"), "invalid production admission mode")
+    contract = approved_contract(policy, contract_bytes)
+    require(mode != "promote" or contract.get("journey") == PRIVATE,
+            "application promotion requires the approved private-music journey")
     main_tip = current_main(trusted)
     git("merge-base", "--is-ancestor", sha, main_tip)
-    contract = approved_contract(policy, contract_bytes)
     trees = TRUSTED_TREES + (("fixtures/synthetic-flac/private-staging",) if contract.get("journey") == PRIVATE else ())
     def source_binding(source):
         records = git("ls-tree", "-z", source, "--", *trees, *TRUSTED_FILES)
