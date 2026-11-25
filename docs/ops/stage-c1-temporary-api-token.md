@@ -11,6 +11,11 @@ service tokens have their own lifecycle. [Stock PostgreSQL trial target](https:/
 
 ## Issue and verify
 
+Before issuance, confirm the existing authorized metadata reader can get
+policies and list tokens in the trial account that were created with the
+approved account key. A reader limited to tokens it created cannot cover a
+different creator. If this visibility is unconfirmed, leave issuance pending.
+
 Use the approved account key in secure custody only to create and delete
 this temporary token. Send `POST /accounts/<trial-account-id>/tokens` once
 with automatic retries disabled, including any caller-level retries. With
@@ -19,21 +24,23 @@ name `nntune-trial-c1-<date>` and an explicit UTC `expires_on` at most seven
 days after issuance. Record the intended policy, issue time, expiry and the
 single zone ID bound to the approved DNS zone in the protected trial record.
 Resolve the six group IDs against the approved names and resource types before
-issuance. On success, retain `result.id` in that record and save `result.value`
-directly to `<c1-secure-drop-file>` with mode `0600`. Keep the value and the
-raw create response out of logs and evidence. If issuance has an unknown
-outcome, hold issuance and trial use while reconciling the original attempt.
-A name match alone cannot identify the attempt's token.
+issuance. On success, take `result.id` and `result.value` from the raw HTTP
+response, or `id` and `value` directly from the SDK's returned object. Retain
+the ID in the protected record and save the value directly to
+`<c1-secure-drop-file>` with mode `0600`. Keep the value and create response
+out of logs and evidence. If issuance has an unknown outcome, hold issuance
+and trial use while reconciling the original attempt. A name match alone
+cannot identify the attempt's token.
 [Create account token](https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/methods/create/)
 
-With existing authorized token-metadata access in the same account, read
+With the same authorized metadata reader in the trial account, read
 `GET /accounts/<trial-account-id>/tokens/<c1-token-id>` before using the
 temporary token. Require `success: true` and match `result.id`, `result.name`
 and `result.status` (`active`). Require `result.expires_on` to be in the
 future, match the recorded expiry and be no more than seven days after
 issuance. Match the full `result.policies` by `effect`, permission group ID
-and resource selector, regardless of array order. This is the relevant
-excerpt from a matching response.
+and resource selector, regardless of array order. This excerpt shows the raw
+HTTP response. The SDK returns the object inside `result` directly.
 [Get account token](https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/methods/get/)
 
 ```json
@@ -92,9 +99,10 @@ created. A list that never showed this ID cannot prove its removal.
 [List account tokens](https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/methods/list/)
 
 Use the approved account key to `DELETE /accounts/<trial-account-id>/tokens/<c1-token-id>`.
-If the response includes `result.id`, match it to the recorded ID. With the
-same metadata reader and unchanged account scope and visibility, repeat the
-exact token GET and the account list with `include_expired=true`. Confirm
+If the response includes an ID (`result.id` in raw HTTP, `id` in the SDK
+result), match it to the recorded ID. With the same metadata reader and
+unchanged account scope and visibility, repeat the exact token GET and the
+account list with `include_expired=true`. Confirm
 absence only when the GET returns 404 and a successful, fully paginated list
 contains no matching `result[].id`. A bare 404, denial, timeout, missing or
 incomplete list, or changed visibility leaves disposal unverified. A token
