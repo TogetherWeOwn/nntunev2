@@ -487,6 +487,9 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
     const ITEM: &str = "si_native_mixed_plan";
     const LEGACY: &str = "in_native_mixed_plan";
     const FRESH: &str = "in_native_mixed_plan_fresh";
+    const RENEWAL: &str = "in_native_mixed_plan_renewal";
+    const BOUNDARY: i64 = NOW + 60;
+    const RENEWAL_END: i64 = BOUNDARY + 30 * 86_400;
     seed.row.stripe_subscription_id = TARGET.into();
     seed.row.stripe_customer_id = CUSTOMER.into();
     seed.row.stripe_item_id = ITEM.into();
@@ -533,33 +536,39 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
     let line = |id, price, start: i64, end: i64| {
         json!({
             "id": id, "amount": 400, "price": price, "currency": "usd",
-            "period": {"start": NOW + start, "end": NOW + end}
+            "period": {"start": start, "end": end}
         })
     };
-    let invoice = |id, amount_paid, lines| {
+    let invoice = |id, amount_paid, lines, paid_at| {
         serde_json::from_value(json!({
             "id": id, "customer": CUSTOMER, "subscription": TARGET, "status": "paid",
-            "amount_paid": amount_paid, "currency": "usd", "status_transitions": {"paid_at": NOW},
+            "amount_paid": amount_paid, "currency": "usd", "status_transitions": {"paid_at": paid_at},
             "lines": {"data": lines, "has_more": false}
         }))
         .unwrap()
     };
     let remote = RemoteSubscription {
         subscription: serde_json::from_value(json!({
-            "id": TARGET, "customer": CUSTOMER, "status": "active", "current_period_end": NOW + 60,
+            "id": TARGET, "customer": CUSTOMER, "status": "active", "current_period_end": BOUNDARY,
             "items": {"data": [{"id": ITEM, "price": PLUS}]}
         }))
         .unwrap(),
         invoices: vec![
-            invoice(FRESH, 400, vec![line("fresh_plus", PLUS, 15, 60)]),
+            invoice(
+                FRESH,
+                400,
+                vec![line("fresh_plus", PLUS, NOW + 15, BOUNDARY)],
+                NOW,
+            ),
             invoice(
                 LEGACY,
                 1200,
                 vec![
-                    line("early_pro", PRO, 1, 10),
-                    line("interleaved_plus", PLUS, 0, 15),
-                    line("late_pro", PRO, 10, 30),
+                    line("early_pro", PRO, NOW + 1, NOW + 10),
+                    line("interleaved_plus", PLUS, NOW, NOW + 15),
+                    line("late_pro", PRO, NOW + 10, NOW + 30),
                 ],
+                NOW,
             ),
         ],
     };
@@ -597,7 +606,7 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
     let fresh = fold(local.clone());
     assert!(!fresh.explicit_stale && fresh.fail_closed.is_none());
     assert_eq!(fresh.row.paid_invoice_id.as_deref(), Some(FRESH));
-    assert_eq!(fresh.row.paid_through_unix, Some(NOW + 60));
+    assert_eq!(fresh.row.paid_through_unix, Some(BOUNDARY));
     assert_eq!(fresh.history[0].stripe_invoice_id, FRESH);
     let current = &fresh.history[1];
     assert_eq!(current.stripe_invoice_id, LEGACY);
@@ -804,7 +813,7 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         .await
         .unwrap()
         .get(0);
-    assert_eq!(paid_through_unix, Some(NOW + 60));
+    assert_eq!(paid_through_unix, Some(BOUNDARY));
     assert!(committed
         .1
         .as_array()
@@ -827,6 +836,61 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         .iter()
         .any(|row| row.stripe_invoice_id == LEGACY));
     assert_eq!(snapshot(observer).await, committed);
+
+    let mut renewal = remote;
+    renewal.subscription.current_period_end = Some(RENEWAL_END);
+    renewal.invoices.insert(
+        0,
+        invoice(
+            RENEWAL,
+            800,
+            vec![line("renewal_plus", PLUS, BOUNDARY, RENEWAL_END)],
+            BOUNDARY,
+        ),
+    );
+    let renewed = dispatch_caller_at(OTHER_USER, TARGET, &renewal, BOUNDARY)
+        .await
+        .expect("paid renewal commits with retained invoice evidence");
+    assert_eq!(renewed.read_anchor.as_deref(), Some(FRESH));
+    let (subscriptions, history) = snapshot(observer).await;
+    let target = subscriptions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["stripe_subscription_id"] == TARGET)
+        .unwrap();
+    assert_eq!(target["paid_invoice_id"], RENEWAL);
+    let history = history.as_array().unwrap();
+    let retained = committed.1.as_array().unwrap();
+    assert_eq!(history.len(), retained.len() + 1);
+    assert!(retained.iter().all(|row| history.contains(row)));
+    assert_eq!(
+        observer
+            .query_one(
+                "SELECT period_start = to_timestamp($2::bigint)
+                    AND period_end = to_timestamp($3::bigint)
+                    AND covered_periods = tstzmultirange(tstzrange(
+                        to_timestamp($2::bigint), to_timestamp($3::bigint), '[)'))
+                 FROM public.paid_invoice_history WHERE stripe_invoice_id = $1",
+                &[&RENEWAL, &BOUNDARY, &RENEWAL_END],
+            )
+            .await
+            .unwrap()
+            .get::<_, Option<bool>>(0),
+        Some(true)
+    );
+    let live = with_store(CALLER_CONNECTION, 1, async |store| {
+        super::Store::live_subscription(store, OTHER_USER).await
+    })
+    .await
+    .unwrap()
+    .expect("renewed subscription is live");
+    assert_eq!(live.paid_through_at_unix, Some(RENEWAL_END));
+    for now in [BOUNDARY, RENEWAL_END - 1] {
+        let effective = crate::billing::resolve_effective_plan(Some(live.as_view()), now);
+        assert!(effective.entitled);
+        assert_eq!(effective.plan, crate::plan_limits::PlanId::Plus);
+    }
 }
 
 async fn check_caller_lock_privilege() {
