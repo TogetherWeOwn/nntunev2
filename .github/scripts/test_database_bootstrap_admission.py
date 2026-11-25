@@ -35,25 +35,45 @@ def check_baseline_workflow():
         raise RuntimeError("baseline workflow admission differs from the required guards")
 
 
-def exercise(event_path):
-    plan = secrets.token_bytes(64)
-    sha, run = secrets.token_hex(20), str(secrets.randbelow(10**10) + 1)
-    env = {
+def synthetic_authorization(plan, sha, run, expiry, *, workflow=admission.WORKFLOW):
+    return {
         "GITHUB_REPOSITORY": admission.REPOSITORY,
-        "GITHUB_WORKFLOW_REF": f"{admission.REPOSITORY}/{admission.WORKFLOW}@{admission.MAIN}",
+        "GITHUB_WORKFLOW_REF": f"{admission.REPOSITORY}/{workflow}@{admission.MAIN}",
         "GITHUB_EVENT_NAME": "workflow_dispatch",
         "GITHUB_REF": admission.MAIN,
         "GITHUB_SHA": sha,
         "GITHUB_WORKFLOW_SHA": sha,
         "GITHUB_RUN_ID": run,
         "GITHUB_RUN_ATTEMPT": "1",
-        "GITHUB_EVENT_PATH": str(event_path),
         "BOOTSTRAP_SHA": sha,
         "BOOTSTRAP_RUN_ID": run,
-        "BOOTSTRAP_EXPIRY": str(int(time.time()) + 60),
+        "BOOTSTRAP_EXPIRY": str(expiry),
         "BOOTSTRAP_PLAN_B64": base64.b64encode(plan).decode("ascii"),
         "BOOTSTRAP_PLAN_DIGEST": hashlib.sha256(plan).hexdigest(),
     }
+
+
+def check_aborted_baseline_run_binding():
+    now = 1800000000
+    sha = secrets.token_hex(20)
+    old_plan, fresh_plan = secrets.token_bytes(64), secrets.token_bytes(64)
+    original = synthetic_authorization(old_plan, sha, "101", now + 60, workflow=BASELINE_WORKFLOW)
+    fresh = synthetic_authorization(fresh_plan, sha, "102", now + 60, workflow=BASELINE_WORKFLOW)
+    cases = (
+        ("original first attempt before cancellation", original, old_plan),
+        ("rerun after cancellation", original | {"GITHUB_RUN_ATTEMPT": "2"}, None),
+        ("fresh dispatch using the canceled run authorization", original | {"GITHUB_RUN_ID": "102"}, None),
+        ("fresh dispatch with its own authorization", fresh, fresh_plan),
+    )
+    for case, env, expected in cases:
+        if admission.authorized_plan(env, {}, now, workflow=BASELINE_WORKFLOW) != expected:
+            raise RuntimeError(f"baseline admission fixture: {case}")
+
+
+def exercise(event_path):
+    plan = secrets.token_bytes(64)
+    sha, run = secrets.token_hex(20), str(secrets.randbelow(10**10) + 1)
+    env = synthetic_authorization(plan, sha, run, int(time.time()) + 60) | {"GITHUB_EVENT_PATH": str(event_path)}
 
     def check(admit, event=b'{"inputs":{}}', args=(), **overrides):
         event_path.write_bytes(event)
@@ -225,6 +245,7 @@ def check_snapshot_label_retry():
 if __name__ == "__main__":
     try:
         check_baseline_workflow()
+        check_aborted_baseline_run_binding()
         with tempfile.TemporaryDirectory(prefix="bootstrap-admission-") as temp:
             exercise(Path(temp) / "event.json")
         if Path(temp).exists():
