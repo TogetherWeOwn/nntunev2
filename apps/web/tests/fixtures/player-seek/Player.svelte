@@ -4,7 +4,7 @@
 	import NativeAudio from '../../../src/lib/player/NativeAudio.svelte';
 	import { createPlayback } from '../../../src/lib/player/playback.js';
 	import { createQueue, currentTrack, nextTrack, selectTrack } from '../../../src/lib/player/queue.js';
-	import { SeekController } from '../../../src/lib/player/seekController.js';
+	import { SeekController, type SeekFetch } from '../../../src/lib/player/seekController.js';
 	import { ARTWORK_PATH, AUDIO_PATH } from './paths.js';
 
 	const tracks = [
@@ -49,22 +49,36 @@
 		void playback.play();
 	}
 
-	async function seekStorm() {
-		const controller = new SeekController(AUDIO_PATH);
-		await Promise.allSettled(Array.from({ length: 10 }, (_, i) =>
-			controller.seek(i * 1000, i * 1000 + 99)
-		));
-		const after = await controller.seek(0, 99);
-		seekReady = true;
+	function createSeekFixture(fetchRange?: SeekFetch) {
+		const controller = new SeekController(AUDIO_PATH, fetchRange);
+		let position: number | null = null;
+		let lastBytes = 0;
 		return {
-			aborted: controller.aborted,
-			completed: controller.completed,
-			lastBytes: after.bytes.length
+			async seek(start: number, end: number) {
+				const result = await controller.seek(start, end);
+				position = start;
+				lastBytes = result.bytes.length;
+				return result;
+			},
+			snapshot: () => ({
+				position, lastBytes, completed: controller.completed, aborted: controller.aborted
+			})
 		};
 	}
 
+	async function seekStorm() {
+		const player = createSeekFixture();
+		await Promise.allSettled(Array.from({ length: 10 }, (_, i) =>
+			player.seek(i * 1000, i * 1000 + 99)
+		));
+		await player.seek(0, 99);
+		seekReady = true;
+		const { aborted, completed, lastBytes } = player.snapshot();
+		return { aborted, completed, lastBytes };
+	}
+
 	// The tests wait for this hook to know the real player mounted.
-	Object.assign(window, { seekFixtureStorm: seekStorm });
+	Object.assign(window, { seekFixtureStorm: seekStorm, createSeekFixture });
 </script>
 
 <p role="status" data-testid="player-status">Status: {status === 'selected' && seekReady ? 'ready' : status}</p>
