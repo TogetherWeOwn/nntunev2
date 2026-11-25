@@ -2180,6 +2180,7 @@ jobs:
           python3 -I .github/scripts/test_worker_build_workflow.py
           python3 -E -s .github/scripts/test_staging_trial_cleanup_preflight.py
           python3 -I -B -m unittest discover -s ops/staging-s3-boundary/fixtures -p test_teardown.py
+          python3 -I -B -m unittest discover -s ops/staging-s3-boundary -p test_dns_ownership.py
       - name: Install pinned Worker Rust
         run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Prepare canonical Worker tools

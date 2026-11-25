@@ -125,3 +125,11 @@ It checks the deny matrix, exact-version deletion and absence, sibling
 preservation and disposal without shared ingress. Its result supplies isolated
 evidence. Hosted provider qualification still requires a separately prepared
 and verified ingress under the protected rollout.
+
+The [offline DNS ownership decision](dns_ownership.py) compares the creation
+receipt with independent readbacks in the recorded zone. The ID lookup and the
+complete exact-name list must both match the receipt's zone, ID, name, type,
+origin, proxy state, TTL, tags and comment. Synthetic tests cover target
+selection before deletion, including a same-name replacement that leaves
+cleanup pending even when the ID lookup is empty. The runbook above governs
+absence proof and recovery after a write.
