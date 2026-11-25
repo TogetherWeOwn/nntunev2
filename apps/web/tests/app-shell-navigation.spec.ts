@@ -1464,7 +1464,12 @@ invitedLibraryTest('[NAV-15 v2] Library keyboard controls work with the shell pr
 	await expect(next).toBeFocused();
 	await page.keyboard.press('Enter');
 	await expect(current).toHaveAttribute(playerHooks.queueId, second.id);
-	await expect(audio).toHaveAttribute('src', fixture.mediaPath(second.id));
+	const secondSource = fixture.mediaPath(second.id);
+	await expect(audio).toHaveAttribute('src', secondSource);
+	await expect.poll(() => audio.evaluate((element: HTMLAudioElement, source) =>
+		element.currentSrc === source && !element.paused && element.currentTime > 0.2,
+		origin + secondSource
+	)).toBe(true);
 });
 
 // [gate: app shell]
