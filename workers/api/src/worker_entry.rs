@@ -8547,7 +8547,12 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
         .ok()
         .flatten()
         .and_then(|v| v.parse::<usize>().ok());
-    let source = if req.inner().body().is_none() {
+    let body_cap = handlers::max_body_bytes(req.method().as_ref(), &req.path());
+    #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
+    let body_cap = trial
+        .as_ref()
+        .map_or(body_cap, |_| handlers::private_trial::FIXTURE_BYTES);
+    let source = if declared_len.is_some_and(|len| len > body_cap) || req.inner().body().is_none() {
         BodySource::Bodyless
     } else {
         match req.stream() {
@@ -8559,11 +8564,6 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     };
     // Per-route collection bound: the in-handler gate re-checks the
     // same bound as defense in depth, so the two cannot drift apart.
-    let body_cap = handlers::max_body_bytes(req.method().as_ref(), &req.path());
-    #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
-    let body_cap = trial
-        .as_ref()
-        .map_or(body_cap, |_| handlers::private_trial::FIXTURE_BYTES);
     let collected = collect_body_with_cap(declared_len, source, body_cap).await;
     let headers_map: HashMap<String, String> = req
         .headers()

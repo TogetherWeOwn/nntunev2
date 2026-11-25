@@ -316,7 +316,6 @@ impl Selection {
             .await
     }
     fn mirror(&self, env: &Env) -> Result<MirrorEvidence, TrialError> {
-        // The protected receipt carries the complete, ready mirror evidence.
         env.hyperdrive("MB_DB").map_err(|_| Unconfirmed)?;
         let verified = secret(env, "PRIVATE_TRIAL_MIRROR_EVIDENCE")?;
         if verified.len() > 16_384 {
