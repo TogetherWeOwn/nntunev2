@@ -13,7 +13,7 @@ use nntune_ingest::{
 };
 use serde::Deserialize;
 use tokio_postgres::{types::Type, Client};
-use worker::{Env, SecureTransport, Socket};
+use worker::Env;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -22,12 +22,11 @@ use crate::{
     ingest_session_request::Request,
     native_rest::Pepper,
     storage_digest_read::uuid_text,
-    worker_entry::with_deadline,
+    worker_entry::{now_millis, private_browser_worker::hex},
 };
 
 use super::super::{
-    read_registered_header,
-    registration::{load_authority, Enrollment},
+    registration::{authorize_enrollment, connect_stage_role, load_authority, Enrollment},
     FIXTURE_BYTES,
 };
 use super::{
@@ -65,23 +64,8 @@ fn uuid(raw: &str) -> Option<[u8; 16]> {
     if !crate::meter_sink::is_uuid_shaped(raw) {
         return None;
     }
-    let id = decode_hex(&raw.replace('-', ""))?;
+    let id = hex(&raw.replace('-', ""))?;
     (id[6] >> 4 == 4 && id[8] >> 6 == 2).then_some(id)
-}
-
-fn decode_hex<const N: usize>(raw: &str) -> Option<[u8; N]> {
-    if raw.len() != N * 2
-        || !raw
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return None;
-    }
-    let mut result = [0; N];
-    for (i, byte) in result.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&raw[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(result)
 }
 
 pub(crate) fn selected(env: &Env) -> Option<Selection> {
@@ -96,14 +80,7 @@ pub(crate) fn selected(env: &Env) -> Option<Selection> {
         return None;
     }
     let selected: Selection = serde_json::from_str(&selection).ok()?;
-    let ids = [
-        &selected.session_id,
-        &selected.object_id,
-        &selected.generation_id,
-        &selected.map_id,
-    ];
     if selected.invite_id <= 0
-        || ids.into_iter().any(|id| uuid(id).is_none())
         || selected.title.len() > 128
         || selected.credential_id.is_empty()
         || selected.credential_id.len() > 64
@@ -149,7 +126,7 @@ impl Selection {
             return Err(Refused);
         }
         let root = secret(env, "PRIVATE_PLAYBACK_ROOT_KEY")?;
-        let root = Zeroizing::new(decode_hex::<32>(&root).ok_or(Unconfirmed)?);
+        let root = Zeroizing::new(hex::<32>(&root).ok_or(Unconfirmed)?);
         let bearer = secret(env, "PRIVATE_TRIAL_UPLOAD_BEARER")?;
         let pepper = secret(env, "PRIVATE_TRIAL_UPLOAD_PEPPER")?;
         let version = var(env, "PRIVATE_TRIAL_UPLOAD_PEPPER_VERSION")
@@ -182,9 +159,9 @@ impl Selection {
         if roles.iter().collect::<std::collections::HashSet<_>>().len() != roles.len() {
             return Err(Refused);
         }
-        let mut writer = connect(env, bindings[0], &roles[0]).await?;
-        let reader = connect(env, bindings[1], &roles[1]).await?;
-        let mut publisher = connect(env, bindings[2], &roles[2]).await?;
+        let mut writer = connect_stage_role(env, bindings[0], &roles[0]).await?;
+        let reader = connect_stage_role(env, bindings[1], &roles[1]).await?;
+        let mut publisher = connect_stage_role(env, bindings[2], &roles[2]).await?;
         permit.preflight(&mut publisher).await?;
 
         let attempt = uuid(self.session_id.as_str()).ok_or(Refused)?;
@@ -220,95 +197,33 @@ impl Selection {
         };
 
         let identities = [environment, library, object, generation, configuration];
-        if let Some(header) =
-            read_registered_header(&reader, &upload_scope, identities, map).await?
-        {
-            let current = load_authority(&reader, &self.credential_id, &upload_scope)
-                .await
-                .map_err(|_| Unconfirmed)?
-                .ok_or(Refused)?;
-            let auth = Authorization {
-                record: &current.record,
-                grant: &current.grant,
-                bearer: &bearer,
-                peppers: &peppers,
+        authorize_enrollment(
+            &reader,
+            &self.credential_id,
+            &upload_scope,
+            &bearer,
+            &peppers,
+            now_millis() / 1000,
+        )
+        .await?;
+        let stored =
+            registered_header(&reader, &upload_scope, identities, map, &self.job_id).await?;
+        let (fixture, mirror) = if stored.is_some() {
+            (None, None)
+        } else {
+            let mirror = self.mirror(env)?;
+            let mut registrar = connect_stage_role(env, bindings[3], &roles[3]).await?;
+            let enrollment = Enrollment {
+                session: &session,
+                job: &self.job_id,
+                actor,
+                fingerprint: fingerprint.bytes(),
             };
-            let intent = CandidateIntent {
-                identities,
-                plaintext_len: FIXTURE_BYTES as u64,
-                map_id: map,
-                header,
-                reservation_generation: 1,
-            };
-            let context = EnvelopeContext {
-                identities: [
-                    root_version,
-                    environment,
-                    library,
-                    object,
-                    generation,
-                    configuration,
-                ],
-                plaintext_len: intent.plaintext_len,
-                header,
-            };
-            let prepared = PreparedUpload {
-                scope: upload_scope,
-                job: &job,
-                request: &request,
-                context: &context,
-                intent: &intent,
-            };
-            return permit
-                .replay(
-                    &mut publisher,
-                    &mut writer,
-                    BUCKET,
-                    auth,
-                    prepared,
-                    async |id, scope| load_authority(&reader, id, scope).await,
-                )
-                .await;
-        }
-
-        // Exact-title evidence is enrolled from the verified CC0 mirror receipt.
-        // The Worker does not fall back to public MusicBrainz search.
-        let verified = secret(env, "PRIVATE_TRIAL_MIRROR_EVIDENCE")?;
-        if verified.len() > 16_384 {
-            return Err(Unconfirmed);
-        }
-        let result: MirrorEvidence = serde_json::from_str(&verified).map_err(|_| Unconfirmed)?;
-        if result.release_mbid != self.release_mbid || result.title != self.title {
-            return Err(Refused);
-        }
-        let lookup = release_lookup(&self.title).map_err(|_| Refused)?;
-        let recordings = serde_json::json!({
-            "release_mbid": result.release_mbid, "recordings": result.recordings
-        })
-        .to_string();
-        let evidence = MatchEvidence {
-            query: &self.title,
-            candidates: Some(CompleteReleaseCandidates {
-                lookup: &lookup,
-                hits: result.exact_title_candidates,
-            }),
-            recordings: (200, &recordings),
-            numbering: FileNumbering {
-                disc: Some("1"),
-                track: Some("1"),
-            },
+            let fixture = enrollment
+                .register(&mut registrar, body, identities, map, root_version, &root)
+                .await?;
+            (Some(fixture), Some(mirror))
         };
-        // Enrollment is isolated from both the session grant read and upload writes.
-        let mut registrar = connect(env, bindings[3], &roles[3]).await?;
-        let enrollment = Enrollment {
-            session: &session,
-            job: &self.job_id,
-            actor,
-            fingerprint: fingerprint.bytes(),
-        };
-        let fixture = enrollment
-            .register(&mut registrar, body, identities, map, root_version, &root)
-            .await?;
         let current = load_authority(&reader, &self.credential_id, &upload_scope)
             .await
             .map_err(|_| Unconfirmed)?
@@ -319,15 +234,61 @@ impl Selection {
             bearer: &bearer,
             peppers: &peppers,
         };
+        let header = stored
+            .or_else(|| fixture.as_ref().map(|sealed| sealed.context.header))
+            .ok_or(Unconfirmed)?;
+        let context = EnvelopeContext {
+            identities: [
+                root_version,
+                environment,
+                library,
+                object,
+                generation,
+                configuration,
+            ],
+            plaintext_len: FIXTURE_BYTES as u64,
+            header,
+        };
+        let intent = CandidateIntent {
+            identities,
+            plaintext_len: context.plaintext_len,
+            map_id: map,
+            header,
+            reservation_generation: fixture
+                .as_ref()
+                .map_or(1, |sealed| sealed.intent.reservation_generation),
+        };
         let prepared = PreparedUpload {
             scope: upload_scope,
             job: &job,
             request: &request,
-            context: &fixture.context,
-            intent: &fixture.intent,
+            context: &context,
+            intent: &intent,
         };
         let reload =
             async |id: &str, scope: &CompletionScope<'_>| load_authority(&reader, id, scope).await;
+        let (Some(fixture), Some(mirror)) = (fixture, mirror) else {
+            return permit
+                .replay(&mut publisher, &mut writer, BUCKET, auth, prepared, reload)
+                .await;
+        };
+        let lookup = release_lookup(&self.title).map_err(|_| Refused)?;
+        let recordings = serde_json::json!({
+            "release_mbid": mirror.release_mbid, "recordings": mirror.recordings
+        })
+        .to_string();
+        let evidence = MatchEvidence {
+            query: &self.title,
+            candidates: Some(CompleteReleaseCandidates {
+                lookup: &lookup,
+                hits: mirror.exact_title_candidates,
+            }),
+            recordings: (200, &recordings),
+            numbering: FileNumbering {
+                disc: Some("1"),
+                track: Some("1"),
+            },
+        };
         fixture
             .send(
                 &mut writer,
@@ -355,6 +316,18 @@ impl Selection {
             )
             .await
     }
+    fn mirror(&self, env: &Env) -> Result<MirrorEvidence, TrialError> {
+        env.hyperdrive("MB_DB").map_err(|_| Unconfirmed)?;
+        let verified = secret(env, "PRIVATE_TRIAL_MIRROR_EVIDENCE")?;
+        if verified.len() > 16_384 {
+            return Err(Unconfirmed);
+        }
+        let result: MirrorEvidence = serde_json::from_str(&verified).map_err(|_| Unconfirmed)?;
+        if result.release_mbid != self.release_mbid || result.title != self.title {
+            return Err(Refused);
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Deserialize)]
@@ -366,43 +339,34 @@ struct MirrorEvidence {
     recordings: Vec<serde_json::Value>,
 }
 
-async fn connect(env: &Env, binding: &str, role: &str) -> Result<Client, TrialError> {
-    with_deadline(
-        async {
-            let target = env.hyperdrive(binding).map_err(|_| Unconfirmed)?;
-            let config: tokio_postgres::Config = target
-                .connection_string()
-                .parse()
-                .map_err(|_| Unconfirmed)?;
-            if config.get_dbname() != Some("nntunev2_staging") || config.get_user() != Some(role) {
-                return Err(Refused);
-            }
-            let socket = Socket::builder()
-                .secure_transport(SecureTransport::StartTls)
-                .connect(target.host(), target.port())
-                .map_err(|_| Unconfirmed)?;
-            socket.opened().await.map_err(|_| Unconfirmed)?;
-            let (client, connection) = config
-                .connect_raw(socket, worker::postgres_tls::PassthroughTls)
-                .await
-                .map_err(|_| Unconfirmed)?;
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = connection.await;
-            });
-            let identity = client
-                .query_typed_one(
-                    "SELECT current_user::text = $1 AND current_database() = 'nntunev2_staging'",
-                    &[(&role, Type::TEXT)],
-                )
-                .await
-                .map_err(|_| Unconfirmed)?;
-            if !identity.try_get::<_, bool>(0).map_err(|_| Unconfirmed)? {
-                return Err(Refused);
-            }
-            Ok(client)
-        },
-        3_000,
-        Unconfirmed,
-    )
-    .await
+// Only after owner/invite preflight and the live credential read.
+async fn registered_header(
+    reader: &Client,
+    scope: &CompletionScope<'_>,
+    identities: [[u8; 16]; 5],
+    map: [u8; 16],
+    job: &str,
+) -> Result<Option<[u8; 48]>, TrialError> {
+    let [environment, library, object, generation, configuration] = identities.map(uuid_text);
+    let row = reader.query_typed_opt(
+        "SELECT i.header_tag FROM public.ingest_session_reservations s
+         JOIN public.storage_object_intents i
+           ON i.object_id = s.multipart_object_id AND i.generation_id = s.checkpoint_generation
+         JOIN public.storage_library_namespaces l ON s.library_id = l.id AND l.owner_id IS NULL
+         WHERE s.id = $1::text::uuid AND s.principal_id = $2 AND s.fingerprint = $3
+           AND l.environment_id = $4::text::uuid AND l.id = $5::text::uuid
+           AND i.object_id = $6::text::uuid AND i.generation_id = $7::text::uuid
+           AND i.provider_configuration_version_id = $8::text::uuid
+           AND s.completed_map_id = $9::text::uuid AND s.terminal_reason = 'completed' AND s.idempotency_key = $10",
+        &[(&scope.session, Type::TEXT), (&scope.principal, Type::TEXT), (&scope.fingerprint.as_slice(), Type::BYTEA),
+          (&environment, Type::TEXT), (&library, Type::TEXT), (&object, Type::TEXT), (&generation, Type::TEXT),
+          (&configuration, Type::TEXT), (&uuid_text(map), Type::TEXT), (&job, Type::TEXT)],
+    ).await.map_err(|_| Unconfirmed)?;
+    row.map(|row| {
+        row.try_get::<_, &[u8]>(0)
+            .map_err(|_| Unconfirmed)?
+            .try_into()
+            .map_err(|_| Unconfirmed)
+    })
+    .transpose()
 }

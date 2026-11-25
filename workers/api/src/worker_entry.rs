@@ -892,7 +892,7 @@ pub use subsonic_pg::load_staging_account;
 #[path = "private_browser_custody.rs"]
 pub(crate) mod private_browser_custody;
 #[path = "private_browser_worker.rs"]
-mod private_browser_worker;
+pub(crate) mod private_browser_worker;
 
 struct PgStore {
     env: Option<Env>,
@@ -8552,15 +8552,13 @@ pub async fn dispatch(mut req: Request, env: Env) -> WorkerResult<Response> {
     // same bound as defense in depth, so the two cannot drift apart.
     let request_path = req.path();
     let body_cap = handlers::max_body_bytes(req.method().as_ref(), &request_path);
-    #[cfg(target_arch = "wasm32")]
-    #[cfg(feature = "encrypted-upload-caller")]
+    #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
     let trial = if req.method() == Method::Post && request_path == handlers::private_trial::PATH {
         handlers::private_trial::worker::selected(&env)
     } else {
         None
     };
-    #[cfg(target_arch = "wasm32")]
-    #[cfg(feature = "encrypted-upload-caller")]
+    #[cfg(all(target_arch = "wasm32", feature = "encrypted-upload-caller"))]
     let body_cap = if trial.is_some() {
         handlers::private_trial::FIXTURE_BYTES
     } else {
