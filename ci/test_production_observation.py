@@ -154,6 +154,22 @@ class ProductionObservationTests(unittest.TestCase):
             check("{ malformed synthetic-private-text", 1)
             check(" " * (256 * 1024 + 1), 1)
 
+    def test_cli_refuses_explicitly_pending_readback(self):
+        pins, watch = fixture()
+        watch["samples"][3]["readbacks"]["stream_errors"] = "pending"
+        script = Path(__file__).with_name("production_observation.py")
+        with TemporaryDirectory(prefix="nntune-observation-") as directory:
+            pin_file = Path(directory) / "pins.json"
+            watch_file = Path(directory) / "watch.json"
+            pin_file.write_text(json.dumps(pins))
+            watch_file.write_text(json.dumps(watch))
+            result = subprocess.run([sys.executable, "-B", script, pin_file, watch_file],
+                                    capture_output=True, text=True, check=False)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "Production observation refused: readback failed, missing or unusable\n")
+
 
 if __name__ == "__main__":
     unittest.main()
