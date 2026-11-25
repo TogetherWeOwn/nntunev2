@@ -64,5 +64,5 @@ if __name__ == "__main__":
         prefix = f"/client/v4/accounts/{account}/workers/scripts"
         provider = preflight(os.environ, lambda worker, path: identity.provider_result(f"{prefix}/{worker}/{path}", token))
         print(json.dumps(provider, separators=(",", ":")))
-    except (identity.Unavailable, OSError, ValueError, KeyError, RecursionError):
+    except (identity.Unavailable, OSError, ValueError, KeyError, RecursionError, TypeError, AttributeError):
         sys.exit("Private staging fixture cleanup containment refused.")

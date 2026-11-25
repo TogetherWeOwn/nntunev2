@@ -126,6 +126,8 @@ After containment, supply `PRIVATE_TRIAL_CLEANUP_CONTAINMENT` in the protected
 after completing and checking those steps. Leave the upload, playback,
 journey, observation and Stream deploy arms unset. Keep the original staging
 storage settings available for the runner to match against the receipt.
+If a later staging deploy changes either serving pin, obtain fresh disable
+receipts before dispatch and retain the original fixture scope and hash.
 
 Store the selected tone A receipt as `PRIVATE_TRIAL_CLEANUP_SCOPE`. Supply
 `object`, `generation`, `map`, `track`, `session`, `job`, `issuer`, `invite`,

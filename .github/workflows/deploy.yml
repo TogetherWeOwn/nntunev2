@@ -13,8 +13,8 @@ name: deploy
 #   push-to-main deployment records land only in `staging`. The deploy
 #   credentials remain repository-scoped. Store the Workers read token and
 #   database observer URL only in `staging`. Subsonic readback uses both.
-#   The private journey's two deployment observations use the read token.
-#   These credentials are scoped to the observation steps. Production
+#   The private journey observations and cleanup containment preflight also
+#   use the Workers read token within those steps. Production
 #   records land only in `production` via deploy-production.yml.
 # - Push deploys need the repo Actions secrets CLOUDFLARE_API_TOKEN and
 #   CLOUDFLARE_ACCOUNT_ID (names only; the full account ID stays private).
