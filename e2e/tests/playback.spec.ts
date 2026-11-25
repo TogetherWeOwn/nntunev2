@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { playbackFailure, type PlaybackEvidence } from '../helpers/playback.js';
+import { observePlayback, playbackFailure, type PlaybackEvidence } from '../helpers/playback.js';
 
 // Offline acceptance for the browser-playback verdict used by the live
 // "ingested audio actually plays in the browser" spec in
@@ -105,4 +105,54 @@ test.describe('playbackFailure (browser playback verdict, offline fixtures)', ()
       ),
     ).not.toBeNull();
   });
+});
+
+test('staging playback evidence follows the current audio element and source', async ({ context, page }) => {
+  await context.setOffline(true);
+  await page.setContent('<audio></audio>');
+  const audio = page.locator('audio');
+  const oldSource = 'https://audio.example.invalid/old.wav';
+  const newSource = 'https://audio.example.invalid/new.wav';
+  const decoded = { readyState: 4, duration: 0.11, paused: true, ended: false, currentTime: 0 };
+  type State = Partial<typeof decoded & { src: string; currentSrc: string }>;
+  // Drive media state and events deterministically through the same browser
+  // callback as staging. Overriding getters keeps both URLs offline.
+  const setState = (state: State, event?: string) => audio.evaluate((element, { state, event }) => {
+    for (const [name, value] of Object.entries(state)) {
+      Object.defineProperty(element, name, { value, configurable: true });
+    }
+    if (event) element.dispatchEvent(new Event(event));
+  }, { state, event });
+  const sample = () => audio.evaluate(observePlayback, 'sample' as const);
+
+  await setState({ ...decoded, src: oldSource, currentSrc: oldSource });
+  await audio.evaluate(observePlayback, 'arm' as const);
+  await setState({ paused: false }, 'playing');
+  await setState({ currentTime: 0.11, paused: true, ended: true }, 'timeupdate');
+  expect(playbackFailure(await sample(), 0)).toBeNull();
+
+  // Resource selection can finish between polls. The first new-source event
+  // must discard the old playing flag and high-water mark.
+  await setState({ ...decoded, src: newSource, currentSrc: newSource, currentTime: 0.01 }, 'timeupdate');
+  const switched = await sample();
+  expect(switched).toMatchObject({ hasSource: true, sawPlaying: false, maxCurrentTime: 0.01 });
+  expect(playbackFailure(switched, 0.02)).toMatch(/not playing/);
+  await setState({ paused: false }, 'playing');
+  expect(playbackFailure(await sample(), 0.02)).toMatch(/did not advance/);
+  await setState({ currentTime: 0.11, paused: true, ended: true }, 'timeupdate');
+  expect(playbackFailure(await sample(), 0.02)).toBeNull();
+
+  await audio.evaluate((element) => element.replaceWith(element.cloneNode()));
+  await setState({ ...decoded, src: newSource, currentSrc: newSource });
+  expect(playbackFailure(await sample(), 0)).toMatch(/not playing/);
+  await audio.evaluate(observePlayback, 'reset' as const);
+  await setState({ paused: false }, 'playing');
+  await setState({ currentTime: 0.11, paused: true, ended: true }, 'timeupdate');
+  expect(playbackFailure(await sample(), 0)).toBeNull();
+
+  // A newly assigned src can be visible before currentSrc changes.
+  await setState({ src: oldSource });
+  const pending = await sample();
+  expect(pending).toMatchObject({ hasSource: false, sawPlaying: false, maxCurrentTime: 0 });
+  expect(playbackFailure(pending, 0)).toMatch(/no source/);
 });

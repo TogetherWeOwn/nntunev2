@@ -11,7 +11,7 @@ import {
   type NamedSecret,
 } from '../helpers/contract.js';
 import { assertNoAccessWall, readApiBody, stagingBaseUrl } from '../helpers/access.js';
-import { playbackFailure, type PlaybackEvidence } from '../helpers/playback.js';
+import { observePlayback, playbackFailure } from '../helpers/playback.js';
 import {
   mediaSessionFailure,
   type ExpectedTrack,
@@ -453,41 +453,8 @@ test.describe.serial('ingest → play → meter → browser', () => {
     // play gesture: the synthetic WAV is sub-second, so polling alone could
     // sample only after it has already ended. Booleans/numbers only — the
     // source URL is never read out of the page.
-    await audio.evaluate((element) => {
-      const player = element as HTMLAudioElement & {
-        __nnPlayback?: { sawPlaying: boolean; maxCurrentTime: number };
-      };
-      const recorder = {
-        sawPlaying: !player.paused && !player.ended,
-        maxCurrentTime: Number.isFinite(player.currentTime) ? player.currentTime : 0,
-      };
-      player.__nnPlayback = recorder;
-      player.addEventListener('playing', () => {
-        recorder.sawPlaying = true;
-        recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
-      });
-      player.addEventListener('timeupdate', () => {
-        recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
-      });
-    });
-    const snapshot = (): Promise<PlaybackEvidence> =>
-      audio.evaluate((element) => {
-        const player = element as HTMLAudioElement & {
-          __nnPlayback?: { sawPlaying: boolean; maxCurrentTime: number };
-        };
-        const recorder = player.__nnPlayback ?? { sawPlaying: false, maxCurrentTime: 0 };
-        return {
-          sawPlaying: recorder.sawPlaying,
-          maxCurrentTime: Math.max(recorder.maxCurrentTime, player.currentTime || 0),
-          paused: player.paused,
-          ended: player.ended,
-          currentTime: player.currentTime,
-          duration: player.duration,
-          readyState: player.readyState,
-          errorCode: player.error ? player.error.code : null,
-          hasSource: Boolean(player.currentSrc),
-        };
-      });
+    await audio.evaluate(observePlayback, 'arm' as const);
+    const snapshot = () => audio.evaluate(observePlayback, 'sample' as const);
 
     await expect
       .poll(async () => (await snapshot()).hasSource, {
@@ -507,27 +474,8 @@ test.describe.serial('ingest → play → meter → browser', () => {
         // the missed first play is discarded and the replay below is the
         // measured one. Re-install if the player recreated the element
         // since the recorder was attached (a fresh node has no expando).
-        baseline = await audio.evaluate((element) => {
-          const player = element as HTMLAudioElement & {
-            __nnPlayback?: { sawPlaying: boolean; maxCurrentTime: number };
-          };
-          const start = player.ended ? 0 : player.currentTime || 0;
-          if (!player.__nnPlayback) {
-            const recorder = { sawPlaying: false, maxCurrentTime: start };
-            player.__nnPlayback = recorder;
-            player.addEventListener('playing', () => {
-              recorder.sawPlaying = true;
-              recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
-            });
-            player.addEventListener('timeupdate', () => {
-              recorder.maxCurrentTime = Math.max(recorder.maxCurrentTime, player.currentTime || 0);
-            });
-          } else {
-            player.__nnPlayback.sawPlaying = false;
-            player.__nnPlayback.maxCurrentTime = start;
-          }
-          return start;
-        });
+        const start = await audio.evaluate(observePlayback, 'reset' as const);
+        baseline = start.hasSource && !start.ended ? start.currentTime || 0 : 0;
         // User gesture #2: the player's own visible play control (custom
         // player-play-pause button, or the native toggle while controls are
         // still rendered — see helpers/player-ui.ts). Clicking the audio
