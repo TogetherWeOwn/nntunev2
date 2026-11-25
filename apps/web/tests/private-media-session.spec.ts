@@ -30,7 +30,21 @@ test('private playback replaces Media Session metadata on natural advance', asyn
 
 	const audio = page.getByTestId(player.audio);
 	const active = page.locator(player.currentQueueItem);
-	const sourceFor = (id: string) => new RegExp(`^${player.plays}/media/${id}/`);
+	// Capture startup before clicking Play so the successor can start between assertions.
+	const startedSources = await page.evaluateHandle(() => {
+		const sources = new WeakMap<HTMLAudioElement, string>();
+		document.addEventListener('playing', (event) => {
+			if (event.isTrusted && event.target instanceof HTMLAudioElement) {
+				sources.set(event.target, event.target.currentSrc);
+			}
+		}, true);
+		return sources;
+	});
+	const expectPlaying = (track: typeof first) => expect.poll(() => audio.evaluate(
+		(node: HTMLAudioElement, { sources, prefix }) =>
+			!node.paused && node.currentSrc.startsWith(prefix) && sources.get(node) === node.currentSrc,
+		{ sources: startedSources, prefix: `${origin}${player.plays}/media/${track.id}/` }
+	), `Native playback started for ${track.title}`).toBe(true);
 	const expectMetadata = (track: typeof first) => expect.poll(() => page.evaluate(() => {
 		const metadata = navigator.mediaSession?.metadata;
 		return metadata && { title: metadata.title, artist: metadata.artist, album: metadata.album };
@@ -41,13 +55,11 @@ test('private playback replaces Media Session metadata on natural advance', asyn
 	await expect(active).toHaveAttribute(player.queueId, first.id);
 	await page.getByRole('region', { name: 'Player', exact: true })
 		.getByRole('button', { name: 'Play', exact: true }).click();
-	await expect(audio).toHaveAttribute('src', sourceFor(first.id));
-	await expect(audio).toHaveJSProperty('paused', false);
+	await expectPlaying(first);
 	await expectMetadata(first);
 
 	// Let the native FLAC finish and advance the queue without a transport action.
 	await expect(active).toHaveAttribute(player.queueId, second.id, { timeout: 18_000 });
-	await expect(audio).toHaveAttribute('src', sourceFor(second.id));
-	await expect(audio).toHaveJSProperty('paused', false);
+	await expectPlaying(second);
 	await expectMetadata(second);
 });
