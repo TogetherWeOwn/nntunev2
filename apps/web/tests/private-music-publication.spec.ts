@@ -1,5 +1,5 @@
 import { fileURLToPath } from 'node:url';
-import { expect, test as base } from '@playwright/test';
+import { expect, test as base, type Route } from '@playwright/test';
 import { preview } from 'vite';
 import { assertCuratedLibrary, PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { freshTrialPublication, privateStagingAudio, PRIVATE_TRIAL_UPLOAD } from '../../../e2e/helpers/private-staging-fixture.js';
@@ -11,6 +11,19 @@ const binding = 'A'.repeat(43);
 const playId = '00000000-0000-4000-8000-000000000003';
 // Loopback HTTP uses a fixture-only cookie. The staged runner sends the real cookie over HTTPS.
 const fixtureCookie = 'private_music_fixture_session';
+const listener = `${fixtureCookie}=synthetic-listener`;
+const isListener = (cookie: string | null) => cookie?.split('; ').includes(listener);
+
+function serveFlac(route: Route, body: Buffer) {
+	const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers()['range'] ?? '');
+	const start = range ? Number(range[1]) : 0;
+	const end = range?.[2] ? Math.min(Number(range[2]), body.length - 1) : body.length - 1;
+	if (start > end) return route.fulfill({ status: 416, headers: { 'content-range': `bytes */${body.length}` } });
+	return route.fulfill({
+		status: range ? 206 : 200, contentType: 'audio/flac', body: body.subarray(start, end + 1),
+		headers: { 'accept-ranges': 'bytes', ...(range && { 'content-range': `bytes ${start}-${end}/${body.length}` }) }
+	});
+}
 
 const test = base.extend<{ origin: string }>({
 	origin: async ({}, use) => {
@@ -43,11 +56,9 @@ test('fresh private publication reaches the invited Library and plays under its 
 	const refresh = page.getByRole('button', { name: PRIVATE_MUSIC.library.refresh, exact: true });
 	const ids = () => rows.evaluateAll((items) => items.map((row) => row.getAttribute('data-id')!));
 	const row = (id: string) => rows.and(page.locator(`[data-id="${id}"]`));
-	const listener = `${fixtureCookie}=synthetic-listener`;
 	let publication: { trackId: string; sha256: string } | undefined;
 	let revoked = false;
 	let playbackSession: string | undefined;
-	const isListener = (cookie: string | null) => cookie?.split('; ').includes(listener);
 	await context.route('**/*', (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
 	await page.route(`${origin}/v1/me/likes/session`, async (route) => {
 		if (!isListener(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
@@ -80,14 +91,7 @@ test('fresh private publication reaches the invited Library and plays under its 
 			call.url() !== `${origin}/v1/plays/media/${publication.trackId}/${playbackSession}/${playId}`) {
 			return route.fulfill({ status: 404 });
 		}
-		const range = /^bytes=(\d+)-(\d*)$/.exec(call.headers()['range'] ?? '');
-		const start = range ? Number(range[1]) : 0;
-		const end = range?.[2] ? Math.min(Number(range[2]), upload.body.length - 1) : upload.body.length - 1;
-		if (start > end) return route.fulfill({ status: 416, headers: { 'content-range': `bytes */${upload.body.length}` } });
-		return route.fulfill({
-			status: range ? 206 : 200, contentType: 'audio/flac', body: upload.body.subarray(start, end + 1),
-			headers: { 'accept-ranges': 'bytes', ...(range && { 'content-range': `bytes ${start}-${end}/${upload.body.length}` }) }
-		});
+		return serveFlac(route, upload.body);
 	});
 
 	const anonymous = page.waitForResponse((response) => response.url() === `${origin}${PRIVATE_MUSIC.library.api}`);
@@ -151,4 +155,119 @@ test('fresh private publication reaches the invited Library and plays under its 
 	await expect(page.getByText(PRIVATE_MUSIC.library.forbidden, { exact: true })).toBeVisible();
 	await expect(rows).toHaveCount(0);
 	await expect(page.getByTestId(PRIVATE_MUSIC.player.queueItem)).toHaveCount(0);
+});
+
+test('invited playback keeps the arranged queue and seek position across Library navigation', async ({ page, context, origin }) => {
+	const tone = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
+	const selected = { id: '00000000-0000-4000-8000-000000000004', title: 'Selected Tone', duration_ms: 14_000 };
+	const catalogue = [
+		{ id: uploadedId, title: 'First Tone', duration_ms: 14_000 },
+		{ id: companionId, title: 'Second Tone', duration_ms: 14_000 },
+		selected
+	];
+	const { library, player: contract } = PRIVATE_MUSIC;
+	const grants: string[] = [];
+	let mediaPath: string | undefined;
+	await context.route('**/*', (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+	await context.addCookies([{ name: fixtureCookie, value: 'synthetic-listener', url: origin, httpOnly: true }]);
+	await page.route(`${origin}/v1/me/likes/session`, async (route) => {
+		if (!isListener(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
+		return route.fulfill({ json: { session_binding: binding } });
+	});
+	await page.route(`${origin}${library.api}`, async (route) => {
+		if (!isListener(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
+		return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: catalogue });
+	});
+	await page.route(`${origin}${contract.plays}`, async (route) => {
+		const call = route.request();
+		const { track_id, session_id, play_id } = call.postDataJSON();
+		grants.push(track_id);
+		if (!isListener(await call.headerValue('cookie')) || call.method() !== 'POST' || track_id !== selected.id ||
+			!/^[0-9a-f-]{36}$/.test(session_id) || play_id !== undefined ||
+			await call.headerValue('x-nntune-browser-playback') !== '1' ||
+			await call.headerValue('x-nntune-session-binding') !== binding) return route.fulfill({ status: 400 });
+		mediaPath = `${contract.plays}/media/${track_id}/${session_id}/${playId}`;
+		return route.fulfill({ json: {
+			trackId: track_id, playbackSessionId: session_id, sessionBinding: binding, playId, durationMs: selected.duration_ms
+		} });
+	});
+	await page.route(`${origin}${contract.plays}/media/**`, async (route) => {
+		const call = route.request();
+		if (!mediaPath || call.url() !== origin + mediaPath || !isListener(await call.headerValue('cookie'))) {
+			return route.fulfill({ status: 404 });
+		}
+		return serveFlac(route, tone.body);
+	});
+
+	const rows = page.getByTestId(library.item);
+	const queue = page.getByTestId(contract.queueItem);
+	const active = page.locator(contract.currentQueueItem);
+	const player = page.getByRole('region', { name: 'Player', exact: true });
+	const audio = page.getByTestId(contract.audio);
+	const seek = page.getByRole('slider', { name: 'Seek', exact: true });
+	const feedback = page.getByTestId('player-seek-feedback');
+	const assertQueue = async () => {
+		await expect.poll(() => queue.evaluateAll((items, attr) => items.map((item) => item.getAttribute(attr)), contract.queueId))
+			.toEqual([uploadedId, selected.id, companionId]);
+		await expect(active).toHaveAttribute(contract.queueId, selected.id);
+	};
+
+	await page.goto(origin + library.path);
+	for (const { id } of catalogue) {
+		await rows.and(page.locator(`[data-id="${id}"]`)).locator(library.select).click();
+	}
+	await page.getByRole('button', { name: 'Move Selected Tone up', exact: true }).click();
+	await page.getByRole('button', { name: 'Select Selected Tone', exact: true }).click();
+	await assertQueue();
+	await expect(audio).toHaveCount(0);
+	await player.getByRole('button', { name: 'Play', exact: true }).click();
+	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => !node.paused && node.currentTime > 0.2)).toBe(true);
+	await player.getByRole('button', { name: 'Pause', exact: true }).click();
+	await waitForPaused(audio, true, 5_000, 'Player did not pause');
+	await expect(seek).toBeEnabled();
+	await seek.press('Home');
+	await expect(seek).toHaveAttribute('aria-valuetext', '0:00 of 0:14');
+	await seek.press('PageUp');
+	await expect(seek).toHaveAttribute('aria-valuetext', '0:01 of 0:14');
+	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => node.seeking)).toBe(false);
+
+	const native = (await audio.elementHandle())!;
+	const coldStartEvents = ['play', 'loadstart', 'emptied'];
+	const start = await native.evaluate((node: HTMLAudioElement, events) => {
+		for (const event of events) node.addEventListener(event, () => { node.dataset.playbackLifecycle = event; });
+		return node.currentTime;
+	}, coldStartEvents);
+	expect(start).toBeCloseTo(1.4, 2);
+	const assertPlayback = async (position: number, clock: string) => {
+		await expect(audio).toHaveCount(1);
+		await expect(audio).toHaveAttribute('src', mediaPath!);
+		await expect(player.getByTestId('library-now-playing')).toHaveText(selected.title);
+		await expect(seek).toHaveAttribute('aria-valuetext', `${clock} of 0:14`);
+		expect(await native.evaluate((node: HTMLAudioElement) => ({
+			sameNode: node === document.querySelector('[data-testid="audio-player"]'),
+			paused: node.paused,
+			lifecycle: node.dataset.playbackLifecycle
+		}))).toEqual({ sameNode: true, paused: true, lifecycle: undefined });
+		await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => node.currentTime)).toBeCloseTo(position, 2);
+	};
+
+	await page.getByTestId('shell-rail').getByRole('link', { name: 'Home', exact: true }).click();
+	await expect(page).toHaveURL(origin + '/home');
+	await expect(page.getByRole('heading', { name: 'Home', exact: true })).toBeVisible();
+	await expect(queue).toHaveCount(0);
+	await assertPlayback(start, '0:01');
+	await player.getByRole('button', { name: 'Forward 10 seconds', exact: true }).click();
+	await expect(feedback).toHaveAttribute('aria-live', 'polite');
+	await expect(feedback).toHaveText('Forward 10 seconds, now at 0:11.');
+	await assertPlayback(start + 10, '0:11');
+
+	await page.goBack();
+	await expect(page).toHaveURL(origin + library.path);
+	await expect(rows).toHaveCount(catalogue.length);
+	await assertQueue();
+	await assertPlayback(start + 10, '0:11');
+	await player.getByRole('button', { name: 'Back 10 seconds', exact: true }).click();
+	await expect(feedback).toHaveText('Back 10 seconds, now at 0:01.');
+	await assertPlayback(start, '0:01');
+	expect(grants).toEqual([selected.id]);
 });
