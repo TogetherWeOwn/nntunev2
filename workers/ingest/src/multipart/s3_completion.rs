@@ -41,6 +41,10 @@ use super::initiation::InitiatedUpload;
 #[path = "s3_readback.rs"]
 mod readback;
 
+#[path = "s3_fixture_retirement.rs"]
+mod fixture_retirement;
+pub use fixture_retirement::{FixtureRetirementError, FixtureVersionRemover};
+
 #[path = "s3_reconcile.rs"]
 mod reconcile;
 

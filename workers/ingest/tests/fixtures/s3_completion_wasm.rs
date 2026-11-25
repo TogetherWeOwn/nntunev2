@@ -1,4 +1,4 @@
-use super::{now, Duration, S3CompletionSender};
+use super::{now, Duration, FixtureVersionRemover, S3CompletionSender};
 use crate::multipart::{
     readback_inventory::CompletedReadbackInventory,
     resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
@@ -41,6 +41,26 @@ pub async fn s3_completion_test(mode: String) -> Result<String, JsValue> {
         _ => "https://fixture.test:8443",
     };
     run(&mode, endpoint).await
+}
+
+#[wasm_bindgen]
+pub async fn s3_fixture_retirement_test(
+    bucket: String,
+    key: String,
+    version: String,
+) -> Result<(), JsValue> {
+    let remover = FixtureVersionRemover::new(
+        id(7),
+        "https://fixture.test:8443",
+        "fixture-region".into(),
+        "FIXTUREACCESS".into(),
+        "fixture-secret".into(),
+    )
+    .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+    remover
+        .delete_and_confirm(&bucket, &key, &version, now() + Duration::from_secs(5))
+        .await
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))
 }
 
 #[wasm_bindgen]
