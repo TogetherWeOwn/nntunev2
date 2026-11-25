@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / ".github/scripts"))
 
 from apply_migration import transaction_body
 from staging_apply import load_entries
-from staging_trial_role_lifecycle import DATABASE, FIXTURE, NAMES, SCOPE_ENV
+from staging_trial_role_lifecycle import CONFIG_ENV, DATABASE, FIXTURE, NAMES, SCOPE_ENV
 from staging_trial_schema import BASELINE, compose
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -90,12 +90,16 @@ try:
     scope = {"database_oid": database_oid, "issuer_oid": role_oid(owner),
              "reader": [reader, role_oid(reader)], "writer": [writer, role_oid(writer)]}
 
-    def cmd(action, *, success=True, pin=database_oid, **overrides):
+    def cmd(action, *, success=True, pin=database_oid, isolated=None, **overrides):
         env = {"PATH": base["PATH"], SCOPE_ENV: json.dumps(scope)}
         for kind, login in (("OWNER", owner), ("EXECUTOR", executor), ("READER", reader), ("WRITER", writer)):
             env[f"PRIVATE_TRIAL_{kind}_URL"] = f"postgresql://{login}:{password}@127.0.0.1:{port}/{DATABASE}"
-        result = subprocess.run([sys.executable, str(ROOT / ".github/scripts/staging_trial_role_lifecycle.py"),
-                                 action, "--fixture-only-oid", str(pin)], env=env | overrides,
+        argv = [sys.executable, str(ROOT / ".github/scripts/staging_trial_role_lifecycle.py"),
+                action, "--fixture-only-oid", str(pin)]
+        if isolated is not None:
+            env[CONFIG_ENV] = json.dumps(isolated)
+            argv.append("--isolated")
+        result = subprocess.run(argv, env=env | overrides,
                                 text=True, capture_output=True, check=False)
         assert password not in (result.stdout + result.stderr)
         assert (result.returncode == 0) == success, result.stdout + result.stderr
@@ -216,6 +220,90 @@ try:
     sql(f"SET ROLE {owner}; DROP ROLE {reader};")
     cmd("retire")  # A pinned reader already removed and an ungranted writer.
     assert sql(f"SELECT count(*) FROM pg_roles WHERE rolname IN ('{reader}','{writer}');") == "0"
+
+    # Rehearse the separate branch's split authority. Retain all app objects and
+    # data but let the database owner, not the executor, control the schema ACL.
+    sql(f"""
+    DROP FUNCTION public.check_storage_s3_locator_intent();
+    ALTER SCHEMA public OWNER TO pg_database_owner;
+    REVOKE CREATE ON SCHEMA public FROM {executor};
+    SET ROLE {owner};
+    CREATE ROLE {reader} LOGIN NOINHERIT PASSWORD '{password}';
+    CREATE ROLE {writer} LOGIN NOINHERIT PASSWORD '{password}';
+    """)
+    scope.update(reader=[reader, role_oid(reader)], writer=[writer, role_oid(writer)])
+    config = dict(database_oid=database_oid, executor_oid=role_oid(executor), direct="127.0.0.1",
+                  direct_port=port, routed="127.0.0.1", routed_port=port,
+                  owner=owner, executor=executor, reader=reader, writer=writer)
+
+    def isolated(action, *, config=config, **kwargs):
+        return cmd(action, isolated=config, **kwargs)
+
+    def ungranted():
+        assert sql(f"""SELECT bool_or(has_database_privilege(rolname,current_database(),'CONNECT'))
+                       FROM pg_roles WHERE rolname IN ('{reader}','{writer}');""") == "f"
+        assert sql("SELECT to_regclass('public.private_library_admissions') IS NULL;") == "t"
+
+    wrong_oid = database_oid + 1
+    isolated("grant", success=False, pin=wrong_oid, config=config | {"database_oid": wrong_oid},
+             **{SCOPE_ENV: json.dumps(scope | {"database_oid": wrong_oid})})
+    isolated("grant", success=False, config=config | {"executor_oid": role_oid(owner)})
+    isolated("grant", success=False,
+             PRIVATE_TRIAL_WRITER_URL=f"postgresql://{writer}.wrong:{password}@127.0.0.1:{port}/{DATABASE}")
+    isolated("grant", success=False,
+             PRIVATE_TRIAL_READER_URL=f"postgresql://{reader}:{password}@127.0.0.2:{port}/{DATABASE}")
+    isolated("grant", success=False, config=config | {"routed_port": port - 1})
+    isolated("grant", success=False)  # Table ownership does not confer schema CREATE.
+    ungranted()
+    sql(f"GRANT CREATE ON SCHEMA public TO {executor};")
+    isolated("grant", success=False)  # PUBLIC USAGE does not confer a grant option.
+    ungranted()
+    sql(f"GRANT USAGE ON SCHEMA public TO {executor} WITH GRANT OPTION;")
+    signature = "public.lock_storage_digest_winner(uuid,uuid,bytea,bigint,uuid,uuid,uuid)"
+    sql(f"ALTER FUNCTION {signature} OWNER TO {owner};")
+    isolated("grant", success=False)
+    ungranted()
+    sql(f"GRANT EXECUTE ON FUNCTION {signature} TO {executor} WITH GRANT OPTION;")
+    sql(f"ALTER FUNCTION {signature} STABLE;")
+    isolated("grant", success=False)  # Correct ownership or grant option is only half the contract.
+    ungranted()
+    sql(f"ALTER FUNCTION {signature} VOLATILE;")
+    sql(f"UPDATE public.schema_migrations SET sha256 = repeat('0',64) WHERE file = '{BASELINE}';")
+    isolated("grant", success=False)
+    ungranted()
+    sql(f"UPDATE public.schema_migrations SET sha256 = '{applied}' WHERE file = '{BASELINE}';")
+    assert "isolated owner authority passed" in isolated("check")
+    ungranted()
+    # A stale or wrong routed password can only be discovered after CONNECT.
+    assert "application grants passed" in isolated("grant", success=False,
+        PRIVATE_TRIAL_WRITER_URL=f"postgresql://{writer}:wrong@127.0.0.1:{port}/{DATABASE}")
+    assert "routed writer passed" in isolated("grant")
+    assert "routed reader passed" in isolated("verify-overlay")
+    sql(f"""
+    INSERT INTO public.invite_codes(code_hash,created_at,expires_at) VALUES ('isolated-fixture',0,1);
+    SET ROLE {writer};
+    INSERT INTO public.private_library_admissions(invite_id,recipient_id,track_id,accepted_seq,object_id)
+      SELECT i.id, 'fixture', t.id, 1, gen_random_uuid() FROM public.invite_codes i CROSS JOIN public.tracks t;
+    """)
+    assert sql(f"SET ROLE {reader}; SELECT count(*) FROM public.private_library_admissions;") == "1"
+    assert sql(f"SELECT has_table_privilege('{reader}','public.private_library_admissions','INSERT,UPDATE,DELETE');") == "f"
+    # An independent ACL drift refuses retirement after fencing. Repair and
+    # retry, leaving the overlay and unrelated application rows intact.
+    sql(f"GRANT DELETE ON public.private_library_admissions TO {writer};")
+    assert "staging drain passed" in isolated("retire", success=False)
+    assert sql(f"SELECT count(*) FROM pg_roles WHERE rolname IN ('{reader}','{writer}') AND rolcanlogin;") == "0"
+    sql(f"REVOKE DELETE ON public.private_library_admissions FROM {writer};")
+    isolated("retire")
+    isolated("retire")
+    assert sql(f"SELECT count(*) FROM pg_roles WHERE rolname IN ('{reader}','{writer}');") == "0"
+    assert sql("SELECT count(*) FROM pg_trigger WHERE tgname = 'private_trial_lock_only';") == "0"
+    assert sql("SELECT count(*) FROM public.users WHERE id = 'fixture';") == "1"
+    assert sql("SELECT count(*) FROM public.private_library_admissions;") == "1"
+    assert sql("SELECT obj_description('public.private_library_admissions'::regclass) LIKE 'isolated-private-trial %';") == "t"
+    sql(f"SET ROLE {owner}; CREATE ROLE {reader} LOGIN NOINHERIT; CREATE ROLE {writer} LOGIN NOINHERIT;")
+    scope.update(reader=[reader, role_oid(reader)], writer=[writer, role_oid(writer)])
+    assert "staging CONNECT passed" not in isolated("grant", success=False)
+    assert sql(f"SELECT has_database_privilege('{writer}',current_database(),'CONNECT');") == "f"
 finally:
     sql(f"""
     DROP DATABASE {DATABASE} WITH (FORCE);

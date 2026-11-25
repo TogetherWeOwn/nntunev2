@@ -1,0 +1,71 @@
+name: staging-trial-isolated-setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Check authority, grant and install, verify routed access, fence, or retire
+        type: choice
+        options: [check, grant, verify-overlay, fence, retire]
+        default: check
+      ref:
+        description: Full reviewed commit at protected main
+        type: string
+        required: true
+      board_approval:
+        description: Recorded approval reference for this staging operation
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migrations-staging-apply
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  setup:
+    name: Manage isolated staging trial access
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment:
+      name: staging
+      deployment: false
+    steps:
+      - name: Admit the reviewed dispatch
+        env:
+          REVIEWED_REF: ${{ inputs.ref }}
+          APPROVAL: ${{ inputs.board_approval }}
+        run: |
+          set -euo pipefail
+          [[ "$REVIEWED_REF" =~ ^[0-9a-f]{40}$ && "$REVIEWED_REF" == "$GITHUB_SHA" ]]
+          [[ "$APPROVAL" =~ ^[A-Za-z0-9._/-]{1,200}$ ]]
+          printf 'Reviewed commit `%s` (%s)\n' "$REVIEWED_REF" "$APPROVAL" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Ensure postgres client
+        run: |
+          set -euo pipefail
+          if ! command -v psql >/dev/null || [ ! -r /etc/ssl/certs/ca-certificates.crt ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client ca-certificates
+          fi
+          test -r /etc/ssl/certs/ca-certificates.crt
+      - name: Run the isolated database lifecycle
+        env:
+          OPERATION: ${{ inputs.operation }}
+          ISOLATED_TRIAL_TARGET: ${{ secrets.ISOLATED_TRIAL_TARGET }}
+          PRIVATE_TRIAL_ROLE_PREFLIGHT_SCOPE: ${{ secrets.ISOLATED_TRIAL_ROLE_SCOPE }}
+          PRIVATE_TRIAL_OWNER_URL: ${{ secrets.ISOLATED_TRIAL_OWNER_URL }}
+          PRIVATE_TRIAL_EXECUTOR_URL: ${{ secrets.ISOLATED_TRIAL_EXECUTOR_URL }}
+          PRIVATE_TRIAL_READER_URL: ${{ secrets.ISOLATED_TRIAL_READER_URL }}
+          PRIVATE_TRIAL_WRITER_URL: ${{ secrets.ISOLATED_TRIAL_WRITER_URL }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -E -s .github/scripts/staging_trial_role_lifecycle.py "$OPERATION" --isolated | tee -a "$GITHUB_STEP_SUMMARY"
