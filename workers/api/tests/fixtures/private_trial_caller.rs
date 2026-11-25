@@ -68,7 +68,20 @@ pub(crate) async fn verify_registration(
         "GRANT SELECT (id, principal_id, library_id, fingerprint, terminal_reason) ON public.ingest_session_reservations TO upload_fixture_authority;
          GRANT SELECT (id, environment_id, owner_id) ON public.storage_library_namespaces TO upload_fixture_authority;"
     ).await.unwrap();
+    observer
+        .batch_execute(include_str!("private_trial_registrar_grants.sql"))
+        .await
+        .unwrap();
     let mut registrar = connection().await;
+    registrar
+        .batch_execute("SET ROLE upload_fixture_registrar")
+        .await
+        .unwrap();
+    assert!(registrar.query_one(
+        "SELECT current_user = 'upload_fixture_registrar'
+            AND NOT has_any_column_privilege(current_user, 'public.native_rest_credentials', 'SELECT')
+            AND NOT has_table_privilege(current_user, 'public.storage_validated_digest_winners', 'INSERT')", &[],
+    ).await.unwrap().get::<_, bool>(0));
     let session = uuid_text(id(0xef));
     let fingerprint = [0x47; 32];
     let enrollment = Enrollment {
@@ -111,21 +124,56 @@ pub(crate) async fn verify_registration(
         authorize(auth.bearer, auth.record.expires_at).await,
         Err(TrialError::Refused)
     );
-    let register = async |db: &mut Client, body: &[u8]| {
+    let register = async |enrollment: &Enrollment<'_>, db: &mut Client, body: &[u8], ids| {
         enrollment
-            .register(db, body, identities, id(0xf0), id(0xf1), &[0xac; 32])
+            .register(db, body, ids, id(0xf0), id(0xf1), &[0xac; 32])
             .await
     };
+    let wrong_owner = Enrollment {
+        actor: OUTSIDER,
+        ..enrollment
+    };
+    assert!(matches!(
+        register(&wrong_owner, &mut registrar, input, identities).await,
+        Err(TrialError::Refused)
+    ));
+    let set_status = async |status: &str| {
+        observer
+            .execute(
+                "UPDATE public.ingest_jobs SET status = $1 WHERE id = $2",
+                &[&status, &JOB],
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(set_status("queued").await, 1);
+    assert!(matches!(
+        register(&enrollment, &mut registrar, input, identities).await,
+        Err(TrialError::Refused)
+    ));
+    assert_eq!(set_status("done").await, 1);
+    let mut owned = identities;
+    owned[1] = id(0xf2);
+    observer.execute(
+        "INSERT INTO public.storage_library_namespaces VALUES ($1::text::uuid,$2::text::uuid,$3)",
+        &[&uuid_text(owned[1]), &env, &enrollment.actor],
+    ).await.unwrap();
+    assert!(matches!(
+        register(&enrollment, &mut registrar, input, owned).await,
+        Err(TrialError::Refused)
+    ));
     let mut changed = input.to_vec();
     changed[0] ^= 1;
     assert!(matches!(
-        register(&mut registrar, &changed).await,
+        register(&enrollment, &mut registrar, &changed, identities).await,
         Err(TrialError::Refused)
     ));
-    let enrolled = register(&mut registrar, input).await.unwrap();
+    let enrolled = register(&enrollment, &mut registrar, input, identities)
+        .await
+        .unwrap();
     assert_eq!(enrolled.intent.reservation_generation, 1);
     assert!(matches!(
-        register(&mut registrar, input).await,
+        register(&enrollment, &mut registrar, input, identities).await,
         Err(TrialError::Refused)
     ));
 
@@ -142,10 +190,27 @@ pub(crate) async fn verify_registration(
         .await
         .unwrap()
         .is_none());
+    let map = enrolled.intent.map_id;
+    let [page] = enrolled
+        .origin()
+        .candidate_page_hashes(
+            &identities,
+            enrolled.intent.plaintext_len,
+            &map,
+            &enrolled.context.header,
+        )
+        .unwrap()
+    else {
+        panic!("expected one fixture digest page")
+    };
     assert!(observer.query_one(
         "SELECT EXISTS (SELECT FROM public.ingest_session_cleanup_intents WHERE session_id=$1::text::uuid)
-              AND EXISTS (SELECT FROM public.storage_object_envelope_intents WHERE object_id=$2::text::uuid AND wrapped_record=$3)",
-        &[&session, &obj, &enrolled.record.as_slice()],
+              AND EXISTS (SELECT FROM public.storage_object_envelope_intents WHERE object_id=$2::text::uuid AND wrapped_record=$3)
+              AND EXISTS (SELECT FROM public.storage_digest_map_intents m
+                JOIN public.storage_digest_map_page_intents p USING (map_id)
+                WHERE m.object_id=$2::text::uuid AND m.map_id=$4::text::uuid AND m.page_count=1
+                  AND p.page_index=0 AND p.expected_hash=$5)",
+        &[&session, &obj, &enrolled.record.as_slice(), &uuid_text(map), &page.as_slice()],
     ).await.unwrap().get::<_, bool>(0));
 }
 
