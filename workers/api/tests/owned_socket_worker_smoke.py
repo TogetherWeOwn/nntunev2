@@ -217,7 +217,7 @@ def exercise_restricted_history(base, observe):
     )
 
 
-def check_webhook_ack(base, observe):
+def setup_webhook_fixture(base, observe):
     status, _, body = routing.http("POST", base + "/billing-ack-fixture")
     routing.check(status == 200 and body == "billing-ack-fixture-ok", body)
     observe("""
@@ -230,20 +230,22 @@ def check_webhook_ack(base, observe):
                 'webhook_ack_fixture', '{"kind":"checkout","price_id":"price_worker_fault","session_id":"cs_worker_fault"}');
     """)
 
-    def snapshot():
-        return json.loads(
-            observe(
-                """
+def webhook_snapshot(observe):
+    return json.loads(
+        observe(
+            """
             SELECT jsonb_build_array(
                 COALESCE((SELECT jsonb_agg(s ORDER BY stripe_subscription_id) FROM public.subscriptions s), '[]'),
                 COALESCE((SELECT jsonb_agg(h ORDER BY stripe_invoice_id) FROM public.paid_invoice_history h), '[]'),
                 COALESCE((SELECT jsonb_agg(o ORDER BY id) FROM public.billing_operations o), '[]'),
                 COALESCE((SELECT jsonb_agg(e ORDER BY stripe_event_id) FROM public.billing_webhook_events e), '[]'))
-        """,
-                tuples=True,
-            )
+            """,
+            tuples=True,
         )
+    )
 
+
+def signed_webhook():
     body = json.dumps(
         {
             "id": "evt_worker_fault",
@@ -256,10 +258,16 @@ def check_webhook_ack(base, observe):
     digest = hmac.digest(
         b"webhook-ack-fixture", stamp.encode() + b"." + body, "sha256"
     ).hex()
-    headers = {
+    return body, {
         "Stripe-Signature": f"t={stamp},v1={digest}",
         "Content-Type": "application/json",
     }
+
+
+def check_webhook_ack(base, observe):
+    setup_webhook_fixture(base, observe)
+    snapshot = partial(webhook_snapshot, observe)
+    body, headers = signed_webhook()
     before = snapshot()
     routing.check(
         before[:2] == [[], []] and not before[3],
@@ -331,6 +339,96 @@ def check_webhook_ack(base, observe):
         "PASS: signed webhook recovered and settled after a withheld billing COMMIT",
         flush=True,
     )
+
+
+def check_checkout_hourly_overlap(base, observe):
+    setup_webhook_fixture(base, observe)
+    observe("""
+        INSERT INTO public.users (id, email, created_at)
+        VALUES ('worker_other_user', 'other@example.test', 1786032000);
+        INSERT INTO public.subscriptions (user_id, stripe_subscription_id, stripe_customer_id,
+            stripe_subscription_item_id, stripe_price_id, plan_id, status, current_period_end)
+        VALUES ('worker_fault_user', 'sub_worker_fault', 'cus_worker_fault', 'si_worker_fault',
+                'price_worker_fault', 'plus', 'past_due', to_timestamp(1786032100)),
+               ('worker_other_user', 'sub_worker_other', 'cus_worker_other', 'si_worker_other',
+                'price_worker_fault', 'plus', 'canceled', to_timestamp(1786032100));
+        INSERT INTO public.paid_invoice_history (user_id, stripe_invoice_id, stripe_subscription_id,
+            plan_id, period_start, period_end, amount_cents, currency, paid_at)
+        VALUES ('worker_other_user', 'in_worker_other', 'sub_worker_other', 'plus',
+            to_timestamp(1786032000), to_timestamp(1786032100), 800, 'usd', to_timestamp(1786032000));
+
+        CREATE SEQUENCE public.checkout_overlap_writes;
+        CREATE FUNCTION public.observe_checkout_overlap_writes() RETURNS trigger
+        LANGUAGE plpgsql AS $$ BEGIN
+            IF EXISTS (SELECT 1 FROM public.subscriptions
+                       WHERE user_id = NEW.user_id AND stripe_subscription_id = NEW.stripe_subscription_id
+                         AND status = 'active' AND paid_invoice_id = 'in_worker_second')
+               AND EXISTS (SELECT 1 FROM public.paid_invoice_history
+                           WHERE user_id = NEW.user_id AND stripe_subscription_id = NEW.stripe_subscription_id
+                             AND stripe_invoice_id = 'in_worker_first') THEN
+                PERFORM nextval('public.checkout_overlap_writes');
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER observe_checkout_overlap_writes BEFORE INSERT ON public.paid_invoice_history
+        FOR EACH ROW WHEN (NEW.stripe_invoice_id = 'in_worker_second' AND NEW.amount_cents = 801)
+        EXECUTE FUNCTION public.observe_checkout_overlap_writes();
+    """)
+    before_subs, before_history, before_ops, before_claims = webhook_snapshot(observe)
+    body, headers = signed_webhook()
+    status, _, reply = routing.http(
+        "POST", base + "/billing-checkout-hourly-overlap-proof", body, headers
+    )
+    routing.check(
+        status == 500 and reply == '{"error":"internal error"}',
+        f"conflicting checkout: {status} {reply}",
+    )
+    routing.check(
+        observe("SELECT is_called FROM public.checkout_overlap_writes", tuples=True) == "t",
+        "checkout failed before reaching both writes and the conflicting insert",
+    )
+    subs, history, ops, claims = webhook_snapshot(observe)
+    hourly, unrelated = before_subs
+    hourly = hourly | {
+        "paid_invoice_id": "in_worker_second",
+        "paid_through_at": hourly["current_period_end"],
+    }
+    routing.check(subs == [hourly, unrelated], "checkout changed hourly or unrelated subscription")
+    old_invoice, hourly_invoice = history
+    routing.check(
+        [old_invoice] == before_history
+        and (hourly_invoice["stripe_invoice_id"], hourly_invoice["user_id"],
+             hourly_invoice["stripe_subscription_id"], hourly_invoice["plan_id"],
+             hourly_invoice["amount_cents"], hourly_invoice["currency"])
+        == ("in_worker_second", "worker_fault_user", "sub_worker_fault", "plus", 800, "eur"),
+        "checkout retained a partial insert or changed attributed hourly evidence",
+    )
+    routing.check(ops == before_ops and claims == before_claims == [], "checkout lost its retry state")
+
+    settled = None
+    for phase in ("corrected retry", "replay"):
+        status, _, reply = routing.http("POST", base + "/billing-webhook-retry-proof", body, headers)
+        routing.check(status == 200 and reply == '{"ok":true}', f"{phase}: {status} {reply}")
+        after = webhook_snapshot(observe)
+        subs, history, ops, claims = after
+        routing.check(subs == [hourly | {"status": "active"}, unrelated], f"{phase} changed subscription state")
+        first, *retained_history = history
+        routing.check(
+            retained_history == [old_invoice, hourly_invoice]
+            and (first["stripe_invoice_id"], first["user_id"], first["stripe_subscription_id"],
+                 first["plan_id"], first["amount_cents"], first["currency"])
+            == ("in_worker_first", "worker_fault_user", "sub_worker_fault", "plus", 800, "usd"),
+            f"{phase} changed invoice attribution or retained evidence",
+        )
+        routing.check(
+            len(ops) == 1 and ops == [before_ops[0] | {"state": "succeeded", "updated_at": ops[0]["updated_at"]}]
+            and [claim["stripe_event_id"] for claim in claims] == ["evt_worker_fault"],
+            f"{phase} did not settle the original checkout",
+        )
+        if settled is not None:
+            routing.check(after == settled, "replay changed settled checkout state")
+        settled = after
+    print("PASS: hourly invoice conflict rolled back checkout writes, then corrected retry converged", flush=True)
 
 
 def main():
@@ -420,6 +518,12 @@ def main():
                 try:
                     observe = partial(routing.psql, settings, BILLING_DB, timeout=10)
                     check_webhook_ack(f"http://127.0.0.1:{port}", observe)
+                finally:
+                    admin(f"DROP DATABASE {BILLING_DB}")
+                admin(f"CREATE DATABASE {BILLING_DB} TEMPLATE template0")
+                try:
+                    observe = partial(routing.psql, settings, BILLING_DB, timeout=10)
+                    check_checkout_hourly_overlap(f"http://127.0.0.1:{port}", observe)
                 finally:
                     admin(f"DROP DATABASE {BILLING_DB}")
                 check_restricted_history(f"http://127.0.0.1:{port}", settings)

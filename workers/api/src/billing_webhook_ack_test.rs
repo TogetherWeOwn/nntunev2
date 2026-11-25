@@ -1,17 +1,27 @@
-//! Hosted disposable Worker control for caller recovery after a lost COMMIT reply.
+//! Hosted disposable Worker controls for checkout reconciliation and retry.
 use super::{handlers, DohDns, MirrorBinding, PgStore, SocketDialer, StoreError, WebhookMailer};
-use crate::postgres::PgClient;
+use crate::billing_sweep::{BATCH_SIZE, DUE_TARGETS};
+use crate::postgres::{PgClient, PgQuery};
 use crate::stripe::{self, StripeError, StripeRequest, StripeResult};
 use serde_json::{json, Value};
 use std::cell::Cell;
+use tokio_postgres::types::Type;
 use worker::{Env, Request, Response};
 
 const NOW: u64 = 1_786_032_000;
+const USER: &str = "worker_fault_user";
 const OPERATION: &str = "a0000000-0000-4000-8000-000000000001";
 const CUSTOMER: &str = "cus_worker_fault";
 pub(super) const SUBSCRIPTION: &str = "sub_worker_fault";
 const PRICE: &str = "price_worker_fault";
 const SESSION: &str = "cs_worker_fault";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    LoseCommitAck,
+    Retry,
+    HourlyOverlap,
+}
 
 pub(super) async fn connect() -> Result<PgClient, StoreError> {
     // Ancillary reads, claims and checkout marks never cross the COMMIT relay.
@@ -40,10 +50,11 @@ pub(super) async fn connect() -> Result<PgClient, StoreError> {
 pub(super) struct StripeScript {
     expected: [(StripeRequest, Value); 3],
     next: Cell<usize>,
+    delivery: Delivery,
 }
 
 impl StripeScript {
-    fn new() -> Self {
+    fn new(delivery: Delivery) -> Self {
         let invoice = |id: &str, currency: &str| {
             json!({
                 "id": id, "customer": CUSTOMER, "subscription": SUBSCRIPTION,
@@ -79,10 +90,11 @@ impl StripeScript {
                 ),
             ],
             next: Cell::new(0),
+            delivery,
         }
     }
 
-    pub(super) fn send<T: serde::de::DeserializeOwned>(
+    pub(super) async fn send<T: serde::de::DeserializeOwned>(
         &self,
         req: &StripeRequest,
     ) -> StripeResult<T> {
@@ -94,17 +106,84 @@ impl StripeScript {
         if req != expected {
             return Err(StripeError::transport());
         }
-        let decoded =
-            serde_json::from_value(response.clone()).map_err(|_| StripeError::transport())?;
+        let mut response = response.clone();
+        if self.delivery == Delivery::HourlyOverlap && index == 2 {
+            // Checkout has completed its exact-target read. Commit the due
+            // observation before checkout receives its conflicting listing.
+            let mut subscription: stripe::Subscription =
+                serde_json::from_value(self.expected[1].1.clone())
+                    .map_err(|_| StripeError::transport())?;
+            subscription.status = "past_due".into();
+            let invoice = serde_json::from_value(response["data"][1].clone())
+                .map_err(|_| StripeError::transport())?;
+            commit_hourly_observation(subscription, invoice)
+                .await
+                .map_err(|_| StripeError::transport())?;
+            response["data"][1]["amount_paid"] = json!(801);
+        }
+        let decoded = serde_json::from_value(response).map_err(|_| StripeError::transport())?;
         self.next.set(index + 1);
         Ok(decoded)
+    }
+}
+
+async fn commit_hourly_observation(
+    subscription: stripe::Subscription,
+    invoice: stripe::Invoice,
+) -> Result<(), StoreError> {
+    let hour = (NOW / 3_600) as i64;
+    let store = fixture_store("worker-webhook-retry-test", None);
+    let due = store
+        .connect()
+        .await?
+        .query_typed(
+            DUE_TARGETS,
+            &[(&hour, Type::INT8), (&BATCH_SIZE, Type::INT8)],
+        )
+        .await
+        .map_err(|_| StoreError)?;
+    let (user, target) = due
+        .iter()
+        .find_map(|row| {
+            let user = row.try_get::<_, &str>(0).ok()?;
+            let target = row.try_get::<_, Option<&str>>(1).ok()??;
+            (user == USER && target == SUBSCRIPTION).then_some((user, target))
+        })
+        .ok_or(StoreError)?;
+    let outcome = store
+        .reconcile_owned_subscription(
+            user,
+            target,
+            subscription,
+            async |_| Ok(vec![invoice]),
+            NOW as i64,
+        )
+        .await?;
+    if outcome.explicit_stale
+        || outcome.fail_closed.is_some()
+        || outcome.read_plan.as_deref() != Some("plus")
+        || outcome.read_anchor.is_some()
+        || outcome.row.paid_invoice_id.as_deref() != Some("in_worker_second")
+    {
+        return Err(StoreError);
+    }
+    Ok(())
+}
+
+fn fixture_store(trace: &str, expired: Option<std::rc::Rc<Cell<bool>>>) -> PgStore {
+    PgStore {
+        env: None,
+        trace_id: trace.into(),
+        mirror_binding: MirrorBinding::Unconfigured,
+        work_deadline_observer: expired,
+        cancel_token_observer: None,
     }
 }
 
 pub(crate) async fn deliver(
     mut req: Request,
     env: Env,
-    lose_ack: bool,
+    delivery: Delivery,
 ) -> worker::Result<Response> {
     let Ok(cfg) = handlers::Config::new(
         "billing.example.test",
@@ -122,21 +201,15 @@ pub(crate) async fn deliver(
     let mut cfg = cfg.with_stripe(Some("synthetic".into()), Some("webhook-ack-fixture".into()));
     cfg.paid_invite_billing = true;
     let expired = std::rc::Rc::new(Cell::new(false));
-    let trace = if lose_ack {
+    let trace = if delivery == Delivery::LoseCommitAck {
         "worker-webhook-ack-test"
     } else {
         "worker-webhook-retry-test"
     };
-    let store = PgStore {
-        env: None,
-        trace_id: trace.into(),
-        mirror_binding: MirrorBinding::Unconfigured,
-        work_deadline_observer: Some(expired.clone()),
-        cancel_token_observer: None,
-    };
+    let store = fixture_store(trace, Some(expired.clone()));
     let stripe = super::WorkerStripeTransport {
         secret_key: None,
-        webhook_script: Some(StripeScript::new()),
+        webhook_script: Some(StripeScript::new(delivery)),
     };
     let mailer = WebhookMailer {
         env,
