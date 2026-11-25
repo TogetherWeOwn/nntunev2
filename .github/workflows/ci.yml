@@ -127,10 +127,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Validate golden fixtures
-        run: python3 scripts/check-subsonic-fixtures.py
-      - name: Exercise disposable DNS convergence with synthetic responses
-        run: python3 -B ops/staging-s3-boundary/test_dns_convergence.py -v
+      - name: Validate golden fixtures and exercise synthetic DNS
+        run: python3 scripts/check-subsonic-fixtures.py && python3 -B ops/staging-s3-boundary/test_dns_convergence.py -v
 
   # No checked-in NZB fixtures anywhere (TWO-1169), and no journey NZB at
   # all since the secret-held staging leg retired under the CC0-only

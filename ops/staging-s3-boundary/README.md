@@ -71,9 +71,8 @@ launcher verdict.
 
 ## Check DNS convergence for the disposable ingress
 
-For an authorized attempt, import [the policy](dns_convergence.py) in the
-protected executor. Hold the exclusive writer from the write through closeout.
-If that scope is lost, stop and reconcile record identity before any change.
+For an authorized attempt, import [the policy](dns_convergence.py) in the protected executor.
+Hold the exclusive writer from write through closeout. If lost, reconcile record identity first.
 
 1. After creation, read back the recorded ID and require exactly that one
    record by exact name, matching the approved type, origin, proxy state, TTL,
@@ -93,8 +92,7 @@ If that scope is lost, stop and reconcile record identity before any change.
    from each authority before 90 seconds from delete readback. On a miss,
    keep reading for containment up to 300 seconds total from that readback.
    Keep the writer held and return the receipt to Engineering even if both
-   authorities later converge. Keep exact provider absence proof throughout
-   and perform no second create or delete.
+   authorities converge. Keep exact provider absence proof. Perform no second write.
 5. In either direction, stop when an authority regresses after two matching
    reads, sends a non-authoritative response, reports `SERVFAIL` or `REFUSED`,
    or otherwise cannot supply a valid observation. Log each read's UTC time,
