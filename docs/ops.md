@@ -466,8 +466,11 @@ with psql `ON_ERROR_STOP`. The transaction binds the five `UPDATE (id)`
 grants to statement triggers that reject the writer's updates, including
 when using `SET ROLE`. Read back the writer's effective update privileges
 and the enabled guards on `users`, `sessions`, `invite_codes`, `ingest_jobs`
-and `tracks`, and confirm the reader has no update privileges. Verify the
-companion publication reads, inserts and storage routine grants separately.
+and `tracks`, and confirm the reader has no update privileges. Keep the
+writer's role membership at the preflight baseline for the trial window.
+Confirm there are no outbound memberships or inbound memberships with SET
+or INHERIT after granting and before reversal. Verify the companion
+publication reads, inserts and storage routine grants separately.
 
 For withdrawal, disarm the trial and unbind its credentials, then remove both
 overlay variables and the preflight scope. Through the same authorized role

@@ -73,13 +73,11 @@ async fn assert_permission_denied(client: &Client, sql: &str, guard: bool) {
         &SqlState::INSUFFICIENT_PRIVILEGE,
         "{sql}: {error}"
     );
-    if guard {
-        assert_eq!(
-            error.message(),
-            "private trial writer may only lock this relation",
-            "{sql}"
-        );
-    }
+    assert_eq!(
+        error.message() == "private trial writer may only lock this relation",
+        guard,
+        "{sql}: {error}"
+    );
 }
 
 #[tokio::test]
@@ -124,6 +122,16 @@ async fn scoped_writer_locks_and_publishes_without_base_updates() {
     );
     tx.rollback().await.unwrap();
     contract(&observer, "grant", writer_oid).await.unwrap();
+    assert!(observer.query_one(
+        "SELECT count(*) FILTER (WHERE attname = 'id') = 5 AND bool_and(
+             NOT has_table_privilege($1::oid, attrelid, 'UPDATE')
+             AND has_column_privilege($1::oid, attrelid, attnum, 'UPDATE') = (attname = 'id')
+             AND NOT has_column_privilege($2::oid, attrelid, attnum, 'UPDATE'))
+         FROM pg_attribute
+         WHERE attrelid IN ('public.users'::regclass, 'public.sessions'::regclass,
+              'public.invite_codes'::regclass, 'public.ingest_jobs'::regclass, 'public.tracks'::regclass)
+           AND attnum > 0 AND NOT attisdropped", &[&writer_oid, &reader_oid],
+    ).await.unwrap().get::<_, bool>(0));
 
     let reader = connect_fixture(LOCK_DB).await;
     reader
