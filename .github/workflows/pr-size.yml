@@ -36,10 +36,10 @@ jobs:
     name: pr-size-gate
     if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''
     permissions:
-      contents: read
+      contents: read # The reusable checks out the trusted size script.
       issues: write # Size comments and repository labels.
       pull-requests: write # PR size labels.
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@649943c1ed8a1af8f8760e075f3923237dd72e50
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@649943c1ed8a1af8f8760e075f3923237dd72e50 # v0.14.0
     with:
       pr-number: ${{ inputs.pr_number || '' }}
       exclude-extra: ""
@@ -49,7 +49,7 @@ jobs:
     name: pr-size-weekly
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')
     permissions:
-      contents: read
-      issues: read
+      contents: read # The reusable checks out the trusted size script.
+      issues: read # The tally searches merged pull requests and reads their size labels.
       pull-requests: read # Weekly tally reads labels on merged PRs.
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@649943c1ed8a1af8f8760e075f3923237dd72e50
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@649943c1ed8a1af8f8760e075f3923237dd72e50 # v0.14.0
