@@ -296,11 +296,23 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
   assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
   assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease']);
 
+  // The padded FLAC ends one byte into the second 64 KiB plaintext chunk.
+  // Stream fetches the header and both sealed chunks for this selection.
+  expectedRange = fullRange;
+  const boundary = await request('bytes=65535-65536');
+  assert.equal(boundary.response.status, 206);
+  assert.equal(boundary.response.headers.get('content-range'), 'bytes 65535-65536/65537');
+  assert.deepEqual(boundary.bytes, Buffer.from([0x9d, 0x1d]));
+  assert.deepEqual(operations.splice(0), ['GET range', 'GET page']);
+  assert.deepEqual(custody.splice(0), ['resolve', 'lease', 'lease', 'lease']);
+
   const interval = { user_id: 'catalogue-other', play_id: play, track_id: track, file_bytes: plaintextLength };
   assert.deepEqual(reports.splice(0), [
     { ...interval, start: 0, end: plaintextLength },
     { ...interval, start: plaintextLength - 1, end: plaintextLength },
+    { ...interval, start: plaintextLength - 2, end: plaintextLength },
   ]);
+  expectedRange = suffixRange;
   for (fault of ['wrong version', 'changed bytes', 'short range']) {
     const refused = await request(seek);
     assert.equal(refused.response.status, 502, fault);
