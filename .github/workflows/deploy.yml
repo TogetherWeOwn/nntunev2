@@ -1293,6 +1293,9 @@ jobs:
             echo '::error::Private staging qualification failed.'
             exit 1
           fi
+      - name: Summarize private music contract enrollment review evidence
+        continue-on-error: true
+        run: python3 -I .github/scripts/private_staging_evidence.py review
       - name: Observe closing private staging deployments
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

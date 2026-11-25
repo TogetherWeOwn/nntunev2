@@ -1,4 +1,4 @@
-"""Exercise Playwright and the actual receipt step without browser or network access."""
+"""Exercise Playwright, review evidence and the receipt step offline."""
 
 from hashlib import sha256
 import importlib.util
@@ -100,7 +100,7 @@ test(detail, async ({{}}, info) => {{
 """.encode())
 
 
-def receipt_step():
+def protected_steps():
     workflow = (ROOT / admission.WORKFLOW).read_text()
 
     def job(name):
@@ -126,7 +126,13 @@ def receipt_step():
     record, upload = qualify.split("\n      - name: Upload candidate admission receipt\n")
     assert upload.count("          path:") == 1 and "          path: staging-admission.json\n" in upload
     assert "retention-days: 7" in upload and "${{ github.run_attempt }}-private-music" in upload
-    return textwrap.dedent(record.rsplit("\n        run: |\n", 1)[1])
+    review = qualify.split("\n      - name: Summarize private music contract enrollment review evidence\n", 1)[1]
+    review, _ = review.split("\n      - name: Observe closing private staging deployments\n", 1)
+    assert qualify.index("      - name: Qualify private listening\n") < qualify.index(
+        "      - name: Summarize private music contract enrollment review evidence\n")
+    assert review == ("        continue-on-error: true\n"
+                      "        run: python3 -I .github/scripts/private_staging_evidence.py review")
+    return textwrap.dedent(record.rsplit("\n        run: |\n", 1)[1]), review.split("run: ", 1)[1]
 
 
 def provider_response(deployment, version=VERSION):
@@ -173,13 +179,75 @@ def capture_pins(root, env):
     return {f"{lane.upper()}_PIN": json.dumps(pin) for lane, pin in pins.items()}
 
 
+def check_review(report, summary, run, command, sha):
+    raw = report.read_bytes()
+    draft = json.loads((ROOT / "ci/private-music-journey-contract.draft.json").read_bytes())
+    draft_cases = {item["name"] for criterion in draft["criteria"] if criterion["applicable"]
+                   for item in criterion["evidence"] if item["classname"] == "private-music"
+                   and item["outcome"] == "passed"}
+    assert len(draft_cases) == 9
+    names = sorted(draft_cases | set(admission.IDENTITY_PHASES))
+    expected = [
+        "## Private music contract enrollment review evidence", "",
+        f"Workflow run `42`, attempt `2`, build `{sha}`.", "",
+        "| Case (class `private-music`) | Observed first-attempt outcome |",
+        "| --- | --- |", *(f"| `{name}` | passed |" for name in names),
+    ]
+    result = run(command)
+    assert result.returncode == 0 and not (result.stdout or result.stderr)
+    assert summary.read_text().splitlines() == expected
+    assert report.read_bytes() == raw
+    summary.unlink()
+
+    root = ET.fromstring(raw)
+    track = root.find("./testcase[@name='upload-to-library']/properties/property")
+    track.set("value", json.dumps(json.loads(track.get("value")) | {"extra": PRIVATE_DETAIL}))
+    unexpected_property = ET.tostring(root)
+    root = ET.fromstring(raw)
+    root.append(root[0])
+    duplicate_case = ET.tostring(root)
+    root = ET.fromstring(raw)
+    root.remove(root[0])
+    missing_case = ET.tostring(root)
+    root = ET.fromstring(raw)
+    props = root.find("./testcase[@name='upload-to-library']/properties")
+    props[1].set("name", props[0].get("name"))
+    duplicate_property = ET.tostring(root)
+    for invalid in (
+        b"", raw[:-16], raw + b" " * (16 * 1024), b"\xff" + raw,
+        b"<!DOCTYPE testsuite>" + raw, b"<?private marker?>" + raw,
+        raw.replace(b"<testsuite>", b'<testsuite xmlns:unused="urn:private">', 1),
+        missing_case, duplicate_case, duplicate_property, unexpected_property,
+        raw.replace(b'classname="private-music"', b'classname="other"', 1),
+        raw.replace(b'name="play"', b'name="disposable-canary"', 1),
+        raw.replace(b'retry="0"', b'retry="1"', 1),
+        raw.replace(b"</testcase>", b"<failure>disposable-canary</failure></testcase>", 1),
+        raw.replace(b"</testcase>", b"<rerunFailure/></testcase>", 1),
+        raw.replace(b"</testcase>", b"<skipped/></testcase>", 1),
+        raw.replace(b"&quot;run_attempt&quot;:&quot;2&quot;", b"&quot;run_attempt&quot;:&quot;1&quot;", 1),
+        raw.replace(sha.encode(), b"0" * 40, 1),
+    ):
+        assert invalid != raw
+        report.write_bytes(invalid)
+        result = run(command)
+        assert result.returncode != 0 and not result.stdout and not summary.exists()
+        assert result.stderr == b"Private music contract enrollment review evidence unavailable.\n"
+    report.write_bytes(raw)
+    result = run(command, {"GITHUB_RUN_ID": PRIVATE_DETAIL})
+    assert result.returncode != 0 and not result.stdout and not summary.exists()
+
+
 def run_fixture(root):
     env = {"PATH": os.environ["PATH"], "CI": "1", "RUNNER_TEMP": str(root),
            "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "2",
            "GITHUB_REPOSITORY": "TogetherWeOwn/nntunev2", "GITHUB_EVENT_NAME": "push",
            "GITHUB_REF": "refs/heads/main", "API_DEPLOYED": "true", "API_DEPLOY_OUTCOME": "deployed"}
     setup(root, env)
-    command = ["bash", "-c", receipt_step()]
+    record, review = protected_steps()
+    command = ["bash", "-c", record]
+    review_command = ["bash", "-c", review]
+    summary = root / "review-summary.md"
+    env["GITHUB_STEP_SUMMARY"] = str(summary)
     env.update(capture_pins(root, env))
 
     def run(args, env_overrides=None):
@@ -200,6 +268,12 @@ def run_fixture(root):
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert {case.attrib["retry"] for case in ET.parse(report).iter("testcase")} == {"0"}
     assert all(marker not in report.read_bytes() for marker in PRIVATE_MARKERS)
+    empty_policy = b'{"schema":1,"evaluator":"junit-map-v1","approvals":[]}'
+    policy = root / admission.POLICY
+    reviewed_policy = policy.read_bytes()
+    policy.write_bytes(empty_policy)
+    check_review(report, summary, run, review_command, env["GITHUB_SHA"])
+    policy.write_bytes(reviewed_policy)
 
     with patch.dict(os.environ, env, clear=True), patch.object(evidence, "provider") as provider:
         reader = provider.return_value
@@ -233,7 +307,7 @@ def run_fixture(root):
     saved = receipt.read_bytes()
     assert all(marker not in saved for marker in PRIVATE_MARKERS)
     assert json.loads(saved)["result"] == "satisfied"
-    write(root, admission.POLICY, b'{"schema":1,"evaluator":"junit-map-v1","approvals":[]}')
+    policy.write_bytes(empty_policy)
     assert run(command).returncode != 0 and json.loads(receipt.read_bytes())["result"] == "incomplete"
 
 

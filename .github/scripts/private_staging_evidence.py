@@ -1,5 +1,6 @@
 """Wire protected private qualification to the trusted admission producer."""
 
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import staging_api_identity as identity
 LANES = ("web", "api", "stream")
 PIN_FIELDS = ("worker", "build_sha", "version_id", "deployment_id")
 PIN_LIMIT = 1024
+REVIEW_REPORT_LIMIT = 16 * 1024
 REPORT = ROOT / "e2e/private-staging-results/admission.xml"
 
 
@@ -28,6 +30,86 @@ def read_bounded(path, limit):
 def provenance():
     return {"run_id": admission.decimal(os.environ["GITHUB_RUN_ID"]),
             "run_attempt": admission.decimal(os.environ["GITHUB_RUN_ATTEMPT"])}
+
+
+def require_review(condition):
+    admission.require(condition, "invalid private staging review report")
+
+
+def review_xml_shape(node, tag, fields):
+    require_review(node.tag == tag and node.attrib.keys() == set(fields)
+                   and not (node.text or "").strip(" \t\r\n") and not (node.tail or "").strip(" \t\r\n"))
+
+
+def review_cases(xml, sha, attempt):
+    # The reporter emits only ASCII, with no declarations, comments, namespaces
+    # or diagnostic nodes. Parse that profile before publishing.
+    require_review(0 < len(xml) <= REVIEW_REPORT_LIMIT and b"<!" not in xml and b"<?" not in xml)
+    parser = ET.iterparse(io.StringIO(xml.decode("ascii")), events=("start-ns", "end"))
+    for event, _ in parser:
+        require_review(event == "end")
+    suite = parser.root
+    review_xml_shape(suite, "testsuite", ())
+    expected = {name: set() for name in admission.PRIVATE_CRITERIA | {"invite-acceptance"}}
+    for phase in admission.IDENTITY_PHASES:
+        expected[phase] = {"candidate-identity"}
+    for proof, name in admission.PRIVATE_TRACK_PROOFS.items():
+        expected[name].add(proof)
+
+    observed = set()
+    for case in suite:
+        review_xml_shape(case, "testcase", ("classname", "name", "retry"))
+        name = case.attrib["name"]
+        require_review(case.attrib["classname"] == admission.PRIVATE and case.attrib["retry"] == "0"
+                       and name in expected and name not in observed)
+        proofs = expected[name].copy()
+        require_review(len(case) == bool(proofs))
+        if proofs:
+            (properties,) = case
+            review_xml_shape(properties, "properties", ())
+            require_review(len(properties) == len(proofs))
+            for prop in properties:
+                review_xml_shape(prop, "property", ("name", "value"))
+                require_review(not len(prop) and prop.attrib["name"] in proofs)
+                proofs.remove(prop.attrib["name"])
+                value = admission.parse_json(prop.attrib["value"].encode(), PIN_LIMIT)
+                if name in admission.IDENTITY_PHASES:
+                    fields = {"phase": name, "web": sha, "api": sha, "expected": sha}
+                    timestamp = value.get("observed_at")
+                    require_review(value.keys() == fields.keys() | {"observed_at"}
+                                   and isinstance(timestamp, str)
+                                   and re.fullmatch(r"[0-9]{4}(?:-[0-9]{2}){2}T[0-9]{2}(?::[0-9]{2}){2}\.[0-9]{3}Z",
+                                                    timestamp))
+                    admission.timestamp(timestamp)
+                else:
+                    fields = {"build_sha": sha, **attempt}
+                    track, digest = value.get("track_id"), value.get("sha256")
+                    require_review(value.keys() == fields.keys() | {"track_id", "sha256"}
+                                   and isinstance(track, str) and admission.UUID.fullmatch(track)
+                                   and isinstance(digest, str) and admission.HASH.fullmatch(digest))
+                require_review(all(value[key] == expected_value for key, expected_value in fields.items()))
+        observed.add(name)
+    require_review(observed == expected.keys())
+    # Render the checked-in names only. The validated first-attempt profile
+    # represents passed cases, and every displayed case had to be in the report.
+    return sorted(expected)
+
+
+def write_review_summary(sha):
+    attempt = provenance()
+    cases = review_cases(read_bounded(REPORT, REVIEW_REPORT_LIMIT), sha, attempt)
+    lines = [
+        "## Private music contract enrollment review evidence",
+        "",
+        f"Workflow run `{attempt['run_id']}`, attempt `{attempt['run_attempt']}`, build `{sha}`.",
+        "",
+        "| Case (class `private-music`) | Observed first-attempt outcome |",
+        "| --- | --- |",
+        *(f"| `{name}` | passed |" for name in cases),
+        "",
+    ]
+    with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+        summary.write("\n".join(lines))
 
 
 def provider(token):
@@ -113,6 +195,14 @@ def main(command):
 
 if __name__ == "__main__":
     try:
-        print(json.dumps(main(sys.argv[1]), separators=(",", ":")))
+        command = sys.argv[1]
+        if command == "review":
+            sha = os.environ["GITHUB_SHA"]
+            admission.require(admission.SHA.fullmatch(sha), "invalid private staging SHA")
+            write_review_summary(sha)
+        else:
+            print(json.dumps(main(command), separators=(",", ":")))
     except (IndexError, KeyError, OSError, ValueError, RecursionError, ET.ParseError, admission.Refused, identity.Unavailable):
+        if sys.argv[1:] == ["review"]:
+            sys.exit("Private music contract enrollment review evidence unavailable.")
         sys.exit("Private staging deployment evidence unavailable or mismatched.")
