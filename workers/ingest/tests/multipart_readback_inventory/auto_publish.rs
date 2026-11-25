@@ -478,14 +478,18 @@ pub(super) async fn exercise(
         )
     };
 
-    // Drop the successful response after COMMIT. The retry has only the
-    // original revision and a separate database connection.
-    drop(
-        run(writer, RETRY_SCOPE, 2, Some(2), false, true, false)
-            .await
-            .unwrap(),
-    );
+    let first = run(writer, RETRY_SCOPE, 2, Some(2), false, true, false)
+        .await
+        .unwrap();
     let (track_id, accepted_seq, view) = publication().await;
+    assert_eq!(
+        first, view,
+        "first response must match the committed receipt"
+    );
+
+    // Discard the response after checking it at the receiver. The retry
+    // still has only the original revision and a separate connection.
+    drop(first);
     let replay = run(outcome_writer, RETRY_SCOPE, 2, None, true, false, true)
         .await
         .unwrap();
