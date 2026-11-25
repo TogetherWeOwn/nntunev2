@@ -81,12 +81,14 @@ def validate_observation(pins, watch):
     serving = {"web_sha": candidate["sha"], "api_sha": candidate["api_sha"],
                "promoted_version_id": candidate["promoted_version_id"], "deployment_id": candidate["deployment_id"],
                "allocation_percent": 100}
-    previous = None
-    for sample in samples:
+    previous = start
+    for index, sample in enumerate(samples):
         fields(sample, serving.keys() | {"observed_at", "readbacks", "evidence"}, "incomplete observation sample")
         observed = utc(sample["observed_at"])
-        require(observed == start if previous is None else timedelta(0) < observed - previous <= CADENCE,
-                "observation start or sample cadence is invalid")
+        if index == 0:
+            require(start <= observed < start + CADENCE, "opening readback missed its deadline")
+        else:
+            require(timedelta(0) < observed - previous <= CADENCE, "invalid observation sample cadence")
         require(type(sample["allocation_percent"]) is int
                 and all(sample[key] == expected for key, expected in serving.items()), "serving identity drift")
         require(sample["readbacks"] == READBACKS and matches(PRIVATE_LINK, sample["evidence"]),

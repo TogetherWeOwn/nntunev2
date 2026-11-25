@@ -125,6 +125,9 @@ outcome records. Collect the pins separately from the watch, using the accepted
 release record and the protected rollout evidence. The verifier reads local
 files and returns success only for a complete, healthy watch. The operator
 still confirms that each evidence link resolves and supports the recorded outcome.
+For final smoke, confirm the pinned attempt's `deploy-production` job and the
+successful **Verify production serves the promoted build** step, including its
+completion time. The offline job link check only matches the release run ID.
 
 Both JSON objects use `schema: 1`. Use UTC timestamps with seconds and a `Z` or
 `+00:00` suffix. Private evidence links are same-record anchors of the form
@@ -143,7 +146,7 @@ provider connection details out of these inputs.
 | `run_id`, `run_attempt`, `error_policy_evidence` | The pinned run and attempt strings and the pinned error policy link |
 | `watcher`, `backup` | Each has a distinct operator `name` (use the canonical handle), `from`, `through`, `recovery_access` of `confirmed` and an `evidence` link for the assignment and access covering the whole watch |
 | `closed_at`, `result` | Time of the closing readback and the recorded `satisfied` disposition |
-| `samples` | Ordered with the first `observed_at` at successful smoke, at most five minutes between consecutive readbacks, and the last exactly at `closed_at` after at least 30 minutes |
+| `samples` | Start the opening readback at successful smoke and record it before the first five-minute boundary. Keep consecutive readbacks at most five minutes apart and the last exactly at `closed_at`, at least 30 minutes after smoke |
 
 Each sample has `observed_at`, `web_sha`, `api_sha`, `promoted_version_id`,
 `deployment_id`, `allocation_percent`, `evidence` and a `readbacks` object.

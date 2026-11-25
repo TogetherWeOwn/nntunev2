@@ -41,6 +41,8 @@ class ProductionObservationTests(unittest.TestCase):
     def test_complete_healthy_window_and_later_close_with_coverage(self):
         pins, watch = fixture()
         validate_observation(pins, watch)
+        watch["samples"][0]["observed_at"] = "2026-10-01T12:00:03Z"
+        validate_observation(pins, watch)
         watch["closed_at"] = "2026-10-01T12:35:00+00:00"
         watch["samples"].append({**watch["samples"][-1], "observed_at": watch["closed_at"],
                                  "evidence": "#evidence-readback-35"})
@@ -62,9 +64,15 @@ class ProductionObservationTests(unittest.TestCase):
         del pins["final_smoke"]
         with self.assertRaises(Refused):
             validate_observation(pins, watch)
+
+    def test_opening_readback_must_follow_smoke_before_first_cadence_deadline(self):
         pins, watch = fixture()
-        watch["samples"][0]["observed_at"] = "2026-10-01T12:00:01Z"
-        with self.assertRaises(Refused):
+        watch["samples"].insert(0, {**watch["samples"][0], "observed_at": "2026-10-01T11:59:59Z"})
+        with self.assertRaisesRegex(Refused, "opening readback missed its deadline"):
+            validate_observation(pins, watch)
+        pins, watch = fixture()
+        watch["samples"].pop(0)
+        with self.assertRaisesRegex(Refused, "opening readback missed its deadline"):
             validate_observation(pins, watch)
 
     def test_missing_or_invalid_coverage_fails_closed(self):
