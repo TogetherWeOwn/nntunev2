@@ -61,6 +61,10 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         for case, raw, diagnostic in (
             ("missing event", b"", "missing synthetic invocation record"),
             ("empty event", b"{}", "missing or malformed synthetic invocation record"),
+            ("wrong method", json.dumps(event | {"method": "POST"}).encode(),
+             "expected a synthetic GET invocation record"),
+            ("wrong event kind", json.dumps(event | {"kind": "log"}).encode(),
+             "expected a synthetic GET invocation record"),
             ("wrong Worker", json.dumps(event | {"worker": "synthetic-web-worker"}).encode(),
              "unexpected synthetic invocation Worker"),
             ("stale marker", json.dumps(event | {"probe_id": uuid4().hex}).encode(),
