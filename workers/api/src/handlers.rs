@@ -14397,6 +14397,32 @@ pub(crate) mod tests {
             decode(call_at(now, "GET", path, Some(cookie), vec![], None), 200)
         };
         let subscription = |now, cookie: &str| billing_read(now, "/v1/me/subscription", cookie);
+        let refresh = |now, cookie: &str| {
+            let refreshed = call_at(
+                now,
+                "POST",
+                "/v1/session/refresh",
+                Some(cookie),
+                vec![],
+                None,
+            );
+            assert_eq!(refreshed.status, 200, "{}", refreshed.body);
+            let refreshed_cookie = cookie_of(&refreshed);
+            assert!(
+                refreshed_cookie != cookie,
+                "refresh must replace the cookie"
+            );
+            let stale = call_at(
+                now,
+                "GET",
+                "/v1/me/subscription",
+                Some(cookie),
+                vec![],
+                None,
+            );
+            assert_eq!(stale.status, 401);
+            refreshed_cookie
+        };
         let play = json!({"track_id":"track-9", "session_id":"tab-a"});
         let play_at = |now, cookie: &str, body: &Value| {
             call_at(
@@ -14428,6 +14454,10 @@ pub(crate) mod tests {
         assert_eq!(account.stripe_customer_id.as_deref(), Some(customer));
         assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
         assert_eq!(decode(play_call(&h, &cookie, play.clone()), 402), unpaid);
+
+        let cookie = refresh(NOW, &cookie);
+        assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
+        assert_eq!(decode(play_at(NOW, &cookie, &play), 402), unpaid);
 
         let stripe_period = |id: &str, start, end| {
             let mut remote = test_subscription(subscription_id, customer, "active", PRICE_PLUS);
@@ -14492,6 +14522,7 @@ pub(crate) mod tests {
         assert!(h.store.webhook_events.borrow().is_empty());
         assert!(h.store.invoice_history.borrow().is_empty());
         assert_eq!(subscription(NOW, &cookie)["state"], "no_subscription");
+        assert_eq!(decode(play_at(NOW, &cookie, &play), 402), unpaid);
 
         let assert_period = |end, invoices| {
             let live = live_for(&h, &user).unwrap();
@@ -14512,29 +14543,11 @@ pub(crate) mod tests {
         assert_eq!(receipts.len(), 1);
         assert!(receipts.contains(event_id));
         let subscribed = subscription(NOW, &cookie);
+        assert_eq!(subscribed["state"], "active");
+        let first_play = decode(play_at(NOW, &cookie, &play), 200);
 
         let refresh_at = NOW + 1;
-        let refreshed = call_at(
-            refresh_at,
-            "POST",
-            "/v1/session/refresh",
-            Some(&cookie),
-            vec![],
-            None,
-        );
-        assert_eq!(refreshed.status, 200, "{}", refreshed.body);
-        let refreshed_cookie = cookie_of(&refreshed);
-        assert_ne!(refreshed_cookie, cookie);
-        let stale = call_at(
-            refresh_at,
-            "GET",
-            "/v1/me/subscription",
-            Some(&cookie),
-            vec![],
-            None,
-        );
-        assert_eq!(stale.status, 401);
-        let cookie = refreshed_cookie;
+        let cookie = refresh(refresh_at, &cookie);
 
         let replay_at = refresh_at + 1;
         webhook_ok(&signed(replay_at as i64, &completed));
@@ -14550,7 +14563,6 @@ pub(crate) mod tests {
         );
 
         assert_eq!(subscription(replay_at, &cookie), subscribed);
-        assert_eq!(subscribed["state"], "active");
         assert_eq!(subscribed["status"], "active");
         assert_eq!(subscribed["planId"], PLAN_PLUS);
         assert_eq!(
@@ -14569,8 +14581,10 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         );
+        // The same tab can replace its first grant after the second refresh.
         let issued = decode(play_at(replay_at, &cookie, &play), 200);
         let play_id = issued["play_id"].as_str().unwrap();
+        assert_ne!(play_id, first_play["play_id"].as_str().unwrap());
         let record = |bytes| {
             let window = crate::ledger::prepare_play_window(
                 &user,
