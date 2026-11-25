@@ -77,7 +77,8 @@ custody across the observation and creation window.
 ## Hosted execution candidate
 
 The [manual workflow](../.github/workflows/deploy-database-bootstrap.yml)
-is disabled at the job boundary. The [disposable CI job](../.github/workflows/ci.yml)
+is off while the repository variable `DATABASE_BOOTSTRAP_CANDIDATE_SHA`
+is unset. The [disposable CI job](../.github/workflows/ci.yml)
 runs the [setup caller](../.github/scripts/database_bootstrap_setup.py)
 on standard Ubuntu with generated authorization and an isolated PostgreSQL
 server. It checks admission, TLS, roles, fixed verdicts and interrupted
@@ -115,7 +116,11 @@ and T0 code reviews are separate from this deployment approval.
 [Environment protection rules](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
 · [Configure environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
 
-1. The invoker dispatches the exact reviewed `main` tip with zero inputs.
+1. After Environment readback and release approval, set the repository
+   variable `DATABASE_BOOTSTRAP_CANDIDATE_SHA` to the exact approved `main`
+   tip. The invoker dispatches that SHA with zero inputs. Preflight refuses
+   if it finds any setup authorization in repository, organization or staging
+   Environment scope. Remove the candidate variable after the attempt.
    Before approval, independently read the pending deployment, workflow,
    repo, ref, head SHA, run ID, first attempt, actor and Environment. Match
    the privately approved SHA and SHA-256 of the exact plan bytes. The
@@ -190,11 +195,21 @@ verified TLS. [Provider roles](https://planetscale.com/docs/postgres/connecting/
 · [Direct connections](https://planetscale.com/docs/postgres/connecting#authentication)
 · [Roles API schema](https://planetscale.com/docs/openapi.yaml)
 
-The catalog check requires a non-admin `CREATEDB` login expiring within
-the authorization, a loginless owner and a reader outside the writer
-roles. After fenced creation, one transaction revokes PUBLIC, admits the
-migrator and transfers ownership. Reader and serving grants and migrations
-use separate protected paths.
+The catalog check requires a primary, a non-admin `CREATEDB` login expiring
+within the authorization, a loginless owner and a non-inheriting reader with
+`LOGIN`, a one-connection limit, `VALID UNTIL 'epoch'`, and no memberships in
+other roles, elevated role attributes or open sessions. Verify `PASSWORD NULL`
+at issuance. The setup login cannot read the password catalog.
+
+After fenced creation, one transaction revokes PUBLIC, admits the migrator
+and transfers ownership. After `complete`, use a separately authorized,
+TLS-verified read-only catalog check on the approved direct endpoint to
+record the provider branch, endpoint and new `pg_database.oid` privately.
+Match the expected owner and ACLs, confirm that the pending reader still
+lacks launch CONNECT, and compare the staging and reserved database OIDs,
+owners, connection settings and ACLs to the pre-setup observation. An
+unexpected result pauses the handoff. Use the verified OID for the protected
+baseline. Reader and serving grants and migrations use separate protected paths.
 
 The hosted disposable fixture models routing with a test-only adapter at
 the `psql` boundary. It checks the exact routed `PGUSER` on each invocation,
