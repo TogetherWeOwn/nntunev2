@@ -2181,6 +2181,8 @@ jobs:
         run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Prepare canonical Worker tools
         run: python3 -I .github/scripts/worker_tools.py install
+      - name: Verify the staging S3 fixture port closes
+        run: python3 -I -B -m unittest discover -s ops/staging-s3-boundary/fixtures -p test_teardown_port.py
       - name: Build ordinary Worker release bundles
         run: |
           set -euo pipefail
