@@ -84,10 +84,8 @@ def lock_contract(scope, action):
 {clean}
 \\endif
 """
-    if action == "check":
-        return sql
-    if action == "verify":
-        return sql + require(f"to_regprocedure('{GUARD}') IS NOT NULL")
+    if action in ("check", "verify"):
+        return sql + (require(f"to_regprocedure('{GUARD}') IS NOT NULL") if action == "verify" else "")
     setup = (f"SET LOCAL nntune.private_trial_writer_oid = '{writer}';\n"
              f"SET LOCAL nntune.private_trial_lock_action = '{action}';\n")
     if action == "grant":
@@ -107,8 +105,8 @@ def run(action, scope, fixture):
     full = list(grants(DATABASE, scope, locks=True, overlay=(action == "verify-overlay")))
     ids = ", ".join(str(scope[k][1]) for k in ("reader", "writer"))
     drained = require(f"NOT EXISTS (SELECT FROM pg_stat_activity WHERE usesysid IN ({ids}))")
-    select_names = f"SELECT rolname FROM pg_roles WHERE oid IN ({ids})"
-
+    names = ", ".join(map(quote_literal, NAMES))
+    select_names = f"SELECT rolname FROM pg_roles WHERE oid IN ({ids}) AND rolname IN ({names})"
     def commands(statement):
         return f"SELECT format('{statement}', rolname) FROM ({select_names}) r \\gexec\n"
 
@@ -136,7 +134,8 @@ def run(action, scope, fixture):
             stage(app, "application withdrawal", absent_ok + drained + audit(full, exact=False)
                   + lock_contract(scope, "revoke") + revoke(app_grants) + audit(connect, exact=False))
             stage(admin, "role retirement", absent_ok + drained + audit(connect, exact=False) + revoke(connect)
-                  + commands("DROP ROLE %I") + require(f"NOT EXISTS ({select_names})") + drained)
+                  + commands("DROP ROLE %I") + require(f"NOT EXISTS (SELECT FROM pg_roles WHERE oid IN ({ids}) "
+                  f"OR rolname IN ({names}))") + drained)
         return
 
     cols = ", ".join(map(quote_literal, WRITER[WINNERS.removeprefix("public.")].split()))

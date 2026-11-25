@@ -430,12 +430,11 @@ scope below, independently verified `PRIVATE_TRIAL_DIRECT_HOST` and
 values. The database owner supplies CONNECT, role fencing and staging drain.
 Use a schema and table owner with routine grant authority as executor for
 the transaction that grants the application ACL and installs the lock guards.
-Use the same executor for withdrawal. The command compares direct and PUBLIC
-ACLs, role OIDs and memberships, cross-database access and guard definitions.
-Pass `verify` before binding and `verify-overlay` after applying the overlay.
+The command verifies direct and PUBLIC ACLs, role OIDs and memberships,
+cross-database access and guard definitions. Use `verify` before binding
+and `verify-overlay` after applying the overlay.
 After disarming and unbinding, use `fence`, withdraw the overlay grants with
-its owner, then use `retire`. A failed phase can be rerun with the same pins.
-
+its owner, then use `retire` with the original executor and pins.
 
 For an authorized private trial, dispatch `migrations-staging-apply` from
 protected `main` with `file=private-trial`, `mode=single`, the reviewed full
