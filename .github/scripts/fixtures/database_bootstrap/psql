@@ -23,6 +23,12 @@ if mode in ("route", "resolve"):
     os.execv(args[0], args)
 
 sql = sys.stdin.buffer.read()
+if mode in ("baseline-read-success", "baseline-read-failure"):
+    verdict = b"empty\n"
+    os.write(1, verdict)
+    with (directory / "baseline-read-output").open("ab") as emitted:
+        emitted.write(verdict)
+    sys.exit(0 if mode == "baseline-read-success" else 3)
 if mode == "baseline-wrong-oid":
     result = subprocess.run(args, input=sql, stderr=subprocess.PIPE, timeout=5)
     # Write only a fixed marker for a server-side rejection at the OID guard.

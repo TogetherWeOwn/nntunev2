@@ -562,6 +562,29 @@ def prove_setup_caller(cluster, *, interrupt, reader):
     require(not list(cluster.directory.glob("database-bootstrap-ca-*")), "remove the caller's temporary CA")
 
 
+def prove_baseline_partial_read(cluster, env, reader):
+    calls = cluster.directory / "invocations"
+    emitted = cluster.directory / "baseline-read-output"
+    before = calls.stat().st_size
+    for mode, expected in (
+        ("baseline-read-failure", (1, b"", b"database-bootstrap-baseline: refused\n")),
+        ("baseline-read-success", (0, b"database-bootstrap-baseline: empty\n", b"")),
+    ):
+        with start_caller(env | {"PATH": routed_client(cluster, mode, reader)}, baseline.__file__) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+        before += 1
+        require(calls.stat().st_size == before, "attempt the baseline read once")
+        require(emitted.read_bytes() == b"empty\n", "emit the same plausible catalog verdict before exit")
+        emitted.unlink()
+        require((process.returncode, stdout, stderr) == expected, f"enforce the child exit status for {mode}")
+        require(not list(cluster.directory.glob("database-baseline-ca-*")), "remove the baseline caller's temporary CA")
+    routed_client(cluster, "route", reader)
+
+
 def prove_baseline(cluster):
     reader = "Fixture-Reader"
     result = cluster.sql(f"SELECT oid, '{READER}'::regrole::oid FROM pg_database WHERE datname = '{LAUNCH}';")
@@ -603,6 +626,7 @@ def prove_baseline(cluster):
     require(calls.stat().st_size == before, "refuse disabled, cross-workflow and invalid plans before SQL")
     run("refused", database_oid=plan["database_oid"] + 1)
     run("empty")
+    prove_baseline_partial_read(cluster, env | plan_binding(json.dumps(plan).encode()), reader)
     with tempfile.TemporaryDirectory(dir=cluster.directory, prefix="handoff-environment-") as evidence:
         directory = Path(evidence)
         save_complete_readback(directory)
