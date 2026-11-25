@@ -13,6 +13,7 @@ concurrency:
 
 jobs:
   preflight:
+    name: Verify staging trial role isolation
     if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

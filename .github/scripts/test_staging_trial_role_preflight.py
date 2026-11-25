@@ -48,7 +48,9 @@ class TrialRolePreflightTests(unittest.TestCase):
             admin_grant = f"GRANT {READER} TO {ISSUER} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;"
             run_psql(db, admin_grant)
             self.assertTrue(all(preflight.observe(db, scope, DIGEST).values()))
-            run_psql(db, f"REVOKE {READER} FROM {ISSUER};")
+            run_psql(db, f"ALTER ROLE {ISSUER} NOCREATEROLE;")
+            self.assertFalse(preflight.observe(db, scope, DIGEST)["role membership"])
+            run_psql(db, f"REVOKE {READER} FROM {ISSUER}; ALTER ROLE {ISSUER} CREATEROLE;")
 
             for connection, pin, digest in (
                 (ADMIN, scope, DIGEST), (db, {**scope, "database_oid": 1}, DIGEST), (db, scope, "4" * 64),
@@ -75,9 +77,13 @@ class TrialRolePreflightTests(unittest.TestCase):
 
             for grant, revoke, verdict in (
                 (f"ALTER ROLE {READER} BYPASSRLS", f"ALTER ROLE {READER} NOBYPASSRLS", "login attributes"),
+                (f"ALTER ROLE {WRITER} INHERIT", f"ALTER ROLE {WRITER} NOINHERIT", "login attributes"),
                 (f"GRANT {WRITER} TO {READER} WITH INHERIT FALSE", f"REVOKE {WRITER} FROM {READER}", "role membership"),
-                (f"GRANT {READER} TO {ISSUER} WITH SET TRUE", f"REVOKE {READER} FROM {ISSUER}", "role membership"),
+                (f"GRANT {READER} TO {ISSUER} WITH ADMIN TRUE, INHERIT FALSE, SET TRUE", f"REVOKE {READER} FROM {ISSUER}", "role membership"),
+                (f"GRANT {READER} TO {ISSUER} WITH ADMIN TRUE, INHERIT TRUE, SET FALSE", f"REVOKE {READER} FROM {ISSUER}", "role membership"),
                 (f"GRANT CONNECT ON DATABASE postgres TO {WRITER}", f"REVOKE CONNECT ON DATABASE postgres FROM {WRITER}", "database isolation"),
+                (f"GRANT CONNECT ON DATABASE {preflight.DATABASE} TO PUBLIC; REVOKE CONNECT ON DATABASE {preflight.DATABASE} FROM {READER}",
+                 f"GRANT CONNECT ON DATABASE {preflight.DATABASE} TO {READER}; REVOKE CONNECT ON DATABASE {preflight.DATABASE} FROM PUBLIC", "staging access"),
                 (f"GRANT TEMP ON DATABASE {preflight.DATABASE} TO PUBLIC", f"REVOKE TEMP ON DATABASE {preflight.DATABASE} FROM PUBLIC", "staging access"),
                 (f"GRANT CREATE ON SCHEMA public TO {READER}", f"REVOKE CREATE ON SCHEMA public FROM {READER}", "schema creation"),
                 (f"CREATE SCHEMA owned AUTHORIZATION {WRITER}", "DROP SCHEMA owned", "object ownership"),
