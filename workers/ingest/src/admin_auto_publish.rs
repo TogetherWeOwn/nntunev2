@@ -115,13 +115,26 @@ pub async fn stage(
     let mut batch = tx.transaction().await?;
     let mut track_ids = Vec::with_capacity(tracks.len());
     for (track, flac) in tracks.into_iter().zip(committed) {
+        let duration_ms = flac
+            .verified
+            .flac_duration_ms()
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| PublicationError::Refused)?;
         let occurrence = VerifiedOccurrence {
             job_id: job.job_id,
             owner_id: job.owner_id,
             object_id: flac.receipt.intent.identities[2],
             track,
         };
-        match catalogue_publication::stage(&mut batch, &occurrence, &flac.receipt).await {
+        match catalogue_publication::stage_with_duration(
+            &mut batch,
+            &occurrence,
+            &flac.receipt,
+            duration_ms,
+        )
+        .await
+        {
             Ok(id) => track_ids.push(id),
             Err(error) => {
                 batch.rollback().await?;

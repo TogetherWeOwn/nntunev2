@@ -73,6 +73,10 @@ impl<'inventory, 'receipts> VerifiedCompletedReadback<'inventory, 'receipts> {
         self.flac_seek.is_some()
     }
 
+    pub fn flac_duration_ms(&self) -> Option<u32> {
+        self.flac_seek.as_ref()?.duration_ms()
+    }
+
     /// Compare all immutable pins from an independently obtained scoped result.
     /// The caller establishes durability, session scope and authorization.
     pub fn matches_committed_outcome(&self, outcome: &CommittedOutcome) -> bool {

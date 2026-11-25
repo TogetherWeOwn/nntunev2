@@ -441,6 +441,7 @@ pub(crate) async fn verify_publication(
     let entries: Vec<serde_json::Value> = serde_json::from_str(&listing.body).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["id"], track);
+    assert_eq!(entries[0]["duration_ms"], 14_000);
     // The database clone already contains references from the reservation race fixture.
     let exact_reference = async || {
         observer.query_one(
@@ -479,6 +480,27 @@ pub(crate) async fn verify_publication(
         503
     );
     assert!(exact_reference().await);
+    let set_duration = async |duration_ms: i32| {
+        observer
+            .execute(
+                "UPDATE public.tracks SET duration_ms = $2 WHERE id = $1::text::uuid",
+                &[&track, &duration_ms],
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(set_duration(14_001).await, 1);
+    assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
+    let duration: i32 = observer
+        .query_one(
+            "SELECT duration_ms FROM public.tracks WHERE id = $1::text::uuid",
+            &[&track],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(duration, 14_001);
+    assert_eq!(set_duration(14_000).await, 1);
 
     observer
         .execute(
