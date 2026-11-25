@@ -45,8 +45,10 @@ test('Retry refreshes the invited Library Find results and keeps the current tra
 		await expect(rows).toHaveCount(tracks.length);
 		for (const { id, title } of tracks) {
 			const button = trackButton(id);
+			const queued = queuedIds.includes(id);
 			await expect(button).toBeVisible();
-			await expect(button).toHaveAccessibleName(queuedIds.includes(id) ? `${title} — Queued` : title);
+			await expect(button).toHaveText(queued ? `${title} Queued` : title, { useInnerText: true });
+			await expect(button).toHaveAccessibleName(queued ? `${title} — Queued` : title);
 		}
 	};
 	const find = main.getByRole('searchbox', { name: 'Find in loaded tracks', exact: true });
