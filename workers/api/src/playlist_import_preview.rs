@@ -58,9 +58,9 @@ pub fn preview<'a>(
         if rows.len() == MAX_ITEMS {
             return Err(PreviewError::TooManyRows);
         }
-        // An incomplete record must leave the next directive available so a
-        // malformed row can't swallow the next complete record.
-        let id = if line.starts_with("#EXTINF:") {
+        // Keep a broken EXTINF header with its ID, even if the colon is missing.
+        // Leave the next directive available when the ID is missing.
+        let id = if line.starts_with("#EXTINF") {
             lines.next_if(|next| !next.is_empty() && !next.starts_with('#'))
         } else {
             None
@@ -116,11 +116,13 @@ mod tests {
             "#EXTM3U\n#EXTINF:-1,A URL\nhttps://example.invalid/track\n\
              #EXTINF:-1,A path\n../track\n#EXTINF:-1,Missing ID\n\
              #EXTINF:8,Unsupported duration\n{A}\n#EXTINF:-1,Bad\0label\n{A}\n\
-             {A}\n#EXTINF:-1,Valid\n{A}\n#EXTINF:-1,Missing final ID"
+             {A}\n#EXTINF-1,Missing colon\n{B}\n\
+             #EXTINF:-1,Valid\n{A}\n#EXTINF:-1,Missing final ID"
         );
         assert_eq!(
             preview(input.as_bytes(), &BTreeSet::from([A])),
             Ok(vec![
+                PreviewRow::Malformed,
                 PreviewRow::Malformed,
                 PreviewRow::Malformed,
                 PreviewRow::Malformed,
