@@ -1,6 +1,7 @@
 use super::*;
 use private_playlists::{route, Command::*};
 use serde_json::{json, Value};
+use tokio_postgres::{Error, Transaction};
 
 #[path = "../support/blocker_observer.rs"]
 mod blocker;
@@ -16,6 +17,58 @@ pub(super) fn assert_denied(response: Response) {
 fn body(response: Response, status: u16) -> Value {
     assert_eq!(response.status, status, "{}", response.body);
     serde_json::from_str(&response.body).unwrap()
+}
+
+// Fixture-only removal contract. Take the account fence before the owned
+// Library fence, then take the membership row's delete lock. Append holds
+// a share lock on that same membership until it commits.
+async fn stage_removal(
+    tx: &Transaction<'_>,
+    owner: &str,
+    library: &str,
+    track: &str,
+) -> Result<u64, Error> {
+    let account = tx
+        .query_opt(
+            "SELECT id FROM public.users WHERE id = $1 AND deleting_at IS NULL FOR SHARE",
+            &[&owner],
+        )
+        .await?;
+    if account.is_none() {
+        return Ok(0);
+    }
+    let library_lock = tx
+        .query_opt(
+            "SELECT id FROM public.libraries
+             WHERE user_id = $1 AND id = $2::text::uuid AND deleting_at IS NULL FOR SHARE",
+            &[&owner, &library],
+        )
+        .await?;
+    if library_lock.is_none() {
+        return Ok(0);
+    }
+    tx.execute(
+        "DELETE FROM public.library_tracks WHERE library_id = $1::text::uuid AND track_id = $2::text::uuid",
+        &[&library, &track],
+    )
+    .await
+}
+
+async fn seed_membership(db: &Client, library: &str, track: &str) {
+    db.execute(
+        "INSERT INTO public.library_tracks (library_id, track_id)
+         VALUES ($1::text::uuid, $2::text::uuid)",
+        &[&library, &track],
+    )
+    .await
+    .unwrap();
+}
+
+async fn remove_membership(db: &mut Client, owner: &str, library: &str, track: &str) -> u64 {
+    let tx = db.transaction().await.unwrap();
+    let removed = stage_removal(&tx, owner, library, track).await.unwrap();
+    tx.commit().await.unwrap();
+    removed
 }
 
 pub(super) async fn exercise(
@@ -68,13 +121,16 @@ pub(super) async fn exercise(
     let detail = body(route(ctx, &owner, db, Read(playlist)).await, 200);
     assert_eq!(detail["entries"], json!([]));
 
-    db.execute(
-        "INSERT INTO public.library_tracks (library_id, track_id)
-         VALUES ($1::text::uuid, $2::text::uuid)",
-        &[&active, &track],
-    )
-    .await
-    .unwrap();
+    let sibling: String = db
+        .query_one_scalar(
+            "INSERT INTO public.tracks (release_id, title, medium_no, track_no)
+             VALUES (gen_random_uuid(), 'Synthetic playlist sibling', 1, 1) RETURNING id::text",
+            &[],
+        )
+        .await
+        .unwrap();
+    seed_membership(db, &active, &sibling).await;
+    seed_membership(db, &active, track).await;
     let appended = body(route(ctx, &owner, db, attempt()).await, 201);
     let detail = body(route(ctx, &owner, db, Read(playlist)).await, 200);
     assert_eq!(
@@ -87,18 +143,53 @@ pub(super) async fn exercise(
         detail
     );
 
+    let alternate: String = db
+        .query_one_scalar(
+            "INSERT INTO public.libraries (user_id, name) VALUES ($1, 'Alternate') RETURNING id::text",
+            &[&RECIPIENT],
+        )
+        .await
+        .unwrap();
+    seed_membership(db, &alternate, track).await;
+    let account_fence = db.transaction().await.unwrap();
+    assert_eq!(
+        account_fence
+            .execute(
+                "UPDATE public.users SET deleting_at = now() WHERE id = $1",
+                &[&RECIPIENT],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        stage_removal(&account_fence, RECIPIENT, &alternate, track)
+            .await
+            .unwrap(),
+        0
+    );
+    account_fence.rollback().await.unwrap();
+    assert_eq!(
+        remove_membership(db, OTHER_MEMBER, &alternate, track).await,
+        0
+    );
+    assert_eq!(remove_membership(db, RECIPIENT, &alternate, track).await, 1);
+    assert_eq!(
+        body(route(ctx, &owner, db, Read(playlist)).await, 200),
+        detail
+    );
+
     // Hold each kind of membership loss open while another append starts.
     let pending = body(route(ctx, &owner, db, Create("Pending".into())).await, 201);
     let pending_id = pending["id"].as_str().unwrap();
     let mut peer = connect().await;
     let mut remover = connect().await;
     let pid = "SELECT pg_backend_pid()";
-    let holder = remover.query_one_scalar(pid, &[]).await.unwrap();
-    let waiter = peer.query_one_scalar(pid, &[]).await.unwrap();
+    let removal_pid = remover.query_one_scalar(pid, &[]).await.unwrap();
+    let append_pid = peer.query_one_scalar(pid, &[]).await.unwrap();
     let fence = "UPDATE public.libraries SET deleting_at = now() WHERE id = $1::text::uuid";
-    let remove = "DELETE FROM public.library_tracks WHERE library_id = $1::text::uuid";
-    for change in [fence, remove] {
-        if change == remove {
+    for removing in [false, true] {
+        if removing {
             // Restore eligibility before exercising removal of the membership row.
             let clear = "UPDATE public.libraries SET deleting_at = NULL WHERE id = $1::text::uuid";
             assert_eq!(db.execute(clear, &[&active]).await.unwrap(), 1);
@@ -108,14 +199,21 @@ pub(super) async fn exercise(
             );
         }
         let tx = remover.transaction().await.unwrap();
-        assert_eq!(tx.execute(change, &[&active]).await.unwrap(), 1);
+        let changed = if removing {
+            stage_removal(&tx, RECIPIENT, &active, track).await.unwrap()
+        } else {
+            tx.execute(fence, &[&active]).await.unwrap()
+        };
+        assert_eq!(changed, 1);
         let late = route(ctx, &owner, &mut peer, Append(pending_id, track.to_owned()));
         tokio::pin!(late);
-        blocker::observe_blocked(db, holder, waiter, late.as_mut())
+        blocker::observe_blocked(db, removal_pid, append_pid, late.as_mut())
             .await
             .unwrap();
         tx.commit().await.unwrap();
         assert_denied(late.await);
+        assert_denied(route(ctx, &owner, db, Append(pending_id, track.to_owned())).await);
+        assert_eq!(remove_membership(db, RECIPIENT, &active, track).await, 0);
         let pending = body(route(ctx, &owner, db, Read(pending_id)).await, 200);
         assert_eq!(pending["entries"], json!([]));
         let dormant = body(route(ctx, &owner, db, Read(playlist)).await, 200);
@@ -124,6 +222,80 @@ pub(super) async fn exercise(
             json!([{"id": appended["id"], "position": 0, "dormant": true}])
         );
     }
+
+    // Seed a fresh case with one qualifying membership. The track row's
+    // foreign-key lock stalls the insert after append locks that membership.
+    seed_membership(db, &active, track).await;
+    let first = body(
+        route(ctx, &owner, db, Create("Append first".into())).await,
+        201,
+    );
+    let first_id = first["id"].as_str().unwrap();
+    let mut track_locker = connect().await;
+    let track_locker_pid = track_locker.query_one_scalar(pid, &[]).await.unwrap();
+    let track_lock = track_locker.transaction().await.unwrap();
+    track_lock
+        .query_one(
+            "SELECT id FROM public.tracks WHERE id = $1::text::uuid FOR UPDATE",
+            &[&track],
+        )
+        .await
+        .unwrap();
+    let first_append = route(ctx, &owner, &mut peer, Append(first_id, track.to_owned()));
+    tokio::pin!(first_append);
+    let late_remove = remove_membership(&mut remover, RECIPIENT, &active, track);
+    tokio::pin!(late_remove);
+
+    // Give both observations one deadline within the database lock timeout.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        blocker::observe_blocked(db, track_locker_pid, append_pid, first_append.as_mut()).await?;
+        blocker::observe_blocked(db, append_pid, removal_pid, late_remove.as_mut()).await
+    })
+    .await
+    .expect("append and removal lock chain was not observed in time")
+    .unwrap();
+    track_lock.commit().await.unwrap();
+    let appended_first = body(first_append.await, 201);
+    assert_eq!(appended_first["position"], 0);
+    // The removal future has yet to send COMMIT, so readers still see membership.
+    let before_removal = body(route(ctx, &owner, db, Read(first_id)).await, 200);
+    assert_eq!(
+        before_removal["entries"],
+        json!([{"id": appended_first["id"], "position": 0, "track_id": track}])
+    );
+    assert_eq!(late_remove.await, 1);
+
+    assert_eq!(remove_membership(db, RECIPIENT, &active, track).await, 0);
+    assert_denied(route(ctx, &owner, db, Append(first_id, track.to_owned())).await);
+    assert_denied(route(ctx, &owner, db, Append(pending_id, track.to_owned())).await);
+    assert_eq!(
+        body(route(ctx, &owner, db, Read(pending_id)).await, 200)["entries"],
+        json!([])
+    );
+    let dormant = body(route(ctx, &owner, db, Read(first_id)).await, 200);
+    assert_eq!(
+        dormant["entries"],
+        json!([{"id": appended_first["id"], "position": 0, "dormant": true}])
+    );
+    let surviving_memberships: Vec<String> = db
+        .query_one_scalar(
+            "SELECT array_agg(l.name ORDER BY l.name)
+             FROM public.library_tracks lt JOIN public.libraries l ON lt.library_id = l.id
+             WHERE lt.track_id = $1::text::uuid",
+            &[&track],
+        )
+        .await
+        .unwrap();
+    assert_eq!(surviving_memberships, ["Deleting", "Foreign"]);
+    let sibling_survived: bool = db
+        .query_one_scalar(
+            "SELECT EXISTS (SELECT FROM public.library_tracks
+             WHERE library_id = $1::text::uuid AND track_id = $2::text::uuid)",
+            &[&active, &sibling],
+        )
+        .await
+        .unwrap();
+    assert!(sibling_survived);
 
     let deleted = body(route(ctx, &owner, db, Delete(playlist)).await, 202);
     assert!(deleted["operation_id"].is_string());
