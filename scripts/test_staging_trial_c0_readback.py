@@ -80,13 +80,14 @@ class ReadbackTest(unittest.TestCase):
             ("duplicate", [first_page, duplicate], "PENDING (count or limit unconfirmed)"),
             ("complete", [first_page, last_page], "CAPACITY (21 used of 25, 4 needed)"),
         ]
-        # Even a previously verified count must not replace failed inventory evidence.
+        # The stale summary count differs from the verified replay count.
+        summary = json.dumps({**json.loads(FIXTURE), "hyperdrive_used": 20}).encode()
         with tempfile.TemporaryDirectory() as scratch:
             replay = Path(scratch) / "synthetic-pages.json"
             for name, pages, verdict in cases:
                 with self.subTest(continuation=name):
                     replay.write_text(json.dumps(pages), encoding="utf-8")
-                    result = self.run_readback(FIXTURE, "--hyperdrive-pages", str(replay))
+                    result = self.run_readback(summary, "--hyperdrive-pages", str(replay))
                     self.assertEqual(result.returncode, 0)
                     self.assertEqual(result.stderr, b"")
                     self.assertEqual(result.stdout.decode().splitlines(), [
