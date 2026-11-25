@@ -84,17 +84,18 @@ test('isolates approved cleanup and recovers the same fixture', { timeout: 120_0
       [pageKey, new Set([scope.page_version, 'other-page'])], [siblingKey, new Set(['sibling-version'])]]);
     const calls = [];
     let interrupt = true;
-    const storageOrigin = (target, requests, interruptHead = () => false) => async (req) => {
+    const storageOrigin = (requests, interruptHead = () => false) => async (req) => {
       const url = new URL(req.url);
-      assert.equal(url.origin, provider.endpoint);
       const prefix = `/${provider.bucket}/`;
-      assert.ok(url.pathname.startsWith(prefix));
       const key = url.pathname.slice(prefix.length);
       const version = url.searchParams.get('versionId');
-      assert.ok(key === media(target) || key === page(target), 'request must target an approved key');
-      assert.deepEqual([...url.searchParams], [['versionId', key === media(target) ? target.media_version : target.page_version]]);
-      assert.match(req.headers.get('authorization'), /Credential=FIXTUREACCESS\//);
+      // Record attempts even when the mock rejects them and the Worker ignores the failure.
       requests.push([req.method, key, version]);
+      assert.equal(url.origin, provider.endpoint);
+      assert.ok(url.pathname.startsWith(prefix));
+      assert.ok(version);
+      assert.deepEqual([...url.searchParams], [['versionId', version]]);
+      assert.match(req.headers.get('authorization'), /Credential=FIXTUREACCESS\//);
       assert.ok(versions.has(key));
       if (req.method === 'DELETE') {
         versions.get(key).delete(version);
@@ -104,7 +105,7 @@ test('isolates approved cleanup and recovers the same fixture', { timeout: 120_0
       if (interruptHead(key)) return new Response(null, { status: 503 });
       return new Response(null, { status: versions.get(key).has(version) ? 200 : 404 });
     };
-    const origin = storageOrigin(scope, calls, (key) => key === mediaKey && interrupt);
+    const origin = storageOrigin(calls, (key) => key === mediaKey && interrupt);
     const approvalFor = (selection) => ({
       provider: selection.provider, scope_sha256: sha(JSON.stringify(selection)), s3_access_key_sha256: sha(cleanupAccessKey),
     });
@@ -165,7 +166,7 @@ test('isolates approved cleanup and recovers the same fixture', { timeout: 120_0
       versions.set(selectedPage, new Set([selected.page_version, 'other-page']));
       const requests = [];
       assert.equal(await run(selected, { CLEANUP_APPROVAL: approved(selected) },
-        storageOrigin(selected, requests)), 'confirmed');
+        storageOrigin(requests)), 'confirmed');
       assert.deepEqual(requests, [
         ['DELETE', selectedMedia, selected.media_version], ['HEAD', selectedMedia, selected.media_version],
         ['DELETE', selectedPage, selected.page_version], ['HEAD', selectedPage, selected.page_version],
