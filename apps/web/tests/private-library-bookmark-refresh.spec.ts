@@ -8,8 +8,9 @@ test('the invited Library reopens a same-title track bookmark after refresh', as
 	const binding = 'A'.repeat(43);
 	const verifierPath = '/v1/me/likes/session';
 	const title = 'Synthetic Echo';
-	const other = { id: '00000000-0000-4000-8000-000000000001', title, artist: 'Alder' };
-	const saved = { id: '00000000-0000-4000-8000-000000000002', title, artist: 'Maple' };
+	const privateTrack = (id: string) => ({ id, occurrence_key: `private:${id}`, title, artist: null, like_target_id: null });
+	const other = privateTrack('00000000-0000-4000-8000-000000000001');
+	const saved = privateTrack('00000000-0000-4000-8000-000000000002');
 	const libraryUrl = origin + library.path;
 	const bookmark = `${libraryUrl}?track=${saved.id}&t=0`;
 	const playbackRequests: string[] = [];
@@ -43,12 +44,11 @@ test('the invited Library reopens a same-title track bookmark after refresh', as
 	const mediaSources = await observeMediaSources(page);
 	const rows = page.getByTestId('library-list').getByTestId(library.item);
 	const rowIds = () => rows.evaluateAll((nodes, attribute) => nodes.map((node) => node.getAttribute(attribute)), library.id);
+	const titleButtons = rows.getByRole('button', { name: title, exact: true });
 	const queue = page.getByTestId(player.queueItem);
 	const current = page.locator(player.currentQueueItem);
 	await expect.poll(rowIds).toEqual([other.id, saved.id]);
-	for (const track of [other, saved]) {
-		await expect(rows.getByRole('button', { name: `${title} — ${track.artist}`, exact: true })).toBeVisible();
-	}
+	await expect(titleButtons).toHaveText([title, title]);
 
 	// Follow the same stored URL twice through normal navigation while keeping the player mounted.
 	await page.evaluate(({ bookmark, libraryUrl }) => {
@@ -82,6 +82,7 @@ test('the invited Library reopens a same-title track bookmark after refresh', as
 
 	await page.getByRole('button', { name: library.refresh, exact: true }).click();
 	await expect.poll(rowIds).toEqual([saved.id, other.id]);
+	await expect(titleButtons).toHaveText([title, title]);
 	await expect(queue).toHaveCount(0);
 	await expectBookmarkedTrack();
 	expect(listings).toBe(2);
