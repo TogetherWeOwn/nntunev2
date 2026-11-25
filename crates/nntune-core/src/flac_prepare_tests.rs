@@ -106,6 +106,17 @@ fn seeks_in_prepared_plaintext_and_maps_complete_sealed_chunks() {
 }
 
 #[test]
+fn duration_rounds_up_and_preserves_values_larger_than_u32() {
+    let mut seek = FlacSeekIndex::new(44_100, 0);
+    seek.total_samples = 44_101;
+    assert_eq!(seek.duration_ms(), Some(1001));
+
+    let mut seek = FlacSeekIndex::new(1, 0);
+    seek.total_samples = 4_294_968;
+    assert_eq!(seek.duration_ms(), Some(4_294_968_000));
+}
+
+#[test]
 fn streamed_seek_ignores_source_offsets_at_every_input_split() {
     let mut input = STREAMINFO.to_vec();
     block_header(&mut input, 0x83, 36);

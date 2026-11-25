@@ -93,12 +93,12 @@ impl FlacSeekIndex {
     }
 
     /// Duration of the validated PCM, rounded up to the next millisecond.
-    pub fn duration_ms(&self) -> Option<u32> {
+    pub fn duration_ms(&self) -> Option<u64> {
         if self.sample_rate == 0 || self.total_samples == 0 {
             return None;
         }
         let millis = self.total_samples.checked_mul(1000)?;
-        u32::try_from(millis.div_ceil(u64::from(self.sample_rate))).ok()
+        Some(millis.div_ceil(u64::from(self.sample_rate)))
     }
 
     /// Whole-frame, half-open range in the indexed plaintext. Seek back to
