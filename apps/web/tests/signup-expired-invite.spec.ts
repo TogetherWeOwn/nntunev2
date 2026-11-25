@@ -43,8 +43,9 @@ test('expired private invite is refused without opening Library or requesting a 
 			};
 			return route.fulfill({ json: challenge });
 		}
-		if (pathname === library.path || pathname === library.api || pathname === player.plays ||
-			pathname.startsWith(`${player.plays}/`) || pathname === '/v1/me/private-session' ||
+		if (pathname === library.path || pathname === library.api || pathname === '/v1/library' ||
+			pathname === player.plays || pathname.startsWith(`${player.plays}/`) ||
+			pathname === '/v1/me/private-session' ||
 			pathname.startsWith('/v1/auth/passkey/register/')) {
 			unexpectedRequests.push(`${request.method()} ${pathname}`);
 			return route.abort();
