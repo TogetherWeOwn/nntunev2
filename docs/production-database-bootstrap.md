@@ -238,10 +238,11 @@ records the actual Settings and REST readbacks for the live handoff.
 1. Keep both candidate variables unset while the prerequisites are gathered.
    Stage A qualifies a disposable PostgreSQL target. Carry the merged Stage A
    result into the fresh Stage B rerun, then qualify capacity, scoped
-   authority, and combined Tunnel/Access and origin TLS at Stage C0. Complete
-   the served private trial and capture exact-candidate staging evidence before
-   production database setup. [Staging database qualification](../ops/staging-trial-pg/README.md)
-   · [Qualify the release candidate](first-private-music-launch.md#qualify-the-candidate)
+   authority, and combined Tunnel/Access and origin TLS at Stage C0. Before
+   production database setup, complete the served private trial and capture
+   the exact-candidate staging evidence in steps 1–3 of
+   [Qualify the candidate](first-private-music-launch.md#qualify-the-candidate).
+   [Staging database qualification](../ops/staging-trial-pg/README.md)
 2. Obtain the GitHub custodian's recorded authorization for the separate
    Environment change and record the independently approved reviewer for each
    Environment. The custodian captures the before state, including an absent
