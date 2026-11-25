@@ -23,7 +23,7 @@ use nntune_ingest::{
     multipart::{session_outcome::CompletionScope, session_upload::begin},
 };
 use sha2::{Digest, Sha256};
-use tokio_postgres::{Client, Transaction};
+use tokio_postgres::{types::Type, Client, Transaction};
 
 const STAGING_ORIGIN: &str = "https://staging.nntune.com";
 // SHA-256 of the original CC0 tone-a.flac in the private staging manifest.
@@ -237,6 +237,24 @@ impl Permit<'_> {
         };
         let mut tx = begin(publication_writer).await.map_err(|_| Unconfirmed)?;
         let recipient = self.recipient(&tx).await?;
+        if upload_writer
+            .query_typed_opt(
+                "SELECT 1 FROM public.ingest_session_reservations
+             WHERE id = $1::text::uuid AND principal_id = $2 AND idempotency_key = $3
+               AND terminal_reason = 'completed' AND multipart_object_id = $4::text::uuid",
+                &[
+                    (&scope.session, Type::TEXT),
+                    (&scope.principal, Type::TEXT),
+                    (&self.target.job_id, Type::TEXT),
+                    (&uuid_text(prepared.intent.identities[2]), Type::TEXT),
+                ],
+            )
+            .await
+            .map_err(|_| Unconfirmed)?
+            .is_none()
+        {
+            return Err(Refused);
+        }
         tx.execute(
             "INSERT INTO public.storage_s3_locator_intents (object_id, root_version_id, s3_bucket, s3_key, s3_version_id)
              VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5) ON CONFLICT (object_id) DO NOTHING",

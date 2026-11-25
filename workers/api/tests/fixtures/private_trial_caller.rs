@@ -21,7 +21,7 @@ const RECIPIENT: &str = "synthetic-trial-listener";
 const OUTSIDER: &str = "synthetic-trial-outsider";
 const RELEASE: &str = "ab340000-0000-4000-8000-000000000000";
 const QUERY: &str = "Trial synthetic FLAC";
-const JOB: &str = "synthetic-trial-publication";
+pub(crate) const JOB: &str = "synthetic-trial-publication";
 const ORIGIN: &str = "https://staging.nntune.com";
 const DB: &str = "postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_upload_caller_ci";
 
@@ -226,7 +226,7 @@ pub(crate) async fn verify_publication(
         &str,
         &CompletionScope<'_>,
     ) -> Result<Option<CurrentAuthorization>, StoreError>,
-) {
+) -> String {
     private_trial::sealed_fixture::verify_sealed_fixture(input);
     observer.batch_execute(concat!(
         include_str!("storage_s3_locator_schema.sql"),
@@ -333,7 +333,7 @@ pub(crate) async fn verify_publication(
     let lookup = release_lookup(QUERY).unwrap();
     let mut publication = connection().await;
     let mut publish = async |publication: &mut Client, upload_writer: &mut Client| {
-        upload(&ctx, &request, target, async |permit, _| {
+        Box::pin(upload(&ctx, &request, target, async |permit, _| {
             permit.preflight(publication).await?;
             let evidence = MatchEvidence {
                 query: QUERY,
@@ -367,9 +367,18 @@ pub(crate) async fn verify_publication(
                     &mut read_authority,
                 )
                 .await
-        })
+        }))
         .await
     };
+    let set_job = async |job: &str| {
+        observer.execute(
+            "UPDATE public.ingest_session_reservations SET idempotency_key = $1 WHERE id = $2::text::uuid",
+            &[&job, &prepared.scope.session],
+        ).await.unwrap()
+    };
+    assert_eq!(set_job("other-trial-job").await, 1);
+    assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
+    assert_eq!(set_job(JOB).await, 1);
     observer.batch_execute(
         "CREATE FUNCTION public.fixture_refuse_trial_admission() RETURNS trigger LANGUAGE plpgsql
          AS $$ BEGIN RETURN NULL; END $$;
@@ -443,4 +452,190 @@ pub(crate) async fn verify_publication(
         .unwrap();
     assert_eq!(publish(&mut publication, upload_writer).await.status, 404);
     assert_eq!(handle(&ctx, &library).await.status, 403);
+
+    track.to_owned()
+}
+
+pub(crate) async fn verify_cleanup(
+    observer: &Client,
+    prepared: PreparedUpload<'_>,
+    track: &str,
+    now: u64,
+) {
+    use private_trial::{
+        cleanup::{cleanup, Fixture},
+        TrialError,
+    };
+    let mut publication = connection().await;
+    let publication = &mut publication;
+    let scope = prepared.scope;
+    let object = prepared.intent.identities[2];
+    let object_id = uuid_text(object);
+    let fixture = Fixture {
+        environment: scope.environment,
+        library: scope.library,
+        object,
+        track,
+        session: scope.session,
+        job: JOB,
+        issuer: scope.principal,
+        invite: 931,
+        bucket: "fixture-bucket",
+        cutoff: now as i64 - 1,
+    };
+    let retained = async |future: bool| {
+        observer.execute(
+            "UPDATE public.storage_validated_digest_winners
+             SET retain_until = clock_timestamp() - interval '1 second',
+                 read_until = CASE WHEN $2 THEN clock_timestamp() + interval '5 minutes' ELSE '-infinity' END
+             WHERE object_id = $1::text::uuid",
+            &[&object_id, &future],
+        ).await.unwrap()
+    };
+    assert_eq!(retained(true).await, 1);
+    let unexpected =
+        async |_: &str, _: &str, _: &str| panic!("ineligible cleanup reached the provider");
+    assert!(!cleanup(publication, &fixture, unexpected).await.unwrap());
+    assert_eq!(retained(false).await, 1);
+    let wrong = Fixture {
+        invite: 932,
+        ..fixture
+    };
+    assert!(!cleanup(publication, &wrong, unexpected).await.unwrap());
+    let before_cutoff = Fixture {
+        cutoff: now as i64 + 300,
+        ..fixture
+    };
+    assert!(!cleanup(publication, &before_cutoff, unexpected)
+        .await
+        .unwrap());
+
+    let other_track: String = observer
+        .query_one(
+            "INSERT INTO public.tracks (release_id, title, medium_no, track_no)
+         VALUES ($1::text::uuid, 'Unrelated cleanup control', 1, 2) RETURNING id::text",
+            &[&RELEASE],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    observer.execute(
+        "INSERT INTO public.catalogue_s3_sources (track_id, source_job_id, accepted_seq, object_id)
+         SELECT $1::text::uuid, source_job_id, accepted_seq, object_id
+         FROM public.catalogue_s3_sources WHERE track_id = $2::text::uuid",
+        &[&other_track, &track],
+    ).await.unwrap();
+    assert!(!cleanup(publication, &fixture, unexpected).await.unwrap());
+    assert_eq!(
+        observer
+            .execute(
+                "DELETE FROM public.catalogue_s3_sources WHERE track_id = $1::text::uuid",
+                &[&other_track],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    observer
+        .batch_execute(
+        "INSERT INTO public.invite_codes (id, code_hash, used, created_at, expires_at, issued_by)
+         SELECT 932, 'auxiliary-trial-invite', true, created_at, expires_at, issued_by
+         FROM public.invite_codes WHERE id = 931;
+         INSERT INTO public.private_library_admissions
+         SELECT 932, recipient_id, track_id, accepted_seq, object_id
+         FROM public.private_library_admissions WHERE invite_id = 931;",
+        )
+        .await
+        .unwrap();
+    assert!(!cleanup(publication, &fixture, unexpected).await.unwrap());
+    assert_eq!(
+        observer
+            .execute("DELETE FROM public.invite_codes WHERE id = 932", &[])
+            .await
+            .unwrap(),
+        1
+    );
+
+    let reference_count = async || {
+        observer.query_one(
+        "SELECT count(*) FROM public.storage_validated_digest_references WHERE object_id <> $1::text::uuid",
+        &[&object_id],
+    ).await.unwrap().get::<_, i64>(0)
+    };
+    let other_references = reference_count().await;
+    let generation = uuid_text(scope.seal);
+    let map = uuid_text(prepared.intent.map_id);
+    let media = format!("media/{object_id}/{generation}");
+    let page = format!("media-digests/{object_id}/{generation}/{map}/00000000");
+    let mut versions = std::collections::BTreeSet::from([
+        (media.clone(), "media-fixture-version".to_owned()),
+        (media.clone(), "unrelated-fixture-version".to_owned()),
+        (page.clone(), "page-fixture-version".to_owned()),
+    ]);
+    let interrupted = cleanup(
+        publication,
+        &fixture,
+        async |bucket: &str, key: &str, version: &str| {
+            assert_eq!(bucket, fixture.bucket);
+            if key == page && version == "page-fixture-version" {
+                return Err(TrialError::Unconfirmed);
+            }
+            assert_eq!((key, version), (media.as_str(), "media-fixture-version"));
+            assert!(versions.remove(&(key.to_owned(), version.to_owned())));
+            Ok(())
+        },
+    )
+    .await;
+    assert_eq!(interrupted, Err(TrialError::Unconfirmed));
+    observer
+        .execute("DELETE FROM public.invite_codes WHERE id = 931", &[])
+        .await
+        .unwrap();
+    let has_source = async || {
+        observer.query_one(
+            "SELECT EXISTS (SELECT FROM public.catalogue_s3_sources WHERE track_id = $1::text::uuid)",
+            &[&track],
+        ).await.unwrap().get::<_, bool>(0)
+    };
+    assert!(
+        has_source().await,
+        "interrupted cleanup must keep the source"
+    );
+    for _ in 0..2 {
+        let mut expected = [
+            (media.as_str(), "media-fixture-version"),
+            (page.as_str(), "page-fixture-version"),
+        ]
+        .into_iter();
+        assert!(cleanup(
+            publication,
+            &fixture,
+            async |bucket: &str, key: &str, version: &str| {
+                assert_eq!(bucket, fixture.bucket);
+                assert_eq!(Some((key, version)), expected.next());
+                versions.remove(&(key.to_owned(), version.to_owned()));
+                Ok(())
+            }
+        )
+        .await
+        .unwrap());
+        assert_eq!(expected.next(), None);
+        assert!(
+            !has_source().await,
+            "confirmed deletion must remove the source"
+        );
+    }
+    assert_eq!(
+        versions,
+        std::collections::BTreeSet::from([(media, "unrelated-fixture-version".to_owned())])
+    );
+    assert_eq!(reference_count().await, other_references);
+    assert!(observer.query_one(
+        "SELECT deleting_at IS NOT NULL
+            AND NOT EXISTS (SELECT FROM public.private_library_admissions a WHERE a.object_id = w.object_id)
+            AND NOT EXISTS (SELECT FROM public.catalogue_s3_sources s WHERE s.object_id = w.object_id)
+            AND NOT EXISTS (SELECT FROM public.storage_validated_digest_references r WHERE r.object_id = w.object_id)
+         FROM public.storage_validated_digest_winners w WHERE w.object_id = $1::text::uuid",
+        &[&object_id],
+    ).await.unwrap().get::<_, bool>(0));
 }

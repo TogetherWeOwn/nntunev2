@@ -322,6 +322,11 @@ async fn prove_attempt(
     };
     let sid = fresh_id().unwrap();
     let fingerprint = request.fingerprint().unwrap();
+    let idempotency_key = if publish_fixture {
+        crate::handlers::tests::private_trial_fixture::JOB
+    } else {
+        "fixture-key"
+    };
     let reserve = include_str!("../../src/ingest_session_reserve.sql");
     writer
         .batch_execute(&format!(
@@ -332,7 +337,7 @@ async fn prove_attempt(
         .unwrap();
     let inserted: String = writer.query_one(
         "SELECT pg_temp.reserve($1::text::uuid, $2::text::uuid, $3, $4, $5, $6::text::uuid)::text",
-        &[&env, &lib, &OWNER, &"fixture-key", &fingerprint.bytes().as_slice(), &sid],
+        &[&env, &lib, &OWNER, &idempotency_key, &fingerprint.bytes().as_slice(), &sid],
     ).await.unwrap().get(0);
     assert_eq!(inserted.replace('-', ""), sid);
     let job = Job {
@@ -898,16 +903,21 @@ async fn prove_attempt(
         .await,
         Err(UploadError::Refused)
     ));
-    if publish_fixture {
-        crate::handlers::tests::private_trial_fixture::verify_publication(
-            observer, writer, now, input, auth, prepared, &committed, reload,
+    let track = if publish_fixture {
+        let track = Box::pin(
+            crate::handlers::tests::private_trial_fixture::verify_publication(
+                observer, writer, now, input, auth, prepared, &committed, reload,
+            ),
         )
         .await;
         crate::handlers::tests::private_trial_fixture::verify_registration(
             observer, authority, input, auth,
         )
         .await;
-    }
+        Some(track)
+    } else {
+        None
+    };
     observer
         .execute(
             "UPDATE public.native_rest_credentials SET revoked_at = $2 WHERE id = $1",
@@ -919,7 +929,13 @@ async fn prove_attempt(
         read(writer, auth, prepared, reload).await,
         Err(UploadError::Refused)
     ));
-    if publish_fixture {
+    if let Some(track) = track {
+        Box::pin(
+            crate::handlers::tests::private_trial_fixture::verify_cleanup(
+                observer, prepared, &track, now,
+            ),
+        )
+        .await;
         return;
     }
     // Restore the disposable credential for the independent reuse cases.
