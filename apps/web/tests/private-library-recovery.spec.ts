@@ -127,6 +127,7 @@ test('returning to Library shows the new track and keeps the current selection',
 });
 
 test('Refresh adds the first available track to an empty invited Library', async ({ page, origin }) => {
+	const updated = { ...first, title: 'Updated catalogue track' };
 	const initial = Promise.withResolvers<Track[]>();
 	const firstRefresh = Promise.withResolvers<Track[]>();
 	const repeatRefresh = Promise.withResolvers<Track[]>();
@@ -139,6 +140,7 @@ test('Refresh adds the first available track to an empty invited Library', async
 
 	try {
 		await page.goto(origin + library.path);
+		await expect.poll(() => fixture.listingAccounts.length).toBe(1);
 		await expect(loading).toBeVisible();
 		await expect(empty).toBeHidden();
 		await expectCatalogue(page, []);
@@ -150,6 +152,7 @@ test('Refresh adds the first available track to an empty invited Library', async
 		catalogue = firstRefresh.promise;
 		expect(fixture.listingAccounts).toEqual([listener.account]);
 		await refresh.click();
+		await expect.poll(() => fixture.listingAccounts.length).toBe(2);
 		await expect(loading).toBeVisible();
 		await expect(empty).toBeHidden();
 		await expectCatalogue(page, []);
@@ -160,16 +163,17 @@ test('Refresh adds the first available track to an empty invited Library', async
 
 		catalogue = repeatRefresh.promise;
 		await refresh.click();
+		await expect.poll(() => fixture.listingAccounts.length).toBe(3);
 		await expect(loading).toBeVisible();
-		repeatRefresh.resolve([first]);
+		repeatRefresh.resolve([updated]);
 		await expect(loading).toBeHidden();
-		await expectCatalogue(page, [first]);
+		await expectCatalogue(page, [updated]);
 		expect(fixture.listingAccounts).toEqual([listener.account, listener.account, listener.account]);
 		await expect(page).toHaveURL(origin + library.path);
 		expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentTimeOrigin);
 	} finally {
 		initial.resolve([]);
 		firstRefresh.resolve([first]);
-		repeatRefresh.resolve([first]);
+		repeatRefresh.resolve([updated]);
 	}
 });
