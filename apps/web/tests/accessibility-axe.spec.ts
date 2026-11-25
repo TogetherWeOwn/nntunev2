@@ -165,6 +165,8 @@ invitedLibraryTest.describe('Library player', () => {
 			await expect(seek).toBeVisible();
 			await expect(seek).toBeEnabled();
 			await expect(player.getByRole('button', { name: 'Restart current track', exact: true })).toBeVisible();
+			await expect(player.getByRole('button', { name: 'Back 10 seconds', exact: true })).toBeVisible();
+			await expect(player.getByRole('button', { name: 'Forward 10 seconds', exact: true })).toBeVisible();
 			await expect(player.getByRole('slider', { name: /^Volume \d+%$/ })).toBeVisible();
 			await expect(player.getByRole('button', { name: 'Mute', exact: true })).toBeVisible();
 			await expect(page.getByRole('combobox', { name: 'Playback speed', exact: true })).toBeVisible();
