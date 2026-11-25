@@ -123,6 +123,64 @@ async fn open_ended_range_delivers_plaintext_through_eof() {
 }
 
 #[tokio::test]
+async fn short_media_read_reports_only_written_bytes_and_retry_is_contiguous() {
+    let source = Source::browser();
+    let attempt = async |start: u64| {
+        let request = PlayRouteRequest {
+            track_id: "track".into(),
+            token: Some(BROWSER_TOKEN.into()),
+            range: Some(format!("bytes={start}-65536")),
+            trace_id: None,
+        };
+        let output = RefCell::new(Vec::new());
+        let aborted = Cell::new(false);
+        let mut receipt = None;
+        let result = serve(
+            &request,
+            b"test only, not a deployed secret",
+            Some(&source),
+            || source.time(),
+            |head| {
+                assert_eq!(head.status, 206);
+                assert_eq!(head.len, LEN - start);
+                Ok(Some(Writer {
+                    output: &output,
+                    fault: Fault::None,
+                    aborted: &aborted,
+                    revoke_on_write: None,
+                }))
+            },
+            |interval| receipt = Some(interval),
+        )
+        .await;
+        (
+            result,
+            output.into_inner(),
+            aborted.get(),
+            receipt.expect("writer-accepted bytes must be reported"),
+        )
+    };
+
+    source.short_media_once.set(true);
+    let start = 65_534;
+    let (result, prefix, aborted, receipt) = attempt(start).await;
+    assert_eq!(result.unwrap_err().status, 502);
+    assert!(aborted);
+    assert_eq!(prefix, b"AY");
+    let cursor = start + prefix.len() as u64;
+    assert_eq!(receipt.start..receipt.end, start..cursor);
+
+    source.expected_media_start.set(65_600);
+    let (result, tail, aborted, retry) = attempt(cursor).await;
+    result.unwrap();
+    assert!(!aborted);
+    assert_eq!(tail, b"Z");
+    assert_eq!(retry.start..retry.end, cursor..cursor + tail.len() as u64);
+    assert_eq!(retry.end, LEN);
+    assert_eq!(retry.play_id, receipt.play_id);
+}
+
+#[tokio::test]
 async fn browser_stream_aborts_at_the_next_chunk_after_lease_revocation() {
     let key = b"test only, not a deployed secret";
     let source = Source::browser();
