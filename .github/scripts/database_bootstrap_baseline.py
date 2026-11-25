@@ -15,7 +15,8 @@ from database_bootstrap_setup import (
 )
 
 WORKFLOW = ".github/workflows/deploy-database-baseline.yml"
-FIELDS = {"version", "host", "port", "ca_pem", "branch_id", "launch", "database_oid", "reader_role"}
+OIDS = {"database_oid", "reader_oid"}
+FIELDS = {"version", "host", "port", "ca_pem", "branch_id", "launch", "reader_role"} | OIDS
 MAX_RELATIONS = 256
 MAX_SQL_BYTES = 8192
 
@@ -24,10 +25,10 @@ def baseline_plan(raw):
     data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
     if (
         not isinstance(data, dict) or data.keys() != FIELDS
-        or type(data["version"]) is not int or data["version"] != 1
+        or type(data["version"]) is not int or data["version"] != 2
         or type(data["port"]) is not int or data["port"] != PORT
-        or type(data["database_oid"]) is not int or not 0 < data["database_oid"] <= 4294967295
-        or any(not isinstance(data[k], str) for k in FIELDS - {"version", "port", "database_oid"})
+        or any(type(data[k]) is not int or not 0 < data[k] <= 4294967295 for k in OIDS)
+        or any(not isinstance(data[k], str) for k in FIELDS - OIDS - {"version", "port"})
         or not valid_host(data["host"])
         or not re.fullmatch(r"(?:[a-z0-9]{10}|[a-z0-9]{12})", data["branch_id"])
         or not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", data["launch"])
@@ -87,6 +88,9 @@ BEGIN
         )
     THEN
         RAISE EXCEPTION 'baseline scope refused';
+    END IF;
+    IF role_id IS DISTINCT FROM '{plan.reader_oid}'::oid THEN
+        RAISE EXCEPTION 'baseline reader OID refused';
     END IF;
 
     FOR target IN

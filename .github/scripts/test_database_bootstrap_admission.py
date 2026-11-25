@@ -1,4 +1,4 @@
-"""Exercise the admission command with generated authorization and event data."""
+"""Check baseline workflow gates and exercise admission with generated inputs."""
 
 import base64
 import hashlib
@@ -11,6 +11,28 @@ import time
 from pathlib import Path
 
 import database_bootstrap_admission as admission
+from database_bootstrap_baseline import WORKFLOW as BASELINE_WORKFLOW
+from test_ci_pnpm_retry import job_level_field, job_needs, split_jobs
+
+
+def check_baseline_workflow():
+    root = Path(__file__).resolve().parents[2]
+    workflow = (root / BASELINE_WORKFLOW).read_text(encoding="utf-8")
+    jobs = split_jobs(workflow)
+    preflight = jobs["preflight"].split("\n    steps:\n", 1)[0]
+    baseline = jobs["baseline"].split("\n    steps:\n", 1)[0]
+    gate = """    if: >-
+      ${{ github.repository == 'TogetherWeOwn/nntunev2' &&
+          github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+          github.run_attempt == '1' && vars.DATABASE_BASELINE_CANDIDATE_SHA == github.sha }}
+"""
+    if (
+        "\non:\n  workflow_dispatch:\n\n" not in workflow or gate not in preflight
+        or job_needs(baseline) != ["preflight"]
+        or job_level_field(baseline, "if") != "github.run_attempt == '1'"
+        or job_level_field(baseline, "environment") != "production-db-baseline"
+    ):
+        raise RuntimeError("baseline workflow admission differs from the required guards")
 
 
 def exercise(event_path):
@@ -85,6 +107,7 @@ def exercise(event_path):
 
 if __name__ == "__main__":
     try:
+        check_baseline_workflow()
         with tempfile.TemporaryDirectory(prefix="bootstrap-admission-") as temp:
             exercise(Path(temp) / "event.json")
         if Path(temp).exists():

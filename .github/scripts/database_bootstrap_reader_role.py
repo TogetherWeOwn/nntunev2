@@ -50,11 +50,11 @@ class ReaderRoleLifecycle(RoleLifecycle):
                 )"""
         return self._transaction(body, result, database=database, guard=guard)
 
-    def _bound_plan(self, raw):
+    def _bound_plan(self, raw, oid):
         plan = baseline_plan(raw)
-        if any(getattr(plan, key) != getattr(self.plan, key)
+        if plan.reader_oid != oid or any(getattr(plan, key) != getattr(self.plan, key)
                for key in ("host", "port", "ca_pem", "branch_id", "launch", "reader_role")):
-            raise ValueError("baseline plan differs from setup")
+            raise ValueError("baseline plan differs from setup or issuance")
         return plan
 
     def prepare(self):
@@ -148,7 +148,7 @@ class ReaderRoleLifecycle(RoleLifecycle):
         RAISE EXCEPTION 'reader authorization expired';
     END IF;
     ALTER ROLE {self.role} PASSWORD '{scram_verifier(password)}' VALID UNTIL '{until}';
-""", plan=self._bound_plan(raw_baseline), require_owner=True)
+""", plan=self._bound_plan(raw_baseline, oid), require_owner=True)
 
     def fence(self, oid):
         # The role is cluster-wide. Fence it even if the launch database is unavailable.
@@ -164,7 +164,7 @@ class ReaderRoleLifecycle(RoleLifecycle):
 
     def retire(self, raw_baseline, oid):
         receipt = role_oid(oid)
-        plan = None if raw_baseline is None else self._bound_plan(raw_baseline)
+        plan = None if raw_baseline is None else self._bound_plan(raw_baseline, oid)
         # From maintenance, DROP ROLE itself refuses any surviving grant or ownership.
         revoke = f"""
         FOR item IN {PHYSICAL_RELATIONS} LOOP
