@@ -871,6 +871,7 @@ def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=
     other_oid = int(result.stdout)
     plan.update(version=2, database_oid=database_oid, reader_oid=oid)
     raw = json.dumps(plan).encode()
+    retirement_readback = lifecycle.retirement_readback(raw, oid)
     cluster.ok("delegate only launch CONNECT and schema/table grant options", f"""
         GRANT CONNECT ON DATABASE {LAUNCH} TO {READER_ISSUER} WITH GRANT OPTION;
         REVOKE USAGE ON SCHEMA public FROM PUBLIC;
@@ -974,11 +975,26 @@ def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=
                 SELECT NOT rolcanlogin AND rolpassword IS NULL AND rolvaliduntil = 'epoch'::timestamptz
                 FROM pg_authid WHERE oid = {oid};
             """, "t\n")
+            if holder is not None and publish is None:
+                cluster.ok("accept the reader CONNECT revoke", f"""
+                    REVOKE CONNECT ON DATABASE {LAUNCH} FROM {lifecycle.role};
+                """, **launch)
+                holder.stdin.write(f"""
+                    SELECT current_user::regrole::oid = {oid}
+                        AND NOT has_database_privilege(current_user, current_database(), 'CONNECT')
+                        AND EXISTS (SELECT FROM reader_scope.leaf WHERE id = 5);
+                """.encode())
+                holder.stdin.flush()
+                require(select.select([holder.stdout], [], [], 3)[0] and holder.stdout.readline() == b"t\n",
+                        "verify the same reader still has effective access after the accepted revoke")
+                cluster.ok("withhold the retired verdict while reader access survives", retirement_readback, **launch)
             cluster.ok("revoke the scoped grants and read back role and session absence", lifecycle.retire(raw, oid),
                        "retired\n", **launch)
             if holder is not None:
                 stdout, _ = holder.communicate(b"SELECT 1;\n", timeout=3)
                 require(holder.returncode != 0 and not stdout, "observe the reader server session terminate")
+                if publish is None:
+                    cluster.ok("read back retirement after access ends", retirement_readback, "retired\n", **launch)
         finally:
             if holder is not None and holder.poll() is None:
                 holder.kill()
