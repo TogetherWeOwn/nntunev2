@@ -2,10 +2,10 @@
 
 const assert = require('node:assert/strict');
 const { execFile, spawnSync } = require('node:child_process');
-const { once } = require('node:events');
-const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
+const { EventEmitter, once } = require('node:events');
+const { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { join } = require('node:path');
+const { join, resolve } = require('node:path');
 const { test } = require('node:test');
 const { createServer } = require('node:tls');
 const { promisify } = require('node:util');
@@ -203,6 +203,89 @@ test('the operator entry requires explicit provider invocation and prints a fixe
   assert.equal(child.status, 1);
   assert.equal(child.stdout, 'Private staging fixture provider preflight: refused.\n');
   assert.equal(child.stderr, '');
+});
+
+test('the protected summary records an interrupted read and a successful fresh dispatch', async (t) => {
+  const root = resolve(__dirname, '../../../..');
+  const workflow = readFileSync(join(root, '.github/workflows/staging-trial-provider-preflight.yml'), 'utf8');
+  const shell = (name, env) => {
+    const step = workflow.split(`      - name: ${name}\n`)[1]?.split('      - ')[0];
+    const script = step?.split('        run: |\n')[1];
+    assert.ok(script, `missing shell step: ${name}`);
+    return promisify(execFile)('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], {
+      cwd: root, env: { PATH: process.env.PATH, ...env }, timeout: 35_000,
+    });
+  };
+  const scratch = mkdtempSync(join(tmpdir(), 'provider-preflight-'));
+  t.after(() => rmSync(scratch, { recursive: true }));
+  const bundleDir = join(scratch, 'trial-provider-preflight');
+  mkdirSync(bundleDir);
+  // Stand in for the WASM verdict at its existing export. The real launcher
+  // sends the initial version-pinned read to the generated loopback fixture.
+  writeFileSync(join(bundleDir, 'nntune_ingest.js'), `
+    exports.qualify_disposable_version = async (endpoint, region, scopeJson) => {
+      const scope = JSON.parse(scopeJson);
+      const url = new URL('/' + scope.bucket + '/media/00000000000040008000000000000000/'
+        + scope.generation + '?versionId=' + encodeURIComponent(scope.version), endpoint);
+      const response = await fetch(new Request(url, { method: 'HEAD' }));
+      return response.ok ? 'qualified' : 'unconfirmed';
+    };
+  `);
+  const reads = new EventEmitter();
+  const server = createServer({ key: readFileSync(process.env.S3_FIXTURE_KEY),
+    cert: readFileSync(process.env.NODE_EXTRA_CA_CERTS) }, (socket) => {
+    socket.on('error', () => {});
+    let request = '';
+    socket.on('data', (chunk) => {
+      request += chunk;
+      if (request.endsWith('\r\n\r\n')) reads.emit('head', request.split('\r\n')[0], socket);
+    });
+  });
+  server.listen(0, '::1');
+  await once(server, 'listening');
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const origin = `https://[::1]:${server.address().port}`;
+  const scopeFor = (generation) => JSON.stringify({
+    bucket, endpoint: origin, region, generation, version, sibling_version: sibling,
+  });
+  const probe = (scope) => shell('Run the bound disposable provider probe', {
+    RUNNER_TEMP: scratch, NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS,
+    PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: origin,
+    PRIVATE_PLAYBACK_STAGING_S3_REGION: region,
+    PRIVATE_TRIAL_PREFLIGHT_PROVIDER_MATCH: 'true',
+    PRIVATE_TRIAL_PREFLIGHT_SCOPE: scope,
+    PRIVATE_TRIAL_PREFLIGHT_SCOPE_SHA256: sha256(scope),
+    PRIVATE_TRIAL_PREFLIGHT_S3: JSON.stringify(credential),
+  });
+  const summary = async (outcome) => {
+    const summaryPath = join(scratch, `summary-${outcome}`);
+    await shell('Report provider preflight outcome', { PROBE_OUTCOME: outcome, GITHUB_STEP_SUMMARY: summaryPath });
+    return readFileSync(summaryPath, 'utf8');
+  };
+
+  const interrupted = probe(scopeFor(generation));
+  const checkedInterruption = assert.rejects(interrupted, { signal: 'SIGTERM', stdout: '', stderr: '' });
+  const [firstRead] = await once(reads, 'head', { signal: AbortSignal.timeout(5000) });
+  interrupted.child.kill('SIGTERM');
+  await checkedInterruption;
+  assert.equal(firstRead, `HEAD ${path}?${queryFor(version)} HTTP/1.1`);
+  for (const outcome of ['failure', 'cancelled', 'skipped']) {
+    assert.equal(await summary(outcome), 'Private staging fixture provider preflight: incomplete.\n');
+  }
+
+  const freshGeneration = 'edededededed40ed80ededededededed';
+  const freshScope = scopeFor(freshGeneration);
+  const reviewedSha = 'a'.repeat(40);
+  await shell('Admit the reviewed dispatch', {
+    REVIEWED_REF: reviewedSha, GITHUB_SHA: reviewedSha, SCOPE_SHA256: sha256(freshScope),
+  });
+  const retry = probe(freshScope);
+  const [retryRead, socket] = await once(reads, 'head', { signal: AbortSignal.timeout(5000) });
+  socket.end('HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n');
+  const { stdout } = await retry;
+  assert.equal(retryRead, `HEAD ${path.replace(generation, freshGeneration)}?${queryFor(version)} HTTP/1.1`);
+  assert.match(stdout, /^Private staging fixture provider preflight: qualified\./);
+  assert.equal(await summary('success'), 'Private staging fixture provider preflight: qualified.\n');
 });
 
 test('the hosted entry refuses provider-setting drift and scope mismatches before loading the bundle', () => {
