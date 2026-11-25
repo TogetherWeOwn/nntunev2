@@ -126,6 +126,12 @@ def protected_steps():
     record, upload = qualify.split("\n      - name: Upload candidate admission receipt\n")
     assert upload.count("          path:") == 1 and "          path: staging-admission.json\n" in upload
     assert "retention-days: 7" in upload and "${{ github.run_attempt }}-private-music" in upload
+    opening = qualify.split("\n      - name: Observe opening private staging deployments\n", 1)[1]
+    opening, listening = opening.split("\n      - name: Qualify private listening\n", 1)
+    listening, _ = listening.split("\n      - name: Summarize private music contract enrollment review evidence\n", 1)
+    assert 'private_staging_evidence.py observe > "$RUNNER_TEMP/build-identity.json"' in opening
+    assert not re.search(r"^        (if|continue-on-error):", opening, re.M)
+    assert not re.search(r"^        if:", listening, re.M)
     review = qualify.split("\n      - name: Summarize private music contract enrollment review evidence\n", 1)[1]
     review, _ = review.split("\n      - name: Observe closing private staging deployments\n", 1)
     assert qualify.index("      - name: Qualify private listening\n") < qualify.index(
@@ -177,6 +183,38 @@ def capture_pins(root, env):
             write(root, stream_file, json.dumps(stream | invalid_stream).encode())
             require_refusal(lambda: evidence.main("stream"), "Stream captured an unarmed or wrong-Worker identity")
     return {f"{lane.upper()}_PIN": json.dumps(pin) for lane, pin in pins.items()}
+
+
+def check_opening_deployments(root, env):
+    opening = root / "build-identity.json"
+    current = provider_response(DEPLOYMENT)
+    previous_api = provider_response(
+        "44444444-4444-4444-8444-444444444444", version="55555555-5555-4555-8555-555555555555",
+    )
+    web, api, stream = (call(f"nntune-{lane}-staging") for lane in evidence.LANES)
+    with patch.dict(os.environ, env, clear=True), patch.object(evidence, "provider") as provider:
+        read = provider.return_value
+        read.side_effect = [current, previous_api]
+        with opening.open("w") as output:
+            try:
+                json.dump(evidence.main("observe"), output)
+            except evidence.identity.Unavailable as error:
+                assert str(error) == "deployed-version-mismatch"
+            else:
+                raise AssertionError("opening observation accepted the previous API version")
+        assert read.call_args_list == [web, api]
+        assert opening.read_bytes() == b"", "refused opening wrote partial deployment evidence"
+
+        read.reset_mock()
+        read.side_effect = [current, current, current]
+        with opening.open("w") as output:
+            json.dump(evidence.main("observe"), output)
+        assert read.call_args_list == [web, api, stream]
+        observed = json.loads(opening.read_bytes())
+        assert observed.keys() == {f"staging-{lane}" for lane in evidence.LANES}
+        for lane in evidence.LANES:
+            pin = json.loads(env[f"{lane.upper()}_PIN"])
+            assert all(observed[f"staging-{lane}"][field] == pin[field] for field in evidence.PIN_FIELDS)
 
 
 def check_review(report, summary, run, command, env):
@@ -264,6 +302,7 @@ def run_fixture(root):
     summary = root / "review-summary.md"
     env["GITHUB_STEP_SUMMARY"] = str(summary)
     env.update(capture_pins(root, env))
+    check_opening_deployments(root, env)
 
     def run(args, env_overrides=None):
         process = subprocess.run(args, cwd=root, env=env | (env_overrides or {}), capture_output=True, timeout=15)
@@ -295,9 +334,8 @@ def run_fixture(root):
     with patch.dict(os.environ, env, clear=True), patch.object(evidence, "provider") as provider:
         reader = provider.return_value
         reader.return_value = provider_response(DEPLOYMENT)
-        for phase in admission.IDENTITY_PHASES:
-            write(root, f"{phase}.json", json.dumps(evidence.main("observe")).encode())
-        assert reader.call_count == 6
+        closing.write_text(json.dumps(evidence.main("observe")))
+        assert reader.call_count == 3
         matching_closing = closing.read_bytes()
         reader.return_value = provider_response(VERSION)
         require_refusal(lambda: evidence.main("observe"), "drifted provider deployment accepted")
