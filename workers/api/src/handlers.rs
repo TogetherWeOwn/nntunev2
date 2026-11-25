@@ -8182,8 +8182,9 @@ where
 /// Serialized purchase attempt (single flight): reuse the open Checkout
 /// Session while open, else create under the converged operation id. No
 /// user-facing route in this slice — the wiring card's routes call this.
-/// `test_clock` is the staging-proof seam (customer creation only, never
-/// a clock the worker manages).
+/// `test_clock` is the staging rehearsal seam. It requires paid dispatch
+/// off, a test key, and a fresh account and checkout flight. The caller
+/// owns the clock and any cleanup if preparation is interrupted.
 ///
 /// `Unavailable` means the price is not a selectable test-mode mapping
 /// (or the binding is otherwise inconsistent), the account already holds
@@ -8385,6 +8386,18 @@ where
         .load_reconcile_input(user_id, None)
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
+    if test_clock.is_some()
+        && (ctx.cfg.paid_invite_billing
+            || !ctx
+                .cfg
+                .stripe_secret_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("sk_test_") || key.starts_with("rk_test_"))
+            || input.stripe_customer_id.is_some()
+            || input.live.is_some())
+    {
+        return Err(EnsureCheckoutError::Unavailable);
+    }
     // Plan ids come only from `plan_prices`: an unmapped, unselectable,
     // or live-mode price disables the purchase (alert, no Stripe call),
     // it never mints a guess.
@@ -8427,6 +8440,9 @@ where
         .await
         .map_err(|_| EnsureCheckoutError::Failed)?;
     if let Some(mut op) = open {
+        if test_clock.is_some() {
+            return Err(EnsureCheckoutError::Unavailable);
+        }
         if ctx.cfg.paid_billing_enabled()
             && (op.price_id.is_none() || (op.session_id.is_none() && !op.replayable))
         {
@@ -8552,6 +8568,19 @@ where
                         })
                         .await
                         .map_err(|_| EnsureCheckoutError::Failed)?;
+                    if let Some(clock) = test_clock {
+                        if created.livemode
+                            || created.test_clock.as_deref() != Some(clock)
+                            || ctx
+                                .store
+                                .user_for_stripe_customer(&created.id)
+                                .await
+                                .map_err(|_| EnsureCheckoutError::Failed)?
+                                .is_some()
+                        {
+                            return Err(EnsureCheckoutError::Unavailable);
+                        }
+                    }
                     minted_customer = Some(created.id.clone());
                     created.id
                 }
@@ -8562,6 +8591,14 @@ where
             .create_checkout_operation(&operation_id, user_id, price_id, Some(&customer_id))
             .await
             .map_err(|_| EnsureCheckoutError::Failed)?;
+        if test_clock.is_some()
+            && !matches!(
+                &outcome,
+                crate::billing_reconcile::CreateOpOutcome::Created(_)
+            )
+        {
+            return Err(EnsureCheckoutError::Unavailable);
+        }
         let converged = outcome.op();
         if ctx.cfg.paid_billing_enabled() && (converged.price_id.is_none() || !converged.replayable)
         {
@@ -8624,13 +8661,16 @@ where
         // unbound minted its own orphan customer before the insert, and the
         // pre-insert snapshot still names nothing. Re-read the binding — the
         // payable session must sit on the bound customer.
-        let customer_id =
+        let bound_customer =
             converged_session_customer(ctx, user_id, snapshot_customer.clone(), customer_id)
                 .await?;
+        if test_clock.is_some() && minted_customer.as_deref() != Some(bound_customer.as_str()) {
+            return Err(EnsureCheckoutError::Unavailable);
+        }
         return create_session_under(
             ctx,
             &converged.id,
-            &customer_id,
+            &bound_customer,
             price_id,
             success_url,
             cancel_url,
@@ -9185,6 +9225,10 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context as TaskContext, Poll, Waker};
 
+    mod paid_invite_clock {
+        include!("paid_invite_clock_tests.rs");
+    }
+
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     mod private_playlist_postgres {
         include!("private_playlists_postgres_tests.rs");
@@ -9409,6 +9453,8 @@ pub(crate) mod tests {
         /// and its insert. The attempt must converge onto (and, on a price
         /// mismatch, deliberately replace) the winner.
         plant_winner_on_next_create: RefCell<Option<crate::billing_reconcile::StoredCheckoutOp>>,
+        /// Binding that lands after the checkout snapshot and before its insert.
+        plant_customer_on_next_create: std::cell::Cell<Option<&'static str>>,
         /// Paid-invoice history by Stripe invoice id (idempotent on the id,
         /// mirroring `paid_invoice_history`).
         invoice_history: RefCell<HashMap<String, crate::billing_reconcile::PaidInvoiceRow>>,
@@ -12069,6 +12115,11 @@ pub(crate) mod tests {
             if *self.fail_billing.borrow() {
                 return Err(StoreError);
             }
+            if let Some(customer) = self.plant_customer_on_next_create.take() {
+                self.billing_customers
+                    .borrow_mut()
+                    .insert(user_id.to_string(), customer.to_string());
+            }
             // Race pin: land the winner between the caller's open-flight
             // read and this insert (consumed once).
             if let Some(winner) = self.plant_winner_on_next_create.borrow_mut().take() {
@@ -12594,6 +12645,7 @@ pub(crate) mod tests {
         fail: RefCell<HashSet<String>>,
         /// Next customer id minted by `create_customer`.
         next_customer: RefCell<Option<String>>,
+        customer_reply: std::cell::Cell<Option<(bool, Option<&'static str>)>>,
     }
 
     impl FakeStripe {
@@ -12643,10 +12695,16 @@ pub(crate) mod tests {
                     .borrow()
                     .clone()
                     .unwrap_or_else(|| "cus_test_1".to_string());
+                let (livemode, test_clock) = self
+                    .customer_reply
+                    .take()
+                    .map_or((false, req.test_clock), |(live, clock)| {
+                        (live, clock.map(str::to_string))
+                    });
                 Ok(crate::stripe::Customer {
                     id,
-                    livemode: false,
-                    test_clock: req.test_clock,
+                    livemode,
+                    test_clock,
                     email: None,
                 })
             })
@@ -13144,6 +13202,20 @@ pub(crate) mod tests {
             "type": "checkout.session.completed",
             "livemode": livemode,
             "data": {"object": {"id": session_id}},
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn paid_invite_event_body(
+        id: &str,
+        kind: &str,
+        now: i64,
+        object: serde_json::Value,
+    ) -> Vec<u8> {
+        serde_json::json!({
+            "id": id, "object": "event", "api_version": "2024-12-18.acacia",
+            "created": now, "type": kind, "livemode": false, "data": {"object": object},
         })
         .to_string()
         .into_bytes()
@@ -13951,14 +14023,6 @@ pub(crate) mod tests {
             .sessions
             .borrow_mut()
             .insert(session_id.into(), session);
-        let event_body = |id: &str, kind: &str, now, object: Value| {
-            json!({
-                "id": id, "object": "event", "api_version": "2024-12-18.acacia",
-                "created": now, "type": kind, "livemode": false, "data": {"object": object},
-            })
-            .to_string()
-            .into_bytes()
-        };
         let signed = |now: i64, body: &[u8]| {
             call_at(
                 now as u64,
@@ -13969,7 +14033,7 @@ pub(crate) mod tests {
                 Some(sign(body, now)),
             )
         };
-        let completed = event_body(
+        let completed = paid_invite_event_body(
             "evt_paid_signup",
             "checkout.session.completed",
             BILLING_NOW,
@@ -14079,7 +14143,7 @@ pub(crate) mod tests {
         let second_end = first_end + BILLING_PERIOD;
         stripe_period("in_test_2", first_end, second_end);
         assert_period(first_end, 1);
-        let renewal = event_body(
+        let renewal = paid_invite_event_body(
             "evt_paid_renewal",
             "invoice.paid",
             first_end,
@@ -14124,7 +14188,7 @@ pub(crate) mod tests {
             .get_mut(subscription_id)
             .unwrap()
             .cancel_at_period_end = true;
-        let update = event_body(
+        let update = paid_invite_event_body(
             "evt_paid_cancel",
             "customer.subscription.updated",
             sweep.now as i64 + 1,

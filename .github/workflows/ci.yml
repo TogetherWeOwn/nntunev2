@@ -657,6 +657,8 @@ jobs:
           persist-credentials: false
       - name: Exercise paid invite staging runner on disposable loopback
         run: python3 -B .github/scripts/test_paid_invite_acceptance.py -v
+      - name: Rehearse paid invite clock readback on disposable loopback
+        run: python3 -B .github/scripts/test_paid_invite_clock.py -v
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy --target wasm32-unknown-unknown
