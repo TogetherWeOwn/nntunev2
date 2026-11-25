@@ -363,6 +363,38 @@ If a partial upload has no matching completed publication, stop and hand it to
 77c for reconciliation through the reviewed upload path. The selected-fixture
 retirement path requires a matching completed publication.
 
+### Offline exercise for a stopped journey
+
+Use the placeholder receipts below at a tabletop exercise. Tone A was written,
+then `Qualify private listening` stopped before the normal handoff. Use the
+recorded Actions links and the protected fixture record to prepare the cleanup
+handoff on paper.
+
+| Receipt | Placeholder record |
+| --- | --- |
+| Trial record | `<trial-run-url>`, attempt `1`, `<trial-build-sha>`, `<journey-job-url>` |
+| Actions metadata | The recorded `deploy.yml` run is a `main` push on `<trial-build-sha>`. In attempt `1`, `Require this run's API and Stream deployment` passed and `post-deploy private music journey` was cancelled in `Qualify private listening`. The same run also lists a rerun as attempt `2`. |
+| Protected tone A record | The selected upload session and job match a completed publication and its canonical track and object. The original media and digest-page version pins match `<tone-a-scope-ref>`, with approved hash `<tone-a-scope-sha256>`. |
+| Containment record | `<disable-run-url>` has the verified disabled API and Stream pins. The session is revoked, the cohort cleared and armed runs drained. The cutoff, retention and lease windows have elapsed. |
+
+1. Match the recorded run, attempt, job and commit against the Actions
+   metadata. Stop if they disagree. Keep the stopped verdict on attempt `1`
+   even though attempt `2` shares its run ID and commit. `Record candidate
+   admission receipt` follows successful qualification and did not run for
+   attempt `1`. Use the protected fixture record to establish cleanup scope.
+2. Match the tone A session, job, completed publication and both version
+   pins to the original protected scope. If that match is ambiguous or the
+   publication is incomplete, stop at reconciliation. Keep the companion
+   fixture under its separate disposition.
+3. On paper, give the cleanup operator the stopped trial run and job links,
+   the original scope reference and hash, and the verified disable run and
+   containment reference. The operator checks the separately authorized access
+   and pins in the [protected cleanup instructions](#protected-cleanup-dispatch).
+   The expected next action is a fresh protected `deploy.yml` dispatch with
+   `private_trial_cleanup_scope_sha256` for the job `Retire the selected private
+   staging fixture`. Record the planned cleanup separately from the stopped
+   journey. End the exercise before dispatch.
+
 ## Stage C2 Hyperdrive origin connection
 
 **Setup pending.** The dedicated PostgreSQL trial uses four distinct Hyperdrive
