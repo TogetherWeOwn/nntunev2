@@ -13,10 +13,15 @@ const UNREADABLE: &[u8] = br#"<subsonic-response status="failed" version="1.16.1
 const UNSUPPORTED_ROUTE: &[u8] = br#"<subsonic-response status="failed" version="1.16.1"><error code="70" message="Endpoint not supported in staging."/></subsonic-response>"#;
 const INVALID_CALLBACK: &[u8] = br#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":10,"message":"Required parameter is missing."}}}"#;
 
-fn build_response(status: u16, content_type: &str, bytes: Vec<u8>) -> WorkerResult<Response> {
+fn document_headers(content_type: &str) -> WorkerResult<Headers> {
     let headers = Headers::new();
     headers.set("Content-Type", content_type)?;
     headers.set("Cache-Control", "private, no-store")?;
+    Ok(headers)
+}
+
+fn build_response(status: u16, content_type: &str, bytes: Vec<u8>) -> WorkerResult<Response> {
+    let headers = document_headers(content_type)?;
     Ok(Response::from_bytes(bytes)?
         .with_status(status)
         .with_headers(headers))
@@ -45,6 +50,36 @@ pub fn finish_document(
     }
 }
 
+/// Probe only the owned payload and the pinned SDK's typed-array copy. EOF
+/// or cancellation here says nothing about downstream transport retention.
+#[cfg(feature = "staging-body-wasm-test")]
+pub fn finish_streamed_document(
+    document: Result<StagingDocument, DocumentError>,
+    budget: &mut nntune_subsonic::construction_budget::ConstructionBudget,
+    permit: nntune_subsonic::construction_permit::ConstructionPermit<'static>,
+) -> WorkerResult<Response> {
+    let doc = match document {
+        Ok(doc) => doc,
+        Err(error) => return finish_document(Err(error)),
+    };
+    if budget.charge_payload_bytes(doc.bytes.len()).is_err() {
+        let format = if doc.content_type == XML_CONTENT_TYPE {
+            RejectionFormat::Xml
+        } else {
+            RejectionFormat::Json
+        };
+        return respond_fixed_rejection(StagingRejection::BusyOrCapacity, format);
+    }
+    let headers = document_headers(doc.content_type)?;
+    // The pinned SDK pulls one Uint8Array on demand. Keep the same permit
+    // after yielding the chunk until the next pull asks for EOF or cancels.
+    let body =
+        futures_util::stream::unfold((Some(doc.bytes), permit), |(bytes, permit)| async move {
+            bytes.map(|bytes| (Ok::<_, worker::Error>(bytes), (None, permit)))
+        });
+    Ok(Response::from_stream(body)?.with_headers(headers))
+}
+
 /// Fixed 413/503 responses have no request text, even on a JSONP request.
 /// Use the default XML format unless a supported selector is already safe.
 pub fn respond_fixed_rejection(
@@ -52,9 +87,7 @@ pub fn respond_fixed_rejection(
     format: RejectionFormat,
 ) -> WorkerResult<Response> {
     let fixed = fixed_staging_rejection(reason, format);
-    let headers = Headers::new();
-    headers.set("Content-Type", fixed.content_type)?;
-    headers.set("Cache-Control", "private, no-store")?;
+    let headers = document_headers(fixed.content_type)?;
     if let Some(retry_after) = fixed.retry_after {
         headers.set("Retry-After", retry_after)?;
     }
