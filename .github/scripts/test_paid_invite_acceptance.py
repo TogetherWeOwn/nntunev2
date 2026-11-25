@@ -150,6 +150,17 @@ class AcceptanceTest(unittest.TestCase):
         self.run_case("missing_evidence")
         self.assertEqual(self.connected, [])
 
+    def test_finish_requires_invoice_history_even_with_paid_checkout(self):
+        # An incomplete invoice comparison leaves this attestation absent.
+        self.evidence["checks"].pop("invoice_history", None)
+        self.run_case("missing_evidence")
+        self.assertEqual(self.connected, [])
+
+        # A complete comparison attests the same build for the same paid fixture.
+        self.evidence["checks"]["invoice_history"] = SHA
+        self.run_case("accepted")
+        self.assertIn(f"/v1/checkout/sessions/{SESSION}", [path for path, _ in self.requests])
+
     def test_redirect_and_denied_access_stop_without_following(self):
         for status in (302, 401, 403):
             with self.subTest(status=status):
