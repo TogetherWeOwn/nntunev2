@@ -241,29 +241,33 @@ pub(super) async fn exercise(
         )
         .await
         .unwrap();
-    let first_append = route(ctx, &owner, &mut peer, Append(first_id, track.to_owned()));
-    tokio::pin!(first_append);
-    let late_remove = remove_membership(&mut remover, RECIPIENT, &active, track);
-    tokio::pin!(late_remove);
+    let appended_first = {
+        let first_append = route(ctx, &owner, &mut peer, Append(first_id, track.to_owned()));
+        tokio::pin!(first_append);
+        let late_remove = remove_membership(&mut remover, RECIPIENT, &active, track);
+        tokio::pin!(late_remove);
 
-    // Give both observations one deadline within the database lock timeout.
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        blocker::observe_blocked(db, track_locker_pid, append_pid, first_append.as_mut()).await?;
-        blocker::observe_blocked(db, append_pid, removal_pid, late_remove.as_mut()).await
-    })
-    .await
-    .expect("append and removal lock chain was not observed in time")
-    .unwrap();
-    track_lock.commit().await.unwrap();
-    let appended_first = body(first_append.await, 201);
-    assert_eq!(appended_first["position"], 0);
-    // The removal future has yet to send COMMIT, so readers still see membership.
-    let before_removal = body(route(ctx, &owner, db, Read(first_id)).await, 200);
-    assert_eq!(
-        before_removal["entries"],
-        json!([{"id": appended_first["id"], "position": 0, "track_id": track}])
-    );
-    assert_eq!(late_remove.await, 1);
+        // Give both observations one deadline within the database lock timeout.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            blocker::observe_blocked(db, track_locker_pid, append_pid, first_append.as_mut())
+                .await?;
+            blocker::observe_blocked(db, append_pid, removal_pid, late_remove.as_mut()).await
+        })
+        .await
+        .expect("append and removal lock chain was not observed in time")
+        .unwrap();
+        track_lock.commit().await.unwrap();
+        let appended = body(first_append.await, 201);
+        assert_eq!(appended["position"], 0);
+        // The removal future has yet to send COMMIT, so readers still see membership.
+        let before_removal = body(route(ctx, &owner, db, Read(first_id)).await, 200);
+        assert_eq!(
+            before_removal["entries"],
+            json!([{"id": appended["id"], "position": 0, "track_id": track}])
+        );
+        assert_eq!(late_remove.await, 1);
+        appended
+    };
 
     assert_eq!(remove_membership(db, RECIPIENT, &active, track).await, 0);
     assert_denied(route(ctx, &owner, db, Append(first_id, track.to_owned())).await);
@@ -296,6 +300,52 @@ pub(super) async fn exercise(
         .await
         .unwrap();
     assert!(sibling_survived);
+
+    // A known track can also be added to a different owned playlist. Queue
+    // that add behind a sibling append, then remove its last owned membership
+    // while the add is still waiting for the playlist lock.
+    seed_membership(db, &active, track).await;
+    let target = body(
+        route(ctx, &owner, db, Create("Queued add".into())).await,
+        201,
+    );
+    let target_id = target["id"].as_str().unwrap();
+    let add_existing = || Append(target_id, track.to_owned());
+    assert_denied(route(ctx, &foreign, db, add_existing()).await);
+
+    let sibling_lock = track_locker.transaction().await.unwrap();
+    sibling_lock
+        .query_one(
+            "SELECT id FROM public.tracks WHERE id = $1::text::uuid FOR UPDATE",
+            &[&sibling],
+        )
+        .await
+        .unwrap();
+    let sibling_append = route(ctx, &owner, &mut peer, Append(target_id, sibling.clone()));
+    tokio::pin!(sibling_append);
+    let queued_add = route(ctx, &owner, &mut remover, add_existing());
+    tokio::pin!(queued_add);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        blocker::observe_blocked(db, track_locker_pid, append_pid, sibling_append.as_mut()).await?;
+        blocker::observe_blocked(db, append_pid, removal_pid, queued_add.as_mut()).await
+    })
+    .await
+    .expect("two appends did not queue in time")
+    .unwrap();
+    assert_eq!(remove_membership(db, RECIPIENT, &active, track).await, 1);
+    sibling_lock.commit().await.unwrap();
+    let sibling_entry = body(sibling_append.await, 201);
+    assert_eq!(sibling_entry["position"], 0);
+    assert_denied(queued_add.await);
+    assert_denied(route(ctx, &owner, db, add_existing()).await);
+    assert_eq!(
+        body(route(ctx, &owner, db, Read(target_id)).await, 200)["entries"],
+        json!([{"id": sibling_entry["id"], "position": 0, "track_id": sibling}])
+    );
+    assert_eq!(
+        body(route(ctx, &owner, db, Read(first_id)).await, 200),
+        dormant
+    );
 
     let deleted = body(route(ctx, &owner, db, Delete(playlist)).await, 202);
     assert!(deleted["operation_id"].is_string());
