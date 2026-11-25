@@ -54,8 +54,10 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    staging MusicBrainz binding, API–Stream service bindings, dedicated fixture
    bucket and matching storage configuration and root versions. Confirm a
    protected, reviewed runner can retire the selected fixture and confirm exact
-   version absence using separate, scoped cleanup access. Record a separate
-   reuse or retirement disposition for the prepublished companion and its trial
+   version absence using separate, scoped cleanup access. Record the assigned
+   cleanup owner and authority evidence in the
+   [sign-off check](#check-cleanup-sign-off). Record a separate reuse or
+   retirement disposition for the prepublished companion and its trial
    admission. Stop if any binding, identity or cleanup path is missing.
    Before arming, confirm a reviewed drill entry point can use an authorized
    synthetic session after companion admission and before cutoff. Confirm the
@@ -108,6 +110,7 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    source row removed. Stop on a refusal, shared reference or ambiguous readback.
    For a partial delete or unconfirmed cleanup commit, resume using the same
    pins and confirm both versions, including any version already absent.
+   Apply the [sign-off check](#check-cleanup-sign-off) before closing the record.
    Handle tone B and its admission through the separate fixture disposition.
 2. **Withdraw access.** Once the trial operator removes the bindings, dispatch
    `fence` and `retire` using the original scope and the reviewed isolated
@@ -119,6 +122,33 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    from custody and withdraw any temporary executor grants through their original
    grantor. If withdrawal refuses, reconcile with the grant owner while both
    logins stay fenced.
+
+### Check cleanup sign-off
+
+Use this offline exercise for one disposable synthetic trial. The placeholders
+refer to evidence in the same protected trial record.
+
+| Evidence | What to check |
+| --- | --- |
+| `<cleanup-owner-ref>` | Before arming, identify the assigned cleanup owner and verify the separate cleanup authority for this trial. Match the direct database host, port, role and role OID and its reviewed grants to the isolated target. Match the cleanup credential to the two fixture keys and the effective policy readback for the reviewed storage route. |
+| `<fixture-receipt-ref>` and `<scope-ref>` | Link the passing `post-deploy private music journey` job to its recorded run, attempt and build. Match the completed tone A publication and storage receipt to the fixture and provider pins in `PRIVATE_TRIAL_CLEANUP_SCOPE`, including the object, generation, `media_version` and `page_version`. Check that the scope carries the verified cleanup identity pins. |
+| `<cleanup-run-ref>` | Link the successful `Retire the selected private staging fixture` job and its `Retire the selected tone A versions once` step in attempt 1 of the recorded [protected cleanup dispatch](#protected-cleanup-dispatch). Require `Private staging fixture cleanup: confirmed` and match that run's `private_trial_cleanup_scope_sha256` input to the SHA-256 of the exact retained UTF-8 scope bytes. |
+
+For the [SeaweedFS route](../../ops/staging-s3-boundary/README.md#render-the-credentials-policy),
+verify the managed policy and attachment and compare the mounted Caddyfile
+digest with the reviewed render for the cleanup credential. The [provider-only
+preflight](#provider-only-preflight) uses a separate disposable credential and
+supplies qualification evidence. Sign-off requires the cleanup dispatch for
+the completed fixture above.
+
+Mark this fixture's cleanup **Confirmed** only when all three checks pass. In
+the exercise, remove the owner assignment or the exact cleanup run receipt.
+Each leaves sign-off **Pending**. A `confirmed` line from a dispatch with a
+different scope digest, or a scope whose media or page version differs from
+the original receipt, also leaves it **Pending**.
+If setup evidence is missing before arming, keep the trial disarmed. At
+closeout, retain the original pins and use the existing reconciliation path
+before clearing the cleanup settings or withdrawing cleanup access.
 
 ### Isolated database catalog preflight
 
