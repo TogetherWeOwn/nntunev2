@@ -72,7 +72,7 @@ until their evidence is available.
    release only with a reviewed staging window that supports admission and
    timely cleanup. Otherwise perform cleanup and leave promotion blocked.
    [Trial cleanup](../e2e/README.md#private-music-journey-preparation)
-   For an expired, unpublished or mismatched receipt, use the
+   For an unusable receipt, use the
    [receipt recovery handoff](#synthetic-handoff-for-an-unusable-receipt).
 4. Quiesce launch writes and schema/grant changes. Use the
    [protected read-only database baseline](production-database-bootstrap.md#protected-baseline)
@@ -126,7 +126,7 @@ verdict Pending. In each case, record **Staging admission** as Pending and
 | Receipt failure | What to record and do |
 | --- | --- |
 | Expired evidence | Record that the selected attempt's artifact expired, even if its journey job passed. Qualify a replacement attempt. |
-| Interrupted upload | Record where the attempt stopped. If receipt recording completed but the upload failed and the matching artifact did not publish, qualify a replacement attempt. |
+| Interrupted recording or upload | Record where the attempt stopped. If the run, private journey job, receipt recording or upload ended without success, qualify a replacement attempt even if Actions lists a matching artifact. |
 | SHA-256 mismatch | Record the verifier refusal when the downloaded ZIP differs from the Actions digest. Repeat qualification step 3 through the authorized Actions read path if the same artifact and attempt are still eligible. If the mismatch persists or the evidence is no longer eligible, qualify a replacement attempt. |
 
 Keep scheduled [trial cleanup](ops/private-staging-trial.md#retire-and-recover)
@@ -136,6 +136,7 @@ Repeat [qualification steps 1–3](#qualify-the-candidate) for the pinned SHA in
 one complete protected main-push `deploy.yml` attempt. For an eligible rerun,
 use **Re-run all jobs** and check the original workflow's compatibility with
 the [staging deploy lock](ops.md#staging-deploy-lock-cutover-and-rollback).
+[Select the replacement receipt by attempt](#offline-handoff-example-after-a-rerun).
 If a fresh protected push changes the SHA, review and pin that build first.
 Keep the original evidence under its own attempt. Record the selected run,
 attempt and artifact digest when the verifier emits matching staging pins.
