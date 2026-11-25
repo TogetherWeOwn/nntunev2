@@ -50,14 +50,18 @@ async function openInvitedQueue(page: Page, origin: string) {
 		expect(grant.status()).toBe(200);
 		const receipt = fixture.mediaPath(playing.id);
 		await expect(audio).toHaveAttribute('src', receipt);
-		await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => !node.paused && node.currentTime > 0.2)).toBe(true);
+		// Stretch the 14-second fixture beyond Playwright's 30-second test budget.
+		await audio.evaluate((node: HTMLAudioElement) => { node.playbackRate = 0.25; });
+		await expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
+			!node.paused && node.readyState >= node.HAVE_FUTURE_DATA && node.currentTime > 0.2
+		)).toBe(true);
 
 		const playback = await audio.evaluateHandle((node: HTMLAudioElement) => {
 			const interruptions: string[] = [];
-			for (const type of ['pause', 'emptied', 'loadstart', 'seeking', 'ended', 'error']) {
+			for (const type of ['pause', 'waiting', 'emptied', 'loadstart', 'seeking', 'ended', 'error']) {
 				node.addEventListener(type, () => interruptions.push(type));
 			}
-			return { node, position: node.currentTime, interruptions };
+			return { node, interruptions };
 		});
 		const tab = grant.request().postDataJSON().session_id;
 
@@ -65,12 +69,14 @@ async function openInvitedQueue(page: Page, origin: string) {
 			await expect(current).toHaveAttribute(player.queueId, playing.id);
 			await expect(transport.getByTestId('library-now-playing')).toHaveText(playing.title);
 			await expect(audio).toHaveAttribute('src', receipt);
-			await expect.poll(() => playback.evaluate(({ node, position, interruptions }) => ({
+			const positionAfterEdit = await playback.evaluate(({ node }) => node.currentTime);
+			await expect.poll(() => playback.evaluate(({ node, interruptions }, position) => ({
 				connected: node.isConnected,
 				source: node.currentSrc,
-				advancing: !node.paused && !node.ended && !node.error && node.currentTime > position + 0.1,
+				advancing: !node.paused && !node.ended && !node.error &&
+					node.readyState >= node.HAVE_FUTURE_DATA && node.currentTime > position + 0.1,
 				interruptions
-			})), 'the original private audio keeps advancing without interruption').toEqual({
+			}), positionAfterEdit), 'the original private audio keeps advancing after the edit').toEqual({
 				connected: true, source: origin + receipt, advancing: true, interruptions: []
 			});
 			expect(grants.map((request) => request.postDataJSON())).toEqual([{ track_id: playing.id, session_id: tab }]);
