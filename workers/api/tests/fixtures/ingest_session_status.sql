@@ -71,4 +71,56 @@ BEGIN
         RAISE EXCEPTION 'status returned the wrong recorded abort or changed the reservation';
     END IF;
 END $$;
+
+DO $$
+DECLARE
+    f digest_lookup_fixture;
+    owner CONSTANT text := 'session-owner';
+    past CONSTANT timestamptz := statement_timestamp() - interval '1 hour';
+    future CONSTANT timestamptz := statement_timestamp() + interval '1 hour';
+    aborted_at CONSTANT timestamptz := past - interval '1 minute';
+    test_case record;
+    sid uuid;
+    observed record;
+    reservation_before public.ingest_session_reservations;
+    cleanup_before jsonb;
+BEGIN
+    SELECT * INTO STRICT f FROM digest_lookup_fixture WHERE n=1;
+    -- Checkpoint renewal caps idle_deadline at absolute_deadline. Match the
+    -- two elapsed cases on both deadlines so only the recorded abort wins.
+    FOR test_case IN SELECT * FROM (VALUES
+        ('active', future, NULL::text, NULL::timestamptz),
+        ('expired', past, NULL, NULL),
+        ('aborted', past, 'aborted', aborted_at)
+    ) AS cases (state, deadline, terminal_reason, terminal_at)
+    LOOP
+        sid := gen_random_uuid();
+        INSERT INTO public.ingest_session_reservations
+            (id, library_id, principal_id, idempotency_key, fingerprint,
+             idle_deadline, absolute_deadline, terminal_reason, terminal_at)
+        VALUES (sid, f.library_id, owner, 'status-capped-' || test_case.state,
+                decode(repeat('ef', 32), 'hex'), test_case.deadline, test_case.deadline,
+                test_case.terminal_reason, test_case.terminal_at)
+        RETURNING * INTO STRICT reservation_before;
+        INSERT INTO public.ingest_session_cleanup_intents (session_id, kind, due_at)
+        VALUES (sid, 'absolute_expiry', test_case.deadline);
+        IF test_case.terminal_reason IS NOT NULL THEN
+            INSERT INTO public.ingest_session_cleanup_intents (session_id, kind, due_at)
+            VALUES (sid, 'terminal_reconcile', test_case.terminal_at);
+        END IF;
+        SELECT jsonb_agg(intent ORDER BY intent.kind) INTO cleanup_before
+        FROM public.ingest_session_cleanup_intents AS intent WHERE session_id=sid;
+
+        SELECT * INTO STRICT observed FROM pg_temp.session_status(f.environment_id, f.library_id, owner, sid);
+        IF observed.state IS DISTINCT FROM test_case.state OR observed.expires_at IS DISTINCT FROM test_case.deadline THEN
+            RAISE EXCEPTION 'wrong capped-deadline status for expected state %', test_case.state;
+        END IF;
+        IF (SELECT session FROM public.ingest_session_reservations AS session WHERE id=sid)
+           IS DISTINCT FROM reservation_before OR
+           (SELECT jsonb_agg(intent ORDER BY intent.kind)
+            FROM public.ingest_session_cleanup_intents AS intent WHERE session_id=sid) IS DISTINCT FROM cleanup_before THEN
+            RAISE EXCEPTION 'capped-deadline status altered stored state for expected state %', test_case.state;
+        END IF;
+    END LOOP;
+END $$;
 \echo ingest session status fixture passed
