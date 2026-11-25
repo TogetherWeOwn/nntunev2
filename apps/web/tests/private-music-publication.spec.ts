@@ -21,6 +21,12 @@ test('fresh private publication reaches the invited Library and plays under its 
 	const row = (id: string) => rows.and(page.locator(`[data-id="${id}"]`));
 	const uploadMetadata = { title: 'Synthetic Copper Tone', artist: 'Synthetic Signal Lab', durationMs: 14_000 };
 	const companionTrack = { id: companionId, title: 'Queue companion', artist: 'Synthetic Queue Artist', duration_ms: 9_000 };
+	const grantUrl = origin + PRIVATE_MUSIC.player.plays;
+	const playbackRequests: string[] = [];
+	page.on('request', (request) => {
+		const url = request.url();
+		if (url === grantUrl || url.startsWith(`${grantUrl}/media/`)) playbackRequests.push(new URL(url).pathname);
+	});
 	let publishedTrack: typeof companionTrack | undefined;
 	let revoked = false;
 	const fixture = await mockInvitedLibraryPlayback(page, origin, {
@@ -88,6 +94,7 @@ test('fresh private publication reaches the invited Library and plays under its 
 	const active = page.locator(PRIVATE_MUSIC.player.currentQueueItem);
 	await expect(active).toHaveAttribute(PRIVATE_MUSIC.player.queueId, uploadedId);
 	await expect(audio).toHaveCount(0);
+	expect(playbackRequests, 'Playback requests before Play').toEqual([]);
 	await player.getByRole('button', { name: 'Play', exact: true }).click();
 	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => !el.paused && el.currentTime > 0.2)).toBe(true);
 	await expect(audio).toHaveAttribute('src', fixture.mediaPath(uploadedId));
