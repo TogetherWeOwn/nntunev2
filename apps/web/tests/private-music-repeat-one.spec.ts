@@ -94,9 +94,10 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 		const player = page.getByRole('region', { name: 'Player', exact: true });
 		const audio = page.getByTestId(contract.audio);
 		const queueIds = () => queue.evaluateAll((items, attr) => items.map((item) => item.getAttribute(attr)), contract.queueId);
-		const expectPlayingNearStart = () => expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
-			!node.paused && !node.ended && node.currentTime > 0.2 && node.currentTime < 3
-		)).toBe(true);
+		const expectPlayingNearStart = (path: string) => expect.poll(() => audio.evaluate((node: HTMLAudioElement, src) =>
+			node.currentSrc === src && !node.paused && !node.ended && node.currentTime > 0.2 && node.currentTime < 3,
+			origin + path
+		), 'private receipt audio plays near the start').toBe(true);
 
 		await page.goto(origin + library.path);
 		for (const { id } of [first, successor]) {
@@ -112,8 +113,7 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 		await player.getByRole('button', { name: 'Play', exact: true }).click();
 		const tab: string = (await firstGrant).postDataJSON().session_id;
 		const initialPath = pathFor(first.id, tab, 1);
-		await expect(audio).toHaveAttribute('src', initialPath);
-		await expectPlayingNearStart();
+		await expectPlayingNearStart(initialPath);
 
 		// Let Chromium play the fixture to completion at its normal speed.
 		const end = await audio.evaluate((node: HTMLAudioElement) => new Promise<{
@@ -127,12 +127,11 @@ test('invited Library playback opens a fresh receipt to repeat the current track
 		expect(end.duration).toBeCloseTo(14, 2);
 		expect(end.position).toBeCloseTo(end.duration, 2);
 
-		await expectPlayingNearStart();
 		await expect(active, 'natural completion keeps the first track selected').toHaveAttribute(contract.queueId, first.id);
 		await expect(player.getByTestId('library-now-playing')).toHaveText(first.title);
 		await expect.poll(queueIds).toEqual([first.id, successor.id]);
 		const replayPath = pathFor(first.id, tab, 2);
-		await expect(audio).toHaveAttribute('src', replayPath);
+		await expectPlayingNearStart(replayPath);
 		expect([...mediaRequests]).toEqual([initialPath, replayPath]);
 		// A repeat is a fresh start for the same tab, with no retry play ID.
 		expect(grants.map((request) => request.postDataJSON())).toEqual([
