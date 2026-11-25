@@ -161,7 +161,9 @@ def check_snapshot_readback():
     check("pre-migration capture before setup", record | {"review": migration | {"setup_completed_at": at + 1}})
     check("pre-migration capture at setup", record | {"review": migration | {"setup_completed_at": at}})
     check("duplicate record key", b'{"snapshot": null, ' + json.dumps(record).encode()[1:])
-    check("oversized record", b" " * 4096 + json.dumps(record).encode())
+    at_limit = json.dumps(record).encode().ljust(4096)
+    check("record at size limit", at_limit, accept=True)
+    check("record one byte over size limit", at_limit + b" ")
     check("malformed record", b"{")
 
 
