@@ -2300,6 +2300,8 @@ jobs:
       - name: Install locked upload CLI without lifecycle scripts
         working-directory: apps/web
         run: pnpm install --frozen-lockfile --ignore-scripts --config.minimumReleaseAge=4320
+      - name: Check the private trial cleanup report with synthetic receipts
+        run: node --test workers/api/tests/fixtures/private_trial_cleanup_report.cjs
       - name: Exercise the one-shot private trial cleanup Worker against disposable PostgreSQL and S3
         env:
           PRIVATE_TRIAL_CLEANUP_BUNDLE: ${{ runner.temp }}/trial-cleanup-fixture

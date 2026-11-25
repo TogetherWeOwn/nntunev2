@@ -44,7 +44,6 @@ test('private playback retries an interrupted seek from the requested position',
 	const fixture = await mockInvitedLibraryPlayback(page, origin, {
 		libraryItems: () => [track],
 		playableTrackId: (requested) => requested === track.id ? track.id : undefined,
-		playId,
 		audio: async (route) => {
 			const request = route.request();
 			const range = /^bytes=(\d+)-$/.exec(request.headers()['range'] ?? '');

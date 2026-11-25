@@ -171,6 +171,56 @@ test('uses the initialized upload ID, signed part receipt and completed version 
   ]);
 });
 
+test('resumes multipart upload with only the missing part and preserves the confirmed receipt', async (t) => {
+  const partBytes = 5_244_160;
+  const tailBytes = wireHeaderLength + Math.ceil(partBytes / 65_536) * 16;
+  const requests = [];
+  const stored = new Map();
+  let interrupted;
+  t.mock.method(globalThis, 'fetch', async (request) => {
+    const url = new URL(request.url);
+    const query = url.search.slice(1);
+    requests.push(`${request.method} ${query}`);
+    if (request.method === 'PUT') {
+      const number = Number(url.searchParams.get('partNumber'));
+      assert.ok(number === 1 || number === 2);
+      assert.equal(stored.has(number), false, 'a confirmed part must never be overwritten');
+      const body = await verifySignedRequest(request, 'PUT', `partNumber=${number}&${uploadQuery}`);
+      assert.equal(body.length, number === 1 ? partBytes : tailBytes);
+      if (number === 2 && !interrupted) {
+        assert.deepEqual([...stored.keys()], [1]);
+        interrupted = body;
+        throw new Error('synthetic interruption before storing part 2');
+      }
+      if (number === 2) {
+        assert.deepEqual(body, interrupted);
+      }
+      const receipt = { etag: `"fixture-part-${number}"`, 'x-amz-checksum-sha256': checksum(body) };
+      stored.set(number, receipt);
+      return new Response(null, { headers: receipt });
+    }
+    const manifest = (await verifySignedRequest(request, 'POST', uploadQuery)).toString();
+    assert.deepEqual([...stored.keys()], [1, 2]);
+    const entries = [...stored].map(([number, receipt]) =>
+      `<Part><PartNumber>${number}</PartNumber><ETag>&quot;${receipt.etag.slice(1, -1)}&quot;</ETag>`
+      + `<ChecksumSHA256>${receipt['x-amz-checksum-sha256']}</ChecksumSHA256></Part>`);
+    assert.equal(manifest, '<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+      + entries.join('') + '</CompleteMultipartUpload>');
+    const composite = checksum(Buffer.concat([...stored.values()].map(
+      (receipt) => Buffer.from(receipt['x-amz-checksum-sha256'], 'base64'))));
+    return new Response(
+      `<CompleteMultipartUploadResult><Bucket>${bucket}</Bucket><Key>${mediaKey}</Key>`
+      + `<ChecksumSHA256>${composite}-2</ChecksumSHA256></CompleteMultipartUploadResult>`,
+      { headers: { 'x-amz-version-id': version } },
+    );
+  });
+  assert.equal(await complete('multipart-resume'), version);
+  assert.deepEqual(requests, [
+    `PUT partNumber=1&${uploadQuery}`, `PUT partNumber=2&${uploadQuery}`,
+    `PUT partNumber=2&${uploadQuery}`, `POST ${uploadQuery}`,
+  ]);
+});
+
 const readbackPageVersion = 'page+%2F/=';
 const readbackPageQuery = 'versionId=page%2B%252F%2F%3D';
 const readbackHeaders = (bytes, id) => ({

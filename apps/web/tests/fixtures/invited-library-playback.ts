@@ -4,18 +4,18 @@ import { fixtureCookie, hasFixtureSession, serveFlac } from '../helpers/private-
 
 const listener = 'synthetic-listener';
 const binding = 'A'.repeat(43);
+const playId = `private_browser_${'a'.repeat(22)}`;
+
 type LibraryTrack = { id: string; title: string; duration_ms: number };
 
 export async function mockInvitedLibraryPlayback(page: Page, origin: string, fixture: {
 	libraryItems: () => LibraryTrack[];
 	playableTrackId: (requestedId: string) => string | undefined;
 	audio: Buffer | ((route: Route) => Promise<void>);
-	playId?: string;
 	isRevoked?: () => boolean;
 }) {
 	const context = page.context();
 	const isListener = (cookie: string | null) => hasFixtureSession(cookie, listener);
-	const playId = fixture.playId ?? '00000000-0000-4000-8000-000000000003';
 	let playback: { trackId: string; sessionId: string } | undefined;
 	const mediaPath = (trackId: string) => `/v1/plays/media/${trackId}/${playback?.sessionId}/${playId}`;
 	await context.route('**/*', (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
