@@ -14111,20 +14111,10 @@ pub(crate) mod tests {
                 },
             ))
         };
-        let plan = |cookie: &str| decode(billing_get(&h, "/v1/plans", Some(cookie.into())), 200);
-        let subscription = |now, cookie: &str| {
-            decode(
-                call_at(
-                    now,
-                    "GET",
-                    "/v1/me/subscription",
-                    Some(cookie),
-                    vec![],
-                    None,
-                ),
-                200,
-            )
+        let billing_read = |now, path: &str, cookie: &str| {
+            decode(call_at(now, "GET", path, Some(cookie), vec![], None), 200)
         };
+        let subscription = |now, cookie: &str| billing_read(now, "/v1/me/subscription", cookie);
         let play = json!({"track_id":"track-9", "session_id":"tab-a"});
         let play_at = |now, cookie: &str, body: &Value| {
             call_at(
@@ -14141,7 +14131,10 @@ pub(crate) mod tests {
         assert_eq!(unpaid["code"], "subscription_required");
         assert_eq!(unpaid["reason"], "never_subscribed");
 
-        assert_eq!(plan(&cookie)["plans"][0]["selectable"], true);
+        assert_eq!(
+            billing_read(NOW, "/v1/plans", &cookie)["plans"][0]["selectable"],
+            true
+        );
         let redirect = decode(checkout(&h), 200);
         let operation = block_on(h.store.open_checkout_operation(&user))
             .unwrap()
@@ -14282,7 +14275,10 @@ pub(crate) mod tests {
             subscribed["currentPeriodEnd"],
             crate::ledger::iso8601_utc(first_end)
         );
-        assert_eq!(plan(&cookie)["plans"][0]["selectable"], false);
+        assert_eq!(
+            billing_read(replay_at, "/v1/plans", &cookie)["plans"][0]["selectable"],
+            false
+        );
 
         h.store.meter_meta.borrow_mut().insert(
             (user.clone(), "track-9".into()),
@@ -14308,7 +14304,7 @@ pub(crate) mod tests {
         };
         assert_eq!(record(1000), crate::meter_sink::PlayWindowOutcome::Written);
         assert_eq!(record(2000), crate::meter_sink::PlayWindowOutcome::Written);
-        let usage = || decode(billing_get(&h, "/v1/me/usage", Some(cookie.clone())), 200);
+        let usage = || billing_read(replay_at, "/v1/me/usage", &cookie);
         assert_eq!(usage()["streamSecondsMonth"], 2);
         assert_eq!(record(2000), crate::meter_sink::PlayWindowOutcome::Covered);
         assert_eq!(usage()["streamSecondsMonth"], 2);
