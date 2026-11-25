@@ -53,6 +53,9 @@ PRIVATE_CONTRACT = dict(CONTRACT, journey="private-music", criteria=[
     for name in PRIVATE_CASES
 ])
 PRIVATE_CONTRACT_BYTES = json.dumps(PRIVATE_CONTRACT).encode()
+PRIVATE_AUDIO = (HERE.parent / "fixtures/synthetic-flac/private-staging/tone-a.flac").read_bytes()
+PRIVATE_AUDIO_SHA = sa.digest(PRIVATE_AUDIO)
+PRIVATE_TRACK_ID = "00000000-0000-4000-8000-000000000001"
 
 
 def make_policy(contract_bytes=CONTRACT_BYTES):
@@ -87,10 +90,20 @@ def private_pins():
             for index, name in enumerate(("web", "api", "stream"), 1)}
 
 
-def private_report(pins):
+def private_report(pins, **track_overrides):
     suite = ET.Element("testsuite")
+    track = {"run_id": str(RUN_ID), "run_attempt": "1", "build_sha": SHA,
+             "track_id": PRIVATE_TRACK_ID, "sha256": PRIVATE_AUDIO_SHA} | track_overrides
     for name in PRIVATE_CASES:
-        ET.SubElement(suite, "testcase", classname="private-music", name=name, retry="0")
+        case = ET.SubElement(suite, "testcase", classname="private-music", name=name, retry="0")
+        proofs = {"upload-to-library": ("private-publication", "private-library"),
+                  "play": ("private-play",), "anonymous-refused": ("private-anonymous-refusal",),
+                  "unlisted-refused": ("private-unlisted-refusal",),
+                  "revoked-or-expired-refused": ("private-cutoff-refusal",)}
+        if name in proofs:
+            props = ET.SubElement(case, "properties")
+            for proof in proofs[name]:
+                ET.SubElement(props, "property", name=proof, value=json.dumps(track))
     observations = {lane: {k: v for k, v in pin.items() if k not in ("run_id", "run_attempt")}
                     for lane, pin in pins.items()}
     for phase, minutes in (("build-identity", -3), ("build-identity-final", -2)):
@@ -154,7 +167,8 @@ class World:
         self.contract_bytes = contract_bytes
         self.manifest = manifest
         self.receipt = sa.produce(make_env(**(env or {})), xml or make_junit(), self.policy,
-                                  contract_bytes, manifest, private_pins=private_deployments)
+                                  contract_bytes, manifest, private_pins=private_deployments,
+                                  private_track_sha256=PRIVATE_AUDIO_SHA)
         self.workflow = {"id": WORKFLOW_ID, "path": sa.WORKFLOW, "state": "active"}
         repo = {"full_name": REPO, "id": REPO_ID}
         self.run = {"id": RUN_ID, "run_attempt": 1, "workflow_id": WORKFLOW_ID, "path": sa.WORKFLOW,
@@ -242,14 +256,15 @@ class World:
     def verify(self, routes=None, hook=None, **over):
         args = dict(repo=REPO, repository_id=str(REPO_ID), sha=SHA, policy=self.policy,
                     contract_bytes=self.contract_bytes, manifest_hash=sa.digest(self.manifest),
-                    producer_source_ok=lambda source: None)
+                    producer_source_ok=lambda source: None, private_track_sha256=PRIVATE_AUDIO_SHA)
         args.update(over)
         return sa.verify(FakeActions(routes or self.routes(), hook), **args)
 
     def verify_with_actions(self, actions):
         return sa.verify(actions, repo=REPO, repository_id=str(REPO_ID), sha=SHA,
                          policy=self.policy, contract_bytes=self.contract_bytes,
-                         manifest_hash=sa.digest(self.manifest), producer_source_ok=lambda source: None)
+                         manifest_hash=sa.digest(self.manifest), producer_source_ok=lambda source: None,
+                         private_track_sha256=PRIVATE_AUDIO_SHA)
 
 
 class Base(unittest.TestCase):
@@ -262,9 +277,9 @@ class Base(unittest.TestCase):
 
 
 class PrivateWorld(World):
-    def __init__(self):
+    def __init__(self, report=None):
         pins = private_pins()
-        super().__init__(env={"JOURNEY_GATE": ""}, xml=ET.tostring(private_report(pins)),
+        super().__init__(env={"JOURNEY_GATE": ""}, xml=ET.tostring(private_report(pins) if report is None else report),
                          contract_bytes=PRIVATE_CONTRACT_BYTES, private_deployments=pins)
         self.jobs = [self.job(lane, -10, steps=[self.step(step, 1)]) for lane, step in (
             ("staging-web", "Deploy to staging"), ("staging-api", "Deploy api to staging"),
@@ -279,7 +294,62 @@ class PrivateAdmissionTests(Base):
         receipt = world.verify()
         self.assertEqual(receipt["coverage"], [{"id": name, "outcome": "passed"} for name in PRIVATE_CASES])
         self.assertEqual(receipt["deployments"], private_pins())
+        self.assertEqual(receipt["private_track"], {"run_id": str(RUN_ID), "run_attempt": "1",
+                         "build_sha": SHA, "track_id": PRIVATE_TRACK_ID, "sha256": PRIVATE_AUDIO_SHA})
         self.assertTrue(world.artifact["name"].endswith("-private-music"))
+
+    def test_green_report_cannot_mix_private_track_fragments(self):
+        pins = private_pins()
+        for proof, field, foreign in (
+            ("private-publication", "run_id", str(RUN_ID - 1)),
+            ("private-library", "build_sha", OTHER_SHA),
+            ("private-play", "track_id", "00000000-0000-4000-8000-000000000002"),
+            ("private-anonymous-refusal", "run_id", str(RUN_ID - 1)),
+            ("private-unlisted-refusal", "sha256", "0" * 64),
+            ("private-cutoff-refusal", "run_attempt", "2"),
+        ):
+            with self.subTest(proof=proof, field=field):
+                mixed = private_report(pins)
+                path = f".//property[@name='{proof}']"
+                mixed.find(path).set("value", private_report(pins, **{field: foreign}).find(path).get("value"))
+                world = PrivateWorld(mixed)
+                self.assertEqual(world.receipt["coverage"],
+                                 [{"id": name, "outcome": "passed"} for name in PRIVATE_CASES])
+                self.assertEqual(world.receipt["reasons"], ["private journey observed different tracks, builds or attempts"])
+                self.assertNotIn("private_track", world.receipt)
+                self.assertWorldRefused(world, "private track evidence")
+
+    def test_green_report_requires_each_private_track_observation_once(self):
+        for defect in ("missing", "duplicate", "misplaced"):
+            with self.subTest(defect=defect):
+                pins = private_pins()
+                report = private_report(pins)
+                upload = report.find("testcase[@name='upload-to-library']/properties")
+                library = upload.find("property[@name='private-library']")
+                if defect == "duplicate":
+                    upload.append(copy.deepcopy(library))
+                else:
+                    upload.remove(library)
+                    if defect == "misplaced":
+                        report.find("testcase[@name='play']/properties").append(library)
+                receipt = sa.produce(make_env(), ET.tostring(report), make_policy(PRIVATE_CONTRACT_BYTES),
+                                     PRIVATE_CONTRACT_BYTES, MANIFEST, private_pins=pins,
+                                     private_track_sha256=PRIVATE_AUDIO_SHA)
+                self.assertEqual(receipt["result"], "incomplete")
+                self.assertIn("private track evidence", receipt["reasons"][0])
+
+    def test_private_track_must_match_selected_run_build_and_fixture(self):
+        for field, foreign in (("run_id", str(RUN_ID - 1)), ("run_attempt", "2"),
+                               ("build_sha", OTHER_SHA), ("sha256", "0" * 64)):
+            with self.subTest(field=field):
+                world = PrivateWorld(private_report(private_pins(), **{field: foreign}))
+                self.assertEqual(world.receipt["result"], "incomplete")
+                self.assertIn("private track evidence", world.receipt["reasons"][0])
+                # Also reject a substituted summary in an otherwise green, digest-correct receipt.
+                world = PrivateWorld()
+                world.receipt["private_track"][field] = foreign
+                world.set_archive()
+                self.assertWorldRefused(world, "private track evidence")
 
     def test_private_receipt_requires_reviewed_policy_and_private_job(self):
         world = PrivateWorld()
@@ -365,7 +435,8 @@ class PrivateAdmissionTests(Base):
         closing["deployments"]["staging-web"]["deployment_id"] = pins["staging-api"]["deployment_id"]
         prop.set("value", json.dumps(closing))
         receipt = sa.produce(make_env(), ET.tostring(suite), make_policy(PRIVATE_CONTRACT_BYTES),
-                             PRIVATE_CONTRACT_BYTES, MANIFEST, private_pins=pins)
+                             PRIVATE_CONTRACT_BYTES, MANIFEST, private_pins=pins,
+                             private_track_sha256=PRIVATE_AUDIO_SHA)
         self.assertEqual(receipt["result"], "incomplete")
         self.assertEqual(receipt["reasons"], ["private journey observed different deployment identities"])
 
@@ -945,8 +1016,8 @@ class SourceBindingTests(Base):
 
     def install_private_contract(self):
         self.install_contract(PRIVATE_CONTRACT_BYTES, make_policy(PRIVATE_CONTRACT_BYTES))
-        fixture = "fixtures/synthetic-flac/private-staging/fixture"
-        self.files[fixture] = ("100644", b"synthetic input")
+        fixture = sa.PRIVATE_TRACK_FILE
+        self.files[fixture] = ("100644", PRIVATE_AUDIO)
         return fixture
 
     def git(self, *args, data=None):
@@ -1065,11 +1136,38 @@ class SourceBindingTests(Base):
         self.refused("current staging identity drift", self.run_main, private=True, mode="promote",
                      live_error=sa.Refused("current staging identity drift"))
 
+    def test_private_producer_cli_binds_candidate_audio(self):
+        fixture = self.install_private_contract()
+        report = self.root / "e2e/private-staging-results/admission.xml"
+        report.parent.mkdir(parents=True)
+        manifest = self.root / "migrations/manifest.toml"
+        manifest.parent.mkdir()
+        manifest.write_bytes(MANIFEST)
+        for audio, result in ((PRIVATE_AUDIO, "satisfied"), (b"different synthetic input", "incomplete")):
+            with self.subTest(result=result):
+                candidate = self.commit(dict(self.files, **{fixture: ("100644", audio)}))
+                with patch.dict(globals(), SHA=candidate):
+                    pins = private_pins()
+                    report.write_bytes(ET.tostring(private_report(pins)))
+                    env = make_env(PRIVATE_STAGING_DEPLOYMENTS=json.dumps(pins), JOURNEY_GATE="")
+                with patch.object(sa, "ROOT", self.root), patch.dict(sa.os.environ, env, clear=True), \
+                        patch.object(sa.sys, "argv", ["staging_admission.py", "produce-private"]), \
+                        patch("sys.stdout", new=io.StringIO()):
+                    sa.main()
+                receipt = json.loads((self.root / "staging-admission.json").read_bytes())
+                self.assertEqual(receipt["result"], result)
+                if result == "satisfied":
+                    self.assertEqual(receipt["private_track"]["sha256"], PRIVATE_AUDIO_SHA)
+                else:
+                    self.assertIn("private track evidence", receipt["reasons"][0])
+
     def test_private_main_binds_synthetic_audio_tree(self):
         fixture = self.install_private_contract()
         self.run_main(private=True, mode="promote")
         corrected = dict(self.files, **{fixture: ("100644", b"different synthetic input")})
         self.refused("producer.*drift", self.run_main, current_files=corrected, private=True, mode="promote")
+        self.refused("private track evidence", self.run_main, candidate_files=corrected,
+                     trusted_files=corrected, current_files=corrected, private=True, mode="promote")
 
     def test_promotion_refuses_missing_approval(self):
         self.install_private_contract()
