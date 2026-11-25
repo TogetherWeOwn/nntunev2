@@ -141,7 +141,9 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
             for index, role in enumerate(("UPLOAD", "AUTH", "PUBLISH", "ENROLL"), 1)
         }
         bindings = {f"PRIVATE_TRIAL_{role.upper()}_DB_STAGING_ID": value for role, value in config_ids.items()}
-        config = STREAM_CONFIG.trial_db_bindings({"PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true", **bindings})
+        ordinary_id = "c" * 32
+        config = ['[[env.staging.hyperdrive]]', 'binding = "HYPERDRIVE"', f'id = "{ordinary_id}"']
+        config.extend(STREAM_CONFIG.trial_db_bindings({"PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true", **bindings}))
         provider = "https://api.cloudflare.com/client/v4/accounts/" + "a" * 32 + "/hyperdrive/configs/"
         # Cloudflare's GET wraps the config and its caching object in result.
         responses = {
@@ -151,8 +153,7 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
                     "id": config_id, "name": f"trial-{role}",
                     "origin": {
                         "host": "trial-db.example.test", "database": "synthetic_trial",
-                        "scheme": "postgresql", "user": f"synthetic_{role}", "password": "fixture-password",
-                        "access_client_id": "fixture-client", "access_client_secret": "fixture-secret",
+                        "scheme": "postgresql", "user": f"synthetic_{role}", "access_client_id": "fixture-client",
                     },
                     "mtls": {"sslmode": "verify-full", "ca_certificate_id": "b" * 32},
                     "caching": {"disabled": True},
