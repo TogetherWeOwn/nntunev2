@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { createServer, type ViteDevServer } from 'vite';
+import { syntheticBody } from '../../src/lib/player/demoMedia.js';
 import type {} from '../fixtures/shared-listen/mount.js';
 
 const ids = ['A', 'Q', 'g'].map((last) => 'A'.repeat(21) + last);
@@ -54,21 +55,52 @@ test('signed-in route replacement and pause/resume keep the same listen until co
 	expect(await journal(page)).toEqual(completed);
 });
 
-test('missing identity and initial error are silent; error and abandonment each end once', async ({ page }) => {
-	const checkpoints = await page.evaluate(([first, next]) => {
+test('failed load is silent, native pause keeps the listen, and media error ends it once', async ({ page }) => {
+	await page.route(new URL('/fixture-audio.wav', url).href, (route) => route.fulfill({
+		contentType: 'audio/wav', body: Buffer.from(syntheticBody())
+	}));
+	const checkpoints = await page.evaluate(async ([first, next]) => {
 		const f = window.sharedListenFixture;
-		f.media('playing'); f.issue(first); f.media('error');
+		const audio = document.querySelector('audio')!;
+		audio.muted = true;
+		f.media('playing'); // No issued identity yet.
+		f.issue(first);
+
+		const loadError = new Promise<Event>((resolve) => audio.addEventListener('error', resolve, { once: true }));
+		audio.src = 'data:audio/wav;base64,AAAA';
+		const failedLoad = (await loadError).isTrusted && audio.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED;
 		const beforeStart = f.read();
-		f.media('playing'); f.media('error');
+
+		audio.src = '/fixture-audio.wav';
+		await audio.play();
+		const pause = new Promise<Event>((resolve) => audio.addEventListener('pause', resolve, { once: true }));
+		audio.pause();
+		const paused = (await pause).isTrusted && audio.paused;
+		const afterPause = f.read();
+		await audio.play();
+		const afterResume = f.read();
+
+		// Deliver an active playback error in isolation before any source teardown.
+		f.media('error');
 		const afterError = f.read();
-		f.media('playing'); f.media('emptied');
+		f.media('playing'); f.media('error'); f.media('emptied'); f.media('ended');
+		const afterRepeats = f.read();
 		f.issue(next); f.media('playing'); f.abandon(); f.abandon();
 		const afterAbandon = f.read();
 		f.detach();
-		return { beforeStart, afterError, afterAbandon };
+		return { failedLoad, beforeStart, paused, afterPause, afterResume, afterError, afterRepeats, afterAbandon };
 	}, ids);
 	const skipped = [row(0, 'start'), row(0, 'skip'), row(1, 'start'), row(1, 'skip')];
-	expect(checkpoints).toEqual({ beforeStart: [], afterError: skipped.slice(0, 2), afterAbandon: skipped });
+	expect(checkpoints).toEqual({
+		failedLoad: true,
+		beforeStart: [],
+		paused: true,
+		afterPause: [row(0, 'start')],
+		afterResume: [row(0, 'start')],
+		afterError: skipped.slice(0, 2),
+		afterRepeats: skipped.slice(0, 2),
+		afterAbandon: skipped
+	});
 	expect(await journal(page)).toEqual(skipped);
 });
 
