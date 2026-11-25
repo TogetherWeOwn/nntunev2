@@ -47,18 +47,27 @@ def binding_identity_verdicts(database_oid, role_pins, rows):
     """Compare one read-only result per binding against independently reviewed pins.
 
     The database OID comes from target admission. Each binding's pin is its
-    configured _ROLE name and reviewed OID. Supply a row only when the same
-    binding returned exactly one row. All four bindings must match to satisfy
-    the role identity check. Origin, TLS, cache and serving version evidence
-    are separate.
+    configured _ROLE name and reviewed OID. Supply the original list of
+    (binding, row) results. A binding can match only if it appears once and
+    returned exactly one row. All four bindings must match to satisfy the role
+    identity check. Origin, TLS, cache and serving version evidence are separate.
     """
     verdicts = {binding: "pending" for binding in BINDINGS}
     if (not oid(database_oid) or not _valid_binding_role_pins(role_pins)
-            or type(rows) is not dict or not rows.keys() <= verdicts.keys()):
+            or type(rows) is not list or len(rows) > len(BINDINGS)):
         return verdicts
 
+    observed = {}
+    for result in rows:
+        if type(result) is not tuple or len(result) != 2:
+            return verdicts
+        binding, row = result
+        if type(binding) is not str or binding not in verdicts:
+            return verdicts
+        observed[binding] = None if binding in observed else row
+
     for binding in BINDINGS:
-        row = rows.get(binding)
+        row = observed.get(binding)
         name, role_oid = role_pins[binding]
         if (type(row) is tuple and len(row) == 6
                 and all(type(row[i]) is str and oid(row[i + 1]) for i in (0, 2, 4))
@@ -84,7 +93,7 @@ def read_binding_identities(*, build_sha, version_id, database_oid, role_pins, q
     verifies config scope, origin TLS and caching.
     """
     pins = role_pins.copy() if _valid_binding_role_pins(role_pins) else {}
-    rows = {}
+    rows = []
     if (query is not None and pins and oid(database_oid)
             and valid(SHA, build_sha) and valid(UUID, version_id)):
         for binding in BINDINGS:
@@ -99,7 +108,7 @@ def read_binding_identities(*, build_sha, version_id, database_oid, role_pins, q
             if (all(type(value) is str for value in observed)
                     and observed == (build_sha, version_id, binding)
                     and type(result.rows) is tuple and len(result.rows) == 1):
-                rows[binding] = result.rows[0]
+                rows.append((binding, result.rows[0]))
     verdicts = binding_identity_verdicts(database_oid, pins, rows)
     return {
         binding: {"role": pins[binding][0] if pins else None, "database": DATABASE,
