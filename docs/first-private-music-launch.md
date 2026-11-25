@@ -103,7 +103,8 @@ until their evidence is available.
 ### Offline handoff example after a rerun
 
 In this synthetic handoff, `deploy.yml` reruns the same `<sha>` under the same
-`<run-id>`. The run-level artifact listing can contain receipts from both attempts.
+`<run-id>`. The run-level artifact listing can contain receipts from multiple
+attempts.
 
 | Artifact name | Handoff disposition |
 | --- | --- |
@@ -139,14 +140,25 @@ verdict Pending. In each case, record **Staging admission** as Pending and
 | SHA-256 mismatch | Record the verifier refusal when the downloaded ZIP differs from the Actions digest. Repeat qualification step 3 through the authorized Actions read path if the same artifact and attempt are still eligible. If the mismatch persists or the evidence is no longer eligible, qualify a replacement attempt. |
 
 Keep scheduled [trial cleanup](ops/private-staging-trial.md#retire-and-recover)
-on time. For a replacement, reconcile the prior invite and fixtures before using
+on time. For a replacement, reconcile the prior invite, upload, publication
+and fixture pins before using
 [fresh single-use inputs](ops/private-staging-trial.md#setup-and-trial).
-Repeat [qualification steps 1–3](#qualify-the-candidate) for the pinned SHA in
-one complete protected main-push `deploy.yml` attempt. For an eligible rerun,
-use **Re-run all jobs** and check the original workflow's compatibility with
-the [staging deploy lock](ops.md#staging-deploy-lock-cutover-and-rollback).
+
+During the next approved staging window, use **Re-run all jobs** only within
+GitHub's 30-day rerun window and if the original protected push uses the
+`deploy-staging-main` lock. Follow the
+[staging rollback procedure](ops.md#staging-deploy-lock-cutover-and-rollback)
+before starting the rerun. Pause merges, pushes and other staging reruns,
+drain active and queued deploys through post-deploy E2E, and keep the pause
+until the rerun finishes and staging serves the pinned SHA. If those conditions
+cannot be met, use a fresh protected push to `main` during an approved staging
+window and pin its reviewed SHA.
+
+Repeat [qualification steps 1–3](#qualify-the-candidate) on the selected build.
+Require successful deployment and journey jobs, a pass without a Playwright
+retry for every required case, and the verified receipt from one complete
+protected main-push `deploy.yml` attempt.
 [Select the replacement receipt by attempt](#offline-handoff-example-after-a-rerun).
-If a fresh protected push changes the SHA, review and pin that build first.
 Keep the original evidence under its own attempt. Record the selected run,
 attempt and artifact digest when the verifier emits matching staging pins.
 
