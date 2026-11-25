@@ -150,10 +150,13 @@ current traffic allocation and version using the comparison in the
 | Matching control | `deployment-b` serves `version-b` | Matched when the version reports the reviewed build SHA and the closing deployment read still returns `deployment-b`. |
 
 For the stale case, mark C2 serving evidence pending. In the protected C2
-handoff, cite the deploy record for the expected version and the saved
-protected deployment history for the observed deployment and version on the
-same Worker and route. The unavailable receipt carries only the mismatch
-reason. If the history is unavailable, leave the observed IDs unconfirmed.
+handoff, cite the deploy record for the expected version and the failed
+probe's run and check for the mismatch reason. Record observed deployment
+and version IDs only from a saved protected allocation readback tied to that
+exact probe observation on the same Worker and route. The unavailable
+receipt carries only the mismatch reason. Leave the observed IDs unconfirmed
+if the tied readback is missing. Any later history read is fresh evidence for
+reconciliation.
 
 The trial operator hands the mismatch to Engineering in **Setup step 4,
 Verify isolated serving and cleanup access**. Engineering reconciles the
