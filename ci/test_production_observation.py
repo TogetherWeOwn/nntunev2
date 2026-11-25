@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import subprocess
@@ -8,20 +9,22 @@ import unittest
 from production_observation import Refused, validate_observation
 
 
-def fixture():
-    def utc(minute):
-        return f"2026-10-01T12:{minute:02}:00Z"
+def fixture(*, start_hour=12, run_attempt="2", smoke_job_id="456"):
+    start = datetime(2026, 10, 1, start_hour, tzinfo=timezone.utc)
 
-    candidate = {"sha": "a" * 40, "api_sha": "b" * 40, "run_id": "123", "run_attempt": "2",
+    def utc(minute):
+        return (start + timedelta(minutes=minute)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    candidate = {"sha": "a" * 40, "api_sha": "b" * 40, "run_id": "123", "run_attempt": run_attempt,
                  "promoted_version_id": "12345678-1234-1234-1234-123456789abc",
                  "deployment_id": "12345678-1234-1234-1234-123456789def"}
     smoke = {key: value for key, value in candidate.items() if key != "api_sha"}
     smoke.update(outcome="success", completed_at=utc(0), allocation_percent=100,
-                 evidence="https://github.com/TogetherWeOwn/nntunev2/actions/runs/123/job/456")
-    policy = {"recorded_at": "2026-10-01T11:55:00Z", "evidence": "#evidence-error-policy"}
+                 evidence=f"https://github.com/TogetherWeOwn/nntunev2/actions/runs/123/job/{smoke_job_id}")
+    policy = {"recorded_at": utc(-5), "evidence": "#evidence-error-policy"}
     pins = {"schema": 1, "candidate": candidate, "final_smoke": smoke, "error_policy": policy}
     assignment = {"from": utc(0), "through": utc(35), "recovery_access": "confirmed"}
-    watch = {"schema": 1, "run_id": "123", "run_attempt": "2", "error_policy_evidence": policy["evidence"],
+    watch = {"schema": 1, "run_id": "123", "run_attempt": run_attempt, "error_policy_evidence": policy["evidence"],
              "watcher": {**assignment, "name": "watcher", "evidence": "#evidence-primary"},
              "backup": {**assignment, "name": "backup", "evidence": "#evidence-backup"},
              "closed_at": utc(30), "result": "satisfied", "samples": []}
@@ -38,6 +41,29 @@ def fixture():
 
 
 class ProductionObservationTests(unittest.TestCase):
+    def test_cli_refuses_an_earlier_healthy_window_for_the_same_build(self):
+        _, earlier_watch = fixture()
+        pins, fresh_watch = fixture(start_hour=13, run_attempt="3", smoke_job_id="789")
+        replayed_samples = {**fresh_watch, "samples": earlier_watch["samples"]}
+        cases = (
+            ("fresh watch", fresh_watch, (0, "Production observation evidence satisfied\n", "")),
+            ("earlier attempt", earlier_watch,
+             (1, "", "Production observation refused: watch run or attempt mismatch\n")),
+            ("earlier samples in current watch", replayed_samples,
+             (1, "", "Production observation refused: opening readback missed its deadline\n")),
+        )
+        script = Path(__file__).with_name("production_observation.py")
+        with TemporaryDirectory(prefix="nntune-observation-") as directory:
+            pin_file = Path(directory) / "pins.json"
+            watch_file = Path(directory) / "watch.json"
+            pin_file.write_text(json.dumps(pins))
+            for label, watch, expected in cases:
+                with self.subTest(case=label):
+                    watch_file.write_text(json.dumps(watch))
+                    result = subprocess.run([sys.executable, "-B", script, pin_file, watch_file],
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), expected)
+
     def test_complete_healthy_window_and_later_close_with_coverage(self):
         pins, watch = fixture()
         validate_observation(pins, watch)
