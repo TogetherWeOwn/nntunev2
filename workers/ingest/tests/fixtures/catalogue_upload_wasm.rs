@@ -7,7 +7,9 @@ use crate::{
         AuthorizedRelease, CommittedFlac, ExpectedFile, StageOutcome,
     },
     admin_review::ObjectRef,
-    catalogue_publication::{PublicationError, PublishedObject},
+    catalogue_publication::{
+        stage_with_duration, PublicationError, PublishedObject, VerifiedOccurrence,
+    },
     digest_candidate_store::{
         outcome::{read_completion, stage_completion},
         CandidateIntent,
@@ -20,6 +22,7 @@ use crate::{
         readback_inventory::{ReadbackScope, VerifiedCompletedReadback},
         session_outcome::CompletionScope,
     },
+    track_writers::TrackRow,
 };
 
 #[path = "catalogue_postgres_wasm.rs"]
@@ -207,6 +210,39 @@ pub(super) async fn publish(
         }],
     };
     let mut tx = writer.transaction().await.unwrap();
+    let occurrence = VerifiedOccurrence {
+        job_id: job.job_id,
+        owner_id: OWNER,
+        object_id,
+        track: TrackRow {
+            release_id: RELEASE,
+            title: "Fixture",
+            medium_no: 1,
+            track_no: 1,
+            mbid: "ab340000-0000-4000-8000-000000000001",
+            file_ordinal: 0,
+        },
+    };
+    for measured_ms in [i32::MAX as u64 + 1, u64::from(u32::MAX) + 2] {
+        assert_eq!(
+            stage_with_duration(
+                &mut tx,
+                &occurrence,
+                &upload.flac.receipt,
+                Some(measured_ms)
+            )
+            .await,
+            Err(PublicationError::Refused),
+        );
+    }
+    assert!(tx
+        .query_one(
+            "SELECT NOT EXISTS (SELECT FROM public.tracks WHERE release_id = $1::text::uuid)",
+            &[&RELEASE],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
     let StageOutcome::Staged(tracks) = stage_completed_release(
         &mut tx,
         &job,
