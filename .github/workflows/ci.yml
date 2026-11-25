@@ -2276,6 +2276,15 @@ jobs:
       - name: Install locked upload CLI without lifecycle scripts
         working-directory: apps/web
         run: pnpm install --frozen-lockfile --ignore-scripts --config.minimumReleaseAge=4320
+      - name: Exercise the one-shot private trial cleanup Worker against disposable PostgreSQL and S3
+        env:
+          PRIVATE_TRIAL_CLEANUP_BUNDLE: ${{ runner.temp }}/trial-cleanup-fixture
+        run: |
+          set -euo pipefail
+          (cd workers/api && worker-build --release --out-dir "$PRIVATE_TRIAL_CLEANUP_BUNDLE" -- --locked --features staging-fixture-cleanup,staging-body-wasm-test) 2>&1 | tee "$RUNNER_TEMP/worker-trial-cleanup-fixture.log"
+          python3 -I .github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-trial-cleanup-fixture.log"
+          git diff --exit-code -- workers/api/Cargo.lock
+          node --test workers/api/tests/fixtures/private_trial_cleanup_runner.cjs
       - name: Exclude Subsonic deadline test markers from release WASM
         run: |
           if grep -aEq 'subsonic-connect-deadline-(proof|ok)' workers/api/build/index_bg.wasm; then

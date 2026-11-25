@@ -66,6 +66,7 @@ worker = "0.9"
 
 [features]
 encrypted-upload-caller = ["dep:nntune-ingest"]
+staging-fixture-cleanup = ["encrypted-upload-caller"]
 postgres-tests = []
 # Exposes the inert adapter only to the synthetic WASM runtime test.
 staging-body-wasm-test = []
