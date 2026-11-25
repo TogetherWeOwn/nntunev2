@@ -98,9 +98,6 @@ fn uuid(raw: &str) -> Result<[u8; 16], TrialError> {
 
 async fn connect(scope: &Scope, dsn: &str) -> Result<Client, TrialError> {
     let cfg: Config = dsn.parse().map_err(|_| Refused)?;
-    // Only the disposable CI artifact can connect without TLS, and only on loopback.
-    let local =
-        cfg!(feature = "staging-fixture-cleanup-test") && scope.database_host == "127.0.0.1";
     if cfg.get_dbname() != Some(DATABASE)
         || cfg.get_user() != Some(&scope.database_role)
         || cfg.get_hosts() != [Host::Tcp(scope.database_host.clone())]
@@ -109,21 +106,12 @@ async fn connect(scope: &Scope, dsn: &str) -> Result<Client, TrialError> {
         || cfg.get_options().is_some()
         || cfg.get_password().is_none_or(|pw| pw.is_empty())
         || scope.database_role_oid == 0
-        || cfg.get_ssl_mode()
-            != if local {
-                SslMode::Disable
-            } else {
-                SslMode::Require
-            }
+        || cfg.get_ssl_mode() != SslMode::Require
     {
         return Err(Refused);
     }
     let socket = Socket::builder()
-        .secure_transport(if local {
-            SecureTransport::Off
-        } else {
-            SecureTransport::StartTls
-        })
+        .secure_transport(SecureTransport::StartTls)
         .connect(&scope.database_host, scope.database_port)
         .map_err(|_| Unconfirmed)?;
     socket.opened().await.map_err(|_| Unconfirmed)?;

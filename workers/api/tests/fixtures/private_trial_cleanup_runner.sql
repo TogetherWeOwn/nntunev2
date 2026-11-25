@@ -40,7 +40,7 @@ INSERT INTO public.ingest_session_reservations
   (id,library_id,principal_id,idempotency_key,fingerprint,absolute_deadline,idle_deadline,terminal_reason,
    terminal_at,completed_map_id,multipart_object_id,multipart_bucket)
 VALUES (:'session', :'lib', 'cleanup-issuer', 'cleanup-fixture-job', decode(repeat('01', 32), 'hex'),
-        clock_timestamp(), clock_timestamp(), 'completed', clock_timestamp(), :'map', :'object', :'bucket');
+        statement_timestamp(), statement_timestamp(), 'completed', statement_timestamp(), :'map', :'object', :'bucket');
 INSERT INTO public.catalogue_s3_sources
 SELECT :'track', id, accepted_seq, :'object' FROM public.ingest_jobs WHERE id = 'cleanup-fixture-job';
 INSERT INTO public.private_library_admissions

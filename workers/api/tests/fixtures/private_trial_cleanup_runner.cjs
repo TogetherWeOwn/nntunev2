@@ -9,7 +9,7 @@ const { invoke } = require('../../../../.github/scripts/staging_trial_cleanup.cj
 
 const db = 'nntunev2_staging';
 const role = 'trial_cleanup_fixture';
-const uri = `postgresql://${role}:disposable-cleanup-password@127.0.0.1:5432/${db}?sslmode=disable`;
+const uri = `postgresql://${role}:disposable-cleanup-password@127.0.0.1:5432/${db}?sslmode=require`;
 const sha = (raw) => createHash('sha256').update(raw).digest('hex');
 const id = (n) => `10000000-0000-4000-8000-00000000000${n}`;
 const keyId = (uuid) => uuid.replaceAll('-', '');
@@ -90,6 +90,7 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
       ['wrong recorded fixture', { ...scope, track: id('a') }],
       ['wrong DB identity', { ...scope, database_role_oid: scope.database_role_oid + 1 }],
       ['wrong DB target', scope, { CLEANUP_DATABASE_URL: uri.replace(db, 'nntune_ci') }],
+      ['plaintext database connection', scope, { CLEANUP_DATABASE_URL: uri.replace('sslmode=require', 'sslmode=disable') }],
       ['wrong S3 authority', scope, { CLEANUP_S3: s3.replace('synthetic-version-secret', 'other-secret') }],
       ['before cohort cutoff', { ...scope, cutoff: scope.cutoff + 3600 }],
     ];
