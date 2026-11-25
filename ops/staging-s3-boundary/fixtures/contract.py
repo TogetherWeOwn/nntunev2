@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from render import BUCKET, render
-from wire import exchange, signed
+from wire import exchange, response, signed
 
 
 GENERATION = "10000000000040008000000000000000"
@@ -118,8 +118,23 @@ def renderer_contract(access):
         raise RuntimeError("renderer accepted invalid input")
 
 
+def fixed_length_response_contract():
+    prefix = b"HTTP/1.1 200 OK\r\nContent-Length: "
+    payload = b"<Inventory/>"
+    require(response(prefix + b"12\r\n\r\n" + payload, decode_body=True)[2] == payload,
+            "valid fixed-length response was changed")
+    for length in (b"13", b"11", b"bad", b"12\r\nContent-Length: 12", b"12\r\nTransfer-Encoding: chunked"):
+        try:
+            response(prefix + length + b"\r\n\r\n" + payload, decode_body=True)
+        except RuntimeError:
+            continue
+        raise RuntimeError("ambiguous fixed-length response was accepted")
+    require(response(prefix + b"12\r\n\r\n")[2] == b"", "bodyless HEAD framing was changed")
+
+
 def recording_contract(stack, boundary):
     renderer_contract(boundary.credential[0])
+    fixed_length_response_contract()
     expected = []
     for method, path, version, status, body in (
         ("HEAD", PATH, "r%2Bv%26x%3D1", 200, b""),

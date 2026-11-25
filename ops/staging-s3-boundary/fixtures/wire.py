@@ -45,7 +45,15 @@ def response(wire, *, decode_body=False):
     for line in lines:
         name, value = line.split(":", 1)
         headers.setdefault(name.lower(), []).append(value.strip())
-    if decode_body and headers.get("transfer-encoding") == ["chunked"]:
+    lengths = headers.get("content-length")
+    encodings = headers.get("transfer-encoding")
+    if decode_body and lengths is not None:
+        if (encodings is not None or len(lengths) != 1 or not lengths[0].isascii()
+                or not lengths[0].isdecimal() or (lengths[0].lstrip("0") or "0") != str(len(body))):
+            raise RuntimeError("invalid fixed-length HTTP response")
+    if decode_body and encodings is not None:
+        if encodings != ["chunked"]:
+            raise RuntimeError("unsupported HTTP response transfer encoding")
         # Use the HTTP decoder for chunked XML. HEAD and DELETE keep the
         # actual wire bytes so the caller can detect stray payloads.
         class CapturedSocket:
