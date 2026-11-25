@@ -301,11 +301,12 @@ test('invited playback grants the next track on natural end and stops at the que
 			!node.paused && node.currentTime > 0.2 && Number.isFinite(node.duration) && node.seekable.length > 0
 		)).toBe(true);
 		// Shorten the wait while still letting Chromium play through to its own ended event.
-		const trustedEnd = await audio.evaluate((node: HTMLAudioElement) => new Promise<boolean>((resolve) => {
-			node.addEventListener('ended', (event) => resolve(event.isTrusted), { once: true });
+		const end = await audio.evaluate((node: HTMLAudioElement) => new Promise<{ trusted: boolean; at: number }>((resolve) => {
+			node.addEventListener('ended', (event) => resolve({ trusted: event.isTrusted, at: event.timeStamp }), { once: true });
 			node.currentTime = node.duration - 2;
 		}));
-		expect(trustedEnd).toBe(true);
+		expect(end.trusted).toBe(true);
+		return end.at;
 	};
 
 	await page.goto(origin + library.path);
@@ -319,7 +320,7 @@ test('invited playback grants the next track on natural end and stops at the que
 	const firstGrant = page.waitForRequest(grantUrl);
 	await play.click();
 	const tab: string = (await firstGrant).postDataJSON().session_id;
-	await finish(mediaPath(first, tab));
+	const firstEndedAt = await finish(mediaPath(first, tab));
 
 	await expect(active).toHaveAttribute(contract.queueId, last.id);
 	await expect(player.getByTestId('library-now-playing')).toHaveText(last.title);
@@ -335,4 +336,10 @@ test('invited playback grants the next track on natural end and stops at the que
 		{ track_id: first.id, session_id: tab },
 		{ track_id: last.id, session_id: tab }
 	]);
+	// Compare fetch starts and the native ended event on the same browser clock.
+	const grantStarts = await page.evaluate((url) =>
+		performance.getEntriesByName(url, 'resource').map((entry) => entry.startTime), grantUrl);
+	expect(grantStarts).toHaveLength(2);
+	expect(grantStarts[1], 'the next grant must start after the first track ends')
+		.toBeGreaterThanOrEqual(firstEndedAt);
 });
