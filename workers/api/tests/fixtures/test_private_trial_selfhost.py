@@ -1,0 +1,311 @@
+"""Qualify the Stage A stock PostgreSQL target on disposable Docker projects."""
+
+import argparse
+from contextlib import contextmanager
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[4]
+OPS = ROOT / "ops/staging-trial-pg"
+sys.path[:0] = [str(ROOT / ".github/scripts"), str(OPS)]
+from create_tls import create_tls
+from private_trial_catalog import apply_catalog, create_catalog
+from staging_apply import StagingApplyError
+from staging_trial_ambient_acl import CATALOG, compose_selfhost
+from staging_trial_isolated import FIXTURE_HOSTS, HOSTS, KIND, ROLES, selfhost_target_config, target_config
+from staging_trial_role_preflight import BASELINE, DATABASE
+from staging_trial_selfhost import (
+    CONTROL, check_catalog, check_session, fingerprint, tls_connection,
+)
+
+BOOTSTRAP = "nntune_trial_bootstrap"
+SERVICE = "nntune-trial-pg"
+PASSWORD = "ci-throwaway"
+PSQL = ["psql", "-XqAtw", "-v", "ON_ERROR_STOP=1"]
+HBA = "pg_hba.conf"
+EXTRA_DB = "trial_fixture_other"
+
+
+class Disposable:
+    def __init__(self, path, certs, wrong_ca, pull, loopback):
+        self.path = path
+        self.loopback = loopback
+        self.pull = pull
+        self.env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"],
+                    "DOCKER_HOST": "unix:///var/run/docker.sock", "TRIAL_PG_DIR": str(path),
+                    "TRIAL_PG_UID": str(os.getuid()), "TRIAL_PG_GID": str(os.getgid())}
+        project = f"nntune-stage-a-{secrets.token_hex(8)}"
+        self.command = ["docker", "compose", "--env-file", "/dev/null", "-f", str(OPS / "compose.yml"), "-p", project]
+        for name in ("config", "data", "tls"):
+            (path / name).mkdir(mode=0o700, parents=True)
+        for name in (HBA, "postgresql.conf"):
+            shutil.copyfile(OPS / name, path / "config" / name)
+        for name in ("server.crt", "server.key"):
+            shutil.copy(certs / "server" / name, path / "tls" / name)
+        self.ca = path / "tls" / "ca.crt"
+        self.wrong_ca = path / "tls" / "wrong-ca.crt"
+        shutil.copyfile(certs / "ca/ca.crt", self.ca)
+        shutil.copyfile(wrong_ca, self.wrong_ca)
+        (path / "init-password").write_text(secrets.token_hex(16), encoding="ascii")
+        (path / "init-password").chmod(0o600)
+        (path / "passwd").write_text(f"{BOOTSTRAP}:x:{os.getuid()}:{os.getgid()}::/tmp:/bin/false\n", encoding="ascii")
+
+    @contextmanager
+    def running(self):
+        config = json.loads(subprocess.check_output(self.command + ["config", "--format", "json"],
+                                                    env=self.env, timeout=10))
+        service, = config["services"].values()
+        network, = config["networks"].values()
+        if not (network["internal"] and not service.get("ports") and len(service["networks"]) == 1
+                and service["cap_drop"] == ["ALL"] and service["read_only"] and service["cpus"] == 2
+                and int(service["mem_limit"]) == 2 * 1024**3 and service["user"] == f"{os.getuid()}:{os.getgid()}"):
+            raise AssertionError("unsafe disposable PostgreSQL configuration")
+        try:
+            subprocess.run(self.command + ["up", "--wait", "--wait-timeout", "40", "--pull", self.pull],
+                           check=True, timeout=150, env=self.env)
+            yield self
+        finally:
+            subprocess.run(self.command + ["down", "--volumes", "--timeout", "5"],
+                           check=True, timeout=30, env=self.env)
+            result = subprocess.check_output(self.command + ["ps", "--all", "-q"], env=self.env, timeout=10)
+            if result.strip():
+                raise RuntimeError("disposable PostgreSQL containers remain")
+
+    def run(self, argv, *, env, **kwargs):
+        child = {key: value for key, value in env.items() if key.startswith("PG")}
+        args = [item.replace(str(self.path / "tls"), "/trial/tls") for item in argv]
+        if "PGSSLROOTCERT" in child:
+            child["PGSSLROOTCERT"] = child["PGSSLROOTCERT"].replace(str(self.path / "tls"), "/trial/tls")
+        if self.loopback and child.get("PGHOST") in FIXTURE_HOSTS.values():
+            child["PGHOSTADDR"] = "127.0.0.1"
+        if self.loopback and args[0] == "openssl":
+            destination = args.index("-connect") + 1
+            args[destination] = "127.0.0.1:5432"
+        options = [item for key in child for item in ("-e", key)]
+        return subprocess.run(self.command + ["exec", "-T", *options, SERVICE, *args],
+                              env=self.env | child, **kwargs)
+
+    def psql(self, env, sql):
+        return self.run(PSQL, env=env, input=sql, capture_output=True, text=True, timeout=30)
+
+    def query(self, env, sql, stage):
+        result = self.psql(env, sql)
+        if result.returncode:
+            raise StagingApplyError(stage)
+        return result.stdout
+
+    def admin(self, sql, *, database=DATABASE):
+        result = self.psql({"PGUSER": BOOTSTRAP, "PGDATABASE": database, "PGHOST": "/var/run/postgresql"}, sql)
+        if result.returncode:
+            raise AssertionError(result.stderr)
+        return result.stdout.strip()
+
+    def setup(self):
+        version = self.admin("SHOW server_version_num;", database="postgres")
+        if version != "180006":
+            raise AssertionError("expected PostgreSQL 18.6")
+        owner, executor = ROLES["owner"], ROLES["executor"]
+        create_catalog(self.admin, "postgres", owner, executor, PASSWORD)
+        self.admin(f"""
+            CREATE DATABASE {EXTRA_DB} OWNER {owner} TEMPLATE template0;
+            ALTER DATABASE postgres OWNER TO {owner};
+            ALTER DATABASE template1 OWNER TO {owner};
+            REVOKE CONNECT ON DATABASE template0 FROM PUBLIC;
+        """, database="postgres")
+        entries = apply_catalog(self.admin, ROOT, executor)
+        self.admin(f"GRANT SELECT (file, sha256) ON public.schema_migrations TO {owner};"
+                   "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC;"
+                   f"GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO {owner};")
+        if self.admin("SELECT file || ':' || sha256 FROM public.schema_migrations ORDER BY file;").splitlines() != [
+                f"{entry['file']}:{entry['sha256']}" for entry in entries]:
+            raise AssertionError("unexpected catalog ledger")
+        return next(entry["sha256"] for entry in entries if entry["file"] == BASELINE)
+
+    def pins(self):
+        control = subprocess.check_output(self.command + ["exec", "-T", SERVICE, "pg_controldata"],
+                                          env=self.env, text=True, timeout=10)
+        instance = int(re.search(r"^Database system identifier:\s+([0-9]+)$", control, re.MULTILINE)[1])
+        db_oid = int(self.admin("SELECT oid FROM pg_database WHERE datname = current_database();"))
+        owners = {key: self.role_oid(ROLES[key]) for key in ("owner", "executor")}
+        return {"kind": KIND, "system_identifier": instance, "database_oid": db_oid,
+                "ca_sha256": fingerprint(self.ca.read_text(encoding="ascii")),
+                "server_sha256": fingerprint((self.path / "tls/server.crt").read_text(encoding="ascii")),
+                "routes": {key: [host, 5432] for key, host in FIXTURE_HOSTS.items()},
+                "role_oids": owners | {"reader": None, "writer": None}}
+
+    def role_oid(self, login):
+        return int(self.admin(f"SELECT oid FROM pg_roles WHERE rolname = '{login}';"))
+
+    def connect(self, pins, route, role, *, mode="verify-full", ca=None):
+        host, port = pins["routes"][route]
+        url = f"postgresql://{ROLES[role]}:{PASSWORD}@{host}:{port}/{DATABASE}?sslmode={mode}"
+        return tls_connection(url, pins, route, role, ca or self.ca, run=self.run)
+
+
+class Qualification(unittest.TestCase):
+    def check_hba(self, cluster):
+        self.assertEqual(cluster.admin("""
+            SELECT type || ':' || array_to_string(database, ',') || ':' || array_to_string(user_name, ',')
+                || ':' || coalesce(address, '') || ':' || auth_method
+            FROM pg_hba_file_rules ORDER BY rule_number;
+        """).splitlines(), [
+            f"local:all:{BOOTSTRAP}::peer",
+            f"hostssl:{DATABASE}:{','.join(ROLES.values())}:all:scram-sha-256",
+            "host:all:all:all:reject",
+        ])
+        self.assertEqual(cluster.admin("SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL OR options IS NOT NULL;"), "0")
+
+    def exercise_catalog(self, cluster, pins, baseline_digest):
+        owner = cluster.connect(pins, "direct", "owner")
+        executor = cluster.connect(pins, "direct", "executor")
+        check_catalog(pins, owner, executor, query=cluster.query)
+        for changed in ({"database_oid": pins["database_oid"] + 1},
+                        {"role_oids": pins["role_oids"] | {"executor": pins["role_oids"]["executor"] + 100}}):
+            with self.assertRaises(StagingApplyError):
+                check_catalog(pins | changed, owner, executor, query=cluster.query)
+        cluster.admin(f"UPDATE public.schema_migrations SET sha256 = repeat('0',64) WHERE file = '{BASELINE}';")
+        with self.assertRaisesRegex(StagingApplyError, "migration baseline"):
+            check_catalog(pins, owner, executor, query=cluster.query)
+        cluster.admin(f"UPDATE public.schema_migrations SET sha256 = '{baseline_digest}' WHERE file = '{BASELINE}';")
+        before = cluster.admin(CATALOG)
+        cluster.admin("CREATE SCHEMA pscale_extensions; CREATE EXTENSION btree_gin WITH SCHEMA pscale_extensions;")
+        with self.assertRaisesRegex(StagingApplyError, "extensions differ"):
+            check_catalog(pins, owner, executor, query=cluster.query)
+        self.assertEqual(cluster.admin("SELECT extname FROM pg_extension ORDER BY extname;"), "btree_gin\nplpgsql")
+        self.assertEqual(cluster.admin(CATALOG), before)
+        cluster.admin("DROP EXTENSION btree_gin; DROP SCHEMA pscale_extensions;")
+        check_catalog(pins, owner, executor, query=cluster.query)
+        return owner
+
+    def exercise_tls(self, cluster, pins, owner):
+        for mode in ("disable", "require", "verify-ca"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                cluster.connect(pins, "direct", "owner", mode=mode)
+        with self.assertRaisesRegex(StagingApplyError, "certificate identity"):
+            wrong = pins | {"ca_sha256": fingerprint(cluster.wrong_ca.read_text(encoding="ascii"))}
+            cluster.connect(wrong, "direct", "owner", ca=cluster.wrong_ca)
+        with self.assertRaisesRegex(StagingApplyError, "certificate identity"):
+            cluster.connect(pins | {"server_sha256": "0" * 64}, "direct", "owner")
+        self.assertNotEqual(cluster.psql(owner | {"PGSSLROOTCERT": str(cluster.wrong_ca)}, "SELECT 1;").returncode, 0)
+        for invalid in ({"PGSSLMODE": "disable", "PGCHANNELBINDING": "disable"},
+                        {"PGHOST": "incorrect.trial.invalid", "PGHOSTADDR": "127.0.0.1"}):
+            self.assertNotEqual(cluster.psql(owner | invalid, "SELECT 1;").returncode, 0)
+
+    def exercise_acl(self, cluster, pins, owner):
+        before = json.loads(cluster.admin(CATALOG))
+        postgres_id = next(entry[0] for entry in before["databases"] if entry[1] == "postgres")
+        plan = {"kind": KIND, "system_identifier": pins["system_identifier"], "database_oid": pins["database_oid"],
+                "baseline": before, "consumers": [[postgres_id, pins["role_oids"]["executor"], ROLES["executor"], "CONNECT"]]}
+        raw = json.dumps(plan)
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        with self.assertRaises(ValueError):
+            compose_selfhost("restrict-ambient", raw, digest, pins | {"system_identifier": 1})
+        with self.assertRaises(ValueError):
+            compose_selfhost("restrict-ambient", raw, "0" * 64, pins)
+        statements = {action: compose_selfhost(action, raw, digest, pins) for action in
+                      ("check-ambient", "restrict-ambient", "restore-ambient")}
+        cluster.query(owner, statements["check-ambient"], "check ambient")
+        cluster.admin(f"GRANT CREATE ON DATABASE {DATABASE} TO PUBLIC;")
+        drifted = json.loads(cluster.admin(CATALOG))
+        with self.assertRaises(StagingApplyError):
+            cluster.query(owner, statements["restrict-ambient"], "restrict ambient")
+        self.assertEqual(json.loads(cluster.admin(CATALOG)), drifted)
+        cluster.admin(f"REVOKE CREATE ON DATABASE {DATABASE} FROM PUBLIC;")
+        for _ in range(2):
+            cluster.query(owner, statements["restrict-ambient"], "restrict ambient")
+        self.assertEqual(cluster.admin(f"SELECT has_database_privilege('{ROLES['executor']}', 'postgres', 'CONNECT');"), "t")
+        for key in ("reader", "writer"):
+            role = ROLES[key]
+            cluster.admin(f"CREATE ROLE {role} LOGIN NOINHERIT PASSWORD '{PASSWORD}'; GRANT CONNECT ON DATABASE {DATABASE} TO {role};")
+            pins["role_oids"][key] = cluster.role_oid(role)
+            env = cluster.connect(pins, "routed", key)
+            check_session(pins, key, cluster.connect(pins, "direct", key), query=cluster.query)
+            check_session(pins, key, env, query=cluster.query)
+            self.assertEqual(cluster.query(env, "SELECT has_function_privilege('pg_catalog.pg_control_system()', 'EXECUTE');",
+                                           "runtime control file privilege"), "f\n")
+            for database in ("postgres", "template0", "template1", EXTRA_DB):
+                self.assertNotEqual(cluster.psql(env | {"PGDATABASE": database}, "SELECT 1;").returncode, 0)
+                cluster.admin(f"GRANT CONNECT ON DATABASE {database} TO {role};")
+                with self.assertRaises(StagingApplyError):
+                    check_session(pins, key, env, query=cluster.query)
+                cluster.admin(f"REVOKE CONNECT ON DATABASE {database} FROM {role};")
+            check_session(pins, key, env, query=cluster.query)
+        with self.assertRaises(StagingApplyError):
+            cluster.query(owner, statements["restore-ambient"], "restore ambient with roles present")
+        for role in (ROLES["reader"], ROLES["writer"]):
+            cluster.admin(f"REVOKE CONNECT ON DATABASE {DATABASE} FROM {role}; DROP ROLE {role};")
+        for _ in range(2):
+            cluster.query(owner, statements["restore-ambient"], "restore ambient")
+        self.assertEqual(json.loads(cluster.admin(CATALOG)), before)
+
+    def test_catalog_and_continuity(self):
+        with tempfile.TemporaryDirectory(prefix="nntune-stage-a-") as directory:
+            root = Path(directory)
+            certs, wrong_certs = root / "identity", root / "wrong-identity"
+            create_tls(certs, fixture=True)
+            create_tls(wrong_certs, fixture=True)
+            args = certs, wrong_certs / "ca/ca.crt", self.pull, self.loopback
+            with (Disposable(root / "primary", *args).running() as primary,
+                  Disposable(root / "alternate", *args).running() as alternate):
+                digest = primary.setup()
+                alternate.setup()
+                pins = selfhost_target_config(json.dumps(primary.pins()), fixture=True)
+                alternate_pins = alternate.pins()
+                self.assertEqual(pins | {"system_identifier": alternate_pins["system_identifier"]}, alternate_pins)
+                self.assertNotEqual(pins["system_identifier"], alternate_pins["system_identifier"])
+                self.assertEqual(int(primary.admin(CONTROL + ";")), pins["system_identifier"])
+                self.assertEqual(int(alternate.admin(CONTROL + ";")), alternate_pins["system_identifier"])
+                self.check_hba(primary)
+                hba = primary.path / "config" / HBA
+                original = hba.read_text(encoding="ascii")
+                try:
+                    hba.write_text(original.replace("peer", "trust"), encoding="ascii")
+                    with self.assertRaises(AssertionError):
+                        self.check_hba(primary)
+                finally:
+                    hba.write_text(original, encoding="ascii")
+                self.check_hba(primary)
+                owner = self.exercise_catalog(primary, pins, digest)
+                self.exercise_tls(primary, pins, owner)
+                check_session(pins, "owner", primary.connect(pins, "routed", "owner"), query=primary.query)
+                check_session(pins, "executor", primary.connect(pins, "routed", "executor"), query=primary.query)
+                alternate_owner = alternate.connect(pins, "routed", "owner")
+                with self.assertRaisesRegex(StagingApplyError, "session continuity"):
+                    check_session(pins, "owner", alternate_owner, query=alternate.query)
+                check_session(alternate_pins, "owner", alternate_owner, query=alternate.query)
+                self.exercise_acl(primary, pins, owner)
+
+    def test_target_kind_pins_are_disjoint(self):
+        cfg = {"database_oid": 16494, "executor_oid": 20001, "direct": "direct.fixture.psdb.cloud",
+               "direct_port": 5432, "routed": "routed.fixture.psdb.cloud", "routed_port": 6432,
+               "owner": "postgres.fixture", "executor": "executor.fixture", "reader": ROLES["reader"],
+               "writer": ROLES["writer"]}
+        self.assertEqual(target_config(json.dumps(cfg), None, False), cfg)
+        stock = {"kind": KIND, "database_oid": 20000, "system_identifier": 30000, "ca_sha256": "a" * 64,
+                 "server_sha256": "b" * 64, "routes": {key: [host, 5432] for key, host in HOSTS.items()},
+                 "role_oids": {key: 20001 + n for n, key in enumerate(ROLES)}}
+        self.assertEqual(selfhost_target_config(json.dumps(stock)), stock)
+        with self.assertRaises(ValueError):
+            selfhost_target_config(json.dumps(cfg))
+        with self.assertRaises(ValueError):
+            target_config(json.dumps(stock), None, False)
+        with self.assertRaises(ValueError):
+            selfhost_target_config((OPS / "pins.example.json").read_text(encoding="ascii"))
+
+
+if __name__ == "__main__":
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("--pull", choices=("never", "missing"), default="never")
+    cli.add_argument("--loopback", action="store_true", help="use 127.0.0.1 in each disposable namespace")
+    opts, unittest_argv = cli.parse_known_args()
+    Qualification.pull, Qualification.loopback = opts.pull, opts.loopback
+    unittest.main(argv=[sys.argv[0], *unittest_argv], verbosity=2)

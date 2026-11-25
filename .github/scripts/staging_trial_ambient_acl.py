@@ -10,7 +10,7 @@ import sys
 
 from apply_migration import ADVISORY_LOCK_KEY, ApplyError
 from staging_apply import StagingApplyError, evidence_child_env, quote_literal as literal
-from staging_trial_isolated import SHARED_OID
+from staging_trial_isolated import KIND, ROLES, SHARED_OID
 from staging_trial_role_acl import audit, isolated_extensions, require
 from staging_trial_role_lifecycle import NAMES, baseline, psql, target
 from staging_trial_role_preflight import DATABASE, ROLE_RE, oid
@@ -107,7 +107,7 @@ def after_plan(original, consumers, database_oid):
     return dbs, after, sorted(public), sorted(added), sorted(identities)
 
 
-def compose(action, original, consumers, database_oid, login, *, fixture=False):
+def compose(action, original, consumers, database_oid, login, *, fixture=False, owner_guard=""):
     dbs, after, public, added, identities = after_plan(original, consumers, database_oid)
     owner = dbs[database_oid][1]
     affected = sorted({row[0] for row in public})
@@ -140,7 +140,7 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False):
 
     readonly = action == "check-ambient"
     sql = f"BEGIN {'READ ONLY' if readonly else 'READ WRITE'};\nSET LOCAL standard_conforming_strings = on;\n"
-    sql += target({"database_oid": database_oid}, login, fixture) + baseline()
+    sql += target({"database_oid": database_oid}, login, fixture) + owner_guard + baseline()
     sql += f"SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
     sql += require(f"to_regrole(current_user)::oid = {owner}")
     sql += require(f"NOT EXISTS (SELECT FROM pg_roles WHERE rolname IN ({', '.join(map(literal, NAMES))}))")
@@ -169,6 +169,23 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False):
         sql += f"SELECT {restricted} AS change_needed \\gset\n\\if :change_needed\n"
         sql += ddl(public, True) + ddl(added, False) + "\\endif\n" + require(before)
     return sql + "COMMIT;\n"
+
+
+def compose_selfhost(action, raw, digest, pins):
+    # A distinct, independently pinned instance replaces the provider branch
+    # check only for the dormant stock PostgreSQL path.
+    from staging_trial_selfhost import session_guard
+
+    if action not in OPERATIONS or len(raw) > 32000 or hashlib.sha256(raw.encode()).hexdigest() != digest:
+        raise ValueError
+    plan = json.loads(raw)
+    if (not isinstance(plan, dict) or plan.keys() != {"kind", "system_identifier", "database_oid", "baseline", "consumers"}
+            or plan["kind"] != KIND or type(plan["system_identifier"]) is not int
+            or plan["system_identifier"] != pins["system_identifier"]
+            or not oid(plan["database_oid"]) or plan["database_oid"] != pins["database_oid"]):
+        raise ValueError
+    return compose(action, plan["baseline"], plan["consumers"], pins["database_oid"], ROLES["owner"],
+                   owner_guard=session_guard(pins, "owner"))
 
 
 def main():
