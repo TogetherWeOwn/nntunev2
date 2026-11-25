@@ -577,13 +577,13 @@ jobs:
           --health-retries 12
     steps:
       - name: Install pinned Ubuntu pooler
+        timeout-minutes: 8
         run: |
-          # Keep the signed development-archive versions available after newer uploads.
-          # Resolute packages remain preferred except for the explicit pins below.
+          apt_fetch_options=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
           printf '%s\n' 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261115T000000Z tenacious main universe' | sudo tee /etc/apt/sources.list.d/fixture-pooler.list >/dev/null
           printf 'Package: *\nPin: release n=tenacious\nPin-Priority: 100\n' | sudo tee /etc/apt/preferences.d/fixture-pooler >/dev/null
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          sudo apt-get "${apt_fetch_options[@]}" update --error-on=any
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${apt_fetch_options[@]}" install -y --no-install-recommends \
             pgbouncer=1.26.1-1 libssl4=4.0.3-1ubuntu1 openssl-provider-legacy=4.0.3-1ubuntu1
           sudo systemctl stop pgbouncer.service
       - name: Configure disposable pool
