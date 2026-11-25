@@ -96,7 +96,15 @@ impl Selection {
         permit: Permit<'_>,
         body: &[u8],
     ) -> Result<CommittedPublication, TrialError> {
-        let cutoff = permit.policy.expires_at.min(permit.actor.expires_at);
+        let step_up_end = permit
+            .actor
+            .created_at
+            .saturating_add(crate::session::PRIVILEGE_REAUTH_WINDOW_SECS + 1);
+        let cutoff = permit
+            .policy
+            .expires_at
+            .min(permit.actor.expires_at)
+            .min(step_up_end);
         let until = UNIX_EPOCH
             .checked_add(Duration::from_secs(cutoff))
             .ok_or(Refused)?;
@@ -308,6 +316,7 @@ impl Selection {
             .await
     }
     fn mirror(&self, env: &Env) -> Result<MirrorEvidence, TrialError> {
+        // The protected receipt carries the complete, ready mirror evidence.
         env.hyperdrive("MB_DB").map_err(|_| Unconfirmed)?;
         let verified = secret(env, "PRIVATE_TRIAL_MIRROR_EVIDENCE")?;
         if verified.len() > 16_384 {
