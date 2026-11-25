@@ -425,15 +425,22 @@ try:
             session = subprocess.Popen(["psql", "-XqAtw"], text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL,
                                        env={**base, "PGDATABASE": "template1", "PGUSER": reliant, "PGCONNECT_TIMEOUT": "5"})
+            pid = None
             try:
-                session.stdin.write("SELECT 1;\n")
+                session.stdin.write("SELECT pg_backend_pid();\n")
                 session.stdin.flush()
-                assert session.stdout.readline().strip() == "1"
+                pid = int(session.stdout.readline().strip())
                 yield
             finally:
-                if session.poll() is None:
-                    session.terminate()
-                session.wait(timeout=10)
+                try:
+                    if pid is not None:
+                        pinned_backend = f"pid = {pid} AND usename = '{reliant}' AND datname = 'template1'"
+                        assert sql(f"SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE {pinned_backend};") in ("", "t")
+                        assert sql(f"SELECT NOT EXISTS (SELECT FROM pg_stat_activity WHERE {pinned_backend});") == "t"
+                finally:
+                    if session.poll() is None:
+                        session.terminate()
+                    session.wait(timeout=10)
 
         try:
             with public_client():
