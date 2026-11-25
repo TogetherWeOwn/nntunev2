@@ -11,7 +11,7 @@ import tempfile
 from textwrap import dedent
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 SPEC = importlib.util.spec_from_file_location("check_worker_upload", Path(__file__).with_name("check_worker_upload.py"))
@@ -251,6 +251,67 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
         for invalid in ("", "1" * 32, ordinary["prod"], ordinary["staging"]):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "distinct scoped binding"):
                 STREAM_CONFIG.trial_db_bindings(env | bindings | {"PRIVATE_TRIAL_AUTH_DB_STAGING_ID": invalid})
+
+    def test_lost_trial_connection_create_prepares_original_binding(self):
+        # Offline C1 runbook fixture. These are normalized, synthetic records
+        # from the attempt, provider lookup and protected SQL/transport pins.
+        request_ref = "synthetic-enroll-request"
+        requested = {
+            "account": "synthetic-trial-account",
+            "binding": "PRIVATE_TRIAL_ENROLL_DB",
+            "database": ("nntunev2_staging", 40200),
+            "role": ("fixture_enroll", 40204),
+            "origin": "trial.example.invalid",
+            "access_client_ref": "synthetic-serving-client",
+            "origin_ca_ref": "synthetic-trial-ca",
+            "sslmode": "verify-full",
+            "caching_disabled": True,
+        }
+        config_id = "4" * 32
+        configs, protected_results = [], {}
+
+        def lose_create_response(ref, scope):
+            configs.append(scope | {"id": config_id})
+            protected_results[scope["account"], ref] = config_id
+            raise TimeoutError("synthetic response lost after create")
+
+        create = Mock(side_effect=lose_create_response)
+        with self.assertRaises(TimeoutError):
+            create(request_ref, requested)
+
+        def reconcile(results, readbacks):
+            bound_id = results.get((requested["account"], request_ref))
+            expected = requested | {"id": bound_id}
+            matches = [row for row in readbacks if row == expected] if bound_id else []
+            if len(matches) != 1:
+                return {"next_action": "reconcile", "connection": None}
+            return {"next_action": "prepare", "connection": matches[0]}
+
+        original = requested | {"id": config_id}
+        unrelated = original | {"id": "9" * 32}
+        handoff = reconcile(protected_results, [unrelated, *configs])
+        self.assertEqual(handoff, {"next_action": "prepare", "connection": original})
+        for case, results, readbacks in (
+            ("missing", protected_results, [unrelated]),
+            ("duplicate", protected_results, configs * 2),
+            ("unbound", {}, configs),
+            ("wrong account", protected_results, [original | {"account": "other-account"}]),
+            ("wrong role", protected_results, [original | {"role": ("fixture_enroll", 40205)}]),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(reconcile(results, readbacks), {"next_action": "reconcile", "connection": None})
+
+        connection = handoff["connection"]
+        already_verified = {"UPLOAD": "1" * 32, "AUTH": "2" * 32, "PUBLISH": "3" * 32}
+        inputs = {f"PRIVATE_TRIAL_{role}_DB_STAGING_ID": value for role, value in already_verified.items()}
+        inputs[f"{connection['binding']}_STAGING_ID"] = connection["id"]
+        rendered = STREAM_CONFIG.trial_db_bindings(inputs | {"PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED": "true"})
+        bindings = tomllib.loads("\n".join(rendered))["env"]["staging"]["hyperdrive"]
+        self.assertEqual(bindings, [
+            {"binding": f"PRIVATE_TRIAL_{role}_DB", "id": value}
+            for role, value in (already_verified | {"ENROLL": config_id}).items()
+        ])
+        create.assert_called_once_with(request_ref, requested)
 
     def test_stream_config_is_internal_and_uses_the_dedicated_fixture_bucket(self):
         source = tomllib.loads((ROOT / "workers/stream/wrangler.toml").read_text())
