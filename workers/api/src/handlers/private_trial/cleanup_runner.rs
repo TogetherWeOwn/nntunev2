@@ -49,6 +49,14 @@ struct Scope {
     page_version: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Approval {
+    provider: Provider,
+    scope_sha256: String,
+    s3_access_key_sha256: String,
+}
+
 #[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Provider {
@@ -150,9 +158,14 @@ async fn run(env: &Env) -> Result<bool, TrialError> {
         return Err(Refused);
     }
     let raw = secret(env, "CLEANUP_SCOPE", 8_192)?;
-    match_sha256(&raw, &secret(env, "CLEANUP_SCOPE_SHA256", 64)?)?;
+    let approval: Approval = parse(&secret(env, "CLEANUP_APPROVAL", 2_048)?)?;
+    let dispatch_scope = secret(env, "CLEANUP_SCOPE_SHA256", 64)?;
+    if approval.scope_sha256.as_str() != dispatch_scope.as_str() {
+        return Err(Refused);
+    }
+    match_sha256(&raw, &approval.scope_sha256)?;
     let scope: Scope = parse(&raw)?;
-    let provider: Provider = parse(&secret(env, "CLEANUP_PROVIDER", 2_048)?)?;
+    let provider = approval.provider;
     if scope.provider != provider
         || provider.bucket != BUCKET
         || scope.invite <= 0
@@ -199,6 +212,7 @@ async fn run(env: &Env) -> Result<bool, TrialError> {
     let credential = secret(env, "CLEANUP_S3", 2_048)?;
     match_sha256(&credential, &scope.s3_credential_sha256)?;
     let keys: S3Credential = parse(&credential)?;
+    match_sha256(&keys.access_key, &approval.s3_access_key_sha256)?;
     let remover = FixtureVersionRemover::new(
         uuid(&provider.configuration)?,
         &provider.endpoint,

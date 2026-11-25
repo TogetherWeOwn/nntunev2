@@ -17,7 +17,9 @@ const provider = {
   environment: id(1), library: id(2), configuration: id(3), root_version: id(4),
   bucket: 'nntunev2-private-fixtures-staging', endpoint: 'https://cleanup-s3.example.test', region: 'fixture-region',
 };
-const s3 = JSON.stringify({ access_key: 'FIXTUREACCESS', secret_key: 'synthetic-version-secret' });
+const cleanupAccessKey = 'FIXTUREACCESS';
+const s3 = JSON.stringify({ access_key: cleanupAccessKey, secret_key: 'synthetic-version-secret' });
+const preflightS3 = JSON.stringify({ access_key: 'PREFLIGHTACCESS', secret_key: 'synthetic-preflight-secret' });
 const scope = {
   provider, database_host: '127.0.0.1', database_port: 5432, database_role: role, s3_credential_sha256: sha(s3),
   object: id(5), generation: id(6), map: id(7), track: id(8), session: id(9),
@@ -27,6 +29,7 @@ const scope = {
 };
 const mediaKey = `media/${keyId(scope.object)}/${keyId(scope.generation)}`;
 const pageKey = `media-digests/${keyId(scope.object)}/${keyId(scope.generation)}/${keyId(scope.map)}/00000000`;
+const siblingKey = `media/${keyId(id('b'))}/${keyId(id('c'))}`;
 const psql = (database, ...args) => execFileSync('psql', [
   '-XqAt', '-h', '127.0.0.1', '-p', '5432', '-U', 'postgres', '-d', database,
   '-v', 'ON_ERROR_STOP=1', ...args,
@@ -53,7 +56,7 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
       (SELECT count(*) FROM public.storage_validated_digest_references WHERE object_id = '${scope.object}'),
       (SELECT count(*) FROM public.catalogue_s3_sources)`);
     const versions = new Map([[mediaKey, new Set([scope.media_version, 'other-media'])],
-      [pageKey, new Set([scope.page_version, 'other-page'])]]);
+      [pageKey, new Set([scope.page_version, 'other-page'])], [siblingKey, new Set(['sibling-version'])]]);
     const calls = [];
     let interrupt = true;
     const origin = async (req) => {
@@ -72,27 +75,37 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
         return new Response(null, { status: 204 });
       }
       assert.equal(req.method, 'HEAD');
-      if (key === pageKey && interrupt) return new Response(null, { status: 503 });
+      if (key === mediaKey && interrupt) return new Response(null, { status: 503 });
       return new Response(null, { status: versions.get(key).has(version) ? 200 : 404 });
     };
+    const approvalFor = (selection) => ({
+      provider, scope_sha256: sha(JSON.stringify(selection)), s3_access_key_sha256: sha(cleanupAccessKey),
+    });
     const run = (selection = scope, overrides = {}) => {
       const raw = JSON.stringify(selection);
       return invoke(process.env.PRIVATE_TRIAL_CLEANUP_BUNDLE, {
         CLEANUP_STAGE: 'staging', CLEANUP_SCOPE: raw, CLEANUP_SCOPE_SHA256: sha(raw),
-        CLEANUP_PROVIDER: JSON.stringify(provider), CLEANUP_S3: s3, CLEANUP_DATABASE_URL: uri, ...overrides,
+        CLEANUP_APPROVAL: JSON.stringify(approvalFor(scope)), CLEANUP_S3: s3, CLEANUP_DATABASE_URL: uri, ...overrides,
       }, origin);
     };
+    const approved = (selection) => JSON.stringify(approvalFor(selection));
+    const wrongVersion = { ...scope, page_version: 'other-page' };
+    const wrongFixture = { ...scope, track: id('a') };
+    const wrongCutoff = { ...scope, cutoff: scope.cutoff + 3600 };
+    const wrongRole = { ...scope, database_role_oid: scope.database_role_oid + 1 };
     const controls = [
       ['missing invocation scope pin', scope, { CLEANUP_SCOPE_SHA256: '' }],
       ['wrong environment', scope, { CLEANUP_STAGE: 'production' }],
-      ['wrong trusted provider', scope, { CLEANUP_PROVIDER: JSON.stringify({ ...provider, endpoint: 'https://foreign.example.test' }) }],
-      ['wrong recorded version', { ...scope, page_version: 'other-page' }],
-      ['wrong recorded fixture', { ...scope, track: id('a') }],
-      ['wrong DB identity', { ...scope, database_role_oid: scope.database_role_oid + 1 }],
+      ['wrong trusted provider', scope, { CLEANUP_APPROVAL: JSON.stringify({
+        ...approvalFor(scope), provider: { ...provider, endpoint: 'https://foreign.example.test' },
+      }) }],
+      ['wrong recorded version', wrongVersion, { CLEANUP_APPROVAL: approved(wrongVersion) }],
+      ['wrong recorded fixture', wrongFixture, { CLEANUP_APPROVAL: approved(wrongFixture) }],
+      ['wrong DB identity', wrongRole, { CLEANUP_APPROVAL: approved(wrongRole) }],
       ['wrong DB target', scope, { CLEANUP_DATABASE_URL: uri.replace(db, 'nntune_ci') }],
       ['plaintext database connection', scope, { CLEANUP_DATABASE_URL: uri.replace('sslmode=require', 'sslmode=disable') }],
       ['wrong S3 authority', scope, { CLEANUP_S3: s3.replace('synthetic-version-secret', 'other-secret') }],
-      ['before cohort cutoff', { ...scope, cutoff: scope.cutoff + 3600 }],
+      ['before cohort cutoff', wrongCutoff, { CLEANUP_APPROVAL: approved(wrongCutoff) }],
     ];
     for (const [label, selection, overrides] of controls) {
       assert.equal(await run(selection, overrides), 'refused', label);
@@ -105,18 +118,41 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
       WHERE object_id = '${scope.object}'`);
     const attempt = [['DELETE', mediaKey, scope.media_version], ['HEAD', mediaKey, scope.media_version],
       ['DELETE', pageKey, scope.page_version], ['HEAD', pageKey, scope.page_version]];
+    const partial = attempt.slice(0, 2);
     assert.equal(await run(), 'unconfirmed');
-    assert.deepEqual(calls, attempt);
+    assert.deepEqual(calls, partial);
     assert.equal(state(), 't|0|0|1');
-    assert.equal(await run({ ...scope, track: id('a') }), 'refused', 'interrupted state is still pinned');
-    assert.deepEqual(calls, attempt);
+    assert.equal(versions.get(mediaKey).has(scope.media_version), false);
+    assert.equal(versions.get(pageKey).has(scope.page_version), true);
+    const preflightScope = { ...scope, s3_credential_sha256: sha(preflightS3) };
+    const continuationControls = [
+      ['another upload attempt', { ...scope, session: id('a'), job: 'other-attempt' }],
+      ['another fixture', wrongFixture],
+      ['another version', wrongVersion],
+      ['changed scope bytes with the original dispatch pin', wrongVersion, {
+        CLEANUP_SCOPE_SHA256: approvalFor(scope).scope_sha256,
+      }],
+      ['missing scope', scope, { CLEANUP_SCOPE: '' }],
+      ['missing approval', scope, { CLEANUP_APPROVAL: '' }],
+      ['missing approved scope pin', scope, { CLEANUP_APPROVAL: JSON.stringify({ ...approvalFor(scope), scope_sha256: undefined }) }],
+      ['missing approved key pin', scope, { CLEANUP_APPROVAL: JSON.stringify({ ...approvalFor(scope), s3_access_key_sha256: undefined }) }],
+      ['storage preflight identity even with matching credential JSON pin', preflightScope, {
+        CLEANUP_APPROVAL: approved(preflightScope), CLEANUP_S3: preflightS3,
+      }],
+    ];
+    for (const [label, selection, overrides] of continuationControls) {
+      assert.equal(await run(selection, overrides), 'refused', label);
+      assert.deepEqual(calls, partial, label);
+      assert.equal(state(), 't|0|0|1', label);
+    }
 
     interrupt = false;
     assert.equal(await run(), 'confirmed');
-    assert.deepEqual(calls, [...attempt, ...attempt]);
+    assert.deepEqual(calls, [...partial, ...attempt]);
     assert.equal(state(), 't|0|0|0');
     assert.deepEqual([...versions.get(mediaKey)], ['other-media']);
     assert.deepEqual([...versions.get(pageKey)], ['other-page']);
+    assert.deepEqual([...versions.get(siblingKey)], ['sibling-version']);
   } finally {
     psql('postgres', '-c', 'DROP DATABASE IF EXISTS nntunev2_staging WITH (FORCE)');
     psql('postgres', '-c', 'DROP ROLE IF EXISTS trial_cleanup_fixture');
