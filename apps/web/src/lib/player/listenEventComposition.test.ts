@@ -6,7 +6,7 @@ import { observeListenEvents } from './observeListenEvents.js';
 
 it('orders the current grant’s events and refuses the retired grant’s late terminal', async () => {
 	vi.useFakeTimers();
-	onTestFinished(() => vi.useRealTimers());
+	onTestFinished(() => { vi.useRealTimers(); });
 	const account = new AbortController();
 	const owner: AccountSession = {
 		generation: 'synthetic-account', signal: account.signal, isCurrent: () => !account.signal.aborted,
