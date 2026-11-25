@@ -9,9 +9,10 @@ const loadWorker = require('../../workers/ingest/tests/fixtures/worker_fixture_w
 // and read the TLS stream to EOF to verify that the wire reply ends there.
 async function sendBodylessRequest(request) {
   const url = new URL(request.url);
+  const hostname = url.hostname.replace(/^\[|\]$/g, '');
   const socket = connect({
-    host: url.hostname, port: Number(url.port || 443),
-    servername: isIP(url.hostname) ? undefined : url.hostname,
+    host: hostname, port: Number(url.port || 443),
+    servername: isIP(hostname) ? undefined : hostname,
     ALPNProtocols: ['http/1.1'], rejectUnauthorized: true,
   });
   const abort = () => socket.destroy(new Error('provider deadline elapsed'));
@@ -20,7 +21,7 @@ async function sendBodylessRequest(request) {
     if (request.signal.aborted) throw new Error('provider deadline elapsed');
     const headers = Array.from(request.headers, ([name, value]) => `${name}: ${value}`);
     socket.write([`${request.method} ${url.pathname}${url.search} HTTP/1.1`, `Host: ${url.host}`,
-      'Connection: close', ...headers, '', ''].join('\r\n'));
+      'Connection: close', 'Cache-Control: no-cache, no-store', 'Pragma: no-cache', ...headers, '', ''].join('\r\n'));
     const chunks = [];
     let size = 0;
     for await (const chunk of socket) {
@@ -57,11 +58,11 @@ async function qualify(bundle, endpoint, region, scope, credential, send = sendB
     const response = await send(request);
     const length = response.headers.get('content-length');
     const marker = response.headers.get('x-amz-delete-marker');
+    const transferEncoded = response.headers.has('transfer-encoding');
     if (response.url !== request.url || response.headers.has('content-range')
         || (marker !== null && marker !== 'false')
-        || (length !== null && !/^\d+$/.test(length))
-        || (response.status === 204 && ((length !== null && length !== '0') ||
-          response.headers.has('transfer-encoding')))) {
+        || (length !== null && (!/^\d+$/.test(length) || transferEncoded))
+        || (response.status === 204 && (transferEncoded || (length !== null && length !== '0')))) {
       throw new Error('ambiguous provider response');
     }
     return response;

@@ -116,9 +116,9 @@ test('synthetic provider proof stops on invalid selection or ambiguous replies',
   }
 });
 
-test('synthetic TLS origin refuses trailing bytes after an otherwise valid HEAD or DELETE', async (t) => {
-  let lines = [];
-  let corruptStep = -1;
+test('synthetic TLS origin checks signed headers and refuses ambiguous wire replies', async (t) => {
+  let requests = [];
+  let fault;
   const server = createServer({ key: readFileSync(process.env.S3_FIXTURE_KEY),
     cert: readFileSync(process.env.NODE_EXTRA_CA_CERTS) }, (socket) => {
     socket.on('error', () => {});
@@ -126,27 +126,46 @@ test('synthetic TLS origin refuses trailing bytes after an otherwise valid HEAD 
     socket.on('data', (chunk) => {
       input += chunk;
       if (!input.endsWith('\r\n\r\n')) return;
-      const step = lines.push(input.split('\r\n')[0]) - 1;
+      const step = requests.push(input) - 1;
       const [, pin] = plan[step];
       const status = ['200 OK', '200 OK', '204 No Content', '404 Not Found',
         '204 No Content', '404 Not Found', '200 OK'][step];
       const length = status.startsWith('204') ? '' : 'Content-Length: 7\r\n';
-      socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\n${length}x-amz-version-id: ${pin}\r\n\r\n`);
-      socket.end(step === corruptStep ? 'payload' : undefined);
+      const extra = step === fault.step && fault.conflictingFraming ? 'Transfer-Encoding: chunked\r\n' : '';
+      socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\n${length}${extra}x-amz-version-id: ${pin}\r\n\r\n`);
+      socket.end(step === fault.step && !fault.conflictingFraming ? 'payload' : undefined);
     });
   });
-  server.listen(0, '127.0.0.1');
+  server.listen(0, '::1');
   await once(server, 'listening');
   t.after(() => new Promise(resolve => server.close(resolve)));
-  const origin = `https://127.0.0.1:${server.address().port}`;
+  const host = `[::1]:${server.address().port}`;
+  const origin = `https://${host}`;
   const scope = { bucket, endpoint: origin, region, generation, version, sibling_version: sibling };
-  for (const step of [-1, 2, 5]) {
-    lines = [];
-    corruptStep = step;
+  for (const scenario of [{ step: -1 }, { step: 2 }, { step: 5 }, { step: 6, conflictingFraming: true }]) {
+    requests = [];
+    fault = scenario;
+    const qualified = fault.step < 0;
     assert.equal(await qualify(process.env.INGEST_WASM_JS, origin, region,
-      JSON.stringify(scope), JSON.stringify(credential)), step < 0 ? 'qualified' : 'unconfirmed');
-    assert.deepEqual(lines, plan.slice(0, step < 0 ? plan.length : step + 1)
-      .map(([method, pin]) => `${method} ${path}?${queryFor(pin)} HTTP/1.1`));
+      JSON.stringify(scope), JSON.stringify(credential)), qualified ? 'qualified' : 'unconfirmed');
+    assert.equal(requests.length, qualified ? plan.length : fault.step + 1);
+    for (const [step, request] of requests.entries()) {
+      const [method, pin] = plan[step];
+      const [line, ...fields] = request.slice(0, -4).split('\r\n');
+      const headers = new Headers(fields.map(field => {
+        const colon = field.indexOf(':');
+        return [field.slice(0, colon), field.slice(colon + 1)];
+      }));
+      assert.equal(line, `${method} ${path}?${queryFor(pin)} HTTP/1.1`);
+      assert.equal(headers.get('host'), host);
+      assert.equal(headers.get('cache-control'), 'no-cache, no-store');
+      assert.equal(headers.get('pragma'), 'no-cache');
+      const signed = { host, 'x-amz-date': headers.get('x-amz-date'),
+        'x-amz-content-sha256': sha256(Buffer.alloc(0)) };
+      assert.equal(headers.get('x-amz-content-sha256'), signed['x-amz-content-sha256']);
+      assert.equal(headers.get('authorization'),
+        authorization(method, path, queryFor(pin), signed, credential.access_key, credential.secret_key, region));
+    }
   }
 });
 
