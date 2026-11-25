@@ -2,14 +2,19 @@
 
 This worked example uses placeholders for the dedicated PostgreSQL trial.
 The assigned C1 executor issues one account-owned API token at C1 time,
-once the existing setup prerequisites pass, including the merged disposable
-proof. Use it only for the approved trial operations. The token is separate
-from the trial's Access service tokens.
+once the existing setup prerequisites pass. In the protected trial record,
+confirm the Stage B loopback rerun passed from the merged stock PostgreSQL
+trial target, with fresh disposables and confirmed teardown. Use the merged
+revision and the rerun and disposal evidence references in that record.
+Use the API token only for approved trial operations. The trial's Access
+service tokens have their own lifecycle. [Stock PostgreSQL trial target](https://github.com/TogetherWeOwn/nntunev2/pull/1919)
 
 ## Issue and verify
 
 Use the approved account key in secure custody only to create and delete
-this temporary token. For `POST /accounts/<trial-account-id>/tokens`, use the
+this temporary token. Send `POST /accounts/<trial-account-id>/tokens` once
+with automatic retries disabled, including any caller-level retries. With
+the Cloudflare TypeScript SDK, set `maxRetries: 0` for this request. Use the
 name `nntune-trial-c1-<date>` and an explicit UTC `expires_on` at most seven
 days after issuance. Record the intended policy, issue time, expiry and the
 single zone ID bound to the approved DNS zone in the protected trial record.
@@ -79,15 +84,26 @@ references and the identity, policy, scope and expiry verdicts.
 
 Dispose with the trial after the last authorized operation that uses the
 token. Follow the existing schedule of same-day disposal, with lead-approved
-retention of up to seven days for reruns. Use the approved account key to
-`DELETE /accounts/<trial-account-id>/tokens/<c1-token-id>`. If the response
-includes `result.id`, match it to the recorded ID. Confirm deletion with the
-same authorized metadata access and exact account-scoped GET used above.
-Require a definitive token-not-found result in the verified account scope.
-Denial, timeout or an ambiguous lookup leaves disposal unverified. An expired
-or disabled token returned by GET is still present. Remove the exact secure
-file and confirm that the path has no remaining entry, including a dangling
-symlink, without reading its contents. Record provider and file absence in the
-protected disposal outcome and carry forward any unresolved item for
-reconciliation.
+retention of up to seven days for reruns. For the absence check, establish
+visibility before deletion. With the authorized metadata reader, list
+`GET /accounts/<trial-account-id>/tokens?include_expired=true` and confirm
+the exact token ID is visible. The list can be limited to tokens the caller
+created. A list that never showed this ID cannot prove its removal.
+[List account tokens](https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/methods/list/)
+
+Use the approved account key to `DELETE /accounts/<trial-account-id>/tokens/<c1-token-id>`.
+If the response includes `result.id`, match it to the recorded ID. With the
+same metadata reader and unchanged account scope and visibility, repeat the
+exact token GET and the account list with `include_expired=true`. Confirm
+absence only when the GET returns 404 and a successful, fully paginated list
+contains no matching `result[].id`. A bare 404, denial, timeout, missing or
+incomplete list, or changed visibility leaves disposal unverified. A token
+returned as expired or disabled is still present. Check both lists during
+the same disposal attempt. If the token is already expired, confirm that
+both lists still cover its expiry time.
 [Delete account token](https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/methods/delete/)
+
+Remove the exact secure file and confirm that the path has no remaining
+entry, including a dangling symlink, without reading its contents. Record
+provider and file absence in the protected disposal outcome and carry
+forward any unresolved item for reconciliation.
