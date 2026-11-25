@@ -25,6 +25,13 @@ test('operator switch-off requires complete readback of the pinned maintenance a
       refusal: /Restore result unresolved/,
     },
     {
+      name: 'the only reported version has an incomplete allocation',
+      changeReadback(history) {
+        history.result.deployments[0].versions[0].percentage = 95;
+      },
+      refusal: /Restore result unresolved/,
+    },
+    {
       name: 'the deployment history readback is incomplete',
       changeReadback(history) {
         history.result_info.total_count += 1;
