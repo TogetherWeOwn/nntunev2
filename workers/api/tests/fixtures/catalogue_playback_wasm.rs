@@ -129,7 +129,10 @@ pub async fn resolve_uploaded_playback(track: String, grant_key: String) -> Stri
         .await
         .unwrap()
         .expect("protected private playback");
-    assert_eq!(playback.media.locator(), &published.locator);
+    assert!(
+        playback.media.locator() == &published.locator,
+        "resolved locator must match the committed catalogue locator"
+    );
     let snapshot = project(&loaded, playback, bearer).unwrap();
     assert_eq!(&snapshot.media_version, version);
     serde_json::json!({
