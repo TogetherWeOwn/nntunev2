@@ -144,9 +144,12 @@ only the two selected fixture keys and no list or bulk operations. Record the
 SHA-256 of the exact UTF-8 credential JSON as `s3_credential_sha256` in the
 scope. Before arming, verify both identities and qualify the provider with the
 same no-list policy on a disposable versioned fixture. Require version-specific
-HEAD to return the selected version while present and an empty HTTP 404 after
-exact-version deletion. Treat HTTP 403, ambiguity or a policy that needs list
-access as a stop. Keep the scope and credentials in protected custody.
+HEAD to return the selected version while present. Require exact-version
+DELETE to return an empty HTTP 204 and, if it includes `x-amz-version-id`,
+require that value to match the selected version. Require the subsequent
+version-specific HEAD to return an empty HTTP 404. Treat HTTP 403, ambiguity
+or a policy that needs list access as a stop. Keep the scope and credentials
+in protected custody.
 
 Once the cutoff, retention and lease windows have elapsed, dispatch
 [`deploy`](../../.github/workflows/deploy.yml) from protected `main` with
