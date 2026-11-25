@@ -26,13 +26,13 @@ pub(super) async fn exercise(
 ) {
     let fixtures = [
         (
-            "catalogue-old",
+            "same-title-first",
             "Synthetic First Release",
             "ab350000-0000-4000-8000-000000000000",
             "ab350000-0000-4000-8000-000000000001",
         ),
         (
-            "catalogue-new",
+            "same-title-second",
             "Synthetic Second Release",
             "ab360000-0000-4000-8000-000000000000",
             "ab360000-0000-4000-8000-000000000001",
@@ -84,6 +84,14 @@ pub(super) async fn exercise(
         })
         .to_string();
         let mut tx = writer.transaction().await.unwrap();
+        // The API tests inherit this database and select their fixture by job ID.
+        tx.execute(
+            "INSERT INTO public.ingest_jobs (id, user_id, idempotency_key, status)
+             VALUES ($1, $2, $1, 'done')",
+            &[&job_id, &upload.scope.principal],
+        )
+        .await
+        .unwrap();
         let result = stage_completed_release(
             &mut tx,
             &job,
