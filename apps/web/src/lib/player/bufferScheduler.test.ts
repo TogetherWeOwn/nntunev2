@@ -10,7 +10,7 @@ function syntheticBuffer(seconds: number): AudioBuffer {
 		duration: samples.length / sampleRate,
 		numberOfChannels: 1,
 		getChannelData: () => samples
-	} as AudioBuffer;
+	} as unknown as AudioBuffer;
 }
 
 function fakeSource() {
