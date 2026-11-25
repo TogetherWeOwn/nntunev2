@@ -90,7 +90,11 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 
 ### Rehearse the verifier handoff offline
 
-From the repository root with the pinned `e2e` dependencies installed, run:
+The hosted [`e2e-lint` job](../../.github/workflows/ci.yml) runs the offline
+test **private staging reporter and receipt wiring with disposable evidence**.
+For a [focused reproduction of that test's failure](../../CONTRIBUTING.md#focused-reproduction-only),
+run from the repository root with the pinned `e2e` dependencies installed
+and Bash, Git, `jq`, Node and Python 3 on `PATH`:
 
 ```sh
 python3 -B -I e2e/fixtures/private-music/test_admission_wiring.py "$(command -v node)"
