@@ -5,6 +5,7 @@ import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.
 import { test } from './helpers/private-music-fixture.js';
 
 const track = { id: '00000000-0000-4000-8000-000000001103', title: 'Interrupted seek audio', duration_ms: 14_000 };
+const playId = `private_browser_${'a'.repeat(22)}`;
 const duration = track.duration_ms / 1000;
 const sampleRate = 48_000;
 const bytesPerFrame = 4; // Two 16-bit PCM channels.
@@ -43,6 +44,7 @@ test('private playback retries an interrupted seek from the requested position',
 	const fixture = await mockInvitedLibraryPlayback(page, origin, {
 		libraryItems: () => [track],
 		playableTrackId: (requested) => requested === track.id ? track.id : undefined,
+		playId,
 		audio: async (route) => {
 			const request = route.request();
 			const range = /^bytes=(\d+)-$/.exec(request.headers()['range'] ?? '');
@@ -90,7 +92,7 @@ test('private playback retries an interrupted seek from the requested position',
 	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) =>
 		!node.paused && node.currentTime > 0.2)).toBe(true);
 	const source = origin + fixture.mediaPath(track.id);
-	const [sessionId, playId] = source.split('/').slice(-2);
+	const sessionId = source.split('/').at(-2);
 	const admission = { track_id: track.id, session_id: sessionId };
 	const continuation = { ...admission, play_id: playId };
 	page.on('response', (response) => {

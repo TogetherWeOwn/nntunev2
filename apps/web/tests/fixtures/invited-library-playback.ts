@@ -4,18 +4,18 @@ import { fixtureCookie, hasFixtureSession, serveFlac } from '../helpers/private-
 
 const listener = 'synthetic-listener';
 const binding = 'A'.repeat(43);
-const playId = '00000000-0000-4000-8000-000000000003';
-
 type LibraryTrack = { id: string; title: string; duration_ms: number };
 
 export async function mockInvitedLibraryPlayback(page: Page, origin: string, fixture: {
 	libraryItems: () => LibraryTrack[];
 	playableTrackId: (requestedId: string) => string | undefined;
 	audio: Buffer | ((route: Route) => Promise<void>);
+	playId?: string;
 	isRevoked?: () => boolean;
 }) {
 	const context = page.context();
 	const isListener = (cookie: string | null) => hasFixtureSession(cookie, listener);
+	const playId = fixture.playId ?? '00000000-0000-4000-8000-000000000003';
 	let playback: { trackId: string; sessionId: string } | undefined;
 	const mediaPath = (trackId: string) => `/v1/plays/media/${trackId}/${playback?.sessionId}/${playId}`;
 	await context.route('**/*', (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
@@ -39,6 +39,10 @@ export async function mockInvitedLibraryPlayback(page: Page, origin: string, fix
 			return route.fulfill({ status: 400 });
 		}
 		expect(input.session_id).toMatch(/^[0-9a-f-]{36}$/);
+		if (input.play_id !== undefined &&
+			(!playback || input.play_id !== playId || trackId !== playback.trackId || input.session_id !== playback.sessionId)) {
+			return route.fulfill({ status: 409 });
+		}
 		playback = { trackId, sessionId: input.session_id };
 		return route.fulfill({ json: { trackId, playbackSessionId: playback.sessionId, sessionBinding: binding, playId, durationMs: 14_000 } });
 	});
