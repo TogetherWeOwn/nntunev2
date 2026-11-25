@@ -1,6 +1,7 @@
 """Disposable PostgreSQL qualification. No connection or credential inputs."""
 
 import base64
+import errno
 import io
 import ipaddress
 import json
@@ -24,7 +25,7 @@ from fixtures.database_bootstrap.authorization import caller_env, plan_binding
 from database_bootstrap_preflight import (
     BootstrapPreflightError, catalog_probe_sql, require_absent_catalog_result,
 )
-from test_database_bootstrap_admission import check_handoff_snapshot_branch
+from test_database_bootstrap_admission import check_handoff_snapshot_branch, check_snapshot, snapshot_record
 from test_database_bootstrap_environment_readback import readback, save_complete_readback
 
 IMAGE = "postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336"
@@ -44,6 +45,10 @@ class FixtureFailure(Exception):
 
 
 class Interrupted(Exception):
+    pass
+
+
+class PublicationFailure(Exception):
     pass
 
 
@@ -537,7 +542,7 @@ def prove_setup_caller(cluster, *, interrupt, reader):
         run(env, "refused", 1)  # The name collision stops any second write.
         cluster.ok("preserve the new database OID after collision refusal", identity_sql, identity.stdout)
         cluster.ok("preserve both sibling database identities and ACLs", sibling_sql, siblings.stdout)
-        return
+        return int(identity.stdout)
 
     sessions = f"SELECT FROM pg_stat_activity WHERE usename = '{CREATOR}'"
     with start_caller(env | {"PATH": routed_client(cluster, "interrupt")}) as process:
@@ -685,13 +690,84 @@ def block_fixture_probe(cluster, plan):
                 locker.kill()
 
 
-def prove_reader_lifecycle(cluster, pending, *, scenario):
+def publish_handoff_snapshot(path, record, *, partial=False):
+    payload = json.dumps(record).encode()
+    try:
+        with path.open("xb") as destination:
+            if partial:
+                destination.write(payload[:len(payload) // 2])
+                raise OSError(errno.EIO, "synthetic upload interrupted")
+            destination.write(payload)
+    except OSError as error:
+        raise PublicationFailure(error.errno) from error
+
+
+def prove_publication_recovery(cluster, pending, *, partial, database_oid):
+    lifecycle, reader_oid, _ = pending
+    branch = lifecycle.plan.branch_id
+    record = snapshot_record(branch)
+    record["review"].update(phase="pre-migration", setup_completed_at=record["snapshot"]["captured_at"] - 1)
+    record["baseline_branch_id"] = branch
+    with tempfile.TemporaryDirectory(dir=cluster.directory, prefix="handoff-publication-") as temp:
+        publication = Path(temp) / "published" / "snapshot.json"
+        if partial:
+            publication.parent.mkdir()
+        try:
+            prove_reader_lifecycle(
+                cluster, pending, scenario="success", database_oid=database_oid,
+                publish=lambda: publish_handoff_snapshot(publication, record, partial=partial),
+            )
+        except PublicationFailure as error:
+            expected = errno.EIO if partial else errno.ENOENT
+            require(error.args == (expected,), "observe the expected publication fault")
+        else:
+            raise FixtureFailure("fail evidence publication after an empty baseline")
+
+        cluster.ok("verify reader, sessions and shared grants are absent after publication failure", f"""
+            SELECT NOT EXISTS (SELECT FROM pg_roles WHERE oid = {reader_oid} OR rolname = '{lifecycle.name}')
+                AND NOT EXISTS (SELECT FROM pg_stat_activity WHERE usesysid = {reader_oid})
+                AND NOT EXISTS (SELECT FROM pg_shdepend WHERE refclassid = 'pg_authid'::regclass
+                                AND refobjid = {reader_oid});
+        """, "t\n")
+        saved = publication.read_bytes() if publication.exists() else b""
+        require(bool(saved) == partial, "observe the intended missing or partial artifact")
+        args = ("--baseline-handoff",)
+        check_snapshot("failed publication keeps the migration handoff closed", saved, args=args)
+
+        # Reobserve the target over the setup endpoint using the original database OID as the pin.
+        readback = f"""
+            BEGIN READ ONLY;
+            SELECT oid FROM pg_database WHERE datname = current_database() AND oid = {database_oid}
+                AND datname = '{lifecycle.plan.launch}'
+                AND datallowconn AND NOT datistemplate AND datdba = '{lifecycle.plan.owner_role}'::regrole;
+            COMMIT;
+        """
+        cluster.ok("refuse to reconcile a sibling at the setup endpoint", readback,
+                   database=SIBLING, host=lifecycle.plan.host)
+        cluster.ok("reconcile the database from setup without reprovisioning", readback,
+                   f"{database_oid}\n", database=lifecycle.plan.launch, host=lifecycle.plan.host)
+        other_branch = branch[:-1] + ("1" if branch.endswith("0") else "0")
+        other_record = record | {
+            "review": record["review"] | {"branch_id": other_branch},
+            "snapshot": record["snapshot"] | {"branch_id": other_branch},
+        }
+        publication.parent.mkdir(exist_ok=True)
+        other_artifact = publication.with_name("wrong-target.json")
+        publish_handoff_snapshot(other_artifact, other_record)
+        other_bytes = other_artifact.read_bytes()
+        check_snapshot("retry with a complete snapshot for a different branch", other_bytes, args=args)
+        retry = publication.with_name("retry.json")
+        publish_handoff_snapshot(retry, record)
+        check_snapshot("retry with matching evidence after retirement", retry.read_bytes(), accept=True, args=args)
+
+
+def prove_reader_lifecycle(cluster, pending, *, scenario, database_oid, publish=None):
     lifecycle, oid, env = pending
     launch = {"database": LAUNCH, "role": READER_ISSUER}
     plan = {key: getattr(lifecycle.plan, key) for key in ("host", "port", "ca_pem", "branch_id", "launch", "reader_role")}
-    result = cluster.sql(f"SELECT oid, '{DECOY}'::regrole::oid FROM pg_database WHERE datname = '{LAUNCH}';")
-    checked(result, "pin the setup database identity")
-    database_oid, other_oid = map(int, result.stdout.strip().split("|"))
+    result = cluster.sql(f"SELECT '{DECOY}'::regrole::oid;")
+    checked(result, "identify the other fixture reader OID")
+    other_oid = int(result.stdout)
     plan.update(version=2, database_oid=database_oid, reader_oid=oid)
     raw = json.dumps(plan).encode()
     cluster.ok("delegate only launch CONNECT and schema/table grant options", f"""
@@ -700,9 +776,10 @@ def prove_reader_lifecycle(cluster, pending, *, scenario):
         CREATE SCHEMA reader_scope;
         CREATE TABLE reader_scope.root (id integer) PARTITION BY RANGE (id);
         CREATE TABLE reader_scope.leaf PARTITION OF reader_scope.root FOR VALUES FROM (0) TO (10);
-        INSERT INTO reader_scope.root VALUES (5);
         GRANT USAGE ON SCHEMA reader_scope TO {READER_ISSUER} WITH GRANT OPTION;
     """, database=LAUNCH)
+    if publish is None:
+        cluster.ok("populate the reader fixture", "INSERT INTO reader_scope.root VALUES (5);", database=LAUNCH)
     password = secrets.token_hex(24)
     expiry = int(time.time()) + MAX_READER_SECONDS
     activate = lifecycle.activate(raw, oid, expiry, password)
@@ -761,8 +838,11 @@ def prove_reader_lifecycle(cluster, pending, *, scenario):
                                  f"SELECT EXISTS ({sessions} AND wait_event = 'PgSleep');")
                         process.terminate()
                     stdout, stderr = process.communicate(timeout=5)
-                    expected = ((0, b"database-bootstrap-baseline: rows-present\n", b"") if scenario == "success"
-                                else (1, b"", b"database-bootstrap-baseline: refused\n"))
+                    if scenario == "success":
+                        verdict = "rows-present" if publish is None else "empty"
+                        expected = (0, f"database-bootstrap-baseline: {verdict}\n".encode(), b"")
+                    else:
+                        expected = (1, b"", b"database-bootstrap-baseline: refused\n")
                     require((process.returncode, stdout, stderr) == expected, "publish only the fixed reader verdict")
                 finally:
                     if process.poll() is None:
@@ -783,6 +863,8 @@ def prove_reader_lifecycle(cluster, pending, *, scenario):
             holder.stdin.flush()
             require(select.select([holder.stdout], [], [], 3)[0] and holder.stdout.readline() == b"1\n",
                     "observe a surviving reader session before retirement")
+        if publish is not None:
+            publish()
     finally:
         env.pop("BASELINE_READER_PASSWORD", None)
         try:
@@ -909,9 +991,11 @@ def exercise(*, interrupt):
                     refuse_before_create(cluster)
                     verify_quiet_failure(cluster)
                 scenarios = ("success", "wrong-oid", "interrupt")
-                names = (BASELINE_READER,) if interrupt else (BASELINE_READER, "Fixture-Wrong-OID", "Fixture-Interrupted")
+                names = (BASELINE_READER,) if interrupt else (
+                    BASELINE_READER, "Fixture-Wrong-OID", "Fixture-Interrupted", "Fixture-Unavailable", "Fixture-Partial",
+                )
                 pending = prepare_baseline_readers(cluster, names, host=cluster.address if interrupt else cluster.server)
-                prove_setup_caller(cluster, interrupt=interrupt, reader=BASELINE_READER)
+                database_oid = prove_setup_caller(cluster, interrupt=interrupt, reader=BASELINE_READER)
                 if interrupt:
                     (reader_lifecycle, reader_oid, _), = pending
                     cluster.ok("fence the pending reader", reader_lifecycle.fence(reader_oid), role=READER_ISSUER)
@@ -919,8 +1003,10 @@ def exercise(*, interrupt):
                                "retired\n", role=READER_ISSUER)
                 else:
                     prove_baseline(cluster)
-                    for reader, scenario in zip(pending, scenarios, strict=True):
-                        prove_reader_lifecycle(cluster, reader, scenario=scenario)
+                    for reader, scenario in zip(pending[:3], scenarios, strict=True):
+                        prove_reader_lifecycle(cluster, reader, scenario=scenario, database_oid=database_oid)
+                    for reader, partial in zip(pending[3:], (False, True), strict=True):
+                        prove_publication_recovery(cluster, reader, partial=partial, database_oid=database_oid)
                     verify_launch_grants(cluster)
                 cluster.ok("revoke setup login and password", lifecycle.fence(oid), role=ISSUER)
                 cluster.ok("read back the login fence and cleared password", f"""

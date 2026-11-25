@@ -455,3 +455,11 @@ snapshot on the baseline branch. If evidence is incomplete or mismatched,
 pause continuation and rerun this offline check with the matching readbacks.
 Use the Environment and baseline checks separately as part of the protected
 release process.
+
+If private evidence publication fails or saves only part of the record after
+setup and baseline readback, keep migration closed and finish reader retirement
+under the original issuance pins. Reconcile the existing database over the
+approved route against the recorded database OID before retrying publication.
+Require a complete saved handoff for the same branch before continuing. The
+disposable CI fixture rehearses both publication failures with local files and
+verifies reader and session removal before checking retry evidence.
