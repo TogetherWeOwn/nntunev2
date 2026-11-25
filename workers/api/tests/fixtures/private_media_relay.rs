@@ -3,6 +3,7 @@ use crate::{meter_sink::TrackMeterMeta, play_grant::IssuedGrant, playback::Lease
 const MEDIA_PLAY: &str = "private_1234567890abcdefghijkl";
 const MEDIA_RANGE: &str = "bytes=2-7";
 const MEDIA_TOKEN: &str = include_str!("../../../../fixtures/play-grant/private-enrolled.token");
+const MEDIA_EPOCH: u64 = 42;
 
 fn media_relay_fixture() -> (Harness, Request, HashMap<String, String>) {
     let mut h = harness();
@@ -28,7 +29,7 @@ fn media_relay_fixture() -> (Harness, Request, HashMap<String, String>) {
         session_id: "tab-1".into(),
         track_id: TRACK.into(),
         play_id: MEDIA_PLAY.into(),
-        epoch: 42,
+        epoch: MEDIA_EPOCH,
         expires_at: 12,
         continuation_deadline: 222,
     };
@@ -201,14 +202,20 @@ fn browser_issue_selects_only_armed_verified_sessions_and_projects_five_fields()
     assert_eq!(h.store.browser_playback_opens.get(), 3);
 }
 
-fn install_browser_play(h: &Harness, request: &mut Request) -> (LeaseRow, String) {
+fn install_browser_play(
+    h: &Harness,
+    request: &mut Request,
+    play_byte: u8,
+    epoch: u64,
+) -> (LeaseRow, String) {
     let play = format!(
         "{}{}",
         crate::private_playback::browser::PREFIX,
-        "A".repeat(22)
+        crate::b64::encode(&[play_byte; 16])
     );
     let mut receipt = h.store.browser_receipt.take().unwrap();
     receipt.lease.play_id.clone_from(&play);
+    receipt.lease.epoch = epoch;
     receipt.grant = crate::private_playback::mint_grant(
         h.config.play_grant_secret.as_deref().unwrap(),
         &receipt.user_id,
@@ -236,7 +243,7 @@ fn production_media_relay_and_legacy_routes_fence_the_browser_lease() {
     use serde_json::json;
 
     let (h, mut request, headers) = media_relay_fixture();
-    let (lease, expected) = install_browser_play(&h, &mut request);
+    let (lease, expected) = install_browser_play(&h, &mut request, 0, MEDIA_EPOCH);
     let play = &lease.play_id;
     h.store.meter_meta.borrow_mut().clear();
 
@@ -276,7 +283,7 @@ fn production_media_relay_and_legacy_routes_fence_the_browser_lease() {
         ("/v1/plays", body),
         (
             "/v1/plays/heartbeat",
-            json!({"session_id": "tab-1", "play_id": play, "lease_epoch": 42}),
+            json!({"session_id": "tab-1", "play_id": play, "lease_epoch": MEDIA_EPOCH}),
         ),
     ] {
         let req = Request {
@@ -293,6 +300,50 @@ fn production_media_relay_and_legacy_routes_fence_the_browser_lease() {
     }
     shorten_media_relay_lease(&h);
     assert_eq!(serve(&request), 404);
+}
+
+#[test]
+fn private_media_relay_refuses_a_new_range_for_a_replaced_browser_lease() {
+    use crate::worker_entry::{relay_media, CollectedBody};
+
+    let (h, mut original, headers) = media_relay_fixture();
+    let (original_lease, original_bearer) = install_browser_play(&h, &mut original, 0, MEDIA_EPOCH);
+    let original_receipt = h.store.browser_receipt.borrow().clone().unwrap();
+    let ctx = media_relay_context(&h);
+    let body = CollectedBody::Complete(Vec::new());
+    let read = |request: &Request, bearer: &str| {
+        block_on(relay_media(&ctx, request, &body, &headers, async |get| {
+            assert_eq!(get.path, "/play/track");
+            assert!(get
+                .headers()
+                .eq([("authorization", bearer), ("range", MEDIA_RANGE)]));
+            (206, b"sample")
+        }))
+        .unwrap()
+        .unwrap()
+    };
+    assert_eq!(read(&original, &original_bearer), (206, b"sample"));
+
+    let mut replacement = original.clone();
+    let (replacement_lease, replacement_bearer) =
+        install_browser_play(&h, &mut replacement, 1, original_lease.epoch + 1);
+    assert_eq!(read(&replacement, &replacement_bearer), (206, b"sample"));
+
+    // Keep the signed original receipt available to the relay at the same
+    // clock time, while the lease lookup returns the replacement.
+    h.store.browser_receipt.replace(Some(original_receipt));
+    let result: Option<Result<(), Response>> =
+        block_on(relay_media(&ctx, &original, &body, &headers, async |_| {
+            panic!("a replaced lease reached Stream")
+        }));
+    let refusal = result.unwrap().unwrap_err();
+    assert_eq!(refusal.status, 404);
+    assert_eq!(refusal.body, not_found().body);
+    assert!(refusal.extra_headers.is_empty());
+    assert_eq!(
+        h.store.playback_leases.borrow()["member"],
+        replacement_lease
+    );
 }
 
 #[test]
@@ -322,7 +373,7 @@ fn browser_grants_and_media_refuse_a_removed_cohort_member() {
         .insert(invite.code_hash.clone(), invite);
     h.store.browser_playback_armed.set(true);
 
-    let (lease, bearer) = install_browser_play(&h, &mut media);
+    let (lease, bearer) = install_browser_play(&h, &mut media, 0, MEDIA_EPOCH);
     let issue = |h: &Harness, browser: &Request, input: serde_json::Value| {
         let ctx = media_relay_context(h);
         let (claims, _) = block_on(ctx.authenticate(browser, false)).unwrap();
