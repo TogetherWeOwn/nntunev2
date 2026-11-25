@@ -295,6 +295,7 @@ class WorkerBuildWorkflowTests(unittest.TestCase):
             ("missing", protected_results, [unrelated]),
             ("duplicate", protected_results, configs * 2),
             ("unbound", {}, configs),
+            ("wrong request", {(requested["account"], "synthetic-other-request"): config_id}, configs),
             ("wrong account", protected_results, [original | {"account": "other-account"}]),
             ("wrong role", protected_results, [original | {"role": ("fixture_enroll", 40205)}]),
         ):
