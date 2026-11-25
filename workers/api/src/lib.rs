@@ -62,6 +62,7 @@ pub mod original_source;
 pub mod plan_limits;
 pub mod play_grant;
 pub mod playback;
+pub mod playlist_import_preview;
 pub mod postgres;
 pub mod preference_rows;
 pub mod private_catalogue_read;
