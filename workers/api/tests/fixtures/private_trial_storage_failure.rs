@@ -1,26 +1,134 @@
 //! Failure at multipart completion before storage can issue a version.
 
 use super::*;
-use crate::{
-    ingest_session_auth::Job, ingest_session_caller::open,
-    ingest_session_request::Request as UploadRequest,
+use crate::{ingest_session_auth::Job, ingest_session_request::Request as UploadRequest};
+use nntune_core::{
+    digest_readback::{EnrolledEnvelope, EnrolledReadbackError},
+    media_envelope::EnvelopeContext,
 };
 use nntune_ingest::multipart::{
     initiation::InitiatedUpload,
+    readback_inventory::{CompletedReadbackInventory, VerifiedCompletedReadback},
     resume_checkpoint::ResumeBinding,
-    session_completion::{CompletionResponse, DispatchError},
-    session_upload::handoff,
-    MultipartError,
+    session_completion::{CompletionResponse, DispatchError, SessionCompletion},
+    session_upload::{handoff, DurableUpload, HandoffError},
+    sidecar::{CompletedSidecar, SidecarPut},
+    CompletedVersionedMedia, MultipartError, UploadPart, UploadedPart,
 };
 use private_trial::{
-    registered::registered_header, registration::Enrollment, CommittedPublication, TrialError,
+    registered::registered_header, registration::Enrollment, sealed_fixture::TrialStorage,
+    CommittedPublication, TrialError,
 };
 use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime};
+use std::{
+    cell::Cell,
+    time::{Duration, SystemTime},
+};
 
 pub(super) const JOB: &str = "synthetic-trial-replacement";
 const BUCKET: &str = "fixture-bucket";
 const UPLOAD: &str = "replacement-upload-fixture";
+
+struct RefusedCompletion {
+    configuration: [u8; 16],
+    key: String,
+    completions: Cell<u8>,
+}
+
+impl TrialStorage for RefusedCompletion {
+    fn matches_storage(&self, configuration: [u8; 16], bucket: &str) -> bool {
+        (configuration, bucket) == (self.configuration, BUCKET)
+    }
+
+    async fn open_upload<'a>(
+        &'a self,
+        db: &mut Client,
+        scope: &CompletionScope<'_>,
+        lease: &str,
+        context: &'a EnvelopeContext,
+        key: &'a str,
+        until: SystemTime,
+    ) -> Result<DurableUpload<'a>, HandoffError> {
+        assert_eq!(key, self.key);
+        handoff(db, scope, lease, context, (BUCKET, key), until, async |_| {
+            let response = format!(
+                "<InitiateMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{key}</Key><UploadId>{UPLOAD}</UploadId></InitiateMultipartUploadResult>"
+            );
+            Ok(InitiatedUpload::verify(self.configuration, BUCKET, key, 200, response.as_bytes()).unwrap())
+        }).await
+    }
+
+    async fn put_part<'a>(
+        &self,
+        _: ResumeBinding<'a>,
+        _: &EnvelopeContext,
+        part: &UploadPart<'a>,
+        upload: &DurableUpload<'_>,
+        _: SystemTime,
+    ) -> Result<UploadedPart<'a>, DispatchError> {
+        let (target, number, _, checksum) = part.request();
+        assert!(target == upload.target());
+        assert_eq!(number, 1);
+        Ok(part
+            .verify_reply("\"replacement-part\"".into(), checksum)
+            .unwrap())
+    }
+
+    async fn complete(
+        &self,
+        completion: SessionCompletion<'_>,
+        _: SystemTime,
+    ) -> Result<CompletedVersionedMedia, DispatchError> {
+        let result = completion
+            .dispatch(async |sent| {
+                self.completions.set(self.completions.get() + 1);
+                assert_eq!(
+                    (sent.target.bucket, sent.target.key, sent.target.upload_id),
+                    (BUCKET, self.key.as_str(), UPLOAD)
+                );
+                Ok(CompletionResponse {
+                    configuration: self.configuration,
+                    status: 503,
+                    body: Vec::new(),
+                    version: None,
+                })
+            })
+            .await;
+        assert!(matches!(
+            &result,
+            Err(DispatchError::Unconfirmed(Some(
+                MultipartError::CompletionStatus
+            )))
+        ));
+        result
+    }
+
+    async fn confirm_head(
+        &self,
+        _: &CompletedVersionedMedia,
+        _: &EnvelopeContext,
+        _: SystemTime,
+    ) -> Result<(), ()> {
+        panic!("failed completion reached HEAD")
+    }
+
+    async fn put_sidecar<'a>(
+        &self,
+        _: SidecarPut<'a>,
+        _: SystemTime,
+    ) -> Result<CompletedSidecar<'a>, ()> {
+        panic!("failed completion reached sidecar upload")
+    }
+
+    async fn verify_readback<'i, 'r>(
+        &self,
+        _: &'i CompletedReadbackInventory<'r>,
+        _: EnrolledEnvelope<'_>,
+        _: SystemTime,
+    ) -> Result<VerifiedCompletedReadback<'i, 'r>, EnrolledReadbackError> {
+        panic!("failed completion reached authenticated readback")
+    }
+}
 
 pub(super) async fn attempt(
     observer: &Client,
@@ -52,8 +160,7 @@ pub(super) async fn attempt(
         id[8] = 0x80;
         id
     });
-    let [session, env, lib, obj, seal] =
-        [session, environment, library, object, generation].map(uuid_text);
+    let [session, obj, seal] = [session, object, generation].map(uuid_text);
     let request = UploadRequest {
         file_bytes: body.len() as u64,
         content_sha256: Sha256::digest(body).into(),
@@ -96,60 +203,26 @@ pub(super) async fn attempt(
         context: &fixture.context,
         intent: &fixture.intent,
     };
-    let key = format!("media/{obj}/{seal}");
-    let opened = open(writer, auth, prepared, SystemTime::now() + Duration::from_secs(30),
-        async |db, scope, lease, deadline| {
-            handoff(db, scope, lease, &fixture.context, (BUCKET, &key), deadline, async |_| {
-                Ok(InitiatedUpload::verify(configuration, BUCKET, &key, 200, format!(
-                    "<InitiateMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{key}</Key><UploadId>{UPLOAD}</UploadId></InitiateMultipartUploadResult>"
-                ).as_bytes()).unwrap())
-            }).await
-        },
-    ).await.expect("the protected caller must reach the storage handoff");
-    let target = opened.durable_target().target();
-    let (plan, part) = fixture.plan_part(target).unwrap();
-    let (_, _, _, checksum) = part.request();
-    let etag = "\"replacement-part\"";
-    let receipt = part.verify_reply(etag.into(), checksum).unwrap();
-    let binding = ResumeBinding {
-        plan,
+    let storage = RefusedCompletion {
         configuration,
-        environment: &env,
-        library: &lib,
-        session: &session,
-        object: &obj,
-        generation: &seal,
-        envelope_scheme: 2,
+        key: format!("media/{obj}/{seal}"),
+        completions: Cell::new(0),
     };
-    let mut completion_calls = 0;
     let failed = fixture
-        .complete_part(binding, &part, receipt, async |completion| {
-            let result = completion
-                .dispatch(async |sent| {
-                    completion_calls += 1;
-                    assert_eq!(
-                        (sent.target.bucket, sent.target.key, sent.target.upload_id),
-                        (BUCKET, key.as_str(), UPLOAD)
-                    );
-                    assert!(std::str::from_utf8(&sent.body).unwrap().contains(checksum));
-                    Ok(CompletionResponse {
-                        configuration,
-                        status: 503,
-                        body: Vec::new(),
-                        version: None,
-                    })
-                })
-                .await;
-            assert!(matches!(
-                &result,
-                Err(DispatchError::Unconfirmed(Some(
-                    MultipartError::CompletionStatus
-                )))
-            ));
-            result
-        })
+        .send(
+            writer,
+            auth,
+            prepared,
+            &storage,
+            BUCKET,
+            &[17; 32],
+            SystemTime::now() + Duration::from_secs(30),
+            auth.record.expires_at as i64,
+            async |_, _| panic!("failed completion reached authority reload"),
+            async |_, _| panic!("failed completion reached publication"),
+        )
         .await;
-    assert_eq!(completion_calls, 1);
+    assert_eq!(storage.completions.get(), 1);
 
     let row = observer.query_one(
         "SELECT multipart_upload_id = $2 AND multipart_object_id = $3::text::uuid
@@ -170,6 +243,5 @@ pub(super) async fn attempt(
         registered_header(writer, &prepared.scope, identities, map, JOB).await,
         Err(TrialError::Unconfirmed)
     );
-    failed?;
-    panic!("a failed storage write must not produce a media version for publication")
+    failed
 }

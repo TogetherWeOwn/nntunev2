@@ -752,6 +752,7 @@ pub(crate) async fn verify_publication(
         (503, unavailable().body)
     );
     assert!(published().await == prior);
+    assert!(exact_reference().await);
     let after = handle(&ctx, &library).await;
     assert_eq!((after.status, after.body), (200, listing.body));
 
