@@ -56,8 +56,10 @@ fn clock_checkout_refuses_existing_and_unverified_customers() {
 }
 
 #[test]
-fn clock_checkout_does_not_inherit_an_unbound_flight() {
-    for wins_during_insert in [false, true] {
+fn clock_checkout_does_not_inherit_a_winning_flight() {
+    for (wins_during_insert, winner_binding) in
+        [(false, None), (true, None), (true, Some("cus_winner"))]
+    {
         let h = stripe_harness();
         seed_billing_user(&h, "u1");
         let winner = crate::billing_reconcile::StoredCheckoutOp {
@@ -75,12 +77,13 @@ fn clock_checkout_does_not_inherit_an_unbound_flight() {
                 "cs_test_winner",
                 "open",
                 "unpaid",
-                None,
+                winner_binding,
                 None,
                 Some("op_winner"),
             ),
         );
         if wins_during_insert {
+            h.store.plant_customer_on_next_create.set(winner_binding);
             h.store
                 .plant_winner_on_next_create
                 .replace(Some(winner.clone()));
@@ -93,7 +96,8 @@ fn clock_checkout_does_not_inherit_an_unbound_flight() {
 
         assert_eq!(clock_checkout(&h), Err(EnsureCheckoutError::Unavailable));
         assert_eq!(h.store.checkout_ops.borrow()["op_winner"], winner);
-        assert!(h.store.billing_customers.borrow().is_empty());
+        let bindings = h.store.billing_customers.borrow();
+        assert_eq!(bindings.get("u1").map(String::as_str), winner_binding);
         assert_eq!(
             h.stripe.customers_created.borrow().len(),
             usize::from(wins_during_insert)
