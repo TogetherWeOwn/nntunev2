@@ -147,10 +147,11 @@ test('private Library and playback stay isolated when another invitee signs out'
 			]);
 			await Promise.all([page.goto(`${origin}${library.path}`), other.goto(`${origin}${library.path}`)]);
 			await Promise.all([startOwnPlayback(page, first), startOwnPlayback(other, second)]);
+			await expect.poll(async () => (await playbackState(other)).time).toBeGreaterThan(1);
 			await toggle(other, 'Pause').click();
 			await expect.poll(async () => (await playbackState(other)).paused).toBe(true);
 			const before = await playbackState(other);
-			expect(before.time).toBeGreaterThan(0.2);
+			expect(before.time).toBeGreaterThan(1);
 
 			// Use ordinary sign-out in a second tab of the first invitee's browser.
 			const security = await context.newPage();
@@ -172,11 +173,29 @@ test('private Library and playback stay isolated when another invitee signs out'
 			await expectOwnLibrary(other, second.item);
 			await expect(other.locator(player.currentQueueItem)).toHaveAttribute(player.queueId, second.item.id);
 			expect(await playbackState(other)).toEqual(before);
+
+			// Sample media events before clicking Play so a restart cannot catch up between polls.
+			const resume = await other.evaluateHandle(({ testId, time }) => {
+				const evidence = { minimumTime: time };
+				const sample = ({ target }: Event) => {
+					if (target instanceof HTMLAudioElement && target.dataset.testid === testId) {
+						evidence.minimumTime = Math.min(evidence.minimumTime, target.currentTime);
+					}
+				};
+				for (const event of ['play', 'playing', 'seeking', 'timeupdate']) {
+					document.addEventListener(event, sample, true);
+				}
+				return evidence;
+			}, { testId: player.audio, time: before.time });
 			await toggle(other, 'Play').click();
+			let minimumTime = before.time;
 			await expect.poll(async () => {
 				const { paused, time, src } = await playbackState(other);
+				minimumTime = Math.min(minimumTime, time);
 				return !paused && time > before.time && src === before.src;
 			}).toBe(true);
+			const eventMinimum = await resume.evaluate((evidence) => evidence.minimumTime);
+			expect(Math.min(minimumTime, eventMinimum), 'playback restarted on resume').toBeGreaterThanOrEqual(before.time - 0.25);
 		} finally {
 			await otherContext.close();
 		}
