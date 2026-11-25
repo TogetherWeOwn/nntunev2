@@ -171,11 +171,13 @@ closeout.
 Before arming, verify upload and playback on the reviewed serving endpoint.
 Also require a passing [cleanup qualification](#protected-cleanup-dispatch)
 on the exact endpoint, region and bucket the cleanup runner will match to
-the trial receipt. If restoring settings changes any of those values,
-repeat the exact-version HEAD and DELETE qualification on fresh disposable
-versions at the restored target. Qualify its two-key cleanup scope separately.
-Keep the trial disarmed until both checks pass. The fixture boundary serves
-HEAD and DELETE only.
+the trial receipt. Require the pinned `nntunev2-private-fixtures-staging`
+bucket. Stop on a different bucket and resolve the storage configuration
+before attempting qualification. If restoring settings changes the endpoint
+or region, repeat the exact-version HEAD and DELETE qualification on fresh
+disposable versions in the pinned bucket at that target. Qualify its two-key
+cleanup scope separately. Keep the trial disarmed until serving and cleanup
+both qualify. The fixture boundary serves HEAD and DELETE only.
 Keep the exact scope JSON and the disposable credential in
 protected custody. Use the SHA-256 of the exact UTF-8 bytes supplied as the
 scope secret. The dispatch inputs contain only the reviewed full `main` commit
