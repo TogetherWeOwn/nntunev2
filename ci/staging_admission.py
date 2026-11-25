@@ -685,10 +685,25 @@ def main():
                 "relevant producer or trusted policy drift; new evidence required")
     manifest = git_file(sha, "migrations/manifest.toml")
     require(manifest == git_file(main_tip, "migrations/manifest.toml"), "current migration manifest drift")
-    verify(Actions(env["GITHUB_REPOSITORY"], env["GITHUB_TOKEN"]), repo=env["GITHUB_REPOSITORY"],
-           repository_id=decimal(env["GITHUB_REPOSITORY_ID"]), sha=sha, policy=policy,
-           contract_bytes=contract_bytes, manifest_hash=digest(manifest), producer_source_ok=producer_source_ok)
+    actions = Actions(env["GITHUB_REPOSITORY"], env["GITHUB_TOKEN"])
+    receipt = verify(actions, repo=env["GITHUB_REPOSITORY"],
+                     repository_id=decimal(env["GITHUB_REPOSITORY_ID"]), sha=sha, policy=policy,
+                     contract_bytes=contract_bytes, manifest_hash=digest(manifest), producer_source_ok=producer_source_ok)
     current_identity(env, sha)
+    if receipt.get("journey") == PRIVATE:
+        # Project only validated pins. The artifact can carry fields that the
+        # verifier does not read and that must never reach the Actions log.
+        pins = {key: receipt[key] for key in (
+            "sha", "run_id", "run_attempt", "migration_manifest_sha256", "contract_sha256",
+            "policy_sha256", "deployments",
+        )}
+        pins["schema"] = 1
+        pins["artifact_name"] = artifact_name(sha, pins["run_id"], pins["run_attempt"], PRIVATE)
+        pins["observed_at"] = {
+            phase: timestamp(receipt["identities"][phase]["observed_at"]).astimezone(timezone.utc).isoformat()
+            for phase in IDENTITY_PHASES
+        }
+        print(json.dumps({"verified_private_music_staging": pins}, sort_keys=True))
     print("candidate deployment and applicable journey receipt verified (not operational acceptance)")
 
 

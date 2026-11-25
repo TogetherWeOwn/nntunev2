@@ -986,7 +986,7 @@ class SourceBindingTests(Base):
         return self.git(*args).decode().strip()
 
     def run_main(self, candidate_files=None, trusted_files=None, current_files=None, private=False,
-                 mode="bootstrap-maintenance", world_factory=None):
+                 mode="bootstrap-maintenance", world_factory=None, live_error=None):
         candidate = self.commit(candidate_files or self.files)
         trusted = self.commit(trusted_files or self.files, candidate)
         current = self.commit(current_files or trusted_files or self.files, trusted)
@@ -1012,9 +1012,14 @@ class SourceBindingTests(Base):
         with patch.object(sa, "ROOT", self.root), patch.dict(sa.os.environ, env, clear=True), \
                 patch.object(sa.sys, "argv", ["staging_admission.py", "verify"]), \
                 patch.object(sa, "Actions", return_value=actions), \
-                patch.object(sa, "current_identity") as live, patch("sys.stdout", new=io.StringIO()):
+                patch.object(sa, "current_identity", side_effect=live_error) as live, \
+                patch("sys.stdout", new=io.StringIO()) as output:
             with patch.object(sa, "git", wraps=sa.git) as source_git:
-                sa.main()
+                try:
+                    sa.main()
+                except sa.Refused:
+                    self.assertEqual(output.getvalue(), "")
+                    raise
             live.assert_called_once_with(sa.os.environ, candidate)
             source_git.assert_any_call("merge-base", "--is-ancestor", candidate, current)
             trees = (*sa.TRUSTED_TREES, "fixtures/synthetic-flac/private-staging") if private else sa.TRUSTED_TREES
@@ -1024,10 +1029,41 @@ class SourceBindingTests(Base):
         self.assertEqual(self.git("rev-parse", "origin/main").decode().strip(), trusted)
         self.assertFalse((self.root / "FETCH_HEAD").exists())
         self.assertIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
+        return world, output.getvalue().splitlines()
 
     def test_main_accepts_matching_closure_despite_unrelated_main_movement(self):
         current = dict(self.files, **{"docs/unrelated.md": ("100644", b"unrelated main change")})
-        self.run_main(current_files=current)
+        _, lines = self.run_main(current_files=current)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("not operational acceptance", lines[0])
+
+    def test_private_main_prints_only_verified_candidate_pins(self):
+        self.install_private_contract()
+
+        def receipt_with_extra_fields():
+            world = PrivateWorld()
+            world.receipt["private_diagnostics"] = "synthetic-private-value"
+            world.receipt["identities"]["build-identity"]["operator_note"] = "synthetic-private-value"
+            world.set_archive()
+            return world
+
+        world, lines = self.run_main(private=True, mode="promote", world_factory=receipt_with_extra_fields)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("not operational acceptance", lines[1])
+        self.assertEqual(json.loads(lines[0]), {"verified_private_music_staging": {
+            "schema": 1, "sha": world.receipt["sha"], "run_id": str(RUN_ID), "run_attempt": "1",
+            "artifact_name": world.artifact["name"], "deployments": world.receipt["deployments"],
+            "migration_manifest_sha256": sa.digest(MANIFEST),
+            "contract_sha256": sa.digest(PRIVATE_CONTRACT_BYTES),
+            "policy_sha256": sa.digest(json.dumps(world.policy, sort_keys=True).encode()),
+            "observed_at": {phase: world.receipt["identities"][phase]["observed_at"]
+                            for phase in sa.IDENTITY_PHASES},
+        }})
+
+    def test_private_main_prints_no_pins_on_live_identity_refusal(self):
+        self.install_private_contract()
+        self.refused("current staging identity drift", self.run_main, private=True, mode="promote",
+                     live_error=sa.Refused("current staging identity drift"))
 
     def test_private_main_binds_synthetic_audio_tree(self):
         fixture = self.install_private_contract()

@@ -1420,6 +1420,8 @@ Verify restored build health and identity or the private maintenance behavior.
 
 ### First private release handoff
 
+Use the [first private music launch instructions and pinned candidate template](first-private-music-launch.md).
+
 Record the exact SHA, checks, reviews, staging build IDs, and admitted health
 and listening attempt. Pin the maintenance module SHA-256 and its isolated
 `503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex`.

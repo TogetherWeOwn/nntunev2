@@ -196,8 +196,20 @@ name. Its single `staging-admission.json` member carries the private `journey`
 and pins. Raw XML, failure details and credentials stay off the artifact.
 
 Protected producer wiring, live evidence and reviewed approval are separate
-release work. The current production workflow's preliminary job check still
-expects the ordinary journey.
+release work. Production preflight currently refuses application promotion.
+The maintenance bootstrap keeps its ordinary preliminary job check.
+
+### Verified private staging pins
+
+After staging receipt verification and the current Web/API identity readback
+succeed, `verify` emits one JSON line under `verified_private_music_staging`.
+The object has `schema: 1`, the candidate `sha`, decimal string `run_id` and
+`run_attempt`, `artifact_name`, `migration_manifest_sha256`, `contract_sha256`,
+`policy_sha256`, and the three validated `deployments` pins described above.
+`observed_at` contains the normalized UTC opening `build-identity` and closing
+`build-identity-final` observation times. Refusals and ordinary admissions emit
+no private pins. The line is staging evidence only. Match it against the
+[pinned candidate template](../docs/first-private-music-launch.md#pinned-candidate-template).
 
 ## Offline verification
 
