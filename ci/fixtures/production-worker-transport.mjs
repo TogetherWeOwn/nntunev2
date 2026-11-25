@@ -35,7 +35,7 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId, d
     GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'deploy-production', GITHUB_REF: 'refs/heads/main', GITHUB_SHA: sha,
     GITHUB_WORKFLOW_SHA: sha, GITHUB_EVENT_NAME: 'workflow_dispatch', RUNNER_TEMP: temp,
     GITHUB_WORKFLOW_REF: 'example/fixture/.github/workflows/deploy-production.yml@refs/heads/main',
-    INTENT_KEY: 'a'.repeat(64), PROMOTED_VERSION: candidate, PREV_VERSION: version };
+    INTENT_KEY: 'a'.repeat(64) };
   const allocation = (version_id, percentage = 100) => ({ version_id, percentage });
   const deployment = (n, versions, annotations) => ({ id: id(n), versions, annotations,
     created_on: new Date(now() + n * 1000).toISOString() });
@@ -91,9 +91,9 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId, d
     await run('check-seed');
     await run('record');
     shift();
-    await run('pin-final', {}, clock);
+    await run('pin-final', { PROMOTED_VERSION: candidate, PREV_VERSION: version }, clock);
   };
-  return { calls, custody, rows, versions, seed, state, id, temp, env, run, prepare, shift, fail };
+  return { calls, custody, rows, versions, seed, state, id, temp, env, run, prepare, shift, fail, candidate };
 }
 
 export function recoveryFixture(t, transport, conclusion) {

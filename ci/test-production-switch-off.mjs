@@ -104,13 +104,13 @@ test('operator switch-off requires complete readback of the pinned maintenance a
         ...fixture,
         deploymentReadback(receipt) {
           const history = structuredClone(receipt);
-          changeReadback?.(history, transport.env.PROMOTED_VERSION);
+          changeReadback?.(history, transport.candidate);
           return history;
         },
       });
       await transport.run('record');
       transport.shift();
-      const { PROMOTED_VERSION: candidate } = transport.env;
+      const { candidate } = transport;
       assert.deepEqual(transport.rows[0].versions, [{ version_id: candidate, percentage: 100 }]);
 
       const { enter, fresh } = recoveryFixture(t, transport, 'success');

@@ -353,7 +353,7 @@ test('a regression during the release watch restores the verified previous Worke
     return 0;
   });
   transport.shift();
-  await transport.run('pin-final');
+  await transport.run('pin-final', { PROMOTED_VERSION: transport.candidate, PREV_VERSION: version });
   const { fresh, enter } = recoveryFixture(t, transport, 'success');
   assert.match(await enter(fresh('13')), /previous Worker allocation verified/);
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
