@@ -22,8 +22,10 @@ For a separately approved rollout, the Compose input directory is
 `/srv/nntune-trial-pg`, with mode `0700` and a dedicated host UID and GID.
 The template defaults to `24186:24186`. Supply a `passwd` entry mapping that
 identity to `nntune_trial_bootstrap` for Unix peer authentication. Mount
-`config`, `tls` and the one-time initialization password file separately
-from the data directory. Generate the CA and server material with
+`config`, `tls` and `init-password` separately from the data directory.
+After successful initialization, empty `init-password` in place. The
+image still opens the mounted file on each restart. Generate the CA and
+server material with
 `python3 -B ops/staging-trial-pg/create_tls.py <new-private-directory>`.
 Keep the CA key outside every container mount. Use the CA for this one
 instance and a single leaf. A rotation requires new pins and readback on
@@ -39,6 +41,11 @@ app database to bootstrap and owner. The executor and runtime roles prove
 their own canonical SQL identity and database and role OIDs. The leaf pin is
 checked via a separate TLS handshake. Each libpq connection enforces the
 dedicated CA, hostname, TLS 1.3 and SCRAM channel binding.
+
+The stock ACL rehearsal transfers ownership of `postgres`, `template0`
+and `template1` to the trial owner. It includes closed templates in its ACL
+snapshot, removes their ambient grants during restriction and restores the
+snapshot after trial roles retire.
 
 Stage B reruns the merged commit with fresh disposables. Stage C0 checks
 account capacity, scoped authority and combined Tunnel/Access and origin

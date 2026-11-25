@@ -20,7 +20,7 @@ sys.path[:0] = [str(ROOT / ".github/scripts"), str(OPS)]
 from create_tls import create_tls
 from private_trial_catalog import apply_catalog, create_catalog
 from staging_apply import StagingApplyError
-from staging_trial_ambient_acl import CATALOG, compose_selfhost
+from staging_trial_ambient_acl import SELFHOST_CATALOG, compose_selfhost
 from staging_trial_isolated import FIXTURE_HOSTS, HOSTS, KIND, ROLES, selfhost_target_config, target_config
 from staging_trial_role_preflight import BASELINE, DATABASE
 from staging_trial_selfhost import (
@@ -70,8 +70,7 @@ class Disposable:
                 and int(service["mem_limit"]) == 2 * 1024**3 and service["user"] == f"{os.getuid()}:{os.getgid()}"):
             raise AssertionError("unsafe disposable PostgreSQL configuration")
         try:
-            subprocess.run(self.command + ["up", "--wait", "--wait-timeout", "40", "--pull", self.pull],
-                           check=True, timeout=150, env=self.env)
+            self.up()
             yield self
         finally:
             subprocess.run(self.command + ["down", "--volumes", "--timeout", "5"],
@@ -79,6 +78,10 @@ class Disposable:
             result = subprocess.check_output(self.command + ["ps", "--all", "-q"], env=self.env, timeout=10)
             if result.strip():
                 raise RuntimeError("disposable PostgreSQL containers remain")
+
+    def up(self, *options):
+        subprocess.run(self.command + ["up", "--wait", "--wait-timeout", "40", "--pull", self.pull, *options],
+                       check=True, timeout=150, env=self.env)
 
     def run(self, argv, *, env, **kwargs):
         child = {key: value for key, value in env.items() if key.startswith("PG")}
@@ -119,7 +122,7 @@ class Disposable:
             CREATE DATABASE {EXTRA_DB} OWNER {owner} TEMPLATE template0;
             ALTER DATABASE postgres OWNER TO {owner};
             ALTER DATABASE template1 OWNER TO {owner};
-            REVOKE CONNECT ON DATABASE template0 FROM PUBLIC;
+            ALTER DATABASE template0 OWNER TO {owner};
         """, database="postgres")
         entries = apply_catalog(self.admin, ROOT, executor)
         self.admin(f"GRANT SELECT (file, sha256) ON public.schema_migrations TO {owner};"
@@ -176,12 +179,12 @@ class Qualification(unittest.TestCase):
         with self.assertRaisesRegex(StagingApplyError, "migration baseline"):
             check_catalog(pins, owner, executor, query=cluster.query)
         cluster.admin(f"UPDATE public.schema_migrations SET sha256 = '{baseline_digest}' WHERE file = '{BASELINE}';")
-        before = cluster.admin(CATALOG)
+        before = cluster.admin(SELFHOST_CATALOG)
         cluster.admin("CREATE SCHEMA pscale_extensions; CREATE EXTENSION btree_gin WITH SCHEMA pscale_extensions;")
         with self.assertRaisesRegex(StagingApplyError, "extensions differ"):
             check_catalog(pins, owner, executor, query=cluster.query)
         self.assertEqual(cluster.admin("SELECT extname FROM pg_extension ORDER BY extname;"), "btree_gin\nplpgsql")
-        self.assertEqual(cluster.admin(CATALOG), before)
+        self.assertEqual(cluster.admin(SELFHOST_CATALOG), before)
         cluster.admin("DROP EXTENSION btree_gin; DROP SCHEMA pscale_extensions;")
         check_catalog(pins, owner, executor, query=cluster.query)
         return owner
@@ -201,8 +204,11 @@ class Qualification(unittest.TestCase):
             self.assertNotEqual(cluster.psql(owner | invalid, "SELECT 1;").returncode, 0)
 
     def exercise_acl(self, cluster, pins, owner):
-        before = json.loads(cluster.admin(CATALOG))
+        before = json.loads(cluster.admin(SELFHOST_CATALOG))
         postgres_id = next(entry[0] for entry in before["databases"] if entry[1] == "postgres")
+        template_id = next(entry[0] for entry in before["databases"] if entry[1] == "template0")
+        template_connect = [template_id, 0, pins["role_oids"]["owner"], "CONNECT", False]
+        self.assertIn(template_connect, before["acl"])
         plan = {"kind": KIND, "system_identifier": pins["system_identifier"], "database_oid": pins["database_oid"],
                 "baseline": before, "consumers": [[postgres_id, pins["role_oids"]["executor"], ROLES["executor"], "CONNECT"]]}
         raw = json.dumps(plan)
@@ -215,13 +221,14 @@ class Qualification(unittest.TestCase):
                       ("check-ambient", "restrict-ambient", "restore-ambient")}
         cluster.query(owner, statements["check-ambient"], "check ambient")
         cluster.admin(f"GRANT CREATE ON DATABASE {DATABASE} TO PUBLIC;")
-        drifted = json.loads(cluster.admin(CATALOG))
+        drifted = json.loads(cluster.admin(SELFHOST_CATALOG))
         with self.assertRaises(StagingApplyError):
             cluster.query(owner, statements["restrict-ambient"], "restrict ambient")
-        self.assertEqual(json.loads(cluster.admin(CATALOG)), drifted)
+        self.assertEqual(json.loads(cluster.admin(SELFHOST_CATALOG)), drifted)
         cluster.admin(f"REVOKE CREATE ON DATABASE {DATABASE} FROM PUBLIC;")
         for _ in range(2):
             cluster.query(owner, statements["restrict-ambient"], "restrict ambient")
+        self.assertNotIn(template_connect, json.loads(cluster.admin(SELFHOST_CATALOG))["acl"])
         self.assertEqual(cluster.admin(f"SELECT has_database_privilege('{ROLES['executor']}', 'postgres', 'CONNECT');"), "t")
         for key in ("reader", "writer"):
             role = ROLES[key]
@@ -245,7 +252,22 @@ class Qualification(unittest.TestCase):
             cluster.admin(f"REVOKE CONNECT ON DATABASE {DATABASE} FROM {role}; DROP ROLE {role};")
         for _ in range(2):
             cluster.query(owner, statements["restore-ambient"], "restore ambient")
-        self.assertEqual(json.loads(cluster.admin(CATALOG)), before)
+        self.assertEqual(json.loads(cluster.admin(SELFHOST_CATALOG)), before)
+
+    def exercise_restart_and_channel_binding(self, cluster, pins, owner):
+        # An empty mounted file is sufficient after initialization. Give this
+        # disposable alternate TLS server password auth to isolate channel binding.
+        (cluster.path / "init-password").write_bytes(b"")
+        hba = cluster.path / "config" / HBA
+        hba.write_text(hba.read_text(encoding="ascii").replace("scram-sha-256", "password"), encoding="ascii")
+        cluster.up("--force-recreate")
+        self.assertEqual(int(cluster.admin(CONTROL + ";")), pins["system_identifier"])
+        unbound = owner | {"PGCHANNELBINDING": "disable"}
+        self.assertEqual(cluster.query(unbound, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid();",
+                                       "verified TLS control without channel binding"), "t\n")
+        denied = cluster.psql(owner, "SELECT 1;")
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("channel binding required", denied.stderr)
 
     def test_catalog_and_continuity(self):
         with tempfile.TemporaryDirectory(prefix="nntune-stage-a-") as directory:
@@ -283,6 +305,7 @@ class Qualification(unittest.TestCase):
                     check_session(pins, "owner", alternate_owner, query=alternate.query)
                 check_session(alternate_pins, "owner", alternate_owner, query=alternate.query)
                 self.exercise_acl(primary, pins, owner)
+                self.exercise_restart_and_channel_binding(alternate, alternate_pins, alternate_owner)
 
     def test_target_kind_pins_are_disjoint(self):
         cfg = {"database_oid": 16494, "executor_oid": 20001, "direct": "direct.fixture.psdb.cloud",

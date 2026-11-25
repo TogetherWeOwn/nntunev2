@@ -19,7 +19,7 @@ from staging_trial_role_preflight import DATABASE, ROLE_RE, oid
 DATABASE_OID = 16494
 PRIVILEGES = {"CONNECT", "CREATE", "TEMPORARY"}
 OPERATIONS = {"check-ambient", "restrict-ambient", "restore-ambient"}
-CATALOG = """WITH db AS (SELECT * FROM pg_database WHERE datallowconn),
+_CATALOG_QUERY = """WITH db AS (SELECT * FROM pg_database{scope}),
 acl AS (SELECT d.oid AS dbid, a.* FROM db d,
         LATERAL aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a)
 SELECT jsonb_build_object(
@@ -28,6 +28,8 @@ SELECT jsonb_build_object(
  'acl', coalesce((SELECT jsonb_agg(jsonb_build_array(dbid::bigint, grantee::bigint, grantor::bigint,
                          privilege_type, is_grantable)
                   ORDER BY dbid, grantee, grantor, privilege_type, is_grantable) FROM acl), '[]'))"""
+CATALOG = _CATALOG_QUERY.format(scope=" WHERE datallowconn")
+SELFHOST_CATALOG = _CATALOG_QUERY.format(scope="")
 
 
 def branch_pin(database, branch, branch_id):
@@ -107,7 +109,7 @@ def after_plan(original, consumers, database_oid):
     return dbs, after, sorted(public), sorted(added), sorted(identities)
 
 
-def compose(action, original, consumers, database_oid, login, *, fixture=False, owner_guard=""):
+def compose(action, original, consumers, database_oid, login, *, fixture=False, owner_guard="", catalog=CATALOG):
     dbs, after, public, added, identities = after_plan(original, consumers, database_oid)
     owner = dbs[database_oid][1]
     affected = sorted({row[0] for row in public})
@@ -116,7 +118,7 @@ def compose(action, original, consumers, database_oid, login, *, fixture=False, 
         raise StagingApplyError("isolated database ACL grantor authority")
 
     def state(value):
-        return f"({CATALOG}) = {literal(json.dumps(value, ensure_ascii=True))}::jsonb"
+        return f"({catalog}) = {literal(json.dumps(value, ensure_ascii=True))}::jsonb"
 
     def ddl(rows, grant):
         verb, direction = ("GRANT", "TO") if grant else ("REVOKE", "FROM")
@@ -185,7 +187,7 @@ def compose_selfhost(action, raw, digest, pins):
             or not oid(plan["database_oid"]) or plan["database_oid"] != pins["database_oid"]):
         raise ValueError
     return compose(action, plan["baseline"], plan["consumers"], pins["database_oid"], ROLES["owner"],
-                   owner_guard=session_guard(pins, "owner"))
+                   owner_guard=session_guard(pins, "owner"), catalog=SELFHOST_CATALOG)
 
 
 def main():
