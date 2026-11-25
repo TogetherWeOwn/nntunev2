@@ -117,6 +117,24 @@ for (const { status, message, action } of [
 	});
 }
 
+test('Home keeps keyboard focus in the discovery shelf after Retry returns an empty library', async ({
+	page
+}) => {
+	await page.route('**/api/library', (route) => route.fulfill({ json: [] }));
+	await page.route('**/api/library', (route) => route.fulfill({ status: 503 }), { times: 1 });
+	await page.goto('/home');
+
+	const shelf = discovery(page);
+	const retry = shelf.getByRole('button', { name: 'Retry' });
+	await retry.focus();
+	await page.keyboard.press('Enter');
+
+	await expect(shelf.getByText('Your library is empty.', { exact: false })).toBeVisible();
+	await expect(shelf.getByRole('heading', { name: 'Discover your library' })).toBeFocused();
+	await page.keyboard.press('Tab');
+	await expect(shelf.getByRole('link', { name: 'Open Your Library' })).toBeFocused();
+});
+
 test('Home keeps scoped recent searches hidden until a successful Retry', async ({ page }) => {
 	const context = 'home-discovery-retry';
 	const key = `nntune.library.recent-finds.v1.${context}`;
