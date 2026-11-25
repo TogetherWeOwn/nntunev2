@@ -7,6 +7,7 @@ use nntune_core::{
         BodyReadbackError, EnrolledEnvelope, EnrolledReadbackError, ReadbackBody, ReadbackError,
         ReadbackPin, ReadbackResponse,
     },
+    media::PLAIN_CHUNK_SIZE,
     media_envelope::wrap_scheme2,
     origin_sealer::SealedChunk,
 };
@@ -163,8 +164,19 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
     .into_iter()
     .enumerate()
     {
-        prove_attempt(&observer, &authority, &mut writer, index as u8 * 16, fault).await;
+        prove_attempt(
+            &observer,
+            &authority,
+            &mut writer,
+            index as u8 * 16,
+            fault,
+            false,
+        )
+        .await;
     }
+    // Reuse tests tombstone their winner. Publication needs its own live winner
+    // and creates a reference that must block deletion in the reuse scenario.
+    prove_attempt(&observer, &authority, &mut writer, 0xc0, None, true).await;
 }
 
 #[derive(Clone, Copy)]
@@ -187,6 +199,7 @@ async fn prove_attempt(
     mut writer: &mut Client,
     seed: u8,
     fault: Option<Fault>,
+    publish_fixture: bool,
 ) {
     let [root_id, environment, library, object, seal, configuration, map] = [1, 2, 3, 4, 5, 6, 7]
         .map(|value| {
@@ -200,7 +213,12 @@ async fn prove_attempt(
     let map_text = uuid_text(map);
     let root_text = uuid_text(root_id);
     let key = format!("media/{obj}/{generation}");
-    let length = FLAC.len() as u64;
+    let input = if publish_fixture {
+        include_bytes!("../../../../fixtures/synthetic-flac/private-staging/tone-a.flac").as_slice()
+    } else {
+        FLAC
+    };
+    let length = input.len() as u64;
     let mut sealer = DigestEnrollment::new(length, identities, map).unwrap();
     let header = sealer.header();
     let context = EnvelopeContext {
@@ -210,12 +228,19 @@ async fn prove_attempt(
     };
     let root = [17; 32];
     let record = wrap_scheme2(&root, &context, sealer.key().expose_secret()).unwrap();
-    let mut plaintext = FLAC.to_vec();
+    let mut plaintext = input.to_vec();
     if matches!(fault, Some(Fault::BadFlac)) {
         *plaintext.last_mut().unwrap() ^= 1;
     }
-    let sealed = sealer.seal_chunk(&plaintext).unwrap();
-    let page = sealed.page.unwrap();
+    let sealed: Vec<_> = plaintext
+        .chunks(PLAIN_CHUNK_SIZE as usize)
+        .map(|chunk| sealer.seal_chunk(chunk).unwrap())
+        .collect();
+    let page = sealed
+        .iter()
+        .filter_map(|chunk| chunk.page.as_ref())
+        .next()
+        .unwrap();
     let origin = sealer.finish().unwrap();
     let intent = CandidateIntent {
         identities,
@@ -233,7 +258,7 @@ async fn prove_attempt(
     observer.batch_execute(&format!(
         "INSERT INTO public.users (id, email, created_at) VALUES ('{OWNER}', '{OWNER}@example.invalid', 1) ON CONFLICT (id) DO NOTHING;
          INSERT INTO public.storage_environments VALUES ('{env}');
-         INSERT INTO public.storage_library_namespaces VALUES ('{lib}', '{env}', '{OWNER}');
+         INSERT INTO public.storage_library_namespaces VALUES ('{lib}', '{env}', NULL);
          INSERT INTO public.storage_object_intents VALUES ('{obj}', '{generation}', '{env}',
              '{lib}', '{provider}', {length}, {}, decode('{}', 'hex'));
          INSERT INTO public.storage_plaintext_digest_claim_intents VALUES ('{obj}', '{env}', '{lib}',
@@ -480,17 +505,19 @@ async fn prove_attempt(
     )
     .unwrap();
     let mut partition = plan.partition();
-    assert!(partition
-        .push(&SealedChunk {
-            digest: Sha256::digest(&sealed.bytes).into(),
-            bytes: sealed.bytes,
-            final_chunk: true
-        })
-        .unwrap()
-        .is_none());
+    for (index, chunk) in sealed.iter().enumerate() {
+        let part = partition
+            .push(&SealedChunk {
+                digest: Sha256::digest(&chunk.bytes).into(),
+                bytes: chunk.bytes.clone(),
+                final_chunk: index + 1 == sealed.len(),
+            })
+            .unwrap();
+        assert!(part.is_none());
+    }
     let part = partition.finish().unwrap().unwrap();
     let (_, number, ciphertext, checksum) = part.request();
-    assert_ne!(ciphertext, FLAC);
+    assert_ne!(ciphertext, input);
     let ciphertext = ciphertext.to_vec();
     let part_digest: [u8; 32] = Sha256::digest(&ciphertext).into();
     let receipt = part.verify_reply("\"synthetic\"".into(), checksum).unwrap();
@@ -532,7 +559,7 @@ async fn prove_attempt(
         })
         .await
         .unwrap();
-    let put = SidecarPut::new(inventory_bucket, &context, &origin, map, 0, &page).unwrap();
+    let put = SidecarPut::new(inventory_bucket, &context, &origin, map, 0, page).unwrap();
     let page_key = put.request().0.key.clone();
     let sidecars = [put
         .verify_reply(SidecarPutReply {
@@ -576,7 +603,7 @@ async fn prove_attempt(
                 (MEDIA, &ciphertext)
             } else {
                 assert_eq!(pin.object_key, page_key);
-                (PAGE, &page)
+                (PAGE, page)
             };
             assert_eq!(pin.version, Some(version));
             let returned_version =
@@ -805,9 +832,15 @@ async fn prove_attempt(
         return;
     }
     let committed = committed.unwrap();
+    // The staged fixture's next sparse seek anchor is at 5.015 seconds.
+    let seek_range = if publish_fixture {
+        8256..68861
+    } else {
+        42..length
+    };
     assert_eq!(
         committed.flac_plaintext_range(completed.metadata(), origin.plaintext_sha256(), 0..1),
-        Some(42..length)
+        Some(seek_range)
     );
     assert_eq!(
         committed.flac_plaintext_range(completed.metadata(), &[0; 32], 0..1),
@@ -865,6 +898,12 @@ async fn prove_attempt(
         .await,
         Err(UploadError::Refused)
     ));
+    if publish_fixture {
+        crate::handlers::tests::private_trial_fixture::verify_publication(
+            observer, writer, now, input, auth, prepared, &committed, reload,
+        )
+        .await;
+    }
     observer
         .execute(
             "UPDATE public.native_rest_credentials SET revoked_at = $2 WHERE id = $1",
@@ -876,6 +915,9 @@ async fn prove_attempt(
         read(writer, auth, prepared, reload).await,
         Err(UploadError::Refused)
     ));
+    if publish_fixture {
+        return;
+    }
     // Restore the disposable credential for the independent reuse cases.
     observer
         .execute(

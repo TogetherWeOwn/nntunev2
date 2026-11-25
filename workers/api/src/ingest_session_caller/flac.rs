@@ -46,6 +46,12 @@ impl CommittedFlacUpload<'_, '_> {
     }
 }
 
+impl<'inventory, 'receipts> CommittedFlacUpload<'inventory, 'receipts> {
+    pub(crate) fn verified(&self) -> &VerifiedCompletedReadback<'inventory, 'receipts> {
+        &self.verified
+    }
+}
+
 #[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]
 impl OpenedUpload<'_> {
     /// Read the immutable ciphertext and sidecars reported by the completed
