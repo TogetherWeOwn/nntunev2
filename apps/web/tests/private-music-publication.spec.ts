@@ -272,29 +272,28 @@ test('invited playback keeps the arranged queue and seek position across Library
 	await expect(feedback).toHaveText('Back 10 seconds, now at 0:01.');
 	await assertPlayback(start, '0:01');
 
-	// Observe Play and subsequent seeks before measuring native advancement.
+	// Play events are queued. Use that clock sample for advancement, and watch
+	// for seeks or reloads from the settled paused position through resume.
 	const resume = await native.evaluateHandle((node: HTMLAudioElement) => {
-		const observed = { playTime: null as number | null, minimumTime: node.currentTime, sought: false };
+		const observed = { playEventTime: null as number | null, minimumTime: node.currentTime, positionChanges: [] as string[] };
 		const sample = () => { observed.minimumTime = Math.min(observed.minimumTime, node.currentTime); };
 		node.addEventListener('play', () => {
-			observed.playTime = node.currentTime;
+			observed.playEventTime = node.currentTime;
 			sample();
 		}, { once: true });
-		node.addEventListener('seeking', () => {
-			observed.sought = true;
-			sample();
-		});
+		for (const event of ['seeking', 'emptied', 'loadstart']) {
+			node.addEventListener(event, () => { observed.positionChanges.push(event); });
+		}
 		for (const event of ['playing', 'timeupdate']) node.addEventListener(event, sample);
 		return observed;
 	});
 	await player.getByRole('button', { name: 'Play', exact: true }).click();
-	await expect.poll(() => native.evaluate((node: HTMLAudioElement, { playTime }) =>
-		playTime !== null && !node.paused && node.currentTime > playTime + 0.2, resume), {
+	await expect.poll(() => native.evaluate((node: HTMLAudioElement, { playEventTime }) =>
+		playEventTime !== null && !node.paused && !node.seeking && node.currentTime > playEventTime + 0.2, resume), {
 		message: 'Native playback should advance after Play'
 	}).toBe(true);
-	const { playTime, minimumTime, sought } = await resume.jsonValue();
-	expect(playTime, 'Native Play should start at the seek target').toBeCloseTo(start, 1);
-	expect(sought, 'Resume should play without seeking again').toBe(false);
+	const { minimumTime, positionChanges } = await resume.jsonValue();
+	expect(positionChanges, 'Resume should play without seeking or reloading').toEqual([]);
 	expect(minimumTime, 'Native playback should stay at or beyond the seek target').toBeGreaterThanOrEqual(start - 0.05);
 	await assertQueue();
 	await expect(player.getByTestId('library-now-playing')).toHaveText(selected.title);
