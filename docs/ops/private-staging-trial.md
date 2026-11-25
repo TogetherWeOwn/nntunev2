@@ -386,8 +386,9 @@ evidence.
 · [Origin TLS](https://developers.cloudflare.com/hyperdrive/configuration/tls-ssl-certificates-for-hyperdrive/)
 · [Cache settings](https://developers.cloudflare.com/hyperdrive/concepts/query-caching/#disable-caching)
 
-See the [stock PostgreSQL preflight](stock-postgresql-trial-preflight.md) for
-the Access and Tunnel capacity readback and the separate operator connection.
+For the dedicated stock PostgreSQL route, use the
+[stock PostgreSQL preflight](stock-postgresql-trial-preflight.md) for the Access
+and Tunnel capacity readback and the separate operator connection.
 
 C1 provisioning waits for completed C0, a passing disposable rehearsal from
 the merged source and the staging writer handoff after storage qualification.
