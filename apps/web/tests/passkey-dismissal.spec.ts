@@ -241,6 +241,7 @@ test('signup: retry after dismissal finishes with the same code and challenge', 
 		challenge: 'Y2hhbGxlbmdl',
 		magic_token: 'fixture-code'
 	});
+	expect(traffic.finishBodies[0]).not.toHaveProperty('invite_code');
 });
 
 test('login: retry after dismissal signs in', async ({ page }) => {
@@ -341,6 +342,50 @@ test('private listening invite opens Library and refusal clears it', async ({ pa
 	await expect(page.getByText(library.forbidden, { exact: true })).toBeVisible();
 	await expect(fixture.track(page)).toHaveCount(0);
 });
+
+for (const phase of ['start', 'finish'] as const) {
+	test(`private invite stays private when registration ${phase} redirects`, async ({ page, baseURL }) => {
+		const origin = new URL(baseURL ?? 'about:blank');
+		if (!['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) {
+			throw new Error('Private invite signup requires a loopback browser fixture');
+		}
+		const { signup } = PRIVATE_MUSIC;
+		const fixture = privateSignupFixture();
+		const endpoint = `/v1/auth/passkey/register/${phase}`;
+		const redirectStatus = phase === 'start' ? 307 : 308;
+		const submissions: { method: string; body: unknown }[] = [];
+		let leakedUrl = false;
+		let leakedDiagnostic = false;
+		page.on('request', (request) => { leakedUrl ||= request.url().includes(fixture.code); });
+		page.on('console', (message) => { leakedDiagnostic ||= message.text().includes(fixture.code); });
+		page.on('pageerror', (error) => { leakedDiagnostic ||= error.message.includes(fixture.code); });
+		await fixture.install(page);
+		await page.route(new URL(endpoint, origin).href, (route) => {
+			const request = route.request();
+			submissions.push({ method: request.method(), body: request.postDataJSON() });
+			return route.fulfill({
+				status: redirectStatus,
+				headers: { location: `/unexpected-signup-target?fixture=${fixture.code}` }
+			});
+		});
+
+		await fixture.openInvite(page);
+		const start = page.getByTestId(signup.submit);
+		const submit = phase === 'start' ? start : page.getByRole('button', { name: signup.finish, exact: true });
+		if (phase === 'finish') {
+			await start.click();
+			await page.getByLabel(signup.emailCode, { exact: true }).fill('fixture-code');
+		}
+		await submit.click();
+		await expect(page.getByRole('alert')).toHaveText(
+			phase === 'start' ? 'Something went wrong. Try again.' : SIGNUP_GENERIC
+		);
+		expect(submissions).toMatchObject([{ method: 'POST', body: { invite_code: fixture.code } }]);
+		await expect(page).toHaveURL(signup.path);
+		expect(leakedUrl, 'signup requested the credential-bearing redirect target').toBe(false);
+		expect(leakedDiagnostic, 'a browser diagnostic included the synthetic invite').toBe(false);
+	});
+}
 
 test('a spent private invite refuses signup in a second browser context', async ({ page, context, browser, baseURL }) => {
 	const { signup, library } = PRIVATE_MUSIC;
