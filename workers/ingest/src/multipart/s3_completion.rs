@@ -67,6 +67,10 @@ pub struct S3CompletionSender {
 }
 
 impl S3CompletionSender {
+    pub fn matches_storage(&self, configuration: [u8; 16], bucket: &str) -> bool {
+        self.configuration == configuration && self.bucket == bucket
+    }
+
     /// Load a canonical HTTPS origin and credentials from trusted configuration.
     pub fn new(
         configuration: [u8; 16],

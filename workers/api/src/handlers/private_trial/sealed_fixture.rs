@@ -3,7 +3,7 @@
 use nntune_core::{
     digest_enrollment::{DigestEnrollment, OriginManifest},
     media::{Header, PLAIN_CHUNK_SIZE},
-    media_envelope::{wrap_scheme2, EnvelopeContext},
+    media_envelope::{verify_enrolled_scheme2, wrap_scheme2, EnvelopeContext},
     origin_sealer::SealedChunk,
 };
 use nntune_ingest::digest_candidate_store::CandidateIntent;
@@ -136,6 +136,16 @@ impl SealedFixture {
         consume: impl AsyncFnOnce(&mut Client, &CommittedFlacUpload<'_, '_>) -> Result<T, TrialError>,
     ) -> Result<T, TrialError> {
         let [environment, library, object, generation, configuration] = self.intent.identities;
+        if prepared.context.identities != self.context.identities
+            || prepared.context.header != self.context.header
+            || prepared.context.plaintext_len != self.context.plaintext_len
+            || prepared.intent.map_id != self.intent.map_id
+            || prepared.intent.reservation_generation != self.intent.reservation_generation
+            || !sender.matches_storage(configuration, bucket)
+        {
+            return Err(Refused);
+        }
+        self.verify_root(root)?;
         let [environment, library, object, generation] =
             [environment, library, object, generation].map(uuid_text);
         let key = format!("media/{object}/{generation}");
@@ -147,17 +157,20 @@ impl SealedFixture {
         let until = upload.usable_until();
         let target = upload.target();
         if target.bucket != bucket {
-            return Err(Refused);
+            return Err(Unconfirmed);
         }
         let plan =
-            Plan::new(target, self.header, self.context.plaintext_len).map_err(|_| Refused)?;
+            Plan::new(target, self.header, self.context.plaintext_len).map_err(|_| Unconfirmed)?;
         let mut partition = plan.partition();
         for chunk in &self.chunks {
-            if partition.push(chunk).map_err(|_| Refused)?.is_some() {
-                return Err(Refused);
+            if partition.push(chunk).map_err(|_| Unconfirmed)?.is_some() {
+                return Err(Unconfirmed);
             }
         }
-        let part = partition.finish().map_err(|_| Refused)?.ok_or(Refused)?;
+        let part = partition
+            .finish()
+            .map_err(|_| Unconfirmed)?
+            .ok_or(Unconfirmed)?;
         let binding = ResumeBinding {
             plan,
             configuration,
@@ -231,6 +244,17 @@ impl SealedFixture {
             .map_err(upload_error)?;
         consume(writer, &committed).await
     }
+
+    fn verify_root(&self, root: &[u8; 32]) -> Result<(), TrialError> {
+        verify_enrolled_scheme2(
+            root,
+            &self.context,
+            &self.record,
+            &self.record,
+            &self.origin,
+        )
+        .map_err(|_| Refused)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -253,6 +277,8 @@ pub(crate) fn verify_sealed_fixture(input: &[u8]) {
     let root = id(7);
     let ids = [1, 2, 3, 4, 5].map(id);
     let fixture = SealedFixture::new(input, ids, map, root, &[0xab; 32]).unwrap();
+    assert_eq!(fixture.verify_root(&[0xab; 32]), Ok(()));
+    assert_eq!(fixture.verify_root(&[0xac; 32]), Err(Refused));
     assert_eq!(fixture.context.identities, [7, 1, 2, 3, 4, 5].map(id));
     assert_eq!(fixture.header.to_bytes(), fixture.context.header);
     assert_eq!(
