@@ -152,6 +152,53 @@ HEAD against the now-absent version and require the same status, body and
 optional version header checks. Treat HTTP 403, ambiguity or a policy that
 needs list access as a stop. Keep the scope and credentials in protected custody.
 
+#### Provider-only preflight
+
+In the protected qualification environment, build the standalone probe from
+the reviewed commit before loading provider credentials. Use Node 24+, an
+absolute disposable `probe_dir` and the `wasm-bindgen` CLI version pinned in
+`workers/ingest/Cargo.lock`.
+
+```sh
+cargo build --locked --manifest-path workers/ingest/Cargo.toml \
+  --target wasm32-unknown-unknown --no-default-features --features fixture-provider-preflight \
+  --target-dir "$probe_dir/target"
+wasm-bindgen --target nodejs --out-dir "$probe_dir" \
+  "$probe_dir/target/wasm32-unknown-unknown/debug/nntune_ingest.wasm"
+```
+
+On the dedicated staging provider and fixture bucket, provision one disposable
+non-member object at `media/00000000000040008000000000000000/<generation>`.
+Reserve that object ID for qualification. Use a fresh compact lowercase UUIDv4
+for `generation` and take the version ID from the protected provisioning
+receipt. Independently read back the disposable credential's policy. Require
+the cleanup policy shape with exact-version HEAD and DELETE on that single key
+and no listing, bulk delete, unversioned delete or broad key grant. Keep the
+provisioning identity separate and withdraw the disposable credential after the
+probe. Verify the trial cleanup credential's two-key policy separately.
+
+In the protected environment, load `PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT` and
+`PRIVATE_PLAYBACK_STAGING_S3_REGION` from trusted staging settings. Pass
+`PRIVATE_TRIAL_PREFLIGHT_SCOPE` as the protected fixture JSON with `bucket`,
+`endpoint`, `region`, `generation` and `version`. Pass the disposable
+`access_key` and `secret_key` in `PRIVATE_TRIAL_PREFLIGHT_S3` as JSON. Use a
+clean process environment with normal TLS verification and shell tracing off.
+Run the provider probe explicitly from the repository root.
+
+```sh
+node .github/scripts/private_trial_provider_preflight.cjs --provider "$probe_dir/nntune_ingest.js"
+```
+
+Record the reviewed commit, UTC run time, redacted policy and fixture custody
+references, and the fixed verdict line in the protected trial record. A
+`qualified` verdict records a matching present HEAD and both confirmed delete
+and absence pairs. A `refused`, `unconfirmed`, interrupted or missing verdict
+blocks arming. A failed attempt can already have deleted its version. Reconcile
+the protected fixture before probing a freshly provisioned disposable version.
+Keep origins, keys, version IDs, credentials, raw requests and replies out of
+shared evidence. Hosted synthetic fixture results prove client behavior only.
+Record actual provider qualification separately before arming the trial.
+
 Once the cutoff, retention and lease windows have elapsed, dispatch
 [`deploy`](../../.github/workflows/deploy.yml) from protected `main` with
 `private_trial_cleanup_scope_sha256` set to the SHA-256 of the exact UTF-8
