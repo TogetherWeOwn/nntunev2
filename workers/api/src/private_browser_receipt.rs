@@ -45,7 +45,7 @@ struct ReceiptPins {
     epoch: u64,
     expires_at: u64,
     #[serde(default)]
-    renewed: bool,
+    renew_until: Option<u64>,
     request_id: Option<String>,
     accepted_seq: i64,
     target: DigestReadTarget,
@@ -262,8 +262,9 @@ impl PrivatePlayback<'_> {
     }
 
     /// Issue under the privacy/deletion fence, or retry the exact current
-    /// receipt. An expired receipt can be reissued once under the same play
-    /// identity after reauthorizing its pinned publication.
+    /// receipt. An expired receipt can be reissued under the same play
+    /// identity after reauthorizing its pinned publication, up to the
+    /// original session and policy cutoff.
     pub(crate) async fn open_browser(
         &self,
         db: &mut impl PgConnect,
@@ -283,7 +284,8 @@ impl PrivatePlayback<'_> {
             let user = &claims.user_id;
             let track = &input.track_id;
             let tab = &input.session_id;
-            if start >= policy.expires_at.min(claims.expires_at)
+            let authorized_until = policy.expires_at.min(claims.expires_at);
+            if start >= authorized_until
                 || !is_valid_key_field(tab, 128)
                 || input
                     .play_id
@@ -327,13 +329,7 @@ impl PrivatePlayback<'_> {
                             .browser_receipt_for(&tx, claims, lease, &pins, scope, checked_at)
                             .await;
                     }
-                    if pins.renewed {
-                        return Ok(None);
-                    }
-                    continuation = Some(ReceiptPins {
-                        renewed: true,
-                        ..pins
-                    });
+                    continuation = Some(pins);
                 }
             }
             // A rejected continuation never falls through to lease acquisition.
@@ -367,7 +363,7 @@ impl PrivatePlayback<'_> {
                     tab: tab.clone(),
                     epoch: 0,
                     expires_at: 0,
-                    renewed: false,
+                    renew_until: Some(authorized_until),
                     request_id: input.request_id.clone(),
                     accepted_seq: row.try_get("accepted_seq").map_err(|_| StoreError)?,
                     target: music.target,
@@ -377,6 +373,10 @@ impl PrivatePlayback<'_> {
                     private: classify_play_privacy(&tx, user, tab, &key, start).await?,
                 }
             };
+            let renew_until = *pins.renew_until.get_or_insert(authorized_until);
+            if start >= renew_until {
+                return Ok(None);
+            }
             let end = playback::continuation_deadline(
                 start,
                 crate::meter_sink::TrackMeterMeta {
@@ -384,8 +384,8 @@ impl PrivatePlayback<'_> {
                     ..Default::default()
                 },
             )
-            .min(policy.expires_at)
-            .min(claims.expires_at)
+            .min(authorized_until)
+            .min(renew_until)
             .min(start.saturating_add(crate::play_grant::MAX_GRANT_TTL));
             // Native <audio> has no heartbeat. Bound this immutable grant
             // and lease to one track's window and the existing v4 TTL cap.

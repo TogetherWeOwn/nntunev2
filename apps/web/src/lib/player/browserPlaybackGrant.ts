@@ -4,11 +4,11 @@ import type { QueuedPlaySource } from './queueController.js';
 type Target = { readonly trackId: string; readonly playId?: string };
 type Owner = { readonly sessionBinding: string; readonly playbackSessionId: string };
 type Reply = Owner & { trackId: string; playId: string; durationMs: number };
-type Prepare = (request: Owner & Target, signal: AbortSignal) => Promise<{ data: unknown; expiresAt?: number } | undefined>;
+type Prepare = (request: Owner & Target, signal: AbortSignal) => Promise<{ data: unknown; expired?: () => boolean } | undefined>;
 export type BrowserPlaybackSource = QueuedPlaySource & {
 	readonly trackId: string;
 	readonly playId: string;
-	readonly expiresAt?: number;
+	readonly expired?: () => boolean;
 };
 
 function validId(value: unknown): value is string {
@@ -54,7 +54,7 @@ export function createBrowserPlaybackGrant(owner: AccountSession, sessionBinding
 						return false;
 					}
 					publish({ streamUrl: `/v1/plays/media/${trackId}/${playbackSessionId}/${issuedPlayId}`, trackId,
-						playId: issuedPlayId, expiresAt: prepared?.expiresAt, isCurrent: ownsAccount }, durationMs);
+						playId: issuedPlayId, expired: prepared?.expired, isCurrent: ownsAccount }, durationMs);
 					return true;
 				})) ?? false;
 			} finally {

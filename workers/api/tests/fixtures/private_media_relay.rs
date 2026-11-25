@@ -179,7 +179,7 @@ fn browser_issue_selects_only_armed_verified_sessions_and_projects_five_fields()
         response.extra_headers,
         [
             ("cache-control".into(), "private, no-store".into()),
-            ("x-nntune-playback-expires-at".into(), "12".into()),
+            ("x-nntune-playback-ttl".into(), "2".into()),
         ]
     );
     assert_eq!(

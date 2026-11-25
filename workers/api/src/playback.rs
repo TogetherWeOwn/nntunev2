@@ -32,8 +32,8 @@
 //!   `superseded` and it pauses itself. The hard guarantee is its next
 //!   grant request, which the lease gate refuses.
 //! - Idle expiry and the per-play deadline are strict. The browser's
-//!   explicit retry can authorize one new lease for the still-current
-//!   receipt without creating a second metered play.
+//!   explicit retry can authorize a new lease for the still-current
+//!   receipt within its original authorization window and keep its play ID.
 
 use crate::billing::{EffectivePlan, SubscriptionView};
 

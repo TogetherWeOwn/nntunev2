@@ -12,11 +12,13 @@ export function createBrowserPlaybackSession(
 	const isCurrent = () => !signal.aborted && owner.isCurrent();
 	const api = new ApiClient({ baseUrl: '', fetchFn, session: { owner, binding } });
 	const grant = createBrowserPlaybackGrant(owner, binding, async ({ trackId, playbackSessionId, playId }, signal) => {
+		const wall = Date.now(), monotonic = performance.now();
 		const { status, data, headers } = await api.writeBrowserPlayback({ track_id: trackId, session_id: playbackSessionId, play_id: playId }, signal);
 		if (status !== 200) return;
-		const cutoff = headers.get('x-nntune-playback-expires-at');
-		const expiresAt = cutoff && /^\d{1,13}$/.test(cutoff) ? Number(cutoff) * 1000 : 0;
-		return { data, expiresAt: expiresAt || undefined };
+		const ttl = headers.get('x-nntune-playback-ttl');
+		if (ttl === null || !/^\d{1,3}$/.test(ttl)) return { data };
+		const duration = Number(ttl) * 1000;
+		return { data, expired: () => Math.max(Date.now() - wall, performance.now() - monotonic) >= duration };
 	});
 	let enabled = false, uncertain = false, pending = false;
 	let tail = Promise.resolve();

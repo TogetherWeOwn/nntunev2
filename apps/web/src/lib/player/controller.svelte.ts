@@ -64,8 +64,7 @@ export function createPlayerController(
 	const media = createMediaController(queue, {
 		...effects, browseCopy, streamFor, announce: announceQueue,
 		commit: (next, source) => commitQueue(next, 'replace', undefined, source),
-		grantExpired: (id) => activeGrant?.trackId === id && activeGrant.expiresAt !== undefined &&
-			Date.now() >= activeGrant.expiresAt,
+		grantExpired: (id) => activeGrant?.trackId === id && activeGrant.expired?.() === true,
 		prepare: browserPlayback ? (id, current, publish, { retry, retireSuperseded } = {}) => {
 			const before = activeGrant;
 			const playId = retry && before?.trackId === id ? before.playId : undefined;

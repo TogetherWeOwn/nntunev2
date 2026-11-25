@@ -14,12 +14,13 @@ test('private Play resumes the same listen after its grant expires during Pause'
 	const playsUrl = origin + player.plays;
 	const grantLifetime = 134_000; // 14 seconds of media plus the private browser window's slack.
 	let now = Date.UTC(2026, 0, 1);
+	const clockSkew = 12 * 60 * 60 * 1000;
 	let expiresAt = 0, sessionId = '';
 	const mediaPath = () => `${player.plays}/media/${selected.id}/${sessionId}/${playId}`;
 	const plays: unknown[] = [], listenEvents: string[] = [];
-	const allowRenewal = Promise.withResolvers<void>();
+	let allowRenewal = Promise.resolve();
 
-	await page.clock.setFixedTime(now);
+	await page.clock.setFixedTime(now - clockSkew);
 	await context.route('**/*', (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
 	await context.addCookies([{ name: fixtureCookie, value: member, url: origin, httpOnly: true }]);
 	await page.route(`${origin}/v1/me/likes/session`, async (route) => hasFixtureSession(await route.request().headerValue('cookie'), member)
@@ -44,10 +45,10 @@ test('private Play resumes the same listen after its grant expires during Pause'
 			sessionId = input.session_id;
 		} else {
 			if (input.session_id !== sessionId || input.play_id !== playId) return route.fulfill({ status: 404 });
-			await allowRenewal.promise;
+			await allowRenewal;
 		}
 		if (now >= expiresAt) expiresAt = now + grantLifetime;
-		return route.fulfill({ headers: { 'x-nntune-playback-expires-at': String(expiresAt / 1000) }, json: {
+		return route.fulfill({ headers: { 'x-nntune-playback-ttl': String((expiresAt - now) / 1000) }, json: {
 			trackId: selected.id, playbackSessionId: sessionId, sessionBinding: binding, playId, durationMs: selected.duration_ms
 		} });
 	});
@@ -75,33 +76,46 @@ test('private Play resumes the same listen after its grant expires during Pause'
 	await expectQueue();
 	await play.click();
 	await expect.poll(() => audio.evaluate((node: HTMLAudioElement) => !node.paused && node.currentTime > 1)).toBe(true);
-	await pause.click();
-	await expect(audio).toHaveJSProperty('paused', true);
-	const resume = await audio.evaluateHandle((node: HTMLAudioElement) => {
-		const observation = { node, pausedAt: node.currentTime, starts: [] as number[] };
-		node.addEventListener('play', () => observation.starts.push(node.currentTime));
-		return observation;
-	});
 	const initial = { track_id: selected.id, session_id: sessionId };
 	const continuation = { ...initial, play_id: playId };
-	now += grantLifetime;
-	await page.clock.setFixedTime(now);
-	await expectQueue();
-	expect(plays).toEqual([initial]);
-	try {
-		await play.click();
-		await expect.poll(() => plays).toEqual([initial, continuation]);
+	const readRange = () => page.evaluate(async (src) => {
+		const response = await fetch(src, { cache: 'no-store', headers: { range: 'bytes=0-3' } });
+		return { status: response.status, bytes: await response.text() };
+	}, mediaPath());
+	const expectedPlays = [initial];
+	for (let attempt = 0; attempt < 2; attempt++) {
+		await pause.click();
 		await expect(audio).toHaveJSProperty('paused', true);
-	} finally {
-		allowRenewal.resolve();
+		const resume = await audio.evaluateHandle((node: HTMLAudioElement) => {
+			const observation = { node, pausedAt: node.currentTime, starts: [] as number[] };
+			node.addEventListener('play', () => observation.starts.push(node.currentTime), { once: true });
+			return observation;
+		});
+		now += grantLifetime;
+		await page.clock.setFixedTime(now - clockSkew);
+		expect(await readRange()).toEqual({ status: 404, bytes: '' });
+		await expectQueue();
+		expect(plays).toEqual(expectedPlays);
+		const renewal = Promise.withResolvers<void>();
+		allowRenewal = renewal.promise;
+		expectedPlays.push(continuation);
+		try {
+			await play.click();
+			await expect.poll(() => plays).toEqual(expectedPlays);
+			await expect(audio).toHaveJSProperty('paused', true);
+			expect(await resume.evaluate(({ starts }) => starts)).toEqual([]);
+		} finally {
+			renewal.resolve();
+		}
+		await expect.poll(() => resume.evaluate(({ node, pausedAt }) => !node.paused && !node.error && node.currentTime > pausedAt + 0.2)).toBe(true);
+		const { pausedAt, starts } = await resume.evaluate(({ pausedAt, starts }) => ({ pausedAt, starts }));
+		expect(starts).toHaveLength(1);
+		expect(Math.abs(starts[0] - pausedAt)).toBeLessThan(0.05);
+		await expect(audio).toHaveJSProperty('currentSrc', origin + mediaPath());
+		expect(await readRange()).toEqual({ status: 206, bytes: 'fLaC' });
+		await expectQueue();
+		await resume.dispose();
 	}
-	await expect.poll(() => resume.evaluate(({ node, pausedAt }) => !node.paused && !node.error && node.currentTime > pausedAt + 0.2)).toBe(true);
-	const { pausedAt, starts } = await resume.evaluate(({ pausedAt, starts }) => ({ pausedAt, starts }));
-	expect(starts).toHaveLength(1);
-	expect(Math.abs(starts[0] - pausedAt)).toBeLessThan(0.05);
-	await expect(audio).toHaveJSProperty('currentSrc', origin + mediaPath());
-	await expectQueue();
-	expect(plays).toEqual([initial, continuation]);
+	expect(plays).toEqual(expectedPlays);
 	expect(listenEvents).toEqual([]);
-	await resume.dispose();
 });

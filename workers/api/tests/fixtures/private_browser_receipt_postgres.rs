@@ -18,6 +18,18 @@ pub(super) async fn receipt_retries(
     publication: &PublicationPins<'_>,
     root_version: [u8; 16],
 ) {
+    let broader_service = service;
+    let broader_policy = service.policy.unwrap();
+    let initial_policy = crate::private_listening::PrivateListening {
+        owner_user_id: broader_policy.owner_user_id.clone(),
+        invite_ids: broader_policy.invite_ids.clone(),
+        expires_at: broader_policy.expires_at - 30,
+        library_scope: None,
+    };
+    let service = &PrivatePlayback {
+        policy: Some(&initial_policy),
+        ..*service
+    };
     let incumbent = &legacy.relay().lease;
     let scope = BrowserScope {
         publication: publication.into(),
@@ -245,7 +257,7 @@ pub(super) async fn receipt_retries(
     assert!(renewed.grant.exp_unix > cutoff);
     assert!(renewed.grant.exp_unix <= claims.expires_at);
     assert!(service
-        .load_for_stream(reader, grant, scope, || expiry)
+        .load_for_stream(reader, grant, scope, || started)
         .await
         .unwrap()
         .is_none());
@@ -261,15 +273,30 @@ pub(super) async fn receipt_retries(
         .unwrap()
         .unwrap();
     assert_eq!(loaded.relay().lease, renewed.lease);
+    let streamed = service
+        .load_for_stream(reader, &renewed.grant.token, scope, || expiry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(streamed.relay().lease, renewed.lease);
     let expired_again = UNIX_EPOCH + Duration::from_secs(renewed.lease.expires_at);
-    assert!(renewed.lease.expires_at < claims.expires_at);
-    assert!(service
+    let resumed_again = service
         .open_browser(reader, claims, &input, scope, || expired_again)
         .await
         .unwrap()
-        .is_none());
-    let policy_cutoff = UNIX_EPOCH + Duration::from_secs(claims.expires_at);
-    assert!(service
+        .unwrap();
+    assert_eq!(resumed_again.relay().lease.play_id, original.lease.play_id);
+    assert_eq!(resumed_again.relay().lease.epoch, renewed.lease.epoch + 1);
+    let policy_cutoff = UNIX_EPOCH + Duration::from_secs(initial_policy.expires_at);
+    let last = broader_service
+        .open_browser(reader, claims, &input, scope, || {
+            policy_cutoff - Duration::from_secs(1)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.relay().lease.expires_at, initial_policy.expires_at);
+    assert!(broader_service
         .open_browser(reader, claims, &input, scope, || policy_cutoff)
         .await
         .unwrap()
@@ -279,7 +306,7 @@ pub(super) async fn receipt_retries(
             .await
             .unwrap()
             .unwrap(),
-        renewed.lease
+        last.relay().lease
     );
     assert_eq!(mark_count().await, before + 1);
     assert!(playback_privacy_mark(writer, MEMBER, &key).await.unwrap());
