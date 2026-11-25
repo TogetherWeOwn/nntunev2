@@ -849,6 +849,8 @@ jobs:
         run: python3 .github/scripts/test_ingest_session_migration_postgres.py
       - name: Rehearse the protected private trial schema on disposable PostgreSQL
         run: python3 .github/scripts/test_staging_trial_schema_postgres.py
+      - name: Rehearse private trial role isolation on disposable PostgreSQL
+        run: python3 .github/scripts/test_staging_trial_role_preflight.py
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal --no-self-update

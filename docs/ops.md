@@ -434,6 +434,35 @@ with the already provisioned caller and reader roles. The overlay grants
 those roles access only to its three new tables. Existing base-table
 permissions, protected caller routing and serving arms are managed separately.
 
+Before adding application grants to newly issued trial logins, use the
+manual `staging-trial-role-preflight` workflow from protected `main`. The
+staging Environment custodian supplies `PRIVATE_TRIAL_ROLE_PREFLIGHT_SCOPE`
+as JSON with `database_oid`, `issuer_oid`, `reader` and `writer`. Each login
+entry is a two-element list of the canonical SQL role name and catalog OID.
+Use the independently verified staging database OID. Set `issuer_oid` to
+zero for roles with no inbound membership, or to the authorized CREATEROLE
+issuer's OID for ADMIN-only membership with SET and INHERIT disabled.
+
+The preflight uses the existing staging migrator credential for a read-only
+catalog query and binds the session to the recorded 0063 staging baseline.
+Both new logins need NOINHERIT, direct staging CONNECT and schema `public`
+USAGE. The check refuses effective CREATE or TEMP on staging and CONNECT to
+any other connectable non-template database, including through PUBLIC's default
+privileges. It also refuses role escalation, object ownership, application
+relation and sequence privileges, and executable application SECURITY DEFINER
+routines. The summary reports only verdicts. Keep the scope secret
+unset until the issuer has verified the logins and remove it after the readback.
+Role issuance and revocation need a separately authorized route. Before
+setting the two overlay variables, verify both routed logins and their exact
+application grants. After the overlay, recheck its effective ACLs before the trial.
+
+For withdrawal, disarm the trial and unbind its credentials, then remove both
+overlay variables and the preflight scope. Through the same authorized role
+route, fence both exact logins, drain their sessions and revoke their scoped
+grants. Verify role and session absence after retiring them. Reconcile any
+dependent overlay receipt with the schema owner before issuing a replacement
+pair. A fresh role alone cannot reuse a conflicting prior overlay receipt.
+
 The overlay applies in one transaction. The job summary records its bundle
 SHA-256. The admission table comment records the bundle and chosen roles so
 an identical retry skips the DDL and any conflicting prior install fails.
