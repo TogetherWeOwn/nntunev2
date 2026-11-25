@@ -1,12 +1,16 @@
 """Regression tests for canonical Worker build and upload sequencing."""
 
 import importlib.util
+import json
 from pathlib import Path
 import re
+import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 SPEC = importlib.util.spec_from_file_location("check_worker_upload", Path(__file__).with_name("check_worker_upload.py"))
 UPLOAD = importlib.util.module_from_spec(SPEC)
@@ -33,6 +37,51 @@ def steps(section):
 
 
 class WorkerBuildWorkflowTests(unittest.TestCase):
+    def test_synthetic_invocation_record(self):
+        probe_id = uuid4().hex
+        clean_url = "https://staging.example.test/v1/plans"
+        probe_url = clean_url + "?redaction_probe=synthetic-only"
+        event = {
+            "kind": "invocation",
+            "worker": "nntune-api-staging",
+            "probe_id": probe_id,
+            "method": "GET",
+            "url": clean_url,
+        }
+        command = [sys.executable, "-I", SPEC.origin, "--invocation-probe-id", probe_id]
+        record = json.dumps(event).encode()
+
+        def verify(raw):
+            return subprocess.run(command, input=raw, capture_output=True, timeout=5)
+
+        passed = verify(record)
+        self.assertEqual((passed.returncode, passed.stdout, passed.stderr),
+                         (0, b"check_worker_upload: synthetic invocation redaction ok\n", b""))
+
+        for case, raw, diagnostic in (
+            ("missing event", b"", "missing synthetic invocation record"),
+            ("empty event", b"{}", "missing or malformed synthetic invocation record"),
+            ("wrong Worker", json.dumps(event | {"worker": "synthetic-web-worker"}).encode(),
+             "unexpected synthetic invocation Worker"),
+            ("stale marker", json.dumps(event | {"probe_id": uuid4().hex}).encode(),
+             "synthetic invocation does not match this probe"),
+            ("missing URL", json.dumps(event | {"url": None}).encode(),
+             "synthetic invocation URL is missing or differs from the redacted URL"),
+            ("retained query", json.dumps(event | {"url": probe_url}).encode(),
+             "synthetic invocation URL is missing or differs from the redacted URL"),
+            ("query delimiter", json.dumps(event | {"url": clean_url + "?"}).encode(),
+             "synthetic invocation URL is missing or differs from the redacted URL"),
+            ("duplicate field", b'{"url":"synthetic-duplicate",' + record[1:],
+             "synthetic invocation record has duplicate fields"),
+            ("two records", record + b"\n" + record, "invalid synthetic invocation record JSON"),
+            ("malformed", b'{"url":"synthetic-incomplete"', "invalid synthetic invocation record JSON"),
+            ("oversized", record + b" " * 4096, "synthetic invocation record exceeds size limit"),
+        ):
+            with self.subTest(case=case):
+                refused = verify(raw)
+                self.assertEqual((refused.returncode, refused.stdout, refused.stderr),
+                                 (1, b"", f"check_worker_upload: FAIL: {diagnostic}\n".encode()))
+
     def test_private_upload_uses_the_gate_and_checks_all_connections_before_deploy(self):
         text = (ROOT / ".github/workflows/deploy.yml").read_text()
         gate = job(text, "gate")

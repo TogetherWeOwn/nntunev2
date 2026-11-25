@@ -21,6 +21,10 @@ No secrets, no Cloudflare API calls. Usage:
 
     GITHUB_SHA=<40 hex> python3 -I .github/scripts/check_worker_upload.py \
         --wrangler path/to/node_modules/wrangler/bin/wrangler.js
+
+For the separate offline invocation check, pipe one normalized synthetic JSON
+record to --invocation-probe-id <32 lowercase hex digits>. This mode uses no
+builds or Wrangler.
 """
 
 import argparse
@@ -42,6 +46,9 @@ WORKFLOW = ".github/workflows/deploy.yml"
 MANIFEST = ".github/scripts/binding_manifest.toml"
 PRIVATE_CONFIG = ".github/scripts/staging_stream_config.py"
 OBSERVATION = "1" * 32 + ":" + "2" * 64
+STAGING_API_WORKER = "nntune-api-staging"
+SYNTHETIC_INVOCATION_URL = "https://staging.example.test/v1/plans"
+INVOCATION_RECORD_MAX_BYTES = 4096
 BUILD_CMD = "worker-build --release -- --locked"
 TIMEOUT = 600
 
@@ -230,6 +237,36 @@ def assert_upload_redaction(upload_body, label):
           f"{label}: Wrangler upload metadata must set observability.redact_query_string to true")
 
 
+def unique_json_object(pairs):
+    obj = {}
+    for key, value in pairs:
+        check(key not in obj, "synthetic invocation record has duplicate fields")
+        obj[key] = value
+    return obj
+
+
+def assert_invocation_redaction(source, probe_id):
+    """Validate one synthetic invocation correlated outside the request URL."""
+    check(re.fullmatch(r"[0-9a-f]{32}", probe_id), "invalid synthetic invocation probe ID")
+    raw = source.read(INVOCATION_RECORD_MAX_BYTES + 1)
+    check(len(raw) <= INVOCATION_RECORD_MAX_BYTES, "synthetic invocation record exceeds size limit")
+    check(raw.strip(), "missing synthetic invocation record")
+    try:
+        event = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_json_object)
+    except (ValueError, RecursionError):
+        raise Failure("invalid synthetic invocation record JSON") from None
+    check(isinstance(event, dict) and set(event) == {"kind", "worker", "probe_id", "method", "url"},
+          "missing or malformed synthetic invocation record")
+    check(event["kind"] == "invocation" and event["method"] == "GET",
+          "expected a synthetic GET invocation record")
+    check(event["worker"] == STAGING_API_WORKER, "unexpected synthetic invocation Worker")
+    check(event["probe_id"] == probe_id, "synthetic invocation does not match this probe")
+    # Exact comparison avoids normalizing away query delimiters or other
+    # unexpected text. The diagnostics never include any input field values.
+    check(event["url"] == SYNTHETIC_INVOCATION_URL,
+          "synthetic invocation URL is missing or differs from the redacted URL")
+
+
 def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_private=False):
     label = f"{worker}" + ("" if worker != "api" else (" mirror-present" if mirror else " mirror-absent"))
     if worker == "stream":
@@ -381,6 +418,7 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
     if worker == "api":
         summary = Path(summary_env["GITHUB_STEP_SUMMARY"]).read_text()
         staging = config["env"]["staging"]
+        check(staging.get("name") == STAGING_API_WORKER, f"{label}: unexpected staging API Worker")
         private_vars = {key: value for key, value in staging["vars"].items() if key.startswith("PRIVATE_PLAYBACK_")}
         expected = {key.replace("PRIVATE_PLAYBACK_STAGING_", "PRIVATE_PLAYBACK_"): value
                     for key, value in summary_env.items() if key.startswith("PRIVATE_PLAYBACK_STAGING_")}
@@ -432,8 +470,15 @@ def negative_control(wrangler, argv, wdir, env, marker, label):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--wrangler", required=True, type=Path, help="path to wrangler/bin/wrangler.js")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--wrangler", type=Path, help="path to wrangler/bin/wrangler.js")
+    mode.add_argument("--invocation-probe-id", help="check one normalized synthetic JSON record from stdin")
     args = parser.parse_args()
+
+    if args.invocation_probe_id is not None:
+        assert_invocation_redaction(sys.stdin.buffer, args.invocation_probe_id)
+        print("check_worker_upload: synthetic invocation redaction ok")
+        return
 
     sha = os.environ.get("GITHUB_SHA", "")
     check(re.fullmatch(r"[0-9a-f]{40}", sha), "GITHUB_SHA must be set to a 40-hex commit sha")
