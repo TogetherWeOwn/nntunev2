@@ -16,47 +16,6 @@ use super::{
     TrialError::{self, Refused, Unconfirmed},
 };
 
-pub async fn read_registered_header(
-    reader: &Client,
-    scope: &CompletionScope<'_>,
-    identities: [[u8; 16]; 5],
-    map: [u8; 16],
-) -> Result<Option<[u8; 48]>, TrialError> {
-    let [environment, library, object, generation, configuration] = identities.map(uuid_text);
-    let row = reader
-        .query_typed_opt(
-            "SELECT i.header_tag FROM public.ingest_session_reservations s
-         JOIN public.storage_object_intents i
-           ON i.object_id = s.multipart_object_id AND i.generation_id = s.checkpoint_generation
-         JOIN public.storage_library_namespaces l ON s.library_id = l.id AND l.owner_id IS NULL
-         WHERE s.id = $1::text::uuid AND s.principal_id = $2 AND s.fingerprint = $3
-           AND l.environment_id = $4::text::uuid AND l.id = $5::text::uuid
-           AND i.object_id = $6::text::uuid AND i.generation_id = $7::text::uuid
-           AND i.provider_configuration_version_id = $8::text::uuid
-           AND s.completed_map_id = $9::text::uuid AND s.terminal_reason = 'completed'",
-            &[
-                (&scope.session, Type::TEXT),
-                (&scope.principal, Type::TEXT),
-                (&scope.fingerprint.as_slice(), Type::BYTEA),
-                (&environment, Type::TEXT),
-                (&library, Type::TEXT),
-                (&object, Type::TEXT),
-                (&generation, Type::TEXT),
-                (&configuration, Type::TEXT),
-                (&uuid_text(map), Type::TEXT),
-            ],
-        )
-        .await
-        .map_err(|_| Unconfirmed)?;
-    row.map(|row| {
-        row.try_get::<_, &[u8]>(0)
-            .map_err(|_| Unconfirmed)?
-            .try_into()
-            .map_err(|_| Unconfirmed)
-    })
-    .transpose()
-}
-
 impl Permit<'_> {
     pub async fn replay(
         self,

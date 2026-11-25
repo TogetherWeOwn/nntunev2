@@ -332,21 +332,23 @@ pub(crate) async fn verify_publication(
 
     let lookup = release_lookup(QUERY).unwrap();
     let mut publication = connection().await;
-    let mut publish = async |publication: &mut Client, upload_writer: &mut Client, replay: bool| {
+    let mut publish = async |publication: &mut Client,
+                             upload_writer: &mut Client,
+                             replay_bucket: Option<&str>| {
         Box::pin(upload(&ctx, &request, target, async |permit, _| {
-            permit.preflight(publication).await?;
-            if replay {
+            if let Some(bucket) = replay_bucket {
                 return permit
                     .replay(
                         publication,
                         upload_writer,
-                        "fixture-bucket",
+                        bucket,
                         auth,
                         prepared,
                         &mut read_authority,
                     )
                     .await;
             }
+            permit.preflight(publication).await?;
             let evidence = MatchEvidence {
                 query: QUERY,
                 candidates: Some(CompleteReleaseCandidates {
@@ -390,7 +392,7 @@ pub(crate) async fn verify_publication(
     };
     assert_eq!(set_job("other-trial-job").await, 1);
     assert_eq!(
-        publish(&mut publication, upload_writer, false).await.status,
+        publish(&mut publication, upload_writer, None).await.status,
         404
     );
     assert_eq!(set_job(JOB).await, 1);
@@ -401,11 +403,13 @@ pub(crate) async fn verify_publication(
          FOR EACH ROW EXECUTE FUNCTION public.fixture_refuse_trial_admission();",
     ).await.unwrap();
     assert_eq!(
-        publish(&mut publication, upload_writer, true).await.status,
+        publish(&mut publication, upload_writer, Some("fixture-bucket"))
+            .await
+            .status,
         503
     );
     assert_eq!(
-        publish(&mut publication, upload_writer, false).await.status,
+        publish(&mut publication, upload_writer, None).await.status,
         404
     );
     publication.simple_query("SELECT 1").await.unwrap();
@@ -423,7 +427,7 @@ pub(crate) async fn verify_publication(
         .batch_execute("DROP TRIGGER fixture_refusal ON public.private_library_admissions")
         .await
         .unwrap();
-    let first = publish(&mut publication, upload_writer, false).await;
+    let first = publish(&mut publication, upload_writer, None).await;
     assert_eq!(first.status, 200);
     let body: serde_json::Value = serde_json::from_str(&first.body).unwrap();
     let track = body["trackId"].as_str().unwrap();
@@ -461,8 +465,18 @@ pub(crate) async fn verify_publication(
         .status,
         403
     );
-    let replay = publish(&mut publication, upload_writer, true).await;
+    let replay = publish(&mut publication, upload_writer, Some("fixture-bucket")).await;
     assert_eq!((replay.status, replay.body), (200, first.body));
+    assert_eq!(
+        publish(
+            &mut publication,
+            upload_writer,
+            Some("other-fixture-bucket")
+        )
+        .await
+        .status,
+        503
+    );
     assert!(exact_reference().await);
 
     observer
@@ -473,7 +487,9 @@ pub(crate) async fn verify_publication(
         .await
         .unwrap();
     assert_eq!(
-        publish(&mut publication, upload_writer, true).await.status,
+        publish(&mut publication, upload_writer, Some("fixture-bucket"))
+            .await
+            .status,
         404
     );
     assert_eq!(handle(&ctx, &library).await.status, 403);
