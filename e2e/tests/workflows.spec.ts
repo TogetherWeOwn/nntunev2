@@ -878,6 +878,7 @@ test.describe('fail-closed artifact publication gate', () => {
 // and the journey job additionally requires the caller-only
 // `inputs.post_deploy`. Scheduled/manual runs stay synthetic monitoring.
 const deployWorkflow = readFileSync(new URL('deploy.yml', workflowDir), 'utf8');
+const PRIVATE_TRIAL_CLEANUP_JOB = 'staging-private-trial-cleanup';
 
 function jobSection(workflow: string, job: string): string {
   const marker = `\n  ${job}:\n`;
@@ -1007,21 +1008,26 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
     }
   });
 
-  test('main staging deploy and post-deploy E2E share a queued workflow lock', () => {
-    const group = "  group: ${{ github.event_name == 'push' && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}\n";
+  test('main staging deploy, post-deploy E2E and private trial cleanup share a queued workflow lock', () => {
+    const group = "  group: ${{ (github.event_name == 'push' || inputs.private_trial_cleanup_scope_sha256 != '') && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}\n";
     const lock = `\nconcurrency:\n${group}  cancel-in-progress: false\n  queue: max\n`;
     const lanes = ['staging-web', 'staging-api', 'staging-mb', 'staging-ingest', 'staging-stream', 'post-deploy-e2e', 'post-deploy-private-music'];
     const assertDeployLock = (body: string) => {
       const header = body.split('\njobs:\n')[0]!;
-      expect(header).toMatch(/^on:\n  push:\n    branches: \[main\]\n  workflow_dispatch:\n\n/m);
-      // Hold the lock until E2E checks this run's SHA. Do not replace pending
-      // pushes or make manual dispatches compete for the push lock.
+      expect(header).toMatch(/^on:\n  push:\n    branches: \[main\]\n  workflow_dispatch:\n    inputs:\n      private_trial_cleanup_scope_sha256:\n        description: [^\n]+\n        type: string\n        default: ''\n\n/m);
+      // E2E holds this run's staging build. Only an explicit cleanup dispatch
+      // shares the push lock, and queued runs cannot replace each other.
       expect(header).toContain(lock);
       for (const lane of lanes) {
         expect(jobIf(body, lane)).toContain("github.event_name == 'push'");
         expect(jobSection(body, lane), `${lane} must not have its own lock`)
           .not.toMatch(/^    concurrency:/m);
       }
+      const cleanup = jobSection(body, PRIVATE_TRIAL_CLEANUP_JOB);
+      expect(cleanup).not.toMatch(/^    concurrency:/m);
+      expect(cleanup).toContain("github.event_name == 'workflow_dispatch' && github.repository == 'TogetherWeOwn/nntunev2' &&");
+      expect(cleanup).toContain("github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&");
+      expect(cleanup).toContain("github.run_attempt == 1 && inputs.private_trial_cleanup_scope_sha256 != ''");
     };
     assertDeployLock(deployWorkflow);
     for (const mutant of [
@@ -1030,6 +1036,7 @@ test.describe('post-deploy sequencing (deploy → full journey)', () => {
       deployWorkflow.replace(lock, lock.replace('cancel-in-progress: false', 'cancel-in-progress: true')),
       deployWorkflow.replace(group, '  group: deploy-staging-main\n'),
       deployWorkflow.replace(group, '  group: deploy-staging-${{ github.run_id }}\n'),
+      deployWorkflow.replace(group, group.replace(" || inputs.private_trial_cleanup_scope_sha256 != ''", '')),
       ...lanes.map(lane =>
         deployWorkflow.replace(
           `\n  ${lane}:\n`,
@@ -1772,9 +1779,9 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
   // outside the evidenced backend lanes, any production-environment deploy
   // step, or a bare `command: deploy` (apps/web top-level name equals the
   // production env name, so a bare deploy targets production).
-  const jobsBody = deployWorkflow.split('\njobs:\n')[1]!;
+  const jobsBody = deployWorkflow.split('\njobs:')[1]!;
 
-  // The authorized backend lanes. Everything outside them stays web-only.
+  // These lanes deploy backend Workers. The cleanup job builds a local bundle.
   const bodyWithoutJob = (body: string, job: string): string => {
     const section = jobSection(body, job);
     return body.split(section).join('');
@@ -1800,6 +1807,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
       'staging-api',
       'staging-ingest',
       'staging-mb',
+      PRIVATE_TRIAL_CLEANUP_JOB,
       'staging-stream',
       'staging-web',
     ]);
@@ -1854,7 +1862,7 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     // Working directories: apps/web everywhere except the backend lanes,
     // which deploy from their own workers/<lane> checkout (see
     // LANE_WORKING_DIRS for the ingest lane's shared gate script).
-    for (const line of bodyWithoutLanes(body, [...BACKEND_LANES, 'post-deploy-private-music']).split('\n')) {
+    for (const line of bodyWithoutLanes(body, [...BACKEND_LANES, 'post-deploy-private-music', PRIVATE_TRIAL_CLEANUP_JOB]).split('\n')) {
       if (line.includes('workingDirectory:') || line.includes('working-directory:')) {
         expect(line, `deploy working directory stays apps/web (${line.trim()})`).toContain(
           'apps/web',
@@ -1876,6 +1884,10 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     // push-to-main deployment records land only in `staging`.
     assertStagingEnv(body, 'staging-web');
     for (const lane of BACKEND_LANES) assertStagingEnv(body, lane);
+    const cleanup = jobSection(body, PRIVATE_TRIAL_CLEANUP_JOB);
+    expect(cleanup).toContain('environment:\n      name: staging\n    steps:');
+    expect(cleanup.match(/working-directory: .*$/gm)).toEqual(['working-directory: apps/web', 'working-directory: workers/api']);
+    expect(cleanup).not.toContain('CLOUDFLARE_API_TOKEN');
   };
 
   const assertNoBackendPath = (body: string) => {
@@ -1894,7 +1906,10 @@ test.describe('deploy.yml backend Worker lanes stay evidenced (web + api/mb/inge
     // keeps the production worker name at the top level of its generated
     // config for parity shape (no production env table is generated), so
     // that single anchored line is its only allowed `production`.
-    const rest = bodyWithoutLanes(body, BACKEND_LANES);
+    const rest = bodyWithoutLanes(body, BACKEND_LANES).replace(
+      jobSection(body, PRIVATE_TRIAL_CLEANUP_JOB),
+      jobSection(body, PRIVATE_TRIAL_CLEANUP_JOB).replace('working-directory: workers/api', ''),
+    );
     expect(rest).not.toContain('workers/');
     expect(codeLines(rest).toLowerCase()).not.toContain('production');
     for (const lane of ['staging-api', 'staging-ingest', 'staging-stream']) {
