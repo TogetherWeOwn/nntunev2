@@ -153,12 +153,13 @@ async fn begin(db: &mut Client) -> Result<Transaction<'_>, OutcomeError> {
 
 /// Protect the exact winner of an authorized completed session. Authenticate
 /// the caller before entering, then use `authorize` for a current reuse grant
-/// and its expiry after both locks. Pins confer no provider access or authority
+/// and its expiry after both locks. The callback can also reject incompatible
+/// pins before the fence is written. Pins confer no provider access or authority
 /// to bind another reference. Consumers must stop at the returned deadline.
 pub async fn protect_completion_reuse(
     db: &mut Client,
     scope: &CompletionScope<'_>,
-    authorize: impl AsyncFnOnce(&CompletionScope<'_>) -> Result<i64, OutcomeError>,
+    authorize: impl AsyncFnOnce(&CompletionScope<'_>, &CommittedOutcome) -> Result<i64, OutcomeError>,
     now: impl Fn() -> SystemTime,
 ) -> Result<ProtectedReuse, OutcomeError> {
     let tx = begin(db).await?;
@@ -174,7 +175,7 @@ pub async fn protect_completion_reuse(
     let outcome = decode_outcome(&row)
         .map_err(|_| Indeterminate)?
         .ok_or(Refused)?;
-    let until = authorize(scope).await?;
+    let until = authorize(scope, &outcome).await?;
     let usable_until = tx
         .query_typed_opt(
             include_str!("reuse_protect.sql"),

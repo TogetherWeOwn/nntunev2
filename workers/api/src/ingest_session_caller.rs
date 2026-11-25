@@ -72,7 +72,7 @@ pub struct PreparedUpload<'a> {
 }
 
 impl<'a> PreparedUpload<'a> {
-    fn authorize(self, auth: Authorization<'_>) -> Result<i64, UploadError> {
+    fn validate(self) -> Result<(), UploadError> {
         let scope = self.scope;
         let [_, environment, library, _, seal, _] = self.context.identities;
         let fingerprint = self.request.fingerprint().map_err(|_| Refused)?;
@@ -86,7 +86,12 @@ impl<'a> PreparedUpload<'a> {
         {
             return Err(Refused);
         }
-        authorize_scope(auth, &scope, self.job, Action::Upload)
+        Ok(())
+    }
+
+    fn authorize(self, auth: Authorization<'_>) -> Result<i64, UploadError> {
+        self.validate()?;
+        authorize_scope(auth, &self.scope, self.job, Action::Upload)
     }
 
     pub(crate) fn completed_scope(self) -> CompletionScope<'a> {
@@ -245,6 +250,57 @@ pub async fn open<'a>(
     })
 }
 
+pub enum UploadAttempt<'a> {
+    Opened(OpenedUpload<'a>),
+    Reused(ProtectedReuse),
+}
+
+/// Try reuse for this reservation's exact final checkpoint before starting an
+/// upload. Supply the existing trusted preparation and current authority
+/// reader. Reuse returns protected pins for comparison with authenticated
+/// receipts. `upload_until` bounds a fresh upload. Reuse has its own deadline.
+/// A refusal can proceed only through the normal lease for a fresh upload.
+pub async fn open_or_reuse<'a>(
+    writer: &mut Client,
+    auth: Authorization<'_>,
+    prepared: PreparedUpload<'a>,
+    upload_until: SystemTime,
+    reader: impl AsyncFnOnce(
+        &str,
+        &CompletionScope<'_>,
+    ) -> Result<Option<CurrentAuthorization>, StoreError>,
+    start: impl AsyncFnOnce(
+        &mut Client,
+        &CompletionScope<'_>,
+        &str,
+        SystemTime,
+    ) -> Result<DurableUpload<'a>, HandoffError>,
+) -> Result<UploadAttempt<'a>, UploadError> {
+    prepared.validate()?;
+    let [_, _, object, _, configuration] = prepared.intent.identities;
+    let matches_intent = |outcome: &CommittedOutcome| {
+        outcome.map.replace('-', "") == uuid_text(prepared.intent.map_id)
+            && outcome.object.replace('-', "") == uuid_text(object)
+            && outcome.configuration.replace('-', "") == uuid_text(configuration)
+    };
+    match reuse_if(
+        writer,
+        auth,
+        &prepared.completed_scope(),
+        prepared.job,
+        reader,
+        matches_intent,
+    )
+    .await
+    {
+        Ok(protected) => Ok(UploadAttempt::Reused(protected)),
+        Err(Refused) => open(writer, auth, prepared, upload_until, start)
+            .await
+            .map(UploadAttempt::Opened),
+        Err(Unconfirmed) => Err(Unconfirmed),
+    }
+}
+
 /// Re-read the exact committed pins. After acquiring the scoped session lock,
 /// invoke the trusted reader for the credential ID and locked upload scope.
 /// It must load current credential and upload grant state from their authorities
@@ -281,11 +337,31 @@ pub async fn reuse(
         &CompletionScope<'_>,
     ) -> Result<Option<CurrentAuthorization>, StoreError>,
 ) -> Result<ProtectedReuse, UploadError> {
+    reuse_if(writer, auth, scope, job, reader, |_| true).await
+}
+
+async fn reuse_if(
+    writer: &mut Client,
+    auth: Authorization<'_>,
+    scope: &CompletionScope<'_>,
+    job: &Job<'_>,
+    reader: impl AsyncFnOnce(
+        &str,
+        &CompletionScope<'_>,
+    ) -> Result<Option<CurrentAuthorization>, StoreError>,
+    accepts: impl FnOnce(&CommittedOutcome) -> bool,
+) -> Result<ProtectedReuse, UploadError> {
     authorize_scope(auth, scope, job, Action::Reuse)?;
     protect_completion_reuse(
         writer,
         scope,
-        async |locked| reauthorize(auth, locked, job, Action::Reuse, reader).await,
+        async |locked, outcome| {
+            let until = reauthorize(auth, locked, job, Action::Reuse, reader).await?;
+            if !accepts(outcome) {
+                return Err(OutcomeError::Refused);
+            }
+            Ok(until)
+        },
         || UNIX_EPOCH + Duration::from_millis(now_millis()),
     )
     .await

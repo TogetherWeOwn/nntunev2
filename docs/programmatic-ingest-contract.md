@@ -55,6 +55,12 @@ reuse grant under the session and winner locks. The protection lasts at most
 The returned pins carry no provider access. A future destination caller must
 authorize and bind its reference through guarded reference admission.
 
+The off-route upload attempt checks this scoped result before opening an upload.
+A reused result carries the durable receipt pins and protection deadline.
+Compare those pins with authenticated readback when consuming receipt evidence.
+A refusal can fall through to the normal upload lease, which only opens a live,
+unstarted reservation. An unconfirmed result stops the attempt for reconciliation.
+
 ## Large uploads and activation requirements
 
 Follow ADR 0015's authenticated, resumable multipart design. Direct object

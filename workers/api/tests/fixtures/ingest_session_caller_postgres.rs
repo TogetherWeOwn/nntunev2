@@ -444,13 +444,27 @@ async fn prove_attempt(
         Err(UploadError::Refused)
     ));
 
-    let opened =
-        open(
+    assert!(matches!(
+        open_or_reuse(
+            &mut writer,
+            auth,
+            prepared,
+            UNIX_EPOCH,
+            async |_, _| panic!("a fresh session has no verified result to authorize"),
+            async |_, _, _, _| panic!("an expired upload must not reach the provider"),
+        )
+        .await,
+        Err(UploadError::Refused)
+    ));
+    let UploadAttempt::Opened(opened) =
+        open_or_reuse(
             &mut writer,
             auth,
             prepared,
             until,
+            async |_, _| panic!("a fresh session has no verified result to authorize"),
             async |db, scope, lease, deadline| {
+                assert_eq!(deadline, until);
                 handoff(
                     db,
                     scope,
@@ -482,7 +496,10 @@ async fn prove_attempt(
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("a fresh reservation must open a new upload");
+    };
     let target = opened.durable_target().target();
     assert_eq!(target.upload_id, UPLOAD);
     let row = observer.query_one(
@@ -491,11 +508,12 @@ async fn prove_attempt(
     ).await.unwrap();
     assert_eq!(row.get::<_, &str>(0), UPLOAD);
     assert!(matches!(
-        open(
+        open_or_reuse(
             &mut writer,
             auth,
             prepared,
             until,
+            async |_, _| panic!("an in-flight upload has no reusable result"),
             async |_, _, _, _| panic!("open replay reached the provider")
         )
         .await,
@@ -971,15 +989,7 @@ async fn prove_attempt(
         )
         .await
         .unwrap();
-    reuse_cases::protect_completed(
-        observer,
-        authority,
-        writer,
-        auth,
-        prepared,
-        committed.outcome(),
-    )
-    .await;
+    reuse_cases::protect_completed(observer, authority, writer, auth, prepared, &committed).await;
 }
 
 async fn backend_pid(client: &Client) -> i32 {

@@ -12,11 +12,16 @@ pub(super) async fn protect_completed(
     writer: &mut Client,
     auth: Authorization<'_>,
     prepared: PreparedUpload<'_>,
-    expected: &CommittedOutcome,
+    committed: &CommittedFlacUpload<'_, '_>,
 ) {
     let scope = prepared.completed_scope();
+    let expected = committed.outcome();
     let reload =
         async |id: &str, scope: &CompletionScope<'_>| load_authority(authority, id, scope).await;
+    let until = SystemTime::now() + Duration::from_secs(60);
+    let no_start = async |_: &mut Client, _: &CompletionScope<'_>, _: &str, _: SystemTime| {
+        panic!("retry must not initiate another multipart upload")
+    };
     let job = prepared.job;
     for foreign_scope in [
         CompletionScope {
@@ -65,7 +70,9 @@ pub(super) async fn protect_completed(
             "SELECT 1 FROM public.storage_validated_digest_winners WHERE object_id = $1::text::uuid FOR UPDATE",
             &[obj],
         ).await.unwrap();
-        let mut attempt = std::pin::pin!(reuse(writer, auth, &scope, job, reload));
+        let mut attempt = std::pin::pin!(open_or_reuse(
+            writer, auth, prepared, until, reload, no_start
+        ));
         observe_blocked(observer, cleaner_pid, writer_pid, attempt.as_mut())
             .await
             .unwrap();
@@ -74,6 +81,18 @@ pub(super) async fn protect_completed(
         assert!(matches!(attempt.await, Err(Refused)));
         set_reuse_grant(observer, &auth.record.id, true).await;
     }
+    assert!(matches!(
+        open_or_reuse(
+            writer,
+            auth,
+            prepared,
+            until,
+            async |_, _| Err(StoreError),
+            no_start
+        )
+        .await,
+        Err(Unconfirmed)
+    ));
     // The credential initially limits the protection. Once restored, a retry
     // can extend the durable fence to its own deadline.
     let cutoff: SystemTime = observer
@@ -93,9 +112,48 @@ pub(super) async fn protect_completed(
         .execute(credential_deadline, &[&auth.record.id, &expiry(cutoff)])
         .await
         .unwrap();
-    let first = reuse(writer, auth, &scope, job, reload).await.unwrap();
-    assert_eq!(first.usable_until(), cutoff);
-    assert_pins(first.outcome(), expected);
+    // Submit two normal retries on separate writer connections. The first
+    // holds the session while it waits for the winner, so the second queues
+    // behind it before either can return a receipt. The second caller's
+    // fresh-upload deadline has already passed.
+    let (first, second) = {
+        let mut other_writer = connect(WRITER).await;
+        let other_pid = backend_pid(&other_writer).await;
+        let held = cleaner.transaction().await.unwrap();
+        held.query_one(
+            "SELECT 1 FROM public.storage_validated_digest_winners WHERE object_id = $1::text::uuid FOR UPDATE",
+            &[obj],
+        ).await.unwrap();
+        let mut first = std::pin::pin!(open_or_reuse(
+            writer, auth, prepared, until, reload, no_start
+        ));
+        observe_blocked(observer, cleaner_pid, writer_pid, first.as_mut())
+            .await
+            .unwrap();
+        let mut second = std::pin::pin!(open_or_reuse(
+            &mut other_writer,
+            auth,
+            prepared,
+            UNIX_EPOCH,
+            reload,
+            no_start
+        ));
+        observe_blocked(observer, writer_pid, other_pid, second.as_mut())
+            .await
+            .unwrap();
+        held.commit().await.unwrap();
+        tokio::join!(first, second)
+    };
+    for attempt in [first, second] {
+        let UploadAttempt::Reused(reused) = attempt.unwrap() else {
+            panic!("a completed retry must return protected reuse");
+        };
+        assert_eq!(reused.usable_until(), cutoff);
+        assert_pins(reused.outcome(), expected);
+        assert!(committed
+            .verified()
+            .matches_committed_outcome(reused.outcome()));
+    }
     observer
         .execute(
             credential_deadline,
@@ -103,6 +161,33 @@ pub(super) async fn protect_completed(
         )
         .await
         .unwrap();
+    let wrong_map = CandidateIntent {
+        map_id: [0xff; 16],
+        ..*prepared.intent
+    };
+    assert!(matches!(
+        open_or_reuse(
+            writer,
+            auth,
+            PreparedUpload {
+                intent: &wrong_map,
+                ..prepared
+            },
+            until,
+            reload,
+            no_start,
+        )
+        .await,
+        Err(Refused)
+    ));
+    assert!(observer
+        .query_one(
+            "SELECT upload_until = $2 FROM public.storage_validated_digest_winners WHERE object_id = $1::text::uuid",
+            &[obj, &cutoff],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
     let extended = reuse(writer, auth, &scope, job, reload).await.unwrap();
     assert_pins(extended.outcome(), expected);
     assert!(extended.usable_until() > cutoff);
@@ -248,9 +333,14 @@ pub(super) async fn refuse_unverified(
         &[&scope.session, &map, &uuid_text(scope.seal), &scope.revision, &scope.offset],
     ).await.unwrap(), 1);
     assert!(matches!(
-        reuse(writer, auth, &scope, prepared.job, async |_, _| {
-            panic!("unverified inventory must not reach the authority reader")
-        })
+        open_or_reuse(
+            writer,
+            auth,
+            prepared,
+            SystemTime::now() + Duration::from_secs(45),
+            async |_, _| panic!("unverified inventory must not reach the authority reader"),
+            async |_, _, _, _| panic!("a terminal reservation must not initiate an upload"),
+        )
         .await,
         Err(Refused)
     ));
