@@ -264,9 +264,16 @@ test('the protected summary records an interrupted read and a successful fresh d
   };
 
   const interrupted = probe(scopeFor(generation));
-  const checkedInterruption = assert.rejects(interrupted, { signal: 'SIGTERM', stdout: '', stderr: '' });
+  const checkedInterruption = assert.rejects(interrupted, (error) => {
+    // GNU timeout can propagate SIGTERM or return the shell status 128 + 15.
+    const termination = error.signal ?? error.code;
+    assert.ok(['SIGTERM', 143].includes(termination), `unexpected probe termination: ${termination}`);
+    assert.equal(error.stdout, '');
+    assert.equal(error.stderr, '');
+    return true;
+  });
   const [firstRead] = await once(reads, 'head', { signal: AbortSignal.timeout(5000) });
-  interrupted.child.kill('SIGTERM');
+  assert.ok(interrupted.child.kill('SIGTERM'));
   await checkedInterruption;
   assert.equal(firstRead, `HEAD ${path}?${queryFor(version)} HTTP/1.1`);
   for (const outcome of ['failure', 'cancelled', 'skipped']) {
