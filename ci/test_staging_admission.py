@@ -226,9 +226,11 @@ class World:
                 page("workflow_runs", self.runs),
             f"runs/{RUN_ID}": self.run,
             f"runs/{RUN_ID}/attempts/1/jobs{base}": jobs or page("jobs", self.jobs),
-            f"runs/{RUN_ID}/artifacts{base}": artifacts or page("artifacts", [self.artifact]),
-            f"artifacts/{ARTIFACT_ID}/zip": self.archive,
+            f"runs/{RUN_ID}/artifacts{base}": artifacts or page(
+                "artifacts", [self.artifact] if self.artifact is not None else []),
         }
+        if self.artifact is not None:
+            r[f"artifacts/{ARTIFACT_ID}/zip"] = self.archive
         # Discovery fixtures expose only the bounded queries. The unfiltered
         # lifetime endpoint remains above to demonstrate that it is not needed.
         candidate = [run for run in self.runs if run.get("head_sha") == SHA]
@@ -1287,8 +1289,10 @@ class SourceBindingTests(Base):
         self.refused("requires the approved private-music journey", self.run_main,
                      mode="promote", world_factory=billing_world)
 
-    def test_promotion_refuses_absent_or_skipped_private_evidence(self):
+    def test_promotion_refuses_missing_skipped_or_malformed_private_evidence(self):
         self.install_private_contract()
+        _, lines = self.run_main(private=True, mode="promote")
+        self.assertIn("verified_private_music_staging", json.loads(lines[0]))
 
         def without_journey():
             world = PrivateWorld()
@@ -1302,12 +1306,19 @@ class SourceBindingTests(Base):
 
         def without_private_artifact():
             world = PrivateWorld()
-            world.artifact["name"] = sa.artifact_name(SHA, RUN_ID, 1)
+            world.artifact = None
+            return world
+
+        def malformed_private_artifact():
+            world = PrivateWorld()
+            # Keep the successful jobs and a matching archive digest. Only the receipt is invalid.
+            world.set_archive(make_zip([("staging-admission.json", '{"schema":')]))
             return world
 
         for factory, reason in ((without_journey, "missing or ambiguous required staging job"),
                                 (skipped_journey, "required job did not pass in selected attempt"),
-                                (without_private_artifact, "missing or ambiguous attempt-bound receipt")):
+                                (without_private_artifact, "missing or ambiguous attempt-bound receipt"),
+                                (malformed_private_artifact, "malformed JSON")):
             with self.subTest(fixture=factory.__name__):
                 self.refused(reason, self.run_main, private=True, mode="promote", world_factory=factory)
 
