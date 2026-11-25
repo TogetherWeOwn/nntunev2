@@ -263,9 +263,10 @@ checks the request and response contract without making staging requests.
 1. Qualify the replacement under the existing opt-in private staging job.
    Keep the native seek, resume and queue checks in
    [the private browser journey](private-staging/journey.spec.ts). Collect
-   seek metering against the first track's play ID before sending any manual
-   range GET for that play. Stream merges delivered intervals per play, so the
-   full-body probe needs its own play ID.
+   seek metering against the first track's play ID before any manual range GET
+   for that play. Move the existing first-track `verifyRange` call after that
+   measurement. Stream merges delivered intervals per play, so the full-body
+   probe needs its own play ID.
 2. Use the second curated track's active play for the transport probe.
    After its `currentMedia` check, verify that `media[3]` differs from the
    first play ID. Before the cohort cutoff, call `assertStagingPlaybackProbe`
