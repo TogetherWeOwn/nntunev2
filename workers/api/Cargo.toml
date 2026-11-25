@@ -120,6 +120,8 @@ rand = "0.10"
 # transaction tests and the session refresh-retry suite). Never enable Tokio's
 # socket runtime in the Worker production dependency graph.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Exercise the unmounted playback consumer in the hosted upload fixture.
+nntune-stream = { version = "0.1.0", path = "../stream" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 
