@@ -182,3 +182,18 @@ Exit 1 means collision. Exit 2 means incomplete evidence, including missing targ
 or projections. An inventory mismatch exits 2 with `scope_incomplete` instead.
 Exit 3 gives `disabled` or `refused`. Keep identities, projections, credentials and DB
 diagnostics private. Recheck on drift. Writer privileges and legacy provenance are separate prerequisites.
+
+### Subscription lock privilege
+
+The owned billing transaction takes a `SHARE ROW EXCLUSIVE` lock on
+`public.subscriptions` for stale no-ops as well as writes. For the writer
+grant checked by #1768, column-level `UPDATE` is insufficient.
+
+The [catalog query](../.github/scripts/billing_subscription_lock_privilege.sql)
+checks effective table-level `UPDATE`, including inherited grants. From a
+read-only transaction on the independently pinned database, load the query
+with `psql` using `ON_ERROR_STOP=1` and the explicit `database` and
+`billing_role` variables. Use the billing writer login name from the
+connection configuration and set the transaction's search path to
+`pg_catalog, pg_temp`. Require one true result for this grant and verify the
+remaining billing privileges separately before recording `effective_privileges`.
