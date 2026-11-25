@@ -517,7 +517,7 @@ async fn check_terminal_provenance(store: &PgStore) -> Result<(), &'static str> 
             .store_reconcile_owned(
                 USER.into(),
                 delayed,
-                ReconcileProbe::ObserveTerminalProvenanceRefusal(refused.clone()),
+                ReconcileProbe::ObserveEqualEndProvenanceRefusal(refused.clone()),
             )
             .await
             .is_ok()

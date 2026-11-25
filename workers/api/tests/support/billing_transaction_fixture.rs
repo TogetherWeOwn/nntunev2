@@ -4,7 +4,7 @@
 use nntune_api::billing_reconcile::{insert_paid_invoice_history_statement, ReconcileOutcome};
 use nntune_api::billing_store_classification::{
     classify_explicit_stale, classify_target, classify_write, has_slot_suppression_proof,
-    validate_history_target, validate_read_provenance, validate_terminal_provenance, Accepted,
+    validate_equal_end_provenance, validate_history_target, validate_read_provenance, Accepted,
     Identity, ObservedTarget, Target,
 };
 use nntune_api::billing_transaction_sql::{
@@ -91,15 +91,17 @@ pub async fn run(
         paid_invoice_id: r.paid_invoice_id.as_deref(),
         read_anchor: o.read_anchor.as_deref(),
         read_plan: o.read_plan.as_deref(),
+        plan: &r.plan_id,
+        cancel_at_period_end: r.cancel_at_period_end,
     };
-    let (subscription_id, paid_through, paid_invoice, read_anchor, read_plan) = binds.ordered();
+    let (subscription_id, paid_through, paid_invoice, read_anchor, read_plan, plan, cancel) = binds.ordered();
     // Fresh global lookup, a separate statement after the lock; no owner filter.
     let found = tx
         .query(
-            &tx.prepare_typed(&lookup, &[Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT])
+            &tx.prepare_typed(&lookup, &[Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT, Type::TEXT, Type::BOOL])
                 .await
                 .map_err(e)?,
-            &[&subscription_id, &paid_through, &paid_invoice, &read_anchor, &read_plan],
+            &[&subscription_id, &paid_through, &paid_invoice, &read_anchor, &read_plan, &plan, &cancel],
         )
         .await
         .map_err(e)?;
@@ -111,6 +113,7 @@ pub async fn run(
                 predicate_stale: row.try_get(2)?,
                 other_live_holder: row.try_get("other_live_holder")?,
                 equal_end_provenance_changed: row.try_get("equal_end_provenance_changed")?,
+                matching_proof_cancel_conflict: row.try_get("matching_proof_cancel_conflict")?,
             })
         })
         .collect::<Result<Vec<_>, tokio_postgres::Error>>()
@@ -124,8 +127,8 @@ pub async fn run(
     } else {
         validate_read_provenance(o, matches!(&target, Target::Owned { .. }))
             .map_err(|_| "missing exact-target read provenance")?;
-        validate_terminal_provenance(o, &target)
-            .map_err(|_| "changed terminal read provenance")?;
+        validate_equal_end_provenance(o, &target)
+            .map_err(|_| "changed equal-end read provenance")?;
         let types = [Type::TEXT; 7]
             .into_iter()
             .chain([

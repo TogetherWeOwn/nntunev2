@@ -1153,4 +1153,59 @@ async fn scheduled_reconciliation_preserves_later_plan_update(observer: &Client)
         .any(|row| row["stripe_invoice_id"] == DELAYED_HISTORY
             && row["stripe_subscription_id"] == SUBSCRIPTION
             && row["user_id"] == USER));
+
+    const RENEWAL_ANCHOR: &str = "in_native_renewal_with_cancel_race";
+    let mut renewed = newer;
+    renewed.subscription = subscription(PRO, "active", RENEWAL_END, false);
+    renewed
+        .invoices
+        .push(invoice(RENEWAL_ANCHOR, PRO, 1500, NEW_END, RENEWAL_END));
+    let mut cancel = renewed.clone();
+    cancel.subscription.cancel_at_period_end = true;
+    let mut committed = None;
+    let overlap = with_store(CALLER_CONNECTION, 2, async |store| {
+        store
+            .reconcile_owned_subscription(
+                &user,
+                &target,
+                cancel.subscription.clone(),
+                async |_| {
+                    let unmodified = dispatch_caller_at(&user, &target, &renewed, NEW_END)
+                        .await
+                        .expect("renewal commits before the cancellation write");
+                    assert_eq!(unmodified.read_anchor.as_deref(), Some(EQUAL_END_ANCHOR));
+                    assert_eq!(
+                        unmodified.row.paid_invoice_id.as_deref(),
+                        Some(RENEWAL_ANCHOR)
+                    );
+                    let after_renewal = snapshot(observer).await;
+                    let row = subscription_row(&after_renewal.0);
+                    assert_eq!(row["paid_invoice_id"], RENEWAL_ANCHOR);
+                    assert_eq!(row["cancel_at_period_end"], false);
+                    // Matching proof and an unchanged flag is an exact replay.
+                    dispatch(&user, &unmodified)
+                        .await
+                        .expect("renewal replay succeeds");
+                    assert_eq!(snapshot(observer).await, after_renewal);
+                    committed = Some(after_renewal);
+                    Ok(cancel.invoices.clone())
+                },
+                NEW_END,
+            )
+            .await
+    })
+    .await;
+    assert!(overlap.is_err(), "overlapping cancellation must be retried");
+    let committed = committed.expect("renewal committed during the cancellation fold");
+    assert_eq!(snapshot(observer).await, committed);
+    let fresh = dispatch_caller_at(&user, &target, &cancel, NEW_END)
+        .await
+        .expect("fresh cancellation commits");
+    assert_eq!(fresh.read_anchor.as_deref(), Some(RENEWAL_ANCHOR));
+    let after_cancel = snapshot(observer).await;
+    assert_eq!(
+        subscription_row(&after_cancel.0)["cancel_at_period_end"],
+        true
+    );
+    assert_eq!(after_cancel.1, committed.1);
 }
