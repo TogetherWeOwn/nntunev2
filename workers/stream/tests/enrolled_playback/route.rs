@@ -43,7 +43,12 @@ async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
                     _ => FLAC.len(),
                 };
                 assert_eq!(head.len, len as u64);
-                Ok((status != 416).then_some(Writer(&output, case.fault, &aborted)))
+                Ok((status != 416).then_some(Writer {
+                    output: &output,
+                    fault: case.fault,
+                    aborted: &aborted,
+                    revoke_on_write: None,
+                }))
             },
             |interval| report = Some(interval),
         )
@@ -66,4 +71,65 @@ async fn private_route_authenticates_flac_and_accounts_for_writer_prefixes() {
             (!slice.is_empty()).then_some(slice)
         );
     }
+}
+
+#[tokio::test]
+async fn browser_stream_aborts_at_the_next_chunk_after_lease_revocation() {
+    let key = b"test only, not a deployed secret";
+    // Pre-signed synthetic v4 grant for Fixture::new(), expiring at Unix 12.
+    let token = concat!(
+        "v4.bWVtYmVyfHRyYWNrfHByaXZhdGVfYnJvd3Nlcl9BQUFBQUFBQUFBQUFBQUFBQUFBQUFBfDQyfDEyf",
+        "GNmMjQ0ZjZkYzYxYWI3ZTU3MTI4MzYwODM2NGZmZGViZTAzZjBiNGZmMGE2MDcyNDE5MDFmOTUzZWE5MDY2ZGE.",
+        "5OZv4_yGbRpUk6HYDXTckBYY046ImHeyN71sQOoZ0MA",
+    );
+    let source = Source::browser();
+    let request = PlayRouteRequest {
+        track_id: "track".into(),
+        token: Some(token.into()),
+        range: Some("bytes=65535-65536".into()),
+        trace_id: None,
+    };
+    let output = RefCell::new(Vec::new());
+    let aborted = Cell::new(false);
+    let mut delivered = Vec::new();
+    let result = serve(
+        &request,
+        key,
+        Some(&source),
+        || source.time(),
+        |head| {
+            assert_eq!(head.status, 206);
+            assert_eq!(head.len, 2);
+            assert_eq!(
+                head.content_range.as_deref(),
+                Some("bytes 65535-65536/65537")
+            );
+            // The sink accepts the final byte of the first chunk, then
+            // the lease is lost before the second chunk can be delivered.
+            Ok(Some(Writer {
+                output: &output,
+                fault: Fault::None,
+                aborted: &aborted,
+                revoke_on_write: Some(&source.revoked),
+            }))
+        },
+        |interval| delivered.push(interval),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().status, 404);
+    assert!(aborted.get());
+    assert_eq!(output.into_inner(), b"Y");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].start..delivered[0].end, 65_535..65_536);
+
+    let replay = serve::<_, Writer<'_>>(
+        &request,
+        key,
+        Some(&source),
+        || source.time(),
+        |_| panic!("a revoked bearer started a response"),
+        |_| panic!("a refused response recorded delivery"),
+    )
+    .await;
+    assert_eq!(replay.unwrap_err().status, 404);
 }

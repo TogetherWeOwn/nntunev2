@@ -93,15 +93,32 @@ pub(super) fn cases() -> impl Iterator<Item = Case> {
 pub(super) struct Source {
     fixture: Fixture,
     sealed: Vec<u8>,
+    play_id: &'static str,
     fault: Fault,
     checked_lease: Cell<bool>,
+    pub(super) revoked: Cell<bool>,
     clock: Cell<SystemTime>,
 }
 
 impl Source {
     pub(super) fn new(fault: Fault) -> Self {
-        let fixture = Fixture::from_plaintext(FLAC);
-        let mut sealed = [&fixture.context.header[..], &fixture.first].concat();
+        Self::with_media(
+            Fixture::from_plaintext(FLAC),
+            "private_1234567890abcdefghijkl",
+            fault,
+        )
+    }
+
+    pub(super) fn browser() -> Self {
+        Self::with_media(
+            Fixture::new(),
+            "private_browser_AAAAAAAAAAAAAAAAAAAAAA",
+            Fault::None,
+        )
+    }
+
+    fn with_media(fixture: Fixture, play_id: &'static str, fault: Fault) -> Self {
+        let mut sealed = [&fixture.context.header[..], &fixture.first, &fixture.last].concat();
         if fault == Fault::Ciphertext {
             sealed[48] ^= 1;
         }
@@ -113,8 +130,10 @@ impl Source {
         Self {
             fixture,
             sealed,
+            play_id,
             fault,
             checked_lease: Cell::new(false),
+            revoked: Cell::new(false),
             clock: Cell::new(start),
         }
     }
@@ -136,10 +155,7 @@ impl PrivateSource for Source {
 
     async fn resolve(&self, grant: &Grant) -> Option<CatalogueMedia<'_>> {
         assert_eq!(grant.user_id, "member");
-        assert_eq!(
-            grant.play_id.as_deref(),
-            Some("private_1234567890abcdefghijkl")
-        );
+        assert_eq!(grant.play_id.as_deref(), Some(self.play_id));
         assert_eq!(grant.lease_epoch, Some(42));
         assert_eq!(grant.track_id, "track");
         (self.fault != Fault::Denied).then(|| {
@@ -165,7 +181,9 @@ impl PrivateSource for Source {
         if checked && self.fault == Fault::ExpiredAtWrite {
             self.clock.set(self.fixture.pins().usable_until);
         }
-        self.fault != Fault::LeaseLost && !(checked && self.fault == Fault::Displaced)
+        !self.revoked.get()
+            && self.fault != Fault::LeaseLost
+            && !(checked && self.fault == Fault::Displaced)
     }
 
     async fn media(&self, get: S3Get<'_>) -> io::Result<S3GetReply<Self::Body>> {
@@ -236,11 +254,12 @@ fn reply(version: &str, bytes: Vec<u8>) -> S3GetReply<BodyBytes> {
     }
 }
 
-pub(super) struct Writer<'a>(
-    pub(super) &'a RefCell<Vec<u8>>,
-    pub(super) Fault,
-    pub(super) &'a Cell<bool>,
-);
+pub(super) struct Writer<'a> {
+    pub(super) output: &'a RefCell<Vec<u8>>,
+    pub(super) fault: Fault,
+    pub(super) aborted: &'a Cell<bool>,
+    pub(super) revoke_on_write: Option<&'a Cell<bool>>,
+}
 impl OriginalWriter for Writer<'_> {
     fn poll_cancel(&mut self, _: &mut Context<'_>) -> Poll<SourceError> {
         Poll::Pending
@@ -250,16 +269,19 @@ impl OriginalWriter for Writer<'_> {
         _: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<Result<usize, SourceError>> {
-        if self.1 == Fault::Writer && !self.0.borrow().is_empty() {
+        if self.fault == Fault::Writer && !self.output.borrow().is_empty() {
             return Poll::Ready(Err(SourceError::Transport));
         }
-        self.0.borrow_mut().push(bytes[0]);
+        self.output.borrow_mut().push(bytes[0]);
+        if let Some(revoked) = self.revoke_on_write {
+            revoked.set(true);
+        }
         Poll::Ready(Ok(1))
     }
     fn poll_close(&mut self, _: &mut Context<'_>) -> Poll<Result<(), SourceError>> {
         Poll::Ready(Ok(()))
     }
     fn abort(&mut self) {
-        self.2.set(true);
+        self.aborted.set(true);
     }
 }
