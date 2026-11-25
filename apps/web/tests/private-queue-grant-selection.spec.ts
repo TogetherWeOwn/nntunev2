@@ -100,7 +100,6 @@ test('the newest private queue choice wins while an earlier grant is pending', a
 		releaseEarlier.resolve();
 		const [firstResponse, secondRequest] = await Promise.all([earlierResponse, latestRequest]);
 		expect(firstResponse.status()).toBe(200);
-		// The next request reaches the server after the superseded receipt has been processed.
 		await expect(selected).toHaveAttribute(player.queueId, initial.id);
 		await expect(audio).toHaveCount(0);
 		expect(secondRequest.postDataJSON()).toEqual(secondGrant);
@@ -115,6 +114,14 @@ test('the newest private queue choice wins while an earlier grant is pending', a
 			node.currentSrc === url && !node.paused && !node.error && node.currentTime > 0.2, origin + path)).toBe(true);
 		await expect.poll(queueIds).toEqual(catalogue.map(({ id }) => id));
 		expect(requestedGrants()).toEqual([firstGrant, secondGrant]);
+		// Compare both requests on the same browser clock, including the gap after releaseEarlier.
+		const timings = await page.evaluate((url) => performance.getEntriesByName(url, 'resource')
+			.filter((entry): entry is PerformanceResourceTiming => entry instanceof PerformanceResourceTiming)
+			.map(({ startTime, responseEnd }) => ({ startTime, responseEnd })), playsUrl);
+		expect(timings).toHaveLength(2);
+		const [earlierTiming, latestTiming] = timings;
+		expect(earlierTiming.responseEnd).toBeGreaterThan(earlierTiming.startTime);
+		expect(latestTiming.startTime).toBeGreaterThanOrEqual(earlierTiming.responseEnd);
 		expect([...mediaRequests]).toEqual([origin + path]);
 		expect(await sources.evaluate((seen) => [...seen])).toEqual([path]);
 	} finally {
