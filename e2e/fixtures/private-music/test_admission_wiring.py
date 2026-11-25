@@ -179,23 +179,35 @@ def capture_pins(root, env):
     return {f"{lane.upper()}_PIN": json.dumps(pin) for lane, pin in pins.items()}
 
 
-def check_review(report, summary, run, command, sha):
+def check_review(report, summary, run, command, env):
     raw = report.read_bytes()
-    draft = json.loads((ROOT / "ci/private-music-journey-contract.draft.json").read_bytes())
-    draft_cases = {item["name"] for criterion in draft["criteria"] if criterion["applicable"]
-                   for item in criterion["evidence"] if item["classname"] == "private-music"
-                   and item["outcome"] == "passed"}
-    assert len(draft_cases) == 9
-    names = sorted(draft_cases | set(admission.IDENTITY_PHASES))
+    sha, run_id, attempt = (env[key] for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
+    draft = admission.parse_json((ROOT / "ci/private-music-journey-contract.draft.json").read_bytes())
+    assert draft["journey"] == admission.PRIVATE
+    names = list(admission.IDENTITY_PHASES)
+    excluded = []
+    for criterion in draft["criteria"]:
+        name = criterion["id"]
+        if criterion["applicable"] is False:
+            assert "evidence" not in criterion, "excluded criterion has an observed case selector"
+            excluded.append(name)
+            continue
+        assert criterion["applicable"] is True
+        assert criterion["evidence"] == [{"classname": admission.PRIVATE, "name": name, "outcome": "passed"}], (
+            "each applicable criterion must select its own private-music case exactly once"
+        )
+        names.append(name)
+    assert excluded == ["paid-signup"] and "paid-signup" not in names, "paid signup must stay excluded"
+    assert len(names) == len(set(names)), "each projected case must map exactly once"
     expected = [
         "## Private music contract enrollment review evidence", "",
-        f"Workflow run `42`, attempt `2`, build `{sha}`.", "",
+        f"Workflow run `{run_id}`, attempt `{attempt}`, build `{sha}`.", "",
         "| Case (class `private-music`) | Observed first-attempt outcome |",
-        "| --- | --- |", *(f"| `{name}` | passed |" for name in names),
+        "| --- | --- |", *(f"| `{name}` | passed |" for name in sorted(names)),
     ]
     result = run(command)
     assert result.returncode == 0 and not (result.stdout or result.stderr)
-    assert summary.read_text().splitlines() == expected
+    assert summary.read_text().splitlines() == expected, "review summary diverges from the draft or synthetic run"
     assert report.read_bytes() == raw
     summary.unlink()
 
@@ -210,6 +222,9 @@ def check_review(report, summary, run, command, sha):
     root.remove(root[0])
     missing_case = ET.tostring(root)
     root = ET.fromstring(raw)
+    ET.SubElement(root, "testcase", classname=admission.PRIVATE, name="paid-signup", retry="0")
+    unexpected_paid_signup = ET.tostring(root)
+    root = ET.fromstring(raw)
     props = root.find("./testcase[@name='upload-to-library']/properties")
     props[1].set("name", props[0].get("name"))
     duplicate_property = ET.tostring(root)
@@ -217,7 +232,7 @@ def check_review(report, summary, run, command, sha):
         b"", raw[:-16], raw + b" " * (16 * 1024), b"\xff" + raw,
         b"<!DOCTYPE testsuite>" + raw, b"<?private marker?>" + raw,
         raw.replace(b"<testsuite>", b'<testsuite xmlns:unused="urn:private">', 1),
-        missing_case, duplicate_case, duplicate_property, unexpected_property,
+        missing_case, duplicate_case, unexpected_paid_signup, duplicate_property, unexpected_property,
         raw.replace(b'classname="private-music"', b'classname="other"', 1),
         raw.replace(b'name="play"', b'name="disposable-canary"', 1),
         raw.replace(b'retry="0"', b'retry="1"', 1),
@@ -272,7 +287,7 @@ def run_fixture(root):
     policy = root / admission.POLICY
     reviewed_policy = policy.read_bytes()
     policy.write_bytes(empty_policy)
-    check_review(report, summary, run, review_command, env["GITHUB_SHA"])
+    check_review(report, summary, run, review_command, env)
     policy.write_bytes(reviewed_policy)
 
     with patch.dict(os.environ, env, clear=True), patch.object(evidence, "provider") as provider:

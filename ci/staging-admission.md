@@ -300,9 +300,14 @@ verifier.
 draft selector check against synthetic private-admission and raw Playwright
 JUnit shapes without Playwright, staging access or network calls.
 
-The hosted private-music fixture exercises the actual Playwright reporter and
-summary step with an empty policy, including refusals for malformed, incomplete,
-unexpected, duplicate and retried evidence. It uses disposable data offline.
+The hosted private-music fixture runs the actual Playwright reporter and
+summary step offline with disposable data and an empty policy. It compares the
+projected run, attempt and build to the synthetic run, and checks that the
+summary contains one first-attempt pass per applicable draft selector and per
+build identity case. It also checks that paid signup stays excluded and that
+a report containing an unexpected paid-signup case emits no summary. This CI
+comparison prepares QA for the live review, which still requires evidence
+from the exact protected run.
 
 `python3 -I ci/test_staging_admission.py` uses synthetic policy and authenticated
 API-shaped fixtures without a network, deploy or operational acceptance claim.
