@@ -5,11 +5,12 @@ and explicitly invited friends and family. Keep public signup, the music-video
 interface and live billing outside this release. Use the existing
 [private listening controls](ops.md#private-listening-qualification).
 
-**Current dispatch status: blocked.** The private staging job runs Playwright
-but still needs protected wiring for the health proof, the three deployment
-pins, and the record and upload steps for the attempt-bound receipt. A reviewed
-release path must also resolve when staging can safely disable the trial and
-open the protected app lane, which currently refuses promotion in preflight.
+Record candidate dispatch readiness in the [pinned candidate template](#pinned-candidate-template).
+The private staging job runs Playwright but still needs protected wiring for
+the health proof, the three deployment pins, and the record and upload steps
+for the attempt-bound receipt. A reviewed release path must also resolve when
+staging can safely disable the trial and open the protected app lane, which
+currently refuses promotion in preflight.
 Enroll real Product and QA approval through the reviewed staging policy.
 Production API/data-plane and Access cutover need protected lanes, evidence and
 fallback. A synthetic receipt is for rehearsal only.
@@ -175,5 +176,36 @@ receipts for rehearsing the staging section only.
 | Production baseline | Protected source SHA, run/attempt and job URL, private provider branch and logical DB/OID reference, manifest digest, read time and `empty` verdict, separate no-live-user/data confirmation, writer fence and custodian |
 | Pre-schema snapshot | Private snapshot reference, capture and completion UTC, branch and restore scope, expiry, verification reference and first schema apply boundary |
 | Protected switch-off | Executors and protected controls for Access/invites and API/media, verified maintenance Worker/deployment/version/seed SHA/module digest, sealed intent custody reference, expected denials and grant expiry boundary |
-| Release review and dispatch | Independent reviewer, decision/time/reference, accepted SHA and staging attempt, protected workflow and rollout run/attempt, final deployment/version and smoke result |
-| Health watch | Watcher, backup, UTC start/end, health and error baseline/threshold, readback schedule and results, switch-off trigger/recovery attempt if used, final disposition |
+| Release review and dispatch | Independent reviewer, decision (initially `Pending`, then `APPROVE` or `BLOCK`), UTC and review reference for the pinned SHA and staging attempt, protected workflow and rollout run/attempt, final deployment/version and smoke result |
+| Dispatch readiness | Pending. Record ready or blocked under the [existing qualification steps](#qualify-the-candidate), with a safe reference to the supporting evidence or blocker. |
+| Health watch and recovery | Watcher, backup, UTC start/end, health and error baseline/threshold, readback schedule and results. Actual disposition pending until the [watch](#watch-the-first-30-minutes) or [switch-off](#switch-off-and-verify) has an outcome. Record the watch result when run and whether recovery was invoked. If used, record the trigger and UTC, recovery attempt and outcome, denial and final allocation readbacks. Link the release thread and product log entries. |
+
+### Personal-use exit assessment
+
+Complete this assessment in the protected release thread. Use the **Staging
+attempt** and **Staging admission** fields above for the same-build evidence.
+Record pass or fail only when the protected attempt supplies a case-level
+verdict. Cite the case ID and a safe reference to that verdict in the accepted
+receipt or protected job evidence. An aggregate job verdict leaves each case
+pending unless its own verdict is available.
+See the [journey assertions](../ci/staging-admission.md#draft-contract-for-the-first-private-music-release).
+Live billing is assessed separately.
+
+- **Private invite scope:** Pending. Record the approved scope and access window
+  for the owner and explicitly invited friends and family.
+- **Unresolved issues and applicability:** Pending. Record each open issue or
+  evidence gap, whether it applies to this invite scope, its effect on the
+  decision and a safe reference. Use the **Staging rollback** and **Protected
+  switch-off** fields above for recovery readiness and any known limits.
+
+| Journey outcome | Result | Safe evidence reference |
+| --- | --- | --- |
+| `invite-acceptance` | Pending | — |
+| `upload-to-library` | Pending | — |
+| `play` | Pending | — |
+| `seek` | Pending | — |
+| `queue` | Pending | — |
+| `anonymous-refused` | Pending | — |
+| `unlisted-refused` | Pending | — |
+| `revoked-or-expired-refused` | Pending | — |
+| `video-off` | Pending | — |
