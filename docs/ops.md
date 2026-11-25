@@ -428,13 +428,11 @@ planetscale:nntunev2/main/nntunev2_staging@16500` with separately issued
 scope below, independently verified `PRIVATE_TRIAL_DIRECT_HOST` and
 `PRIVATE_TRIAL_ROUTED_HOST`, and protected `PRIVATE_TRIAL_{OWNER,EXECUTOR,READER,WRITER}_URL`
 values. The database owner supplies CONNECT, role fencing and staging drain.
-Use a schema and table owner with routine grant authority as executor for
-the transaction that grants the application ACL and installs the lock guards.
-The command verifies direct and PUBLIC ACLs, role OIDs and memberships,
-cross-database access and guard definitions. Use `verify` before binding
-and `verify-overlay` after applying the overlay.
-After disarming and unbinding, use `fence`, withdraw the overlay grants with
-its owner, then use `retire` with the original executor and pins.
+The schema and table executor reads the ledger, grants the application ACL
+and installs the lock guards. Trial logins must lack access to all other
+connectable databases, including templates. Use `verify` before binding
+and `verify-overlay` after applying the overlay. After disarming and unbinding,
+use `fence`, withdraw overlay grants with their owner, then use `retire`.
 
 For an authorized private trial, dispatch `migrations-staging-apply` from
 protected `main` with `file=private-trial`, `mode=single`, the reviewed full
@@ -490,7 +488,7 @@ or INHERIT after granting and before reversal. Verify the companion
 publication reads, inserts and storage routine grants separately.
 
 For withdrawal, disarm the trial and unbind its credentials, then remove both
-overlay variables and the preflight scope. Through the same authorized role
+overlay variables. Keep the original scope in custody. Through the same role
 route, fence both exact logins and drain their sessions. If the publication
 lock contract was applied, run it with the same pinned writer OID and
 `nntune.private_trial_lock_action` set to `revoke` before retiring the role.

@@ -165,12 +165,10 @@ def identities(scope, *, missing=False, login=True):
     return require(f"""
 WITH requested(name, id) AS ({requested})
 SELECT NOT EXISTS (
-    SELECT FROM requested q {'LEFT' if missing else 'FULL'} JOIN
-      (SELECT * FROM pg_roles WHERE oid IN ({ids}) OR rolname IN ('{reader[0]}','{writer[0]}')) r
-      ON q.name = r.rolname::text AND q.id = r.oid
-    WHERE q.id IS NULL OR ({'false' if missing else 'r.oid IS NULL'})
-       OR (r.rolsuper OR r.rolinherit OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication
-           OR r.rolbypassrls {'OR NOT r.rolcanlogin' if login else ''})
+    SELECT FROM requested q LEFT JOIN pg_roles r ON q.name = r.rolname::text AND q.id = r.oid
+    WHERE {'false' if missing else 'r.oid IS NULL'}
+       OR r.rolsuper OR r.rolinherit OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication
+       OR r.rolbypassrls {'OR NOT r.rolcanlogin' if login else ''}
 )
 AND NOT EXISTS (
     SELECT FROM pg_roles r WHERE (oid,rolname::text) NOT IN (SELECT id,name FROM requested)

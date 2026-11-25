@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -17,7 +18,9 @@ from staging_trial_schema import compose
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--disposable-port", required=True, type=int)
-port = parser.parse_args().disposable_port
+parser.add_argument("--local-data-dir", type=Path)
+args = parser.parse_args()
+port = args.disposable_port
 password = "ci-throwaway"
 base = dict(PATH=os.environ["PATH"], PGHOST="127.0.0.1", PGPORT=str(port), PGPASSWORD=password,
             PGUSER="postgres", PGDATABASE="nntune_ci", PGSSLMODE="disable")
@@ -32,6 +35,28 @@ def sql(text, *, database=DATABASE):
         raise AssertionError(result.stderr)
     return result.stdout.strip()
 
+
+cluster_query = "SELECT system_identifier FROM pg_catalog.pg_control_system();"
+container = os.environ.get("TRIAL_FIXTURE_CONTAINER", "")
+if args.local_data_dir is not None:
+    data_dir = args.local_data_dir.resolve(strict=True)
+    if not re.fullmatch(r"/tmp/nntune-trial77f\.[A-Za-z0-9]+/db", str(data_dir)):
+        raise SystemExit("requires a scoped disposable local PostgreSQL directory")
+    control = subprocess.check_output(["pg_controldata", str(data_dir)], text=True, timeout=10,
+                                      env={"PATH": base["PATH"], "LC_ALL": "C"})
+    expected_cluster = re.search(r"^Database system identifier:\s+([0-9]+)$", control, re.MULTILINE)
+    expected_cluster = expected_cluster[1] if expected_cluster else ""
+elif (os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+      and os.environ.get("GITHUB_JOB") == "api-migrations" and port == 5432
+      and re.fullmatch(r"[0-9a-f]{64}", container)):
+    expected_cluster = subprocess.check_output(
+        ["docker", "exec", container, "psql", "-XAtw", "-U", "postgres", "-d", "nntune_ci", "-c", cluster_query],
+        text=True, timeout=10,
+    ).strip()
+else:
+    raise SystemExit("requires independently pinned disposable PostgreSQL")
+if not re.fullmatch(r"[0-9]+", expected_cluster) or sql(cluster_query, database="nntune_ci") != expected_cluster:
+    raise SystemExit("loopback server does not match the disposable PostgreSQL cluster")
 
 owner_setup = f"""
 CREATE ROLE {owner} LOGIN CREATEROLE NOINHERIT PASSWORD '{password}';
@@ -55,8 +80,8 @@ try:
     ledger = ", ".join(f"('{e['file']}','{e['sha256']}')" for e in entries)
     sql(f"SET ROLE {executor};\n" + "\n".join(transaction_body(text) for text in migrations)
         + "CREATE TABLE public.schema_migrations(file text, sha256 text);"
-        + f"INSERT INTO public.schema_migrations VALUES {ledger};"
-        + f"GRANT SELECT ON public.schema_migrations TO {owner};")
+        + f"INSERT INTO public.schema_migrations VALUES {ledger};")
+    assert sql(f"SELECT has_table_privilege('{owner}','public.schema_migrations','SELECT');") == "f"
 
     def role_oid(role):
         return int(sql(f"SELECT oid FROM pg_roles WHERE rolname = '{role}';"))
@@ -81,6 +106,9 @@ try:
     cmd("grant", success=False)
     sql(f"COMMENT ON DATABASE {DATABASE} IS '{FIXTURE}';")
     assert sql(f"SELECT has_database_privilege('{writer}',current_database(),'CONNECT');") == "f"
+    sql("GRANT CONNECT ON DATABASE template1 TO PUBLIC;")
+    cmd("grant", success=False)
+    sql("REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;")
     sql(f"GRANT UPDATE (id) ON public.users TO {writer};")
     cmd("grant", success=False)
     assert sql(f"SELECT has_database_privilege('{writer}',current_database(),'CONNECT');") == "f"

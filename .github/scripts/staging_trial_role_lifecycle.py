@@ -120,7 +120,7 @@ def run(action, scope, fixture):
                               "WHERE datname = current_database()") if env is admin else ""
         psql(env, f"BEGIN {mode};\n" + target(scope, env["PGUSER"], fixture) + owner_check
              + f"SELECT pg_advisory_xact_lock({ADVISORY_LOCK_KEY});\n"
-             + baseline() + sql + "\nCOMMIT;\n", label)
+             + (baseline() if env is app else "") + sql + "\nCOMMIT;\n", label)
 
     if action in ("fence", "retire"):
         absent_ok = identities(scope, missing=True, login=False)
@@ -157,6 +157,7 @@ AND EXISTS (SELECT FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
         if env["PGUSER"].partition(".")[0] != name:
             raise ValueError
     if action == "grant":
+        stage(app, "staging baseline", "", readonly=True)
         stage(admin, "staging CONNECT", identity_check + lock_contract(scope, "check") + audit(full, exact=False)
               + change(connect, "GRANT") + identities(scope))
         stage(app, "application grants", identity_check + audit(full, exact=False) + change(app_grants, "GRANT")
