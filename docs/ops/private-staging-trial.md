@@ -98,7 +98,7 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    and trial runtime bindings.
    Keep the selected pins and authorized cleanup access until cleanup finishes.
    After the cohort cutoff and all retention and lease windows, run the
-   [selected-fixture retirement path](../../workers/api/src/handlers/private_trial/cleanup.rs)
+   [protected cleanup dispatch](#protected-cleanup-dispatch)
    for tone A against the exact trial scope, invite, upload session, job,
    track, object and bucket. Require the admission and digest reference to be
    retired, the exact media and digest page versions absent, and the selected
@@ -116,6 +116,52 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    from custody. If reversal refuses because of residual privileges, keep the
    logins fenced and have the grant owner reconcile the exact access before
    resuming withdrawal.
+
+### Protected cleanup dispatch
+
+After containment, supply `PRIVATE_TRIAL_CLEANUP_CONTAINMENT` in the protected
+`staging` Environment. Use the verified disable run's `build_sha` and its
+`api` and `stream` pins, each with `deployment_id` and `version_id`. Set
+`session_revoked`, `cohort_cleared` and `armed_runs_drained` to `true` only
+after completing and checking those steps. Leave the upload, playback,
+journey, observation and Stream deploy arms unset. Keep the original staging
+storage settings available for the runner to match against the receipt.
+If a later staging deploy changes either serving pin, obtain fresh disable
+receipts before dispatch and retain the original fixture scope and hash.
+
+Store the selected tone A receipt as `PRIVATE_TRIAL_CLEANUP_SCOPE`. Supply
+`object`, `generation`, `map`, `track`, `session`, `job`, `issuer`, `invite`,
+`cutoff` (Unix seconds), `media_version` and `page_version`, and the original
+`provider` object with `environment`, `library`, `configuration`,
+`root_version`, `bucket`, `endpoint` and `region`. Pin the independently
+verified cleanup login with `database_host`, `database_port`, `database_role`
+and `database_role_oid`. Use `PRIVATE_TRIAL_CLEANUP_DATABASE_URL` for its
+direct `nntunev2_staging` connection with `sslmode=require`. Keep the role
+separate from upload, read, publication and enrollment. Use
+`PRIVATE_TRIAL_CLEANUP_S3` for JSON with `access_key` and `secret_key` from the
+independent exact-version DELETE and HEAD credential. Its policy must allow
+only the two selected fixture keys and no list or bulk operations. Record the
+SHA-256 of the exact UTF-8 credential JSON as `s3_credential_sha256` in the
+scope. Before arming, verify both identities and qualify the provider with the
+same no-list policy on a disposable versioned fixture. Require version-specific
+HEAD to return the selected version while present. Require exact-version
+DELETE to return an empty HTTP 204 and, if it includes `x-amz-version-id`,
+require that value to match the selected version. Require the subsequent
+version-specific HEAD to return an empty HTTP 404. Repeat the same DELETE and
+HEAD against the now-absent version and require the same status, body and
+optional version header checks. Treat HTTP 403, ambiguity or a policy that
+needs list access as a stop. Keep the scope and credentials in protected custody.
+
+Once the cutoff, retention and lease windows have elapsed, dispatch
+[`deploy`](../../.github/workflows/deploy.yml) from protected `main` with
+`private_trial_cleanup_scope_sha256` set to the SHA-256 of the exact UTF-8
+scope JSON. The job checks the disable deployments under the staging deploy
+lock and invokes the isolated Worker once. `confirmed` means two verified
+version absences and a committed source finalization. Stop on `refused`,
+`withheld`, `unconfirmed` or missing evidence. Reconcile SQL and provider state
+before a fresh dispatch with the original scope and hash. Keep those pins
+until cleanup is confirmed, then clear the cleanup settings in custody and
+withdraw its scoped access.
 
 After an interruption, reconcile the last run and actual staging state before
 retrying. For a partial role setup, 77f compares the pinned identities and
