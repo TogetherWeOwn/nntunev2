@@ -20,9 +20,10 @@ fallback. A synthetic receipt is for rehearsal only.
 ## Qualify the candidate
 
 1. Select a full `main` commit SHA and pin its build artifacts. Complete the
-   [staging promotion checklist](ops.md#staging-promotion-checklist), including
-   the last-good staging restore evidence. Record required CI check results and
-   each included PR's review clearance on the relevant SHA. Main can keep moving.
+   [staging promotion checklist](ops.md#staging-promotion-checklist) using its
+   private music E2E box and the shared checks, including the last-good staging
+   restore evidence. Record required CI check results and each included PR's
+   review clearance on the relevant SHA. Main can keep moving.
 2. Pin the successful main-push `deploy.yml` run **and attempt** for that SHA.
    Match successful health proof, actual Web/API/Stream deploy steps and the
    `post-deploy private music journey` to it. The ordinary post-deploy smoke
