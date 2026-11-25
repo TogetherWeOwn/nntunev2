@@ -16,6 +16,7 @@ SHA = "6" * 40
 SESSION = "cs_test_privateSession"
 ACCOUNT = "acct_privateAccount"
 SUBSCRIPTION = "sub_privateSubscription"
+SUBSCRIPTION_PATH = f"/v1/subscriptions/{SUBSCRIPTION}"
 ENV = {
     "NNTUNE_PAID_INVITE_ACCEPTANCE": "1", "EXPECTED_BUILD_SHA": SHA,
     "CF_ACCESS_CLIENT_ID": "privateAccessId", "CF_ACCESS_CLIENT_SECRET": "privateAccessSecret",
@@ -40,11 +41,12 @@ class AcceptanceTest(unittest.TestCase):
                 "mode": "subscription", "status": "complete", "payment_status": "paid",
                 "amount_total": 1500, "subscription": SUBSCRIPTION,
             },
-            f"/v1/subscriptions/{SUBSCRIPTION}": {
+            SUBSCRIPTION_PATH: {
                 "object": "subscription", "id": SUBSCRIPTION, "livemode": False, "status": "canceled",
             },
         }
         self.env = ENV.copy()
+        self.late_responses = {}
         self.connected = []
         self.requests = []
         fixture = self
@@ -53,6 +55,8 @@ class AcceptanceTest(unittest.TestCase):
             def do_GET(self):
                 fixture.requests.append((self.path, dict(self.headers)))
                 reply = fixture.routes[self.path]
+                if any(path == SUBSCRIPTION_PATH for path, _ in fixture.requests):
+                    reply = fixture.late_responses.get(self.path, reply)
                 self.send_response(reply if isinstance(reply, int) else 200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Location", "https://outside.invalid/privateRedirect")
@@ -96,15 +100,33 @@ class AcceptanceTest(unittest.TestCase):
 
     def test_finish_verifies_payment_and_teardown_with_redacted_output(self):
         self.run_case("accepted")
-        self.assertEqual([path for path, _ in self.requests], list(self.routes))
-        self.assertEqual(self.connected, ["staging.nntune.com"] * 2 + ["api.stripe.com"] * 4)
+        self.assertEqual([path for path, _ in self.requests],
+                         list(self.routes) + ["/api/build", "/healthz"])
+        self.assertEqual(self.connected,
+                         ["staging.nntune.com"] * 2 + ["api.stripe.com"] * 4
+                         + ["staging.nntune.com"] * 2)
         for path, headers in self.requests:
             if path.startswith("/v1/"):
                 self.assertEqual(headers["Authorization"], "Bearer " + ENV["PAID_INVITE_STRIPE_READ_KEY"])
+                self.assertNotIn("CF-Access-Client-Id", headers)
                 self.assertNotIn("CF-Access-Client-Secret", headers)
             else:
+                self.assertEqual(headers["CF-Access-Client-Id"], ENV["CF_ACCESS_CLIENT_ID"])
                 self.assertEqual(headers["CF-Access-Client-Secret"], ENV["CF_ACCESS_CLIENT_SECRET"])
                 self.assertNotIn("Authorization", headers)
+
+    def test_finish_refuses_late_build_drift_or_read_failure(self):
+        for path, response, code in (
+            ("/api/build", {"sha": "7" * 40}, "wrong_build"),
+            ("/healthz", {"ok": True, "build_sha": "7" * 40}, "wrong_build"),
+            ("/api/build", 503, "upstream_refused"),
+            ("/healthz", 503, "upstream_refused"),
+        ):
+            with self.subTest(path=path, code=code), patch.dict(self.late_responses, {path: response}):
+                self.requests.clear()
+                self.run_case(code)
+                closing_paths = ["/api/build"] if path == "/api/build" else ["/api/build", "/healthz"]
+                self.assertEqual([seen for seen, _ in self.requests], list(self.routes) + closing_paths)
 
     def test_default_off_and_invalid_admission_send_no_requests(self):
         for evidence in ({"app": "other-app"}, {"environment": "production"},
@@ -145,7 +167,7 @@ class AcceptanceTest(unittest.TestCase):
             ("/v1/account", "stripe_account", {"id": "acct_other"}),
             (f"/v1/checkout/sessions/{SESSION}", "stripe_mode", {"livemode": True}),
             (f"/v1/checkout/sessions/{SESSION}", "payment_unverified", {"payment_status": "unpaid"}),
-            (f"/v1/subscriptions/{SUBSCRIPTION}", "teardown_unverified", {"status": "active"}),
+            (SUBSCRIPTION_PATH, "teardown_unverified", {"status": "active"}),
         ):
             with self.subTest(code=code), patch.dict(self.routes[path], override):
                 self.run_case(code)
