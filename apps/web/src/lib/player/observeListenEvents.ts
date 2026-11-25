@@ -29,7 +29,7 @@ export interface ListenObserver {
 }
 
 /** Reformat the canonical unpadded base64url grant ID without changing its bits. */
-function playbackIdFromGrant(id: string | undefined): string | undefined {
+export function playbackIdFromGrant(id: string | undefined): string | undefined {
 	if (id === undefined || !/^[A-Za-z0-9_-]{21}[AQgw]$/.test(id)) return;
 	const bytes = atob(id.replace(/-/g, '+').replace(/_/g, '/'));
 	const h = Array.from(bytes, (byte) => byte.charCodeAt(0).toString(16).padStart(2, '0')).join('');
