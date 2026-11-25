@@ -71,28 +71,24 @@ launcher verdict.
 
 ## Check DNS convergence for the disposable ingress
 
-For an authorized attempt, import [the read-only policy](dns_convergence.py)
-in the protected executor on the post-create and post-delete paths for the
-single run-owned record. Keep the existing exclusive writer held from the
-provider write through convergence and closeout. If that scope is lost,
-stop and reconcile the record's identity before any further change.
+For an authorized attempt, import [the policy](dns_convergence.py) in the
+protected executor. Hold the exclusive writer from the write through closeout.
+If that scope is lost, stop and reconcile record identity before any change.
 
 1. After creation, read back the recorded ID and require exactly that one
    record by exact name, matching the approved type, origin, proxy state, TTL,
    tags and comment. After deletion, require `404` by recorded ID and an empty
-   exact-name provider list. Bind both results to the change direction,
-   exact name and record ID in `Readback` and use the original monotonic
-   completion time. Invoke the check once per provider write.
+   exact-name provider list. Bind direction, name, ID and the original
+   monotonic completion time in `Readback`. Run the check once per write.
 2. Use the two distinct authorities from the approved zone inputs. Pin each
-   query endpoint before the write. Every two seconds `read_pair` sends one
-   direct, non-recursive `IN A` query to each endpoint within the round timeout.
+   query endpoint before the write. Every two seconds `read_pair` starts one
+   direct, non-recursive `IN A` query per endpoint together under one timeout.
    Match each reply to its query and server. Return one observation per
    attempt, using a non-authoritative failure if a valid reply is unavailable.
    Count exact-owner A answers. Proxied answers are edge IPs.
 3. For create, require `NOERROR` with at least one exact-owner A answer on two
-   consecutive reads from each authority before the 90-second deadline. Only
-   then continue to existing HTTPS readiness. A missed deadline or stop
-   leaves the trial disarmed and goes to scoped disposal and full closeout.
+   consecutive reads per authority before 90 seconds, then proceed to HTTPS
+   readiness. On expiry or stop, keep the trial disarmed and dispose as scoped.
 4. For delete, require `NXDOMAIN` with zero answers on two consecutive reads
    from each authority before 90 seconds from delete readback. On a miss,
    keep reading for containment up to 300 seconds total from that readback.
@@ -103,11 +99,10 @@ stop and reconcile the record's identity before any further change.
    reads, sends a non-authoritative response, reports `SERVFAIL` or `REFUSED`,
    or otherwise cannot supply a valid observation. Log each read's UTC time,
    server, response code, AA flag, answer count and seconds since REST readback
-   to the protected receipt. Use the reply arrival time for qualification.
-   Record the merged SHA and SHA-256 of the executor diff. If the callbacks
-   fail or the executor is interrupted, keep the trial disarmed. Keep DNS
-   cleanup pending and retain the writer on delete failure while other scoped
-   closeout continues.
+   to the protected receipt with the merged SHA and executor diff SHA-256.
+   Determine delete qualification by reply arrival time. On callback failure
+   or interruption, keep the trial disarmed. On delete failure, keep DNS
+   cleanup pending and retain the writer while other scoped closeout continues.
 
 Exercise the policy with synthetic observations only.
 
@@ -144,11 +139,11 @@ reconciliation. Keep the trial disarmed.
    the separate `other.example.invalid` route update in place. Restoring
    `<before>` here would undo that update. Recheck both targets against the
    receipt before applying. Validate the resulting Caddy config. Delete the
-   recorded DNS ID in its zone and record the successful deletion and exact-ID
-   absence before reloading Caddy. If a step fails, record what applied and
-   read both targets again before any retry.
-3. Confirm absence by exact DNS record ID and name and verify authoritative
-   absence under the [delete convergence check](#check-dns-convergence-for-the-disposable-ingress).
+   recorded DNS ID in its zone and record absence by exact ID and name. Run the
+   [delete convergence check](#check-dns-convergence-for-the-disposable-ingress)
+   and save its verdict before attempting the Caddy reload. On failure, record
+   what applied and read both targets again before any retry.
+3. Use the original delete receipt for provider and authoritative absence.
    Read the Caddy source and active route to confirm the rollout block is
    absent, the concurrent route update is still loaded and all three existing
    sites still return their expected responses. Record those results and leave
