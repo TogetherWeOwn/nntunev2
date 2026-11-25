@@ -263,25 +263,46 @@ The early refusal step collects the anonymous and unlisted statuses.
 `assertPrivateRefusals` checks them at cutoff. The reporter can mark those
 cases passed only after their status assertions pass at cutoff.
 
-The protected suite currently uses the dot reporter. Playwright's built-in
-JUnit reporter records the enclosing test as one testcase and has no per-step
-case or explicit first-attempt marker. The private admission format requires the
-bounded per-case report above, including the two separately required build
-identity cases. The selector fixtures exercise that format without staging.
-Cross-stage track correlation is tracked in
-[#1823](https://github.com/TogetherWeOwn/nntunev2/pull/1823). Rendering verified
-candidate pins and the switch-off instructions are tracked in
-[#1822](https://github.com/TogetherWeOwn/nntunev2/pull/1822).
+The protected suite uses the private admission reporter. It emits the bounded
+per-case report above, including both required build identity cases. Playwright's
+built-in JUnit reporter records the enclosing test as one testcase and has no
+per-step case or explicit first-attempt marker.
 
 The production verifier reads `ci/product-journey-contract.json`. The
-separately named draft has no approval entry. Enrollment requires the exact
-live report from protected staging and reviewed product and QA approval.
+separately named draft has no approval entry. Enrollment requires live
+evidence from the exact protected attempt and reviewed Product and QA approval.
+
+### Protected contract enrollment review
+
+On the protected main-push `deploy` run for the candidate, open the Actions
+summary for the exact attempt and find **Private music contract enrollment
+review evidence**. Match the workflow run ID, attempt and build SHA to the
+candidate being reviewed. QA compares the
+class, case names and first-attempt outcomes with the applicable selectors in
+the draft. Both build identity cases are required by the receipt evaluator.
+Product reviews applicability, including the paid-signup exclusion.
+
+The summary reads the report directly after successful qualification, before
+the receipt step can add provider pins. It is available with an empty approval
+policy, even if the receipt step fails. The reporter emits a report only when
+all cases pass on their first attempt. An absent summary supplies no case-level
+evidence. Treat the Actions summary as public. It exposes only the case table
+and public run, attempt and build references. Raw XML, proof values and
+diagnostics stay on the runner.
+If reviewers require those details, keep approval pending until restricted
+custody is available. The summary is review evidence only. The receipt upload
+still requires a satisfied receipt, and promotion still uses the independent
+verifier.
 
 ## Offline verification
 
 `python3 -I ci/test_staging_admission.py DraftPrivateContractTests` runs the
 draft selector check against synthetic private-admission and raw Playwright
 JUnit shapes without Playwright, staging access or network calls.
+
+The hosted private-music fixture exercises the actual Playwright reporter and
+summary step with an empty policy, including refusals for malformed, incomplete,
+unexpected, duplicate and retried evidence. It uses disposable data offline.
 
 `python3 -I ci/test_staging_admission.py` uses synthetic policy and authenticated
 API-shaped fixtures without a network, deploy or operational acceptance claim.

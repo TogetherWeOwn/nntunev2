@@ -18,12 +18,13 @@ Scoped staging access and a live qualifying attempt remain pending. Follow the
 [protected staging trial runbook](ops/private-staging-trial.md) for setup,
 qualification and cleanup. The admission policy has no approvals, so the
 protected job cannot upload a satisfied receipt and the verifier refuses
-admission. The job keeps the bounded report on the runner. Keep enrollment
-pending until there is a reviewed protected path to obtain the exact live
-report for [contract enrollment](../ci/staging-admission.md#draft-contract-for-the-first-private-music-release).
-Enrolling the exact contract requires a reviewed policy change, with Product
-approval of applicability and separate QA approval of the executable mapping.
-Synthetic receipts are for rehearsal only.
+admission. After successful qualification, the Actions summary exposes the
+case names and first-attempt outcomes from that exact attempt as
+[contract enrollment review evidence](../ci/staging-admission.md#protected-contract-enrollment-review).
+The raw report stays on the runner. Keep enrollment pending until Product
+approves applicability and QA separately approves the executable mapping
+against the protected live evidence. Enrollment requires a reviewed policy
+change. Synthetic receipts are for rehearsal only.
 
 Production preflight currently refuses application promotion, even when the
 lane is enabled. Maintenance bootstrap requires a passing ordinary full journey
