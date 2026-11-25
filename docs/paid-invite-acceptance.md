@@ -149,6 +149,35 @@ provider time. Resolve ambiguous old payments before reusing their flight. Remov
 `PAID_INVITE_BILLING` to close paid dispatch.
 Check Worker error logs for unresolved scheduled targets.
 
+## Synthetic evidence handoff
+
+Use the full SHA from the protected staging deploy for `EXPECTED_BUILD_SHA`,
+the record's `build` and each verified `checks` entry. The runner reads Web
+`/api/build` and API `/healthz` at admission and before and after the closing
+payment readback. Record the same-run Stream deployment separately under
+`stream_deployed`.
+
+This example uses build `1111111111111111111111111111111111111111` and a
+synthetic invitee with user UUID `11111111-1111-4111-8111-111111111111`.
+Carry the admission fields, including the verified `stripe_account`, into
+`finish`. Record `checks.admitted` from the `admitted` verdict on that same
+build and run. Carry the underlying observations forward as follows.
+
+| Observation | Acceptance input |
+| --- | --- |
+| The invoice-history preflight at the pinned cutoff reports `total=3`, `exact=1`, `eligible_hydration=1`, `fresh=1`, `collision=0`, `incomplete=0` and exits 0 for the independently inventoried scope of three keys. | Record the SHA under `checks.invoice_history` at admission and carry it into `finish`. The comparison covers existing subscription targets. The new invitee's first Checkout is observed during the journey. |
+| The invitee completes `cs_test_fixtureSignup` for `sub_fixtureSignup`, and the signed delivery applies coverage once to that invitee. | Copy the original ID into `checkout_session` and record the SHA under `checks.payment_applied` in `finish`. The runner reads back the paid test session and its canceled subscription during closing verification. |
+| The same invitee plays the synthetic track over a ranged response, seeks, keeps playing and shows positive delivered usage. Replaying the meter window leaves the total flat. | Record the SHA under `checks.playback_and_meter` in `finish`. Keep the authenticated listener ID and the play and usage times with the private observations. Where the candidate's runner requires `enrollment_id` and a structured playback receipt, use the invitee's UUID for the top-level `enrollment_id` and match the receipt's `build`, `checkout_session` and `enrollment_id` to this run. For example, `played_at=1700000010` and `metered_at=1700000020` are ordered Unix seconds. |
+
+Collect the remaining admission and finish checks from the same run. The
+[loopback clock fixture](../.github/scripts/test_paid_invite_clock.py)
+rehearses the runner's opening and closing readback. The ordinary
+[playback assertions](../e2e/tests/ingest-play-meter.spec.ts) provide a pattern
+for the paid journey. Their user-ingest audio legs are parked, so collect
+fresh playback and usage observations using the callable synthetic fixture
+in the selected paid session. Missing or skipped evidence leaves acceptance
+open. In the readout, retain only the runner verdict and protected job URL.
+
 ## Invoice history preflight
 
 Run the [read-only preflight](../.github/scripts/billing_history_preflight.py) with
