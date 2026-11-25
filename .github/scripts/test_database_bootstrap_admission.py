@@ -12,7 +12,7 @@ from pathlib import Path
 
 import database_bootstrap_admission as admission
 from database_bootstrap_baseline import WORKFLOW as BASELINE_WORKFLOW
-from test_ci_pnpm_retry import job_needs, split_jobs, step_field
+from test_ci_pnpm_retry import job_level_field, job_needs, split_jobs
 
 
 def check_baseline_workflow():
@@ -29,8 +29,8 @@ def check_baseline_workflow():
     if (
         "\non:\n  workflow_dispatch:\n\n" not in workflow or gate not in preflight
         or job_needs(baseline) != ["preflight"]
-        or step_field(baseline, "if") != "github.run_attempt == '1'"
-        or step_field(baseline, "environment") != "production-db-baseline"
+        or job_level_field(baseline, "if") != "github.run_attempt == '1'"
+        or job_level_field(baseline, "environment") != "production-db-baseline"
     ):
         raise RuntimeError("baseline workflow admission differs from the required guards")
 
