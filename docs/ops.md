@@ -1140,8 +1140,9 @@ Apply the existing staging promotion checklist to any release candidate.
 
 ## Staging promotion checklist
 
-Promotion is `main` HEAD → staging; production promotion is a later gated
-lane. Complete every box on the exact head being promoted.
+Promotion is `main` HEAD → staging. Production promotion is a later gated
+lane. Complete the shared boxes and the applicable journey box on the exact
+head being promoted.
 
 ### Private Stream staging
 
@@ -1420,6 +1421,8 @@ Verify restored build health and identity or the private maintenance behavior.
 
 ### First private release handoff
 
+Use the [first private music launch instructions and pinned candidate template](first-private-music-launch.md).
+
 Record the exact SHA, checks, reviews, staging build IDs, and admitted health
 and listening attempt. Pin the maintenance module SHA-256 and its isolated
 `503`, `Cache-Control: no-store` and `X-Robots-Tag: noindex`.
@@ -1496,7 +1499,8 @@ requires independent release approval. A push to `main` deploys to the
   staging host is served by Worker routes (web catch-all plus api path
   routes, see the DNS section); the `100::` placeholder record stays —
   it routes the hostname to the edge and is not replaced.
-- [ ] Staging E2E: `deploy.yml` sequences it — its `post-deploy-e2e` job
+- [ ] Staging E2E, ordinary journey and maintenance bootstrap: `deploy.yml`
+  sequences it — its `post-deploy-e2e` job
   calls `e2e-staging.yml` (reusable workflow) only after the same run's
   `staging-web` and `staging-api` jobs succeed (explicit result checks;
   a green `staging-api` job may be an unconfigured skip, passed on as
@@ -1514,6 +1518,13 @@ requires independent release approval. A push to `main` deploys to the
   box above).
   Pre-configuration skips do not count once staging is configured; the
   workflow fails closed without both Access client credentials.
+- [ ] Staging E2E, private music application promotion: the armed `deploy.yml`
+  run skips `post-deploy-e2e`. Require passing same-attempt health proof and
+  the private music journey and receipt from the exact Web, API and Stream
+  deployments. Record the ordinary job as inapplicable to this run. Missing
+  private proof still blocks promotion, and the protected production
+  preflight currently refuses application promotion. Follow the
+  [private launch procedure](first-private-music-launch.md#qualify-the-candidate).
 - [ ] Access intact: the `NNTune v2 staging` Access app, its owner-OTP allow
   policy and the QA service-token policy still gate `staging.nntune.com`.
   No bypass, no shared-token rotation, and both `CF_ACCESS_CLIENT_*`
