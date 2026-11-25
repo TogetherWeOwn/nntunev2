@@ -6,7 +6,14 @@ use nntune_core::{
     media_envelope::{verify_enrolled_scheme2, wrap_scheme2, EnvelopeContext},
     origin_sealer::SealedChunk,
 };
-use nntune_ingest::digest_candidate_store::CandidateIntent;
+use nntune_ingest::{
+    digest_candidate_store::CandidateIntent,
+    multipart::{
+        resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
+        session_completion::{DispatchError, SessionCompletion},
+        CompletedVersionedMedia, Plan, UploadPart, UploadTarget, UploadedPart,
+    },
+};
 use sha2::{Digest, Sha256};
 
 #[cfg(target_arch = "wasm32")]
@@ -20,13 +27,8 @@ use {
     },
     nntune_core::digest_readback::EnrolledEnvelope,
     nntune_ingest::multipart::{
-        readback_inventory::CompletedReadbackInventory,
-        resume_checkpoint::{CheckpointPart, ResumeBinding, ResumeCheckpoint},
-        s3_completion::S3CompletionSender,
-        session_completion::SessionCompletion,
-        session_outcome::CompletionScope,
-        sidecar::SidecarPut,
-        Plan,
+        readback_inventory::CompletedReadbackInventory, s3_completion::S3CompletionSender,
+        session_outcome::CompletionScope, sidecar::SidecarPut,
     },
     std::time::SystemTime,
     tokio_postgres::Client,
@@ -116,6 +118,52 @@ impl SealedFixture {
         &self.origin
     }
 
+    pub(crate) fn plan_part<'a>(
+        &self,
+        target: UploadTarget<'a>,
+    ) -> Result<(Plan<'a>, UploadPart<'a>), TrialError> {
+        let plan =
+            Plan::new(target, self.header, self.context.plaintext_len).map_err(|_| Unconfirmed)?;
+        let mut partition = plan.partition();
+        for chunk in &self.chunks {
+            if partition.push(chunk).map_err(|_| Unconfirmed)?.is_some() {
+                return Err(Unconfirmed);
+            }
+        }
+        let part = partition
+            .finish()
+            .map_err(|_| Unconfirmed)?
+            .ok_or(Unconfirmed)?;
+        Ok((plan, part))
+    }
+
+    pub(crate) async fn complete_part<'a>(
+        &'a self,
+        binding: ResumeBinding<'a>,
+        part: &UploadPart<'a>,
+        uploaded: UploadedPart<'a>,
+        dispatch: impl AsyncFnOnce(
+            SessionCompletion<'a>,
+        ) -> Result<CompletedVersionedMedia, DispatchError>,
+    ) -> Result<CompletedVersionedMedia, TrialError> {
+        let (_, number, bytes, _) = part.request();
+        let etag = uploaded.etag().to_owned();
+        let parts = [CheckpointPart {
+            number,
+            len: bytes.len(),
+            etag: &etag,
+            digest: Sha256::digest(bytes).into(),
+        }];
+        let checkpoint = ResumeCheckpoint {
+            binding,
+            parts: &parts,
+        };
+        let completion =
+            SessionCompletion::prepare(binding, &self.context, vec![uploaded], &checkpoint)
+                .map_err(|_| Unconfirmed)?;
+        dispatch(completion).await.map_err(|_| Unconfirmed)
+    }
+
     /// Run only after the exact candidate and reservation are durable, and
     /// after the owner, redeemed invite and current upload grant pass preflight.
     #[cfg(target_arch = "wasm32")]
@@ -159,18 +207,7 @@ impl SealedFixture {
         if target.bucket != bucket {
             return Err(Unconfirmed);
         }
-        let plan =
-            Plan::new(target, self.header, self.context.plaintext_len).map_err(|_| Unconfirmed)?;
-        let mut partition = plan.partition();
-        for chunk in &self.chunks {
-            if partition.push(chunk).map_err(|_| Unconfirmed)?.is_some() {
-                return Err(Unconfirmed);
-            }
-        }
-        let part = partition
-            .finish()
-            .map_err(|_| Unconfirmed)?
-            .ok_or(Unconfirmed)?;
+        let (plan, part) = self.plan_part(target)?;
         let binding = ResumeBinding {
             plan,
             configuration,
@@ -185,25 +222,11 @@ impl SealedFixture {
             .put_part(binding, &self.context, &part, upload, until)
             .await
             .map_err(|_| Unconfirmed)?;
-        let (_, number, bytes, _) = part.request();
-        let etag = uploaded.etag().to_owned();
-        let parts = [CheckpointPart {
-            number,
-            len: bytes.len(),
-            etag: &etag,
-            digest: Sha256::digest(bytes).into(),
-        }];
-        let checkpoint = ResumeCheckpoint {
-            binding,
-            parts: &parts,
-        };
-        let completion =
-            SessionCompletion::prepare(binding, &self.context, vec![uploaded], &checkpoint)
-                .map_err(|_| Unconfirmed)?;
-        let completed = sender
-            .complete(completion, until)
-            .await
-            .map_err(|_| Unconfirmed)?;
+        let completed = self
+            .complete_part(binding, &part, uploaded, async |completion| {
+                sender.complete(completion, until).await
+            })
+            .await?;
         sender
             .confirm_head(&completed, &self.context, until)
             .await

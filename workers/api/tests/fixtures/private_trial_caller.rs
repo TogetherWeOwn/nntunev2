@@ -21,6 +21,8 @@ use tokio_postgres::{Client, NoTls};
 
 #[path = "../support/blocker_observer.rs"]
 mod blocker_observer;
+#[path = "private_trial_storage_failure.rs"]
+mod storage_failure;
 
 const RECIPIENT: &str = "synthetic-trial-listener";
 const OUTSIDER: &str = "synthetic-trial-outsider";
@@ -709,6 +711,49 @@ pub(crate) async fn verify_publication(
         assert_eq!(duration, stored);
     }
     assert_eq!(set_duration(Some(14_000)).await, 1);
+
+    let published = async || {
+        use crate::private_catalogue_read::{lookup_scoped, PublicationScope};
+        lookup_scoped(
+            observer,
+            track,
+            PublicationScope {
+                environment: prepared.scope.environment,
+                library: prepared.scope.library,
+                provider_configuration: prepared.intent.identities[4],
+                bucket: "fixture-bucket",
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("the published track must resolve from an independent connection")
+        .0
+    };
+    let prior = published().await;
+    assert_eq!(prior.target.object, prepared.intent.identities[2]);
+    assert!(matches!(
+        prior.locator.binding(),
+        nntune_core::s3_locator::S3Binding::VersionId(version)
+            if version == &committed.outcome().media_version
+    ));
+    let replacement = Some(Target {
+        invite_id: 931,
+        job_id: storage_failure::JOB,
+    });
+    let unconfirmed = Box::pin(upload(&ctx, &request, replacement, async |permit, body| {
+        permit.preflight(&mut publication).await?;
+        storage_failure::attempt(observer, upload_writer, body, auth, prepared).await
+    }))
+    .await;
+    assert_eq!(
+        (unconfirmed.status, unconfirmed.body),
+        (503, unavailable().body)
+    );
+    assert!(published().await == prior);
+    let after = handle(&ctx, &library).await;
+    assert_eq!((after.status, after.body), (200, listing.body));
 
     observer
         .execute(
