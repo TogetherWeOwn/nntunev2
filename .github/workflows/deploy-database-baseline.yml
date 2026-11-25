@@ -12,7 +12,7 @@ jobs:
     if: >-
       ${{ github.repository == 'TogetherWeOwn/nntunev2' &&
           github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
-          github.run_attempt == '1' }}
+          github.run_attempt == '1' && vars.DATABASE_BASELINE_CANDIDATE_SHA == github.sha }}
     environment:
       name: staging
       deployment: false
@@ -34,6 +34,7 @@ jobs:
   baseline:
     name: Read the first-launch baseline
     needs: preflight
+    if: github.run_attempt == '1'
     environment: production-db-baseline
     concurrency:
       group: production-db-bootstrap

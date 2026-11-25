@@ -152,7 +152,7 @@ and T0 code reviews are separate from this deployment approval.
    · [Job logs](https://docs.github.com/en/actions/how-tos/monitor-workflows/use-workflow-run-logs)
 4. The Operator records the credential expiry before approval and revokes
    each temporary role after use. Use a bootstrap TTL at most two hours and
-   an independently scoped aggregate reader TTL at most 24 hours. Read back
+   an independently scoped aggregate reader TTL at most 120 seconds. Read back
    that authorization and credential material were removed from the
    Environment and secure custody, that the temporary roles are gone, and
    that their server sessions are closed. A hard kill can skip runner
@@ -236,15 +236,32 @@ attempted creation is uncertain. The caller stops without retry or deletion.
 ### Protected baseline
 
 The [baseline workflow](../.github/workflows/deploy-database-baseline.yml)
-shares setup's lock and protection rules in its own `production-db-baseline` Environment.
-Dispatch the approved main SHA with zero inputs. Set `BASELINE_ENABLED=true`, `BASELINE_SHA`,
-`BASELINE_RUN_ID`, `BASELINE_EXPIRY`, `BASELINE_PLAN_B64`, `BASELINE_PLAN_DIGEST`
-and `BASELINE_READER_PASSWORD` there. Remove them after use and verify reader retirement and session closure.
+shares setup's lock and uses a separate `production-db-baseline` Environment.
+Verify that exact Environment's independent reviewer, self-review and bypass
+settings, and the sole typed `main` branch policy before setting
+`DATABASE_BASELINE_CANDIDATE_SHA` to the approved main SHA. Dispatch from
+`main` with zero inputs. The staging preflight rejects any baseline authorization
+visible outside the protected Environment.
 
-The version 1 plan requires `version`, `host`, `port`, `ca_pem`, `branch_id`, `launch`,
-`database_oid` and `reader_role` only. Bind the verified name and OID to the provider
-branch, primary endpoint and CA. Give the reader only launch CONNECT, schema USAGE
-and direct SELECT on physical relations. Quiesce schema, grants and writes through the read.
+For the first attempt, stage `BASELINE_ENABLED=true`, `BASELINE_SHA`,
+`BASELINE_RUN_ID`, `BASELINE_EXPIRY`, `BASELINE_PLAN_B64`, `BASELINE_PLAN_DIGEST`
+and `BASELINE_READER_PASSWORD` only in `production-db-baseline`. Use the
+pending deployment's run ID, an absolute Unix expiry in seconds, standard
+base64 of the exact UTF-8 JSON plan, and its lowercase hex SHA-256. Check
+the pending deployment and its approval history as for setup. Activate the
+reader just before approving the job, with expiry at most 120 seconds from
+activation and no later than the run authorization. Keep the candidate
+variable unset outside the approved dispatch.
+
+The version 2 plan requires `version`, `host`, `port`, `ca_pem`, `branch_id`,
+`launch`, `database_oid`, `reader_role` and `reader_oid` only. Use JSON
+integers for version, port and both OIDs. Pin the setup readback's database OID
+and the issuance receipt's reader OID. Activation checks that the plan and
+the receipt refer to the same role and match the setup route. The runner
+routes as `reader_role.branch_id` over verified TLS and checks both SQL
+identities and both OIDs before reading any data. Give the reader only launch
+CONNECT, schema USAGE and direct SELECT on physical relations. Quiesce schema,
+grants and writes through the read.
 
 One TLS-verified read-only snapshot checks primary status, identity and rights.
 It scans up to 256 user relations and large objects, and refuses incomplete coverage.
@@ -260,12 +277,24 @@ Reconcile shared ACLs separately if activation refuses. The fixture uses direct 
 physical relations. Only the protected read-only caller may use the credential, since its
 SQL role grants permit reading the underlying rows.
 
-Serialize lifecycle calls and hold schema and grant custody until retirement. On completion
-or failure, fence the reader from maintenance, then drain sessions and revoke launch grants.
-Require the retired result and SQL success. Maintenance retirement also handles readers with
-no remaining grants, including interrupted setup. Wire live calls to protected custody and
-bind the runner to the issued role OID. Remove and read back Environment pins and the 0600
-connection reference on every exit. Reconcile uncertain commits before another attempt.
+Serialize lifecycle calls and hold schema and grant custody until retirement.
+After success, refusal or cancellation, remove the candidate variable, all
+seven Environment secrets and the 0600 connection reference from secure
+custody. The runner holds only the reader credential, closes its own client
+and removes the temporary CA. The separate authorized SQL custodian fences the reader
+from maintenance using the private issuance OID, then retires it on the pinned
+launch database to drain sessions and revoke grants. Require SQL success and
+the fixed retired result, and read back credential removal and role and session
+absence. If activation never granted access, maintenance retirement also
+works, including after interrupted setup.
+
+After cancellation or an uncertain result, verify the job stopped and fence
+the reader even if the launch route is unavailable. Keep the role fenced while
+reconciling its issuance identity, grants, and sessions before completing retirement.
+Use a fresh run, approval and role for another attempt. The disposable fixture
+exercises the routed caller and custodian with synthetic credentials and a
+private temporary connection reference. GitHub secret removal and the live
+custodian readbacks belong to the protected release.
 
 ### Setup role custody and lifecycle
 
