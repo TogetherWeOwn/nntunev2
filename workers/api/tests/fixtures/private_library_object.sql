@@ -7,4 +7,3 @@ JOIN public.storage_object_intents i USING (object_id)
 JOIN public.storage_digest_map_intents m USING (object_id)
 JOIN public.storage_s3_locator_intents l USING (object_id)
 JOIN public.storage_digest_inventory_intents p USING (map_id)
-WHERE w.object_id = $1::text::uuid

@@ -23,8 +23,6 @@ const RECIPIENT: &str = "library-invitee";
 const OTHER_MEMBER: &str = "library-unrelated";
 const JOB: &str = "catalogue-new";
 const MBID: &str = "ab310000-0000-4000-8000-000000000000";
-const ORIGINAL_OBJECT: &str = "76767676-7676-4076-8076-767676767676";
-const REPLACEMENT_OBJECT: &str = "82828282-8282-4082-8082-828282828282";
 
 async fn connect() -> Client {
     connect_fixture(DB).await
@@ -49,16 +47,7 @@ async fn connect_fixture(db: &str) -> Client {
 #[tokio::test]
 async fn publishes_and_admits_only_the_fresh_canonical_track() {
     let mut writer = connect().await;
-    writer
-        .batch_execute(concat!(
-            include_str!("../../src/private_library_schema.sql"),
-            include_str!("private_library_users.sql")
-        ))
-        .await
-        .unwrap();
-    let fixture =
-        publication_fixture::PublicationFixture::load(&writer, ORIGINAL_OBJECT, "new-page-pin")
-            .await;
+    let fixture = publication_fixture::PublicationFixture::load(&writer, JOB).await;
     let source = fixture.source();
     let mut h = harness();
     h.config.private_listening = Some(fixture.policy(ISSUER));
@@ -310,9 +299,7 @@ async fn verify_replacement(
     assert_eq!(original_row["id"], track);
     assert_eq!(original_row["title"], "Fresh synthetic track");
 
-    let replacement =
-        publication_fixture::PublicationFixture::load(writer, REPLACEMENT_OBJECT, "Final%2f+==")
-            .await;
+    let replacement = publication_fixture::PublicationFixture::load_replacement(writer).await;
     let source = replacement.source();
     let mut next = replacement.occurrence(REPLACEMENT_JOB, ISSUER, MBID);
     next.track.title = "Replacement match title";
