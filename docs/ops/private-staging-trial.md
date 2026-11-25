@@ -69,6 +69,8 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    if either prerequisite is missing.
    See [#1816](https://github.com/TogetherWeOwn/nntunev2/pull/1816) and the
    [staging binding instructions](../ops.md#private-stream-staging).
+   For the dedicated PostgreSQL target, see the
+   [Stage C2 Hyperdrive origin connection](#stage-c2-hyperdrive-origin-connection).
 5. **Arm and qualify one synthetic journey (77c).** Follow the
    [private music journey](../../e2e/README.md#private-music-journey-preparation)
    for the fresh owner step-up, recipient invite and prepublished tone B
@@ -318,3 +320,68 @@ result as unconfirmed and use only the reviewed replay path for the same attempt
 If a partial upload has no matching completed publication, stop and hand it to
 77c for reconciliation through the reviewed upload path. The selected-fixture
 retirement path requires a matching completed publication.
+
+## Stage C2 Hyperdrive origin connection
+
+**Setup pending.** The dedicated PostgreSQL trial uses four distinct Hyperdrive
+configs, one each for `UPLOAD`, `AUTH`, `PUBLISH` and `ENROLL`. Each config uses
+the separate PostgreSQL login role assigned by its reviewed caller and scoped
+to the trial database. All four use the same dedicated Tunnel TCP route and
+serving Access service token for transport access. Each requires origin TLS
+`verify-full` with the same dedicated origin CA, uploaded once and referenced by
+all four configs, and query caching disabled.
+[Binding validation](../../.github/scripts/staging_stream_config.py)
+
+In C0, the read-only account preflight, confirm a complete count of **21
+existing Hyperdrive configs or fewer**. That leaves room for all four within
+the Workers Paid limit of 25 configs. At 22 or more, stop before provisioning.
+An incomplete count leaves C0 pending. Also confirm Tunnel and Access capacity
+against the Zero Trust plan and that one eligible account-scoped credential
+covers Tunnel, Access and Hyperdrive writes. Cloudflare documents the serving
+features individually. Their use together on this origin still needs hosted
+evidence.
+[Tunnel and Access](https://developers.cloudflare.com/hyperdrive/configuration/connect-to-private-database/)
+· [Origin TLS](https://developers.cloudflare.com/hyperdrive/configuration/tls-ssl-certificates-for-hyperdrive/)
+· [Cache settings](https://developers.cloudflare.com/hyperdrive/concepts/query-caching/#disable-caching)
+
+C1 provisioning waits for completed C0, a passing disposable rehearsal from
+the merged source and the staging writer handoff after storage qualification.
+C2 verifies the actual serving connections after authorized provisioning.
+Collect both readbacks independently for each of the four bindings, using its
+own `<hyperdrive-config-id>`. Keep each config unchanged across its readback
+and Worker query.
+
+1. From the [Hyperdrive config GET](https://developers.cloudflare.com/api/resources/hyperdrive/subresources/configs/methods/get/),
+   match the returned ID, `origin.host` and `origin.access_client_id` to the
+   reviewed config, Tunnel hostname and dedicated serving Access client.
+   Require `mtls.sslmode=verify-full` and match `mtls.ca_certificate_id` to the
+   protected upload record for the dedicated origin CA and its pinned
+   fingerprint. The Access origin variant uses the Tunnel's configured TCP
+   destination port. In the same protected context, run
+   [`workers/api/check_hyperdrive_cache.sh`](../../workers/api/check_hyperdrive_cache.sh)
+   with `--config-id <hyperdrive-config-id>` and require an executed pass for
+   `caching.disabled=true`. Leave `--allow-skip` off. This script checks cache
+   metadata only. Keep raw provider responses and script output in protected
+   custody.
+2. Record the reviewed commit, protected run and exact check reference, and
+   serving Worker route and version. Read back that version's binding to the
+   same config ID. Reuse a protected Worker connection check when its result
+   shows a successful read-only query through that binding. Tie the origin
+   connection to the settings above with evidence of its establishment under
+   those settings or the protected C1 record showing the config has used them
+   since creation. Query caching is disabled while origin pooling remains
+   active, including across new Worker-side connections.
+
+The checked-in Worker verifies these bindings in the upload flow, which can
+write. The exact protected check that can supply a read-only result for each
+binding is still pending. [Worker upload flow](../../workers/api/src/handlers/private_trial/worker.rs)
+
+Record one independently verified result per binding in the protected C2
+handoff. Include evidence references and match or pass outcomes. Keep
+credentials, connection strings and raw errors out of the record. A missing
+config field, binding readback or qualifying Worker result on any of the four
+paths leaves setup pending for the whole lane. Keep the trial disarmed. If the
+required TLS combination is confirmed unavailable or a cache check fails,
+stop and report the affected binding to Engineering. Retain the `verify-full`
+requirement. Use these serving results in the C2 comparison of operator and
+serving database identities.
