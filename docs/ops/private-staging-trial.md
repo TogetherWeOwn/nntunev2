@@ -138,9 +138,9 @@ custody. Confirm the database is distinct from shared staging. From the
 reviewed checkout, load `ISOLATED_TRIAL_TARGET` using the shape in step 2,
 with planned reader and writer logins, and load just the candidate's owner and
 executor URLs as `PRIVATE_TRIAL_OWNER_URL` and `PRIVATE_TRIAL_EXECUTOR_URL` from
-secure custody. Use a private operator host with Python 3 and `psql` on `PATH`
-and a readable system CA bundle at `/etc/ssl/certs/ca-certificates.crt`. Run
-the opt-in readback from that session:
+secure custody. Use a private operator host with Python 3.11 or later, `psql`
+on `PATH`, and a readable system CA bundle at
+`/etc/ssl/certs/ca-certificates.crt`. Run the opt-in readback from that session:
 
 ```sh
 python3 -E -s .github/scripts/staging_trial_role_lifecycle.py check-catalog --isolated
