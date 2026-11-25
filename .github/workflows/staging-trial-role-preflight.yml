@@ -1,0 +1,31 @@
+name: staging-trial-role-preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migrations-staging-apply
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  preflight:
+    if: ${{ github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: staging
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check staging trial role isolation before application grants
+        env:
+          PLANETSCALE_MIGRATOR_URL_STAGING: ${{ secrets.PLANETSCALE_MIGRATOR_URL_STAGING }}
+          PRIVATE_TRIAL_ROLE_PREFLIGHT_SCOPE: ${{ secrets.PRIVATE_TRIAL_ROLE_PREFLIGHT_SCOPE }}
+        run: python3 -E -s .github/scripts/staging_trial_role_preflight.py

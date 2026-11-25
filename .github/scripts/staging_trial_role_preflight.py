@@ -1,0 +1,135 @@
+"""Qualify two newly issued staging trial logins before issuing app grants."""
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+from staging_apply import SECRET_ENV, StagingApplyError, evidence_child_env, load_entries
+from staging_trial_schema import BASELINE, ROLE_RE
+
+
+DATABASE = "nntunev2_staging"
+SCOPE_ENV = "PRIVATE_TRIAL_ROLE_PREFLIGHT_SCOPE"
+LOGIN_RE = re.compile(r"[A-Za-z0-9_-]{1,63}(?:\.[A-Za-z0-9_-]{1,63})?")
+
+
+def oid(value, *, optional=False):
+    return type(value) is int and (0 if optional else 1) <= value < 2**32
+
+
+def parse_scope(raw):
+    if len(raw) > 1024:
+        raise ValueError
+    scope = json.loads(raw)
+    if not isinstance(scope, dict) or scope.keys() != {"database_oid", "issuer_oid", "reader", "writer"}:
+        raise ValueError
+    reader, writer = scope["reader"], scope["writer"]
+    if (not oid(scope["database_oid"]) or not oid(scope["issuer_oid"], optional=True)
+            or any(not isinstance(role, list) or len(role) != 2
+                   or not isinstance(role[0], str) or not ROLE_RE.fullmatch(role[0])
+                   or role[0].lower() == "public" or not oid(role[1]) for role in (reader, writer))
+            or reader[0] == writer[0] or len({scope["issuer_oid"], reader[1], writer[1]}) != 3):
+        raise ValueError
+    return scope
+
+
+def observe(child, scope, digest):
+    # PlanetScale can append a provider routing suffix to the libpq login.
+    login = child["PGUSER"]
+    if not LOGIN_RE.fullmatch(login) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError
+    observer = login.partition(".")[0]
+    if observer in (scope["reader"][0], scope["writer"][0]):
+        raise ValueError
+    reader, writer = scope["reader"], scope["writer"]
+    # All interpolated values are validated identifiers, integers or digests.
+    # Check identity before accessing baseline or privilege catalogs.
+    sql = rf"""BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL search_path = pg_catalog;
+SELECT current_database() = '{DATABASE}'
+   AND session_user = '{observer}' AND current_user = session_user
+   AND EXISTS (SELECT FROM pg_database WHERE datname = current_database()
+               AND oid = {scope['database_oid']}) AS correct_target
+\gset
+\if :correct_target
+SELECT count(*) = 1 AND COALESCE(bool_and(sha256 = '{digest}'), false) AS correct_baseline
+  FROM public.schema_migrations WHERE file = '{BASELINE}'
+\gset
+\if :correct_baseline
+WITH requested(rolname, oid) AS (VALUES ('{reader[0]}', {reader[1]}::oid), ('{writer[0]}', {writer[1]}::oid)),
+roles AS (SELECT r.* FROM pg_roles r JOIN requested q ON q.rolname = r.rolname AND q.oid = r.oid),
+app_schemas AS (SELECT oid FROM pg_namespace WHERE nspname NOT LIKE 'pg\_%' AND nspname <> 'information_schema')
+SELECT count(*) = 2,
+       COALESCE(bool_and(rolcanlogin AND NOT (rolsuper OR rolcreaterole OR rolcreatedb OR
+           rolinherit OR rolreplication OR rolbypassrls)), false),
+       NOT EXISTS (SELECT FROM pg_auth_members m
+          WHERE m.member IN (SELECT oid FROM roles)
+             OR (m.roleid IN (SELECT oid FROM roles) AND NOT (
+                  m.member = {scope['issuer_oid']} AND m.admin_option
+                  AND NOT (m.inherit_option OR m.set_option)
+                  AND EXISTS (SELECT FROM pg_roles i WHERE i.oid = m.member AND i.rolcreaterole)))),
+       COALESCE(bool_and(has_database_privilege(roles.oid, current_database(), 'CONNECT')
+           AND NOT has_database_privilege(roles.oid, current_database(), 'CREATE,TEMPORARY')
+           AND NOT has_database_privilege(roles.oid, current_database(), 'CONNECT WITH GRANT OPTION')
+           AND has_schema_privilege(roles.oid, 'public', 'USAGE')
+           AND NOT has_schema_privilege(roles.oid, 'public', 'USAGE WITH GRANT OPTION')
+           AND EXISTS (SELECT FROM pg_database d CROSS JOIN LATERAL aclexplode(d.datacl) a
+                WHERE d.datname = current_database() AND a.grantee = roles.oid AND a.privilege_type = 'CONNECT')), false),
+       NOT EXISTS (SELECT FROM roles CROSS JOIN pg_database d
+          WHERE d.datallowconn AND NOT d.datistemplate AND d.datname <> current_database()
+            AND has_database_privilege(roles.oid, d.oid, 'CONNECT')),
+       NOT EXISTS (SELECT FROM pg_shdepend d JOIN roles ON roles.oid = d.refobjid
+          WHERE d.refclassid = 'pg_authid'::regclass AND d.deptype = 'o'),
+       NOT EXISTS (SELECT FROM roles CROSS JOIN app_schemas s
+          WHERE has_schema_privilege(roles.oid, s.oid, 'CREATE')),
+       NOT EXISTS (SELECT FROM roles CROSS JOIN pg_class c JOIN app_schemas s ON s.oid = c.relnamespace
+          WHERE CASE
+              WHEN c.relkind = 'S' THEN has_sequence_privilege(roles.oid, c.oid, 'USAGE,SELECT,UPDATE')
+              WHEN c.relkind IN ('r', 'p', 'v', 'm', 'f') THEN
+                  has_any_column_privilege(roles.oid, c.oid, 'SELECT,INSERT,UPDATE,REFERENCES') OR
+                  has_table_privilege(roles.oid, c.oid, 'DELETE,TRUNCATE,TRIGGER,MAINTAIN')
+              ELSE false END),
+       NOT EXISTS (SELECT FROM roles CROSS JOIN pg_proc p JOIN app_schemas s ON s.oid = p.pronamespace
+          WHERE p.prosecdef AND has_schema_privilege(roles.oid, s.oid, 'USAGE')
+            AND has_function_privilege(roles.oid, p.oid, 'EXECUTE'))
+  FROM roles;
+\endif
+\endif
+COMMIT;
+"""
+    result = subprocess.run(
+        ["psql", "--no-psqlrc", "--no-password", "--quiet", "--tuples-only", "--no-align",
+         "--set", "ON_ERROR_STOP=1"], input=sql, text=True, capture_output=True, timeout=60, env=child)
+    if result.returncode or not re.fullmatch(r"[tf](?:\|[tf]){8}\n", result.stdout):
+        raise StagingApplyError("staging target, baseline or catalog read could not be verified")
+    checks = ("issued identities", "login attributes", "role membership", "staging access", "database isolation",
+              "object ownership", "schema creation", "relation and sequence access", "privileged routines")
+    return dict(zip(checks, (value == "t" for value in result.stdout.strip().split("|")), strict=True))
+
+
+def main():
+    try:
+        scope = parse_scope(os.environ.get(SCOPE_ENV, ""))
+        child = evidence_child_env(os.environ[SECRET_ENV], DATABASE)
+        if not child["PGPASSWORD"]:
+            raise ValueError
+        child.update(PGGSSENCMODE="disable", PGPASSFILE="/dev/null")
+        manifest_root = Path(__file__).resolve().parents[2]
+        baseline, = (entry for entry in load_entries(manifest_root)
+                     if entry["file"] == BASELINE and entry["target"] == "app")
+        verdicts = observe(child, scope, baseline["sha256"])
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+            print("### Staging trial roles before application grants\n", file=summary)
+            for check, passed in verdicts.items():
+                print(f"- {check} — {'pass' if passed else 'refused'}", file=summary)
+    except (KeyError, ValueError, OSError, subprocess.TimeoutExpired, StagingApplyError):
+        print("Trial role preflight refused; scope or staging catalog could not be verified.", file=sys.stderr)
+        return 1
+    return 0 if all(verdicts.values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
