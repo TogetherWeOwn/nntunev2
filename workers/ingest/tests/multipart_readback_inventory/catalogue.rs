@@ -174,8 +174,7 @@ pub(super) async fn exercise(
     refuse(&mut tx, &cross_scope, &foreign).await;
     assert_eq!(stage(&mut tx, &next_match, &new).await.unwrap(), track_id);
     refuse(&mut tx, &first_match, &old).await;
-    tx.commit().await.unwrap();
-    operator_source::refuse_replaced(writer, first, &track_id).await;
+    operator_source::refresh_during_replacement(contender, tx, first, &track_id).await;
 
     let mut tx = writer.transaction().await.unwrap();
     let second_match = occurrence("catalogue-new", object, 2);
