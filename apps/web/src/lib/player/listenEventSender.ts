@@ -107,12 +107,19 @@ export function createListenEventSender({ owner, canRecord, grantForStart, fetch
 				if (!result) return false;
 				const { response, requestSignal } = result;
 				if (response?.status === 200 && allowed(requestSignal)) {
-					const data = await readCappedJson(response) as { ok?: unknown } | null;
-					return data?.ok === true && allowed(requestSignal) && isCurrent();
+					try {
+						const data = await readCappedJson(response) as { ok?: unknown } | null;
+						if (!requestSignal.aborted) return data?.ok === true && allowed(requestSignal) && isCurrent();
+					} catch (error) {
+						// A broken response stream leaves the write outcome unknown. The
+						// receiver accepts identical replays. Malformed JSON stays final.
+						if (!(error instanceof TypeError) && !requestSignal.aborted) return false;
+					}
+				} else {
+					void response?.body?.cancel().catch(() => undefined);
+					if (response && response.status !== 200 && !isTransient(response.status)) return false;
 				}
-				void response?.body?.cancel().catch(() => undefined);
-				if (response && !isTransient(response.status)) return false;
-				if (open.aborted || attempt >= RETRY_DELAYS_MS.length) return false;
+				if (!allowed(open) || !isCurrent() || attempt >= RETRY_DELAYS_MS.length) return false;
 				await delay(Math.max(RETRY_DELAYS_MS[attempt], response ? retryAfterMs(response) : 0), open);
 				if (open.aborted) return false;
 			}

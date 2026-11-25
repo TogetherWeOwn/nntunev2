@@ -119,6 +119,24 @@ it('bounds transient retries and honors a capped Retry-After', async () => {
 	expect(f.bodies()).toEqual(Array(3).fill({ ...start, context }));
 });
 
+it('replays a start with an interrupted acknowledgement before sending its terminal', async () => {
+	vi.useFakeTimers();
+	const interrupted = new Response(new ReadableStream({
+		start: (controller) => controller.enqueue(new TextEncoder().encode('{"ok":')),
+		pull: (controller) => controller.error(new TypeError('connection interrupted'))
+	}));
+	const fetchFn = contextFetch().mockResolvedValueOnce(interrupted).mockImplementation(async () => ack());
+	const f = fixture(fetchFn);
+	await f.sender.ready;
+	await f.openGrant();
+	f.sender.send(start);
+	f.sender.send(complete);
+	await vi.advanceTimersByTimeAsync(499);
+	expect(f.bodies()).toEqual([{ ...start, context }]);
+	await vi.advanceTimersByTimeAsync(1);
+	expect(f.bodies()).toEqual([{ ...start, context }, { ...start, context }, { ...complete, context }]);
+});
+
 it('aborts in-flight account work and disregards a late acknowledgement', async () => {
 	const pending = Promise.withResolvers<Response>();
 	const fetchFn = contextFetch().mockImplementationOnce(() => pending.promise);
