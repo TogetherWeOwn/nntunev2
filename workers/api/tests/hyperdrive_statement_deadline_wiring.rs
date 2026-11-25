@@ -486,16 +486,20 @@ fn private_trial_ingest_statements_run_unnamed() {
     ] {
         let source: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
         for named in [
-            ".prepare(",
-            ".prepare_typed(",
-            ".query(",
-            ".query_one(",
-            ".query_opt(",
-            ".query_raw(",
-            ".execute(",
-            ".execute_raw(",
+            ".prepare",
+            ".prepare_typed",
+            ".query",
+            ".query_one",
+            ".query_opt",
+            ".query_raw",
+            ".execute",
+            ".execute_raw",
         ] {
-            assert!(!source.contains(named), "{module} must not use {named}");
+            let called = source.match_indices(named).any(|(start, _)| {
+                let suffix = &source[start + named.len()..];
+                suffix.starts_with('(') || suffix.starts_with("::<")
+            });
+            assert!(!called, "{module} must not use {named}");
         }
     }
 }
