@@ -276,6 +276,17 @@ async fn verify_replacement(
     companion.track.track_no = 150;
     companion.track.title = "Synthetic companion";
     let mut tx = writer.transaction().await.unwrap();
+    // Give the pre-existing canonical row a duration to preserve across replacement.
+    const STORED_DURATION_MS: i32 = 14_000;
+    assert_eq!(
+        tx.execute(
+            "UPDATE public.tracks SET duration_ms = $2 WHERE id = $1::text::uuid",
+            &[&track, &STORED_DURATION_MS],
+        )
+        .await
+        .unwrap(),
+        1
+    );
     let companion_id = stage(&mut tx, &companion, &original.source())
         .await
         .unwrap();
@@ -298,6 +309,7 @@ async fn verify_replacement(
     assert_eq!(companion_row["id"], companion_id);
     assert_eq!(original_row["id"], track);
     assert_eq!(original_row["title"], "Fresh synthetic track");
+    assert_eq!(original_row["duration_ms"], STORED_DURATION_MS);
 
     let replacement = publication_fixture::PublicationFixture::load_replacement(writer).await;
     let source = replacement.source();
