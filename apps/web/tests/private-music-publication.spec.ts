@@ -2,13 +2,15 @@ import { fileURLToPath } from 'node:url';
 import { expect, test as base } from '@playwright/test';
 import { preview } from 'vite';
 import { assertCuratedLibrary, PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
-import { freshTrialPublication, privateStagingAudio, PRIVATE_TRIAL_UPLOAD, SESSION_COOKIE } from '../../../e2e/helpers/private-staging-fixture.js';
+import { freshTrialPublication, privateStagingAudio, PRIVATE_TRIAL_UPLOAD } from '../../../e2e/helpers/private-staging-fixture.js';
 import { seekProofFailure, seekViaPlayerUi, waitForPaused } from '../../../e2e/helpers/player-ui.js';
 
 const uploadedId = '00000000-0000-4000-8000-000000000001';
 const companionId = '00000000-0000-4000-8000-000000000002';
 const binding = 'A'.repeat(43);
 const playId = '00000000-0000-4000-8000-000000000003';
+// Loopback HTTP uses a fixture-only cookie. The staged runner sends the real cookie over HTTPS.
+const fixtureCookie = 'private_music_fixture_session';
 
 const test = base.extend<{ origin: string }>({
 	origin: async ({}, use) => {
@@ -41,7 +43,7 @@ test('fresh private publication reaches the invited Library and plays under its 
 	const refresh = page.getByRole('button', { name: PRIVATE_MUSIC.library.refresh, exact: true });
 	const ids = () => rows.evaluateAll((items) => items.map((row) => row.getAttribute('data-id')!));
 	const row = (id: string) => rows.and(page.locator(`[data-id="${id}"]`));
-	const listener = `${SESSION_COOKIE}=synthetic-listener`;
+	const listener = `${fixtureCookie}=synthetic-listener`;
 	let publication: { trackId: string; sha256: string } | undefined;
 	let revoked = false;
 	let playbackSession: string | undefined;
@@ -92,7 +94,7 @@ test('fresh private publication reaches the invited Library and plays under its 
 	await page.goto(`${origin}${PRIVATE_MUSIC.library.path}`);
 	expect((await anonymous).status()).toBe(401);
 	await expect(rows).toHaveCount(0);
-	await context.addCookies([{ name: SESSION_COOKIE, value: 'synthetic-listener', url: origin, httpOnly: true, secure: true }]);
+	await context.addCookies([{ name: fixtureCookie, value: 'synthetic-listener', url: origin, httpOnly: true }]);
 	await page.reload();
 	await expect(row(companionId)).toBeVisible();
 	const before = await ids();
@@ -101,10 +103,10 @@ test('fresh private publication reaches the invited Library and plays under its 
 	// The browser keeps the invited session. A separate request uses the owner cookie.
 	const owner = await browser.newContext({ serviceWorkers: 'block' });
 	try {
-		await owner.addCookies([{ name: SESSION_COOKIE, value: 'synthetic-owner', url: origin, httpOnly: true, secure: true }]);
+		await owner.addCookies([{ name: fixtureCookie, value: 'synthetic-owner', url: origin, httpOnly: true }]);
 		await owner.route(`${origin}${PRIVATE_TRIAL_UPLOAD}`, async (route) => {
 			const call = route.request();
-			if (call.method() !== 'POST' || await call.headerValue('cookie') !== `${SESSION_COOKIE}=synthetic-owner` ||
+			if (call.method() !== 'POST' || await call.headerValue('cookie') !== `${fixtureCookie}=synthetic-owner` ||
 				await call.headerValue('origin') !== origin || await call.headerValue('authorization')) return route.fulfill({ status: 404 });
 			if (!call.postDataBuffer()?.equals(upload.body)) return route.fulfill({ status: 400 });
 			publication = { trackId: uploadedId, sha256: upload.sha256 };

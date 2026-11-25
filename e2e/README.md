@@ -230,8 +230,8 @@ existing bound roots.
 The `post-deploy-private-music` job is an explicit staging opt-in in the
 same workflow and concurrency group as the staging deploy. Keep
 the repository variable `PRIVATE_MUSIC_STAGING_JOURNEY` unset until the
-protected upload schema, dedicated versioned S3 path, MusicBrainz mirror
-and serving bindings are qualified. Prepublish the `tone-b.flac` companion
+protected upload route and schema, dedicated versioned S3 path, MusicBrainz
+mirror and serving bindings are qualified. Prepublish the `tone-b.flac` companion
 from the original [14-second FLAC fixtures](../fixtures/synthetic-flac/private-staging/manifest.json)
 and retain the version pins separately. Protected fixture setup admits that
 companion to the exact recipient after invite redemption. The browser waits
@@ -239,16 +239,18 @@ up to 60 seconds for that admission before sending tone A.
 Set the staging Environment secret `PRIVATE_MUSIC_STAGE_FIXTURE` with the
 unredeemed `example.test` recipient `email`, its `inviteCode`, the cohort's
 `expiresAt` in Unix seconds, the `companion` receipt `{ sha256, trackId }`
-for tone B, and the fresh stepped-up owner's cookie value as `ownerSession`.
-Use a dedicated owner session for the run. The upload must reach the Worker
-within ten minutes of step-up.
+for tone B, and the dedicated owner's stepped-up cookie value as `ownerSession`.
+Refresh `ownerSession` near the end of the Web, API and Stream deploys, before
+the private qualification job starts and reads the Environment secret. Allow
+time for Chromium setup, invite redemption and companion admission within
+the ten minutes from step-up to upload.
 Configure `PRIVATE_LISTENING_COHORT` for this recipient
 using the [private listening runbook](../docs/ops.md#private-listening-qualification).
 Arrange for the job to start within eight minutes of the cutoff. The armed
 push runs the private journey instead of the ordinary journey, so it cannot
 provide the ordinary journey gate required for production admission. Revoke
-the dedicated owner session, remove the arm, cohort setting and single-use
-fixture secret, then verify the
+the dedicated owner session by signing out of that session. Remove the arm,
+cohort setting and single-use fixture secret, then verify the
 [Stream disable deploy](../docs/ops.md#private-stream-staging).
 
 The runner checks both serving build identities before and after the journey,
