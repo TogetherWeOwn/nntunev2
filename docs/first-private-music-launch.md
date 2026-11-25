@@ -149,7 +149,7 @@ operator checks that fallback before dispatch.
 
 | Record | Example entry |
 | --- | --- |
-| Staging rollback rehearsal | **Passed.** Push-triggered staging `deploy.yml` run `<staging-run>` had `staging-web` conclude `success` on `<last-good-staging-sha>`. **Re-run all jobs** produced attempt `<attempt>` with `staging-web` at `success`, passing health and the matching SHA from staging `/api/build`. |
+| Staging rollback rehearsal | **Passed.** Push-triggered staging `deploy.yml` run `<staging-run>` had `staging-web` conclude `success` on `<last-good-staging-sha>`. [**Re-run all jobs**](ops.md#staging-deploy-lock-cutover-and-rollback) produced attempt `<attempt>` with `staging-web` at `success`, passing health and the matching SHA from staging `/api/build`. |
 | Launch maintenance target | The maintenance seed record pins production Worker ID `<worker-id>` (`nntune-web`), `<maintenance-deployment>` and `<maintenance-version>` at 100%. |
 | Launch serving readback | **Missing.** The current launch allocation is unavailable. In the disagreement variant, the latest launch deployment reports 100% on `<other-launch-version>`. |
 | Handoff | In either variant, retain the staging pass, leave verification of the maintenance fallback open and keep the release decision `Pending`. |
