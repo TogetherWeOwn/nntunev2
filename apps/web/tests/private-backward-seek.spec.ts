@@ -52,7 +52,8 @@ test('invited playback continues after a backward seek across the first chunk bo
 	});
 
 	const duration = track.duration_ms / 1000;
-	const { fraction } = await seekViaPlayerUi(page, audio, 0.2);
+	const { fraction, surface } = await seekViaPlayerUi(page, audio, 0.2);
+	expect(surface, 'The backward seek should use the custom slider').toBe('custom');
 	await expect.poll(() => native.evaluate((node: HTMLAudioElement, { observed, boundary }) =>
 		observed.landed !== null && !node.paused && !node.seeking &&
 		node.currentTime > observed.landed.time + 0.2 && node.currentTime < boundary,
