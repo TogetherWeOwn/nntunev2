@@ -1,0 +1,12 @@
+{
+  "kind": "selfhost-pg18",
+  "system_identifier": 0,
+  "database_oid": 0,
+  "ca_sha256": "<dedicated CA DER SHA-256>",
+  "server_sha256": "<server leaf DER SHA-256>",
+  "routes": {
+    "direct": ["nntune-trial-db-op.nntune.com", 5432],
+    "routed": ["nntune-trial-db-hd.nntune.com", 5432]
+  },
+  "role_oids": {"owner": 0, "executor": 0, "reader": null, "writer": null}
+}

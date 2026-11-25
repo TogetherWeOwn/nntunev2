@@ -1,0 +1,62 @@
+services:
+  nntune-trial-pg:
+    image: postgres@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
+    user: "${TRIAL_PG_UID:-24186}:${TRIAL_PG_GID:-24186}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    cpus: 2
+    mem_limit: 2g
+    pids_limit: 64
+    shm_size: 128m
+    tmpfs:
+      - /tmp:mode=1777
+      - /var/run/postgresql:mode=3775,uid=${TRIAL_PG_UID:-24186},gid=${TRIAL_PG_GID:-24186}
+    environment:
+      POSTGRES_USER: nntune_trial_bootstrap
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD_FILE: /trial/init-password
+      POSTGRES_INITDB_ARGS: --data-checksums --locale=C.UTF-8 --auth-local=peer --auth-host=scram-sha-256
+      PGHOST: /var/run/postgresql
+    command: [postgres, -c, config_file=/trial/config/postgresql.conf]
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, nntune_trial_owner]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - type: bind
+        source: ${TRIAL_PG_DIR:?set the dedicated PostgreSQL directory}/config
+        target: /trial/config
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${TRIAL_PG_DIR}/tls
+        target: /trial/tls
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${TRIAL_PG_DIR}/init-password
+        target: /trial/init-password
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${TRIAL_PG_DIR}/data
+        target: /var/lib/postgresql
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${TRIAL_PG_DIR}/passwd
+        target: /etc/passwd
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./bootstrap.sql
+        target: /docker-entrypoint-initdb.d/00-bootstrap.sql
+        read_only: true
+        bind: {create_host_path: false}
+    networks:
+      trial:
+        aliases: [op.trial.invalid, routed.trial.invalid]
+networks:
+  trial:
+    internal: true

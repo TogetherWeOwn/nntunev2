@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-from unittest.mock import patch
+from unittest.mock import call, patch
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -290,12 +290,24 @@ def run_fixture(root):
     check_review(report, summary, run, review_command, env)
     policy.write_bytes(reviewed_policy)
 
+    receipt = root / "staging-admission.json"
+    closing = root / "build-identity-final.json"
     with patch.dict(os.environ, env, clear=True), patch.object(evidence, "provider") as provider:
         reader = provider.return_value
         reader.return_value = provider_response(DEPLOYMENT)
         for phase in admission.IDENTITY_PHASES:
             write(root, f"{phase}.json", json.dumps(evidence.main("observe")).encode())
         assert reader.call_count == 6
+        matching_closing = closing.read_bytes()
+
+        # An earlier attempt can observe the same build and serving deployment IDs.
+        earlier_attempt = {"GITHUB_RUN_ATTEMPT": "1"}
+        for lane in evidence.LANES:
+            key = f"{lane.upper()}_PIN"
+            earlier_attempt[key] = json.dumps(json.loads(env[key]) | {"run_attempt": "1"})
+        with patch.dict(os.environ, earlier_attempt):
+            earlier_closing = evidence.main("observe")
+
         reader.return_value = provider_response(VERSION)
         require_refusal(lambda: evidence.main("observe"), "drifted provider deployment accepted")
 
@@ -305,14 +317,31 @@ def run_fixture(root):
         with patch.dict(os.environ, {"API_PIN": json.dumps(api_pin)}):
             drifted_closing = evidence.main("observe")
 
-    receipt = root / "staging-admission.json"
-    closing = root / "build-identity-final.json"
-    same_build_closing = closing.read_bytes()
+        # The closing observation redirects its output before reading the serving deployments.
+        reader.reset_mock()
+        reader.side_effect = [provider_response(DEPLOYMENT), {"deployments": []}]
+        with closing.open("w") as output:
+            require_refusal(lambda: json.dump(evidence.main("observe"), output),
+                            "closing observation accepted a Worker without a serving deployment")
+        assert reader.call_args_list == [call("nntune-web-staging"), call("nntune-api-staging")]
+
+    assert closing.read_bytes() == b"", "failed observation wrote partial deployment evidence"
+    original_report = report.read_bytes()
+    result = run(command)
+    assert result.returncode != 0 and not receipt.exists(), "incomplete readback qualified the candidate"
+    assert result.stderr == b"Private staging deployment evidence unavailable or mismatched.\n"
+    assert report.read_bytes() == original_report, "incomplete readback changed the report"
+
+    closing.write_text(json.dumps(earlier_closing))
+    result = run(command)
+    assert result.returncode != 0, "receipt step accepted a closing observation from an earlier attempt"
+    assert not receipt.exists(), "receipt step wrote a receipt using evidence from different attempts"
+
     closing.write_text(json.dumps(drifted_closing))
     result = run(command)
     assert result.returncode != 0, "receipt step accepted a changed serving deployment"
     assert not receipt.exists(), "receipt step wrote a receipt after serving deployment drift"
-    closing.write_bytes(same_build_closing)
+    closing.write_bytes(matching_closing)
 
     mismatched = json.loads(env["API_PIN"]) | {"run_attempt": "1"}
     for bad_pins in ({"WEB_PIN": ""}, {"API_PIN": json.dumps(mismatched)}):

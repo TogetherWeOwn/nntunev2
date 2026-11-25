@@ -48,6 +48,17 @@ class ProductionObservationTests(unittest.TestCase):
                                  "evidence": "#evidence-readback-35"})
         validate_observation(pins, watch)
 
+    def test_healthy_samples_stop_short_of_declared_close(self):
+        pins, watch = fixture()
+        # Moving only the final readback earlier keeps the count and valid cadence.
+        closing_sample = watch["samples"][-1]
+        closing_sample["observed_at"] = "2026-10-01T12:29:59.999999Z"
+        with self.assertRaisesRegex(Refused, "^closing readback is missing$"):
+            validate_observation(pins, watch)
+
+        closing_sample["observed_at"] = watch["closed_at"]
+        validate_observation(pins, watch)
+
     def test_start_requires_successful_pinned_final_smoke(self):
         for field, value in (("outcome", "failure"), ("sha", "c" * 40), ("run_attempt", "1"),
                              ("evidence", "https://github.com/TogetherWeOwn/nntunev2/actions/runs/999/job/456"),
@@ -153,6 +164,22 @@ class ProductionObservationTests(unittest.TestCase):
             check('{"schema": 1, "schema": 1}', 1)
             check("{ malformed synthetic-private-text", 1)
             check(" " * (256 * 1024 + 1), 1)
+
+    def test_cli_refuses_explicitly_pending_readback(self):
+        pins, watch = fixture()
+        watch["samples"][3]["readbacks"]["stream_errors"] = "pending"
+        script = Path(__file__).with_name("production_observation.py")
+        with TemporaryDirectory(prefix="nntune-observation-") as directory:
+            pin_file = Path(directory) / "pins.json"
+            watch_file = Path(directory) / "watch.json"
+            pin_file.write_text(json.dumps(pins))
+            watch_file.write_text(json.dumps(watch))
+            result = subprocess.run([sys.executable, "-B", script, pin_file, watch_file],
+                                    capture_output=True, text=True, check=False)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "Production observation refused: readback failed, missing or unusable\n")
 
 
 if __name__ == "__main__":

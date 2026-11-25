@@ -7,7 +7,8 @@ const fromWeb = createRequire(resolve(__dirname, '../../apps/web/package.json'))
 const fromWrangler = createRequire(fromWeb.resolve('wrangler/package.json'));
 const { Miniflare, Log, LogLevel, convertV4MiniflareOptions } = fromWrangler('miniflare');
 
-async function invoke(bundle, env, outboundService) {
+async function invoke(bundlePath, env, outboundService) {
+  const bundle = resolve(bundlePath);
   const bindings = Object.fromEntries([
     'CLEANUP_STAGE', 'CLEANUP_SCOPE', 'CLEANUP_SCOPE_SHA256', 'CLEANUP_APPROVAL',
     'CLEANUP_S3', 'CLEANUP_DATABASE_URL',
@@ -44,7 +45,7 @@ async function invoke(bundle, env, outboundService) {
 module.exports = { invoke };
 
 if (require.main === module) {
-  invoke(resolve(process.argv[2]), process.env).catch(() => 'unconfirmed').then((verdict) => {
+  invoke(process.argv[2], process.env).catch(() => 'unconfirmed').then((verdict) => {
     console.log(`Private staging fixture cleanup: ${verdict}`);
     if (verdict !== 'confirmed') process.exitCode = 1;
   });

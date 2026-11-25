@@ -37,7 +37,8 @@ fallback. Keep deployment and release approvals pending in the candidate record
 until their evidence is available.
 [Staging deploy](../.github/workflows/deploy.yml) ·
 [Production preflight](../.github/workflows/deploy-production.yml) ·
-[Staging admission policy](../ci/staging-admission-policy.json)
+[Staging admission policy](../ci/staging-admission-policy.json) ·
+[Cancelled production approval rehearsal](ops.md#offline-rehearsal-for-cancelled-production-approval)
 
 ## Qualify the candidate
 
@@ -95,6 +96,23 @@ until their evidence is available.
    Dispatch only through the supported protected workflow with the existing
    environment and credential custodians. [Production release gates](../CONTRIBUTING.md#production-releases)
 
+### Offline handoff example after a rerun
+
+In this synthetic handoff, `deploy.yml` reruns the same `<sha>` under the same
+`<run-id>`. The run-level artifact listing can contain receipts from both attempts.
+
+| Artifact name | Handoff disposition |
+| --- | --- |
+| `staging-admission-<sha>-<run-id>-1-private-music` | Historical evidence from attempt 1, which the rerun superseded. |
+| `staging-admission-<sha>-<run-id>-2-private-music` | Use for verification when the run and required jobs identify attempt 2 and exactly one artifact has this name. |
+
+If the handoff only identifies the run ID, the attempt records disagree, or
+the selected attempt has no unique matching artifact, record **Staging
+admission** as Pending and **Dispatch readiness** as Blocked. Resolve the
+attempt and artifact from the same protected run before resuming step 3.
+The name selects the artifact for verification. The verifier still checks
+the archive digest and the receipt's own SHA, run ID and attempt.
+
 ## Switch off and verify
 
 Before promotion, name the executor and backup and pin the protected control
@@ -122,6 +140,9 @@ Access writers as required by [protected recovery](ops.md#protected-production-w
    service fenced and verify denial before declaring switch-off complete.
    Preserve the database and snapshot. Record the job, allocation and denial
    readbacks and then retire the temporary release-window controls.
+
+See the [synthetic post-recovery handoff](ops/first-release-recovery-example.md)
+for an example of recording the serving build and the pending release decision.
 
 ## Watch the first 30 minutes
 
@@ -207,6 +228,17 @@ raw diagnostics and connection details out of the record. The
 [offline verifier fixtures](../ci/test_staging_admission.py) contain synthetic
 receipts for rehearsing the staging section only.
 
+Before dispatch, record `<candidate-sha>` under **Candidate** and
+`<private-maintenance-seed-evidence>` under **Protected switch-off**. Leave the
+rollback artifact reference pending until the original rollout uploads
+`production-rollback-intent-<original-rollout-run-id>-1` before shifting traffic.
+Add its private link alongside the seed evidence. Protected recovery uses the
+sealed intent from attempt 1 of that rollout.
+
+After successful final smoke, the [promotion proof](ops.md#production-promotion-publishes-a-calver-release)
+uses the separate `production-promotion-<candidate-sha>-<original-rollout-run-id>-1`
+receipt for release publication.
+
 | Item | Pin or evidence to record |
 | --- | --- |
 | Candidate | Full main SHA, artifact digest(s), exact-head required checks and per-PR review references |
@@ -215,10 +247,15 @@ receipts for rehearsing the staging section only.
 | Staging rollback | Last-good SHA, run/attempt, restore and identity readback |
 | Production baseline | Protected source SHA, run/attempt and job URL, private provider branch and logical DB/OID reference, manifest digest, read time and `empty` verdict, separate no-live-user/data confirmation, writer fence and custodian |
 | Pre-schema snapshot | Private snapshot reference, capture and completion UTC, branch and restore scope, expiry, verification reference and first schema apply boundary |
-| Protected switch-off | Executors and protected controls for Access/invites and API/media, verified maintenance Worker/deployment/version/seed SHA/module digest, sealed intent custody reference, expected denials and grant expiry boundary |
+| Protected switch-off | Executors and protected controls for Access/invites and API/media, private seed evidence for the verified maintenance Worker/deployment/version/seed SHA/module digest, sealed intent custody reference and original rollout artifact link when published, expected denials and grant expiry boundary |
 | Release review and dispatch | Independent reviewer, decision (initially `Pending`, then `APPROVE` or `BLOCK`), UTC and review reference for the pinned SHA and staging attempt, protected workflow and rollout run/attempt, final deployment/version and smoke result |
 | Dispatch readiness | Pending. Record ready or blocked under the [existing qualification steps](#qualify-the-candidate), with a safe reference to the supporting evidence or blocker. |
 | Health watch and recovery | Watcher, backup, UTC start/end, health and error baseline/threshold, readback schedule and results. Actual disposition pending until the [watch](#watch-the-first-30-minutes) or [switch-off](#switch-off-and-verify) has an outcome. Record the watch result when run and whether recovery was invoked. If used, record the trigger and UTC, recovery attempt and outcome, denial and final allocation readbacks. Link the release thread and product log entries. |
+
+When a scheduled readback is still pending during the watch, name the check
+and its scheduled UTC time in the private release handoff. For example, “The
+Stream error threshold readback scheduled for 12:15 UTC is `Pending`. The
+release disposition is `Pending`.”
 
 ### Personal-use exit assessment
 
@@ -249,3 +286,19 @@ Live billing is assessed separately.
 | `unlisted-refused` | Pending | — |
 | `revoked-or-expired-refused` | Pending | — |
 | `video-off` | Pending | — |
+
+### Offline handoff example with a skipped step
+
+In this synthetic rehearsal, eight journey cases have passing observations
+from one attempt. The operator deliberately skips `seek` when the time
+reserved for the manual playback check runs out.
+
+| Handoff item | Synthetic entry |
+| --- | --- |
+| Journey outcome `seek` | Pending |
+| Unresolved issues and applicability | `seek` applies and was deliberately skipped. The manual playback check ran out of time. |
+| Rehearsal verdict | Pending. Remaining step is `seek`. In the next offline rehearsal, pause playback, seek mid-track, resume playback and verify it advances from the sought position. |
+
+The offline admission fixture returns `incomplete` and names `seek` as the
+only incomplete case.
+[Synthetic fixture](../ci/test_staging_admission.py)

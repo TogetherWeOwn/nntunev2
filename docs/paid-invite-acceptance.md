@@ -12,6 +12,12 @@ play refusals with the in-memory store and Stripe transport. The recording
 below verifies hourly dispatch and the browser, provider and database on the
 deployed build.
 
+The API CI case `paid_invite_resumes_interrupted_checkout_before_verified_subscription`
+rehearses a lost Checkout session mark after signup. Signing in again with the
+same passkey recovers the original customer and session. Signed events for an
+unpaid completion and a completion with a mismatched subscription both leave
+playback gated. The fixture stops before invoice reads.
+
 ## Run the protected evidence check
 
 The [runner](../.github/scripts/paid_invite_acceptance.py) is off unless
@@ -88,6 +94,11 @@ customer and a live or mismatched clock response. The API fixture follows
 the selected Checkout Session and subscription from signed Checkout through
 synthetic renewal. The loopback runner fixture rehearses closing readback
 before clock retirement.
+
+The offline cancellation fixture checks the Checkout return destination, then
+verifies that the invited listener stays unsubscribed and playback stays gated.
+After the abandoned session expires in the Stripe fixture, the same listener
+can explicitly open a fresh Checkout Session.
 
 The browser Checkout path does not supply a test clock. Before arming the
 protected trial, still verify in the approved Stripe test account that a
@@ -176,3 +187,18 @@ Exit 1 means collision. Exit 2 means incomplete evidence, including missing targ
 or projections. An inventory mismatch exits 2 with `scope_incomplete` instead.
 Exit 3 gives `disabled` or `refused`. Keep identities, projections, credentials and DB
 diagnostics private. Recheck on drift. Writer privileges and legacy provenance are separate prerequisites.
+
+### Subscription lock privilege
+
+The owned billing transaction takes a `SHARE ROW EXCLUSIVE` lock on
+`public.subscriptions` for stale no-ops as well as writes. For the writer
+grant checked by #1768, column-level `UPDATE` is insufficient.
+
+The [catalog query](../.github/scripts/billing_subscription_lock_privilege.sql)
+checks effective table-level `UPDATE`, including inherited grants. From a
+read-only transaction on the independently pinned database, load the query
+with `psql` using `ON_ERROR_STOP=1` and the explicit `database` and
+`billing_role` variables. Use the billing writer login name from the
+connection configuration and set the transaction's search path to
+`pg_catalog, pg_temp`. Require one true result for this grant and verify the
+remaining billing privileges separately before recording `effective_privileges`.

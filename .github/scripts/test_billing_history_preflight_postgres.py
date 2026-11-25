@@ -49,6 +49,41 @@ def refused(role, connection):
     raise AssertionError("unadmitted comparison returned a report")
 
 
+def exercise_subscription_lock_privilege():
+    check_sql = (SCRIPTS / "billing_subscription_lock_privilege.sql").read_text()
+    verdicts = "\n".join(
+        f"\\set database {database}\n\\set billing_role {role}\n{check_sql}"
+        for database, role in (
+            (DATABASE, "billing_lock_fixture_writer"),
+            (DATABASE, "billing_lock_fixture_incomplete"),
+            (DATABASE, "billing_lock_fixture_missing"),
+            ("wrong_database", "billing_lock_fixture_writer"),
+        )
+    )
+    # Use the migrated table before seeding invoice history. Roll back the
+    # role and grant setup with the fixture transaction.
+    observed = sql(f"""
+        BEGIN;
+        CREATE ROLE billing_lock_fixture_group;
+        CREATE ROLE billing_lock_fixture_writer LOGIN;
+        CREATE ROLE billing_lock_fixture_incomplete LOGIN;
+        GRANT UPDATE ON public.subscriptions TO billing_lock_fixture_group;
+        GRANT billing_lock_fixture_group TO billing_lock_fixture_writer WITH INHERIT TRUE;
+        GRANT billing_lock_fixture_group TO billing_lock_fixture_incomplete WITH INHERIT FALSE;
+        GRANT SELECT, INSERT ON public.subscriptions
+            TO billing_lock_fixture_writer, billing_lock_fixture_incomplete;
+        GRANT UPDATE (status) ON public.subscriptions TO billing_lock_fixture_incomplete;
+        SET TRANSACTION READ ONLY;
+        SET LOCAL search_path = pg_catalog, pg_temp;
+        SET LOCAL ROLE billing_lock_fixture_incomplete;
+        SELECT has_column_privilege(current_user, 'public.subscriptions', 'status', 'UPDATE');
+{verdicts}
+        ROLLBACK;
+    """)
+    assert observed.splitlines() == ["t", "t", "f", "f", "f"], observed
+    print("Subscription lock privilege fixture passed")
+
+
 def exercise_global_invoice_key():
     check(0, exact=1, eligible_hydration=1, fresh=1)
 
@@ -167,6 +202,7 @@ def main():
     try:
         migration_dir = SCRIPTS.parents[1] / "migrations"
         sql("\n".join((migration_dir / name).read_text() for name in MIGRATIONS))
+        exercise_subscription_lock_privilege()
         sql((SCRIPTS.parent / "fixtures/billing_history_preflight.sql").read_text())
         exercise_entrypoint()
         assert sql("SELECT count(*), count(covered_periods) FROM public.paid_invoice_history") == "2|1\n"

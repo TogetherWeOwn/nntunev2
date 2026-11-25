@@ -338,6 +338,23 @@ exercises the routed caller and custodian with synthetic credentials and a
 private temporary connection reference. GitHub secret removal and the live
 custodian readbacks belong to the protected release.
 
+#### Offline rehearsal: stop before baseline capture
+
+Use the placeholder records below for a tabletop exercise. No workflow or
+database connection is needed. Start with completed setup on `fixture001`
+(database OID `41001`) and a private activation plan for reader OID `42001`.
+In the exercise, the reader has been activated for run `101`, attempt `1`.
+Preflight has passed and the baseline job is waiting for Environment approval.
+The release operator calls a stop while the job is still waiting.
+
+| Readback to rehearse | Expected decision |
+| --- | --- |
+| Run `101` is canceled. Its baseline job never started and has no verdict. | Record the stopped attempt and leave the new baseline absent. Keep migration closed even if a prior receipt says `empty`. |
+| The candidate variable, seven baseline Environment secrets and 0600 connection reference are absent. The issuance OID and exact activation plan remain in private SQL custody. | Verify authorization removal. The separate SQL custodian carries out [reader retirement](#reader-role-custody-and-lifecycle) even though the job never started. |
+| Maintenance readback for reader `42001` shows no login and a cleared credential. | Keep the fence committed even if the launch route is unavailable. Keep migration closed while retirement is unresolved. |
+| On the pinned launch database `41001`, retirement commits with `retired`, the grants are revoked, and the role and its sessions are absent. | Record cleanup complete. The canceled attempt still has no baseline. |
+| Run `102`, attempt `1`, is proposed for the same setup target. | Require fresh approval, run-bound authorization and a new reader role. Verify a new baseline for the same database and branch before using it in the existing release handoff. |
+
 ### Setup role custody and lifecycle
 
 The dormant [role SQL](../.github/scripts/database_bootstrap_role.py)
@@ -439,6 +456,9 @@ all times and the same precision for observations and the reviewed schedule.
   kind, restore scope and completion as `kind: ordinary-native`,
   `restore_scope: whole-branch` and `status: succeeded`.
 
+If the provider reports success but omits the capture time, leave snapshot
+evidence pending until you can verify the capture time.
+
 Capture must be at or before completion, and completion at or before
 readback. Read back success before the applicable write, which must occur
 by the reviewed window end. Expiry must be after that end. For
@@ -463,3 +483,23 @@ approved route against the recorded database OID before retrying publication.
 Require a complete saved handoff for the same branch before continuing. The
 disposable CI fixture rehearses both publication failures with local files and
 verifies reader and session removal before checking retry evidence.
+
+#### Retry when a snapshot label is already in use
+
+If a provider response says the snapshot label already exists, keep migration
+closed while you reconcile the prior attempt. Use the provider snapshot
+identifier in the private prior readback to identify that snapshot on the
+approved branch. A label alone leaves identity unresolved. Keep the existing
+snapshot and its retention in place while reconciling. Once the prior snapshot
+is verified, normalize its complete readback and run the same
+`--baseline-handoff` check.
+
+In a synthetic retry on branch `fixture001`, the prior readback identifies
+snapshot `fixture-a` and the response names the existing label
+`fixture-handoff`.
+
+| Evidence in the retry | Expected decision |
+| --- | --- |
+| The response names only the label. | Keep migration closed pending readback. |
+| The same label points to `fixture-b` on the same branch, captured before setup and completed after setup. | Keep migration closed. The readback identifies a different snapshot, and the capture predates setup. |
+| The readback identifies `fixture-a` and confirms a successful capture after setup with the reviewed timing and restore scope. | The offline check accepts the complete evidence. The separate protected release checks still apply. |

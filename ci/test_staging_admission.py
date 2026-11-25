@@ -226,9 +226,11 @@ class World:
                 page("workflow_runs", self.runs),
             f"runs/{RUN_ID}": self.run,
             f"runs/{RUN_ID}/attempts/1/jobs{base}": jobs or page("jobs", self.jobs),
-            f"runs/{RUN_ID}/artifacts{base}": artifacts or page("artifacts", [self.artifact]),
-            f"artifacts/{ARTIFACT_ID}/zip": self.archive,
+            f"runs/{RUN_ID}/artifacts{base}": artifacts or page(
+                "artifacts", [self.artifact] if self.artifact is not None else []),
         }
+        if self.artifact is not None:
+            r[f"artifacts/{ARTIFACT_ID}/zip"] = self.archive
         # Discovery fixtures expose only the bounded queries. The unfiltered
         # lifetime endpoint remains above to demonstrate that it is not needed.
         candidate = [run for run in self.runs if run.get("head_sha") == SHA]
@@ -298,6 +300,19 @@ class PrivateAdmissionTests(Base):
                          "build_sha": SHA, "track_id": PRIVATE_TRACK_ID, "sha256": PRIVATE_AUDIO_SHA})
         self.assertTrue(world.artifact["name"].endswith("-private-music"))
 
+    def test_private_receipt_timing_matches_selected_attempt_job_start(self):
+        world = PrivateWorld()
+        world.receipt["recorded_at"] = iso(-1)
+        world.set_archive()
+        journey = world.jobs[-1]
+
+        journey["started_at"] = world.receipt["identities"]["build-identity"]["observed_at"]
+        self.assertEqual(world.verify()["result"], "satisfied")
+
+        # Keep the same archive and attempt pins with all receipt times before job start.
+        journey["started_at"] = iso(0)
+        self.assertWorldRefused(world, "^journey timing mismatch$")
+
     def test_green_report_cannot_mix_private_track_fragments(self):
         pins = private_pins()
         for proof, field, foreign in (
@@ -337,6 +352,20 @@ class PrivateAdmissionTests(Base):
                                      private_track_sha256=PRIVATE_AUDIO_SHA)
                 self.assertEqual(receipt["result"], "incomplete")
                 self.assertIn("private track evidence", receipt["reasons"][0])
+
+    def test_green_report_requires_private_play_observation(self):
+        report = private_report(private_pins())
+        complete = PrivateWorld(report).receipt
+        self.assertEqual(complete["result"], "satisfied")
+
+        play = report.find("testcase[@name='play']/properties")
+        play.remove(play.find("property[@name='private-play']"))
+
+        incomplete = PrivateWorld(report).receipt
+        self.assertEqual(incomplete["coverage"], complete["coverage"])
+        self.assertEqual(incomplete["result"], "incomplete")
+        self.assertEqual(incomplete["reasons"], ["missing private track evidence"])
+        self.assertNotIn("private_track", incomplete)
 
     def test_private_track_must_match_selected_run_build_and_fixture(self):
         for field, foreign in (("run_id", str(RUN_ID - 1)), ("run_attempt", "2"),
@@ -452,6 +481,36 @@ class PrivateAdmissionTests(Base):
         stream["conclusion"] = "success"
         self.assertWorldRefused(world, "intervening staging deployment")
 
+    def test_same_run_private_rerun_selects_only_the_current_attempt_artifact(self):
+        world = PrivateWorld()
+        prior_artifact = world.artifact
+        routes = world.routes()
+        world.run["run_attempt"] = 2
+        rerun_jobs = [dict(job, run_attempt=2) for job in world.jobs]
+        pins = {lane: dict(pin, run_attempt="2") for lane, pin in private_pins().items()}
+        report = ET.tostring(private_report(pins, run_attempt="2"))
+        world.receipt = sa.produce(make_env(GITHUB_RUN_ATTEMPT="2"), report, world.policy,
+                                   world.contract_bytes, world.manifest, private_pins=pins,
+                                   private_track_sha256=PRIVATE_AUDIO_SHA)
+        world.set_archive()
+        current_artifact = dict(world.artifact, id=ARTIFACT_ID + 1,
+                                name=f"staging-admission-{SHA}-{RUN_ID}-2-private-music")
+        routes[f"runs/{RUN_ID}/attempts/2/jobs?per_page=100&page=1"] = page("jobs", rerun_jobs)
+        routes[f"artifacts/{ARTIFACT_ID + 1}/zip"] = world.archive
+        artifact_listing = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
+
+        routes[artifact_listing] = page("artifacts", [prior_artifact, current_artifact])
+        actions = FakeActions(routes)
+        verified = world.verify_with_actions(actions)
+        self.assertEqual(verified["result"], "satisfied")
+        self.assertEqual(verified["run_attempt"], "2")
+        self.assertNotIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
+
+        routes[artifact_listing] = page("artifacts", [prior_artifact])
+        actions = FakeActions(routes)
+        self.refused("missing or ambiguous attempt-bound receipt", world.verify_with_actions, actions)
+        self.assertFalse(any(call.endswith("/zip") for call in actions.calls))
+
 
 class PolicyTests(Base):
     def assert_installed_policy(self, root):
@@ -519,10 +578,10 @@ class DraftPrivateContractTests(Base):
              "anonymous-refused", "unlisted-refused", "revoked-or-expired-refused", "video-off")
 
     def setUp(self):
-        data = (HERE / "private-music-journey-contract.draft.json").read_bytes()
-        policy = make_policy(data)
-        policy["approvals"][0]["spec_revision"] = sa.parse_json(data)["spec_revision"]
-        self.contract = sa.approved_contract(policy, data)
+        self.contract_bytes = (HERE / "private-music-journey-contract.draft.json").read_bytes()
+        self.policy = make_policy(self.contract_bytes)
+        self.policy["approvals"][0]["spec_revision"] = sa.parse_json(self.contract_bytes)["spec_revision"]
+        self.contract = sa.approved_contract(self.policy, self.contract_bytes)
 
     def private_suite(self):
         suite = private_report(private_pins())
@@ -532,6 +591,11 @@ class DraftPrivateContractTests(Base):
     def coverage(self, report):
         rows = sa.junit_evidence(ET.tostring(report), self.contract)[0]
         return {row["id"]: row["outcome"] for row in rows}
+
+    def produce_receipt(self, report):
+        return sa.produce(make_env(JOURNEY_GATE=""), ET.tostring(report), self.policy,
+                          self.contract_bytes, MANIFEST, private_pins=private_pins(),
+                          private_track_sha256=PRIVATE_AUDIO_SHA)
 
     def raw_playwright_report(self):
         # Playwright 1.65.1 writes the spec filename and outer test title.
@@ -582,6 +646,34 @@ class DraftPrivateContractTests(Base):
                     expected = dict.fromkeys(self.CASES, "passed")
                     expected[name] = "incomplete"
                     self.assertEqual(self.coverage(suite), expected)
+
+    def test_repeated_case_cannot_replace_a_required_case_in_receipt(self):
+        suite = self.private_suite()
+        expected = dict.fromkeys(self.CASES, "passed")
+        receipt = self.produce_receipt(suite)
+        self.assertEqual(receipt["result"], "satisfied")
+        self.assertEqual(receipt["reasons"], [])
+        self.assertEqual({row["id"]: row["outcome"] for row in receipt["coverage"]}, expected)
+
+        # Neither case carries track properties, so only the selector changes.
+        suite.find("testcase[@name='queue']").set("name", "seek")
+        receipt = self.produce_receipt(suite)
+        self.assertEqual(receipt["result"], "incomplete")
+        self.assertEqual(receipt["reasons"], ["applicable product evidence incomplete, skipped or failed"])
+        expected.update(seek="incomplete", queue="incomplete")
+        self.assertEqual({row["id"]: row["outcome"] for row in receipt["coverage"]}, expected)
+
+    def test_deliberate_skip_names_the_incomplete_case_without_its_reason(self):
+        suite = self.private_suite()
+        seek = suite.find("testcase[@name='seek']")
+        reason = "The manual playback check ran out of time."
+        ET.SubElement(seek, "skipped", message=reason)
+
+        receipt = self.produce_receipt(suite)
+        self.assertEqual(receipt["result"], "incomplete")
+        coverage = {row["id"]: row["outcome"] for row in receipt["coverage"]}
+        self.assertEqual(coverage, dict.fromkeys(self.CASES, "passed") | {"seek": "incomplete"})
+        self.assertNotIn(reason, json.dumps(receipt))
 
     def test_raw_playwright_pass_cannot_supply_private_cases(self):
         root = self.raw_playwright_report()
@@ -1274,8 +1366,10 @@ class SourceBindingTests(Base):
         self.refused("requires the approved private-music journey", self.run_main,
                      mode="promote", world_factory=billing_world)
 
-    def test_promotion_refuses_absent_or_skipped_private_evidence(self):
+    def test_promotion_refuses_missing_skipped_or_malformed_private_evidence(self):
         self.install_private_contract()
+        _, lines = self.run_main(private=True, mode="promote")
+        self.assertIn("verified_private_music_staging", json.loads(lines[0]))
 
         def without_journey():
             world = PrivateWorld()
@@ -1289,12 +1383,19 @@ class SourceBindingTests(Base):
 
         def without_private_artifact():
             world = PrivateWorld()
-            world.artifact["name"] = sa.artifact_name(SHA, RUN_ID, 1)
+            world.artifact = None
+            return world
+
+        def malformed_private_artifact():
+            world = PrivateWorld()
+            # Keep the successful jobs and a matching archive digest. Only the receipt is invalid.
+            world.set_archive(make_zip([("staging-admission.json", '{"schema":')]))
             return world
 
         for factory, reason in ((without_journey, "missing or ambiguous required staging job"),
                                 (skipped_journey, "required job did not pass in selected attempt"),
-                                (without_private_artifact, "missing or ambiguous attempt-bound receipt")):
+                                (without_private_artifact, "missing or ambiguous attempt-bound receipt"),
+                                (malformed_private_artifact, "malformed JSON")):
             with self.subTest(fixture=factory.__name__):
                 self.refused(reason, self.run_main, private=True, mode="promote", world_factory=factory)
 

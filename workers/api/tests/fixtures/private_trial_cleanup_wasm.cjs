@@ -59,6 +59,30 @@ test('reconfirms the same media and page versions after interrupted page confirm
   assert.deepEqual([...pageVersions], ['page-other-version']);
 });
 
+test('requires a fresh exact-version HEAD after the first absence read fails', async (t) => {
+  const media = `https://fixture.test:8443/${bucket}/${mediaKey}?versionId=${encodeURIComponent(mediaVersion)}`;
+  const page = `https://fixture.test:8443/${bucket}/${sidecarKey}?versionId=${encodeURIComponent(pageVersion)}`;
+  const requests = [];
+  let mediaHeadStatus = 503;
+  t.mock.method(globalThis, 'fetch', async (request) => {
+    requests.push([request.method, request.url, request.cache]);
+    if (request.method === 'DELETE') return new Response(null, { status: 204 });
+    return new Response(null, { status: request.url === media ? mediaHeadStatus : 404 });
+  });
+
+  const retry = () => cleanup(bucket, mediaKey, mediaVersion, sidecarKey, pageVersion);
+  const mediaAttempt = [['DELETE', media, 'no-store'], ['HEAD', media, 'no-store']];
+  await assert.rejects(retry(), (error) => error === 'Unconfirmed');
+  assert.deepEqual(requests, mediaAttempt);
+  await assert.rejects(retry(), (error) => error === 'Unconfirmed');
+  assert.deepEqual(requests, [...mediaAttempt, ...mediaAttempt]);
+
+  mediaHeadStatus = 404;
+  await retry();
+  assert.deepEqual(requests, [...mediaAttempt, ...mediaAttempt, ...mediaAttempt,
+    ['DELETE', page, 'no-store'], ['HEAD', page, 'no-store']]);
+});
+
 test('preserves transport refusal for a foreign bucket', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', () => assert.fail('unexpected fetch'));
   await assert.rejects(cleanup('fixture-bucket', mediaKey, mediaVersion, sidecarKey, pageVersion),

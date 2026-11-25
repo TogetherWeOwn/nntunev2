@@ -348,6 +348,50 @@ pub(super) async fn exercise(
     assert_eq!(replay, Ok(StageOutcome::Staged(ids.clone())));
     assert_counter(&replay, json!({"outcome": "staged"}));
     tx.commit().await.unwrap();
+
+    let publication = async || {
+        db.query_one(
+            "SELECT jsonb_agg(jsonb_build_array(t, s, l) ORDER BY t.medium_no, t.track_no)::text
+             FROM public.tracks t
+             LEFT JOIN public.catalogue_s3_sources s ON t.id = s.track_id
+             LEFT JOIN public.storage_s3_locator_intents l USING (object_id)
+             WHERE t.release_id = $1::text::uuid",
+            &[&RELEASE],
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0)
+    };
+    let before = publication().await;
+    let locator = nntune_core::s3_locator::S3Locator::new(
+        both[1].receipt.locator.bucket().into(),
+        both[1].receipt.locator.key().into(),
+        S3Binding::VersionId("synthetic-stale-media-version".into()),
+    )
+    .unwrap();
+    let mut stale = both;
+    stale[1].receipt.locator = &locator;
+    // PostgreSQL makes any attempt to stage a track fail in this transaction.
+    // The receipt check must refuse the second file before staging either one.
+    let mut tx = writer
+        .build_transaction()
+        .read_only(true)
+        .start()
+        .await
+        .unwrap();
+    assert_eq!(
+        apply(&mut tx, Receipt(&stale), false, 2).await,
+        Err(PublicationError::Refused),
+        "a version-only mismatch must refuse before catalogue staging"
+    );
+    assert_eq!(
+        apply(&mut tx, Receipt(&both), false, 2).await,
+        Err(PublicationError::Indeterminate),
+        "the exact receipt must reach the write fence"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(publication().await, before);
+
     let rows = db.query(ROWS, &[&RELEASE]).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(ids.len(), 2);

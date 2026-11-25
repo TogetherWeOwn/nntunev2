@@ -16,18 +16,23 @@ export interface DiscoveryCandidate {
 
 export type DiscoveryTrack = Pick<LibraryItem, 'id' | 'title' | 'artist'>;
 
+export function toPublicDiscoveryTrack(candidate: DiscoveryCandidate): DiscoveryTrack | undefined {
+	const { user_id, id, release_mbid, recording_mbids, track_no, title, artist } = candidate;
+	// A track position is present only for an exact mirror release/recording match.
+	if (
+		user_id !== null || !release_mbid || track_no === null ||
+		!recording_mbids.includes(id) || !title?.trim()
+	) return;
+	return { id: id.toLowerCase(), title, artist: artist ?? undefined };
+}
+
 /** Select one entry per recording from shared, mirror-matched catalogue rows. */
 export function selectDiscoveryTracks(candidates: readonly DiscoveryCandidate[]): DiscoveryTrack[] {
 	const tracks = new Map<string, DiscoveryTrack>();
-	for (const { user_id, id, release_mbid, recording_mbids, track_no, title, artist } of candidates) {
-		// A track position is present only for an exact mirror release/recording match.
-		if (
-			user_id !== null || !release_mbid || track_no === null ||
-			!recording_mbids.includes(id) || !title?.trim()
-		) continue;
-		const recordingId = id.toLowerCase();
-		if (tracks.has(recordingId)) continue;
-		tracks.set(recordingId, { id: recordingId, title, artist: artist ?? undefined });
+	for (const candidate of candidates) {
+		const track = toPublicDiscoveryTrack(candidate);
+		if (!track || tracks.has(track.id)) continue;
+		tracks.set(track.id, track);
 		if (tracks.size === SHELF_LIMIT) break;
 	}
 	return [...tracks.values()];

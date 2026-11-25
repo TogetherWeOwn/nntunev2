@@ -64,10 +64,22 @@ export function createPlayerController(
 	const media = createMediaController(queue, {
 		...effects, browseCopy, streamFor, announce: announceQueue,
 		commit: (next, source) => commitQueue(next, 'replace', undefined, source),
-		prepare: browserPlayback ? (id, current, publish, retry) => {
-			const playId = retry && activeGrant?.trackId === id ? activeGrant.playId : undefined;
+		prepare: browserPlayback ? (id, current, publish, { retry, retireSuperseded } = {}) => {
+			const before = activeGrant;
+			const playId = retry && before?.trackId === id ? before.playId : undefined;
 			if (retry && !playId) return Promise.resolve(false);
-			return browserSession?.open(id, current, publish, playId) ?? Promise.resolve(false);
+			return browserSession?.open(id, current, publish, playId,
+				retireSuperseded && before && (() => {
+					const track = currentTrack(queue.snapshot);
+					if (!retireSuperseded() || activeGrant !== before || track?.id !== before.trackId) return;
+					activeGrant = undefined;
+					retireNativeHost();
+					media.clearSeekFeedback();
+					if (before.isCurrent() && currentTrack(queue.snapshot)?.id === track.id && !activeGrant) {
+						media.bindPausedTransport(track);
+						announceQueue('Playback stopped. Press Play to continue.', true);
+					}
+				})) ?? Promise.resolve(false);
 		} : undefined
 	}, matchesNative);
 

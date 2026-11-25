@@ -35,25 +35,45 @@ def check_baseline_workflow():
         raise RuntimeError("baseline workflow admission differs from the required guards")
 
 
-def exercise(event_path):
-    plan = secrets.token_bytes(64)
-    sha, run = secrets.token_hex(20), str(secrets.randbelow(10**10) + 1)
-    env = {
+def synthetic_authorization(plan, sha, run, expiry, *, workflow=admission.WORKFLOW):
+    return {
         "GITHUB_REPOSITORY": admission.REPOSITORY,
-        "GITHUB_WORKFLOW_REF": f"{admission.REPOSITORY}/{admission.WORKFLOW}@{admission.MAIN}",
+        "GITHUB_WORKFLOW_REF": f"{admission.REPOSITORY}/{workflow}@{admission.MAIN}",
         "GITHUB_EVENT_NAME": "workflow_dispatch",
         "GITHUB_REF": admission.MAIN,
         "GITHUB_SHA": sha,
         "GITHUB_WORKFLOW_SHA": sha,
         "GITHUB_RUN_ID": run,
         "GITHUB_RUN_ATTEMPT": "1",
-        "GITHUB_EVENT_PATH": str(event_path),
         "BOOTSTRAP_SHA": sha,
         "BOOTSTRAP_RUN_ID": run,
-        "BOOTSTRAP_EXPIRY": str(int(time.time()) + 60),
+        "BOOTSTRAP_EXPIRY": str(expiry),
         "BOOTSTRAP_PLAN_B64": base64.b64encode(plan).decode("ascii"),
         "BOOTSTRAP_PLAN_DIGEST": hashlib.sha256(plan).hexdigest(),
     }
+
+
+def check_aborted_baseline_run_binding():
+    now = 1800000000
+    sha = secrets.token_hex(20)
+    old_plan, fresh_plan = secrets.token_bytes(64), secrets.token_bytes(64)
+    original = synthetic_authorization(old_plan, sha, "101", now + 60, workflow=BASELINE_WORKFLOW)
+    fresh = synthetic_authorization(fresh_plan, sha, "102", now + 60, workflow=BASELINE_WORKFLOW)
+    cases = (
+        ("original first attempt before cancellation", original, old_plan),
+        ("rerun after cancellation", original | {"GITHUB_RUN_ATTEMPT": "2"}, None),
+        ("fresh dispatch using the canceled run authorization", original | {"GITHUB_RUN_ID": "102"}, None),
+        ("fresh dispatch with its own authorization", fresh, fresh_plan),
+    )
+    for case, env, expected in cases:
+        if admission.authorized_plan(env, {}, now, workflow=BASELINE_WORKFLOW) != expected:
+            raise RuntimeError(f"baseline admission fixture: {case}")
+
+
+def exercise(event_path):
+    plan = secrets.token_bytes(64)
+    sha, run = secrets.token_hex(20), str(secrets.randbelow(10**10) + 1)
+    env = synthetic_authorization(plan, sha, run, int(time.time()) + 60) | {"GITHUB_EVENT_PATH": str(event_path)}
 
     def check(admit, event=b'{"inputs":{}}', args=(), **overrides):
         event_path.write_bytes(event)
@@ -139,6 +159,10 @@ def check_snapshot_readback():
     check = check_snapshot
 
     check("pre-bootstrap", record, accept=True)
+    without_capture = snapshot.copy()
+    del without_capture["captured_at"]
+    check("successful readback missing capture time", record | {"snapshot": without_capture})
+
     for case, override in {
         "wrong branch": {"branch_id": "fixture002"},
         "wrong restore scope": {"restore_scope": "logical-database"},
@@ -192,17 +216,42 @@ def check_handoff_snapshot_branch(baseline_branch="fixture001"):
     check_snapshot("standalone snapshot for a different branch", wrong_branch, accept=True)
     check_snapshot("handoff snapshot for a different branch", wrong_branch | baseline_pin, args=args)
     check_snapshot("handoff without the exact baseline branch", post_setup, args=args)
+    late_readback = record["snapshot"] | {"readback_at": review["protected_write_at"] + 1}
+    check_snapshot("matching handoff first read back after the protected write",
+                   post_setup | baseline_pin | {"snapshot": late_readback}, args=args)
     check_snapshot("retry with matching completed evidence", post_setup | baseline_pin, accept=True, args=args)
+
+
+def check_snapshot_label_retry():
+    record = snapshot_record()
+    prior = record["snapshot"]
+    setup_completed_at = prior["captured_at"] - 1
+    handoff = {
+        "review": record["review"] | {"phase": "pre-migration", "setup_completed_at": setup_completed_at},
+        "baseline_branch_id": prior["branch_id"],
+    }
+    args = ("--baseline-handoff",)
+    # This synthetic response illustrates what the operator sees before normalizing a readback.
+    response = {"message": "Snapshot label fixture-handoff already exists"}
+    check_snapshot("retry with only a duplicate-label response", handoff | {"snapshot": response}, args=args)
+
+    # Both readbacks carry the same label outside the checker. The older snapshot
+    # completed after setup, but its capture belongs to the pre-setup state.
+    other = prior | {"captured_at": setup_completed_at - 1}
+    check_snapshot("retry with the older same-label snapshot", handoff | {"snapshot": other}, args=args)
+    check_snapshot("retry with the verified prior snapshot", handoff | {"snapshot": prior}, accept=True, args=args)
 
 
 if __name__ == "__main__":
     try:
         check_baseline_workflow()
+        check_aborted_baseline_run_binding()
         with tempfile.TemporaryDirectory(prefix="bootstrap-admission-") as temp:
             exercise(Path(temp) / "event.json")
         if Path(temp).exists():
             raise RuntimeError
         check_snapshot_readback()
+        check_snapshot_label_retry()
     except Exception:
         sys.exit("database-bootstrap-admission-fixture: failed")
     print("database-bootstrap-admission-fixture: run binding, snapshot readback, refusals and teardown passed")

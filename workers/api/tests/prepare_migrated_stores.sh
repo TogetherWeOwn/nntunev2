@@ -84,12 +84,16 @@ psql_run -d nntune_app_ci -v locator_schema="$locator_schema" -v replay=true < "
 port="$(docker_clean port "$id" 5432/tcp)"
 [[ "$port" =~ ^127\.0\.0\.1:([0-9]+)$ ]]
 port="${BASH_REMATCH[1]}"
-playlist_test=(--locked --manifest-path "$root/workers/api/Cargo.toml" --features postgres-tests --lib
-  handlers::tests::private_playlist_postgres::postgres_store_rehearsal)
-NNTUNE_TEST_PRIVATE_PLAYLIST_PORT="$port" \
-NNTUNE_TEST_PRIVATE_PLAYLIST_MARKER="$(psql_run -d nntune_playlist_ci -Atc 'SELECT token FROM private_playlist_rehearsal.marker')" \
-  cargo test "${playlist_test[@]}" -- --exact --ignored | tee "$tmp/playlist-test.log"
-grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$tmp/playlist-test.log"
+playlist_test=(--locked --manifest-path "$root/workers/api/Cargo.toml" --features postgres-tests --lib)
+playlist_marker="$(psql_run -d nntune_playlist_ci -Atc 'SELECT token FROM private_playlist_rehearsal.marker')"
+# The store rehearsal fences the fixture owner, so read the repeated entries first.
+for test_name in repeated_entries_read postgres_store_rehearsal; do
+  NNTUNE_TEST_PRIVATE_PLAYLIST_PORT="$port" \
+  NNTUNE_TEST_PRIVATE_PLAYLIST_MARKER="$playlist_marker" \
+    cargo test "${playlist_test[@]}" "handlers::tests::private_playlist_postgres::$test_name" \
+      -- --exact --ignored | tee "$tmp/$test_name.log"
+  grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$tmp/$test_name.log"
+done
 NNTUNE_TEST_APP_DATABASE_URL="postgresql://postgres:ci-throwaway@127.0.0.1:$port/nntune_app_ci" \
 NNTUNE_TEST_MIRROR_DATABASE_URL="postgresql://postgres:ci-throwaway@127.0.0.1:$port/nntune_mirror_ci" \
   cargo test --locked --manifest-path "$root/workers/api/Cargo.toml" --features postgres-tests --test meter_meta_store_postgres

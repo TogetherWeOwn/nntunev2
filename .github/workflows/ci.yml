@@ -863,6 +863,8 @@ jobs:
         run: python3 workers/api/tests/fixtures/private_trial_role_lifecycle.py --disposable-port 5432
         env:
           TRIAL_FIXTURE_CONTAINER: ${{ job.services.postgres.id }}
+      - name: Qualify the dormant stock PostgreSQL trial target
+        run: python3 -B workers/api/tests/fixtures/test_private_trial_selfhost.py --pull missing
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
@@ -1522,6 +1524,8 @@ jobs:
         run: python3 -I -B -m unittest discover -s .github/scripts -p test_production_backend_identity.py
       - name: Rehearse the paired backend readback caller offline
         run: python3 -I -B -m unittest discover -s .github/scripts -p test_production_backend_readback.py
+      - name: Rehearse release-watch closeout with missing or failed readbacks (offline)
+        run: python3 -I -B -m unittest discover -s ci -p test_production_observation_recovery.py -v
       - name: Unit-test gate incident reporting (offline API fixtures)
         run: python3 -I ci/test_incident_report.py
       - name: Promotion proof scripts parse clean
@@ -2177,6 +2181,7 @@ jobs:
           python3 -I .github/scripts/test_worker_sealed_candidate.py
           python3 -I .github/scripts/test_worker_build_workflow.py
           python3 -E -s .github/scripts/test_staging_trial_cleanup_preflight.py
+          python3 -I -B -m unittest discover -s ops/staging-s3-boundary/fixtures -p test_teardown.py
       - name: Install pinned Worker Rust
         run: python3 -I .github/scripts/worker_rust_provenance.py rust
       - name: Prepare canonical Worker tools
@@ -2287,14 +2292,16 @@ jobs:
           export NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/s3-fixture/loopback.crt" S3_FIXTURE_KEY="$RUNNER_TEMP/s3-fixture/loopback.key"
           INGEST_WASM_JS="$RUNNER_TEMP/preflight-js/nntune_ingest.js" node --test workers/ingest/tests/fixtures/s3_fixture_preflight.cjs
       - name: Qualify the staging S3 boundary with disposable containers
-        run: >-
-          python3 -B ops/staging-s3-boundary/fixtures/qualify.py
-          --bundle "$RUNNER_TEMP/preflight-js/nntune_ingest.js"
+        run: |
+          python3 -I -B -m unittest discover -s ops/staging-s3-boundary/fixtures -p test_readiness.py
+          python3 -B ops/staging-s3-boundary/fixtures/qualify.py --bundle "$RUNNER_TEMP/preflight-js/nntune_ingest.js"
       # Reuse the existing locked Wrangler dependency. No root prepare or
       # dependency install scripts are needed for upload-only dry-runs.
       - name: Install locked upload CLI without lifecycle scripts
         working-directory: apps/web
         run: pnpm install --frozen-lockfile --ignore-scripts --config.minimumReleaseAge=4320
+      - name: Check the private trial cleanup report with synthetic receipts
+        run: node --test workers/api/tests/fixtures/private_trial_cleanup_report.cjs
       - name: Exercise the one-shot private trial cleanup Worker against disposable PostgreSQL and S3
         env:
           PRIVATE_TRIAL_CLEANUP_BUNDLE: ${{ runner.temp }}/trial-cleanup-fixture

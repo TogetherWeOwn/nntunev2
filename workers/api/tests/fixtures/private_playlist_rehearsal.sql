@@ -17,8 +17,17 @@ SELECT handle, gen_random_uuid() AS id FROM (
     SELECT e->>'track_public_id' AS handle FROM fixture_cases c, jsonb_array_elements(c.entries) e
     WHERE e->>'status' = 'resolved' UNION SELECT 'new-track' UNION SELECT 'inactive-track'
 ) handles;
-INSERT INTO public.tracks (id, release_id, title, medium_no, track_no)
-SELECT id, gen_random_uuid(), handle, 1, 1 FROM fixture_tracks;
+-- An owned occurrence and a foreign-only occurrence share recording and release.
+-- Library membership must match the exact canonical track ID.
+WITH shared_recording AS (
+    SELECT gen_random_uuid() AS release_id, gen_random_uuid() AS mbid
+)
+INSERT INTO public.tracks (id, release_id, mbid, title, medium_no, track_no)
+SELECT t.id, coalesce(pair.release_id, gen_random_uuid()), pair.mbid, t.handle, 1,
+    CASE WHEN t.handle = 'trkRpMiddle00000000000' THEN 2 ELSE 1 END
+FROM fixture_tracks t
+LEFT JOIN shared_recording pair
+    ON t.handle IN ('trkRpRepeat00000000000', 'trkRpMiddle00000000000');
 -- Fixture-provided explicit resolution is test input, not a production resolver.
 CREATE TEMP TABLE legacy_resolution AS
 SELECT c.playlist_id, (e->>'position')::integer AS position, e->>'legacy_ref' AS legacy_ref, t.id AS track_id
@@ -28,7 +37,7 @@ JOIN fixture_tracks t ON t.handle = e->>'track_public_id' WHERE e->>'status' = '
 UNION ALL SELECT 9002, 1, 'not-the-original-ref', id FROM fixture_tracks WHERE handle = 'new-track';
 CREATE TEMP TABLE fixture_memberships AS
 SELECT 'fixture-user-owner'::text AS owner_id, id AS track_id FROM fixture_tracks
-WHERE handle IN ('new-track', 'trkRpRepeat00000000000', 'trkFrAlpha000000000000')
+WHERE handle IN ('new-track', 'trkRpRepeat00000000000', 'trkFrAlpha000000000000', 'trkFrGamma000000000000')
 UNION ALL SELECT 'fixture-user-other', id FROM fixture_tracks WHERE handle IN ('new-track', 'trkRpMiddle00000000000');
 CREATE TEMP TABLE sequence_before AS SELECT last_value, is_called FROM public.playlists_id_seq;
 SAVEPOINT applied_legacy;
@@ -94,11 +103,18 @@ BEGIN
     IF (SELECT jsonb_agg(s ORDER BY s.kind, s.data) FROM pg_temp.crud_state s) IS DISTINCT FROM snapshot THEN
         RAISE EXCEPTION 'denied operation changed a playlist, entry or deletion operation';
     END IF;
+    IF NOT EXISTS (
+        SELECT FROM public.tracks owned JOIN public.tracks foreign_track USING (release_id, mbid, medium_no)
+        WHERE owned.id = old_track AND foreign_track.id = middle_track
+            AND owned.track_no <> foreign_track.track_no
+    ) THEN
+        RAISE EXCEPTION 'expected two canonical positions for one recording on one release';
+    END IF;
     IF (SELECT r.entries->1 FROM read_playlist(owner, repeated) r) IS DISTINCT FROM (
         SELECT jsonb_build_object('id', e.id, 'position', 1, 'dormant', true)
         FROM public.playlist_tracks e WHERE e.playlist_id = 9006 AND e.position = 1 AND e.track_id = middle_track
     ) THEN
-        RAISE EXCEPTION 'nonmember entry must be a tombstone with its stored track FK preserved';
+        RAISE EXCEPTION 'the other occurrence must stay dormant with its stored track FK preserved';
     END IF;
     IF (SELECT jsonb_agg(e->'position' ORDER BY ord) FROM read_playlist(owner, repeated) r,
         jsonb_array_elements(r.entries) WITH ORDINALITY AS x(e, ord) WHERE e->>'track_id' = old_track::text)

@@ -9,7 +9,7 @@ import sys
 
 from apply_migration import ADVISORY_LOCK_KEY, ApplyError
 from staging_apply import StagingApplyError, evidence_child_env, load_entries, quote_literal
-from staging_trial_isolated import CONFIG_ENV, ROUTES, SHARED_OID, authority, overlay, routines, target_config
+from staging_trial_isolated import CONFIG_ENV, NAMES, ROUTES, SHARED_OID, authority, overlay, routines, target_config
 from staging_trial_role_acl import (
     GUARD, ISOLATED_EXTENSION_CATALOG, LOCK_TABLES, WINNERS, WRITER, audit, change, grants, identities,
     isolated_extensions, other_database_connections, require,
@@ -18,7 +18,6 @@ from staging_trial_role_preflight import BASELINE, DATABASE, LOGIN_RE, SCOPE_ENV
 from staging_trial_schema import read_source
 
 TARGET = f"planetscale:nntunev2/main/nntunev2_staging@{SHARED_OID}"
-NAMES = ("nntune_trial_reader", "nntune_trial_writer")
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = "nntune-private-trial-synthetic-fixture"
 
@@ -75,14 +74,20 @@ def baseline():
 def check_catalog(isolated, fixture):
     owner = connection("OWNER", fixture, isolated)
     executor = connection("EXECUTOR", fixture, isolated)
+    check_catalog_connections(isolated, owner, executor, fixture=fixture)
+
+
+def check_catalog_connections(isolated, owner, executor, *, fixture=False,
+                              owner_guard="", executor_guard="", query=psql_output):
     begin = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n"
-    psql(owner, begin + target(isolated, owner["PGUSER"], fixture)
-         + require("SELECT datdba = to_regrole(current_user)::oid FROM pg_database "
-                   "WHERE datname = current_database()") + "COMMIT;\n", "isolated owner identity")
+    query(owner, begin + target(isolated, owner["PGUSER"], fixture) + owner_guard
+          + require("SELECT datdba = to_regrole(current_user)::oid FROM pg_database "
+                    "WHERE datname = current_database()") + "COMMIT;\n", "isolated owner identity")
+    print("isolated owner identity passed")
     stage = "isolated executor identity or migration baseline"
-    verdict = psql_output(executor, begin + target(isolated, executor["PGUSER"], fixture)
-                          + require(f"to_regrole(current_user)::oid = {isolated['executor_oid']}") + baseline()
-                          + f"SELECT ({ISOLATED_EXTENSION_CATALOG}) IS TRUE;\nCOMMIT;\n", stage)
+    verdict = query(executor, begin + target(isolated, executor["PGUSER"], fixture) + executor_guard
+                    + require(f"to_regrole(current_user)::oid = {isolated['executor_oid']}") + baseline()
+                    + f"SELECT ({ISOLATED_EXTENSION_CATALOG}) IS TRUE;\nCOMMIT;\n", stage)
     if verdict == "f\n":
         raise StagingApplyError("isolated catalog extensions differ from policy; see "
                                 "docs/ops/private-staging-trial.md#isolated-database-catalog-preflight")

@@ -9232,6 +9232,7 @@ pub(crate) mod tests {
     #[cfg(all(feature = "postgres-tests", not(target_arch = "wasm32")))]
     mod private_playlist_postgres {
         include!("private_playlists_postgres_tests.rs");
+        include!("../tests/fixtures/private_playlist_repeated_read.rs");
     }
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -12615,6 +12616,8 @@ pub(crate) mod tests {
         portal_reply: RefCell<Option<crate::stripe::PortalSession>>,
         /// Checkout sessions minted through `create_checkout_session`.
         sessions_created: RefCell<usize>,
+        /// Cancel destinations supplied when minting Checkout sessions.
+        session_cancel_urls: RefCell<Vec<String>>,
         /// Customers the minted sessions were bound to (proves a
         /// converged attempt sessions on the winner-bound customer,
         /// never a racing loser's orphan).
@@ -12643,6 +12646,7 @@ pub(crate) mod tests {
         missing_sessions: RefCell<HashSet<String>>,
         /// Method names that fail like a Stripe outage.
         fail: RefCell<HashSet<String>>,
+        forbid_invoice_reads: bool,
         /// Next customer id minted by `create_customer`.
         next_customer: RefCell<Option<String>>,
         customer_reply: std::cell::Cell<Option<(bool, Option<&'static str>)>>,
@@ -12737,6 +12741,7 @@ pub(crate) mod tests {
                 self.session_customers
                     .borrow_mut()
                     .push(req.customer_id.clone());
+                self.session_cancel_urls.borrow_mut().push(req.cancel_url);
                 let id = format!("cs_test_{created}");
                 let url = format!("https://checkout.stripe.com/pay/{id}");
                 let session = crate::stripe::CheckoutSession {
@@ -12839,6 +12844,7 @@ pub(crate) mod tests {
         ) -> Pin<Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Invoice>> + '_>>
         {
             Box::pin(async move {
+                assert!(!self.forbid_invoice_reads, "unexpected invoice read");
                 if self.fail("retrieve_invoice") {
                     return self.err();
                 }
@@ -12858,6 +12864,7 @@ pub(crate) mod tests {
             Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::InvoiceLines>> + '_>,
         > {
             Box::pin(async move {
+                assert!(!self.forbid_invoice_reads, "unexpected invoice line read");
                 if self.fail("list_invoice_lines") {
                     return self.err();
                 }
@@ -12882,6 +12889,7 @@ pub(crate) mod tests {
             Box<dyn Future<Output = crate::stripe::StripeResult<Vec<crate::stripe::Invoice>>> + '_>,
         > {
             Box::pin(async move {
+                assert!(!self.forbid_invoice_reads, "unexpected invoice list read");
                 if self.fail("list_invoices") {
                     return self.err();
                 }
@@ -13776,6 +13784,154 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn paid_invite_checkout_cancel_returns_unsubscribed_and_allows_fresh_checkout() {
+        use serde_json::{json, Value};
+
+        let mut h = stripe_harness();
+        h.config = h.config.with_play_grant_secret(PLAY_SECRET.to_vec());
+        h.config.invites_required = true;
+        h.config.paid_invite_billing = true;
+        h.store.billing_bindings.replace(test_bindings());
+
+        let email = "checkout-cancel@example.test";
+        let owner = seed_admin(&h, "owner", "owner@example.test");
+        let invite = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(json!({"email": email}).to_string()),
+            Some(owner),
+            Some(ORIGIN),
+        );
+        assert_eq!(invite.status, 201);
+        let invite: Value = serde_json::from_str(&invite.body).unwrap();
+        let (signup, user) = signup_with_invite(
+            &h,
+            email,
+            b"checkout-cancel-cred",
+            40,
+            Some(invite["code"].as_str().unwrap()),
+        );
+        assert_eq!(signup.status, 200);
+
+        let call = |now, cookie: &str, method: &str, path: &str, body: Vec<u8>, status| {
+            let mut ctx = h.ctx();
+            ctx.now = now;
+            let reply = block_on(handle(
+                &ctx,
+                &Request {
+                    method: method.into(),
+                    path: path.into(),
+                    cookie: Some(cookie.into()),
+                    origin: Some(ORIGIN.into()),
+                    authorization: None,
+                    stripe_signature: None,
+                    body,
+                },
+            ));
+            assert_eq!(reply.status, status, "{method} {path}: {}", reply.body);
+            serde_json::from_str::<Value>(&reply.body).unwrap()
+        };
+        let checkout = |now, cookie: &str| {
+            call(
+                now,
+                cookie,
+                "POST",
+                paid_invite_billing::CHECKOUT,
+                json!({"planId": PLAN_PLUS}).to_string().into_bytes(),
+                200,
+            )
+        };
+        let assert_unsubscribed = |now, cookie: &str| {
+            let sub = call(now, cookie, "GET", "/v1/me/subscription", vec![], 200);
+            assert_eq!(sub["state"], "no_subscription");
+            let play = call(
+                now,
+                cookie,
+                "POST",
+                "/v1/plays",
+                json!({"track_id":"track-9", "session_id":"tab-a"})
+                    .to_string()
+                    .into_bytes(),
+                402,
+            );
+            assert_eq!(play["code"], "subscription_required");
+            assert_eq!(play["reason"], "never_subscribed");
+            assert!(h.store.subscriptions.borrow().is_empty());
+            assert!(h.store.invoice_history.borrow().is_empty());
+        };
+        let open_op = || {
+            block_on(h.store.open_checkout_operation(&user))
+                .unwrap()
+                .unwrap()
+        };
+        let cookie = cookie_of(&signup);
+        let first = checkout(NOW, &cookie);
+        let pending = open_op();
+        assert_eq!(pending.state, "submitted");
+        let abandoned_id = pending.session_id.as_deref().unwrap();
+        assert_eq!(
+            first["url"],
+            h.stripe.sessions.borrow()[abandoned_id]
+                .url
+                .as_deref()
+                .unwrap()
+        );
+        assert_eq!(
+            h.stripe.session_cancel_urls.borrow().as_slice(),
+            [format!("{ORIGIN}/account/billing")]
+        );
+
+        // Back from Checkout leaves the unpaid Stripe session open. Read the
+        // subscription as the billing page would and attempt gated playback.
+        assert_unsubscribed(NOW + 60, &cookie);
+        assert_eq!(open_op().id, pending.id);
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+
+        // The listener returns after Stripe's default 24-hour expiry. Advance
+        // only the remote fixture and give the same member a fresh login cookie.
+        {
+            let mut sessions = h.stripe.sessions.borrow_mut();
+            let abandoned = sessions.get_mut(abandoned_id).unwrap();
+            assert_eq!(abandoned.status.as_deref(), Some("open"));
+            assert_eq!(abandoned.payment_status.as_deref(), Some("unpaid"));
+            assert!(abandoned.subscription.is_none());
+            abandoned.status = Some("expired".into());
+            abandoned.url = None;
+        }
+        let mut later = h.ctx();
+        later.now = NOW + 24 * 60 * 60 + 1;
+        let returned = cookie_of(&block_on(later.start_session(&user)).unwrap());
+        assert_unsubscribed(later.now, &returned);
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+
+        let second = checkout(later.now, &returned);
+        let replacement = open_op();
+        let replacement_id = replacement.session_id.as_deref().unwrap();
+        assert_ne!(replacement.id, pending.id);
+        assert_eq!(replacement.price_id.as_deref(), Some(PRICE_PLUS));
+        assert_ne!(replacement_id, abandoned_id);
+        assert_ne!(second["url"], first["url"]);
+        {
+            let sessions = h.stripe.sessions.borrow();
+            let fresh = &sessions[replacement_id];
+            assert_eq!(second["url"], fresh.url.as_deref().unwrap());
+            assert_eq!(fresh.status.as_deref(), Some("open"));
+            assert_eq!(fresh.customer, sessions[abandoned_id].customer);
+        }
+        assert_eq!(
+            block_on(h.store.checkout_operation_by_id(&pending.id))
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::billing_reconcile::SUPERSEDED_OP_STATE
+        );
+        assert_eq!(*h.stripe.sessions_created.borrow(), 2);
+        assert_eq!(h.stripe.customers_created.borrow().len(), 1);
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert_unsubscribed(later.now, &returned);
+    }
+
+    #[test]
     fn checkout_replacement_refuses_a_mark_miss_on_an_open_flight() {
         let mut h = stripe_harness();
         h.config.invites_required = true;
@@ -13854,6 +14010,161 @@ pub(crate) mod tests {
         assert!(op().is_none());
         assert!(live_for(&h, "u1").is_none());
         assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+    }
+
+    #[test]
+    fn paid_invite_resumes_interrupted_checkout_before_verified_subscription() {
+        use serde_json::{json, Value};
+
+        let mut h = stripe_harness();
+        h.config = h.config.with_play_grant_secret(PLAY_SECRET.to_vec());
+        h.config.invites_required = true;
+        h.store.billing_bindings.replace(test_bindings());
+        h.stripe.forbid_invoice_reads = true;
+
+        let email = "resume-listener@example.test";
+        let credential = b"paid-invite-resume-cred";
+        let seed = 38;
+        let owner = seed_admin(&h, "owner", "owner@example.test");
+        let invite = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(json!({"email": email}).to_string()),
+            Some(owner),
+            Some(ORIGIN),
+        );
+        assert_eq!(invite.status, 201, "{}", invite.body);
+        let invite: Value = serde_json::from_str(&invite.body).unwrap();
+        let (signup, user) =
+            signup_with_invite(&h, email, credential, seed, invite["code"].as_str());
+        assert_eq!(signup.status, 200, "{}", signup.body);
+        let signup_cookie = cookie_of(&signup);
+        let checkout = |h: &Harness, cookie: &str| {
+            h.call_full(
+                "POST",
+                paid_invite_billing::CHECKOUT,
+                Some(json!({"planId": PLAN_PLUS}).to_string()),
+                Some(cookie.to_string()),
+                Some(ORIGIN),
+            )
+        };
+        assert_eq!(checkout(&h, &signup_cookie).status, 404);
+        assert!(h.stripe.customers_created.borrow().is_empty());
+        h.config.paid_invite_billing = true;
+
+        // Stripe creates the session, but the operation loses its session mark.
+        h.store.skip_checkout_mark.set(true);
+        assert_eq!(checkout(&h, &signup_cookie).status, 503);
+        h.store.skip_checkout_mark.set(false);
+        let open_op = || {
+            block_on(h.store.open_checkout_operation(&user))
+                .unwrap()
+                .unwrap()
+        };
+        let interrupted = open_op();
+        assert!(interrupted.session_id.is_none());
+        let session_id = h.stripe.sessions_by_op.borrow()[&interrupted.id].clone();
+        let original_session = h.stripe.sessions.borrow()[&session_id].clone();
+        let customer = original_session.customer.as_deref().unwrap();
+        assert_eq!(h.store.billing_customers.borrow()[&user], customer);
+
+        let logout = h.call_full(
+            "POST",
+            "/v1/session/logout",
+            None,
+            Some(signup_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(logout.status, 200, "{}", logout.body);
+        assert_eq!(checkout(&h, &signup_cookie).status, 401);
+        let start = h.call(
+            "POST",
+            "/v1/auth/passkey/login/start",
+            json!({"email": email}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let start: Value = serde_json::from_str(&start.body).unwrap();
+        let login = h.call(
+            "POST",
+            "/v1/auth/passkey/login/finish",
+            fx_reauth_assertion(start["challenge"].as_str().unwrap(), credential, seed, 2),
+        );
+        assert_eq!(login.status, 200, "{}", login.body);
+        let cookie = cookie_of(&login);
+        assert_ne!(cookie, signup_cookie);
+
+        let resume = checkout(&h, &cookie);
+        assert_eq!(resume.status, 200, "{}", resume.body);
+        let redirect: Value = serde_json::from_str(&resume.body).unwrap();
+        assert_eq!(redirect["url"], original_session.url.as_deref().unwrap());
+        let resumed = open_op();
+        assert_eq!(resumed.id, interrupted.id);
+        assert_eq!(resumed.session_id.as_deref(), Some(session_id.as_str()));
+
+        let assert_unentitled = || {
+            let subscription = billing_get(&h, "/v1/me/subscription", Some(cookie.clone()));
+            assert_eq!(subscription.status, 200, "{}", subscription.body);
+            let subscription: Value = serde_json::from_str(&subscription.body).unwrap();
+            assert_eq!(subscription["state"], "no_subscription");
+            let play = play_call(
+                &h,
+                &cookie,
+                json!({"track_id": "track-9", "session_id": "tab-a"}),
+            );
+            assert_eq!(play.status, 402, "{}", play.body);
+            let denial: Value = serde_json::from_str(&play.body).unwrap();
+            assert_eq!(denial["code"], "subscription_required");
+            assert_eq!(denial["reason"], "never_subscribed");
+            assert!(live_for(&h, &user).is_none());
+            assert!(block_on(h.store.playback_lease(&user)).unwrap().is_none());
+        };
+        assert_unentitled();
+
+        let subscription_id = "sub_test_resume";
+        let deliver = |event: &str, payment: &str| {
+            let mut session = original_session.clone();
+            session.status = Some("complete".into());
+            session.payment_status = Some(payment.into());
+            session.subscription = Some(subscription_id.into());
+            session.url = None;
+            let body = paid_invite_event_body(
+                event,
+                "checkout.session.completed",
+                BILLING_NOW,
+                json!({
+                    "id": session_id, "object": "checkout.session", "mode": "subscription",
+                    "livemode": false, "status": "complete", "payment_status": session.payment_status,
+                    "customer": customer, "subscription": subscription_id,
+                    "client_reference_id": resumed.id,
+                }),
+            );
+            h.stripe
+                .sessions
+                .borrow_mut()
+                .insert(session_id.clone(), session);
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW)))
+        };
+        webhook_ok(&deliver("evt_resume_unpaid", "unpaid"));
+        assert_eq!(checkout(&h, &cookie).status, 503);
+        assert_unentitled();
+
+        h.stripe.subscriptions.borrow_mut().insert(
+            subscription_id.into(),
+            test_subscription(subscription_id, "cus_test_unrelated", "active", PRICE_PLUS),
+        );
+        assert_eq!(deliver("evt_resume_unverified", "paid").status, 500);
+        assert_eq!(checkout(&h, &cookie).status, 503);
+        assert_unentitled();
+        assert_eq!(open_op(), resumed);
+        assert_eq!(h.store.checkout_ops.borrow().len(), 1);
+        assert_eq!(h.store.billing_customers.borrow()[&user], customer);
+        assert_eq!(
+            h.stripe.customers_created.borrow().as_slice(),
+            &[(Some(user), None)]
+        );
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.store.invoice_history.borrow().is_empty());
     }
 
     #[test]
@@ -14221,6 +14532,34 @@ pub(crate) mod tests {
         let refusal = decode(play_at(cutoff as u64, &cookie, &play), 402);
         assert_eq!(refusal["code"], "subscription_required");
         assert_eq!(refusal["reason"], "lapsed");
+
+        // Stripe reaches the scheduled end. The hourly pass reads the
+        // terminal subscription while its paid invoices are still available.
+        h.stripe
+            .subscriptions
+            .borrow_mut()
+            .get_mut(subscription_id)
+            .unwrap()
+            .status = "canceled".into();
+        sweep.now = cutoff as u64;
+        block_on(reconcile_paid_targets(
+            &sweep,
+            vec![(&user, Some(subscription_id))],
+        ))
+        .unwrap();
+        assert!(live_for(&h, &user).is_none());
+        let retained = block_on(h.store.load_reconcile_input(&user, Some(subscription_id)))
+            .unwrap()
+            .live
+            .expect("canceled subscription retained");
+        assert_eq!(retained.status, "canceled");
+        assert_eq!(retained.stripe_customer_id, customer);
+        assert_eq!(retained.paid_through_unix, Some(cutoff));
+        assert_eq!(retained.paid_invoice_id.as_deref(), Some("in_test_3"));
+        assert_eq!(retained.grace_until_unix, None);
+        assert_eq!(*h.store.invoice_history.borrow(), history);
+        assert_eq!(subscription(sweep.now, &cookie)["state"], "lapsed");
+        assert!(h.stripe.canceled.borrow().is_empty());
     }
 
     #[test]

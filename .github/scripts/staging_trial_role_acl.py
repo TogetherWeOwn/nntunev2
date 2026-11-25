@@ -109,8 +109,9 @@ def isolated_extensions():
     return require(ISOLATED_EXTENSION_CATALOG)
 
 
-def other_database_connections(role):
-    return f"""SELECT FROM pg_database d WHERE d.datallowconn AND d.datname <> current_database()
+def other_database_connections(role, *, include_closed=False):
+    connectable = "" if include_closed else "d.datallowconn AND "
+    return f"""SELECT FROM pg_database d WHERE {connectable}d.datname <> current_database()
               AND has_database_privilege({role}, d.oid, 'CONNECT')"""
 
 

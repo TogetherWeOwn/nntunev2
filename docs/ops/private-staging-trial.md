@@ -25,6 +25,8 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    both routed logins independently lack CONNECT to every other connectable
    database, including templates. Retain the original protected scope for
    withdrawal.
+   For the dedicated PostgreSQL trial with Cloudflare resources, see the
+   [Stage C1 temporary API token example](stage-c1-temporary-api-token.md).
 2. **Check protected inputs.** Store the existing role-scope JSON in
    staging as `ISOLATED_TRIAL_ROLE_SCOPE`. Set `ISOLATED_TRIAL_TARGET` to a
    reviewed JSON object with `database_oid` and `executor_oid` (numbers),
@@ -54,8 +56,10 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    staging MusicBrainz binding, API–Stream service bindings, dedicated fixture
    bucket and matching storage configuration and root versions. Confirm a
    protected, reviewed runner can retire the selected fixture and confirm exact
-   version absence using separate, scoped cleanup access. Record a separate
-   reuse or retirement disposition for the prepublished companion and its trial
+   version absence using separate, scoped cleanup access. Record the assigned
+   cleanup owner and authority evidence in the
+   [sign-off check](#check-cleanup-sign-off). Record a separate reuse or
+   retirement disposition for the prepublished companion and its trial
    admission. Stop if any binding, identity or cleanup path is missing.
    Before arming, confirm a reviewed drill entry point can use an authorized
    synthetic session after companion admission and before cutoff. Confirm the
@@ -108,6 +112,7 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    source row removed. Stop on a refusal, shared reference or ambiguous readback.
    For a partial delete or unconfirmed cleanup commit, resume using the same
    pins and confirm both versions, including any version already absent.
+   Apply the [sign-off check](#check-cleanup-sign-off) before closing the record.
    Handle tone B and its admission through the separate fixture disposition.
 2. **Withdraw access.** Once the trial operator removes the bindings, dispatch
    `fence` and `retire` using the original scope and the reviewed isolated
@@ -119,6 +124,34 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    from custody and withdraw any temporary executor grants through their original
    grantor. If withdrawal refuses, reconcile with the grant owner while both
    logins stay fenced.
+
+### Check cleanup sign-off
+
+Use this offline exercise for one disposable synthetic trial. The placeholders
+refer to evidence in the same protected trial record.
+
+| Evidence | What to check |
+| --- | --- |
+| `<cleanup-owner-ref>` | Before arming, identify the assigned cleanup owner and verify the separate cleanup authority for this trial. Match the direct database host, port, role and role OID and its reviewed grants to the isolated target. Match the cleanup credential to the two fixture keys and the effective policy readback for the reviewed storage route. At sign-off, verify from the current protected record that the assigned owner is authorized for this same trial scope. |
+| `<fixture-receipt-ref>` and `<scope-ref>` | Link the passing `post-deploy private music journey` job to its recorded run, attempt and build. Match the completed tone A publication and storage receipt to the fixture and provider pins in `PRIVATE_TRIAL_CLEANUP_SCOPE`, including the object, generation, `media_version` and `page_version`. Check that the scope carries the verified cleanup identity pins. |
+| `<cleanup-run-ref>` | Link the successful `Retire the selected private staging fixture` job and its `Retire the selected tone A versions once` step in attempt 1 of the recorded [protected cleanup dispatch](#protected-cleanup-dispatch). Require `Private staging fixture cleanup: confirmed` and match that run's `private_trial_cleanup_scope_sha256` input to the SHA-256 of the exact retained UTF-8 scope bytes. |
+
+For the [SeaweedFS route](../../ops/staging-s3-boundary/README.md#render-the-credentials-policy),
+verify the managed policy and attachment and compare the mounted Caddyfile
+digest with the reviewed render for the cleanup credential. The [provider-only
+preflight](#provider-only-preflight) uses a separate disposable credential and
+supplies qualification evidence. Sign-off requires the cleanup dispatch for
+the completed fixture above.
+
+Mark this fixture's cleanup **Confirmed** only when all three checks pass. In
+the exercise, remove the owner assignment after arming, reassign it without
+verified authorization for the new owner, or remove the exact cleanup run
+receipt. Each leaves sign-off **Pending**. A `confirmed` line from a dispatch
+with a different scope digest, or a scope whose media or page version differs
+from the original receipt, also leaves it **Pending**.
+If setup evidence is missing before arming, keep the trial disarmed. At
+closeout, retain the original pins and use the existing reconciliation path
+before clearing the cleanup settings or withdrawing cleanup access.
 
 ### Isolated database catalog preflight
 
@@ -241,12 +274,38 @@ HEAD against the now-absent version and require the same status, body and
 optional version header checks. Treat HTTP 403, ambiguity or a policy that
 needs list access as a stop. Keep the scope and credentials in protected custody.
 
+#### Tabletop for a refused shared ingress reload
+
+In this offline example, the trial is disarmed and hosted qualification has
+yet to be dispatched. Engineering is undoing the fixture ingress in the
+protected rollout's shared-writer window. The exact fixture DNS record has
+been removed and its absence recorded. The shared Caddy server is serving
+synthetic revision A, which includes the fixture route and an unrelated route
+update. Revision B on disk removes only the fixture route.
+
+1. The process launcher rejects the reload before the Caddy reload process
+   starts. Record the refusal and the completed DNS step separately.
+2. Engineering restores and verifies revision A on disk from the copy taken
+   before writing revision B. An independent readback from the running server
+   confirms revision A is still serving both routes. Record the disk and
+   serving results separately. The fixture route is still active, so ingress
+   rollback remains pending.
+3. If that live readback is unavailable, inconclusive or mismatched, record
+   what was observed and leave recovery pending even if the disk copy matches
+   revision A.
+
+Keep the trial disarmed and hosted qualification pending. Engineering owns
+diagnosis and any retry through the existing protected rollout, including
+reconciling DNS and serving state before retrying.
+
 #### Provider-only preflight
 
 For a hosted run, use [staging-trial-provider-preflight](../../.github/workflows/staging-trial-provider-preflight.yml).
 For the fixture boundary, provision and verify a reachable HTTPS ingress
 forwarding to its loopback listener through the protected rollout. The
-disposable qualification uses a runner-local endpoint.
+disposable qualification uses a runner-local endpoint. See the [offline
+tabletop](#tabletop-for-a-refused-shared-ingress-reload) for a refused shared
+ingress reload during rollback.
 Prepare the two disposable versions and read back the credential policy as
 described below. Supply the four settings below as secrets in the existing
 `staging` Environment for this run. The endpoint and region secrets must match
@@ -349,8 +408,9 @@ the cleanup database. `confirmed` means two verified version absences and a
 committed source finalization. Stop on `refused`,
 `withheld`, `unconfirmed` or missing evidence. Reconcile SQL and provider state
 before a fresh dispatch with the original approved scope and cleanup key.
-Keep those pins until cleanup is confirmed, then clear the cleanup settings in
-custody and withdraw its scoped access.
+Keep those pins while the [sign-off check](#check-cleanup-sign-off) is pending.
+Clear the cleanup settings in custody and withdraw the scoped cleanup access
+after sign-off is **Confirmed**.
 
 After an interruption, reconcile the last run and actual staging state before
 retrying. A grant retry requires the same reviewed overlay bytes and role OIDs.
@@ -362,6 +422,38 @@ result as unconfirmed and use only the reviewed replay path for the same attempt
 If a partial upload has no matching completed publication, stop and hand it to
 77c for reconciliation through the reviewed upload path. The selected-fixture
 retirement path requires a matching completed publication.
+
+### Offline exercise for a stopped journey
+
+Use the placeholder receipts below at a tabletop exercise. Tone A was written,
+then `Qualify private listening` stopped before the normal handoff. Use the
+recorded Actions links and the protected fixture record to prepare the cleanup
+handoff on paper.
+
+| Receipt | Placeholder record |
+| --- | --- |
+| Trial record | `<trial-run-url>`, attempt `1`, `<trial-build-sha>`, `<journey-job-url>` |
+| Actions metadata | The recorded `deploy.yml` run is a `main` push on `<trial-build-sha>`. In attempt `1`, `Require this run's API and Stream deployment` passed and `post-deploy private music journey` was cancelled in `Qualify private listening`. The same run also lists a rerun as attempt `2`. |
+| Protected tone A record | The selected upload session and job match a completed publication and its canonical track and object. The original media and digest-page version pins match `<tone-a-scope-ref>`, with approved hash `<tone-a-scope-sha256>`. |
+| Containment record | `<disable-run-url>` has the verified disabled API and Stream pins. The session is revoked, the cohort cleared and armed runs drained. The cutoff, retention and lease windows have elapsed. |
+
+1. Match the recorded run, attempt, job and commit against the Actions
+   metadata. Stop if they disagree. Keep the stopped verdict on attempt `1`
+   even though attempt `2` shares its run ID and commit. `Record candidate
+   admission receipt` follows successful qualification and did not run for
+   attempt `1`. Use the protected fixture record to establish cleanup scope.
+2. Match the tone A session, job, completed publication and both version
+   pins to the original protected scope. If that match is ambiguous or the
+   publication is incomplete, stop at reconciliation. Keep the companion
+   fixture under its separate disposition.
+3. On paper, give the cleanup operator the stopped trial run and job links,
+   the original scope reference and hash, and the verified disable run and
+   containment reference. The operator checks the separately authorized access
+   and pins in the [protected cleanup instructions](#protected-cleanup-dispatch).
+   The expected next action is a fresh protected `deploy.yml` dispatch with
+   `private_trial_cleanup_scope_sha256` for the job `Retire the selected private
+   staging fixture`. Record the planned cleanup separately from the stopped
+   journey. End the exercise before dispatch.
 
 ## Stage C2 Hyperdrive origin connection
 

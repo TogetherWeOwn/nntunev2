@@ -12,8 +12,8 @@ use nntune_ingest::{
     },
     multipart::{readback_inventory::ReadbackScope, MultipartError},
 };
-use std::time::Duration;
-use tokio_postgres::{Client, NoTls};
+use std::time::{Duration, SystemTime};
+use tokio_postgres::{types::Type, Client, NoTls};
 
 #[path = "publisher_outcome.rs"]
 mod outcome;
@@ -55,7 +55,7 @@ async fn postgres_stages_completed_candidate_atomically() {
 }
 
 async fn publisher_fixture(with_outcome: bool) {
-    let observer = connect().await;
+    let mut observer = connect().await;
     let mut writer = connect().await;
     let mut contender = connect().await;
     let first = if with_outcome { 0x90 } else { 0x70 };
@@ -405,4 +405,49 @@ async fn publisher_fixture(with_outcome: bool) {
         },
     });
     auto_publish::exercise(&observer, &mut writer, &mut contender, &objects, committed).await;
+
+    // Read the single-track review publication after its committed retry.
+    let readback = observer.transaction().await.unwrap();
+    let track: String = readback
+        .query_one(
+            "SELECT id::text FROM public.tracks
+             WHERE release_id = 'ab340000-0000-4000-8000-000000000000'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let deadline = SystemTime::now() + Duration::from_secs(60);
+    let attached: bool = readback
+        .query_one(
+            include_str!("../../../api/tests/fixtures/private_catalogue_attach.sql"),
+            &[&track, &deadline],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        attached,
+        "fixture must attach the published track reference"
+    );
+
+    // Let the catalogue choose the current version without an expected pin.
+    let row = readback
+        .query_typed_one(
+            include_str!("../../../api/src/private_catalogue_read.sql"),
+            &[
+                (&track, Type::TEXT),
+                (&environment, Type::TEXT),
+                (&library, Type::TEXT),
+                (&None::<i64>, Type::INT8),
+                (&provider, Type::TEXT),
+                (&BUCKET, Type::TEXT),
+                (&None::<&str>, Type::TEXT),
+                (&None::<&str>, Type::TEXT),
+            ],
+        )
+        .await
+        .expect("catalogue must resolve the committed review publication");
+    assert_eq!(row.get::<_, &str>("s3_version_id"), SHARED_VERSION);
+    readback.rollback().await.unwrap();
 }
