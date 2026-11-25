@@ -177,6 +177,7 @@ def fixture(base, worker, label):
     shutil.copy(ROOT / MANIFEST, tree / MANIFEST)
     if worker == "stream":
         shutil.copy(ROOT / "workers/stream/wrangler.toml", wdir / "wrangler.toml")
+    if worker in ("api", "stream"):
         shutil.copy(ROOT / PRIVATE_CONFIG, tree / PRIVATE_CONFIG)
     return tree, wdir
 
@@ -279,7 +280,6 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
     env = base_env(home, path, marker)
     tree, wdir = fixture(base, worker, f"tree-{tag}")
     if api_private:
-        shutil.copy(ROOT / PRIVATE_CONFIG, tree / PRIVATE_CONFIG)
         trial = {key: value for key, value in summary_env.items() if key != "GITHUB_STEP_SUMMARY"}
         trial.pop("HYPERDRIVE_ID_MB", None)
         generator = step_text(job_text(wf_text, "staging-api"), "Generate staging wrangler.toml")
@@ -289,7 +289,7 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
                      PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION=OBSERVATION)
         gate = job_text(wf_text, "gate")
         preflight = step_text(gate, "Validate private staging trial settings")
-        condition = "        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}"
+        condition = "        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '' || vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED != '') }}"
         check(condition in preflight.splitlines() and gate.splitlines().count(condition) == 2,
               "trial preflight and its checkout must run when either arm is configured")
         check("        id: trial" in preflight.splitlines(), "missing trial preflight output ID")
@@ -327,12 +327,12 @@ def scenario(wrangler, wf_text, sha, manifest, base, path, worker, mirror, api_p
         output = tree / "trial-output"
         trial_env = {**env, **trial, "GITHUB_OUTPUT": str(output)}
         good = run(args, cwd=tree, env=trial_env, label="private staging preflight")
-        check(good.returncode == 0 and output.read_text() == "browser_playback=1\n",
+        check(good.returncode == 0 and output.read_text() == "browser_playback=1\nprivate_trial_upload=0\n",
               "complete settings did not arm the browser build")
         output.write_text("")
         off = run(args, cwd=tree, env={**trial_env, "PRIVATE_PLAYBACK_STAGING_ENABLED": "false",
                                       "PRIVATE_MUSIC_STAGING_JOURNEY": "false"}, label="private staging preflight disarmed")
-        check(off.returncode == 0 and output.read_text() == "browser_playback=0\n",
+        check(off.returncode == 0 and output.read_text() == "browser_playback=0\nprivate_trial_upload=0\n",
               "disarmed settings enabled the browser build")
         for key, value in (
             ("API_RP_ORIGIN_STAGING", ""),

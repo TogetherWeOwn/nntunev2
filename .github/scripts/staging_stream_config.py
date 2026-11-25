@@ -86,6 +86,7 @@ def trial_db_bindings(env):
 
 def trial_preflight(env):
     armed = bool(api_vars(env))
+    trial_db_bindings(env)
     source = tomllib.loads(Path("workers/stream/wrangler.toml").read_text())
     render(source, env)
     if armed:
@@ -160,5 +161,6 @@ if __name__ == "__main__":
             print("\n".join(trial_db_bindings(os.environ)))
         case ["--trial-preflight"]:
             print(f"browser_playback={int(trial_preflight(os.environ))}")
+            print(f"private_trial_upload={int(trial_upload(os.environ))}")
         case _:
             raise SystemExit(2)

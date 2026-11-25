@@ -33,6 +33,27 @@ def steps(section):
 
 
 class WorkerBuildWorkflowTests(unittest.TestCase):
+    def test_private_upload_uses_the_gate_and_checks_all_connections_before_deploy(self):
+        text = (ROOT / ".github/workflows/deploy.yml").read_text()
+        gate = job(text, "gate")
+        self.assertIn("private_trial_upload: ${{ steps.trial.outputs.private_trial_upload || '0' }}", gate)
+        items = steps(job(text, "staging-api"))
+        build, generate, cache, deploy = (
+            next(i for i, step in enumerate(items) if name in step)
+            for name in ("Build api with canonical tools", "Generate staging wrangler.toml",
+                         "Require uncached private trial connections", "id: deploy\n")
+        )
+        self.assertIn("if [[ '${{ needs.gate.outputs.private_trial_upload }}' == 1 ]]; then", items[build])
+        self.assertIn(BUILD + " --features encrypted-upload-caller 2>&1 | tee", items[build])
+        self.assertIn("else\n            " + BUILD + " 2>&1 | tee", items[build])
+        self.assertIn("          private_playback=$(python3 -I ../../.github/scripts/staging_stream_config.py --api-vars)", items[generate])
+        self.assertIn("--trial-db-bindings >> wrangler.toml", items[generate])
+        self.assertLess(generate, cache)
+        self.assertLess(cache, deploy)
+        self.assertIn("needs.gate.outputs.private_trial_upload == '1'", items[cache])
+        self.assertIn("if len(ids) != 4:", items[cache])
+        self.assertIn('while IFS= read -r id; do\n            ./check_hyperdrive_cache.sh --config-id "$id"', items[cache])
+
     def test_private_upload_is_default_off_and_uses_distinct_staging_bindings(self):
         self.assertEqual(STREAM_CONFIG.api_vars({}), [])
         self.assertEqual(STREAM_CONFIG.trial_db_bindings({}), [])

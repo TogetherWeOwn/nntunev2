@@ -83,6 +83,7 @@ jobs:
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
       browser_playback: ${{ steps.trial.outputs.browser_playback || '0' }}
+      private_trial_upload: ${{ steps.trial.outputs.private_trial_upload || '0' }}
     steps:
       - id: check
         env:
@@ -100,14 +101,20 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}
+        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '' || vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED != '') }}
         with:
           persist-credentials: false
       - name: Validate private staging trial settings
         id: trial
-        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '') }}
+        if: ${{ github.event_name == 'push' && (vars.PRIVATE_MUSIC_STAGING_JOURNEY != '' || vars.PRIVATE_PLAYBACK_STAGING_ENABLED != '' || vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED != '') }}
         env:
           HYPERDRIVE_ID_STAGING: ${{ vars.HYPERDRIVE_ID_STAGING }}
+          HYPERDRIVE_ID_MB: ${{ vars.HYPERDRIVE_ID_MB }}
+          PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED: ${{ vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED }}
+          PRIVATE_TRIAL_UPLOAD_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_UPLOAD_DB_STAGING_ID }}
+          PRIVATE_TRIAL_AUTH_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_AUTH_DB_STAGING_ID }}
+          PRIVATE_TRIAL_PUBLISH_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_PUBLISH_DB_STAGING_ID }}
+          PRIVATE_TRIAL_ENROLL_DB_STAGING_ID: ${{ vars.PRIVATE_TRIAL_ENROLL_DB_STAGING_ID }}
           API_RP_ID_STAGING: ${{ vars.API_RP_ID_STAGING }}
           API_RP_ORIGIN_STAGING: ${{ vars.API_RP_ORIGIN_STAGING }}
           STREAM_SERVICE_STAGING: ${{ vars.STREAM_SERVICE_STAGING }}
@@ -241,12 +248,10 @@ jobs:
       - name: Build api with canonical tools
         if: steps.config.outputs.configured == 'true'
         working-directory: workers/api
-        env:
-          PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED: ${{ vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED }}
         run: |
           set -euo pipefail
           cargo metadata --locked --format-version 1 > /dev/null
-          if [[ "$PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED" == true ]]; then
+          if [[ '${{ needs.gate.outputs.private_trial_upload }}' == 1 ]]; then
             worker-build --release -- --locked --features encrypted-upload-caller 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
           else
             worker-build --release -- --locked 2>&1 | tee "$RUNNER_TEMP/worker-api.log"
@@ -465,7 +470,7 @@ jobs:
             echo "stream: absent (Subsonic stream answers error 70)" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Require uncached private trial connections
-        if: steps.config.outputs.configured == 'true' && vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED == 'true'
+        if: steps.config.outputs.configured == 'true' && needs.gate.outputs.private_trial_upload == '1'
         working-directory: workers/api
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
