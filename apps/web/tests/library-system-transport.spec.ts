@@ -216,9 +216,11 @@ test('direct Library-to-demo navigation leaves the demo system controls usable',
 	const wav = expectedSyntheticBody();
 	await page.route('**/api/demo/audio**', (route) => serveRangedAudio(route, wav, 'audio/wav'));
 	await openWithSystemControls(page);
+	const session = await page.evaluateHandle(() => navigator.mediaSession);
 	await navigateInApp(page, '/demo/player');
 	await expect(page).toHaveURL(/\/demo\/player$/);
 	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	expect(await session.evaluate((original) => original === navigator.mediaSession)).toBe(true);
 	const demo = page.getByTestId('demo-audio');
 	await expect(demo).toBeVisible();
 	await expect.poll(() => systemSnapshot(page)).toMatchObject({
@@ -228,8 +230,11 @@ test('direct Library-to-demo navigation leaves the demo system controls usable',
 	const current = await systemSnapshot(page);
 	expect(current.metadata?.title).not.toBe(coral.title);
 	await expect(demo).toHaveJSProperty('paused', true);
+	const time = () => demo.evaluate((el: HTMLAudioElement) => el.currentTime);
+	const pausedAt = await time();
 	await systemAction(page, 'play');
 	await expect(demo).toHaveJSProperty('paused', false);
+	await expect.poll(time).toBeGreaterThan(pausedAt + 0.1);
 	await systemAction(page, 'pause');
 	await expect(demo).toHaveJSProperty('paused', true);
 	expect(await systemSnapshot(page)).toEqual(current);
