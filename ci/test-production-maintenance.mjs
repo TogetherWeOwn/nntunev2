@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { finalSmokeFixture, mainSha, recoveryError, recoveryFixture } from './fixtures/production-worker-transport.mjs';
+import { seedTransport } from './fixtures/production-maintenance-seed.mjs';
 import { admitRecovery } from './production-maintenance/recovery-evidence.mjs';
 import { seedMaintenance } from './production-maintenance/seed.mjs';
 import worker from './production-maintenance/worker.mjs';
@@ -32,9 +33,12 @@ const version = '12345678-1234-1234-1234-123456789abc';
 const workflow = readFileSync(new URL('../.github/workflows/deploy-production.yml', import.meta.url), 'utf8');
 const sha = 'a'.repeat(40);
 const workerId = 'b'.repeat(32);
+const account = 'd'.repeat(32);
 const checkedAt = '2026-10-01T12:00:00Z';
 const now = () => Date.parse(checkedAt) + 60_000;
 const routeProof = JSON.stringify({ worker_id: workerId, sha, checked_at: checkedAt, route_count: 0 });
+const bootstrap = workflow.split('\n  bootstrap-maintenance:\n')[1].split('\n  recover-worker:\n')[0];
+const seedCommand = bootstrap.match(/\n        run: (node ci\/production-maintenance\/seed\.mjs)\n/)?.[1];
 
 test('only exact-main bootstrap uses the protected production job after staging admission', (t) => {
   const preflight = workflow.match(/id: target\n        env:\n((?: {10}[^\n]*\n)+)        run: \|\n((?: {10}[^\n]*\n)+)/);
@@ -59,7 +63,7 @@ test('only exact-main bootstrap uses the protected production job after staging 
       timeout: 5_000,
     }).status, expected);
   }
-  const job = workflow.split('\n  bootstrap-maintenance:\n')[1].split('\n  release:\n')[0];
+  const job = bootstrap;
   assert.match(job, /if: inputs.mode == 'bootstrap-maintenance'\n    needs: \[preflight, staging-evidence\]/);
   assert.match(job, /group: production-worker-mutation\n      cancel-in-progress: false\n    environment: production/);
   const gate = job.match(/steps:\n      - name: Require the exact Release Manager-accepted SHA\n        env:\n(?: {10}[^\n]*\n)*? {10}ACCEPTED_SHA: \$\{\{ vars\.PRODUCTION_ACCEPTED_SHA \}\}\n        run: \|\n((?: {10}[^\n]*\n)+)      - uses: actions\/checkout@/);
@@ -72,17 +76,22 @@ test('only exact-main bootstrap uses the protected production job after staging 
   }
   const workspace = mkdtempSync(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || tmpdir(), 'maintenance-preflight-'));
   t.after(() => rmSync(workspace, { recursive: true, force: true }));
-  const output = join(workspace, 'github-output');
-  for (const [overrides, refusal] of [
+  const attempts = [
+    [{ PRODUCTION_DEPLOY_ENABLED: '' }, /Production lane disabled/],
     [{ DEPLOY_MODE: 'promote' }, /Application promotion is disabled/],
     [{ INPUT_SHA: 'c'.repeat(40) }, /must match the dispatched main commit/],
     [{}],
-  ]) {
+    [{ PRODUCTION_DEPLOY_ENABLED: 'false' }, /Production lane disabled/],
+    [{ PRODUCTION_DEPLOY_ENABLED: 'false' }, /Production lane disabled/],
+    [{ PRODUCTION_DEPLOY_ENABLED: 'false', DEPLOY_MODE: 'recover-worker', RECOVERY_RUN_ID: '12' }],
+  ];
+  for (const [index, [overrides, refusal]] of attempts.entries()) {
+    const output = join(workspace, `github-output-${index}`);
     const result = spawnSync('/bin/bash', ['-c', preflight[2].replace(/^ {10}/gm, '')], {
       encoding: 'utf8', timeout: 5_000, env: {
         PATH: process.env.PATH, GITHUB_OUTPUT: output, GITHUB_REF: 'refs/heads/main', GITHUB_SHA: sha,
         INPUT_SHA: sha, DEPLOY_MODE: 'bootstrap-maintenance', PRODUCTION_DEPLOY_ENABLED: 'true',
-        UNPROTECTED_ACCEPTED_SHA: '',
+        UNPROTECTED_ACCEPTED_SHA: '', GITHUB_RUN_ATTEMPT: '1',
         PRODUCTION_DOMAIN: 'example.com', PRODUCTION_DOMAIN_DEFAULT: 'example.invalid',
         ...overrides,
       },
@@ -109,50 +118,8 @@ test('production requires the independently accepted SHA before checkout or cred
   }
 });
 
-function cloudflareFixture(overrides = {}) {
-  const account = 'd'.repeat(32);
-  const root = `https://api.cloudflare.com/client/v4/accounts/${account}/workers`;
-  const pinned = `/workers/${workerId}`;
-  const script = '/scripts/nntune-web';
-  const query = '?page=1&per_page=2';
-  const deployments = `${script}/deployments${query}`;
-  const state = { id: workerId, name: 'nntune-web', references: { domains: [] },
-    subdomain: { enabled: false, previews_enabled: false } };
-  const seed = { id: version, annotations: { 'workers/tag': sha }, bindings: [] };
-  const calls = [];
-  let written = false;
-  const request = async (url, options) => {
-    assert.ok(url.startsWith(root + '/'));
-    const path = url.slice(root.length);
-    calls.push([options.method, path]);
-    assert.equal(options.headers.Authorization, 'Bearer fixture-only');
-    assert.equal(options.redirect, 'error');
-    const entries = written ? [{ versions: [{ version_id: version, percentage: 100 }] }] : [];
-    const list = (result, count) => ({ result, result_info: { page: 1, count, total_count: count } });
-    let envelope;
-    if (options.method === 'POST') {
-      assert.equal(path, `${pinned}/versions?deploy=true`);
-      const code = readFileSync(new URL('./production-maintenance/worker.mjs', import.meta.url));
-      assert.deepEqual(JSON.parse(options.body), {
-        main_module: 'worker.mjs', compatibility_date: '2026-10-01', bindings: [], annotations: seed.annotations,
-        modules: [{ name: 'worker.mjs', content_type: 'application/javascript+module', content_base64: code.toString('base64') }],
-      });
-      written = true;
-      envelope = { result: seed };
-    } else if (path === pinned) {
-      envelope = { result: { ...state, deployed_on: written ? checkedAt : null, ...overrides.worker } };
-    } else if (path === deployments) {
-      envelope = { ...list({ deployments: entries }, entries.length), ...(written ? overrides.readback : overrides.deployments) };
-    } else if (path === `${pinned}/versions${query}`) {
-      envelope = { ...list([], 0), ...overrides.versions };
-    } else if (path === `${script}/settings`) {
-      envelope = { result: { bindings: [], ...overrides.settings } };
-    } else {
-      assert.equal(path, `${pinned}/versions/${version}`);
-      envelope = { result: seed };
-    }
-    return Response.json({ success: true, errors: [], ...envelope });
-  };
+function cloudflareFixture(overrides) {
+  const { calls, request } = seedTransport({ account, checkedAt, sha, version, workerId }, overrides);
   return { calls, run: (input = {}) => seedMaintenance({ account, token: 'fixture-only', worker: workerId,
     sha, routeProof, now, request, ...input }) };
 }
@@ -160,15 +127,17 @@ function cloudflareFixture(overrides = {}) {
 test('empty Worker is seeded once, read back at 100%, and refuses re-entry', async () => {
   const { calls, run } = cloudflareFixture();
   assert.equal(await run(), version);
-  assert.deepEqual(calls.map(([method]) => method), ['GET', 'GET', 'GET', 'GET', 'POST', 'GET', 'GET', 'GET']);
+  assert.deepEqual(calls.map(([method]) => method), ['GET', 'GET', 'GET', 'GET', 'POST', 'GET', 'GET', 'GET', 'GET']);
   await assert.rejects(run(), /not confirmed undeployed and unexposed/);
   assert.equal(calls.filter(([method]) => method === 'POST').length, 1);
 });
 
 test('incumbent, exposed or uncertain Worker never reaches a write', async () => {
   for (const [overrides, diagnostic] of [
+    [{ unregistered: true }, /Worker identity.*HTTP 404/],
     [{ worker: { deployed_on: checkedAt } }, /not confirmed undeployed/],
     [{ worker: { id: 'c'.repeat(32) } }, /not confirmed undeployed/],
+    [{ worker: { name: 'other-app' } }, /not confirmed undeployed/],
     [{ worker: { references: { domains: [{ hostname: 'example.com' }] } } }, /unexposed/],
     [{ worker: { subdomain: { enabled: true, previews_enabled: false } } }, /unexposed/],
     [{ worker: { subdomain: { enabled: false } } }, /unexposed/],
@@ -193,13 +162,78 @@ test('missing, stale, mismatched or nonempty route proof refuses before Cloudfla
   assert.deepEqual(calls, []);
 });
 
-test('wrong allocation, version or page count fails readback without retry or deletion', async () => {
-  for (const [version_id, percentage, total_pages] of [[version, 99, 1], ['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, 1], [version, 100, 2]]) {
+test('wrong deployment ID, allocation or page count fails readback without retry or deletion', async () => {
+  for (const [id, version_id, percentage, total_pages] of [
+    ['malformed', version, 100, 1],
+    [version, version, 99, 1],
+    [version, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 100, 1],
+    [version, version, 100, 2],
+  ]) {
     const { calls, run } = cloudflareFixture({ readback: { result_info: { page: 1, count: 1, total_count: 1, total_pages },
-      result: { deployments: [{ versions: [{ version_id, percentage }] }] } } });
+      result: { deployments: [{ id, versions: [{ version_id, percentage }] }] } } });
     await assert.rejects(run(), total_pages === 1 ? /exactly the new seed version at 100%/ : /complete first page/);
     assert.deepEqual(calls.map(([method]) => method), ['GET', 'GET', 'GET', 'GET', 'POST', 'GET']);
   }
+});
+
+test('a foreign allocation or version cannot be accepted as the seed for this submission', async () => {
+  const foreign = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  for (const [overrides, diagnostic] of [
+    [{ acknowledged: foreign }, /exactly the new seed version at 100%/],
+    [{ submission: 'lost', seed: { annotations: { 'workers/tag': sha } } }, /this submission/],
+    [{ submission: 'lost', seed: { bindings: [{ type: 'secret_text' }] } }, /binding-free seed/],
+    [{ versionReadback: { result: [{ id: version }, { id: foreign }],
+      result_info: { page: 1, count: 2, total_count: 2 } } }, /exactly 1 versions/],
+    [{ versionReadback: { result: [{ id: foreign }] } }, /this submission/],
+  ]) {
+    const { calls, run } = cloudflareFixture(overrides);
+    await assert.rejects(run(), diagnostic);
+    assert.equal(calls.filter(([method]) => method === 'POST').length, 1);
+  }
+});
+
+test('protected bootstrap command reconciles a committed seed after a lost response and refuses a partial one', () => {
+  assert.ok(seedCommand);
+  const transport = new URL('./fixtures/production-maintenance-seed.mjs', import.meta.url).href;
+  const checkedAt = new Date().toISOString().slice(0, 19) + 'Z';
+  for (const submission of ['lost', 'partial', 'no-commit']) {
+    const preload = `
+      import { seedTransport } from ${JSON.stringify(transport)};
+      const { calls, request } = seedTransport(
+        ${JSON.stringify({ account, checkedAt, sha, version, workerId })}, ${JSON.stringify({ submission })}
+      );
+      globalThis.fetch = request;
+      process.on('exit', () => {
+        const posts = calls.filter(([method]) => method === 'POST').length;
+        if (posts !== 1) {
+          console.error('Expected one seed POST, saw ' + posts);
+          process.exitCode = 2;
+        }
+      });
+    `;
+    const result = spawnSync('/bin/bash', ['-c', seedCommand], {
+      env: {
+        PATH: process.env.PATH, NODE_OPTIONS: `--import=data:text/javascript;base64,${Buffer.from(preload).toString('base64')}`,
+        CLOUDFLARE_ACCOUNT_ID: account, CLOUDFLARE_API_TOKEN: 'fixture-only', WORKER_ID: workerId,
+        DEPLOY_SHA: sha, ROUTE_PROOF: JSON.stringify({ worker_id: workerId, sha, checked_at: checkedAt, route_count: 0 }),
+      },
+      encoding: 'utf8', timeout: 5_000,
+    });
+    assert.equal(result.status, submission === 'lost' ? 0 : 1, result.stderr);
+    if (submission === 'lost') assert.match(result.stdout, new RegExp(`${version} verified at 100%`));
+    else {
+      assert.equal(result.stdout, '');
+      assert.match(result.stderr, /Reconcile Worker, deployment and route state/);
+    }
+    assert.doesNotMatch(result.stdout + result.stderr, /fixture-only|synthetic private provider failure/);
+  }
+});
+
+test('a registered version without a deployment refuses a fresh bootstrap without another write', async () => {
+  const { calls, run } = cloudflareFixture({ submission: 'partial' });
+  await assert.rejects(run(), /deployment/i);
+  await assert.rejects(run(), /exactly 0 versions/);
+  assert.equal(calls.filter(([method]) => method === 'POST').length, 1);
 });
 
 test('automatic rollback passes the selected maintenance UUID to the locked binary without npm fallback', () => {
@@ -275,6 +309,9 @@ test('final smoke refuses stale or tampered intent, changed targets and newer al
   await assert.rejects(run('restore', { GITHUB_RUN_ID: '13' }), /invalid or stale/);
   await assert.rejects(run('restore', { GITHUB_RUN_ATTEMPT: '2' }), /production rollback context/);
   await assert.rejects(run('restore', { ROLLBACK_CUSTODY: JSON.stringify({ ...custody, exclusive_writers: false }) }), /custody/);
+  state.name = 'other-app';
+  await assert.rejects(run('restore'), /Worker identity/);
+  state.name = 'nntune-web';
   state.subdomain.previews_enabled = true;
   await assert.rejects(run('restore'), /previews drifted/);
   state.subdomain.previews_enabled = false;
@@ -322,8 +359,9 @@ test('a regression during the release watch restores the verified previous Worke
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
 });
 
-test('an interrupted 100% promotion can recover maintenance from a fresh runner', async (t) => {
+test('first-release switch-off recovers maintenance from a fresh runner and repeats without writes', async (t) => {
   const transport = finalSmokeFixture(t, { ...rollbackFixture, sha: mainSha() }, 'lost');
+  assert.equal(transport.custody.previous, undefined);
   await transport.run('record');
   transport.shift();
   const { fresh, enter, claimedRecovery } = recoveryFixture(t, transport, 'cancelled');
@@ -336,8 +374,11 @@ test('an interrupted 100% promotion can recover maintenance from a fresh runner'
   transport.fail.nextRead = true;
   await assert.rejects(enter(fresh('13')), /Cloudflare request/);
   assert.match(await enter(fresh('14')), /reconciled by readback/);
+  const afterRecovery = transport.calls.length;
   assert.match(await enter(fresh('15')), /already verified/);
   assert.match(await claimedRecovery(fresh('16'), now), /already verified/);
+  assert.ok(transport.calls.slice(afterRecovery).every((method) => method === 'GET'));
+  assert.deepEqual(transport.rows[0].versions, [{ version_id: version, percentage: 100 }]);
   assert.equal(transport.calls.filter((method) => method === 'POST').length, 1);
 });
 
