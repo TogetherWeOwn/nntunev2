@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from contract import KEY, PATH, bulk_body, bulk_checksum, denied_matrix, require, require_denial
 from qualify import wait_for
 from render import BUCKET
-from wire import response, signed
+from wire import request_bytes, response, signed
 
 
 ENDPOINT = "127.0.0.1:8333"
@@ -61,8 +61,6 @@ class Storage:
     def curl(self, method, target, fields, body):
         args = ["exec", "-T", "backend", "curl", "-q", "--http1.1", "--silent", "--show-error",
                 "--max-time", "8", "--include", "--path-as-is", "--request", method]
-        if method == "HEAD":
-            args.append("--head")
         for name, value in fields:
             args.extend(("--header", f"{name}: {value}"))
         if body or method == "POST":
@@ -80,6 +78,10 @@ class Storage:
 
     def s3(self, method, target, body=b"", *, identity=None, extra=()):
         fields = signed(method, target, ENDPOINT, identity or self.stack.admin, body, extra)
+        if method in ("HEAD", "DELETE"):
+            # Check the actual backend reply to connection close. HTTP clients
+            # can discard bytes following the headers of HEAD and 204 replies.
+            return response(self.stack.backend_wire(request_bytes(method, target, fields, body)))
         return self.curl(method, target, fields, body)
 
     def upload(self, body):
@@ -223,6 +225,7 @@ class Storage:
         require((status, body) == (403, b"") and "x-nntune-boundary" not in headers,
                 "backend did not enforce SigV4 independently")
         for version in (self.selected, self.sibling):
+            present(self.s3("HEAD", version_target(version)), version, "private present version HEAD")
             present(boundary.request("HEAD", version_target(version)), version, "present version HEAD")
         if bundle:
             from launcher import qualified_launcher

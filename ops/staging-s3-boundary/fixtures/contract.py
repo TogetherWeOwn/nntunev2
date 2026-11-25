@@ -2,7 +2,7 @@
 
 from base64 import b64encode
 from dataclasses import dataclass
-from hashlib import md5
+from hashlib import md5, sha256
 import json
 from pathlib import Path
 
@@ -156,6 +156,9 @@ def recording_contract(stack, boundary):
         require((request["method"], request["uri"]) == (method, target), "request target changed")
         require(request["host"] == headers.pop("host"), "signed Host changed")
         actual = {name.lower(): values for name, values in request["headers"].items()}
+        authorization = headers.pop("authorization")
+        require(actual.get("authorization") == [sha256(authorization.encode()).hexdigest()[:8]],
+                "upstream authorization changed or was logged without hashing")
         require(all(actual.get(name) == [value] for name, value in headers.items()), "signed header changed")
     print("Recording upstream preserved signed requests and backend replies, with zero denied traffic.", flush=True)
 

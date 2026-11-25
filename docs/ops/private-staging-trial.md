@@ -155,6 +155,10 @@ needs list access as a stop. Keep the scope and credentials in protected custody
 #### Provider-only preflight
 
 For a hosted run, use [staging-trial-provider-preflight](../../.github/workflows/staging-trial-provider-preflight.yml).
+The protected workflow needs its own reachable HTTPS ingress forwarding to
+the boundary's loopback listener. Provision and verify that ingress through
+the protected rollout before dispatch. The disposable qualification uses a
+runner-local endpoint.
 Prepare the two disposable versions and read back the credential policy as
 described below. Supply the four settings below as secrets in the existing
 `staging` Environment for this run. The endpoint and region secrets must match

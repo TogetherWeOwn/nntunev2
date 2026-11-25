@@ -10,7 +10,12 @@
 :8333 {
 	log {
 		output stdout
-		format json
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization hash
+			}
+		}
 	}
 	route {
 		header Cache-Control public

@@ -59,9 +59,13 @@ def read_to_close(stream):
     return bytes(chunks)
 
 
-def exchange(port, method, target, headers, body=b"", protocol="HTTP/1.1"):
+def request_bytes(method, target, headers, body=b"", protocol="HTTP/1.1"):
     lines = [f"{method} {target} {protocol}", "Connection: close"]
     lines.extend(f"{name}: {value}" for name, value in headers)
+    return "\r\n".join([*lines, "", ""]).encode("ascii") + body
+
+
+def exchange(port, method, target, headers, body=b"", protocol="HTTP/1.1"):
     with connect(port) as stream:
-        stream.sendall("\r\n".join([*lines, "", ""]).encode("ascii") + body)
+        stream.sendall(request_bytes(method, target, headers, body, protocol))
         return response(read_to_close(stream))

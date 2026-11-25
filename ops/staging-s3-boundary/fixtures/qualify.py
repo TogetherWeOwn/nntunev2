@@ -106,6 +106,16 @@ volumes:
         result = run([*self.cmd, *args], self.compose_env, data=data, check=check, timeout=timeout)
         return result.stdout.decode()
 
+    def backend_wire(self, request):
+        # Save the exec streams before nc gives its connected socket to sh.
+        # Keep the socket writable until SeaweedFS closes the response.
+        relay = (
+            "exec 8<&0 9>&1; "
+            "exec timeout 8 nc 127.0.0.1 8333 -e sh -ec 'cat <&8; exec cat >&9'"
+        )
+        args = [*self.cmd, "exec", "-T", "backend", "sh", "-ec", relay]
+        return run(args, self.compose_env, data=request, timeout=12).stdout
+
     def start(self):
         self.run("up", "-d", timeout=180)
         address = self.run("port", "boundary", "8080").strip()
