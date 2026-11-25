@@ -73,11 +73,12 @@ export function createBrowserPlaybackSession(
 				}
 			});
 		},
-		open(trackId: string, current: () => boolean, publish: (source: BrowserPlaybackSource) => void, playId?: string) {
+		open(trackId: string, current: () => boolean, publish: (source: BrowserPlaybackSource) => void, playId?: string,
+			onDiscarded?: () => void) {
 			return serialize(() => grant.open({ trackId, playId }, signal, () => {
 				if (expired?.()) expire();
 				return (playId !== undefined || !uncertain) && current();
-			}, publish));
+			}, publish, onDiscarded));
 		}
 	};
 }

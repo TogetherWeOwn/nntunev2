@@ -26,13 +26,15 @@ type QueueAuthority = Pick<ReturnType<typeof createQueueController>,
 export type MediaSelection = {
 	commit: (queue: QueueState, grant?: BrowserPlaybackSource) => boolean;
 	streamFor?: (track: Track | null) => string;
-	prepare?: (trackId: string, isCurrent: () => boolean, publish: (source: BrowserPlaybackSource) => void, retry?: boolean) => Promise<boolean>;
+	prepare?: (trackId: string, isCurrent: () => boolean, publish: (source: BrowserPlaybackSource) => void,
+		options?: { retry?: boolean; retireSuperseded?: () => boolean }) => Promise<boolean>;
 	flush: () => Promise<void>;
 	browseCopy: { invalidate: () => void };
 	announce: (message: string, replay?: boolean) => void;
 };
 
 const REPEAT_KEY = 'nntune:library-repeat:v1';
+const PREVIOUS_RESTART_SECONDS = 3;
 // Native played snapshots are static and normalized (ordered, disjoint, non-touching ranges).
 function playedNewTail(before: TimeRanges, after: TimeRanges, end: number, duration: number): boolean {
 	for (let i = 0, j = 0; i < (after?.length ?? 0); i++) {
@@ -137,7 +139,7 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			: audio.error || (!audio.paused && !audio.ended)) ||
 			!matches(() => playIntent === previousIntent && sameTrack())) return;
 		if (trackId && selection?.prepare && !recoverPosition) {
-			return preparePlay(trackId, matches, () => startCurrent(true, true), true);
+			return preparePlay(trackId, matches, () => startCurrent(true, true), { retry: true });
 		}
 		++playIntent;
 		if (retry) ++endGeneration;
@@ -253,7 +255,29 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			selection.commit({ ...next, tracks });
 		}
 	}
-	const queueTransport = { playCurrent, pauseCurrent, onNext: () => navigateQueue(nextTrack), onPrevious: () => navigateQueue(previousTrack) };
+
+	function previousFromTransport(): void {
+		const transport = selection?.prepare ? transportTarget() : undefined;
+		if (!transport) return navigateQueue(previousTrack);
+		const base = queue.snapshot;
+		const { audio, matches } = transport;
+		const sameQueue = () => queue.snapshot === base;
+		if (!matches(sameQueue)) return;
+		const playing = !audio.paused && !audio.ended && !audio.error;
+		const position = audio.currentTime;
+		if (!matches(sameQueue)) return;
+		if (!playing) return navigateQueue(previousTrack);
+		if (position >= PREVIOUS_RESTART_SECONDS) return restart();
+		if (pendingGrant !== undefined) return;
+		const previous = previousTrack(base);
+		if (previous === base) return;
+		const target = currentTrack(previous);
+		const source = target && queue.sourceForQueuedPlay(target.id);
+		if (target && source) void preparePlay(target.id, source.isCurrent,
+			(grant) => playSelected(previous, previous.currentIndex, grant, '', grant), { retireSuperseded: true });
+	}
+
+	const queueTransport = { playCurrent, pauseCurrent, onNext: () => navigateQueue(nextTrack), onPrevious: previousFromTransport };
 
 	function clearJumpFeedback(): void {
 		const feedback = get(seekFeedback);
@@ -311,7 +335,8 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 		}
 	}
 
-	async function preparePlay(trackId: string, isEligible: () => boolean, publish: (source: BrowserPlaybackSource) => Promise<void>, retry?: boolean) {
+	async function preparePlay(trackId: string, isEligible: () => boolean, publish: (source: BrowserPlaybackSource) => Promise<void>,
+		{ retry, retireSuperseded }: { retry?: boolean; retireSuperseded?: boolean } = {}) {
 		if (!selection?.prepare || destroyed || queue.purging || !isEligible()) return;
 		const request = pendingGrant = ++grantIntent;
 		const revision = queue.revision, intent = playIntent, position = positionIntent, version = attachmentVersion;
@@ -319,7 +344,9 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 			intent === playIntent && position === positionIntent && version === attachmentVersion;
 		let playback: Promise<void> | undefined;
 		try {
-			const accepted = await selection.prepare(trackId, current, (grant) => { playback = publish(grant); }, retry);
+			const accepted = await selection.prepare(trackId, current, (grant) => { playback = publish(grant); }, {
+				retry, retireSuperseded: retireSuperseded ? () => pendingGrant === request : undefined
+			});
 			if (!accepted && current()) selection.announce('Could not start playback.', true);
 			await playback;
 		} finally { if (pendingGrant === request) pendingGrant = undefined; }
