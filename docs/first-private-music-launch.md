@@ -37,7 +37,8 @@ fallback. Keep deployment and release approvals pending in the candidate record
 until their evidence is available.
 [Staging deploy](../.github/workflows/deploy.yml) ·
 [Production preflight](../.github/workflows/deploy-production.yml) ·
-[Staging admission policy](../ci/staging-admission-policy.json)
+[Staging admission policy](../ci/staging-admission-policy.json) ·
+[Cancelled production approval rehearsal](ops.md#offline-rehearsal-for-cancelled-production-approval)
 
 ## Qualify the candidate
 
@@ -207,6 +208,17 @@ raw diagnostics and connection details out of the record. The
 [offline verifier fixtures](../ci/test_staging_admission.py) contain synthetic
 receipts for rehearsing the staging section only.
 
+Before dispatch, record `<candidate-sha>` under **Candidate** and
+`<private-maintenance-seed-evidence>` under **Protected switch-off**. Leave the
+rollback artifact reference pending until the original rollout uploads
+`production-rollback-intent-<original-rollout-run-id>-1` before shifting traffic.
+Add its private link alongside the seed evidence. Protected recovery uses the
+sealed intent from attempt 1 of that rollout.
+
+After successful final smoke, the [promotion proof](ops.md#production-promotion-publishes-a-calver-release)
+uses the separate `production-promotion-<candidate-sha>-<original-rollout-run-id>-1`
+receipt for release publication.
+
 | Item | Pin or evidence to record |
 | --- | --- |
 | Candidate | Full main SHA, artifact digest(s), exact-head required checks and per-PR review references |
@@ -215,7 +227,7 @@ receipts for rehearsing the staging section only.
 | Staging rollback | Last-good SHA, run/attempt, restore and identity readback |
 | Production baseline | Protected source SHA, run/attempt and job URL, private provider branch and logical DB/OID reference, manifest digest, read time and `empty` verdict, separate no-live-user/data confirmation, writer fence and custodian |
 | Pre-schema snapshot | Private snapshot reference, capture and completion UTC, branch and restore scope, expiry, verification reference and first schema apply boundary |
-| Protected switch-off | Executors and protected controls for Access/invites and API/media, verified maintenance Worker/deployment/version/seed SHA/module digest, sealed intent custody reference, expected denials and grant expiry boundary |
+| Protected switch-off | Executors and protected controls for Access/invites and API/media, private seed evidence for the verified maintenance Worker/deployment/version/seed SHA/module digest, sealed intent custody reference and original rollout artifact link when published, expected denials and grant expiry boundary |
 | Release review and dispatch | Independent reviewer, decision (initially `Pending`, then `APPROVE` or `BLOCK`), UTC and review reference for the pinned SHA and staging attempt, protected workflow and rollout run/attempt, final deployment/version and smoke result |
 | Dispatch readiness | Pending. Record ready or blocked under the [existing qualification steps](#qualify-the-candidate), with a safe reference to the supporting evidence or blocker. |
 | Health watch and recovery | Watcher, backup, UTC start/end, health and error baseline/threshold, readback schedule and results. Actual disposition pending until the [watch](#watch-the-first-30-minutes) or [switch-off](#switch-off-and-verify) has an outcome. Record the watch result when run and whether recovery was invoked. If used, record the trigger and UTC, recovery attempt and outcome, denial and final allocation readbacks. Link the release thread and product log entries. |
