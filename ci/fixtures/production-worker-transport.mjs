@@ -15,7 +15,8 @@ export function recoveryError(command) {
   });
 }
 
-export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId }, outcome = 'ack', kind = 'maintenance') {
+export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId, deploymentReadback },
+  outcome = 'ack', kind = 'maintenance') {
   const temp = mkdtempSync(join(tmpdir(), 'final-smoke-'));
   t.after(() => rmSync(temp, { recursive: true, force: true }));
   const id = (n) => `00000000-0000-0000-0000-${String(n).padStart(12, '0')}`;
@@ -57,8 +58,9 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId },
       fail.nextRead = false;
       throw new Error('synthetic provider read failed');
     }
-    const response = (result, count) => Response.json({ success: true, errors: [], result,
-      result_info: { page: 1, total_count: count, count } });
+    const response = (result, count, transform = (receipt) => receipt) => Response.json(transform({
+      success: true, errors: [], result, result_info: { page: 1, total_count: count, count },
+    }));
     if (options.method === 'POST') {
       assert.equal(path, '/scripts/nntune-web/deployments');
       const { strategy, versions, annotations, ...extra } = JSON.parse(options.body);
@@ -75,7 +77,8 @@ export function finalSmokeFixture(t, { checkedAt, now, sha, version, workerId },
       case `${pinned}/versions/${version}`: return response(seed);
       case `${pinned}/versions/${candidate}`: return response(versions[1]);
       case `${pinned}/versions?page=1&per_page=100`: return response(versions, versions.length);
-      case '/scripts/nntune-web/deployments?page=1&per_page=100': return response({ deployments: rows }, rows.length);
+      case '/scripts/nntune-web/deployments?page=1&per_page=100':
+        return response({ deployments: rows }, rows.length, calls.includes('POST') ? deploymentReadback : undefined);
       default: assert.fail('Unexpected offline request');
     }
   };
