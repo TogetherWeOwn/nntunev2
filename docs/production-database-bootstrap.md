@@ -219,7 +219,7 @@ python3 -B .github/scripts/test_database_bootstrap_environment_readback.py \
   EnvironmentReadbackTests.test_custodian_handoff_before_and_after
 ```
 
-| Saved evidence | `production-db-bootstrap` | `production-db-baseline` | Checker exit |
+| Synthetic fixture | `production-db-bootstrap` | `production-db-baseline` | Checker exit |
 | --- | --- | --- | --- |
 | Before | `main` branch and `main` tag refused | Administrator bypass enabled and refused | `1` |
 | After | Sole `main` branch and bypass disabled | Sole `main` branch and bypass disabled | `0` |
@@ -265,14 +265,16 @@ records the actual Settings and REST readbacks for the live handoff.
    [Snapshot and metering](#snapshot-and-metering) ·
    [Production releases](../CONTRIBUTING.md#production-releases)
 4. After setup, verify the new database OID, reader fence, grants and sibling
-   isolation, and clear the setup candidate variable and authorization. Use
-   the verified database OID and the separately issued reader OID for the
-   baseline plan. Recheck the baseline Environment and confirm approval of
-   the baseline candidate and plan before enabling the baseline. Obtain
-   Environment approval for its exact pending attempt as part of the
-   [protected baseline](#protected-baseline) sequence. Require `empty` and
-   completed reader teardown before handing off to the later migration and
-   cutover gates.
+   isolation. Clear the setup candidate variable and authorization. Retire
+   the temporary setup role under [setup role custody](#setup-role-custody-and-lifecycle),
+   require the fixed `retired` verdict, and confirm removal of its credential,
+   role and sessions before enabling baseline. Use the verified database OID
+   and the separately issued reader OID for the baseline plan. Recheck the
+   baseline Environment and confirm approval of the baseline candidate and
+   plan. Obtain Environment approval for its exact pending attempt as part
+   of the [protected baseline](#protected-baseline) sequence. Require `empty`
+   and completed reader teardown before handing off to the later migration
+   and cutover gates.
 
 ### Setup plan and enforced limits
 
