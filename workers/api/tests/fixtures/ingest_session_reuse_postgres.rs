@@ -114,7 +114,8 @@ pub(super) async fn protect_completed(
         .unwrap();
     // Submit two normal retries on separate writer connections. The first
     // holds the session while it waits for the winner, so the second queues
-    // behind it before either can return a receipt.
+    // behind it before either can return a receipt. The second caller's
+    // fresh-upload deadline has already passed.
     let (first, second) = {
         let mut other_writer = connect(WRITER).await;
         let other_pid = backend_pid(&other_writer).await;
@@ -133,7 +134,7 @@ pub(super) async fn protect_completed(
             &mut other_writer,
             auth,
             prepared,
-            until,
+            UNIX_EPOCH,
             reload,
             no_start
         ));
