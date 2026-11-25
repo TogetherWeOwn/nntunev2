@@ -218,12 +218,15 @@ mod subsonic_measurement;
 
 // The synthetic Node build exports only the adapter, not the Worker entry
 // whose database transport imports the Cloudflare-only sockets module.
-#[cfg(not(all(
-    target_arch = "wasm32",
-    any(
-        feature = "staging-body-wasm-test",
-        feature = "billing-owned-wasm-test",
-        feature = "span-runtime-test"
+#[cfg(not(any(
+    feature = "staging-fixture-cleanup",
+    all(
+        target_arch = "wasm32",
+        any(
+            feature = "staging-body-wasm-test",
+            feature = "billing-owned-wasm-test",
+            feature = "span-runtime-test"
+        )
     )
 )))]
 #[worker::event(fetch)]
@@ -250,6 +253,7 @@ pub async fn main(
     target_arch = "wasm32",
     not(any(
         feature = "staging-body-wasm-test",
+        feature = "staging-fixture-cleanup",
         feature = "billing-owned-wasm-test",
         feature = "span-runtime-test"
     ))

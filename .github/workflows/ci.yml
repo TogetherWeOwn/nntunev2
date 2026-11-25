@@ -2263,6 +2263,9 @@ jobs:
           set -euo pipefail
           command -v psql >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client)
           bash workers/api/tests/run_migration_tests.sh --migrate-only
+          # Snapshot the disposable schema before this fixture writes its own data.
+          env -i PATH="$PATH" PGPASSWORD=ci-throwaway psql -Xw -h 127.0.0.1 -p 5432 -U postgres -d postgres \
+            -v ON_ERROR_STOP=1 -c 'CREATE DATABASE nntunev2_staging TEMPLATE nntune_ci'
           cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features catalogue-playback-wasm-test --target-dir "$RUNNER_TEMP/staging-body-target"
           wasm-bindgen --target nodejs --out-dir "$RUNNER_TEMP/catalogue-playback-js" "$RUNNER_TEMP/staging-body-target/wasm32-unknown-unknown/debug/nntune_api.wasm"
           # The stream and ingest lockfiles pin different wasm-bindgen versions.
@@ -2280,6 +2283,30 @@ jobs:
       - name: Install locked upload CLI without lifecycle scripts
         working-directory: apps/web
         run: pnpm install --frozen-lockfile --ignore-scripts --config.minimumReleaseAge=4320
+      - name: Exercise the one-shot private trial cleanup Worker against disposable PostgreSQL and S3
+        env:
+          PRIVATE_TRIAL_CLEANUP_BUNDLE: ${{ runner.temp }}/trial-cleanup-fixture
+          CLEANUP_FIXTURE_POSTGRES: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          cert="$RUNNER_TEMP/s3-fixture/loopback.crt"
+          docker cp "$cert" "$CLEANUP_FIXTURE_POSTGRES:/tmp/trial-cleanup.crt"
+          docker cp "${cert%.crt}.key" "$CLEANUP_FIXTURE_POSTGRES:/tmp/trial-cleanup.key"
+          docker exec -u root "$CLEANUP_FIXTURE_POSTGRES" chown postgres:postgres /tmp/trial-cleanup.crt /tmp/trial-cleanup.key
+          docker exec -u root "$CLEANUP_FIXTURE_POSTGRES" chmod 600 /tmp/trial-cleanup.key
+          docker exec -u postgres "$CLEANUP_FIXTURE_POSTGRES" env -i PATH=/usr/local/bin:/usr/bin:/bin \
+            psql -Xqw -h /var/run/postgresql -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET ssl_cert_file = '/tmp/trial-cleanup.crt'" \
+            -c "ALTER SYSTEM SET ssl_key_file = '/tmp/trial-cleanup.key'" \
+            -c 'ALTER SYSTEM SET ssl = on' -c 'SELECT pg_reload_conf()'
+          (cd workers/api && worker-build --release --out-dir "$PRIVATE_TRIAL_CLEANUP_BUNDLE" -- --locked --features staging-fixture-cleanup) 2>&1 | tee "$RUNNER_TEMP/worker-trial-cleanup-fixture.log"
+          python3 -I .github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-trial-cleanup-fixture.log"
+          git diff --exit-code -- workers/api/Cargo.lock
+          tls_ready=$(env -i PATH="$PATH" PGPASSWORD=ci-throwaway PGCONNECT_TIMEOUT=5 PGSSLMODE=verify-full PGSSLROOTCERT="$cert" \
+            psql -XqwAt -h 127.0.0.1 -p 5432 -U postgres -d nntunev2_staging \
+            -c 'SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()')
+          test "$tls_ready" = t
+          NODE_EXTRA_CA_CERTS="$cert" node --test workers/api/tests/fixtures/private_trial_cleanup_runner.cjs
       - name: Exclude Subsonic deadline test markers from release WASM
         run: |
           if grep -aEq 'subsonic-connect-deadline-(proof|ok)' workers/api/build/index_bg.wasm; then

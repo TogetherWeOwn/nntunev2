@@ -7,6 +7,8 @@ mod caller;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use caller::worker;
 pub mod cleanup;
+#[cfg(all(target_arch = "wasm32", feature = "staging-fixture-cleanup"))]
+mod cleanup_runner;
 #[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]
 pub mod registered;
 #[cfg(any(target_arch = "wasm32", all(test, feature = "postgres-tests")))]
