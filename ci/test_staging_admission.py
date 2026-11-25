@@ -413,6 +413,19 @@ class PrivateAdmissionTests(Base):
                 self.assertEqual(receipt["coverage"][0]["outcome"], "incomplete")
                 self.assertNotIn("synthetic diagnostic", json.dumps(receipt))
 
+    def test_private_receipt_requires_selected_run_workflow(self):
+        world = PrivateWorld()
+        routes = world.routes()
+        self.assertEqual(world.verify(routes=routes)["result"], "satisfied")
+
+        # Change only the selected run lookup. The receipt and attempt pins still match.
+        for field, foreign in (("workflow_id", WORKFLOW_ID + 1),
+                               ("path", ".github/workflows/other.yml")):
+            with self.subTest(field=field):
+                foreign_run = dict(world.run, **{field: foreign})
+                self.assertWorldRefused(world, "^wrong, superseded or unsuccessful staging attempt$",
+                                        routes={**routes, f"runs/{RUN_ID}": foreign_run})
+
     def test_private_jobs_and_deploy_steps_must_belong_to_the_attempt(self):
         world = PrivateWorld()
         stream = world.jobs[2]
