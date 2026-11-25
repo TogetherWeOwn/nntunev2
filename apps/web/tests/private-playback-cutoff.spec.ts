@@ -1,7 +1,10 @@
 import { errors, expect, type Request } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { privateStagingAudio } from '../../../e2e/helpers/private-staging-fixture.js';
-import { fixtureCookie, hasFixtureSession, serveFlac, test } from './helpers/private-music-fixture.js';
+import {
+	expectPlaybackRefusal, fixtureCookie, hasFixtureSession, observeMediaSources, playQueuedTrack,
+	privateListeningRefusal, serveFlac, test
+} from './helpers/private-music-fixture.js';
 
 test('an open private player refuses to switch tracks at cohort cutoff', async ({ page, context, origin }) => {
 	const { library, player } = PRIVATE_MUSIC;
@@ -16,8 +19,6 @@ test('an open private player refuses to switch tracks at cohort cutoff', async (
 	const bound = async (request: Request) => hasFixtureSession(await request.headerValue('cookie'), listener);
 	const playsUrl = origin + player.plays;
 	const mediaPrefix = `${playsUrl}/media/`;
-	// browser_play_issue returns the private_listening_deadline error once the cohort expires.
-	const cutoff = { code: 'forbidden', message: 'private listening access required', retryable: false };
 	let cutoffReached = false;
 	const grantedMedia = new Map<string, Buffer>();
 	const grants: Request[] = [];
@@ -39,7 +40,7 @@ test('an open private player refuses to switch tracks at cohort cutoff', async (
 		if (request.method() !== 'POST' || !await bound(request) || await request.headerValue('origin') !== origin ||
 			await request.headerValue('x-nntune-browser-playback') !== '1' ||
 			await request.headerValue('x-nntune-session-binding') !== binding) return route.fulfill({ status: 400 });
-		if (cutoffReached) return route.fulfill({ status: 403, json: cutoff });
+		if (cutoffReached) return route.fulfill({ status: 403, json: privateListeningRefusal });
 		const { track_id, session_id, play_id } = request.postDataJSON();
 		const track = catalogue.find(({ id }) => id === track_id);
 		if (!track || !/^[0-9a-f-]{36}$/.test(session_id) || play_id !== undefined) return route.fulfill({ status: 400 });
@@ -78,39 +79,13 @@ test('an open private player refuses to switch tracks at cohort cutoff', async (
 		source: node.currentSrc, playing: !node.paused && node.error === null && node.currentTime > 0.2
 	}))).toEqual({ source: origin + originalSource, playing: true });
 
-	// Capture transient src assignments as well as sources that make a media request.
-	const sources = await page.evaluateHandle(() => {
-		const seen = new Set<string>();
-		const selector = 'audio[src], audio source[src]';
-		const record = (node: Element) => {
-			if (node.matches(selector)) seen.add(node.getAttribute('src')!);
-			node.querySelectorAll(selector).forEach((source) => seen.add(source.getAttribute('src')!));
-		};
-		record(document.documentElement);
-		new MutationObserver((entries) => {
-			for (const entry of entries) {
-				if (entry.target instanceof Element && entry.target.matches('audio, audio source')) {
-					if (entry.oldValue) seen.add(entry.oldValue);
-					record(entry.target);
-				}
-				for (const node of [...entry.addedNodes, ...entry.removedNodes]) {
-					if (node instanceof Element) record(node);
-				}
-			}
-		}).observe(document, { childList: true, subtree: true, attributeFilter: ['src'], attributeOldValue: true });
-		return seen;
-	});
+	const sources = await observeMediaSources(page);
 
 	cutoffReached = true;
-	await queue.getByRole('button', { name: `More actions for ${second.title}`, exact: true }).click();
-	const [denial] = await Promise.all([
-		page.waitForResponse(playsUrl),
-		page.getByRole('menuitem', { name: 'Play now', exact: true }).click()
-	]);
+	const denial = await playQueuedTrack(page, origin, second.title);
 	expect(denial.status()).toBe(403);
 	expect(denial.request().postDataJSON()).toEqual({ track_id: second.id, session_id: sessionId });
-	const feedback = page.getByRole('status').and(page.getByTestId('queue-announcement'));
-	await expect(feedback).toHaveText('Could not start playback.');
+	await expectPlaybackRefusal(page);
 	await expect(transport.getByRole('button', { name: 'Retry playback', exact: true })).toHaveCount(0);
 	await expect(page).toHaveURL(origin + library.path);
 	await expect(current).toHaveAttribute(player.queueId, first.id);
