@@ -4,8 +4,9 @@ import { privateStagingAudio } from '../../../e2e/helpers/private-staging-fixtur
 import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.js';
 import { fixtureCookie, hasFixtureSession, test } from './helpers/private-music-fixture.js';
 
-// Playwright disables Chromium's back/forward cache by default.
-test.use({ launchOptions: { ignoreDefaultArgs: ['--disable-back-forward-cache'] } });
+// The headless shell cannot restore this document. Use full Chromium's headless
+// mode and remove Playwright's default flag that disables the back/forward cache.
+test.use({ channel: 'chromium', launchOptions: { ignoreDefaultArgs: ['--disable-back-forward-cache'] } });
 
 test('Back after sign-out restores Library offline without private playback', async ({ page, context, origin }, info) => {
 	const { library, player } = PRIVATE_MUSIC;
@@ -55,20 +56,22 @@ test('Back after sign-out restores Library offline without private playback', as
 	expect(playRequests).toContain(mediaPath);
 
 	// This listener and its original decoder only exist in the visited Library document.
-	await audio.evaluate((decoder: HTMLAudioElement) => {
+	await audio.evaluate((decoder: HTMLAudioElement, protectedContent) => {
 		const marker = document.documentElement.dataset;
-		const markPlayback = () => { marker.historyPlayback = 'started'; };
+		const markPlayback = (event: Event) => { marker.historyPlayback = event.type; };
 		addEventListener('pagehide', () => {
 			marker.historyPausedOnExit = String(decoder.paused && !decoder.ended);
-			decoder.addEventListener('play', markPlayback);
-			document.addEventListener('play', markPlayback, { capture: true });
-		});
+			for (const event of ['play', 'loadstart']) {
+				decoder.addEventListener(event, markPlayback);
+				document.addEventListener(event, markPlayback, { capture: true });
+			}
+		}, { once: true });
 		addEventListener('pageshow', ({ persisted }) => {
 			marker.historyRestored = String(persisted);
-			marker.historyOffline = String(!navigator.onLine);
 			marker.historyPausedOnReturn = String(decoder.paused && !decoder.ended);
+			marker.historyProtectedOnReturn = String(!!document.querySelector(protectedContent));
 		});
-	});
+	}, `[data-testid="${library.item}"], [data-testid="${player.queueItem}"], audio`);
 
 	await page.getByRole('button', { name: 'Account menu', exact: true }).click();
 	const logout = page.waitForResponse(logoutUrl);
@@ -76,7 +79,7 @@ test('Back after sign-out restores Library offline without private playback', as
 	expect((await logout).status()).toBe(200);
 	await expect(page).toHaveURL(`${origin}/login`);
 	expect(await context.cookies(origin)).not.toContainEqual(expect.objectContaining({ name: fixtureCookie }));
-	const requestsAtSignOut = playRequests.slice();
+	const requestsBeforeBack = playRequests.length;
 	expect(documents).toEqual([library.path, '/login']);
 
 	await context.setOffline(true);
@@ -84,20 +87,29 @@ test('Back after sign-out restores Library offline without private playback', as
 	await expect(page).toHaveURL(libraryUrl);
 	const html = page.locator('html');
 	await expect(html, 'Back must restore the same Library document from the browser cache').toHaveAttribute('data-history-restored', 'true');
-	await expect(html).toHaveAttribute('data-history-offline', 'true');
+	// The restored document can retain a stale navigator.onLine value. Check the
+	// actual network boundary using an uncached request to the loopback server.
+	const [offlineProbe] = await Promise.all([
+		page.waitForEvent('requestfailed', { predicate: (request) => request.url() === `${origin}/api/build`, timeout: 5_000 }),
+		page.evaluate(() => fetch('/api/build', { cache: 'no-store' }).catch(() => null))
+	]);
+	const offlineFailure = offlineProbe.failure()?.errorText;
+	expect(offlineFailure).toBe('net::ERR_INTERNET_DISCONNECTED');
 	await expect(html).toHaveAttribute('data-history-paused-on-exit', 'true');
 	await expect(html).toHaveAttribute('data-history-paused-on-return', 'true');
+	await expect(html, 'The restored document must have no private rows, queued tracks or audio').toHaveAttribute('data-history-protected-on-return', 'false');
 	await expect(page.getByRole('link', { name: 'Sign in', exact: true })).toHaveAttribute('href', '/login');
 	await expect(rows).toHaveCount(0);
 	await expect(queue).toHaveCount(0);
 	await expect(nowPlaying).toHaveCount(0);
 	await expect(transport).toHaveCount(0);
-	await expect(page.locator('audio, source')).toHaveCount(0);
-	await expect(html).not.toHaveAttribute('data-history-playback', 'started');
+	await expect(page.locator('audio')).toHaveCount(0);
+	expect(await html.getAttribute('data-history-playback')).toBeNull();
 	expect(documents).toEqual([library.path, '/login']);
-	expect(playRequests).toEqual(requestsAtSignOut);
+	const playbackRequestsAfterBack = playRequests.slice(requestsBeforeBack);
+	expect(playbackRequestsAfterBack).toEqual([]);
 	await info.attach('offline history restoration', {
 		contentType: 'application/json',
-		body: JSON.stringify({ persisted: true, offline: true, documentRequests: documents, postLogoutPlaybackRequests: [] })
+		body: JSON.stringify({ persisted: true, offlineFailure, documentRequests: documents, playbackRequestsAfterBack })
 	});
 });
