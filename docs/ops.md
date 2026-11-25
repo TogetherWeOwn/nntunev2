@@ -456,12 +456,38 @@ Role issuance and revocation need a separately authorized route. Before
 setting the two overlay variables, verify both routed logins and their exact
 application grants. After the overlay, recheck its effective ACLs before the trial.
 
+The [publication-lock contract](../scripts/private_trial_publication_locks.sql)
+supplies the five base-table lock grants separately. It is opt-in and has no
+workflow dispatch. Verify the exact staging catalog and dedicated writer OID
+from the role preflight. Use a separately authorized executor and confirm
+its effective role owns all five tables and has USAGE and CREATE on `public`.
+Use the same executor for withdrawal. In the verified session set
+`nntune.private_trial_writer_oid` to that numeric
+OID and `nntune.private_trial_lock_action` to `grant`, then run the script
+with psql `ON_ERROR_STOP`. The transaction takes bounded exclusive table
+locks before checking the ACLs. It binds the five `UPDATE (id)`
+grants to statement triggers that reject the writer's updates, including
+when using `SET ROLE`. Read back the writer's effective update privileges
+and the enabled guards on `users`, `sessions`, `invite_codes`, `ingest_jobs`
+and `tracks`, and confirm the reader has no update privileges. Keep the
+writer's role membership at the preflight baseline for the trial window.
+Confirm there are no outbound memberships or inbound memberships with SET
+or INHERIT after granting and before reversal. Verify the companion
+publication reads, inserts and storage routine grants separately.
+
 For withdrawal, disarm the trial and unbind its credentials, then remove both
 overlay variables and the preflight scope. Through the same authorized role
-route, fence both exact logins, drain their sessions and revoke their scoped
-grants. Verify role and session absence after retiring them. Reconcile any
-dependent overlay receipt with the schema owner before issuing a replacement
-pair. A fresh role alone cannot reuse a conflicting prior overlay receipt.
+route, fence both exact logins and drain their sessions. If the publication
+lock contract was applied, run it with the same pinned writer OID and
+`nntune.private_trial_lock_action` set to `revoke` before retiring the role.
+The transaction verifies that UPDATE access is gone before dropping the guards.
+If residual UPDATE access causes a refusal, keep both logins fenced. Identify
+and remove the separate grant supplying that access through the authorized
+route, then retry `revoke` with the guards still installed.
+Revoke the remaining scoped grants and verify role and session absence after
+retiring them. Reconcile any dependent overlay receipt with the schema owner
+before issuing a replacement pair. A fresh role alone cannot reuse a
+conflicting prior overlay receipt.
 
 The overlay applies in one transaction. The job summary records its bundle
 SHA-256. The admission table comment records the bundle and chosen roles so
