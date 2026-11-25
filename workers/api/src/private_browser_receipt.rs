@@ -44,6 +44,8 @@ struct ReceiptPins {
     tab: String,
     epoch: u64,
     expires_at: u64,
+    #[serde(default)]
+    renewed: bool,
     request_id: Option<String>,
     accepted_seq: i64,
     target: DigestReadTarget,
@@ -260,8 +262,8 @@ impl PrivatePlayback<'_> {
     }
 
     /// Issue under the privacy/deletion fence, or retry the exact current
-    /// receipt. An expired receipt can only be reissued under the same play
-    /// identity and after reauthorizing its pinned publication.
+    /// receipt. An expired receipt can be reissued once under the same play
+    /// identity after reauthorizing its pinned publication.
     pub(crate) async fn open_browser(
         &self,
         db: &mut impl PgConnect,
@@ -313,7 +315,8 @@ impl PrivatePlayback<'_> {
                 let retry = input.play_id.as_ref() == Some(&lease.play_id);
                 let replay = input.request_id.is_some() && input.request_id == pins.request_id;
                 if retry || replay {
-                    if lease.session_id != *tab || lease.track_id != *track
+                    if lease.session_id != *tab
+                        || lease.track_id != *track
                         || pins.account_session != claims.session_id
                     {
                         return Ok(None);
@@ -324,7 +327,13 @@ impl PrivatePlayback<'_> {
                             .browser_receipt_for(&tx, claims, lease, &pins, scope, checked_at)
                             .await;
                     }
-                    continuation = Some(pins);
+                    if pins.renewed {
+                        return Ok(None);
+                    }
+                    continuation = Some(ReceiptPins {
+                        renewed: true,
+                        ..pins
+                    });
                 }
             }
             // A rejected continuation never falls through to lease acquisition.
@@ -350,13 +359,15 @@ impl PrivatePlayback<'_> {
                 };
                 let mut play = random_id::<16>().map_err(|_| StoreError)?;
                 play.insert_str(0, PREFIX);
-                let key = derive_play_idempotency_key(user, track, &play).map_err(|_| StoreError)?;
+                let key =
+                    derive_play_idempotency_key(user, track, &play).map_err(|_| StoreError)?;
                 ReceiptPins {
                     account_session: claims.session_id.clone(),
                     play,
                     tab: tab.clone(),
                     epoch: 0,
                     expires_at: 0,
+                    renewed: false,
                     request_id: input.request_id.clone(),
                     accepted_seq: row.try_get("accepted_seq").map_err(|_| StoreError)?,
                     target: music.target,

@@ -201,6 +201,39 @@ pub(super) async fn receipt_retries(
         ..claims.clone()
     };
     assert!(open(reader, &wrong_account, &input, scope).await.is_none());
+    let set_state = async |state: &str| {
+        writer
+            .query_one(
+                "SELECT pg_temp.private_playback_state($1, $2, $3)",
+                &[&state, &input.track_id, &publication.accepted_seq],
+            )
+            .await
+            .unwrap();
+    };
+    for state in ["revision", "invite", "session"] {
+        set_state(state).await;
+        assert!(
+            service
+                .open_browser(reader, claims, &input, scope, || expiry)
+                .await
+                .unwrap()
+                .is_none(),
+            "{state}"
+        );
+        assert!(
+            service
+                .load_for_stream(reader, grant, scope, || started)
+                .await
+                .unwrap()
+                .is_none(),
+            "{state}"
+        );
+        assert_eq!(
+            query_playback_lease_row(writer, MEMBER).await.unwrap(),
+            Some(original.lease.clone())
+        );
+    }
+    set_state("valid").await;
     let renewed = service
         .open_browser(reader, claims, &input, scope, || expiry)
         .await
@@ -230,37 +263,17 @@ pub(super) async fn receipt_retries(
     assert_eq!(loaded.relay().lease, renewed.lease);
     let expired_again = UNIX_EPOCH + Duration::from_secs(renewed.lease.expires_at);
     assert!(renewed.lease.expires_at < claims.expires_at);
+    assert!(service
+        .open_browser(reader, claims, &input, scope, || expired_again)
+        .await
+        .unwrap()
+        .is_none());
     let policy_cutoff = UNIX_EPOCH + Duration::from_secs(claims.expires_at);
     assert!(service
         .open_browser(reader, claims, &input, scope, || policy_cutoff)
         .await
         .unwrap()
         .is_none());
-    for state in ["revision", "invite", "session"] {
-        writer
-            .query_one(
-                "SELECT pg_temp.private_playback_state($1, $2, $3)",
-                &[&state, &input.track_id, &publication.accepted_seq],
-            )
-            .await
-            .unwrap();
-        assert!(
-            service
-                .open_browser(reader, claims, &input, scope, || expired_again)
-                .await
-                .unwrap()
-                .is_none(),
-            "{state}"
-        );
-        assert!(
-            service
-            .load_for_stream(reader, &renewed.grant.token, scope, || expiry)
-                .await
-                .unwrap()
-                .is_none(),
-            "{state}"
-        );
-    }
     assert_eq!(
         query_playback_lease_row(writer, MEMBER)
             .await
