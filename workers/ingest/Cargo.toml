@@ -14,6 +14,7 @@ default = ["worker-entry"]
 worker-entry = []
 upload-caller = []
 cleanup-dispatch-wasm-test = []
+fixture-provider-preflight = []
 s3-completion-wasm-test = []
 
 [dependencies]
