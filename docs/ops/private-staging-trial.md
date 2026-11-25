@@ -108,14 +108,16 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    `fence` and `retire` using the original scope and the reviewed isolated
    workflow. Require reports that both logins are fenced and drained, their
    overlay and base grants and lock guards are withdrawn, and their names and
-   OIDs are absent. The overlay and its OID-bound receipt remain for data
-   reconciliation. Remove retired credentials from custody and withdraw any
-   temporary executor grants through their original grantor. If withdrawal
-   refuses, reconcile with the grant owner while both logins stay fenced.
+   OIDs are absent. Retirement accepts an earlier overlay bundle digest when
+   the receipt, pinned role OIDs, executor ownership and ACLs pass. The overlay
+   and its receipt remain for data reconciliation. Remove retired credentials
+   from custody and withdraw any temporary executor grants through their original
+   grantor. If withdrawal refuses, reconcile with the grant owner while both
+   logins stay fenced.
 
 After an interruption, reconcile the last run and actual staging state before
-retrying. Use the same reviewed overlay bytes and role OIDs to resume. An
-identical install reuses the existing overlay. A conflicting receipt or
+retrying. A grant retry requires the same reviewed overlay bytes and role OIDs.
+An identical install reuses the existing overlay. A conflicting receipt or
 replacement role goes to the schema owner before reapply. If a deploy or trial
 fails, verify the disabled state and reconcile the upload state, publication and
 storage pins before starting a fresh invite and attempt. Treat an unknown upload

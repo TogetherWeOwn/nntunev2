@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / ".github/scripts"))
 
 from apply_migration import transaction_body
 from staging_apply import load_entries
+from staging_trial_isolated import target_config
 from staging_trial_role_lifecycle import CONFIG_ENV, DATABASE, FIXTURE, NAMES, SCOPE_ENV
 from staging_trial_schema import BASELINE, compose
 
@@ -235,6 +236,16 @@ try:
     config = dict(database_oid=database_oid, executor_oid=role_oid(executor), direct="127.0.0.1",
                   direct_port=port, routed="127.0.0.1", routed_port=port,
                   owner=owner, executor=executor, reader=reader, writer=writer)
+    hosted_config = config | {"direct": "direct.fixture.psdb.cloud", "routed": "routed.fixture.psdb.cloud",
+                              "owner": "postgres.fixture"}
+    assert target_config(json.dumps(hosted_config), scope, fixture=False) == hosted_config
+    try:
+        shared_pin = {"database_oid": 16500}
+        target_config(json.dumps(hosted_config | shared_pin), scope | shared_pin, fixture=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("isolated admission accepted the shared database pin")
 
     def isolated(action, *, config=config, **kwargs):
         return cmd(action, isolated=config, **kwargs)
@@ -272,6 +283,11 @@ try:
     isolated("grant", success=False)
     ungranted()
     sql(f"UPDATE public.schema_migrations SET sha256 = '{applied}' WHERE file = '{BASELINE}';")
+    sql(f"REVOKE pg_signal_backend FROM {owner};")
+    report = isolated("grant", success=False)
+    assert "isolated executor authority passed" in report and "staging CONNECT passed" not in report
+    ungranted()
+    sql(f"GRANT pg_signal_backend TO {owner} WITH INHERIT TRUE;")
     assert "isolated owner authority passed" in isolated("check")
     ungranted()
     # A stale or wrong routed password can only be discovered after CONNECT.
@@ -287,12 +303,21 @@ try:
     """)
     assert sql(f"SET ROLE {reader}; SELECT count(*) FROM public.private_library_admissions;") == "1"
     assert sql(f"SELECT has_table_privilege('{reader}','public.private_library_admissions','INSERT,UPDATE,DELETE');") == "f"
+    # A protected main revision can carry a newer recipe than the deployed
+    # receipt. Verification refuses that drift and withdrawal can still run.
+    previous_digest = "1" * 64
+    receipt = f"isolated-private-trial {previous_digest} {scope['reader'][1]} {scope['writer'][1]}"
+    sql(f"COMMENT ON TABLE public.private_library_admissions IS '{receipt}';")
+    isolated("verify-overlay", success=False)
     # An independent ACL drift refuses retirement after fencing. Repair and
     # retry, leaving the overlay and unrelated application rows intact.
     sql(f"GRANT DELETE ON public.private_library_admissions TO {writer};")
     assert "staging drain passed" in isolated("retire", success=False)
     assert sql(f"SELECT count(*) FROM pg_roles WHERE rolname IN ('{reader}','{writer}') AND rolcanlogin;") == "0"
     sql(f"REVOKE DELETE ON public.private_library_admissions FROM {writer};")
+    sql(f"COMMENT ON TABLE public.private_library_admissions IS '{receipt}0';")
+    assert "application withdrawal passed" not in isolated("retire", success=False)
+    sql(f"COMMENT ON TABLE public.private_library_admissions IS '{receipt}';")
     isolated("retire")
     isolated("retire")
     assert sql(f"SELECT count(*) FROM pg_roles WHERE rolname IN ('{reader}','{writer}');") == "0"

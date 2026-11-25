@@ -80,15 +80,20 @@ def routines(root):
 def overlay(root, scope, executor_oid, action, *, installed_sql="", absent_sql=""):
     reader, reader_oid = scope["reader"]
     writer, writer_oid = scope["writer"]
-    sql, digest = compose(root, root, writer, reader, database=DATABASE)
     # Bind retries and revocation to the actual logins, even after reissuance
-    # of the same SQL names. The shared overlay keeps its original receipt.
-    receipt = f"isolated-private-trial {digest} {reader_oid} {writer_oid}"
+    # of the same SQL names. Withdrawal still works after the recipe changes
+    # on main because it revokes the audited grants without applying DDL.
+    if action == "retire":
+        receipt_match = f"~ '^isolated-private-trial [0-9a-f]{{64}} {reader_oid} {writer_oid}$'"
+    else:
+        sql, digest = compose(root, root, writer, reader, database=DATABASE)
+        receipt = f"isolated-private-trial {digest} {reader_oid} {writer_oid}"
+        receipt_match = f"= '{receipt}'"
     tables = ", ".join(f"to_regclass('{table}')" for table in TABLES.split(", "))
     admission = "public.private_library_admissions"
     count = f"num_nonnulls({tables}, to_regprocedure('{LOCATOR_CHECK}'))"
     owned = require(f"""{count} = 4
-        AND obj_description('{admission}'::regclass, 'pg_class') = '{receipt}'
+        AND obj_description('{admission}'::regclass, 'pg_class') {receipt_match}
         AND (SELECT bool_and(relowner = {executor_oid}) FROM pg_class WHERE oid IN ({tables}))
         AND (SELECT proowner = {executor_oid} AND NOT prosecdef
              FROM pg_proc WHERE oid = '{LOCATOR_CHECK}'::regprocedure)""")
