@@ -81,6 +81,13 @@ def validate_evidence(evidence, sha, phase):
                 "stripe_mode")
 
 
+def verify_staging_build(sha, access):
+    require(get_json(STAGING, "/api/build", access) == {"sha": sha}, "wrong_build")
+    api = get_json(STAGING, "/healthz", access)
+    require(api.keys() == {"ok", "build_sha"} and api["ok"] is True and
+            api["build_sha"] == sha, "wrong_build")
+
+
 def verify_staging(evidence, sha, phase, env):
     key = env.get("PAID_INVITE_STRIPE_READ_KEY")
     require(matches(key, r"(?:rk|sk)_test_[A-Za-z0-9]{1,256}"), "stripe_mode")
@@ -89,10 +96,7 @@ def verify_staging(evidence, sha, phase, env):
         "CF-Access-Client-Secret": env.get("CF_ACCESS_CLIENT_SECRET"),
     }
     require(all(matches(value, r"[!-~]{1,512}") for value in access.values()), "access_denied")
-    require(get_json(STAGING, "/api/build", access) == {"sha": sha}, "wrong_build")
-    api = get_json(STAGING, "/healthz", access)
-    require(api.keys() == {"ok", "build_sha"} and api["ok"] is True and
-            api["build_sha"] == sha, "wrong_build")
+    verify_staging_build(sha, access)
 
     stripe = {"Authorization": f"Bearer {key}", "Stripe-Version": "2024-12-18.acacia"}
     balance = get_json(STRIPE, "/v1/balance", stripe)
@@ -119,6 +123,7 @@ def verify_staging(evidence, sha, phase, env):
         require(subscription.get("object") == "subscription"
                 and subscription.get("id") == subscription_id
                 and subscription.get("status") == "canceled", "teardown_unverified")
+        verify_staging_build(sha, access)
 
 
 def main(argv, env, source):
