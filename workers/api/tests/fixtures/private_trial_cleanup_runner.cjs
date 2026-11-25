@@ -158,9 +158,13 @@ test('refuses foreign fixture pins, environment and authority and recovers the s
       await expectContinuationRefused(label, selection, { CLEANUP_APPROVAL: approved(selection) });
     }
 
+    assert.equal(await run(), 'unconfirmed', 'a retry without usable HEAD must stay pending');
+    assert.deepEqual(calls, [...partial, ...partial]);
+    assert.equal(state(), 't|0|0|1');
+
     interrupt = false;
     assert.equal(await run(), 'confirmed');
-    assert.deepEqual(calls, [...partial, ...attempt]);
+    assert.deepEqual(calls, [...partial, ...partial, ...attempt]);
     assert.equal(state(), 't|0|0|0');
     assert.deepEqual([...versions.get(mediaKey)], ['other-media']);
     assert.deepEqual([...versions.get(pageKey)], ['other-page']);
