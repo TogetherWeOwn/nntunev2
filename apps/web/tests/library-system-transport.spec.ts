@@ -2,7 +2,7 @@ import { expect, test, type Page } from '@playwright/test';
 import { expectedSyntheticBody } from '../../../e2e/helpers/demo-audio.js';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.js';
-import { playQueuedTrack, test as signedInTest } from './helpers/private-music-fixture.js';
+import { playQueuedTrack, serveRangedAudio, test as signedInTest } from './helpers/private-music-fixture.js';
 
 type Probe = {
 	handlers: Record<string, (() => void) | null>;
@@ -208,6 +208,31 @@ test("navigation to /pricing retires the app's system controls", async ({ page }
 	await retiredAction(page, 'pause');
 	expect(await systemSnapshot(page)).toEqual(cleared);
 	expect(await page.evaluate(() => window.__librarySystemTransport.retiredPlays)).toBe(0);
+});
+
+test('direct Library-to-demo navigation leaves the demo system controls usable', async ({ page }) => {
+	// Both players update the same Media Session during this navigation. Keep this
+	// check while the demo runs, since the remount below waits for a public route.
+	const wav = expectedSyntheticBody();
+	await page.route('**/api/demo/audio**', (route) => serveRangedAudio(route, wav, 'audio/wav'));
+	await openWithSystemControls(page);
+	await navigateInApp(page, '/demo/player');
+	await expect(page).toHaveURL(/\/demo\/player$/);
+	await expect(page.getByTestId('audio-player')).toHaveCount(0);
+	const demo = page.getByTestId('demo-audio');
+	await expect(demo).toBeVisible();
+	await expect.poll(() => systemSnapshot(page)).toMatchObject({
+		metadata: { title: expect.stringMatching(/\S/) },
+		active: expect.arrayContaining(['play', 'pause', 'seekto'])
+	});
+	const current = await systemSnapshot(page);
+	expect(current.metadata?.title).not.toBe(coral.title);
+	await expect(demo).toHaveJSProperty('paused', true);
+	await systemAction(page, 'play');
+	await expect(demo).toHaveJSProperty('paused', false);
+	await systemAction(page, 'pause');
+	await expect(demo).toHaveJSProperty('paused', true);
+	expect(await systemSnapshot(page)).toEqual(current);
 });
 
 signedInTest('a remounted Library player owns system Play and Pause', async ({ page, origin }) => {
