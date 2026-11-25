@@ -68,3 +68,60 @@ For focused reproduction, use `--contract` for the recording upstream or
 `--storage` for the SeaweedFS lifecycle with the synthetic wire client. The
 hosted `worker release builds` job runs `--bundle` and records the reviewed
 launcher verdict.
+
+## Recover ingress before hosted qualification starts
+
+This tabletop uses placeholder records. The protected rollout owner handles
+any live recovery in the coordinated shared-writer window. The dedicated
+shared Caddy site and proxied DNS record were created, then setup stopped
+before [provider-only preflight](../../docs/ops/private-staging-trial.md#provider-only-preflight)
+started. First reconcile the rollout's dispatch record with workflow run
+metadata. In this example no matching run was queued or started. If either
+occurred or the status is unclear, defer to the rollout owner for
+reconciliation. Keep the trial disarmed.
+
+| Readback | Synthetic result |
+| --- | --- |
+| Pre-change backup and DNS baseline | Caddy revision `<before>` has no site for `fixture.example.invalid`. Zone `<zone>` has no record for that name. |
+| Existing-site checks | `other.example.invalid/healthz` and `app.example.invalid/healthz` return `200`. `admin.example.invalid/healthz` returns `401`. |
+| Rollout receipt | The rollout added one site for `fixture.example.invalid`, with `import <origin-snippet>` and `reverse_proxy 127.0.0.1:18080`. It created DNS record `<record-id>` in `<zone>` for that name, with type `A`, origin `192.0.2.10`, proxy on, TTL automatic and no tags or comment. |
+| Current Caddy source and active route | The exact site block and active route match the rollout receipt. Revision `<current>` also contains a separately deployed `other.example.invalid` route update, confirmed by its owner's change receipt. |
+| Current DNS control plane | Reading `<record-id>` in `<zone>` confirms the recorded name, type, origin, proxy state and TTL. It still has no tags or comment. |
+
+1. Compare the live readbacks to the recorded additions, including the full
+   Caddy site block and exact DNS record ID. A hostname match alone is
+   insufficient. If the hostname now has `<replacement-id>`, leave that
+   record in place and stop. Stop before removal if either identity or
+   ownership is ambiguous or either addition differs from its receipt.
+2. In the rollout owner's shared-writer window, prepare the inverse against
+   `<current>` by removing just the rollout's site block. The diff must leave
+   the separate `other.example.invalid` route update in place. Restoring
+   `<before>` here would undo that update. Recheck both targets against the
+   receipt before applying. Validate the resulting Caddy config. Delete the
+   recorded DNS ID in its zone and record the successful deletion and exact-ID
+   absence before reloading Caddy. If a step fails, record what applied and
+   read both targets again before any retry.
+3. Read back the DNS record ID and the Caddy source and active route to confirm
+   the two additions are absent. Confirm the concurrent route update is still
+   loaded and all three existing sites still return their expected responses.
+   Record those results and leave hosted qualification marked pending.
+   Separately staged fixtures, credentials or protected inputs belong to the
+   rollout owner's existing closeout.
+
+If DNS deletion succeeded and the Caddy reload failed, resume with Caddy only
+in the rollout owner's shared-writer window. Match the deletion receipt to
+`<record-id>` and `<zone>`, then confirm that ID and the fixture hostname are
+both absent in the DNS control plane. Stop on missing proof or a replacement
+record. Read the latest Caddy source and active route. If the rollout block is
+already absent from both, continue to step 3. Otherwise require the active
+site to match the rollout receipt and the source to show either that same
+block or its recorded removal. Stop on unexplained differences between source
+and active configuration. Build the removal from the latest verified source,
+keeping the unrelated route update, then validate, reload and apply step 3.
+
+After recovery, [disposable qualification](#reproduce-the-disposable-qualification)
+can use fresh synthetic credentials and versions with `--bundle` on loopback.
+It checks the deny matrix, exact-version deletion and absence, sibling
+preservation and disposal without shared ingress. Its result supplies isolated
+evidence. Hosted provider qualification still requires a separately prepared
+and verified ingress under the protected rollout.
