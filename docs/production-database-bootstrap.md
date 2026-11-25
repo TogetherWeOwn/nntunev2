@@ -444,12 +444,18 @@ Use a synthetic timestamp and a private readback reference for each
 observation. The positive control records every scoped capability in the
 table above as verified for its issuer and operation.
 
+Use `sha256sum` on each version 2 plan file and compare its digest with
+the issuer entry for that workflow. Review each entry against the plan
+whose digest it carries. Record the plan-digest match and the Operator's
+disposition for both attempts.
+
 | Synthetic evidence reviewed | Preparation outcome to record |
 | --- | --- |
 | Both bootstrap issuers match their expected identities and maintenance route. The setup issuer's authority to delegate `fixture_owner` is unresolved. | `Pending — SQL issuer authority incomplete` for bootstrap. Leave baseline pending through setup and its readback. |
 | Bootstrap evidence also verifies delegation of the named owner and the remaining scoped issue, fence, drain and retirement capabilities. | The bootstrap issuer evidence is complete. With the rest of the bootstrap prerequisites supplied, mark the preparation `Eligible for independent release review`. |
 | The later baseline record has matching launch and reader OIDs, but the reader issuer's direct SELECT grant option is unresolved, or the observation came from maintenance. | `Pending — SQL issuer authority incomplete` for baseline. |
-| The baseline record also verifies the pinned issuer on the selected launch database, the launch grant and cleanup scope, and the maintenance fence. | With the rest of the baseline prerequisites supplied, mark the preparation `Eligible for independent release review`. |
+| A complete baseline issuer entry carries the bootstrap plan digest. | `Pending — SQL issuer authority incomplete` for baseline. Record the plan-digest mismatch. |
+| The baseline record carries the baseline plan digest and verifies the pinned issuer on the selected launch database, the launch grant and cleanup scope, and the maintenance fence. | With the rest of the baseline prerequisites supplied, mark the preparation `Eligible for independent release review`. |
 
 These are Operator entries. Keep release approval pending until the reviewer
 decides. The [hosted disposable fixture](../.github/scripts/test_database_bootstrap_isolation.py)
