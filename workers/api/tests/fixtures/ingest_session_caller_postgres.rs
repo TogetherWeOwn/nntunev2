@@ -98,9 +98,25 @@ async fn load_authority(
     .transpose()
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "requires the disposable hosted upload caller database"]
-async fn scoped_writer_commits_and_replays_exact_upload() {
+fn scoped_writer_commits_and_replays_exact_upload() {
+    // The combined upload and publication futures exceed libtest's default stack in debug builds.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(prove_scoped_writer());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn prove_scoped_writer() {
     let observer = connect(DB).await;
     observer
         .batch_execute(include_str!("ingest_session_writer_grants.sql"))
