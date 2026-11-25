@@ -17,7 +17,7 @@ import {
 import {
   freshTrialPublication, parsePrivateStagingFixture, privateStagingAudio, PRIVATE_TRIAL_UPLOAD, SESSION_COOKIE,
 } from '../helpers/private-staging-fixture.js';
-import { privateRunIdentity, privateTrackObservation } from './track-evidence.js';
+import { privateLibraryObservation, privateRunIdentity, privateTrackObservation } from './track-evidence.js';
 
 const ORIGIN = 'https://staging.nntune.com';
 const REGISTER = '/v1/auth/passkey/register';
@@ -95,7 +95,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const response = await apiGet(context, url, access, 'private-library');
     const body = await readApiBody(response, url, 'private-library');
     const items = response.ok() ? JSON.parse(body) as { id: string }[] : [];
-    return { status: response.status(), ids: items.map(({ id }) => id) };
+    return { status: response.status(), items };
   };
   const post = async (context: typeof request, path: string, body: unknown, headers = access) => {
     const url = `${ORIGIN}${path}`;
@@ -151,7 +151,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     let priorIds: string[] = [];
     await expect.poll(async () => {
       const library = await getLibrary();
-      priorIds = library.ids;
+      priorIds = library.items.map(({ id }) => id);
       return library.status === 200 && priorIds.includes(fixture.companion.trackId);
     }, { timeout: 60_000, intervals: [1_000] }).toBe(true);
     await refresh.click();
@@ -165,9 +165,11 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     await refresh.click();
     const row = rowFor(publication.trackId);
     await expect(row).toBeVisible();
-    expect((await getLibrary()).ids.filter((id) => id === publication.trackId)).toHaveLength(1);
+    const libraryEvidence = privateLibraryObservation(
+      run, publication, await getLibrary(), await row.getAttribute(PRIVATE_MUSIC.library.id),
+    );
     observe('private-publication', publication, publication.trackId);
-    observe('private-library', publication, await row.getAttribute(PRIVATE_MUSIC.library.id));
+    test.info().annotations.push({ type: 'private-library', description: JSON.stringify(libraryEvidence) });
     return publication;
   });
   const requestFreshPlay = async (context: typeof request, binding?: string) => {
@@ -327,7 +329,7 @@ test('private staging invite serves curated audio and refuses access at cutoff',
     const { retry } = await retryBrowserPlay(start, media);
     await verifyRange(media.source, upload.body);
     const library = await getLibrary();
-    expect(library.status === 200 && library.ids.includes(fresh.trackId)).toBe(true);
+    expect(library.status === 200 && library.items.some(({ id }) => id === fresh.trackId)).toBe(true);
     return { retry, mediaUrl: media.source.href };
   });
   await check('revoked-or-expired-refused', async () => {

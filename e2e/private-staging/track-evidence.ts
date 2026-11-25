@@ -18,3 +18,15 @@ export function privateTrackObservation(
   }
   return { track_id: observedTrackId, sha256: publication.sha256, ...run };
 }
+
+export function privateLibraryObservation(
+  run: RunIdentity,
+  publication: { trackId: string; sha256: string },
+  library: { status: number; items: readonly { id: string }[] },
+  renderedTrackId: unknown,
+) {
+  if (library.status !== 200 || library.items.filter(({ id }) => id === publication.trackId).length !== 1) {
+    throw new Error('Private staging Library must return the fresh publication exactly once');
+  }
+  return privateTrackObservation(run, publication, renderedTrackId);
+}
