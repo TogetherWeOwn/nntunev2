@@ -6,8 +6,8 @@ WITH job AS MATERIALIZED (
       AND current_setting('transaction_isolation') = 'read committed'
     FOR SHARE OF j
 ), inserted AS (
-    INSERT INTO public.tracks (release_id, medium_no, track_no, mbid, title)
-    SELECT $1::text::uuid, $2, $3, $4::text::uuid, $5 FROM job
+    INSERT INTO public.tracks (release_id, medium_no, track_no, mbid, title, duration_ms)
+    SELECT $1::text::uuid, $2, $3, $4::text::uuid, $5, $8 FROM job
     ON CONFLICT (release_id, medium_no, track_no) DO NOTHING
 )
 SELECT accepted_seq FROM job

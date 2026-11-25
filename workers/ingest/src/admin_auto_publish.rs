@@ -121,7 +121,14 @@ pub async fn stage(
             object_id: flac.receipt.intent.identities[2],
             track,
         };
-        match catalogue_publication::stage(&mut batch, &occurrence, &flac.receipt).await {
+        match catalogue_publication::stage_with_duration(
+            &mut batch,
+            &occurrence,
+            &flac.receipt,
+            flac.verified.flac_duration_ms(),
+        )
+        .await
+        {
             Ok(id) => track_ids.push(id),
             Err(error) => {
                 batch.rollback().await?;

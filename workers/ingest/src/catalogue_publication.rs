@@ -48,7 +48,24 @@ pub async fn stage(
     matched: &VerifiedOccurrence<'_>,
     result: &PublishedObject<'_>,
 ) -> Result<String, PublicationError> {
+    stage_with_duration(tx, matched, result, None).await
+}
+
+/// When authenticated FLAC readback measured a duration, a fresh canonical row
+/// stores it and an existing row must have the same measured value. A legacy
+/// row with no duration requires separate reconciliation of the shared track.
+/// Refuse a measured duration that does not fit the catalogue column.
+pub(crate) async fn stage_with_duration(
+    tx: &mut Transaction<'_>,
+    matched: &VerifiedOccurrence<'_>,
+    result: &PublishedObject<'_>,
+    duration_ms: Option<u64>,
+) -> Result<String, PublicationError> {
     use PublicationError::Refused;
+    let duration_ms = duration_ms
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| Refused)?;
     let track = &matched.track;
     let S3Binding::VersionId(version) = result.locator.binding() else {
         return Err(Refused);
@@ -70,14 +87,22 @@ pub async fn stage(
         return Err(Refused);
     }
 
-    let track_params: [&(dyn ToSql + Sync); 7] = [
+    let identity: [&(dyn ToSql + Sync); 5] = [
         &track.release_id,
         &track.medium_no,
         &track.track_no,
         &track.mbid,
+        &duration_ms,
+    ];
+    let track_params: [&(dyn ToSql + Sync); 8] = [
+        identity[0],
+        identity[1],
+        identity[2],
+        identity[3],
         &track.title,
         &matched.job_id,
         &matched.owner_id,
+        &duration_ms,
     ];
     let savepoint = tx.transaction().await?;
     let staged = async {
@@ -94,8 +119,9 @@ pub async fn stage(
             .query_opt(
                 "SELECT id::text FROM public.tracks
              WHERE release_id = $1::text::uuid AND medium_no = $2 AND track_no = $3
-               AND mbid = $4::text::uuid FOR NO KEY UPDATE",
-                &track_params[..4],
+               AND mbid = $4::text::uuid AND ($5::integer IS NULL OR duration_ms = $5)
+             FOR NO KEY UPDATE",
+                &identity,
             )
             .await?
             .ok_or(Refused)?;
