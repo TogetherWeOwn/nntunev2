@@ -25,16 +25,17 @@ test('clearing Find during an invited Library refresh shows the full refreshed c
 	await context.route('**/*', async (route) => {
 		const request = route.request();
 		const { origin: requestOrigin, pathname, search } = new URL(request.url());
-		if (requestOrigin !== origin || request.method() !== 'GET') return route.abort();
-		if (!search && (pathname === library.api || pathname === verifierPath)) {
+		if (requestOrigin !== origin) return route.abort();
+		const listing = pathname === library.api ? ++listings : undefined;
+		if (request.method() !== 'GET') return route.abort();
+		if (!search && (listing !== undefined || pathname === verifierPath)) {
 			if (!hasFixtureSession(await request.headerValue('cookie'), listener)) return route.fulfill({ status: 401 });
-			if (pathname === verifierPath) return route.fulfill({ json: { session_binding: binding } });
-			listings += 1;
-			if (listings > 2) return route.fulfill({ status: 500 });
-			if (listings === 2) refreshStarted.resolve();
+			if (listing === undefined) return route.fulfill({ json: { session_binding: binding } });
+			if (listing > 2) return route.fulfill({ status: 500 });
+			if (listing === 2) refreshStarted.resolve();
 			return route.fulfill({
 				headers: { 'x-nntune-session-binding': binding },
-				json: listings === 1 ? initial : await refreshReply.promise
+				json: listing === 1 ? initial : await refreshReply.promise
 			});
 		}
 		if (pathname.startsWith('/api/') || pathname.startsWith('/v1/')) return route.fulfill({ status: 404 });
