@@ -48,7 +48,9 @@ pub fn make_s3_fixture() -> PlaybackFixture {
         header: seal.header().to_bytes(),
     };
     let envelope = wrap_scheme2(&ROOT, &context, seal.key().expose_secret()).unwrap();
-    let first = seal.seal_chunk(&vec![b'A'; 65_536]).unwrap();
+    let mut first_chunk = vec![b'A'; 65_536];
+    first_chunk[65_534..].copy_from_slice(b"XY");
+    let first = seal.seal_chunk(&first_chunk).unwrap();
     let last = seal.seal_chunk(b"Z").unwrap();
     PlaybackFixture {
         cipher: [context.header.as_slice(), &first.bytes, &last.bytes].concat(),
