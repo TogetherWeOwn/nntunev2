@@ -316,16 +316,10 @@ test('queue batch selection has keyboard insertion parity and preserves the curr
 	await expect.poll(() => queueIds(page)).toEqual(['dawn', 'ember', 'tide', 'coral']);
 	await expect(page.getByTestId('now-playing')).toHaveText(current!);
 	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
-	const more = queueRow(page, 'dawn').getByTestId(TESTIDS.queueMore);
-	await more.focus();
-	await page.keyboard.press('Enter');
+	await queueRow(page, 'dawn').getByTestId(TESTIDS.queueMore).click();
 	await expect(menu(page)).toHaveAttribute('aria-label', '3 selected tracks');
-	await expect(menu(page).getByRole('menuitem', { name: 'Play next', exact: true })).toBeFocused();
-	await page.keyboard.press('ArrowDown');
-	await expect(menu(page).getByRole('menuitem', { name: 'Move to bottom', exact: true })).toBeFocused();
-	await page.keyboard.press('Enter');
+	await menu(page).getByRole('menuitem', { name: 'Move to bottom', exact: true }).click();
 	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember', 'tide']);
-	await expect(more).toBeFocused();
 	await toolbar.getByRole('button', { name: 'Remove selected from queue' }).click();
 	await expect.poll(() => queueIds(page)).toEqual(['coral']);
 });
@@ -511,6 +505,34 @@ test('keyboard reordering from a queue menu returns focus to the moved track', a
 	await expect(grip).toBeFocused();
 	await page.keyboard.press('Tab');
 	await expect(coral.getByTestId(TESTIDS.queueMore)).toBeFocused();
+});
+
+test('keyboard reordering a selected queue group returns focus to its moved More button', async ({ page }) => {
+	await seed(page);
+	await queueAll(page);
+	const coral = queueRow(page, 'coral');
+	const dawn = queueRow(page, 'dawn');
+	const more = coral.getByTestId(TESTIDS.queueMore);
+	// Moving the leading pair reinserts Coral's keyed row with the invoker.
+	await coral.getByRole('checkbox').check();
+	await dawn.getByRole('checkbox').check();
+
+	await more.focus();
+	await page.keyboard.press('Enter');
+	await expect(menu(page)).toHaveAccessibleName('2 selected tracks');
+	await expect(menu(page).getByRole('menuitem', { name: 'Play next', exact: true })).toBeFocused();
+	await page.keyboard.press('ArrowDown');
+	await expect(menu(page).getByRole('menuitem', { name: 'Move to bottom', exact: true })).toBeFocused();
+	await page.keyboard.press('Enter');
+
+	await expect.poll(() => queueIds(page)).toEqual(['ember', 'tide', 'coral', 'dawn']);
+	await expect(coral).toHaveAttribute('aria-current', 'true');
+	await expect(coral.getByRole('checkbox')).toBeChecked();
+	await expect(dawn.getByRole('checkbox')).toBeChecked();
+	await expect(menu(page)).toHaveCount(0);
+	await expect(more).toBeFocused();
+	await page.keyboard.press('Shift+Tab');
+	await expect(coral.getByRole('button', { name: 'Reorder Coral Night', exact: true })).toBeFocused();
 });
 
 for (const outcome of ['accepted', 'blocked', 'no-stream', 'superseded'] as const) {
