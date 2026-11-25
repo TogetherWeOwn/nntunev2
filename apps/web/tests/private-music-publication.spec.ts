@@ -3,6 +3,7 @@ import { fixtureCookie, hasFixtureSession, serveFlac, test } from './helpers/pri
 import { assertCuratedLibrary, PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { freshTrialPublication, privateStagingAudio, PRIVATE_TRIAL_UPLOAD } from '../../../e2e/helpers/private-staging-fixture.js';
 import { seekProofFailure, seekViaPlayerUi, waitForPaused } from '../../../e2e/helpers/player-ui.js';
+import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.js';
 
 const uploadedId = '00000000-0000-4000-8000-000000000001';
 const companionId = '00000000-0000-4000-8000-000000000002';
@@ -10,7 +11,7 @@ const binding = 'A'.repeat(43);
 const playId = '00000000-0000-4000-8000-000000000003';
 const isListener = (cookie: string | null) => hasFixtureSession(cookie, 'synthetic-listener');
 
-test('fresh private publication reaches the invited Library and plays under its canonical ID', async ({ page, context, browser, origin }) => {
+test('fresh private publication reaches the invited Library and plays under its canonical ID', async ({ page, browser, origin }) => {
 	const upload = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
 	const companion = privateStagingAudio().find(({ file }) => file === 'tone-b.flac')!;
 	const rows = page.getByTestId(PRIVATE_MUSIC.library.item);
@@ -19,47 +20,21 @@ test('fresh private publication reaches the invited Library and plays under its 
 	const row = (id: string) => rows.and(page.locator(`[data-id="${id}"]`));
 	let publication: { trackId: string; sha256: string } | undefined;
 	let revoked = false;
-	let playbackSession: string | undefined;
-	await context.route('**/*', (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
-	await page.route(`${origin}/v1/me/likes/session`, async (route) => {
-		if (!isListener(await route.request().headerValue('cookie'))) return route.fulfill({ status: 401 });
-		if (revoked) return route.fulfill({ status: 403 });
-		return route.fulfill({ json: { session_binding: binding } });
-	});
-	await page.route(`${origin}${PRIVATE_MUSIC.library.api}`, async (route) => {
-		const cookie = await route.request().headerValue('cookie');
-		if (!isListener(cookie)) return route.fulfill({ status: 401 });
-		if (revoked) return route.fulfill({ status: 403 });
-		const seed = { id: companionId, title: 'Queue companion', duration_ms: 14_000 };
-		const items = publication ? [{ id: publication.trackId, title: 'Fresh publication', duration_ms: 14_000 }, seed] : [seed];
-		return route.fulfill({ headers: { 'x-nntune-session-binding': binding }, json: items });
-	});
-	await page.route(`${origin}${PRIVATE_MUSIC.player.plays}`, async (route) => {
-		const call = route.request();
-		if (!isListener(await call.headerValue('cookie')) || revoked) return route.fulfill({ status: 403 });
-		const input = call.postDataJSON();
-		if (call.method() !== 'POST' || !publication || input.track_id !== publication.trackId ||
-			await call.headerValue('x-nntune-browser-playback') !== '1' || await call.headerValue('x-nntune-session-binding') !== binding) {
-			return route.fulfill({ status: 400 });
-		}
-		expect(input.session_id).toMatch(/^[0-9a-f-]{36}$/);
-		playbackSession = input.session_id;
-		return route.fulfill({ json: { trackId: publication.trackId, playbackSessionId: playbackSession, sessionBinding: binding, playId, durationMs: 14_000 } });
-	});
-	await page.route(`${origin}/v1/plays/media/**`, async (route) => {
-		const call = route.request();
-		if (!isListener(await call.headerValue('cookie')) || revoked || !publication || !playbackSession ||
-			call.url() !== `${origin}/v1/plays/media/${publication.trackId}/${playbackSession}/${playId}`) {
-			return route.fulfill({ status: 404 });
-		}
-		return serveFlac(route, upload.body);
+	const companionTrack = { id: companionId, title: 'Queue companion', duration_ms: 14_000 };
+	const fixture = await mockInvitedLibraryPlayback(page, origin, {
+		libraryItems: () => publication
+			? [{ id: publication.trackId, title: 'Fresh publication', duration_ms: 14_000 }, companionTrack]
+			: [companionTrack],
+		playableTrackId: () => publication?.trackId,
+		audio: upload.body,
+		isRevoked: () => revoked
 	});
 
 	const anonymous = page.waitForResponse((response) => response.url() === `${origin}${PRIVATE_MUSIC.library.api}`);
 	await page.goto(`${origin}${PRIVATE_MUSIC.library.path}`);
 	expect((await anonymous).status()).toBe(401);
 	await expect(rows).toHaveCount(0);
-	await context.addCookies([{ name: fixtureCookie, value: 'synthetic-listener', url: origin, httpOnly: true }]);
+	await fixture.signIn();
 	await page.reload();
 	await expect(row(companionId)).toBeVisible();
 	const before = await ids();
@@ -101,7 +76,7 @@ test('fresh private publication reaches the invited Library and plays under its 
 	await expect(audio).toHaveCount(0);
 	await player.getByRole('button', { name: 'Play', exact: true }).click();
 	await expect.poll(() => audio.evaluate((el: HTMLAudioElement) => !el.paused && el.currentTime > 0.2)).toBe(true);
-	await expect(audio).toHaveAttribute('src', `/v1/plays/media/${uploadedId}/${playbackSession}/${playId}`);
+	await expect(audio).toHaveAttribute('src', fixture.mediaPath(uploadedId));
 	await player.getByRole('button', { name: 'Pause', exact: true }).click();
 	await waitForPaused(audio, true, 5_000, 'Player did not pause');
 	await audio.evaluate((el) => el.addEventListener('seeked', () => { el.dataset.seeked = 'yes'; }, { once: true }));

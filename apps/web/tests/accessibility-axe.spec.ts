@@ -1,5 +1,9 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
+import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
+import { privateStagingAudio } from '../../../e2e/helpers/private-staging-fixture.js';
+import { mockInvitedLibraryPlayback } from './fixtures/invited-library-playback.js';
+import { test as invitedLibraryTest } from './helpers/private-music-fixture.js';
 
 /**
  * Axe accessibility gate: every existing route must report zero serious or
@@ -11,8 +15,8 @@ import { expect, test, type Page } from '@playwright/test';
  * landmark (`region`). Visual-regression screenshot baselines are deferred
  * until the next shell rebuild lands; this file asserts semantics only.
  *
- * Network is mocked the same way as the other shell specs: API routes fail
- * closed with 503 so pages render their signed-out / empty states.
+ * Shell route scans mock API routes to fail closed with 503. Player scans
+ * use the invited Library fixture to load synthetic audio through the relay.
  */
 const ROUTES = [
 	'/',
@@ -22,7 +26,6 @@ const ROUTES = [
 	'/auth/magic',
 	'/account/security',
 	'/account/billing',
-	'/demo/player',
 	'/home',
 	'/search',
 	'/settings',
@@ -31,7 +34,7 @@ const ROUTES = [
 	'/library/recent'
 ] as const;
 
-const MOBILE_ROUTES = new Set<string>(['/demo/player', '/library']);
+const MOBILE_ROUTES = new Set<string>(['/library']);
 
 async function mockApi(page: Page, route: string) {
 	await page.route('**/v1/**', (r) =>
@@ -96,9 +99,6 @@ async function visit(page: Page, route: string) {
 	}
 	await page.goto(url, { waitUntil: 'load' });
 	await expect(page.locator('main')).toBeVisible();
-	if (route === '/demo/player') {
-		await expect(page.getByTestId('leveling-toggle')).toBeVisible();
-	}
 	if (route === '/library') {
 		await expect(page.getByTestId('library-item').first()).toBeVisible();
 	}
@@ -110,6 +110,66 @@ async function visit(page: Page, route: string) {
 	}
 	await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
 }
+
+invitedLibraryTest.describe('Library player', () => {
+	const track = {
+		id: '00000000-0000-4000-8000-000000000001',
+		title: 'Fixture tone',
+		duration_ms: 14_000
+	};
+	const libraryFixture = () => ({
+		libraryItems: () => [track],
+		playableTrackId: () => track.id,
+		audio: privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!.body
+	});
+
+	invitedLibraryTest('axe: anonymous Library denies access', async ({ page, origin }) => {
+		await mockInvitedLibraryPlayback(page, origin, libraryFixture());
+		const libraryResponse = page.waitForResponse(`${origin}${PRIVATE_MUSIC.library.api}`);
+		await page.goto(`${origin}${PRIVATE_MUSIC.library.path}`);
+		expect((await libraryResponse).status()).toBe(401);
+		const main = page.getByRole('main');
+		await expect(main.getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
+		await expect(page.getByTestId(PRIVATE_MUSIC.library.item)).toHaveCount(0);
+		await expect(page.getByRole('region', { name: 'Player', exact: true })).toHaveCount(0);
+		await expectNoSeriousOrCriticalViolations(page, '/library (anonymous)');
+	});
+
+	for (const viewport of [{ width: 1280, height: 720 }, { width: 390, height: 844 }]) {
+		const name = `/library populated player at ${viewport.width}px`;
+		invitedLibraryTest(`axe: ${name}`, async ({ page, origin }) => {
+			await page.setViewportSize(viewport);
+			const fixture = await mockInvitedLibraryPlayback(page, origin, libraryFixture());
+			await fixture.signIn();
+			await page.goto(`${origin}${PRIVATE_MUSIC.library.path}`);
+			const main = page.getByRole('main');
+			await expect(main.getByRole('heading', { name: 'Library', exact: true })).toBeVisible();
+			await main.getByRole('button', { name: track.title, exact: true }).click();
+
+			const player = page.getByRole('region', { name: 'Player', exact: true });
+			const play = player.getByRole('button', { name: 'Play', exact: true });
+			const pause = player.getByRole('button', { name: 'Pause', exact: true });
+			await expect(player.getByRole('heading', { name: 'Now playing', exact: true })).toBeVisible();
+			await expect(player.getByText(track.title, { exact: true })).toBeVisible();
+			await play.click();
+			const audio = player.getByTestId(PRIVATE_MUSIC.player.audio);
+			await expect.poll(() => audio.evaluate((element: HTMLAudioElement) => element.currentTime)).toBeGreaterThan(0);
+			await pause.click();
+			await expect(audio).toHaveJSProperty('paused', true);
+			await expect(play).toBeVisible();
+			const seek = player.getByRole('slider', { name: 'Seek', exact: true });
+			await expect(seek).toBeVisible();
+			await expect(seek).toBeEnabled();
+			await expect(player.getByRole('button', { name: 'Restart current track', exact: true })).toBeVisible();
+			await expect(player.getByRole('slider', { name: /^Volume \d+%$/ })).toBeVisible();
+			await expect(player.getByRole('button', { name: 'Mute', exact: true })).toBeVisible();
+			await expect(page.getByRole('combobox', { name: 'Playback speed', exact: true })).toBeVisible();
+			const timer = page.getByRole('region', { name: 'Sleep timer', exact: true });
+			await expect(timer.getByRole('spinbutton', { name: 'Sleep timer (minutes)', exact: true })).toBeVisible();
+			await expectNoSeriousOrCriticalViolations(page, name);
+		});
+	}
+});
 
 for (const route of ROUTES) {
 	test(`axe: ${route} has no serious or critical violations`, async ({ page }) => {
