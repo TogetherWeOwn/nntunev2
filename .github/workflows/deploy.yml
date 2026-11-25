@@ -76,6 +76,7 @@ env:
 
 jobs:
   staging-private-trial-cleanup:
+    name: Retire the selected private staging fixture
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && github.repository == 'TogetherWeOwn/nntunev2' &&
           github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&
