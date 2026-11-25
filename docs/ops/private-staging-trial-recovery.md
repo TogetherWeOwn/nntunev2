@@ -110,10 +110,20 @@ readbacks that no runtime SQL logins were issued, no serving bindings were
 deployed and no fixture activity requires cleanup. Record containment and
 withdrawal as inapplicable only after those checks pass.
 
-If the trial reached serving, complete the applicable [protected fixture
+If fixture activity occurred, complete the applicable [protected fixture
 containment and cleanup](private-staging-trial.md#retire-and-recover) using
 reviewed stock-target access. Keep the selected fixture pins and cleanup
-access until cleanup is confirmed. Verify that all serving bindings are gone.
+access until cleanup is confirmed.
+
+Reconcile every Worker binding from the attempt, including bindings deployed
+for [Stage C2 qualification](private-staging-trial.md#stage-c2-hyperdrive-origin-connection)
+while the trial was disarmed. Match the recorded routes, deployments, Worker
+versions, binding names and Hyperdrive config IDs. Remove the trial bindings
+through the reviewed stock-target deployment path. Verify that no active
+deployment or separately reachable Worker version still references any trial
+config. Keep step 1 pending if a binding, deployment or removal result is
+unresolved. Complete this readback before deleting any Hyperdrive config.
+
 If any runtime SQL login was issued, require a separately reviewed
 stock-target procedure and scoped readbacks for fencing, draining and
 withdrawing those roles before infrastructure teardown. The linked `fence`
@@ -152,7 +162,10 @@ create is `AUTH`. A wrong account or timed-out `UPLOAD` lookup leaves its
 checkpoint pending. During retirement stop at step 2 and retain the listed
 dependencies until the result is reconciled. For disposal of the known layout, the
 first removal is the connector. No config or Environment input is a deletion
-target. After simulated DNS removal with the tunnel deletion still pending,
+target. In the C2 case, suppose a deployed Worker version still binds
+`UPLOAD` when the read-only check times out. Even with the trial disarmed,
+keep step 1 pending until the deployment readback confirms the binding is gone.
+After simulated DNS removal with the tunnel deletion still pending,
 recheck the two exact DNS IDs and the connector's absence, then remove only
 the remaining tunnel before touching Access. The tabletop uses synthetic
 provider readbacks and leaves serving qualification to Stage C2.
