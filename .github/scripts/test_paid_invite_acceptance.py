@@ -128,6 +128,30 @@ class AcceptanceTest(unittest.TestCase):
                 closing_paths = ["/api/build"] if path == "/api/build" else ["/api/build", "/healthz"]
                 self.assertEqual([seen for seen, _ in self.requests], list(self.routes) + closing_paths)
 
+    def test_finish_requires_the_selected_checkout_readback_with_meter_attested(self):
+        session_path = f"/v1/checkout/sessions/{SESSION}"
+        session = self.routes[session_path]
+        session["customer"] = "cus_syntheticRehearsal"
+        earlier_session = {
+            **session, "id": "cs_test_earlierPlayback", "subscription": "sub_earlierPlayback",
+        }
+        earlier_subscription = {**self.routes[SUBSCRIPTION_PATH], "id": "sub_earlierPlayback"}
+
+        # Both runs attest the same build for playback_and_meter. The receipt
+        # cannot date that observation. The verifier can bind the Stripe
+        # readback to the Checkout Session selected for this run.
+        with patch.dict(self.routes, {
+            session_path: earlier_session,
+            "/v1/subscriptions/sub_earlierPlayback": earlier_subscription,
+        }):
+            self.run_case("payment_unverified")
+            self.assertEqual([path for path, _ in self.requests], list(self.routes)[:5])
+
+        self.requests.clear()
+        self.run_case("accepted")
+        self.assertEqual([path for path, _ in self.requests],
+                         list(self.routes) + ["/api/build", "/healthz"])
+
     def test_default_off_and_invalid_admission_send_no_requests(self):
         for evidence in ({"app": "other-app"}, {"environment": "production"},
                          {"origin": "https://nntune.com"}):
