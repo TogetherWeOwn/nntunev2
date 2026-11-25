@@ -5,7 +5,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import qualify
 
@@ -25,18 +25,24 @@ class TeardownPortTest(unittest.TestCase):
                     [*qualify.DOCKER, "volume", "ls", "-q", "--filter", label],
                 ]
                 results = [CompletedProcess(command, 0, b"", b"") for command in commands]
+                teardown = Mock()
 
                 with (
                     patch.object(qualify.subprocess, "run", side_effect=results) as docker,
                     patch.object(qualify.socket, "create_connection", return_value=nullcontext(),
                                  side_effect=None if accepting else ConnectionRefusedError) as connect,
                 ):
+                    teardown.attach_mock(docker, "docker")
+                    teardown.attach_mock(connect, "connect")
                     if accepting:
                         with self.assertRaisesRegex(RuntimeError, "^disposable loopback port is still open$"):
                             stack.close()
                     else:
                         stack.close()
 
-                self.assertEqual([invocation.args[0] for invocation in docker.call_args_list], commands)
-                connect.assert_called_once()
-                self.assertEqual(connect.call_args.args, (("127.0.0.1", prior_port),))
+                expected_calls = [("docker", command) for command in commands]
+                expected_calls.append(("connect", ("127.0.0.1", prior_port)))
+                self.assertEqual(
+                    [(invocation[0], invocation.args[0]) for invocation in teardown.mock_calls],
+                    expected_calls,
+                )
