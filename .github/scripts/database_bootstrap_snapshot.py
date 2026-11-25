@@ -21,11 +21,12 @@ def unique_fields(pairs):
     return fields
 
 
-def consistent_readback(raw):
+def consistent_readback(raw, *, baseline_handoff=False):
     if len(raw) > MAX_RECORD_BYTES:
         return False
     record = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)
-    if not isinstance(record, dict) or record.keys() != {"review", "snapshot"}:
+    fields = {"review", "snapshot", "baseline_branch_id"} if baseline_handoff else {"review", "snapshot"}
+    if not isinstance(record, dict) or record.keys() != fields:
         return False
     review, snapshot = record["review"], record["snapshot"]
     if not isinstance(review, dict) or not isinstance(snapshot, dict):
@@ -39,6 +40,8 @@ def consistent_readback(raw):
         return False
 
     branch_id = review["branch_id"]
+    if baseline_handoff and (not post_setup or record["baseline_branch_id"] != branch_id):
+        return False
     if not (
         isinstance(branch_id, str) and BRANCH_ID.fullmatch(branch_id)
         and snapshot["branch_id"] == branch_id
@@ -65,7 +68,10 @@ def consistent_readback(raw):
 
 if __name__ == "__main__":
     try:
-        consistent = len(sys.argv) == 1 and consistent_readback(sys.stdin.buffer.read(MAX_RECORD_BYTES + 1))
+        args = sys.argv[1:]
+        consistent = args in ([], ["--baseline-handoff"]) and consistent_readback(
+            sys.stdin.buffer.read(MAX_RECORD_BYTES + 1), baseline_handoff=bool(args),
+        )
     except (OSError, ValueError, RecursionError):
         consistent = False
     if not consistent:

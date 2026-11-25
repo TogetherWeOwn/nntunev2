@@ -105,9 +105,7 @@ def exercise(event_path):
     check(False, event=b" " * admission.MAX_EVENT_BYTES + b"{}")
 
 
-def check_snapshot_readback():
-    script = Path(__file__).with_name("database_bootstrap_snapshot.py")
-    branch = "fixture001"
+def snapshot_record(branch="fixture001"):
     at = 1800000000
     review = {
         "phase": "pre-bootstrap", "branch_id": branch,
@@ -118,18 +116,27 @@ def check_snapshot_readback():
         "status": "succeeded", "captured_at": at, "completed_at": at + 30,
         "readback_at": at + 60, "expires_at": at + 3600,
     }
-    record = {"review": review, "snapshot": snapshot}
+    return {"review": review, "snapshot": snapshot}
 
-    def check(case, evidence, accept=False):
-        raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
-        result = subprocess.run(
-            [sys.executable, "-IB", str(script)], input=raw,
-            capture_output=True, timeout=3, check=False,
-        )
-        expected = ((0, b"database-bootstrap-snapshot: consistent\n", b"") if accept else
-                    (1, b"", b"database-bootstrap-snapshot: refused\n"))
-        if (result.returncode, result.stdout, result.stderr) != expected:
-            raise RuntimeError(f"snapshot fixture: {case}")
+
+def check_snapshot(case, evidence, accept=False, *, args=()):
+    script = Path(__file__).with_name("database_bootstrap_snapshot.py")
+    raw = evidence if isinstance(evidence, bytes) else json.dumps(evidence).encode()
+    result = subprocess.run(
+        [sys.executable, "-IB", str(script), *args], input=raw,
+        capture_output=True, timeout=3, check=False,
+    )
+    expected = ((0, b"database-bootstrap-snapshot: consistent\n", b"") if accept else
+                (1, b"", b"database-bootstrap-snapshot: refused\n"))
+    if (result.returncode, result.stdout, result.stderr) != expected:
+        raise RuntimeError(f"snapshot fixture: {case}")
+
+
+def check_snapshot_readback():
+    record = snapshot_record()
+    review, snapshot = record["review"], record["snapshot"]
+    at = snapshot["captured_at"]
+    check = check_snapshot
 
     check("pre-bootstrap", record, accept=True)
     for case, override in {
@@ -165,6 +172,27 @@ def check_snapshot_readback():
     check("record at size limit", at_limit, accept=True)
     check("record one byte over size limit", at_limit + b" ")
     check("malformed record", b"{")
+
+
+def check_handoff_snapshot_branch(baseline_branch="fixture001"):
+    record = snapshot_record(baseline_branch)
+    baseline_pin = {"baseline_branch_id": baseline_branch}
+    args = ("--baseline-handoff",)
+    check_snapshot("pre-bootstrap evidence for post-setup handoff", record | baseline_pin, args=args)
+    review = record["review"] | {"phase": "pre-migration"}
+    check_snapshot("setup completion not recorded", record | {"review": review} | baseline_pin, args=args)
+
+    completed = {"setup_completed_at": record["snapshot"]["captured_at"] - 1}
+    post_setup = record | {"review": review | completed}
+    other_branch = baseline_branch[:-1] + ("1" if baseline_branch.endswith("0") else "0")
+    wrong_branch = {
+        "review": post_setup["review"] | {"branch_id": other_branch},
+        "snapshot": post_setup["snapshot"] | {"branch_id": other_branch},
+    }
+    check_snapshot("standalone snapshot for a different branch", wrong_branch, accept=True)
+    check_snapshot("handoff snapshot for a different branch", wrong_branch | baseline_pin, args=args)
+    check_snapshot("handoff without the exact baseline branch", post_setup, args=args)
+    check_snapshot("retry with matching completed evidence", post_setup | baseline_pin, accept=True, args=args)
 
 
 if __name__ == "__main__":

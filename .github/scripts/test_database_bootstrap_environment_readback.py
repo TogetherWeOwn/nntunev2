@@ -30,26 +30,42 @@ def branch_policies(**changes):
     return {"total_count": 1, "branch_policies": [{"type": "branch", "name": "main", **changes}]}
 
 
+def save_response(directory, name, response_kind, response):
+    (directory / f"{name}.{response_kind}.json").write_text(json.dumps(response), encoding="utf-8")
+
+
+def save_complete_readback(directory):
+    for name, kind, identifier in ((BOOTSTRAP, "User", 101), (BASELINE, "Team", 202)):
+        save_response(directory, name, "environment", environment(name, kind, identifier))
+        save_response(directory, name, "branch-policies", branch_policies())
+
+
+def check_readback(directory, *args):
+    return subprocess.run(
+        [sys.executable, "-IB", str(CHECKER), str(directory), *args],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3, check=False,
+    )
+
+
+def readback(directory):
+    return check_readback(directory, "--bootstrap-reviewer", "User:101", "--baseline-reviewer", "Team:202")
+
+
 class EnvironmentReadbackTests(unittest.TestCase):
     def setUp(self):
         self.directory = Path(self.enterContext(TemporaryDirectory(prefix="db-environment-readback-")))
         self.bootstrap = environment(BOOTSTRAP, "User", 101)
         self.baseline = environment(BASELINE, "Team", 202)
-        for name, response in ((BOOTSTRAP, self.bootstrap), (BASELINE, self.baseline)):
-            self.save(name, "environment", response)
-            self.save(name, "branch-policies", branch_policies())
+        save_complete_readback(self.directory)
 
     def save(self, name, response_kind, response):
-        (self.directory / f"{name}.{response_kind}.json").write_text(json.dumps(response), encoding="utf-8")
+        save_response(self.directory, name, response_kind, response)
 
     def check(self, *args):
-        return subprocess.run(
-            [sys.executable, "-IB", str(CHECKER), str(self.directory), *args],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3, check=False,
-        )
+        return check_readback(self.directory, *args)
 
     def readback(self):
-        return self.check("--bootstrap-reviewer", "User:101", "--baseline-reviewer", "Team:202")
+        return readback(self.directory)
 
     def assert_blocked(self, name, diagnostic):
         result = self.readback()

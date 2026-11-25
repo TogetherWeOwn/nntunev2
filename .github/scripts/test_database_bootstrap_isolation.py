@@ -24,6 +24,8 @@ from fixtures.database_bootstrap.authorization import caller_env, plan_binding
 from database_bootstrap_preflight import (
     BootstrapPreflightError, catalog_probe_sql, require_absent_catalog_result,
 )
+from test_database_bootstrap_admission import check_handoff_snapshot_branch
+from test_database_bootstrap_environment_readback import readback, save_complete_readback
 
 IMAGE = "postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336"
 PORT = 5432
@@ -594,6 +596,11 @@ def prove_baseline(cluster):
     require(calls.stat().st_size == before, "refuse disabled, cross-workflow and invalid plans before SQL")
     run("refused", database_oid=plan["database_oid"] + 1)
     run("empty")
+    with tempfile.TemporaryDirectory(dir=cluster.directory, prefix="handoff-environment-") as evidence:
+        directory = Path(evidence)
+        save_complete_readback(directory)
+        require(readback(directory).returncode == 0, "verify both saved Environment readbacks for the handoff")
+        check_handoff_snapshot_branch(plan["branch_id"])
     run("refused", overrides={"PATH": routed_client(cluster, "standby", reader)})
     require(b"baseline scope refused" in (cluster.directory / "standby-result").read_bytes(),
             "refuse the simulated PostgreSQL recovery verdict for an otherwise eligible reader")
