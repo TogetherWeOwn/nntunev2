@@ -128,6 +128,7 @@ async function routeSignup(page: Page, finishStatus = 200): Promise<SignupTraffi
 
 async function reachSignupCodeStep(page: Page): Promise<void> {
 	await page.goto('/signup');
+	await expect(page.locator('html')).toHaveAttribute('data-hydrated', '');
 	await page.getByTestId('signup-email').fill('alice@example.com');
 	await page.getByTestId('signup-submit').click();
 	await page.getByLabel('Email code').fill('fixture-code');
