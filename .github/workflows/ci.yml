@@ -1503,7 +1503,7 @@ jobs:
       - name: Unit-test the promotion receipt proof
         run: node --test ci/test-release-promotion-proof.cjs
       - name: Exercise first-release admission, maintenance seed and rollback (offline)
-        run: node --test ci/test-production-maintenance.mjs
+        run: node --test ci/test-production-maintenance.mjs ci/test-production-switch-off.mjs
       - name: Unit-test candidate staging admission (offline synthetic evidence only)
         run: python3 ci/test_staging_admission.py
       - name: Unit-test the private launch observation record (offline)
