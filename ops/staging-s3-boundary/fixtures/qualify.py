@@ -176,7 +176,8 @@ volumes:
     def close(self):
         self.run("down", "--volumes", "--remove-orphans")
         for kind in ("container", "network", "volume"):
-            args = ["ls", "-q", "--filter", f"label=com.docker.compose.project={self.project}"]
+            states = ["--all"] if kind == "container" else []
+            args = ["ls", "-q", *states, "--filter", f"label=com.docker.compose.project={self.project}"]
             require(not run([*DOCKER, kind, *args], self.env).stdout.strip(), f"disposable {kind} remains")
         if self.port is not None:
             try:

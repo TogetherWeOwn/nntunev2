@@ -155,15 +155,19 @@ needs list access as a stop. Keep the scope and credentials in protected custody
 #### Provider-only preflight
 
 For a hosted run, use [staging-trial-provider-preflight](../../.github/workflows/staging-trial-provider-preflight.yml).
-The protected workflow needs its own reachable HTTPS ingress forwarding to
-the boundary's loopback listener. Provision and verify that ingress through
-the protected rollout before dispatch. The disposable qualification uses a
-runner-local endpoint.
+For the fixture boundary, provision and verify a reachable HTTPS ingress
+forwarding to its loopback listener through the protected rollout. The
+disposable qualification uses a runner-local endpoint.
 Prepare the two disposable versions and read back the credential policy as
 described below. Supply the four settings below as secrets in the existing
 `staging` Environment for this run. The endpoint and region secrets must match
-the existing staging Actions variables of the same names. The workflow compares
-them before sending a request and keeps the variable values out of its logs.
+the staging Actions variables of the same names. During the protected
+provider-only window, keep the upload, playback and journey arms unset and
+bind both endpoint inputs to the reviewed fixture ingress. The workflow
+compares the settings before sending a request and keeps the variable values
+out of its logs. Clear the temporary inputs or restore the prior settings on
+closeout. Before arming, independently verify the reviewed serving endpoint
+with upload and playback. The fixture boundary serves HEAD and DELETE only.
 Keep the exact scope JSON and the disposable credential in
 protected custody. Use the SHA-256 of the exact UTF-8 bytes supplied as the
 scope secret. The dispatch inputs contain only the reviewed full `main` commit
