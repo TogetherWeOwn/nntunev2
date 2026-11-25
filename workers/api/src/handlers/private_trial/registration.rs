@@ -7,6 +7,7 @@ use crate::{
     handlers::StoreError,
     ingest_session_auth::{Action, Grant},
     ingest_session_caller::CurrentAuthorization,
+    native_rest::{self, Pepper, Scope},
     storage_digest_read::uuid_text,
     worker_entry::native_credential_from_row,
 };
@@ -168,6 +169,42 @@ pub async fn load_authority(
     credential: &str,
     scope: &CompletionScope<'_>,
 ) -> Result<Option<CurrentAuthorization>, StoreError> {
+    load(reader, credential, scope, true).await
+}
+
+/// Check the current credential before registering any fixture records.
+pub async fn authorize_enrollment(
+    reader: &Client,
+    credential: &str,
+    scope: &CompletionScope<'_>,
+    bearer: &str,
+    peppers: &[Pepper<'_>],
+    now: u64,
+) -> Result<(), TrialError> {
+    let current = load(reader, credential, scope, false)
+        .await
+        .map_err(|_| TrialError::Unconfirmed)?
+        .ok_or(TrialError::Refused)?;
+    if now >= current.record.expires_at {
+        return Err(TrialError::Refused);
+    }
+    native_rest::authorize(
+        &current.record,
+        bearer,
+        Scope::IngestSubmit,
+        now,
+        scope.principal,
+        peppers,
+    )
+    .map_err(|_| TrialError::Refused)
+}
+
+async fn load(
+    reader: &Client,
+    credential: &str,
+    scope: &CompletionScope<'_>,
+    require_reservation: bool,
+) -> Result<Option<CurrentAuthorization>, StoreError> {
     let environment = uuid_text(scope.environment);
     let library = uuid_text(scope.library);
     let row = reader
@@ -176,12 +213,13 @@ pub async fn load_authority(
                 c.created_at, c.expires_at, c.revoked_at, NULL::bigint AS last_used_at,
                 ''::text AS label, ''::text AS created_from_ip
            FROM public.native_rest_credentials c
-           JOIN public.ingest_session_reservations s ON s.principal_id = c.user_id
-           JOIN public.storage_library_namespaces n ON n.id = s.library_id
-          WHERE c.id = $1 AND c.user_id = $2 AND s.id = $3::text::uuid
-            AND n.environment_id = $4::text::uuid AND n.id = $5::text::uuid
-            AND s.fingerprint = $6 AND n.owner_id IS NULL
-            AND (s.terminal_reason IS NULL OR s.terminal_reason = 'completed')",
+          WHERE c.id = $1 AND c.user_id = $2 AND (NOT $7 OR EXISTS (
+              SELECT FROM public.ingest_session_reservations s
+              JOIN public.storage_library_namespaces n ON n.id = s.library_id
+              WHERE s.principal_id = c.user_id AND s.id = $3::text::uuid
+                AND n.environment_id = $4::text::uuid AND n.id = $5::text::uuid
+                AND s.fingerprint = $6 AND n.owner_id IS NULL
+                AND (s.terminal_reason IS NULL OR s.terminal_reason = 'completed')))",
             &[
                 (&credential, Type::TEXT),
                 (&scope.principal, Type::TEXT),
@@ -189,6 +227,7 @@ pub async fn load_authority(
                 (&environment, Type::TEXT),
                 (&library, Type::TEXT),
                 (&scope.fingerprint.as_slice(), Type::BYTEA),
+                (&require_reservation, Type::BOOL),
             ],
         )
         .await

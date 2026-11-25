@@ -44,7 +44,7 @@ pub(crate) async fn verify_registration(
     auth: Authorization<'_>,
 ) {
     use private_trial::{
-        registration::{load_authority, Enrollment},
+        registration::{authorize_enrollment, load_authority, Enrollment},
         TrialError,
     };
     let id = |byte| {
@@ -77,6 +77,40 @@ pub(crate) async fn verify_registration(
         actor: &auth.record.user_id,
         fingerprint: &fingerprint,
     };
+    let scope = CompletionScope {
+        environment,
+        library,
+        principal: enrollment.actor,
+        session: &session,
+        fingerprint: &fingerprint,
+        seal: generation,
+        revision: 0,
+        offset: 0,
+    };
+    assert!(load_authority(authority, &auth.record.id, &scope)
+        .await
+        .unwrap()
+        .is_none());
+    let authorize = async |bearer, now| {
+        authorize_enrollment(
+            authority,
+            &auth.record.id,
+            &scope,
+            bearer,
+            auth.peppers,
+            now,
+        )
+        .await
+    };
+    assert_eq!(authorize(auth.bearer, auth.record.created_at).await, Ok(()));
+    assert_eq!(
+        authorize("synthetic-incorrect-credential", auth.record.created_at).await,
+        Err(TrialError::Refused)
+    );
+    assert_eq!(
+        authorize(auth.bearer, auth.record.expires_at).await,
+        Err(TrialError::Refused)
+    );
     let register = async |db: &mut Client, body: &[u8]| {
         enrollment
             .register(db, body, identities, id(0xf0), id(0xf1), &[0xac; 32])
@@ -95,16 +129,6 @@ pub(crate) async fn verify_registration(
         Err(TrialError::Refused)
     ));
 
-    let scope = CompletionScope {
-        environment,
-        library,
-        principal: enrollment.actor,
-        session: &session,
-        fingerprint: &fingerprint,
-        seal: generation,
-        revision: 0,
-        offset: 0,
-    };
     let current = load_authority(authority, &auth.record.id, &scope)
         .await
         .unwrap()
