@@ -153,19 +153,17 @@
 			class="nt-button nt-button--ghost"
 			type="button"
 			data-testid="player-seek-back"
-			aria-label="Back 10 seconds"
 			onclick={() => jumpRelative('back')}
 		>
-			Back 10 s
+			Back 10 seconds
 		</button>
 		<button
 			class="nt-button nt-button--ghost"
 			type="button"
 			data-testid="player-seek-forward"
-			aria-label="Forward 10 seconds"
 			onclick={() => jumpRelative('forward')}
 		>
-			Forward 10 s
+			Forward 10 seconds
 		</button>
 	</div>
 	<p data-testid="player-seek-feedback" aria-live="polite">{#key jumpStatusVersion}{jumpStatus}{/key}</p>
