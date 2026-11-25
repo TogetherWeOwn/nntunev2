@@ -2298,6 +2298,10 @@ jobs:
           (cd workers/api && worker-build --release --out-dir "$PRIVATE_TRIAL_CLEANUP_BUNDLE" -- --locked --features staging-fixture-cleanup) 2>&1 | tee "$RUNNER_TEMP/worker-trial-cleanup-fixture.log"
           python3 -I .github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-trial-cleanup-fixture.log"
           git diff --exit-code -- workers/api/Cargo.lock
+          tls_ready=$(env -i PATH="$PATH" PGPASSWORD=ci-throwaway PGCONNECT_TIMEOUT=5 PGSSLMODE=verify-full PGSSLROOTCERT="$cert" \
+            psql -XqwAt -h 127.0.0.1 -p 5432 -U postgres -d nntunev2_staging \
+            -c 'SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()')
+          test "$tls_ready" = t
           NODE_EXTRA_CA_CERTS="$cert" node --test workers/api/tests/fixtures/private_trial_cleanup_runner.cjs
       - name: Exclude Subsonic deadline test markers from release WASM
         run: |
