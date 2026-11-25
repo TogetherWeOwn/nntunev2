@@ -124,11 +124,14 @@ test('staging playback evidence follows the current audio element and source', a
     if (event) element.dispatchEvent(new Event(event));
   }, { state, event });
   const sample = () => audio.evaluate(observePlayback, 'sample' as const);
+  const completePlayback = async () => {
+    await setState({ paused: false }, 'playing');
+    await setState({ currentTime: 0.11, paused: true, ended: true }, 'timeupdate');
+  };
 
   await setState({ ...decoded, src: oldSource, currentSrc: oldSource });
   await audio.evaluate(observePlayback, 'arm' as const);
-  await setState({ paused: false }, 'playing');
-  await setState({ currentTime: 0.11, paused: true, ended: true }, 'timeupdate');
+  await completePlayback();
   expect(playbackFailure(await sample(), 0)).toBeNull();
 
   // Resource selection can finish between polls. The first new-source event
@@ -146,11 +149,25 @@ test('staging playback evidence follows the current audio element and source', a
   await setState({ ...decoded, src: newSource, currentSrc: newSource });
   expect(playbackFailure(await sample(), 0)).toMatch(/not playing/);
   await audio.evaluate(observePlayback, 'reset' as const);
-  await setState({ paused: false }, 'playing');
-  await setState({ currentTime: 0.11, paused: true, ended: true }, 'timeupdate');
+  await completePlayback();
   expect(playbackFailure(await sample(), 0)).toBeNull();
 
+  // Reset an already-armed element before replaying the same source.
+  await setState({ currentTime: 0.02, ended: false });
+  const reset = await audio.evaluate(observePlayback, 'reset' as const);
+  expect(reset).toMatchObject({ hasSource: true, sawPlaying: false, maxCurrentTime: 0.02 });
+  await completePlayback();
+  expect(playbackFailure(await sample(), 0.02)).toBeNull();
+
+  // A same-URL reload can empty and decode between polls.
+  await setState({ ...decoded, readyState: 0, duration: Number.NaN }, 'emptied');
+  await setState(decoded);
+  const reloaded = await sample();
+  expect(reloaded).toMatchObject({ hasSource: true, sawPlaying: false, maxCurrentTime: 0 });
+  expect(playbackFailure(reloaded, 0)).toMatch(/not playing/);
+
   // A newly assigned src can be visible before currentSrc changes.
+  await completePlayback();
   await setState({ src: oldSource });
   const pending = await sample();
   expect(pending).toMatchObject({ hasSource: false, sawPlaying: false, maxCurrentTime: 0 });
