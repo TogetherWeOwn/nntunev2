@@ -200,11 +200,29 @@ needs list access as a stop. Keep the scope and credentials in protected custody
 #### Provider-only preflight
 
 For a hosted run, use [staging-trial-provider-preflight](../../.github/workflows/staging-trial-provider-preflight.yml).
+For the fixture boundary, provision and verify a reachable HTTPS ingress
+forwarding to its loopback listener through the protected rollout. The
+disposable qualification uses a runner-local endpoint.
 Prepare the two disposable versions and read back the credential policy as
 described below. Supply the four settings below as secrets in the existing
 `staging` Environment for this run. The endpoint and region secrets must match
-the existing staging Actions variables of the same names. The workflow compares
-them before sending a request and keeps the variable values out of its logs.
+the staging Actions variables of the same names. During the protected
+provider-only window, keep the upload, playback and journey arms unset and
+bind both endpoint inputs to the reviewed fixture ingress. The workflow
+compares the settings before sending a request and keeps the variable values
+out of its logs. Clear the temporary inputs or restore the prior settings on
+closeout.
+
+Before arming, verify upload and playback on the reviewed serving endpoint.
+Also require a passing [cleanup qualification](#protected-cleanup-dispatch)
+on the exact endpoint, region and bucket the cleanup runner will match to
+the trial receipt. Require the pinned `nntunev2-private-fixtures-staging`
+bucket. Stop on a different bucket and resolve the storage configuration
+before attempting qualification. If restoring settings changes the endpoint
+or region, repeat the exact-version HEAD and DELETE qualification on fresh
+disposable versions in the pinned bucket at that target. Qualify its two-key
+cleanup scope separately. Keep the trial disarmed until serving and cleanup
+both qualify. The fixture boundary serves HEAD and DELETE only.
 Keep the exact scope JSON and the disposable credential in
 protected custody. Use the SHA-256 of the exact UTF-8 bytes supplied as the
 scope secret. The dispatch inputs contain only the reviewed full `main` commit
@@ -238,10 +256,16 @@ Provision two non-member versions of one disposable key on the dedicated staging
 provider and fixture bucket. Use `media/00000000000040008000000000000000/<generation>`
 with a fresh compact lowercase UUIDv4 generation. Reserve that object ID for
 qualification. Take both version IDs from the protected provisioning receipt.
-Independently read back the disposable credential's policy. Require the cleanup
-policy shape on this single key, with version-specific HEAD and DELETE and no
-listing, bulk delete, unversioned delete or broad key grant. The probe sends
-DELETE only for the selected version. Keep provisioning separate.
+For the [SeaweedFS fixture boundary](../../ops/staging-s3-boundary/README.md),
+read back the managed policy and its attachment with the provisioner inside
+the private backend container. Independently hash the Caddy configuration
+mounted in the boundary container and compare it with the reviewed render for
+that access key ID and exact key. Record both readbacks for the second
+reviewer. The effective policy must allow version-specific HEAD and DELETE
+on this single key and deny listing, bulk delete, unversioned access and
+other keys. The launcher sends DELETE for the selected version only.
+Run the disposable boundary qualification before the protected provider
+dispatch. Keep provisioning and its credentials inside the private backend.
 After recording the proof, withdraw the credential and retire the sibling using
 the provisioning identity and its exact version pin. Verify the trial cleanup
 credential's two-key policy separately.

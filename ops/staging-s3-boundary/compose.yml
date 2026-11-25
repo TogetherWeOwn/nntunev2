@@ -1,0 +1,56 @@
+services:
+  backend:
+    image: chrislusf/seaweedfs@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9 # 4.55
+    command:
+      - mini
+      - -dir=/data
+      - -ip=backend
+      - -ip.bind=0.0.0.0
+      - -master.telemetry=false
+      - -s3.iam.readOnly=false
+      - -s3.iam.selfServiceRequiresGrant=true
+      - -s3.autoCreateBucket=false
+      - -webdav=false
+      - -admin.ui=false
+    cpus: 1
+    mem_limit: 1g
+    env_file:
+      - path: ${FIXTURE_ADMIN_ENV:?absolute private admin env file required}
+        format: raw
+    volumes:
+      - type: bind
+        source: ${FIXTURE_DATA_DIR:?absolute fixture data directory required}
+        target: /data
+        bind:
+          create_host_path: false
+    networks: [storage]
+
+  boundary:
+    image: caddy@sha256:4e2425f6009577e7c651010f16679c28f7d12df3e7b1914f941a7a3370746b3c # 2.11.9
+    cpus: 1
+    mem_limit: 256m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - target: 8080
+        published: "${FIXTURE_BOUNDARY_PORT:?loopback port required}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ${FIXTURE_CADDYFILE:?absolute rendered Caddyfile required}
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [ingress, storage]
+
+networks:
+  ingress:
+    driver: bridge
+  storage:
+    driver: bridge
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
