@@ -236,11 +236,12 @@ records the actual Settings and REST readbacks for the live handoff.
 | [First-launch database baseline](../.github/workflows/deploy-database-baseline.yml) | `production-db-baseline` | `DATABASE_BASELINE_CANDIDATE_SHA` |
 
 1. Keep both candidate variables unset while the prerequisites are gathered.
-   Stage A qualifies a disposable PostgreSQL target. Carry the merged Stage A
-   result into the fresh Stage B rerun, then qualify capacity, scoped
-   authority, and combined Tunnel/Access and origin TLS at Stage C0. Before
-   production database setup, complete the served private trial and capture
-   the exact-candidate staging evidence in steps 1–3 of
+   For the stock PostgreSQL staging target, carry the merged disposable
+   Stage A result into the fresh Stage B rerun, then qualify capacity,
+   scoped authority, and combined Tunnel/Access and origin TLS at Stage C0.
+   Before production database setup, complete the served private trial on
+   the approved staging target and capture the exact-candidate staging
+   evidence in steps 1–3 of
    [Qualify the candidate](first-private-music-launch.md#qualify-the-candidate).
    [Staging database qualification](../ops/staging-trial-pg/README.md)
 2. Obtain the GitHub custodian's recorded authorization for the separate
@@ -265,17 +266,19 @@ records the actual Settings and REST readbacks for the live handoff.
    [Setup role custody](#setup-role-custody-and-lifecycle) ·
    [Snapshot and metering](#snapshot-and-metering) ·
    [Production releases](../CONTRIBUTING.md#production-releases)
-4. After setup, verify the new database OID, reader fence, grants and sibling
-   isolation. Clear the setup candidate variable and authorization. Retire
-   the temporary setup role under [setup role custody](#setup-role-custody-and-lifecycle),
+4. When the setup attempt ends, clear its candidate variable and authorization.
+   Retire the temporary setup role under [setup role custody](#setup-role-custody-and-lifecycle),
    require the fixed `retired` verdict, and confirm removal of its credential,
-   role and sessions before enabling baseline. Use the verified database OID
-   and the separately issued reader OID for the baseline plan. Recheck the
-   baseline Environment and confirm approval of the baseline candidate and
-   plan. Obtain Environment approval for its exact pending attempt as part
-   of the [protected baseline](#protected-baseline) sequence. Require `empty`
-   and completed reader teardown before handing off to the later migration
-   and cutover gates.
+   role and sessions. Complete this cleanup even when setup is refused,
+   canceled or needs reconciliation. Keep baseline pending until setup
+   success and the new database OID, reader fence, grants and sibling
+   isolation are verified.
+5. Use the verified database OID and the separately issued reader OID for the
+   baseline plan. Recheck the baseline Environment and confirm approval of
+   the baseline candidate and plan. Obtain Environment approval for its exact
+   pending attempt as part of the [protected baseline](#protected-baseline)
+   sequence. Require `empty` and completed reader teardown before handing off
+   to the later migration and cutover gates.
 
 ### Setup plan and enforced limits
 
