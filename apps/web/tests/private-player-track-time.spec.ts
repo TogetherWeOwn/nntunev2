@@ -7,7 +7,8 @@ import { test } from './helpers/private-music-fixture.js';
 test.use({ viewport: { width: 390, height: 844 } });
 
 test('Library and Now Playing display elapsed time and duration from the private decoder', async ({ page, origin }) => {
-	const track = { id: '00000000-0000-4000-8000-000000000001', title: 'Fixture tone', duration_ms: 14_000 };
+	// The catalogue can disagree with the 14-second FLAC.
+	const track = { id: '00000000-0000-4000-8000-000000000001', title: 'Fixture tone', duration_ms: 15_000 };
 	const tone = privateStagingAudio().find(({ file }) => file === 'tone-a.flac')!;
 	const { library, player: hooks } = PRIVATE_MUSIC;
 	const fixture = await mockInvitedLibraryPlayback(page, origin, {
@@ -69,6 +70,9 @@ test('Library and Now Playing display elapsed time and duration from the private
 
 	await expect(audio).toHaveAttribute('data-native-duration', '14');
 	await expect(audio).toHaveAttribute('data-native-clock-advanced', 'yes');
+	await expect(seek).toHaveAttribute('aria-valuetext', /^0:(0[1-9]|1[0-3]) of 0:14$/);
+	await expect(clocks.first()).toHaveText(/^0:(0[1-9]|1[0-3])$/);
+	await expect(audio).toHaveJSProperty('paused', false);
 	await player.getByRole('button', { name: 'Pause', exact: true }).click();
 	await expect(audio).toHaveJSProperty('paused', true);
 	const seconds = await audio.evaluate((el: HTMLAudioElement) => Math.floor(el.currentTime));
