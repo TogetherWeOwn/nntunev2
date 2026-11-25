@@ -2,17 +2,31 @@ import { expect } from '@playwright/test';
 import { PRIVATE_MUSIC } from '../../../e2e/helpers/private-music-journey.js';
 import { fixtureCookie, hasFixtureSession, test } from './helpers/private-music-fixture.js';
 
-test('the invited Library groups tracks by artist and queues the track chosen from its group', async ({
+test('the invited Library queues the admitted track chosen from Unknown artist', async ({
 	page, context, origin
 }) => {
 	const { library, player } = PRIVATE_MUSIC;
 	const listener = 'synthetic-listener';
 	const binding = 'A'.repeat(43);
 	const verifierPath = '/v1/me/likes/session';
-	const target = { id: '00000000-0000-4000-8000-000000000001', title: 'Synthetic Prelude', artist: 'Willow' };
-	const otherArtist = { id: '00000000-0000-4000-8000-000000000002', title: 'Synthetic Interlude', artist: 'Alder' };
-	const sameArtist = { id: '00000000-0000-4000-8000-000000000003', title: 'Synthetic Finale', artist: 'Willow' };
-	const tracks = [target, otherArtist, sameArtist];
+	const target = {
+		id: '00000000-0000-4000-8000-000000000001',
+		occurrence_key: 'private:00000000-0000-4000-8000-000000000001',
+		title: 'Synthetic Prelude',
+		artist: null,
+		like_target_id: null
+	};
+	const otherAdmission = {
+		id: '00000000-0000-4000-8000-000000000002',
+		occurrence_key: 'private:00000000-0000-4000-8000-000000000002',
+		title: 'Synthetic Interlude',
+		artist: null,
+		like_target_id: null
+	};
+	const willowTrack = { id: '00000000-0000-4000-8000-000000000003', title: 'Synthetic Finale', artist: 'Willow' };
+	const alderTrack = { id: '00000000-0000-4000-8000-000000000004', title: 'Synthetic Reprise', artist: 'Alder' };
+	// The Library endpoint returns private admissions before saved catalogue rows.
+	const tracks = [target, otherAdmission, willowTrack, alderTrack];
 	const playbackRequests: string[] = [];
 
 	await context.route('**/*', async (route) => {
@@ -51,7 +65,8 @@ test('the invited Library groups tracks by artist and queues the track chosen fr
 	await toggle.click();
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 	await expect.poll(headingAndRowOrder).toEqual([
-		otherArtist.artist, otherArtist.id, target.artist, target.id, sameArtist.id
+		alderTrack.artist, alderTrack.id, willowTrack.artist, willowTrack.id,
+		'Unknown artist', target.id, otherAdmission.id
 	]);
 	await expect(queue).toHaveCount(0);
 
