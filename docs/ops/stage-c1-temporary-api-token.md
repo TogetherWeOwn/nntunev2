@@ -40,7 +40,9 @@ and `result.status` (`active`). Require `result.expires_on` to be in the
 future, match the recorded expiry and be no more than seven days after
 issuance. Match the full `result.policies` by `effect`, permission group ID
 and resource selector, regardless of array order. This excerpt shows the raw
-HTTP response. The SDK returns the object inside `result` directly.
+HTTP response. With the Cloudflare TypeScript SDK, call `.asResponse()` on the
+promise returned by `accounts.tokens.get()` and parse the response body as
+JSON to check the envelope. The default parsed SDK result omits `success`.
 [Get account token](https://developers.cloudflare.com/api/resources/accounts/subresources/tokens/methods/get/)
 
 ```json
