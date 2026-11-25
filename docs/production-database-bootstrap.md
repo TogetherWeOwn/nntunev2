@@ -192,16 +192,19 @@ this deployment approval.
      --baseline-reviewer "$approved_baseline_reviewer"
    ```
 
-   Record the capture time, endpoints, approved identities, checker revision,
-   output and exit status in release evidence. Exit 0 means both saved REST
-   readbacks match, including a complete custom policy list with the sole
-   `branch` pattern `main`. Recheck the live settings before approval.
-4. Where the Environment REST body omits `can_admins_bypass` or supplies a
-   non-boolean value, the checker reports bypass as unresolved and exits
-   nonzero. Obtain and record the custodian's direct Settings readback of the
-   unchecked bypass control for that exact Environment. Keep that evidence
-   with the release checklist and preserve the unresolved REST result. An
-   explicit REST value of `true` is a failed protection check.
+   Record the capture time, REST API version, endpoints, approved identities,
+   checker revision, output and exit status in release evidence. Exit 0 means
+   both saved REST readbacks match. GitHub's branch policy schema makes `type`
+   optional. The saved list must explicitly identify the sole `main` rule as
+   `type: "branch"`. An omitted type fails the check because the rule could
+   target a tag. Recheck the live settings before approval.
+4. GitHub's published GET Environment schema leaves `can_admins_bypass`
+   unspecified. Plan to record the custodian's direct Settings readback of the
+   unchecked bypass control for each exact Environment. If the REST body omits
+   the field or supplies a non-boolean value, the checker reports bypass as
+   unresolved and exits nonzero. Keep that result alongside the Settings
+   readback. The Settings readback covers administrator bypass only. An explicit
+   REST value of `true` is a failed protection check.
 
 ### Setup plan and enforced limits
 
