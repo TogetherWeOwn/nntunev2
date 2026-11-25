@@ -186,7 +186,7 @@ impl SealedFixture {
             .await
             .map_err(|_| Unconfirmed)?;
         let (_, number, bytes, _) = part.request();
-        let etag = uploaded.etag.clone();
+        let etag = uploaded.etag().to_owned();
         let parts = [CheckpointPart {
             number,
             len: bytes.len(),
