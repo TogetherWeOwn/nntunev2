@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 const name = 'nntune-web';
@@ -85,28 +86,35 @@ export async function seedMaintenance({ account, token, worker, sha, routeProof,
 
   const code = readFileSync(new URL('./worker.mjs', import.meta.url));
   requireRouteProof(routeProof, worker, sha, now());
+  const marker = `Maintenance seed ${randomUUID()}`;
   // No provider-side compare-and-set: the protected lane must be the sole
   // Worker writer from the first GET through readback. Never retry the POST.
-  const { result: created } = await api(`${pinned}/versions?deploy=true`, 'Seed upload and deploy', {
+  const submission = await api(`${pinned}/versions?deploy=true`, 'Seed upload and deploy', {
     main_module: 'worker.mjs', compatibility_date: '2026-10-01', bindings: [],
-    annotations: { 'workers/tag': sha },
+    annotations: { 'workers/tag': sha, 'workers/message': marker },
     modules: [{ name: 'worker.mjs', content_type: 'application/javascript+module', content_base64: code.toString('base64') }],
-  });
-  if (typeof created.id !== 'string' || !versionId.test(created.id)) throw new Error('Seed response has no valid version ID');
+  }).catch(() => null); // The upload may have committed before the response failed.
 
   const active = await api(`${script}/deployments${page}`, 'Deployment readback');
   requireCompletePage(active, active.result.deployments, 1, 'deployments');
-  const deployed = active.result.deployments[0]?.versions;
-  if (!Array.isArray(deployed) || deployed.length !== 1 ||
-      deployed[0]?.version_id !== created.id || deployed[0].percentage !== 100) {
+  const deployment = active.result.deployments[0];
+  const deployed = deployment?.versions;
+  const id = deployed?.[0]?.version_id;
+  if (typeof deployment?.id !== 'string' || !versionId.test(deployment.id) ||
+      !Array.isArray(deployed) || deployed.length !== 1 ||
+      typeof id !== 'string' || !versionId.test(id) || deployed[0].percentage !== 100 ||
+      (submission && submission.result.id !== id)) {
     throw new Error('Readback did not confirm exactly the new seed version at 100%');
   }
-  const { result: version } = await api(`${pinned}/versions/${created.id}`, 'Seed version readback');
-  if (version.id !== created.id || version.annotations?.['workers/tag'] !== sha || !empty(version.bindings)) {
-    throw new Error('Readback did not confirm the SHA-tagged, binding-free seed on the pinned Worker');
+  const inventory = await api(`${pinned}/versions${page}`, 'Version inventory readback');
+  requireCompletePage(inventory, inventory.result, 1, 'versions');
+  const { result: version } = await api(`${pinned}/versions/${id}`, 'Seed version readback');
+  if (inventory.result[0]?.id !== id || version.id !== id || version.annotations?.['workers/tag'] !== sha ||
+      version.annotations['workers/message'] !== marker || !empty(version.bindings)) {
+    throw new Error('Readback did not confirm this submission as the only binding-free seed');
   }
   await workerState(true);
-  return created.id;
+  return id;
 }
 
 if (import.meta.main) {
