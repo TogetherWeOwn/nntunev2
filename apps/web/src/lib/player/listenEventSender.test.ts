@@ -137,6 +137,32 @@ it('replays a start with an interrupted acknowledgement before sending its termi
 	expect(f.bodies()).toEqual([{ ...start, context }, { ...start, context }, { ...complete, context }]);
 });
 
+it('retries when the request deadline aborts a stalled acknowledgement', async () => {
+	vi.useFakeTimers();
+	const deadline = new AbortController();
+	const fetchFn = contextFetch().mockImplementationOnce(async (_path, init) => new Response(new ReadableStream({
+		start(controller) {
+			controller.enqueue(new TextEncoder().encode('{"ok":'));
+			init?.signal?.addEventListener('abort', () => controller.error(init.signal?.reason), { once: true });
+		}
+	}))).mockImplementation(async () => ack());
+	const f = fixture(fetchFn);
+	await f.sender.ready;
+	await f.openGrant();
+	const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(deadline.signal);
+	onTestFinished(() => { timeout.mockRestore(); });
+	f.sender.send(start);
+	f.sender.send(complete);
+	await vi.advanceTimersByTimeAsync(0);
+	expect(timeout).toHaveBeenCalledWith(10_000);
+	deadline.abort(new DOMException('fixture deadline', 'TimeoutError'));
+	await vi.advanceTimersByTimeAsync(499);
+	expect(f.bodies()).toEqual([{ ...start, context }]);
+	await vi.advanceTimersByTimeAsync(1);
+	expect(f.account.signal.aborted).toBe(false);
+	expect(f.bodies()).toEqual([{ ...start, context }, { ...start, context }, { ...complete, context }]);
+});
+
 it('aborts in-flight account work and disregards a late acknowledgement', async () => {
 	const pending = Promise.withResolvers<Response>();
 	const fetchFn = contextFetch().mockImplementationOnce(() => pending.promise);
