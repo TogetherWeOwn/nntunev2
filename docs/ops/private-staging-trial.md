@@ -12,7 +12,9 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 If dedicated PostgreSQL provisioning stops partway through, use the
 [Stage C recovery handoff](private-staging-trial-recovery.md) before retrying.
 
-1. **Prepare the isolated database.** Run the [catalog preflight](#isolated-database-catalog-preflight)
+1. **Prepare the isolated database.** For the dedicated PostgreSQL target,
+   verify the [storage handoff](#storage-closeout-before-stage-c1) before C1
+   provisioning or database writes. Run the [catalog preflight](#isolated-database-catalog-preflight)
    before preparing ACLs or issuing either login. If the isolated branch has
    ambient database grants, qualify the [database ACL preparation](#isolated-database-acl-preparation)
    before issuance. Issue the two dedicated SQL logins through the branch's
@@ -518,16 +520,16 @@ and the database lane read-only until all three checks pass.
    dispatch commits, and the disposable scope SHA-256. Match the protected
    main `staging-trial-provider-preflight` run ID, attempt `1`, job ID and
    tested SHA to that dispatch. Require the job's executed storage probe and
-   fixed pass verdict. A local disposable pass or a skipped probe leaves
-   storage qualification pending. Refer any stop to the storage owner for
-   reconciliation before accepting the handoff.
-2. **Verify exact absence.** Require independent provider reads for the
-   selected version's empty `404` and the sibling's matching ETag before
-   disposal. At closeout require both pinned versions absent by exact-version
-   HEAD and an empty scoped inventory of versions, delete markers and multipart
-   uploads. Match the storage owner's completed DNS closeout to the exact
-   attempt and require the recorded Caddy, staging Environment and scoped
-   resource disposal readbacks. A delete acknowledgement or a successful
+   its fixed `qualified` verdict. A local disposable pass or a skipped probe
+   leaves storage qualification pending. Refer any stop to the storage owner
+   for reconciliation before accepting the handoff.
+2. **Verify exact absence.** After the probe and before disposal, require
+   independent provider reads for the selected version's empty `404` and the
+   sibling's matching ETag. At closeout require both pinned versions absent by
+   exact-version HEAD and an empty scoped inventory of versions, delete markers
+   and multipart uploads. Match the storage owner's completed DNS closeout to
+   the exact attempt and require the recorded Caddy, staging Environment and
+   scoped resource disposal readbacks. A delete acknowledgement or a successful
    Compose `down` alone leaves closeout pending.
 3. **Verify writer release.** Require the timestamped release and successful
    free readback on the original shared writer lock after verified closeout.
@@ -544,8 +546,8 @@ needed to walk through the C1 decision.
 
 | Check | Synthetic evidence |
 | --- | --- |
-| Run | Approved attempt `storage-02` pins merge `M2`, dispatch `D2` and scope digest `S2`. Its protected run `8202`, attempt `1`, job `9202`, tested `D2` with the `S2` dispatch. The probe executed and recorded its fixed pass verdict. |
-| Independent verification | For scope `S2`, admin HEAD reads selected `v2-selected` as empty `404` and the sibling `v2-sibling` as `200` with its original ETag. At `10:03 UTC`, exact HEAD confirms both absent and inventory shows zero versions, delete markers and uploads. The storage owner records passing DNS, Caddy, Environment and resource disposal readbacks for `storage-02`. |
+| Run | Approved attempt `storage-02` pins merge `M2`, dispatch `D2` and scope digest `S2`. Its protected run `8202`, attempt `1`, job `9202`, tested `D2` with the `S2` dispatch. The probe recorded `qualified` at `10:00 UTC`. |
+| Independent verification | At `10:01 UTC`, admin HEAD for scope `S2` reads selected `v2-selected` as empty `404` and the sibling `v2-sibling` as `200` with its original ETag. By `10:03 UTC`, exact HEAD confirms both absent and inventory shows zero versions, delete markers and uploads. At `10:03 UTC`, the storage owner records completed closeout for `storage-02` with passing DNS, Caddy, Environment and scoped resource disposal readbacks. |
 | Writer | At `10:04 UTC` the storage owner records release and a free readback on the same shared writer lock. |
 
 The database operator accepts the storage prerequisite for `storage-02` at
