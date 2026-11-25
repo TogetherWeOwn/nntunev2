@@ -138,7 +138,9 @@ custody. Confirm the database is distinct from shared staging. From the
 reviewed checkout, load `ISOLATED_TRIAL_TARGET` using the shape in step 2,
 with planned reader and writer logins, and load just the candidate's owner and
 executor URLs as `PRIVATE_TRIAL_OWNER_URL` and `PRIVATE_TRIAL_EXECUTOR_URL` from
-secure custody. Run the opt-in readback from a private operator session:
+secure custody. Use a private operator host with Python 3 and `psql` on `PATH`
+and a readable system CA bundle at `/etc/ssl/certs/ca-certificates.crt`. Run
+the opt-in readback from that session:
 
 ```sh
 python3 -E -s .github/scripts/staging_trial_role_lifecycle.py check-catalog --isolated
@@ -153,8 +155,11 @@ baseline refusal, reconcile the reviewed pins and migration readback before
 retrying. Retain only fixed verdicts and a private reference to the pins.
 
 After a pass, qualify the same target's provider management and consumer
-continuity under [ACL preparation](#isolated-database-acl-preparation). The
-protected ambient workflow pins both the provider branch and database OID.
+continuity under [ACL preparation](#isolated-database-acl-preparation). For
+that operation, confirm separately that the isolated owner can read the 0063
+checksum from `public.schema_migrations`. The catalog preflight reads it as
+the executor. The protected ambient workflow pins both the provider branch
+and database OID.
 If the candidate differs from those pins, obtain a separately reviewed
 protected target update before dispatch. Keep the trial off until the
 protected checks, separate routed reader and writer readbacks, and serving
