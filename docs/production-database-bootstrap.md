@@ -104,15 +104,13 @@ GitHub supports required reviewers on this public repository. The existing
 production Environment has only a branch restriction. Under separate release
 admission, configure `production-db-bootstrap` **before** enabling the job.
 GitHub can create a missing Environment from a workflow reference without
-protection. In Settings, verify the required independent reviewer or team,
-prevent self-review and disabled administrator bypass. Cross-check the
-reviewer and `prevent_self_review` in the [environment REST readback](https://docs.github.com/en/rest/deployments/environments)
-and `can_admins_bypass` when returned. Use a custom policy with the sole typed
-branch `main`, no tag policy. Verify the list through
-[deployment branch policies](https://docs.github.com/en/rest/deployments/branch-policies).
-Keep Environment administration with the custodian and check rule changes
-before approval. One listed reviewer suffices on GitHub. The release review
-and T0 code reviews are separate from this deployment approval.
+protection. Verify both `production-db-bootstrap` and `production-db-baseline`
+using the [Environment protection readback](#environment-protection-readback)
+before enabling the corresponding job. Keep Environment administration with
+the custodian and check rule changes before approval. One listed reviewer
+suffices on GitHub, so require only the approved independent user or team in
+each Environment. The release review and T0 code reviews are separate from
+this deployment approval.
 [Environment protection rules](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
 · [Configure environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
 
@@ -163,6 +161,50 @@ and T0 code reviews are separate from this deployment approval.
    readback keeps the release closed. A later run requires fresh approval.
    [Job cancellation](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-cancellation)
    · [Provider role management](https://planetscale.com/docs/postgres/connecting/roles)
+
+### Environment protection readback
+
+1. In `TogetherWeOwn/nntunev2`, record the independently approved reviewer
+   for each Environment as `User:ID` or `Team:ID`, using the numeric GitHub
+   ID from the release evidence. In Settings, check the approved reviewer,
+   **Prevent self-review**, and that **Allow administrators to bypass
+   configured protection rules** is unchecked.
+2. Save the successful JSON response bodies for each exact Environment in a
+   private evidence directory. Replace `<env>` with `production-db-bootstrap`
+   and `production-db-baseline` in the read-only endpoints and filenames
+   below. Keep each branch policy response paired with its source endpoint
+   to bind it to the named Environment.
+
+   | GET endpoint under `/repos/TogetherWeOwn/nntunev2` | Filename |
+   | --- | --- |
+   | `/environments/<env>` | `<env>.environment.json` |
+   | `/environments/<env>/deployment-branch-policies?per_page=100` | `<env>.branch-policies.json` |
+
+   [Environment endpoint](https://docs.github.com/en/rest/deployments/environments)
+   · [Deployment branch policies endpoint](https://docs.github.com/en/rest/deployments/branch-policies)
+
+3. Run the [offline checker](../.github/scripts/database_bootstrap_environment_readback.py)
+   with the approved identities and the saved files.
+
+   ```sh
+   python3 -B .github/scripts/database_bootstrap_environment_readback.py "$evidence_dir" \
+     --bootstrap-reviewer "$approved_bootstrap_reviewer" \
+     --baseline-reviewer "$approved_baseline_reviewer"
+   ```
+
+   Record the capture time, REST API version, endpoints, approved identities,
+   checker revision, output and exit status in release evidence. Exit 0 means
+   both saved REST readbacks match. GitHub's branch policy schema makes `type`
+   optional. The saved list must explicitly identify the sole `main` rule as
+   `type: "branch"`. An omitted type fails the check because the rule could
+   target a tag. Recheck the live settings before approval.
+4. GitHub's published GET Environment schema leaves `can_admins_bypass`
+   unspecified. Plan to record the custodian's direct Settings readback of the
+   unchecked bypass control for each exact Environment. If the REST body omits
+   the field or supplies a non-boolean value, the checker reports bypass as
+   unresolved and exits nonzero. Keep that result alongside the Settings
+   readback. The Settings readback covers administrator bypass only. An explicit
+   REST value of `true` is a failed protection check.
 
 ### Setup plan and enforced limits
 
@@ -237,11 +279,10 @@ attempted creation is uncertain. The caller stops without retry or deletion.
 
 The [baseline workflow](../.github/workflows/deploy-database-baseline.yml)
 shares setup's lock and uses a separate `production-db-baseline` Environment.
-Verify that exact Environment's independent reviewer, self-review and bypass
-settings, and the sole typed `main` branch policy before setting the repository
-variable `DATABASE_BASELINE_CANDIDATE_SHA` to the approved main SHA. Dispatch from
-`main` with zero inputs. The staging preflight rejects any baseline authorization
-visible outside the protected Environment.
+Complete the [Environment protection readback](#environment-protection-readback)
+before setting the repository variable `DATABASE_BASELINE_CANDIDATE_SHA` to the
+approved main SHA. Dispatch from `main` with zero inputs. The staging preflight
+rejects any baseline authorization visible outside the protected Environment.
 
 For the first attempt, stage `BASELINE_ENABLED=true`, `BASELINE_SHA`,
 `BASELINE_RUN_ID`, `BASELINE_EXPIRY`, `BASELINE_PLAN_B64`, `BASELINE_PLAN_DIGEST`
