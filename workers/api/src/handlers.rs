@@ -9233,6 +9233,7 @@ pub(crate) mod tests {
     mod private_playlist_postgres {
         include!("private_playlists_postgres_tests.rs");
         include!("../tests/fixtures/private_playlist_repeated_read.rs");
+        include!("../tests/fixtures/private_playlist_library_reload.rs");
     }
 
     fn block_on<F: Future>(future: F) -> F::Output {
