@@ -444,10 +444,10 @@ Use a synthetic timestamp and a private readback reference for each
 observation. The positive control records every scoped capability in the
 table above as verified for its issuer and operation.
 
-Use `sha256sum` on each version 2 plan file and compare its digest with
-the issuer entry for that workflow. Review each entry against the plan
-whose digest it carries. Record the plan-digest match and the Operator's
-disposition for both attempts.
+For each workflow, use `sha256sum` on its version 2 plan file. Compare the
+computed digest with the digest in that workflow's issuer entry. A mismatch
+keeps the entry pending. Record the digest comparison and the Operator's
+disposition for the bootstrap and baseline entries.
 
 | Synthetic evidence reviewed | Preparation outcome to record |
 | --- | --- |
