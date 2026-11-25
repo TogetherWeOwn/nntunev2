@@ -24,6 +24,8 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    `storage_object_intent_append_only()` to install the locator trigger. Confirm
    both logins lack access to other connectable databases. Retain the original
    protected scope for withdrawal.
+   If the isolated branch has ambient database grants, qualify the
+   [database ACL preparation](#isolated-database-acl-preparation) before issuance.
 2. **Check protected inputs.** Store the existing role-scope JSON in
    staging as `ISOLATED_TRIAL_ROLE_SCOPE`. Set `ISOLATED_TRIAL_TARGET` to a
    reviewed JSON object with `database_oid` and `executor_oid` (numbers),
@@ -116,6 +118,35 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    from custody and withdraw any temporary executor grants through their original
    grantor. If withdrawal refuses, reconcile with the grant owner while both
    logins stay fenced.
+
+### Isolated database ACL preparation
+
+Before issuing either trial login, collect the normalized `CATALOG` projection
+from `.github/scripts/staging_trial_ambient_acl.py` and the original ACL nullness
+on the pinned isolated branch through a private read-only session. Inventory
+every connectable database and template. Check provider management and each
+existing consumer's required CONNECT, TEMP and CREATE, including dormant
+consumers. Establish their approved access and a reversible window before any
+write. A live session inventory alone cannot establish those dependencies.
+
+Store the private plan as `ISOLATED_TRIAL_AMBIENT_PLAN` and retain it for undo.
+Use fields `branch_id`, `direct`, `port`, `baseline` (the catalog projection)
+and `consumers` (lists of database OID, role OID, role name and privilege).
+Review the exact plan digest and rollback, then pass its SHA-256 in
+`ambient_plan_sha256`. Use the isolated owner URL and `ISOLATED_TRIAL_BRANCH_READ`
+with a scoped PlanetScale `id:token` to confirm the distinct nonproduction branch
+at dispatch. Keep the private plan, snapshots and access values out of logs.
+
+With roles absent, run `check-ambient`, then `restrict-ambient` from protected
+`main`. Refuse unsupported grantors, template changes with unverified support,
+unproven dependencies, unexpected application ACLs or unexplained drift. The
+workflow transfers only reviewed PUBLIC privileges to consumers that need them
+and withdraws PUBLIC access atomically. Verify management connectivity and
+the isolated catalog before issuing any login. After retiring both roles, use
+the same plan for `restore-ambient`. The inverse restores normalized grants,
+including grantors and grant options. Supported PostgreSQL DDL may leave an
+explicit ACL where `datacl` was previously NULL. Confirm normalized equality
+and record any raw representation difference privately.
 
 ### Protected cleanup dispatch
 

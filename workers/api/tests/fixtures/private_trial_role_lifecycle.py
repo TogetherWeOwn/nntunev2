@@ -12,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / ".github/scripts"))
 
 from apply_migration import transaction_body
-from staging_apply import load_entries
+from staging_apply import StagingApplyError, load_entries
+from staging_trial_ambient_acl import CATALOG, branch_pin, compose as ambient_sql
 from staging_trial_isolated import target_config
 from staging_trial_role_lifecycle import CONFIG_ENV, DATABASE, FIXTURE, NAMES, SCOPE_ENV
 from staging_trial_schema import BASELINE, compose
@@ -334,6 +335,87 @@ try:
     scope.update(reader=[reader, role_oid(reader)], writer=[writer, role_oid(writer)])
     assert "staging CONNECT passed" not in isolated("grant", success=False)
     assert sql(f"SELECT has_database_privilege('{writer}',current_database(),'CONNECT');") == "f"
+
+    # Exercise supported ACL-only change and inverse while no trial role exists.
+    sql(f"DROP ROLE {reader}, {writer}; ALTER DATABASE {DATABASE} OWNER TO postgres;")
+    other = "trial_ambient_fixture"
+    sql(f"CREATE DATABASE {other} TEMPLATE template0;")
+    try:
+        pg_branch = {"id": "fixture", "name": "staging", "ready": True, "default": False, "production": False}
+        assert branch_pin(pg_branch, "fixture") and not branch_pin(pg_branch | {"production": True}, "fixture")
+        assert not branch_pin(pg_branch, "other") and not branch_pin(pg_branch | {"default": True}, "fixture")
+        sql(f"GRANT CONNECT,TEMP ON DATABASE {DATABASE}, template1 TO PUBLIC;")
+        sql(f"GRANT CONNECT ON DATABASE template1 TO {executor} WITH GRANT OPTION;")
+        initial = json.loads(sql(CATALOG))
+        assert sql(f"SELECT datacl IS NULL FROM pg_database WHERE datname='{other}';") == "t"
+        template_oid = next(row[0] for row in initial["databases"] if row[1] == "template1")
+        consumer = [[template_oid, role_oid(executor), executor, "CONNECT"],
+                    [template_oid, role_oid(executor), executor, "TEMPORARY"]]
+
+        def ambient(action, snapshot=initial):
+            return ambient_sql(action, snapshot, consumer, database_oid, "postgres", fixture=True)
+
+        def refused(statement):
+            try:
+                sql(statement)
+            except AssertionError:
+                return
+            raise AssertionError("ambient ACL operation accepted an unsafe plan")
+
+        sql(ambient("check-ambient"))
+        assert json.loads(sql(CATALOG)) == initial
+        sql(f"ALTER DATABASE {other} OWNER TO {owner};")
+        try:
+            ambient("restrict-ambient", snapshot=json.loads(sql(CATALOG)))
+        except StagingApplyError as error:
+            assert str(error) == "isolated database ACL grantor authority"
+        else:
+            raise AssertionError("ambient ACL operation accepted a foreign grantor")
+        sql(f"ALTER DATABASE {other} OWNER TO postgres;")
+        assert json.loads(sql(CATALOG)) == initial
+        sql("CREATE FUNCTION public.ambient_fixture_unexpected() RETURNS int LANGUAGE sql AS 'SELECT 1';")
+        refused(ambient("restrict-ambient"))
+        assert json.loads(sql(CATALOG)) == initial
+        sql("DROP FUNCTION public.ambient_fixture_unexpected();")
+        forward = ambient("restrict-ambient")
+        reliant = "ambient_fixture_reliant"
+        sql(f"CREATE ROLE {reliant} LOGIN PASSWORD '{password}';")
+        session = subprocess.Popen(["psql", "-XqAtw"], text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL,
+                                   env={**base, "PGDATABASE": "template1", "PGUSER": reliant, "PGCONNECT_TIMEOUT": "5"})
+        try:
+            session.stdin.write("SELECT 1;\n")
+            session.stdin.flush()
+            assert session.stdout.readline().strip() == "1"
+            refused(forward)
+            assert json.loads(sql(CATALOG)) == initial
+        finally:
+            if session.poll() is None:
+                session.terminate()
+            session.wait(timeout=10)
+            sql(f"DROP ROLE {reliant};")
+        changed = forward.replace("\\gexec\n", "\\gexec\nSELECT 1/0;\n", 1)
+        assert changed != forward
+        refused(changed)
+        assert json.loads(sql(CATALOG)) == initial
+        sql(forward)
+        restricted = json.loads(sql(CATALOG))
+        assert all(entry[1] != 0 for entry in restricted["acl"])
+        assert sql(f"SELECT has_database_privilege('{executor}','template1','CONNECT WITH GRANT OPTION')"
+                   f" AND has_database_privilege('{executor}','template1','TEMPORARY');") == "t"
+        sql(forward)
+        assert json.loads(sql(CATALOG)) == restricted
+        sql(f"CREATE ROLE {reader} NOLOGIN NOINHERIT;")
+        refused(ambient("restore-ambient"))
+        assert json.loads(sql(CATALOG)) == restricted
+        sql(f"DROP ROLE {reader};")
+        sql(ambient("restore-ambient"))
+        sql(ambient("restore-ambient"))
+        assert json.loads(sql(CATALOG)) == initial
+        assert sql(f"SELECT datacl IS NULL FROM pg_database WHERE datname='{other}';") == "f"
+    finally:
+        sql(f"DROP DATABASE {other};")
+    print("Isolated ambient ACL prepare, refusal, retry and restoration passed")
 finally:
     sql(f"""
     DROP DATABASE {DATABASE} WITH (FORCE);
