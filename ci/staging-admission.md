@@ -231,6 +231,29 @@ The object has `schema: 1`, the candidate `sha`, decimal string `run_id` and
 no private pins. The line is staging evidence only. Match it against the
 [pinned candidate template](../docs/first-private-music-launch.md#pinned-candidate-template).
 
+### Synthetic handoff when Actions evidence is unavailable
+
+For candidate `<sha>`, the private journey and receipt upload in run
+`<run-id>`, attempt `1` succeeded. Actions lists the unexpired receipt. The ZIP
+download times out before the verifier can check its digest. If the existing
+Actions reader instead cannot retrieve the required job records for that
+attempt, record the job read as the blocker and use the same disposition.
+
+| Release record field | Example entry |
+| --- | --- |
+| Staging attempt | `<sha>`, run `<run-id>`, attempt `1`. Retain the run reference and the job references already available. |
+| Staging admission | Pending. The ZIP for `staging-admission-<sha>-<run-id>-1-private-music` could not be fetched. |
+| Dispatch readiness | Blocked pending verified staging evidence. |
+
+When the existing authorized Actions read path is available, repeat step 3 of
+[Qualify the candidate](../docs/first-private-music-launch.md#qualify-the-candidate)
+for the pinned SHA. Recheck the selected run and attempt and verify the exact
+archive from that attempt, including its digest and the current staging identity.
+Keep admission Pending until the verifier emits matching pins. If expiry, a
+superseding attempt or staging drift invalidates the original evidence, return
+to candidate qualification for fresh evidence. Keep scheduled trial cleanup
+on time while verification is blocked.
+
 ### Draft contract for the first private music release
 
 The [draft contract](private-music-journey-contract.draft.json) maps the
