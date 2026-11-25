@@ -49,15 +49,21 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      private_trial_cleanup_scope_sha256:
+        description: Recorded SHA-256 of the contained tone A cleanup scope
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 # Hold the main staging lock until post-deploy E2E finishes checking this
 # run's SHA. Queue pending pushes instead of replacing them during E2E.
-# Non-push runs use separate groups so they do not wait on staging deploys.
+# Cleanup shares the deploy lock so the disabled providers cannot change mid-run.
+# Other non-push runs use separate groups.
 concurrency:
-  group: ${{ github.event_name == 'push' && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}
+  group: ${{ (github.event_name == 'push' || inputs.private_trial_cleanup_scope_sha256 != '') && 'deploy-staging-main' || format('deploy-staging-{0}', github.run_id) }}
   cancel-in-progress: false
   queue: max
 
@@ -69,8 +75,78 @@ env:
   WRANGLER_VERSION: 4.162.0
 
 jobs:
+  staging-private-trial-cleanup:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' && github.repository == 'TogetherWeOwn/nntunev2' &&
+          github.ref == 'refs/heads/main' && github.ref_protected && github.workflow_sha == github.sha &&
+          github.run_attempt == 1 && inputs.private_trial_cleanup_scope_sha256 != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: staging
+      deployment: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Install locked local Worker runtime
+        working-directory: apps/web
+        run: pnpm install --frozen-lockfile --ignore-scripts --config.minimumReleaseAge=4320
+      - name: Install pinned Worker tools
+        run: |
+          python3 -I .github/scripts/worker_rust_provenance.py rust
+          python3 -I .github/scripts/worker_tools.py install
+      - name: Build the isolated cleanup Worker
+        working-directory: workers/api
+        run: |
+          set -euo pipefail
+          worker-build --release --out-dir "$RUNNER_TEMP/trial-cleanup" -- --locked --features staging-fixture-cleanup 2>&1 | tee "$RUNNER_TEMP/worker-trial-cleanup.log"
+          python3 -I ../../.github/scripts/worker_tools.py check-build "$RUNNER_TEMP/worker-trial-cleanup.log"
+          git diff --exit-code -- Cargo.lock
+      - name: Verify the pinned staging disable deployment
+        env:
+          CLEANUP_SCOPE_SHA256: ${{ inputs.private_trial_cleanup_scope_sha256 }}
+          CLEANUP_CONTAINMENT: ${{ secrets.PRIVATE_TRIAL_CLEANUP_CONTAINMENT }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_WORKERS_READ_TOKEN: ${{ secrets.SUBSONIC_STAGING_WORKERS_READ_TOKEN }}
+          PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED: ${{ vars.PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED }}
+          PRIVATE_PLAYBACK_STAGING_ENABLED: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENABLED }}
+          PRIVATE_MUSIC_STAGING_JOURNEY: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY }}
+          PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION }}
+          STREAM_STAGING_DEPLOY_ENABLED: ${{ vars.STREAM_STAGING_DEPLOY_ENABLED }}
+          PRIVATE_PLAYBACK_STAGING_ENVIRONMENT: ${{ vars.PRIVATE_PLAYBACK_STAGING_ENVIRONMENT }}
+          PRIVATE_PLAYBACK_STAGING_LIBRARY: ${{ vars.PRIVATE_PLAYBACK_STAGING_LIBRARY }}
+          PRIVATE_PLAYBACK_STAGING_ROOT_VERSION: ${{ vars.PRIVATE_PLAYBACK_STAGING_ROOT_VERSION }}
+          PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_CONFIGURATION }}
+          PRIVATE_PLAYBACK_STAGING_S3_BUCKET: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_BUCKET }}
+          PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_ENDPOINT }}
+          PRIVATE_PLAYBACK_STAGING_S3_REGION: ${{ vars.PRIVATE_PLAYBACK_STAGING_S3_REGION }}
+        run: |
+          umask 077
+          timeout -k 2s 40s python3 -E -s .github/scripts/staging_trial_cleanup_preflight.py > "$RUNNER_TEMP/trial-cleanup-provider.json"
+      - name: Retire the selected tone A versions once
+        env:
+          CLEANUP_STAGE: staging
+          CLEANUP_SCOPE_SHA256: ${{ inputs.private_trial_cleanup_scope_sha256 }}
+          CLEANUP_SCOPE: ${{ secrets.PRIVATE_TRIAL_CLEANUP_SCOPE }}
+          CLEANUP_DATABASE_URL: ${{ secrets.PRIVATE_TRIAL_CLEANUP_DATABASE_URL }}
+          CLEANUP_S3: ${{ secrets.PRIVATE_TRIAL_CLEANUP_S3 }}
+        run: |
+          set -euo pipefail
+          export CLEANUP_PROVIDER="$(cat "$RUNNER_TEMP/trial-cleanup-provider.json")"
+          exec timeout -k 3s 45s node .github/scripts/staging_trial_cleanup.cjs "$RUNNER_TEMP/trial-cleanup" 2>/dev/null
+
   gate:
     name: gate
+    if: ${{ github.event_name == 'push' || inputs.private_trial_cleanup_scope_sha256 == '' }}
     environment:
       name: staging
       deployment: false
