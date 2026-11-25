@@ -661,9 +661,11 @@ samples must agree on PR number, repository IDs/names, refs, commits and
 file count. An observed head change or retarget fails; it never adopts a
 live head. Git must prove the original event base B0 is the tested first
 parent or its ancestor. A recorded effective base B1 must equal or descend
-from the tested first parent in the same repository/ref. Every observed base
-must equal or descend from the preceding observation across brackets and
-attempts. An observed rewind or divergent transition fails the check.
+from the event base in the same repository/ref. It must also equal or
+descend from the tested first parent, unless Git proves it trails that
+parent and shares its exact `migrations/` tree and unique merge base with H.
+Every observed base must equal or descend from the preceding observation
+across brackets and attempts. An observed rewind or divergent transition fails.
 B1 need not be an ancestor of H. Its immutable object must be available in the full data
 checkout; missing objects or ambiguous ancestry fail, with no mutable-ref
 fetch or trust-pin substitution. Missing or incompatible first-parent code

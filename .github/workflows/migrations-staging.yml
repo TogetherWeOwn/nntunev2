@@ -99,8 +99,8 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          # Each API bracket must retain the event identities and descend
-          # from the tested first parent. Both history passes share bounds.
+          # Each bracket retains the event identities. Git checks ancestry
+          # and migration equivalence when the API trails the tested parent.
           python3 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from migration_snapshot import main; sys.exit(main())' \
             "$GITHUB_WORKSPACE/trusted-checker/.github/scripts" \
             --root "$GITHUB_WORKSPACE/pr-data" \
