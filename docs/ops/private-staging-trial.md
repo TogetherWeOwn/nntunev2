@@ -20,9 +20,10 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    the overlay and grants. The `public` schema owner must authorize `CREATE`
    and grant `USAGE WITH GRANT OPTION` to the executor. The executor needs
    grantable column access, `REFERENCES` for the overlay's foreign keys, and
-   grantable `EXECUTE` on both reviewed 0052 routines. Confirm the two SQL-created
-   identities can be routed on the provider and that both lack access to other
-   connectable databases. Retain the original protected scope for withdrawal.
+   grantable `EXECUTE` on both reviewed 0052 routines and `EXECUTE` on
+   `storage_object_intent_append_only()` to install the locator trigger. Confirm
+   both logins lack access to other connectable databases. Retain the original
+   protected scope for withdrawal.
 2. **Check protected inputs.** Store the existing role-scope JSON in
    staging as `ISOLATED_TRIAL_ROLE_SCOPE`. Set `ISOLATED_TRIAL_TARGET` to a
    reviewed JSON object with `database_oid` and `executor_oid` (numbers),
@@ -37,15 +38,16 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    catalog pin. Keep the shared staging URLs, roles and routing in service.
 3. **Grant and verify access.** Dispatch `grant`, then `verify-overlay`
    with the reviewed ref and approval. Require the exact overlay ACL verdict
-   and separate routed reader and writer verdicts. `grant` installs the base
-   grants, row-lock guards and overlay in one executor transaction after the
-   owner's CONNECT grant. If routing fails after that transaction, keep the
-   trial disarmed and either retry with the same pins and corrected dedicated
-   connection or fence and retire. Hand the verified isolated pair to the
-   trial operator through protected custody.
-4. **Verify staging bindings and cleanup access.** Verify isolated routing
-   for the exact trial build before arming. Check the candidate's
-   mounted upload caller and actual staging identities for all four dedicated,
+   and separate reader and writer verdicts through the provider's routed
+   endpoint. After the owner grants CONNECT, the executor installs the base
+   grants, guards and overlay in one transaction. If routing fails, keep the
+   trial disarmed and correct the dedicated connection or fence and retire.
+   Hand the verified pair to the trial operator through protected custody.
+4. **Verify isolated serving and cleanup access.** Keep the trial disarmed
+   until a separately reviewed serving lane proves that the exact build's
+   account, invite, session, publication, Library, playback and cleanup
+   connections all reach the same pinned isolated database.
+   Check the mounted upload caller and actual identities for all four dedicated,
    uncached Hyperdrive bindings (`UPLOAD`, `AUTH`, `PUBLISH`, `ENROLL`). Use the
    scoped role assigned to each binding by the reviewed caller. Verify the
    staging MusicBrainz binding, API–Stream service bindings, dedicated fixture
@@ -67,7 +69,7 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    companion. Set `PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION` for the prepublished
    tone B track before the armed push so Stream reads the selector at deploy
    time. Arm upload, playback and the private journey on the same protected
-   `main` push with Stream deployment enabled. Require successful API, Stream
+   isolated build with Stream enabled. Require successful API, Stream
    and Web deploy readbacks for that run and commit, plus matching `/api/build`
    and `/healthz` before and after playback. Require tone A's upload receipt to
    match the pinned digest and a fresh canonical track visible after Library
@@ -89,9 +91,9 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    After the cutoff checks, revoke the stepped-up owner session. Clear
    `PRIVATE_MUSIC_STAGING_JOURNEY`, `PRIVATE_PLAYBACK_STAGING_READ_OBSERVATION`,
    the single-use fixture and cohort settings, then follow the
-   [disable deploy](../ops.md#private-stream-staging). Cancel queued or running
-   armed deploys and use a fresh protected `main` push so the gate reads the
-   cleared settings. Require a deployed API and a Stream receipt showing
+   isolated lane's disable deploy procedure. Cancel queued or running armed
+   deploys and use a fresh protected build so the gate reads the cleared
+   settings. Require a deployed API and a Stream receipt showing
    `private_playback_enabled=false` before removing the Stream deployment arm
    and trial runtime bindings.
    Keep the selected pins and authorized cleanup access until cleanup finishes.

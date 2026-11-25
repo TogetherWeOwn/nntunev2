@@ -279,6 +279,11 @@ try:
     isolated("grant", success=False)  # Correct ownership or grant option is only half the contract.
     ungranted()
     sql(f"ALTER FUNCTION {signature} VOLATILE;")
+    locator_guard = "public.storage_object_intent_append_only()"
+    sql(f"ALTER FUNCTION {locator_guard} OWNER TO {owner}; REVOKE EXECUTE ON FUNCTION {locator_guard} FROM PUBLIC;")
+    isolated("grant", success=False)
+    ungranted()
+    sql(f"GRANT EXECUTE ON FUNCTION {locator_guard} TO {executor};")
     sql(f"UPDATE public.schema_migrations SET sha256 = repeat('0',64) WHERE file = '{BASELINE}';")
     isolated("grant", success=False)
     ungranted()

@@ -47,6 +47,8 @@ def authority(root, app_grants):
     sql = require(f"""SELECT count(*) = {len(LOCK_TABLES)} AND bool_and(relowner = to_regrole(current_user)::oid)
                        FROM pg_class WHERE oid IN ({tables})""")
     sql += require("has_schema_privilege('public', 'CREATE')")
+    sql += require("to_regclass('public.storage_s3_locator_intents') IS NOT NULL OR "
+                   "has_function_privilege('public.storage_object_intent_append_only()', 'EXECUTE')")
     checks = []
     for _, _, kind, obj, privilege, columns in app_grants:
         if columns:
