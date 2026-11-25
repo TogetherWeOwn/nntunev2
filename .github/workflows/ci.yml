@@ -1506,6 +1506,8 @@ jobs:
         run: node --test ci/test-production-maintenance.mjs
       - name: Unit-test candidate staging admission (offline synthetic evidence only)
         run: python3 ci/test_staging_admission.py
+      - name: Unit-test the private launch observation record (offline)
+        run: python3 ci/test_production_observation.py
       - name: Unit-test staging Worker target and submission comparison (offline)
         run: python3 ci/test_staging_worker_submission.py
       - name: Unit-test the receipt archive bounds

@@ -118,6 +118,42 @@ time, recovery outcome and final allocation. A successful watch ends with all
 readbacks healthy after at least 30 minutes. Record the outcome in the release
 thread and product log. [Observability runbook](runbook-observability.md)
 
+### Check the observation record offline
+
+Run `python3 ci/production_observation.py pins.json watch.json` on two private
+outcome records. Collect the pins separately from the watch, using the accepted
+release record and the protected rollout evidence. The verifier reads local
+files and returns success only for a complete, healthy watch. The operator
+still confirms that each evidence link resolves and supports the recorded outcome.
+
+Both JSON objects use `schema: 1`. Use UTC timestamps with seconds and a `Z` or
+`+00:00` suffix. Private evidence links are same-record anchors of the form
+`#evidence-<lowercase-slug>`, pointing to sections of the private release record
+with the backing evidence. Keep raw logs, credentials, member identifiers and
+provider connection details out of these inputs.
+
+| `pins.json` field | Contents |
+| --- | --- |
+| `candidate` | Full `sha` and expected `api_sha`, decimal strings `run_id` and `run_attempt`, and UUIDs `promoted_version_id` and `deployment_id` |
+| `final_smoke` | Candidate fields except `api_sha`, `allocation_percent` of `100`, `outcome` of `success`, `completed_at`, and `evidence` linking to the same run's Actions job |
+| `error_policy` | `recorded_at` before smoke completion and `evidence` for the pre-recorded Web/API/Stream baseline and thresholds |
+
+| `watch.json` field | Contents |
+| --- | --- |
+| `run_id`, `run_attempt`, `error_policy_evidence` | The pinned run and attempt strings and the pinned error policy link |
+| `watcher`, `backup` | Each has a distinct operator `name` (use the canonical handle), `from`, `through`, `recovery_access` of `confirmed` and an `evidence` link for the assignment and access covering the whole watch |
+| `closed_at`, `result` | Time of the closing readback and the recorded `satisfied` disposition |
+| `samples` | Ordered with the first `observed_at` at successful smoke, at most five minutes between consecutive readbacks, and the last exactly at `closed_at` after at least 30 minutes |
+
+Each sample has `observed_at`, `web_sha`, `api_sha`, `promoted_version_id`,
+`deployment_id`, `allocation_percent`, `evidence` and a `readbacks` object.
+Record `health`, `readiness`, `authorized_playback` and `expected_denials` as
+`passed` only when confirmed. Record `web_errors`, `api_errors` and
+`stream_errors` as `within-threshold` only when usable readbacks confirm it
+against the pinned baseline and thresholds. A missing or unsuccessful check
+refuses the record. The [synthetic fixtures](../ci/test_production_observation.py)
+show the field values and successful and refused records.
+
 ## Pinned candidate template
 
 Copy this into the private release record. Fill the evidence before dispatch
