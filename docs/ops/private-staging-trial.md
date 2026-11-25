@@ -88,6 +88,24 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    publication and versioned storage pins for cleanup. Keep tone B's pins
    separately for its recorded disposition.
 
+### Rehearse the verifier handoff offline
+
+From the repository root with the pinned `e2e` dependencies installed, run:
+
+```sh
+python3 -B -I e2e/fixtures/private-music/test_admission_wiring.py "$(command -v node)"
+```
+
+The disposable runner checks the original tone A FLAC against its manifest,
+then passes the synthetic publication, Library row and play receipt through
+the staging journey's observation helper. It checks that
+`private-publication`, `private-library` and `private-play` carry the same
+track ID, digest, build, run and attempt in `admission.xml`. The existing
+receipt step must carry those fields into `private_track` in
+`staging-admission.json`. A play receipt for the companion track must fail
+with no report. Use the result as an offline handoff check. Live qualification
+and admission still require the protected run's evidence.
+
 ## Retire and recover
 
 1. **Contain and retire the selected fixture (77c).** Stop new trial activity.
