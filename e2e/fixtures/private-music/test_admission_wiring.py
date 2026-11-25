@@ -299,6 +299,15 @@ def run_fixture(root):
             write(root, f"{phase}.json", json.dumps(evidence.main("observe")).encode())
         assert reader.call_count == 6
         matching_closing = closing.read_bytes()
+
+        # An earlier attempt can observe the same build and serving deployment IDs.
+        earlier_attempt = {"GITHUB_RUN_ATTEMPT": "1"}
+        for lane in evidence.LANES:
+            key = f"{lane.upper()}_PIN"
+            earlier_attempt[key] = json.dumps(json.loads(env[key]) | {"run_attempt": "1"})
+        with patch.dict(os.environ, earlier_attempt):
+            earlier_closing = evidence.main("observe")
+
         reader.return_value = provider_response(VERSION)
         require_refusal(lambda: evidence.main("observe"), "drifted provider deployment accepted")
 
@@ -322,6 +331,11 @@ def run_fixture(root):
     assert result.returncode != 0 and not receipt.exists(), "incomplete readback qualified the candidate"
     assert result.stderr == b"Private staging deployment evidence unavailable or mismatched.\n"
     assert report.read_bytes() == original_report, "incomplete readback changed the report"
+
+    closing.write_text(json.dumps(earlier_closing))
+    result = run(command)
+    assert result.returncode != 0, "receipt step accepted a closing observation from an earlier attempt"
+    assert not receipt.exists(), "receipt step wrote a receipt using evidence from different attempts"
 
     closing.write_text(json.dumps(drifted_closing))
     result = run(command)
