@@ -121,6 +121,15 @@ pub(super) async fn exercise(
     let detail = body(route(ctx, &owner, db, Read(playlist)).await, 200);
     assert_eq!(detail["entries"], json!([]));
 
+    let sibling: String = db
+        .query_one_scalar(
+            "INSERT INTO public.tracks (release_id, title, medium_no, track_no)
+             VALUES (gen_random_uuid(), 'Synthetic playlist sibling', 1, 1) RETURNING id::text",
+            &[],
+        )
+        .await
+        .unwrap();
+    seed_membership(db, &active, &sibling).await;
     seed_membership(db, &active, track).await;
     let appended = body(route(ctx, &owner, db, attempt()).await, 201);
     let detail = body(route(ctx, &owner, db, Read(playlist)).await, 200);
@@ -258,6 +267,11 @@ pub(super) async fn exercise(
 
     assert_eq!(remove_membership(db, RECIPIENT, &active, track).await, 0);
     assert_denied(route(ctx, &owner, db, Append(first_id, track.to_owned())).await);
+    assert_denied(route(ctx, &owner, db, Append(pending_id, track.to_owned())).await);
+    assert_eq!(
+        body(route(ctx, &owner, db, Read(pending_id)).await, 200)["entries"],
+        json!([])
+    );
     let dormant = body(route(ctx, &owner, db, Read(first_id)).await, 200);
     assert_eq!(
         dormant["entries"],
@@ -273,6 +287,15 @@ pub(super) async fn exercise(
         .await
         .unwrap();
     assert_eq!(surviving_memberships, ["Deleting", "Foreign"]);
+    let sibling_survived: bool = db
+        .query_one_scalar(
+            "SELECT EXISTS (SELECT FROM public.library_tracks
+             WHERE library_id = $1::text::uuid AND track_id = $2::text::uuid)",
+            &[&active, &sibling],
+        )
+        .await
+        .unwrap();
+    assert!(sibling_survived);
 
     let deleted = body(route(ctx, &owner, db, Delete(playlist)).await, 202);
     assert!(deleted["operation_id"].is_string());
