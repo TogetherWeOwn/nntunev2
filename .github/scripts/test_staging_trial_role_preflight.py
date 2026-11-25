@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -30,6 +31,7 @@ class TrialRolePreflightTests(unittest.TestCase):
                 GRANT CONNECT ON DATABASE {preflight.DATABASE} TO {READER}, {WRITER};
                 CREATE TABLE public.schema_migrations (file text, sha256 text);
                 INSERT INTO public.schema_migrations VALUES ('{preflight.BASELINE}', '{DIGEST}');
+                GRANT SELECT ON public.schema_migrations TO {ISSUER};
                 CREATE TABLE public.preflight_data (hint text);
                 CREATE SEQUENCE public.preflight_seq;
             """)
@@ -55,6 +57,21 @@ class TrialRolePreflightTests(unittest.TestCase):
                     with self.assertRaises(StagingApplyError):
                         preflight.observe(connection, pin, digest)
             self.assertFalse(preflight.observe(db, {**scope, "reader": [READER, 1]}, DIGEST)["issued identities"])
+
+            run = subprocess.run
+            for switch, expected in ((f"SET SESSION AUTHORIZATION {ISSUER};", f"{ISSUER}|{ISSUER}"),
+                                     (f"SET ROLE {ISSUER};", f"postgres|{ISSUER}")):
+                with self.subTest(switch=switch):
+                    self.assertEqual(run_psql(db, switch +
+                                             "SELECT session_user, current_user FROM public.schema_migrations;"),
+                                     expected)
+
+                    def switched_psql(*args, input, **kwargs):
+                        return run(*args, input=switch + "\n" + input, **kwargs)
+
+                    with patch.object(preflight.subprocess, "run", side_effect=switched_psql):
+                        with self.assertRaises(StagingApplyError):
+                            preflight.observe(db, scope, DIGEST)
 
             for grant, revoke, verdict in (
                 (f"ALTER ROLE {READER} BYPASSRLS", f"ALTER ROLE {READER} NOBYPASSRLS", "login attributes"),
