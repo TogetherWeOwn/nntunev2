@@ -335,6 +335,7 @@ pub(crate) async fn verify_publication(
     let mut publish = async |publication: &mut Client,
                              upload_writer: &mut Client,
                              replay_bucket: Option<&str>| {
+        // Keep the PostgreSQL replay/publication futures off the test stack.
         Box::pin(upload(&ctx, &request, target, async |permit, _| {
             if let Some(bucket) = replay_bucket {
                 return permit
