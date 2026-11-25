@@ -2,7 +2,8 @@
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { private_trial_dispatch_test: dispatch } = require(process.env.STAGING_BODY_WASM_JS);
+const loadWorker = require('../../../ingest/tests/fixtures/worker_fixture_wasm.cjs');
+const { private_trial_dispatch_test: dispatch } = loadWorker(process.env.PRIVATE_TRIAL_DISPATCH_WASM_JS);
 
 const origin = 'https://staging.nntune.com';
 const byteLimit = 177175;
@@ -34,7 +35,7 @@ test('private trial requires every staging arm before reading its bounded body',
   }
 
   const exact = request(byteLimit);
-  assert.equal((await dispatch(exact, env)).status, 404, 'anonymous request');
+  assert.equal((await dispatch(exact, env)).status, 404, 'missing cohort');
   assert.equal(exact.bodyUsed, true);
 
   const over = request(byteLimit + 1);
