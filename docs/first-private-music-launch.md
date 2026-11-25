@@ -96,6 +96,23 @@ until their evidence is available.
    Dispatch only through the supported protected workflow with the existing
    environment and credential custodians. [Production release gates](../CONTRIBUTING.md#production-releases)
 
+### Offline handoff example after a rerun
+
+In this synthetic handoff, `deploy.yml` reruns the same `<sha>` under the same
+`<run-id>`. The run-level artifact listing can contain receipts from both attempts.
+
+| Artifact name | Handoff disposition |
+| --- | --- |
+| `staging-admission-<sha>-<run-id>-1-private-music` | Historical evidence from attempt 1, which the rerun superseded. |
+| `staging-admission-<sha>-<run-id>-2-private-music` | Use for verification when the run and required jobs identify attempt 2 and exactly one artifact has this name. |
+
+If the handoff only identifies the run ID, the attempt records disagree, or
+the selected attempt has no unique matching artifact, record **Staging
+admission** as Pending and **Dispatch readiness** as Blocked. Resolve the
+attempt and artifact from the same protected run before resuming step 3.
+The name selects the artifact for verification. The verifier still checks
+the archive digest and the receipt's own SHA, run ID and attempt.
+
 ## Switch off and verify
 
 Before promotion, name the executor and backup and pin the protected control

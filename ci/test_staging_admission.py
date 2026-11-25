@@ -465,6 +465,36 @@ class PrivateAdmissionTests(Base):
         stream["conclusion"] = "success"
         self.assertWorldRefused(world, "intervening staging deployment")
 
+    def test_same_run_private_rerun_selects_only_the_current_attempt_artifact(self):
+        world = PrivateWorld()
+        prior_artifact = world.artifact
+        routes = world.routes()
+        world.run["run_attempt"] = 2
+        rerun_jobs = [dict(job, run_attempt=2) for job in world.jobs]
+        pins = {lane: dict(pin, run_attempt="2") for lane, pin in private_pins().items()}
+        report = ET.tostring(private_report(pins, run_attempt="2"))
+        world.receipt = sa.produce(make_env(GITHUB_RUN_ATTEMPT="2"), report, world.policy,
+                                   world.contract_bytes, world.manifest, private_pins=pins,
+                                   private_track_sha256=PRIVATE_AUDIO_SHA)
+        world.set_archive()
+        current_artifact = dict(world.artifact, id=ARTIFACT_ID + 1,
+                                name=f"staging-admission-{SHA}-{RUN_ID}-2-private-music")
+        routes[f"runs/{RUN_ID}/attempts/2/jobs?per_page=100&page=1"] = page("jobs", rerun_jobs)
+        routes[f"artifacts/{ARTIFACT_ID + 1}/zip"] = world.archive
+        artifact_listing = f"runs/{RUN_ID}/artifacts?per_page=100&page=1"
+
+        routes[artifact_listing] = page("artifacts", [prior_artifact, current_artifact])
+        actions = FakeActions(routes)
+        verified = world.verify_with_actions(actions)
+        self.assertEqual(verified["result"], "satisfied")
+        self.assertEqual(verified["run_attempt"], "2")
+        self.assertNotIn(f"artifacts/{ARTIFACT_ID}/zip", actions.calls)
+
+        routes[artifact_listing] = page("artifacts", [prior_artifact])
+        actions = FakeActions(routes)
+        self.refused("missing or ambiguous attempt-bound receipt", world.verify_with_actions, actions)
+        self.assertFalse(any(call.endswith("/zip") for call in actions.calls))
+
 
 class PolicyTests(Base):
     def assert_installed_policy(self, root):
