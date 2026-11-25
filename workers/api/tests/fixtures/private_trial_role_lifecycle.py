@@ -42,6 +42,45 @@ def sql(text, *, database=DATABASE):
     return result.stdout.strip()
 
 
+def exercise_catalog_preflight(config, digest):
+    def check(*, target=config, failure=None):
+        env = {"PATH": base["PATH"], CONFIG_ENV: json.dumps(target)}
+        for key in ("owner", "executor"):
+            env[f"PRIVATE_TRIAL_{key.upper()}_URL"] = (
+                f"postgresql://{config[key]}:{password}@127.0.0.1:{port}/{DATABASE}"
+            )
+        result = subprocess.run(
+            [sys.executable, "-B", "-E", "-s", str(ROOT / ".github/scripts/staging_trial_role_lifecycle.py"), "check-catalog",
+             "--isolated", "--fixture-only-oid", str(target["database_oid"])],
+            env=env, text=True, capture_output=True, timeout=30,
+        )
+        output = result.stdout + result.stderr
+        assert all(value not in output for value in (password, config["owner"], config["executor"], digest))
+        if failure is None:
+            assert result.returncode == 0 and "isolated catalog preflight passed" in output, output
+        else:
+            assert result.returncode == 1 and failure in result.stderr, output
+            assert "isolated catalog preflight passed" not in output, output
+
+    before = sql(ambient_acl.CATALOG)
+    check()
+    check(target=config | {"database_oid": 16500}, failure="Trial role lifecycle refused")
+    check(target=config | {"database_oid": config["database_oid"] + 1}, failure="isolated owner identity")
+    check(target=config | {"executor_oid": config["executor_oid"] + 1}, failure="isolated executor identity")
+    sql(f"UPDATE public.schema_migrations SET sha256 = repeat('0',64) WHERE file = '{BASELINE}';")
+    check(failure="isolated executor identity or migration baseline")
+    sql(f"UPDATE public.schema_migrations SET sha256 = '{digest}' WHERE file = '{BASELINE}';")
+    # Use a bundled stand-in for an unexpected provider extension in its own schema.
+    sql("CREATE SCHEMA pscale_extensions; CREATE EXTENSION btree_gin WITH SCHEMA pscale_extensions;")
+    check(failure="docs/ops/private-staging-trial.md#isolated-database-catalog-preflight")
+    assert sql("SELECT extname FROM pg_extension ORDER BY extname;") == "btree_gin\nplpgsql"
+    assert sql(ambient_acl.CATALOG) == before
+    assert sql(f"SELECT count(*) FROM pg_roles WHERE rolname IN ('{reader}','{writer}');") == "0"
+    sql("DROP EXTENSION btree_gin; DROP SCHEMA pscale_extensions;")
+    check()
+    print("isolated catalog preflight rehearsal passed")
+
+
 cluster_query = "SELECT system_identifier FROM pg_catalog.pg_control_system();"
 container = os.environ.get("TRIAL_FIXTURE_CONTAINER", "")
 if args.local_data_dir is not None:
@@ -77,9 +116,6 @@ try:
     REVOKE CONNECT, TEMP ON DATABASE nntune_ci, postgres, template1, {DATABASE} FROM PUBLIC;
     GRANT CONNECT, CREATE ON DATABASE {DATABASE} TO {executor};
     ALTER SCHEMA public OWNER TO {executor};
-    SET ROLE {owner};
-    CREATE ROLE {reader} LOGIN NOINHERIT PASSWORD '{password}';
-    CREATE ROLE {writer} LOGIN NOINHERIT PASSWORD '{password}';
     """)
     entries = [e for e in load_entries(ROOT) if e["target"] == "app"]
     migrations = [(ROOT / "migrations" / e["file"]).read_text() for e in entries]
@@ -93,6 +129,16 @@ try:
         return int(sql(f"SELECT oid FROM pg_roles WHERE rolname = '{role}';"))
 
     database_oid = int(sql("SELECT oid FROM pg_database WHERE datname = current_database();"))
+    config = dict(database_oid=database_oid, executor_oid=role_oid(executor), direct="127.0.0.1",
+                  direct_port=port, routed="127.0.0.1", routed_port=port,
+                  owner=owner, executor=executor, reader=reader, writer=writer)
+    applied = next(e["sha256"] for e in entries if e["file"] == BASELINE)
+    exercise_catalog_preflight(config, applied)
+    sql(f"""
+    SET ROLE {owner};
+    CREATE ROLE {reader} LOGIN NOINHERIT PASSWORD '{password}';
+    CREATE ROLE {writer} LOGIN NOINHERIT PASSWORD '{password}';
+    """)
     scope = {"database_oid": database_oid, "issuer_oid": role_oid(owner),
              "reader": [reader, role_oid(reader)], "writer": [writer, role_oid(writer)]}
 
@@ -116,7 +162,6 @@ try:
     cmd("grant", success=False)
     sql(f"COMMENT ON DATABASE {DATABASE} IS '{FIXTURE}';")
     assert sql(f"SELECT has_database_privilege('{writer}',current_database(),'CONNECT');") == "f"
-    applied = next(e["sha256"] for e in entries if e["file"] == BASELINE)
     sql(f"UPDATE public.schema_migrations SET sha256 = repeat('0', 64) WHERE file = '{BASELINE}';")
     report = cmd("grant", success=False)
     assert "staging CONNECT passed" not in report
@@ -238,9 +283,6 @@ try:
     CREATE ROLE {writer} LOGIN NOINHERIT PASSWORD '{password}';
     """)
     scope.update(reader=[reader, role_oid(reader)], writer=[writer, role_oid(writer)])
-    config = dict(database_oid=database_oid, executor_oid=role_oid(executor), direct="127.0.0.1",
-                  direct_port=port, routed="127.0.0.1", routed_port=port,
-                  owner=owner, executor=executor, reader=reader, writer=writer)
     hosted_config = config | {"direct": "direct.fixture.psdb.cloud", "routed": "routed.fixture.psdb.cloud",
                               "owner": "postgres.fixture"}
     assert target_config(json.dumps(hosted_config), scope, fixture=False) == hosted_config

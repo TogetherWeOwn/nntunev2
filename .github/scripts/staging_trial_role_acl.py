@@ -99,11 +99,14 @@ def require(test):
     return f"DO $check$ BEGIN IF ({test}) IS NOT TRUE THEN RAISE EXCEPTION 'contract refused'; END IF; END $check$;\n"
 
 
-def isolated_extensions():
-    # The only approved installed extension is the catalog's PL/pgSQL.
-    return require("""SELECT count(*) = 1 AND bool_and(e.extname = 'plpgsql'
+# The only approved installed extension is the catalog's PL/pgSQL.
+ISOLATED_EXTENSION_CATALOG = """SELECT count(*) = 1 AND bool_and(e.extname = 'plpgsql'
              AND e.extversion = '1.0' AND n.nspname = 'pg_catalog')
-             FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace""")
+             FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace"""
+
+
+def isolated_extensions():
+    return require(ISOLATED_EXTENSION_CATALOG)
 
 
 def other_database_connections(role):

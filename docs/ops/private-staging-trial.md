@@ -9,11 +9,11 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
 
 ## Setup and trial
 
-1. **Prepare the isolated database.** The setup operator reads back the separate branch's
-   `nntunev2_staging` database OID, canonical `postgres` owner, migration 0063
-   checksum, and both direct and routed addresses. Arrange authorized owner
-   and executor connections for that branch and issue the two dedicated SQL
-   logins through its authorized issuer. Use the [role names and membership
+1. **Prepare the isolated database.** Run the [catalog preflight](#isolated-database-catalog-preflight)
+   before preparing ACLs or issuing either login. If the isolated branch has
+   ambient database grants, qualify the [database ACL preparation](#isolated-database-acl-preparation)
+   before issuance. Issue the two dedicated SQL logins through the branch's
+   authorized issuer. Use the [role names and membership
    rules](../ops.md#private-trial-schema) from the existing lifecycle. The owner
    needs authority to grant CONNECT, fence, drain and retire the pair. Before
    dispatch, confirm the executor owns the five lock tables and can install
@@ -24,12 +24,7 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    `storage_object_intent_append_only()` to install the locator trigger. Confirm
    both routed logins independently lack CONNECT to every other connectable
    database, including templates. Retain the original protected scope for
-   withdrawal. The isolated lifecycle admits only the reviewed catalog
-   extension set. The current isolated staging catalog has provider-managed
-   HypoPG, so setup on that catalog is blocked. Keep setup off until an
-   isolated catalog passes the reviewed extension check.
-   If the isolated branch has ambient database grants, qualify the
-   [database ACL preparation](#isolated-database-acl-preparation) before issuance.
+   withdrawal.
 2. **Check protected inputs.** Store the existing role-scope JSON in
    staging as `ISOLATED_TRIAL_ROLE_SCOPE`. Set `ISOLATED_TRIAL_TARGET` to a
    reviewed JSON object with `database_oid` and `executor_oid` (numbers),
@@ -122,6 +117,48 @@ keys, passwords, cookies, invite codes and cohort values in secure custody.
    from custody and withdraw any temporary executor grants through their original
    grantor. If withdrawal refuses, reconcile with the grant owner while both
    logins stay fenced.
+
+### Isolated database catalog preflight
+
+The observed isolated app catalog contains provider-managed HypoPG 1.4.3 in
+`pscale_extensions`. The approved set is exactly PL/pgSQL 1.0 in `pg_catalog`.
+The absence of `pg_trgm` is expected here. Migration `0001_mb_mirror.sql`
+installs it on the separate MusicBrainz mirror.
+
+Keep setup and the trial arms off while no eligible target is documented.
+The next step is to establish from provider documentation or a supported
+provider readback whether the isolated staging branch can expose an app
+catalog with the approved extension set and supported management access.
+Record the blocker if this route is unavailable. Keep the provider-managed
+extension and ACLs intact.
+
+For a candidate, independently confirm the ready, nonproduction branch ID
+and its direct and routed endpoint pins against provider metadata in private
+custody. Confirm the database is distinct from shared staging. From the
+reviewed checkout, load `ISOLATED_TRIAL_TARGET` using the shape in step 2,
+with planned reader and writer logins, and load just the candidate's owner and
+executor URLs as `PRIVATE_TRIAL_OWNER_URL` and `PRIVATE_TRIAL_EXECUTOR_URL` from
+secure custody. Run the opt-in readback from a private operator session:
+
+```sh
+python3 -E -s .github/scripts/staging_trial_role_lifecycle.py check-catalog --isolated
+```
+
+The command uses verified TLS and checks the direct owner and executor
+sessions against the pinned database OID and identities. It checks the 0063
+ledger checksum and exact extension set through the executor. It requires no
+reader or writer credentials, role scope, or ambient plan. On an extension
+refusal, stop and return to candidate selection above. On an identity or
+baseline refusal, reconcile the reviewed pins and migration readback before
+retrying. Retain only fixed verdicts and a private reference to the pins.
+
+After a pass, qualify the same target's provider management and consumer
+continuity under [ACL preparation](#isolated-database-acl-preparation). The
+protected ambient workflow pins both the provider branch and database OID.
+If the candidate differs from those pins, obtain a separately reviewed
+protected target update before dispatch. Keep the trial off until the
+protected checks, separate routed reader and writer readbacks, and serving
+and cleanup checks in steps 2–4 pass on that same target.
 
 ### Isolated database ACL preparation
 
