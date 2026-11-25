@@ -464,16 +464,19 @@ pub(super) async fn exercise(
                 if result.status == ReviewStatus::Published {
                     assert_eq!(tx.query(ROWS, &[&release]).await.unwrap().len(), 1);
                     assert_eq!(rows().await, 0, "staged track must be invisible to readers");
+                    let (stored_view, retried_revision) = stored_review().await;
                     assert_eq!(
-                        stored_review().await,
-                        (expected.view.clone(), expected.retried_revision.map(i64::from)),
+                        (&stored_view, retried_revision),
+                        (&expected.view, expected.retried_revision.map(i64::from)),
                         "staged receipt must be invisible to readers"
                     );
                 }
                 if fail_record {
                     // Force a database error after staging the track and receipt.
-                    let error = tx.execute("UPDATE public.test_flac_review SET view = NULL", &[])
-                        .await.expect_err("the receipt must reject a null view");
+                    let error = tx
+                        .execute("UPDATE public.test_flac_review SET view = NULL", &[])
+                        .await
+                        .expect_err("the receipt must reject a null view");
                     assert_eq!(error.code(), Some(&SqlState::NOT_NULL_VIOLATION));
                     return Err(BoundaryError::Unavailable);
                 }
