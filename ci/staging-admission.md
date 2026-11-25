@@ -227,6 +227,10 @@ below. These are the assertions the bounded reporter must use for each case.
 | `revoked-or-expired-refused` | At the configured cutoff, the same invitee session gets 403 from Library and play, its media range is refused, and the Library shows the denial with neither curated row visible. |
 | `video-off` | Now Playing exposes no Music Video tab, iframe or video element. |
 
+The early refusal step collects the anonymous and unlisted statuses.
+`assertPrivateRefusals` checks them at cutoff. The reporter can mark those
+cases passed only after their status assertions pass at cutoff.
+
 The protected suite currently uses the dot reporter. Playwright's built-in
 JUnit reporter records the enclosing test as one testcase and has no per-step
 case or explicit first-attempt marker. The private admission format requires the
