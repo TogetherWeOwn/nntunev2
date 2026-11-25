@@ -165,6 +165,16 @@ test('operator switch-off resumes read-only after incomplete deployment history'
 });
 
 test('operator recovers the existing rollback run after the dispatch response is lost', () => {
+  const source = readFileSync(new URL(`../${workflow}`, import.meta.url), 'utf8');
+  const job = source.split('\n  preflight:\n')[1]?.split(/\n {2}\S/)[0];
+  assert.match(job, /^    name: production-preflight$/m);
+  const target = job.match(/^      - name: Resolve and validate the promotion target\n        id: target\n        env:\n((?: {10}\S[^\n]*\n)+)        run: \|$/m);
+  assert.ok(target, 'target resolution step must expose the dispatch inputs in its environment');
+  const envLines = target[1].split('\n');
+  for (const [key, input] of Object.entries({ DEPLOY_MODE: 'mode', INPUT_SHA: 'sha', RECOVERY_RUN_ID: 'recovery_run_id' })) {
+    assert.ok(envLines.includes(`          ${key}: \${{ inputs.${input} }}`), `${key} must expose the submitted ${input}`);
+  }
+
   const repository = { id: 114, full_name: 'example/fixture' };
   const workflowId = 77;
   const run = {

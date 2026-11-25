@@ -15,13 +15,13 @@ start **Pending readback** and keep the switch-off fences in place. Do not
 dispatch again or rerun a workflow while resolving the start. An empty list
 can mean the first request is still becoming visible.
 
-Read the authenticated Actions run records for the recovery request's time
-window in the same repository. For an exact match, bind the run to the workflow
-ID and path for `deploy-production.yml`, `workflow_dispatch`, `main` and
-attempt `1`. Verify the submitted mode, candidate SHA and original rollout
-run ID for that same attempt. In this example those values come from `DEPLOY_MODE`, `INPUT_SHA`
-and `RECOVERY_RUN_ID` on the **Resolve and validate the promotion target** step
-in the attempt's `production-preflight` job log. The Actions `head_sha`
+Use authenticated Actions records to list `deploy-production.yml` workflow
+dispatches on `main` in the same repository for the recorded request window.
+Verify the workflow ID and path and that the run is on attempt `1`. Verify
+the submitted mode, candidate SHA and original rollout run ID for that same
+attempt. In this example those values come from `DEPLOY_MODE`, `INPUT_SHA`
+and `RECOVERY_RUN_ID` on the **Resolve and validate the promotion target**
+step in the attempt's `production-preflight` job log. The Actions `head_sha`
 identifies the workflow checkout. Verify the reviewed candidate against the
 submitted `sha` input.
 
