@@ -843,15 +843,36 @@ async fn check_legacy_mixed_plan_history(observer: &Client, mut seed: ReconcileO
         0,
         invoice(
             RENEWAL,
-            800,
+            400,
             vec![line("renewal_plus", PLUS, BOUNDARY, RENEWAL_END)],
             BOUNDARY,
         ),
     );
+    let mut conflicting = renewal.clone();
+    conflicting
+        .invoices
+        .iter_mut()
+        .find(|invoice| invoice.id == FRESH)
+        .expect("renewal includes the previous paid invoice")
+        .amount_paid += 1;
+    assert!(
+        dispatch_caller_at(OTHER_USER, TARGET, &conflicting, BOUNDARY)
+            .await
+            .is_err()
+    );
+    assert_eq!(snapshot(observer).await, committed);
+
     let renewed = dispatch_caller_at(OTHER_USER, TARGET, &renewal, BOUNDARY)
         .await
         .expect("paid renewal commits with retained invoice evidence");
     assert_eq!(renewed.read_anchor.as_deref(), Some(FRESH));
+    assert_eq!(renewed.history.len(), 3);
+    for invoice_id in [RENEWAL, FRESH, LEGACY] {
+        assert!(renewed
+            .history
+            .iter()
+            .any(|row| row.stripe_invoice_id == invoice_id));
+    }
     let (subscriptions, history) = snapshot(observer).await;
     let target = subscriptions
         .as_array()
