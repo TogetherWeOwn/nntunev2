@@ -1,0 +1,12 @@
+{
+  "license": "CC0-1.0",
+  "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "source": "Original synthetic PCM generated for browser tests. Mono 16-bit little-endian, 8000 Hz, with sample n equal to ((n * 7919 + 13) % 65536) - 32768.",
+  "tracks": [
+    {
+      "file": "seek-fixture.wav",
+      "bytes": 262144,
+      "sha256": "c950476bd1f6006e970593a4e8e54af0878482159baff6418c5a3efd90aad729"
+    }
+  ]
+}

@@ -1,18 +1,16 @@
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, type Locator, type Page } from '@playwright/test';
+import { AUDIO_PATH } from './fixtures/player-seek/paths.js';
+import { test } from './fixtures/player-seek/test.js';
 
 /**
- * Browser pins for Range seeking on the deterministic demo audio route.
- *
- * The demo track is a ~16 s synthetic WAV served by `/api/demo/audio`
- * (`apps/web/src/lib/player/demoMedia.ts` generator,
- * `apps/web/src/routes/api/demo/audio/+server.ts` range parser). These specs
- * prove, in a real Chromium, that a mid-track Range seek moves the audible
+ * The isolated player serves a checked-in ~16 s synthetic WAV. These specs
+ * prove in Chromium that a mid-track Range seek moves the audible
  * position, that an unsatisfiable range fails honestly (an error state, never
  * a stuck spinner), and that pause -> seek -> resume holds the seek target
  * while paused and continues from it on resume.
  *
  * No stubs: real media decodes and advances, except for the injected-416 UI
- * case, which answers the audio route with the same 416 shape the server
+ * case, which answers the audio request with the same 416 shape the fixture
  * returns for an unsatisfiable range.
  */
 
@@ -21,7 +19,7 @@ const WAV_HEADER_BYTES = 44;
 /** 8 kHz mono 16-bit PCM: 16 000 bytes carry one second of audio. */
 const BYTES_PER_SECOND = 16_000;
 
-/** Sample formula pinned by the demo generator: ((n * 7919 + 13) % 65536) - 32768. */
+/** Sample formula in the checked-in WAV: ((n * 7919 + 13) % 65536) - 32768. */
 function expectedSampleValue(sample: number): number {
 	return ((sample * 7919 + 13) % 65_536) - 32_768;
 }
@@ -39,8 +37,8 @@ interface RangeProbe {
  * body would satisfy the probe locally and a Range-ignoring server would pass.
  */
 async function probeRange(page: Page, range: string): Promise<RangeProbe> {
-	return page.evaluate(async (rangeHeader) => {
-		const response = await fetch('/api/demo/audio', {
+	return page.evaluate(async ({ path, rangeHeader }) => {
+		const response = await fetch(path, {
 			headers: { range: rangeHeader },
 			cache: 'no-store'
 		});
@@ -51,7 +49,7 @@ async function probeRange(page: Page, range: string): Promise<RangeProbe> {
 			length: buffer.byteLength,
 			firstInt16: buffer.byteLength >= 2 ? new DataView(buffer).getInt16(0, true) : null
 		};
-	}, range);
+	}, { path: AUDIO_PATH, rangeHeader: range });
 }
 
 async function audioSnapshot(audio: Locator) {
@@ -69,19 +67,12 @@ async function audioSnapshot(audio: Locator) {
 }
 
 /**
- * Open the demo player, start the default track, and wait until the element
- * is genuinely playing (unpaused with an advanced clock), mirroring the
- * "demo audio plays and advances" contract.
+ * Start the default track and wait for an unpaused element with an advanced clock.
  */
 async function startPlayback(page: Page): Promise<Locator> {
-	await page.goto('/demo/player');
-	await page.waitForFunction(
-		() => typeof (window as unknown as { __seekStorm?: unknown }).__seekStorm === 'function'
-	);
-
-	const audio = page.getByTestId('demo-audio');
+	const audio = page.getByTestId('audio-player');
 	await expect(audio).toBeVisible();
-	await page.getByTestId('queue-select-demo-track').click();
+	await page.getByTestId('queue-select-first').click();
 
 	let playbackState = '';
 	await expect
@@ -98,13 +89,14 @@ async function startPlayback(page: Page): Promise<Locator> {
 			{ timeout: 15_000 }
 		)
 		.toMatch(/^(playing|error:\d+)$/);
-	expect(playbackState, 'the selected demo track should decode and advance').toBe('playing');
+	expect(playbackState, 'the selected track should decode and advance').toBe('playing');
 	return audio;
 }
 
 test('Range seek mid-track advances the audible position to the seek target', async ({
-	page
+	page, openPlayer
 }) => {
+	await openPlayer();
 	const audio = await startPlayback(page);
 
 	const { duration } = await audioSnapshot(audio);
@@ -176,12 +168,13 @@ test('Range seek mid-track advances the audible position to the seek target', as
 });
 
 test('unsatisfiable Range refusal surfaces an honest error with no spinner hang', async ({
-	page
+	page, openPlayer
 }) => {
-	await page.goto('/demo/player');
-	await page.waitForFunction(
-		() => typeof (window as unknown as { __seekStorm?: unknown }).__seekStorm === 'function'
-	);
+	await openPlayer();
+	const audio = page.getByTestId('audio-player');
+	await expect.poll(() => audio.evaluate((element: HTMLAudioElement) =>
+		element.readyState >= HTMLMediaElement.HAVE_METADATA
+	)).toBe(true);
 
 	// The wire refusal itself: beyond-the-end and end-before-start ranges
 	// answer 416 with the complete length, never a hang and never a 200
@@ -198,9 +191,11 @@ test('unsatisfiable Range refusal surfaces an honest error with no spinner hang'
 	// that never resolves. Select a track whose bytes are not buffered yet so
 	// the refusal is actually exercised (the initial track already decoded).
 	let refusedRequests = 0;
-	await page.route('**/api/demo/audio**', (route) => {
+	const secondTrack = (url: URL) =>
+		url.pathname === AUDIO_PATH && url.searchParams.get('track') === 'second';
+	await page.route(secondTrack, (route) => {
 		refusedRequests += 1;
-		void route.fulfill({
+		return route.fulfill({
 			status: 416,
 			contentType: 'text/plain',
 			headers: { 'content-range': `bytes */${MEDIA_BYTES}`, 'content-length': '0' },
@@ -208,7 +203,11 @@ test('unsatisfiable Range refusal surfaces an honest error with no spinner hang'
 		});
 	});
 
-	await page.getByTestId('queue-select-second-signal').click();
+	const [refusal] = await Promise.all([
+		page.waitForResponse((response) => secondTrack(new URL(response.url()))),
+		page.getByTestId('queue-select-second').click()
+	]);
+	expect(refusal.status()).toBe(416);
 	await expect(page.getByTestId('now-playing')).toContainText('Second Signal');
 	const status = page.getByTestId('player-status');
 	await expect(status, 'a refused load must leave the loading state promptly').not.toContainText(
@@ -217,6 +216,7 @@ test('unsatisfiable Range refusal surfaces an honest error with no spinner hang'
 	);
 	await expect(status).toContainText('error');
 	expect(refusedRequests, 'the error state must come from refused audio loads').toBeGreaterThan(0);
+	await expect.poll(async () => (await audioSnapshot(audio)).errorCode).not.toBeNull();
 
 	const error = page.getByTestId('player-error');
 	await expect(error).toBeVisible();
@@ -226,8 +226,9 @@ test('unsatisfiable Range refusal surfaces an honest error with no spinner hang'
 });
 
 test('pause, seek while paused, and resume holds position then continues from the target', async ({
-	page
+	page, openPlayer
 }) => {
+	await openPlayer();
 	const audio = await startPlayback(page);
 
 	const started = await audioSnapshot(audio);
