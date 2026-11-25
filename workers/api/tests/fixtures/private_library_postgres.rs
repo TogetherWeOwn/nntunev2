@@ -9,6 +9,9 @@ use tokio_postgres::{Client, NoTls};
 mod publication_fixture {
     include!("private_library_publication.rs");
 }
+mod publication_locks {
+    include!("private_trial_publication_locks.rs");
+}
 
 mod playlist_membership {
     include!("private_library_playlist_membership.rs");
@@ -22,13 +25,17 @@ const JOB: &str = "catalogue-new";
 const MBID: &str = "ab310000-0000-4000-8000-000000000000";
 
 async fn connect() -> Client {
+    connect_fixture(DB).await
+}
+
+async fn connect_fixture(db: &str) -> Client {
     assert!(
         std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
             && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted")
-            && std::env::var("NNTUNE_TEST_DATABASE_URL").as_deref() == Ok(DB),
+            && std::env::var("NNTUNE_TEST_DATABASE_URL").as_deref() == Ok(db),
         "disposable hosted Library fixture required"
     );
-    let (client, connection) = tokio_postgres::connect(DB, NoTls).await.unwrap();
+    let (client, connection) = tokio_postgres::connect(db, NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
     client
         .batch_execute("SET statement_timeout = '5s'; SET lock_timeout = '3s'")

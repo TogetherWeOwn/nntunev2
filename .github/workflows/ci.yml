@@ -916,6 +916,17 @@ jobs:
           args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests,encrypted-upload-caller --lib "$test_name")
           cargo test "${args[@]}" -- --exact | tee "$RUNNER_TEMP/private-library-test.log"
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/private-library-test.log"
+      - name: Rehearse scoped publication locks on disposable PostgreSQL
+        env:
+          NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntunev2_staging
+        run: |
+          set -euo pipefail
+          psql postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_ci -X -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE nntunev2_staging TEMPLATE nntune_catalogue_ci'
+          test_name='handlers::tests::private_library_postgres::publication_locks::scoped_writer_locks_and_publishes_without_base_updates'
+          args=(--locked --manifest-path workers/api/Cargo.toml --features postgres-tests,encrypted-upload-caller --lib "$test_name")
+          cargo test "${args[@]}" -- --exact | tee "$RUNNER_TEMP/private-trial-locks-test.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/private-trial-locks-test.log"
       - name: Resolve private music against the committed catalogue fixture
         env:
           NNTUNE_TEST_DATABASE_URL: postgresql://postgres:ci-throwaway@127.0.0.1:5432/nntune_catalogue_ci
