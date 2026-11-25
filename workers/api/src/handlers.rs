@@ -12643,6 +12643,7 @@ pub(crate) mod tests {
         missing_sessions: RefCell<HashSet<String>>,
         /// Method names that fail like a Stripe outage.
         fail: RefCell<HashSet<String>>,
+        forbid_invoice_reads: bool,
         /// Next customer id minted by `create_customer`.
         next_customer: RefCell<Option<String>>,
         customer_reply: std::cell::Cell<Option<(bool, Option<&'static str>)>>,
@@ -12839,6 +12840,7 @@ pub(crate) mod tests {
         ) -> Pin<Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::Invoice>> + '_>>
         {
             Box::pin(async move {
+                assert!(!self.forbid_invoice_reads, "unexpected invoice read");
                 if self.fail("retrieve_invoice") {
                     return self.err();
                 }
@@ -12858,6 +12860,7 @@ pub(crate) mod tests {
             Box<dyn Future<Output = crate::stripe::StripeResult<crate::stripe::InvoiceLines>> + '_>,
         > {
             Box::pin(async move {
+                assert!(!self.forbid_invoice_reads, "unexpected invoice line read");
                 if self.fail("list_invoice_lines") {
                     return self.err();
                 }
@@ -12882,6 +12885,7 @@ pub(crate) mod tests {
             Box<dyn Future<Output = crate::stripe::StripeResult<Vec<crate::stripe::Invoice>>> + '_>,
         > {
             Box::pin(async move {
+                assert!(!self.forbid_invoice_reads, "unexpected invoice list read");
                 if self.fail("list_invoices") {
                     return self.err();
                 }
@@ -13854,6 +13858,161 @@ pub(crate) mod tests {
         assert!(op().is_none());
         assert!(live_for(&h, "u1").is_none());
         assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+    }
+
+    #[test]
+    fn paid_invite_resumes_interrupted_checkout_before_verified_subscription() {
+        use serde_json::{json, Value};
+
+        let mut h = stripe_harness();
+        h.config = h.config.with_play_grant_secret(PLAY_SECRET.to_vec());
+        h.config.invites_required = true;
+        h.store.billing_bindings.replace(test_bindings());
+        h.stripe.forbid_invoice_reads = true;
+
+        let email = "resume-listener@example.test";
+        let credential = b"paid-invite-resume-cred";
+        let seed = 38;
+        let owner = seed_admin(&h, "owner", "owner@example.test");
+        let invite = h.call_full(
+            "POST",
+            "/v1/admin/invites",
+            Some(json!({"email": email}).to_string()),
+            Some(owner),
+            Some(ORIGIN),
+        );
+        assert_eq!(invite.status, 201, "{}", invite.body);
+        let invite: Value = serde_json::from_str(&invite.body).unwrap();
+        let (signup, user) =
+            signup_with_invite(&h, email, credential, seed, invite["code"].as_str());
+        assert_eq!(signup.status, 200, "{}", signup.body);
+        let signup_cookie = cookie_of(&signup);
+        let checkout = |h: &Harness, cookie: &str| {
+            h.call_full(
+                "POST",
+                paid_invite_billing::CHECKOUT,
+                Some(json!({"planId": PLAN_PLUS}).to_string()),
+                Some(cookie.to_string()),
+                Some(ORIGIN),
+            )
+        };
+        assert_eq!(checkout(&h, &signup_cookie).status, 404);
+        assert!(h.stripe.customers_created.borrow().is_empty());
+        h.config.paid_invite_billing = true;
+
+        // Stripe creates the session, but the operation loses its session mark.
+        h.store.skip_checkout_mark.set(true);
+        assert_eq!(checkout(&h, &signup_cookie).status, 503);
+        h.store.skip_checkout_mark.set(false);
+        let open_op = || {
+            block_on(h.store.open_checkout_operation(&user))
+                .unwrap()
+                .unwrap()
+        };
+        let interrupted = open_op();
+        assert!(interrupted.session_id.is_none());
+        let session_id = h.stripe.sessions_by_op.borrow()[&interrupted.id].clone();
+        let original_session = h.stripe.sessions.borrow()[&session_id].clone();
+        let customer = original_session.customer.as_deref().unwrap();
+        assert_eq!(h.store.billing_customers.borrow()[&user], customer);
+
+        let logout = h.call_full(
+            "POST",
+            "/v1/session/logout",
+            None,
+            Some(signup_cookie.clone()),
+            Some(ORIGIN),
+        );
+        assert_eq!(logout.status, 200, "{}", logout.body);
+        assert_eq!(checkout(&h, &signup_cookie).status, 401);
+        let start = h.call(
+            "POST",
+            "/v1/auth/passkey/login/start",
+            json!({"email": email}),
+        );
+        assert_eq!(start.status, 200, "{}", start.body);
+        let start: Value = serde_json::from_str(&start.body).unwrap();
+        let login = h.call(
+            "POST",
+            "/v1/auth/passkey/login/finish",
+            fx_reauth_assertion(start["challenge"].as_str().unwrap(), credential, seed, 2),
+        );
+        assert_eq!(login.status, 200, "{}", login.body);
+        let cookie = cookie_of(&login);
+        assert_ne!(cookie, signup_cookie);
+
+        let resume = checkout(&h, &cookie);
+        assert_eq!(resume.status, 200, "{}", resume.body);
+        let redirect: Value = serde_json::from_str(&resume.body).unwrap();
+        assert_eq!(redirect["url"], original_session.url.as_deref().unwrap());
+        let resumed = open_op();
+        assert_eq!(resumed.id, interrupted.id);
+        assert_eq!(resumed.session_id.as_deref(), Some(session_id.as_str()));
+
+        let assert_unentitled = || {
+            let subscription = billing_get(&h, "/v1/me/subscription", Some(cookie.clone()));
+            assert_eq!(subscription.status, 200, "{}", subscription.body);
+            let subscription: Value = serde_json::from_str(&subscription.body).unwrap();
+            assert_eq!(subscription["state"], "no_subscription");
+            let play = play_call(
+                &h,
+                &cookie,
+                json!({"track_id": "track-9", "session_id": "tab-a"}),
+            );
+            assert_eq!(play.status, 402, "{}", play.body);
+            let denial: Value = serde_json::from_str(&play.body).unwrap();
+            assert_eq!(denial["code"], "subscription_required");
+            assert_eq!(denial["reason"], "never_subscribed");
+            assert!(live_for(&h, &user).is_none());
+            assert!(block_on(h.store.playback_lease(&user)).unwrap().is_none());
+        };
+        assert_unentitled();
+
+        let subscription_id = "sub_test_resume";
+        let deliver = |event: &str, payment: &str| {
+            let mut session = original_session.clone();
+            session.status = Some("complete".into());
+            session.payment_status = Some(payment.into());
+            session.subscription = Some(subscription_id.into());
+            session.url = None;
+            let body = paid_invite_event_body(
+                event,
+                "checkout.session.completed",
+                BILLING_NOW,
+                json!({
+                    "id": session_id, "object": "checkout.session", "mode": "subscription",
+                    "livemode": false, "status": "complete", "payment_status": session.payment_status,
+                    "customer": customer, "subscription": subscription_id,
+                    "client_reference_id": resumed.id,
+                }),
+            );
+            h.stripe
+                .sessions
+                .borrow_mut()
+                .insert(session_id.clone(), session);
+            h.call_webhook(&body, Some(sign(&body, BILLING_NOW)))
+        };
+        webhook_ok(&deliver("evt_resume_unpaid", "unpaid"));
+        assert_eq!(checkout(&h, &cookie).status, 503);
+        assert_unentitled();
+
+        h.stripe.subscriptions.borrow_mut().insert(
+            subscription_id.into(),
+            test_subscription(subscription_id, "cus_test_unrelated", "active", PRICE_PLUS),
+        );
+        assert_eq!(deliver("evt_resume_unverified", "paid").status, 500);
+        assert_eq!(checkout(&h, &cookie).status, 503);
+        assert_unentitled();
+        assert_eq!(open_op(), resumed);
+        assert_eq!(h.store.checkout_ops.borrow().len(), 1);
+        assert_eq!(h.store.billing_customers.borrow()[&user], customer);
+        assert_eq!(
+            h.stripe.customers_created.borrow().as_slice(),
+            &[(Some(user), None)]
+        );
+        assert_eq!(*h.stripe.sessions_created.borrow(), 1);
+        assert!(h.stripe.expired.borrow().is_empty());
+        assert!(h.store.invoice_history.borrow().is_empty());
     }
 
     #[test]

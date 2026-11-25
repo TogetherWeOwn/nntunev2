@@ -12,6 +12,12 @@ play refusals with the in-memory store and Stripe transport. The recording
 below verifies hourly dispatch and the browser, provider and database on the
 deployed build.
 
+The API CI case `paid_invite_resumes_interrupted_checkout_before_verified_subscription`
+rehearses a lost Checkout session mark after signup. Signing in again with the
+same passkey recovers the original customer and session. Signed events for an
+unpaid completion and a completion with a mismatched subscription both leave
+playback gated. The fixture stops before invoice reads.
+
 ## Run the protected evidence check
 
 The [runner](../.github/scripts/paid_invite_acceptance.py) is off unless
