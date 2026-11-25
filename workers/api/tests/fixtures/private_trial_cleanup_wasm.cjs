@@ -4,7 +4,10 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const loadWorker = require('../../../ingest/tests/fixtures/worker_fixture_wasm.cjs');
 const { authorization, mediaKey, sha256, sidecarKey } = require('../../../ingest/tests/fixtures/s3_fixture_protocol.cjs');
-const { private_trial_cleanup_test: cleanup } = loadWorker(process.env.PRIVATE_TRIAL_DISPATCH_WASM_JS);
+const {
+  private_trial_cleanup_test: cleanup,
+  private_trial_cleanup_foreign_bucket_test: cleanupForeignBucket,
+} = loadWorker(process.env.PRIVATE_TRIAL_DISPATCH_WASM_JS, true);
 
 const bucket = 'nntunev2-private-fixtures-staging';
 const mediaVersion = 'media-fixture+/=?';
@@ -60,5 +63,11 @@ test('preserves transport refusal for a foreign bucket', async (t) => {
   const fetch = t.mock.method(globalThis, 'fetch', () => assert.fail('unexpected fetch'));
   await assert.rejects(cleanup('fixture-bucket', mediaKey, mediaVersion, sidecarKey, pageVersion),
     (error) => error === 'Refused');
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('the runner refuses a foreign bucket before attempting SQL retirement', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', () => assert.fail('unexpected fetch'));
+  await assert.rejects(cleanupForeignBucket(), (error) => error === 'Refused');
   assert.equal(fetch.mock.callCount(), 0);
 });

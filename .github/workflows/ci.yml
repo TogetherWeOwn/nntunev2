@@ -2239,6 +2239,8 @@ jobs:
       - name: Exercise unmounted staging admission through Worker responses
         run: STAGING_BODY_WASM_JS="$RUNNER_TEMP/ledger-js/nntune_api.js" node --test workers/api/tests/staging_dispatch_wasm.cjs
       - name: Exercise private trial dispatch and cleanup confirmation in the Worker runtime
+        env:
+          DATABASE_URL: postgresql://postgres:ci-throwaway@localhost:5432/nntune_ci
         run: |
           set -euo pipefail
           cargo build --locked --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown --features staging-body-wasm-test,encrypted-upload-caller --target-dir "$RUNNER_TEMP/upload-caller-target"
