@@ -4,6 +4,7 @@ import type { FullResult, Reporter, TestCase, TestResult, TestStep } from '@play
 
 const identities = ['build-identity', 'build-identity-final'];
 const proofs = {
+  'invite-acceptance': [],
   'upload-to-library': ['private-publication', 'private-library'],
   play: ['private-play'],
   seek: [],
@@ -72,7 +73,8 @@ export default class PrivateStagingAdmissionReporter implements Reporter {
       if (observed.length !== identities.length) throw new Error();
 
       const cases = [...identities, ...Object.keys(proofs)].map((name) => {
-        const step = exactlyOne(steps.filter((step) => step.title === name));
+        const title = name === 'invite-acceptance' ? 'invite redemption and Library arrival' : name;
+        const step = exactlyOne(steps.filter((step) => step.title === title));
         if (step.error || step.duration < 0 || step.annotations.some(({ type }) => type === 'skip')) throw new Error();
         const annotations = [];
         if (identities.includes(name)) {

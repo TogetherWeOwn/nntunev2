@@ -53,9 +53,10 @@ def setup(root, env):
     git("commit", "--quiet", "-m", "Synthetic fixture")
     sha = git("rev-parse", "HEAD")
     env.update(GITHUB_SHA=sha, GITHUB_WORKFLOW_SHA=sha, API_SOURCE_SHA=sha)
+    required_criteria = sorted(admission.PRIVATE_CRITERIA | {"invite-acceptance"})
     criteria = [{"id": key, "applicable": True,
                  "evidence": [{"classname": "private-music", "name": key, "outcome": "passed"}]}
-                for key in sorted(admission.PRIVATE_CRITERIA)]
+                for key in required_criteria]
     contract = json.dumps({"schema": 1, "evaluator": "junit-map-v1", "journey": "private-music",
                            "spec_revision": "fixture", "criteria": criteria}).encode()
     write(root, admission.CONTRACT, contract)
@@ -86,9 +87,10 @@ test(detail, async ({{}}, info) => {{
         observed_at: `2025-01-01T00:00:0${{index}}.000Z`, ignored: detail,
       }}),
     }}));
-    if (index === 0) for (const name of {json.dumps(sorted(admission.PRIVATE_CRITERIA))}) {{
-      if (name === 'seek' && process.env.FIXTURE_OUTCOME === 'skip') await test.step.skip(name, async () => {{}});
-      else await test.step(name, async () => {{}});
+    if (index === 0) for (const name of {json.dumps(required_criteria)}) {{
+      const title = name === 'invite-acceptance' ? 'invite redemption and Library arrival' : name;
+      if (name === 'invite-acceptance' && process.env.FIXTURE_OUTCOME === 'skip') await test.step.skip(title, async () => {{}});
+      else await test.step(title, async () => {{}});
     }}
   }}
   for (const type of {json.dumps(names)})
@@ -115,6 +117,7 @@ def receipt_step():
         assert "if: vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true'" in bind
         assert "printf 'pin=%s\\n' \"$pin\" >> \"$GITHUB_OUTPUT\"" in bind
         if lane == "web":
+            assert "PRIVATE_MUSIC_STAGING_JOURNEY: ${{ vars.PRIVATE_MUSIC_STAGING_JOURNEY == 'true' && 'true' || 'false' }}" in steps
             assert 'private_staging_evidence.py web > "$RUNNER_TEMP/staging-web-pin.json"' in steps
             assert 'pin=$(cat "$RUNNER_TEMP/staging-web-pin.json")' in bind
         else:
