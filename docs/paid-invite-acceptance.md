@@ -67,6 +67,8 @@ Scope covers existing subscription targets, including retained targets that can
 return to advancing states. Inventory the union of relevant retained and eligible
 keys at the cutoff, set boolean `retained` per key and pass the independent
 `BILLING_PREFLIGHT_SCOPE_COUNT` (1–10,000). The paid invite journey covers first-time Checkout.
+Align the archive snapshot with the evidence cutoff. If the archive changes
+after that cutoff, prepare a new inventory and projection at a common observation.
 
 Project the candidate's fold using current target and price bindings at the same
 observation. Set boolean `evidence_complete` after verifying ownership and

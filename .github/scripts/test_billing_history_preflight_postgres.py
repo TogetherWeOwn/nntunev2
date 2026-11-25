@@ -87,10 +87,11 @@ def exercise():
            WHERE stripe_invoice_id = 'in_fixture_1';
            DELETE FROM billing_preflight.projection WHERE stripe_invoice_id = 'in_fixture_2';""")
     check(2, incomplete=2, fresh=1)
+    sql("""UPDATE billing_preflight.projection SET stripe_subscription_id = 'sub_fixture_absent'
+           WHERE stripe_invoice_id = 'in_fixture_3'""")
+    check(2, incomplete=3)
     sql("""UPDATE billing_preflight.scope SET stripe_subscription_id = 'sub_fixture_absent'
-           WHERE stripe_invoice_id = 'in_fixture_3';
-           UPDATE billing_preflight.projection SET stripe_subscription_id = 'sub_fixture_absent'
-           WHERE stripe_invoice_id = 'in_fixture_3';""")
+           WHERE stripe_invoice_id = 'in_fixture_3'""")
     check(2, incomplete=3)
 
     refused("different_observer", OBSERVER)
