@@ -161,6 +161,7 @@ async fn scoped_writer_commits_and_replays_exact_upload() {
         Some(Fault::ForeignTarget),
         Some(Fault::CommittedSidecarVersion),
         Some(Fault::Quarantined),
+        Some(Fault::LostCompletionResponse),
     ]
     .into_iter()
     .enumerate()
@@ -192,6 +193,7 @@ enum Fault {
     ForeignTarget,
     CommittedSidecarVersion,
     Quarantined,
+    LostCompletionResponse,
 }
 
 async fn prove_attempt(
@@ -678,6 +680,95 @@ async fn prove_attempt(
         }
         verified
     };
+    if matches!(fault, Some(Fault::LostCompletionResponse)) {
+        // Model the already charged admission using the real ingest job writer.
+        let accepted_at = now as i64;
+        assert_eq!(
+            observer
+                .execute(
+                    nntune_ingest::ingest_jobs::upsert_ingest_job_sql(),
+                    &[&sid, &OWNER, &idempotency_key, &accepted_at],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let quota_used = async || {
+            observer
+                .query_one(
+                    "SELECT count(*) FROM public.ingest_jobs
+                     WHERE user_id = $1 AND accepted_at / 86400 = $2::bigint / 86400
+                       AND source = 'pipeline'",
+                    &[&OWNER, &accepted_at],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        };
+        assert_eq!(quota_used().await, 1);
+
+        // The caller can lose its result when the post-commit read fails.
+        let result = Box::pin(opened.commit_flac(
+            writer,
+            auth,
+            &inventory,
+            accepted_at + 600,
+            async |_, _| Err(StoreError),
+            verify,
+        ))
+        .await;
+        assert!(matches!(result, Err(UploadError::Unconfirmed)));
+        let final_scope = prepared.completed_scope();
+        // The row versions expose a second write even if it repeats the same values.
+        let committed_rows = async || {
+            let row = observer
+                .query_one(
+                    "SELECT s.xmin::text, i.xmin::text
+                     FROM public.ingest_session_reservations s
+                     JOIN public.storage_digest_inventory_intents i ON i.map_id = s.completed_map_id
+                     WHERE s.id = $1::text::uuid AND s.terminal_reason = 'completed'
+                       AND s.checkpoint_generation = $2::text::uuid AND s.checkpoint_revision = $3
+                       AND s.checkpoint_offset = $4 AND s.write_lease_id IS NULL
+                       AND i.map_id = $5::text::uuid",
+                    &[
+                        &sid,
+                        &generation,
+                        &final_scope.revision,
+                        &final_scope.offset,
+                        &map_text,
+                    ],
+                )
+                .await
+                .expect("the first completion and its receipt must already be committed");
+            (row.get::<_, String>(0), row.get::<_, String>(1))
+        };
+        let committed = committed_rows().await;
+
+        let mut retry_writer = connect(WRITER).await;
+        let UploadAttempt::Reused(replayed) = Box::pin(open_or_reuse(
+            &mut retry_writer,
+            auth,
+            prepared,
+            until,
+            reload,
+            async |_, _, _, _| panic!("completion replay reached the upload provider"),
+        ))
+        .await
+        .unwrap() else {
+            panic!("the same generation must replay the committed upload");
+        };
+        let receipt = replayed.outcome();
+        assert_eq!(receipt.map.replace('-', ""), map_text);
+        assert_eq!(receipt.object.replace('-', ""), obj);
+        assert_eq!(receipt.generation.replace('-', ""), generation);
+        assert_eq!(receipt.configuration.replace('-', ""), provider);
+        assert_eq!(receipt.root_version.replace('-', ""), root_text);
+        assert_eq!(receipt.media_version, MEDIA);
+        assert_eq!(receipt.page_versions, [PAGE]);
+        assert_eq!(committed_rows().await, committed);
+        assert_eq!(quota_used().await, 1);
+        return;
+    }
     if matches!(fault, Some(Fault::CommittedSidecarVersion)) {
         // Inject a different version only after the real commit. Only the
         // disposable database owner can bypass the append-only fixture guard.
@@ -779,7 +870,8 @@ async fn prove_attempt(
             }
             Fault::Quarantined
             | Fault::GrantRevokedWhileWaiting
-            | Fault::CommittedSidecarVersion => unreachable!(),
+            | Fault::CommittedSidecarVersion
+            | Fault::LostCompletionResponse => unreachable!(),
         };
         assert!(
             matches!(opened.commit_flac(writer, auth, &inventory, retain, reload, verify).await,
