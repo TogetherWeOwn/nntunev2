@@ -113,7 +113,8 @@ test('the latest invited Library selection wins while playback is loading', asyn
 		new MutationObserver((entries) => {
 			for (const entry of entries) {
 				if (entry.target instanceof Element && entry.target.matches(selector) && entry.oldValue) seen.add(entry.oldValue);
-				for (const node of entry.addedNodes) {
+				// An added wrapper can lose descendants before the callback runs.
+				for (const node of [...entry.addedNodes, ...entry.removedNodes]) {
 					if (!(node instanceof Element)) continue;
 					if (node.matches(selector)) record(node);
 					node.querySelectorAll(selector).forEach(record);
