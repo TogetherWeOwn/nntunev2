@@ -4,8 +4,18 @@ use nntune_core::s3_locator::{S3Binding, S3Locator};
 use nntune_ingest::multipart::session_upload::begin;
 use tokio_postgres::{types::Type, Client};
 
+#[cfg(target_arch = "wasm32")]
+use {
+    nntune_ingest::multipart::s3_completion::{FixtureRetirementError, FixtureVersionRemover},
+    std::time::SystemTime,
+};
+
 use super::{caller::FIXTURE_DIGEST, TrialError};
 use crate::storage_digest_read::uuid_text;
+
+#[cfg(all(target_arch = "wasm32", feature = "staging-body-wasm-test"))]
+#[path = "../../../tests/fixtures/private_trial_cleanup_wasm.rs"]
+mod wasm_fixture;
 
 pub struct Fixture<'a> {
     pub environment: [u8; 16],
@@ -27,22 +37,64 @@ struct RetiredFixture {
     page_version: String,
 }
 
+impl RetiredFixture {
+    async fn confirm_versions(
+        &self,
+        mut delete_and_confirm: impl AsyncFnMut(&str, &str, &str) -> Result<(), TrialError>,
+    ) -> Result<(), TrialError> {
+        let S3Binding::VersionId(media_version) = self.media.binding() else {
+            return Err(TrialError::Unconfirmed);
+        };
+        delete_and_confirm(self.media.bucket(), self.media.key(), media_version).await?;
+        delete_and_confirm(self.media.bucket(), &self.page_key, &self.page_version).await
+    }
+}
+
+/// Runner entry point for the Worker WASM transport. Supply a separately
+/// authorized cleanup DB connection and remover from trusted staging custody,
+/// with the same selected fixture pins on each retry. `until` is the absolute
+/// deadline shared by all S3 requests in this attempt.
+#[cfg(target_arch = "wasm32")]
+pub async fn cleanup_with_s3(
+    db: &mut Client,
+    fixture: &Fixture<'_>,
+    remover: &FixtureVersionRemover,
+    until: SystemTime,
+) -> Result<bool, TrialError> {
+    if !remover.matches_bucket(fixture.bucket) {
+        return Err(TrialError::Refused);
+    }
+    cleanup(db, fixture, s3_confirmation(remover, until)).await
+}
+
+#[cfg(target_arch = "wasm32")]
+fn s3_confirmation(
+    remover: &FixtureVersionRemover,
+    until: SystemTime,
+) -> impl AsyncFnMut(&str, &str, &str) -> Result<(), TrialError> + '_ {
+    async move |bucket: &str, key: &str, version: &str| {
+        remover
+            .delete_and_confirm(bucket, key, version, until)
+            .await
+            .map_err(|error| match error {
+                FixtureRetirementError::Refused => TrialError::Refused,
+                FixtureRetirementError::Unconfirmed => TrialError::Unconfirmed,
+            })
+    }
+}
+
 /// Invoke from a protected staging cleanup job with its selected fixture. The
 /// transport must delete the indicated version and confirm its absence. A retry
 /// can resume after the first version disappears or a commit is unconfirmed.
 pub async fn cleanup(
     db: &mut Client,
     fixture: &Fixture<'_>,
-    mut delete_and_confirm: impl AsyncFnMut(&str, &str, &str) -> Result<(), TrialError>,
+    delete_and_confirm: impl AsyncFnMut(&str, &str, &str) -> Result<(), TrialError>,
 ) -> Result<bool, TrialError> {
     let Some(pins) = retire(db, fixture).await? else {
         return Ok(false);
     };
-    let S3Binding::VersionId(media_version) = pins.media.binding() else {
-        return Err(TrialError::Unconfirmed);
-    };
-    delete_and_confirm(pins.media.bucket(), pins.media.key(), media_version).await?;
-    delete_and_confirm(pins.media.bucket(), &pins.page_key, &pins.page_version).await?;
+    pins.confirm_versions(delete_and_confirm).await?;
     let tx = begin(db).await.map_err(|_| TrialError::Unconfirmed)?;
     tx.execute_typed(
         "DELETE FROM public.catalogue_s3_sources s USING public.storage_validated_digest_winners w
