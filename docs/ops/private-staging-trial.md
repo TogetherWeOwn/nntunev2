@@ -166,8 +166,16 @@ provider-only window, keep the upload, playback and journey arms unset and
 bind both endpoint inputs to the reviewed fixture ingress. The workflow
 compares the settings before sending a request and keeps the variable values
 out of its logs. Clear the temporary inputs or restore the prior settings on
-closeout. Before arming, independently verify the reviewed serving endpoint
-with upload and playback. The fixture boundary serves HEAD and DELETE only.
+closeout.
+
+Before arming, verify upload and playback on the reviewed serving endpoint.
+Also require a passing [cleanup qualification](#protected-cleanup-dispatch)
+on the exact endpoint, region and bucket the cleanup runner will match to
+the trial receipt. If restoring settings changes any of those values,
+repeat the exact-version HEAD and DELETE qualification on fresh disposable
+versions at the restored target. Qualify its two-key cleanup scope separately.
+Keep the trial disarmed until both checks pass. The fixture boundary serves
+HEAD and DELETE only.
 Keep the exact scope JSON and the disposable credential in
 protected custody. Use the SHA-256 of the exact UTF-8 bytes supplied as the
 scope secret. The dispatch inputs contain only the reviewed full `main` commit
