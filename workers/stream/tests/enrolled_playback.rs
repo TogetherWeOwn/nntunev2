@@ -192,3 +192,50 @@ async fn suffix_opens_two_complete_chunks_and_counts_only_writer_bytes() {
     assert!(play.next_chunk(now()).unwrap().is_none());
     play.finish().unwrap();
 }
+
+#[tokio::test]
+async fn adjacent_single_byte_ranges_count_each_write_separately() {
+    let f = Fixture::new();
+    for (request, expected_range, expected_byte, first, sealed) in [
+        (
+            "bytes=65535-65535",
+            "bytes 65535-65535/65537",
+            b"Y",
+            true,
+            f.first.as_slice(),
+        ),
+        (
+            "bytes=65536-65536",
+            "bytes 65536-65536/65537",
+            b"Z",
+            false,
+            f.last.as_slice(),
+        ),
+    ] {
+        let (outcome, play) =
+            EnrolledPlayback::start(Some(request), f.pins(), f.media_input(), now()).unwrap();
+        let RangeOutcome::Partial(range) = outcome else {
+            panic!("expected 206 for {request}");
+        };
+        assert_eq!(content_range_value(range, LEN), expected_range);
+
+        let mut play = play.unwrap();
+        let part = play
+            .open_next(
+                f.media.locator(),
+                f.response(first),
+                Body(sealed),
+                f.page(),
+                first.then_some(&f.context.header[..]),
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(part.as_slice(), expected_byte);
+        assert_eq!(play.served_bytes(), 0);
+        play.written(1).unwrap();
+        assert_eq!(play.served_bytes(), 1);
+        assert!(play.next_chunk(now()).unwrap().is_none());
+        play.finish().unwrap();
+    }
+}
