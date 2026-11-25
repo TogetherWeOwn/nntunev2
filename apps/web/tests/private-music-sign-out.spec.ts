@@ -85,6 +85,10 @@ test('sign-out stops active private playback and clears the invited queue', asyn
 		await expect(audio).toHaveCount(0);
 		await expect(transport).toHaveCount(0);
 	};
+	const storedQueue = () => page.evaluate((prefix) =>
+		Object.keys(sessionStorage).filter((key) => key.startsWith(prefix))
+			.map((key) => JSON.parse(sessionStorage.getItem(key)!)), 'nntune.library.queue.v1.'
+	);
 
 	await seedSession(firstAccount);
 	await page.goto(origin + library.path);
@@ -98,6 +102,7 @@ test('sign-out stops active private playback and clears the invited queue', asyn
 	await expect.poll(() => decoder.evaluate((node: HTMLAudioElement) =>
 		!node.paused && node.currentTime > 0.2)).toBe(true);
 	await expect(nowPlaying).toHaveText(track.title);
+	expect(await storedQueue()).toEqual([{ orderIds: [track.id, companion.id], currentId: track.id }]);
 
 	// A 204 lets the sign-out redirect finish without unloading the original decoder.
 	const loginUrl = `${origin}/login`;
@@ -116,6 +121,7 @@ test('sign-out stops active private playback and clears the invited queue', asyn
 		message: 'Sign-out must pause the original native decoder before the document unloads', timeout: 3_000
 	}).toEqual({ paused: true, ended: false });
 	await assertEmptyPlayer();
+	expect(await storedQueue(), 'Sign-out must delete the first invite’s saved queue').toEqual([]);
 	await expect(rows).toHaveCount(0);
 	expect((await context.cookies(origin)).find(({ name }) => name === fixtureCookie)).toBeUndefined();
 
