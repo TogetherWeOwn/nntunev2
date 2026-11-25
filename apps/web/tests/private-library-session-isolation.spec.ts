@@ -255,11 +255,14 @@ for (const { name, leakDenial } of [
 			const [revokedSession, activeSession] = await openInviteePages(page, other, origin, revoked, active,
 				(invitee) => revokedAccount !== undefined && (invitee.account === revokedAccount || leakDenial));
 			expect(activeSession).not.toBe(revokedSession);
-			// Keep natural-end handling from initiating a switch before the explicit queue action.
-			await Promise.all([toggle(page, 'Pause').click(), toggle(other, 'Pause').click()]);
+			// The revoked queue already has a successor. Keep its switch tied to the queue action.
+			await toggle(page, 'Pause').click();
 			await expect.poll(async () => (await playbackState(page)).paused).toBe(true);
-			const activeBefore = await playbackState(other);
-			expect(activeBefore.paused).toBe(true);
+			const activePlayback = await other.getByTestId(player.audio).evaluateHandle((audio: HTMLAudioElement) => {
+				const sample = { audio, time: audio.currentTime, source: audio.currentSrc, sawPause: false };
+				audio.addEventListener('pause', () => { sample.sawPause = true; }, { once: true });
+				return sample;
+			});
 			const originalSource = mediaPath(revoked.tracks[0], revokedSession);
 			const sources = await observeMediaSources(page);
 
@@ -274,7 +277,15 @@ for (const { name, leakDenial } of [
 			await expect(page.locator(player.currentQueueItem)).toHaveAttribute(player.queueId, revoked.tracks[0].item.id);
 			await expect(page.getByTestId(player.audio)).toHaveAttribute('src', originalSource);
 
-			// The new row must come from the active invitee's refreshed Library.
+			await expect.poll(() => activePlayback.evaluate(({ audio, time, source, sawPause }) =>
+				audio.isConnected && audio.currentSrc === source && !sawPause && !audio.paused && audio.currentTime > time
+			), { message: 'The active invitee keeps playing through the revoked grant' }).toBe(true);
+			await activePlayback.dispose();
+
+			// Pause before revealing the successor so natural end cannot start the switch.
+			await toggle(other, 'Pause').click();
+			const activeBefore = await playbackState(other);
+			expect(activeBefore.paused).toBe(true);
 			active.tracks.push(activeNext);
 			await refreshOwnLibrary(other, origin, active);
 			expect(await playbackState(other)).toEqual(activeBefore);
