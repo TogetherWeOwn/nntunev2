@@ -20,6 +20,7 @@ PRIVATE_SETTINGS = {
 API_SETTINGS = {"ENVIRONMENT": UUID_V4, "LIBRARY": UUID_V4, **{
     name: PRIVATE_SETTINGS[name] for name in ("S3_CONFIGURATION", "S3_BUCKET", "ROOT_VERSION")
 }}
+TRIAL_DATABASES = ("UPLOAD", "AUTH", "PUBLISH", "ENROLL")
 
 
 def private_vars(env, settings):
@@ -45,7 +46,42 @@ def api_vars(env):
     if lines and (env.get("STREAM_SERVICE_STAGING") != "nntune-stream-staging"
                   or env.get("STREAM_STAGING_DEPLOY_ENABLED") != "true"):
         raise ValueError("Private API playback requires the staging Stream service and deploy lane")
+    if trial_upload(env):
+        if not lines or not env.get("HYPERDRIVE_ID_MB"):
+            raise ValueError("Private trial upload requires staged playback and the mirror binding")
+        lines.append('PRIVATE_TRIAL_UPLOAD_ENABLED = "true"')
+        for name in ("ENDPOINT", "REGION"):
+            value = env.get(f"PRIVATE_PLAYBACK_STAGING_S3_{name}", "")
+            if len(value) > 253 or not re.fullmatch(PRIVATE_SETTINGS[f"S3_{name}"], value):
+                raise ValueError(f"PRIVATE_PLAYBACK_STAGING_S3_{name} is invalid")
+            lines.append(f"PRIVATE_TRIAL_S3_{name} = {json.dumps(value)}")
     return lines
+
+
+def trial_upload(env):
+    value = env.get("PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED", "")
+    if value not in ("", "false", "true"):
+        raise ValueError("PRIVATE_TRIAL_UPLOAD_STAGING_ENABLED has an invalid value")
+    return value == "true"
+
+
+def trial_db_bindings(env):
+    if not trial_upload(env):
+        return []
+    manifest = tomllib.loads(Path(__file__).with_name("binding_manifest.toml").read_text())
+    existing = {
+        binding.get(stage) for worker in manifest["worker"] for binding in worker.get("binding", [])
+        if binding.get("type") == "hyperdrive" for stage in ("prod", "staging")
+    }
+    bindings = []
+    for role in TRIAL_DATABASES:
+        name = f"PRIVATE_TRIAL_{role}_DB"
+        value = env.get(f"{name}_STAGING_ID", "")
+        if not re.fullmatch(r"[0-9a-f]{32}", value) or value in existing:
+            raise ValueError(f"{name}_STAGING_ID needs a distinct scoped binding")
+        existing.add(value)
+        bindings.extend(("", "[[env.staging.hyperdrive]]", f'binding = "{name}"', f'id = "{value}"'))
+    return bindings
 
 
 def trial_preflight(env):
@@ -120,6 +156,8 @@ if __name__ == "__main__":
             config.write_text(render(tomllib.loads(config.read_text()), os.environ))
         case ["--api-vars"]:
             print("\n".join(api_vars(os.environ)))
+        case ["--trial-db-bindings"]:
+            print("\n".join(trial_db_bindings(os.environ)))
         case ["--trial-preflight"]:
             print(f"browser_playback={int(trial_preflight(os.environ))}")
         case _:
