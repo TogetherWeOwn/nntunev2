@@ -8,6 +8,7 @@ test('a revoked invitee cannot reopen Library directly while a valid invitee can
 	const { library } = PRIVATE_MUSIC;
 	const libraryUrl = origin + library.path;
 	const listingUrl = origin + library.api;
+	const observedRow = 'data-observed-library-row';
 	const first = {
 		cookie: 'synthetic-first-invitee', binding: 'A'.repeat(43),
 		track: { id: '00000000-0000-4000-8000-000000000001', title: 'Synthetic Prelude', duration_ms: 14_000 }
@@ -21,6 +22,21 @@ test('a revoked invitee cannot reopen Library directly while a valid invitee can
 
 	async function wireInvitee(tab: Page, invitee: typeof first) {
 		const context = tab.context();
+		await tab.addInitScript(({ item, marker }) => {
+			const selector = `[data-testid="${item}"]`;
+			// Keep evidence of a row that appears and disappears between assertions.
+			const observer = new MutationObserver((entries) => {
+				for (const { addedNodes, removedNodes } of entries) {
+					if ([...addedNodes, ...removedNodes].some((node) =>
+						node instanceof Element && (node.matches(selector) || node.querySelector(selector)))) {
+						document.documentElement.setAttribute(marker, 'true');
+						observer.disconnect();
+						return;
+					}
+				}
+			});
+			observer.observe(document, { childList: true, subtree: true });
+		}, { item: library.item, marker: observedRow });
 		await context.addCookies([{
 			name: fixtureCookie, value: invitee.cookie, url: origin, httpOnly: true, sameSite: 'Lax'
 		}]);
@@ -62,6 +78,7 @@ test('a revoked invitee cannot reopen Library directly while a valid invitee can
 		await expect(rows).toHaveCount(1);
 		await expect(rows).toHaveAttribute(library.id, invitee.track.id);
 		await expect(rows.getByRole('button', { name: invitee.track.title, exact: true })).toBeVisible();
+		await expect(tab.locator('html')).toHaveAttribute(observedRow, 'true');
 		await expect(tab).toHaveURL(libraryUrl);
 	}
 
@@ -94,6 +111,7 @@ test('a revoked invitee cannot reopen Library directly while a valid invitee can
 	await expect(page.getByRole('link', { name: 'Sign in', exact: true })).toHaveCount(0);
 	await expect(page.getByTestId(library.item)).toHaveCount(0);
 	await expect(page.getByText(first.track.title, { exact: true })).toHaveCount(0);
+	expect(await page.locator('html').getAttribute(observedRow), 'a Library row rendered in the denied document').toBeNull();
 	await expect(page).toHaveURL(libraryUrl);
 
 	const validContext = await browser.newContext({ serviceWorkers: 'block' });
