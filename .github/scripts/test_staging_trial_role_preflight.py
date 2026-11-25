@@ -79,14 +79,24 @@ class TrialBindingIdentityTests(unittest.TestCase):
             database_oid = int(run_psql(db, "SELECT oid FROM pg_database WHERE datname = current_database();"))
             pins = {binding: (role, int(run_psql(db, f"SELECT '{role}'::regrole::oid;")))
                     for binding, role in BINDING_ROLES.items()}
-            rows = {}
-            for binding, role in BINDING_ROLES.items():
+
+            def read_identity(role, setup=""):
                 result = run_psql({**db, "PGUSER": role},
-                                  "BEGIN READ ONLY;\n" + preflight.BINDING_IDENTITY_SQL + "ROLLBACK;\n")
+                                  "BEGIN READ ONLY;\n" + setup + preflight.BINDING_IDENTITY_SQL + "ROLLBACK;\n")
                 name, db_oid, login, login_oid, effective, effective_oid = result.split("|")
-                rows[binding] = (name, int(db_oid), login, int(login_oid), effective, int(effective_oid))
-            self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, rows),
-                             dict.fromkeys(BINDING_ROLES, "matched"))
+                return name, int(db_oid), login, int(login_oid), effective, int(effective_oid)
+
+            rows = {binding: read_identity(role) for binding, role in BINDING_ROLES.items()}
+            matched = dict.fromkeys(BINDING_ROLES, "matched")
+            self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, rows), matched)
+
+            upload, auth, *_ = BINDING_ROLES
+            upload_role, auth_role = BINDING_ROLES[upload], BINDING_ROLES[auth]
+            run_psql(db, f"GRANT {auth_role} TO {upload_role} WITH INHERIT FALSE, SET TRUE;")
+            switched = read_identity(upload_role, f"SET LOCAL ROLE {auth_role};\n")
+            self.assertEqual(switched, (preflight.DATABASE, database_oid, *pins[upload], *pins[auth]))
+            self.assertEqual(preflight.binding_identity_verdicts(database_oid, pins, {**rows, upload: switched}),
+                             {**matched, upload: "pending"})
 
 
 class TrialRolePreflightTests(unittest.TestCase):
