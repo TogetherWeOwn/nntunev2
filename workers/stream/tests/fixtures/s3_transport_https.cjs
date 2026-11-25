@@ -11,6 +11,7 @@ const { make_s3_fixture, fetch: streamFetch } = require('./s3_stream_wasm.cjs');
 const path = '/fixture-media/media/00000000000040008000000000000003/00000000000040008000000000000004';
 const query = 'versionId=version%2B%2F%25%3F%3D%26';
 const span = 'bytes 65600-65616/65617';
+const shiftedSpan = 'bytes 65599-65615/65617';
 const pagePath = path.replace('/media/', '/media-digests/') + '/00000000000040008000000000000006/00000000';
 const pageQuery = 'versionId=page%2B%2F%25%3F%3D%26';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -98,7 +99,7 @@ test('versioned encrypted playback over a disposable HTTPS origin', { timeout: 2
     { headers: { 'x-amz-version-id': 'wrong-version' } },
     { headers: { 'x-amz-version-id': null } },
     { headers: { 'x-amz-version-id': ['version+/%?=&', 'version+/%?=&'] } },
-    { headers: { 'content-range': 'bytes 65599-65615/65617' } },
+    { headers: { 'content-range': shiftedSpan } },
     { headers: { 'content-range': 'bytes 65600-65616/65618' } },
     { headers: { 'content-range': [span, span] } },
     { headers: { 'content-length': [17, 17] } },
@@ -196,6 +197,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   let host;
   let mediaVersionOverride;
   let observedPageVersion = 'page+/%?=&';
+  let seekContentRange = span;
   let fullRange = false;
   let stallTail;
   const fetches = [];
@@ -213,7 +215,7 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
       'content-length': bytes.length,
       'x-amz-version-id': page ? observedPageVersion : (mediaVersionOverride ?? 'version+/%?=&'),
     };
-    if (!page) headers['content-range'] = fullRange ? 'bytes 0-65616/65617' : span;
+    if (!page) headers['content-range'] = fullRange ? 'bytes 0-65616/65617' : seekContentRange;
     res.writeHead(page ? 200 : 206, headers);
     if (!page && stallTail) {
       res.once('close', () => stallTail(res.writableFinished));
@@ -373,8 +375,22 @@ test('Stream fetch serves a pinned encrypted seek and settles only written bytes
   assert.equal(await status(), 502);
   assert.deepEqual(fetches.slice(pageFaultStart), ['media', 'page']);
   assert.equal(reports.length, 1);
-
   observedPageVersion = 'page+/%?=&';
+
+  await t.test('a shifted Content-Range delivers and counts no media', async (t) => {
+    const fetchStart = fetches.length;
+    const reportStart = reports.length;
+    // Keep the status, version, length and authentic ciphertext from the successful seek.
+    seekContentRange = shiftedSpan;
+    t.after(() => { seekContentRange = span; });
+    const refused = await request();
+    assert.equal(refused.response.status, 502);
+    assert.equal(refused.response.headers.get('content-range'), null);
+    assert.equal(JSON.parse(refused.bytes).code, 'upstream_unavailable');
+    assert.deepEqual(fetches.slice(fetchStart), ['media']);
+    assert.equal(reports.length, reportStart);
+  });
+
   fullRange = true;
   await t.test('a bounded range crossing the short final chunk ends at media EOF', { timeout: 5_000 }, async () => {
     const firstFetch = fetches.length;
