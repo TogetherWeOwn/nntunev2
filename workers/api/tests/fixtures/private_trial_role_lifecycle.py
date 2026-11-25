@@ -14,8 +14,8 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / ".github/scripts"))
 
-from apply_migration import transaction_body
-from staging_apply import StagingApplyError, load_entries
+from private_trial_catalog import apply_catalog, create_catalog
+from staging_apply import StagingApplyError
 import staging_trial_ambient_acl as ambient_acl
 from staging_trial_isolated import target_config
 from staging_trial_role_acl import audit
@@ -103,26 +103,13 @@ else:
 if not re.fullmatch(r"[0-9]+", expected_cluster) or sql(cluster_query, database="nntune_ci") != expected_cluster:
     raise SystemExit("loopback server does not match the disposable PostgreSQL cluster")
 
-owner_setup = f"""
-CREATE ROLE {owner} LOGIN CREATEROLE NOINHERIT PASSWORD '{password}';
-CREATE ROLE {executor} LOGIN NOINHERIT PASSWORD '{password}';
-GRANT pg_signal_backend TO {owner} WITH INHERIT TRUE;
-CREATE DATABASE {DATABASE} OWNER {owner} TEMPLATE template0;
-"""
-sql(owner_setup, database="nntune_ci")
+create_catalog(sql, "nntune_ci", owner, executor, password)
 try:
     sql(f"""
     COMMENT ON DATABASE {DATABASE} IS '{FIXTURE}';
     REVOKE CONNECT, TEMP ON DATABASE nntune_ci, postgres, template1, {DATABASE} FROM PUBLIC;
-    GRANT CONNECT, CREATE ON DATABASE {DATABASE} TO {executor};
-    ALTER SCHEMA public OWNER TO {executor};
     """)
-    entries = [e for e in load_entries(ROOT) if e["target"] == "app"]
-    migrations = [(ROOT / "migrations" / e["file"]).read_text() for e in entries]
-    ledger = ", ".join(f"('{e['file']}','{e['sha256']}')" for e in entries)
-    sql(f"SET ROLE {executor};\n" + "\n".join(transaction_body(text) for text in migrations)
-        + "CREATE TABLE public.schema_migrations(file text, sha256 text);"
-        + f"INSERT INTO public.schema_migrations VALUES {ledger};")
+    entries = apply_catalog(sql, ROOT, executor)
     assert sql(f"SELECT has_table_privilege('{owner}','public.schema_migrations','SELECT');") == "f"
 
     def role_oid(role):

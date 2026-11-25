@@ -13,6 +13,13 @@ CONFIG_ENV = "ISOLATED_TRIAL_TARGET"
 SHARED_OID = 16500
 ROUTES = {"OWNER": "direct", "EXECUTOR": "direct", "READER": "routed", "WRITER": "routed"}
 
+KIND = "selfhost-pg18"
+HOSTS = {"direct": "nntune-trial-db-op.nntune.com", "routed": "nntune-trial-db-hd.nntune.com"}
+FIXTURE_HOSTS = {"direct": "op.trial.invalid", "routed": "routed.trial.invalid"}
+NAMES = ("nntune_trial_reader", "nntune_trial_writer")
+ROLES = {"owner": "nntune_trial_owner", "executor": "nntune_trial_executor",
+         "reader": NAMES[0], "writer": NAMES[1]}
+
 
 def target_config(raw, scope, fixture):
     if len(raw) > 2048:
@@ -42,6 +49,33 @@ def target_config(raw, scope, fixture):
                                           for key in ("reader", "writer")))):
         raise ValueError
     return config
+
+
+def selfhost_target_config(raw, *, fixture=False):
+    """Read separately supplied evidence pins. The PlanetScale parser is separate."""
+    if len(raw) > 4096:
+        raise ValueError
+    pins = json.loads(raw)
+    if (not isinstance(pins, dict) or pins.keys() != {
+            "kind", "system_identifier", "database_oid", "ca_sha256", "server_sha256", "routes", "role_oids"}
+            or pins["kind"] != KIND or not oid(pins["database_oid"]) or pins["database_oid"] in (16494, SHARED_OID)
+            or type(pins["system_identifier"]) is not int or not 0 < pins["system_identifier"] < 2**64
+            or any(not isinstance(pins[key], str) or not re.fullmatch(r"[a-f0-9]{64}", pins[key])
+                   for key in ("ca_sha256", "server_sha256"))):
+        raise ValueError
+    hosts = FIXTURE_HOSTS if fixture else HOSTS
+    routes, roles = pins["routes"], pins["role_oids"]
+    if (not isinstance(routes, dict) or routes.keys() != hosts.keys()
+            or any(not isinstance(routes[key], list) or len(routes[key]) != 2 or routes[key][0] != host
+                   or type(routes[key][1]) is not int or not 1 <= routes[key][1] <= 65535
+                   for key, host in hosts.items())
+            or not isinstance(roles, dict) or roles.keys() != ROLES.keys()
+            or not all(oid(roles[key]) for key in ("owner", "executor"))
+            or any(roles[key] is not None and not oid(roles[key]) for key in ("reader", "writer"))
+            or len({value for value in roles.values() if value is not None}) != sum(
+                value is not None for value in roles.values())):
+        raise ValueError
+    return pins
 
 
 def authority(root, app_grants):
