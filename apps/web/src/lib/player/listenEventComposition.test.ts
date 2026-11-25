@@ -26,7 +26,7 @@ it('orders the current grant’s events and refuses the retired grant’s late t
 
 	let source: BrowserPlaybackSource | undefined;
 	const grant = createBrowserPlaybackGrant(owner, 'A'.repeat(43), async (request) => ({
-		...request, durationMs: 60_000
+		data: { ...request, durationMs: 60_000 }
 	}));
 	const sender = createListenEventSender({ owner, canRecord: () => true, grantForStart: () => source, fetchFn });
 	onTestFinished(() => { sender.dispose(); grant.dispose(); });

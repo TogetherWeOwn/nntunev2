@@ -12,8 +12,11 @@ export function createBrowserPlaybackSession(
 	const isCurrent = () => !signal.aborted && owner.isCurrent();
 	const api = new ApiClient({ baseUrl: '', fetchFn, session: { owner, binding } });
 	const grant = createBrowserPlaybackGrant(owner, binding, async ({ trackId, playbackSessionId, playId }, signal) => {
-		const { status, data } = await api.writeBrowserPlayback({ track_id: trackId, session_id: playbackSessionId, play_id: playId }, signal);
-		return status === 200 ? data : undefined;
+		const { status, data, headers } = await api.writeBrowserPlayback({ track_id: trackId, session_id: playbackSessionId, play_id: playId }, signal);
+		if (status !== 200) return;
+		const cutoff = headers.get('x-nntune-playback-expires-at');
+		const expiresAt = cutoff && /^\d{1,13}$/.test(cutoff) ? Number(cutoff) * 1000 : 0;
+		return { data, expiresAt: expiresAt || undefined };
 	});
 	let enabled = false, uncertain = false, pending = false;
 	let tail = Promise.resolve();

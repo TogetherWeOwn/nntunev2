@@ -64,11 +64,16 @@ export function createPlayerController(
 	const media = createMediaController(queue, {
 		...effects, browseCopy, streamFor, announce: announceQueue,
 		commit: (next, source) => commitQueue(next, 'replace', undefined, source),
+		grantExpired: (id) => activeGrant?.trackId === id && activeGrant.expiresAt !== undefined &&
+			Date.now() >= activeGrant.expiresAt,
 		prepare: browserPlayback ? (id, current, publish, { retry, retireSuperseded } = {}) => {
 			const before = activeGrant;
 			const playId = retry && before?.trackId === id ? before.playId : undefined;
 			if (retry && !playId) return Promise.resolve(false);
-			return browserSession?.open(id, current, publish, playId,
+			return browserSession?.open(id, current, (source) => {
+				if (retry) activeGrant = source;
+				publish(source);
+			}, playId,
 				retireSuperseded && before && (() => {
 					const track = currentTrack(queue.snapshot);
 					if (!retireSuperseded() || activeGrant !== before || track?.id !== before.trackId) return;

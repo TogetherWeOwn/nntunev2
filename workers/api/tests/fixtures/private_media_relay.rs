@@ -177,7 +177,10 @@ fn browser_issue_selects_only_armed_verified_sessions_and_projects_five_fields()
     assert!(response.set_cookie.is_none());
     assert_eq!(
         response.extra_headers,
-        [("cache-control".into(), "private, no-store".into())]
+        [
+            ("cache-control".into(), "private, no-store".into()),
+            ("x-nntune-playback-expires-at".into(), "12".into()),
+        ]
     );
     assert_eq!(
         browser(json!({"track_id": "track", "session_id": "tab-1", "play_id": MEDIA_PLAY})).body,

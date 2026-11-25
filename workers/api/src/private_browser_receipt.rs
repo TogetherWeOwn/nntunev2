@@ -259,8 +259,9 @@ impl PrivatePlayback<'_> {
         receipt.music.target.reference
     }
 
-    /// Issue under the privacy/deletion fence, or replay the exact current
-    /// receipt. Only the HTTP adapter supplies already-verified claims.
+    /// Issue under the privacy/deletion fence, or retry the exact current
+    /// receipt. An expired receipt can only be reissued under the same play
+    /// identity and after reauthorizing its pinned publication.
     pub(crate) async fn open_browser(
         &self,
         db: &mut impl PgConnect,
@@ -301,6 +302,7 @@ impl PrivatePlayback<'_> {
             if !lock_playback_account(&tx, user).await? || !authorized(&tx, policy, claims).await? {
                 return Ok(None);
             }
+            let mut continuation = None;
             if let Some((lease, pins)) = current(&tx, user).await? {
                 if lease.is_live(start)
                     && lease.session_id == *tab
@@ -311,40 +313,63 @@ impl PrivatePlayback<'_> {
                 let retry = input.play_id.as_ref() == Some(&lease.play_id);
                 let replay = input.request_id.is_some() && input.request_id == pins.request_id;
                 if retry || replay {
-                    if lease.session_id != *tab || lease.track_id != *track {
+                    if lease.session_id != *tab || lease.track_id != *track
+                        || pins.account_session != claims.session_id
+                    {
                         return Ok(None);
                     }
-                    return self
-                        .browser_receipt_for(&tx, claims, lease, &pins, scope, seconds(now())?)
-                        .await;
+                    let checked_at = seconds(now())?;
+                    if !retry || lease.is_live(start) {
+                        return self
+                            .browser_receipt_for(&tx, claims, lease, &pins, scope, checked_at)
+                            .await;
+                    }
+                    continuation = Some(pins);
                 }
             }
             // A rejected continuation never falls through to lease acquisition.
-            if input.play_id.is_some() {
-                return Ok(None);
-            }
-            let Some((music, row)) =
-                lookup_scoped(&tx, track, scope.publication, None, None).await?
-            else {
-                return Ok(None);
+            let mut pins = if let Some(pins) = continuation {
+                pins
+            } else {
+                if input.play_id.is_some() {
+                    return Ok(None);
+                }
+                let Some((music, row)) =
+                    lookup_scoped(&tx, track, scope.publication, None, None).await?
+                else {
+                    return Ok(None);
+                };
+                if music.target.root_version != scope.root_version {
+                    return Ok(None);
+                }
+                let Some(duration_ms) = duration(&row)? else {
+                    return Ok(None);
+                };
+                let S3Binding::VersionId(version) = music.locator.binding() else {
+                    return Ok(None);
+                };
+                let mut play = random_id::<16>().map_err(|_| StoreError)?;
+                play.insert_str(0, PREFIX);
+                let key = derive_play_idempotency_key(user, track, &play).map_err(|_| StoreError)?;
+                ReceiptPins {
+                    account_session: claims.session_id.clone(),
+                    play,
+                    tab: tab.clone(),
+                    epoch: 0,
+                    expires_at: 0,
+                    request_id: input.request_id.clone(),
+                    accepted_seq: row.try_get("accepted_seq").map_err(|_| StoreError)?,
+                    target: music.target,
+                    bucket: scope.publication.bucket.into(),
+                    version: version.into(),
+                    duration_ms,
+                    private: classify_play_privacy(&tx, user, tab, &key, start).await?,
+                }
             };
-            if music.target.root_version != scope.root_version {
-                return Ok(None);
-            }
-            let Some(duration_ms) = duration(&row)? else {
-                return Ok(None);
-            };
-            let S3Binding::VersionId(version) = music.locator.binding() else {
-                return Ok(None);
-            };
-            let mut play = random_id::<16>().map_err(|_| StoreError)?;
-            play.insert_str(0, PREFIX);
-            let key = derive_play_idempotency_key(user, track, &play).map_err(|_| StoreError)?;
-            let private = classify_play_privacy(&tx, user, tab, &key, start).await?;
             let end = playback::continuation_deadline(
                 start,
                 crate::meter_sink::TrackMeterMeta {
-                    track_duration_ms: Some(duration_ms.get()),
+                    track_duration_ms: Some(pins.duration_ms.get()),
                     ..Default::default()
                 },
             )
@@ -354,33 +379,20 @@ impl PrivatePlayback<'_> {
             // Native <audio> has no heartbeat. Bound this immutable grant
             // and lease to one track's window and the existing v4 TTL cap.
             let LeaseAcquire::Acquired { epoch } = acquire_playback_lease_with_expiry(
-                &tx, user, tab, track, &play, start, end, end, false,
+                &tx, user, tab, track, &pins.play, start, end, end, false,
             )
             .await?
             else {
                 return Ok(None);
             };
-            let expires_at = end;
-            let pins = ReceiptPins {
-                account_session: claims.session_id.clone(),
-                play: play.clone(),
-                tab: tab.clone(),
-                epoch,
-                expires_at,
-                request_id: input.request_id.clone(),
-                accepted_seq: row.try_get("accepted_seq").map_err(|_| StoreError)?,
-                target: music.target,
-                bucket: scope.publication.bucket.into(),
-                version: version.into(),
-                duration_ms,
-                private,
-            };
+            pins.epoch = epoch;
+            pins.expires_at = end;
             let lease = LeaseRow {
                 session_id: tab.clone(),
                 track_id: track.clone(),
-                play_id: play,
+                play_id: pins.play.clone(),
                 epoch,
-                expires_at,
+                expires_at: end,
                 continuation_deadline: end,
             };
             let Some(receipt) = self

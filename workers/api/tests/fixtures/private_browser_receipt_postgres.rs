@@ -117,6 +117,12 @@ pub(super) async fn receipt_retries(
     let replay = open(reader, claims, &input, scope).await.unwrap();
     assert_eq!(replay.relay().lease, original.lease);
     assert!(replay.relay().grant.token == original.grant.token);
+    let expiry = UNIX_EPOCH + Duration::from_secs(cutoff);
+    assert!(service
+        .open_browser(reader, claims, &input, scope, || expiry)
+        .await
+        .unwrap()
+        .is_none());
     let key = crate::ledger::derive_play_idempotency_key(
         MEMBER,
         &input.track_id,
@@ -137,7 +143,7 @@ pub(super) async fn receipt_retries(
     assert_eq!(retry.relay().lease, original.lease);
     assert!(retry.relay().grant.token == original.grant.token);
     let second_cookie =
-        crate::session::issue_session(&[91; 32], MEMBER, claims.created_at, 120).unwrap();
+        crate::session::issue_session(&[91; 32], MEMBER, claims.created_at, 600).unwrap();
     let second =
         crate::session::verify_session(&[91; 32], &second_cookie, claims.created_at).unwrap();
     writer.execute(
@@ -164,14 +170,13 @@ pub(super) async fn receipt_retries(
         .await
         .unwrap()
         .is_none());
-    let expiry = UNIX_EPOCH + Duration::from_secs(original.lease.expires_at);
     assert!(service
         .load_browser(reader, claims, &path, scope, || expiry)
         .await
         .unwrap()
         .is_none());
     assert!(service
-        .open_browser(reader, claims, &input, scope, || expiry)
+        .open_browser(reader, &second, &input, scope, || expiry)
         .await
         .unwrap()
         .is_none());
@@ -196,6 +201,41 @@ pub(super) async fn receipt_retries(
         ..claims.clone()
     };
     assert!(open(reader, &wrong_account, &input, scope).await.is_none());
+    let renewed = service
+        .open_browser(reader, claims, &input, scope, || expiry)
+        .await
+        .unwrap()
+        .expect("the exact expired browser receipt can be reauthorized");
+    let renewed = renewed.relay();
+    assert_eq!(renewed.lease.play_id, original.lease.play_id);
+    assert_eq!(renewed.lease.epoch, original.lease.epoch + 1);
+    assert!(renewed.grant.exp_unix > cutoff);
+    assert!(renewed.grant.exp_unix <= claims.expires_at);
+    assert!(service
+        .load_for_stream(reader, grant, scope, || expiry)
+        .await
+        .unwrap()
+        .is_none());
+    let replayed = service
+        .open_browser(reader, claims, &input, scope, || expiry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replayed.relay().lease, renewed.lease);
+    let loaded = service
+        .load_browser(reader, claims, &path, scope, || expiry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.relay().lease, renewed.lease);
+    let expired_again = UNIX_EPOCH + Duration::from_secs(renewed.lease.expires_at);
+    assert!(renewed.lease.expires_at < claims.expires_at);
+    let policy_cutoff = UNIX_EPOCH + Duration::from_secs(claims.expires_at);
+    assert!(service
+        .open_browser(reader, claims, &input, scope, || policy_cutoff)
+        .await
+        .unwrap()
+        .is_none());
     for state in ["revision", "invite", "session"] {
         writer
             .query_one(
@@ -205,12 +245,16 @@ pub(super) async fn receipt_retries(
             .await
             .unwrap();
         assert!(
-            open(reader, claims, &input, scope).await.is_none(),
+            service
+                .open_browser(reader, claims, &input, scope, || expired_again)
+                .await
+                .unwrap()
+                .is_none(),
             "{state}"
         );
         assert!(
             service
-                .load_for_stream(reader, grant, scope, SystemTime::now)
+            .load_for_stream(reader, &renewed.grant.token, scope, || expiry)
                 .await
                 .unwrap()
                 .is_none(),
@@ -222,7 +266,7 @@ pub(super) async fn receipt_retries(
             .await
             .unwrap()
             .unwrap(),
-        original.lease
+        renewed.lease
     );
     assert_eq!(mark_count().await, before + 1);
     assert!(playback_privacy_mark(writer, MEMBER, &key).await.unwrap());

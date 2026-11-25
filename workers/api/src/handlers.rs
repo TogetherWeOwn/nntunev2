@@ -6969,6 +6969,10 @@ where
     response
         .extra_headers
         .push(("cache-control".into(), "private, no-store".into()));
+    response.extra_headers.push((
+        "x-nntune-playback-expires-at".into(),
+        receipt.grant.exp_unix.to_string(),
+    ));
     response
 }
 

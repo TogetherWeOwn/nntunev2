@@ -26,6 +26,7 @@ type QueueAuthority = Pick<ReturnType<typeof createQueueController>,
 export type MediaSelection = {
 	commit: (queue: QueueState, grant?: BrowserPlaybackSource) => boolean;
 	streamFor?: (track: Track | null) => string;
+	grantExpired?: (trackId: string) => boolean;
 	prepare?: (trackId: string, isCurrent: () => boolean, publish: (source: BrowserPlaybackSource) => void,
 		options?: { retry?: boolean; retireSuperseded?: () => boolean }) => Promise<boolean>;
 	flush: () => Promise<void>;
@@ -192,11 +193,19 @@ export function createMediaController(queue: QueueAuthority, selection?: MediaSe
 	}
 
 	function playCurrent(): Promise<void> {
-		if (selection?.prepare && !selectedSource()) {
+		if (selection?.prepare) {
 			const base = queue.snapshot;
 			const id = currentTrack(base)?.id;
-			const evidence = id && queue.sourceForQueuedPlay(id);
-			if (evidence) return playSelected(base, base.currentIndex, evidence);
+			if (!selectedSource()) {
+				const evidence = id && queue.sourceForQueuedPlay(id);
+				if (evidence) return playSelected(base, base.currentIndex, evidence);
+			} else if (id && selection.grantExpired?.(id)) {
+				const target = transportTarget();
+				if (target?.audio.paused && !target.audio.ended && !target.audio.error) {
+					if (pendingGrant !== undefined) return Promise.resolve();
+					return preparePlay(id, target.matches, () => startCurrent(false), { retry: true });
+				}
+			}
 		}
 		return startCurrent(false);
 	}
