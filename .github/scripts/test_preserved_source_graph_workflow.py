@@ -16,13 +16,35 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestPreservedSourceGraphWorkflow(unittest.TestCase):
-    def test_head_and_graph_control_are_wired(self):
+    def test_event_gate_and_concurrency_match(self):
         text = (ROOT / ".github/workflows/preserved-source-graph.yml").read_text()
         self.assertIn(
-            "  pull_request:\n"
-            "    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]\n",
+            "\non:\n  pull_request:\n"
+            "    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]\n\n",
             text,
         )
+        job = split_jobs(text)["synthetic-graph"]
+        condition = job.split("\n    if: >-\n", 1)[1].split("\n    runs-on:", 1)[0]
+        condition = " ".join(line.strip() for line in condition.splitlines())
+        predicate = (
+            "(contains(fromJSON('[\"opened\",\"synchronize\",\"reopened\"]'), github.event.action) || "
+            "contains(fromJSON('[1072,1075]'), github.event.pull_request.number) || "
+            "(github.event.action == 'edited' && github.event.changes.base.ref.from != '') || "
+            "(contains(fromJSON('[\"labeled\",\"unlabeled\"]'), github.event.action) && "
+            "!contains(fromJSON('[\"size/S\",\"size/M\",\"size/L\",\"size/XL\"]'), github.event.label.name)))"
+        )
+        self.assertEqual("${{ " + predicate + " }}", condition)
+        concurrency = text.split("\nconcurrency:\n", 1)[1].split("\njobs:", 1)[0]
+        group, cancel = concurrency.split("\n  group: >-\n", 1)[1].split("\n  cancel-in-progress: ", 1)
+        self.assertEqual("true", cancel.strip())
+        self.assertEqual(
+            "${{ " + predicate + " && format('preserved-source-graph-{0}', github.event.pull_request.number) "
+            "|| format('preserved-source-graph-skipped-{0}', github.run_id) }}",
+            " ".join(line.strip() for line in group.splitlines()),
+        )
+
+    def test_head_and_graph_control_are_wired(self):
+        text = (ROOT / ".github/workflows/preserved-source-graph.yml").read_text()
         self.assertNotIn("pull_request_target:", text)
         self.assertIn("permissions:\n  contents: read\n", text)
         jobs = split_jobs(text)
@@ -41,7 +63,9 @@ class TestPreservedSourceGraphWorkflow(unittest.TestCase):
         self.assertIn("git --version", identity)
         self.assertIn("GitFixture.test_preserved_source_requires_original_graph_and_data_objects", graph)
         self.assertNotIn("continue-on-error:", job)
-        self.assertNotIn("if:", job)
+        self.assertEqual(1, job.count("\n    if:"))
+        for step in steps:
+            self.assertIsNone(step_field(step, "if"))
 
     def test_identity_uses_actual_merge_parents(self):
         text = (ROOT / ".github/workflows/preserved-source-graph.yml").read_text()

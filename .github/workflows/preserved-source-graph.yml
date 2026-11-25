@@ -10,12 +10,29 @@ permissions:
   contents: read
 
 concurrency:
-  group: preserved-source-graph-${{ github.event.pull_request.number }}
+  # A skipped event must never cancel an in-flight graph check for the PR.
+  group: >-
+    ${{ (contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) ||
+        contains(fromJSON('[1072,1075]'), github.event.pull_request.number) ||
+        (github.event.action == 'edited' && github.event.changes.base.ref.from != '') ||
+        (contains(fromJSON('["labeled","unlabeled"]'), github.event.action) &&
+         !contains(fromJSON('["size/S","size/M","size/L","size/XL"]'), github.event.label.name))) &&
+        format('preserved-source-graph-{0}', github.event.pull_request.number) ||
+        format('preserved-source-graph-skipped-{0}', github.run_id) }}
   cancel-in-progress: true
 
 jobs:
   synthetic-graph:
     name: Synthetic graph controls
+    # Retargets and deliberate label changes can refresh the tested merge with
+    # the same head. Keep all refresh events for the documented #1072 and #1075
+    # evidence, including edits, advisory labels and review-ready transitions.
+    if: >-
+      ${{ (contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) ||
+          contains(fromJSON('[1072,1075]'), github.event.pull_request.number) ||
+          (github.event.action == 'edited' && github.event.changes.base.ref.from != '') ||
+          (contains(fromJSON('["labeled","unlabeled"]'), github.event.action) &&
+           !contains(fromJSON('["size/S","size/M","size/L","size/XL"]'), github.event.label.name))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
