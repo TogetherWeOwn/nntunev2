@@ -333,6 +333,7 @@ test('Stream plays and seeks the committed FLAC, and refuses invalid pinned resp
       assert.equal(refused.response.status, 404);
       assert.deepEqual(custody.splice(0), ['resolve', 'lease']);
       assert.deepEqual(operations, []);
+      assert.equal(rejectedUnsigned, 1, 'only the explicit unsigned control reached the origin');
       assert.deepEqual(reports.splice(0), [prefix, tail]);
       leaseLive = true;
     });
