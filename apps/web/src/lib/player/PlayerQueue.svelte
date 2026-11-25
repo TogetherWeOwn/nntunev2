@@ -592,6 +592,18 @@
 		});
 	}
 
+	async function runMenuReorder(invoker: HTMLElement, reorder: () => void): Promise<void> {
+		// ContextMenu restores its invoker before running the action. Moving
+		// the keyed row can detach that focused control during the render.
+		const heldFocus = document.activeElement === invoker;
+		const generation = confirmGeneration;
+		reorder();
+		await tick();
+		if (generation !== confirmGeneration || interactionsUnavailable || !invoker.isConnected ||
+			invoker.matches(':disabled, [aria-disabled="true"]') || !focusStranded(heldFocus, invoker)) return;
+		focusVisible(invoker);
+	}
+
 	function openTrackMenu(id: string, invoker: HTMLElement, point?: { x: number; y: number }, focusMove = false): void {
 		if (interactionsUnavailable || (!oninsert && !onreorder)) return;
 		const index = queue.tracks.findIndex((track) => track.id === id);
@@ -601,14 +613,18 @@
 		const actions: MenuAction[] = [];
 		const ids = batchFor(id);
 		const target = invoker.matches('li') ? invoker.querySelector<HTMLElement>('[data-testid="queue-more"]') ?? invoker : invoker;
+		const reorderAction = (label: string, reorder: () => void): MenuAction => ({
+			label,
+			run: () => void runMenuReorder(target, reorder)
+		});
 		let request: MenuRequest;
 		if (ids.length > 1 && onreorder) {
 			const all = queue.tracks.map((track) => track.id);
 			const atTop = all.slice(0, ids.length).every((x) => ids.includes(x));
 			const atBottom = all.slice(all.length - ids.length).every((x) => ids.includes(x));
-			if (onplaynextids) actions.push({ label: 'Play next', run: () => onplaynextids?.(ids) });
-			if (!atTop) actions.push({ label: 'Move to top', run: () => onreorder?.(ids, queue.tracks.find((track) => !ids.includes(track.id))?.id ?? null) });
-			if (!atBottom) actions.push({ label: 'Move to bottom', run: () => onreorder?.(ids, null) });
+			if (onplaynextids) actions.push(reorderAction('Play next', () => onplaynextids?.(ids)));
+			if (!atTop) actions.push(reorderAction('Move to top', () => onreorder?.(ids, queue.tracks.find((track) => !ids.includes(track.id))?.id ?? null)));
+			if (!atBottom) actions.push(reorderAction('Move to bottom', () => onreorder?.(ids, null)));
 			if (onfavoriteids || ontogglefavorite) {
 				const starred = ids.every((x) => favoriteIds.has(x));
 				actions.push({ label: starred ? 'Unstar all' : 'Star all', run: () => toggleFavorites(ids, starred) });
@@ -623,14 +639,14 @@
 		} else {
 			const last = queue.tracks.length - 1;
 			if (onplaynow) actions.push({ label: 'Play now', run: () => { if (at() >= 0) onplaynow?.(id); } });
-			if (onplaynext) actions.push({ label: 'Play next', run: () => { const i = at(); if (i >= 0) onplaynext?.(i); } });
+			if (onplaynext) actions.push(reorderAction('Play next', () => { const i = at(); if (i >= 0) onplaynext?.(i); }));
 			if (onmove && index > 0) {
-				actions.push({ label: 'Move to top', run: () => move(0) });
-				actions.push({ label: 'Move up', run: () => move(at() - 1) });
+				actions.push(reorderAction('Move to top', () => move(0)));
+				actions.push(reorderAction('Move up', () => move(at() - 1)));
 			}
 			if (onmove && index < last) {
-				actions.push({ label: 'Move down', run: () => move(at() + 1) });
-				actions.push({ label: 'Move to bottom', run: () => move(queue.tracks.length - 1) });
+				actions.push(reorderAction('Move down', () => move(at() + 1)));
+				actions.push(reorderAction('Move to bottom', () => move(queue.tracks.length - 1)));
 			}
 			if (onfavoriteids || ontogglefavorite) {
 				const starred = favoriteIds.has(id);

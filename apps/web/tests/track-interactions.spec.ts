@@ -316,10 +316,16 @@ test('queue batch selection has keyboard insertion parity and preserves the curr
 	await expect.poll(() => queueIds(page)).toEqual(['dawn', 'ember', 'tide', 'coral']);
 	await expect(page.getByTestId('now-playing')).toHaveText(current!);
 	await expect(queueRow(page, 'coral')).toHaveAttribute('aria-current', 'true');
-	await queueRow(page, 'dawn').getByTestId(TESTIDS.queueMore).click();
+	const more = queueRow(page, 'dawn').getByTestId(TESTIDS.queueMore);
+	await more.focus();
+	await page.keyboard.press('Enter');
 	await expect(menu(page)).toHaveAttribute('aria-label', '3 selected tracks');
-	await menu(page).getByRole('menuitem', { name: 'Move to bottom', exact: true }).click();
+	await expect(menu(page).getByRole('menuitem', { name: 'Play next', exact: true })).toBeFocused();
+	await page.keyboard.press('ArrowDown');
+	await expect(menu(page).getByRole('menuitem', { name: 'Move to bottom', exact: true })).toBeFocused();
+	await page.keyboard.press('Enter');
 	await expect.poll(() => queueIds(page)).toEqual(['coral', 'dawn', 'ember', 'tide']);
+	await expect(more).toBeFocused();
 	await toolbar.getByRole('button', { name: 'Remove selected from queue' }).click();
 	await expect.poll(() => queueIds(page)).toEqual(['coral']);
 });
