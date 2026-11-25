@@ -27,6 +27,13 @@ impl Scope {
     pub(crate) fn valid(&self) -> bool {
         canonical_uuid(&self.environment_id) && canonical_uuid(&self.library_id)
     }
+
+    #[cfg(feature = "encrypted-upload-caller")]
+    pub(crate) fn matches(&self, environment: [u8; 16], library: [u8; 16]) -> bool {
+        use crate::storage_digest_read::uuid_text;
+        self.environment_id.replace('-', "") == uuid_text(environment)
+            && self.library_id.replace('-', "") == uuid_text(library)
+    }
 }
 
 #[derive(Clone, Copy)]
