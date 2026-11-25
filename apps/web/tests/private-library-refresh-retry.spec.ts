@@ -39,11 +39,14 @@ test('Retry refreshes the invited Library Find results and keeps the current tra
 
 	const main = page.getByRole('main');
 	const rows = main.getByTestId(library.item);
-	const rowTitle = ({ id, title }: typeof selected) => rows.and(page.locator(`[${library.id}="${id}"]`))
-		.getByRole('button', { name: title, exact: true });
+	const trackButton = (id: string) => rows.and(page.locator(`[${library.id}="${id}"]`))
+		.locator(library.select);
 	const expectTracks = async (tracks: typeof initial) => {
 		await expect(rows).toHaveCount(tracks.length);
-		for (const track of tracks) await expect(rowTitle(track)).toBeVisible();
+		for (const { id, title } of tracks) {
+			await expect(trackButton(id)).toBeVisible();
+			await expect(trackButton(id)).toContainText(title);
+		}
 	};
 	const find = main.getByRole('searchbox', { name: 'Find in loaded tracks', exact: true });
 	const refresh = main.getByRole('button', { name: library.refresh, exact: true });
@@ -55,8 +58,8 @@ test('Retry refreshes the invited Library Find results and keeps the current tra
 	await expectTracks(initial);
 	await find.fill('harbor');
 	await expectTracks([first, selected]);
-	await rowTitle(first).click();
-	await rowTitle(selected).click();
+	await trackButton(first.id).click();
+	await trackButton(selected.id).click();
 	await page.getByTestId(player.queueItem)
 		.getByRole('button', { name: `Select ${selected.title}`, exact: true }).click();
 	await expect(current).toHaveAttribute(player.queueId, selected.id);
