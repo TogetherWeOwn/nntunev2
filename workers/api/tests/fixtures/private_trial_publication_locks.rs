@@ -89,6 +89,13 @@ async fn scoped_writer_locks_and_publishes_without_base_updates() {
         .batch_execute(concat!(
             "CREATE ROLE trial_lock_writer LOGIN NOINHERIT;
          CREATE ROLE trial_lock_reader LOGIN NOINHERIT;
+         CREATE ROLE trial_lock_executor NOINHERIT;
+         GRANT USAGE, CREATE ON SCHEMA public TO trial_lock_executor;
+         ALTER TABLE public.users OWNER TO trial_lock_executor;
+         ALTER TABLE public.sessions OWNER TO trial_lock_executor;
+         ALTER TABLE public.invite_codes OWNER TO trial_lock_executor;
+         ALTER TABLE public.ingest_jobs OWNER TO trial_lock_executor;
+         ALTER TABLE public.tracks OWNER TO trial_lock_executor;
          UPDATE public.users SET email = 'listener@example.test' WHERE id = 'library-invitee';
          UPDATE public.invite_codes SET email = 'listener@example.test' WHERE id = 901;",
             include_str!("private_trial_publication_access.sql"),
@@ -121,7 +128,21 @@ async fn scoped_writer_locks_and_publishes_without_base_updates() {
         Some(&SqlState::INSUFFICIENT_PRIVILEGE)
     );
     tx.rollback().await.unwrap();
-    contract(&observer, "grant", writer_oid).await.unwrap();
+    let executor = connect_fixture(LOCK_DB).await;
+    executor
+        .batch_execute("SET SESSION AUTHORIZATION trial_lock_executor")
+        .await
+        .unwrap();
+    assert!(executor
+        .query_one(
+            "SELECT current_user = 'trial_lock_executor' AND session_user = current_user
+                AND NOT current_setting('is_superuser')::boolean",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    contract(&executor, "grant", writer_oid).await.unwrap();
     assert!(observer.query_one(
         "SELECT count(*) FILTER (WHERE attname = 'id') = 5 AND bool_and(
              NOT has_table_privilege($1::oid, attrelid, 'UPDATE')
@@ -279,22 +300,22 @@ async fn scoped_writer_locks_and_publishes_without_base_updates() {
         .await
         .unwrap();
     assert_permission_denied(&assumed, "UPDATE public.users SET id = id", true).await;
-    assert!(contract(&observer, "revoke", reader_oid).await.is_err());
+    assert!(contract(&executor, "revoke", reader_oid).await.is_err());
     assert_permission_denied(&writer, "UPDATE public.users SET id = id", true).await;
     // A stray grant on the last table must leave even the earlier guards in place.
-    observer
+    executor
         .batch_execute("GRANT UPDATE (duration_ms) ON public.tracks TO trial_lock_writer_renamed")
         .await
         .unwrap();
-    assert!(contract(&observer, "revoke", writer_oid).await.is_err());
+    assert!(contract(&executor, "revoke", writer_oid).await.is_err());
     assert_permission_denied(&writer, "UPDATE public.users SET id = id", true).await;
-    observer
+    executor
         .batch_execute(
             "REVOKE UPDATE (duration_ms) ON public.tracks FROM trial_lock_writer_renamed",
         )
         .await
         .unwrap();
-    contract(&observer, "revoke", writer_oid).await.unwrap();
+    contract(&executor, "revoke", writer_oid).await.unwrap();
     assert!(observer
         .query_one(
             "SELECT to_regprocedure('public.reject_private_trial_publication_update()') IS NULL

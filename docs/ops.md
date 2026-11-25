@@ -458,9 +458,11 @@ application grants. After the overlay, recheck its effective ACLs before the tri
 
 The [publication-lock contract](../scripts/private_trial_publication_locks.sql)
 supplies the five base-table lock grants separately. It is opt-in and has no
-workflow dispatch. Use the separately authorized catalog owner and verify the
-exact staging catalog and dedicated writer OID from the role preflight. In
-the verified session set `nntune.private_trial_writer_oid` to that numeric
+workflow dispatch. Verify the exact staging catalog and dedicated writer OID
+from the role preflight. Use a separately authorized executor and confirm
+its effective role owns all five tables and has USAGE and CREATE on `public`.
+Use the same executor for withdrawal. In the verified session set
+`nntune.private_trial_writer_oid` to that numeric
 OID and `nntune.private_trial_lock_action` to `grant`, then run the script
 with psql `ON_ERROR_STOP`. The transaction binds the five `UPDATE (id)`
 grants to statement triggers that reject the writer's updates, including
