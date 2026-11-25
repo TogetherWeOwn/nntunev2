@@ -67,6 +67,13 @@ test('operator switch-off requires complete readback of the pinned maintenance a
   const cases = [
     { name: 'all traffic serves the pinned maintenance version' },
     {
+      name: 'the pinned maintenance version is reported under a different deployment ID',
+      changeReadback(history) {
+        history.result.deployments[0].id = '00000000-0000-0000-0000-000000000006';
+      },
+      refusal: /Restore result unresolved/,
+    },
+    {
       name: 'the acknowledged deployment serves a different version',
       changeReadback(history, candidate) {
         history.result.deployments[0].versions = [{ version_id: candidate, percentage: 100 }];
